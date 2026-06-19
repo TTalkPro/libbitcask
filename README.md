@@ -102,6 +102,8 @@ cmake --install build        # 头文件、libbitcask.{so,a}、bitcask_c.h
 
 ## 用法示例
 
+> 完整接口参考见 [`doc/api-cpp.md`](doc/api-cpp.md)（C++）与 [`doc/api-c.md`](doc/api-c.md)（C / FFI）。
+
 ### C++：KV 模式
 
 ```cpp
@@ -224,7 +226,7 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 - **并发协议**：HNSW 单写者 + 多读者（`atomic<NodeChunk*>` 发布 + per-node 自旋锁）；InvertedIndex 按词 hash 分片锁 + CoW posting；KeyDir 256 分片锁
 - **小端 only**：所有多字节整数小端（LE 主机原生零转换），不再与 legacy 大端 Erlang 字节互通，迁移用 `tools/migrate_le`
 
-更多详见 `doc/`：[`cpp-arch.md`](doc/cpp-arch.md)（架构）、[`format-zh.md`](doc/format-zh.md)（字节级格式）、[`concurrency-zh.md`](doc/concurrency-zh.md)（锁与并发）、[`hnsw-design-zh.md`](doc/hnsw-design-zh.md)（HNSW 设计）、[`unified-architecture-plan-zh.md`](doc/unified-architecture-plan-zh.md)（统一架构规划）。
+更多详见 `doc/`：[`api-cpp.md`](doc/api-cpp.md)（C++ API 参考）、[`api-c.md`](doc/api-c.md)（C API 参考 / FFI 绑定）、[`cpp-arch.md`](doc/cpp-arch.md)（架构）、[`format-zh.md`](doc/format-zh.md)（字节级格式）、[`concurrency-zh.md`](doc/concurrency-zh.md)（锁与并发）、[`hnsw-design-zh.md`](doc/hnsw-design-zh.md)（HNSW 设计）、[`unified-architecture-plan-zh.md`](doc/unified-architecture-plan-zh.md)（统一架构规划）。
 
 ---
 
