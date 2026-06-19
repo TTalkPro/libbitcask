@@ -4,7 +4,7 @@
 
 - **KV 模式**：append-only 数据文件 + 内存 keydir，O(1) `get` / `put`，单次 `pread` 读值
 - **索引模式**：在 KV 之上叠加 BM25 倒排、HNSW 图、字段索引，支持向量/文本/混合检索
-- **C++23**，无 Boost / abseil / 运行时第三方依赖（GoogleTest / Google Benchmark / oneTBB / utf8proc / cppjieba 均由 CMake `FetchContent` 自动拉取）
+- **C++23**，无 Boost / abseil 依赖；第三方库以 git submodule 形式 vendored 在 `third_party/`（构建无需联网）
 - **Apache 2.0** 协议
 
 ---
@@ -31,9 +31,38 @@
 
 ## 快速开始
 
-### 构建
+### 构建依赖
 
-需要支持 C++23 的编译器（GCC 13+ / Clang 17+）、CMake ≥ 3.20、ZLIB。
+**系统依赖**（需自行安装）：
+
+| 依赖 | 版本 | 说明 | Debian/Ubuntu 包 |
+|------|------|------|------------------|
+| C++ 编译器 | GCC 13+ / Clang 17+ | 需 C++23 支持 | `gcc` `g++` |
+| CMake | ≥ 3.20 | 构建系统 | `cmake` |
+| ZLIB | — | CRC32 / 数据压缩 | `zlib1g-dev` |
+| oneTBB | — | 并发容器；普通构建用系统包 | `libtbb-dev` |
+
+> 普通构建用系统的 `libtbb`（`find_package(TBB)`）；仅 TSan 构建会改用 `third_party/oneTBB` 源码编译插桩版——系统 libtbb 未插桩，TSan 下会漏报/误报。
+
+**Vendored 依赖**（git submodule，位于 `third_party/`，clone 后无需手动安装，构建无需联网）：
+
+| submodule | 版本 | 来源 | 用途 |
+|-----------|------|------|------|
+| `third_party/utf8proc` | v2.10.0 | https://github.com/JuliaStrings/utf8proc | Unicode NFKC 归一化 |
+| `third_party/cppjieba` | v5.6.7 | https://github.com/yanyiwu/cppjieba | 中文分词 |
+| `third_party/limonp` | v1.0.2 | https://github.com/yanyiwu/limonp | cppjieba 的 header-only 依赖 |
+| `third_party/googletest` | v1.15.2 | https://github.com/google/googletest | 测试（仅 `BUILD_TESTING=ON`）|
+| `third_party/benchmark` | v1.9.0 | https://github.com/google/benchmark | 微基准（仅 `BITCASK_BUILD_BENCHMARKS=ON`）|
+| `third_party/oneTBB` | v2022.0.0 | https://github.com/uxlfoundation/oneTBB | TSan 插桩版（仅 `-DBITCASK_SANITIZE=thread`）|
+
+### 获取代码与构建
+
+```bash
+# 首次 clone —— 带 submodule（.gitmodules 已配 shallow=true，浅克隆）
+git clone --recurse-submodules <repo-url>
+# 已 clone 的仓库补拉 submodule
+git submodule update --init --recursive
+```
 
 ```bash
 # Release 构建（含 LTO / -falign-functions=64）
@@ -51,7 +80,7 @@ ctest --test-dir build --output-on-failure
 ```bash
 cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug \
     -DBITCASK_SANITIZE=address,undefined -DBUILD_TESTING=ON
-# TSan 构建会自动从源码编译插桩版 oneTBB（系统 libtbb 未插桩）
+# TSan 构建用 third_party/oneTBB 源码编译插桩版（系统 libtbb 未插桩）
 cmake -S . -B build/tsan -DCMAKE_BUILD_TYPE=Debug \
     -DBITCASK_SANITIZE=thread -DBUILD_TESTING=ON
 ```
@@ -211,6 +240,7 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 ├── bench/             # Google Benchmark（keydir / cask / inverted / hnsw ...）
 ├── tools/             # migrate_le、gen_inert_table
 ├── cmake/             # BitcaskSanitizers 模块 + tsan.supp
+├── third_party/       # 第三方依赖（git submodule，见「构建依赖」）
 └── doc/               # 架构 / 格式 / 设计文档
 ```
 

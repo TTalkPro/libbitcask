@@ -1,18 +1,24 @@
 [submodule "third_party/cppjieba"]
 	path = third_party/cppjieba
 	url = https://github.com/yanyiwu/cppjieba.git
+	shallow = true
 [submodule "third_party/limonp"]
 	path = third_party/limonp
 	url = https://github.com/yanyiwu/limonp.git
+	shallow = true
 [submodule "third_party/googletest"]
 	path = third_party/googletest
 	url = https://github.com/google/googletest.git
+	shallow = true
 [submodule "third_party/benchmark"]
 	path = third_party/benchmark
 	url = https://github.com/google/benchmark.git
+	shallow = true
 [submodule "third_party/utf8proc"]
 	path = third_party/utf8proc
 	url = https://github.com/JuliaStrings/utf8proc.git
+	shallow = true
 [submodule "third_party/oneTBB"]
 	path = third_party/oneTBB
 	url = https://github.com/uxlfoundation/oneTBB.git
+	shallow = true
