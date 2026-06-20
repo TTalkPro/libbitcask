@@ -5,7 +5,7 @@
 ## 1. 问题
 
 `Cask::get()` 返回的 `GetResult` 持有 3 个 `std::vector`（value/meta/vector），
-每次 get 调用产生 2–3 次堆分配 + 2–3 次堆释放。NIF 热路径（100K+ gets/sec）
+每次 get 调用产生 2–3 次堆分配 + 2–3 次堆释放。C API 热路径（100K+ gets/sec）
 下，这些临时分配消耗大量 malloc/free 带宽和内存带宽。
 
 **当前三次拷贝链**：
@@ -15,13 +15,13 @@ pread buffer (内核)
   → DataFile::read() 返回 ReadRecord { vector<byte> key, value }     ← 拷贝 1（pread→vector）
     → decode_doc_value(rec.value) 返回 DocValueView { span text/meta/vector_raw }  ← 零拷贝
       → Cask::get() 构造 GetResult { vector<byte> value, meta, vector<float> }     ← 拷贝 2
-        → NIF make_binary_checked() 拷贝到 ErlNifBinary                            ← 拷贝 3
+        → C API translate_get_result() 拷贝到 bitcask_get_result_t                  ← 拷贝 3
 ```
 
-**目标**：消除拷贝 2（GetResult 中间层），让 NIF 直接从 ReadRecord 的 spans
-拷贝到 Erlang binary。结果：
+**目标**：消除拷贝 2（GetResult 中间层），让 C API 直接从 ReadRecord 的 spans
+拷贝到 `bitcask_get_result_t`。结果：
 
-- 拷贝次数：3 → 2（拷贝 3 不可避免——Erlang VM 管理自己的堆）
+- 拷贝次数：3 → 2（拷贝 3 不可避免——C API 返回 owned 数据供调用方使用）
 - 临时堆分配：2–3 次/get → 0 次/get
 - 内存带宽节省：~1× value + ~1× meta size/get
 
@@ -78,7 +78,7 @@ Cask::get(key)
 ```
 
 **无需 shared_ptr 的理由**：
-- 所有权链始终唯一：DataFile::read → Cask::get → NIF handler → Erlang binary 创建 → GetResultView 析构
+- 所有权链始终唯一：DataFile::read → Cask::get → C API handler → `bitcask_get_result_t` 创建 → GetResultView 析构
 - 无跨线程共享场景
 - atomic refcount 对此路径是纯开销
 
@@ -117,7 +117,7 @@ GetResultView::GetResultView(GetResultView&& other) noexcept
 
 | 方法 | 返回类型 | 语义 | 调用方 |
 |------|---------|------|--------|
-| `Cask::get(key)` | `expected<GetResultView, CaskFault>` | 零拷贝 view（热路径） | NIF handler |
+| `Cask::get(key)` | `expected<GetResultView, CaskFault>` | 零拷贝 view（热路径） | C API handler |
 | `Cask::get_owned(key)` | `expected<GetResult, CaskFault>` | 拷贝语义（向后兼容） | benchmark |
 
 `get_owned()` 内部调用 `get()` 后 `.to_owned()`：
@@ -132,43 +132,38 @@ Cask::get_owned(std::span<const std::byte> key) {
 ```
 
 **影响面**：仅 2 个调用方需更新：
-1. `nif_cask.cpp:51` — 改为消费 `GetResultView` 的 spans
+1. `c_api/bitcask_c.cpp` — 改为消费 `GetResultView` 的 spans
 2. `cask_bench.cpp:113` — 改为 `get_owned()`
 
-### 2.5 NIF 层适配
+### 2.5 C API 层适配
 
-`make_binary_checked` 已接受 `span<const byte>`，无需修改签名。
-NIF handler 直接从 view 的 spans 创建 Erlang binary：
+C API handler 直接从 view 的 spans 填充 `bitcask_get_result_t`：
 
 ```cpp
-// nif_cask.cpp — 改造后
+// c_api/bitcask_c.cpp — 改造后
 auto r = h->cask->get(as_bytes(key));   // GetResultView
-if (!r) return fault_to_term(env, r.error());
+if (!r) return translate_fault(r.error(), fault);
 
-if (h->cask->has_search()) {
-    ERL_NIF_TERM map = enif_make_new_map(env);
-    ERL_NIF_TERM text_val = make_binary_checked(env, r->value);  // span→Erlang binary
-    enif_make_map_put(env, map, atoms().text, text_val, &map);
-    ERL_NIF_TERM meta_val = r->meta.empty() ? atoms().undefined
-                                             : make_binary_checked(env, r->meta);
-    enif_make_map_put(env, map, atoms().meta, meta_val, &map);
-    return make_ok(env, map);
-}
-ERL_NIF_TERM val_bin = make_binary_checked(env, r->value);
-return make_ok(env, val_bin);
+// r->value / r->meta / r->vector 是 span,指向 ReadRecord 内部
+out->value = {r->value.data(), r->value.size()};        // 零拷贝借用
+out->meta  = {r->meta.data(),  r->meta.size()};
+out->vector = r->vector.data();
+out->vector_len = r->vector.size();
+out->tstamp = r->tstamp;
+out->ord    = r->ord;
+// GetResultView 保持存活直到 caller 调 bitcask_get_result_free
 ```
 
 **消除的拷贝**：`r->value` 和 `r->meta` 不再是 `vector<byte>`（堆分配+memcpy），
-而是直接指向 `ReadRecord::value` 内部的 spans。`make_binary_checked` 仍需一次
-`enif_alloc_binary + memcpy`（拷贝 3，不可避免），但省掉了中间的 vector 构造。
+而是直接指向 `ReadRecord::value` 内部的 spans。C API 仍需一次
+`malloc + memcpy`（拷贝 3，不可避免——调用方需要 owned 数据），但省掉了中间的 vector 构造。
 
 ### 2.6 Fold/Stream 批量 API（V6.1.4 设计预留）
 
 `next_batch(n)` 返回 `std::vector<GetResultView>`，每项持有一个独立 ReadRecord。
-单次 NIF 调用返回 n 条记录，减少 NIF 调用开销（每次 NIF 调用 ~1μs 的 BEAM
-scheduler 切换成本）。
+单次 C API 调用返回 n 条记录，减少函数调用开销。
 
-Erlang 侧新增 `stream_fold/4` wrapper，内部循环调用 `cask_fold_next_batch`
+调用方可用 `bitcask_iter_next_batch` 批量取数据，内部循环调 `CaskIter::next_batch`
 直到 EOI。
 
 ## 3. 前置条件与约束
@@ -178,7 +173,7 @@ Erlang 侧新增 `stream_fold/4` wrapper，内部循环调用 `cask_fold_next_ba
 - **ReadRecord 的 vector move 是指针窃取**——C++ 标准保证 `std::vector` 的 move
   是 O(1) pointer steal（非 SSO 场景），满足
 - **GetResultView 不可比 Cask 活得更久**——当前代码中 get() 返回的 view 在
-  同一个栈帧内消费（NIF handler），满足。ReadRecord 的数据来自 pread，
+  同一个栈帧内消费（C API handler），满足。ReadRecord 的数据来自 pread，
   不依赖 DataFile 的生命周期
 
 ## 4. 性能预期
@@ -186,7 +181,7 @@ Erlang 侧新增 `stream_fold/4` wrapper，内部循环调用 `cask_fold_next_ba
 | 指标 | 改造前 | 改造后 |
 |------|--------|--------|
 | get() 堆分配次数 | 2–3（value/meta/vector vectors） | 0 |
-| value 数据 memcpy 次数 | 2（ReadRecord→GetResult→ErlNif） | 1（ReadRecord→ErlNif） |
+| value 数据 memcpy 次数 | 2（ReadRecord→GetResult→bitcask_get_result_t） | 1（ReadRecord→bitcask_get_result_t） |
 | meta 数据 memcpy 次数 | 2 | 1 |
 | 100K gets/sec 节省 | — | ~200K–300K malloc/free + ~100MB/s 内存带宽 |
 
@@ -196,14 +191,14 @@ Erlang 侧新增 `stream_fold/4` wrapper，内部循环调用 `cask_fold_next_ba
 |---|------|------|
 | V6.1.1 | 设计文档（本文档） | — |
 | V6.1.2 | C++ `GetResultView` 定义 + `Cask::get()` 返回 view + `get_owned()` + 调用方适配 | V6.1.1 |
-| V6.1.3 | NIF `make_binary_checked` span 适配 + TSan 生命周期测试 | V6.1.2 |
-| V6.1.4 | fold/stream 批量：`Cask::next_batch(n)` + Erlang wrapper | V6.1.2 |
+| V6.1.3 | C API `bitcask_get_result_t` span 适配 + TSan 生命周期测试 | V6.1.2 |
+| V6.1.4 | fold/stream 批量：`CaskIter::next_batch(n)` + `bitcask_iter_next_batch` | V6.1.2 |
 | V6.1.5 | 基准 `BM_Cask_Get_Hot`：目标 < 90% baseline | V6.1.2 |
 
 ## 6. 不做的事
 
-- **不引入 `enif_make_resource_binary`**——Erlang VM 的 binary 路径足够快，
-  resource binary 引入 GC 交互复杂度不值得
+- **不引入 `enif_make_resource_binary`**——已不适用（Erlang NIF 已移除）。
+  C API 路径通过 `bitcask_get_result_free` 显式释放，无需 GC 交互
 - **不改变 `DataFile::read()` 签名**——ReadRecord 返回 by value 已满足需求，
   move 进 GetResultView 是零开销的
 - **不做 mmap 零拷贝**——pread → vector 的拷贝（拷贝 1）暂不优化，
