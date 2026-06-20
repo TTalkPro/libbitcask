@@ -1069,14 +1069,20 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
         }
     }
 
-    // 段 4: hnsw (type 4)。
+    // 段 4: hnsw (type 4)。V7:BCVS v2 双文件——vecs_ 先落 search.vec
+    // (save_vec_payload, atomic tmp+rename),再 serialize header 入 ckpt 段。
     if (config_.vector_dim > 0) {
         auto hnsw = hnsw_.load(std::memory_order_acquire);
         if (hnsw) {
-            std::vector<std::uint8_t> buf;
-            if (hnsw->serialize(buf)) {
-                add_u8_sec(static_cast<std::uint16_t>(sc::CkptSectionType::kHnsw),
-                           std::move(buf));
+            const std::string vec_path =
+                std::filesystem::path(fp).replace_extension(".vec").string();
+            if (hnsw->save_vec_payload(vec_path)) {
+                std::vector<std::uint8_t> buf;
+                if (hnsw->serialize(buf)) {
+                    add_u8_sec(
+                        static_cast<std::uint16_t>(sc::CkptSectionType::kHnsw),
+                        std::move(buf));
+                }
             }
         }
     }
@@ -1107,6 +1113,9 @@ SearchLayer::load_search_ckpt(std::string_view path) {
     namespace sc = bitcask::search;
     const std::string fp(path);
     const std::string prev = fp + ".prev";
+    // V7:BCVS v2 vecs_ payload 路径(与 ckpt 同目录,.vec 扩展名)。
+    const std::string vec_path =
+        std::filesystem::path(fp).replace_extension(".vec").string();
 
     auto try_load = [&](std::string_view p) -> std::optional<sc::LoadedCheckpoint> {
         return sc::SearchCheckpoint::read(p);
@@ -1206,8 +1215,16 @@ SearchLayer::load_search_ckpt(std::string_view path) {
                 auto fresh = std::make_shared<vec::HnswIndex>(cur->config());
                 auto* raw = reinterpret_cast<const std::uint8_t*>(ls.payload.data());
                 if (fresh->deserialize({raw, ls.payload.size()})) {
-                    hnsw_.store(std::move(fresh), std::memory_order_release);
-                    hnsw_loaded = true;
+                    // V7:mmap vec payload(search.vec)。inmem_int8 无 payload
+                    // (has_payload=false);否则 mmap,失败则段坏 → fold 重建。
+                    if (fresh->config().inmem_int8 ||
+                        fresh->load_vec_payload(vec_path)) {
+                        hnsw_.store(std::move(fresh),
+                                    std::memory_order_release);
+                        hnsw_loaded = true;
+                    } else {
+                        result.all_segments_ok = false;
+                    }
                 } else {
                     result.all_segments_ok = false;
                 }
