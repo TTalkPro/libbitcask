@@ -111,7 +111,7 @@ struct GetResultView {
 };
 ```
 
-`get()` 返回 view：`value`/`meta`/`vector` 是借用内部 pread 缓冲的 span，**生命周期与 `GetResultView` 绑定**。NIF/即时消费场景零拷贝；需持久化用 `get_owned()` 或 `to_owned()`。量化文档无法零拷贝成 f32，引擎内部 dequant 进自有缓冲。
+`get()` 返回 view：`value`/`meta`/`vector` 是借用内部 pread 缓冲的 span，**生命周期与 `GetResultView` 绑定**。即时消费场景零拷贝；需持久化用 `get_owned()` 或 `to_owned()`。量化文档无法零拷贝成 f32，引擎内部 dequant 进自有缓冲。
 
 ### 4.2 `GetResult`（owned 读结果）
 
@@ -338,7 +338,7 @@ void set_synonym_map(std::unique_ptr<text::SynonymMap> map);
 
 ```cpp
 bool has_search() const;             // 是否启用索引模式
-search::SearchLayer* search();       // 访问内部 SearchLayer（NIF 层用）
+search::SearchLayer* search();       // 访问内部 SearchLayer（高级用法 / C API 层用）
 void flush_index();                  // 排空异步索引队列
 ```
 
@@ -455,7 +455,7 @@ bool is_iterating() const noexcept;
 
 ## 7. 检索子系统
 
-`Cask::search()` 返回内部 `SearchLayer` 指针（NIF 层或高级用法访问）。普通用户经 `Cask` 的 `search_*` 方法间接使用。
+`Cask::search()` 返回内部 `SearchLayer` 指针（高级用法或 C API 层访问）。普通用户经 `Cask` 的 `search_*` 方法间接使用。
 
 ### 7.1 `search::SearchLayerConfig`
 

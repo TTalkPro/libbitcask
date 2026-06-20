@@ -1,6 +1,6 @@
 # C API 参考（C Wrapper）
 
-本文档是 libbitcask C ABI 的完整参考，面向跨语言 FFI 绑定作者（Python / Rust / Go / Erlang 等）。权威来源为 `c_api/bitcask_c.h`。配套阅读：[`api-cpp.md`](api-cpp.md)（被包装的 C++ 接口）、[`cpp-arch.md`](cpp-arch.md)（架构）。
+本文档是 libbitcask C ABI 的完整参考，面向跨语言 FFI 绑定作者（Python / Rust / Go / Node 等）。权威来源为 `c_api/bitcask_c.h`。配套阅读：[`api-cpp.md`](api-cpp.md)（被包装的 C++ 接口）、[`cpp-arch.md`](cpp-arch.md)（架构）。
 
 C API 是 C++ `bitcask::Cask` 的薄包装，符号导出由 `BITCASK_API` 宏控制，编译为 `libbitcask.so`（`SOVERSION=1`）。
 
