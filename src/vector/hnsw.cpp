@@ -13,6 +13,12 @@
 #include <queue>
 #include <string>
 
+// V7:BCVS v2 payload 文件 mmap(只读 MAP_SHARED + madvise RANDOM)。
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
 #endif
@@ -286,8 +292,8 @@ std::atomic<std::uint64_t> g_instance_seq{1};
 
 }  // namespace
 
-HnswIndex::NodeChunk::NodeChunk(std::size_t dim, bool inmem_int8)
-    : vecs(inmem_int8 ? 0 : static_cast<std::size_t>(kChunkSize) * dim),
+HnswIndex::NodeChunk::NodeChunk(std::size_t dim, bool needs_vecs)
+    : vecs(needs_vecs ? static_cast<std::size_t>(kChunkSize) * dim : 0),
       ords(kChunkSize, 0),
       levels(kChunkSize, 0),
       adj(kChunkSize),
@@ -334,6 +340,18 @@ std::span<const float> HnswIndex::node_vec(std::uint32_t id) const {
 }
 
 HnswIndex::~HnswIndex() {
+    // V7:mmap payload 先于 chunk 释放——mmap 区域只读、生命周期与 fd 绑定,
+    // close fd 前 munmap 防止其他进程拿同一文件 mmap 时 kernel 行为未定义。
+    if (vecs_mmap_raw_ != nullptr) {
+        ::munmap(vecs_mmap_raw_, vecs_mmap_len_);
+        vecs_mmap_raw_  = nullptr;
+        vecs_mmap_base_ = nullptr;
+        vecs_mmap_len_  = 0;
+    }
+    if (vecs_payload_fd_ >= 0) {
+        ::close(vecs_payload_fd_);
+        vecs_payload_fd_ = -1;
+    }
     for (auto& slot : chunks_) {
         delete slot.load(std::memory_order_relaxed);
     }
@@ -635,8 +653,14 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     assert(ci < kMaxChunks && "HnswIndex capacity exceeded (kMaxChunks)");
     NodeChunk* c = chunks_[ci].load(std::memory_order_relaxed);
     if (c == nullptr) {
-        c = new NodeChunk(cfg_.dim, cfg_.inmem_int8);
+        c = new NodeChunk(cfg_.dim, !cfg_.inmem_int8);
         chunks_[ci].store(c, std::memory_order_release);
+    } else if (!cfg_.inmem_int8 && c->vecs.empty()) {
+        // checkpoint 加载的 chunk(needs_vecs=false)首次插入热数据:
+        // 懒分配 vecs_。单写者协议下安全(count_.store 在后,读者看不到
+        // 未就绪节点);首帧 assign 无旧指针可失效。
+        c->vecs.assign(
+            static_cast<std::size_t>(kChunkSize) * cfg_.dim, 0.0f);
     }
     const std::uint32_t slot = id & kChunkMask;
 
@@ -647,8 +671,10 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     if (level > 31) level = 31;
 
     // 1) 写满本节点数据:vec/ord/level + 零初始化邻接块。
-    // P5:int8-only 不存常驻 f32(vecs 容量 0),只落量化副本——建图/查询
-    // 全程 int8。默认 f32+int8 路径不变:存 f32,VNNI 在时附带量化副本粗筛。
+    // P5:int8-only 不存常驻 f32,只落量化副本——建图/查询全程 int8。默认
+    // f32+int8 路径不变:vecs_ 走 hot_vecs_,VNNI 在时附带量化副本粗筛。
+    // V7:vecs_ 已从 NodeChunk 移出——checkpoint 加载的 vecs 由 mmap 覆盖,
+    // 新插入追加 hot_vecs_;vec_of(id) 统一路由两者。
     if (cfg_.inmem_int8) {
         auto qv = int8::quantize(vec.data(), cfg_.dim);
         std::memcpy(c->qcodes.data() +
@@ -658,7 +684,10 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
         c->qscales[slot] = qv.scale;
         c->qsums[slot]   = qv.sum_codes;
     } else {
-        std::memcpy(c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim,
+        // V7:vecs_ 走 NodeChunk::vecs(定容;仅 hot chunk 分配)。
+        // checkpoint flush 时 save_vec_payload 合并 mmap + chunk vecs 写新 payload。
+        std::memcpy(c->vecs.data() +
+                        static_cast<std::size_t>(slot) * cfg_.dim,
                     vec.data(),
                     static_cast<std::size_t>(cfg_.dim) * sizeof(float));
         // V4.2:同步落 int8 量化副本。int8 路径存在时(VNNI)下游 search 用
@@ -699,9 +728,9 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
 
     // P5:int8-only 用本节点量化副本作建图 query(无常驻 f32);默认用 f32。
     const bool i8 = cfg_.inmem_int8;
-    const float* q =
-        i8 ? nullptr
-           : c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim;
+    // V7:vecs_ 已走 hot_vecs_;vec_of(id) 路由(< checkpoint_count_ → mmap,
+    // ≥ → hot_vecs_)。本节点是刚插入的 id,hot_vecs_ 末尾正是其 vec。
+    const float* q = i8 ? nullptr : vec_of(id);
     const std::int8_t* qc = i8 ? qcodes_of(id) : nullptr;
     const float        qs = i8 ? qscale_of(id) : 0.0f;
     const std::int32_t qsum = i8 ? qsum_of(id) : 0;
@@ -837,6 +866,22 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
         // 默认 f32+int8:对 top k*3 做 f32 精排,召回对齐纯 f32。
         if (!cfg_.inmem_int8) {
             const std::size_t rerank_n = std::min(found.size(), k * 3);
+            // V7:mmap'd vecs_ 预取——sort 前 madvise(WILLNEED) top 候选页,
+            // 内核异步 page-in,延迟藏在 sort 比较后面(O(N log k) 次 dist_id)。
+            if (vecs_mmap_base_ != nullptr) {
+                const std::size_t vec_bytes =
+                    static_cast<std::size_t>(cfg_.dim) * sizeof(float);
+                const std::size_t prefetch_n =
+                    std::min(found.size(), rerank_n);
+                for (std::size_t i = 0; i < prefetch_n; ++i) {
+                    const std::uint32_t id = found[i].second;
+                    if (id < checkpoint_count_) {
+                        const void* v = vec_of(id);
+                        ::madvise(const_cast<void*>(v), vec_bytes,
+                                  MADV_WILLNEED);
+                    }
+                }
+            }
             std::partial_sort(found.begin(), found.begin() + rerank_n,
                               found.end(),
                               [this, q](const auto& a, const auto& b) {
@@ -865,18 +910,37 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
     return hits;
 }
 
-// ---- V3.5:BCVS v1 快照(协议注释见 hnsw.hpp;格式见设计 §5)----
+// ---- V7:BCVS v2 快照(协议注释见 hnsw.hpp;格式见设计 §5)----
 //
-// payload 布局(LE):
-//   dim u16 | metric u8 | M u32 | ef_construction u32 | seed u64
-//   count u32 | entry_meta u64 | max_inserted_ord u64
-//   count 个节点(节点 id 即写出顺序 0..count-1,邻接 id 引用该编号):
-//     ord u64 | level u8 | vec f32×dim | (level+1) 层: cnt u32 | cnt×u32 id
+// 双文件模型:search.ckpt 的 kHnsw 段嵌入 BVH2 头(qcodes/adj/ords/levels +
+// entry/count + flags),search.vec 单独 mmap(BCVP,vecs_ f32 字节流 + 每 4KB
+// 页 CRC32)。写入顺序 save_vec_payload → serialize → SearchCheckpoint::write;
+// 读出顺序 fread(.ckpt) → deserialize → load_vec_payload(.vec)。
+//
+// BVH2 segment 布局(LE,嵌 search.ckpt kHnsw 段内):
+//   magic "BVH2" (4) | version u32=2 (4) | flags u32 (4) | dim u16 (2) |
+//   metric u8 (1) | M u32 (4) | efc u32 (4) | seed u64 (8) | count u32 (4) |
+//   entry_meta u64 (8) | max_ord u64 (8)
+//   --- per-node (id=0..count-1) ---
+//     ord u64 | level u8 | qcodes int8[dim] | qscale f32 | qsum i32
+//     for l=0..level: cnt u32 | neighbors[cnt] u32
+//   --- end ---
+//   crc32 u32 (covers magic..last_neighbor)
 
 namespace {
 
-constexpr std::uint32_t kBcvsMagic   = 0x42435653;  // "BCVS"
-constexpr std::uint32_t kBcvsVersion = 1;
+// V7:BCVS v2 段头 magic/version(search.ckpt kHnsw 段内嵌)。
+constexpr std::uint32_t kBcvhMagic   = 0x32485642;  // "BVH2" (LE)
+constexpr std::uint32_t kBcvhVersion = 2;
+
+// V7:BCVS v2 payload 文件(独立 .vec)magic/version。
+constexpr char          kBcvpMagic[4] = {'B', 'C', 'V', 'P'};
+constexpr std::uint32_t kBcvpVersion = 1;
+// BCVP 头 64 字节(数据 46B + 14B 填充 + 4B header_crc,凑 2 的幂好对齐)。
+constexpr std::size_t   kBcvpHeaderSize  = 64;
+constexpr std::uint32_t kBcvpPageSize    = 4096;
+// header_crc 在 header 末尾 4 字节,覆盖 [0, header_crc_offset)。
+constexpr std::uint32_t kBcvpHeaderCrcOff = kBcvpHeaderSize - 4;
 
 void vs_put16(std::vector<std::uint8_t>& b, std::uint16_t v) {
     const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
@@ -893,6 +957,183 @@ void vs_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
 
 }  // namespace
 
+// V7:BCVP payload 文件 = 头 + 每 4KB 页 CRC32 表 + 页对齐 vecs 数据。
+// tmp + rename 原子写;inmem_int8 模式无 vecs_,save_vec_payload 是 no-op。
+bool HnswIndex::save_vec_payload(std::string_view path) const {
+    if (cfg_.inmem_int8) return true;  // 无常驻 f32 → 无 .vec 文件
+    const std::uint32_t n = count_.load(std::memory_order_acquire);
+    const std::string fp(path);
+
+    const std::size_t vec_bytes =
+        static_cast<std::size_t>(cfg_.dim) * sizeof(float);
+    const std::size_t total_vecs =
+        static_cast<std::size_t>(n) * vec_bytes;
+    const std::uint32_t crc_count =
+        total_vecs == 0
+            ? 0u
+            : static_cast<std::uint32_t>((total_vecs + kBcvpPageSize - 1) /
+                                         kBcvpPageSize);
+
+    // vecs_off:头后接 CRC 表,非空数据需页对齐;空数据保留在 header 末尾。
+    std::size_t vecs_off =
+        kBcvpHeaderSize + static_cast<std::size_t>(crc_count) * 4;
+    if (total_vecs > 0) {
+        vecs_off = (vecs_off + kBcvpPageSize - 1) &
+                   ~(static_cast<std::size_t>(kBcvpPageSize) - 1);
+    }
+    const std::size_t total_size = vecs_off + total_vecs;
+
+    std::vector<std::uint8_t> buf(total_size, 0);
+    // magic "BCVP"
+    buf[0] = kBcvpMagic[0]; buf[1] = kBcvpMagic[1];
+    buf[2] = kBcvpMagic[2]; buf[3] = kBcvpMagic[3];
+    std::memcpy(buf.data() + 4,  &kBcvpVersion,    4);
+    std::memcpy(buf.data() + 8,  &cfg_.dim,        2);
+    std::memcpy(buf.data() + 10, &n,               4);
+    const std::uint64_t watermark = max_inserted_ord_.load(
+        std::memory_order_relaxed);
+    std::memcpy(buf.data() + 14, &watermark,       8);
+    std::memcpy(buf.data() + 22, &kBcvpPageSize,   4);
+    std::memcpy(buf.data() + 26, &vecs_off,        8);
+    std::memcpy(buf.data() + 34, &total_vecs,      8);
+    std::memcpy(buf.data() + 42, &crc_count,       4);
+    // bytes 46..59:保留为 0(初始化已零);header_crc 落在 offset 60-63。
+    const std::uint32_t header_crc = bitcask::codec::crc32(
+        std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(buf.data()),
+            kBcvpHeaderCrcOff));
+    std::memcpy(buf.data() + kBcvpHeaderCrcOff, &header_crc, 4);
+
+    // vecs 数据区:从 vec_of() 拷贝。mmap 段与 hot_vecs_ 段都由 vec_of 路由。
+    for (std::uint32_t id = 0; id < n; ++id) {
+        const float* v = vec_of(id);
+        std::memcpy(buf.data() + vecs_off + static_cast<std::size_t>(id) * vec_bytes,
+                    v, vec_bytes);
+    }
+
+    // 每页 CRC32(覆盖实际数据尾页可能 < 4KB)。
+    const std::size_t crc_off = kBcvpHeaderSize;
+    for (std::uint32_t p = 0; p < crc_count; ++p) {
+        const std::size_t off = vecs_off + static_cast<std::size_t>(p) * kBcvpPageSize;
+        const std::size_t len =
+            std::min(static_cast<std::size_t>(kBcvpPageSize),
+                     total_vecs - static_cast<std::size_t>(p) * kBcvpPageSize);
+        const std::uint32_t crc = bitcask::codec::crc32(
+            std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(buf.data() + off), len));
+        std::memcpy(buf.data() + crc_off + static_cast<std::size_t>(p) * 4,
+                    &crc, 4);
+    }
+
+    const std::string tmp = fp + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    const bool wrote =
+        std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+    std::fclose(f);
+    if (!wrote || std::rename(tmp.c_str(), fp.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+// V7:mmap .vec payload。PRECONDITION:deserialize() 已设 count_/cfg_。校验
+// magic/version/dim/count 与 cfg_ 一致;设 vecs_mmap_* / checkpoint_count_。
+bool HnswIndex::load_vec_payload(std::string_view path) {
+    if (cfg_.inmem_int8) return true;  // 无 payload,语义上 no-op
+
+    const std::string fp(path);
+    int fd = ::open(fp.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+
+    // 已持有 mmap 时先拆——契约要求 load 前为空(load 由 open 期单线程串入)。
+    if (vecs_mmap_raw_ != nullptr) {
+        ::munmap(vecs_mmap_raw_, vecs_mmap_len_);
+        vecs_mmap_raw_  = nullptr;
+        vecs_mmap_base_ = nullptr;
+        vecs_mmap_len_  = 0;
+    }
+    if (vecs_payload_fd_ >= 0) {
+        ::close(vecs_payload_fd_);
+        vecs_payload_fd_ = -1;
+    }
+
+    std::uint8_t hdr[kBcvpHeaderSize];
+    if (::read(fd, hdr, kBcvpHeaderSize) !=
+        static_cast<ssize_t>(kBcvpHeaderSize)) {
+        ::close(fd);
+        return false;
+    }
+    if (hdr[0] != kBcvpMagic[0] || hdr[1] != kBcvpMagic[1] ||
+        hdr[2] != kBcvpMagic[2] || hdr[3] != kBcvpMagic[3]) {
+        ::close(fd);
+        return false;
+    }
+    std::uint32_t version;
+    std::memcpy(&version, hdr + 4, 4);
+    if (version != kBcvpVersion) {
+        ::close(fd);
+        return false;
+    }
+    std::uint16_t dim;
+    std::memcpy(&dim, hdr + 8, 2);
+    std::uint32_t count;
+    std::memcpy(&count, hdr + 10, 4);
+    std::uint64_t vecs_off_u64;
+    std::memcpy(&vecs_off_u64, hdr + 26, 8);
+    std::uint64_t vecs_len_u64;
+    std::memcpy(&vecs_len_u64, hdr + 34, 8);
+
+    // 与 deserialize() 状态交叉校验。
+    const std::uint32_t n = count_.load(std::memory_order_relaxed);
+    if (dim != cfg_.dim || count != n || vecs_len_u64 !=
+        static_cast<std::uint64_t>(n) *
+            static_cast<std::uint64_t>(cfg_.dim) * 4u) {
+        ::close(fd);
+        return false;
+    }
+
+    // header_crc
+    std::uint32_t stored_hdr_crc;
+    std::memcpy(&stored_hdr_crc, hdr + kBcvpHeaderCrcOff, 4);
+    const std::uint32_t calc_hdr_crc = bitcask::codec::crc32(
+        std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(hdr), kBcvpHeaderCrcOff));
+    if (stored_hdr_crc != calc_hdr_crc) {
+        ::close(fd);
+        return false;
+    }
+
+    // 文件大小校验(vecs_off + vecs_len 不能超出文件)。
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+        ::close(fd);
+        return false;
+    }
+    const std::size_t file_size = static_cast<std::size_t>(st.st_size);
+    if (file_size < vecs_off_u64 + vecs_len_u64) {
+        ::close(fd);
+        return false;
+    }
+    // count=0 时文件可能仅 header(无 vecs 段),mmap 整个文件即可。
+    void* raw = ::mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (raw == MAP_FAILED) {
+        ::close(fd);
+        return false;
+    }
+
+    vecs_mmap_raw_   = raw;
+    vecs_mmap_base_  = reinterpret_cast<const float*>(
+        static_cast<std::byte*>(raw) + vecs_off_u64);
+    vecs_mmap_len_   = file_size;
+    vecs_payload_fd_ = fd;  // fd 持有至 mmap 生命周期末(destructor close)
+    checkpoint_count_ = n;
+    // 随机访问模式:稀疏读,预取收益小,直接 MADV_RANDOM。
+    ::madvise(raw, file_size, MADV_RANDOM);
+    return true;
+}
+
 bool HnswIndex::serialize(std::vector<std::uint8_t>& buf) const {
     // 读者协议快照:entry 先于 count(同 search;entry 发布 happens-after
     // 其 count 发布)。n 之后追加的节点/反向边一律不进本快照。
@@ -904,11 +1145,14 @@ bool HnswIndex::serialize(std::vector<std::uint8_t>& buf) const {
     }
 
     buf.clear();
+    // 粗估:头 64B + 每节点 17+dim + 邻接上限 ~ (1+M*2)*4*(level+1)
     buf.reserve(64 + static_cast<std::size_t>(n) *
-                         (16 + static_cast<std::size_t>(cfg_.dim) * 4 +
-                          (1 + cfg_.M * 2) * 4));
-    vs_put32(buf, kBcvsMagic);
-    vs_put32(buf, kBcvsVersion);
+                         (24 + static_cast<std::size_t>(cfg_.dim) +
+                          (1 + cfg_.M * 2) * 4 * 8));
+    vs_put32(buf, kBcvhMagic);
+    vs_put32(buf, kBcvhVersion);
+    const std::uint32_t flags = cfg_.inmem_int8 ? 0u : 1u;  // bit 0 = has_payload
+    vs_put32(buf, flags);
     vs_put16(buf, cfg_.dim);
     buf.push_back(static_cast<std::uint8_t>(cfg_.metric));
     vs_put32(buf, cfg_.M);
@@ -921,29 +1165,24 @@ bool HnswIndex::serialize(std::vector<std::uint8_t>& buf) const {
     vs_put64(buf, n > 0 ? ord_of(n - 1) : static_cast<std::uint64_t>(-1));
 
     std::vector<std::uint32_t> scratch(1 + cfg_.M * 2);
+    const std::size_t qbytes =
+        static_cast<std::size_t>(cfg_.dim) * sizeof(std::int8_t);
     for (std::uint32_t id = 0; id < n; ++id) {
         const NodeChunk* c = chunk_of(id);
         const std::uint32_t slot = id & kChunkMask;
         vs_put64(buf, c->ords[slot]);
         const std::uint8_t level = c->levels[slot];
         buf.push_back(level);
-        // P5:BCVS v1 盘上恒存 f32(格式不变)。int8-only 无常驻 f32 →
-        // 从量化副本反量化写出;load 再量化回。盘上存 int8 的优化留 P5b。
-        if (cfg_.inmem_int8) {
-            const std::int8_t* codes =
-                c->qcodes.data() + static_cast<std::size_t>(slot) * cfg_.dim;
-            const float factor = c->qscales[slot] / 127.0f;
-            for (std::uint32_t d = 0; d < cfg_.dim; ++d) {
-                const float fv = static_cast<float>(codes[d]) * factor;
-                const auto* fp = reinterpret_cast<const std::uint8_t*>(&fv);
-                buf.insert(buf.end(), fp, fp + sizeof(float));
-            }
-        } else {
-            const auto* v = reinterpret_cast<const std::uint8_t*>(
-                c->vecs.data() + static_cast<std::size_t>(slot) * cfg_.dim);
-            buf.insert(buf.end(), v,
-                       v + static_cast<std::size_t>(cfg_.dim) * sizeof(float));
-        }
+        // V7:直存 qcodes/qscale/qsum——省启动量化 pass(V1 是读盘后量化)。
+        const std::int8_t* qcodes =
+            c->qcodes.data() + static_cast<std::size_t>(slot) * cfg_.dim;
+        buf.insert(buf.end(),
+                   reinterpret_cast<const std::uint8_t*>(qcodes),
+                   reinterpret_cast<const std::uint8_t*>(qcodes) + qbytes);
+        const auto* sp = reinterpret_cast<const std::uint8_t*>(&c->qscales[slot]);
+        buf.insert(buf.end(), sp, sp + sizeof(float));
+        const auto* zp = reinterpret_cast<const std::uint8_t*>(&c->qsums[slot]);
+        buf.insert(buf.end(), zp, zp + sizeof(std::int32_t));
         for (std::uint32_t l = 0; l <= level; ++l) {
             // 持节点锁拷邻接(与并发写者互斥);≥ n 的邻居(快照水位外的
             // 反向边)滤掉,保证文件内不变量 id < count。
@@ -959,30 +1198,37 @@ bool HnswIndex::serialize(std::vector<std::uint8_t>& buf) const {
         }
     }
 
+    // CRC 覆盖 magic..last_neighbor,即整个 buf 减去尾部 4 字节 CRC。
     const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
-        reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 8));
+        reinterpret_cast<const std::byte*>(buf.data()), buf.size()));
     vs_put32(buf, crc);
     return true;
 }
 
-bool HnswIndex::save(std::string_view path) const {
+bool HnswIndex::save(std::string_view base_path) const {
+    // V7:双文件——.vec 是 payload,.ckpt 是头。先 payload 后头:若 .ckpt 写
+    // 成功而 .vec 缺失,load 端按 has_payload 拒收;反之 .vec 孤儿文件由
+    // 下次 save 覆盖。
+    const std::string bp(base_path);
+    const std::string vec_path = bp + ".vec";
+    if (!save_vec_payload(vec_path)) return false;
     std::vector<std::uint8_t> buf;
     if (!serialize(buf)) return false;
-    const std::string fp(path);
-    const std::string tmp = fp + ".tmp";
+    const std::string tmp = bp + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) return false;
     const bool wrote = std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
     std::fclose(f);
-    if (!wrote || std::rename(tmp.c_str(), fp.c_str()) != 0) {
+    if (!wrote || std::rename(tmp.c_str(), bp.c_str()) != 0) {
         std::remove(tmp.c_str());
         return false;
     }
     return true;
 }
 
-bool HnswIndex::load(std::string_view path) {
-    std::FILE* f = std::fopen(std::string(path).c_str(), "rb");
+bool HnswIndex::load(std::string_view base_path) {
+    const std::string bp(base_path);
+    std::FILE* f = std::fopen(bp.c_str(), "rb");
     if (!f) return false;
     std::fseek(f, 0, SEEK_END);
     const long fsz = std::ftell(f);
@@ -992,7 +1238,13 @@ bool HnswIndex::load(std::string_view path) {
     const bool rd = std::fread(buf.data(), 1, buf.size(), f) == buf.size();
     std::fclose(f);
     if (!rd) return false;
-    return deserialize(buf);
+    if (!deserialize(buf)) return false;
+    // V7:deserialize 之后装 payload。inmem_int8 或 count=0 不读 .vec。
+    if (!cfg_.inmem_int8 && count_.load(std::memory_order_relaxed) > 0) {
+        const std::string vec_path = bp + ".vec";
+        if (!load_vec_payload(vec_path)) return false;
+    }
+    return true;
 }
 
 bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
@@ -1007,20 +1259,23 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
     for (auto& slot : chunks_) {
         delete slot.exchange(nullptr, std::memory_order_relaxed);
     }
+    checkpoint_count_ = 0;
 
-    // 最小:magic+ver+header(39)+crc。
-    if (buf.size() < 51) return false;
+    // 最小:magic(4)+ver(4)+flags(4)+header(39)+至少一个空邻接(4)+crc(4)。
+    if (buf.size() < 51 + 4 + 4) return false;
 
     auto rd32at = [&](std::size_t off) {
         std::uint32_t v;
         std::memcpy(&v, buf.data() + off, 4);
         return v;
     };
-    if (rd32at(0) != kBcvsMagic || rd32at(4) != kBcvsVersion) return false;
+    if (rd32at(0) != kBcvhMagic || rd32at(4) != kBcvhVersion) return false;
+
     std::uint32_t stored_crc = 0;
     std::memcpy(&stored_crc, buf.data() + buf.size() - 4, 4);
+    // CRC 覆盖 magic..last_neighbor(整个 buf 减去尾部 4 字节)。
     const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
-        reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 12));
+        reinterpret_cast<const std::byte*>(buf.data()), buf.size() - 4));
     if (crc != stored_crc) return false;
 
     const std::uint8_t* p   = buf.data() + 8;
@@ -1029,6 +1284,10 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         return static_cast<std::size_t>(end - p) >= nb;
     };
 
+    std::uint32_t flags;
+    std::memcpy(&flags, p, 4); p += 4;
+    const bool has_payload = (flags & 1u) != 0;  // 留档,校验交由 load 路径
+    (void)has_payload;
     std::uint16_t dim;
     std::memcpy(&dim, p, 2); p += 2;
     const std::uint8_t metric = *p++;
@@ -1054,6 +1313,9 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         if (em != 0 || max_ord != static_cast<std::uint64_t>(-1) || p != end) {
             return false;
         }
+        max_inserted_ord_.store(max_ord, std::memory_order_relaxed);
+        entry_meta_.store(em, std::memory_order_relaxed);
+        count_.store(cnt, std::memory_order_release);
         return true;
     }
     const auto entry_id    = static_cast<std::uint32_t>(em & 0xFFFFFFFFu);
@@ -1062,23 +1324,20 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         return false;
     }
 
-    const std::size_t vec_bytes =
-        static_cast<std::size_t>(cfg_.dim) * sizeof(float);
-    // P5:int8-only 读盘 f32 → 量化进 qcodes 的对齐暂存(逐节点复用)。
-    std::vector<float> tmpvec;
-    if (cfg_.inmem_int8) tmpvec.resize(cfg_.dim);
+    const std::size_t qbytes =
+        static_cast<std::size_t>(cfg_.dim) * sizeof(std::int8_t);
     std::uint64_t prev_ord = 0;
     bool have_prev = false;
     for (std::uint32_t id = 0; id < cnt; ++id) {
         const std::uint32_t ci = id >> kChunkBits;
         NodeChunk* c = chunks_[ci].load(std::memory_order_relaxed);
         if (c == nullptr) {
-            c = new NodeChunk(cfg_.dim, cfg_.inmem_int8);
+        c = new NodeChunk(cfg_.dim, false);
             chunks_[ci].store(c, std::memory_order_relaxed);
         }
         const std::uint32_t slot = id & kChunkMask;
 
-        if (!need(9 + vec_bytes)) return false;
+        if (!need(13 + qbytes)) return false;
         std::uint64_t ord;
         std::memcpy(&ord, p, 8); p += 8;
         // ord 严格递增是写者不变量(插入序分配),也是水位幂等的前提。
@@ -1087,22 +1346,15 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         have_prev = true;
         const std::uint8_t level = *p++;
         if (level > 31) return false;
-        if (cfg_.inmem_int8) {
-            // 无常驻 f32:读 f32(memcpy 防未对齐)→ 量化进 qcodes。
-            std::memcpy(tmpvec.data(), p, vec_bytes);
-            auto qv = int8::quantize(tmpvec.data(), cfg_.dim);
-            std::memcpy(c->qcodes.data() +
-                            static_cast<std::size_t>(slot) * cfg_.dim,
-                        qv.codes.data(),
-                        static_cast<std::size_t>(cfg_.dim) * sizeof(std::int8_t));
-            c->qscales[slot] = qv.scale;
-            c->qsums[slot]   = qv.sum_codes;
-        } else {
-            std::memcpy(c->vecs.data() +
-                            static_cast<std::size_t>(slot) * cfg_.dim,
-                        p, vec_bytes);
-        }
-        p += vec_bytes;
+        // V7:直读 qcodes(免去 V1 的启动量化 pass)。
+        std::memcpy(c->qcodes.data() +
+                        static_cast<std::size_t>(slot) * cfg_.dim,
+                    p, qbytes);
+        p += qbytes;
+        std::memcpy(&c->qscales[slot], p, sizeof(float));
+        p += sizeof(float);
+        std::memcpy(&c->qsums[slot],   p, sizeof(std::int32_t));
+        p += sizeof(std::int32_t);
         c->ords[slot]   = ord;
         c->levels[slot] = level;
         const std::size_t slots =
@@ -1154,27 +1406,6 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
 
     max_inserted_ord_.store(max_ord, std::memory_order_relaxed);
     entry_meta_.store(em, std::memory_order_relaxed);
-    // V4.2:从 f32 副本重算 int8 量化。BCVS v1 不持久化量化副本——量化是
-    // 确定的(f32 输入 → 同一组 int8 codes),重算开销与全图加载同阶,免去
-    // 格式升级/兼容成本。仅 kDot + VNNI 路径需要;kL2/无 VNNI 跳过。
-    // P5:int8-only 已在读盘循环内量化(无常驻 f32 可重读),此处跳过。
-    if (!cfg_.inmem_int8 && int8_dot_ != nullptr &&
-        cfg_.metric == HnswMetric::kDot && cnt > 0) {
-        for (std::uint32_t id = 0; id < cnt; ++id) {
-            NodeChunk* c = chunks_[id >> kChunkBits].load(
-                std::memory_order_relaxed);
-            const std::uint32_t slot = id & kChunkMask;
-            const float* v = c->vecs.data() +
-                             static_cast<std::size_t>(slot) * cfg_.dim;
-            auto qv = int8::quantize(v, cfg_.dim);
-            std::memcpy(c->qcodes.data() +
-                            static_cast<std::size_t>(slot) * cfg_.dim,
-                        qv.codes.data(),
-                        static_cast<std::size_t>(cfg_.dim) * sizeof(std::int8_t));
-            c->qscales[slot] = qv.scale;
-            c->qsums[slot]   = qv.sum_codes;
-        }
-    }
     count_.store(cnt, std::memory_order_release);
     return true;
 }

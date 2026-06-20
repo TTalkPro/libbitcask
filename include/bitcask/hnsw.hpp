@@ -113,29 +113,35 @@ public:
     // rebuild_hnsw 单写者即时消费,下次调用前已被 insert 拷走)。
     [[nodiscard]] std::span<const float> node_vec(std::uint32_t id) const;
 
-    // ---- V3.5:快照持久化(BCVS v1,设计 doc/hnsw-design-zh.md §5)----
-    // 外壳与 BCKS/BCIS 同款:[magic "BCVS"][ver u32=1][payload][crc32(payload)],
-    // tmp+rename 原子落盘。payload 存完整图(向量+邻接+entry)——重插的
-    // 距离计算才是开库慢的大头,只存向量等于没省。
+    // ---- V7:BCVS v2 快照(header in search.ckpt + vecs_ in search.vec mmap)----
     //
-    // save:线程安全(遵守读者协议:entry/count acquire 快照 + per-node 锁
-    // 拷邻接,≥ 快照水位的邻居 id 一律滤掉)。落盘的 max_inserted_ord 取
-    // **已保存节点的最大 ord**(= ord_of(n-1)),而非 max_inserted_ord_ 原子
-    // ——后者在写者 mid-insert 时可能领先于 count 发布,照抄会让重开后的
-    // 水位幂等错杀该文档的尾部回放。静止点(close/merge flush 后)两者相等。
-    [[nodiscard]] bool save(std::string_view path) const;
-    // P14e:序列化到字节缓冲(供 search.ckpt 分段嵌入);返回 false 同 save
-    // 的"活跃 fold/不一致"放弃。盘字节与 save() 完全一致(自带 BCVS 框架)。
+    // 双文件模型:search.ckpt 的 kHnsw 段存 header(qcodes/adj/ords/levels +
+    // entry/count),search.vec 存 vecs_ f32 字节流(mmap 只读)。写入顺序:
+    // save_vec_payload → serialize → SearchCheckpoint::write,任一步崩溃由
+    // watermark + CRC 校验回退 fold 重建。inmem_int8 模式下 has_payload=false,
+    // 不产生 search.vec(无常驻 f32)。
+    //
+    // save_vec_payload:把 vecs_[0..count_) 写入 payload 文件。BCVP 格式:
+    // header(48B) + 每 4KB 页 CRC32 表 + 页对齐 vecs 数据区。tmp+rename 原子。
+    [[nodiscard]] bool save_vec_payload(std::string_view path) const;
+    // load_vec_payload:mmap payload 文件。MAP_SHARED 只读 + madvise(RANDOM)。
+    // PRECONDITION:deserialize() 已设 count_/dim;本调用设置 vecs_mmap_base_/
+    // checkpoint_count_。校验 header 的 dim/count/header_crc,不符返回 false。
+    [[nodiscard]] bool load_vec_payload(std::string_view path);
+
+    // serialize:V2 header → buf(供 search.ckpt kHnsw 段嵌入)。
+    // 含 qcodes/qscales/qsums 直存 + has_payload 标志 + payload 基本元信息
+    // (dim/count/watermark 供 load_vec_payload 交叉校验)。不含 vecs_ 字节。
     [[nodiscard]] bool serialize(std::vector<std::uint8_t>& out) const;
-    // load:仅 open 期单线程调用(空图上,不可与任何读写并发)。校验:
-    // config(dim/metric/M)一致、邻居/entry id < count、level/cnt 不超容、
-    // ord 严格递增、邻居层数覆盖(layer-l 表只允许 level ≥ l 的节点,防
-    // copy_neighbors 越块读)——任何违例**整体拒绝**返回 false(本实例
-    // 报废,调用方弃之换全量 fold;绝不半载示人)。
-    [[nodiscard]] bool load(std::string_view path);
-    // P14e:从字节缓冲反序列化(search.ckpt 段)。语义同 load:仅空图调用,
-    // 任何校验违例整体拒绝返回 false。
+    // deserialize:V2 header buf → 内存结构。设置 qcodes/adj/entry/count/
+    // max_inserted_ord。不 mmap payload;调用方随后 load_vec_payload()。
     [[nodiscard]] bool deserialize(std::span<const std::uint8_t> bytes);
+
+    // save/load:独立文件便捷 wrapper(测试用)。save = save_vec_payload +
+    //   serialize → fwrite;load = fread → deserialize → load_vec_payload。
+    //   base_path.ckpt = header,base_path.vec = payload。
+    [[nodiscard]] bool save(std::string_view base_path) const;
+    [[nodiscard]] bool load(std::string_view base_path);
 
 private:
     static constexpr std::uint32_t kChunkBits = 16;
@@ -145,7 +151,11 @@ private:
 
     // 节点分段存储:全部成员构造时定容,生命周期内地址稳定。
     struct NodeChunk {
-        std::vector<float>          vecs;    // kChunkSize * dim
+        // V7:vecs_ 仅 hot chunk(insert 新建)分配,deserialize 路径传
+        // needs_vecs=false → 容量 0(数据在 mmap)。定容预分配,地址永不变,
+        // 恢复并发读者协议依赖的地址稳定不变量(hot_vecs_ 单 vector 方案
+        // 因 reallocation 破坏此不变量,segfault)。
+        std::vector<float>          vecs;    // needs_vecs ? kChunkSize*dim : 0
         std::vector<std::uint64_t>  ords;
         std::vector<std::uint8_t>   levels;
         // 每节点邻接块:内层 vector 构造时 resize(slots) 定容,此后 .data()
@@ -156,12 +166,12 @@ private:
         // V4.2:int8 量化副本(对称量化,scale = max |v[i]|)。codes 是紧
         // 排 int8,scale/sum_codes 是每向量一个标量;load/insert 时写入,
         // 读者两阶段检索的粗筛直接读这段,4× 带宽缩减 + VNNI 指令提速。
+        // V7:BCVS v2 盘上直存(省启动量化 pass);V1 是启动时从 f32 重算。
         std::vector<std::int8_t>    qcodes;  // kChunkSize * dim
         std::vector<float>          qscales; // kChunkSize
         std::vector<std::int32_t>   qsums;   // kChunkSize(VNNI 偏置补偿)
 
-        // P5:inmem_int8 时 vecs 容量 0(不存常驻 f32),只分配量化副本。
-        NodeChunk(std::size_t dim, bool inmem_int8);
+        NodeChunk(std::size_t dim, bool needs_vecs);
         ~NodeChunk() = default;
         NodeChunk(const NodeChunk&) = delete;
         NodeChunk& operator=(const NodeChunk&) = delete;
@@ -173,6 +183,10 @@ private:
         return chunks_[id >> kChunkBits].load(std::memory_order_acquire);
     }
     [[nodiscard]] const float* vec_of(std::uint32_t id) const {
+        if (id < checkpoint_count_) {
+            return vecs_mmap_base_ +
+                   static_cast<std::size_t>(id) * cfg_.dim;
+        }
         const NodeChunk* c = chunk_of(id);
         return c->vecs.data() +
                static_cast<std::size_t>(id & kChunkMask) * cfg_.dim;
@@ -298,6 +312,17 @@ private:
     // 单写者声明用守卫(assert 仅 debug 生效;成员无条件存在,避免
     // NDEBUG 不一致的 TU 间布局分歧)。
     std::atomic<bool> writer_active_{false};
+
+    // V7:BCVS v2 vecs_ 外存化。checkpoint 加载的 vecs_[0..checkpoint_count_)
+    // 由 mmap 只读覆盖;checkpoint 后的新插入由 NodeChunk::vecs(定容,仅 hot
+    // chunk 分配)覆盖。vec_of() 按 id 分支: < checkpoint_count_ 走 mmap,
+    // ≥ 走 chunk->vecs。下次 checkpoint 时 save_vec_payload() 合并两者写新
+    // payload。inmem_int8 模式下 mmap 不建立(chunk 容量 0)。
+    const float*       vecs_mmap_base_  = nullptr;
+    void*              vecs_mmap_raw_   = nullptr;
+    int                vecs_payload_fd_ = -1;
+    std::size_t        vecs_mmap_len_   = 0;
+    std::uint32_t      checkpoint_count_ = 0;
 };
 
 }  // namespace bitcask::vec
