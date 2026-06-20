@@ -181,15 +181,15 @@ Gate 不通过说明快照之后有新写入未入图——回退全量 fold + W
 
 | 文件 | 内容 |
 |---|---|
-| `cpp/src/vector/hnsw.cpp:568-706` | `insert()` — 增量插入 + 层采样 + 连边 |
-| `cpp/src/vector/hnsw.cpp:533-566` | `select_neighbors()` — HNSW Algorithm 4 |
-| `cpp/src/vector/hnsw.cpp:773-869` | `save()` — BCVS v1 序列化 |
-| `cpp/src/vector/hnsw.cpp:871-1038` | `load()` — BCVS v1 反序列化 + 校验 |
-| `cpp/src/search/search_layer.cpp:49-53` | `save_vec_snapshot()` |
-| `cpp/src/search/search_layer.cpp:55-62` | `load_vec_snapshot()` |
-| `cpp/src/search/search_layer.cpp:76-90` | `rebuild_hnsw()` — 全量重建 |
-| `cpp/src/cask/cask.cpp:24` | `kHnswSnapName = "hnsw.snap"` |
-| `cpp/src/cask/cask.cpp:617-619` | `close()` 落盘 |
-| `cpp/src/cask/cask.cpp:688-691` | `open()` 加载 + gate |
-| `cpp/src/cask/cask.cpp:1661-1665` | `merge()` rebuild + 落盘 |
-| `cpp/include/bitcask/hnsw.hpp:256` | `entry_meta_` 定义 |
+| `src/vector/hnsw.cpp:568-706` | `insert()` — 增量插入 + 层采样 + 连边 |
+| `src/vector/hnsw.cpp:533-566` | `select_neighbors()` — HNSW Algorithm 4 |
+| `src/vector/hnsw.cpp:773-869` | `save()` — BCVS v1 序列化 |
+| `src/vector/hnsw.cpp:871-1038` | `load()` — BCVS v1 反序列化 + 校验 |
+| `src/search/search_layer.cpp:49-53` | `save_vec_snapshot()` |
+| `src/search/search_layer.cpp:55-62` | `load_vec_snapshot()` |
+| `src/search/search_layer.cpp:76-90` | `rebuild_hnsw()` — 全量重建 |
+| `src/cask/cask.cpp:24` | `kHnswSnapName = "hnsw.snap"` |
+| `src/cask/cask.cpp:617-619` | `close()` 落盘 |
+| `src/cask/cask.cpp:688-691` | `open()` 加载 + gate |
+| `src/cask/cask.cpp:1661-1665` | `merge()` rebuild + 落盘 |
+| `include/bitcask/hnsw.hpp:256` | `entry_meta_` 定义 |

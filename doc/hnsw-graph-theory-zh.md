@@ -252,16 +252,16 @@ FAISS (`IndexHNSWSQ`)、Elasticsearch（`dense_vector` 量化）、Qdrant 等均
 
 | 文件 | 内容 |
 |---|---|
-| `cpp/include/bitcask/hnsw.hpp:131-149` | NodeChunk 结构 |
-| `cpp/include/bitcask/hnsw.hpp:178-187` | layer_off / layer_cap |
-| `cpp/include/bitcask/hnsw.hpp:256-257` | entry_meta_ 编码 |
-| `cpp/src/vector/hnsw.cpp:271-283` | VisitedTable 版本化数组 |
-| `cpp/src/vector/hnsw.cpp:323-336` | copy_neighbors |
-| `cpp/src/vector/hnsw.cpp:338-362` | greedy_closest（上层贪心下降） |
-| `cpp/src/vector/hnsw.cpp:364-423` | search_layer（L0 束搜） |
-| `cpp/src/vector/hnsw.cpp:427-461` | greedy_closest_int8（量化版） |
-| `cpp/src/vector/hnsw.cpp:465-531` | search_layer_int8（量化版束搜） |
-| `cpp/src/vector/hnsw.cpp:568-706` | insert（增量构建 + 层采样 + 连边） |
-| `cpp/src/vector/hnsw.cpp:709-771` | search（三阶段调度） |
-| `cpp/include/bitcask/int8_kernels.hpp:89-118` | quantize（f32 → int8） |
-| `cpp/include/bitcask/int8_kernels.hpp:190-287` | VNNI dot product 内核 |
+| `include/bitcask/hnsw.hpp:131-149` | NodeChunk 结构 |
+| `include/bitcask/hnsw.hpp:178-187` | layer_off / layer_cap |
+| `include/bitcask/hnsw.hpp:256-257` | entry_meta_ 编码 |
+| `src/vector/hnsw.cpp:271-283` | VisitedTable 版本化数组 |
+| `src/vector/hnsw.cpp:323-336` | copy_neighbors |
+| `src/vector/hnsw.cpp:338-362` | greedy_closest（上层贪心下降） |
+| `src/vector/hnsw.cpp:364-423` | search_layer（L0 束搜） |
+| `src/vector/hnsw.cpp:427-461` | greedy_closest_int8（量化版） |
+| `src/vector/hnsw.cpp:465-531` | search_layer_int8（量化版束搜） |
+| `src/vector/hnsw.cpp:568-706` | insert（增量构建 + 层采样 + 连边） |
+| `src/vector/hnsw.cpp:709-771` | search（三阶段调度） |
+| `include/bitcask/int8_kernels.hpp:89-118` | quantize（f32 → int8） |
+| `include/bitcask/int8_kernels.hpp:190-287` | VNNI dot product 内核 |

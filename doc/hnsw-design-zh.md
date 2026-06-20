@@ -7,11 +7,11 @@
 
 ## 1. 边界与配置(已定稿,不再讨论)
 
-1. **向量进、近邻出**:embedding 由调用方提供(Erlang 层可选 `embedder`
-   behaviour 接外部模型服务);C++ 引擎不含任何 ML runtime。依据:
+1. **向量进、近邻出**:embedding 由调用方提供(可选 `embedder`
+   接外部模型服务);C++ 引擎不含任何 ML runtime。依据:
    ① DocValue v3 vector 段已是 source of truth,merge/恢复不依赖模型;
    ② BM25 内置因分词廉价确定,embedding 是重推理,性质不同;
-   ③ BEAM 进程不引入百 MB 级推理依赖(同 tbbmalloc 决策一脉)。
+   ③ 引擎不引入百 MB 级推理依赖(同 tbbmalloc 决策一脉)。
 2. **维度:库内恒定、初始化显式配置**:
    ```cpp
    struct VectorConfig {
@@ -53,8 +53,8 @@ std::vector<std::uint64_t>  id2ord_;   // node_id → ord(结果翻译)
 **部署目标实测(2026-06-12,192.168.186.1:8080,OpenAI 兼容
 /v1/embeddings,model=qwen3-embedding)**:dim=2560,输入上限 32K token,
 **输出已 L2 归一化(实测 norm=1.0)**——引擎写入侧归一化对其幂等,
-保留不变(兜其它客户端/模型漂移);32K 上限的文本截断是 Erlang 层
-embedder behaviour 的职责,引擎不感知。2560 = 8×320,AVX2 内核
+保留不变(兜其它客户端/模型漂移);32K 上限的文本截断是调用方
+embedder 的职责,引擎不感知。2560 = 8×320,AVX2 内核
 整块覆盖无尾循环。
 
 ### 2.2 图结构
@@ -257,7 +257,7 @@ close 保存顺序:bm25 → sidecar → **hnsw snap** → keydir snap(worker
 
 ## 7. 明确不做(V3 边界)
 
-- 进程内 embedding 推理(Erlang 层 behaviour 解决);
+- 进程内 embedding 推理(调用方 embedder 解决);
 - 多字段多图(接口留位,V3.x);
 - 量化(int8/PQ)与外存图(V4,DocValue 段已留版本位);
 - 过滤式向量检索的图内实现(V3.x 课题);
