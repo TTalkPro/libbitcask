@@ -227,7 +227,7 @@ fstats 槽位 per-shard 化。
   生产"单 active 文件"形态一致);③ 本机 P/E 混合核,8 线程含 E 核拉低
   聚合。进一步收敛(per-shard epoch 域 / fstats 写侧分片聚合)收益
   预估有限且复杂度高,**有意止步**——记录为 M6 关账状态。
-- baseline.json 已刷新(cpp/bench/baseline/,含 Mixed 全档)。
+- baseline.json 已刷新(bench/baseline/,含 Mixed 全档)。
 
 ## 11. 屏障 v2(写者闸门)实测(2026-06-12,本机)
 
@@ -245,7 +245,7 @@ fstats 槽位 per-shard 化。
 | ASan(address,undefined)全量 ctest | 371/371 |
 | eunit(plain .so,ldd 0 tsan) | 44/44 |
 
-基准回归(repetitions=3 median,vs cpp/bench/baseline/baseline.json,
+基准回归(repetitions=3 median,vs bench/baseline/baseline.json,
 门槛 ±10%):
 
 | 负载 | baseline M/s | 屏障 v2 M/s | Δ |

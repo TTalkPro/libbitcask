@@ -34,7 +34,7 @@ sealed/immutable，续写要 un-seal、且破坏 file_id 单调与 sealed 不可
 
 - open（read_write）后判 `needs_merge`（复用现有阈值 `small_file_threshold` /
   `frag_threshold` / `dead_bytes_threshold`）。命中才触发。
-- **后台执行，不阻塞 open**：merge 走 dirty 调度器 / `bitcask_merge_worker`，open 立即
+- **后台执行，不阻塞 open**：merge 走独立线程，open 立即
   返回。**绝不在 open 同步跑 merge**（见 §5）。
 - 产物 = 你要的形态：少数 sealed（merge 输出）+ 下次写起一个**全新 active**。
 - **复用**：`merge` + `needs_merge` + `bitcask_merge_worker` + `small_file_threshold`
@@ -66,7 +66,7 @@ sealed/immutable，续写要 un-seal、且破坏 file_id 单调与 sealed 不可
 
 ## 8. 风险
 - **别同步**：同步 merge 阻塞启动——强制后台。
-- 后台 merge 与正常读写抢 IO/CPU（既有 merge 代价，dirty 调度器隔离主调度）。
+- 后台 merge 与正常读写抢 IO/CPU（既有 merge 代价，独立线程隔离调用方）。
 - 短命进程：open 即触发后台 merge 但进程很快退出 → merge 可能未跑完/被打断（merge
   是幂等可重入的写新删旧，无损；下次再触发）。
 - 默认值选择：默认开会让所有部署在 open 时承担后台 merge——倾向**默认 off、显式开**。

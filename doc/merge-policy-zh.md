@@ -6,7 +6,7 @@
 ## 1. 概述
 
 bitcask 的 merge **不会自动触发**——没有后台定时器，没有写入量阈值自动启动。
-调用方必须显式调用 `bitcask:needs_merge/1` 检查，再调 `bitcask:merge/1` 执行。
+调用方必须显式调用 `bitcask_needs_merge()` 检查，再调 `bitcask_merge()` 执行。
 
 merge 是唯一物理回收 HNSW 死节点（已 delete 的文档向量）的时机。在此之前，
 死节点通过搜索时的 `is_live` callback 软过滤。
@@ -16,7 +16,7 @@ merge 是唯一物理回收 HNSW 死节点（已 delete 的文档向量）的时
 ### 2.1 delete 时发生了什么
 
 ```
-bitcask:delete(Ref, Key)
+bitcask_delete(cask, key, 0, &fault)
   └→ Cask::remove(key)
        ├→ KeyDir: 写 tombstone entry（ord 分配不变）
        └→ IndexPool worker:
@@ -80,9 +80,13 @@ hnsw->search(q, k, ef, &live);   // 死节点不入候选集
 专门为索引模式设计。当 `(total_ords - live_docs) / total_ords × 100 ≥ N` 时
 触发 merge——即使 data file 的碎片率没到阈值。
 
-```erlang
-%% 配置示例：20% 文档被删就触发 merge
-bitcask:open(Dir, [read_write, {analyzer, whitespace}, {deletion_rate_trigger, 20}]).
+```c
+/* 配置示例：20% 文档被删就触发 merge */
+bitcask_options_t opts; bitcask_options_init(&opts);
+opts.read_write = 1;
+opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+/* deletion_rate_trigger 在 PolicyOptions 中配置 */
+bitcask_open(Dir, &opts, &cask, NULL);
 ```
 
 如果 trigger 成立但无文件通过 per-file 阈值，所有非活跃文件全部入选
@@ -103,7 +107,7 @@ needs_merge(Ref)
 
 ### 3.5 代码位置
 
-- 策略纯函数：`cpp/src/merge/merge_policy.cpp` + `cpp/include/bitcask/merge_policy.hpp`
+- 策略纯函数：`src/merge/merge_policy.cpp` + `include/bitcask/merge_policy.hpp`
 - 调用入口：`Cask::needs_merge()` in `cask.cpp`，从 Index 计算 `dead_doc_rate`
 - 默认值：`priv/bitcask.app.src` env 段
 
@@ -133,7 +137,7 @@ void SearchLayer::rebuild_hnsw() {
 ### 4.2 完整 merge 流程
 
 ```
-bitcask:merge(Dir)
+bitcask_merge(cask, &fault)
   └→ Cask::merge(files)
        Phase 1: 合并 data files（写新文件，KeyDir 更新定位）
        Phase 2: rebuild_index() + rebuild_hnsw()（物理清死）
@@ -145,7 +149,7 @@ bitcask:merge(Dir)
 
 | 场景 | 建议 |
 |------|------|
-| 大量 delete 后向量搜索变慢 | 调 `bitcask:merge(Dir)`，重建 HNSW |
+| 大量 delete 后向量搜索变慢 | 调 `bitcask_merge(cask, &fault)`，重建 HNSW |
 | 持续写入 + 偶尔删除 | 设 `deletion_rate_trigger` 为 10-20，轮询 `needs_merge` |
 | 纯 KV（无向量/搜索） | 默认策略足够，碎片率和死字节驱动 |
 | 低延迟要求 | 在低峰期手动 merge，避免影响在线查询 |
@@ -154,11 +158,11 @@ bitcask:merge(Dir)
 
 | 文件 | 内容 |
 |------|------|
-| `cpp/src/merge/merge_policy.cpp` | `decide()` — 两段式决策纯函数 |
-| `cpp/include/bitcask/merge_policy.hpp` | `PolicyOptions` — 默认值 + 参数定义 |
-| `cpp/src/search/search_layer.cpp:429-464` | `on_delete()` — BM25 清理（HNSW 不动） |
-| `cpp/src/search/search_layer.cpp:222-234` | search_vector live callback |
-| `cpp/src/search/search_layer.cpp:76-90` | `rebuild_hnsw()` — 物理清死 |
-| `cpp/src/cask/cask.cpp` | `needs_merge()` + `merge()` 调用链 |
+| `src/merge/merge_policy.cpp` | `decide()` — 两段式决策纯函数 |
+| `include/bitcask/merge_policy.hpp` | `PolicyOptions` — 默认值 + 参数定义 |
+| `src/search/search_layer.cpp:429-464` | `on_delete()` — BM25 清理（HNSW 不动） |
+| `src/search/search_layer.cpp:222-234` | search_vector live callback |
+| `src/search/search_layer.cpp:76-90` | `rebuild_hnsw()` — 物理清死 |
+| `src/cask/cask.cpp` | `needs_merge()` + `merge()` 调用链 |
 | `src/bitcask.app.src` | 默认阈值（frag_merge_trigger 等） |
 | `doc/hnsw-lifecycle-zh.md` | HNSW 图完整生命周期（构建/持久化/恢复） |
