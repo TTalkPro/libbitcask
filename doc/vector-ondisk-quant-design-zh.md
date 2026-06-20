@@ -70,7 +70,7 @@ f32 当前是三处的 source of truth，int8-only 落盘都会受影响：
 
 测量隔离量化误差对召回的影响：brute-force f32 余弦 top-k 为真值，对比
 「dequant-int8 库（= 落盘 int8 读回）vs f32 query」的 top-k 重叠。复用 `vec::int8`
-的同一量化方案。harness：`cpp/tests/hnsw_test.cpp::measure_quant_recall`（CI
+的同一量化方案。harness：`tests/hnsw_test.cpp::measure_quant_recall`（CI
 回归红线 ≥ 0.95，可任意改 n/dim/k 复跑）。
 
 **结果（2026-06，合成归一化高斯，dim=2560，n=2000，nq=30）：**

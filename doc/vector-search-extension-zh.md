@@ -152,7 +152,7 @@ Value 内容（早期固定宽度示意）:
 
 > 向量段放最前是关键设计：HNSW 重建只需读前 6 字节（Ver+Flags+dim）即可 memcpy 出全部向量，不碰 text/meta。BM25 重建按 dim 算出向量段长度跳过，直达 text。两条偏路径都 O(1) 定位。
 
-字节级权威定义见 `doc/format-zh.md` §五（DocValue 格式）。常量定义见 `cpp/include/bitcask/format.hpp`。
+字节级权威定义见 `doc/format-zh.md` §五（DocValue 格式）。常量定义见 `include/bitcask/format.hpp`。
 
 ### 3.3 向量字段命名约定
 
@@ -188,7 +188,7 @@ struct DocSlot {
 ### 4.1 接口
 
 ```cpp
-// cpp/include/bitcask/vector_index.hpp
+// include/bitcask/vector_index.hpp
 namespace bitcask::vector {
 
 enum class Metric { Cosine, L2, InnerProduct };
@@ -247,7 +247,7 @@ private:
 
 ### 4.2 pimpl 隐藏 usearch
 
-usearch 头较重，污染公共头。所有 usearch 类型放在 `cpp/src/vector/vector_index.cpp` 的 `Impl` 中；`vector_index.hpp` 只暴露 `std::span<const float>` / `std::vector<VectorSearchResult>` 这类标准类型。
+usearch 头较重，污染公共头。所有 usearch 类型放在 `src/vector/vector_index.cpp` 的 `Impl` 中；`vector_index.hpp` 只暴露 `std::span<const float>` / `std::vector<VectorSearchResult>` 这类标准类型。
 
 ### 4.3 选型理由：为什么 usearch
 
@@ -495,7 +495,7 @@ SearchLayer::search_hybrid(std::string_view text_query,
 | Condorcet / Borda 融合 | 投票论基础 | 计算贵；对召回长尾不友好 |
 | 倒数归一化 + 加权 | 平衡两者 | 实现复杂 |
 
-经验上 RRF 在 Elasticsearch / Vespa / Weaviate 的生产环境中表现稳健，作为默认；Erlang 层留 `{fusion, linear}` 旋钮供高级用户切换。
+经验上 RRF 在 Elasticsearch / Vespa / Weaviate 的生产环境中表现稳健，作为默认；设计预留 `{fusion, linear}` 旋钮供高级用户切换。
 
 ### 6.4 ef 参数语义
 
@@ -640,55 +640,62 @@ public:
 };
 ```
 
-### 9.2 Erlang API
+### 9.2 C API
 
-```erlang
-%% 打开 collection 时启用向量字段
-R = bitcask:collection_open("/tmp/db", [
-    {analyzer, ngram},
-    {vector_field, <<"$vector">>},
-    {vector_dim, 768},
-    {vector_metric, cosine}
-]).
+```c
+/* 打开时启用向量字段 */
+bitcask_options_t opts;
+bitcask_options_init(&opts);
+opts.read_write    = 1;
+opts.enable_search = 1;
+opts.analyzer_type = BITCASK_ANALYZER_NGRAM;
+opts.vector_dim    = 768;
+opts.vector_metric = BITCASK_VECTOR_METRIC_COSINE;
 
-%% 写入带向量的文档
-bitcask:collection_put_vector(R, <<"doc1">>, <<"文本内容">>, VectorBinary).
+bitcask_t* cask = NULL;
+bitcask_open("/tmp/db", &opts, &cask, NULL);
 
-%% 纯向量检索
-{ok, Hits} = bitcask:search_vector(R, QueryVecBinary, 10).
+/* 写入带向量的文档 */
+float vec[768] = { /* … */ };
+bitcask_doc_input_t doc = {
+    .text       = (bitcask_slice_t){"文本内容", 12},
+    .vector     = vec,
+    .vector_len = 768,
+};
+bitcask_put_doc(cask, (bitcask_slice_t){"doc1", 4}, &doc, 0, NULL);
 
-%% 混合检索
-{ok, Hits} = bitcask:search_hybrid(R, <<"降息 政策">>, QueryVecBinary, 10).
+/* 纯向量检索 */
+bitcask_search_result_t* hits = NULL;
+bitcask_search_vector(cask, query_vec, 768, 10, 0, &hits, NULL);
 
-%% 自定义融合策略
-{ok, Hits} = bitcask:search_hybrid(R, Text, Vec, 10, [
-    {fusion, rrf},           % 默认
-    {fusion, {linear, 0.6}}  % 文本权重 0.6
-]).
+/* 混合检索 */
+bitcask_search_hybrid(cask, "降息 政策", query_vec, 768, 10, &hits, NULL);
+
+bitcask_search_result_free(hits);
 ```
 
-### 9.3 NIF 入口
+### 9.3 C API 入口
 
 ```cpp
-// nif_cask.cpp
-static ERL_NIF_TERM cask_search_vector(ErlNifEnv*, int, ERL_NIF_TERM args[]) {
-    auto* handle = …;
-    auto query = take_binary_arg(args[1]);
-    auto k     = take_uint_arg(args[2]);
-    auto field = take_binary_arg(args[3], "$vector");
-    return cpp_to_term(handle->cask.search_vector(query, k, field));
+// c_api/bitcask_c.cpp
+BITCASK_API bitcask_error_t bitcask_search_vector(bitcask_t* cask,
+    const float* query, size_t query_len, size_t k, size_t ef,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    auto* h = reinterpret_cast<Handle*>(cask);
+    auto result = h->cask->search_vector({query, query_len}, k, ef);
+    return translate_search_result(std::move(result), out, fault);
 }
 
-static ERL_NIF_TERM cask_search_hybrid(ErlNifEnv*, int, ERL_NIF_TERM args[]) {
-    auto* handle = …;
-    auto text   = take_binary_arg(args[1]);
-    auto vec    = take_binary_arg(args[2]);
-    auto k      = take_uint_arg(args[3]);
-    return cpp_to_term(handle->cask.search_hybrid(text, vec, k));
+BITCASK_API bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
+    const char* text_query, const float* vec_query, size_t vec_len,
+    size_t k, bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    auto* h = reinterpret_cast<Handle*>(cask);
+    auto result = h->cask->search_hybrid(text_query, {vec_query, vec_len}, k);
+    return translate_search_result(std::move(result), out, fault);
 }
 ```
 
-Erlang 端 binary 视为 `<<F32:little-float, F32, …>>`，NIF 侧零拷贝 `span` 直接传给 HNSW。
+查询向量以 `{const float*, size_t}` 切片传入，内部 `std::span` 零拷贝直接喂给 HNSW。
 
 ---
 
@@ -746,17 +753,17 @@ Erlang 端 binary 视为 `<<F32:little-float, F32, …>>`，NIF 侧零拷贝 `sp
 
 | 路径 | 用途 |
 |---|---|
-| `cpp/include/bitcask/vector_index.hpp` | 公共 API（pimpl 隐藏 usearch） |
-| `cpp/src/vector/vector_index.cpp` | usearch 包装实现 |
-| `cpp/include/bitcask/search_layer.hpp` | 新增 `vector_fields_` / `search_vector` / `search_hybrid` |
-| `cpp/src/search/search_layer.cpp` | 写入路径扩展 / RRF 融合 / 段持久化 |
-| `cpp/include/bitcask/cask.hpp` | `put_vector` / `search_vector` / `search_hybrid` |
-| `cpp/src/cask/cask.cpp` | 委托给 SearchLayer |
-| `cpp/nif/nif_cask.cpp` | `cask_put_vector` / `cask_search_vector` / `cask_search_hybrid` |
+| `include/bitcask/vector_index.hpp` | 公共 API（pimpl 隐藏 usearch） |
+| `src/vector/vector_index.cpp` | usearch 包装实现 |
+| `include/bitcask/search_layer.hpp` | 新增 `vector_fields_` / `search_vector` / `search_hybrid` |
+| `src/search/search_layer.cpp` | 写入路径扩展 / RRF 融合 / 段持久化 |
+| `include/bitcask/cask.hpp` | `put_vector` / `search_vector` / `search_hybrid` |
+| `src/cask/cask.cpp` | 委托给 SearchLayer |
+| `c_api/nif_cask.cpp` | `cask_put_vector` / `cask_search_vector` / `cask_search_hybrid` |
 | `src/bitcask.erl` | Erlang 门面对象 |
 | `third_party/usearch/include/ust.hpp` | vendored 单头文件库 |
-| `cpp/tests/vector_index_test.cpp` | 单元测试 |
-| `cpp/tests/search_layer_test.cpp` | 新增 `HybridRetrieval` 测试组 |
+| `tests/vector_index_test.cpp` | 单元测试 |
+| `tests/search_layer_test.cpp` | 新增 `HybridRetrieval` 测试组 |
 | `doc/vector-search-extension-zh.md` | 本文档 |
 
 ---
