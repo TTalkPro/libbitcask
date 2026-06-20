@@ -32,7 +32,7 @@ data / want to keep the existing store).
 ```bash
 cmake -S . -B _build/cmake -DBUILD_TESTING=ON
 cmake --build _build/cmake -j --target migrate_le
-# output: _build/cmake/cpp/migrate_le
+# output: build/migrate_le
 ```
 
 ## 3. Usage
@@ -49,7 +49,7 @@ migrate_le <src_dir> <dst_dir>
 Example:
 
 ```bash
-$ _build/cmake/cpp/migrate_le ~/db/wiki ~/db/wiki.le
+$ build/migrate_le ~/db/wiki ~/db/wiki.le
 migrated /home/me/db/wiki -> /home/me/db/wiki.le
   data files     : 2
   records        : 12000 (tombstones 134)
@@ -82,9 +82,12 @@ migration).
 
 ```bash
 # Open dst with the new code: a successful open + reads means success
-# (meta is now v2). e.g. via rebar3 shell:
-#   {ok, R} = bitcask:open("/home/me/db/wiki.le", [read_write]),
-#   bitcask:get(R, <<"some-key">>).
+# (meta is now v2). e.g. via C API (c_api/bitcask_c.h):
+#   bitcask_options_t opts; bitcask_options_init(&opts); opts.read_write = 1;
+#   bitcask_t* cask; bitcask_fault_t fault;
+#   bitcask_open("/home/me/db/wiki.le", &opts, &cask, &fault);
+#   bitcask_get_result_t* res;
+#   bitcask_get(cask, (bitcask_slice_t){"some-key", 8}, &res, NULL);
 ```
 
 `migrate_le` is covered by a round-trip test (`MigrateBEtoLE.RoundTrip`:
@@ -101,6 +104,6 @@ via the little-endian read path).
 - Migrating a directory that is already v2 (little-endian) **fails cleanly**
   (`src meta already v2`); it will not double-migrate.
 - Implementation:
-  [`cpp/include/bitcask/migrate.hpp`](../cpp/include/bitcask/migrate.hpp)
-  (`migrate_be_to_le`) + `cpp/src/fileops/migrate.cpp` + CLI
-  `cpp/tools/migrate_le.cpp`.
+  [`include/bitcask/migrate.hpp`](../include/bitcask/migrate.hpp)
+  (`migrate_be_to_le`) + `src/fileops/migrate.cpp` + CLI
+  `tools/migrate_le.cpp`.

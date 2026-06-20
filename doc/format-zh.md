@@ -2,18 +2,18 @@
 
 本文档是 C++ 实现读写的字节级规范。权威来源：
 
-- 常量定义：`cpp/include/bitcask/format.hpp`
-- 编解码：`cpp/src/fileops/codec.cpp`
-- 文件抽象：`cpp/include/bitcask/data_file.hpp` / `hint_file.hpp`
-- Meta 文件：`cpp/include/bitcask/meta_file.hpp`
-- 字节级测试固件：`cpp/tests/codec_test.cpp`
+- 常量定义：`include/bitcask/format.hpp`
+- 编解码：`src/fileops/codec.cpp`
+- 文件抽象：`include/bitcask/data_file.hpp` / `hint_file.hpp`
+- Meta 文件：`include/bitcask/meta_file.hpp`
+- 字节级测试固件：`tests/codec_test.cpp`
 
 所有多字节整数均为**小端**（LE-only 主机：x86/ARM64，原生零转换 + mmap 零拷贝
 友好）。**flag-day 切换**：此前 record/hint/field.schema 为大端（对齐 legacy Erlang
 `<<X:N>>`），切换后旧大端文件不可读（meta version 1→2，旧目录 open 时被干净拒绝），
-不再与 legacy Erlang 字节互通。**迁移**：旧大端目录可用 `cpp/tools/migrate_le
+不再与 legacy Erlang 字节互通。**迁移**：旧大端目录可用 `tools/migrate_le
 <src> <dst>` 离线转换成小端（非破坏性；迁移 data/hint/meta/field.schema，ckpt/seg/wal
-等可重建文件由新库首开自动重建）；详见 `cpp/include/bitcask/migrate.hpp`。
+等可重建文件由新库首开自动重建）；详见 `include/bitcask/migrate.hpp`。
 字段大小单位均为字节。
 
 ---
@@ -68,7 +68,7 @@
 
 不变量：`(VecMetric==kNone) ⟺ (VecDim==0)`。VecMetric/Dim/Quantized/InmemInt8
 创建即固定，重开必须与 open 选项一致，否则 `kModeMismatch`。
-来源：`cpp/src/cask/meta_file.cpp`、`cpp/include/bitcask/meta_file.hpp`。
+来源：`src/cask/meta_file.cpp`、`include/bitcask/meta_file.hpp`。
 
 ---
 
@@ -334,8 +334,8 @@ Z      Fields 段（可选，Flags&0x10 时存在；多字段）
 **收益**（3 字段 doc，名 title/body/author）：结构开销从 ~35B/record 降到
 ~7B/record，字段名全局只存一份；append-only + merge 双重放大。
 
-来源：`cpp/include/bitcask/format.hpp` + `cpp/src/fileops/codec.cpp`
-（`encode_doc_value` / `decode_doc_value`）+ `cpp/include/bitcask/field_schema.hpp`。
+来源：`include/bitcask/format.hpp` + `src/fileops/codec.cpp`
+（`encode_doc_value` / `decode_doc_value`）+ `include/bitcask/field_schema.hpp`。
 
 ---
 
@@ -379,7 +379,7 @@ leading PID、`kill(pid, 0)` 探测原持有进程是否存活：
 - `EPERM`  → 进程存在但无权发送信号 → 保守视为存活
 
 这处理了常见的"writer crash 后未释放锁"场景
-（见 `cpp/src/cask/cask.cpp::try_remove_stale_lock` + `process_alive`）。
+（见 `src/cask/cask.cpp::try_remove_stale_lock` + `process_alive`）。
 
 存在一个极小的 race 窗口：读取 PID 到 unlink 之间，另一个 writer 可能
 写入了新锁而被我们误删。这个 race 在 legacy 中同样存在，实际影响面
@@ -442,7 +442,7 @@ NFS 上 `O_EXCL` 不可靠，但 bitcask 也不该跑在网络文件系统上。
 
 ## 九、磁盘契约的硬约束
 
-以下为线格式（wire-format）保证，在 `cpp/tests/codec_test.cpp`
+以下为线格式（wire-format）保证，在 `tests/codec_test.cpp`
 中有字节级测试固件。修改其中任何一项都破坏二进制兼容性：
 
 - **小端**编码贯穿全部多字节整数字段（LE-only 主机原生零转换 + mmap 零拷贝）。
@@ -458,7 +458,7 @@ NFS 上 `O_EXCL` 不可靠，但 bitcask 也不该跑在网络文件系统上。
   排序；所有长度/计数为 VByte 变长，fields 段存字段 id（见 §五）。解码只接受
   Ver==3（不向后兼容）。
 
-所有这些常量集中在 `cpp/include/bitcask/format.hpp`，是本格式的唯一权威来源。
+所有这些常量集中在 `include/bitcask/format.hpp`，是本格式的唯一权威来源。
 
 ---
 
@@ -488,7 +488,7 @@ entry_n u64, 重复 entry_n 次:
 ```
 
 `covered_offset` 是尾部回放的水位：open 装载快照后只 fold 各文件该偏移之后的
-尾巴。来源 `cpp/src/keydir/keydir.cpp`（`save_snapshot`/`load_snapshot`）。
+尾巴。来源 `src/keydir/keydir.cpp`（`save_snapshot`/`load_snapshot`）。
 
 ### 10.2 search.docmap.ckpt — 搜索文档目录 checkpoint（BCIS v1）
 
@@ -503,7 +503,7 @@ rows u64, 重复 rows 次（每活索引文档一行）:
 
 把 bm25/hnsw 吐出的 ord 翻译回 key / 物理位置 / live / doc_len。与 keydir.ckpt
 字段大量重叠（见 recovery 设计），但按 ord 而非 key 索引。来源
-`cpp/src/search/search_layer.cpp`（`save_index_sidecar`/`load_index_sidecar`）。
+`src/search/search_layer.cpp`（`save_index_sidecar`/`load_index_sidecar`）。
 
 ### 10.3 search.vec.ckpt — HNSW 向量图 checkpoint（BCVS v1）
 
@@ -519,7 +519,7 @@ count u32 | entry_meta u64 | max_inserted_ord u64
 
 不变量：邻居/entry id `< count`、ord 严格递增、layer-l 表只含 level≥l 的节点。
 **注意**：即便内存为 int8-only（P5），盘上仍存 f32（save 反量化、load 再量化）。
-来源 `cpp/src/vector/hnsw.cpp`（`save`/`load`）。
+来源 `src/vector/hnsw.cpp`（`save`/`load`）。
 
 ### 10.4 search.bm25.* — bm25 倒排索引
 
@@ -530,11 +530,11 @@ count u32 | entry_meta u64 | max_inserted_ord u64
 - **search.bm25.f\<i\>.seg**：第 i 个字段的倒排段（`InvertedIndex::save`）。
   标量字段 u32/u64 **小端**（原生 `fwrite`），postings 用 VByte gap 压缩 +
   block-max 元数据。逐字节布局随检索特性（BMW / zero-copy posting）演进，
-  以源码为准：`cpp/src/bm25/inverted.cpp` + `doc/posting-zero-copy-design-zh.md`、
+  以源码为准：`src/bm25/inverted.cpp` + `doc/posting-zero-copy-design-zh.md`、
   `doc/kway-blockmax-bmw-zh.md`。
 - **search.bm25.f\<i\>.wal**：`[Magic "WAL1"=0x57414C31:u32][Version=1:u32]` +
   增量记录（`add_doc`/`remove_doc`，VByte 编码）。load 快照后若 WAL 存在则重放、
-  随后 truncate。来源 `cpp/src/bm25/inverted_wal.cpp`。
+  随后 truncate。来源 `src/bm25/inverted_wal.cpp`。
 
 > 字节序例外回顾：bm25 倒排**位流**为 MSB-first 位级打包（`inverted.cpp`），
 > 作为字节序列与主机字节序无关；VByte（§五）同样字节序中立。其余所有多字节

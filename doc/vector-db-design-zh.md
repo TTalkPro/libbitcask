@@ -131,7 +131,7 @@ meta   段 (has_meta):    [len:u32][ 序列化字节 (msgpack/CBOR) ]
 
 | 字段 | 字节序 | 理由 |
 |---|---|---|
-| header 整数（`dim`/`len`/`ord`/`tstamp`…） | **大端** | 沿用 `format.hpp` 既有契约 |
+| header 整数（`dim`/`len`/`ord`/`tstamp`…） | **小端** | 沿用 `format.hpp` 既有契约（P 起全盘统一 LE） |
 | 向量 `f32` 数组 | **固定小端** | x86/ARM64 都是 LE，原生零 byte-swap；格式仍良定义 |
 
 - 把磁盘格式定义为「f32 固定小端」（而非「平台原生」），契约确定。x86 与 AArch64
