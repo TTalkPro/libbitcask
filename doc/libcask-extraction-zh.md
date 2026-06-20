@@ -15,10 +15,10 @@
 
 | 层 | 文件 | `erl_nif.h` 依赖 | 可独立？ |
 |---|---|---|---|
-| **纯 C++ 核心** | `cpp/src/`（24 文件，10 子模块） + `cpp/include/bitcask/`（45 头文件） | **零** | ✅ |
-| **NIF 胶水** | `cpp/nif/`（14 文件） | 全部依赖 | ❌ 留在 Erlang 项目 |
+| **纯 C++ 核心** | `src/`（24 文件，10 子模块） + `include/bitcask/`（45 头文件） | **零** | ✅ |
+| **NIF 胶水** | `c_api/`（14 文件） | 全部依赖 | ❌ 留在 Erlang 项目 |
 
-关键事实：`cpp/src/` 和 `cpp/include/` 中没有任何一个文件 include 了
+关键事实：`src/` 和 `include/` 中没有任何一个文件 include 了
 `erl_nif.h`，也没有任何 `enif_*` 调用。耦合是单向的——NIF 层调用 C++ 类
 （`Cask`、`CaskIter`），C++ 核心对 Erlang 完全无知。
 
@@ -40,36 +40,36 @@
 
 ### 1.3 纯 C++ 核心模块清单（可提取为库）
 
-**源文件**（`cpp/src/`，24 文件）：
+**源文件**（`src/`，24 文件）：
 
 ```
-cpp/src/cask/cask.cpp              # 核心 KV 存储
-cpp/src/cask/meta_file.cpp
-cpp/src/fileops/codec.cpp           # 记录编解码
-cpp/src/fileops/data_file.cpp       # 数据文件
-cpp/src/fileops/hint_file.cpp       # 提示文件
-cpp/src/fileops/migrate.cpp         # 迁移工具
-cpp/src/fileops/scanner.cpp         # 扫描器
-cpp/src/io/posix_file.cpp           # POSIX I/O
-cpp/src/lock/file_lock.cpp          # 文件锁
-cpp/src/keydir/keydir.cpp           # 内存 KeyDir
-cpp/src/keydir/keydir_registry.cpp
-cpp/src/keydir/index.cpp            # Index 侧表
-cpp/src/bm25/intersect.cpp          # BM25 倒排交集
-cpp/src/bm25/inverted.cpp           # 倒排索引
-cpp/src/bm25/inverted_wal.cpp       # WAL
-cpp/src/bm25/query_parser.cpp       # 查询解析
-cpp/src/merge/merger.cpp            # Merge 执行
-cpp/src/merge/merge_policy.cpp      # Merge 策略
-cpp/src/search/search_cache.cpp     # 搜索缓存
-cpp/src/search/search_layer.cpp     # 搜索层
-cpp/src/search/highlighter.cpp      # 高亮
-cpp/src/text/analyzer.cpp           # 分词器
-cpp/src/text/jieba_analyzer.cpp     # Jieba 中文分词
-cpp/src/vector/hnsw.cpp             # HNSW 向量索引
+src/cask/cask.cpp              # 核心 KV 存储
+src/cask/meta_file.cpp
+src/fileops/codec.cpp           # 记录编解码
+src/fileops/data_file.cpp       # 数据文件
+src/fileops/hint_file.cpp       # 提示文件
+src/fileops/migrate.cpp         # 迁移工具
+src/fileops/scanner.cpp         # 扫描器
+src/io/posix_file.cpp           # POSIX I/O
+src/lock/file_lock.cpp          # 文件锁
+src/keydir/keydir.cpp           # 内存 KeyDir
+src/keydir/keydir_registry.cpp
+src/keydir/index.cpp            # Index 侧表
+src/bm25/intersect.cpp          # BM25 倒排交集
+src/bm25/inverted.cpp           # 倒排索引
+src/bm25/inverted_wal.cpp       # WAL
+src/bm25/query_parser.cpp       # 查询解析
+src/merge/merger.cpp            # Merge 执行
+src/merge/merge_policy.cpp      # Merge 策略
+src/search/search_cache.cpp     # 搜索缓存
+src/search/search_layer.cpp     # 搜索层
+src/search/highlighter.cpp      # 高亮
+src/text/analyzer.cpp           # 分词器
+src/text/jieba_analyzer.cpp     # Jieba 中文分词
+src/vector/hnsw.cpp             # HNSW 向量索引
 ```
 
-**公共头文件**（`cpp/include/bitcask/`，45 文件）：`cask.hpp`, `keydir.hpp`,
+**公共头文件**（`include/bitcask/`，45 文件）：`cask.hpp`, `keydir.hpp`,
 `data_file.hpp`, `codec.hpp`, `hnsw.hpp`, `search_layer.hpp`, `analyzer.hpp` 等，
 全部为纯 C++。
 
@@ -79,7 +79,7 @@ cpp/src/vector/hnsw.cpp             # HNSW 向量索引
 
 ### 2.1 已有的模块化
 
-`cpp/CMakeLists.txt` 已经将 C++ 核心拆成 **11 个独立的 static library**：
+`CMakeLists.txt` 已经将 C++ 核心拆成 **11 个独立的 static library**：
 
 ```
 bitcask_format  → bitcask_io  → bitcask_fileops  → bitcask_keydir
@@ -89,7 +89,7 @@ bitcask_text    → bitcask_merge → bitcask_cask (顶层，链接以上全部)
 
 NIF 的 `bitcask_cpp.so` 只是把这些 static lib 链接在一起再加一层 NIF 入口。
 
-`cpp/CMakeLists.txt` **第 1-9 行已支持脱离顶层 CMake 独立构建**。
+`CMakeLists.txt` **第 1-9 行已支持脱离顶层 CMake 独立构建**。
 
 ### 2.2 当前构建流水线
 

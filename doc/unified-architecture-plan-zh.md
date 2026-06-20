@@ -173,10 +173,10 @@ bitcask:upgrade(Dir, [{analyzer, jieba}]).                 %% 离线 KV → 索�
 
 | 文件 | Phase |
 |------|-------|
-| `cpp/include/bitcask/meta_file.hpp` | 2 |
-| `cpp/src/fileops/meta_file.cpp` | 2 |
-| `cpp/include/bitcask/search_layer.hpp` | 3 |
-| `cpp/src/search/search_layer.cpp` | 3 |
+| `include/bitcask/meta_file.hpp` | 2 |
+| `src/fileops/meta_file.cpp` | 2 |
+| `include/bitcask/search_layer.hpp` | 3 |
+| `src/search/search_layer.cpp` | 3 |
 
 ### 修改
 

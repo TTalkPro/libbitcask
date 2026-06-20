@@ -9,7 +9,7 @@
 
 ### 1.1 `PosixFile::pread()` 每次调用分配堆内存
 
-**文件**: `cpp/src/io/posix_file.cpp:70`
+**文件**: `src/io/posix_file.cpp:70`
 
 ```cpp
 ReadResult PosixFile::pread(std::uint64_t offset, std::size_t count) noexcept {
@@ -23,7 +23,7 @@ ReadResult PosixFile::pread(std::uint64_t offset, std::size_t count) noexcept {
 
 ### 1.2 `DataFile::write()` 每次写入分配临时 vector
 
-**文件**: `cpp/src/fileops/data_file.cpp:73-75`
+**文件**: `src/fileops/data_file.cpp:73-75`
 
 ```cpp
 std::vector<std::byte> buf;
@@ -38,7 +38,7 @@ auto w = file_.pwrite(off, buf);  // <--- buf 是临时分配
 
 ### 1.3 `DataFile::fold()` 每条记录两次 `pread` = 两次堆分配
 
-**文件**: `cpp/src/fileops/data_file.cpp:166-192`
+**文件**: `src/fileops/data_file.cpp:166-192`
 
 ```cpp
 // 第一次 pread: 只读 14B header 拿 key_sz/value_sz
@@ -54,7 +54,7 @@ auto br = file_.pread(offset, rec_total);              // <--- malloc #2
 
 ### 1.4 `HintFile::write()` 也有临时 vector 分配
 
-**文件**: `cpp/src/fileops/hint_file.cpp:50-51`
+**文件**: `src/fileops/hint_file.cpp:50-51`
 
 ```cpp
 std::vector<std::byte> buf;
@@ -65,7 +65,7 @@ hint record 固定大小（18B + key），完全可以用栈缓冲区。
 
 ### 1.5 `InvertedWAL` 逐字节 `fwrite` + 每次写入 `fflush`
 
-**文件**: `cpp/src/bm25/inverted_wal.cpp:15,89,93,98`
+**文件**: `src/bm25/inverted_wal.cpp:15,89,93,98`
 
 ```cpp
 bool write_u8(std::FILE* f, std::uint8_t v) {
@@ -89,7 +89,7 @@ std::fflush(file_);  // <--- 每次 append_add_doc 结尾强制 flush
 
 ### 2.1 `Index` 使用 `std::vector<bool>` — 经典性能陷阱
 
-**文件**: `cpp/include/bitcask/index.hpp:123`
+**文件**: `include/bitcask/index.hpp:123`
 
 ```cpp
 std::vector<bool> live_;  // 下标 = ord（Roaring 留待优化）
@@ -101,7 +101,7 @@ std::vector<bool> live_;  // 下标 = ord（Roaring 留待优化）
 
 ### 2.2 `Posting::positions` 每条 posting 独立堆分配
 
-**文件**: `cpp/include/bitcask/inverted.hpp:68`
+**文件**: `include/bitcask/inverted.hpp:68`
 
 ```cpp
 struct Posting {
@@ -117,7 +117,7 @@ struct Posting {
 
 ### 2.3 `put` 路径的字符串拷贝
 
-**文件**: `cpp/src/cask/cask.cpp:932-944`
+**文件**: `src/cask/cask.cpp:932-944`
 
 ```cpp
 submit_index_task(IndexTask{
@@ -136,7 +136,7 @@ submit_index_task(IndexTask{
 
 ### 2.4 `score_bow_topk` 中间 `unordered_map` 累加分数
 
-**文件**: `cpp/src/bm25/inverted.cpp:94`
+**文件**: `src/bm25/inverted.cpp:94`
 
 ```cpp
 using ScoreMap = std::unordered_map<std::uint64_t, float>;
@@ -156,7 +156,7 @@ ScoreMap scores = tbb::parallel_reduce(
 
 ### 2.5 `DataFile::read()` 不必要的 key/value 拷贝
 
-**文件**: `cpp/src/fileops/data_file.cpp:144-145`
+**文件**: `src/fileops/data_file.cpp:144-145`
 
 ```cpp
 out.key.assign(rec->key.begin(), rec->key.end());    // <--- 拷贝 key
@@ -167,7 +167,7 @@ out.value.assign(rec->value.begin(), rec->value.end()); // <--- 拷贝 value
 
 ### 2.6 `fstats_` 使用 `unordered_map<uint32_t, FStatsEntry>`
 
-**文件**: `cpp/include/bitcask/keydir.hpp:328`
+**文件**: `include/bitcask/keydir.hpp:328`
 
 文件 ID 通常是连续的小整数，`flat_vector` 或直接 `vector<FStatsEntry>` 按 file_id 下标访问会更快。
 
@@ -177,7 +177,7 @@ out.value.assign(rec->value.begin(), rec->value.end()); // <--- 拷贝 value
 
 ### 3.1 `KeyDir` 单一 `shared_mutex` 全局竞争
 
-**文件**: `cpp/src/keydir/keydir.cpp`
+**文件**: `src/keydir/keydir.cpp`
 
 所有操作（get/put/remove/alloc_ord/update_fstats）走同一把 `shared_mutex`。注释里已经提到 sharding 是 M6 候选。
 
@@ -196,7 +196,7 @@ std::unique_lock lock(mutex_);   // alloc_ord (line 220)
 
 ### 3.2 `SearchCache` 使用 `std::mutex` 而非 `shared_mutex`
 
-**文件**: `cpp/src/search/search_cache.cpp:21,37`
+**文件**: `src/search/search_cache.cpp:21,37`
 
 ```cpp
 std::lock_guard<std::mutex> lock(mutex_);  // get 也独占！
@@ -208,7 +208,7 @@ std::lock_guard<std::mutex> lock(mutex_);  // get 也独占！
 
 ### 3.3 `Cask::read_file()` 每次都锁 `read_cache_mu_`
 
-**文件**: `cpp/src/cask/cask.cpp:780-798`
+**文件**: `src/cask/cask.cpp:780-798`
 
 ```cpp
 fileops::DataFile* Cask::read_file(std::uint32_t file_id) {
@@ -226,7 +226,7 @@ fileops::DataFile* Cask::read_file(std::uint32_t file_id) {
 
 ### 4.1 `keydir::entries_` 使用 `std::unordered_map` — hash 碰撞 + cache 不友好
 
-**文件**: `cpp/include/bitcask/keydir.hpp:317`
+**文件**: `include/bitcask/keydir.hpp:317`
 
 ```cpp
 std::unordered_map<std::string, Entry, StringHash, std::equal_to<>> entries_;
@@ -238,7 +238,7 @@ std::unordered_map<std::string, Entry, StringHash, std::equal_to<>> entries_;
 
 ### 4.2 WAND 算法每轮重排序
 
-**文件**: `cpp/src/bm25/inverted.cpp:484`
+**文件**: `src/bm25/inverted.cpp:484`
 
 ```cpp
 while (true) {
@@ -251,7 +251,7 @@ while (true) {
 
 ### 4.3 `search_fields` 对每个 term 做独立搜索
 
-**文件**: `cpp/src/search/search_layer.cpp:417-423`
+**文件**: `src/search/search_layer.cpp:417-423`
 
 ```cpp
 for (auto& [t, boost] : term_boosts) {
@@ -271,7 +271,7 @@ for (auto& [t, boost] : term_boosts) {
 
 ### 5.1 `now_sec_default()` 在每次 `get/put` 调用
 
-**文件**: `cpp/src/cask/cask.cpp:27-31`
+**文件**: `src/cask/cask.cpp:27-31`
 
 ```cpp
 std::uint32_t now_sec_default() {
@@ -285,7 +285,7 @@ std::uint32_t now_sec_default() {
 
 ### 5.2 `InvertedIndex::df()` 查询热路径上的字符串拷贝
 
-**文件**: `cpp/src/bm25/inverted.cpp:1112,1119`
+**文件**: `src/bm25/inverted.cpp:1112,1119`
 
 ```cpp
 if (!shard.inverted.find(acc, std::string(term))) return 0;  // <--- copy on every find
@@ -402,7 +402,7 @@ LRU(get 共享锁并发,顺带修掉「返回内部指针,解锁后可被 evict 
 
 | # | 位置 | 问题 | 严重度 |
 |---|---|---|---|
-| M1 | cask.cpp read_file + merge 清理 | `read_file()` 返回缓存内 `unique_ptr.get()` 裸指针,调用方锁外使用;并发 merge `read_files_.erase()` 析构 DataFile → 在途 get UAF。窗口窄但机制成立,NIF 内崩的是 BEAM | **高** |
+| M1 | cask.cpp read_file + merge 清理 | `read_file()` 返回缓存内 `unique_ptr.get()` 裸指针,调用方锁外使用;并发 merge `read_files_.erase()` 析构 DataFile → 在途 get UAF。窗口窄但机制成立,调用方进程内崩 | **高** |
 | M2 | cask.cpp merge unlink 窗口 | erase fd(持锁)→放锁→unlink 之间,持旧 keydir 快照的在途 get lazy reopen:unlink 后打开 ENOENT → 假失败。与 M1 同根 | 低 |
 | M3 | inverted.cpp mutable_pl | CoW 协议(`use_count()==1 ⟺ 无读者`)前提"调用方持写 accessor"仅靠注释维持,无断言/类型强制 | 隐患 |
 | M4 | keydir.hpp CaskIter | 析构与并发 next() 竞态,文档自认,无防护(API 滥用才触发) | 低 |
@@ -458,7 +458,7 @@ L3+L4 与 BMW/恢复路线合并设计。M6:分片按 8.2-3 清单推进。
 ```bash
 gcc -O2 -shared -fPIC scripts/alloc_audit/alloc_shim.c -o /tmp/alloc_shim.so -ldl
 g++ -O2 -std=c++23 scripts/alloc_audit/alloc_audit.cpp -I cpp/include \
-    -Wl,--start-group _build/cmake/cpp/libbitcask_*.a \
+    -Wl,--start-group build/libbitcask_*.a \
     _build/cmake/_deps/utf8proc-build/libutf8proc.a -Wl,--end-group \
     -ltbb -lz -lpthread -ldl -o /tmp/alloc_audit
 LD_PRELOAD=/tmp/alloc_shim.so /tmp/alloc_audit

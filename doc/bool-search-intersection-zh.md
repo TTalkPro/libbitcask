@@ -5,7 +5,7 @@
 
 ## 1. 布尔查询语义
 
-布尔查询（S3 阶段引入）支持三种操作符，Erlang 侧查询串形如
+布尔查询（S3 阶段引入）支持三种操作符，查询串形如
 `"+hello +world -spam"`，由 `query_parser` 解析为 QueryAST：
 
 | 操作符 | 语义 | 集合含义 |
@@ -129,7 +129,7 @@ AVX2 做 u64 shuffle 交集的障碍只有一个：`_mm256_permutevar8x32_epi32`
 2 倍。块推进、守卫（cnt+8 越界防护的 u64 版为 cnt+4）与 §4③ 完全同构。
 
 **已原型实证（2026-06，i9-13900H/AVX2），原型收录于
-`cpp/bench/intersect_u64_proto_bench.cpp`**（opt-in bench 目标，
+`bench/intersect_u64_proto_bench.cpp`**（opt-in bench 目标，
 `--benchmark_filter=IntersectU64Proto`）：
 
 - 对拍 2354 组全过——覆盖 4/8 块边界尺寸 × 跨 2^32 边界/高位大值的
