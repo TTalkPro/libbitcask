@@ -68,7 +68,11 @@
 - [~] **⑧ `search_layer` 两个 `std::priority_queue` → 复用扁平有界堆** — `src/vector/hnsw.cpp`。**暂跳过（割当 hygiene，⑦ 实测前例）**：⑦ 已证 dim=384 下割当除去性能中性（距离计算主导）。⑧ 同类但是热路径双函数（f32 + int8 twin）重写、正确性风险更大；查询路径走 search_layer_int8。除非实测确证 −5~10% 否则不值。可作「做并实测、不赚就回退」的实验项。
 - [~] **⑨ AVX2 intersection 分支提取 → branchless compress** — `src/bm25/intersect.cpp:95`。**跳过（此机不可测 + 风险）**：本机走 AVX-512 路径（已用最优 `compressstoreu`），要改的 AVX2 路径仅 AVX2-only CPU 命中、**此机无法 benchmark**；且 permute+full-store 需输出缓冲 ≥3 qword slack 否则尾部 overflow。盲改不做。
 - [x] **⑩ 公共 `put` 每次 new `encoded`** — `src/cask/cask.cpp:1361`。已实现 (a)：`encoded` 改 `thread_local` 复用（clear 保容量，并发 put 各线程独占）。(b) scatter-write 双拷贝消除未做（较大重构）。📊 A/B：`BM_Put_WalBatch` **−4~6%**，`Cask_Put_Overwrite` 中性。无回归。
-- [ ] **⑪ data 文件每条记录一次无缓冲 `pwrite`（hint 已缓冲）** — `src/cask/cask.cpp:1113-1120`、`src/fileops/data_file.cpp:148`。**高风险（崩溃/持久语义）**：缓冲 data 追加触及 crash recovery torn-tail 协议，需单独谨慎设计 + 崩溃注入测试。**待显式确认**。
+- [~] **⑪ data 文件每条记录一次无缓冲 `pwrite`** — `src/cask/cask.cpp`、`src/fileops/data_file.cpp:148`。**❌ 按设计否决（WAL 语义下 = 丢数据）**。
+  - **data 文件即 WAL**：现状每条记录立即 pwrite → 字节立刻进内核 page cache，**进程崩溃一条不丢**（重启 fold 读 data 文件即得）。⑪ 把字节攒在用户态内存 → 进程崩在 flush 前那批**从没进内核 → 直接丢失**，正是 WAL 要防的事。
+  - 与持久化模型冲突（`cask.hpp:58-62`）：`o_sync`（逐条 O_SYNC durable）下 ⑪ **根本不兼容**；`sync_every_n` 组提交下 ⑪ 把丢数据窗口从「仅断电」扩大到「连进程崩溃也丢」。
+  - 前提也不成立：对持久 WAL，贵的是 **fsync**（等磁盘），不是 pwrite（拷进 page cache，便宜）；而 fsync 批处理**已由 `maybe_group_commit`（`cask.cpp:946`）的组提交实现**。⑪ 是「不安全地优化便宜的一半，而贵的一半早已优化」。
+  - 唯一不牺牲持久性的 syscall 批处理 = **批量 put API**（一次 encode N 条、一次 pwrite，N 条整体进内核），但前提是写入本来就成批；非 ⑪ 的「跨已确认写缓冲」。
 - [~] **⑫ WAND `total_ub` 每轮重新累加所有 term 上界** — `src/bm25/inverted.cpp:601-604`。**跳过（FP 风险）**：total_ub 用于 epsilon 敏感的 admissible block-skip（注释 629-632 明确警告不能加 epsilon）。增量 FP 和与每轮新求和最终位会漂移，total_ub 偏小 → 过剩跳过 → 结果欠落。小 t 利得僅少，不值此风险。
 - [~] **⑬ `select_neighbors` O(M²) 距离重算无缓存** — `src/vector/hnsw.cpp:584`（int8 版 607）。**跳过（无法缓存）**：内层是 candidate↔picked 两两距离，每对唯一、跨调用无复用，缓存不掉；只能微优化 `vec_of(pid)` 提升，收益僅微。构建期成本本就由 search_layer 主导（agent 评 secondary）。
 - [x] **⑭ `serialize` 每 FOR block / positions 列表 new 一个 vector** — `src/bm25/inverted.cpp:1761`。已实现：`packed`/`ords_view` 提到块循环外复用（`for_encode_block` 内部自 clear/assign，安全）。save 路径，无回归。
