@@ -127,6 +127,14 @@ target_link_libraries(bitcask_cask_docvalue_test PRIVATE
 target_compile_definitions(bitcask_cask_docvalue_test PRIVATE
     BITCASK_JIEBA_DICT_DIR="${BITCASK_JIEBA_DICT_DIR}")
 
+add_executable(bitcask_crash_recovery_test crash_recovery_test.cpp)
+target_link_libraries(bitcask_crash_recovery_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 add_executable(bitcask_inverted_wal_test inverted_wal_test.cpp)
 target_link_libraries(bitcask_inverted_wal_test PRIVATE
     GTest::gtest_main
@@ -216,6 +224,7 @@ gtest_discover_tests(bitcask_inverted_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_jieba_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_keydir_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_cask_docvalue_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_crash_recovery_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_search_layer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_inverted_wal_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_highlighter_test ${_bitcask_test_props})

@@ -666,6 +666,66 @@ TEST_F(CaskUpgradeTest, UpgradePreservesDeletes) {
     (*upg)->close();
 }
 
+// --- C1 延后 apply：merge 失败时 keydir 完全未动，所有 key 立即可见 ---
+//
+// 复现：写多个文件 → 给 merge 传一个不存在的输入路径触发 kInputOpenFailed →
+// 验证：(1) merge 返回错误；(2) 失败后所有 key 仍可 get（keydir 未动）；
+// (3) 值完全不变。改造前（fold 内即时 CAS），已 fold 的部分 key 会指向
+// 已 cleanup 删掉的输出文件 → get() 失败，需重启 fold 才能恢复可见性。
+TEST_F(CaskDocValueTest, MergeFailurePreservesKeyDirVisibility) {
+    namespace fs = std::filesystem;
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.max_file_size = 256;  // 强制 roll 出多个 data 文件
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    auto& cask = **c;
+
+    constexpr int N = 20;
+    std::map<std::vector<std::byte>, std::vector<std::byte>> expected;
+    for (int i = 0; i < N; ++i) {
+        std::vector<std::byte> key{std::byte{'k'}, static_cast<std::byte>(i)};
+        std::vector<std::byte> val(40, static_cast<std::byte>(i));
+        ASSERT_TRUE(cask.put(key, val, static_cast<std::uint32_t>(1000 + i)));
+        expected[key] = val;
+    }
+    ASSERT_GE(expected.size(), 20u);
+
+    // 失败前快照：所有 key 应可见
+    for (const auto& [k, v] : expected) {
+        auto r = cask.get_owned(k);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->value, v);
+    }
+
+    // 收集 data 文件并构造无效 merge 输入（含不存在路径 → kInputOpenFailed）
+    std::vector<std::pair<std::uint32_t, std::string>> files;
+    for (const auto& de : fs::directory_iterator(tmpdir_)) {
+        const auto name = de.path().filename().string();
+        if (auto t = bitcask::fileops::parse_data_tstamp(name)) {
+            files.push_back({static_cast<std::uint32_t>(*t), de.path().string()});
+        }
+    }
+    ASSERT_GE(files.size(), 2u) << "max_file_size 应已滚出多个文件";
+    std::sort(files.begin(), files.end());
+    std::vector<std::string> invalid_input = {
+        files[0].second,
+        (tmpdir_ / "9999999.bitcask.data").string(),  // 不存在
+    };
+
+    auto mr = cask.merge(invalid_input);
+    EXPECT_FALSE(mr) << "含无效路径的 merge 应失败";
+
+    // 关键验证：失败后所有 key 仍可 get，值完全不变
+    for (const auto& [k, v] : expected) {
+        auto r = cask.get_owned(k);
+        ASSERT_TRUE(r) << "merge 失败后 key 仍应可见";
+        EXPECT_EQ(r->value, v) << "值应不变";
+    }
+
+    cask.close();
+}
+
 // --- S13: fold 文件句柄快照 pin —— fold 跨越并发 merge 的 unlink 仍正确 ---
 //
 // 复现：小 max_file_size 滚出多个 data 文件 → 开 fold（next() 一次触发 pin）→
