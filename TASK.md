@@ -80,6 +80,195 @@
 - [x] **⑯ `f32 prefetch_vec` 不感知 dim** — `src/vector/hnsw.cpp:222`。已实现：传 dim，按字节守卫每条 prefetch（仿 int8 路径）。dim=384 性能中性（分支可预测），小 dim 不再越尾预取。
 - [x] **⑰ 可选 `-march=native` 构建开关** — `CMakeLists.txt`。已实现 opt-in `BITCASK_NATIVE`（默认 OFF；ON 时加 `-march=native` 榨 scalar glue ~3-8%，破坏二进制可移植性）。**jemalloc 不做**（用户明确不需要）。未加 `-ffast-math`（HNSW/int8 依赖精确可复现浮点，self-test 校验 ULP）。
 
+## 第四梯队：生产正确性问题（必做，<1 天/项）
+
+> 来源：2026-06-22 API / 错误处理 / 可观测性 / 生命周期审计（原 perf 审计未覆盖维度，4 个并行 explore agent）。
+> 这些都是**用户/数据可见**的失败模式，逻辑上与 ⑪「WAL 不能丢数据」同级。建议在任何下一波性能优化前先清掉——否则性能建立在脆弱基础上。
+> 风险/收益与第一梯队反向：这里**风险=不做就生产事故**，收益=「消除静默损坏」。
+
+- [ ] **C1 `run_merge` 失败泄露部分输出文件** — `src/merge/merger.cpp:156-168`
+  - 现状：`out_hint->finalize()` 或 `out_data->sync()` 失败时直接返回错误，**不清理 `output_data_path` / `output_hint_path`**。残文件留在盘上。
+  - 后果：下次 `needs_merge` 把这些**残文件当输入** → 数据损坏或 merge 失败循环。Ops 无错误提示。
+  - 改法：失败分支 `std::filesystem::remove()` 两个输出路径（容许 ignore ENOENT）。
+  - 风险：无（纯 cleanup）；改动 ~5 行。
+
+- [ ] **C2 `bitcask_set_synonym_map` 静默吞加载错误** — `c_api/bitcask_c.cpp:497-506`、`include/bitcask/synonym_map.hpp:18-37`
+  - 现状：**API 签名是对的**（C API 已返回 `bitcask_error_t` + 有 `fault` 出参；C++ `set_synonym_map(unique_ptr)` 接管所有权，`void` 合理）。问题在实现链路：
+    - `SynonymMap::load_from_file` 返回 `void`，文件打不开 `if (!file) return;` 静默返回。
+    - C API `bitcask_set_synonym_map` 不检查加载结果，**永远返回 `BITCASK_OK`**。
+  - 后果：文件不存在/解析错 → 用户以为同义词生效，实际 `set_synonym_map` 装了个空 map；Ops 无法察觉。
+  - 改法（**零 API 破坏**）：(1) `load_from_file` 返回 `bool`（成功/失败）；(2) C API 检查返回值，失败填 `fault` + 返 `BITCASK_ERR_IO`。共 ~10 行。
+  - 风险：无（签名不变，只开始正确填充早就设计好的错误出参）。
+
+- [ ] **C3 IndexPool worker `catch(...)` 吞所有异常 → 索引静默漂移** — `src/cask/cask.cpp:620-647`
+  - 现状：`search.on_write()` / `on_delete()` 抛异常被吞，`pending_--`，worker 继续。注释「best-effort」。
+  - 后果：keydir 与 search index **悄悄不一致**；get/put 正常但搜索返回陈旧/缺失结果。**Ops 无任何信号**——没日志、没计数、没告警。
+  - 改法（最小）：加 `std::atomic<std::uint64_t> index_errors_` 计数；暴露到 `bitcask_status()`；可选挂一个 `on_index_error` 回调 hook。
+  - 风险：低（计数器是无锁原子，热路径开销 relaxed RMW）。
+
+- [ ] **C4 IndexPool 析构 UB（`start()` 未调用即销毁）** — `include/bitcask/thread_pool.hpp:169,230`
+  - 现状：`~IndexPool()` → `stop()` → `worker_.join()`；若 `start()` 从未调用，`worker_` 默认构造，`joinable()` 返回 false 当前已 guard——需核实。**核实点**：若 `start()` 失败回滚，worker 可能在半启动状态。
+  - 后果：`Cask::open()` 失败回滚路径 → UB 崩溃。
+  - 改法：`stop()` 加 `started_` 标志门；或 `worker_.joinable()` guard 写得更严格。
+  - 风险：低；需先核实当前 `joinable()` 是否已正确 guard（若是则降级为文档项）。
+
+- [ ] **C5 `close()` 标 `noexcept` 但调用非 noexcept 操作** — `src/cask/cask.cpp:662`
+  - 现状：`close() noexcept` 调 `maybe_group_commit()` / `active_hint_->finalize()` / `save_search_ckpt()` / `save_snapshot()`——这些都不是 noexcept。任何抛出 → `std::terminate`。
+  - 后果：关闭路径任何异常 = **进程硬死**，无日志、无 cleanup 机会。
+  - 改法：要么去 noexcept、要么内部 `try/catch(...)` 兜底 + 错误记到成员/日志。
+  - 风险：低（去 noexcept 是 API 变更；内部 try/catch 是内部修改）。
+
+## 第五梯队：高 ROI 性能（启动延迟 + 索引吞吐，原审计未覆盖）
+
+> 来源：2026-06-22 recovery / analyzer / checkpoint / IndexPool 审计。
+> 原审计（①-⑰）聚焦**查询热路径**；启动延迟 + 写入/索引吞吐几乎未触。下列是确证高 ROI、风险低、改动小的项。
+> 预期总体：大库冷启动 **−30~50%**，写入/索引吞吐显著提升（具体数字待 A/B）。
+
+### 启动恢复（冷启动延迟）
+
+- [ ] **R1 `DataFile::read()` 在 fold 路径每记录 2 次堆分配** — `src/fileops/data_file.cpp:218-219`
+  - 现状：`out.key.assign(...)` / `out.value.assign(...)` 每记录两次 `vector::assign` 堆分配；fold 调用方（`cask.cpp:799`）只用 `bytes_to_view()`——**堆拷贝完全浪费**。
+  - 改法：加 fold-friendly 读路径返回 `DataRecordView`（span 进 thread_local 解码缓冲，仿 `get()` 的 mmap 零拷贝路径）。
+  - 收益：**100 万记录启动省 200 万次 malloc**。
+  - 风险：低（fold 专用，不影响 query 路径）。
+
+- [ ] **R2 `HintFile::fold()` 每记录 2 次 pread syscall** — `src/fileops/hint_file.cpp:79-130`
+  - 现状：每条 hint 记录先 `pread(18)` 读头、再 `pread(full_size)` 读完整记录——**2 syscall/记录**。
+  - 改法：64-256KB thread_local chunked read + 流式解析（仿 ⑮ 的 `pread_into` 模式扩展到整段 fold）。
+  - 收益：**100 万 hint 文件：200 万 syscall → hundreds**。
+  - 风险：低（流式解析结构已支持，buf.resize 已有）。
+
+- [ ] **R3 多数据文件 fold 串行** — `src/cask/cask.cpp:752-855`
+  - 现状：`for (file : entries) df->fold(...)` 完全串行；keydir 分片锁本就支持并发写。
+  - 改法：`std::async` 或 worker pool 并行 fold N 文件、按 tstamp 序合并入 keydir。
+  - 收益：**大库多文件冷启动 ~N× 加速**（N = 数据文件数；典型 8-32）。
+  - 风险：中（需保证 tstamp 顺序、keydir 并发正确、错误传播）。
+
+### 索引/写入吞吐
+
+- [ ] **W1 NgramAnalyzer 每 n-gram 一次堆分配** — `src/text/analyzer.cpp:187-193`
+  - 现状：每个 n-gram 构造一个 `std::string`，`tpm[std::move(term)]` 还是拷贝进 map 节点。Latin 文本 1KB 文档 ~ 数千 bigram → 数千 malloc。
+  - 改法：`std::string_view` 作 map key；归一化后整段 `std::string` 单独持有，key 切片进它。
+  - 收益：**每文档 N 次堆分配 → 0**（N = n-gram 数；CJK trigram 更甚）。
+  - 风险：低（map 必须 owning 整段 string；lifecycle 已就地）。
+
+- [ ] **W2 `IndexTask::make` fields 参数双重拷贝 + vec/meta assign 拷贝** — `include/bitcask/thread_pool.hpp:86-107`、`src/cask/cask.cpp:1505-1513`
+  - 现状：(a) `make()` 取 `fields_` by value；`task_fields()` 是 prvalue 但 copy-initialize 参数（非 move）。(b) `task.vec.assign(begin, end)` / `task.meta.assign(...)` 是拷贝。
+  - 改法：(a) `fields_&&` + caller `std::move(task_fields())`；(b) vec/meta 改 `std::move` 或换 `std::span`（caller 保活到 flush）。
+  - 收益：**每个 put_doc 省 1~3 次堆分配 + 1~2 次大拷贝**（128-dim vec = 512B）。
+  - 风险：低（move 语义标准；span 方案需审计 caller lifetime）。
+
+- [ ] **W3 `IndexPool::flush()` 自旋 `yield()` 浪费 CPU** — `include/bitcask/thread_pool.hpp:199-201`
+  - 现状：`while (pending_.load(acquire) > 0) std::this_thread::yield();`——`pending_` cache line 在 flusher 与 worker 间来回弹。
+  - 改法：加 `std::condition_variable cv_` + `std::mutex`；worker `fetch_sub` 后若归 0 则 `notify`；`flush()` wait on cv。
+  - 收益：flush 路径 CPU 占用 **−5~15%**（merge / close 场景显现）。
+  - 风险：低（cv 语义严格强于 spin）。
+
+## 第六梯队：结构性优化（高收益但需设计）
+
+> 这些需要新 API 或较大重构，建议第五梯队落地后再做（部分有依赖关系）。
+
+- [ ] **S1 `put_doc_batch` API + `submit_index_task_batch`** — `src/cask/cask.cpp`、`include/bitcask/thread_pool.hpp`
+  - 现状：每 `put_doc` 单任务入队，1M 文档批量索引 = 1M 次锁。
+  - 改法：批量入队 API（vector of IndexTask 一次锁）；可选配套 `Cask::put_doc_batch`。
+  - 收益：批量索引吞吐 **2-5×**（多核机器）。
+  - 风险：中（新公共 API + 测试 + 文档）。
+
+- [ ] **S2 Merger 批量 `write`（每条 pwrite → 累积 N 条一次 pwrite）** — `src/merge/merger.cpp:102-118`、`src/fileops/data_file.cpp:148`
+  - 现状：fold callback 每条 live 记录调一次 `out_data->write()` → 一次 `pwrite`。
+  - 改法：`DataFile::write_batch(span<Record>)` 累积到 1MB 缓冲再一次 pwrite；hint 已 batched（kFlushBytes=64KB）。
+  - 收益：**100 万记录 merge 节省 ~10s**（高延迟 I/O 更显著）；syscall 数 N → N/batch_size。
+  - 风险：中（需保 hint/data 位置原子性；新 API；partial write 处理）。
+
+- [ ] **S3 Recovery 期 IndexPool 批量化 / 流水线** — `src/search/search_layer.cpp` `recover_doc`
+  - 现状：recovery 时每 doc 同步走 `bm25::InvertedIndex::add_doc`，未走 IndexPool，无批量化、无流水线。
+  - 改法：批量 1024 一组；analysis 与 index insert 流水线（batch N 分析 vs batch N-1 插入重叠）。
+  - 收益：冷启动索引重建 **~2× 加速**（CPU bound 部分）。
+  - 风险：中（需保证 ord 顺序一致）。
+
+- [ ] **S4 Checkpoint / keydir 序列化：reserve + memcpy 替代 N 次 vector::insert** — `src/search/search_layer.cpp:803-812`、`src/keydir/keydir.cpp:1082-1089`
+  - 现状：每个字段一次 `buf.insert(end, p, p+n)`；vector 多次 realloc。
+  - 改法：预估总长 `reserve()` 一次，后续 `memcpy` 到 `data() + offset`。
+  - 收益：docmap/keydir save 路径 **5M insert → 1 reserve + 5M memcpy**。
+  - 风险：低（size 可计算）。
+
+- [ ] **S5 Checkpoint 可选 zstd 压缩** — `src/search/search_layer.cpp:998-1109`
+  - 现状：docmap/bm25/hnsw payload 全部原始序列化，大库可达 GB 级。
+  - 改法：section header 加 `compression` 标志（0=raw, 1=zstd）；zstd level 1（2-4× 压缩比，~1GB/s）。
+  - 收益：checkpoint 文件体积 **−50~70%**；冷启动 I/O 减少。
+  - 风险：低（向后兼容：旧文件 compression=0）。
+
+## 第七梯队：小修小补（低成本、收益较小）
+
+> 来源：merger / analyzer / jieba 审计的边角发现。可穿插在任何阶段做。
+
+- [ ] **P1 `merge_policy::cap_size` 无条件分配 vector** — `src/merge/merge_policy.cpp:146-164`
+  - `max_merge_size==0` 时 `return files;`（const ref → copy）；改 `return {}` 让 caller 自查。
+- [ ] **P2 HintFile `kFlushBytes` 64KB → 1MB** — `include/bitcask/hint_file.hpp:95`
+  - merge 时 hint flush 次数 16×↓。
+- [ ] **P3 `nfkc_fold` ASCII fast path 仍 std::string 拷贝** — `include/bitcask/text_utils.hpp:68-74`
+  - 大多数索引文本以 ASCII 为主；in-place 或返回 `string_view`。
+- [ ] **P4 `to_codepoints` 必堆分配 vector** — `include/bitcask/text_utils.hpp:99-118`
+  - 改出参 `vector<CpInfo>& out` 或 `thread_local` 复用。
+- [ ] **P5 Jieba `jieba_cut` 多余 `std::string(sentence)` 拷贝** — `src/text/jieba_analyzer.cpp:97-99`
+  - 检查 cppjieba 是否接受 string_view。
+- [ ] **P6 Jieba 输出词再走一次 NFKC + codepoint** — `src/text/jieba_analyzer.cpp:144-146`
+  - 源已归一化；冗余工作；考虑缓存或短路。
+- [ ] **P7 Jieba 词位置搜索 O(n²)** — `src/text/jieba_analyzer.cpp:171-185`
+  - 每个 jieba 词线性扫全 codepoint 数组；考虑后缀数组或多模式匹配。
+
+## 第八梯队：工程基础设施（不阻塞优化但阻塞可维护性）
+
+> 来源：测试 / bench / 构建 / CI 审计。
+> **重要**：第一~七梯队所有改动的「回归保护」依赖这里。没 CI 意味着 429/429 这个数字没有持续验证。
+
+### 测试缺失（必加项标 **\***）
+
+- [ ] **T1\* 崩溃恢复测试（fork+SIGKILL+restart → fold）** — `tests/crash_recovery_test.cpp`（新建）
+  - 保护 R1/R2 + torn-write 截断路径（`cask.cpp:847-853`）。
+- [ ] **T2\* Merge 并发 writer 测试** — `tests/merge_concurrent_writer_test.cpp`（新建）
+  - 保护 C1 修复 + tier-1 ④ 假共享消除 + write.lock/merge.lock 独立性。
+- [ ] **T3\* Checkpoint 腐败回退测试** — `tests/checkpoint_recovery_test.cpp`（新建）
+  - 保护 P14e 设计契约：`search.ckpt` / `kv.keydir.ckpt` CRC 失败 → 全量 fold。
+- [ ] **T4 IndexPool 背压 / 关闭排空测试** — `tests/index_pool_backpressure_test.cpp`（新建）
+  - 队列满 → submit 阻塞；stop() 排空 pending。
+- [ ] **T5 `key_length_histogram` 测试** — `tests/keydir_histogram_test.cpp`（新建）
+  - 验证 tier-2 ⑤ 诊断探针（bucket 边界、sso/heap 计数）。
+- [ ] **T6 `thread_local encoded` 并发测试** — `tests/thread_local_encoded_buffer_test.cpp`（新建）
+  - 保护 tier-3 ⑩ 多线程并发 put 无干扰。
+
+### Bench 缺失
+
+- [ ] **B1 Merge 吞吐 bench** — `bench/merge_bench.cpp`（新建）
+  - 度量 S2 + tier-1 ④；记录数/秒、MB/秒。
+- [ ] **B2 IndexPool 异步路径 bench** — `bench/index_pool_bench.cpp`（新建）
+  - 度量 W2/W3；submit 延迟、worker 处理延迟。
+- [ ] **B3 大 keydir bench（>cache，1M key）** — 扩展 `bench/keydir_bench.cpp`
+  - 永久回归保护 tier-2 ⑤ 的 −31%；当前 1024 key 永远 cache-hot 测不出。
+- [ ] **B4 Checkpoint 保存/加载 bench** — `bench/checkpoint_bench.cpp`（新建）
+  - 度量 S4/S5；ms/save、ms/load。
+
+### 构建加固（独立于优化，可任意时刻加）
+
+- [ ] **H1 栈保护 `-fstack-protector-strong`** — `CMakeLists.txt`
+- [ ] **H2 `_FORTIFY_SOURCE=2`** — `CMakeLists.txt`（需配合 `-O2` 以上）
+- [ ] **H3 Full RELRO `-Wl,-z,relro,-z,now`** — `CMakeLists.txt`
+- [ ] **H4 可执行文件 PIE `-pie`** — `CMAKE_EXE_LINKER_FLAGS`（migrate_le / gen_inert_table）
+- [ ] **H5 PCH（precompiled header）** — `CMakeLists.txt`
+  - `target_precompile_headers(bitcask_cask PRIVATE bitcask/cask.hpp)` 等；编译时间 −20~30%。
+
+> 当前只有 `-fvisibility=hidden` + `-fPIC`（SO 用）；RELRO/FORTIFY/栈保护全无。
+
+### CI（完全空白）
+
+- [ ] **CI1 `.github/workflows/ci.yml`：Release + ctest on PR**
+- [ ] **CI2 Sanitizer matrix（ASAN/UBSAN/TSan）**
+  - TSan 是 Barrier v2 / IndexPool 并发协议的唯一回归保护。
+- [ ] **CI3 Benchmark-on-PR 追踪**
+  - 周期跑 bench → JSON artifact；可选 PR 回归检测（>10% 报警）。
+
+> 现 429/429 全绿仅本地验证；无 CI 意味着无回归检测。
+
 ## 已核实「无需改动」（避免重复审计）
 
 - CRC32：PCLMULQDQ 硬件路径 + zlib fallback，已最优。
@@ -89,7 +278,22 @@
 - LTO/IPO：已开（`BITCASK_LTO=ON`）。
 - `live` 谓词 `std::function`：仅在结果收集 O(k) 处调用，不在图遍历热路径。
 - BM25 评分：branchless + SIMD 派发，live/dl 批量化消除 per-posting 虚调用。
+- Merger fold buffer 复用：`data_file.cpp` write_buf_ / hint pending_ 已正确复用（输出侧无堆分配问题；S2 是 syscall 批量化的独立维度）。
+- `std::string_view` key in fold callback：`merger.cpp:89-91` 已零拷贝指向 fold 复用缓冲。
+- IndexPool 队列底座：`tbb::concurrent_bounded_queue` 已 MPSC lock-free；问题在 flush 等待策略（W3）而非队列本身。
 
 ## 建议执行顺序
 
-第一梯队 **①②③④** 可一批做完（各处改动小、互不耦合），跑测试验证后再上结构性的 **⑤⑥**。第三梯队按需穿插。
+**已完成（2026-06-22）**：第一梯队 ①②③④ + 第二梯队 ⑤⑥ + 第三梯队 ⑦⑩⑭⑮⑯⑰。⑧⑨⑫⑬ 跳过（风险/不可测/无收益），⑪ 按设计否决（WAL 语义）。
+
+**下一波建议（按依赖关系）**：
+
+1. **第四梯队（C1-C5）+ T1-T3 配套测试** ← 阻塞生产部署，必须先做
+2. **CI1-CI2（Release + TSan）** ← 后续一切改动的护栏
+3. **第五梯队 R1/R2/W1**（启动 + 索引热路径，最高 ROI 性能）
+4. **第五梯队 R3/W2/W3**（需 R1/W1 基础）
+5. **第六梯队 S1-S5**（结构性优化，依赖第五梯队的 batch/zero-copy 基础）
+6. **第七梯队 P1-P7** 按需穿插
+7. **第八梯队剩余（T4-T6、B1-B4、H1-H5、CI3）** 长期推进
+
+> **关键决策点**：第一~三梯队是「查询热路径性能」；第四梯队是「生产正确性」；第五梯队是「启动 + 索引吞吐」。**前者的优化基础不能跳过后者**——否则性能建立在脆弱基础上。
