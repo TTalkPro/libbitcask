@@ -6,8 +6,10 @@
 >
 > 本文解释三个递进的概念——k-way 交集、posting 块级元数据、
 > Block-Max WAND——以及它们为什么应排在 AVX-512 内核之前。
-> 状态：**§2(k-way)已落地(TASK.md K1,2026-06-12)**;块级元数据、
-> BMW 未实施。
+> 状态：**§2/§3/§4/§6 均已落地**——k-way(K1)、块级元数据、must-only
+> 合取 BMW(B1/v5,§6,2026-06-12)、以及 disjunctive top-k 的 `search_wand`
+> 都已实现。本文是**设计路线 / 动机 / 选型**记录;**已实现版的算法讲解 +
+> 现有代码映射见 [`wand-blockmax-zh.md`](wand-blockmax-zh.md)**。
 >
 > K1 实测修正本文 §2 的预期:在尺寸升序 pairwise + SIMD/galloping
 > 内核(经预分配/游标优化)之上,k-way 的去物化**没有可测时间收益**
@@ -105,6 +107,9 @@ posting:  [ord0 ... ord127][ord128 ... ord255][ord256 ...]
 这是 §4 跳过整块的依据。
 
 ## 4. 第三步：WAND → Block-Max WAND（BMW）
+
+> 本节是设计动机层面的介绍。**已实现的 `search_wand` 算法逐步讲解 + 变量
+> 映射表**见 [`wand-blockmax-zh.md`](wand-blockmax-zh.md)。
 
 ### 4.1 WAND（Broder et al., CIKM 2003）
 
