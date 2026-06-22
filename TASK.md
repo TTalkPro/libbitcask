@@ -60,17 +60,21 @@
 
 ## 第三梯队：小修小补（低成本、收益较小）
 
-- [ ] **⑦ HNSW `scratch`/`found`/`pool` 每次调用都 new → 改 `thread_local`** — `src/vector/hnsw.cpp:727,841,749,792`（仿已有 `t_visited`）。查询 −2~5%。
-- [ ] **⑧ `search_layer` 每次构造两个 `std::priority_queue`（各自 malloc）→ 复用扁平有界堆** — `src/vector/hnsw.cpp:422-423`（int8 双胞胎 522-523）。查询 −5~10%。
-- [ ] **⑨ AVX2 intersection 用 4 个数据相关分支提取匹配 → branchless compress** — `src/bm25/intersect.cpp:95-98`（AVX-512 路径已用 `compressstoreu`；文件注释已标 PairLut 待测）。
-- [ ] **⑩ 公共 `put` 把 value memcpy 两次 + 每次 new `encoded`** — `src/cask/cask.cpp:1361-1365`。(a) `encoded` 改复用缓冲（仿 `write_buf_`）；(b) scatter-write 消除 DocValue→record 双拷贝。
-- [ ] **⑪ data 文件每条记录一次无缓冲 `pwrite`（hint 已缓冲）** — `src/cask/cask.cpp:1113-1120`、`src/fileops/data_file.cpp:148`。缓冲 data 追加，group-commit/roll 时合并 flush，系统调用 N→N/sync_n。
-- [ ] **⑫ WAND `total_ub` 每轮重新累加所有 term 上界** — `src/bm25/inverted.cpp:587-590`。改维护增量 `live_ub_sum`。
-- [ ] **⑬ `select_neighbors` O(M²) 距离重算无缓存** — `src/vector/hnsw.cpp:584`（int8 版 607）。构建期成本，build 吞吐 +5~10%。
-- [ ] **⑭ `serialize` 每 FOR block / positions 列表 new 一个 vector** — `src/bm25/inverted.cpp:1747-1751,1695-1701`。save 路径，hoist + reuse 缓冲。
-- [ ] **⑮ `HintFile::validate_trailer` 每 64KiB chunk 一次堆分配** — `src/fileops/hint_file.cpp:157-166`。改 `pread_into` + 复用缓冲（fold 已用此模式）。
-- [ ] **⑯ `f32 prefetch_vec` 不感知 dim** — `src/vector/hnsw.cpp:222-237`。仿 int8 路径按 dim 守卫每条 prefetch。
-- [ ] **⑰ 可选 `-march=native` / jemalloc 构建开关** — `CMakeLists.txt`。opt-in `BITCASK_NATIVE`（scalar glue ~3-8%）、`BITCASK_MALLOC`（写密集分配压力）。注意：**勿全局加 `-ffast-math`**，HNSW/int8 依赖精确可复现浮点（self-test 校验 ULP）。
+> 2026-06-22 本轮做了 ⑦⑭⑮⑯（安全的分配除去 / dim 修正），跳过 ⑫（FP 风险）。其余 ⑧⑨⑩⑪⑬⑰ 为中风险/策略项，待逐项确认后再做。全程 429/429 通过。
+
+- [x] **⑦ HNSW `scratch`/`found`/`pool` 每次调用都 new → 改 `thread_local`** — `src/vector/hnsw.cpp`（仿 `t_visited`）。
+  - 已实现：search/insert 的 `scratch`/`found` + insert 收缩的 `pool` 全部 `thread_local` 复用（resize/clear 保容量）。serialize 的冷路径 scratch 保留。
+  - 📊 同会话 back-to-back A/B（`BM_Hnsw_Search`，dim=384）：**性能中性**（±2~3% 噪声内）。dim=384 下 malloc 仅占查询时间极小一段 → 测不出；价值在高并发/多索引时降低 allocator 压力（hygiene）。无回归。
+- [~] **⑧ `search_layer` 两个 `std::priority_queue` → 复用扁平有界堆** — `src/vector/hnsw.cpp`。**暂跳过（割当 hygiene，⑦ 实测前例）**：⑦ 已证 dim=384 下割当除去性能中性（距离计算主导）。⑧ 同类但是热路径双函数（f32 + int8 twin）重写、正确性风险更大；查询路径走 search_layer_int8。除非实测确证 −5~10% 否则不值。可作「做并实测、不赚就回退」的实验项。
+- [~] **⑨ AVX2 intersection 分支提取 → branchless compress** — `src/bm25/intersect.cpp:95`。**跳过（此机不可测 + 风险）**：本机走 AVX-512 路径（已用最优 `compressstoreu`），要改的 AVX2 路径仅 AVX2-only CPU 命中、**此机无法 benchmark**；且 permute+full-store 需输出缓冲 ≥3 qword slack 否则尾部 overflow。盲改不做。
+- [x] **⑩ 公共 `put` 每次 new `encoded`** — `src/cask/cask.cpp:1361`。已实现 (a)：`encoded` 改 `thread_local` 复用（clear 保容量，并发 put 各线程独占）。(b) scatter-write 双拷贝消除未做（较大重构）。📊 A/B：`BM_Put_WalBatch` **−4~6%**，`Cask_Put_Overwrite` 中性。无回归。
+- [ ] **⑪ data 文件每条记录一次无缓冲 `pwrite`（hint 已缓冲）** — `src/cask/cask.cpp:1113-1120`、`src/fileops/data_file.cpp:148`。**高风险（崩溃/持久语义）**：缓冲 data 追加触及 crash recovery torn-tail 协议，需单独谨慎设计 + 崩溃注入测试。**待显式确认**。
+- [~] **⑫ WAND `total_ub` 每轮重新累加所有 term 上界** — `src/bm25/inverted.cpp:601-604`。**跳过（FP 风险）**：total_ub 用于 epsilon 敏感的 admissible block-skip（注释 629-632 明确警告不能加 epsilon）。增量 FP 和与每轮新求和最终位会漂移，total_ub 偏小 → 过剩跳过 → 结果欠落。小 t 利得僅少，不值此风险。
+- [~] **⑬ `select_neighbors` O(M²) 距离重算无缓存** — `src/vector/hnsw.cpp:584`（int8 版 607）。**跳过（无法缓存）**：内层是 candidate↔picked 两两距离，每对唯一、跨调用无复用，缓存不掉；只能微优化 `vec_of(pid)` 提升，收益僅微。构建期成本本就由 search_layer 主导（agent 评 secondary）。
+- [x] **⑭ `serialize` 每 FOR block / positions 列表 new 一个 vector** — `src/bm25/inverted.cpp:1761`。已实现：`packed`/`ords_view` 提到块循环外复用（`for_encode_block` 内部自 clear/assign，安全）。save 路径，无回归。
+- [x] **⑮ `HintFile::validate_trailer` 每 64KiB chunk 一次堆分配** — `src/fileops/hint_file.cpp:152`。已实现：`pread_into(off, span)` + 复用缓冲（容量只增）替代 `file_.read(n)`。open 路径 O(filesize/64K)→1 次分配，无回归。
+- [x] **⑯ `f32 prefetch_vec` 不感知 dim** — `src/vector/hnsw.cpp:222`。已实现：传 dim，按字节守卫每条 prefetch（仿 int8 路径）。dim=384 性能中性（分支可预测），小 dim 不再越尾预取。
+- [x] **⑰ 可选 `-march=native` 构建开关** — `CMakeLists.txt`。已实现 opt-in `BITCASK_NATIVE`（默认 OFF；ON 时加 `-march=native` 榨 scalar glue ~3-8%，破坏二进制可移植性）。**jemalloc 不做**（用户明确不需要）。未加 `-ffast-math`（HNSW/int8 依赖精确可复现浮点，self-test 校验 ULP）。
 
 ## 已核实「无需改动」（避免重复审计）
 

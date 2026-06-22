@@ -1358,7 +1358,10 @@ Cask::put(std::span<const std::byte> key,
 
     // 分配 ord + 编码 DocValue（text 段 = 原始 value）
     const std::uint64_t ord = keydir_->alloc_ord();
-    std::vector<std::byte> encoded;
+    // ⑩ thread_local 复用：encode_doc_value 是 append 语义，clear 后重填；
+    // 并发 put 各线程独占一份，消除每次 put 的 encoded 堆分配。
+    thread_local std::vector<std::byte> encoded;
+    encoded.clear();
     encoded.reserve(value.size() + 16);
     codec::DocValueParts parts;
     parts.text = value;

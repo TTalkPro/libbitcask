@@ -219,20 +219,24 @@ namespace {
 // V3.8:候选向量软件预取。大图下每个候选是 ~1.5KB(384d)的冷 DRAM
 // 取数,先扫一遍邻居把向量首 256B 拉向 L1,再进距离循环——取数与计算
 // 重叠,后续行交给硬件流预取。非 x86 为空操作。
-inline void prefetch_vec(const float* p) {
+inline void prefetch_vec(const float* p, std::size_t dim) {
 #ifdef BITCASK_HNSW_SIMD
     // V3.9:拉宽到 384B(96 floats)以覆盖 384d(1.5KB)前两 AVX-512 行 =
     // 128B;另加 256B 段为 384d 第 2-3 个 cache line 提前热身。AVX2 也
     // 受益(384d 头 64B×4 cache line 已覆盖)。
+    // ⑯:按 dim 守卫每条 prefetch(仿 int8 路径)——小 dim 不越过向量尾预取
+    // 到下个节点;大 dim 仍取头 384B(其余交硬件流预取)。
     const char* c = reinterpret_cast<const char*>(p);
+    const std::size_t bytes = dim * sizeof(float);
     _mm_prefetch(c, _MM_HINT_T0);
-    _mm_prefetch(c + 64, _MM_HINT_T0);
-    _mm_prefetch(c + 128, _MM_HINT_T0);
-    _mm_prefetch(c + 192, _MM_HINT_T0);
-    _mm_prefetch(c + 256, _MM_HINT_T0);
-    _mm_prefetch(c + 320, _MM_HINT_T0);
+    if (bytes > 64)  _mm_prefetch(c + 64, _MM_HINT_T0);
+    if (bytes > 128) _mm_prefetch(c + 128, _MM_HINT_T0);
+    if (bytes > 192) _mm_prefetch(c + 192, _MM_HINT_T0);
+    if (bytes > 256) _mm_prefetch(c + 256, _MM_HINT_T0);
+    if (bytes > 320) _mm_prefetch(c + 320, _MM_HINT_T0);
 #else
     (void)p;
+    (void)dim;
 #endif
 }
 
@@ -385,7 +389,7 @@ std::uint32_t HnswIndex::greedy_closest(const float* q, std::uint32_t start,
         improved = false;
         const std::uint32_t cnt = copy_neighbors(cur, layer, scratch);
         for (std::uint32_t i = 0; i < cnt; ++i) {
-            if (scratch[i] < n) prefetch_vec(vec_of(scratch[i]));
+            if (scratch[i] < n) prefetch_vec(vec_of(scratch[i]), cfg_.dim);
         }
         for (std::uint32_t i = 0; i < cnt; ++i) {
             const std::uint32_t nid = scratch[i];
@@ -438,7 +442,7 @@ void HnswIndex::search_layer(
         // 预取与计算分两遍:未访问的在界邻居先把向量段拉过来。
         for (std::uint32_t i = 0; i < cnt; ++i) {
             const std::uint32_t nid = scratch[i];
-            if (nid < n && visited[nid] != ep) prefetch_vec(vec_of(nid));
+            if (nid < n && visited[nid] != ep) prefetch_vec(vec_of(nid), cfg_.dim);
         }
         for (std::uint32_t i = 0; i < cnt; ++i) {
             const std::uint32_t nid = scratch[i];
@@ -727,7 +731,9 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
 
     // 写者侧搜索的可见边界 = id(自身排除:防低层把自己选成自己邻居)。
     const std::uint32_t n_bound = id;
-    std::vector<std::uint32_t> scratch(1 + cfg_.M * 2);
+    // ⑦ thread_local 复用(insert 单写者，本线程独占）。
+    thread_local std::vector<std::uint32_t> scratch;
+    scratch.resize(1 + cfg_.M * 2);
 
     // P5:int8-only 用本节点量化副本作建图 query(无常驻 f32);默认用 f32。
     const bool i8 = cfg_.inmem_int8;
@@ -749,7 +755,8 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     }
 
     // 3) level..0:efConstruction 搜索 + 启发式选边 + 双向连边 + 邻居收缩。
-    std::vector<std::pair<float, std::uint32_t>> found;
+    // ⑦ thread_local：search_layer 每层 out.clear() 后填充，跨 insert 复用。
+    thread_local std::vector<std::pair<float, std::uint32_t>> found;
     for (std::int32_t l = std::min<std::int32_t>(
              static_cast<std::int32_t>(level), max_level);
          l >= 0; --l) {
@@ -792,7 +799,9 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
                 // 收缩:旧邻居 + 新候选并集,以 nid 为查询点重选 cap 条。
                 // 持锁做距离计算(微秒级临界区):读者只在 copy_neighbors
                 // 短暂争同一把锁,实测可接受;arena/锁外预选留 V3.x。
-                std::vector<std::pair<float, std::uint32_t>> pool;
+                // ⑦ thread_local：单写者 insert 收缩路径复用，clear 保留容量。
+                thread_local std::vector<std::pair<float, std::uint32_t>> pool;
+                pool.clear();
                 pool.reserve(cap + 1);
                 if (i8) {
                     for (std::uint32_t i = 1; i <= nb[0]; ++i) {
@@ -841,7 +850,9 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
     auto cur = static_cast<std::uint32_t>(em & 0xFFFFFFFFu);
     if (ef < k) ef = k;
 
-    std::vector<std::uint32_t> scratch(1 + cfg_.M * 2);
+    // ⑦ thread_local 复用:并发读者各持一份,消除每次查询的 scratch malloc。
+    thread_local std::vector<std::uint32_t> scratch;
+    scratch.resize(1 + cfg_.M * 2);
     const float* q = query.data();
 
     // V4.2:int8 粗筛 + f32 精排。int8 路径只在 VNNI 存在 + kDot 度量下
@@ -855,7 +866,8 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
         ((int8_dot_ != nullptr) && (cfg_.metric == HnswMetric::kDot) &&
          (cfg_.dim >= 64));
 
-    std::vector<std::pair<float, std::uint32_t>> found;
+    // ⑦ thread_local：search_layer 内 out.clear() 后填充，跨查询复用。
+    thread_local std::vector<std::pair<float, std::uint32_t>> found;
     if (use_int8) {
         const int8::QVector qq = int8::quantize(q, cfg_.dim);
         for (std::int32_t l = max_level; l > 0; --l) {

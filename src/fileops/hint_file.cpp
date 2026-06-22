@@ -150,20 +150,25 @@ std::expected<bool, DataFileFault> HintFile::validate_trailer() {
     const std::uint32_t expected_crc = trailer->total_sz;
 
     // 2) 流式扫 trailer 之前的全部字节算 CRC，64 KiB 一块。
-    if (auto s = file_.seek_bof(); !s) return std::unexpected(io_fault(s.error()));
+    // ⑮:pread_into + 复用缓冲（容量只增），替代 file_.read(n) 每块一次堆
+    // 分配（open 路径，O(filesize/64K) 次分配 → 1 次）。
     std::uint64_t remaining = total - format::kHintRecordSize;
+    std::uint64_t off = 0;
     std::uint32_t crc = 0;
     constexpr std::size_t kChunk = 65536;
+    std::vector<std::byte> buf;
     while (remaining > 0) {
         const std::size_t n =
             static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, remaining));
-        auto r = file_.read(n);
+        if (buf.size() < n) buf.resize(n);
+        auto r = file_.pread_into(off, std::span(buf.data(), n));
         if (!r) return std::unexpected(io_fault(r.error()));
-        if (std::holds_alternative<io::ReadEof>(*r)) break;
-        auto& chunk = std::get<io::ReadOk>(*r);
-        crc = codec::crc32_update(crc, chunk.data);
-        remaining -= chunk.data.size();
-        if (chunk.data.size() < n) break;
+        const std::size_t got = *r;
+        if (got == 0) break;
+        crc = codec::crc32_update(crc, std::span<const std::byte>(buf.data(), got));
+        remaining -= got;
+        off += got;
+        if (got < n) break;
     }
     return crc == expected_crc;
 }

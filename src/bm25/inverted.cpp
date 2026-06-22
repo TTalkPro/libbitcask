@@ -1753,13 +1753,16 @@ void InvertedIndex::serialize(std::vector<std::byte>& out) const {
             // v6：ord 改用 FOR 块压缩（128/块）。
             std::size_t ord_block_count = (pc + kBlock - 1) / kBlock;
             write_u32(static_cast<std::uint32_t>(ord_block_count));
+            // ⑭ 块间复用缓冲（容量只增）：for_encode_block 内部自 clear/assign，
+            // ords_view 每块 resize 覆盖；替代每块两次 new。
+            std::vector<std::uint8_t> packed;
+            std::vector<std::uint64_t> ords_view;
             for (std::size_t b = 0; b < ord_block_count; ++b) {
                 std::size_t start = b * kBlock;
                 std::size_t cnt = std::min(kBlock, static_cast<std::size_t>(pc) - start);
                 std::uint64_t frame;
                 std::uint8_t  bits;
-                std::vector<std::uint8_t> packed;
-                std::vector<std::uint64_t> ords_view(cnt);
+                ords_view.resize(cnt);
                 for (std::size_t i = 0; i < cnt; ++i) {
                     ords_view[i] = pl.items[start + i].ord;
                 }

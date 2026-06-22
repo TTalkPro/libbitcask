@@ -60,6 +60,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options($<$<CONFIG:Release>:-falign-functions=64>)
 endif()
 
+# ⑰ 可选 -march=native（默认 OFF）。SIMD 内核本就运行时按 CPUID 派发，故
+# 通用构建故意不带 -march；此开关仅给「在部署机上现编」场景榨取 scalar glue
+# 的 ~3-8%（让非 SIMD 代码也用本机 ISA）。勿与 -ffast-math 混用：HNSW/int8
+# 依赖精确可复现浮点（int8 kernel self-test 校验 ULP）。
+option(BITCASK_NATIVE "为本机现编启用 -march=native（默认 OFF，破坏二进制可移植性）" OFF)
+if(BITCASK_NATIVE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-march=native)
+    message(STATUS "libbitcask: BITCASK_NATIVE -> -march=native（二进制仅限本机 ISA）")
+endif()
+
 option(BITCASK_LTO "Release 构建启用 LTO/IPO（sanitizer 构建自动关闭）" ON)
 if(BITCASK_LTO AND "${BITCASK_SANITIZE}" STREQUAL "")
     include(CheckIPOSupported)
