@@ -173,7 +173,11 @@ auto NgramAnalyzer::analyze_with_positions(std::string_view text) const -> TermP
     auto cps = detail::to_codepoints(normalized);
     if (cps.empty()) return {};
 
-    TermPositionsMap tpm;
+    // W1：内部以 string_view 去重，仅在末尾对每个唯一 term 分配一次 std::string。
+    // 安全前提：normalized 在本函数内持有全部字节，vpm 不超过其生命周期。
+    using ViewMap = std::unordered_map<std::string_view,
+                                       std::pair<std::uint32_t, std::vector<std::uint32_t>>>;
+    ViewMap vpm;
     std::size_t i = 0;
     std::uint32_t pos = 0;
 
@@ -184,10 +188,10 @@ auto NgramAnalyzer::analyze_with_positions(std::string_view text) const -> TermP
             for (std::size_t j = start; j + gram <= end; ++j) {
                 auto& first_cp = cps[j];
                 auto& last_cp = cps[j + gram - 1];
-                auto term = std::string(
+                std::string_view term(
                     normalized.data() + first_cp.byte_off,
                     (last_cp.byte_off + last_cp.byte_len) - first_cp.byte_off);
-                auto& [tf, positions] = tpm[std::move(term)];
+                auto& [tf, positions] = vpm[term];
                 ++tf;
                 positions.push_back(pos);
             }
@@ -200,11 +204,11 @@ auto NgramAnalyzer::analyze_with_positions(std::string_view text) const -> TermP
         if (end - start >= min_token_length_) {
             auto& first = cps[start];
             auto& last = cps[end - 1];
-            auto term = std::string(
+            std::string_view term(
                 normalized.data() + first.byte_off,
                 (last.byte_off + last.byte_len) - first.byte_off);
             if (!term.empty()) {
-                auto& [tf, positions] = tpm[std::move(term)];
+                auto& [tf, positions] = vpm[term];
                 ++tf;
                 positions.push_back(pos);
             }
@@ -239,6 +243,12 @@ auto NgramAnalyzer::analyze_with_positions(std::string_view text) const -> TermP
             }
             emit_word(word_start, i);
         }
+    }
+
+    TermPositionsMap tpm;
+    tpm.reserve(vpm.size());
+    for (auto& [view, data] : vpm) {
+        tpm.emplace(std::string(view), std::move(data));
     }
 
     if (enable_stop_words_ && !stop_words_.empty()) {
