@@ -2,6 +2,7 @@
 
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cstring>
 #include <utility>
 
@@ -89,23 +90,67 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
 
     std::uint64_t offset = 0;
 
-    // 在文件尾留出 sentinel record 的位置——遇到 EOF sentinel 就停下，
-    // 不会把 sentinel 喂给 fn。
-    // 缓冲整个 fold 循环复用(容量只增),每条 record 零分配。
-    std::vector<std::byte> buf;
-    while (offset + format::kHintRecordSize <= total) {
-        // 先读 18 字节固定 header 拿 key_sz（offset 4..5, P:小端 u16）。
-        // 直接 decode_hint_record(header_only) 会被 kBufferTooShort 拒掉，
-        // 因为 decoder 要求 header + key 全部就位——所以分两次 pread。
-        if (buf.size() < format::kHintRecordSize) {
-            buf.resize(format::kHintRecordSize);
-        }
-        auto hn = file_.pread_into(
-            offset, std::span(buf.data(), format::kHintRecordSize));
-        if (!hn) return std::unexpected(io_fault(hn.error()));
-        if (*hn < format::kHintRecordSize) break;  // 含 EOF
+    // 流式 chunked pread：每 256 KiB 一次 syscall，buffer 跨 record 复用。
+    // 1M 条 record → 2M syscalls（原）→ ~几百次 chunked read，fold 主导
+    // 路径 syscalls 减 1000+ 倍。buffer thread_local 是因为 fold 可在多
+    // reader 并发调同一 HintFile——preade 线程安全，但 buf 不能共享。
+    static thread_local std::vector<std::byte> buf;
+    constexpr std::size_t kChunkBytes = 256 * 1024;  // 256 KiB
+    constexpr std::size_t kBufRetain   = 1u << 20;   // 1 MiB 防膨胀阈值
+    if (buf.size() < kChunkBytes) buf.resize(kChunkBytes);
 
-        const auto* p = buf.data();
+    // buf 内的有效数据区间：[buf_pos, buf_len)。每次消费完一段记录就
+    // 推进 buf_pos；不够一条新 record 时先把残留 memmove 到 buf 头部，
+    // 再从 file 续读剩余字节。
+    std::size_t buf_pos = 0;
+    std::size_t buf_len = 0;
+
+    // refill 把残留字节搬到 buf 头部，再读一整块 256 KiB（或剩余文件字节）
+    // 进去。返回从磁盘新读的字节数（0 = EOF）。read_size_hint 用来告诉
+    // refill 这次至少要多少字节（巨型 record case 下需要扩容 buf）。
+    auto refill = [&](std::uint64_t file_off,
+                      std::size_t read_size_hint)
+        -> std::expected<std::size_t, DataFileFault> {
+        const std::size_t leftover = buf_len - buf_pos;
+        if (leftover > 0 && buf_pos > 0) {
+            std::memmove(buf.data(), buf.data() + buf_pos, leftover);
+        }
+        buf_pos = 0;
+        buf_len = leftover;
+
+        // 缓冲扩容到能装下「残留 + 一块」——巨型 record case（key_sz > 256K-18）
+        // 需要把 buf 撑大，单次 read 才能装下。
+        const std::size_t desired = buf_len + kChunkBytes;
+        const std::size_t need = std::max(desired, buf_len + read_size_hint);
+        if (buf.size() < need) buf.resize(need);
+
+        // 一次 pread 尽量读满 kChunkBytes；不要短读时多调一次。
+        // 截到文件总长，避免 read 出 EOF 部分徒增 syscalls。
+        const std::uint64_t file_remaining =
+            total > (file_off + buf_len) ? total - (file_off + buf_len) : 0;
+        if (file_remaining == 0) return static_cast<std::size_t>(0);
+        const std::size_t to_read = static_cast<std::size_t>(
+            std::min<std::uint64_t>(buf.size() - buf_len, file_remaining));
+        if (to_read == 0) return static_cast<std::size_t>(0);
+
+        auto n = file_.pread_into(
+            file_off + buf_len, std::span(buf.data() + buf_len, to_read));
+        if (!n) return std::unexpected(io_fault(n.error()));
+        buf_len += *n;
+        return *n;
+    };
+
+    while (offset + format::kHintRecordSize <= total) {
+        // 1) 至少 18 字节 header 要就位
+        if (buf_len - buf_pos < format::kHintRecordSize) {
+            auto r = refill(offset, format::kHintRecordSize);
+            if (!r) return std::unexpected(r.error());
+            if (*r == 0) break;  // EOF
+        }
+        if (buf_len - buf_pos < format::kHintRecordSize) break;  // 短读
+
+        // 2) 从 header 拿 key_sz（offset 4..5, P:小端 u16）
+        const auto* p = buf.data() + buf_pos;
         const std::uint16_t key_sz =
             static_cast<std::uint16_t>(
                 static_cast<std::uint16_t>(p[4]) |
@@ -115,14 +160,16 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
 
         if (offset + rec_size > total) break;  // 文件尾被截断
 
-        if (buf.size() < rec_size) buf.resize(rec_size);
-        auto fn_ = file_.pread_into(
-            offset, std::span(buf.data(), static_cast<std::size_t>(rec_size)));
-        if (!fn_) return std::unexpected(io_fault(fn_.error()));
-        if (*fn_ < rec_size) break;
+        // 3) 整条 record 就位才 decode——缺就再 refill 一块。短读当 EOF 处理
+        if (buf_len - buf_pos < rec_size) {
+            auto r = refill(offset, static_cast<std::size_t>(rec_size));
+            if (!r) return std::unexpected(r.error());
+        }
+        if (buf_len - buf_pos < rec_size) break;  // 短读 / EOF
 
+        // 4) 复用 codec 解码——不重写解析逻辑
         auto rec = codec::decode_hint_record(
-            std::span<const std::byte>(buf.data(),
+            std::span<const std::byte>(buf.data() + buf_pos,
                                        static_cast<std::size_t>(rec_size)));
         if (!rec) return std::unexpected(DataFileFault{DataFileError::kShortRead});
 
@@ -131,6 +178,13 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
 
         fn(*rec);
         offset += rec_size;
+        buf_pos += static_cast<std::size_t>(rec_size);
+    }
+
+    // 防线程内存膨胀：一次巨型 hint 文件不应让 buffer 永久占住线程栈/堆
+    if (buf.size() > kBufRetain) {
+        buf.clear();
+        buf.shrink_to_fit();
     }
     return {};
 }
