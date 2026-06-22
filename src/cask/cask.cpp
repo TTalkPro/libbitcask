@@ -662,34 +662,45 @@ Cask::create_search_infra(const CaskOptions& opts) {
 // 失败全部静默——close 路径上的错误没有合理的恢复动作，硬抛会让 Erlang
 // 进程意外崩溃。
 void Cask::close() noexcept {
-    (void)maybe_group_commit(/*force*/ true);  // P4:落最后一批未 fsync 的写
-    if (active_hint_) {
-        (void)active_hint_->finalize();
-        active_hint_.reset();
+    // close 内部步骤（save_ckpt/snapshot 的 vector 操作）可能抛 bad_alloc；
+    // noexcept 函数抛出 → std::terminate。整个 body 包 try/catch 兜底：吞掉
+    // 异常让后续资源释放仍能执行，优于进程硬死。错误可见性靠 index_errors_
+    // 计数 + 未来可观测性梯队，不在 close 加日志。
+    try {
+        (void)maybe_group_commit(/*force*/ true);  // P4:落最后一批未 fsync 的写
+        if (active_hint_) {
+            (void)active_hint_->finalize();
+            active_hint_.reset();
+        }
+        {
+            std::scoped_lock lk(read_cache_mu_);
+            active_data_.reset();
+            read_files_.clear();
+        }
+        // A4-P2/P3 顺序要点:先停 IndexPool(排干 → Index 覆盖全部已分配
+        // ord),再在 keydir 仍在手时做 search 双保存(bm25 + sidecar,
+        // 覆盖标记取 peek_next_ord),最后落 keydir 快照并释放——
+        // 旧版在 keydir_.reset() 之后才存 sidecar,恒被跳过(P3 测试抓出)。
+        if (index_pool_) {
+            // flush 排干队列后再 stop:worker_loop 顶部的 stopped_ 检查可能在
+            // stop() 设位后、Sentinel 被 pop 前退出循环,漏掉待处理任务。
+            index_pool_->flush();
+            index_pool_->stop();
+            index_pool_.reset();
+        }
+        if (search_ && opts_.read_write && keydir_) {
+            // P14e:统一分段 search.ckpt（docmap + bm25 + hnsw 单文件）。
+            const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
+            (void)search_->save_search_ckpt(search_ckpt,
+                                             keydir_->peek_next_ord());
+        }
+        if (opts_.read_write) write_keydir_snapshot();
+    } catch (...) {
+        // 吞掉：close 是终结路径，没有合理的恢复动作。后续 keydir/lock
+        // release 仍需执行，所以不 return。
     }
-    {
-        std::scoped_lock lk(read_cache_mu_);
-        active_data_.reset();
-        read_files_.clear();
-    }
-    // A4-P2/P3 顺序要点:先停 IndexPool(排干 → Index 覆盖全部已分配
-    // ord),再在 keydir 仍在手时做 search 双保存(bm25 + sidecar,
-    // 覆盖标记取 peek_next_ord),最后落 keydir 快照并释放——
-    // 旧版在 keydir_.reset() 之后才存 sidecar,恒被跳过(P3 测试抓出)。
-    if (index_pool_) {
-        // flush 排干队列后再 stop:worker_loop 顶部的 stopped_ 检查可能在
-        // stop() 设位后、Sentinel 被 pop 前退出循环,漏掉待处理任务。
-        index_pool_->flush();
-        index_pool_->stop();
-        index_pool_.reset();
-    }
-    if (search_ && opts_.read_write && keydir_) {
-        // P14e:统一分段 search.ckpt（docmap + bm25 + hnsw 单文件）。
-        const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
-        (void)search_->save_search_ckpt(search_ckpt,
-                                         keydir_->peek_next_ord());
-    }
-    if (opts_.read_write) write_keydir_snapshot();
+    // 资源释放步骤不抛异常（unique_ptr reset / atomic / 简单 bool 操作），
+    // 放 try 外确保即使上面 catch 也一定执行。
     if (registry_ && !keydir_name_.empty()) {
         registry_->release(keydir_name_);
         registry_ = nullptr;

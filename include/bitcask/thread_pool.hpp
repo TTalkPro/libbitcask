@@ -191,6 +191,9 @@ public:
             return;
         }
         queue_.push(IndexTask{IndexOp::Sentinel});
+        // joinable() guard 兼容「start() 从未调用」场景：默认构造的
+        // std::thread 不 joinable，跳过 join——Cask::open 失败回滚时
+        // IndexPool 可能在 start() 前被析构，此 guard 防止 UB。
         if (worker_.joinable()) worker_.join();
     }
 
