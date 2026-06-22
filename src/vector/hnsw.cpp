@@ -292,15 +292,16 @@ std::atomic<std::uint64_t> g_instance_seq{1};
 
 }  // namespace
 
-HnswIndex::NodeChunk::NodeChunk(std::size_t dim, bool needs_vecs)
+HnswIndex::NodeChunk::NodeChunk(std::size_t dim, bool needs_vecs,
+                                bool needs_qcodes)
     : vecs(needs_vecs ? static_cast<std::size_t>(kChunkSize) * dim : 0),
       ords(kChunkSize, 0),
       levels(kChunkSize, 0),
       adj(kChunkSize),
       locks(new std::atomic<std::uint8_t>[kChunkSize]),
-      qcodes(static_cast<std::size_t>(kChunkSize) * dim),
-      qscales(kChunkSize, 0.0f),
-      qsums(kChunkSize, 0) {
+      qcodes(needs_qcodes ? static_cast<std::size_t>(kChunkSize) * dim : 0),
+      qscales(needs_qcodes ? kChunkSize : 0, 0.0f),
+      qsums(needs_qcodes ? kChunkSize : 0, 0) {
     for (std::uint32_t i = 0; i < kChunkSize; ++i) {
         locks[i].store(0, std::memory_order_relaxed);
     }
@@ -310,6 +311,8 @@ HnswIndex::HnswIndex(const HnswConfig& cfg)
     : cfg_(cfg),
       dist_(pick_kernel(cfg.metric)),
       int8_dot_(int8::pick_int8_dot_kernel()),
+      needs_qcodes_(cfg.inmem_int8 ||
+                    (int8_dot_ != nullptr && cfg.metric == HnswMetric::kDot)),
       inv_log_m_(1.0 / std::log(static_cast<double>(cfg.M))),
       instance_id_(g_instance_seq.fetch_add(1, std::memory_order_relaxed)),
       rng_(cfg.seed) {
@@ -653,7 +656,7 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     assert(ci < kMaxChunks && "HnswIndex capacity exceeded (kMaxChunks)");
     NodeChunk* c = chunks_[ci].load(std::memory_order_relaxed);
     if (c == nullptr) {
-        c = new NodeChunk(cfg_.dim, !cfg_.inmem_int8);
+        c = new NodeChunk(cfg_.dim, !cfg_.inmem_int8, needs_qcodes_);
         chunks_[ci].store(c, std::memory_order_release);
     } else if (!cfg_.inmem_int8 && c->vecs.empty()) {
         // checkpoint 加载的 chunk(needs_vecs=false)首次插入热数据:
@@ -882,14 +885,18 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
                     }
                 }
             }
+            // 先把每个候选的 f32 距离算一次写回 .first(此前存的是 int8
+            // 粗筛距离),之后 partial_sort 只比较缓存的浮点值。原写法在比较
+            // 器里每次重算 2 次 dist_id、排完再算第 3 次,全维 SIMD 距离被重
+            // 复计算 O(N log rerank_n) 次;此处降为每候选恰好 1 次(共 N 次)。
+            // 线性遍历顺序与上面的 madvise 预取顺序一致,page-in 延迟仍被藏住。
+            for (auto& [d, id] : found) d = dist_id(q, id);
             std::partial_sort(found.begin(), found.begin() + rerank_n,
                               found.end(),
-                              [this, q](const auto& a, const auto& b) {
-                                  return dist_id(q, a.second) <
-                                         dist_id(q, b.second);
+                              [](const auto& a, const auto& b) {
+                                  return a.first < b.first;
                               });
             found.resize(rerank_n);
-            for (auto& [d, id] : found) d = dist_id(q, id);
         }
     } else {
         for (std::int32_t l = max_level; l > 0; --l) {
@@ -1174,15 +1181,24 @@ bool HnswIndex::serialize(std::vector<std::uint8_t>& buf) const {
         const std::uint8_t level = c->levels[slot];
         buf.push_back(level);
         // V7:直存 qcodes/qscale/qsum——省启动量化 pass(V1 是读盘后量化)。
-        const std::int8_t* qcodes =
-            c->qcodes.data() + static_cast<std::size_t>(slot) * cfg_.dim;
-        buf.insert(buf.end(),
-                   reinterpret_cast<const std::uint8_t*>(qcodes),
-                   reinterpret_cast<const std::uint8_t*>(qcodes) + qbytes);
-        const auto* sp = reinterpret_cast<const std::uint8_t*>(&c->qscales[slot]);
-        buf.insert(buf.end(), sp, sp + sizeof(float));
-        const auto* zp = reinterpret_cast<const std::uint8_t*>(&c->qsums[slot]);
-        buf.insert(buf.end(), zp, zp + sizeof(std::int32_t));
+        // needs_qcodes_ 为假(kL2/无 VNNI)时三段未分配:写零占位,保持盘上
+        // 格式定长不变(读端按 needs_qcodes_ 决定存或跳)。
+        if (needs_qcodes_) {
+            const std::int8_t* qcodes =
+                c->qcodes.data() + static_cast<std::size_t>(slot) * cfg_.dim;
+            buf.insert(buf.end(),
+                       reinterpret_cast<const std::uint8_t*>(qcodes),
+                       reinterpret_cast<const std::uint8_t*>(qcodes) + qbytes);
+            const auto* sp =
+                reinterpret_cast<const std::uint8_t*>(&c->qscales[slot]);
+            buf.insert(buf.end(), sp, sp + sizeof(float));
+            const auto* zp =
+                reinterpret_cast<const std::uint8_t*>(&c->qsums[slot]);
+            buf.insert(buf.end(), zp, zp + sizeof(std::int32_t));
+        } else {
+            buf.insert(buf.end(), qbytes + sizeof(float) + sizeof(std::int32_t),
+                       std::uint8_t{0});
+        }
         for (std::uint32_t l = 0; l <= level; ++l) {
             // 持节点锁拷邻接(与并发写者互斥);≥ n 的邻居(快照水位外的
             // 反向边)滤掉,保证文件内不变量 id < count。
@@ -1332,7 +1348,7 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         const std::uint32_t ci = id >> kChunkBits;
         NodeChunk* c = chunks_[ci].load(std::memory_order_relaxed);
         if (c == nullptr) {
-        c = new NodeChunk(cfg_.dim, false);
+        c = new NodeChunk(cfg_.dim, false, needs_qcodes_);
             chunks_[ci].store(c, std::memory_order_relaxed);
         }
         const std::uint32_t slot = id & kChunkMask;
@@ -1346,15 +1362,20 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         have_prev = true;
         const std::uint8_t level = *p++;
         if (level > 31) return false;
-        // V7:直读 qcodes(免去 V1 的启动量化 pass)。
-        std::memcpy(c->qcodes.data() +
-                        static_cast<std::size_t>(slot) * cfg_.dim,
-                    p, qbytes);
-        p += qbytes;
-        std::memcpy(&c->qscales[slot], p, sizeof(float));
-        p += sizeof(float);
-        std::memcpy(&c->qsums[slot],   p, sizeof(std::int32_t));
-        p += sizeof(std::int32_t);
+        // V7:直读 qcodes(免去 V1 的启动量化 pass)。needs_qcodes_ 为假时
+        // 盘上是零占位且本地未分配——跳过存储,仅推进游标。
+        if (needs_qcodes_) {
+            std::memcpy(c->qcodes.data() +
+                            static_cast<std::size_t>(slot) * cfg_.dim,
+                        p, qbytes);
+            p += qbytes;
+            std::memcpy(&c->qscales[slot], p, sizeof(float));
+            p += sizeof(float);
+            std::memcpy(&c->qsums[slot],   p, sizeof(std::int32_t));
+            p += sizeof(std::int32_t);
+        } else {
+            p += qbytes + sizeof(float) + sizeof(std::int32_t);
+        }
         c->ords[slot]   = ord;
         c->levels[slot] = level;
         const std::size_t slots =

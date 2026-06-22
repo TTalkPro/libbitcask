@@ -430,7 +430,9 @@ private:
     // fstats_size_ release 发布——读者 idx < size(acquire) 即可直接对
     // 字段做 relaxed 原子累加,put 热路径零锁字共享(S2 起生效;S1 仍在
     // mutex_ 内调用,顺序平凡安全)。
-    struct AtomicFStats {
+    // alignas(64):deque 每元素独占 cache line。否则两个 file_id 的 stats
+    // 可能跨同一 64B 行,merge + active 并发写不同文件时假共享。
+    struct alignas(64) AtomicFStats {
         std::atomic<std::uint64_t> live_keys{0};
         std::atomic<std::uint64_t> total_keys{0};
         std::atomic<std::uint64_t> live_bytes{0};

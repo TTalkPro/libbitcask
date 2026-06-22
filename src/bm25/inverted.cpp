@@ -549,19 +549,33 @@ auto InvertedIndex::search_wand(
     std::vector<std::size_t> order(tps.size());
     for (std::size_t i = 0; i < tps.size(); ++i) order[i] = i;
 
+    // 比较器语义：耗尽的 term 排前面（会被下方 continue 跳过），其余按当前
+    // ord 升序。平局顺序不影响正确性——pivot_ord 由 cursor 推进确定，打分
+    // 循环（line 642）遍历全部匹配词，块跳跃仅 admissible 跳过。
+    auto wand_less = [&tps](std::size_t a, std::size_t b) {
+        const auto& ta = tps[a];
+        const auto& tb = tps[b];
+        bool a_ex = ta.cursor >= ta.fp.ords.size();
+        bool b_ex = tb.cursor >= tb.fp.ords.size();
+        if (a_ex && b_ex) return false;
+        if (a_ex) return true;
+        if (b_ex) return false;
+        return ta.fp.ords[ta.cursor] < tb.fp.ords[tb.cursor];
+    };
+
     while (true) {
-        // 按当前 ord 升序排列（保留原比较器语义：耗尽的 term 排前面，会被下方 continue 跳过）。
-        std::sort(order.begin(), order.end(),
-                  [&tps](std::size_t a, std::size_t b) {
-                      const auto& ta = tps[a];
-                      const auto& tb = tps[b];
-                      bool a_ex = ta.cursor >= ta.fp.ords.size();
-                      bool b_ex = tb.cursor >= tb.fp.ords.size();
-                      if (a_ex && b_ex) return false;
-                      if (a_ex) return true;
-                      if (b_ex) return false;
-                      return ta.fp.ords[ta.cursor] < tb.fp.ords[tb.cursor];
-                  });
+        // 优化②：order 在迭代间持久，每轮仅少数 cursor 前移 → 近乎有序。
+        // 插入排序对近乎有序输入是 O(t+inversions)，替代每轮 std::sort 的
+        // O(t log t) 最坏。等价：任一正确排序都满足比较器，平局差异已论证无害。
+        for (std::size_t i = 1; i < order.size(); ++i) {
+            std::size_t key = order[i];
+            std::size_t j = i;
+            while (j > 0 && wand_less(key, order[j - 1])) {
+                order[j] = order[j - 1];
+                --j;
+            }
+            order[j] = key;
+        }
 
         std::size_t pivot_pos = 0;  // pivot 在排序序列 order 中的位置
         float acc_score = 0.0f;

@@ -171,7 +171,7 @@ private:
         std::vector<float>          qscales; // kChunkSize
         std::vector<std::int32_t>   qsums;   // kChunkSize(VNNI 偏置补偿)
 
-        NodeChunk(std::size_t dim, bool needs_vecs);
+        NodeChunk(std::size_t dim, bool needs_vecs, bool needs_qcodes);
         ~NodeChunk() = default;
         NodeChunk(const NodeChunk&) = delete;
         NodeChunk& operator=(const NodeChunk&) = delete;
@@ -294,6 +294,10 @@ private:
     HnswConfig cfg_;
     DistFn dist_;                       // 构造时按 metric+ISA 分发一次
     int8::Int8DotFn int8_dot_;          // V4.2:int8 粗筛内核;无 VNNI 时 nullptr
+    // 量化副本是否需要(写/读/序列化)。= inmem_int8 || (int8_dot_ && kDot)。
+    // kL2 或无 VNNI 时为 false:qcodes/qscales/qsums 不分配(省 ~D 字节/节点),
+    // serialize 写零占位、deserialize 跳过,盘上格式定长不变(跨配置兼容)。
+    bool needs_qcodes_;
     double inv_log_m_;                  // mL = 1/ln(M)
     std::uint64_t instance_id_;         // thread_local visited 的实例区分键
 
