@@ -659,8 +659,8 @@ Cask::create_search_infra(const CaskOptions& opts) {
 //   3. 清 read cache（关掉缓存的 fd，避免泄漏）；
 //   4. registry release（refcount -1，归零时 keydir 真正销毁）；
 //   5. 释放 write/merge lock。
-// 失败全部静默——close 路径上的错误没有合理的恢复动作，硬抛会让 Erlang
-// 进程意外崩溃。
+// 失败全部静默——close 路径上的错误没有合理的恢复动作，硬抛会让调用方
+// 进程意外崩溃（close 标 noexcept，抛出即 std::terminate）。
 void Cask::close() noexcept {
     // close 内部步骤（save_ckpt/snapshot 的 vector 操作）可能抛 bad_alloc；
     // noexcept 函数抛出 → std::terminate。整个 body 包 try/catch 兜底：吞掉
@@ -699,10 +699,17 @@ void Cask::close() noexcept {
         // 吞掉：close 是终结路径，没有合理的恢复动作。后续 keydir/lock
         // release 仍需执行，所以不 return。
     }
-    // 资源释放步骤不抛异常（unique_ptr reset / atomic / 简单 bool 操作），
-    // 放 try 外确保即使上面 catch 也一定执行。
+    // 资源释放步骤放 try 外，确保即使上面 catch 触发也一定执行。
+    // unique_ptr::reset（析构隐式 noexcept）与 FileLock::release_quiet（显式
+    // noexcept）不抛；唯 registry_->release 内部取 mutex + 构造 std::string，
+    // 理论上可抛 system_error/bad_alloc——单独包 try 兜底，保证 close() 整体
+    // 真正 noexcept（否则此处抛出仍会 std::terminate）。
     if (registry_ && !keydir_name_.empty()) {
-        registry_->release(keydir_name_);
+        try {
+            registry_->release(keydir_name_);
+        } catch (...) {
+            // 极罕见（mutex 资源耗尽 / OOM）；吞掉，继续释放本地资源。
+        }
         registry_ = nullptr;
         keydir_name_.clear();
     }
