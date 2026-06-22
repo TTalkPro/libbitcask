@@ -63,6 +63,11 @@ public:
     // 线程安全: 否（与 write() 共享 running_crc_）；caller 串行化。
     [[nodiscard]] std::expected<void, DataFileFault> finalize();
 
+    // fsync(2) 落盘。给 merger 在删除原始输入文件前强制持久化输出文件用：
+    // 断电是 caller 删除原始文件后无法回退的临界点，必须保证新文件已真正
+    // 落盘才能 unlink 旧文件。线程安全: 否（与 write() 共享 fd）；caller 串行化。
+    [[nodiscard]] std::expected<void, DataFileFault> sync();
+
     // ---- 读取 ----
 
     // 遍历每条 hint record（不调 EOF sentinel 给 fn）。如果 trailer CRC

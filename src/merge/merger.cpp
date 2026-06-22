@@ -1,6 +1,7 @@
 #include "bitcask/merger.hpp"
 
 #include <cstring>
+#include <filesystem>
 
 #include "bitcask/data_file.hpp"
 #include "bitcask/format.hpp"
@@ -14,6 +15,19 @@ namespace {
 MergeFault io_fault(MergeError kind, int errnum, std::string detail = {}) {
     return MergeFault{kind, errnum, std::move(detail)};
 }
+
+// 延迟应用项：fold 时只写新文件 + 记录变更，不立即 CAS 更新 keydir。
+// fsync 成功后才统一 apply——保证 merge 失败时 keydir 完全未动，所有
+// key 仍可立即可见（无需重启恢复）。
+struct PendingUpdate {
+    std::string    key;
+    std::uint32_t  old_file_id;
+    std::uint64_t  old_offset;
+    std::uint32_t  new_total_size;
+    std::uint64_t  new_offset;
+    std::uint32_t  tstamp;
+    std::uint64_t  ord;
+};
 
 }  // namespace
 
@@ -31,10 +45,21 @@ run_merge(std::span<const std::string> input_data_paths,
         fileops::mk_data_filename(output_dir, stats.output_file_id);
     stats.output_hint_path = fileops::mk_hint_filename(stats.output_data_path);
 
+    // 失败清理：避免残文件被下次 needs_merge 当输入→数据损坏。
+    // 残文件指输出 data + hint，任意一个 write/finalize/sync 失败时触发。
+    auto cleanup_partial_outputs = [&]() {
+        std::error_code ec;
+        std::filesystem::remove(stats.output_data_path, ec);
+        std::filesystem::remove(stats.output_hint_path, ec);
+    };
+
+    std::vector<PendingUpdate> pending_;
+
     auto out_data = fileops::DataFile::open(stats.output_data_path,
                                              fileops::DataFile::Mode::kCreate,
                                              sync_output);
     if (!out_data) {
+        cleanup_partial_outputs();  // 幂等：kCreate 可能已建空文件
         return std::unexpected(io_fault(MergeError::kOutputOpenFailed,
                                          out_data.error().errnum,
                                          stats.output_data_path));
@@ -43,6 +68,7 @@ run_merge(std::span<const std::string> input_data_paths,
                                              fileops::HintFile::Mode::kCreate,
                                              sync_output);
     if (!out_hint) {
+        cleanup_partial_outputs();  // 关键：out_data 已创建，必须清理
         return std::unexpected(io_fault(MergeError::kOutputOpenFailed,
                                          out_hint.error().errnum,
                                          stats.output_hint_path));
@@ -63,6 +89,7 @@ run_merge(std::span<const std::string> input_data_paths,
                                                 /*sync*/ false,
                                                 /*mmap_enabled*/ false);
         if (!in_data) {
+            cleanup_partial_outputs();
             return std::unexpected(io_fault(MergeError::kInputOpenFailed,
                                              in_data.error().errnum, path));
         }
@@ -97,8 +124,9 @@ run_merge(std::span<const std::string> input_data_paths,
                     return;
                 }
 
-                // 复制到输出：先写新 data file，再写新 hint file，
-                // 最后 CAS 更新 keydir 指向新位置。
+                // 复制到输出：先写新 data file，再写新 hint file。
+                // keydir CAS 更新延后到所有 fold 完成 + fsync 成功后，
+                // 失败时 keydir 完全未动→key 仍可读，无需重启恢复。
                 auto w = out_data->write(format::RecordType::kDoc,
                                           view.tstamp, view.ord,
                                           view.key, view.value);
@@ -106,6 +134,7 @@ run_merge(std::span<const std::string> input_data_paths,
                     error = std::unexpected(io_fault(
                         MergeError::kOutputWriteFailed, 0,
                         stats.output_data_path));
+                    cleanup_partial_outputs();
                     return;
                 }
                 auto h = out_hint->write(view.tstamp, w->total_size,
@@ -114,39 +143,28 @@ run_merge(std::span<const std::string> input_data_paths,
                     error = std::unexpected(io_fault(
                         MergeError::kOutputWriteFailed, 0,
                         stats.output_hint_path));
+                    cleanup_partial_outputs();
                     return;
                 }
 
-                // CAS 更新 keydir。带上 old_file_id + old_offset：如果在
-                // 我们写 data/hint 的中途有别的 writer 把 key 又改了，
-                // CAS 会失败——data file 里那条 record 留着但成了 dead，
-                // 下一次 merge 自然会清。
-                // newest_put=true 让 keydir 接受 new entry 不管 biggest_file_id
-                // 的当前值（输出 file_id 就是新的 biggest）。
-                auto pr = keydir.put(
-                    key_sv,
-                    stats.output_file_id, w->total_size, w->offset,
-                    view.tstamp, /*now_sec*/ 0,
-                    /*newest_put*/ true,
-                    /*old_file_id*/ in_file_id,
-                    /*old_offset*/  offset,
-                    /*ord*/ view.ord);
-                (void)pr;  // 并发 put 时 CAS 失败是合法情况，不阻断 merge
-
-                // 通知 SearchLayer：文档 ord 不变，存储定位更新到新文件。
-                if (search_layer) {
-                    search_layer->on_relocate(key_sv, view.ord,
-                                              stats.output_file_id,
-                                              w->offset, w->total_size);
-                }
+                pending_.push_back(PendingUpdate{
+                    std::string(key_sv),
+                    in_file_id, offset,
+                    w->total_size, w->offset,
+                    view.tstamp, view.ord
+                });
 
                 stats.records_kept += 1;
                 stats.bytes_written += total_size;
                 (void)total_size;  // 已在 w->total_size 里记过
             },
             /*tolerate_crc_errors*/ true);
-        if (!error) return std::unexpected(error.error());
+        if (!error) {
+            cleanup_partial_outputs();
+            return std::unexpected(error.error());
+        }
         if (!fold_res) {
+            cleanup_partial_outputs();
             return std::unexpected(io_fault(MergeError::kInputReadFailed,
                                              fold_res.error().errnum,
                                              path));
@@ -154,17 +172,46 @@ run_merge(std::span<const std::string> input_data_paths,
     }
 
     if (auto f = out_hint->finalize(); !f) {
+        cleanup_partial_outputs();
         return std::unexpected(io_fault(MergeError::kFinalizeFailed,
                                          f.error().errnum,
                                          stats.output_hint_path));
     }
-    if (sync_output) {
-        if (auto s = out_data->sync(); !s) {
-            return std::unexpected(io_fault(MergeError::kFinalizeFailed,
-                                             s.error().errnum,
-                                             stats.output_data_path));
+    // 无条件 fsync 输出 data + hint：保证 run_merge 成功返回 = 新文件已落盘，
+    // 调用方据此才能安全 unlink 原始输入文件。sync_output 仅控制写入过程是
+    // 否每条 pwrite 都 O_SYNC 落盘（写入吞吐 vs 单条延迟权衡）；末尾必须至
+    // 少一次 fsync 把 page cache 刷到磁盘——否则断电窗口内新文件未落盘而
+    // 原始文件已被 caller 删除 → 数据永久丢失。data 是权威优先 fsync。
+    if (auto s = out_data->sync(); !s) {
+        cleanup_partial_outputs();
+        return std::unexpected(io_fault(MergeError::kFinalizeFailed,
+                                         s.error().errnum,
+                                         stats.output_data_path));
+    }
+    if (auto s = out_hint->sync(); !s) {
+        cleanup_partial_outputs();
+        return std::unexpected(io_fault(MergeError::kFinalizeFailed,
+                                         s.error().errnum,
+                                         stats.output_hint_path));
+    }
+
+    // 批量 apply：fsync 已完成，新文件持久化。现在原子切换 keydir + search
+    // 指向新文件。CAS 失败 = 并发 put 已改这个 key（合法）→ 跳过，X 中的
+    // record 成 dead，下次 merge 清。on_relocate 必须与 keydir.put 配对成功
+    // 才调，避免 search 已切但 keydir 未切的不一致窗口。
+    for (const auto& u : pending_) {
+        auto pr = keydir.put(u.key, stats.output_file_id, u.new_total_size,
+                             u.new_offset, u.tstamp, /*now_sec*/ 0,
+                             /*newest_put*/ true,
+                             /*old_file_id*/ u.old_file_id,
+                             /*old_offset*/ u.old_offset,
+                             /*ord*/ u.ord);
+        if (pr == keydir::PutResult::kOk && search_layer) {
+            search_layer->on_relocate(u.key, u.ord, stats.output_file_id,
+                                       u.new_offset, u.new_total_size);
         }
     }
+
     return stats;
 }
 

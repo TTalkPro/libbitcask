@@ -72,6 +72,12 @@ std::expected<void, DataFileFault> HintFile::finalize() {
     return flush_pending();                          // 缓冲 record + sentinel 一次写
 }
 
+std::expected<void, DataFileFault> HintFile::sync() {
+    auto s = file_.sync();
+    if (!s) return std::unexpected(io_fault(s.error()));
+    return {};
+}
+
 // ---------------------------------------------------------------------------
 // 读取
 // ---------------------------------------------------------------------------

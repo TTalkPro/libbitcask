@@ -500,7 +500,14 @@ BITCASK_API bitcask_error_t bitcask_set_synonym_map(bitcask_t* cask,
     if (!cask || !path) return BITCASK_ERR_INVALID_OPTION;
 
     auto map = std::make_unique<text::SynonymMap>();
-    map->load_from_file(path);
+    if (!map->load_from_file(path)) {
+        if (fault) {
+            fault->code = BITCASK_ERR_IO;
+            fault->errnum = 0;
+            snprintf(fault->detail, BITCASK_DETAIL_MAX, "failed to load synonym map from: %s", path);
+        }
+        return BITCASK_ERR_IO;
+    }
     as_cpp_cask(cask)->set_synonym_map(std::move(map));
     return BITCASK_OK;
 }
@@ -655,6 +662,7 @@ BITCASK_API bitcask_error_t bitcask_status(bitcask_t* cask,
     out->key_count = info.key_count;
     out->key_bytes = info.key_bytes;
     out->epoch = info.epoch;
+    out->index_errors = info.index_errors;
     return BITCASK_OK;
 }
 

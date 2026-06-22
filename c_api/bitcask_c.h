@@ -220,6 +220,8 @@ typedef struct {
     uint64_t key_count;
     uint64_t key_bytes;
     uint64_t epoch;
+    // indexed worker 抛异常时自增；非零 = 索引可能漂移，搜索结果可能陈旧
+    uint64_t index_errors;
 } bitcask_status_t;
 
 // needs_merge 结果

@@ -196,6 +196,8 @@ struct StatusInfo {
     std::uint64_t key_bytes = 0;
     std::uint64_t epoch     = 0;
     std::vector<merge::FileStatus> files;
+    // indexed worker 抛异常时自增；非零 = 索引可能漂移，搜索结果可能陈旧
+    std::uint64_t index_errors = 0;
 };
 
 class Cask;
@@ -522,6 +524,8 @@ private:
 
     // T2.4: Index Pool（搜索模式开启时创建，用于 T3 异步索引）
     std::unique_ptr<IndexPool> index_pool_;
+    // indexed worker 异常计数器：catch(...) 时 fetch_add(1)；非零 = 索引可能漂移
+    std::atomic<std::uint64_t> index_errors_{0};
 
     // T3: 提交索引任务到 IndexPool（异步索引）。背压由 IndexPool 的有界
     // 队列提供：队列满（capacity 10240）时 submit 内部的 push 阻塞写线程，

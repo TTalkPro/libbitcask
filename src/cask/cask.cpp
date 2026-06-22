@@ -612,7 +612,7 @@ Cask::create_search_infra(const CaskOptions& opts) {
                                    "analyzer creation failed (check analyzer type / dict_path)"));
     }
     index_pool_ = std::make_unique<IndexPool>(1, 10240);
-    index_pool_->start([&search = *search_](const IndexTask& task) {
+    index_pool_->start([&search = *search_, this](const IndexTask& task) {
         // 消费者必须吞掉所有异常:worker_loop 不捕获,抛出会 std::terminate
         // 整个进程,且即便不崩,pending_ 也无法递减→每次搜索走的 flush()
         // 永久挂起。索引更新失败按 best-effort 丢弃(返回 true 让 pending_
@@ -643,6 +643,8 @@ Cask::create_search_infra(const CaskOptions& opts) {
                 search.on_vector(task.ord, task.vec);
             }
         } catch (...) {
+            // indexed worker 抛异常时自增；非零 = 索引可能漂移，搜索结果可能陈旧
+            index_errors_.fetch_add(1, std::memory_order_relaxed);
             // best-effort:丢弃本次更新,保活 worker 与 flush()。
         }
         return true;
@@ -1642,6 +1644,7 @@ StatusInfo Cask::status() {
     for (const auto& f : info.fstats) {
         s.files.push_back(merge::summarize(dirname_, f));
     }
+    s.index_errors = index_errors_.load(std::memory_order_relaxed);
     return s;
 }
 

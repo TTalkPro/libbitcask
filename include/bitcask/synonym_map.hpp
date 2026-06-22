@@ -15,9 +15,9 @@ class SynonymMap {
 public:
     SynonymMap() = default;
 
-    void load_from_file(const std::string& path) {
+    [[nodiscard]] bool load_from_file(const std::string& path) {
         std::ifstream file(path);
-        if (!file) return;
+        if (!file) return false;
         std::string line;
         while (std::getline(file, line)) {
             if (line.empty()) continue;
@@ -34,6 +34,7 @@ public:
                 add_group(std::move(terms));
             }
         }
+        return true;
     }
 
     void add_group(std::vector<std::string> terms) {
