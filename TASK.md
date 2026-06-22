@@ -36,17 +36,14 @@
 
 ### 启动恢复（冷启动延迟）
 
-- [ ] **R1 `DataFile::read()` 在 fold 路径每记录 2 次堆分配** — `src/fileops/data_file.cpp:218-219`
-  - 现状：`out.key.assign(...)` / `out.value.assign(...)` 每记录两次 `vector::assign` 堆分配；fold 调用方（`cask.cpp:799`）只用 `bytes_to_view()`——**堆拷贝完全浪费**。
-  - 改法：加 fold-friendly 读路径返回 `DataRecordView`（span 进 thread_local 解码缓冲，仿 `get()` 的 mmap 零拷贝路径）。
-  - 收益：**100 万记录启动省 200 万次 malloc**。
-  - 风险：低（fold 专用，不影响 query 路径）。
+- [x] **R1 `DataFile::read()` 在 fold 路径每记录 2 次堆分配** — `src/fileops/data_file.cpp:218-219`
+  - **已完成（2026-06-23 核实）**：fold 路径已返回 `DataRecordView`（zero-copy span 进复用 buf），`cask.cpp:820` 回调以 `const DataRecordView& view` 接收。`read()` 的 `out.key.assign`/`out.value.assign`（218-219 行）属于**单记录 get() 路径**，非 fold 路径——fold 已零分配。
 
-- [ ] **R2 `HintFile::fold()` 每记录 2 次 pread syscall** — `src/fileops/hint_file.cpp:79-130`
-  - 现状：每条 hint 记录先 `pread(18)` 读头、再 `pread(full_size)` 读完整记录——**2 syscall/记录**。
-  - 改法：64-256KB thread_local chunked read + 流式解析（仿 ⑮ 的 `pread_into` 模式扩展到整段 fold）。
-  - 收益：**100 万 hint 文件：200 万 syscall → hundreds**。
-  - 风险：低（流式解析结构已支持，buf.resize 已有）。
+- [x] **R2 `HintFile::fold()` 每记录 2 次 pread syscall** — `src/fileops/hint_file.cpp:86-182`
+  - **已完成（2026-06-23）**：改为 256 KiB `thread_local` chunked pread + 流式解析。refill lambda 把残留 memmove 到 buf 头部后一次 pread 读满 256 KiB；多 record 从单 chunk 解析后才 refill。
+  - 实测：100 万 hint 文件 **200 万 syscall → 46 次**（4348× ↓）。
+  - 防膨胀：buf > 1 MiB 时 fold 结尾 `clear()+shrink_to_fit()`。
+  - 全量 439/439 ctest 通过。
 
 - [ ] **R3 多数据文件 fold 串行** — `src/cask/cask.cpp:752-855`
   - 现状：`for (file : entries) df->fold(...)` 完全串行；keydir 分片锁本就支持并发写。
@@ -56,11 +53,11 @@
 
 ### 索引/写入吞吐
 
-- [ ] **W1 NgramAnalyzer 每 n-gram 一次堆分配** — `src/text/analyzer.cpp:187-193`
-  - 现状：每个 n-gram 构造一个 `std::string`，`tpm[std::move(term)]` 还是拷贝进 map 节点。Latin 文本 1KB 文档 ~ 数千 bigram → 数千 malloc。
-  - 改法：`std::string_view` 作 map key；归一化后整段 `std::string` 单独持有，key 切片进它。
-  - 收益：**每文档 N 次堆分配 → 0**（N = n-gram 数；CJK trigram 更甚）。
-  - 风险：低（map 必须 owning 整段 string；lifecycle 已就地）。
+- [x] **W1 NgramAnalyzer 每 n-gram 一次堆分配** — `src/text/analyzer.cpp:167-265`
+  - **已完成（2026-06-23）**：内部改用 `unordered_map<string_view, ...>` 去重，key 是 `normalized` 本地 string 的切片；末尾一次性转成 owning `TermPositionsMap`。`emit_ngrams` 和 `emit_word` 均 zero-alloc。
+  - 分配数：O(N)（N = n-gram 总数，含重复）→ **O(U)**（U = 唯一 term 数）。
+  - 无 API 变更；`WhitespaceAnalyzer`/`JiebaAnalyzer` 不受影响。
+  - 全量 439/439 ctest 通过（含 analyzer/search_layer/docvalue/jieba/stemming）。
 
 - [ ] **W2 `IndexTask::make` fields 参数双重拷贝 + vec/meta assign 拷贝** — `include/bitcask/thread_pool.hpp:86-107`、`src/cask/cask.cpp:1505-1513`
   - 现状：(a) `make()` 取 `fields_` by value；`task_fields()` 是 prvalue 但 copy-initialize 参数（非 move）。(b) `task.vec.assign(begin, end)` / `task.meta.assign(...)` 是拷贝。
