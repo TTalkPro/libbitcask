@@ -7,7 +7,13 @@
 
 ---
 
-## [Unreleased]（1.0.0 之后）
+## [Unreleased]
+
+无未发布变更。
+
+---
+
+## [1.1.0] - 2026-06-22
 
 ### 新增（Added）
 - **HNSW 向量外存化（V7 / BVH2 v2）**：全精度 f32 向量改存独立的 `search.vec`
@@ -78,5 +84,6 @@
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: 与 1.0.0 比较的未发布变更（性能 / 持久化 / 生产正确性 / CI）。
-[1.0.0]: 首个发布（C++23 重写，C ABI）。
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/davidalphafox/libbitcask/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/davidalphafox/libbitcask/releases/tag/v1.0.0
