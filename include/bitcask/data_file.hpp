@@ -167,7 +167,8 @@ private:
     Mode           mode_           = Mode::kRead;
     std::vector<std::byte> write_buf_;  // write() 复用的编码缓冲;容量跨调用保留
     // P6:sealed mmap。map_base_ != nullptr 表示整文件已 mmap(PROT_READ,
-    // MAP_SHARED);此时 fd 已关闭,read_mmap 直读映射。~DataFile munmap。
+    // MAP_SHARED);read_mmap 直读映射。fd 仍保留打开(read()/fold() 的 pread 需要,
+    // 见 data_file.cpp::open 注释;fd 回收归 P9)。~DataFile munmap。
     const std::byte* map_base_ = nullptr;
     std::size_t      map_size_ = 0;
 };

@@ -1,7 +1,7 @@
 # P12 — meta_blobs_ 内存按需 / 有界 设计
 
-> 状态：2.1.1 **备选**（需 gate）。路线图见 [`../ROADMAP.md`](../ROADMAP.md)；
-> meta filter 见 [`api-zh.md`](api-zh.md)（Meta 过滤）。
+> 状态：2.1.1 **备选**（需 gate，**未实施**）。路线图见 [`../ROADMAP.md`](../ROADMAP.md)；
+> meta filter（`meta::MetaFilter`）见 [`api-cpp.md`](api-cpp.md)。
 
 ## 1. 背景
 

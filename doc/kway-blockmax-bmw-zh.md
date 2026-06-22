@@ -1,7 +1,8 @@
 # k-way 交集 + 块级元数据 + Block-Max WAND（BM25 V2 检索加速路线）
 
-> 对应代码：`inverted.cpp` 的 `run_must_intersect`（inverted.cpp:900，
-> 当前为 pairwise 物化交集）、`intersect.hpp` 的 `intersect_u64`。
+> 对应代码：`inverted.cpp` 的 `run_must_intersect`（lambda，inverted.cpp:1228；
+> K1 已落地——k==2 走 SIMD pairwise、k≥3 走 leapfrog）、`intersect.hpp` 的 `intersect_u64`。
+> 合取 BMW 主体见 `search_wand`、B1 块跳跃见 `inverted.cpp:976` 起。
 > 前置阅读：`doc/inoue-simd-intersection-zh.md`（尤其 §8 设计评审）。
 >
 > 本文解释三个递进的概念——k-way 交集、posting 块级元数据、
@@ -22,7 +23,7 @@
 当前 BM25 查询路径是「完整 must 交集 → 全部评分 → 排序取 top-k」。
 两个问题：
 
-1. **pairwise 物化交集**（inverted.cpp:900）：k 个 must 词做 k-1 轮
+1. **pairwise 物化交集**（K1 落地前的基线）：k 个 must 词做 k-1 轮
    两两交集，每轮分配中间 vector、完整重读上一轮结果。
 2. **完整交集本身就是无用功**：top-k 查询要的是分数最高的 10 篇文档，
    却把全部命中文档都求了出来、评了分。工业引擎
@@ -64,7 +65,7 @@ candidate = 各游标当前值的最大者
 位置」。这个接口正好接住 §3 的块级元数据：advance 跳多远取决于
 元数据的粒度。
 
-改动范围：仅 `run_must_intersect` 局部（inverted.cpp:900），
+改动范围：仅 `run_must_intersect` 局部（inverted.cpp:1228），
 posting 存储不动。独立收益：消除 k-1 次中间分配与搬运。
 
 ## 3. 第二步：posting 块级元数据（每 128 ord 存 max ord + max tf）
@@ -234,8 +235,13 @@ quantize 到 u8/u16),上界零松弛(仅量化误差)。BoolMustSkewed 基准
 统计,预存会随统计漂移失去 admissibility;(max_tf, min_dl) 与统计
 无关,查询期用当前统计算上界,天然 admissible。实现:`Posting` 增
 `dl` 字段(索引时 Σtf,**恰落原 4B padding,内存零增量**),封块/
-finalize/compact 都能精确重算 min_dl;快照 InvVersion=5(块 +4B),
+finalize/compact 都能精确重算 min_dl;此次快照为 InvVersion=5(块 +4B),
 v4 载入 min_dl=1 回退(等价旧行为)。
+
+> 当前 `kInvVersion=6`（`inverted.cpp:1607`）:v6 在 v5 基础上对 ord 用 FOR
+> (Frame-of-Reference,128/块)块压缩、TFs/dls 改 VByte varint 整组编码,且
+> **不再支持 v1..v5 载入**(旧快照需外部工具迁移或重建)。即下文「另行排期」的
+> 压缩改动已落地。`min_dl` 上界剪枝逻辑不变。
 
 **新不变量**(已写入 LiveChecker 文档):查询期 doc_len(ord) 必须
 == add_doc 时 Σtf(SearchLayer 同源天然成立)——若查询期 dl 更小,
@@ -249,7 +255,7 @@ v4 载入 min_dl=1 回退(等价旧行为)。
 | BoolMustHot3/100k | 695μs | 674μs | 1011 → 674(基准 checker dl 与 Σtf 不一致,上界留有余隙——良性,admissible 方向) |
 
 剪枝如预期触发:均匀形态 min_dl==实际 dl ⇒ ub==θ ⇒ 堆满后整块跳过。
-压缩类改动(TF 量化、FOR)与本次解耦,另行排期(纯体积收益)。
+压缩类改动(FOR + VByte)当时与本次解耦,**现已作为 InvVersion=6 落地**(见上注)。
 
 ## 7. 参考
 

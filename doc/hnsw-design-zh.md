@@ -154,6 +154,13 @@ search_hybrid(query, qvec, k)     → BM25 top-K' ∥ HNSW top-K'
 
 ### V3.6 落地记录(2026-06-12,search_hybrid + NIF/Erlang 接口)
 
+> ⚠️ **Erlang/NIF 接口已下线。** 本项目现为纯 C++ 库 + **C ABI**
+> (`c_api/bitcask_c.{h,cpp}`),无 Erlang/NIF/eunit。下文第 5/6 点描述的
+> `cask_search_vector` / `bitcask_embedder` / `<<X:32/float-little>>` 等 Erlang
+> 绑定为历史记录;当前等价接口见 [`api-c.md`](api-c.md)(`bitcask_search_vector` /
+> `bitcask_search_hybrid` / `bitcask_doc_input_t.vector`)与
+> [`api-cpp.md`](api-cpp.md)。RRF 融合语义(1–4 点)与当前实现一致。
+
 实现主体在 `SearchLayer::search_hybrid`(Cask 门面只做向量配置校验 +
 flush),语义定稿如下:
 
@@ -182,6 +189,14 @@ flush),语义定稿如下:
    (BITCASK_EMBEDDER_LIVE=1 手动开)。
 
 ## 5. 持久化与恢复(A4 体系的第四块;V3.5 落地定稿)
+
+> ⚠️ **本节为 V3.5 历史定稿,已被 V5/V7 取代。** 当前实现:HNSW 不再有独立
+> `hnsw.snap`/BCVS 单文件;图头作为 **`search.ckpt` 的 hnsw 段(BVH2 v2,magic
+> 0x32485642,int8 qcodes 内嵌)**、f32 向量外存 **`search.vec`(BCVP,mmap)**;
+> 四块成对门改为 **单 watermark 自门 + 全段 CRC**。权威以
+> [`format-zh.md` §10](format-zh.md)、[`hnsw-lifecycle-zh.md`](hnsw-lifecycle-zh.md)、
+> [`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)
+> 为准。下文 §5.1–5.3 保留 V3.5 设计原貌作历史记录。
 
 > 实施记录(2026-06-12):本节由设计稿的"vec/hnsw 两文件"方案合并
 > 定稿为**单文件完整图快照**——快照内容 = 向量 + 邻接 + entry。

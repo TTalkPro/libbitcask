@@ -30,8 +30,8 @@ data / want to keep the existing store).
 `migrate_le` is built as part of the CMake build:
 
 ```bash
-cmake -S . -B _build/cmake -DBUILD_TESTING=ON
-cmake --build _build/cmake -j --target migrate_le
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build -j --target migrate_le
 # output: build/migrate_le
 ```
 

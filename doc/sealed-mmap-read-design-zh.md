@@ -6,8 +6,9 @@
 ## 1. 背景与动机
 
 现状：data 文件读路径是 `pread`（`posix_file.cpp`）；`read_files_` 按 file_id 缓**打开的
-DataFile 句柄（fd）**，不缓 value、不 mmap（`cask.cpp:1045`）。`Cask::get` =
-keydir 查 → `read_file` → `df->read` pread → `GetResultView`（span 借 pread 缓冲）。
+DataFile 句柄（fd）**（`Cask::read_file`，`cask.cpp:1044`）。`Cask::get` =
+keydir 查 → `read_file` → `df->read`/`read_mmap` → `GetResultView`（mmap 命中零拷贝，
+否则 span 借 pread 缓冲）。
 
 `pread` 已享 OS page cache（热数据不打盘），但每次 get：① 一次 pread **syscall**；
 ② page cache → 用户态**一次拷贝**。**mmap sealed 文件**可同时消掉这两项：指针直读

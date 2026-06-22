@@ -27,7 +27,9 @@ tp.pl_copy = acc->second;          // ← 整个 PostingList 深拷贝
 
 - `items`：每条 `Posting{ord(8B), tf(4B), positions(vector, 24B 头 + 独立堆块)}`
   —— **每条 posting 一次堆分配**；
-- `compressed_ords` / `blocks` / `max_tf`（派生态，量小）。
+- `blocks` / `max_tf`（派生态，量小）。
+  （注：写作时还有常驻 `compressed_ords` 压缩副本，已于 O3 移除——VByte 压缩
+  改为 save 时现场编码，内存不再常驻；见 `inverted.hpp` PostingList 注释。）
 
 热词 10 万 posting ≈ 4MB 拷贝 + 10 万次小分配，**每次查询、每个命中词**都付一遍。
 这是当前查询路径上最大的单项开销，超过 O 系列已优化项的总和。
@@ -150,8 +152,9 @@ save/load/compact 全要过一遍、内存序推理需要 TSan 背书。
 - 不动 `rebuild_index()` 换整个 InvertedIndex 的上层互斥假设（fields_ 的
   发布是另一个独立问题，见审计报告 §健壮性）；
 - 不动磁盘格式（Phase 2 的 deque 仅内存形态，save 仍按序写）；
-- `compressed_ords` 的内存冗余（审计 #2）与本设计正交：Phase 2 落地后
-  顺手把内存中的 `compressed_ords` 砍掉（save 时现编码）收益更顺。
+- ~~`compressed_ords` 的内存冗余（审计 #2）与本设计正交：Phase 2 落地后
+  顺手把内存中的 `compressed_ords` 砍掉（save 时现编码）收益更顺。~~
+  **已完成（O3，独立于 Phase 2）**：内存不再常驻压缩副本，VByte 仅 save 时现编码。
 
 ## 6. 基准先行（依赖审计 #7）
 

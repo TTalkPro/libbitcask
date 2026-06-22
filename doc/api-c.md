@@ -94,7 +94,7 @@ typedef struct {
 | `11` | `BITCASK_ERR_MODE_MISMATCH` | 模式不匹配 |
 | `12` | `BITCASK_ERR_ANALYZER_MISMATCH` | 分析器类型不匹配 |
 
-> `bitcask_iter_next` 的 `BITCASK_ERR_OUT_OF_DATE`（快照过期，caller 重试）是 `BITCASK_ERR_INVALID_OPTION` 的别名使用场景。
+> `bitcask_iter_next` 遇快照过期（caller 应重试）时返回 `BITCASK_ERR_INVALID_OPTION`——头文件中无独立的 `BITCASK_ERR_OUT_OF_DATE` 常量。
 
 ---
 
@@ -140,7 +140,7 @@ typedef struct {
 | 字段 | 类型 | 默认 | 含义 |
 |------|------|------|------|
 | `enable_search` | `int` | `0` | 启用索引模式 |
-| `analyzer_type` | `bitcask_analyzer_type_t` | `NGRAM` | 分析器类型 |
+| `analyzer_type` | `bitcask_analyzer_type_t` | `NONE` | 分析器类型（`NONE` 内部映射为 `NGRAM`）|
 | `analyzer_min_n` | `uint32_t` | `2` | Ngram 最小 n |
 | `analyzer_max_n` | `uint32_t` | `3` | Ngram 最大 n |
 | `jieba_dict_path` | `const char*` | `NULL` | Jieba 词典目录（`NULL`=库内默认）|
@@ -226,6 +226,7 @@ typedef struct {
     uint64_t key_count;
     uint64_t key_bytes;
     uint64_t epoch;
+    uint64_t index_errors;  // indexed worker 抛异常时自增；非零 = 索引可能漂移
 } bitcask_status_t;
 ```
 

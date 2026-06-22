@@ -4,8 +4,10 @@
 > 前置阅读：`doc/inoue-simd-intersection-zh.md`（块过滤设计与评审）。
 >
 > 本文三部分：旋转法（Schlegel/Lemire）的深度原理介绍；
-> 两项输出段微优化的收益分析——①预分配 + 裸指针游标（待实施），
-> ②压缩段「条件分支 vs PairLut」实测对比（待实施，依赖①）。
+> 两项输出段微优化的收益分析——①预分配 + 裸指针游标（**已落地**，
+> `intersect_u64` 入口一次 resize 上界 + 各内核裸指针游标写出 + 末尾截断，
+> 见 intersect.cpp:4-6/196-199），②压缩段「条件分支 vs PairLut」实测选型
+> （AVX2 仍待实测，压缩段维持分支形式，见 intersect.cpp:69-70）。
 
 ## 1. 旋转法（Schlegel/Lemire, ADMS 2011）深度介绍
 
@@ -40,7 +42,7 @@ rot 3:  a0:b3  a1:b0  a2:b1  a3:b2
 4 轮旋转把 16 个配对按**对角线**切成 4 份，每对恰比较一次。
 4 轮掩码 OR 起来，lane i = 「a[i] 是否出现在 b 块中」。
 
-对应代码（intersect.cpp:72-84）：
+对应代码（intersect.cpp:81-93，`exact_match_u64_avx2`）：
 
 ```cpp
 cmp01 = cmpeq(va, vb)                              // rot 0
@@ -64,7 +66,7 @@ mask  = movemask_pd(cmp);                          // 4-bit 命中掩码
 
 ### 1.3 块间推进
 
-比较两块最大值（intersect.cpp:106-109）：
+比较两块最大值（intersect.cpp:116-119）：
 
 ```cpp
 if (amax <= bmax) i += B;    // 相等时两边都推进
@@ -83,8 +85,8 @@ mask 标出命中 lane，还要把命中元素**紧凑**写出。这是旋转法
 | 宽度 | mask 取值数 | 经典做法 |
 |---|---|---|
 | u32 × 8 lane（AVX2） | 256 | 256 项 LUT（8KB）+ `permutevar8x32` + store |
-| u64 × 4 lane（AVX2） | 16 | 16 项 PairLut（512B）+ paired `permutevar8x32`；或当前代码的 4 × 条件 push_back（intersect.cpp:86-89） |
-| AVX-512 | — | `vpcompress` 一条指令，LUT 消失（intersect.cpp:146 已用） |
+| u64 × 4 lane（AVX2） | 16 | 16 项 PairLut（512B）+ paired `permutevar8x32`；或当前代码的 4 × 条件游标写 `*cur++`（intersect.cpp:95-98） |
+| AVX-512 | — | `vpcompress` 一条指令，LUT 消失（`_mm512_mask_compressstoreu_epi64`，intersect.cpp:155 已用） |
 
 压缩段选型见 §3。
 
@@ -100,17 +102,21 @@ Lemire/Boytsov/Kurz 2016 推广到 u32 shuffle + galloping 混合。
 
 **局限**：全对全是「块内」无分支，但**每块照付全套 13 条指令，
 哪怕两块毫无交集**。低重叠率下大部分 SIMD 工作花在空块上——
-这正是 Inoue 块过滤（intersect.cpp:101-102 两次标量区间比较）
+这正是 Inoue 块过滤（intersect.cpp:111-112 两次标量区间比较）
 要在它前面挡掉的开销。互补关系：**Inoue 管「这块要不要算」，
 旋转法管「要算的块怎么算到最快」**。
 
-## 2. 微优化①：预分配 min(na,nb) 上界 + 裸指针游标
+## 2. 微优化①：预分配 min(na,nb) 上界 + 裸指针游标（已落地）
 
-### 2.1 push_back 在热循环里的真实成本
+> 本节描述的优化**已实现**：`intersect_u64`（intersect.cpp:196-199）入口
+> `out.resize(min(na,nb))` 一次给足，各内核经裸指针 `cur` 写出
+> （scalar `:33`、galloping `:59`、AVX2 `:95-98`、AVX-512 `compressstoreu` `:155`），
+> 末尾 `out.resize(cur-base)` 截断。下文「push_back 成本」分析为落地前的动机记录。
 
-当前四处逐元素写出：标量归并（intersect.cpp:29）、galloping（:54）、
-AVX2 内核（:86-89）、AVX-512 每重叠块一次 `resize`（:144-145）。
-每次 `push_back` 编译后：
+### 2.1 push_back 的真实成本（落地前动机）
+
+改造前四处逐元素 `push_back`：标量归并、galloping、AVX2 内核、AVX-512
+每重叠块一次 `resize`。每次 `push_back` 编译后：
 
 ```
 载入 size、capacity → 比较 → 分支（满？）
@@ -151,14 +157,19 @@ SIMD 省 per-block resize——**对所有路径纯收益**。
 
 ### 2.3 实现细节
 
-无条件 SIMD store 写满整个向量宽度（哪怕只 2 个命中），预分配须
-多留 `kSlack = B` 余量；多写部分被后续写出覆盖或最终截断丢弃。
+> **落地现状**：当前内核写出精确元素数——AVX2 用 4 个条件 `*cur++`、
+> AVX-512 用 `compressstoreu`（按 mask 只写 popcount 个），均**不会越写**，
+> 故落地代码 `out.resize(min(na,nb))` **无 kSlack 余量**（intersect.cpp:196-197）。
+
+下述 kSlack 仅在 §3 的「无条件 SIMD store」PairLut 变体落地后才需要：
+无条件 store 写满整个向量宽度（哪怕只 2 个命中），预分配须多留 `kSlack = B`
+余量；多写部分被后续写出覆盖或最终截断丢弃。
 
 ## 3. 微优化②：压缩段「4×条件分支 vs PairLut 无分支」实测
 
 ### 3.1 当前实现的分支形态依赖
 
-intersect.cpp:86-89 每重叠块 4 个数据相关分支：
+intersect.cpp:95-98 每重叠块 4 个数据相关分支：
 
 - **mask 几乎恒 0**（稀疏交集）或**恒满**（自交）：预测近乎全对，
   成本 ≈ 0，此写法很快；
@@ -206,8 +217,8 @@ cur += std::popcount(mask);
 | 内核段 | 无分支手段 | 状态 |
 |---|---|---|
 | 块内比较 | 旋转法全对全（§1） | 已落地 |
-| 压缩 | PairLut 或 vpcompress（§3） | AVX-512 已落地；AVX2 待实测选型 |
-| 写出 | 预分配 + 裸指针游标（§2） | 待实施 |
+| 压缩 | PairLut 或 vpcompress（§3） | AVX-512 已落地（compressstoreu）；AVX2 待实测选型（仍 4 条件分支） |
+| 写出 | 预分配 + 裸指针游标（§2） | **已落地** |
 
 三件做完，整条内核从头到尾才真正没有数据相关分支。
 

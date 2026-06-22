@@ -1,7 +1,7 @@
 # P11 — merge I/O 顺序优化 设计
 
-> 状态：2.1.1 承诺项（小项）。路线图见 [`../ROADMAP.md`](../ROADMAP.md)；merge 见
-> [`merge-policy-zh.md`](merge-policy-zh.md)、[`merger.cpp`]。
+> 状态：2.1.1 承诺项（小项，**未实施**）。路线图见 [`../ROADMAP.md`](../ROADMAP.md)；merge 见
+> [`merge-policy-zh.md`](merge-policy-zh.md)、`src/merge/merger.cpp`。
 
 ## 1. 背景
 

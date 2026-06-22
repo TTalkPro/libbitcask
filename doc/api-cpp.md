@@ -150,10 +150,11 @@ struct TextSearchResult {
 
 ```cpp
 struct StatusInfo {
-    std::uint64_t                   key_count = 0;
-    std::uint64_t                   key_bytes = 0;
-    std::uint64_t                   epoch     = 0;
+    std::uint64_t                   key_count    = 0;
+    std::uint64_t                   key_bytes    = 0;
+    std::uint64_t                   epoch        = 0;
     std::vector<merge::FileStatus>  files;
+    std::uint64_t                   index_errors = 0;  // indexed worker 抛异常时自增；非零 = 索引可能漂移
 };
 ```
 

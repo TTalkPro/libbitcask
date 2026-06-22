@@ -34,16 +34,17 @@
 ├── bitcask.write.lock        # 写锁（live writer 持有）              §六
 ├── bitcask.merge.lock        # 合并锁（active merger 持有）          §六
 │   # —— 以下为恢复 checkpoint / 索引文件（可 fold 重建，纯优化）——  §十
-├── kv.keydir.ckpt            # keydir checkpoint（BCKS）
-├── search.docmap.ckpt        # 搜索文档目录 checkpoint（BCIS）
-├── search.vec.ckpt           # HNSW 向量图 checkpoint（BCVS）
-├── search.bm25.manifest      # bm25 字段清单（文本）
-├── search.bm25.f<i>.seg      # bm25 per-field 倒排段
-└── search.bm25.f<i>.wal      # bm25 per-field 增量 WAL
+├── kv.keydir.ckpt            # keydir checkpoint（BCKS）                §十.1
+├── search.ckpt               # 搜索分段 checkpoint 容器（BCSC）         §十.2
+├── search.ckpt.prev          # 上一代 search.ckpt（代际回退）           §十.2
+└── search.vec                # HNSW 向量 payload（BCVP，mmap）          §十.3
 ```
 
-> checkpoint/索引文件**全部可由 fold 数据文件重建**（纯优化），命名契约
-> `{kv|search}.{组件}.{ckpt|seg|wal|manifest}`（P14a）；详见 §十与
+> checkpoint/索引文件**全部可由 fold 数据文件重建**（纯优化），任何校验失败 →
+> 丢弃 → 回退全量 fold，绝不影响正确性。P14e 起搜索侧的 docmap / bm25 倒排 /
+> HNSW 图头统一为单个 **`search.ckpt`** 分段容器（每段独立 CRC）+ 一个外存
+> **`search.vec`** 向量 payload；旧的 `search.docmap.ckpt` / `search.vec.ckpt` /
+> `search.bm25.*` 多文件已不再产生。详见 §十与
 > [`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)。
 
 `<tstampN>` 是 file id，一个全局单调递增的十进制整数（内部 uint32，
@@ -262,9 +263,14 @@ meta、fields 四段的打包二进制结构。
 0      Ver               1       布局版本，当前 = 3
 1      Flags             1       位掩码（见下）
 2      Vector 段（可选，Flags&0x01 时存在）
+       —— 未量化（Flags&0x08 清零）——
          Dim            varint  f32 元素个数
          f32 数组        Dim×4   小端 f32 值
-         [若 Flags&0x08 置位，则为量化码字——未来扩展；当前不支持]
+       —— int8 量化（Flags&0x08 置位，P3a）——
+         Dim            varint  元素个数
+         SchemeVer      1       量化方案版本（当前 = 1，对称 int8）
+         scale          4       小端 f32
+         int8 码字       Dim     每元素一个 int8；v̂[i] = codes[i]·scale/127
 X      Text 段（可选，Flags&0x02 时存在）
          Len            varint  字节长度
          字节数组         Len    UTF-8 文本
@@ -286,7 +292,7 @@ Z      Fields 段（可选，Flags&0x10 时存在；多字段）
 | 0   | `has_vector`    | Vector 段存在                             |
 | 1   | `has_text`      | Text 段存在                               |
 | 2   | `has_meta`      | Meta 段存在                               |
-| 3   | `vec_quantized` | Vector 段含量化数据（未来扩展；当前不支持） |
+| 3   | `vec_quantized` | Vector 段为 int8 量化码字（P3a），而非 f32 数组 |
 | 4   | `has_fields`    | Fields 段存在（多字段）                    |
 
 四个可选段存在时**按 vector→text→meta→fields 顺序**排列，由 Flags 决定哪些存在。
@@ -304,8 +310,11 @@ Z      Fields 段（可选，Flags&0x10 时存在；多字段）
 
 ### Vector / Text / Meta 段
 
-- Vector：`Dim` 为 f32 元素个数（非字节数），payload 为 `Dim×4` 个小端 f32，
-  或量化码字（未来扩展；`vec_quantized=1` 当前报错）。
+- Vector：`Dim` 为元素个数（非字节数）。`vec_quantized=0` 时 payload 为 `Dim×4`
+  个小端 f32；`vec_quantized=1`（P3a）时 payload 为 `[SchemeVer:u8][scale:f32 LE]
+  [int8×Dim]` 的对称 int8 码字，重建 `v̂[i] = codes[i]·scale/127`（见
+  `detail/int8_kernels.hpp`）。落盘是否量化由 `bitcask.meta` 的 `VecQuantized`
+  位决定（§一）。
 - Text / Meta：`Len` 为 payload 字节长度，payload 为原始字节（Text 是 UTF-8，
   Meta 是任意序列化字节）。
 
@@ -465,12 +474,18 @@ NFS 上 `O_EXCL` 不可靠，但 bitcask 也不该跑在网络文件系统上。
 ## 十、恢复 checkpoint 与索引文件
 
 以下文件都是**派生缓存**：可由 fold 数据文件完全重建（`recover_doc` / keydir
-重建），是**纯优化**——任何校验失败 → 丢弃 → 回退全量 fold，绝不影响正确性。
-命名契约 `{kv|search}.{组件}.{ckpt|seg|wal|manifest}`（P14a）。详见
+重建），是**纯优化**——任何校验失败 → 丢弃 → 回退全量 fold，绝不影响正确性。详见
 [`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)。
 
-**统一外壳**（除 manifest 与 bm25 段外）：`[Magic:u32 LE][Version:u32 LE]
-[payload][CRC32(payload):u32 LE]`，`tmp + rename` 原子落盘。全部多字节整数小端。
+当前共两类 checkpoint 文件：
+
+- **`kv.keydir.ckpt`**（§10.1）：keydir 快照，独立单文件外壳
+  `[Magic:u32 LE][Version:u32 LE][payload][CRC32(payload):u32 LE]`。
+- **`search.ckpt`**（§10.2，P14e）：搜索侧分段容器，docmap / bm25 倒排 / HNSW 图头
+  各为一段、**每段独立 CRC**；其 HNSW 向量 payload 外存到同目录 **`search.vec`**
+  （§10.3）。
+
+全部多字节整数小端，`tmp + rename` 原子落盘。
 
 ### 10.1 kv.keydir.ckpt — keydir checkpoint（BCKS v1）
 
@@ -490,52 +505,85 @@ entry_n u64, 重复 entry_n 次:
 `covered_offset` 是尾部回放的水位：open 装载快照后只 fold 各文件该偏移之后的
 尾巴。来源 `src/keydir/keydir.cpp`（`save_snapshot`/`load_snapshot`）。
 
-### 10.2 search.docmap.ckpt — 搜索文档目录 checkpoint（BCIS v1）
+### 10.2 search.ckpt — 搜索分段 checkpoint 容器（BCSC v1）
 
-Magic `0x42434953`（"BCIS"），Version 1。payload：
+自描述、分段、**每段独立 CRC**；页脚最后写（`tmp + rename` 原子）——页脚存在且
+`footerCrc` 通过 ⟺ 文件结构完整。容器只管头部 + 段载荷 + 页脚目录，段 payload 是
+不透明字节（由各索引序列化器产出/消费）。来源
+`include/bitcask/search_checkpoint.hpp`（`SearchCheckpoint::write`/`read`）+
+`src/search/search_layer.cpp`（`save_search_ckpt`/`load_search_ckpt`）。
 
 ```
-covers_next_ord u64                 ← 保存时 keydir.next_ord（成对性门用）
+头部 (16B):  "BCSC"(4) | Version u32=1 (4) | watermark u64 (8)   ← 覆盖 next_ord 上界
+段载荷区:    各段 payload 顺序拼接（位置/校验由页脚目录给出）
+页脚:        SectionCount u32
+             重复 SectionCount 次:  type u16 | flags u16 | offset u64 | len u64 | crc32 u32
+             footerCrc u32   ← 覆盖整个目录
+             dirLen   u32   ← 目录字节数（从尾倒走定位）
+             "BCSC"(4)      ← trailer magic
+```
+
+保存时先把现有 `search.ckpt` 重命名为 `search.ckpt.prev`（代际回退）再写新文件；
+load 时 `search.ckpt` 结构损坏（页脚缺失 / `footerCrc` 失败 / 目录越界）则退
+`.prev`，再不行 → 全量 fold 重建。`watermark` 是单趟自门模型的成对性依据：
+open 装载快照后只 fold 各文件 watermark 之后的尾巴。
+
+**段类型**（`CkptSectionType`）：`kDocmap=1`、`kBm25Default=2`、`kBm25Fields=3`、
+`kHnsw=4`、`kMeta=5`、`kTerms=6`（5/6 为可选加速缓存）。当前写出 1–4 段。
+
+**段 1 — docmap**（payload 自带 `"BCIS"(0x42434953) u32 | Version u32=1` 头）：
+
+```
+covers_next_ord u64                 ← 保存时 keydir.next_ord
 rows u64, 重复 rows 次（每活索引文档一行）:
     ord u64 | klen u16 | ext[klen] | file_id u32 | offset u64
     | total_sz u32 | tstamp u32 | doc_len u32
+末尾 crc32 u32（覆盖 payload[8..]）   ← 段内自校验（容器目录另有逐段 CRC）
 ```
 
-把 bm25/hnsw 吐出的 ord 翻译回 key / 物理位置 / live / doc_len。与 keydir.ckpt
-字段大量重叠（见 recovery 设计），但按 ord 而非 key 索引。来源
-`src/search/search_layer.cpp`（`save_index_sidecar`/`load_index_sidecar`）。
+把 bm25/hnsw 吐出的 ord 翻译回 key / 物理位置 / live / doc_len，按 ord 索引。
 
-### 10.3 search.vec.ckpt — HNSW 向量图 checkpoint（BCVS v1）
+**段 2/3 — bm25.default / bm25.fields**：默认字段倒排序列化为段 2；其余字段
+打包为段 3（`FieldCount u32` × `{ NameLen u16 | name | invLen u64 | inv 段 }`）。
+单字段倒排段由 `InvertedIndex::serialize` 产出：标量字段 u32/u64 **小端**，postings
+用 VByte gap 压缩 + block-max 元数据；逐字节布局随检索特性（BMW / zero-copy
+posting）演进，以源码为准——`src/bm25/inverted.cpp` +
+[`posting-zero-copy-design-zh.md`](posting-zero-copy-design-zh.md)、
+[`kway-blockmax-bmw-zh.md`](kway-blockmax-bmw-zh.md)。
 
-Magic `0x42435653`（"BCVS"），Version 1。payload：
+> bm25 倒排**位流**为 MSB-first 位级打包（`inverted.cpp`），作为字节序列与主机
+> 字节序无关；VByte（§五）同样字节序中立。`inverted_wal.cpp` 的增量 WAL
+> （magic `"WAL1"=0x57414C31`）目前仅测试使用，未接入生产的 `search.ckpt` 流程。
+
+**段 4 — hnsw**（BVH2 v2 段头，向量另存 `search.vec`）：
 
 ```
-dim u16 | metric u8 | M u32 | ef_construction u32 | seed u64
-count u32 | entry_meta u64 | max_inserted_ord u64
+"BVH2"(0x32485642) u32 | Version u32=2 | flags u32 | dim u16 | metric u8
+| M u32 | efc u32 | seed u64 | count u32 | entry_meta u64 | max_ord u64
 重复 count 次（节点 id = 写出顺序 0..count-1）:
-    ord u64 | level u8 | vec[dim] f32 小端
+    ord u64 | level u8 | qcodes int8[dim] | qscale f32 | qsum i32
     重复 (level+1) 层:  cnt u32 | cnt×(neighbor_id u32)
+末尾 crc32 u32（覆盖 magic..最后一个 neighbor）
 ```
 
 不变量：邻居/entry id `< count`、ord 严格递增、layer-l 表只含 level≥l 的节点。
-**注意**：即便内存为 int8-only（P5），盘上仍存 f32（save 反量化、load 再量化）。
-来源 `src/vector/hnsw.cpp`（`save`/`load`）。
+段头内直存 **int8 量化码字**（省启动量化 pass）；全精度 f32 向量在 `search.vec`
+（§10.3）。来源 `src/vector/hnsw.cpp`（`serialize`/`deserialize`）。
 
-### 10.4 search.bm25.* — bm25 倒排索引
+### 10.3 search.vec — HNSW 向量 payload（BCVP v1）
 
-多字段：一个 `manifest` + 每字段一个 `.seg`（+ 运行期 `.wal`）。
+段 4 的 f32 向量外存到同目录 `search.vec`，只读 `mmap`（`MAP_SHARED` +
+`madvise RANDOM`）。`inmem_int8` 模式无常驻 f32 → 不产生 `.vec` 文件。
 
-- **search.bm25.manifest**（文本）：第一行 = 字段数；其后每行一个字段名
-  （可能含控制字符前缀，如默认字段 `\x01default`）。
-- **search.bm25.f\<i\>.seg**：第 i 个字段的倒排段（`InvertedIndex::save`）。
-  标量字段 u32/u64 **小端**（原生 `fwrite`），postings 用 VByte gap 压缩 +
-  block-max 元数据。逐字节布局随检索特性（BMW / zero-copy posting）演进，
-  以源码为准：`src/bm25/inverted.cpp` + `doc/posting-zero-copy-design-zh.md`、
-  `doc/kway-blockmax-bmw-zh.md`。
-- **search.bm25.f\<i\>.wal**：`[Magic "WAL1"=0x57414C31:u32][Version=1:u32]` +
-  增量记录（`add_doc`/`remove_doc`，VByte 编码）。load 快照后若 WAL 存在则重放、
-  随后 truncate。来源 `src/bm25/inverted_wal.cpp`。
+```
+头部 (64B):  "BCVP"(4) | Version u32=1 (4) | dim u16 (2) | count u32 (4)
+             | watermark u64 (8) | page_size u32=4096 (4) | vecs_off u64 (8)
+             | total_vecs u64 (8，字节数) | crc_count u32 (4)
+             | 保留 14B (0) | header_crc u32（覆盖 [0,60)）
+每 4KB 页 CRC32 表:  crc32 × crc_count = ceil(total_vecs / 4096)
+向量数据:    从 vecs_off 起页对齐，count × dim 个小端 f32
+```
 
-> 字节序例外回顾：bm25 倒排**位流**为 MSB-first 位级打包（`inverted.cpp`），
-> 作为字节序列与主机字节序无关；VByte（§五）同样字节序中立。其余所有多字节
-> 整数字段一律小端（§九）。
+写入顺序 `save_vec_payload(.vec)` → `serialize`（段头）→ `SearchCheckpoint::write`；
+读出顺序 `read(.ckpt)` → `deserialize` → `load_vec_payload(.vec)`。来源
+`src/vector/hnsw.cpp`（`save_vec_payload`/`load_vec_payload`）。

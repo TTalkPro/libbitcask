@@ -21,8 +21,10 @@
    data 文件——data 文件**本身已是一条带 ord 的全量 WAL**——又把分析后
    的 term 追加进 bm25 WAL(`inverted.cpp:358`)。同一笔写记两遍。
 3. **重用率 ≈ 0**:checkpoint 只在 close/merge 落盘,无周期性。崩溃后
-   keydir/docmap/hnsw 三块必陈旧 → 成对门(`cask.cpp:881`)按**最弱环**
-   判定 → 全量 fold。此时 bm25 WAL 被丢弃重建,**等于白记**。
+   keydir/docmap/hnsw 三块必陈旧 → 旧 4-way 成对门按**最弱环**判定 →
+   全量 fold。此时 bm25 WAL 被丢弃重建,**等于白记**。
+   (此成对门已被 P14e 的单 watermark 自门取代,见现 `load_recovery_snapshots`
+   `cask.cpp:873`;本节为重构前的问题陈述。)
 
 ## 2. 核心决策
 
@@ -58,10 +60,17 @@ field.schema             字段注册表(不变)
 kv.keydir.ckpt           KV keydir checkpoint(BCKS,单块,独立)
 search.ckpt        ← 新  搜索索引快照(分段:docmap/bm25/hnsw,逐段 CRC)
 search.ckpt.prev   ← 新  上一代搜索快照(代际回退)
+search.vec         ← V7  HNSW f32 向量 payload(BCVP,mmap;hnsw 段外存,见下)
 ```
 
 `.prev` 只对 `search.ckpt` 设(搜索段重建最贵、最值得回退提速);keydir
 重建便宜,不设 `.prev`。无 `*.wal`(路线 A)。
+
+> **实现现状(V7)**:本设计原把 HNSW 图(含 f32 向量)整体放进 `search.ckpt` 的
+> hnsw 段。V7 起做了**双文件拆分**:hnsw 段只存 BVH2 v2 图头(int8 量化码字 +
+> 邻接/ord/level),全精度 f32 向量外存到同目录 `search.vec`(BCVP,只读 mmap);
+> `inmem_int8` 模式无常驻 f32 → 不产生 `.vec`。字节级布局以
+> [`format-zh.md` §10](format-zh.md) 为准。
 
 > **取代关系(P14a → P14e)**:P14a 已落地的多文件搜索命名
 > (`search.docmap.ckpt` / `search.vec.ckpt` / `search.bm25.manifest` /
@@ -102,7 +111,7 @@ trailer   "BCSC"  4 ASCII
 | 1 | `docmap` | **可选加速** | `ord → key/loc/live/doc_len`(原 BCIS sidecar 内容) |
 | 2 | `bm25.default` | 必需 | 默认域 `InvertedIndex` |
 | 3 | `bm25.fields` | 有字段时 | `u32 fieldCount; [name; InvertedIndex]×` |
-| 4 | `hnsw` | 有向量时 | `HnswIndex` 图(原 BCVS;int8-only 盘上仍 f32) |
+| 4 | `hnsw` | 有向量时 | `HnswIndex` 图头(V7:BVH2 v2,int8 码字内嵌;f32 向量外存 `search.vec`) |
 | 5 | `meta` | **可选加速** | `u32 count; [ord; blob]×`(过滤搜索免按 ord 读 data;缺失则按需读) |
 | 6 | `terms` | **可选加速** | `ord → 分析后 term`(回放/重建免重分词;缺失则 fold 原文重分词) |
 
@@ -165,8 +174,9 @@ keydir.ckpt 缺失**或**某搜索段坏/缺(且 keydir 水位>0)才回退 `fold
 
 ## 5. 写入(snapshot)流程 + 周期 checkpoint
 
-现仅 close(`cask.cpp:674`)/merge(`:1675/:1734`)。新增周期触发,把
-`wm_min` 拉近尾部、限定崩溃后回放量。`search.ckpt` 单文件分段写流程:
+现仅 close(`cask.cpp:664`：search.ckpt `:694`、keydir `:697`)/merge
+(`Cask::merge` `:1739`：keydir `:1757`、search.ckpt `:1779`、收尾 keydir `:1812`)。
+新增周期触发,把 `wm_min` 拉近尾部、限定崩溃后回放量。`search.ckpt` 单文件分段写流程:
 
 ```
 1. drain 异步索引(IndexPool 静止);watermark = keydir.next_ord。

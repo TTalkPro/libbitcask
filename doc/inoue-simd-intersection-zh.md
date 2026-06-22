@@ -1,7 +1,10 @@
 # Inoue 块过滤 + SIMD 精确匹配（交集内核设计方案）
 
-> 对应代码：`intersect.cpp` 的 `intersect_u32`/`intersect_u64`、
-> `inverted.cpp` 的 `run_must_intersect`。
+> 对应代码（**as-built**）：`intersect.cpp` 的 `intersect_u64`（四路分发：
+> galloping `:41` / `intersect_inoue_avx512` `:161` / `intersect_inoue_avx2` `:103` /
+> `intersect_scalar` `:22`，分发体 `:187`）、`inverted.cpp` 的 `run_must_intersect`
+> （lambda，`:1228`）。本文 §2 提出的 Inoue 块过滤 + SIMD 精确匹配**已落地为
+> 上述 u64 内核**；`intersect_u32` 内核已随 u32 收窄路径移除（§8.5）。
 > 前置阅读：`doc/bool-search-intersection-zh.md`。
 
 > **状态（2026-06-12 决策，见 §8.5）**：ord 恒为 u64，**u32 收窄路径已整体
@@ -344,7 +347,7 @@ u64 只有 4 lane（u32 的一半），SIMD 加速比本就有限。Inoue 的阶
 |---|---|
 | `intersect.hpp` | 新增 `intersect_u64()` 接口声明 |
 | `intersect.cpp` | 新增 `intersect_inoue` 模板 + 各 ISA 精确匹配内核 + `intersect_u64` 三路分发 |
-| `inverted.cpp` | `run_must_intersect` 的 u64 lambda 从 `set_intersection` 改调 `intersect_u64` |
+| `inverted.cpp` | `run_must_intersect`（lambda，`:1228`）的 u64 路径从 `set_intersection` 改调 `intersect_u64`（k==2；k≥3 走 leapfrog） |
 
 **不需要改的文件**：
 - `inverted.hpp`（PostingList / FlatPostings 不变）
@@ -465,7 +468,7 @@ run_must_intersect 骨架中的分发：
 
 **理由**：
 
-1. **u32 窄化已覆盖 99.99%+ 的场景**——现有 `narrow_ok` 门（inverted.cpp:904-910）
+1. **u32 窄化已覆盖 99.99%+ 的场景**——当时的 `narrow_ok` 门（已随 §8.5 删除）
    检查 `fp.ords.back() ≤ 0xFFFFFFFF`，需要累计写入超 43 亿条才失败。
 2. **u32 Roaring 比 Roaring64 快约 2 倍**——对同一查询，u32 路径始终更快。
 3. **u64 回退是影子路径**——用 Inoue + 原生 u64 SIMD（§2.4）比 Roaring64 更合适：
@@ -481,7 +484,7 @@ run_must_intersect 骨架中的分发：
 |---|---|
 | **tf/positions 丢失** | Roaring bitmap 只存 doc ID，不存 tf。需要混合存储：Roaring 存 ords + 并行数组存 tfs/positions。PostingList 内部表示需要完全重写 |
 | **snapshot_flat 重写** | 当前拷贝 `vector<u64> ords + vector<u32> tfs`。Roaring 版需要拷贝 Roaring 容器或共享引用 |
-| **save/load 格式变更** | 当前 VByte gap 编码（inverted.cpp:1272-1289）。需改成 Roaring 序列化格式（或维护两套） |
+| **save/load 格式变更** | 当前 v6（`kInvVersion=6`）：ord 用 FOR 块压缩 + tfs/dls VByte varint（`inverted.cpp:1605` 起）。需改成 Roaring 序列化格式（或维护两套） |
 | **外部依赖** | CRoaring 是 header-only 或静态库，需引入构建系统 |
 | **6 个模块受影响** | `PostingList`、`FlatPostings`、`intersect_u32`、`snapshot_flat`、`save/load`、`compact` 全要改 |
 
@@ -549,9 +552,10 @@ run_must_intersect 骨架中的分发：
 | 评分集成 | 完整 must 交集 → 再评分 | WAND / Block-Max WAND / MaxScore：分数上界跳文档，top-k 出来时大部分 posting 未被触碰 | 交集内核优化的环节会被 BMW 整体绕开；纯 filter 场景工业答案是 Roaring AND（§5 已分析） |
 | doc ID 宽度 | ord 恒 u64，单一 u64 路径（决策见 §8.5） | segment 内 u32 局部 ID（Lucene 段上限 2³¹），分段消解 u64 需求 | 有意识的取舍：接受 2x 内存带宽 / 半数 SIMD lane，换单路径简单性；带宽代价的正解是将来块压缩，不是 u32 收窄 |
 
-另一处工程差异：`run_must_intersect`（inverted.cpp:900）是 pairwise
-物化交集——k 个 must 词产生 k-1 次中间 vector 分配 + move。工业实现用
+另一处工程差异（评审时状态）：`run_must_intersect`（现 inverted.cpp:1228）当时是
+pairwise 物化交集——k 个 must 词产生 k-1 次中间 vector 分配 + move。工业实现用
 k-way leapfrog 或迭代器 advance 链零物化。短交集上此开销可能盖过内核优化。
+（**此后 K1 已落地 k-way leapfrog**，见 `kway-blockmax-bmw-zh.md` §2。）
 
 ### 8.2 已知缺陷（按严重程度排序）
 

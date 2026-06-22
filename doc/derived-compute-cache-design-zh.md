@@ -19,7 +19,7 @@ CPU 成本**的结果。省的是 **recompute、不是 I/O**。这正是 LevelDB
 
 | 候选 | 派生成本 | 现状 |
 |------|---------|------|
-| highlight 的 **NFKC 归一 + `analyze_with_offsets`** | 高：每次高亮都重算（`search_layer.cpp:1069-1070`，即便 DocTextLru 原文命中也重跑分词） | DocTextLru 只缓**原文**；可缓「ord → 分词 offsets」 |
+| highlight 的 **NFKC 归一 + `analyze_with_offsets`** | 高：每次高亮都重算（`search_text_highlight`，`search_layer.cpp:902`；`doc_texts_.get` `:933` 命中原文后仍在 `:940` 重跑 NFKC + `analyze_with_offsets`） | DocTextLru 只缓**原文**；可缓「ord → 分词 offsets」 |
 | int8→f32 **dequant 向量**（盘上 int8 + get 要返 f32 时） | 中：逐元素 ×scale | 无缓存 |
 | raw KV value | ~0 | 不缓（mmap 足矣） |
 

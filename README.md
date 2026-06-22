@@ -54,6 +54,7 @@
 | `third_party/googletest` | v1.15.2 | https://github.com/google/googletest | 测试（仅 `BUILD_TESTING=ON`）|
 | `third_party/benchmark` | v1.9.0 | https://github.com/google/benchmark | 微基准（仅 `BITCASK_BUILD_BENCHMARKS=ON`）|
 | `third_party/oneTBB` | v2022.0.0 | https://github.com/uxlfoundation/oneTBB | TSan 插桩版（仅 `-DBITCASK_SANITIZE=thread`）|
+| `third_party/unordered_dense` | v4.8.1 | https://github.com/martinus/unordered_dense | KeyDir 分片表的稠密哈希表（header-only INTERFACE 库）|
 
 ### 获取代码与构建
 
@@ -161,7 +162,7 @@ auto knn  = (*c)->search_vector(query_vec, /*k=*/10);
 auto hyb  = (*c)->search_hybrid("北京 天气", query_vec, /*k=*/10);
 ```
 
-> 完整示例见 `tests/cask_docvalue_test.cpp`（2696 行端到端用例）。
+> 完整示例见 `tests/cask_docvalue_test.cpp`（2756 行端到端用例）。
 
 ### C API（跨语言绑定）
 
@@ -248,7 +249,7 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 ├── c_api/             # libbitcask.so 的 C ABI（bitcask_c.{cpp,h}）
 ├── src/               # 实现：fileops / io / lock / keydir / merge /
 │                      #       cask / search / bm25 / text / vector
-├── tests/             # GoogleTest 单元 + 集成测试（22 个测试二进制）
+├── tests/             # GoogleTest 单元 + 集成测试（24 个测试二进制）
 ├── bench/             # Google Benchmark（keydir / cask / inverted / hnsw ...）
 ├── tools/             # migrate_le、gen_inert_table
 ├── cmake/             # BitcaskSanitizers 模块 + tsan.supp

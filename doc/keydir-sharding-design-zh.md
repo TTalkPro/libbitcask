@@ -7,18 +7,26 @@
 
 ## 1. 结构
 
+定稿结构（`include/bitcask/keydir.hpp:367-383`）：
+
 ```cpp
-static constexpr std::size_t kShards = 16;   // 2^n,hash 低位路由
-struct Shard {
-    mutable std::shared_mutex mu;
-    std::unordered_map<std::string, Entry, StringHash, std::equal_to<>> entries;
-    // 按 64B 对齐隔离,防伪共享
+static constexpr std::size_t kShards = 256;  // 2^n,hash 低位路由（S5:16→64→256）
+struct alignas(64) Shard {                    // 按 64B 对齐隔离,防伪共享
+    mutable std::mutex mu;                     // S5:rwlock→mutex(消写者偏好停车)
+    // 稠密扁平表替代 std::unordered_map：消每键 malloc + find 指针追逐
+    alignas(64) ankerl::unordered_dense::map<std::string, Entry,
+                                             StringHash, std::equal_to<>> entries;
 };
 std::array<Shard, kShards> shards_;
 mutable std::shared_mutex meta_mu_;          // pending_/iter 协调专用
 ```
 
 shard = StringHash{}(key) & (kShards-1)。每 key 操作只触自己分片的锁字。
+
+> 上面是**定稿结构**。初版 S2 为 16 分片 + `std::shared_mutex` + `std::unordered_map`；
+> 分片数与锁类型的演进（→256 + `std::mutex`）见 §10；`std::unordered_map` 后续换为
+> `ankerl::unordered_dense::map`（稠密扁平表，见 `keydir.hpp` Shard 注释）。下文
+> §8–§11 的基准标签（如「S2(16 分片)」）保留当时配置，是历史测量记录。
 
 ## 2. 全局状态的去锁化(热路径零全局锁)
 
