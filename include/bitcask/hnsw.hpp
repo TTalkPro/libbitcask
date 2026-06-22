@@ -43,6 +43,7 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -148,6 +149,9 @@ private:
     static constexpr std::uint32_t kChunkSize = 1u << kChunkBits;
     static constexpr std::uint32_t kChunkMask = kChunkSize - 1;
     static constexpr std::size_t   kMaxChunks = 1024;  // 上限 64M 节点
+    // ⑥ 邻接 arena slab 大小(uint32 个数)。单节点块最大 (1+2M)+31*(1+M),
+    // M=16 时 = 560，远小于 slab；大 M 仍 << 此值(alloc_adj 有 assert 兜底)。
+    static constexpr std::size_t   kAdjSlabWords = 1u << 18;  // 256K u32 = 1 MB
 
     // 节点分段存储:全部成员构造时定容,生命周期内地址稳定。
     struct NodeChunk {
@@ -158,9 +162,16 @@ private:
         std::vector<float>          vecs;    // needs_vecs ? kChunkSize*dim : 0
         std::vector<std::uint64_t>  ords;
         std::vector<std::uint8_t>   levels;
-        // 每节点邻接块:内层 vector 构造时 resize(slots) 定容,此后 .data()
-        // 地址永不搬迁,供并发读者经 count_ acquire 安全读取。
-        std::vector<std::vector<std::uint32_t>> adj;
+        // ⑥ 每节点邻接块首指针,指向 per-chunk bump-slab arena(adj_slabs)。
+        // 替代旧的 vector<vector> 每节点 malloc：消除 ~93.75% 的 L0-only 节点
+        // malloc，且分配序=插入序 → 邻接块在 slab 内连续(copy_neighbors 局部
+        // 性)。slab 永不搬迁，地址稳定不变量与旧 vector.data() 一致。
+        std::vector<std::uint32_t*> adj;
+        // bump arena：固定大小 slab，满了追加新 slab(旧 slab 永不移动)。仅
+        // 单写者(insert)/deserialize 触碰；读者只跟 adj[slot] 指针、不读
+        // adj_slabs，故 slab 增长对并发读者安全。
+        std::vector<std::unique_ptr<std::uint32_t[]>> adj_slabs;
+        std::size_t adj_slab_used = 0;
         std::unique_ptr<std::atomic<std::uint8_t>[]> locks;  // per-node 自旋
 
         // V4.2:int8 量化副本(对称量化,scale = max |v[i]|)。codes 是紧
@@ -170,6 +181,21 @@ private:
         std::vector<std::int8_t>    qcodes;  // kChunkSize * dim
         std::vector<float>          qscales; // kChunkSize
         std::vector<std::int32_t>   qsums;   // kChunkSize(VNNI 偏置补偿)
+
+        // 从 arena bump 分配 n 个零初始化 uint32(slab 构造即全零，bump 区
+        // 从不复用，故无需再清零——与旧 resize(slots) 的零填充语义一致)。
+        // 仅单写者/deserialize 调用，非线程安全(协议保证不并发)。
+        std::uint32_t* alloc_adj(std::size_t n) {
+            assert(n <= kAdjSlabWords && "adj block exceeds slab");
+            if (adj_slabs.empty() || adj_slab_used + n > kAdjSlabWords) {
+                adj_slabs.push_back(
+                    std::make_unique<std::uint32_t[]>(kAdjSlabWords));
+                adj_slab_used = 0;
+            }
+            std::uint32_t* p = adj_slabs.back().get() + adj_slab_used;
+            adj_slab_used += n;
+            return p;
+        }
 
         NodeChunk(std::size_t dim, bool needs_vecs, bool needs_qcodes);
         ~NodeChunk() = default;

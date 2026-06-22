@@ -37,15 +37,26 @@
 
 ## 第二梯队：中等成本 / 高收益（结构性）
 
-- [ ] **⑤ KeyDir 用 node-based `std::unordered_map<std::string, Entry>`** — `include/bitcask/keydir.hpp:359`
+- [x] **⑤ KeyDir 用 node-based `std::unordered_map<std::string, Entry>`** — `include/bitcask/keydir.hpp:359`
   - 现状：每新 key 一次堆分配（`keydir.cpp:496` 的 `std::string(key)`）；每次 get/put 指针追逐随机节点 → 必然 cache miss。
   - 改法：换开放寻址扁平表（`absl::flat_hash_map` / `boost::unordered_flat_map`）+ 内联 key。`IterHandle` 已按拷贝快照 key（`keydir.hpp:208`），rehash-immune，扁平表安全。
   - 收益：存储侧最高杠杆，触及每次 get/put；同时消掉 #⑩ 的恢复期 key 分配。
+  - 🔶 **2026-06-22 SSO 测量 → 决策待定**：libstdc++ SSO 阈值=15B。代码库全部基准/测试用 ≤8B 短 key（`"k0"`/`"key123"`），即**围绕短 key 设计**。结论：
+    - 真实 key ≤15B → 已 SSO 内联无堆分配 → ⑤ 的「消除每键分配」收益=0，只剩指针 cache-miss（较小一半）。
+    - 真实 key >15B（UUID/路径/复合）→ 每键一次 malloc → ⑤ 收益显著。
+    - **缺失输入**：生产真实 key 典型长度（用户答「混合/不确定」）。
+    - ✅ **已加诊断探针** `KeyDir::key_length_histogram()`（`keydir.hpp` / `keydir.cpp`，零热路径开销，只读已存 key）：在真实负载调用读出 `sso`/`heap` 占比 + 8 桶分布。
+    - ✅ **已实现（用 `ankerl::unordered_dense`，非 boost/abseil）**：单头 submodule `third_party/unordered_dense`（v4.8.1，MIT，INTERFACE 库）→ CMake `add_subdirectory` + `bitcask_keydir` PUBLIC 链接传播 include。`Shard::entries` 改为 `ankerl::unordered_dense::map<std::string, Entry, StringHash, std::equal_to<>>`（透明 hash 异构查找不变）。`entries_entry` 裸指针经审计仅锁内、获取与使用间无 insert/erase → 安全（plain `map`，非 `segmented_map`）。
+    - ✅ **验证**：429/429 测试通过；**TSan**（`-DBITCASK_SANITIZE=thread`，含插桩 oneTBB）keydir 并发测试 7/7 无 race；零 API 改动（unordered_dense 兼容 std API）。
+    - 📊 **keydir_bench A/B（关键：收益随工作集放大）**：
+      - 小数据集（1024 key，全在 cache）：纯查找 ~持平（甚至 +1~4%，dense 多一跳 index→value），Mixed −7%。
+      - **大数据集（1M key，出 cache）**：**Get_Single −31%**、Get_MT/4 −17%、Mixed_MT/4 −23%。出 cache 后 std 指针追逐=DRAM miss，dense 连续布局完胜。
+      - 结论：**读重 + 大 keydir 场景收益显著**（−31% 纯查找）；小数据集常驻 cache 时收益主要在插入半边。
 
-- [ ] **⑥ HNSW 邻接表是 per-node `vector<vector<uint32_t>>`** — `include/bitcask/hnsw.hpp:163`、`src/vector/hnsw.cpp:710`
+- [x] **⑥ HNSW 邻接表是 per-node `vector<vector<uint32_t>>`** — `include/bitcask/hnsw.hpp:163`、`src/vector/hnsw.cpp:713`
   - 现状：每节点一次独立 malloc（L0-only 节点 132B 数据背 ~40B 开销 ≈30%）；内层块散落堆上，拖累 `copy_neighbors` 预取局部性。
-  - 改法：per-chunk 扁平 arena（L0 容量固定，上层稀疏单独溢出区）；定容不重分配 → 地址稳定性不变。
-  - 收益：邻接内存 **−30%** + 图遍历局部性提升。代码注释已把此列为 V3.x 计划。
+  - 改法（已实现）：per-chunk **bump-slab arena**（`kAdjSlabWords=256K u32/slab`）。`adj` 从 `vector<vector>` 改为 `vector<uint32*>`（8B/节点指针）+ 永不搬迁的固定 slab；`alloc_adj()` 顺序 bump 分配（分配序=插入序 → 邻接块连续）。保持拼接布局（`layer_off` 不变）+ 地址稳定不变量。serialize/deserialize 同步改 `.data()`→指针、`.resize()`→`alloc_adj()`。
+  - ✅ **实测验证（tier1 → tier1+⑥，`BM_Hnsw_Search` median）**：10k/ef64 **−7.3%**、10k/ef256 **−8.5%**、100k/ef64 −2.2%、100k/ef256 **−5.5%**。局部性收益证实。叠加 ①后 HNSW 查询累计 **−11~15%** vs 原始 baseline。消除 ~93.75% 每节点 malloc（插入/碎片有利，未单独量化）。429/429 测试通过（含并发读者 + checkpoint 往返）。
 
 ## 第三梯队：小修小补（低成本、收益较小）
 

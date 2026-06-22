@@ -1044,6 +1044,30 @@ KeyDirInfo KeyDir::info() const {
     return r;
 }
 
+KeyDir::KeyLenHistogram KeyDir::key_length_histogram() const {
+    KeyLenHistogram h;
+    // 逐分片取锁（任意时刻 ≤1 把，合锁序）；只读 key 长度，不碰 meta/计数。
+    for (auto& sh : shards_) {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        for (const auto& kv : sh.entries) {
+            const std::size_t n = kv.first.size();
+            ++h.total;
+            if (n <= 15) ++h.sso; else ++h.heap;
+            std::size_t b;
+            if (n < 8) b = 0;
+            else if (n < 16) b = 1;
+            else if (n < 24) b = 2;
+            else if (n < 32) b = 3;
+            else if (n < 48) b = 4;
+            else if (n < 64) b = 5;
+            else if (n < 128) b = 6;
+            else b = 7;
+            ++h.buckets[b];
+        }
+    }
+    return h;
+}
+
 // ============================================================================
 // A4:keydir 段快照(设计 doc/recovery-snapshot-design-zh.md)
 // 格式:[magic "BCKS"][ver=1][payload][crc32(payload)],LE,tmp+rename。

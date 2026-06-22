@@ -50,6 +50,8 @@
 
 #include "bitcask/string_hash.hpp"
 
+#include <ankerl/unordered_dense.h>
+
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -340,6 +342,19 @@ public:
     // 线程安全: 是。锁: meta shared（iter 状态）;计数走 atomic,fstats 无锁。
     [[nodiscard]] KeyDirInfo info() const;
 
+    // ⑤ 诊断探针：遍历已存 key 统计长度分布，判断 SSO 命中率（libstdc++
+    // std::string ≤15B 内联无堆分配）。零热路径开销——只读已有 entries，
+    // 在真实负载（如生产数据恢复后）调用即得真实 sso/heap 占比，据此决定
+    // 是否值得把 unordered_map 换成开放寻址扁平表。逐分片取锁，O(key 数)。
+    struct KeyLenHistogram {
+        std::uint64_t total = 0;
+        std::uint64_t sso   = 0;  // ≤15B：SSO 内联，无堆分配
+        std::uint64_t heap  = 0;  // >15B：每键一次堆分配
+        // 桶：[0,8) [8,16) [16,24) [24,32) [32,48) [48,64) [64,128) [128,∞)
+        std::array<std::uint64_t, 8> buckets{};
+    };
+    [[nodiscard]] KeyLenHistogram key_length_histogram() const;
+
 private:
     friend class IterHandle;
 
@@ -354,9 +369,16 @@ private:
         // 分片锁。主 hash 的值是 variant;判别用 std::get_if<Single|Multi>。
         // 透明 hash:get/put/remove 热路径用 string_view 直接查,零拷贝(O1)。
         mutable std::mutex mu;  // S5 实验:rwlock→mutex(消写者偏好停车;短临界区)
+        // ⑤ 开放寻址 + 稠密存储扁平表(ankerl::unordered_dense）替代
+        // std::unordered_map：消除每键节点 malloc + 每次 find 的指针追逐 cache
+        // miss。透明 hash（StringHash::is_transparent）→ string_view 热路径零拷
+        // 贝异构查找不变。引用语义：值存于稠密数组，insert 增长会搬移、erase
+        // 用 swap-with-last——KeyDir 的 entries_entry 裸指针仅在分片锁内、获取
+        // 与使用之间无 insert/erase（已审计），故安全。
         // map 头独占缓存行:find 路径读 map 头,别让它与锁字(每次加解锁
         // RMW)同行。
-        alignas(64) std::unordered_map<std::string, Entry, StringHash, std::equal_to<>> entries;
+        alignas(64) ankerl::unordered_dense::map<std::string, Entry, StringHash,
+                                                  std::equal_to<>> entries;
     };
     mutable std::array<Shard, kShards> shards_;
 

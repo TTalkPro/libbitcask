@@ -297,7 +297,7 @@ HnswIndex::NodeChunk::NodeChunk(std::size_t dim, bool needs_vecs,
     : vecs(needs_vecs ? static_cast<std::size_t>(kChunkSize) * dim : 0),
       ords(kChunkSize, 0),
       levels(kChunkSize, 0),
-      adj(kChunkSize),
+      adj(kChunkSize, nullptr),
       locks(new std::atomic<std::uint8_t>[kChunkSize]),
       qcodes(needs_qcodes ? static_cast<std::size_t>(kChunkSize) * dim : 0),
       qscales(needs_qcodes ? kChunkSize : 0, 0.0f),
@@ -368,7 +368,7 @@ std::uint32_t HnswIndex::copy_neighbors(std::uint32_t id, std::uint32_t layer,
     lock_node(lk);
     // adj 指针在节点发布(count release)前写入且永不搬迁;经 count
     // acquire 或本锁的 happens-before 链均可见。
-    const std::uint32_t* a = c->adj[slot].data() + layer_off(layer);
+    const std::uint32_t* a = c->adj[slot] + layer_off(layer);
     const std::uint32_t n = a[0];
     std::memcpy(out, a + 1, static_cast<std::size_t>(n) * sizeof(std::uint32_t));
     unlock_node(lk);
@@ -710,7 +710,7 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     c->levels[slot] = static_cast<std::uint8_t>(level);
     const std::size_t slots =
         (1 + cfg_.M * 2) + static_cast<std::size_t>(level) * (1 + cfg_.M);
-    c->adj[slot].resize(slots);  // 定容,.data() 地址此后永不搬迁
+    c->adj[slot] = c->alloc_adj(slots);  // arena 分配，地址此后永不搬迁
 
     // 2) 发布:此后读者可见本节点(邻接为空 → 图内不可达,无害)。
     count_.store(id + 1, std::memory_order_release);
@@ -771,7 +771,7 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
         {
             auto& my_lk = c->locks[slot];
             lock_node(my_lk);
-            std::uint32_t* my = c->adj[slot].data() + layer_off(lay);
+            std::uint32_t* my = c->adj[slot] + layer_off(lay);
             for (const auto& [d, nid] : picked) {
                 my[++my[0]] = nid;
             }
@@ -784,7 +784,7 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
             const std::uint32_t nslot = nid & kChunkMask;
             auto& nlk = nc->locks[nslot];
             lock_node(nlk);
-            std::uint32_t* nb = nc->adj[nslot].data() + layer_off(lay);
+            std::uint32_t* nb = nc->adj[nslot] + layer_off(lay);
             const std::uint32_t cap = layer_cap(lay);
             if (nb[0] < cap) {
                 nb[++nb[0]] = id;
@@ -1380,8 +1380,8 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         c->levels[slot] = level;
         const std::size_t slots =
             (1 + cfg_.M * 2) + static_cast<std::size_t>(level) * (1 + cfg_.M);
-        c->adj[slot].resize(slots);
-        auto* adj = c->adj[slot].data();
+        c->adj[slot] = c->alloc_adj(slots);
+        auto* adj = c->adj[slot];
         for (std::uint32_t l = 0; l <= level; ++l) {
             if (!need(4)) return false;
             std::uint32_t nb_cnt;
@@ -1416,7 +1416,7 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
     for (std::uint32_t id = 0; id < cnt; ++id) {
         const NodeChunk* c = chunk_of(id);
         const std::uint32_t slot = id & kChunkMask;
-        const std::uint32_t* adj = c->adj[slot].data();
+        const std::uint32_t* adj = c->adj[slot];
         for (std::uint32_t l = 0; l <= c->levels[slot]; ++l) {
             const std::uint32_t* row = adj + layer_off(l);
             for (std::uint32_t i = 1; i <= row[0]; ++i) {

@@ -22,3 +22,6 @@
 	path = third_party/oneTBB
 	url = https://github.com/uxlfoundation/oneTBB.git
 	shallow = true
+[submodule "third_party/unordered_dense"]
+	path = third_party/unordered_dense
+	url = https://github.com/martinus/unordered_dense.git

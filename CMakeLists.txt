@@ -116,13 +116,23 @@ target_link_libraries(bitcask_fileops
 # ---------------------------------------------------------------------------
 # bitcask_keydir — in-memory keydir (KeyDir class for bitcask).
 # ---------------------------------------------------------------------------
+# ankerl::unordered_dense（单头 INTERFACE 库）：KeyDir 分片表用它替代
+# std::unordered_map（开放寻址 + 稠密存储，消除每键节点 malloc + 指针追逐）。
+# header-only，EXCLUDE_FROM_ALL 不会引入测试/benchmark 目标。
+if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/unordered_dense/include/ankerl/unordered_dense.h")
+    message(FATAL_ERROR
+        "third_party/unordered_dense 未初始化。请运行:\n"
+        "  git submodule update --init third_party/unordered_dense")
+endif()
+add_subdirectory(third_party/unordered_dense EXCLUDE_FROM_ALL)
+
 add_library(bitcask_keydir STATIC
     src/keydir/keydir.cpp
     src/keydir/keydir_registry.cpp
 )
 target_include_directories(bitcask_keydir PUBLIC include)
 target_link_libraries(bitcask_keydir
-    PUBLIC  bitcask_fileops bitcask_io
+    PUBLIC  bitcask_fileops bitcask_io unordered_dense::unordered_dense
     PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
