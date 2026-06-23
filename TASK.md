@@ -301,10 +301,20 @@
 
 ### CI 剩余
 
-- [ ] **CI2 Sanitizer matrix（ASAN/UBSAN/TSan）自动化验证**
-  - 当前 ci.yml 已配置 matrix，但尚未在 GitHub 实际跑过；TSan 是 Barrier v2 / IndexPool 并发协议的唯一回归保护。首次 push 后核实 workflow 运行情况。
-- [ ] **CI3 Benchmark-on-PR 追踪**
-  - 周期跑 bench → JSON artifact；可选 PR 回归检测（>10% 报警）。
+- [x] **CI2 Sanitizer matrix（ASAN+UBSAN / TSan）自动化验证** — `.github/workflows/ci.yml`
+  - **已完成（2026-06-23）**：加固既有 matrix——`concurrency`（取消过期运行）、
+    job `timeout-minutes`（30/60，防 TSan 挂死）、`hendrikmuhs/ccache-action`（按
+    sanitizer 分桶缓存，摊薄插桩 oneTBB 重编）、确定性运行期选项（`ASAN/UBSAN/TSAN_OPTIONS`
+    = halt_on_error + print_stacktrace；ASAN 含 detect_leaks）、ctest `-j` 并行。
+  - **本地全量 TSan 验证**：build-tsan 全 target 重建 + `TSAN_OPTIONS=halt_on_error=1`
+    跑全 451 ctest（详见验证小结）——确认 push 后 TSan job 应绿（X1 既有 UAF 已修，
+    无残留 race）。
+- [x] **CI3 Benchmark 追踪** — `.github/workflows/ci.yml`
+  - **已完成（2026-06-23）**：新增 `benchmark` job——Release + `BITCASK_BUILD_BENCHMARKS=ON`
+    构建 `bitcask_bench`，`--benchmark_format=json` 跑全部微基准（含 B1-B4），
+    `actions/upload-artifact` 上传 `bench-results-<sha>.json`（保留 30 天）。
+  - **非门控**：GitHub 共享 runner CPU 噪声大，自动 >10% 回归报警会频繁误报；artifact
+    留作离线/趋势比对，自动回归检测维度留待专用稳定机（避免误报噪声淹没真信号）。
 
 ---
 
