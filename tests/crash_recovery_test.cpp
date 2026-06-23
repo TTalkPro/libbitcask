@@ -296,4 +296,42 @@ TEST_F(CrashRecoveryTest, MultiFileParallelFoldRecovers) {
     }
 }
 
+// X1:迭代器存活期间调用 close() 不得 UAF。close() 会 reset keydir_（经
+// registry 递减引用计数释放 KeyDir），而 CaskIter 内部的 IterHandle 持
+// KeyDir* 裸指针；迭代器在 close() 后析构（release()→BarrierGuard 锁
+// KeyDir mutex）若 KeyDir 已释放即 heap-use-after-free。CaskIter 现 pin
+// 一份 KeyDir shared_ptr 兜住其生命周期。本测试在 TSan 下守护该契约。
+TEST_F(CrashRecoveryTest, IteratorAliveAcrossCloseNoUaf) {
+    constexpr int kN = 20;
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c) << c.error().detail;
+        for (int i = 0; i < kN; ++i) {
+            ASSERT_TRUE((*c)->put(bytes(key_for(i)), bytes(value_for(i)),
+                                  static_cast<std::uint32_t>(3000 + i)));
+        }
+        (*c)->close();
+    }
+
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c) << c.error().detail;
+
+    auto it = (*c)->make_iter();
+    auto start = it->start();
+    ASSERT_TRUE(start);
+    // 部分迭代后即 close()——迭代器仍存活，随后离开作用域析构。
+    auto first = it->next();
+    ASSERT_TRUE(first);
+
+    (*c)->close();  // reset keydir_ 于迭代器存活期间
+
+    // it 在此后析构 → release() 锁 KeyDir mutex。pin 生效时不应 UAF/崩溃。
+    it.reset();
+    SUCCEED();
+}
+
 }  // namespace

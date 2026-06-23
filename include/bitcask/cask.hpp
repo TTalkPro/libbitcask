@@ -267,6 +267,13 @@ private:
     void pin_files();
 
     Cask* parent_;
+    // X1:pin 一份 KeyDir 的 shared_ptr，保证迭代器存活期间 KeyDir 不被
+    // 释放。Cask::close() 会 reset 自己的 keydir_（并经 registry release
+    // 递减引用计数），但 IterHandle 内部持 KeyDir* 裸指针——若迭代器在
+    // close() 后才析构（release()→BarrierGuard 锁 KeyDir mutex），裸指针
+    // 会悬空 UAF。pin 让 KeyDir 至少活到本迭代器析构。声明在 iter_ 之前
+    // → 隐式析构序中后于 iter_ 释放（release() 也显式保证此序）。
+    std::shared_ptr<keydir::KeyDir> keydir_pin_;
     std::unique_ptr<keydir::IterHandle> iter_;
     bool see_tombstones_ = false;
     std::unordered_map<std::uint32_t,

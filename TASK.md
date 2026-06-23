@@ -218,24 +218,31 @@
 2. ~~**R1 + R2 + W1** ← 高 ROI 性能（启动 + 索引热路径）~~ ✅ 完成（2026-06-23）
 3. ~~**T2 + T3** ← C1 / checkpoint 的回归保护~~ ✅ 完成
 4. ~~**R3 + W2 + W3** ← 需 R1/W1 基础~~ ✅ 完成（2026-06-23）
-5. **S1 - S5** ← 结构性优化，依赖第五梯队的 batch/zero-copy 基础
-6. **P1 - P7** 按需穿插
-7. **T4 - T6、B1 - B4、H1 - H5、CI3** 长期推进
+5. **X1** ← 正确性收尾（本轮 TSan 发现）✅ 完成（2026-06-23）
+6. **S1 - S5** ← 结构性优化，依赖第五梯队的 batch/zero-copy 基础
+7. **P1 - P7** 按需穿插
+8. **T4 - T6、B1 - B4、H1 - H5、CI3** 长期推进
 
-> **关键决策点**：第五梯队（R1-R3 + W1-W3）全部落地，纯 KV 冷启动并行化完成。
+> **关键决策点**：第五梯队（R1-R3 + W1-W3）全部落地 + X1 正确性收尾。
 > 下一波：S1-S5 结构性优化（batch API / merge 批量 write / recovery 流水线 /
-> checkpoint reserve+memcpy / zstd），或先补 X1（下方）这一发现项。
+> checkpoint reserve+memcpy / zstd）。建议起手 **S4**（低风险、收益明确）。
 
 ## 待办：本轮发现（2026-06-23 TSan 跑出）
 
-- [ ] **X1 `Cask::close()` 释放 keydir 后存活的 iterator → UAF** — 既有问题，非本轮引入
-  - 现象：TSan 插桩 `CrashRecoveryTest.MidPutRestartFoldsCorrectly` 报
-    heap-use-after-free：测试在 `it = make_iter()`（line 128）后调 `(*c)->close()`
-    （line 158，reset keydir shared_ptr），随后 `it` 析构 → `IterHandle::release`
-    → `BarrierGuard` 锁已释放的 keydir mutex。
+- [x] **X1 `Cask::close()` 释放 keydir 后存活的 iterator → UAF** — 既有问题，非本轮引入
+  - **已完成（2026-06-23）**：`CaskIter` 新增 `std::shared_ptr<keydir::KeyDir>
+    keydir_pin_` 成员（声明在 `iter_` 之前）；`start()` 建 `IterHandle` 前先
+    `keydir_pin_ = parent_->keydir_` 复制一份引用，`release()` 在 `iter_.reset()`
+    之后才 `keydir_pin_.reset()`——保证 `IterHandle::release()→BarrierGuard` 锁
+    KeyDir mutex 期间该 KeyDir 始终存活。
+  - 现象（修复前）：TSan 插桩 `MidPutRestartFoldsCorrectly` 报 heap-use-after-free：
+    `it=make_iter()` 后调 `(*c)->close()`（reset keydir shared_ptr + registry
+    release），随后 `it` 析构 → `IterHandle` 裸 `KeyDir*` 悬空。
   - 已核实**在 clean tree（无本轮改动）同样复现**——纯生命周期序问题，与 R3
-    并行 fold 无关（fold 线程在 open 返回前已 join）。Release/ASAN 未暴露（释放
-    内存恰未被复用）。CI 的 TSan matrix 一旦实跑（CI2）即会拦下。
-  - 改法二选一：(a) 库侧——`close()` 校验无存活 IterHandle 或让 iterator 持
-    keydir shared_ptr 延长生命周期；(b) 测试侧——iterator 作用域先于 close 结束。
-  - 风险：低；属正确性收尾，建议与 CI2 一起处理。
+    并行 fold 无关。Release/ASAN 未暴露（释放内存恰未被复用）。
+  - 回归保护：新增 `IteratorAliveAcrossCloseNoUaf`（迭代器跨 close 存活）；
+    已验证**移除修复后该测试在 TSan 下必 UAF**，加回后通过。Release 441/441
+    + 全 3 crash-recovery 测试 TSan 零 race。
+  - **副作用契约**：iterator pin 会让 KeyDir 存活到迭代器析构；若同名库在此期间
+    被 `open()`，registry 建新 KeyDir，老 iterator 在已释放出 registry 的旧
+    KeyDir 快照上完成 fold——隔离、无正确性影响（fd 已 S13 pin）。

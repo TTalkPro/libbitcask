@@ -188,6 +188,9 @@ CaskIter::start(int maxage, int maxputs, std::uint32_t now_sec,
     if (iter_ && iter_->is_iterating()) {
         return std::unexpected(err(CaskError::kIo, "iter already started"));
     }
+    // X1:先 pin KeyDir（shared_ptr 复制），再建 IterHandle——保证
+    // close() 在迭代器存活期间 reset keydir_ 也不会让 iter_ 的裸指针悬空。
+    keydir_pin_ = parent_->keydir_;
     iter_ = parent_->keydir_->make_iter();
     auto r = iter_->start(now_sec, maxage, maxputs);
     see_tombstones_ = see_tombstones;
@@ -334,6 +337,9 @@ void CaskIter::release() noexcept {
     }
     // S13：关掉 pin 的只读 fd；若文件已被 merge unlink，此刻 inode 才真正释放。
     pinned_files_.clear();
+    // X1:最后释放 KeyDir pin——必在 iter_ 析构/release 之后，确保
+    // BarrierGuard 锁的 KeyDir mutex 在锁期间始终存活。
+    keydir_pin_.reset();
 }
 
 // =============================================================================
