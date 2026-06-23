@@ -211,6 +211,21 @@ class Cask;
 // CaskIter 自身不持锁，方法非线程安全——同一对象只能由一个线程使用。
 // 但不同 CaskIter 对象之间可在多线程并发使用同一个 parent Cask
 // （读路径并行 + KeyDir::IterHandle 支持多 fold）。
+//
+// === 生命周期契约（T9 / 见 X1）===
+// 1. CaskIter **可以** 跨越 `Cask::close()` 存活：close() reset 自己的 KeyDir
+//    shared_ptr，但 CaskIter 经 `keydir_pin_` 持一份引用让 KeyDir 续命；start()
+//    时 pin_files() 已 pin 住 sealed fd，故 close() 后 `start/next/release` 仍
+//    可用（next() 对未 pin 文件退回 parent_->read_file lazy-open，文件仍在盘上）。
+//    多 iterator 交错 release 时，最后一个（keyfolders_→0）才触发 KeyDir 的
+//    pending 应用 + MultiEntry 折叠——全在 pinned KeyDir 上安全完成。
+// 2. CaskIter **必须先于 Cask 对象本身析构**。`parent_` 是裸 `Cask*`（非
+//    weak/shared）：若 Cask 对象被销毁（持有它的 unique_ptr 析构）而 iterator
+//    仍存活，则 `next()` 访问 `parent_->opts_/dirname_/read_file` 即悬空 UAF。
+//    这与 close() 正交——close() 不销毁 Cask 对象。X1 的 pin 兜 KeyDir 生命周期，
+//    但不兜 Cask 对象本身（裸 parent_ 的结构性问题，留待 zero-copy 重构时
+//    用 weak_ptr/owning 句柄解决；在 next() 加 keydir_ 空检查无用——既会误杀
+//    上述「合法的 close 后 next()」，又无法防住真正的 parent_ 悬空）。
 class CaskIter {
 public:
     explicit CaskIter(Cask* parent) noexcept : parent_(parent) {}

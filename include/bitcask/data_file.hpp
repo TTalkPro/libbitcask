@@ -92,6 +92,26 @@ public:
           std::span<const std::byte> key,
           std::span<const std::byte> value);
 
+    // S2:批量 append。语义同 write()，但把编码后的 record 累积到 batch_buf_，
+    // 累计 ≥ kBatchFlushBytes 才一次 pwrite——把 N 条 pwrite 降到 N/batch。
+    // 返回的 offset 是逻辑偏移（current_offset_，含尚未落盘的缓冲），确定性
+    // 不依赖落盘时机，故 hint/keydir 引用照旧正确。
+    //   ⚠️ 仅用于 merge 输出等「末尾统一 fsync 后才被 caller 采信」的场景——
+    //   put 的 WAL 语义必须每条 durable，不可用本 API（见 ⑪ 否决记录）。
+    //   caller 必须在 sync()/采信前调 flush_batch()（sync() 已内部兜底 flush）。
+    // 线程安全: 否（修改 current_offset_ + batch_buf_）；caller 串行化。
+    [[nodiscard]] std::expected<WriteResult, DataFileFault>
+    write_buffered(format::RecordType type,
+                   std::uint32_t tstamp,
+                   std::uint64_t ord,
+                   std::span<const std::byte> key,
+                   std::span<const std::byte> value);
+
+    // 把 batch_buf_ 里尚未落盘的字节一次 pwrite 到磁盘并清空缓冲。
+    // 空缓冲是 no-op。write() 路径从不缓冲，调用本函数恒为 no-op。
+    // 线程安全: 否（pwrite + 改 batch_buf_）；与 write_buffered 串行。
+    [[nodiscard]] std::expected<void, DataFileFault> flush_batch();
+
     // 截断到当前 write offset。给 undo / 部分写恢复用
     // （比 truncate_to(current_offset_) 更明确意图）。
     // 线程安全: 否（依赖 current_offset_ + ftruncate）；与 write() 互斥串行。
@@ -166,6 +186,10 @@ private:
     std::uint64_t  current_offset_ = 0;
     Mode           mode_           = Mode::kRead;
     std::vector<std::byte> write_buf_;  // write() 复用的编码缓冲;容量跨调用保留
+    // S2:write_buffered() 累积缓冲。对应文件区间 [current_offset_-size, current_offset_)；
+    // flush_batch() 一次 pwrite 后清空（容量保留复用）。
+    std::vector<std::byte> batch_buf_;
+    static constexpr std::size_t kBatchFlushBytes = 1u << 20;  // 1 MiB
     // P6:sealed mmap。map_base_ != nullptr 表示整文件已 mmap(PROT_READ,
     // MAP_SHARED);read_mmap 直读映射。fd 仍保留打开(read()/fold() 的 pread 需要,
     // 见 data_file.cpp::open 注释;fd 回收归 P9)。~DataFile munmap。

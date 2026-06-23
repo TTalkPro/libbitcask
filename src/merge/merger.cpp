@@ -127,7 +127,9 @@ run_merge(std::span<const std::string> input_data_paths,
                 // 复制到输出：先写新 data file，再写新 hint file。
                 // keydir CAS 更新延后到所有 fold 完成 + fsync 成功后，
                 // 失败时 keydir 完全未动→key 仍可读，无需重启恢复。
-                auto w = out_data->write(format::RecordType::kDoc,
+                // S2:批量 append——累积到 1 MiB 才一次 pwrite。merge 输出末尾
+                // 统一 fsync 后才被 caller 采信，符合 write_buffered 的使用前提。
+                auto w = out_data->write_buffered(format::RecordType::kDoc,
                                           view.tstamp, view.ord,
                                           view.key, view.value);
                 if (!w) {
@@ -169,6 +171,15 @@ run_merge(std::span<const std::string> input_data_paths,
                                              fold_res.error().errnum,
                                              path));
         }
+    }
+
+    // S2:把 data 的 batch_buf_ 残尾一次 pwrite 落盘（后续 sync() 也会兜底，
+    // 这里显式 flush 让错误能走 cleanup 路径而非掩盖在 sync 里）。
+    if (auto f = out_data->flush_batch(); !f) {
+        cleanup_partial_outputs();
+        return std::unexpected(io_fault(MergeError::kOutputWriteFailed,
+                                         f.error().errnum,
+                                         stats.output_data_path));
     }
 
     if (auto f = out_hint->finalize(); !f) {

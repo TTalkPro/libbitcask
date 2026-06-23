@@ -97,11 +97,22 @@
   - 收益：批量索引吞吐 **2-5×**（多核机器）。
   - 风险：中（新公共 API + 测试 + 文档）。
 
-- [ ] **S2 Merger 批量 `write`（每条 pwrite → 累积 N 条一次 pwrite）** — `src/merge/merger.cpp:102-118`、`src/fileops/data_file.cpp:148`
-  - 现状：fold callback 每条 live 记录调一次 `out_data->write()` → 一次 `pwrite`。
-  - 改法：`DataFile::write_batch(span<Record>)` 累积到 1MB 缓冲再一次 pwrite；hint 已 batched（kFlushBytes=64KB）。
-  - 收益：**100 万记录 merge 节省 ~10s**（高延迟 I/O 更显著）；syscall 数 N → N/batch_size。
-  - 风险：中（需保 hint/data 位置原子性；新 API；partial write 处理）。
+- [x] **S2 Merger 批量 `write`（每条 pwrite → 累积 N 条一次 pwrite）** — `src/merge/merger.cpp`、`src/fileops/data_file.cpp`
+  - **已完成（2026-06-23）**：`DataFile` 新增 `write_buffered()` + `flush_batch()`：
+    record 编码进 `batch_buf_`（encode 是 append 语义，累积），累计 ≥ 1 MiB 才一次
+    `pwrite`；返回的 `offset` 取 `current_offset_`（逻辑位置，含未落盘缓冲），
+    确定性、与落盘时机解耦——hint/keydir 引用照旧正确。`flush_batch()` 把残尾
+    pwrite 到 `current_offset_-batch_buf_.size()` 起点。`sync()` 内部先兜底
+    `flush_batch()`，防漏 flush 致缓冲未落盘却被采信。
+  - merger fold callback 改调 `write_buffered`，input 循环结束后显式 `flush_batch()`
+    （错误走 cleanup 而非掩在 sync）；末尾 fsync 序不变。**仅 merge 输出用本 API**
+    （末尾统一 fsync 后才被 caller 采信）；put 的 WAL 每条 durable 语义不变（⑪ 否决）。
+  - syscall：data pwrite 数 **N → ⌈总字节/1MiB⌉**（如 1M 记录 ~数百万 → 数十次）。
+  - 验证：新增 `S2BatchedMergeManyRecordsRoundTrip`（写 ~3.3 MiB live + 跨文件覆盖 →
+    merge 输出跨阈值多次 flush → 逐 key 读回 + 重开再验，端到端校验 flush 边界两侧
+    offset 连续）。Release 442/442 ctest 通过；merge 并发护栏测试 TSan 零 race。
+  - 风险：中（已含 partial-write：`PosixFile::pwrite` 循环写满；offset 原子性靠
+    逻辑 offset 确定性 + 末尾统一 fsync）。
 
 - [ ] **S3 Recovery 期 IndexPool 批量化 / 流水线** — `src/search/search_layer.cpp` `recover_doc`
   - 现状：recovery 时每 doc 同步走 `bm25::InvertedIndex::add_doc`，未走 IndexPool，无批量化、无流水线。
@@ -159,41 +170,39 @@
 
 ### 测试缺失（必加项标 **\***）
 
-- [ ] **T2\* Merge 并发 writer 测试** — `tests/merge_concurrent_writer_test.cpp`（新建）
-  - 保护 C1 修复 + tier-1 ④ 假共享消除 + write.lock/merge.lock 独立性。
-- [ ] **T3\* Checkpoint 腐败回退测试** — `tests/checkpoint_recovery_test.cpp`（新建）
-  - 保护 P14e 设计契约：`search.ckpt` / `kv.keydir.ckpt` CRC 失败 → 全量 fold。
+- [x] **T2\* Merge 并发 writer 测试** — `tests/merge_concurrent_writer_test.cpp`
+  - **已完成**：3 例（ConcurrentMergeWithActiveReader / ConcurrentMergePreservesActiveFile
+    / MergeFailureLeavesKeydirConsistent）保护 C1 修复 + write.lock/merge.lock 独立性；
+    Release 全绿 + TSan 零 race（本轮多次复跑）。
+- [x] **T3\* Checkpoint 腐败回退测试** — `tests/checkpoint_recovery_test.cpp`
+  - **已完成**：4 例（CorruptKeydir / MissingCheckpoint / CorruptSearch /
+    CorruptSearchPrevGenerationFallback → 全量 fold）保护 P14e 设计契约；全绿。
 - [ ] **T4 IndexPool 背压 / 关闭排空测试** — `tests/index_pool_backpressure_test.cpp`（新建）
   - 队列满 → submit 阻塞；stop() 排空 pending。
 - [ ] **T5 `key_length_histogram` 测试** — `tests/keydir_histogram_test.cpp`（新建）
   - 验证 tier-2 ⑤ 诊断探针（bucket 边界、sso/heap 计数）。
 - [ ] **T6 `thread_local encoded` 并发测试** — `tests/thread_local_encoded_buffer_test.cpp`（新建）
   - 保护 tier-3 ⑩ 多线程并发 put 无干扰。
-- [ ] **T7 X1 显式 release 路径回归** — `tests/crash_recovery_test.cpp`（追加）
-  - X1 现仅覆盖隐式析构路径（`it.reset()` 触发 `~IterHandle`）；补一个
-    `(*c)->close()` 后调 `it->release()` 再 `it.reset()` 的 case，验证显式
-    release 序（`iter_->release()` → `iter_.reset()` → `keydir_pin_.reset()`）
-    下 KeyDir 仍存活。低成本，TSan 跑一次即可。
-- [ ] **T8 X1 多 iterator 交错 release → MultiEntry 折叠正确性** — `tests/crash_recovery_test.cpp`（追加）
-  - 同一 Cask 上 `make_iter() × N`，全部 start 后 close()，逐个 release/reset。
-    真正要测的不是 shared_ptr 引用计数（std lib 自洽），而是 KeyDir 内部协调：
-    `keyfolders_` 在每个 iterator release 时递减，**仅最后一个**（fetch_sub 返回 1）
-    触发 `apply_pending_to_entries_barrier` + `collapse_multi_entries_barrier`；
-    期间用另一活 iterator 做 `next()` 应看到一致快照（MultiEntry 链未折叠时
-    取链头 revision，折叠后取 SingleEntry）。中等成本，需 TSan 验证。
-- [ ] **T9 iterator ↔ Cask 对象生命周期契约文档化** — 文档 + 测试
-  - 核实结论：X1 已让 `it->next()` 在 `(*c)->close()` 后**实际可用**（不是 UB）。
-    CaskIter::next 访问点核实：`parent_->opts_.expiry_secs`（Cask 成员，close 不动）；
-    `iter_->next()` 走 IterHandle 的 KeyDir 裸指针（X1 pin 保活）；fallback
-    `parent_->read_file()` 会 lazy-open 新 fd（read_files_ 空但 map 有效，active_data_
-    null 有 null 检查）。原描述「close 后 next() 是 UB」不准确。
-  - 真问题（与 close() 正交）：`CaskIter::parent_` 是裸 `Cask*`——若用户销毁
-    Cask 对象本身（`c.reset()` 或离开作用域）而 iterator 仍存活，parent_ 悬空，
-    `next()` 访问 `parent_->opts_` 即 UAF。此契约问题 X1 未恶化也未修复。
-  - 决策二选一：(a) 文档化「iterator 析构必须先于 Cask 对象析构」+ 在 next()
-    加 `parent_->keydir_` 状态检查做礼貌性错误返回（非 UB 防护，仅UX）；
-    (b) iterator 持 `std::weak_ptr<Cask>` 或要求 caller 显式保活——重型改造，
-    留 S 梯队 zero-copy 重构一起做。倾向 (a)。
+- [x] **T7 X1 显式 release 路径回归** — `tests/crash_recovery_test.cpp`
+  - **已完成（2026-06-23）**：`IteratorExplicitReleaseAfterCloseNoUaf`——close() 后
+    显式 `it->release()`（验证 `iter_->release → iter_.reset → keydir_pin_.reset`
+    序）+ 二次 release 幂等 + `it.reset()`。Release 通过 + TSan 零 race。
+- [x] **T8 X1 多 iterator 交错 release → MultiEntry 折叠正确性** — `tests/crash_recovery_test.cpp`
+  - **已完成（2026-06-23）**：`MultiIteratorInterleavedReleaseAfterClose`——3 iterator，
+    fold 态 overwrite k0 造 MultiEntry，close() 后交错 release（it1/it3 非末位不折叠），
+    其间用活的 it2 drain 全部 entry，断言见 k0..k4 且 k0=新 revision（链头）；末位
+    it2 release（keyfolders_→0）触发折叠。**附带实证 close 后 next() 可用**（T9 点 1）。
+    Release 通过 + **TSan 零 race**（折叠机制在 pinned KeyDir 上无 race）。
+- [x] **T9 iterator ↔ Cask 对象生命周期契约文档化** — `include/bitcask/cask.hpp`
+  - **已完成（2026-06-23）**：CaskIter 类头补生命周期契约：①可跨 close() 存活
+    （keydir_pin_ + pin_files 保活，next/release 仍可用，多 iterator 折叠安全）；
+    ②**必须先于 Cask 对象析构**（`parent_` 裸 `Cask*`，Cask 销毁则 next() 访问
+    `parent_->opts_` UAF——与 close() 正交，X1 未恶化）。
+  - **修正原计划 (a)**：经核实「在 next() 加 keydir_ 空检查」是**有害的**——X1 已让
+    close 后 next() 合法（T8 实证），空检查会误杀该合法用法；且无法防真正的
+    parent_ 悬空（裸指针解引用本身即 UAF）。故只做文档，结构性修复（weak_ptr/
+    owning 句柄，原 (b)）留 zero-copy 重构。测试由 T7/T8 覆盖可测部分（点 2 违反
+    即 UB，不可测）。
 
 ### Bench 缺失
 
@@ -259,10 +268,12 @@
 7. **P1 - P7** 按需穿插
 8. **T4 - T6、B1 - B4、H1 - H5、CI3** 长期推进
 
-> **关键决策点**：第五梯队（R1-R3 + W1-W3）全部落地 + X1 正确性收尾 + S4 落地。
-> 剩余结构性优化：**S2**（merge 批量 pwrite，低-中风险、收益明确）、**S5**（checkpoint
-> zstd，低风险但引依赖）、**S1/S3**（batch API / recovery 流水线，中风险需设计）。
-> 建议下一步 **S2**（merge 吞吐，与既有 hint batching 对称，无新公共 API）。
+> **关键决策点**：R1-R3 + W1-W3 + X1 + S4 + S2 全部落地。
+> 剩余结构性优化：**S5**（checkpoint zstd，低风险但引第三方依赖）、
+> **S1**（put_doc_batch 公共 API，中风险需测试+文档）、
+> **S3**（recovery IndexPool 流水线，中风险需保 ord 序）。
+> 建议下一步 **S1**（批量索引吞吐 2-5×，纯写侧、不碰磁盘格式），或按需穿插
+> P1-P7 小修。S5 需评估是否愿引入 zstd 依赖再定。
 
 ## 待办：本轮发现（2026-06-23 TSan 跑出）
 

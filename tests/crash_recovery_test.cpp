@@ -334,4 +334,92 @@ TEST_F(CrashRecoveryTest, IteratorAliveAcrossCloseNoUaf) {
     SUCCEED();
 }
 
+// T7:X1 显式 release 路径回归。IteratorAliveAcrossCloseNoUaf 走隐式析构
+// （it.reset()→~CaskIter→release）；本例在 close() 后**显式** it->release()，
+// 验证显式释放序（iter_->release → iter_.reset → keydir_pin_.reset）下 KeyDir
+// 仍存活，且 release() 幂等（二次调用不崩）。
+TEST_F(CrashRecoveryTest, IteratorExplicitReleaseAfterCloseNoUaf) {
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c) << c.error().detail;
+        for (int i = 0; i < 20; ++i) {
+            ASSERT_TRUE((*c)->put(bytes(key_for(i)), bytes(value_for(i)),
+                                  static_cast<std::uint32_t>(3000 + i)));
+        }
+        (*c)->close();
+    }
+
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c) << c.error().detail;
+
+    auto it = (*c)->make_iter();
+    ASSERT_TRUE(it->start());
+    ASSERT_TRUE(it->next());
+
+    (*c)->close();    // KeyDir 经 pin 存活
+    it->release();    // 显式 release：锁已释放出 registry 的 KeyDir mutex
+    it->release();    // 幂等：二次 release 不得崩
+    it.reset();       // ~CaskIter 再走一次 release（已空，no-op）
+    SUCCEED();
+}
+
+// T8:X1 多 iterator 交错 release → 仅最后一个（keyfolders_ fetch_sub 返回 1）
+// 触发 pending 应用 + MultiEntry 折叠；全程 KeyDir 经多 pin 在 close() 后存活。
+// 真正要守护的是 KeyDir 内部协调（折叠时机 + 活 iterator 一致快照），非
+// shared_ptr 计数本身。需 TSan 验证折叠期无 race。
+TEST_F(CrashRecoveryTest, MultiIteratorInterleavedReleaseAfterClose) {
+    auto str = [](const std::vector<std::byte>& v) {
+        return std::string(reinterpret_cast<const char*>(v.data()), v.size());
+    };
+
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c) << c.error().detail;
+    auto& cask = **c;
+
+    constexpr int kN = 5;
+    for (int i = 0; i < kN; ++i) {
+        ASSERT_TRUE(cask.put(bytes(key_for(i)), bytes(value_for(i)),
+                             static_cast<std::uint32_t>(4000 + i)));
+    }
+
+    // it1 先 start；之后在 fold 态 overwrite k0 → SingleEntry 升级成 MultiEntry
+    // （旧 revision 留给 it1，新 revision 给后启 iterator）。
+    auto it1 = cask.make_iter();
+    ASSERT_TRUE(it1->start());
+    const std::string k0_new = "k0_NEW_REVISION";
+    ASSERT_TRUE(cask.put(bytes(key_for(0)), bytes(k0_new), 4100));
+
+    auto it2 = cask.make_iter();
+    ASSERT_TRUE(it2->start());
+    auto it3 = cask.make_iter();
+    ASSERT_TRUE(it3->start());
+
+    cask.close();  // keyfolders_==3，snapshot 跳过；KeyDir 经三 pin 存活
+
+    // 交错 release：it1、it3 均非最后一个 → 不折叠。
+    it1->release();
+    it3->release();
+
+    // it2 仍活（keyfolders_==1）：drain 全部 entry，应见 k0..k4 且 k0=新 revision。
+    std::map<std::string, std::string> got;
+    while (true) {
+        auto e = it2->next();
+        ASSERT_TRUE(e) << "post-close next() 失败：" << e.error().detail;
+        if (!e->has_value()) break;
+        got[str((*e)->key)] = str((*e)->value);
+    }
+    EXPECT_EQ(got.size(), static_cast<std::size_t>(kN));
+    EXPECT_EQ(got[key_for(0)], k0_new)
+        << "后启 iterator 应看到 MultiEntry 链头的新 revision";
+
+    it2->release();  // keyfolders_ 1→0 → 最后一个 → 触发折叠（pinned KeyDir 上）
+    SUCCEED();
+}
+
 }  // namespace

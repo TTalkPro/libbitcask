@@ -797,6 +797,80 @@ TEST_F(CaskDocValueTest, FoldSurvivesConcurrentMergeUnlink) {
     cask.close();
 }
 
+// S2:批量 merge 写。merge 输出走 DataFile::write_buffered（累积 1 MiB 一次
+// pwrite），本测试写 > 3 MiB live 数据让 merge 输出跨阈值多次 flush——校验
+// flush 边界两侧 offset 连续、merge 后每个 key 仍能按 keydir offset 读回正确
+// value（offset 算错会 CRC 失败或读到错位字节）。含跨文件覆盖以验活性检查。
+TEST_F(CaskDocValueTest, S2BatchedMergeManyRecordsRoundTrip) {
+    namespace fs = std::filesystem;
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.max_file_size = 64 * 1024;  // 64 KiB → 滚出几十个 data 文件
+
+    auto c = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c);
+    auto& cask = **c;
+
+    constexpr int N = 3000;
+    constexpr std::size_t kValLen = 1100;  // N*1100 ≈ 3.3 MiB live → 多次 flush
+    auto make_key = [](int i) {
+        return std::vector<std::byte>{static_cast<std::byte>(i & 0xFF),
+                                      static_cast<std::byte>((i >> 8) & 0xFF)};
+    };
+    std::map<std::vector<std::byte>, std::vector<std::byte>> expected;
+
+    std::uint32_t ts = 1000;
+    // 第一轮：写入旧值（稍后覆盖，制造 stale 记录让活性检查介入）。
+    for (int i = 0; i < N; ++i) {
+        std::vector<std::byte> stale(kValLen, static_cast<std::byte>(0xEE));
+        ASSERT_TRUE(cask.put(make_key(i), stale, ts++));
+    }
+    // 第二轮：覆盖成正确值（高 tstamp 必胜）。
+    for (int i = 0; i < N; ++i) {
+        std::vector<std::byte> val(kValLen, static_cast<std::byte>(i & 0xFF));
+        val[0] = static_cast<std::byte>(i & 0xFF);
+        val[1] = static_cast<std::byte>((i >> 8) & 0xFF);
+        ASSERT_TRUE(cask.put(make_key(i), val, ts++));
+        expected[make_key(i)] = val;
+    }
+
+    // 收集 data 文件，merge 除 active 外全部。
+    std::vector<std::pair<std::uint32_t, std::string>> files;
+    for (const auto& de : fs::directory_iterator(tmpdir_)) {
+        if (auto t = bitcask::fileops::parse_data_tstamp(
+                de.path().filename().string())) {
+            files.push_back({static_cast<std::uint32_t>(*t), de.path().string()});
+        }
+    }
+    ASSERT_GE(files.size(), 4u) << "应滚出多个文件";
+    std::sort(files.begin(), files.end());
+    std::vector<std::string> to_merge;
+    for (std::size_t i = 0; i + 1 < files.size(); ++i) {
+        to_merge.push_back(files[i].second);
+    }
+
+    auto mr = cask.merge(to_merge);
+    ASSERT_TRUE(mr) << "batched merge failed";
+
+    // merge 后逐 key 读回，校验 value 完整（offset 连续性的端到端验证）。
+    for (const auto& [k, v] : expected) {
+        auto gr = cask.get_owned(k);
+        ASSERT_TRUE(gr) << "key missing after batched merge";
+        EXPECT_EQ(gr->value, v) << "value corrupted after batched merge";
+    }
+
+    // 重开再验一次：从磁盘 fold/hint 重建 keydir 指向 merge 输出文件。
+    cask.close();
+    auto c2 = Cask::open(tmpdir_.string(), opts);
+    ASSERT_TRUE(c2);
+    for (const auto& [k, v] : expected) {
+        auto gr = (*c2)->get_owned(k);
+        ASSERT_TRUE(gr) << "key missing after reopen";
+        EXPECT_EQ(gr->value, v) << "value corrupted after reopen";
+    }
+    (*c2)->close();
+}
+
 // P6:持有 mmap 命中的 GetResultView 期间,并发 merge unlink 掉该 view 映射的
 // sealed 文件 → view 照常读、无 UAF/SIGBUS（map_holder_ shared_ptr 锚定映射,
 // 即便文件被 unlink + 从 read_files_ 淘汰）。释放后映射随最后引用 munmap。

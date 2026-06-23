@@ -151,6 +151,42 @@ DataFile::write(format::RecordType type,
     return WriteResult{off, static_cast<std::uint32_t>(total)};
 }
 
+// S2:批量 append——编码进 batch_buf_，越过阈值才一次 pwrite。offset 取
+// current_offset_（逻辑位置，含缓冲），与落盘时机解耦。
+std::expected<WriteResult, DataFileFault>
+DataFile::write_buffered(format::RecordType type,
+                         std::uint32_t tstamp,
+                         std::uint64_t ord,
+                         std::span<const std::byte> key,
+                         std::span<const std::byte> value) {
+    if (mode_ == Mode::kRead) {
+        return std::unexpected(DataFileFault{DataFileError::kIo, 0});
+    }
+    if (key.size()   > format::kMaxKeySize)   return std::unexpected(DataFileFault{DataFileError::kTooLarge});
+    if (value.size() > format::kMaxValueSize) return std::unexpected(DataFileFault{DataFileError::kTooLarge});
+
+    const std::uint64_t off = current_offset_;
+    // encode 是 append 语义:累积到 batch_buf_ 尾部,不清空。
+    const std::size_t total =
+        codec::encode_data_record(batch_buf_, type, tstamp, ord, key, value);
+    current_offset_ += total;
+    if (batch_buf_.size() >= kBatchFlushBytes) {
+        if (auto f = flush_batch(); !f) return std::unexpected(f.error());
+    }
+    return WriteResult{off, static_cast<std::uint32_t>(total)};
+}
+
+// 把 batch_buf_ 一次 pwrite 到它对应的文件区间起点并清空。
+std::expected<void, DataFileFault> DataFile::flush_batch() {
+    if (batch_buf_.empty()) return {};
+    // 缓冲首字节对应的文件偏移 = 逻辑末尾 − 缓冲长度。
+    const std::uint64_t flush_off = current_offset_ - batch_buf_.size();
+    auto w = file_.pwrite(flush_off, batch_buf_);
+    if (!w) return std::unexpected(io_fault(w.error()));
+    batch_buf_.clear();  // 复用容量
+    return {};
+}
+
 // 截到当前写入位置：先 lseek 到 current_offset_，再 ftruncate 到那里。
 // 用于 undo——caller 想撤销最近一次 write 的话，可以记下 write 前的
 // current_offset_，写完发现不对就 truncate_to(那个旧值)。
@@ -165,6 +201,9 @@ std::expected<void, DataFileFault> DataFile::truncate_here() {
 // fsync 包装。cask 的 sync_strategy=o_sync 模式下不会调到这里
 //（已经在 write 时直接落盘）；none 模式下由调用方在合适时机主动调。
 std::expected<void, DataFileFault> DataFile::sync() {
+    // S2:兜底——sync 前确保 batch_buf_ 已落盘（write() 路径恒空,no-op），
+    // 防 caller 漏调 flush_batch() 导致缓冲数据未落盘却被采信。
+    if (auto f = flush_batch(); !f) return std::unexpected(f.error());
     auto s = file_.sync();
     if (!s) return std::unexpected(io_fault(s.error()));
     return {};
