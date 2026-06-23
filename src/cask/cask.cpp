@@ -774,6 +774,18 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         return 0;  // 快照不认识的文件(快照后新建/merge 产物)→ 全量 fold
     };
 
+    // S3:search 恢复期把 recover_doc 攒成批，交 recover_doc_batch 并行 analyze
+    // + 串行有序插入（仅 search_layer!=null 的串行路径用；并行 KV 路径不碰）。
+    // 插入序 == fold 序 → 与逐条 recover 结果一致。墓碑前必 flush 以保相对序。
+    constexpr std::size_t kRecoverBatch = 1024;
+    std::vector<search::SearchLayer::RecoverDoc> recover_batch;
+    auto flush_recover = [&] {
+        if (search_layer && !recover_batch.empty()) {
+            search_layer->recover_doc_batch(recover_batch);
+            recover_batch.clear();
+        }
+    };
+
     // R3:每个 data file 的 fold 抽成独立单元 fold_one(e)。纯 KV 恢复
     // （search_layer==null）可并行——见函数尾部的并行调度。串行语义下
     // 「按 tstamp 升序后写覆盖前写」仍成立；并行下 keydir 冲突解析按
@@ -834,6 +846,9 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                 if (view.type == format::RecordType::kTombstone) {
                     keydir_->remove(bytes_to_view(view.key), view.tstamp);
                     if (search_layer) {
+                        // S3:墓碑前 flush 攒批，保「文档↔墓碑」相对序（否则墓碑
+                        // 可能先于其要删的 batch 内文档插入而被无效化）。
+                        flush_recover();
                         search_layer->recover_tomb(bytes_to_view(view.key), view.ord);
                     }
                     return;
@@ -849,16 +864,23 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                     // P3b:量化落盘(vec_quantized)也算带向量。
                     const bool dv_has_vec = dv && (dv->has_vector || dv->vec_quantized);
                     if (dv && (!dv->text.empty() || dv_has_vec)) {
-                        std::string_view text_sv(
-                            reinterpret_cast<const char*>(dv->text.data()),
-                            dv->text.size());
+                        // S3:攒进批，满 kRecoverBatch 即并行处理。RecoverDoc 持
+                        // owning 拷贝（fold 缓冲会复用，view 不可跨记录留存）。
+                        search::SearchLayer::RecoverDoc rd;
+                        rd.key.assign(reinterpret_cast<const char*>(view.key.data()),
+                                      view.key.size());
+                        rd.ord      = view.ord;
+                        rd.text.assign(reinterpret_cast<const char*>(dv->text.data()),
+                                       dv->text.size());
+                        rd.file_id  = static_cast<std::uint32_t>(e.tstamp);
+                        rd.offset   = offset;
+                        rd.total_sz = total_size;
+                        rd.tstamp   = view.tstamp;
                         // P3b:doc_vector_f32 统一处理 f32 与 int8 量化两种落盘
                         // （内部 memcpy 未对齐安全 / dequant）。
-                        std::vector<float> vbuf = codec::doc_vector_f32(*dv);
-                        search_layer->recover_doc(bytes_to_view(view.key), view.ord,
-                                                  text_sv, static_cast<std::uint32_t>(e.tstamp),
-                                                  offset, total_size, view.tstamp,
-                                                  vbuf);
+                        rd.vector   = codec::doc_vector_f32(*dv);
+                        recover_batch.push_back(std::move(rd));
+                        if (recover_batch.size() >= kRecoverBatch) flush_recover();
                     }
                 }
             }, /*tolerate_crc_errors*/ true,
@@ -887,9 +909,10 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         return {};
     };
 
-    // 调度：search_layer 存在时 HNSW 单写者 + BM25 ord 序约束，必须串行
-    // （批量化/流水线属 S3）。纯 KV 恢复且文件数 > 1 时并行 fold——
-    // worker 各取一文件，原子计数器分发，结果数组收集错误后统一传播。
+    // 调度：search_layer 存在时 HNSW 单写者 + BM25 插入须串行 → 走串行 fold，
+    // 但 S3 在串行 fold 内把 recover_doc 攒批、analyze 并行化（见 flush_recover）。
+    // 纯 KV 恢复且文件数 > 1 时并行 fold——worker 各取一文件，原子计数器分发，
+    // 结果数组收集错误后统一传播。
     const std::size_t nfiles = entries->size();
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 4;
@@ -900,6 +923,7 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         for (const auto& e : *entries) {
             if (auto r = fold_one(e); !r) return std::unexpected(r.error());
         }
+        flush_recover();  // S3:落最后一个不满批
         return {};
     }
 

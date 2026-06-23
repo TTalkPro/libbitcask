@@ -231,6 +231,22 @@ public:
                      std::uint32_t total_sz, std::uint32_t tstamp,
                      std::span<const float> vector = {});
 
+    // S3:批量恢复。一批文档的 analyze 在 TBB 线程池并行（analyzer 无可变
+    // 状态，纯函数线程安全），随后**按 batch 序串行插入**索引/HNSW——插入序
+    // == 逐条 recover_doc 的 fold 序，结果与串行完全一致（HNSW 单写者亦保持）。
+    // caller 必须在任何 recover_tomb 之前 flush 本批，以保持「文档↔墓碑」相对序。
+    struct RecoverDoc {
+        std::string        key;
+        std::uint64_t      ord = 0;
+        std::string        text;
+        std::uint32_t      file_id = 0;
+        std::uint64_t      offset = 0;
+        std::uint32_t      total_sz = 0;
+        std::uint32_t      tstamp = 0;
+        std::vector<float> vector;  // 空 = 无向量
+    };
+    void recover_doc_batch(std::vector<RecoverDoc>& batch);
+
     // ---- 恢复：从磁盘 record 重放墓碑 ----
     void recover_tomb(std::string_view key, std::uint64_t ord);
 

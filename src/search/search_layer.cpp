@@ -4,6 +4,8 @@
 #include "bitcask/codec.hpp"
 #include "bitcask/highlighter.hpp"
 
+#include <oneapi/tbb/parallel_for.h>  // S3:恢复期批量并行 analyze
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -764,6 +766,40 @@ void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
 void SearchLayer::set_synonym_map(std::unique_ptr<text::SynonymMap> map) {
     synonym_map_ = std::move(map);
     cache_.invalidate();
+}
+
+// S3:批量恢复——并行 analyze + 串行有序插入（见头文件注释的正确性论证）。
+// 与逐条 recover_doc 字节等价：同一 fold 序插入、同一单字段路径、HNSW 串行。
+void SearchLayer::recover_doc_batch(std::vector<RecoverDoc>& batch) {
+    if (batch.empty()) return;
+    const std::size_t n = batch.size();
+
+    // 阶段一：并行 analyze（analyzer_ const 无可变态；写 terms[i]/doc_lens[i]
+    // 互不相交，无共享可变状态）。TBB 全局线程池，无 per-batch 线程创建。
+    std::vector<text::TermPositionsMap> terms(n);
+    std::vector<std::uint32_t>          doc_lens(n, 0);
+    tbb::parallel_for(std::size_t{0}, n, [&](std::size_t i) {
+        terms[i] = analyzer_->analyze_with_positions(batch[i].text);
+        std::uint32_t dl = 0;
+        for (auto& [_, data] : terms[i]) dl += data.first;
+        doc_lens[i] = dl;
+    });
+
+    // 阶段二：按 batch 序串行插入（= fold 序）。HNSW 单写者 = 本线程。
+    for (std::size_t i = 0; i < n; ++i) {
+        auto& d = batch[i];
+        index_.put_doc(d.key, d.ord,
+                       index::DocSlot{
+                           index::DocLoc{d.file_id, d.offset, d.total_sz},
+                           d.tstamp,
+                           doc_lens[i]});
+        if (!terms[i].empty()) {
+            field_index(kDefaultField).add_doc(d.ord, terms[i]);
+        }
+        doc_texts_.put(d.ord, std::move(d.text));
+        if (!d.vector.empty()) on_vector(d.ord, d.vector);
+    }
+    cache_.invalidate();  // 逐条版每条 invalidate；批量一次即可（恢复期无查询）。
 }
 
 void SearchLayer::recover_tomb(std::string_view key, std::uint64_t ord) {

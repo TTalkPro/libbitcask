@@ -91,11 +91,19 @@
 
 > 建议第五梯队落地后再做（部分有依赖关系）。
 
-- [ ] **S1 `put_doc_batch` API + `submit_index_task_batch`** — `src/cask/cask.cpp`、`include/bitcask/thread_pool.hpp`
-  - 现状：每 `put_doc` 单任务入队，1M 文档批量索引 = 1M 次锁。
-  - 改法：批量入队 API（vector of IndexTask 一次锁）；可选配套 `Cask::put_doc_batch`。
-  - 收益：批量索引吞吐 **2-5×**（多核机器）。
-  - 风险：中（新公共 API + 测试 + 文档）。
+- [ ] **S1 `submit_index_task_batch`（仅索引入队批量化，不碰 data WAL）** — `src/cask/cask.cpp`、`include/bitcask/thread_pool.hpp`
+  - 🚫 **WAL 红线**：data 文件是 WAL，put 路径每条 record 必须**立刻 pwrite 落盘**，
+    **绝不可** buffered 缓冲写（= ⑪ 否决项）。故 `put_doc_batch` **不得**把 data 写
+    走 `write_buffered`/`batch_buf_`；S2 的批量写**只**适用 merge 输出（非 WAL）。
+  - 现状：每 `put_doc` 单独 `index_pool_->submit`（`pending_.fetch_add(1)` + 单条入队）。
+  - 合法改法（仅内存侧）：`IndexPool::submit_batch(vector<IndexTask>)`——`pending_.fetch_add(N)`
+    一次 + 循环 push（tbb 队列无原生 batch push）。data 写仍逐条 immediate pwrite，
+    fsync 仍按 `sync_every_n`/`o_sync` 既有组提交策略，不变。
+  - 收益：**有限**——单 IndexPool worker 串行消费是吞吐上限，入队批量化只省
+    producer 侧 N−1 次 atomic RMW + 调用开销，非 2-5×（原估值含 data 批写，已作废）。
+  - 风险：低（纯内存入队；无 API durability 语义变更）。
+  - **决策**：收益有限，优先级下调；若做仅做内存入队批量化，公共 `put_doc_batch`
+    可选（其 data 写逐条 durable，仅省入队/encode 开销）。
 
 - [x] **S2 Merger 批量 `write`（每条 pwrite → 累积 N 条一次 pwrite）** — `src/merge/merger.cpp`、`src/fileops/data_file.cpp`
   - **已完成（2026-06-23）**：`DataFile` 新增 `write_buffered()` + `flush_batch()`：
@@ -114,11 +122,23 @@
   - 风险：中（已含 partial-write：`PosixFile::pwrite` 循环写满；offset 原子性靠
     逻辑 offset 确定性 + 末尾统一 fsync）。
 
-- [ ] **S3 Recovery 期 IndexPool 批量化 / 流水线** — `src/search/search_layer.cpp` `recover_doc`
-  - 现状：recovery 时每 doc 同步走 `bm25::InvertedIndex::add_doc`，未走 IndexPool，无批量化、无流水线。
-  - 改法：批量 1024 一组；analysis 与 index insert 流水线（batch N 分析 vs batch N-1 插入重叠）。
-  - 收益：冷启动索引重建 **~2× 加速**（CPU bound 部分）。
-  - 风险：中（需保证 ord 顺序一致）。
+- [x] **S3 Recovery 期索引重建批量并行 analyze** — `src/search/search_layer.cpp`、`src/cask/cask.cpp`
+  - **已完成（2026-06-23）**：新增 `SearchLayer::recover_doc_batch`——一批文档的
+    `analyze_with_positions` 走 `tbb::parallel_for` **并行**（analyzer 仅 const 配置态、
+    无可变 scratch，cppjieba `Cut` 亦 const 线程安全 → 纯函数并发安全），随后**按
+    batch 序串行插入**索引/HNSW（插入序 == fold 序 → 与逐条 `recover_doc` 字节等价；
+    HNSW 单写者 = 本线程）。`cask.cpp` 恢复 fold 把 `recover_doc` 攒成 1024 一批，
+    **墓碑前强制 flush** 保「文档↔墓碑」相对序。
+  - 安全前提核实：恢复期 IndexPool worker 阻塞在空队列、仅主线程碰 index；recover_doc
+    本就以 fold 序（非严格 ord 序）调用 → index 早已容忍任意插入序，故只需保持
+    fold 序即可逐字节复现。
+  - 收益：冷启动索引重建的 **analyze（CPU bound 大头）并行化 ~核数×**；插入串行不变。
+    （流水线 overlap fold-IO 与 analyze 是进一步优化，未做——风险/收益不划算。）
+  - 验证：新增 `S3BatchedRecoveryMatchesSerial`（1500 文档跨 batch + 删除穿插）——断言
+    **批量 fold 恢复的搜索结果集 == 异步索引结果集**；**已实证移除 tomb-flush 则
+    key1030/1040/1050 等高位被删 key 复活**（搜索可观测，非被 keydir live filter 掩盖）→
+    测试确为护栏。Release 445/445 + TSan 零 race。
+  - 风险：中（已通过等价性测试 + TSan 验证）。
 
 - [x] **S4 Checkpoint / keydir 序列化：reserve + memcpy 替代 N 次 vector::insert** — `src/search/search_layer.cpp`、`src/keydir/keydir.cpp`
   - **已完成（2026-06-23）**：核心问题是 **reallocation churn**（从零/低估容量起几何
@@ -263,17 +283,19 @@
 2. ~~**R1 + R2 + W1** ← 高 ROI 性能（启动 + 索引热路径）~~ ✅ 完成（2026-06-23）
 3. ~~**T2 + T3** ← C1 / checkpoint 的回归保护~~ ✅ 完成
 4. ~~**R3 + W2 + W3** ← 需 R1/W1 基础~~ ✅ 完成（2026-06-23）
-5. **X1** ← 正确性收尾（本轮 TSan 发现）✅ 完成（2026-06-23）
-6. **S1 - S5** ← 结构性优化，依赖第五梯队的 batch/zero-copy 基础
+5. **X1 + T7/T8/T9** ← 正确性收尾（迭代器生命周期）✅ 完成（2026-06-23）
+6. **S2 + S3 + S4** ← 结构性优化 ✅ 完成（2026-06-23）
 7. **P1 - P7** 按需穿插
 8. **T4 - T6、B1 - B4、H1 - H5、CI3** 长期推进
 
-> **关键决策点**：R1-R3 + W1-W3 + X1 + S4 + S2 全部落地。
-> 剩余结构性优化：**S5**（checkpoint zstd，低风险但引第三方依赖）、
-> **S1**（put_doc_batch 公共 API，中风险需测试+文档）、
-> **S3**（recovery IndexPool 流水线，中风险需保 ord 序）。
-> 建议下一步 **S1**（批量索引吞吐 2-5×，纯写侧、不碰磁盘格式），或按需穿插
-> P1-P7 小修。S5 需评估是否愿引入 zstd 依赖再定。
+> **关键决策点**：R1-R3 + W1-W3 + X1(+T7-T9) + S2 + S3 + S4 全部落地。
+> 结构性优化剩余：
+> - **S1**：已降级——data 是 WAL，put 路径不可缓冲写；仅合法的「内存索引入队
+>   批量化」收益有限（单 worker 串行是瓶颈），暂不做。
+> - **S5**（checkpoint zstd）：低风险但需**引入 zstd 第三方依赖**——待用户拍板是否
+>   接受新依赖再做。
+> 建议下一步：**P1-P7 小修**（低成本 WAL-safe，穿插即可）或 **T4-T6 补测试** /
+> **H1-H5 构建加固**（独立、低风险）。S5 需依赖决策。
 
 ## 待办：本轮发现（2026-06-23 TSan 跑出）
 
