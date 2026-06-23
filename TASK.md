@@ -158,6 +158,23 @@
   - 验证 tier-2 ⑤ 诊断探针（bucket 边界、sso/heap 计数）。
 - [ ] **T6 `thread_local encoded` 并发测试** — `tests/thread_local_encoded_buffer_test.cpp`（新建）
   - 保护 tier-3 ⑩ 多线程并发 put 无干扰。
+- [ ] **T7 X1 显式 release 路径回归** — `tests/crash_recovery_test.cpp`（追加）
+  - X1 现仅覆盖隐式析构路径（`it.reset()` 触发 `~IterHandle`）；补一个
+    `(*c)->close()` 后调 `it->release()` 再 `it.reset()` 的 case，验证显式
+    release 序（`iter_->release()` → `iter_.reset()` → `keydir_pin_.reset()`）
+    下 KeyDir 仍存活。低成本，TSan 跑一次即可。
+- [ ] **T8 X1 多 iterator 并发 pin KeyDir** — `tests/crash_recovery_test.cpp`（追加）
+  - 同一 Cask 上 `make_iter()` × N，全部 start 后 close()，逐个 reset。
+    验证 shared_ptr 引用计数在并发/交错析构下正确，KeyDir 在最后一个 iterator
+    释放前始终存活。中等成本（需 TSan 验证无 race）。
+- [ ] **T9 iterator `next()` after close() 的契约澄清** — 文档 + 测试
+  - X1 修了析构路径 UAF，但 `CaskIter::parent_` 仍是裸 `Cask*`：close() 后
+    若继续 `it->next()`（read_file 经 parent_->read_files_，已被 close 清空）
+    行为未定义。这是 pre-existing 问题，X1 未恶化也未修复。
+  - 决策二选一：(a) 文档化「close 后 iterator 仅可析构，不可推进」并在
+    next() 加 `if (!parent_->keydir_) return unexpected` 防御；(b) 让 iterator
+    自带 read_file 缓存（接近 S13 的 pin_files_），完全自洽。
+    倾向 (a)（成本低，契约清晰）；(b) 留作后续 S 梯队的 zero-copy 重构。
 
 ### Bench 缺失
 
