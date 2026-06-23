@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <string>
+#include <vector>
+
 #include "bitcask/keydir.hpp"
 
 namespace {
@@ -107,6 +110,60 @@ TEST(KeyDir, AdvanceOrdAfterPut) {
     auto r = kd.put("k2", 1, 10, 100, 1000, 0, true, 0, 0, o);
     EXPECT_EQ(r, PutResult::kOk);
     EXPECT_EQ(kd.get("k2")->ord, 51u);
+}
+
+// T5:key_length_histogram 诊断探针（tier-2 ⑤）。验证桶边界 + sso/heap 计数。
+// 桶：[0,8) [8,16) [16,24) [24,32) [32,48) [48,64) [64,128) [128,∞)；
+// sso：len≤15（libstdc++ SSO 内联），heap：len>15。
+TEST(KeyDir, KeyLengthHistogramBucketsAndSso) {
+    KeyDir kd;
+    // 每个长度恰插一个 key（不同长度天然是不同的 key）。每桶取「下界」与
+    // 「上界−1」两个长度，校验边界归桶正确。
+    const std::vector<std::size_t> lens = {
+        1, 7,     // 桶 0
+        8, 15,    // 桶 1（均 sso，≤15）
+        16, 23,   // 桶 2（起 heap）
+        24, 31,   // 桶 3
+        32, 47,   // 桶 4
+        48, 63,   // 桶 5
+        64, 127,  // 桶 6
+        128, 200  // 桶 7
+    };
+    for (std::size_t L : lens) {
+        std::string k(L, 'x');
+        ASSERT_EQ(kd.put(k, 1, 10, 100, 1000, 0, true, 0, 0, 0), PutResult::kOk);
+    }
+
+    auto h = kd.key_length_histogram();
+    EXPECT_EQ(h.total, lens.size());
+    // sso = {1,7,8,15} = 4；heap = 其余 12。
+    EXPECT_EQ(h.sso, 4u);
+    EXPECT_EQ(h.heap, lens.size() - 4);
+    for (std::size_t b = 0; b < 8; ++b) {
+        EXPECT_EQ(h.buckets[b], 2u) << "桶 " << b << " 应有 2 个 key";
+    }
+}
+
+// T5:空 keydir → 全零；墓碑（删除）不计入 entries 直方图。
+TEST(KeyDir, KeyLengthHistogramEmptyAndAfterRemove) {
+    KeyDir kd;
+    auto h0 = kd.key_length_histogram();
+    EXPECT_EQ(h0.total, 0u);
+    EXPECT_EQ(h0.sso, 0u);
+    EXPECT_EQ(h0.heap, 0u);
+
+    kd.put("short", 1, 10, 100, 1000, 0, true, 0, 0, 0);          // len 5
+    kd.put("a_much_longer_key_over_15", 1, 10, 100, 1000, 0, true, 0, 0, 1);  // len>15
+    auto h1 = kd.key_length_histogram();
+    EXPECT_EQ(h1.total, 2u);
+    EXPECT_EQ(h1.sso, 1u);
+    EXPECT_EQ(h1.heap, 1u);
+
+    kd.remove("short", 2000);  // 删除后该 key 不再是 live entry
+    auto h2 = kd.key_length_histogram();
+    EXPECT_EQ(h2.total, 1u) << "墓碑不应计入直方图";
+    EXPECT_EQ(h2.sso, 0u);
+    EXPECT_EQ(h2.heap, 1u);
 }
 
 TEST(KeyDir, AllocOrdThreadSafety) {

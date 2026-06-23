@@ -146,3 +146,37 @@ BENCHMARK(BM_KeyDir_Mixed_MultiThreaded)
     ->Threads(1)->Threads(2)->Threads(4)->Threads(8)
     ->UseRealTime()
     ->Unit(benchmark::kNanosecond);
+
+// -----------------------------------------------------------------------------
+// B3:大 keydir（>cache）随机 get。kKeyspace=1024 永远 cache-hot，测不出
+// tier-2 ⑤（KeyDir 换 ankerl::unordered_dense）的 −31%——那来自消除每键节点
+// malloc + 指针追逐，只有在 keydir 远超 L2/L3、随机访问频繁 cache-miss 时才显现。
+// 1M key 随机 get 是该优化的永久回归护栏。建表一次（function-local static），
+// 跨 repetition 复用。
+// -----------------------------------------------------------------------------
+static void BM_KeyDir_Get_Large(benchmark::State& state) {
+    constexpr int kLargeKeyspace = 1'000'000;
+    static KeyDir kd;
+    static std::vector<std::string> keys;
+    static bool initialized = false;
+    if (!initialized) {
+        keys.reserve(kLargeKeyspace);
+        for (int i = 0; i < kLargeKeyspace; ++i) {
+            keys.push_back("key_" + std::to_string(i));
+        }
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            kd.put(keys[i], 1, 100, static_cast<std::uint64_t>(i), 1, 0,
+                   /*newest*/ false, 0, 0);
+        }
+        initialized = true;
+    }
+
+    std::mt19937 rng(0xD00DFEED);
+    std::uniform_int_distribution<int> dist(0, kLargeKeyspace - 1);
+    for (auto _ : state) {
+        const std::string& k = keys[static_cast<std::size_t>(dist(rng))];
+        benchmark::DoNotOptimize(kd.get(k));
+    }
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_KeyDir_Get_Large)->Unit(benchmark::kNanosecond);

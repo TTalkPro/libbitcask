@@ -120,6 +120,36 @@ TEST(JiebaAnalyzer, OffsetsAreRealNotZero) {
     EXPECT_GT(checked, 0u);
 }
 
+// P7:>64 codepoint 触发首码点倒排定位路径（use_index）。验证长文本下每个
+// token 的 byte 区间仍精确切出 term（定位正确——倒排返回错位会让 substr≠term），
+// 且重复词取首次出现位置（语义与 naive 线扫一致）。
+TEST(JiebaAnalyzer, LongDocIndexedWordLocation) {
+    JiebaAnalyzer a(kDictDir);
+    std::string text;
+    for (int i = 0; i < 12; ++i) text += "北京大学是好学校";  // 8cp × 12 = 96 > 64
+    auto norm = detail::nfkc_fold(text);
+    auto ttm = a.analyze_with_offsets(text);
+
+    ASSERT_FALSE(ttm.empty());
+    std::size_t checked = 0;
+    for (auto& [term, infos] : ttm) {
+        for (auto& info : infos) {
+            ASSERT_LE(info.end_byte, norm.size()) << "term=" << term;
+            if (info.end_byte > info.start_byte) {
+                EXPECT_EQ(norm.substr(info.start_byte, info.end_byte - info.start_byte),
+                          term)
+                    << "index-path 定位错位 term=" << term;
+                ++checked;
+            }
+        }
+    }
+    EXPECT_GT(checked, 0u);
+    // "北京" 首次出现在归一化文本 byte 0（重复词取首次位置）。
+    auto it = ttm.find("北京");
+    ASSERT_NE(it, ttm.end());
+    EXPECT_EQ(it->second.front().start_byte, 0u);
+}
+
 // 回归 S9.26：jieba CutForSearch 会把空格也输出为词，不应进索引。
 TEST(JiebaAnalyzer, SpaceNotIndexedAsToken) {
     JiebaAnalyzer a(kDictDir);

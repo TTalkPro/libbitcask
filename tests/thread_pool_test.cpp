@@ -1,7 +1,10 @@
 // T2.7 单元测试：IndexPool + IndexTaskQueue + TbbLifetime
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -90,6 +93,100 @@ TEST(IndexTaskQueue, TaskOrderingFIFO) {
     for (std::size_t i = 0; i < kCount; ++i) {
         EXPECT_EQ(received[i], i);
     }
+}
+
+// T4:背压——队列满时 submit 阻塞。worker 卡在首个任务上让队列填满，额外
+// 一次 submit 必须阻塞（不立刻返回），释放 worker 后才完成。
+TEST(IndexPool, BackpressureBlocksWhenQueueFull) {
+    constexpr std::size_t kCap = 4;
+    IndexPool pool(1, kCap);
+    std::mutex m;
+    std::condition_variable cv;
+    bool release = false;
+    std::atomic<std::size_t> processed{0};
+    std::atomic<bool> worker_in_wait{false};
+
+    pool.start([&](const IndexTask& task) {
+        if (task.op == IndexOp::Sentinel) return false;
+        if (processed.load() == 0) {  // 卡住首个任务 → worker 不再消费
+            std::unique_lock<std::mutex> lk(m);
+            worker_in_wait = true;
+            cv.wait(lk, [&] { return release; });
+        }
+        ++processed;
+        return true;
+    });
+
+    // 首任务被 worker 取走并卡住（队列腾空、worker 不再 pop）。
+    pool.submit(IndexTask::make(IndexOp::Add, "a0", 0, "t", 0, 0, 0, 0, 0));
+    while (!worker_in_wait.load()) std::this_thread::yield();
+
+    // 填满有界队列（kCap 个）。
+    for (std::size_t i = 0; i < kCap; ++i) {
+        pool.submit(IndexTask::make(IndexOp::Add, "k", i, "t", 0, 0, 0, 0, 0));
+    }
+
+    // 再 submit 一个 → 队列满 → 必阻塞。用单独线程提交并观测。
+    std::atomic<bool> extra_done{false};
+    std::thread t([&] {
+        pool.submit(IndexTask::make(IndexOp::Add, "x", 999, "t", 0, 0, 0, 0, 0));
+        extra_done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_FALSE(extra_done.load()) << "队列满时 submit 应阻塞（背压）";
+
+    // 释放 worker → 队列排空 → 阻塞的 submit 完成。
+    { std::lock_guard<std::mutex> lk(m); release = true; }
+    cv.notify_all();
+    t.join();
+    EXPECT_TRUE(extra_done.load());
+    pool.flush();
+    pool.stop();
+}
+
+// T4:关闭排空契约。close() 的真实序是 flush()→stop()（cask.cpp）：flush()
+// 等 pending 归 0（W3 cv），把背压堆积的全部任务消费干净，再 stop() 干净退出。
+// （stop() 本身是 abrupt：worker 在循环顶部查 stopped_，忙时设标志会让它处理
+//  完当前任务即退出、不排空——索引可由 data 重建，故此设计可接受。）
+TEST(IndexPool, FlushDrainsBackpressuredThenStopClean) {
+    IndexPool pool(1, 16);
+    std::mutex m;
+    std::condition_variable cv;
+    bool release = false;
+    std::atomic<std::size_t> processed{0};
+    std::atomic<bool> worker_in_wait{false};
+
+    pool.start([&](const IndexTask& task) {
+        if (task.op == IndexOp::Sentinel) return false;
+        if (processed.load() == 0) {
+            std::unique_lock<std::mutex> lk(m);
+            worker_in_wait = true;
+            cv.wait(lk, [&] { return release; });
+        }
+        ++processed;
+        return true;
+    });
+
+    pool.submit(IndexTask::make(IndexOp::Add, "a0", 0, "t", 0, 0, 0, 0, 0));
+    while (!worker_in_wait.load()) std::this_thread::yield();
+
+    // 背压：worker 卡住期间塞满队列（16）。第 17 个会阻塞——用线程提交。
+    constexpr std::size_t kN = 16;
+    std::thread feeder([&] {
+        for (std::size_t i = 1; i <= kN; ++i) {
+            pool.submit(IndexTask::make(IndexOp::Add, "k", i, "t", 0, 0, 0, 0, 0));
+        }
+    });
+
+    // 释放 worker → 队列排空，feeder 的阻塞 submit 也陆续完成。
+    { std::lock_guard<std::mutex> lk(m); release = true; }
+    cv.notify_all();
+    feeder.join();
+
+    pool.flush();  // 真实排空机制：等 pending 归 0
+    EXPECT_EQ(processed.load(), kN + 1) << "flush() 必须排空全部已提交任务";
+    pool.stop();   // flush 后干净退出，不挂起
+    EXPECT_TRUE(pool.is_stopped());
 }
 
 TEST(TbbLifetime, AcquireRelease) {

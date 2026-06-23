@@ -32,8 +32,11 @@ using Utf8ProcBuf = std::unique_ptr<uint8_t[], Utf8ProcDeleter>;
     return {static_cast<char32_t>(cp), static_cast<std::size_t>(consumed)};
 }
 
-[[nodiscard]] inline std::string nfkc_fold(std::string_view input) {
-    if (input.empty()) return {};
+// P6:出参版——写入 caller 缓冲（clear 保留容量），热路径稳态零分配。
+// caller 用 thread_local 复用（如 jieba 逐词归一化）。语义与返回值版完全一致。
+inline void nfkc_fold(std::string_view input, std::string& out) {
+    out.clear();
+    if (input.empty()) return;
 
     // P2.5/P2.5b 统一快路径：全部码点 ∈（NFKC_Casefold 恒等区段 ∪ ASCII）
     // 时，整个变换等价于「原串 + ASCII 字节 tolower」——纯 ASCII 文本与
@@ -66,28 +69,34 @@ using Utf8ProcBuf = std::unique_ptr<uint8_t[], Utf8ProcDeleter>;
         }
     }
     if (fast) {
-        std::string out(input);
+        out.assign(input);
         for (auto& c : out) {
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
         }
-        return out;
+        return;
     }
 
     // 非 ASCII：utf8proc_map 接受显式长度（utf8proc_NFKC_Casefold 即
     // 它加 NULLTERM 的包装）——免去此前「输入拷贝求 null 终止」与
     // 「输出 strlen」两次全串遍历。选项与 NFKC_Casefold 完全一致。
     // 行为差异仅在含内嵌 \0 的输入：旧版在 \0 截断，本版处理全长（更正确）。
-    utf8proc_uint8_t* out = nullptr;
+    utf8proc_uint8_t* mapped = nullptr;
     auto n = utf8proc_map(
         reinterpret_cast<const utf8proc_uint8_t*>(input.data()),
-        static_cast<utf8proc_ssize_t>(input.size()), &out,
+        static_cast<utf8proc_ssize_t>(input.size()), &mapped,
         static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE |
                                        UTF8PROC_COMPAT | UTF8PROC_CASEFOLD |
                                        UTF8PROC_IGNORE));
-    if (n < 0 || out == nullptr) return {};
-    Utf8ProcBuf guard(out);
-    return std::string(reinterpret_cast<const char*>(out),
-                       static_cast<std::size_t>(n));
+    if (n < 0 || mapped == nullptr) return;  // out 已 clear
+    Utf8ProcBuf guard(mapped);
+    out.assign(reinterpret_cast<const char*>(mapped),
+               static_cast<std::size_t>(n));
+}
+
+[[nodiscard]] inline std::string nfkc_fold(std::string_view input) {
+    std::string out;
+    nfkc_fold(input, out);
+    return out;
 }
 
 struct CpInfo {

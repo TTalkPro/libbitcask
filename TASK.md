@@ -187,12 +187,21 @@
     稳态零 codepoint 分配。并发安全（thread_local 每线程独立），S3 并行 analyze 下
     **TSan 零 race**。Release 445/445（含 analyzer/jieba/stemming/docvalue）。
     jieba 的 to_codepoints（嵌套用法）未迁移，归 P5-P7 一并处理。
-- [ ] **P5 Jieba `jieba_cut` 多余 `std::string(sentence)` 拷贝** — `src/text/jieba_analyzer.cpp:97-99`
-  - 检查 cppjieba 是否接受 string_view。
-- [ ] **P6 Jieba 输出词再走一次 NFKC + codepoint** — `src/text/jieba_analyzer.cpp:144-146`
-  - 源已归一化；冗余工作；考虑缓存或短路。
-- [ ] **P7 Jieba 词位置搜索 O(n²)** — `src/text/jieba_analyzer.cpp:171-185`
-  - 每个 jieba 词线性扫全 codepoint 数组；考虑后缀数组或多模式匹配。
+- [x] **P5 Jieba `jieba_cut` 多余 `std::string(sentence)` 拷贝** — `src/text/jieba_analyzer.cpp`
+  - **已完成（2026-06-23）**：cppjieba `CutForSearch` 要 `const std::string&`（不接
+    string_view），但缓冲改 `thread_local sentence` 复用 → 稳态零分配。
+- [x] **P6 Jieba 输出词再走一次 NFKC + codepoint** — `src/text/jieba_analyzer.cpp`、`text_utils.hpp`
+  - **已完成（2026-06-23）**：加 `nfkc_fold(input, out&)` + `to_codepoints(text, out&)`
+    出参版；collect_tokens 的全文 `normalized`/`cps` 与逐词 `word_norm`/`word_cps`
+    各用独立 `thread_local` 复用（**两组分开避免别名**）→ 逐词归一化/分码点稳态零分配。
+- [x] **P7 Jieba 词位置搜索 O(n²)** — `src/text/jieba_analyzer.cpp`
+  - **已完成（2026-06-23）**：>64 codepoint 时建「首码点 → cps 下标（升序）」倒排，
+    逐词定位从 O(词数·cps长度) 线扫降到 O(候选位置数)；小文本仍 naive（免建表）。
+    倒排按升序 push → 候选升序 → 仍取首次匹配，**语义不变**。
+  - 验证：新增 `LongDocIndexedWordLocation`（96 cp 触发倒排，断言每 token byte 区间
+    精确切出 term + 重复词取首次位置）；**已实证强制 use_index=true 全 13 例 jieba 测试
+    通过**（倒排路径与 naive 在整语料一致）。Release 446/446 通过。
+  - 关联 **P4 jieba 嵌套 to_codepoints** 一并迁移（见 P6）。
 
 ---
 
@@ -207,12 +216,19 @@
 - [x] **T3\* Checkpoint 腐败回退测试** — `tests/checkpoint_recovery_test.cpp`
   - **已完成**：4 例（CorruptKeydir / MissingCheckpoint / CorruptSearch /
     CorruptSearchPrevGenerationFallback → 全量 fold）保护 P14e 设计契约；全绿。
-- [ ] **T4 IndexPool 背压 / 关闭排空测试** — `tests/index_pool_backpressure_test.cpp`（新建）
-  - 队列满 → submit 阻塞；stop() 排空 pending。
-- [ ] **T5 `key_length_histogram` 测试** — `tests/keydir_histogram_test.cpp`（新建）
-  - 验证 tier-2 ⑤ 诊断探针（bucket 边界、sso/heap 计数）。
-- [ ] **T6 `thread_local encoded` 并发测试** — `tests/thread_local_encoded_buffer_test.cpp`（新建）
-  - 保护 tier-3 ⑩ 多线程并发 put 无干扰。
+- [x] **T4 IndexPool 背压 / 关闭排空测试** — `tests/thread_pool_test.cpp`（并入既有，免 CMake 改动）
+  - **已完成（2026-06-23）**：`BackpressureBlocksWhenQueueFull`（worker 卡住填满有界队列 →
+    额外 submit 阻塞，释放后才完成）+ `FlushDrainsBackpressuredThenStopClean`（修正契约：
+    **真实序是 flush()→stop()**，flush 等 pending 归 0 排空背压堆积；stop() 本身 abrupt——
+    worker 循环顶查 stopped_，忙时即退不排空，索引可由 data 重建故可接受）。
+    Release 全绿 + **TSan 零 race**。
+- [x] **T5 `key_length_histogram` 测试** — `tests/keydir_test.cpp`（并入既有）
+  - **已完成（2026-06-23）**：`KeyLengthHistogramBucketsAndSso`（8 桶各取下界+上界−1，
+    校验边界归桶 + sso≤15/heap>15 计数）+ `...EmptyAndAfterRemove`（空→全零；墓碑不计入）。
+- [x] **T6 `thread_local encoded` 并发测试** — `tests/crash_recovery_test.cpp`（并入既有）
+  - **已完成（2026-06-23）**：`ThreadLocalEncodedBufferNoCrossThreadInterference`——8 线程
+    各独立 Cask 并发 put 变长 value，重开逐值校验无串台/残留（若缓冲是 static 则数据竞争，
+    若未正确 clear 则变长 value 读残留字节）。Release 全绿 + **TSan 零 race**。
 - [x] **T7 X1 显式 release 路径回归** — `tests/crash_recovery_test.cpp`
   - **已完成（2026-06-23）**：`IteratorExplicitReleaseAfterCloseNoUaf`——close() 后
     显式 `it->release()`（验证 `iter_->release → iter_.reset → keydir_pin_.reset`
@@ -236,25 +252,52 @@
 
 ### Bench 缺失
 
-- [ ] **B1 Merge 吞吐 bench** — `bench/merge_bench.cpp`（新建）
-  - 度量 S2 + tier-1 ④；记录数/秒、MB/秒。
-- [ ] **B2 IndexPool 异步路径 bench** — `bench/index_pool_bench.cpp`（新建）
-  - 度量 W2/W3；submit 延迟、worker 处理延迟。
-- [ ] **B3 大 keydir bench（>cache，1M key）** — 扩展 `bench/keydir_bench.cpp`
-  - 永久回归保护 tier-2 ⑤ 的 −31%；当前 1024 key 永远 cache-hot 测不出。
-- [ ] **B4 Checkpoint 保存/加载 bench** — `bench/checkpoint_bench.cpp`（新建）
-  - 度量 S4/S5；ms/save、ms/load。
+- [x] **B1 Merge 吞吐 bench** — `bench/merge_bench.cpp`
+  - **已完成（2026-06-23）**：`BM_Merge_Throughput`——两轮写（旧值→覆写）造一半死记录，
+    Pause/ResumeTiming 仅计时 `merge()`，报 records/s + MB/s（度量 S2 批量 pwrite）。
+    实测 20k 记录 merge ≈ 330k records/s、~33 MiB/s（本机 tmpfs）。
+- [x] **B2 IndexPool 异步路径 bench** — `bench/index_pool_bench.cpp`
+  - **已完成（2026-06-23）**：`BM_IndexPool_SubmitDrain`——no-op consumer 隔离队列/调度/
+    flush 开销，度量 `make + submit + worker 消费 + flush(W3 cv)` 端到端吞吐。实测
+    ~3M tasks/s。
+- [x] **B3 大 keydir bench（>cache，1M key）** — 扩展 `bench/keydir_bench.cpp`
+  - **已完成（2026-06-23）**：`BM_KeyDir_Get_Large`——1M key 随机 get（cache-cold），暴露
+    tier-2 ⑤（ankerl::unordered_dense）的 cache-miss + 指针追逐成本，永久回归护栏。
+    实测 ~260-290 ns/get（vs 1024-key hot 远快——故旧基准测不出该优化）。
+- [x] **B4 Checkpoint 保存/加载 bench** — `bench/checkpoint_bench.cpp`
+  - **已完成（2026-06-23）**：`BM_Checkpoint_KeydirSave`/`...Load`——度量 S4 keydir 快照
+    序列化（精确 reserve）+ 反序列化重建。实测 100k key：save ~5 ms（~20M keys/s）、
+    load ~10.6 ms（~9.5M keys/s）。（S5 zstd 未做 → 暂无压缩维度。）
+
+> 全部并入单一 `bitcask_bench`（`-DBITCASK_BUILD_BENCHMARKS=ON` 构建）；bench 链接加
+> `TBB::tbb`（IndexPool 模板实例化 tbb 队列）。**bench 不链 sanitizer**（perf 数无意义）。
 
 ### 构建加固（独立于优化，可任意时刻加）
 
-- [ ] **H1 栈保护 `-fstack-protector-strong`** — `CMakeLists.txt`
-- [ ] **H2 `_FORTIFY_SOURCE=2`** — `CMakeLists.txt`（需配合 `-O2` 以上）
-- [ ] **H3 Full RELRO `-Wl,-z,relro,-z,now`** — `CMakeLists.txt`
-- [ ] **H4 可执行文件 PIE `-pie`** — `CMAKE_EXE_LINKER_FLAGS`（migrate_le / gen_inert_table）
-- [ ] **H5 PCH（precompiled header）** — `CMakeLists.txt`
-  - `target_precompile_headers(bitcask_cask PRIVATE bitcask/cask.hpp)` 等；编译时间 −20~30%。
+- [x] **H1 栈保护 `-fstack-protector-strong`** — `CMakeLists.txt`
+  - **已完成（2026-06-23）**：目录作用域 `add_compile_options(-fstack-protector-strong)`，
+    全配置（含 Debug/sanitizer）启用。验证：Release migrate_le `__stack_chk` 符号在位。
+- [x] **H2 `_FORTIFY_SOURCE=2`** — `CMakeLists.txt`
+  - **已完成（2026-06-23）**：`$<$<NOT:$<CONFIG:Debug>>:-U_FORTIFY_SOURCE;-D_FORTIFY_SOURCE=2>`，
+    **且仅当 `BITCASK_SANITIZE` 为空**（与 ASAN/TSan interceptor 冲突）。先 `-U` 防发行版
+    预定义重定义告警。验证：Release flags.make 含 `_FORTIFY_SOURCE=2`；Debug（-O0）与
+    TSan 构建均**正确缺省**。
+- [x] **H3 Full RELRO `-Wl,-z,relro,-z,now`** — `CMakeLists.txt`
+  - **已完成（2026-06-23）**：`add_link_options(-Wl,-z,relro,-z,now)`。原仅 partial RELRO
+    （有 GNU_RELRO 段、无 BIND_NOW）→ 现 **Full**：Release migrate_le `FLAGS=BIND_NOW` +
+    `FLAGS_1=NOW`。覆盖 .so + 可执行文件。
+- [x] **H4 可执行文件 PIE `-pie`** — 已由顶部 `CMAKE_POSITION_INDEPENDENT_CODE ON`
+  - **已满足（核实，无需改动）**：cmake≥3.20 → CMP0083=NEW，全局 PIC 令可执行文件
+    自动 `-fPIE -pie`。migrate_le / gen_inert_table 实测 `Type: DYN` + `FLAGS_1: PIE`。
+- [x] **H5 PCH（precompiled header）** — `CMakeLists.txt`
+  - **已完成（2026-06-23）**：重型 TU（cask/search/keydir/bm25/text）各 PCH 一组 STL 公共头
+    （algorithm/cstdint/expected/memory/optional/span/string/string_view/unordered_map/vector）。
+    仅 STL 头入 PCH（恒可用、与各 TU 无冲突）。`-DBITCASK_PCH=OFF` 可关闭排查。
+    验证：Release/Debug/TSan 三构建均通过，全量 451/451 ctest 绿。
 
-> 当前只有 `-fvisibility=hidden` + `-fPIC`（SO 用）；RELRO/FORTIFY/栈保护全无。
+> ✅ H1-H5 全部落地。新增加固：栈保护（strong，全配置）+ FORTIFY=2（优化非 san）+
+> Full RELRO（BIND_NOW）；PIE 早已就位（全局 PIC）。sanitizer 构建按需排除 FORTIFY，
+> 实测 Release/Debug/TSan 三向验证一致。
 
 ### CI 剩余
 

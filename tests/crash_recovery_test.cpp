@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -420,6 +422,73 @@ TEST_F(CrashRecoveryTest, MultiIteratorInterleavedReleaseAfterClose) {
 
     it2->release();  // keyfolders_ 1→0 → 最后一个 → 触发折叠（pinned KeyDir 上）
     SUCCEED();
+}
+
+// T6:put 路径的 `thread_local encoded` 缓冲（tier-3 ⑩）跨线程无干扰。
+// 每线程独立 Cask（单写者模型），并发 put 变长 value——若缓冲是 static 而非
+// thread_local，并发会数据竞争 / 串台；若跨 put 未正确 clear，变长 value 会读到
+// 残留字节。重开逐值校验 + TSan 守护。
+TEST_F(CrashRecoveryTest, ThreadLocalEncodedBufferNoCrossThreadInterference) {
+    namespace fs = std::filesystem;
+    constexpr int kThreads = 8;
+    constexpr int kPuts = 200;
+
+    // value 长度随 i 大幅变化（~10..310），强制缓冲反复 clear/扩缩。
+    auto value_for_tp = [](int tid, int i) {
+        std::string v = "T" + std::to_string(tid) + "_V" + std::to_string(i) + "_";
+        v.append(static_cast<std::size_t>(10 + (i * 7) % 300),
+                 static_cast<char>('a' + (tid % 26)));
+        return v;
+    };
+    auto key_for_tp = [](int tid, int i) {
+        return "t" + std::to_string(tid) + "_k" + std::to_string(i);
+    };
+
+    std::vector<fs::path> dirs(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        dirs[t] = tmpdir_ / ("thread_" + std::to_string(t));
+        std::error_code ec;
+        fs::create_directories(dirs[t], ec);
+    }
+
+    std::atomic<bool> ok{true};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&, t] {
+            CaskOptions opts;
+            opts.read_write = true;
+            auto c = Cask::open(dirs[t].string(), opts);
+            if (!c) { ok = false; return; }
+            for (int i = 0; i < kPuts; ++i) {
+                if (!(*c)->put(bytes(key_for_tp(t, i)), bytes(value_for_tp(t, i)),
+                               static_cast<std::uint32_t>(1000 + i))) {
+                    ok = false;
+                    return;
+                }
+            }
+            (*c)->close();
+        });
+    }
+    for (auto& w : workers) w.join();
+    ASSERT_TRUE(ok.load()) << "并发 put 失败";
+
+    // 逐 Cask 重开，校验每个 value 完整无串台。
+    for (int t = 0; t < kThreads; ++t) {
+        CaskOptions opts;
+        opts.read_write = true;
+        auto c = Cask::open(dirs[t].string(), opts);
+        ASSERT_TRUE(c) << "reopen thread_" << t << " failed";
+        for (int i = 0; i < kPuts; ++i) {
+            auto gr = (*c)->get_owned(bytes(key_for_tp(t, i)));
+            ASSERT_TRUE(gr) << "missing tid=" << t << " i=" << i;
+            std::string got(reinterpret_cast<const char*>(gr->value.data()),
+                            gr->value.size());
+            EXPECT_EQ(got, value_for_tp(t, i))
+                << "value 串台/残留 tid=" << t << " i=" << i;
+        }
+        (*c)->close();
+    }
 }
 
 }  // namespace

@@ -60,6 +60,34 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options($<$<CONFIG:Release>:-falign-functions=64>)
 endif()
 
+# ---------------------------------------------------------------------------
+# H1-H4 构建加固（栈保护 / FORTIFY / Full RELRO / PIE）。目录作用域——必须在
+# 任何 add_library/add_executable 之前设置（目录级编译/链接选项在 target 创建
+# 时固化）。sanitizer 构建按需排除 FORTIFY（与运行时 interceptor 冲突）。
+# ---------------------------------------------------------------------------
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # H1:栈溢出探测——strong 覆盖含数组/大局部对象/取址局部变量的函数
+    # （比默认 -fstack-protector 覆盖面大，开销可忽略）。全配置启用。
+    add_compile_options(-fstack-protector-strong)
+
+    # H3:Full RELRO——GOT 启动时全解析后置只读。默认链接仅 partial RELRO
+    # （有 GNU_RELRO 段但无 BIND_NOW）；-z,now 补齐 BIND_NOW。覆盖 .so + 可执行。
+    add_link_options(-Wl,-z,relro,-z,now)
+
+    # H2:_FORTIFY_SOURCE=2——glibc 对 memcpy/strcpy 等加边界检查。需 -O1+
+    # （Debug -O0 仅触发无效告警），且与 ASAN/TSan 运行时 interceptor 冲突，
+    # 故仅在优化的非 sanitizer 构建启用。先 -U 防发行版预定义导致重定义告警。
+    if("${BITCASK_SANITIZE}" STREQUAL "")
+        add_compile_options(
+            $<$<NOT:$<CONFIG:Debug>>:-U_FORTIFY_SOURCE>
+            $<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>)
+    endif()
+
+    # H4:可执行文件 PIE 已由顶部 CMAKE_POSITION_INDEPENDENT_CODE ON +
+    # CMP0083=NEW（cmake≥3.14，本项目要求 3.20）保证——migrate_le/gen_inert_table
+    # 实测为 DYN/PIE，无需额外 -pie。
+endif()
+
 # ⑰ 可选 -march=native（默认 OFF）。SIMD 内核本就运行时按 CPUID 派发，故
 # 通用构建故意不带 -march；此开关仅给「在部署机上现编」场景榨取 scalar glue
 # 的 ~3-8%（让非 SIMD 代码也用本机 ISA）。勿与 -ffast-math 混用：HNSW/int8
@@ -303,6 +331,22 @@ target_link_libraries(bitcask_text
     PRIVATE bitcask_warnings bitcask_sanitizers cppjieba
 )
 add_dependencies(bitcask_text generate_inert_table)
+
+# ---------------------------------------------------------------------------
+# H5:预编译头（PCH）——预编译重型 STL 公共头，编译时间 −20~30%。重型 TU
+# （cask/search/keydir/bm25/text）各自 PCH 同一组头（均共享 warnings/sanitizers
+# 选项 → flags 一致）。仅 STL 头入 PCH（恒可用、与各 TU 无冲突）。排查 PCH 相关
+# 编译异常时可 -DBITCASK_PCH=OFF 关闭。
+# ---------------------------------------------------------------------------
+option(BITCASK_PCH "预编译头加速编译（默认 ON）" ON)
+if(BITCASK_PCH)
+    set(_bitcask_pch_headers
+        <algorithm> <cstdint> <expected> <memory> <optional>
+        <span> <string> <string_view> <unordered_map> <vector>)
+    foreach(_t bitcask_cask bitcask_search bitcask_keydir bitcask_bm25 bitcask_text)
+        target_precompile_headers(${_t} PRIVATE ${_bitcask_pch_headers})
+    endforeach()
+endif()
 
 # ---------------------------------------------------------------------------
 # libbitcask 聚合 target（libbitcask.a + libbitcask.so）

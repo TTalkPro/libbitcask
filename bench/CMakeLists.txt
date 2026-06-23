@@ -27,6 +27,9 @@ add_executable(bitcask_bench
     hnsw_bench.cpp
     crc32_bench.cpp
     gate_bench.cpp
+    merge_bench.cpp          # B1
+    index_pool_bench.cpp     # B2
+    checkpoint_bench.cpp     # B4 （B3 扩展在 keydir_bench.cpp 内）
     bench_main.cpp
 )
 target_link_libraries(bitcask_bench
@@ -40,4 +43,5 @@ target_link_libraries(bitcask_bench
         bitcask_vector
         bitcask_format
         bitcask_warnings
+        TBB::tbb
 )

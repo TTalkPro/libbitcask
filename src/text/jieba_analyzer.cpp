@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -94,8 +95,10 @@ JiebaAnalyzer::JiebaAnalyzer(const std::string& dict_dir,
 auto JiebaAnalyzer::jieba_cut(std::string_view text) const
     -> std::vector<std::pair<std::string, std::uint32_t>>
 {
-    // cppjieba 接口要求 std::string，走一次拷贝。
-    std::string sentence(text);
+    // P5:cppjieba 接口要求 const std::string&，但缓冲可 thread_local 复用——
+    // 稳态零分配（每线程独立，S3 并行 analyze 安全）。
+    thread_local std::string sentence;
+    sentence.assign(text.data(), text.size());
     std::vector<cppjieba::Word> words;
     jieba_->jieba.CutForSearch(sentence, words, true);
 
@@ -125,25 +128,49 @@ auto JiebaAnalyzer::collect_tokens(std::string_view text, bool need_offsets) con
     if (text.empty()) return tokens;
 
     // Step 1: NFKC 归一化（n-gram 回退路径 + 高亮 offset 的统一坐标系）。
-    auto normalized = detail::nfkc_fold(text);
+    // P6:thread_local 复用归一化缓冲。函数内不重入，cps/term 引用它期间稳定；
+    // term 在末尾 copy-out，函数返回后无悬垂。每线程独立（S3 并行 analyze 安全）。
+    thread_local std::string normalized;
+    detail::nfkc_fold(text, normalized);
     if (normalized.empty()) return tokens;
 
     // Step 2: jieba CutForSearch 切词。
     auto jieba_words = jieba_cut(text);
 
     // Step 3: 在归一化文本上做 codepoint 分析（定位 jieba 词 + 检测未覆盖 CJK 段）。
-    auto cps = detail::to_codepoints(normalized);
+    // P4:thread_local 复用 codepoint 缓冲（与逐词 word_cps 用不同缓冲，避免别名）。
+    thread_local std::vector<detail::CpInfo> cps;
+    detail::to_codepoints(normalized, cps);
 
     std::uint32_t pos = 0;
     std::vector<bool> cjk_covered(cps.size(), false);
+
+    // P7:大文本时建「首码点 → cps 下标（升序）」倒排，把逐词定位从
+    // O(词数·cps长度) 的线扫降到 O(候选位置数)。小文本（≤阈值）naive 扫更省
+    // （免建表分配）。倒排按 k 升序 push → 候选天然升序 → 仍取首次匹配，语义不变。
+    constexpr std::size_t kIndexThreshold = 64;
+    const bool use_index = cps.size() > kIndexThreshold;
+    std::unordered_map<char32_t, std::vector<std::size_t>> cp_index;
+    bool index_built = false;
+    auto ensure_index = [&] {
+        if (index_built) return;
+        index_built = true;
+        cp_index.reserve(cps.size());
+        for (std::size_t k = 0; k < cps.size(); ++k) {
+            cp_index[cps[k].cp].push_back(k);
+        }
+    };
 
     // jieba 词：在归一化 cps 序列中定位，记录 byte 区间。
     // CutForSearch 会对同一段输出重叠的子词与全词（如"北京""大学""北京大学"），
     // 其顺序与文本位置并不单调，故不能用单调游标定位——每个词独立从头查找
     // 首次匹配。同词多次出现时高亮取首次位置（高亮为尽力而为，非索引正确性）。
+    // P4/P6:thread_local 复用逐词归一化 / codepoint 缓冲（与全文 cps 用不同缓冲）。
+    thread_local std::string word_norm;
+    thread_local std::vector<detail::CpInfo> word_cps;
     for (auto& [word, _] : jieba_words) {
-        auto word_norm = detail::nfkc_fold(word);
-        auto word_cps = detail::to_codepoints(word_norm);
+        detail::nfkc_fold(word, word_norm);
+        detail::to_codepoints(word_norm, word_cps);
         if (word_cps.empty()) continue;
 
         // S9.26：jieba CutForSearch 偶尔把空格/标点也输出为词，过滤掉纯噪声词
@@ -175,12 +202,24 @@ auto JiebaAnalyzer::collect_tokens(std::string_view text, bool need_offsets) con
         // 词的 O(cps长度) 扫描（S9 复审：S9.9 把高亮开销带进了索引路径）。
         std::size_t found = cps.size();
         if (has_cjk || need_offsets) {
-            for (std::size_t si = 0; si + word_cps.size() <= cps.size(); ++si) {
-                bool match = true;
+            auto match_at = [&](std::size_t si) -> bool {
+                if (si + word_cps.size() > cps.size()) return false;
                 for (std::size_t wi = 0; wi < word_cps.size(); ++wi) {
-                    if (cps[si + wi].cp != word_cps[wi].cp) { match = false; break; }
+                    if (cps[si + wi].cp != word_cps[wi].cp) return false;
                 }
-                if (match) { found = si; break; }
+                return true;
+            };
+            if (use_index) {
+                ensure_index();
+                if (auto it = cp_index.find(word_cps[0].cp); it != cp_index.end()) {
+                    for (std::size_t si : it->second) {  // 升序候选，取首个全匹配
+                        if (match_at(si)) { found = si; break; }
+                    }
+                }
+            } else {
+                for (std::size_t si = 0; si + word_cps.size() <= cps.size(); ++si) {
+                    if (match_at(si)) { found = si; break; }
+                }
             }
         }
 
