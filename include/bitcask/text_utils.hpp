@@ -96,8 +96,10 @@ struct CpInfo {
     std::size_t byte_len;
 };
 
-[[nodiscard]] inline std::vector<CpInfo> to_codepoints(std::string_view text) {
-    std::vector<CpInfo> cps;
+// P4:出参版——复用 caller 的缓冲（clear 保留容量），热路径稳态零分配。
+// 多线程并发调用安全（只写 out，无共享状态）；caller 用 thread_local 复用。
+inline void to_codepoints(std::string_view text, std::vector<CpInfo>& cps) {
+    cps.clear();
     cps.reserve(text.size() / 2);
     std::size_t off = 0;
     while (off < text.size()) {
@@ -114,7 +116,28 @@ struct CpInfo {
         cps.push_back({cp, off, consumed});
         off += consumed;
     }
+}
+
+[[nodiscard]] inline std::vector<CpInfo> to_codepoints(std::string_view text) {
+    std::vector<CpInfo> cps;
+    to_codepoints(text, cps);
     return cps;
+}
+
+// P4:thread_local 复用版——返回对每线程复用缓冲的引用，分词热路径稳态零分配。
+// 并发安全（thread_local 每线程独立；S3 恢复的 parallel analyze 各线程互不干扰）。
+// ⚠️ 同一线程不可同时持有两份返回引用（会别名同一缓冲）——分词器每次只用一份。
+[[nodiscard]] inline const std::vector<CpInfo>& to_codepoints_reuse(
+    std::string_view text) {
+    thread_local std::vector<CpInfo> tls;
+    to_codepoints(text, tls);
+    // 防膨胀:一次超大文本后不让缓冲长期占住线程内存（对齐 read_buf 策略）。
+    // size 是本次内容、capacity 是历史峰值；峰值远超阈值且本次很小才回收。
+    constexpr std::size_t kRetain = 1u << 16;  // 65536 CpInfo
+    if (tls.capacity() > kRetain && tls.size() <= kRetain) {
+        tls.shrink_to_fit();  // 收到 size()（≤kRetain），内容保留
+    }
+    return tls;
 }
 
 [[nodiscard]] inline bool is_cjk_punct(char32_t cp) noexcept {

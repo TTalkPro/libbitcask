@@ -97,7 +97,9 @@ private:
     [[nodiscard]] std::expected<void, DataFileFault> flush_pending();
 
     // 攒满多少字节就 flush 一次（hint 可重建，丢缓冲只触发 fold(data) 回退）。
-    static constexpr std::size_t kFlushBytes = 64 * 1024;
+    // P2:64KiB→1MiB——merge/active 写 hint 的 pwrite 次数 16×↓。hint 非 WAL，
+    // 加大缓冲只增大「崩溃丢 hint → fold(data) 回退」的窗口，不影响正确性。
+    static constexpr std::size_t kFlushBytes = 1024 * 1024;
 
     io::PosixFile file_;
     std::string   path_;

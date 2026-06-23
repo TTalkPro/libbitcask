@@ -169,14 +169,24 @@
 
 > 可穿插在任何阶段做。
 
-- [ ] **P1 `merge_policy::cap_size` 无条件分配 vector** — `src/merge/merge_policy.cpp:146-164`
-  - `max_merge_size==0` 时 `return files;`（const ref → copy）；改 `return {}` 让 caller 自查。
-- [ ] **P2 HintFile `kFlushBytes` 64KB → 1MB** — `include/bitcask/hint_file.hpp:95`
-  - merge 时 hint flush 次数 16×↓。
-- [ ] **P3 `nfkc_fold` ASCII fast path 仍 std::string 拷贝** — `include/bitcask/text_utils.hpp:68-74`
-  - 大多数索引文本以 ASCII 为主；in-place 或返回 `string_view`。
-- [ ] **P4 `to_codepoints` 必堆分配 vector** — `include/bitcask/text_utils.hpp:99-118`
-  - 改出参 `vector<CpInfo>& out` 或 `thread_local` 复用。
+- [~] **P1 `merge_policy::cap_size` 无条件分配 vector** — `src/merge/merge_policy.cpp:146-164`
+  - **跳过（语义风险）**：`max_merge_size==0`/size 不匹配时返回 `{}` 会让「空=无 cap」
+    与「空=无文件可 merge」语义混淆，需 caller 配合自查——为省一次（merge 决策频率，
+    非热路径）vector 拷贝换语义歧义不划算。保留现状。
+- [x] **P2 HintFile `kFlushBytes` 64KB → 1MB** — `include/bitcask/hint_file.hpp`
+  - **已完成（2026-06-23）**：常量改 `1024*1024`。merge/active 写 hint 的 pwrite 次数
+    16×↓。hint 非 WAL（可重建），加大缓冲只增大「崩溃丢 hint → fold(data) 回退」窗口，
+    不影响正确性。Release 445/445 通过。
+- [ ] **P3 `nfkc_fold` ASCII fast path 仍 std::string 拷贝** — `include/bitcask/text_utils.hpp`
+  - 暂留：fast path 必须返回 owning string（要 tolower），拷贝固有；省拷贝需改 API
+    （string_view + caller 保活 / in-place），lifetime 复杂、收益边际。低优先。
+- [x] **P4 `to_codepoints` 必堆分配 vector** — `include/bitcask/text_utils.hpp`、`src/text/analyzer.cpp`
+  - **已完成（2026-06-23）**：加出参版 `to_codepoints(text, out&)` + `to_codepoints_reuse()`
+    （thread_local 复用 + 防膨胀 shrink 守卫，对齐 read_buf 策略）。Ngram/Whitespace
+    分词 3 处热点改 `const auto& cps = to_codepoints_reuse(normalized)`——分词热路径
+    稳态零 codepoint 分配。并发安全（thread_local 每线程独立），S3 并行 analyze 下
+    **TSan 零 race**。Release 445/445（含 analyzer/jieba/stemming/docvalue）。
+    jieba 的 to_codepoints（嵌套用法）未迁移，归 P5-P7 一并处理。
 - [ ] **P5 Jieba `jieba_cut` 多余 `std::string(sentence)` 拷贝** — `src/text/jieba_analyzer.cpp:97-99`
   - 检查 cppjieba 是否接受 string_view。
 - [ ] **P6 Jieba 输出词再走一次 NFKC + codepoint** — `src/text/jieba_analyzer.cpp:144-146`

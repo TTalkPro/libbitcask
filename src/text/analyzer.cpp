@@ -170,7 +170,7 @@ auto NgramAnalyzer::analyze_with_positions(std::string_view text) const -> TermP
     auto normalized = detail::nfkc_fold(text);
     if (normalized.empty()) return {};
 
-    auto cps = detail::to_codepoints(normalized);
+    const auto& cps = detail::to_codepoints_reuse(normalized);  // P4:thread_local 复用
     if (cps.empty()) return {};
 
     // W1：内部以 string_view 去重，仅在末尾对每个唯一 term 分配一次 std::string。
@@ -274,7 +274,7 @@ auto WhitespaceAnalyzer::analyze_with_positions(std::string_view text) const -> 
     auto normalized = detail::nfkc_fold(text);
     if (normalized.empty()) return {};
 
-    auto cps = detail::to_codepoints(normalized);
+    const auto& cps = detail::to_codepoints_reuse(normalized);  // P4:thread_local 复用
     if (cps.empty()) return {};
 
     TermPositionsMap tpm;
@@ -315,7 +315,7 @@ auto WhitespaceAnalyzer::analyze_with_offsets(std::string_view text) const -> Te
     auto normalized = detail::nfkc_fold(text);
     if (normalized.empty()) return {};
 
-    auto cps = detail::to_codepoints(normalized);
+    const auto& cps = detail::to_codepoints_reuse(normalized);  // P4:thread_local 复用
     if (cps.empty()) return {};
 
     TermTokenMap ttm;
