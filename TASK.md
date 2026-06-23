@@ -45,11 +45,18 @@
   - 防膨胀：buf > 1 MiB 时 fold 结尾 `clear()+shrink_to_fit()`。
   - 全量 439/439 ctest 通过。
 
-- [ ] **R3 多数据文件 fold 串行** — `src/cask/cask.cpp:752-855`
-  - 现状：`for (file : entries) df->fold(...)` 完全串行；keydir 分片锁本就支持并发写。
-  - 改法：`std::async` 或 worker pool 并行 fold N 文件、按 tstamp 序合并入 keydir。
-  - 收益：**大库多文件冷启动 ~N× 加速**（N = 数据文件数；典型 8-32）。
-  - 风险：中（需保证 tstamp 顺序、keydir 并发正确、错误传播）。
+- [x] **R3 多数据文件 fold 串行** — `src/cask/cask.cpp:752-855`
+  - **已完成（2026-06-23）**：per-file fold 抽成 `fold_one(e)`，纯 KV 恢复
+    （`search_layer==null`）且文件数 > 1 时用 worker pool（`hardware_concurrency`
+    上限、原子计数器分发）并行 fold；结果数组收集错误统一传播。
+  - **并发正确性论证**：keydir 冲突解析按 `(file_id, tstamp, offset)` LWW，与到达
+    序无关（`put_overwrite`）；`update_fstats` 全程无锁原子累加；cold-start 期
+    `keyfolders_==0` → 新 key 直入分片 `entries`（不触 `meta_mu_`），256 分片提供
+    真并发；`increment_file_id_at_least`/`advance_ord`/`biggest_file_id_` 均原子。
+  - **search_layer 存在时仍串行**（HNSW 单写者 + BM25 ord 序约束属 S3 域）。
+  - 验证：新增 `MultiFileParallelFoldRecovers`（多文件 + 跨文件覆盖校验 LWW），
+    Release 全量 440/440 ctest 通过；**TSan 插桩跑该测试零 data race**。
+  - 收益：纯 KV 大库多文件冷启动 ~min(N, 核数)× 加速。
 
 ### 索引/写入吞吐
 
@@ -59,16 +66,23 @@
   - 无 API 变更；`WhitespaceAnalyzer`/`JiebaAnalyzer` 不受影响。
   - 全量 439/439 ctest 通过（含 analyzer/search_layer/docvalue/jieba/stemming）。
 
-- [ ] **W2 `IndexTask::make` fields 参数双重拷贝 + vec/meta assign 拷贝** — `include/bitcask/thread_pool.hpp:86-107`、`src/cask/cask.cpp:1505-1513`
-  - 现状：(a) `make()` 取 `fields_` by value；`task_fields()` 是 prvalue 但 copy-initialize 参数（非 move）。(b) `task.vec.assign(begin, end)` / `task.meta.assign(...)` 是拷贝。
-  - 改法：(a) `fields_&&` + caller `std::move(task_fields())`；(b) vec/meta 改 `std::move` 或换 `std::span`（caller 保活到 flush）。
-  - 收益：**每个 put_doc 省 1~3 次堆分配 + 1~2 次大拷贝**（128-dim vec = 512B）。
-  - 风险：低（move 语义标准；span 方案需审计 caller lifetime）。
+- [x] **W2 `IndexTask::make` fields 参数双重拷贝 + vec/meta assign 拷贝** — `include/bitcask/thread_pool.hpp:86-107`、`src/cask/cask.cpp:1505-1513`
+  - **已完成（2026-06-23）**：cosine 路径 `vec_out` 是本地 `vec_norm` 的 span，
+    encode（`parts.vector`）用完后直接 `task.vec = std::move(vec_norm)`，省一次
+    512B（128-dim）拷贝 + 分配；passthrough/L2 仍按需 `assign`。
+  - **(a) make() fields 经核实非双重拷贝**：`task_fields()` 是 prvalue，传入
+    by-value 参数 C++17 强制 elision → 仅一次构造，随后 `std::move` 入 `t.fields`；
+    原审计「copy-initialize」描述不确，无可省拷贝，未改签名（避免无收益 churn）。
+  - **meta 仍 assign**：`doc` 是 `const DocInput&`，不可移动；无 API 变更下属固有拷贝。
+  - 验证：Release 440/440 ctest 通过。
+  - 风险：低（move 语义标准）。
 
-- [ ] **W3 `IndexPool::flush()` 自旋 `yield()` 浪费 CPU** — `include/bitcask/thread_pool.hpp:199-201`
-  - 现状：`while (pending_.load(acquire) > 0) std::this_thread::yield();`——`pending_` cache line 在 flusher 与 worker 间来回弹。
-  - 改法：加 `std::condition_variable cv_` + `std::mutex`；worker `fetch_sub` 后若归 0 则 `notify`；`flush()` wait on cv。
-  - 收益：flush 路径 CPU 占用 **−5~15%**（merge / close 场景显现）。
+- [x] **W3 `IndexPool::flush()` 自旋 `yield()` 浪费 CPU** — `include/bitcask/thread_pool.hpp:199-201`
+  - **已完成（2026-06-23）**：加 `std::mutex flush_mu_` + `std::condition_variable
+    flush_cv_`；worker 的两处 `pending_` 减 1 统一走 `dec_pending()`，`fetch_sub`
+    返回 1（即归 0）时持锁 `notify_all`；`flush()` 在锁下 `wait` 谓词 `pending_==0`
+    （锁下复查 + worker notify 同持锁 → 无丢失唤醒）。仅归零时取锁，重负载罕见。
+  - 验证：Release 440/440 ctest 通过；TSan 插桩 thread_pool/crash 路径无新 race。
   - 风险：低（cv 语义严格强于 spin）。
 
 ---
@@ -201,12 +215,27 @@
 **下一波建议（按依赖关系）**：
 
 1. ~~**C4 + C5** ← 收尾正确性问题~~ ✅ 完成（2026-06-22）
-2. **R1 + R2 + W1** ← 高 ROI 性能（启动 + 索引热路径，**最高优先级**）
-3. **T2 + T3** ← C1 / checkpoint 的回归保护（必加测试）
-4. **R3 + W2 + W3** ← 需 R1/W1 基础
+2. ~~**R1 + R2 + W1** ← 高 ROI 性能（启动 + 索引热路径）~~ ✅ 完成（2026-06-23）
+3. ~~**T2 + T3** ← C1 / checkpoint 的回归保护~~ ✅ 完成
+4. ~~**R3 + W2 + W3** ← 需 R1/W1 基础~~ ✅ 完成（2026-06-23）
 5. **S1 - S5** ← 结构性优化，依赖第五梯队的 batch/zero-copy 基础
 6. **P1 - P7** 按需穿插
 7. **T4 - T6、B1 - B4、H1 - H5、CI3** 长期推进
 
-> **关键决策点**：所有「生产正确性」问题已清空（C1-C5 全部落地）。
-> 下一波最高 ROI：R1/R2/W1——大库冷启动 −30~50%，索引吞吐显著提升。
+> **关键决策点**：第五梯队（R1-R3 + W1-W3）全部落地，纯 KV 冷启动并行化完成。
+> 下一波：S1-S5 结构性优化（batch API / merge 批量 write / recovery 流水线 /
+> checkpoint reserve+memcpy / zstd），或先补 X1（下方）这一发现项。
+
+## 待办：本轮发现（2026-06-23 TSan 跑出）
+
+- [ ] **X1 `Cask::close()` 释放 keydir 后存活的 iterator → UAF** — 既有问题，非本轮引入
+  - 现象：TSan 插桩 `CrashRecoveryTest.MidPutRestartFoldsCorrectly` 报
+    heap-use-after-free：测试在 `it = make_iter()`（line 128）后调 `(*c)->close()`
+    （line 158，reset keydir shared_ptr），随后 `it` 析构 → `IterHandle::release`
+    → `BarrierGuard` 锁已释放的 keydir mutex。
+  - 已核实**在 clean tree（无本轮改动）同样复现**——纯生命周期序问题，与 R3
+    并行 fold 无关（fold 线程在 open 返回前已 join）。Release/ASAN 未暴露（释放
+    内存恰未被复用）。CI 的 TSan matrix 一旦实跑（CI2）即会拦下。
+  - 改法二选一：(a) 库侧——`close()` 校验无存活 IterHandle 或让 iterator 持
+    keydir shared_ptr 延长生命周期；(b) 测试侧——iterator 作用域先于 close 结束。
+  - 风险：低；属正确性收尾，建议与 CI2 一起处理。

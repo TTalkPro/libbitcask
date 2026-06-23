@@ -3,6 +3,7 @@
 #include <signal.h>     // ::kill for stale-lock detection
 #include <unistd.h>     // ::getpid, ::unlink
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -767,9 +768,14 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         return 0;  // 快照不认识的文件(快照后新建/merge 产物)→ 全量 fold
     };
 
-    // 按 tstamp 升序遍历每个 data file。fold 顺序是关键：后写入的 entry
-    // 必须覆盖前面的，否则 keydir 重建出来会跟实际「最新值」不一致。
-    for (const auto& e : *entries) {
+    // R3:每个 data file 的 fold 抽成独立单元 fold_one(e)。纯 KV 恢复
+    // （search_layer==null）可并行——见函数尾部的并行调度。串行语义下
+    // 「按 tstamp 升序后写覆盖前写」仍成立；并行下 keydir 冲突解析按
+    // (file_id, tstamp, offset) LWW 与到达序无关（put_overwrite），fstats
+    // 全程无锁原子累加，cold-start 期 keyfolders_==0 故新 key 直入分片
+    // entries（不触 meta_mu_），256 分片提供真并发。
+    auto fold_one =
+        [&](const fileops::DataFileEntry& e) -> std::expected<void, CaskFault> {
         // 把 keydir 的 biggest_file_id 推到至少这个文件的 id——保证后续
         // 分配新 file_id 时不会跟磁盘上已有的文件冲突。
         keydir_->increment_file_id_at_least(static_cast<std::uint32_t>(e.tstamp));
@@ -803,7 +809,7 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                 }
             }
         }
-        if (used_hint) continue;
+        if (used_hint) return {};
 
         // Fallback：fold 整个 data file。tolerate_crc_errors=true 让单条
         // 损坏的 record 跳过而不是中断整个文件加载——legacy 也是这语义。
@@ -872,6 +878,51 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                 (void)wdf->truncate_to(last_valid_end);  // best-effort
             }
         }
+        return {};
+    };
+
+    // 调度：search_layer 存在时 HNSW 单写者 + BM25 ord 序约束，必须串行
+    // （批量化/流水线属 S3）。纯 KV 恢复且文件数 > 1 时并行 fold——
+    // worker 各取一文件，原子计数器分发，结果数组收集错误后统一传播。
+    const std::size_t nfiles = entries->size();
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    const std::size_t nworkers =
+        std::min<std::size_t>(nfiles, hw);
+
+    if (search_layer != nullptr || nfiles <= 1 || nworkers <= 1) {
+        for (const auto& e : *entries) {
+            if (auto r = fold_one(e); !r) return std::unexpected(r.error());
+        }
+        return {};
+    }
+
+    std::vector<std::expected<void, CaskFault>> results(nfiles);
+    std::atomic<std::size_t> next{0};
+    // RAII join guard：emplace_back 抛异常时已创建的 worker 会被析构自动
+    // join——裸 vector<std::thread> 在此场景会让 joinable 线程触发
+    // std::terminate，把可恢复的资源耗尽升级为崩溃。join 幂等（joinable
+    // 检查），与下方显式 join 共存无重复 join。
+    struct JoiningPool {
+        std::vector<std::thread> threads;
+        ~JoiningPool() {
+            for (auto& t : threads) if (t.joinable()) t.join();
+        }
+    } pool;
+    pool.threads.reserve(nworkers);
+    for (std::size_t t = 0; t < nworkers; ++t) {
+        pool.threads.emplace_back([&] {
+            for (;;) {
+                std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= nfiles) break;
+                results[i] = fold_one((*entries)[i]);
+            }
+        });
+    }
+    for (auto& t : pool.threads) t.join();
+
+    for (auto& r : results) {
+        if (!r) return std::unexpected(r.error());
     }
     return {};
 }
@@ -1528,7 +1579,14 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
                          doc.text.size()),
         persisted->file_id, persisted->offset, persisted->total_size, tstamp, 0,
         task_fields());
-    task.vec.assign(vec_out.begin(), vec_out.end());
+    // W2:cosine 路径 vec_out 是 vec_norm 的 span，encode（上方 parts.vector）
+    // 已用完，可直接移交，省一次 512B（128-dim）拷贝 + 分配。其余情形
+    // （passthrough / L2）vec_out 指向 doc.vector，仍需拷贝。
+    if (!vec_out.empty() && vec_out.data() == vec_norm.data()) {
+        task.vec = std::move(vec_norm);
+    } else if (!vec_out.empty()) {
+        task.vec.assign(vec_out.begin(), vec_out.end());
+    }
     task.meta.assign(doc.meta.begin(), doc.meta.end());
     submit_index_task(std::move(task));
     if (auto r = maybe_group_commit(); !r) return std::unexpected(r.error());

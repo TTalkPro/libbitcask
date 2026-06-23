@@ -20,8 +20,10 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -198,10 +200,15 @@ public:
     }
 
     // 等待所有已提交任务被 worker 消费完毕。
+    // W3:cv 替代自旋 yield。原自旋让 pending_ cache line 在 flusher 与
+    // worker 间反复弹跳并空耗 CPU；改为阻塞等待，worker 把 pending_ 减到
+    // 0 时 notify。谓词在锁下复查规避丢失唤醒（worker 的 notify 也持同
+    // 一锁），cv 语义严格强于 spin。
     void flush() {
-        while (pending_.load(std::memory_order_acquire) > 0) {
-            std::this_thread::yield();
-        }
+        std::unique_lock<std::mutex> lk(flush_mu_);
+        flush_cv_.wait(lk, [this] {
+            return pending_.load(std::memory_order_acquire) == 0;
+        });
     }
 
     bool is_stopped() const {
@@ -221,18 +228,29 @@ private:
                 while (queue_.try_pop(remaining)) {
                     if (remaining.op == IndexOp::Sentinel) continue;
                     consumer(remaining);
-                    pending_.fetch_sub(1, std::memory_order_release);
+                    dec_pending();
                 }
                 break;
             }
             consumer(task);
-            pending_.fetch_sub(1, std::memory_order_release);
+            dec_pending();
+        }
+    }
+
+    // pending_ 减 1；归 0 时持锁 notify 唤醒 flush()。仅在真正归零时取锁，
+    // 重负载下队列非空，notify 罕见，无额外争用。
+    void dec_pending() {
+        if (pending_.fetch_sub(1, std::memory_order_release) == 1) {
+            std::lock_guard<std::mutex> lk(flush_mu_);
+            flush_cv_.notify_all();
         }
     }
 
     std::thread worker_;
     std::atomic<bool> stopped_{false};
     std::atomic<std::size_t> pending_{0};
+    std::mutex flush_mu_;
+    std::condition_variable flush_cv_;
     IndexTaskQueue   queue_;
 };
 

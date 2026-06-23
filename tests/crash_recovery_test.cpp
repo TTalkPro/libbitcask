@@ -230,4 +230,70 @@ TEST_F(CrashRecoveryTest, TornWriteTruncated) {
     }
 }
 
+// R3:多数据文件纯 KV 冷启动并行 fold。小 max_file_size 强制滚动出多个
+// data 文件，触发 load_keydir_from_disk 的并行路径（search_layer==null）。
+// 含跨文件覆盖（同 key 多版本）以校验并行下 (file_id,tstamp,offset) LWW
+// 冲突解析与到达序无关——最后写入的值必胜。
+TEST_F(CrashRecoveryTest, MultiFileParallelFoldRecovers) {
+    constexpr int kN = 400;
+    // ~100B 值，4 KiB 文件 → 每文件 ~30 record，共 ~13 个 data 文件。
+    auto big_value = [](int i) {
+        std::string v = value_for(i);
+        v.resize(100, 'x');
+        return v;
+    };
+
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        opts.max_file_size = 4096;
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c) << c.error().detail;
+
+        std::uint32_t ts = 1000;
+        // 第一轮：全部写入旧值（故意写错的 value，稍后被覆盖）。
+        for (int i = 0; i < kN; ++i) {
+            auto pr = (*c)->put(bytes(key_for(i)), bytes("STALE_VERSION"), ts++);
+            ASSERT_TRUE(pr) << pr.error().detail;
+        }
+        // 第二轮：用更高 tstamp 覆盖成正确值，跨越多个后续文件。
+        for (int i = 0; i < kN; ++i) {
+            auto pr = (*c)->put(bytes(key_for(i)), bytes(big_value(i)), ts++);
+            ASSERT_TRUE(pr) << pr.error().detail;
+        }
+        (*c)->close();
+    }
+
+    // 应当滚出多个 data 文件，否则没测到并行路径。
+    int data_files = 0;
+    for (const auto& e : std::filesystem::directory_iterator(tmpdir_)) {
+        const std::string name = e.path().filename().string();
+        if (name.size() > 13 &&
+            name.compare(name.size() - 13, 13, ".bitcask.data") == 0) {
+            ++data_files;
+        }
+    }
+    ASSERT_GT(data_files, 1) << "expected multiple data files to exercise "
+                                "parallel fold";
+
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        opts.max_file_size = 4096;
+        auto c = Cask::open(tmpdir_.string(), opts);
+        ASSERT_TRUE(c) << "parallel reopen failed: " << c.error().detail;
+
+        for (int i = 0; i < kN; ++i) {
+            auto gr = (*c)->get_owned(bytes(key_for(i)));
+            ASSERT_TRUE(gr) << "key " << key_for(i) << " missing after reopen";
+            EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(
+                                           gr->value.data()),
+                                       gr->value.size()),
+                      big_value(i))
+                << "LWW resolution wrong under parallel fold for " << key_for(i);
+        }
+        (*c)->close();
+    }
+}
+
 }  // namespace
