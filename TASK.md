@@ -109,11 +109,22 @@
   - 收益：冷启动索引重建 **~2× 加速**（CPU bound 部分）。
   - 风险：中（需保证 ord 顺序一致）。
 
-- [ ] **S4 Checkpoint / keydir 序列化：reserve + memcpy 替代 N 次 vector::insert** — `src/search/search_layer.cpp:803-812`、`src/keydir/keydir.cpp:1082-1089`
-  - 现状：每个字段一次 `buf.insert(end, p, p+n)`；vector 多次 realloc。
-  - 改法：预估总长 `reserve()` 一次，后续 `memcpy` 到 `data() + offset`。
-  - 收益：docmap/keydir save 路径 **5M insert → 1 reserve + 5M memcpy**。
-  - 风险：低（size 可计算）。
+- [x] **S4 Checkpoint / keydir 序列化：reserve + memcpy 替代 N 次 vector::insert** — `src/search/search_layer.cpp`、`src/keydir/keydir.cpp`
+  - **已完成（2026-06-23）**：核心问题是 **reallocation churn**（从零/低估容量起几何
+    增长，GB 级 buffer 累计搬运 ~2× 终态字节），非 `insert` 本身——trivial 元素
+    的 end-`insert(end,p,p+n)` 在容量足够时即编译为 memcpy。故修复 = 精确 reserve：
+    - `keydir.cpp save_snapshot`：旧 `64 + entries_total*56`（按 ~18B 均长 key，长 key
+      反复 realloc）→ 一次算出 `头+标量+fstats+watermarks+entries(38/条)+key 字节+crc`。
+      变长 key 段用增量维护的 `key_bytes_` 原子（put +/remove −；快照点 keyfolders_==0
+      全 SingleEntry 时即 live key 字节总和），**免去对 entries 的第二趟随机遍历**
+      （大 keydir 下二次遍历可能比省下的 realloc 还贵）。
+    - `search_layer.cpp serialize_docmap`：原 **完全无 reserve** → 按 `index_.info()
+      .live_docs`（O(1) 计数器）预留 `28 + live*(34+48)`（34B 固定行 + ext 估值）。
+  - reserve 偏差只影响容量（偏小→个别 realloc，偏大→略浪费），**绝不溢出 / 不影响
+    正确性**；故未改用裸指针 cursor（溢出风险换边际收益不划算）。
+  - 验证：Release 441/441 ctest 通过（含 keydir snapshot 与 search.ckpt 全量 round-trip：
+    MidPut/TornWrite/MultiFileParallelFold 写读快照 + CheckpointRecovery 全 4 例）。
+  - 风险：低（纯容量预留，行为不变）。
 
 - [ ] **S5 Checkpoint 可选 zstd 压缩** — `src/search/search_layer.cpp:998-1109`
   - 现状：docmap/bm25/hnsw payload 全部原始序列化，大库可达 GB 级。
@@ -163,18 +174,26 @@
     `(*c)->close()` 后调 `it->release()` 再 `it.reset()` 的 case，验证显式
     release 序（`iter_->release()` → `iter_.reset()` → `keydir_pin_.reset()`）
     下 KeyDir 仍存活。低成本，TSan 跑一次即可。
-- [ ] **T8 X1 多 iterator 并发 pin KeyDir** — `tests/crash_recovery_test.cpp`（追加）
-  - 同一 Cask 上 `make_iter()` × N，全部 start 后 close()，逐个 reset。
-    验证 shared_ptr 引用计数在并发/交错析构下正确，KeyDir 在最后一个 iterator
-    释放前始终存活。中等成本（需 TSan 验证无 race）。
-- [ ] **T9 iterator `next()` after close() 的契约澄清** — 文档 + 测试
-  - X1 修了析构路径 UAF，但 `CaskIter::parent_` 仍是裸 `Cask*`：close() 后
-    若继续 `it->next()`（read_file 经 parent_->read_files_，已被 close 清空）
-    行为未定义。这是 pre-existing 问题，X1 未恶化也未修复。
-  - 决策二选一：(a) 文档化「close 后 iterator 仅可析构，不可推进」并在
-    next() 加 `if (!parent_->keydir_) return unexpected` 防御；(b) 让 iterator
-    自带 read_file 缓存（接近 S13 的 pin_files_），完全自洽。
-    倾向 (a)（成本低，契约清晰）；(b) 留作后续 S 梯队的 zero-copy 重构。
+- [ ] **T8 X1 多 iterator 交错 release → MultiEntry 折叠正确性** — `tests/crash_recovery_test.cpp`（追加）
+  - 同一 Cask 上 `make_iter() × N`，全部 start 后 close()，逐个 release/reset。
+    真正要测的不是 shared_ptr 引用计数（std lib 自洽），而是 KeyDir 内部协调：
+    `keyfolders_` 在每个 iterator release 时递减，**仅最后一个**（fetch_sub 返回 1）
+    触发 `apply_pending_to_entries_barrier` + `collapse_multi_entries_barrier`；
+    期间用另一活 iterator 做 `next()` 应看到一致快照（MultiEntry 链未折叠时
+    取链头 revision，折叠后取 SingleEntry）。中等成本，需 TSan 验证。
+- [ ] **T9 iterator ↔ Cask 对象生命周期契约文档化** — 文档 + 测试
+  - 核实结论：X1 已让 `it->next()` 在 `(*c)->close()` 后**实际可用**（不是 UB）。
+    CaskIter::next 访问点核实：`parent_->opts_.expiry_secs`（Cask 成员，close 不动）；
+    `iter_->next()` 走 IterHandle 的 KeyDir 裸指针（X1 pin 保活）；fallback
+    `parent_->read_file()` 会 lazy-open 新 fd（read_files_ 空但 map 有效，active_data_
+    null 有 null 检查）。原描述「close 后 next() 是 UB」不准确。
+  - 真问题（与 close() 正交）：`CaskIter::parent_` 是裸 `Cask*`——若用户销毁
+    Cask 对象本身（`c.reset()` 或离开作用域）而 iterator 仍存活，parent_ 悬空，
+    `next()` 访问 `parent_->opts_` 即 UAF。此契约问题 X1 未恶化也未修复。
+  - 决策二选一：(a) 文档化「iterator 析构必须先于 Cask 对象析构」+ 在 next()
+    加 `parent_->keydir_` 状态检查做礼貌性错误返回（非 UB 防护，仅UX）；
+    (b) iterator 持 `std::weak_ptr<Cask>` 或要求 caller 显式保活——重型改造，
+    留 S 梯队 zero-copy 重构一起做。倾向 (a)。
 
 ### Bench 缺失
 
@@ -240,9 +259,10 @@
 7. **P1 - P7** 按需穿插
 8. **T4 - T6、B1 - B4、H1 - H5、CI3** 长期推进
 
-> **关键决策点**：第五梯队（R1-R3 + W1-W3）全部落地 + X1 正确性收尾。
-> 下一波：S1-S5 结构性优化（batch API / merge 批量 write / recovery 流水线 /
-> checkpoint reserve+memcpy / zstd）。建议起手 **S4**（低风险、收益明确）。
+> **关键决策点**：第五梯队（R1-R3 + W1-W3）全部落地 + X1 正确性收尾 + S4 落地。
+> 剩余结构性优化：**S2**（merge 批量 pwrite，低-中风险、收益明确）、**S5**（checkpoint
+> zstd，低风险但引依赖）、**S1/S3**（batch API / recovery 流水线，中风险需设计）。
+> 建议下一步 **S2**（merge 吞吐，与既有 hint batching 对称，无新公共 API）。
 
 ## 待办：本轮发现（2026-06-23 TSan 跑出）
 

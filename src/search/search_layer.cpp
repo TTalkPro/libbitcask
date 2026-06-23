@@ -787,6 +787,12 @@ void sc_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
 bool SearchLayer::serialize_docmap(std::vector<std::uint8_t>& buf,
                                    std::uint64_t covers_next_ord) const {
     buf.clear();
+    // S4:预留容量。无 reserve 时从零起几何增长，GB 级 docmap 累计搬运 ~2×
+    // 终态字节。每行固定 34B（ord8+klen2+file_id4+offset8+total_sz4+tstamp4
+    // +doc_len4）+ 变长 ext_id；按 live_docs 预留固定段 + 48B/行 ext 估值，
+    // 常态零 realloc（偏小由几何增长兜底，reserve 仅设容量、绝不溢出）。
+    const std::uint64_t live = index_.info().live_docs;
+    buf.reserve(28 + static_cast<std::size_t>(live) * (34 + 48));
     sc_put32(buf, kSidecarMagic);
     sc_put32(buf, kSidecarVersion);
     sc_put64(buf, covers_next_ord);

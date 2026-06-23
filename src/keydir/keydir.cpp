@@ -1123,11 +1123,38 @@ bool KeyDir::save_snapshot(
         return false;  // 活跃 fold:MultiEntry 可能存在,放弃
     }
 
+    // S4:一次算出 payload 字节数 → reserve 一次，后续 snap_put* 的
+    // insert(end,…) 全程零 realloc（trivial 元素的 end-insert 即 memcpy）。
+    // 旧 `64 + entries_total*56` 按 ~18B 均长 key 估值，长 key 会反复 realloc
+    // （GB 级 keydir 累计搬运 ~2× 终态字节）。
+    //
+    // entries_total 用 size()（每分片 O(1)）。变长 key 段用 key_bytes_——它在
+    // put(+key.size) / remove(-key.size) 上增量维护，快照点 keyfolders_==0 且
+    // 全 SingleEntry（无 MultiEntry/pending）时即当前 live 全部 key 字节之和。
+    // 用它免去对 entries 的第二趟随机遍历（大 keydir 下可能比省下的 realloc
+    // 还贵）；偏差仅影响 reserve 容量（偏小→个别 realloc，偏大→略浪费），
+    // 绝不溢出、不影响正确性。
     std::size_t entries_total = 0;
     for (const auto& sh : shards_) entries_total += sh.entries.size();
 
+    const std::size_t fsz = fstats_size_.load(std::memory_order_acquire);
+    std::uint32_t fstats_n = 0;
+    for (std::size_t i = 0; i < fsz; ++i) {
+        if (fstats_[i].present.load(std::memory_order_relaxed)) ++fstats_n;
+    }
+
+    // 头(magic+ver=8)+5 标量(36)+fstats(4+52·n)+watermarks(4+12·m)
+    //   +entries(8 + 38/条 + key 字节)+crc(4)。
+    const std::size_t est_size =
+        8 + 36
+        + 4 + static_cast<std::size_t>(fstats_n) * 52
+        + 4 + watermarks.size() * 12
+        + 8 + entries_total * 38
+        + static_cast<std::size_t>(key_bytes_.load(std::memory_order_relaxed))
+        + 4;
+
     std::vector<std::uint8_t> buf;
-    buf.reserve(64 + entries_total * 56);
+    buf.reserve(est_size);
     snap_put32(buf, kSnapMagic);
     snap_put32(buf, kSnapVersion);
     const std::size_t payload_begin = buf.size();
@@ -1138,11 +1165,6 @@ bool KeyDir::save_snapshot(
     snap_put64(buf, key_count_.load(std::memory_order_relaxed));
     snap_put64(buf, key_bytes_.load(std::memory_order_relaxed));
 
-    const std::size_t fsz = fstats_size_.load(std::memory_order_acquire);
-    std::uint32_t fstats_n = 0;
-    for (std::size_t i = 0; i < fsz; ++i) {
-        if (fstats_[i].present.load(std::memory_order_relaxed)) ++fstats_n;
-    }
     snap_put32(buf, fstats_n);
     for (std::size_t i = 0; i < fsz; ++i) {
         const auto& f = fstats_[i];
