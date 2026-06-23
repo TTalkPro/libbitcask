@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "bitcask/cask.hpp"
+#include "bitcask/keydir_registry.hpp"
 #include "bitcask/search_layer.hpp"
 #include "bitcask/synonym_map.hpp"
 
@@ -18,6 +19,14 @@ namespace {
 namespace meta = bitcask::meta;
 namespace search = bitcask::search;
 namespace text = bitcask::text;
+
+// S6-P0-pre：open() 强制非空 registry。C API 是进程级 host——一个全局 registry
+// 共享给所有经本 FFI 打开的句柄（即「每个共享库实例一个全局 registry」生产形态）。
+// 同目录多次 open 共享同一 keydir（refcount），与既有 NIF host 语义一致。
+bitcask::keydir::KeyDirRegistry& c_api_registry() {
+    static bitcask::keydir::KeyDirRegistry reg;
+    return reg;
+}
 
 struct bitcask_impl_t {
     std::unique_ptr<bitcask::Cask> cask;
@@ -204,7 +213,7 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
         }
     }
 
-    auto result = bitcask::Cask::open(dirname, cpp_opts);
+    auto result = bitcask::Cask::open(dirname, cpp_opts, &c_api_registry());
     if (!result) {
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);

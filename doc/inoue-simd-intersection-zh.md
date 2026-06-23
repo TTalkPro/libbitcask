@@ -5,7 +5,6 @@
 > `intersect_scalar` `:22`，分发体 `:187`）、`inverted.cpp` 的 `run_must_intersect`
 > （lambda，`:1228`）。本文 §2 提出的 Inoue 块过滤 + SIMD 精确匹配**已落地为
 > 上述 u64 内核**；`intersect_u32` 内核已随 u32 收窄路径移除（§8.5）。
-> 前置阅读：`doc/bool-search-intersection-zh.md`。
 
 > **状态（2026-06-12 决策，见 §8.5）**：ord 恒为 u64，**u32 收窄路径已整体
 > 移除**——commit 08fbc92 起 `bool_search` 统一走 `intersect_u64`，
@@ -21,8 +20,7 @@
 
 - 每个块固定执行 7 次 `permutevar8x32` 旋转 + 8 次 `cmpeq` + 7 次 OR + LUT 压缩；
 - **不重叠的块也照跑完全套 SIMD**——浪费在非匹配区域上的指令不可忽略；
-- u64 扩展依赖「成对 u32 索引模拟 64 位 lane 移动」（见
-  `doc/bool-search-intersection-zh.md` §7.1），引入 PairLut（512B）+
+- u64 扩展依赖「成对 u32 索引模拟 64 位 lane 移动」，引入 PairLut（512B）+
   `permutevar8x32` 配对索引，代码复杂且难推理。
 
 ### 1.2 Inoue 方法的核心思想

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <bitcask/cask.hpp>
+#include <bitcask/keydir_registry.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -14,6 +15,14 @@
 #include <vector>
 
 namespace {
+
+// S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
+// 各用例用唯一目录名，互不冲突；同用例内 open→close→reopen 经 refcount 归零
+// 重新从盘加载，与旧 nullptr 行为等价。
+inline bitcask::keydir::KeyDirRegistry& test_registry() {
+    static bitcask::keydir::KeyDirRegistry reg;
+    return reg;
+}
 
 using bitcask::Cask;
 using bitcask::CaskOptions;
@@ -107,7 +116,7 @@ TEST_F(CheckpointRecoveryTest, CorruptSearchCheckpointFallsBackToFullFold) {
   const auto opts = make_search_options(kDim);
 
   {
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c) << "initial open failed: " << c.error().detail;
 
     for (int i = 0; i < kN; ++i) {
@@ -136,7 +145,7 @@ TEST_F(CheckpointRecoveryTest, CorruptSearchCheckpointFallsBackToFullFold) {
   }
 
   {
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c) << "reopen with corrupt search.ckpt failed: "
                    << c.error().detail;
 
@@ -175,7 +184,7 @@ TEST_F(CheckpointRecoveryTest, CorruptKeydirCheckpointFallsBackToFullFold) {
   {
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     for (int i = 0; i < kN; ++i) {
@@ -200,7 +209,7 @@ TEST_F(CheckpointRecoveryTest, CorruptKeydirCheckpointFallsBackToFullFold) {
   {
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c) << "reopen with corrupt kv.keydir.ckpt failed: "
                    << c.error().detail;
 
@@ -225,7 +234,7 @@ TEST_F(CheckpointRecoveryTest, MissingCheckpointFallsBackToFullFold) {
   {
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     for (int i = 0; i < kN; ++i) {
@@ -244,7 +253,7 @@ TEST_F(CheckpointRecoveryTest, MissingCheckpointFallsBackToFullFold) {
   {
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c) << "reopen with missing kv.keydir.ckpt failed: "
                    << c.error().detail;
 
@@ -275,7 +284,7 @@ TEST_F(CheckpointRecoveryTest,
   const auto opts = make_search_options(kDim);
 
   {
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     for (int i = 0; i < kFirst; ++i) {
       bitcask::DocInput doc;
@@ -290,7 +299,7 @@ TEST_F(CheckpointRecoveryTest,
   }
 
   {
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     for (int i = kFirst; i < kFirst + kSecond; ++i) {
       bitcask::DocInput doc;
@@ -319,7 +328,7 @@ TEST_F(CheckpointRecoveryTest,
   }
 
   {
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c) << "reopen with corrupt current search.ckpt failed: "
                    << c.error().detail;
 
@@ -363,7 +372,7 @@ TEST_F(CheckpointRecoveryTest, S3BatchedRecoveryMatchesSerial) {
 
   std::set<std::string> before;
   {
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c) << c.error().detail;
     for (int i = 0; i < kN; ++i) {
       bitcask::DocInput doc;
@@ -400,7 +409,7 @@ TEST_F(CheckpointRecoveryTest, S3BatchedRecoveryMatchesSerial) {
   fs::remove(search_ckpt);
 
   {
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c) << "reopen (batched fold recovery) failed: "
                    << c.error().detail;
 

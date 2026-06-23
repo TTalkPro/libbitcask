@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <bitcask/cask.hpp>
+#include <bitcask/keydir_registry.hpp>
 #include <bitcask/codec.hpp>
 #include <bitcask/data_file.hpp>  // parse_data_tstamp（S13 测试枚举 data 文件）
 #include <algorithm>
@@ -15,6 +16,14 @@
 
 namespace {
 
+// S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
+// 各用例用唯一目录名，互不冲突；同用例内 open→close→reopen 经 refcount 归零
+// 重新从盘加载，与旧 nullptr 行为等价。
+inline bitcask::keydir::KeyDirRegistry& test_registry() {
+    static bitcask::keydir::KeyDirRegistry reg;
+    return reg;
+}
+
 using bitcask::Cask;
 using bitcask::CaskOptions;
 using bitcask::GetResult;
@@ -22,6 +31,19 @@ using bitcask::GetResultView;  // V6.1
 using bitcask::search::SearchLayerConfig;
 using bitcask::search::SearchHit;
 using bitcask::text::AnalyzerType;
+
+// S6-P0-pre 契约护栏：open() 强制非空 registry，传 nullptr 必返 kInvalidOption。
+TEST(CaskRegistryContract, OpenWithNullRegistryReturnsInvalidOption) {
+    namespace fs = std::filesystem;
+    auto tmp = fs::temp_directory_path() / "bitcask_null_registry_test";
+    fs::remove_all(tmp);
+    CaskOptions opts;
+    opts.read_write = true;
+    auto r = Cask::open(tmp.string(), opts, nullptr);
+    ASSERT_FALSE(r);
+    EXPECT_EQ(r.error().kind, bitcask::CaskError::kInvalidOption);
+    fs::remove_all(tmp);
+}
 
 class CaskDocValueTest : public ::testing::Test {
 protected:
@@ -50,7 +72,7 @@ protected:
 TEST_F(CaskDocValueTest, PutGetRoundTrip) {
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     std::vector<std::byte> key{std::byte{'k'}, std::byte{'e'}, std::byte{'y'}};
@@ -72,7 +94,7 @@ TEST_F(CaskDocValueTest, PutGetRoundTrip) {
 TEST_F(CaskDocValueTest, PutGetRoundTripMultipleKeys) {
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     std::vector<std::byte> key1{std::byte{'a'}};
@@ -102,7 +124,7 @@ TEST_F(CaskDocValueTest, PutGetRoundTripMultipleKeys) {
 TEST_F(CaskDocValueTest, OrdMonotonicallyIncreasing) {
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     std::vector<std::byte> key{std::byte{'k'}};
@@ -125,7 +147,7 @@ TEST_F(CaskDocValueTest, OrdMonotonicallyIncreasing) {
 TEST_F(CaskDocValueTest, RemoveAndReinsert) {
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     std::vector<std::byte> key{std::byte{'k'}};
@@ -152,7 +174,7 @@ TEST_F(CaskDocValueTest, MetaFileCreatedOnOpen) {
     namespace fs = std::filesystem;
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     EXPECT_TRUE(fs::exists(tmpdir_ / "bitcask.meta"));
@@ -163,14 +185,14 @@ TEST_F(CaskDocValueTest, ModeMismatchKVVsSearch) {
     namespace fs = std::filesystem;
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     (*c)->close();
 
     CaskOptions search_opts;
     search_opts.read_write = true;
     search_opts.enable_search = true;
-    auto c2 = Cask::open(tmpdir_.string(), search_opts);
+    auto c2 = Cask::open(tmpdir_.string(), search_opts, &test_registry());
     ASSERT_FALSE(c2);
     EXPECT_EQ(c2.error().kind, bitcask::CaskError::kModeMismatch);
 }
@@ -180,13 +202,13 @@ TEST_F(CaskDocValueTest, ModeMismatchSearchVsKV) {
     CaskOptions search_opts;
     search_opts.read_write = true;
     search_opts.enable_search = true;
-    auto c = Cask::open(tmpdir_.string(), search_opts);
+    auto c = Cask::open(tmpdir_.string(), search_opts, &test_registry());
     ASSERT_TRUE(c);
     (*c)->close();
 
     CaskOptions opts;
     opts.read_write = true;
-    auto c2 = Cask::open(tmpdir_.string(), opts);
+    auto c2 = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_FALSE(c2);
     EXPECT_EQ(c2.error().kind, bitcask::CaskError::kModeMismatch);
 }
@@ -194,7 +216,7 @@ TEST_F(CaskDocValueTest, ModeMismatchSearchVsKV) {
 TEST_F(CaskDocValueTest, DocValueEncodingVerified) {
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     std::vector<std::byte> key{std::byte{'t'}, std::byte{'e'}, std::byte{'s'}, std::byte{'t'}};
@@ -204,7 +226,7 @@ TEST_F(CaskDocValueTest, DocValueEncodingVerified) {
     (*c)->close();
 
     // 重新打开后 get 仍然能正确解码 DocValue
-    auto c2 = Cask::open(tmpdir_.string(), opts);
+    auto c2 = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c2);
 
     auto gr = (*c2)->get_owned(key);
@@ -226,7 +248,7 @@ TEST_F(CaskDocValueTest, SearchTextAfterPut) {
     sl_cfg.analyzer_config.max_n = 3;
     opts.search_config = sl_cfg;
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     EXPECT_TRUE((*c)->has_search());
 
@@ -266,7 +288,7 @@ TEST_F(CaskDocValueTest, MultiFieldPutAndSearch) {
     sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
     opts.search_config = sl_cfg;
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     auto bytes = [](std::string_view s) {
@@ -311,7 +333,7 @@ TEST_F(CaskDocValueTest, SearchTextEmptyAfterRemove) {
     sl_cfg.analyzer_config.max_n = 3;
     opts.search_config = sl_cfg;
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     std::vector<std::byte> key{std::byte{'k'}};
@@ -363,7 +385,7 @@ TEST_F(CaskMergeSearchTest, SearchSurvivesMerge) {
     auto opts = make_search_opts();
     opts.max_file_size = 32;
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     std::vector<std::byte> key_a{std::byte{'a'}};
@@ -379,7 +401,7 @@ TEST_F(CaskMergeSearchTest, SearchSurvivesMerge) {
 
     // 关闭后重新打开，恢复 SearchLayer
     (*c)->close();
-    c = Cask::open(tmpdir_.string(), opts);
+    c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     sr = (*c)->search_text("hello", 10);
@@ -419,7 +441,7 @@ TEST_F(CaskMergeSearchTest, MergeWithMultipleKeysAndSearch) {
     auto opts = make_search_opts();
     opts.max_file_size = 256;
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     std::vector<std::byte> k1{std::byte{'x'}};
@@ -453,7 +475,7 @@ TEST_F(CaskMergeSearchTest, MergeEliminatesDeletedDocs) {
     auto opts = make_search_opts();
     opts.max_file_size = 256;
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     std::vector<std::byte> key{std::byte{'z'}};
@@ -486,7 +508,7 @@ TEST_F(CaskMergeSearchTest, MergeUpdatesOverwrittenKey) {
     auto opts = make_search_opts();
     opts.max_file_size = 256;
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     std::vector<std::byte> key{std::byte{'m'}};
@@ -545,7 +567,7 @@ TEST_F(CaskUpgradeTest, UpgradeKVToIndex) {
     {
         CaskOptions opts;
         opts.read_write = true;
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
 
         auto k1 = bytes("key1");
@@ -583,7 +605,7 @@ TEST_F(CaskUpgradeTest, UpgradeKVToIndex) {
         opts.read_write = true;
         opts.enable_search = true;
         opts.search_config = search_cfg;
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
 
         auto sr2 = (*c)->search_text("hello", 10);
@@ -614,7 +636,7 @@ TEST_F(CaskUpgradeTest, UpgradeFailsOnAlreadyIndexMode) {
     SearchLayerConfig search_cfg;
     search_cfg.analyzer_config.type = AnalyzerType::Ngram;
     opts.search_config = search_cfg;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     (*c)->put(bytes("k"), bytes("v"));
     (*c)->close();
@@ -633,7 +655,7 @@ TEST_F(CaskUpgradeTest, UpgradePreservesDeletes) {
     {
         CaskOptions opts;
         opts.read_write = true;
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
 
         (*c)->put(bytes("keep"), bytes("kept value"));
@@ -677,7 +699,7 @@ TEST_F(CaskDocValueTest, MergeFailurePreservesKeyDirVisibility) {
     CaskOptions opts;
     opts.read_write = true;
     opts.max_file_size = 256;  // 强制 roll 出多个 data 文件
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     auto& cask = **c;
 
@@ -737,7 +759,7 @@ TEST_F(CaskDocValueTest, FoldSurvivesConcurrentMergeUnlink) {
     CaskOptions opts;
     opts.read_write = true;
     opts.max_file_size = 256;  // 强制 roll 出多个 data 文件
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     auto& cask = **c;
 
@@ -807,7 +829,7 @@ TEST_F(CaskDocValueTest, S2BatchedMergeManyRecordsRoundTrip) {
     opts.read_write = true;
     opts.max_file_size = 64 * 1024;  // 64 KiB → 滚出几十个 data 文件
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     auto& cask = **c;
 
@@ -861,7 +883,7 @@ TEST_F(CaskDocValueTest, S2BatchedMergeManyRecordsRoundTrip) {
 
     // 重开再验一次：从磁盘 fold/hint 重建 keydir 指向 merge 输出文件。
     cask.close();
-    auto c2 = Cask::open(tmpdir_.string(), opts);
+    auto c2 = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c2);
     for (const auto& [k, v] : expected) {
         auto gr = (*c2)->get_owned(k);
@@ -881,7 +903,7 @@ TEST_F(CaskDocValueTest, P6MmapViewSurvivesMergeUnlink) {
     opts.max_file_size = 256;  // 滚出多个 sealed 文件
     constexpr int N = 20;
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < N; ++i) {
             std::vector<std::byte> key{std::byte{'k'}, static_cast<std::byte>(i)};
@@ -891,7 +913,7 @@ TEST_F(CaskDocValueTest, P6MmapViewSurvivesMergeUnlink) {
         (*c)->close();
     }
     // reopen:此后所有 data 文件均 sealed,get 经 read_file 按需 mmap。
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     auto& cask = **c;
 
@@ -999,7 +1021,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotRoundTripEquivalence) {
     CaskOptions opts;
     opts.read_write = true;
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < 500; ++i) {
             const std::string k = "k" + std::to_string(i);
@@ -1016,7 +1038,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotRoundTripEquivalence) {
 
     auto collect = [&]() {
         std::map<std::string, std::string> m;
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         EXPECT_TRUE(c);
         for (int i = 0; i < 500; ++i) {
             const std::string k = "k" + std::to_string(i);
@@ -1046,7 +1068,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotStaleTailReplay) {
     const auto snap_old = tmpdir_ / "snap.old";
 
     {   // 会话 1
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < 200; ++i) {
             ASSERT_TRUE((*c)->put(sv_bytes("a" + std::to_string(i)),
@@ -1057,7 +1079,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotStaleTailReplay) {
     std::filesystem::copy_file(snap, snap_old);
 
     {   // 会话 2:新增 + 覆写 + 删除
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < 100; ++i) {
             ASSERT_TRUE((*c)->put(sv_bytes("b" + std::to_string(i)),
@@ -1071,7 +1093,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotStaleTailReplay) {
     std::filesystem::copy_file(snap_old, snap,
         std::filesystem::copy_options::overwrite_existing);
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     auto g = (*c)->get_owned(sv_bytes(std::string("b42")));
     ASSERT_TRUE(g);  // 会话 2 新键:尾部回放恢复
@@ -1089,7 +1111,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotCorruptFallsBackToFullFold) {
     CaskOptions opts;
     opts.read_write = true;
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < 300; ++i) {
             ASSERT_TRUE((*c)->put(sv_bytes("k" + std::to_string(i)),
@@ -1112,7 +1134,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotCorruptFallsBackToFullFold) {
         std::fclose(f);
     }
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < 300; ++i) {
             EXPECT_TRUE((*c)->get_owned(sv_bytes("k" + std::to_string(i)))) << i;
@@ -1122,7 +1144,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotCorruptFallsBackToFullFold) {
     // 截断注入。
     std::filesystem::resize_file(snap, std::filesystem::file_size(snap) / 3);
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < 300; ++i) {
             EXPECT_TRUE((*c)->get_owned(sv_bytes("k" + std::to_string(i)))) << i;
@@ -1149,7 +1171,7 @@ CaskOptions p3_search_opts() {
 TEST_F(CaskDocValueTest, SearchSnapshotFastReopen) {
     auto opts = p3_search_opts();
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < 200; ++i) {
             const std::string k = "k" + std::to_string(i);
@@ -1162,7 +1184,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotFastReopen) {
     }
     ASSERT_TRUE(std::filesystem::exists(tmpdir_ / "search.ckpt"));
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     auto sr = (*c)->search_text("banana", 300);
     ASSERT_TRUE(sr);
@@ -1179,7 +1201,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotStaleKeydirTailReplay) {
     const auto snap = tmpdir_ / "kv.keydir.ckpt";
     const auto snap_old = tmpdir_ / "kd.old";
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < 100; ++i) {
             ASSERT_TRUE((*c)->put(sv_bytes("a" + std::to_string(i)),
@@ -1189,7 +1211,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotStaleKeydirTailReplay) {
     }
     std::filesystem::copy_file(snap, snap_old);
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < 50; ++i) {
             ASSERT_TRUE((*c)->put(sv_bytes("b" + std::to_string(i)),
@@ -1201,7 +1223,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotStaleKeydirTailReplay) {
     std::filesystem::copy_file(snap_old, snap,
         std::filesystem::copy_options::overwrite_existing);
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     EXPECT_TRUE((*c)->get_owned(sv_bytes(std::string("b25"))));   // 尾部回放
     auto sr = (*c)->search_text("beta", 100);
@@ -1214,7 +1236,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotStaleKeydirTailReplay) {
 TEST_F(CaskDocValueTest, SearchSnapshotCorruptSidecarFallsBack) {
     auto opts = p3_search_opts();
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < 120; ++i) {
             ASSERT_TRUE((*c)->put(sv_bytes("k" + std::to_string(i)),
@@ -1225,7 +1247,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotCorruptSidecarFallsBack) {
     const auto sc = tmpdir_ / "search.ckpt";
     std::filesystem::resize_file(sc, std::filesystem::file_size(sc) / 2);
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     auto sr = (*c)->search_text("gamma", 200);
     ASSERT_TRUE(sr);
@@ -1261,7 +1283,7 @@ TEST_F(CaskDocValueTest, JiebaIndexModePutDoesNotCrash) {
     cfg.analyzer_config.dict_path = BITCASK_JIEBA_DICT_DIR;
     opts.search_config = cfg;
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);   // analyzer 为空时 open 现在干净失败，不再带病打开
     const std::string text =
         "BM25 全文检索 — 用 {analyzer, ...} 打开即可启用。\n"
@@ -1281,7 +1303,7 @@ TEST_F(CaskDocValueTest, P4GroupCommitWritesSurviveReopen) {
     opts.read_write = true;
     opts.sync_every_n = 3;  // 每 3 次写 fsync 一次
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < 10; ++i) {  // 10 % 3 = 1 条留给 close force-flush
             std::vector<std::byte> k{std::byte{'k'}, static_cast<std::byte>('0' + i)};
@@ -1290,7 +1312,7 @@ TEST_F(CaskDocValueTest, P4GroupCommitWritesSurviveReopen) {
         }
         (*c)->close();
     }
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     for (int i = 0; i < 10; ++i) {
         std::vector<std::byte> k{std::byte{'k'}, static_cast<std::byte>('0' + i)};
@@ -1307,7 +1329,7 @@ TEST_F(CaskDocValueTest, V31VectorRoundTripNormalized) {
     const float raw[4] = {3.0f, 4.0f, 0.0f, 0.0f};   // 模长 5
     std::vector<std::byte> key{std::byte{'k'}};
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         bitcask::DocInput doc;
         const std::string text = "hello vec";
@@ -1323,7 +1345,7 @@ TEST_F(CaskDocValueTest, V31VectorRoundTripNormalized) {
         (*c)->close();
     }
     // 重开(快照路径)后向量仍在(data file 为 source of truth)。
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     auto g = (*c)->get_owned(key);
     ASSERT_TRUE(g);
@@ -1341,7 +1363,7 @@ TEST_F(CaskDocValueTest, P3bQuantizedVectorRoundTripAndReopen) {
     const float raw[4] = {3.0f, 4.0f, 0.0f, 0.0f};  // 模长5 → cosine 归一化 0.6,0.8,0,0
     std::vector<std::byte> key{std::byte{'k'}};
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         bitcask::DocInput doc;
         const std::string text = "hello vec";
@@ -1356,7 +1378,7 @@ TEST_F(CaskDocValueTest, P3bQuantizedVectorRoundTripAndReopen) {
         (*c)->close();
     }
     {  // 重开（quantized 一致）→ 向量仍可读
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         auto g = (*c)->get_owned(key);
         ASSERT_TRUE(g);
@@ -1365,7 +1387,7 @@ TEST_F(CaskDocValueTest, P3bQuantizedVectorRoundTripAndReopen) {
         (*c)->close();
     }
     // 重开但 vector_quantized 不一致 → mode_mismatch
-    auto cbad = Cask::open(tmpdir_.string(), v31_opts(4));  // quantized=false
+    auto cbad = Cask::open(tmpdir_.string(), v31_opts(4), &test_registry());  // quantized=false
     ASSERT_FALSE(cbad);
     EXPECT_EQ(cbad.error().kind, bitcask::CaskError::kModeMismatch);
 }
@@ -1389,7 +1411,7 @@ TEST_F(CaskDocValueTest, P5bInmemInt8OpenSearchAndReopen) {
         ASSERT_TRUE(c.put_doc(sv_bytes(key), doc, 1000));
     };
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         put_vec(**c, k1, v1);
         put_vec(**c, k2, v2);
@@ -1409,7 +1431,7 @@ TEST_F(CaskDocValueTest, P5bInmemInt8OpenSearchAndReopen) {
     }
     // 重开(inmem_int8 一致)→ 全量 fold 重建 int8-only 图,search 仍命中。
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         auto r = (*c)->search_vector(std::span<const float>(q, 4), 3);
         ASSERT_TRUE(r);
@@ -1418,7 +1440,7 @@ TEST_F(CaskDocValueTest, P5bInmemInt8OpenSearchAndReopen) {
         (*c)->close();
     }
     // 重开但 inmem_int8 不一致(默认 false)→ mode_mismatch。
-    auto cbad = Cask::open(tmpdir_.string(), v31_opts(4));
+    auto cbad = Cask::open(tmpdir_.string(), v31_opts(4), &test_registry());
     ASSERT_FALSE(cbad);
     EXPECT_EQ(cbad.error().kind, bitcask::CaskError::kModeMismatch);
 }
@@ -1430,7 +1452,7 @@ TEST_F(CaskDocValueTest, P5bInmemInt8RejectsL2) {
     opts.vector_metric = bitcask::meta::VectorMetric::kL2;
     auto tmp = tmpdir_ / "i8l2";
     std::filesystem::create_directories(tmp);
-    auto c = Cask::open(tmp.string(), opts);
+    auto c = Cask::open(tmp.string(), opts, &test_registry());
     ASSERT_FALSE(c);
     EXPECT_EQ(c.error().kind, bitcask::CaskError::kInvalidOption);
 }
@@ -1442,7 +1464,7 @@ TEST_F(CaskDocValueTest, P5bInmemInt8ComposesWithQuantized) {
     opts.vector_quantized = true;
     const float v1[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     const float q[4]  = {2.0f, 0.0f, 0.0f, 0.0f};
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     bitcask::DocInput doc;
     const std::string text = "doc k1";
@@ -1478,7 +1500,7 @@ TEST_F(CaskDocValueTest, LegacyV1MetaRejectedCleanly) {
     // 经 Cask::open 也应失败(不静默读坏)。
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     EXPECT_FALSE(c) << "旧大端目录 open 必须失败,提示重建";
 }
 
@@ -1490,7 +1512,7 @@ TEST_F(CaskDocValueTest, P9ReadHandleCapEvictsAndRereads) {
         CaskOptions w;
         w.read_write = true;
         w.max_file_size = 64;
-        auto c = Cask::open(tmpdir_.string(), w);
+        auto c = Cask::open(tmpdir_.string(), w, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < N; ++i) {
             std::vector<std::byte> key{std::byte{'k'}, static_cast<std::byte>(i)};
@@ -1504,7 +1526,7 @@ TEST_F(CaskDocValueTest, P9ReadHandleCapEvictsAndRereads) {
     CaskOptions r;
     r.read_write = false;
     r.max_read_handles = 4;
-    auto c = Cask::open(tmpdir_.string(), r);
+    auto c = Cask::open(tmpdir_.string(), r, &test_registry());
     ASSERT_TRUE(c);
     for (int i = 0; i < N; ++i) {
         std::vector<std::byte> key{std::byte{'k'}, static_cast<std::byte>(i)};
@@ -1527,7 +1549,7 @@ TEST_F(CaskDocValueTest, P9ReadHandleCapEvictsAndRereads) {
     // cap=0 → 不限:读完所有文件后常驻句柄数 = 文件数(> 4)。
     CaskOptions u;
     u.read_write = false;  // max_read_handles 默认 0
-    auto c2 = Cask::open(tmpdir_.string(), u);
+    auto c2 = Cask::open(tmpdir_.string(), u, &test_registry());
     ASSERT_TRUE(c2);
     for (int i = 0; i < N; ++i) {
         std::vector<std::byte> key{std::byte{'k'}, static_cast<std::byte>(i)};
@@ -1542,7 +1564,7 @@ TEST_F(CaskDocValueTest, V31VectorValidation) {
     std::vector<std::byte> key{std::byte{'k'}};
     const std::string text = "t";
     {
-        auto c = Cask::open(tmpdir_.string(), v31_opts(4));
+        auto c = Cask::open(tmpdir_.string(), v31_opts(4), &test_registry());
         ASSERT_TRUE(c);
         bitcask::DocInput doc;
         doc.text = sv_bytes(text);
@@ -1562,7 +1584,7 @@ TEST_F(CaskDocValueTest, V31VectorValidation) {
     // 未配置向量的集合拒收向量(新目录,search 模式 dim=0)。
     auto tmp2 = tmpdir_ / "novec";
     std::filesystem::create_directories(tmp2);
-    auto c2 = Cask::open(tmp2.string(), p3_search_opts());
+    auto c2 = Cask::open(tmp2.string(), p3_search_opts(), &test_registry());
     ASSERT_TRUE(c2);
     bitcask::DocInput doc;
     doc.text = sv_bytes(text);
@@ -1577,19 +1599,19 @@ TEST_F(CaskDocValueTest, V31VectorValidation) {
 // 重开配置必须与 meta 一致:dim 改变 / 去掉向量配置 → kModeMismatch。
 TEST_F(CaskDocValueTest, V31MetaVectorMismatchOnReopen) {
     {
-        auto c = Cask::open(tmpdir_.string(), v31_opts(4));
+        auto c = Cask::open(tmpdir_.string(), v31_opts(4), &test_registry());
         ASSERT_TRUE(c);
         (*c)->close();
     }
-    auto bad_dim = Cask::open(tmpdir_.string(), v31_opts(8));
+    auto bad_dim = Cask::open(tmpdir_.string(), v31_opts(8), &test_registry());
     ASSERT_FALSE(bad_dim);
     EXPECT_EQ(bad_dim.error().kind, bitcask::CaskError::kModeMismatch);
 
-    auto no_vec = Cask::open(tmpdir_.string(), p3_search_opts());
+    auto no_vec = Cask::open(tmpdir_.string(), p3_search_opts(), &test_registry());
     ASSERT_FALSE(no_vec);
     EXPECT_EQ(no_vec.error().kind, bitcask::CaskError::kModeMismatch);
 
-    auto ok = Cask::open(tmpdir_.string(), v31_opts(4));
+    auto ok = Cask::open(tmpdir_.string(), v31_opts(4), &test_registry());
     EXPECT_TRUE(ok);
     if (ok) (*ok)->close();
 }
@@ -1615,7 +1637,7 @@ TEST_F(CaskDocValueTest, V33VectorSearchEndToEnd) {
     };
 
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         put_vec_doc(**c, k1, v1);
         put_vec_doc(**c, k2, v2);
@@ -1643,7 +1665,7 @@ TEST_F(CaskDocValueTest, V33VectorSearchEndToEnd) {
 
     // reopen:V3.3 向量集合强制全量 fold(HNSW 持久化是 V3.5)——
     // 恢复路径 recover_doc(…, vector) 重建图;k1 的墓碑令其仍被滤掉。
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     auto r = (*c)->search_vector(std::span<const float>(q, 4), 3);
     ASSERT_TRUE(r);
@@ -1663,7 +1685,7 @@ TEST_F(CaskDocValueTest, V33VectorSearchEndToEnd) {
     // 无向量配置的 search 集合 → kInvalidOption;KV 集合 → kNoIndex。
     auto tmp2 = tmpdir_ / "novec33";
     std::filesystem::create_directories(tmp2);
-    auto c2 = Cask::open(tmp2.string(), p3_search_opts());
+    auto c2 = Cask::open(tmp2.string(), p3_search_opts(), &test_registry());
     ASSERT_TRUE(c2);
     auto bad = (*c2)->search_vector(std::span<const float>(q, 4), 3);
     ASSERT_FALSE(bad);
@@ -1674,7 +1696,7 @@ TEST_F(CaskDocValueTest, V33VectorSearchEndToEnd) {
     std::filesystem::create_directories(tmp3);
     CaskOptions kv_opts;
     kv_opts.read_write = true;
-    auto c3 = Cask::open(tmp3.string(), kv_opts);
+    auto c3 = Cask::open(tmp3.string(), kv_opts, &test_registry());
     ASSERT_TRUE(c3);
     auto bad2 = (*c3)->search_vector(std::span<const float>(q, 4), 3);
     ASSERT_FALSE(bad2);
@@ -1687,7 +1709,7 @@ TEST_F(CaskDocValueTest, V33VectorSearchEndToEnd) {
 // 覆写:同 key 重写新向量后,旧向量必须不可达——key 只能经新向量的
 // 位置出现(旧 ord 翻死,新 ord 存活),且结果中恰出现一次。
 TEST_F(CaskDocValueTest, V34OverwriteVectorMovesKey) {
-    auto c = Cask::open(tmpdir_.string(), v31_opts(4));
+    auto c = Cask::open(tmpdir_.string(), v31_opts(4), &test_registry());
     ASSERT_TRUE(c);
     const float va[4] = {1.0f, 0.0f, 0.0f, 0.0f};   // k1 初版
     const float vb[4] = {0.0f, 0.0f, 1.0f, 0.0f};   // k1 覆写版(⊥ va)
@@ -1726,7 +1748,7 @@ TEST_F(CaskDocValueTest, V34OverwriteVectorMovesKey) {
 // 且与活集暴力真值一致——证"死节点留作图内路标"参与导航而不污染结果。
 TEST_F(CaskDocValueTest, V34DeadZoneNavigation) {
     constexpr std::size_t kDim = 8, kN = 300, kDead = 150, kTopK = 10;
-    auto c = Cask::open(tmpdir_.string(), v31_opts(kDim));
+    auto c = Cask::open(tmpdir_.string(), v31_opts(kDim), &test_registry());
     ASSERT_TRUE(c);
 
     std::mt19937 rng(0x5EED34);  // 固定种子可复现
@@ -1849,7 +1871,7 @@ TEST_F(CaskDocValueTest, V35SnapshotFastReopen) {
 
     std::vector<std::string> expect_keys;
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (std::size_t i = 0; i < 40; ++i) v35_put(**c, key_of(i), vecs[i]);
         (*c)->flush_index();
@@ -1871,7 +1893,7 @@ TEST_F(CaskDocValueTest, V35SnapshotFastReopen) {
 
     auto search_in = [&](const std::string& dir) {
         std::vector<std::string> keys;
-        auto c = Cask::open(dir, opts);
+        auto c = Cask::open(dir, opts, &test_registry());
         EXPECT_TRUE(c);
         if (!c) return keys;
         auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
@@ -1920,7 +1942,7 @@ TEST_F(CaskDocValueTest, V35StaleTailReplay) {
     const auto hs_old = tmpdir_ / "hs.old";
 
     {   // 会话 1:20 个向量文档。
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (std::size_t i = 0; i < 20; ++i) {
             v35_put(**c, "a" + std::to_string(i), vecs[i]);
@@ -1931,7 +1953,7 @@ TEST_F(CaskDocValueTest, V35StaleTailReplay) {
     std::filesystem::copy_file(hs_snap, hs_old);
 
     {   // 会话 2:再写 15 个。
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (std::size_t i = 20; i < 35; ++i) {
             v35_put(**c, "b" + std::to_string(i), vecs[i]);
@@ -1945,7 +1967,7 @@ TEST_F(CaskDocValueTest, V35StaleTailReplay) {
     std::filesystem::copy_file(hs_old, hs_snap,
         std::filesystem::copy_options::overwrite_existing);
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     auto q = v35_make_vecs(1, kDim, 0xFACE)[0];
     auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
@@ -1973,7 +1995,7 @@ TEST_F(CaskDocValueTest, V35CorruptFallsBack) {
 
     std::vector<std::string> expect_keys;
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (std::size_t i = 0; i < 30; ++i) {
             v35_put(**c, "k" + std::to_string(i), vecs[i]);
@@ -2000,7 +2022,7 @@ TEST_F(CaskDocValueTest, V35CorruptFallsBack) {
         std::fclose(f);
     }
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
                                      10, /*ef=*/256);
@@ -2009,7 +2031,7 @@ TEST_F(CaskDocValueTest, V35CorruptFallsBack) {
         (*c)->close();                              // 快照重写恢复健康
     }
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
                                      10, /*ef=*/256);
@@ -2033,7 +2055,7 @@ TEST_F(CaskDocValueTest, V35MergeRebuildEvictsDead) {
     };
 
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (std::size_t i = 0; i < kN; ++i) v35_put(**c, key_of(i), vecs[i]);
         (*c)->flush_index();
@@ -2043,7 +2065,7 @@ TEST_F(CaskDocValueTest, V35MergeRebuildEvictsDead) {
         (*c)->close();   // 放掉 active writer,merge 可吃全部文件
     }
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     (*c)->flush_index();
     // merge 前:图含全部 50 节点(死节点只是结果侧滤除)。
@@ -2076,7 +2098,7 @@ TEST_F(CaskDocValueTest, V35MergeRebuildEvictsDead) {
     (*c)->close();
 
     // 重开(merge 后快照/数据均只剩活集)仍一致。
-    auto c2 = Cask::open(tmpdir_.string(), opts);
+    auto c2 = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c2);
     auto r2 = (*c2)->search_vector(std::span<const float>(q.data(), kDim),
                                    10, /*ef=*/256);
@@ -2100,7 +2122,7 @@ TEST_F(CaskDocValueTest, V35ConcurrentSearchDuringRebuild) {
     };
 
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (std::size_t i = 0; i < kN; ++i) v35_put(**c, key_of(i), vecs[i]);
         (*c)->flush_index();
@@ -2110,7 +2132,7 @@ TEST_F(CaskDocValueTest, V35ConcurrentSearchDuringRebuild) {
         (*c)->close();
     }
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     std::atomic<bool> done{false};
@@ -2205,7 +2227,7 @@ constexpr double v36_rrf(int rank) { return 1.0 / (60.0 + rank); }
 //   序:d1(ord 小)→ d3 → d2 → d4。
 TEST_F(CaskDocValueTest, V36HybridRrfFusion) {
     auto opts = v31_opts(4);
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     v36_put_corpus(**c);
     const float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
@@ -2236,7 +2258,7 @@ TEST_F(CaskDocValueTest, V36HybridRrfFusion) {
 // 单路退化:text 空 → 等价纯向量(RRF 重打分 1/61..);vec 空 → 纯文本。
 TEST_F(CaskDocValueTest, V36HybridSingleLeg) {
     auto opts = v31_opts(4);
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     v36_put_corpus(**c);
     const float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
@@ -2271,7 +2293,7 @@ TEST_F(CaskDocValueTest, V36HybridErrors) {
     // 无向量配置的 search 集合。
     auto tmp_novec = tmpdir_ / "novec36";
     std::filesystem::create_directories(tmp_novec);
-    auto c1 = Cask::open(tmp_novec.string(), p3_search_opts());
+    auto c1 = Cask::open(tmp_novec.string(), p3_search_opts(), &test_registry());
     ASSERT_TRUE(c1);
     auto e1 = (*c1)->search_hybrid("x", std::span<const float>(q, 4), 10);
     ASSERT_FALSE(e1);
@@ -2283,7 +2305,7 @@ TEST_F(CaskDocValueTest, V36HybridErrors) {
     std::filesystem::create_directories(tmp_kv);
     CaskOptions kv_opts;
     kv_opts.read_write = true;
-    auto c2 = Cask::open(tmp_kv.string(), kv_opts);
+    auto c2 = Cask::open(tmp_kv.string(), kv_opts, &test_registry());
     ASSERT_TRUE(c2);
     auto e2 = (*c2)->search_hybrid("x", std::span<const float>(q, 4), 10);
     ASSERT_FALSE(e2);
@@ -2291,7 +2313,7 @@ TEST_F(CaskDocValueTest, V36HybridErrors) {
     (*c2)->close();
 
     // 向量集合:维度不符 / 双空。
-    auto c3 = Cask::open(tmpdir_.string(), v31_opts(4));
+    auto c3 = Cask::open(tmpdir_.string(), v31_opts(4), &test_registry());
     ASSERT_TRUE(c3);
     v36_put_corpus(**c3);
     const float wrong[2] = {1.0f, 0.0f};
@@ -2316,7 +2338,7 @@ TEST_F(CaskMergeSearchTest, DeletionRateTrigger) {
     opts.policy.deletion_rate_trigger = 50;  // 50% 死文档即触发
 
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         // 写 20 篇文档,每个 put 因 max_file_size 小而滚动新文件
         for (std::size_t i = 0; i < 20; ++i) {
@@ -2332,7 +2354,7 @@ TEST_F(CaskMergeSearchTest, DeletionRateTrigger) {
 
     // 对照组:不删任何文档 → needs_merge 不触发(文件小但无碎片)
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         auto nm = (*c)->needs_merge(3000);
         // 文件小且碎片低,deletion_rate = 0% < 50%,不应触发
@@ -2343,7 +2365,7 @@ TEST_F(CaskMergeSearchTest, DeletionRateTrigger) {
 
     // 删除 12 篇(60%)
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (std::size_t i = 0; i < 20; i += 2) {
             // 删除偶数位(0,2,4,...,18) = 10 篇
@@ -2362,7 +2384,7 @@ TEST_F(CaskMergeSearchTest, DeletionRateTrigger) {
 
     // 删除 60% → needs_merge 应触发(deletion_rate=60% >= 50%)
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         auto nm = (*c)->needs_merge(3000);
         EXPECT_TRUE(nm.needs) << "deletion_rate=60% should trigger merge";
@@ -2387,7 +2409,7 @@ TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
 
     // 写入 40 篇向量文档
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (std::size_t i = 0; i < kN; ++i) v35_put(**c, key_of(i), vecs[i]);
         (*c)->flush_index();
@@ -2396,7 +2418,7 @@ TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
 
     // 删除一半(偶数位)
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (std::size_t i = 0; i < kN; i += 2) {
             ASSERT_TRUE((*c)->remove(sv_bytes(key_of(i))));
@@ -2406,7 +2428,7 @@ TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
 
     // merge:V4 改为同步 rebuild + save search.ckpt
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         std::vector<std::string> files;
         for (const auto& e : std::filesystem::directory_iterator(tmpdir_)) {
@@ -2425,7 +2447,7 @@ TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
 
     // 关键验证:重开时 search.ckpt 存在,图大小 = 活节点数(非全量 fold 重建)
     {
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         // search.ckpt 被 merge 保存,open 时走快照路径,图大小 = kN/2
         EXPECT_EQ((*c)->search()->hnsw_size(), kN / 2);
@@ -2484,7 +2506,7 @@ std::unique_ptr<bitcask::meta::MetaFilter> make_eq_filter(
 // V5.1:文本搜索 + metadata filter
 TEST_F(CaskDocValueTest, V5SearchTextWithMetaFilter) {
     auto opts = p3_search_opts();
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     auto m_tech = make_meta_blob({{"category", std::string("tech")}, {"year", std::int64_t(2024)}});
@@ -2543,7 +2565,7 @@ TEST_F(CaskDocValueTest, V5SearchVectorWithMetaFilter) {
     auto m_a = make_meta_blob({{"group", std::string("a")}});
     auto m_b = make_meta_blob({{"group", std::string("b")}});
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     for (std::size_t i = 0; i < kN; ++i) {
         auto key = "v" + std::to_string(i);
@@ -2599,7 +2621,7 @@ TEST_F(CaskDocValueTest, V5NoMetaFilteredOut) {
     auto q = v35_make_vecs(1, kDim, 0xF00D)[0];
     auto m = make_meta_blob({{"tag", std::string("ok")}});
 
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     v5_put(**c, "v0", "doc v0", std::span<const float>(vecs[0].data(), kDim), m);
     bitcask::DocInput doc1;
@@ -2642,7 +2664,7 @@ TEST_F(CaskDocValueTest, V5NoMetaFilteredOut) {
 TEST_F(CaskDocValueTest, V61GetResultViewLifecycle) {
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     const std::string payload = "tsan-lifecycle-payload-1234567890";
@@ -2717,7 +2739,7 @@ TEST_F(CaskDocValueTest, V61GetResultViewLifecycle) {
 TEST_F(CaskDocValueTest, V61GetResultViewConcurrentReaders) {
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
 
     constexpr int kKeys = 64;
@@ -2775,7 +2797,7 @@ TEST(V61BatchFold, NextBatchReturnsMultiple) {
 
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir.string(), opts);
+    auto c = Cask::open(tmpdir.string(), opts, &test_registry());
     ASSERT_TRUE(c);
     auto& cask = **c;
 

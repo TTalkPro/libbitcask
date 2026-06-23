@@ -1,7 +1,7 @@
 # ord 回收复用：可行性分析与方案
 
-> 前置阅读：`vector-db-design-zh.md`（ord 模型）、`ord-density-analysis-zh.md`（gap 分析）、
-> `concurrency-zh.md`（锁与不变量）、`recovery-snapshot-design-zh.md`（快照恢复流程）
+> 前置阅读：`vector-db-design-zh.md`（ord 模型）、
+> `concurrency-zh.md`（锁与不变量）、`recovery-unified-checkpoint-design-zh.md`（快照恢复流程）
 > 状态：设计分析（含两条方案路径 + 结论建议）。**实现现状：方案 B（分块数组 +
 > merge 释放全死 chunk）已落地（§5）；方案 A（seq + ord 回收）未做，结论不变。**
 

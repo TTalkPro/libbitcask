@@ -14,10 +14,19 @@
 #include <vector>
 
 #include "bitcask/cask.hpp"
+#include <bitcask/keydir_registry.hpp>
 
 namespace fs = std::filesystem;
 
 namespace {
+
+// S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
+// 各用例用唯一目录名，互不冲突；同用例内 open→close→reopen 经 refcount 归零
+// 重新从盘加载，与旧 nullptr 行为等价。
+inline bitcask::keydir::KeyDirRegistry& test_registry() {
+    static bitcask::keydir::KeyDirRegistry reg;
+    return reg;
+}
 
 class TempDir {
 public:
@@ -50,7 +59,7 @@ static void BM_Merge_Throughput(benchmark::State& state) {
         bitcask::CaskOptions opts;
         opts.read_write = true;
         opts.max_file_size = 256 * 1024;  // 滚出多个 sealed 文件供 merge
-        auto c = bitcask::Cask::open(td.path(), opts);
+        auto c = bitcask::Cask::open(td.path(), opts, &test_registry());
         if (!c) { state.SkipWithError("open failed"); break; }
         auto& cask = **c;
         // 第一轮旧值（将变死）+ 第二轮覆写为活值 → 约一半记录是死记录。

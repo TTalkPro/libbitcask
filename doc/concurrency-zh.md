@@ -768,7 +768,6 @@ ctest --test-dir _build/tsan --output-on-failure
 **相关设计文档：**
 - doc/keydir-sharding-design-zh.md - 分片并发设计
 - doc/put-flow-zh.md - put 完整调用链
-- doc/unified-architecture-plan-zh.md - 统一架构计划
 
 ---
 

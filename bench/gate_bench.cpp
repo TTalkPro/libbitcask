@@ -22,6 +22,7 @@
 
 #include "bitcask/analyzer.hpp"
 #include "bitcask/cask.hpp"
+#include <bitcask/keydir_registry.hpp>
 #include "bitcask/detail/int8_kernels.hpp"
 #include "bitcask/highlighter.hpp"
 #include "bitcask/index.hpp"
@@ -39,6 +40,14 @@ using namespace bitcask::search;
 // ============================================================================
 
 namespace {
+
+// S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
+// 各用例用唯一目录名，互不冲突；同用例内 open→close→reopen 经 refcount 归零
+// 重新从盘加载，与旧 nullptr 行为等价。
+inline bitcask::keydir::KeyDirRegistry& test_registry() {
+    static bitcask::keydir::KeyDirRegistry reg;
+    return reg;
+}
 
 class TempDir {
 public:
@@ -206,7 +215,7 @@ static void BM_P7_DocTextLruHit(benchmark::State& state) {
     sc.doc_text_cache_max = n_docs;
     opts.search_config = sc;
 
-    auto c = Cask::open(td.path(), opts);
+    auto c = Cask::open(td.path(), opts, &test_registry());
     if (!c) { state.SkipWithError("open failed"); return; }
     auto& cask = **c;
 
@@ -254,7 +263,7 @@ static void BM_P7_SearchHighlightE2E_Warm(benchmark::State& state) {
     sc.doc_text_cache_max = 1024;
     opts.search_config = sc;
 
-    auto c = Cask::open(td.path(), opts);
+    auto c = Cask::open(td.path(), opts, &test_registry());
     if (!c) { state.SkipWithError("open failed"); return; }
     auto& cask = **c;
 
@@ -270,7 +279,7 @@ static void BM_P7_SearchHighlightE2E_Warm(benchmark::State& state) {
     cask.close();
 
     // Reopen — sealed files → mmap active, DocTextLru empty.
-    auto c2 = Cask::open(td.path(), opts);
+    auto c2 = Cask::open(td.path(), opts, &test_registry());
     if (!c2) { state.SkipWithError("reopen failed"); return; }
     auto& cask2 = **c2;
 
@@ -303,7 +312,7 @@ static void BM_P7_CaskGet_DocValueText(benchmark::State& state) {
     sc.analyzer_config.type = AnalyzerType::Whitespace;
     opts.search_config = sc;
 
-    auto c = Cask::open(td.path(), opts);
+    auto c = Cask::open(td.path(), opts, &test_registry());
     if (!c) { state.SkipWithError("open failed"); return; }
     auto& cask = **c;
 
@@ -316,7 +325,7 @@ static void BM_P7_CaskGet_DocValueText(benchmark::State& state) {
     cask.close();
 
     // Reopen → sealed files → mmap path.
-    auto c2 = Cask::open(td.path(), opts);
+    auto c2 = Cask::open(td.path(), opts, &test_registry());
     if (!c2) { state.SkipWithError("reopen failed"); return; }
     auto& cask2 = **c2;
 
@@ -350,7 +359,7 @@ static void BM_P7_CaskGet_QuantizedVec(benchmark::State& state) {
     sc.vector_dim = dim;
     opts.search_config = sc;
 
-    auto c = Cask::open(td.path(), opts);
+    auto c = Cask::open(td.path(), opts, &test_registry());
     if (!c) { state.SkipWithError("open failed"); return; }
     auto& cask = **c;
 
@@ -375,7 +384,7 @@ static void BM_P7_CaskGet_QuantizedVec(benchmark::State& state) {
     cask.close();
 
     // Reopen → sealed files → mmap path + dequant on get.
-    auto c2 = Cask::open(td.path(), opts);
+    auto c2 = Cask::open(td.path(), opts, &test_registry());
     if (!c2) { state.SkipWithError("reopen failed"); return; }
     auto& cask2 = **c2;
 

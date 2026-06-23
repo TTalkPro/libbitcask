@@ -1,8 +1,8 @@
 # V3:HNSW 向量检索设计(定稿待实施)
 
 > 前置阅读:`vector-db-design-zh.md`(可行性探索与总体定位)、
-> `recovery-snapshot-design-zh.md`(A4 快照体系,本设计的持久化模板)、
-> `keydir-sharding-design-zh.md` §6(锁序纪律)。
+> `recovery-unified-checkpoint-design-zh.md`(checkpoint 体系 + 附录 A 快照模板,
+> 本设计的持久化模板)、`keydir-sharding-design-zh.md` §6(锁序纪律)。
 > 边界讨论结论(2026-06-12,与 owner 定稿):引擎**只收向量不算向量**。
 
 ## 1. 边界与配置(已定稿,不再讨论)

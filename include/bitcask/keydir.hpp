@@ -313,7 +313,7 @@ public:
         return next_ord_.load(std::memory_order_relaxed);
     }
 
-    // ---- A4:keydir 段快照(open 加速;设计 doc/recovery-snapshot-design-zh.md)----
+    // ---- A4:keydir 段快照(open 加速;设计 doc/recovery-unified-checkpoint-design-zh.md 附录 A)----
     // dump 当前内存态 + 调用方给的 per-file 字节水位。有活跃 fold
     // (MultiEntry 可能存在)时拒绝并返回 false(快照是纯优化)。
     // 线程安全: 是(写者闸门屏障 + meta unique;屏障期间读者照常并发)。

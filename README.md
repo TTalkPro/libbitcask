@@ -111,8 +111,11 @@ cmake --install build        # 头文件、libbitcask.{so,a}、bitcask_c.h
 #include <bitcask/cask.hpp>
 
 using bitcask::Cask, bitcask::CaskOptions;
+using bitcask::keydir::KeyDirRegistry;
 
-auto c = Cask::open("/tmp/db", CaskOptions{.read_write = true});
+// registry 强制非空：管理同目录 Cask 间的共享 keydir（典型：每进程一个）。
+KeyDirRegistry registry;
+auto c = Cask::open("/tmp/db", CaskOptions{.read_write = true}, &registry);
 assert(c);
 
 std::vector<std::byte> key{std::byte{'h'}, std::byte{'i'}};
@@ -142,7 +145,8 @@ opts.search_config = SearchLayerConfig{
 opts.vector_dim    = 128;                                       // 启用向量
 opts.vector_metric = meta::VectorMetric::kCosineNormalized;     // 写入端归一化
 
-auto c = Cask::open("/tmp/db", opts);
+KeyDirRegistry registry;
+auto c = Cask::open("/tmp/db", opts, &registry);
 assert(c && (*c)->has_search());
 
 std::vector<std::byte> key{'d'_b, '1'_b};
@@ -237,7 +241,7 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 | [`format-zh.md`](doc/format-zh.md) | 字节级格式 |
 | [`concurrency-zh.md`](doc/concurrency-zh.md) | 锁与并发 |
 | [`hnsw-design-zh.md`](doc/hnsw-design-zh.md) | HNSW 设计 |
-| [`unified-architecture-plan-zh.md`](doc/unified-architecture-plan-zh.md) | 统一架构规划 |
+| [`recovery-unified-checkpoint-design-zh.md`](doc/recovery-unified-checkpoint-design-zh.md) | 恢复 / checkpoint 设计 |
 
 ---
 

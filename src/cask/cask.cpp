@@ -417,6 +417,11 @@ Cask::upgrade(std::string_view dirname,
 std::expected<std::unique_ptr<Cask>, CaskFault>
 Cask::open(std::string_view dirname, const CaskOptions& opts,
             keydir::KeyDirRegistry* registry) {
+    // S6-P0-pre：registry 强制非空（双池归属 registry，无 nullptr fallback）。
+    if (registry == nullptr) {
+        return std::unexpected(err(CaskError::kInvalidOption,
+            "open() requires a non-null KeyDirRegistry"));
+    }
     auto cask = std::make_unique<Cask>();
     cask->dirname_ = std::string(dirname);
     cask->opts_    = opts;
@@ -728,7 +733,7 @@ void Cask::close() noexcept {
     }
 }
 
-// A4:写 keydir 段快照(best-effort,设计 doc/recovery-snapshot-design-zh.md)。
+// A4:写 keydir 段快照(best-effort,设计 doc/recovery-unified-checkpoint-design-zh.md 附录 A)。
 // 水位 = 各 data 文件当前磁盘大小,**先于** dump 捕获(尾部回放重叠区
 // 幂等,方向安全);调用点都在写者静止处(close / merge 末尾)。
 void Cask::write_keydir_snapshot() noexcept {

@@ -3,7 +3,7 @@
 > 动机数据:`BM_KeyDir_Mixed_MultiThreaded`(90% get + 10% put 覆写):
 > 1t 23.6M ops/s → 8t **0.22M ops/s(-100×)**。M5.3 实测结论:锁类型
 > 无解(临界区亚微秒,锁字 cache-line ping-pong 主导),唯一出路是
-> 让不同 key 不共享锁字。障碍清单初版见 cpp-optimization-zh.md §8.2。
+> 让不同 key 不共享锁字。
 
 ## 1. 结构
 

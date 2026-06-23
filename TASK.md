@@ -91,19 +91,11 @@
 
 > 建议第五梯队落地后再做（部分有依赖关系）。
 
-- [ ] **S1 `submit_index_task_batch`（仅索引入队批量化，不碰 data WAL）** — `src/cask/cask.cpp`、`include/bitcask/thread_pool.hpp`
-  - 🚫 **WAL 红线**：data 文件是 WAL，put 路径每条 record 必须**立刻 pwrite 落盘**，
-    **绝不可** buffered 缓冲写（= ⑪ 否决项）。故 `put_doc_batch` **不得**把 data 写
-    走 `write_buffered`/`batch_buf_`；S2 的批量写**只**适用 merge 输出（非 WAL）。
-  - 现状：每 `put_doc` 单独 `index_pool_->submit`（`pending_.fetch_add(1)` + 单条入队）。
-  - 合法改法（仅内存侧）：`IndexPool::submit_batch(vector<IndexTask>)`——`pending_.fetch_add(N)`
-    一次 + 循环 push（tbb 队列无原生 batch push）。data 写仍逐条 immediate pwrite，
-    fsync 仍按 `sync_every_n`/`o_sync` 既有组提交策略，不变。
-  - 收益：**有限**——单 IndexPool worker 串行消费是吞吐上限，入队批量化只省
-    producer 侧 N−1 次 atomic RMW + 调用开销，非 2-5×（原估值含 data 批写，已作废）。
-  - 风险：低（纯内存入队；无 API durability 语义变更）。
-  - **决策**：收益有限，优先级下调；若做仅做内存入队批量化，公共 `put_doc_batch`
-    可选（其 data 写逐条 durable，仅省入队/encode 开销）。
+- [⛔] **S1 `submit_index_task_batch`（仅索引入队批量化）** — **被 S6 取代，否决**
+  - 原结论：入队批量化只省 producer 侧 N−1 次 atomic RMW，**碰不到消费端单 worker
+    串行瓶颈**（收益有限）。
+  - **被 S6 取代**：S6 直接解掉「单 worker 串行消费」这个真瓶颈（并行 analyze），
+    S1 的入队批量化在 S6 架构下无独立价值。详见 `docs/design/async-index-pipeline.md`。
 
 - [x] **S2 Merger 批量 `write`（每条 pwrite → 累积 N 条一次 pwrite）** — `src/merge/merger.cpp`、`src/fileops/data_file.cpp`
   - **已完成（2026-06-23）**：`DataFile` 新增 `write_buffered()` + `flush_batch()`：
@@ -162,6 +154,62 @@
   - 改法：section header 加 `compression` 标志（0=raw, 1=zstd）；zstd level 1（2-4× 压缩比，~1GB/s）。
   - 收益：checkpoint 文件体积 **−50~70%**；冷启动 I/O 减少。
   - 风险：低（向后兼容：旧文件 compression=0）。
+
+- [ ] **S6 异步索引 MapReduce 流水线（全局双池）** — 设计稿 `docs/design/async-index-pipeline.md`
+  - **背景**：当前每库一个 `IndexPool` 单 worker，把 analyze（CPU 重，纯函数）与
+    insert（改共享索引，必串行）焊死 → ① 热点库吞吐被单 worker 锁死；② 库数不定
+    → 常驻 worker 线程随库数线性膨胀。S1（入队批量化）碰不到瓶颈，已被本条取代。
+  - **目标**：G1 热点库 analyze 并行吃满多核；G2 索引线程数与库数解耦（≈2×核数）；
+    G3 与现串行 worker **字节等价**；G4 不削弱任何现有不变量（LWW/墓碑序/durability/checkpoint）。
+  - **架构**：全局共享 **Map 池**（并行分词，纯函数）+ 全局共享 **Reduce 池**
+    （per-库串行车道：reorder buffer 按 ord 序 apply + per-库 apply 锁）。
+  - **核心约束（设计稿 §3 F4∧F5）**：当前正确性 = 单写线程让「到达序==ord序」⇒
+    到达序 LWW 等价 ord 序 LWW。analyze 一并行则完成序乱 → **必须 reorder buffer
+    把 apply 拗回 ord 序**（否则被删 key 复活）。乱序脆弱点**仅** `ext2ord_` 一行
+    （设计稿 §9.1）。
+  - **决策（设计稿 §14，已定稿 2026-06-23）**：D1 **策略 A**（reorder buffer，按 ord 序
+    apply，不改 index 核心）/ D2 **registry 级 + registry 强制**（open 无 registry 报错，
+    无 fallback）/ D3 N=核数·M≤4 / D4 reorder in-flight 上限待 bench / D5 接受慢分词队头
+    阻塞致该库可见性短暂延迟 / D6 单写契约不放宽。
+
+  - [x] **S6-P0-pre registry 强制化（纯 API 硬化）** — `include/bitcask/cask.hpp`、`src/cask/cask.cpp`、`c_api/bitcask_c.cpp`、`tests/`、`bench/`
+    - **已完成（2026-06-23）**：`Cask::open()` **移除 `=nullptr` 默认** + 顶部 null 校验
+      返回 `kInvalidOption`（双保险，编译期 + 运行期）。
+    - **迁移 151 处调用点**（4 测试文件 132 + 3 bench 文件 19）：各文件匿名 namespace
+      加 `test_registry()` 静态局部 registry 访问器，Python 平衡括号注入器统一注入
+      `&test_registry()`（含 `v31_opts(4)` 等嵌套括号正确处理）。
+    - **C API**（真生产调用方，原传 nullptr）：加进程级 `c_api_registry()` 全局 registry
+      —— 即「每共享库实例一个全局 registry」生产形态。
+    - **行为等价性**：测试共享 registry 对「open→close→reopen」经 refcount 归零重载等价；
+      read_write 双开撞 write.lock 本不可能 → 无同目录并发共享风险。全量 **452/452 通过**。
+    - 新增契约护栏 `CaskRegistryContract.OpenWithNullRegistryReturnsInvalidOption`。
+    - 文档同步：README / doc/api-cpp.md 的 open 签名与示例。
+  - [ ] **S6-P0 重构（无行为变更）** — `src/search/search_layer.cpp`
+    - `on_write_fields` 拆 `map_analyze()`（纯：analyze + catch-all 合并下推，产
+      `ReduceJob`）+ `reduce_apply()`（锁下：add_doc/put_doc/HNSW/set_meta）。
+    - **仍同线程顺序调用**，`recover_*` 复用 `map_analyze`。
+    - 验收：全量 ctest **逐字节不变** + TSan 零 race。← 先把最高风险的逻辑拆分单独验证。
+  - [ ] **S6-P1 reorder buffer（仍单 worker，map 仍同步）** — `include/bitcask/thread_pool.hpp`
+    - worker 走 `map → reorder buffer → reduce`；新增 `IndexOp::Skip`，单写线程在
+      alloc_ord 后对每个 ord 发真任务或 Skip（填 ord 空洞，防 buffer 永久 stall）。
+    - per-库 `next_apply_ord` + `pending` map，严格按 ord 升序 apply。
+    - `flush()` → `flush(lib)`：等 `applied_ord >= submitted_ord_hwm`（重定义 §7.4，
+      复核 close/checkpoint/merge/search 四依赖点）。
+    - 验收：AT3（空洞不 stall）+ AT4（flush 追平）+ 结果不变。
+  - [ ] **S6-P2 Map 池并行（拿到 G1）** — `include/bitcask/thread_pool.hpp`、`src/cask/cask.cpp`
+    - analyze 移入全局 Map 池并行；Reduce 仍 per-库串行车道（apply 锁保 HNSW 单写）。
+    - 验收：AT1（管线 vs 串行字节等价，复用 S3 范式）+ AT2（墓碑不复活，负向护栏）
+      + AT5（库间并发 TSan 零 race）+ AT7（慢分词队头阻塞边界）。
+  - [ ] **S6-P3 池全局共享化（拿到 G2）** — `include/bitcask/cask.hpp`、`src/cask/cask.cpp`
+    - 每库一池 → 进程级单例双池 + LibId 路由 + per-库 reorder 状态注册/注销。
+    - open 注册 / close `flush(lib)` 后注销；open 失败回滚注销 lib（对齐现 RAII）。
+    - 验收：AT5 大规模库数 + 线程数恒定（= N+M，与库数无关）。
+  - [ ] **S6-P4 背压调优 + bench** — `bench/index_pool_bench.cpp`
+    - Map 入队有界（满则阻塞 put）+ reorder buffer in-flight 上限（超则反压 Map）。
+    - bench：双池吞吐 + 热点库多核加速比基线；AT6（背压不 OOM）+ AT8（崩溃恢复一致）。
+
+  - **风险**：中（改索引消费核心 + 并发）。缓释：Phase 0/1 行为等价于现状可安全停步；
+    每 Phase 独立 TSan + 字节等价对拍；策略 A 不动 index 核心语义。
 
 ---
 
@@ -350,15 +398,16 @@
 6. **S2 + S3 + S4** ← 结构性优化 ✅ 完成（2026-06-23）
 7. **P1 - P7** 按需穿插
 8. **T4 - T6、B1 - B4、H1 - H5、CI3** 长期推进
+9. **S6 异步索引 MapReduce 流水线** ← **当前进行中**（Phase 0 起步）
 
 > **关键决策点**：R1-R3 + W1-W3 + X1(+T7-T9) + S2 + S3 + S4 全部落地。
 > 结构性优化剩余：
-> - **S1**：已降级——data 是 WAL，put 路径不可缓冲写；仅合法的「内存索引入队
->   批量化」收益有限（单 worker 串行是瓶颈），暂不做。
+> - **S6（异步索引双池）：当前进行中** ← 取代 S1，解热点库吞吐 + 库数线程膨胀两个
+>   真问题。设计稿 `docs/design/async-index-pipeline.md` 已评审；分 Phase 0-4 落地，
+>   Phase 0/1 行为等价于现状可安全停步。
+> - ~~**S1**：已降级~~ → **被 S6 取代否决**。
 > - **S5**（checkpoint zstd）：低风险但需**引入 zstd 第三方依赖**——待用户拍板是否
 >   接受新依赖再做。
-> 建议下一步：**P1-P7 小修**（低成本 WAL-safe，穿插即可）或 **T4-T6 补测试** /
-> **H1-H5 构建加固**（独立、低风险）。S5 需依赖决策。
 
 ## 待办：本轮发现（2026-06-23 TSan 跑出）
 

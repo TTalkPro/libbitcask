@@ -4,8 +4,9 @@
 > (save/load_index_sidecar、save/load_vec_snapshot、load_snapshot)、
 > `inverted.cpp`/`inverted_wal.cpp`(bm25 WAL)、`cask.cpp`
 > (`load_recovery_snapshots`/`load_keydir_from_disk`/写入点)。
-> 背景:本文取代并收敛 `recovery-snapshot-design-zh.md` 的命名与
-> 多写者日志策略;不变量论证沿用其 §2,不重复。搜索快照的**单文件分段 +
+> 背景:本文取代并收敛原 `recovery-snapshot-design-zh.md`(A4)的命名与
+> 多写者日志策略;其仍生效的快照不变量、`kv.keydir.ckpt` 格式与写入点已并入
+> 本文**附录 A**(原文档已删除)。搜索快照的**单文件分段 +
 > 逐段 CRC + 代际回退 + docmap 可选缓存**与姊妹引擎 `cellar`
 > (`design-cellar-search.md`)**已全面收敛到路线 A**(对比见 §10):两引擎
 > 都以 data 为唯一 WAL、砍搜索 WAL、`.prev` 用 data 尾巴追平,仅命名/magic 不同。
@@ -166,7 +167,7 @@ open 流程(取代 `load_recovery_snapshots` + `load_keydir_from_disk` 双轨):
      `fold_start` 取 **0**(健康段已载入,fold 中靠自门跳过其重应用,**只有坏段
      真正重建** → bm25 坏只重分词、hnsw 坏只重插)。即 I/O 不省但 CPU 只付坏段。
 6. **幂等收敛**:回放区每条都是重 put/重 insert,与全量 fold 同语义
-   (`recovery-snapshot-design-zh.md §2.1`),方向安全。
+   (附录 A·不变量 1),方向安全。
 
 **无成对门、无悬崖**:健康路径 `fold_start=keydir_wm`(跳 I/O、各索引自门);仅当
 keydir.ckpt 缺失**或**某搜索段坏/缺(且 keydir 水位>0)才回退 `fold_start=0`——
@@ -195,7 +196,7 @@ keydir.ckpt 缺失**或**某搜索段坏/缺(且 keydir 水位>0)才回退 `fold
   写),落快照后清零。无向量写的周期里 `hnsw` 段**零成本前移**——砍写放大。
 - **触发**:写入字节/文档累计超阈值(`checkpoint_interval`),在 worker
   静止窗口执行。
-- **静止性**:沿用「写者静止点才 dump」(`recovery-snapshot-design-zh.md §2.4`)。
+- **静止性**:沿用「写者静止点才 dump」(附录 A·不变量 4)。
 - **顺序**:watermark **先于** payload 捕获(水位 ≤ 覆盖点 ⟹ 回放区与快照
   重叠,幂等安全);keydir.ckpt 与 search.ckpt 落盘顺序无关(回放取 wm_min)。
 
@@ -258,7 +259,7 @@ docmap 每行 7 个字段与 keydir **6 个重合**(key/file_id/offset/total_sz/
    (幂等)。
 2. **崩溃任意点**:checkpoint 偏旧或部分写(tmp 未 rename)⟹ 对应块退回
    旧态/空态,wm_min 下移,fold 补齐。无「门失败 → 全量 fold」悬崖。
-3. **merge unlink 竞争**:沿用 `recovery-snapshot-design-zh.md §2.3`——
+3. **merge unlink 竞争**:沿用 附录 A·不变量 3——
    指向已 unlink 文件的 entry 被 merge 输出文件以同 ord 重 put 覆盖。
 4. **ord 单调**:回放 `advance_ord(view.ord)` 重建 next_ord;checkpoint
    的 next_ord 仅作上界校验(`peek_next_ord`)。
@@ -328,3 +329,60 @@ cellar(JDK/.NET 姊妹引擎)更新版**已和本设计完全收敛到路线 A**
 互读;跨引擎互读的是 data/hint/meta/DocValue 等**真相源**)。段 payload 沿用
 各自中立小端序列化;若未来要让 checkpoint 也跨引擎互读,再统一 magic/前缀/
 段编号。
+
+---
+
+## 附录 A:keydir 段快照——不变量、格式、写入点(原 A4 设计并入)
+
+> 原 `recovery-snapshot-design-zh.md`(A4:keydir 段快照 + 尾部回放)已被本文取代
+> 并删除。其中仍生效的部分——快照不变量(被 §4/§5/§7 引用)、`kv.keydir.ckpt`
+> 字节格式、写入触发点——收录于此。对应代码:`keydir.cpp` 的
+> `save_snapshot/load_snapshot`、`data_file.cpp` 的 `fold(start_offset)`、
+> `cask.cpp` 的写入/加载点。
+
+### A.1 问题与方案
+
+open 重建 keydir 本需 fold 全部 data(或 hint)文件,O(全库)。方案:在**写者
+静止点**(close、merge 末尾)把 keydir 内存态整体落盘,附带 **per-file 字节水位**;
+open 时加载快照,再只 fold 各文件水位之后的尾巴。快照是**纯优化**:任何校验
+失败 → 丢弃,走原全量 fold。
+
+### A.2 关键不变量与论证
+
+1. **水位先于 dump 捕获**:水位 ≤ 快照覆盖点 ⟹ 尾部回放区间与快照有重叠,
+   重放是重 put/重 remove——keydir fold 语义本就幂等(全量 fold 同样反复覆盖),
+   方向安全。
+2. **快照 = keydir 精确状态**:覆盖区内的墓碑已体现为「键不存在」,无需重放;
+   水位后的墓碑由尾部 fold 正常执行。
+3. **崩溃于 merge unlink 与快照写之间**(快照偏旧):快照里指向已 unlink 文件的
+   entry,其 key 必然被 merge 输出文件(不在水位表 → 从 0 全量 fold)以同 ord
+   重 put 覆盖;与现状「old+merge 文件并存崩溃」同一恢复语义。
+4. **活跃 fold(MultiEntry 存在)时拒绝快照**:save 返回 false,本次放弃——
+   快照点都在写者静止处,正常不会撞上。
+
+### A.3 格式(`kv.keydir.ckpt`,BCKS,LE,tmp+rename 原子写)
+
+```
+[magic "BCKS"][ver=1]
+payload:
+  next_ord u64 | epoch u64 | biggest_file_id u32 | key_count u64 | key_bytes u64
+  fstats_n u32 × {file_id,live_keys,total_keys,live_bytes,total_bytes,
+                  oldest,newest,expiration}
+  wm_n u32 × {file_id u32, covered_offset u64}
+  entry_n u64 × {klen u16, key, file_id u32, total_sz u32,
+                 offset u64, epoch u64, tstamp u32, ord u64}
+[crc32(payload)]
+```
+
+防御:长度/CRC 校验失败、截断、版本不识 → load 返回 nullopt 并清空状态,
+调用方全量 fold。
+
+### A.4 写入点与触发
+
+- `Cask::close()`:close_write_file 之后(写者静止),best-effort;
+- `Cask::merge()` 末尾:trim_fstats 之后(水位取 unlink 后的现存文件);
+- 水位 = scan_dir 各 data 文件当前字节大小(pwrite 无缓冲,fs size 精确)。
+
+> 搜索模式下早期(2026-06)曾尝试以独立 `bm25`/`index` sidecar 快照打通 search 快
+> 路径并经历多次门控调整;该过渡历史已被正文「单文件分段 `search.ckpt` + 单趟
+> 尾部回放」整体取代,不再保留细节。

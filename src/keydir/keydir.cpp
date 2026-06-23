@@ -1069,7 +1069,7 @@ KeyDir::KeyLenHistogram KeyDir::key_length_histogram() const {
 }
 
 // ============================================================================
-// A4:keydir 段快照(设计 doc/recovery-snapshot-design-zh.md)
+// A4:keydir 段快照(设计 doc/recovery-unified-checkpoint-design-zh.md 附录 A)
 // 格式:[magic "BCKS"][ver=1][payload][crc32(payload)],LE,tmp+rename。
 // 磁盘格式无分片概念（重分片自由）,S2 只改内存侧的读写路径。
 // ============================================================================

@@ -303,14 +303,16 @@ public:
     Cask(const Cask&) = delete;
     Cask& operator=(const Cask&) = delete;
 
-    // 打开一个 Cask。registry 非空时通过命名 keydir 跟同目录的其它 Cask
-    // 共享 keydir（典型生产形态：每个 NIF 实例一个全局 registry）。
+    // 打开一个 Cask。通过命名 keydir 跟同目录的其它 Cask 共享 keydir
+    // （典型生产形态：每个 NIF 实例一个全局 registry）。
+    // S6-P0-pre：registry **强制非空**——双池（异步索引 MapReduce）归属 registry，
+    //   无 registry 则池无处可挂。传 nullptr 返回 kInvalidOption（无 nullptr fallback）。
     // 线程安全: 是（每次调用产生独立的 Cask 对象）；registry 自身的并发
     // 由 KeyDirRegistry 内部锁保证。
     // 锁要求: 无。
     [[nodiscard]] static std::expected<std::unique_ptr<Cask>, CaskFault>
     open(std::string_view dirname, const CaskOptions& opts,
-         keydir::KeyDirRegistry* registry = nullptr);
+         keydir::KeyDirRegistry* registry);
 
     // 离线升级：将 KV 模式目录升级为索引模式。
     // 前提条件：目录必须存在且当前为 KV 模式；目录必须处于离线状态（无活跃 writer）。

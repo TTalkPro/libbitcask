@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "bitcask/cask.hpp"
+#include <bitcask/keydir_registry.hpp>
 #include "bitcask/inverted_wal.hpp"
 
 namespace fs = std::filesystem;
@@ -22,6 +23,14 @@ using bitcask::Cask;
 using bitcask::CaskOptions;
 
 namespace {
+
+// S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
+// 各用例用唯一目录名，互不冲突；同用例内 open→close→reopen 经 refcount 归零
+// 重新从盘加载，与旧 nullptr 行为等价。
+inline bitcask::keydir::KeyDirRegistry& test_registry() {
+    static bitcask::keydir::KeyDirRegistry reg;
+    return reg;
+}
 
 class TempDir {
 public:
@@ -55,7 +64,7 @@ CaskOptions rw_opts() {
 // -----------------------------------------------------------------------------
 static void BM_Cask_Put_Overwrite(benchmark::State& state) {
     TempDir td;
-    auto c = Cask::open(td.path(), rw_opts());
+    auto c = Cask::open(td.path(), rw_opts(), &test_registry());
     if (!c) state.SkipWithError("Cask::open failed");
     auto& cask = **c;
 
@@ -91,7 +100,7 @@ BENCHMARK(BM_Cask_Put_Overwrite);
 // -----------------------------------------------------------------------------
 static void BM_Cask_Get_Hot(benchmark::State& state) {
     TempDir td;
-    auto c = Cask::open(td.path(), rw_opts());
+    auto c = Cask::open(td.path(), rw_opts(), &test_registry());
     if (!c) state.SkipWithError("Cask::open failed");
     auto& cask = **c;
 
@@ -124,7 +133,7 @@ BENCHMARK(BM_Cask_Get_Hot);
 // 目标：get() (view) 耗时 < 90% get_owned() (owned)。
 static void BM_Cask_Get_Hot_View(benchmark::State& state) {
     TempDir td;
-    auto c = Cask::open(td.path(), rw_opts());
+    auto c = Cask::open(td.path(), rw_opts(), &test_registry());
     if (!c) state.SkipWithError("Cask::open failed");
     auto& cask = **c;
 
@@ -162,7 +171,7 @@ std::string prepare_open_dir() {
     static TempDir td;
     static bool done = false;
     if (!done) {
-        auto c = Cask::open(td.path(), rw_opts());
+        auto c = Cask::open(td.path(), rw_opts(), &test_registry());
         const std::string value(64, 'v');
         for (int i = 0; i < 20000; ++i) {
             (void)(*c)->put(as_bytes("key" + std::to_string(i)), as_bytes(value));
@@ -177,7 +186,7 @@ std::string prepare_open_dir() {
 static void BM_Cask_Open_Snapshot(benchmark::State& state) {
     auto dir = prepare_open_dir();
     for (auto _ : state) {
-        auto c = Cask::open(dir, rw_opts());
+        auto c = Cask::open(dir, rw_opts(), &test_registry());
         if (!c) state.SkipWithError("open failed");
         benchmark::DoNotOptimize(c);
         (*c)->close();  // 重写快照,下一轮仍走快路径
@@ -192,7 +201,7 @@ static void BM_Cask_Open_FullFold(benchmark::State& state) {
         std::error_code ec;
         fs::remove(fs::path(dir) / "kv.keydir.ckpt", ec);
         state.ResumeTiming();
-        auto c = Cask::open(dir, rw_opts());
+        auto c = Cask::open(dir, rw_opts(), &test_registry());
         if (!c) state.SkipWithError("open failed");
         benchmark::DoNotOptimize(c);
         (*c)->close();
@@ -221,7 +230,7 @@ std::string prepare_vec_open_dir() {
     static TempDir td;
     static bool done = false;
     if (!done) {
-        auto c = Cask::open(td.path(), vec_opts());
+        auto c = Cask::open(td.path(), vec_opts(), &test_registry());
         std::mt19937 rng(0xBC35);
         std::normal_distribution<float> nd(0.0f, 1.0f);
         std::vector<float> v(384);
@@ -251,7 +260,7 @@ std::string prepare_vec_open_dir() {
 static void BM_Cask_Open_VecSnapshot(benchmark::State& state) {
     auto dir = prepare_vec_open_dir();
     for (auto _ : state) {
-        auto c = Cask::open(dir, vec_opts());
+        auto c = Cask::open(dir, vec_opts(), &test_registry());
         if (!c) state.SkipWithError("open failed");
         benchmark::DoNotOptimize(c);
         (*c)->close();
@@ -268,7 +277,7 @@ static void BM_Cask_Open_VecFullFold(benchmark::State& state) {
         std::error_code ec;
         fs::remove(fs::path(dir) / "search.vec.ckpt", ec);
         state.ResumeTiming();
-        auto c = Cask::open(dir, vec_opts());
+        auto c = Cask::open(dir, vec_opts(), &test_registry());
         if (!c) state.SkipWithError("open failed");
         benchmark::DoNotOptimize(c);
         (*c)->close();
@@ -284,7 +293,7 @@ BENCHMARK(BM_Cask_Open_VecFullFold)
 // -----------------------------------------------------------------------------
 static void BM_Cask_SearchHybrid(benchmark::State& state) {
     auto dir = prepare_vec_open_dir();
-    auto c = Cask::open(dir, vec_opts());
+    auto c = Cask::open(dir, vec_opts(), &test_registry());
     if (!c) { state.SkipWithError("open failed"); return; }
     std::mt19937 rng(0x9337);
     std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -329,7 +338,7 @@ static void BM_Put_WalBatch(benchmark::State& state) {
     sc.wal_batch_size = batch_size;
     opts.search_config = sc;
 
-    auto c = Cask::open(td.path(), opts);
+    auto c = Cask::open(td.path(), opts, &test_registry());
     if (!c) state.SkipWithError("Cask::open failed");
     auto& cask = **c;
 

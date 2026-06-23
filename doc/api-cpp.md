@@ -180,10 +180,10 @@ struct NeedsMerge {
 ```cpp
 static std::expected<std::unique_ptr<Cask>, CaskFault>
 open(std::string_view dirname, const CaskOptions& opts,
-     keydir::KeyDirRegistry* registry = nullptr);
+     keydir::KeyDirRegistry* registry);
 ```
-打开一个 Cask 实例。`registry` 非空时通过命名 keydir 跟同目录的其它 Cask 共享 keydir（典型生产形态：每实例一个全局 registry）。
-- **错误**：`kIo`、`kWriteLocked`（锁被占）、`kInvalidOption`、`kModeMismatch`、`kAnalyzerMismatch`。
+打开一个 Cask 实例。`registry` **强制非空**（管理同目录 Cask 间的共享 keydir；典型生产形态：每进程/实例一个全局 registry）——传 `nullptr` 返回 `kInvalidOption`（无 fallback；异步索引双池归属 registry）。
+- **错误**：`kIo`、`kWriteLocked`（锁被占）、`kInvalidOption`（含 registry 为空）、`kModeMismatch`、`kAnalyzerMismatch`。
 - **线程安全**：是（每次调用产生独立 Cask 对象；registry 并发由其内部锁保证）。
 
 #### `upgrade`
@@ -526,9 +526,12 @@ struct SearchHit {
 #include <bitcask/cask.hpp>
 
 using bitcask::Cask, bitcask::CaskOptions;
+using bitcask::keydir::KeyDirRegistry;
 
 int main() {
-    auto c = Cask::open("/tmp/mydb", CaskOptions{.read_write = true});
+    // registry 强制非空（管理同目录 Cask 的共享 keydir；典型每进程一个）。
+    KeyDirRegistry registry;
+    auto c = Cask::open("/tmp/mydb", CaskOptions{.read_write = true}, &registry);
     if (!c) return 1;                       // c.error() 是 CaskFault
 
     std::vector<std::byte> key{std::byte{'h'}, std::byte{'i'}};
@@ -569,7 +572,8 @@ int main() {
     opts.vector_dim    = 128;                                        // 启用向量
     opts.vector_metric = meta::VectorMetric::kCosineNormalized;      // 写入端归一化
 
-    auto c = Cask::open("/tmp/db", opts);
+    keydir::KeyDirRegistry registry;
+    auto c = Cask::open("/tmp/db", opts, &registry);
     if (!c || !(*c)->has_search()) return 1;
 
     std::vector<std::byte> key{std::byte{'d'}, std::byte{'1'}};

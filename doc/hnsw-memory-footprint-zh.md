@@ -1,6 +1,6 @@
 # HNSW 内存占用分析（1M 向量）
 
-> 前置阅读：`hnsw-design-zh.md`（HNSW 基础设计）、`hnsw-external-storage-design-zh.md`（外存预留点）、`hnsw-int8-only-design-zh.md`（int8-only 模式）
+> 前置阅读：`hnsw-design-zh.md`（HNSW 基础设计）、`hnsw-int8-only-design-zh.md`（int8-only 模式）
 > 状态：分析文档（基于当前 V7 实现，对照 `src/vector/hnsw.cpp` / `include/bitcask/hnsw.hpp`）
 > 结论速览：典型 768 维默认配置下，100 万向量约占 **4 GiB**；int8-only 约 **1 GiB**；mmap 外存化则堆常驻约 1 GiB + 文件 3 GiB（可回收）。
 

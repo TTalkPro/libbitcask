@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <bitcask/cask.hpp>
+#include <bitcask/keydir_registry.hpp>
 
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -18,6 +19,14 @@
 #include <vector>
 
 namespace {
+
+// S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
+// 各用例用唯一目录名，互不冲突；同用例内 open→close→reopen 经 refcount 归零
+// 重新从盘加载，与旧 nullptr 行为等价。
+inline bitcask::keydir::KeyDirRegistry& test_registry() {
+    static bitcask::keydir::KeyDirRegistry reg;
+    return reg;
+}
 
 using bitcask::Cask;
 using bitcask::CaskOptions;
@@ -93,7 +102,7 @@ TEST_F(CrashRecoveryTest, MidPutRestartFoldsCorrectly) {
     if (child == 0) {
         CaskOptions opts;
         opts.read_write = true;
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         if (!c) {
             std::fprintf(stderr, "child open failed: %s\n",
                          c.error().detail.c_str());
@@ -124,7 +133,7 @@ TEST_F(CrashRecoveryTest, MidPutRestartFoldsCorrectly) {
 
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c) << "reopen after crash failed: " << c.error().detail;
 
     auto it = (*c)->make_iter();
@@ -171,7 +180,7 @@ TEST_F(CrashRecoveryTest, TornWriteTruncated) {
     {
         CaskOptions opts;
         opts.read_write = true;
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         for (int i = 0; i < kN; ++i) {
             ASSERT_TRUE((*c)->put(bytes(key_for(i)), bytes(value_for(i)),
@@ -210,7 +219,7 @@ TEST_F(CrashRecoveryTest, TornWriteTruncated) {
     {
         CaskOptions opts;
         opts.read_write = true;
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c) << "reopen with torn tail failed: " << c.error().detail;
 
         const std::uint64_t repaired_size =
@@ -249,7 +258,7 @@ TEST_F(CrashRecoveryTest, MultiFileParallelFoldRecovers) {
         CaskOptions opts;
         opts.read_write = true;
         opts.max_file_size = 4096;
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c) << c.error().detail;
 
         std::uint32_t ts = 1000;
@@ -282,7 +291,7 @@ TEST_F(CrashRecoveryTest, MultiFileParallelFoldRecovers) {
         CaskOptions opts;
         opts.read_write = true;
         opts.max_file_size = 4096;
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c) << "parallel reopen failed: " << c.error().detail;
 
         for (int i = 0; i < kN; ++i) {
@@ -308,7 +317,7 @@ TEST_F(CrashRecoveryTest, IteratorAliveAcrossCloseNoUaf) {
     {
         CaskOptions opts;
         opts.read_write = true;
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c) << c.error().detail;
         for (int i = 0; i < kN; ++i) {
             ASSERT_TRUE((*c)->put(bytes(key_for(i)), bytes(value_for(i)),
@@ -319,7 +328,7 @@ TEST_F(CrashRecoveryTest, IteratorAliveAcrossCloseNoUaf) {
 
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c) << c.error().detail;
 
     auto it = (*c)->make_iter();
@@ -344,7 +353,7 @@ TEST_F(CrashRecoveryTest, IteratorExplicitReleaseAfterCloseNoUaf) {
     {
         CaskOptions opts;
         opts.read_write = true;
-        auto c = Cask::open(tmpdir_.string(), opts);
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c) << c.error().detail;
         for (int i = 0; i < 20; ++i) {
             ASSERT_TRUE((*c)->put(bytes(key_for(i)), bytes(value_for(i)),
@@ -355,7 +364,7 @@ TEST_F(CrashRecoveryTest, IteratorExplicitReleaseAfterCloseNoUaf) {
 
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c) << c.error().detail;
 
     auto it = (*c)->make_iter();
@@ -380,7 +389,7 @@ TEST_F(CrashRecoveryTest, MultiIteratorInterleavedReleaseAfterClose) {
 
     CaskOptions opts;
     opts.read_write = true;
-    auto c = Cask::open(tmpdir_.string(), opts);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c) << c.error().detail;
     auto& cask = **c;
 
@@ -458,7 +467,7 @@ TEST_F(CrashRecoveryTest, ThreadLocalEncodedBufferNoCrossThreadInterference) {
         workers.emplace_back([&, t] {
             CaskOptions opts;
             opts.read_write = true;
-            auto c = Cask::open(dirs[t].string(), opts);
+            auto c = Cask::open(dirs[t].string(), opts, &test_registry());
             if (!c) { ok = false; return; }
             for (int i = 0; i < kPuts; ++i) {
                 if (!(*c)->put(bytes(key_for_tp(t, i)), bytes(value_for_tp(t, i)),
@@ -477,7 +486,7 @@ TEST_F(CrashRecoveryTest, ThreadLocalEncodedBufferNoCrossThreadInterference) {
     for (int t = 0; t < kThreads; ++t) {
         CaskOptions opts;
         opts.read_write = true;
-        auto c = Cask::open(dirs[t].string(), opts);
+        auto c = Cask::open(dirs[t].string(), opts, &test_registry());
         ASSERT_TRUE(c) << "reopen thread_" << t << " failed";
         for (int i = 0; i < kPuts; ++i) {
             auto gr = (*c)->get_owned(bytes(key_for_tp(t, i)));

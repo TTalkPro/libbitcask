@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <bitcask/cask.hpp>
+#include <bitcask/keydir_registry.hpp>
 #include <bitcask/data_file.hpp>
 
 #include <atomic>
@@ -17,6 +18,14 @@
 #include <vector>
 
 namespace {
+
+// S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
+// 各用例用唯一目录名，互不冲突；同用例内 open→close→reopen 经 refcount 归零
+// 重新从盘加载，与旧 nullptr 行为等价。
+inline bitcask::keydir::KeyDirRegistry& test_registry() {
+    static bitcask::keydir::KeyDirRegistry reg;
+    return reg;
+}
 
 using bitcask::Cask;
 using bitcask::CaskOptions;
@@ -91,7 +100,7 @@ TEST_F(MergeConcurrentWriterTest, ConcurrentMergeWithActiveReader) {
   CaskOptions opts;
   opts.read_write = true;
   opts.max_file_size = 256;
-  auto c = Cask::open(tmpdir_.string(), opts);
+  auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
   ASSERT_TRUE(c);
   auto& cask = **c;
 
@@ -160,7 +169,7 @@ TEST_F(MergeConcurrentWriterTest, ConcurrentMergePreservesActiveFile) {
   CaskOptions opts;
   opts.read_write = true;
   opts.max_file_size = 256;
-  auto c = Cask::open(tmpdir_.string(), opts);
+  auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
   ASSERT_TRUE(c);
   auto& cask = **c;
 
@@ -240,7 +249,7 @@ TEST_F(MergeConcurrentWriterTest, MergeFailureLeavesKeydirConsistent) {
   CaskOptions opts;
   opts.read_write = true;
   opts.max_file_size = 256;
-  auto c = Cask::open(tmpdir_.string(), opts);
+  auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
   ASSERT_TRUE(c);
   auto& cask = **c;
 
