@@ -478,6 +478,46 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         if (auto r = cask->load_keydir_from_disk(cask->search_.get()); !r) return std::unexpected(r.error());
         cask->keydir_->mark_ready();
     }
+    // S6-P2: 仅 search 模式启动 pool（KV 模式无 index_pool_ / search_）。
+    // pool 初始 next_apply_ord_ 对齐到 keydir 当前水位——让 reducer 跳过
+    // disk 已恢复的 [0, peek_next_ord) 区间。merge 提交的 RebuildHnsw
+    // {ord=peek_next_ord} 等首个 entry 进 reorder 时 next_apply_ord_ 已对齐，
+    // 无 stall。必须放在 keydir_ 已就绪之后（create_search_infra 早于此装配）。
+    if (cask->index_pool_) {
+        cask->index_pool_->set_initial_ord(cask->keydir_->peek_next_ord());
+        cask->index_pool_->start(
+            // Map fn（并行 TBB）：IndexTask → ReduceEntry。map_analyze 是纯函数
+            // （analyzer_ const、无共享可变态），跨线程安全。
+            [&search = *cask->search_](const IndexTask& task) -> ReduceEntry {
+                auto job = search.map_analyze(task.key(), task.ord, task.fields,
+                                              task.file_id, task.offset,
+                                              task.total_sz, task.tstamp);
+                return ReduceEntry{std::move(job), task.meta, task.vec};
+            },
+            // Reduce fn（串行 reducer）：ReorderEntry → apply。
+            [&search = *cask->search_, cask_ptr = cask.get()](ReorderEntry& entry) {
+                std::visit([&search](auto& e) {
+                    using T = std::decay_t<decltype(e)>;
+                    if constexpr (std::is_same_v<T, ReduceEntry>) {
+                        search.reduce_apply(e.job, e.meta, e.vec);
+                    } else if constexpr (std::is_same_v<T, OnWriteEntry>) {
+                        search.on_write(e.key, e.ord, e.text,
+                                        e.file_id, e.offset, e.total_sz, e.tstamp);
+                        if (!e.meta.empty()) search.index().set_meta(e.ord, e.meta);
+                        if (!e.vec.empty())  search.on_vector(e.ord, e.vec);
+                    } else if constexpr (std::is_same_v<T, DeleteEntry>) {
+                        search.on_delete(e.key, e.ord);
+                    } else if constexpr (std::is_same_v<T, SkipEntry>) {
+                        // no-op（ord 空洞填充）
+                    } else if constexpr (std::is_same_v<T, RebuildEntry>) {
+                        search.rebuild_hnsw();
+                    }
+                }, entry);
+            },
+            // Error fn：异常计数器自增（best-effort 保活 pool）。
+            [cask_ptr = cask.get()]() { cask_ptr->index_errors_.fetch_add(1, std::memory_order_relaxed); }
+        );
+    }
     return cask;
 }
 
@@ -624,43 +664,9 @@ Cask::create_search_infra(const CaskOptions& opts) {
                                    "analyzer creation failed (check analyzer type / dict_path)"));
     }
     index_pool_ = std::make_unique<IndexPool>(1, 10240);
-    index_pool_->start([&search = *search_, this](const IndexTask& task) {
-        // 消费者必须吞掉所有异常:worker_loop 不捕获,抛出会 std::terminate
-        // 整个进程,且即便不崩,pending_ 也无法递减→每次搜索走的 flush()
-        // 永久挂起。索引更新失败按 best-effort 丢弃(返回 true 让 pending_
-        // 正常递减、worker 存活)。
-        try {
-            if (task.op == IndexOp::RebuildHnsw) {
-                // V3.5:merge 后图重建(物理清死)。在 worker 执行 →
-                // 与 on_vector 同线程,维持 HNSW 单写者约束。
-                search.rebuild_hnsw();
-                return true;
-            }
-            if (task.op == IndexOp::Delete) {
-                search.on_delete(task.key(), task.ord);
-            } else if (!task.fields.empty()) {
-                search.on_write_fields(task.key(), task.ord, task.fields,
-                                       task.file_id, task.offset, task.total_sz, task.tstamp);
-            } else {
-                search.on_write(task.key(), task.ord, task.text(),
-                                task.file_id, task.offset, task.total_sz, task.tstamp);
-            }
-            // V5:meta blob 跟 on_write 同一 worker 顺序写入——meta 与
-            // 定位/live 对读路径原子可见(filter 直接读 meta_blob())。
-            if (task.op != IndexOp::Delete && !task.meta.empty()) {
-                search.index().set_meta(task.ord, task.meta);
-            }
-            // V3.3:向量接入 HNSW(单写者 = 本 worker 线程)。
-            if (task.op != IndexOp::Delete && !task.vec.empty()) {
-                search.on_vector(task.ord, task.vec);
-            }
-        } catch (...) {
-            // indexed worker 抛异常时自增；非零 = 索引可能漂移，搜索结果可能陈旧
-            index_errors_.fetch_add(1, std::memory_order_relaxed);
-            // best-effort:丢弃本次更新,保活 worker 与 flush()。
-        }
-        return true;
-    });
+    // 注意：set_initial_ord + start 必须在 keydir_ 已设置后调用（caller
+    // 在 create_search_infra 返回后做 keydir 装配）。此处仅创建 pool，调用
+    // 时机由 caller 负责。
     return {};
 }
 
@@ -1249,6 +1255,10 @@ Cask::write_and_keydir(std::span<const std::byte> key,
     if (pr2 == keydir::PutResult::kAlreadyExists) {
         return std::unexpected(err(CaskError::kAlreadyExists));
     }
+    // S6-P1: 原始 ord 在 keydir 竞争中落败（kAlreadyExists），数据已写入但
+    // keydir 未收录。发 Skip 填充 ord 空洞，防 reorder buffer stall。
+    // 必须在 caller 提交 ord2 的真任务之前提交（队列 FIFO 保序）。
+    submit_index_task(IndexTask::make(IndexOp::Skip, {}, ord, {}, 0, 0, 0, 0, 0));
     return PersistedRecord{ord2, w2->offset, w2->total_size, active_file_id_};
 }
 
@@ -1869,8 +1879,16 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
 
         // V4:merge 后同步重建 HNSW（物理清除死节点）。重建在 IndexPool
         // worker 内执行（单写者约束），flush 阻塞等待完成。
+        // S6-P2: RebuildHnsw 现在携带 ord（alloc_ord 分配），通过 reorder
+        // buffer 与本 merge 期间累积的 put/delete 同序串行 apply——保持 HNSW
+        // 单写者约束在 ord 维度上的严格性。该 ord 在数据语义上不指向任何
+        // 文档（类似 Skip），仅用于 occupy ord 序列中的位置。
         if (meta_config_.vector_dim > 0 && index_pool_) {
-            index_pool_->submit(IndexTask{IndexOp::RebuildHnsw});
+            auto rebuild_ord = keydir_->alloc_ord();
+            IndexTask t;
+            t.op  = IndexOp::RebuildHnsw;
+            t.ord = rebuild_ord;
+            index_pool_->submit(std::move(t));
             index_pool_->flush();
         }
 

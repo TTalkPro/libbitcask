@@ -87,6 +87,40 @@ struct SearchHitEx {
     std::vector<Snippet>     highlights;
 };
 
+// S6-P0: map_analyze 的产出 / reduce_apply 的输入。
+// 把「纯函数 analyze + catch-all 合并」的结果封装为一个 owning 结构，
+// 供 reduce_apply 在锁下逐字段 apply。P0 阶段 map/reduce 仍在同线程
+// 顺序调用；P2+ 将跨线程传递此结构。
+struct ReduceJob {
+    std::string          key;           // owning key (reduce_apply 要用)
+    std::uint64_t        ord = 0;
+
+    // 每字段的分词结果（field_name 已映射：空名 → kDefaultField）。
+    // terms 可能为空（该字段无有效 token）→ reduce_apply 跳过 add_doc。
+    struct FieldResult {
+        std::string                   field_name;
+        text::TermPositionsMap        terms;
+        std::uint32_t                 doc_len = 0;  // Σ tf
+    };
+    std::vector<FieldResult> fields;
+
+    std::uint32_t        total_doc_len = 0;
+
+    // catch-all 合并结果（非默认字段词项合并到默认字段，使 search_text 能命中多字段文档）
+    text::TermPositionsMap ca_data;      // 空 = 无需 catch-all add_doc
+    std::uint32_t        ca_len = 0;
+    bool                 wrote_default = false;  // 有字段直接写了默认字段 → 跳过 catch-all
+
+    // 高亮原文缓存（默认取第一个字段的 text，与现有 on_write_fields line 403 一致）
+    std::string          doc_text;
+
+    // DocSlot 定位数据
+    std::uint32_t        file_id = 0;
+    std::uint64_t        offset = 0;
+    std::uint32_t        total_sz = 0;
+    std::uint32_t        tstamp = 0;
+};
+
 class SearchLayer {
 public:
     // 构造 analyzer（可能因无效配置失败）。caller 应检查返回值。
@@ -115,6 +149,20 @@ public:
                          const std::vector<std::pair<std::string, std::string>>& fields,
                          std::uint32_t file_id, std::uint64_t offset,
                          std::uint32_t total_sz, std::uint32_t tstamp);
+
+    // S6-P0: 纯函数阶段 — analyze 各字段 + catch-all 合并，产 ReduceJob。
+    // 无锁、无共享状态变更（analyzer_ 是 const 线程安全）。
+    [[nodiscard]] ReduceJob map_analyze(
+        std::string_view key, std::uint64_t ord,
+        const std::vector<std::pair<std::string, std::string>>& fields,
+        std::uint32_t file_id, std::uint64_t offset,
+        std::uint32_t total_sz, std::uint32_t tstamp) const;
+
+    // S6-P0: 状态变更阶段 — 把 ReduceJob apply 到索引（add_doc/put_doc/set_meta/on_vector/cache invalidate）。
+    // meta/vec 以 span 传入（P0 同线程免拷贝；P2+ 跨线程时由 MapJob 承载 owning 拷贝）。
+    void reduce_apply(const ReduceJob& job,
+                      std::span<const std::byte> meta,
+                      std::span<const float> vec);
 
     // ---- 文档删除：移除索引 ----
     // key: 要删除的 key

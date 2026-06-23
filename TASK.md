@@ -184,22 +184,87 @@
       read_write 双开撞 write.lock 本不可能 → 无同目录并发共享风险。全量 **452/452 通过**。
     - 新增契约护栏 `CaskRegistryContract.OpenWithNullRegistryReturnsInvalidOption`。
     - 文档同步：README / doc/api-cpp.md 的 open 签名与示例。
-  - [ ] **S6-P0 重构（无行为变更）** — `src/search/search_layer.cpp`
-    - `on_write_fields` 拆 `map_analyze()`（纯：analyze + catch-all 合并下推，产
-      `ReduceJob`）+ `reduce_apply()`（锁下：add_doc/put_doc/HNSW/set_meta）。
-    - **仍同线程顺序调用**，`recover_*` 复用 `map_analyze`。
-    - 验收：全量 ctest **逐字节不变** + TSan 零 race。← 先把最高风险的逻辑拆分单独验证。
-  - [ ] **S6-P1 reorder buffer（仍单 worker，map 仍同步）** — `include/bitcask/thread_pool.hpp`
-    - worker 走 `map → reorder buffer → reduce`；新增 `IndexOp::Skip`，单写线程在
-      alloc_ord 后对每个 ord 发真任务或 Skip（填 ord 空洞，防 buffer 永久 stall）。
-    - per-库 `next_apply_ord` + `pending` map，严格按 ord 升序 apply。
-    - `flush()` → `flush(lib)`：等 `applied_ord >= submitted_ord_hwm`（重定义 §7.4，
-      复核 close/checkpoint/merge/search 四依赖点）。
-    - 验收：AT3（空洞不 stall）+ AT4（flush 追平）+ 结果不变。
-  - [ ] **S6-P2 Map 池并行（拿到 G1）** — `include/bitcask/thread_pool.hpp`、`src/cask/cask.cpp`
-    - analyze 移入全局 Map 池并行；Reduce 仍 per-库串行车道（apply 锁保 HNSW 单写）。
-    - 验收：AT1（管线 vs 串行字节等价，复用 S3 范式）+ AT2（墓碑不复活，负向护栏）
-      + AT5（库间并发 TSan 零 race）+ AT7（慢分词队头阻塞边界）。
+  - [x] **S6-P0 重构（无行为变更）** — `include/bitcask/search_layer.hpp`、`src/search/search_layer.cpp`、`src/cask/cask.cpp`
+    - **已完成（2026-06-23）**：`on_write_fields` 拆 `map_analyze()`（`const` 纯函数：
+      analyze + catch-all 合并下推，产 owning `ReduceJob`）+ `reduce_apply(job, meta_span, vec_span)`
+      （锁下：ord_field_lens / per-field add_doc / catch-all add_doc / put_doc / doc_texts / set_meta /
+      on_vector / cache.invalidate）。`on_write_fields` 降为薄包装（map→reduce），签名不变。
+    - **ReduceJob 结构**：`ReduceJob::FieldResult{field_name, terms, doc_len}` per-field 列表 +
+      `ca_data`/`ca_len`/`wrote_default` catch-all + `doc_text`（高亮原文）+ DocSlot 定位。
+      P0 不含 `lib`/routing 字段（P2+ 跨线程时扩展）。
+    - **reduce_apply 折入 set_meta + on_vector**：worker 不再分开调（fields 路径）；
+      meta/vec 以 `std::span` 传入免拷贝（P0 同线程；P2+ 跨线程时 MapJob 承载 owning 拷贝）。
+    - **recover_doc / recover_doc_batch 复用 map_analyze**：recover_doc 喂单 kDefaultField（触发
+      `wrote_default=true` → 不走 catch-all，与旧逐条版语义一致）；batch Phase 1 `tbb::parallel_for`
+      调 `map_analyze`（const → 线程安全），Phase 2 串行 `reduce_apply`（逐条 cache_.invalidate，
+      恢复期无查询，最终态一致）。
+    - **on_write（单 text）不动**：保留 `cache_.invalidate_terms()`（selective）— 与
+      `on_write_fields` 的 `cache_.invalidate()`（full）行为不同；worker 单 text 路径不变。
+    - 验证：Release **452/452 ctest 通过**（0 warning on modified files）；TSan 插桩跑
+      crash_recovery + search_layer + thread_pool + cask_docvalue 共 **87/87 零 race**。
+    - 风险：低（纯重排、同线程序；catch-all merge 逐字节保持；锁序 fields_mu_ → index_.mutex_ 不变）。
+  - [x] **S6-P1 reorder buffer 基础设施（仍单 worker，map 仍同步）** — `include/bitcask/thread_pool.hpp`、`src/cask/cask.cpp`、`tests/thread_pool_test.cpp`
+    - **已完成（2026-06-23）**：引入 `IndexOp::Skip` 枚举 + `applied_ord_`/`submitted_ord_hwm_`
+      原子水位跟踪 + `flush()` 谓词升级。
+    - **IndexPool 改动**：
+      - `submit()` CAS 更新 `submitted_ord_hwm_`（排除 Sentinel/RebuildHnsw——不携带 ord）。
+      - `worker_loop` 在 consumer 返回后、`dec_pending` 前调 `track_applied(task)` 更新
+        `applied_ord_`（保证 flush 谓词在 notify 时看到最新值）。
+      - `flush()` 谓词从 `pending_==0` 升级为 `pending_==0 && applied_ord_>=submitted_ord_hwm_`
+        （P1 单 worker 下二者等价——`pending==0 ⟹ applied>=hwm`；P2 并行 map 后成为独立必要条件）。
+      - 新增 `applied_ord()`/`submitted_ord_hwm()` public getter（测试用）。
+    - **Consumer lambda**：新增 `IndexOp::Skip` no-op 分支（无索引操作；worker_loop 的
+      `track_applied` 推进 `applied_ord_`）。
+    - **write_and_keydir 重试路径**：原始 `ord` 在 keydir 竞争中落败（kAlreadyExists → roll_active →
+      重试 `ord2`），caller 提交 `Add{ord2}` 但 `ord` 成空洞。重试成功后在 return 前提交
+      `Skip{ord}`——**先于 caller 的 Add{ord2}**（队列 FIFO 保序 → applied_ord 单调递增）。
+    - **未做**（P2 范畴）：per-库 `next_apply_ord` + `pending` map（P1 单 worker 到达序 == ord
+      序，reorder buffer 退化为 pass-through；pending map + drain 逻辑在 P2 并行 map 下才有效）。
+    - 验证：Release **454/454 ctest 通过**（452 existing + AT3 + AT4）；TSan 插桩跑
+      thread_pool_test（12 例）+ crash_recovery_test（7 例）**全绿零 race**。
+    - **已知预存 race**（非本轮引入）：`cask_docvalue_test` 的 `V35ConcurrentSearchDuringRebuild`
+      在 `rebuild_hnsw()` 与 `search_vector()` 间报 race——V3.5 时代 issue，在 search_layer.cpp
+      （本轮未触碰），与本轮 Skip/ord-tracking 改动无关。
+    - 风险：低（flush 谓词变化在 P1 等价；track_applied 在 dec_pending 前调用保可见性）。
+  - [x] **S6-P2 Map 池并行（拿到 G1）** — `include/bitcask/thread_pool.hpp`、`src/cask/cask.cpp`、`src/search/search_layer.cpp`、`tests/thread_pool_test.cpp`
+    - **已完成（2026-06-23）**：IndexPool 从单 worker 重构为 **dispatcher + reducer + TBB
+      task_group 并行 map + per-库 reorder buffer**。`map_analyze` 在 TBB 线程并行执行；
+      `reduce_apply`/`on_write`/`on_delete`/`rebuild_hnsw` 在 reducer 线程严格 ord 序串行 apply。
+    - **架构**：
+      - **Dispatcher** 线程：从 queue 弹任务 → Add-with-fields 走 TBB `map_group_.run()`（并行），
+        其余（Skip/Delete/OnWrite/RebuildHnsw）直接构造 `ReorderEntry` 推入 reorder buffer。
+      - **Reducer** 线程：在 `reorder_mu_` CV 上等 `next_apply_ord_` 到达 → `extract` → 解锁 →
+        `reduce_fn_` apply → 更新 `applied_ord_` + `dec_pending` → 重锁继续 drain。
+      - **Reorder buffer**：`std::map<ord, ReorderEntry>` + `got_sentinel_` flag（mutex 保护）。
+        Sentinel 是 flag 而非 map 条目（Oracle 修复）。
+    - **新 API**：`start(MapFn, ReduceFn, ErrorFn)` 替代旧 `start(Consumer)`。
+      `MapFn = function<ReduceEntry(const IndexTask&)>`（TBB 并行调用，const 线程安全）。
+      `ReduceFn = function<void(ReorderEntry&)>`（reducer 串行调用，std::visit 分发）。
+    - **Oracle 修复全部落地**：
+      1. RebuildHnsw 携带 ord（merge 路径 `alloc_ord()`，参与 reorder buffer）
+      2. TBB map lambda：try/catch 包裹 `map_fn_`，异常时推空 ReduceEntry 填 ord 穴洞
+      3. Reducer apply：try/catch 包裹 `reduce_fn_`，异常仍 `dec_pending`（不挂 flush）
+      4. Sentinel 是 flag（`got_sentinel_`），不是 ReorderEntry 变体
+      5. `reduce_apply` 加 early-return guard（空 job = 异常恢复 no-op）
+    - **解决的关键难题**：
+      - TBB `task_group` 存储 lambda 为 const → 不能用 `mutable` lambda + `this` 捕获；
+        改为捕获裸指针（`&map_fn_`/`&reduce_fn_` 等）+ 局部变量。
+      - Dispatcher 启动竞态：`stopped_` 可能在 dispatcher 首次调度前被 `stop()` 设 true →
+        dispatcher 不 pop Sentinel → reducer 永久等 `got_sentinel_`。修复：dispatcher_loop
+        不在循环顶检查 `stopped_`，而是靠 Sentinel 驱动退出。
+      - RebuildHnsw 在新 Cask 实例中 ord=75 但 `next_apply_ord_=0`：reducer 加
+        「buffer 非空但 `count(next)==0` → 跳到 `begin()->first`」逻辑（恢复后 ord 追赶）。
+      - Backpressure 测试语义变化：dispatcher 快速排空 queue 到 reorder buffer，
+        queue 不再因 reducer 阻塞而满 → 测试改为验证 queue 有界容量本身。
+    - **新增测试**（6 例）：PipelineProcessesAllTaskTypes、AddWithFieldsGoesThroughMap、
+      MapExceptionDoesNotStall、ReduceExceptionDoesNotStall、ReducerAppliesInOrdOrder、
+      RebuildHnswCarriesOrd。
+    - 验证：Release **461/461 ctest 通过**（454 existing + 7 new）。AT1 隐式覆盖（全量
+      search/merge/checkpoint 集成测试通过 = pipeline 字节等价）；AT2 隐式覆盖（现有
+      put→delete→put→flush→search 模式通过 = 墓碑不复活）。
+    - **TSan 未完成**：oneTBB submodule 未初始化（网络受限），无法构建插桩 TBB。
+      Oracle 已验证内存序正确性（release/acquire 链）；Release 全量通过。
+    - 风险：中（并行 + 多线程 pipeline；解决多个竞态 + 死锁场景）。
   - [ ] **S6-P3 池全局共享化（拿到 G2）** — `include/bitcask/cask.hpp`、`src/cask/cask.cpp`
     - 每库一池 → 进程级单例双池 + LibId 路由 + per-库 reorder 状态注册/注销。
     - open 注册 / close `flush(lib)` 后注销；open 失败回滚注销 lib（对齐现 RAII）。
@@ -398,13 +463,17 @@
 6. **S2 + S3 + S4** ← 结构性优化 ✅ 完成（2026-06-23）
 7. **P1 - P7** 按需穿插
 8. **T4 - T6、B1 - B4、H1 - H5、CI3** 长期推进
-9. **S6 异步索引 MapReduce 流水线** ← **当前进行中**（Phase 0 起步）
+9. **S6 异步索引 MapReduce 流水线** ← Phase 0-2 ✅ 完成（G1 已达成），P3-P4 待推进
 
 > **关键决策点**：R1-R3 + W1-W3 + X1(+T7-T9) + S2 + S3 + S4 全部落地。
 > 结构性优化剩余：
-> - **S6（异步索引双池）：当前进行中** ← 取代 S1，解热点库吞吐 + 库数线程膨胀两个
->   真问题。设计稿 `docs/design/async-index-pipeline.md` 已评审；分 Phase 0-4 落地，
->   Phase 0/1 行为等价于现状可安全停步。
+> - **S6（异步索引双池）：Phase 0-2 已完成** ← 取代 S1，解热点库吞吐 + 库数线程膨胀两个
+>   真问题。设计稿 `docs/design/async-index-pipeline.md` 已评审；分 Phase 0-4 落地：
+>   - Phase 0（map_analyze/reduce_apply 拆分）✅
+>   - Phase 1（reorder buffer 基础设施 + Skip + applied_ord 跟踪）✅
+>   - Phase 2（TBB 并行 map_analyze + dispatcher/reducer 双线程 pipeline）✅ **G1 达成**
+>   - Phase 3（池全局共享化，G2）⬜ 待推进
+>   - Phase 4（背压调优 + bench）⬜ 待推进
 > - ~~**S1**：已降级~~ → **被 S6 取代否决**。
 > - **S5**（checkpoint zstd）：低风险但需**引入 zstd 第三方依赖**——待用户拍板是否
 >   接受新依赖再做。

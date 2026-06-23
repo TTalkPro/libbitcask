@@ -337,17 +337,20 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
     cache_.invalidate_terms(changed_terms);
 }
 
-void SearchLayer::on_write_fields(
+ReduceJob SearchLayer::map_analyze(
     std::string_view key, std::uint64_t ord,
     const std::vector<std::pair<std::string, std::string>>& fields,
     std::uint32_t file_id, std::uint64_t offset,
-    std::uint32_t total_sz, std::uint32_t tstamp) {
-    std::uint32_t total_doc_len = 0;
-    auto& field_lens = ord_field_lens_[ord];
-    field_lens.reserve(fields.size() + 1);
+    std::uint32_t total_sz, std::uint32_t tstamp) const {
+    ReduceJob job;
+    job.key      = std::string(key);
+    job.ord      = ord;
+    job.file_id  = file_id;
+    job.offset   = offset;
+    job.total_sz = total_sz;
+    job.tstamp   = tstamp;
 
     const std::string default_field(kDefaultField);
-    bool wrote_default = false;    // 是否已有字段直接写入默认字段
 
     // catch-all（S8.6 修复 + O5 合并优化）：把非默认字段词项合并进默认字段，
     // 使 search_text/phrase/near（只查默认字段）也能命中多字段文档。
@@ -357,21 +360,15 @@ void SearchLayer::on_write_fields(
     // position + 1」，与拼接版仅在字段尾部存在被丢短词时差极小的 slop。
     text::TermPositionsMap ca_data;
     std::uint32_t ca_pos_base = 0;
-    std::uint32_t ca_len = 0;
 
     for (auto& [fname, ftext] : fields) {
         const std::string field = fname.empty() ? default_field : fname;
         auto term_data = analyzer_->analyze_with_positions(ftext);
         std::uint32_t flen = 0;
         for (auto& [_, data] : term_data) flen += data.first;
-        if (!term_data.empty()) {
-            field_index(field).add_doc(ord, term_data);
-        }
-        field_lens.push_back({field, flen});
-        total_doc_len += flen;
 
         if (field == default_field) {
-            wrote_default = true;
+            job.wrote_default = true;
         } else if (!term_data.empty()) {
             std::uint32_t field_max_pos = 0;
             for (auto& [term, data] : term_data) {
@@ -383,25 +380,69 @@ void SearchLayer::on_write_fields(
                     if (p > field_max_pos) field_max_pos = p;
                 }
             }
-            ca_len += flen;
+            job.ca_len += flen;
             ca_pos_base += field_max_pos + 1;
+        }
+
+        job.fields.push_back(ReduceJob::FieldResult{
+            std::move(field), std::move(term_data), flen});
+        job.total_doc_len += flen;
+    }
+
+    job.ca_data = std::move(ca_data);
+    // 高亮：默认字段原文（多字段高亮的精细化留待后续）。
+    job.doc_text = fields.empty() ? std::string{} : fields.front().second;
+    return job;
+}
+
+void SearchLayer::reduce_apply(const ReduceJob& job,
+                               std::span<const std::byte> meta,
+                               std::span<const float> vec) {
+    // S6-P2: 空 job 守卫（map_fn_ 抛异常时 reducer 收到空 ReduceEntry）。
+    // key+fields 都空 = map_analyze 未产出，跳过 apply；reducer 仍推进 ord。
+    if (job.key.empty() && job.fields.empty()) return;
+    auto& field_lens = ord_field_lens_[job.ord];
+    field_lens.reserve(job.fields.size() + 1);
+    for (const auto& f : job.fields) {
+        field_lens.emplace_back(f.field_name, f.doc_len);
+    }
+
+    for (const auto& f : job.fields) {
+        if (!f.terms.empty()) {
+            field_index(f.field_name).add_doc(job.ord, f.terms);
         }
     }
 
     // 若已有字段直接写默认字段，则不重复合并（避免双写）。
-    if (!wrote_default && !ca_data.empty()) {
-        field_index(default_field).add_doc(ord, ca_data);
-        field_lens.push_back({default_field, ca_len});
+    if (!job.wrote_default && !job.ca_data.empty()) {
+        field_index(kDefaultField).add_doc(job.ord, job.ca_data);
+        field_lens.emplace_back(std::string(kDefaultField), job.ca_len);
     }
 
-    index_.put_doc(key, ord,
+    index_.put_doc(job.key, job.ord,
                    index::DocSlot{
-                       index::DocLoc{file_id, offset, total_sz},
-                       tstamp,
-                       total_doc_len});
-    // 高亮：默认字段原文（多字段高亮的精细化留待后续）。
-    if (!fields.empty()) doc_texts_.put(ord, fields.front().second);
+                       index::DocLoc{job.file_id, job.offset, job.total_sz},
+                       job.tstamp,
+                       job.total_doc_len});
+    if (!job.doc_text.empty()) {
+        doc_texts_.put(job.ord, job.doc_text);
+    }
+    if (!meta.empty()) {
+        index_.set_meta(job.ord, meta);
+    }
+    if (!vec.empty()) {
+        on_vector(job.ord, vec);
+    }
     cache_.invalidate();
+}
+
+void SearchLayer::on_write_fields(
+    std::string_view key, std::uint64_t ord,
+    const std::vector<std::pair<std::string, std::string>>& fields,
+    std::uint32_t file_id, std::uint64_t offset,
+    std::uint32_t total_sz, std::uint32_t tstamp) {
+    auto job = map_analyze(key, ord, fields, file_id, offset, total_sz, tstamp);
+    reduce_apply(job, {}, {});
 }
 
 std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::uint64_t tomb_ord) {
@@ -741,26 +782,13 @@ void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
                               std::uint32_t file_id, std::uint64_t offset,
                               std::uint32_t total_sz, std::uint32_t tstamp,
                               std::span<const float> vector) {
-    auto term_data = analyzer_->analyze_with_positions(text);
-
-    std::uint32_t doc_len = 0;
-    for (auto& [_, data] : term_data) {
-        doc_len += data.first;
-    }
-
-    index_.put_doc(key, ord,
-                   index::DocSlot{
-                       index::DocLoc{file_id, offset, total_sz},
-                       tstamp,
-                       doc_len});
-
-    if (!term_data.empty()) {
-        field_index(kDefaultField).add_doc(ord, term_data);
-    }
-    doc_texts_.put(ord, std::string(text));
-    cache_.invalidate();
-    // V3.3:向量段顺路重建 HNSW(水位幂等 → 重放重叠区安全)。
-    if (!vector.empty()) on_vector(ord, vector);
+    // S6-P0:单字段(kDefaultField) 恢复——map_analyze + reduce_apply 复用。
+    // map_analyze 在 default_field 上写出 → wrote_default=true,触发不到
+    // catch-all 路径,语义与原版逐条 recover_doc 完全一致。
+    std::vector<std::pair<std::string, std::string>> fields;
+    fields.emplace_back(std::string(kDefaultField), std::string(text));
+    auto job = map_analyze(key, ord, fields, file_id, offset, total_sz, tstamp);
+    reduce_apply(job, {}, vector);
 }
 
 void SearchLayer::set_synonym_map(std::unique_ptr<text::SynonymMap> map) {
@@ -774,32 +802,25 @@ void SearchLayer::recover_doc_batch(std::vector<RecoverDoc>& batch) {
     if (batch.empty()) return;
     const std::size_t n = batch.size();
 
-    // 阶段一：并行 analyze（analyzer_ const 无可变态；写 terms[i]/doc_lens[i]
-    // 互不相交，无共享可变状态）。TBB 全局线程池，无 per-batch 线程创建。
-    std::vector<text::TermPositionsMap> terms(n);
-    std::vector<std::uint32_t>          doc_lens(n, 0);
+    // 阶段一：并行 map_analyze（analyzer_ const 无可变态；写 jobs[i] 互不相交，
+    // 无共享可变状态）。map_analyze 自身 const、纯函数，并行调用安全。TBB
+    // 全局线程池，无 per-batch 线程创建。
+    std::vector<ReduceJob> jobs(n);
     tbb::parallel_for(std::size_t{0}, n, [&](std::size_t i) {
-        terms[i] = analyzer_->analyze_with_positions(batch[i].text);
-        std::uint32_t dl = 0;
-        for (auto& [_, data] : terms[i]) dl += data.first;
-        doc_lens[i] = dl;
+        const auto& d = batch[i];
+        std::vector<std::pair<std::string, std::string>> fields;
+        fields.emplace_back(std::string(kDefaultField), d.text);
+        jobs[i] = map_analyze(d.key, d.ord, fields,
+                              d.file_id, d.offset, d.total_sz, d.tstamp);
     });
 
-    // 阶段二：按 batch 序串行插入（= fold 序）。HNSW 单写者 = 本线程。
+    // 阶段二：按 batch 序串行 reduce_apply（= fold 序）。HNSW 单写者 = 本线程。
+    // reduce_apply 内部逐条 cache_.invalidate()：恢复期无查询，性能影响可忽略；
+    // 最终状态与旧版完全一致。
     for (std::size_t i = 0; i < n; ++i) {
-        auto& d = batch[i];
-        index_.put_doc(d.key, d.ord,
-                       index::DocSlot{
-                           index::DocLoc{d.file_id, d.offset, d.total_sz},
-                           d.tstamp,
-                           doc_lens[i]});
-        if (!terms[i].empty()) {
-            field_index(kDefaultField).add_doc(d.ord, terms[i]);
-        }
-        doc_texts_.put(d.ord, std::move(d.text));
-        if (!d.vector.empty()) on_vector(d.ord, d.vector);
+        const auto& d = batch[i];
+        reduce_apply(jobs[i], {}, d.vector);
     }
-    cache_.invalidate();  // 逐条版每条 invalidate；批量一次即可（恢复期无查询）。
 }
 
 void SearchLayer::recover_tomb(std::string_view key, std::uint64_t ord) {
