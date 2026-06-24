@@ -20,8 +20,10 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <list>
 #include <memory>
 #include <optional>
@@ -437,6 +439,16 @@ private:
     mutable SearchCache cache_;
     mutable DocTextLru  doc_texts_;
     std::unique_ptr<text::SynonymMap> synonym_map_;
+    // 注：查询并行用的「有界 Search 池」是**进程级共享**的（非 per-Cask），
+    // 定义在 search_layer.cpp（search_arena()）。见 S7-2。
 };
+
+// S7-4: 把 [0, n) 并发跑在进程级共享「有界 Search 池」上（inter-query 并发）。
+// body(i) 执行第 i 条**独立**查询，写各自结果槽（槽间不重叠 → 无需锁）。每条
+// 查询内部仍串行；并发发生在查询**之间**（多条独立重查询，总功/核数，无单查询
+// 两路并行的均衡/唤醒摊销问题）。n<=1 直跑（零池开销）。
+// 要求：body 之间不共享可变态（查询纯读各索引 shared_lock，安全）。
+void parallel_for_queries(std::size_t n,
+                          const std::function<void(std::size_t)>& body);
 
 }  // namespace bitcask::search

@@ -4,7 +4,9 @@
 #include "bitcask/codec.hpp"
 #include "bitcask/highlighter.hpp"
 
-#include <oneapi/tbb/parallel_for.h>  // S3:恢复期批量并行 analyze
+#include <oneapi/tbb/parallel_for.h>      // S3:恢复期批量并行 analyze
+#include <oneapi/tbb/task_arena.h>        // S7:共享有界 Search 池（inter-query）
+#include <thread>
 
 #include <algorithm>
 #include <cmath>
@@ -18,6 +20,39 @@
 #include <utility>
 
 namespace bitcask::search {
+
+namespace {
+// S7: 进程级**共享**的「有界 Search 池」。所有 Cask / SearchLayer 共用这一个
+// task_arena —— **不是每 Cask 一个**（与 S6 索引池 registry 共享同思路）。
+// 用途 = **inter-query 并发**：多条独立查询提交进池并发跑（稳赚，无单查询
+// 两路并行的均衡/唤醒摊销问题）。并发上限由 TBB market 封顶（≈hardware_
+// concurrency），与索引/恢复期 TBB 工作隔离。
+//
+// 故意泄漏（never-destroyed）：规避静态析构与 TbbLifetime::finalize 的顺序坑
+// （进程退出/.so 卸载时 arena 不主动析构，交给 OS 回收）。task_arena 仅是
+// 调度上下文、不持有线程（线程来自全局 market），泄漏成本可忽略。
+//
+tbb::task_arena& search_arena() {
+    static tbb::task_arena* arena = [] {
+        unsigned hc = std::thread::hardware_concurrency();
+        int slots = static_cast<int>(hc > 1 ? hc : 2);
+        return new tbb::task_arena(slots);
+    }();
+    return *arena;
+}
+}  // namespace
+
+// S7-4: inter-query 并发入口。n 条独立查询并发跑共享有界 Search 池。
+void parallel_for_queries(std::size_t n,
+                          const std::function<void(std::size_t)>& body) {
+    if (n == 0) return;
+    if (n == 1) { body(0); return; }  // 单条直跑，不进池（零开销快路径）
+    // grainsize=1 在此正确：每 item 是一条完整重查询（与 BOW 的小 posting 不同）。
+    search_arena().execute([&] {
+        tbb::parallel_for(std::size_t{0}, n,
+                          [&](std::size_t i) { body(i); });
+    });
+}
 
 SearchLayer::SearchLayer(const SearchLayerConfig& config)
     : config_(config)
@@ -236,6 +271,14 @@ SearchLayer::search_hybrid(std::string_view text_query,
 
     // V5:filter 独立走两条路(text 后过滤 + vec 折 live callback)——只有
     // 同时通过两路 filter 的文档才进 RRF 融合,符合「filter 收紧 live」语义。
+    //
+    // S7【单查询两路：串行】决策（2026-06-24，实测定）。两路独立、纯读，理论上
+    // 可并行，但实测（见 TASK.md S7-3）盲目并行常见情形不赢：
+    //   ① text 路缓存命中（生产 cache 开的常态）→ 近 0，并行白付 worker 唤醒
+    //      ~10–13µs → 0.66× 变慢；② 两路常严重不对称 → 并行≈max≈大路，无收益。
+    // 只有「≥10 万文档 + 未命中缓存 + 两路成本同数量级」的甜区才赢 ~1.5–1.8×。
+    // 故单查询两路保持串行（零开销，对常见情形最优）。线程池的稳赚用途是
+    // **inter-query**（多条独立查询并发，见 search_arena() + 待落地的并发入口）。
     std::vector<SearchHit> text_hits;
     if (!text_query.empty()) {
         auto t = search_text(text_query, kp, nullptr, filter);
