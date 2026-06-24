@@ -22,6 +22,7 @@
 | 模糊 / 通配符 | `search_fuzzy` / `search_wildcard` | 编辑距离 / `*?` 模式 |
 | 向量 ANN | `search_vector` | HNSW，cosine / dot / L2 度量 |
 | 混合检索 | `search_hybrid` | BM25 + 向量 RRF 融合 |
+| 批量检索 | `search_text_batch` / `search_vector_batch` / `search_hybrid_batch` | 多条独立查询并发跑共享 Search 池（inter-query 并行），保序返回 |
 | 同义词 | `set_synonym_map` | 查询时自动展开 |
 | 高亮 | `search_text_highlight` | 命中片段截取 |
 | 迭代 | `make_iter` | MVCC 快照（兄弟链 + pending 哈希）|
@@ -166,7 +167,7 @@ auto knn  = (*c)->search_vector(query_vec, /*k=*/10);
 auto hyb  = (*c)->search_hybrid("北京 天气", query_vec, /*k=*/10);
 ```
 
-> 完整示例见 `tests/cask_docvalue_test.cpp`（2756 行端到端用例）。
+> 完整示例见 `tests/cask_docvalue_test.cpp`（2974 行端到端用例）。
 
 ### C API（跨语言绑定）
 
@@ -212,10 +213,18 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 │  │   ├─ InvertedIndex（按字段隔离的 BM25 倒排）             │
 │  │   ├─ HnswIndex（单写者 + 多读者无锁发布协议）            │
 │  │   └─ Analyzer（Ngram / Whitespace / Jieba）            │
-│  └─ MetaConfig（bitcask.meta 模式持久化）                  │
+│  ├─ MetaConfig（bitcask.meta 模式持久化）                  │
+│  └─ IndexLane*（借用句柄 → registry 共享 IndexPool）        │
 └───────────────────────────────────────────────────────────┘
-              │
-┌─────────────▼─────────────────────────────────────────────┐
+              │                    │
+┌─────────────▼────────┐ ┌────────▼──────────────────────────┐
+│  KeyDirRegistry       │ │  search_arena()（进程级共享       │
+│  └─ IndexPool         │ │  TBB task_arena，inter-query 并行）│
+│     N map worker      │ └──────────────────────────────────┘
+│     + 1 reducer       │
+│     + reorder 背压    │  批量查询入口 parallel_for_queries
+└───────────────────────┘
+┌───────────────────────────────────────────────────────────┐
 │  fileops (codec / data_file / hint_file / scanner / migrate) │
 │  io (PosixFile / FileLock)  merge (Merger / Policy)        │
 │  text (Analyzer / JiebaAnalyzer)  bm25 (Inverted / WAL)   │
@@ -227,7 +236,8 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 
 - **双持久化**：数据文件（append-only，KV 权威）+ 倒排 WAL + checkpoint（索引恢复优化，纯派生缓存，校验失败回退全量 fold）
 - **双锁模型**：`bitcask.write.lock`（writer）与 `bitcask.merge.lock`（merger）独立，周期性 merge 与 live writer 并行不互斥
-- **异步索引**：`put_doc` 入队有界 `IndexPool`（满则背压），单 worker 串行变更索引，查询线程并发读
+- **异步索引 MapReduce 流水线**：`put_doc` 入队有界 `IndexPool`（满则背压）→ N 个 map worker 并行分词（`hardware_concurrency` 真数据并行，G1）→ per-lane reorder buffer（按 ord 排序）→ 单 reducer 串行 apply（库内单写者 I3）。池由 `KeyDirRegistry` 共享，线程数 = N+1 与库数无关（G2）
+- **查询并发**：批量查询接口（`search_*_batch`）在进程级共享 `search_arena`（TBB task_arena）上 inter-query 并行；单查询内部仍串行（WAND 顺序依赖、HNSW 图遍历）。多条独立查询并发跑满核
 - **并发协议**：HNSW 单写者 + 多读者（`atomic<NodeChunk*>` 发布 + per-node 自旋锁）；InvertedIndex 按词 hash 分片锁 + CoW posting；KeyDir 256 分片锁
 - **小端 only**：所有多字节整数小端（LE 主机原生零转换），不再与 legacy 大端 Erlang 字节互通，迁移用 `tools/migrate_le`
 
@@ -253,7 +263,7 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 ├── c_api/             # libbitcask.so 的 C ABI（bitcask_c.{cpp,h}）
 ├── src/               # 实现：fileops / io / lock / keydir / merge /
 │                      #       cask / search / bm25 / text / vector
-├── tests/             # GoogleTest 单元 + 集成测试（24 个测试二进制）
+├── tests/             # GoogleTest 单元 + 集成测试（26 个测试二进制）
 ├── bench/             # Google Benchmark（keydir / cask / inverted / hnsw ...）
 ├── tools/             # migrate_le、gen_inert_table
 ├── cmake/             # BitcaskSanitizers 模块 + tsan.supp
