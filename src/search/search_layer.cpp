@@ -75,6 +75,12 @@ SearchLayer::SearchLayer(const SearchLayerConfig& config)
     }
 }
 
+SearchLayer::SearchLayer(const SearchLayerConfig& config,
+                         std::unique_ptr<text::Analyzer> injected_analyzer)
+    : SearchLayer(config) {
+    if (injected_analyzer) analyzer_ = std::move(injected_analyzer);
+}
+
 void SearchLayer::on_vector(std::uint64_t ord, std::span<const float> vec) {
     // 防御:无 HNSW 配置 / dim 不符的向量直接忽略(不崩)。正常路径
     // put_doc 已在写入端校验过 dim。V3.5:经 atomic load 取图快照——
@@ -542,8 +548,9 @@ std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::search_text(std::string_view query, std::size_t k,
                          const bm25::Bm25Params* params_override,
                          const meta::MetaFilter* filter) const {
-    auto term_freqs = analyzer_->analyze(query);
-    if (term_freqs.empty()) return std::vector<SearchHit>{};
+    // S10-A1:缓存检查前置以跳过 ~20µs NLP analyze（详见 TASK.md）。
+    // 安全前提:CacheKey 仅依赖 (query_type, query, k_req),不依赖 analyze 结果。
+    if (query.empty()) return std::vector<SearchHit>{};
 
     // V5:filter 非空时 overfetch K'=max(k×4, 64)——BM25 评分排序在
     // filter 之前,过严 filter 命中数 < k 时需更多候选弥补损耗。无 filter
@@ -559,6 +566,9 @@ SearchLayer::search_text(std::string_view query, std::size_t k,
     if (cached) {
         results = std::move(*cached);
     } else {
+        auto term_freqs = analyzer_->analyze(query);
+        if (term_freqs.empty()) return std::vector<SearchHit>{};
+
         std::vector<std::string> terms;
         terms.reserve(term_freqs.size());
         for (auto& [term, _] : term_freqs) {
@@ -593,10 +603,8 @@ SearchLayer::search_text(std::string_view query, std::size_t k,
 std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::search_phrase(std::string_view query, std::size_t k,
                            const bm25::Bm25Params* params_override) const {
-    // S9.28：短语匹配依赖查询词序。analyze() 返回的 map 无序，不能直接取 terms；
-    // 用 analyze_with_positions 按 position 还原 query 词序（与 search_near 一致）。
-    auto tpm = analyzer_->analyze_with_positions(query);
-    if (tpm.empty()) return std::vector<SearchHit>{};
+    // S10-A1:缓存检查前置（同 search_text）。
+    if (query.empty()) return std::vector<SearchHit>{};
 
     auto cache_key = CacheKey::make("phrase", query, k);
     auto cached = params_override
@@ -607,6 +615,11 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k,
     if (cached) {
         results = std::move(*cached);
     } else {
+        // S9.28：短语匹配依赖查询词序。analyze() 返回的 map 无序，不能直接取 terms；
+        // 用 analyze_with_positions 按 position 还原 query 词序（与 search_near 一致）。
+        auto tpm = analyzer_->analyze_with_positions(query);
+        if (tpm.empty()) return std::vector<SearchHit>{};
+
         std::vector<std::pair<std::uint32_t, std::string>> ordered;  // (position, term)
         for (auto& [term, data] : tpm) {
             for (auto pos : data.second) ordered.push_back({pos, term});
@@ -691,10 +704,8 @@ SearchLayer::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t m
 std::expected<std::vector<SearchHit>, std::string>
 SearchLayer::bool_search(std::string_view query, std::size_t k,
                          const bm25::Bm25Params* params_override) const {
-    auto query_node = bitcask::bm25::parse_query(query);
-    if (query_node.term.empty() && query_node.children.empty()) {
-        return std::vector<SearchHit>{};
-    }
+    // S10-A1:缓存检查前置（同 search_text）。
+    if (query.empty()) return std::vector<SearchHit>{};
 
     auto cache_key = CacheKey::make("bool", query, k);
     auto cached = params_override
@@ -705,6 +716,11 @@ SearchLayer::bool_search(std::string_view query, std::size_t k,
     if (cached) {
         results = std::move(*cached);
     } else {
+        auto query_node = bitcask::bm25::parse_query(query);
+        if (query_node.term.empty() && query_node.children.empty()) {
+            return std::vector<SearchHit>{};
+        }
+
         const auto* inv = field_index(kDefaultField);
         if (inv) results = inv->bool_search(query_node, k, index_, params_override);
         if (!params_override && !results.empty()) {

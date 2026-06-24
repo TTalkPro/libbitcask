@@ -128,6 +128,11 @@ public:
     // 构造 analyzer（可能因无效配置失败）。caller 应检查返回值。
     explicit SearchLayer(const SearchLayerConfig& config);
 
+    // S10-A1: 测试专用构造函数——注入自定义 analyzer（如计数 wrapper）。
+    // 生产代码用上面的构造函数。injected_analyzer 为 nullptr 时退化为默认。
+    SearchLayer(const SearchLayerConfig& config,
+                std::unique_ptr<text::Analyzer> injected_analyzer);
+
     // 禁止拷贝（Index 内部含共享状态）。
     SearchLayer(const SearchLayer&) = delete;
     SearchLayer& operator=(const SearchLayer&) = delete;
