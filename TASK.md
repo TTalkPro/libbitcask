@@ -442,6 +442,69 @@
   - 验证：每条 build + 全量 **469/469 ctest** + TSan（thread_pool 23 / batch 4）零 race +
     修改文件无新增告警，行为零变更（纯重构对拍）。
 
+- [ ] **S9 全代码库重构评估（6 准则）** — 全代码库审计（S8 仅覆盖 S6/S7 新代码，本轮扩展到全部）
+  - **审计方法（2026-06-24）**：3 个并行 explore agent 扫描全代码库（架构/类层级 + RAII/锁 +
+    代码重复）。指标快照：总 21853 行，raw new/delete 仅 6 处（4 HNSW 锁-free 必需、1 task_arena
+    故意泄漏），smart pointer 96 处，std::thread 16 处（全 join）。注释密度：cask 23%、keydir 26%
+    （好）；inverted/hnsw 12%（中等）；**search_layer 仅 8%（需补）**。
+  - **准则 5（锁/死锁）✅ 无问题**：IndexPool「单锁不变量」（S8-R2 已审计）、KeyDir 文档化锁序
+    （`barrier → gate → meta → shard → fstats`）、HNSW 正确 spinlock 协议、SearchLayer/SearchCache
+    标准 shared_mutex。全代码库无死锁风险、无线程泄漏。
+  - **准则 2（内聚/耦合/继承/模式）✅ 总体健康**：无循环依赖（DAG：cask → keydir/fileops/merge/
+    search → index/bm25/vec/text）；11 种设计模式正确使用（Template Method / Factory / Strategy /
+    CoW / Atomic Swap / Pipeline / Registry / LRU / Barrier / Sharded / WAL）。**2 个 god class 待评估**
+    （见 P2 项）。
+
+  - [ ] **P0-a FieldSchema FILE\* → RAII** — `include/bitcask/field_schema.hpp:28,52,54,105`
+    - 裸 `std::FILE* fp_`，析构 + open() 手动 fclose。fread 抛异常或 open 中途失败 → fd 泄露。
+    - 修复：`std::unique_ptr<std::FILE, int(*)(std::FILE*)> fp_{nullptr, std::fclose}`。
+    - 风险：低（行为零变更）。
+  - [ ] **P0-b search_checkpoint 3 处 fclose → RAII** — `include/bitcask/search_checkpoint.hpp:146-174`
+    - 3 个 fopen/fclose 对；第二个 fopen 后抛异常 → 第一个 fd 泄露。
+    - 修复：同 P0-a unique_ptr<FILE,deleter> 包裹。
+    - 风险：低。
+  - [ ] **P0-c kDefaultField → constexpr string_view** — `src/search/search_layer.cpp`（22+ 处）
+    - 每次比较构造临时 `std::string(kDefaultField)`；改 `constexpr std::string_view` 直接比较，
+      消除 22+ 次临时 string 分配。
+    - 风险：低（性能小赢）。
+  - [ ] **P0-d byte_order.hpp 提取共享工具** — `src/fileops/codec.cpp:20-54` + `src/keydir/keydir.cpp:1082-1107`
+    - `le_load_u16/32/64` / `le_store_u16/32/64` 在 codec.cpp 匿名空间；keydir.cpp 用 reinterpret_cast
+      + memcpy 重造了 `snap_put32/snap_put64`。新建 `include/bitcask/byte_order.hpp` 两处共用。
+    - 风险：低。
+  - [ ] **P1-a C API new/delete → unique_ptr** — `c_api/bitcask_c.cpp:222,231`
+    - 裸 `new bitcask_impl_t` / 裸 `delete`；caller 遗漏 close → 泄露。改 unique_ptr + 自定义 deleter。
+    - 风险：低。
+  - [ ] **P1-b vbyte 编码去重** — `src/fileops/codec.cpp:58-64` + `include/bitcask/vbyte.hpp:27-33`
+    - codec.cpp 匿名 `vbyte_append()` 与 vbyte.hpp `vbyte_encode()` 逻辑相同；合并到 vbyte.hpp。
+    - 风险：低。
+  - [ ] **P1-c search_layer.cpp 注释补充** — `src/search/search_layer.cpp`（1355 行，注释密度仅 8%）
+    - 补 `map_analyze` / `reduce_apply` / `search_hybrid` RRF 融合 / checkpoint save/load 的算法说明。
+    - 风险：零（纯文档）。
+  - [ ] **P1-d thread_local buffer 工具类** — `src/fileops/data_file.cpp:225` + `src/fileops/hint_file.cpp:97`
+    - 两处 `thread_local vector<byte>` + retain 限制 + resize 模式重复；抽 `ThreadLocalBuffer` 工具类。
+    - 风险：中（改 I/O 路径，需全量测试）。
+  - [ ] **P2-a Cask god class 拆分（search 方法抽 SearchOps）** — `include/bitcask/cask.hpp`（694 行,
+    60+ 公有方法） + `src/cask/cask.cpp`（1993 行）
+    - 职责过多：KV facade + search facade + merge 协调 + 迭代器 + 读缓存 + 索引池。
+    - 建议：search_* 系列 15+ 方法抽到内部 `SearchOps` helper 类。Cask 保留 facade 角色。
+    - 风险：高（大重构，动核心 API）。
+  - [ ] **P2-b InvertedIndex god class 拆分（ScoringEngine + PostingManager）** — `src/bm25/inverted.cpp`（2049 行）
+    - 职责过多：BM25 评分 + Block-Max WAND + posting 管理 + WAL + compaction + 5 种搜索模式。
+    - 建议：抽 `ScoringEngine`（纯评分）+ `PostingManager`（posting 生命周期）。
+    - 风险：高（核心算法路径，需 bench 对拍）。
+  - [ ] **P2-c Analyzer 空文本基类默认实现** — `src/text/analyzer.cpp:167,271,312,358`
+    - 4 个子类 `analyze_with_positions` 开头都 `if (text.empty()) return {};`；基类加默认实现。
+    - 风险：低。
+  - [ ] **P2-d search 层 SearchError 枚举** — `src/search/search_layer.cpp`（返回 `expected<..., string>`）
+    vs `src/cask/cask.cpp`（返回 `expected<..., CaskFault>`）
+    - search 层定义 `SearchError` 枚举，cask 边界翻译为 CaskFault。消除 leaky abstraction。
+    - 风险：中（接口变更）。
+  - [ ] **P2-e 魔法数字具名常量** — `src/bm25/inverted.cpp`（`0xFFFFFFFF` sentinel 3 处）+ 分散页大小常量
+    - `0xFFFFFFFF` → `kInvalidPos`；`4096/65536/262144` → `format.hpp` 统一 `kPageSize4K` 等。
+    - 风险：低。
+  - **执行建议**：P0（4 项）风险最低、收益明确，优先实施。P1（4 项）次之。P2（5 项）含 god class
+    拆分等高风险大重构，按需推进或永久搁置（现状可工作，god class 是风格问题非正确性问题）。
+
 ---
 
 ## 待办：小修小补（第七梯队，低成本、收益较小）
