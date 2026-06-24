@@ -655,4 +655,65 @@ TEST(IndexPoolMultiLib, UnregisterOneLibKeepsOthersRunning) {
     pool.stop();
 }
 
+// AT6（S6-P4）：reorder 背压防 OOM。reducer 卡在首个 entry → reorder buffer
+// 涨到 reorder_cap 后 map worker 停 pop → queue 满 → producer 阻塞（内存有界，
+// 不无限堆积）。释放 reducer 后全部追平、零丢失。
+TEST(IndexPoolMultiLib, ReorderBackpressureBoundsMemoryThenDrains) {
+    constexpr int kWorkers = 2;
+    constexpr std::size_t kQueueCap   = 8;
+    constexpr std::size_t kReorderCap = 8;
+    IndexPool pool(kWorkers, kQueueCap, kReorderCap);
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool release = false;
+    std::atomic<std::size_t> processed{0};
+    std::atomic<bool> reducer_blocked{false};
+
+    IndexLane* lane = pool.register_lib(
+        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        [&](ReorderEntry&) {
+            if (processed.load() == 0) {
+                std::unique_lock<std::mutex> lk(m);
+                reducer_blocked = true;
+                cv.wait(lk, [&] { return release; });
+            }
+            ++processed;
+        },
+        []() {}, 0);
+
+    // 先喂一条让 reducer 卡住。
+    pool.submit(lane, IndexTask::make(IndexOp::Add, "k", 0, "t", 0, 0, 0, 0, 0));
+    while (!reducer_blocked.load()) std::this_thread::yield();
+
+    // feeder 狂喂 kTotal 条：reducer 卡住 → reorder 涨到 cap → worker 停 pop →
+    // queue 满 → feeder 在某条 submit 上阻塞。
+    constexpr std::size_t kTotal = 1000;
+    std::atomic<std::size_t> submitted{1};  // 已喂 ord=0
+    std::thread feeder([&] {
+        for (std::size_t i = 1; i < kTotal; ++i) {
+            pool.submit(lane, IndexTask::make(IndexOp::Add, "k", i, "t", 0, 0, 0, 0, 0));
+            submitted.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    // 给 feeder 充分时间——它必定被背压卡住，远不到 kTotal（内存有界证明）。
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const std::size_t s = submitted.load();
+    EXPECT_LT(s, kTotal) << "背压必须挡住 producer（内存有界），实际已 submit=" << s;
+    // 上界粗估：在途 ≈ reorder_cap + 队列 + worker 数 + 余量，远小于 kTotal。
+    EXPECT_LE(s, kReorderCap + kQueueCap + kWorkers + 16u);
+
+    // 释放 reducer → 全部追平。
+    { std::lock_guard<std::mutex> lk(m); release = true; }
+    cv.notify_all();
+    feeder.join();
+    pool.flush(lane);
+    EXPECT_EQ(processed.load(), kTotal) << "释放后必须零丢失全部 apply";
+    EXPECT_EQ(submitted.load(), kTotal);
+
+    pool.unregister_lib(lane);
+    pool.stop();
+}
+
 }  // namespace

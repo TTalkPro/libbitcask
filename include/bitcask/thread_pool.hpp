@@ -256,20 +256,21 @@ struct IndexLane {
     std::atomic<std::size_t>   in_flight{0};          // 本 lane 在途任务数（队列+reorder）
 };
 
-// per-registry 的共享索引线程管理器（S6-P3）。
-// S6-P2: 拆成 dispatcher（pop 任务 + 分发到 TBB 或 reorder）+ reducer（按 ord
-// 序 apply）双线程架构。tbb::task_group 跑 map_fn_；reorder buffer 用 mutex
-// + cv 协调两端。
-// T6 阶段会增加 Search Pool（基于 TBB task_arena）。
+// per-registry 的共享索引线程管理器（S6-P3 共享 / S6-P4 并行 map）。
+// 架构：queue → N 个 map worker（std::thread，并发跑 map_analyze，真数据并行
+// → G1）→ per-lane reorder buffer → 1 reducer（按 ord 序 apply，库内单写者）。
+// 背压：reorder 在途上限，达限则 map worker 停 pop → queue 满 → put 阻塞。
 class IndexPool {
 public:
-    explicit IndexPool(int concurrency = 1, std::size_t queue_capacity = 10240)
-        : queue_(queue_capacity)
-    {
-        // stopped_/pending_/next_apply_ord_ 走默认成员初始化（false/0/0），
-        // 不在此重复列出——避免与声明顺序不一致触发 -Wreorder。
-        (void)concurrency;
-    }
+    // S6-P4: concurrency = map worker 线程数（真数据并行：N 个 worker 从 queue
+    // 并发拉取跑 map_analyze）。reorder_cap = 全局 reorder buffer 在途上限
+    // （背压：达上限 map worker 停 pop → queue 满 → put 阻塞；防 OOM，D4）。
+    explicit IndexPool(int concurrency = 1, std::size_t queue_capacity = 10240,
+                       std::size_t reorder_cap = 16384)
+        : map_concurrency_(concurrency > 0 ? concurrency : 1)
+        , reorder_cap_(reorder_cap)
+        , queue_(queue_capacity)
+    {}
 
     ~IndexPool() { stop(); }
 
@@ -281,7 +282,7 @@ public:
     // 注册一条库车道：注入回调 + reorder buffer 起始 ord，返回稳定句柄。
     // init_ord = cask::open 时 keydir「已分配最大 ord + 1」，reducer 跳过
     // [0, init_ord) 区间（disk fold 恢复已建索引）。首次注册时惰性启动
-    // dispatcher/reducer 线程（registry 共享池：线程数与库数解耦 → G2）。
+    // N 个 map worker + reducer 线程（registry 共享池：线程数与库数解耦 → G2）。
     IndexLane* register_lib(MapFn map_fn, ReduceFn reduce_fn, ErrorFn error_fn,
                             std::uint64_t init_ord = 0) {
         IndexLane* raw = nullptr;
@@ -360,14 +361,29 @@ public:
                                                std::memory_order_acq_rel)) {
             return;
         }
-        queue_.push(IndexTask::sentinel());
-        // joinable() guard 兼容「start() 从未调用」场景：默认构造的
-        // std::thread 不 joinable，跳过 join——Cask::open 失败回滚时
-        // IndexPool 可能在 start() 前被析构，此 guard 防止 UB。
-        if (dispatcher_.joinable()) dispatcher_.join();
-        // S6-P2: dispatcher 退出时已串行排干所有 in-flight map（dispatcher
-        // 单线程 + parallel_for 同步）。无需额外 wait。
-        if (reducer_.joinable())    reducer_.join();
+        // S6-P4: 唤醒可能卡在背压上的 map worker（stopped_ 旁路谓词 → 全速排干）。
+        {
+            std::lock_guard<std::mutex> lk(reorder_mu_);
+            map_cv_.notify_all();
+        }
+        // 每个 map worker 推一个 sentinel：FIFO 下 sentinel 排在所有真任务之后，
+        // worker 先排干真任务再各 pop 一个 sentinel 退出（N 任务 N 哨兵，均衡，
+        // 无 worker 卡空队列）。从未 ensure_started 时 map_workers_ 空，零推送。
+        for (std::size_t i = 0; i < map_workers_.size(); ++i) {
+            queue_.push(IndexTask::sentinel());
+        }
+        for (auto& w : map_workers_) {
+            if (w.joinable()) w.join();
+        }
+        // 所有 map worker 已退出 ⇒ 所有 in-flight map 完成、所有 entry 已入
+        // reorder buffer。此时才置 got_sentinel_ 通知 reducer 收尾——保证
+        // reducer 不会在尚有 entry 未入 buffer 时提前退出。
+        {
+            std::lock_guard<std::mutex> lk(reorder_mu_);
+            got_sentinel_ = true;
+        }
+        reorder_cv_.notify_one();
+        if (reducer_.joinable()) reducer_.join();
     }
 
     bool is_stopped() const {
@@ -390,70 +406,36 @@ public:
     }
 
 private:
-    // ---- Dispatcher + TBB map + reorder buffer (S6-P2) ----
+    // ---- S6-P4: 并行 map worker 池 + reorder buffer ----
 
-    // 路由一条 IndexTask：Add + fields → TBB map；其它 → 直接构造 entry 推
-    // reorder buffer。RebuildHnsw 是同步屏障点（必须等所有 in-flight map
-    // 跑完才能插入到正确 ord 位置）。
-    void dispatch_one(IndexTask task) {
+    // 处理一条任务：Add+fields 跑 map_analyze（真并行——本函数在 N 个 map
+    // worker 上并发执行），其余直接构造 entry。结果按 ord 入 lane 的 reorder
+    // buffer，reducer 串行按 ord 序 apply。RebuildHnsw 无需屏障：reducer 的
+    // ord 序保证它在所有 ord<K apply 后才 apply（届时所有前序 map 必已完成）。
+    void process_task(IndexTask task) {
+        IndexLane* lane = task.lane;
         if (task.op == IndexOp::Add && !task.fields.empty()) {
-            // S6-P2: 并行 map 用 tbb::parallel_for(0,1,lambda) —— 单元素
-            // range，TBB 调度一个 task 到 worker 线程执行。task 的小对象
-            // 分配在 TBB arena 内，释放也在 arena 内，避开 task_group
-            // 从 std::thread 调 run() 的 thread_data 错配（TSan 严苛检查
-            // 下会触发 small_object_pool destroy 断言 m_private_counter<0）。
-            // TSan 限制：lambda 不能是 mutable（TBB 内部 const 调）。
-            // 所有可变状态通过捕获指针 + lambda 内局部变量实现。
-            IndexLane* lane = task.lane;
-            MapFn     map_fn   = lane->map_fn;
-            ErrorFn   error_fn = lane->error_fn;
-            std::mutex*                       mu = &reorder_mu_;
-            std::condition_variable*          cv = &reorder_cv_;
-            std::map<std::uint64_t, ReorderEntry>* pending = &lane->pending;
-            std::uint64_t                     ord  = task.ord;
-            // 显式构造 local task 对象并调用 operator() —— 避免 parallel_for
-            // 内部的 start_for 分配（TSan-strict 模式下与 std::thread 调
-            // parallel_for 的 thread_data 错配）。并行语义由 TBB 调度器
-            // 自然处理。
-            auto map_task = [t = std::move(task), map_fn = std::move(map_fn),
-                             error_fn = std::move(error_fn), ord, mu, cv, pending]() {
-                ReduceEntry entry;
-                try {
-                    entry = map_fn(t);
-                } catch (...) {
-                    if (error_fn) error_fn();
-                    entry = ReduceEntry{};
-                }
-                ReorderEntry re{std::move(entry)};
-                {
-                    std::lock_guard<std::mutex> lk(*mu);
-                    pending->emplace(ord, std::move(re));
-                }
-                cv->notify_one();
-            };
-            // TSan 兼容：tbb::parallel_for(0, 0) 不会分配 start_for（早退）；
-            // tbb::parallel_for(0, 1) 会分配，可能与 caller thread_data 错配。
-            // 解法：直接调 tbb::this_task_arena::isolate + parallel_for。
-            tbb::this_task_arena::isolate([&] {
-                tbb::parallel_for(std::size_t{0}, std::size_t{1},
-                                  [&](std::size_t) { map_task(); });
-            });
+            // map_analyze：纯函数（analyzer const、cppjieba Cut const 线程安全），
+            // 多 worker 对同 lane 并发调用安全（F7）。
+            ReduceEntry entry;
+            try {
+                entry = lane->map_fn(task);
+            } catch (...) {
+                if (lane->error_fn) lane->error_fn();
+                entry = ReduceEntry{};
+            }
+            push_reorder(lane, task.ord, ReorderEntry{std::move(entry)});
         } else if (task.op == IndexOp::RebuildHnsw) {
-            // Sync barrier：必须等所有 in-flight map job 完成，才能把
-            // RebuildEntry 插到正确 ord 位置（ord 序由 reducer 保证）。
-            flush_parallel_map();
-            push_reorder(task.lane, task.ord, ReorderEntry{RebuildEntry{}});
+            push_reorder(lane, task.ord, ReorderEntry{RebuildEntry{}});
         } else if (task.op == IndexOp::Delete) {
             DeleteEntry de;
             de.key = std::string(task.key());
             de.ord = task.ord;
-            push_reorder(task.lane, task.ord, ReorderEntry{std::move(de)});
+            push_reorder(lane, task.ord, ReorderEntry{std::move(de)});
         } else if (task.op == IndexOp::Skip) {
-            push_reorder(task.lane, task.ord, ReorderEntry{SkipEntry{}});
+            push_reorder(lane, task.ord, ReorderEntry{SkipEntry{}});
         } else {
-            // on_write（单 text 路径）：构造 OnWriteEntry 跨线程交给 reducer
-            // —— task 持有的是 owning 副本（buf/meta/vec），在 dispatcher
-            // 线程构造 entry 时复制到 entry 字段，然后 push 后 task 析构。
+            // on_write（单 text 路径）：构造 OnWriteEntry 跨线程交给 reducer。
             OnWriteEntry owe;
             owe.key      = std::string(task.key());
             owe.ord      = task.ord;
@@ -464,65 +446,48 @@ private:
             owe.tstamp   = task.tstamp;
             owe.meta     = std::move(task.meta);
             owe.vec      = std::move(task.vec);
-            push_reorder(task.lane, task.ord, ReorderEntry{std::move(owe)});
+            push_reorder(lane, task.ord, ReorderEntry{std::move(owe)});
         }
     }
 
-    // S6-P2: RebuildHnsw barrier 替代 map_group_.wait()。当前实现：空
-    // parallel_for(0, 0)，无任务立即返回——in-flight map 任务由 parallel_for
-    // 自身隐式同步（其返回时所有任务已 complete）。但仅在「dispatcher 串行
-    // 处理任务」的语义下成立：若某时刻 dispatcher 已 fork 但 TBB worker 尚未
-    // 返回，parallel_for 会等它完成才返回 dispatch_one。
-    void flush_parallel_map() {
-        tbb::parallel_for(std::size_t{0}, std::size_t{0},
-                          [](std::size_t) {});
-    }
-
+    // 推一条 entry 进 lane 的 reorder buffer，并计入全局在途计数（背压）。
     void push_reorder(IndexLane* lane, std::uint64_t ord, ReorderEntry entry) {
         {
             std::lock_guard<std::mutex> lk(reorder_mu_);
             lane->pending.emplace(ord, std::move(entry));
+            ++reorder_inflight_;
         }
         reorder_cv_.notify_one();
     }
 
-    // 惰性启动 dispatcher + reducer（首次 register_lib 调）。幂等。
-    // reducer 先启动，确保在 dispatcher 推 entry 前已在 reorder_cv_ 等待。
+    // 惰性启动 N 个 map worker + 1 个 reducer（首次 register_lib 调）。幂等。
+    // reducer 先启动，确保在 worker 推 entry 前已在 reorder_cv_ 等待。
     void ensure_started() {
         std::lock_guard<std::mutex> lk(start_mu_);
         if (started_) return;
         started_ = true;
-        reducer_    = std::thread([this] { reducer_loop(); });
-        dispatcher_ = std::thread([this] { dispatcher_loop(); });
+        reducer_ = std::thread([this] { reducer_loop(); });
+        map_workers_.reserve(static_cast<std::size_t>(map_concurrency_));
+        for (int i = 0; i < map_concurrency_; ++i) {
+            map_workers_.emplace_back([this] { map_worker_loop(); });
+        }
     }
 
-    void dispatcher_loop() {
-        // 关键：必须先 pop 再检查 stopped_。否则 start() 之后立即 stop()
-        // 会把 stopped_ 置位，然后才轮到本线程被调度 → 顶部检查就退出、
-        // 留下的 sentinel 永远不被消费 → reducer 永远卡在 cv 上。
+    // map worker：从 queue 并发拉任务跑 process_task（真数据并行 → G1）。
+    // 背压：reorder 在途达上限则先在 map_cv_ 上等（不 pop → queue 满 → put
+    // 阻塞），stopped_ 旁路谓词使 shutdown 全速排干（防与 sentinel 死锁）。
+    void map_worker_loop() {
         while (true) {
-            auto task = queue_.pop();
-            if (task.op == IndexOp::Sentinel) {
-                // Shutdown：dispatcher 单线程串行处理所有任务，循环回到
-                // 顶部 pop 必然看到 sentinel 之前所有 parallel_for 已返
-                // 回（parallel_for 同步），无需显式 barrier。drain 残留
-                // 任务后设 got_sentinel_ 唤醒 reducer。
-                IndexTask remaining;
-                while (queue_.try_pop(remaining)) {
-                    if (remaining.op == IndexOp::Sentinel) continue;
-                    dispatch_one(std::move(remaining));
-                }
-                {
-                    std::lock_guard<std::mutex> lk(reorder_mu_);
-                    got_sentinel_ = true;
-                }
-                reorder_cv_.notify_one();
-                break;
+            {
+                std::unique_lock<std::mutex> lk(reorder_mu_);
+                map_cv_.wait(lk, [this] {
+                    return reorder_inflight_ < reorder_cap_
+                        || stopped_.load(std::memory_order_acquire);
+                });
             }
-            dispatch_one(std::move(task));
-            // 严格 shutdown 路径必须经 Sentinel；外部 stop() 总是推
-            // 一个 Sentinel 进来，所以即使本循环迭代完了所有在飞任务，
-            // 下一个 pop 必拿到 sentinel 退出。无需在此读 stopped_。
+            IndexTask task = queue_.pop();
+            if (task.op == IndexOp::Sentinel) break;  // 每 worker 恰好一个哨兵
+            process_task(std::move(task));
         }
     }
 
@@ -568,6 +533,10 @@ private:
                     dec_in_flight(lane.get());  // 必然执行：异常也推进 ord
 
                     lk.lock();
+                    // S6-P4: 该 entry 已离开 reorder buffer → 让出在途名额，
+                    // 唤醒可能因背压阻塞的 map worker。
+                    --reorder_inflight_;
+                    map_cv_.notify_one();
                     progressed = true;
                     break;  // 迭代器可能已失效 → 重扫
                 }
@@ -600,24 +569,21 @@ private:
 
     // ---- 成员 ----
 
-    // S6-P2: 双线程 pipeline
-    std::thread     dispatcher_;
-    std::thread     reducer_;
-    // 实际用 tbb::parallel_for(0, 1, lambda) 调度单元素并行 map。原先
-    // 用 tbb::task_group 时从 std::thread（dispatcher）调 run()，小对象
-    // 分配走 dispatcher 线程的 thread_data，TBB worker 释放 → 线程退出时
-    // small_object_pool destroy 断言 m_private_counter<0。parallel_for
-    // 把内部 task 分配交给 TBB 调度器所在的 arena，避开此问题。
-    // RebuildHnsw barrier 用 flush_parallel_map() 串行调用 parallel_for
-    // （无任务时即立即返回，等价于 wait）。
+    // S6-P4: N 个 map worker（真数据并行跑 map_analyze）+ 1 个 reducer
+    // （per-lane ord 序串行 apply）。worker 是普通 std::thread（不走 TBB
+    // task_group → 规避 P2 的 small_object_pool thread_data TSan 坑）。
+    const int                        map_concurrency_;
+    std::vector<std::thread>         map_workers_;
+    std::thread                      reducer_;
 
     // S6-P3: 惰性启动（首次 register_lib）。start_mu_ 保护 started_ 与建线程。
     std::mutex                       start_mu_;
     bool                             started_ = false;
 
     // S6-P3: 库车道表。reorder_mu_ 同时保护 lanes_ 容器与各 lane 的 pending/
-    // next_apply_ord（register/unregister 改容器，dispatcher/TBB push pending，
-    // reducer 扫描+drain，全在此锁下）。shared_ptr 让 reducer 拷活 lane 防 UAF。
+    // next_apply_ord + reorder_inflight_（register/unregister 改容器，map
+    // worker push pending，reducer 扫描+drain，全在此锁下）。shared_ptr 让
+    // reducer 拷活 lane 防 UAF。
     std::unordered_map<LibId, std::shared_ptr<IndexLane>> lanes_;
     LibId                            next_lib_id_ = 0;
 
@@ -625,10 +591,16 @@ private:
     IndexLane*                       default_lane_ = nullptr;
     std::uint64_t                    pending_initial_ord_ = 0;
 
-    // Reorder 协调（全 lane 共享一把锁 + cv；apply 极轻，P4 可分片）
+    // Reorder 协调（全 lane 共享一把锁；apply 极轻，P4+ 可分片）。
+    // reorder_cv_：reducer 等就绪 entry。map_cv_：map worker 等背压名额。
     std::mutex                       reorder_mu_;
     std::condition_variable          reorder_cv_;
+    std::condition_variable          map_cv_;
     bool                             got_sentinel_ = false;  // 退出信号（整池）
+    // S6-P4: reorder buffer 全局在途计数 + 上限（背压防 OOM，D4）。受
+    // reorder_mu_ 保护。push 时 ++，apply 后 --；达 cap 时 map worker 停 pop。
+    std::size_t                      reorder_inflight_ = 0;
+    const std::size_t                reorder_cap_;
 
     // 控制
     std::atomic<bool>                stopped_{false};
