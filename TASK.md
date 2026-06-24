@@ -914,8 +914,6 @@
   - **已完成（2026-06-24）**：扫输入文件 sizes 估算 record 数（`file_size / 64` 粗估），
     `pending_.reserve(est)`。`file_size` 失败（ec 非零）时跳过该文件。大 merge 省 ~log(N) realloc。
   - 验证：472/472 ctest + TSan（merge_concurrent 3 例零 race）。
-  - **修法**：扫输入文件 sizes 估算 `pending_.reserve(estimated_live_count)`。
-  - **收益**：大 merge 减少 ~log(N) 次 realloc。风险：低。
 
 ### C 梯队：算法 / SOTA（中 ROI 中风险，需 bench）
 
@@ -967,15 +965,15 @@
 - [ ] **D6 `select_neighbors` 中 `vec_of(pid)` 反复取** — `src/vector/hnsw.cpp:577-610`
   - M=16 ef=200 = 3200 次冗余向量取指。picked 列表存 `{d, id, vec_ptr}` 或预取。风险：低。
 
-### S10 执行建议
+### S10 执行进度（2026-06-24）
 
-**立即做（A 梯队）**：A1 → A4 → A5 → A2 → A3（A1 最简零风险；A4/A5 写入热路径；A2/A3
-查询热路径）。预估 ~3-4 天全部落地 + 全量 ctest + TSan + bench 量化。
+**A 梯队 — 全部完成**：A1 ✅（缓存前置）/ A2 ✅（WAND 块上界 <1% 保留）/ A3 ⏭️ 跳过（std::function 非热点）/ A4 ✅（字段名 intern，内存 −40%）/ A5 ✅（字段打包，alloc −6.4%）。
 
-**次轮（B 梯队）**：B1 → B3 → B6 → B5 → B2 → B4（B2/B4 依赖 B1 或动接口，靠后）。
+**B 梯队 — 低风险项完成**：B1 ✅（SynonymMap span）/ B5 ✅（HNSW PQ 复用）/ B6 ✅（merger reserve）/ B3 ⏭️ 跳过（NRVO 已优化）。**B2/B4 保留**（中风险：B2 动 InvertedIndex 接口，B4 改 LRU 结构）。
 
-**按需（C 梯队）**：A2 落地后跑 WAND bench，决定 C4 是否值得；C5/C6 与未来 v4 格式
-绑定，不在本轮范围。
+**S9-P0 — 全部完成**：P0-a ✅（FieldSchema RAII）/ P0-b ✅（checkpoint RAII）/ P0-c ✅（kDefaultField 透明查找）/ P0-d ✅（byte_order.hpp 提取）。**P1/P2 保留**。
+
+**按需（C 梯队）**：A2 实测 <1%，C4（Block-Max MaxScore）暂不推荐（A2 同类优化未达预期）。C5/C6 与未来 v4 格式绑定。
 
 **穿插（D 梯队）**：D1/D2/D3 可随手改；D4 单独 PR 配套导出表审计；D5/D6 视 bench 结果。
 
