@@ -161,9 +161,10 @@ public:
 
     // S6-P0: 纯函数阶段 — analyze 各字段 + catch-all 合并，产 ReduceJob。
     // 无锁、无共享状态变更（analyzer_ 是 const 线程安全）。
+    // S10-A5:fields 改 string_view 借用（IndexTask 打包进 fields_store；同步 caller 借 caller 的 string）。
     [[nodiscard]] ReduceJob map_analyze(
         std::string_view key, std::uint64_t ord,
-        const std::vector<std::pair<std::string, std::string>>& fields,
+        const std::vector<std::pair<std::string_view, std::string_view>>& fields,
         std::uint32_t file_id, std::uint64_t offset,
         std::uint32_t total_sz, std::uint32_t tstamp) const;
 

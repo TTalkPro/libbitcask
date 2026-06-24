@@ -855,19 +855,24 @@
     crash_recovery 7 + thread_pool 18 = 125 例）。bench：`bench/a4_field_intern_bench.cpp`（ad-hoc，
     全局 operator new 计数 + 短/长字段名 before/after 对比）。
 
-- [ ] **A5 `put_doc` 的 `task_fields()` lambda 拷贝所有字段名+值为新 string** — `src/cask/cask.cpp:1591-1599`
-  - **现状**：
-    ```cpp
-    for (auto& [name, val] : doc.fields) {
-        fs.push_back({name,  // ← 字段名 string 拷贝
-            std::string(reinterpret_cast<const char*>(val.data()), val.size())});  // ← 值 string 拷贝
-    }
-    ```
-    字段名在 `field_schema_.intern(name)`（`:1587`）已算过 id，这里又拷一份 owning
-    string；字段值是 `span<byte>` 强转 string 又一份。
-  - **修法**：`IndexTask::fields` 改 `vector<pair<string_view, span<const byte>>>` 或
-    `vector<pair<uint32_t field_id, span<const byte>>>`。W2 已示范 IndexTask 字段演进。
-  - **收益**：每次 `put_doc` 省 `2 × num_fields` 次 string 分配。风险：低。
+- [x] **A5 `put_doc` 的 `task_fields()` lambda 拷贝所有字段名+值为新 string** — `src/cask/cask.cpp`、`include/bitcask/thread_pool.hpp`、`include/bitcask/search_layer.hpp`、`src/search/search_layer.cpp`
+  - **已完成（2026-06-24）**。`IndexTask::fields` 从 `vector<pair<string,string>>` 改为
+    `vector<pair<string_view,string_view>>`，字段名+值打包进新增 `fields_store`（`vector<char>`，
+    **一次分配**替代 N×2 次 string 拷贝）。`make()` 去掉 `fields_` 参数（caller 构造后直设
+    fields_store+fields，同 vec/meta 模式）。`map_analyze` 签名改收 `pair<string_view,string_view>`；
+    `on_write_fields` 外部签名不变（内部转换 pair<string,string>→pair<sv,sv>，无堆分配）。
+  - **生命周期安全**：`fields_store` 是 `vector<char>`（无 SSO），move 必为指针转移 → string_view
+    跨 IndexTask 多次移动（入队/出队）始终有效。同步路径（on_write_fields/recover_doc*）的 views
+    借自 caller 的 string / 局部 string_view，调用期间有效。
+  - **实测（before/after operator new 计数，Release+LTO+native，5 字段/文档）**：
+    - alloc/put: 101.8 → **95.3**（**−6.5, −6.4%**）—— 精确消除 5 value string 拷贝 + vector，
+      净增 2 alloc（pack buffer + views vector）。
+    - bytes/put: 8145 → **7086**（**−1059, −13%**）—— 堆字节显著降（省去 N 个 string 对象开销）。
+    - 字段名（SSO ≤15B）本就不堆分配（A4 已验），收益主要来自字段值（>15B 文档文本）。
+  - **改动面**：4 生产文件 + 2 测试/bench 文件（加 `mk_fields_task` helper 替代旧 10 参数 make）。
+    on_write_fields/recover_doc* 内部改构造 `pair<string_view,string_view>`，无 API 变更。
+  - 验证：Release **472/472 ctest**；TSan 零 race（cask_docvalue 66 + thread_pool 22 +
+    search_layer 34 + crash_recovery 7 = 129 例）。
 
 ### B 梯队：中 ROI 低/中风险（次轮）
 

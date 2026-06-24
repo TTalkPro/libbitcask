@@ -96,9 +96,12 @@ struct IndexTask {
     std::uint64_t        offset    = 0;
     std::uint32_t        total_sz  = 0;
     std::uint32_t        tstamp    = 0;
-    std::uint32_t        doc_len   = 0; // token 总数（BM25 统计用）
-    // S8.6 多字段：非空时走 on_write_fields；text 字段保留兼容单字段路径。
-    std::vector<std::pair<std::string, std::string>> fields;
+    std::uint32_t doc_len   = 0; // token 总数（BM25 统计用）
+    // S10-A5:多字段名+值打包进 fields_store(一次分配),fields 持 string_view 借自其中。
+    // vector<char> move 必为指针转移(无 SSO)→跨 IndexTask 移动后 view 仍有效。
+    // 空时(fields_store 为空)对应无多字段(text-only)路径。
+    std::vector<char> fields_store;
+    std::vector<std::pair<std::string_view, std::string_view>> fields;
     // V3.3:Add 任务的文档向量(已归一化;空 = 无)。worker 转交
     // SearchLayer::on_vector → HNSW insert。
     std::vector<float> vec;
@@ -115,13 +118,12 @@ struct IndexTask {
     }
 
     // 唯一构造入口（Sentinel 除外）：key+text 一次分配进 buf。
+    // S10-A5:多字段数据由 caller 在构造后直接设 fields_store+fields（同 vec/meta 模式）。
     static IndexTask make(IndexOp op_, std::string_view key_,
                           std::uint64_t ord_, std::string_view text_,
                           std::uint32_t file_id_, std::uint64_t offset_,
                           std::uint32_t total_sz_, std::uint32_t tstamp_,
-                          std::uint32_t doc_len_,
-                          std::vector<std::pair<std::string, std::string>>
-                              fields_ = {}) {
+                          std::uint32_t doc_len_) {
         IndexTask t;
         t.op = op_;
         t.buf.reserve(key_.size() + text_.size());
@@ -134,7 +136,6 @@ struct IndexTask {
         t.total_sz = total_sz_;
         t.tstamp   = tstamp_;
         t.doc_len  = doc_len_;
-        t.fields   = std::move(fields_);
         return t;
     }
 

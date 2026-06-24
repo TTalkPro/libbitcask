@@ -400,7 +400,7 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
 
 ReduceJob SearchLayer::map_analyze(
     std::string_view key, std::uint64_t ord,
-    const std::vector<std::pair<std::string, std::string>>& fields,
+    const std::vector<std::pair<std::string_view, std::string_view>>& fields,
     std::uint32_t file_id, std::uint64_t offset,
     std::uint32_t total_sz, std::uint32_t tstamp) const {
     ReduceJob job;
@@ -410,8 +410,6 @@ ReduceJob SearchLayer::map_analyze(
     job.offset   = offset;
     job.total_sz = total_sz;
     job.tstamp   = tstamp;
-
-    const std::string default_field(kDefaultField);
 
     // catch-all（S8.6 修复 + O5 合并优化）：把非默认字段词项合并进默认字段，
     // 使 search_text/phrase/near（只查默认字段）也能命中多字段文档。
@@ -423,12 +421,12 @@ ReduceJob SearchLayer::map_analyze(
     std::uint32_t ca_pos_base = 0;
 
     for (auto& [fname, ftext] : fields) {
-        const std::string field = fname.empty() ? default_field : fname;
+        const std::string_view field = fname.empty() ? kDefaultField : fname;
         auto term_data = analyzer_->analyze_with_positions(ftext);
         std::uint32_t flen = 0;
         for (auto& [_, data] : term_data) flen += data.first;
 
-        if (field == default_field) {
+        if (field == kDefaultField) {
             job.wrote_default = true;
         } else if (!term_data.empty()) {
             std::uint32_t field_max_pos = 0;
@@ -446,13 +444,14 @@ ReduceJob SearchLayer::map_analyze(
         }
 
         job.fields.push_back(ReduceJob::FieldResult{
-            std::move(field), std::move(term_data), flen});
+            std::string(field), std::move(term_data), flen});
         job.total_doc_len += flen;
     }
 
     job.ca_data = std::move(ca_data);
     // 高亮：默认字段原文（多字段高亮的精细化留待后续）。
-    job.doc_text = fields.empty() ? std::string{} : fields.front().second;
+    job.doc_text = fields.empty() ? std::string{}
+                                  : std::string(fields.front().second);
     return job;
 }
 
@@ -503,7 +502,13 @@ void SearchLayer::on_write_fields(
     const std::vector<std::pair<std::string, std::string>>& fields,
     std::uint32_t file_id, std::uint64_t offset,
     std::uint32_t total_sz, std::uint32_t tstamp) {
-    auto job = map_analyze(key, ord, fields, file_id, offset, total_sz, tstamp);
+    // S10-A5:同步路径—fields 借 caller 的 string 构造 views（无堆分配）。
+    std::vector<std::pair<std::string_view, std::string_view>> fvs;
+    fvs.reserve(fields.size());
+    for (const auto& [name, text] : fields) {
+        fvs.emplace_back(name, text);
+    }
+    auto job = map_analyze(key, ord, fvs, file_id, offset, total_sz, tstamp);
     reduce_apply(job, {}, {});
 }
 
@@ -857,8 +862,8 @@ void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
     // S6-P0:单字段(kDefaultField) 恢复——map_analyze + reduce_apply 复用。
     // map_analyze 在 default_field 上写出 → wrote_default=true,触发不到
     // catch-all 路径,语义与原版逐条 recover_doc 完全一致。
-    std::vector<std::pair<std::string, std::string>> fields;
-    fields.emplace_back(std::string(kDefaultField), std::string(text));
+    std::vector<std::pair<std::string_view, std::string_view>> fields;
+    fields.emplace_back(kDefaultField, text);
     auto job = map_analyze(key, ord, fields, file_id, offset, total_sz, tstamp);
     reduce_apply(job, {}, vector);
 }
@@ -880,8 +885,8 @@ void SearchLayer::recover_doc_batch(std::vector<RecoverDoc>& batch) {
     std::vector<ReduceJob> jobs(n);
     tbb::parallel_for(std::size_t{0}, n, [&](std::size_t i) {
         const auto& d = batch[i];
-        std::vector<std::pair<std::string, std::string>> fields;
-        fields.emplace_back(std::string(kDefaultField), d.text);
+        std::vector<std::pair<std::string_view, std::string_view>> fields;
+        fields.emplace_back(kDefaultField, d.text);
         jobs[i] = map_analyze(d.key, d.ord, fields,
                               d.file_id, d.offset, d.total_sz, d.tstamp);
     });

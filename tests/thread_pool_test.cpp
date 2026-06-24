@@ -31,6 +31,19 @@ using bitcask::DeleteEntry;
 using bitcask::SkipEntry;
 using bitcask::RebuildEntry;
 
+// S10-A5: make() 不再带 fields 参数；测试用此 helper 构造带字段 task。
+// string_view 指向 string literal（静态存储）→ 任务生命周期内有效。
+static IndexTask mk_fields_task(
+    bitcask::IndexOp op, std::string_view key, std::uint64_t ord,
+    std::string_view text, std::uint32_t file_id, std::uint64_t offset,
+    std::uint32_t total_sz, std::uint32_t tstamp, std::uint32_t doc_len,
+    std::initializer_list<std::pair<std::string_view, std::string_view>> flds) {
+    auto t = IndexTask::make(op, key, ord, text, file_id, offset, total_sz,
+                             tstamp, doc_len);
+    t.fields.assign(flds.begin(), flds.end());
+    return t;
+}
+
 // S6-P2: 简单计数测试用 — map 返回空 ReduceEntry，reduce 端计数。
 // ALL task 类型走 reducer 计数（map 仅 Add+fields 触发）。
 static void StartCountingPool(IndexPool& pool,
@@ -370,10 +383,10 @@ TEST(IndexPool, AddWithFieldsGoesThroughMap) {
         []() {}
     );
 
-    pool.submit(IndexTask::make(
+    pool.submit(mk_fields_task(
         IndexOp::Add, "k0", 0, "text", 1, 0, 0, 0, 0,
         {{"title", "hello"}, {"body", "world"}}));
-    pool.submit(IndexTask::make(
+    pool.submit(mk_fields_task(
         IndexOp::Add, "k1", 1, "text", 1, 0, 0, 0, 0,
         {{"title", "another"}}));
 
@@ -402,10 +415,10 @@ TEST(IndexPool, MapExceptionDoesNotStall) {
         [&]() { ++error_count; }
     );
 
-    pool.submit(IndexTask::make(
+    pool.submit(mk_fields_task(
         IndexOp::Add, "k0", 0, "text", 1, 0, 0, 0, 0,
         {{"title", "x"}}));
-    pool.submit(IndexTask::make(
+    pool.submit(mk_fields_task(
         IndexOp::Add, "k1", 1, "text", 1, 0, 0, 0, 0,
         {{"title", "y"}}));
 
@@ -468,11 +481,11 @@ TEST(IndexPool, ReducerAppliesInOrdOrder) {
         []() {}
     );
 
-    pool.submit(IndexTask::make(
+    pool.submit(mk_fields_task(
         IndexOp::Add, "k0", 0, "t", 1, 0, 0, 0, 0, {{"f", "x"}}));
-    pool.submit(IndexTask::make(
+    pool.submit(mk_fields_task(
         IndexOp::Add, "k1", 1, "t", 1, 0, 0, 0, 0, {{"f", "y"}}));
-    pool.submit(IndexTask::make(
+    pool.submit(mk_fields_task(
         IndexOp::Add, "k2", 2, "t", 1, 0, 0, 0, 0, {{"f", "z"}}));
 
     pool.flush();
@@ -600,7 +613,7 @@ TEST(IndexPoolMultiLib, LanesApplyIndependentlyInOrdOrder) {
         producers.emplace_back([&pool, lane = lanes[lib]] {
             for (int i = 0; i < kPerLib; ++i) {
                 // Add-with-fields → 走 TBB 并行 map → 该 lane 的 reorder buffer。
-                pool.submit(lane, IndexTask::make(
+                pool.submit(lane, mk_fields_task(
                     IndexOp::Add, "k" + std::to_string(i),
                     static_cast<std::uint64_t>(i), "text",
                     1, 0, 0, 0, 0,

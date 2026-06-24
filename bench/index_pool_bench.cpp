@@ -28,6 +28,17 @@ using bitcask::IndexTask;
 using bitcask::ReduceEntry;
 using bitcask::ReorderEntry;
 
+static IndexTask mk_fields_task(
+    bitcask::IndexOp op, std::string_view key, std::uint64_t ord,
+    std::string_view text, std::uint32_t file_id, std::uint64_t offset,
+    std::uint32_t total_sz, std::uint32_t tstamp, std::uint32_t doc_len,
+    std::initializer_list<std::pair<std::string_view, std::string_view>> flds) {
+    auto t = IndexTask::make(op, key, ord, text, file_id, offset, total_sz,
+                             tstamp, doc_len);
+    t.fields.assign(flds.begin(), flds.end());
+    return t;
+}
+
 namespace {
 
 // 固定 CPU 负载，模拟 analyze（分词）的每文档开销。volatile sink 防优化。
@@ -56,7 +67,7 @@ static void BM_IndexPool_SubmitDrain(benchmark::State& state) {
         state.ResumeTiming();
 
         for (int i = 0; i < kTasks; ++i) {
-            pool.submit(IndexTask::make(
+            pool.submit(mk_fields_task(
                 IndexOp::Add, "key", static_cast<std::uint64_t>(i),
                 "some representative text payload", 0, 0, 0, 0, 0,
                 {{"body", "some representative text payload"}}));
@@ -93,7 +104,7 @@ static void BM_IndexPool_MapSpeedup(benchmark::State& state) {
         state.ResumeTiming();
 
         for (int i = 0; i < kTasks; ++i) {
-            pool.submit(IndexTask::make(
+            pool.submit(mk_fields_task(
                 IndexOp::Add, "k", static_cast<std::uint64_t>(i), "t",
                 0, 0, 0, 0, 0, {{"body", "t"}}));
         }
@@ -142,7 +153,7 @@ static void BM_IndexPool_MultiLibThroughput(benchmark::State& state) {
         for (std::size_t l = 0; l < lanes.size(); ++l) {
             producers.emplace_back([&pool, lane = lanes[l]] {
                 for (int i = 0; i < kPerLib; ++i) {
-                    pool.submit(lane, IndexTask::make(
+                    pool.submit(lane, mk_fields_task(
                         IndexOp::Add, "k", static_cast<std::uint64_t>(i), "t",
                         0, 0, 0, 0, 0, {{"body", "t"}}));
                 }

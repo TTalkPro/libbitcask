@@ -1587,15 +1587,27 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
             p.fields.push_back({field_schema_.intern(name), val});
         }
     };
-    // S8.6：把多字段拷成 IndexTask.fields（name→text string，异步路径需独立存储）。
-    auto task_fields = [&doc]() {
-        std::vector<std::pair<std::string, std::string>> fs;
-        fs.reserve(doc.fields.size());
-        for (auto& [name, val] : doc.fields) {
-            fs.push_back({name,
-                std::string(reinterpret_cast<const char*>(val.data()), val.size())});
+    // S10-A5:多字段名+值打包进单个 fields_store（一次分配替代 2×num_fields 次 string 分配）。
+    // fields 持 string_view 借自 fields_store；vector<char> move = 指针转移 → view 跨 IndexTask 移动仍有效。
+    auto pack_fields = [&doc]() {
+        std::size_t total = 0;
+        for (const auto& [name, val] : doc.fields) total += name.size() + val.size();
+        std::vector<char> store;
+        store.reserve(total);
+        std::vector<std::pair<std::string_view, std::string_view>> views;
+        views.reserve(doc.fields.size());
+        for (const auto& [name, val] : doc.fields) {
+            auto name_off = store.size();
+            store.insert(store.end(), name.begin(), name.end());
+            auto val_off = store.size();
+            store.insert(store.end(),
+                         reinterpret_cast<const char*>(val.data()),
+                         reinterpret_cast<const char*>(val.data()) + val.size());
+            views.emplace_back(
+                std::string_view(store.data() + name_off, name.size()),
+                std::string_view(store.data() + val_off, val.size()));
         }
-        return fs;
+        return std::pair{std::move(store), std::move(views)};
     };
 
     if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
@@ -1631,8 +1643,13 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
         IndexOp::Add, bytes_to_view(key), persisted->ord,
         std::string_view(reinterpret_cast<const char*>(doc.text.data()),
                          doc.text.size()),
-        persisted->file_id, persisted->offset, persisted->total_size, tstamp, 0,
-        task_fields());
+        persisted->file_id, persisted->offset, persisted->total_size, tstamp, 0);
+    // S10-A5:多字段打包进 fields_store（一次分配），替代旧 task_fields() 的 N×2 string 拷贝。
+    {
+        auto [store, views] = pack_fields();
+        task.fields_store = std::move(store);
+        task.fields = std::move(views);
+    }
     // W2:cosine 路径 vec_out 是 vec_norm 的 span，encode（上方 parts.vector）
     // 已用完，可直接移交，省一次 512B（128-dim）拷贝 + 分配。其余情形
     // （passthrough / L2）vec_out 指向 doc.vector，仍需拷贝。
