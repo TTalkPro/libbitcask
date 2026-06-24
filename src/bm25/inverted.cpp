@@ -491,6 +491,9 @@ auto InvertedIndex::search_wand(
         std::size_t cursor = 0;
         float idf = 0.0f;
         float list_upper_bound = 0.0f;
+        // S10-A2:per-query per-block 上界缓存。idf/avgdl 查询时常量，
+        // max_tf/min_dl 索引时确定 → block_upper 整个查询期间不变，初始化一次算好。
+        std::vector<float> block_upper_bounds;
     };
     std::vector<TermPostings> tps;
     tps.reserve(query_terms.size());
@@ -531,6 +534,12 @@ auto InvertedIndex::search_wand(
         tp.idf = static_cast<float>(std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) /
                                              (static_cast<double>(live_df) + 0.5)));
         tp.list_upper_bound = tp.fp.block_upper_bound(tp.idf, params, avgdl);
+        // S10-A2:per-block 上界一次算好，WAND 内层循环免每次 pivot 重算。
+        tp.block_upper_bounds.reserve(tp.fp.blocks.size());
+        for (const auto& blk : tp.fp.blocks) {
+            tp.block_upper_bounds.push_back(
+                upper_bound_from(blk.max_tf, tp.idf, params, avgdl, blk.min_dl));
+        }
     }
 
     using Entry = std::pair<float, std::uint64_t>;
@@ -605,17 +614,10 @@ auto InvertedIndex::search_wand(
 
             const auto* block = tp.fp.block_for_ord(pivot_ord);
             if (block != nullptr) {
-                // A1:块上界接 v5 impacts(max_tf + min_dl),替代 dl=1
-                // 假设——与 bool MUST 路径同源收紧 ~25%/词(§6.2)。
-                // (保持内联表达式,与原代码逐运算一致;此循环每 pivot
-                // 每词执行一次,在热路径上。)
-                float block_tf_norm =
-                    static_cast<float>(block->max_tf) * (params.k1 + 1.0f) /
-                    (static_cast<float>(block->max_tf) + params.k1 *
-                     (1.0f - params.b +
-                      params.b * static_cast<float>(block->min_dl) /
-                          static_cast<float>(avgdl)));
-                float block_upper = tp.idf * (block_tf_norm + params.delta);
+                // S10-A2:读初始化阶段算好的 per-block 上界（免每次 pivot 重算 6 FMA+1 div）。
+                const std::size_t block_idx =
+                    static_cast<std::size_t>(block - tp.fp.blocks.data());
+                const float block_upper = tp.block_upper_bounds[block_idx];
                 // A1 修复:原公式 threshold - heap.top() 在 threshold ==
                 // heap.top()(下方 θ 更新同源)时恒 ≈1e-6,块跳跃从未
                 // 触发过(死代码)。正确判定:本词块上界 + 其余词列表

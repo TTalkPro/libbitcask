@@ -797,14 +797,30 @@
       build/third_party/utf8proc/libutf8proc.a -ltbb -lz -lpthread -o /tmp/a1_bench && /tmp/a1_bench`
   - 风险：低（纯顺序调整 + test-only API 扩展）。
 
-- [ ] **A2 WAND 块上界 / list 上界每次重算 — 未缓存** — `src/bm25/inverted.cpp:531-533, 612-618`
-  - **现状**：`block_tf_norm = max_tf × (k1+1) / (max_tf + k1×(...))` 公式每次 pivot
-    重算（6 FMA + 1 div）；`list_upper_bound` 每查询重算。
-  - **修法**：`PostingBlock`（`inverted.hpp:71-82`）加 `float upper_bound`，`finalize()`/
-    `seal_full_blocks()` 时一次算好；`FlatPostings` 加 `float list_upper_bound`，
-    `snapshot_flat()` 时算好。WAND 内层循环改成 O(1) 读。
-  - **收益**：3-8%（多 term WAND，10-term × 100 pivot ≈ 1000 次冗余浮点除法）。
-  - 风险：低（容量预留 + 一次写入；不动 WAND 算法）。
+- [x] **A2 WAND 块上界 / list 上界每次重算 — 未缓存** — `src/bm25/inverted.cpp:531-533, 612-618`
+  - **已完成（2026-06-24）**：`TermPostings` 加 `block_upper_bounds` 数组（per-query
+    per-block 缓存），查询初始化阶段一次性算好所有 block 的 upper_bound；WAND 内层
+    循环改为指针减法取 index + O(1) 读缓存。`list_upper_bound` 经核实**本就已缓存**
+    （line 533），仅 `block_upper` 是每次 pivot 重算。
+  - **⚠️ 实测收益 < 1%（噪声级别）**，远低于预估的 3-8%：
+    - 5-term WAND (k=10): 121.13 → 121.67 µs/q（-0.4%，噪声）
+    - 10-term WAND (k=10): 264.44 → 263.04 µs/q（+0.5%，噪声）
+    - 5-term WAND (k=1):  116.27 → 116.79 µs/q（-0.4%，噪声）
+    - 10-term WAND (k=1): 264.27 → 263.28 µs/q（+0.4%，噪声）
+  - **收益不显著原因（事后分析）**：WAND 热点不在 `block_upper` 浮点计算（~5ns/次，
+    6 FMA + 1 div），而在：① `snapshot_flat`（每 term 拷贝 ords/tfs/blocks 数组）；
+    ② `fill_is_live`/`fill_doc_lens`（每 term 虚调用 + 批量填充）；③ 评分循环的 tf_norm
+    除法（每 pivot_ord 一次）；④ cursor 排序（每 pivot 插入排序）。这些都是 µs 级，
+    block_upper 的 5ns 是小头。
+  - **决策：保留改动**。理由：① 代码正确（语义不变，消除冗余计算）；② 与 bool_search
+    BMW 路径的 `c.block_ub[b]` 缓存模式统一；③ 极端场景（更频繁块跳跃）可能有边际收益；
+    ④ 风险低（不改算法，仅缓存派生值）。
+  - **测试**：无新增（既有 472 例覆盖 WAND 路径）。
+  - **验证**：Release **472/472 ctest** + TSan 零 race（inverted 77 + search_layer 34）。
+  - **bench**：`bench/a2_wand_blockmax_bench.cpp`（ad-hoc，5000 docs × 12 vocab，
+    5/10-term × k=1/10 对比）。
+  - **教训**：预估"3-8%"基于"1000 次冗余浮点除法"的算术，忽略了 block_upper 判定分支
+    的实际触发频率相对其他热点偏低。未来类似优化应先 profile 再投入。
 
 - [ ] **A3 `search_vector` 每次构造 `std::function` 回调** — `src/search/search_layer.cpp:235-247`
   - **现状**：`std::function<bool(std::uint64_t)> live` 捕获 `[this, filter]` 触发
