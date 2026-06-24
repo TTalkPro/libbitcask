@@ -7,7 +7,10 @@
 #include <cstdint>
 #include <mutex>
 #include <thread>
+#include <variant>
 #include <vector>
+
+#include <dirent.h>
 
 #include <gtest/gtest.h>
 
@@ -17,6 +20,7 @@ namespace {
 
 using bitcask::IndexOp;
 using bitcask::IndexPool;
+using bitcask::IndexLane;
 using bitcask::IndexTask;
 using bitcask::IndexTaskQueue;
 using bitcask::TbbLifetime;
@@ -517,6 +521,137 @@ TEST(IndexPool, RebuildHnswCarriesOrd) {
     EXPECT_EQ(rebuild_count.load(), 1);
     EXPECT_EQ(pool.submitted_ord_hwm(), 2);  // RebuildHnsw ord=1 included
     EXPECT_EQ(pool.applied_ord(), 2);
+    pool.stop();
+}
+
+// ===== S6-P3: 多 lib 共享池（AT5）=====
+
+// 统计当前进程 OS 线程数（/proc/self/task 目录项）。Linux 专用。
+static int count_os_threads() {
+    int n = 0;
+    if (DIR* d = ::opendir("/proc/self/task")) {
+        while (dirent* e = ::readdir(d)) {
+            if (e->d_name[0] != '.') ++n;
+        }
+        ::closedir(d);
+    }
+    return n;
+}
+
+// AT5-a：线程数与库数解耦（G2）。注册第 1 个 lib 惰性启动 dispatcher+reducer
+// 两个线程；之后注册任意多 lib 都不再起新线程。不提交任务（避免 TBB 懒起
+// worker 干扰计数），纯验证「线程数 = 常量，与库数无关」的结构性保证。
+TEST(IndexPoolMultiLib, ThreadCountIndependentOfLibCount) {
+    IndexPool pool(1, 10240);
+    auto noop_map   = [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; };
+    auto noop_red   = [](ReorderEntry&) {};
+    auto noop_err   = []() {};
+
+    const int before = count_os_threads();
+    IndexLane* l0 = pool.register_lib(noop_map, noop_red, noop_err, 0);
+    const int after_first = count_os_threads();
+    // 首个 register 起 dispatcher + reducer 两条线程。
+    EXPECT_EQ(after_first - before, 2);
+
+    std::vector<IndexLane*> lanes{l0};
+    for (int i = 0; i < 49; ++i) {
+        lanes.push_back(pool.register_lib(noop_map, noop_red, noop_err, 0));
+    }
+    const int after_many = count_os_threads();
+    // 多注册 49 个 lib：零新增线程（无 per-库线程）。
+    EXPECT_EQ(after_many, after_first);
+
+    for (IndexLane* l : lanes) pool.unregister_lib(l);
+    pool.stop();
+}
+
+// AT5-b：库间独立 + 库内 ord 序。一个共享池，N 条 lane，每 lane 各自交错
+// 提交 Add-with-fields；reducer 对每条 lane 按其 ord 严格升序 apply（per-lane
+// I2）；各 lane 结果互不串扰。
+TEST(IndexPoolMultiLib, LanesApplyIndependentlyInOrdOrder) {
+    IndexPool pool(1, 10240);
+    constexpr int kLibs  = 4;
+    constexpr int kPerLib = 200;
+
+    // 每 lane 记录 reducer 看到的 ord 序列（reducer 单线程串行，无需锁）。
+    std::vector<std::vector<std::uint64_t>> seen(kLibs);
+    std::vector<IndexLane*> lanes(kLibs);
+
+    for (int lib = 0; lib < kLibs; ++lib) {
+        lanes[lib] = pool.register_lib(
+            // map：仅把 ord 透传进 ReduceJob（不做真分词），供 reducer 核对序。
+            [](const IndexTask& t) -> ReduceEntry {
+                ReduceEntry re;
+                re.job.ord = t.ord;
+                return re;
+            },
+            [&seen, lib](ReorderEntry& e) {
+                // ReduceEntry 来自 Add-with-fields；记录其 ord。
+                if (auto* re = std::get_if<ReduceEntry>(&e)) {
+                    seen[lib].push_back(re->job.ord);
+                }
+            },
+            []() {}, 0);
+    }
+
+    // N 个生产者线程，各喂自己的 lane（单写者契约：每 lane 一个 producer）。
+    std::vector<std::thread> producers;
+    for (int lib = 0; lib < kLibs; ++lib) {
+        producers.emplace_back([&pool, lane = lanes[lib]] {
+            for (int i = 0; i < kPerLib; ++i) {
+                // Add-with-fields → 走 TBB 并行 map → 该 lane 的 reorder buffer。
+                pool.submit(lane, IndexTask::make(
+                    IndexOp::Add, "k" + std::to_string(i),
+                    static_cast<std::uint64_t>(i), "text",
+                    1, 0, 0, 0, 0,
+                    {{"body", "text"}}));
+            }
+        });
+    }
+    for (auto& t : producers) t.join();
+
+    for (int lib = 0; lib < kLibs; ++lib) pool.flush(lanes[lib]);
+
+    // 每 lane 恰好看到自己的 kPerLib 条，且严格 0,1,...,kPerLib-1 升序。
+    for (int lib = 0; lib < kLibs; ++lib) {
+        ASSERT_EQ(seen[lib].size(), static_cast<std::size_t>(kPerLib))
+            << "lib " << lib;
+        for (int i = 0; i < kPerLib; ++i) {
+            EXPECT_EQ(seen[lib][i], static_cast<std::uint64_t>(i))
+                << "lib " << lib << " pos " << i;
+        }
+        EXPECT_EQ(lanes[lib]->applied_ord.load(),
+                  static_cast<std::uint64_t>(kPerLib - 1));
+    }
+
+    for (int lib = 0; lib < kLibs; ++lib) pool.unregister_lib(lanes[lib]);
+    pool.stop();
+}
+
+// AT5-c：unregister 后池仍服务其它 lib（生命周期隔离）。
+TEST(IndexPoolMultiLib, UnregisterOneLibKeepsOthersRunning) {
+    IndexPool pool(1, 10240);
+    std::atomic<std::size_t> cntA{0}, cntB{0};
+    IndexLane* a = pool.register_lib(
+        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        [&](ReorderEntry&) { ++cntA; }, []() {}, 0);
+    IndexLane* b = pool.register_lib(
+        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        [&](ReorderEntry&) { ++cntB; }, []() {}, 0);
+
+    for (int i = 0; i < 50; ++i)
+        pool.submit(a, IndexTask::make(IndexOp::Add, "k", i, "t", 1, 0, 0, 0, 0));
+    pool.flush(a);
+    pool.unregister_lib(a);  // a 排空并注销
+    EXPECT_EQ(cntA.load(), 50u);
+
+    // b 仍正常工作。
+    for (int i = 0; i < 30; ++i)
+        pool.submit(b, IndexTask::make(IndexOp::Add, "k", i, "t", 1, 0, 0, 0, 0));
+    pool.flush(b);
+    EXPECT_EQ(cntB.load(), 30u);
+
+    pool.unregister_lib(b);
     pool.stop();
 }
 
