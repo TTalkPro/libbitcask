@@ -735,3 +735,216 @@
   - **副作用契约**：iterator pin 会让 KeyDir 存活到迭代器析构；若同名库在此期间
     被 `open()`，registry 建新 KeyDir，老 iterator 在已释放出 registry 的旧
     KeyDir 快照上完成 fold——隔离、无正确性影响（fd 已 S13 pin）。
+
+---
+
+## 待办：第十梯队（S10 第三方审计 — 2026-06-24）
+
+> 来源：3 个并行 agent（explore × 2 + librarian × 1）+ 直接审计 posix_file / merger /
+> highlighter / synonym_map / search_cache / codec 等。已与 TASK.md 全部既有项交叉去重。
+> 总计 22 项，按 ROI/风险分 4 梯队。建议优先实施 A 梯队（5 项，~3-4 天可全部落地）。
+
+### A 梯队：高 ROI 低风险（优先）
+
+- [x] **A1 `search_text` / `phrase` / `bool` 缓存检查在 `analyze()` 之后** — `src/search/search_layer.cpp:545-556` 等
+  - **已完成（2026-06-24）**：三个查询入口（`search_text` / `search_phrase` / `bool_search`）
+    均改为缓存前置——`query.empty()` 早退 → 构造 `cache_key` → `cache_.get()` → 命中直接
+    用 cached results / 未命中才 `analyze` 或 `parse_query`。
+  - **正确性分析（Oracle 验证）**：
+    - `prepare_search() → flush_index()` 保证搜索开始前所有**先前**写入的失效已完成。
+    - 并发写入期间（设计允许，concurrency-zh §6）存在 ~20µs TOCTOU 窗口——hit 路径
+      返回的拷贝可能含并发删除的 doc。Oracle 确认这是 near-real-time 契约的**程度**
+      调整（窗口从 ~1µs 拓宽到 ~21µs），非**类别**变更。已在 `search_cache.hpp` 头注释
+      明示。
+    - `on_delete` / `reduce_apply` / `on_write` 的失效逻辑不动；`invalidate_terms` 的
+      交集判定无漏洞（Oracle 验证）。
+  - **测试**：新增 3 例护栏：
+    - `CacheHitSkipsAnalyzer`：注入 `CountingAnalyzer`（test-only 注入构造函数），
+      断言 hit 时 `analyze()` 调用次数不增加。
+    - `CachePhraseHitSkipsAnalyzer`：短语查询同等护栏（`analyze_with_positions`）。
+    - `CacheInvalidatedOnDeleteThenMissRecomputes`：契约验证——`on_delete` 后下次
+      查询 miss 重算，不返回陈旧缓存。
+  - **验证**：Release **472/472 ctest** 通过（原 469 + 3 新）；**TSan 零 race**
+    （search_layer 34 例 + cask_docvalue batch/concurrent 12 例）。
+  - **新公共 API**：`SearchLayer(const SearchLayerConfig&, unique_ptr<Analyzer>)`
+    test-only 注入构造函数（delegating ctor，nullptr 退化为默认）。
+  - **bench 量化**：`third_party/benchmark` submodule 网络受限，改写 ad-hoc 微基准
+    `bench/a1_cache_bench.cpp`（不依赖 google benchmark，直接 `<chrono>` 计时）。
+    **Release + LTO + `-march=native`，6 核**：
+
+    | 场景 | hit (µs/q) | miss (µs/q) | A1 节省 |
+    |---|---|---|---|
+    | Latin ngram 短查询（~20 字符）| 0.18 | 2.25 | **2.06 µs/q** |
+    | CJK ngram 短查询（~4 字符）| 0.17 | 2.43 | **2.27 µs/q** |
+    | **CJK ngram 长查询（~200 字符）** | **0.21** | **414** | **🔥 414 µs/q** |
+
+    命中率对整体延迟影响（Latin 短查询）：
+
+    | hit ratio | avg µs/q | QPS | 相对 0% 提升 |
+    |---|---|---|---|
+    | 0% | 2.10 | 478k | — |
+    | 50% | 1.13 | 884k | **+85%** |
+    | 90% | 0.34 | 2.93M | **+513%** |
+
+    **关键洞察**：
+    - **短查询**：节省 ~2µs/q，高 QPS 系统下显著（100k QPS × 2µs = 20% CPU 节省）。
+    - **长查询（甜区）**：CJK ngram 200 字符查询节省 **~414µs/q**——ngram 切分成本
+      随字符数超线性增长，A1 让这类查询从 ~2.4k QPS 飙到 ~4.8M QPS（hit 时）。
+    - **生产典型**（50% 命中率）：整体 QPS **+85%**。
+    - 复跑：`g++ -std=c++23 -O3 -DNDEBUG -march=native -Iinclude \
+      -Ithird_party/{unordered_dense,utf8proc,cppjieba,limonp}/include \
+      bench/a1_cache_bench.cpp build/libbitcask.a \
+      build/third_party/utf8proc/libutf8proc.a -ltbb -lz -lpthread -o /tmp/a1_bench && /tmp/a1_bench`
+  - 风险：低（纯顺序调整 + test-only API 扩展）。
+
+- [ ] **A2 WAND 块上界 / list 上界每次重算 — 未缓存** — `src/bm25/inverted.cpp:531-533, 612-618`
+  - **现状**：`block_tf_norm = max_tf × (k1+1) / (max_tf + k1×(...))` 公式每次 pivot
+    重算（6 FMA + 1 div）；`list_upper_bound` 每查询重算。
+  - **修法**：`PostingBlock`（`inverted.hpp:71-82`）加 `float upper_bound`，`finalize()`/
+    `seal_full_blocks()` 时一次算好；`FlatPostings` 加 `float list_upper_bound`，
+    `snapshot_flat()` 时算好。WAND 内层循环改成 O(1) 读。
+  - **收益**：3-8%（多 term WAND，10-term × 100 pivot ≈ 1000 次冗余浮点除法）。
+  - 风险：低（容量预留 + 一次写入；不动 WAND 算法）。
+
+- [ ] **A3 `search_vector` 每次构造 `std::function` 回调** — `src/search/search_layer.cpp:235-247`
+  - **现状**：`std::function<bool(std::uint64_t)> live` 捕获 `[this, filter]` 触发
+    small-object heap 分配（~32B）。每次向量查询都付。
+  - **注**：TASK.md:677 已审计谓词「仅在结果侧调，O(k) 次」— 但那是**调用频次**，
+    **每次 query 仍要构造 std::function 一次**（与调用频次独立）。
+  - **修法**：`HnswIndex::search()` 模板化 `template<class F> search(..., F&& live)`，
+    或定义 `LiveView{const Index*; const MetaFilter*}` + `operator()` 传 const 引用。
+  - **收益**：每次向量查询省 1 次堆分配 + 缓存扰动。风险：低（HNSW 接口模板化）。
+
+- [ ] **A4 `reduce_apply` 字段名 `std::string` 拷进 `ord_field_lens_`** — `src/search/search_layer.cpp:446-451`
+  - **现状**：`ord_field_lens_[job.ord]` 是 `std::map<uint64_t, vector<pair<string, u32>>>`，
+    每文档 map lookup（log n）+ 每字段 `emplace_back(f.field_name, ...)` 拷一份 owning
+    string。字段名在 `FieldSchema` 已 intern，这里多此一举。
+  - **修法**：改 `unordered_map<uint64_t, vector<pair<string_view, u32>>>`，string_view
+    借自 `FieldSchema`（put 期间 schema 不动）；`std::map` → `std::unordered_map`
+    把 log n → O(1)。
+  - **收益**：高。1M 文档 × 5 字段 × 10B ≈ 50MB 字符串分配消除 + 每文档 log n → O(1)。
+    风险：低（侧表，单写者访问）。
+
+- [ ] **A5 `put_doc` 的 `task_fields()` lambda 拷贝所有字段名+值为新 string** — `src/cask/cask.cpp:1591-1599`
+  - **现状**：
+    ```cpp
+    for (auto& [name, val] : doc.fields) {
+        fs.push_back({name,  // ← 字段名 string 拷贝
+            std::string(reinterpret_cast<const char*>(val.data()), val.size())});  // ← 值 string 拷贝
+    }
+    ```
+    字段名在 `field_schema_.intern(name)`（`:1587`）已算过 id，这里又拷一份 owning
+    string；字段值是 `span<byte>` 强转 string 又一份。
+  - **修法**：`IndexTask::fields` 改 `vector<pair<string_view, span<const byte>>>` 或
+    `vector<pair<uint32_t field_id, span<const byte>>>`。W2 已示范 IndexTask 字段演进。
+  - **收益**：每次 `put_doc` 省 `2 × num_fields` 次 string 分配。风险：低。
+
+### B 梯队：中 ROI 低/中风险（次轮）
+
+- [ ] **B1 `SynonymMap::expand` 返回 `vector<string>` by value** — `include/bitcask/synonym_map.hpp:64-86`
+  - **现状**：每次调用拷一份整组 synonyms。`expand_terms` 内部又调 `expand` 再拷。
+  - **修法**：返回 `span<const string>` 借内部存储；查不到返回空 span，caller 处理 fallback。
+  - **收益**：开启 synonyms 时每次查询省 ~num_synonyms × 10B 拷贝。风险：低。
+
+- [ ] **B2 `search_text` 的 `terms` 拷贝 + synonym 再拷** — `src/search/search_layer.cpp:562-568`
+  - **现状**：`analyzer_->analyze()` 返回 `unordered_map<string,...>`（map 拥有 string），
+    接着 `terms.push_back(term)` 又拷一遍 keys；synonym_map 存在则 `expand_terms(terms)`
+    返回新 vector 再拷。
+  - **修法**：`InvertedIndex::search` 接 `span<const string_view>`；analyzer 增
+    `analyze_terms()` 直接返回 `vector<string_view>`（借内部存储）。`search_phrase`/
+    `near`/`fuzzy`/`bool` 同模式（5 处重复，可抽 helper）。
+  - **收益**：每次查询省 `num_terms × avg_term_len` 拷贝。风险：中（动 InvertedIndex 接口）。
+
+- [ ] **B3 `doc_vector_f32` 总是返回 owning `vector<float>`** — `src/fileops/codec.cpp:345-364`
+  - **现状**：被 `cask.cpp:901, 1393` 调，每次分配 + memcpy（128-dim = 512B）。
+    `to_owned()`（`:1450-1451`）再 assign 一份（双拷贝）。
+  - **修法**：加 `doc_vector_f32_into(span<float> out)` 出参重载，对齐 `pread_into` 模式；
+    caller 复用 `thread_local` 缓冲。
+  - **收益**：每次 vector get 省 1 分配 + 1 memcpy。风险：低。
+
+- [ ] **B4 `on_delete` 重新跑完整 analyze 仅为失效缓存** — `src/search/search_layer.cpp:497-502`
+  - **现状**：`auto tf = analyzer_->analyze(*text)` 完整 NFKC + ngram + fold，
+    纯为建 `changed_terms` 给 `cache_.invalidate_terms()` 用。写入时已分过词。
+  - **修法**：`doc_texts_` LRU 条目同时存 `vector<string>` term 集（或 `vector<u64>`
+    hashed terms），删除时直接取。
+  - **收益**：每次删除省一次完整 NLP（CJK ~20µs/doc）。代价：每缓存条目多占
+    `num_terms × avg_term_len` 字节。风险：中（多占内存）。
+
+- [ ] **B5 HNSW `search_layer` 每次 stack 构造两个 `priority_queue`** — `src/vector/hnsw.cpp:429-430, 529-530`
+  - **现状**：`scratch` thread_local 复用了，但 `priority_queue` 对象本身每次重新
+    构造 — 内部 `vector<Cand>` 首次 push 分配（ef=256 估算 ~4KB）。
+  - **修法**：thread_local 持底层 `vector<Cand>`，每次从 move 构造 queue；函数尾 move
+    出来保留容量。
+  - **收益**：每次向量查询省 2 次堆分配。风险：低（注意 thread_local 生命周期）。
+
+- [ ] **B6 `merger` 的 `pending_` 不 reserve** — `src/merge/merger.cpp:56`
+  - **现状**：`vector<PendingUpdate>` 空，几何级增长。100M 记录 merge 多次 realloc。
+  - **修法**：扫输入文件 sizes 估算 `pending_.reserve(estimated_live_count)`。
+  - **收益**：大 merge 减少 ~log(N) 次 realloc。风险：低。
+
+### C 梯队：算法 / SOTA（中 ROI 中风险，需 bench）
+
+- [ ] **C1 `select_best_fragments` 是 O(F·R²)** — `src/search/highlighter.cpp:32-87`
+  - 三重嵌套：每选片段扫 R ranges × 每 anchor 扫 R × 选 F 片段。wildcard 扩展
+    出 20+ term 时 R 可能数百。
+  - **修法**：滑动窗口 + 前缀和 → O(R log R + F·R)。风险：中（算法重写）。
+
+- [ ] **C2 `SynonymMap::add_group` 是 O(n²)** — `include/bitcask/synonym_map.hpp:40-62`
+  - 每 term 都把整组 terms 拷进 map。N term 同组 → N 次完整 vector 拷贝。
+  - **修法**：组用 `shared_ptr<vector<string>>` 共享。风险：低。
+
+- [ ] **C3 BM25 BOW 整 vector 排序** — `src/bm25/inverted.cpp:155-156`
+  - `std::sort(hits.end())` 整集排序，仅为合并重复 ord + 取 top-k。
+  - **修法**：先 hash-aggregate 合并 ord（O(N)），再 partial_sort（O(N + k log k)）。
+    风险：中（动算法需对拍）。
+
+- [ ] **C4 SOTA：Block-Max MaxScore（Lucene 9.9 自适应合取）** — `src/bm25/inverted.cpp`（WAND 路径）
+  - Lucene 9.9 (2023)：term 按 max_score 排序，随 min-competitive-score 上升把
+    非本质子句转合取评估。
+  - **来源**：Elasticsearch Labs MAXSCORE 博客；Lucene story paper PMC7148045。
+  - **收益**：高频多子句查询 6-11%（Lucene nightly bench）。
+  - **风险**：中-高（核心评分路径重构）。建议 A2 落地后再评估。
+
+- [ ] **C5 SOTA：SIMD Posting 压缩（FastPFOR / SIMD-BP128）** — `src/bm25/inverted.cpp` + `inverted.hpp`
+  - posting list 未压缩存 `vector<Posting>`。Lemire SIMD-BP128⋆ ~0.7 cycles/int。
+  - **来源**：Lemire et al. SIMD Compression (2016)；ClickHouse 已采用。
+  - **风险**：高（新编码 + 兼容老 checkpoint）。建议作为新存储格式 v4 一部分。
+
+- [ ] **C6 SOTA：Roaring Bitmap 用于 filter / posting** — `src/bm25/`、`include/bitcask/meta_filter.hpp`
+  - 当前 filter 用 `MetaFilter::evaluate(blob)`；posting 用 vector。dense block + rank
+    优化可加速多字段 AND/OR 与 bool_search。
+  - **来源**：ES / Weaviate / Quickwit 均采用。
+  - **风险**：中（新依赖或自实现）。建议 bool_search 成为瓶颈时引入。
+
+### D 梯队：清理与小幅优化（按需穿插）
+
+- [ ] **D1 HNSW `search_layer` 顶层 `out.resize` 跨层 churn** — `src/vector/hnsw.cpp:461-466`
+  - `out.clear() + resize` 跨层可能 realloc。`out.reserve(ef)` 一次即可。风险：零。
+- [ ] **D2 `search_phrase`/`near`/`bool`/`fuzzy` 的内层重复模式抽 helper** — 多处
+  - "ordered terms 构建" + "results → hits materialize" 5+ 处重复。S8-R3 只动了外层。
+    纯代码质量。
+- [ ] **D3 `mmap` 的 read 文件加 `madvise(MADV_RANDOM)`** — `src/fileops/data_file.cpp:54-59`
+  - random access 模式 hint，减少内核 readahead 浪费。风险：零。
+- [ ] **D4 `.so` 链接加 `-fno-semantic-interposition` + `-fvisibility=hidden`** — `CMakeLists.txt`
+  - C++ 内部符号 inline 潜力释放（C API 已 `extern "C"`）。~3-5%。需审计导出表。风险：低。
+- [ ] **D5 `PosixFile::pread` / `read` 每次分配 `vector<byte>`** — `src/io/posix_file.cpp:70, 108`
+  - 已有 `pread_into`，但旧 API 还在。grep 确认无热路径调用，逐步迁移。风险：低。
+- [ ] **D6 `select_neighbors` 中 `vec_of(pid)` 反复取** — `src/vector/hnsw.cpp:577-610`
+  - M=16 ef=200 = 3200 次冗余向量取指。picked 列表存 `{d, id, vec_ptr}` 或预取。风险：低。
+
+### S10 执行建议
+
+**立即做（A 梯队）**：A1 → A4 → A5 → A2 → A3（A1 最简零风险；A4/A5 写入热路径；A2/A3
+查询热路径）。预估 ~3-4 天全部落地 + 全量 ctest + TSan + bench 量化。
+
+**次轮（B 梯队）**：B1 → B3 → B6 → B5 → B2 → B4（B2/B4 依赖 B1 或动接口，靠后）。
+
+**按需（C 梯队）**：A2 落地后跑 WAND bench，决定 C4 是否值得；C5/C6 与未来 v4 格式
+绑定，不在本轮范围。
+
+**穿插（D 梯队）**：D1/D2/D3 可随手改；D4 单独 PR 配套导出表审计；D5/D6 视 bench 结果。
+
+> **审计方法（2026-06-24）**：3 个并行 agent（explore × 2 + librarian × 1），覆盖
+> （a）Cask facade / search_layer / codec 热路径分配拷贝；（b）BM25/HNSW 算法与内存
+> 布局；（c）Bitcask/BM25/HNSW SOTA 文献对比。直接审计补充：posix_file / merger /
+> highlighter / synonym_map / search_cache。所有发现均与 TASK.md 既有项交叉去重。
