@@ -591,6 +591,17 @@ private:
     // 自然限速，避免任务无限堆积撑爆内存。
     void submit_index_task(IndexTask task);
 
+    // S7-4: 批量搜索公共骨架（去 search_*_batch 三方法的重复）。
+    //   ① 空批早退；② 一次 prepare_search()（flush，覆盖全批）；
+    //   ③ require_vector 时校验 vector_dim；④ N 条查询经共享 Search 池并发跑，
+    //      保序写各自结果槽（槽间不重叠 → 无锁）。
+    // run_one(i) 执行第 i 条查询并返回其结果（含 expected 错误）。
+    [[nodiscard]] std::vector<std::expected<TextSearchResult, CaskFault>>
+    run_search_batch(
+        std::size_t n, bool require_vector,
+        const std::function<
+            std::expected<TextSearchResult, CaskFault>(std::size_t)>& run_one);
+
     // S8-R3: 单条搜索公共骨架（去 9 个 search_* 单查询方法的重复）。
     //   prepare_search()（flush）→ require_vector 时校验 vector_dim → run() 跑内核
     //   → 失败包 err_kind（text 族 kIo / 向量族 kInvalidOption）→ 包成 TextSearchResult。
