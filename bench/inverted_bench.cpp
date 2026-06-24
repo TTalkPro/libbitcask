@@ -275,6 +275,48 @@ void BM_Inverted_SearchWhileIndexing(benchmark::State& state) {
 BENCHMARK(BM_Inverted_SearchWhileIndexing)->Threads(4)
     ->Unit(benchmark::kMicrosecond)->UseRealTime();
 
+// BOW 查询并发吞吐回归基准（T6 测量遗留）。多个调用线程并发跑同一小 BOW
+// 查询（8 词 × 120 postings = 960 总 < 1024 kWandThreshold → 走 score_bow_topk）。
+// items/s = 聚合 QPS（benchmark 跨线程自动汇总），随调用线程数（读并发）变化。
+//
+// 【背景】score_bow_topk 原用 tbb::parallel_reduce（grainsize=1）做查询内并行，
+// 本基准 + BITCASK_BM25_GRAIN 对拍实测：BOW 小查询上并行净亏（单线程 1.6×、
+// 并发 1.4–2.4× 慢，过度订阅）→ 已串行化（见 inverted.cpp score_bow_topk）。
+// 本基准留作回归：守住串行 BOW 的吞吐不退化。
+static InvertedIndex* g_bow_idx = nullptr;
+
+void BM_Inverted_QueryThroughputBOW(benchmark::State& state) {
+    if (state.thread_index() == 0) {
+        g_bow_idx = new InvertedIndex();
+        constexpr int kDocs = 120;   // 每词 120 postings × 8 词 = 960 < 1024 → BOW
+        for (int i = 0; i < kDocs; ++i) {
+            TermPositions tp;
+            for (int t = 0; t < 8; ++t) {
+                tp.emplace("t" + std::to_string(t),
+                           std::make_pair(std::uint32_t{1},
+                               std::vector<std::uint32_t>{
+                                   static_cast<std::uint32_t>(t)}));
+            }
+            g_bow_idx->add_doc(static_cast<std::uint64_t>(i), tp);
+        }
+    }
+    AllLiveChecker live;
+    const std::vector<std::string> query = {"t0", "t1", "t2", "t3",
+                                            "t4", "t5", "t6", "t7"};
+    for (auto _ : state) {
+        auto results = g_bow_idx->search(query, 10, live);
+        benchmark::DoNotOptimize(results);
+    }
+    if (state.thread_index() == 0) {
+        delete g_bow_idx;
+        g_bow_idx = nullptr;
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()));
+}
+// 1→16 调用线程（6 核机重点看 1/2/4/8）。
+BENCHMARK(BM_Inverted_QueryThroughputBOW)
+    ->ThreadRange(1, 16)->Unit(benchmark::kMicrosecond)->UseRealTime();
+
 }  // namespace
 
 // P2-min 基准：phrase 路径（唯一仍深拷贝 PostingList 的查询路径）。

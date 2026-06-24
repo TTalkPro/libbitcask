@@ -94,68 +94,62 @@ std::vector<SearchResult> score_bow_topk(
     const double avgdl =
         N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
-    // 并行 BM25 评分：parallel_reduce 按查询词分片，线程本地扁平
-    // (ord, contrib) 数组累积。替代 unordered_map：每 posting 一次 hash
-    // 节点分配 + reduce 阶段 O(n) hash 合并 → 向量追加 + 拼接,最终
-    // sort + 按 ord 归并累加(同 ord 的浮点累加顺序与 hash 版同为
-    // 分片相关,不引入新的不确定性)。
+    // 串行 BM25 评分：按查询词顺序累积扁平 (ord, contrib) 数组。
+    //
+    // 【T6 决策，2026-06-24】曾用 tbb::parallel_reduce 按词分片并行，但 BOW
+    // 路径按定义只在 total_postings < kWandThreshold(1024) 时走 ——评分工作量
+    // 恒小，TBB task spawn/steal/join 开销远超收益。实测（8 词 960 posting）：
+    // 串行较 grain=1 并行 **单线程快 1.6×、并发下快 1.4–2.4×**（grain=1 拆任务
+    // 在高读并发下过度订阅）。大查询走 WAND（串行），BOW 无任何需要并行的区间，
+    // 故彻底串行化。附带收益：评分浮点累加序确定（不再分片相关）。
     using Hit = std::pair<std::uint64_t, float>;
-    std::vector<Hit> hits = tbb::parallel_reduce(
-        tbb::blocked_range<std::size_t>(0, tps.size()),
-        std::vector<Hit>{},
-        [&](const tbb::blocked_range<std::size_t>& range,
-            std::vector<Hit> local) {
-            // 工作数组提到 term 循环外复用(原实现每 term 3 次分配)。
-            std::vector<char> live;
-            std::vector<std::uint32_t> dls;
-            std::vector<float> contrib;
-            for (std::size_t ti = range.begin(); ti < range.end(); ++ti) {
-                const auto& fp = tps[ti].fp;
-                const std::size_t n = fp.size();
+    std::vector<Hit> hits;
+    {
+        // 工作数组提到 term 循环外复用(原实现每 term 3 次分配)。
+        std::vector<char> live;
+        std::vector<std::uint32_t> dls;
+        std::vector<float> contrib;
+        for (std::size_t ti = 0; ti < tps.size(); ++ti) {
+            const auto& fp = tps[ti].fp;
+            const std::size_t n = fp.size();
 
-                // P2.1：live/doc_len 批量取——一次虚调用（Index 侧一次锁）完成
-                // 整列，评分浮点循环不再含虚调用，编译器可自动向量化。
-                live.resize(n);
-                live_checker.fill_is_live(fp.ords, live);
-                std::size_t live_df = 0;
-                for (std::size_t i = 0; i < n; ++i) {
-                    live_df += static_cast<std::size_t>(live[i]);
-                }
-                if (live_df == 0) continue;
-
-                auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
-
-                dls.resize(n);
-                live_checker.fill_doc_lens(fp.ords, dls);
-
-                // 两阶段评分：① 纯数组浮点（可向量化；死点也算、结果不用，
-                // 保持无分支），公式与逐 posting 版逐运算一致（分数位级不变）；
-                // ② 标量 append 进线程本地扁平数组。
-                contrib.resize(n);
-                const float fidf = static_cast<float>(idf);
-                const float inv_avgdl = 1.0f / static_cast<float>(avgdl);
-                detail::bm25_score_dispatch(
-                    fp.tfs.data(), dls.data(),
-                    params.k1 + 1.0f,
-                    params.k1 * (1.0f - params.b),
-                    params.k1 * params.b,
-                    params.delta,
-                    fidf,
-                    inv_avgdl,
-                    contrib.data(),
-                    n);
-                local.reserve(local.size() + live_df);
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (live[i]) local.emplace_back(fp.ords[i], contrib[i]);
-                }
+            // P2.1：live/doc_len 批量取——一次虚调用（Index 侧一次锁）完成
+            // 整列，评分浮点循环不再含虚调用，编译器可自动向量化。
+            live.resize(n);
+            live_checker.fill_is_live(fp.ords, live);
+            std::size_t live_df = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                live_df += static_cast<std::size_t>(live[i]);
             }
-            return local;
-        },
-        [](std::vector<Hit> a, std::vector<Hit> b) {
-            if (a.size() < b.size()) a.swap(b);  // 总把小的拼进大的
-            a.insert(a.end(), b.begin(), b.end());
-            return a;
-        });
+            if (live_df == 0) continue;
+
+            auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
+
+            dls.resize(n);
+            live_checker.fill_doc_lens(fp.ords, dls);
+
+            // 两阶段评分：① 纯数组浮点（可向量化；死点也算、结果不用，
+            // 保持无分支），公式与逐 posting 版逐运算一致（分数位级不变）；
+            // ② 标量 append 进扁平数组。
+            contrib.resize(n);
+            const float fidf = static_cast<float>(idf);
+            const float inv_avgdl = 1.0f / static_cast<float>(avgdl);
+            detail::bm25_score_dispatch(
+                fp.tfs.data(), dls.data(),
+                params.k1 + 1.0f,
+                params.k1 * (1.0f - params.b),
+                params.k1 * params.b,
+                params.delta,
+                fidf,
+                inv_avgdl,
+                contrib.data(),
+                n);
+            hits.reserve(hits.size() + live_df);
+            for (std::size_t i = 0; i < n; ++i) {
+                if (live[i]) hits.emplace_back(fp.ords[i], contrib[i]);
+            }
+        }
+    }
 
     // 按 ord 排序 → 同 ord 连续成段 → 归并累加,边累加边喂 top-k 小顶堆。
     std::sort(hits.begin(), hits.end(),
