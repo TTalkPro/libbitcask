@@ -265,13 +265,39 @@
     - **TSan 未完成**：oneTBB submodule 未初始化（网络受限），无法构建插桩 TBB。
       Oracle 已验证内存序正确性（release/acquire 链）；Release 全量通过。
     - 风险：中（并行 + 多线程 pipeline；解决多个竞态 + 死锁场景）。
-  - [ ] **S6-P3 池全局共享化（拿到 G2）** — `include/bitcask/cask.hpp`、`src/cask/cask.cpp`
-    - 每库一池 → 进程级单例双池 + LibId 路由 + per-库 reorder 状态注册/注销。
-    - open 注册 / close `flush(lib)` 后注销；open 失败回滚注销 lib（对齐现 RAII）。
-    - 验收：AT5 大规模库数 + 线程数恒定（= N+M，与库数无关）。
+  - [x] **S6-P3 池全局共享化（拿到 G2）** — `include/bitcask/thread_pool.hpp`、`include/bitcask/keydir_registry.hpp`、`src/keydir/keydir_registry.cpp`、`include/bitcask/cask.hpp`、`src/cask/cask.cpp`、`tests/thread_pool_test.cpp`
+    - **已完成（2026-06-24）**：每库一池 → **registry 共享单池 + per-`LibId` 车道（lane）**。
+    - **IndexPool 多 lib 化**：抽出 `IndexLane`（per-库回调 `map_fn/reduce_fn/error_fn` +
+      reorder buffer `pending`/`next_apply_ord` + 水位 `submitted_ord_hwm/applied_ord/in_flight`）。
+      **1 dispatcher + 1 reducer 全局共享**：dispatcher 按 `task.lane` 路由（Add-with-fields →
+      TBB 并行 map → 该 lane 的 pending；其余直推）；reducer **扫描所有 lane**，对每条 lane 按
+      其 `next_apply_ord` 串行 apply（库内 I2/I3，库间无队头阻塞）。新 API `register_lib(map,
+      reduce,error,init_ord)→IndexLane*` / `unregister_lib` / `submit(lane,task)` / `flush(lane)`；
+      保留单 lane facade（`start/submit/flush/applied_ord/...`）零改动兼容既有 12 例测试。
+    - **lane 生命周期（UAF 防护）**：`lanes_` 持 `shared_ptr<IndexLane>`，reducer 在 unlock
+      apply 前拷一份 shared_ptr 续命；`unregister_lib` 先 `flush`（保证 `in_flight==0` ⇒ 队列/
+      reorder 无引用本 lane 的任务）再从 `lanes_` 移除。任务里的裸 `lane*` 由 in_flight 计数守护。
+    - **registry 持有池（D2）**：`KeyDirRegistry` 懒创建 `unique_ptr<IndexPool>`（前置声明 +
+      `.cpp` out-of-line dtor，避免头依赖 search_layer/TBB），dtor 停池。同 registry 所有 search
+      库共用一对线程。
+    - **Cask 接共享池**：去掉自有 `unique_ptr<IndexPool>` → 借用 `registry_->index_pool()` +
+      车道句柄 `index_lane_`。open 注册 lane（起始 ord = `peek_next_ord`）；close `unregister_lib`
+      （不停池）；open 失败经 `~Cask→close` 注销回滚。merge/checkpoint 三处 flush 改 `flush(lane)`。
+    - **AT5 测试（3 例）**：`ThreadCountIndependentOfLibCount`（首注册起 2 线程，再注册 49 库零新增
+      → G2 结构性证明，/proc/self/task 计数）、`LanesApplyIndependentlyInOrdOrder`（4 库 × 4 producer
+      交错写，每库严格 ord 升序、互不串扰）、`UnregisterOneLibKeepsOthersRunning`（注销一库后池仍
+      服务其它库）。
+    - 验证：Release **464/464 ctest 通过**（461 + 3 AT5）。**TSan 全绿零 race**：thread_pool
+      22 例（含 AT5 多 lib 并发）+ crash_recovery 7 + search_layer 31。oneTBB submodule 已就绪，
+      补上 P2 当时无法跑的 TSan 插桩。
+    - 风险：中（共享池 + 多线程 lane 路由）。缓释：facade 保旧 API 等价；shared_ptr 守 lane 生命
+      期；flush 守 in_flight 防裸指针悬空；全量 + TSan 对拍。
   - [ ] **S6-P4 背压调优 + bench** — `bench/index_pool_bench.cpp`
     - Map 入队有界（满则阻塞 put）+ reorder buffer in-flight 上限（超则反压 Map）。
     - bench：双池吞吐 + 热点库多核加速比基线；AT6（背压不 OOM）+ AT8（崩溃恢复一致）。
+    - **前置已就绪（2026-06-24）**：`index_pool_bench.cpp` 已恢复可编译并切到 P2 新
+      `start(MapFn, ReduceFn, ErrorFn)` API（Add-with-fields 走 TBB 并行 map 路径），P4
+      在此基础上加双池/背压度量即可；旧 `~3M tasks/s` 基线需重测（详见 B2 条目修订）。
 
   - **风险**：中（改索引消费核心 + 并发）。缓释：Phase 0/1 行为等价于现状可安全停步；
     每 Phase 独立 TSan + 字节等价对拍；策略 A 不动 index 核心语义。
@@ -373,6 +399,13 @@
   - **已完成（2026-06-23）**：`BM_IndexPool_SubmitDrain`——no-op consumer 隔离队列/调度/
     flush 开销，度量 `make + submit + worker 消费 + flush(W3 cv)` 端到端吞吐。实测
     ~3M tasks/s。
+  - **S6-P2 后修订（2026-06-24）**：P2 把单参 `start(Consumer)` API 换成三段
+    `start(MapFn, ReduceFn, ErrorFn)`，本 bench 一度编译不过。已改用新 API：map_fn/
+    reduce_fn/error_fn 均 no-op，提交 **Add-with-fields** 走 dispatcher + TBB 并行 map +
+    reorder buffer + reducer 按 ord 序 apply + flush（pending 归 0 且 applied_ord 追上
+    hwm）的双线程流水线端到端吞吐。**旧 `~3M tasks/s` 数值已废，待在新形态下重测**。
+    同轮清掉 `thread_pool.hpp` 的 `-Wreorder`（构造列表冗余）+ `-Wmissing-field-initializers`
+    （新增 `IndexTask::sentinel()` 工厂替代聚合初始化）两处告警。
 - [x] **B3 大 keydir bench（>cache，1M key）** — 扩展 `bench/keydir_bench.cpp`
   - **已完成（2026-06-23）**：`BM_KeyDir_Get_Large`——1M key 随机 get（cache-cold），暴露
     tier-2 ⑤（ankerl::unordered_dense）的 cache-miss + 指针追逐成本，永久回归护栏。
@@ -463,16 +496,16 @@
 6. **S2 + S3 + S4** ← 结构性优化 ✅ 完成（2026-06-23）
 7. **P1 - P7** 按需穿插
 8. **T4 - T6、B1 - B4、H1 - H5、CI3** 长期推进
-9. **S6 异步索引 MapReduce 流水线** ← Phase 0-2 ✅ 完成（G1 已达成），P3-P4 待推进
+9. **S6 异步索引 MapReduce 流水线** ← Phase 0-3 ✅ 完成（G1+G2 已达成），P4 待推进
 
 > **关键决策点**：R1-R3 + W1-W3 + X1(+T7-T9) + S2 + S3 + S4 全部落地。
 > 结构性优化剩余：
-> - **S6（异步索引双池）：Phase 0-2 已完成** ← 取代 S1，解热点库吞吐 + 库数线程膨胀两个
+> - **S6（异步索引双池）：Phase 0-3 已完成** ← 取代 S1，解热点库吞吐 + 库数线程膨胀两个
 >   真问题。设计稿 `docs/design/async-index-pipeline.md` 已评审；分 Phase 0-4 落地：
 >   - Phase 0（map_analyze/reduce_apply 拆分）✅
 >   - Phase 1（reorder buffer 基础设施 + Skip + applied_ord 跟踪）✅
 >   - Phase 2（TBB 并行 map_analyze + dispatcher/reducer 双线程 pipeline）✅ **G1 达成**
->   - Phase 3（池全局共享化，G2）⬜ 待推进
+>   - Phase 3（registry 共享池 + per-LibId 车道，线程数与库数解耦）✅ **G2 达成**
 >   - Phase 4（背压调优 + bench）⬜ 待推进
 > - ~~**S1**：已降级~~ → **被 S6 取代否决**。
 > - **S5**（checkpoint zstd）：低风险但需**引入 zstd 第三方依赖**——待用户拍板是否
