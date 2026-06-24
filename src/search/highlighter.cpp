@@ -42,27 +42,35 @@ std::vector<OffsetRange> select_best_fragments(
     std::size_t remaining = max_fragments;
 
     while (remaining > 0 && !remaining_ranges.empty()) {
-        std::size_t best_start = remaining_ranges[0].start;
-        std::size_t best_end = remaining_ranges[0].end;
+        std::size_t best_idx = 0;
         std::size_t best_count = 0;
 
-        for (const auto& anchor : remaining_ranges) {
-            std::size_t window_start = anchor.start;
-            std::size_t window_end = window_start + fragment_size;
+        // C1:remaining_ranges 已按 start 排序 → 用 lower/upper_bound 计数窗口内 range
+        // 数（O(log R)），替代旧 O(R) 线性扫描 → 每轮 O(R log R) 替代 O(R²)。
+        const auto cmp_start = [](const OffsetRange& r, std::size_t val) {
+            return r.start < val;
+        };
+        for (std::size_t ai = 0; ai < remaining_ranges.size(); ++ai) {
+            const std::size_t window_start = remaining_ranges[ai].start;
+            const std::size_t window_end = window_start + fragment_size;
 
-            std::size_t count = 0;
-            for (auto& r : remaining_ranges) {
-                if (r.start >= window_start && r.start < window_end) {
-                    ++count;
-                }
-            }
+            auto lo = std::lower_bound(remaining_ranges.begin(),
+                                       remaining_ranges.end(),
+                                       window_start, cmp_start);
+            auto hi = std::lower_bound(remaining_ranges.begin(),
+                                       remaining_ranges.end(),
+                                       window_end, cmp_start);
+            const std::size_t count = static_cast<std::size_t>(hi - lo);
 
             if (count > best_count) {
                 best_count = count;
-                best_start = window_start;
-                best_end = std::min<std::size_t>(window_end, remaining_ranges.back().end);
+                best_idx = ai;
             }
         }
+
+        std::size_t best_start = remaining_ranges[best_idx].start;
+        std::size_t best_end = std::min<std::size_t>(
+            best_start + fragment_size, remaining_ranges.back().end);
 
         if (best_count == 0) {
             best_start = remaining_ranges[0].start;
@@ -71,7 +79,7 @@ std::vector<OffsetRange> select_best_fragments(
         }
 
         selected.push_back({static_cast<std::uint32_t>(best_start),
-                           static_cast<std::uint32_t>(best_end)});
+                            static_cast<std::uint32_t>(best_end)});
 
         // 消费掉落在本片段窗口内的 range，下一轮只在剩余 range 中选。
         remaining_ranges.erase(

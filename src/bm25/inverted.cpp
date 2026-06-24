@@ -152,6 +152,9 @@ std::vector<SearchResult> score_bow_topk(
     }
 
     // 按 ord 排序 → 同 ord 连续成段 → 归并累加,边累加边喂 top-k 小顶堆。
+    // C3（2026-06-24 评估后保留 sort）：micro-bench 证明 hash-aggregate 在 BOW
+    // 范围（< 1024 hits）比 sort 慢 25-40%——sort 在 cache-resident 数据上极快，
+    // hash map 的 hashing/probing 开销不划算。sort+merge+heap 已是该规模最优。
     std::sort(hits.begin(), hits.end(),
               [](const Hit& x, const Hit& y) { return x.first < y.first; });
 

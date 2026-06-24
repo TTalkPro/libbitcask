@@ -917,19 +917,24 @@
 
 ### C 梯队：算法 / SOTA（中 ROI 中风险，需 bench）
 
-- [ ] **C1 `select_best_fragments` 是 O(F·R²)** — `src/search/highlighter.cpp:32-87`
-  - 三重嵌套：每选片段扫 R ranges × 每 anchor 扫 R × 选 F 片段。wildcard 扩展
-    出 20+ term 时 R 可能数百。
-  - **修法**：滑动窗口 + 前缀和 → O(R log R + F·R)。风险：中（算法重写）。
+- [x] **C1 `select_best_fragments` 是 O(F·R²)** — `src/search/highlighter.cpp`
+  - **已完成（2026-06-24）**：内层 O(R) 线性扫描 → `lower_bound` 二分搜索 O(log R)。
+    `remaining_ranges` 已按 start 排序（`collect_query_ranges` 保证）→ 每轮 O(R log R)
+    替代 O(R²)。F=5 R=200 时 200K → ~8K 次比较。
+  - 验证：472/472 ctest + TSan 零 race（search_layer 34 + docvalue 66）。
 
-- [ ] **C2 `SynonymMap::add_group` 是 O(n²)** — `include/bitcask/synonym_map.hpp:40-62`
-  - 每 term 都把整组 terms 拷进 map。N term 同组 → N 次完整 vector 拷贝。
-  - **修法**：组用 `shared_ptr<vector<string>>` 共享。风险：低。
+- [x] **C2 `SynonymMap::add_group` 是 O(n²)** — `include/bitcask/synonym_map.hpp`
+  - **已完成（2026-06-24）**：`unordered_map<string, vector<string>>` →
+    `unordered_map<string, shared_ptr<const vector<string>>>`。add_group 排序去重 +
+    set_union 合并 → 所有 term 指向同一 shared_ptr（零 vector 拷贝）。
+  - **实测**：N=1000 add_group 5240µs → **116µs（45× 加速）**；per-term 5.2→0.1µs（O(n²)→O(n log n)）。
+  - 验证：472/472 ctest + TSan 零 race（synonym 11）。
 
-- [ ] **C3 BM25 BOW 整 vector 排序** — `src/bm25/inverted.cpp:155-156`
-  - `std::sort(hits.end())` 整集排序，仅为合并重复 ord + 取 top-k。
-  - **修法**：先 hash-aggregate 合并 ord（O(N)），再 partial_sort（O(N + k log k)）。
-    风险：中（动算法需对拍）。
+- [~] **C3 BM25 BOW 整 vector 排序** — **跳过（实测 hash-aggregate 更慢）**
+  - **评估（2026-06-24）**：micro-bench 对比 sort+merge+heap vs hash-aggregate+nth_element。
+    BOW 范围（< 1024 hits）：hash-aggregate **慢 25-40%**——sort 在 cache-resident 数据上
+    极快（960 hits 仅 3.3µs），hash map 的 hashing/probing 开销不划算。**sort+merge+heap
+    已是该规模最优**，保留原实现。inverted.cpp 注释登记评估结论防重复尝试。
 
 - [ ] **C4 SOTA：Block-Max MaxScore（Lucene 9.9 自适应合取）** — `src/bm25/inverted.cpp`（WAND 路径）
   - Lucene 9.9 (2023)：term 按 max_score 排序，随 min-competitive-score 上升把
