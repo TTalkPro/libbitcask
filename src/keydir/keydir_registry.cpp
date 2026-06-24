@@ -17,11 +17,11 @@ bitcask::IndexPool* KeyDirRegistry::index_pool() {
     std::scoped_lock lock(mutex_);
     if (!index_pool_) {
         // S6-P4: map worker 数 = 硬件并发（真数据并行跑 analyze → G1）。
-        // 至少 2（hardware_concurrency 可能返回 0/1）。queue 10240 + reorder
-        // 在途上限 16384（默认，背压防 OOM，D4，P4 bench 可校准）。
+        // 至少 2（hardware_concurrency 可能返回 0/1）。queue / reorder 在途上限
+        // 取 IndexPool 具名默认（kDefaultIndexQueueCapacity / kDefaultReorderInflightCap）。
         unsigned hc = std::thread::hardware_concurrency();
         int map_workers = static_cast<int>(hc > 1 ? hc : 2);
-        index_pool_ = std::make_unique<bitcask::IndexPool>(map_workers, 10240);
+        index_pool_ = std::make_unique<bitcask::IndexPool>(map_workers);
     }
     return index_pool_.get();
 }

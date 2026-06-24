@@ -257,6 +257,10 @@ struct IndexLane {
     std::atomic<std::size_t>   in_flight{0};          // 本 lane 在途任务数（队列+reorder）
 };
 
+// S6/S8-R4: IndexPool 默认容量（具名常量，单一真相源；默认值由 P4 bench 校准）。
+inline constexpr std::size_t kDefaultIndexQueueCapacity = 10240;  // 入队有界 → 背压 put
+inline constexpr std::size_t kDefaultReorderInflightCap = 16384;  // reorder 在途上限 → 防 OOM
+
 // per-registry 的共享索引线程管理器（S6-P3 共享 / S6-P4 并行 map）。
 // 架构：queue → N 个 map worker（std::thread，并发跑 map_analyze，真数据并行
 // → G1）→ per-lane reorder buffer → 1 reducer（按 ord 序 apply，库内单写者）。
@@ -279,8 +283,9 @@ public:
     // S6-P4: concurrency = map worker 线程数（真数据并行：N 个 worker 从 queue
     // 并发拉取跑 map_analyze）。reorder_cap = 全局 reorder buffer 在途上限
     // （背压：达上限 map worker 停 pop → queue 满 → put 阻塞；防 OOM，D4）。
-    explicit IndexPool(int concurrency = 1, std::size_t queue_capacity = 10240,
-                       std::size_t reorder_cap = 16384)
+    explicit IndexPool(int concurrency = 1,
+                       std::size_t queue_capacity = kDefaultIndexQueueCapacity,
+                       std::size_t reorder_cap = kDefaultReorderInflightCap)
         : map_concurrency_(concurrency > 0 ? concurrency : 1)
         , reorder_cap_(reorder_cap)
         , queue_(queue_capacity)
