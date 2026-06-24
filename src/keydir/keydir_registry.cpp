@@ -1,6 +1,7 @@
 #include "bitcask/keydir_registry.hpp"
 
 #include <algorithm>
+#include <thread>
 
 #include "bitcask/thread_pool.hpp"  // S6-P3: IndexPool 完整定义（out-of-line dtor + 懒创建）
 
@@ -15,7 +16,12 @@ KeyDirRegistry::~KeyDirRegistry() = default;
 bitcask::IndexPool* KeyDirRegistry::index_pool() {
     std::scoped_lock lock(mutex_);
     if (!index_pool_) {
-        index_pool_ = std::make_unique<bitcask::IndexPool>(1, 10240);
+        // S6-P4: map worker 数 = 硬件并发（真数据并行跑 analyze → G1）。
+        // 至少 2（hardware_concurrency 可能返回 0/1）。queue 10240 + reorder
+        // 在途上限 16384（默认，背压防 OOM，D4，P4 bench 可校准）。
+        unsigned hc = std::thread::hardware_concurrency();
+        int map_workers = static_cast<int>(hc > 1 ? hc : 2);
+        index_pool_ = std::make_unique<bitcask::IndexPool>(map_workers, 10240);
     }
     return index_pool_.get();
 }
