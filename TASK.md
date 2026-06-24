@@ -155,7 +155,7 @@
   - 收益：checkpoint 文件体积 **−50~70%**；冷启动 I/O 减少。
   - 风险：低（向后兼容：旧文件 compression=0）。
 
-- [ ] **S6 异步索引 MapReduce 流水线（全局双池）** — 设计稿 `docs/design/async-index-pipeline.md`
+- [x] **S6 异步索引 MapReduce 流水线（全局双池）** ✅ Phase 0-4 全部完成（2026-06-24，G1+G2 达成）— 设计稿 `docs/design/async-index-pipeline.md`
   - **背景**：当前每库一个 `IndexPool` 单 worker，把 analyze（CPU 重，纯函数）与
     insert（改共享索引，必串行）焊死 → ① 热点库吞吐被单 worker 锁死；② 库数不定
     → 常驻 worker 线程随库数线性膨胀。S1（入队批量化）碰不到瓶颈，已被本条取代。
@@ -264,14 +264,19 @@
       put→delete→put→flush→search 模式通过 = 墓碑不复活）。
     - **TSan 未完成**：oneTBB submodule 未初始化（网络受限），无法构建插桩 TBB。
       Oracle 已验证内存序正确性（release/acquire 链）；Release 全量通过。
+      （后注 2026-06-24：oneTBB 就绪后已补 TSan，见 P3/P4。）
+    - **⚠️ 后注（2026-06-24）：本条「拿到 G1」表述不准**。`parallel_for(0,1)` 阻塞 dispatcher
+      使 map 实为**串行**（探针实测 max 并发=1），P2 只拿到 pipeline 并行而非数据并行。
+      真正的多核 analyze 并行在 **P4** 用 std::thread map worker 池达成（实测 5.9×）。详见 P4。
     - 风险：中（并行 + 多线程 pipeline；解决多个竞态 + 死锁场景）。
   - [x] **S6-P3 池全局共享化（拿到 G2）** — `include/bitcask/thread_pool.hpp`、`include/bitcask/keydir_registry.hpp`、`src/keydir/keydir_registry.cpp`、`include/bitcask/cask.hpp`、`src/cask/cask.cpp`、`tests/thread_pool_test.cpp`
     - **已完成（2026-06-24）**：每库一池 → **registry 共享单池 + per-`LibId` 车道（lane）**。
     - **IndexPool 多 lib 化**：抽出 `IndexLane`（per-库回调 `map_fn/reduce_fn/error_fn` +
       reorder buffer `pending`/`next_apply_ord` + 水位 `submitted_ord_hwm/applied_ord/in_flight`）。
-      **1 dispatcher + 1 reducer 全局共享**：dispatcher 按 `task.lane` 路由（Add-with-fields →
-      TBB 并行 map → 该 lane 的 pending；其余直推）；reducer **扫描所有 lane**，对每条 lane 按
-      其 `next_apply_ord` 串行 apply（库内 I2/I3，库间无队头阻塞）。新 API `register_lib(map,
+      **dispatcher + reducer 全局共享**（P4 后 dispatcher → N 个 map worker，见 P4）：按
+      `task.lane` 路由（Add-with-fields → 并行 map → 该 lane 的 pending；其余直推）；reducer
+      **扫描所有 lane**，对每条 lane 按其 `next_apply_ord` 串行 apply（库内 I2/I3，库间无队头
+      阻塞）。新 API `register_lib(map,
       reduce,error,init_ord)→IndexLane*` / `unregister_lib` / `submit(lane,task)` / `flush(lane)`；
       保留单 lane facade（`start/submit/flush/applied_ord/...`）零改动兼容既有 12 例测试。
     - **lane 生命周期（UAF 防护）**：`lanes_` 持 `shared_ptr<IndexLane>`，reducer 在 unlock
@@ -292,12 +297,36 @@
       补上 P2 当时无法跑的 TSan 插桩。
     - 风险：中（共享池 + 多线程 lane 路由）。缓释：facade 保旧 API 等价；shared_ptr 守 lane 生命
       期；flush 守 in_flight 防裸指针悬空；全量 + TSan 对拍。
-  - [ ] **S6-P4 背压调优 + bench** — `bench/index_pool_bench.cpp`
-    - Map 入队有界（满则阻塞 put）+ reorder buffer in-flight 上限（超则反压 Map）。
-    - bench：双池吞吐 + 热点库多核加速比基线；AT6（背压不 OOM）+ AT8（崩溃恢复一致）。
-    - **前置已就绪（2026-06-24）**：`index_pool_bench.cpp` 已恢复可编译并切到 P2 新
-      `start(MapFn, ReduceFn, ErrorFn)` API（Add-with-fields 走 TBB 并行 map 路径），P4
-      在此基础上加双池/背压度量即可；旧 `~3M tasks/s` 基线需重测（详见 B2 条目修订）。
+  - [x] **S6-P4 真并行 map + 背压调优 + bench** — `include/bitcask/thread_pool.hpp`、`src/keydir/keydir_registry.cpp`、`bench/index_pool_bench.cpp`、`tests/thread_pool_test.cpp`
+    - **已完成（2026-06-24）**。
+    - **⚠️ 关键修正：P2/P3 的 map 实为串行，G1 未真正达成**。探针实测（map_fn 含 5ms
+      负载，200 文档，6 核）：**P2/P3 max 并发 map = 1，总耗时 ≈ 串行**。根因：P2 的
+      `tbb::parallel_for(0,1,…)+isolate`（为绕 task_group 的 TSan small_object_pool
+      thread_data 坑而选）**阻塞单 dispatcher**——每文档 map 完成才处理下一条，无数据并行；
+      P3 单 dispatcher 进一步把所有库的 map 串行化。P2 的「G1 达成」实为 **pipeline 并行
+      （map∥reduce∥put）**，非数据并行。
+    - **真并行 map worker 池**：去掉 dispatcher + `parallel_for(0,1)`，改 **N 个 std::thread
+      map worker**（N=`hardware_concurrency`，registry 池）从 queue **并发**拉任务跑
+      `map_analyze`，乱序结果入 per-lane reorder buffer，reducer 按 ord 序 apply。worker 是
+      普通 std::thread（不碰 TBB task_group → 规避 P2 的坑）。`map_analyze` 纯函数线程安全
+      （F7，P0 的 recover_doc_batch `parallel_for` 已验证）。RebuildHnsw 屏障**移除**——
+      reducer 的 ord 序天然保证它在所有前序 map apply 后才执行。
+    - **多核加速实测（探针 + bench）**：6 核上 **max 并发 map = 6，5.9× wall-clock 加速**
+      （1042ms→176ms）。bench `BM_IndexPool_MapSpeedup`：1→8 worker **48k→181k tasks/s
+      （3.7×）**（含 CPU 负载的模拟 analyze；过 4 后次线性因 6 核 + 单 reducer + sink 争用）。
+    - **reorder 背压上限（D4）**：全局 `reorder_inflight_` 计数 + `reorder_cap`（默认 16384）。
+      map worker push 前等 `inflight<cap`（否则停 pop → queue 满 → put 阻塞），reducer
+      apply 后 `--inflight` 唤醒 worker；`stopped_` 旁路谓词防 shutdown 与 sentinel 死锁。
+      shutdown：每 worker 一个 sentinel（FIFO 排真任务后，均衡 pop 退出），全 join 后才置
+      `got_sentinel_` 通知 reducer 收尾。
+    - **bench**（3 个）：`SubmitDrain`（纯流水线开销）、`MapSpeedup`（多核加速比，UseRealTime）、
+      `MultiLibThroughput`（共享池多 lib 并发，吞吐随库数恒定 ≈ 池饱和 → 印证 G2）。
+    - **新增测试**：`ReorderBackpressureBoundsMemoryThenDrains`（AT6：reducer 卡死 → 背压挡住
+      producer（在途有界）→ 释放后零丢失全部 apply）。AT8 由现有 crash_recovery 套件覆盖。
+    - 验证：Release **465/465 ctest**（464 + AT6）。**TSan 全绿零 race**（N 并行 worker 下）：
+      thread_pool 23（含 AT5/AT6）+ crash_recovery 7 + search_layer 31 + cask_docvalue 62。
+    - 风险：中（并行 map worker 池 + 背压）。缓释：std::thread worker 避 TBB 坑；shared_ptr
+      守 lane；背压 cap 防 OOM；全量 + 4 套 TSan 对拍。
 
   - **风险**：中（改索引消费核心 + 并发）。缓释：Phase 0/1 行为等价于现状可安全停步；
     每 Phase 独立 TSan + 字节等价对拍；策略 A 不动 index 核心语义。
@@ -496,17 +525,19 @@
 6. **S2 + S3 + S4** ← 结构性优化 ✅ 完成（2026-06-23）
 7. **P1 - P7** 按需穿插
 8. **T4 - T6、B1 - B4、H1 - H5、CI3** 长期推进
-9. **S6 异步索引 MapReduce 流水线** ← Phase 0-3 ✅ 完成（G1+G2 已达成），P4 待推进
+9. **S6 异步索引 MapReduce 流水线** ← Phase 0-4 ✅ **全部完成**（G1 多核并行 + G2 线程解耦达成）
 
 > **关键决策点**：R1-R3 + W1-W3 + X1(+T7-T9) + S2 + S3 + S4 全部落地。
 > 结构性优化剩余：
-> - **S6（异步索引双池）：Phase 0-3 已完成** ← 取代 S1，解热点库吞吐 + 库数线程膨胀两个
->   真问题。设计稿 `docs/design/async-index-pipeline.md` 已评审；分 Phase 0-4 落地：
+> - **S6（异步索引双池）：Phase 0-4 全部完成** ← 取代 S1，解热点库吞吐 + 库数线程膨胀两个
+>   真问题。设计稿 `docs/design/async-index-pipeline.md` 已评审；Phase 0-4 全部落地：
 >   - Phase 0（map_analyze/reduce_apply 拆分）✅
 >   - Phase 1（reorder buffer 基础设施 + Skip + applied_ord 跟踪）✅
->   - Phase 2（TBB 并行 map_analyze + dispatcher/reducer 双线程 pipeline）✅ **G1 达成**
+>   - Phase 2（dispatcher/reducer 双线程 pipeline）✅ ——但 `parallel_for(0,1)` 致 map 实为
+>     串行，只拿到 pipeline 并行（**G1 当时未真达成**，P4 修正）
 >   - Phase 3（registry 共享池 + per-LibId 车道，线程数与库数解耦）✅ **G2 达成**
->   - Phase 4（背压调优 + bench）⬜ 待推进
+>   - Phase 4（**N 个 std::thread map worker 真数据并行**，实测 5.9× → **G1 真达成**；reorder
+>     背压上限防 OOM；多核加速比 + 多 lib 吞吐 bench）✅
 > - ~~**S1**：已降级~~ → **被 S6 取代否决**。
 > - **S5**（checkpoint zstd）：低风险但需**引入 zstd 第三方依赖**——待用户拍板是否
 >   接受新依赖再做。
