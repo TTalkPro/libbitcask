@@ -37,6 +37,11 @@
 
 #include "bitcask/keydir.hpp"
 
+// S6-P3: 共享索引双池挂在 registry 上（D2：registry 级所有权）。前置声明
+// 避免在本头引入 thread_pool.hpp（→ search_layer/TBB 的重依赖）——完整类型
+// 仅在 keydir_registry.cpp 内可见，unique_ptr 析构走 out-of-line dtor。
+namespace bitcask { class IndexPool; }
+
 namespace bitcask::keydir {
 
 enum class AcquireStatus {
@@ -53,10 +58,16 @@ struct AcquireResult {
 class KeyDirRegistry {
 public:
     KeyDirRegistry() = default;
-    ~KeyDirRegistry() = default;
+    // S6-P3: out-of-line dtor —— index_pool_ 是 unique_ptr<不完整类型>，
+    // 析构需 IndexPool 完整定义（在 .cpp 内）；dtor 内停池 join 线程。
+    ~KeyDirRegistry();
 
     KeyDirRegistry(const KeyDirRegistry&) = delete;
     KeyDirRegistry& operator=(const KeyDirRegistry&) = delete;
+
+    // S6-P3: 获取本 registry 共享的索引双池（懒创建，进程内每 registry 一对
+    // Map/Reduce 线程 → 线程数与库数解耦，G2）。线程安全（内部锁）。
+    [[nodiscard]] bitcask::IndexPool* index_pool();
 
     // 获取或新建一个命名 KeyDir。语义见文件头注释的初始化协议。
     // 线程安全: 是。锁: 内部 std::lock_guard(mutex_)。
@@ -91,6 +102,9 @@ private:
     // refcount=0 后保留的「最大 file_id 已用过的下一个值」；
     // 重新 acquire 时让 KeyDir 从这里恢复 file_id 计数器。
     std::unordered_map<std::string, std::uint32_t> saved_biggest_file_id_;
+    // S6-P3: registry 级共享索引双池（懒创建，受 mutex_ 保护）。所有同 registry
+    // 的 search 库共享这一对 Map/Reduce 线程。registry 析构时停池。
+    std::unique_ptr<bitcask::IndexPool> index_pool_;
 };
 
 }  // namespace bitcask::keydir

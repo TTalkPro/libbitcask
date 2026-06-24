@@ -2,7 +2,23 @@
 
 #include <algorithm>
 
+#include "bitcask/thread_pool.hpp"  // S6-P3: IndexPool 完整定义（out-of-line dtor + 懒创建）
+
 namespace bitcask::keydir {
+
+// S6-P3: out-of-line dtor。unique_ptr<IndexPool> 在此处见到完整类型，
+// ~IndexPool() 内 stop() 推 sentinel + join dispatcher/reducer。
+KeyDirRegistry::~KeyDirRegistry() = default;
+
+// S6-P3: 懒创建 registry 共享双池。首次调用建池（线程在首个 register_lib
+// 时才真正 ensure_started）。受 mutex_ 保护，多 Cask 并发 open 安全。
+bitcask::IndexPool* KeyDirRegistry::index_pool() {
+    std::scoped_lock lock(mutex_);
+    if (!index_pool_) {
+        index_pool_ = std::make_unique<bitcask::IndexPool>(1, 10240);
+    }
+    return index_pool_.get();
+}
 
 AcquireResult KeyDirRegistry::acquire(std::string_view name) {
     std::scoped_lock lock(mutex_);
