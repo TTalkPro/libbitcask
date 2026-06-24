@@ -139,7 +139,7 @@ static void BM_IndexPool_MultiLibThroughput(benchmark::State& state) {
         state.ResumeTiming();
 
         std::vector<std::thread> producers;
-        for (int l = 0; l < kLibs; ++l) {
+        for (std::size_t l = 0; l < lanes.size(); ++l) {
             producers.emplace_back([&pool, lane = lanes[l]] {
                 for (int i = 0; i < kPerLib; ++i) {
                     pool.submit(lane, IndexTask::make(
