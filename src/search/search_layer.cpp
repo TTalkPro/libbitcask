@@ -358,6 +358,18 @@ const bm25::InvertedIndex* SearchLayer::field_index(std::string_view field) cons
     return it == fields_.end() ? nullptr : it->second.get();
 }
 
+std::string_view SearchLayer::intern_field_name(std::string_view name) {
+    // S10-A4:双检。常容(字段名已 intern)只共享锁;首次出现升级独占 emplace。
+    {
+        std::shared_lock lk(field_names_intern_mu_);
+        auto it = field_names_intern_.find(name);
+        if (it != field_names_intern_.end()) return std::string_view(*it);
+    }
+    std::unique_lock lk(field_names_intern_mu_);
+    auto [it, _] = field_names_intern_.emplace(name);
+    return std::string_view(*it);
+}
+
 void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
                            std::string_view text,
                            std::uint32_t file_id, std::uint64_t offset,
@@ -453,7 +465,8 @@ void SearchLayer::reduce_apply(const ReduceJob& job,
     auto& field_lens = ord_field_lens_[job.ord];
     field_lens.reserve(job.fields.size() + 1);
     for (const auto& f : job.fields) {
-        field_lens.emplace_back(f.field_name, f.doc_len);
+        // S10-A4:intern 取稳定 string_view，免 owning string 分配。
+        field_lens.emplace_back(intern_field_name(f.field_name), f.doc_len);
     }
 
     for (const auto& f : job.fields) {
@@ -465,7 +478,7 @@ void SearchLayer::reduce_apply(const ReduceJob& job,
     // 若已有字段直接写默认字段，则不重复合并（避免双写）。
     if (!job.wrote_default && !job.ca_data.empty()) {
         field_index(kDefaultField).add_doc(job.ord, job.ca_data);
-        field_lens.emplace_back(std::string(kDefaultField), job.ca_len);
+        field_lens.emplace_back(intern_field_name(kDefaultField), job.ca_len);
     }
 
     index_.put_doc(job.key, job.ord,

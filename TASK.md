@@ -822,24 +822,38 @@
   - **教训**：预估"3-8%"基于"1000 次冗余浮点除法"的算术，忽略了 block_upper 判定分支
     的实际触发频率相对其他热点偏低。未来类似优化应先 profile 再投入。
 
-- [ ] **A3 `search_vector` 每次构造 `std::function` 回调** — `src/search/search_layer.cpp:235-247`
-  - **现状**：`std::function<bool(std::uint64_t)> live` 捕获 `[this, filter]` 触发
-    small-object heap 分配（~32B）。每次向量查询都付。
-  - **注**：TASK.md:677 已审计谓词「仅在结果侧调，O(k) 次」— 但那是**调用频次**，
-    **每次 query 仍要构造 std::function 一次**（与调用频次独立）。
-  - **修法**：`HnswIndex::search()` 模板化 `template<class F> search(..., F&& live)`，
-    或定义 `LiveView{const Index*; const MetaFilter*}` + `operator()` 传 const 引用。
-  - **收益**：每次向量查询省 1 次堆分配 + 缓存扰动。风险：低（HNSW 接口模板化）。
+- [~] **A3 `search_vector` 每次构造 `std::function` 回调** — `src/search/search_layer.cpp:235-247`
+  - **跳过（2026-06-24，二次分析后判定收益不足）**。详细拆解：
+    - `std::function` 成本（构造 ~30-100ns + 间接调用 ~3-5ns/次）确认存在
+    - 但 `live` 回调**仅在结果收集循环调用**（`hnsw.cpp:924`，O(ef) ≈ 几百次/查询），
+      **不在图遍历热路径**（`greedy_closest`/`search_layer` 无 live 调用，TASK.md:677 已确认）
+    - 总成本 ~1-2µs/查询，相对 search_vector 总耗时（137-503µs）**< 1.5%**
+    - 真实热点是距离计算（dist_id × ef×M，~80%）+ 优先队列（~10%）
+  - **预期与 A2 同病**：A2 预估 3-8% 实测 <1%（WAND 块上界非热点）；A3 的 std::function
+    同样不是热点。**先做 A4（写入热路径，确定收益）**，A3 待 profile 证实再投入。
 
-- [ ] **A4 `reduce_apply` 字段名 `std::string` 拷进 `ord_field_lens_`** — `src/search/search_layer.cpp:446-451`
-  - **现状**：`ord_field_lens_[job.ord]` 是 `std::map<uint64_t, vector<pair<string, u32>>>`，
-    每文档 map lookup（log n）+ 每字段 `emplace_back(f.field_name, ...)` 拷一份 owning
-    string。字段名在 `FieldSchema` 已 intern，这里多此一举。
-  - **修法**：改 `unordered_map<uint64_t, vector<pair<string_view, u32>>>`，string_view
-    借自 `FieldSchema`（put 期间 schema 不动）；`std::map` → `std::unordered_map`
-    把 log n → O(1)。
-  - **收益**：高。1M 文档 × 5 字段 × 10B ≈ 50MB 字符串分配消除 + 每文档 log n → O(1)。
-    风险：低（侧表，单写者访问）。
+- [x] **A4 `reduce_apply` 字段名 `std::string` 拷进 `ord_field_lens_`** — `src/search/search_layer.cpp:446-451`、`include/bitcask/search_layer.hpp`
+  - **已完成（2026-06-24）**：`ord_field_lens_` 值类型 `vector<pair<string,u32>>` →
+    `vector<pair<string_view,u32>>`；新增 `intern_field_name(sv)` 把字段名首次 emplace 进
+    `field_names_intern_`（`unordered_set<string,StringHash>`，node 稳定→string_view 安全），
+    后续全命中返回稳定 string_view。双检锁（shared 查 / unique emplace）。`reduce_apply` 两处
+    `emplace_back` 改用 intern；`on_delete` 消费端 `field_index(string_view)` 透明兼容无需改。
+  - **实测（before/after 对比，Release+LTO+native，3 轮）**：
+    - **短字段名（SSO ≤15B，典型）**：稳态 alloc/doc **139.0 → 139.0（零变化）**——SSO 本就
+      不堆分配；bytes/doc 10257→10161（-96B，vector 元素缩小）。吞吐 ~4.9µs/doc 两版持平（噪声内）。
+    - **长字段名（>15B，堆分配）**：稳态 alloc/doc **154.0 → 149.0（−5/doc）**——精确消除 5 字段名
+      堆分配；bytes/doc 10590→10383（-207B）。吞吐 ~5.0µs/doc 持平（噪声内）。
+    - **内存占用**：`ord_field_lens_` 元素 `pair<string,u32>`(40B) → `pair<string_view,u32>`(24B)，
+      **−40%**。1M 文档×5 字段：200MB → 120MB。
+  - **结论（诚实）**：**非吞吐优化**（<1%，analyze 主导的 5µs/doc 下 5 次小堆分配/SSO 拷贝可忽略；
+    与 A2 同病——预估「高收益」基于「50MB 分配消除」算术，忽略了 SSO 对短名零堆分配的现实）。
+    **保留**因：① 长字段名真实消除 5 alloc/doc（实测）② 侧表内存 −40% ③ intern 池是干净设计
+    （与 FieldSchema 已有 intern 一致）④ 低风险（侧表、单写者、全量 472/472 + TSan 零 race）。
+  - **教训**：优化前先验证「预估的分配是否真的走堆」——SSO 阈值（libstdc++ 15B）决定了短字符串
+    名本就不分配。未来类似项先 `operator new` 计数器探针再投入。
+  - 验证：Release **472/472 ctest**；TSan 零 race（cask_docvalue 66 + search_layer 34 +
+    crash_recovery 7 + thread_pool 18 = 125 例）。bench：`bench/a4_field_intern_bench.cpp`（ad-hoc，
+    全局 operator new 计数 + 短/长字段名 before/after 对比）。
 
 - [ ] **A5 `put_doc` 的 `task_fields()` lambda 拷贝所有字段名+值为新 string** — `src/cask/cask.cpp:1591-1599`
   - **现状**：

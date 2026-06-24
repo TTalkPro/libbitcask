@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "bitcask/analyzer.hpp"
 #include "bitcask/highlighter.hpp"
@@ -42,6 +43,7 @@
 #include "bitcask/meta_file.hpp"
 #include "bitcask/meta_filter.hpp"  // V5：filter 表达树 + MetaOp/MetaCondition
 #include "bitcask/search_cache.hpp"
+#include "bitcask/string_hash.hpp"  // StringHash（透明 hash，fields_/field_names_intern_ 共用）
 #include "bitcask/synonym_map.hpp"
 
 namespace bitcask::search {
@@ -416,6 +418,9 @@ private:
     // 取某字段的 InvertedIndex（只读，不存在返回 nullptr）。
     const bm25::InvertedIndex* field_index(std::string_view field) const;
 
+    // S10-A4：把字段名 intern 进 field_names_intern_，返回稳定 string_view（node 不失效）。
+    std::string_view intern_field_name(std::string_view name);
+
     SearchLayerConfig  config_;
     index::Index      index_;
     // S8.6：每字段一个 InvertedIndex（字段间 avgdl/idf 隔离）。
@@ -430,8 +435,13 @@ private:
                        StringHash, std::equal_to<>> fields_;
     // R3：ord → (字段名 → 该字段 doc_len)，供 on_delete 按字段精确扣减统计。
     // 仅多字段路径填充；单 text 路径用 index_ 的 doc_len 即可（默认字段）。
+    // S10-A4：字段名借自 field_names_intern_，消除每文档每字段一次 owning string 分配。
     std::unordered_map<std::uint64_t,
-                       std::vector<std::pair<std::string, std::uint32_t>>> ord_field_lens_;
+                       std::vector<std::pair<std::string_view, std::uint32_t>>> ord_field_lens_;
+    // S10-A4:字段名 intern 池。unordered_set node 在 insert 后稳定 → string_view 安全。
+    // 透明 hash（StringHash）让 find 直接吃 string_view，免临时 string（与 fields_ 同）。
+    std::unordered_set<std::string, StringHash, std::equal_to<>> field_names_intern_;
+    mutable std::shared_mutex field_names_intern_mu_;
     std::unique_ptr<text::Analyzer>      analyzer_;
     // V3.3:HNSW 向量索引(config.vector_dim>0 时创建)。单写者
     // (IndexPool worker 的 on_vector/recover_doc/rebuild_hnsw)+ 多读者
