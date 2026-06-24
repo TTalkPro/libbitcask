@@ -435,7 +435,7 @@ public:
     [[nodiscard]] search::SearchLayer* search() { return search_.get(); }
 
     void flush_index() {
-        if (index_pool_) index_pool_->flush();
+        if (index_pool_ && index_lane_) index_pool_->flush(index_lane_);
     }
 
     // fsync active data file。o_sync 模式下退化为 no-op。
@@ -546,8 +546,11 @@ private:
     // SearchLayer 实例（enable_search 时创建）
     std::unique_ptr<search::SearchLayer> search_;
 
-    // T2.4: Index Pool（搜索模式开启时创建，用于 T3 异步索引）
-    std::unique_ptr<IndexPool> index_pool_;
+    // S6-P3: 索引双池现由 registry 共享所有（非本 Cask 拥有）。index_pool_
+    // 是借用指针（= registry_->index_pool()）；index_lane_ 是本库在共享池里
+    // 注册的车道句柄（register_lib 返回，close 时 unregister_lib）。
+    IndexPool* index_pool_ = nullptr;
+    IndexLane* index_lane_ = nullptr;
     // indexed worker 异常计数器：catch(...) 时 fetch_add(1)；非零 = 索引可能漂移
     std::atomic<std::uint64_t> index_errors_{0};
 
@@ -560,8 +563,8 @@ private:
     void write_keydir_snapshot() noexcept;
 
 public:
-    // 访问 IndexPool（用于 T3 阶段启动 worker）
-    [[nodiscard]] IndexPool* index_pool() { return index_pool_.get(); }
+    // 访问共享 IndexPool（借用自 registry）
+    [[nodiscard]] IndexPool* index_pool() { return index_pool_; }
 
     // 内部辅助
     [[nodiscard]] std::expected<void, CaskFault> load_keydir_from_disk(search::SearchLayer* search_layer);

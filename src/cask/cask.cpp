@@ -478,14 +478,18 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         if (auto r = cask->load_keydir_from_disk(cask->search_.get()); !r) return std::unexpected(r.error());
         cask->keydir_->mark_ready();
     }
-    // S6-P2: 仅 search 模式启动 pool（KV 模式无 index_pool_ / search_）。
-    // pool 初始 next_apply_ord_ 对齐到 keydir 当前水位——让 reducer 跳过
-    // disk 已恢复的 [0, peek_next_ord) 区间。merge 提交的 RebuildHnsw
-    // {ord=peek_next_ord} 等首个 entry 进 reorder 时 next_apply_ord_ 已对齐，
-    // 无 stall。必须放在 keydir_ 已就绪之后（create_search_infra 早于此装配）。
-    if (cask->index_pool_) {
-        cask->index_pool_->set_initial_ord(cask->keydir_->peek_next_ord());
-        cask->index_pool_->start(
+    // S6-P3: 仅 search 模式注册车道（KV 模式无 search_）。索引双池由 registry
+    // 共享所有——本库向其注册一条 lane（map/reduce/error 闭包 + 起始 ord），
+    // 拿到稳定句柄 index_lane_。线程数与库数解耦（G2）：所有同 registry 的库
+    // 共用一对 dispatcher/reducer。
+    //
+    // 起始 ord 对齐 keydir 当前水位——reducer 跳过 disk 已恢复的
+    // [0, peek_next_ord) 区间。merge 提交的 RebuildHnsw{ord=peek_next_ord} 等
+    // 首个 entry 进该 lane 的 reorder 时 next_apply_ord 已对齐，无 stall。必须
+    // 在 keydir_/registry_ 就绪后（create_search_infra 早于此装配）。
+    if (cask->search_ && cask->registry_) {
+        cask->index_pool_ = cask->registry_->index_pool();
+        cask->index_lane_ = cask->index_pool_->register_lib(
             // Map fn（并行 TBB）：IndexTask → ReduceEntry。map_analyze 是纯函数
             // （analyzer_ const、无共享可变态），跨线程安全。
             [&search = *cask->search_](const IndexTask& task) -> ReduceEntry {
@@ -494,8 +498,8 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
                                               task.total_sz, task.tstamp);
                 return ReduceEntry{std::move(job), task.meta, task.vec};
             },
-            // Reduce fn（串行 reducer）：ReorderEntry → apply。
-            [&search = *cask->search_, cask_ptr = cask.get()](ReorderEntry& entry) {
+            // Reduce fn（串行 reducer，per-lane ord 序）：ReorderEntry → apply。
+            [&search = *cask->search_](ReorderEntry& entry) {
                 std::visit([&search](auto& e) {
                     using T = std::decay_t<decltype(e)>;
                     if constexpr (std::is_same_v<T, ReduceEntry>) {
@@ -514,8 +518,10 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
                     }
                 }, entry);
             },
-            // Error fn：异常计数器自增（best-effort 保活 pool）。
-            [cask_ptr = cask.get()]() { cask_ptr->index_errors_.fetch_add(1, std::memory_order_relaxed); }
+            // Error fn：异常计数器自增（best-effort 保活 lane）。
+            [cask_ptr = cask.get()]() { cask_ptr->index_errors_.fetch_add(1, std::memory_order_relaxed); },
+            // 起始 ord。
+            cask->keydir_->peek_next_ord()
         );
     }
     return cask;
@@ -527,7 +533,8 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
 //     拍 live writer 的 active file id 快照供 needs_merge 排除）
 //   - 只读 → 不拿锁
 // 任何失败路径都返回 unexpected,unique_ptr<cask> 在 caller 析构时按 RAII
-// 回滚已分配的资源（write_lock_/search_/index_pool_ 都是 RAII 自管）。
+// 回滚已分配的资源（write_lock_/search_ RAII 自管；S6-P3 共享池车道
+// index_lane_ 由 ~Cask→close()→unregister_lib 注销，见 close()）。
 std::expected<void, CaskFault> Cask::acquire_open_locks() {
     if (opts_.read_write && !opts_.merge_only) {
         auto fl = acquire_writer_lock(dirname_);
@@ -663,10 +670,9 @@ Cask::create_search_infra(const CaskOptions& opts) {
         return std::unexpected(err(CaskError::kInvalidOption,
                                    "analyzer creation failed (check analyzer type / dict_path)"));
     }
-    index_pool_ = std::make_unique<IndexPool>(1, 10240);
-    // 注意：set_initial_ord + start 必须在 keydir_ 已设置后调用（caller
-    // 在 create_search_infra 返回后做 keydir 装配）。此处仅创建 pool，调用
-    // 时机由 caller 负责。
+    // S6-P3: 不再每库自建池。共享池借用 + 车道注册推迟到 keydir 就绪后
+    // （caller 在 create_search_infra 返回、registry_/keydir_ 装配完成后做）。
+    // 此处仅建好 search_，标记本库为 search 模式（search_ != nullptr）。
     return {};
 }
 
@@ -695,16 +701,19 @@ void Cask::close() noexcept {
             active_data_.reset();
             read_files_.clear();
         }
-        // A4-P2/P3 顺序要点:先停 IndexPool(排干 → Index 覆盖全部已分配
+        // A4-P2/P3 顺序要点:先排干本库车道(flush → Index 覆盖全部已分配
         // ord),再在 keydir 仍在手时做 search 双保存(bm25 + sidecar,
         // 覆盖标记取 peek_next_ord),最后落 keydir 快照并释放——
         // 旧版在 keydir_.reset() 之后才存 sidecar,恒被跳过(P3 测试抓出)。
-        if (index_pool_) {
-            // flush 排干队列后再 stop:worker_loop 顶部的 stopped_ 检查可能在
-            // stop() 设位后、Sentinel 被 pop 前退出循环,漏掉待处理任务。
-            index_pool_->flush();
-            index_pool_->stop();
-            index_pool_.reset();
+        //
+        // S6-P3: 池由 registry 共享，close 只注销本库车道（flush 排空 + 从
+        // lanes_ 移除），不停池（其它库仍在用）。unregister_lib 内含 flush，
+        // 保证 search_ 析构前本 lane 的 reduce 闭包（捕获 *search_）已不再被
+        // reducer 调用。整池停在 registry 析构。
+        if (index_pool_ && index_lane_) {
+            index_pool_->unregister_lib(index_lane_);
+            index_lane_ = nullptr;
+            index_pool_ = nullptr;  // 仅清借用指针，不动共享池本体
         }
         if (search_ && opts_.read_write && keydir_) {
             // P14e:统一分段 search.ckpt（docmap + bm25 + hnsw 单文件）。
@@ -760,8 +769,8 @@ void Cask::write_keydir_snapshot() noexcept {
 // T3: 提交索引任务到 IndexPool。背压由有界队列提供：队列满（10240）时
 // index_pool_->submit 的 push 阻塞写线程，让 put 路径自然减速、避免内存溢出。
 void Cask::submit_index_task(IndexTask task) {
-    if (!index_pool_) return;
-    index_pool_->submit(std::move(task));
+    if (!index_pool_ || !index_lane_) return;
+    index_pool_->submit(index_lane_, std::move(task));
 }
 
 // ---- open 时重建 keydir ----------------------------------------------------
@@ -1865,7 +1874,7 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         // IndexPool,之后保存的 bm25/sidecar 覆盖必然 ≥ keydir 快照——
         // 并发写入下成对性门依然可判。
         write_keydir_snapshot();
-        if (index_pool_) index_pool_->flush();
+        if (index_pool_ && index_lane_) index_pool_->flush(index_lane_);
 
         // P2:merge 不再全量重读+重分词重建倒排。merge::run_merge 已通过
         // on_relocate 把每条 live 文档的存储定位更新到新文件;倒排 posting 以
@@ -1883,13 +1892,13 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         // buffer 与本 merge 期间累积的 put/delete 同序串行 apply——保持 HNSW
         // 单写者约束在 ord 维度上的严格性。该 ord 在数据语义上不指向任何
         // 文档（类似 Skip），仅用于 occupy ord 序列中的位置。
-        if (meta_config_.vector_dim > 0 && index_pool_) {
+        if (meta_config_.vector_dim > 0 && index_pool_ && index_lane_) {
             auto rebuild_ord = keydir_->alloc_ord();
             IndexTask t;
             t.op  = IndexOp::RebuildHnsw;
             t.ord = rebuild_ord;
-            index_pool_->submit(std::move(t));
-            index_pool_->flush();
+            index_pool_->submit(index_lane_, std::move(t));
+            index_pool_->flush(index_lane_);
         }
 
         // P14e:统一分段 search.ckpt 替代旧多文件保存。
