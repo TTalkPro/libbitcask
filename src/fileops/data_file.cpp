@@ -56,6 +56,8 @@ DataFile::open(std::string_view path, Mode mode, bool sync, bool mmap_enabled) {
         if (base != MAP_FAILED) {
             df.map_base_ = static_cast<const std::byte*>(base);
             df.map_size_ = static_cast<std::size_t>(initial_off);
+            // D3:get() 热路径按 offset 随机读，禁 readahead 避免内核预读浪费。
+            ::madvise(base, static_cast<std::size_t>(initial_off), MADV_RANDOM);
         }
     }
     return df;

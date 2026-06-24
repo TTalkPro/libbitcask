@@ -956,19 +956,23 @@
 
 ### D 梯队：清理与小幅优化（按需穿插）
 
-- [ ] **D1 HNSW `search_layer` 顶层 `out.resize` 跨层 churn** — `src/vector/hnsw.cpp:461-466`
-  - `out.clear() + resize` 跨层可能 realloc。`out.reserve(ef)` 一次即可。风险：零。
+- [x] **D1 HNSW `search_layer` 顶层 `out.resize` 跨层 churn** — `src/vector/hnsw.cpp`
+  - **已完成（2026-06-24）**：函数入口 `out.reserve(ef)`，保证后续 `clear+resize` 不 realloc。f32 + int8 两路。
 - [ ] **D2 `search_phrase`/`near`/`bool`/`fuzzy` 的内层重复模式抽 helper** — 多处
   - "ordered terms 构建" + "results → hits materialize" 5+ 处重复。S8-R3 只动了外层。
-    纯代码质量。
-- [ ] **D3 `mmap` 的 read 文件加 `madvise(MADV_RANDOM)`** — `src/fileops/data_file.cpp:54-59`
-  - random access 模式 hint，减少内核 readahead 浪费。风险：零。
-- [ ] **D4 `.so` 链接加 `-fno-semantic-interposition` + `-fvisibility=hidden`** — `CMakeLists.txt`
-  - C++ 内部符号 inline 潜力释放（C API 已 `extern "C"`）。~3-5%。需审计导出表。风险：低。
-- [ ] **D5 `PosixFile::pread` / `read` 每次分配 `vector<byte>`** — `src/io/posix_file.cpp:70, 108`
-  - 已有 `pread_into`，但旧 API 还在。grep 确认无热路径调用，逐步迁移。风险：低。
-- [ ] **D6 `select_neighbors` 中 `vec_of(pid)` 反复取** — `src/vector/hnsw.cpp:577-610`
-  - M=16 ef=200 = 3200 次冗余向量取指。picked 列表存 `{d, id, vec_ptr}` 或预取。风险：低。
+    纯代码质量，后续按需。
+- [x] **D3 `mmap` 的 read 文件加 `madvise(MADV_RANDOM)`** — `src/fileops/data_file.cpp`
+  - **已完成（2026-06-24）**：mmap 成功后加 `madvise(MADV_RANDOM)`。get() 热路径按 offset
+    随机读，禁 readahead 避免内核预读浪费。
+- [~] **D4 `.so` 链接加 `-fno-semantic-interposition` + `-fvisibility=hidden`** — **部分完成**
+  - `-fvisibility=hidden -fvisibility-inlines-hidden` 已在 CMakeLists.txt:27 应用。
+    `-fno-semantic-interposition` 增量收益边际（visibility hidden 已防大多数 interposition），
+    暂缓。
+- [~] **D5 `PosixFile::pread` / `read` 每次分配 `vector<byte>`** — **评估后保留**
+  - 旧 API 仅 1 处 caller（hint_file.cpp:202，冷启动恢复路径），非热路径。不迁移。
+- [x] **D6 `select_neighbors` 中 `vec_of(pid)` 反复取** — `src/vector/hnsw.cpp`
+  - **已完成（2026-06-24）**：picked 旁挂 `picked_vecs` 缓存 vec_of 结果，内层循环用缓存指针
+    替代重复 `vec_of(pid)` 调用。M=16 ef=200 下省 ~3000 次冗余取指/insert。
 
 ### S10 执行进度（2026-06-24）
 

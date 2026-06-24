@@ -421,6 +421,7 @@ void HnswIndex::search_layer(
     const float* q, std::uint32_t entry, std::size_t ef, std::uint32_t layer,
     std::uint32_t n, std::uint32_t* scratch,
     std::vector<std::pair<float, std::uint32_t>>& out) const {
+    out.reserve(ef);  // D1:保容量 ≥ ef，后续 clear+resize 不 realloc。
     // visited:thread_local 版本化数组(方案见文件顶部注释)。
     auto& vt = t_visited;
     if (vt.owner != instance_id_) {
@@ -527,6 +528,7 @@ void HnswIndex::search_layer_int8(
     std::uint32_t entry, std::size_t ef, std::uint32_t layer, std::uint32_t n,
     std::uint32_t* scratch,
     std::vector<std::pair<float, std::uint32_t>>& out) const {
+    out.reserve(ef);
     auto& vt = t_visited;
     if (vt.owner != instance_id_) {
         vt.owner = instance_id_;
@@ -603,17 +605,22 @@ void HnswIndex::select_neighbors(
     if (cands.size() <= m) return;
     std::vector<std::pair<float, std::uint32_t>> picked;
     picked.reserve(m);
+    std::vector<const float*> picked_vecs;  // D6:缓存 vec_of，免内层循环冗余取指。
+    picked_vecs.reserve(m);
     for (const auto& [d, id] : cands) {
         if (picked.size() >= m) break;
         bool ok = true;
         const float* v = vec_of(id);
-        for (const auto& [pd, pid] : picked) {
-            if (dist_(v, vec_of(pid), cfg_.dim) < d) {  // 离已选者比离 query 还近
+        for (std::size_t pi = 0; pi < picked_vecs.size(); ++pi) {
+            if (dist_(v, picked_vecs[pi], cfg_.dim) < d) {
                 ok = false;
                 break;
             }
         }
-        if (ok) picked.push_back({d, id});
+        if (ok) {
+            picked.push_back({d, id});
+            picked_vecs.push_back(v);
+        }
     }
     // 不足 m 时用剩余最近者补齐(论文 keepPruned 变体)。
     if (picked.size() < m) {
