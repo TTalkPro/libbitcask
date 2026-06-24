@@ -126,6 +126,15 @@ struct IndexTask {
         t.fields   = std::move(fields_);
         return t;
     }
+
+    // 停止信号构造入口。显式初始化 op（其余成员走默认成员初始化），
+    // 避免聚合初始化 IndexTask{IndexOp::Sentinel} 触发
+    // -Wmissing-field-initializers（buf/fields/vec/meta 无默认成员初始化）。
+    static IndexTask sentinel() {
+        IndexTask t;
+        t.op = IndexOp::Sentinel;
+        return t;
+    }
 };
 
 // 索引任务队列：多生产者（put/delete 线程）→ 单消费者（Index Pool worker）。
@@ -218,11 +227,10 @@ using ErrorFn  = std::function<void()>;
 class IndexPool {
 public:
     explicit IndexPool(int concurrency = 1, std::size_t queue_capacity = 10240)
-        : stopped_(false)
-        , pending_(0)
-        , next_apply_ord_(0)
-        , queue_(queue_capacity)
+        : queue_(queue_capacity)
     {
+        // stopped_/pending_/next_apply_ord_ 走默认成员初始化（false/0/0），
+        // 不在此重复列出——避免与声明顺序不一致触发 -Wreorder。
         (void)concurrency;
     }
 
@@ -274,7 +282,7 @@ public:
                                                std::memory_order_acq_rel)) {
             return;
         }
-        queue_.push(IndexTask{IndexOp::Sentinel});
+        queue_.push(IndexTask::sentinel());
         // joinable() guard 兼容「start() 从未调用」场景：默认构造的
         // std::thread 不 joinable，跳过 join——Cask::open 失败回滚时
         // IndexPool 可能在 start() 前被析构，此 guard 防止 UB。

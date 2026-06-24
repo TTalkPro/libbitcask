@@ -82,7 +82,7 @@ TEST(IndexPool, SentinelStopsWorker) {
 
     // S6-P2: Sentinel 走 dispatcher 的特殊路径 — 不进 map 也不进 reducer，
     // 仅触发 got_sentinel_ 标志让 reducer 退出。所以 reducer 不会被回调。
-    pool.queue().push(IndexTask{IndexOp::Sentinel});
+    pool.queue().push(IndexTask::sentinel());
     pool.stop();
 
     EXPECT_FALSE(invoked);
