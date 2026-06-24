@@ -1,30 +1,31 @@
-// TBB 线程池封装：per-Cask 的 Index Pool + Search Pool。
+// 索引线程池封装：registry 级共享的 Index Pool（写/索引侧）。
 //
-// Index Pool（2 线程 + TBB task_group）— S6-P2 流水线：
-//   1) dispatcher_ 线程：从 IndexTaskQueue 拉任务
-//      - Add + 非空 fields：丢给 tbb::task_group 并行跑 map_fn_
-//      - Add + 空 fields（单 text 走 on_write）：构造 OnWriteEntry 直接入 reorder
-//      - Delete / Skip / RebuildHnsw：构造对应 entry 直接入 reorder
-//      - 收到 Sentinel：等 map_group_ 排空 → 设 got_sentinel_ → 通知 reducer 退出
-//   2) reducer_ 线程：从 reorder buffer 按 ord 严格升序取 entry，调用 reduce_fn_
-//      - 单一写者约束（I3）：HNSW/索引的 apply 都在此线程串行
-//      - 异常路径：try/catch 包裹，失败时调 error_fn_，仍推进 ord（避免 stall）
-//   使用 std::thread 而非 TBB task_arena，避免 concurrency=1 时
-//   主线程与 worker 争用同一 slot 导致 flush() 死锁。
-// Search Pool（N 线程 unbounded）：执行 BM25 并行搜索（T6 阶段启用）。
+// === Index Pool（S6-P3 共享 + S6-P4 并行 map）===
+// **registry 级共享**（非每 Cask 一个）。架构 = MapReduce 流水线：
+//   queue → N 个 map worker（std::thread，并发跑 map_fn_=map_analyze，真数据并行
+//           → G1；Add+fields 走分词，其余直接构造 entry）
+//        → per-lane reorder buffer（按 ord 暂存乱序结果）
+//        → 1 个 reducer（按 ord 严格升序取 entry 调 reduce_fn_，库内单写者 I3；
+//           异常仍推进 ord 避免 stall）。
+//   背压：reorder 在途上限（reorder_cap_），达限则 map worker 停 pop → queue 满
+//        → put 阻塞。用 std::thread（非 TBB task_group）规避 TSan thread_data 坑。
+//   多 lib：每个 search 库注册一条 lane（register_lib/unregister_lib），按 task.lane
+//          路由；线程数 = N+1 与库数无关（G2）。详见 IndexPool 类注释的锁/RAII 约定。
+//
+// 注：查询/读侧的「Search Pool」是另一回事——见 search_layer.cpp 的 search_arena()
+// （进程级共享有界 arena，用于 inter-query 并发；单查询内并行实测净亏已不用，S7）。
 //
 // === 生命周期 ===
-//   1. Cask::open() → 创建 IndexPool
-//   2. put/delete → push IndexTask 到队列
-//   3. Index Pool worker 异步消费（T3 阶段实现）
-//   4. Cask::close() → stop() + join
-//   5. NIF on_unload → tbb::finalize() 确保所有线程退出
+//   1. registry 懒创建 IndexPool（KeyDirRegistry::index_pool）
+//   2. Cask::open（search 模式）→ register_lib 注册本库 lane
+//   3. put/delete → submit(lane, IndexTask) 异步入队
+//   4. Cask::close → unregister_lib（flush 排空 + 注销 lane，不停池）
+//   5. registry 析构 → ~IndexPool → stop() join 所有线程
 //
 // === 线程安全 ===
-//   - IndexTaskQueue：基于 tbb::concurrent_bounded_queue，多生产者单消费者安全。
-//   - stop()：设置原子标志后推入 sentinel，dispatcher/reducer 安全退出。
-//   - flush()：等待 pending_ 计数归零 + applied_ord_ 追上 submitted_ord_hwm_，
-//     保证所有已提交任务已被 reducer 消费并 apply。
+//   - IndexTaskQueue：基于 tbb::concurrent_bounded_queue，多生产者多 map worker 安全。
+//   - stop()：CAS stopped_ + 每 worker 一个 sentinel，全 join 后置 got_sentinel_ 收尾 reducer。
+//   - flush(lane)：等 lane.in_flight==0 且 applied_ord≥submitted_ord_hwm，保证该库已 apply。
 
 #pragma once
 
@@ -71,7 +72,7 @@ enum class IndexOp : std::uint8_t {
     // 重试路径浪费了原始 ord），单写线程发 Skip 填洞，使 reorder buffer 的
     // next_apply_ord 不永久 stall。P2 并行 map 下保证 ord 序重建。
     Skip,
-    Sentinel,    // 停止信号，dispatcher 收到后等 map 排空并通知 reducer 退出
+    Sentinel,    // 停止信号，每个 map worker 各消费一个后退出（见 stop()）
 };
 
 // S6-P3: per-库车道（lane）。共享池按 lib 路由任务到各自的 reorder buffer。
@@ -193,8 +194,8 @@ private:
     tbb::concurrent_bounded_queue<IndexTask> queue_;
 };
 
-// ---- S6-P2: Reorder buffer entry types ----
-// dispatcher/TBB map 把构造好的 entry 塞进 reorder buffer，reducer 按 ord 序
+// ---- Reorder buffer entry types ----
+// map worker 把构造好的 entry 塞进 lane 的 reorder buffer，reducer 按 ord 序
 // 取出来 apply。variant 涵盖所有 IndexOp 类型。
 struct ReduceEntry {
     search::ReduceJob job;             // map_analyze 产出（meta/vec 复用 ReduceJob）
@@ -260,6 +261,19 @@ struct IndexLane {
 // 架构：queue → N 个 map worker（std::thread，并发跑 map_analyze，真数据并行
 // → G1）→ per-lane reorder buffer → 1 reducer（按 ord 序 apply，库内单写者）。
 // 背压：reorder 在途上限，达限则 map worker 停 pop → queue 满 → put 阻塞。
+//
+// === 锁与死锁约定（criterion 5，已审计）===
+// 三把锁：reorder_mu_（护 lanes_/各 lane pending/next_apply_ord/reorder_inflight_/
+// got_sentinel_）、flush_mu_（护 flush_cv_ 等待）、start_mu_（护 started_ + 建线程）。
+// **不变量：任一线程任一时刻最多持其中一把**——无锁嵌套 ⇒ 无加锁顺序 ⇒ 不可能
+// 死锁。关键点：reducer apply 前 `lk.unlock()` 释放 reorder_mu_，再 dec_in_flight
+// （取 flush_mu_）；register_lib 先放 reorder_mu_ 再 ensure_started（start_mu_）。
+// cv 唤醒（notify）持各自锁，不跨锁。改动本类务必维持「单锁」不变量。
+//
+// === RAII / 生命周期（criterion 4，已审计）===
+// 线程：ensure_started 建，stop() join（幂等，CAS stopped_），~IndexPool 调 stop()
+// ⇒ 线程必被 join，无 detach 泄漏。lane：lanes_ 持 shared_ptr，reducer apply 前拷
+// 活防 UAF；unregister_lib 先 flush（in_flight==0 ⇒ 无在途引用）再 erase。
 class IndexPool {
 public:
     // S6-P4: concurrency = map worker 线程数（真数据并行：N 个 worker 从 queue
