@@ -1022,9 +1022,8 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
 
     new_inv->finalize_all_postings();
 
-    const std::string default_field(kDefaultField);
     fields_.clear();
-    fields_.emplace(default_field, std::move(new_inv));
+    fields_.emplace(kDefaultField, std::move(new_inv));
 
     cache_.invalidate();
 }
@@ -1174,7 +1173,7 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
     // 段 2 + 3: bm25.default + bm25.fields。
     {
         std::shared_lock lk(fields_mu_);
-        auto dit = fields_.find(std::string(kDefaultField));
+        auto dit = fields_.find(kDefaultField);
         if (dit != fields_.end()) {
             std::vector<std::byte> buf;
             dit->second->serialize(buf);
@@ -1295,7 +1294,7 @@ SearchLayer::load_search_ckpt(std::string_view path) {
                 if (inv->deserialize(
                         std::span<const std::byte>(ls.payload.data(),
                                                     ls.payload.size()))) {
-                    fields_.emplace(std::string(kDefaultField),
+                    fields_.emplace(kDefaultField,
                                      std::move(inv));
                     bm25_loaded = true;
                 } else {

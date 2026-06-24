@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -22,10 +23,15 @@
 
 namespace bitcask {
 
+namespace detail {
+struct FileCloser {
+    void operator()(std::FILE* f) const noexcept { if (f) std::fclose(f); }
+};
+}  // namespace detail
+
 class FieldSchema {
 public:
     FieldSchema() = default;
-    ~FieldSchema() { if (fp_ != nullptr) std::fclose(fp_); }
     FieldSchema(const FieldSchema&) = delete;
     FieldSchema& operator=(const FieldSchema&) = delete;
 
@@ -51,8 +57,8 @@ public:
             }
             std::fclose(rf);
         }
-        if (fp_ != nullptr) { std::fclose(fp_); fp_ = nullptr; }
-        fp_ = std::fopen(path.c_str(), "ab");  // best-effort 追加句柄
+        if (fp_) fp_.reset();
+        fp_.reset(std::fopen(path.c_str(), "ab"));  // best-effort 追加句柄
         return true;
     }
 
@@ -70,14 +76,14 @@ public:
             return it->second;
         }
         const auto id = static_cast<std::uint32_t>(id_to_name_.size());
-        if (fp_ != nullptr) {
+        if (fp_) {
             const auto nlen = static_cast<std::uint16_t>(name.size());
             const std::uint8_t hdr[2] = {
                 static_cast<std::uint8_t>(nlen & 0xFF),
                 static_cast<std::uint8_t>((nlen >> 8) & 0xFF)};
-            std::fwrite(hdr, 1, 2, fp_);
-            if (!name.empty()) std::fwrite(name.data(), 1, name.size(), fp_);
-            std::fflush(fp_);
+            std::fwrite(hdr, 1, 2, fp_.get());
+            if (!name.empty()) std::fwrite(name.data(), 1, name.size(), fp_.get());
+            std::fflush(fp_.get());
         }
         std::string key(name);
         name_to_id_.emplace(key, id);
@@ -102,7 +108,7 @@ private:
     std::unordered_map<std::string, std::uint32_t> name_to_id_;
     std::vector<std::string> id_to_name_;  // id == 下标
     std::string path_;
-    std::FILE* fp_ = nullptr;  // append-only 写句柄
+    std::unique_ptr<std::FILE, detail::FileCloser> fp_;  // append-only 写句柄
 };
 
 }  // namespace bitcask

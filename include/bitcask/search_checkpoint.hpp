@@ -59,6 +59,10 @@ struct LoadedCheckpoint {
 
 namespace detail {
 
+struct FileCloser {
+    void operator()(std::FILE* f) const noexcept { if (f) std::fclose(f); }
+};
+
 constexpr char kCkptMagic[4] = {'B', 'C', 'S', 'C'};
 constexpr std::uint32_t kCkptVersion = 1;
 constexpr std::size_t kHeaderLen = 16;  // magic(4)+ver(4)+watermark(8)
@@ -143,11 +147,11 @@ public:
 
         const std::string fp(path);
         const std::string tmp = fp + ".tmp";
-        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        std::unique_ptr<std::FILE, FileCloser> f(std::fopen(tmp.c_str(), "wb"));
         if (!f) return false;
         const bool wrote =
-            std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
-        std::fclose(f);
+            std::fwrite(buf.data(), 1, buf.size(), f.get()) == buf.size();
+        f.reset();  // close before rename（须 flush OS buffer）
         if (!wrote || std::rename(tmp.c_str(), fp.c_str()) != 0) {
             std::remove(tmp.c_str());
             return false;
@@ -160,18 +164,18 @@ public:
     [[nodiscard]] static std::optional<LoadedCheckpoint>
     read(std::string_view path) {
         using namespace detail;
-        std::FILE* f = std::fopen(std::string(path).c_str(), "rb");
+        std::unique_ptr<std::FILE, FileCloser> f(
+            std::fopen(std::string(path).c_str(), "rb"));
         if (!f) return std::nullopt;
-        std::fseek(f, 0, SEEK_END);
-        const long fsz = std::ftell(f);
-        std::fseek(f, 0, SEEK_SET);
+        std::fseek(f.get(), 0, SEEK_END);
+        const long fsz = std::ftell(f.get());
+        std::fseek(f.get(), 0, SEEK_SET);
         if (fsz < static_cast<long>(kHeaderLen + kTrailerLen)) {
-            std::fclose(f);
             return std::nullopt;
         }
         std::vector<std::byte> buf(static_cast<std::size_t>(fsz));
-        const bool rd = std::fread(buf.data(), 1, buf.size(), f) == buf.size();
-        std::fclose(f);
+        const bool rd =
+            std::fread(buf.data(), 1, buf.size(), f.get()) == buf.size();
         if (!rd) return std::nullopt;
 
         const std::byte* base = buf.data();

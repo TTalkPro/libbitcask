@@ -455,22 +455,22 @@
     CoW / Atomic Swap / Pipeline / Registry / LRU / Barrier / Sharded / WAL）。**2 个 god class 待评估**
     （见 P2 项）。
 
-  - [ ] **P0-a FieldSchema FILE\* → RAII** — `include/bitcask/field_schema.hpp:28,52,54,105`
-    - 裸 `std::FILE* fp_`，析构 + open() 手动 fclose。fread 抛异常或 open 中途失败 → fd 泄露。
-    - 修复：`std::unique_ptr<std::FILE, int(*)(std::FILE*)> fp_{nullptr, std::fclose}`。
-    - 风险：低（行为零变更）。
-  - [ ] **P0-b search_checkpoint 3 处 fclose → RAII** — `include/bitcask/search_checkpoint.hpp:146-174`
-    - 3 个 fopen/fclose 对；第二个 fopen 后抛异常 → 第一个 fd 泄露。
-    - 修复：同 P0-a unique_ptr<FILE,deleter> 包裹。
-    - 风险：低。
-  - [ ] **P0-c kDefaultField → constexpr string_view** — `src/search/search_layer.cpp`（22+ 处）
-    - 每次比较构造临时 `std::string(kDefaultField)`；改 `constexpr std::string_view` 直接比较，
-      消除 22+ 次临时 string 分配。
-    - 风险：低（性能小赢）。
-  - [ ] **P0-d byte_order.hpp 提取共享工具** — `src/fileops/codec.cpp:20-54` + `src/keydir/keydir.cpp:1082-1107`
-    - `le_load_u16/32/64` / `le_store_u16/32/64` 在 codec.cpp 匿名空间；keydir.cpp 用 reinterpret_cast
-      + memcpy 重造了 `snap_put32/snap_put64`。新建 `include/bitcask/byte_order.hpp` 两处共用。
-    - 风险：低。
+  - [x] **P0-a FieldSchema FILE\* → RAII** — `include/bitcask/field_schema.hpp`
+    - **已完成（2026-06-24）**：`std::FILE* fp_` → `unique_ptr<FILE, detail::FileCloser>`；删除手动析构
+      fclose + open() 中途 fclose。detail::FileCloser 无状态 deleter（零额外开销）。
+  - [x] **P0-b search_checkpoint fopen/fclose → RAII** — `include/bitcask/search_checkpoint.hpp`
+    - **已完成（2026-06-24）**：write() 和 read() 的 `FILE*` → `unique_ptr<FILE, FileCloser>`；
+      write 保留 `f.reset()` 在 rename 前显式关闭（平台正确性）；read 早退路径自动关闭。
+  - [x] **P0-c kDefaultField 临时 string 消除** — `src/search/search_layer.cpp`
+    - **已完成（2026-06-24）**：`fields_.find(std::string(kDefaultField))` × 2 → `fields_.find(kDefaultField)`
+      （透明 hash 直传 string_view，零临时 string）；`fields_.emplace(std::string(kDefaultField), ...)` × 2 →
+      `fields_.emplace(kDefaultField, ...)`。默认字段查询热路径每次省 1 次 SSO string 构造。
+  - [x] **P0-d byte_order.hpp 提取共享 LE 工具** — 新建 `include/bitcask/byte_order.hpp`、`src/fileops/codec.cpp`、`src/keydir/keydir.cpp`
+    - **已完成（2026-06-24）**：codec.cpp 匿名 namespace 的 `le_store/load_u16/32/64` 提取到
+      `byte_order.hpp`；keydir.cpp `snap_put32/64` 从 `reinterpret_cast<uint8_t*>(&v)`（隐式依赖
+      主机 LE）改为显式 `le_store_u32/64`（可移植 + DRY）。
+  - 验证：Release **472/472 ctest**；TSan 零 race（checkpoint_recovery 5 + cask_docvalue 66 +
+    keydir 9 = 80 例）。
   - [ ] **P1-a C API new/delete → unique_ptr** — `c_api/bitcask_c.cpp:222,231`
     - 裸 `new bitcask_impl_t` / 裸 `delete`；caller 遗漏 close → 泄露。改 unique_ptr + 自定义 deleter。
     - 风险：低。

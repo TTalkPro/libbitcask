@@ -1,4 +1,5 @@
 #include "bitcask/keydir.hpp"
+#include "bitcask/byte_order.hpp"
 #include "bitcask/codec.hpp"
 
 #include <cstdio>
@@ -1080,12 +1081,14 @@ constexpr std::uint32_t kSnapMagic   = 0x42434B53;  // "BCKS"
 constexpr std::uint32_t kSnapVersion = 1;
 
 void snap_put32(std::vector<std::uint8_t>& b, std::uint32_t v) {
-    const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
-    b.insert(b.end(), p, p + 4);
+    const auto sz = b.size();
+    b.resize(sz + 4);
+    bitcask::le_store_u32(reinterpret_cast<std::byte*>(b.data() + sz), v);
 }
 void snap_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
-    const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
-    b.insert(b.end(), p, p + 8);
+    const auto sz = b.size();
+    b.resize(sz + 8);
+    bitcask::le_store_u64(reinterpret_cast<std::byte*>(b.data() + sz), v);
 }
 
 struct SnapCursor {
