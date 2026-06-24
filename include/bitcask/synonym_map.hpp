@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
+#include <span>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -61,11 +62,10 @@ public:
         }
     }
 
-    [[nodiscard]] std::vector<std::string> expand(const std::string& term) const {
+    // B1:返回 span 借内部存储，零分配。空 span = 无同义词（caller 自行处理原 term）。
+    [[nodiscard]] std::span<const std::string> expand(const std::string& term) const {
         auto it = term_to_group_.find(term);
-        if (it == term_to_group_.end()) {
-            return {term};
-        }
+        if (it == term_to_group_.end()) return {};
         return it->second;
     }
 
@@ -76,9 +76,11 @@ public:
         result.reserve(terms.size() * 2);
         for (const auto& term : terms) {
             auto syns = expand(term);
-            for (auto& syn : syns) {
-                if (seen.insert(syn).second) {
-                    result.push_back(std::move(syn));
+            if (syns.empty()) {
+                if (seen.insert(term).second) result.push_back(term);
+            } else {
+                for (const auto& syn : syns) {
+                    if (seen.insert(syn).second) result.push_back(syn);
                 }
             }
         }

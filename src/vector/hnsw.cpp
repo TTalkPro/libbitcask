@@ -405,6 +405,18 @@ std::uint32_t HnswIndex::greedy_closest(const float* q, std::uint32_t start,
     return cur;
 }
 
+using Cand = std::pair<float, std::uint32_t>;
+// B5:priority_queue 底层 vector 跨调用复用（ef=256 → ~4KB × 2 省首次 alloc + 几何增长）。
+// ReusablePQ 继承暴露 protected Container c 供函数尾 extract 保容量。
+template <class Compare>
+struct ReusablePQ : std::priority_queue<Cand, std::vector<Cand>, Compare> {
+    using Base = std::priority_queue<Cand, std::vector<Cand>, Compare>;
+    using Base::Base;
+    std::vector<Cand> extract() && noexcept { return std::move(this->c); }
+};
+thread_local std::vector<Cand> tl_cands_buf;
+thread_local std::vector<Cand> tl_top_buf;
+
 void HnswIndex::search_layer(
     const float* q, std::uint32_t entry, std::size_t ef, std::uint32_t layer,
     std::uint32_t n, std::uint32_t* scratch,
@@ -424,10 +436,12 @@ void HnswIndex::search_layer(
     const std::uint32_t ep = vt.epoch;
     std::uint32_t* visited = vt.marks.data();
 
-    using Cand = std::pair<float, std::uint32_t>;
-    // 候选:小顶(最近优先);结果:大顶(便于踢最远)。
-    std::priority_queue<Cand, std::vector<Cand>, std::greater<>> cands;
-    std::priority_queue<Cand> top;
+    using Cand [[maybe_unused]] = std::pair<float, std::uint32_t>;
+    // B5:从 thread_local buffer move 构造（保容量），函数尾 extract 回收。
+    tl_cands_buf.clear();
+    tl_top_buf.clear();
+    ReusablePQ<std::greater<>> cands(std::greater<>{}, std::move(tl_cands_buf));
+    ReusablePQ<std::less<Cand>> top(std::less<Cand>{}, std::move(tl_top_buf));
 
     const float d0 = dist_id(q, entry);
     cands.push({d0, entry});
@@ -464,6 +478,8 @@ void HnswIndex::search_layer(
         out[i] = top.top();
         top.pop();
     }
+    tl_cands_buf = std::move(cands).extract();
+    tl_top_buf = std::move(top).extract();
 }
 
 // V4.2:int8 粗筛版 greedy_closest,与 f32 版同结构,只换 dist_id →
@@ -525,9 +541,11 @@ void HnswIndex::search_layer_int8(
     const std::uint32_t ep = vt.epoch;
     std::uint32_t* visited = vt.marks.data();
 
-    using Cand = std::pair<float, std::uint32_t>;
-    std::priority_queue<Cand, std::vector<Cand>, std::greater<>> cands;
-    std::priority_queue<Cand> top;
+    using Cand [[maybe_unused]] = std::pair<float, std::uint32_t>;
+    tl_cands_buf.clear();
+    tl_top_buf.clear();
+    ReusablePQ<std::greater<>> cands(std::greater<>{}, std::move(tl_cands_buf));
+    ReusablePQ<std::less<Cand>> top(std::less<Cand>{}, std::move(tl_top_buf));
 
     const float d0 = dist_id_int8(query_codes, query_scale, query_sum, entry);
     cands.push({d0, entry});
@@ -572,6 +590,8 @@ void HnswIndex::search_layer_int8(
         out[i] = top.top();
         top.pop();
     }
+    tl_cands_buf = std::move(cands).extract();
+    tl_top_buf = std::move(top).extract();
 }
 
 void HnswIndex::select_neighbors(

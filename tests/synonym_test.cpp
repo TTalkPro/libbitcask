@@ -25,8 +25,7 @@ TEST(SynonymMap, AddGroupAndExpand) {
 TEST(SynonymMap, ExpandUnknownTerm) {
     SynonymMap map;
     auto r = map.expand("unknown");
-    EXPECT_EQ(r.size(), 1u);
-    EXPECT_EQ(r[0], "unknown");
+    EXPECT_EQ(r.size(), 0u);
 }
 
 TEST(SynonymMap, ExpandTermsDedup) {

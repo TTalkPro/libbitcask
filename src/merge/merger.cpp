@@ -54,6 +54,19 @@ run_merge(std::span<const std::string> input_data_paths,
     };
 
     std::vector<PendingUpdate> pending_;
+    // B6:估算 live record 数预 reserve，避免几何增长 realloc。
+    // 每 record 至少 ~48B（header 18 + key 8 + value_min + hint），用 64B 粗估。
+    {
+        std::uint64_t est_records = 0;
+        for (const auto& path : input_data_paths) {
+            std::error_code ec;
+            const auto sz = std::filesystem::file_size(path, ec);
+            if (!ec) est_records += sz / 64;
+        }
+        if (est_records > 0) {
+            pending_.reserve(static_cast<std::size_t>(est_records));
+        }
+    }
 
     auto out_data = fileops::DataFile::open(stats.output_data_path,
                                              fileops::DataFile::Mode::kCreate,

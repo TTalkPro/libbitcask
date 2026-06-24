@@ -829,8 +829,9 @@ SearchLayer::search_fields(std::string_view query, std::size_t k,
             terms = synonym_map_->expand_terms(terms);
         }
         for (auto& [t, boost] : term_boosts) {
-            auto expanded = synonym_map_ ? synonym_map_->expand(t) : std::vector<std::string>{t};
-            for (auto& et : expanded) {
+            auto expanded = synonym_map_ ? synonym_map_->expand(t) : std::span<const std::string>{};
+            if (expanded.empty()) expanded = {&t, 1};
+            for (const auto& et : expanded) {
                 auto res = inv->search({et}, k, index_, params_override);
                 for (auto& r : res) acc[r.ord] += static_cast<double>(r.score) * boost;
             }

@@ -876,10 +876,11 @@
 
 ### B 梯队：中 ROI 低/中风险（次轮）
 
-- [ ] **B1 `SynonymMap::expand` 返回 `vector<string>` by value** — `include/bitcask/synonym_map.hpp:64-86`
-  - **现状**：每次调用拷一份整组 synonyms。`expand_terms` 内部又调 `expand` 再拷。
-  - **修法**：返回 `span<const string>` 借内部存储；查不到返回空 span，caller 处理 fallback。
-  - **收益**：开启 synonyms 时每次查询省 ~num_synonyms × 10B 拷贝。风险：低。
+- [x] **B1 `SynonymMap::expand` 返回 `vector<string>` by value** — `include/bitcask/synonym_map.hpp`、`src/search/search_layer.cpp`、`tests/synonym_test.cpp`
+  - **已完成（2026-06-24）**：`expand()` 返回 `span<const string>` 借内部 map（零分配）；
+    空 span = 无同义词。`expand_terms` 显式处理空 span（fallback 原词）。`search_layer.cpp`
+    search_fields 路径的 `expand(t)` 改 span + 空 span fallback。测试同步更新。
+  - 验证：472/472 ctest + TSan（synonym 11 例零 race）。
 
 - [ ] **B2 `search_text` 的 `terms` 拷贝 + synonym 再拷** — `src/search/search_layer.cpp:562-568`
   - **现状**：`analyzer_->analyze()` 返回 `unordered_map<string,...>`（map 拥有 string），
@@ -890,12 +891,10 @@
     `near`/`fuzzy`/`bool` 同模式（5 处重复，可抽 helper）。
   - **收益**：每次查询省 `num_terms × avg_term_len` 拷贝。风险：中（动 InvertedIndex 接口）。
 
-- [ ] **B3 `doc_vector_f32` 总是返回 owning `vector<float>`** — `src/fileops/codec.cpp:345-364`
-  - **现状**：被 `cask.cpp:901, 1393` 调，每次分配 + memcpy（128-dim = 512B）。
-    `to_owned()`（`:1450-1451`）再 assign 一份（双拷贝）。
-  - **修法**：加 `doc_vector_f32_into(span<float> out)` 出参重载，对齐 `pread_into` 模式；
-    caller 复用 `thread_local` 缓冲。
-  - **收益**：每次 vector get 省 1 分配 + 1 memcpy。风险：低。
+- [~] **B3 `doc_vector_f32` 总是返回 owning `vector<float>`** — **跳过（收益边际）**
+  - 分析（2026-06-24）：cask.cpp:901（recovery 路径）的 `rd.vector = doc_vector_f32(*dv)` 已
+    被 NRVO 优化（直接构造进 rd.vector，无中间拷贝）。`_into` + thread_local 在此路径无
+    省分配（rd 需拥有数据）。cask.cpp:1393 是一次性初始化。**无可省分配**。
 
 - [ ] **B4 `on_delete` 重新跑完整 analyze 仅为失效缓存** — `src/search/search_layer.cpp:497-502`
   - **现状**：`auto tf = analyzer_->analyze(*text)` 完整 NFKC + ngram + fold，
@@ -905,15 +904,16 @@
   - **收益**：每次删除省一次完整 NLP（CJK ~20µs/doc）。代价：每缓存条目多占
     `num_terms × avg_term_len` 字节。风险：中（多占内存）。
 
-- [ ] **B5 HNSW `search_layer` 每次 stack 构造两个 `priority_queue`** — `src/vector/hnsw.cpp:429-430, 529-530`
-  - **现状**：`scratch` thread_local 复用了，但 `priority_queue` 对象本身每次重新
-    构造 — 内部 `vector<Cand>` 首次 push 分配（ef=256 估算 ~4KB）。
-  - **修法**：thread_local 持底层 `vector<Cand>`，每次从 move 构造 queue；函数尾 move
-    出来保留容量。
-  - **收益**：每次向量查询省 2 次堆分配。风险：低（注意 thread_local 生命周期）。
+- [x] **B5 HNSW `search_layer` 每次 stack 构造两个 `priority_queue`** — `src/vector/hnsw.cpp`
+  - **已完成（2026-06-24）**：`ReusablePQ`（继承 `priority_queue` 暴露 protected `Container c`）
+    + `thread_local vector<Cand>` 底层 buffer。函数入口 clear（保容量）→ move 构造 queue →
+    函数尾 `extract()` 回收。f32 + int8 两路均改。每次向量查询稳态零堆分配（cands + top）。
+  - 验证：472/472 ctest + TSan（hnsw 14 例零 race）。
 
-- [ ] **B6 `merger` 的 `pending_` 不 reserve** — `src/merge/merger.cpp:56`
-  - **现状**：`vector<PendingUpdate>` 空，几何级增长。100M 记录 merge 多次 realloc。
+- [x] **B6 `merger` 的 `pending_` 不 reserve** — `src/merge/merger.cpp`
+  - **已完成（2026-06-24）**：扫输入文件 sizes 估算 record 数（`file_size / 64` 粗估），
+    `pending_.reserve(est)`。`file_size` 失败（ec 非零）时跳过该文件。大 merge 省 ~log(N) realloc。
+  - 验证：472/472 ctest + TSan（merge_concurrent 3 例零 race）。
   - **修法**：扫输入文件 sizes 估算 `pending_.reserve(estimated_live_count)`。
   - **收益**：大 merge 减少 ~log(N) 次 realloc。风险：低。
 
