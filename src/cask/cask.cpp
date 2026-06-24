@@ -1688,6 +1688,76 @@ Cask::search_text(std::string_view query, std::size_t k,
     return TextSearchResult{std::move(*hits)};
 }
 
+// S7-4: 批量文本搜索——K 条独立查询并发跑共享 Search 池，保序返回。
+std::vector<std::expected<TextSearchResult, CaskFault>>
+Cask::search_text_batch(std::span<const std::string_view> queries,
+                        std::size_t k, const meta::MetaFilter* filter) {
+    std::vector<std::expected<TextSearchResult, CaskFault>> out(queries.size());
+    if (queries.empty()) return out;
+    // 一次 flush（prepare_search）覆盖全批——所有查询共享同一 search_/lane，
+    // 不在并发体内重复 flush。失败则全槽返回同一错误。
+    if (auto g = prepare_search(); !g) {
+        for (auto& o : out) o = std::unexpected(g.error());
+        return out;
+    }
+    search::parallel_for_queries(queries.size(), [&](std::size_t i) {
+        auto hits = search_->search_text(queries[i], k, nullptr, filter);
+        if (!hits) out[i] = std::unexpected(err(CaskError::kIo, hits.error()));
+        else       out[i] = TextSearchResult{std::move(*hits)};
+    });
+    return out;
+}
+
+// S7-4: 批量向量检索——K 条独立查询并发跑共享 Search 池，保序返回。
+std::vector<std::expected<TextSearchResult, CaskFault>>
+Cask::search_vector_batch(std::span<const std::span<const float>> queries,
+                          std::size_t k, std::size_t ef,
+                          const meta::MetaFilter* filter) {
+    std::vector<std::expected<TextSearchResult, CaskFault>> out(queries.size());
+    if (queries.empty()) return out;
+    // 前置校验一次覆盖全批：search_ 存在（flush）+ 向量配置。失败 → 全槽同错。
+    if (auto g = prepare_search(); !g) {
+        for (auto& o : out) o = std::unexpected(g.error());
+        return out;
+    }
+    if (meta_config_.vector_dim == 0) {
+        for (auto& o : out)
+            o = std::unexpected(err(CaskError::kInvalidOption,
+                                    "collection has no vector config"));
+        return out;
+    }
+    search::parallel_for_queries(queries.size(), [&](std::size_t i) {
+        auto hits = search_->search_vector(queries[i], k, ef, filter);
+        if (!hits) out[i] = std::unexpected(err(CaskError::kInvalidOption, hits.error()));
+        else       out[i] = TextSearchResult{std::move(*hits)};
+    });
+    return out;
+}
+
+// S7-4: 批量 hybrid 检索——K 条独立 (text,vec) 查询并发跑共享 Search 池。
+std::vector<std::expected<TextSearchResult, CaskFault>>
+Cask::search_hybrid_batch(std::span<const HybridQuery> queries,
+                          std::size_t k, const meta::MetaFilter* filter) {
+    std::vector<std::expected<TextSearchResult, CaskFault>> out(queries.size());
+    if (queries.empty()) return out;
+    if (auto g = prepare_search(); !g) {
+        for (auto& o : out) o = std::unexpected(g.error());
+        return out;
+    }
+    if (meta_config_.vector_dim == 0) {
+        for (auto& o : out)
+            o = std::unexpected(err(CaskError::kInvalidOption,
+                                    "collection has no vector config"));
+        return out;
+    }
+    search::parallel_for_queries(queries.size(), [&](std::size_t i) {
+        auto hits = search_->search_hybrid(queries[i].text, queries[i].vec, k, filter);
+        if (!hits) out[i] = std::unexpected(err(CaskError::kInvalidOption, hits.error()));
+        else       out[i] = TextSearchResult{std::move(*hits)};
+    });
+    return out;
+}
+
 // search_phrase：BM25 短语模式搜索。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_phrase(std::string_view query, std::size_t k) {

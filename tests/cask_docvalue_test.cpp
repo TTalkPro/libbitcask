@@ -2327,6 +2327,128 @@ TEST_F(CaskDocValueTest, V36HybridErrors) {
     (*c3)->close();
 }
 
+// ── S7-4:批量文本搜索（inter-query 并发入口）──────────────────────────
+
+// 批量结果必须与逐条 search_text 字节等价（保序 + 各槽独立），并发安全（TSan）。
+TEST_F(CaskDocValueTest, S74SearchTextBatchMatchesSerial) {
+    auto opts = v31_opts(4);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    v36_put_corpus(**c);
+
+    // 含重复 "x"（并发写同一缓存键，压 cache 写锁）+ 无命中查询。
+    std::vector<std::string> qstr = {"x", "y", "z", "nomatch",
+                                     "x", "y", "x", "z"};
+    std::vector<std::string_view> q(qstr.begin(), qstr.end());
+
+    // oracle：逐条串行 search_text。
+    std::vector<std::vector<std::string>> expect;
+    for (const auto& s : qstr) {
+        auto r = (*c)->search_text(s, 10);
+        ASSERT_TRUE(r);
+        std::vector<std::string> keys;
+        for (const auto& h : r->hits) keys.push_back(h.key);
+        expect.push_back(std::move(keys));
+    }
+
+    auto batch = (*c)->search_text_batch(q, 10);
+    ASSERT_EQ(batch.size(), q.size());
+    for (std::size_t i = 0; i < q.size(); ++i) {
+        ASSERT_TRUE(batch[i]) << "query " << i << " = " << qstr[i];
+        std::vector<std::string> keys;
+        for (const auto& h : batch[i]->hits) keys.push_back(h.key);
+        EXPECT_EQ(keys, expect[i]) << "query " << i << " = " << qstr[i];
+    }
+    (*c)->close();
+}
+
+// 边界：空批量 → 空；单条 → 走快路径（不进池）仍正确。
+TEST_F(CaskDocValueTest, S74SearchTextBatchEdgeCases) {
+    auto opts = v31_opts(4);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    v36_put_corpus(**c);
+
+    auto empty = (*c)->search_text_batch({}, 10);
+    EXPECT_TRUE(empty.empty());
+
+    std::string one = "x";
+    std::vector<std::string_view> q1{one};
+    auto b1 = (*c)->search_text_batch(q1, 10);
+    ASSERT_EQ(b1.size(), 1u);
+    ASSERT_TRUE(b1[0]);
+    EXPECT_EQ(b1[0]->hits.size(), 3u);  // d1,d2,d3 命中 "x"
+    (*c)->close();
+}
+
+// 向量批量：批量 == 逐条 search_vector oracle，并发安全（TSan）。
+TEST_F(CaskDocValueTest, S74SearchVectorBatchMatchesSerial) {
+    auto opts = v31_opts(4);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    v36_put_corpus(**c);
+
+    static const float qa[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    static const float qb[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    static const float qc[4] = {0.6f, 0.8f, 0.0f, 0.0f};
+    std::vector<std::span<const float>> q = {
+        std::span<const float>(qa, 4), std::span<const float>(qb, 4),
+        std::span<const float>(qc, 4), std::span<const float>(qa, 4),
+        std::span<const float>(qb, 4), std::span<const float>(qc, 4)};
+
+    std::vector<std::vector<std::string>> expect;
+    for (const auto& vq : q) {
+        auto r = (*c)->search_vector(vq, 10);
+        ASSERT_TRUE(r);
+        std::vector<std::string> keys;
+        for (const auto& h : r->hits) keys.push_back(h.key);
+        expect.push_back(std::move(keys));
+    }
+    auto batch = (*c)->search_vector_batch(q, 10);
+    ASSERT_EQ(batch.size(), q.size());
+    for (std::size_t i = 0; i < q.size(); ++i) {
+        ASSERT_TRUE(batch[i]) << "vec query " << i;
+        std::vector<std::string> keys;
+        for (const auto& h : batch[i]->hits) keys.push_back(h.key);
+        EXPECT_EQ(keys, expect[i]) << "vec query " << i;
+    }
+    (*c)->close();
+}
+
+// hybrid 批量：批量 == 逐条 search_hybrid oracle，并发安全（TSan）。
+TEST_F(CaskDocValueTest, S74SearchHybridBatchMatchesSerial) {
+    auto opts = v31_opts(4);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    v36_put_corpus(**c);
+
+    static const float qv[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    std::span<const float> vsp(qv, 4);
+    using HQ = Cask::HybridQuery;
+    std::vector<HQ> q = {
+        HQ{"x", vsp}, HQ{"y", vsp}, HQ{"", vsp},          // 纯向量退化
+        HQ{"x", std::span<const float>{}},                // 纯文本退化
+        HQ{"x", vsp}, HQ{"z", vsp}};
+
+    std::vector<std::vector<std::string>> expect;
+    for (const auto& hq : q) {
+        auto r = (*c)->search_hybrid(hq.text, hq.vec, 10);
+        ASSERT_TRUE(r);
+        std::vector<std::string> keys;
+        for (const auto& h : r->hits) keys.push_back(h.key);
+        expect.push_back(std::move(keys));
+    }
+    auto batch = (*c)->search_hybrid_batch(q, 10);
+    ASSERT_EQ(batch.size(), q.size());
+    for (std::size_t i = 0; i < q.size(); ++i) {
+        ASSERT_TRUE(batch[i]) << "hybrid query " << i;
+        std::vector<std::string> keys;
+        for (const auto& h : batch[i]->hits) keys.push_back(h.key);
+        EXPECT_EQ(keys, expect[i]) << "hybrid query " << i;
+    }
+    (*c)->close();
+}
+
 // ── V4:单域 merge 三项变更 ──────────────────────────────────────────────
 
 // V4.1:删除率触发策略。写入 20 篇文档,删除 12 篇(60%),设置

@@ -375,6 +375,18 @@ public:
     search_text(std::string_view query, std::size_t k = 10,
                 const meta::MetaFilter* filter = nullptr);
 
+    // S7-4:批量 BM25 文本搜索——K 条**独立**查询并发跑在进程级共享「有界
+    // Search 池」上（inter-query 并发；非每 Cask 一个线程），按输入序返回各自
+    // 结果。每条查询内部仍串行。单条查询失败只影响该槽（其余照常）。一次
+    // flush（prepare_search）覆盖全批。
+    // 线程安全:本方法内部对 search_ 的并发只读安全（cache_/doc_texts_ 各
+    // shared_mutex、倒排/HNSW shared_lock、analyzer const）；但与**写线程**仍受
+    // 「一个 Cask 一个写线程」契约约束——批量查询期间该 Cask 不得有并发写。
+    [[nodiscard]] std::vector<std::expected<TextSearchResult, CaskFault>>
+    search_text_batch(std::span<const std::string_view> queries,
+                      std::size_t k = 10,
+                      const meta::MetaFilter* filter = nullptr);
+
     // BM25 文本搜索（短语模式）。
     // 线程安全: 否（search_ 非线程安全）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
@@ -396,6 +408,13 @@ public:
                   std::size_t ef = 0,
                   const meta::MetaFilter* filter = nullptr);
 
+    // S7-4:批量 HNSW 向量检索——K 条独立向量查询并发跑共享 Search 池，保序
+    // 返回。HNSW 读路径本身线程安全（V3.3）。语义/约束同 search_text_batch。
+    [[nodiscard]] std::vector<std::expected<TextSearchResult, CaskFault>>
+    search_vector_batch(std::span<const std::span<const float>> queries,
+                        std::size_t k = 10, std::size_t ef = 0,
+                        const meta::MetaFilter* filter = nullptr);
+
     // V3.6:RRF 混合检索(hnsw-design §4)。两路各取 K'=max(k×4,64):
     // BM25 走 search_text 内核,向量走 search_vector 内核;融合
     // score = Σ 1/(60+rank),rank 从 1 起;平局 → ord 小者在前。
@@ -408,6 +427,18 @@ public:
     search_hybrid(std::string_view text_query,
                   std::span<const float> vec_query, std::size_t k = 10,
                   const meta::MetaFilter* filter = nullptr);
+
+    // S7-4:hybrid 批量查询项（文本 + 向量一对）。
+    struct HybridQuery {
+        std::string_view       text;
+        std::span<const float> vec;
+    };
+    // S7-4:批量 RRF 混合检索——K 条独立 (text, vec) 查询并发跑共享 Search 池，
+    // 保序返回。每条 hybrid 内部仍串行两路（见 S7-3）；并发发生在查询之间。
+    [[nodiscard]] std::vector<std::expected<TextSearchResult, CaskFault>>
+    search_hybrid_batch(std::span<const HybridQuery> queries,
+                        std::size_t k = 10,
+                        const meta::MetaFilter* filter = nullptr);
 
     // BM25 多字段搜索（S8.6）：支持 `field:term^boost` 语法，跨字段加权合并。
     // 无字段限定的词等价于默认字段词袋搜索。线程安全: 否。
