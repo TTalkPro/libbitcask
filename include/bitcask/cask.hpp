@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <mutex>
@@ -589,6 +590,16 @@ private:
     // 队列提供：队列满（capacity 10240）时 submit 内部的 push 阻塞写线程，
     // 自然限速，避免任务无限堆积撑爆内存。
     void submit_index_task(IndexTask task);
+
+    // S8-R3: 单条搜索公共骨架（去 9 个 search_* 单查询方法的重复）。
+    //   prepare_search()（flush）→ require_vector 时校验 vector_dim → run() 跑内核
+    //   → 失败包 err_kind（text 族 kIo / 向量族 kInvalidOption）→ 包成 TextSearchResult。
+    // run() 返回 SearchLayer 内核的 expected<vector<SearchHit>, string>。
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    run_search_one(
+        bool require_vector, CaskError err_kind,
+        const std::function<
+            std::expected<std::vector<search::SearchHit>, std::string>()>& run);
 
     // A4:落 keydir 段快照(best-effort;close/merge 末尾调)。
     void write_keydir_snapshot() noexcept;
