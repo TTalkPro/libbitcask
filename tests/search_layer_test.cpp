@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
+#include <atomic>
 #include <filesystem>
+#include <memory>
 
 #include "bitcask/search_layer.hpp"
 
@@ -13,6 +15,37 @@ SearchLayerConfig default_config() {
         .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
     };
 }
+
+// S10-A1: 包装 analyzer 计数 analyze() / analyze_with_positions() 调用次数。
+class CountingAnalyzer : public bitcask::text::Analyzer {
+public:
+    explicit CountingAnalyzer(std::unique_ptr<bitcask::text::Analyzer> inner)
+        : inner_(std::move(inner)) {}
+
+    mutable std::atomic<std::size_t> analyze_count{0};
+    mutable std::atomic<std::size_t> analyze_with_positions_count{0};
+
+    [[nodiscard]] auto analyze(std::string_view text) const
+        -> bitcask::text::TermFreqMap override {
+        analyze_count.fetch_add(1, std::memory_order_relaxed);
+        return inner_->analyze(text);
+    }
+    [[nodiscard]] auto analyze_with_positions(std::string_view text) const
+        -> bitcask::text::TermPositionsMap override {
+        analyze_with_positions_count.fetch_add(1, std::memory_order_relaxed);
+        return inner_->analyze_with_positions(text);
+    }
+    [[nodiscard]] auto analyze_with_offsets(std::string_view text) const
+        -> bitcask::text::TermTokenMap override {
+        return inner_->analyze_with_offsets(text);
+    }
+    [[nodiscard]] auto type() const noexcept -> bitcask::text::AnalyzerType override {
+        return inner_->type();
+    }
+
+private:
+    std::unique_ptr<bitcask::text::Analyzer> inner_;
+};
 
 }  // namespace
 
@@ -661,4 +694,89 @@ TEST(SearchLayer, CheckpointPrevFallback) {
 
     std::filesystem::remove(path);
     std::filesystem::remove(prev);
+}
+
+// S10-A1 核心护栏：验证缓存命中时不调 analyzer（仅 miss 分支才调）。
+TEST(SearchLayer, CacheHitSkipsAnalyzer) {
+    auto inner = bitcask::text::AnalyzerFactory::create(
+        bitcask::text::AnalyzerConfig{});
+    ASSERT_NE(inner, nullptr);
+    auto counter = std::make_unique<CountingAnalyzer>(std::move(inner));
+    CountingAnalyzer* counter_ptr = counter.get();
+
+    auto config = default_config();
+    SearchLayer layer(config, std::move(counter));
+
+    layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
+
+    const auto count_before = counter_ptr->analyze_count.load();
+    ASSERT_EQ(count_before, 0u) << "on_write 走 analyze_with_positions，不走 analyze";
+
+    auto r1 = layer.search_text("hello", 10);
+    ASSERT_TRUE(r1.has_value());
+    ASSERT_EQ(r1->size(), 1u);
+    EXPECT_EQ(counter_ptr->analyze_count.load(), 1u)
+        << "首次查询 miss，应调一次 analyze";
+
+    auto r2 = layer.search_text("hello", 10);
+    ASSERT_TRUE(r2.has_value());
+    ASSERT_EQ(r2->size(), 1u);
+    EXPECT_EQ(counter_ptr->analyze_count.load(), 1u)
+        << "S10-A1: 二次查询命中缓存，不应再调 analyze";
+
+    EXPECT_EQ(r1->at(0).key, r2->at(0).key);
+    EXPECT_EQ(r1->at(0).score, r2->at(0).score);
+}
+
+// S10-A1 短语查询的同等护栏。
+TEST(SearchLayer, CachePhraseHitSkipsAnalyzer) {
+    auto inner = bitcask::text::AnalyzerFactory::create(
+        bitcask::text::AnalyzerConfig{});
+    ASSERT_NE(inner, nullptr);
+    auto counter = std::make_unique<CountingAnalyzer>(std::move(inner));
+    CountingAnalyzer* counter_ptr = counter.get();
+
+    auto config = default_config();
+    SearchLayer layer(config, std::move(counter));
+
+    layer.on_write("doc1", 0, "hello world foo bar", 1, 100, 50, 1000);
+
+    const auto baseline = counter_ptr->analyze_with_positions_count.load();
+    ASSERT_EQ(baseline, 1u) << "on_write 调一次 analyze_with_positions";
+
+    auto r1 = layer.search_phrase("hello world", 10);
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(counter_ptr->analyze_with_positions_count.load(), 2u)
+        << "miss: 再调一次 analyze_with_positions";
+
+    auto r2 = layer.search_phrase("hello world", 10);
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(counter_ptr->analyze_with_positions_count.load(), 2u)
+        << "hit: 不应再调 analyze_with_positions";
+}
+
+// S10-A1 契约验证：on_delete 后下次查询应 miss 重算（不返回陈旧缓存）。
+TEST(SearchLayer, CacheInvalidatedOnDeleteThenMissRecomputes) {
+    auto config = default_config();
+    SearchLayer layer(config);
+
+    layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
+
+    auto r1 = layer.search_text("hello", 10);
+    ASSERT_TRUE(r1.has_value());
+    ASSERT_EQ(r1->size(), 1u);
+    EXPECT_EQ(r1->at(0).key, "doc1");
+
+    auto r2 = layer.search_text("hello", 10);
+    ASSERT_TRUE(r2.has_value());
+    ASSERT_EQ(r2->size(), 1u);
+    EXPECT_EQ(r2->at(0).key, "doc1");
+
+    auto tomb_ord = layer.on_delete("doc1", 1);
+    ASSERT_TRUE(tomb_ord.has_value());
+
+    auto r3 = layer.search_text("hello", 10);
+    ASSERT_TRUE(r3.has_value());
+    EXPECT_TRUE(r3->empty())
+        << "on_delete 失效缓存后，下次查询应 miss 重算，不返回已删文档";
 }
