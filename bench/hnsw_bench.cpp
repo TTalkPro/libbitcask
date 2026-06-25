@@ -104,4 +104,5 @@ BENCHMARK(BM_Hnsw_Search)
     ->Args({10000, 256})
     ->Args({100000, 64})
     ->Args({100000, 256})
+    ->Args({100000, 1024})  // S7-6：ef≥512 → int8 f32 精排批算走并行
     ->Unit(benchmark::kMicrosecond);

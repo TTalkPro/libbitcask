@@ -141,6 +141,54 @@ TEST(InvertedIndex, PhraseSearchLatin) {
     EXPECT_EQ(results[0].ord, 0u);
 }
 
+// S7-5：短语候选评分并行路径（候选数 ≥ kPhraseParallelThreshold=2048 触发
+// tbb::parallel_for）的正确性 + 确定性护栏。
+// 构造：3000 doc 全含首词 "alpha"（候选数 3000 > 2048 → 走并行）。偶数 doc 把
+// "alpha"/"beta" 交错排（alpha@0,2,..  beta@1,3,..）→ 形成 reps=(ord%5)+1 次
+// 紧邻短语；奇数 doc 把 beta 排到远处（beta@5）→ slop=0 不成短语。
+// 断言：① 仅偶数 ord 入选（奇数 phrase_tf=0）② 得分随 reps 单调（ranking 正确）
+// ③ 连跑两次 (ord,score) 序列逐字节一致（并行不破坏确定性）。
+TEST(InvertedIndex, PhraseSearchParallelPathDeterministic) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    constexpr std::uint64_t kDocs = 3000;  // > kPhraseParallelThreshold(2048)
+    for (std::uint64_t ord = 0; ord < kDocs; ++ord) {
+        if (ord % 2 == 0) {
+            const std::uint32_t reps = static_cast<std::uint32_t>(ord % 5) + 1;
+            std::vector<std::uint32_t> apos, bpos;
+            for (std::uint32_t r = 0; r < reps; ++r) {
+                apos.push_back(2 * r);
+                bpos.push_back(2 * r + 1);
+            }
+            idx.add_doc(ord, {{"alpha", tp(reps, apos)}, {"beta", tp(reps, bpos)}});
+            checker.doc_lens[ord] = 2 * reps;
+        } else {
+            // alpha@0, beta@5 —— 间隔过大，slop=0 不成短语，但 alpha 仍是候选。
+            idx.add_doc(ord, {{"alpha", tp(1, {0})}, {"beta", tp(1, {5})}});
+            checker.doc_lens[ord] = 6;
+        }
+    }
+
+    const std::size_t k = 50;
+    auto r1 = idx.search_phrase({"alpha", "beta"}, k, checker);
+    ASSERT_EQ(r1.size(), k);
+    for (const auto& hit : r1) {
+        EXPECT_EQ(hit.ord % 2, 0u) << "奇数 doc 不应成短语: ord=" << hit.ord;
+        EXPECT_GT(hit.score, 0.0f);
+    }
+    // 得分按 reps 桶降序（reps=5 的 doc 必排在 reps=1 之前）。
+    for (std::size_t i = 1; i < r1.size(); ++i) {
+        EXPECT_GE(r1[i - 1].score, r1[i].score) << "结果未按分数降序";
+    }
+    // 确定性：再跑一次，(ord, score) 逐项一致。
+    auto r2 = idx.search_phrase({"alpha", "beta"}, k, checker);
+    ASSERT_EQ(r2.size(), r1.size());
+    for (std::size_t i = 0; i < r1.size(); ++i) {
+        EXPECT_EQ(r1[i].ord, r2[i].ord);
+        EXPECT_FLOAT_EQ(r1[i].score, r2[i].score);
+    }
+}
+
 // S8.7：近邻搜索。doc "quick brown fox"，quick@0 fox@2（间隔 brown）。
 TEST(InvertedIndex, NearSearchSlop) {
     InvertedIndex idx;

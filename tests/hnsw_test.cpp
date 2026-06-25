@@ -511,3 +511,39 @@ TEST(Hnsw, L2MetricBasic) {
     EXPECT_EQ(got[0].ord, 1u);  // 最近 (1,0)
     EXPECT_EQ(got[2].ord, 2u);  // 最远 (5,5)
 }
+
+// S7-6：int8 路径 f32 精排距离批算的并行护栏（found.size() ≥
+// kRerankParallelThreshold=512 触发 tbb::parallel_for）。
+// 触发条件：kDot + dim≥64 + 有 VNNI（int8_dot_ 非空）+ ef≥512。无 VNNI 的机器
+// 走纯 f32 路径（不触发并行），本测试仍作为正确性护栏通过。
+// 断言：① 自匹配向量（query=base[42]，f32 内积=1.0 为最大）稳居 top-1
+// ② 分数严格降序 ③ 连跑两次 (ord,score) 序列逐字节一致——并行批算不破坏
+// 确定性（各 task 写互异 found[i].first，partial_sort 仍串行 → 与串行同果）。
+TEST(Hnsw, Int8RerankParallelPathDeterministic) {
+    const std::size_t n = 2000, dim = 128, k = 10, ef = 600;  // ef>512 → 并行精排
+    auto base = make_vectors(n, dim, 0xBA5E);
+
+    HnswConfig cfg;
+    cfg.dim = static_cast<std::uint16_t>(dim);
+    cfg.metric = HnswMetric::kDot;  // 默认 f32+int8（非 inmem_int8 → 走 f32 精排）
+    HnswIndex idx(cfg);
+    for (std::size_t i = 0; i < n; ++i) {
+        idx.insert(i, std::span<const float>(base.data() + i * dim, dim));
+    }
+
+    const float* q = base.data() + 42 * dim;  // 自匹配：ord 42 内积=1.0
+    auto r1 = idx.search(std::span<const float>(q, dim), k, ef);
+    ASSERT_EQ(r1.size(), k);
+    EXPECT_EQ(r1[0].ord, 42u) << "自匹配向量应为 top-1";
+    for (std::size_t i = 1; i < r1.size(); ++i) {
+        EXPECT_GE(r1[i - 1].score, r1[i].score) << "结果未按分数降序";
+    }
+
+    // 确定性：再跑一次，(ord, score) 逐项一致。
+    auto r2 = idx.search(std::span<const float>(q, dim), k, ef);
+    ASSERT_EQ(r2.size(), r1.size());
+    for (std::size_t i = 0; i < r1.size(); ++i) {
+        EXPECT_EQ(r1[i].ord, r2[i].ord);
+        EXPECT_FLOAT_EQ(r1[i].score, r2[i].score);
+    }
+}

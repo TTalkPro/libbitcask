@@ -6,6 +6,7 @@
 #include "bitcask/bm25_kernels.hpp"
 
 #include <oneapi/tbb/blocked_range.h>
+#include <oneapi/tbb/parallel_for.h>       // S7-5：短语候选评分并行
 #include <oneapi/tbb/parallel_reduce.h>
 
 #include <algorithm>
@@ -741,42 +742,47 @@ auto InvertedIndex::search_phrase_impl(
     auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
-    std::unordered_map<std::uint64_t, float> scores;
-
     auto& first_pl = *tps[0].pl;
+    const std::size_t n_cand = first_pl.items.size();
 
     // live_df 只依赖 first term 的 posting list（与具体候选 doc 无关），
     // 提到循环外算一次，避免每个匹配 doc 重算 O(D)（S9.7）。
     // P2.1：first term 的 live 批量取一次（Index 侧一次锁），主循环复用。
-    std::vector<std::uint64_t> first_ords(first_pl.items.size());
-    for (std::size_t j = 0; j < first_pl.items.size(); ++j) {
+    std::vector<std::uint64_t> first_ords(n_cand);
+    for (std::size_t j = 0; j < n_cand; ++j) {
         first_ords[j] = first_pl.items[j].ord;
     }
-    std::vector<char> first_live(first_ords.size());
+    std::vector<char> first_live(n_cand);
     live_checker.fill_is_live(first_ords, first_live);
+    // S7-5：doc_len 也批量取一次（Index 侧一次 shared_lock）。原先在评分点逐个
+    // 调 live_checker.doc_len() 各抢一次锁——并行候选循环里会变成锁争用热点。
+    std::vector<std::uint32_t> first_dls(n_cand);
+    live_checker.fill_doc_lens(first_ords, first_dls);
     std::size_t live_df = 0;
     for (std::size_t j = 0; j < first_live.size(); ++j) {
         live_df += static_cast<std::size_t>(first_live[j]);
     }
     auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
-    for (std::size_t i = 0; i < first_pl.items.size(); ++i) {
+    // S7-5：单候选评分——纯函数，仅读 tps/first_*/params（const）并写自己的返回值，
+    // 无共享可变态 → 串行与并行两路共用。返回 0 表示「该 doc 不构成短语」
+    // （phrase_tf==0 / 已删 / 缺词）；idf>0 ∧ tf_norm>0 ∧ delta≥0 ⇒ 真匹配分恒 >0，
+    // 故 0 可作哨兵无歧义。
+    auto score_one = [&](std::size_t i) -> float {
+        if (!first_live[i]) return 0.0F;
         auto& posting = first_pl.items[i];
         auto posting_ord = posting.ord;
-        if (!first_live[i]) continue;
 
         // 把「在其余 term 的 posting list 里定位本 doc」提到 start_pos 循环外：
         // idx 对固定 (doc, term) 不变，原先每个 start_pos 都重查一次 O(log D)（S9.7）。
-        // 任一 other term 在本 doc 不存在 → 整 doc 不可能成短语，直接跳过。
-        bool doc_has_all_terms = true;
+        // 任一 other term 在本 doc 不存在 → 整 doc 不可能成短语，直接返回 0。
         std::vector<const std::vector<std::uint32_t>*> other_pos(tps.size(), nullptr);
         for (std::size_t t = 1; t < tps.size(); ++t) {
             auto& other_pl = *tps[t].pl;
             auto idx = other_pl.find(posting_ord);
-            if (idx >= other_pl.items.size()) { doc_has_all_terms = false; break; }
+            if (idx >= other_pl.items.size()) return 0.0F;
             other_pos[t] = &other_pl.items[idx].positions;
         }
-        if (!doc_has_all_terms) continue;
 
         std::uint32_t phrase_tf = 0;
         for (auto start_pos : posting.positions) {
@@ -795,20 +801,34 @@ auto InvertedIndex::search_phrase_impl(
             if (match) ++phrase_tf;
         }
 
-        if (phrase_tf > 0) {
-            auto dl = live_checker.doc_len(posting_ord);
-            auto tf_norm = static_cast<float>(phrase_tf) *
-                           (params.k1 + 1.0F) /
-                           (static_cast<float>(phrase_tf) + params.k1 *
-                            (1.0F - params.b + params.b *
-                             static_cast<float>(dl) / static_cast<float>(avgdl)));
-            scores[posting_ord] += static_cast<float>(idf) * (tf_norm + params.delta);
-        }
+        if (phrase_tf == 0) return 0.0F;
+        auto dl = first_dls[i];
+        auto tf_norm = static_cast<float>(phrase_tf) *
+                       (params.k1 + 1.0F) /
+                       (static_cast<float>(phrase_tf) + params.k1 *
+                        (1.0F - params.b + params.b *
+                         static_cast<float>(dl) / static_cast<float>(avgdl)));
+        return static_cast<float>(idf) * (tf_norm + params.delta);
+    };
+
+    // S7-5：候选数过阈才并行（甜区：大候选集短语，~8.7ms）。各候选写自己的
+    // cand_scores[i]（不同下标、互不重叠）→ 无锁 data-race-free。候选 ord 互异
+    // （posting 每 doc 一条），故末尾按 (score, ord) 选 top-k 与评分顺序无关，
+    // 并行/串行**逐字节同果**（确定性）。
+    std::vector<float> cand_scores(n_cand);
+    if (n_cand >= kPhraseParallelThreshold) {
+        tbb::parallel_for(std::size_t{0}, n_cand,
+                          [&](std::size_t i) { cand_scores[i] = score_one(i); });
+    } else {
+        for (std::size_t i = 0; i < n_cand; ++i) cand_scores[i] = score_one(i);
     }
 
     using Entry = std::pair<float, std::uint64_t>;
     std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
-    for (auto& [ord, score] : scores) {
+    for (std::size_t i = 0; i < n_cand; ++i) {
+        float score = cand_scores[i];
+        if (score <= 0.0F) continue;  // 0 = 非短语（见 score_one 哨兵契约）
+        std::uint64_t ord = first_pl.items[i].ord;
         if (heap.size() < k) {
             heap.push({score, ord});
         } else if (score > heap.top().first) {

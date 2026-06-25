@@ -149,11 +149,9 @@
     MidPut/TornWrite/MultiFileParallelFold 写读快照 + CheckpointRecovery 全 4 例）。
   - 风险：低（纯容量预留，行为不变）。
 
-- [ ] **S5 Checkpoint 可选 zstd 压缩** — `src/search/search_layer.cpp:998-1109`
-  - 现状：docmap/bm25/hnsw payload 全部原始序列化，大库可达 GB 级。
-  - 改法：section header 加 `compression` 标志（0=raw, 1=zstd）；zstd level 1（2-4× 压缩比，~1GB/s）。
-  - 收益：checkpoint 文件体积 **−50~70%**；冷启动 I/O 减少。
-  - 风险：低（向后兼容：旧文件 compression=0）。
+- [⛔] **S5 Checkpoint 可选 zstd 压缩** — **否决（用户决定，2026-06-25：不做）**
+  - 原计划：section header 加 `compression` 标志（0=raw, 1=zstd），zstd level 1（2-4× 压缩比）。
+  - **否决理由**：需引入 zstd 第三方依赖；用户拍板不接受新依赖换 checkpoint 体积收益，保留现状原始序列化。
 
 - [x] **S6 异步索引 MapReduce 流水线（全局双池）** ✅ Phase 0-4 全部完成（2026-06-24，G1+G2 达成）— 设计稿 `docs/design/async-index-pipeline.md`
   - **背景**：当前每库一个 `IndexPool` 单 worker，把 analyze（CPU 重，纯函数）与
@@ -352,7 +350,7 @@
   - **风险**：中（改索引消费核心 + 并发）。缓释：Phase 0/1 行为等价于现状可安全停步；
     每 Phase 独立 TSan + 字节等价对拍；策略 A 不动 index 核心语义。
 
-- [ ] **S7 查询内并行（Search Pool）** — `src/bm25/inverted.cpp`、`src/vector/hnsw.cpp`、`bench/inverted_bench.cpp`
+- [x] **S7 查询内并行（Search Pool）** ✅ S7-1~S7-6 全部完成（2026-06-25）— `src/bm25/inverted.cpp`、`src/vector/hnsw.cpp`、`bench/inverted_bench.cpp`
   - 即 `thread_pool.hpp:14` 注释的「Search Pool（T6 阶段）」/ 设计稿待启用项。**注意**：与
     第八梯队的测试任务「T6 thread_local encoded 并发测试」（line 417，已完成，无关）**不是同一个
     T6**——本条是查询侧并行。
@@ -412,13 +410,59 @@
       并发 `cache_.put` 同键）。
     - 验证：**469/469 ctest**（465 + 4）+ TSan 零 race + 新增代码零告警。
     - 后续可选：跨 Cask 并发入口（`parallel_for_queries` 的 `fn` 闭包已支持多库——caller 直接用）。
-  - [ ] **S7-5（甜区 intra-query，后置）并行化短语** — `search_phrase_impl` 候选文档循环（嵌
-    `search_arena()`），候选数过阈才并行；末尾按 ord 稳定排序保确定性。预期砍 8.7ms。仅甜区做。
-  - [ ] **S7-6（后置）HNSW 单查询并行** — 并行距离批算 / 多起点 ef-search。ROI 低 + 确定性/召回
-    风险；先靠 inter-query（S7-4）吃满核。WAND 不碰（顺序依赖 + 已剪枝）。
+  - [x] **S7-5（甜区 intra-query）并行化短语** — `src/bm25/inverted.cpp`（`search_phrase_impl`）、
+    `include/bitcask/inverted.hpp`、`tests/inverted_test.cpp`、`bench/inverted_bench.cpp`
+    - **已完成（2026-06-25）**：`search_phrase_impl` 候选文档循环（遍历 first term 的 posting
+      list）抽成纯函数 `score_one(i)`（仅读 tps/first_*/params，写自己返回值，无共享可变态），
+      候选数 `first_pl.items.size() ≥ kPhraseParallelThreshold(2048)` 才 `tbb::parallel_for`
+      并行评分写 `cand_scores[i]`（互异下标 → 无锁 data-race-free），否则串行。末尾按
+      `(score, ord)` 串行选 top-k。
+    - **确定性**：候选 ord 互异（posting 每 doc 一条）→ top-k 选择与评分顺序无关，并行/串行
+      **逐字节同果**。附带把 `doc_len` 批量取一次（`fill_doc_lens`，原在评分点逐个抢 shared_lock
+      → 并行下会成锁争用热点）。哨兵约定：`score_one` 返回 0 = 非短语（idf>0∧tf_norm>0∧δ≥0 ⇒
+      真匹配恒 >0，0 无歧义）。
+    - **实测（Release+LTO+native，6 核，`BM_Inverted_PhraseHotTerm`，A/B 切阈值）**：
+
+      | 候选数 | 串行 | 并行 | 加速 |
+      |---|---|---|---|
+      | 4096 | 196 µs | 56 µs | **3.5×** |
+      | 100000 | 5986 µs（~6 ms）| 1286 µs（~1.3 ms）| **4.65×** |
+
+      正是任务预估的「砍 8.7ms 热词短语」。
+    - **测试**：`PhraseSearchParallelPathDeterministic`（3000 doc 跨 2048 阈值 → 仅偶数 doc 成短语 +
+      得分随 reps 降序 + 连跑两次 (ord,score) 逐字节一致）。
+    - **架构说明**：未嵌 `search_arena()`（那在 search 层，bm25 在其下游，依赖倒置）；直接用
+      `tbb::parallel_for`（bm25 本就依赖 TBB），并发上限由 TBB market 封顶（与 search_arena 同效），
+      嵌在 search_arena.execute 内（batch 查询）时 TBB 可组合嵌套。
+    - 验证：Release/Debug **474/474 ctest**（472 + 2 新）；**TSan 零 race**（inverted + hnsw 88 例）。
+    - 风险：低（纯函数 + 互异下标写 + 末尾串行选 top-k；确定性测试 + TSan 双护栏）。
+  - [x] **S7-6（甜区 intra-query）HNSW int8 精排距离批算并行** — `src/vector/hnsw.cpp`、
+    `CMakeLists.txt`、`tests/hnsw_test.cpp`、`bench/hnsw_bench.cpp`
+    - **已完成（2026-06-25）**。**先评估两条候选路再定甜区**：
+      - **① 图遍历距离批算（per-step M≈16-32 邻居）**：太细粒度 → task spawn 开销 >> 16-32 次
+        SIMD 距离，**保证净亏**（同 S7-1 BOW / A2 / A3 教训）。**否决**。
+      - **② 多起点 ef-search**：改召回 + 确定性，且 R× 全量功换边际召回，**对吞吐严格劣于
+        inter-query（S7-4）**。**否决**。
+      - **③ int8 路径 f32 精排距离批算**（line 932 `for found: d = dist_id(q,id)`）：**唯一安全
+        甜区**——嵌入式并行（各写互异 `found[i].first`），**确定性**（随后 partial_sort 仍串行
+        → 与串行同果，不改召回/排序），读 mmap 只读。**采纳**。
+    - **落地**：`found.size() ≥ kRerankParallelThreshold(512)` 才 `tbb::parallel_for` 批算 f32
+      距离，否则串行。触发条件：kDot + dim≥64 + 有 VNNI（`int8_dot_` 非空）+ ef≥512。f32-only 路径
+      （无 rerank 批，距离在串行遍历中算）+ inmem_int8（跳过 f32 精排）+ 无 VNNI 机器均不触发，
+      走原串行——纯增量、无行为变更。`bitcask_vector` CMake 加 `TBB::tbb` 链接。
+    - **实测（Release+native，6 核，`BM_Hnsw_Search/100000/1024`，dim=384）**：串行 1887 µs →
+      并行 1689 µs ≈ **1.12×（省 ~198µs）**。**ROI 低，符合任务预判**——rerank 批仅占 HNSW 查询
+      少数，图遍历（串行、不可并行）才是大头。**保留**因：确定性 + 安全 + 窄门控（仅大 ef int8
+      查询付出，小 ef/无 VNNI 零成本），且 HNSW 并发主力仍是 inter-query（S7-4）。
+    - **测试**：`Int8RerankParallelPathDeterministic`（2000 vec × dim128 × ef600 → 自匹配 top-1 +
+      分数降序 + 连跑两次逐字节一致）；本机有 `avx_vnni` → 实测走并行精排路径，TSan 验证。
+    - **WAND 不碰**（顺序依赖 + 已 Block-Max 剪枝）。
+    - 验证：Release/Debug **474/474 ctest**；**TSan 零 race**（hnsw 含本测试 + inverted 88 例）。
+    - 风险：低（确定性批算 + 互异下标 + 窄门控；确定性测试 + TSan）。
   - **决策**：S7-1（BOW 串行）+ S7-2（共享池）+ S7-3（hybrid 串行）+ S7-4（inter-query 并发
-    入口 + Cask 批量查询）**已落地**。单查询 intra-query 并行（S7-5/6）只对甜区做，且必经
-    `search_arena()` + 自适应门控，绝不重蹈 grainsize=1 无脑拆分。
+    入口 + Cask 批量查询）+ **S7-5（短语并行，3.5–4.65×）+ S7-6（HNSW int8 精排并行，1.12×）
+    全部落地**。intra-query 并行严守「候选/规模过阈才并行 + 末尾串行选 top-k 保确定性」，
+    绝不重蹈 grainsize=1 无脑拆分。S7 全部完成。
 
 - [x] **S8 S6/S7 代码重构（质量收尾）** ✅ R1-R5 全完成（2026-06-24）— 6 准则：① C++ 最佳实践
   ② 高内聚低耦合/适当模式/合理继承 ③ 公共函数降冗余 ④ RAII/无泄露 ⑤ 加锁顺序/无死锁 ⑥ 完善中文注释
@@ -713,8 +757,7 @@
 >   - Phase 4（**N 个 std::thread map worker 真数据并行**，实测 5.9× → **G1 真达成**；reorder
 >     背压上限防 OOM；多核加速比 + 多 lib 吞吐 bench）✅
 > - ~~**S1**：已降级~~ → **被 S6 取代否决**。
-> - **S5**（checkpoint zstd）：低风险但需**引入 zstd 第三方依赖**——待用户拍板是否
->   接受新依赖再做。
+> - ~~**S5**（checkpoint zstd）~~：**否决**（2026-06-25 用户决定不引入 zstd 依赖）。
 
 ## 待办：本轮发现（2026-06-23 TSan 跑出）
 

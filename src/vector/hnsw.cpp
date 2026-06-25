@@ -5,6 +5,8 @@
 #include "bitcask/codec.hpp"
 #include "hnsw_kernels.hpp"
 
+#include <oneapi/tbb/parallel_for.h>       // S7-6：int8 路径 f32 精排距离批算并行
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -24,6 +26,15 @@
 #endif
 
 namespace bitcask::vec {
+
+// S7-6：int8 路径精排阶段对 found（≈ef 个候选）逐个算 f32 距离。候选数 ≥ 此
+// 阈值才并行批算（甜区：大 ef / 大 k 的向量查询，如 k=256 → ef≥256，~503µs）。
+// 小 ef 并行 task 唤醒开销 > 收益，走串行（同 S7-1/S7-5 的门控教训）。
+// 并行**确定性**：各 task 只写自己的 found[i].first（互异下标），随后 partial_sort
+// 串行 → 与串行逐字节同果，不改召回/排序。
+namespace {
+constexpr std::size_t kRerankParallelThreshold = 512;
+}  // namespace
 
 // V3.9:距离内核从匿名命名空间外移一份到 bitcask::vec::detail,只给
 // cpp/bench/distance_bench.cpp 等 micro-bench 走 hnsw_kernels.hpp 直接调
@@ -929,7 +940,17 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
             // 器里每次重算 2 次 dist_id、排完再算第 3 次,全维 SIMD 距离被重
             // 复计算 O(N log rerank_n) 次;此处降为每候选恰好 1 次(共 N 次)。
             // 线性遍历顺序与上面的 madvise 预取顺序一致,page-in 延迟仍被藏住。
-            for (auto& [d, id] : found) d = dist_id(q, id);
+            // S7-6：候选数过阈则并行批算 f32 距离（各写自己的 found[i].first，
+            // 无共享可变态 → data-race-free；确定性，见 kRerankParallelThreshold）。
+            if (found.size() >= kRerankParallelThreshold) {
+                auto* fp = found.data();
+                tbb::parallel_for(std::size_t{0}, found.size(),
+                                  [&, fp](std::size_t i) {
+                                      fp[i].first = dist_id(q, fp[i].second);
+                                  });
+            } else {
+                for (auto& [d, id] : found) d = dist_id(q, id);
+            }
             std::partial_sort(found.begin(), found.begin() + rerank_n,
                               found.end(),
                               [](const auto& a, const auto& b) {

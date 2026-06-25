@@ -401,6 +401,10 @@ public:
 private:
     static constexpr std::size_t kShardCount = 64;
     static constexpr std::size_t kWandThreshold = 1024;
+    // S7-5：短语/近邻查询候选数（first term posting 数）≥ 此阈值才并行评分。
+    // 甜区是大候选集（热词短语，~8.7ms）；小候选集并行 task spawn 开销 > 收益，
+    // 走串行（同 S7-1 BOW 串行化的教训）。
+    static constexpr std::size_t kPhraseParallelThreshold = 2048;
 
     std::array<Shard, kShardCount> shards_;
     Bm25Params params_;

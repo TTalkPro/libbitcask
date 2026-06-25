@@ -212,7 +212,7 @@ target_include_directories(bitcask_vector
 )
 target_link_libraries(bitcask_vector
     PUBLIC  bitcask_format
-    PRIVATE bitcask_warnings bitcask_sanitizers
+    PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb
 )
 
 # ---------------------------------------------------------------------------
