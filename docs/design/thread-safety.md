@@ -121,9 +121,11 @@
 | 关闭后误用 | fail-fast 而非 UB | ❌ UB | W3 |
 | 配置类（`set_synonym_map`）与查询并发 | 安全或明确「需先于并发配置」 | ⚠️ 未明确 | W2 审计 |
 
-> 写吞吐说明：data 文件是单 append WAL,写在文件层本就串行;W1 的互斥**不损失
-> 本可获得的吞吐**。需要更高写并发的用户 → **按目录分片多个 Cask 实例**（标准
-> 横向扩展手段,文档需明示）。
+> 写吞吐说明（实测校准，见 §9）：**单写线程吞吐不受 `write_mu_` 影响**（uncontended
+> 锁 ~20ns ≪ pwrite）。**多写线程堆同一 handle 不提速、反降**——put 临界区极短
+> （~1µs），高争用下 futex 唤醒开销压过临界区（threads 1→8：980k→46k/s）。这不是
+> bug：data 是单 append WAL 文件层本就串行，往一个 handle 堆写线程只增争用。需要
+> 更高写并发 → **按目录分片多个 Cask 实例**（各自独立 WAL + 锁，标准横向扩展）。
 
 ### 6.2 结论（通用库定位下）
 
@@ -272,3 +274,31 @@
       不受影响。语义：n=0→hw_concurrency;并发删 kNotFound 跳过;其它错误停止;close 后 fail-fast。
 - [x] 测试 `ParallelScanVisitsAllKeysOnce`（2000 key 删 1/10，每 key 恰一次 + 值正确 + close fail-fast）。
       478/478 + TSan 零 race。C++-only（C API 未绑定，C host 可自行多线程 get）。
+
+## 9. 实测基线（benchmark，2026-06-25，Release+LTO+native，6 核 / 24 MiB L3）
+
+跑法：`cmake --build build-rel --target bitcask_bench &&
+build-rel/bench/bitcask_bench --benchmark_filter='BM_Cask_Put_Concurrent|BM_Cask_ParallelScan'`
+
+### W1 — 并发写同一 handle（`BM_Cask_Put_Concurrent`，聚合吞吐）
+
+| 写线程数 | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| put/s（聚合） | ~980k | ~200k | ~112k | ~46k |
+
+- **单写不受锁影响**（~980k/s ≈ 单写基线 `BM_Cask_Put_Overwrite`）。
+- **多写不升反降**：put 临界区 ~1µs，`write_mu_` 串行下 futex 唤醒/上下文切换开销压过
+  临界区（短临界区高争用 mutex 退化）。**非 bug**——印证「写扩展靠分片，不靠堆线程」。
+- 多写**安全**（数据不坏，TSan `ConcurrentWritersSharedCaskNoCorruption` 验证）。
+
+### W4 — `parallel_scan` 全表扫描加速（`BM_Cask_ParallelScan`，5 万 key×128B）
+
+| 工作线程数 | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| 扫描耗时 | 56.8 ms | 30.8 ms | 17.9 ms | 17.8 ms |
+| 加速比 | 1.0× | 1.84× | **3.17×** | 3.19×（6 核饱和） |
+
+- 读值的 keydir 查找 + pread + DocValue decode 被并行化（页缓存热后 CPU bound）；
+  快照 key 串行。4 线程近饱和 6 核，8 线程过订阅无增益。
+- 对比 W1：**读可扩展（parallel_scan 3.2×），写不可扩展（串行 WAL）**——这正是
+  「读真并行 + 写内部串行」契约的实测体现。

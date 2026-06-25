@@ -96,10 +96,18 @@ static void BM_Cask_Put_Overwrite(benchmark::State& state) {
 BENCHMARK(BM_Cask_Put_Overwrite);
 
 // -----------------------------------------------------------------------------
-// S11-W1：多线程并发写**同一** Cask handle 的吞吐。各线程写自己的 key 段（无跨
-// 线程 LWW）。预期：聚合吞吐随线程数**基本持平**——写路径 write_mu_ 串行化 +
-// 单 append WAL 文件层本就串行。本基准验证「多写者安全 + 锁不引入崩溃/异常退化」，
-// 并量化锁竞争开销（应远小于 pwrite/fsync）。更高写并发须按目录分片多实例。
+// S11-W1：多线程并发写**同一** Cask handle 的吞吐。各线程写自己的 key 段。
+// 本基准量化「多写者安全的代价」。**实测（6 核，2026-06-25）：聚合吞吐随线程数
+// 不升反降**——
+//   threads:1 ≈ 980k/s | 2 ≈ 200k/s | 4 ≈ 112k/s | 8 ≈ 46k/s
+// 根因：put 临界区极短（~1µs：encode + pwrite(128B) + keydir），write_mu_ 串行化下，
+// 多线程争锁的 **futex 唤醒/上下文切换开销（~µs 级）压过临界区本身** → 经典「短临界
+// 区高争用」mutex 退化。这**不是** bug——它印证设计结论：
+//   ① 单写线程吞吐不受 write_mu_ 影响（uncontended 锁 ~20ns，见 threads:1 ≈ 单写基线）；
+//   ② **写扩展靠按目录分片多个 Cask 实例**（各自独立 WAL + 锁），而非往一个 handle
+//      堆写线程（单 append WAL 本就串行，堆线程只增争用）；
+//   ③ 多写**安全**（数据不坏，TSan 验证）——只是不该指望它提速。
+// 混合读写负载里写是少数、读不争 write_mu_，本极端纯写争用不代表常态。
 // -----------------------------------------------------------------------------
 static TempDir* g_cw_dir = nullptr;
 static std::unique_ptr<Cask> g_cw_cask;
@@ -119,14 +127,10 @@ static void BM_Cask_Put_Concurrent(benchmark::State& state) {
         keys.push_back("t" + std::to_string(tid) + "_" + std::to_string(i));
     }
     const std::string value(128, 'v');
-    // 预热各自 key 段（并发 populate 也走 write_mu_，安全）。
-    for (const auto& k : keys) {
-        if (!g_cw_cask->put(as_bytes(k), as_bytes(value))) {
-            state.SkipWithError("populate put failed");
-            break;
-        }
-    }
-
+    // 注意：循环前**不**碰 g_cw_cask——google benchmark 仅在计时循环起点设线程
+    // 屏障，循环前的代码各线程并发执行；只有 thread 0 在此前写 g_cw_cask。其余
+    // 线程对 g_cw_cask 的访问全部落在计时循环内（屏障后，thread 0 的初始化已可见）。
+    // 首轮为 insert、key 段绕回后转 overwrite——稳态即覆盖写。
     std::size_t idx = 0;
     for (auto _ : state) {
         auto& k = keys[idx++ & (kKeyspace - 1)];

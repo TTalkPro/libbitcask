@@ -1186,3 +1186,18 @@
 > **结论**：通用库定位下 **W1+W2+W3 为必做组**，共同建立「多读 + 多写（内部串行）
 > + 读写并发 + fail-fast 生命周期」的常规契约（对标 RocksDB/LMDB）。合计约一天多，
 > 全部低风险。建议顺序 W1 → W2 → W3，W4 按需。
+
+**S11 — W1–W4 全部完成（2026-06-25）**：W1 ✅（write_mu_ 写路径串行化）/ W2 ✅（读写并发
+确认 + 全文档注释订正 + set_synonym_map 契约）/ W3 ✅（closed_ fail-fast + 幂等）/
+W4 ✅（parallel_scan 并行全表扫描）。
+- **单元测试**（4 例，全 Debug 478/478 + TSan 零 race）：ConcurrentWritersSharedCaskNoCorruption /
+  W2ConcurrentSearchAndWriteNoRace / OperationsAfterCloseReturnErrorNotUb / ParallelScanVisitsAllKeysOnce。
+- **性能测试**（`bench/cask_bench.cpp` 新增 2 个）：
+  - `BM_Cask_Put_Concurrent`（多写争用）：单写 ~980k/s 不受锁影响；多写**不升反降**
+    （1→8 线程 980k→46k/s）——短临界区高争用 mutex 退化，**印证「写扩展靠分片不靠堆线程」**
+    （LMDB-like 写串行；非 bug，数据安全 TSan 验证）。
+  - `BM_Cask_ParallelScan`（读扩展）：5 万 key 全表扫描 1→4 线程 **3.17× 加速**（6 核饱和）。
+  - 实测体现契约本质：**读真并行（scan 3.2×）+ 写内部串行（堆线程不提速）**。详见
+    `docs/design/thread-safety.md` §9。
+- **全套文档同步**：README / api-cpp §5+§9 / api-c §14 / cpp-arch / concurrency-zh /
+  async-index-pipeline / design/thread-safety（§7 各接口实现机制 + §9 实测基线）+ 头注释。
