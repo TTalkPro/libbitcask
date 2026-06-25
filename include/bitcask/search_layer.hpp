@@ -433,6 +433,20 @@ private:
     // S10-A4：把字段名 intern 进 field_names_intern_，返回稳定 string_view（node 不失效）。
     std::string_view intern_field_name(std::string_view name);
 
+    // D2：抽出 5+ 处 search_* 共有的「bm25 结果集物化为 SearchHit」骨架：
+    // 逐条 ord→ext 翻译（翻译失败跳过）+ 可选 MetaFilter 后过滤（空 meta 不通过）
+    // + 可选截断到 k（k==0 不截断，bm25 内核已 top-k 的路径用之）。
+    [[nodiscard]] std::vector<SearchHit> materialize_hits(
+        const std::vector<bm25::SearchResult>& results,
+        const meta::MetaFilter* filter = nullptr,
+        std::size_t k = 0) const;
+
+    // D2：抽出 search_phrase/search_near 共有的「按 position 还原 query 词序」：
+    // analyze_with_positions → 展开 (position, term) → 按位置排序 → terms 向量
+    // （phrase/near 依赖词序，analyze() 的 map 无序不可直接用）。空查询 → 空向量。
+    [[nodiscard]] std::vector<std::string> ordered_query_terms(
+        std::string_view query) const;
+
     SearchLayerConfig  config_;
     index::Index      index_;
     // S8.6：每字段一个 InvertedIndex（字段间 avgdl/idf 隔离）。

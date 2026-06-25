@@ -1046,9 +1046,18 @@
 
 - [x] **D1 HNSW `search_layer` 顶层 `out.resize` 跨层 churn** — `src/vector/hnsw.cpp`
   - **已完成（2026-06-24）**：函数入口 `out.reserve(ef)`，保证后续 `clear+resize` 不 realloc。f32 + int8 两路。
-- [ ] **D2 `search_phrase`/`near`/`bool`/`fuzzy` 的内层重复模式抽 helper** — 多处
-  - "ordered terms 构建" + "results → hits materialize" 5+ 处重复。S8-R3 只动了外层。
-    纯代码质量，后续按需。
+- [x] **D2 `search_phrase`/`near`/`bool`/`fuzzy` 的内层重复模式抽 helper** — `include/bitcask/search_layer.hpp`、`src/search/search_layer.cpp`
+  - **已完成（2026-06-25）**：抽两个私有 helper（S8-R3 只动外层骨架，本条收内层）：
+    - `materialize_hits(results, filter=null, k=0)`——「bm25 结果集 → SearchHit」物化（ord→ext 翻译跳过
+      失败 + 可选 MetaFilter 后过滤 + 可选截断 k）。**6 处调用**：search_text（filter+k 截断）/ phrase /
+      near / fuzzy / bool / wildcard，各从 ~10 行循环降为 1 行。
+    - `ordered_query_terms(query)`——phrase/near 共用的「analyze_with_positions 按 position 还原词序」，
+      **2 处**各从 ~9 行降为 1 行。
+  - **保留不动**（元素类型/逻辑确不同，强抽反增耦合）：search_vector（迭代 HNSW `Hit`、score float→double）/
+    search_hybrid（RRF 融合 + 稳定平局排序）/ search_fields（`pair<ord,score>` 累加器、已 partial_sort 截断）。
+  - 验证：Release/Debug **474/474 ctest**；TSan 零 race（SearchLayer/DocValue/Highlight 123 例）；
+    修改文件零新增告警（2 处既有告警 `\x01default` hex-escape + search_fields:827 sign-conv 非本条引入）。
+    纯重构、行为零变更（物化语义逐字保持）。
 - [x] **D3 `mmap` 的 read 文件加 `madvise(MADV_RANDOM)`** — `src/fileops/data_file.cpp`
   - **已完成（2026-06-24）**：mmap 成功后加 `madvise(MADV_RANDOM)`。get() 热路径按 offset
     随机读，禁 readahead 避免内核预读浪费。
@@ -1076,7 +1085,7 @@
 
 **按需（C 梯队）**：A2 实测 <1%，C4（Block-Max MaxScore）暂不推荐（A2 同类优化未达预期）。C5/C6 与未来 v4 格式绑定。
 
-**穿插（D 梯队）**：D1/D2/D3 可随手改；D4 单独 PR 配套导出表审计；D5/D6 视 bench 结果。
+**穿插（D 梯队）**：D1 ✅ / D2 ✅（2026-06-25：materialize_hits + ordered_query_terms 两 helper，8 处去重）/ D3 ✅ / D6 ✅；D4 ⏭️ 部分（visibility 已加，-fno-semantic-interposition 暂缓）/ D5 ⏭️ 保留（非热路径）。
 
 > **审计方法（2026-06-24）**：3 个并行 agent（explore × 2 + librarian × 1），覆盖
 > （a）Cask facade / search_layer / codec 热路径分配拷贝；（b）BM25/HNSW 算法与内存

@@ -208,6 +208,42 @@ inline void scale_query(float* dst, const float* src, float inv, std::size_t n) 
 
 }  // namespace
 
+// D2：bm25 结果集 → SearchHit 物化骨架（5+ 处共用）。filter 非空时按 meta_blob
+// 后过滤（空 blob 不通过）；k>0 时截断到 k（text 的 overfetch 路径用之，其余
+// bm25 内核已返回 top-k 的路径传 0 不截断）。
+std::vector<SearchHit> SearchLayer::materialize_hits(
+    const std::vector<bm25::SearchResult>& results,
+    const meta::MetaFilter* filter, std::size_t k) const {
+    std::vector<SearchHit> hits;
+    hits.reserve(results.size());
+    for (auto& r : results) {
+        if (filter) {
+            auto blob = index_.meta_blob(r.ord);
+            if (blob.empty() || !filter->evaluate(blob)) continue;
+        }
+        auto ext_id = index_.ord_to_ext(r.ord);
+        if (!ext_id) continue;
+        hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
+    }
+    if (k > 0 && hits.size() > k) hits.resize(k);
+    return hits;
+}
+
+// D2：phrase/near 共用——analyze_with_positions 还原 query 词序。
+std::vector<std::string> SearchLayer::ordered_query_terms(
+    std::string_view query) const {
+    auto tpm = analyzer_->analyze_with_positions(query);
+    std::vector<std::pair<std::uint32_t, std::string>> ordered;  // (position, term)
+    for (auto& [term, data] : tpm) {
+        for (auto pos : data.second) ordered.push_back({pos, term});
+    }
+    std::sort(ordered.begin(), ordered.end());
+    std::vector<std::string> terms;
+    terms.reserve(ordered.size());
+    for (auto& [_, term] : ordered) terms.push_back(std::move(term));
+    return terms;
+}
+
 std::expected<std::vector<SearchHit>, SearchError>
 SearchLayer::search_vector(std::span<const float> query, std::size_t k,
                            std::size_t ef,
@@ -617,21 +653,8 @@ SearchLayer::search_text(std::string_view query, std::size_t k,
         if (!params_override) cache_.put(cache_key, results, terms);
     }
 
-    std::vector<SearchHit> hits;
-    hits.reserve(results.size());
-    for (auto& r : results) {
-        // V5:filter 后过滤——空 meta 一律不通过(无 meta → 不在 filter 集合)。
-        if (filter) {
-            auto blob = index_.meta_blob(r.ord);
-            if (blob.empty() || !filter->evaluate(blob)) continue;
-        }
-        auto ext_id = index_.ord_to_ext(r.ord);
-        if (!ext_id) continue;
-        hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
-    }
-    // overfetch 后截断到调用方请求的 k(filter 通过率高时也仅给 k 条)。
-    if (hits.size() > k) hits.resize(k);
-    return hits;
+    // D2：filter 后过滤（空 meta 不通过）+ overfetch 后截断到 k。
+    return materialize_hits(results, filter, k);
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
@@ -649,64 +672,30 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k,
     if (cached) {
         results = std::move(*cached);
     } else {
-        // S9.28：短语匹配依赖查询词序。analyze() 返回的 map 无序，不能直接取 terms；
-        // 用 analyze_with_positions 按 position 还原 query 词序（与 search_near 一致）。
-        auto tpm = analyzer_->analyze_with_positions(query);
-        if (tpm.empty()) return std::vector<SearchHit>{};
-
-        std::vector<std::pair<std::uint32_t, std::string>> ordered;  // (position, term)
-        for (auto& [term, data] : tpm) {
-            for (auto pos : data.second) ordered.push_back({pos, term});
-        }
-        std::sort(ordered.begin(), ordered.end());
-        std::vector<std::string> terms;
-        terms.reserve(ordered.size());
-        for (auto& [_, term] : ordered) terms.push_back(term);
+        // S9.28：短语匹配依赖查询词序——用 analyze_with_positions 还原（D2 helper）。
+        auto terms = ordered_query_terms(query);
+        if (terms.empty()) return std::vector<SearchHit>{};
 
         const auto* inv = field_index(kDefaultField);
         if (inv) results = inv->search_phrase(terms, k, index_, params_override);
         if (!params_override) cache_.put(cache_key, results, terms);
     }
 
-    std::vector<SearchHit> hits;
-    hits.reserve(results.size());
-    for (auto& r : results) {
-        auto ext_id = index_.ord_to_ext(r.ord);
-        if (!ext_id) continue;
-        hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
-    }
-    return hits;
+    return materialize_hits(results);
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
 SearchLayer::search_near(std::string_view query, std::uint32_t slop, std::size_t k,
                          const bm25::Bm25Params* params_override) const {
-    // 近邻依赖查询词序：用 analyze_with_positions 取每词 position，按 position 排序，
-    // 还原 query 中的词序（analyze 返回的 map 无序，不能直接用）。
-    auto tpm = analyzer_->analyze_with_positions(query);
-    if (tpm.empty()) return std::vector<SearchHit>{};
-
-    std::vector<std::pair<std::uint32_t, std::string>> ordered;  // (position, term)
-    for (auto& [term, data] : tpm) {
-        for (auto pos : data.second) ordered.push_back({pos, term});
-    }
-    std::sort(ordered.begin(), ordered.end());
-    std::vector<std::string> terms;
-    terms.reserve(ordered.size());
-    for (auto& [_, term] : ordered) terms.push_back(term);
+    // 近邻依赖查询词序——用 analyze_with_positions 还原（D2 helper，同 phrase）。
+    auto terms = ordered_query_terms(query);
+    if (terms.empty()) return std::vector<SearchHit>{};
 
     std::vector<bm25::SearchResult> results;
     const auto* inv = field_index(kDefaultField);
     if (inv) results = inv->search_near(terms, k, slop, index_, params_override);
 
-    std::vector<SearchHit> hits;
-    hits.reserve(results.size());
-    for (auto& r : results) {
-        auto ext_id = index_.ord_to_ext(r.ord);
-        if (!ext_id) continue;
-        hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
-    }
-    return hits;
+    return materialize_hits(results);
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
@@ -725,14 +714,7 @@ SearchLayer::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t m
     const auto* inv = field_index(kDefaultField);
     if (inv) results = inv->search_fuzzy(terms, k, max_edit_distance, index_, params_override);
 
-    std::vector<SearchHit> hits;
-    hits.reserve(results.size());
-    for (auto& r : results) {
-        auto ext_id = index_.ord_to_ext(r.ord);
-        if (!ext_id) continue;
-        hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
-    }
-    return hits;
+    return materialize_hits(results);
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
@@ -768,14 +750,7 @@ SearchLayer::bool_search(std::string_view query, std::size_t k,
         }
     }
 
-    std::vector<SearchHit> hits;
-    hits.reserve(results.size());
-    for (auto& r : results) {
-        auto ext_id = index_.ord_to_ext(r.ord);
-        if (!ext_id) continue;
-        hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
-    }
-    return hits;
+    return materialize_hits(results);
 }
 
 std::optional<bm25::ScoreExplanation>
@@ -801,14 +776,7 @@ SearchLayer::search_wildcard(std::string_view pattern, std::size_t k,
     const auto* inv = field_index(kDefaultField);
     if (inv) results = inv->search_wildcard(std::string(pattern), k, index_, params_override);
 
-    std::vector<SearchHit> hits;
-    hits.reserve(results.size());
-    for (auto& r : results) {
-        auto ext_id = index_.ord_to_ext(r.ord);
-        if (!ext_id) continue;
-        hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
-    }
-    return hits;
+    return materialize_hits(results);
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
