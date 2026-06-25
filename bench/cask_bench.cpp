@@ -7,6 +7,7 @@
 #include <benchmark/benchmark.h>
 
 #include <unistd.h>
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <random>
@@ -93,6 +94,95 @@ static void BM_Cask_Put_Overwrite(benchmark::State& state) {
     state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(value.size()));
 }
 BENCHMARK(BM_Cask_Put_Overwrite);
+
+// -----------------------------------------------------------------------------
+// S11-W1：多线程并发写**同一** Cask handle 的吞吐。各线程写自己的 key 段（无跨
+// 线程 LWW）。预期：聚合吞吐随线程数**基本持平**——写路径 write_mu_ 串行化 +
+// 单 append WAL 文件层本就串行。本基准验证「多写者安全 + 锁不引入崩溃/异常退化」，
+// 并量化锁竞争开销（应远小于 pwrite/fsync）。更高写并发须按目录分片多实例。
+// -----------------------------------------------------------------------------
+static TempDir* g_cw_dir = nullptr;
+static std::unique_ptr<Cask> g_cw_cask;
+
+static void BM_Cask_Put_Concurrent(benchmark::State& state) {
+    if (state.thread_index() == 0) {
+        g_cw_dir = new TempDir();
+        auto c = Cask::open(g_cw_dir->path(), rw_opts(), &test_registry());
+        if (!c) { state.SkipWithError("Cask::open failed"); return; }
+        g_cw_cask = std::move(*c);
+    }
+    const int tid = state.thread_index();
+    constexpr int kKeyspace = 1024;
+    std::vector<std::string> keys;
+    keys.reserve(kKeyspace);
+    for (int i = 0; i < kKeyspace; ++i) {
+        keys.push_back("t" + std::to_string(tid) + "_" + std::to_string(i));
+    }
+    const std::string value(128, 'v');
+    // 预热各自 key 段（并发 populate 也走 write_mu_，安全）。
+    for (const auto& k : keys) {
+        if (!g_cw_cask->put(as_bytes(k), as_bytes(value))) {
+            state.SkipWithError("populate put failed");
+            break;
+        }
+    }
+
+    std::size_t idx = 0;
+    for (auto _ : state) {
+        auto& k = keys[idx++ & (kKeyspace - 1)];
+        auto r = g_cw_cask->put(as_bytes(k), as_bytes(value));
+        benchmark::DoNotOptimize(r);
+    }
+    state.SetItemsProcessed(state.iterations());
+
+    if (state.thread_index() == 0) {
+        g_cw_cask->close();
+        g_cw_cask.reset();
+        delete g_cw_dir;
+        g_cw_dir = nullptr;
+    }
+}
+// 1→8 写线程（6 核机重点看 1/2/4/8）；聚合吞吐 ~持平 = write_mu_ 串行如预期。
+BENCHMARK(BM_Cask_Put_Concurrent)->ThreadRange(1, 8)->UseRealTime();
+
+// -----------------------------------------------------------------------------
+// S11-W4：parallel_scan 全表扫描随线程数的加速比。预填 5 万 key（128B），
+// 计时 parallel_scan(n, fn)。被并行化的是读值的 keydir 查找 + pread + DocValue
+// decode（页缓存热后为 CPU bound）；快照 key 串行。Arg = 工作线程数。
+// -----------------------------------------------------------------------------
+static void BM_Cask_ParallelScan(benchmark::State& state) {
+    const std::size_t nthr = static_cast<std::size_t>(state.range(0));
+    TempDir td;
+    auto c = Cask::open(td.path(), rw_opts(), &test_registry());
+    if (!c) { state.SkipWithError("Cask::open failed"); return; }
+    auto& cask = **c;
+
+    constexpr int kN = 50000;
+    const std::string value(128, 'v');
+    for (int i = 0; i < kN; ++i) {
+        if (!cask.put(as_bytes("k" + std::to_string(i)), as_bytes(value))) {
+            state.SkipWithError("populate put failed");
+            break;
+        }
+    }
+
+    std::atomic<std::uint64_t> sink{0};
+    auto fn = [&sink](std::span<const std::byte>,
+                      const bitcask::GetResultView& v) {
+        sink.fetch_add(v.value.size(), std::memory_order_relaxed);
+    };
+
+    for (auto _ : state) {
+        auto n = cask.parallel_scan(nthr, fn);
+        benchmark::DoNotOptimize(n);
+        if (!n) { state.SkipWithError("parallel_scan failed"); break; }
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(kN));
+    cask.close();
+}
+BENCHMARK(BM_Cask_ParallelScan)
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)
+    ->Unit(benchmark::kMillisecond)->UseRealTime();
 
 // -----------------------------------------------------------------------------
 // Hot get. Pre-populated dir; every get hits the keydir + reads back from
