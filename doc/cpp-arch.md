@@ -287,13 +287,14 @@ KeyDir 全局标量（`epoch_` / `key_count_` / `key_bytes_` / `biggest_file_id_
 | 迭代 | `bitcask_iter_start`, `bitcask_iter_next`, `bitcask_iter_next_batch`, `bitcask_iter_release`, `bitcask_iter_entry_free` |
 | 管理 | `bitcask_status`, `bitcask_needs_merge`, `bitcask_needs_merge_free`, `bitcask_merge`, `bitcask_is_empty`, `bitcask_is_frozen`, `bitcask_flush_index` |
 
-### 线程模型（与 C++ 核心一致）
+### 线程模型（S11：通用 C++ 库，同一 handle 多线程安全）
 
-- **线程安全**：`open` / `close` / `bitcask_get` / `bitcask_search_vector` / `bitcask_search_hybrid` / `bitcask_status` / `bitcask_is_*` / `bitcask_needs_merge` / `bitcask_flush_index`
-- **非线程安全**（caller 串行化）：`bitcask_put` / `bitcask_delete` / `bitcask_sync` / `bitcask_put_doc` / `bitcask_search_text` / `bitcask_search_phrase` / `bitcask_bool_search` / `bitcask_search_fields` / `bitcask_search_near` / `bitcask_search_fuzzy` / `bitcask_search_wildcard` / `bitcask_set_synonym_map` / `bitcask_merge`
-- **iter**：同一 `bitcask_iter_t` 不可并发使用。
+- **线程安全（读）**：`bitcask_get` / `bitcask_search_*`（text/phrase/bool/fields/near/fuzzy/wildcard/vector/hybrid）/ `bitcask_status` / `bitcask_is_*` / `bitcask_needs_merge` / `bitcask_flush_index`
+- **线程安全（写）**：`bitcask_put` / `bitcask_delete` / `bitcask_put_doc` / `bitcask_sync` / `bitcask_close_write_file` / `bitcask_merge`——S11-W1 内部 `write_mu_` 串行化，同一 handle 多线程写安全（写在文件层本就串行 → 锁不损吞吐；更高写并发 → 按目录分片多实例）。读写并发安全（搜索 near-real-time）。
+- **例外**：`bitcask_set_synonym_map`（配置类，须先于并发查询配置）；`bitcask_close`（生命周期，close 即 free 句柄，须无在途调用）；同一 `bitcask_iter_t` 不可并发（每线程一个）。
+- 并行全表扫描：C++ `Cask::parallel_scan`（C-only host 可自行多线程 `bitcask_get`）。
 
-完整原型与字段语义见 [`api-c.md`](api-c.md) 与头文件 `c_api/bitcask_c.h`。
+完整契约见 [`design/thread-safety.md`](design/thread-safety.md)；原型见 [`api-c.md`](api-c.md) 与 `c_api/bitcask_c.h`。
 
 ## 构建入口
 

@@ -629,20 +629,23 @@ it->release();
 > **定位（S11）**：libbitcask 是**通用 C++ 库**——同一 Cask handle 可被多线程安全共享。
 > 详见 [`design/thread-safety.md`](design/thread-safety.md)。
 
-| 操作 | 线程安全 | 说明 |
+图例：✅ = 同一 handle 多线程调用安全；⚠️ = 有条件/不安全（见说明）。
+**实现机制详见 [`design/thread-safety.md`](design/thread-safety.md) §7「各接口线程安全实现机制」。**
+
+| 操作 | 线程安全 | 机制（详见设计稿 §7） |
 |------|---------|------|
-| `open` / `upgrade` | 是（产生独立对象）| registry 并发由其内部锁保证 |
-| `close` | 否（生命周期，幂等）| caller 须保证关闭时刻无在途调用；S11-W3：close 后新调用 fail-fast 返回 kInvalidOption |
-| `get` / `get_owned` / `read_handle_count` | 是 | 读路径无锁；pread thread-safe |
-| `put` / `remove` / `put_doc` / `sync` / `close_write_file` | **是** | S11-W1：内部 `write_mu_` 串行化；多线程并发写安全（吞吐不变，写本就串行） |
-| `search_text` / `_phrase` / `_bool` / `_fields` / `_near` / `_fuzzy` / `_wildcard` | **是** | 并发读安全（cache_/doc_texts_ shared_mutex、倒排/HNSW shared_lock、analyzer const） |
-| `search_vector` / `search_hybrid` | 是 | HNSW `atomic<shared_ptr>` 快照；两路内核读路径均并发安全 |
-| `*_batch`（text/vector/hybrid） | 是 | inter-query 并发跑共享 Search 池 |
-| `set_synonym_map` | **否**（配置类）| 改 `synonym_map_`，须先于并发查询配置或外部串行化 |
-| `status` / `is_empty_estimate` / `is_frozen` / `needs_merge` | 是 | 只读快照 |
-| `merge` | 是 | 与读写并发（经 keydir shared_mutex 协调，不取 write_mu_）；跨进程 merge 经 `merge.lock` |
-| `parallel_scan` | 是 | 全表并行扫描：单次快照 live key → 分 N 段 → 并发 get；`fn` 须线程安全 |
-| `CaskIter::start` / `next` / `next_batch` / `release` | 否（同一对象）| 每线程一个迭代器；不同 CaskIter 对象可并发；并行遍历用 `parallel_scan` |
+| `open` / `upgrade` | ✅ | 产生独立对象；registry 内部锁 |
+| `close` | ⚠️ 生命周期（幂等）| caller 须保证无在途调用；S11-W3：close 后新调用 fail-fast 返回 kInvalidOption |
+| `get` / `get_owned` / `read_handle_count` | ✅ | keydir 分片 shared_lock + `pread`（无状态、thread-safe）；read_files_ 由 read_cache_mu_ 护 |
+| `put` / `remove` / `put_doc` / `sync` / `close_write_file` | ✅ | **S11-W1：内部 `write_mu_` 串行化**整个写序列；多线程并发写安全（写本就串行 → 吞吐不变） |
+| `search_text` / `_phrase` / `_bool` / `_fields` / `_near` / `_fuzzy` / `_wildcard` | ✅ | 并发读：cache_/doc_texts_ shared_mutex、InvertedIndex 分片 shared_lock、analyzer const |
+| `search_vector` / `search_hybrid` | ✅ | HNSW `atomic<shared_ptr>` 快照（读者引用计数续命）；两路内核读路径均并发安全 |
+| `*_batch`（text/vector/hybrid） | ✅ | inter-query 并发跑共享 Search 池（`search_arena`）；各结果槽独立 |
+| `set_synonym_map` | ⚠️ 配置类 | 改 `synonym_map_` 裸指针，与并发查询竞态 → 须先于并发查询配置或外部串行化 |
+| `status` / `is_empty_estimate` / `is_frozen` / `needs_merge` / `flush_index` | ✅ | 只读 keydir 快照 / IndexPool flush 自带 cv 同步 |
+| `merge` | ✅ | 写自有输出文件 + keydir shared_mutex 协调（不取 write_mu_，与读写并发）；跨进程经 `merge.lock` |
+| `parallel_scan` | ✅ | 串行快照 live key → 分 N 段 → 并发 `get`；`fn` 须线程安全（各处理不相交段） |
+| `CaskIter::start` / `next` / `next_batch` / `release` | ⚠️ 每线程一个 | 有状态游标，同一对象不可并发；不同 CaskIter 可并发；并行遍历用 `parallel_scan` |
 
 > **读写并发**：搜索可见性遵循 near-real-time 契约（`prepare_search` flush 覆盖调用前的写）。
 > **更高写并发**：写在文件层本就串行（单 append WAL），`write_mu_` 不损吞吐；需要更高写

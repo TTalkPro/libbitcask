@@ -26,7 +26,28 @@
 | 同义词 | `set_synonym_map` | 查询时自动展开 |
 | 高亮 | `search_text_highlight` | 命中片段截取 |
 | 迭代 | `make_iter` | MVCC 快照（兄弟链 + pending 哈希）|
+| 并行扫描 | `parallel_scan` | 多线程全表扫描（快照 key → 分段并发 get）|
 | 维护 | `merge` / `needs_merge` / `status` | 并发 merge（不阻塞 writer）|
+
+---
+
+## 线程安全（通用 C++ 库）
+
+**同一个 `Cask` handle 可被多线程安全共享**，无需每线程一个实例：
+
+| 操作 | 并发语义 |
+|------|----------|
+| **读**（`get` / `search_*` / 批量检索） | ✅ 真并发（无锁 / shared_lock） |
+| **写**（`put` / `remove` / `put_doc` / `sync`） | ✅ 多线程安全（内部 `write_mu_` 串行化；写本就串行 → 锁不损吞吐） |
+| **读写并发** | ✅ 安全；搜索可见性 near-real-time |
+| **`merge`** | ✅ 与读写并发（keydir `shared_mutex` 协调 + 独立 `merge.lock`） |
+| **`parallel_scan`** | ✅ 内部多线程并发 `get` |
+| `set_synonym_map` | ⚠️ 配置类：须先于并发查询配置 |
+| `close` | ⚠️ 生命周期：须无在途调用（close 后调用 fail-fast 返错码而非崩溃） |
+| `CaskIter` | ⚠️ 每线程一个迭代器（并行遍历用 `parallel_scan`） |
+
+> 对标 RocksDB / LMDB 的常规契约：**多读真并行 + 多写内部串行 + 读写并发 + fail-fast 生命周期**。更高写并发 → **按目录分片多个 Cask 实例**（单 append WAL 的横向扩展）。
+> 完整契约与各接口实现机制见 [`design/thread-safety.md`](docs/design/thread-safety.md)。
 
 ---
 
