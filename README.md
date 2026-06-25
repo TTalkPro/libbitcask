@@ -7,6 +7,8 @@
 - **C++23**，无 Boost / abseil 依赖；第三方库以 git submodule 形式 vendored 在 `third_party/`（构建无需联网）
 - **Apache 2.0** 协议
 
+> 变更历史见 [`CHANGELOG.md`](CHANGELOG.md)。
+
 ---
 
 ## 功能一览
@@ -38,7 +40,7 @@
 | 操作 | 并发语义 |
 |------|----------|
 | **读**（`get` / `search_*` / 批量检索） | ✅ 真并发（无锁 / shared_lock） |
-| **写**（`put` / `remove` / `put_doc` / `sync`） | ✅ 多线程安全（内部 `write_mu_` 串行化；写本就串行 → 锁不损吞吐） |
+| **写**（`put` / `remove` / `put_doc` / `sync`） | ✅ 多线程安全（内部 `write_mu_` 串行化）。单写吞吐不受锁影响；多写**安全但不提速**（短临界区争用 → 写扩展靠分片，见下） |
 | **读写并发** | ✅ 安全；搜索可见性 near-real-time |
 | **`merge`** | ✅ 与读写并发（keydir `shared_mutex` 协调 + 独立 `merge.lock`） |
 | **`parallel_scan`** | ✅ 内部多线程并发 `get` |
@@ -272,6 +274,7 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 | [`format-zh.md`](doc/format-zh.md) | 字节级格式 |
 | [`concurrency-zh.md`](doc/concurrency-zh.md) | 锁与并发 |
 | [`design/thread-safety.md`](docs/design/thread-safety.md) | 线程安全契约（通用 C++ 库：handle 多线程安全） |
+| [`design/async-index-pipeline.md`](docs/design/async-index-pipeline.md) | 异步索引 MapReduce 流水线设计 |
 | [`hnsw-design-zh.md`](doc/hnsw-design-zh.md) | HNSW 设计 |
 | [`recovery-unified-checkpoint-design-zh.md`](doc/recovery-unified-checkpoint-design-zh.md) | 恢复 / checkpoint 设计 |
 
@@ -290,7 +293,8 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 ├── tools/             # migrate_le、gen_inert_table
 ├── cmake/             # BitcaskSanitizers 模块 + tsan.supp
 ├── third_party/       # 第三方依赖（git submodule，见「构建依赖」）
-└── doc/               # 架构 / 格式 / 设计文档
+├── doc/               # 架构 / 格式 / API 参考文档
+└── docs/design/       # 设计稿（线程安全、异步索引流水线）
 ```
 
 ---

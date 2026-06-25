@@ -9,7 +9,51 @@
 
 ## [Unreleased]
 
-无未发布变更。
+### 新增（Added）
+- **S11 线程安全化（通用 C++ 库定位）**——同一个 `Cask` handle 可被多线程安全共享，
+  对标 RocksDB / LMDB 常规契约。设计稿 [`docs/design/thread-safety.md`](docs/design/thread-safety.md)。
+  - **W1 写路径内部串行化**：`put` / `remove` / `put_doc` / `sync` / `close_write_file`
+    由内部 `std::mutex write_mu_` 串行化——把「调用方串行化」内化为「库内互斥」，
+    同一 handle 多线程并发写安全（写在文件层本就串行 → 锁不损吞吐；更高写并发
+    → 按目录分片多实例）。读路径不取 `write_mu_`，吞吐不变。
+  - **W2 读/搜索并发确认**：搜索方法（text / phrase / bool / fields / near / fuzzy /
+    wildcard）全部确认为并发读安全，订正历史「否（保守）」注释。
+  - **W3 `close()` fail-fast 生命周期硬化**：加 `std::atomic<bool> closed_`，
+    `close()` 后**新发起**的公共调用返回 `kInvalidOption` 而非解引用已释放状态（UB）；
+    `close()` 幂等（二次 no-op）。best-effort 防误用，非完整 rundown。
+  - **W4 `parallel_scan` 并行全表扫描 API**：单次快照 live key → 分 N 段 → 并发 `get`
+    读值 + 回调；用于 analytics / export / reindex。被并行化的是读值的 pread + decode。
+- **S7 批量检索 API**：`search_text_batch` / `search_vector_batch` / `search_hybrid_batch`
+  ——多条独立查询在进程级共享 `search_arena`（TBB `task_arena`）上 inter-query 并行，
+  保序返回各结果；单查询内部仍串行（WAND 顺序依赖、HNSW 图遍历）。
+- **S6 异步索引 MapReduce 流水线**：`put_doc` 入队有界 `IndexPool`（满则背压）
+  → N 个 map worker 并行分词（`hardware_concurrency` 真数据并行）→ per-lane reorder
+  buffer（按 ord 排序）→ 单 reducer 串行 apply。池由 `KeyDirRegistry` 共享，线程数
+  = N+1 与库数无关——多 `Cask` 实例共享同一组索引线程。
+
+### 变更（Changed）
+- **性能优化（多梯队，均经实测验证）**：
+  - **搜索缓存前置检查**（S10-A1）：命中即跳过 ~2µs NLP analyze。
+  - **put_doc 字段打包进单 buffer**（S10-A5）：alloc/put −6.5，heap bytes −13%。
+  - **ord_field_lens_ 字段名 intern 化**（S10-A4）：内存 −40%，吞吐 <1% 影响。
+  - **短语并行 + HNSW int8 精排并行**（S7-5/6）：3.5–4.65× / 1.12×。
+  - **SynonymMap `shared_ptr`**（C-tier）：热路径 45×；highlighter 二分搜索。
+  - **HNSW output reserve + madvise RANDOM + select_neighbors 缓存**（D-tier）。
+  - **merger 批量 pwrite**（S2）；**checkpoint/keydir 序列化精确 reserve**（S4）；
+    **recovery 批量并行 analyze**（S3）；**多文件并行 fold**（R3）。
+  - **HintFile::fold chunked pread**：syscall ↓4348×；**hint flush 1MiB**（P2）。
+  - **NgramAnalyzer 内部 `string_view` 去重**：alloc O(N)→O(U)。
+- **重构（行为零变更）**：
+  - **S9**：RAII fd 管理 + `kDefaultField` 透明查找 + `byte_order` 提取（P0）；
+    C API `unique_ptr` + vbyte 模板化 + `ThreadLocalBuffer`（P1）；
+    `SearchError` 强类型枚举 + deserialize 哨兵具名（P2）。
+  - **S8**：批量 / 单条 search 方法去重（R1/R3）+ `thread_pool.hpp` 注释收尾（R2/R5）
+    + 池魔法数字 → 具名常量（R4）。
+  - **D2**：`search_*` 物化抽 `materialize_hits` + 词序还原抽 `ordered_query_terms`（8 处去重）。
+
+### 修复（Fixed）
+- **X1**：`CaskIter` pin `KeyDir` 的 `shared_ptr`（`keydir_pin_`），防 `close()` 后
+  iterator 解引用已释放 keydir 的 use-after-free。
 
 ---
 
