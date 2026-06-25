@@ -2363,6 +2363,72 @@ TEST_F(CaskDocValueTest, S74SearchTextBatchMatchesSerial) {
     (*c)->close();
 }
 
+// S11-W2：并发**多模式搜索 + 并发写**同一 Cask handle 的安全护栏（通用 C++ 库）。
+// 验证读路径（text/phrase/bool/fields/vector/hybrid 各模式并发）+ 写路径（put_doc/
+// remove，W1 后内部 write_mu_）在同一 handle 上并发零 data race。结果因并发写不可
+// 严格断言（near-real-time），只断言「不崩、查询不返回错误」——TSan 负责抓竞态。
+TEST_F(CaskDocValueTest, W2ConcurrentSearchAndWriteNoRace) {
+    auto opts = v31_opts(4);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    v36_put_corpus(**c);
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> ok{true};
+    const float qv[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+
+    std::vector<std::thread> ts;
+    // 4 个读线程：轮转 6 种搜索模式。
+    for (int r = 0; r < 4; ++r) {
+        ts.emplace_back([&, r] {
+            int n = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                std::span<const float> v(qv, 4);
+                switch ((r + n) % 6) {
+                    case 0: if (!(*c)->search_text("x", 10)) ok = false; break;
+                    case 1: if (!(*c)->search_phrase("x y", 10)) ok = false; break;
+                    case 2: if (!(*c)->bool_search("x y", 10)) ok = false; break;
+                    case 3: if (!(*c)->search_fields("x", 10)) ok = false; break;
+                    case 4: if (!(*c)->search_vector(v, 10)) ok = false; break;
+                    case 5: if (!(*c)->search_hybrid("x", v, 10)) ok = false; break;
+                }
+                if (++n >= 200) break;
+            }
+        });
+    }
+    // 2 个写线程：并发 put_doc（新键）+ 间隔 remove。
+    for (int w = 0; w < 2; ++w) {
+        ts.emplace_back([&, w] {
+            for (int i = 0; i < 150; ++i) {
+                bitcask::DocInput doc;
+                std::string text = "x y z w" + std::to_string(i);
+                doc.text = sv_bytes(text);
+                const float dv[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+                doc.vector = std::span<const float>(dv, 4);
+                std::string key = "w" + std::to_string(w) + "_" + std::to_string(i);
+                if (!(*c)->put_doc(sv_bytes(key), doc,
+                                   static_cast<std::uint32_t>(3000 + i))) {
+                    ok = false; return;
+                }
+                if (i % 7 == 6) {
+                    std::string old = "w" + std::to_string(w) + "_" +
+                                      std::to_string(i - 6);
+                    (void)(*c)->remove(sv_bytes(old));  // 删除可因时序无目标，忽略返回
+                }
+            }
+        });
+    }
+    for (auto& t : ts) t.join();
+    stop.store(true);
+    EXPECT_TRUE(ok.load()) << "并发搜索/写出现错误返回";
+
+    // 收尾一致性：flush 后搜索仍正常返回。
+    (*c)->flush_index();
+    auto final_r = (*c)->search_text("x", 100);
+    ASSERT_TRUE(final_r);
+    (*c)->close();
+}
+
 // 边界：空批量 → 空；单条 → 走快路径（不进池）仍正确。
 TEST_F(CaskDocValueTest, S74SearchTextBatchEdgeCases) {
     auto opts = v31_opts(4);

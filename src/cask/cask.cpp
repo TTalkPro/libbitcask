@@ -185,6 +185,10 @@ CaskIter::~CaskIter() noexcept { release(); }
 std::expected<keydir::StartIterResult, CaskFault>
 CaskIter::start(int maxage, int maxputs, std::uint32_t now_sec,
                 bool see_tombstones) {
+    // S11-W3：parent Cask 已 close → keydir_ 已释放,fail-fast 而非解引用空指针。
+    if (parent_->is_closed()) {
+        return std::unexpected(err(CaskError::kInvalidOption, "cask is closed"));
+    }
     if (iter_ && iter_->is_iterating()) {
         return std::unexpected(err(CaskError::kIo, "iter already started"));
     }
@@ -686,6 +690,9 @@ Cask::create_search_infra(const CaskOptions& opts) {
 // 失败全部静默——close 路径上的错误没有合理的恢复动作，硬抛会让调用方
 // 进程意外崩溃（close 标 noexcept，抛出即 std::terminate）。
 void Cask::close() noexcept {
+    // S11-W3：置 closed_ 标志（兼作幂等门——二次 close 直接返回）。后续公共方法
+    // 入口 is_closed() 检查 → fail-fast 返回错误码而非解引用已释放状态。
+    if (closed_.exchange(true)) return;
     // close 内部步骤（save_ckpt/snapshot 的 vector 操作）可能抛 bad_alloc；
     // noexcept 函数抛出 → std::terminate。整个 body 包 try/catch 兜底：吞掉
     // 异常让后续资源释放仍能执行，优于进程硬死。错误可见性靠 index_errors_
@@ -1107,6 +1114,8 @@ std::expected<void, CaskFault> Cask::roll_active() {
 }
 
 std::expected<void, CaskFault> Cask::close_write_file() {
+    std::lock_guard<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    if (is_closed()) return std::unexpected(err(CaskError::kInvalidOption, "cask is closed"));  // S11-W3
     if (!opts_.read_write) {
         return std::unexpected(err(CaskError::kReadOnly,
                                      "close_write_file: read-only cask"));
@@ -1321,6 +1330,7 @@ Cask::prepare_vector(std::span<const float> input,
 //   benchmark / 测试 / 需要持久化 → get_owned()。
 std::expected<GetResultView, CaskFault>
 Cask::get(std::span<const std::byte> key) {
+    if (is_closed()) return std::unexpected(err(CaskError::kInvalidOption, "cask is closed"));  // S11-W3
     auto entry = keydir_->get(bytes_to_view(key));
     if (!entry) return std::unexpected(err(CaskError::kNotFound));
 
@@ -1463,6 +1473,8 @@ GetResult GetResultView::to_owned() const {
 Cask::put(std::span<const std::byte> key,
           std::span<const std::byte> value,
           std::uint32_t tstamp) {
+    std::lock_guard<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    if (is_closed()) return std::unexpected(err(CaskError::kInvalidOption, "cask is closed"));  // S11-W3
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly));
     }
@@ -1513,6 +1525,8 @@ Cask::put(std::span<const std::byte> key,
 //       (P：盘格式统一小端，flag-day 前为大端。)
 std::expected<void, CaskFault>
 Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
+    std::lock_guard<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    if (is_closed()) return std::unexpected(err(CaskError::kInvalidOption, "cask is closed"));  // S11-W3
     if (!opts_.read_write) return std::unexpected(err(CaskError::kReadOnly));
     if (tstamp == 0) tstamp = now_sec_default();
 
@@ -1563,6 +1577,8 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
 std::expected<void, CaskFault>
 Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
               std::uint32_t tstamp) {
+    std::lock_guard<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    if (is_closed()) return std::unexpected(err(CaskError::kInvalidOption, "cask is closed"));  // S11-W3
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly));
     }
@@ -1686,6 +1702,7 @@ Cask::run_search_one(
     bool require_vector,
     const std::function<
         std::expected<std::vector<search::SearchHit>, search::SearchError>()>& run) {
+    if (is_closed()) return std::unexpected(err(CaskError::kInvalidOption, "cask is closed"));  // S11-W3
     if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     if (require_vector && meta_config_.vector_dim == 0) {
         return std::unexpected(err(CaskError::kInvalidOption,
@@ -1730,6 +1747,11 @@ Cask::run_search_batch(
         std::expected<TextSearchResult, CaskFault>(std::size_t)>& run_one) {
     std::vector<std::expected<TextSearchResult, CaskFault>> out(n);
     if (n == 0) return out;
+    if (is_closed()) {  // S11-W3：全槽同 closed 错误
+        for (auto& o : out)
+            o = std::unexpected(err(CaskError::kInvalidOption, "cask is closed"));
+        return out;
+    }
     // 前置校验一次覆盖全批（所有查询共享同一 search_/lane）；失败 → 全槽同错。
     if (auto g = prepare_search(); !g) {
         for (auto& o : out) o = std::unexpected(g.error());
@@ -1831,6 +1853,8 @@ void Cask::set_synonym_map(std::unique_ptr<text::SynonymMap> map) {
 }
 
 std::expected<void, CaskFault> Cask::sync() {
+    std::lock_guard<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    if (is_closed()) return std::unexpected(err(CaskError::kInvalidOption, "cask is closed"));  // S11-W3
     if (active_data_) {
         if (auto r = active_data_->sync(); !r) {
             return std::unexpected(io_fault(r.error().errnum));
@@ -1849,6 +1873,7 @@ std::expected<void, CaskFault> Cask::sync() {
 
 StatusInfo Cask::status() {
     StatusInfo s;
+    if (is_closed()) return s;  // S11-W3：已关闭返回零值快照（不解引用 keydir_）
     auto info = keydir_->info();
     s.key_count = info.key_count;
     s.key_bytes = info.key_bytes;
@@ -1862,10 +1887,12 @@ StatusInfo Cask::status() {
 }
 
 bool Cask::is_empty_estimate() {
+    if (is_closed()) return true;  // S11-W3
     return keydir_->info().key_count == 0;
 }
 
 bool Cask::is_frozen() {
+    if (is_closed()) return false;  // S11-W3
     return keydir_->info().iter_info.frozen;
 }
 
@@ -1876,6 +1903,7 @@ bool Cask::is_frozen() {
 //     防御性地排除所有 file_id >= snapshot 的文件。代价是少并几个文件，
 //     下一轮 merge 自然处理。
 Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
+    if (is_closed()) return {};  // S11-W3：needs=false
     auto info = keydir_->info();
     const std::uint32_t exclude_id =
         opts_.merge_only ? merger_writer_active_id_ : active_file_id_;
@@ -1939,6 +1967,7 @@ Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
 //  - Phase 3 的 unlink 必须在 Phase 2 之后——否则 HNSW rebuild 读不到源数据
 std::expected<merge::MergeStats, CaskFault>
 Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
+    if (is_closed()) return std::unexpected(err(CaskError::kInvalidOption, "cask is closed"));  // S11-W3
     if (files.empty()) {
         auto n = needs_merge(now_sec);
         if (!n.needs) {

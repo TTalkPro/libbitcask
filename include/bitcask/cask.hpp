@@ -3,19 +3,26 @@
 // 一次 open / close / get / put / delete 就够，替代 legacy 那 30+ 个细粒度
 // keydir_*_int / file_*_int 调用。
 //
-// === 线程模型 ===
+// === 线程模型（S11：通用 C++ 库,handle 内部线程安全；docs/design/thread-safety.md）===
 //
-// 一个 Cask 由单个 Erlang 进程持有 resource ref 拥有。底层 KeyDir 可能在
-// 同目录的多个 Cask 之间共享（KeyDirRegistry 管 refcount）——多写者要求
-// 调用方自己串行化（M5 的 cask_cpp 是「一个 Erlang 进程一个 Cask」模型，
-// 因此 Cask 自身不做内部并发写控制）。
+// 同一个 Cask handle 可被多线程安全共享：
+//   - **读**（get / search* / search_vector / 批量搜索）：并发安全,无锁/共享锁。
+//     keydir get + DataFile pread thread-safe;read_files_ cache 受 read_cache_mu_ 护;
+//     搜索读 cache_/doc_texts_ shared_mutex、倒排/HNSW shared_lock、analyzer const。
+//   - **写**（put / remove / put_doc / sync / close_write_file）：并发安全,由内部
+//     `write_mu_` 串行化（S11-W1）。写在文件层本就串行 → 锁不损吞吐;需要更高写
+//     并发 → 按目录分片多个 Cask 实例（横向扩展）。
+//   - **读写并发**：安全;搜索可见性遵循 near-real-time 契约（prepare_search flush
+//     覆盖调用前的写）。
+//   - **merge**：与读写并发,经 keydir shared_mutex 协调（不取 write_mu_,写自有
+//     输出文件）。
 //
-// 读路径无锁：keydir get + DataFile 的 pread 是 thread-safe 的，read_files_
-// cache 由 read_cache_mu_ 保护。
+// 例外（非 handle 级线程安全,见各方法注释）：
+//   - `CaskIter`：每线程一个迭代器（同 std 容器迭代器约定）;不同迭代器并发安全。
+//   - `set_synonym_map`：配置类,须先于并发查询配置（或外部串行化）。
+//   - `close()`：caller 须保证关闭时刻无在途操作。
 //
-// 写路径单线程：put / delete / sync / close_write_file 串行，由调用方
-// （单 Erlang 进程）保证。merge 在 dirty IO 调度器上跑，跟 put 共享
-// keydir 的 shared_mutex 做并发保护。
+// 底层 KeyDir 可在同目录多个 Cask 间共享（KeyDirRegistry 管 refcount）。
 
 #pragma once
 
@@ -324,8 +331,12 @@ public:
     [[nodiscard]] static std::expected<std::unique_ptr<Cask>, CaskFault>
     upgrade(std::string_view dirname, const search::SearchLayerConfig& search_config);
 
-    // 线程安全: 否（修改对象状态、释放资源）；caller 保证关闭时刻没有
-    // 其它线程仍在调用 get/put/remove/sync/iter。
+    // 释放资源。**幂等**（二次 close no-op）。
+    // 线程安全: 否（生命周期方法，修改对象状态、释放资源）；caller 须保证关闭
+    // 时刻没有其它线程仍在调用 get/put/remove/sync/iter。
+    // S11-W3：close 后**新发起**的公共调用 fail-fast 返回 kInvalidOption（"cask
+    // is closed"）而非解引用已释放状态；但与 close **并发在途**的调用仍是 UB
+    // （上面的契约）——这是 best-effort 防误用,非完整 rundown。
     void close() noexcept;
 
     // 单 key 读：keydir.get → DataFile.read 一次 pread。kNotFound 用
@@ -348,29 +359,29 @@ public:
     [[nodiscard]] std::size_t read_handle_count() const;
 
     // 写入。tstamp=0 表示用当前 wall-clock 秒。
-    // 线程安全: 否（写路径要求「一个 Cask 同时只有一个写线程」——M5 通过
-    // 「一个 Erlang 进程独占一个 Cask」实现，本类不提供互斥）。
-    // 同一 Cask 与并发 merge_only 句柄安全（双方共享 keydir 的 shared_mutex
-    // 保护）。
-    // 锁要求: caller 串行化所有 put/remove/sync/close_write_file 调用。
+    // 线程安全: **是**（S11-W1：内部 `write_mu_` 串行化整个写序列;同一 handle 可
+    // 被多线程并发写而不损坏。写在文件层本就串行 → 锁不损吞吐;更高写并发 → 按
+    // 目录分片多 Cask 实例）。与并发 merge / 并发读（get/search）安全。
     [[nodiscard]] std::expected<void, CaskFault>
     put(std::span<const std::byte> key,
         std::span<const std::byte> value,
         std::uint32_t tstamp = 0);
 
     // 软删除：写一条墓碑 record。空间在下一次 merge 时回收。
-    // 线程安全: 否（同 put）。锁要求: caller 串行化所有写操作。
+    // 线程安全: **是**（同 put，内部 write_mu_）。
     [[nodiscard]] std::expected<void, CaskFault>
     remove(std::span<const std::byte> key, std::uint32_t tstamp = 0);
 
     // 写入结构化文档（text + 选填 meta）。用于索引模式。
-    // 线程安全: 否（同 put）。
+    // 线程安全: **是**（同 put，内部 write_mu_）。
     [[nodiscard]] std::expected<void, CaskFault>
     put_doc(std::span<const std::byte> key, const DocInput& doc,
             std::uint32_t tstamp = 0);
 
     // BM25 文本搜索（词袋模式）。
-    // 线程安全: 否（search_ 非线程安全）。
+    // 线程安全: **是**（并发读安全：cache_/doc_texts_ 各 shared_mutex、倒排/HNSW
+    // shared_lock、analyzer const;S6/S7 TSan 已证）。与并发写安全,可见性遵循
+    // near-real-time 契约（prepare_search flush 覆盖调用前的写)。
     // V5:filter 非空时 meta 过滤(后过滤 overfetch k×4 再截断到 k)。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_text(std::string_view query, std::size_t k = 10,
@@ -380,19 +391,20 @@ public:
     // Search 池」上（inter-query 并发；非每 Cask 一个线程），按输入序返回各自
     // 结果。每条查询内部仍串行。单条查询失败只影响该槽（其余照常）。一次
     // flush（prepare_search）覆盖全批。
-    // 线程安全:本方法内部对 search_ 的并发只读安全（cache_/doc_texts_ 各
-    // shared_mutex、倒排/HNSW shared_lock、analyzer const）；但与**写线程**仍受
-    // 「一个 Cask 一个写线程」契约约束——批量查询期间该 Cask 不得有并发写。
+    // 线程安全: **是**（并发只读 search_：cache_/doc_texts_ 各 shared_mutex、
+    // 倒排/HNSW shared_lock、analyzer const）。与并发写安全（S11-W1 后写路径内部
+    // 串行）;可见性遵循 near-real-time 契约（一次 flush 覆盖全批调用前的写）。
     [[nodiscard]] std::vector<std::expected<TextSearchResult, CaskFault>>
     search_text_batch(std::span<const std::string_view> queries,
                       std::size_t k = 10,
                       const meta::MetaFilter* filter = nullptr);
 
     // BM25 文本搜索（短语模式）。
-    // 线程安全: 否（search_ 非线程安全）。
+    // 线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_phrase(std::string_view query, std::size_t k = 10);
 
+    // BM25 布尔搜索（AND/OR/NOT）。线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     bool_search(std::string_view query, std::size_t k = 10);
 
@@ -442,24 +454,29 @@ public:
                         const meta::MetaFilter* filter = nullptr);
 
     // BM25 多字段搜索（S8.6）：支持 `field:term^boost` 语法，跨字段加权合并。
-    // 无字段限定的词等价于默认字段词袋搜索。线程安全: 否。
+    // 无字段限定的词等价于默认字段词袋搜索。线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_fields(std::string_view query, std::size_t k = 10);
 
     // BM25 近邻搜索（S8.7）：term 按序出现且相邻间隙 ≤ slop。slop=0 即短语。
-    // 线程安全: 否。
+    // 线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_near(std::string_view query, std::uint32_t slop, std::size_t k = 10);
 
     // S8.3：BM25 模糊搜索（Levenshtein 编辑距离匹配）。
+    // 线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance);
 
     // S8.4：BM25 通配符搜索（* / ? 模式匹配）。
+    // 线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_wildcard(std::string_view pattern, std::size_t k);
 
     // S8.2：设置同义词词典（查询时自动展开同义词）。
+    // ⚠️ 线程安全: **否**——配置类方法，与并发查询竞态（改 synonym_map_ 指针,
+    // 而 search_text/search_fields 读它）。契约：**必须在并发查询开始前配置**
+    // （或由 caller 外部串行化）。典型用法是 open 后、对外服务前设置一次。
     void set_synonym_map(std::unique_ptr<text::SynonymMap> map);
 
     // 访问内部 SearchLayer（用于 NIF 层）。
@@ -471,14 +488,14 @@ public:
     }
 
     // fsync active data file。o_sync 模式下退化为 no-op。
-    // 线程安全: 否（操作 active_data_，与 put/remove 互斥）；caller 串行化。
+    // 线程安全: **是**（S11-W1：内部 write_mu_，与 put/remove 互斥）。
     [[nodiscard]] std::expected<void, CaskFault> sync();
 
     // 强制关 active write file：finalize hint trailer、丢掉 active data/hint
     // 句柄、释放 bitcask.write.lock。Cask 仍可用——下次 put/delete 自动
     // 重新拿锁、新建 active file（对应 legacy bitcask:close_write_file 语义）。
     // 只读 / merge_only 句柄返回 kReadOnly。
-    // 线程安全: 否（操作 active_*）；caller 串行化所有写操作。
+    // 线程安全: **是**（S11-W1：内部 write_mu_，与 put/remove/sync 互斥）。
     [[nodiscard]] std::expected<void, CaskFault> close_write_file();
 
     // 线程安全: 是（只读 keydir + opts 快照）；不需任何锁。
@@ -543,6 +560,27 @@ private:
     // P4 组提交计数：自上次 fsync 以来的写次数。写路径单线程（caller 串行），
     // 无需原子。sync_every_n>0 时由 maybe_group_commit() 维护。
     std::uint32_t writes_since_sync_ = 0;
+
+    // S11-W1：写路径互斥——把「调用方串行化所有写」的外部契约**内化**为内部锁，
+    // 使同一 Cask 可被多线程并发写而不损坏数据（通用 C++ 库定位，
+    // docs/design/thread-safety.md）。覆盖 put/remove/put_doc/sync/close_write_file
+    // 的整个写序列（含内部 ensure_active_writer/roll_active/maybe_group_commit/
+    // write_and_keydir）。保护对象：active_data_ 的 current_offset_/write_buf_/
+    // batch_buf_、writes_since_sync_、active_file_id_、active_hint_ 等写态。
+    // 锁序：write_mu_ 最外层 → 内部再取 read_cache_mu_/keydir 锁；**读路径不取
+    // write_mu_**（get/搜索保持无锁/共享锁，吞吐不变）。merge 不取本锁（写自有
+    // 输出文件，经 keydir shared_mutex 协调，与写并发）；flush_index 不取本锁
+    // （读/写共用、IndexPool flush 自带 cv 同步）。
+    std::mutex write_mu_;
+
+    // S11-W3：生命周期 fail-fast 标志。close() 置位后,公共方法入口检查 → 返回
+    // 错误码而非解引用已释放的 keydir_/search_/active_data_（UB）。这是**尽力
+    // 而为的 fail-fast**,非完整 rundown：已在途的操作与 close() 并发仍是 caller
+    // 责任（契约：close 时刻无在途调用）。close() 用 exchange 兼作幂等门。
+    std::atomic<bool> closed_{false};
+    [[nodiscard]] bool is_closed() const noexcept {
+        return closed_.load(std::memory_order_acquire);
+    }
 
     // 按 file_id 缓存的 DataFile 读句柄。read 路径懒打开。
     // 多读者并发，read_cache_mu_ 保护 unordered_map 本身；DataFile 内部

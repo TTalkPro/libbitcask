@@ -500,4 +500,149 @@ TEST_F(CrashRecoveryTest, ThreadLocalEncodedBufferNoCrossThreadInterference) {
     }
 }
 
+// S11-W1：多线程并发写**同一** Cask handle 的正确性护栏（通用 C++ 库定位）。
+// 区别于上一个 T6 测试（每线程独立 Cask）——这里 N 个写线程**共享一个 handle**，
+// 正是 W1（write_mu_ 写路径互斥）针对的场景。无 write_mu_ 时并发
+// active_data_->write() 竞争 current_offset_/write_buf_/batch_buf_ + writes_since_sync_
+// → 数据损坏/串台/offset 错位（TSan 插桩下直接报 data race）。
+// 各线程写**互不相交**的 key 段 → 无跨线程 LWW，期望态确定可断言。
+TEST_F(CrashRecoveryTest, ConcurrentWritersSharedCaskNoCorruption) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.sync_every_n = 4;  // 走 maybe_group_commit 组提交（writes_since_sync_ 亦受 write_mu_ 护）
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    constexpr int kThreads = 8;
+    constexpr int kOps = 300;
+    auto key_tp = [](int t, int i) {
+        char b[32]{}; std::snprintf(b, sizeof b, "k_%02d_%05d", t, i);
+        return std::string(b);
+    };
+    // 变长 value（8..24B，跨 SSO 边界）→ 若 write_buf_ 并发串台则读回残留/错位可检。
+    auto val_tp = [](int t, int i) {
+        std::string v(static_cast<std::size_t>(8 + (i % 17)),
+                      static_cast<char>('A' + t));
+        v += "_" + std::to_string(t) + "_" + std::to_string(i);
+        return v;
+    };
+
+    std::atomic<bool> ok{true};
+
+    // 阶段 1：N 线程并发 put（互不相交 key 段）。
+    {
+        std::vector<std::thread> ws;
+        ws.reserve(kThreads);
+        for (int t = 0; t < kThreads; ++t) {
+            ws.emplace_back([&, t] {
+                for (int i = 0; i < kOps; ++i) {
+                    if (!(*c)->put(bytes(key_tp(t, i)), bytes(val_tp(t, i)),
+                                   static_cast<std::uint32_t>(1000 + i))) {
+                        ok = false; return;
+                    }
+                }
+            });
+        }
+        for (auto& w : ws) w.join();
+    }
+    ASSERT_TRUE(ok.load()) << "并发 put 失败";
+
+    auto verify_all_present = [&](Cask& cask) {
+        for (int t = 0; t < kThreads; ++t) {
+            for (int i = 0; i < kOps; ++i) {
+                auto gr = cask.get_owned(bytes(key_tp(t, i)));
+                ASSERT_TRUE(gr) << "missing t=" << t << " i=" << i;
+                std::string got(reinterpret_cast<const char*>(gr->value.data()),
+                                gr->value.size());
+                EXPECT_EQ(got, val_tp(t, i)) << "value 串台/损坏 t=" << t << " i=" << i;
+            }
+        }
+    };
+    verify_all_present(**c);
+
+    // 阶段 2：N 线程并发 remove（各删自己偶数 i 的 key）+ 并发校验 put/remove 混合写路径。
+    {
+        std::vector<std::thread> ws;
+        ws.reserve(kThreads);
+        for (int t = 0; t < kThreads; ++t) {
+            ws.emplace_back([&, t] {
+                for (int i = 0; i < kOps; i += 2) {
+                    if (!(*c)->remove(bytes(key_tp(t, i)),
+                                      static_cast<std::uint32_t>(5000 + i))) {
+                        ok = false; return;
+                    }
+                }
+            });
+        }
+        for (auto& w : ws) w.join();
+    }
+    ASSERT_TRUE(ok.load()) << "并发 remove 失败";
+
+    auto verify_after_remove = [&](Cask& cask) {
+        for (int t = 0; t < kThreads; ++t) {
+            for (int i = 0; i < kOps; ++i) {
+                auto gr = cask.get_owned(bytes(key_tp(t, i)));
+                if (i % 2 == 0) {
+                    EXPECT_FALSE(gr) << "应已删除 t=" << t << " i=" << i;
+                } else {
+                    ASSERT_TRUE(gr) << "missing t=" << t << " i=" << i;
+                    std::string got(reinterpret_cast<const char*>(gr->value.data()),
+                                    gr->value.size());
+                    EXPECT_EQ(got, val_tp(t, i)) << "value 损坏 t=" << t << " i=" << i;
+                }
+            }
+        }
+    };
+    verify_after_remove(**c);
+    (*c)->close();
+
+    // 重开：校验落盘字节无损坏（offset/CRC 正确）。
+    auto c2 = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c2);
+    verify_after_remove(**c2);
+    (*c2)->close();
+}
+
+// S11-W3：生命周期 fail-fast——close() 后调用公共方法返回错误码而非 UB（通用
+// C++ 库的防误用契约）。同时验证 close() 幂等（二次 close 安全）。
+TEST_F(CrashRecoveryTest, OperationsAfterCloseReturnErrorNotUb) {
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    ASSERT_TRUE((*c)->put(bytes("k0"), bytes("v0")));
+
+    // close 前 make_iter（合法）——但在 close 后才 start，验证 start fail-fast。
+    auto it_after = (*c)->make_iter();
+
+    (*c)->close();
+
+    // 数据面：get/put/remove/sync 均返回 kInvalidOption，不崩。
+    auto g = (*c)->get(bytes("k0"));
+    ASSERT_FALSE(g);
+    EXPECT_EQ(g.error().kind, bitcask::CaskError::kInvalidOption);
+
+    auto p = (*c)->put(bytes("k1"), bytes("v1"));
+    ASSERT_FALSE(p);
+    EXPECT_EQ(p.error().kind, bitcask::CaskError::kInvalidOption);
+
+    auto rm = (*c)->remove(bytes("k0"));
+    ASSERT_FALSE(rm);
+    EXPECT_EQ(rm.error().kind, bitcask::CaskError::kInvalidOption);
+
+    EXPECT_FALSE((*c)->sync());
+    EXPECT_FALSE((*c)->merge());
+
+    // 内省：安全默认值，不解引用已释放的 keydir_。
+    EXPECT_TRUE((*c)->is_empty_estimate());
+    EXPECT_EQ((*c)->read_handle_count(), 0u);
+
+    // close 后 start 迭代器 → fail-fast。
+    auto sr = it_after->start(0, 0, false);
+    EXPECT_FALSE(sr);
+
+    // close 幂等：二次 close 不崩。
+    (*c)->close();
+}
+
 }  // namespace
