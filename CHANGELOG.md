@@ -3,13 +3,40 @@
 本文件记录 libbitcask 的所有重要变更。
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
-版本遵循语义化版本（库 `SOVERSION=1`，盘上 meta 格式版本 `v2`）。
+版本遵循语义化版本。**3.0.0 起三套版本号统一**：CHANGELOG 发布版本 = 库 `VERSION` =
+C API 产品版本 `bitcask_version_*` = **`3.0.0`**；库 `SOVERSION` = **`3`**（= major）；
+盘上 meta 格式版本 `v2`（独立，与库版本无关）。
 
 ---
 
 ## [Unreleased]
 
 无未发布变更。
+
+---
+
+## [3.0.0] - 2026-06-25
+
+> ⚠️ **破坏性 ABI 变更**（库 `SOVERSION 1 → 3`，C API 产品版本 `2.2.0 → 3.0.0`）。
+> 下游 C/C++ 调用方需**重新编译链接**；soname `libbitcask.so.1 → libbitcask.so.3`，
+> 链接器会在 ABI 不兼容时明确报错而非静默崩溃。
+>
+> 本版**统一三套版本号为 `3.0.0`**：此前 CHANGELOG（1.x）、C API（2.x）、库 VERSION
+> 各自为政；自此 CHANGELOG 发布版本 = 库 VERSION = C API 版本 = `3.0.0`，SOVERSION = 3。
+
+### 变更（Changed — 破坏性）
+- **同义词词典：运行期 setter → open-time 不可变配置**。
+  - **移除** `bitcask_set_synonym_map`（C）/ `Cask::set_synonym_map`（C++）。
+  - **新增** `bitcask_options_t::synonym_file_path`（C，同义词文件路径）/
+    `CaskOptions::synonym_map`（C++，`std::shared_ptr<const text::SynonymMap>`）。
+  - 词典 open 时一次性加载、构造后**不可变** → 并发查询天然安全（消除配置项里唯一的
+    reader-vs-writer 竞态，把「须先于并发配置」的口头契约升级为结构保证）。运行期更换
+    词典需重开库；按请求用不同词典请自行展开查询串。
+
+### 版本（Versioning）
+- **三套版本号统一为 `3.0.0`**：C API `bitcask_version_*` `2.2.0` → **`3.0.0`**（删公共函数 =
+  major）；库 `VERSION` `1.0.0` → **`3.0.0`**、`SOVERSION` `1` → **`3`**；CHANGELOG 发布版本同步为
+  `3.0.0`。
 
 ---
 

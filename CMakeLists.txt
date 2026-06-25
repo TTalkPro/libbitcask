@@ -359,8 +359,8 @@ target_link_libraries(bitcask_shared PRIVATE bitcask_cask)
 target_compile_definitions(bitcask_shared PRIVATE BITCASK_DLL_EXPORTS)
 set_target_properties(bitcask_shared PROPERTIES
     OUTPUT_NAME "bitcask"
-    VERSION 1.0.0
-    SOVERSION 1
+    VERSION 3.0.0
+    SOVERSION 3
 )
 add_library(Bitcask::shared ALIAS bitcask_shared)
 
