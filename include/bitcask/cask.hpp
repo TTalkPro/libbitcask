@@ -19,8 +19,9 @@
 //
 // 例外（非 handle 级线程安全,见各方法注释）：
 //   - `CaskIter`：每线程一个迭代器（同 std 容器迭代器约定）;不同迭代器并发安全。
-//   - `set_synonym_map`：配置类,须先于并发查询配置（或外部串行化）。
 //   - `close()`：caller 须保证关闭时刻无在途操作。
+// （同义词词典已改为 open-time 不可变配置 `CaskOptions::synonym_map`，不再是运行期
+//  可变项 → 无并发竞态。）
 //
 // 底层 KeyDir 可在同目录多个 Cask 间共享（KeyDirRegistry 管 refcount）。
 
@@ -107,6 +108,11 @@ struct CaskOptions {
     bool          vector_quantized = false;  // P3b：向量落盘 int8 量化（4× 磁盘，有损）
     bool          vector_inmem_int8 = false; // P5b：HNSW int8-only 内存（−80% 向量内存，仅 kDot；与 quantized 正交）
     meta::VectorMetric vector_metric = meta::VectorMetric::kCosineNormalized;
+    // 同义词词典（**Cask 级、open-time、不可变**）。查询时 search_text/search_fields
+    // 自动展开同义词。构造后只读 → 并发查询安全（取代了曾经的运行期
+    // set_synonym_map setter，那是配置项里唯一的 reader-vs-writer 竞态源）。
+    // 空 = 不展开。仅在 enable_search 时生效；运行期更换词典请重开库。
+    std::shared_ptr<const text::SynonymMap> synonym_map;
 };
 
 // --- 错误码 ------------------------------------------------------------------
@@ -496,11 +502,8 @@ public:
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_wildcard(std::string_view pattern, std::size_t k);
 
-    // S8.2：设置同义词词典（查询时自动展开同义词）。
-    // ⚠️ 线程安全: **否**——配置类方法，与并发查询竞态（改 synonym_map_ 指针,
-    // 而 search_text/search_fields 读它）。契约：**必须在并发查询开始前配置**
-    // （或由 caller 外部串行化）。典型用法是 open 后、对外服务前设置一次。
-    void set_synonym_map(std::unique_ptr<text::SynonymMap> map);
+    // 同义词词典在 **open 时**经 `CaskOptions::synonym_map` 配置（不可变、并发安全）；
+    // 运行期 setter 已移除（曾是配置项里唯一的竞态源，见 docs/design/thread-safety.md）。
 
     // 访问内部 SearchLayer（用于 NIF 层）。
     [[nodiscard]] bool has_search() const { return search_ != nullptr; }

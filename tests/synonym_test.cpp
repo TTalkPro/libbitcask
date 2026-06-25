@@ -86,23 +86,32 @@ TEST(SynonymMap, LoadFromFileEmptyLine) {
 }
 
 TEST(SearchLayerSynonym, SearchTextWithSynonym) {
+    // 基线（无同义词词典）：只命中 1 篇。
+    {
+        SearchLayerConfig config{
+            .analyzer_config = bitcask::text::AnalyzerConfig{
+                .type = bitcask::text::AnalyzerType::Whitespace},
+            .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+        };
+        SearchLayer layer(config);
+        layer.on_write("doc1", 0, "nyc is great", 1, 100, 50, 1000);
+        layer.on_write("doc2", 1, "automobile is great", 1, 200, 50, 1001);
+        auto r = layer.search_text("nyc", 10);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), 1u);
+    }
+    // S11：同义词词典经 open-time config 注入（不可变）→ 展开命中 2 篇。
+    auto sm = std::make_shared<SynonymMap>();
+    sm->add_group({"nyc", "automobile"});
     SearchLayerConfig config{
         .analyzer_config = bitcask::text::AnalyzerConfig{
             .type = bitcask::text::AnalyzerType::Whitespace},
-        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F},
+        .synonym_map = sm
     };
     SearchLayer layer(config);
-
     layer.on_write("doc1", 0, "nyc is great", 1, 100, 50, 1000);
     layer.on_write("doc2", 1, "automobile is great", 1, 200, 50, 1001);
-
-    auto result_before = layer.search_text("nyc", 10);
-    ASSERT_TRUE(result_before.has_value());
-    EXPECT_EQ(result_before->size(), 1u);
-
-    auto sm = std::make_unique<SynonymMap>();
-    sm->add_group({"nyc", "automobile"});
-    layer.set_synonym_map(std::move(sm));
 
     auto result_after = layer.search_text("nyc", 10);
     ASSERT_TRUE(result_after.has_value());
@@ -110,18 +119,18 @@ TEST(SearchLayerSynonym, SearchTextWithSynonym) {
 }
 
 TEST(SearchLayerSynonym, SearchTextWithSynonymViaAlias) {
+    auto sm = std::make_shared<SynonymMap>();
+    sm->add_group({"hi", "hello"});
     SearchLayerConfig config{
         .analyzer_config = bitcask::text::AnalyzerConfig{
             .type = bitcask::text::AnalyzerType::Whitespace},
-        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F},
+        .synonym_map = sm
     };
     SearchLayer layer(config);
 
     layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
 
-    auto sm = std::make_unique<SynonymMap>();
-    sm->add_group({"hi", "hello"});
-    layer.set_synonym_map(std::move(sm));
 
     auto result = layer.search_text("hi", 10);
     ASSERT_TRUE(result.has_value());
@@ -130,19 +139,19 @@ TEST(SearchLayerSynonym, SearchTextWithSynonymViaAlias) {
 }
 
 TEST(SearchLayerSynonym, PhraseSearchDoesNotExpand) {
+    auto sm = std::make_shared<SynonymMap>();
+    sm->add_group({"hi", "hello"});
     SearchLayerConfig config{
         .analyzer_config = bitcask::text::AnalyzerConfig{
             .type = bitcask::text::AnalyzerType::Whitespace},
-        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F},
+        .synonym_map = sm
     };
     SearchLayer layer(config);
 
     layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
     layer.on_write("doc2", 1, "hi world", 1, 200, 50, 1001);
 
-    auto sm = std::make_unique<SynonymMap>();
-    sm->add_group({"hi", "hello"});
-    layer.set_synonym_map(std::move(sm));
 
     auto result = layer.search_phrase("hi world", 10);
     ASSERT_TRUE(result.has_value());
@@ -151,19 +160,19 @@ TEST(SearchLayerSynonym, PhraseSearchDoesNotExpand) {
 }
 
 TEST(SearchLayerSynonym, NearSearchDoesNotExpand) {
+    auto sm = std::make_shared<SynonymMap>();
+    sm->add_group({"hi", "hello"});
     SearchLayerConfig config{
         .analyzer_config = bitcask::text::AnalyzerConfig{
             .type = bitcask::text::AnalyzerType::Whitespace},
-        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F},
+        .synonym_map = sm
     };
     SearchLayer layer(config);
 
     layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
     layer.on_write("doc2", 1, "hi world", 1, 200, 50, 1001);
 
-    auto sm = std::make_unique<SynonymMap>();
-    sm->add_group({"hi", "hello"});
-    layer.set_synonym_map(std::move(sm));
 
     auto result = layer.search_near("hi world", 0, 10);
     ASSERT_TRUE(result.has_value());
@@ -172,19 +181,19 @@ TEST(SearchLayerSynonym, NearSearchDoesNotExpand) {
 }
 
 TEST(SearchLayerSynonym, SearchFieldsWithSynonym) {
+    auto sm = std::make_shared<SynonymMap>();
+    sm->add_group({"nyc", "automobile"});
     SearchLayerConfig config{
         .analyzer_config = bitcask::text::AnalyzerConfig{
             .type = bitcask::text::AnalyzerType::Whitespace},
-        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F},
+        .synonym_map = sm
     };
     SearchLayer layer(config);
 
     layer.on_write("doc1", 0, "nyc is great", 1, 100, 50, 1000);
     layer.on_write("doc2", 1, "automobile is great", 1, 200, 50, 1001);
 
-    auto sm = std::make_unique<SynonymMap>();
-    sm->add_group({"nyc", "automobile"});
-    layer.set_synonym_map(std::move(sm));
 
     auto result = layer.search_fields("nyc", 10);
     ASSERT_TRUE(result.has_value());

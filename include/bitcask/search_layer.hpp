@@ -74,6 +74,10 @@ struct SearchLayerConfig {
     // V6.2:WAL 批量刷新阈值。1 = 即时模式(默认,与旧版行为完全一致)。
     // >1 时积攒 entries 缓冲后单次 fwrite+fflush,减少 sync 调用次数。
     std::size_t          wal_batch_size = 1;
+    // 同义词词典（open-time，不可变）。由 Cask::open 从 CaskOptions::synonym_map
+    // 透传进来（同 vector_dim 的注入方式）。构造后只读 → 并发查询安全，无需锁。
+    // 空 = 不展开同义词。
+    std::shared_ptr<const text::SynonymMap> synonym_map;
 };
 
 // 搜索结果条目。
@@ -247,7 +251,6 @@ public:
     search_text_highlight(std::string_view query, std::size_t k,
                           const HighlightOptions& opts = {}) const;
 
-    void set_synonym_map(std::unique_ptr<text::SynonymMap> map);
 
     // ---- V3.3:向量写入(IndexPool worker 线程,单写者)----
     // hnsw_ 存在且 vec.size()==配置 dim 才 insert;不符直接忽略(防御,
@@ -479,7 +482,10 @@ private:
     std::atomic<std::shared_ptr<vec::HnswIndex>> hnsw_;
     mutable SearchCache cache_;
     mutable DocTextLru  doc_texts_;
-    std::unique_ptr<text::SynonymMap> synonym_map_;
+    // S11：open-time 注入的不可变同义词词典（来自 SearchLayerConfig::synonym_map）。
+    // shared_ptr<const> → 构造后只读，并发查询安全；移除了运行期 set_synonym_map
+    // setter（曾是配置项里唯一的 reader-vs-writer 竞态源）。
+    std::shared_ptr<const text::SynonymMap> synonym_map_;
     // 注：查询并行用的「有界 Search 池」是**进程级共享**的（非 per-Cask），
     // 定义在 search_layer.cpp（search_arena()）。见 S7-2。
 };

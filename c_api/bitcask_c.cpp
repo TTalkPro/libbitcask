@@ -140,10 +140,10 @@ bitcask::CaskIter* as_cpp_iter(bitcask_iter_t* h) {
 
 extern "C" {
 
-BITCASK_API int bitcask_version_major(void) { return 2; }
-BITCASK_API int bitcask_version_minor(void) { return 2; }
+BITCASK_API int bitcask_version_major(void) { return 3; }
+BITCASK_API int bitcask_version_minor(void) { return 0; }
 BITCASK_API int bitcask_version_patch(void) { return 0; }
-BITCASK_API const char* bitcask_version_string(void) { return "2.2.0"; }
+BITCASK_API const char* bitcask_version_string(void) { return "3.0.0"; }
 
 BITCASK_API void bitcask_options_init(bitcask_options_t* opts) {
     if (!opts) return;
@@ -164,6 +164,7 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts) {
     opts->stop_words = nullptr;
     opts->min_token_length = 1;
     opts->enable_stemming = 0;
+    opts->synonym_file_path = nullptr;
     opts->vector_dim = 0;
     opts->vector_metric = BITCASK_VECTOR_METRIC_NONE;
     opts->vector_quantized = 0;
@@ -210,6 +211,22 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
             }
             cpp_opts.search_config = search_cfg;
             cpp_opts.enable_search = true;
+            // 同义词词典：open 时一次性加载（不可变、并发安全）。文件无法打开 →
+            // 干净拒绝（INVALID_OPTION），不静默忽略。
+            if (opts->synonym_file_path) {
+                auto sm = std::make_shared<text::SynonymMap>();
+                if (!sm->load_from_file(opts->synonym_file_path)) {
+                    if (fault) {
+                        fault->code = BITCASK_ERR_INVALID_OPTION;
+                        fault->errnum = 0;
+                        snprintf(fault->detail, BITCASK_DETAIL_MAX,
+                                 "synonym_file_path load failed: %s",
+                                 opts->synonym_file_path);
+                    }
+                    return BITCASK_ERR_INVALID_OPTION;
+                }
+                cpp_opts.synonym_map = std::move(sm);
+            }
         }
     }
 
@@ -506,23 +523,8 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
     return BITCASK_OK;
 }
 
-BITCASK_API bitcask_error_t bitcask_set_synonym_map(bitcask_t* cask,
-                                                       const char* path,
-                                                       bitcask_fault_t* fault) {
-    if (!cask || !path) return BITCASK_ERR_INVALID_OPTION;
-
-    auto map = std::make_unique<text::SynonymMap>();
-    if (!map->load_from_file(path)) {
-        if (fault) {
-            fault->code = BITCASK_ERR_IO;
-            fault->errnum = 0;
-            snprintf(fault->detail, BITCASK_DETAIL_MAX, "failed to load synonym map from: %s", path);
-        }
-        return BITCASK_ERR_IO;
-    }
-    as_cpp_cask(cask)->set_synonym_map(std::move(map));
-    return BITCASK_OK;
-}
+// 同义词词典已改为 open 时配置（bitcask_options_t::synonym_file_path）；
+// 运行期 bitcask_set_synonym_map 已移除。
 
 BITCASK_API void bitcask_search_result_free(bitcask_search_result_t* result) {
     if (!result) return;

@@ -680,6 +680,7 @@ Cask::create_search_infra(const CaskOptions& opts) {
     scfg.vector_dim = meta_config_.vector_dim;
     scfg.vector_metric = meta_config_.vector_metric;
     scfg.vector_inmem_int8 = meta_config_.vector_inmem_int8;  // P5b
+    scfg.synonym_map = opts.synonym_map;  // S11：Cask 级 open-time 同义词词典透传
     search_ = std::make_unique<search::SearchLayer>(scfg);
     // analyzer 构造失败（无效配置 / 分词器未注册 / 词典加载失败）则 analyzer_
     // 为空——决不能带病打开，否则首次带 text 的 put 段错误。干净拒绝。
@@ -1922,11 +1923,6 @@ std::expected<TextSearchResult, CaskFault>
 Cask::search_wildcard(std::string_view pattern, std::size_t k) {
     return run_search_one(/*require_vector=*/false,
         [&] { return search_->search_wildcard(pattern, k); });
-}
-
-// S8.2：设置同义词词典。
-void Cask::set_synonym_map(std::unique_ptr<text::SynonymMap> map) {
-    if (search_) search_->set_synonym_map(std::move(map));
 }
 
 std::expected<void, CaskFault> Cask::sync() {

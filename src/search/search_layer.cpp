@@ -60,6 +60,7 @@ SearchLayer::SearchLayer(const SearchLayerConfig& config)
     , analyzer_(text::AnalyzerFactory::create(config.analyzer_config))
     , cache_(config.cache_max_entries)
     , doc_texts_(config.doc_text_cache_max)
+    , synonym_map_(config.synonym_map)   // S11：open-time 不可变同义词词典
 {
     // V3.3:向量配置存在时创建 HNSW。metric 映射:cosine 已在写入端
     // 归一化 → kDot;kDot → kDot;kL2 → kL2。
@@ -851,11 +852,6 @@ void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
     fields.emplace_back(kDefaultField, text);
     auto job = map_analyze(key, ord, fields, file_id, offset, total_sz, tstamp);
     reduce_apply(job, {}, vector);
-}
-
-void SearchLayer::set_synonym_map(std::unique_ptr<text::SynonymMap> map) {
-    synonym_map_ = std::move(map);
-    cache_.invalidate();
 }
 
 // S3:批量恢复——并行 analyze + 串行有序插入（见头文件注释的正确性论证）。

@@ -164,6 +164,10 @@ typedef struct {
     const char* const* stop_words; // 自定义停用词表（NULL 结尾数组，NULL = 默认）
     uint32_t  min_token_length;  // 拉丁整词最小 codepoint 长度（默认 1）
     int       enable_stemming;   // 启用 Porter 词干提取
+    // 同义词词典文件（NULL = 不启用）。open 时一次性加载，构造后不可变 → 并发查询
+    // 安全。每行一组、逗号分隔，如 "番茄, 西红柿, tomato"。文件无法打开 → open 返
+    // BITCASK_ERR_INVALID_OPTION。运行期更换词典请重开库。
+    const char* synonym_file_path;
 
     // --- 向量 ---
     uint16_t  vector_dim;        // 向量维度（0 = 无向量）
@@ -390,11 +394,8 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
                                                      bitcask_search_result_t** out,
                                                      bitcask_fault_t* fault);
 
-// 设置同义词词典。
-// path: 同义词词典文件路径（NUL 结尾）。
-BITCASK_API bitcask_error_t bitcask_set_synonym_map(bitcask_t* cask,
-                                                      const char* path,
-                                                      bitcask_fault_t* fault);
+// 同义词词典已改为 **open 时配置**：见 bitcask_options_t::synonym_file_path
+//（不可变、并发查询安全；运行期 setter 已移除）。
 
 // 释放搜索结果
 BITCASK_API void bitcask_search_result_free(bitcask_search_result_t* result);

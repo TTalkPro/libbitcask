@@ -119,7 +119,7 @@
 | 读 与 写 并发 | 安全（near-real-time 可见性） | ✅ 已满足（注释保守） | W2 文档 |
 | 迭代器 | 每线程一个（同 std 容器迭代器） | ✅ 已满足 | 文档化 |
 | 关闭后误用 | fail-fast 而非 UB | ❌ UB | W3 |
-| 配置类（`set_synonym_map`）与查询并发 | 安全或明确「需先于并发配置」 | ⚠️ 未明确 | W2 审计 |
+| 同义词词典与查询并发 | 安全 | ✅ 已结构化为 open-time 不可变（`CaskOptions::synonym_map`，setter 已移除） | — |
 
 > 写吞吐说明（实测校准，见 §9）：**单写线程吞吐不受 `write_mu_` 影响**（uncontended
 > 锁 ~20ns ≪ pwrite）。**多写线程堆同一 handle 不提速、反降**——put 临界区极短
@@ -222,11 +222,14 @@
   `acquire` load 检查 → 已关闭返回 `kInvalidOption`。**best-effort fail-fast**：拒绝 close
   后**新发起**的调用；与 close **并发在途**的调用仍是 caller 责任（非完整 rundown）。
 
-### 7.10 配置（**非线程安全**）：`set_synonym_map`
-- **机制**：改 `synonym_map_`（`unique_ptr`）裸指针，而 `search_text`/`search_fields` 读它
-  → reader-vs-writer 竞态。**判定为配置类**：契约「须先于并发查询配置或外部串行化」。
-  不加锁的理由——加 `atomic<shared_ptr>` 会给「无 synonym」的查询热路径（常态）添每查询
-  原子开销，为罕见的动态重配不划算。
+### 7.10 同义词词典（**已结构化为 open-time 不可变**）
+- **演进**：曾有运行期 `set_synonym_map` setter（改 `synonym_map_` 裸指针 vs 查询读它 →
+  reader-vs-writer 竞态，W2 当时定为「配置类，须先于并发查询配置」）。
+- **现状（已落地）**：**移除 setter**，改为 `CaskOptions::synonym_map`
+  （`shared_ptr<const SynonymMap>`）/ C 侧 `synonym_file_path`，在 `Cask::open` 时注入
+  `SearchLayer`，构造后**不可变**。`synonym_map_` 类型 `unique_ptr` → `shared_ptr<const>`。
+  → **竞态从根上消除**（无写者）：契约从「文档口头约束」升级为「结构保证」；读路径
+  `if (synonym_map_) ...->expand(...)` 全程只读，零锁零 atomic。运行期换词典 = 重开库。
 
 ## 8. 落地子任务清单（实施 checklist）
 
@@ -251,8 +254,9 @@
 - [x] TSan 测试：`W2ConcurrentSearchAndWriteNoRace`（4 读线程 ×6 模式 + 2 写线程并发，零 race）。
 - [x] 订正搜索方法「线程安全:否」→「**是**（并发读安全）」;**连带订正 W1 后写方法**「否」→「是」;
       cask.hpp 顶部线程模型重写为「通用库 handle 多线程安全」。
-- [x] **`set_synonym_map` 审计**：定为**配置类**（加锁会给无 synonym 的查询热路径添 atomic 开销）→
-      契约「**须先于并发查询配置**或外部串行化」（注释 + 文档明示）。
+- [x] **同义词词典**：W2 当时定为「配置类，须先于并发查询配置」；**后续（2026-06-25）进一步
+      结构化**——移除运行期 `set_synonym_map` setter，改为 open-time 不可变 `CaskOptions::synonym_map`
+      （C 侧 `synonym_file_path`），竞态从根上消除（见 §7.10）。
 - [x] 契约**显眼化**：`doc/api-cpp.md` §9 汇总表全面订正 + §5.3/各方法注释;README 一行订正 + docs 表
       加本文指针。
 - [x] 写吞吐指引：文档明示「更高写并发 → 按目录分片多 Cask 实例」。
