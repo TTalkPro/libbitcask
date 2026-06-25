@@ -143,7 +143,90 @@
 读写并发 + fail-fast 生命周期」的常规契约。这是合格通用存储库的下限,不是过度
 工程。**
 
-## 7. 落地子任务清单（实施 checklist）
+## 7. 各接口线程安全实现机制
+
+逐组说明「触及哪些共享态 → 用什么同步原语保护 → 为何安全」。这是 api-cpp.md §9
+线程模型汇总表的实现依据。
+
+### 7.1 读：`get` / `get_owned`
+- **触及**：keydir（ord/定位查找）、`active_data_` 指针、`read_files_` 句柄缓存、
+  `DataFile::read`。
+- **机制**：
+  - keydir 查找 → 内部按 key hash **分片 `shared_mutex`**（256 分片，多读并发）。
+  - `active_data_` / `read_files_` 的读取在 **`read_cache_mu_` shared_lock** 下（写路径
+    的 roll/close_write_file 在同锁 unique_lock 下改它们）。
+  - 实际读盘 = **`pread(2)`**：无状态系统调用，每次显式传 offset，不依赖/不修改文件
+    位置 → 多线程并发 pread 同一 fd 安全。sealed 文件走 mmap 零拷贝（映射不可变）。
+- `get_owned` = `get` + `to_owned()`（拷贝），机制同 `get`。
+
+### 7.2 写：`put` / `remove` / `put_doc` / `sync` / `close_write_file`
+- **触及**：`active_data_`（`current_offset_`/`write_buf_`/`batch_buf_`）、`active_file_id_`、
+  `active_hint_`、`writes_since_sync_`、keydir put/remove、IndexPool 提交。
+- **机制**：
+  - **`write_mu_`（`std::mutex`）串行化整个写序列**——同一时刻仅一个写线程进入临界区。
+    这是 W1 的核心：把「调用方串行化」内化为「库内互斥」。
+  - 写线程内部再取 keydir 分片锁（put_overwrite，含原子 `ord`/`file_id` 的 LWW 冲突
+    解析，与并发 reader/merger 协调）+ roll 时取 `read_cache_mu_`。
+  - 索引提交走 **MPSC lock-free 队列** + per-lane **reorder buffer**（按 ord 序 apply，
+    天然容忍多写线程乱序到达——见 async-index-pipeline.md）。
+  - **锁序**：`write_mu_`（最外）→ `read_cache_mu_` / keydir；读路径不取 `write_mu_`
+    → 无反向依赖、无死锁；写方法互不内部调用 → 无递归锁。
+- 为何不损吞吐：data 是单 append WAL，文件层本就串行；锁 ~20ns ≪ pwrite/fsync。
+
+### 7.3 全文搜索：`search_text` / `phrase` / `near` / `bool` / `fields` / `fuzzy` / `wildcard`
+- **触及**：`SearchCache`（cache_）、`DocTextLru`（doc_texts_）、`InvertedIndex` 倒排、
+  `Index`（docmap/live/doc_len/ord_to_ext）、analyzer。
+- **机制**（全是「多读并发 + 写者经同锁协调」）：
+  - cache_ = **`shared_mutex`**（命中 shared_lock 读，put unique_lock）。
+  - doc_texts_ = **内置 `mutex`**（get/put 短临界区）。
+  - 倒排 = **`tbb::concurrent_hash_map` 分片** + 查询持引用零拷贝读快照
+    （写者 CoW，见 posting-zero-copy-design）。
+  - Index = **`shared_mutex`**（is_live/doc_len/ord_to_ext 读 shared_lock；
+    `fill_is_live`/`fill_doc_lens` 批量持锁数组直读）。
+  - analyzer = **const 纯函数**（cppjieba `Cut` const 线程安全）→ 无状态可并发。
+  - 与并发写（索引 reducer 单写线程改这些结构）经上述 shared_lock 协调；可见性
+    遵循 near-real-time（`prepare_search`→flush 覆盖调用前的写）。
+
+### 7.4 向量 / 混合：`search_vector` / `search_hybrid`
+- **机制**：HNSW 图 = **`std::atomic<std::shared_ptr<HnswIndex>>`**——查询开头 `load`
+  一次快照指针；merge 重建用「新图旁路构建 + 原子换指针」发布，旧图由在途读者的
+  `shared_ptr` 引用计数续命到查询结束。图遍历本身无锁（图节点不可变 + visited 用
+  `thread_local` 版本化数组，各线程独立）。`search_hybrid` = text 路 + vec 路串行 + RRF
+  融合，复用上述两路机制。
+
+### 7.5 批量：`search_*_batch`
+- **机制**：经 `search::parallel_for_queries` 跑在**进程级共享 `search_arena`**（TBB
+  `task_arena`，并发上限由 market 封顶 ≈hardware_concurrency）。每条查询是完整独立
+  单元、结果槽不重叠 → 无需额外锁，复用 7.3/7.4 的单查询读机制。
+
+### 7.6 `merge`
+- **机制**：写**自有 merge 输出文件**（不碰 `active_*`/`write_mu_`）；keydir 更新
+  （`on_relocate`）走 keydir 分片锁；与 put/search 经 keydir `shared_mutex` 协调。
+  跨进程经 **`merge.lock`**（`O_EXCL` 文件锁）与 live writer 的 `write.lock` 互不阻塞。
+
+### 7.7 迭代器：`CaskIter`
+- **机制**：`start()` 经 keydir **BarrierGuard** 拍 key 快照（frozen pending）；X1：复制
+  keydir `shared_ptr`（`keydir_pin_`）+ S13 pin 全部 data fd → **跨 close 存活**。`next()`
+  对每 key 取分片 shared_lock + pread。**同一 iter 是有状态游标（`cursor_`）→ 不可并发**；
+  不同 iter 各持独立快照 → 可并发。W3：close 后 `start()` 经 `parent_->is_closed()` fail-fast。
+
+### 7.8 `parallel_scan`
+- **机制**：① 串行阶段——一个 iter `drain_live_keys()` 快照 live key（仅 keydir proxy，
+  **不读 value**）。② 并发阶段——N 个 `std::thread` 各 `get()` 自己的不相交 key 段 + 调
+  `fn`。安全性 = 复用 7.1 的并发读机制 + 段不相交 + `fn` 由 caller 保证线程安全。
+
+### 7.9 生命周期：`closed_`（W3）
+- **机制**：`std::atomic<bool>`；`close()` 用 `exchange(true)`（兼幂等门）；公共方法入口
+  `acquire` load 检查 → 已关闭返回 `kInvalidOption`。**best-effort fail-fast**：拒绝 close
+  后**新发起**的调用；与 close **并发在途**的调用仍是 caller 责任（非完整 rundown）。
+
+### 7.10 配置（**非线程安全**）：`set_synonym_map`
+- **机制**：改 `synonym_map_`（`unique_ptr`）裸指针，而 `search_text`/`search_fields` 读它
+  → reader-vs-writer 竞态。**判定为配置类**：契约「须先于并发查询配置或外部串行化」。
+  不加锁的理由——加 `atomic<shared_ptr>` 会给「无 synonym」的查询热路径（常态）添每查询
+  原子开销，为罕见的动态重配不划算。
+
+## 8. 落地子任务清单（实施 checklist）
 
 ### W1 — 写路径互斥 ✅ 已完成（2026-06-25）
 - [x] `Cask` 加 `std::mutex write_mu_`（成员）。

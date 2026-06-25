@@ -45,7 +45,7 @@
 
 | # | 事实 | 出处 |
 |---|---|---|
-| F1 | `put_doc` 无写锁；写路径单线程是**调用方契约**，库内不强制 | `cask.hpp:11-16`、`data_file.hpp:20/87/102` |
+| F1 | ~~`put_doc` 无写锁；写路径单线程是**调用方契约**，库内不强制~~ → **S11-W1 已变更**：写路径由 `Cask::write_mu_` 内部串行化（同一 handle 多线程写安全）。reorder buffer 仍是必需（并行 map 致完成序乱，与本契约无关），见 design/thread-safety.md | `cask.cpp write_mu_`、`design/thread-safety.md` |
 | F2 | `ord = alloc_ord()` 在 put_doc 的**调用线程**上分配，紧接着 `submit` | `cask.cpp:1588 → 1621` |
 | F3 | `alloc_ord` = `next_ord_.fetch_add(1)`，密集递增 | `keydir.cpp:333-334` |
 | F4 | **单写线程下 submit 顺序天然 == ord 顺序** | F1 ∧ F2 ∧ F3 推论 |
