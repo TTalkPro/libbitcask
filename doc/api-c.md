@@ -518,18 +518,25 @@ void bitcask_flush_index(bitcask_t* cask);
 
 ## 14. 线程安全模型
 
-照搬头注释，与 C++ 核心一致：
+与 C++ 核心一致（S11：通用库，**同一 handle 多线程安全**）。C API 透传 `Cask` 的并发
+契约。**各接口实现机制详见 [`design/thread-safety.md`](design/thread-safety.md) §7。**
+图例：✅ 多线程安全；⚠️ 有条件/不安全（见备注）。
 
 | 操作 | 线程安全 |
 |------|---------|
-| `bitcask_open` / `bitcask_close` | 是（产生/销毁独立对象）|
-| `bitcask_get` | 是（读路径）|
-| `bitcask_search_vector` / `bitcask_search_hybrid` | 是（HNSW 读路径）|
-| `bitcask_put` / `bitcask_delete` / `bitcask_sync` / `bitcask_close_write_file` | **否**（caller 串行化）|
-| `bitcask_search_text` / `_phrase` / `_bool` / `_fields` / `_near` / `_fuzzy` / `_wildcard` | **否** |
-| `bitcask_set_synonym_map` | 否 |
-| `bitcask_iter_*` | **否**（同一 iter 不可并发使用）|
-| `bitcask_status` / `bitcask_needs_merge` / `bitcask_merge` / `bitcask_is_empty` / `bitcask_is_frozen` / `bitcask_flush_index` | 是 |
+| `bitcask_open` | ✅（产生独立对象）|
+| `bitcask_close` | ⚠️（生命周期：close 即 **free 句柄**，此后 handle 失效，caller 须保证无在途调用且不再使用）|
+| `bitcask_get` | ✅（读路径无锁）|
+| `bitcask_put` / `bitcask_delete` / `bitcask_sync` / `bitcask_close_write_file` | ✅（S11-W1：内部 `write_mu_` 串行化；同一 handle 多线程写安全。更高写并发 → 按目录分片多实例）|
+| `bitcask_search_text` / `_phrase` / `_bool` / `_fields` / `_near` / `_fuzzy` / `_wildcard` | ✅（并发读安全）|
+| `bitcask_search_vector` / `bitcask_search_hybrid` | ✅（HNSW 读路径）|
+| `bitcask_set_synonym_map` | ⚠️（配置类：须先于并发查询配置或外部串行化）|
+| `bitcask_iter_*` | ⚠️（同一 iter 不可并发；每线程一个迭代器）|
+| `bitcask_status` / `bitcask_needs_merge` / `bitcask_merge` / `bitcask_is_empty` / `bitcask_is_frozen` / `bitcask_flush_index` | ✅ |
+
+> 读写并发安全（搜索可见性 near-real-time）。merge 与读写并发（经 keydir shared_mutex 协调）。
+> 并行全表扫描（`Cask::parallel_scan`）是 C++-only API；C host 可自行多线程并发 `bitcask_get`
+> 达到等价效果（get 线程安全）。
 
 ---
 
