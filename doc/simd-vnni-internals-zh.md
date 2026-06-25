@@ -2,7 +2,7 @@
 
 记录 bitcask 量化距离内核用到的 SIMD 指令的底层运算逻辑。
 背景见 [int8-vnni-v4-zh.md](int8-vnni-v4-zh.md);内核实现见
-`include/bitcask/int8_kernels.hpp` 与 `src/vector/hnsw.cpp`。
+`include/bitcask/detail/int8_kernels.hpp` 与 `src/vector/hnsw.cpp`。
 
 ## 1. `_mm256_madd_epi16`:相邻配对乘加
 

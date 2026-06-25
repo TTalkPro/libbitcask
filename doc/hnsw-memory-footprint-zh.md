@@ -13,13 +13,16 @@
 
 ## 2. NodeChunk 每槽位内存布局
 
-`NodeChunk` 构造函数（`src/vector/hnsw.cpp:295-307`）对**每个槽位必定分配**以下成员。
-关键点：**int8 量化副本 `qcodes` 永远会分配**，即使不是 `inmem_int8` 模式（`hnsw.cpp:301`）。
+`NodeChunk` 构造函数（`src/vector/hnsw.cpp`）按需分配以下成员。
+关键点（**已订正**）：`qcodes` **仅当 `needs_qcodes_` 为真时分配**——即
+`inmem_int8` 或（有 VNNI 且 `metric==kDot`）。**无 VNNI 机器 / kL2 度量下 qcodes 不分配**
+（`needs_qcodes_ = inmem_int8 || (int8_dot_ != nullptr && metric==kDot)`）。下表「5D」基线
+仅适用于 VNNI+kDot 默认路径。
 
 | 成员 | 类型 | 字节/节点 | 说明 |
 |---|---|---|---|
 | `vecs`（f32 本体） | `float[dim]` | **4·D** | 仅 `needs_vecs = !inmem_int8` 时分配 |
-| `qcodes`（int8 量化） | `int8[dim]` | **D** | **永远分配** |
+| `qcodes`（int8 量化） | `int8[dim]` | **D** | 仅 `needs_qcodes_`（inmem_int8 或 VNNI+kDot）时分配 |
 | `qscales` | `float` | 4 | 每向量量化 scale |
 | `qsums` | `int32` | 4 | VNNI 偏置补偿 |
 | `ords` | `uint64` | 8 | ordinal / 文档序号 |
@@ -32,15 +35,17 @@
 
 ## 3. 邻接表（adjacency）
 
-分配逻辑（`hnsw.cpp:707-710`）：
+分配逻辑（`NodeChunk::alloc_adj`，bump-slab arena，**非**per-node vector）：
 
 ```cpp
 const std::size_t slots =
     (1 + cfg_.M * 2) + static_cast<std::size_t>(level) * (1 + cfg_.M);
-c->adj[slot].resize(slots);  // 定容，.data() 地址此后永不搬迁
+c->adj[slot] = chunk_arena.alloc(slots);  // uint32_t*，指向所属 chunk 的 arena，地址稳定
 ```
 
 - M = 16（默认），L0 容量 = `1 + 2M = 33` 槽，每个上层 = `1 + M = 17` 槽，每槽 4 字节（`uint32`）。
+- **arena bump 分配，无 per-node vector 外层句柄、无 per-node malloc 头开销**（下文按
+  「24B 外层句柄 + 16B malloc」估算的旧账已不适用——arena 把这些摊掉）。
 - 层级分布几何衰减：`P(level ≥ 1) ≈ 1/(M-1) ≈ 1/15`。约 **93.75%** 节点只有 L0（33×4 = 132B）。
 - 平均 ≈ 34 槽 ×4 + glibc malloc 开销（~16B）≈ **150B/节点**。
 - 内层 vector 仅对实际插入的节点（1M）分配，不按 1,048,576 槽过分配。

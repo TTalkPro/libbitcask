@@ -27,7 +27,15 @@ pread buffer (内核)
 
 ## 2. 设计方案
 
-### 2.1 GetResultView 结构
+> ⚠️ **后续演进（P6 sealed-mmap，见 [`sealed-mmap-read-design-zh.md`](sealed-mmap-read-design-zh.md)）**：
+> 本节描述的是 V6.1 **pread 单一所有权**路径（`storage_` 持 pread 数据）。P6 之后
+> `GetResultView` 增加了第二条 **mmap 锚定**所有权路径——多了 `std::shared_ptr<DataFile>
+> map_holder_`（锚定 sealed 文件映射）、`value_bytes_` span（指向映射）、`rec_type_`、
+> `vector_dequant_`（量化文档 dequant 缓冲）成员 + 一个 mmap 私有构造函数；spans 的派生
+> 统一收进 `derive_from_storage()`。故下文「无 shared_ptr / 无跨线程共享」仅适用于
+> pread 路径；当前结构以 `include/bitcask/cask.hpp` 的 `GetResultView` 定义为准。
+
+### 2.1 GetResultView 结构（V6.1 pread 路径）
 
 ```cpp
 // cask.hpp
@@ -201,5 +209,7 @@ out->ord    = r->ord;
   C API 路径通过 `bitcask_get_result_free` 显式释放，无需 GC 交互
 - **不改变 `DataFile::read()` 签名**——ReadRecord 返回 by value 已满足需求，
   move 进 GetResultView 是零开销的
-- **不做 mmap 零拷贝**——pread → vector 的拷贝（拷贝 1）暂不优化，
-  归入后续 V7+ 评估
+- ~~**不做 mmap 零拷贝**~~ —— **已在 P6 落地**（sealed 只读文件整文件 mmap，
+  `GetResultView` 持 `map_holder_` shared_ptr 锚定映射、`value_bytes_` 直指映射，
+  get 热路径零拷贝）。详见 [`sealed-mmap-read-design-zh.md`](sealed-mmap-read-design-zh.md)。
+  本 V6.1 设计的 pread 路径仍是非 sealed / 非 mmap 文件的回退路径。

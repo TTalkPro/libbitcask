@@ -20,8 +20,9 @@
 
 `bitcask_put` 在**调用方线程上同步执行**——单次 put 是确定的小工作量，
 不需要把控制权让出去。长耗时的 `merge` 由调用方自己决定：开一个
-worker 线程（或子进程）调 `bitcask_merge`，write 路径仍由调用方串行化
-（caller-side 锁，库内不做多写者同步）。
+worker 线程（或子进程）调 `bitcask_merge`。**写路径由库内 `write_mu_` 串行化
+（S11-W1）——同一 handle 多线程并发写安全，无需调用方串行化**；写本就串行
+（单 append WAL），更高写并发请按目录分片多实例。
 
 ---
 
@@ -61,7 +62,7 @@ worker 线程（或子进程）调 `bitcask_merge`，write 路径仍由调用方
    d. keydir 返回 kAlreadyExists（极少见的二段 race）→ roll_active + 重试一次；
       二次仍失败 → 上报 kAlreadyExists
 10. submit_index_task(IndexOp::Add, ...)
-    - 索引模式下入队 IndexPool（单 worker 异步 on_write）；无 IndexPool 则 no-op
+    - 索引模式下入队 IndexPool（**N 个 map worker 并行分词 + reducer 按 ord 序串行 apply**，S6-P4；registry 共享池）；无 IndexPool 则 no-op
     - 注意：put 路径**不**同步调 search_->on_write，全部异步（见 concurrency-zh §6）
 11. maybe_group_commit()
     - sync_every_n>0 且非 o_sync 时：累计写满 N 条 → active_data_->sync() 组提交
@@ -235,7 +236,7 @@ DocValue 编码将原始 value 打包为 `[Ver=3][Flags][Len:varint][text bytes]
 | `o_sync=1`                          | data + hint 都用 O_SYNC 打开，每次 write 写穿到磁盘       |
 | `sync_every_n=N`（非 o_sync）       | 每累计 N 条写后 `maybe_group_commit` 对 **active data** fsync 一次（组提交）；hint 不在此 fsync（可由 fold(data) 重建） |
 
-读路径是单调可见的：`keydir.put` 拿 `unique_lock` 串行化所有写者，
+读路径是单调可见的：`keydir.put` 拿**对应分片**的 `unique_lock`（kShards=256 把之一，非单一全局锁），
 put 返回后任何后续 `get(K)` 立刻能看到新值（即使 OS 还没刷盘——只要
 进程不死就有效）。
 

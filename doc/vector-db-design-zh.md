@@ -1,5 +1,16 @@
 # 向量库设计：在 Bitcask 引擎上原生扩展（BM25 + Embedding）
 
+> ⚠️ **本文是早期蓝图设计稿，部分 API/格式细节已与实现演进分叉**——架构思路
+> （单域引擎、BM25 倒排 + HNSW、混合检索）仍准确，但具体接口/持久化以现行代码与
+> API 文档为准：
+> - **API**：实际入口是 `Cask::put_doc` / `search_text` / `search_vector` /
+>   `search_hybrid`（见 [`api-cpp.md`](api-cpp.md)）；文中 `CaskOptions{...}` 旧字段、
+>   `upsert()→ord`、`remove()→bool`、`{fusion, w_text, w_vec}` 权重参数**均不存在**——
+>   RRF 融合是固定常数 c=60，无权重旋钮。
+> - **持久化**：文中「`bm25/seg-*.inv` + `hnsw/graph.ann` 分文件」已被**统一单文件
+>   `search.ckpt`**（P14e）取代，见 [`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)。
+> 实现地图见 [`cpp-arch.md`](cpp-arch.md)、磁盘格式见 [`format-zh.md`](format-zh.md)。
+
 本文是在当前 C++ Bitcask 引擎之上构建**混合检索向量库**的落地设计。
 配合 `doc/cpp-arch.md`（实现地图）、`doc/format-zh.md`（磁盘格式）阅读。
 
