@@ -1664,19 +1664,35 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     return {};
 }
 
+// S9-P2-d: 搜索层 SearchError → CaskFault 边界翻译（消除 expected<,string> 的
+// leaky abstraction）。当前三种都映射 kInvalidOption，但语义集中在此一处、
+// detail 文案由枚举确定性派生——新增搜索错误时只改这里，不必各 caller 猜 kind。
+static CaskFault search_fault(search::SearchError e) {
+    switch (e) {
+        case search::SearchError::kNoVectorIndex:
+            return err(CaskError::kInvalidOption, "no vector index configured");
+        case search::SearchError::kVectorDimMismatch:
+            return err(CaskError::kInvalidOption, "query vector dim mismatch");
+        case search::SearchError::kEmptyHybridQuery:
+            return err(CaskError::kInvalidOption,
+                       "hybrid query empty (no text, no vector)");
+    }
+    return err(CaskError::kInvalidOption, "unknown search error");
+}
+
 // S8-R3: 单条搜索公共骨架。flush → 可选 vector 校验 → 跑内核 → 包错误/结果。
 std::expected<TextSearchResult, CaskFault>
 Cask::run_search_one(
-    bool require_vector, CaskError err_kind,
+    bool require_vector,
     const std::function<
-        std::expected<std::vector<search::SearchHit>, std::string>()>& run) {
+        std::expected<std::vector<search::SearchHit>, search::SearchError>()>& run) {
     if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     if (require_vector && meta_config_.vector_dim == 0) {
         return std::unexpected(err(CaskError::kInvalidOption,
             "collection has no vector config"));
     }
     auto hits = run();
-    if (!hits) return std::unexpected(err(err_kind, hits.error()));
+    if (!hits) return std::unexpected(search_fault(hits.error()));
     return TextSearchResult{std::move(*hits)};
 }
 
@@ -1684,7 +1700,7 @@ Cask::run_search_one(
 std::expected<TextSearchResult, CaskFault>
 Cask::search_vector(std::span<const float> query, std::size_t k,
                      std::size_t ef, const meta::MetaFilter* filter) {
-    return run_search_one(/*require_vector=*/true, CaskError::kInvalidOption,
+    return run_search_one(/*require_vector=*/true,
         [&] { return search_->search_vector(query, k, ef, filter); });
 }
 
@@ -1693,7 +1709,7 @@ std::expected<TextSearchResult, CaskFault>
 Cask::search_hybrid(std::string_view text_query,
                      std::span<const float> vec_query, std::size_t k,
                      const meta::MetaFilter* filter) {
-    return run_search_one(/*require_vector=*/true, CaskError::kInvalidOption,
+    return run_search_one(/*require_vector=*/true,
         [&] { return search_->search_hybrid(text_query, vec_query, k, filter); });
 }
 
@@ -1701,7 +1717,7 @@ Cask::search_hybrid(std::string_view text_query,
 std::expected<TextSearchResult, CaskFault>
 Cask::search_text(std::string_view query, std::size_t k,
                   const meta::MetaFilter* filter) {
-    return run_search_one(/*require_vector=*/false, CaskError::kIo,
+    return run_search_one(/*require_vector=*/false,
         [&] { return search_->search_text(query, k, nullptr, filter); });
 }
 
@@ -1737,7 +1753,7 @@ Cask::search_text_batch(std::span<const std::string_view> queries,
     return run_search_batch(queries.size(), /*require_vector=*/false,
         [&](std::size_t i) -> std::expected<TextSearchResult, CaskFault> {
             auto hits = search_->search_text(queries[i], k, nullptr, filter);
-            if (!hits) return std::unexpected(err(CaskError::kIo, hits.error()));
+            if (!hits) return std::unexpected(search_fault(hits.error()));
             return TextSearchResult{std::move(*hits)};
         });
 }
@@ -1750,7 +1766,7 @@ Cask::search_vector_batch(std::span<const std::span<const float>> queries,
     return run_search_batch(queries.size(), /*require_vector=*/true,
         [&](std::size_t i) -> std::expected<TextSearchResult, CaskFault> {
             auto hits = search_->search_vector(queries[i], k, ef, filter);
-            if (!hits) return std::unexpected(err(CaskError::kInvalidOption, hits.error()));
+            if (!hits) return std::unexpected(search_fault(hits.error()));
             return TextSearchResult{std::move(*hits)};
         });
 }
@@ -1762,7 +1778,7 @@ Cask::search_hybrid_batch(std::span<const HybridQuery> queries,
     return run_search_batch(queries.size(), /*require_vector=*/true,
         [&](std::size_t i) -> std::expected<TextSearchResult, CaskFault> {
             auto hits = search_->search_hybrid(queries[i].text, queries[i].vec, k, filter);
-            if (!hits) return std::unexpected(err(CaskError::kInvalidOption, hits.error()));
+            if (!hits) return std::unexpected(search_fault(hits.error()));
             return TextSearchResult{std::move(*hits)};
         });
 }
@@ -1770,42 +1786,42 @@ Cask::search_hybrid_batch(std::span<const HybridQuery> queries,
 // search_phrase：BM25 短语模式搜索。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_phrase(std::string_view query, std::size_t k) {
-    return run_search_one(/*require_vector=*/false, CaskError::kIo,
+    return run_search_one(/*require_vector=*/false,
         [&] { return search_->search_phrase(query, k); });
 }
 
 // search_fields：BM25 多字段搜索（S8.6），支持 field:term^boost。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_fields(std::string_view query, std::size_t k) {
-    return run_search_one(/*require_vector=*/false, CaskError::kIo,
+    return run_search_one(/*require_vector=*/false,
         [&] { return search_->search_fields(query, k); });
 }
 
 // search_near：BM25 近邻搜索（S8.7）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_near(std::string_view query, std::uint32_t slop, std::size_t k) {
-    return run_search_one(/*require_vector=*/false, CaskError::kIo,
+    return run_search_one(/*require_vector=*/false,
         [&] { return search_->search_near(query, slop, k); });
 }
 
 // bool_search：BM25 布尔搜索（AND/OR/NOT）。
 std::expected<TextSearchResult, CaskFault>
 Cask::bool_search(std::string_view query, std::size_t k) {
-    return run_search_one(/*require_vector=*/false, CaskError::kIo,
+    return run_search_one(/*require_vector=*/false,
         [&] { return search_->bool_search(query, k); });
 }
 
 // S8.3：模糊搜索（Levenshtein 编辑距离匹配）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance) {
-    return run_search_one(/*require_vector=*/false, CaskError::kIo,
+    return run_search_one(/*require_vector=*/false,
         [&] { return search_->search_fuzzy(query, k, max_edit_distance); });
 }
 
 // S8.4：通配符搜索（* / ? 模式匹配）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_wildcard(std::string_view pattern, std::size_t k) {
-    return run_search_one(/*require_vector=*/false, CaskError::kIo,
+    return run_search_one(/*require_vector=*/false,
         [&] { return search_->search_wildcard(pattern, k); });
 }
 

@@ -486,7 +486,7 @@
   - 验证：每条 build + 全量 **469/469 ctest** + TSan（thread_pool 23 / batch 4）零 race +
     修改文件无新增告警，行为零变更（纯重构对拍）。
 
-- [ ] **S9 全代码库重构评估（6 准则）** — 全代码库审计（S8 仅覆盖 S6/S7 新代码，本轮扩展到全部）
+- [x] **S9 全代码库重构评估（6 准则）** ✅ 收尾（2026-06-25：P0/P1 全做 + P2 = 2 实现/1 跳过/2 搁置）— 全代码库审计（S8 仅覆盖 S6/S7 新代码，本轮扩展到全部）
   - **审计方法（2026-06-24）**：3 个并行 explore agent 扫描全代码库（架构/类层级 + RAII/锁 +
     代码重复）。指标快照：总 21853 行，raw new/delete 仅 6 处（4 HNSW 锁-free 必需、1 task_arena
     故意泄漏），smart pointer 96 处，std::thread 16 处（全 join）。注释密度：cask 23%、keydir 26%
@@ -541,25 +541,44 @@
     Checkpoint/Codec/DocValue/Inverted 共 177 例）。修改文件零新增告警。
     （注：`CApi.SmokeTest` 在 TSan 下有**预存** SEGV——已核实 stash 掉本轮全部改动后基线同样复现，
     与 P1 无关，属 C 测试 × TSan/.so 交互的历史问题。）
-  - [ ] **P2-a Cask god class 拆分（search 方法抽 SearchOps）** — `include/bitcask/cask.hpp`（694 行,
-    60+ 公有方法） + `src/cask/cask.cpp`（1993 行）
-    - 职责过多：KV facade + search facade + merge 协调 + 迭代器 + 读缓存 + 索引池。
-    - 建议：search_* 系列 15+ 方法抽到内部 `SearchOps` helper 类。Cask 保留 facade 角色。
-    - 风险：高（大重构，动核心 API）。
-  - [ ] **P2-b InvertedIndex god class 拆分（ScoringEngine + PostingManager）** — `src/bm25/inverted.cpp`（2049 行）
-    - 职责过多：BM25 评分 + Block-Max WAND + posting 管理 + WAL + compaction + 5 种搜索模式。
-    - 建议：抽 `ScoringEngine`（纯评分）+ `PostingManager`（posting 生命周期）。
-    - 风险：高（核心算法路径，需 bench 对拍）。
-  - [ ] **P2-c Analyzer 空文本基类默认实现** — `src/text/analyzer.cpp:167,271,312,358`
-    - 4 个子类 `analyze_with_positions` 开头都 `if (text.empty()) return {};`；基类加默认实现。
-    - 风险：低。
-  - [ ] **P2-d search 层 SearchError 枚举** — `src/search/search_layer.cpp`（返回 `expected<..., string>`）
-    vs `src/cask/cask.cpp`（返回 `expected<..., CaskFault>`）
-    - search 层定义 `SearchError` 枚举，cask 边界翻译为 CaskFault。消除 leaky abstraction。
-    - 风险：中（接口变更）。
-  - [ ] **P2-e 魔法数字具名常量** — `src/bm25/inverted.cpp`（`0xFFFFFFFF` sentinel 3 处）+ 分散页大小常量
-    - `0xFFFFFFFF` → `kInvalidPos`；`4096/65536/262144` → `format.hpp` 统一 `kPageSize4K` 等。
-    - 风险：低。
+  - [⛔] **P2-a Cask god class 拆分（search 方法抽 SearchOps）** — **搁置（用户决定，2026-06-25）**
+    - `include/bitcask/cask.hpp`（694 行,60+ 公有方法）+ `src/cask/cask.cpp`（1993 行）：KV facade +
+      search facade + merge 协调 + 迭代器 + 读缓存 + 索引池。
+    - **搁置理由**：高风险大重构、动核心 API、纯风格收益；现状可工作、TSan-clean。与本仓 S8 既定
+      准则「不强加继承/拆分，拆分反增耦合」一致。god class 是风格问题非正确性问题。
+  - [⛔] **P2-b InvertedIndex god class 拆分（ScoringEngine + PostingManager）** — **搁置（用户决定，2026-06-25）**
+    - `src/bm25/inverted.cpp`（2049 行）：BM25 评分 + Block-Max WAND + posting 管理 + WAL +
+      compaction + 5 种搜索模式。
+    - **搁置理由**：高风险（核心算法路径，需 bench 对拍防回归）、纯风格收益；现状高内聚、可工作、
+      TSan-clean。同 P2-a。
+  - [~] **P2-c Analyzer 空文本基类默认实现** — **跳过（评估后，2026-06-25）**
+    - 核实：`if (text.empty()) return {};` 仅在各子类 `analyze_with_positions` 开头各一行，且与紧随
+      其后的 `if (normalized.empty()) return {}`（`nfkc_fold("")` → 空）**语义冗余**——是省一次空
+      nfkc 调用的微守卫，非正确性必需。
+    - 唯一干净的去重是 NVI（公有非虚 wrapper 做空检查 + 受保护纯虚 `_impl`），但要改 4 个子类
+      （Ngram/Whitespace/Jieba/Stemming）的头+实现 + 公有虚接口，为消一行冗余守卫引入接口间接层，
+      **净负值**——与本仓「不强加继承/过度套模式」准则（S8 注）相悖。保留现状。
+  - [x] **P2-d search 层 SearchError 枚举** — `include/bitcask/search_layer.hpp`、`src/search/search_layer.cpp`、`include/bitcask/cask.hpp`、`src/cask/cask.cpp`、`tests/cask_docvalue_test.cpp`
+    - **已完成（2026-06-25）**：搜索层全部 `expected<vector<SearchHit/Ex>, std::string>`（10 个方法）→
+      `expected<…, SearchError>`（强类型枚举，仅 3 值：`kNoVectorIndex`/`kVectorDimMismatch`/
+      `kEmptyHybridQuery`，对应 search_layer.cpp 仅有的 3 处 `unexpected`）。Cask 边界新增
+      `search_fault(SearchError)→CaskFault` 翻译器，`run_search_one` **删掉 `err_kind` 参数**（caller 不再
+      静态猜 kind，9 个单查询方法 + 3 个 batch lambda 统一走 search_fault）。
+    - **行为等价**：三种 SearchError 当前都映射 `kInvalidOption`（与原 search_vector/hybrid 的
+      `err_kind=kInvalidOption` 一致；text 族原传 `kIo` 但从不报错——dead path 一并清除）。detail 文案
+      由枚举确定性派生，保持原字符串。测试断言（kInvalidOption × search_vector 无向量 / hybrid 维度不符 /
+      双空）全部仍成立。
+    - 验证：Release/Debug **474/474 ctest**；TSan 零 race（Inverted/SearchLayer/DocValue/Checkpoint 196 例）。
+    - 风险：中（接口变更）→ 实测零行为变更（纯类型强化 + 边界翻译集中化）。
+  - [x] **P2-e 魔法数字具名常量** — `src/bm25/inverted.cpp`（deserialize 读越界哨兵）
+    - **已完成（2026-06-25）**：`deserialize` 的 `read_u32/u64/u8` 越界哨兵 `0xFFFFFFFF` /
+      `0xFFFFFFFFFFFFFFFF` / `0xFF` → 具名 `kReadFail32/64/8`（函数局部 constexpr），下游 11 处
+      `== 0xFFFFFFFF` 短读判定改用具名常量，语义自解释。
+    - **原计划修正**：审计称「sentinel → kInvalidPos」+「4096/65536/262144 → kPageSize4K」**与实际不符**——
+      这些 0xFFFFFFFF 是**读越界/短读哨兵**（非「无效位置」，故名 kReadFail 而非 kInvalidPos）；且
+      inverted.cpp 内**根本不存在** 4096/65536/262144 页大小魔法数（65536 仅在 inverted_wal 的 term_len
+      校验上界 + hint_file 的 kChunk 局部，已具名/有上下文）。故只落实准确的子集。
+    - 验证：Release/Debug **474/474 ctest**（含 inverted serialize↔deserialize 全量 round-trip）。
   - **执行建议**：P0（4 项）风险最低、收益明确，优先实施。P1（4 项）次之。P2（5 项）含 god class
     拆分等高风险大重构，按需推进或永久搁置（现状可工作，god class 是风格问题非正确性问题）。
 
@@ -1039,7 +1058,9 @@
 
 **S9-P0 — 全部完成**：P0-a ✅（FieldSchema RAII）/ P0-b ✅（checkpoint RAII）/ P0-c ✅（kDefaultField 透明查找）/ P0-d ✅（byte_order.hpp 提取）。
 
-**S9-P1 — 全部完成（2026-06-25）**：P1-a ✅（C API make_unique + release/adopt）/ P1-b ✅（vbyte_encode 模板化去重）/ P1-c ✅（map_analyze/reduce_apply/serialize_docmap 注释）/ P1-d ✅（ThreadLocalBuffer 工具类）。**P2 保留**（含 god class 拆分等高风险大重构，按需推进或永久搁置）。
+**S9-P1 — 全部完成（2026-06-25）**：P1-a ✅（C API make_unique + release/adopt）/ P1-b ✅（vbyte_encode 模板化去重）/ P1-c ✅（map_analyze/reduce_apply/serialize_docmap 注释）/ P1-d ✅（ThreadLocalBuffer 工具类）。
+
+**S9-P2 — 收尾（2026-06-25）**：P2-c ⏭️ 跳过（空文本守卫冗余 + NVI 间接层净负值）/ P2-d ✅（SearchError 强类型枚举 + 边界翻译，去 leaky abstraction）/ P2-e ✅（deserialize 读越界哨兵具名 kReadFail*；原计划页大小常量经核实不存在）/ P2-a ⛔ 搁置 + P2-b ⛔ 搁置（god class 拆分，用户决定：高风险大重构、纯风格收益、动 TSan-clean 核心代码，永久搁置）。**S9 全部收尾**（P0/P1 完成，P2 = 2 实现 + 1 跳过 + 2 搁置）。
 
 **按需（C 梯队）**：A2 实测 <1%，C4（Block-Max MaxScore）暂不推荐（A2 同类优化未达预期）。C5/C6 与未来 v4 格式绑定。
 

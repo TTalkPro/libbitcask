@@ -604,13 +604,14 @@ private:
 
     // S8-R3: 单条搜索公共骨架（去 9 个 search_* 单查询方法的重复）。
     //   prepare_search()（flush）→ require_vector 时校验 vector_dim → run() 跑内核
-    //   → 失败包 err_kind（text 族 kIo / 向量族 kInvalidOption）→ 包成 TextSearchResult。
-    // run() 返回 SearchLayer 内核的 expected<vector<SearchHit>, string>。
+    //   → 失败经 search_fault 把 SearchError 翻译成 CaskFault → 包成 TextSearchResult。
+    // S9-P2-d：run() 返回 expected<vector<SearchHit>, SearchError>（强类型错误），
+    //   不再由 caller 静态指定 err_kind——边界统一翻译，消除 leaky abstraction。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     run_search_one(
-        bool require_vector, CaskError err_kind,
+        bool require_vector,
         const std::function<
-            std::expected<std::vector<search::SearchHit>, std::string>()>& run);
+            std::expected<std::vector<search::SearchHit>, search::SearchError>()>& run);
 
     // A4:落 keydir 段快照(best-effort;close/merge 末尾调)。
     void write_keydir_snapshot() noexcept;

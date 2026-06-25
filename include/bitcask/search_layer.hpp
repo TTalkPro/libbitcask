@@ -83,6 +83,17 @@ struct SearchHit {
     double        score; // BM25 分数
 };
 
+// S9-P2-d：搜索层错误类型。此前各搜索方法返回 `expected<…, std::string>`，
+// 把错误语义压成自由文本，迫使 Cask 边界**静态猜** CaskError 种类（leaky
+// abstraction）。改为强类型枚举：搜索层只表达「发生了哪类错误」，由 Cask 边界
+// （cask.cpp `search_fault`）翻译成 CaskFault（kind + 人类可读 detail）。
+// 全部三种当前都映射到 CaskError::kInvalidOption（见 search_fault）。
+enum class SearchError {
+    kNoVectorIndex,       // 无向量索引配置（hnsw_ 为空）
+    kVectorDimMismatch,   // 查询向量维度与配置不符
+    kEmptyHybridQuery,    // hybrid 两路皆空（无文本、无向量）
+};
+
 // 带高亮的搜索结果。
 struct SearchHitEx {
     std::string              key;
@@ -189,27 +200,27 @@ public:
     // params_override 非空时按查询覆盖默认 BM25 k1/b（S8.5）。
     // V5:filter 非空时从倒排 overfetch K'=max(k×4, 64) 再过滤截断到 k;
     // 因为 BM25 评分的得分排序在 filter 之前,需要更多候选弥补过滤损耗。
-    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    [[nodiscard]] std::expected<std::vector<SearchHit>, SearchError>
     search_text(std::string_view query, std::size_t k,
                 const bm25::Bm25Params* params_override = nullptr,
                 const meta::MetaFilter* filter = nullptr) const;
 
     // ---- 搜索（短语模式）----
-    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    [[nodiscard]] std::expected<std::vector<SearchHit>, SearchError>
     search_phrase(std::string_view query, std::size_t k,
                   const bm25::Bm25Params* params_override = nullptr) const;
 
     // ---- 搜索（近邻模式，S8.7）----
     // term 按 query 词序出现且相邻间隙 ≤ slop。slop=0 等价短语。
-    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    [[nodiscard]] std::expected<std::vector<SearchHit>, SearchError>
     search_near(std::string_view query, std::uint32_t slop, std::size_t k,
                 const bm25::Bm25Params* params_override = nullptr) const;
 
-    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    [[nodiscard]] std::expected<std::vector<SearchHit>, SearchError>
     bool_search(std::string_view query, std::size_t k,
                 const bm25::Bm25Params* params_override = nullptr) const;
 
-    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    [[nodiscard]] std::expected<std::vector<SearchHit>, SearchError>
     search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance,
                  const bm25::Bm25Params* params_override = nullptr) const;
 
@@ -217,11 +228,11 @@ public:
     // 解析 `field:term^boost` 语法：有字段限定的词查对应字段索引，无限定的词
     // 查默认字段；各词得分 × boost，同一文档跨字段累加；返回 top-k。
     // 不含字段语法时等价于在默认字段做词袋搜索。
-    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    [[nodiscard]] std::expected<std::vector<SearchHit>, SearchError>
     search_fields(std::string_view query, std::size_t k,
                   const bm25::Bm25Params* params_override = nullptr) const;
 
-    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    [[nodiscard]] std::expected<std::vector<SearchHit>, SearchError>
     search_wildcard(std::string_view pattern, std::size_t k,
                     const bm25::Bm25Params* params_override = nullptr) const;
 
@@ -232,7 +243,7 @@ public:
             const bm25::Bm25Params* params_override = nullptr) const;
 
     // ---- 搜索（带高亮）----
-    [[nodiscard]] std::expected<std::vector<SearchHitEx>, std::string>
+    [[nodiscard]] std::expected<std::vector<SearchHitEx>, SearchError>
     search_text_highlight(std::string_view query, std::size_t k,
                           const HighlightOptions& opts = {}) const;
 
@@ -259,7 +270,7 @@ public:
     // V5:filter 非空时与 is_live 组合为 HNSW live callback — 拒节点从
     // 图遍历源头就不入候选集,无需 overfetch。结果可能少于 k(filter
     // 通过率低时),符合「filter 收紧 live」语义。
-    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    [[nodiscard]] std::expected<std::vector<SearchHit>, SearchError>
     search_vector(std::span<const float> query, std::size_t k,
                   std::size_t ef = 0,
                   const meta::MetaFilter* filter = nullptr) const;
@@ -275,7 +286,7 @@ public:
     // V5:filter 同时作用于两条路(text 路 overfetch 后过滤;vec 路
     // 折进 HNSW live callback);只有同时通过两路 filter 的文档进 RRF 融合。
     // 线程安全:同两条内核(text 路同 search_text,vec 路同 search_vector)。
-    [[nodiscard]] std::expected<std::vector<SearchHit>, std::string>
+    [[nodiscard]] std::expected<std::vector<SearchHit>, SearchError>
     search_hybrid(std::string_view text_query,
                   std::span<const float> vec_query, std::size_t k,
                   const meta::MetaFilter* filter = nullptr) const;

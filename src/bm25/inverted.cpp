@@ -1868,16 +1868,22 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
     const std::byte* d = bytes.data();
     const std::size_t n = bytes.size();
     std::size_t pos = 0;
+    // S9-P2-e：读越界哨兵——read_u* 越界时返回全 1，下游 `== kReadFail*` 比较捕获
+    // 短读（同旧 fread 短读语义）。正常的 count/len 字段不会取到全 1（更有后续
+    // `> kMax…` 上界校验兜底），故全 1 作哨兵无歧义。
+    constexpr std::uint32_t kReadFail32 = 0xFFFFFFFFu;
+    constexpr std::uint64_t kReadFail64 = 0xFFFFFFFFFFFFFFFFull;
+    constexpr std::uint8_t  kReadFail8  = 0xFFu;
     auto read_u32 = [&]() -> std::uint32_t {
-        if (pos + 4 > n) return 0xFFFFFFFF;
+        if (pos + 4 > n) return kReadFail32;
         std::uint32_t v; std::memcpy(&v, d + pos, 4); pos += 4; return v;
     };
     auto read_u64 = [&]() -> std::uint64_t {
-        if (pos + 8 > n) return 0xFFFFFFFFFFFFFFFF;
+        if (pos + 8 > n) return kReadFail64;
         std::uint64_t v; std::memcpy(&v, d + pos, 8); pos += 8; return v;
     };
     auto read_u8 = [&]() -> std::uint8_t {
-        if (pos + 1 > n) return 0xFF;
+        if (pos + 1 > n) return kReadFail8;
         std::uint8_t v = static_cast<std::uint8_t>(d[pos]); pos += 1; return v;
     };
     // 读 len 字节进 dst;越界返回 false(同旧 fread 短读失败)。
@@ -1905,17 +1911,17 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
 
     for (auto& shard : shards_) {
         auto term_count = read_u32();
-        if (term_count == 0xFFFFFFFF) { return false; }
+        if (term_count == kReadFail32) { return false; }
 
         for (std::uint32_t t = 0; t < term_count; ++t) {
             auto tlen = read_u32();
-            if (tlen == 0xFFFFFFFF || tlen > 1024) { return false; }
+            if (tlen == kReadFail32 || tlen > 1024) { return false; }
 
             std::string term(tlen, '\0');
             if (!read_bytes(term.data(), tlen)) return false;
 
             auto pc = read_u32();
-            if (pc == 0xFFFFFFFF || pc > kMaxPostingsPerTerm) {
+            if (pc == kReadFail32 || pc > kMaxPostingsPerTerm) {
                 return false;
             }
 
@@ -1924,7 +1930,7 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
 
             // v6：ord 走 FOR 块压缩。
             auto ord_block_count = read_u32();
-            if (ord_block_count == 0xFFFFFFFF) { return false; }
+            if (ord_block_count == kReadFail32) { return false; }
             if (ord_block_count != ((pc + kBlock - 1) / kBlock)) {
                 return false;
             }
@@ -1932,7 +1938,7 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
                 auto frame = read_u64();
                 auto bits  = read_u8();
                 auto packed_len = read_u32();
-                if (frame == 0xFFFFFFFFFFFFFFFF || packed_len == 0xFFFFFFFF) {
+                if (frame == kReadFail64 || packed_len == kReadFail32) {
                     return false;
                 }
                 std::size_t start = static_cast<std::size_t>(b) * kBlock;
@@ -1951,7 +1957,7 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
             // v6：TFs 整组 VByte 解码。
             {
                 auto tf_csize = read_u32();
-                if (tf_csize == 0xFFFFFFFF) { return false; }
+                if (tf_csize == kReadFail32) { return false; }
                 std::vector<std::uint8_t> tf_buf(tf_csize);
                 if (tf_csize > 0 && !read_bytes(tf_buf.data(), tf_csize)) {
                     return false;
@@ -1968,7 +1974,7 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
             // v6：dls 整组 VByte 解码。
             {
                 auto dl_csize = read_u32();
-                if (dl_csize == 0xFFFFFFFF) { return false; }
+                if (dl_csize == kReadFail32) { return false; }
                 std::vector<std::uint8_t> dl_buf(dl_csize);
                 if (dl_csize > 0 && !read_bytes(dl_buf.data(), dl_csize)) {
                     return false;
@@ -1985,11 +1991,11 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
             // positions：与 v4+ 同——每 posting (u32 个数 + u32 压缩字节数 + 字节流)。
             for (std::uint32_t p = 0; p < pc; ++p) {
                 auto posc = read_u32();
-                if (posc == 0xFFFFFFFF || posc > kMaxPositionsPerPosting) {
+                if (posc == kReadFail32 || posc > kMaxPositionsPerPosting) {
                     return false;
                 }
                 auto csize = read_u32();
-                if (csize == 0xFFFFFFFF) { return false; }
+                if (csize == kReadFail32) { return false; }
                 std::vector<std::uint8_t> comp(csize);
                 if (csize > 0 && !read_bytes(comp.data(), csize)) {
                     return false;
@@ -2004,7 +2010,7 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
 
             // Block-Max WAND 元数据：保持 v5 结构。
             auto block_count = read_u32();
-            if (block_count == 0xFFFFFFFF || block_count > kMaxBlocksPerTerm) {
+            if (block_count == kReadFail32 || block_count > kMaxBlocksPerTerm) {
                 return false;
             }
             pl.blocks.resize(block_count);

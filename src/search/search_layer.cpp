@@ -208,7 +208,7 @@ inline void scale_query(float* dst, const float* src, float inv, std::size_t n) 
 
 }  // namespace
 
-std::expected<std::vector<SearchHit>, std::string>
+std::expected<std::vector<SearchHit>, SearchError>
 SearchLayer::search_vector(std::span<const float> query, std::size_t k,
                            std::size_t ef,
                            const meta::MetaFilter* filter) const {
@@ -216,10 +216,10 @@ SearchLayer::search_vector(std::span<const float> query, std::size_t k,
     // (旧图被换出后由本地 shared_ptr 引用计数续命到查询结束)。
     auto hnsw = hnsw_.load(std::memory_order_acquire);
     if (!hnsw) {
-        return std::unexpected("no vector index configured");
+        return std::unexpected(SearchError::kNoVectorIndex);
     }
     if (query.size() != config_.vector_dim) {
-        return std::unexpected("query vector dim mismatch");
+        return std::unexpected(SearchError::kVectorDimMismatch);
     }
     // cosine:查询向量同样入口归一化(hnsw-design §1);零向量无方向,
     // 返回空结果(写入端零向量被拒,查询端宽容)。
@@ -264,14 +264,14 @@ SearchLayer::search_vector(std::span<const float> query, std::size_t k,
     return hits;
 }
 
-std::expected<std::vector<SearchHit>, std::string>
+std::expected<std::vector<SearchHit>, SearchError>
 SearchLayer::search_hybrid(std::string_view text_query,
                            std::span<const float> vec_query,
                            std::size_t k,
                            const meta::MetaFilter* filter) const {
     // 两路都空才报错;单路空 = 退化为另一路的 RRF 重打分(hnsw-design §4)。
     if (text_query.empty() && vec_query.empty()) {
-        return std::unexpected("hybrid query empty (no text, no vector)");
+        return std::unexpected(SearchError::kEmptyHybridQuery);
     }
     const std::size_t kp = std::max<std::size_t>(k * 4, 64);  // K'
 
@@ -578,7 +578,7 @@ void SearchLayer::on_relocate(std::string_view key, std::uint64_t ord,
                        slot->doc_len});
 }
 
-std::expected<std::vector<SearchHit>, std::string>
+std::expected<std::vector<SearchHit>, SearchError>
 SearchLayer::search_text(std::string_view query, std::size_t k,
                          const bm25::Bm25Params* params_override,
                          const meta::MetaFilter* filter) const {
@@ -634,7 +634,7 @@ SearchLayer::search_text(std::string_view query, std::size_t k,
     return hits;
 }
 
-std::expected<std::vector<SearchHit>, std::string>
+std::expected<std::vector<SearchHit>, SearchError>
 SearchLayer::search_phrase(std::string_view query, std::size_t k,
                            const bm25::Bm25Params* params_override) const {
     // S10-A1:缓存检查前置（同 search_text）。
@@ -678,7 +678,7 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k,
     return hits;
 }
 
-std::expected<std::vector<SearchHit>, std::string>
+std::expected<std::vector<SearchHit>, SearchError>
 SearchLayer::search_near(std::string_view query, std::uint32_t slop, std::size_t k,
                          const bm25::Bm25Params* params_override) const {
     // 近邻依赖查询词序：用 analyze_with_positions 取每词 position，按 position 排序，
@@ -709,7 +709,7 @@ SearchLayer::search_near(std::string_view query, std::uint32_t slop, std::size_t
     return hits;
 }
 
-std::expected<std::vector<SearchHit>, std::string>
+std::expected<std::vector<SearchHit>, SearchError>
 SearchLayer::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance,
                           const bm25::Bm25Params* params_override) const {
     auto term_freqs = analyzer_->analyze(query);
@@ -735,7 +735,7 @@ SearchLayer::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t m
     return hits;
 }
 
-std::expected<std::vector<SearchHit>, std::string>
+std::expected<std::vector<SearchHit>, SearchError>
 SearchLayer::bool_search(std::string_view query, std::size_t k,
                          const bm25::Bm25Params* params_override) const {
     // S10-A1:缓存检查前置（同 search_text）。
@@ -794,7 +794,7 @@ SearchLayer::explain(std::string_view query, std::string_view key,
     return inv->explain(terms, slot->ord, index_, params_override);
 }
 
-std::expected<std::vector<SearchHit>, std::string>
+std::expected<std::vector<SearchHit>, SearchError>
 SearchLayer::search_wildcard(std::string_view pattern, std::size_t k,
                              const bm25::Bm25Params* params_override) const {
     std::vector<bm25::SearchResult> results;
@@ -811,7 +811,7 @@ SearchLayer::search_wildcard(std::string_view pattern, std::size_t k,
     return hits;
 }
 
-std::expected<std::vector<SearchHit>, std::string>
+std::expected<std::vector<SearchHit>, SearchError>
 SearchLayer::search_fields(std::string_view query, std::size_t k,
                            const bm25::Bm25Params* params_override) const {
     auto qnode = bitcask::bm25::parse_query(query);
@@ -1060,7 +1060,7 @@ std::size_t SearchLayer::compact(double dead_ratio_threshold) {
     return total;
 }
 
-std::expected<std::vector<SearchHitEx>, std::string>
+std::expected<std::vector<SearchHitEx>, SearchError>
 SearchLayer::search_text_highlight(std::string_view query, std::size_t k,
                                    const HighlightOptions& opts) const {
     auto term_freqs = analyzer_->analyze(query);

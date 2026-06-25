@@ -268,7 +268,8 @@ TEST_F(CaskDocValueTest, SearchTextAfterPut) {
     search->on_write("testkey", 0, "hello world", 1, 100, 50, 1000);
 
     auto r1 = search->search_text("hello", 10);
-    ASSERT_TRUE(r1) << "search_text failed: " << r1.error();
+    ASSERT_TRUE(r1) << "search_text failed: SearchError="
+                    << static_cast<int>(r1.error());
     EXPECT_EQ(r1->size(), 1u);
 
     auto sr = (*c)->search_text("hello", /*k*/ 10);
