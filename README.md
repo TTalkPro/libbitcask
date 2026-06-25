@@ -196,7 +196,7 @@ if (bitcask_get(cask, key, &res, NULL) == BITCASK_OK) {
 bitcask_close(cask);
 ```
 
-C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_fault_t` 详情、二进制安全 `{data, size}` 切片。线程模型与 C++ 核心一致（读路径线程安全、写路径需 caller 串行化）。
+C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_fault_t` 详情、二进制安全 `{data, size}` 切片。线程模型与 C++ 核心一致（同一 handle 多线程安全：读并发无锁、写由内部 `write_mu_` 串行化；例外见下）。
 
 ---
 
@@ -250,6 +250,7 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 | [`cpp-arch.md`](doc/cpp-arch.md) | 架构 |
 | [`format-zh.md`](doc/format-zh.md) | 字节级格式 |
 | [`concurrency-zh.md`](doc/concurrency-zh.md) | 锁与并发 |
+| [`design/thread-safety.md`](docs/design/thread-safety.md) | 线程安全契约（通用 C++ 库：handle 多线程安全） |
 | [`hnsw-design-zh.md`](doc/hnsw-design-zh.md) | HNSW 设计 |
 | [`recovery-unified-checkpoint-design-zh.md`](doc/recovery-unified-checkpoint-design-zh.md) | 恢复 / checkpoint 设计 |
 

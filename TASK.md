@@ -1091,3 +1091,98 @@
 > （a）Cask facade / search_layer / codec 热路径分配拷贝；（b）BM25/HNSW 算法与内存
 > 布局；（c）Bitcask/BM25/HNSW SOTA 文献对比。直接审计补充：posix_file / merger /
 > highlighter / synonym_map / search_cache。所有发现均与 TASK.md 既有项交叉去重。
+
+---
+
+## 待办：第十一梯队（S11 线程安全化 — 通用 C++ 库定位，2026-06-25）
+
+> **定向**：libbitcask 作为**通用 C++ 库**，而非仅服务 Erlang/NIF「一进程一 Cask」
+> 模型。该定位下「同一 handle 多线程安全」从可选变为契约——通用用户默认期望它，
+> 会在并发写时静默损坏数据的存储库不合格。设计稿 `docs/design/thread-safety.md`。
+>
+> **当前唯一真实安全缺口 = 多线程写同一 handle**（writer-vs-writer：`DataFile`
+> 的 `current_offset_`/`write_buf_`/`batch_buf_`、`writes_since_sync_` 无保护）。
+> 读路径（get/搜索）已结构级并发安全（S6/S7 TSan 已证）；keydir + 索引池
+> （S6 reorder buffer 支持任意到达序按 ord apply）早为并发写就绪——W1 只补
+> 「active 文件写序列」这最后一块。
+>
+> **否决**：细粒度写并发（预分配 offset + 并发 pwrite）——data 是单 append WAL，
+> 写在文件层本就串行、IO-bound，串行化非瓶颈；高风险换不到吞吐。更高写并发 →
+> 按目录分片多 Cask 实例（横向扩展）。
+
+- [x] **W1 写路径内部串行化（核心）** — `include/bitcask/cask.hpp`、`src/cask/cask.cpp`、`tests/crash_recovery_test.cpp`
+  - **已完成（2026-06-25）**：加 `std::mutex write_mu_`，在 `put`/`remove`/`put_doc`/`sync`/
+    `close_write_file` 入口 `lock_guard`（覆盖内部 `ensure_active_writer`/`roll_active`/
+    `maybe_group_commit`/`write_and_keydir` 全序列）。把「外部串行契约」内化为「内部互斥」→
+    同一 handle 多线程写安全。
+  - **关键修正（实施时核实）**：`flush_index` **不纳入** write_mu_——经核实它被 `prepare_search()`
+    （**读/搜索路径**）调用，上锁会让搜索串行化；且 IndexPool flush 自带 cv 同步本就线程安全。
+    锁集最终 = 5 个真写方法（put/remove/put_doc/sync/close_write_file）。
+  - **merge 交互审计**：核实 `merge()` 不触 `active_*`/DataFile 成员（写自有输出文件，经 keydir
+    `shared_mutex` 协调）→ **不纳入 write_mu_**，与写并发不变。`FieldSchema::intern` 已自带
+    `shared_mutex`（读写安全）→ 无新增 reader-vs-writer 缺口。
+  - **锁序确认**：`write_mu_` 最外层 → 内部再取 `read_cache_mu_`（roll/close_write_file）；读路径
+    （get/search）**不**取 write_mu_（保持无锁/共享锁）→ 无反向依赖、无死锁。无递归锁（写方法
+    互不内部调用）。
+  - 吞吐不变（写本就串行，锁 ~20ns ≪ pwrite/fsync µs–ms）。C API 自动受益（包装 Cask）。
+  - **验证**：新增 `ConcurrentWritersSharedCaskNoCorruption`（8 线程共享 handle 并发 put + remove，
+    互不相交 key 段，重开逐键校验）。Release/Debug **475/475 ctest**；**TSan 零 race**（95 例并发
+    套件含本测试）；**已实证移除 write_mu_ 后该测试 TSan 必报 data race**（active_data_/
+    current_offset_/DataFile::size）→ 确为真护栏。
+  - 风险：低（串行化把契约内化，读路径不动，全量 + TSan 对拍）。
+- [x] **W2 读/搜索并发确认 + 注释订正 + 配置类审计** — `include/bitcask/cask.hpp`、`doc/api-cpp.md`、`README.md`、`tests/cask_docvalue_test.cpp`
+  - **已完成（2026-06-25）**：
+    - **TSan 测试** `W2ConcurrentSearchAndWriteNoRace`：4 读线程轮转 6 种搜索模式
+      （text/phrase/bool/fields/vector/hybrid）+ 2 写线程并发 put_doc/remove 同一 handle →
+      **TSan 零 race**（读路径并发安全 + W1 后读写并发安全实证）。
+    - **注释订正（含 W1 连带）**：`cask.hpp` 顶部线程模型重写为「通用 C++ 库 handle 多线程安全」；
+      写方法（put/remove/put_doc/sync/close_write_file）「线程安全:否」→「**是**（W1 write_mu_）」；
+      搜索方法（text/phrase/bool/fields/near/fuzzy/wildcard）「否（保守）」→「**是**（并发读安全）」；
+      search_text_batch 去掉「不得并发写」过时 caveat。
+    - **`set_synonym_map` 审计**：判定为**配置类**——加锁会给查询热路径（无 synonym 的常态）添
+      atomic 开销，不划算；定为「**须先于并发查询配置**或外部串行化」契约（注释 + 文档明示）。
+    - **契约显眼化**：`doc/api-cpp.md` §9 线程模型汇总表全面订正（写=是、搜索=是、merge 与读写并发、
+      set_synonym_map=配置类）+ §5.3 写节头 + 各方法注释；README 线程模型一行订正 + docs 表加
+      `design/thread-safety.md` 指针；写吞吐指引「更高写并发 → 按目录分片」写入文档。
+  - 验证：Release/Debug **476/476 ctest**（475 + 1）；TSan 零 race（CaskDocValue/CrashRecovery/
+    SearchLayer 110 例）。纯文档 + 1 测试，零行为变更。
+  - 风险：零。
+- [x] **W3 生命周期硬化（close fail-fast）** — `include/bitcask/cask.hpp`、`src/cask/cask.cpp`、`doc/api-cpp.md`、`tests/crash_recovery_test.cpp`
+  - **已完成（2026-06-25）**：加 `std::atomic<bool> closed_` + `is_closed()` helper。`close()` 顶
+    `closed_.exchange(true)`（兼作**幂等门**——二次 close 直接返回）。公共方法入口 fail-fast：
+    - 数据面（get/put/remove/put_doc/sync/close_write_file/merge）→ `unexpected(kInvalidOption,
+      "cask is closed")`；
+    - 搜索集中在 `run_search_one`/`run_search_batch` 两处守（覆盖 9 单 + 3 batch）；
+    - 内省（status/needs_merge/is_empty_estimate/is_frozen）→ 安全默认值（不解引用空 keydir_）；
+    - `CaskIter::start` 守 `parent_->is_closed()`（close 后建/启迭代器 fail-fast）。
+  - **范围（诚实）**：best-effort 防误用——拒绝 close **后新发起**的调用;与 close **并发在途**
+    的调用仍是 caller 责任（契约：close 时刻无在途操作）。**不做完整 rundown**（成本高、价值低）。
+    `get_owned` 经 `get()` 透明覆盖;`read_handle_count` 天然返回 0（read_files_ 已 clear）。
+    用 `kInvalidOption`+detail 而非新增 `kClosed`（避免 C API 枚举 churn）。
+  - 验证：新增 `OperationsAfterCloseReturnErrorNotUb`（close 后 get/put/remove/sync/merge 返
+    kInvalidOption + 内省安全默认 + iter start fail-fast + 二次 close 幂等）。Release/Debug
+    **477/477 ctest**；TSan crash_recovery 11 例零 race。无 W3 守时该测试在 Debug 下空指针解引用崩溃。
+  - 风险：低。
+- [x] **W4 迭代器并行扫描** — `include/bitcask/cask.hpp`、`src/cask/cask.cpp`、`doc/api-cpp.md`、`tests/crash_recovery_test.cpp`
+  - **已完成（2026-06-25）**：加 `Cask::parallel_scan(n_threads, fn)` 高层 API。把 W1-W3 建立的
+    「多线程读安全」用于全表扫描（analytics/export/reindex）。
+  - **设计**：原计划「N 独立 iterator 分区」不可行——keydir 迭代器是**单快照游标**
+    （`keys_snapshot_` + cursor），无法切分。改为：① 单次快照所有 live key（调用线程串行，新增
+    `CaskIter::drain_live_keys`——走 keydir proxy，**仅 key 拷贝、不读 value**，比逐条 next 的
+    pread+decode 廉价）② 按 n_threads 分段 ③ N 个 std::thread 并发 `get()` 读值 + 调 fn。
+    **被并行化的是读值的 pread+decode**（真正的成本）；单 append WAL 写串行不受影响。
+  - **语义**：`n_threads==0` → hardware_concurrency；并发删除致 get kNotFound → 跳过
+    （near-real-time，与搜索一致）；其它错误（IO/CRC）→ 停止返回该错误；返回遍历到的 key 数。
+    `fn` 必须线程安全（不同线程并发调用，各处理不相交 key 段）；value 是零拷贝 view（仅回调内有效）。
+    Cask 已 close → kInvalidOption（W3）。KV 模式也可用（不依赖 search）。C++-only（C API 未绑定——
+    C host 可自行多线程 get）。
+  - **决策**：单 iterator **不**支持并发（cursor 语义模糊，价值低）——已在 W2/W3 文档化「每线程一个
+    CaskIter」（同 std 容器迭代器约定）。parallel_scan 是「并行遍历」的正解。
+  - 验证：新增 `ParallelScanVisitsAllKeysOnce`（2000 key + 删 1/10 → 4 线程扫描每 key 恰一次 +
+    value 正确 + 删的不出现；n_threads=0 路径；close 后 fail-fast）。Release/Debug **478/478 ctest**；
+    **TSan 零 race**（parallel_scan 多线程 get + W1/W3 测试）。
+  - 风险：低（建于 W1-W3 安全基座；快照串行 + get 并发安全；全量 + TSan 对拍）。
+
+> **结论**：通用库定位下 **W1+W2+W3 为必做组**，共同建立「多读 + 多写（内部串行）
+> + 读写并发 + fail-fast 生命周期」的常规契约（对标 RocksDB/LMDB）。合计约一天多，
+> 全部低风险。建议顺序 W1 → W2 → W3，W4 按需。
