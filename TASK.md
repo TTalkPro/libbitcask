@@ -958,27 +958,39 @@
     search_fields 路径的 `expand(t)` 改 span + 空 span fallback。测试同步更新。
   - 验证：472/472 ctest + TSan（synonym 11 例零 race）。
 
-- [ ] **B2 `search_text` 的 `terms` 拷贝 + synonym 再拷** — `src/search/search_layer.cpp:562-568`
-  - **现状**：`analyzer_->analyze()` 返回 `unordered_map<string,...>`（map 拥有 string），
-    接着 `terms.push_back(term)` 又拷一遍 keys；synonym_map 存在则 `expand_terms(terms)`
-    返回新 vector 再拷。
-  - **修法**：`InvertedIndex::search` 接 `span<const string_view>`；analyzer 增
-    `analyze_terms()` 直接返回 `vector<string_view>`（借内部存储）。`search_phrase`/
-    `near`/`fuzzy`/`bool` 同模式（5 处重复，可抽 helper）。
-  - **收益**：每次查询省 `num_terms × avg_term_len` 拷贝。风险：中（动 InvertedIndex 接口）。
+- [~] **B2 `search_text` 的 `terms` 拷贝 + synonym 再拷** — **跳过（评估后判定净负，2026-06-25）**
+  - **核实**：提议「`InvertedIndex::search` 接 `span<const string_view>`」**与底层数据结构冲突**——
+    `PostingMap = tbb::concurrent_hash_map<std::string, …>`，**tbb 不支持异构查找**（无 transparent
+    comparator），`find(acc, term)` 必须 `const std::string&`。代码已自证：`inverted.cpp:1542/1549`
+    在只有 string_view 时被迫写 `find(acc, std::string(term))`。
+  - **若改 string_view 反而更慢**：`search()` 对每 term 迭代 **2–3 次 find**（387 计数 + 403 快照 +
+    447 wand），现 `vector<string>` 一次物化、全程复用（find 零临时）；改 string_view 后每次 find 都得
+    `std::string(term)` → **每 term 2–3 个临时串**，比现状多。
+  - **现状的「拷贝」近乎免费**：被消的是 analyze map keys → `vector<string>` 一次拷贝，而该 vector
+    **本就是 find 所需**；且查询词通常 ≤15B → **SSO 零堆分配**（同 A4/A5 教训）。
+  - **结论**：现 `vector<std::string>` 正是 tbb key 要求下的最优表示，无可省。DRY 维度（5 处构建
+    terms 重复）归 [D2]（抽 helper，纯代码质量）处理，非本条性能项。
 
 - [~] **B3 `doc_vector_f32` 总是返回 owning `vector<float>`** — **跳过（收益边际）**
   - 分析（2026-06-24）：cask.cpp:901（recovery 路径）的 `rd.vector = doc_vector_f32(*dv)` 已
     被 NRVO 优化（直接构造进 rd.vector，无中间拷贝）。`_into` + thread_local 在此路径无
     省分配（rd 需拥有数据）。cask.cpp:1393 是一次性初始化。**无可省分配**。
 
-- [ ] **B4 `on_delete` 重新跑完整 analyze 仅为失效缓存** — `src/search/search_layer.cpp:497-502`
-  - **现状**：`auto tf = analyzer_->analyze(*text)` 完整 NFKC + ngram + fold，
-    纯为建 `changed_terms` 给 `cache_.invalidate_terms()` 用。写入时已分过词。
-  - **修法**：`doc_texts_` LRU 条目同时存 `vector<string>` term 集（或 `vector<u64>`
-    hashed terms），删除时直接取。
-  - **收益**：每次删除省一次完整 NLP（CJK ~20µs/doc）。代价：每缓存条目多占
-    `num_terms × avg_term_len` 字节。风险：中（多占内存）。
+- [~] **B4 `on_delete` 重新跑完整 analyze 仅为失效缓存** — **跳过（评估后判定默认不划算，2026-06-25）**
+  - **现状**：`on_delete` 取被删文档原文（`doc_texts_` LRU，本就为高亮存）后 `analyzer_->analyze(*text)`
+    重分词，纯为建 `changed_terms` 给 `cache_.invalidate_terms()` 做选择性失效。
+  - **提议**：写入时把 term 集存进 LRU 条目，删除时直接取，省那次 analyze。
+  - **判定净负（默认场景）**——收益有条件且有界 vs 成本无条件且可观：
+    - **收益**：仅省 1 次 analyze（Latin ~7µs / CJK-ngram ~21µs），且仅当 `on_delete` 命中 LRU
+      （冷文档已降级 `invalidate()`）。`on_delete` 是显式墓碑路径，通常远低频于 写/查（bitcask 覆写是
+      LWW put 走 `on_write`，非 `on_delete`）。
+    - **成本（被主力 ngram 放大）**：默认 ngram(2–3)，T 码点文档 → ~2T term；即便 SSO `std::string`
+      （~32B/个）也 ≈ **64·T 字节/文档**——200 字 CJK 文档约 **12 KB（原文的 4–5×）**；默认 1024 条 LRU
+      → **常驻 +~12 MB**。hashed `vector<u64>` 变体约减半（~3 MB）但仍增内存，且要改 `SearchCache::
+      invalidate_terms` + 每条目改存 hash（blast radius 更大）。
+  - **结论**：为低频路径省 ~21µs 换无条件多 MB 常驻内存，对通用嵌入式存储是错的默认。
+    **唯一划算的反例**：delete-heavy + whitespace/jieba 分词（term 集 ≈ 词数，不被 ngram 膨胀）——
+    若将来确证此类工作负载再做（hashed 变体）。保留现状。
 
 - [x] **B5 HNSW `search_layer` 每次 stack 构造两个 `priority_queue`** — `src/vector/hnsw.cpp`
   - **已完成（2026-06-24）**：`ReusablePQ`（继承 `priority_queue` 暴露 protected `Container c`）
@@ -1054,7 +1066,7 @@
 
 **A 梯队 — 全部完成**：A1 ✅（缓存前置）/ A2 ✅（WAND 块上界 <1% 保留）/ A3 ⏭️ 跳过（std::function 非热点）/ A4 ✅（字段名 intern，内存 −40%）/ A5 ✅（字段打包，alloc −6.4%）。
 
-**B 梯队 — 低风险项完成**：B1 ✅（SynonymMap span）/ B5 ✅（HNSW PQ 复用）/ B6 ✅（merger reserve）/ B3 ⏭️ 跳过（NRVO 已优化）。**B2/B4 保留**（中风险：B2 动 InvertedIndex 接口，B4 改 LRU 结构）。
+**B 梯队 — 全部收尾**：B1 ✅（SynonymMap span）/ B5 ✅（HNSW PQ 复用）/ B6 ✅（merger reserve）/ B3 ⏭️ 跳过（NRVO 已优化）/ B2 ⏭️ 跳过（2026-06-25：tbb 无异构查找 → string_view 反增临时串，且现 vector<string> 是 find 所需、短词 SSO 零堆）/ B4 ⏭️ 跳过（2026-06-25：为低频 delete 路径省 ~21µs 换 ngram 下常驻 +~12MB，默认不划算）。
 
 **S9-P0 — 全部完成**：P0-a ✅（FieldSchema RAII）/ P0-b ✅（checkpoint RAII）/ P0-c ✅（kDefaultField 透明查找）/ P0-d ✅（byte_order.hpp 提取）。
 
