@@ -9,6 +9,12 @@
 
 ## [Unreleased]
 
+无未发布变更。
+
+---
+
+## [1.2.0] - 2026-06-25
+
 ### 新增（Added）
 - **S11 线程安全化（通用 C++ 库定位）**——同一个 `Cask` handle 可被多线程安全共享，
   对标 RocksDB / LMDB 常规契约。设计稿 [`docs/design/thread-safety.md`](docs/design/thread-safety.md)。
@@ -128,6 +134,7 @@
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/davidalphafox/libbitcask/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/davidalphafox/libbitcask/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/davidalphafox/libbitcask/releases/tag/v1.0.0
