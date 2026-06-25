@@ -515,18 +515,32 @@
       主机 LE）改为显式 `le_store_u32/64`（可移植 + DRY）。
   - 验证：Release **472/472 ctest**；TSan 零 race（checkpoint_recovery 5 + cask_docvalue 66 +
     keydir 9 = 80 例）。
-  - [ ] **P1-a C API new/delete → unique_ptr** — `c_api/bitcask_c.cpp:222,231`
-    - 裸 `new bitcask_impl_t` / 裸 `delete`；caller 遗漏 close → 泄露。改 unique_ptr + 自定义 deleter。
-    - 风险：低。
-  - [ ] **P1-b vbyte 编码去重** — `src/fileops/codec.cpp:58-64` + `include/bitcask/vbyte.hpp:27-33`
-    - codec.cpp 匿名 `vbyte_append()` 与 vbyte.hpp `vbyte_encode()` 逻辑相同；合并到 vbyte.hpp。
-    - 风险：低。
-  - [ ] **P1-c search_layer.cpp 注释补充** — `src/search/search_layer.cpp`（1355 行，注释密度仅 8%）
-    - 补 `map_analyze` / `reduce_apply` / `search_hybrid` RRF 融合 / checkpoint save/load 的算法说明。
-    - 风险：零（纯文档）。
-  - [ ] **P1-d thread_local buffer 工具类** — `src/fileops/data_file.cpp:225` + `src/fileops/hint_file.cpp:97`
-    - 两处 `thread_local vector<byte>` + retain 限制 + resize 模式重复；抽 `ThreadLocalBuffer` 工具类。
-    - 风险：中（改 I/O 路径，需全量测试）。
+  - [x] **P1-a C API new/delete → unique_ptr** — `c_api/bitcask_c.cpp`
+    - **已完成（2026-06-25）**：`bitcask_open`/`bitcask_iter_create` 的裸 `new` → `make_unique` 构造期
+      持有 + 跨 C 边界前 `release()` 转交裸句柄给调用方；`bitcask_close`/`bitcask_iter_release` 把裸句柄
+      `adopt` 回 `unique_ptr`（作用域结束自动 delete，与 open 的 release 对称、异常安全）。cask + iterator
+      两处统一。
+  - [x] **P1-b vbyte 编码去重** — `include/bitcask/vbyte.hpp`、`src/fileops/codec.cpp`
+    - **已完成（2026-06-25）**：`vbyte_encode` **模板化**单字节元素类型（`std::uint8_t` for bm25 WAL/落盘 +
+      `std::byte` for codec DocValue 段），codec.cpp 删除匿名 `vbyte_append`、5 处调用改 `vbyte_encode`。
+      **读端 `vbyte_read` 保留**——它对 std::byte 缓冲做 bounds-checked + 溢出防御（返回 bool），契约严于
+      vbyte.hpp 的 `vbyte_decode`（裸指针无越界检查），非重复。
+  - [x] **P1-c search_layer.cpp 注释补充** — `src/search/search_layer.cpp`
+    - **已完成（2026-06-25）**：补 `map_analyze`（Map 阶段：纯 const、可并行、产 owning ReduceJob）/
+      `reduce_apply`（Reduce 阶段：串行按 ord 序 apply、锁序、LWW 正确性关键）/ `serialize_docmap`
+      （docmap sidecar 用途 + covers_next_ord 衔接点）的函数级算法说明。`search_hybrid` RRF 融合本就
+      有引文注释（Cormack 2009，k=60）。
+  - [x] **P1-d thread_local buffer 工具类** — 新建 `include/bitcask/detail/thread_local_buffer.hpp`、
+    `src/fileops/data_file.cpp`、`src/fileops/hint_file.cpp`
+    - **已完成（2026-06-25）**：新建 `detail::ThreadLocalBuffer`（`ensure(n)` 按需扩 + `data()`/`size()`
+      直访 + `maybe_shrink()` 防膨胀，默认 retain 1 MiB）。`DataFile::read`（get 热路径）与
+      `HintFile::fold`（chunked 流式）两处 `static thread_local vector<byte>` + retain/resize 重复模式
+      收敛进本类，语义逐字等价。**仅这两处是 thread_local**（data_file fold 的 buf 与 hint validate_trailer
+      的 buf 是 per-call local，RAII 自管，不迁移）。
+  - **S9-P1 验证**：Release/Debug **474/474 ctest**；**TSan 零 race**（DataFile/HintFile/CrashRecovery/
+    Checkpoint/Codec/DocValue/Inverted 共 177 例）。修改文件零新增告警。
+    （注：`CApi.SmokeTest` 在 TSan 下有**预存** SEGV——已核实 stash 掉本轮全部改动后基线同样复现，
+    与 P1 无关，属 C 测试 × TSan/.so 交互的历史问题。）
   - [ ] **P2-a Cask god class 拆分（search 方法抽 SearchOps）** — `include/bitcask/cask.hpp`（694 行,
     60+ 公有方法） + `src/cask/cask.cpp`（1993 行）
     - 职责过多：KV facade + search facade + merge 协调 + 迭代器 + 读缓存 + 索引池。
@@ -1023,7 +1037,9 @@
 
 **B 梯队 — 低风险项完成**：B1 ✅（SynonymMap span）/ B5 ✅（HNSW PQ 复用）/ B6 ✅（merger reserve）/ B3 ⏭️ 跳过（NRVO 已优化）。**B2/B4 保留**（中风险：B2 动 InvertedIndex 接口，B4 改 LRU 结构）。
 
-**S9-P0 — 全部完成**：P0-a ✅（FieldSchema RAII）/ P0-b ✅（checkpoint RAII）/ P0-c ✅（kDefaultField 透明查找）/ P0-d ✅（byte_order.hpp 提取）。**P1/P2 保留**。
+**S9-P0 — 全部完成**：P0-a ✅（FieldSchema RAII）/ P0-b ✅（checkpoint RAII）/ P0-c ✅（kDefaultField 透明查找）/ P0-d ✅（byte_order.hpp 提取）。
+
+**S9-P1 — 全部完成（2026-06-25）**：P1-a ✅（C API make_unique + release/adopt）/ P1-b ✅（vbyte_encode 模板化去重）/ P1-c ✅（map_analyze/reduce_apply/serialize_docmap 注释）/ P1-d ✅（ThreadLocalBuffer 工具类）。**P2 保留**（含 god class 拆分等高风险大重构，按需推进或永久搁置）。
 
 **按需（C 梯队）**：A2 实测 <1%，C4（Block-Max MaxScore）暂不推荐（A2 同类优化未达预期）。C5/C6 与未来 v4 格式绑定。
 

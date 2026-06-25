@@ -23,13 +23,17 @@
 namespace bitcask::codec {
 
 // VByte 编码：将无符号整数压缩为变长字节序列，追加到 buf 末尾。
-// val 必须为无符号整数。
-inline void vbyte_encode(std::uint64_t val, std::vector<std::uint8_t>& buf) {
+// val 必须为无符号整数。S9-P1-b：模板化单字节元素类型，统一服务
+// `std::vector<std::uint8_t>`（bm25 WAL/落盘）与 `std::vector<std::byte>`
+// （codec DocValue 段）两种缓冲——消除 codec.cpp 原匿名 vbyte_append 的重复。
+template <typename Byte>
+inline void vbyte_encode(std::uint64_t val, std::vector<Byte>& buf) {
+    static_assert(sizeof(Byte) == 1, "vbyte 缓冲元素必须为单字节类型");
     while (val >= 128) {
-        buf.push_back(static_cast<std::uint8_t>(val & 0x7F));
+        buf.push_back(static_cast<Byte>(val & 0x7F));
         val >>= 7;
     }
-    buf.push_back(static_cast<std::uint8_t>(val | 0x80));
+    buf.push_back(static_cast<Byte>(val | 0x80));
 }
 
 // VByte 解码：从 data[pos] 开始读取一个 VByte 编码的无符号整数。

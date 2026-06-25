@@ -8,21 +8,16 @@
 #include "bitcask/detail/int8_kernels.hpp"  // P3a：向量落盘 int8 对称量化
 #include "bitcask/format.hpp"
 #include "bitcask/hw_crc32.hpp"
+#include "bitcask/vbyte.hpp"  // S9-P1-b：vbyte_encode 模板（消除本地 vbyte_append）
 
 namespace bitcask::codec {
 
 namespace {
 
-// VByte 变长整数（DocValue v3 的段长度/计数/字段 id 用，#1/#2）。
-// 算法同 vbyte.hpp：低 7 位数据，最高位 1=末字节。这里直接对 std::byte 缓冲操作。
-inline void vbyte_append(std::vector<std::byte>& out, std::uint64_t val) {
-    while (val >= 128) {
-        out.push_back(static_cast<std::byte>(val & 0x7F));
-        val >>= 7;
-    }
-    out.push_back(static_cast<std::byte>(val | 0x80));
-}
-
+// VByte 变长整数读取（DocValue v3 的段长度/计数/字段 id 用，#1/#2）。
+// 写端用 vbyte.hpp 的 vbyte_encode（S9-P1-b 合并）；读端保留本地版——它对
+// std::byte 缓冲做 **bounds-checked + 溢出防御**（返回 bool），契约严于
+// vbyte.hpp 的 vbyte_decode（裸指针、无越界检查）。
 // 从 buf[pos] 读一个 VByte，成功写出 val 并推进 pos；越界/编码过长返回 false。
 inline bool vbyte_read(std::span<const std::byte> buf, std::size_t& pos, std::uint64_t& val) {
     std::uint64_t result = 0;
@@ -164,7 +159,7 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
 
     // 追加「varint 长度前缀 + 原始字节」的段（text/meta/字段值用，#2）。
     auto append_bytes = [&out](std::span<const std::byte> s) {
-        vbyte_append(out, s.size());
+        vbyte_encode(s.size(), out);
         const std::size_t at = out.size();
         out.resize(at + s.size());
         if (!s.empty()) std::memcpy(out.data() + at, s.data(), s.size());
@@ -174,7 +169,7 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
         // P3a：per-vector 对称 int8。[Dim:varint][SchemeVer:u8][scale:f32 LE][int8×Dim]
         const auto& v = *parts.vector;
         const auto qv = vec::int8::quantize(v.data(), v.size());
-        vbyte_append(out, v.size());  // Dim（元素数）
+        vbyte_encode(v.size(), out);  // Dim（元素数）
         out.push_back(static_cast<std::byte>(format::kQuantizedVersion));
         out.resize(out.size() + sizeof(float));  // scale f32 LE
         std::memcpy(out.data() + out.size() - sizeof(float), &qv.scale, sizeof(float));
@@ -185,7 +180,7 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
         }
     } else if (parts.vector) {
         const auto& v = *parts.vector;
-        vbyte_append(out, v.size());  // Dim（元素个数）
+        vbyte_encode(v.size(), out);  // Dim（元素个数）
         const std::size_t at = out.size();
         const std::size_t bytes = v.size() * sizeof(float);
         out.resize(at + bytes);
@@ -195,9 +190,9 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
     if (parts.meta) append_bytes(*parts.meta);
     // fields 段（#1）：[FieldCount:varint] × { [FieldId:varint][ValLen:varint][value] }
     if (has_fields) {
-        vbyte_append(out, parts.fields.size());
+        vbyte_encode(parts.fields.size(), out);
         for (const auto& f : parts.fields) {
-            vbyte_append(out, f.id);
+            vbyte_encode(f.id, out);
             append_bytes(f.value);
         }
     }

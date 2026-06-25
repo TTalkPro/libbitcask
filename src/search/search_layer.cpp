@@ -398,6 +398,14 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
     cache_.invalidate_terms(changed_terms);
 }
 
+// S6 索引流水线的 **Map 阶段**（设计稿 §3）。**纯 const 函数**：只读
+// analyzer_（const 配置态，cppjieba Cut 亦 const 线程安全），对每个字段跑
+// NFKC + 分词 + 位置，**不碰任何共享可变态** → 可在 N 个 map worker 上对不同
+// 文档**并发**调用（F7 不变量，TSan 已验证）。产出 owning `ReduceJob`（自带
+// terms/positions/catch-all/DocSlot），由 reducer 线程按 ord 序串行 apply。
+//
+// catch-all：把非默认字段的分词结果合并进默认字段（让只查默认字段的
+// search_text/phrase/near 也能命中多字段文档），见下方注释。
 ReduceJob SearchLayer::map_analyze(
     std::string_view key, std::uint64_t ord,
     const std::vector<std::pair<std::string_view, std::string_view>>& fields,
@@ -455,6 +463,14 @@ ReduceJob SearchLayer::map_analyze(
     return job;
 }
 
+// S6 索引流水线的 **Reduce 阶段**（设计稿 §3）。与 map_analyze 相反：**改共享
+// 索引/HNSW/缓存，必须串行**。reducer 线程对每条 lane 按 `next_apply_ord` 严格
+// **ord 序**调用本函数（reorder buffer 把并行 map 的乱序结果拗回 ord 序）——
+// 这是「到达序 LWW 等价 ord 序 LWW」正确性的关键（否则被删 key 复活，§3 F4∧F5）。
+// 锁序：fields_mu_ → index_.mutex_（类级不变量，无死锁）。
+// 步骤：① 侧表 ord_field_lens_ 记字段长 ② 各字段 add_doc 进倒排
+//       ③ catch-all 合并默认字段 ④ index_.put_doc 落 DocSlot ⑤ 高亮原文 / meta /
+//       向量（on_vector → HNSW，单写者=本 reducer）⑥ 失效查询缓存。
 void SearchLayer::reduce_apply(const ReduceJob& job,
                                std::span<const std::byte> meta,
                                std::span<const float> vec) {
@@ -919,6 +935,12 @@ void sc_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
 }
 }  // namespace
 
+// docmap sidecar（"BCIS"）序列化：把 index_ 的 ord → (ext_id, DocSlot) 活映射
+// 落进 checkpoint，避免冷启动靠全量 fold 重建 docmap。`covers_next_ord` 记录
+// 快照覆盖到的 ord 水位——load 后只需 fold 该水位之后的增量（checkpoint 与
+// 后续 WAL/data 的衔接点）。布局：header(magic+version+covers_next_ord+行数) +
+// 每活文档一行（见下方固定段 34B + 变长 ext_id）。仅遍历 live 文档（死文档
+// 由 keydir LWW 过滤，不入快照）。
 bool SearchLayer::serialize_docmap(std::vector<std::uint8_t>& buf,
                                    std::uint64_t covers_next_ord) const {
     buf.clear();

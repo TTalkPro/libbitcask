@@ -219,16 +219,19 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
         return to_c_error_kind(result.error().kind);
     }
 
-    auto* wrapper = new bitcask_impl_t;
+    // S9-P1-a：构造期用 unique_ptr 持有（异常安全），跨 C 边界前 release 转交
+    // 裸句柄所有权给调用方；bitcask_close 再 adopt 回 unique_ptr 自动析构。
+    auto wrapper = std::make_unique<bitcask_impl_t>();
     wrapper->cask = std::move(*result);
-    *out = reinterpret_cast<bitcask_t*>(wrapper);
+    *out = reinterpret_cast<bitcask_t*>(wrapper.release());
     return BITCASK_OK;
 }
 
 BITCASK_API void bitcask_close(bitcask_t* cask) {
     if (!cask) return;
-    as_cpp_cask(cask)->close();
-    delete reinterpret_cast<bitcask_impl_t*>(cask);
+    // adopt 回 unique_ptr：close() 后作用域结束自动 delete（与 open 的 release 对称）。
+    std::unique_ptr<bitcask_impl_t> owned(reinterpret_cast<bitcask_impl_t*>(cask));
+    owned->cask->close();
 }
 
 BITCASK_API bitcask_error_t bitcask_get(bitcask_t* cask,
@@ -552,9 +555,10 @@ BITCASK_API bitcask_error_t bitcask_iter_start(bitcask_t* cask,
         return BITCASK_ERR_INVALID_OPTION;
     }
 
-    auto* wrapper = new bitcask_iter_impl_t;
+    // S9-P1-a：同 open——构造期 unique_ptr 持有，release 转交裸句柄给调用方。
+    auto wrapper = std::make_unique<bitcask_iter_impl_t>();
     wrapper->iter = std::move(iter);
-    *out = reinterpret_cast<bitcask_iter_t*>(wrapper);
+    *out = reinterpret_cast<bitcask_iter_t*>(wrapper.release());
     return BITCASK_OK;
 }
 
@@ -648,8 +652,9 @@ BITCASK_API int bitcask_iter_next_batch(bitcask_iter_t* iter,
 
 BITCASK_API void bitcask_iter_release(bitcask_iter_t* iter) {
     if (!iter) return;
-    as_cpp_iter(iter)->release();
-    delete reinterpret_cast<bitcask_iter_impl_t*>(iter);
+    // adopt 回 unique_ptr：release() 后作用域结束自动 delete（与创建处 release 对称）。
+    std::unique_ptr<bitcask_iter_impl_t> owned(reinterpret_cast<bitcask_iter_impl_t*>(iter));
+    owned->iter->release();
 }
 
 BITCASK_API void bitcask_iter_entry_free(bitcask_iter_entry_t* entry) {

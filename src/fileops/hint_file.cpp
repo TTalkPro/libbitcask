@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "bitcask/format.hpp"
+#include "bitcask/detail/thread_local_buffer.hpp"  // S9-P1-d
 
 namespace bitcask::fileops {
 
@@ -94,10 +95,10 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
     // 1M 条 record → 2M syscalls（原）→ ~几百次 chunked read，fold 主导
     // 路径 syscalls 减 1000+ 倍。buffer thread_local 是因为 fold 可在多
     // reader 并发调同一 HintFile——preade 线程安全，但 buf 不能共享。
-    static thread_local std::vector<std::byte> buf;
+    // S9-P1-d：ensure+防膨胀收敛进 ThreadLocalBuffer（默认 retain 1 MiB）。
+    static thread_local detail::ThreadLocalBuffer buf;
     constexpr std::size_t kChunkBytes = 256 * 1024;  // 256 KiB
-    constexpr std::size_t kBufRetain   = 1u << 20;   // 1 MiB 防膨胀阈值
-    if (buf.size() < kChunkBytes) buf.resize(kChunkBytes);
+    buf.ensure(kChunkBytes);
 
     // buf 内的有效数据区间：[buf_pos, buf_len)。每次消费完一段记录就
     // 推进 buf_pos；不够一条新 record 时先把残留 memmove 到 buf 头部，
@@ -122,7 +123,7 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
         // 需要把 buf 撑大，单次 read 才能装下。
         const std::size_t desired = buf_len + kChunkBytes;
         const std::size_t need = std::max(desired, buf_len + read_size_hint);
-        if (buf.size() < need) buf.resize(need);
+        buf.ensure(need);
 
         // 一次 pread 尽量读满 kChunkBytes；不要短读时多调一次。
         // 截到文件总长，避免 read 出 EOF 部分徒增 syscalls。
@@ -182,10 +183,7 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
     }
 
     // 防线程内存膨胀：一次巨型 hint 文件不应让 buffer 永久占住线程栈/堆
-    if (buf.size() > kBufRetain) {
-        buf.clear();
-        buf.shrink_to_fit();
-    }
+    buf.maybe_shrink();
     return {};
 }
 

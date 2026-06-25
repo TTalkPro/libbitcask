@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "bitcask/format.hpp"
+#include "bitcask/detail/thread_local_buffer.hpp"  // S9-P1-d
 
 namespace bitcask::fileops {
 
@@ -224,19 +225,17 @@ std::expected<ReadRecord, DataFileFault>
 DataFile::read(std::uint64_t offset, std::uint32_t total_size) {
     // get 热路径:per-thread 复用读缓冲,稳态零分配。pread 线程安全,
     // 多线程可并发调 read(),故缓冲必须 thread_local 而非成员。
-    static thread_local std::vector<std::byte> read_buf;
-    // 防膨胀:一次超大 value 不让缓冲长期占住线程内存。
-    constexpr std::size_t kReadBufRetain = 1u << 20;  // 1 MiB
-    if (read_buf.size() < total_size) read_buf.resize(total_size);
+    // S9-P1-d：ensure+防膨胀收敛进 ThreadLocalBuffer（默认 retain 1 MiB）。
+    static thread_local detail::ThreadLocalBuffer read_buf;
+    std::byte* rb = read_buf.ensure(total_size);
 
-    auto n = file_.pread_into(offset,
-                              std::span(read_buf.data(), total_size));
+    auto n = file_.pread_into(offset, std::span(rb, total_size));
     if (!n) return std::unexpected(io_fault(n.error()));
     if (*n < total_size) {  // 含 EOF(0 字节)
         return std::unexpected(DataFileFault{DataFileError::kShortRead});
     }
     auto rec = codec::decode_data_record(
-        std::span<const std::byte>(read_buf.data(), total_size));
+        std::span<const std::byte>(rb, total_size));
     if (!rec) {
         // codec::DecodeError → DataFileFault
         switch (rec.error()) {
@@ -259,10 +258,7 @@ DataFile::read(std::uint64_t offset, std::uint32_t total_size) {
     out.key.assign(rec->key.begin(), rec->key.end());
     out.value.assign(rec->value.begin(), rec->value.end());
     // key/value 已拷出,缓冲可以安全收缩(防超大 value 撑住线程内存)。
-    if (read_buf.size() > kReadBufRetain) {
-        read_buf.clear();
-        read_buf.shrink_to_fit();
-    }
+    read_buf.maybe_shrink();
     return out;
 }
 
