@@ -1,13 +1,14 @@
 // bitcask.meta 文件管理：创建/读取 bitcask.meta 二进制格式。
 //
 // 格式（18 bytes）：
-//   [0..3]   Magic     "BCME" (4 bytes)
-//   [4]      Version   uint8 = 1
-//   [5]      Mode      uint8 = 0(KV) or 1(Index)
-//   [6]      VecMetric uint8 (V3.1)
-//   [7..8]   VecDim    uint16 LE (V3.1)
-//   [9]      VecQuant  uint8 = 0/1（P3b：向量落盘 int8 量化；旧文件全零=否）
-//   [10..17] Reserved  8 bytes zeros（future use）
+//   [0..3]   Magic        "BCME" (4 bytes)
+//   [4]      Version      uint8 = 2（kMetaVersion；v1 已不兼容，open 直接拒绝）
+//   [5]      Mode         uint8 = 0(KV) or 1(Index)
+//   [6]      VecMetric    uint8 (V3.1)
+//   [7..8]   VecDim       uint16 LE (V3.1)
+//   [9]      VecQuant     uint8 = 0/1（P3b：向量落盘 int8 量化；旧文件全零=否）
+//   [10]     VecInmemInt8 uint8 = 0/1（P5b：HNSW int8-only 内存；旧文件全零=否）
+//   [11..17] Reserved     7 bytes zeros（future use）
 //
 // === 线程模型 ===
 // 所有函数均为纯函数：线程安全、可重入、无锁。
