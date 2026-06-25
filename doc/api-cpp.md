@@ -198,7 +198,7 @@ upgrade(std::string_view dirname, const search::SearchLayerConfig& search_config
 ```cpp
 void close() noexcept;
 ```
-释放资源。此后对象不可再用。**线程安全**：否（caller 保证关闭时刻无其它线程在调用 get/put/remove/sync/iter）。
+释放资源。**幂等**（二次 close no-op）。**线程安全**：否（生命周期方法，caller 须保证关闭时刻无其它线程在调用 get/put/remove/sync/iter）。S11-W3：close 后**新发起**的公共调用 fail-fast 返回 `kInvalidOption`（"cask is closed"）而非 UB；与 close **并发在途**的调用仍是 caller 责任（best-effort 防误用，非完整 rundown）。
 
 ### 5.2 读
 
@@ -224,9 +224,24 @@ std::size_t read_handle_count() const;
 ```
 当前常驻 read 句柄数（内省用，测试断言 fd 预算上限）。线程安全：共享锁读。
 
+#### `parallel_scan`（并行全表扫描）
+```cpp
+using ScanFn = std::function<void(std::span<const std::byte> key,
+                                  const GetResultView& value)>;
+std::expected<std::size_t, CaskFault>
+parallel_scan(std::size_t n_threads, const ScanFn& fn);
+```
+全表并行扫描，用于 analytics / export / reindex。实现：① 在调用线程串行快照所有 live key（仅 key 拷贝，**不读 value**）② 按 `n_threads` 分段 ③ N 个线程并发 `get()` 读值并调 `fn`——**被并行化的是读值的 pread+decode**（真正的成本）；单 append WAL 写串行不受影响（更高写并发请按目录分片）。
+- `n_threads==0` → `hardware_concurrency()`。
+- `fn` **必须线程安全**（不同线程并发调用，各处理不相交 key 段）；`value` 是借用工作线程读缓冲的零拷贝 view，仅在回调内有效。
+- 并发删除致某 key 在 `get` 时 `kNotFound` → 跳过（near-real-time，与搜索一致）；其它错误（IO/CRC）→ 停止并返回该错误。返回成功遍历到的 key 数。
+- KV 模式亦可用（不依赖 search 层）。**线程安全：是**（快照串行建立 + get 并发安全）；Cask 已 close → `kInvalidOption`。
+
+> 注：单个 `CaskIter` 是有状态游标，**不可**跨线程共享（每线程一个）；需要并行遍历用本方法。
+
 ### 5.3 写
 
-> 写路径要求**「一个 Cask 同时只有一个写线程」**——本类不提供互斥。同一 Cask 与并发 `merge_only` 句柄安全（双方共享 keydir 的 shared_mutex）。
+> **线程安全（S11-W1）**：写路径由内部 `write_mu_` 串行化——同一 handle 可被**多线程并发写**而不损坏。写在文件层本就串行（单 append WAL）→ 锁不损吞吐；需要更高写并发请**按目录分片多个 Cask 实例**。与并发 `merge` / 并发读（get/search）安全。
 
 #### `put`
 ```cpp
@@ -235,14 +250,14 @@ put(std::span<const std::byte> key,
     std::span<const std::byte> value,
     std::uint32_t tstamp = 0);
 ```
-`tstamp=0` 用当前 wall-clock 秒。**错误**：`kReadOnly`、`kKeyTooLarge`、`kValueTooLarge`、`kAlreadyExists`（CAS 竞态，内部 roll 后重试）、`kIo`。**线程安全**：否（caller 串行化所有 put/remove/sync/close_write_file）。
+`tstamp=0` 用当前 wall-clock 秒。**错误**：`kReadOnly`、`kKeyTooLarge`、`kValueTooLarge`、`kAlreadyExists`（CAS 竞态，内部 roll 后重试）、`kIo`。**线程安全**：是（S11-W1：内部 `write_mu_` 串行化）。
 
 #### `remove`
 ```cpp
 std::expected<void, CaskFault>
 remove(std::span<const std::byte> key, std::uint32_t tstamp = 0);
 ```
-软删除：写一条墓碑 record，空间在下次 merge 时回收。线程安全：否（同 `put`）。
+软删除：写一条墓碑 record，空间在下次 merge 时回收。线程安全：是（同 `put`）。
 
 #### `put_doc`
 ```cpp
@@ -250,7 +265,7 @@ std::expected<void, CaskFault>
 put_doc(std::span<const std::byte> key, const DocInput& doc,
         std::uint32_t tstamp = 0);
 ```
-写入结构化文档（text + 选填 meta/vector/fields），用于索引模式。线程安全：否。
+写入结构化文档（text + 选填 meta/vector/fields），用于索引模式。线程安全：是（同 `put`）。
 
 ### 5.4 检索（索引模式）
 
@@ -262,49 +277,49 @@ std::expected<TextSearchResult, CaskFault>
 search_text(std::string_view query, std::size_t k = 10,
             const meta::MetaFilter* filter = nullptr);
 ```
-`filter` 非空时 meta 后过滤（overfetch `k×4` 再截断到 `k`）。线程安全：否（search_ 非线程安全）。
+`filter` 非空时 meta 后过滤（overfetch `k×4` 再截断到 `k`）。线程安全：是（并发读安全：cache_/doc_texts_ shared_mutex、倒排/HNSW shared_lock、analyzer const；与写并发遵循 near-real-time 可见性）。
 
 #### `search_phrase`（短语）
 ```cpp
 std::expected<TextSearchResult, CaskFault>
 search_phrase(std::string_view query, std::size_t k = 10);
 ```
-term 连续出现。需 `index_positions=true`。线程安全：否。
+term 连续出现。需 `index_positions=true`。线程安全：是（并发读安全，同 `search_text`）。
 
 #### `bool_search`（布尔）
 ```cpp
 std::expected<TextSearchResult, CaskFault>
 bool_search(std::string_view query, std::size_t k = 10);
 ```
-AND / OR / NOT 查询语法。线程安全：否。
+AND / OR / NOT 查询语法。线程安全：是（并发读安全，同 `search_text`）。
 
 #### `search_fields`（多字段）
 ```cpp
 std::expected<TextSearchResult, CaskFault>
 search_fields(std::string_view query, std::size_t k = 10);
 ```
-解析 `field:term^boost` 语法：有字段限定的词查对应字段，无限定的查默认字段；各词得分 × boost，跨字段累加。不含字段语法时等价默认字段词袋。线程安全：否。
+解析 `field:term^boost` 语法：有字段限定的词查对应字段，无限定的查默认字段；各词得分 × boost，跨字段累加。不含字段语法时等价默认字段词袋。线程安全：是（并发读安全，同 `search_text`）。
 
 #### `search_near`（近邻）
 ```cpp
 std::expected<TextSearchResult, CaskFault>
 search_near(std::string_view query, std::uint32_t slop, std::size_t k = 10);
 ```
-term 按序出现且相邻间隙 ≤ `slop`；`slop=0` 即短语。线程安全：否。
+term 按序出现且相邻间隙 ≤ `slop`；`slop=0` 即短语。线程安全：是（并发读安全，同 `search_text`）。
 
 #### `search_fuzzy`（模糊）
 ```cpp
 std::expected<TextSearchResult, CaskFault>
 search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance);
 ```
-Levenshtein 编辑距离匹配。线程安全：否。
+Levenshtein 编辑距离匹配。线程安全：是（并发读安全，同 `search_text`）。
 
 #### `search_wildcard`（通配符）
 ```cpp
 std::expected<TextSearchResult, CaskFault>
 search_wildcard(std::string_view pattern, std::size_t k);
 ```
-`*` / `?` 模式匹配。线程安全：否。
+`*` / `?` 模式匹配。线程安全：是（并发读安全，同 `search_text`）。
 
 #### `search_vector`（HNSW 向量 ANN）
 ```cpp
@@ -327,13 +342,13 @@ search_hybrid(std::string_view text_query,
 两路各取 `K'=max(k×4,64)`：BM25 走 `search_text` 内核，向量走 `search_vector` 内核。融合 `score = Σ 1/(60+rank)`，`rank` 从 1 起；平局 → `ord` 小者在前。
 - `text_query` 空 → 纯向量；`vec_query` 空 → 纯文本；两路都空 / 无向量配置 / 维度不符 → `kInvalidOption`。
 - `filter` 同时作用于两路。返回 score = RRF 分。
-- **线程安全**：同两条内核（文本路否，向量路是）。
+- **线程安全**：是（两条内核读路径均并发安全）。
 
 #### `set_synonym_map`
 ```cpp
 void set_synonym_map(std::unique_ptr<text::SynonymMap> map);
 ```
-设置同义词词典，查询时自动展开。
+设置同义词词典，查询时自动展开。⚠️ **线程安全：否**——配置类方法，与并发查询竞态（改 `synonym_map_` 指针，而搜索读它）。契约：**必须在并发查询开始前配置**（或外部串行化）；典型用法是 open 后、对外服务前设一次。
 
 ### 5.5 搜索基础设施访问
 
@@ -349,13 +364,13 @@ void flush_index();                  // 排空异步索引队列
 ```cpp
 std::expected<void, CaskFault> sync();
 ```
-fsync active data file。`o_sync` 模式下退化为 no-op。线程安全：否（操作 active_data_，与 put/remove 互斥）。
+fsync active data file。`o_sync` 模式下退化为 no-op。线程安全：是（S11-W1：内部 `write_mu_`，与 put/remove 互斥）。
 
 #### `close_write_file`
 ```cpp
 std::expected<void, CaskFault> close_write_file();
 ```
-finalize 当前 active write file（写 hint trailer、丢句柄、释放 `write.lock`）。Cask 仍可用——下次 put 自动重开。只读/`merge_only` 句柄返回 `kReadOnly`。线程安全：否。
+finalize 当前 active write file（写 hint trailer、丢句柄、释放 `write.lock`）。Cask 仍可用——下次 put 自动重开。只读/`merge_only` 句柄返回 `kReadOnly`。线程安全：是（S11-W1：内部 `write_mu_`）。
 
 ### 5.7 状态与 merge
 
@@ -611,17 +626,26 @@ it->release();
 
 ## 9. 线程模型汇总
 
+> **定位（S11）**：libbitcask 是**通用 C++ 库**——同一 Cask handle 可被多线程安全共享。
+> 详见 [`design/thread-safety.md`](design/thread-safety.md)。
+
 | 操作 | 线程安全 | 说明 |
 |------|---------|------|
-| `open` / `close` / `upgrade` | 是（产生独立对象）| close 要求 caller 保证无在途调用 |
+| `open` / `upgrade` | 是（产生独立对象）| registry 并发由其内部锁保证 |
+| `close` | 否（生命周期，幂等）| caller 须保证关闭时刻无在途调用；S11-W3：close 后新调用 fail-fast 返回 kInvalidOption |
 | `get` / `get_owned` / `read_handle_count` | 是 | 读路径无锁；pread thread-safe |
-| `put` / `remove` / `put_doc` / `sync` / `close_write_file` | **否** | 单写者；caller 串行化 |
-| `search_text` / `_phrase` / `_bool` / `_fields` / `_near` / `_fuzzy` / `_wildcard` | 否 | search_ 非线程安全 |
-| `search_vector` | 是 | HNSW 读路径线程安全 |
-| `search_hybrid` | 否（文本路）/ 是（向量路）| 取决于两路内核 |
-| `set_synonym_map` | 否 | 写 search_ |
+| `put` / `remove` / `put_doc` / `sync` / `close_write_file` | **是** | S11-W1：内部 `write_mu_` 串行化；多线程并发写安全（吞吐不变，写本就串行） |
+| `search_text` / `_phrase` / `_bool` / `_fields` / `_near` / `_fuzzy` / `_wildcard` | **是** | 并发读安全（cache_/doc_texts_ shared_mutex、倒排/HNSW shared_lock、analyzer const） |
+| `search_vector` / `search_hybrid` | 是 | HNSW `atomic<shared_ptr>` 快照；两路内核读路径均并发安全 |
+| `*_batch`（text/vector/hybrid） | 是 | inter-query 并发跑共享 Search 池 |
+| `set_synonym_map` | **否**（配置类）| 改 `synonym_map_`，须先于并发查询配置或外部串行化 |
 | `status` / `is_empty_estimate` / `is_frozen` / `needs_merge` | 是 | 只读快照 |
-| `merge` | 是（前提 `merge_only` + 持 `merge.lock`）| read_write Cask 上不可与 put 并发 |
-| `CaskIter::start` / `next` / `next_batch` / `release` | 否（同一对象）| 不同 CaskIter 对象可并发 |
+| `merge` | 是 | 与读写并发（经 keydir shared_mutex 协调，不取 write_mu_）；跨进程 merge 经 `merge.lock` |
+| `parallel_scan` | 是 | 全表并行扫描：单次快照 live key → 分 N 段 → 并发 get；`fn` 须线程安全 |
+| `CaskIter::start` / `next` / `next_batch` / `release` | 否（同一对象）| 每线程一个迭代器；不同 CaskIter 对象可并发；并行遍历用 `parallel_scan` |
 
-> 并发 merge 与 live writer 通过双锁模型（`write.lock` / `merge.lock`）并行不互斥。详见 [`concurrency-zh.md`](concurrency-zh.md)。
+> **读写并发**：搜索可见性遵循 near-real-time 契约（`prepare_search` flush 覆盖调用前的写）。
+> **更高写并发**：写在文件层本就串行（单 append WAL），`write_mu_` 不损吞吐；需要更高写
+> 并发请**按目录分片多个 Cask 实例**（横向扩展）。
+> 并发 merge 与 live writer 通过双锁模型（`write.lock` / `merge.lock`）并行不互斥。详见
+> [`concurrency-zh.md`](concurrency-zh.md)。
