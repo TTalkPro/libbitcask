@@ -283,6 +283,12 @@ public:
     [[nodiscard]] bool is_iterating() const noexcept { return iter_ != nullptr; }
 
 private:
+    friend class Cask;  // S11-W4：Cask::parallel_scan 调用 drain_live_keys()
+
+    // S11-W4：排干所有 live key（仅 key 拷贝，**不读 value**——走 keydir proxy）。
+    // 供 Cask::parallel_scan 取快照后分区并行 get。start() 之后调用,消费迭代器。
+    [[nodiscard]] std::vector<std::vector<std::byte>> drain_live_keys();
+
     // S13：fold 启动时 pin 一份「目录下全部 data file」的只读句柄快照。
     // 并发 merge 在 fold 期间 unlink 旧文件时，已 open 的 fd 让 inode 在
     // Linux 上存活，next() 仍能从 pin 的句柄 pread——不会因文件被删而失败。
@@ -357,6 +363,23 @@ public:
     /// P9:当前常驻的 read 句柄数（read_files_ 大小）。内省用（测试断言 fd
     /// 预算上限生效）。线程安全：共享锁读。
     [[nodiscard]] std::size_t read_handle_count() const;
+
+    // S11-W4：并行全表扫描回调。`fn(key, value)` 对每个 live 文档调用一次；
+    // value 是借用本工作线程 read 缓冲的零拷贝 view（仅在本次回调内有效）。
+    // **fn 必须线程安全**——不同工作线程并发调用,各处理不相交 key 段。
+    using ScanFn = std::function<void(std::span<const std::byte> key,
+                                      const GetResultView& value)>;
+
+    // S11-W4：并行全表扫描——单次快照所有 live key（在调用线程串行,仅 key 拷贝,
+    // 不读 value），按 `n_threads` 分段,各线程并发 `get()` 读值并调 `fn`。把 W1-W3
+    // 建立的「多线程读安全」用于全表扫描（analytics/export/reindex）。读值的 pread+
+    // decode 是被并行化的成本;单 append WAL 写串行不受影响。
+    //   n_threads==0 → hardware_concurrency()。
+    //   并发删除致某 key 在 get 时 kNotFound → 跳过（near-real-time,与搜索一致）；
+    //   其它错误（IO/CRC）→ 停止并返回该错误。返回成功遍历到的 key 数。
+    // 线程安全: 是（快照串行建立 + get 并发安全）。Cask 已 close → kInvalidOption。
+    [[nodiscard]] std::expected<std::size_t, CaskFault>
+    parallel_scan(std::size_t n_threads, const ScanFn& fn);
 
     // 写入。tstamp=0 表示用当前 wall-clock 秒。
     // 线程安全: **是**（S11-W1：内部 `write_mu_` 串行化整个写序列;同一 handle 可

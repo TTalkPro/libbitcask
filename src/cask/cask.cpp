@@ -334,6 +334,20 @@ CaskIter::next_batch(std::size_t max_n) {
     return batch;
 }
 
+// S11-W4：排干 live key（仅 key，不读 value）。走 keydir proxy（含 key + 定位，
+// 无 pread），比逐条 next()（每条 pread+decode）廉价得多 → 供 parallel_scan 取
+// 快照后并行读值。消费迭代器（推进 cursor 到尾）。
+std::vector<std::vector<std::byte>> CaskIter::drain_live_keys() {
+    std::vector<std::vector<std::byte>> out;
+    if (!iter_ || !iter_->is_iterating()) return out;
+    // include_tombstones=false → keydir 层跳过墓碑，只给 live key。
+    while (auto proxy = iter_->next(/*include_tombstones=*/false)) {
+        const auto* p = reinterpret_cast<const std::byte*>(proxy->key.data());
+        out.emplace_back(p, p + proxy->key.size());
+    }
+    return out;
+}
+
 void CaskIter::release() noexcept {
     if (iter_) {
         iter_->release();
@@ -1387,6 +1401,69 @@ Cask::get_owned(std::span<const std::byte> key) {
     auto v = get(key);
     if (!v) return std::unexpected(v.error());
     return v->to_owned();
+}
+
+// S11-W4：并行全表扫描。快照 live key（串行,廉价）→ 分段 → N 个 std::thread
+// 并发 get + fn（读值的 pread+decode 是被并行化的成本）。
+std::expected<std::size_t, CaskFault>
+Cask::parallel_scan(std::size_t n_threads, const ScanFn& fn) {
+    if (is_closed()) {
+        return std::unexpected(err(CaskError::kInvalidOption, "cask is closed"));
+    }
+    // 1) 单次快照所有 live key（调用线程串行,仅 key 拷贝,不读 value）。
+    auto it = make_iter();
+    auto sr = it->start(/*maxage=*/-1, /*maxputs=*/-1, /*now_sec=*/0,
+                        /*see_tombstones=*/false);
+    if (!sr) return std::unexpected(sr.error());
+    if (*sr != keydir::StartIterResult::kOk) {
+        return std::unexpected(err(CaskError::kIo,
+            "parallel_scan: keydir iterator out of date"));
+    }
+    auto keys = it->drain_live_keys();
+    it->release();
+
+    const std::size_t total = keys.size();
+    if (total == 0) return std::size_t{0};
+
+    std::size_t nthr = (n_threads == 0)
+                           ? std::max<std::size_t>(std::thread::hardware_concurrency(), 1)
+                           : n_threads;
+    nthr = std::min(nthr, total);
+
+    // 2) 分段并发：各线程 get + fn 自己的不相交 key 段。并发删除 → kNotFound
+    //    跳过（near-real-time）；其它错误记录第一例并令各线程尽快收尾。
+    std::atomic<bool> ok{true};
+    std::mutex err_mu;
+    CaskFault first_err{};
+    auto worker = [&](std::size_t begin, std::size_t end) {
+        for (std::size_t i = begin; i < end; ++i) {
+            if (!ok.load(std::memory_order_relaxed)) return;
+            auto v = get(keys[i]);
+            if (v) {
+                fn(keys[i], *v);
+            } else if (v.error().kind != CaskError::kNotFound) {
+                std::lock_guard<std::mutex> lk(err_mu);
+                if (ok.exchange(false)) first_err = v.error();
+                return;
+            }
+        }
+    };
+
+    if (nthr <= 1) {
+        worker(0, total);
+    } else {
+        std::vector<std::thread> ws;
+        ws.reserve(nthr);
+        const std::size_t chunk = (total + nthr - 1) / nthr;
+        for (std::size_t t = 0; t < nthr; ++t) {
+            const std::size_t b = t * chunk;
+            if (b >= total) break;
+            ws.emplace_back(worker, b, std::min(b + chunk, total));
+        }
+        for (auto& w : ws) w.join();
+    }
+    if (!ok.load()) return std::unexpected(first_err);
+    return total;
 }
 
 // --- GetResultView implementation ---

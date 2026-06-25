@@ -645,4 +645,63 @@ TEST_F(CrashRecoveryTest, OperationsAfterCloseReturnErrorNotUb) {
     (*c)->close();
 }
 
+// S11-W4：并行全表扫描——所有 live key 恰好被访问一次、value 正确、并发 fn 安全。
+TEST_F(CrashRecoveryTest, ParallelScanVisitsAllKeysOnce) {
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    constexpr int kN = 2000;
+    for (int i = 0; i < kN; ++i) {
+        ASSERT_TRUE((*c)->put(bytes(key_for(i)), bytes(value_for(i))));
+    }
+    // 删一部分 → 不应出现在扫描中。
+    for (int i = 0; i < kN; i += 10) {
+        ASSERT_TRUE((*c)->remove(bytes(key_for(i))));
+    }
+
+    std::mutex mu;
+    std::map<std::string, std::string> seen;
+    auto collect = [&](std::span<const std::byte> k, const bitcask::GetResultView& v) {
+        std::string ks(reinterpret_cast<const char*>(k.data()), k.size());
+        std::string vs(reinterpret_cast<const char*>(v.value.data()), v.value.size());
+        std::lock_guard<std::mutex> lk(mu);
+        auto [it, fresh] = seen.emplace(std::move(ks), std::move(vs));
+        EXPECT_TRUE(fresh) << "key 被访问多次: " << it->first;  // 恰好一次
+    };
+
+    auto n = (*c)->parallel_scan(4, collect);
+    ASSERT_TRUE(n);
+    const std::size_t expected = static_cast<std::size_t>(kN - (kN + 9) / 10);
+    EXPECT_EQ(*n, expected);
+    EXPECT_EQ(seen.size(), expected);
+    // 内容正确 + 被删的不在。
+    for (int i = 0; i < kN; ++i) {
+        auto it = seen.find(key_for(i));
+        if (i % 10 == 0) {
+            EXPECT_EQ(it, seen.end()) << "已删 key 出现在扫描: " << key_for(i);
+        } else {
+            ASSERT_NE(it, seen.end()) << "缺 key: " << key_for(i);
+            EXPECT_EQ(it->second, value_for(i));
+        }
+    }
+
+    // n_threads=0 → hardware_concurrency；结果一致。
+    std::atomic<std::size_t> cnt{0};
+    auto count_only = [&](std::span<const std::byte>, const bitcask::GetResultView&) {
+        cnt.fetch_add(1, std::memory_order_relaxed);
+    };
+    auto n2 = (*c)->parallel_scan(0, count_only);
+    ASSERT_TRUE(n2);
+    EXPECT_EQ(*n2, expected);
+    EXPECT_EQ(cnt.load(), expected);
+
+    (*c)->close();
+    // close 后 fail-fast（W3）。
+    auto after = (*c)->parallel_scan(4, count_only);
+    ASSERT_FALSE(after);
+    EXPECT_EQ(after.error().kind, bitcask::CaskError::kInvalidOption);
+}
+
 }  // namespace
