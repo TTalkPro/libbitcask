@@ -264,7 +264,7 @@ KeyDir 全局标量（`epoch_` / `key_count_` / `key_bytes_` / `biggest_file_id_
 
 ## C API 导出
 
-`c_api/bitcask_c.{h,cpp}` 提供 `extern "C"` ABI，由 `libbitcask.so`（`SOVERSION=1`）导出，供跨语言绑定（Python / Rust / Go / Node …）使用。设计要点：
+`c_api/bitcask_c.{h,cpp}` 提供 `extern "C"` ABI，由 `libbitcask.so`（`SOVERSION=3`）导出，供跨语言绑定（Python / Rust / Go / Node …）使用。设计要点：
 
 - **不透明句柄**：`bitcask_t` / `bitcask_iter_t` 是 forward-declared struct，调用方只持有指针。
 - **显式内存配对**：每个返回堆分配的函数都有对应的 `*_free`（如 `bitcask_get_result_free`、`bitcask_search_result_free`、`bitcask_iter_entry_free`、`bitcask_needs_merge_free`）。
@@ -283,7 +283,7 @@ KeyDir 全局标量（`epoch_` / `key_count_` / `key_bytes_` / `biggest_file_id_
 | 结构化文档 | `bitcask_put_doc` |
 | BM25 搜索 | `bitcask_search_text`, `bitcask_search_phrase`, `bitcask_bool_search`, `bitcask_search_fields`, `bitcask_search_near`, `bitcask_search_fuzzy`, `bitcask_search_wildcard` |
 | 向量 / 混合 | `bitcask_search_vector`（HNSW）, `bitcask_search_hybrid`（RRF 融合） |
-| 词典 | `bitcask_set_synonym_map`, `bitcask_search_result_free` |
+| 词典 | 同义词经 `options.synonym_file_path`（open-time）；`bitcask_search_result_free` |
 | 迭代 | `bitcask_iter_start`, `bitcask_iter_next`, `bitcask_iter_next_batch`, `bitcask_iter_release`, `bitcask_iter_entry_free` |
 | 管理 | `bitcask_status`, `bitcask_needs_merge`, `bitcask_needs_merge_free`, `bitcask_merge`, `bitcask_is_empty`, `bitcask_is_frozen`, `bitcask_flush_index` |
 
@@ -291,7 +291,7 @@ KeyDir 全局标量（`epoch_` / `key_count_` / `key_bytes_` / `biggest_file_id_
 
 - **线程安全（读）**：`bitcask_get` / `bitcask_search_*`（text/phrase/bool/fields/near/fuzzy/wildcard/vector/hybrid）/ `bitcask_status` / `bitcask_is_*` / `bitcask_needs_merge` / `bitcask_flush_index`
 - **线程安全（写）**：`bitcask_put` / `bitcask_delete` / `bitcask_put_doc` / `bitcask_sync` / `bitcask_close_write_file` / `bitcask_merge`——S11-W1 内部 `write_mu_` 串行化，同一 handle 多线程写安全（写在文件层本就串行 → 锁不损吞吐；更高写并发 → 按目录分片多实例）。读写并发安全（搜索 near-real-time）。
-- **例外**：`bitcask_set_synonym_map`（配置类，须先于并发查询配置）；`bitcask_close`（生命周期，close 即 free 句柄，须无在途调用）；同一 `bitcask_iter_t` 不可并发（每线程一个）。
+- **例外**：`bitcask_close`（生命周期，close 即 free 句柄，须无在途调用）；同一 `bitcask_iter_t` 不可并发（每线程一个）。（同义词词典已改为 open-time 不可变配置 `options.synonym_file_path`，无并发竞态。）
 - 并行全表扫描：C++ `Cask::parallel_scan`（C-only host 可自行多线程 `bitcask_get`）。
 
 完整契约见 [`design/thread-safety.md`](design/thread-safety.md)；原型见 [`api-c.md`](api-c.md) 与 `c_api/bitcask_c.h`。
@@ -324,7 +324,7 @@ cmake --install build        # 头文件、libbitcask.{so,a}、bitcask_c.h
 
 产物：
 
-- `libbitcask.so` — 共享库，导出 C API（`SOVERSION=1`）
+- `libbitcask.so` — 共享库，导出 C API（`SOVERSION=3`）
 - `libbitcask.a` — 把全部静态归档合并为单一 `.a`
 - `migrate_le` — 旧大端目录 → 小端目录的离线迁移工具
 - `gen_inert_table` — NFKC 惰性区间表代码生成器（构建期自动执行）

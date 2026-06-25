@@ -2,7 +2,7 @@
 
 本文档是 libbitcask C ABI 的完整参考，面向跨语言 FFI 绑定作者（Python / Rust / Go / Node 等）。权威来源为 `c_api/bitcask_c.h`。配套阅读：[`api-cpp.md`](api-cpp.md)（被包装的 C++ 接口）、[`cpp-arch.md`](cpp-arch.md)（架构）。
 
-C API 是 C++ `bitcask::Cask` 的薄包装，符号导出由 `BITCASK_API` 宏控制，编译为 `libbitcask.so`（`SOVERSION=1`）。
+C API 是 C++ `bitcask::Cask` 的薄包装，符号导出由 `BITCASK_API` 宏控制，编译为 `libbitcask.so`（`SOVERSION=3`）。
 
 ---
 
@@ -401,12 +401,11 @@ bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
 ```
 `text_query=NULL` → 纯向量；`vec_query=NULL` → 纯文本；两路都空 → `ERR_INVALID_OPTION`。
 
-### `bitcask_set_synonym_map`
-```c
-bitcask_error_t bitcask_set_synonym_map(bitcask_t* cask, const char* path,
-                                        bitcask_fault_t* fault);
-```
-从 `path` 加载同义词词典。
+### 同义词词典（open-time 配置）
+运行期 `bitcask_set_synonym_map` **已移除**。改在 open 时设
+`bitcask_options_t::synonym_file_path`（同义词文件路径，每行一组、逗号分隔）：
+词典一次性加载、**不可变 → 并发查询安全**；文件无法打开 → `bitcask_open` 返
+`BITCASK_ERR_INVALID_OPTION`。运行期更换请重开库。
 
 ### `bitcask_search_result_free`
 ```c
@@ -530,7 +529,7 @@ void bitcask_flush_index(bitcask_t* cask);
 | `bitcask_put` / `bitcask_delete` / `bitcask_sync` / `bitcask_close_write_file` | ✅（S11-W1：内部 `write_mu_` 串行化；同一 handle 多线程写安全。更高写并发 → 按目录分片多实例）|
 | `bitcask_search_text` / `_phrase` / `_bool` / `_fields` / `_near` / `_fuzzy` / `_wildcard` | ✅（并发读安全）|
 | `bitcask_search_vector` / `bitcask_search_hybrid` | ✅（HNSW 读路径）|
-| `bitcask_set_synonym_map` | ⚠️（配置类：须先于并发查询配置或外部串行化）|
+| 同义词词典（`options.synonym_file_path`，open-time） | ✅（不可变 → 并发查询安全；无运行期 setter）|
 | `bitcask_iter_*` | ⚠️（同一 iter 不可并发；每线程一个迭代器）|
 | `bitcask_status` / `bitcask_needs_merge` / `bitcask_merge` / `bitcask_is_empty` / `bitcask_is_frozen` / `bitcask_flush_index` | ✅ |
 

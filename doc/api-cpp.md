@@ -344,11 +344,22 @@ search_hybrid(std::string_view text_query,
 - `filter` 同时作用于两路。返回 score = RRF 分。
 - **线程安全**：是（两条内核读路径均并发安全）。
 
-#### `set_synonym_map`
+#### 同义词词典（open-time 配置）
 ```cpp
-void set_synonym_map(std::unique_ptr<text::SynonymMap> map);
+// CaskOptions 字段（Cask 级、不可变）：
+std::shared_ptr<const text::SynonymMap> synonym_map;
 ```
-设置同义词词典，查询时自动展开。⚠️ **线程安全：否**——配置类方法，与并发查询竞态（改 `synonym_map_` 指针，而搜索读它）。契约：**必须在并发查询开始前配置**（或外部串行化）；典型用法是 open 后、对外服务前设一次。
+同义词词典在 **`Cask::open` 时**经 `CaskOptions::synonym_map` 配置：`search_text` /
+`search_fields` 查询时自动展开同义词（短语/近邻/布尔/向量不展开）。构造后**不可变** →
+并发查询**天然安全，无需锁**。运行期 setter（旧 `set_synonym_map`）**已移除**——它曾是
+配置项里唯一的 reader-vs-writer 竞态源。运行期更换词典请重开库；按请求用不同词典需
+自行在查询串里展开。用法：
+```cpp
+auto sm = std::make_shared<text::SynonymMap>();
+sm->add_group({"番茄", "西红柿", "tomato"});   // 或 sm->load_from_file(path)
+CaskOptions opts; opts.enable_search = true; /* ... */ opts.synonym_map = sm;
+auto c = Cask::open(dir, opts, &registry);
+```
 
 ### 5.5 搜索基础设施访问
 
@@ -641,7 +652,7 @@ it->release();
 | `search_text` / `_phrase` / `_bool` / `_fields` / `_near` / `_fuzzy` / `_wildcard` | ✅ | 并发读：cache_/doc_texts_ shared_mutex、InvertedIndex 分片 shared_lock、analyzer const |
 | `search_vector` / `search_hybrid` | ✅ | HNSW `atomic<shared_ptr>` 快照（读者引用计数续命）；两路内核读路径均并发安全 |
 | `*_batch`（text/vector/hybrid） | ✅ | inter-query 并发跑共享 Search 池（`search_arena`）；各结果槽独立 |
-| `set_synonym_map` | ⚠️ 配置类 | 改 `synonym_map_` 裸指针，与并发查询竞态 → 须先于并发查询配置或外部串行化 |
+| 同义词词典（`CaskOptions::synonym_map`） | ✅ | open-time 不可变 → 并发查询安全（无运行期 setter，无竞态） |
 | `status` / `is_empty_estimate` / `is_frozen` / `needs_merge` / `flush_index` | ✅ | 只读 keydir 快照 / IndexPool flush 自带 cv 同步 |
 | `merge` | ✅ | 写自有输出文件 + keydir shared_mutex 协调（不取 write_mu_，与读写并发）；跨进程经 `merge.lock` |
 | `parallel_scan` | ✅ | 串行快照 live key → 分 N 段 → 并发 `get`；`fn` 须线程安全（各处理不相交段） |
