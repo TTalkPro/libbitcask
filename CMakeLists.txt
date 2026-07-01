@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
-project(libbitcask CXX)
+# 版本单一真源（S12-7）：project(VERSION ...) 是唯一手写版本处。
+# 库 SOVERSION 与 C API bitcask_version_* 均从此派生，杜绝三处手工同步漂移。
+project(libbitcask VERSION 3.0.0 LANGUAGES CXX)
+
+# 由 project 版本生成 C API 版本头（configure 时展开 @PROJECT_VERSION*@）。
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/c_api/bitcask_version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/bitcask_version.h"
+    @ONLY)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -354,13 +362,15 @@ endif()
 
 # libbitcask.so — 共享库, C API (extern "C") 跨 ABI 稳定
 add_library(bitcask_shared SHARED c_api/bitcask_c.cpp)
-target_include_directories(bitcask_shared PUBLIC include c_api)
+target_include_directories(bitcask_shared
+    PUBLIC include c_api
+    PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")  # 生成的 bitcask_version.h
 target_link_libraries(bitcask_shared PRIVATE bitcask_cask)
 target_compile_definitions(bitcask_shared PRIVATE BITCASK_DLL_EXPORTS)
 set_target_properties(bitcask_shared PROPERTIES
     OUTPUT_NAME "bitcask"
-    VERSION 3.0.0
-    SOVERSION 3
+    VERSION "${PROJECT_VERSION}"
+    SOVERSION "${PROJECT_VERSION_MAJOR}"
 )
 add_library(Bitcask::shared ALIAS bitcask_shared)
 

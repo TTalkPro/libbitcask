@@ -5,8 +5,10 @@
 #include <filesystem>
 #include <vector>
 
+#include "bitcask/byte_order.hpp"
 #include "bitcask/codec.hpp"
 #include "bitcask/data_file.hpp"
+#include "bitcask/field_schema.hpp"
 #include "bitcask/format.hpp"
 #include "bitcask/hint_file.hpp"
 
@@ -185,8 +187,13 @@ migrate_field_schema(const fs::path& src_dir, const fs::path& dst_dir,
     auto bytes = read_all(src_fs);
     if (!bytes) return std::unexpected(bytes.error());
 
+    // 输出新格式（S12-3）：文件头 [magic:u32][version:u32] + 每条 [len:u16][name][crc32:u32]。
     std::vector<std::byte> out;
-    out.reserve(bytes->size());
+    out.reserve(bytes->size() + FieldSchema::kHeaderSize);
+    out.resize(FieldSchema::kHeaderSize);
+    le_store_u32(out.data(), FieldSchema::kMagic);
+    le_store_u32(out.data() + 4, FieldSchema::kVersion);
+
     const std::byte* b = bytes->data();
     const std::size_t n = bytes->size();
     std::size_t pos = 0;
@@ -194,9 +201,15 @@ migrate_field_schema(const fs::path& src_dir, const fs::path& dst_dir,
         const std::uint16_t nlen = be_u16(b + pos);  // 旧大端
         pos += 2;
         if (pos + nlen > n) break;  // 截断,停。
-        out.push_back(static_cast<std::byte>(nlen & 0xFF));         // 小端
-        out.push_back(static_cast<std::byte>((nlen >> 8) & 0xFF));
-        out.insert(out.end(), b + pos, b + pos + nlen);
+        // entry = [len:u16 LE][name] + CRC32(over [len|name])，全部小端。
+        std::vector<std::byte> entry(2 + nlen);
+        le_store_u16(entry.data(), nlen);
+        std::memcpy(entry.data() + 2, b + pos, nlen);
+        const std::uint32_t crc = codec::crc32(entry);
+        out.insert(out.end(), entry.begin(), entry.end());
+        std::byte cb[4];
+        le_store_u32(cb, crc);
+        out.insert(out.end(), cb, cb + 4);
         pos += nlen;
     }
     if (auto r = write_all(dst_dir / "field.schema", out); !r) {

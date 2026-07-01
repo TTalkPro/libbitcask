@@ -1547,9 +1547,11 @@ TEST_F(CaskDocValueTest, P9ReadHandleCapEvictsAndRereads) {
     }
     (*c)->close();
 
-    // cap=0 → 不限:读完所有文件后常驻句柄数 = 文件数(> 4)。
+    // 显式不限:读完所有文件后常驻句柄数 = 文件数(> 4)。
+    // （S12-1 后默认 0 = 自动上限，须用哨兵显式请求不限。）
     CaskOptions u;
-    u.read_write = false;  // max_read_handles 默认 0
+    u.read_write = false;
+    u.max_read_handles = CaskOptions::kUnlimitedReadHandles;
     auto c2 = Cask::open(tmpdir_.string(), u, &test_registry());
     ASSERT_TRUE(c2);
     for (int i = 0; i < N; ++i) {
@@ -1558,6 +1560,68 @@ TEST_F(CaskDocValueTest, P9ReadHandleCapEvictsAndRereads) {
     }
     EXPECT_GT((*c2)->read_handle_count(), 4u);
     (*c2)->close();
+}
+
+// S12-1：read 句柄上限解析（纯函数，确定性）。
+TEST(ReadHandleCap, ResolveSemantics) {
+    using bitcask::Cask;
+    using bitcask::CaskOptions;
+    // 显式不限哨兵 → 0（evict 语义下不限），与 nofile 无关。
+    EXPECT_EQ(Cask::resolve_read_handle_cap(CaskOptions::kUnlimitedReadHandles, 1024u), 0u);
+    EXPECT_EQ(Cask::resolve_read_handle_cap(CaskOptions::kUnlimitedReadHandles, 16u), 0u);
+    // 显式上限 → 原样。
+    EXPECT_EQ(Cask::resolve_read_handle_cap(7u, 1024u), 7u);
+    EXPECT_EQ(Cask::resolve_read_handle_cap(4096u, 1024u), 4096u);
+    // 自动（0）→ 约一半，下限 64。
+    EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 1024u), 512u);
+    EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 2048u), 1024u);
+    EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 100u), 64u);   // 50 < 64 → 抬到下限
+    EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 0u), 64u);     // 极端：仍给下限
+}
+
+// S12-2：auto-compact 开启下，并发读者 + churn 写者经异步管线（reducer 线程内触发
+// compact）无 data race、结果最终一致、posting 有界。TSan 下为主要护栏。
+TEST_F(CaskDocValueTest, AutoCompactConcurrentReadersNoRace) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.auto_compact_dead_ratio = 0.5;  // 开
+    opts.search_config = sl_cfg;
+
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    constexpr int K = 16;
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 3; ++t) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto sr = (*c)->search_text("hello", 50);  // 只求不崩不 race
+                (void)sr;
+            }
+        });
+    }
+
+    std::uint32_t ts = 1000;
+    for (int round = 0; round < 200; ++round) {   // 200*16=3200 次写，≫ 阈值 → 多次触发
+        for (int i = 0; i < K; ++i) {
+            bitcask::DocInput doc;
+            const std::string text = "hello world";
+            doc.text = sv_bytes(text);
+            ASSERT_TRUE((*c)->put_doc(sv_bytes("k" + std::to_string(i)), doc, ts++));
+        }
+    }
+    stop.store(true);
+    for (auto& th : readers) th.join();
+
+    (*c)->flush_index();
+    auto sr = (*c)->search_text("hello", 50);
+    ASSERT_TRUE(sr);
+    EXPECT_EQ(sr->hits.size(), static_cast<std::size_t>(K));   // 最终恰 K 篇 live
+    EXPECT_LT((*c)->search()->total_postings(), 2000u);        // 有界回收
+    (*c)->close();
 }
 
 // 校验:dim 不符 / 未配置却带向量 / cosine 下零向量,全部拒绝。

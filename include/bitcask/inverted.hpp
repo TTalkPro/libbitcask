@@ -351,6 +351,9 @@ public:
     [[nodiscard]] auto live_doc_count() const -> std::uint64_t;
     [[nodiscard]] auto sum_doc_len() const -> std::uint64_t;
     [[nodiscard]] auto avg_doc_len() const -> double;
+    // 所有 posting list 的 items 总数（含尚未压实的死点）。内省/测试用：
+    // 观测 compaction 效果与 posting 膨胀。非并发安全遍历——须在静止时调用。
+    [[nodiscard]] std::size_t total_postings() const;
 
     // 调试：返回 term 的 df（posting list 长度，含死点）。
     [[nodiscard]] auto df(std::string_view term) const -> std::size_t;

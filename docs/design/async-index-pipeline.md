@@ -1,6 +1,18 @@
 # 设计评审稿：异步索引 MapReduce 流水线（全局双池）
 
-> 状态：**评审中**（未实现）
+> 状态：**已落地**（代号 S6，P0–P4；本稿为原始评审设计，仅存历史）。
+> 更新（核实于 2026-07-01）：设计主体已在生产路径实现——全局共享 Map 池（并行分词）
+> + per-lane reorder buffer（`std::map<ord, ReduceJob> pending` + `next_apply_ord`
+> 严格 ord 序 drain，`thread_pool.hpp:253/521-565`）、skip-marker 填 ord 空洞
+> （`IndexOp::Skip`，`cask.cpp:1292-1294`）、双路背压（入队有界队列 + reorder 在途上限，
+> `thread_pool.hpp:262-263`）、`flush(lane)` 水位（`thread_pool.hpp:354-362`）、
+> **apply 抛异常仍无条件推进 `next_apply_ord` + 记 metric**（§8 红线，
+> `thread_pool.hpp:544-553`、`cask.cpp:540`）均已落地。Cask open 注册 lane / close 注销
+> （`cask.cpp:508-544`）。
+> **与本稿的唯一偏差**：Reduce 端实现为**单 reducer 线程**串行轮扫所有 lane
+> （`thread_pool.hpp:597`），替代本稿 §5 的「M 线程池 + per-库 `apply_mu` 令牌」，
+> 因此「**库间 apply 并发**」未实现（只有 Map 阶段并行；库间靠单线程天然串行换取 I2/I3）。
+> 若未来多库高写入吞吐成为瓶颈，可回到本稿 §5 的 M 线程池方案。
 > 作者：—　日期：2026-06-23
 > 关联：TASK.md S1（否决）/ S3（恢复期已验证的并行 analyze 先例）
 > 一句话：把「每库一个串行 worker」改为「**全局共享 Map 池（并行分词）+ 全局共享 Reduce 池（per-库串行 apply）**」，解决热点库吞吐瓶颈 + 库数膨胀导致的线程爆炸。

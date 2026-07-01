@@ -147,13 +147,17 @@ float l2_avx2(const float* a, const float* b, std::size_t n) {
 // 检验见 cpp/bench/distance_bench.cpp。
 __attribute__((target("avx512f")))
 float hsum512(__m512 v) {
-#if defined(__GNUC__) && (__GNUC__ >= 10)
-    // GCC 10+/Clang 的 _mm512_reduce_add_ps:内部即树形归并,单指令。
+#if defined(__clang__) || (defined(__GNUC__) && (__GNUC__ >= 10))
+    // Clang 与 GCC 10+ 的 _mm512_reduce_add_ps:内部即树形归并,单指令。
+    // 注意:clang 的 __GNUC__ 恒为 4（GCC 4.2.1 兼容伪装），必须显式 defined(__clang__)
+    // 才能走此路径——否则落入下方 #else 的手工归并（S12-7 修:clang 曾在此编译失败）。
     return _mm512_reduce_add_ps(v);
 #else
     // 兼容旧编译器:手工两两归并(8 步加法 vs 横向 ~16 步)。
+    // 取高 256 位:经 f64 视图 extract 高 4×f64（= 256 位），仅需 AVX512F。
     __m256 lo = _mm512_castps512_ps256(v);
-    __m256 hi = _mm512_extractf64x4_ps(v, 1);
+    __m256 hi = _mm256_castpd_ps(
+        _mm512_extractf64x4_pd(_mm512_castps_pd(v), 1));
     __m256 s256 = _mm256_add_ps(lo, hi);
     __m128 lo2 = _mm256_castps256_ps128(s256);
     __m128 hi2 = _mm256_extractf128_ps(s256, 1);

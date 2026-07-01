@@ -336,6 +336,19 @@ bitcask_error_t bitcask_search_text(bitcask_t* cask, const char* query,
                                     bitcask_fault_t* fault);
 ```
 
+### `bitcask_search_text_batch`（批量词袋）
+一次 `prepare_search` flush 覆盖全批，比逐条调用省重复索引 flush。`queries` 为 `n` 个
+NUL 结尾查询串；`*out_results` 指向 malloc 的 `n` 元数组，`out_results[i]` 为第 `i` 个查询的
+结果（该查询失败则为 `NULL`，无命中则 `count==0` 的非空结果）。`fault` 回填首个失败查询详情。
+用 `bitcask_search_result_batch_free(results, n)` 释放。`n==0` → `*out_results=NULL` 且返回 OK。
+```c
+bitcask_error_t bitcask_search_text_batch(bitcask_t* cask, const char* const* queries,
+                                          size_t n, size_t k,
+                                          bitcask_search_result_t*** out_results,
+                                          bitcask_fault_t* fault);
+void bitcask_search_result_batch_free(bitcask_search_result_t** results, size_t n);
+```
+
 ### `bitcask_search_phrase`（短语）
 ```c
 bitcask_error_t bitcask_search_phrase(bitcask_t* cask, const char* query,
@@ -391,6 +404,17 @@ bitcask_error_t bitcask_search_vector(bitcask_t* cask,
 ```
 `query_len` 必须等于 `vector_dim`；`ef=0` → `max(k,64)`。
 
+### `bitcask_search_vector_batch`（批量向量）
+一次 flush 覆盖全批。`queries` 为 `n` 个向量指针（每个 `query_len` 个 f32）。结果数组语义/
+释放同 `bitcask_search_text_batch`（`bitcask_search_result_batch_free`）。
+```c
+bitcask_error_t bitcask_search_vector_batch(bitcask_t* cask,
+                                            const float* const* queries, size_t n,
+                                            size_t query_len, size_t k, size_t ef,
+                                            bitcask_search_result_t*** out_results,
+                                            bitcask_fault_t* fault);
+```
+
 ### `bitcask_search_hybrid`（RRF 混合）
 ```c
 bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
@@ -400,6 +424,18 @@ bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
                                       bitcask_fault_t* fault);
 ```
 `text_query=NULL` → 纯向量；`vec_query=NULL` → 纯文本；两路都空 → `ERR_INVALID_OPTION`。
+
+### `bitcask_search_hybrid_batch`（批量混合）
+一次 flush 覆盖全批。每条查询是 `bitcask_hybrid_query_t{text, vector, vector_len}`（text/vector
+至少一非空）。结果数组语义/释放同 `bitcask_search_text_batch`。
+```c
+typedef struct { const char* text; const float* vector; size_t vector_len; } bitcask_hybrid_query_t;
+
+bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
+                                            const bitcask_hybrid_query_t* queries, size_t n,
+                                            size_t k, bitcask_search_result_t*** out_results,
+                                            bitcask_fault_t* fault);
+```
 
 ### 同义词词典（open-time 配置）
 运行期 `bitcask_set_synonym_map` **已移除**。改在 open 时设
@@ -456,6 +492,21 @@ void bitcask_iter_entry_free(bitcask_iter_entry_t* entry);
 ```
 释放 entry 内部缓冲（key/value 的 malloc 缓冲）。
 - **内存配对**：`bitcask_iter_next` / `_next_batch` 的每条 entry ↔ `bitcask_iter_entry_free`。
+
+### `bitcask_parallel_scan`（并行全表扫描）
+单次快照所有 live key（调用线程串行，仅拷 key），按 `n_threads` 分段并发 `get` 读值并调
+回调——把「多线程读安全」用于 analytics / export / reindex。`n_threads==0` → `hardware_concurrency`。
+成功时 `*out_count`（可为 NULL）= 遍历到的 key 数。
+```c
+typedef void (*bitcask_scan_fn)(void* ctx, bitcask_slice_t key, bitcask_slice_t value);
+
+bitcask_error_t bitcask_parallel_scan(bitcask_t* cask, size_t n_threads,
+                                      bitcask_scan_fn fn, void* ctx,
+                                      size_t* out_count, bitcask_fault_t* fault);
+```
+- **回调可能来自多个工作线程并发调用**——回调内写共享状态须自行加锁/用原子。
+- `key`/`value` 是零拷贝 view，仅在本次回调内有效（需保留请自行拷贝）。
+- 并发删除致某 key `get` 时 not-found → 跳过（near-real-time）；IO/CRC 错误 → 停止并返回。
 
 ---
 

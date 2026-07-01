@@ -95,8 +95,12 @@ recall@10 ef64 = **0.9650（−3.5% vs f32）**——query 量化的额外误差
 - **P5b**（已落地）：`CaskOptions.vector_inmem_int8` + NIF atom/解析 + erl 透传白名单；
   `MetaConfig.vector_inmem_int8` 持久化到 `bitcask.meta` offset[10]（旧文件全零=否）；
   `check_or_create_meta` 重开一致校验（不符 → kModeMismatch）+ kL2 拒绝（kInvalidOption）；
-  meta → `SearchLayerConfig` → `HnswConfig.inmem_int8` 透传。BCVS 快照适配已在 P5a 完成
-  （盘存 f32、load 量化）；盘上直接存 int8 的优化仍未做（可选，收益仅省一次 dequant 往返）。
+  meta → `SearchLayerConfig` → `HnswConfig.inmem_int8` 透传。BCVS 快照适配 P5a 完成时
+  为「盘存 f32、load 量化」；**盘上直接存 int8 已在 V7 落地**（BVH2 v2 段直接持久化
+  `qcodes int8[dim] | qscale f32 | qsum i32`，load 不再 re-quantize，
+  `hnsw.cpp:1243-1257`、段布局 `hnsw.cpp:988`、`hnsw.hpp:184`）。另 DocValue 数据文件
+  的 int8 落盘（P3 / `vector_quantized`）亦已实现（`codec.cpp:148-173/220-302`，
+  接线 `cask.cpp:1729`）。故此处「仍未做」为过期注释，两条盘上 int8 路径均已落地。
   测试：`P5bInmemInt8OpenSearchAndReopen` / `P5bInmemInt8RejectsL2` /
   `P5bInmemInt8ComposesWithQuantized`。
 - **P5c**（已落地，部分）：召回 gate `Int8OnlyRecallGate_Dim2560`（真实 inmem_int8 +

@@ -1,0 +1,11 @@
+// 自动生成，请勿手改。版本单一真源 = CMakeLists.txt 的 project(libbitcask VERSION ...)。
+// configure 时由 CMake 展开 @PROJECT_VERSION*@，供 c_api/bitcask_c.cpp 使用。
+#ifndef BITCASK_VERSION_H
+#define BITCASK_VERSION_H
+
+#define BITCASK_VERSION_MAJOR  @PROJECT_VERSION_MAJOR@
+#define BITCASK_VERSION_MINOR  @PROJECT_VERSION_MINOR@
+#define BITCASK_VERSION_PATCH  @PROJECT_VERSION_PATCH@
+#define BITCASK_VERSION_STRING "@PROJECT_VERSION@"
+
+#endif  // BITCASK_VERSION_H

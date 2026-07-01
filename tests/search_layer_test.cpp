@@ -780,3 +780,56 @@ TEST(SearchLayer, CacheInvalidatedOnDeleteThenMissRecomputes) {
     EXPECT_TRUE(r3->empty())
         << "on_delete 失效缓存后，下次查询应 miss 重算，不返回已删文档";
 }
+// ---------------------------------------------------------------------------
+// S12-2：reducer 线程内自动 compaction。opt-in（auto_compact_dead_ratio>0）。
+// ---------------------------------------------------------------------------
+
+// 开启后：高 churn 下 posting 增长被有界回收（不依赖 merge），且搜索结果正确。
+TEST(SearchLayer, AutoCompactBoundsPostingGrowth) {
+    auto cfg = default_config();
+    cfg.auto_compact_dead_ratio = 0.5;  // 开
+    SearchLayer layer(cfg);
+
+    constexpr int K = 20;
+    constexpr int R = 300;
+    std::uint64_t ord = 0;
+    for (int i = 0; i < K; ++i) {
+        layer.on_write("k" + std::to_string(i), ord++, "hello", 1, 100, 10, 1000);
+    }
+    // 覆盖写 K*R 次 → K*R 次退休 ≫ 阈值 → 自动 compact 多次触发。
+    for (int r = 0; r < R; ++r) {
+        for (int i = 0; i < K; ++i) {
+            layer.on_write("k" + std::to_string(i), ord++, "hello", 1, 100, 10,
+                           static_cast<std::uint32_t>(1001 + r));
+        }
+    }
+    // 总写入 = 20 + 6000 = 6020；posting 被有界回收，远低于总写入。
+    EXPECT_LT(layer.total_postings(), 2000u);
+    // 搜索仍正确：恰 20 篇 live。
+    auto res = layer.search_text("hello", 100);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->size(), static_cast<std::size_t>(K));
+}
+
+// 关闭（默认 0）：死点全部保留（posting ≈ 总写入），但搜索仍正确（查询期过滤）。
+TEST(SearchLayer, NoAutoCompactWhenDisabledButSearchCorrect) {
+    auto cfg = default_config();  // auto_compact_dead_ratio = 0.0（默认关）
+    SearchLayer layer(cfg);
+
+    constexpr int K = 20;
+    constexpr int R = 300;
+    std::uint64_t ord = 0;
+    for (int i = 0; i < K; ++i) {
+        layer.on_write("k" + std::to_string(i), ord++, "hello", 1, 100, 10, 1000);
+    }
+    for (int r = 0; r < R; ++r) {
+        for (int i = 0; i < K; ++i) {
+            layer.on_write("k" + std::to_string(i), ord++, "hello", 1, 100, 10,
+                           static_cast<std::uint32_t>(1001 + r));
+        }
+    }
+    EXPECT_GT(layer.total_postings(), 6000u);  // 死点无回收
+    auto res = layer.search_text("hello", 100);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->size(), static_cast<std::size_t>(K));
+}

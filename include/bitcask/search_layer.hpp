@@ -50,7 +50,11 @@ namespace bitcask::search {
 
 // 默认字段名（S8.6）：旧单 text 文档 / 无字段限定查询都映射到此字段，
 // 使新旧路径收敛。用不可见控制字符前缀避免与用户字段名冲突。
-inline constexpr std::string_view kDefaultField = "\x01default";
+// 默认字段哨兵。历史：原意为 `\x01` + "default"，但 `\x` 转义会贪婪吞掉后续 hex 位
+// （"defa" 全是 hex）→ 实际编译为单字节 0xFA + "ult"（4 字节）。GCC 静默截断、clang
+// 直接报「hex escape out of range」。此值已作 fields_ 键 / 可能入 checkpoint，故**保留
+// 完全相同的 4 字节**（0xFA 'u' 'l' 't'），仅改写法让 clang 也能编译（相邻字面量断开转义）。
+inline constexpr std::string_view kDefaultField = "\xfa" "ult";
 
 // SearchLayer 配置。
 struct SearchLayerConfig {
@@ -74,6 +78,14 @@ struct SearchLayerConfig {
     // V6.2:WAL 批量刷新阈值。1 = 即时模式(默认,与旧版行为完全一致)。
     // >1 时积攒 entries 缓冲后单次 fwrite+fflush,减少 sync 调用次数。
     std::size_t          wal_batch_size = 1;
+    // S12-2：后台自动 compaction 的 per-list 死占比阈值。
+    //   0（默认）  → **关**：行为与旧版完全一致，索引流水线零开销（仅一次 double 比较）；
+    //   (0,1]      → **开**：在写入流水线的 reducer 线程内，累计退休文档达节流阈值
+    //                （max(1024, live/2)）时对死占比 ≥ 本值的 posting list 触发一次
+    //                compact()。与 add_doc/put_doc 同线程串行 → 无并发窗口（见 S12-2）。
+    // 效果：posting list 内存随 churn 有界，不再依赖 merge 才回收。代价：触发时 reducer
+    // 短暂扫描压实，延迟后续文档的**索引可见性**（非 durability——数据已落 data file）。
+    double               auto_compact_dead_ratio = 0.0;
     // 同义词词典（open-time，不可变）。由 Cask::open 从 CaskOptions::synonym_map
     // 透传进来（同 vector_dim 的注入方式）。构造后只读 → 并发查询安全，无需锁。
     // 空 = 不展开同义词。
@@ -371,6 +383,10 @@ public:
     // dead_doc_rate。无索引时 = IndexInfo 零值。
     [[nodiscard]] index::IndexInfo index_info() const { return index_.info(); }
 
+    // S12-2：所有字段所有 posting list 的 items 总数（含未压实死点）。内省/测试用。
+    // 非并发安全——须在静止时调用。
+    [[nodiscard]] std::size_t total_postings() const;
+
 private:
     // 高亮原文 LRU（S9.3）：ord → 原文，带容量上限。只为高亮路径服务；
     // 冷文档被挤出后高亮降级为无片段，不影响 BM25 检索本身。
@@ -435,6 +451,12 @@ private:
 
     // S10-A4：把字段名 intern 进 field_names_intern_，返回稳定 string_view（node 不失效）。
     std::string_view intern_field_name(std::string_view name);
+
+    // S12-2：写路径末尾（reducer 线程）的自动 compaction 触发。config_.auto_compact_dead_ratio
+    // <=0 时是单次 double 比较即返回（默认关，零开销）。开启后累计退休文档达节流阈值才
+    // 在本线程内 compact()——与 add_doc/put_doc 同线程，无并发窗口。由 reduce_apply /
+    // on_write / on_delete 末尾调用。
+    void maybe_auto_compact();
 
     // D2：抽出 5+ 处 search_* 共有的「bm25 结果集物化为 SearchHit」骨架：
     // 逐条 ord→ext 翻译（翻译失败跳过）+ 可选 MetaFilter 后过滤（空 meta 不通过）

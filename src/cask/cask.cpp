@@ -1,6 +1,7 @@
 #include "bitcask/cask.hpp"
 
 #include <signal.h>     // ::kill for stale-lock detection
+#include <sys/resource.h>  // ::getrlimit, RLIMIT_NOFILE（S12-1 read 句柄默认上限）
 #include <unistd.h>     // ::getpid, ::unlink
 
 #include <atomic>
@@ -411,7 +412,10 @@ Cask::upgrade(std::string_view dirname,
     auto cask = std::make_unique<Cask>();
     cask->dirname_ = std::string(dirname);
     cask->meta_config_ = new_mc;
-    cask->field_schema_.open((fs::path(dirname) / "field.schema").string());  // #1
+    if (!cask->field_schema_.open((fs::path(dirname) / "field.schema").string())) {  // #1
+        return std::unexpected(err(CaskError::kIo,
+            "field.schema corrupt or incompatible version"));
+    }
 
     cask->search_ = std::make_unique<search::SearchLayer>(search_config);
 
@@ -444,12 +448,28 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     cask->dirname_ = std::string(dirname);
     cask->opts_    = opts;
 
+    // S12-1：解析 read 句柄上限。默认(0)从 RLIMIT_NOFILE 软上限推导安全上限，
+    // 避免大库无界累积 fd/mmap 撞 `ulimit -n` / `vm.max_map_count`。显式值/不限
+    // 哨兵原样透传（见 resolve_read_handle_cap）。
+    {
+        std::size_t nofile = 1024;  // getrlimit 失败/INFINITY 时的保守兜底
+        struct ::rlimit rl{};
+        if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+            nofile = static_cast<std::size_t>(rl.rlim_cur);
+        }
+        cask->opts_.max_read_handles =
+            resolve_read_handle_cap(opts.max_read_handles, nofile);
+    }
+
     // 目录不存在就建（mkdir -p 语义）。已存在不报错。
     std::error_code ec;
     fs::create_directories(cask->dirname_, ec);
 
     // 字段名 ↔ id 注册表（#1）：加载已有 + 打开追加句柄。
-    cask->field_schema_.open((fs::path(cask->dirname_) / "field.schema").string());
+    if (!cask->field_schema_.open((fs::path(cask->dirname_) / "field.schema").string())) {
+        return std::unexpected(err(CaskError::kIo,
+            "field.schema corrupt or incompatible version"));
+    }
 
     if (auto r = cask->acquire_open_locks(); !r) {
         return std::unexpected(r.error());
@@ -1217,6 +1237,16 @@ std::shared_ptr<fileops::DataFile> Cask::read_file(std::uint32_t file_id) {
 std::size_t Cask::read_handle_count() const {
     std::shared_lock lk(read_cache_mu_);
     return read_files_.size();
+}
+
+std::size_t Cask::resolve_read_handle_cap(std::size_t opt,
+                                          std::size_t nofile_soft) noexcept {
+    if (opt == CaskOptions::kUnlimitedReadHandles) return 0;  // 显式不限
+    if (opt != 0) return opt;                                 // 显式上限
+    // 自动（opt==0）：留约一半 fd 给 active writer / WAL / hint / meta / lock 等
+    // 非缓存 fd，其余给 read 句柄缓存。下限 64，避免极低 ulimit 下 cap 过小。
+    const std::size_t derived = nofile_soft / 2;
+    return derived < 64 ? 64 : derived;
 }
 
 // P9:read_files_ 超 max_read_handles 时,淘汰 atime 最旧的**空闲**句柄
@@ -2087,9 +2117,11 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         }
 
         // P14e:统一分段 search.ckpt 替代旧多文件保存。
+        // best-effort:checkpoint 保存失败非致命——下次 open 回退到全量 fold 重建
+        // 搜索索引（仅慢一次启动，数据不受影响），故显式忽略返回值而非让 merge 失败。
         const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
-        search_->save_search_ckpt(search_ckpt,
-                                   keydir_->peek_next_ord());
+        (void)search_->save_search_ckpt(search_ckpt,
+                                        keydir_->peek_next_ord());
     }
 
     // After run_merge, every live record from `files` has been CAS-rewritten

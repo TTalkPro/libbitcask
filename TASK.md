@@ -1201,3 +1201,163 @@ W4 ✅（parallel_scan 并行全表扫描）。
     `docs/design/thread-safety.md` §9。
 - **全套文档同步**：README / api-cpp §5+§9 / api-c §14 / cpp-arch / concurrency-zh /
   async-index-pipeline / design/thread-safety（§7 各接口实现机制 + §9 实测基线）+ 头注释。
+
+## 待办：第十二梯队（S12 全库审计 — 2026-07-01）
+
+> 来源：2026-07-01 全代码库深审（4 路并行核实：异步索引管线 / 向量·HNSW /
+> WAL·mmap·存储层 / 并发·格式·构建工具链）。
+> **总体结论**：代码质量高、功能债少——**多数设计文档标注的「未做」其实已落地**
+> （文档滞后于实现，非缺口）。真实工程价值集中在 **P0 三项**；P1 文档同步本轮已清；
+> P2 为能力/工程质量债；P3 为已知权衡（对齐「已核实无需改动」节，记录备查）。
+
+### P0 真实缺口（建议优先，成本均不高）
+
+- [x] **S12-1 sealed-mmap read 句柄默认上限（防 fd/mmap 无界）** — 已完成（2026-07-01）
+    · `include/bitcask/cask.hpp`、`src/cask/cask.cpp`、`include/bitcask/data_file.hpp`、`tests/cask_docvalue_test.cpp`
+  - **订正原判断**：审计报告称「无 LRU 驱逐」**有误**——P9 的 read-handle 近似 LRU
+    （`max_read_handles` cap + atime + `evict_read_handles_locked`，只淘空闲句柄）**早已实现**，
+    每句柄 = 1 fd + 1 sealed mmap（mmap 后 **fd 保留不关**，`data_file.cpp:50`），故该 cap
+    **同时界定 fd 数与 mmap 映射数**。真实缺口只有一个：**默认 `max_read_handles = 0` = 不限**，
+    即开箱无界。
+  - **改动**：细化语义——`0`（默认）→ **自动**：由 `RLIMIT_NOFILE` 软上限推导安全上限
+    （`getrlimit`，约一半、下限 64）；新增哨兵 `CaskOptions::kUnlimitedReadHandles` → 显式不限；
+    其它 N → 显式上限。解析逻辑抽成纯静态 `Cask::resolve_read_handle_cap(opt, nofile_soft)`
+    便于单测。open() 时 `getrlimit(RLIMIT_NOFILE)` 解析并写回 `opts_.max_read_handles`
+    （evict 逻辑不变）。
+  - **附带修 bug**：`data_file.hpp:78` 头注释「映射成功后 close(fd)」与实际（fd 保留）矛盾，已订正。
+  - **未做（有意）**：字节/地址空间上限——count-based cap 已界定两个稀缺资源（`ulimit -n`、
+    `vm.max_map_count`），64 位地址空间充裕，byte-based 收益低不做。
+  - **验证**：新增 `ReadHandleCap.ResolveSemantics`（哨兵/显式/自动三态 + 下限），既有
+    read-handle cap 测试改用显式哨兵；**Debug 全量 484/484**（483+1），Release 干净，零回归。
+  - 风险：低。小/中库（< 自动上限）行为不变、零 churn；大库由 crash（fd 耗尽）改为 graceful
+    句柄淘汰（miss 时重开 sealed 文件 ~μs）。**默认行为变更**（0 从「不限」变「自动上限」）——
+    需显式不限者用 `kUnlimitedReadHandles`。
+
+- [x] **S12-2 reducer 线程内自动 compaction（opt-in）** — 已完成（2026-07-01）
+    · `include/bitcask/search_layer.hpp`、`src/search/search_layer.cpp`、`include/bitcask/index.hpp`、
+      `src/keydir/index.cpp`、`include/bitcask/inverted.hpp`、`src/bm25/inverted.cpp`、
+      `tests/search_layer_test.cpp`、`tests/cask_docvalue_test.cpp`
+  - **并发核实（决定设计）**：后台线程 compact 与 live reducer 并发**不安全**——`reduce_apply`
+    里 `add_doc`(先) 在 `put_doc`(后) 之前，间隙内 posting list 已含新 ord 但 Index 未 size 到它，
+    并发 compact 的 `fill_is_live(新ord)` 因越界**误判 dead** → 压掉 live posting（数据损坏）。
+    安全前提只有「先 flush 到静止」或「compact 在 reducer 线程内」。结合代码库**无后台维护线程**
+    的哲学（merge 亦 caller 驱动），选**后者**。
+  - **实现**：新增 `SearchLayerConfig::auto_compact_dead_ratio`（0=关，默认；(0,1]=开+per-list 阈值）。
+    Index 加 `retired_since_compact_` 计数器（put_doc 覆盖 + remove 两个死亡点各 +1，均在
+    `index_.mutex_` 下、仅 reducer 线程）。`SearchLayer::maybe_auto_compact()` 在 reduce_apply /
+    on_write / on_delete 末尾调用：关时仅一次 double 比较（零开销）；开时累计退休达
+    `max(1024, live/2)` 才在**本 reducer 线程内** compact()，与 add_doc/put_doc 同线程 → 无并发窗口。
+    节流随 live 规模缩放，摊薄全量扫描成本。附带加 `total_postings()` 内省（InvertedIndex + SearchLayer）。
+  - **未做（有意）**：不新增后台线程（违哲学 + 需 flush stall）；不改写路径 O(1) 触发（remove_doc
+    仍不碰 posting list）；compact 频率靠节流而非精确 per-list 计数（够用，避免给 remove 加桶锁开销）。
+  - **验证**：新增 3 例——`SearchLayer.AutoCompactBoundsPostingGrowth`（开：6020 写→postings<2000）/
+    `NoAutoCompactWhenDisabledButSearchCorrect`（关：>6000 保留但搜索正确）/
+    `CaskDocValueTest.AutoCompactConcurrentReadersNoRace`（3 读者并发 + churn 写者经异步管线，
+    reducer 内触发 compact）。**Debug 全量 487/487**（484+3），**TSan 三例零 race**（并发护栏），
+    Release 干净。
+  - 风险：低。默认关=行为不变、零开销；开启后 compact 在 reducer 线程串行（安全已 TSan 实证），
+    仅延迟索引可见性（非 durability）。**默认关，需显式 opt-in**。
+
+- [x] **S12-3 field.schema 加 magic/version/CRC** — 已完成（2026-07-01）
+    · `include/bitcask/field_schema.hpp`、`src/cask/cask.cpp`、`src/fileops/migrate.cpp`、`tests/data_file_test.cpp`
+  - **格式**：文件头 8 字节 `[magic="FSCH":u32][version=1:u32]`（小端）；每条 entry
+    `[NameLen:u16][name][CRC32:u32]`，CRC 覆盖 `[NameLen|name]`（`hw::crc32`，与 data/hint/WAL 同多项式）。
+  - **健壮性**：magic/version 未知 → `open()` 返回 false（fail-fast）；完整 entry 但 CRC 不符
+    → fail-fast；**torn tail**（尾部半条，append 崩溃常态）容忍跳过（与 WAL 语义一致）。两处
+    `open()` 调用点（`cask.cpp` 创建/打开路径）已检查返回值 → `unexpected(kIo, "corrupt or
+    incompatible")`。
+  - **兼容（用户定：自动探测 + 兼容读旧）**：`open()` peek 前 4 字节——有 magic 走新格式；
+    无头（v3.0.0 现存库）按 legacy `[len][name]` 照读，并在可写目录下**原子升级**为新格式
+    （temp + `fsync` + `rename`，权威数据零丢失窗口）；升级失败（只读目录）退回 legacy 追加，
+    保持文件自洽。`migrate_le` BE→LE 输出改为直接写新格式。
+  - **验证**：新增 5 例（`FieldSchema.NewFormatRoundTripAndMagicHeader` / `DetectsCrcCorruption` /
+    `RejectsUnknownVersion` / `LegacyHeaderlessAutoUpgrades` / `ToleratesTornTailNewFormat`），
+    含既有 2 例全过；**Debug 全量 483/483 ctest**（478+5），零回归。
+  - 风险：低（新写入 + 兼容读旧 + 原子升级；权威数据无丢失窗口）。
+
+### P1 文档同步（✅ 本轮已完成 2026-07-01）
+
+- [x] **S12-4 4 处过时设计文档状态行订正** — 已完成（2026-07-01）
+  - `docs/design/async-index-pipeline.md:3`「评审中(未实现)」→ **已落地(S6/P0–P4)**，
+    列各子项代码落地点，并标注唯一偏差（单 reducer 线程替代 M 线程池 → **库间 apply 未并发**，
+    仅 Map 并行；`thread_pool.hpp:597`）。
+  - `hnsw-design-zh.md` §4 + §7「过滤检索 V3 不做」→ **V5 已落地图内过滤**
+    （`search_layer.cpp:279-290`，`cask.hpp:449-451`）。
+  - `hnsw-int8-only-design-zh.md:99`「盘上直存 int8 仍未做」→ **V7 已落地**
+    （BVH2 v2 段直存 qcodes+scale+sum，`hnsw.cpp:1243-1257`；另 DocValue int8 落盘
+    `codec.cpp:148-173`）。
+  - 原则：保留历史评审推理，加「已落地/更新」标注 + 代码落地点（沿用文档既有「落地记录」风格）。
+
+### P2 能力覆盖 / 工程质量
+
+- [x] **S12-5 C API 契约债 + 能力缺口** — 已完成（2026-07-01；[高] 注释订正 + [中] batch/parallel_scan 全落地）
+  - [x] **[高] 头部线程安全注释订正** — 已完成。`bitcask_c.h:9-14` 旧注释「put/delete/search
+    非线程安全，caller 串行化」与 C++ W1/W2 内化线程安全**矛盾**（C API 是 Cask 的透明包装、
+    无 C 层共享可变态，完全继承其契约）。已重写为「同一 handle 多线程安全」，对齐
+    cask.hpp:6-24 / api-c.md §14，含读/写/读写并发/merge/iter 各条。**纯注释、零行为变更**，
+    C API smoke 测试通过。注：api-c.md §14 早在 S11 已正确，仅头文件被漏。
+  - [x] **[中] batch / parallel_scan** — 已完成（2026-07-01）
+    - [x] **三种批量搜索全部暴露**（`c_api/bitcask_c.{h,cpp}`）：`bitcask_search_text_batch` /
+      `bitcask_search_vector_batch` / `bitcask_search_hybrid_batch`（新增 `bitcask_hybrid_query_t`）
+      + 共用 `bitcask_search_result_batch_free`。共用 `fill_batch_results` helper（DRY）；`out_results[i]`
+      失败=NULL、无命中=count 0 的非空结果，`fault` 回填首个失败详情；`n==0` → NULL+OK；参数校验。
+    - [x] **`bitcask_parallel_scan` + `bitcask_scan_fn`**（callback 式；`ctx` 带用户状态，key/value 零
+      拷贝 view 仅回调内有效；回调可能多线程并发调用）。透传 C++ `parallel_scan`（W4）。
+    - **验证**：`test_search_text_batch` / `test_search_vector_hybrid_batch`（L2 精确 top-1）/
+      `test_parallel_scan`（500 key×4 线程，atomic 校验访问一次 + value checksum；n_threads=0；空参）。
+      **C API 7/7**；符号在 .so 导出；api-c.md §10/§11 已补文档；**plain + ASan(含 leak) + TSan 全过**。
+    - **顺带修构建缺口**：`bitcask_c_api_test` 未 link `bitcask_sanitizers`（与其它测试目标不一致）→
+      sanitize 构建下未插桩的 C 主程序链接已插桩 `.so`，`.so` 内起线程（search 模式 IndexPool）即
+      SEGV。KV-only 时不触发，search 测试首次暴露。修：`tests/CMakeLists.txt` 补 link
+      `bitcask_sanitizers`，TSan/ASan 无需 preload 即通过。
+  - [ ] **[中] 无 `BITCASK_ERR_CLOSED`**（closed 与参数非法共码，`:97-110`）；`bitcask_close`
+    返 `void` 无法回报。注：W3 曾**有意**复用 kInvalidOption 避免枚举 churn；改动即 ABI 语义
+    变更，需权衡。留待评估。
+
+- [~] **S12-6 CI 单一编译器/平台** — 部分完成（2026-07-01）
+  - [x] **加 clang 构建 job**（`.github/workflows/ci.yml` `clang-build-test`）。**过程中修了 2 个
+    真实可移植性 bug**（代码库从未用 clang 构建过）：① `hnsw.cpp:150` AVX-512 归并的
+    `#if` 只判 `__GNUC__>=10`，漏了 clang（其 `__GNUC__` 恒为 4）→ 落入 `#else` 用了错误
+    intrinsic `_mm512_extractf64x4_ps`（clang 不认）；补 `defined(__clang__)` + 修正死分支
+    intrinsic。② `kDefaultField = "\x01default"` 的 `\x` 转义贪婪吞 "defa" → 实际是 0xFA+"ult"
+    （GCC 静默、clang 报错）；改 `"\xfa" "ult"` **保留完全相同字节**（已入 checkpoint，零 on-disk 变化）。
+    **本地验证**：clang Debug 全量 486/486 通过（GCC 亦 486/486）。CI 用 Debug（clang+Release LTO
+    需 gold 插件/lld，Debug 无 LTO 规避）。
+  - [ ] **macOS / ARM64 job** — 需对应 runner + 本地无法验证的交叉构建，留待。ARM64 尤有价值
+    （验证 NEON/非 VNNI 标量路径 `detail/int8_kernels.hpp`）。
+  - 注：端序已安全（整数可移植位移；float 向量有 `static_assert(endian==little)`，`codec.cpp:139`）。
+
+- [~] **S12-7 构建加固小项** — 部分完成（2026-07-01）
+  - [x] **版本号单一真源**。`project()` 原无 VERSION；库 SOVERSION（`CMakeLists.txt` 硬编码
+    `VERSION 3.0.0`）与 C API（`bitcask_c.cpp:143-146` 硬编码 `return 3/0/0`）各写一份，易漂移。
+    改：`project(libbitcask VERSION 3.0.0)` 为唯一手写处；`configure_file` 从 `PROJECT_VERSION*`
+    生成 `bitcask_version.h`（新增 `c_api/bitcask_version.h.in`），c_api 用宏（带非 CMake 回退）；
+    库 `VERSION/SOVERSION` 用 `${PROJECT_VERSION}/${PROJECT_VERSION_MAJOR}`。生成头验证为 3/0/0，
+    c_api 测试通过。**顺带修** `cask.cpp:2121` 忽略 `save_search_ckpt()` 返回值（-Wunused-result）→
+    显式 `(void)` + best-effort 注释（checkpoint 失败非致命，下次 fold 重建）。
+  - [ ] **`-Werror`（first-party）** — 未做。first-party 有 ~15 处告警（`-Wshadow` 29 /
+    `-Wsign-conversion` 17，多在 hnsw/inverted 热点），多为噪音型；`-Werror` 需先清理这批，
+    触碰热点代码为 cosmetic 告警、风险>价值。且需排除 third_party（cppjieba 大量告警）。留待评估。
+
+### P3 已知权衡 / 远期（记录备查，当前无需动）
+
+> 均为设计文档**有意判定延后**或架构性约束，现有定位下不构成正确性问题；列此避免重复审计。
+
+- **close 与并发在途操作 UB**：`closed_` 只是 best-effort fail-fast 门（`cask.cpp:710`），
+  与 close 并发在途的调用仍 caller 责任；完整 rundown 判「成本高价值低」放弃
+  （`docs/design/thread-safety.md:82`）。未来做通用嵌入库需重估。
+- **异步管线 Reduce 端单 reducer → 库间 apply 不并发**（`thread_pool.hpp:597`）：多库高写入
+  吞吐升级点，方案见 `async-index-pipeline` §5 的 M 线程池 + per-库 apply 锁。
+- **WAL 异步 flush / 跨线程 group-commit**：单写者前提成立（`inverted_wal.hpp:22`），归 V7+。
+- **posting zero-copy 完整 Phase 2**（published_count + deque）：Phase 1 + 2-min CoW
+  已覆盖主要收益（`inverted.hpp:378-381`），有条件延后。
+- **向量远期**：affine 量化（<1pt 召回）/ PQ（10M+ 才划算）/ 多段+DiskANN 外存（>1M 才需要）——
+  当前 ≤1M 规模单图 μs 级已达红线，全用不上。
+
+> **建议执行顺序**：~~S12-3（field.schema 加头）✅~~ → ~~S12-1（read 句柄默认上限）✅~~ →
+> ~~S12-2（reducer 内自动 compaction）✅~~ → ~~S12-5 [高] C API 头注释订正 ✅~~ 2026-07-01
+> （**P0 三项 + P1 文档债全部完成**）→ ~~S12-5[高] C API 注释~~ ✅ →
+> ~~S12-6 clang job（+2 可移植性 bug 修复）~~ ✅ → ~~S12-7 版本单一真源~~ ✅ 2026-07-01。
+> → ~~S12-5[中] C API batch×3 + parallel_scan~~ ✅ 2026-07-01。
+> 剩余（均需独立评估）：S12-5 `BITCASK_ERR_CLOSED`（触 W3 枚举决策）/ S12-6 macOS·ARM64 job（需
+> runner）/ S12-7 `-Werror`（先清 ~15 处 cosmetic 告警）。P3 按需。

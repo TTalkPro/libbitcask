@@ -1,5 +1,17 @@
 #include "bitcask_c.h"
 
+// 版本单一真源（S12-7）：由 CMake configure_file 从 project(VERSION) 生成。
+// 非 CMake 构建（少见）时回退到占位，避免编译失败。
+#if __has_include("bitcask_version.h")
+#  include "bitcask_version.h"
+#endif
+#ifndef BITCASK_VERSION_MAJOR
+#  define BITCASK_VERSION_MAJOR  0
+#  define BITCASK_VERSION_MINOR  0
+#  define BITCASK_VERSION_PATCH  0
+#  define BITCASK_VERSION_STRING "0.0.0-unknown"
+#endif
+
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -93,6 +105,31 @@ void to_search_result(bitcask::TextSearchResult&& src, bitcask_search_result_t**
     *out = r;
 }
 
+// 把 C++ 批量搜索的 n 个 expected 物化为 malloc 的 n 元结果数组（S12-5）。三种批量
+// （text/vector/hybrid）返回类型相同，故共用。out_results[i]：成功=result 指针，
+// 失败=NULL；fault 回填首个失败查询详情。calloc 失败返回 BITCASK_ERR_IO。
+bitcask_error_t fill_batch_results(
+    std::vector<std::expected<bitcask::TextSearchResult, bitcask::CaskFault>>&& batch,
+    size_t n, bitcask_search_result_t*** out_results, bitcask_fault_t* fault) {
+    auto** arr = static_cast<bitcask_search_result_t**>(
+        std::calloc(n, sizeof(bitcask_search_result_t*)));
+    if (!arr) return BITCASK_ERR_IO;
+    bool fault_set = false;
+    for (size_t i = 0; i < batch.size(); ++i) {
+        if (batch[i]) {
+            to_search_result(std::move(*batch[i]), &arr[i]);
+        } else {
+            arr[i] = nullptr;
+            if (!fault_set && fault) {
+                to_c_error(batch[i].error(), fault);
+                fault_set = true;
+            }
+        }
+    }
+    *out_results = arr;
+    return BITCASK_OK;
+}
+
 void fill_get_result(const bitcask::GetResult& src, bitcask_get_result_t* out) {
     if (src.value.empty()) {
         out->value.data = nullptr;
@@ -140,10 +177,10 @@ bitcask::CaskIter* as_cpp_iter(bitcask_iter_t* h) {
 
 extern "C" {
 
-BITCASK_API int bitcask_version_major(void) { return 3; }
-BITCASK_API int bitcask_version_minor(void) { return 0; }
-BITCASK_API int bitcask_version_patch(void) { return 0; }
-BITCASK_API const char* bitcask_version_string(void) { return "3.0.0"; }
+BITCASK_API int bitcask_version_major(void) { return BITCASK_VERSION_MAJOR; }
+BITCASK_API int bitcask_version_minor(void) { return BITCASK_VERSION_MINOR; }
+BITCASK_API int bitcask_version_patch(void) { return BITCASK_VERSION_PATCH; }
+BITCASK_API const char* bitcask_version_string(void) { return BITCASK_VERSION_STRING; }
 
 BITCASK_API void bitcask_options_init(bitcask_options_t* opts) {
     if (!opts) return;
@@ -375,6 +412,36 @@ BITCASK_API bitcask_error_t bitcask_search_text(bitcask_t* cask,
     return BITCASK_OK;
 }
 
+BITCASK_API bitcask_error_t bitcask_search_text_batch(bitcask_t* cask,
+                                                      const char* const* queries,
+                                                      size_t n,
+                                                      size_t k,
+                                                      bitcask_search_result_t*** out_results,
+                                                      bitcask_fault_t* fault) {
+    if (!cask || !out_results) return BITCASK_ERR_INVALID_OPTION;
+    *out_results = nullptr;
+    if (n == 0) return BITCASK_OK;
+    if (!queries) return BITCASK_ERR_INVALID_OPTION;
+
+    std::vector<std::string_view> qv;
+    qv.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (!queries[i]) return BITCASK_ERR_INVALID_OPTION;
+        qv.emplace_back(queries[i]);
+    }
+
+    // C++ 返回 n 个 expected（每查询一个结果或错误）。
+    return fill_batch_results(as_cpp_cask(cask)->search_text_batch(qv, k),
+                              n, out_results, fault);
+}
+
+BITCASK_API void bitcask_search_result_batch_free(bitcask_search_result_t** results,
+                                                  size_t n) {
+    if (!results) return;
+    for (size_t i = 0; i < n; ++i) bitcask_search_result_free(results[i]);
+    std::free(results);
+}
+
 BITCASK_API bitcask_error_t bitcask_search_phrase(bitcask_t* cask,
                                                       const char* query,
                                                       size_t k,
@@ -523,6 +590,54 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
     return BITCASK_OK;
 }
 
+BITCASK_API bitcask_error_t bitcask_search_vector_batch(bitcask_t* cask,
+                                                        const float* const* queries,
+                                                        size_t n,
+                                                        size_t query_len,
+                                                        size_t k,
+                                                        size_t ef,
+                                                        bitcask_search_result_t*** out_results,
+                                                        bitcask_fault_t* fault) {
+    if (!cask || !out_results) return BITCASK_ERR_INVALID_OPTION;
+    *out_results = nullptr;
+    if (n == 0) return BITCASK_OK;
+    if (!queries) return BITCASK_ERR_INVALID_OPTION;
+
+    std::vector<std::span<const float>> qv;
+    qv.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (!queries[i] && query_len > 0) return BITCASK_ERR_INVALID_OPTION;
+        qv.emplace_back(queries[i], query_len);
+    }
+    return fill_batch_results(as_cpp_cask(cask)->search_vector_batch(qv, k, ef),
+                              n, out_results, fault);
+}
+
+BITCASK_API bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
+                                                        const bitcask_hybrid_query_t* queries,
+                                                        size_t n,
+                                                        size_t k,
+                                                        bitcask_search_result_t*** out_results,
+                                                        bitcask_fault_t* fault) {
+    if (!cask || !out_results) return BITCASK_ERR_INVALID_OPTION;
+    *out_results = nullptr;
+    if (n == 0) return BITCASK_OK;
+    if (!queries) return BITCASK_ERR_INVALID_OPTION;
+
+    std::vector<bitcask::Cask::HybridQuery> qv;
+    qv.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        bitcask::Cask::HybridQuery hq;
+        if (queries[i].text) hq.text = queries[i].text;
+        if (queries[i].vector && queries[i].vector_len > 0) {
+            hq.vec = std::span<const float>(queries[i].vector, queries[i].vector_len);
+        }
+        qv.push_back(hq);
+    }
+    return fill_batch_results(as_cpp_cask(cask)->search_hybrid_batch(qv, k),
+                              n, out_results, fault);
+}
+
 // 同义词词典已改为 open 时配置（bitcask_options_t::synonym_file_path）；
 // 运行期 bitcask_set_synonym_map 已移除。
 
@@ -667,6 +782,34 @@ BITCASK_API void bitcask_iter_entry_free(bitcask_iter_entry_t* entry) {
     entry->key.size = 0;
     entry->value.data = nullptr;
     entry->value.size = 0;
+}
+
+BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
+                                                  size_t n_threads,
+                                                  bitcask_scan_fn fn,
+                                                  void* ctx,
+                                                  size_t* out_count,
+                                                  bitcask_fault_t* fault) {
+    if (!cask || !fn) return BITCASK_ERR_INVALID_OPTION;
+    if (out_count) *out_count = 0;
+
+    // fn+ctx 按值捕获（函数指针 + void*，平凡可拷、多线程读安全）；wrapper 无共享
+    // 可变态。回调本身的线程安全由 C 消费方负责（见头文件契约）。key/value 是零拷贝
+    // view，仅在本次回调内有效。
+    auto result = as_cpp_cask(cask)->parallel_scan(
+        n_threads,
+        [fn, ctx](std::span<const std::byte> key,
+                  const bitcask::GetResultView& view) {
+            bitcask_slice_t k{key.data(), key.size()};
+            bitcask_slice_t v{view.value.data(), view.value.size()};
+            fn(ctx, k, v);
+        });
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    if (out_count) *out_count = *result;
+    return BITCASK_OK;
 }
 
 BITCASK_API bitcask_error_t bitcask_status(bitcask_t* cask,

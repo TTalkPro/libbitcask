@@ -433,6 +433,7 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
     doc_texts_.put(ord, std::string(text));
     // S9.2：只失效查询词与本文档词集有交集的缓存条目。
     cache_.invalidate_terms(changed_terms);
+    maybe_auto_compact();  // S12-2
 }
 
 // S6 索引流水线的 **Map 阶段**（设计稿 §3）。**纯 const 函数**：只读
@@ -548,6 +549,7 @@ void SearchLayer::reduce_apply(const ReduceJob& job,
         on_vector(job.ord, vec);
     }
     cache_.invalidate();
+    maybe_auto_compact();  // S12-2：本 reducer 线程内，达阈值则压实死 posting
 }
 
 void SearchLayer::on_write_fields(
@@ -599,6 +601,7 @@ std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::u
     } else {
         cache_.invalidate();
     }
+    maybe_auto_compact();  // S12-2
     return tomb_ord;
 }
 
@@ -1022,6 +1025,32 @@ std::size_t SearchLayer::compact(double dead_ratio_threshold) {
     }
     if (total > 0) cache_.invalidate();  // posting 行变了，缓存可能含陈旧结果
     return total;
+}
+
+namespace {
+// S12-2：自动 compaction 节流下限。累计退休文档达 max(此值, live/2) 才触发一次全量
+// 死点扫描，使 compact 频率随 churn 量摊薄（单库空/小时也不至于频繁空扫）。
+constexpr std::uint64_t kAutoCompactMinDeaths = 1024;
+}  // namespace
+
+std::size_t SearchLayer::total_postings() const {
+    std::shared_lock lk(fields_mu_);
+    std::size_t n = 0;
+    for (const auto& [field, inv] : fields_) n += inv->total_postings();
+    return n;
+}
+
+void SearchLayer::maybe_auto_compact() {
+    const double thr = config_.auto_compact_dead_ratio;
+    if (thr <= 0.0) return;  // opt-in 关（默认）→ 零开销
+
+    const std::uint64_t retired = index_.retired_since_compact();
+    if (retired < kAutoCompactMinDeaths) return;      // 常态早退（1 次 shared_lock）
+    // 节流阈值随 live 规模缩放：大库摊薄扫描成本，小库用下限。
+    if (retired < index_.live_docs() / 2) return;
+
+    compact(thr);  // reducer 线程内串行 → 与 add_doc/put_doc 无并发窗口（S12-2）
+    index_.reset_retired_since_compact();
 }
 
 std::expected<std::vector<SearchHitEx>, SearchError>

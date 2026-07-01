@@ -6,12 +6,19 @@
 //   - 错误码 + out-param：函数返回错误码，详情经 bitcask_fault_t* 传出
 //   - 二进制安全：使用 {ptr, len} 切片，不依赖 NUL 结尾
 //
-// 线程安全（与 C++ 核心一致）：
+// 线程安全（与 C++ 核心一致；S11：通用库，**同一 handle 多线程安全**。
+// C API 透明包装 Cask，无 C 层共享可变态，故完全继承其契约。详见
+// doc/api-c.md §14 / docs/design/thread-safety.md）：
 //   - open/close/factory：线程安全（产生/销毁独立对象）
-//   - get/search_vector/search_hybrid：线程安全（读路径）
-//   - put/delete/sync/search_text/search_phrase/search_fields/search_near/
-//     search_fuzzy/search_wildcard/bool_search：非线程安全（caller 串行化）
-//   - iter_*：非线程安全（同一 iter 不可并发使用）
+//   - 读（get / 全部 search_text/phrase/fields/near/fuzzy/wildcard/bool /
+//     search_vector / search_hybrid）：**线程安全**（并发读，无锁/共享锁）
+//   - 写（put / delete / sync / put_doc / close_write_file）：**线程安全**
+//     （S11-W1：内部 write_mu_ 串行化；同一 handle 多线程写安全。写在文件层本就
+//     串行 → 锁不损吞吐；更高写并发 → 按目录分片多个实例横向扩展）
+//   - 读写并发：安全（搜索可见性遵循 near-real-time 契约）；merge 与读写并发
+//     （经 keydir shared_mutex 协调，不阻塞写）
+//   - iter_*：同一 iter 不可并发使用（每线程一个迭代器，同 std 容器约定）；
+//     不同迭代器之间并发安全
 //
 // 用法示例：
 //   bitcask_options_t opts;
@@ -327,6 +334,27 @@ BITCASK_API bitcask_error_t bitcask_search_text(bitcask_t* cask,
                                                    bitcask_search_result_t** out,
                                                    bitcask_fault_t* fault);
 
+// BM25 文本批量搜索（S12-5）。一次 prepare_search flush 覆盖全批，比逐条调用省重复
+// 索引 flush；语义/可见性同 bitcask_search_text（并发读安全）。
+//   queries : n 个 NUL 结尾查询串的数组（n==0 时 *out_results 置 NULL 并返回 OK）
+//   out_results : 成功时 *out_results 指向 malloc 的 n 元数组，out_results[i] 为第 i 个
+//                 查询的结果指针（该查询失败则为 NULL）。用 bitcask_search_result_batch_free
+//                 (*out_results, n) 释放整个数组。
+//   fault   : 若有查询失败，回填首个失败查询的错误详情（best-effort 诊断）。
+// 返回：BITCASK_OK（批量已执行；单查询错误体现为对应元素 NULL）；
+//       BITCASK_ERR_INVALID_OPTION（cask/out_results 为空，或某 query 指针为空）。
+BITCASK_API bitcask_error_t bitcask_search_text_batch(bitcask_t* cask,
+                                                         const char* const* queries,
+                                                         size_t n,
+                                                         size_t k,
+                                                         bitcask_search_result_t*** out_results,
+                                                         bitcask_fault_t* fault);
+
+// 释放 bitcask_search_text_batch 分配的结果数组（逐个 result_free 后释放数组本身）。
+// results 为 NULL 时是 no-op。
+BITCASK_API void bitcask_search_result_batch_free(bitcask_search_result_t** results,
+                                                     size_t n);
+
 // BM25 短语搜索。
 BITCASK_API bitcask_error_t bitcask_search_phrase(bitcask_t* cask,
                                                      const char* query,
@@ -383,6 +411,19 @@ BITCASK_API bitcask_error_t bitcask_search_vector(bitcask_t* cask,
                                                      bitcask_search_result_t** out,
                                                      bitcask_fault_t* fault);
 
+// HNSW 向量批量搜索（S12-5）。一次 flush 覆盖全批，语义同 bitcask_search_vector。
+//   queries    : n 个向量指针数组，每个指向 query_len 个 f32（query_len 须等于 vector_dim）
+//   out_results: 见 bitcask_search_text_batch；用 bitcask_search_result_batch_free 释放
+// 返回同 bitcask_search_text_batch（单查询失败体现为对应 NULL）。
+BITCASK_API bitcask_error_t bitcask_search_vector_batch(bitcask_t* cask,
+                                                           const float* const* queries,
+                                                           size_t n,
+                                                           size_t query_len,
+                                                           size_t k,
+                                                           size_t ef,
+                                                           bitcask_search_result_t*** out_results,
+                                                           bitcask_fault_t* fault);
+
 // RRF 混合检索（BM25 + 向量融合）。
 // text_query: NUL 结尾 UTF-8（NULL = 纯向量路径）。
 // vec_query:  f32 向量数组（NULL = 纯文本路径）。
@@ -393,6 +434,23 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
                                                      size_t k,
                                                      bitcask_search_result_t** out,
                                                      bitcask_fault_t* fault);
+
+// 混合批量查询的单条输入：text 与 vector 至少一非空（纯文本 / 纯向量 / 两路融合）。
+typedef struct {
+    const char*  text;        // NUL 结尾 UTF-8（NULL = 纯向量）
+    const float* vector;      // f32 向量（NULL = 纯文本）
+    size_t       vector_len;  // 向量元素数（vector==NULL 时忽略）
+} bitcask_hybrid_query_t;
+
+// RRF 混合批量检索（S12-5）。一次 flush 覆盖全批，语义同 bitcask_search_hybrid。
+//   queries    : n 条 (text, vector) 查询
+//   out_results: 见 bitcask_search_text_batch；用 bitcask_search_result_batch_free 释放
+BITCASK_API bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
+                                                           const bitcask_hybrid_query_t* queries,
+                                                           size_t n,
+                                                           size_t k,
+                                                           bitcask_search_result_t*** out_results,
+                                                           bitcask_fault_t* fault);
 
 // 同义词词典已改为 **open 时配置**：见 bitcask_options_t::synonym_file_path
 //（不可变、并发查询安全；运行期 setter 已移除）。
@@ -439,6 +497,27 @@ BITCASK_API void bitcask_iter_release(bitcask_iter_t* iter);
 
 // 释放迭代器条目内部缓冲（key/value 的 malloc 缓冲）。
 BITCASK_API void bitcask_iter_entry_free(bitcask_iter_entry_t* entry);
+
+// 并行全表扫描回调（S12-5）。对每个 live 文档调用一次；**可能来自多个工作线程并发调用**。
+//   ctx  : bitcask_parallel_scan 透传的用户指针（C 无闭包，用它带状态）
+//   key/value: 零拷贝 view，仅在本次回调内有效（返回后即失效，需保留请自行拷贝）
+// **回调必须线程安全**——不同工作线程并发调用，各处理不相交 key 段（若写共享状态需自行加锁）。
+typedef void (*bitcask_scan_fn)(void* ctx,
+                                bitcask_slice_t key,
+                                bitcask_slice_t value);
+
+// 并行全表扫描（S12-5）。单次快照所有 live key（调用线程串行，仅拷 key），按 n_threads
+// 分段并发 get 读值并调 fn——把「多线程读安全」用于 analytics/export/reindex。
+//   n_threads==0 → hardware_concurrency()。
+//   并发删除致某 key get 时 not-found → 跳过（near-real-time）；IO/CRC 错误 → 停止并返回。
+//   成功时 *out_count（可为 NULL）= 遍历到的 key 数。cask 已 close → INVALID_OPTION。
+// 线程安全: 是（快照串行 + get 并发安全）。
+BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
+                                                    size_t n_threads,
+                                                    bitcask_scan_fn fn,
+                                                    void* ctx,
+                                                    size_t* out_count,
+                                                    bitcask_fault_t* fault);
 
 /* ===========================================================================
  *  管理

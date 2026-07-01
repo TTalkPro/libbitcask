@@ -134,6 +134,25 @@ public:
     // ---- 内省 ----
     [[nodiscard]] IndexInfo info() const;
 
+    // 当前存活文档数（= ext2ord_.size()）。线程安全：shared_lock。
+    [[nodiscard]] std::uint64_t live_docs() const {
+        std::shared_lock lk(mutex_);
+        return live_docs_;
+    }
+
+    // S12-2：自上次 reset 以来退休（软删/覆盖/删除）的文档版本数——put_doc 覆盖旧版本
+    // 与 remove 各计 1。用于后台自动 compaction 的节流触发。仅 reducer 线程读写
+    // （put_doc/remove 在写路径、maybe_auto_compact 在同线程末尾），故非并发热点。
+    // 线程安全：shared_lock 读 / unique_lock 重置（与 put_doc/remove 的 unique_lock 一致）。
+    [[nodiscard]] std::uint64_t retired_since_compact() const {
+        std::shared_lock lk(mutex_);
+        return retired_since_compact_;
+    }
+    void reset_retired_since_compact() {
+        std::unique_lock lk(mutex_);
+        retired_since_compact_ = 0;
+    }
+
     // 遍历所有 live 文档，对每个调用 fn(ord, ext_id, slot)。
     // 线程安全：持 shared_lock。
     template <typename Fn>
@@ -162,6 +181,7 @@ private:
 
     std::uint64_t next_ord_       = 0;
     std::uint64_t live_docs_      = 0;
+    std::uint64_t retired_since_compact_ = 0;  // S12-2：自上次 compact 起退休的文档版本数
     std::uint64_t chunks_alloc_   = 0;      // 历史分配 chunk 数（内省用）
     std::uint64_t chunks_freed_   = 0;      // 被 compact_chunks 释放的 chunk 数
 

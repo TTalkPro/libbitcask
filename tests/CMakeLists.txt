@@ -266,5 +266,8 @@ gtest_discover_tests(bitcask_thread_pool_test ${_bitcask_test_props})
 # ---------------------------------------------------------------------------
 enable_language(C)
 add_executable(bitcask_c_api_test c_api_test.c)
-target_link_libraries(bitcask_c_api_test PRIVATE bitcask_shared)
+# bitcask_sanitizers（INTERFACE）：与所有 C++ 测试目标一致，让 C 测试也被 sanitizer
+# 插桩。否则 sanitize 构建下，未插桩的 C 主程序链接已插桩的 .so，一旦 .so 内部起线程
+# （如 search 模式的 IndexPool worker）就会因运行时缺失而 SEGV（S12-5 修）。
+target_link_libraries(bitcask_c_api_test PRIVATE bitcask_shared bitcask_sanitizers)
 add_test(NAME CApi.SmokeTest COMMAND bitcask_c_api_test)

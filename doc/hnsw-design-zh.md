@@ -148,9 +148,12 @@ search_hybrid(query, qvec, k)     → BM25 top-K' ∥ HNSW top-K'
 
 - RRF:`score = Σ 1/(60 + rank_i)`,K' = max(k×4, 64)(两路各取);
   无需分数归一化,与 vector-db-design 既定一致。
-- 过滤式向量检索(bool 条件 + 向量)V3 不做,接口留
-  `search_vector(qvec, k, filter_query?)` 形状,实现 V3.x 再议
-  (预过滤/后过滤/图内过滤是独立课题)。
+- 过滤式向量检索(bool 条件 + 向量):**V3 不做,已在 V5 落地(采用图内过滤方案)**。
+  公共接口 `search_vector(..., const meta::MetaFilter* filter = nullptr)`
+  (`cask.hpp:449-451`,`cask.cpp:1796-1799` 透传);`filter` 与 `is_live` 组合成
+  HNSW 遍历回调,被拒节点从图遍历源头即不入候选、无需 overfetch
+  (`search_layer.cpp:279-290`);hybrid 两路同样走 filter(`search_layer.cpp:308/334`)。
+  下方"V3 不做"为历史评审结论,现已过期。
 
 ### V3.6 落地记录(2026-06-12,search_hybrid + NIF/Erlang 接口)
 
@@ -275,5 +278,6 @@ close 保存顺序:bm25 → sidecar → **hnsw snap** → keydir snap(worker
 - 进程内 embedding 推理(调用方 embedder 解决);
 - 多字段多图(接口留位,V3.x);
 - 量化(int8/PQ)与外存图(V4,DocValue 段已留版本位);
-- 过滤式向量检索的图内实现(V3.x 课题);
+- ~~过滤式向量检索的图内实现(V3.x 课题)~~ —— **已在 V5 落地**(图内过滤,
+  `search_layer.cpp:279-290`;详见 §4 更新);
 - 多写者并发插入(全引擎统一约束)。

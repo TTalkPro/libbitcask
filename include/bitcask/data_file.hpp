@@ -74,8 +74,10 @@ public:
     DataFile& operator=(DataFile&&) noexcept;
 
     // 线程安全: 是（每次调用产出新对象）；不需任何锁。
-    // P6:mmap_enabled 且 Mode::kRead 且 64 位 → 整文件 mmap 只读(零拷贝),
-    // 映射成功后 close(fd)。失败/active/32 位/禁用 → 走 pread。
+    // P6:mmap_enabled 且 Mode::kRead 且 64 位 → 整文件 mmap 只读(零拷贝)。
+    // **fd 保留不关**（read()/fold() 的 pread 仍需 fd；见 .cpp::open 注释）——故每个
+    // sealed 读句柄同时占 1 fd + 1 mmap，两者由 cask 层 read_files_ LRU
+    // (CaskOptions::max_read_handles) 统一界定。失败/active/32 位/禁用 → 走 pread。
     [[nodiscard]] static std::expected<DataFile, DataFileFault>
     open(std::string_view path, Mode mode, bool sync = false,
          bool mmap_enabled = true);

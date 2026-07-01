@@ -1571,6 +1571,16 @@ void InvertedIndex::finalize_all_postings() {
     }
 }
 
+std::size_t InvertedIndex::total_postings() const {
+    std::size_t n = 0;
+    for (const auto& shard : shards_) {
+        for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
+            n += it->second->items.size();
+        }
+    }
+    return n;
+}
+
 auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_threshold)
     -> std::size_t {
     std::size_t compacted = 0;

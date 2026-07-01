@@ -79,6 +79,7 @@ void Index::put_doc(std::string_view ext_id, std::uint64_t ord,
             live_[old_ord] = false;
             const auto oc = old_ord / kChunkOrds;
             if (chunks_[oc]) --chunks_[oc]->live_count;
+            ++retired_since_compact_;  // S12-2：覆盖写退休旧版本
         }
         it->second = ord;
     } else {
@@ -107,6 +108,7 @@ bool Index::remove(std::string_view ext_id, std::uint64_t tomb_ord) {
         live_[cur_ord] = false;
         const auto ci = cur_ord / kChunkOrds;
         if (chunks_[ci]) --chunks_[ci]->live_count;
+        ++retired_since_compact_;  // S12-2：删除退休当前版本
     }
     ext2ord_.erase(it);
     --live_docs_;

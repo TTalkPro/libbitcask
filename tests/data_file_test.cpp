@@ -10,8 +10,11 @@
 
 #include <gtest/gtest.h>
 
+#include <fstream>
+
 #include "bitcask/codec.hpp"
 #include "bitcask/data_file.hpp"
+#include "bitcask/field_schema.hpp"
 #include "bitcask/format.hpp"
 #include "bitcask/hint_file.hpp"
 #include "bitcask/migrate.hpp"
@@ -721,4 +724,133 @@ TEST(SearchCheckpoint, EmptySections) {
     ASSERT_TRUE(lc.has_value());
     EXPECT_EQ(lc->watermark, 77u);
     EXPECT_TRUE(lc->sections.empty());
+}
+
+// ------------------------------------------------------------------
+// FieldSchema magic/version/CRC 健壮性（S12-3）。LE-only 主机：原始 u32
+// 读写与 le_store/le_load 一致，故测试直接用原始 u32。
+// ------------------------------------------------------------------
+
+// 新格式写入 → 文件带 magic 头 → 重开 id 保持。
+TEST(FieldSchema, NewFormatRoundTripAndMagicHeader) {
+    TempDir td;
+    const std::string path = td / "field.schema";
+    {
+        bitcask::FieldSchema fs;
+        ASSERT_TRUE(fs.open(path));
+        EXPECT_EQ(fs.intern("title"), 0u);
+        EXPECT_EQ(fs.intern("body"), 1u);
+        EXPECT_EQ(fs.intern("title"), 0u);  // 幂等
+    }
+    std::ifstream in(path, std::ios::binary);
+    std::uint32_t magic = 0;
+    in.read(reinterpret_cast<char*>(&magic), 4);
+    EXPECT_EQ(magic, bitcask::FieldSchema::kMagic);
+
+    bitcask::FieldSchema fs2;
+    ASSERT_TRUE(fs2.open(path));
+    EXPECT_EQ(fs2.size(), 2u);
+    ASSERT_TRUE(fs2.name_of(0).has_value());
+    EXPECT_EQ(fs2.name_of(0).value(), "title");
+    EXPECT_EQ(fs2.name_of(1).value(), "body");
+    EXPECT_EQ(fs2.intern("body"), 1u);         // 重开后仍认得旧字段
+    EXPECT_EQ(fs2.intern("author"), 2u);       // 续接新 id
+}
+
+// 完整 entry 的 CRC 被篡改 → open fail-fast。
+TEST(FieldSchema, DetectsCrcCorruption) {
+    TempDir td;
+    const std::string path = td / "field.schema";
+    {
+        bitcask::FieldSchema fs;
+        ASSERT_TRUE(fs.open(path));
+        fs.intern("title");
+        fs.intern("body");
+    }
+    // 翻转第一条 entry 的首个 name 字节（越过 8 字节头 + 2 字节 len）。
+    {
+        std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+        f.seekg(bitcask::FieldSchema::kHeaderSize + 2, std::ios::beg);
+        char c = 0;
+        f.read(&c, 1);
+        c = static_cast<char>(c ^ 0xFF);
+        f.seekp(bitcask::FieldSchema::kHeaderSize + 2, std::ios::beg);
+        f.write(&c, 1);
+    }
+    bitcask::FieldSchema fs2;
+    EXPECT_FALSE(fs2.open(path));  // CRC 不符 → 硬失败
+}
+
+// magic 匹配但 version 未知 → open fail-fast。
+TEST(FieldSchema, RejectsUnknownVersion) {
+    TempDir td;
+    const std::string path = td / "field.schema";
+    {
+        std::ofstream out(path, std::ios::binary);
+        std::uint32_t magic = bitcask::FieldSchema::kMagic;
+        std::uint32_t ver = 99;
+        out.write(reinterpret_cast<const char*>(&magic), 4);
+        out.write(reinterpret_cast<const char*>(&ver), 4);
+    }
+    bitcask::FieldSchema fs;
+    EXPECT_FALSE(fs.open(path));
+}
+
+// legacy 无头文件 → 读得出 + 原子升级为带头新格式 + 重开仍可用。
+TEST(FieldSchema, LegacyHeaderlessAutoUpgrades) {
+    TempDir td;
+    const std::string path = td / "field.schema";
+    {
+        std::ofstream out(path, std::ios::binary);
+        auto put = [&](std::string_view s) {
+            const auto n = static_cast<std::uint16_t>(s.size());
+            const char lb[2] = {static_cast<char>(n & 0xFF),
+                                static_cast<char>((n >> 8) & 0xFF)};
+            out.write(lb, 2);
+            out.write(s.data(), static_cast<std::streamsize>(s.size()));
+        };
+        put("title");
+        put("body");
+    }
+    bitcask::FieldSchema fs;
+    ASSERT_TRUE(fs.open(path));
+    EXPECT_EQ(fs.size(), 2u);
+    EXPECT_EQ(fs.name_of(0).value(), "title");
+    EXPECT_EQ(fs.name_of(1).value(), "body");
+
+    // 文件已升级：现在以 magic 开头。
+    std::ifstream in(path, std::ios::binary);
+    std::uint32_t magic = 0;
+    in.read(reinterpret_cast<char*>(&magic), 4);
+    EXPECT_EQ(magic, bitcask::FieldSchema::kMagic);
+
+    // 以新格式重开仍正确，且续接新 id。
+    bitcask::FieldSchema fs2;
+    ASSERT_TRUE(fs2.open(path));
+    EXPECT_EQ(fs2.size(), 2u);
+    EXPECT_EQ(fs2.name_of(1).value(), "body");
+    EXPECT_EQ(fs2.intern("extra"), 2u);
+}
+
+// 尾部半条（torn tail，崩溃常态）→ 容忍跳过，不算损坏。
+TEST(FieldSchema, ToleratesTornTailNewFormat) {
+    TempDir td;
+    const std::string path = td / "field.schema";
+    {
+        bitcask::FieldSchema fs;
+        ASSERT_TRUE(fs.open(path));
+        fs.intern("title");
+        fs.intern("body");
+    }
+    // 追加一条截断 entry：len 声称 5，但只有 2 字节 name、无 CRC。
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::app);
+        const char lb[2] = {static_cast<char>(5), static_cast<char>(0)};
+        out.write(lb, 2);
+        out.write("ab", 2);
+    }
+    bitcask::FieldSchema fs2;
+    ASSERT_TRUE(fs2.open(path));   // torn tail 容忍
+    EXPECT_EQ(fs2.size(), 2u);     // 只保留两条完整 entry
+    EXPECT_EQ(fs2.name_of(0).value(), "title");
 }

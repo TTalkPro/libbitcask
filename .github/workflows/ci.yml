@@ -44,6 +44,38 @@ jobs:
         run: ctest --test-dir build --output-on-failure -j$(nproc)
 
   # ---------------------------------------------------------------------------
+  # Clang 构建 + 全量 ctest（S12-6）。GCC 是主编译器；clang 作可移植性护栏——
+  # 抓 gcc-ism（AVX-512 intrinsic 分支的 __GNUC__ 条件、`\x` 转义贪婪等 clang 更严
+  # 之处）。Debug 配置：clang + Release LTO 需 LLVM gold 插件/lld，Debug 无 LTO 规避。
+  # ---------------------------------------------------------------------------
+  clang-build-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: debug-clang
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build -j$(nproc)
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j$(nproc)
+
+  # ---------------------------------------------------------------------------
   # CI2:Sanitizer matrix（ASAN+UBSAN / TSan）。TSan 是 Barrier v2 / IndexPool
   # 并发协议 + 恢复期并行 fold/analyze 的唯一回归护栏；TSan 构建用源码编译的
   # 插桩 oneTBB（submodule recursive 已拉取）。运行期选项设为「首个错误即 abort
