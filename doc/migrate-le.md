@@ -9,7 +9,7 @@ bitcask 做过一次字节序 **flag-day**：盘上所有多字节整数从大�
 （LE-only 主机原生零转换 + mmap 零拷贝友好；详见
 [`format-zh.md` 字节序说明](format-zh.md)）。切换后：
 
-- `bitcask.meta` 的 version 从 `1`（大端纪元）升到 `2`（小端）。
+- `bitcask.meta` 的 version 从 `1`（大端纪元）迁到 `3`（小端 + CRC32；S12 前迁到 `2` 无 CRC）。
 - 新代码打开旧大端目录时**当场拒绝**（不会静默把大端读成小端而损坏）：
 
   ```
@@ -60,7 +60,7 @@ migrated /home/me/db/wiki -> /home/me/db/wiki.le
 |---|---|
 | `<id>.bitcask.data` | 逐 record 解**大端**头 → 用小端 codec 重编码（CRC 重算） |
 | `<id>.bitcask.hint` | 从迁移后的 data **重新生成**（trailer CRC 一致） |
-| `bitcask.meta` | version `1→2`，`VecDim` u16 大端→小端，其余字段照搬 |
+| `bitcask.meta` | version `1→3`（LE + 偏移 14 加 CRC32），`VecDim` u16 大端→小端，其余字段照搬 |
 | `field.schema` | 每条 `NameLen` u16 大端→小端 |
 | 墓碑 v2 shadow file_id | 4 字节大端值 → 重排成小端 |
 | `kv.keydir.ckpt` / `search.*`（ckpt/seg/wal）/ 锁 | **不迁移**——可由 fold 重建,新库首开自动重建 |

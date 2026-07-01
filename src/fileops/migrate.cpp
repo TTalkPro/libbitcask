@@ -159,10 +159,11 @@ migrate_meta(const fs::path& src_dir, const fs::path& dst_dir,
     }
     if (ver != 1) return std::unexpected("unknown meta version");
 
-    // v1 → v2：version 字节改 2,VecDim u16 大端→小端,其余单字节字段照搬。
+    // v1 → v3（S12：LE + CRC）：version 改 3,VecDim u16 大端→小端,其余单字节照搬,
+    // 偏移 14 放 CRC32(覆盖前 14 字节),与 write_meta 一致。
     std::byte out[18] = {};
     std::memcpy(out, "BCME", 4);
-    out[4] = static_cast<std::byte>(2);            // version 2
+    out[4] = static_cast<std::byte>(3);            // version 3（LE + CRC）
     out[5] = b[5];                                 // mode
     out[6] = b[6];                                 // vec metric
     const std::uint16_t dim = be_u16(b + 7);       // 旧大端 → 主机
@@ -170,7 +171,8 @@ migrate_meta(const fs::path& src_dir, const fs::path& dst_dir,
     out[8] = static_cast<std::byte>((dim >> 8) & 0xFF);
     out[9] = b[9];                                 // vec quantized
     out[10] = b[10];                               // vec inmem_int8
-    // out[11..17] 保留全零
+    // out[11..13] 保留全零；out[14..18) = CRC32(覆盖 [0,14))。
+    le_store_u32(out + 14, codec::crc32(std::span<const std::byte>(out, 14)));
     if (auto r = write_all(dst_dir / "bitcask.meta",
                            std::span<const std::byte>(out, 18)); !r) {
         return std::unexpected(r.error());

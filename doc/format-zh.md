@@ -58,14 +58,18 @@
 偏移   字段          字节数  说明
 ──────────────────────────────────────────────────────────
 0      Magic         4       "BCME" (0x42434D45)
-4      Version       1       2（v1=大端 legacy；v2=小端 flag-day 起，旧 v1 目录 open 时拒绝）
+4      Version       1       3（v1=大端 legacy 拒绝；v2=小端无 CRC 兼容读；v3=小端+CRC）
 5      Mode          1       0 = KV 模式，1 = 索引模式（BM25 搜索）
 6      VecMetric     1       0=kNone 1=kCosineNormalized 2=kL2 3=kDot（V3.1）
 7      VecDim        2       向量维度 u16 小端；0 = 无向量（V3.1）
 9      VecQuantized  1       0/1：向量落盘 int8 量化（P3b；旧文件全零=否）
 10     VecInmemInt8  1       0/1：HNSW int8-only 内存模式（P5b；仅 kDot）
-11     Reserved      7       全零；预留将来扩展
+11     Reserved      3       全零；预留将来扩展
+14     CRC32         4       u32 小端；覆盖 [0,14)（S12；v2 无此字段，读端兼容）
 ```
+
+版本读端策略（`read_meta`）：v1 → 拒绝（提示重建）；v2 → 向后兼容读（无 CRC 校验，旧库不破坏）；
+v3 → 校验 CRC（失配 → fail-fast）。写端恒写 v3。
 
 不变量：`(VecMetric==kNone) ⟺ (VecDim==0)`。VecMetric/Dim/Quantized/InmemInt8
 创建即固定，重开必须与 open 选项一致，否则 `kModeMismatch`。

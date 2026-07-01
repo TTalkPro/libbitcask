@@ -1505,6 +1505,51 @@ TEST_F(CaskDocValueTest, LegacyV1MetaRejectedCleanly) {
     EXPECT_FALSE(c) << "旧大端目录 open 必须失败,提示重建";
 }
 
+// S12：bitcask.meta v3 加 CRC32——往返保真 + 覆盖区被篡改则 fail-fast。
+TEST_F(CaskDocValueTest, MetaV3CrcRoundTripAndCorruption) {
+    bitcask::meta::MetaConfig cfg;
+    cfg.mode = bitcask::meta::Mode::kIndex;
+    cfg.vector_metric = bitcask::meta::VectorMetric::kL2;
+    cfg.vector_dim = 8;
+    ASSERT_TRUE(bitcask::meta::write_meta(tmpdir_.string(), cfg));
+
+    auto rd = bitcask::meta::read_meta(tmpdir_.string());
+    ASSERT_TRUE(rd);
+    EXPECT_EQ(rd->mode, bitcask::meta::Mode::kIndex);
+    EXPECT_EQ(rd->vector_dim, 8);
+    EXPECT_EQ(rd->vector_metric, bitcask::meta::VectorMetric::kL2);
+
+    // 篡改覆盖区内一字节（偏移 7 = vector dim 低字节）→ CRC 失配 → 拒绝。
+    const auto path = (tmpdir_ / "bitcask.meta").string();
+    std::FILE* mf = std::fopen(path.c_str(), "r+b");
+    ASSERT_NE(mf, nullptr);
+    std::fseek(mf, 7, SEEK_SET);
+    int b = std::fgetc(mf);
+    std::fseek(mf, 7, SEEK_SET);
+    std::fputc(b ^ 0xFF, mf);
+    std::fclose(mf);
+
+    EXPECT_FALSE(bitcask::meta::read_meta(tmpdir_.string()))
+        << "meta 覆盖区被篡改 → CRC 失配必须拒绝";
+}
+
+// v2（无 CRC 字段）向后兼容读取——旧库不破坏。
+TEST_F(CaskDocValueTest, MetaV2BackwardCompatRead) {
+    unsigned char hdr[18] = {0};
+    hdr[0] = 'B'; hdr[1] = 'C'; hdr[2] = 'M'; hdr[3] = 'E';
+    hdr[4] = 2;  // version 2 = 旧格式（无 CRC），保留区全零
+    hdr[5] = 1;  // mode = Index（向量配置全零 = kNone/dim0，一致）
+    const auto path = (tmpdir_ / "bitcask.meta").string();
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    ASSERT_NE(f, nullptr);
+    ASSERT_EQ(std::fwrite(hdr, 1, sizeof(hdr), f), sizeof(hdr));
+    std::fclose(f);
+
+    auto rd = bitcask::meta::read_meta(tmpdir_.string());
+    ASSERT_TRUE(rd) << "v2 无 CRC meta 必须向后兼容读取";
+    EXPECT_EQ(rd->mode, bitcask::meta::Mode::kIndex);
+}
+
 // P9:read 句柄缓存上限——读 > cap 个文件后常驻句柄数 ≤ cap;淘汰后再读正确;
 // cap=0 不限。
 TEST_F(CaskDocValueTest, P9ReadHandleCapEvictsAndRereads) {

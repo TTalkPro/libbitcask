@@ -554,15 +554,21 @@ TEST(MigrateBEtoLE, RoundTrip) {
     EXPECT_TRUE(res->meta_migrated);
     EXPECT_TRUE(res->field_schema_migrated);
 
-    // dst meta：version 2、dim 小端 = 4。
+    // dst meta：version 3（S12：LE + CRC）、dim 小端 = 4、CRC 覆盖 [0,14) 正确。
     {
         std::FILE* f = std::fopen((fs::path(dst) / "bitcask.meta").c_str(), "rb");
         ASSERT_NE(f, nullptr);
         unsigned char m[18];
         ASSERT_EQ(std::fread(m, 1, 18, f), 18u);
         std::fclose(f);
-        EXPECT_EQ(m[4], 2u);
+        EXPECT_EQ(m[4], 3u);
         EXPECT_EQ(static_cast<std::uint16_t>(m[7] | (m[8] << 8)), 4u);
+        const std::uint32_t crc = bitcask::codec::crc32(
+            std::span<const std::byte>(reinterpret_cast<const std::byte*>(m), 14));
+        const std::uint32_t stored =
+            static_cast<std::uint32_t>(m[14]) | (static_cast<std::uint32_t>(m[15]) << 8) |
+            (static_cast<std::uint32_t>(m[16]) << 16) | (static_cast<std::uint32_t>(m[17]) << 24);
+        EXPECT_EQ(stored, crc);
     }
 
     // dst data：用小端读路径 fold，逐 record 校验（CRC 重算后必须通过）。

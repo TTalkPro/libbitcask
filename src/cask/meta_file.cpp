@@ -3,6 +3,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <span>
+
+#include "bitcask/hw_crc32.hpp"
 
 namespace bitcask::meta {
 
@@ -18,13 +21,23 @@ inline constexpr std::size_t kMetaVecMetricOffset = 6;
 inline constexpr std::size_t kMetaVecDimOffset    = 7;  // u16 LE
 inline constexpr std::size_t kMetaVecQuantOffset  = 9;  // P3b：u8 0/1（旧文件全零=否）
 inline constexpr std::size_t kMetaVecInmemInt8Offset = 10;  // P5b：u8 0/1（旧文件全零=否）
+// v3(S12)：保留区偏移 14 起放 CRC32(u32 LE)，覆盖前 14 字节(magic+version+mode+
+// 向量配置+保留 11-13)。CRC 字段自身不被覆盖。
+inline constexpr std::size_t kMetaCrcOffset   = 14;
+inline constexpr std::size_t kMetaCrcCoverLen = 14;  // CRC 覆盖 [0, 14)
 inline constexpr std::size_t kMetaFileSize = kMetaMagicSize + 1 + 1 + kMetaReservedSize;  // 18 bytes
 
-// v1 = 大端纪元(legacy);v2 = 小端 flag-day 起。bump 到 2 后,旧大端目录
-// (meta version 1)在 open 时被干净拒绝,而非静默把大端字节读成小端 → 全 record
-// CRC 失败 → 恢复成空库的危险路径。见 doc/format-zh.md 字节序说明。
-inline constexpr std::uint8_t kMetaVersion = 2;
+// v1 = 大端纪元(legacy);v2 = 小端 flag-day 起;v3(S12) = 加 CRC32 校验和。
+// 读端：v1 干净拒绝(大端,提示重建);v2 向后兼容读(无 CRC,旧库不破坏);v3 校验 CRC。
+// 写端恒写 v3(带 CRC)。见 doc/format-zh.md 字节序说明。
+inline constexpr std::uint8_t kMetaVersion = 3;
 inline constexpr char kMetaMagic[kMetaMagicSize + 1] = "BCME";
+
+// header 前 kMetaCrcCoverLen 字节的 CRC32（与 data/hint/field.schema 同多项式）。
+inline std::uint32_t meta_crc(const char* header) {
+    return hw::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(header), kMetaCrcCoverLen));
+}
 
 }  // namespace
 
@@ -51,15 +64,23 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
     }
 
     const std::uint8_t ver = static_cast<std::uint8_t>(header[kMetaVersionOffset]);
-    if (ver != kMetaVersion) {
-        // v1 = 大端 legacy 格式;v2 起为小端(flag-day)。旧目录在此干净拒绝,
-        // 提示重建——绝不静默把大端字节按小端读坏。
-        if (ver == 1) {
-            return std::unexpected(MetaError{0,
-                "incompatible legacy big-endian format (meta v1); "
-                "little-endian flag-day requires rebuild — re-ingest data"});
-        }
+    // v1 = 大端 legacy 格式;干净拒绝,提示重建——绝不静默把大端字节按小端读坏。
+    if (ver == 1) {
+        return std::unexpected(MetaError{0,
+            "incompatible legacy big-endian format (meta v1); "
+            "little-endian flag-day requires rebuild — re-ingest data"});
+    }
+    if (ver != 2 && ver != 3) {
         return std::unexpected(MetaError{0, "unsupported meta version"});
+    }
+    // v3：校验 CRC32（检出位翻转/损坏 → fail-fast）。v2：无 CRC 字段，向后兼容读
+    // （旧库不破坏；写端恒写 v3）。
+    if (ver == 3) {
+        std::uint32_t stored = 0;
+        std::memcpy(&stored, header + kMetaCrcOffset, 4);
+        if (stored != meta_crc(header)) {
+            return std::unexpected(MetaError{0, "bitcask.meta CRC mismatch (corrupt)"});
+        }
     }
 
     const std::uint8_t mode_val = static_cast<std::uint8_t>(header[kMetaModeOffset]);
@@ -106,6 +127,10 @@ std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaCo
     header[kMetaVersionOffset] = static_cast<char>(kMetaVersion);
     header[kMetaModeOffset] = static_cast<char>(
         config.mode == Mode::kKV ? 0 : 1);
+
+    // v3：所有覆盖字段填好后算 CRC32 存入偏移 14（LE-only 主机，host 序 memcpy）。
+    const std::uint32_t crc = meta_crc(header);
+    std::memcpy(header + kMetaCrcOffset, &crc, 4);
 
     f.write(header, static_cast<std::streamsize>(kMetaFileSize));
     if (!f) {

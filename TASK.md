@@ -1275,6 +1275,18 @@ W4 ✅（parallel_scan 并行全表扫描）。
     含既有 2 例全过；**Debug 全量 483/483 ctest**（478+5），零回归。
   - 风险：低（新写入 + 兼容读旧 + 原子升级；权威数据无丢失窗口）。
 
+- [x] **S12-3b bitcask.meta 加 CRC（version 3）** — 已完成（2026-07-01；S12-3 的姊妹项）
+    · `src/cask/meta_file.cpp`、`src/fileops/migrate.cpp`、`tests/cask_docvalue_test.cpp`、`tests/data_file_test.cpp`、`doc/format-zh.md`、`doc/migrate-le.md`
+  - 审计指出 `bitcask.meta` 有 magic+version 但**无 CRC**（18B 里 metric/dim/quant/inmem 单 bit
+    翻转检测不出）。修：**version bump 2→3**，保留区偏移 14 放 CRC32（u32 LE，覆盖 `[0,14)`）。
+  - **读端向后兼容**：v1 拒绝（大端）；**v2 兼容读**（无 CRC 字段，旧库不破坏）；v3 校验 CRC
+    失配 → fail-fast。**写端恒写 v3**。`migrate_le` 输出改 v1→v3（含 CRC）。
+  - **验证**：新增 `MetaV3CrcRoundTripAndCorruption`（往返 + 篡改覆盖区 → 拒绝）/
+    `MetaV2BackwardCompatRead`（v2 兼容读）；migrate RoundTrip 断言更新为 v3 + 校验 CRC。
+    **全量 488/488**，Release + `-Werror` 库构建干净。
+  - 附带回答：field.schema legacy 读后**确实原子重写为新升级格式**（`upgrade_legacy_to_new_`），
+    仅只读目录升级失败时才回退 legacy 追加。
+
 ### P1 文档同步（✅ 本轮已完成 2026-07-01）
 
 - [x] **S12-4 4 处过时设计文档状态行订正** — 已完成（2026-07-01）

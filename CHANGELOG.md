@@ -47,6 +47,23 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
     回归护栏。third_party 头标 SYSTEM 不受影响。
 
 ### 变更（Changed）
+- **bitcask.meta 版本 2→3 + CRC32（S12-3b，field.schema 头+CRC 的姊妹项）**：
+  `bitcask.meta` 之前有 magic+version 但**无 CRC**（18 字节里 metric/dim/quant/inmem
+  单 bit 翻转检测不出 → 静默以错误配置打开库）。`kMetaVersion` bump 2→3，保留区偏移
+  14 放 CRC32（u32 LE，覆盖 `[0,14)`），与 data/hint/field.schema 同多项式
+  （`hw::crc32`）。
+  - **读端向后兼容**：v1（大端 legacy）仍干净拒绝；v2（无 CRC）向后兼容读（旧库不
+    破坏）；v3 校验 CRC 失配 → fail-fast（`bitcask.meta CRC mismatch`）。
+  - **写端恒写 v3**：所有 open + 重写路径自动写 v3（带 CRC）。
+  - **`migrate_le` 输出 v1→v3**：含 CRC 写入与 `write_meta` 一致。
+  - **验证**：新增 `MetaV3CrcRoundTripAndCorruption`（往返 + 篡改覆盖区一字节 →
+    CRC 失配拒绝）+ `MetaV2BackwardCompatRead`（v2 无 CRC 兼容读）。migrate
+    RoundTrip 断言更新为 v3 + 校验 CRC。**全量 488/488**（486+2），Release +
+    `-Werror` 库构建干净。
+  - **附带回答**：field.schema legacy 读后**确实原子重写为新升级格式**
+    （`upgrade_legacy_to_new_`），仅只读目录升级失败时才回退 legacy 追加。
+  - 文档：`doc/format-zh.md` 加版本读端策略表 + CRC 偏移；`doc/migrate-le.md` 同步
+    v1→v3 描述。
 - **C API 能力缺口全部补齐（S12-5 [中]）**：
   - 头里早已声明 `bitcask_search_text_batch` / `bitcask_search_vector_batch` /
     `bitcask_search_hybrid_batch`（+ `bitcask_iter_next_batch`）但 `.cpp` 未实现——
@@ -101,8 +118,8 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   key、3 处 `static_cast<ptrdiff_t>`）。
 
 ### 说明（Notes）
-- 全量 486/486 零回归（C++，Debug GCC）；C API 7/7 通过（plain + ASan(含 leak) +
-  TSan）；TSan 三例零 race（reducer 内 compact 并发护栏）。
+- 全量 488/488 零回归（C++，Debug GCC，含 S12-3b 新增 2 例）；C API 7/7 通过（plain +
+  ASan(含 leak) + TSan）；TSan 三例零 race（reducer 内 compact 并发护栏）。
 - **默认行为变更**：`max_read_handles = 0` 由「不限」变「按 RLIMIT_NOFILE 自动上限」
   ——需显式不限者用 `kUnlimitedReadHandles`。
 - **未做（有意）**：

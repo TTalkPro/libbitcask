@@ -256,7 +256,7 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 │  │   ├─ InvertedIndex（按字段隔离的 BM25 倒排）             │
 │  │   ├─ HnswIndex（单写者 + 多读者无锁发布协议）            │
 │  │   └─ Analyzer（Ngram / Whitespace / Jieba）            │
-│  ├─ MetaConfig（bitcask.meta 模式持久化）                  │
+│  ├─ MetaConfig（bitcask.meta v3：magic + version + CRC32）  │
 │  └─ IndexLane*（借用句柄 → registry 共享 IndexPool）        │
 └───────────────────────────────────────────────────────────┘
               │                    │
