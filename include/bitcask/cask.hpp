@@ -138,6 +138,7 @@ enum class CaskError {
     kNoIndex,           // KV 模式下调用了 search 接口
     kModeMismatch,      // 文件模式与打开选项不匹配
     kAnalyzerMismatch,  // 分析器类型不匹配
+    kClosed,            // 对已 close 的 handle 发起调用（S12-5：与 kInvalidOption 区分）
 };
 
 struct CaskFault {
@@ -355,8 +356,9 @@ public:
     // 释放资源。**幂等**（二次 close no-op）。
     // 线程安全: 否（生命周期方法，修改对象状态、释放资源）；caller 须保证关闭
     // 时刻没有其它线程仍在调用 get/put/remove/sync/iter。
-    // S11-W3：close 后**新发起**的公共调用 fail-fast 返回 kInvalidOption（"cask
-    // is closed"）而非解引用已释放状态；但与 close **并发在途**的调用仍是 UB
+    // S11-W3：close 后**新发起**的公共调用 fail-fast 返回 kClosed（"cask
+    // is closed"，S12-5 前为 kInvalidOption）而非解引用已释放状态；但与 close
+    // **并发在途**的调用仍是 UB
     // （上面的契约）——这是 best-effort 防误用,非完整 rundown。
     void close() noexcept;
 
@@ -401,7 +403,7 @@ public:
     //   n_threads==0 → hardware_concurrency()。
     //   并发删除致某 key 在 get 时 kNotFound → 跳过（near-real-time,与搜索一致）；
     //   其它错误（IO/CRC）→ 停止并返回该错误。返回成功遍历到的 key 数。
-    // 线程安全: 是（快照串行建立 + get 并发安全）。Cask 已 close → kInvalidOption。
+    // 线程安全: 是（快照串行建立 + get 并发安全）。Cask 已 close → kClosed。
     [[nodiscard]] std::expected<std::size_t, CaskFault>
     parallel_scan(std::size_t n_threads, const ScanFn& fn);
 

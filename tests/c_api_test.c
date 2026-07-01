@@ -332,6 +332,11 @@ static int test_parallel_scan(void) {
     return 0;
 }
 
+// 注：C API 的 bitcask_close **销毁句柄**（adopt+delete），故纯 C 无「已关闭但存活」
+// 状态——close 后再用是 use-after-free（caller bug），非 BITCASK_ERR_CLOSED 场景。
+// kClosed 的实际受益方是 C++ 消费方（Cask::close 保留对象 + fail-fast），其覆盖见
+// C++ 测试 CrashRecoveryTest.OperationsAfterCloseReturnErrorNotUb。
+
 int main(void) {
     int failures = 0;
     failures += test_version();

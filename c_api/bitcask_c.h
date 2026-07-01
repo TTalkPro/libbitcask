@@ -114,6 +114,7 @@ typedef enum {
     BITCASK_ERR_NO_INDEX       = 10,
     BITCASK_ERR_MODE_MISMATCH  = 11,
     BITCASK_ERR_ANALYZER_MISMATCH = 12,
+    BITCASK_ERR_CLOSED         = 13,  // 对已 bitcask_close 的 handle 发起调用（S12-5）
 } bitcask_error_t;
 
 // 错误详情（对应 bitcask::CaskFault）
@@ -510,7 +511,7 @@ typedef void (*bitcask_scan_fn)(void* ctx,
 // 分段并发 get 读值并调 fn——把「多线程读安全」用于 analytics/export/reindex。
 //   n_threads==0 → hardware_concurrency()。
 //   并发删除致某 key get 时 not-found → 跳过（near-real-time）；IO/CRC 错误 → 停止并返回。
-//   成功时 *out_count（可为 NULL）= 遍历到的 key 数。cask 已 close → INVALID_OPTION。
+//   成功时 *out_count（可为 NULL）= 遍历到的 key 数。cask 已 close → BITCASK_ERR_CLOSED。
 // 线程安全: 是（快照串行 + get 并发安全）。
 BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
                                                     size_t n_threads,

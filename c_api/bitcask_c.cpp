@@ -62,6 +62,7 @@ bitcask_error_t to_c_error_kind(bitcask::CaskError e) {
         case bitcask::CaskError::kNoIndex:          return BITCASK_ERR_NO_INDEX;
         case bitcask::CaskError::kModeMismatch:     return BITCASK_ERR_MODE_MISMATCH;
         case bitcask::CaskError::kAnalyzerMismatch: return BITCASK_ERR_ANALYZER_MISMATCH;
+        case bitcask::CaskError::kClosed:           return BITCASK_ERR_CLOSED;
     }
     return BITCASK_ERR_IO;
 }

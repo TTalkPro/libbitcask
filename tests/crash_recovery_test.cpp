@@ -617,18 +617,18 @@ TEST_F(CrashRecoveryTest, OperationsAfterCloseReturnErrorNotUb) {
 
     (*c)->close();
 
-    // 数据面：get/put/remove/sync 均返回 kInvalidOption，不崩。
+    // 数据面：get/put/remove/sync 均返回 kClosed（S12-5：与参数非法区分），不崩。
     auto g = (*c)->get(bytes("k0"));
     ASSERT_FALSE(g);
-    EXPECT_EQ(g.error().kind, bitcask::CaskError::kInvalidOption);
+    EXPECT_EQ(g.error().kind, bitcask::CaskError::kClosed);
 
     auto p = (*c)->put(bytes("k1"), bytes("v1"));
     ASSERT_FALSE(p);
-    EXPECT_EQ(p.error().kind, bitcask::CaskError::kInvalidOption);
+    EXPECT_EQ(p.error().kind, bitcask::CaskError::kClosed);
 
     auto rm = (*c)->remove(bytes("k0"));
     ASSERT_FALSE(rm);
-    EXPECT_EQ(rm.error().kind, bitcask::CaskError::kInvalidOption);
+    EXPECT_EQ(rm.error().kind, bitcask::CaskError::kClosed);
 
     EXPECT_FALSE((*c)->sync());
     EXPECT_FALSE((*c)->merge());
@@ -701,7 +701,7 @@ TEST_F(CrashRecoveryTest, ParallelScanVisitsAllKeysOnce) {
     // close 后 fail-fast（W3）。
     auto after = (*c)->parallel_scan(4, count_only);
     ASSERT_FALSE(after);
-    EXPECT_EQ(after.error().kind, bitcask::CaskError::kInvalidOption);
+    EXPECT_EQ(after.error().kind, bitcask::CaskError::kClosed);
 }
 
 }  // namespace

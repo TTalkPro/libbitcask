@@ -93,6 +93,7 @@ typedef struct {
 | `10` | `BITCASK_ERR_NO_INDEX` | KV 模式调用 search |
 | `11` | `BITCASK_ERR_MODE_MISMATCH` | 模式不匹配 |
 | `12` | `BITCASK_ERR_ANALYZER_MISMATCH` | 分析器类型不匹配 |
+| `13` | `BITCASK_ERR_CLOSED` | 对已 `bitcask_close` 的 handle 发起调用（S12-5：与选项非法区分）|
 
 > `bitcask_iter_next` 遇快照过期（caller 应重试）时返回 `BITCASK_ERR_INVALID_OPTION`——头文件中无独立的 `BITCASK_ERR_OUT_OF_DATE` 常量。
 

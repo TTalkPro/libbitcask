@@ -1310,9 +1310,19 @@ W4 ✅（parallel_scan 并行全表扫描）。
       sanitize 构建下未插桩的 C 主程序链接已插桩 `.so`，`.so` 内起线程（search 模式 IndexPool）即
       SEGV。KV-only 时不触发，search 测试首次暴露。修：`tests/CMakeLists.txt` 补 link
       `bitcask_sanitizers`，TSan/ASan 无需 preload 即通过。
-  - [ ] **[中] 无 `BITCASK_ERR_CLOSED`**（closed 与参数非法共码，`:97-110`）；`bitcask_close`
-    返 `void` 无法回报。注：W3 曾**有意**复用 kInvalidOption 避免枚举 churn；改动即 ABI 语义
-    变更，需权衡。留待评估。
+  - [x] **[中] `BITCASK_ERR_CLOSED`**（路线 A，2026-07-01）。新增 C++ `CaskError::kClosed`（枚举末尾，
+    ABI 增量安全），11 处 `is_closed()` fail-fast 从 `kInvalidOption` 改为 `kClosed`
+    （`cask.cpp`）；C 枚举加 `BITCASK_ERR_CLOSED = 13` + `to_c_error_kind` 映射。反转 W3 的
+    "复用 kInvalidOption"取舍——现 C++ 消费方可区分「用了已关闭 handle」与「参数非法」。
+    - **关键发现**：**纯 C API 下 `BITCASK_ERR_CLOSED` 不可达**——`bitcask_close` 直接 adopt+delete
+      销毁句柄（`bitcask_c.cpp:284`），无「已关闭但存活」的 C 句柄；close 后再用是 UAF（caller bug）。
+      故 kClosed 的实际受益方是 **C++ 消费方**（`Cask::close` 保留对象 + fail-fast），C 映射为
+      完整性/未来路径保留。
+    - 测试：C++ `OperationsAfterCloseReturnErrorNotUb` / `ParallelScanVisitsAllKeysOnce` 断言改
+      kClosed；C 测试注明 UAF 语义不测。api-c.md §4.4 错误码表补 `13`。全量 486/486 + Release 干净。
+    - **未做（有意）**：`bitcask_close` 返 `void` 不改——C++ `close()` 本就 void+noexcept best-effort，
+      无可回报；改签名是破坏性变更却无实益。若要让 C 侧也能 graceful「close 后 fail-fast 不 UAF」，
+      需把 close 拆成 `close`（不销毁）+ `free`（销毁）——ownership 破坏性变更，留待独立评估。
 
 - [~] **S12-6 CI 单一编译器/平台** — 部分完成（2026-07-01）
   - [x] **加 clang 构建 job**（`.github/workflows/ci.yml` `clang-build-test`）。**过程中修了 2 个
