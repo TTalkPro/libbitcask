@@ -3,18 +3,30 @@
 本文件记录 libbitcask 的所有重要变更。
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
-版本遵循语义化版本。**3.0.0 起三套版本号统一**：CHANGELOG 发布版本 = 库 `VERSION` =
-C API 产品版本 `bitcask_version_*` = **`3.0.0`**；库 `SOVERSION` = **`3`**（= major）；
-盘上 meta 格式版本 `v2`（独立，与库版本无关）。
+版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
+`project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
+`bitcask_version_*` = **`3.1.0`**；库 `SOVERSION` = **`3`**（= major，ABI 兼容不变）；
+盘上格式版本独立于库版本：`bitcask.meta` = **`v3`**（含 CRC32），`field.schema` = **FSCH v1**。
 
 ---
 
 ## [Unreleased]
 
-S12 全库审计批次落地（2026-07-01）：read 句柄默认上限 / reducer 内自动 compaction
-（opt-in）/ field.schema 格式升至 v2（magic + version + CRC32）/ C API 能力缺口全部
-补齐（批量×3 + parallel_scan + BITCASK_ERR_CLOSED）/ C API 头线程安全注释订正 /
+（暂无）
+
+## [3.1.0] - 2026-07-01
+
+S12 全库审计批次落地：read 句柄默认上限 / reducer 内自动 compaction（opt-in）/
+field.schema 加 magic+version+CRC（FSCH v1）/ **bitcask.meta 加 CRC（v3）** / C API
+能力扩展（批量检索×3 + parallel_scan + BITCASK_ERR_CLOSED）/ C API 头线程安全注释订正 /
 clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
+
+> **版本语义**：本版为向后兼容的**功能新增**（C API 纯增量、格式加校验），故 MINOR +1
+> → `3.1.0`；ABI 未破坏（新符号 + 枚举末尾加值），`SOVERSION` 保持 `3`。
+>
+> ⚠️ **前向不兼容（数据格式）**：本版写出的库**不能被 3.0.0 打开**——`bitcask.meta`
+> 升至 v3（3.0.0 读端只认 v2，遇 v3 报 "unsupported meta version"）。**反向兼容**：本版
+> **能读**旧库（v2 meta 兼容读、legacy field.schema 自动升级为 FSCH）。升级请单向进行。
 
 ### 新增（Added）
 - **read 句柄默认上限（防 fd/mmap 无界，S12-1）**：`CaskOptions::max_read_handles = 0`
@@ -27,12 +39,17 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   on_write / on_delete 末尾调用，开时累计退休达 `max(1024, live/2)` 才在 reducer
   线程内 compact（与 add_doc/put_doc 同线程、无并发窗口，TSan 三例零 race 实证）。
   默认关零开销；附 `total_postings()` 内省。
-- **field.schema 格式升至 v2（S12-3）**：文件头 8 字节
+- **field.schema 加格式头（FSCH v1，S12-3）**：文件头 8 字节
   `[magic="FSCH":u32][version=1:u32]`（小端）+ 每条 entry 的
   `[NameLen:u16][name][CRC32:u32]`（CRC 覆盖 `[NameLen|name]`）。magic/version 未知或
   entry CRC 不符 → `open()` 返回 false（fail-fast）；torn tail 容忍跳过。兼容旧库：
   peek 前 4 字节，无 magic 按 legacy `[len][name]` 照读并在可写目录**原子升级**
   （temp + fsync + rename，权威数据零丢失窗口）。
+- **bitcask.meta 加 CRC（version 2→3，S12-3b）**：保留区偏移 14 放 CRC32（u32 LE，
+  覆盖 `[0,14)`）。读端：v1 拒绝（大端）；**v2 向后兼容读**（无 CRC 字段，旧库不破坏）；
+  v3 校验 CRC 失配 → fail-fast。写端恒写 v3；`migrate_le` 输出改 v1→v3（含 CRC）。
+  补齐审计发现的「meta 有 magic+version 但无 CRC」缺口，使 field.schema 与 meta 都具备
+  magic+version+CRC 三件套。
 - **C API `BITCASK_ERR_CLOSED = 13`（S12-5）**：C++ `CaskError::kClosed` 末尾追加
   （ABI 增量安全），11 处 `is_closed()` fail-fast 从 `kInvalidOption` 改为 `kClosed`。
   C 枚举加 `BITCASK_ERR_CLOSED` + `to_c_error_kind` 映射。**关键**：纯 C API 下不可达
@@ -82,7 +99,7 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   包装、无 C 层共享可变态，完全继承其契约）。重写为「同一 handle 多线程安全」对齐
   `cask.hpp:6-24` / `api-c.md §14`，含读/写/读写并发/merge/iter 各条。**纯注释、
   零行为变更**。
-- **三套版本号单一真源（S12-7）**：`project(libbitcask VERSION 3.0.0)` 为唯一手写处；
+- **三套版本号单一真源（S12-7）**：`project(libbitcask VERSION ...)` 为唯一手写处；
   `configure_file` 从 `PROJECT_VERSION*` 生成 `c_api/bitcask_version.h`，
   `bitcask_c.cpp` 用宏替换原硬编码 `return 3/0/0`（`__has_include` 优雅回退到
   `0.0.0-unknown` 占位）。库 `VERSION/SOVERSION` 改 `${PROJECT_VERSION}/${PROJECT_VERSION_MAJOR}`。
@@ -279,7 +296,9 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/davidalphafox/libbitcask/compare/v3.0.0...v3.1.0
+[3.0.0]: https://github.com/davidalphafox/libbitcask/compare/v1.2.0...v3.0.0
 [1.2.0]: https://github.com/davidalphafox/libbitcask/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/davidalphafox/libbitcask/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/davidalphafox/libbitcask/releases/tag/v1.0.0
