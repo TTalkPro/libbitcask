@@ -155,7 +155,7 @@ class IndexTaskQueue {
 public:
     explicit IndexTaskQueue(std::size_t capacity = 10240)
     {
-        queue_.set_capacity(capacity);
+        queue_.set_capacity(static_cast<std::ptrdiff_t>(capacity));
     }
 
     // C1:tbb 队列内部以 fence 同步,TSan 不建模独立 fence——producer
@@ -180,7 +180,7 @@ public:
         return true;
     }
 
-    std::size_t size() const { return queue_.size(); }
+    std::size_t size() const { return static_cast<std::size_t>(queue_.size()); }
 
 private:
 #if defined(__SANITIZE_THREAD__) || \

@@ -52,10 +52,6 @@ std::uint32_t now_sec_default() {
 #endif
 }
 
-std::span<const std::byte> str_to_bytes(std::string_view s) {
-    return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
-}
-
 std::string_view bytes_to_view(std::span<const std::byte> b) {
     return {reinterpret_cast<const char*>(b.data()), b.size()};
 }

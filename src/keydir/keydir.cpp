@@ -514,7 +514,7 @@ PutResult KeyDir::put_insert(PutCtx& ctx, std::string_view key,
 }
 
 // ---- put 分支 (B)/(C)：key 当前是活的，可能要覆盖 ----
-PutResult KeyDir::put_overwrite(PutCtx& ctx, std::string_view key,
+PutResult KeyDir::put_overwrite(PutCtx& ctx, [[maybe_unused]] std::string_view key,
                                  std::uint32_t file_id, std::uint32_t total_sz,
                                  std::uint64_t offset, std::uint32_t tstamp,
                                  bool newest_put,

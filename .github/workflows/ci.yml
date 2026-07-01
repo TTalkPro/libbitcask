@@ -76,6 +76,37 @@ jobs:
         run: ctest --test-dir build --output-on-failure -j$(nproc)
 
   # ---------------------------------------------------------------------------
+  # -Werror 库构建（S12-7）。只对 first-party 开 -Werror 作新告警回归护栏——
+  # BUILD_TESTING=OFF 且只建库目标（不含 bench/tests）；third_party 头已 SYSTEM 不受影响。
+  # ---------------------------------------------------------------------------
+  werror-lib:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install GCC 13
+        run: |
+          sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
+          sudo apt-get update
+          sudo apt-get install -y g++-13
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: werror-gcc13
+      - name: Configure (-Werror, library only)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DBITCASK_WERROR=ON \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build library (first-party warnings = errors)
+        run: cmake --build build -j$(nproc) --target bitcask_static bitcask_shared
+
+  # ---------------------------------------------------------------------------
   # CI2:Sanitizer matrix（ASAN+UBSAN / TSan）。TSan 是 Barrier v2 / IndexPool
   # 并发协议 + 恢复期并行 fold/analyze 的唯一回归护栏；TSan 构建用源码编译的
   # 插桩 oneTBB（submodule recursive 已拉取）。运行期选项设为「首个错误即 abort

@@ -828,7 +828,8 @@ SearchLayer::search_fields(std::string_view query, std::size_t k,
 
     std::vector<std::pair<std::uint64_t,double>> ranked(acc.begin(), acc.end());
     std::partial_sort(ranked.begin(),
-                      ranked.begin() + std::min(k, ranked.size()),
+                      ranked.begin() +
+                          static_cast<std::ptrdiff_t>(std::min(k, ranked.size())),
                       ranked.end(),
                       [](const auto& a, const auto& b) { return a.second > b.second; });
     if (ranked.size() > k) ranked.resize(k);

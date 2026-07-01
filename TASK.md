@@ -1337,7 +1337,7 @@ W4 ✅（parallel_scan 并行全表扫描）。
     （验证 NEON/非 VNNI 标量路径 `detail/int8_kernels.hpp`）。
   - 注：端序已安全（整数可移植位移；float 向量有 `static_assert(endian==little)`，`codec.cpp:139`）。
 
-- [~] **S12-7 构建加固小项** — 部分完成（2026-07-01）
+- [x] **S12-7 构建加固小项** — 已完成（2026-07-01；版本单一真源 + -Werror）
   - [x] **版本号单一真源**。`project()` 原无 VERSION；库 SOVERSION（`CMakeLists.txt` 硬编码
     `VERSION 3.0.0`）与 C API（`bitcask_c.cpp:143-146` 硬编码 `return 3/0/0`）各写一份，易漂移。
     改：`project(libbitcask VERSION 3.0.0)` 为唯一手写处；`configure_file` 从 `PROJECT_VERSION*`
@@ -1345,9 +1345,19 @@ W4 ✅（parallel_scan 并行全表扫描）。
     库 `VERSION/SOVERSION` 用 `${PROJECT_VERSION}/${PROJECT_VERSION_MAJOR}`。生成头验证为 3/0/0，
     c_api 测试通过。**顺带修** `cask.cpp:2121` 忽略 `save_search_ckpt()` 返回值（-Wunused-result）→
     显式 `(void)` + best-effort 注释（checkpoint 失败非致命，下次 fold 重建）。
-  - [ ] **`-Werror`（first-party）** — 未做。first-party 有 ~15 处告警（`-Wshadow` 29 /
-    `-Wsign-conversion` 17，多在 hnsw/inverted 热点），多为噪音型；`-Werror` 需先清理这批，
-    触碰热点代码为 cosmetic 告警、风险>价值。且需排除 third_party（cppjieba 大量告警）。留待评估。
+  - [x] **`-Werror`（first-party）** — 已完成。原估「~15 处噪音告警」核实后，**真正 first-party
+    库告警只有 13 处**（之前把 vendored `include/cppjieba`/`include/limonp` 误算进来）：
+    -Wshadow×7、-Wsign-conversion×4、-Wunused-function×1、-Wunused-parameter×1，全为**零行为风险**
+    的机械修复（rename `max_tf`/`pos`/`k`、删冗余 `using Cand`、删未用 `str_to_bytes`、
+    `[[maybe_unused]]` key、3 处 `static_cast<ptrdiff_t>`）。跨 6 文件（inverted.hpp/cpp、
+    hnsw.cpp、thread_pool.hpp、search_layer.cpp、cask.cpp、keydir.cpp）。
+    - **third_party 隔离**：`cppjieba` INTERFACE 改 `SYSTEM` include（`CMakeLists.txt`），编译器视为
+      系统头、不对其大量告警报错，使 -Werror 只作用于 first-party。
+    - **机制**：新增 `option(BITCASK_WERROR OFF)` → 开时给 `bitcask_warnings` 加 `-Werror`。**默认关**
+      （避免新编译器新告警破坏下游/本地构建）；新增 CI job `werror-lib`（Release + BUILD_TESTING=OFF +
+      只建 `bitcask_static`/`bitcask_shared`，不含 bench/tests）开启作护栏。
+    - **验证**：本地 `-DBITCASK_WERROR=ON` 建库 0 错误 0 告警；常规构建全量 486/486 零回归
+      （13 处编辑行为中性）；ci.yml YAML 合法（5 jobs）。
 
 ### P3 已知权衡 / 远期（记录备查，当前无需动）
 
@@ -1368,6 +1378,6 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > ~~S12-2（reducer 内自动 compaction）✅~~ → ~~S12-5 [高] C API 头注释订正 ✅~~ 2026-07-01
 > （**P0 三项 + P1 文档债全部完成**）→ ~~S12-5[高] C API 注释~~ ✅ →
 > ~~S12-6 clang job（+2 可移植性 bug 修复）~~ ✅ → ~~S12-7 版本单一真源~~ ✅ 2026-07-01。
-> → ~~S12-5[中] C API batch×3 + parallel_scan~~ ✅ 2026-07-01。
-> 剩余（均需独立评估）：S12-5 `BITCASK_ERR_CLOSED`（触 W3 枚举决策）/ S12-6 macOS·ARM64 job（需
-> runner）/ S12-7 `-Werror`（先清 ~15 处 cosmetic 告警）。P3 按需。
+> → ~~S12-5[中] C API batch×3 + parallel_scan~~ ✅ → ~~S12-5 BITCASK_ERR_CLOSED~~ ✅ →
+> ~~S12-7 -Werror（first-party 库）~~ ✅ 2026-07-01。**S12-5 / S12-7 全部完成**。
+> 剩余（均需 runner，本地无法验证）：**S12-6 macOS · ARM64 job**（唯一 S12 未决项）。P3 按需。

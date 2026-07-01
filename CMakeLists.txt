@@ -34,6 +34,13 @@ target_compile_options(bitcask_warnings INTERFACE
     -Wcast-align -Woverloaded-virtual
     -fvisibility=hidden -fvisibility-inlines-hidden
 )
+# S12-7：把告警升为错误。**默认关**——避免新编译器版本的新告警破坏下游/本地构建；
+# CI 的库构建（BUILD_TESTING=OFF，只建 first-party）开启作回归护栏。third_party
+# 头已标 SYSTEM，-Werror 不作用于它们。
+option(BITCASK_WERROR "Treat first-party warnings as errors（CI 库构建开启）" OFF)
+if(BITCASK_WERROR)
+    target_compile_options(bitcask_warnings INTERFACE -Werror)
+endif()
 
 find_package(ZLIB REQUIRED)
 
@@ -317,7 +324,10 @@ endif()
 
 if(NOT TARGET cppjieba)
     add_library(cppjieba INTERFACE)
-    target_include_directories(cppjieba INTERFACE
+    # SYSTEM：cppjieba/limonp 是 vendored 第三方头，含大量 -Wold-style-cast/
+    # -Wsign-conversion 等告警；标 SYSTEM 让编译器视为系统头、不对其告警，
+    # 使 BITCASK_WERROR（-Werror）只作用于 first-party 代码。
+    target_include_directories(cppjieba SYSTEM INTERFACE
         "${CMAKE_SOURCE_DIR}/third_party/cppjieba/include"
         "${CMAKE_SOURCE_DIR}/third_party/limonp/include"
     )

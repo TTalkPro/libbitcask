@@ -452,8 +452,8 @@ void HnswIndex::search_layer(
     const std::uint32_t ep = vt.epoch;
     std::uint32_t* visited = vt.marks.data();
 
-    using Cand [[maybe_unused]] = std::pair<float, std::uint32_t>;
     // B5:从 thread_local buffer move 构造（保容量），函数尾 extract 回收。
+    // Cand 用文件级全局别名（std::pair<float, std::uint32_t>）。
     tl_cands_buf.clear();
     tl_top_buf.clear();
     ReusablePQ<std::greater<>> cands(std::greater<>{}, std::move(tl_cands_buf));
@@ -558,7 +558,7 @@ void HnswIndex::search_layer_int8(
     const std::uint32_t ep = vt.epoch;
     std::uint32_t* visited = vt.marks.data();
 
-    using Cand [[maybe_unused]] = std::pair<float, std::uint32_t>;
+    // Cand 用文件级全局别名（std::pair<float, std::uint32_t>）。
     tl_cands_buf.clear();
     tl_top_buf.clear();
     ReusablePQ<std::greater<>> cands(std::greater<>{}, std::move(tl_cands_buf));
@@ -955,7 +955,8 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
             } else {
                 for (auto& [d, id] : found) d = dist_id(q, id);
             }
-            std::partial_sort(found.begin(), found.begin() + rerank_n,
+            std::partial_sort(found.begin(),
+                              found.begin() + static_cast<std::ptrdiff_t>(rerank_n),
                               found.end(),
                               [](const auto& a, const auto& b) {
                                   return a.first < b.first;

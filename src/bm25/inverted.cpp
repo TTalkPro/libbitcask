@@ -1246,10 +1246,10 @@ auto InvertedIndex::bool_search(
         // 后续块级元数据 / BMW 的游标接口(doc/kway-blockmax-bmw-zh.md)。
         auto run_must_intersect = [&] {
             std::vector<std::uint64_t> acc;
-            const std::size_t k = must_order.size();
+            const std::size_t mk = must_order.size();
 
             // 单词退化:live 过滤直拷(与旧实现首词分支等价)。
-            if (k == 1) {
+            if (mk == 1) {
                 auto& tp = must_tps[must_order[0]];
                 acc.reserve(tp.fp.size());
                 for (std::size_t i = 0; i < tp.fp.size(); ++i) {
@@ -1263,7 +1263,7 @@ auto InvertedIndex::bool_search(
             // (BoolMustHot 4096:44.3→50.3μs),两次 live 过滤拷贝的代价
             // 小于 SIMD 对标量的优势;k≥3 才轮到 leapfrog(收益来自
             // 消除 k-1 轮物化 + 多列表互相 gallop)。
-            if (k == 2) {
+            if (mk == 2) {
                 std::vector<std::uint64_t> a;
                 std::vector<std::uint64_t> b;
                 auto fill = [&](const TermPostings& tp,
@@ -1286,7 +1286,7 @@ auto InvertedIndex::bool_search(
                 std::size_t i = 0;
             };
             std::vector<Cur> curs;
-            curs.reserve(k);
+            curs.reserve(mk);
             for (auto mi : must_order) {
                 auto& tp = must_tps[mi];
                 if (tp.fp.size() == 0) return acc;  // 任一列表空 → 交集空
@@ -1317,15 +1317,15 @@ auto InvertedIndex::bool_search(
             while (curs[0].i < curs[0].n) {
                 const std::uint64_t v = curs[0].ords[curs[0].i];
                 std::size_t j = 1;
-                for (; j < k; ++j) {
+                for (; j < mk; ++j) {
                     advance(curs[j], v);
                     if (curs[j].i == curs[j].n) return acc;  // 耗尽 → 结束
                     if (curs[j].ords[curs[j].i] != v) break; // 被挡住
                 }
-                if (j == k) {
+                if (j == mk) {
                     // 全列表命中:liveness 全检后输出。
                     bool all_live = true;
-                    for (std::size_t m = 0; m < k; ++m) {
+                    for (std::size_t m = 0; m < mk; ++m) {
                         if (!curs[m].live[curs[m].i]) {
                             all_live = false;
                             break;
@@ -1972,13 +1972,13 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
                 if (tf_csize > 0 && !read_bytes(tf_buf.data(), tf_csize)) {
                     return false;
                 }
-                std::size_t pos = 0;
+                std::size_t tf_pos = 0;
                 for (std::uint32_t p = 0; p < pc; ++p) {
-                    auto [val, np] = codec::vbyte_decode(tf_buf.data(), pos);
+                    auto [val, np] = codec::vbyte_decode(tf_buf.data(), tf_pos);
                     pl.items[p].tf = static_cast<std::uint32_t>(val);
-                    pos = np;
+                    tf_pos = np;
                 }
-                if (pos != tf_csize) { return false; }
+                if (tf_pos != tf_csize) { return false; }
             }
 
             // v6：dls 整组 VByte 解码。
@@ -1989,13 +1989,13 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
                 if (dl_csize > 0 && !read_bytes(dl_buf.data(), dl_csize)) {
                     return false;
                 }
-                std::size_t pos = 0;
+                std::size_t dl_pos = 0;
                 for (std::uint32_t p = 0; p < pc; ++p) {
-                    auto [val, np] = codec::vbyte_decode(dl_buf.data(), pos);
+                    auto [val, np] = codec::vbyte_decode(dl_buf.data(), dl_pos);
                     pl.items[p].dl = static_cast<std::uint32_t>(val);
-                    pos = np;
+                    dl_pos = np;
                 }
-                if (pos != dl_csize) { return false; }
+                if (dl_pos != dl_csize) { return false; }
             }
 
             // positions：与 v4+ 同——每 posting (u32 个数 + u32 压缩字节数 + 字节流)。
