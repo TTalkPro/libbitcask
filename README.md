@@ -110,6 +110,26 @@ cmake -S . -B build/tsan -DCMAKE_BUILD_TYPE=Debug \
     -DBITCASK_SANITIZE=thread -DBUILD_TESTING=ON
 ```
 
+### `-Werror` 库构建（first-party 护栏）
+
+```bash
+# 默认关（避免新编译器新告警破坏下游）；开时只对 first-party 库目标生效，
+# third_party 头（cppjieba/limonp）已标 SYSTEM 不受影响。CI `werror-lib` job
+# 已开启（GCC 13 + Release + 只建 bitcask_static/bitcask_shared）。
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    -DBITCASK_WERROR=ON -DBUILD_TESTING=OFF
+cmake --build build -j --target bitcask_static bitcask_shared
+```
+
+### 主要 CMake 选项
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `BUILD_TESTING` | OFF | 编测试二进制 + ctest |
+| `BITCASK_BUILD_BENCHMARKS` | OFF | 编 Google Benchmark 微基准 |
+| `BITCASK_SANITIZE` | 空 | `address,undefined` / `thread` ——见上 |
+| `BITCASK_WERROR` | OFF | first-party 告警升错（CI `werror-lib` 开启） |
+
 ### 产物
 
 - `libbitcask.so` — 共享库，导出 C API（`extern "C"`，跨 ABI 稳定，`SOVERSION=3`）

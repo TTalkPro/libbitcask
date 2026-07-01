@@ -11,7 +11,108 @@ C API 产品版本 `bitcask_version_*` = **`3.0.0`**；库 `SOVERSION` = **`3`**
 
 ## [Unreleased]
 
-无未发布变更。
+S12 全库审计批次落地（2026-07-01）：read 句柄默认上限 / reducer 内自动 compaction
+（opt-in）/ field.schema 格式升至 v2（magic + version + CRC32）/ C API 能力缺口全部
+补齐（批量×3 + parallel_scan + BITCASK_ERR_CLOSED）/ C API 头线程安全注释订正 /
+clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
+
+### 新增（Added）
+- **read 句柄默认上限（防 fd/mmap 无界，S12-1）**：`CaskOptions::max_read_handles = 0`
+  从「不限」改为按 `RLIMIT_NOFILE` 软上限自动推导（约一半、下限 64）。新增
+  `kUnlimitedReadHandles` 哨兵显式不限。小/中库行为不变、零 churn；大库由 fd 耗尽
+  crash 改为 graceful 句柄淘汰（miss 时重开 sealed 文件 ~μs）。
+- **reducer 线程内自动 compaction（opt-in，S12-2）**：新增
+  `SearchLayerConfig::auto_compact_dead_ratio`（默认 0=关；`(0,1]`=开+per-list 阈值）。
+  Index 加 `retired_since_compact_` 计数器；`maybe_auto_compact()` 在 reduce_apply /
+  on_write / on_delete 末尾调用，开时累计退休达 `max(1024, live/2)` 才在 reducer
+  线程内 compact（与 add_doc/put_doc 同线程、无并发窗口，TSan 三例零 race 实证）。
+  默认关零开销；附 `total_postings()` 内省。
+- **field.schema 格式升至 v2（S12-3）**：文件头 8 字节
+  `[magic="FSCH":u32][version=1:u32]`（小端）+ 每条 entry 的
+  `[NameLen:u16][name][CRC32:u32]`（CRC 覆盖 `[NameLen|name]`）。magic/version 未知或
+  entry CRC 不符 → `open()` 返回 false（fail-fast）；torn tail 容忍跳过。兼容旧库：
+  peek 前 4 字节，无 magic 按 legacy `[len][name]` 照读并在可写目录**原子升级**
+  （temp + fsync + rename，权威数据零丢失窗口）。
+- **C API `BITCASK_ERR_CLOSED = 13`（S12-5）**：C++ `CaskError::kClosed` 末尾追加
+  （ABI 增量安全），11 处 `is_closed()` fail-fast 从 `kInvalidOption` 改为 `kClosed`。
+  C 枚举加 `BITCASK_ERR_CLOSED` + `to_c_error_kind` 映射。**关键**：纯 C API 下不可达
+  ——`bitcask_close` 直接 `adopt+delete` 销毁句柄，close 后再用是 use-after-free
+  （caller bug）；kClosed 的实际受益方是 C++ 消费方，C 映射为完整性 / 未来路径保留。
+- **CI 矩阵扩容**：
+  - **clang Debug 构建 job**（`clang-build-test`，S12-6）：ubuntu-24.04 + Clang +
+    Debug，作为 GCC 主构建的**可移植性护栏**，抓 gcc-ism（AVX-512 intrinsic 分支的
+    `__GNUC__` 条件、`\x` 转义贪婪等 clang 更严之处）。
+  - **`-Werror` 库构建 job**（`werror-lib`，S12-7）：GCC 13 + Release + `BUILD_TESTING=OFF`
+    + 只建 `bitcask_static`/`bitcask_shared`，开启 `-Werror` 作 first-party 新告警
+    回归护栏。third_party 头标 SYSTEM 不受影响。
+
+### 变更（Changed）
+- **C API 能力缺口全部补齐（S12-5 [中]）**：
+  - 头里早已声明 `bitcask_search_text_batch` / `bitcask_search_vector_batch` /
+    `bitcask_search_hybrid_batch`（+ `bitcask_iter_next_batch`）但 `.cpp` 未实现——
+    本批一并补齐实现。共用 `fill_batch_results` helper + `bitcask_search_result_batch_free`
+    释放（先逐个 `result_free` 再 `free` 数组）。`search_hybrid` 额外新增
+    `bitcask_hybrid_query_t{text, vector, vector_len}` 结构体。公共模式：
+    queries/single-query 为 NULL → `INVALID_OPTION`；`n==0` → `*out_results=NULL + OK`；
+    首条失败查询回填 fault + 对应 `out_results[i]=NULL`。
+  - 新增 `bitcask_parallel_scan` + `bitcask_scan_fn` 回调 typedef（callback + `ctx`
+    用户状态）。透传 C++ W4 的 `parallel_scan`：单次快照所有 live key → 按 `n_threads`
+    分段并发 `get` 读值 + 回调（**回调可能多工作线程并发调用**）；`n_threads==0` →
+    `hardware_concurrency()`；并发删除致 get not-found → 跳过；IO/CRC 错误 → 停止并
+    返回。`key/value` 是零拷贝 view（仅回调内有效）。
+- **C API 头线程安全注释订正（S12-5 [高]）**：`bitcask_c.h` 旧「put/delete/search 非
+  线程安全，caller 串行化」与 C++ W1/W2 内化线程安全**矛盾**（C API 是 Cask 的透明
+  包装、无 C 层共享可变态，完全继承其契约）。重写为「同一 handle 多线程安全」对齐
+  `cask.hpp:6-24` / `api-c.md §14`，含读/写/读写并发/merge/iter 各条。**纯注释、
+  零行为变更**。
+- **三套版本号单一真源（S12-7）**：`project(libbitcask VERSION 3.0.0)` 为唯一手写处；
+  `configure_file` 从 `PROJECT_VERSION*` 生成 `c_api/bitcask_version.h`，
+  `bitcask_c.cpp` 用宏替换原硬编码 `return 3/0/0`（`__has_include` 优雅回退到
+  `0.0.0-unknown` 占位）。库 `VERSION/SOVERSION` 改 `${PROJECT_VERSION}/${PROJECT_VERSION_MAJOR}`。
+  杜绝 `SOVERSION` / C API / 库 `VERSION` 三处手工同步漂移。
+- **C API 测试链接 `bitcask_sanitizers`**：`bitcask_c_api_test` 补 link（与其它测试
+  目标一致），sanitize 构建下未插桩的 C 主程序链接已插桩 `.so` 不再 SEGV（KV-only 时
+  不触发，search 测试首次暴露）。
+
+### 修复（Fixed）
+- **AVX-512 归并可移植性 bug（S12-6）**：`hnsw.cpp:150` `#if` 只判 `__GNUC__>=10` 漏
+  了 clang（其 `__GNUC__` 恒为 4，即 GCC 4.2.1 兼容伪装）→ 落入 `#else` 用了 clang
+  不认的 `_mm512_extractf64x4_ps`。补 `defined(__clang__)` + 修正死分支 intrinsic。
+- **`kDefaultField` 字节可移植性 bug（S12-6）**：`"\x01default"` 的 `\x` 转义贪婪吞
+  "defa" → 实际是 `0xFA + "ult"`（GCC 静默、clang 报错）。改 `"\xfa" "ult"` 保留
+  完全相同字节（已入 checkpoint，零 on-disk 变化）。
+- **`cask.cpp` 忽略 `save_search_ckpt()` 返回值（`-Wunused-result`）**：显式 `(void)`
+  + best-effort 注释（checkpoint 失败非致命，下次 fold 重建）。
+- **设计文档 4 处状态行订正（S12-4）**：
+  - `docs/design/async-index-pipeline.md`「评审中（未实现）」→「**S6 已落地**」+ 唯一
+    偏差（单 reducer 线程替代 M 线程池 → 库间 apply 未并发，仅 Map 并行）。
+  - `doc/hnsw-design-zh.md`「过滤检索 V3 不做」→「**V5 图内过滤已落地**」。
+  - `doc/hnsw-int8-only-design-zh.md`「盘上直存 int8 仍未做」→「**V7 BVH2 v2 段直存
+    qcodes+scale+sum 已落地**」+ DocValue int8 落盘。
+
+### 构建 / 工具链
+- **`-Werror` 选项**：新增 `option(BITCASK_WERROR OFF)`，开时给 `bitcask_warnings`
+  INTERFACE 加 `-Werror`。**默认关**——避免新编译器新告警破坏下游 / 本地构建；
+  CI `werror-lib` 开启作护栏。
+- **`cppjieba` SYSTEM include**：消除 third_party 头大量告警对 `-Werror` 的干扰。
+- **13 处 first-party cosmetic 告警清零**（`-Wshadow`×7 + `-Wsign-conversion`×4 +
+  `-Wunused-function`×1 + `-Wunused-parameter`×1）：机械修复、零行为风险（rename
+  `max_tf`/`pos`/`k`、删冗余 `using Cand`、删未用 `str_to_bytes`、`[[maybe_unused]]`
+  key、3 处 `static_cast<ptrdiff_t>`）。
+
+### 说明（Notes）
+- 全量 486/486 零回归（C++，Debug GCC）；C API 7/7 通过（plain + ASan(含 leak) +
+  TSan）；TSan 三例零 race（reducer 内 compact 并发护栏）。
+- **默认行为变更**：`max_read_handles = 0` 由「不限」变「按 RLIMIT_NOFILE 自动上限」
+  ——需显式不限者用 `kUnlimitedReadHandles`。
+- **未做（有意）**：
+  - `bitcask_close` 仍返 `void`：C++ `close()` 本就 void + noexcept + best-effort；
+    改签名是破坏性变更却无实益。若要让 C 侧也能「close 后 fail-fast 不 UAF」，
+    需把 close 拆为 `close`(不销毁) + `free`(销毁) ——ownership 模型破坏性变更，
+    留待独立评估。
+  - 后台线程驱动 compaction：违"无后台维护线程"哲学 + 需 flush stall；用 caller
+    驱动 + reducer 内 opt-in 替代。
+  - macOS / ARM64 CI job：需对应 runner，本地无法验证——S12 唯一未决项。
 
 ---
 
