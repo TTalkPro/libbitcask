@@ -144,6 +144,12 @@ TEST_F(MergeConcurrentWriterTest, ConcurrentMergeWithActiveReader) {
   started.count_down();
   started.wait();
 
+  // S13：满载下 merge 可能在读者跑第一轮前完成 → iterations==0 偶发。
+  // 等读者至少完成一轮再启动 merge（保持「读与 merge 并发」的测试意图）。
+  while (iterations.load(std::memory_order_relaxed) == 0) {
+    std::this_thread::yield();
+  }
+
   auto mr = cask.merge({});
   ASSERT_TRUE(mr) << "merge failed: " << mr.error().detail;
 

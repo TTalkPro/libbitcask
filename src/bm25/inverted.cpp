@@ -16,6 +16,8 @@
 #include <cstring>
 #include <iterator>
 #include <memory>
+#include <functional>
+#include <limits>
 #include <queue>
 #include <string>
 #include <string_view>
@@ -1495,6 +1497,205 @@ auto InvertedIndex::bool_search(
     while (!heap.empty()) {
         auto& [score, ord] = heap.top();
         results.push_back({ord, score});
+        heap.pop();
+    }
+    std::reverse(results.begin(), results.end());
+    return results;
+}
+
+// S13-D9：树形布尔求值（契约见 inverted.hpp）。集合式：每叶产出 live ord
+// 升序集，组内交/并/差后按全部正向词打分取 top-k。
+auto InvertedIndex::bool_search_tree(
+    const QueryNode& root,
+    std::size_t k,
+    const LiveChecker& live_checker,
+    const Bm25Params* params_override) const -> std::vector<SearchResult> {
+    const Bm25Params& params = params_override ? *params_override : params_;
+
+    // term 叶 → live ord 升序集（posting ords 本就 ord 升序）。
+    auto term_ords = [&](const std::string& term) {
+        std::vector<std::uint64_t> out;
+        const auto& shard = shard_for(term);
+        PostingMap::const_accessor acc;
+        if (!shard.inverted.find(acc, term)) return out;
+        const PostingList& pl = *acc->second;
+        std::vector<std::uint64_t> ords(pl.items.size());
+        for (std::size_t i = 0; i < pl.items.size(); ++i) {
+            ords[i] = pl.items[i].ord;
+        }
+        std::vector<char> live(ords.size());
+        acc.release();
+        live_checker.fill_is_live(ords, live);
+        out.reserve(ords.size());
+        for (std::size_t i = 0; i < ords.size(); ++i) {
+            if (live[i]) out.push_back(ords[i]);
+        }
+        return out;
+    };
+    // 短语叶 → 匹配 ord 升序集（复用 search_phrase 内核取全部命中）。
+    auto phrase_ords = [&](const std::vector<std::string>& terms) {
+        std::vector<std::uint64_t> out;
+        if (terms.empty()) return out;
+        auto hits = search_phrase(terms,
+                                  std::numeric_limits<std::size_t>::max(),
+                                  live_checker, params_override);
+        out.reserve(hits.size());
+        for (const auto& h : hits) out.push_back(h.ord);
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    auto intersect = [](std::vector<std::uint64_t>& a,
+                        const std::vector<std::uint64_t>& b) {
+        std::vector<std::uint64_t> out;
+        std::set_intersection(a.begin(), a.end(), b.begin(), b.end(),
+                              std::back_inserter(out));
+        a = std::move(out);
+    };
+    auto unite = [](std::vector<std::uint64_t>& a,
+                    const std::vector<std::uint64_t>& b) {
+        std::vector<std::uint64_t> out;
+        std::set_union(a.begin(), a.end(), b.begin(), b.end(),
+                       std::back_inserter(out));
+        a = std::move(out);
+    };
+    auto subtract = [](std::vector<std::uint64_t>& a,
+                       const std::vector<std::uint64_t>& b) {
+        std::vector<std::uint64_t> out;
+        std::set_difference(a.begin(), a.end(), b.begin(), b.end(),
+                            std::back_inserter(out));
+        a = std::move(out);
+    };
+
+    // 递归求值。返回该节点的匹配 ord 集（升序）。
+    std::function<std::vector<std::uint64_t>(const QueryNode&)> eval =
+        [&](const QueryNode& node) -> std::vector<std::uint64_t> {
+        if (node.is_phrase) return phrase_ords(node.phrase_terms);
+        if (!node.term.empty()) return term_ords(node.term);
+        // 组：MUST 交集为基集（无 MUST 则 SHOULD 并集）；MUST_NOT 差集。
+        std::vector<std::uint64_t> base;
+        bool has_must = false, base_init = false;
+        for (const auto& c : node.children) {
+            if (c.op != QueryOp::MUST) continue;
+            has_must = true;
+            auto cs = eval(c);
+            if (!base_init) { base = std::move(cs); base_init = true; }
+            else intersect(base, cs);
+            if (base.empty()) break;
+        }
+        if (!has_must) {
+            for (const auto& c : node.children) {
+                if (c.op != QueryOp::SHOULD) continue;
+                auto cs = eval(c);
+                if (!base_init) { base = std::move(cs); base_init = true; }
+                else unite(base, cs);
+            }
+        }
+        if (!base.empty()) {
+            for (const auto& c : node.children) {
+                if (c.op != QueryOp::MUST_NOT) continue;
+                subtract(base, eval(c));
+                if (base.empty()) break;
+            }
+        }
+        return base;
+    };
+
+    auto candidates = eval(root);
+    if (candidates.empty()) return {};
+
+    // 打分词集：全部正向 term 叶（带 boost）+ 正向短语成分词（boost 1）。
+    struct ScoringTerm { std::string term; float boost; };
+    std::vector<ScoringTerm> sterms;
+    std::function<void(const QueryNode&)> collect_pos =
+        [&](const QueryNode& node) {
+        if (node.op == QueryOp::MUST_NOT) return;
+        if (node.is_phrase) {
+            for (const auto& t : node.phrase_terms) sterms.push_back({t, 1.0F});
+            return;
+        }
+        if (!node.term.empty()) { sterms.push_back({node.term, node.boost}); return; }
+        for (const auto& c : node.children) collect_pos(c);
+    };
+    collect_pos(root);
+    // 同词去重（保留最大 boost，避免重复计分）。
+    std::sort(sterms.begin(), sterms.end(),
+              [](const auto& a, const auto& b) {
+                  return a.term < b.term ||
+                         (a.term == b.term && a.boost > b.boost);
+              });
+    sterms.erase(std::unique(sterms.begin(), sterms.end(),
+                             [](const auto& a, const auto& b) {
+                                 return a.term == b.term;
+                             }),
+                 sterms.end());
+
+    const auto N = live_doc_count_.load(std::memory_order_relaxed);
+    const auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
+    const double avgdl =
+        N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
+
+    // 候选平行分数数组 + 每词双指针归并（同扁平 bool_search 的评分形态）。
+    std::vector<float> scores(candidates.size(), 0.0F);
+    std::vector<std::uint64_t> ords_buf;
+    std::vector<std::uint32_t> tfs_buf;
+    std::vector<char> live_buf;
+    std::vector<std::uint32_t> dls_buf;
+    for (const auto& st : sterms) {
+        const auto& shard = shard_for(st.term);
+        PostingMap::const_accessor acc;
+        if (!shard.inverted.find(acc, st.term)) continue;
+        const PostingList& pl = *acc->second;
+        ords_buf.resize(pl.items.size());
+        tfs_buf.resize(pl.items.size());
+        for (std::size_t i = 0; i < pl.items.size(); ++i) {
+            ords_buf[i] = pl.items[i].ord;
+            tfs_buf[i]  = pl.items[i].tf;
+        }
+        acc.release();
+        live_buf.resize(ords_buf.size());
+        live_checker.fill_is_live(ords_buf, live_buf);
+        dls_buf.resize(ords_buf.size());
+        live_checker.fill_doc_lens(ords_buf, dls_buf);
+
+        std::size_t live_df = 0;
+        for (char c : live_buf) live_df += static_cast<std::size_t>(c);
+        if (live_df == 0) continue;
+        const float idf = static_cast<float>(std::log(
+            1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) /
+                      (static_cast<double>(live_df) + 0.5)));
+
+        std::size_t ci = 0;
+        for (std::size_t i = 0;
+             i < ords_buf.size() && ci < candidates.size(); ++i) {
+            const auto po = ords_buf[i];
+            while (ci < candidates.size() && candidates[ci] < po) ++ci;
+            if (ci == candidates.size()) break;
+            if (candidates[ci] != po || !live_buf[i]) continue;
+            const auto dl = dls_buf[i];
+            const float tf_norm =
+                static_cast<float>(tfs_buf[i]) * (params.k1 + 1.0F) /
+                (static_cast<float>(tfs_buf[i]) +
+                 params.k1 * (1.0F - params.b +
+                              params.b * static_cast<float>(dl) /
+                                  static_cast<float>(avgdl)));
+            scores[ci] += st.boost * idf * (tf_norm + params.delta);
+        }
+    }
+
+    using Entry = std::pair<float, std::uint64_t>;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+        if (heap.size() < k) {
+            heap.push({scores[i], candidates[i]});
+        } else if (scores[i] > heap.top().first) {
+            heap.pop();
+            heap.push({scores[i], candidates[i]});
+        }
+    }
+    std::vector<SearchResult> results;
+    results.reserve(heap.size());
+    while (!heap.empty()) {
+        results.push_back({heap.top().second, heap.top().first});
         heap.pop();
     }
     std::reverse(results.begin(), results.end());

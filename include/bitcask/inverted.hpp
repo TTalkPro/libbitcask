@@ -316,6 +316,19 @@ public:
         const LiveChecker& live_checker,
         const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
 
+    // S13-D9：树形布尔求值（括号嵌套 + 引号短语）。语义：
+    //   组内 MUST 子项交集为基集（无 MUST 则 SHOULD 并集），MUST_NOT 差集；
+    //   SHOULD 在有 MUST 时只参与打分不扩候选（与扁平 bool_search 一致）。
+    //   短语叶子按 phrase_terms 的 positions 匹配（需 index_positions）。
+    // 评分：候选按全部正向词（term 叶 + 正向短语成分词）的 BM25 贡献求和
+    //   （term 叶乘 boost），top-k。集合式求值 O(Σ posting)——无新语法的
+    //   查询由 SearchLayer 路由到扁平 bool_search，性能不受影响。
+    [[nodiscard]] auto bool_search_tree(
+        const QueryNode& root,
+        std::size_t k,
+        const LiveChecker& live_checker,
+        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+
     [[nodiscard]] auto search_fuzzy(
         const std::vector<std::string>& query_terms,
         std::size_t k,

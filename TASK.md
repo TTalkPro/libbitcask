@@ -1607,7 +1607,16 @@ W4 ✅（parallel_scan 并行全表扫描）。
     访问器）。**有意不含** total_postings：统计需遍历 concurrent_hash_map，与 reducer
     插入并发不安全（S13-F6 同类）——待 InvertedIndex 原子计数器后再暴露（已注明）。
   - C API：additive `bitcask_status_ex_t` + `bitcask_status_ex()`（旧 struct 布局不动）。
-- [ ] **S13-D9【P2·M】查询语言括号嵌套+引号短语子句**：QueryNode 已树形，parser 升级递归下降。
+- [x] **S13-D9【P2·M】查询语言括号嵌套+引号短语子句** — 已完成（2026-07-02）
+  - 语法：`+(rust go) +web`、`+"rust systems"`、`-"exact phrase"`，任意嵌套；
+    容错（未闭合引号取到尾、多余括号忽略）。
+  - 实现：`parse_query_tree`（递归下降，query_parser.cpp）+ QueryNode 加
+    `is_phrase/phrase_terms`；执行侧新增 `InvertedIndex::bool_search_tree`
+    （集合式：组内 MUST 交/SHOULD 并/MUST_NOT 差，短语叶复用 search_phrase
+    内核；候选按全部正向词 BM25 求和 top-k，term 叶乘 boost）。
+  - **零风险路由**：仅查询含 '(' 或 '"' 走树路径——既有扁平查询走原路径，
+    行为位级不变。缓存词集含短语成分词（collect_terms 扩展），按词失效正确。
+  - 测试：`BoolSearchTreeSyntax`（组合/嵌套/短语排除/容错/扁平回归 6 例）。
 - [x] **S13-D11【P2·S】HNSW M/ef_construction 透传** — 已完成（2026-07-02）：
   `SearchLayerConfig::hnsw_m/hnsw_ef_construction`（0=默认），构造与 merge 期
   rebuild（复用 old->config()）均生效；C options 同步追加；不入 meta 校验

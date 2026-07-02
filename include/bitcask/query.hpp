@@ -36,6 +36,10 @@ struct QueryNode {
     std::string           field;                    // 字段限定（S8.6，空=默认字段）
     float                 boost = 1.0F;             // 字段/词权重（S8.6）
     std::vector<QueryNode> children;               // 非叶子子节点
+    // S13-D9：短语叶子。term 存引号内原文；phrase_terms 由 SearchLayer 用
+    // analyzer 填充（有序词列表），执行侧按 positions 匹配。
+    bool                     is_phrase = false;
+    std::vector<std::string> phrase_terms;
 
     // 工厂方法：创建叶子节点
     static QueryNode must_term(std::string t);
@@ -56,6 +60,17 @@ struct QueryNode {
 //   - 所有 token 均为 SHOULD 时，返回单一 SHOULD 节点（向后兼容）
 // 空字符串返回空 children 的 SHOULD 节点。
 [[nodiscard]] auto parse_query(std::string_view input) -> QueryNode;
+
+// S13-D9：递归下降解析（括号嵌套 + 引号短语）。语法：
+//   expr    := clause+
+//   clause  := [+|-] primary          （+ = MUST，- = MUST_NOT，裸 = SHOULD）
+//   primary := '(' expr ')' | '"' 任意字符 '"' | token（含 field:term^boost）
+// 组语义：组内 MUST 交集为基集（无 MUST 则 SHOULD 并集），MUST_NOT 差集；
+// 组自身的 +/- 前缀决定它在父组中的角色。容错：未闭合引号取到行尾；
+// 多余 ')' 忽略；未闭合 '(' 组取到行尾。
+// 仅当查询含 '(' 或 '"' 时才需要本入口——SearchLayer 按此路由，
+// 无新语法的查询仍走 parse_query（扁平路径，行为位级不变）。
+[[nodiscard]] auto parse_query_tree(std::string_view input) -> QueryNode;
 
 // 将 QueryNode AST 展平为三个 term 集合。
 // 用于 bool_search 算法：

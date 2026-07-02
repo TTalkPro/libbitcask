@@ -82,6 +82,10 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
   all-or-nothing 可见）。批内 syscall 从 N 次摊到少数几次；merge race 条目自动
   走单条重写路径。C API 新增 `bitcask_kv_pair_t` + `bitcask_put_batch`。
   不提供跨崩溃原子性（契约注明，与连续单条 put 的崩溃语义一致）。
+- **布尔查询语言：括号嵌套 + 引号短语（S13-D9）**：`bool_search` 现支持
+  `+(rust go) +web`、`+"exact phrase"`、`-"..."` 及任意嵌套（递归下降 parser +
+  集合式树求值，短语按 positions 匹配）。仅含新语法的查询走树路径——既有
+  扁平查询行为位级不变。
 - **搜索分页 offset（S13-D10）**：`search_text/search_phrase/bool_search` 新增
   尾置 `offset` 参数（overfetch 后截断；total 估计有意不做——剪枝下仅有下界，
   见 TASK.md）。

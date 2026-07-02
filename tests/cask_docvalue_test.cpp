@@ -361,6 +361,69 @@ TEST_F(CaskDocValueTest, LogHookFiresOnSnapshotFailure) {
     EXPECT_TRUE(has_snap_warn) << "应包含 keydir snapshot 失败的 warn";
 }
 
+// S13-D9：布尔查询语言——括号嵌套 + 引号短语（树路径），扁平语法行为不变。
+TEST_F(CaskDocValueTest, BoolSearchTreeSyntax) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = sl_cfg;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    auto bytes = [](std::string_view s2) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+    };
+    auto put = [&](std::string_view key, std::string_view text) {
+        bitcask::DocInput doc;
+        doc.text = bytes(text);
+        ASSERT_TRUE((*c)->put_doc(bytes(key), doc, 1000));
+    };
+    put("d1", "rust systems programming");
+    put("d2", "rust web framework");
+    put("d3", "go web service");
+    put("d4", "python data science");
+
+    auto keys_of = [](const bitcask::TextSearchResult& r) {
+        std::vector<std::string> ks;
+        for (const auto& h : r.hits) ks.push_back(h.key);
+        std::sort(ks.begin(), ks.end());
+        return ks;
+    };
+
+    // 括号组：(rust OR go) AND web → d2, d3。扁平语法无法表达。
+    auto r1 = (*c)->bool_search("+(rust go) +web", 10);
+    ASSERT_TRUE(r1);
+    EXPECT_EQ(keys_of(*r1), (std::vector<std::string>{"d2", "d3"}));
+
+    // 引号短语子句：必须包含 "rust systems" → 仅 d1。
+    auto r2 = (*c)->bool_search("+\"rust systems\"", 10);
+    ASSERT_TRUE(r2);
+    EXPECT_EQ(keys_of(*r2), (std::vector<std::string>{"d1"}));
+
+    // 短语排除 + 词：rust 文档中排除短语命中 → d2。
+    auto r3 = (*c)->bool_search("+rust -\"rust systems\"", 10);
+    ASSERT_TRUE(r3);
+    EXPECT_EQ(keys_of(*r3), (std::vector<std::string>{"d2"}));
+
+    // 嵌套组 + 组级排除：(web AND (rust OR go)) 排除 go → d2。
+    auto r4 = (*c)->bool_search("+(+web +(rust go)) -go", 10);
+    ASSERT_TRUE(r4);
+    EXPECT_EQ(keys_of(*r4), (std::vector<std::string>{"d2"}));
+
+    // 容错：未闭合引号取到尾。
+    auto r5 = (*c)->bool_search("+\"rust systems", 10);
+    ASSERT_TRUE(r5);
+    EXPECT_EQ(keys_of(*r5), (std::vector<std::string>{"d1"}));
+
+    // 回归：无新语法查询走扁平路径，语义不变（+rust +web → d2）。
+    auto r6 = (*c)->bool_search("+rust +web", 10);
+    ASSERT_TRUE(r6);
+    EXPECT_EQ(keys_of(*r6), (std::vector<std::string>{"d2"}));
+    (*c)->close();
+}
+
 // S13-D10：分页 offset——overfetch 后截断；offset 页与全量列表的对应切片一致。
 TEST_F(CaskDocValueTest, SearchTextPaginationOffset) {
     CaskOptions opts;

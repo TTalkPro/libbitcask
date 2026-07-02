@@ -161,12 +161,105 @@ auto parse_query(std::string_view input) -> QueryNode {
     return QueryNode::should_any(std::move(leaves));
 }
 
+// S13-D9：递归下降解析器（契约见 query.hpp）。
+namespace {
+
+struct TreeParser {
+    std::string_view in;
+    std::size_t pos = 0;
+
+    void skip_ws() {
+        while (pos < in.size() &&
+               std::isspace(static_cast<unsigned char>(in[pos]))) {
+            ++pos;
+        }
+    }
+
+    // 解析一串 clause 直到 ')' 或输入尾。返回组节点（op 由 caller 设置）。
+    QueryNode parse_group() {
+        QueryNode group;
+        group.op = QueryOp::SHOULD;
+        while (true) {
+            skip_ws();
+            if (pos >= in.size()) break;
+            if (in[pos] == ')') { ++pos; break; }  // 组结束（多余 ')' 由外层忽略）
+            QueryOp op = QueryOp::SHOULD;
+            if (in[pos] == '+' && pos + 1 < in.size()) { op = QueryOp::MUST; ++pos; }
+            else if (in[pos] == '-' && pos + 1 < in.size() &&
+                     in[pos + 1] != ' ') { op = QueryOp::MUST_NOT; ++pos; }
+            skip_ws();
+            if (pos >= in.size()) break;
+
+            if (in[pos] == '(') {
+                ++pos;
+                QueryNode child = parse_group();
+                child.op = op;
+                if (!child.children.empty() || !child.term.empty()) {
+                    group.children.push_back(std::move(child));
+                }
+            } else if (in[pos] == '"') {
+                ++pos;
+                const auto close = in.find('"', pos);
+                const auto end = (close == std::string_view::npos)
+                                     ? in.size() : close;  // 容错：未闭合取到尾
+                QueryNode leaf;
+                leaf.op = op;
+                leaf.is_phrase = true;
+                leaf.term = std::string(in.substr(pos, end - pos));
+                pos = (close == std::string_view::npos) ? in.size() : close + 1;
+                if (!leaf.term.empty()) group.children.push_back(std::move(leaf));
+            } else {
+                // 普通 token：读到空白 / ')' / '"'。
+                const std::size_t start = pos;
+                while (pos < in.size() && in[pos] != ')' && in[pos] != '"' &&
+                       !std::isspace(static_cast<unsigned char>(in[pos]))) {
+                    ++pos;
+                }
+                auto tok = in.substr(start, pos - start);
+                if (!tok.empty()) {
+                    auto pt = parse_field_boost(tok);
+                    QueryNode leaf;
+                    leaf.op = op;
+                    leaf.term = std::move(pt.term);
+                    leaf.field = std::move(pt.field);
+                    leaf.boost = pt.boost;
+                    if (!leaf.term.empty()) group.children.push_back(std::move(leaf));
+                }
+            }
+        }
+        return group;
+    }
+};
+
+}  // namespace
+
+auto parse_query_tree(std::string_view input) -> QueryNode {
+    TreeParser tp{input};
+    QueryNode root = tp.parse_group();
+    // 顶层多余 ')' 之后可能还有 clause——继续吞并入 root（容错语义）。
+    while (tp.pos < tp.in.size()) {
+        QueryNode more = tp.parse_group();
+        for (auto& c : more.children) root.children.push_back(std::move(c));
+    }
+    if (root.children.empty()) return QueryNode::should_term({});
+    return root;
+}
+
 void collect_terms(
     const QueryNode& node,
     std::vector<std::string>& must_terms,
     std::vector<std::string>& should_terms,
     std::vector<std::string>& must_not_terms) {
 
+    // S13-D9：短语叶子——成分词整体入所属桶（供缓存词集/失效判定）。
+    if (node.is_phrase) {
+        auto& dst = node.op == QueryOp::MUST ? must_terms
+                    : node.op == QueryOp::MUST_NOT ? must_not_terms
+                                                   : should_terms;
+        dst.insert(dst.end(), node.phrase_terms.begin(),
+                   node.phrase_terms.end());
+        return;
+    }
     if (!node.term.empty()) {
         switch (node.op) {
             case QueryOp::MUST:

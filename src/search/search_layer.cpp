@@ -758,13 +758,37 @@ SearchLayer::bool_search(std::string_view query, std::size_t k,
     if (cached) {
         results = std::move(*cached);
     } else {
-        auto query_node = bitcask::bm25::parse_query(query);
+        // S13-D9：含 '(' 或 '"' 的查询走树路径（递归下降 + 集合求值）；
+        // 其余仍走扁平路径——既有查询行为位级不变。
+        const bool tree_syntax =
+            query.find('(') != std::string_view::npos ||
+            query.find('"') != std::string_view::npos;
+        auto query_node = tree_syntax ? bitcask::bm25::parse_query_tree(query)
+                                      : bitcask::bm25::parse_query(query);
         if (query_node.term.empty() && query_node.children.empty()) {
             return std::vector<SearchHit>{};
         }
+        if (tree_syntax) {
+            // 短语叶子：analyzer 切词填 phrase_terms（有序）。
+            std::function<void(bm25::QueryNode&)> fill =
+                [&](bm25::QueryNode& node) {
+                if (node.is_phrase) {
+                    node.phrase_terms = ordered_query_terms(node.term);
+                    return;
+                }
+                for (auto& c : node.children) fill(c);
+            };
+            fill(query_node);
+        }
 
         const auto* inv = field_index(kDefaultField);
-        if (inv) results = inv->bool_search(query_node, k, index_, params_override);
+        if (inv) {
+            results = tree_syntax
+                          ? inv->bool_search_tree(query_node, k, index_,
+                                                  params_override)
+                          : inv->bool_search(query_node, k, index_,
+                                             params_override);
+        }
         if (!params_override && !results.empty()) {
             // 收集 MUST/SHOULD/MUST_NOT 全部叶子词，作为该缓存条目的词集。
             std::vector<std::string> must, should, must_not;
