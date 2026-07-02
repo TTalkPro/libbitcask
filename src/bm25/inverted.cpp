@@ -515,6 +515,7 @@ auto InvertedIndex::search_wand(
         // live 仍需全量：IDF 用 live_df（分数位级不变约定，不能换 raw df）。
         std::vector<std::uint32_t> dls;
         std::vector<char> dls_filled;    // 每 kBlockSize 粒度一位
+        bool dls_all = false;            // S13-P4：小列表全量填充标记
         std::size_t cursor = 0;
         float idf = 0.0f;
         float list_upper_bound = 0.0f;
@@ -548,9 +549,19 @@ auto InvertedIndex::search_wand(
     for (auto& tp : tps) {
         tp.live.resize(tp.fp.size());
         live_checker.fill_is_live(tp.fp.ords, tp.live);
-        // S13-P4：dls 只分配不填充，评分点按块惰性取（见 ensure_dls）。
+        // S13-P4：dls 惰性按块填充（见 ensure_dls）。中小列表（≤32 块 =
+        // 4K posting）直接全量填充——批量 gather 本就便宜，惰性簿记
+        // （per-pivot 分支 + 位图）反而更贵（实测 4K 档 +13%~28%）；
+        // 大列表才吃 WAND 块跳跃的省填充收益。
         tp.dls.resize(tp.fp.size());
-        tp.dls_filled.assign((tp.fp.size() + kB - 1) / kB, 0);
+        // 单词查询恒全量：无其它词可比 → WAND 不可能跳块，惰性纯开销。
+        if (query_terms.size() == 1 || tp.fp.size() <= 32 * kB) {
+            live_checker.fill_doc_lens(tp.fp.ords, tp.dls);
+            tp.dls_filled.assign(1, 1);  // 单标记=全满（ensure_dls 兼容见下）
+            tp.dls_all = true;
+        } else {
+            tp.dls_filled.assign((tp.fp.size() + kB - 1) / kB, 0);
+        }
         std::size_t live_df = 0;
         for (std::size_t i = 0; i < tp.live.size(); ++i) {
             live_df += static_cast<std::size_t>(tp.live[i]);
@@ -574,6 +585,7 @@ auto InvertedIndex::search_wand(
     // S13-P4：dls 惰性按块填充（每块一次批量 gather；被 WAND 块跳跃略过的
     // 区段永不付 doc_len 查询成本）。dl 值 ord 定后不可变，填充时机无关正确性。
     auto ensure_dls = [&](TermPostings& tp, std::size_t idx) {
+        if (tp.dls_all) return;  // 小列表已全量填充
         const std::size_t b = idx / kB;
         if (tp.dls_filled[b]) return;
         const std::size_t start = b * kB;

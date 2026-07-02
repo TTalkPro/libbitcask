@@ -56,9 +56,18 @@ run_merge(std::span<const std::string> input_data_paths,
         std::filesystem::remove(stats.output_hint_path, ec);
     };
 
+    // S13-P8：pending 分批 apply——不再全量驻留（原大库 merge 内存峰值
+    // O(活 key 总字节)）。批边界：每个输入文件 fold 完成后，或批内累计达
+    // kApplyBatch 条（兜住巨型单文件）。每批 apply 前 flush+fsync 输出
+    //（fsync-before-apply 契约逐批成立）。
+    // 失败语义（替代旧「keydir 完全未动」）：已 apply 的批指向**已 fsync 的
+    // 输出**（合法可读，输出文件保留不删）；未 apply 的 key 完全不动——
+    // 无任何中间不可读状态。崩溃重启：输出 file_id > 全部输入 ⟹ fold 重建
+    // 时输出记录按序胜出，一致。
+    constexpr std::size_t kApplyBatch = 1u << 18;  // 256K 条/批
     std::vector<PendingUpdate> pending_;
-    // B6:估算 live record 数预 reserve，避免几何增长 realloc。
-    // 每 record 至少 ~48B（header 18 + key 8 + value_min + hint），用 64B 粗估。
+    bool any_applied = false;
+    // B6:预 reserve 避免几何增长 realloc；分批后按批上限封顶。
     {
         std::uint64_t est_records = 0;
         for (const auto& path : input_data_paths) {
@@ -67,9 +76,15 @@ run_merge(std::span<const std::string> input_data_paths,
             if (!ec) est_records += sz / 64;
         }
         if (est_records > 0) {
-            pending_.reserve(static_cast<std::size_t>(est_records));
+            pending_.reserve(static_cast<std::size_t>(
+                std::min<std::uint64_t>(est_records, kApplyBatch)));
         }
     }
+    // 失败清理（分批版）：任何批 apply 过之后，输出已被 keydir 引用——
+    // 绝不能删（删 = S13-F1 同型数据丢失）；只在零 apply 时清残件。
+    auto fail_cleanup = [&]() {
+        if (!any_applied) cleanup_partial_outputs();
+    };
 
     auto out_data = fileops::DataFile::open(stats.output_data_path,
                                              fileops::DataFile::Mode::kCreate,
@@ -90,6 +105,48 @@ run_merge(std::span<const std::string> input_data_paths,
                                          stats.output_hint_path));
     }
 
+    // 一批 apply：flush 输出尾批 → fsync data（fsync-before-apply）→ CAS
+    // 切 keydir + on_relocate → 清批。CAS 语义与失败处理见下方原注释
+    //（S13-F1：newest_put=false + stuck 复查）。
+    auto apply_pending = [&]() -> std::expected<void, MergeFault> {
+        if (pending_.empty()) return {};
+        if (auto f = out_data->flush_batch(); !f) {
+            return std::unexpected(io_fault(MergeError::kOutputWriteFailed,
+                                            f.error().errnum,
+                                            stats.output_data_path));
+        }
+        if (auto sy = out_data->sync(); !sy) {
+            return std::unexpected(io_fault(MergeError::kFinalizeFailed,
+                                            sy.error().errnum,
+                                            stats.output_data_path));
+        }
+        for (const auto& u : pending_) {
+            auto pr = keydir.put(u.key, stats.output_file_id, u.new_total_size,
+                                 u.new_offset, u.tstamp, /*now_sec*/ 0,
+                                 /*newest_put*/ false,
+                                 /*old_file_id*/ u.old_file_id,
+                                 /*old_offset*/ u.old_offset,
+                                 /*ord*/ u.ord);
+            if (pr == keydir::PutResult::kOk) {
+                if (search_layer) {
+                    search_layer->on_relocate(u.key, u.ord,
+                                              stats.output_file_id,
+                                              u.new_offset, u.new_total_size);
+                }
+                continue;
+            }
+            auto cur = keydir.get(u.key);
+            if (cur && cur->file_id == u.old_file_id &&
+                cur->offset == u.old_offset) {
+                stats.relocations_stuck += 1;
+                stats.stuck_file_ids.push_back(u.old_file_id);
+            }
+        }
+        pending_.clear();
+        any_applied = true;
+        return {};
+    };
+
     // 按顺序遍历每个输入文件。对每条 record 都问 keydir：「这个 key 当前
     // 最新的 entry 是不是还指向 (in_file_id, offset)？」是的话就是活的，
     // 复制到输出；否则跳过（已经被新 put 或 delete 覆盖了）。
@@ -105,7 +162,7 @@ run_merge(std::span<const std::string> input_data_paths,
                                                 /*sync*/ false,
                                                 /*mmap_enabled*/ false);
         if (!in_data) {
-            cleanup_partial_outputs();
+            fail_cleanup();  // S13-P8：前序文件批可能已 apply → 输出不可删
             return std::unexpected(io_fault(MergeError::kInputOpenFailed,
                                              in_data.error().errnum, path));
         }
@@ -166,7 +223,7 @@ run_merge(std::span<const std::string> input_data_paths,
                     error = std::unexpected(io_fault(
                         MergeError::kOutputWriteFailed, 0,
                         stats.output_data_path));
-                    cleanup_partial_outputs();
+                    fail_cleanup();  // S13-P8
                     return;
                 }
                 auto h = out_hint->write(view.tstamp, w->total_size,
@@ -175,7 +232,7 @@ run_merge(std::span<const std::string> input_data_paths,
                     error = std::unexpected(io_fault(
                         MergeError::kOutputWriteFailed, 0,
                         stats.output_hint_path));
-                    cleanup_partial_outputs();
+                    fail_cleanup();  // S13-P8
                     return;
                 }
 
@@ -189,31 +246,44 @@ run_merge(std::span<const std::string> input_data_paths,
                 stats.records_kept += 1;
                 stats.bytes_written += total_size;
                 (void)total_size;  // 已在 w->total_size 里记过
+
+                // S13-P8：巨型单文件兜底——批内达阈值即 apply（fsync 已含）。
+                if (pending_.size() >= kApplyBatch) {
+                    if (auto ap = apply_pending(); !ap) {
+                        error = std::unexpected(ap.error());
+                    }
+                }
             },
             /*tolerate_crc_errors*/ true);
         if (!error) {
-            cleanup_partial_outputs();
+            fail_cleanup();
             return std::unexpected(error.error());
         }
         if (!fold_res) {
-            cleanup_partial_outputs();
+            fail_cleanup();
             return std::unexpected(io_fault(MergeError::kInputReadFailed,
                                              fold_res.error().errnum,
                                              path));
+        }
+        // S13-P8：每输入文件一批（典型批边界；内存峰值 ≈ 单文件活记录）。
+        if (auto ap = apply_pending(); !ap) {
+            fail_cleanup();
+            return std::unexpected(ap.error());
         }
     }
 
     // S2:把 data 的 batch_buf_ 残尾一次 pwrite 落盘（后续 sync() 也会兜底，
     // 这里显式 flush 让错误能走 cleanup 路径而非掩盖在 sync 里）。
+    // S13-P8：分批后此处通常已空（每批 apply 前已 flush+sync），保留兜底。
     if (auto f = out_data->flush_batch(); !f) {
-        cleanup_partial_outputs();
+        fail_cleanup();
         return std::unexpected(io_fault(MergeError::kOutputWriteFailed,
                                          f.error().errnum,
                                          stats.output_data_path));
     }
 
     if (auto f = out_hint->finalize(); !f) {
-        cleanup_partial_outputs();
+        fail_cleanup();
         return std::unexpected(io_fault(MergeError::kFinalizeFailed,
                                          f.error().errnum,
                                          stats.output_hint_path));
@@ -224,55 +294,30 @@ run_merge(std::span<const std::string> input_data_paths,
     // 少一次 fsync 把 page cache 刷到磁盘——否则断电窗口内新文件未落盘而
     // 原始文件已被 caller 删除 → 数据永久丢失。data 是权威优先 fsync。
     if (auto s = out_data->sync(); !s) {
-        cleanup_partial_outputs();
+        fail_cleanup();
         return std::unexpected(io_fault(MergeError::kFinalizeFailed,
                                          s.error().errnum,
                                          stats.output_data_path));
     }
     if (auto s = out_hint->sync(); !s) {
-        cleanup_partial_outputs();
+        fail_cleanup();
         return std::unexpected(io_fault(MergeError::kFinalizeFailed,
                                          s.error().errnum,
                                          stats.output_hint_path));
     }
 
-    // 批量 apply：fsync 已完成，新文件持久化。现在原子切换 keydir + search
-    // 指向新文件。CAS 失败 = 并发 put 已改这个 key（合法）→ 跳过，X 中的
-    // record 成 dead，下次 merge 清。on_relocate 必须与 keydir.put 配对成功
-    // 才调，避免 search 已切但 keydir 未切的不一致窗口。
-    //
-    // S13-F1：这里必须是 newest_put=false（条件 CAS 语义，keydir.hpp 的契约
-    // 本就为 merge 设计）。曾误传 true——true 的 accept 条件是
-    // file_id >= biggest_file_id_，merge 期间任何并发 put 触发 roll 后该条件
-    // 恒假 → 全部冷 key 重定位被拒 + caller 无条件 unlink 输入 → 数据丢失。
-    // false 时：CAS 门要求精确匹配 (old_file_id, old_offset)，accept 走
-    // cur.file_id < file_id（输入 id 恒小于输出 id）——语义正确且不受并发
-    // roll 影响。
-    for (const auto& u : pending_) {
-        auto pr = keydir.put(u.key, stats.output_file_id, u.new_total_size,
-                             u.new_offset, u.tstamp, /*now_sec*/ 0,
-                             /*newest_put*/ false,
-                             /*old_file_id*/ u.old_file_id,
-                             /*old_offset*/ u.old_offset,
-                             /*ord*/ u.ord);
-        if (pr == keydir::PutResult::kOk) {
-            if (search_layer) {
-                search_layer->on_relocate(u.key, u.ord, stats.output_file_id,
-                                           u.new_offset, u.new_total_size);
-            }
-            continue;
-        }
-        // CAS 被拒。合法原因只有一种：并发 put/remove 已把 key 从
-        // (old_file_id, old_offset) 挪走/删除——输入里这条 record 已 dead，
-        // unlink 输入依然安全。纵深防御：复查 keydir，若仍指向旧位置，说明
-        // 重定位被内部逻辑卡住（当前实现不可达；防未来回归）——标记该输入
-        // 文件 stuck，caller 必须跳过它的 unlink，留给下轮 merge 重试。
-        auto cur = keydir.get(u.key);
-        if (cur && cur->file_id == u.old_file_id &&
-            cur->offset == u.old_offset) {
-            stats.relocations_stuck += 1;
-            stats.stuck_file_ids.push_back(u.old_file_id);
-        }
+    // 收尾 apply：分批后 pending 通常已空（各文件批已在 fold 循环内 apply）。
+    // 语义注释（S13-F1，适用于 apply_pending 内的 CAS 循环）：
+    //   - newest_put=false 条件 CAS：CAS 门要求精确匹配 (old_file_id,
+    //     old_offset)，accept 走 cur.file_id < file_id（输入 id 恒小于输出
+    //     id）——不受并发 roll 影响。CAS 被拒 = 并发 put/remove 已改该 key
+    //     （合法，输入中该 record 已 dead）；复查仍指旧位置 = stuck（当前
+    //     实现不可达，防回归），caller 跳过该输入的 unlink。
+    //   - on_relocate 与 keydir.put 配对成功才调，避免 search 已切但
+    //     keydir 未切的不一致窗口。
+    if (auto ap = apply_pending(); !ap) {
+        fail_cleanup();
+        return std::unexpected(ap.error());
     }
     if (!stats.stuck_file_ids.empty()) {
         std::sort(stats.stuck_file_ids.begin(), stats.stuck_file_ids.end());

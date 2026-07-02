@@ -1565,8 +1565,21 @@ W4 ✅（parallel_scan 并行全表扫描）。
     的整体同义词扩展块；每 (词×同义词) 独立 top-k 改按 boost 分组一次多词
     search（内核调用 O(组)，组级 top-k 截断）。**行为改进**：跨词组合分高、
     单词排名 >k 被截丢的文档现在能进结果（synonym 11/11 回归通过）。
-  - [ ] 剩余 2 项待做：merge `pending_` 分批 apply、`rebuild_hnsw` 并行/
-    结构化拷贝（涉单写者约束，需 TSan 护栏设计，建议单独一批）。
+  - [x] merge `pending_` 分批 apply（2026-07-02）：每输入文件一批 + 批内
+    256K 条阈值兜底巨型单文件，每批 flush+fsync 后才 apply（fsync-before-
+    apply 契约逐批成立）。内存峰值从 O(全部活 key 字节) 降到 O(单文件/单批)。
+    **失败语义修订**（替代 C1「keydir 完全未动」）：已 apply 批指向已 fsync
+    的输出（合法可读，任何批 apply 过后输出保留不删——删即 S13-F1 同型丢失）；
+    未 apply 的 key 完全不动，无中间不可读态；崩溃重启输出 file_id 最大按序胜出。
+  - [x] `rebuild_hnsw` 结构化拷贝（2026-07-02）：新增 `HnswIndex::clone_live`
+    ——保留原图层数/邻接，仅 id 重映射 + 死邻过滤，O(节点+边) memcpy 级、
+    **零距离计算**（原从零重插每点 ~efC 次全维距离，100k 节点分钟级阻塞
+    merge）。召回补偿：某层邻居全死时一跳路径收缩借道补边（去重限 cap）；
+    极端删除下个别节点可能孤立，下轮 merge 自愈（已注明）。int8-only 直拷
+    量化副本——顺带消掉旧路径的反量化→再量化往返（audit 同批项）。
+    验证：V4 rebuild 端到端（删半→merge→图大小/ckpt 往返/搜索排除已删）
+    11/11 + checkpoint recovery 5/5。
+  - **S13-P8 至此 14/14 全部闭环。**
 
 ### D. 功能缺口（对照已规划 C4/C5/C6 与已否决项排除后）
 

@@ -392,6 +392,137 @@ HnswIndex::~HnswIndex() {
     }
 }
 
+// S13-P8：结构化拷贝活子图（契约见头文件）。
+std::shared_ptr<HnswIndex>
+HnswIndex::clone_live(const std::function<bool(std::uint64_t)>& is_live) const {
+    auto fresh = std::make_shared<HnswIndex>(cfg_);
+    const std::uint32_t n = count_.load(std::memory_order_acquire);
+    fresh->max_inserted_ord_.store(
+        max_inserted_ord_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+    if (n == 0) return fresh;
+
+    // pass 0：old_id → new_id 重映射（活节点按 id 序紧凑编号 = ord 序保持）。
+    constexpr std::uint32_t kDead = 0xFFFFFFFFu;
+    std::vector<std::uint32_t> remap(n, kDead);
+    std::uint32_t nn = 0;
+    for (std::uint32_t id = 0; id < n; ++id) {
+        if (is_live(node_ord(id))) remap[id] = nn++;
+    }
+    if (nn == 0) return fresh;
+
+    // pass 1：节点数据（vec/qcodes/ord/level）+ 邻接块分配（零初始化）。
+    std::uint32_t best_level = 0;
+    std::uint32_t best_new_id = 0;
+    bool have_entry = false;
+    for (std::uint32_t old_id = 0; old_id < n; ++old_id) {
+        const std::uint32_t new_id = remap[old_id];
+        if (new_id == kDead) continue;
+        const std::uint32_t ci = new_id >> kChunkBits;
+        NodeChunk* c = fresh->chunks_[ci].load(std::memory_order_relaxed);
+        if (c == nullptr) {
+            c = new NodeChunk(cfg_.dim, !cfg_.inmem_int8,
+                              fresh->needs_qcodes_);
+            fresh->chunks_[ci].store(c, std::memory_order_release);
+        }
+        const std::uint32_t slot = new_id & kChunkMask;
+        const NodeChunk* oc = chunk_of(old_id);
+        const std::uint32_t oslot = old_id & kChunkMask;
+        const std::uint32_t level = oc->levels[oslot];
+
+        if (!cfg_.inmem_int8) {
+            // vec_of 统一路由 mmap 段与 hot chunk 段。
+            std::memcpy(c->vecs.data() +
+                            static_cast<std::size_t>(slot) * cfg_.dim,
+                        vec_of(old_id),
+                        static_cast<std::size_t>(cfg_.dim) * sizeof(float));
+        }
+        if (fresh->needs_qcodes_ || cfg_.inmem_int8) {
+            // 量化副本直拷——不做反量化→再量化往返（无损、免两遍标量运算）。
+            std::memcpy(c->qcodes.data() +
+                            static_cast<std::size_t>(slot) * cfg_.dim,
+                        qcodes_of(old_id),
+                        static_cast<std::size_t>(cfg_.dim));
+            c->qscales[slot] = qscale_of(old_id);
+            c->qsums[slot]   = qsum_of(old_id);
+        }
+        c->ords[slot]   = oc->ords[oslot];
+        c->levels[slot] = static_cast<std::uint8_t>(level);
+        const std::size_t slots =
+            (1 + cfg_.M * 2) + static_cast<std::size_t>(level) * (1 + cfg_.M);
+        c->adj[slot] = c->alloc_adj(slots);
+
+        if (!have_entry || level > best_level) {
+            have_entry = true;
+            best_level = level;
+            best_new_id = new_id;
+        }
+    }
+
+    // pass 2：邻接重映射 + 死邻过滤（一跳路径收缩补边）。
+    // 本线程是唯一写者：旧图 adj 无并发写，普通读安全（并发读者只读不冲突）。
+    std::vector<std::uint32_t> merged;
+    for (std::uint32_t old_id = 0; old_id < n; ++old_id) {
+        const std::uint32_t new_id = remap[old_id];
+        if (new_id == kDead) continue;
+        const NodeChunk* oc = chunk_of(old_id);
+        const std::uint32_t oslot = old_id & kChunkMask;
+        NodeChunk* c = fresh->chunk_of(new_id);
+        const std::uint32_t slot = new_id & kChunkMask;
+        const std::uint32_t level = oc->levels[oslot];
+
+        for (std::uint32_t l = 0; l <= level; ++l) {
+            const std::uint32_t* src = oc->adj[oslot] + layer_off(l);
+            std::uint32_t* dst = c->adj[slot] + fresh->layer_off(l);
+            const std::uint32_t cap = fresh->layer_cap(l);
+            merged.clear();
+            const std::uint32_t cnt = src[0];
+            for (std::uint32_t i = 1; i <= cnt && merged.size() < cap; ++i) {
+                const std::uint32_t nb = src[i];
+                if (nb >= n) continue;  // 超出快照边界（并发插入的新节点）
+                const std::uint32_t r = remap[nb];
+                if (r != kDead && r != new_id) merged.push_back(r);
+            }
+            if (merged.empty() && cnt > 0) {
+                // 一跳路径收缩：全部直接邻居已死——借道死邻的活邻居补边，
+                // 保持该层连通性（否则本节点该层出边为空，可达性劣化）。
+                for (std::uint32_t i = 1;
+                     i <= cnt && merged.size() < cap; ++i) {
+                    const std::uint32_t dead_nb = src[i];
+                    if (dead_nb >= n || remap[dead_nb] != kDead) continue;
+                    const NodeChunk* dc = chunk_of(dead_nb);
+                    const std::uint32_t dslot = dead_nb & kChunkMask;
+                    if (dc->levels[dslot] < l) continue;  // 防御（不应发生）
+                    const std::uint32_t* dsrc = dc->adj[dslot] + layer_off(l);
+                    const std::uint32_t dcnt = dsrc[0];
+                    for (std::uint32_t j = 1;
+                         j <= dcnt && merged.size() < cap; ++j) {
+                        const std::uint32_t nb2 = dsrc[j];
+                        if (nb2 >= n) continue;
+                        const std::uint32_t r2 = remap[nb2];
+                        if (r2 == kDead || r2 == new_id) continue;
+                        if (std::find(merged.begin(), merged.end(), r2) ==
+                            merged.end()) {
+                            merged.push_back(r2);
+                        }
+                    }
+                }
+            }
+            dst[0] = static_cast<std::uint32_t>(merged.size());
+            for (std::size_t i = 0; i < merged.size(); ++i) {
+                dst[1 + i] = merged[i];
+            }
+        }
+    }
+
+    // 发布（fresh 尚未对读者可见，本函数返回后由调用方 atomic store 换图）。
+    fresh->entry_meta_.store(
+        (static_cast<std::uint64_t>(best_level + 1) << 32) | best_new_id,
+        std::memory_order_release);
+    fresh->count_.store(nn, std::memory_order_release);
+    return fresh;
+}
+
 std::uint32_t HnswIndex::copy_neighbors(std::uint32_t id, std::uint32_t layer,
                                         std::uint32_t* out) const {
     NodeChunk* c = chunk_of(id);
@@ -402,12 +533,21 @@ std::uint32_t HnswIndex::copy_neighbors(std::uint32_t id, std::uint32_t layer,
     const std::uint32_t* a = c->adj[slot] + layer_off(layer);
     const std::uint32_t cap = layer_cap(layer);
     // S13-P7 seqlock 读侧：纯读、零共享行写——hub 节点并发查询不再乒乓。
+    // 拷贝方式分构建：TSan 构建逐字 atomic_ref（工具可见、零误报）；常规
+    // 构建 memcpy（逐字循环阻断向量化，实测单线程 HNSW 查询 +17%——经典
+    // seqlock 取舍：torn 读被 seq 复读检测丢弃，正确性同）。
     for (;;) {
         const std::uint32_t s1 = seq.load(std::memory_order_acquire);
         if (s1 & 1u) { cpu_pause(); continue; }  // 写者更新中
         const std::uint32_t n = adj_load(a);
         if (n > cap) { cpu_pause(); continue; }  // torn count，防 out 越界
+#if defined(__SANITIZE_THREAD__) || \
+    (defined(__has_feature) && __has_feature(thread_sanitizer))
         for (std::uint32_t i = 0; i < n; ++i) out[i] = adj_load(a + 1 + i);
+#else
+        std::memcpy(out, a + 1,
+                    static_cast<std::size_t>(n) * sizeof(std::uint32_t));
+#endif
         std::atomic_thread_fence(std::memory_order_acquire);
         if (seq.load(std::memory_order_relaxed) == s1) return n;
         // 期间有写者插入 → 丢弃重读。
@@ -964,9 +1104,9 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
                 // 下纯开销。合并后典型降到个位数 syscall。
                 const std::size_t vec_bytes =
                     static_cast<std::size_t>(cfg_.dim) * sizeof(float);
-                const long page = ::sysconf(_SC_PAGESIZE);
-                const std::uintptr_t pmask =
-                    ~(static_cast<std::uintptr_t>(page) - 1);
+                const auto page = static_cast<std::uintptr_t>(
+                    ::sysconf(_SC_PAGESIZE));
+                const std::uintptr_t pmask = ~(page - 1);
                 thread_local std::vector<std::uintptr_t> addrs;
                 addrs.clear();
                 for (std::size_t i = 0; i < rerank_n; ++i) {

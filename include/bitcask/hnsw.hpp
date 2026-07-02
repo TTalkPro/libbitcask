@@ -114,6 +114,18 @@ public:
     // rebuild_hnsw 单写者即时消费,下次调用前已被 insert 拷走)。
     [[nodiscard]] std::span<const float> node_vec(std::uint32_t id) const;
 
+    // S13-P8：结构化拷贝活子图（merge 期 rebuild 用）。替代「从零逐点重插」
+    //（每点 ~ef_construction 次全维距离，100k 节点分钟级、阻塞 merge）：
+    // 保留原图的层数与邻接结构，只做 id 重映射 + 死邻过滤——O(节点+边) 的
+    // memcpy 级拷贝，无距离计算。死邻过滤的召回补偿：某层邻居全死时做
+    // **一跳路径收缩**（借道死邻的活邻居补边，去重、限 cap）；极端删除
+    // 模式下个别节点仍可能孤立（无出边），由后续 merge 轮或重插自愈。
+    // int8-only 模式直接拷 qcodes/scale/sum——顺带消掉旧重插路径的
+    // 反量化→再量化往返（audit P8 项）。
+    // 线程模型：调用方须为单写者（reducer）；旧图并发读者不受影响（只读）。
+    [[nodiscard]] std::shared_ptr<HnswIndex>
+    clone_live(const std::function<bool(std::uint64_t)>& is_live) const;
+
     // ---- V7:BCVS v2 快照(header in search.ckpt + vecs_ in search.vec mmap)----
     //
     // 双文件模型:search.ckpt 的 kHnsw 段存 header(qcodes/adj/ords/levels +

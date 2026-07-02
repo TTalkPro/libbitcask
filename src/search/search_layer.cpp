@@ -106,13 +106,11 @@ std::size_t SearchLayer::hnsw_size() const {
 void SearchLayer::rebuild_hnsw() {
     auto old = hnsw_.load(std::memory_order_acquire);
     if (!old) return;
-    auto fresh = std::make_shared<vec::HnswIndex>(old->config());
-    const auto n = static_cast<std::uint32_t>(old->size());
-    for (std::uint32_t id = 0; id < n; ++id) {
-        const std::uint64_t ord = old->node_ord(id);
-        if (!index_.is_live(ord)) continue;
-        fresh->insert(ord, old->node_vec(id));
-    }
+    // S13-P8：结构化拷贝替代从零重插——O(节点+边) memcpy 级，无距离计算
+    //（原 100k 节点分钟级、阻塞 merge）。层数/邻接保持原图结构，死邻过滤 +
+    // 一跳路径收缩补边；int8-only 直拷量化副本（免反量化→再量化往返）。
+    auto fresh = old->clone_live(
+        [this](std::uint64_t ord) { return index_.is_live(ord); });
     hnsw_.store(std::move(fresh), std::memory_order_release);
 }
 
