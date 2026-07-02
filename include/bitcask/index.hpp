@@ -15,6 +15,7 @@
 #pragma once
 
 #include "bitcask/live_checker.hpp"
+#include "bitcask/meta_filter.hpp"  // S13-P8：eval_meta 锁内求值
 #include "bitcask/string_hash.hpp"
 
 #include <array>
@@ -118,6 +119,13 @@ public:
     // set_meta(worker 线程)会重分配底层 vector;若返回内部 span 会在锁外
     // 被并发 set_meta 释放(use-after-free)。锁内拷贝杜绝逃逸。
     [[nodiscard]] std::vector<std::byte> meta_blob(std::uint64_t ord) const;
+
+    // S13-P8：meta filter 锁内求值——省去 meta_blob 的锁内堆拷贝（过滤查询
+    // 每候选一次，overfetch K'=4k 时最多 4k 次拷贝/查询）。evaluate 是纯读
+    // 无 IO（meta_filter.hpp），shared_lock 内直接跑安全。
+    // 语义与「meta_blob 后 evaluate」一致：无 meta（空 blob）恒 false。
+    [[nodiscard]] bool eval_meta(std::uint64_t ord,
+                                 const meta::MetaFilter& filter) const;
 
     // P2.1 批量版本：一次 shared_lock 完成整个数组（逐 posting 版本每条
     // posting 一次锁 + 一次虚调用，热词查询 = 数十万次锁操作且阻断评分

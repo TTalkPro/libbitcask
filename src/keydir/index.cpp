@@ -161,6 +161,15 @@ std::vector<std::byte> Index::meta_blob(std::uint64_t ord) const {
     return meta_blobs_[ord];
 }
 
+// S13-P8：锁内求值（契约见头文件）。
+bool Index::eval_meta(std::uint64_t ord, const meta::MetaFilter& filter) const {
+    std::shared_lock lk(mutex_);
+    if (ord >= meta_blobs_.size()) return false;
+    const auto& blob = meta_blobs_[ord];
+    if (blob.empty()) return false;  // 无 meta 恒不通过（与 materialize_hits 一致）
+    return filter.evaluate(std::span<const std::byte>(blob));
+}
+
 void Index::set_meta(std::uint64_t ord, std::span<const std::byte> blob) {
     std::unique_lock lk(mutex_);
     ensure_capacity_locked(ord);

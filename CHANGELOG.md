@@ -119,6 +119,12 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
   自旋锁做 exchange（写操作）——hub 节点并发查询缓存行核间乒乓。写者单线程
   ⟹ 改 seqlock（数据字 `atomic_ref` relaxed，TSan 干净），读侧零共享行写。
   新增并发基准 `BM_Hnsw_SearchConcurrent`（1→4 线程延迟持平实证）。
+- **查询侧三件套（S13-P8，+3 → 12/14）**：`invalidate_terms` 反向索引
+  （O(全部条目×词) → O(变更词+受害条目)，写路径独占锁热点）；meta filter
+  改 `Index::eval_meta` 锁内求值（免 overfetch 每候选一次 blob 堆拷贝，
+  HNSW 图内过滤回调同享）；`search_fields` 删死代码 + 按 boost 分组一次
+  多词搜索（内核调用 O(组)；行为改进：跨词组合分高的文档不再被单词 top-k
+  截丢）。
 - **启动/checkpoint 三件套（S13-P8，+3 → 9/14）**：FOR 解码 64-bit 窗口
   （大索引 ckpt 加载主导项，位级等价）；`save_vec_payload` 流式写（峰值内存
   从整 payload ~1.5GB 降到一页）；hint 恢复单遍 `fold_validated`（原校验+

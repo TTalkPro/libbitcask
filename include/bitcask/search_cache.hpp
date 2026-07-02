@@ -97,6 +97,15 @@ private:
     // key → list iterator
     mutable std::unordered_map<std::uint64_t, std::list<ListNode>::iterator> map_;
 
+    // S13-P8：term → 含该词的条目 hash 集（反向索引）。invalidate_terms 从
+    // O(全部条目×词) 降为 O(变更词 + 受害条目)——它跑在每次写入的 reducer
+    // 路径上、持独占锁。put/erase/invalidate 同步维护。
+    mutable std::unordered_map<std::string, std::unordered_set<std::uint64_t>>
+        term_index_;
+
+    // 摘除一个条目（term_index_ 反链 + map_ + lru_list_）。锁要求：mutex_ 独占。
+    void remove_entry_locked(std::list<ListNode>::iterator it);
+
     // 读写锁:get 共享,put/invalidate 独占。
     mutable std::shared_mutex mutex_;
     // 全局访问时钟(LRU 序号源)。

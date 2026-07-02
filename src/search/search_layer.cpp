@@ -16,6 +16,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <map>
 #include <string>
 #include <utility>
 
@@ -225,8 +226,8 @@ std::vector<SearchHit> SearchLayer::materialize_hits(
     hits.reserve(results.size());
     for (auto& r : results) {
         if (filter) {
-            auto blob = index_.meta_blob(r.ord);
-            if (blob.empty() || !filter->evaluate(blob)) continue;
+            // S13-P8：锁内求值，免每候选一次 blob 堆拷贝。
+            if (!index_.eval_meta(r.ord, *filter)) continue;
         }
         auto ext_id = index_.ord_to_ext(r.ord);
         if (!ext_id) continue;
@@ -285,9 +286,8 @@ SearchLayer::search_vector(std::span<const float> query, std::size_t k,
     if (filter) {
         live = [this, filter](std::uint64_t ord) -> bool {
             if (!index_.is_live(ord)) return false;
-            auto blob = index_.meta_blob(ord);
-            if (blob.empty()) return false;
-            return filter->evaluate(blob);
+            // S13-P8：锁内求值（HNSW 图内过滤每展开节点调一次——热点）。
+            return index_.eval_meta(ord, *filter);
         };
     } else {
         live = [this](std::uint64_t ord) -> bool {
@@ -864,18 +864,25 @@ SearchLayer::search_fields(std::string_view query, std::size_t k,
     for (auto& [field, term_boosts] : by_field) {
         const auto* inv = field_index(field);
         if (!inv) continue;
-        std::vector<std::string> terms;
-        terms.reserve(term_boosts.size());
-        for (auto& [t, _] : term_boosts) terms.push_back(t);
-        if (synonym_map_) {
-            terms = synonym_map_->expand_terms(terms);
-        }
+        // S13-P8：① 删死代码——此前这里构建 terms 并做整体同义词扩展，但
+        // 结果从未被使用（真正的扩展在下方逐词做）。② 按 boost 分组一次
+        // 多词搜索：原每 (词×同义词) 一次独立 top-k 内核调用，且各自截断
+        // 到 k——跨词组合分高、单词排名 >k 的文档会被截丢。分组后同 boost
+        // 词（含同义词）合并为一次 search（BM25 逐词贡献求和公式不变），
+        // 组级 top-k 截断，内核调用数从 O(词×同义词) 降到 O(boost 组)，
+        // 召回不降（这是行为改进：结果可能比旧版多出此前被截丢的文档）。
+        std::map<float, std::vector<std::string>> boost_groups;
         for (auto& [t, boost] : term_boosts) {
-            auto expanded = synonym_map_ ? synonym_map_->expand(t) : std::span<const std::string>{};
+            auto expanded = synonym_map_ ? synonym_map_->expand(t)
+                                         : std::span<const std::string>{};
             if (expanded.empty()) expanded = {&t, 1};
-            for (const auto& et : expanded) {
-                auto res = inv->search({et}, k, index_, params_override);
-                for (auto& r : res) acc[r.ord] += static_cast<double>(r.score) * boost;
+            auto& g = boost_groups[boost];
+            g.insert(g.end(), expanded.begin(), expanded.end());
+        }
+        for (auto& [boost, gterms] : boost_groups) {
+            auto res = inv->search(gterms, k, index_, params_override);
+            for (auto& r : res) {
+                acc[r.ord] += static_cast<double>(r.score) * boost;
             }
         }
     }

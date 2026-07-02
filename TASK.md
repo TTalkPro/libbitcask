@@ -1554,9 +1554,19 @@ W4 ✅（parallel_scan 并行全表扫描）。
     读入 → trailer CRC 判定（与 validate_trailer 逐字节一致）→ 内存解析
     回调；CRC 不过回调零次（keydir 零污染）。内存代价 = hint 文件瞬时缓冲
     （hint ≪ data）。
-  - [ ] 剩余 5 项待做：`search_fields` 死代码+逐词 top-k、`invalidate_terms`
-    反向索引、meta filter 锁内求值、merge `pending_` 分批 apply、
-    `rebuild_hnsw` 并行/结构化拷贝。
+  - [x] `invalidate_terms` 反向索引（2026-07-02）：SearchCache 加
+    `term_index_`（term→条目 hash 集，put/erase/invalidate/evict 同步维护），
+    失效从 O(全部条目×词) 降为 O(变更词+受害条目)——每次写入持独占锁的热路径。
+  - [x] meta filter 锁内求值（2026-07-02）：`Index::eval_meta(ord, filter)`
+    shared_lock 内直接 evaluate（纯读无 IO），替代 `meta_blob` 的锁内堆拷贝
+    ——materialize_hits（overfetch 4k 候选 = 4k 次拷贝/查询）与 HNSW 图内
+    过滤 live 回调（每展开节点一次）两处受益。
+  - [x] `search_fields` 死代码 + boost 分组搜索（2026-07-02）：删除从未使用
+    的整体同义词扩展块；每 (词×同义词) 独立 top-k 改按 boost 分组一次多词
+    search（内核调用 O(组)，组级 top-k 截断）。**行为改进**：跨词组合分高、
+    单词排名 >k 被截丢的文档现在能进结果（synonym 11/11 回归通过）。
+  - [ ] 剩余 2 项待做：merge `pending_` 分批 apply、`rebuild_hnsw` 并行/
+    结构化拷贝（涉单写者约束，需 TSan 护栏设计，建议单独一批）。
 
 ### D. 功能缺口（对照已规划 C4/C5/C6 与已否决项排除后）
 
