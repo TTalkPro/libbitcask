@@ -548,7 +548,23 @@ void SearchLayer::reduce_apply(const ReduceJob& job,
     if (!vec.empty()) {
         on_vector(job.ord, vec);
     }
-    cache_.invalidate();
+    // S13-P1：S9.2 选择性失效——job 已物化本文档全部词集（各字段 terms +
+    // catch-all），与单文本路径 on_write 的 invalidate_terms 对齐。此前这里
+    // 无条件 invalidate()，而所有 put/put_doc 都走管线 → 混合读写负载下
+    // 查询缓存命中率归零。向量/纯 meta 文档不影响缓存正确性：缓存只存
+    // text/phrase/bool/highlight 结果，BM25 全局统计漂移是 S9.2 已接受的
+    // near-real-time 近似（见 search_cache.hpp 头注释）。
+    std::vector<std::string> changed_terms;
+    {
+        std::size_t est = job.ca_data.size();
+        for (const auto& f : job.fields) est += f.terms.size();
+        changed_terms.reserve(est);
+    }
+    for (const auto& f : job.fields) {
+        for (const auto& [term, data] : f.terms) changed_terms.push_back(term);
+    }
+    for (const auto& [term, data] : job.ca_data) changed_terms.push_back(term);
+    cache_.invalidate_terms(changed_terms);
     maybe_auto_compact();  // S12-2：本 reducer 线程内，达阈值则压实死 posting
 }
 
@@ -877,8 +893,8 @@ void SearchLayer::recover_doc_batch(std::vector<RecoverDoc>& batch) {
     });
 
     // 阶段二：按 batch 序串行 reduce_apply（= fold 序）。HNSW 单写者 = 本线程。
-    // reduce_apply 内部逐条 cache_.invalidate()：恢复期无查询，性能影响可忽略；
-    // 最终状态与旧版完全一致。
+    // reduce_apply 内部逐条按词失效缓存（S13-P1）：恢复期无查询，缓存本就空，
+    // 性能影响可忽略；最终状态与旧版完全一致。
     for (std::size_t i = 0; i < n; ++i) {
         const auto& d = batch[i];
         reduce_apply(jobs[i], {}, d.vector);

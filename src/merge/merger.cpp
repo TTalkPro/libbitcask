@@ -1,5 +1,6 @@
 #include "bitcask/merger.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 
@@ -223,17 +224,46 @@ run_merge(std::span<const std::string> input_data_paths,
     // 指向新文件。CAS 失败 = 并发 put 已改这个 key（合法）→ 跳过，X 中的
     // record 成 dead，下次 merge 清。on_relocate 必须与 keydir.put 配对成功
     // 才调，避免 search 已切但 keydir 未切的不一致窗口。
+    //
+    // S13-F1：这里必须是 newest_put=false（条件 CAS 语义，keydir.hpp 的契约
+    // 本就为 merge 设计）。曾误传 true——true 的 accept 条件是
+    // file_id >= biggest_file_id_，merge 期间任何并发 put 触发 roll 后该条件
+    // 恒假 → 全部冷 key 重定位被拒 + caller 无条件 unlink 输入 → 数据丢失。
+    // false 时：CAS 门要求精确匹配 (old_file_id, old_offset)，accept 走
+    // cur.file_id < file_id（输入 id 恒小于输出 id）——语义正确且不受并发
+    // roll 影响。
     for (const auto& u : pending_) {
         auto pr = keydir.put(u.key, stats.output_file_id, u.new_total_size,
                              u.new_offset, u.tstamp, /*now_sec*/ 0,
-                             /*newest_put*/ true,
+                             /*newest_put*/ false,
                              /*old_file_id*/ u.old_file_id,
                              /*old_offset*/ u.old_offset,
                              /*ord*/ u.ord);
-        if (pr == keydir::PutResult::kOk && search_layer) {
-            search_layer->on_relocate(u.key, u.ord, stats.output_file_id,
-                                       u.new_offset, u.new_total_size);
+        if (pr == keydir::PutResult::kOk) {
+            if (search_layer) {
+                search_layer->on_relocate(u.key, u.ord, stats.output_file_id,
+                                           u.new_offset, u.new_total_size);
+            }
+            continue;
         }
+        // CAS 被拒。合法原因只有一种：并发 put/remove 已把 key 从
+        // (old_file_id, old_offset) 挪走/删除——输入里这条 record 已 dead，
+        // unlink 输入依然安全。纵深防御：复查 keydir，若仍指向旧位置，说明
+        // 重定位被内部逻辑卡住（当前实现不可达；防未来回归）——标记该输入
+        // 文件 stuck，caller 必须跳过它的 unlink，留给下轮 merge 重试。
+        auto cur = keydir.get(u.key);
+        if (cur && cur->file_id == u.old_file_id &&
+            cur->offset == u.old_offset) {
+            stats.relocations_stuck += 1;
+            stats.stuck_file_ids.push_back(u.old_file_id);
+        }
+    }
+    if (!stats.stuck_file_ids.empty()) {
+        std::sort(stats.stuck_file_ids.begin(), stats.stuck_file_ids.end());
+        stats.stuck_file_ids.erase(
+            std::unique(stats.stuck_file_ids.begin(),
+                        stats.stuck_file_ids.end()),
+            stats.stuck_file_ids.end());
     }
 
     return stats;

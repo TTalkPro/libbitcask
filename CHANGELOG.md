@@ -12,7 +12,48 @@
 
 ## [Unreleased]
 
-（暂无）
+S13 四维审查（内存/并发/性能/功能）首批修复。
+
+### Fixed（并发正确性）
+
+- **【Critical·数据丢失】merge 重定位改条件 CAS（S13-F1）**：merger 曾误传
+  `newest_put=true`——merge 期间任何并发 put 触发 roll 后，全部冷 key 重定位被拒
+  且输入文件被无条件 unlink → key 指向已删文件、重启后永久丢失。改传 `false`
+  （keydir 契约本为 merge 设计的条件 CAS 语义），并加纵深防御：`MergeStats` 新增
+  `relocations_stuck`/`stuck_file_ids`，`Cask::merge` 对复查后 keydir 仍引用的输入
+  文件跳过 unlink。新增回归测试 `ConcurrentWriterRollDuringMergeNoDataLoss`
+  （反向验证：bug 版本下立即失败）。
+- **【High·永久挂起】写路径失败泄漏 ord（S13-F2）**：put/remove/put_doc 在
+  alloc_ord 之后、真任务提交之前的任何错误 return（含 `write_and_keydir` 重试
+  路径的双泄漏）都会在 reorder buffer 留下永久空洞 → 此后 flush/merge/close
+  全部永久阻塞（一次 ENOSPC 即卡死句柄）。新增 `OrdSkipGuard` RAII 守卫，
+  错误/异常路径自动补 `IndexOp::Skip`。
+- **【UB】`CaskIter::pin_files` 无锁读 `active_data_`（S13-F3）**：与并发 roll 的
+  shared_ptr reset 构成数据竞争。改为 `read_cache_mu_` 共享锁内拍快照。
+- **【UB】`active_file_id_` 改 `std::atomic<uint32_t>`（S13-F4）**：写者持
+  `write_mu_`、读者持 `read_cache_mu_` 或无锁，无 happens-before。
+- **get 与 merge unlink 窗口的假 kIo（S13-F5）**：读者先查 keydir、后 open 文件，
+  merge 恰在其间重定位并 unlink → ENOENT 假失败。`get()` 现对该窗口重查 keydir
+  重试一次。
+- **文档矛盾订正（S13-F7）**：`cask.hpp` merge 线程安全注释与 thread-safety.md
+  §7.6 统一（KV 路径安全；索引模式注明 S13-F6 未修前的并发注意事项）。
+
+### Fixed（内存）
+
+- **C API `bitcask_iter_next_batch` 错误中途泄漏（S13-M1）**：返回 -1 前现已释放
+  已填充条目的 key/value malloc 缓冲（契约在头文件注明：错误时调用方无需 free）。
+
+### Performance
+
+- **搜索管线改按词选择性失效查询缓存（S13-P1）**：`reduce_apply` 曾无条件清空
+  整个查询缓存——所有 put/put_doc 走管线，混合读写负载下命中率归零。现与单文本
+  路径 `on_write` 对齐，用文档词集调 `invalidate_terms`。
+- **`fdatasync` 替代 `fsync`、`O_DSYNC` 替代 `O_SYNC`（S13-P2）**：追加写下持久性
+  语义等价，每次持久化省一笔元数据 journal 提交（ext4/xfs 可观）。WAL 契约不变。
+
+**验证**：Debug（clang）全量 490/490（489+1 新回归）；TSan 并发相关 109 项全过
+（`ThreadCountIndependentOfLibCount` 为 TSan 环境既有失败，干净树同样失败，与本
+批无关）；Release 构建干净。
 
 ## [3.1.0] - 2026-07-01
 

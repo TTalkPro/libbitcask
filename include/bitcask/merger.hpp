@@ -61,6 +61,11 @@ struct MergeStats {
     std::uint64_t records_stale  = 0;   // 跳过：keydir 已指向别处
     std::uint64_t records_tombs  = 0;   // 跳过：源 record 是墓碑
     std::uint64_t bytes_written  = 0;
+    // S13-F1 纵深防御：重定位 CAS 被拒且复查发现 keydir 仍指向输入文件的旧
+    // 位置（正常流程不应发生）。非零时 caller 绝不能 unlink 对应输入文件，
+    // 否则这些 key 将指向已删除文件——重启后永久丢失。
+    std::uint64_t relocations_stuck = 0;
+    std::vector<std::uint32_t> stuck_file_ids;  // 对应输入 file_id（已排序去重）
 };
 
 // 把 input_data_paths（必须都是 data file，不是 hint）合并到 output_dir

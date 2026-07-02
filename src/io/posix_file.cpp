@@ -28,7 +28,10 @@ int translate_open_flags(OpenFlag in) noexcept {
         flags = O_RDONLY;
     }
     if (has_flag(in, OpenFlag::kOSync)) {
-        flags |= O_SYNC;
+        // S13-P2：O_DSYNC 而非 O_SYNC——追加写场景下 fdatasync 语义已保证
+        // 数据 + 文件大小（检索数据所需的全部元数据）落盘，省去每次写的
+        // mtime 等 journal 元数据提交。durability 语义不变。
+        flags |= O_DSYNC;
     }
     return flags;
 }
@@ -56,9 +59,11 @@ void PosixFile::close_quiet() noexcept {
     }
 }
 
-// fsync(2)：确保 fd 的脏页落盘。bitcask 的 sync_strategy 控制何时调用。
+// fdatasync(2)：确保 fd 的脏数据页 + 检索所需元数据（文件大小）落盘。
+// bitcask 的 sync_strategy 控制何时调用。S13-P2：fdatasync 替代 fsync——
+// 追加写下持久性等价，每次省一笔 mtime 等元数据 journal 提交（ext4/xfs 可观）。
 std::expected<void, IoError> PosixFile::sync() noexcept {
-    if (::fsync(fd_) == -1) return std::unexpected(IoError{errno});
+    if (::fdatasync(fd_) == -1) return std::unexpected(IoError{errno});
     return {};
 }
 

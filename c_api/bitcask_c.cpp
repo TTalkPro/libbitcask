@@ -732,6 +732,12 @@ BITCASK_API int bitcask_iter_next_batch(bitcask_iter_t* iter,
     while (count < max_n) {
         auto result = as_cpp_iter(iter)->next();
         if (!result) {
+            // S13-M1：中途失败时已填充的 entries[0..count-1] 持有 malloc
+            // 缓冲，而契约只返回 -1、caller 无从得知已填充多少条——必须在
+            // 此处释放，否则必然泄漏。
+            for (std::size_t i = 0; i < count; ++i) {
+                bitcask_iter_entry_free(&entries[i]);
+            }
             to_c_error(result.error(), fault);
             return -1;
         }

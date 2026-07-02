@@ -243,6 +243,91 @@ TEST_F(MergeConcurrentWriterTest, ConcurrentMergePreservesActiveFile) {
   cask.close();
 }
 
+// S13-F1 回归：merge 期间并发 put 持续触发 roll_active。修复前 merger 误用
+// newest_put=true 做重定位——roll 把 keydir.biggest_file_id 推过 merge 输出
+// id 后，accept 条件 (file_id >= biggest) 恒假 → 全部冷 key 重定位被拒，而
+// Cask::merge 收尾无条件 unlink 输入 → 冷 key 指向已删文件：进程内 get 报
+// kIo，重启后永久丢失。修复后重定位是条件 CAS（newest_put=false，accept 走
+// 输入 id < 输出 id 恒真），不受并发 roll 影响；且 stuck 文件跳过 unlink 兜底。
+TEST_F(MergeConcurrentWriterTest, ConcurrentWriterRollDuringMergeNoDataLoss) {
+  constexpr int kCold = 60;
+
+  CaskOptions opts;
+  opts.read_write = true;
+  opts.max_file_size = 256;  // 极小文件：写入线程每几条 put 即 roll 一次
+  auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+  ASSERT_TRUE(c);
+  auto& cask = **c;
+
+  // 冷数据：写入后不再触碰，merge 必须原样搬运。
+  std::map<std::string, std::vector<std::byte>> cold;
+  for (int i = 0; i < kCold; ++i) {
+    auto key = key_for(i);
+    auto val = value_for(i);
+    ASSERT_TRUE(
+        cask.put(bytes(key), val, static_cast<std::uint32_t>(1000 + i)));
+    cold[key] = std::move(val);
+  }
+
+  // merge 候选 = 除 active 外全部 sealed 文件（绕过 needs_merge 触发条件）。
+  std::vector<std::pair<std::uint32_t, std::string>> files;
+  for (const auto& de : std::filesystem::directory_iterator(tmpdir_)) {
+    const auto name = de.path().filename().string();
+    if (auto t = bitcask::fileops::parse_data_tstamp(name)) {
+      files.push_back({static_cast<std::uint32_t>(*t), de.path().string()});
+    }
+  }
+  ASSERT_GE(files.size(), 2u);
+  std::sort(files.begin(), files.end());
+  std::vector<std::string> to_merge;
+  for (std::size_t i = 0; i + 1 < files.size(); ++i) {
+    to_merge.push_back(files[i].second);
+  }
+
+  // 热写者：独立 keyspace，持续 put → 频繁 roll（触发 F1 的必要条件）。
+  std::atomic<bool> stop{false};
+  std::latch started(2);
+  std::thread writer([&]() {
+    started.count_down();
+    started.wait();
+    int i = 0;
+    while (!stop.load(std::memory_order_acquire)) {
+      const std::string k = "hot" + std::to_string(i % 100);
+      std::vector<std::byte> v(48, static_cast<std::byte>(i & 0xFF));
+      (void)cask.put(bytes(k), v, static_cast<std::uint32_t>(5000 + i));
+      ++i;
+    }
+  });
+  started.count_down();
+  started.wait();
+
+  auto mr = cask.merge(to_merge);
+  stop.store(true, std::memory_order_release);
+  writer.join();
+  ASSERT_TRUE(mr) << "merge failed: " << mr.error().detail;
+  EXPECT_EQ(mr->relocations_stuck, 0u)
+      << "条件 CAS 语义下不应出现 stuck 重定位";
+
+  // 进程内：全部冷 key 仍可读且值正确。
+  for (const auto& [k, v] : cold) {
+    auto r = cask.get_owned(bytes(k));
+    ASSERT_TRUE(r) << "cold key lost after merge with concurrent roll: " << k;
+    EXPECT_EQ(r->value, v) << "cold key corrupted: " << k;
+  }
+
+  cask.close();
+
+  // 重启后：修复前输入文件已被 unlink，冷 key 永久丢失；修复后必须全在。
+  auto c2 = Cask::open(tmpdir_.string(), opts, &test_registry());
+  ASSERT_TRUE(c2);
+  for (const auto& [k, v] : cold) {
+    auto r = (*c2)->get_owned(bytes(k));
+    ASSERT_TRUE(r) << "cold key lost after reopen: " << k;
+    EXPECT_EQ(r->value, v) << "cold key corrupted after reopen: " << k;
+  }
+  (*c2)->close();
+}
+
 TEST_F(MergeConcurrentWriterTest, MergeFailureLeavesKeydirConsistent) {
   constexpr int kN = 30;
 

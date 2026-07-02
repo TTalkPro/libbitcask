@@ -488,6 +488,8 @@ BITCASK_API int bitcask_iter_next(bitcask_iter_t* iter,
 // 返回取到的条数（0 = 迭代结束），<0 = 错误。
 // entries 是调用方分配的数组，max_n 为数组大小。
 // 每条 entry 的 key/value 指向 malloc 缓冲，需逐条 free。
+// 错误（<0）时本函数已释放中途填充的条目缓冲——调用方无需（也不可）
+// 对 entries 做任何 free。
 BITCASK_API int bitcask_iter_next_batch(bitcask_iter_t* iter,
                                           bitcask_iter_entry_t* entries,
                                           size_t max_n,

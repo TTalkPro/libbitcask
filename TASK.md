@@ -1393,3 +1393,130 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > → ~~S12-5[中] C API batch×3 + parallel_scan~~ ✅ → ~~S12-5 BITCASK_ERR_CLOSED~~ ✅ →
 > ~~S12-7 -Werror（first-party 库）~~ ✅ 2026-07-01。**S12-5 / S12-7 全部完成**。
 > 剩余（均需 runner，本地无法验证）：**S12-6 macOS · ARM64 job**（唯一 S12 未决项）。P3 按需。
+
+---
+
+## 待办：第十三梯队（S13 四维审查 — 2026-07-02）
+
+> 来源：2026-07-02 四路并行深审（内存泄漏 / 线程死锁·竞态 / 性能 / 功能缺口）。
+> **总体结论**：RAII 全覆盖（内存侧仅 1 处真实泄漏）、锁纪律大部分论证成立，但发现
+> **1 个并发数据丢失级 bug（S13-F1）** 与 **1 个永久挂起级 bug（S13-F2)**——均为纯并发
+> 触发、串行测试不可见。性能侧最高性价比是搜索缓存全量失效（S13-P1）。功能侧最大断层
+> 是 C API 缺 meta filter + README/门面漂移。
+
+### A. 并发正确性（最优先）
+
+- [x] **S13-F1【Critical·数据丢失】merge 重定位误用 `newest_put=true` + 收尾无条件 unlink** — 已完成（2026-07-02）
+    · `src/merge/merger.cpp:229`、`src/keydir/keydir.cpp:539-556`、`src/cask/cask.cpp:2123-2148`
+  - 交错：merge `output_id=N` → 并发 put 见 `active < N` roll → `biggest=N+1` → apply 时
+    accept 条件 `N >= N+1` 恒假 → 全部冷 key 重定位被拒（kAlreadyExists）→ `Cask::merge`
+    基于「CAS 失败=已被新写覆盖」的假设无条件 unlink 输入 → keydir 指向已删文件，
+    **重启后 key 永久丢失**。`keydir.hpp:237-244` 注释本就写明 merge 应传 `newest_put=false`。
+  - 修：① merger 改传 `false`（output_id > 全部输入 id，语义正确）；② 纵深防御：统计
+    「CAS 门过但 accept 拒」条目，非零则跳过 unlink 留下轮 merge。
+  - 验证：新增 `MergeConcurrentWriterTest.ConcurrentWriterRollDuringMergeNoDataLoss`
+    （并发热写者持续 roll + merge 冷数据 → 进程内全可读 + close/reopen 后全可读 +
+    `relocations_stuck==0`）。**反向验证**：临时改回 `newest_put=true` 该测试立即失败
+    （抓到数据丢失），恢复后 4/4 过。落地：`merger.cpp` 改 false + `MergeStats` 加
+    `relocations_stuck/stuck_file_ids`（复查 keydir 仍指旧位置才计）+ `Cask::merge`
+    对 stuck 文件跳过 unlink/erase/trim。
+
+- [x] **S13-F2【High·永久挂起】写路径失败泄漏 ord → reorder buffer 永久 stall** — 已完成（2026-07-02）
+    · `src/cask/cask.cpp:1286-1316,1601,1660,1744`、`include/bitcask/thread_pool.hpp:354-362,521-565`
+  - `write_and_keydir` 各错误路径（pwrite/hint/roll 失败、`pr2==kAlreadyExists` 双泄漏）
+    return 前未对已 alloc 的 ord 提交 Skip → reducer `next_apply_ord` 永久空洞 →
+    此后 flush/merge/close 全部在 `flush_cv_.wait` 永久阻塞（谓词永假）。一次 ENOSPC 即卡死句柄。
+  - 修：ord RAII 守卫——析构时若未提交则自动 submit `IndexOp::Skip`（复用 S6-P1 机制）。
+  - 落地：`cask.hpp` 新增私有 `OrdSkipGuard`（RAII，析构未 disarm 即 submit Skip），
+    接入 put/remove/put_doc 三个 alloc 点 + `write_and_keydir` 内 ord2；`pr2==kAlreadyExists`
+    双泄漏路径由双守卫覆盖。异常路径（bad_alloc 等）同样被 RAII 兜住。
+    注：fault-injection 挂起测试留待（需 mock 文件层），守卫逻辑经全量回归验证无副作用。
+
+- [x] **S13-F3【High·UB】`CaskIter::pin_files` 无锁读 `active_data_`（shared_ptr）** — 已完成（2026-07-02，shared_lock 内拍快照）
+    · `src/cask/cask.cpp:217` vs 写方 `1083-1085,1140-1142,1168-1172`
+  - 与并发 roll 对同一 shared_ptr 对象读写竞争（非控制块），TSan 必报，最坏解引用悬垂。
+  - 修：`shared_lock(read_cache_mu_)` 内拍 `(active_data_ 副本, active_file_id_)` 快照。
+
+- [x] **S13-F4【Medium·UB】`active_file_id_` 普通 u32，写者持 write_mu_/读者持 read_cache_mu_ 无 HB** — 已完成（2026-07-02，改 atomic + needs_merge 显式 relaxed load）
+    · `src/cask/cask.cpp:1068,1172` vs `1207,1218,2008,2013-2015,217`
+  - 修：改 `std::atomic<std::uint32_t>`（relaxed 足够，值仅作提示）。
+
+- [x] **S13-F5【Medium】get 与 merge unlink 窗口 → 假 kIo** — 已完成（2026-07-02，get() 对 read_file 失败重查 keydir 重试一次）
+    · `src/cask/cask.cpp:1375-1385` vs `2137-2148`
+  - 读者先查 keydir 拿旧定位、后 open；merge 恰在其间 CAS+unlink → ENOENT 假失败。
+    O10 的同临界区只保护已持句柄读者。修：`read_file` ENOENT 时重查 keydir 重试一次。
+
+- [ ] **S13-F6【Medium】tbb::concurrent_hash_map 并发插入时被整表遍历（TBB 不支持）**
+    · `src/bm25/inverted.cpp:196-205,299-305`、`src/search/search_layer.cpp:1192-1226,1259-1262`
+  - `ensure_vocab`（查询线程）/ `compact`·`serialize`·`truncate_wal`（merge/close 线程）遍历
+    与 reducer `add_doc` 插入并发；merge 路径破坏 S12-2「compact 仅在 reducer 内」前提。
+  - 修：compact/ckpt 序列化封装成 IndexTask 经 reorder buffer 在 reducer 线程执行
+    （沿 RebuildHnsw 先例）；vocab 改增量维护或遍历持分片排他锁。
+
+- [x] **S13-F7【文档】`cask.hpp:566-570`（merge 与 put 不兼容）与 `cask.hpp:16-18` / thread-safety.md §7.6（安全）自相矛盾** — 已完成（2026-07-02）
+  - 统一为：KV 路径安全（F1/F5 已修）；索引模式注明 F6 未修前建议避免 merge 与高频 put_doc 并发。
+
+### B. 内存 / 资源
+
+- [x] **S13-M1【中】`bitcask_iter_next_batch` 错误中途 return -1 泄漏已填充条目** — 已完成（2026-07-02，错误分支逐条 free + 头文件契约注明）
+    · `c_api/bitcask_c.cpp:725-769`、契约 `bitcask_c.h:486-494`
+  - 修：错误分支 return 前对 `entries[0..count-1]` 逐条 `bitcask_iter_entry_free` 等价清理。
+- [ ] **S13-M2【低】C API malloc/strdup 返回值未检查（OOM → nullptr memcpy）+ extern "C" 未隔离异常**
+    · `bitcask_c.cpp:98-106,139-161,306,702-715,746-757,840-843`；全部导出函数缺 try/catch
+  - 修：统一 `try/catch(...) → BITCASK_ERR_IO` 包裹 + alloc 检查（或明示 OOM abort 契约）。
+- [ ] **S13-M3【低·异常路径】5 处 fopen 与 fclose 间 vector 分配可抛 → FILE* 泄漏**
+    · `keydir.cpp:1242`、`hnsw.cpp:1318`、`inverted.cpp:1866`、`inverted_wal.cpp:409`、`migrate.cpp:46`
+  - 修：照搬库内既有 `unique_ptr<FILE, FileCloser>` 模式（`field_schema.hpp:47` 先例）。
+- [ ] **S13-M4【信息】`fstats_` 按 file_id 下标永不收缩**（长寿进程缓慢增长）· `keydir.cpp:196-200,254`
+  - 低优先：考虑稀疏化或周期压缩。registry 目录记录只增为有意设计，不动。
+
+### C. 性能（按性价比排序）
+
+- [x] **S13-P1【高·一行级】搜索管线每写入清空整个查询缓存** · `src/search/search_layer.cpp:551` — 已完成（2026-07-02，reduce_apply 改 invalidate_terms，词集取自 job.fields[].terms + ca_data；缓存仅存 text 类查询，向量/meta 文档不影响正确性）
+  - `reduce_apply` 末尾无条件 `cache_.invalidate()`，而 `on_write`(:436) 已有按词失效。
+    所有 put/put_doc 走管线 → 混合负载缓存命中率归零。修：改调 `invalidate_terms`
+    （`ReduceJob.fields[].terms` 已物化词集）。
+- [x] **S13-P2【高·一行级】fsync→fdatasync、O_SYNC→O_DSYNC** · `src/io/posix_file.cpp:61,30-33` — 已完成（2026-07-02）
+  - 追加写语义等价，每次持久化省一次 journal 元数据提交。**不改变 WAL 持久性契约**。
+- [ ] **S13-P3【高】`bool_search` posting 快照二次深拷贝** · `src/bm25/inverted.cpp:1378-1387`
+  - 热词 ~1.7MB/词/查询。修：move 迭代器或 `vector<TermPostings*>`。
+- [ ] **S13-P4【高】`search_wand` 前置全量快照+live 填充抵消 BMW 跳块** · `inverted.cpp:505-528`
+  - 修：搬 `ensure_block`(:1063-1076) 惰性按块填充过去 + shared_ptr 引用替代拷贝。
+- [ ] **S13-P5【中】HNSW int8 每查询/插入堆分配 + 标量 round；精排逐候选 madvise**
+    · `hnsw.cpp:914,728,746,933-940`、`detail/int8_kernels.hpp:104-114`
+  - 修：thread_local `quantize_into` + SIMD round；madvise 候选按地址区间合并。
+- [ ] **S13-P6【中】`DataFile::fold` 每记录 2 次 pread** · `src/fileops/data_file.cpp:285-311`
+  - 影响 merge 全部输入扫描 + 搜索模式恢复。修：照搬 `hint_file.cpp:87-188` 256KiB 分块 refill。
+- [ ] **S13-P7【中】HNSW 读者 copy_neighbors 对节点自旋锁 atomic exchange → hub 缓存行乒乓**
+    · `hnsw.cpp:384-395`。修：per-node seqlock 或单写者 release 发布。**bench 无并发搜索项，
+    需先补 `->Threads(N)` 基准**（元发现：`bench/hnsw_bench.cpp` 仅单线程）。
+- [ ] **S13-P8【中批】** 短语打分每候选堆分配(`inverted.cpp:779`)、短语驱动词未选最稀有(:745)、
+    新词全量 vocab 重建(:299-308)、`search_fuzzy` 串行(:1484 vs wildcard 并行:904)、
+    `on_delete` 重分词(`search_layer.cpp:576`)、`search_fields` 死代码+逐词独立 top-k(:813-824)、
+    `invalidate_terms` O(条目×词)(`search_cache.cpp:67-88`)、meta filter 每候选拷 blob
+    (`search_layer.cpp:221`)、C `bitcask_get` 双拷贝(`bitcask_c.cpp:300`)、merge `pending_`
+    全量驻留内存(`merger.cpp:56-68`)、hint 启动读两遍(`hint_file.cpp:193-232`)、
+    `rebuild_hnsw` 串行重插(`search_layer.cpp:99-110`)、`save_vec_payload` 全量物化
+    (`hnsw.cpp:1056`)、FOR 编解码逐 bit(:1651)。逐项独立评估落地。
+
+### D. 功能缺口（对照已规划 C4/C5/C6 与已否决项排除后）
+
+- [ ] **S13-D1【P0·M】`put_batch` 原子批量写**：`write_buffered/flush_batch` 基建已有（仅 merge 用）；
+  批内一次 fsync 语义=单次提交，兼容 WAL 契约；keydir 延后统一 apply（C1 模式）。+ C API。
+- [ ] **S13-D2【P0·M】C API 暴露 meta filter**：`search_text/vector/hybrid` 的 `MetaFilter*` C 端
+  完全缺失（V5 核心能力 FFI 不可用）。`bitcask_meta_filter_t`（条件数组 + And/Or 映射
+  `meta_filter.hpp` 全部算子）。
+- [ ] **S13-D3【P0·S】`search_text_highlight` 提上 Cask 门面 + 修 README 漂移**：README 宣称有，
+  `cask.hpp` 实无（仅 SearchLayer）。用 `run_search_one` 骨架包一层。
+- [ ] **S13-D4【P0·S】前缀扫描**：`CaskIter::start` / `parallel_scan` 加可选 `key_prefix` 过滤。
+- [ ] **S13-D5【P1·M】per-key TTL**：DocValue v3 已版本化，加可选 expiry；merge policy 同步扩展。
+- [ ] **S13-D6【P1·M】备份/热拷贝 API**：sealed 不可变 → 关 active + hardlink 清单 + 释放锁。
+- [ ] **S13-D7【P1·S/M】日志回调 hook**：`CaskOptions::log_fn`（open-time 不可变）+ C 函数指针；
+  ~10 处静默失败点插桩。
+- [ ] **S13-D8【P2·S】统计 API 扩展**：StatusInfo 加搜索侧（postings/HNSW 内存/cache 命中率）。
+- [ ] **S13-D9【P2·M】查询语言括号嵌套+引号短语子句**：QueryNode 已树形，parser 升级递归下降。
+- [ ] **S13-D10【P2·S/M】搜索分页 offset + total 估计**；**S13-D11【P2·S】HNSW M/ef_construction 透传**。
+
+> **建议执行顺序**：F1（数据丢失）→ F2（永久挂起）→ F3/F4（TSan 干净化）→ P1/P2（两处
+> 一行级高收益）→ M1 → F5/F6 → F7+D3（文档漂移一并修）→ 其余按价值推进。
+> F1/F3 均配 build-tsan 并发压测验证。

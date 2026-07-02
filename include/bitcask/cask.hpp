@@ -564,9 +564,14 @@ public:
 
     // 在指定文件上跑 merge。files 为空时先调 needs_merge。caller 自己负责
     // 外部调度 / 锁——这个方法只是把 run_merge 包了一层。
-    // 线程安全: 是（前提是只在 merge_only 模式下被调用，调用方持
-    // bitcask.merge.lock；read_write Cask 上的并发 merge() 与 put/remove 不
-    // 兼容——上层应避免）。
+    // 线程安全（S13-F7 统一措辞，对齐 thread-safety.md §7.6）:
+    //   - KV 路径：merge 与并发 put/remove/get 安全——keydir 重定位是条件
+    //     CAS（newest_put=false，S13-F1），收尾对 stuck 文件跳过 unlink 兜底；
+    //     get 对 merge unlink 窗口有一次重查重试（S13-F5）。
+    //   - 索引模式（enable_search）注意：merge 内的 compact/ckpt 序列化会
+    //     遍历 tbb::concurrent_hash_map，与 reducer 并发插入新词的组合
+    //     TBB 不保证安全（S13-F6，待修）——修复落地前，索引模式下建议
+    //     避免 merge 与高频 put_doc 并发。
     // 锁要求: caller 须保证同一 dirname 上同时仅一次 merge 在跑。
     [[nodiscard]] std::expected<merge::MergeStats, CaskFault>
     merge(std::vector<std::string> files = {}, std::uint32_t now_sec = 0);
@@ -602,7 +607,11 @@ private:
     // 时旧对象由在途读者的引用计数续命,不会析构正在被 pread 的对象。
     std::shared_ptr<fileops::DataFile> active_data_;
     std::unique_ptr<fileops::HintFile> active_hint_;
-    std::uint32_t active_file_id_ = 0;
+    // S13-F4：atomic——写者仅持 write_mu_、读者（read_file/needs_merge/
+    // CaskIter::pin_files）持 read_cache_mu_ 或无锁，双方无公共锁、无
+    // happens-before。值仅作提示（读到陈旧值最多多开一次文件句柄，良性），
+    // relaxed 序即可，但按 C++ 内存模型必须是原子避免 UB/TSan 报告。
+    std::atomic<std::uint32_t> active_file_id_{0};
     // P4 组提交计数：自上次 fsync 以来的写次数。写路径单线程（caller 串行），
     // 无需原子。sync_every_n>0 时由 maybe_group_commit() 维护。
     std::uint32_t writes_since_sync_ = 0;
@@ -674,6 +683,27 @@ private:
     // 队列提供：队列满（capacity 10240）时 submit 内部的 push 阻塞写线程，
     // 自然限速，避免任务无限堆积撑爆内存。
     void submit_index_task(IndexTask task);
+
+    // S13-F2: ord 泄漏守卫。写路径 alloc_ord 后、真任务提交前的任何错误
+    // return 都必须给该 ord 补一条 Skip——否则 reducer 的 next_apply_ord
+    // 出现永久空洞，此后 flush/merge/close 全部在 flush_cv_ 上永久阻塞
+    // （一次 ENOSPC 即卡死句柄）。析构时未 disarm 则自动提交 Skip；
+    // 真任务（Add/Delete）或等价 Skip 已覆盖该 ord 后调 disarm()。
+    struct OrdSkipGuard {
+        Cask* cask;
+        std::uint64_t ord;
+        bool armed = true;
+        OrdSkipGuard(Cask* c, std::uint64_t o) : cask(c), ord(o) {}
+        OrdSkipGuard(const OrdSkipGuard&) = delete;
+        OrdSkipGuard& operator=(const OrdSkipGuard&) = delete;
+        void disarm() { armed = false; }
+        ~OrdSkipGuard() {
+            if (armed) {
+                cask->submit_index_task(
+                    IndexTask::make(IndexOp::Skip, {}, ord, {}, 0, 0, 0, 0, 0));
+            }
+        }
+    };
 
     // S7-4: 批量搜索公共骨架（去 search_*_batch 三方法的重复）。
     //   ① 空批早退；② 一次 prepare_search()（flush，覆盖全批）；

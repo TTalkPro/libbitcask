@@ -4,6 +4,7 @@
 #include <sys/resource.h>  // ::getrlimit, RLIMIT_NOFILE（S12-1 read 句柄默认上限）
 #include <unistd.h>     // ::getpid, ::unlink
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -212,9 +213,21 @@ void CaskIter::pin_files() {
     pinned_files_.clear();
     auto scan = fileops::scan_dir(parent_->dirname_);
     if (!scan) return;
+    // S13-F3：active_data_（shared_ptr 对象本体）与并发 roll/close 的
+    // reset/赋值构成数据竞争——对同一 shared_ptr 对象的并发读写非线程安全，
+    // 必须在 read_cache_mu_ 下拍快照（写点均持其独占锁）。快照略陈旧无害：
+    // pin 是 best-effort，漏 pin 的文件由 next() 退回 parent_->read_file。
+    bool has_active = false;
+    std::uint32_t active_fid = 0;
+    {
+        std::shared_lock lk(parent_->read_cache_mu_);
+        has_active = static_cast<bool>(parent_->active_data_);
+        active_fid =
+            parent_->active_file_id_.load(std::memory_order_relaxed);
+    }
     for (const auto& e : *scan) {
         const auto fid = static_cast<std::uint32_t>(e.tstamp);
-        if (parent_->active_data_ && fid == parent_->active_file_id_) continue;
+        if (has_active && fid == active_fid) continue;
         // P6:迭代器 pin 句柄经 read() 读(非 read_mmap),且只用于本次 fold——
         // 不 mmap(避免无谓映射;fd 开着,read() pread 正常)。
         auto df = fileops::DataFile::open(e.data_path,
@@ -1300,6 +1313,9 @@ Cask::write_and_keydir(std::span<const std::byte> key,
     // keydir 认为已存在更新的 entry → roll_active 切新文件后重试一次。
     if (auto r = roll_active(); !r) return std::unexpected(r.error());
     const std::uint64_t ord2 = keydir_->alloc_ord();
+    // S13-F2: ord2 守卫——重试路径任何失败 return 都补 Skip，防 reorder
+    // buffer 空洞（ord 本身由 caller 的守卫覆盖）。
+    OrdSkipGuard g2(this, ord2);
     auto w2 = active_data_->write(format::RecordType::kDoc, tstamp, ord2,
                                    key, encoded);
     if (!w2) return std::unexpected(io_fault(w2.error().errnum,
@@ -1312,12 +1328,15 @@ Cask::write_and_keydir(std::span<const std::byte> key,
                              w2->total_size, w2->offset, tstamp,
                              0, true, 0, 0, ord2);
     if (pr2 == keydir::PutResult::kAlreadyExists) {
+        // S13-F2: ord 与 ord2 均未被真任务覆盖——g2 析构补 ord2 的 Skip，
+        // ord 由 caller 守卫补。
         return std::unexpected(err(CaskError::kAlreadyExists));
     }
     // S6-P1: 原始 ord 在 keydir 竞争中落败（kAlreadyExists），数据已写入但
     // keydir 未收录。发 Skip 填充 ord 空洞，防 reorder buffer stall。
     // 必须在 caller 提交 ord2 的真任务之前提交（队列 FIFO 保序）。
     submit_index_task(IndexTask::make(IndexOp::Skip, {}, ord, {}, 0, 0, 0, 0, 0));
+    g2.disarm();  // S13-F2: ord2 将由 caller 的真任务（Add）覆盖
     return PersistedRecord{ord2, w2->offset, w2->total_size, active_file_id_};
 }
 
@@ -1372,6 +1391,12 @@ Cask::prepare_vector(std::span<const float> input,
 std::expected<GetResultView, CaskFault>
 Cask::get(std::span<const std::byte> key) {
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
+    // S13-F5：get 与并发 merge 收尾之间有窗口——本线程先查 keydir 拿到旧定位，
+    // merge 随即把该 key CAS 到新文件并 unlink 旧文件（O10 的同临界区 erase+
+    // unlink 只保护已持缓存句柄的读者，保护不了「先查 keydir、后 open」的
+    // 读者），read_file lazy open 得 ENOENT。此时 keydir 已指向新文件——
+    // 重查 keydir 重试一次必命中；重试仍失败才是真 I/O 错误。
+    for (int attempt = 0; ; ++attempt) {
     auto entry = keydir_->get(bytes_to_view(key));
     if (!entry) return std::unexpected(err(CaskError::kNotFound));
 
@@ -1383,8 +1408,11 @@ Cask::get(std::span<const std::byte> key) {
     }
 
     auto df = read_file(entry->file_id);
-    if (!df) return std::unexpected(err(CaskError::kIo,
-        "open file_id=" + std::to_string(entry->file_id)));
+    if (!df) {
+        if (attempt == 0) continue;  // S13-F5: merge 窗口，重查 keydir 重试
+        return std::unexpected(err(CaskError::kIo,
+            "open file_id=" + std::to_string(entry->file_id)));
+    }
 
     // P6:sealed mmap 命中 → 零拷贝(无 syscall,直读 page cache)。GetResultView
     // 持 df 的 shared_ptr 锚定映射,view 生命内映射不撤(即便并发 merge unlink)。
@@ -1421,6 +1449,7 @@ Cask::get(std::span<const std::byte> key) {
     }
 
     return GetResultView(std::move(*rec));
+    }  // for (attempt)
 }
 
 std::expected<GetResult, CaskFault>
@@ -1599,6 +1628,7 @@ Cask::put(std::span<const std::byte> key,
 
     // 分配 ord + 编码 DocValue（text 段 = 原始 value）
     const std::uint64_t ord = keydir_->alloc_ord();
+    OrdSkipGuard og(this, ord);  // S13-F2: 失败路径补 Skip 防 reorder stall
     // ⑩ thread_local 复用：encode_doc_value 是 append 语义，clear 后重填；
     // 并发 put 各线程独占一份，消除每次 put 的 encoded 堆分配。
     thread_local std::vector<std::byte> encoded;
@@ -1610,6 +1640,9 @@ Cask::put(std::span<const std::byte> key,
 
     auto persisted = write_and_keydir(key, encoded, tstamp, ord);
     if (!persisted) return std::unexpected(persisted.error());
+    // S13-F2: 成功 ⇒ ord 已有归宿——非重试路径由下面的 Add 覆盖
+    // （persisted->ord == ord），重试路径由 write_and_keydir 内部 Skip 覆盖。
+    og.disarm();
     submit_index_task(IndexTask::make(
         IndexOp::Add, bytes_to_view(key), persisted->ord,
         std::string_view(reinterpret_cast<const char*>(value.data()),
@@ -1658,6 +1691,7 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
     if (auto r = roll_active_if_needed(about); !r) return std::unexpected(r.error());
 
     const std::uint64_t ord = keydir_->alloc_ord();
+    OrdSkipGuard og(this, ord);  // S13-F2: 失败路径补 Skip 防 reorder stall
     auto w = active_data_->write(format::RecordType::kTombstone, tstamp,
                                   ord, key, tomb_value);
     if (!w) return std::unexpected(io_fault(w.error().errnum));
@@ -1666,6 +1700,7 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
                                   /*tomb*/ true, key);
     if (!h) return std::unexpected(io_fault(h.error().errnum));
     keydir_->remove(bytes_to_view(key), tstamp);
+    og.disarm();  // S13-F2: ord 由下面的 Delete 任务（或非池路径直调）覆盖
     if (index_pool_) {
         submit_index_task(IndexTask::make(
             IndexOp::Delete, bytes_to_view(key), ord, {}, 0, 0, 0, tstamp, 0));
@@ -1742,6 +1777,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     auto vec_out = *vec_result;
 
     const std::uint64_t ord = keydir_->alloc_ord();
+    OrdSkipGuard og(this, ord);  // S13-F2: 失败路径补 Skip 防 reorder stall
     std::vector<std::byte> encoded;
     encoded.reserve(doc.text.size() + doc.meta.size() +
                     vec_out.size() * sizeof(float) + 16);
@@ -1759,6 +1795,8 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
 
     auto persisted = write_and_keydir(key, encoded, tstamp, ord);
     if (!persisted) return std::unexpected(persisted.error());
+    // S13-F2: 成功 ⇒ ord 已有归宿（同 put：Add 或内部 Skip）。
+    og.disarm();
     auto task = IndexTask::make(
         IndexOp::Add, bytes_to_view(key), persisted->ord,
         std::string_view(reinterpret_cast<const char*>(doc.text.data()),
@@ -2005,7 +2043,9 @@ Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
     if (is_closed()) return {};  // S11-W3：needs=false
     auto info = keydir_->info();
     const std::uint32_t exclude_id =
-        opts_.merge_only ? merger_writer_active_id_ : active_file_id_;
+        opts_.merge_only
+            ? merger_writer_active_id_
+            : active_file_id_.load(std::memory_order_relaxed);
     std::vector<merge::FileStatus> summary;
     summary.reserve(info.fstats.size());
     for (const auto& f : info.fstats) {
@@ -2125,6 +2165,10 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
     // elsewhere. So nothing in the keydir references these inputs anymore —
     // safe to unlink the .data + .hint pair and drop the fstats entry.
     //
+    // S13-F1 纵深防御：run_merge 复查后仍有 keydir entry 指向的输入文件
+    // （stuck，正常流程不可达）绝不能 unlink——否则这些 key 指向已删文件，
+    // 重启后永久丢失。跳过其 unlink/erase/trim，留给下轮 merge 重试。
+    //
     // erase + unlink 收在同一临界区(O10):放锁后再 unlink 会留一个窗口,
     // 持旧 keydir 快照的在途 get 在 unlink 后 lazy reopen 报 ENOENT 假失败。
     // 持锁做文件系统操作可接受——merge 收尾是冷路径。被 erase 的句柄若仍
@@ -2139,8 +2183,13 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         for (const auto& path : files) {
             std::error_code ec;
             if (auto t = fileops::parse_data_tstamp(path)) {
-                read_files_.erase(static_cast<std::uint32_t>(*t));
-                trimmed_ids.push_back(static_cast<std::uint32_t>(*t));
+                const auto fid = static_cast<std::uint32_t>(*t);
+                if (std::binary_search(r->stuck_file_ids.begin(),
+                                       r->stuck_file_ids.end(), fid)) {
+                    continue;  // S13-F1: keydir 仍引用，保留文件与句柄
+                }
+                read_files_.erase(fid);
+                trimmed_ids.push_back(fid);
             }
             std::filesystem::remove(path, ec);
             std::filesystem::remove(fileops::mk_hint_filename(path), ec);
