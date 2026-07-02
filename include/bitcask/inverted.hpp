@@ -392,8 +392,16 @@ public:
         // shard.inverted 与 vocab_ 的不一致窗口由 vocab_dirty_ 兜住：
         //   写者 add_doc 后 release-store true；
         //   读者 ensure_vocab 入口 acquire-load，true 才付写锁重建。
+        //
+        // S13-F6：重建不再遍历 inverted（tbb::concurrent_hash_map 的遍历与
+        // 并发插入不兼容，rehash 可致迭代器失效——而 ensure_vocab 跑在查询
+        // 线程、与 reducer 的 add_doc 插入并发）。改为增量：add_doc 插入新
+        // term 时在 vocab_mtx_ 下 push 进 vocab_delta_，重建 = vocab_ ∪ delta
+        // （term 一经插入永不从 map 删除——compact 有意保留空 posting list，
+        // 该不变量是本设计的前提）。
         mutable std::shared_mutex vocab_mtx_;
         mutable std::shared_ptr<const std::vector<std::string>> vocab_;
+        mutable std::vector<std::string> vocab_delta_;  // 由 vocab_mtx_ 保护
         mutable std::atomic<bool> vocab_dirty_{true};
     };
 

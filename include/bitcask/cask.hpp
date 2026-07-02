@@ -522,6 +522,18 @@ public:
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_wildcard(std::string_view pattern, std::size_t k);
 
+    // S13-D3：带高亮的 BM25 文本搜索。README 功能表早已宣称本方法，此前却
+    // 只在 SearchLayer 上——绕过门面调用会丢失 closed_ fail-fast 与
+    // prepare_search flush（near-real-time 可见性）契约。命中含高亮片段
+    // （SearchHitEx.highlights），截取策略由 opts 控制。
+    // 线程安全: **是**（并发读安全，同 search_text）。
+    struct HighlightSearchResult {
+        std::vector<search::SearchHitEx> hits;
+    };
+    [[nodiscard]] std::expected<HighlightSearchResult, CaskFault>
+    search_text_highlight(std::string_view query, std::size_t k = 10,
+                          const search::HighlightOptions& opts = {});
+
     // 同义词词典在 **open 时**经 `CaskOptions::synonym_map` 配置（不可变、并发安全）；
     // 运行期 setter 已移除（曾是配置项里唯一的竞态源，见 docs/design/thread-safety.md）。
 
@@ -564,14 +576,13 @@ public:
 
     // 在指定文件上跑 merge。files 为空时先调 needs_merge。caller 自己负责
     // 外部调度 / 锁——这个方法只是把 run_merge 包了一层。
-    // 线程安全（S13-F7 统一措辞，对齐 thread-safety.md §7.6）:
+    // 线程安全（S13-F7 统一措辞，对齐 thread-safety.md §7.6）: **是**。
     //   - KV 路径：merge 与并发 put/remove/get 安全——keydir 重定位是条件
     //     CAS（newest_put=false，S13-F1），收尾对 stuck 文件跳过 unlink 兜底；
     //     get 对 merge unlink 窗口有一次重查重试（S13-F5）。
-    //   - 索引模式（enable_search）注意：merge 内的 compact/ckpt 序列化会
-    //     遍历 tbb::concurrent_hash_map，与 reducer 并发插入新词的组合
-    //     TBB 不保证安全（S13-F6，待修）——修复落地前，索引模式下建议
-    //     避免 merge 与高频 put_doc 并发。
+    //   - 索引模式：merge 内的 compact/ckpt 序列化经 RunFn 任务在 reducer
+    //     线程内执行（S13-F6，同 RebuildHnsw 先例）——concurrent_hash_map
+    //     的遍历与 add_doc 插入始终同线程串行，无并发窗口。
     // 锁要求: caller 须保证同一 dirname 上同时仅一次 merge 在跑。
     [[nodiscard]] std::expected<merge::MergeStats, CaskFault>
     merge(std::vector<std::string> files = {}, std::uint32_t now_sec = 0);

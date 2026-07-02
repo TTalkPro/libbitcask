@@ -72,6 +72,12 @@ enum class IndexOp : std::uint8_t {
     // 重试路径浪费了原始 ord），单写线程发 Skip 填洞，使 reorder buffer 的
     // next_apply_ord 不永久 stall。P2 并行 map 下保证 ord 序重建。
     Skip,
+    // S13-F6：在 reducer 线程内执行任意回调（携带 ord，经 reorder buffer 与
+    // Add/Delete 同序串行）。用途：merge 路径的 compact / checkpoint 序列化
+    // ——这些操作遍历 tbb::concurrent_hash_map，与 reducer 的 add_doc 插入
+    // 并发不安全（TBB 不支持遍历与插入并发），必须与 RebuildHnsw 一样搬进
+    // reducer 单写者上下文。
+    RunFn,
     Sentinel,    // 停止信号，每个 map worker 各消费一个后退出（见 stop()）
 };
 
@@ -109,6 +115,8 @@ struct IndexTask {
     // 与 put_doc 同 unique_lock 路径——filter 读取时 meta 与定位/live
     // 已原子一致。make() 不接管:caller 在构造后按需 assign。
     std::vector<std::byte> meta;
+    // S13-F6：RunFn 任务的回调（其余 op 为空）。在 reducer 线程按 ord 序执行。
+    std::function<void()> fn;
 
     [[nodiscard]] std::string_view key() const noexcept {
         return std::string_view(buf).substr(0, key_len);
@@ -218,9 +226,14 @@ struct DeleteEntry {
 };
 struct SkipEntry {};
 struct RebuildEntry {};
+// S13-F6：reducer 线程内执行的任意回调（compact / ckpt 序列化等需要
+// 单写者上下文的操作）。
+struct RunFnEntry {
+    std::function<void()> fn;
+};
 
 using ReorderEntry = std::variant<ReduceEntry, OnWriteEntry, DeleteEntry,
-                                  SkipEntry, RebuildEntry>;
+                                  SkipEntry, RebuildEntry, RunFnEntry>;
 
 // ---- S6-P2: Pipeline callbacks ----
 // MapFn（并行 TBB）：IndexTask → ReduceEntry。Add + 非空 fields 走此路径。
@@ -454,6 +467,10 @@ private:
             push_reorder(lane, task.ord, ReorderEntry{std::move(de)});
         } else if (task.op == IndexOp::Skip) {
             push_reorder(lane, task.ord, ReorderEntry{SkipEntry{}});
+        } else if (task.op == IndexOp::RunFn) {
+            // S13-F6：回调经 reorder buffer 送 reducer 线程按 ord 序执行。
+            push_reorder(lane, task.ord,
+                         ReorderEntry{RunFnEntry{std::move(task.fn)}});
         } else {
             // on_write（单 text 路径）：构造 OnWriteEntry 跨线程交给 reducer。
             OnWriteEntry owe;

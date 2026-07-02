@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <queue>
 #include <string>
@@ -296,11 +297,20 @@ auto InvertedIndex::ensure_vocab(std::size_t shard_idx) const
         return shard.vocab_;
     }
 
+    // S13-F6：不再遍历 shard.inverted（本函数跑在查询线程，与 reducer 的
+    // add_doc 插入并发——TBB 明确不支持遍历与插入并发）。重建 = 旧 vocab_
+    // ∪ vocab_delta_（add_doc/deserialize 对每个新 term 在 vocab_mtx_ 下
+    // 记账；term 永不从 map 删除，故并集恒等于 map 的 key 全集）。
     std::vector<std::string> keys;
-    keys.reserve(shard.inverted.size());
-    for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
-        keys.push_back(it->first);
+    keys.reserve((shard.vocab_ ? shard.vocab_->size() : 0) +
+                 shard.vocab_delta_.size());
+    if (shard.vocab_) {
+        keys.insert(keys.end(), shard.vocab_->begin(), shard.vocab_->end());
     }
+    keys.insert(keys.end(),
+                std::make_move_iterator(shard.vocab_delta_.begin()),
+                std::make_move_iterator(shard.vocab_delta_.end()));
+    shard.vocab_delta_.clear();
     std::sort(keys.begin(), keys.end());
     keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 
@@ -342,8 +352,14 @@ void InvertedIndex::add_doc(
         }
         pl.note_appended();  // S10.6：增量封块，在线索引也吃 WAND 块跳跃
         // V6.3.1：仅当新 key 时标脏——旧 term 的 posting list 增删不影响已排序
-        // 的 vocab_ 集合。无条件置 true 也能正确工作（只是浪费一次重建）。
+        // 的 vocab_ 集合。
+        // S13-F6：新 term 同时在 vocab_mtx_ 下记入 delta（ensure_vocab 改为
+        // 增量并集，不再遍历 map）。delta push 必须先于 dirty=true 的
+        // release-store（同锁内），保证「读者观察到 dirty ⟹ delta 可见」。
+        // 仅新 term 付锁开销，稳态（词表收敛后）零额外成本。
         if (is_new_term) {
+            std::unique_lock vlock(shard.vocab_mtx_);
+            shard.vocab_delta_.push_back(term);
             shard.vocab_dirty_.store(true, std::memory_order_release);
         }
     }
@@ -1375,9 +1391,17 @@ auto InvertedIndex::bool_search(
     auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
+    // S13-P3：move 而非拷贝——TermPostings 持整条 posting 扁平快照
+    // （ords u64 + tfs u32 + live + dls，热词可达 MB 级），此处之后
+    // must_tps/should_tps 不再使用，深拷贝纯属浪费。
     std::vector<TermPostings> all_tps;
-    all_tps.insert(all_tps.end(), must_tps.begin(), must_tps.end());
-    all_tps.insert(all_tps.end(), should_tps.begin(), should_tps.end());
+    all_tps.reserve(must_tps.size() + should_tps.size());
+    all_tps.insert(all_tps.end(),
+                   std::make_move_iterator(must_tps.begin()),
+                   std::make_move_iterator(must_tps.end()));
+    all_tps.insert(all_tps.end(),
+                   std::make_move_iterator(should_tps.begin()),
+                   std::make_move_iterator(should_tps.end()));
 
     std::sort(all_tps.begin(), all_tps.end(), [](const auto& a, const auto& b) {
         return a.term < b.term;
@@ -1565,9 +1589,8 @@ void InvertedIndex::finalize_all_postings() {
             if (!shard.inverted.find(acc, key)) continue;
             mutable_pl(acc->second).finalize();
         }
-        // V6.3.1：finalize 不改 key 集合，但 conservative 标脏——下次搜索重建
-        // vocab_ 即可（rebuild 廉价，N log N 一遍）。
-        shard.vocab_dirty_.store(true, std::memory_order_release);
+        // S13-F6：finalize 不改 key 集合，vocab_ 无需失效（曾保守标脏；
+        // 增量 delta 设计下 dirty+空 delta 只会触发一次无谓的全量拷贝重建）。
     }
 }
 
@@ -1622,8 +1645,9 @@ auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_t
             }
         }
         // V6.3.1：compact 不删 key（保留空 posting list 是有意设计——避免与
-        // 写者抢桶锁），但保守标脏便于下次搜索重建 vocab_。
-        shard.vocab_dirty_.store(true, std::memory_order_release);
+        // 写者抢桶锁）。S13-F6：key 集不变 ⇒ vocab_ 无需失效（曾保守标脏；
+        // 增量 delta 设计下只会触发无谓的全量拷贝重建）。该「key 永不删除」
+        // 不变量是 vocab delta 设计的前提，改动此处需同步重审 ensure_vocab。
     }
     return compacted;
 }
@@ -1855,19 +1879,27 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
 }
 
 auto InvertedIndex::load(std::string_view path) -> bool {
-    auto* f = std::fopen(std::string(path).c_str(), "rb");
+    // S13-M3：RAII 持 FILE*——fsz 来自可能损坏的文件，resize 可抛 bad_alloc，
+    // 裸 FILE* 在异常路径泄漏。
+    struct FileCloser {
+        void operator()(std::FILE* fp) const noexcept {
+            if (fp) std::fclose(fp);
+        }
+    };
+    std::unique_ptr<std::FILE, FileCloser> f(
+        std::fopen(std::string(path).c_str(), "rb"));
     if (!f) return false;
-    std::fseek(f, 0, SEEK_END);
-    const long fsz = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
+    std::fseek(f.get(), 0, SEEK_END);
+    const long fsz = std::ftell(f.get());
+    std::fseek(f.get(), 0, SEEK_SET);
     std::vector<std::byte> buf;
     bool rd = (fsz >= 0);
     if (rd) {
         buf.resize(static_cast<std::size_t>(fsz));
         rd = buf.empty() ||
-             std::fread(buf.data(), 1, buf.size(), f) == buf.size();
+             std::fread(buf.data(), 1, buf.size(), f.get()) == buf.size();
     }
-    std::fclose(f);
+    f.reset();
     if (!rd) return false;
     return deserialize(buf);
 }
@@ -2044,6 +2076,10 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
                     max_indexed_ord_.store(p.ord, std::memory_order_relaxed);
                 }
             }
+            // S13-F6：load 单线程（reducer 车道尚未注册），但 ensure_vocab
+            // 已改为「vocab_ ∪ delta」增量重建、不再遍历 map——load 直填的
+            // key 必须同步记入 delta，否则首次 wildcard/fuzzy 查询拿到空词典。
+            shard.vocab_delta_.push_back(term);
             shard.inverted.emplace(std::move(term), std::make_shared<PostingList>(std::move(pl)));
         }
     }

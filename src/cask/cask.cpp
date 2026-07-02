@@ -562,6 +562,10 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
                         // no-op（ord 空洞填充）
                     } else if constexpr (std::is_same_v<T, RebuildEntry>) {
                         search.rebuild_hnsw();
+                    } else if constexpr (std::is_same_v<T, RunFnEntry>) {
+                        // S13-F6：merge 路径的 compact/ckpt 序列化等在此
+                        // （reducer 单写者上下文）执行。
+                        if (e.fn) e.fn();
                     }
                 }, entry);
             },
@@ -1880,6 +1884,19 @@ Cask::search_text(std::string_view query, std::size_t k,
         [&] { return search_->search_text(query, k, nullptr, filter); });
 }
 
+// S13-D3：带高亮搜索——补门面缺口（README 宣称有而 Cask 无）。骨架与
+// run_search_one 相同（closed fail-fast → prepare_search flush → 内核 →
+// 错误翻译），仅命中类型是 SearchHitEx、无法复用泛型骨架。
+std::expected<Cask::HighlightSearchResult, CaskFault>
+Cask::search_text_highlight(std::string_view query, std::size_t k,
+                            const search::HighlightOptions& opts) {
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
+    if (auto g = prepare_search(); !g) return std::unexpected(g.error());
+    auto hits = search_->search_text_highlight(query, k, opts);
+    if (!hits) return std::unexpected(search_fault(hits.error()));
+    return HighlightSearchResult{std::move(*hits)};
+}
+
 // S7-4: 批量搜索公共骨架。空批早退 → 一次 prepare_search（flush 覆盖全批）→
 // 可选向量配置校验 → N 条查询并发跑共享 Search 池，保序写各自结果槽。
 std::vector<std::expected<TextSearchResult, CaskFault>>
@@ -2133,9 +2150,29 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         // 不依赖压实)。这里只按阈值压实死 posting 回收空间——不读数据文件、
         // 不重分词,省掉 merge 的全量 NLP 重算。死占比 < 阈值的 posting list
         // 留待后续 merge 累积到阈值再压。
+        //
+        // S13-F6：compact 遍历 tbb::concurrent_hash_map——与 reducer 的
+        // add_doc 插入并发不安全（上面的 flush 只排干已提交任务，§7.6 允许
+        // 的并发 put 在 flush 之后仍持续提交）。故封装成 RunFn 任务经
+        // reorder buffer 在 reducer 线程内执行（同 RebuildHnsw 先例），
+        // 恢复 S12-2「遍历只发生在 reducer」的不变量。
         constexpr double kMergeCompactDeadRatio = 0.2;
-        search_->compact(kMergeCompactDeadRatio);
-        search_->compact_index_chunks();
+        if (index_pool_ && index_lane_) {
+            IndexTask t;
+            t.op  = IndexOp::RunFn;
+            t.ord = keydir_->alloc_ord();
+            t.fn  = [this] {
+                search_->compact(kMergeCompactDeadRatio);
+                search_->compact_index_chunks();
+            };
+            index_pool_->submit(index_lane_, std::move(t));
+            index_pool_->flush(index_lane_);
+        } else {
+            // 无索引池（理论不可达：search_ 存在则 lane 已注册）——退化为
+            // 调用线程直跑，行为同旧版。
+            search_->compact(kMergeCompactDeadRatio);
+            search_->compact_index_chunks();
+        }
 
         // V4:merge 后同步重建 HNSW（物理清除死节点）。重建在 IndexPool
         // worker 内执行（单写者约束），flush 阻塞等待完成。
@@ -2155,9 +2192,23 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         // P14e:统一分段 search.ckpt 替代旧多文件保存。
         // best-effort:checkpoint 保存失败非致命——下次 open 回退到全量 fold 重建
         // 搜索索引（仅慢一次启动，数据不受影响），故显式忽略返回值而非让 merge 失败。
+        // S13-F6：序列化同样遍历 concurrent_hash_map（且 truncate_wal 与
+        // reducer 的 WAL 追加竞争）——经 RunFn 在 reducer 线程执行。
+        // 水位在提交时取值（by-value 捕获），语义与旧版一致。
         const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
-        (void)search_->save_search_ckpt(search_ckpt,
-                                        keydir_->peek_next_ord());
+        if (index_pool_ && index_lane_) {
+            IndexTask t;
+            t.op  = IndexOp::RunFn;
+            t.ord = keydir_->alloc_ord();
+            t.fn  = [this, search_ckpt, wm = keydir_->peek_next_ord()] {
+                (void)search_->save_search_ckpt(search_ckpt, wm);
+            };
+            index_pool_->submit(index_lane_, std::move(t));
+            index_pool_->flush(index_lane_);
+        } else {
+            (void)search_->save_search_ckpt(search_ckpt,
+                                            keydir_->peek_next_ord());
+        }
     }
 
     // After run_merge, every live record from `files` has been CAS-rewritten

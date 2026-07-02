@@ -1446,12 +1446,19 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - 读者先查 keydir 拿旧定位、后 open；merge 恰在其间 CAS+unlink → ENOENT 假失败。
     O10 的同临界区只保护已持句柄读者。修：`read_file` ENOENT 时重查 keydir 重试一次。
 
-- [ ] **S13-F6【Medium】tbb::concurrent_hash_map 并发插入时被整表遍历（TBB 不支持）**
+- [x] **S13-F6【Medium】tbb::concurrent_hash_map 并发插入时被整表遍历（TBB 不支持）** — 已完成（2026-07-02）
     · `src/bm25/inverted.cpp:196-205,299-305`、`src/search/search_layer.cpp:1192-1226,1259-1262`
   - `ensure_vocab`（查询线程）/ `compact`·`serialize`·`truncate_wal`（merge/close 线程）遍历
     与 reducer `add_doc` 插入并发；merge 路径破坏 S12-2「compact 仅在 reducer 内」前提。
-  - 修：compact/ckpt 序列化封装成 IndexTask 经 reorder buffer 在 reducer 线程执行
-    （沿 RebuildHnsw 先例）；vocab 改增量维护或遍历持分片排他锁。
+  - 落地：① 新增 `IndexOp::RunFn` + `RunFnEntry`（thread_pool.hpp）——任意回调经
+    reorder buffer 在 reducer 线程按 ord 序执行；`Cask::merge` 的 compact/
+    compact_index_chunks 与 save_search_ckpt（含 truncate_wal）改经 RunFn 提交+flush，
+    恢复 S12-2「遍历只在 reducer」不变量（close 路径本就在 unregister flush 之后，安全）。
+    ② `ensure_vocab` 改增量：Shard 加 `vocab_delta_`（vocab_mtx_ 保护），add_doc 新词
+    时记账（仅新词付锁，稳态零成本），重建 = vocab_ ∪ delta、不再遍历 map；deserialize
+    直填路径同步记 delta；compact/finalize 的保守标脏移除（key 永不删除的不变量已注明）。
+  - 验证：新增 `CaskDocValueTest.VocabConcurrentNewTermsAndMergeNoRace`（2 wildcard
+    读者 + 400 新词写者 + 中途 merge；plain 验证 vocab 正确性，TSan 作竞态护栏）。
 
 - [x] **S13-F7【文档】`cask.hpp:566-570`（merge 与 put 不兼容）与 `cask.hpp:16-18` / thread-safety.md §7.6（安全）自相矛盾** — 已完成（2026-07-02）
   - 统一为：KV 路径安全（F1/F5 已修）；索引模式注明 F6 未修前建议避免 merge 与高频 put_doc 并发。
@@ -1461,10 +1468,13 @@ W4 ✅（parallel_scan 并行全表扫描）。
 - [x] **S13-M1【中】`bitcask_iter_next_batch` 错误中途 return -1 泄漏已填充条目** — 已完成（2026-07-02，错误分支逐条 free + 头文件契约注明）
     · `c_api/bitcask_c.cpp:725-769`、契约 `bitcask_c.h:486-494`
   - 修：错误分支 return 前对 `entries[0..count-1]` 逐条 `bitcask_iter_entry_free` 等价清理。
-- [ ] **S13-M2【低】C API malloc/strdup 返回值未检查（OOM → nullptr memcpy）+ extern "C" 未隔离异常**
+- [x] **S13-M2【低】C API malloc/strdup 返回值未检查（OOM → nullptr memcpy）+ extern "C" 未隔离异常** — 已完成（2026-07-02）
     · `bitcask_c.cpp:98-106,139-161,306,702-715,746-757,840-843`；全部导出函数缺 try/catch
-  - 修：统一 `try/catch(...) → BITCASK_ERR_IO` 包裹 + alloc 检查（或明示 OOM abort 契约）。
-- [ ] **S13-M3【低·异常路径】5 处 fopen 与 fclose 间 vector 分配可抛 → FILE* 泄漏**
+  - 落地：31 个导出函数统一 `guarded`/try-catch 包裹（bad_alloc→ENOMEM、std::exception
+    →detail 带 what()、其余→unexpected exception，均 BITCASK_ERR_IO）；`to_search_result`/
+    `fill_get_result`/`fill_iter_entry`（新抽 helper，消 iter_next/next_batch 重复）/
+    `needs_merge` 全部 malloc/strdup 检查 + 半成品清理；C API 测试通过。
+- [x] **S13-M3【低·异常路径】5 处 fopen 与 fclose 间 vector 分配可抛 → FILE* 泄漏** — 已完成（2026-07-02，5 处全改 `unique_ptr<FILE, FileCloser>`；migrate.cpp 复用 field_schema 的 detail::FileCloser，其余局部定义）
     · `keydir.cpp:1242`、`hnsw.cpp:1318`、`inverted.cpp:1866`、`inverted_wal.cpp:409`、`migrate.cpp:46`
   - 修：照搬库内既有 `unique_ptr<FILE, FileCloser>` 模式（`field_schema.hpp:47` 先例）。
 - [ ] **S13-M4【信息】`fstats_` 按 file_id 下标永不收缩**（长寿进程缓慢增长）· `keydir.cpp:196-200,254`
@@ -1478,7 +1488,7 @@ W4 ✅（parallel_scan 并行全表扫描）。
     （`ReduceJob.fields[].terms` 已物化词集）。
 - [x] **S13-P2【高·一行级】fsync→fdatasync、O_SYNC→O_DSYNC** · `src/io/posix_file.cpp:61,30-33` — 已完成（2026-07-02）
   - 追加写语义等价，每次持久化省一次 journal 元数据提交。**不改变 WAL 持久性契约**。
-- [ ] **S13-P3【高】`bool_search` posting 快照二次深拷贝** · `src/bm25/inverted.cpp:1378-1387`
+- [x] **S13-P3【高】`bool_search` posting 快照二次深拷贝** · `src/bm25/inverted.cpp:1378-1387` — 已完成（2026-07-02，make_move_iterator + reserve；all_tps 构建后 must/should_tps 不再使用）
   - 热词 ~1.7MB/词/查询。修：move 迭代器或 `vector<TermPostings*>`。
 - [ ] **S13-P4【高】`search_wand` 前置全量快照+live 填充抵消 BMW 跳块** · `inverted.cpp:505-528`
   - 修：搬 `ensure_block`(:1063-1076) 惰性按块填充过去 + shared_ptr 引用替代拷贝。
@@ -1506,8 +1516,10 @@ W4 ✅（parallel_scan 并行全表扫描）。
 - [ ] **S13-D2【P0·M】C API 暴露 meta filter**：`search_text/vector/hybrid` 的 `MetaFilter*` C 端
   完全缺失（V5 核心能力 FFI 不可用）。`bitcask_meta_filter_t`（条件数组 + And/Or 映射
   `meta_filter.hpp` 全部算子）。
-- [ ] **S13-D3【P0·S】`search_text_highlight` 提上 Cask 门面 + 修 README 漂移**：README 宣称有，
-  `cask.hpp` 实无（仅 SearchLayer）。用 `run_search_one` 骨架包一层。
+- [x] **S13-D3【P0·S】`search_text_highlight` 提上 Cask 门面 + 修 README 漂移** — 已完成（2026-07-02）
+  - `Cask::search_text_highlight`（closed fail-fast + prepare_search flush + search_fault
+    翻译，返回 `HighlightSearchResult{vector<SearchHitEx>}`）；README 第 29 行宣称从此为真。
+  - 测试：`SearchTextHighlightViaCaskFacade`（端到端高亮片段 + close 后 kClosed）。
 - [ ] **S13-D4【P0·S】前缀扫描**：`CaskIter::start` / `parallel_scan` 加可选 `key_prefix` 过滤。
 - [ ] **S13-D5【P1·M】per-key TTL**：DocValue v3 已版本化，加可选 expiry；merge policy 同步扩展。
 - [ ] **S13-D6【P1·M】备份/热拷贝 API**：sealed 不可变 → 关 active + hardlink 清单 + 释放锁。

@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <filesystem>
 #include <vector>
 
@@ -36,29 +37,35 @@ std::uint64_t be_u64(const std::byte* p) {
     return v;
 }
 
+// S13-M3：RAII 持 FILE*（复用 field_schema.hpp 的 detail::FileCloser）——
+// buf 分配（大小来自文件）与 unexpected 的 string 拼接均可抛，裸 FILE*
+// 在异常路径泄漏。
 std::expected<std::vector<std::byte>, std::string>
 read_all(const fs::path& path) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::unique_ptr<std::FILE, detail::FileCloser> f(
+        std::fopen(path.c_str(), "rb"));
     if (!f) return std::unexpected("cannot open " + path.string());
-    std::fseek(f, 0, SEEK_END);
-    const long sz = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
+    std::fseek(f.get(), 0, SEEK_END);
+    const long sz = std::ftell(f.get());
+    std::fseek(f.get(), 0, SEEK_SET);
     std::vector<std::byte> buf(sz > 0 ? static_cast<std::size_t>(sz) : 0);
     const bool ok =
-        buf.empty() || std::fread(buf.data(), 1, buf.size(), f) == buf.size();
-    std::fclose(f);
+        buf.empty() ||
+        std::fread(buf.data(), 1, buf.size(), f.get()) == buf.size();
+    f.reset();
     if (!ok) return std::unexpected("short read " + path.string());
     return buf;
 }
 
 std::expected<void, std::string>
 write_all(const fs::path& path, std::span<const std::byte> bytes) {
-    std::FILE* f = std::fopen(path.c_str(), "wb");
+    std::unique_ptr<std::FILE, detail::FileCloser> f(
+        std::fopen(path.c_str(), "wb"));
     if (!f) return std::unexpected("cannot create " + path.string());
     const bool ok =
         bytes.empty() ||
-        std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
-    std::fclose(f);
+        std::fwrite(bytes.data(), 1, bytes.size(), f.get()) == bytes.size();
+    f.reset();
     if (!ok) return std::unexpected("write failed " + path.string());
     return {};
 }

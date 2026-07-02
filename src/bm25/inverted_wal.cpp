@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <memory>
 
 namespace bitcask::bm25 {
 
@@ -374,19 +375,26 @@ bool apply_entry(const std::uint8_t* data, std::size_t len,
 int InvertedWal::replay(InvertedIndex& target) const {
     if (!file_) return 0;
 
-    std::FILE* input = std::fopen(path_.c_str(), "rb");
-    if (!input) return -1;
+    // S13-M3：RAII 持 FILE*——下方 payload.resize 可抛（len 有 kWalMaxPayload
+    // 上界，风险小，仍统一 RAII），且省去各早退分支的手工 fclose。
+    struct FileCloser {
+        void operator()(std::FILE* fp) const noexcept {
+            if (fp) std::fclose(fp);
+        }
+    };
+    std::unique_ptr<std::FILE, FileCloser> input_owner(
+        std::fopen(path_.c_str(), "rb"));
+    if (!input_owner) return -1;
+    std::FILE* input = input_owner.get();
 
     // V6.3.3:校验 8 字节文件头(magic + version)。magic 不匹配视为非 WAL
     // 文件(旧格式/随机文件),返回 -1 拒绝整文件——不考虑向后兼容。
     std::uint32_t magic = 0, version = 0;
     if (std::fread(&magic, 4, 1, input) != 1 ||
         std::fread(&version, 4, 1, input) != 1) {
-        std::fclose(input);
         return -1;
     }
     if (magic != kWalMagic || version != kWalVersion) {
-        std::fclose(input);
         return -1;
     }
 
@@ -425,7 +433,7 @@ int InvertedWal::replay(InvertedIndex& target) const {
         ++count;
         last_good += kWalLenPrefix + len + kWalCrcSuffix;
     }
-    std::fclose(input);
+    input_owner.reset();  // 截断前须已关闭（S13-M3：RAII 化后显式提前关）
 
     if (corrupted) {
         // 截断修复:丢掉损坏尾巴。失败不致命——下次 replay 仍会在同一

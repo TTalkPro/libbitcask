@@ -38,10 +38,32 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
 - **文档矛盾订正（S13-F7）**：`cask.hpp` merge 线程安全注释与 thread-safety.md
   §7.6 统一（KV 路径安全；索引模式注明 S13-F6 未修前的并发注意事项）。
 
-### Fixed（内存）
+- **tbb::concurrent_hash_map 遍历与并发插入的竞态（S13-F6）**：TBB 不支持遍历与
+  插入并发（rehash 可致迭代器失效），但 `ensure_vocab` 在查询线程、merge 的
+  compact/ckpt 序列化在调用线程遍历，均与 reducer 的 `add_doc` 插入并发。修复：
+  ① 新增 `IndexOp::RunFn`——merge 路径的 compact/`compact_index_chunks`/
+  `save_search_ckpt`（含 truncate_wal）经 reorder buffer 在 reducer 线程内执行
+  （同 RebuildHnsw 先例）；② vocab 侧表改增量维护（`vocab_delta_`，add_doc 仅
+  新词付锁记账），重建不再遍历 map。`Cask::merge` 线程安全注释同步更新为
+  索引模式亦安全。新增回归测试 `VocabConcurrentNewTermsAndMergeNoRace`。
+
+### Fixed（内存 / C API 健壮性）
 
 - **C API `bitcask_iter_next_batch` 错误中途泄漏（S13-M1）**：返回 -1 前现已释放
   已填充条目的 key/value malloc 缓冲（契约在头文件注明：错误时调用方无需 free）。
+- **extern "C" 边界异常隔离（S13-M2）**：31 个导出函数统一 try/catch——C++ 异常
+  穿越 C 栈帧是 UB（通常 terminate），现翻译为 `BITCASK_ERR_IO` + fault 详情
+  （bad_alloc→ENOMEM）。所有 malloc/strdup 现已检查返回值，OOM 时清理半成品
+  并报错（此前直接对 nullptr memcpy）。
+- **5 处 FILE\* 异常路径泄漏（S13-M3）**：keydir 快照 / HNSW / 倒排 / WAL replay /
+  migrate 的加载函数改用 `unique_ptr<FILE, FileCloser>` RAII——文件大小来自可能
+  损坏的输入，缓冲分配可抛 bad_alloc。
+
+### Added
+
+- **`Cask::search_text_highlight` 门面方法（S13-D3）**：README 功能表宣称已久但
+  实际只在 SearchLayer 上（绕过门面丢失 closed fail-fast 与 flush 可见性契约）。
+  现补上门面（返回 `HighlightSearchResult`，命中含高亮片段），README 与代码对齐。
 
 ### Performance
 
@@ -50,10 +72,13 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
   路径 `on_write` 对齐，用文档词集调 `invalidate_terms`。
 - **`fdatasync` 替代 `fsync`、`O_DSYNC` 替代 `O_SYNC`（S13-P2）**：追加写下持久性
   语义等价，每次持久化省一笔元数据 journal 提交（ext4/xfs 可观）。WAL 契约不变。
+- **`bool_search` 消除 posting 快照二次深拷贝（S13-P3）**：must/should 的
+  `TermPostings`（热词可达 MB 级扁平快照）合入评分数组时改 move（原为整体拷贝，
+  每个含 SHOULD/MUST_NOT 的查询都付）。
 
-**验证**：Debug（clang）全量 490/490（489+1 新回归）；TSan 并发相关 109 项全过
-（`ThreadCountIndependentOfLibCount` 为 TSan 环境既有失败，干净树同样失败，与本
-批无关）；Release 构建干净。
+**验证**：Debug（clang）全量 492/492（489 既有 + 3 新回归）；TSan 并发相关 111 项
+全过（`ThreadCountIndependentOfLibCount` 为 TSan 环境既有失败，干净树同样失败，
+与本批无关）；C API 测试通过；Release 构建干净。
 
 ## [3.1.0] - 2026-07-01
 

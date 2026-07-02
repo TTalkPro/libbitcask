@@ -12,6 +12,7 @@
 #  define BITCASK_VERSION_STRING "0.0.0-unknown"
 #endif
 
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -74,6 +75,52 @@ void to_c_error(const bitcask::CaskFault& f, bitcask_fault_t* out) {
     snprintf(out->detail, BITCASK_DETAIL_MAX, "%s", f.detail.c_str());
 }
 
+// S13-M2：extern "C" 边界异常隔离。C++ 异常穿越 C 栈帧是 UB（通常直接
+// terminate）；bad_alloc（含内部 string/vector 分配失败）与任何意外异常
+// 在此翻译为 BITCASK_ERR_IO + fault 详情。
+bitcask_error_t fault_from_exception(bitcask_fault_t* fault) noexcept {
+    try {
+        throw;
+    } catch (const std::bad_alloc&) {
+        if (fault) {
+            fault->code = BITCASK_ERR_IO;
+            fault->errnum = ENOMEM;
+            snprintf(fault->detail, BITCASK_DETAIL_MAX, "out of memory");
+        }
+    } catch (const std::exception& e) {
+        if (fault) {
+            fault->code = BITCASK_ERR_IO;
+            fault->errnum = 0;
+            snprintf(fault->detail, BITCASK_DETAIL_MAX,
+                     "unexpected exception: %s", e.what());
+        }
+    } catch (...) {
+        if (fault) {
+            fault->code = BITCASK_ERR_IO;
+            fault->errnum = 0;
+            snprintf(fault->detail, BITCASK_DETAIL_MAX,
+                     "unexpected exception");
+        }
+    }
+    return BITCASK_ERR_IO;
+}
+
+template <typename Fn>
+bitcask_error_t guarded(bitcask_fault_t* fault, Fn&& fn) noexcept {
+    try {
+        return fn();
+    } catch (...) {
+        return fault_from_exception(fault);
+    }
+}
+
+void set_oom_fault(bitcask_fault_t* fault) {
+    if (!fault) return;
+    fault->code = BITCASK_ERR_IO;
+    fault->errnum = ENOMEM;
+    snprintf(fault->detail, BITCASK_DETAIL_MAX, "out of memory");
+}
+
 meta::VectorMetric to_cpp_vector_metric(bitcask_vector_metric_t m) {
     switch (m) {
         case BITCASK_VECTOR_METRIC_NONE:    return meta::VectorMetric::kNone;
@@ -94,16 +141,30 @@ text::AnalyzerType to_cpp_analyzer_type(bitcask_analyzer_type_t t) {
     return text::AnalyzerType::Ngram;
 }
 
-void to_search_result(bitcask::TextSearchResult&& src, bitcask_search_result_t** out) {
+// S13-M2：malloc/strdup 检查——OOM 时释放半成品并返回 false（此前直接
+// 解引用 nullptr）。失败时 *out 保持 NULL。
+bool to_search_result(bitcask::TextSearchResult&& src, bitcask_search_result_t** out) {
     auto* r = static_cast<bitcask_search_result_t*>(std::malloc(sizeof(bitcask_search_result_t)));
+    if (!r) return false;
     r->count = src.hits.size();
-    r->hits = static_cast<bitcask_search_hit_t*>(std::malloc(sizeof(bitcask_search_hit_t) * r->count));
+    r->hits = static_cast<bitcask_search_hit_t*>(std::malloc(sizeof(bitcask_search_hit_t) * (r->count ? r->count : 1)));
+    if (!r->hits) {
+        std::free(r);
+        return false;
+    }
     for (std::size_t i = 0; i < r->count; ++i) {
         r->hits[i].key = strdup(src.hits[i].key.c_str());
+        if (!r->hits[i].key) {
+            for (std::size_t j = 0; j < i; ++j) std::free(r->hits[j].key);
+            std::free(r->hits);
+            std::free(r);
+            return false;
+        }
         r->hits[i].ord = src.hits[i].ord;
         r->hits[i].score = src.hits[i].score;
     }
     *out = r;
+    return true;
 }
 
 // 把 C++ 批量搜索的 n 个 expected 物化为 malloc 的 n 元结果数组（S12-5）。三种批量
@@ -118,7 +179,12 @@ bitcask_error_t fill_batch_results(
     bool fault_set = false;
     for (size_t i = 0; i < batch.size(); ++i) {
         if (batch[i]) {
-            to_search_result(std::move(*batch[i]), &arr[i]);
+            // S13-M2：OOM 时该槽保持 NULL（calloc 已清零），fault 回填。
+            if (!to_search_result(std::move(*batch[i]), &arr[i]) &&
+                !fault_set) {
+                set_oom_fault(fault);
+                fault_set = true;
+            }
         } else {
             arr[i] = nullptr;
             if (!fault_set && fault) {
@@ -131,32 +197,47 @@ bitcask_error_t fill_batch_results(
     return BITCASK_OK;
 }
 
-void fill_get_result(const bitcask::GetResult& src, bitcask_get_result_t* out) {
-    if (src.value.empty()) {
-        out->value.data = nullptr;
-        out->value.size = 0;
-    } else {
+// S13-M2：malloc 检查——OOM 时释放已分配段并返回 false（此前直接
+// memcpy 到 nullptr）。
+bool fill_get_result(const bitcask::GetResult& src, bitcask_get_result_t* out) {
+    out->value.data = nullptr;
+    out->value.size = 0;
+    out->meta.data = nullptr;
+    out->meta.size = 0;
+    out->vector = nullptr;
+    out->vector_len = 0;
+
+    auto cleanup = [out]() {
+        if (out->value.data) std::free(const_cast<void*>(out->value.data));
+        if (out->meta.data) std::free(const_cast<void*>(out->meta.data));
+        if (out->vector) std::free(const_cast<float*>(out->vector));
+    };
+
+    if (!src.value.empty()) {
         auto* p = std::malloc(src.value.size());
+        if (!p) return false;
         std::memcpy(p, src.value.data(), src.value.size());
         out->value.data = p;
         out->value.size = src.value.size();
     }
 
-    if (src.meta.empty()) {
-        out->meta.data = nullptr;
-        out->meta.size = 0;
-    } else {
+    if (!src.meta.empty()) {
         auto* p = std::malloc(src.meta.size());
+        if (!p) {
+            cleanup();
+            return false;
+        }
         std::memcpy(p, src.meta.data(), src.meta.size());
         out->meta.data = p;
         out->meta.size = src.meta.size();
     }
 
-    if (src.vector.empty()) {
-        out->vector = nullptr;
-        out->vector_len = 0;
-    } else {
+    if (!src.vector.empty()) {
         auto* p = std::malloc(sizeof(float) * src.vector.size());
+        if (!p) {
+            cleanup();
+            return false;
+        }
         std::memcpy(p, src.vector.data(), sizeof(float) * src.vector.size());
         out->vector = static_cast<const float*>(p);
         out->vector_len = src.vector.size();
@@ -164,6 +245,43 @@ void fill_get_result(const bitcask::GetResult& src, bitcask_get_result_t* out) {
 
     out->tstamp = src.tstamp;
     out->ord = src.ord;
+    return true;
+}
+
+// S13-M2：iter entry 填充公共 helper（iter_next / iter_next_batch 共用），
+// malloc 检查——OOM 时释放半成品并返回 false。
+bool fill_iter_entry(const bitcask::CaskIter::Entry& e,
+                     bitcask_iter_entry_t* entry) {
+    entry->key.data = nullptr;
+    entry->key.size = 0;
+    entry->value.data = nullptr;
+    entry->value.size = 0;
+    if (!e.key.empty()) {
+        auto* p = std::malloc(e.key.size());
+        if (!p) return false;
+        std::memcpy(p, e.key.data(), e.key.size());
+        entry->key.data = p;
+        entry->key.size = e.key.size();
+    }
+    if (!e.value.empty()) {
+        auto* p = std::malloc(e.value.size());
+        if (!p) {
+            std::free(const_cast<void*>(entry->key.data));
+            entry->key.data = nullptr;
+            entry->key.size = 0;
+            return false;
+        }
+        std::memcpy(p, e.value.data(), e.value.size());
+        entry->value.data = p;
+        entry->value.size = e.value.size();
+    }
+    entry->tstamp = e.tstamp;
+    entry->file_id = e.file_id;
+    entry->offset = e.offset;
+    entry->total_sz = e.total_sz;
+    entry->is_tombstone = e.is_tombstone ? 1 : 0;
+    entry->ord = e.ord;
+    return true;
 }
 
 bitcask::Cask* as_cpp_cask(bitcask_t* h) {
@@ -213,6 +331,8 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
                                           const bitcask_options_t* opts,
                                           bitcask_t** out,
                                           bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -280,19 +400,26 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
     wrapper->cask = std::move(*result);
     *out = reinterpret_cast<bitcask_t*>(wrapper.release());
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API void bitcask_close(bitcask_t* cask) {
+    // S13-M2：extern "C" 异常隔离（无可报告通道，吞掉）
+    try {
     if (!cask) return;
     // adopt 回 unique_ptr：close() 后作用域结束自动 delete（与 open 的 release 对称）。
     std::unique_ptr<bitcask_impl_t> owned(reinterpret_cast<bitcask_impl_t*>(cask));
     owned->cask->close();
+    } catch (...) {
+    }
 }
 
 BITCASK_API bitcask_error_t bitcask_get(bitcask_t* cask,
                                           bitcask_slice_t key,
                                           bitcask_get_result_t** out,
                                           bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -304,9 +431,14 @@ BITCASK_API bitcask_error_t bitcask_get(bitcask_t* cask,
     }
 
     auto* r = static_cast<bitcask_get_result_t*>(std::malloc(sizeof(bitcask_get_result_t)));
-    fill_get_result(*result, r);
+    if (!r || !fill_get_result(*result, r)) {  // S13-M2：OOM 检查
+        std::free(r);
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
     *out = r;
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
@@ -314,6 +446,8 @@ BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
                                           bitcask_slice_t value,
                                           uint32_t tstamp,
                                           bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask) return BITCASK_ERR_INVALID_OPTION;
 
     std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
@@ -324,12 +458,15 @@ BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
         return to_c_error_kind(result.error().kind);
     }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_delete(bitcask_t* cask,
                                              bitcask_slice_t key,
                                              uint32_t tstamp,
                                              bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask) return BITCASK_ERR_INVALID_OPTION;
 
     std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
@@ -339,10 +476,13 @@ BITCASK_API bitcask_error_t bitcask_delete(bitcask_t* cask,
         return to_c_error_kind(result.error().kind);
     }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_sync(bitcask_t* cask,
                                            bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask) return BITCASK_ERR_INVALID_OPTION;
     auto result = as_cpp_cask(cask)->sync();
     if (!result) {
@@ -350,10 +490,13 @@ BITCASK_API bitcask_error_t bitcask_sync(bitcask_t* cask,
         return to_c_error_kind(result.error().kind);
     }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_close_write_file(bitcask_t* cask,
                                                         bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask) return BITCASK_ERR_INVALID_OPTION;
     auto result = as_cpp_cask(cask)->close_write_file();
     if (!result) {
@@ -361,6 +504,7 @@ BITCASK_API bitcask_error_t bitcask_close_write_file(bitcask_t* cask,
         return to_c_error_kind(result.error().kind);
     }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API void bitcask_get_result_free(bitcask_get_result_t* result) {
@@ -376,6 +520,8 @@ BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
                                               const bitcask_doc_input_t* doc,
                                               uint32_t tstamp,
                                               bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !doc) return BITCASK_ERR_INVALID_OPTION;
 
     std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
@@ -394,6 +540,7 @@ BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
         return to_c_error_kind(result.error().kind);
     }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_search_text(bitcask_t* cask,
@@ -401,6 +548,8 @@ BITCASK_API bitcask_error_t bitcask_search_text(bitcask_t* cask,
                                                    size_t k,
                                                    bitcask_search_result_t** out,
                                                    bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -409,8 +558,12 @@ BITCASK_API bitcask_error_t bitcask_search_text(bitcask_t* cask,
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);
     }
-    to_search_result(std::move(*result), out);
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_search_text_batch(bitcask_t* cask,
@@ -419,6 +572,8 @@ BITCASK_API bitcask_error_t bitcask_search_text_batch(bitcask_t* cask,
                                                       size_t k,
                                                       bitcask_search_result_t*** out_results,
                                                       bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !out_results) return BITCASK_ERR_INVALID_OPTION;
     *out_results = nullptr;
     if (n == 0) return BITCASK_OK;
@@ -434,6 +589,7 @@ BITCASK_API bitcask_error_t bitcask_search_text_batch(bitcask_t* cask,
     // C++ 返回 n 个 expected（每查询一个结果或错误）。
     return fill_batch_results(as_cpp_cask(cask)->search_text_batch(qv, k),
                               n, out_results, fault);
+    });
 }
 
 BITCASK_API void bitcask_search_result_batch_free(bitcask_search_result_t** results,
@@ -448,6 +604,8 @@ BITCASK_API bitcask_error_t bitcask_search_phrase(bitcask_t* cask,
                                                       size_t k,
                                                       bitcask_search_result_t** out,
                                                       bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -456,8 +614,12 @@ BITCASK_API bitcask_error_t bitcask_search_phrase(bitcask_t* cask,
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);
     }
-    to_search_result(std::move(*result), out);
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_bool_search(bitcask_t* cask,
@@ -465,6 +627,8 @@ BITCASK_API bitcask_error_t bitcask_bool_search(bitcask_t* cask,
                                                    size_t k,
                                                    bitcask_search_result_t** out,
                                                    bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -473,8 +637,12 @@ BITCASK_API bitcask_error_t bitcask_bool_search(bitcask_t* cask,
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);
     }
-    to_search_result(std::move(*result), out);
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_search_fields(bitcask_t* cask,
@@ -482,6 +650,8 @@ BITCASK_API bitcask_error_t bitcask_search_fields(bitcask_t* cask,
                                                       size_t k,
                                                       bitcask_search_result_t** out,
                                                       bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -490,8 +660,12 @@ BITCASK_API bitcask_error_t bitcask_search_fields(bitcask_t* cask,
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);
     }
-    to_search_result(std::move(*result), out);
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_search_near(bitcask_t* cask,
@@ -500,6 +674,8 @@ BITCASK_API bitcask_error_t bitcask_search_near(bitcask_t* cask,
                                                    size_t k,
                                                    bitcask_search_result_t** out,
                                                    bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -508,8 +684,12 @@ BITCASK_API bitcask_error_t bitcask_search_near(bitcask_t* cask,
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);
     }
-    to_search_result(std::move(*result), out);
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_search_fuzzy(bitcask_t* cask,
@@ -518,6 +698,8 @@ BITCASK_API bitcask_error_t bitcask_search_fuzzy(bitcask_t* cask,
                                                      uint32_t max_edit_distance,
                                                      bitcask_search_result_t** out,
                                                      bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -526,8 +708,12 @@ BITCASK_API bitcask_error_t bitcask_search_fuzzy(bitcask_t* cask,
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);
     }
-    to_search_result(std::move(*result), out);
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_search_wildcard(bitcask_t* cask,
@@ -535,6 +721,8 @@ BITCASK_API bitcask_error_t bitcask_search_wildcard(bitcask_t* cask,
                                                         size_t k,
                                                         bitcask_search_result_t** out,
                                                         bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !pattern || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -543,8 +731,12 @@ BITCASK_API bitcask_error_t bitcask_search_wildcard(bitcask_t* cask,
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);
     }
-    to_search_result(std::move(*result), out);
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_search_vector(bitcask_t* cask,
@@ -554,6 +746,8 @@ BITCASK_API bitcask_error_t bitcask_search_vector(bitcask_t* cask,
                                                       size_t ef,
                                                       bitcask_search_result_t** out,
                                                       bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -563,8 +757,12 @@ BITCASK_API bitcask_error_t bitcask_search_vector(bitcask_t* cask,
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);
     }
-    to_search_result(std::move(*result), out);
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
@@ -574,6 +772,8 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
                                                       size_t k,
                                                       bitcask_search_result_t** out,
                                                       bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -587,8 +787,12 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);
     }
-    to_search_result(std::move(*result), out);
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_search_vector_batch(bitcask_t* cask,
@@ -599,6 +803,8 @@ BITCASK_API bitcask_error_t bitcask_search_vector_batch(bitcask_t* cask,
                                                         size_t ef,
                                                         bitcask_search_result_t*** out_results,
                                                         bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !out_results) return BITCASK_ERR_INVALID_OPTION;
     *out_results = nullptr;
     if (n == 0) return BITCASK_OK;
@@ -612,6 +818,7 @@ BITCASK_API bitcask_error_t bitcask_search_vector_batch(bitcask_t* cask,
     }
     return fill_batch_results(as_cpp_cask(cask)->search_vector_batch(qv, k, ef),
                               n, out_results, fault);
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
@@ -620,6 +827,8 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
                                                         size_t k,
                                                         bitcask_search_result_t*** out_results,
                                                         bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !out_results) return BITCASK_ERR_INVALID_OPTION;
     *out_results = nullptr;
     if (n == 0) return BITCASK_OK;
@@ -637,6 +846,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
     }
     return fill_batch_results(as_cpp_cask(cask)->search_hybrid_batch(qv, k),
                               n, out_results, fault);
+    });
 }
 
 // 同义词词典已改为 open 时配置（bitcask_options_t::synonym_file_path）；
@@ -657,6 +867,8 @@ BITCASK_API bitcask_error_t bitcask_iter_start(bitcask_t* cask,
                                                   int see_tombstones,
                                                   bitcask_iter_t** out,
                                                   bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
@@ -678,11 +890,14 @@ BITCASK_API bitcask_error_t bitcask_iter_start(bitcask_t* cask,
     wrapper->iter = std::move(iter);
     *out = reinterpret_cast<bitcask_iter_t*>(wrapper.release());
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API int bitcask_iter_next(bitcask_iter_t* iter,
                                     bitcask_iter_entry_t* entry,
                                     bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    try {
     if (!iter || !entry) return -1;
 
     auto result = as_cpp_iter(iter)->next();
@@ -694,38 +909,23 @@ BITCASK_API int bitcask_iter_next(bitcask_iter_t* iter,
         return 0;
     }
 
-    auto& e = **result;
-    if (e.key.empty()) {
-        entry->key.data = nullptr;
-        entry->key.size = 0;
-    } else {
-        auto* p = std::malloc(e.key.size());
-        std::memcpy(p, e.key.data(), e.key.size());
-        entry->key.data = p;
-        entry->key.size = e.key.size();
+    if (!fill_iter_entry(**result, entry)) {  // S13-M2：OOM 检查
+        set_oom_fault(fault);
+        return -1;
     }
-    if (e.value.empty()) {
-        entry->value.data = nullptr;
-        entry->value.size = 0;
-    } else {
-        auto* p = std::malloc(e.value.size());
-        std::memcpy(p, e.value.data(), e.value.size());
-        entry->value.data = p;
-        entry->value.size = e.value.size();
-    }
-    entry->tstamp = e.tstamp;
-    entry->file_id = e.file_id;
-    entry->offset = e.offset;
-    entry->total_sz = e.total_sz;
-    entry->is_tombstone = e.is_tombstone ? 1 : 0;
-    entry->ord = e.ord;
     return 1;
+    } catch (...) {
+        (void)fault_from_exception(fault);
+        return -1;
+    }
 }
 
 BITCASK_API int bitcask_iter_next_batch(bitcask_iter_t* iter,
                                           bitcask_iter_entry_t* entries,
                                           size_t max_n,
                                           bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    try {
     if (!iter || !entries || max_n == 0) return -1;
 
     std::size_t count = 0;
@@ -744,41 +944,31 @@ BITCASK_API int bitcask_iter_next_batch(bitcask_iter_t* iter,
         if (!*result) {
             break;
         }
-        auto& e = **result;
-        if (e.key.empty()) {
-            entries[count].key.data = nullptr;
-            entries[count].key.size = 0;
-        } else {
-            auto* p = std::malloc(e.key.size());
-            std::memcpy(p, e.key.data(), e.key.size());
-            entries[count].key.data = p;
-            entries[count].key.size = e.key.size();
+        if (!fill_iter_entry(**result, &entries[count])) {  // S13-M2：OOM
+            for (std::size_t i = 0; i < count; ++i) {
+                bitcask_iter_entry_free(&entries[i]);
+            }
+            set_oom_fault(fault);
+            return -1;
         }
-        if (e.value.empty()) {
-            entries[count].value.data = nullptr;
-            entries[count].value.size = 0;
-        } else {
-            auto* p = std::malloc(e.value.size());
-            std::memcpy(p, e.value.data(), e.value.size());
-            entries[count].value.data = p;
-            entries[count].value.size = e.value.size();
-        }
-        entries[count].tstamp = e.tstamp;
-        entries[count].file_id = e.file_id;
-        entries[count].offset = e.offset;
-        entries[count].total_sz = e.total_sz;
-        entries[count].is_tombstone = e.is_tombstone ? 1 : 0;
-        entries[count].ord = e.ord;
         ++count;
     }
     return static_cast<int>(count);
+    } catch (...) {
+        (void)fault_from_exception(fault);
+        return -1;
+    }
 }
 
 BITCASK_API void bitcask_iter_release(bitcask_iter_t* iter) {
+    // S13-M2：extern "C" 异常隔离（无可报告通道，吞掉）
+    try {
     if (!iter) return;
     // adopt 回 unique_ptr：release() 后作用域结束自动 delete（与创建处 release 对称）。
     std::unique_ptr<bitcask_iter_impl_t> owned(reinterpret_cast<bitcask_iter_impl_t*>(iter));
     owned->iter->release();
+    } catch (...) {
+    }
 }
 
 BITCASK_API void bitcask_iter_entry_free(bitcask_iter_entry_t* entry) {
@@ -797,6 +987,8 @@ BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
                                                   void* ctx,
                                                   size_t* out_count,
                                                   bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !fn) return BITCASK_ERR_INVALID_OPTION;
     if (out_count) *out_count = 0;
 
@@ -817,11 +1009,14 @@ BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
     }
     if (out_count) *out_count = *result;
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_status(bitcask_t* cask,
                                              bitcask_status_t* out,
                                              bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
 
     bitcask::StatusInfo info = as_cpp_cask(cask)->status();
@@ -830,11 +1025,14 @@ BITCASK_API bitcask_error_t bitcask_status(bitcask_t* cask,
     out->epoch = info.epoch;
     out->index_errors = info.index_errors;
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API bitcask_error_t bitcask_needs_merge(bitcask_t* cask,
                                                   bitcask_needs_merge_t* out,
                                                   bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
 
     bitcask::Cask::NeedsMerge result = as_cpp_cask(cask)->needs_merge();
@@ -844,11 +1042,25 @@ BITCASK_API bitcask_error_t bitcask_needs_merge(bitcask_t* cask,
         out->files = nullptr;
     } else {
         out->files = static_cast<char**>(std::malloc(sizeof(char*) * result.files.size()));
+        if (!out->files) {  // S13-M2：OOM 检查
+            out->files_count = 0;
+            set_oom_fault(fault);
+            return BITCASK_ERR_IO;
+        }
         for (std::size_t i = 0; i < result.files.size(); ++i) {
             out->files[i] = strdup(result.files[i].c_str());
+            if (!out->files[i]) {
+                for (std::size_t j = 0; j < i; ++j) std::free(out->files[j]);
+                std::free(out->files);
+                out->files = nullptr;
+                out->files_count = 0;
+                set_oom_fault(fault);
+                return BITCASK_ERR_IO;
+            }
         }
     }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API void bitcask_needs_merge_free(bitcask_needs_merge_t* nm) {
@@ -865,6 +1077,8 @@ BITCASK_API void bitcask_needs_merge_free(bitcask_needs_merge_t* nm) {
 
 BITCASK_API bitcask_error_t bitcask_merge(bitcask_t* cask,
                                             bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask) return BITCASK_ERR_INVALID_OPTION;
 
     auto result = as_cpp_cask(cask)->merge();
@@ -873,21 +1087,36 @@ BITCASK_API bitcask_error_t bitcask_merge(bitcask_t* cask,
         return to_c_error_kind(result.error().kind);
     }
     return BITCASK_OK;
+    });
 }
 
 BITCASK_API int bitcask_is_empty(bitcask_t* cask) {
+    // S13-M2：extern "C" 异常隔离
+    try {
     if (!cask) return 1;
     return as_cpp_cask(cask)->is_empty_estimate() ? 1 : 0;
+    } catch (...) {
+        return 1;
+    }
 }
 
 BITCASK_API int bitcask_is_frozen(bitcask_t* cask) {
+    // S13-M2：extern "C" 异常隔离
+    try {
     if (!cask) return 0;
     return as_cpp_cask(cask)->is_frozen() ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 BITCASK_API void bitcask_flush_index(bitcask_t* cask) {
+    // S13-M2：extern "C" 异常隔离（无可报告通道，吞掉）
+    try {
     if (!cask) return;
     as_cpp_cask(cask)->flush_index();
+    } catch (...) {
+    }
 }
 
 }

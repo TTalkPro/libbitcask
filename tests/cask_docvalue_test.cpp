@@ -280,6 +280,40 @@ TEST_F(CaskDocValueTest, SearchTextAfterPut) {
     (*c)->close();
 }
 
+// S13-D3：search_text_highlight 门面方法（README 宣称已久，本轮补上）。
+// 端到端：put 经异步管线索引 → Cask 门面高亮搜索 → 命中含片段；
+// 关闭后 fail-fast 返回 kClosed（门面契约，绕过门面直调 SearchLayer 没有）。
+TEST_F(CaskDocValueTest, SearchTextHighlightViaCaskFacade) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = sl_cfg;
+
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    const std::string_view text = "the quick brown fox jumps over the lazy dog";
+    std::vector<std::byte> key{std::byte{'k'}};
+    std::vector<std::byte> val(
+        reinterpret_cast<const std::byte*>(text.data()),
+        reinterpret_cast<const std::byte*>(text.data()) + text.size());
+    ASSERT_TRUE((*c)->put(key, val, 1000));
+
+    // 门面内部 prepare_search() 会 flush 异步索引管线，无需手动 flush。
+    auto hr = (*c)->search_text_highlight("quick fox", 10);
+    ASSERT_TRUE(hr) << "search_text_highlight failed";
+    ASSERT_EQ(hr->hits.size(), 1u);
+    EXPECT_FALSE(hr->hits[0].highlights.empty())
+        << "hit should carry highlight snippets";
+
+    (*c)->close();
+    auto closed = (*c)->search_text_highlight("quick", 10);
+    ASSERT_FALSE(closed);
+    EXPECT_EQ(closed.error().kind, bitcask::CaskError::kClosed);
+}
+
 // S8.6：put_doc 多字段 → search_fields 字段路由，端到端经 Cask（含异步 IndexTask）。
 TEST_F(CaskDocValueTest, MultiFieldPutAndSearch) {
     CaskOptions opts;
@@ -1666,6 +1700,63 @@ TEST_F(CaskDocValueTest, AutoCompactConcurrentReadersNoRace) {
     ASSERT_TRUE(sr);
     EXPECT_EQ(sr->hits.size(), static_cast<std::size_t>(K));   // 最终恰 K 篇 live
     EXPECT_LT((*c)->search()->total_postings(), 2000u);        // 有界回收
+    (*c)->close();
+}
+
+// S13-F6 回归：ensure_vocab（wildcard 查询线程）与 reducer add_doc 新词插入
+// 并发，加 merge 期 compact/ckpt 序列化（现经 RunFn 在 reducer 内执行）。
+// 修复前 ensure_vocab 在查询线程遍历 tbb::concurrent_hash_map、merge 在调用
+// 线程遍历——两者都与 reducer 插入并发（TBB 不支持，rehash 可致迭代器失效）。
+// 本测试在 TSan 构建下作为竞态护栏；plain 构建下验证 vocab 增量维护的正确性
+// （wildcard 能命中所有历史新词）。
+TEST_F(CaskDocValueTest, VocabConcurrentNewTermsAndMergeNoRace) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    opts.max_file_size = 4096;  // 滚出多个文件给 merge
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = sl_cfg;
+
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 2; ++t) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                // wildcard 走 ensure_vocab（dirty 时重建词典侧表）。
+                auto sr = (*c)->search_wildcard("term*", 20);
+                (void)sr;
+            }
+        });
+    }
+
+    // 写者：每篇文档带一个此前未见过的新词 → 持续触发 vocab delta 记账。
+    std::uint32_t ts = 1000;
+    for (int i = 0; i < 400; ++i) {
+        bitcask::DocInput doc;
+        const std::string text = "term" + std::to_string(i) + " filler";
+        doc.text = sv_bytes(text);
+        ASSERT_TRUE((*c)->put_doc(sv_bytes("k" + std::to_string(i)), doc, ts++));
+        if (i == 200) {
+            // merge 与写/查并发：compact + ckpt 序列化经 RunFn 在 reducer 执行。
+            auto mr = (*c)->merge({});
+            ASSERT_TRUE(mr);
+        }
+    }
+    stop.store(true);
+    for (auto& th : readers) th.join();
+
+    // 正确性：全部 400 个历史新词都必须进 vocab（wildcard 可枚举）。
+    (*c)->flush_index();
+    auto sr = (*c)->search_wildcard("term39?", 20);  // term390..term399
+    ASSERT_TRUE(sr);
+    EXPECT_EQ(sr->hits.size(), 10u);
+    auto sr0 = (*c)->search_wildcard("term0", 5);    // 最早的词仍在
+    ASSERT_TRUE(sr0);
+    EXPECT_EQ(sr0->hits.size(), 1u);
     (*c)->close();
 }
 

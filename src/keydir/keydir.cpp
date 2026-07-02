@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <memory>
 #include <shared_mutex>
 
 // =============================================================================
@@ -1233,15 +1234,24 @@ bool KeyDir::save_snapshot(
 
 auto KeyDir::load_snapshot(std::string_view path)
     -> std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> {
-    std::FILE* f = std::fopen(std::string(path).c_str(), "rb");
+    // S13-M3：RAII 持 FILE*——fsz 来自可能损坏的文件（可为巨值），下方
+    // vector 分配可抛 bad_alloc，裸 FILE* 在异常路径泄漏。
+    struct FileCloser {
+        void operator()(std::FILE* fp) const noexcept {
+            if (fp) std::fclose(fp);
+        }
+    };
+    std::unique_ptr<std::FILE, FileCloser> f(
+        std::fopen(std::string(path).c_str(), "rb"));
     if (!f) return std::nullopt;
-    std::fseek(f, 0, SEEK_END);
-    const long fsz = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (fsz < 16) { std::fclose(f); return std::nullopt; }
+    std::fseek(f.get(), 0, SEEK_END);
+    const long fsz = std::ftell(f.get());
+    std::fseek(f.get(), 0, SEEK_SET);
+    if (fsz < 16) return std::nullopt;
     std::vector<std::uint8_t> buf(static_cast<std::size_t>(fsz));
-    const bool rd = std::fread(buf.data(), 1, buf.size(), f) == buf.size();
-    std::fclose(f);
+    const bool rd =
+        std::fread(buf.data(), 1, buf.size(), f.get()) == buf.size();
+    f.reset();
     if (!rd) return std::nullopt;
 
     SnapCursor c{buf.data(), buf.data() + buf.size()};

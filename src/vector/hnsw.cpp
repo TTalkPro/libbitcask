@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <queue>
 #include <string>
 
@@ -1309,15 +1310,23 @@ bool HnswIndex::save(std::string_view base_path) const {
 
 bool HnswIndex::load(std::string_view base_path) {
     const std::string bp(base_path);
-    std::FILE* f = std::fopen(bp.c_str(), "rb");
+    // S13-M3：RAII 持 FILE*——fsz 来自可能损坏的文件，下方 vector 分配可抛
+    // bad_alloc，裸 FILE* 在异常路径泄漏。
+    struct FileCloser {
+        void operator()(std::FILE* fp) const noexcept {
+            if (fp) std::fclose(fp);
+        }
+    };
+    std::unique_ptr<std::FILE, FileCloser> f(std::fopen(bp.c_str(), "rb"));
     if (!f) return false;
-    std::fseek(f, 0, SEEK_END);
-    const long fsz = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (fsz < 0) { std::fclose(f); return false; }
+    std::fseek(f.get(), 0, SEEK_END);
+    const long fsz = std::ftell(f.get());
+    std::fseek(f.get(), 0, SEEK_SET);
+    if (fsz < 0) return false;
     std::vector<std::uint8_t> buf(static_cast<std::size_t>(fsz));
-    const bool rd = std::fread(buf.data(), 1, buf.size(), f) == buf.size();
-    std::fclose(f);
+    const bool rd =
+        std::fread(buf.data(), 1, buf.size(), f.get()) == buf.size();
+    f.reset();
     if (!rd) return false;
     if (!deserialize(buf)) return false;
     // V7:deserialize 之后装 payload。inmem_int8 或 count=0 不读 .vec。
