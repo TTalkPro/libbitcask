@@ -231,4 +231,55 @@ std::expected<bool, DataFileFault> HintFile::validate_trailer() {
     return crc == expected_crc;
 }
 
+// S13-P8：单遍校验 + fold（契约见头文件）。
+std::expected<bool, DataFileFault> HintFile::fold_validated(FoldFn fn) {
+    auto end = file_.seek(0, SEEK_END);
+    if (!end) return std::unexpected(io_fault(end.error()));
+    const std::uint64_t total = *end;
+    if (total < format::kHintRecordSize) return false;
+
+    // 整文件一次读入（单 I/O 遍 + 单 CRC 遍 + 内存解析）。
+    std::vector<std::byte> buf(static_cast<std::size_t>(total));
+    std::size_t got_total = 0;
+    while (got_total < buf.size()) {
+        auto r = file_.pread_into(
+            got_total, std::span(buf.data() + got_total,
+                                 buf.size() - got_total));
+        if (!r) return std::unexpected(io_fault(r.error()));
+        if (*r == 0) break;  // 短读（文件被并发截断）→ 按校验失败处理
+        got_total += *r;
+    }
+    if (got_total < buf.size()) return false;
+
+    // trailer sentinel + CRC 判定（与 validate_trailer 逐字节一致）。
+    const std::size_t body = buf.size() - format::kHintRecordSize;
+    auto trailer = codec::decode_hint_record(
+        std::span<const std::byte>(buf.data() + body, format::kHintRecordSize));
+    if (!trailer) return false;
+    if (!codec::is_hint_eof(*trailer)) return false;
+    const std::uint32_t expected_crc = trailer->total_sz;
+    const std::uint32_t crc = codec::crc32(
+        std::span<const std::byte>(buf.data(), body));
+    if (crc != expected_crc) return false;
+
+    // 内存解析逐条回调（与 fold 的记录界定一致：header 拿 key_sz 推进）。
+    std::size_t off = 0;
+    while (off + format::kHintRecordSize <= body) {
+        const auto* pb = buf.data() + off;
+        const std::uint16_t key_sz = static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(pb[4]) |
+            (static_cast<std::uint16_t>(pb[5]) << 8));
+        const std::size_t rec_size =
+            format::kHintRecordSize + static_cast<std::size_t>(key_sz);
+        if (off + rec_size > body) break;  // 尾部截断（CRC 已过，防御性）
+        auto rec = codec::decode_hint_record(
+            std::span<const std::byte>(pb, rec_size));
+        if (!rec) return std::unexpected(DataFileFault{DataFileError::kShortRead});
+        if (codec::is_hint_eof(*rec)) break;
+        fn(*rec);
+        off += rec_size;
+    }
+    return true;
+}
+
 }  // namespace bitcask::fileops

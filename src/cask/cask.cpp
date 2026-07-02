@@ -920,9 +920,9 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
             auto hf = fileops::HintFile::open(e.hint_path,
                                                 fileops::HintFile::Mode::kRead);
             if (hf) {
-                auto v = hf->validate_trailer();
-                if (v && *v) {
-                    auto fr = hf->fold([&](const auto& rec) {
+                // S13-P8：单遍校验+fold（原 validate_trailer 全文件读一遍、
+                // fold 再读一遍）。CRC 不过时回调零次，keydir 零污染。
+                auto fr = hf->fold_validated([&](const auto& rec) {
                         if (rec.tombstone) {
                             // 墓碑 hint 必须执行——否则前一个 file 里的同 key
                             // 活 entry 会被错误保留。
@@ -933,9 +933,8 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                                      static_cast<std::uint32_t>(e.tstamp), rec.total_sz, rec.offset,
                                      rec.tstamp, /*now*/ 0,
                                      /*newest*/ false, 0, 0, /*ord*/ 0);
-                    });
-                    if (fr) used_hint = true;
-                }
+                });
+                if (fr && *fr) used_hint = true;
             }
         }
         if (used_hint) return {};

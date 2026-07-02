@@ -83,6 +83,14 @@ public:
     // 线程安全: 是（仅 pread + 局部 CRC 累加）。
     [[nodiscard]] std::expected<bool, DataFileFault> validate_trailer();
 
+    // S13-P8：单遍「校验 + fold」——整文件一次读入内存，先对 trailer 前
+    // 全部字节算 CRC（与 validate_trailer 判定逐字节一致），通过才从内存
+    // 解析逐条回调 fn（fn 语义同 fold；CRC 不过时 fn 一次都不会被调）。
+    // 返回 true = 校验通过且已 fold；false = 校验不过（caller 回退
+    // fold(data)）。替代「validate_trailer 全文件读一遍 + fold 再读一遍」。
+    // 内存代价：hint 文件大小的瞬时缓冲（hint ≪ data，可接受）。
+    [[nodiscard]] std::expected<bool, DataFileFault> fold_validated(FoldFn fn);
+
     // ---- 内省 ----
     [[nodiscard]] std::string_view path() const noexcept { return path_; }
     [[nodiscard]] std::uint32_t    running_crc() const noexcept { return running_crc_; }

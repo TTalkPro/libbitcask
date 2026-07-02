@@ -1544,10 +1544,19 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - [x] `on_delete` 空缓存跳过重分词（LRU 拷原文 + NFKC + 分词全免）
   - [x] C `bitcask_get` 双拷贝 → `fill_get_result_view` 直接从零拷贝 view malloc
   - [x] 新词 vocab 全量重建 → **已被 S13-F6 的 delta 增量设计覆盖**（不再遍历 map）
-  - [ ] 剩余 8 项待做：`search_fields` 死代码+逐词 top-k、`invalidate_terms`
-    反向索引、meta filter 锁内求值、merge `pending_` 分批 apply、hint 启动
-    CRC 边读边算、`rebuild_hnsw` 并行/结构化拷贝、`save_vec_payload` 流式、
-    FOR 编解码 64-bit 窗口。
+  - [x] FOR 解码 64-bit 窗口（2026-07-02）：MSB-first 流按大端 8 字节窗口
+    一次移位+掩码取值，位级等价；bits>56 与尾部不足 8 字节回退逐 bit（越界
+    安全兜底）。编码保持原样（输出位级不变）。inverted 78/78 含 ckpt 往返。
+  - [x] `save_vec_payload` 流式（2026-07-02）：fseek 预留头区 → 逐页流式写
+    + 累计页 CRC → 回补 header+CRC 表；文件字节与旧版一致（padding 走文件
+    洞）。峰值内存从整 payload（1M×384d ≈ 1.5GB）降到头区+一页。
+  - [x] hint 启动读两遍 → 单遍 `fold_validated`（2026-07-02）：整文件一次
+    读入 → trailer CRC 判定（与 validate_trailer 逐字节一致）→ 内存解析
+    回调；CRC 不过回调零次（keydir 零污染）。内存代价 = hint 文件瞬时缓冲
+    （hint ≪ data）。
+  - [ ] 剩余 5 项待做：`search_fields` 死代码+逐词 top-k、`invalidate_terms`
+    反向索引、meta filter 锁内求值、merge `pending_` 分批 apply、
+    `rebuild_hnsw` 并行/结构化拷贝。
 
 ### D. 功能缺口（对照已规划 C4/C5/C6 与已否决项排除后）
 
