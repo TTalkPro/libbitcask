@@ -106,3 +106,28 @@ BENCHMARK(BM_Hnsw_Search)
     ->Args({100000, 256})
     ->Args({100000, 1024})  // S7-6：ef≥512 → int8 f32 精排批算走并行
     ->Unit(benchmark::kMicrosecond);
+
+// S13-P7：并发查询扩展性（此前 bench 仅单线程，读者对节点自旋锁的
+// exchange 造成的 hub 缓存行乒乓不可见；seqlock 修复后读侧零共享行写）。
+// 每线程独立查询流轮转；对账指标 = 线程数↑时单查询延迟的退化幅度。
+static void BM_Hnsw_SearchConcurrent(benchmark::State& state) {
+    const auto n = static_cast<std::size_t>(state.range(0));
+    const auto ef = static_cast<std::size_t>(state.range(1));
+    const HnswIndex& g = shared_graph(n);
+    static thread_local std::vector<float> qs;
+    // 每线程独立随机查询集（种子掺线程号防同流缓存驻留）。
+    qs = make_vecs(256, 0x9337u + static_cast<unsigned>(state.thread_index()));
+    std::size_t qi = 0;
+    for (auto _ : state) {
+        auto hits = g.search(
+            std::span<const float>(&qs[(qi++ % 256) * kDim], kDim), 10, ef);
+        benchmark::DoNotOptimize(hits);
+    }
+}
+BENCHMARK(BM_Hnsw_SearchConcurrent)
+    ->Args({100000, 64})
+    ->Threads(1)
+    ->Threads(4)
+    ->Threads(8)
+    ->Unit(benchmark::kMicrosecond)
+    ->UseRealTime();

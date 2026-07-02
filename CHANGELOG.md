@@ -115,6 +115,14 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
 
 ### Performance
 
+- **HNSW 读路径 seqlock（S13-P7）**：读者 `copy_neighbors` 此前对 per-node
+  自旋锁做 exchange（写操作）——hub 节点并发查询缓存行核间乒乓。写者单线程
+  ⟹ 改 seqlock（数据字 `atomic_ref` relaxed，TSan 干净），读侧零共享行写。
+  新增并发基准 `BM_Hnsw_SearchConcurrent`（1→4 线程延迟持平实证）。
+- **搜索杂项批（S13-P8，6/14）**：短语打分 thread_local 复用 + 最稀有词驱动
+  （分数逐字节同果）；`search_fuzzy` 并行化（镜像 wildcard）；`on_delete`
+  空缓存跳过重分词；C `bitcask_get` 消除双拷贝（直接消费零拷贝 view）；
+  vocab 全量重建由 F6 delta 设计覆盖。
 - **HNSW int8 热路径零分配 + madvise 批量化（S13-P5）**：`quantize_into` +
   thread_local 复用消除每查询/插入的 codes 堆分配；精排预取按地址区间合并，
   k=256 时 ~768 次 madvise/查询降到个位数。SIMD round 有意不做（舍入模式与

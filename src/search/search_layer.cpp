@@ -595,12 +595,20 @@ std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::u
 
     // S9.2：取被删文档词集做选择性失效。原文 LRU 命中则精确 analyze；
     // miss（冷文档被挤出）则降级为整缓存失效（安全但粗粒度）。
-    auto text = doc_texts_.get(slot->ord);  // 拷贝(C1:并发安全,见 DocTextLru)
+    // S13-P8.5：缓存本就为空时跳过整个「LRU 拷原文 + NFKC + 分词」——
+    // 失效是 no-op，重分词纯属浪费（写密集无查询负载下每删一篇省一次分词）。
     std::vector<std::string> changed_terms;
-    if (text) {
-        auto tf = analyzer_->analyze(*text);
-        changed_terms.reserve(tf.size());
-        for (auto& [term, _] : tf) changed_terms.push_back(term);
+    bool have_terms = false;
+    if (cache_.size() > 0) {
+        auto text = doc_texts_.get(slot->ord);  // 拷贝(C1:并发安全,见 DocTextLru)
+        if (text) {
+            auto tf = analyzer_->analyze(*text);
+            changed_terms.reserve(tf.size());
+            for (auto& [term, _] : tf) changed_terms.push_back(term);
+            have_terms = true;
+        }
+    } else {
+        have_terms = true;  // 空缓存：invalidate_terms(空) 即 no-op，语义等价
     }
 
     // 删除该文档在各字段的统计。多字段路径用 ord_field_lens_ 精确扣减各字段
@@ -618,10 +626,10 @@ std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::u
     }
     index_.remove(key, tomb_ord);
     doc_texts_.erase(slot->ord);
-    if (text) {
-        cache_.invalidate_terms(changed_terms);
+    if (have_terms) {
+        cache_.invalidate_terms(changed_terms);  // 空缓存时为 no-op
     } else {
-        cache_.invalidate();
+        cache_.invalidate();  // 原文 LRU miss：降级整缓存失效（S9.2）
     }
     maybe_auto_compact();  // S12-2
     return tomb_ord;

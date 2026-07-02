@@ -172,7 +172,13 @@ private:
         // adj_slabs，故 slab 增长对并发读者安全。
         std::vector<std::unique_ptr<std::uint32_t[]>> adj_slabs;
         std::size_t adj_slab_used = 0;
-        std::unique_ptr<std::atomic<std::uint8_t>[]> locks;  // per-node 自旋
+        // S13-P7：per-node seqlock 序号（偶=稳定，奇=写者更新中）。此前是
+        // 自旋锁——读者 copy_neighbors 对锁字节做 exchange（写操作），HNSW
+        // 流量高度偏向 hub 节点 → 并发查询时锁缓存行核间乒乓。写者是单
+        // 线程（reducer），无需互斥，只需发布协议：写者 ±1 包住 adj 更新，
+        // 读者双读序号一致才采信（torn 读被重试丢弃；数据字全走 atomic_ref
+        // relaxed，UB-free 且 TSan 干净）。u32 防 ABA 回绕。
+        std::unique_ptr<std::atomic<std::uint32_t>[]> locks;
 
         // V4.2:int8 量化副本(对称量化,scale = max |v[i]|)。codes 是紧
         // 排 int8,scale/sum_codes 是每向量一个标量;load/insert 时写入,

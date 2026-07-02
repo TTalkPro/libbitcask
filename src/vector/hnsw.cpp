@@ -285,13 +285,25 @@ inline void cpu_pause() {
 }
 
 // per-node 自旋锁(1 字节,test-and-set + pause;临界区 ~百 ns)。
-inline void lock_node(std::atomic<std::uint8_t>& l) {
-    while (l.exchange(1, std::memory_order_acquire) != 0) {
-        while (l.load(std::memory_order_relaxed) != 0) cpu_pause();
-    }
+// S13-P7：per-node seqlock（写者单线程 → 无写-写互斥需求）。
+// 写者：seq→奇（进入）… atomic_ref relaxed 写 adj … seq→偶（release 发布）。
+// 读者：acquire 读 seq（奇则退避）→ relaxed 读数据 → acquire fence → 复读
+// seq 一致才采信。数据字读写均经 atomic_ref → 无非原子冲突访问（TSan 干净）。
+// 注：节点发布（count release）前的 adj 初始化是单线程预发布阶段的普通写，
+// 与发布后的 atomic_ref 访问经 happens-before 分隔，不构成并发混用。
+inline void seq_write_begin(std::atomic<std::uint32_t>& seq) {
+    seq.fetch_add(1, std::memory_order_relaxed);  // → 奇
+    std::atomic_thread_fence(std::memory_order_release);
 }
-inline void unlock_node(std::atomic<std::uint8_t>& l) {
-    l.store(0, std::memory_order_release);
+inline void seq_write_end(std::atomic<std::uint32_t>& seq) {
+    seq.fetch_add(1, std::memory_order_release);  // → 偶，发布本轮更新
+}
+inline std::uint32_t adj_load(const std::uint32_t* p) {
+    return std::atomic_ref<const std::uint32_t>(*p).load(
+        std::memory_order_relaxed);
+}
+inline void adj_store(std::uint32_t* p, std::uint32_t v) {
+    std::atomic_ref<std::uint32_t>(*p).store(v, std::memory_order_relaxed);
 }
 
 // ---- visited 标记:thread_local 版本化数组 ----
@@ -318,7 +330,7 @@ HnswIndex::NodeChunk::NodeChunk(std::size_t dim, bool needs_vecs,
       ords(kChunkSize, 0),
       levels(kChunkSize, 0),
       adj(kChunkSize, nullptr),
-      locks(new std::atomic<std::uint8_t>[kChunkSize]),
+      locks(new std::atomic<std::uint32_t>[kChunkSize]),
       qcodes(needs_qcodes ? static_cast<std::size_t>(kChunkSize) * dim : 0),
       qscales(needs_qcodes ? kChunkSize : 0, 0.0f),
       qsums(needs_qcodes ? kChunkSize : 0, 0) {
@@ -384,15 +396,22 @@ std::uint32_t HnswIndex::copy_neighbors(std::uint32_t id, std::uint32_t layer,
                                         std::uint32_t* out) const {
     NodeChunk* c = chunk_of(id);
     const std::uint32_t slot = id & kChunkMask;
-    auto& lk = c->locks[slot];
-    lock_node(lk);
+    auto& seq = c->locks[slot];
     // adj 指针在节点发布(count release)前写入且永不搬迁;经 count
     // acquire 或本锁的 happens-before 链均可见。
     const std::uint32_t* a = c->adj[slot] + layer_off(layer);
-    const std::uint32_t n = a[0];
-    std::memcpy(out, a + 1, static_cast<std::size_t>(n) * sizeof(std::uint32_t));
-    unlock_node(lk);
-    return n;
+    const std::uint32_t cap = layer_cap(layer);
+    // S13-P7 seqlock 读侧：纯读、零共享行写——hub 节点并发查询不再乒乓。
+    for (;;) {
+        const std::uint32_t s1 = seq.load(std::memory_order_acquire);
+        if (s1 & 1u) { cpu_pause(); continue; }  // 写者更新中
+        const std::uint32_t n = adj_load(a);
+        if (n > cap) { cpu_pause(); continue; }  // torn count，防 out 越界
+        for (std::uint32_t i = 0; i < n; ++i) out[i] = adj_load(a + 1 + i);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (seq.load(std::memory_order_relaxed) == s1) return n;
+        // 期间有写者插入 → 丢弃重读。
+    }
 }
 
 std::uint32_t HnswIndex::greedy_closest(const float* q, std::uint32_t start,
@@ -823,25 +842,30 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
 
         // 正向边:本节点已发布,读者可能在拷它的邻居 → 持自身锁写。
         {
-            auto& my_lk = c->locks[slot];
-            lock_node(my_lk);
+            auto& my_seq = c->locks[slot];
+            seq_write_begin(my_seq);
             std::uint32_t* my = c->adj[slot] + layer_off(lay);
+            std::uint32_t cnt = adj_load(my);
             for (const auto& [d, nid] : picked) {
-                my[++my[0]] = nid;
+                adj_store(my + 1 + cnt, nid);
+                ++cnt;
             }
-            unlock_node(my_lk);
+            adj_store(my, cnt);
+            seq_write_end(my_seq);
         }
 
         // 反向边 + 超容收缩:逐邻居持其锁改其邻接。
         for (const auto& [d, nid] : picked) {
             NodeChunk* nc = chunk_of(nid);
             const std::uint32_t nslot = nid & kChunkMask;
-            auto& nlk = nc->locks[nslot];
-            lock_node(nlk);
+            auto& nseq = nc->locks[nslot];
+            seq_write_begin(nseq);
             std::uint32_t* nb = nc->adj[nslot] + layer_off(lay);
             const std::uint32_t cap = layer_cap(lay);
-            if (nb[0] < cap) {
-                nb[++nb[0]] = id;
+            const std::uint32_t ncnt = adj_load(nb);
+            if (ncnt < cap) {
+                adj_store(nb + 1 + ncnt, id);
+                adj_store(nb, ncnt + 1);
             } else {
                 // 收缩:旧邻居 + 新候选并集,以 nid 为查询点重选 cap 条。
                 // 持锁做距离计算(微秒级临界区):读者只在 copy_neighbors
@@ -851,26 +875,28 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
                 pool.clear();
                 pool.reserve(cap + 1);
                 if (i8) {
-                    for (std::uint32_t i = 1; i <= nb[0]; ++i) {
-                        pool.push_back({dist_id_int8_node(nid, nb[i]), nb[i]});
+                    for (std::uint32_t i = 1; i <= ncnt; ++i) {
+                        const std::uint32_t nn = adj_load(nb + i);
+                        pool.push_back({dist_id_int8_node(nid, nn), nn});
                     }
                     pool.push_back({dist_id_int8_node(nid, id), id});
                 } else {
                     const float* nv = vec_of(nid);
-                    for (std::uint32_t i = 1; i <= nb[0]; ++i) {
-                        pool.push_back({dist_id(nv, nb[i]), nb[i]});
+                    for (std::uint32_t i = 1; i <= ncnt; ++i) {
+                        const std::uint32_t nn = adj_load(nb + i);
+                        pool.push_back({dist_id(nv, nn), nn});
                     }
                     pool.push_back({dist_id(nv, id), id});
                 }
                 std::sort(pool.begin(), pool.end());
                 if (i8) select_neighbors_int8(pool, cap);
                 else    select_neighbors(vec_of(nid), pool, cap);
-                nb[0] = static_cast<std::uint32_t>(pool.size());
                 for (std::uint32_t i = 0; i < pool.size(); ++i) {
-                    nb[i + 1] = pool[i].second;
+                    adj_store(nb + 1 + i, pool[i].second);
                 }
+                adj_store(nb, static_cast<std::uint32_t>(pool.size()));
             }
-            unlock_node(nlk);
+            seq_write_end(nseq);
         }
     }
 
@@ -1083,57 +1109,82 @@ bool HnswIndex::save_vec_payload(std::string_view path) const {
         vecs_off = (vecs_off + kBcvpPageSize - 1) &
                    ~(static_cast<std::size_t>(kBcvpPageSize) - 1);
     }
-    const std::size_t total_size = vecs_off + total_vecs;
 
-    std::vector<std::uint8_t> buf(total_size, 0);
-    // magic "BCVP"
-    buf[0] = kBcvpMagic[0]; buf[1] = kBcvpMagic[1];
-    buf[2] = kBcvpMagic[2]; buf[3] = kBcvpMagic[3];
-    std::memcpy(buf.data() + 4,  &kBcvpVersion,    4);
-    std::memcpy(buf.data() + 8,  &cfg_.dim,        2);
-    std::memcpy(buf.data() + 10, &n,               4);
+    // S13-P8：流式写。原实现把整个 payload 在 RAM 物化（1M×384d ≈ 1.5GB
+    // 瞬时分配，checkpoint 期 RSS 翻倍）。现单遍：fseek 预留 [0, vecs_off)
+    // 头区 → 逐页流式写数据并累计每页 CRC → 回头补写 header+CRC 表。
+    // 头区与数据区之间的 padding 由文件洞承担（读出为 0），文件字节与旧版
+    // 逐字节一致。峰值内存 = 头区（~头+CRC 表）+ 一页。
+    std::vector<std::uint8_t> head(vecs_off, 0);
+    head[0] = kBcvpMagic[0]; head[1] = kBcvpMagic[1];
+    head[2] = kBcvpMagic[2]; head[3] = kBcvpMagic[3];
+    std::memcpy(head.data() + 4,  &kBcvpVersion,    4);
+    std::memcpy(head.data() + 8,  &cfg_.dim,        2);
+    std::memcpy(head.data() + 10, &n,               4);
     const std::uint64_t watermark = max_inserted_ord_.load(
         std::memory_order_relaxed);
-    std::memcpy(buf.data() + 14, &watermark,       8);
-    std::memcpy(buf.data() + 22, &kBcvpPageSize,   4);
-    std::memcpy(buf.data() + 26, &vecs_off,        8);
-    std::memcpy(buf.data() + 34, &total_vecs,      8);
-    std::memcpy(buf.data() + 42, &crc_count,       4);
+    std::memcpy(head.data() + 14, &watermark,       8);
+    std::memcpy(head.data() + 22, &kBcvpPageSize,   4);
+    std::memcpy(head.data() + 26, &vecs_off,        8);
+    std::memcpy(head.data() + 34, &total_vecs,      8);
+    std::memcpy(head.data() + 42, &crc_count,       4);
     // bytes 46..59:保留为 0(初始化已零);header_crc 落在 offset 60-63。
     const std::uint32_t header_crc = bitcask::codec::crc32(
         std::span<const std::byte>(
-            reinterpret_cast<const std::byte*>(buf.data()),
+            reinterpret_cast<const std::byte*>(head.data()),
             kBcvpHeaderCrcOff));
-    std::memcpy(buf.data() + kBcvpHeaderCrcOff, &header_crc, 4);
-
-    // vecs 数据区:从 vec_of() 拷贝。mmap 段与 hot_vecs_ 段都由 vec_of 路由。
-    for (std::uint32_t id = 0; id < n; ++id) {
-        const float* v = vec_of(id);
-        std::memcpy(buf.data() + vecs_off + static_cast<std::size_t>(id) * vec_bytes,
-                    v, vec_bytes);
-    }
-
-    // 每页 CRC32(覆盖实际数据尾页可能 < 4KB)。
-    const std::size_t crc_off = kBcvpHeaderSize;
-    for (std::uint32_t p = 0; p < crc_count; ++p) {
-        const std::size_t off = vecs_off + static_cast<std::size_t>(p) * kBcvpPageSize;
-        const std::size_t len =
-            std::min(static_cast<std::size_t>(kBcvpPageSize),
-                     total_vecs - static_cast<std::size_t>(p) * kBcvpPageSize);
-        const std::uint32_t crc = bitcask::codec::crc32(
-            std::span<const std::byte>(
-                reinterpret_cast<const std::byte*>(buf.data() + off), len));
-        std::memcpy(buf.data() + crc_off + static_cast<std::size_t>(p) * 4,
-                    &crc, 4);
-    }
+    std::memcpy(head.data() + kBcvpHeaderCrcOff, &header_crc, 4);
 
     const std::string tmp = fp + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    struct FileCloser {
+        void operator()(std::FILE* fh) const noexcept {
+            if (fh) std::fclose(fh);
+        }
+    };
+    std::unique_ptr<std::FILE, FileCloser> f(std::fopen(tmp.c_str(), "wb"));
     if (!f) return false;
-    const bool wrote =
-        std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
-    std::fclose(f);
-    if (!wrote || std::rename(tmp.c_str(), fp.c_str()) != 0) {
+
+    bool ok = true;
+    if (total_vecs > 0) {
+        // 数据区：逐页组装（页与向量边界不对齐——页跨向量/向量跨页均有）。
+        ok = std::fseek(f.get(), static_cast<long>(vecs_off), SEEK_SET) == 0;
+        std::vector<std::uint8_t> page(kBcvpPageSize);
+        std::size_t fill = 0;
+        std::uint32_t pidx = 0;
+        auto flush_page = [&](std::size_t len) {
+            const std::uint32_t crc = bitcask::codec::crc32(
+                std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(page.data()), len));
+            std::memcpy(head.data() + kBcvpHeaderSize +
+                            static_cast<std::size_t>(pidx) * 4,
+                        &crc, 4);
+            ++pidx;
+            return std::fwrite(page.data(), 1, len, f.get()) == len;
+        };
+        for (std::uint32_t id = 0; ok && id < n; ++id) {
+            const auto* src = reinterpret_cast<const std::uint8_t*>(vec_of(id));
+            std::size_t rem = vec_bytes;
+            while (ok && rem > 0) {
+                const std::size_t take =
+                    std::min(static_cast<std::size_t>(kBcvpPageSize) - fill,
+                             rem);
+                std::memcpy(page.data() + fill, src, take);
+                src += take;
+                rem -= take;
+                fill += take;
+                if (fill == kBcvpPageSize) {
+                    ok = flush_page(kBcvpPageSize);
+                    fill = 0;
+                }
+            }
+        }
+        if (ok && fill > 0) ok = flush_page(fill);  // 尾页（< 4KB）
+    }
+    // 回头补写 header + CRC 表。
+    if (ok) ok = std::fseek(f.get(), 0, SEEK_SET) == 0;
+    if (ok) ok = std::fwrite(head.data(), 1, head.size(), f.get()) == head.size();
+    f.reset();
+    if (!ok || std::rename(tmp.c_str(), fp.c_str()) != 0) {
         std::remove(tmp.c_str());
         return false;
     }

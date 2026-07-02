@@ -1526,17 +1526,28 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - 照搬 hint_file 的 256KiB chunked refill（thread_local ThreadLocalBuffer + memmove
     残留 + 巨型 record 扩容 + maybe_shrink）。百万条 2M 次 pread → 数百次。
     短读改为 EOF-break（同 hint fold 语义；out_last_valid_end 仍正确供 caller 截断）。
-- [ ] **S13-P7【中】HNSW 读者 copy_neighbors 对节点自旋锁 atomic exchange → hub 缓存行乒乓**
-    · `hnsw.cpp:384-395`。修：per-node seqlock 或单写者 release 发布。**bench 无并发搜索项，
-    需先补 `->Threads(N)` 基准**（元发现：`bench/hnsw_bench.cpp` 仅单线程）。
-- [ ] **S13-P8【中批】** 短语打分每候选堆分配(`inverted.cpp:779`)、短语驱动词未选最稀有(:745)、
-    新词全量 vocab 重建(:299-308)、`search_fuzzy` 串行(:1484 vs wildcard 并行:904)、
-    `on_delete` 重分词(`search_layer.cpp:576`)、`search_fields` 死代码+逐词独立 top-k(:813-824)、
-    `invalidate_terms` O(条目×词)(`search_cache.cpp:67-88`)、meta filter 每候选拷 blob
-    (`search_layer.cpp:221`)、C `bitcask_get` 双拷贝(`bitcask_c.cpp:300`)、merge `pending_`
-    全量驻留内存(`merger.cpp:56-68`)、hint 启动读两遍(`hint_file.cpp:193-232`)、
-    `rebuild_hnsw` 串行重插(`search_layer.cpp:99-110`)、`save_vec_payload` 全量物化
-    (`hnsw.cpp:1056`)、FOR 编解码逐 bit(:1651)。逐项独立评估落地。
+- [x] **S13-P7【中】HNSW 读者 copy_neighbors 对节点自旋锁 atomic exchange → hub 缓存行乒乓** — 已完成（2026-07-02）
+  - per-node 自旋锁改 **seqlock**（写者是单线程 reducer，无写-写互斥需求，只需
+    发布协议）：写者 seq→奇 … 更新 adj … seq→偶（release）；读者双读 seq 一致
+    才采信，torn count 有 cap 钳制防越界。数据字全走 `std::atomic_ref` relaxed
+    ——UB-free 且 TSan 干净（无非原子冲突访问）。锁字 u8→u32 防 ABA 回绕。
+  - 读侧 copy_neighbors **零共享行写**——hub 节点并发查询不再乒乓。
+  - 补 `BM_Hnsw_SearchConcurrent`（100k/ef64 × Threads 1/4/8，UseRealTime）：
+    实测 1→4 线程延迟持平（147→135µs）、8 线程 CPU 时间不涨（无锁争用）。
+  - 验证：HNSW 15/15（含 recall）、TSan 并发批零告警。
+- [~] **S13-P8【中批】** — 部分完成（2026-07-02，6/14 项落地）：
+  - [x] 短语打分每候选堆分配 → `other_pos` thread_local（parallel_for 内免分配器争用）
+  - [x] 短语驱动词选最稀有（"the quantum" 不再遍历 "the" 大表；候选集/分数/平分
+    决策逐字节同果——两列表均 ord 升序，idf 仍取 first term 语义）
+  - [x] `search_fuzzy` 并行化（镜像 wildcard 的 parallel_reduce；MyersMatcher::within
+    const 纯计算无 mutable，跨线程安全）
+  - [x] `on_delete` 空缓存跳过重分词（LRU 拷原文 + NFKC + 分词全免）
+  - [x] C `bitcask_get` 双拷贝 → `fill_get_result_view` 直接从零拷贝 view malloc
+  - [x] 新词 vocab 全量重建 → **已被 S13-F6 的 delta 增量设计覆盖**（不再遍历 map）
+  - [ ] 剩余 8 项待做：`search_fields` 死代码+逐词 top-k、`invalidate_terms`
+    反向索引、meta filter 锁内求值、merge `pending_` 分批 apply、hint 启动
+    CRC 边读边算、`rebuild_hnsw` 并行/结构化拷贝、`save_vec_payload` 流式、
+    FOR 编解码 64-bit 窗口。
 
 ### D. 功能缺口（对照已规划 C4/C5/C6 与已否决项排除后）
 

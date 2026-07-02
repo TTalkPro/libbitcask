@@ -344,6 +344,49 @@ bool to_cpp_meta_filter(const bitcask_meta_filter_t& src,
     return true;
 }
 
+// S13-P8.9：从零拷贝 GetResultView 直接 malloc+memcpy（跳过 to_owned 的
+// 中间 vector 拷贝）。结构与 fill_get_result 一致。
+bool fill_get_result_view(const bitcask::GetResultView& src,
+                          bitcask_get_result_t* out) {
+    out->value.data = nullptr;
+    out->value.size = 0;
+    out->meta.data = nullptr;
+    out->meta.size = 0;
+    out->vector = nullptr;
+    out->vector_len = 0;
+
+    auto cleanup = [out]() {
+        if (out->value.data) std::free(const_cast<void*>(out->value.data));
+        if (out->meta.data) std::free(const_cast<void*>(out->meta.data));
+        if (out->vector) std::free(const_cast<float*>(out->vector));
+    };
+
+    if (!src.value.empty()) {
+        auto* p = std::malloc(src.value.size());
+        if (!p) return false;
+        std::memcpy(p, src.value.data(), src.value.size());
+        out->value.data = p;
+        out->value.size = src.value.size();
+    }
+    if (!src.meta.empty()) {
+        auto* p = std::malloc(src.meta.size());
+        if (!p) { cleanup(); return false; }
+        std::memcpy(p, src.meta.data(), src.meta.size());
+        out->meta.data = p;
+        out->meta.size = src.meta.size();
+    }
+    if (!src.vector.empty()) {
+        auto* p = std::malloc(sizeof(float) * src.vector.size());
+        if (!p) { cleanup(); return false; }
+        std::memcpy(p, src.vector.data(), sizeof(float) * src.vector.size());
+        out->vector = static_cast<const float*>(p);
+        out->vector_len = src.vector.size();
+    }
+    out->tstamp = src.tstamp;
+    out->ord = src.ord;
+    return true;
+}
+
 bitcask::Cask* as_cpp_cask(bitcask_t* h) {
     return reinterpret_cast<bitcask_impl_t*>(h)->cask.get();
 }
@@ -500,14 +543,16 @@ BITCASK_API bitcask_error_t bitcask_get(bitcask_t* cask,
     *out = nullptr;
 
     std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
-    auto result = as_cpp_cask(cask)->get_owned(key_span);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
+    // S13-P8.9：直接消费零拷贝 view（此前 get_owned 先 span→vector 拷一次、
+    // fill_get_result 再 malloc+memcpy 一次——每次 C get 多付整份 value 拷贝）。
+    auto view = as_cpp_cask(cask)->get(key_span);
+    if (!view) {
+        to_c_error(view.error(), fault);
+        return to_c_error_kind(view.error().kind);
     }
 
     auto* r = static_cast<bitcask_get_result_t*>(std::malloc(sizeof(bitcask_get_result_t)));
-    if (!r || !fill_get_result(*result, r)) {  // S13-M2：OOM 检查
+    if (!r || !fill_get_result_view(*view, r)) {  // S13-M2：OOM 检查
         std::free(r);
         set_oom_fault(fault);
         return BITCASK_ERR_IO;

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -781,24 +782,41 @@ auto InvertedIndex::search_phrase_impl(
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
     auto& first_pl = *tps[0].pl;
-    const std::size_t n_cand = first_pl.items.size();
 
-    // live_df 只依赖 first term 的 posting list（与具体候选 doc 无关），
-    // 提到循环外算一次，避免每个匹配 doc 重算 O(D)（S9.7）。
-    // P2.1：first term 的 live 批量取一次（Index 侧一次锁），主循环复用。
-    std::vector<std::uint64_t> first_ords(n_cand);
-    for (std::size_t j = 0; j < n_cand; ++j) {
-        first_ords[j] = first_pl.items[j].ord;
+    // S13-P8.2：候选枚举改由**最稀有词**驱动（此前恒 tps[0]——"the quantum"
+    // 会遍历 "the" 的大表）。候选集 = 全词交集不变；两列表都按 ord 升序 ⟹
+    // (score, ord) 推入序一致，top-k 含平分决策**逐字节同果**。idf 语义仍取
+    // first term 的 live_df（评分公式不变）。
+    std::size_t drv = 0;
+    for (std::size_t t = 1; t < tps.size(); ++t) {
+        if (tps[t].pl->items.size() < tps[drv].pl->items.size()) drv = t;
     }
-    std::vector<char> first_live(n_cand);
-    live_checker.fill_is_live(first_ords, first_live);
-    // S7-5：doc_len 也批量取一次（Index 侧一次 shared_lock）。原先在评分点逐个
-    // 调 live_checker.doc_len() 各抢一次锁——并行候选循环里会变成锁争用热点。
-    std::vector<std::uint32_t> first_dls(n_cand);
-    live_checker.fill_doc_lens(first_ords, first_dls);
+    auto& cand_pl = *tps[drv].pl;
+    const std::size_t n_cand = cand_pl.items.size();
+
+    // live/doc_len 批量取一次（Index 侧各一次锁），主循环复用（P2.1/S7-5）。
+    std::vector<std::uint64_t> cand_ords(n_cand);
+    for (std::size_t j = 0; j < n_cand; ++j) {
+        cand_ords[j] = cand_pl.items[j].ord;
+    }
+    std::vector<char> cand_live(n_cand);
+    live_checker.fill_is_live(cand_ords, cand_live);
+    std::vector<std::uint32_t> cand_dls(n_cand);
+    live_checker.fill_doc_lens(cand_ords, cand_dls);
+
+    // live_df/idf 只依赖 first term 的 posting list（与候选枚举无关），
+    // 提到循环外算一次（S9.7）。drv==0 时复用 cand_live 免二次 gather。
     std::size_t live_df = 0;
-    for (std::size_t j = 0; j < first_live.size(); ++j) {
-        live_df += static_cast<std::size_t>(first_live[j]);
+    if (drv == 0) {
+        for (char c : cand_live) live_df += static_cast<std::size_t>(c);
+    } else {
+        std::vector<std::uint64_t> first_ords(first_pl.items.size());
+        for (std::size_t j = 0; j < first_ords.size(); ++j) {
+            first_ords[j] = first_pl.items[j].ord;
+        }
+        std::vector<char> first_live(first_ords.size());
+        live_checker.fill_is_live(first_ords, first_live);
+        for (char c : first_live) live_df += static_cast<std::size_t>(c);
     }
     auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
 
@@ -807,15 +825,30 @@ auto InvertedIndex::search_phrase_impl(
     // （phrase_tf==0 / 已删 / 缺词）；idf>0 ∧ tf_norm>0 ∧ delta≥0 ⇒ 真匹配分恒 >0，
     // 故 0 可作哨兵无歧义。
     auto score_one = [&](std::size_t i) -> float {
-        if (!first_live[i]) return 0.0F;
-        auto& posting = first_pl.items[i];
-        auto posting_ord = posting.ord;
+        if (!cand_live[i]) return 0.0F;
+        const auto posting_ord = cand_pl.items[i].ord;
 
-        // 把「在其余 term 的 posting list 里定位本 doc」提到 start_pos 循环外：
-        // idx 对固定 (doc, term) 不变，原先每个 start_pos 都重查一次 O(log D)（S9.7）。
-        // 任一 other term 在本 doc 不存在 → 整 doc 不可能成短语，直接返回 0。
-        std::vector<const std::vector<std::uint32_t>*> other_pos(tps.size(), nullptr);
+        // 把「在各 term 的 posting list 里定位本 doc」提到 start_pos 循环外：
+        // idx 对固定 (doc, term) 不变（S9.7）。任一 term 在本 doc 不存在 →
+        // 整 doc 不可能成短语，直接返回 0。
+        // S13-P8.1：other_pos 改 thread_local（此前每候选一次堆分配，且在
+        // tbb::parallel_for 内 → 分配器争用）。
+        thread_local std::vector<const std::vector<std::uint32_t>*> other_pos;
+        other_pos.assign(tps.size(), nullptr);
+        // 链式匹配从 term 0 的 positions 起步（驱动词只负责候选枚举）。
+        const std::vector<std::uint32_t>* anchor = nullptr;
+        if (drv == 0) {
+            anchor = &cand_pl.items[i].positions;
+        } else {
+            auto idx0 = first_pl.find(posting_ord);
+            if (idx0 >= first_pl.items.size()) return 0.0F;
+            anchor = &first_pl.items[idx0].positions;
+        }
         for (std::size_t t = 1; t < tps.size(); ++t) {
+            if (t == drv) {
+                other_pos[t] = &cand_pl.items[i].positions;
+                continue;
+            }
             auto& other_pl = *tps[t].pl;
             auto idx = other_pl.find(posting_ord);
             if (idx >= other_pl.items.size()) return 0.0F;
@@ -823,7 +856,7 @@ auto InvertedIndex::search_phrase_impl(
         }
 
         std::uint32_t phrase_tf = 0;
-        for (auto start_pos : posting.positions) {
+        for (auto start_pos : *anchor) {
             // 有序匹配：term t 必须在 (prev, prev+1+slop] 内出现（slop=0 即精确相邻）。
             bool match = true;
             std::uint32_t prev = start_pos;
@@ -840,7 +873,7 @@ auto InvertedIndex::search_phrase_impl(
         }
 
         if (phrase_tf == 0) return 0.0F;
-        auto dl = first_dls[i];
+        auto dl = cand_dls[i];
         auto tf_norm = static_cast<float>(phrase_tf) *
                        (params.k1 + 1.0F) /
                        (static_cast<float>(phrase_tf) + params.k1 *
@@ -866,7 +899,7 @@ auto InvertedIndex::search_phrase_impl(
     for (std::size_t i = 0; i < n_cand; ++i) {
         float score = cand_scores[i];
         if (score <= 0.0F) continue;  // 0 = 非短语（见 score_one 哨兵契约）
-        std::uint64_t ord = first_pl.items[i].ord;
+        std::uint64_t ord = cand_pl.items[i].ord;
         if (heap.size() < k) {
             heap.push({score, ord});
         } else if (score > heap.top().first) {
@@ -1726,35 +1759,48 @@ auto InvertedIndex::search_fuzzy(
     matchers.reserve(query_terms.size());
     for (auto& q : query_terms) matchers.emplace_back(q);
 
-    for (auto& shard : shards_) {
-        // V6.3.1：用排序 vocab_ 替代 collect_term_keys 的 hash_map 全扫 + sort。
-        // 模糊匹配编辑距离不保 lexicographic 序 → 不能 binary search，只能线性
-        // 扫；但排序 vector 比 hash_map 节点 cache 友好得多（连续 string 数组
-        // 顺次访问，无链表间接跳转），且 O(N log N) sort 折到「首次搜索后惰性」
-        // 一次摊销。
-        auto vocab = ensure_vocab(static_cast<std::size_t>(&shard - shards_.data()));
-        for (const auto& term : *vocab) {
-            bool hit = false;
-            for (std::size_t qi = 0; qi < query_terms.size(); ++qi) {
-                auto& query_term = query_terms[qi];
-                auto len_diff = term.size() > query_term.size()
-                                    ? term.size() - query_term.size()
-                                    : query_term.size() - term.size();
-                if (len_diff > max_edit_distance) continue;
-                if (matchers[qi].within(term, max_edit_distance)) {
-                    hit = true;
-                    break;
+    // S13-P8.4：并行扫词表（镜像 search_wildcard 的 parallel_reduce 结构——
+    // 按 shard 分区互不重叠；此前串行扫全部 64 shard，Myers DP 是纯 CPU 热点）。
+    // matchers[].within 需可变内部态？MyersMatcher 是 per-查询词只读 Peq 表 +
+    // 局部 DP——within 为 const 纯计算，跨线程并发安全。
+    // V6.3.1：排序 vocab_ 线性扫（编辑距离不保序，不能 binary search）。
+    tps = tbb::parallel_reduce(
+        tbb::blocked_range<std::size_t>(0, kShardCount),
+        std::vector<TermPostings>{},
+        [&](const tbb::blocked_range<std::size_t>& range,
+            std::vector<TermPostings> local) {
+            for (std::size_t si = range.begin(); si < range.end(); ++si) {
+                auto vocab = ensure_vocab(si);
+                for (const auto& term : *vocab) {
+                    bool hit = false;
+                    for (std::size_t qi = 0; qi < query_terms.size(); ++qi) {
+                        auto& query_term = query_terms[qi];
+                        auto len_diff = term.size() > query_term.size()
+                                            ? term.size() - query_term.size()
+                                            : query_term.size() - term.size();
+                        if (len_diff > max_edit_distance) continue;
+                        if (matchers[qi].within(term, max_edit_distance)) {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if (!hit) continue;
+                    PostingMap::const_accessor acc;
+                    if (!shards_[si].inverted.find(acc, term)) continue;
+                    TermPostings tp;
+                    tp.term = term;
+                    acc->second->snapshot_flat(tp.fp);
+                    local.push_back(std::move(tp));
                 }
             }
-            if (!hit) continue;
-            PostingMap::const_accessor acc;
-            if (!shard.inverted.find(acc, term)) continue;
-            TermPostings tp;
-            tp.term = term;
-            acc->second->snapshot_flat(tp.fp);
-            tps.push_back(std::move(tp));
-        }
-    }
+            return local;
+        },
+        [](std::vector<TermPostings> a, const std::vector<TermPostings>& b) {
+            a.insert(a.end(), b.begin(), b.end());
+            return a;
+        });
+    // 评分一致性：score_bow_topk 对 tps 排序不敏感？——与 wildcard 同一前提
+    // （tps 集合相同、每 term 恰一份；BM25 贡献按 term 求和，顺序无关）。
 
     if (tps.empty()) return {};
 
@@ -1955,10 +2001,31 @@ inline void for_decode_block(std::uint64_t frame, std::uint8_t bits,
         for (std::size_t i = 0; i < count; ++i) out[i] = frame;
         return;
     }
-    std::size_t pos = 0;
-    for (std::size_t i = 0; i < count; ++i) {
+    // S13-P8：64-bit 窗口批量解包（原逐 bit 循环每值 ~bits 次移位；v6
+    // checkpoint 加载对每个 ord 付此代价，大索引启动主导项之一）。流是
+    // MSB-first 大端位序：窗口 8 字节大端载入后一次移位+掩码取值，与逐
+    // bit 版位级等价。bits>56 时 off+bits 可跨 9 字节 → 整体回退逐 bit
+    //（ord delta 位宽 >56 实际不出现，纯正确性兜底）；尾部不足 8 字节的
+    // 值同样回退（越界安全）。
+    const std::size_t total_bits = static_cast<std::size_t>(bits) * count;
+    const std::size_t total_bytes = (total_bits + 7) >> 3;
+    std::size_t i = 0;
+    if (bits <= 56) {
+        const std::uint64_t mask = (1ull << bits) - 1;
+        std::size_t pos = 0;
+        for (; i < count; ++i, pos += bits) {
+            const std::size_t byte_i = pos >> 3;
+            if (byte_i + 8 > total_bytes) break;  // 尾部回退逐 bit
+            std::uint64_t w;
+            std::memcpy(&w, packed + byte_i, 8);
+            w = std::byteswap(w);  // LE 主机（codec 已 static_assert）
+            const unsigned off = static_cast<unsigned>(pos & 7);
+            out[i] = frame + ((w >> (64u - off - bits)) & mask);
+        }
+    }
+    std::size_t pos = static_cast<std::size_t>(bits) * i;
+    for (; i < count; ++i, pos += bits) {
         out[i] = frame + for_unpack_u64(packed, pos, bits);
-        pos += bits;
     }
 }
 
