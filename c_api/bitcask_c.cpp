@@ -284,6 +284,66 @@ bool fill_iter_entry(const bitcask::CaskIter::Entry& e,
     return true;
 }
 
+// S13-D2：C 过滤树 → C++ MetaFilter。返回 false = 输入非法（key 为 NULL、
+// STRING 缺 str、op/type 越界、嵌套深度超限）。
+constexpr int kMetaFilterMaxDepth = 32;
+
+bool to_cpp_meta_value(const bitcask_meta_value_t& v, meta::MetaValue& out) {
+    switch (v.type) {
+        case BITCASK_META_VALUE_NULL:    out = std::monostate{}; return true;
+        case BITCASK_META_VALUE_BOOL:    out = (v.i64 != 0);     return true;
+        case BITCASK_META_VALUE_INT64:   out = static_cast<std::int64_t>(v.i64); return true;
+        case BITCASK_META_VALUE_FLOAT64: out = v.f64;            return true;
+        case BITCASK_META_VALUE_STRING:
+            if (!v.str) return false;
+            out = std::string(v.str);
+            return true;
+    }
+    return false;
+}
+
+bool to_cpp_meta_filter(const bitcask_meta_filter_t& src,
+                        meta::MetaFilter& out, int depth) {
+    if (depth > kMetaFilterMaxDepth) return false;
+    out.logic = src.logic_or ? meta::MetaFilter::Logic::Or
+                             : meta::MetaFilter::Logic::And;
+    if (src.conditions_count > 0 && !src.conditions) return false;
+    out.conditions.reserve(src.conditions_count);
+    for (size_t i = 0; i < src.conditions_count; ++i) {
+        const auto& c = src.conditions[i];
+        if (!c.key) return false;
+        if (static_cast<unsigned>(c.op) >
+            static_cast<unsigned>(BITCASK_META_OP_EXISTS)) {
+            return false;
+        }
+        meta::MetaCondition mc;
+        mc.key = c.key;
+        mc.op  = static_cast<meta::MetaOp>(c.op);
+        if (mc.op == meta::MetaOp::In) {
+            if (c.values_count > 0 && !c.values) return false;
+            mc.values.reserve(c.values_count);
+            for (size_t j = 0; j < c.values_count; ++j) {
+                meta::MetaValue mv;
+                if (!to_cpp_meta_value(c.values[j], mv)) return false;
+                mc.values.push_back(std::move(mv));
+            }
+        } else if (mc.op != meta::MetaOp::Exists) {
+            if (!to_cpp_meta_value(c.value, mc.value)) return false;
+        }
+        out.conditions.push_back(std::move(mc));
+    }
+    if (src.children_count > 0 && !src.children) return false;
+    out.children.reserve(src.children_count);
+    for (size_t i = 0; i < src.children_count; ++i) {
+        auto child = std::make_unique<meta::MetaFilter>();
+        if (!to_cpp_meta_filter(src.children[i], *child, depth + 1)) {
+            return false;
+        }
+        out.children.push_back(std::move(child));
+    }
+    return true;
+}
+
 bitcask::Cask* as_cpp_cask(bitcask_t* h) {
     return reinterpret_cast<bitcask_impl_t*>(h)->cask.get();
 }
@@ -846,6 +906,97 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
     }
     return fill_batch_results(as_cpp_cask(cask)->search_hybrid_batch(qv, k),
                               n, out_results, fault);
+    });
+}
+
+// S13-D2：带 meta 过滤的检索变体。filter==NULL 退化为无过滤；非法 filter →
+// INVALID_OPTION。过滤树在调用期间转换为 C++ MetaFilter（调用返回后 C 侧
+// 存储即可释放）。
+BITCASK_API bitcask_error_t bitcask_search_text_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+
+    meta::MetaFilter mf;
+    if (filter && !to_cpp_meta_filter(*filter, mf, 0)) {
+        return BITCASK_ERR_INVALID_OPTION;
+    }
+    auto result = as_cpp_cask(cask)->search_text(query, k,
+                                                 filter ? &mf : nullptr);
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
+    return BITCASK_OK;
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_search_vector_filtered(
+    bitcask_t* cask, const float* query, size_t query_len, size_t k, size_t ef,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+
+    meta::MetaFilter mf;
+    if (filter && !to_cpp_meta_filter(*filter, mf, 0)) {
+        return BITCASK_ERR_INVALID_OPTION;
+    }
+    std::span<const float> query_span{query, query_len};
+    auto result = as_cpp_cask(cask)->search_vector(query_span, k, ef,
+                                                   filter ? &mf : nullptr);
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
+    return BITCASK_OK;
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
+    bitcask_t* cask, const char* text_query,
+    const float* vec_query, size_t vec_len, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+
+    meta::MetaFilter mf;
+    if (filter && !to_cpp_meta_filter(*filter, mf, 0)) {
+        return BITCASK_ERR_INVALID_OPTION;
+    }
+    std::string_view text_sv;
+    if (text_query) text_sv = text_query;
+    std::span<const float> vec_span;
+    if (vec_query && vec_len > 0) vec_span = {vec_query, vec_len};
+
+    auto result = as_cpp_cask(cask)->search_hybrid(text_sv, vec_span, k,
+                                                   filter ? &mf : nullptr);
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
+    return BITCASK_OK;
     });
 }
 

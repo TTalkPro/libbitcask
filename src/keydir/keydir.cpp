@@ -184,6 +184,32 @@ public:
 // should_create=false 时如果 file_id 不存在直接 return：set_pending_delete
 // 路径要这个语义——只对已知 file_id 标记 expiration_epoch，不为不存在的
 // file 凭空建一条 fstats。
+// S13-F8：扩容 fstats_ 并同步 RCU 指针表（见 keydir.hpp 注释）。
+// 锁要求：fstats_grow_mu_。发布序：先填/换指针表（release），后发布 size
+// （release）——acquire 读 size 的读者必见覆盖该 size 的指针表。
+void KeyDir::grow_fstats_locked(std::size_t need_size) {
+    while (fstats_.size() < need_size) fstats_.emplace_back();
+    const std::size_t n = fstats_.size();
+    if (fstats_ptr_cap_ < n) {
+        std::size_t new_cap = fstats_ptr_cap_ ? fstats_ptr_cap_ : 1024;
+        while (new_cap < n) new_cap *= 2;
+        auto arr = std::make_unique<AtomicFStats*[]>(new_cap);
+        for (std::size_t i = 0; i < n; ++i) arr[i] = &fstats_[i];
+        fstats_ptrs_.store(arr.get(), std::memory_order_release);
+        // 旧表退休不释放：在途无锁读者可能仍持有其指针。
+        fstats_ptr_arrays_.push_back(std::move(arr));
+        fstats_ptr_cap_ = new_cap;
+    } else {
+        // 容量足够：只填新槽位。读者经 size 门禁不会触碰 [old_n, n) 槽。
+        AtomicFStats** cur = fstats_ptrs_.load(std::memory_order_relaxed);
+        for (std::size_t i = fstats_size_.load(std::memory_order_relaxed);
+             i < n; ++i) {
+            cur[i] = &fstats_[i];
+        }
+    }
+    fstats_size_.store(n, std::memory_order_release);
+}
+
 void KeyDir::update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
                            std::uint64_t expiration_epoch,
                            std::int32_t live_inc, std::int32_t total_inc,
@@ -193,14 +219,15 @@ void KeyDir::update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
     // M6-S1 无锁化:槽位发布 + relaxed 原子累加(wrap-around 语义经
     // int64 二补数保留,与 legacy 字节级对账一致)。锁序:fstats_grow_mu_
     // 是全序最末一把,caller 持分片锁/meta 时调用均合法。
+    // S13-F8:读经 fstats_slot（RCU 指针表）——直接 fstats_[idx] 会与并发
+    // emplace_back 的 deque 内部块表重分配构成 UAF（TSan 实证）。
     const std::size_t idx = file_id;
     if (idx >= fstats_size_.load(std::memory_order_acquire)) {
         if (!should_create) return;
         std::lock_guard<std::mutex> g(fstats_grow_mu_);
-        while (fstats_.size() <= idx) fstats_.emplace_back();
-        fstats_size_.store(fstats_.size(), std::memory_order_release);
+        grow_fstats_locked(idx + 1);
     }
-    auto& f = fstats_[idx];
+    auto& f = fstats_slot(idx);
     if (!f.present.load(std::memory_order_relaxed)) {
         if (!should_create) return;
         f.present.store(1, std::memory_order_relaxed);
@@ -252,8 +279,8 @@ std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
     std::uint32_t missing = 0;
     const std::size_t n = fstats_size_.load(std::memory_order_acquire);
     for (auto id : ids) {
-        if (id < n && fstats_[id].present.exchange(0, std::memory_order_relaxed)) {
-            auto& f = fstats_[id];  // 清零槽位,防陈旧数据被误读
+        if (id < n && fstats_slot(id).present.exchange(0, std::memory_order_relaxed)) {
+            auto& f = fstats_slot(id);  // 清零槽位,防陈旧数据被误读
             f.live_keys.store(0, std::memory_order_relaxed);
             f.total_keys.store(0, std::memory_order_relaxed);
             f.live_bytes.store(0, std::memory_order_relaxed);
@@ -1030,7 +1057,7 @@ KeyDirInfo KeyDir::info() const {
     const std::size_t fn = fstats_size_.load(std::memory_order_acquire);
     r.fstats.reserve(fn);
     for (std::size_t i = 0; i < fn; ++i) {
-        const auto& f = fstats_[i];
+        const auto& f = fstats_slot(i);  // S13-F8：无锁读经 RCU 指针表
         if (!f.present.load(std::memory_order_relaxed)) continue;
         FStatsEntry e;
         e.file_id          = static_cast<std::uint32_t>(i);
@@ -1144,7 +1171,7 @@ bool KeyDir::save_snapshot(
     const std::size_t fsz = fstats_size_.load(std::memory_order_acquire);
     std::uint32_t fstats_n = 0;
     for (std::size_t i = 0; i < fsz; ++i) {
-        if (fstats_[i].present.load(std::memory_order_relaxed)) ++fstats_n;
+        if (fstats_slot(i).present.load(std::memory_order_relaxed)) ++fstats_n;
     }
 
     // 头(magic+ver=8)+5 标量(36)+fstats(4+52·n)+watermarks(4+12·m)
@@ -1171,7 +1198,7 @@ bool KeyDir::save_snapshot(
 
     snap_put32(buf, fstats_n);
     for (std::size_t i = 0; i < fsz; ++i) {
-        const auto& f = fstats_[i];
+        const auto& f = fstats_slot(i);  // S13-F8
         if (!f.present.load(std::memory_order_relaxed)) continue;
         snap_put32(buf, static_cast<std::uint32_t>(i));
         snap_put64(buf, f.live_keys.load(std::memory_order_relaxed));
@@ -1274,6 +1301,11 @@ auto KeyDir::load_snapshot(std::string_view path)
         {
             std::lock_guard<std::mutex> g(fstats_grow_mu_);
             fstats_.clear();
+            // S13-F8：deque 元素已析构，指针表全部作废。open 期屏障保证无
+            // 并发无锁读者，可安全清空（含退休表）。
+            fstats_ptrs_.store(nullptr, std::memory_order_release);
+            fstats_ptr_arrays_.clear();
+            fstats_ptr_cap_ = 0;
             fstats_size_.store(0, std::memory_order_release);
         }
         key_count_.store(0, std::memory_order_relaxed);
@@ -1304,10 +1336,9 @@ auto KeyDir::load_snapshot(std::string_view path)
         if (c.fail || fe.file_id > (1u << 24)) { reset_all(); return std::nullopt; }
         {
             std::lock_guard<std::mutex> g(fstats_grow_mu_);
-            while (fstats_.size() <= fe.file_id) fstats_.emplace_back();
-            fstats_size_.store(fstats_.size(), std::memory_order_release);
+            grow_fstats_locked(static_cast<std::size_t>(fe.file_id) + 1);
         }
-        auto& slot = fstats_[fe.file_id];
+        auto& slot = fstats_slot(fe.file_id);  // S13-F8
         slot.live_keys.store(fe.live_keys, std::memory_order_relaxed);
         slot.total_keys.store(fe.total_keys, std::memory_order_relaxed);
         slot.live_bytes.store(fe.live_bytes, std::memory_order_relaxed);

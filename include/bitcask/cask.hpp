@@ -267,9 +267,15 @@ public:
     //   kOutOfDate  — pending 表 freshness 检查没过；caller 应稍后重试
     // CaskFault 留给真正的失败（比如 handle 已经在迭代）。
     // 线程安全: 否（修改自身字段）；同一 CaskIter 不可并发使用。
+    //
+    // S13-D4：key_prefix 非空时只产出以该前缀开头的 key——过滤发生在
+    // keydir proxy 层（不 pread value），遍历命名空间（如 "user:"）无需
+    // caller 全表扫 + 自行过滤。keydir 是哈希表，过滤版仍是 O(全表) 扫描
+    // （省的是 value 读取与跨界拷贝）；有序范围扫描需有序索引，见 TASK.md。
     [[nodiscard]] std::expected<keydir::StartIterResult, CaskFault>
     start(int maxage = -1, int maxputs = -1, std::uint32_t now_sec = 0,
-          bool see_tombstones = false);
+          bool see_tombstones = false,
+          std::span<const std::byte> key_prefix = {});
 
     // 取下一项；end-of-iteration 返回 nullopt。Entry 内部的 vector 拥有
     // 自己的存储，调用方持有期间可任意使用。
@@ -321,6 +327,7 @@ private:
     std::shared_ptr<keydir::KeyDir> keydir_pin_;
     std::unique_ptr<keydir::IterHandle> iter_;
     bool see_tombstones_ = false;
+    std::string key_prefix_;  // S13-D4：空 = 不过滤
     std::unordered_map<std::uint32_t,
                        std::unique_ptr<fileops::DataFile>> pinned_files_;
 };
@@ -403,9 +410,12 @@ public:
     //   n_threads==0 → hardware_concurrency()。
     //   并发删除致某 key 在 get 时 kNotFound → 跳过（near-real-time,与搜索一致）；
     //   其它错误（IO/CRC）→ 停止并返回该错误。返回成功遍历到的 key 数。
+    //   S13-D4：key_prefix 非空时只扫描以该前缀开头的 key（快照阶段在
+    //   keydir proxy 层过滤，非匹配 key 零拷贝零 pread）。
     // 线程安全: 是（快照串行建立 + get 并发安全）。Cask 已 close → kClosed。
     [[nodiscard]] std::expected<std::size_t, CaskFault>
-    parallel_scan(std::size_t n_threads, const ScanFn& fn);
+    parallel_scan(std::size_t n_threads, const ScanFn& fn,
+                  std::span<const std::byte> key_prefix = {});
 
     // 写入。tstamp=0 表示用当前 wall-clock 秒。
     // 线程安全: **是**（S11-W1：内部 `write_mu_` 串行化整个写序列;同一 handle 可

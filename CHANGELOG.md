@@ -47,6 +47,15 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
   新词付锁记账），重建不再遍历 map。`Cask::merge` 线程安全注释同步更新为
   索引模式亦安全。新增回归测试 `VocabConcurrentNewTermsAndMergeNoRace`。
 
+- **【High·UAF】fstats 无锁读与 deque 扩容的竞态（S13-F8，F1 修复揭出的存量
+  问题）**：merge 线程 `update_fstats` 无锁 `fstats_[idx]` 与写者 `emplace_back`
+  的 deque 内部块指针表重分配构成 use-after-free（「元素地址稳定」≠
+  「operator[] 并发安全」；F1 修复前 merge 的该路径从未真正与写者并发执行，
+  故一直潜伏）。修复：旁挂 RCU 指针表 `fstats_ptrs_`（扩容建新表 release 发布、
+  旧表退休不释放，内存有界），无锁读点全部改经 `fstats_slot()`。TSan 下
+  F1 并发测试 10 连跑 + 全并发批零告警。另：`cmake/tsan.supp` 增补
+  `mutable_pl` CoW 协议的 fence 假阳性抑制（协议正确，TSan 不建模 fence）。
+
 ### Fixed（内存 / C API 健壮性）
 
 - **C API `bitcask_iter_next_batch` 错误中途泄漏（S13-M1）**：返回 -1 前现已释放
@@ -64,6 +73,14 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
 - **`Cask::search_text_highlight` 门面方法（S13-D3）**：README 功能表宣称已久但
   实际只在 SearchLayer 上（绕过门面丢失 closed fail-fast 与 flush 可见性契约）。
   现补上门面（返回 `HighlightSearchResult`，命中含高亮片段），README 与代码对齐。
+- **前缀扫描（S13-D4）**：`CaskIter::start` / `Cask::parallel_scan` 新增尾置默认
+  参数 `key_prefix`（源兼容）——遍历命名空间（如 `"user:"`）无需全表扫 + 自行
+  过滤；过滤在 keydir proxy 层，非匹配 key 零 pread 零拷贝。
+- **C API meta 过滤（S13-D2）**：V5 meta 过滤此前 FFI 完全不可用。新增
+  `bitcask_meta_filter_t`（条件数组 + And/Or + 嵌套子树）与三个 **additive**
+  检索变体 `bitcask_search_text_filtered` / `bitcask_search_vector_filtered` /
+  `bitcask_search_hybrid_filtered`（ABI 兼容，既有签名不动）。全部 8 算子
+  （Eq/Neq/Gt/Gte/Lt/Lte/In/Exists）+ 5 值类型；非法 filter → INVALID_OPTION。
 
 ### Performance
 
@@ -80,10 +97,14 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
   （每 `kBlockSize=128` 一位），pivot 评分点处按需 `ensure_dls`；被跳
   过的块永付 gather 成本。`live` 仍全量（IDF 用 live_df 不可换 raw df）。
   位级行为等价，无新回归。
+- **`DataFile::fold` 改 256KiB 分块流式读（S13-P6）**：原每条 record 2 次
+  pread（header + body），百万条即两百万 syscalls；照搬 hint_file 的 chunked
+  refill 模式后降 3 个数量级。影响 merge 全部输入扫描、搜索模式恢复与纯 KV
+  无 hint 回退。
 
-**验证**：Debug（clang）全量 492/492（489 既有 + 3 新回归）；TSan 并发相关 111 项
-全过（`ThreadCountIndependentOfLibCount` 为 TSan 环境既有失败，干净树同样失败，
-与本批无关）；C API 测试通过；Release 构建干净。
+**验证**：Debug（clang）全量 494/494（489 既有 + 5 新回归：F1/F6/D3/D4 + C
+过滤）；TSan 并发相关全过（`ThreadCountIndependentOfLibCount` 为 TSan 环境既有
+失败，干净树同样失败，与本批无关）；C API 8/8；Release 构建干净。
 
 ## [3.1.0] - 2026-07-01
 

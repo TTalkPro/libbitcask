@@ -280,6 +280,72 @@ TEST_F(CaskDocValueTest, SearchTextAfterPut) {
     (*c)->close();
 }
 
+// S13-D4：前缀扫描——CaskIter::start / parallel_scan 的 key_prefix 过滤。
+TEST_F(CaskDocValueTest, PrefixScanIterAndParallelScan) {
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto bytes = [](std::string_view s) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s.data()), s.size());
+    };
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE((*c)->put(bytes("user:" + std::to_string(i)),
+                              bytes("u" + std::to_string(i)), 1000));
+    }
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE((*c)->put(bytes("post:" + std::to_string(i)),
+                              bytes("p" + std::to_string(i)), 1000));
+    }
+    // "user" 是 "user:*" 的前缀但也是完整 key——加一条验证边界（恰等于前缀）。
+    ASSERT_TRUE((*c)->put(bytes("user:"), bytes("root"), 1000));
+
+    // 迭代器前缀过滤：只出 "user:" 开头的 6 条。
+    auto it = (*c)->make_iter();
+    auto sr = it->start(-1, -1, 0, false, bytes("user:"));
+    ASSERT_TRUE(sr);
+    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+    std::size_t n = 0;
+    while (true) {
+        auto e = it->next();
+        ASSERT_TRUE(e);
+        if (!e->has_value()) break;
+        const auto& key = (*e)->key;
+        ASSERT_GE(key.size(), 5u);
+        EXPECT_EQ(std::memcmp(key.data(), "user:", 5), 0);
+        ++n;
+    }
+    it->release();
+    EXPECT_EQ(n, 6u);
+
+    // parallel_scan 前缀过滤：只访问 3 条 "post:"。
+    std::atomic<std::size_t> visited{0};
+    auto pr = (*c)->parallel_scan(
+        2,
+        [&](std::span<const std::byte> key, const bitcask::GetResultView&) {
+            ASSERT_GE(key.size(), 5u);
+            EXPECT_EQ(std::memcmp(key.data(), "post:", 5), 0);
+            visited.fetch_add(1, std::memory_order_relaxed);
+        },
+        bytes("post:"));
+    ASSERT_TRUE(pr);
+    EXPECT_EQ(*pr, 3u);
+    EXPECT_EQ(visited.load(), 3u);
+
+    // 空前缀 = 全表（回归既有语义）。
+    std::atomic<std::size_t> all{0};
+    auto pr_all = (*c)->parallel_scan(
+        2, [&](std::span<const std::byte>, const bitcask::GetResultView&) {
+            all.fetch_add(1, std::memory_order_relaxed);
+        });
+    ASSERT_TRUE(pr_all);
+    EXPECT_EQ(*pr_all, 9u);
+
+    (*c)->close();
+}
+
 // S13-D3：search_text_highlight 门面方法（README 宣称已久，本轮补上）。
 // 端到端：put 经异步管线索引 → Cask 门面高亮搜索 → 命中含片段；
 // 关闭后 fail-fast 返回 kClosed（门面契约，绕过门面直调 SearchLayer 没有）。

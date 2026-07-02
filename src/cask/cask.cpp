@@ -182,7 +182,7 @@ CaskIter::~CaskIter() noexcept { release(); }
 
 std::expected<keydir::StartIterResult, CaskFault>
 CaskIter::start(int maxage, int maxputs, std::uint32_t now_sec,
-                bool see_tombstones) {
+                bool see_tombstones, std::span<const std::byte> key_prefix) {
     // S11-W3：parent Cask 已 close → keydir_ 已释放,fail-fast 而非解引用空指针。
     if (parent_->is_closed()) {
         return std::unexpected(err(CaskError::kClosed, "cask is closed"));
@@ -196,6 +196,12 @@ CaskIter::start(int maxage, int maxputs, std::uint32_t now_sec,
     iter_ = parent_->keydir_->make_iter();
     auto r = iter_->start(now_sec, maxage, maxputs);
     see_tombstones_ = see_tombstones;
+    // S13-D4：前缀拷入自有存储（span 借 caller 缓冲，start 返回后可能失效）。
+    key_prefix_.clear();
+    if (!key_prefix.empty()) {
+        key_prefix_.assign(reinterpret_cast<const char*>(key_prefix.data()),
+                           key_prefix.size());
+    }
     // S13：真正开始迭代后（kOk），pin 当前目录下所有 data file 的只读句柄快照，
     // 让并发 merge 在本次 fold 期间 unlink 旧文件不影响后续 next() 的 pread。
     // kOutOfDate 时 caller 会重试，不在此处 pin。
@@ -257,6 +263,14 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
 
         if (expiry > 0 && proxy->tstamp + expiry <= now) {
             continue;  // expired; skip
+        }
+
+        // S13-D4：前缀过滤——proxy 层跳过（不 pread value、不跨界拷 key）。
+        if (!key_prefix_.empty() &&
+            (proxy->key.size() < key_prefix_.size() ||
+             std::memcmp(proxy->key.data(), key_prefix_.data(),
+                         key_prefix_.size()) != 0)) {
+            continue;
         }
 
         // sibling 墓碑只活在 keydir 里（file_id 是 sentinel，磁盘上没
@@ -352,6 +366,13 @@ std::vector<std::vector<std::byte>> CaskIter::drain_live_keys() {
     if (!iter_ || !iter_->is_iterating()) return out;
     // include_tombstones=false → keydir 层跳过墓碑，只给 live key。
     while (auto proxy = iter_->next(/*include_tombstones=*/false)) {
+        // S13-D4：前缀过滤（与 next() 一致）。
+        if (!key_prefix_.empty() &&
+            (proxy->key.size() < key_prefix_.size() ||
+             std::memcmp(proxy->key.data(), key_prefix_.data(),
+                         key_prefix_.size()) != 0)) {
+            continue;
+        }
         const auto* p = reinterpret_cast<const std::byte*>(proxy->key.data());
         out.emplace_back(p, p + proxy->key.size());
     }
@@ -1466,14 +1487,16 @@ Cask::get_owned(std::span<const std::byte> key) {
 // S11-W4：并行全表扫描。快照 live key（串行,廉价）→ 分段 → N 个 std::thread
 // 并发 get + fn（读值的 pread+decode 是被并行化的成本）。
 std::expected<std::size_t, CaskFault>
-Cask::parallel_scan(std::size_t n_threads, const ScanFn& fn) {
+Cask::parallel_scan(std::size_t n_threads, const ScanFn& fn,
+                    std::span<const std::byte> key_prefix) {
     if (is_closed()) {
         return std::unexpected(err(CaskError::kClosed, "cask is closed"));
     }
     // 1) 单次快照所有 live key（调用线程串行,仅 key 拷贝,不读 value）。
+    // S13-D4：key_prefix 在 proxy 层过滤（drain_live_keys 内）。
     auto it = make_iter();
     auto sr = it->start(/*maxage=*/-1, /*maxputs=*/-1, /*now_sec=*/0,
-                        /*see_tombstones=*/false);
+                        /*see_tombstones=*/false, key_prefix);
     if (!sr) return std::unexpected(sr.error());
     if (*sr != keydir::StartIterResult::kOk) {
         return std::unexpected(err(CaskError::kIo,

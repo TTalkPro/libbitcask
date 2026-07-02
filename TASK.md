@@ -1463,6 +1463,23 @@ W4 ✅（parallel_scan 并行全表扫描）。
 - [x] **S13-F7【文档】`cask.hpp:566-570`（merge 与 put 不兼容）与 `cask.hpp:16-18` / thread-safety.md §7.6（安全）自相矛盾** — 已完成（2026-07-02）
   - 统一为：KV 路径安全（F1/F5 已修）；索引模式注明 F6 未修前建议避免 merge 与高频 put_doc 并发。
 
+- [x] **S13-F8【High·UAF·F1 修复揭出的存量竞态】fstats 无锁读与 deque 扩容的 UAF** — 已完成（2026-07-02）
+    · `src/keydir/keydir.cpp`、`include/bitcask/keydir.hpp`
+  - **发现**：新增的 F1 并发回归测试在 TSan 下抓出 heap-use-after-free——
+    merge 线程 `update_fstats`（apply 成功路径，F1 修复前从未与写者并发执行过）
+    无锁 `fstats_[idx]` 读，与写者 `emplace_back` 触发的 deque 内部块指针表
+    重分配竞争。「deque 元素地址稳定」≠「operator[] 并发安全」：operator[]
+    要遍历内部 map，而 map 会被扩容释放。
+  - **修**：deque 保留为元素所有者（地址稳定），旁挂 RCU 指针表
+    `fstats_ptrs_`——扩容在 `fstats_grow_mu_` 下建新表、release 发布、旧表
+    退休不释放（在途读者可能持有；总内存 < 2×终表 ≈ 16B/file_id 有界）。
+    全部无锁读点（update_fstats/info/save_snapshot）改经 `fstats_slot(idx)`；
+    发布序「先指针表后 size」保证 acquire 读 size 的读者必见覆盖表。
+  - **验证**：TSan 下 F1 测试 10 连跑 + 全并发批 199 项零告警（修复前 ~40% 复现率）。
+  - **附带**：`cmake/tsan.supp` 增补 `mutable_pl` use_count+fence CoW 协议的
+    fence 假阳性抑制（TSan 不建模 fence；协议论证正确，报告形状仅在读者已
+    释放引用后出现——真并发时写者走克隆不触共享对象）。
+
 ### B. 内存 / 资源
 
 - [x] **S13-M1【中】`bitcask_iter_next_batch` 错误中途 return -1 泄漏已填充条目** — 已完成（2026-07-02，错误分支逐条 free + 头文件契约注明）
@@ -1500,8 +1517,10 @@ W4 ✅（parallel_scan 并行全表扫描）。
 - [ ] **S13-P5【中】HNSW int8 每查询/插入堆分配 + 标量 round；精排逐候选 madvise**
     · `hnsw.cpp:914,728,746,933-940`、`detail/int8_kernels.hpp:104-114`
   - 修：thread_local `quantize_into` + SIMD round；madvise 候选按地址区间合并。
-- [ ] **S13-P6【中】`DataFile::fold` 每记录 2 次 pread** · `src/fileops/data_file.cpp:285-311`
-  - 影响 merge 全部输入扫描 + 搜索模式恢复。修：照搬 `hint_file.cpp:87-188` 256KiB 分块 refill。
+- [x] **S13-P6【中】`DataFile::fold` 每记录 2 次 pread** — 已完成（2026-07-02）
+  - 照搬 hint_file 的 256KiB chunked refill（thread_local ThreadLocalBuffer + memmove
+    残留 + 巨型 record 扩容 + maybe_shrink）。百万条 2M 次 pread → 数百次。
+    短读改为 EOF-break（同 hint fold 语义；out_last_valid_end 仍正确供 caller 截断）。
 - [ ] **S13-P7【中】HNSW 读者 copy_neighbors 对节点自旋锁 atomic exchange → hub 缓存行乒乓**
     · `hnsw.cpp:384-395`。修：per-node seqlock 或单写者 release 发布。**bench 无并发搜索项，
     需先补 `->Threads(N)` 基准**（元发现：`bench/hnsw_bench.cpp` 仅单线程）。
@@ -1518,14 +1537,23 @@ W4 ✅（parallel_scan 并行全表扫描）。
 
 - [ ] **S13-D1【P0·M】`put_batch` 原子批量写**：`write_buffered/flush_batch` 基建已有（仅 merge 用）；
   批内一次 fsync 语义=单次提交，兼容 WAL 契约；keydir 延后统一 apply（C1 模式）。+ C API。
-- [ ] **S13-D2【P0·M】C API 暴露 meta filter**：`search_text/vector/hybrid` 的 `MetaFilter*` C 端
-  完全缺失（V5 核心能力 FFI 不可用）。`bitcask_meta_filter_t`（条件数组 + And/Or 映射
-  `meta_filter.hpp` 全部算子）。
+- [x] **S13-D2【P0·M】C API 暴露 meta filter** — 已完成（2026-07-02）
+  - `bitcask_meta_filter_t`（条件数组 + logic_or + 嵌套 children 数组）+
+    `bitcask_meta_condition_t`/`bitcask_meta_value_t`（全部 8 算子 + 5 值类型），
+    指针借调用方存储、调用返回即可释放。新增 **additive** 三函数（ABI 兼容）：
+    `bitcask_search_text_filtered` / `bitcask_search_vector_filtered` /
+    `bitcask_search_hybrid_filtered`；非法 filter（NULL key/缺 str/深度>32/枚举越界）
+    → INVALID_OPTION。C 测试 `test_search_filtered`（8/8 过）。
+  - 备忘：头文件注明引擎「无 meta 文档 filter 下一律不通过」语义；批量 `_filtered`
+    变体与 C API 前缀扫描留待后续（薄包装）。
 - [x] **S13-D3【P0·S】`search_text_highlight` 提上 Cask 门面 + 修 README 漂移** — 已完成（2026-07-02）
   - `Cask::search_text_highlight`（closed fail-fast + prepare_search flush + search_fault
     翻译，返回 `HighlightSearchResult{vector<SearchHitEx>}`）；README 第 29 行宣称从此为真。
   - 测试：`SearchTextHighlightViaCaskFacade`（端到端高亮片段 + close 后 kClosed）。
-- [ ] **S13-D4【P0·S】前缀扫描**：`CaskIter::start` / `parallel_scan` 加可选 `key_prefix` 过滤。
+- [x] **S13-D4【P0·S】前缀扫描** — 已完成（2026-07-02）
+  - `CaskIter::start` / `Cask::parallel_scan` 加尾置默认参 `key_prefix`（源兼容），
+    过滤在 keydir proxy 层（非匹配 key 零 pread 零拷贝）；next/drain_live_keys 同步。
+    测试 `PrefixScanIterAndParallelScan`（前缀/边界/空前缀回归）。C API 暴露留待后续。
 - [ ] **S13-D5【P1·M】per-key TTL**：DocValue v3 已版本化，加可选 expiry；merge policy 同步扩展。
 - [ ] **S13-D6【P1·M】备份/热拷贝 API**：sealed 不可变 → 关 active + hardlink 清单 + 释放锁。
 - [ ] **S13-D7【P1·S/M】日志回调 hook**：`CaskOptions::log_fn`（open-time 不可变）+ C 函数指针；

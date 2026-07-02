@@ -332,6 +332,117 @@ static int test_parallel_scan(void) {
     return 0;
 }
 
+// S13-D2：meta 过滤检索变体。文档不带 meta（C 侧暂无 meta 编码 API），
+// 引擎语义：**filter 非空时无 meta 的文档一律不通过**（materialize_hits 的
+// 「空 blob 不通过」约定）——故任何 filter 下命中皆 0；NULL filter 退化为
+// 无过滤；非法 filter（NULL key）→ INVALID_OPTION；嵌套子树正常转换。
+static int test_search_filtered(void) {
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.enable_search = 1;
+    opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    bitcask_error_t err =
+        bitcask_open("/tmp/bitcask_c_test_filter", &opts, &cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_search_filtered: open failed: %s\n", fault.detail);
+        return 1;
+    }
+
+    const char* docs[3] = {"hello world", "hello there", "foo bar"};
+    const char* keys[3] = {"f0", "f1", "f2"};
+    for (int i = 0; i < 3; i++) {
+        bitcask_doc_input_t doc;
+        memset(&doc, 0, sizeof(doc));
+        doc.text.data = docs[i];
+        doc.text.size = strlen(docs[i]);
+        bitcask_slice_t key = {keys[i], strlen(keys[i])};
+        err = bitcask_put_doc(cask, key, &doc, 0, &fault);
+        assert(err == BITCASK_OK);
+    }
+    bitcask_flush_index(cask);
+
+    // Exists("tag")：无 doc 带 meta → 0 命中。
+    bitcask_meta_condition_t cond_exists;
+    memset(&cond_exists, 0, sizeof(cond_exists));
+    cond_exists.key = "tag";
+    cond_exists.op = BITCASK_META_OP_EXISTS;
+    bitcask_meta_filter_t filter;
+    memset(&filter, 0, sizeof(filter));
+    filter.conditions = &cond_exists;
+    filter.conditions_count = 1;
+
+    bitcask_search_result_t* r = NULL;
+    err = bitcask_search_text_filtered(cask, "hello", 10, &filter, &r, &fault);
+    assert(err == BITCASK_OK);
+    assert(r != NULL && r->count == 0);
+    bitcask_search_result_free(r);
+
+    // Neq("tag", int64 1)：无 meta 文档同样被「空 blob 不通过」滤掉 → 0。
+    bitcask_meta_condition_t cond_neq;
+    memset(&cond_neq, 0, sizeof(cond_neq));
+    cond_neq.key = "tag";
+    cond_neq.op = BITCASK_META_OP_NEQ;
+    cond_neq.value.type = BITCASK_META_VALUE_INT64;
+    cond_neq.value.i64 = 1;
+    filter.conditions = &cond_neq;
+
+    r = NULL;
+    err = bitcask_search_text_filtered(cask, "hello", 10, &filter, &r, &fault);
+    assert(err == BITCASK_OK);
+    assert(r != NULL && r->count == 0);
+    bitcask_search_result_free(r);
+
+    // 嵌套：root{AND, children=[ OR{ Exists(tag), Neq(tag,1) } ]} → 转换正常，
+    // 无 meta 文档仍 0 命中。
+    bitcask_meta_condition_t or_conds[2];
+    memset(or_conds, 0, sizeof(or_conds));
+    or_conds[0] = cond_exists;
+    or_conds[1] = cond_neq;
+    bitcask_meta_filter_t child;
+    memset(&child, 0, sizeof(child));
+    child.logic_or = 1;
+    child.conditions = or_conds;
+    child.conditions_count = 2;
+    bitcask_meta_filter_t root;
+    memset(&root, 0, sizeof(root));
+    root.children = &child;
+    root.children_count = 1;
+
+    r = NULL;
+    err = bitcask_search_text_filtered(cask, "hello", 10, &root, &r, &fault);
+    assert(err == BITCASK_OK);
+    assert(r != NULL && r->count == 0);
+    bitcask_search_result_free(r);
+
+    // NULL filter 退化为无过滤。
+    r = NULL;
+    err = bitcask_search_text_filtered(cask, "hello", 10, NULL, &r, &fault);
+    assert(err == BITCASK_OK);
+    assert(r != NULL && r->count == 2);
+    bitcask_search_result_free(r);
+
+    // 非法：condition.key == NULL → INVALID_OPTION。
+    bitcask_meta_condition_t bad;
+    memset(&bad, 0, sizeof(bad));
+    bad.op = BITCASK_META_OP_EQ;
+    bitcask_meta_filter_t bad_filter;
+    memset(&bad_filter, 0, sizeof(bad_filter));
+    bad_filter.conditions = &bad;
+    bad_filter.conditions_count = 1;
+    r = NULL;
+    err = bitcask_search_text_filtered(cask, "hello", 10, &bad_filter, &r, &fault);
+    assert(err == BITCASK_ERR_INVALID_OPTION);
+    assert(r == NULL);
+
+    bitcask_close(cask);
+    printf("PASS test_search_filtered\n");
+    return 0;
+}
+
 // 注：C API 的 bitcask_close **销毁句柄**（adopt+delete），故纯 C 无「已关闭但存活」
 // 状态——close 后再用是 use-after-free（caller bug），非 BITCASK_ERR_CLOSED 场景。
 // kClosed 的实际受益方是 C++ 消费方（Cask::close 保留对象 + fail-fast），其覆盖见
@@ -346,6 +457,7 @@ int main(void) {
     failures += test_search_text_batch();
     failures += test_search_vector_hybrid_batch();
     failures += test_parallel_scan();
+    failures += test_search_filtered();
 
     if (failures == 0) {
         printf("\n=== All C API tests passed ===\n");

@@ -4,3 +4,12 @@
 # TBB 并行区内的共享状态正确性靠专项并发测试保证(如
 # SearchConcurrentWithSingleWriter),不靠全量 TSan。
 race:*tbb*
+
+# S13：P2-min CoW 协议（inverted.cpp mutable_pl）的 fence 假阳性。写者以
+# use_count()==1 + acquire fence 判定「无 phrase/near 读者持引用」后原地改
+# posting list；fence 与读者 shared_ptr 析构的 release 递减配对（论证见
+# mutable_pl 头注释）——协议正确，但 TSan 不建模独立 fence：读者恰在写者
+# 检查前释放引用时报假阳性（实际 happens-before 成立）。若读者仍持引用
+# （真并发），写者走 CoW 克隆、不触碰共享对象，不产生本报告形状。
+# 以 phrase/near 读者帧兜底（add_doc 写-写等其它 race 不受影响）。
+race:bitcask::bm25::InvertedIndex::search_phrase_impl

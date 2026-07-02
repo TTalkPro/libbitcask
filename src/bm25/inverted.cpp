@@ -570,7 +570,7 @@ auto InvertedIndex::search_wand(
 
     // S13-P4：dls 惰性按块填充（每块一次批量 gather；被 WAND 块跳跃略过的
     // 区段永不付 doc_len 查询成本）。dl 值 ord 定后不可变，填充时机无关正确性。
-    auto ensure_dls = [&live_checker](TermPostings& tp, std::size_t idx) {
+    auto ensure_dls = [&](TermPostings& tp, std::size_t idx) {
         const std::size_t b = idx / kB;
         if (tp.dls_filled[b]) return;
         const std::size_t start = b * kB;

@@ -452,6 +452,15 @@ private:
     // fstats_size_ release 发布——读者 idx < size(acquire) 即可直接对
     // 字段做 relaxed 原子累加,put 热路径零锁字共享(S2 起生效;S1 仍在
     // mutex_ 内调用,顺序平凡安全)。
+    //
+    // S13-F8（TSan 实证,新 F1 并发测试抓出）:「deque 元素地址稳定」不等于
+    // 「operator[] 并发安全」——deque::operator[] 要遍历内部块指针表(map),
+    // 而 emplace_back 触发的 map 重分配会释放旧表 → 无锁读者 UAF。修复:
+    // deque 仍是元素所有者(地址稳定),旁挂 RCU 指针表 fstats_ptrs_——扩容
+    // 时在 grow_mu_ 下建新表、release 发布,旧表退休进 fstats_ptr_arrays_
+    // 不释放(在途读者可能仍持有;总内存 < 2×终表 ≈ 16B/file_id,有界)。
+    // 无锁读者一律经 fstats_slot(idx) 访问,前置条件 idx < size(acquire):
+    // size 的 release 发布在指针表填充/替换之后,acquire 读者必见新表。
     // alignas(64):deque 每元素独占 cache line。否则两个 file_id 的 stats
     // 可能跨同一 64B 行,merge + active 并发写不同文件时假共享。
     struct alignas(64) AtomicFStats {
@@ -467,6 +476,19 @@ private:
     mutable std::mutex fstats_grow_mu_;   // 仅新 file_id 槽位构造(罕见)
     mutable std::deque<AtomicFStats> fstats_;
     std::atomic<std::size_t> fstats_size_{0};
+    // S13-F8：RCU 指针表（见上）。fstats_ptr_arrays_/fstats_ptr_cap_ 仅在
+    // fstats_grow_mu_ 下触碰；fstats_ptrs_ 读者 acquire 无锁读。
+    mutable std::atomic<AtomicFStats**> fstats_ptrs_{nullptr};
+    mutable std::vector<std::unique_ptr<AtomicFStats*[]>> fstats_ptr_arrays_;
+    mutable std::size_t fstats_ptr_cap_ = 0;
+
+    // 无锁读路径的槽位访问。前置条件：idx < fstats_size_.load(acquire)。
+    [[nodiscard]] AtomicFStats& fstats_slot(std::size_t idx) const {
+        return *fstats_ptrs_.load(std::memory_order_acquire)[idx];
+    }
+    // 扩容到至少 need_size 个槽位并同步指针表 + 发布 size。
+    // 锁要求：调用方持 fstats_grow_mu_。
+    void grow_fstats_locked(std::size_t need_size);
 
     // M6-S1/S2:全局标量原子化。epoch_ 的跨线程可见性判据
     // (entry.epoch < iter_epoch)由「分片锁内 fetch_add + 屏障内读取」

@@ -456,6 +456,79 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
 // 同义词词典已改为 **open 时配置**：见 bitcask_options_t::synonym_file_path
 //（不可变、并发查询安全；运行期 setter 已移除）。
 
+/* ===========================================================================
+ *  Meta 过滤（S13-D2）——V5 结构化 meta 过滤的 C 表示
+ *
+ *  一棵过滤树 = 叶子条件数组 + 子树数组，logic 决定 AND/OR 合流。全部指针
+ *  借调用方存储（栈上/静态构造即可），仅在 search 调用期间读取，调用返回后
+ *  即可释放——引擎内部会转换成自有表示。空树（无条件无子树）恒通过。
+ *  类型规则与 C++ 端一致：Eq/Neq 同型比较；Gt/Gte/Lt/Lte 仅 int64/float64；
+ *  In 用 values 数组（Eq 语义逐项）；Exists 只看 key 是否存在。
+ * ========================================================================= */
+
+typedef enum {
+    BITCASK_META_OP_EQ     = 0,
+    BITCASK_META_OP_NEQ    = 1,
+    BITCASK_META_OP_GT     = 2,
+    BITCASK_META_OP_GTE    = 3,
+    BITCASK_META_OP_LT     = 4,
+    BITCASK_META_OP_LTE    = 5,
+    BITCASK_META_OP_IN     = 6,
+    BITCASK_META_OP_EXISTS = 7
+} bitcask_meta_op_t;
+
+typedef enum {
+    BITCASK_META_VALUE_NULL    = 0,
+    BITCASK_META_VALUE_BOOL    = 1,
+    BITCASK_META_VALUE_INT64   = 2,
+    BITCASK_META_VALUE_FLOAT64 = 3,
+    BITCASK_META_VALUE_STRING  = 4
+} bitcask_meta_value_type_t;
+
+typedef struct {
+    bitcask_meta_value_type_t type;
+    int64_t     i64;  /* BOOL（0/1）与 INT64 用 */
+    double      f64;  /* FLOAT64 用 */
+    const char* str;  /* STRING 用（NUL 结尾；其余类型忽略） */
+} bitcask_meta_value_t;
+
+typedef struct {
+    const char*                 key;   /* 必填，NUL 结尾 */
+    bitcask_meta_op_t           op;
+    bitcask_meta_value_t        value;        /* IN/EXISTS 之外使用 */
+    const bitcask_meta_value_t* values;       /* 仅 IN：候选值数组 */
+    size_t                      values_count; /* 仅 IN */
+} bitcask_meta_condition_t;
+
+typedef struct bitcask_meta_filter {
+    int logic_or;  /* 0 = AND（默认语义），非 0 = OR */
+    const bitcask_meta_condition_t*   conditions;
+    size_t                            conditions_count;
+    const struct bitcask_meta_filter* children;  /* 子树数组（嵌套组合） */
+    size_t                            children_count;
+} bitcask_meta_filter_t;
+
+/* 带 meta 过滤的检索变体（S13-D2）。filter==NULL 等价于无过滤版本；
+ * filter 非法（key 为 NULL、STRING 值缺 str、嵌套深度 > 32、op/type 越界）
+ * → BITCASK_ERR_INVALID_OPTION。其余语义与同名无 _filtered 函数一致。
+ * 注意：filter 非空时**没有 meta 段的文档一律不通过**（引擎「空 blob 不通过」
+ * 约定，与 C++ MetaFilter 行为一致）——含 Neq/Exists 等否定式条件。 */
+BITCASK_API bitcask_error_t bitcask_search_text_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_search_vector_filtered(
+    bitcask_t* cask, const float* query, size_t query_len, size_t k, size_t ef,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
+    bitcask_t* cask, const char* text_query,
+    const float* vec_query, size_t vec_len, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
 // 释放搜索结果
 BITCASK_API void bitcask_search_result_free(bitcask_search_result_t* result);
 
