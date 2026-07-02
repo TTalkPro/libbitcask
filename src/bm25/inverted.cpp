@@ -507,7 +507,11 @@ auto InvertedIndex::search_wand(
         std::string term;
         FlatPostings fp;   // P1：扁平快照，ords/tfs 兼任 DAAT 游标数组
         std::vector<char> live;          // P2.1：与 ords 平行，批量取一次
-        std::vector<std::uint32_t> dls;  // P2.1：同上（DAAT 每 pivot 免锁免虚调用）
+        // S13-P4：dls 改按块惰性填充（沿 bool_search BMW 的 ensure_block
+        // 模式）——dl 只在 pivot 评分点读一次，被块跳跃略过的区段永不填充。
+        // live 仍需全量：IDF 用 live_df（分数位级不变约定，不能换 raw df）。
+        std::vector<std::uint32_t> dls;
+        std::vector<char> dls_filled;    // 每 kBlockSize 粒度一位
         std::size_t cursor = 0;
         float idf = 0.0f;
         float list_upper_bound = 0.0f;
@@ -537,11 +541,13 @@ auto InvertedIndex::search_wand(
     // 计算每个 term 的 IDF 和上界分数。
     // P2.1：live/doc_len 批量取一次（Index 侧各一次锁）存进 tp——
     // DAAT 循环每 pivot 的 is_live/doc_len 改读数组，全程零虚调用零锁。
+    constexpr std::size_t kB = PostingList::kBlockSize;
     for (auto& tp : tps) {
         tp.live.resize(tp.fp.size());
         live_checker.fill_is_live(tp.fp.ords, tp.live);
+        // S13-P4：dls 只分配不填充，评分点按块惰性取（见 ensure_dls）。
         tp.dls.resize(tp.fp.size());
-        live_checker.fill_doc_lens(tp.fp.ords, tp.dls);
+        tp.dls_filled.assign((tp.fp.size() + kB - 1) / kB, 0);
         std::size_t live_df = 0;
         for (std::size_t i = 0; i < tp.live.size(); ++i) {
             live_df += static_cast<std::size_t>(tp.live[i]);
@@ -561,6 +567,19 @@ auto InvertedIndex::search_wand(
                 upper_bound_from(blk.max_tf, tp.idf, params, avgdl, blk.min_dl));
         }
     }
+
+    // S13-P4：dls 惰性按块填充（每块一次批量 gather；被 WAND 块跳跃略过的
+    // 区段永不付 doc_len 查询成本）。dl 值 ord 定后不可变，填充时机无关正确性。
+    auto ensure_dls = [&live_checker](TermPostings& tp, std::size_t idx) {
+        const std::size_t b = idx / kB;
+        if (tp.dls_filled[b]) return;
+        const std::size_t start = b * kB;
+        const std::size_t cnt = std::min(kB, tp.fp.size() - start);
+        live_checker.fill_doc_lens(
+            std::span<const std::uint64_t>(tp.fp.ords.data() + start, cnt),
+            std::span<std::uint32_t>(tp.dls.data() + start, cnt));
+        tp.dls_filled[b] = 1;
+    };
 
     using Entry = std::pair<float, std::uint64_t>;
     std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
@@ -668,6 +687,7 @@ auto InvertedIndex::search_wand(
         if (pivot_tp.live[pivot_tp.cursor]) {
             float score = 0.0f;
             // S10.8：dl 只依赖 pivot_ord，提到 term 循环外取一次（原先每个匹配 term 重取）。
+            ensure_dls(pivot_tp, pivot_tp.cursor);  // S13-P4：惰性按块填充
             auto dl = pivot_tp.dls[pivot_tp.cursor];
             for (std::size_t i = 0; i < tps.size(); ++i) {
                 if (tps[i].cursor >= tps[i].fp.ords.size()) continue;
