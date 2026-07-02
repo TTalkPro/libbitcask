@@ -75,6 +75,11 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
 - **`bool_search` 消除 posting 快照二次深拷贝（S13-P3）**：must/should 的
   `TermPostings`（热词可达 MB 级扁平快照）合入评分数组时改 move（原为整体拷贝，
   每个含 SHOULD/MUST_NOT 的查询都付）。
+- **`search_wand` doc_len 按块惰性填充（S13-P4）**：DAAT 全量前置
+  `fill_doc_lens` 抵消 WAND 块跳跃剪枝——每 term 加 `dls_filled` 位图
+  （每 `kBlockSize=128` 一位），pivot 评分点处按需 `ensure_dls`；被跳
+  过的块永付 gather 成本。`live` 仍全量（IDF 用 live_df 不可换 raw df）。
+  位级行为等价，无新回归。
 
 **验证**：Debug（clang）全量 492/492（489 既有 + 3 新回归）；TSan 并发相关 111 项
 全过（`ThreadCountIndependentOfLibCount` 为 TSan 环境既有失败，干净树同样失败，

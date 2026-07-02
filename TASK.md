@@ -1490,8 +1490,13 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - 追加写语义等价，每次持久化省一次 journal 元数据提交。**不改变 WAL 持久性契约**。
 - [x] **S13-P3【高】`bool_search` posting 快照二次深拷贝** · `src/bm25/inverted.cpp:1378-1387` — 已完成（2026-07-02，make_move_iterator + reserve；all_tps 构建后 must/should_tps 不再使用）
   - 热词 ~1.7MB/词/查询。修：move 迭代器或 `vector<TermPostings*>`。
-- [ ] **S13-P4【高】`search_wand` 前置全量快照+live 填充抵消 BMW 跳块** · `inverted.cpp:505-528`
-  - 修：搬 `ensure_block`(:1063-1076) 惰性按块填充过去 + shared_ptr 引用替代拷贝。
+- [x] **S13-P4【高】`search_wand` 前置全量快照+live 填充抵消 BMW 跳块** · `inverted.cpp:505-528` — 已完成（2026-07-02）
+  - 落地：每 term 加 `dls_filled` 位图（每 `kBlockSize=128` 一位），初始化
+    只 resize 不填充；新增 `ensure_dls(tp, idx)` lambda 以
+    `idx / kBlockSize` 查位按需 `fill_doc_lens` 整块；pivot 评分点前调。
+    `live` 仍全量（IDF 用 live_df 是 BM25 分数位级不变约定）。走的是
+    `bool_search` 既有 `ensure_block` 模式（:1099）。位级行为等价，
+    无新回归。
 - [ ] **S13-P5【中】HNSW int8 每查询/插入堆分配 + 标量 round；精排逐候选 madvise**
     · `hnsw.cpp:914,728,746,933-940`、`detail/int8_kernels.hpp:104-114`
   - 修：thread_local `quantize_into` + SIMD round；madvise 候选按地址区间合并。
