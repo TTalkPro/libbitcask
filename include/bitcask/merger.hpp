@@ -60,6 +60,7 @@ struct MergeStats {
     std::uint64_t records_kept   = 0;   // 实际复制到输出的
     std::uint64_t records_stale  = 0;   // 跳过：keydir 已指向别处
     std::uint64_t records_tombs  = 0;   // 跳过：源 record 是墓碑
+    std::uint64_t records_expired = 0;  // S13-D5：per-key TTL 过期，丢弃 + 清 keydir
     std::uint64_t bytes_written  = 0;
     // S13-F1 纵深防御：重定位 CAS 被拒且复查发现 keydir 仍指向输入文件的旧
     // 位置（正常流程不应发生）。非零时 caller 绝不能 unlink 对应输入文件，
@@ -87,6 +88,7 @@ run_merge(std::span<const std::string> input_data_paths,
           std::string_view output_dir,
           keydir::KeyDir& keydir,
           bool sync_output = false,
-          search::SearchLayer* search_layer = nullptr);
+          search::SearchLayer* search_layer = nullptr,
+          std::uint32_t now_sec = 0);  // S13-D5：TTL 判定时刻（0 = 不判 TTL）
 
 }  // namespace bitcask::merge

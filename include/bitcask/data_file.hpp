@@ -98,8 +98,9 @@ public:
     // 累计 ≥ kBatchFlushBytes 才一次 pwrite——把 N 条 pwrite 降到 N/batch。
     // 返回的 offset 是逻辑偏移（current_offset_，含尚未落盘的缓冲），确定性
     // 不依赖落盘时机，故 hint/keydir 引用照旧正确。
-    //   ⚠️ 仅用于 merge 输出等「末尾统一 fsync 后才被 caller 采信」的场景——
-    //   put 的 WAL 语义必须每条 durable，不可用本 API（见 ⑪ 否决记录）。
+    //   ⚠️ 仅用于「flush（+按策略 sync）之后才被 caller 采信」的场景：merge
+    //   输出、put_batch（S13-D1，flush 后才 apply keydir）。单条 put 的 WAL
+    //   语义必须每条立即 pwrite，不可用本 API（见 ⑪ 否决记录）。
     //   caller 必须在 sync()/采信前调 flush_batch()（sync() 已内部兜底 flush）。
     // 线程安全: 否（修改 current_offset_ + batch_buf_）；caller 串行化。
     [[nodiscard]] std::expected<WriteResult, DataFileFault>

@@ -1514,9 +1514,14 @@ W4 ✅（parallel_scan 并行全表扫描）。
     `live` 仍全量（IDF 用 live_df 是 BM25 分数位级不变约定）。走的是
     `bool_search` 既有 `ensure_block` 模式（:1099）。位级行为等价，
     无新回归。
-- [ ] **S13-P5【中】HNSW int8 每查询/插入堆分配 + 标量 round；精排逐候选 madvise**
-    · `hnsw.cpp:914,728,746,933-940`、`detail/int8_kernels.hpp:104-114`
-  - 修：thread_local `quantize_into` + SIMD round；madvise 候选按地址区间合并。
+- [x] **S13-P5【中】HNSW int8 每查询/插入堆分配 + 精排逐候选 madvise** — 已完成（2026-07-02）
+  - `int8::quantize_into(v, dim, out)`：thread_local QVector 复用，查询/插入
+    三个调用点稳态零分配（insert 两处 memcpy 即取即用，无别名）。
+  - madvise：rerank 候选按地址排序 + 相邻页区间合并后批量 madvise——k=256
+    时 ~768 次 syscall/查询降到典型个位数。
+  - **有意不做**：SIMD round——`_mm256_cvtps_epi32` 是 round-half-to-even，与
+    `std::round`（half-away-from-zero）在 .5 边界结果不同，codes 入 checkpoint，
+    违反位级不变约定。
 - [x] **S13-P6【中】`DataFile::fold` 每记录 2 次 pread** — 已完成（2026-07-02）
   - 照搬 hint_file 的 256KiB chunked refill（thread_local ThreadLocalBuffer + memmove
     残留 + 巨型 record 扩容 + maybe_shrink）。百万条 2M 次 pread → 数百次。
@@ -1535,8 +1540,20 @@ W4 ✅（parallel_scan 并行全表扫描）。
 
 ### D. 功能缺口（对照已规划 C4/C5/C6 与已否决项排除后）
 
-- [ ] **S13-D1【P0·M】`put_batch` 原子批量写**：`write_buffered/flush_batch` 基建已有（仅 merge 用）；
-  批内一次 fsync 语义=单次提交，兼容 WAL 契约；keydir 延后统一 apply（C1 模式）。+ C API。
+- [x] **S13-D1【P0·M】`put_batch` 原子批量写** — 已完成（2026-07-02）
+  - `Cask::put_batch(span<BatchItem>)`：全批前置校验（零副作用）→ write_buffered
+    聚合（1MiB 块 pwrite）→ 单次 flush（+按 sync 策略组提交：o_sync 即时 /
+    sync_every_n>0 整批一次 fdatasync / 否则同单条 put 由 caller sync() 控制）→
+    keydir apply + 索引提交（**flush 之后** ⟹ 本进程内 all-or-nothing 可见）。
+  - merge race（merge 恰在批写入期启动）：被拒条目走 write_and_keydir 单条重写
+    （内部 roll+重试），原始 ord 由 BatchOrdGuard（S13-F2 批量版）补 Skip。
+  - 不提供跨崩溃原子性（磁盘可能残留批前缀，重启 fold 后可见——与连续单条 put
+    的崩溃语义一致），契约在头文件注明。write_buffered 使用契约注释同步放宽
+    （「flush 后才采信」的第二个合法使用方）。
+  - C API：`bitcask_kv_pair_t` + `bitcask_put_batch`（additive）。
+  - 测试：`PutBatchBasicAndPersistence`（200 条 + 校验零副作用 + LWW 覆盖 +
+    reopen 持久性）/ `PutBatchIndexedSearchable`（异步管线入索引）/ C 端
+    `test_put_batch`。
 - [x] **S13-D2【P0·M】C API 暴露 meta filter** — 已完成（2026-07-02）
   - `bitcask_meta_filter_t`（条件数组 + logic_or + 嵌套 children 数组）+
     `bitcask_meta_condition_t`/`bitcask_meta_value_t`（全部 8 算子 + 5 值类型），
@@ -1554,13 +1571,55 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - `CaskIter::start` / `Cask::parallel_scan` 加尾置默认参 `key_prefix`（源兼容），
     过滤在 keydir proxy 层（非匹配 key 零 pread 零拷贝）；next/drain_live_keys 同步。
     测试 `PrefixScanIterAndParallelScan`（前缀/边界/空前缀回归）。C API 暴露留待后续。
-- [ ] **S13-D5【P1·M】per-key TTL**：DocValue v3 已版本化，加可选 expiry；merge policy 同步扩展。
-- [ ] **S13-D6【P1·M】备份/热拷贝 API**：sealed 不可变 → 关 active + hardlink 清单 + 释放锁。
-- [ ] **S13-D7【P1·S/M】日志回调 hook**：`CaskOptions::log_fn`（open-time 不可变）+ C 函数指针；
+- [x] **S13-D5【P1·M】per-key TTL** — 已完成（2026-07-02）
+  - 格式：`kFlagHasExpiry=0x20` + value 末尾 `[ExpiryAt:u32 LE]`（绝对 unix 秒）。
+    段在既有全部段之后 ⟹ **旧读端按位忽略、静默降级为永不过期**（非拒绝）。
+  - API：`put(..., expiry_at=0)` 尾置默认参 / `DocInput::expiry_at`；C 端
+    `bitcask_put_ex` + `bitcask_doc_input_t.expiry_at`（追加字段）。
+  - 读路径：get（mmap/pread 双路径）过期 → kNotFound；CaskIter::next 跳过。
+    与整库 expiry_secs 叠加（任一判过期即过期）。
+  - merge：`run_merge` 加 `now_sec` 参——过期记录不搬运 + `conditional_remove`
+    CAS 清 keydir（位置匹配才删，与并发 put 无冲突）+ `records_expired` 统计。
+  - **未做（有意）**：per-key TTL 不参与 needs_merge 的过期触发（需全量扫描
+    记录才能统计，fstats 无此信息）；put_batch 暂不带 TTL（后续薄扩展）。
+  - 测试：`PerKeyTtlExpiryAndMergeReclaim`（三类 key + iter 过滤 + merge 回收
+    计数 + 重启不复活）。
+  - 原案：DocValue v3 已版本化，加可选 expiry；merge policy 同步扩展。
+- [x] **S13-D6【P1·M】备份/热拷贝 API** — 已完成（2026-07-02）
+  - `Cask::backup(dst_dir)`：持 write_mu_ 封存 active（finalize hint，write_lock
+    不释放、下一次 put 惰性重建）→ hardlink（跨设备回退 copy）data/hint +
+    bitcask.meta + field.schema + keydir/search ckpt（可选）。sealed 不可变 ⟹
+    hardlink 即一致快照。契约：caller 保证与 merge 不并发（同 merge 单实例约束）。
+  - 测试：`BackupHotCopyAndReopen`（多文件备份 → 独立只读 open 全量校验 +
+    原库备份后继续可写）。
+- [x] **S13-D7【P1·S/M】日志回调 hook** — 已完成（2026-07-02）
+  - `CaskOptions::log_fn`（`function<void(LogLevel, string_view)>`，open-time 不可变，
+    沿 synonym_map 模式）+ `LogLevel{kWarn,kError}`；`Cask::log/log_warn/log_error`
+    noexcept（回调抛出被吞）。插桩 6 点：keydir 快照保存失败、write.lock active-path
+    更新失败、merge 后 search ckpt 保存失败（RunFn/fallback 双路径）、stuck 重定位
+    （S13-F1 防御路径触发）、索引 worker 吞异常、close 兜底 catch。
+  - C API：options 追加 `log_fn(int level, const char* msg, void* ctx)` + `log_ctx`。
+  - 测试：`LogHookFiresOnSnapshotFailure`（只读目录触发 close 快照失败 → warn）。
+  - 原案文字：`CaskOptions::log_fn`（open-time 不可变）+ C 函数指针；
   ~10 处静默失败点插桩。
-- [ ] **S13-D8【P2·S】统计 API 扩展**：StatusInfo 加搜索侧（postings/HNSW 内存/cache 命中率）。
+- [x] **S13-D8【P2·S】统计 API 扩展** — 已完成（2026-07-02）
+  - StatusInfo 加 `hnsw_nodes`/`search_cache_entries`/`read_handles`（全部经线程安全
+    访问器）。**有意不含** total_postings：统计需遍历 concurrent_hash_map，与 reducer
+    插入并发不安全（S13-F6 同类）——待 InvertedIndex 原子计数器后再暴露（已注明）。
+  - C API：additive `bitcask_status_ex_t` + `bitcask_status_ex()`（旧 struct 布局不动）。
 - [ ] **S13-D9【P2·M】查询语言括号嵌套+引号短语子句**：QueryNode 已树形，parser 升级递归下降。
-- [ ] **S13-D10【P2·S/M】搜索分页 offset + total 估计**；**S13-D11【P2·S】HNSW M/ef_construction 透传**。
+- [x] **S13-D11【P2·S】HNSW M/ef_construction 透传** — 已完成（2026-07-02）：
+  `SearchLayerConfig::hnsw_m/hnsw_ef_construction`（0=默认），构造与 merge 期
+  rebuild（复用 old->config()）均生效；C options 同步追加；不入 meta 校验
+  （调优参数非格式参数，已注明）。测试 `StatusExFieldsAndHnswParamPassthrough`。
+- [x] **S13-D10【P2·S/M】搜索分页 offset** — 已完成（2026-07-02，offset 部分）
+  - `search_text/search_phrase/bool_search` 加尾置 `offset=0`：facade 层
+    overfetch k+offset 后截断（深分页线性成本，已注明）。测试
+    `SearchTextPaginationOffset`（切片一致性 + 越界空页）。
+  - **total 估计有意不做**：WAND/BMW 剪枝下只能给下界，误导大于价值；确需
+    精确 total 的场景等 C6 Roaring（已规划）位图求交后自然获得。C API 分页
+    变体留待后续薄包装。
+- ~~S13-D11~~（见上）HNSW M/ef_construction 透传**。
 
 > **建议执行顺序**：F1（数据丢失）→ F2（永久挂起）→ F3/F4（TSan 干净化）→ P1/P2（两处
 > 一行级高收益）→ M1 → F5/F6 → F7+D3（文档漂移一并修）→ 其余按价值推进。

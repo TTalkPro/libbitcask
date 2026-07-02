@@ -73,6 +73,13 @@ struct SearchLayerConfig {
     // 写入端归一化),kL2 → kL2。
     std::uint16_t        vector_dim = 0;
     meta::VectorMetric   vector_metric = meta::VectorMetric::kNone;
+    // S13-D11：HNSW 建图参数透传（0 = 用 HnswConfig 默认：M=16、
+    // ef_construction=200）。高召回部署调大、低内存部署调小。注意：已有
+    // checkpoint 的图按建图时参数持久化——改参数影响新插入与 merge 期
+    // rebuild 出的图，不追溯改写既有 checkpoint（不入 meta 校验，属调优
+    // 参数而非格式参数）。
+    std::uint32_t        hnsw_m = 0;
+    std::uint32_t        hnsw_ef_construction = 0;
     // P5b:HNSW int8-only 内存模式(Cask::open 从 meta 透传)。仅 kDot。
     bool                 vector_inmem_int8 = false;
     // V6.2:WAL 批量刷新阈值。1 = 即时模式(默认,与旧版行为完全一致)。
@@ -272,6 +279,8 @@ public:
     // ---- HNSW 大小 + merge 重建 ----
     // 图节点数(含软删死节点;测试/观测用)。无向量配置 = 0。
     [[nodiscard]] std::size_t hnsw_size() const;
+    // S13-D8：查询缓存当前条目数（观测用；SearchCache 自带锁，线程安全）。
+    [[nodiscard]] std::size_t cache_entries() const { return cache_.size(); }
     // merge 重建(物理清除死节点)。**只能由 IndexPool worker 执行**
     // (与 on_vector 同线程 → 维持 HNSW 单写者约束):新建同 config 图,
     // 遍历旧图节点,跳过 !index_.is_live(ord),重插活节点,完毕原子换

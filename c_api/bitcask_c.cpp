@@ -385,6 +385,10 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts) {
     opts->vector_metric = BITCASK_VECTOR_METRIC_NONE;
     opts->vector_quantized = 0;
     opts->vector_inmem_int8 = 0;
+    opts->hnsw_m = 0;                 // S13-D11：0 = HnswConfig 默认
+    opts->hnsw_ef_construction = 0;
+    opts->log_fn = NULL;              // S13-D7：默认不上报
+    opts->log_ctx = NULL;
 }
 
 BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
@@ -410,6 +414,16 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
         cpp_opts.vector_metric = to_cpp_vector_metric(opts->vector_metric);
         cpp_opts.vector_quantized = opts->vector_quantized != 0;
         cpp_opts.vector_inmem_int8 = opts->vector_inmem_int8 != 0;
+        // S13-D7：C 函数指针 + ctx 包成 std::function（open-time 不可变）。
+        if (opts->log_fn) {
+            cpp_opts.log_fn =
+                [fn = opts->log_fn, ctx = opts->log_ctx](
+                    bitcask::CaskOptions::LogLevel lvl, std::string_view msg) {
+                    // C 侧要 NUL 结尾——msg 是引擎构造的临时串，拷一份。
+                    const std::string owned(msg);
+                    fn(static_cast<int>(lvl), owned.c_str(), ctx);
+                };
+        }
 
         if (opts->enable_search) {
             search::SearchLayerConfig search_cfg;
@@ -419,6 +433,8 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
             search_cfg.analyzer_config.enable_stop_words = opts->enable_stop_words != 0;
             search_cfg.analyzer_config.min_token_length = opts->min_token_length;
             search_cfg.analyzer_config.enable_stemming = opts->enable_stemming != 0;
+            search_cfg.hnsw_m = opts->hnsw_m;                              // S13-D11
+            search_cfg.hnsw_ef_construction = opts->hnsw_ef_construction;  // S13-D11
             if (opts->jieba_dict_path) {
                 search_cfg.analyzer_config.dict_path = opts->jieba_dict_path;
             }
@@ -521,6 +537,27 @@ BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
     });
 }
 
+// S13-D5：带 per-key TTL 的写入。
+BITCASK_API bitcask_error_t bitcask_put_ex(bitcask_t* cask,
+                                           bitcask_slice_t key,
+                                           bitcask_slice_t value,
+                                           uint32_t tstamp,
+                                           uint32_t expiry_at,
+                                           bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
+    std::span<const std::byte> value_span{static_cast<const std::byte*>(value.data), value.size};
+    auto result = as_cpp_cask(cask)->put(key_span, value_span, tstamp, expiry_at);
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    return BITCASK_OK;
+    });
+}
+
 BITCASK_API bitcask_error_t bitcask_delete(bitcask_t* cask,
                                              bitcask_slice_t key,
                                              uint32_t tstamp,
@@ -593,6 +630,7 @@ BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
     if (doc->vector && doc->vector_len > 0) {
         doc_input.vector = {doc->vector, doc->vector_len};
     }
+    doc_input.expiry_at = doc->expiry_at;  // S13-D5
 
     auto result = as_cpp_cask(cask)->put_doc(key_span, doc_input, tstamp);
     if (!result) {
@@ -909,6 +947,36 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
     });
 }
 
+// S13-D1：批量写。
+BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
+                                              const bitcask_kv_pair_t* items,
+                                              size_t n,
+                                              uint32_t tstamp,
+                                              bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    if (n == 0) return BITCASK_OK;
+    if (!items) return BITCASK_ERR_INVALID_OPTION;
+
+    std::vector<bitcask::Cask::BatchItem> batch;
+    batch.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        batch.push_back(bitcask::Cask::BatchItem{
+            {static_cast<const std::byte*>(items[i].key.data),
+             items[i].key.size},
+            {static_cast<const std::byte*>(items[i].value.data),
+             items[i].value.size}});
+    }
+    auto result = as_cpp_cask(cask)->put_batch(batch, tstamp);
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    return BITCASK_OK;
+    });
+}
+
 // S13-D2：带 meta 过滤的检索变体。filter==NULL 退化为无过滤；非法 filter →
 // INVALID_OPTION。过滤树在调用期间转换为 C++ MetaFilter（调用返回后 C 侧
 // 存储即可释放）。
@@ -1175,6 +1243,26 @@ BITCASK_API bitcask_error_t bitcask_status(bitcask_t* cask,
     out->key_bytes = info.key_bytes;
     out->epoch = info.epoch;
     out->index_errors = info.index_errors;
+    return BITCASK_OK;
+    });
+}
+
+// S13-D8：扩展观测（additive）。
+BITCASK_API bitcask_error_t bitcask_status_ex(bitcask_t* cask,
+                                              bitcask_status_ex_t* out,
+                                              bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
+
+    bitcask::StatusInfo info = as_cpp_cask(cask)->status();
+    out->key_count = info.key_count;
+    out->key_bytes = info.key_bytes;
+    out->epoch = info.epoch;
+    out->index_errors = info.index_errors;
+    out->hnsw_nodes = info.hnsw_nodes;
+    out->search_cache_entries = info.search_cache_entries;
+    out->read_handles = info.read_handles;
     return BITCASK_OK;
     });
 }

@@ -99,6 +99,8 @@ struct DocValueParts {
     std::optional<std::span<const std::byte>>  meta;
     std::vector<DocField>                      fields;  // 空 = 不写 fields 段
     bool                                      vec_quantized = false;  // V6.4.1 stub
+    // S13-D5：per-key 过期时刻（绝对 unix 秒；0 = 永不过期，不写段）。
+    std::uint32_t                             expiry_at = 0;
 };
 
 // 解码后的 kDoc value 视图。各段是 zero-copy span，生命周期跟着输入 buf。
@@ -120,6 +122,7 @@ struct DocValueView {
     std::span<const std::byte> text;
     std::span<const std::byte> meta;
     std::vector<DocField>      fields;      // 解出的字段（id + zero-copy value span）
+    std::uint32_t expiry_at = 0;            // S13-D5：0 = 无 per-key TTL
 };
 
 // 把 {vector,text,meta} 打包成 kDoc value，append 到 out。返回写入字节数。

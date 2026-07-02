@@ -153,6 +153,7 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
     if (parts.text)   flags |= format::kFlagHasText;
     if (parts.meta)   flags |= format::kFlagHasMeta;
     if (has_fields)   flags |= format::kFlagHasFields;
+    if (parts.expiry_at != 0) flags |= format::kFlagHasExpiry;  // S13-D5
 
     out.push_back(static_cast<std::byte>(format::kDocValueVersion));  // v3：统一版本
     out.push_back(static_cast<std::byte>(flags));
@@ -195,6 +196,12 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
             vbyte_encode(f.id, out);
             append_bytes(f.value);
         }
+    }
+    // S13-D5：expiry 段固定追加在最后（旧读端按位忽略尾部字节）。
+    if (parts.expiry_at != 0) {
+        const std::size_t at = out.size();
+        out.resize(at + sizeof(std::uint32_t));
+        std::memcpy(out.data() + at, &parts.expiry_at, sizeof(std::uint32_t));
     }
     return out.size() - base;
 }
@@ -293,6 +300,14 @@ decode_doc_value(std::span<const std::byte> buf) {
             }
             v.fields.push_back(f);
         }
+    }
+    // S13-D5：expiry 段（flag 0x20，末尾 u32 LE 绝对 unix 秒）。
+    if ((flags & format::kFlagHasExpiry) != 0) {
+        if (pos + sizeof(std::uint32_t) > buf.size()) {
+            return std::unexpected(DecodeError::kBufferTooShort);
+        }
+        std::memcpy(&v.expiry_at, buf.data() + pos, sizeof(std::uint32_t));
+        pos += sizeof(std::uint32_t);
     }
     return v;
 }

@@ -182,6 +182,19 @@ typedef struct {
     bitcask_vector_metric_t vector_metric;
     int       vector_quantized;  // 落盘 int8 量化
     int       vector_inmem_int8; // HNSW int8-only 内存模式
+
+    /* S13-D11：HNSW 建图参数（0 = 默认：M=16 / ef_construction=200）。
+       仅影响新插入与 merge 期重建出的图。 */
+    uint32_t  hnsw_m;
+    uint32_t  hnsw_ef_construction;
+
+    /* S13-D7：日志回调（open-time 不可变）。库内 best-effort 静默失败点
+       （checkpoint 保存失败、索引 worker 异常、merge 收尾异常等）经此上报。
+       level: 0 = warn, 1 = error。msg 为 NUL 结尾单行文本，仅回调期间有效。
+       可能从任意内部线程调用——回调须线程安全、不得回调进本 cask。
+       NULL = 不上报（默认，零开销）。 */
+    void (*log_fn)(int level, const char* msg, void* ctx);
+    void* log_ctx;
 } bitcask_options_t;
 
 // 初始化为默认值
@@ -236,6 +249,18 @@ typedef struct {
     uint64_t index_errors;
 } bitcask_status_t;
 
+// S13-D8：扩展状态（additive 新结构 + 新函数，既有 bitcask_status 的
+// struct 布局与语义不动——ABI 兼容）。
+typedef struct {
+    uint64_t key_count;
+    uint64_t key_bytes;
+    uint64_t epoch;
+    uint64_t index_errors;
+    uint64_t hnsw_nodes;           // HNSW 图节点数（含软删；无向量索引 = 0）
+    uint64_t search_cache_entries; // 查询缓存当前条目数（无索引 = 0）
+    uint64_t read_handles;         // read 句柄缓存当前大小（fd+mmap 数）
+} bitcask_status_ex_t;
+
 // needs_merge 结果
 typedef struct {
     int      needs;       // 0 = 不需要，1 = 需要
@@ -283,6 +308,15 @@ BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
                                           uint32_t tstamp,
                                           bitcask_fault_t* fault);
 
+/* S13-D5：带 per-key TTL 的写入。expiry_at = 绝对 unix 秒（0 = 永不过期，
+ * 等价 bitcask_put）。过期后 get/iter 视作不存在，空间 merge 时回收。 */
+BITCASK_API bitcask_error_t bitcask_put_ex(bitcask_t* cask,
+                                           bitcask_slice_t key,
+                                           bitcask_slice_t value,
+                                           uint32_t tstamp,
+                                           uint32_t expiry_at,
+                                           bitcask_fault_t* fault);
+
 // 删除 key（写入墓碑）。
 // tstamp = 0 表示使用当前时间。
 BITCASK_API bitcask_error_t bitcask_delete(bitcask_t* cask,
@@ -311,6 +345,7 @@ typedef struct {
     bitcask_slice_t meta;       // optional（data=NULL 跳过）
     const float*    vector;     // optional（NULL = 无向量）
     size_t          vector_len; // 向量元素数
+    uint32_t        expiry_at;  // S13-D5：per-key 过期时刻（绝对 unix 秒；0=永不）
 } bitcask_doc_input_t;
 
 // 写入结构化文档（索引模式）。
@@ -455,6 +490,23 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
 
 // 同义词词典已改为 **open 时配置**：见 bitcask_options_t::synonym_file_path
 //（不可变、并发查询安全；运行期 setter 已移除）。
+
+/* 批量写（S13-D1）。语义同逐条 bitcask_put，但整批一次提交：记录聚合写入、
+ * 单次 flush 后才更新 keydir 并返回——本进程内 all-or-nothing 可见；
+ * durability 与单条 put 的 sync 策略一致（o_sync 即时；sync_every_n>0 整批一次
+ * 组提交；否则由 bitcask_sync 控制）。失败返回时整批不可见（磁盘可能残留
+ * 前缀，重启后可见——与连续单条 put 的崩溃语义一致）。
+ * 校验（key/value 大小）在任何写之前全批完成。items 借调用方存储。 */
+typedef struct {
+    bitcask_slice_t key;
+    bitcask_slice_t value;
+} bitcask_kv_pair_t;
+
+BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
+                                              const bitcask_kv_pair_t* items,
+                                              size_t n,
+                                              uint32_t tstamp,
+                                              bitcask_fault_t* fault);
 
 /* ===========================================================================
  *  Meta 过滤（S13-D2）——V5 结构化 meta 过滤的 C 表示
@@ -602,6 +654,11 @@ BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
 // 获取状态信息。
 BITCASK_API bitcask_error_t bitcask_status(bitcask_t* cask,
                                               bitcask_status_t* out,
+                                              bitcask_fault_t* fault);
+
+// S13-D8：扩展观测（见 bitcask_status_ex_t）。
+BITCASK_API bitcask_error_t bitcask_status_ex(bitcask_t* cask,
+                                              bitcask_status_ex_t* out,
                                               bitcask_fault_t* fault);
 
 // 检查是否需要 merge。

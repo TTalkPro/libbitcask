@@ -4,6 +4,7 @@
 #include <cstring>
 #include <filesystem>
 
+#include "bitcask/codec.hpp"
 #include "bitcask/data_file.hpp"
 #include "bitcask/format.hpp"
 #include "bitcask/hint_file.hpp"
@@ -37,7 +38,8 @@ run_merge(std::span<const std::string> input_data_paths,
           std::string_view output_dir,
           keydir::KeyDir& keydir,
           bool sync_output,
-          search::SearchLayer* search_layer) {
+          search::SearchLayer* search_layer,
+          std::uint32_t now_sec) {
     MergeStats stats;
     // 给输出文件分配新 file_id；这一步必须在 open 前完成，
     // 文件名直接拼成 "<id>.bitcask.data" / "<id>.bitcask.hint"。
@@ -136,6 +138,20 @@ run_merge(std::span<const std::string> input_data_paths,
                     current->offset  != offset) {
                     stats.records_stale += 1;
                     return;
+                }
+
+                // S13-D5：per-key TTL——过期记录不搬运，并 CAS 清 keydir（位置
+                // 匹配才删，与并发 put 无冲突）。keydir 删除后输入 unlink 即
+                // 完成空间回收；搜索侧死文档由 is_live 过滤 + compact 回收。
+                if (now_sec != 0 &&
+                    view.type == format::RecordType::kDoc) {
+                    auto dv = codec::decode_doc_value(view.value);
+                    if (dv && dv->expiry_at != 0 && dv->expiry_at <= now_sec) {
+                        stats.records_expired += 1;
+                        (void)keydir.conditional_remove(
+                            key_sv, view.tstamp, in_file_id, offset, now_sec);
+                        return;
+                    }
                 }
 
                 // 复制到输出：先写新 data file，再写新 hint file。

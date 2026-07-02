@@ -332,6 +332,86 @@ static int test_parallel_scan(void) {
     return 0;
 }
 
+// S13-D1：批量写。基础语义 + n==0 边界 + 参数校验。
+static int test_put_batch(void) {
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    bitcask_error_t err =
+        bitcask_open("/tmp/bitcask_c_test_putbatch", &opts, &cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_put_batch: open failed: %s\n", fault.detail);
+        return 1;
+    }
+
+    bitcask_kv_pair_t items[3] = {
+        {{"bk0", 3}, {"v0", 2}},
+        {{"bk1", 3}, {"v1", 2}},
+        {{"bk2", 3}, {"v2", 2}},
+    };
+    err = bitcask_put_batch(cask, items, 3, 0, &fault);
+    assert(err == BITCASK_OK);
+
+    for (int i = 0; i < 3; i++) {
+        bitcask_get_result_t* r = NULL;
+        err = bitcask_get(cask, items[i].key, &r, &fault);
+        assert(err == BITCASK_OK);
+        assert(r->value.size == 2);
+        assert(memcmp(r->value.data, items[i].value.data, 2) == 0);
+        bitcask_get_result_free(r);
+    }
+
+    // n==0 → OK；items NULL + n>0 → INVALID_OPTION。
+    assert(bitcask_put_batch(cask, NULL, 0, 0, &fault) == BITCASK_OK);
+    assert(bitcask_put_batch(cask, NULL, 2, 0, &fault) ==
+           BITCASK_ERR_INVALID_OPTION);
+
+    bitcask_close(cask);
+    printf("PASS test_put_batch\n");
+    return 0;
+}
+
+// S13-D7/D8/D11：options 新字段默认值 + status_ex + log 回调冒烟。
+static void test_log_cb(int level, const char* msg, void* ctx) {
+    (void)level; (void)msg;
+    atomic_fetch_add((atomic_int*)ctx, 1);
+}
+static int test_status_ex_and_log(void) {
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    assert(opts.log_fn == NULL && opts.log_ctx == NULL);
+    assert(opts.hnsw_m == 0 && opts.hnsw_ef_construction == 0);
+
+    static atomic_int log_calls;
+    atomic_store(&log_calls, 0);
+    opts.read_write = 1;
+    opts.log_fn = test_log_cb;   // 冒烟：挂上回调不影响正常路径
+    opts.log_ctx = &log_calls;
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    bitcask_error_t err =
+        bitcask_open("/tmp/bitcask_c_test_statusex", &opts, &cask, &fault);
+    assert(err == BITCASK_OK);
+    bitcask_slice_t k = {"sk", 2}, v = {"sv", 2};
+    assert(bitcask_put(cask, k, v, 0, &fault) == BITCASK_OK);
+
+    bitcask_status_ex_t st;
+    err = bitcask_status_ex(cask, &st, &fault);
+    assert(err == BITCASK_OK);
+    assert(st.key_count == 1);
+    assert(st.hnsw_nodes == 0);           // 无向量索引
+    assert(st.search_cache_entries == 0); // 无搜索
+    assert(bitcask_status_ex(cask, NULL, &fault) == BITCASK_ERR_INVALID_OPTION);
+
+    bitcask_close(cask);
+    printf("PASS test_status_ex_and_log\n");
+    return 0;
+}
+
 // S13-D2：meta 过滤检索变体。文档不带 meta（C 侧暂无 meta 编码 API），
 // 引擎语义：**filter 非空时无 meta 的文档一律不通过**（materialize_hits 的
 // 「空 blob 不通过」约定）——故任何 filter 下命中皆 0；NULL filter 退化为
@@ -457,6 +537,8 @@ int main(void) {
     failures += test_search_text_batch();
     failures += test_search_vector_hybrid_batch();
     failures += test_parallel_scan();
+    failures += test_put_batch();
+    failures += test_status_ex_and_log();
     failures += test_search_filtered();
 
     if (failures == 0) {

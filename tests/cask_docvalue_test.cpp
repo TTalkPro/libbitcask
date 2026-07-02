@@ -280,6 +280,346 @@ TEST_F(CaskDocValueTest, SearchTextAfterPut) {
     (*c)->close();
 }
 
+// S13-D8+D11：扩展观测字段 + HNSW 参数透传（端到端冒烟：非默认 M/efc 下
+// 建图、检索、观测计数正确）。
+TEST_F(CaskDocValueTest, StatusExFieldsAndHnswParamPassthrough) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    opts.vector_dim = 4;
+    opts.vector_metric = bitcask::meta::VectorMetric::kL2;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    sl_cfg.hnsw_m = 8;                 // S13-D11：非默认建图参数
+    sl_cfg.hnsw_ef_construction = 64;
+    opts.search_config = sl_cfg;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto bytes = [](std::string_view s2) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+    };
+    const float vecs[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+    for (int i = 0; i < 3; ++i) {
+        bitcask::DocInput doc;
+        const std::string text = "doc number " + std::to_string(i);
+        doc.text = bytes(text);
+        doc.vector = std::span<const float>(vecs[i], 4);
+        ASSERT_TRUE((*c)->put_doc(bytes("sx" + std::to_string(i)), doc, 1000));
+    }
+    (*c)->flush_index();
+
+    // D11 冒烟：非默认参数下向量检索正确。
+    const float q[4] = {1, 0, 0, 0};
+    auto vr = (*c)->search_vector(std::span<const float>(q, 4), 1);
+    ASSERT_TRUE(vr);
+    ASSERT_EQ(vr->hits.size(), 1u);
+    EXPECT_EQ(vr->hits[0].key, "sx0");
+
+    // D8：文本搜索一次让缓存入一条，再看观测字段。
+    auto tr = (*c)->search_text("doc", 10);
+    ASSERT_TRUE(tr);
+    auto st = (*c)->status();
+    EXPECT_EQ(st.hnsw_nodes, 3u);
+    EXPECT_GE(st.search_cache_entries, 1u);
+    EXPECT_EQ(st.key_count, 3u);
+    (*c)->close();
+}
+
+// S13-D7：日志回调——用「keydir 快照保存失败」（目录只读）确定性触发 warn。
+TEST_F(CaskDocValueTest, LogHookFiresOnSnapshotFailure) {
+    std::vector<std::string> logs;
+    std::mutex logs_mu;
+
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.log_fn = [&](CaskOptions::LogLevel lvl, std::string_view msg) {
+        std::lock_guard<std::mutex> g(logs_mu);
+        logs.push_back(std::string(lvl == CaskOptions::LogLevel::kError
+                                       ? "E:" : "W:") + std::string(msg));
+    };
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    std::vector<std::byte> k{std::byte{'k'}}, v{std::byte{'v'}};
+    ASSERT_TRUE((*c)->put(k, v, 1000));
+
+    // 目录改只读：close 的 write_keydir_snapshot（temp 文件创建）失败 → warn。
+    std::filesystem::permissions(tmpdir_,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
+    (*c)->close();
+    std::filesystem::permissions(tmpdir_, std::filesystem::perms::owner_all);
+
+    std::lock_guard<std::mutex> g(logs_mu);
+    ASSERT_FALSE(logs.empty()) << "只读目录下 close 应触发快照保存失败上报";
+    bool has_snap_warn = false;
+    for (const auto& m : logs) {
+        if (m.find("snapshot save failed") != std::string::npos) {
+            has_snap_warn = true;
+        }
+    }
+    EXPECT_TRUE(has_snap_warn) << "应包含 keydir snapshot 失败的 warn";
+}
+
+// S13-D10：分页 offset——overfetch 后截断；offset 页与全量列表的对应切片一致。
+TEST_F(CaskDocValueTest, SearchTextPaginationOffset) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = sl_cfg;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    auto bytes = [](std::string_view s2) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+    };
+    // 5 篇含 "page"，词频递增 → 分数区分度。
+    for (int i = 0; i < 5; ++i) {
+        std::string text = "page";
+        for (int r = 0; r < i; ++r) text += " page";
+        text += " filler" + std::to_string(i);
+        bitcask::DocInput doc;
+        doc.text = bytes(text);
+        ASSERT_TRUE((*c)->put_doc(bytes("pg" + std::to_string(i)), doc, 1000));
+    }
+
+    auto full = (*c)->search_text("page", 5);
+    ASSERT_TRUE(full);
+    ASSERT_EQ(full->hits.size(), 5u);
+
+    auto page2 = (*c)->search_text("page", 2, nullptr, /*offset*/ 2);
+    ASSERT_TRUE(page2);
+    ASSERT_EQ(page2->hits.size(), 2u);
+    EXPECT_EQ(page2->hits[0].key, full->hits[2].key);
+    EXPECT_EQ(page2->hits[1].key, full->hits[3].key);
+
+    auto beyond = (*c)->search_text("page", 10, nullptr, /*offset*/ 100);
+    ASSERT_TRUE(beyond);
+    EXPECT_TRUE(beyond->hits.empty());
+    (*c)->close();
+}
+
+// S13-D5：per-key TTL——get/iter 过滤 + merge 回收（清 keydir）+ 无 TTL 回归。
+TEST_F(CaskDocValueTest, PerKeyTtlExpiryAndMergeReclaim) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.max_file_size = 512;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    auto bytes = [](std::string_view s2) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+    };
+    const auto now = static_cast<std::uint32_t>(::time(nullptr));
+
+    // 三类：已过期 / 未来过期 / 无 TTL。
+    ASSERT_TRUE((*c)->put(bytes("t_expired"), bytes("v1"), 1000, now - 10));
+    ASSERT_TRUE((*c)->put(bytes("t_future"),  bytes("v2"), 1000, now + 3600));
+    ASSERT_TRUE((*c)->put(bytes("t_none"),    bytes("v3"), 1000));
+
+    EXPECT_FALSE((*c)->get_owned(bytes("t_expired")));   // 过期 = 不存在
+    ASSERT_TRUE((*c)->get_owned(bytes("t_future")));
+    ASSERT_TRUE((*c)->get_owned(bytes("t_none")));
+
+    // 迭代器同语义：只见 2 条。
+    auto it = (*c)->make_iter();
+    auto sr = it->start();
+    ASSERT_TRUE(sr);
+    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+    std::size_t n = 0;
+    while (true) {
+        auto e = it->next();
+        ASSERT_TRUE(e);
+        if (!e->has_value()) break;
+        ++n;
+    }
+    it->release();
+    EXPECT_EQ(n, 2u);
+
+    // merge：过期记录不搬运并清 keydir（records_expired 计数）。
+    // 先滚出 sealed 文件再显式 merge 全部 sealed。
+    for (int i = 0; i < 30; ++i) {
+        ASSERT_TRUE((*c)->put(bytes("fill" + std::to_string(i)),
+                              bytes("ffffffffffffffff"), 1000));
+    }
+    auto nm = (*c)->needs_merge();
+    std::vector<std::string> files = std::move(nm.files);
+    if (files.empty()) {
+        // 手动收集 sealed 文件（全 live 不触发策略）。
+        for (const auto& de : std::filesystem::directory_iterator(tmpdir_)) {
+            const auto name = de.path().filename().string();
+            if (auto t = bitcask::fileops::parse_data_tstamp(name)) {
+                files.push_back(de.path().string());
+            }
+        }
+        std::sort(files.begin(), files.end());
+        files.pop_back();  // 排除 active
+    }
+    auto mr = (*c)->merge(files);
+    ASSERT_TRUE(mr);
+    EXPECT_GE(mr->records_expired, 1u);
+    EXPECT_FALSE((*c)->get_owned(bytes("t_expired")));
+    ASSERT_TRUE((*c)->get_owned(bytes("t_future")));
+    ASSERT_TRUE((*c)->get_owned(bytes("t_none")));
+    (*c)->close();
+
+    // 重启：过期 key 不复活（merge 已清）；其余仍在。
+    auto c2 = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c2);
+    EXPECT_FALSE((*c2)->get_owned(bytes("t_expired")));
+    ASSERT_TRUE((*c2)->get_owned(bytes("t_future")));
+    ASSERT_TRUE((*c2)->get_owned(bytes("t_none")));
+    (*c2)->close();
+}
+
+// S13-D6：备份——热拷贝到新目录，备份目录可独立 open；原库备份后继续可写。
+TEST_F(CaskDocValueTest, BackupHotCopyAndReopen) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.max_file_size = 512;  // 滚出多个 sealed 文件
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto bytes = [](std::string_view s2) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+    };
+    for (int i = 0; i < 50; ++i) {
+        ASSERT_TRUE((*c)->put(bytes("bku" + std::to_string(i)),
+                              bytes("val" + std::to_string(i)), 1000));
+    }
+
+    const auto dst = tmpdir_.string() + "_backup";
+    std::filesystem::remove_all(dst);
+    ASSERT_TRUE((*c)->backup(dst));
+
+    // 原库备份后仍可写（active writer 惰性重建）且旧数据可读。
+    ASSERT_TRUE((*c)->put(bytes("after_backup"), bytes("x"), 2000));
+    ASSERT_TRUE((*c)->get_owned(bytes("bku0")));
+    (*c)->close();
+
+    // 备份目录独立 open：50 个 key 全在，备份后写入的 key 不在。
+    CaskOptions ro;
+    ro.read_write = false;
+    auto b = Cask::open(dst, ro, &test_registry());
+    ASSERT_TRUE(b);
+    for (int i = 0; i < 50; ++i) {
+        auto r = (*b)->get_owned(bytes("bku" + std::to_string(i)));
+        ASSERT_TRUE(r) << "backup missing key bku" << i;
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(r->value.data()),
+                              r->value.size()),
+                  "val" + std::to_string(i));
+    }
+    EXPECT_FALSE((*b)->get_owned(bytes("after_backup")));
+    (*b)->close();
+    std::filesystem::remove_all(dst);
+}
+
+// S13-D1：put_batch——整批一次提交（flush 后才 apply keydir）。
+TEST_F(CaskDocValueTest, PutBatchBasicAndPersistence) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.sync_every_n = 8;  // 走「整批一次组提交」路径
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto bytes = [](std::string_view s) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s.data()), s.size());
+    };
+
+    constexpr int kN = 200;
+    std::vector<std::string> keys, vals;
+    keys.reserve(kN);
+    vals.reserve(kN);
+    for (int i = 0; i < kN; ++i) {
+        keys.push_back("bk" + std::to_string(i));
+        vals.push_back("value_" + std::to_string(i));
+    }
+    std::vector<Cask::BatchItem> batch;
+    batch.reserve(kN);
+    for (int i = 0; i < kN; ++i) {
+        batch.push_back({bytes(keys[i]), bytes(vals[i])});
+    }
+    ASSERT_TRUE((*c)->put_batch(batch, 1000));
+
+    // 全部可读且值正确。
+    for (int i = 0; i < kN; ++i) {
+        auto r = (*c)->get_owned(bytes(keys[i]));
+        ASSERT_TRUE(r) << "batch key missing: " << keys[i];
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(r->value.data()),
+                              r->value.size()),
+                  vals[i]);
+    }
+
+    // 空批 no-op；校验失败零副作用（超大 key 的批整体拒绝，其余条目不写入）。
+    ASSERT_TRUE((*c)->put_batch({}, 1000));
+    std::string big_key(bitcask::format::kMaxKeySize + 1, 'x');
+    std::vector<Cask::BatchItem> bad;
+    bad.push_back({bytes("bk_new_never_written"), bytes("v")});
+    bad.push_back({bytes(big_key), bytes("v")});
+    auto br = (*c)->put_batch(bad, 1000);
+    ASSERT_FALSE(br);
+    EXPECT_EQ(br.error().kind, bitcask::CaskError::kKeyTooLarge);
+    EXPECT_FALSE((*c)->get_owned(bytes("bk_new_never_written")))
+        << "校验失败的批不应有任何副作用";
+
+    // 批中覆盖已有 key：LWW 生效。
+    std::vector<Cask::BatchItem> upd;
+    upd.push_back({bytes(keys[0]), bytes("updated")});
+    ASSERT_TRUE((*c)->put_batch(upd, 2000));
+    auto u = (*c)->get_owned(bytes(keys[0]));
+    ASSERT_TRUE(u);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(u->value.data()),
+                          u->value.size()),
+              "updated");
+
+    (*c)->close();
+
+    // 重启后全部仍在（含覆盖后的值）。
+    auto c2 = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c2);
+    for (int i = 1; i < kN; ++i) {
+        auto r = (*c2)->get_owned(bytes(keys[i]));
+        ASSERT_TRUE(r) << "batch key lost after reopen: " << keys[i];
+    }
+    auto u2 = (*c2)->get_owned(bytes(keys[0]));
+    ASSERT_TRUE(u2);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(u2->value.data()),
+                          u2->value.size()),
+              "updated");
+    (*c2)->close();
+}
+
+// S13-D1：索引模式下 put_batch 的 Add 任务经异步管线正确入索引。
+TEST_F(CaskDocValueTest, PutBatchIndexedSearchable) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = sl_cfg;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto bytes = [](std::string_view s) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s.data()), s.size());
+    };
+    std::vector<Cask::BatchItem> batch;
+    batch.push_back({bytes("bd0"), bytes("batch hello world")});
+    batch.push_back({bytes("bd1"), bytes("batch hello there")});
+    batch.push_back({bytes("bd2"), bytes("other text")});
+    ASSERT_TRUE((*c)->put_batch(batch, 1000));
+
+    auto sr = (*c)->search_text("hello", 10);  // 门面内部 flush 管线
+    ASSERT_TRUE(sr);
+    EXPECT_EQ(sr->hits.size(), 2u);
+    (*c)->close();
+}
+
 // S13-D4：前缀扫描——CaskIter::start / parallel_scan 的 key_prefix 过滤。
 TEST_F(CaskDocValueTest, PrefixScanIterAndParallelScan) {
     CaskOptions opts;

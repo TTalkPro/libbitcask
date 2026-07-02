@@ -122,6 +122,16 @@ struct CaskOptions {
     // set_synonym_map setter，那是配置项里唯一的 reader-vs-writer 竞态源）。
     // 空 = 不展开。仅在 enable_search 时生效；运行期更换词典请重开库。
     std::shared_ptr<const text::SynonymMap> synonym_map;
+
+    // S13-D7：日志回调（**open-time、不可变**——沿 synonym_map 的「不可变
+    // 配置无竞态」模式）。库内 best-effort 静默失败点（checkpoint/快照保存
+    // 失败、索引 worker 异常、merge 收尾 unlink 失败、stuck 重定位等）经此
+    // 上报。空 = 不上报（默认，零开销）。
+    // 契约：可能从**任意内部线程**（写线程、reducer、merge 调用线程）调用；
+    // 回调自身必须线程安全、不得抛出（抛出被吞掉）、不得回调进本 Cask
+    // （死锁风险）。消息为一行人类可读文本，仅在回调期间有效。
+    enum class LogLevel : std::uint8_t { kWarn = 0, kError = 1 };
+    std::function<void(LogLevel, std::string_view)> log_fn;
 };
 
 // --- 错误码 ------------------------------------------------------------------
@@ -171,6 +181,7 @@ public:
     std::span<const float> vector{};       // 向量段（空=无向量）
     std::uint32_t tstamp = 0;
     std::uint64_t ord = 0;
+    std::uint32_t expiry_at = 0;           // S13-D5：per-key 过期时刻（0=永不）
 
     /// 拷贝为 owned 版本
     GetResult to_owned() const;
@@ -213,6 +224,7 @@ struct DocInput {
     // cosine_normalized 度量下引擎写入前归一化(存储的即归一化值)。
     std::span<const float> vector{};
     std::vector<std::pair<std::string, std::span<const std::byte>>> fields;  // S8.6
+    std::uint32_t expiry_at = 0;  // S13-D5：per-key 过期时刻（0 = 永不）
 };
 
 struct StatusInfo {
@@ -222,6 +234,13 @@ struct StatusInfo {
     std::vector<merge::FileStatus> files;
     // indexed worker 抛异常时自增；非零 = 索引可能漂移，搜索结果可能陈旧
     std::uint64_t index_errors = 0;
+    // S13-D8：观测扩展（无索引/不适用时为 0）。
+    std::uint64_t hnsw_nodes = 0;            // HNSW 图节点数（含软删死节点）
+    std::uint64_t search_cache_entries = 0;  // 查询缓存当前条目数
+    std::uint64_t read_handles = 0;          // read 句柄缓存当前大小（fd+mmap 数）
+    // 注：倒排 posting 总量（total_postings）未纳入——其统计需遍历
+    // concurrent_hash_map，与 reducer 插入并发不安全（S13-F6 同类）；待
+    // InvertedIndex 维护原子计数器后再暴露。
 };
 
 class Cask;
@@ -421,10 +440,37 @@ public:
     // 线程安全: **是**（S11-W1：内部 `write_mu_` 串行化整个写序列;同一 handle 可
     // 被多线程并发写而不损坏。写在文件层本就串行 → 锁不损吞吐;更高写并发 → 按
     // 目录分片多 Cask 实例）。与并发 merge / 并发读（get/search）安全。
+    // S13-D5：expiry_at = per-key 过期时刻（绝对 unix 秒；0 = 永不过期）。
+    // 过期后 get/iter/scan 视作不存在（kNotFound/跳过），空间在 merge 时回收
+    // （merge 对过期记录同时清 keydir）。与整库 opts_.expiry_secs 叠加：任一
+    // 判过期即过期。旧版本库读带 TTL 的记录 = 忽略 TTL（永不过期，静默降级）。
     [[nodiscard]] std::expected<void, CaskFault>
     put(std::span<const std::byte> key,
         std::span<const std::byte> value,
-        std::uint32_t tstamp = 0);
+        std::uint32_t tstamp = 0,
+        std::uint32_t expiry_at = 0);
+
+    // S13-D1：批量写（语义同 put 的 KV 路径）。整批一次提交：记录经
+    // write_buffered 聚合成 1MiB 块 pwrite、单次 flush **之后**才 apply
+    // keydir / 提交索引任务并返回——批内 syscall 开销从 N 次摊到少数几次。
+    // 语义契约：
+    //   - 成功返回 ⟹ 整批已写入且全部可见（keydir apply 在数据 flush 之后，
+    //     本进程内 all-or-nothing——读者不会观察到批的中间态）。durability
+    //     与单条 put 的 sync 策略对齐：o_sync 即时（O_DSYNC）；
+    //     sync_every_n>0 时整批为一次组提交、返回前 fdatasync；
+    //     sync_every_n==0 时同单条 put，由 caller 的 sync() 控制。
+    //   - 失败返回 ⟹ 整批在本进程内不可见（keydir 未动）。磁盘上可能残留
+    //     批的前缀（每条记录独立自洽，崩溃重启 fold 后可见）——与连续单条
+    //     put 的崩溃语义一致；本 API 不提供跨崩溃的原子性。
+    //   - 校验（key/value 大小）在任何写发生前全批完成——校验失败零副作用。
+    //   - 整批写入同一 active 文件；巨批允许该文件超出 max_file_size（软上限）。
+    // 线程安全: **是**（同 put，内部 write_mu_）。
+    struct BatchItem {
+        std::span<const std::byte> key;
+        std::span<const std::byte> value;
+    };
+    [[nodiscard]] std::expected<void, CaskFault>
+    put_batch(std::span<const BatchItem> items, std::uint32_t tstamp = 0);
 
     // 软删除：写一条墓碑 record。空间在下一次 merge 时回收。
     // 线程安全: **是**（同 put，内部 write_mu_）。
@@ -442,9 +488,14 @@ public:
     // shared_lock、analyzer const;S6/S7 TSan 已证）。与并发写安全,可见性遵循
     // near-real-time 契约（prepare_search flush 覆盖调用前的写)。
     // V5:filter 非空时 meta 过滤(后过滤 overfetch k×4 再截断到 k)。
+    // S13-D10：offset = 跳过排名前 offset 条（分页）。实现为 overfetch
+    // k+offset 后截断——深分页成本线性增长（offset 大时考虑游标式方案）。
+    // 不提供总命中数：WAND/BMW 剪枝下 total 只能给下界，误导大于价值（详见
+    // TASK.md S13-D10 注）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_text(std::string_view query, std::size_t k = 10,
-                const meta::MetaFilter* filter = nullptr);
+                const meta::MetaFilter* filter = nullptr,
+                std::size_t offset = 0);
 
     // S7-4:批量 BM25 文本搜索——K 条**独立**查询并发跑在进程级共享「有界
     // Search 池」上（inter-query 并发；非每 Cask 一个线程），按输入序返回各自
@@ -461,11 +512,13 @@ public:
     // BM25 文本搜索（短语模式）。
     // 线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    search_phrase(std::string_view query, std::size_t k = 10);
+    search_phrase(std::string_view query, std::size_t k = 10,
+                  std::size_t offset = 0);  // S13-D10
 
     // BM25 布尔搜索（AND/OR/NOT）。线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    bool_search(std::string_view query, std::size_t k = 10);
+    bool_search(std::string_view query, std::size_t k = 10,
+                std::size_t offset = 0);  // S13-D10
 
     // V3.3:HNSW 向量检索。query 长度必须 == meta 配置的 vector_dim;
     // cosine 配置时内部归一化查询向量(零向量返回空命中)。ef=0 →
@@ -597,6 +650,17 @@ public:
     [[nodiscard]] std::expected<merge::MergeStats, CaskFault>
     merge(std::vector<std::string> files = {}, std::uint32_t now_sec = 0);
 
+    // S13-D6：不停机备份到 dst_dir（不存在则创建）。流程：持 write_mu_ 关闭
+    // active writer（finalize hint trailer，下一次 put 自动重建）→ 快照文件
+    // 清单 → 逐文件 hardlink（跨设备回退 copy）data/hint + bitcask.meta +
+    // field.schema + keydir/search checkpoint（有则带上，加速备份目录首次
+    // open）。sealed 文件不可变 ⟹ hardlink 即一致快照。
+    // 备份目录可直接以只读或读写模式 open。
+    // 锁要求：**caller 须保证 backup 与 merge 不并发**（merge 收尾会 unlink
+    // 输入文件；与同目录 merge 的单实例约束同级）。与并发 put/get 安全
+    // （put 被 write_mu_ 挡在备份期间外，get 不受影响）。
+    [[nodiscard]] std::expected<void, CaskFault> backup(std::string_view dst_dir);
+
     // 线程安全: 是；不需任何锁。返回的 CaskIter 自身非线程安全。
     [[nodiscard]] std::unique_ptr<CaskIter> make_iter() {
         return std::make_unique<CaskIter>(this);
@@ -704,6 +768,22 @@ private:
     // 队列提供：队列满（capacity 10240）时 submit 内部的 push 阻塞写线程，
     // 自然限速，避免任务无限堆积撑爆内存。
     void submit_index_task(IndexTask task);
+
+    // S13-D7：日志上报（best-effort：未配置 log_fn 为 no-op；回调抛出被吞）。
+    void log(CaskOptions::LogLevel lvl, std::string_view msg) const noexcept {
+        if (!opts_.log_fn) return;
+        try {
+            opts_.log_fn(lvl, msg);
+        } catch (...) {
+            // 回调契约不得抛出；违约吞掉，日志不能反过来搞挂引擎。
+        }
+    }
+    void log_warn(std::string_view msg) const noexcept {
+        log(CaskOptions::LogLevel::kWarn, msg);
+    }
+    void log_error(std::string_view msg) const noexcept {
+        log(CaskOptions::LogLevel::kError, msg);
+    }
 
     // S13-F2: ord 泄漏守卫。写路径 alloc_ord 后、真任务提交前的任何错误
     // return 都必须给该 ord 补一条 Skip——否则 reducer 的 next_apply_ord

@@ -99,6 +99,10 @@ inline constexpr std::uint8_t kFlagHasText      = 0x02;
 inline constexpr std::uint8_t kFlagHasMeta      = 0x04;
 inline constexpr std::uint8_t kFlagVecQuantized = 0x08;
 inline constexpr std::uint8_t kFlagHasFields    = 0x10;  // fields 段存在（S8.6）
+// S13-D5：per-key TTL。置位时 value 末尾追加 [ExpiryAt:u32 LE]（绝对 unix 秒，
+// 恒非 0）。段追加在既有全部段之后 ⟹ 旧读端（不识别本位）按位忽略、跳过
+// 尾部字节——旧库读带 TTL 的记录 = 永不过期（静默降级，非拒绝）。
+inline constexpr std::uint8_t kFlagHasExpiry    = 0x20;
 
 // P3a 量化向量码字（kFlagVecQuantized 段，per-vector 对称 int8）。布局：
 //   [Dim:varint 元素数][SchemeVer:u8][scale:f32 小端][int8 × Dim]

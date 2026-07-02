@@ -76,6 +76,33 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
 - **前缀扫描（S13-D4）**：`CaskIter::start` / `Cask::parallel_scan` 新增尾置默认
   参数 `key_prefix`（源兼容）——遍历命名空间（如 `"user:"`）无需全表扫 + 自行
   过滤；过滤在 keydir proxy 层，非匹配 key 零 pread 零拷贝。
+- **批量写 `put_batch`（S13-D1）**：全批校验（零副作用）→ 聚合 pwrite → 单次
+  flush（durability 按既有 sync 策略：o_sync 即时 / sync_every_n>0 整批一次组
+  提交 / 否则 caller sync() 控制）→ keydir apply（flush 之后 ⟹ 本进程内
+  all-or-nothing 可见）。批内 syscall 从 N 次摊到少数几次；merge race 条目自动
+  走单条重写路径。C API 新增 `bitcask_kv_pair_t` + `bitcask_put_batch`。
+  不提供跨崩溃原子性（契约注明，与连续单条 put 的崩溃语义一致）。
+- **搜索分页 offset（S13-D10）**：`search_text/search_phrase/bool_search` 新增
+  尾置 `offset` 参数（overfetch 后截断；total 估计有意不做——剪枝下仅有下界，
+  见 TASK.md）。
+- **per-key TTL（S13-D5）**：`put(..., expiry_at)` / `DocInput::expiry_at` /
+  C `bitcask_put_ex`（绝对 unix 秒，0=永不）。过期后 get/iter 视作不存在；
+  merge 时不搬运并 CAS 清 keydir（`MergeStats::records_expired`）。格式：
+  DocValue 新 flag 0x20 + 末尾 u32 段——**旧版本库读到带 TTL 的记录会静默
+  忽略 TTL（永不过期），不拒绝**。
+- **备份/热拷贝 API（S13-D6）**：`Cask::backup(dst_dir)`——封存 active 后
+  hardlink（跨设备回退 copy）全部数据与元数据文件，备份目录可独立 open；
+  原库不停机（下一次 put 自动重建 writer）。caller 须保证与 merge 不并发。
+- **日志回调 hook（S13-D7）**：`CaskOptions::log_fn`（open-time 不可变、可能从
+  任意内部线程调用、回调抛出被吞）。库内 6 处 best-effort 静默失败点现可观测
+  （keydir/search checkpoint 保存失败、stuck 重定位、索引 worker 异常、close
+  兜底等）。C API 追加 `log_fn`/`log_ctx`。
+- **统计扩展（S13-D8）**：StatusInfo 加 `hnsw_nodes`/`search_cache_entries`/
+  `read_handles`；C API additive `bitcask_status_ex`。total_postings 有意不含
+  （遍历 concurrent map 与 reducer 并发不安全，待原子计数器）。
+- **HNSW 建图参数透传（S13-D11）**：`SearchLayerConfig::hnsw_m`/
+  `hnsw_ef_construction`（0=默认 16/200），构造与 merge 期 rebuild 均生效；
+  C options 同步。
 - **C API meta 过滤（S13-D2）**：V5 meta 过滤此前 FFI 完全不可用。新增
   `bitcask_meta_filter_t`（条件数组 + And/Or + 嵌套子树）与三个 **additive**
   检索变体 `bitcask_search_text_filtered` / `bitcask_search_vector_filtered` /
@@ -84,6 +111,10 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
 
 ### Performance
 
+- **HNSW int8 热路径零分配 + madvise 批量化（S13-P5）**：`quantize_into` +
+  thread_local 复用消除每查询/插入的 codes 堆分配；精排预取按地址区间合并，
+  k=256 时 ~768 次 madvise/查询降到个位数。SIMD round 有意不做（舍入模式与
+  std::round 在 .5 边界不同，codes 入 checkpoint，违反位级不变约定）。
 - **搜索管线改按词选择性失效查询缓存（S13-P1）**：`reduce_apply` 曾无条件清空
   整个查询缓存——所有 put/put_doc 走管线，混合读写负载下命中率归零。现与单文本
   路径 `on_write` 对齐，用文档词集调 `invalidate_terms`。
@@ -102,9 +133,10 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
   refill 模式后降 3 个数量级。影响 merge 全部输入扫描、搜索模式恢复与纯 KV
   无 hint 回退。
 
-**验证**：Debug（clang）全量 494/494（489 既有 + 5 新回归：F1/F6/D3/D4 + C
-过滤）；TSan 并发相关全过（`ThreadCountIndependentOfLibCount` 为 TSan 环境既有
-失败，干净树同样失败，与本批无关）；C API 8/8；Release 构建干净。
+**验证**：Debug（clang）全量 503/503（494 既有 + 本批 9 新回归：put_batch×2
++ ttl/backup/log/status_ex/hnsw_param/c_pagination × 7）；TSan 并发相关全过
+（`ThreadCountIndependentOfLibCount` 为 TSan 环境既有失败，干净树同样失败，
+与本批无关）；C API 11/11；Release 构建干净。
 
 ## [3.1.0] - 2026-07-01
 

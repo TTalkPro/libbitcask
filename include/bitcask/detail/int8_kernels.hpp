@@ -86,6 +86,38 @@ struct QVector {
 // Precomputes sum_codes and sq_norm_codes so each downstream VNNI call is
 // a pure arithmetic op (no per-vector reduction loop).
 // ---------------------------------------------------------------------------
+// S13-P5：就地量化——codes 复用 out 的既有容量（thread_local 调用方稳态
+// 零分配）。逻辑与 quantize() 逐运算一致（含 std::round 半离零舍入——不换
+// SIMD round：_mm256_cvtps_epi32 是 round-half-to-even，.5 边界结果不同，
+// codes 会入 checkpoint，违反位级不变约定）。
+inline void quantize_into(const float* v, std::size_t dim,
+                          QVector& out) noexcept {
+    float max_abs = 0.0f;
+    for (std::size_t i = 0; i < dim; ++i) {
+        const float a = std::abs(v[i]);
+        if (a > max_abs) max_abs = a;
+    }
+    if (max_abs == 0.0f) max_abs = 1.0f;
+
+    out.codes.resize(dim);  // 容量只增：thread_local 复用后零分配
+    out.scale = max_abs;
+
+    const float inv_scale = 127.0f / max_abs;
+    std::int32_t sum = 0;
+    std::int32_t sq  = 0;
+    for (std::size_t i = 0; i < dim; ++i) {
+        float val = v[i] * inv_scale;
+        if (val >  127.0f) val =  127.0f;
+        if (val < -127.0f) val = -127.0f;
+        const auto code = static_cast<std::int8_t>(std::round(val));
+        out.codes[i] = code;
+        sum += static_cast<std::int32_t>(code);
+        sq  += static_cast<std::int32_t>(code) * static_cast<std::int32_t>(code);
+    }
+    out.sum_codes     = sum;
+    out.sq_norm_codes = sq;
+}
+
 inline QVector quantize(const float* v, std::size_t dim) noexcept {
     float max_abs = 0.0f;
     for (std::size_t i = 0; i < dim; ++i) {

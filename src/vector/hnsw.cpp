@@ -726,7 +726,9 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     // V7:vecs_ 已从 NodeChunk 移出——checkpoint 加载的 vecs 由 mmap 覆盖,
     // 新插入追加 hot_vecs_;vec_of(id) 统一路由两者。
     if (cfg_.inmem_int8) {
-        auto qv = int8::quantize(vec.data(), cfg_.dim);
+        // S13-P5：thread_local 复用（单写者路径）。
+        thread_local int8::QVector qv;
+        int8::quantize_into(vec.data(), cfg_.dim, qv);
         std::memcpy(c->qcodes.data() +
                         static_cast<std::size_t>(slot) * cfg_.dim,
                     qv.codes.data(),
@@ -744,7 +746,9 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
         // 4× 缩的带宽 + VNNI 加速;int8_dot_ == nullptr 时这段不被读,浪费
         // 一些内存但功能不变(仅 kDot 有意义,kL2 见 search 路径判断)。
         if (int8_dot_ != nullptr && cfg_.metric == HnswMetric::kDot) {
-            auto qv = int8::quantize(vec.data(), cfg_.dim);
+            // S13-P5：thread_local 复用（单写者路径）。
+            thread_local int8::QVector qv;
+            int8::quantize_into(vec.data(), cfg_.dim, qv);
             std::memcpy(c->qcodes.data() +
                             static_cast<std::size_t>(slot) * cfg_.dim,
                         qv.codes.data(),
@@ -912,7 +916,9 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
     // ⑦ thread_local：search_layer 内 out.clear() 后填充，跨查询复用。
     thread_local std::vector<std::pair<float, std::uint32_t>> found;
     if (use_int8) {
-        const int8::QVector qq = int8::quantize(q, cfg_.dim);
+        // S13-P5：thread_local 复用，消除每查询一次 codes 堆分配。
+        thread_local int8::QVector qq;
+        int8::quantize_into(q, cfg_.dim, qq);
         for (std::int32_t l = max_level; l > 0; --l) {
             cur = greedy_closest_int8(qq.codes.data(), qq.scale, qq.sum_codes,
                                       cur, static_cast<std::uint32_t>(l), n,
@@ -927,17 +933,40 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
             // V7:mmap'd vecs_ 预取——sort 前 madvise(WILLNEED) top 候选页,
             // 内核异步 page-in,延迟藏在 sort 比较后面(O(N log k) 次 dist_id)。
             if (vecs_mmap_base_ != nullptr) {
+                // S13-P5：候选按地址排序 + 相邻页区间合并后批量 madvise——
+                // 原逐候选一次 syscall（k=256 时 ~768 次/查询），页常驻稳态
+                // 下纯开销。合并后典型降到个位数 syscall。
                 const std::size_t vec_bytes =
                     static_cast<std::size_t>(cfg_.dim) * sizeof(float);
-                const std::size_t prefetch_n =
-                    std::min(found.size(), rerank_n);
-                for (std::size_t i = 0; i < prefetch_n; ++i) {
+                const long page = ::sysconf(_SC_PAGESIZE);
+                const std::uintptr_t pmask =
+                    ~(static_cast<std::uintptr_t>(page) - 1);
+                thread_local std::vector<std::uintptr_t> addrs;
+                addrs.clear();
+                for (std::size_t i = 0; i < rerank_n; ++i) {
                     const std::uint32_t id = found[i].second;
                     if (id < checkpoint_count_) {
-                        const void* v = vec_of(id);
-                        ::madvise(const_cast<void*>(v), vec_bytes,
-                                  MADV_WILLNEED);
+                        addrs.push_back(
+                            reinterpret_cast<std::uintptr_t>(vec_of(id)));
                     }
+                }
+                std::sort(addrs.begin(), addrs.end());
+                std::size_t i = 0;
+                while (i < addrs.size()) {
+                    const std::uintptr_t start = addrs[i] & pmask;
+                    std::uintptr_t end =
+                        (addrs[i] + vec_bytes + page - 1) & pmask;
+                    std::size_t j = i + 1;
+                    // 下一候选起始页 ≤ 当前区间末页 ⟹ 合并（含相邻页）。
+                    while (j < addrs.size() && (addrs[j] & pmask) <= end) {
+                        const std::uintptr_t e2 =
+                            (addrs[j] + vec_bytes + page - 1) & pmask;
+                        if (e2 > end) end = e2;
+                        ++j;
+                    }
+                    ::madvise(reinterpret_cast<void*>(start), end - start,
+                              MADV_WILLNEED);
+                    i = j;
                 }
             }
             // 先把每个候选的 f32 距离算一次写回 .first(此前存的是 int8

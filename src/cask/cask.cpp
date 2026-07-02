@@ -333,6 +333,10 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
         } else {
             auto dv = codec::decode_doc_value(std::span<const std::byte>(rec->value));
             if (!dv) return std::unexpected(err(CaskError::kIo, "corrupt DocValue"));
+            // S13-D5：per-key TTL——过期记录跳过（与整库 expiry_secs 同语义）。
+            if (dv->expiry_at != 0 && dv->expiry_at <= now_sec_default()) {
+                continue;
+            }
             e.value.assign(dv->text.begin(), dv->text.end());
         }
         e.tstamp       = rec->tstamp;
@@ -591,7 +595,13 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
                 }, entry);
             },
             // Error fn：异常计数器自增（best-effort 保活 lane）。
-            [cask_ptr = cask.get()]() { cask_ptr->index_errors_.fetch_add(1, std::memory_order_relaxed); },
+            [cask_ptr = cask.get()]() {
+                cask_ptr->index_errors_.fetch_add(1, std::memory_order_relaxed);
+                // S13-D7：索引 worker 吞异常此前仅计数——现同步上报。
+                cask_ptr->log_error(
+                    "index worker exception swallowed (index may drift; "
+                    "see StatusInfo::index_errors)");
+            },
             // 起始 ord。
             cask->keydir_->peek_next_ord()
         );
@@ -800,7 +810,9 @@ void Cask::close() noexcept {
         if (opts_.read_write) write_keydir_snapshot();
     } catch (...) {
         // 吞掉：close 是终结路径，没有合理的恢复动作。后续 keydir/lock
-        // release 仍需执行，所以不 return。
+        // release 仍需执行，所以不 return。S13-D7：上报（log 自身 noexcept）。
+        log_error("close: exception during shutdown (resources still released; "
+                  "checkpoint/snapshot may be missing)");
     }
     // 资源释放步骤放 try 外，确保即使上面 catch 触发也一定执行。
     // unique_ptr::reset（析构隐式 noexcept）与 FileLock::release_quiet（显式
@@ -839,7 +851,10 @@ void Cask::write_keydir_snapshot() noexcept {
         if (ec) return;  // 文件态不稳定,放弃本次快照
         wms.emplace_back(static_cast<std::uint32_t>(e.tstamp), sz);
     }
-    (void)keydir_->save_snapshot(dirname_ + "/" + kKeydirSnapName, wms);
+    if (!keydir_->save_snapshot(dirname_ + "/" + kKeydirSnapName, wms)) {
+        // best-effort：失败下次 open 走全量 fold（仅慢一次启动）。S13-D7 上报。
+        log_warn("keydir snapshot save failed (will rebuild on next open)");
+    }
 }
 
 // T3: 提交索引任务到 IndexPool。背压由有界队列提供：队列满（10240）时
@@ -1131,7 +1146,10 @@ std::expected<void, CaskFault> Cask::ensure_active_writer() {
                                   data_path + "\n";
         auto bytes = std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(line.data()), line.size());
-        (void)write_lock_->write_data(bytes);  // best-effort：失败不阻断
+        if (!write_lock_->write_data(bytes)) {  // best-effort：失败不阻断
+            log_warn("write.lock active-path update failed "
+                     "(merge_only handles may not exclude active file)");
+        }
     }
     return {};
 }
@@ -1454,8 +1472,13 @@ Cask::get(std::span<const std::byte> key) {
         if (rv->type == format::RecordType::kTombstone) {
             return std::unexpected(err(CaskError::kNotFound));
         }
-        return GetResultView(std::move(df), rv->value, rv->type,
-                             rv->tstamp, rv->ord);
+        GetResultView view(std::move(df), rv->value, rv->type,
+                           rv->tstamp, rv->ord);
+        // S13-D5：per-key TTL——过期视作不存在（空间留给 merge 回收）。
+        if (view.expiry_at != 0 && view.expiry_at <= now_sec_default()) {
+            return std::unexpected(err(CaskError::kNotFound));
+        }
+        return view;
     }
 
     auto rec = df->read(entry->offset, entry->total_sz);
@@ -1473,7 +1496,14 @@ Cask::get(std::span<const std::byte> key) {
         return std::unexpected(err(CaskError::kNotFound));
     }
 
-    return GetResultView(std::move(*rec));
+    {
+        GetResultView view(std::move(*rec));
+        // S13-D5：per-key TTL——过期视作不存在。
+        if (view.expiry_at != 0 && view.expiry_at <= now_sec_default()) {
+            return std::unexpected(err(CaskError::kNotFound));
+        }
+        return view;
+    }
     }  // for (attempt)
 }
 
@@ -1558,6 +1588,7 @@ void GetResultView::derive_from_storage() {
     if (!dv) return;  // corrupt DocValue → empty spans
     value = dv->text;
     meta  = dv->meta;
+    expiry_at = dv->expiry_at;  // S13-D5
     if (dv->vec_quantized) {
         // P3b:量化 → dequant 进拥有缓冲，span 指向它。
         vector_dequant_ = codec::doc_vector_f32(*dv);
@@ -1632,7 +1663,7 @@ GetResult GetResultView::to_owned() const {
     std::expected<void, CaskFault>
 Cask::put(std::span<const std::byte> key,
           std::span<const std::byte> value,
-          std::uint32_t tstamp) {
+          std::uint32_t tstamp, std::uint32_t expiry_at) {
     std::lock_guard<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
     if (!opts_.read_write || opts_.merge_only) {
@@ -1663,6 +1694,7 @@ Cask::put(std::span<const std::byte> key,
     encoded.reserve(value.size() + 16);
     codec::DocValueParts parts;
     parts.text = value;
+    parts.expiry_at = expiry_at;  // S13-D5
     codec::encode_doc_value(encoded, parts);
 
     auto persisted = write_and_keydir(key, encoded, tstamp, ord);
@@ -1676,6 +1708,159 @@ Cask::put(std::span<const std::byte> key,
                          value.size()),
         persisted->file_id, persisted->offset, persisted->total_size, tstamp, 0));
     if (auto r = maybe_group_commit(); !r) return std::unexpected(r.error());
+    return {};
+}
+
+// S13-D1：批量写。流程：全批校验 → roll → 逐条 alloc_ord + encode +
+// write_buffered（聚合 1MiB 块 pwrite）→ 一次 flush + fdatasync（批的持久化
+// 点）→ hint → keydir apply + 索引提交。keydir apply 在 fsync 之后 ⟹ 本进程
+// 内 all-or-nothing。merge race（merge 恰在批写入期间启动、biggest_file_id
+// 被推过批文件）时被拒条目走 write_and_keydir 单条重写路径（内部 roll+重试），
+// 与单条 put 的 race 处理一致。
+std::expected<void, CaskFault>
+Cask::put_batch(std::span<const BatchItem> items, std::uint32_t tstamp) {
+    std::lock_guard<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
+    if (!opts_.read_write || opts_.merge_only) {
+        return std::unexpected(err(CaskError::kReadOnly));
+    }
+    if (items.empty()) return {};
+
+    // ① 全批前置校验——任何写发生前完成，校验失败零副作用。
+    std::size_t about = 0;
+    for (const auto& it : items) {
+        if (it.key.size() > format::kMaxKeySize) {
+            return std::unexpected(err(CaskError::kKeyTooLarge));
+        }
+        if (it.value.size() > format::kMaxValueSize) {
+            return std::unexpected(err(CaskError::kValueTooLarge));
+        }
+        about += format::kHeaderSize + it.key.size() + it.value.size();
+    }
+    if (tstamp == 0) tstamp = now_sec_default();
+
+    // ② roll：整批进同一 active 文件（巨批允许超 max_file_size，软上限）。
+    if (auto r = roll_active_if_needed(about); !r) return std::unexpected(r.error());
+    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
+        if (auto r = roll_active(); !r) return std::unexpected(r.error());
+    }
+    const std::uint32_t batch_file =
+        active_file_id_.load(std::memory_order_relaxed);
+
+    // S13-F2 批量版守卫：函数退出时对所有未被真任务覆盖的 ord 补 Skip——
+    // 错误路径全批 Skip；成功路径恰好补掉 merge-race 重写条目的原始 ord。
+    struct BatchOrdGuard {
+        Cask* cask;
+        std::vector<std::uint64_t> ords;
+        std::vector<char> done;
+        ~BatchOrdGuard() {
+            for (std::size_t i = 0; i < ords.size(); ++i) {
+                if (!done[i]) {
+                    cask->submit_index_task(IndexTask::make(
+                        IndexOp::Skip, {}, ords[i], {}, 0, 0, 0, 0, 0));
+                }
+            }
+        }
+    } og{this, {}, {}};
+    og.ords.reserve(items.size());
+    og.done.reserve(items.size());
+
+    // ③ 逐条 encode + write_buffered。offset 是确定性逻辑偏移（含未落盘缓冲）。
+    struct PendingWrite {
+        std::uint64_t ord;
+        std::uint64_t offset;
+        std::uint32_t total_size;
+    };
+    std::vector<PendingWrite> pw;
+    pw.reserve(items.size());
+    thread_local std::vector<std::byte> encoded;
+    for (const auto& it : items) {
+        const std::uint64_t ord = keydir_->alloc_ord();
+        og.ords.push_back(ord);
+        og.done.push_back(0);
+        encoded.clear();
+        encoded.reserve(it.value.size() + 16);
+        codec::DocValueParts parts;
+        parts.text = it.value;
+        codec::encode_doc_value(encoded, parts);
+        auto w = active_data_->write_buffered(format::RecordType::kDoc,
+                                              tstamp, ord, it.key, encoded);
+        if (!w) {
+            return std::unexpected(io_fault(w.error().errnum,
+                                            std::string(active_data_->path())));
+        }
+        pw.push_back({ord, w->offset, w->total_size});
+    }
+
+    // ④ 批的提交点：flush 尾批（此前 keydir 未动——任何失败整批在本进程内
+    //    不可见）。durability 与单条 put 的 sync 策略对齐：
+    //    - o_sync：fd 是 O_DSYNC，flush 的单次 pwrite 即 durable；
+    //    - sync_every_n > 0：整批视作一次组提交，立即 fdatasync；
+    //    - 其余（sync_every_n==0）：与单条 put 相同，由 caller 的 sync() 控制。
+    if (auto f = active_data_->flush_batch(); !f) {
+        return std::unexpected(io_fault(f.error().errnum,
+                                        std::string(active_data_->path())));
+    }
+    if (!opts_.o_sync && opts_.sync_every_n > 0) {
+        if (auto s = active_data_->sync(); !s) {
+            return std::unexpected(io_fault(s.error().errnum,
+                                            std::string(active_data_->path())));
+        }
+        writes_since_sync_ = 0;  // P4 组提交计数：刚 fsync 过，归零
+    }
+
+    // ⑤ hint（可重建；失败语义与单条 put 一致：报错、keydir 未动）。
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        auto h = active_hint_->write(tstamp, pw[i].total_size, pw[i].offset,
+                                     /*tomb*/ false, items[i].key);
+        if (!h) {
+            return std::unexpected(io_fault(h.error().errnum,
+                                            std::string(active_hint_->path())));
+        }
+    }
+
+    // ⑥ keydir apply + 索引提交。
+    bool retried = false;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        auto pr = keydir_->put(bytes_to_view(items[i].key), batch_file,
+                               pw[i].total_size, pw[i].offset, tstamp,
+                               /*now*/ 0, /*newest*/ true, 0, 0, pw[i].ord);
+        PersistedRecord rec{pw[i].ord, pw[i].offset, pw[i].total_size,
+                            batch_file};
+        if (pr == keydir::PutResult::kAlreadyExists) {
+            // merge race：单条重写（write_and_keydir 内部 roll+重试）。
+            // 原始 ord 保持 !done → 函数退出时由 og 补 Skip。
+            encoded.clear();
+            encoded.reserve(items[i].value.size() + 16);
+            codec::DocValueParts parts;
+            parts.text = items[i].value;
+            codec::encode_doc_value(encoded, parts);
+            const std::uint64_t ord2 = keydir_->alloc_ord();
+            OrdSkipGuard g2(this, ord2);
+            auto p2 = write_and_keydir(items[i].key, encoded, tstamp, ord2);
+            if (!p2) return std::unexpected(p2.error());
+            g2.disarm();  // ord2（或其内部重试链）由下面的 Add 覆盖
+            rec = *p2;
+            retried = true;
+        } else {
+            og.done[i] = 1;  // 原始 ord 由下面的 Add 覆盖
+        }
+        submit_index_task(IndexTask::make(
+            IndexOp::Add, bytes_to_view(items[i].key), rec.ord,
+            std::string_view(
+                reinterpret_cast<const char*>(items[i].value.data()),
+                items[i].value.size()),
+            rec.file_id, rec.offset, rec.total_size, tstamp, 0));
+    }
+    // merge-race 重写走的是非缓冲 write（write_and_keydir），不在 ④ 的提交
+    // 覆盖内——按同一 sync 策略补一次组提交（罕见路径；o_sync/caller-sync
+    // 模式下 maybe_group_commit 自身为 no-op，语义一致）。
+    if (retried) {
+        ++writes_since_sync_;
+        if (auto r = maybe_group_commit(/*force*/ true); !r) {
+            return std::unexpected(r.error());
+        }
+    }
     return {};
 }
 
@@ -1810,6 +1995,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
                     vec_out.size() * sizeof(float) + 16);
     codec::DocValueParts parts;
     parts.text = doc.text;
+    parts.expiry_at = doc.expiry_at;  // S13-D5
     if (!doc.meta.empty()) {
         parts.meta = doc.meta;
     }
@@ -1902,9 +2088,20 @@ Cask::search_hybrid(std::string_view text_query,
 // search_text：BM25 词袋模式搜索。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_text(std::string_view query, std::size_t k,
-                  const meta::MetaFilter* filter) {
+                  const meta::MetaFilter* filter, std::size_t offset) {
     return run_search_one(/*require_vector=*/false,
-        [&] { return search_->search_text(query, k, nullptr, filter); });
+        [&] {
+            auto hits = search_->search_text(query, k + offset, nullptr, filter);
+            if (hits && offset > 0) {  // S13-D10：overfetch 后丢前 offset 条
+                if (hits->size() > offset) {
+                    hits->erase(hits->begin(),
+                                hits->begin() + static_cast<std::ptrdiff_t>(offset));
+                } else {
+                    hits->clear();
+                }
+            }
+            return hits;
+        });
 }
 
 // S13-D3：带高亮搜索——补门面缺口（README 宣称有而 Cask 无）。骨架与
@@ -1989,9 +2186,21 @@ Cask::search_hybrid_batch(std::span<const HybridQuery> queries,
 
 // search_phrase：BM25 短语模式搜索。
 std::expected<TextSearchResult, CaskFault>
-Cask::search_phrase(std::string_view query, std::size_t k) {
+Cask::search_phrase(std::string_view query, std::size_t k,
+                    std::size_t offset) {
     return run_search_one(/*require_vector=*/false,
-        [&] { return search_->search_phrase(query, k); });
+        [&] {
+            auto hits = search_->search_phrase(query, k + offset);
+            if (hits && offset > 0) {  // S13-D10
+                if (hits->size() > offset) {
+                    hits->erase(hits->begin(),
+                                hits->begin() + static_cast<std::ptrdiff_t>(offset));
+                } else {
+                    hits->clear();
+                }
+            }
+            return hits;
+        });
 }
 
 // search_fields：BM25 多字段搜索（S8.6），支持 field:term^boost。
@@ -2010,9 +2219,21 @@ Cask::search_near(std::string_view query, std::uint32_t slop, std::size_t k) {
 
 // bool_search：BM25 布尔搜索（AND/OR/NOT）。
 std::expected<TextSearchResult, CaskFault>
-Cask::bool_search(std::string_view query, std::size_t k) {
+Cask::bool_search(std::string_view query, std::size_t k,
+                  std::size_t offset) {
     return run_search_one(/*require_vector=*/false,
-        [&] { return search_->bool_search(query, k); });
+        [&] {
+            auto hits = search_->bool_search(query, k + offset);
+            if (hits && offset > 0) {  // S13-D10
+                if (hits->size() > offset) {
+                    hits->erase(hits->begin(),
+                                hits->begin() + static_cast<std::ptrdiff_t>(offset));
+                } else {
+                    hits->clear();
+                }
+            }
+            return hits;
+        });
 }
 
 // S8.3：模糊搜索（Levenshtein 编辑距离匹配）。
@@ -2048,6 +2269,75 @@ std::expected<void, CaskFault> Cask::sync() {
 //   2. 从 read_files_ 缓存淘汰对应句柄（防止 fd 泄漏）
 //   3. unlink 旧 data + hint 文件（节省磁盘）
 
+// S13-D6：不停机备份（契约见 cask.hpp）。
+std::expected<void, CaskFault> Cask::backup(std::string_view dst_dir) {
+    std::lock_guard<std::mutex> wlk(write_mu_);  // 备份期间挡住写者
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path dst(dst_dir);
+    fs::create_directories(dst, ec);
+    if (ec) return std::unexpected(err(CaskError::kIo,
+        "backup: cannot create dst dir: " + dst.string()));
+
+    // 关闭 active writer：finalize hint trailer 后该文件成为 sealed（不可变），
+    // 可安全 hardlink。read_write 且有 active 时才需要；下一次 put 经
+    // ensure_active_writer 自动重建（write_lock_ 保留不释放——与
+    // close_write_file 不同，备份不让出写权）。
+    if (active_data_) {
+        if (auto r = maybe_group_commit(/*force*/ true); !r) {
+            return std::unexpected(r.error());
+        }
+        if (active_hint_) {
+            if (auto r = active_hint_->finalize(); !r) {
+                return std::unexpected(io_fault(r.error().errnum,
+                                                std::string(active_hint_->path())));
+            }
+        }
+        {
+            std::unique_lock lk(read_cache_mu_);
+            active_data_.reset();
+        }
+        active_hint_.reset();
+        active_file_id_ = 0;
+    }
+
+    // hardlink（同设备零拷贝、天然一致）→ 跨设备回退字节拷贝。
+    auto link_or_copy = [&](const fs::path& src) -> bool {
+        if (!fs::exists(src, ec)) return true;  // 可选文件缺失 = 跳过
+        const fs::path to = dst / src.filename();
+        std::error_code ec2;
+        fs::remove(to, ec2);  // 幂等：目标已存在则覆盖
+        fs::create_hard_link(src, to, ec2);
+        if (!ec2) return true;
+        ec2.clear();
+        fs::copy_file(src, to, fs::copy_options::overwrite_existing, ec2);
+        return !ec2;
+    };
+
+    auto entries = fileops::scan_dir(dirname_);
+    if (!entries) {
+        return std::unexpected(io_fault(entries.error().errnum, dirname_));
+    }
+    for (const auto& e : *entries) {
+        if (!link_or_copy(e.data_path)) {
+            return std::unexpected(err(CaskError::kIo,
+                "backup: copy failed: " + e.data_path));
+        }
+        (void)link_or_copy(fileops::mk_hint_filename(e.data_path));  // hint 可重建
+    }
+    // 元数据必备；checkpoint 可选（缺失只是备份目录首次 open 慢一次）。
+    const fs::path base(dirname_);
+    if (!link_or_copy(base / "bitcask.meta")) {
+        return std::unexpected(err(CaskError::kIo, "backup: meta copy failed"));
+    }
+    (void)link_or_copy(base / "field.schema");
+    (void)link_or_copy(base / kKeydirSnapName);
+    (void)link_or_copy(base / kSearchCkptName);
+    return {};
+}
+
 StatusInfo Cask::status() {
     StatusInfo s;
     if (is_closed()) return s;  // S11-W3：已关闭返回零值快照（不解引用 keydir_）
@@ -2060,6 +2350,13 @@ StatusInfo Cask::status() {
         s.files.push_back(merge::summarize(dirname_, f));
     }
     s.index_errors = index_errors_.load(std::memory_order_relaxed);
+    // S13-D8：观测扩展（全部经线程安全访问器：HNSW 原子计数、cache 自带锁、
+    // read_files_ shared_lock；不含需遍历 concurrent map 的指标，见 hpp 注）。
+    if (search_) {
+        s.hnsw_nodes = search_->hnsw_size();
+        s.search_cache_entries = search_->cache_entries();
+    }
+    s.read_handles = read_handle_count();
     return s;
 }
 
@@ -2155,7 +2452,9 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         }
         files = std::move(n.files);
     }
-    auto r = merge::run_merge(files, dirname_, *keydir_, opts_.o_sync, search_.get());
+    auto r = merge::run_merge(files, dirname_, *keydir_, opts_.o_sync,
+                              search_.get(),
+                              now_sec ? now_sec : now_sec_default());
     if (!r) {
         return std::unexpected(err(CaskError::kIo, r.error().detail));
     }
@@ -2224,13 +2523,19 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
             t.op  = IndexOp::RunFn;
             t.ord = keydir_->alloc_ord();
             t.fn  = [this, search_ckpt, wm = keydir_->peek_next_ord()] {
-                (void)search_->save_search_ckpt(search_ckpt, wm);
+                if (!search_->save_search_ckpt(search_ckpt, wm)) {
+                    log_warn("search checkpoint save failed after merge "
+                             "(will rebuild on next open)");  // S13-D7
+                }
             };
             index_pool_->submit(index_lane_, std::move(t));
             index_pool_->flush(index_lane_);
         } else {
-            (void)search_->save_search_ckpt(search_ckpt,
-                                            keydir_->peek_next_ord());
+            if (!search_->save_search_ckpt(search_ckpt,
+                                           keydir_->peek_next_ord())) {
+                log_warn("search checkpoint save failed after merge "
+                         "(will rebuild on next open)");  // S13-D7
+            }
         }
     }
 
@@ -2250,6 +2555,10 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
     //
     // Failures here are best-effort: the keydir is already consistent. A
     // residual file just wastes disk until the next process tries the same.
+    if (r->relocations_stuck > 0) {  // S13-D7：防御路径触发即上报（不应发生）
+        log_error("merge: " + std::to_string(r->relocations_stuck) +
+                  " stuck relocation(s); input file(s) kept for retry");
+    }
     std::vector<std::uint32_t> trimmed_ids;
     trimmed_ids.reserve(files.size());
     {

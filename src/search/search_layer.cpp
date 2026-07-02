@@ -71,6 +71,12 @@ SearchLayer::SearchLayer(const SearchLayerConfig& config)
                         ? vec::HnswMetric::kL2
                         : vec::HnswMetric::kDot;
         hc.inmem_int8 = config.vector_inmem_int8;  // P5b
+        // S13-D11：建图参数透传（0 = 保持 HnswConfig 默认）。rebuild_hnsw
+        // 复用 old->config() → 本处设置对重建图同样生效。
+        if (config.hnsw_m > 0) hc.M = config.hnsw_m;
+        if (config.hnsw_ef_construction > 0) {
+            hc.ef_construction = config.hnsw_ef_construction;
+        }
         hnsw_.store(std::make_shared<vec::HnswIndex>(hc),
                     std::memory_order_release);
     }
