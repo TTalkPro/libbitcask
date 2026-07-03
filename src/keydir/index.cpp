@@ -129,6 +129,13 @@ std::optional<DocSlot> Index::get(std::string_view ext_id) const {
     return s;
 }
 
+std::optional<std::uint64_t> Index::ord_of(std::string_view ext_id) const {
+    std::shared_lock lk(mutex_);
+    auto it = ext2ord_.find(ext_id);
+    if (it == ext2ord_.end()) return std::nullopt;
+    return it->second;
+}
+
 std::optional<std::string> Index::ord_to_ext(std::uint64_t ord) const {
     std::shared_lock lk(mutex_);
     if (ord >= live_.size()) {

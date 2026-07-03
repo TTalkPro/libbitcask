@@ -458,6 +458,9 @@ public:
     // ---- 访问内部组件（Phase 4 集成用）----
     [[nodiscard]] index::Index&       index()       { return index_; }
     [[nodiscard]] const index::Index& index() const { return index_; }
+    // S16-3：查询面只读身份表视图（Index IS-A DocTable）。查询代码经此消费
+    // docmap，不直摸 index_ 的具体类型——P4 双插件拆分的前置。
+    [[nodiscard]] const bm25::DocTable& doc_table() const noexcept { return index_; }
 
     // V4:Index 概要(totlive / total_ords),Cask::needs_merge 据此算
     // dead_doc_rate。无索引时 = IndexInfo 零值。
@@ -541,8 +544,10 @@ private:
     // D2：抽出 5+ 处 search_* 共有的「bm25 结果集物化为 SearchHit」骨架：
     // 逐条 ord→ext 翻译（翻译失败跳过）+ 可选 MetaFilter 后过滤（空 meta 不通过）
     // + 可选截断到 k（k==0 不截断，bm25 内核已 top-k 的路径用之）。
+    // S16-3：经 const DocTable& 形参消费 docmap（不直摸 index_ 具体类型）。
     [[nodiscard]] std::vector<SearchHit> materialize_hits(
         const std::vector<bm25::SearchResult>& results,
+        const bm25::DocTable& doc_table,
         const meta::MetaFilter* filter = nullptr,
         std::size_t k = 0) const;
 

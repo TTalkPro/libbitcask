@@ -232,15 +232,16 @@ inline void scale_query(float* dst, const float* src, float inv, std::size_t n) 
 // bm25 内核已返回 top-k 的路径传 0 不截断）。
 std::vector<SearchHit> SearchLayer::materialize_hits(
     const std::vector<bm25::SearchResult>& results,
+    const bm25::DocTable& doc_table,
     const meta::MetaFilter* filter, std::size_t k) const {
     std::vector<SearchHit> hits;
     hits.reserve(results.size());
     for (auto& r : results) {
         if (filter) {
             // S13-P8：锁内求值，免每候选一次 blob 堆拷贝。
-            if (!index_.eval_meta(r.ord, *filter)) continue;
+            if (!doc_table.eval_meta(r.ord, *filter)) continue;
         }
-        auto ext_id = index_.ord_to_ext(r.ord);
+        auto ext_id = doc_table.ord_to_ext(r.ord);
         if (!ext_id) continue;
         hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
     }
@@ -293,16 +294,18 @@ SearchLayer::search_vector(std::span<const float> query, std::size_t k,
     // V5:filter 与 is_live 组合为 HNSW live callback——被拒节点从图遍历
     // 源头就不入候选集,无需 overfetch(k 直接交给 HNSW)。空 meta blob
     // 的文档一律不通过(无 meta → 视为「不在 filter 集合」)。
+    // S16-3：经 const DocTable& 消费 docmap，不直摸 index_。
+    const bm25::DocTable& dt = doc_table();
     std::function<bool(std::uint64_t)> live;
     if (filter) {
-        live = [this, filter](std::uint64_t ord) -> bool {
-            if (!index_.is_live(ord)) return false;
+        live = [&dt, filter](std::uint64_t ord) -> bool {
+            if (!dt.is_live(ord)) return false;
             // S13-P8：锁内求值（HNSW 图内过滤每展开节点调一次——热点）。
-            return index_.eval_meta(ord, *filter);
+            return dt.eval_meta(ord, *filter);
         };
     } else {
-        live = [this](std::uint64_t ord) -> bool {
-            return index_.is_live(ord);
+        live = [&dt](std::uint64_t ord) -> bool {
+            return dt.is_live(ord);
         };
     }
     auto raw = hnsw->search(q, k, ef, &live);
@@ -310,7 +313,7 @@ SearchLayer::search_vector(std::span<const float> query, std::size_t k,
     std::vector<SearchHit> hits;
     hits.reserve(raw.size());
     for (auto& h : raw) {
-        auto ext_id = index_.ord_to_ext(h.ord);
+        auto ext_id = dt.ord_to_ext(h.ord);
         if (!ext_id) continue;
         hits.push_back(SearchHit{std::move(*ext_id), h.ord,
                                  static_cast<double>(h.score)});
@@ -737,12 +740,12 @@ SearchLayer::search_text(std::string_view query, std::size_t k,
         }
 
         const auto* inv = field_index(kDefaultField);
-        if (inv) results = inv->search(terms, k_req, index_, params_override);
+        if (inv) results = inv->search(terms, k_req, doc_table(), params_override);
         if (!params_override) cache_.put(cache_key, results, terms);
     }
 
     // D2：filter 后过滤（空 meta 不通过）+ overfetch 后截断到 k。
-    return materialize_hits(results, filter, k);
+    return materialize_hits(results, doc_table(), filter, k);
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
@@ -765,11 +768,11 @@ SearchLayer::search_phrase(std::string_view query, std::size_t k,
         if (terms.empty()) return std::vector<SearchHit>{};
 
         const auto* inv = field_index(kDefaultField);
-        if (inv) results = inv->search_phrase(terms, k, index_, params_override);
+        if (inv) results = inv->search_phrase(terms, k, doc_table(), params_override);
         if (!params_override) cache_.put(cache_key, results, terms);
     }
 
-    return materialize_hits(results);
+    return materialize_hits(results, doc_table());
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
@@ -781,9 +784,9 @@ SearchLayer::search_near(std::string_view query, std::uint32_t slop, std::size_t
 
     std::vector<bm25::SearchResult> results;
     const auto* inv = field_index(kDefaultField);
-    if (inv) results = inv->search_near(terms, k, slop, index_, params_override);
+    if (inv) results = inv->search_near(terms, k, slop, doc_table(), params_override);
 
-    return materialize_hits(results);
+    return materialize_hits(results, doc_table());
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
@@ -800,9 +803,9 @@ SearchLayer::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t m
 
     std::vector<bm25::SearchResult> results;
     const auto* inv = field_index(kDefaultField);
-    if (inv) results = inv->search_fuzzy(terms, k, max_edit_distance, index_, params_override);
+    if (inv) results = inv->search_fuzzy(terms, k, max_edit_distance, doc_table(), params_override);
 
-    return materialize_hits(results);
+    return materialize_hits(results, doc_table());
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
@@ -846,9 +849,9 @@ SearchLayer::bool_search(std::string_view query, std::size_t k,
         const auto* inv = field_index(kDefaultField);
         if (inv) {
             results = tree_syntax
-                          ? inv->bool_search_tree(query_node, k, index_,
+                          ? inv->bool_search_tree(query_node, k, doc_table(),
                                                   params_override)
-                          : inv->bool_search(query_node, k, index_,
+                          : inv->bool_search(query_node, k, doc_table(),
                                              params_override);
         }
         if (!params_override && !results.empty()) {
@@ -862,14 +865,14 @@ SearchLayer::bool_search(std::string_view query, std::size_t k,
         }
     }
 
-    return materialize_hits(results);
+    return materialize_hits(results, doc_table());
 }
 
 std::optional<bm25::ScoreExplanation>
 SearchLayer::explain(std::string_view query, std::string_view key,
                      const bm25::Bm25Params* params_override) const {
-    auto slot = index_.get(key);
-    if (!slot) return std::nullopt;
+    auto ord = doc_table().ord_of(key);
+    if (!ord) return std::nullopt;
 
     auto term_freqs = analyzer_->analyze(query);
     std::vector<std::string> terms;
@@ -878,7 +881,7 @@ SearchLayer::explain(std::string_view query, std::string_view key,
 
     const auto* inv = field_index(kDefaultField);
     if (!inv) return bm25::ScoreExplanation{};
-    return inv->explain(terms, slot->ord, index_, params_override);
+    return inv->explain(terms, *ord, doc_table(), params_override);
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
@@ -886,9 +889,9 @@ SearchLayer::search_wildcard(std::string_view pattern, std::size_t k,
                              const bm25::Bm25Params* params_override) const {
     std::vector<bm25::SearchResult> results;
     const auto* inv = field_index(kDefaultField);
-    if (inv) results = inv->search_wildcard(std::string(pattern), k, index_, params_override);
+    if (inv) results = inv->search_wildcard(std::string(pattern), k, doc_table(), params_override);
 
-    return materialize_hits(results);
+    return materialize_hits(results, doc_table());
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
@@ -934,7 +937,7 @@ SearchLayer::search_fields(std::string_view query, std::size_t k,
             g.insert(g.end(), expanded.begin(), expanded.end());
         }
         for (auto& [boost, gterms] : boost_groups) {
-            auto res = inv->search(gterms, k, index_, params_override);
+            auto res = inv->search(gterms, k, doc_table(), params_override);
             for (auto& r : res) {
                 acc[r.ord] += static_cast<double>(r.score) * boost;
             }
@@ -952,7 +955,7 @@ SearchLayer::search_fields(std::string_view query, std::size_t k,
     std::vector<SearchHit> hits;
     hits.reserve(ranked.size());
     for (auto& [ord, score] : ranked) {
-        auto ext_id = index_.ord_to_ext(ord);
+        auto ext_id = doc_table().ord_to_ext(ord);
         if (!ext_id) continue;
         hits.push_back(SearchHit{std::move(*ext_id), ord, score});
     }
@@ -1225,14 +1228,14 @@ SearchLayer::search_text_highlight(std::string_view query, std::size_t k,
         }
 
         const auto* inv = field_index(kDefaultField);
-        if (inv) results = inv->search(terms, k, index_);
+        if (inv) results = inv->search(terms, k, doc_table());
         cache_.put(cache_key, results, terms);
     }
 
     std::vector<SearchHitEx> hits;
     hits.reserve(results.size());
     for (auto& r : results) {
-        auto ext_id = index_.ord_to_ext(r.ord);
+        auto ext_id = doc_table().ord_to_ext(r.ord);
         if (!ext_id) continue;
 
         // S9.3：原文 LRU 命中才生成高亮片段；冷文档被挤出（miss）时降级为

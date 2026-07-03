@@ -15,6 +15,7 @@
 #pragma once
 
 #include "bitcask/live_checker.hpp"
+#include "bitcask/doc_table.hpp"  // S16-3：Index 实现 DocTable（查询面只读身份表）
 #include "bitcask/meta_filter.hpp"  // S13-P8：eval_meta 锁内求值
 #include "bitcask/string_hash.hpp"
 
@@ -70,7 +71,7 @@ struct Chunk {
     std::uint32_t live_count = 0;                    // chunk 内存活 ord 数；== 0 可释放
 };
 
-class Index : public bm25::LiveChecker {
+class Index : public bm25::DocTable {
 public:
     Index() = default;
     Index(const Index&) = delete;
@@ -111,7 +112,8 @@ public:
     [[nodiscard]] std::optional<DocSlot> get(std::string_view ext_id) const;
 
     // ord → ext_id（检索结果翻译用；V1 主要给调试/恢复）。越界返回 nullopt。
-    [[nodiscard]] std::optional<std::string> ord_to_ext(std::uint64_t ord) const;
+    // S16-3：override DocTable::ord_to_ext。
+    [[nodiscard]] std::optional<std::string> ord_to_ext(std::uint64_t ord) const override;
 
     // 某 ord 是否存活。越界返回 false。线程安全：shared_lock。
     // 同时实现 LiveChecker::is_live。
@@ -119,6 +121,11 @@ public:
 
     // LiveChecker::doc_len — 返回 ord 对应文档的 token 数，越界返回 0。
     [[nodiscard]] std::uint32_t doc_len(std::uint64_t ord) const override;
+
+    // S16-3：DocTable::ord_of — ext_id → ord（explain 等 key→ord 反查）。
+    // get() 的窄投影，避免查询面暴露完整 DocSlot。
+    [[nodiscard]] std::optional<std::uint64_t>
+    ord_of(std::string_view ext_id) const override;
 
     // V5:取 ord 的原始 meta blob(结构化 KV 二进制)。越界或空 → 空 vector,
     // 让上层 filter 直接判 false 跳过(无 meta = 不通过过滤)。
@@ -132,7 +139,7 @@ public:
     // 无 IO（meta_filter.hpp），shared_lock 内直接跑安全。
     // 语义与「meta_blob 后 evaluate」一致：无 meta（空 blob）恒 false。
     [[nodiscard]] bool eval_meta(std::uint64_t ord,
-                                 const meta::MetaFilter& filter) const;
+                                 const meta::MetaFilter& filter) const override;
 
     // P2.1 批量版本：一次 shared_lock 完成整个数组（逐 posting 版本每条
     // posting 一次锁 + 一次虚调用，热词查询 = 数十万次锁操作且阻断评分
