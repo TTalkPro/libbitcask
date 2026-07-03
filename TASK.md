@@ -2068,7 +2068,7 @@ W4 ✅（parallel_scan 并行全表扫描）。
 >   `DeleteEvent` 增带（无则哨兵值）。这对 P4 的独立 BM25 插件同样必要
 >   （插件不该为拿旧 ord 反查 docmap）。
 
-- [ ] **S16-1【P0·S】Index 所有权上提（零行为变化）**
+- [x] **S16-1【P0·S】Index 所有权上提（零行为变化）** — 已完成（2026-07-03）
   - SearchLayer 成员 `index::Index index_` 改为
     `std::shared_ptr<index::Index> index_holder_` + `index::Index& index_`
     引用别名（声明序 holder 先于 ref）——**两个 141K/88K 实现体零改动**，
@@ -2079,6 +2079,11 @@ W4 ✅（parallel_scan 并行全表扫描）。
     create_search_infra / upgrade 两处先建 docmap_ 再注入 SearchLayer。
   - 测试：全量回归零差异（纯所有权反转）；新增一条断言
     `cask 侧 docmap_ 与 search_->index() 同一实例`（地址相等）。
+  - **落地结果**：holder+引用别名如设计零改动实现体；`Cask::docmap()` 访问
+    器补上（宿主服务句柄，S16-2 的写入口）；close 清句柄。新增
+    `DocmapIsHostOwnedSharedInstance`（同址断言 + 双句柄可见性 + close 清
+    句柄）。clang 523/523、TSan 522/523（唯一失败为既知预存项
+    ThreadCountIndependentOfLibCount）。
 - [ ] **S16-2【P0·L】写路径反转：宿主先 apply DocMap，插件退纯索引写**
   - reduce 闭包 PutEntry 分支：广播插件**之前**宿主直调
     `docmap_->put_doc`（DocSlot 从 task 构造）+ `set_meta`；DeleteEntry
