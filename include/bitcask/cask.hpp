@@ -51,7 +51,9 @@
 #include "bitcask/meta_file.hpp"
 #include "bitcask/field_schema.hpp"
 #include "bitcask/meta_filter.hpp"
+#include "bitcask/plugin_api.hpp"
 #include "bitcask/search_layer.hpp"
+#include "bitcask/search_plugin_adapter.hpp"
 #include "bitcask/thread_pool.hpp"
 
 namespace bitcask {
@@ -838,6 +840,13 @@ private:
 
     // SearchLayer 实例（enable_search 时创建）
     std::unique_ptr<search::SearchLayer> search_;
+
+    // S15-3：插件分发表。P1 恒 = {search_adapter_.get()}（SearchLayer 经
+    // adapter 作「唯一插件」接入）；IndexPool 写路径的 map/reduce 闭包只
+    // 认识 plugins_，不再直呼 SearchLayer 方法。生命周期：create_search_infra
+    // 装配，close 在 unregister_lib（flush 排空）后、search_ 之前重置。
+    std::unique_ptr<search::SearchLayerAdapter> search_adapter_;
+    std::vector<plugin::CaskPlugin*> plugins_;
 
     // S6-P3: 索引双池现由 registry 共享所有（非本 Cask 拥有）。index_pool_
     // 是借用指针（= registry_->index_pool()）；index_lane_ 是本库在共享池里

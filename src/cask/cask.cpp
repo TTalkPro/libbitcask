@@ -556,40 +556,52 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     // 共用一对 dispatcher/reducer。
     //
     // 起始 ord 对齐 keydir 当前水位——reducer 跳过 disk 已恢复的
-    // [0, peek_next_ord) 区间。merge 提交的 RebuildHnsw{ord=peek_next_ord} 等
+    // [0, peek_next_ord) 区间。merge 提交的 RunFn{ord=peek_next_ord} 等
     // 首个 entry 进该 lane 的 reorder 时 next_apply_ord 已对齐，无 stall。必须
     // 在 keydir_/registry_ 就绪后（create_search_infra 早于此装配）。
+    //
+    // S15-3：闭包按 CaskPlugin 接口分发（捕获 plugins_ 快照 by value；P1 恒
+    // = {SearchLayerAdapter}）。生命周期：close 先 unregister_lib（flush 排空
+    // ⇒ 闭包不再被调用）再 reset adapter/search_，与旧「捕获 *search_」等价。
     if (cask->search_ && cask->registry_) {
         cask->index_pool_ = cask->registry_->index_pool();
         cask->index_lane_ = cask->index_pool_->register_lib(
-            // Map fn（并行 TBB）：IndexTask → ReduceEntry。map_analyze 是纯函数
-            // （analyzer_ const、无共享可变态），跨线程安全。
-            [&search = *cask->search_](const IndexTask& task) -> ReduceEntry {
-                auto job = search.map_analyze(task.key(), task.ord, task.fields,
-                                              task.file_id, task.offset,
-                                              task.total_sz, task.tstamp);
-                return ReduceEntry{std::move(job), task.meta, task.vec};
+            // Map fn（并行 map worker）：IndexTask → 各插件 prepare 相产物
+            // （注册序；只对声明 wants_prepare 的插件调用）。prepare 契约 =
+            // 纯函数（map_analyze：analyzer_ const、无共享可变态），跨线程安全。
+            [plugins = cask->plugins_](const IndexTask& task) {
+                std::vector<plugin::PreparedPtr> preps(plugins.size());
+                const plugin::DocView  doc = make_doc_view(task);
+                const plugin::PutEvent ev  = make_put_event(task, &doc);
+                for (std::size_t i = 0; i < plugins.size(); ++i) {
+                    if (plugins[i]->wants_prepare()) {
+                        preps[i] = plugins[i]->prepare(ev);
+                    }
+                }
+                return preps;
             },
-            // Reduce fn（串行 reducer，per-lane ord 序）：ReorderEntry → apply。
-            [&search = *cask->search_](ReorderEntry& entry) {
-                std::visit([&search](auto& e) {
+            // Reduce fn（串行 reducer，per-lane ord 序）：ReorderEntry →
+            // 按注册序广播给各插件。
+            [plugins = cask->plugins_](ReorderEntry& entry) {
+                std::visit([&plugins](auto& e) {
                     using T = std::decay_t<decltype(e)>;
-                    if constexpr (std::is_same_v<T, ReduceEntry>) {
-                        search.reduce_apply(e.job, e.meta, e.vec);
-                    } else if constexpr (std::is_same_v<T, OnWriteEntry>) {
-                        search.on_write(e.key, e.ord, e.text,
-                                        e.file_id, e.offset, e.total_sz, e.tstamp);
-                        if (!e.meta.empty()) search.index().set_meta(e.ord, e.meta);
-                        if (!e.vec.empty())  search.on_vector(e.ord, e.vec);
+                    if constexpr (std::is_same_v<T, PutEntry>) {
+                        const plugin::DocView  doc = make_doc_view(e.task);
+                        const plugin::PutEvent ev  = make_put_event(e.task, &doc);
+                        for (std::size_t i = 0; i < plugins.size(); ++i) {
+                            plugins[i]->on_put(
+                                ev, i < e.preps.size() ? std::move(e.preps[i])
+                                                       : plugin::PreparedPtr{});
+                        }
                     } else if constexpr (std::is_same_v<T, DeleteEntry>) {
-                        search.on_delete(e.key, e.ord);
+                        for (auto* p : plugins) {
+                            p->on_delete(plugin::DeleteEvent{e.ord, e.key});
+                        }
                     } else if constexpr (std::is_same_v<T, SkipEntry>) {
                         // no-op（ord 空洞填充）
-                    } else if constexpr (std::is_same_v<T, RebuildEntry>) {
-                        search.rebuild_hnsw();
                     } else if constexpr (std::is_same_v<T, RunFnEntry>) {
-                        // S13-F6：merge 路径的 compact/ckpt 序列化等在此
-                        // （reducer 单写者上下文）执行。
+                        // S13-F6：merge 路径的 compact/HNSW 重建/ckpt 序列化
+                        // 等在此（reducer 单写者上下文）执行。
                         if (e.fn) e.fn();
                     }
                 }, entry);
@@ -757,6 +769,11 @@ Cask::create_search_infra(const CaskOptions& opts) {
         return std::unexpected(err(CaskError::kInvalidOption,
                                    "analyzer creation failed (check analyzer type / dict_path)"));
     }
+    // S15-3：SearchLayer 经 adapter 作「唯一插件」接入分发表——IndexPool
+    // 写路径的 map/reduce 闭包只认识 plugins_（CaskPlugin 接口），不再直呼
+    // SearchLayer 方法。
+    search_adapter_ = std::make_unique<search::SearchLayerAdapter>(*search_);
+    plugins_ = {search_adapter_.get()};
     // S6-P3: 不再每库自建池。共享池借用 + 车道注册推迟到 keydir 就绪后
     // （caller 在 create_search_infra 返回、registry_/keydir_ 装配完成后做）。
     // 此处仅建好 search_，标记本库为 search 模式（search_ != nullptr）。
@@ -845,6 +862,10 @@ void Cask::close() noexcept {
         keydir_name_.clear();
     }
     keydir_.reset();
+    // S15-3：adapter 引用 *search_，先于 search_ 重置（lane 已在上方
+    // unregister（含 flush），闭包不会再触碰二者）。
+    search_adapter_.reset();
+    plugins_.clear();
     search_.reset();
     if (write_lock_) {
         write_lock_->release_quiet();
@@ -2101,13 +2122,11 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
                                   /*tomb*/ true, key);
     if (!h) return std::unexpected(io_fault(h.error().errnum));
     keydir_->remove(bytes_to_view(key), tstamp);
-    og.disarm();  // S13-F2: ord 由下面的 Delete 任务（或非池路径直调）覆盖
-    // H1：池路径的 Delete 提交移出临界区（同 put）。非池路径的 on_delete
-    // 是同步直调，依赖 write_mu_ 串行化写者，保持锁内。
+    og.disarm();  // S13-F2: ord 由下面的 Delete 任务覆盖
+    // H1：Delete 提交移出临界区（同 put）。S15-3：原「非池同步直调
+    // on_delete」分支删除——open 强制 registry 非空（本文件 open() 首行
+    // 校验），search_ 存在 ⇒ index_pool_ 恒已装配，该分支不可达。
     const bool pooled = index_pool_ != nullptr;
-    if (!pooled && search_) {
-        search_->on_delete(bytes_to_view(key), ord);
-    }
     auto gc = maybe_group_commit();
     wlk.unlock();
     if (pooled) {
@@ -2871,17 +2890,17 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
             search_->compact_index_chunks();
         }
 
-        // V4:merge 后同步重建 HNSW（物理清除死节点）。重建在 IndexPool
-        // worker 内执行（单写者约束），flush 阻塞等待完成。
-        // S6-P2: RebuildHnsw 现在携带 ord（alloc_ord 分配），通过 reorder
-        // buffer 与本 merge 期间累积的 put/delete 同序串行 apply——保持 HNSW
-        // 单写者约束在 ord 维度上的严格性。该 ord 在数据语义上不指向任何
-        // 文档（类似 Skip），仅用于 occupy ord 序列中的位置。
+        // V4:merge 后同步重建 HNSW（物理清除死节点）。重建在 reducer 线程
+        // 执行（单写者约束），flush 阻塞等待完成。S15-2：原专用 RebuildHnsw
+        // 操作并入 RunFn 通道——重建本就是塞进 reducer 静止点的闭包。ord
+        // 照旧 alloc_ord 占位，经 reorder buffer 与本 merge 期间累积的
+        // put/delete 同序串行 apply——保持 HNSW 单写者约束在 ord 维度上的
+        // 严格性。该 ord 在数据语义上不指向任何文档（类似 Skip）。
         if (meta_config_.vector_dim > 0 && index_pool_ && index_lane_) {
-            auto rebuild_ord = keydir_->alloc_ord();
             IndexTask t;
-            t.op  = IndexOp::RebuildHnsw;
-            t.ord = rebuild_ord;
+            t.op  = IndexOp::RunFn;
+            t.ord = keydir_->alloc_ord();
+            t.fn  = [this] { search_->rebuild_hnsw(); };
             index_pool_->submit(index_lane_, std::move(t));
             index_pool_->flush(index_lane_);
         }

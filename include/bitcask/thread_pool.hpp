@@ -2,8 +2,8 @@
 //
 // === Index Pool（S6-P3 共享 + S6-P4 并行 map）===
 // **registry 级共享**（非每 Cask 一个）。架构 = MapReduce 流水线：
-//   queue → N 个 map worker（std::thread，并发跑 map_fn_=map_analyze，真数据并行
-//           → G1；Add+fields 走分词，其余直接构造 entry）
+//   queue → N 个 map worker（std::thread，并发跑 map_fn_=各插件 prepare 相，
+//           真数据并行 → G1；Add 走 map_fn，其余直接构造 entry）
 //        → per-lane reorder buffer（按 ord 暂存乱序结果）
 //        → 1 个 reducer（按 ord 严格升序取 entry 调 reduce_fn_，库内单写者 I3；
 //           异常仍推进 ord 避免 stall）。
@@ -48,7 +48,7 @@
 #include <oneapi/tbb/parallel_for.h>     // S6-P2: parallel map 调度（避免 task_group 与非 TBB 线程的小对象池错配）
 #include <oneapi/tbb/task_arena.h>       // S6-P2: this_task_arena::isolate for TSan compatibility
 
-#include "bitcask/search_layer.hpp"  // S6-P2: ReduceJob 用于 ReorderEntry
+#include "bitcask/plugin_api.hpp"  // S15-2: PreparedPtr 用于 PutEntry（本头不再依赖 search）
 
 #if defined(__SANITIZE_THREAD__) || \
     (defined(__has_feature) && __has_feature(thread_sanitizer))
@@ -62,21 +62,17 @@ namespace bitcask {
 
 // 索引操作类型。
 enum class IndexOp : std::uint8_t {
-    Add,         // 文档写入（分词 + put_doc + add_doc）
-    Delete,      // 文档删除（remove_doc + index.remove）
-    // V3.5:merge 后 HNSW 重建(物理清死)。S6-P2: 现在携带 ord（由
-    // keydir_->alloc_ord 分配），通过 reorder buffer 与 Add/Delete 同序串行
-    // apply，维护 HNSW 单写者约束。
-    RebuildHnsw,
+    Add,         // 记录写入（map 相调各插件 prepare，reduce 相广播 on_put）
+    Delete,      // 记录删除（reduce 相广播 on_delete）
     // S6-P1: ord 空洞填充标记。alloc_ord 后若该 ord 不进索引（如 write_and_keydir
     // 重试路径浪费了原始 ord），单写线程发 Skip 填洞，使 reorder buffer 的
     // next_apply_ord 不永久 stall。P2 并行 map 下保证 ord 序重建。
     Skip,
     // S13-F6：在 reducer 线程内执行任意回调（携带 ord，经 reorder buffer 与
-    // Add/Delete 同序串行）。用途：merge 路径的 compact / checkpoint 序列化
-    // ——这些操作遍历 tbb::concurrent_hash_map，与 reducer 的 add_doc 插入
-    // 并发不安全（TBB 不支持遍历与插入并发），必须与 RebuildHnsw 一样搬进
-    // reducer 单写者上下文。
+    // Add/Delete 同序串行）。用途：merge 路径的 compact / HNSW 重建 /
+    // checkpoint 序列化——这些操作遍历 tbb::concurrent_hash_map 或换图指针，
+    // 与 reducer 的插入并发不安全，必须搬进 reducer 单写者上下文。
+    // （S15-2：原专用 RebuildHnsw 操作已并入本通道——重建本就是闭包。）
     RunFn,
     Sentinel,    // 停止信号，每个 map worker 各消费一个后退出（见 stop()）
 };
@@ -157,6 +153,24 @@ struct IndexTask {
     }
 };
 
+// ---- S15-3: IndexTask → 插件事件视图（宿主分发闭包与契约测试共用）----
+// 返回值借用 task 的缓冲，仅在 task 存活期间有效（PutEntry 持有 task 至
+// on_put 返回，满足 PutEvent 的「回调期间有效」契约）。
+inline plugin::DocView make_doc_view(const IndexTask& t) {
+    return plugin::DocView{t.text(), t.fields, t.vec, t.meta};
+}
+inline plugin::PutEvent make_put_event(const IndexTask& t,
+                                       const plugin::DocView* doc) {
+    plugin::PutEvent e;
+    e.ord    = t.ord;
+    e.key    = t.key();
+    e.value  = t.text();
+    e.doc    = doc;
+    e.loc    = {t.file_id, t.offset, t.total_sz};
+    e.tstamp = t.tstamp;
+    return e;
+}
+
 // 索引任务队列：多生产者（put/delete 线程）→ 单消费者（Index Pool worker）。
 // 背压通过 tbb::concurrent_bounded_queue 的 bounded capacity 实现。
 class IndexTaskQueue {
@@ -203,44 +217,39 @@ private:
     tbb::concurrent_bounded_queue<IndexTask> queue_;
 };
 
-// ---- Reorder buffer entry types ----
+// ---- Reorder buffer entry types（S15-2：通用条目，无搜索领域类型）----
 // map worker 把构造好的 entry 塞进 lane 的 reorder buffer，reducer 按 ord 序
 // 取出来 apply。variant 涵盖所有 IndexOp 类型。
-struct ReduceEntry {
-    search::ReduceJob job;             // map_analyze 产出（meta/vec 复用 ReduceJob）
-    std::vector<std::byte> meta;       // 跨线程持有 owning
-    std::vector<float>    vec;
-};
-struct OnWriteEntry {
-    std::string           key;
-    std::uint64_t         ord = 0;
-    std::string           text;
-    std::uint32_t         file_id = 0, total_sz = 0, tstamp = 0;
-    std::uint64_t         offset  = 0;
-    std::vector<std::byte> meta;
-    std::vector<float>    vec;
+//
+// PutEntry：一次记录写入的完整载荷。task 是 owning 载体（buf/fields_store/
+// vec/meta 的所有权随 entry 跨线程移交；vector 移动必为指针转移 → fields
+// 的 string_view 借用跨移动仍有效，见 IndexTask 注释）。preps 按插件注册序
+// 存放 map 相产物（未声明 prepare 能力/预处理失败的插件为 nullptr），由
+// reduce 相逐插件配对移交 on_put。
+struct PutEntry {
+    IndexTask                        task;
+    std::vector<plugin::PreparedPtr> preps;
 };
 struct DeleteEntry {
     std::string  key;
     std::uint64_t ord = 0;
 };
 struct SkipEntry {};
-struct RebuildEntry {};
-// S13-F6：reducer 线程内执行的任意回调（compact / ckpt 序列化等需要
-// 单写者上下文的操作）。
+// S13-F6：reducer 线程内执行的任意回调（compact / HNSW 重建 / ckpt 序列化
+// 等需要单写者上下文的操作）。
 struct RunFnEntry {
     std::function<void()> fn;
 };
 
-using ReorderEntry = std::variant<ReduceEntry, OnWriteEntry, DeleteEntry,
-                                  SkipEntry, RebuildEntry, RunFnEntry>;
+using ReorderEntry = std::variant<PutEntry, DeleteEntry, SkipEntry, RunFnEntry>;
 
-// ---- S6-P2: Pipeline callbacks ----
-// MapFn（并行 TBB）：IndexTask → ReduceEntry。Add + 非空 fields 走此路径。
-// ReduceFn（串行 reducer）：ReorderEntry → apply（含 on_write/on_delete/
-//   reduce_apply/rebuild_hnsw 全部分支）。
+// ---- S6-P2: Pipeline callbacks（S15-2 泛化）----
+// MapFn（并行 map worker）：IndexTask → 各插件 prepare 相产物（注册序；
+//   宿主闭包只对 wants_prepare() 的插件调 prepare，其余置 nullptr）。
+//   所有 Add 任务都经过 map_fn——是否需要预处理由插件自决。
+// ReduceFn（串行 reducer）：ReorderEntry → 广播给各插件 apply。
 // ErrorFn：异常计数器（best-effort 失败上报）。
-using MapFn    = std::function<ReduceEntry(const IndexTask&)>;
+using MapFn    = std::function<std::vector<plugin::PreparedPtr>(const IndexTask&)>;
 using ReduceFn = std::function<void(ReorderEntry&)>;
 using ErrorFn  = std::function<void()>;
 
@@ -441,25 +450,26 @@ public:
 private:
     // ---- S6-P4: 并行 map worker 池 + reorder buffer ----
 
-    // 处理一条任务：Add+fields 跑 map_analyze（真并行——本函数在 N 个 map
-    // worker 上并发执行），其余直接构造 entry。结果按 ord 入 lane 的 reorder
-    // buffer，reducer 串行按 ord 序 apply。RebuildHnsw 无需屏障：reducer 的
-    // ord 序保证它在所有 ord<K apply 后才 apply（届时所有前序 map 必已完成）。
+    // 处理一条任务：Add 跑 map_fn（真并行——本函数在 N 个 map worker 上
+    // 并发执行；宿主闭包只对声明 prepare 能力的插件调 prepare，纯函数、
+    // 多 worker 对同 lane 并发调用安全（F7）），其余直接构造 entry。
+    // 结果按 ord 入 lane 的 reorder buffer，reducer 串行按 ord 序 apply。
     void process_task(IndexTask task) {
         IndexLane* lane = task.lane;
-        if (task.op == IndexOp::Add && !task.fields.empty()) {
-            // map_analyze：纯函数（analyzer const、cppjieba Cut const 线程安全），
-            // 多 worker 对同 lane 并发调用安全（F7）。
-            ReduceEntry entry;
+        if (task.op == IndexOp::Add) {
+            // S15-2：所有 Add 统一走 map_fn（是否预处理由插件自决）。
+            // 预处理异常 → error_fn + 空 preps（reduce 相各插件收 nullptr，
+            // 自行降级——语义同旧版「map 抛异常收空 entry」）。
+            std::vector<plugin::PreparedPtr> preps;
             try {
-                entry = lane->map_fn(task);
+                preps = lane->map_fn(task);
             } catch (...) {
                 if (lane->error_fn) lane->error_fn();
-                entry = ReduceEntry{};
+                preps.clear();
             }
-            push_reorder(lane, task.ord, ReorderEntry{std::move(entry)});
-        } else if (task.op == IndexOp::RebuildHnsw) {
-            push_reorder(lane, task.ord, ReorderEntry{RebuildEntry{}});
+            const std::uint64_t ord = task.ord;
+            push_reorder(lane, ord,
+                         ReorderEntry{PutEntry{std::move(task), std::move(preps)}});
         } else if (task.op == IndexOp::Delete) {
             DeleteEntry de;
             de.key = std::string(task.key());
@@ -467,23 +477,10 @@ private:
             push_reorder(lane, task.ord, ReorderEntry{std::move(de)});
         } else if (task.op == IndexOp::Skip) {
             push_reorder(lane, task.ord, ReorderEntry{SkipEntry{}});
-        } else if (task.op == IndexOp::RunFn) {
-            // S13-F6：回调经 reorder buffer 送 reducer 线程按 ord 序执行。
+        } else {
+            // S13-F6：RunFn 回调经 reorder buffer 送 reducer 线程按 ord 序执行。
             push_reorder(lane, task.ord,
                          ReorderEntry{RunFnEntry{std::move(task.fn)}});
-        } else {
-            // on_write（单 text 路径）：构造 OnWriteEntry 跨线程交给 reducer。
-            OnWriteEntry owe;
-            owe.key      = std::string(task.key());
-            owe.ord      = task.ord;
-            owe.text     = std::string(task.text());
-            owe.file_id  = task.file_id;
-            owe.offset   = task.offset;
-            owe.total_sz = task.total_sz;
-            owe.tstamp   = task.tstamp;
-            owe.meta     = std::move(task.meta);
-            owe.vec      = std::move(task.vec);
-            push_reorder(lane, task.ord, ReorderEntry{std::move(owe)});
         }
     }
 

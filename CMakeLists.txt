@@ -202,6 +202,13 @@ target_link_libraries(bitcask_index
 )
 
 # ---------------------------------------------------------------------------
+# bitcask_plugin_api — KV 存储层插件回调接口（S15 P1，纯头文件、自包含：
+# 只依赖标准库）。Cask/merge/thread_pool 经它与索引插件解耦。
+# ---------------------------------------------------------------------------
+add_library(bitcask_plugin_api INTERFACE)
+target_include_directories(bitcask_plugin_api INTERFACE include)
+
+# ---------------------------------------------------------------------------
 # bitcask_bm25 — BM25 倒排索引（InvertedIndex + DAAT 评分）。
 # ---------------------------------------------------------------------------
 add_library(bitcask_bm25 STATIC

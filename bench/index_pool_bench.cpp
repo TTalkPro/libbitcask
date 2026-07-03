@@ -25,8 +25,12 @@ using bitcask::IndexLane;
 using bitcask::IndexOp;
 using bitcask::IndexPool;
 using bitcask::IndexTask;
-using bitcask::ReduceEntry;
 using bitcask::ReorderEntry;
+
+// S15-2：MapFn 泛化 = IndexTask → 各插件 prepare 产物；bench 无插件用空 preps。
+static std::vector<bitcask::plugin::PreparedPtr> no_preps(const bitcask::IndexTask&) {
+    return {};
+}
 
 static IndexTask mk_fields_task(
     bitcask::IndexOp op, std::string_view key, std::uint64_t ord,
@@ -61,7 +65,7 @@ static void BM_IndexPool_SubmitDrain(benchmark::State& state) {
         IndexPool pool(1, 1u << 17);
         std::atomic<std::size_t> n{0};
         pool.start(
-            [](const IndexTask&) { return ReduceEntry{}; },
+            no_preps,
             [&](ReorderEntry&) { n.fetch_add(1, std::memory_order_relaxed); },
             [] {});
         state.ResumeTiming();
@@ -94,10 +98,10 @@ static void BM_IndexPool_MapSpeedup(benchmark::State& state) {
         state.PauseTiming();
         IndexPool pool(kWorkers, 1u << 16);
         pool.start(
-            [&sink](const IndexTask& t) -> ReduceEntry {
+            [&sink](const IndexTask& t) -> std::vector<bitcask::plugin::PreparedPtr> {
                 sink.fetch_add(simulated_analyze(t.ord),
                                std::memory_order_relaxed);
-                return ReduceEntry{};
+                return {};
             },
             [](ReorderEntry&) {},
             [] {});
@@ -140,10 +144,10 @@ static void BM_IndexPool_MultiLibThroughput(benchmark::State& state) {
         std::vector<IndexLane*> lanes;
         for (int l = 0; l < kLibs; ++l) {
             lanes.push_back(pool.register_lib(
-                [&sink](const IndexTask& t) -> ReduceEntry {
+                [&sink](const IndexTask& t) -> std::vector<bitcask::plugin::PreparedPtr> {
                     sink.fetch_add(simulated_analyze(t.ord),
                                    std::memory_order_relaxed);
-                    return ReduceEntry{};
+                    return {};
                 },
                 [](ReorderEntry&) {}, [] {}, 0));
         }

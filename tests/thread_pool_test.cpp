@@ -24,12 +24,17 @@ using bitcask::IndexLane;
 using bitcask::IndexTask;
 using bitcask::IndexTaskQueue;
 using bitcask::TbbLifetime;
-using bitcask::ReduceEntry;
+using bitcask::PutEntry;
 using bitcask::ReorderEntry;
-using bitcask::OnWriteEntry;
 using bitcask::DeleteEntry;
 using bitcask::SkipEntry;
-using bitcask::RebuildEntry;
+using bitcask::RunFnEntry;
+
+// S15-2：MapFn 签名泛化 = IndexTask → 各插件 prepare 产物（注册序）。
+// 纯池测试无插件，统一用「空 preps」noop map。
+static std::vector<bitcask::plugin::PreparedPtr> no_preps(const bitcask::IndexTask&) {
+    return {};
+}
 
 // S10-A5: make() 不再带 fields 参数；测试用此 helper 构造带字段 task。
 // string_view 指向 string literal（静态存储）→ 任务生命周期内有效。
@@ -44,12 +49,12 @@ static IndexTask mk_fields_task(
     return t;
 }
 
-// S6-P2: 简单计数测试用 — map 返回空 ReduceEntry，reduce 端计数。
-// ALL task 类型走 reducer 计数（map 仅 Add+fields 触发）。
+// S6-P2: 简单计数测试用 — map 返回空 preps，reduce 端计数。
+// ALL task 类型走 reducer 计数（S15-2：所有 Add 都过 map_fn）。
 static void StartCountingPool(IndexPool& pool,
                               std::atomic<std::size_t>& count) {
     pool.start(
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [&](ReorderEntry&) { ++count; },
         []() {}
     );
@@ -74,7 +79,7 @@ TEST(IndexPool, SubmitAndProcess) {
 TEST(IndexPool, StopIsIdempotent) {
     IndexPool pool(1, 10240);
     pool.start(
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [](ReorderEntry&) {},
         []() {}
     );
@@ -92,7 +97,7 @@ TEST(IndexPool, SentinelStopsWorker) {
     std::atomic<bool> invoked{false};
 
     pool.start(
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [&](ReorderEntry&) { invoked = true; },
         []() {}
     );
@@ -141,7 +146,7 @@ TEST(IndexPool, BackpressureBlocksWhenQueueFull) {
     std::atomic<std::size_t> processed{0};
 
     pool.start(
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [&](ReorderEntry&) { ++processed; },
         []() {}
     );
@@ -196,7 +201,7 @@ TEST(IndexPool, FlushDrainsBackpressuredThenStopClean) {
     std::atomic<bool> reducer_in_wait{false};
 
     pool.start(
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [&](ReorderEntry&) {
             if (processed.load() == 0) {
                 // 第一个 entry：reducer 卡住，让 queue 填满
@@ -225,7 +230,7 @@ TEST(IndexPool, FlushDrainsBackpressuredThenStopClean) {
     // 等 feeder 全部 submit（queue 不阻塞因为 dispatcher 在 dispatch）
     feeder.join();
 
-    // 此时 reducer 仍卡在第一条；reorder_pending_ 里有 16 条 OnWriteEntry；
+    // 此时 reducer 仍卡在第一条；reorder_pending_ 里有 16 条 PutEntry；
     // queue 空。释放 reducer → 排空 reorder buffer。
     { std::lock_guard<std::mutex> lk(m); release = true; }
     cv.notify_all();
@@ -254,17 +259,16 @@ TEST(CaskCompilation, IndexPoolAccessor) {
 
 // S6-P1 AT3: ord 空洞（Skip marker）不 stall flush。
 // 提交 Add{ord=0}, Skip{ord=1}, Add{ord=2} → flush 必须返回（不永久阻塞）。
-// S6-P2: 计数走 reducer（map 只处理 Add+fields，单 text 走 OnWriteEntry）。
+// S15-2: 所有 Add 统一走 map（此处空 preps），entry 类型 = PutEntry。
 TEST(IndexPool, SkipMarkerFillsOrdHole) {
     IndexPool pool(1, 10240);
     std::atomic<std::size_t> add_count{0};
     std::atomic<std::size_t> skip_count{0};
 
     pool.start(
-        // Add+fields 才会触发 map（这里 fields 全空 → 全走 OnWriteEntry）
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [&](ReorderEntry& e) {
-            if (std::holds_alternative<OnWriteEntry>(e)) ++add_count;
+            if (std::holds_alternative<PutEntry>(e)) ++add_count;
             else if (std::holds_alternative<SkipEntry>(e)) ++skip_count;
         },
         []() {}
@@ -290,7 +294,7 @@ TEST(IndexPool, FlushCatchesUpToSubmittedHwm) {
     std::atomic<std::size_t> processed{0};
 
     pool.start(
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [&](ReorderEntry&) { ++processed; },
         []() {}
     );
@@ -312,35 +316,34 @@ TEST(IndexPool, FlushCatchesUpToSubmittedHwm) {
     pool.stop();
 }
 
-// S6-P2 AT1: 管线 vs 串行字节等价 — 简化版（不接真 SearchLayer，用 mock
-// 计数验证 dispatcher → TBB map → reorder buffer → reducer 全链路）。
+// S6-P2 AT1: 管线 vs 串行字节等价 — 简化版（不接真插件，用 mock
+// 计数验证 dispatcher → 并行 map → reorder buffer → reducer 全链路）。
 //
-// 守护的契约：
-//   - Add+fields 走 TBB map（map_fn_ 被调用一次/条）
-//   - Add+空 fields / Delete / Skip / RebuildHnsw 都不走 map_fn_，直接
-//     进 reducer（dispatcher 构造对应 entry）
+// 守护的契约（S15-2 修订）：
+//   - 所有 Add 走 map（map_fn_ 被调用一次/条；是否真预处理由插件自决）
+//   - Delete / Skip / RunFn 不走 map_fn_，直接进 reducer 对应 entry
 //   - ALL 任务都在 reducer 串行 apply
-//   - exception 路径：map_fn_ 抛 → reducer 仍收到 entry（空）+ error_fn_
-//     被调用 + ord 不 stall
+//   - exception 路径：map_fn_ 抛 → reducer 仍收到 entry（空 preps）+
+//     error_fn_ 被调用 + ord 不 stall
 TEST(IndexPool, PipelineProcessesAllTaskTypes) {
     IndexPool pool(1, 10240);
     std::atomic<std::size_t> map_count{0};
     std::atomic<std::size_t> reduce_count{0};
     std::atomic<std::size_t> error_count{0};
-    std::atomic<std::size_t> onwrite_count{0};
+    std::atomic<std::size_t> put_count{0};
     std::atomic<std::size_t> delete_count{0};
     std::atomic<std::size_t> skip_count{0};
 
     pool.start(
-        [&](const IndexTask& task) -> ReduceEntry {
+        [&](const IndexTask&) {
             ++map_count;
-            // 真实 map_analyze 在此被调用（测试中只验证被触发次数）
-            return ReduceEntry{};
+            // 真实 prepare 分发在此被调用（测试中只验证被触发次数）
+            return std::vector<bitcask::plugin::PreparedPtr>{};
         },
         [&](ReorderEntry& entry) {
             ++reduce_count;
             // 分发到 variant 各分支计数
-            if (std::holds_alternative<OnWriteEntry>(entry)) ++onwrite_count;
+            if (std::holds_alternative<PutEntry>(entry)) ++put_count;
             else if (std::holds_alternative<DeleteEntry>(entry)) ++delete_count;
             else if (std::holds_alternative<SkipEntry>(entry)) ++skip_count;
         },
@@ -355,11 +358,10 @@ TEST(IndexPool, PipelineProcessesAllTaskTypes) {
 
     pool.flush();
 
-    // Add+空 fields → OnWriteEntry（不进 map）；所以 map_count=0
-    // 期望（基于当前提交：4 条任务全是 Add+空fields/Skip/Delete）：
-    EXPECT_EQ(map_count.load(), 0);
+    // S15-2：所有 Add 统一走 map（单文本预处理与否由插件自决）→ map_count=2
+    EXPECT_EQ(map_count.load(), 2);    // Add{0}, Add{3}
     EXPECT_EQ(reduce_count.load(), 4); // ALL tasks go through reduce_fn
-    EXPECT_EQ(onwrite_count.load(), 2); // Add{0}, Add{3}
+    EXPECT_EQ(put_count.load(), 2);    // Add{0}, Add{3}
     EXPECT_EQ(delete_count.load(), 1); // Delete{2}
     EXPECT_EQ(skip_count.load(), 1);   // Skip{1}
     EXPECT_EQ(error_count.load(), 0);
@@ -375,9 +377,9 @@ TEST(IndexPool, AddWithFieldsGoesThroughMap) {
     std::atomic<std::size_t> reduce_count{0};
 
     pool.start(
-        [&](const IndexTask& task) -> ReduceEntry {
+        [&](const IndexTask&) {
             ++map_count;
-            return ReduceEntry{};
+            return std::vector<bitcask::plugin::PreparedPtr>{};
         },
         [&](ReorderEntry&) { ++reduce_count; },
         []() {}
@@ -408,8 +410,8 @@ TEST(IndexPool, MapExceptionDoesNotStall) {
     std::atomic<std::size_t> reduce_count{0};
 
     pool.start(
-        [](const IndexTask&) -> ReduceEntry {
-            throw std::runtime_error("map_analyze failed");
+        [](const IndexTask&) -> std::vector<bitcask::plugin::PreparedPtr> {
+            throw std::runtime_error("prepare failed");
         },
         [&](ReorderEntry&) { ++reduce_count; },
         [&]() { ++error_count; }
@@ -437,7 +439,7 @@ TEST(IndexPool, ReduceExceptionDoesNotStall) {
     std::atomic<std::size_t> processed{0};
 
     pool.start(
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [&](ReorderEntry&) {
             ++processed;
             throw std::runtime_error("apply failed");
@@ -468,11 +470,11 @@ TEST(IndexPool, ReducerAppliesInOrdOrder) {
     std::vector<std::uint64_t> snapshot;
 
     pool.start(
-        [&](const IndexTask& task) -> ReduceEntry {
+        [&](const IndexTask& task) -> std::vector<bitcask::plugin::PreparedPtr> {
             // 大 ord sleep 短，小 ord sleep 长 → 完成顺序乱
             if (task.ord == 0) std::this_thread::sleep_for(std::chrono::milliseconds(30));
             else if (task.ord == 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            return ReduceEntry{};
+            return {};
         },
         [&](ReorderEntry&) {
             std::lock_guard<std::mutex> lk(mu);
@@ -504,35 +506,42 @@ TEST(IndexPool, ReducerAppliesInOrdOrder) {
     EXPECT_EQ(pool.applied_ord(), 2u);
 }
 
-// S6-P2: RebuildHnsw 现在携带 ord（merge 路径 alloc_ord）。
-// 验证 RebuildHnsw 进 reducer 的 RebuildEntry 分支 + ord 参与 submitted_ord_hwm。
-TEST(IndexPool, RebuildHnswCarriesOrd) {
+// S15-2: RunFn 携带 ord（merge 路径 alloc_ord；原 RebuildHnsw 已并入本通道）。
+// 验证 RunFn 进 reducer 的 RunFnEntry 分支、闭包在 reducer 执行 + ord 参与
+// submitted_ord_hwm。
+TEST(IndexPool, RunFnCarriesOrdAndExecutesInReducer) {
     IndexPool pool(1, 10240);
-    std::atomic<std::size_t> rebuild_count{0};
+    std::atomic<std::size_t> runfn_entry_count{0};
+    std::atomic<std::size_t> fn_ran{0};
 
     pool.start(
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [&](ReorderEntry& e) {
-            if (std::holds_alternative<RebuildEntry>(e)) ++rebuild_count;
+            if (auto* rf = std::get_if<RunFnEntry>(&e)) {
+                ++runfn_entry_count;
+                if (rf->fn) rf->fn();  // 宿主 reduce 闭包的分发语义
+            }
         },
         []() {}
     );
 
-    // Add{0} + RebuildHnsw{1} + Add{2} —— 验证 RebuildHnsw 携带 ord 参与
+    // Add{0} + RunFn{1} + Add{2} —— 验证 RunFn 携带 ord 参与
     // submitted_ord_hwm 且 reducer 按 ord 序 apply。
     pool.submit(IndexTask::make(IndexOp::Add, "k0", 0, "t", 1, 0, 0, 0, 0));
     {
         IndexTask t;
-        t.op  = IndexOp::RebuildHnsw;
+        t.op  = IndexOp::RunFn;
         t.ord = 1;
+        t.fn  = [&] { ++fn_ran; };
         pool.submit(std::move(t));
     }
     pool.submit(IndexTask::make(IndexOp::Add, "k2", 2, "t", 1, 0, 0, 0, 0));
 
     pool.flush();
 
-    EXPECT_EQ(rebuild_count.load(), 1);
-    EXPECT_EQ(pool.submitted_ord_hwm(), 2);  // RebuildHnsw ord=1 included
+    EXPECT_EQ(runfn_entry_count.load(), 1);
+    EXPECT_EQ(fn_ran.load(), 1);
+    EXPECT_EQ(pool.submitted_ord_hwm(), 2);  // RunFn ord=1 included
     EXPECT_EQ(pool.applied_ord(), 2);
     pool.stop();
 }
@@ -556,7 +565,7 @@ static int count_os_threads() {
 // worker 干扰计数），纯验证「线程数 = 常量，与库数无关」的结构性保证。
 TEST(IndexPoolMultiLib, ThreadCountIndependentOfLibCount) {
     IndexPool pool(1, 10240);
-    auto noop_map   = [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; };
+    auto noop_map   = no_preps;
     auto noop_red   = [](ReorderEntry&) {};
     auto noop_err   = []() {};
 
@@ -592,16 +601,12 @@ TEST(IndexPoolMultiLib, LanesApplyIndependentlyInOrdOrder) {
 
     for (int lib = 0; lib < kLibs; ++lib) {
         lanes[lib] = pool.register_lib(
-            // map：仅把 ord 透传进 ReduceJob（不做真分词），供 reducer 核对序。
-            [](const IndexTask& t) -> ReduceEntry {
-                ReduceEntry re;
-                re.job.ord = t.ord;
-                return re;
-            },
+            // S15-2：ord 直接随 PutEntry.task 到达 reducer，map 无需透传。
+            no_preps,
             [&seen, lib](ReorderEntry& e) {
-                // ReduceEntry 来自 Add-with-fields；记录其 ord。
-                if (auto* re = std::get_if<ReduceEntry>(&e)) {
-                    seen[lib].push_back(re->job.ord);
+                // PutEntry 来自 Add；记录其 ord。
+                if (auto* pe = std::get_if<PutEntry>(&e)) {
+                    seen[lib].push_back(pe->task.ord);
                 }
             },
             []() {}, 0);
@@ -646,10 +651,10 @@ TEST(IndexPoolMultiLib, UnregisterOneLibKeepsOthersRunning) {
     IndexPool pool(1, 10240);
     std::atomic<std::size_t> cntA{0}, cntB{0};
     IndexLane* a = pool.register_lib(
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [&](ReorderEntry&) { ++cntA; }, []() {}, 0);
     IndexLane* b = pool.register_lib(
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [&](ReorderEntry&) { ++cntB; }, []() {}, 0);
 
     for (int i = 0; i < 50; ++i)
@@ -684,7 +689,7 @@ TEST(IndexPoolMultiLib, ReorderBackpressureBoundsMemoryThenDrains) {
     std::atomic<bool> reducer_blocked{false};
 
     IndexLane* lane = pool.register_lib(
-        [](const IndexTask&) -> ReduceEntry { return ReduceEntry{}; },
+        no_preps,
         [&](ReorderEntry&) {
             if (processed.load() == 0) {
                 std::unique_lock<std::mutex> lk(m);

@@ -251,6 +251,29 @@ gtest_discover_tests(bitcask_synonym_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_fuzzy_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_hnsw_test ${_bitcask_test_props})
 
+# S15-1：plugin_api 头自包含测试——只链 bitcask_plugin_api（+gtest），
+# 编译通过即证明接口层对 search/bm25/vector 零依赖。
+add_executable(bitcask_plugin_api_test plugin_api_test.cpp)
+target_link_libraries(bitcask_plugin_api_test PRIVATE
+    GTest::gtest_main
+    bitcask_plugin_api
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_plugin_api_test ${_bitcask_test_props})
+
+# S15-4：插件契约 Mock 测试——不链 search（thread_pool.hpp 已去搜索化，
+# 只需 plugin_api + TBB），守护 IndexPool 分发通路对 CaskPlugin 的契约。
+add_executable(bitcask_plugin_contract_test plugin_contract_test.cpp)
+target_link_libraries(bitcask_plugin_contract_test PRIVATE
+    GTest::gtest_main
+    bitcask_plugin_api
+    bitcask_warnings
+    bitcask_sanitizers
+    TBB::tbb
+)
+gtest_discover_tests(bitcask_plugin_contract_test ${_bitcask_test_props})
+
 add_executable(bitcask_thread_pool_test thread_pool_test.cpp)
 target_link_libraries(bitcask_thread_pool_test PRIVATE
     GTest::gtest_main

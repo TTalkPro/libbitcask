@@ -464,7 +464,7 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
 // search_text/phrase/near 也能命中多字段文档），见下方注释。
 ReduceJob SearchLayer::map_analyze(
     std::string_view key, std::uint64_t ord,
-    const std::vector<std::pair<std::string_view, std::string_view>>& fields,
+    std::span<const std::pair<std::string_view, std::string_view>> fields,
     std::uint32_t file_id, std::uint64_t offset,
     std::uint32_t total_sz, std::uint32_t tstamp) const {
     ReduceJob job;
