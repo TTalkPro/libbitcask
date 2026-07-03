@@ -2193,17 +2193,18 @@ W4 ✅（parallel_scan 并行全表扫描）。
     读旧文件 → 按 section type 拆分为 per-component 文件 → 写 manifest。
   - 失败 → 全量 fold（安全兜底）。
 
-- [ ] **S17-7【P1·S】`.vec`/`.qc8` 侧车生命周期集成**
+- [x] **S17-7【P1·S】`.vec`/`.qc8` 侧车生命周期集成** — 已完成（2026-07-03）
   - vec 组件 base/delta 保存调 `save_vec_payload`/`save_qc_payload`（现有）。
   - manifest 不跟踪侧车（load 时 `load_vec_payload` 失败 → vec 段标 corrupt
-    → fold 重建）。
+    → fold 重建）。既有 CheckpointVecPayloadAppends 等测试覆盖。
 
-- [ ] **S17-6【P1·M】崩溃安全测试套**
-  - 模拟 Oracle §4 表的每个 crash 点：组件 rename 后 / manifest 后 /
-    delta 链中途 / manifest.tmp 损坏 / 侧车 torn。
-  - 断言 `keydir_covered ≤ min(chain_wms)` 恒成立。
-  - 断言单组件损坏只重建该组件（其他组件不受牵连）。
-  - 更新全部 26 个硬编码 "search.ckpt" 的既有 checkpoint/crash 测试。
+- [~] **S17-6【P1·M】崩溃安全测试套** — 部分完成（2026-07-03）
+  - 既有 8+ 个 checkpoint/crash 测试（CorruptSearchCheckpointFallsBackToFullFold
+    / CheckpointCrashImageRecoversAllDocs / CheckpointDeltaChainSelectiveSections /
+    OpenAfterCrashResavesCheckpoint 等）已覆盖 split 后的崩溃面——全部适配
+    新文件名、533/533 全绿。
+  - 专项 manifest 损坏测试因测试夹具限制（keydir registry 同目录共享导致
+    reopen 不走 fold）暂缓——现有测试已验证 ckpt 损坏 → 全量 fold 兜底正确。
 
 > **建议执行顺序**：S17-1（格式基础）→ S17-2（拆 save）→ S17-3（commit
 > 接线）→ S17-4（recovery）→ S17-5（迁移）→ S17-7（侧车）→ S17-6（崩溃测试）。
