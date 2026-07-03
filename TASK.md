@@ -2084,7 +2084,7 @@ W4 ✅（parallel_scan 并行全表扫描）。
     `DocmapIsHostOwnedSharedInstance`（同址断言 + 双句柄可见性 + close 清
     句柄）。clang 523/523、TSan 522/523（唯一失败为既知预存项
     ThreadCountIndependentOfLibCount）。
-- [ ] **S16-2【P0·L】写路径反转：宿主先 apply DocMap，插件退纯索引写**
+- [x] **S16-2【P0·L】写路径反转：宿主先 apply DocMap，插件退纯索引写** — 已完成（2026-07-03）
   - reduce 闭包 PutEntry 分支：广播插件**之前**宿主直调
     `docmap_->put_doc`（DocSlot 从 task 构造）+ `set_meta`；DeleteEntry
     分支：先捕获 `prior_ord = docmap_->get(key)`，再 `docmap_->remove`，
@@ -2101,17 +2101,23 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - 测试：全量回归（尤其 crash_recovery / checkpoint_recovery / S14 全系
     delta 链测试）+ TSan；plugin_contract_test 增「宿主 docmap 先于插件
     可见」断言（插件 on_put 内查 docmap 必已有本 ord 的 slot）。
-- [ ] **S16-3【P1·M】查询面 DocTable 化（P4 铺路）**
-  - 以 `bm25::LiveChecker` 为基础扩展只读接口（ord_to_ext / eval_meta 补
-    进去，或新设 `DocTable : LiveChecker`），HNSW live-callback、
-    materialize_hits、search_vector 的过滤链改经 `const DocTable&` 形参——
+  - **落地结果**：clang 524/524、TSan 523/523（唯一失败为既知预存项
+    ThreadCountIndependentOfLibCount）；plugin_contract 新增
+    DocmapVisibleBeforePluginOnPut（契约⑨，3 写 + 3 删全覆盖）；顺带修
+    CheckpointDeltaChainLengthBound flaky（mtime→字节内容比较）。
+- [x] **S16-3【P1·M】查询面 DocTable 化（P4 铺路）** — 已完成（2026-07-03）
+  - 新设 `include/bitcask/doc_table.hpp`——`DocTable : public LiveChecker`，
+    扩展 `ord_to_ext`/`eval_meta`/`ord_of`。`Index` 基类 LiveChecker→DocTable
+    （已有方法补 override + ord_of 薄包装）。HNSW live-callback、
+    materialize_hits、search_vector 过滤链改经 `const DocTable&` 形参——
     SearchLayer 查询代码不再直摸 `index_` 的具体类型。
   - 测试：查询全家（text/phrase/bool/fields/fuzzy/wildcard/vector/hybrid）
-    回归零差异。
-- [ ] **S16-4【P2·S】文档与契约测试收口**
+    回归零差异。**落地结果**：clang 524/524、TSan 523/523；查询全家 99/99。
+- [x] **S16-4【P2·S】文档与契约测试收口** — 已完成（2026-07-03）
   - 设计文档 §4 更新（doc_len 缓行决定 + DeleteEvent.prior_ord 修正 +
-    进度标记）；cpp-arch.md 分层图补 DocMap 宿主服务框。
-  - plugin_contract_test 补 DeleteEvent.prior_ord 契约用例。
+    DocTable 最终形态 + 进度标记）；cpp-arch.md 分层图补 DocMap 宿主服务框。
+  - plugin_contract_test 补 DeleteEvent.prior_ord 契约用例（契约⑩：
+    覆盖写后 prior_ord = 最新 ord，非原始 ord）。
 
 > **建议执行顺序**：S16-1 → S16-2（重头，含记账迁移）→ S16-3 → S16-4。
 > S16-2 是 P2 的实质；若其 ckpt 记账迁移在评审中被判过重，可退化为

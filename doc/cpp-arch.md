@@ -24,6 +24,7 @@
 │   ├── field_schema.hpp     # FieldSchema：字段名↔id 追加注册表（DocValue v3 字段）
 │   ├── index.hpp            # Index：内存文档侧表（ext2ord/slots/ord2ext/live）
 │   ├── live_checker.hpp     # live 集合批量维护（HNSW / 搜索死文档过滤）
+│   ├── doc_table.hpp        # DocTable : LiveChecker 查询面只读身份表（S16-3）
 │   ├── inverted.hpp         # InvertedIndex：BM25 倒排索引（按字段隔离 + 分片锁）
 │   ├── inverted_wal.hpp     # InvertedWal：倒排索引 WAL + 批量刷新
 │   ├── bm25_kernels.hpp     # DAAT BM25 评分内核
@@ -86,10 +87,12 @@
 ┌────────────────────────────▼───────────────────────────────┐
 │  Cask (KV + 搜索门面)                                     │
 │  ├─ KeyDir（256 分片 shared_mutex + MVCC 迭代器）          │
+│  ├─ DocMap / Index（宿主服务：ord↔ext/live/meta，S16）     │
+│  │   └─ DocTable（查询面只读接口：ord_to_ext/eval_meta，   │
+│  │       继承 bm25::LiveChecker；S16-3）                   │
 │  ├─ DataFile 缓存（pread 句柄 + 近似 LRU 淘汰）            │
 │  ├─ HintFile（活跃写入器；含整文件 CRC trailer）           │
-│  ├─ SearchLayer（仅索引模式）                              │
-│  │   ├─ Index（ext2ord/slots/ord2ext/live 侧表）          │
+│  ├─ SearchLayer（仅索引模式，借用 DocMap）                 │
 │  │   ├─ InvertedIndex（按字段隔离的 BM25 倒排 + WAL）      │
 │  │   ├─ HnswIndex（单写者 + 多读者无锁发布协议）           │
 │  │   └─ Analyzer（ngram / whitespace / jieba / stemming） │

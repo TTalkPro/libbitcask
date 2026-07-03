@@ -3,9 +3,12 @@
 状态：设计稿 v2（接口层按评审意见通用化——KV 事件词汇，2026-07-03）
 进度：**P1 已落地**（S15 批次，2026-07-03，TASK.md 第十五梯队）——plugin_api
 接口层 + thread_pool 去搜索化 + SearchLayerAdapter 唯一插件接入；clang 522/522、
-TSan 521/522（唯一失败为预存问题）、put_doc bench −0.3%。**P2 进行中**（S16
-批次，DocMap 宿主服务化）：S16-1 所有权上提已落地（Cask 持有 docmap_、
-SearchLayer 借用，同实例断言测试）；S16-2 写路径反转进行中。
+TSan 521/522（唯一失败为预存问题）、put_doc bench −0.3%。**P2 已落地**（S16
+批次，DocMap 宿主服务化）：S16-1 所有权上提（Cask 持有 docmap_、SearchLayer
+借用）；S16-2 写路径反转（宿主先 apply DocMap 再广播插件 + DeleteEvent.prior_ord
+修正 + doc_len 回填通道）；S16-3 查询面 DocTable 化（DocTable : LiveChecker，
+查询代码经 const DocTable& 消费，不再直摸 index_）；S16-4 文档与契约测试收口。
+clang 524/524、TSan 523/523（唯一失败为既知预存项 ThreadCountIndependent）。
 前置：S14 全系收官（增量 checkpoint、keydir 快照增量化、int8 码字外置）
 
 ---
@@ -425,7 +428,22 @@ merge 线程:  on_merge_begin ──► fold + 写新数据文件 + fsync
   打分专属输入，但它是 `DocSlot` 持久化字段（kDocmap 段行内）且以平坦 SoA
   支撑打分的 SIMD gather（`Index::fill_doc_lens`）——迁移同时牵连盘上格式与
   热路径。P2 保持「存储在 DocMap、语义归属 BM25」，P4 与 ckpt 格式变更（P3）
-  合并评估。
+  合并评估。**S16-2 落地通道**：宿主 `put_doc` 时 `doc_len=0` 占位，BM25 侧
+  （reducer 单写者）经 `Index::set_doc_len(ord, len)` 回填——同时更新 slots_
+  AoS 与 doc_lens_ SoA。
+- **DeleteEvent.prior_ord 修正（P2 实现期修正，2026-07-03）**：`SearchLayer::
+  on_delete` 旧实现先 `index_.get(key)` 查旧 ord 再调 BM25 统计——宿主先 remove
+  后插件查不到。修正：宿主在 docmap remove **前**捕获 `prior_ord`，`DeleteEvent`
+  增 `prior_ord` 字段（哨兵 `kNoPriorOrd`=原不存在）。这对 P4 的独立 BM25 插件
+  同样必要（插件不该为拿旧 ord 反查 docmap）。
+- **DocTable 最终形态（S16-3 落地，2026-07-03）**：新设 `include/bitcask/
+  doc_table.hpp`——`DocTable : public LiveChecker`（IS-A），扩展 `ord_to_ext`/
+  `eval_meta`/`ord_of`（ext_id→ord 窄投影，explain 用）。`Index` 基类从
+  `LiveChecker` 改为 `DocTable`（已有方法仅补 `override`）。BM25 单测的 5 个
+  FakeLiveChecker 仅实现 LiveChecker，不受影响（DocTable 不添评分侧方法）。
+  SearchLayer 全部查询路径（text/phrase/bool/fields/fuzzy/wildcard/vector/
+  hybrid/highlight/explain）经 `const DocTable&` 消费——`materialize_hits` 与
+  HNSW live-callback 改为 DocTable 形参，不再直摸 `index_` 具体类型。
 - DocMap 自己的持久化 = 现 ckpt 的 `kDocmap/kMeta/kTerms + kDocmapDelta`
   段，随 keydir 快照一起归宿主 checkpoint 管（见 §5），
   S14-7 的 `kKeydirDelta` 同文件成对不变量因此**原样保留**。
@@ -546,7 +564,7 @@ bitcask_search       （过渡期兼容 shim，迁移完成后删除）
 | 阶段 | 内容 | 风险 |
 |---|---|---|
 | P1 ✅ | `bitcask_plugin_api` 头 + thread_pool 类型擦除（ReduceEntry 去 ReduceJob）；SearchLayer 原样套 adapter 变「唯一插件」 | 低：纯接口化，行为零变——已落地（S15，2026-07-03） |
-| P2 | DocMap 抽离为宿主服务，SearchLayer 改消费 `const DocTable&`；doc_len 迁 BM25 侧 | 中：动 reduce_apply 内部顺序，需 TSan + 恢复回归 |
+| P2 ✅ | DocMap 抽离为宿主服务，SearchLayer 改消费 `const DocTable&`；doc_len 迁 BM25 侧 | 中：动 reduce_apply 内部顺序，需 TSan + 恢复回归——已落地（S16，2026-07-03；含 prior_ord 修正 + doc_len 回填通道 + DocTable 查询面化） |
 | P3 | checkpoint 拆分（manifest + 每组件文件族 + min-水位恢复协议） | **高**：动 S14 全部成果的持久化布局，需 crash_recovery / checkpoint_recovery 全系 + 新增「单组件损坏」注错测试；提供旧 search.ckpt 一次性迁移器 |
 | P4 | SearchLayer 拆 TextPlugin/VectorPlugin，hybrid 上移；merge/恢复改插件广播 | 中：大搬家但 P1-P3 已备好落点 |
 | P5 | Cask 门面瘦身、C API 分文件、配置拆分、删 shim、文档（cpp-arch.md 分层图更新） | 低 |
