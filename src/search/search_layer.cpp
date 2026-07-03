@@ -95,6 +95,13 @@ void SearchLayer::on_vector(std::uint64_t ord, std::span<const float> vec) {
     // worker 是唯一写者,但指针可能被本线程稍早的 rebuild_hnsw 换过。
     auto hnsw = hnsw_.load(std::memory_order_acquire);
     if (!hnsw || vec.size() != config_.vector_dim) return;
+    dirty_hnsw_.store(true, std::memory_order_relaxed);  // S14-3
+    // S14-4：窗口向量日志（delta 的 hnsw 半边——图无不可变旧段，用插入
+    // 日志重放）。只记链覆盖之外的（fold 重叠区的重放向量已在链里）。
+    if (ord >= ckpt_chain_wm_) {
+        delta_vecs_.emplace_back(ord,
+                                 std::vector<float>(vec.begin(), vec.end()));
+    }
     hnsw->insert(ord, vec);
 }
 
@@ -106,6 +113,9 @@ std::size_t SearchLayer::hnsw_size() const {
 void SearchLayer::rebuild_hnsw() {
     auto old = hnsw_.load(std::memory_order_acquire);
     if (!old) return;
+    dirty_hnsw_.store(true, std::memory_order_relaxed);  // S14-3
+    // S14-4：图重建（物理清死节点）后旧链的插入日志语义不再成立 → rebase。
+    ckpt_rebase_needed_.store(true, std::memory_order_relaxed);
     // S13-P8：结构化拷贝替代从零重插——O(节点+边) memcpy 级，无距离计算
     //（原 100k 节点分钟级、阻塞 merge）。层数/邻接保持原图结构，死邻过滤 +
     // 一跳路径收缩补边；int8-only 直拷量化副本（免反量化→再量化往返）。
@@ -415,6 +425,9 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
                            std::string_view text,
                            std::uint32_t file_id, std::uint64_t offset,
                            std::uint32_t total_sz, std::uint32_t tstamp) {
+    // S14-3：单文本路径恒触 docmap；默认域倒排仅在真有词项时标脏
+    // （向量-only 文档 text 为空，不碰 bm25——add_doc 有空词集门）。
+    dirty_docmap_.store(true, std::memory_order_relaxed);
     auto term_data = analyzer_->analyze_with_positions(text);
 
     std::uint32_t doc_len = 0;
@@ -432,6 +445,7 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
                        doc_len});
 
     if (!term_data.empty()) {
+        dirty_bm25_default_.store(true, std::memory_order_relaxed);  // S14-3
         field_index(kDefaultField).add_doc(ord, term_data);
     }
     doc_texts_.put(ord, std::string(text));
@@ -519,6 +533,9 @@ void SearchLayer::reduce_apply(const ReduceJob& job,
     // S6-P2: 空 job 守卫（map_fn_ 抛异常时 reducer 收到空 ReduceEntry）。
     // key+fields 都空 = map_analyze 未产出，跳过 apply；reducer 仍推进 ord。
     if (job.key.empty() && job.fields.empty()) return;
+    // S14-3：docmap 恒触（put_doc 在下方无条件执行）；bm25 按实际写到的
+    // 域精确标脏——recover 路径也走本函数（单默认域），不误脏 fields 段。
+    dirty_docmap_.store(true, std::memory_order_relaxed);
     auto& field_lens = ord_field_lens_[job.ord];
     field_lens.reserve(job.fields.size() + 1);
     for (const auto& f : job.fields) {
@@ -528,12 +545,18 @@ void SearchLayer::reduce_apply(const ReduceJob& job,
 
     for (const auto& f : job.fields) {
         if (!f.terms.empty()) {
+            if (f.field_name == kDefaultField) {
+                dirty_bm25_default_.store(true, std::memory_order_relaxed);
+            } else {
+                dirty_bm25_fields_.store(true, std::memory_order_relaxed);
+            }
             field_index(f.field_name).add_doc(job.ord, f.terms);
         }
     }
 
     // 若已有字段直接写默认字段，则不重复合并（避免双写）。
     if (!job.wrote_default && !job.ca_data.empty()) {
+        dirty_bm25_default_.store(true, std::memory_order_relaxed);  // S14-3
         field_index(kDefaultField).add_doc(job.ord, job.ca_data);
         field_lens.emplace_back(intern_field_name(kDefaultField), job.ca_len);
     }
@@ -590,6 +613,11 @@ void SearchLayer::on_write_fields(
 std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::uint64_t tomb_ord) {
     auto slot = index_.get(key);
     if (!slot) return std::nullopt;
+    // S14-3：删除触 docmap（live 翻转）+ 全部 bm25 段（remove_doc 调整各域
+    // N/sum_doc_len 全局统计，序列化字节随之变化）。
+    dirty_docmap_.store(true, std::memory_order_relaxed);
+    dirty_bm25_default_.store(true, std::memory_order_relaxed);
+    dirty_bm25_fields_.store(true, std::memory_order_relaxed);
 
     // S9.2：取被删文档词集做选择性失效。原文 LRU 命中则精确 analyze；
     // miss（冷文档被挤出）则降级为整缓存失效（安全但粗粒度）。
@@ -623,6 +651,11 @@ std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::u
         }
     }
     index_.remove(key, tomb_ord);
+    // S14-4：窗口删除日志（docmap delta 的 remove 半边；bm25 统计效果由
+    // delta 头的绝对 N/sdl 覆盖）。
+    if (tomb_ord >= ckpt_chain_wm_) {
+        delta_removals_.emplace_back(std::string(key), tomb_ord);
+    }
     doc_texts_.erase(slot->ord);
     if (have_terms) {
         cache_.invalidate_terms(changed_terms);  // 空缓存时为 no-op
@@ -639,6 +672,7 @@ void SearchLayer::on_relocate(std::string_view key, std::uint64_t ord,
     auto slot = index_.get(key);
     if (!slot) return;
 
+    dirty_docmap_.store(true, std::memory_order_relaxed);  // S14-3：loc 列刷新
     index_.put_doc(key, ord,
                    index::DocSlot{
                        index::DocLoc{new_file_id, new_offset, new_total_sz},
@@ -930,7 +964,19 @@ void SearchLayer::recover_doc_batch(std::vector<RecoverDoc>& batch) {
     tbb::parallel_for(std::size_t{0}, n, [&](std::size_t i) {
         const auto& d = batch[i];
         std::vector<std::pair<std::string_view, std::string_view>> fields;
-        fields.emplace_back(kDefaultField, d.text);
+        if (d.fields.empty()) {
+            fields.emplace_back(kDefaultField, d.text);
+        } else {
+            // S14-6：命名字段文档镜像活写路径（map 只喂 fields，text 不参与
+            // 索引——与 put_doc 的 task.fields 装配一致）；per-field 词表与
+            // catch-all 合并进默认域都在 map_analyze 内自然复原。此前这里
+            // 硬编码单默认字段 → fold 重放的文档 bm25.fields 与 catch-all
+            // 全部丢失（TASK.md S14-6）。
+            fields.reserve(d.fields.size());
+            for (const auto& [fname, fval] : d.fields) {
+                fields.emplace_back(fname, fval);
+            }
+        }
         jobs[i] = map_analyze(d.key, d.ord, fields,
                               d.file_id, d.offset, d.total_sz, d.tstamp);
     });
@@ -945,6 +991,12 @@ void SearchLayer::recover_doc_batch(std::vector<RecoverDoc>& batch) {
 }
 
 void SearchLayer::recover_tomb(std::string_view key, std::uint64_t ord) {
+    dirty_docmap_.store(true, std::memory_order_relaxed);  // S14-3
+    // S14-4：只记链覆盖之外的墓碑（重叠区旧墓碑的目标可能已被链内更新的
+    // put 复活，重放进下个 delta 会误杀）。
+    if (ord >= ckpt_chain_wm_) {
+        delta_removals_.emplace_back(std::string(key), ord);
+    }
     index_.remove(key, ord);
 }
 
@@ -1052,6 +1104,7 @@ SearchLayer::deserialize_docmap(std::span<const std::uint8_t> buf) {
 }
 
 void SearchLayer::rebuild_index(DocReader doc_reader) {
+    ckpt_rebase_needed_.store(true, std::memory_order_relaxed);  // S14-4
     // 阶段2a：仍按默认字段重建（多字段从 DocValue 取字段在阶段4打通）。
     auto new_inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params, config_.index_positions);
     doc_texts_.clear();
@@ -1079,6 +1132,12 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
 }
 
 std::size_t SearchLayer::compact(double dead_ratio_threshold) {
+    // S14-3：压实物理重排 posting，两个 bm25 段序列化字节都会变。
+    dirty_bm25_default_.store(true, std::memory_order_relaxed);
+    dirty_bm25_fields_.store(true, std::memory_order_relaxed);
+    // S14-4：压实破坏 base+delta 可重构性（posting 物理重排）→ 下次 save
+    // 必须全量 base、链坍缩。merge 收尾恒 compact ⇒ merge 即 rebase 点。
+    ckpt_rebase_needed_.store(true, std::memory_order_relaxed);
     std::size_t total = 0;
     for (auto& [field, inv] : fields_) {
         total += inv->compact(index_, dead_ratio_threshold);
@@ -1210,10 +1269,305 @@ std::uint64_t get_u64_byte(const std::byte* p) {
 }
 }  // namespace
 
+// S14-4：delta 保存——只序列化窗口 [ckpt_chain_wm_, watermark) 的增量，
+// 写独立文件 search.ckpt.d<seq>（BCSC 容器，tmp+rename），base 不动。
+// 与 base 同在 reducer / 静止点上下文执行。失败返回 false（caller 落回
+// 全量 base）；成功推进链状态并清窗口日志/脏位。
+bool SearchLayer::save_delta_ckpt(const std::string& base_path,
+                                  std::uint64_t watermark) {
+    namespace sc = bitcask::search;
+    const std::uint64_t from = ckpt_chain_wm_;
+
+    std::vector<sc::CkptSection> secs;
+    std::vector<std::vector<std::byte>> bufs;  // payload 缓冲活到 write()
+    auto add_sec = [&](sc::CkptSectionType t, std::vector<std::byte> b) {
+        bufs.push_back(std::move(b));
+        secs.push_back(sc::CkptSection{
+            static_cast<std::uint16_t>(t), 0,
+            std::span<const std::byte>(bufs.back().data(),
+                                        bufs.back().size())});
+    };
+
+    // 段 kDeltaInfo：链校验三元组。
+    {
+        std::vector<std::byte> b;
+        put_u64_byte(b, ckpt_base_gen_);
+        put_u64_byte(b, from);
+        put_u32_byte(b, ckpt_next_seq_);
+        add_sec(sc::CkptSectionType::kDeltaInfo, std::move(b));
+    }
+
+    // bm25 delta（default / fields）——脏才有内容；干净直接省段。
+    {
+        std::shared_lock lk(fields_mu_);
+        if (dirty_bm25_default_.load(std::memory_order_relaxed)) {
+            if (auto dit = fields_.find(kDefaultField); dit != fields_.end()) {
+                std::vector<std::byte> b;
+                dit->second->serialize_delta(b, from);
+                add_sec(sc::CkptSectionType::kBm25DefaultDelta, std::move(b));
+            }
+        }
+        if (dirty_bm25_fields_.load(std::memory_order_relaxed)) {
+            std::uint32_t other = 0;
+            for (auto& [field, inv] : fields_) {
+                if (field != kDefaultField) ++other;
+            }
+            if (other > 0) {
+                std::vector<std::byte> fb;
+                put_u32_byte(fb, other);
+                for (auto& [field, inv] : fields_) {
+                    if (field == kDefaultField) continue;
+                    put_u16_byte(fb, static_cast<std::uint16_t>(field.size()));
+                    fb.insert(fb.end(),
+                        reinterpret_cast<const std::byte*>(field.data()),
+                        reinterpret_cast<const std::byte*>(field.data()) +
+                            field.size());
+                    const std::uint64_t pos = fb.size();
+                    put_u64_byte(fb, 0);  // len 占位
+                    inv->serialize_delta(fb, from);
+                    const std::uint64_t len = fb.size() - pos - 8;
+                    std::memcpy(fb.data() + pos, &len, 8);
+                }
+                add_sec(sc::CkptSectionType::kBm25FieldsDelta, std::move(fb));
+            }
+        }
+    }
+
+    // docmap delta：窗口 live 行 + 删除日志。恒写（可能为空，几十字节）。
+    {
+        std::vector<std::byte> b;
+        const std::uint64_t cnt_pos = b.size();
+        put_u64_byte(b, 0);  // 行数占位
+        std::uint64_t rows = 0;
+        bool ok = true;
+        index_.for_each_live_in(
+            from, watermark,
+            [&](std::uint64_t ord, const std::string& ext,
+                const index::DocSlot& slot) {
+                if (ext.size() > 0xFFFF) { ok = false; return; }
+                put_u64_byte(b, ord);
+                put_u16_byte(b, static_cast<std::uint16_t>(ext.size()));
+                b.insert(b.end(),
+                    reinterpret_cast<const std::byte*>(ext.data()),
+                    reinterpret_cast<const std::byte*>(ext.data()) +
+                        ext.size());
+                put_u32_byte(b, slot.loc.file_id);
+                put_u64_byte(b, slot.loc.offset);
+                put_u32_byte(b, slot.loc.total_sz);
+                put_u32_byte(b, slot.tstamp);
+                put_u32_byte(b, slot.doc_len);
+                ++rows;
+            });
+        if (!ok) return false;  // 超长 key（理论不可达，写端已限）
+        std::memcpy(b.data() + cnt_pos, &rows, 8);
+        put_u64_byte(b, static_cast<std::uint64_t>(delta_removals_.size()));
+        for (const auto& [key, tomb] : delta_removals_) {
+            if (key.size() > 0xFFFF) return false;
+            put_u64_byte(b, tomb);
+            put_u16_byte(b, static_cast<std::uint16_t>(key.size()));
+            b.insert(b.end(),
+                reinterpret_cast<const std::byte*>(key.data()),
+                reinterpret_cast<const std::byte*>(key.data()) + key.size());
+        }
+        add_sec(sc::CkptSectionType::kDocmapDelta, std::move(b));
+    }
+
+    // hnsw delta：窗口插入日志（重放 insert，见 delta_vecs_ 注释）。
+    if (!delta_vecs_.empty()) {
+        std::vector<std::byte> b;
+        put_u64_byte(b, static_cast<std::uint64_t>(delta_vecs_.size()));
+        put_u16_byte(b, config_.vector_dim);
+        for (const auto& [ord, vec] : delta_vecs_) {
+            put_u64_byte(b, ord);
+            b.insert(b.end(),
+                reinterpret_cast<const std::byte*>(vec.data()),
+                reinterpret_cast<const std::byte*>(vec.data()) +
+                    vec.size() * sizeof(float));
+        }
+        add_sec(sc::CkptSectionType::kHnswDelta, std::move(b));
+    }
+
+    const std::string dpath =
+        base_path + ".d" + std::to_string(ckpt_next_seq_);
+    if (!sc::SearchCheckpoint::write(dpath, watermark, secs)) return false;
+
+    ckpt_chain_wm_ = watermark;
+    ++ckpt_next_seq_;
+    delta_removals_.clear();
+    delta_vecs_.clear();
+    // 脏位语义 =「自上次 save（任一种）以来」——delta 落成同样清零。
+    dirty_docmap_.store(false, std::memory_order_relaxed);
+    dirty_bm25_default_.store(false, std::memory_order_relaxed);
+    dirty_bm25_fields_.store(false, std::memory_order_relaxed);
+    dirty_hnsw_.store(false, std::memory_order_relaxed);
+    return true;
+}
+
+// S14-4：应用单个 delta 文件的段集。先整体 CRC 预检（原子性：任何坏段 →
+// 整个 delta 拒绝，不部分应用）；应用中途解析失败返回 false，caller 视链
+// 断裂、退全量 fold（自门保证多放安全）。
+bool SearchLayer::apply_delta_file(
+    const std::vector<bitcask::search::LoadedSection>& sections) {
+    namespace sc = bitcask::search;
+    for (const auto& ls : sections) {
+        if (!ls.crc_ok) return false;
+    }
+    for (const auto& ls : sections) {
+        switch (static_cast<sc::CkptSectionType>(ls.type)) {
+        case sc::CkptSectionType::kBm25DefaultDelta: {
+            std::unique_lock lk(fields_mu_);
+            auto it = fields_.find(std::string(kDefaultField));
+            if (it == fields_.end()) {
+                auto inv = std::make_unique<bm25::InvertedIndex>(
+                    config_.bm25_params, config_.index_positions);
+                it = fields_.emplace(kDefaultField, std::move(inv)).first;
+            }
+            if (!it->second->apply_delta(std::span<const std::byte>(
+                    ls.payload.data(), ls.payload.size()))) {
+                return false;
+            }
+            break;
+        }
+        case sc::CkptSectionType::kBm25FieldsDelta: {
+            const auto* p = ls.payload.data();
+            const auto* end = p + ls.payload.size();
+            if (end - p < 4) return false;
+            std::uint32_t cnt = get_u32_byte(p); p += 4;
+            std::unique_lock lk(fields_mu_);
+            for (std::uint32_t i = 0; i < cnt; ++i) {
+                if (end - p < 2) return false;
+                std::uint16_t nlen = get_u16_byte(p); p += 2;
+                if (end - p < nlen + 8) return false;
+                std::string name(reinterpret_cast<const char*>(p), nlen);
+                p += nlen;
+                std::uint64_t ilen = get_u64_byte(p); p += 8;
+                if (end - p < static_cast<std::ptrdiff_t>(ilen)) return false;
+                auto it = fields_.find(name);
+                if (it == fields_.end()) {
+                    auto inv = std::make_unique<bm25::InvertedIndex>(
+                        config_.bm25_params, config_.index_positions);
+                    it = fields_.emplace(std::move(name),
+                                         std::move(inv)).first;
+                }
+                if (!it->second->apply_delta(
+                        std::span<const std::byte>(p, ilen))) {
+                    return false;
+                }
+                p += ilen;
+            }
+            break;
+        }
+        case sc::CkptSectionType::kDocmapDelta: {
+            const auto* p = ls.payload.data();
+            const auto* end = p + ls.payload.size();
+            struct Row {
+                std::uint64_t ord;
+                std::string ext;
+                index::DocSlot slot;
+            };
+            struct Rem {
+                std::uint64_t tomb;
+                std::string key;
+            };
+            std::vector<Row> rows;
+            std::vector<Rem> rems;
+            if (end - p < 8) return false;
+            std::uint64_t rn = get_u64_byte(p); p += 8;
+            rows.reserve(rn);
+            for (std::uint64_t i = 0; i < rn; ++i) {
+                if (end - p < 10) return false;
+                Row r;
+                r.ord = get_u64_byte(p); p += 8;
+                std::uint16_t klen = get_u16_byte(p); p += 2;
+                if (end - p < klen + 24) return false;
+                r.ext.assign(reinterpret_cast<const char*>(p), klen);
+                p += klen;
+                r.slot.loc.file_id = get_u32_byte(p); p += 4;
+                r.slot.loc.offset = get_u64_byte(p); p += 8;
+                r.slot.loc.total_sz = get_u32_byte(p); p += 4;
+                r.slot.tstamp = get_u32_byte(p); p += 4;
+                r.slot.doc_len = get_u32_byte(p); p += 4;
+                rows.push_back(std::move(r));
+            }
+            if (end - p < 8) return false;
+            std::uint64_t mn = get_u64_byte(p); p += 8;
+            rems.reserve(mn);
+            for (std::uint64_t i = 0; i < mn; ++i) {
+                if (end - p < 10) return false;
+                Rem m;
+                m.tomb = get_u64_byte(p); p += 8;
+                std::uint16_t klen = get_u16_byte(p); p += 2;
+                if (end - p < klen) return false;
+                m.key.assign(reinterpret_cast<const char*>(p), klen);
+                p += klen;
+                rems.push_back(std::move(m));
+            }
+            if (p != end) return false;
+            // 按 ord 交错重放（行与删除都按 ord 升序产出）——「删后重写」
+            // 场景下删除必须先于同 key 的新行应用，否则误杀。
+            std::size_t ri = 0, mi = 0;
+            while (ri < rows.size() || mi < rems.size()) {
+                const bool take_row =
+                    mi >= rems.size() ||
+                    (ri < rows.size() && rows[ri].ord < rems[mi].tomb);
+                if (take_row) {
+                    index_.put_doc(rows[ri].ext, rows[ri].ord, rows[ri].slot);
+                    ++ri;
+                } else {
+                    index_.remove(rems[mi].key, rems[mi].tomb);
+                    ++mi;
+                }
+            }
+            break;
+        }
+        case sc::CkptSectionType::kHnswDelta: {
+            const auto* p = ls.payload.data();
+            const auto* end = p + ls.payload.size();
+            if (end - p < 10) return false;
+            std::uint64_t cnt = get_u64_byte(p); p += 8;
+            std::uint16_t dim = get_u16_byte(p); p += 2;
+            if (dim != config_.vector_dim) return false;
+            auto hnsw = hnsw_.load(std::memory_order_acquire);
+            const std::size_t vb =
+                static_cast<std::size_t>(dim) * sizeof(float);
+            std::vector<float> v(dim);
+            for (std::uint64_t i = 0; i < cnt; ++i) {
+                if (end - p < static_cast<std::ptrdiff_t>(8 + vb)) {
+                    return false;
+                }
+                const std::uint64_t ord = get_u64_byte(p); p += 8;
+                std::memcpy(v.data(), p, vb);
+                p += vb;
+                // 直插（不走 on_vector：不入窗口日志、不标脏——链内容
+                // 本就已持久化）。insert 自带 ord 水位幂等门。
+                if (hnsw) {
+                    hnsw->insert(ord,
+                                 std::span<const float>(v.data(), dim));
+                }
+            }
+            if (p != end) return false;
+            break;
+        }
+        case sc::CkptSectionType::kDeltaInfo:
+        default:
+            break;  // info 由 caller 校验；未知段忽略（前向兼容）。
+        }
+    }
+    return true;
+}
+
 bool SearchLayer::save_search_ckpt(std::string_view path,
                                    std::uint64_t watermark) {
     namespace sc = bitcask::search;
     const std::string fp(path);
+
+    // S14-4：增量路径——无 rebase 事件（compact/rebuild）且链状态有效时只
+    // 写 delta 文件（search.ckpt.d<seq>），base 不重写：写 I/O 从 ∝ 索引
+    // 总量降到 ∝ 窗口增量。失败落回全量 base（重建链，安全兜底）。
+    if (!ckpt_rebase_needed_.load(std::memory_order_relaxed) &&
+        watermark >= ckpt_chain_wm_) {
+        if (save_delta_ckpt(fp, watermark)) return true;
+    }
 
     std::vector<sc::CkptSection> secs;
     // 段 payload 缓冲区须活到 write() 完成——span 是非 owning 视图。
@@ -1237,8 +1591,56 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
                 u8_bufs.back().size())});
     };
 
-    // 段 1: docmap (type 1)。
-    {
+    // S14-3（路线 A §5）：段级 dirty-bit——干净段从现有 search.ckpt 原字节
+    // 前移（免重序列化：无向量写周期 hnsw 段零 CPU，纯向量负载 bm25 段零
+    // CPU）。读取发生在下方 rename→.prev 之前（同一 inode）。脏位只捕获
+    // 一次：save 全程在 reducer / 静止点内执行，无并发写者推进的窗口。
+    // 干净但旧文件缺段/坏段（首存、结构损坏）→ 正常回退重序列化。
+    // S14-4：链激活期间 base 文件字节落后于内存（差 delta 内容）——一律
+    // 视作脏，禁止 S14-3 原字节前移（否则新 base 把链内容丢了）。
+    const bool chain_active = ckpt_chain_wm_ > ckpt_base_gen_;
+    const bool d_doc =
+        chain_active || dirty_docmap_.load(std::memory_order_relaxed);
+    const bool d_bd =
+        chain_active || dirty_bm25_default_.load(std::memory_order_relaxed);
+    const bool d_bf =
+        chain_active || dirty_bm25_fields_.load(std::memory_order_relaxed);
+    const bool d_h =
+        chain_active || dirty_hnsw_.load(std::memory_order_relaxed);
+    std::vector<sc::LoadedSection> carried;  // 须活到 write() 完成
+    if (!(d_doc && d_bd && d_bf && d_h)) {
+        auto sel = sc::SearchCheckpoint::read_selected(
+            fp, [&](std::uint16_t t) {
+                switch (static_cast<sc::CkptSectionType>(t)) {
+                case sc::CkptSectionType::kDocmap:      return !d_doc;
+                case sc::CkptSectionType::kBm25Default: return !d_bd;
+                case sc::CkptSectionType::kBm25Fields:  return !d_bf;
+                case sc::CkptSectionType::kHnsw:        return !d_h;
+                default:                                return false;
+                }
+            });
+        if (sel) carried = std::move(*sel);
+    }
+    auto carried_sec =
+        [&](sc::CkptSectionType t) -> const sc::LoadedSection* {
+        for (const auto& ls : carried) {
+            if (ls.type == static_cast<std::uint16_t>(t)) return &ls;
+        }
+        return nullptr;
+    };
+    auto add_carried = [&](const sc::LoadedSection& ls) {
+        secs.push_back(sc::CkptSection{
+            ls.type, ls.flags,
+            std::span<const std::byte>(ls.payload.data(),
+                                        ls.payload.size())});
+    };
+
+    // 段 1: docmap (type 1)。S14-3：干净则前移（其内嵌的旧 covers_next_ord
+    // 较小——自门方向安全，fold 多放的重叠区被幂等丢弃）。
+    if (const auto* ls =
+            d_doc ? nullptr : carried_sec(sc::CkptSectionType::kDocmap)) {
+        add_carried(*ls);
+    } else {
         std::vector<std::uint8_t> buf;
         if (serialize_docmap(buf, watermark)) {
             add_u8_sec(static_cast<std::uint16_t>(sc::CkptSectionType::kDocmap),
@@ -1246,21 +1648,33 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
         }
     }
 
-    // 段 2 + 3: bm25.default + bm25.fields。
+    // 段 2 + 3: bm25.default + bm25.fields。S14-3：各自独立前移。
     {
         std::shared_lock lk(fields_mu_);
-        auto dit = fields_.find(kDefaultField);
-        if (dit != fields_.end()) {
+        if (const auto* ls = d_bd
+                ? nullptr
+                : carried_sec(sc::CkptSectionType::kBm25Default)) {
+            add_carried(*ls);
+        } else if (auto dit = fields_.find(kDefaultField);
+                   dit != fields_.end()) {
             std::vector<std::byte> buf;
             dit->second->serialize(buf);
             add_byte_sec(
                 static_cast<std::uint16_t>(sc::CkptSectionType::kBm25Default),
                 std::move(buf));
         }
+        const auto* carried_fields = d_bf
+            ? nullptr
+            : carried_sec(sc::CkptSectionType::kBm25Fields);
+        if (carried_fields) {
+            add_carried(*carried_fields);
+        }
         std::uint32_t other_count = 0;
-        for (auto& [field, inv] : fields_) {
-            if (field == kDefaultField) continue;
-            ++other_count;
+        if (!carried_fields) {
+            for (auto& [field, inv] : fields_) {
+                if (field == kDefaultField) continue;
+                ++other_count;
+            }
         }
         if (other_count > 0) {
             std::vector<std::byte> fbuf;
@@ -1285,8 +1699,14 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
     }
 
     // 段 4: hnsw (type 4)。V7:BCVS v2 双文件——vecs_ 先落 search.vec
-    // (save_vec_payload, atomic tmp+rename),再 serialize header 入 ckpt 段。
-    if (config_.vector_dim > 0) {
+    // (save_vec_payload, S14-2 起常规为追加),再 serialize header 入 ckpt 段。
+    // S14-3：干净 ⇒ 无向量写 ⇒ .vec 也未动——BVH2 段前移且跳过
+    // save_vec_payload（本周期图序列化零成本）。
+    if (const auto* ls = (config_.vector_dim == 0 || d_h)
+            ? nullptr
+            : carried_sec(sc::CkptSectionType::kHnsw)) {
+        add_carried(*ls);
+    } else if (config_.vector_dim > 0) {
         auto hnsw = hnsw_.load(std::memory_order_acquire);
         if (hnsw) {
             const std::string vec_path =
@@ -1312,6 +1732,34 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
     }
 
     if (!sc::SearchCheckpoint::write(fp, watermark, secs)) return false;
+
+    // S14-3：文件此刻反映内存态（fresh 序列化或 carried 原字节）→ 清脏位。
+    // save 在 reducer / 静止点内执行，序列化之后无并发写者置位的窗口。
+    dirty_docmap_.store(false, std::memory_order_relaxed);
+    dirty_bm25_default_.store(false, std::memory_order_relaxed);
+    dirty_bm25_fields_.store(false, std::memory_order_relaxed);
+    dirty_hnsw_.store(false, std::memory_order_relaxed);
+
+    // S14-4：base 落成 → 链坍缩。清 delta 文件（连续序号 + 8 个空洞的
+    // orphan 扫尾，兜过去 unlink 半途崩溃留下的孤儿），重置链状态与窗口
+    // 日志。
+    {
+        std::uint32_t misses = 0;
+        for (std::uint32_t i = 1; misses < 8; ++i) {
+            std::error_code ec;
+            if (std::filesystem::remove(fp + ".d" + std::to_string(i), ec)) {
+                misses = 0;
+            } else {
+                ++misses;
+            }
+        }
+    }
+    ckpt_base_gen_ = watermark;
+    ckpt_chain_wm_ = watermark;
+    ckpt_next_seq_ = 1;
+    ckpt_rebase_needed_.store(false, std::memory_order_relaxed);
+    delta_removals_.clear();
+    delta_vecs_.clear();
 
     // 保存成功后截断 WAL（与旧 save_snapshot 行为一致）。
     {
@@ -1353,6 +1801,10 @@ SearchLayer::load_search_ckpt(std::string_view path) {
     bool bm25_loaded = false;
     bool docmap_loaded = false;
     bool hnsw_loaded = false;
+    // S14-3: per-type 载入成功标记（清脏位用；bm25_loaded 是「至少一个域」
+    // 的聚合语义，粒度不够）。
+    bool default_sec_ok = false;
+    bool fields_sec_ok = false;
 
     for (auto& ls : lc->sections) {
         auto st = static_cast<sc::CkptSectionType>(ls.type);
@@ -1373,6 +1825,7 @@ SearchLayer::load_search_ckpt(std::string_view path) {
                     fields_.emplace(kDefaultField,
                                      std::move(inv));
                     bm25_loaded = true;
+                    default_sec_ok = true;  // S14-3
                 } else {
                     result.all_segments_ok = false;
                 }
@@ -1380,6 +1833,7 @@ SearchLayer::load_search_ckpt(std::string_view path) {
                 bm25_loaded = it->second->deserialize(
                     std::span<const std::byte>(ls.payload.data(),
                                                 ls.payload.size()));
+                default_sec_ok = bm25_loaded;  // S14-3
                 if (!bm25_loaded) result.all_segments_ok = false;
             }
             break;
@@ -1391,15 +1845,26 @@ SearchLayer::load_search_ckpt(std::string_view path) {
             if (end - p < 4) { result.all_segments_ok = false; break; }
             std::uint32_t cnt = get_u32_byte(p); p += 4;
             std::unique_lock lk(fields_mu_);
+            fields_sec_ok = true;  // S14-3：任一字段失败即回 false
             for (std::uint32_t i = 0; i < cnt; ++i) {
-                if (end - p < 2) { result.all_segments_ok = false; break; }
+                if (end - p < 2) {
+                    result.all_segments_ok = false;
+                    fields_sec_ok = false;
+                    break;
+                }
                 std::uint16_t nlen = get_u16_byte(p); p += 2;
-                if (end - p < nlen + 8) { result.all_segments_ok = false; break; }
+                if (end - p < nlen + 8) {
+                    result.all_segments_ok = false;
+                    fields_sec_ok = false;
+                    break;
+                }
                 std::string name(reinterpret_cast<const char*>(p), nlen);
                 p += nlen;
                 std::uint64_t ilen = get_u64_byte(p); p += 8;
                 if (end - p < static_cast<std::ptrdiff_t>(ilen)) {
-                    result.all_segments_ok = false; break;
+                    result.all_segments_ok = false;
+                    fields_sec_ok = false;  // S14-3
+                    break;
                 }
                 auto inv = std::make_unique<bm25::InvertedIndex>(
                     config_.bm25_params, config_.index_positions);
@@ -1408,6 +1873,7 @@ SearchLayer::load_search_ckpt(std::string_view path) {
                     bm25_loaded = true;
                 } else {
                     result.all_segments_ok = false;
+                    fields_sec_ok = false;  // S14-3
                 }
                 p += ilen;
             }
@@ -1458,7 +1924,76 @@ SearchLayer::load_search_ckpt(std::string_view path) {
     // 有向量配置但 hnsw 未载入 → 需要重建。
     if (config_.vector_dim > 0 && !hnsw_loaded) result.all_segments_ok = false;
 
-    (void)from_prev;  // 仅调试用
+    // S14-4：.prev 回退显式化——段级健康与「可走字节水位快路径」分离：
+    // 退到旧代时磁盘 keydir 快照可能与坏掉的新代成对（水位超前于 prev
+    // 覆盖），caller 必须放弃快路径退全量 fold（自门跳过已载入区）。
+    result.from_prev = from_prev;
+
+    // S14-4：delta 链重放。base 健康且非 .prev 回退才吃链（回退时
+    // base_gen 天然不匹配，此处显式跳过是双保险）。链在「文件缺失」处
+    // 正常终止；「文件存在但无效」（结构坏/info 链断/apply 失败）→ 保守
+    // 判整体不健康、退全量 fold——与 base 坏段同级的健康语义，快路径的
+    // 字节水位可能超前于链覆盖，必须放弃。
+    std::uint64_t chain_coverage = result.watermark;
+    const std::uint64_t chain_base_gen = result.watermark;
+    std::uint32_t chain_next_seq = 1;
+    if (result.all_segments_ok && !from_prev) {
+        for (;; ++chain_next_seq) {
+            const std::string dpath =
+                fp + ".d" + std::to_string(chain_next_seq);
+            std::error_code ec;
+            if (!std::filesystem::exists(dpath, ec)) break;  // 正常链尾
+            auto dc = sc::SearchCheckpoint::read(dpath);
+            bool applied = false;
+            if (dc) {
+                const sc::LoadedSection* info = nullptr;
+                for (const auto& dls : dc->sections) {
+                    if (dls.type == static_cast<std::uint16_t>(
+                                        sc::CkptSectionType::kDeltaInfo)) {
+                        info = &dls;
+                        break;
+                    }
+                }
+                if (info && info->crc_ok && info->payload.size() == 20) {
+                    const auto* q = info->payload.data();
+                    const std::uint64_t gen = get_u64_byte(q); q += 8;
+                    const std::uint64_t prev = get_u64_byte(q); q += 8;
+                    const std::uint32_t seq = get_u32_byte(q);
+                    if (gen == chain_base_gen && prev == chain_coverage &&
+                        seq == chain_next_seq) {
+                        applied = apply_delta_file(dc->sections);
+                    }
+                }
+            }
+            if (!applied) {
+                result.all_segments_ok = false;
+                break;
+            }
+            chain_coverage = dc->watermark;
+        }
+    }
+    result.watermark = chain_coverage;
+    // 链状态初始化：后续 save 由此续链；不健康 ⇒ rebase（下次全量 base）。
+    ckpt_base_gen_ = chain_base_gen;
+    ckpt_chain_wm_ = chain_coverage;
+    ckpt_next_seq_ = chain_next_seq;
+    ckpt_rebase_needed_.store(!result.all_segments_ok,
+                              std::memory_order_relaxed);
+    delta_removals_.clear();
+    delta_vecs_.clear();
+
+    // S14-3：载入成功的段清脏位——此刻该段内存态 == 文件字节，下次 save
+    // 可原字节前移。未载入/坏段保持脏（首次 save 重序列化）；fold 尾部
+    // 重放随后把真正变过的段重新标脏。
+    if (docmap_loaded) dirty_docmap_.store(false, std::memory_order_relaxed);
+    if (default_sec_ok) {
+        dirty_bm25_default_.store(false, std::memory_order_relaxed);
+    }
+    if (fields_sec_ok) {
+        dirty_bm25_fields_.store(false, std::memory_order_relaxed);
+    }
+    if (hnsw_loaded) dirty_hnsw_.store(false, std::memory_order_relaxed);
+
     return result;
 }
 

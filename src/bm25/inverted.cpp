@@ -2396,6 +2396,173 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
     return true;
 }
 
+// ---- S14-4：ord-delta 增量序列化 ----------------------------------------
+//
+// 格式（"BIVD" v1，LE）：
+//   magic u32 | ver u32=1 | N u32 | sdl u64 | from_ord u64 | term_count u64
+//   每 term：tlen u32 | term | item_count u32
+//     每 item：ord u64 | tf u32 | dl u32
+//              | positions（u32 个数 + u32 压缩字节数 + gap+VByte 流）
+// 与 base 的列式 FOR 编码刻意不同：delta 是窗口小量（∝ 增量 tokens），
+// 逐条编码换取 apply 的直接尾部追加（无需块重排）；WAND 块由
+// note_appended 在 apply 侧增量重建。
+namespace {
+constexpr std::uint32_t kInvDeltaMagic   = 0x44564942;  // "BIVD"
+constexpr std::uint32_t kInvDeltaVersion = 1;
+}  // namespace
+
+void InvertedIndex::serialize_delta(std::vector<std::byte>& out,
+                                    std::uint64_t from_ord) const {
+    auto put = [&](const void* p, std::size_t n) {
+        const auto* b = reinterpret_cast<const std::byte*>(p);
+        out.insert(out.end(), b, b + n);
+    };
+    auto write_u32 = [&](std::uint32_t v) { put(&v, 4); };
+    auto write_u64 = [&](std::uint64_t v) { put(&v, 8); };
+    auto write_positions = [&](const std::vector<std::uint32_t>& positions) {
+        write_u32(static_cast<std::uint32_t>(positions.size()));
+        std::vector<std::uint64_t> tmp(positions.begin(), positions.end());
+        auto comp = codec::gap_encode(tmp);
+        write_u32(static_cast<std::uint32_t>(comp.size()));
+        if (!comp.empty()) put(comp.data(), comp.size());
+    };
+
+    write_u32(kInvDeltaMagic);
+    write_u32(kInvDeltaVersion);
+    write_u32(static_cast<std::uint32_t>(
+        live_doc_count_.load(std::memory_order_relaxed)));
+    write_u64(sum_doc_len_.load(std::memory_order_relaxed));
+    write_u64(from_ord);
+    // term_count 占位，遍历后回填。
+    const std::size_t cnt_pos = out.size();
+    write_u64(0);
+    std::uint64_t term_cnt = 0;
+
+    for (auto& shard : shards_) {
+        // 并发安全遍历（与 serialize 相同，不变量见 collect_term_keys）。
+        auto keys = collect_term_keys(shard.inverted,
+                                      [](const std::string&) { return true; });
+        for (const auto& key : keys) {
+            PostingMap::const_accessor acc;
+            if (!shard.inverted.find(acc, key)) continue;
+            std::shared_ptr<PostingList> plsp = acc->second;
+            const PostingList& pl = *plsp;
+            if (pl.items.empty() || pl.items.back().ord < from_ord) continue;
+            // 后缀起点：第一个 ord ≥ from_ord（items 按 ord 升序）。
+            auto it = std::lower_bound(
+                pl.items.begin(), pl.items.end(), from_ord,
+                [](const Posting& a, std::uint64_t v) { return a.ord < v; });
+            const auto start =
+                static_cast<std::size_t>(it - pl.items.begin());
+            const auto n = pl.items.size() - start;
+            if (n == 0) continue;
+            ++term_cnt;
+            write_u32(static_cast<std::uint32_t>(key.size()));
+            put(key.data(), key.size());
+            write_u32(static_cast<std::uint32_t>(n));
+            for (std::size_t i = start; i < pl.items.size(); ++i) {
+                const auto& item = pl.items[i];
+                write_u64(item.ord);
+                write_u32(item.tf);
+                write_u32(item.dl);
+                write_positions(item.positions);
+            }
+        }
+    }
+    std::memcpy(out.data() + cnt_pos, &term_cnt, 8);
+}
+
+bool InvertedIndex::apply_delta(std::span<const std::byte> bytes) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(bytes.data());
+    const auto* end = p + bytes.size();
+    auto need = [&](std::size_t n) {
+        return static_cast<std::size_t>(end - p) >= n;
+    };
+    auto rd_u32 = [&](std::uint32_t& v) {
+        if (!need(4)) return false;
+        std::memcpy(&v, p, 4);
+        p += 4;
+        return true;
+    };
+    auto rd_u64 = [&](std::uint64_t& v) {
+        if (!need(8)) return false;
+        std::memcpy(&v, p, 8);
+        p += 8;
+        return true;
+    };
+
+    std::uint32_t magic = 0, ver = 0, n_docs = 0;
+    std::uint64_t sdl = 0, from_ord = 0, term_cnt = 0;
+    if (!rd_u32(magic) || magic != kInvDeltaMagic) return false;
+    if (!rd_u32(ver) || ver != kInvDeltaVersion) return false;
+    if (!rd_u32(n_docs) || !rd_u64(sdl) || !rd_u64(from_ord) ||
+        !rd_u64(term_cnt)) {
+        return false;
+    }
+
+    std::uint64_t max_ord_seen = 0;
+    bool any_item = false;
+    for (std::uint64_t t = 0; t < term_cnt; ++t) {
+        std::uint32_t tlen = 0;
+        if (!rd_u32(tlen) || !need(tlen)) return false;
+        std::string term(reinterpret_cast<const char*>(p), tlen);
+        p += tlen;
+        std::uint32_t item_cnt = 0;
+        if (!rd_u32(item_cnt)) return false;
+
+        auto& shard = shard_for(term);
+        PostingMap::accessor acc;
+        const bool is_new_term = shard.inverted.insert(acc, term);
+        PostingList& pl = mutable_pl(acc->second);
+        for (std::uint32_t i = 0; i < item_cnt; ++i) {
+            std::uint64_t ord = 0;
+            std::uint32_t tf = 0, dl = 0, posc = 0, csize = 0;
+            if (!rd_u64(ord) || !rd_u32(tf) || !rd_u32(dl) ||
+                !rd_u32(posc) || posc > kMaxPositionsPerPosting ||
+                !rd_u32(csize) || !need(csize)) {
+                return false;
+            }
+            std::vector<std::uint32_t> positions;
+            if (index_positions_ && posc > 0) {
+                std::vector<std::uint8_t> comp(p, p + csize);
+                auto vals = codec::gap_decode(comp);
+                if (vals.size() != posc) return false;
+                positions.resize(posc);
+                for (std::uint32_t k = 0; k < posc; ++k) {
+                    positions[k] = static_cast<std::uint32_t>(vals[k]);
+                }
+            }
+            p += csize;
+            // 幂等守卫：陈旧/重叠条目（ord ≤ 列尾）拒绝——维持「按 ord
+            // 升序、同 ord 不重复」不变量（陈旧 delta 误 apply 的防线）。
+            if (!pl.items.empty() && ord <= pl.items.back().ord) continue;
+            pl.items.push_back({ord, tf, dl, std::move(positions)});
+            pl.note_appended();
+            if (ord > max_ord_seen) max_ord_seen = ord;
+            any_item = true;
+        }
+        // 新 term 记账（镜像 add_doc 的 S13-F6 增量 vocab 协议）。
+        if (is_new_term) {
+            std::unique_lock vlock(shard.vocab_mtx_);
+            shard.vocab_delta_.push_back(term);
+            shard.vocab_dirty_.store(true, std::memory_order_release);
+        }
+    }
+    if (p != end) return false;
+
+    // 全局统计取绝对值（删除的统计效果由此覆盖，无需删除日志）。
+    live_doc_count_.store(n_docs, std::memory_order_relaxed);
+    sum_doc_len_.store(sdl, std::memory_order_relaxed);
+    if (any_item) {
+        const std::uint64_t wm =
+            max_indexed_ord_.load(std::memory_order_relaxed);
+        if (wm == static_cast<std::uint64_t>(-1) || max_ord_seen > wm) {
+            max_indexed_ord_.store(max_ord_seen, std::memory_order_relaxed);
+        }
+    }
+    return true;
+}
+
 void InvertedIndex::enable_wal(std::string_view path, std::size_t batch_size) {
     wal_path_ = path;
     wal_ = std::make_unique<InvertedWal>(path, batch_size);

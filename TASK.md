@@ -1724,29 +1724,126 @@ W4 ✅（parallel_scan 并行全表扫描）。
     （默认零行为变化）、`CheckpointConcurrentWithWrites` 增开小文件 roll + 自动
     ckpt（手动/自动 RunFn 与并发写在 reducer 交错，TSan 护栏）。
     clang 507/507、TSan 505/505（排除项为既知预存问题）。
-- [ ] **S14-2【P0·M】search.vec / int8 码字按 ord 追加化（最大单点收益）**
-  - 向量 per-ord 不可变、删除是掩码 → 追加语义天然成立。ckpt 只 append
-    [上次水位, 本次水位) 的向量/码字（带帧头 count+CRC+水位），~5–6GB 全量重写
-    降为 MB 级 append。load 校验到最后完整帧，torn 尾截断、缺口 fold 补
-    （与 data 文件 torn-write 同型）。merge 点 rebase 全量重写收缩（清死向量）。
-- [ ] **S14-3【P1·M】段级 dirty-bit + 旧段字节前移（路线 A §5）**
-  - 写路径维护 per-type 脏标记（bm25 默认域/字段域/hnsw/docmap）；save 时干净段
-    从旧 search.ckpt 按页脚目录原字节拷贝前移（连旧 CRC），只重序列化脏段。
-    无向量写周期 hnsw 段零成本；纯向量负载 bm25 段零成本。文本持续写入下 bm25
-    仍全量——本项是机制骨架，主力负载增量化靠 S14-4。
-- [ ] **S14-4【P1·L】bm25/docmap ord-delta 段 + merge 点 rebase**
-  - 持久化层分段（**非** Lucene 运行时段——内存仍单一索引，查询零改动）：ckpt 写
-    delta 段 = 每 term 中 ord ∈ (上次水位, 本次水位] 的 posting 尾巴 + 新 vocab 项
-    （posting items 由 reducer 单写者按 ord 追加 → 区间恰为每条 list 的后缀）。
-    load = base + 按序 apply deltas（尾部追加）。**rebase 条件**：compact/merge
-    重写 posting 破坏可重构性 → merge 收尾存全量 base（位置现成），delta 链坍缩。
-    日常 roll 点 ckpt 写入量从 GB 级降到 ∝ 增量。
+- [x] **S14-2【P0·M】search.vec 按 id 追加化（最大单点收益）** — 已完成（2026-07-03）
+  - 实现与原设计的偏差（帧链 → **前缀不变契约**，更简且白得 .prev 修复）：
+    数据区必须保持连续定长寻址（`vecs_mmap_base_ + id*dim` 查询路径不动），
+    帧头无法内嵌 → 改为「文件 = header + 连续数据区」，有效向量 = ckpt
+    （BVH2 段）声称的 [0, n) 前缀，header.count 允许 ≥ n。追加只写
+    offset ≥ 旧数据尾的字节 → torn append 恒不伤前缀；顺序 数据 pwrite →
+    fdatasync → header 原地重写（version=2、不再维护从未被 load 校验的页
+    CRC 表）→ fdatasync → ckpt 原子发布。
+  - 追加目标身份用 dev/ino 追踪（`VecFileState`，与 mmap 解耦）：load 与
+    全量重写成功后收养；身份不符/前缀缺损/IO 失败退全量重写兜底（新建/
+    rebuild 后的索引自动走全量 = merge 点 rebase，回收死向量，无需新机制）。
+  - **副产品修复**：load 的 count 等值校验放宽为 ≥（前缀契约）——旧版下
+    `.prev` 回退必然拒载 .vec（新代已重写文件）→ HNSW 全量重建；现在旧代
+    ckpt + 更长的 .vec 正常装载。
+  - **int8 码字不在本批**：qcodes 与可变邻接表逐节点交错在 BVH2 段内，
+    拆出独立追加文件只有在邻接段低频化（S14-5）后才有净收益——并入 S14-5。
+  - 测试：`HnswVecAppend.AppendRoundTripPrefixContract`（追加轮回 + inode
+    稳定 + v2 header + .prev 等价装载 + 截短拒载）、
+    `CaskDocValueTest.CheckpointVecPayloadAppends`（两次 checkpoint 间
+    inode 不变/尺寸精确增长 + 崩溃镜像重开追加区向量可检索）。
+    clang 509/509、TSan 507/507。
+- [x] **S14-3【P1·M】段级 dirty-bit + 旧段字节前移（路线 A §5）** — 已完成（2026-07-03）
+  - SearchLayer 四个 relaxed 原子脏位（docmap / bm25.default / bm25.fields /
+    hnsw，初值 true=未知即重序列化）。**标记点**（全部变异入口）：reduce_apply
+    （docmap 恒触；bm25 按实际写到的域**精确**标——recover 走单默认域不误脏
+    fields 段）、on_write（docmap 恒触；bm25 仅真有词项时——向量-only 文档
+    不碰 bm25）、on_vector/rebuild_hnsw（hnsw）、on_delete（docmap + 两个
+    bm25：remove_doc 调整各域 N/sdl 全局统计）、on_relocate/recover_tomb/
+    compact_index_chunks（docmap）、compact（两个 bm25）。
+  - **清位点**：save 成功后清全部（save 在 reducer/静止点内，无并发置位
+    窗口）；load 成功载入的段亦清（此刻内存 == 文件字节，新增 per-type
+    载入标记 default_sec_ok/fields_sec_ok）——重启后首个 ckpt 即可享受
+    carry，fold 尾部重放只重新弄脏真正变过的段。
+  - **前移机制**：`SearchCheckpoint::read_selected(path, want)`——按页脚目录
+    fseek 只读选中段（不为搬运干净段读整文件），坏段/缺段自动回退重序列化。
+    hnsw 干净时同时跳过 save_vec_payload（配合 S14-2：无向量写周期图序列化
+    + .vec 全部零成本）。carried docmap 的旧 covers_next_ord 较小——自门
+    方向安全（fold 多放重叠区幂等丢弃）。
+  - 测试：`CaskDocValueTest.CheckpointSectionCarry`——三阶段双向验证：纯文本
+    增量期 hnsw 段与上代**逐字节相同**（carried）、纯向量增量期 bm25 段逐
+    字节相同，且崩溃镜像重开后 carry 段与 fresh 段合成完整状态（文本 100/100
+    + 向量抽查 self-top1 全中）。clang 510/510、TSan 508/508。
+- [x] **S14-4【P1·L】ord-delta 链（bm25/docmap/hnsw）+ rebase** — 已完成（2026-07-03）
+  - **前置修复（成对写序崩溃窗口，pre-existing）**：所有保存点原为「先 keydir
+    快照后 search.ckpt」——两写之间崩溃留下「新快照+旧 ckpt」，fold 从超前
+    字节水位起跳、search 永久丢窗口。对调为「先 ckpt/delta、成功后才写快照」
+    （checkpoint()/自动/①/merge 四处；merge 早段快照改为捕获水位、延后落盘），
+    崩溃任何前缀只留「旧快照+新 ckpt」（fold 多放、自门幂等）。
+  - **delta 链**：`search.ckpt.d<seq>` 独立小文件（BCSC 容器复用，段型 7-11），
+    base 不重写——写 I/O 从 ∝ 索引总量降到 ∝ 窗口增量。
+    · bm25 delta（`serialize_delta/apply_delta`，"BIVD" 逐条编码）= 每 term
+      的 ord 后缀 + 绝对 N/sdl（删除只改统计不碰 posting）；apply 尾部追加 +
+      per-item ord 守卫幂等 + note_appended 增量封块 + vocab_delta_ 记账。
+    · docmap delta = 窗口 live 行（for_each_live_in 范围提取）+ 删除日志
+      (key, tomb_ord)，**按 ord 交错重放**（删后重写不误杀）；覆盖写靠
+      put_doc 同 key 杀旧；relocate 只在 merge=rebase 点，永不进 delta。
+    · hnsw delta = 插入日志 (ord, f32)（图无不可变旧段，重放 insert，
+      自带 ord 水位门）；delta 路径不碰 .vec（向量内联，.vec 追加留给 base）。
+  - **rebase**：compact/rebuild_index/rebuild_hnsw 置标志 → 下次 save 全量
+    base + 链清扫（merge 恒 compact ⇒ merge 即 rebase 点，零特殊分支）；
+    **close 强制 rebase**（干净关闭收敛单一 base，.prev 代际刷新，链不跨干净
+    重启累积——链的存续范围 = 两次 base 间的运行期窗口）。
+  - **防陈旧四层**：base_gen(=base wm) + prev_wm 链校验 + rebase unlink
+    （8 空洞 orphan 扫尾）+ apply 幂等守卫；坏 delta（存在但无效）→ 整链判
+    不健康退全量 fold（字节水位可能超前于链覆盖，必须放弃快路径）。
+  - **`.prev` 回退加固（pre-existing 洞）**：CkptLoadResult 加 `from_prev`，
+    cask 快路径门禁 `!from_prev`——回退旧代时磁盘 keydir 快照可能与坏掉的
+    新代成对（水位超前），旧行为直接吃字节水位会漏喂 [prev, 快照) 区间。
+  - 测试：`CheckpointDeltaChainDeletesAndOverwrites`（跨窗删/覆盖写/写后删/
+    删后重写交错重放 + 多 delta 链 + 崩溃镜像重开 + 重开续链 d3 + close
+    坍缩清扫）、`CheckpointDeltaChainSelectiveSections`（脏标记驱动段选择：
+    纯文本窗口无 hnsw delta、纯向量窗口无 bm25 delta、base 逐字节不动）、
+    `CheckpointVecPayloadAppends` 更新（delta 不碰 .vec，close 的 base 走
+    S14-2 追加）。clang 512/512、TSan 510/510。
+  - **已知后续**：每次 delta 保存仍全量写 kv.keydir.ckpt（O(live keys)，
+    10M 库 ~0.5–1GB）——现在它成了 per-save I/O 的大头；keydir 快照增量化
+    另立任务（S14-7 候选）。
 - [ ] **S14-5【P2·M】HNSW 邻接段低频保存 + 载入尾部 insert 追平**
   - HNSW 违反 append-only 前提（插入改写旧节点邻居表）→ 无不可变旧段。混频策略：
     邻接段每 K 次 ckpt（或仅 merge 点）保存；恢复时图水位 wm_g < 向量水位 wm →
     载旧图 + [wm_g, wm) 逐条 insert 追平（fold 尾部重放既有形态，per-section
     水位自门已支持段间不一致）。K 间隔的增量插入分钟内，替代小时级全量重建。
 
-> **建议执行顺序**：S14-1（cadence 机制，小）→ S14-2（性价比最高的一刀）→
-> S14-3（段复用骨架）→ S14-4（主力负载增量化，大）→ S14-5（图的混频收尾）。
-> 每步独立可交付；S14-1 落地后 ②③ 即形成完整的「手动 + 自动」ckpt 节奏。
+- [x] **S14-6【P0·M·BUG】fold 增量重放丢弃命名字段索引（bm25.fields）—— 崩溃恢复正确性** — 已完成（2026-07-03）
+  - **现象**：最后一次 search.ckpt 之后、crash 之前写入的多字段文档，重启 fold 重放后其
+    命名字段索引（bm25.fields）在任何地方都不存在 →「`title:foo`」类字段限定查询漏掉这些
+    文档；连默认域 catch-all 也一并丢（仅存在于字段值、不在 `doc.text` 里的词，全文检索
+    也命不中）。**不是数据丢失**：字段值仍在磁盘 DocValue 的 fields 段（可 decode），纯属
+    索引重建缺口——但会**固化**（下次 `save_search_ckpt` 把不完整索引序列化下去）。
+  - **根因**：恢复路径完全不消费 `dv->fields`。
+    - `RecoverDoc` 结构体无 fields 成员 —— `include/bitcask/search_layer.hpp:331-340`
+    - `recover_doc_batch` 硬编码 `fields = {{kDefaultField, d.text}}` —— `src/search/search_layer.cpp:932-933`
+    - fold 解出 `dv->fields` 后只拷 `dv->text`，字段段直接丢弃 —— `src/cask/cask.cpp:1012-1033`
+    - 对照活写路径 `map_analyze(task.fields)` 正常建 per-field 词表 + catch-all 合并进默认域
+      —— `src/cask/cask.cpp:568`、`src/search/search_layer.cpp:496,536`
+  - **窗口边界**：`fold_start = snap_loaded ? wm_of(file) : 0`（`cask.cpp:956`）。
+    `ord ≤ ckpt watermark` 从 search.ckpt 反序列化（含 bm25.fields 段，完好）；
+    `ord > watermark`（增量窗口）只能靠 fold → 丢。**checkpoint 不健康时更糟**：
+    `all_segments_ok=false → snap_loaded=false → fold_start=0`（`cask.cpp:1152-1155`）→
+    **全量 fold → 全库命名字段索引丢失**，不止窗口。
+  - **修法**：`RecoverDoc` 加 `fields` 成员；fold 时把 `dv->fields` 各 `FieldId` 经
+    `field_schema_.name_of(id)` 还原成名字塞入；`recover_doc_batch` 把命名字段一并喂
+    `map_analyze`（与活写路径对齐，per-field + catch-all 都自然复原）。
+  - **⚠️ 会触发「field.schema 悬空 id」**：恢复一旦调 `name_of(id)`，掉电场景下丢失的
+    field.schema 尾条映射（intern 只 fflush 未 fsync，与数据文件落盘无序）会让
+    `name_of` 返回 `nullopt`（`field_schema.hpp:155`，越界安全但需处理）→ 定策略：
+    **跳过该字段 + 计数告警**（降级，与当前「丢」同级但更收敛可观测），或 fail-fast。
+  - **落地**（2026-07-03）：`RecoverDoc` 加 owning `fields` 成员；fold 解出
+    `dv->fields` 后经 `field_schema_.name_of(id)` 还原名字（悬空 id 跳过该字段 +
+    fold 后聚合 log_warn 一次，可观测不刷屏）；`recover_doc_batch` 非空 fields 时
+    镜像活写路径（map 只喂 fields、text 不参与索引——与 put_doc 的 task.fields
+    装配一致），per-field 词表 + catch-all 在 map_analyze 内自然复原。
+    **同族追加修复**：recover 门 `(!text.empty() || has_vec)` 会把纯命名字段文档
+    （text 空、无向量）整个拒之门外——连 docmap 都不恢复、live 过滤当死文档；
+    门补 `|| dv->has_fields`。
+  - 测试：`RecoverPreservesNamedFields`——两分支崩溃镜像（无 ckpt 全量 fold /
+    ckpt 健康 + 增量窗口），`search_fields` 与 catch-all `search_text` 全命中；
+    **反向验证**：临时禁用修复该测试立即失败。clang 511/511、TSan 509/509。
+
+> **建议执行顺序**：S14-1 ✅ → S14-2 ✅（int8 码字并入 S14-5）→ S14-3 ✅ →
+> S14-6 ✅ → S14-4 ✅（含成对写序修复 + .prev 加固）→ S14-5（图的混频收尾）→
+> S14-7 候选（keydir 快照增量化——delta 时代 per-save I/O 的新大头）。每步独立可交付；S14-1 落地后 ②③ 即形成完整的「手动 + 自动」
+> ckpt 节奏。

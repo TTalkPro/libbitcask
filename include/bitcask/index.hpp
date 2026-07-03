@@ -175,6 +175,22 @@ public:
         }
     }
 
+    // S14-4：范围版——只遍历 ord ∈ [from, to) 的 live 文档（docmap delta
+    // 行提取用）。语义/锁与 for_each_live 一致。
+    template <typename Fn>
+    void for_each_live_in(std::uint64_t from, std::uint64_t to, Fn&& fn) const {
+        std::shared_lock lk(mutex_);
+        const std::uint64_t hi =
+            std::min<std::uint64_t>(to, live_.size());
+        for (std::uint64_t ord = from; ord < hi; ++ord) {
+            if (live_[ord]) {
+                const auto ci = ord / kChunkOrds;
+                const auto si = ord % kChunkOrds;
+                fn(ord, chunks_[ci]->ord2ext[si], chunks_[ci]->slots[si]);
+            }
+        }
+    }
+
 private:
     mutable std::shared_mutex mutex_;
 

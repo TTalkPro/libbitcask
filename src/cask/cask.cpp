@@ -815,6 +815,9 @@ void Cask::close() noexcept {
         }
         if (search_ && opts_.read_write && keydir_) {
             // P14e:统一分段 search.ckpt（docmap + bm25 + hnsw 单文件）。
+            // S14-4：close 强制全量 base——干净关闭收敛为单一 base，
+            // .prev 代际刷新、delta 链坍缩（链不跨干净重启累积）。
+            search_->force_ckpt_rebase();
             const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
             (void)search_->save_search_ckpt(search_ckpt,
                                              keydir_->peek_next_ord());
@@ -930,6 +933,10 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
     // recover 的文档（含被索引 ord 自门丢弃的重叠区：分析成本已经付了，
     // 回存快照能让下次 fold 起点前移、免掉这部分）。
     std::size_t recovered_docs = 0;
+    // S14-6：恢复期遇到 field.schema 无法解析的悬空 FieldId 的计数（掉电
+    // 窗口：intern 只 fflush 未 fsync，schema 尾条映射可能晚于数据丢失）。
+    // 跳过该字段（与"丢弃"同级的降级）+ 循环后聚合告警，可观测不刷屏。
+    std::size_t dangling_field_ids = 0;
     auto flush_recover = [&] {
         if (search_layer && !recover_batch.empty()) {
             recovered_docs += recover_batch.size();
@@ -1014,7 +1021,11 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                     // Index 无该 ord,live 过滤会把它当死文档)。
                     // P3b:量化落盘(vec_quantized)也算带向量。
                     const bool dv_has_vec = dv && (dv->has_vector || dv->vec_quantized);
-                    if (dv && (!dv->text.empty() || dv_has_vec)) {
+                    // S14-6：纯命名字段文档（text 空、无向量）也必须恢复——
+                    // 否则连 docmap 都缺该 ord，live 过滤把它当死文档，
+                    // bm25.fields 重建无从谈起。
+                    if (dv && (!dv->text.empty() || dv_has_vec ||
+                               dv->has_fields)) {
                         // S3:攒进批，满 kRecoverBatch 即并行处理。RecoverDoc 持
                         // owning 拷贝（fold 缓冲会复用，view 不可跨记录留存）。
                         search::SearchLayer::RecoverDoc rd;
@@ -1030,6 +1041,26 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                         // P3b:doc_vector_f32 统一处理 f32 与 int8 量化两种落盘
                         // （内部 memcpy 未对齐安全 / dequant）。
                         rd.vector   = codec::doc_vector_f32(*dv);
+                        // S14-6：命名字段还原（FieldId → 名字经 field.schema），
+                        // 使 fold 重放与活写路径同构（per-field + catch-all）。
+                        // 此前 dv->fields 被整段丢弃——增量窗口（ckpt 不健康
+                        // 时全库）的字段索引在恢复后不存在且被下次 ckpt 固化。
+                        if (dv->has_fields) {
+                            rd.fields.reserve(dv->fields.size());
+                            for (const auto& f : dv->fields) {
+                                auto fname = field_schema_.name_of(f.id);
+                                if (!fname) {
+                                    ++dangling_field_ids;
+                                    continue;
+                                }
+                                rd.fields.emplace_back(
+                                    std::move(*fname),
+                                    std::string(
+                                        reinterpret_cast<const char*>(
+                                            f.value.data()),
+                                        f.value.size()));
+                            }
+                        }
                         recover_batch.push_back(std::move(rd));
                         if (recover_batch.size() >= kRecoverBatch) flush_recover();
                     }
@@ -1075,6 +1106,13 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
             if (auto r = fold_one(e); !r) return std::unexpected(r.error());
         }
         flush_recover();  // S3:落最后一个不满批
+        if (dangling_field_ids > 0) {
+            log_warn("recovery: skipped " +
+                     std::to_string(dangling_field_ids) +
+                     " field value(s) with dangling field id "
+                     "(field.schema tail lost; affected fields stay "
+                     "unindexed until rewritten)");
+        }
         // ①（s13-review §P1 后续）：恢复期重分析量超过阈值时，立即回存
         // checkpoint——否则重建成果只在内存，下次干净 close/merge 前再崩
         // 一次就全价重付（10M 级库重分词 + HNSW 重建可达小时级）。
@@ -1090,10 +1128,13 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         constexpr std::size_t kPostRecoveryCkptMinDocs = 1000;
         if (search_layer && recovered_docs >= kPostRecoveryCkptMinDocs &&
             opts_.read_write && !opts_.merge_only) {
-            write_keydir_snapshot();  // 成对：快路径要求快照与 ckpt 同时健康
-            if (!search_layer->save_search_ckpt(
+            // S14-4 写序：先 ckpt 后快照，成功才落快照（成对：快路径要求
+            // 两者同时健康且 search 覆盖 ≥ 快照水位）。
+            if (search_layer->save_search_ckpt(
                     dirname_ + "/" + kSearchCkptName,
                     keydir_->peek_next_ord())) {
+                write_keydir_snapshot();
+            } else {
                 log_warn("post-recovery search checkpoint save failed "
                          "(next open will re-fold)");
             }
@@ -1143,7 +1184,10 @@ Cask::load_recovery_snapshots(search::SearchLayer* search_layer) {
     if (search_layer) {
         auto result = search_layer->load_search_ckpt(
             dirname_ + "/" + kSearchCkptName);
-        search_ok = result.loaded && result.all_segments_ok;
+        // S14-4：.prev 回退不走字节水位快路径（keydir 快照可能与坏掉的
+        // 新代成对、水位超前）——退全量 fold，自门保证只重建缺口。
+        search_ok = result.loaded && result.all_segments_ok &&
+                    !result.from_prev;
     }
     if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
         recovery.snap_wms = std::move(*w);
@@ -2580,8 +2624,12 @@ std::expected<void, CaskFault> Cask::checkpoint() {
                  wm = keydir_->peek_next_ord()] {
             int result = 2;
             try {
-                if (wms) write_keydir_snapshot(*wms);  // best-effort
+                // S14-4 写序：先 search.ckpt 后 keydir 快照，且仅成功后写
+                // 快照——崩溃任何前缀只留「旧快照+新 ckpt」（fold 多放、
+                // 自门幂等丢弃）；反序在两写之间崩溃会造成「新快照+旧
+                // ckpt」→ fold 从超前字节水位起跳、search 永久丢窗口。
                 result = search_->save_search_ckpt(search_ckpt, wm) ? 1 : 2;
+                if (result == 1 && wms) write_keydir_snapshot(*wms);
             } catch (...) {
                 // result 保持 2；异常本体由 reducer 的 error_fn 计数上报。
             }
@@ -2601,13 +2649,13 @@ std::expected<void, CaskFault> Cask::checkpoint() {
                 "checkpoint: search checkpoint save failed"));
         }
     } else {
-        // 无索引池（理论不可达：search_ 存在则 lane 已注册）——调用线程直跑，
-        // 行为同 merge 收尾的退化分支。
-        write_keydir_snapshot();
+        // 无索引池（理论不可达：search_ 存在则 lane 已注册）——调用线程直跑。
+        // S14-4 写序：先 ckpt 后快照（见 RunFn 分支注释）。
         if (!search_->save_search_ckpt(search_ckpt, keydir_->peek_next_ord())) {
             return std::unexpected(err(CaskError::kIo,
                 "checkpoint: search checkpoint save failed"));
         }
+        write_keydir_snapshot();
     }
     return {};
 }
@@ -2642,9 +2690,10 @@ void Cask::maybe_submit_auto_checkpoint() {
              wms = collect_snapshot_watermarks(),
              wm = keydir_->peek_next_ord()] {
         try {
-            if (wms) write_keydir_snapshot(*wms);
+            // S14-4 写序：先 ckpt 后快照（见 checkpoint() RunFn 注释）。
             if (search_->save_search_ckpt(dirname_ + "/" + kSearchCkptName,
                                           wm)) {
+                if (wms) write_keydir_snapshot(*wms);
                 last_ckpt_ord_.store(wm, std::memory_order_relaxed);
             } else {
                 log_warn("auto checkpoint: search ckpt save failed "
@@ -2706,10 +2755,11 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
     }
 
     if (search_) {
-        // P3 顺序约定:先落 keydir 快照(取较早的 next_ord),再 flush
-        // IndexPool,之后保存的 bm25/sidecar 覆盖必然 ≥ keydir 快照——
-        // 并发写入下成对性门依然可判。
-        write_keydir_snapshot();
+        // P3 顺序约定（S14-4 修订）:**捕获**较早水位（此刻文件大小），但
+        // 文件**写入**延后到 search.ckpt 保存成功之后——写序反了的话，
+        // 两写之间崩溃会留下「新快照+旧 ckpt」，fold 从超前水位起跳、
+        // search 永久丢窗口。捕获早 + 写入晚，两个约束同时满足。
+        const auto merge_snap_wms = collect_snapshot_watermarks();
         if (index_pool_ && index_lane_) index_pool_->flush(index_lane_);
 
         // P2:merge 不再全量重读+重分词重建倒排。merge::run_merge 已通过
@@ -2783,6 +2833,9 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
                          "(will rebuild on next open)");  // S13-D7
             }
         }
+        // S14-4 写序：早段捕获的水位此刻才落盘（search.ckpt 已保存在前）。
+        // best-effort；merge 末尾还有一次「最紧凑状态」快照兜底。
+        if (merge_snap_wms) write_keydir_snapshot(*merge_snap_wms);
     }
 
     // After run_merge, every live record from `files` has been CAS-rewritten

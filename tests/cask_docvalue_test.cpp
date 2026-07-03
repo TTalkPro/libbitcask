@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
+
+#include <sys/stat.h>  // S14-2 .vec 追加测试:stat inode 断言
+
 #include <bitcask/cask.hpp>
 #include <bitcask/keydir_registry.hpp>
+#include <bitcask/search_checkpoint.hpp>  // S14-3 段 carry 断言
 #include <bitcask/codec.hpp>
 #include <bitcask/data_file.hpp>  // parse_data_tstamp（S13 测试枚举 data 文件）
 #include <algorithm>
@@ -3152,6 +3156,7 @@ TEST_F(CaskDocValueTest, H1CloseConvergesWithInflightWriters) {
     EXPECT_EQ(after.error().kind, bitcask::CaskError::kClosed);
 }
 
+
 // ── checkpoint()（s13-review §P1 后续①②）：崩溃恢复窗口收敛 ─────────────
 
 namespace {
@@ -3289,6 +3294,336 @@ TEST_F(CaskDocValueTest, AutoCheckpointOnRoll) {
     EXPECT_EQ(hits->hits.size(), 400u)
         << "ckpt 覆盖区 + fold 尾部重放应恢复全部文档（水位成对性）";
     (*r)->close();
+    std::error_code ec;
+    fs::remove_all(img, ec);
+}
+
+// S14-2/S14-4：.vec 与 delta 链的引擎级验证——第二次 checkpoint 走 delta
+// （search.ckpt.d1，base 与 .vec 均不动：向量随 delta 内联）；close 强制
+// 全量 base，此时 .vec 才**追加**（inode 不变、尺寸精确增长）。崩溃镜像
+// 重开：base + 链重放恢复全部向量。
+TEST_F(CaskDocValueTest, CheckpointVecPayloadAppends) {
+    namespace fs = std::filesystem;
+    constexpr std::size_t kDim = 8;
+    auto opts = v31_opts(kDim);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto vec_i = [&](int i) {
+        std::mt19937 rng(static_cast<std::uint32_t>(i) * 2654435761u + 11u);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> v(kDim);
+        for (auto& x : v) x = nd(rng);
+        return v;
+    };
+    auto put_range = [&](int from, int to) {
+        for (int i = from; i < to; ++i) {
+            bitcask::DocInput doc;
+            std::string text = "vecdoc n" + std::to_string(i);
+            doc.text = sv_bytes(text);
+            auto v = vec_i(i);
+            doc.vector = std::span<const float>(v.data(), v.size());
+            ASSERT_TRUE((*c)->put_doc(sv_bytes("vk_" + std::to_string(i)), doc,
+                                      static_cast<std::uint32_t>(6000 + i)));
+        }
+    };
+
+    put_range(0, 120);
+    ASSERT_TRUE((*c)->checkpoint());  // 首存：全量 base（.vec 收养 inode）
+    const std::string vec_path = (tmpdir_ / "search.vec").string();
+    struct stat st1;
+    ASSERT_EQ(::stat(vec_path.c_str(), &st1), 0);
+
+    put_range(120, 160);
+    ASSERT_TRUE((*c)->checkpoint());  // 二存：delta——base 与 .vec 均不动
+    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d1"));
+    struct stat st2;
+    ASSERT_EQ(::stat(vec_path.c_str(), &st2), 0);
+    EXPECT_EQ(st1.st_ino, st2.st_ino);
+    EXPECT_EQ(st1.st_size, st2.st_size) << "delta 保存不应触碰 .vec";
+
+    auto img = crash_image(tmpdir_, "vecapp");
+
+    // close 强制全量 base → 此时 .vec 走 S14-2 追加（inode 不变、精确增长）。
+    (*c)->close();
+    struct stat st3;
+    ASSERT_EQ(::stat(vec_path.c_str(), &st3), 0);
+    EXPECT_EQ(st1.st_ino, st3.st_ino) << "close 的 base 保存应追加 .vec 而非重写";
+    EXPECT_EQ(static_cast<std::size_t>(st3.st_size - st1.st_size),
+              40u * kDim * sizeof(float));
+    EXPECT_FALSE(fs::exists(tmpdir_ / "search.ckpt.d1"))
+        << "base 落成后 delta 链应被清扫";
+
+    auto r = Cask::open(img.string(), opts, &test_registry());
+    ASSERT_TRUE(r);
+    // 追加区（链重放的 ord 120-159）与 base 区（0-119）抽查 self-top1。
+    for (int i : {0, 119, 120, 159}) {
+        auto q = vec_i(i);
+        auto hits = (*r)->search_vector(
+            std::span<const float>(q.data(), q.size()), 1);
+        ASSERT_TRUE(hits) << "i=" << i;
+        ASSERT_FALSE(hits->hits.empty()) << "i=" << i;
+        EXPECT_EQ(hits->hits[0].key, "vk_" + std::to_string(i)) << "i=" << i;
+    }
+    (*r)->close();
+    std::error_code ec;
+    fs::remove_all(img, ec);
+}
+
+// S14-3/S14-4：脏标记驱动 delta 段选择性 + base 不动性。三阶段：
+//   A 文本+向量 → ckpt#1（全量 base）；
+//   B 纯文本增量 → ckpt#2 = d1：含 bm25.default/docmap delta、**无 hnsw delta**，
+//     base 文件逐字节不动；
+//   C 纯向量增量 → ckpt#3 = d2：含 hnsw/docmap delta、**无 bm25.default delta**；
+//   崩溃镜像重开：base + 链重放合成完整状态（文本与向量全可检索）。
+TEST_F(CaskDocValueTest, CheckpointDeltaChainSelectiveSections) {
+    namespace fs = std::filesystem;
+    namespace sc = bitcask::search;
+    constexpr std::size_t kDim = 8;
+    auto opts = v31_opts(kDim);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto vec_i = [&](int i) {
+        std::mt19937 rng(static_cast<std::uint32_t>(i) * 2654435761u + 23u);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> v(kDim);
+        for (auto& x : v) x = nd(rng);
+        return v;
+    };
+    auto put_one = [&](int i, bool with_text, bool with_vec) {
+        bitcask::DocInput doc;
+        std::string text;
+        if (with_text) {
+            text = "carrytoken n" + std::to_string(i);
+            doc.text = sv_bytes(text);
+        }
+        std::vector<float> v;
+        if (with_vec) {
+            v = vec_i(i);
+            doc.vector = std::span<const float>(v.data(), v.size());
+        }
+        ASSERT_TRUE((*c)->put_doc(sv_bytes("sc_" + std::to_string(i)), doc,
+                                  static_cast<std::uint32_t>(7000 + i)));
+    };
+    auto read_file = [&](const fs::path& fp) {
+        std::vector<char> bytes;
+        std::FILE* f = std::fopen(fp.string().c_str(), "rb");
+        if (!f) return bytes;
+        std::fseek(f, 0, SEEK_END);
+        bytes.resize(static_cast<std::size_t>(std::ftell(f)));
+        std::fseek(f, 0, SEEK_SET);
+        if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) {
+            bytes.clear();
+        }
+        std::fclose(f);
+        return bytes;
+    };
+    auto delta_types = [&](const fs::path& fp) {
+        std::set<std::uint16_t> types;
+        auto lc = sc::SearchCheckpoint::read(fp.string());
+        if (lc) {
+            for (auto& ls : lc->sections) {
+                if (ls.crc_ok) types.insert(ls.type);
+            }
+        }
+        return types;
+    };
+    constexpr std::uint16_t kBm25D = 7, kInfo = 9, kDocD = 10, kHnswD = 11;
+
+    // A：文本+向量 → 全量 base。
+    for (int i = 0; i < 60; ++i) put_one(i, true, true);
+    ASSERT_TRUE((*c)->checkpoint());
+    auto base1 = read_file(tmpdir_ / "search.ckpt");
+    ASSERT_FALSE(base1.empty());
+
+    // B：纯文本增量 → d1（无 hnsw delta；base 不动）。
+    for (int i = 60; i < 100; ++i) put_one(i, true, false);
+    ASSERT_TRUE((*c)->checkpoint());
+    auto t1 = delta_types(tmpdir_ / "search.ckpt.d1");
+    EXPECT_TRUE(t1.count(kInfo) && t1.count(kBm25D) && t1.count(kDocD));
+    EXPECT_FALSE(t1.count(kHnswD)) << "纯文本窗口不应有 hnsw delta";
+    EXPECT_EQ(read_file(tmpdir_ / "search.ckpt"), base1)
+        << "delta 保存不应重写 base";
+
+    // C：纯向量增量 → d2（无 bm25.default delta）。
+    for (int i = 100; i < 130; ++i) put_one(i, false, true);
+    ASSERT_TRUE((*c)->checkpoint());
+    auto t2 = delta_types(tmpdir_ / "search.ckpt.d2");
+    EXPECT_TRUE(t2.count(kInfo) && t2.count(kHnswD) && t2.count(kDocD));
+    EXPECT_FALSE(t2.count(kBm25D)) << "纯向量窗口不应有 bm25.default delta";
+    EXPECT_EQ(read_file(tmpdir_ / "search.ckpt"), base1);
+
+    // 恢复语义：base + 链重放合成完整状态。
+    auto img = crash_image(tmpdir_, "chain");
+    (*c)->close();
+    auto r = Cask::open(img.string(), opts, &test_registry());
+    ASSERT_TRUE(r);
+    auto th = (*r)->search_text("carrytoken", 200);
+    ASSERT_TRUE(th);
+    EXPECT_EQ(th->hits.size(), 100u);  // A(60)+B(40) 均含文本
+    for (int i : {0, 59, 100, 129}) {  // base 区与链区向量抽查
+        auto q = vec_i(i);
+        auto vh = (*r)->search_vector(
+            std::span<const float>(q.data(), q.size()), 1);
+        ASSERT_TRUE(vh) << "i=" << i;
+        ASSERT_FALSE(vh->hits.empty()) << "i=" << i;
+        EXPECT_EQ(vh->hits[0].key, "sc_" + std::to_string(i)) << "i=" << i;
+    }
+    (*r)->close();
+    std::error_code ec;
+    fs::remove_all(img, ec);
+}
+
+// S14-6：fold 重放必须消费 DocValue.fields。修复前：恢复只喂 text →
+// 增量窗口（ckpt 不健康/缺失时全库）的命名字段索引（bm25.fields 与
+// catch-all）丢失，且纯字段文档（text 空、无向量）连 docmap 都不恢复；
+// 下次 ckpt 把缺口固化。两分支验证：
+//   全量 fold（无 ckpt 镜像）→ 全库字段可查；
+//   ckpt 健康（增量窗口镜像）→ 覆盖区（反序列化）+ 窗口（fold）都可查。
+TEST_F(CaskDocValueTest, RecoverPreservesNamedFields) {
+    namespace fs = std::filesystem;
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = sl_cfg;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto put_fields_doc = [&](int i) {
+        bitcask::DocInput doc;  // 纯命名字段：text 空、无向量
+        std::string title = "alpha t" + std::to_string(i);
+        std::string body  = "beta b" + std::to_string(i);
+        doc.fields.push_back({"title", sv_bytes(title)});
+        doc.fields.push_back({"body", sv_bytes(body)});
+        ASSERT_TRUE((*c)->put_doc(sv_bytes("nf_" + std::to_string(i)), doc,
+                                  static_cast<std::uint32_t>(8000 + i)));
+    };
+
+    for (int i = 0; i < 30; ++i) put_fields_doc(i);
+    // 分支镜像 A：无任何 ckpt → 重开走全量 fold 重建。
+    auto img_full = crash_image(tmpdir_, "nf_full");
+    ASSERT_TRUE((*c)->checkpoint());
+    for (int i = 30; i < 50; ++i) put_fields_doc(i);
+    // 分支镜像 B：ckpt 覆盖 [0,30)，[30,50) 是增量窗口（fold 重放）。
+    auto img_incr = crash_image(tmpdir_, "nf_incr");
+    (*c)->close();
+
+    auto verify = [&](const fs::path& dir, std::size_t expect) {
+        auto r = Cask::open(dir.string(), opts, &test_registry());
+        ASSERT_TRUE(r) << dir;
+        auto t = (*r)->search_fields("title:alpha", 100);
+        ASSERT_TRUE(t);
+        EXPECT_EQ(t->hits.size(), expect) << dir << " title:alpha";
+        auto b = (*r)->search_fields("body:beta", 100);
+        ASSERT_TRUE(b);
+        EXPECT_EQ(b->hits.size(), expect) << dir << " body:beta";
+        // catch-all：字段值词条在默认域可全文命中（docmap live 亦经此验证）。
+        auto ca = (*r)->search_text("alpha", 100);
+        ASSERT_TRUE(ca);
+        EXPECT_EQ(ca->hits.size(), expect) << dir << " catch-all";
+        (*r)->close();
+    };
+    verify(img_full, 30u);
+    verify(img_incr, 50u);
+
+    std::error_code ec;
+    fs::remove_all(img_full, ec);
+    fs::remove_all(img_incr, ec);
+}
+
+// S14-4：delta 窗口的删除/覆盖语义——removals 日志 + 按 ord 交错重放。
+// 覆盖四种棘手形态：跨窗删除（杀 base 行）、窗口内覆盖写（新行自动杀旧）、
+// 写后删（行不入 delta + removal 杀 base/前版）、删后重写（removal 先于
+// 新行应用，不误杀）。另验多 delta 链、重开后续链（d3）、close 链坍缩。
+TEST_F(CaskDocValueTest, CheckpointDeltaChainDeletesAndOverwrites) {
+    namespace fs = std::filesystem;
+    auto opts = v31_opts(0);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto put_text = [&](const std::string& key, const std::string& text) {
+        bitcask::DocInput doc;
+        doc.text = sv_bytes(text);
+        ASSERT_TRUE((*c)->put_doc(sv_bytes(key), doc, 9000));
+    };
+    for (int i = 0; i < 50; ++i) {
+        put_text("dd_" + std::to_string(i),
+                 "delword n" + std::to_string(i) + "x");
+    }
+    ASSERT_TRUE((*c)->checkpoint());  // base
+
+    // 窗口 1（→ d1）：
+    put_text("dd_5", "delword updated5x");            // 覆盖写
+    ASSERT_TRUE((*c)->remove(sv_bytes(std::string("dd_7"))));   // 跨窗删除
+    put_text("dd_8", "delword rewritten8x");          // 写后删（下一行删掉）
+    ASSERT_TRUE((*c)->remove(sv_bytes(std::string("dd_8"))));
+    ASSERT_TRUE((*c)->remove(sv_bytes(std::string("dd_9"))));   // 删后重写
+    put_text("dd_9", "delword reborn9x");
+    for (int i = 50; i < 60; ++i) {
+        put_text("dd_" + std::to_string(i),
+                 "delword n" + std::to_string(i) + "x");
+    }
+    ASSERT_TRUE((*c)->remove(sv_bytes(std::string("dd_50"))));  // 窗口内建又删
+    ASSERT_TRUE((*c)->checkpoint());  // d1
+    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d1"));
+
+    // 窗口 2（→ d2）：
+    for (int i = 60; i < 65; ++i) {
+        put_text("dd_" + std::to_string(i),
+                 "delword n" + std::to_string(i) + "x");
+    }
+    ASSERT_TRUE((*c)->remove(sv_bytes(std::string("dd_2"))));
+    ASSERT_TRUE((*c)->checkpoint());  // d2
+    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d2"));
+
+    auto img = crash_image(tmpdir_, "deltas");
+    (*c)->close();
+
+    auto r = Cask::open(img.string(), opts, &test_registry());
+    ASSERT_TRUE(r);
+    auto expect_hits = [&](const char* q, std::size_t n) {
+        auto h = (*r)->search_text(q, 200);
+        ASSERT_TRUE(h) << q;
+        EXPECT_EQ(h->hits.size(), n) << q;
+    };
+    // live = base 50 − {2,7,8} + 新增 {51..59}(9) + {60..64}(5) = 61
+    //（dd_5/dd_9 以新版存活，各计一次）。
+    expect_hits("delword", 61);
+    expect_hits("n7x", 0);          // 跨窗删除
+    expect_hits("n2x", 0);          // d2 窗口删除
+    expect_hits("n8x", 0);          // 写后删：旧版
+    expect_hits("rewritten8x", 0);  // 写后删：窗口内版本
+    expect_hits("n5x", 0);          // 覆盖写：旧版死
+    expect_hits("updated5x", 1);    // 覆盖写：新版活
+    expect_hits("n9x", 0);          // 删后重写：旧版死
+    expect_hits("reborn9x", 1);     // 删后重写：新版活（交错重放不误杀）
+    expect_hits("n50x", 0);         // 窗口内建又删
+
+    // 重开后续链：再写一条 → checkpoint 应产出 d3（链状态在 load 端恢复）。
+    {
+        bitcask::DocInput doc;
+        std::string text = "delword continuedx";
+        doc.text = sv_bytes(text);
+        ASSERT_TRUE((*r)->put_doc(sv_bytes(std::string("dd_cont")), doc, 9100));
+    }
+    ASSERT_TRUE((*r)->checkpoint());
+    EXPECT_TRUE(fs::exists(img / "search.ckpt.d3")) << "重开后应续链";
+    // close 强制 base → 链坍缩清扫。
+    (*r)->close();
+    EXPECT_FALSE(fs::exists(img / "search.ckpt.d1"));
+    EXPECT_FALSE(fs::exists(img / "search.ckpt.d3"));
+
+    // 链坍缩后的 base 独立可用。
+    auto r2 = Cask::open(img.string(), opts, &test_registry());
+    ASSERT_TRUE(r2);
+    auto h2 = (*r2)->search_text("delword", 200);
+    ASSERT_TRUE(h2);
+    EXPECT_EQ(h2->hits.size(), 62u);  // 61 + dd_cont
+    (*r2)->close();
+
     std::error_code ec;
     fs::remove_all(img, ec);
 }

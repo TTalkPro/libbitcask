@@ -3,10 +3,14 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/stat.h>   // S14-2 vec append 测试:stat/truncate
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <random>
 #include <thread>
@@ -546,4 +550,117 @@ TEST(Hnsw, Int8RerankParallelPathDeterministic) {
         EXPECT_EQ(r1[i].ord, r2[i].ord);
         EXPECT_FLOAT_EQ(r1[i].score, r2[i].score);
     }
+}
+
+// ── S14-2：.vec 增量追加 ─────────────────────────────────────────────────
+
+// 追加轮回：首次 save 全量重写（v1）；再插入后二次 save 走追加（inode 不变、
+// 尺寸精确增长、header 升 v2）；reload 语义与全量重写等价（逐样本 self-top1）。
+// 另验前缀契约：旧代 ckpt + 被追加过的 .vec（header.count > ckpt.n）可装载
+// （.prev 回退等价场景）；.vec 截短到前缀不足则拒载（退 fold 重建的安全门）。
+TEST(HnswVecAppend, AppendRoundTripPrefixContract) {
+    namespace fs = std::filesystem;
+    const std::size_t dim = 8;
+    HnswConfig cfg;
+    cfg.dim = static_cast<std::uint16_t>(dim);
+    cfg.metric = HnswMetric::kDot;
+
+    auto vec_i = [&](std::size_t i) {
+        // 按 i 播种的随机单位向量——方向充分分散（确定性伪随机；线性构造的
+        // 向量族会近平行，int8 量化相位分不开 self 与近邻）。
+        std::mt19937 rng(static_cast<std::uint32_t>(i * 2654435761u + 7));
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> v(dim);
+        double sq = 0;
+        for (std::size_t j = 0; j < dim; ++j) {
+            v[j] = nd(rng);
+            sq += static_cast<double>(v[j]) * v[j];
+        }
+        const float inv = 1.0f / static_cast<float>(std::sqrt(sq));
+        for (auto& x : v) x *= inv;  // 归一化 → kDot 下 self 即最近邻
+        return v;
+    };
+
+    HnswIndex idx(cfg);
+    for (std::size_t i = 0; i < 100; ++i) {
+        auto v = vec_i(i);
+        idx.insert(i, std::span<const float>(v.data(), dim));
+    }
+    const auto base =
+        (fs::temp_directory_path() / "bitcask_vec_append_test.bcvs").string();
+    const std::string vec_path = base + ".vec";
+    ASSERT_TRUE(idx.save(base));  // 全量重写世代（v1）
+
+    struct stat st1;
+    ASSERT_EQ(::stat(vec_path.c_str(), &st1), 0);
+    // 留存旧代 ckpt（模拟 .prev）供前缀契约验证。
+    const std::string old_ckpt = base + ".gen1";
+    fs::copy_file(base, old_ckpt, fs::copy_options::overwrite_existing);
+
+    for (std::size_t i = 100; i < 150; ++i) {
+        auto v = vec_i(i);
+        idx.insert(i, std::span<const float>(v.data(), dim));
+    }
+    ASSERT_TRUE(idx.save(base));  // 应走追加
+
+    struct stat st2;
+    ASSERT_EQ(::stat(vec_path.c_str(), &st2), 0);
+    EXPECT_EQ(st1.st_ino, st2.st_ino) << "二次 save 应追加（无 tmp+rename）";
+    EXPECT_EQ(static_cast<std::size_t>(st2.st_size - st1.st_size),
+              50 * dim * sizeof(float))
+        << "尺寸应精确增长 50 个向量";
+    {
+        std::FILE* f = std::fopen(vec_path.c_str(), "rb");
+        ASSERT_NE(f, nullptr);
+        std::uint8_t h[8];
+        ASSERT_EQ(std::fread(h, 1, 8, f), 8u);
+        std::fclose(f);
+        std::uint32_t ver;
+        std::memcpy(&ver, h + 4, 4);
+        EXPECT_EQ(ver, 2u) << "追加后 header 应升 v2";
+    }
+
+    // reload 与全量语义等价。
+    {
+        HnswIndex r(cfg);
+        ASSERT_TRUE(r.load(base));
+        EXPECT_EQ(r.size(), 150u);
+        for (std::size_t i : {0u, 99u, 100u, 149u}) {
+            auto q = vec_i(i);
+            auto hits = r.search(std::span<const float>(q.data(), dim), 1, 64);
+            ASSERT_FALSE(hits.empty());
+            EXPECT_EQ(hits[0].ord, i) << "向量 " << i << " 追加后内容错位";
+        }
+    }
+
+    // 前缀契约：旧代 ckpt（n=100）+ 追加过的 .vec（count=150）→ 可装载。
+    {
+        fs::copy_file(old_ckpt, base, fs::copy_options::overwrite_existing);
+        HnswIndex r(cfg);
+        ASSERT_TRUE(r.load(base)) << ".prev 回退等价场景应可装载";
+        EXPECT_EQ(r.size(), 100u);
+        auto q = vec_i(42);
+        auto hits = r.search(std::span<const float>(q.data(), dim), 1, 64);
+        ASSERT_FALSE(hits.empty());
+        EXPECT_EQ(hits[0].ord, 42u);
+    }
+
+    // 安全门：.vec 截短到前缀不足（新代 ckpt 要 150，只留 120 个向量的字节）
+    // → 拒载（调用方回退 fold 重建）。
+    {
+        // 恢复新代 ckpt：base 现在是旧代——用 idx 重存一次新代
+        // （.vec 身份未变，追加路径 no-op）。
+        ASSERT_TRUE(idx.save(base));
+        struct stat stv;
+        ASSERT_EQ(::stat(vec_path.c_str(), &stv), 0);
+        const off_t cut =
+            stv.st_size - static_cast<off_t>(30 * dim * sizeof(float));
+        ASSERT_EQ(::truncate(vec_path.c_str(), cut), 0);
+        HnswIndex r(cfg);
+        EXPECT_FALSE(r.load(base)) << "前缀不足必须拒载";
+    }
+
+    fs::remove(base);
+    fs::remove(old_ckpt);
+    fs::remove(vec_path);
 }

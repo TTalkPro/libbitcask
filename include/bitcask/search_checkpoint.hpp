@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>  // S14-3: read_selected 的段选择谓词
 #include <optional>
 #include <span>
 #include <string>
@@ -35,6 +36,12 @@ enum class CkptSectionType : std::uint16_t {
     kHnsw        = 4,
     kMeta        = 5,  // 可选加速缓存
     kTerms       = 6,  // 可选加速缓存
+    // S14-4：delta 链段型（只出现在 search.ckpt.d<seq> 文件里）。
+    kBm25DefaultDelta = 7,   // InvertedIndex::serialize_delta 字节
+    kBm25FieldsDelta  = 8,   // u32 count; 每字段 [u16 nameLen|name|u64 len|delta]
+    kDeltaInfo        = 9,   // base_gen u64 | prev_wm u64 | seq u32（链校验）
+    kDocmapDelta      = 10,  // 窗口 live 行 + 删除日志（按 ord 交错重放）
+    kHnswDelta        = 11,  // 插入日志：count u64; 每条 ord u64 | f32[dim]
 };
 
 // 写入用:caller 持有 payload 字节。
@@ -157,6 +164,93 @@ public:
             return false;
         }
         return true;
+    }
+
+    // S14-3:只载入 want(type) 选中的段——段级 dirty-bit 前移用（干净段原
+    // 字节搬运进新 ckpt，免重序列化；脏段由调用方重建，不为其付读 I/O）。
+    // 结构损坏（页脚缺失/footerCrc 失败/越界）→ nullopt；选中段逐段校验
+    // CRC，失败的段不返回（调用方视作脏段重新序列化，安全收敛）。
+    // 页脚解析逻辑与 read() 相同，但按目录 fseek 只读选中 payload。
+    [[nodiscard]] static std::optional<std::vector<LoadedSection>>
+    read_selected(std::string_view path,
+                  const std::function<bool(std::uint16_t)>& want) {
+        using namespace detail;
+        std::unique_ptr<std::FILE, FileCloser> f(
+            std::fopen(std::string(path).c_str(), "rb"));
+        if (!f) return std::nullopt;
+        std::fseek(f.get(), 0, SEEK_END);
+        const long fsz = std::ftell(f.get());
+        if (fsz < static_cast<long>(kHeaderLen + kTrailerLen)) {
+            return std::nullopt;
+        }
+        const std::size_t n = static_cast<std::size_t>(fsz);
+
+        std::byte head[kHeaderLen];
+        std::fseek(f.get(), 0, SEEK_SET);
+        if (std::fread(head, 1, kHeaderLen, f.get()) != kHeaderLen) {
+            return std::nullopt;
+        }
+        if (std::memcmp(head, kCkptMagic, 4) != 0) return std::nullopt;
+        if (get_u32(head + 4) != kCkptVersion) return std::nullopt;
+
+        std::byte tail[kTrailerLen];
+        std::fseek(f.get(), static_cast<long>(n - kTrailerLen), SEEK_SET);
+        if (std::fread(tail, 1, kTrailerLen, f.get()) != kTrailerLen) {
+            return std::nullopt;
+        }
+        if (std::memcmp(tail + 8, kCkptMagic, 4) != 0) return std::nullopt;
+        const std::uint32_t dir_len = get_u32(tail + 4);
+        const std::uint32_t footer_crc = get_u32(tail);
+        if (static_cast<std::size_t>(dir_len) + kHeaderLen + kTrailerLen > n) {
+            return std::nullopt;
+        }
+        const std::size_t dir_begin = n - kTrailerLen - dir_len;
+        if (dir_begin < kHeaderLen) return std::nullopt;
+        std::vector<std::byte> dir(dir_len);
+        std::fseek(f.get(), static_cast<long>(dir_begin), SEEK_SET);
+        if (std::fread(dir.data(), 1, dir_len, f.get()) != dir_len) {
+            return std::nullopt;
+        }
+        if (bitcask::codec::crc32(
+                std::span<const std::byte>(dir.data(), dir_len)) !=
+            footer_crc) {
+            return std::nullopt;
+        }
+
+        if (dir_len < 4) return std::nullopt;
+        const std::uint32_t cnt = get_u32(dir.data());
+        std::size_t p = 4;
+        constexpr std::size_t kEntLen = 2 + 2 + 8 + 8 + 4;  // 24
+        std::vector<LoadedSection> out;
+        for (std::uint32_t i = 0; i < cnt; ++i) {
+            if (p + kEntLen > dir_len) return std::nullopt;
+            const std::byte* e = dir.data() + p;
+            p += kEntLen;
+            const std::uint16_t type = get_u16(e);
+            if (!want(type)) continue;
+            const std::uint16_t flags = get_u16(e + 2);
+            const std::uint64_t off = get_u64(e + 4);
+            const std::uint64_t len = get_u64(e + 12);
+            const std::uint32_t crc = get_u32(e + 20);
+            if (off < kHeaderLen || off > dir_begin ||
+                len > dir_begin - off) {
+                return std::nullopt;  // 目录越界 = 结构损坏。
+            }
+            LoadedSection ls;
+            ls.type = type;
+            ls.flags = flags;
+            ls.payload.resize(static_cast<std::size_t>(len));
+            std::fseek(f.get(), static_cast<long>(off), SEEK_SET);
+            if (std::fread(ls.payload.data(), 1, ls.payload.size(), f.get()) !=
+                ls.payload.size()) {
+                return std::nullopt;
+            }
+            ls.crc_ok = bitcask::codec::crc32(std::span<const std::byte>(
+                            ls.payload.data(), ls.payload.size())) == crc;
+            if (!ls.crc_ok) continue;  // 坏段不搬——调用方重序列化
+            out.push_back(std::move(ls));
+        }
+        return out;
     }
 
     // 读 + 校验。结构损坏(页脚缺失/footerCrc 失败/越界)→ nullopt(调用方退

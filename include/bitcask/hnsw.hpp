@@ -41,6 +41,8 @@
 
 #pragma once
 
+#include <sys/types.h>  // S14-2: dev_t/ino_t（.vec 追加目标身份）
+
 #include <array>
 #include <atomic>
 #include <cassert>
@@ -136,10 +138,21 @@ public:
     //
     // save_vec_payload:把 vecs_[0..count_) 写入 payload 文件。BCVP 格式:
     // header(48B) + 每 4KB 页 CRC32 表 + 页对齐 vecs 数据区。tmp+rename 原子。
+    // S14-2:增量追加路径。目标文件身份（dev/ino）与本对象的追加状态
+    // （vec_file_，见私有区）匹配时，只把 [vec_file_.count, count_) 的新
+    // 向量 pwrite 到数据区尾 + fdatasync + 原地重写 64B header（version=2；
+    // 不再维护页 CRC 表——该表从未被 load 校验）；否则退全量重写（v1 字节
+    // 格式原样，成功后收养新文件身份，使后续 save 走追加）。
+    // **前缀不变契约**：追加只写 offset ≥ 旧 count 数据尾的区域——文件里
+    // ckpt 声称的 [0, n) 前缀在任何 torn append 下保持完好；配合「先 .vec
+    // 后 .ckpt 原子发布」顺序，崩溃后要么用旧 n（尾部垃圾被忽略/下次覆盖）
+    // 要么用新 n（数据已 fdatasync），方向恒安全。
     [[nodiscard]] bool save_vec_payload(std::string_view path) const;
     // load_vec_payload:mmap payload 文件。MAP_SHARED 只读 + madvise(RANDOM)。
     // PRECONDITION:deserialize() 已设 count_/dim;本调用设置 vecs_mmap_base_/
-    // checkpoint_count_。校验 header 的 dim/count/header_crc,不符返回 false。
+    // checkpoint_count_。校验 header 的 dim/header_crc；S14-2 前缀契约：
+    // 接受 header.count ≥ n（.prev 回退时 .vec 比旧代 ckpt 长是常态），
+    // 只要求文件持有 [0, n) 前缀字节。version 1/2 均接受。
     [[nodiscard]] bool load_vec_payload(std::string_view path);
 
     // serialize:V2 header → buf(供 search.ckpt kHnsw 段嵌入)。
@@ -371,6 +384,29 @@ private:
     int                vecs_payload_fd_ = -1;
     std::size_t        vecs_mmap_len_   = 0;
     std::uint32_t      checkpoint_count_ = 0;
+
+    // S14-2:.vec 追加状态——与 mmap 解耦（追加读内存 vec_of、写文件，不需要
+    // 目标文件被 mmap；全量重写换 inode 后也能收养新文件继续追加）。
+    // valid=false ⇒ 无已知目标（新建/rebuild 后的索引）→ save 走全量重写。
+    // count = 文件已持有的向量数（追加起点；load 时取 ckpt 的 n 而非
+    // header.count——.prev 回退后文件尾部可能是新代垃圾，从 n 起覆盖）。
+    // 并发：只在 save/load 上下文访问（reducer RunFn / close / open 均已
+    // 串行化），无并发读者——mutable 仅为让 const 的 save 路径更新状态。
+    struct VecFileState {
+        bool          valid = false;
+        dev_t         dev   = 0;
+        ino_t         ino   = 0;
+        std::uint64_t data_off = 0;   // 数据区起始偏移（header.vecs_off）
+        std::uint32_t count    = 0;   // 已在文件中的向量数
+    };
+    mutable VecFileState vec_file_{};
+
+    // S14-2:追加路径本体。前置条件由 caller（save_vec_payload）检查
+    // （vec_file_.valid 且 count_ ≥ vec_file_.count）；本函数再做文件身份
+    // （dev/ino）与前缀完整性校验，不符/IO 失败返回 false（caller 退全量
+    // 重写兜底）。成功时推进 vec_file_.count。
+    [[nodiscard]] bool try_append_vec_payload(std::string_view path,
+                                              std::uint32_t n) const;
 };
 
 }  // namespace bitcask::vec

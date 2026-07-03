@@ -356,6 +356,18 @@ public:
     // P14e:序列化到字节缓冲(供 search.ckpt 分段嵌入)。盘字节与 save() 一致
     // (自带 INV 框架、原生小端)。serialize 仅追加缓冲、不会失败。
     void serialize(std::vector<std::byte>& out) const;
+
+    // S14-4：增量（delta）序列化——只导出 ord ≥ from_ord 的 posting 后缀
+    // （items 按 ord 升序不变量 → 后缀连续，见 PostingList 头注释）+ 绝对
+    // 全局统计（N/sdl：删除只改统计不碰 posting，随 delta 整体覆盖）。
+    // 与 serialize 相同的并发安全遍历（collect_term_keys + const_accessor）。
+    void serialize_delta(std::vector<std::byte>& out,
+                         std::uint64_t from_ord) const;
+    // 应用 delta：对每 term 尾部追加（per-item「ord > 列尾」守卫幂等拒绝
+    // 陈旧/重叠条目），note_appended 增量封块；新 term 走 add_doc 同款
+    // vocab_delta_ 记账；全局统计取 delta 内绝对值。解析失败（截断/魔数
+    // 不符）返回 false，调用方视作坏 delta 终止链。
+    [[nodiscard]] bool apply_delta(std::span<const std::byte> bytes);
     // 从字节缓冲反序列化(search.ckpt 段)。语义同 load:任何越界/校验违例
     // 整体拒绝返回 false。
     [[nodiscard]] auto deserialize(std::span<const std::byte> bytes) -> bool;

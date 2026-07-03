@@ -39,6 +39,7 @@
 #include "bitcask/highlighter.hpp"
 #include "bitcask/hnsw.hpp"
 #include "bitcask/index.hpp"
+#include "bitcask/search_checkpoint.hpp"  // S14-4
 #include "bitcask/inverted.hpp"
 #include "bitcask/meta_file.hpp"
 #include "bitcask/meta_filter.hpp"  // V5：filter 表达树 + MetaOp/MetaCondition
@@ -337,6 +338,11 @@ public:
         std::uint32_t      total_sz = 0;
         std::uint32_t      tstamp = 0;
         std::vector<float> vector;  // 空 = 无向量
+        // S14-6：命名字段（名字已由 caller 经 field.schema 还原；owning
+        // 拷贝——fold 缓冲复用）。非空时镜像活写路径语义：map 只喂 fields、
+        // text 不参与索引（与 put_doc 的 task.fields 装配一致），per-field
+        // 词表 + catch-all 合并在 map_analyze 内自然复原。空 = 单默认字段。
+        std::vector<std::pair<std::string, std::string>> fields;
     };
     void recover_doc_batch(std::vector<RecoverDoc>& batch);
 
@@ -362,13 +368,25 @@ public:
     // load_search_ckpt 结果。
     struct CkptLoadResult {
         bool loaded         = false;  // search.ckpt（或 .prev）结构完整
-        std::uint64_t watermark = 0;   // 快照覆盖的 next_ord 上界
-        bool all_segments_ok = false;  // 全段 CRC 通过 → 可走快路径
+        std::uint64_t watermark = 0;   // 快照覆盖的 next_ord 上界（S14-4：含 delta 链）
+        bool all_segments_ok = false;  // 全段 CRC 通过（段级健康）
+        // S14-4：本次载入落到了 .prev 旧代。段级可能完全健康，但磁盘上的
+        // keydir 快照可能与坏掉的新代成对（水位超前于 prev 覆盖）——caller
+        // （Cask::load_recovery_snapshots）必须据此放弃字节水位快路径，
+        // 退全量 fold（自门跳过已载入区）。
+        bool from_prev = false;
     };
     // 读 search.ckpt → 逐段校验 CRC → 分发到各反序列化器。
     // 结构损坏 → 尝试 .prev；都失败 → loaded=false（全量 fold 兜底）。
     // 段 CRC 失败 → 该段内存为空（fold 时重建），其余段照常载入。
     [[nodiscard]] CkptLoadResult load_search_ckpt(std::string_view path);
+
+    // S14-4：强制下次 save 写全量 base（链坍缩）。close 前调用——干净关闭
+    // 收敛为单一 base 文件：.prev 代际随之刷新，链不跨干净重启累积
+    // （delta 链的预期存续范围 = 两次 base 之间的运行期窗口）。
+    void force_ckpt_rebase() {
+        ckpt_rebase_needed_.store(true, std::memory_order_relaxed);
+    }
 
     // 从磁盘重建倒排索引：遍历 Index 中所有 live 文档，通过 doc_reader 回调读取文本，
     // 重新分词并构建全新的 InvertedIndex，原子替换旧的。
@@ -382,7 +400,10 @@ public:
     // 比 rebuild_index 轻（不重读磁盘、不重新分词）；分数无关。返回压实的 list 数。
     std::size_t compact(double dead_ratio_threshold = 0.5);
 
-    std::uint64_t compact_index_chunks() { return index_.compact_chunks(); }
+    std::uint64_t compact_index_chunks() {
+        dirty_docmap_.store(true, std::memory_order_relaxed);  // S14-3
+        return index_.compact_chunks();
+    }
 
     // ---- 访问内部组件（Phase 4 集成用）----
     [[nodiscard]] index::Index&       index()       { return index_; }
@@ -519,6 +540,43 @@ private:
     std::shared_ptr<const text::SynonymMap> synonym_map_;
     // 注：查询并行用的「有界 Search 池」是**进程级共享**的（非 per-Cask），
     // 定义在 search_layer.cpp（search_arena()）。见 S7-2。
+
+    // S14-3：段级 dirty-bit（路线 A §5）。写路径置位，save_search_ckpt
+    // 消费：干净段从现有 search.ckpt 原字节前移（免重序列化，无向量写
+    // 周期 hnsw 段零 CPU；纯向量负载 bm25 段零 CPU），只重序列化脏段；
+    // 保存成功后清零，load 成功载入的段亦清零（此刻内存 == 文件）。
+    // 初值 true：未知状态一律重序列化。relaxed 原子：全部写点与 save 点
+    // 在现有路径中已被 reducer / 静止点串行化，原子仅为同步旁路（无池
+    // 模式的 on_write/on_delete）的形式安全。
+    std::atomic<bool> dirty_docmap_{true};
+    std::atomic<bool> dirty_bm25_default_{true};
+    std::atomic<bool> dirty_bm25_fields_{true};
+    std::atomic<bool> dirty_hnsw_{true};
+
+    // ---- S14-4：ord-delta 链状态（base + search.ckpt.d<seq> 文件链）----
+    // 全部只在 save/load/reducer 上下文访问（现有路径已串行化）。
+    //
+    // rebase 标志：compact/rebuild_index 物理重排 posting、破坏 base+delta
+    // 的可重构性 → 置位后下次 save 写全量 base 并清链。初值 true（未知
+    // 状态一律全量），base 成功保存/载入后清。
+    std::atomic<bool> ckpt_rebase_needed_{true};
+    std::uint64_t ckpt_base_gen_ = 0;   // 当前 base 的 watermark（代 id）
+    std::uint64_t ckpt_chain_wm_ = 0;   // base+链的覆盖水位（下个 delta 的 from）
+    std::uint32_t ckpt_next_seq_ = 1;   // 下个 delta 文件序号
+    // 窗口日志（自上次 save 起，save 成功即清）：
+    // 删除 (key, tomb_ord)——docmap delta 的 remove 半边；bm25 统计效果由
+    // delta 头的绝对 N/sdl 覆盖，无需入日志。只记 tomb_ord ≥ chain_wm 的
+    // （fold 重叠区的旧墓碑不入——其目标可能已被链内更新的 put 复活）。
+    std::vector<std::pair<std::string, std::uint64_t>> delta_removals_;
+    // 向量插入 (ord, f32)——hnsw 无不可变旧段（插入改写旧邻接），delta 用
+    // 插入日志重放（insert 有 ord 水位自门）。只记 ord ≥ chain_wm 的。
+    std::vector<std::pair<std::uint64_t, std::vector<float>>> delta_vecs_;
+
+    // delta 保存/应用（save_search_ckpt / load_search_ckpt 内部）。
+    [[nodiscard]] bool save_delta_ckpt(const std::string& base_path,
+                                       std::uint64_t watermark);
+    [[nodiscard]] bool apply_delta_file(
+        const std::vector<bitcask::search::LoadedSection>& sections);
 };
 
 // S7-4: 把 [0, n) 并发跑在进程级共享「有界 Search 池」上（inter-query 并发）。

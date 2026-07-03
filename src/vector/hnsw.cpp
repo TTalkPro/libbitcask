@@ -1227,10 +1227,20 @@ void vs_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
 
 // V7:BCVP payload 文件 = 头 + 每 4KB 页 CRC32 表 + 页对齐 vecs 数据。
 // tmp + rename 原子写;inmem_int8 模式无 vecs_,save_vec_payload 是 no-op。
+// S14-2:常规路径改为**增量追加**（见 hnsw.hpp 声明注释），本函数体的全量
+// 重写降级为兜底（新建/rebuild 后的索引、目标文件身份不符、追加 IO 失败）。
 bool HnswIndex::save_vec_payload(std::string_view path) const {
     if (cfg_.inmem_int8) return true;  // 无常驻 f32 → 无 .vec 文件
     const std::uint32_t n = count_.load(std::memory_order_acquire);
     const std::string fp(path);
+
+    // S14-2:优先追加——已知目标文件（load 或上次全量重写收养）且节点只增
+    // （HNSW id 追加分配，正常运行恒真；rebuild 产出新对象、vec_file_ 为空）。
+    // 追加失败清状态退全量重写兜底。
+    if (vec_file_.valid && n >= vec_file_.count) {
+        if (try_append_vec_payload(path, n)) return true;
+        vec_file_.valid = false;
+    }
 
     const std::size_t vec_bytes =
         static_cast<std::size_t>(cfg_.dim) * sizeof(float);
@@ -1326,9 +1336,121 @@ bool HnswIndex::save_vec_payload(std::string_view path) const {
     f.reset();
     if (!ok || std::rename(tmp.c_str(), fp.c_str()) != 0) {
         std::remove(tmp.c_str());
+        vec_file_.valid = false;  // 目标状态未知，下次全量重写
         return false;
     }
+    // S14-2:收养新文件身份（rename 保 inode 不变）——后续 save 走追加。
+    struct stat st;
+    if (::stat(fp.c_str(), &st) == 0) {
+        vec_file_ = VecFileState{true, st.st_dev, st.st_ino,
+                                 static_cast<std::uint64_t>(vecs_off), n};
+    } else {
+        vec_file_.valid = false;
+    }
     return true;
+}
+
+namespace {
+// 循环处理 partial write 的 pwrite。
+bool pwrite_all(int fd, const void* buf, std::size_t len, std::uint64_t off) {
+    const auto* p = static_cast<const std::uint8_t*>(buf);
+    while (len > 0) {
+        const ssize_t w = ::pwrite(fd, p, len, static_cast<off_t>(off));
+        if (w <= 0) return false;
+        p   += w;
+        off += static_cast<std::uint64_t>(w);
+        len -= static_cast<std::size_t>(w);
+    }
+    return true;
+}
+}  // namespace
+
+// S14-2:.vec 增量追加。只写 [vec_file_.count, n) 的新向量（前缀不变契约：
+// offset < 旧数据尾的字节一律不碰，torn append 不伤 ckpt 声称的有效前缀）。
+// 顺序：数据 pwrite → fdatasync → header 原地重写（version=2）→ fdatasync。
+// header 先于数据落盘的窗口不存在；header 更新丢失时文件仍是旧 count 的
+// 合法 v1/v2 文件（配旧 ckpt 恰好成对）。页 CRC 表在 v2 中不再维护
+// （load 从未校验过它，v1 遗留表成为数据区前的死字节，vecs_off 照常跳过）。
+bool HnswIndex::try_append_vec_payload(std::string_view path,
+                                       std::uint32_t n) const {
+    const std::size_t vec_bytes =
+        static_cast<std::size_t>(cfg_.dim) * sizeof(float);
+    const std::string fp(path);
+    const int fd = ::open(fp.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st;
+    if (::fstat(fd, &st) != 0 ||
+        st.st_dev != vec_file_.dev || st.st_ino != vec_file_.ino) {
+        ::close(fd);  // 路径已指向别的文件（外部替换）→ 全量重写
+        return false;
+    }
+    // 前缀完整性：文件必须仍持有 [0, vec_file_.count) 的数据字节。
+    const std::uint64_t old_end =
+        vec_file_.data_off +
+        static_cast<std::uint64_t>(vec_file_.count) * vec_bytes;
+    if (static_cast<std::uint64_t>(st.st_size) < old_end) {
+        ::close(fd);
+        return false;
+    }
+    if (n == vec_file_.count) {
+        ::close(fd);  // 无新向量 ⇒ watermark 也未变（仅 insert 推进），无事可做
+        return true;
+    }
+
+    // 按 chunk 连续段聚合 pwrite（chunk 内 id 连续 ⇒ 内存连续；mmap 段同理，
+    // 在 chunk 边界多切一刀无碍正确性）。
+    bool ok = true;
+    {
+        std::uint32_t id = vec_file_.count;
+        std::uint64_t off = vec_file_.data_off +
+                            static_cast<std::uint64_t>(id) * vec_bytes;
+        while (ok && id < n) {
+            const std::uint32_t chunk_end =
+                ((id >> kChunkBits) + 1u) << kChunkBits;
+            const std::uint32_t run_end = std::min(n, chunk_end);
+            const std::size_t len =
+                static_cast<std::size_t>(run_end - id) * vec_bytes;
+            ok = pwrite_all(fd, vec_of(id), len, off);
+            off += len;
+            id = run_end;
+        }
+        if (ok) ok = ::fdatasync(fd) == 0;
+        // 裁到精确末端：覆盖掉可能更长的旧代垃圾尾（.prev 回退场景）。
+        // best-effort——mmap 前缀 [0, checkpoint_count_) 远在截断点之前。
+        if (ok) {
+            (void)::ftruncate(fd, static_cast<off_t>(
+                vec_file_.data_off +
+                static_cast<std::uint64_t>(n) * vec_bytes));
+        }
+    }
+
+    // header 原地重写（64B，字段偏移与 v1 相同；version=2、crc_count=0）。
+    if (ok) {
+        std::uint8_t hdr[kBcvpHeaderSize] = {0};
+        hdr[0] = kBcvpMagic[0]; hdr[1] = kBcvpMagic[1];
+        hdr[2] = kBcvpMagic[2]; hdr[3] = kBcvpMagic[3];
+        const std::uint32_t v2 = 2;
+        std::memcpy(hdr + 4,  &v2,       4);
+        std::memcpy(hdr + 8,  &cfg_.dim, 2);
+        std::memcpy(hdr + 10, &n,        4);
+        const std::uint64_t watermark =
+            max_inserted_ord_.load(std::memory_order_relaxed);
+        std::memcpy(hdr + 14, &watermark, 8);
+        std::memcpy(hdr + 22, &kBcvpPageSize, 4);
+        std::memcpy(hdr + 26, &vec_file_.data_off, 8);
+        const std::uint64_t total =
+            static_cast<std::uint64_t>(n) * vec_bytes;
+        std::memcpy(hdr + 34, &total, 8);
+        // hdr+42 crc_count = 0（零初始化）；46..59 保留 0。
+        const std::uint32_t hcrc = bitcask::codec::crc32(
+            std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(hdr), kBcvpHeaderCrcOff));
+        std::memcpy(hdr + kBcvpHeaderCrcOff, &hcrc, 4);
+        ok = pwrite_all(fd, hdr, kBcvpHeaderSize, 0) && ::fdatasync(fd) == 0;
+    }
+    ::close(fd);
+    if (ok) vec_file_.count = n;
+    return ok;
 }
 
 // V7:mmap .vec payload。PRECONDITION:deserialize() 已设 count_/cfg_。校验
@@ -1365,7 +1487,9 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
     }
     std::uint32_t version;
     std::memcpy(&version, hdr + 4, 4);
-    if (version != kBcvpVersion) {
+    // S14-2:v1 = 全量重写世代（有页 CRC 表，从未校验）；v2 = 被追加过的
+    // 世代（不再维护页表）。两者数据区语义相同，均按前缀契约装载。
+    if (version != 1 && version != 2) {
         ::close(fd);
         return false;
     }
@@ -1378,11 +1502,14 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
     std::uint64_t vecs_len_u64;
     std::memcpy(&vecs_len_u64, hdr + 34, 8);
 
-    // 与 deserialize() 状态交叉校验。
+    // 与 deserialize() 状态交叉校验。S14-2 前缀契约：文件物理持有量
+    // （header.count）允许 ≥ ckpt 声称的 n——.prev 回退时 .vec 已被新代
+    // 追加过是常态，只要求 [0, n) 前缀存在；旧 v1 文件恒等值，天然通过。
     const std::uint32_t n = count_.load(std::memory_order_relaxed);
-    if (dim != cfg_.dim || count != n || vecs_len_u64 !=
+    const std::uint64_t need_bytes =
         static_cast<std::uint64_t>(n) *
-            static_cast<std::uint64_t>(cfg_.dim) * 4u) {
+        static_cast<std::uint64_t>(cfg_.dim) * 4u;
+    if (dim != cfg_.dim || count < n || vecs_len_u64 < need_bytes) {
         ::close(fd);
         return false;
     }
@@ -1405,7 +1532,9 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
         return false;
     }
     const std::size_t file_size = static_cast<std::size_t>(st.st_size);
-    if (file_size < vecs_off_u64 + vecs_len_u64) {
+    // S14-2:只要求有效前缀 [0, n) 的字节在文件内（header.count 声称的
+    // 更长区域允许缺失——torn append 的尾巴不影响前缀装载）。
+    if (file_size < vecs_off_u64 + need_bytes) {
         ::close(fd);
         return false;
     }
@@ -1422,6 +1551,9 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
     vecs_mmap_len_   = file_size;
     vecs_payload_fd_ = fd;  // fd 持有至 mmap 生命周期末(destructor close)
     checkpoint_count_ = n;
+    // S14-2:记录追加目标。count 取 n（ckpt 有效前缀）而非 header.count——
+    // 文件尾部可能是被 .prev 回退否掉的新代数据，下次追加从 n 起覆盖。
+    vec_file_ = VecFileState{true, st.st_dev, st.st_ino, vecs_off_u64, n};
     // 随机访问模式:稀疏读,预取收益小,直接 MADV_RANDOM。
     ::madvise(raw, file_size, MADV_RANDOM);
     return true;
