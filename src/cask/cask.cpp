@@ -567,76 +567,15 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     // ⇒ 闭包不再被调用）再 reset adapter/search_，与旧「捕获 *search_」等价。
     if (cask->search_ && cask->registry_) {
         cask->index_pool_ = cask->registry_->index_pool();
+        // 分发逻辑提取为命名方法（prepare_index_task / reduce_index_entry /
+        // on_index_worker_error），闭包退化为薄捕获委托——可独立测试，消除
+        // 契约测试里的闭包复刻。生命周期：close 先 unregister_lib（flush 排空
+        // ⇒ 闭包不再被调用）再 reset adapter/search_/docmap_。
+        auto* c = cask.get();
         cask->index_lane_ = cask->index_pool_->register_lib(
-            // Map fn（并行 map worker）：IndexTask → 各插件 prepare 相产物
-            // （注册序；只对声明 wants_prepare 的插件调用）。prepare 契约 =
-            // 纯函数（map_analyze：analyzer_ const、无共享可变态），跨线程安全。
-            [plugins = cask->plugins_](const IndexTask& task) {
-                std::vector<plugin::PreparedPtr> preps(plugins.size());
-                const plugin::DocView  doc = make_doc_view(task);
-                const plugin::PutEvent ev  = make_put_event(task, &doc);
-                for (std::size_t i = 0; i < plugins.size(); ++i) {
-                    if (plugins[i]->wants_prepare()) {
-                        preps[i] = plugins[i]->prepare(ev);
-                    }
-                }
-                return preps;
-            },
-            // Reduce fn（串行 reducer，per-lane ord 序）：ReorderEntry →
-            // S16-2 写路径反转：宿主**先 apply DocMap**（身份/存活/meta），
-            // 再按注册序广播给各插件（设计 §4：DocMap 恒在所有插件之前）。
-            // 顺序安全性：docmap 先亮 live、postings/向量后加（与旧「postings
-            // 先、live 后」互换）——两序下并发查询都不可能命中「半个文档」
-            // （postings 无 → 不命中；live 无 → 过滤），且 reducer 单写者保证
-            // 同 ord 两步间无写交错。doc_len 是分析产物，宿主以 0 落行、
-            // BM25 侧经 set_doc_len 回填（S16 批次头②的缓行通道）。
-            [plugins = cask->plugins_, docmap = cask->docmap_](ReorderEntry& entry) {
-                std::visit([&plugins, &docmap](auto& e) {
-                    using T = std::decay_t<decltype(e)>;
-                    if constexpr (std::is_same_v<T, PutEntry>) {
-                        const auto& t = e.task;
-                        docmap->put_doc(t.key(), t.ord,
-                                        index::DocSlot{
-                                            index::DocLoc{t.file_id, t.offset,
-                                                          t.total_sz},
-                                            t.tstamp, /*doc_len=*/0});
-                        if (!t.meta.empty()) docmap->set_meta(t.ord, t.meta);
-                        const plugin::DocView  doc = make_doc_view(e.task);
-                        const plugin::PutEvent ev  = make_put_event(e.task, &doc);
-                        for (std::size_t i = 0; i < plugins.size(); ++i) {
-                            plugins[i]->on_put(
-                                ev, i < e.preps.size() ? std::move(e.preps[i])
-                                                       : plugin::PreparedPtr{});
-                        }
-                    } else if constexpr (std::is_same_v<T, DeleteEntry>) {
-                        // prior_ord 在 remove **前**捕获（删除统计需要旧 ord，
-                        // 插件不能反查已删行）；key 不存在 → 不动 docmap、
-                        // 广播哨兵（历史「删不存在」语义 = 插件侧 no-op）。
-                        std::uint64_t prior = plugin::kNoPriorOrd;
-                        if (auto slot = docmap->get(e.key)) {
-                            prior = slot->ord;
-                            docmap->remove(e.key, e.ord);
-                        }
-                        for (auto* p : plugins) {
-                            p->on_delete(plugin::DeleteEvent{e.ord, e.key, prior});
-                        }
-                    } else if constexpr (std::is_same_v<T, SkipEntry>) {
-                        // no-op（ord 空洞填充）
-                    } else if constexpr (std::is_same_v<T, RunFnEntry>) {
-                        // S13-F6：merge 路径的 compact/HNSW 重建/ckpt 序列化
-                        // 等在此（reducer 单写者上下文）执行。
-                        if (e.fn) e.fn();
-                    }
-                }, entry);
-            },
-            // Error fn：异常计数器自增（best-effort 保活 lane）。
-            [cask_ptr = cask.get()]() {
-                cask_ptr->index_errors_.fetch_add(1, std::memory_order_relaxed);
-                // S13-D7：索引 worker 吞异常此前仅计数——现同步上报。
-                cask_ptr->log_error(
-                    "index worker exception swallowed (index may drift; "
-                    "see StatusInfo::index_errors)");
-            },
+            [c](const IndexTask& task) { return c->prepare_index_task(task); },
+            [c](ReorderEntry& entry) { c->reduce_index_entry(entry); },
+            [c]() { c->on_index_worker_error(); },
             // 起始 ord。
             cask->keydir_->peek_next_ord()
         );
@@ -803,6 +742,71 @@ Cask::create_search_infra(const CaskOptions& opts) {
     // （caller 在 create_search_infra 返回、registry_/keydir_ 装配完成后做）。
     // 此处仅建好 search_，标记本库为 search 模式（search_ != nullptr）。
     return {};
+}
+
+std::vector<plugin::PreparedPtr>
+Cask::prepare_index_task(const IndexTask& task) {
+    std::vector<plugin::PreparedPtr> preps(plugins_.size());
+    const plugin::DocView  doc = make_doc_view(task);
+    const plugin::PutEvent ev  = make_put_event(task, &doc);
+    for (std::size_t i = 0; i < plugins_.size(); ++i) {
+        if (plugins_[i]->wants_prepare()) {
+            preps[i] = plugins_[i]->prepare(ev);
+        }
+    }
+    return preps;
+}
+
+// S16-2 写路径反转：宿主**先 apply DocMap**（身份/存活/meta），再按注册序广播
+// 给各插件（设计 §4：DocMap 恒在所有插件之前）。
+// 顺序安全性：docmap 先亮 live、postings/向量后加（与旧「postings 先、live 后」
+// 互换）——两序下并发查询都不可能命中「半个文档」（postings 无 → 不命中；
+// live 无 → 过滤），且 reducer 单写者保证同 ord 两步间无写交错。doc_len 是
+// 分析产物，宿主以 0 落行、BM25 侧经 set_doc_len 回填（S16 批次头②的缓行通道）。
+void Cask::reduce_index_entry(ReorderEntry& entry) {
+    std::visit([this](auto& e) {
+        using T = std::decay_t<decltype(e)>;
+        if constexpr (std::is_same_v<T, PutEntry>) {
+            const auto& t = e.task;
+            docmap_->put_doc(t.key(), t.ord,
+                             index::DocSlot{
+                                 index::DocLoc{t.file_id, t.offset, t.total_sz},
+                                 t.tstamp, /*doc_len=*/0});
+            if (!t.meta.empty()) docmap_->set_meta(t.ord, t.meta);
+            const plugin::DocView  doc = make_doc_view(e.task);
+            const plugin::PutEvent ev  = make_put_event(e.task, &doc);
+            for (std::size_t i = 0; i < plugins_.size(); ++i) {
+                plugins_[i]->on_put(
+                    ev, i < e.preps.size() ? std::move(e.preps[i])
+                                           : plugin::PreparedPtr{});
+            }
+        } else if constexpr (std::is_same_v<T, DeleteEntry>) {
+            // prior_ord 在 remove **前**捕获（删除统计需要旧 ord，插件不能
+            // 反查已删行）；key 不存在 → 不动 docmap、广播哨兵（历史「删不存在」
+            // 语义 = 插件侧 no-op）。
+            std::uint64_t prior = plugin::kNoPriorOrd;
+            if (auto slot = docmap_->get(e.key)) {
+                prior = slot->ord;
+                docmap_->remove(e.key, e.ord);
+            }
+            for (auto* p : plugins_) {
+                p->on_delete(plugin::DeleteEvent{e.ord, e.key, prior});
+            }
+        } else if constexpr (std::is_same_v<T, SkipEntry>) {
+            // no-op（ord 空洞填充）
+        } else if constexpr (std::is_same_v<T, RunFnEntry>) {
+            // S13-F6：merge 路径的 compact/HNSW 重建/ckpt 序列化等在此
+            // （reducer 单写者上下文）执行。
+            if (e.fn) e.fn();
+        }
+    }, entry);
+}
+
+void Cask::on_index_worker_error() noexcept {
+    index_errors_.fetch_add(1, std::memory_order_relaxed);
+    // S13-D7：索引 worker 吞异常此前仅计数——现同步上报。
+    log_error("index worker exception swallowed (index may drift; "
+              "see StatusInfo::index_errors)");
 }
 
 // 收尾顺序很关键：

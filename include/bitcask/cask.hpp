@@ -785,6 +785,12 @@ private:
     // 消费 pending 标记，增量达阈值则 fire-and-forget 提交 ckpt RunFn。
     void maybe_submit_auto_checkpoint();
 
+    // IndexPool 分发闭包的命名方法（原 register_lib 内联 lambda 体提取）。
+    // lambda 退化为薄捕获委托——逻辑可独立测试，消除契约测试里的闭包复刻。
+    std::vector<plugin::PreparedPtr> prepare_index_task(const IndexTask& task);
+    void reduce_index_entry(ReorderEntry& entry);
+    void on_index_worker_error() noexcept;
+
     // S14-7：成对保存——search.ckpt（delta 或 base）+ keydir 推进的统一
     // 入口。delta 路径把 keydir 元数据（水位/标量/fstats，caller 于提交
     // 时刻构建）内联进 delta 文件（**同文件原子成对**，无写序窗口，且
