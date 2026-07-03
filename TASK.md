@@ -2045,3 +2045,70 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > P2（DocMap 抽离为宿主服务）→ P3（checkpoint 拆分，高风险独立成批，设计 §5，
 > 附退化方案 B）→ P4（SearchLayer 拆 Text/Vector 插件 + hybrid 上移）→
 > P5（门面/C API/配置拆分收尾）。P1/P2/P4/P5 不依赖 P3。
+
+## 待办：第十六梯队（S16 插件化架构 P2 — DocMap 宿主服务化，2026-07-03）
+
+> 来源：`doc/plugin-arch-split-design-zh.md` §4/§9 P2。目标：`index::Index`
+> （docmap：ord↔ext / live / meta）从 SearchLayer 私有成员上提为 **Cask 宿主
+> 服务**，reducer 里先于所有插件 apply；SearchLayer 退化为借用消费者。这是
+> BM25/HNSW 拆分（P4）的前置——双插件不能各自私有身份表。
+>
+> **实现期侦查发现（对设计 §4 的三点修正）**：
+> - ① `index::Index` 已实现 `bm25::LiveChecker`（is_live/doc_len + SIMD
+>   fill_is_live/fill_doc_lens，index.hpp:73,110-135）——「DocTable 只读窄
+>   接口」有现成雏形，S16-3 在其上扩展而非新造。
+> - ② **doc_len 迁移缓行**（偏离设计 §4「doc_len 迁 BM25 侧」）：doc_len 是
+>   `DocSlot` 字段（index.hpp:49）**持久化在 kDocmap 段行内**，且以平坦 SoA
+>   （`doc_lens_`，index.hpp:203）支撑 BM25 打分的 SIMD gather 热路径——迁移
+>   同时牵连盘上格式与打分热路径。P2 保持「存储在 DocMap、语义归属 BM25」，
+>   P4 拆插件时与 ckpt 格式变更（P3）合并评估。
+> - ③ **delete 反转的顺序依赖**：`SearchLayer::on_delete` 先 `index_.get(key)`
+>   查旧 ord 再调整 BM25 统计（ord_field_lens_）——若宿主先 remove docmap，
+>   插件查不到旧 ord。修正：宿主在 docmap remove **前**捕获 `prior_ord`，
+>   `DeleteEvent` 增带（无则哨兵值）。这对 P4 的独立 BM25 插件同样必要
+>   （插件不该为拿旧 ord 反查 docmap）。
+
+- [ ] **S16-1【P0·S】Index 所有权上提（零行为变化）**
+  - SearchLayer 成员 `index::Index index_` 改为
+    `std::shared_ptr<index::Index> index_holder_` + `index::Index& index_`
+    引用别名（声明序 holder 先于 ref）——**两个 141K/88K 实现体零改动**，
+    全部既有 `index_.` 用法照旧。
+  - 构造函数增尾置参 `std::shared_ptr<index::Index> docmap = nullptr`：
+    空 = 自持（standalone/测试路径零改动，59+ 测试构造点不动）；非空 =
+    借用宿主实例。Cask 增成员 `std::shared_ptr<index::Index> docmap_`，
+    create_search_infra / upgrade 两处先建 docmap_ 再注入 SearchLayer。
+  - 测试：全量回归零差异（纯所有权反转）；新增一条断言
+    `cask 侧 docmap_ 与 search_->index() 同一实例`（地址相等）。
+- [ ] **S16-2【P0·L】写路径反转：宿主先 apply DocMap，插件退纯索引写**
+  - reduce 闭包 PutEntry 分支：广播插件**之前**宿主直调
+    `docmap_->put_doc`（DocSlot 从 task 构造）+ `set_meta`；DeleteEntry
+    分支：先捕获 `prior_ord = docmap_->get(key)`，再 `docmap_->remove`，
+    再广播（DeleteEvent 增 `prior_ord` 字段，哨兵 UINT64_MAX=原不存在）。
+  - SearchLayer 侧：reduce_apply 去掉 ④put_doc/⑤set_meta（on_vector 留，
+    属 HNSW）；on_write 同理；on_delete 改以 prior_ord 直达（不再
+    index_.get 反查）。**顺序变化**（docmap 先亮 live 后加 postings，与现
+    「postings 先、live 后」互换）的并发安全性论证写进注释：两序下查询
+    都不可能命中「半个文档」（postings 无 → 不命中；live 无 → 过滤）。
+  - **ckpt 记账迁移**：`dirty_docmap_` 脏位与 `delta_removals_` 删除日志
+    从 SearchLayer 迁进 `index::Index`（写它的人负责记账）；SearchLayer
+    的 save/delta 路径改读 Index 记账。恢复路径（recover_doc_batch /
+    recover_tomb / DeltaReplayHook 链重放）的 docmap 写同步上提到 Cask。
+  - 测试：全量回归（尤其 crash_recovery / checkpoint_recovery / S14 全系
+    delta 链测试）+ TSan；plugin_contract_test 增「宿主 docmap 先于插件
+    可见」断言（插件 on_put 内查 docmap 必已有本 ord 的 slot）。
+- [ ] **S16-3【P1·M】查询面 DocTable 化（P4 铺路）**
+  - 以 `bm25::LiveChecker` 为基础扩展只读接口（ord_to_ext / eval_meta 补
+    进去，或新设 `DocTable : LiveChecker`），HNSW live-callback、
+    materialize_hits、search_vector 的过滤链改经 `const DocTable&` 形参——
+    SearchLayer 查询代码不再直摸 `index_` 的具体类型。
+  - 测试：查询全家（text/phrase/bool/fields/fuzzy/wildcard/vector/hybrid）
+    回归零差异。
+- [ ] **S16-4【P2·S】文档与契约测试收口**
+  - 设计文档 §4 更新（doc_len 缓行决定 + DeleteEvent.prior_ord 修正 +
+    进度标记）；cpp-arch.md 分层图补 DocMap 宿主服务框。
+  - plugin_contract_test 补 DeleteEvent.prior_ord 契约用例。
+
+> **建议执行顺序**：S16-1 → S16-2（重头，含记账迁移）→ S16-3 → S16-4。
+> S16-2 是 P2 的实质；若其 ckpt 记账迁移在评审中被判过重，可退化为
+> 「记账经 SearchLayer 暴露的 docmap 写门面代持」（宿主仍是唯一写发起方，
+> 记账物理位置暂留 SearchLayer，P3 一并迁）。

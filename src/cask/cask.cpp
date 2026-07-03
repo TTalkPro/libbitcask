@@ -451,7 +451,9 @@ Cask::upgrade(std::string_view dirname,
             "field.schema corrupt or incompatible version"));
     }
 
-    cask->search_ = std::make_unique<search::SearchLayer>(search_config);
+    cask->docmap_ = std::make_shared<index::Index>();  // S16-1：宿主服务
+    cask->search_ = std::make_unique<search::SearchLayer>(search_config,
+                                                          cask->docmap_);
 
     cask->keydir_ = std::make_shared<keydir::KeyDir>();
     if (auto r = cask->load_keydir_from_disk(cask->search_.get()); !r) {
@@ -761,7 +763,9 @@ Cask::create_search_infra(const CaskOptions& opts) {
     scfg.vector_metric = meta_config_.vector_metric;
     scfg.vector_inmem_int8 = meta_config_.vector_inmem_int8;  // P5b
     scfg.synonym_map = opts.synonym_map;  // S11：Cask 级 open-time 同义词词典透传
-    search_ = std::make_unique<search::SearchLayer>(scfg);
+    // S16-1：docmap 宿主先建，注入 SearchLayer（同一实例，所有权在 Cask）。
+    docmap_ = std::make_shared<index::Index>();
+    search_ = std::make_unique<search::SearchLayer>(scfg, docmap_);
     // analyzer 构造失败（无效配置 / 分词器未注册 / 词典加载失败）则 analyzer_
     // 为空——决不能带病打开，否则首次带 text 的 put 段错误。干净拒绝。
     if (!search_->has_analyzer()) {
@@ -867,6 +871,7 @@ void Cask::close() noexcept {
     search_adapter_.reset();
     plugins_.clear();
     search_.reset();
+    docmap_.reset();  // S16-1：shared_ptr 共持，序无关；此处只清宿主句柄
     if (write_lock_) {
         write_lock_->release_quiet();
         write_lock_.reset();

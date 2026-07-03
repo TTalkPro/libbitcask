@@ -611,6 +611,11 @@ public:
     // 访问内部 SearchLayer（用于 NIF 层）。
     [[nodiscard]] bool has_search() const { return search_ != nullptr; }
     [[nodiscard]] search::SearchLayer* search() { return search_.get(); }
+    // S16-1：DocMap 宿主服务句柄（索引模式下非空；与 search()->index()
+    // 同一实例——所有权在 Cask，SearchLayer 借用）。
+    [[nodiscard]] const std::shared_ptr<index::Index>& docmap() const {
+        return docmap_;
+    }
 
     void flush_index() {
         if (index_pool_ && index_lane_) index_pool_->flush(index_lane_);
@@ -837,6 +842,11 @@ private:
 
     // bitcask.meta 配置（open 时读写）
     meta::MetaConfig meta_config_{};
+
+    // S16-1：DocMap 宿主服务（ord↔ext/live/meta 身份表）。Cask 持有、
+    // SearchLayer 借用（设计 §4：docmap 属「文档身份」域而非「搜索」域）。
+    // P2 后续批次（S16-2）reducer 将先于插件 apply 它。
+    std::shared_ptr<index::Index> docmap_;
 
     // SearchLayer 实例（enable_search 时创建）
     std::unique_ptr<search::SearchLayer> search_;

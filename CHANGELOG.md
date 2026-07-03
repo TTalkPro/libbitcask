@@ -70,6 +70,14 @@ S13 四维审查（内存/并发/性能/功能）首批修复。
 
 ### Added
 
+- **插件回调接口层 `bitcask::plugin`（S15 P1）**：新增自包含头
+  `include/bitcask/plugin_api.hpp`（`CaskPlugin`/`PluginHost` + KV 事件类型）与
+  `bitcask_plugin_api` INTERFACE 目标。KV 核心的 IndexPool 写路径改经
+  `CaskPlugin` 接口分发（SearchLayer 经 `SearchLayerAdapter` 作「唯一插件」接
+  入，行为零变化）；`thread_pool.hpp` 不再依赖 search 头（reorder variant 塌缩
+  为 Put/Delete/Skip/RunFn 四类通用条目，原 `IndexOp::RebuildHnsw` 并入 RunFn
+  通道）。设计见 `doc/plugin-arch-split-design-zh.md`。内部管线类型
+  `ReduceEntry/OnWriteEntry/RebuildEntry` 移除（非公开 API，无 ABI 影响）。
 - **`Cask::search_text_highlight` 门面方法（S13-D3）**：README 功能表宣称已久但
   实际只在 SearchLayer 上（绕过门面丢失 closed fail-fast 与 flush 可见性契约）。
   现补上门面（返回 `HighlightSearchResult`，命中含高亮片段），README 与代码对齐。

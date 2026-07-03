@@ -1,6 +1,10 @@
 # 插件化架构拆分设计（KV 回调接口 + BM25/HNSW 解耦）
 
 状态：设计稿 v2（接口层按评审意见通用化——KV 事件词汇，2026-07-03）
+进度：**P1 已落地**（S15 批次，2026-07-03，TASK.md 第十五梯队）——plugin_api
+接口层 + thread_pool 去搜索化 + SearchLayerAdapter 唯一插件接入；clang 522/522、
+TSan 521/522（唯一失败为预存问题）、put_doc bench −0.3%。**P2 进行中**（S16
+批次，DocMap 宿主服务化）。
 前置：S14 全系收官（增量 checkpoint、keydir 快照增量化、int8 码字外置）
 
 ---
@@ -142,7 +146,10 @@ struct PutEvent {
   uint64_t         tstamp;
 };
 
-struct DeleteEvent   { uint64_t ord; std::string_view key; };
+// prior_ord（P2 修正）：被删文档原 ord，宿主在 docmap remove 前捕获；
+// 原不存在 = UINT64_MAX。插件（尤其 BM25 统计调整）不必反查 docmap。
+struct DeleteEvent   { uint64_t ord; std::string_view key;
+                       uint64_t prior_ord; };
 
 // merge 搬迁事件。value 视图免费附带——merge fold 此刻正持有整条记录的
 // 缓冲，插件可借 merge 的这遍 I/O 做影子重建（见 §3.9），不需要就忽略。
@@ -409,10 +416,15 @@ merge 线程:  on_merge_begin ──► fold + 写新数据文件 + fsync
   （put_doc/set_meta/remove），等价现 reduce_apply 的 ④⑤ 步顺序。
 - 插件构造时注入一个**只读窄接口** `const DocTable&`：
   `is_live(ord)`、`ord_to_ext(ord)`、`eval_meta(ord, filter)`。
+  实现基础现成：`index::Index` 已实现 `bm25::LiveChecker`（is_live/doc_len +
+  SIMD fill 族），DocTable 在其上扩展而非新造。
   BM25 打分存活过滤、HNSW live-callback（hnsw.cpp:924 的 `std::function`
   形状不变）都消费它。
-- **doc_len 迁出 DocMap 进 BM25 插件**：doc_len 是 BM25 打分专属输入，
-  与 `ord_field_lens_` 合并管理；DocMap 只留身份/存活/meta。
+- **doc_len 迁移缓行（P2 实现期修正，2026-07-03）**：doc_len 语义上是 BM25
+  打分专属输入，但它是 `DocSlot` 持久化字段（kDocmap 段行内）且以平坦 SoA
+  支撑打分的 SIMD gather（`Index::fill_doc_lens`）——迁移同时牵连盘上格式与
+  热路径。P2 保持「存储在 DocMap、语义归属 BM25」，P4 与 ckpt 格式变更（P3）
+  合并评估。
 - DocMap 自己的持久化 = 现 ckpt 的 `kDocmap/kMeta/kTerms + kDocmapDelta`
   段，随 keydir 快照一起归宿主 checkpoint 管（见 §5），
   S14-7 的 `kKeydirDelta` 同文件成对不变量因此**原样保留**。
@@ -532,7 +544,7 @@ bitcask_search       （过渡期兼容 shim，迁移完成后删除）
 
 | 阶段 | 内容 | 风险 |
 |---|---|---|
-| P1 | `bitcask_plugin_api` 头 + thread_pool 类型擦除（ReduceEntry 去 ReduceJob）；SearchLayer 原样套 adapter 变「唯一插件」 | 低：纯接口化，行为零变 |
+| P1 ✅ | `bitcask_plugin_api` 头 + thread_pool 类型擦除（ReduceEntry 去 ReduceJob）；SearchLayer 原样套 adapter 变「唯一插件」 | 低：纯接口化，行为零变——已落地（S15，2026-07-03） |
 | P2 | DocMap 抽离为宿主服务，SearchLayer 改消费 `const DocTable&`；doc_len 迁 BM25 侧 | 中：动 reduce_apply 内部顺序，需 TSan + 恢复回归 |
 | P3 | checkpoint 拆分（manifest + 每组件文件族 + min-水位恢复协议） | **高**：动 S14 全部成果的持久化布局，需 crash_recovery / checkpoint_recovery 全系 + 新增「单组件损坏」注错测试；提供旧 search.ckpt 一次性迁移器 |
 | P4 | SearchLayer 拆 TextPlugin/VectorPlugin，hybrid 上移；merge/恢复改插件广播 | 中：大搬家但 P1-P3 已备好落点 |

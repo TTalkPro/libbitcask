@@ -169,7 +169,12 @@ struct ReduceJob {
 class SearchLayer {
 public:
     // 构造 analyzer（可能因无效配置失败）。caller 应检查返回值。
-    explicit SearchLayer(const SearchLayerConfig& config);
+    // S16-1：docmap 尾置注入参——nullptr = 自持（standalone/测试路径，行为
+    // 与旧版完全一致）；非空 = 借用宿主（Cask）持有的实例（设计
+    // doc/plugin-arch-split-design-zh.md §4：DocMap 是宿主服务，SearchLayer
+    // 是消费者）。生命周期：shared_ptr 共持，析构序无关。
+    explicit SearchLayer(const SearchLayerConfig& config,
+                         std::shared_ptr<index::Index> docmap = nullptr);
 
     // S10-A1: 测试专用构造函数——注入自定义 analyzer（如计数 wrapper）。
     // 生产代码用上面的构造函数。injected_analyzer 为 nullptr 时退化为默认。
@@ -533,7 +538,11 @@ private:
         std::string_view query) const;
 
     SearchLayerConfig  config_;
-    index::Index      index_;
+    // S16-1：docmap 实体经 shared_ptr 持有（自持或宿主注入），index_ 是其
+    // 引用别名——两个大实现体的既有 `index_.` 用法零改动。声明序：holder
+    // 必须先于引用初始化。
+    std::shared_ptr<index::Index> index_holder_;
+    index::Index&     index_;
     // S8.6：每字段一个 InvertedIndex（字段间 avgdl/idf 隔离）。
     // 旧单 text 文档与无字段限定查询都走 kDefaultField。
     // O8：透明 hash——field_index 查找直接吃 string_view，免临时 string。

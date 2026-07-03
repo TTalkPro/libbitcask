@@ -55,9 +55,12 @@ void parallel_for_queries(std::size_t n,
     });
 }
 
-SearchLayer::SearchLayer(const SearchLayerConfig& config)
+SearchLayer::SearchLayer(const SearchLayerConfig& config,
+                         std::shared_ptr<index::Index> docmap)
     : config_(config)
-    , index_()
+    , index_holder_(docmap ? std::move(docmap)
+                           : std::make_shared<index::Index>())
+    , index_(*index_holder_)
     , analyzer_(text::AnalyzerFactory::create(config.analyzer_config))
     , cache_(config.cache_max_entries)
     , doc_texts_(config.doc_text_cache_max)

@@ -243,6 +243,33 @@ TEST_F(CaskDocValueTest, DocValueEncodingVerified) {
     (*c2)->close();
 }
 
+// S16-1：DocMap 宿主服务——Cask 持有的 docmap_ 与 SearchLayer 借用的
+// index() 必须是同一实例（所有权反转的结构性断言）。
+TEST_F(CaskDocValueTest, DocmapIsHostOwnedSharedInstance) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = sl_cfg;
+
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    ASSERT_TRUE((*c)->has_search());
+    ASSERT_NE((*c)->docmap(), nullptr);
+    EXPECT_EQ((*c)->docmap().get(), &(*c)->search()->index());
+
+    // 经宿主句柄可见的写入 == 经 SearchLayer 可见的写入（同一实例语义）。
+    std::vector<std::byte> key{std::byte{'d'}, std::byte{'m'}};
+    std::vector<std::byte> val{std::byte{'x'}};
+    ASSERT_TRUE((*c)->put(key, val, 1000));
+    (*c)->flush_index();
+    EXPECT_TRUE((*c)->docmap()->is_live(0));
+    EXPECT_TRUE((*c)->search()->index().is_live(0));
+    (*c)->close();
+    EXPECT_EQ((*c)->docmap(), nullptr);  // close 清宿主句柄
+}
+
 TEST_F(CaskDocValueTest, SearchTextAfterPut) {
     CaskOptions opts;
     opts.read_write = true;
