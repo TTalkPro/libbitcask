@@ -5,6 +5,7 @@
 #include <bitcask/data_file.hpp>  // parse_data_tstamp（S13 测试枚举 data 文件）
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -3096,6 +3097,59 @@ TEST_F(CaskDocValueTest, W2ConcurrentSearchAndWriteNoRace) {
     auto final_r = (*c)->search_text("x", 100);
     ASSERT_TRUE(final_r);
     (*c)->close();
+}
+
+// H1（s13-review §P1）：close 与在途写并发的防御性收敛护栏。写路径的
+// Add/Delete 提交现已移出 write_mu_ 临界区（队列背压不再冻结全部写者），
+// close() 靠 WriteOpGate 等在途写者（含其锁外提交尾段）排空后才注销
+// index lane——否则锁外 submit_index_task 会解引用已 erase 的 lane（UAF）。
+// 契约上 close 时刻不应有在途写（caller 责任），本测试验证违约时的收敛
+// 行为：不崩、close 后写路径 kClosed fail-fast。TSan 负责抓 gate 的同步。
+TEST_F(CaskDocValueTest, H1CloseConvergesWithInflightWriters) {
+    auto opts = v31_opts(4);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    std::atomic<bool> ok{true};
+    std::vector<std::thread> ts;
+    for (int w = 0; w < 4; ++w) {
+        ts.emplace_back([&, w] {
+            for (int i = 0; i < 400; ++i) {
+                bitcask::DocInput doc;
+                std::string text = "alpha beta gamma " + std::to_string(i);
+                doc.text = sv_bytes(text);
+                std::string key =
+                    "h1_" + std::to_string(w) + "_" + std::to_string(i);
+                auto r = (*c)->put_doc(sv_bytes(key), doc,
+                                       static_cast<std::uint32_t>(4000 + i));
+                if (!r) {
+                    // close 之后必须是 kClosed fail-fast，而非崩溃/其它错误。
+                    if (r.error().kind != bitcask::CaskError::kClosed) ok = false;
+                    return;
+                }
+                if (i % 5 == 4) {
+                    // 混入 remove（Delete 同样走锁外提交路径）。
+                    auto d = (*c)->remove(sv_bytes(key));
+                    if (!d && d.error().kind != bitcask::CaskError::kClosed) {
+                        ok = false;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    // 写者先跑起来，然后并发 close——close 内部等 WriteOpGate 归零。
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    (*c)->close();
+    for (auto& t : ts) t.join();
+    EXPECT_TRUE(ok.load()) << "close 并发下写路径出现非 kClosed 错误";
+
+    // close 返回后库不可写：kClosed fail-fast。
+    bitcask::DocInput doc;
+    doc.text = sv_bytes("post");
+    auto after = (*c)->put_doc(sv_bytes("h1_after"), doc, 9000);
+    ASSERT_FALSE(after);
+    EXPECT_EQ(after.error().kind, bitcask::CaskError::kClosed);
 }
 
 // 边界：空批量 → 空；单条 → 走快路径（不进池）仍正确。

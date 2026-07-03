@@ -722,6 +722,33 @@ private:
         return closed_.load(std::memory_order_acquire);
     }
 
+    // H1（s13-review §P1）：在途写操作计数。写路径（put/put_batch/remove/
+    // put_doc）在整个调用期间持有 WriteOpGate——含释放 write_mu_ 之后的
+    // 索引提交尾段。close() 置 closed_ 后等待归零，才注销 index lane /
+    // 清空 index_pool_ 指针；否则锁外的 submit_index_task 可能解引用已
+    // erase 的 lane（UAF）。这是对「close 时刻无在途调用」契约（见上）的
+    // 防御性收敛：违约的并发 close 从 UB 变为阻塞等待写者退出。收敛性：
+    // 池由 registry 持有、close 不停池，队列背压中的 push 必然返回；
+    // closed_ 置位后新写者在入口检查处退出，计数单调排空。
+    // 内存序：fetch_add/fetch_sub 与 close 侧 load 均 seq_cst——写者
+    // 「inc 后读 closed_」与 close「写 closed_ 后读计数」构成 store-buffer
+    // 形状，RMW 的全序 + seq_cst load 保证两侧不会同时读到旧值。
+    std::atomic<std::uint32_t> writes_in_flight_{0};
+    struct WriteOpGate {
+        Cask* cask;
+        explicit WriteOpGate(Cask* c) : cask(c) {
+            cask->writes_in_flight_.fetch_add(1, std::memory_order_seq_cst);
+        }
+        WriteOpGate(const WriteOpGate&) = delete;
+        WriteOpGate& operator=(const WriteOpGate&) = delete;
+        ~WriteOpGate() {
+            if (cask->writes_in_flight_.fetch_sub(
+                    1, std::memory_order_seq_cst) == 1) {
+                cask->writes_in_flight_.notify_all();
+            }
+        }
+    };
+
     // 按 file_id 缓存的 DataFile 读句柄。read 路径懒打开。
     // 多读者并发，read_cache_mu_ 保护 unordered_map 本身；DataFile 内部
     // 的 pread 是 thread-safe 的。
@@ -767,6 +794,11 @@ private:
     // T3: 提交索引任务到 IndexPool（异步索引）。背压由 IndexPool 的有界
     // 队列提供：队列满（capacity 10240）时 submit 内部的 push 阻塞写线程，
     // 自然限速，避免任务无限堆积撑爆内存。
+    // H1（s13-review §P1）：常规路径（put/put_batch/remove/put_doc 的
+    // Add/Delete）在 **write_mu_ 释放之后** 调用——背压只阻塞本写者，
+    // 不冻结其他写路径。失败补偿的 Skip（OrdSkipGuard/写内重试）可能仍在
+    // 锁内提交（罕见路径，可接受）。锁外调用由 WriteOpGate 保护，close()
+    // 等其归零后才清 index_pool_/index_lane_。
     void submit_index_task(IndexTask task);
 
     // S13-D7：日志上报（best-effort：未配置 log_fn 为 no-op；回调抛出被吞）。

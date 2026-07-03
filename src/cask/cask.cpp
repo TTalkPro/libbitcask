@@ -772,6 +772,14 @@ void Cask::close() noexcept {
     // S11-W3：置 closed_ 标志（兼作幂等门——二次 close 直接返回）。后续公共方法
     // 入口 is_closed() 检查 → fail-fast 返回错误码而非解引用已释放状态。
     if (closed_.exchange(true)) return;
+    // H1：等在途写操作退出（含其 write_mu_ 外的索引提交尾段）再拆资源。
+    // 契约上 close 时刻不应有在途写调用（closed_ 注释），此处防御性收敛：
+    // 违约时 close 阻塞等待而非 UAF。被队列背压挡住的写者也会收敛——池由
+    // registry 持有仍在消费，push 必然返回；closed_ 已置位，新写者入口即退。
+    for (auto n = writes_in_flight_.load(std::memory_order_seq_cst); n != 0;
+         n = writes_in_flight_.load(std::memory_order_seq_cst)) {
+        writes_in_flight_.wait(n, std::memory_order_seq_cst);
+    }
     // close 内部步骤（save_ckpt/snapshot 的 vector 操作）可能抛 bad_alloc；
     // noexcept 函数抛出 → std::terminate。整个 body 包 try/catch 兜底：吞掉
     // 异常让后续资源释放仍能执行，优于进程硬死。错误可见性靠 index_errors_
@@ -859,6 +867,9 @@ void Cask::write_keydir_snapshot() noexcept {
 
 // T3: 提交索引任务到 IndexPool。背压由有界队列提供：队列满（10240）时
 // index_pool_->submit 的 push 阻塞写线程，让 put 路径自然减速、避免内存溢出。
+// H1（s13-review §P1）：常规写路径在 write_mu_ 释放后才调本函数——push
+// 阻塞只挡本写者，不再全队冻结。锁外读 index_pool_/index_lane_ 由
+// WriteOpGate 与 close() 的排空等待同步（见 cask.hpp）。
 void Cask::submit_index_task(IndexTask task) {
     if (!index_pool_ || !index_lane_) return;
     index_pool_->submit(index_lane_, std::move(task));
@@ -1663,7 +1674,8 @@ GetResult GetResultView::to_owned() const {
 Cask::put(std::span<const std::byte> key,
           std::span<const std::byte> value,
           std::uint32_t tstamp, std::uint32_t expiry_at) {
-    std::lock_guard<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
+    std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly));
@@ -1701,12 +1713,21 @@ Cask::put(std::span<const std::byte> key,
     // S13-F2: 成功 ⇒ ord 已有归宿——非重试路径由下面的 Add 覆盖
     // （persisted->ord == ord），重试路径由 write_and_keydir 内部 Skip 覆盖。
     og.disarm();
+    // H1（s13-review §P1）：索引提交移出 write_mu_ 临界区——组提交留在
+    // 锁内（不做 relock，规避 relock 后 active 已被并发写者 roll 的世界
+    // 变化），Add 在释锁后提交：队列背压只阻塞本写者，不再冻结全部写路径。
+    // 数据此刻已持久化（pwrite + keydir），reorder buffer 按 ord 乱序
+    // apply，到达序无关。gc 失败也先提交 Add——ord 必须被真任务覆盖，
+    // 与旧序（先 submit 后 group_commit）的对外语义一致。
+    const PersistedRecord rec = *persisted;
+    auto gc = maybe_group_commit();
+    wlk.unlock();
     submit_index_task(IndexTask::make(
-        IndexOp::Add, bytes_to_view(key), persisted->ord,
+        IndexOp::Add, bytes_to_view(key), rec.ord,
         std::string_view(reinterpret_cast<const char*>(value.data()),
                          value.size()),
-        persisted->file_id, persisted->offset, persisted->total_size, tstamp, 0));
-    if (auto r = maybe_group_commit(); !r) return std::unexpected(r.error());
+        rec.file_id, rec.offset, rec.total_size, tstamp, 0));
+    if (!gc) return std::unexpected(gc.error());
     return {};
 }
 
@@ -1718,7 +1739,8 @@ Cask::put(std::span<const std::byte> key,
 // 与单条 put 的 race 处理一致。
 std::expected<void, CaskFault>
 Cask::put_batch(std::span<const BatchItem> items, std::uint32_t tstamp) {
-    std::lock_guard<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
+    std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly));
@@ -1819,6 +1841,30 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint32_t tstamp) {
     }
 
     // ⑥ keydir apply + 索引提交。
+    // H1（s13-review §P1）：Add 的实际提交延后到 write_mu_ 释放之后——锁内
+    // 只收集 {item 下标, og 槽位, 定位记录}，锁外逐条构造 + 提交（IndexTask
+    // 深拷贝 key/text，队列背压兜底，峰值内存与旧的即时提交一致）。中途
+    // 失败路径先冲刷已收集的 Add 再返回：这些条目 keydir 已收录，必须由
+    // Add 覆盖，不能落给 og 的 Skip（该路径在锁内提交，行为同旧版）。
+    struct PendingAdd {
+        std::size_t item;   // items 下标（key/value 借 caller 生命周期）
+        std::size_t slot;   // og.ords/done 槽位（Add 提交后置 done）
+        PersistedRecord rec;
+    };
+    std::vector<PendingAdd> adds;
+    adds.reserve(items.size());
+    auto flush_adds = [&]() {
+        for (const auto& a : adds) {
+            submit_index_task(IndexTask::make(
+                IndexOp::Add, bytes_to_view(items[a.item].key), a.rec.ord,
+                std::string_view(
+                    reinterpret_cast<const char*>(items[a.item].value.data()),
+                    items[a.item].value.size()),
+                a.rec.file_id, a.rec.offset, a.rec.total_size, tstamp, 0));
+            og.done[a.slot] = 1;
+        }
+        adds.clear();
+    };
     bool retried = false;
     for (std::size_t i = 0; i < items.size(); ++i) {
         auto pr = keydir_->put(bytes_to_view(items[i].key), batch_file,
@@ -1826,6 +1872,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint32_t tstamp) {
                                /*now*/ 0, /*newest*/ true, 0, 0, pw[i].ord);
         PersistedRecord rec{pw[i].ord, pw[i].offset, pw[i].total_size,
                             batch_file};
+        std::size_t slot = i;
         if (pr == keydir::PutResult::kAlreadyExists) {
             // merge race：单条重写（write_and_keydir 内部 roll+重试）。
             // 原始 ord 保持 !done → 函数退出时由 og 补 Skip。
@@ -1837,29 +1884,36 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint32_t tstamp) {
             const std::uint64_t ord2 = keydir_->alloc_ord();
             OrdSkipGuard g2(this, ord2);
             auto p2 = write_and_keydir(items[i].key, encoded, tstamp, ord2);
-            if (!p2) return std::unexpected(p2.error());
-            g2.disarm();  // ord2（或其内部重试链）由下面的 Add 覆盖
+            if (!p2) {
+                flush_adds();  // 先前条目 keydir 已收录 → 锁内补交 Add（同旧版）
+                return std::unexpected(p2.error());
+            }
+            // 真实落盘 ord 改由批守卫追踪至 Add 提交为止（双重试时
+            // p2->ord != ord2，此时 ord2 已被 write_and_keydir 内部 Skip
+            // 覆盖，og 只追踪 p2->ord，不重复提交）。
+            og.done.push_back(0);
+            og.ords.push_back(p2->ord);
+            g2.disarm();
+            slot = og.ords.size() - 1;
             rec = *p2;
             retried = true;
-        } else {
-            og.done[i] = 1;  // 原始 ord 由下面的 Add 覆盖
         }
-        submit_index_task(IndexTask::make(
-            IndexOp::Add, bytes_to_view(items[i].key), rec.ord,
-            std::string_view(
-                reinterpret_cast<const char*>(items[i].value.data()),
-                items[i].value.size()),
-            rec.file_id, rec.offset, rec.total_size, tstamp, 0));
+        // done 置位延后到 Add 实际提交之后（flush_adds）——中途失败时未提交
+        // 的 ord 仍由 og 补 Skip，无空洞。
+        adds.push_back({i, slot, rec});
     }
     // merge-race 重写走的是非缓冲 write（write_and_keydir），不在 ④ 的提交
     // 覆盖内——按同一 sync 策略补一次组提交（罕见路径；o_sync/caller-sync
-    // 模式下 maybe_group_commit 自身为 no-op，语义一致）。
+    // 模式下 maybe_group_commit 自身为 no-op，语义一致）。gc 失败不早退：
+    // keydir 已收录的条目仍须 Add 覆盖，错误在锁外提交完成后返回（同 put）。
+    std::expected<void, CaskFault> gc;
     if (retried) {
         ++writes_since_sync_;
-        if (auto r = maybe_group_commit(/*force*/ true); !r) {
-            return std::unexpected(r.error());
-        }
+        gc = maybe_group_commit(/*force*/ true);
     }
+    wlk.unlock();  // H1：常规路径的 Add 全部在锁外提交
+    flush_adds();
+    if (!gc) return std::unexpected(gc.error());
     return {};
 }
 
@@ -1873,7 +1927,8 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint32_t tstamp) {
 //       (P：盘格式统一小端，flag-day 前为大端。)
 std::expected<void, CaskFault>
 Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
-    std::lock_guard<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
+    std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
     if (!opts_.read_write) return std::unexpected(err(CaskError::kReadOnly));
     if (tstamp == 0) tstamp = now_sec_default();
@@ -1912,13 +1967,19 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
     if (!h) return std::unexpected(io_fault(h.error().errnum));
     keydir_->remove(bytes_to_view(key), tstamp);
     og.disarm();  // S13-F2: ord 由下面的 Delete 任务（或非池路径直调）覆盖
-    if (index_pool_) {
-        submit_index_task(IndexTask::make(
-            IndexOp::Delete, bytes_to_view(key), ord, {}, 0, 0, 0, tstamp, 0));
-    } else if (search_) {
+    // H1：池路径的 Delete 提交移出临界区（同 put）。非池路径的 on_delete
+    // 是同步直调，依赖 write_mu_ 串行化写者，保持锁内。
+    const bool pooled = index_pool_ != nullptr;
+    if (!pooled && search_) {
         search_->on_delete(bytes_to_view(key), ord);
     }
-    if (auto r = maybe_group_commit(); !r) return std::unexpected(r.error());
+    auto gc = maybe_group_commit();
+    wlk.unlock();
+    if (pooled) {
+        submit_index_task(IndexTask::make(
+            IndexOp::Delete, bytes_to_view(key), ord, {}, 0, 0, 0, tstamp, 0));
+    }
+    if (!gc) return std::unexpected(gc.error());
     return {};
 }
 
@@ -1927,7 +1988,8 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
 std::expected<void, CaskFault>
 Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
               std::uint32_t tstamp) {
-    std::lock_guard<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
+    std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly));
@@ -2009,11 +2071,17 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     if (!persisted) return std::unexpected(persisted.error());
     // S13-F2: 成功 ⇒ ord 已有归宿（同 put：Add 或内部 Skip）。
     og.disarm();
+    // H1：组提交留在锁内，任务构造（fields 打包、vec 移交、meta 拷贝）与
+    // 提交移出临界区（同 put）。所需数据（doc/persisted/vec_norm）均为
+    // caller 参数或函数局部，锁外访问安全。
+    const PersistedRecord rec = *persisted;
+    auto gc = maybe_group_commit();
+    wlk.unlock();
     auto task = IndexTask::make(
-        IndexOp::Add, bytes_to_view(key), persisted->ord,
+        IndexOp::Add, bytes_to_view(key), rec.ord,
         std::string_view(reinterpret_cast<const char*>(doc.text.data()),
                          doc.text.size()),
-        persisted->file_id, persisted->offset, persisted->total_size, tstamp, 0);
+        rec.file_id, rec.offset, rec.total_size, tstamp, 0);
     // S10-A5:多字段打包进 fields_store（一次分配），替代旧 task_fields() 的 N×2 string 拷贝。
     {
         auto [store, views] = pack_fields();
@@ -2030,7 +2098,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     }
     task.meta.assign(doc.meta.begin(), doc.meta.end());
     submit_index_task(std::move(task));
-    if (auto r = maybe_group_commit(); !r) return std::unexpected(r.error());
+    if (!gc) return std::unexpected(gc.error());
     return {};
 }
 

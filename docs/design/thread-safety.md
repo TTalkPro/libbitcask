@@ -174,15 +174,19 @@
   - **锁序**：`write_mu_`（最外）→ `read_cache_mu_` / keydir；读路径不取 `write_mu_`
     → 无反向依赖、无死锁；写方法互不内部调用 → 无递归锁。
 - 为何不损吞吐：data 是单 append WAL，文件层本就串行；锁 ~20ns ≪ pwrite/fsync。
-- ⚠️ **`write_mu_` × IndexPool 背压交互**（S13 审查发现，见
+- **`write_mu_` × IndexPool 背压交互**（S13 审查发现 P1/H1，**已修复**，见
   [`s13-review-2026-07-02.md`](s13-review-2026-07-02.md) §P1）：`submit_index_task()` →
   `index_pool_->submit()` → `tbb::concurrent_bounded_queue::push()`（cap=10240）在队列满时
-  **阻塞**，且此调用在 `write_mu_` 临界区内 → 写者全队冻结。延迟**无上界**（取决于索引
-  worker 消费速度）。`async-index-pipeline.md` 早于 `write_mu_`，此交互在设计期未被分析。
-  **修复**：`submit_index_task` 移出 `write_mu_` 临界区（`lock_guard` → `unique_lock`，
-  keydir put 后释锁、submit 后重新获取做 `maybe_group_commit`）。reorder buffer 保证 ord
-  序正确（"本就支持任意到达序按 ord apply"）。另两个持锁阻塞子问题（`sync` 的 fdatasync、
-  `backup` 的文件系统 copy）为可接受取舍 / 低频操作，暂不动。
+  **阻塞**；修复前此调用在 `write_mu_` 临界区内 → 写者全队冻结、延迟无上界（还存在跨库
+  放大：队列与 reorder 在途预算均为 per-registry 共享，别的库的慢任务也能灌满队列）。
+  **修复方式**：常规路径（put/put_batch/remove/put_doc 的 Add/Delete）的索引提交移出
+  `write_mu_` 临界区——`maybe_group_commit` 留在锁内（不做 unlock→relock，规避 relock 后
+  active 已被并发写者 roll 的世界变化），submit 在释锁后执行：背压只阻塞本写者。reorder
+  buffer 保证 ord 序正确（"本就支持任意到达序按 ord apply"）。锁外提交与 `close()` 的
+  竞态由 `WriteOpGate`（`writes_in_flight_` 计数）收敛：close 置 `closed_` 后等在途写者
+  排空才注销 index lane。失败补偿的 Skip（OrdSkipGuard）仍可能在锁内提交（罕见路径）。
+  另两个持锁阻塞子问题（H2 `sync` 的 fdatasync、H3 `backup` 的文件系统 copy）为可接受
+  取舍 / 低频操作，暂不动。
 
 ### 7.3 全文搜索：`search_text` / `phrase` / `near` / `bool` / `fields` / `fuzzy` / `wildcard`
 - **触及**：`SearchCache`（cache_）、`DocTextLru`（doc_texts_）、`InvertedIndex` 倒排、
