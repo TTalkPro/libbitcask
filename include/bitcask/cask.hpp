@@ -907,6 +907,15 @@ private:
 
     // A4:落 keydir 段快照(best-effort;close/merge 末尾调)。
     void write_keydir_snapshot() noexcept;
+    // S14-1：水位捕获与快照写入拆分。RunFn 路径（checkpoint()/自动 ckpt）
+    // 必须在**提交时刻**（writer 侧）捕获字节水位、reducer 执行时刻写快照
+    // 本体——执行时取水位会被并发写者推进，反转「keydir_covered ≤
+    // search_covered」保存序不变量（路线 A §4），fold 跳过 search 未覆盖区。
+    [[nodiscard]] std::optional<
+        std::vector<std::pair<std::uint32_t, std::uint64_t>>>
+    collect_snapshot_watermarks() const noexcept;
+    void write_keydir_snapshot(
+        const std::vector<std::pair<std::uint32_t, std::uint64_t>>& wms) noexcept;
 
 public:
     // 访问共享 IndexPool（借用自 registry）

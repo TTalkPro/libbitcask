@@ -1702,16 +1702,28 @@ W4 ✅（parallel_scan 并行全表扫描）。
 >   tri-state 原子只等自己的 RunFn（不等 flush(lane)，持续写入下等待有界）；
 >   与 close 竞态由 H1 WriteOpGate 收敛。
 
-- [ ] **S14-1【P0·S】roll 封口点异步自动 checkpoint（cadence 机制）**
+- [x] **S14-1【P0·S】roll 封口点异步自动 checkpoint（cadence 机制）** — 已完成（2026-07-03）
   - `CaskOptions::auto_checkpoint_min_docs = 0`（0=关闭，默认零行为变化）。
-    roll_active 置 pending 标记（原子）；写路径释放 write_mu_ 后的锁外提交点检测：
+    roll_active 置 pending 标记（原子）；写路径释放 write_mu_ 后的锁外提交点
+    （maybe_submit_auto_checkpoint，WriteOpGate 持有中 → close 竞态安全）检测：
     增量（peek_next_ord − last_ckpt_ord_）≥ 阈值且无在途 → fire-and-forget 提交
-    RunFn（keydir 快照 + search.ckpt 都在 reducer 线程内做，成对顺序保持），
-    **不阻塞任何写者**。仅索引模式生效（KV 恢复本就走 hint 快路径）。
-  - 防重入：`auto_ckpt_inflight_` 原子标志，RunFn 完成时清。
-  - 快照写并发统一：manual checkpoint() 的 write_keydir_snapshot 同步移进其 RunFn
-    （所有 ckpt 文件写统一到 reducer 单线程，消除 tmp 文件并发写窗口；merge 收尾
-    的快照仍在 caller 线程，靠 CRC 兜底 + 单实例运维约束）。
+    RunFn，**不阻塞任何写者**。仅索引模式生效（KV 恢复本就走 hint 快路径）。
+    防重入：`auto_ckpt_inflight_` 原子标志，RunFn 完成时清；last_ckpt_ord_ 于
+    open 末尾以当前水位初始化（老库首个 roll 不触发无谓全量 ckpt）。
+  - **落地中抓出并修复一个成对性反转 bug**：write_keydir_snapshot 若在 reducer
+    的 RunFn 执行时刻取字节水位，会被并发写者推进到超过 search.ckpt 的 ord 覆盖
+    （破坏路线 A §4「keydir_covered ≤ search_covered」保存序不变量）→ 下次 open
+    fold 从超前水位起跳，search 永久丢失 [ckpt_wm, 快照时刻) 区间。修法：
+    `collect_snapshot_watermarks()` 拆分——字节水位在**提交时刻**（writer 侧，
+    先于 wm 捕获）取，快照本体仍在 reducer 写（entries 较新无害，fold 幂等）。
+    manual checkpoint() 的 RunFn 同步修正（其快照本批被移进 RunFn，统一 ckpt
+    文件写到 reducer 单线程、消除 .tmp 并发写窗口；merge 收尾快照仍在 caller
+    线程——flush 前捕获，本就满足不变量）。
+  - 测试：`AutoCheckpointOnRoll`（roll 自动落成对文件 + 崩溃镜像重开 400/400
+    可检索——该测试正是抓出水位反转的现场）、`AutoCheckpointDisabledByDefault`
+    （默认零行为变化）、`CheckpointConcurrentWithWrites` 增开小文件 roll + 自动
+    ckpt（手动/自动 RunFn 与并发写在 reducer 交错，TSan 护栏）。
+    clang 507/507、TSan 505/505（排除项为既知预存问题）。
 - [ ] **S14-2【P0·M】search.vec / int8 码字按 ord 追加化（最大单点收益）**
   - 向量 per-ord 不可变、删除是掩码 → 追加语义天然成立。ckpt 只 append
     [上次水位, 本次水位) 的向量/码字（带帧头 count+CRC+水位），~5–6GB 全量重写

@@ -3286,16 +3286,11 @@ TEST_F(CaskDocValueTest, AutoCheckpointOnRoll) {
     ASSERT_TRUE(r);
     auto hits = (*r)->search_text("lemon", 500);
     ASSERT_TRUE(hits);
-    // 临时诊断
-    for (const char* probe : {"n0", "n50", "n100", "n200", "n300", "n399"}) {
-        auto p = (*r)->search_text(probe, 5);
-        fprintf(stderr, "DBG probe %s -> %zu\n", probe,
-                p ? p->hits.size() : size_t(999));
-    }
-    EXPECT_EQ(hits->hits.size(), 400u);
+    EXPECT_EQ(hits->hits.size(), 400u)
+        << "ckpt 覆盖区 + fold 尾部重放应恢复全部文档（水位成对性）";
     (*r)->close();
-    // 临时诊断：保留 img 现场
-    fprintf(stderr, "DBG img=%s\n", img.string().c_str());
+    std::error_code ec;
+    fs::remove_all(img, ec);
 }
 
 // S14-1：默认关闭（auto_checkpoint_min_docs=0）——即使频繁 roll 也零行为

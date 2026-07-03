@@ -850,23 +850,43 @@ void Cask::close() noexcept {
 
 // A4:写 keydir 段快照(best-effort,设计 doc/recovery-unified-checkpoint-design-zh.md 附录 A)。
 // 水位 = 各 data 文件当前磁盘大小,**先于** dump 捕获(尾部回放重叠区
-// 幂等,方向安全);调用点都在写者静止处(close / merge 末尾)。
-void Cask::write_keydir_snapshot() noexcept {
-    if (!keydir_) return;
+// 幂等,方向安全)。
+// S14-1：水位捕获与快照写入拆分。无参版本 = 捕获+写入（调用点须在写者
+// 静止处：close / merge 末尾 / open 恢复①）；RunFn 路径（checkpoint()/
+// 自动 ckpt）在**提交时刻**捕获水位、reducer 执行时刻写快照本体——执行时
+// 取水位会被并发写者推进，反转「keydir_covered ≤ search_covered」保存序
+// 不变量（路线 A §4），fold 从超前的字节水位起跳、search 丢失
+// [ckpt_wm, 快照时刻) 区间（回归测试 AutoCheckpointOnRoll 抓过此反转）。
+// 快照 entries 比水位新无害：fold 尾部重放对 keydir 幂等覆盖。
+std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>>
+Cask::collect_snapshot_watermarks() const noexcept {
+    if (!keydir_) return std::nullopt;
     auto entries = fileops::scan_dir(dirname_);
-    if (!entries) return;
+    if (!entries) return std::nullopt;
     std::vector<std::pair<std::uint32_t, std::uint64_t>> wms;
     wms.reserve(entries->size());
     for (const auto& e : *entries) {
         std::error_code ec;
         const auto sz = std::filesystem::file_size(e.data_path, ec);
-        if (ec) return;  // 文件态不稳定,放弃本次快照
+        if (ec) return std::nullopt;  // 文件态不稳定,放弃本次快照
         wms.emplace_back(static_cast<std::uint32_t>(e.tstamp), sz);
     }
+    return wms;
+}
+
+void Cask::write_keydir_snapshot(
+    const std::vector<std::pair<std::uint32_t, std::uint64_t>>& wms) noexcept {
+    if (!keydir_) return;
     if (!keydir_->save_snapshot(dirname_ + "/" + kKeydirSnapName, wms)) {
         // best-effort：失败下次 open 走全量 fold（仅慢一次启动）。S13-D7 上报。
         log_warn("keydir snapshot save failed (will rebuild on next open)");
     }
+}
+
+void Cask::write_keydir_snapshot() noexcept {
+    auto wms = collect_snapshot_watermarks();
+    if (!wms) return;
+    write_keydir_snapshot(*wms);
 }
 
 // T3: 提交索引任务到 IndexPool。背压由有界队列提供：队列满（10240）时
@@ -2552,12 +2572,15 @@ std::expected<void, CaskFault> Cask::checkpoint() {
         // S14-1：keydir 快照也移进 RunFn——所有 ckpt 文件写统一到 reducer
         // 单线程，与自动 checkpoint 的 RunFn 天然串行（消除 .tmp 并发写
         // 窗口，且不能在此持 ckpt_mu_ 等 reducer——会与手动调用互锁）。
-        // 成对性保持：RunFn 内先快照（较早时刻）后 search.ckpt。
+        // 成对性：字节水位在**提交时刻**捕获（wms 先于 wm，保证水位覆盖的
+        // 记录 ord < wm ≤ search 覆盖）；RunFn 执行时刻取水位会被并发写者
+        // 推进而反转不变量（见 collect_snapshot_watermarks 注释）。
         t.fn  = [this, search_ckpt, done,
+                 wms = collect_snapshot_watermarks(),
                  wm = keydir_->peek_next_ord()] {
             int result = 2;
             try {
-                write_keydir_snapshot();  // best-effort（失败内部已上报）
+                if (wms) write_keydir_snapshot(*wms);  // best-effort
                 result = search_->save_search_ckpt(search_ckpt, wm) ? 1 : 2;
             } catch (...) {
                 // result 保持 2；异常本体由 reducer 的 error_fn 计数上报。
@@ -2613,16 +2636,13 @@ void Cask::maybe_submit_auto_checkpoint() {
     IndexTask t;
     t.op  = IndexOp::RunFn;
     t.ord = keydir_->alloc_ord();
-    fprintf(stderr, "DBG auto-ckpt submit ord=%llu wm=%llu\n",
-            (unsigned long long)t.ord,
-            (unsigned long long)keydir_->peek_next_ord());
-    t.fn  = [this, wm = keydir_->peek_next_ord()] {
-        fprintf(stderr, "DBG auto-ckpt run wm=%llu live=%llu\n",
-                (unsigned long long)wm,
-                (unsigned long long)search_->index_info().live_docs);
+    // 成对性：字节水位在提交时刻捕获（wms 先于 wm），快照本体在 reducer 写
+    // （同 checkpoint()，见 collect_snapshot_watermarks 注释）。
+    t.fn  = [this,
+             wms = collect_snapshot_watermarks(),
+             wm = keydir_->peek_next_ord()] {
         try {
-            // 成对顺序（同 checkpoint()）：先 keydir 快照，后 search.ckpt。
-            write_keydir_snapshot();
+            if (wms) write_keydir_snapshot(*wms);
             if (search_->save_search_ckpt(dirname_ + "/" + kSearchCkptName,
                                           wm)) {
                 last_ckpt_ord_.store(wm, std::memory_order_relaxed);
