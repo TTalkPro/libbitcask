@@ -23,6 +23,7 @@
 
 #include "bitcask/plugin_api.hpp"
 #include "bitcask/thread_pool.hpp"
+#include "bitcask/index.hpp"  // S16-2：宿主 docmap（index::Index 身份/存活/meta）
 
 namespace {
 
@@ -36,6 +37,9 @@ using bitcask::PutEntry;
 using bitcask::ReorderEntry;
 using bitcask::RunFnEntry;
 using bitcask::SkipEntry;
+using bitcask::index::DocLoc;
+using bitcask::index::DocSlot;
+using bitcask::index::Index;
 
 struct MockPrepared final : bp::Prepared {
     std::uint64_t ord = 0;
@@ -133,6 +137,42 @@ static IndexTask mk_fields_task(std::string_view key, std::uint64_t ord,
     auto t = IndexTask::make(IndexOp::Add, key, ord, text, 1, 0, 0, 0, 0);
     t.fields.assign({{"body", text}});
     return t;
+}
+
+// S16-2：复刻 cask.cpp reduce 闭包——宿主先 apply DocMap（put_doc/set_meta、
+// 捕 prior_ord + remove），再广播。守护「DocMap 恒在所有插件之前」不变量。
+static bitcask::ReduceFn host_reduce_docmap(std::vector<bp::CaskPlugin*> plugins,
+                                             Index& docmap) {
+    return [plugins = std::move(plugins), &docmap](ReorderEntry& entry) {
+        std::visit([&](auto& e) {
+            using T = std::decay_t<decltype(e)>;
+            if constexpr (std::is_same_v<T, PutEntry>) {
+                const auto& t = e.task;
+                docmap.put_doc(t.key(), t.ord,
+                                DocSlot{DocLoc{t.file_id, t.offset, t.total_sz},
+                                        t.tstamp, /*doc_len=*/0});
+                if (!t.meta.empty()) docmap.set_meta(t.ord, t.meta);
+                const bp::DocView  doc = bitcask::make_doc_view(t);
+                const bp::PutEvent ev  = bitcask::make_put_event(t, &doc);
+                for (std::size_t i = 0; i < plugins.size(); ++i) {
+                    plugins[i]->on_put(ev, i < e.preps.size()
+                                              ? std::move(e.preps[i])
+                                              : bp::PreparedPtr{});
+                }
+            } else if constexpr (std::is_same_v<T, DeleteEntry>) {
+                std::uint64_t prior = bp::kNoPriorOrd;
+                if (auto slot = docmap.get(e.key)) {
+                    prior = slot->ord;
+                    docmap.remove(e.key, e.ord);
+                }
+                for (auto* p : plugins)
+                    p->on_delete(bp::DeleteEvent{e.ord, e.key, prior});
+            } else if constexpr (std::is_same_v<T, SkipEntry>) {
+            } else if constexpr (std::is_same_v<T, RunFnEntry>) {
+                if (e.fn) e.fn();
+            }
+        }, entry);
+    };
 }
 
 // 契约①②③④⑤：升序、注册序、prepare 过滤、配对移交、Skip/Delete 语义。
@@ -275,6 +315,155 @@ TEST(PluginContract, TwoLanesConcurrentNoRace) {
 
     pool.unregister_lib(l0);
     pool.unregister_lib(l1);
+    pool.stop();
+}
+
+// S16-2：观察型插件——on_put/on_delete 内查宿主 docmap 状态，记录顺序不变量
+// 快照（reducer 单写者上下文记录，主线程 flush 后读——无 race）。
+class ObservingPlugin final : public bp::CaskPlugin {
+public:
+    explicit ObservingPlugin(const Index* dm) : docmap_(dm) {}
+
+    std::string_view name() const override { return "observer"; }
+    bp::PluginStatus open(const bp::OpenContext&) override { return bp::PluginStatus::kOk; }
+    std::uint64_t watermark() const override { return 0; }
+    bp::PluginStatus close() override { return bp::PluginStatus::kOk; }
+
+    void on_put(const bp::PutEvent& e, bp::PreparedPtr) override {
+        PutObs o;
+        o.ord = e.ord;
+        o.docmap_live = docmap_->is_live(e.ord);
+        if (auto slot = docmap_->get(e.key)) {
+            o.docmap_has_key = true;
+            o.maps_to_this_ord = (slot->ord == e.ord);
+            o.loc_match = slot->loc.file_id == e.loc.file_id
+                       && slot->loc.offset  == e.loc.offset
+                       && slot->loc.total_sz== e.loc.total_sz;
+        }
+        o.meta_size = docmap_->meta_blob(e.ord).size();
+        puts_.push_back(o);
+    }
+
+    void on_delete(const bp::DeleteEvent& e) override {
+        DelObs o;
+        o.ord = e.ord;
+        o.prior_ord = e.prior_ord;
+        o.key_already_removed = !docmap_->get(e.key).has_value();
+        dels_.push_back(o);
+    }
+
+    bp::FlushResult flush(const bp::FlushRequest&) override {
+        return {bp::PluginStatus::kOk, 0, 0};
+    }
+
+    struct PutObs {
+        std::uint64_t ord = 0;
+        bool docmap_live = false;
+        bool docmap_has_key = false;
+        bool maps_to_this_ord = false;
+        bool loc_match = false;
+        std::size_t meta_size = 0;
+    };
+    struct DelObs {
+        std::uint64_t ord = 0;
+        std::uint64_t prior_ord = bp::kNoPriorOrd;
+        bool key_already_removed = false;
+    };
+
+    const Index* docmap_;
+    std::vector<PutObs> puts_;
+    std::vector<DelObs> dels_;
+};
+
+// S16-2 契约⑨：宿主 reduce 先 apply DocMap（身份/存活/meta），再广播给插件。
+// 插件 on_put 内查 docmap 必已有本 ord 的 live slot；on_delete 时 prior_ord 已
+// 捕获且 key 已 remove。复刻 cask.cpp reduce 闭包（host_reduce_docmap），
+// 守护「DocMap 恒在所有插件之前」顺序不变量。
+TEST(PluginContract, DocmapVisibleBeforePluginOnPut) {
+    IndexPool pool(2, 10240);
+    Index docmap;
+    ObservingPlugin obs(&docmap);
+    std::vector<bp::CaskPlugin*> plugins{&obs};
+    pool.start(host_map(plugins), host_reduce_docmap(plugins, docmap), [] {});
+
+    pool.submit(mk_fields_task("k0", 0, "alpha beta"));
+    pool.submit(IndexTask::make(IndexOp::Add, "k1", 1, "gamma", 7, 99, 64, 5, 0));
+    {
+        auto t = IndexTask::make(IndexOp::Add, "k2", 4, "delta epsilon", 2, 200, 48, 6, 0);
+        t.meta = {std::byte{0xAB}, std::byte{0xCD}};
+        pool.submit(std::move(t));
+    }
+    pool.submit(IndexTask::make(IndexOp::Delete, "k0", 2, "", 0, 0, 0, 0, 0));
+    pool.submit(IndexTask::make(IndexOp::Delete, "nope", 3, "", 0, 0, 0, 0, 0));
+    pool.submit(IndexTask::make(IndexOp::Delete, "k2", 5, "", 0, 0, 0, 0, 0));
+    pool.flush();
+
+    ASSERT_EQ(obs.puts_.size(), 3u);
+    EXPECT_EQ(obs.puts_[0].ord, 0u);
+    EXPECT_TRUE(obs.puts_[0].docmap_live);
+    EXPECT_TRUE(obs.puts_[0].docmap_has_key);
+    EXPECT_TRUE(obs.puts_[0].maps_to_this_ord);
+    EXPECT_TRUE(obs.puts_[0].loc_match);
+
+    EXPECT_EQ(obs.puts_[1].ord, 1u);
+    EXPECT_TRUE(obs.puts_[1].docmap_live);
+    EXPECT_TRUE(obs.puts_[1].maps_to_this_ord);
+    EXPECT_TRUE(obs.puts_[1].loc_match);
+
+    EXPECT_EQ(obs.puts_[2].ord, 4u);
+    EXPECT_TRUE(obs.puts_[2].docmap_live);
+    EXPECT_TRUE(obs.puts_[2].maps_to_this_ord);
+    EXPECT_EQ(obs.puts_[2].meta_size, 2u);
+
+    ASSERT_EQ(obs.dels_.size(), 3u);
+    EXPECT_EQ(obs.dels_[0].ord, 2u);
+    EXPECT_EQ(obs.dels_[0].prior_ord, 0u);
+    EXPECT_TRUE(obs.dels_[0].key_already_removed);
+
+    EXPECT_EQ(obs.dels_[1].ord, 3u);
+    EXPECT_EQ(obs.dels_[1].prior_ord, bp::kNoPriorOrd);
+
+    EXPECT_EQ(obs.dels_[2].ord, 5u);
+    EXPECT_EQ(obs.dels_[2].prior_ord, 4u);
+    EXPECT_TRUE(obs.dels_[2].key_already_removed);
+
+    pool.stop();
+}
+
+// S16-2 契约⑩：DeleteEvent.prior_ord 反映删除时刻 key 的**当前**（最新版本）
+// ord——覆盖写后 prior_ord = 最新 ord，非原始 ord；不存在 key = kNoPriorOrd。
+TEST(PluginContract, DeleteEventPriorOrdReflectsLatestVersion) {
+    IndexPool pool(2, 10240);
+    Index docmap;
+    ObservingPlugin obs(&docmap);
+    std::vector<bp::CaskPlugin*> plugins{&obs};
+    pool.start(host_map(plugins), host_reduce_docmap(plugins, docmap), [] {});
+
+    pool.submit(mk_fields_task("k0", 0, "v0"));
+    pool.submit(mk_fields_task("k0", 1, "v1 overwritten"));
+    pool.submit(IndexTask::make(IndexOp::Delete, "k0", 2, "", 0, 0, 0, 0, 0));
+    pool.submit(mk_fields_task("k1", 3, "single"));
+    pool.submit(IndexTask::make(IndexOp::Delete, "k1", 4, "", 0, 0, 0, 0, 0));
+    pool.submit(IndexTask::make(IndexOp::Delete, "nope", 5, "", 0, 0, 0, 0, 0));
+    pool.flush();
+
+    ASSERT_EQ(obs.puts_.size(), 3u);
+    EXPECT_EQ(obs.puts_[0].ord, 0u);
+    EXPECT_EQ(obs.puts_[1].ord, 1u);
+    EXPECT_TRUE(obs.puts_[1].docmap_live);
+    EXPECT_TRUE(obs.puts_[1].maps_to_this_ord);
+
+    ASSERT_EQ(obs.dels_.size(), 3u);
+    EXPECT_EQ(obs.dels_[0].ord, 2u);
+    EXPECT_EQ(obs.dels_[0].prior_ord, 1u) << "覆盖写后 prior_ord 应为最新 ord";
+    EXPECT_TRUE(obs.dels_[0].key_already_removed);
+
+    EXPECT_EQ(obs.dels_[1].ord, 4u);
+    EXPECT_EQ(obs.dels_[1].prior_ord, 3u);
+
+    EXPECT_EQ(obs.dels_[2].ord, 5u);
+    EXPECT_EQ(obs.dels_[2].prior_ord, bp::kNoPriorOrd);
+
     pool.stop();
 }
 

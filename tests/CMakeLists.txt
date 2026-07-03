@@ -262,12 +262,14 @@ target_link_libraries(bitcask_plugin_api_test PRIVATE
 )
 gtest_discover_tests(bitcask_plugin_api_test ${_bitcask_test_props})
 
-# S15-4：插件契约 Mock 测试——不链 search（thread_pool.hpp 已去搜索化，
-# 只需 plugin_api + TBB），守护 IndexPool 分发通路对 CaskPlugin 的契约。
+# S15-4：插件契约 Mock 测试——不链 search（thread_pool.hpp 已去搜索化），
+# 守护 IndexPool 分发通路对 CaskPlugin 的契约。S16-2 增链 bitcask_index
+# （docmap 宿主服务）以验证「宿主先 apply DocMap、再广播插件」顺序不变量。
 add_executable(bitcask_plugin_contract_test plugin_contract_test.cpp)
 target_link_libraries(bitcask_plugin_contract_test PRIVATE
     GTest::gtest_main
     bitcask_plugin_api
+    bitcask_index
     bitcask_warnings
     bitcask_sanitizers
     TBB::tbb
