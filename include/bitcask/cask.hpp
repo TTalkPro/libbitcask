@@ -778,6 +778,17 @@ private:
     // 消费 pending 标记，增量达阈值则 fire-and-forget 提交 ckpt RunFn。
     void maybe_submit_auto_checkpoint();
 
+    // S14-7：成对保存——search.ckpt（delta 或 base）+ keydir 推进的统一
+    // 入口。delta 路径把 keydir 元数据（水位/标量/fstats，caller 于提交
+    // 时刻构建）内联进 delta 文件（**同文件原子成对**，无写序窗口，且
+    // 不再每次全量写 kv.keydir.ckpt——它曾是 delta 时代 per-save I/O 的
+    // 大头）；base 路径照旧全量快照（先 ckpt 后快照）。
+    bool save_search_ckpt_paired(
+        const std::string& path, std::uint64_t wm,
+        const std::optional<std::vector<
+            std::pair<std::uint32_t, std::uint64_t>>>& wms,
+        const std::vector<std::byte>& keydir_delta);
+
     std::atomic<std::uint32_t> writes_in_flight_{0};
     struct WriteOpGate {
         Cask* cask;

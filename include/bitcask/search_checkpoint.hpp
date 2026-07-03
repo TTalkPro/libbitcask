@@ -42,6 +42,7 @@ enum class CkptSectionType : std::uint16_t {
     kDeltaInfo        = 9,   // base_gen u64 | prev_wm u64 | seq u32（链校验）
     kDocmapDelta      = 10,  // 窗口 live 行 + 删除日志（按 ord 交错重放）
     kHnswDelta        = 11,  // 插入日志：count u64; 每条 ord u64 | f32[dim]
+    kKeydirDelta      = 12,  // S14-7：keydir 元数据（"BKMD"：水位/标量/fstats）
 };
 
 // 写入用:caller 持有 payload 字节。

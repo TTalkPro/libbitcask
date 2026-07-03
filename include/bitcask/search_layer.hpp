@@ -355,6 +355,24 @@ public:
     // ---- 恢复：从磁盘 record 重放墓碑 ----
     void recover_tomb(std::string_view key, std::uint64_t ord);
 
+    // S14-7：delta 链重放钩子——每应用一个 delta 文件，把解析好的 docmap
+    // 行/删除 + kKeydirDelta 段原始字节回调给上层（Cask 用它同步推进
+    // keydir：行 → put、删除 → remove_if_older、meta → apply_meta_delta）。
+    // SearchLayer 不依赖 KeyDir，只透传；keydir_meta 可为空（该 delta 无
+    // 元数据段 → 字节水位不推进，方向安全）。
+    struct DeltaDocRow {
+        std::uint64_t  ord = 0;
+        std::string    ext;
+        index::DocSlot slot;
+    };
+    struct DeltaRemoval {
+        std::uint64_t tomb = 0;
+        std::string   key;
+    };
+    using DeltaReplayHook = std::function<void(
+        const std::vector<DeltaDocRow>&, const std::vector<DeltaRemoval>&,
+        std::span<const std::byte> keydir_meta)>;
+
     // P14e:docmap 序列化到/自字节缓冲(供 search.ckpt 分段)。
     // serialize 返回 false 仅当某 ext 超 64KiB;
     // deserialize 校验失败返回 nullopt,成功返回 covers。
@@ -368,8 +386,10 @@ public:
     // hnsw）写入单个 search.ckpt，并做 .prev 代际回退。watermark = 保存时
     // 的 next_ord（覆盖上界）。caller 须先排干 IndexPool（写者静止点）。
     // 返回 false = 序列化或写入失败（best-effort，caller 不阻断）。
-    [[nodiscard]] bool save_search_ckpt(std::string_view path,
-                                        std::uint64_t watermark);
+    [[nodiscard]] bool save_search_ckpt(
+        std::string_view path, std::uint64_t watermark,
+        std::span<const std::byte> keydir_delta = {},
+        bool* wrote_base = nullptr);
 
     // load_search_ckpt 结果。
     struct CkptLoadResult {
@@ -385,7 +405,9 @@ public:
     // 读 search.ckpt → 逐段校验 CRC → 分发到各反序列化器。
     // 结构损坏 → 尝试 .prev；都失败 → loaded=false（全量 fold 兜底）。
     // 段 CRC 失败 → 该段内存为空（fold 时重建），其余段照常载入。
-    [[nodiscard]] CkptLoadResult load_search_ckpt(std::string_view path);
+    // S14-7：hook 见 DeltaReplayHook；空 = 不透传（SearchLayer 单元测试）。
+    [[nodiscard]] CkptLoadResult load_search_ckpt(
+        std::string_view path, const DeltaReplayHook& hook = {});
 
     // S14-4：强制下次 save 写全量 base（链坍缩）。close 前调用——干净关闭
     // 收敛为单一 base 文件：.prev 代际随之刷新，链不跨干净重启累积
@@ -580,9 +602,11 @@ private:
 
     // delta 保存/应用（save_search_ckpt / load_search_ckpt 内部）。
     [[nodiscard]] bool save_delta_ckpt(const std::string& base_path,
-                                       std::uint64_t watermark);
+                                       std::uint64_t watermark,
+                                       std::span<const std::byte> keydir_delta);
     [[nodiscard]] bool apply_delta_file(
-        const std::vector<bitcask::search::LoadedSection>& sections);
+        const std::vector<bitcask::search::LoadedSection>& sections,
+        const DeltaReplayHook& hook);
 };
 
 // S7-4: 把 [0, n) 并发跑在进程级共享「有界 Search 池」上（inter-query 并发）。

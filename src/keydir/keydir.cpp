@@ -1140,6 +1140,142 @@ struct SnapCursor {
 
 }  // namespace
 
+// ---- S14-7：keydir 元数据 delta ------------------------------------------
+namespace {
+constexpr std::uint32_t kMetaDeltaMagic   = 0x444D4B42;  // "BKMD"
+constexpr std::uint32_t kMetaDeltaVersion = 1;
+inline void md_put32(std::vector<std::byte>& b, std::uint32_t v) {
+    const auto* p = reinterpret_cast<const std::byte*>(&v);
+    b.insert(b.end(), p, p + 4);
+}
+inline void md_put64(std::vector<std::byte>& b, std::uint64_t v) {
+    const auto* p = reinterpret_cast<const std::byte*>(&v);
+    b.insert(b.end(), p, p + 8);
+}
+}  // namespace
+
+void KeyDir::serialize_meta_delta(
+    std::vector<std::byte>& out,
+    const std::vector<std::pair<std::uint32_t, std::uint64_t>>& watermarks)
+    const {
+    md_put32(out, kMetaDeltaMagic);
+    md_put32(out, kMetaDeltaVersion);
+    md_put64(out, next_ord_.load(std::memory_order_relaxed));
+    md_put64(out, epoch_.load(std::memory_order_relaxed));
+    md_put32(out, biggest_file_id_.load(std::memory_order_relaxed));
+
+    // fstats（absolute 快照；present 槽逐条）。
+    const std::size_t fsz = fstats_size_.load(std::memory_order_acquire);
+    std::uint32_t fstats_n = 0;
+    for (std::size_t i = 0; i < fsz; ++i) {
+        if (fstats_slot(i).present.load(std::memory_order_relaxed)) ++fstats_n;
+    }
+    md_put32(out, fstats_n);
+    for (std::size_t i = 0; i < fsz; ++i) {
+        const auto& f = fstats_slot(i);
+        if (!f.present.load(std::memory_order_relaxed)) continue;
+        md_put32(out, static_cast<std::uint32_t>(i));
+        md_put64(out, f.live_keys.load(std::memory_order_relaxed));
+        md_put64(out, f.total_keys.load(std::memory_order_relaxed));
+        md_put64(out, f.live_bytes.load(std::memory_order_relaxed));
+        md_put64(out, f.total_bytes.load(std::memory_order_relaxed));
+        md_put32(out, f.oldest_tstamp.load(std::memory_order_relaxed));
+        md_put32(out, f.newest_tstamp.load(std::memory_order_relaxed));
+        md_put64(out, f.expiration_epoch.load(std::memory_order_relaxed));
+    }
+
+    md_put32(out, static_cast<std::uint32_t>(watermarks.size()));
+    for (const auto& [fid, off] : watermarks) {
+        md_put32(out, fid);
+        md_put64(out, off);
+    }
+}
+
+std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>>
+KeyDir::apply_meta_delta(std::span<const std::byte> bytes) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(bytes.data());
+    const auto* end = p + bytes.size();
+    auto need = [&](std::size_t n) {
+        return static_cast<std::size_t>(end - p) >= n;
+    };
+    auto rd32 = [&](std::uint32_t& v) {
+        if (!need(4)) return false;
+        std::memcpy(&v, p, 4);
+        p += 4;
+        return true;
+    };
+    auto rd64 = [&](std::uint64_t& v) {
+        if (!need(8)) return false;
+        std::memcpy(&v, p, 8);
+        p += 8;
+        return true;
+    };
+
+    std::uint32_t magic = 0, ver = 0, biggest = 0, fstats_n = 0;
+    std::uint64_t next_ord = 0, epoch = 0;
+    if (!rd32(magic) || magic != kMetaDeltaMagic) return std::nullopt;
+    if (!rd32(ver) || ver != kMetaDeltaVersion) return std::nullopt;
+    if (!rd64(next_ord) || !rd64(epoch) || !rd32(biggest) ||
+        !rd32(fstats_n) || fstats_n > (1u << 24)) {
+        return std::nullopt;
+    }
+
+    // 单调标量：取 max（链按序应用，max 是保险带）。
+    advance_ord(next_ord);
+    {
+        std::uint64_t cur = epoch_.load(std::memory_order_relaxed);
+        while (cur < epoch && !epoch_.compare_exchange_weak(
+                                  cur, epoch, std::memory_order_relaxed)) {
+        }
+    }
+    increment_file_id_at_least(biggest);
+
+    for (std::uint32_t i = 0; i < fstats_n; ++i) {
+        std::uint32_t fid = 0, oldest = 0, newest = 0;
+        std::uint64_t lk = 0, tk = 0, lb = 0, tb = 0, ee = 0;
+        if (!rd32(fid) || fid > (1u << 24) || !rd64(lk) || !rd64(tk) ||
+            !rd64(lb) || !rd64(tb) || !rd32(oldest) || !rd32(newest) ||
+            !rd64(ee)) {
+            return std::nullopt;
+        }
+        {
+            std::lock_guard<std::mutex> g(fstats_grow_mu_);
+            grow_fstats_locked(static_cast<std::size_t>(fid) + 1);
+        }
+        auto& slot = fstats_slot(fid);
+        slot.live_keys.store(lk, std::memory_order_relaxed);
+        slot.total_keys.store(tk, std::memory_order_relaxed);
+        slot.live_bytes.store(lb, std::memory_order_relaxed);
+        slot.total_bytes.store(tb, std::memory_order_relaxed);
+        slot.oldest_tstamp.store(oldest, std::memory_order_relaxed);
+        slot.newest_tstamp.store(newest, std::memory_order_relaxed);
+        slot.expiration_epoch.store(ee, std::memory_order_relaxed);
+        slot.present.store(1, std::memory_order_relaxed);
+    }
+
+    std::uint32_t wm_n = 0;
+    if (!rd32(wm_n) || wm_n > (1u << 24)) return std::nullopt;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> wms;
+    wms.reserve(wm_n);
+    for (std::uint32_t i = 0; i < wm_n; ++i) {
+        std::uint32_t fid = 0;
+        std::uint64_t off = 0;
+        if (!rd32(fid) || !rd64(off)) return std::nullopt;
+        wms.emplace_back(fid, off);
+    }
+    if (p != end) return std::nullopt;
+    return wms;
+}
+
+bool KeyDir::remove_if_older(std::string_view key, std::uint64_t tomb_ord) {
+    {
+        auto e = get(key);
+        if (!e || e->ord >= tomb_ord) return false;
+    }
+    // 链重放在 open 单线程上下文（无 fold/并发写者），get→remove 无 TOCTOU。
+    return remove(key, /*remove_time*/ 0);
+}
+
 bool KeyDir::save_snapshot(
     std::string_view path,
     const std::vector<std::pair<std::uint32_t, std::uint64_t>>& watermarks) const {

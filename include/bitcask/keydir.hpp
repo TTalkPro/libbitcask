@@ -317,6 +317,28 @@ public:
     // dump 当前内存态 + 调用方给的 per-file 字节水位。有活跃 fold
     // (MultiEntry 可能存在)时拒绝并返回 false(快照是纯优化)。
     // 线程安全: 是(写者闸门屏障 + meta unique;屏障期间读者照常并发)。
+    // ---- S14-7：keydir 元数据 delta（"BKMD" v1）----
+    // 增量 checkpoint（search.ckpt.d<seq> 的 kKeydirDelta 段）只携带小件：
+    // per-file 字节水位 + 单调标量（next_ord/epoch/biggest_file_id）+
+    // fstats（absolute，advisory 精度——提交时刻快照，微观并发漂移可接受，
+    // merge/close 的全量快照定期校准）。**不含 entries 与 key 计数**：
+    // entries 由链的 docmap 行/删除重放推进（put/remove 原生维护
+    // key_count_/key_bytes_，精确）。
+    void serialize_meta_delta(
+        std::vector<std::byte>& out,
+        const std::vector<std::pair<std::uint32_t, std::uint64_t>>& watermarks)
+        const;
+    // 应用元数据 delta：标量取 max（单调）、fstats 绝对覆盖；返回其中的
+    // 字节水位（caller 用链尾水位驱动 fold_start）。解析失败返回 nullopt。
+    [[nodiscard]] std::optional<
+        std::vector<std::pair<std::uint32_t, std::uint64_t>>>
+    apply_meta_delta(std::span<const std::byte> bytes);
+
+    // S14-7：ord 守卫删除——仅当当前 entry 的 ord < tomb_ord 才删除。
+    // 链重放（delta 删除日志）用：顺序无关（「删后重写」的新行 ord >
+    // tomb_ord，无论先后应用都不误杀）。返回是否实际删除。
+    bool remove_if_older(std::string_view key, std::uint64_t tomb_ord);
+
     [[nodiscard]] bool save_snapshot(
         std::string_view path,
         const std::vector<std::pair<std::uint32_t, std::uint64_t>>& watermarks) const;

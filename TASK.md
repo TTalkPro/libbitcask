@@ -1801,11 +1801,27 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - **已知后续**：每次 delta 保存仍全量写 kv.keydir.ckpt（O(live keys)，
     10M 库 ~0.5–1GB）——现在它成了 per-save I/O 的大头；keydir 快照增量化
     另立任务（S14-7 候选）。
-- [ ] **S14-5【P2·M】HNSW 邻接段低频保存 + 载入尾部 insert 追平**
-  - HNSW 违反 append-only 前提（插入改写旧节点邻居表）→ 无不可变旧段。混频策略：
-    邻接段每 K 次 ckpt（或仅 merge 点）保存；恢复时图水位 wm_g < 向量水位 wm →
-    载旧图 + [wm_g, wm) 逐条 insert 追平（fold 尾部重放既有形态，per-section
-    水位自门已支持段间不一致）。K 间隔的增量插入分钟内，替代小时级全量重建。
+- [x] **S14-5【P2·M】HNSW 邻接低频保存 + 追平（经 S14-4 重估后收敛）** — 已完成（2026-07-03）
+  - **重估结论：原方案两个目标已被 S14-4 链架构天然实现**——
+    「邻接段低频保存」= delta 保存完全不序列化 BVH2，图只在 base 点
+    （merge/close/rebase）落盘；「载入尾部追平」= hnsw delta 插入日志重放
+    （带向量内联 + insert ord 水位自门），比原设想的「从 .vec 追平」更完备
+    （.vec 无 ord 映射，本就追不了）。原「每 K 次 ckpt 存图」的混频水位
+    机制不再需要。
+  - **本轮落地：链长上限自动 rebase**（S14-4 的遗留缺口）——不 merge 的纯
+    追加负载（无删除 ⇒ needs_merge 不触发）链随写入量线性堆积、永不回收，
+    向量库尤甚（每 delta 内联 f32）。`SearchLayerConfig::max_delta_chain`
+    （默认 64，0=不设限）：链达上限 → 下次 save 强制全量 base、链坍缩回收。
+    上限权衡已注释（小 → base 重序列化频繁；大 → 恢复重放长 + 磁盘冗余）。
+  - 测试：`CheckpointDeltaChainLengthBound`（上限 2：d1/d2 → 第 4 次 ckpt
+    强制 base + 链清扫 + .prev 刷新 + 重新起链 + 崩溃镜像重开 50/50）。
+    clang 513/513、TSan 511/511。
+  - **int8 码字拆分（S14-2 递延）→ 另立 S14-8 候选**：qcodes 逐节点嵌在
+    BVH2 内，拆出 append-only 文件（qc8，S14-2 的 .vec 前缀契约同构）可
+    减半非 rebuild 的 base 保存（close / 链满 rebase）的 hnsw 序列化；但
+    merge 的 rebuild 重映射 node id 后必须全量重写 → 收益面 = 纯追加负载的
+    链满 rebase 周期。BVH2 v3 格式手术 + 双模式（含 inmem_int8）兼容，
+    等链满 rebase 的真实频率数据出来再定 ROI。
 
 - [x] **S14-6【P0·M·BUG】fold 增量重放丢弃命名字段索引（bm25.fields）—— 崩溃恢复正确性** — 已完成（2026-07-03）
   - **现象**：最后一次 search.ckpt 之后、crash 之前写入的多字段文档，重启 fold 重放后其
@@ -1843,7 +1859,32 @@ W4 ✅（parallel_scan 并行全表扫描）。
     ckpt 健康 + 增量窗口），`search_fields` 与 catch-all `search_text` 全命中；
     **反向验证**：临时禁用修复该测试立即失败。clang 511/511、TSan 509/509。
 
-> **建议执行顺序**：S14-1 ✅ → S14-2 ✅（int8 码字并入 S14-5）→ S14-3 ✅ →
-> S14-6 ✅ → S14-4 ✅（含成对写序修复 + .prev 加固）→ S14-5（图的混频收尾）→
-> S14-7 候选（keydir 快照增量化——delta 时代 per-save I/O 的新大头）。每步独立可交付；S14-1 落地后 ②③ 即形成完整的「手动 + 自动」
+- [x] **S14-7【P1·L】keydir 快照增量化（delta 内联元数据 + 链重放推进）** — 已完成（2026-07-03）
+  - **核心洞察：搜索 delta 里已含 keydir delta 的主体**——docmap 行
+    (ord/key/file_id/offset/total_sz/tstamp) 恰是 keydir entry 全字段，
+    删除日志亦然。keydir 独缺的只有小件：字节水位 + 单调标量
+    （next_ord/epoch/biggest）+ fstats——全 KB 级。
+  - **保存**：delta 路径不再全量写 kv.keydir.ckpt（曾是 delta 时代 per-save
+    I/O 大头，~0.5–1GB @10M）；delta 文件新增 `kKeydirDelta` 段（"BKMD"，
+    提交时刻捕获）——搜索与 keydir 推进**同文件原子成对**，增量路径的写序
+    窗口彻底消失。base 路径照旧全量快照。全部保存点统一收口到
+    `Cask::save_search_ckpt_paired`（写序不变量集中一处）。
+  - **载入**：重排为 keydir base 快照**先**载 → 链重放经 `DeltaReplayHook`
+    同步推进 keydir（行 → LWW put；删除 → 新增 `KeyDir::remove_if_older`
+    ——ord 守卫使「删后重写」顺序无关）→ 字节水位取链尾
+    （`apply_meta_delta` 返回）。SearchLayer 不依赖 KeyDir：只透传解析
+    结果，分层不破。
+  - **计数策略（推敲后）**：key_count/key_bytes **不入 delta**——行/删除
+    重放让 keydir 原生 ++/-- ，精确且免提交时刻的并发漂移；fstats 绝对
+    覆盖（advisory 精度，merge/close 全量快照定期校准）；标量取 max 单调。
+  - 测试：`CheckpointDeltaChainDeletesAndOverwrites` 扩展——delta 保存
+    kv.keydir.ckpt mtime 不变 + 重开后 KV get() 全语义断言（跨窗删除无
+    僵尸/删后重写不误杀/窗口新增可读）；**反向验证**：断开链推进钩子，
+    僵尸断言立即抓到。clang 513/513、TSan 511/511。
+
+> **建议执行顺序（全批完成）**：S14-1 ✅ → S14-2 ✅ → S14-3 ✅ → S14-6 ✅ →
+> S14-4 ✅（含成对写序修复 + .prev 加固）→ S14-5 ✅（重估收敛为链长上限）→
+> S14-7 ✅（keydir 增量化收口）。
+> **剩余候选**：S14-8 int8 码字拆分（见 S14-5 内 ROI 记录，等链满 rebase
+> 频率数据）。每步独立可交付；S14-1 落地后 ②③ 即形成完整的「手动 + 自动」
 > ckpt 节奏。

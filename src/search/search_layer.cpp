@@ -1274,7 +1274,8 @@ std::uint64_t get_u64_byte(const std::byte* p) {
 // 与 base 同在 reducer / 静止点上下文执行。失败返回 false（caller 落回
 // 全量 base）；成功推进链状态并清窗口日志/脏位。
 bool SearchLayer::save_delta_ckpt(const std::string& base_path,
-                                  std::uint64_t watermark) {
+                                  std::uint64_t watermark,
+                                  std::span<const std::byte> keydir_delta) {
     namespace sc = bitcask::search;
     const std::uint64_t from = ckpt_chain_wm_;
 
@@ -1372,6 +1373,14 @@ bool SearchLayer::save_delta_ckpt(const std::string& base_path,
         add_sec(sc::CkptSectionType::kDocmapDelta, std::move(b));
     }
 
+    // S14-7：keydir 元数据段（水位/标量/fstats，caller 于提交时刻构建）。
+    // 与搜索增量同文件原子成对——delta 路径不再单写 kv.keydir.ckpt，
+    // 成对写序的崩溃窗口在增量路径上彻底消失。
+    if (!keydir_delta.empty()) {
+        std::vector<std::byte> b(keydir_delta.begin(), keydir_delta.end());
+        add_sec(sc::CkptSectionType::kKeydirDelta, std::move(b));
+    }
+
     // hnsw delta：窗口插入日志（重放 insert，见 delta_vecs_ 注释）。
     if (!delta_vecs_.empty()) {
         std::vector<std::byte> b;
@@ -1407,11 +1416,16 @@ bool SearchLayer::save_delta_ckpt(const std::string& base_path,
 // 整个 delta 拒绝，不部分应用）；应用中途解析失败返回 false，caller 视链
 // 断裂、退全量 fold（自门保证多放安全）。
 bool SearchLayer::apply_delta_file(
-    const std::vector<bitcask::search::LoadedSection>& sections) {
+    const std::vector<bitcask::search::LoadedSection>& sections,
+    const DeltaReplayHook& hook) {
     namespace sc = bitcask::search;
     for (const auto& ls : sections) {
         if (!ls.crc_ok) return false;
     }
+    // S14-7：钩子素材——docmap 行/删除（解析一次共用）+ keydir 元数据段。
+    std::vector<DeltaDocRow> hook_rows;
+    std::vector<DeltaRemoval> hook_rems;
+    std::span<const std::byte> hook_meta;
     for (const auto& ls : sections) {
         switch (static_cast<sc::CkptSectionType>(ls.type)) {
         case sc::CkptSectionType::kBm25DefaultDelta: {
@@ -1460,23 +1474,14 @@ bool SearchLayer::apply_delta_file(
         case sc::CkptSectionType::kDocmapDelta: {
             const auto* p = ls.payload.data();
             const auto* end = p + ls.payload.size();
-            struct Row {
-                std::uint64_t ord;
-                std::string ext;
-                index::DocSlot slot;
-            };
-            struct Rem {
-                std::uint64_t tomb;
-                std::string key;
-            };
-            std::vector<Row> rows;
-            std::vector<Rem> rems;
+            std::vector<DeltaDocRow>& rows = hook_rows;
+            std::vector<DeltaRemoval>& rems = hook_rems;
             if (end - p < 8) return false;
             std::uint64_t rn = get_u64_byte(p); p += 8;
             rows.reserve(rn);
             for (std::uint64_t i = 0; i < rn; ++i) {
                 if (end - p < 10) return false;
-                Row r;
+                DeltaDocRow r;
                 r.ord = get_u64_byte(p); p += 8;
                 std::uint16_t klen = get_u16_byte(p); p += 2;
                 if (end - p < klen + 24) return false;
@@ -1494,7 +1499,7 @@ bool SearchLayer::apply_delta_file(
             rems.reserve(mn);
             for (std::uint64_t i = 0; i < mn; ++i) {
                 if (end - p < 10) return false;
-                Rem m;
+                DeltaRemoval m;
                 m.tomb = get_u64_byte(p); p += 8;
                 std::uint16_t klen = get_u16_byte(p); p += 2;
                 if (end - p < klen) return false;
@@ -1548,18 +1553,28 @@ bool SearchLayer::apply_delta_file(
             if (p != end) return false;
             break;
         }
+        case sc::CkptSectionType::kKeydirDelta:
+            hook_meta = std::span<const std::byte>(ls.payload.data(),
+                                                    ls.payload.size());
+            break;
         case sc::CkptSectionType::kDeltaInfo:
         default:
             break;  // info 由 caller 校验；未知段忽略（前向兼容）。
         }
     }
+    // S14-7：全部段应用成功后回调（行/删除已按本 delta 解析；顺序契约：
+    // caller 先应用行/删除、后应用 meta——meta 的水位声明覆盖 ≤ 行集）。
+    if (hook) hook(hook_rows, hook_rems, hook_meta);
     return true;
 }
 
 bool SearchLayer::save_search_ckpt(std::string_view path,
-                                   std::uint64_t watermark) {
+                                   std::uint64_t watermark,
+                                   std::span<const std::byte> keydir_delta,
+                                   bool* wrote_base) {
     namespace sc = bitcask::search;
     const std::string fp(path);
+    if (wrote_base) *wrote_base = true;  // delta 路径成功时改写
 
     // S14-4：增量路径——无 rebase 事件（compact/rebuild）且链状态有效时只
     // 写 delta 文件（search.ckpt.d<seq>），base 不重写：写 I/O 从 ∝ 索引
@@ -1572,7 +1587,10 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
     if (!chain_full &&
         !ckpt_rebase_needed_.load(std::memory_order_relaxed) &&
         watermark >= ckpt_chain_wm_) {
-        if (save_delta_ckpt(fp, watermark)) return true;
+        if (save_delta_ckpt(fp, watermark, keydir_delta)) {
+            if (wrote_base) *wrote_base = false;
+            return true;
+        }
     }
 
     std::vector<sc::CkptSection> secs;
@@ -1778,7 +1796,8 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
 }
 
 SearchLayer::CkptLoadResult
-SearchLayer::load_search_ckpt(std::string_view path) {
+SearchLayer::load_search_ckpt(std::string_view path,
+                              const DeltaReplayHook& hook) {
     namespace sc = bitcask::search;
     const std::string fp(path);
     const std::string prev = fp + ".prev";
@@ -1967,7 +1986,7 @@ SearchLayer::load_search_ckpt(std::string_view path) {
                     const std::uint32_t seq = get_u32_byte(q);
                     if (gen == chain_base_gen && prev == chain_coverage &&
                         seq == chain_next_seq) {
-                        applied = apply_delta_file(dc->sections);
+                        applied = apply_delta_file(dc->sections, hook);
                     }
                 }
             }

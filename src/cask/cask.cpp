@@ -819,8 +819,9 @@ void Cask::close() noexcept {
             // .prev 代际刷新、delta 链坍缩（链不跨干净重启累积）。
             search_->force_ckpt_rebase();
             const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
-            (void)search_->save_search_ckpt(search_ckpt,
-                                             keydir_->peek_next_ord());
+            (void)save_search_ckpt_paired(search_ckpt,
+                                          keydir_->peek_next_ord(),
+                                          collect_snapshot_watermarks(), {});
         }
         if (opts_.read_write) write_keydir_snapshot();
     } catch (...) {
@@ -1128,13 +1129,13 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         constexpr std::size_t kPostRecoveryCkptMinDocs = 1000;
         if (search_layer && recovered_docs >= kPostRecoveryCkptMinDocs &&
             opts_.read_write && !opts_.merge_only) {
-            // S14-4 写序：先 ckpt 后快照，成功才落快照（成对：快路径要求
-            // 两者同时健康且 search 覆盖 ≥ 快照水位）。
-            if (search_layer->save_search_ckpt(
-                    dirname_ + "/" + kSearchCkptName,
-                    keydir_->peek_next_ord())) {
-                write_keydir_snapshot();
-            } else {
+            // S14-7：经成对入口（fold 后链可能有效 → delta 回存更省）。
+            std::vector<std::byte> kd;
+            auto wms0 = collect_snapshot_watermarks();
+            if (wms0) keydir_->serialize_meta_delta(kd, *wms0);
+            if (!save_search_ckpt_paired(dirname_ + "/" + kSearchCkptName,
+                                         keydir_->peek_next_ord(), wms0,
+                                         kd)) {
                 log_warn("post-recovery search checkpoint save failed "
                          "(next open will re-fold)");
             }
@@ -1180,18 +1181,49 @@ std::expected<Cask::RecoverySnapshots, CaskFault>
 Cask::load_recovery_snapshots(search::SearchLayer* search_layer) {
     RecoverySnapshots recovery;
 
+    // S14-7：keydir base 快照**先**载（链的行/删除要应用在 base 之上）。
+    if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
+        recovery.snap_wms = std::move(*w);
+        recovery.snap_loaded = true;
+    }
+
     bool search_ok = false;
     if (search_layer) {
+        // S14-7：链重放钩子——每个 delta 的 docmap 行/删除同步推进 keydir
+        // （行 → LWW put；删除 → remove_if_older，ord 守卫顺序无关），
+        // kKeydirDelta 段推进标量/fstats/字节水位。行/删除先于 meta 应用
+        // （meta 的水位声明覆盖 ≤ 行集）。
+        search::SearchLayer::DeltaReplayHook hook =
+            [this, &recovery](
+                const std::vector<search::SearchLayer::DeltaDocRow>& rows,
+                const std::vector<search::SearchLayer::DeltaRemoval>& rems,
+                std::span<const std::byte> keydir_meta) {
+                for (const auto& r : rows) {
+                    keydir_->put(r.ext, r.slot.loc.file_id,
+                                 r.slot.loc.total_sz, r.slot.loc.offset,
+                                 r.slot.tstamp, /*now*/ 0,
+                                 /*newest*/ false, 0, 0, r.ord);
+                    keydir_->advance_ord(r.ord);
+                }
+                for (const auto& m : rems) {
+                    (void)keydir_->remove_if_older(m.key, m.tomb);
+                    keydir_->advance_ord(m.tomb);
+                }
+                if (!keydir_meta.empty()) {
+                    if (auto wms = keydir_->apply_meta_delta(keydir_meta)) {
+                        // 链尾水位驱动 fold_start（快照对里最新的一份）。
+                        recovery.snap_wms = std::move(*wms);
+                    }
+                }
+            };
         auto result = search_layer->load_search_ckpt(
-            dirname_ + "/" + kSearchCkptName);
+            dirname_ + "/" + kSearchCkptName,
+            recovery.snap_loaded ? hook
+                                 : search::SearchLayer::DeltaReplayHook{});
         // S14-4：.prev 回退不走字节水位快路径（keydir 快照可能与坏掉的
         // 新代成对、水位超前）——退全量 fold，自门保证只重建缺口。
         search_ok = result.loaded && result.all_segments_ok &&
                     !result.from_prev;
-    }
-    if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
-        recovery.snap_wms = std::move(*w);
-        recovery.snap_loaded = true;
     }
     // search.ckpt 不健康 → 退回全量 fold（snap_loaded=false 让 fold_start=0）。
     if (search_layer && !search_ok) {
@@ -2619,17 +2651,37 @@ std::expected<void, CaskFault> Cask::checkpoint() {
         // 成对性：字节水位在**提交时刻**捕获（wms 先于 wm，保证水位覆盖的
         // 记录 ord < wm ≤ search 覆盖）；RunFn 执行时刻取水位会被并发写者
         // 推进而反转不变量（见 collect_snapshot_watermarks 注释）。
+        // S14-7：keydir 元数据 payload 于提交时刻构建（wms 同刻捕获，
+        // 成对一致）；delta 路径内联进 delta 文件，base 路径落全量快照。
+        std::vector<std::byte> kd;
+        if (auto wms0 = collect_snapshot_watermarks()) {
+            keydir_->serialize_meta_delta(kd, *wms0);
+            t.fn = [this, search_ckpt, done, wms = std::move(wms0),
+                    kd = std::move(kd), wm = keydir_->peek_next_ord()] {
+                int result = 2;
+                try {
+                    result = save_search_ckpt_paired(search_ckpt, wm, wms, kd)
+                                 ? 1
+                                 : 2;
+                } catch (...) {
+                    // result 保持 2；异常由 reducer error_fn 计数上报。
+                }
+                if (result == 1) {
+                    last_ckpt_ord_.store(wm, std::memory_order_relaxed);
+                }
+                done->store(result, std::memory_order_release);
+                done->notify_all();
+            };
+        } else
         t.fn  = [this, search_ckpt, done,
                  wms = collect_snapshot_watermarks(),
                  wm = keydir_->peek_next_ord()] {
             int result = 2;
             try {
-                // S14-4 写序：先 search.ckpt 后 keydir 快照，且仅成功后写
-                // 快照——崩溃任何前缀只留「旧快照+新 ckpt」（fold 多放、
-                // 自门幂等丢弃）；反序在两写之间崩溃会造成「新快照+旧
-                // ckpt」→ fold 从超前字节水位起跳、search 永久丢窗口。
-                result = search_->save_search_ckpt(search_ckpt, wm) ? 1 : 2;
-                if (result == 1 && wms) write_keydir_snapshot(*wms);
+                // 水位捕获失败（文件态不稳定）：无 keydir payload，delta
+                // 的字节水位不推进（方向安全）；base 路径也无快照可写。
+                result = save_search_ckpt_paired(
+                             search_ckpt, wm, wms, {}) ? 1 : 2;
             } catch (...) {
                 // result 保持 2；异常本体由 reducer 的 error_fn 计数上报。
             }
@@ -2650,12 +2702,14 @@ std::expected<void, CaskFault> Cask::checkpoint() {
         }
     } else {
         // 无索引池（理论不可达：search_ 存在则 lane 已注册）——调用线程直跑。
-        // S14-4 写序：先 ckpt 后快照（见 RunFn 分支注释）。
-        if (!search_->save_search_ckpt(search_ckpt, keydir_->peek_next_ord())) {
+        std::vector<std::byte> kd;
+        auto wms0 = collect_snapshot_watermarks();
+        if (wms0) keydir_->serialize_meta_delta(kd, *wms0);
+        if (!save_search_ckpt_paired(search_ckpt, keydir_->peek_next_ord(),
+                                     wms0, kd)) {
             return std::unexpected(err(CaskError::kIo,
                 "checkpoint: search checkpoint save failed"));
         }
-        write_keydir_snapshot();
     }
     return {};
 }
@@ -2666,6 +2720,26 @@ std::expected<void, CaskFault> Cask::checkpoint() {
 // fire-and-forget：不等待完成，序列化在 reducer 线程进行（与手动 checkpoint
 // 的 RunFn 天然串行），失败仅 log_warn——自动路径是 best-effort 加速，
 // 正确性恒由 data fold 兜底。
+// S14-7：成对保存统一入口（语义见 cask.hpp 声明）。所有 search 模式的
+// ckpt 保存点（手动/自动 RunFn、①、close、merge）都经此，写序不变量
+// （search 覆盖 ≥ keydir 水位）集中在一处维护。
+bool Cask::save_search_ckpt_paired(
+    const std::string& path, std::uint64_t wm,
+    const std::optional<std::vector<
+        std::pair<std::uint32_t, std::uint64_t>>>& wms,
+    const std::vector<std::byte>& keydir_delta) {
+    bool wrote_base = true;
+    const bool ok = search_->save_search_ckpt(
+        path, wm,
+        std::span<const std::byte>(keydir_delta.data(), keydir_delta.size()),
+        &wrote_base);
+    if (ok && wrote_base && wms) {
+        // base 路径：全量快照（写序：ckpt 成功后才落快照）。
+        write_keydir_snapshot(*wms);
+    }
+    return ok;
+}
+
 void Cask::maybe_submit_auto_checkpoint() {
     if (opts_.auto_checkpoint_min_docs == 0) return;          // 未启用
     if (!search_ || !index_pool_ || !index_lane_) return;     // 仅索引模式
@@ -2684,16 +2758,16 @@ void Cask::maybe_submit_auto_checkpoint() {
     IndexTask t;
     t.op  = IndexOp::RunFn;
     t.ord = keydir_->alloc_ord();
-    // 成对性：字节水位在提交时刻捕获（wms 先于 wm），快照本体在 reducer 写
-    // （同 checkpoint()，见 collect_snapshot_watermarks 注释）。
-    t.fn  = [this,
-             wms = collect_snapshot_watermarks(),
+    // 成对性：字节水位与 keydir 元数据 payload 都在提交时刻捕获（wms 先
+    // 于 wm），保存本体在 reducer 执行（同 checkpoint()）。
+    std::vector<std::byte> auto_kd;
+    auto auto_wms = collect_snapshot_watermarks();
+    if (auto_wms) keydir_->serialize_meta_delta(auto_kd, *auto_wms);
+    t.fn  = [this, wms = std::move(auto_wms), kd = std::move(auto_kd),
              wm = keydir_->peek_next_ord()] {
         try {
-            // S14-4 写序：先 ckpt 后快照（见 checkpoint() RunFn 注释）。
-            if (search_->save_search_ckpt(dirname_ + "/" + kSearchCkptName,
-                                          wm)) {
-                if (wms) write_keydir_snapshot(*wms);
+            if (save_search_ckpt_paired(dirname_ + "/" + kSearchCkptName,
+                                        wm, wms, kd)) {
                 last_ckpt_ord_.store(wm, std::memory_order_relaxed);
             } else {
                 log_warn("auto checkpoint: search ckpt save failed "
@@ -2818,8 +2892,11 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
             IndexTask t;
             t.op  = IndexOp::RunFn;
             t.ord = keydir_->alloc_ord();
-            t.fn  = [this, search_ckpt, wm = keydir_->peek_next_ord()] {
-                if (!search_->save_search_ckpt(search_ckpt, wm)) {
+            // S14-7：merge 恒 rebase（compact 已置位）→ paired 走 base +
+            // 全量快照（用早段捕获的水位）。
+            t.fn  = [this, search_ckpt, wms = merge_snap_wms,
+                     wm = keydir_->peek_next_ord()] {
+                if (!save_search_ckpt_paired(search_ckpt, wm, wms, {})) {
                     log_warn("search checkpoint save failed after merge "
                              "(will rebuild on next open)");  // S13-D7
                 }
@@ -2827,15 +2904,15 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
             index_pool_->submit(index_lane_, std::move(t));
             index_pool_->flush(index_lane_);
         } else {
-            if (!search_->save_search_ckpt(search_ckpt,
-                                           keydir_->peek_next_ord())) {
+            if (!save_search_ckpt_paired(search_ckpt,
+                                         keydir_->peek_next_ord(),
+                                         merge_snap_wms, {})) {
                 log_warn("search checkpoint save failed after merge "
                          "(will rebuild on next open)");  // S13-D7
             }
         }
-        // S14-4 写序：早段捕获的水位此刻才落盘（search.ckpt 已保存在前）。
-        // best-effort；merge 末尾还有一次「最紧凑状态」快照兜底。
-        if (merge_snap_wms) write_keydir_snapshot(*merge_snap_wms);
+        // 快照已由 paired 入口在 ckpt 成功后落盘（写序不变量集中维护）；
+        // merge 末尾还有一次「最紧凑状态」快照兜底。
     }
 
     // After run_merge, every live record from `files` has been CAS-rewritten

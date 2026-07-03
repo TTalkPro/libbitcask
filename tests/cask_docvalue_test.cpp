@@ -3554,6 +3554,8 @@ TEST_F(CaskDocValueTest, CheckpointDeltaChainDeletesAndOverwrites) {
                  "delword n" + std::to_string(i) + "x");
     }
     ASSERT_TRUE((*c)->checkpoint());  // base
+    const auto keydir_snap_v1 =
+        fs::last_write_time(tmpdir_ / "kv.keydir.ckpt");
 
     // 窗口 1（→ d1）：
     put_text("dd_5", "delword updated5x");            // 覆盖写
@@ -3578,6 +3580,9 @@ TEST_F(CaskDocValueTest, CheckpointDeltaChainDeletesAndOverwrites) {
     ASSERT_TRUE((*c)->remove(sv_bytes(std::string("dd_2"))));
     ASSERT_TRUE((*c)->checkpoint());  // d2
     EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d2"));
+    // S14-7：delta 保存不再全量写 kv.keydir.ckpt（元数据内联进 delta 文件）。
+    EXPECT_EQ(fs::last_write_time(tmpdir_ / "kv.keydir.ckpt"), keydir_snap_v1)
+        << "delta 保存不应重写 keydir 快照";
 
     auto img = crash_image(tmpdir_, "deltas");
     (*c)->close();
@@ -3602,6 +3607,21 @@ TEST_F(CaskDocValueTest, CheckpointDeltaChainDeletesAndOverwrites) {
     expect_hits("reborn9x", 1);     // 删后重写：新版活（交错重放不误杀）
     expect_hits("n50x", 0);         // 窗口内建又删
 
+    // S14-7：KV 侧一致性——链的行/删除已推进 keydir（此前靠每次全量快照）。
+    // 快路径 fold 从链尾字节水位起跳，删除若未经链应用会留僵尸。
+    auto expect_kv = [&](const char* key, bool alive) {
+        auto g = (*r)->get_owned(sv_bytes(std::string(key)));
+        EXPECT_EQ(static_cast<bool>(g), alive) << key;
+    };
+    expect_kv("dd_7", false);   // 跨窗删除：无僵尸
+    expect_kv("dd_2", false);   // d2 窗口删除
+    expect_kv("dd_8", false);   // 写后删
+    expect_kv("dd_50", false);  // 窗口内建又删
+    expect_kv("dd_9", true);    // 删后重写（remove_if_older 不误杀）
+    expect_kv("dd_5", true);    // 覆盖写新版
+    expect_kv("dd_55", true);   // 窗口新增
+    expect_kv("dd_63", true);   // d2 窗口新增
+
     // 重开后续链：再写一条 → checkpoint 应产出 d3（链状态在 load 端恢复）。
     {
         bitcask::DocInput doc;
@@ -3624,6 +3644,64 @@ TEST_F(CaskDocValueTest, CheckpointDeltaChainDeletesAndOverwrites) {
     EXPECT_EQ(h2->hits.size(), 62u);  // 61 + dd_cont
     (*r2)->close();
 
+    std::error_code ec;
+    fs::remove_all(img, ec);
+}
+
+// S14-5：delta 链长上限——达到 max_delta_chain 后下次 checkpoint 强制
+// 全量 base：链坍缩、delta 文件回收、.prev 代际刷新。防不 merge 的纯追加
+// 负载链无界堆积。
+TEST_F(CaskDocValueTest, CheckpointDeltaChainLengthBound) {
+    namespace fs = std::filesystem;
+    auto opts = v31_opts(0);
+    ASSERT_TRUE(opts.search_config.has_value());
+    opts.search_config->max_delta_chain = 2;  // 低上限便于测试
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto put_batch_n = [&](int from, int to) {
+        for (int i = from; i < to; ++i) {
+            bitcask::DocInput doc;
+            std::string text = "bound n" + std::to_string(i);
+            doc.text = sv_bytes(text);
+            ASSERT_TRUE((*c)->put_doc(sv_bytes("cb_" + std::to_string(i)),
+                                      doc, 9500));
+        }
+    };
+
+    put_batch_n(0, 10);
+    ASSERT_TRUE((*c)->checkpoint());  // #1：base
+    auto base_v1 = fs::last_write_time(tmpdir_ / "search.ckpt");
+    put_batch_n(10, 20);
+    ASSERT_TRUE((*c)->checkpoint());  // #2：d1
+    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d1"));
+    put_batch_n(20, 30);
+    ASSERT_TRUE((*c)->checkpoint());  // #3：d2（链长达上限 2）
+    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d2"));
+    EXPECT_EQ(fs::last_write_time(tmpdir_ / "search.ckpt"), base_v1)
+        << "delta 保存不应动 base";
+    put_batch_n(30, 40);
+    ASSERT_TRUE((*c)->checkpoint());  // #4：链满 → 强制 base 坍缩
+    EXPECT_FALSE(fs::exists(tmpdir_ / "search.ckpt.d1"))
+        << "base 落成后链应被清扫";
+    EXPECT_FALSE(fs::exists(tmpdir_ / "search.ckpt.d2"));
+    EXPECT_NE(fs::last_write_time(tmpdir_ / "search.ckpt"), base_v1)
+        << "链满应重写 base";
+    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.prev")) << "代际应刷新";
+    // 坍缩后从 d1 重新起链。
+    put_batch_n(40, 50);
+    ASSERT_TRUE((*c)->checkpoint());
+    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d1"));
+
+    // 崩溃镜像重开：新 base + 新链合成完整状态。
+    auto img = crash_image(tmpdir_, "bound");
+    (*c)->close();
+    auto r = Cask::open(img.string(), opts, &test_registry());
+    ASSERT_TRUE(r);
+    auto h = (*r)->search_text("bound", 100);
+    ASSERT_TRUE(h);
+    EXPECT_EQ(h->hits.size(), 50u);
+    (*r)->close();
     std::error_code ec;
     fs::remove_all(img, ec);
 }
