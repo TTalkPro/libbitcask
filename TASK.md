@@ -1933,7 +1933,7 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > P1 不动 Cask 门面/恢复编排/checkpoint（那是 P3/P4/P5 的事），Cask 仍持
 > `unique_ptr<SearchLayer>`。
 
-- [ ] **S15-1【P0·S】plugin_api 接口层（`bitcask_plugin_api` INTERFACE 目标）**
+- [x] **S15-1【P0·S】plugin_api 接口层（`bitcask_plugin_api` INTERFACE 目标）** — 已完成（2026-07-03）
   - 新增 `include/bitcask/plugin_api.hpp`（KV 事件词汇，设计 §3.1/§3.2 签名为准）：
     数据类型 `RecordLoc` / `FieldKV` / `DocView{text, fields, vec, meta}` /
     `PutEvent{ord, key, value, doc*, loc, tstamp}`（原始 value 为主、DocView
@@ -1964,7 +1964,7 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - CMake：`bitcask_plugin_api` INTERFACE 目标，仅依赖 `bitcask_format`。
   - 测试：头自包含编译单元（单独 TU include 即过编译）；CI 检查该头不引入
     任何 search/bm25/vector 依赖。
-- [ ] **S15-2【P0·M】thread_pool 去搜索化（variant 塌缩 + 类型擦除）**
+- [x] **S15-2【P0·M】thread_pool 去搜索化（variant 塌缩 + 类型擦除）** — 已完成（2026-07-03）
   - 现状（源码已核实）：`thread_pool.hpp:51` include search_layer.hpp（ReduceJob
     用于 ReduceEntry）；`ReorderEntry` variant 烧死六个搜索领域分支
     （ReduceEntry/OnWriteEntry/DeleteEntry/SkipEntry/RebuildEntry/RunFnEntry），
@@ -1985,7 +1985,15 @@ W4 ✅（parallel_scan 并行全表扫描）。
     优化，不预优化）。
   - 测试：thread_pool_test 全绿；TSan 全量（reorder/保序核心零改动，变的只是
     payload 类型，但 unique_ptr 跨线程移交需 TSan 确认无新告警）。
-- [ ] **S15-3【P0·M】SearchLayerAdapter + Cask 装配点改造（唯一插件，零行为变化）**
+  - **落地结果**：variant 四分支（PutEntry{task, preps}/Delete/Skip/RunFn）；
+    `IndexOp::RebuildHnsw` 枚举删除，merge 提交点改 RunFn 闭包；所有 Add 统一
+    走 map_fn（PipelineProcessesAllTaskTypes 契约同步改写：map_count 0→2）；
+    `RebuildHnswCarriesOrd` 重写为 `RunFnCarriesOrdAndExecutesInReducer`；
+    另附 make_doc_view/make_put_event 宿主视图 helper（分发闭包与契约测试共用）。
+    **bench 护栏通过**：池级 SubmitDrain 3.59M/s vs HEAD 3.64M/s（−1.5%，噪声
+    内）；端到端 put_doc（C API 临时压测，200k docs ×3 轮 ABBA 排除时序漂移）
+    36.3k vs 36.4k docs/s（−0.3%）——未触发 arena 优化。
+- [x] **S15-3【P0·M】SearchLayerAdapter + Cask 装配点改造（唯一插件，零行为变化）** — 已完成（2026-07-03）
   - `SearchLayerAdapter : CaskPlugin`（放 bitcask_search 目标内，内持
     `SearchLayer&`；DeltaReplayHook 经构造参数私有传入，不进通用接口）：
     `wants_prepare()=true`、prepare → `map_analyze`（单文本路径同样产
@@ -2006,7 +2014,14 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - 测试：全量回归 clang/TSan **零差异**（零行为变化是本批验收标准）；
     smoke / cask_docvalue（含 S14 全部 ckpt 系列）/ crash_recovery /
     checkpoint_recovery / merge_concurrent_writer 全绿；bench 对比 S15-2 基线。
-- [ ] **S15-4【P1·S】插件契约 Mock 测试（为 P2/P4 铺回归床）**
+  - **落地结果**：`search_plugin_adapter.hpp`（SearchPrepared 携带 ReduceJob；
+    prepare 异常→空 job 降级镜像旧「空 ReduceEntry」语义；`doc==nullptr` 时
+    `text:=value` 语义下沉 adapter）；cask.cpp 装配点改 plugins_ 注册序广播；
+    on_delete 非池直调分支坐实不可达（open 强制 registry 非空）后删除；
+    `map_analyze` fields 参数放宽为 span（调用点隐式转换，零行为变化）。
+    clang 522/522；TSan 521/522——唯一失败 `ThreadCountIndependentOfLibCount`
+    为 TSan 预存问题（git stash 后未改动 HEAD 同样失败，坐实与本批无关）。
+- [x] **S15-4【P1·S】插件契约 Mock 测试（为 P2/P4 铺回归床）** — 已完成（2026-07-03）
   - `tests/plugin_contract_test.cpp` + `MockPlugin`（只链 bitcask_plugin_api +
     thread_pool 相关目标，**不链 search**）：断言 on_put 按 ord 严格递增到达；
     多插件按注册序固定分发（P2 的 DocMap 插队 reducer 首位、P4 的双插件扇出
@@ -2016,9 +2031,17 @@ W4 ✅（parallel_scan 并行全表扫描）。
     （cask.cpp:598-604 语义）。
   - 附带一条 TSan 场景：双 Mock 插件并发写入下扇出组移交无 race。
   - 测试：本条即测试；纳入 ctest 常规集。
+  - **落地结果**：`plugin_contract_test.cpp` 4 测试（升序+注册序+配对移交+
+    prepare 过滤+Skip/Delete 广播 / RunFn 精确顺位 / prepare 异常降级 ord 不
+    stall / 双 lane 并发 TSan）——**配对契约**升级为强断言：prep 必须是本插件
+    同 ord 的产物（MockPrepared 携带 ord+plugin_idx 验证）。目标只链
+    plugin_api+TBB，不链 search。clang/TSan 双绿。
 
-> **建议执行顺序**：S15-1 → S15-2 → S15-3（S15-4 可与 S15-3 并行，依赖 S15-2）。
-> 每步独立可交付、独立可回滚；S15-3 完成即达成 P1 验收判据。后续批次预告：
+> **建议执行顺序（全批完成，2026-07-03）**：S15-1 ✅ → S15-2 ✅ → S15-3 ✅ →
+> S15-4 ✅。**P1 验收判据全部达成**：thread_pool.hpp 不再 include
+> search_layer.hpp；IndexPool 通路全部经 CaskPlugin 分发；clang 522/522、
+> TSan 521/522（唯一失败为预存问题）；put_doc bench −0.3%（≤3% 护栏）。
+> 后续批次预告：
 > P2（DocMap 抽离为宿主服务）→ P3（checkpoint 拆分，高风险独立成批，设计 §5，
 > 附退化方案 B）→ P4（SearchLayer 拆 Text/Vector 插件 + hybrid 上移）→
 > P5（门面/C API/配置拆分收尾）。P1/P2/P4/P5 不依赖 P3。
