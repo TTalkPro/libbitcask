@@ -2198,13 +2198,12 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - manifest 不跟踪侧车（load 时 `load_vec_payload` 失败 → vec 段标 corrupt
     → fold 重建）。既有 CheckpointVecPayloadAppends 等测试覆盖。
 
-- [~] **S17-6【P1·M】崩溃安全测试套** — 部分完成（2026-07-03）
-  - 既有 8+ 个 checkpoint/crash 测试（CorruptSearchCheckpointFallsBackToFullFold
-    / CheckpointCrashImageRecoversAllDocs / CheckpointDeltaChainSelectiveSections /
-    OpenAfterCrashResavesCheckpoint 等）已覆盖 split 后的崩溃面——全部适配
-    新文件名、533/533 全绿。
-  - 专项 manifest 损坏测试因测试夹具限制（keydir registry 同目录共享导致
-    reopen 不走 fold）暂缓——现有测试已验证 ckpt 损坏 → 全量 fold 兜底正确。
+- [x] **S17-6【P1·M】崩溃安全测试套** — 已完成（2026-07-03）
+  - 既有 8+ 个 checkpoint/crash 测试已适配新文件名、全绿。
+  - 新增 S17ManifestCorruptionFallsBackToFullFold：删 manifest + keydir →
+    全量 fold 兜底 → 20/20 docs 全恢复。
+  - 调查发现根因为测试代码 use-after-free（sv_bytes(temporary) 悬垂引用），
+    非生产 bug——修正后测试通过。
 
 > **建议执行顺序**：S17-1（格式基础）→ S17-2（拆 save）→ S17-3（commit
 > 接线）→ S17-4（recovery）→ S17-5（迁移）→ S17-7（侧车）→ S17-6（崩溃测试）。

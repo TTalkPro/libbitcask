@@ -3834,6 +3834,46 @@ TEST_F(CaskDocValueTest, OpenAfterCrashResavesCheckpoint) {
     fs::remove_all(img, ec);
 }
 
+// S17-6①：manifest 损坏 → 全量 fold 兜底，全部文档仍可恢复。
+TEST_F(CaskDocValueTest, S17ManifestCorruptionFallsBackToFullFold) {
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() /
+        ("s17_manifest_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    auto opts = v31_opts(0);
+
+    bitcask::keydir::KeyDirRegistry reg1;
+    {
+        auto c = Cask::open(dir.string(), opts, &reg1);
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 20; ++i) {
+            bitcask::DocInput doc;
+            std::string text = "apple banana n" + std::to_string(i);
+            std::string key = "mc_" + std::to_string(i);
+            doc.text = sv_bytes(text);
+            ASSERT_TRUE((*c)->put_doc(sv_bytes(key), doc,
+                                      static_cast<std::uint32_t>(1000 + i)));
+        }
+        (*c)->flush_index();
+        ASSERT_TRUE((*c)->checkpoint());
+        ASSERT_TRUE(fs::exists(dir / "index.manifest"));
+        (*c)->close();
+    }
+
+    fs::remove(dir / "index.manifest");
+    fs::remove(dir / "kv.keydir.ckpt");
+
+    bitcask::keydir::KeyDirRegistry reg2;
+    auto r = Cask::open(dir.string(), opts, &reg2);
+    ASSERT_TRUE(r);
+    auto h = (*r)->search_text("banana", 100);
+    ASSERT_TRUE(h);
+    EXPECT_EQ(h->hits.size(), 20u);
+    (*r)->close();
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 // 边界：空批量 → 空；单条 → 走快路径（不进池）仍正确。
 TEST_F(CaskDocValueTest, S74SearchTextBatchEdgeCases) {
     auto opts = v31_opts(4);
