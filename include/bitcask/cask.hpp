@@ -1001,6 +1001,14 @@ public:
     [[nodiscard]] std::expected<RecoverySnapshots, CaskFault>
     load_recovery_snapshots(search::SearchLayer* search_layer);
 
+    // checkpoint delta 链重放钩子——把 delta 行/删除/keydir 元数据应用到
+    // keydir，推进恢复水位。原 load_search_ckpt 内联 DeltaReplayHook 闭包提取。
+    void replay_delta_to_keydir(
+        const std::vector<search::SearchLayer::DeltaDocRow>& rows,
+        const std::vector<search::SearchLayer::DeltaRemoval>& rems,
+        std::span<const std::byte> keydir_meta,
+        RecoverySnapshots& recovery);
+
     // ---- 搜索方法共用基础设施 ----
 
     // 搜索前置检查 + flush。返回错误则 caller 直接 propagate。

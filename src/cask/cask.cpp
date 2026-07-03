@@ -809,6 +809,33 @@ void Cask::on_index_worker_error() noexcept {
               "see StatusInfo::index_errors)");
 }
 
+void Cask::replay_delta_to_keydir(
+    const std::vector<search::SearchLayer::DeltaDocRow>& rows,
+    const std::vector<search::SearchLayer::DeltaRemoval>& rems,
+    std::span<const std::byte> keydir_meta,
+    RecoverySnapshots& recovery) {
+    // 链重放：行 → LWW put；删除 → remove_if_older，ord 守卫顺序无关；
+    // kKeydirDelta 段推进标量/fstats/字节水位。行/删除先于 meta 应用
+    // （meta 的水位声明覆盖 ≤ 行集）。
+    for (const auto& r : rows) {
+        keydir_->put(r.ext, r.slot.loc.file_id,
+                     r.slot.loc.total_sz, r.slot.loc.offset,
+                     r.slot.tstamp, /*now*/ 0,
+                     /*newest*/ false, 0, 0, r.ord);
+        keydir_->advance_ord(r.ord);
+    }
+    for (const auto& m : rems) {
+        (void)keydir_->remove_if_older(m.key, m.tomb);
+        keydir_->advance_ord(m.tomb);
+    }
+    if (!keydir_meta.empty()) {
+        if (auto wms = keydir_->apply_meta_delta(keydir_meta)) {
+            // 链尾水位驱动 fold_start（快照对里最新的一份）。
+            recovery.snap_wms = std::move(*wms);
+        }
+    }
+}
+
 // 收尾顺序很关键：
 //   1. finalize active hint（写 trailer + running CRC，否则 hint 文件
 //      下次 open 时会被判失效，回退到全量 fold(data) 重建 keydir）；
@@ -1240,32 +1267,14 @@ Cask::load_recovery_snapshots(search::SearchLayer* search_layer) {
 
     bool search_ok = false;
     if (search_layer) {
-        // S14-7：链重放钩子——每个 delta 的 docmap 行/删除同步推进 keydir
-        // （行 → LWW put；删除 → remove_if_older，ord 守卫顺序无关），
-        // kKeydirDelta 段推进标量/fstats/字节水位。行/删除先于 meta 应用
-        // （meta 的水位声明覆盖 ≤ 行集）。
+        // S14-7：链重放钩子——逻辑提取为 replay_delta_to_keydir，闭包退化为
+        // 薄委托（可独立测试）。
         search::SearchLayer::DeltaReplayHook hook =
             [this, &recovery](
                 const std::vector<search::SearchLayer::DeltaDocRow>& rows,
                 const std::vector<search::SearchLayer::DeltaRemoval>& rems,
                 std::span<const std::byte> keydir_meta) {
-                for (const auto& r : rows) {
-                    keydir_->put(r.ext, r.slot.loc.file_id,
-                                 r.slot.loc.total_sz, r.slot.loc.offset,
-                                 r.slot.tstamp, /*now*/ 0,
-                                 /*newest*/ false, 0, 0, r.ord);
-                    keydir_->advance_ord(r.ord);
-                }
-                for (const auto& m : rems) {
-                    (void)keydir_->remove_if_older(m.key, m.tomb);
-                    keydir_->advance_ord(m.tomb);
-                }
-                if (!keydir_meta.empty()) {
-                    if (auto wms = keydir_->apply_meta_delta(keydir_meta)) {
-                        // 链尾水位驱动 fold_start（快照对里最新的一份）。
-                        recovery.snap_wms = std::move(*wms);
-                    }
-                }
+                replay_delta_to_keydir(rows, rems, keydir_meta, recovery);
             };
         auto result = search_layer->load_search_ckpt(
             dirname_ + "/" + kSearchCkptName,
