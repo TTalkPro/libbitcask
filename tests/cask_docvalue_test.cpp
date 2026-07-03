@@ -3696,23 +3696,38 @@ TEST_F(CaskDocValueTest, CheckpointDeltaChainLengthBound) {
         }
     };
 
+    auto read_file = [&](const fs::path& fp) {
+        std::vector<char> bytes;
+        std::FILE* f = std::fopen(fp.string().c_str(), "rb");
+        if (!f) return bytes;
+        std::fseek(f, 0, SEEK_END);
+        bytes.resize(static_cast<std::size_t>(std::ftell(f)));
+        std::fseek(f, 0, SEEK_SET);
+        if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) {
+            bytes.clear();
+        }
+        std::fclose(f);
+        return bytes;
+    };
+
     put_batch_n(0, 10);
     ASSERT_TRUE((*c)->checkpoint());  // #1：base
-    auto base_v1 = fs::last_write_time(tmpdir_ / "search.ckpt");
+    auto base_v1 = read_file(tmpdir_ / "search.ckpt");
+    ASSERT_FALSE(base_v1.empty());
     put_batch_n(10, 20);
     ASSERT_TRUE((*c)->checkpoint());  // #2：d1
     EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d1"));
     put_batch_n(20, 30);
     ASSERT_TRUE((*c)->checkpoint());  // #3：d2（链长达上限 2）
     EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d2"));
-    EXPECT_EQ(fs::last_write_time(tmpdir_ / "search.ckpt"), base_v1)
+    EXPECT_EQ(read_file(tmpdir_ / "search.ckpt"), base_v1)
         << "delta 保存不应动 base";
     put_batch_n(30, 40);
     ASSERT_TRUE((*c)->checkpoint());  // #4：链满 → 强制 base 坍缩
     EXPECT_FALSE(fs::exists(tmpdir_ / "search.ckpt.d1"))
         << "base 落成后链应被清扫";
     EXPECT_FALSE(fs::exists(tmpdir_ / "search.ckpt.d2"));
-    EXPECT_NE(fs::last_write_time(tmpdir_ / "search.ckpt"), base_v1)
+    EXPECT_NE(read_file(tmpdir_ / "search.ckpt"), base_v1)
         << "链满应重写 base";
     EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.prev")) << "代际应刷新";
     // 坍缩后从 d1 重新起链。
