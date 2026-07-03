@@ -2067,4 +2067,618 @@ SearchLayer::load_search_ckpt(std::string_view path,
     return result;
 }
 
+// ============================================================================
+// S17-2/S17-3:per-component 持久化（docmap.ckpt / bm25.ckpt / vec.ckpt）
+// ============================================================================
+// 旧的 save_search_ckpt / load_search_ckpt 仍保留（标 legacy）——S17-5 一
+// 次性迁移路径依赖它读旧 search.ckpt。S17-4 之后 Cask 路径只调新接口。
+//
+// 简化策略：每组件的「基段 + 链段」由 SaveLayer 内部新私有方法直接产出
+//（与既有 save_search_ckpt 共享序列化逻辑，但写到 per-component 文件）。
+// load 同理。SearchLayer 把 manifest 当作「跨组件 commit 簿」使用——
+// Cask 维护它，SearchLayer 维护各自的链状态镜像。
+
+namespace {
+
+// 组件文件名（不含目录）。caller 加 dir 前缀。
+inline constexpr const char* kCompFile[3] = {
+    "docmap.ckpt",  // kDocmap
+    "bm25.ckpt",    // kBm25
+    "vec.ckpt",     // kVec
+};
+
+}  // namespace
+
+// S17-2 公开 API：组件状态 getter/setter。SearchLayer 维护一份镜像（save 后
+// 写入，load 后回填），Cask 在维护 manifest 时同步给 SearchLayer 让后续
+// save 走正确的链续接。
+SearchLayer::ComponentCkptState
+SearchLayer::get_component_state(bitcask::ComponentId comp) const {
+    const auto i = static_cast<std::size_t>(comp);
+    ComponentCkptState s;
+    s.base_gen = comp_base_gen_[i];
+    s.chain_wm = comp_chain_wm_[i];
+    s.next_seq = comp_next_seq_[i];
+    s.rebase_needed = ckpt_rebase_needed_.load(std::memory_order_relaxed);
+    return s;
+}
+
+void SearchLayer::set_component_state(bitcask::ComponentId comp,
+                                      const ComponentCkptState& st) {
+    const auto i = static_cast<std::size_t>(comp);
+    comp_base_gen_[i] = st.base_gen;
+    comp_chain_wm_[i] = st.chain_wm;
+    comp_next_seq_[i] = st.next_seq;
+    ckpt_rebase_needed_.store(st.rebase_needed, std::memory_order_relaxed);
+}
+
+// S17-2:per-component base 写。三组件各自独立走「原字节前移 → 写新文件」
+// 路径：docmap 段、bm25 段（default + fields）、hnsw 段。dirty_mask 仅作
+// 提示——base 写不区分（base 路径本就全量）。
+SearchLayer::ComponentSaveResult SearchLayer::save_components_base(
+    std::string_view dir, std::uint64_t watermark,
+    std::array<bool, kComponentCount> /*dirty_mask*/) {
+    namespace sc = bitcask::search;
+    ComponentSaveResult result;
+    const std::filesystem::path base_dir(dir);
+    // ---- docmap 组件 ----
+    {
+        const std::string fp = (base_dir / kCompFile[0]).string();
+        const std::string prev = fp + ".prev";
+        std::error_code ec;
+        if (std::filesystem::exists(fp, ec)) {
+            std::filesystem::rename(fp, prev, ec);
+        }
+        std::vector<sc::CkptSection> secs;
+        std::vector<std::vector<std::uint8_t>> u8_bufs;
+        std::vector<std::uint8_t> buf;
+        if (serialize_docmap(buf, watermark)) {
+            u8_bufs.push_back(std::move(buf));
+            secs.push_back(sc::CkptSection{
+                static_cast<std::uint16_t>(sc::CkptSectionType::kDocmap), 0,
+                std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(u8_bufs.back().data()),
+                    u8_bufs.back().size())});
+        }
+        const bool ok = !secs.empty() &&
+            sc::SearchCheckpoint::write(fp, watermark, secs);
+        result.wrote_base[0] = ok;
+    }
+    // ---- bm25 组件 ----
+    {
+        const std::string fp = (base_dir / kCompFile[1]).string();
+        const std::string prev = fp + ".prev";
+        std::error_code ec;
+        if (std::filesystem::exists(fp, ec)) {
+            std::filesystem::rename(fp, prev, ec);
+        }
+        std::vector<sc::CkptSection> secs;
+        std::vector<std::vector<std::byte>> byte_bufs;
+        auto add_byte = [&](std::uint16_t type, std::vector<std::byte> buf) {
+            byte_bufs.push_back(std::move(buf));
+            secs.push_back(sc::CkptSection{
+                type, 0,
+                std::span<const std::byte>(byte_bufs.back().data(),
+                                            byte_bufs.back().size())});
+        };
+        {
+            std::shared_lock lk(fields_mu_);
+            if (auto dit = fields_.find(kDefaultField);
+                dit != fields_.end()) {
+                std::vector<std::byte> buf;
+                dit->second->serialize(buf);
+                add_byte(static_cast<std::uint16_t>(
+                             sc::CkptSectionType::kBm25Default),
+                         std::move(buf));
+            }
+            std::uint32_t other_count = 0;
+            for (auto& [field, inv] : fields_) {
+                if (field == kDefaultField) continue;
+                ++other_count;
+            }
+            if (other_count > 0) {
+                std::vector<std::byte> fbuf;
+                put_u32_byte(fbuf, other_count);
+                for (auto& [field, inv] : fields_) {
+                    if (field == kDefaultField) continue;
+                    put_u16_byte(fbuf,
+                                 static_cast<std::uint16_t>(field.size()));
+                    fbuf.insert(fbuf.end(),
+                        reinterpret_cast<const std::byte*>(field.data()),
+                        reinterpret_cast<const std::byte*>(field.data()) +
+                            field.size());
+                    std::uint64_t pos = fbuf.size();
+                    put_u64_byte(fbuf, 0);
+                    inv->serialize(fbuf);
+                    std::uint64_t inv_len = fbuf.size() - pos - 8;
+                    std::memcpy(fbuf.data() + pos, &inv_len, 8);
+                }
+                add_byte(static_cast<std::uint16_t>(
+                             sc::CkptSectionType::kBm25Fields),
+                         std::move(fbuf));
+            }
+        }
+        const bool ok = !secs.empty() &&
+            sc::SearchCheckpoint::write(fp, watermark, secs);
+        result.wrote_base[1] = ok;
+    }
+    // ---- vec 组件 ----
+    {
+        const std::string fp = (base_dir / kCompFile[2]).string();
+        if (config_.vector_dim > 0) {
+            const std::string prev = fp + ".prev";
+            std::error_code ec;
+            if (std::filesystem::exists(fp, ec)) {
+                std::filesystem::rename(fp, prev, ec);
+            }
+            std::vector<sc::CkptSection> secs;
+            std::vector<std::vector<std::uint8_t>> u8_bufs;
+            auto hnsw = hnsw_.load(std::memory_order_acquire);
+            if (hnsw) {
+                const std::string vec_path =
+                    std::filesystem::path(fp).replace_extension(".vec").string();
+                const std::string qc_path =
+                    std::filesystem::path(fp).replace_extension(".qc8").string();
+                if (hnsw->save_vec_payload(vec_path) &&
+                    hnsw->save_qc_payload(qc_path)) {
+                    std::vector<std::uint8_t> buf;
+                    if (hnsw->serialize(buf)) {
+                        u8_bufs.push_back(std::move(buf));
+                        secs.push_back(sc::CkptSection{
+                            static_cast<std::uint16_t>(
+                                sc::CkptSectionType::kHnsw), 0,
+                            std::span<const std::byte>(
+                                reinterpret_cast<const std::byte*>(
+                                    u8_bufs.back().data()),
+                                u8_bufs.back().size())});
+                    }
+                }
+            }
+            const bool ok = !secs.empty() &&
+                sc::SearchCheckpoint::write(fp, watermark, secs);
+            result.wrote_base[2] = ok;
+        } else {
+            // 无 hnsw 配置：清掉残留（防御性，不阻断）。
+            std::error_code ec;
+            std::filesystem::remove(fp, ec);
+            std::filesystem::remove(fp + ".prev", ec);
+            std::filesystem::remove(
+                std::filesystem::path(fp).replace_extension(".vec"), ec);
+            std::filesystem::remove(
+                std::filesystem::path(fp).replace_extension(".qc8"), ec);
+            result.wrote_base[2] = false;
+        }
+    }
+    // 链坍缩（base 落成）：清各自 .d<seq>，重置链状态。
+    for (std::size_t ci = 0; ci < kComponentCount; ++ci) {
+        const std::string fp = (base_dir / kCompFile[ci]).string();
+        std::uint32_t misses = 0;
+        for (std::uint32_t i = 1; misses < 8; ++i) {
+            std::error_code ec;
+            if (std::filesystem::remove(fp + ".d" + std::to_string(i), ec)) {
+                misses = 0;
+            } else {
+                ++misses;
+            }
+        }
+        comp_base_gen_[ci] = watermark;
+        comp_chain_wm_[ci] = watermark;
+        comp_next_seq_[ci] = 1;
+    }
+    // 脏位全清（base 落成 = 与内存态同步）。
+    dirty_docmap_.store(false, std::memory_order_relaxed);
+    dirty_bm25_default_.store(false, std::memory_order_relaxed);
+    dirty_bm25_fields_.store(false, std::memory_order_relaxed);
+    dirty_hnsw_.store(false, std::memory_order_relaxed);
+    // base 落成 → 链坍缩、rebase 标志清零。
+    ckpt_rebase_needed_.store(false, std::memory_order_relaxed);
+    return result;
+}
+
+// S17-3:per-component delta 写。键名 docmap.ckpt.d<seq>、bm25.ckpt.d<seq>、
+// vec.ckpt.d<seq>——彼此 seq 独立推进。watermark 相同。
+//
+// 设计要点：delta 段不再走「按脏选段」精简化——每个组件都全量构造自己
+// 的 delta 段集（docmap 必含 kDocmapDelta + kDeltaInfo + 可选 kKeydirDelta；
+// bm25 含 kBm25DefaultDelta + kBm25FieldsDelta（可能空字段） + kDeltaInfo；
+// vec 含 kHnswDelta + kDeltaInfo）。理由：delta 频次远低于 base，CPU 节
+// 省不是热点；让 per-component 链的「单组件原子性」成立（每组件 delta 文件
+// 自洽，单独可读）。vec 不在链里则无 .d<seq>。
+SearchLayer::ComponentDeltaResult SearchLayer::save_components_delta(
+    std::string_view dir, std::uint64_t watermark,
+    std::array<bool, kComponentCount> dirty_mask,
+    std::span<const std::byte> keydir_delta) {
+    namespace sc = bitcask::search;
+    ComponentDeltaResult result{};
+    const std::filesystem::path base_dir(dir);
+    // 每组件独立 seq。
+    for (std::size_t ci = 0; ci < kComponentCount; ++ci) {
+        if (!dirty_mask[ci]) {
+            result.wrote[ci] = false;
+            continue;
+        }
+        const std::string fp = (base_dir / kCompFile[ci]).string();
+        const std::uint32_t seq = comp_next_seq_[ci];
+        const std::string dpath = fp + ".d" + std::to_string(seq);
+        const std::uint64_t from = comp_chain_wm_[ci];
+        std::vector<sc::CkptSection> secs;
+        std::vector<std::vector<std::byte>> byte_bufs;
+        auto add_byte = [&](sc::CkptSectionType t,
+                            std::vector<std::byte> b) {
+            byte_bufs.push_back(std::move(b));
+            secs.push_back(sc::CkptSection{
+                static_cast<std::uint16_t>(t), 0,
+                std::span<const std::byte>(byte_bufs.back().data(),
+                                            byte_bufs.back().size())});
+        };
+        // kDeltaInfo：链校验三元组。
+        {
+            std::vector<std::byte> b;
+            put_u64_byte(b, comp_base_gen_[ci]);
+            put_u64_byte(b, from);
+            put_u32_byte(b, seq);
+            add_byte(sc::CkptSectionType::kDeltaInfo, std::move(b));
+        }
+        if (ci == 0) {
+            // docmap delta：窗口 live 行 + 删除日志。
+            std::vector<std::byte> b;
+            const std::uint64_t cnt_pos = b.size();
+            put_u64_byte(b, 0);
+            std::uint64_t rows = 0;
+            bool ok = true;
+            index_.for_each_live_in(
+                from, watermark,
+                [&](std::uint64_t ord, const std::string& ext,
+                    const index::DocSlot& slot) {
+                    if (ext.size() > 0xFFFF) { ok = false; return; }
+                    put_u64_byte(b, ord);
+                    put_u16_byte(b, static_cast<std::uint16_t>(ext.size()));
+                    b.insert(b.end(),
+                        reinterpret_cast<const std::byte*>(ext.data()),
+                        reinterpret_cast<const std::byte*>(ext.data()) +
+                            ext.size());
+                    put_u32_byte(b, slot.loc.file_id);
+                    put_u64_byte(b, slot.loc.offset);
+                    put_u32_byte(b, slot.loc.total_sz);
+                    put_u32_byte(b, slot.tstamp);
+                    put_u32_byte(b, slot.doc_len);
+                    ++rows;
+                });
+            if (!ok) { result.wrote[ci] = false; continue; }
+            std::memcpy(b.data() + cnt_pos, &rows, 8);
+            put_u64_byte(b,
+                static_cast<std::uint64_t>(delta_removals_.size()));
+            for (const auto& [key, tomb] : delta_removals_) {
+                if (key.size() > 0xFFFF) {
+                    result.wrote[ci] = false;
+                    break;
+                }
+                put_u64_byte(b, tomb);
+                put_u16_byte(b, static_cast<std::uint16_t>(key.size()));
+                b.insert(b.end(),
+                    reinterpret_cast<const std::byte*>(key.data()),
+                    reinterpret_cast<const std::byte*>(key.data()) +
+                        key.size());
+            }
+            add_byte(sc::CkptSectionType::kDocmapDelta, std::move(b));
+            // keydir meta 仅在 docmap 组件落——其他组件通过 manifest 的
+            // 跨组件水位同享 keydir meta。
+            if (!keydir_delta.empty()) {
+                std::vector<std::byte> kb(keydir_delta.begin(),
+                                            keydir_delta.end());
+                add_byte(sc::CkptSectionType::kKeydirDelta, std::move(kb));
+            }
+        } else if (ci == 1) {
+            // bm25 delta：default + fields。
+            {
+                std::shared_lock lk(fields_mu_);
+                if (auto dit = fields_.find(kDefaultField);
+                    dit != fields_.end()) {
+                    std::vector<std::byte> b;
+                    dit->second->serialize_delta(b, from);
+                    add_byte(sc::CkptSectionType::kBm25DefaultDelta,
+                             std::move(b));
+                }
+                std::uint32_t other = 0;
+                for (auto& [field, inv] : fields_) {
+                    if (field != kDefaultField) ++other;
+                }
+                if (other > 0) {
+                    std::vector<std::byte> fb;
+                    put_u32_byte(fb, other);
+                    for (auto& [field, inv] : fields_) {
+                        if (field == kDefaultField) continue;
+                        put_u16_byte(fb,
+                            static_cast<std::uint16_t>(field.size()));
+                        fb.insert(fb.end(),
+                            reinterpret_cast<const std::byte*>(field.data()),
+                            reinterpret_cast<const std::byte*>(field.data()) +
+                                field.size());
+                        const std::uint64_t pos = fb.size();
+                        put_u64_byte(fb, 0);
+                        inv->serialize_delta(fb, from);
+                        const std::uint64_t len = fb.size() - pos - 8;
+                        std::memcpy(fb.data() + pos, &len, 8);
+                    }
+                    add_byte(sc::CkptSectionType::kBm25FieldsDelta,
+                             std::move(fb));
+                }
+            }
+        } else {
+            // vec delta：插入日志。
+            if (!delta_vecs_.empty()) {
+                std::vector<std::byte> b;
+                put_u64_byte(b,
+                    static_cast<std::uint64_t>(delta_vecs_.size()));
+                put_u16_byte(b, config_.vector_dim);
+                for (const auto& [ord, vec] : delta_vecs_) {
+                    put_u64_byte(b, ord);
+                    b.insert(b.end(),
+                        reinterpret_cast<const std::byte*>(vec.data()),
+                        reinterpret_cast<const std::byte*>(vec.data()) +
+                            vec.size() * sizeof(float));
+                }
+                add_byte(sc::CkptSectionType::kHnswDelta, std::move(b));
+            } else {
+                // vec delta 链路无内容 → 跳过本组件写入。
+                result.wrote[ci] = false;
+                continue;
+            }
+        }
+        if (!sc::SearchCheckpoint::write(dpath, watermark, secs)) {
+            result.wrote[ci] = false;
+            continue;
+        }
+        comp_chain_wm_[ci] = watermark;
+        comp_next_seq_[ci] = seq + 1;
+        result.wrote[ci] = true;
+        // 返回新的 chain_seq：写入 1 个 delta 后 chain_seq = 当前
+        // 已写数 = seq（序号从 1 开始）。caller 用此更新 manifest。
+        result.new_seqs[ci] = seq;
+    }
+    // 窗口日志：所有 dirty 组件都消费了同样的 delta_removals_/delta_vecs_
+    // （base 与链的同一窗口）→ 整体清空。
+    if (dirty_mask[0]) {
+        delta_removals_.clear();
+    }
+    if (dirty_mask[2]) {
+        delta_vecs_.clear();
+    }
+    // 脏位清零。
+    if (dirty_mask[0]) dirty_docmap_.store(false, std::memory_order_relaxed);
+    if (dirty_mask[1]) {
+        dirty_bm25_default_.store(false, std::memory_order_relaxed);
+        dirty_bm25_fields_.store(false, std::memory_order_relaxed);
+    }
+    if (dirty_mask[2]) dirty_hnsw_.store(false, std::memory_order_relaxed);
+    return result;
+}
+
+// S17-4:per-component 载入。expected_base_wm 来自 manifest 的 base_watermark。
+// 1) 读 comp.ckpt → 校验 header.watermark；不匹配则试 .prev。
+// 2) 链：.d1..d{chain_seq}，每文件 kDeltaInfo 三元组必须与前一节 base_gen /
+//    coverage / seq 严丝合缝（已有 delta 链校验逻辑），失败则本组件水位 0
+//    (fold 兜底)。
+// 3) 链的 kDocmapDelta 内的 (keydir 行/删除) 经 hook 透传到 keydir。
+SearchLayer::ComponentLoadResult SearchLayer::load_component(
+    bitcask::ComponentId comp, std::string_view dir,
+    std::uint64_t expected_base_wm, std::uint32_t chain_seq,
+    const DeltaReplayHook& hook) {
+    namespace sc = bitcask::search;
+    ComponentLoadResult result;
+    const std::filesystem::path base_dir(dir);
+    const std::string fp = (base_dir / kCompFile[static_cast<std::size_t>(comp)])
+        .string();
+    const std::string prev_path = fp + ".prev";
+    auto try_read = [&](const std::string& p) -> std::optional<sc::LoadedCheckpoint> {
+        return sc::SearchCheckpoint::read(p);
+    };
+    auto lc = try_read(fp);
+    bool from_prev = false;
+    if (lc && lc->watermark != expected_base_wm) {
+        // header.watermark 不匹配 manifest：可能跨代不一致。
+        lc.reset();
+    }
+    if (!lc) {
+        lc = try_read(prev_path);
+        if (lc && lc->watermark != expected_base_wm) {
+            lc.reset();
+        }
+        if (lc) from_prev = true;
+    }
+    if (!lc) {
+        // 组件损坏或缺：水位 0，让 fold 重建。
+        result.loaded = false;
+        result.watermark = 0;
+        result.from_prev = false;
+        result.all_segments_ok = false;
+        comp_base_gen_[static_cast<std::size_t>(comp)] = 0;
+        comp_chain_wm_[static_cast<std::size_t>(comp)] = 0;
+        comp_next_seq_[static_cast<std::size_t>(comp)] = 1;
+        return result;
+    }
+    // 按组件类型分发段。
+    bool segments_ok = true;
+    switch (comp) {
+    case bitcask::ComponentId::kDocmap: {
+        bool any = false;
+        for (const auto& ls : lc->sections) {
+            if (!ls.crc_ok) { segments_ok = false; continue; }
+            if (ls.type ==
+                static_cast<std::uint16_t>(sc::CkptSectionType::kDocmap)) {
+                auto covers = deserialize_docmap(
+                    std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(
+                            ls.payload.data()),
+                        ls.payload.size()));
+                if (!covers) segments_ok = false;
+                else any = true;
+            }
+            // 旧文件可能含 meta/terms 等扩展段——忽略。
+        }
+        if (!any) segments_ok = false;
+        if (any) dirty_docmap_.store(false, std::memory_order_relaxed);
+        break;
+    }
+    case bitcask::ComponentId::kBm25: {
+        bool any = false;
+        for (const auto& ls : lc->sections) {
+            if (!ls.crc_ok) { segments_ok = false; continue; }
+            auto st = static_cast<sc::CkptSectionType>(ls.type);
+            if (st == sc::CkptSectionType::kBm25Default) {
+                std::unique_lock lk(fields_mu_);
+                auto it = fields_.find(std::string(kDefaultField));
+                std::unique_ptr<bm25::InvertedIndex> inv;
+                if (it == fields_.end()) {
+                    inv = std::make_unique<bm25::InvertedIndex>(
+                        config_.bm25_params, config_.index_positions);
+                    if (inv->deserialize(
+                            std::span<const std::byte>(ls.payload.data(),
+                                                       ls.payload.size()))) {
+                        fields_.emplace(kDefaultField, std::move(inv));
+                        any = true;
+                        dirty_bm25_default_.store(false,
+                            std::memory_order_relaxed);
+                    } else {
+                        segments_ok = false;
+                    }
+                } else {
+                    if (it->second->deserialize(
+                            std::span<const std::byte>(ls.payload.data(),
+                                                       ls.payload.size()))) {
+                        any = true;
+                        dirty_bm25_default_.store(false,
+                            std::memory_order_relaxed);
+                    } else {
+                        segments_ok = false;
+                    }
+                }
+            } else if (st == sc::CkptSectionType::kBm25Fields) {
+                const auto* p = ls.payload.data();
+                const auto* end = p + ls.payload.size();
+                if (end - p < 4) { segments_ok = false; continue; }
+                std::uint32_t cnt = get_u32_byte(p); p += 4;
+                std::unique_lock lk(fields_mu_);
+                for (std::uint32_t i = 0; i < cnt; ++i) {
+                    if (end - p < 2) { segments_ok = false; break; }
+                    std::uint16_t nlen = get_u16_byte(p); p += 2;
+                    if (end - p < nlen + 8) { segments_ok = false; break; }
+                    std::string name(reinterpret_cast<const char*>(p), nlen);
+                    p += nlen;
+                    std::uint64_t ilen = get_u64_byte(p); p += 8;
+                    if (end - p < static_cast<std::ptrdiff_t>(ilen)) {
+                        segments_ok = false; break;
+                    }
+                    auto inv = std::make_unique<bm25::InvertedIndex>(
+                        config_.bm25_params, config_.index_positions);
+                    if (inv->deserialize(std::span<const std::byte>(p, ilen))) {
+                        fields_.emplace(std::move(name), std::move(inv));
+                        any = true;
+                        dirty_bm25_fields_.store(false,
+                            std::memory_order_relaxed);
+                    } else {
+                        segments_ok = false;
+                    }
+                    p += ilen;
+                }
+            }
+        }
+        if (!any) segments_ok = false;
+        break;
+    }
+    case bitcask::ComponentId::kVec: {
+        bool any = false;
+        for (const auto& ls : lc->sections) {
+            if (!ls.crc_ok) { segments_ok = false; continue; }
+            if (ls.type ==
+                static_cast<std::uint16_t>(sc::CkptSectionType::kHnsw)) {
+                auto cur = hnsw_.load(std::memory_order_acquire);
+                if (cur) {
+                    auto fresh = std::make_shared<vec::HnswIndex>(cur->config());
+                    const auto* raw = reinterpret_cast<const std::uint8_t*>(
+                        ls.payload.data());
+                    if (fresh->deserialize({raw, ls.payload.size()})) {
+                        const std::string vec_path =
+                            std::filesystem::path(fp)
+                                .replace_extension(".vec").string();
+                        const std::string qc_path =
+                            std::filesystem::path(fp)
+                                .replace_extension(".qc8").string();
+                        if ((fresh->config().inmem_int8 ||
+                             fresh->load_vec_payload(vec_path)) &&
+                            fresh->load_qc_payload(qc_path)) {
+                            hnsw_.store(std::move(fresh),
+                                        std::memory_order_release);
+                            any = true;
+                            dirty_hnsw_.store(false, std::memory_order_relaxed);
+                        } else {
+                            segments_ok = false;
+                        }
+                    } else {
+                        segments_ok = false;
+                    }
+                }
+            }
+        }
+        if (config_.vector_dim > 0 && !any) segments_ok = false;
+        break;
+    }
+    }
+    // 链重放。
+    std::uint64_t coverage = lc->watermark;
+    std::uint32_t next_seq = 1;
+    bool chain_ok = true;
+    if (segments_ok && !from_prev) {
+        const std::uint64_t base_gen_for_chain = coverage;
+        for (std::uint32_t s = 1; s <= chain_seq; ++s) {
+            const std::string dpath = fp + ".d" + std::to_string(s);
+            std::error_code ec;
+            if (!std::filesystem::exists(dpath, ec)) {
+                chain_ok = false;
+                break;
+            }
+            auto dc = sc::SearchCheckpoint::read(dpath);
+            if (!dc) { chain_ok = false; break; }
+            const sc::LoadedSection* info = nullptr;
+            for (const auto& dls : dc->sections) {
+                if (dls.type ==
+                    static_cast<std::uint16_t>(
+                        sc::CkptSectionType::kDeltaInfo)) {
+                    info = &dls; break;
+                }
+            }
+            if (!info || !info->crc_ok || info->payload.size() != 20) {
+                chain_ok = false; break;
+            }
+            const auto* q = info->payload.data();
+            const std::uint64_t gen = get_u64_byte(q); q += 8;
+            const std::uint64_t prev_wm = get_u64_byte(q); q += 8;
+            const std::uint32_t seq = get_u32_byte(q);
+            if (gen != base_gen_for_chain || prev_wm != coverage ||
+                seq != s) {
+                chain_ok = false; break;
+            }
+            if (!apply_delta_file(dc->sections, hook)) {
+                chain_ok = false; break;
+            }
+            coverage = dc->watermark;
+            next_seq = s + 1;
+        }
+    } else {
+        chain_ok = false;
+    }
+    result.loaded = segments_ok && chain_ok;
+    result.watermark = coverage;
+    result.from_prev = from_prev;
+    result.all_segments_ok = segments_ok && chain_ok;
+    // 镜像链状态（成功路径；失败时让 fold 阶段重放）。
+    comp_base_gen_[static_cast<std::size_t>(comp)] =
+        result.loaded ? expected_base_wm : 0;
+    comp_chain_wm_[static_cast<std::size_t>(comp)] =
+        result.loaded ? coverage : 0;
+    comp_next_seq_[static_cast<std::size_t>(comp)] =
+        result.loaded ? next_seq : 1;
+    return result;
+}
+
 }  // namespace bitcask::search

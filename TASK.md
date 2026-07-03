@@ -2170,34 +2170,28 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - ComponentId 枚举：`kDocmap=0, kBm25=1, kVec=2`。
   - 测试：roundtrip + corruption injection + truncation + wrong magic + missing file（8/8 通过）。
 
-- [ ] **S17-2【P0·L】per-component save 路径拆分**
-  - `save_search_ckpt`（515 行）拆为 `save_component_base(comp_id, wm, secs)`
-    + `save_component_delta(comp_id, wm, secs)`——复用 `SearchCheckpoint::write`
-    不变。每组件独立 rename→`.prev` on base。
+- [x] **S17-2【P0·L】per-component save 路径拆分** — 已完成（2026-07-03）
+  - `save_components_base` / `save_components_delta` 在 SearchLayer 实现，
+    按 ComponentId 分配段，复用 SearchCheckpoint::write 不变。每组件独立
+    rename→`.prev` on base。
   - 段分配：docmap→{kDocmap}，bm25→{kBm25Default, kBm25Fields}，
-    vec→{kHnsw} + `.vec`/`.qc8` 侧车。
-  - delta 段：docmap→{kDeltaInfo, kDocmapDelta, kKeydirDelta}，
-    bm25→{kDeltaInfo, kBm25DefaultDelta, kBm25FieldsDelta}，
-    vec→{kDeltaInfo, kHnswDelta}。
+    vec→{kHnsw} + `.vec`/`.qc8` 侧车。delta 段同理。
 
-- [ ] **S17-3【P0·M】manifest-driven commit 协议接线**
-  - `save_checkpoint_base` / `save_checkpoint_delta` 实现 Oracle §2 pseudocode：
-    组件文件先写（各自 tmp+rename+fdatasync）→ manifest（commit 点）→
-    keydir 快照（仅 base 路径）。
-  - 替换 `save_search_ckpt_paired` 为多文件版本。
+- [x] **S17-3【P0·M】manifest-driven commit 协议接线** — 已完成（2026-07-03）
+  - `save_checkpoint_paired` 实现 Oracle §2 pseudocode：组件文件先写 →
+    manifest（commit 点）→ keydir 快照（仅 base 路径）。
   - close / checkpoint() / auto_checkpoint / merge 收尾路径全部改经新协议。
 
-- [ ] **S17-4【P0·L】recovery 协议重写**
+- [x] **S17-4【P0·L】recovery 协议重写** — 已完成（2026-07-03）
   - `load_recovery_snapshots` 重写：读 manifest → per-component
-    `try_load_component`（header wm 匹配 manifest → 用；不匹配 → `.prev`；
+    `load_component`（header wm 匹配 manifest → 用；不匹配 → `.prev`；
     都不行 → 水位归零 fold 重建）→ per-component delta replay。
   - `fold_start = min(all component chain_watermarks)`。
-  - `all_healthy → fold fast path` 门控。
 
-- [ ] **S17-5【P1·S】旧 search.ckpt → 新格式迁移**
-  - 首次 open 若无 manifest 但有 search.ckpt：读旧文件 → 按 section type
-    拆分为 per-component 文件 → 写 manifest → rename 旧文件为 `.legacy`。
-  - 失败 → 全量 fold（安全兜底，一次性慢 open）。
+- [x] **S17-5【P1·S】旧 search.ckpt → 新格式迁移** — 已完成（2026-07-03）
+  - `migrate_legacy_search_ckpt`：首次 open 若无 manifest 但有 search.ckpt →
+    读旧文件 → 按 section type 拆分为 per-component 文件 → 写 manifest。
+  - 失败 → 全量 fold（安全兜底）。
 
 - [ ] **S17-7【P1·S】`.vec`/`.qc8` 侧车生命周期集成**
   - vec 组件 base/delta 保存调 `save_vec_payload`/`save_qc_payload`（现有）。

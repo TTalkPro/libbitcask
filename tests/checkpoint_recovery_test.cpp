@@ -108,11 +108,13 @@ class CheckpointRecoveryTest : public ::testing::Test {
 // P14e: search.ckpt corruption (CRC mismatch) must fall back to full fold of
 // data files. Open succeeds, all docs remain searchable, and a new checkpoint
 // is rewritten on the next close.
+// S17-2:per-component split — corrupt the bm25.ckpt (always present) to
+// trigger component-level fallback. docmap.ckpt / vec.ckpt are healthy.
 TEST_F(CheckpointRecoveryTest, CorruptSearchCheckpointFallsBackToFullFold) {
   namespace fs = std::filesystem;
   constexpr int kN = 10;
   constexpr int kDim = 128;
-  const auto search_ckpt = tmpdir_ / "search.ckpt";
+  const auto bm25_ckpt = tmpdir_ / "bm25.ckpt";
   const auto opts = make_search_options(kDim);
 
   {
@@ -132,21 +134,21 @@ TEST_F(CheckpointRecoveryTest, CorruptSearchCheckpointFallsBackToFullFold) {
     (*c)->close();
   }
 
-  ASSERT_TRUE(fs::exists(search_ckpt)) << "search.ckpt was not written";
+  ASSERT_TRUE(fs::exists(bm25_ckpt)) << "bm25.ckpt was not written";
 
   {
-    const auto sz = fs::file_size(search_ckpt);
-    ASSERT_GT(sz, 8u) << "search.ckpt too small to corrupt";
+    const auto sz = fs::file_size(bm25_ckpt);
+    ASSERT_GT(sz, 8u) << "bm25.ckpt too small to corrupt";
     const std::vector<std::byte> garbage{
         std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF}, std::byte{0xFF},
         std::byte{0xDE}, std::byte{0xAD}, std::byte{0xBE}, std::byte{0xEF}};
     const std::size_t off = std::max<std::size_t>(4, sz / 2);
-    corrupt_file_bytes(search_ckpt, off, garbage);
+    corrupt_file_bytes(bm25_ckpt, off, garbage);
   }
 
   {
     auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
-    ASSERT_TRUE(c) << "reopen with corrupt search.ckpt failed: "
+    ASSERT_TRUE(c) << "reopen with corrupt bm25.ckpt failed: "
                    << c.error().detail;
 
     auto text_res = (*c)->search_text("hello", 20);
@@ -170,9 +172,9 @@ TEST_F(CheckpointRecoveryTest, CorruptSearchCheckpointFallsBackToFullFold) {
     (*c)->close();
   }
 
-  EXPECT_TRUE(fs::exists(search_ckpt))
-      << "search.ckpt was not rewritten after recovery";
-  EXPECT_GT(fs::file_size(search_ckpt), 0u);
+  EXPECT_TRUE(fs::exists(bm25_ckpt))
+      << "bm25.ckpt was not rewritten after recovery";
+  EXPECT_GT(fs::file_size(bm25_ckpt), 0u);
 }
 
 // P14e: kv.keydir.ckpt corruption must fall back to full fold of data files.
@@ -273,14 +275,16 @@ TEST_F(CheckpointRecoveryTest, MissingCheckpointFallsBackToFullFold) {
 // either load the previous generation or fall back to full fold. Either is
 // acceptable; open must succeed and at least the older generation's docs must
 // be searchable.
+// S17-2:per-component split — corrupt the current bm25.ckpt; the .prev
+// generation should still be readable, or fallback to full fold.
 TEST_F(CheckpointRecoveryTest,
        CorruptSearchCheckpointPrevGenerationFallback) {
   namespace fs = std::filesystem;
   constexpr int kFirst = 5;
   constexpr int kSecond = 5;
   constexpr int kDim = 128;
-  const auto search_ckpt = tmpdir_ / "search.ckpt";
-  const auto search_prev = tmpdir_ / "search.ckpt.prev";
+  const auto bm25_ckpt = tmpdir_ / "bm25.ckpt";
+  const auto bm25_prev = tmpdir_ / "bm25.ckpt.prev";
   const auto opts = make_search_options(kDim);
 
   {
@@ -313,23 +317,23 @@ TEST_F(CheckpointRecoveryTest,
     (*c)->close();
   }
 
-  ASSERT_TRUE(fs::exists(search_ckpt));
-  ASSERT_TRUE(fs::exists(search_prev))
-      << "second close did not create search.ckpt.prev";
+  ASSERT_TRUE(fs::exists(bm25_ckpt));
+  ASSERT_TRUE(fs::exists(bm25_prev))
+      << "second close did not create bm25.ckpt.prev";
 
   {
-    const auto sz = fs::file_size(search_ckpt);
+    const auto sz = fs::file_size(bm25_ckpt);
     ASSERT_GT(sz, 8u);
     const std::vector<std::byte> garbage{
         std::byte{0xAA}, std::byte{0xBB}, std::byte{0xCC}, std::byte{0xDD},
         std::byte{0x11}, std::byte{0x22}, std::byte{0x33}, std::byte{0x44}};
     const std::size_t off = std::max<std::size_t>(4, sz / 2);
-    corrupt_file_bytes(search_ckpt, off, garbage);
+    corrupt_file_bytes(bm25_ckpt, off, garbage);
   }
 
   {
     auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
-    ASSERT_TRUE(c) << "reopen with corrupt current search.ckpt failed: "
+    ASSERT_TRUE(c) << "reopen with corrupt current bm25.ckpt failed: "
                    << c.error().detail;
 
     auto text_res = (*c)->search_text("hello", 20);
@@ -348,14 +352,14 @@ TEST_F(CheckpointRecoveryTest,
 }
 
 // S3: 批量并行恢复必须与逐条恢复结果一致。> 1024 文档（跨 batch 边界多次）
-// + 删除（穿插墓碑，触发 tomb-flush 保序）。删 search.ckpt 强制全量 fold →
+// + 删除（穿插墓碑，触发 tomb-flush 保序）。删 docmap.ckpt 强制全量 fold →
 // 批量 recover_doc_batch。断言：fold 重建后的搜索结果集 == close 前（异步
 // 索引）的结果集，且被删 key 不在其中。
 TEST_F(CheckpointRecoveryTest, S3BatchedRecoveryMatchesSerial) {
   namespace fs = std::filesystem;
   constexpr int kN = 1500;            // > 1024 → 多个 batch
   constexpr int kDim = 64;
-  const auto search_ckpt = tmpdir_ / "search.ckpt";
+  const auto docmap_ckpt = tmpdir_ / "docmap.ckpt";
   const auto opts = make_search_options(kDim);
 
   auto query_keys = [](Cask& c) {
@@ -404,9 +408,9 @@ TEST_F(CheckpointRecoveryTest, S3BatchedRecoveryMatchesSerial) {
   ASSERT_EQ(before, expected_live)
       << "async-built index 的 live 集与预期不符（前置条件）";
 
-  // 删 search.ckpt → 强制全量 fold → 批量 recover_doc_batch。
-  ASSERT_TRUE(fs::exists(search_ckpt));
-  fs::remove(search_ckpt);
+  // 删 docmap.ckpt → 强制全量 fold → 批量 recover_doc_batch。
+  ASSERT_TRUE(fs::exists(docmap_ckpt));
+  fs::remove(docmap_ckpt);
 
   {
     auto c = Cask::open(tmpdir_.string(), opts, &test_registry());

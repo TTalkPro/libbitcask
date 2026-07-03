@@ -45,6 +45,7 @@
 #include "bitcask/data_file.hpp"
 #include "bitcask/file_lock.hpp"
 #include "bitcask/hint_file.hpp"
+#include "bitcask/index_manifest.hpp"  // S17-2:per-component commit
 #include "bitcask/keydir.hpp"
 #include "bitcask/merge_policy.hpp"
 #include "bitcask/merger.hpp"
@@ -796,11 +797,27 @@ private:
     // 时刻构建）内联进 delta 文件（**同文件原子成对**，无写序窗口，且
     // 不再每次全量写 kv.keydir.ckpt——它曾是 delta 时代 per-save I/O 的
     // 大头）；base 路径照旧全量快照（先 ckpt 后快照）。
+    // S17-3 改造为 P3：先写 per-component 段（docmap/bm25/vec），再写
+    // manifest（commit point），最后才写 keydir 快照（仅 base 路径）。
     bool save_search_ckpt_paired(
         const std::string& path, std::uint64_t wm,
         const std::optional<std::vector<
             std::pair<std::uint32_t, std::uint64_t>>>& wms,
         const std::vector<std::byte>& keydir_delta);
+
+    // S17-3 显式 commit 入口：先 per-component base（或 delta），再写
+    // manifest 作为 commit point，最后 base 路径下写 keydir 快照。
+    // delta 路径不写 keydir 快照（元数据已内联进 delta 文件）。返回
+    // manifest 是否成功提交。
+    bool save_checkpoint_paired(
+        const std::string& dir, std::uint64_t wm,
+        const std::optional<std::vector<
+            std::pair<std::uint32_t, std::uint64_t>>>& wms,
+        const std::vector<std::byte>& keydir_delta);
+
+    // S17-2:当前 manifest。save 时按组件结果更新；load 时初始化。每组件
+    // 链状态也镜像一份（SearchLayer 内部维护，Cask 在 commit 时同步）。
+    bitcask::Manifest current_manifest_;
 
     std::atomic<std::uint32_t> writes_in_flight_{0};
     struct WriteOpGate {
@@ -1008,6 +1025,13 @@ public:
         const std::vector<search::SearchLayer::DeltaRemoval>& rems,
         std::span<const std::byte> keydir_meta,
         RecoverySnapshots& recovery);
+
+    // S17-5:legacy search.ckpt → 3 个组件文件 + manifest 的一次性迁移。
+    // 仅在 open 阶段、manifest 不存在但 search.ckpt 存在时触发。成功
+    // 后写 index.manifest + docmap.ckpt/bm25.ckpt/vec.ckpt + 删旧文件。
+    // 失败返回 false（caller 退全量 fold）。
+    [[nodiscard]] bool migrate_legacy_search_ckpt(
+        search::SearchLayer& search_layer);
 
     // ---- 搜索方法共用基础设施 ----
 

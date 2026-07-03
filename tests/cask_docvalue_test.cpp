@@ -1718,7 +1718,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotFastReopen) {
         ASSERT_TRUE((*c)->remove(sv_bytes(std::string("k7"))));
         (*c)->close();
     }
-    ASSERT_TRUE(std::filesystem::exists(tmpdir_ / "search.ckpt"));
+    ASSERT_TRUE(std::filesystem::exists(tmpdir_ / "bm25.ckpt"));
 
     auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
@@ -1780,7 +1780,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotCorruptSidecarFallsBack) {
         }
         (*c)->close();
     }
-    const auto sc = tmpdir_ / "search.ckpt";
+    const auto sc = tmpdir_ / "bm25.ckpt";
     std::filesystem::resize_file(sc, std::filesystem::file_size(sc) / 2);
 
     auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
@@ -2591,7 +2591,7 @@ TEST_F(CaskDocValueTest, V35SnapshotFastReopen) {
         expect_keys = v35_hit_keys(*r);
         (*c)->close();
     }
-    ASSERT_TRUE(std::filesystem::exists(tmpdir_ / "search.ckpt"));
+    ASSERT_TRUE(std::filesystem::exists(tmpdir_ / "bm25.ckpt"));
 
     auto search_in = [&](const std::string& dir) {
         std::vector<std::string> keys;
@@ -2627,9 +2627,9 @@ TEST_F(CaskDocValueTest, V35SnapshotFastReopen) {
     std::filesystem::remove_all(snaponly, ec);
 
     // (c) 删 search.ckpt → 全量 fold,结果等价;close 后快照重新落盘。
-    std::filesystem::remove(tmpdir_ / "search.ckpt");
+    std::filesystem::remove(tmpdir_ / "bm25.ckpt");
     EXPECT_EQ(search_in(tmpdir_.string()), expect_keys);
-    EXPECT_TRUE(std::filesystem::exists(tmpdir_ / "search.ckpt"));
+    EXPECT_TRUE(std::filesystem::exists(tmpdir_ / "bm25.ckpt"));
 }
 
 // 三件套 2:快照旧于 data 尾部(崩溃形态)——回退 keydir+search.ckpt 到
@@ -2639,7 +2639,7 @@ TEST_F(CaskDocValueTest, V35StaleTailReplay) {
     auto opts = v31_opts(kDim);
     auto vecs = v35_make_vecs(35, kDim, 0x57A1E);
     const auto kd_snap = tmpdir_ / "kv.keydir.ckpt";
-    const auto hs_snap = tmpdir_ / "search.ckpt";
+    const auto hs_snap = tmpdir_ / "bm25.ckpt";
     const auto kd_old = tmpdir_ / "kd.old";
     const auto hs_old = tmpdir_ / "hs.old";
 
@@ -2709,7 +2709,7 @@ TEST_F(CaskDocValueTest, V35CorruptFallsBack) {
         expect_keys = v35_hit_keys(*r);
         (*c)->close();
     }
-    const auto snap = tmpdir_ / "search.ckpt";
+    const auto snap = tmpdir_ / "bm25.ckpt";
     ASSERT_TRUE(std::filesystem::exists(snap));
 
     {   // 位翻转 payload 中部(CRC 必炸 → load 整体拒绝)。
@@ -3224,7 +3224,7 @@ TEST_F(CaskDocValueTest, CheckpointCrashImageRecoversAllDocs) {
     };
     put_n(0, 120);
     ASSERT_TRUE((*c)->checkpoint());
-    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt"));
     EXPECT_TRUE(fs::exists(tmpdir_ / "kv.keydir.ckpt"));
     put_n(120, 160);  // ckpt 之后的尾部增量，崩溃时只存在于 data 文件
 
@@ -3281,7 +3281,7 @@ TEST_F(CaskDocValueTest, CheckpointConcurrentWithWrites) {
     for (auto& t : ts) t.join();
     EXPECT_TRUE(ok.load()) << "并发写下 checkpoint 出现错误返回";
     ASSERT_TRUE((*c)->checkpoint());  // 静止后收尾一份
-    EXPECT_TRUE(std::filesystem::exists(tmpdir_ / "search.ckpt"));
+    EXPECT_TRUE(std::filesystem::exists(tmpdir_ / "bm25.ckpt"));
     (*c)->close();
 }
 
@@ -3304,7 +3304,7 @@ TEST_F(CaskDocValueTest, AutoCheckpointOnRoll) {
                                   static_cast<std::uint32_t>(3000 + i)));
     }
     (*c)->flush_index();  // 排干 reducer → 在途自动 ckpt RunFn 必已执行
-    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt"));
     EXPECT_TRUE(fs::exists(tmpdir_ / "kv.keydir.ckpt"));
     {
         auto live = (*c)->search_text("lemon", 500);
@@ -3357,13 +3357,16 @@ TEST_F(CaskDocValueTest, CheckpointVecPayloadAppends) {
 
     put_range(0, 120);
     ASSERT_TRUE((*c)->checkpoint());  // 首存：全量 base（.vec 收养 inode）
-    const std::string vec_path = (tmpdir_ / "search.vec").string();
+    // S17-2:per-component sidecar is sibling to vec.ckpt（vec.vec / vec.qc8）。
+    const std::string vec_path = (tmpdir_ / "vec.vec").string();
     struct stat st1;
     ASSERT_EQ(::stat(vec_path.c_str(), &st1), 0);
 
     put_range(120, 160);
     ASSERT_TRUE((*c)->checkpoint());  // 二存：delta——base 与 .vec 均不动
-    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d1"));
+    // S17-2:per-component delta——vec 组件写 .d1。
+    EXPECT_TRUE(fs::exists(tmpdir_ / "vec.ckpt.d1"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "docmap.ckpt.d1"));
     struct stat st2;
     ASSERT_EQ(::stat(vec_path.c_str(), &st2), 0);
     EXPECT_EQ(st1.st_ino, st2.st_ino);
@@ -3378,8 +3381,9 @@ TEST_F(CaskDocValueTest, CheckpointVecPayloadAppends) {
     EXPECT_EQ(st1.st_ino, st3.st_ino) << "close 的 base 保存应追加 .vec 而非重写";
     EXPECT_EQ(static_cast<std::size_t>(st3.st_size - st1.st_size),
               40u * kDim * sizeof(float));
-    EXPECT_FALSE(fs::exists(tmpdir_ / "search.ckpt.d1"))
+    EXPECT_FALSE(fs::exists(tmpdir_ / "vec.ckpt.d1"))
         << "base 落成后 delta 链应被清扫";
+    EXPECT_FALSE(fs::exists(tmpdir_ / "docmap.ckpt.d1"));
 
     auto r = Cask::open(img.string(), opts, &test_registry());
     ASSERT_TRUE(r);
@@ -3459,27 +3463,39 @@ TEST_F(CaskDocValueTest, CheckpointDeltaChainSelectiveSections) {
     constexpr std::uint16_t kBm25D = 7, kInfo = 9, kDocD = 10, kHnswD = 11;
 
     // A：文本+向量 → 全量 base。
+    // S17-2：per-component 路径——base 是 bm25.ckpt（docmap+bm25+hnsw
+    // 各自独立 base 文件），不是合并的 search.ckpt。
     for (int i = 0; i < 60; ++i) put_one(i, true, true);
     ASSERT_TRUE((*c)->checkpoint());
-    auto base1 = read_file(tmpdir_ / "search.ckpt");
+    auto base1 = read_file(tmpdir_ / "bm25.ckpt");
     ASSERT_FALSE(base1.empty());
 
-    // B：纯文本增量 → d1（无 hnsw delta；base 不动）。
+    // B：纯文本增量 → 各自 .d1（无 hnsw delta；base 不动）。
     for (int i = 60; i < 100; ++i) put_one(i, true, false);
     ASSERT_TRUE((*c)->checkpoint());
-    auto t1 = delta_types(tmpdir_ / "search.ckpt.d1");
-    EXPECT_TRUE(t1.count(kInfo) && t1.count(kBm25D) && t1.count(kDocD));
-    EXPECT_FALSE(t1.count(kHnswD)) << "纯文本窗口不应有 hnsw delta";
-    EXPECT_EQ(read_file(tmpdir_ / "search.ckpt"), base1)
+    // docmap 组件 delta 必含 kDocmapDelta + kInfo。
+    auto t1_doc = delta_types(tmpdir_ / "docmap.ckpt.d1");
+    EXPECT_TRUE(t1_doc.count(kInfo) && t1_doc.count(kDocD));
+    EXPECT_FALSE(t1_doc.count(kHnswD)) << "纯文本窗口不应有 hnsw delta";
+    // bm25 组件 delta 必含 kBm25D + kInfo。
+    auto t1_bm = delta_types(tmpdir_ / "bm25.ckpt.d1");
+    EXPECT_TRUE(t1_bm.count(kInfo) && t1_bm.count(kBm25D));
+    EXPECT_EQ(read_file(tmpdir_ / "bm25.ckpt"), base1)
         << "delta 保存不应重写 base";
 
-    // C：纯向量增量 → d2（无 bm25.default delta）。
+    // C：纯向量增量 → 各自 .d2（无 bm25.default delta）。
     for (int i = 100; i < 130; ++i) put_one(i, false, true);
     ASSERT_TRUE((*c)->checkpoint());
-    auto t2 = delta_types(tmpdir_ / "search.ckpt.d2");
-    EXPECT_TRUE(t2.count(kInfo) && t2.count(kHnswD) && t2.count(kDocD));
-    EXPECT_FALSE(t2.count(kBm25D)) << "纯向量窗口不应有 bm25.default delta";
-    EXPECT_EQ(read_file(tmpdir_ / "search.ckpt"), base1);
+    // docmap delta 必含 kDocmapDelta（vec 写也会更新 docmap）。
+    auto t2_doc = delta_types(tmpdir_ / "docmap.ckpt.d2");
+    EXPECT_TRUE(t2_doc.count(kInfo) && t2_doc.count(kDocD));
+    // bm25 组件 delta 必不含 kBm25D（纯 vec 窗口无 bm25 变化）。
+    auto t2_bm = delta_types(tmpdir_ / "bm25.ckpt.d2");
+    EXPECT_FALSE(t2_bm.count(kBm25D)) << "纯向量窗口不应有 bm25.default delta";
+    // vec 组件 delta 必含 kHnswD。
+    auto t2_vec = delta_types(tmpdir_ / "vec.ckpt.d1");
+    EXPECT_TRUE(t2_vec.count(kInfo) && t2_vec.count(kHnswD));
+    EXPECT_EQ(read_file(tmpdir_ / "bm25.ckpt"), base1);
 
     // 恢复语义：base + 链重放合成完整状态。
     auto img = crash_image(tmpdir_, "chain");
@@ -3584,7 +3600,7 @@ TEST_F(CaskDocValueTest, CheckpointDeltaChainDeletesAndOverwrites) {
     const auto keydir_snap_v1 =
         fs::last_write_time(tmpdir_ / "kv.keydir.ckpt");
 
-    // 窗口 1（→ d1）：
+    // 窗口 1（→ 各组件 d1）：
     put_text("dd_5", "delword updated5x");            // 覆盖写
     ASSERT_TRUE((*c)->remove(sv_bytes(std::string("dd_7"))));   // 跨窗删除
     put_text("dd_8", "delword rewritten8x");          // 写后删（下一行删掉）
@@ -3597,16 +3613,19 @@ TEST_F(CaskDocValueTest, CheckpointDeltaChainDeletesAndOverwrites) {
     }
     ASSERT_TRUE((*c)->remove(sv_bytes(std::string("dd_50"))));  // 窗口内建又删
     ASSERT_TRUE((*c)->checkpoint());  // d1
-    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d1"));
+    // S17-2：per-component delta——docmap / bm25 组件各自写 .d1。
+    EXPECT_TRUE(fs::exists(tmpdir_ / "docmap.ckpt.d1"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt.d1"));
 
-    // 窗口 2（→ d2）：
+    // 窗口 2（→ 各组件 d2）：
     for (int i = 60; i < 65; ++i) {
         put_text("dd_" + std::to_string(i),
                  "delword n" + std::to_string(i) + "x");
     }
     ASSERT_TRUE((*c)->remove(sv_bytes(std::string("dd_2"))));
     ASSERT_TRUE((*c)->checkpoint());  // d2
-    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d2"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "docmap.ckpt.d2"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt.d2"));
     // S14-7：delta 保存不再全量写 kv.keydir.ckpt（元数据内联进 delta 文件）。
     EXPECT_EQ(fs::last_write_time(tmpdir_ / "kv.keydir.ckpt"), keydir_snap_v1)
         << "delta 保存不应重写 keydir 快照";
@@ -3657,11 +3676,15 @@ TEST_F(CaskDocValueTest, CheckpointDeltaChainDeletesAndOverwrites) {
         ASSERT_TRUE((*r)->put_doc(sv_bytes(std::string("dd_cont")), doc, 9100));
     }
     ASSERT_TRUE((*r)->checkpoint());
-    EXPECT_TRUE(fs::exists(img / "search.ckpt.d3")) << "重开后应续链";
+    // S17-2：per-component——重开后续链产出 .d3（docmap 组件）。
+    EXPECT_TRUE(fs::exists(img / "docmap.ckpt.d3")) << "重开后应续链";
+    EXPECT_TRUE(fs::exists(img / "bm25.ckpt.d3"));
     // close 强制 base → 链坍缩清扫。
     (*r)->close();
-    EXPECT_FALSE(fs::exists(img / "search.ckpt.d1"));
-    EXPECT_FALSE(fs::exists(img / "search.ckpt.d3"));
+    EXPECT_FALSE(fs::exists(img / "docmap.ckpt.d1"));
+    EXPECT_FALSE(fs::exists(img / "docmap.ckpt.d3"));
+    EXPECT_FALSE(fs::exists(img / "bm25.ckpt.d1"));
+    EXPECT_FALSE(fs::exists(img / "bm25.ckpt.d3"));
 
     // 链坍缩后的 base 独立可用。
     auto r2 = Cask::open(img.string(), opts, &test_registry());
@@ -3712,28 +3735,33 @@ TEST_F(CaskDocValueTest, CheckpointDeltaChainLengthBound) {
 
     put_batch_n(0, 10);
     ASSERT_TRUE((*c)->checkpoint());  // #1：base
-    auto base_v1 = read_file(tmpdir_ / "search.ckpt");
+    auto base_v1 = read_file(tmpdir_ / "bm25.ckpt");
     ASSERT_FALSE(base_v1.empty());
     put_batch_n(10, 20);
     ASSERT_TRUE((*c)->checkpoint());  // #2：d1
-    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d1"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "docmap.ckpt.d1"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt.d1"));
     put_batch_n(20, 30);
     ASSERT_TRUE((*c)->checkpoint());  // #3：d2（链长达上限 2）
-    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d2"));
-    EXPECT_EQ(read_file(tmpdir_ / "search.ckpt"), base_v1)
+    EXPECT_TRUE(fs::exists(tmpdir_ / "docmap.ckpt.d2"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt.d2"));
+    EXPECT_EQ(read_file(tmpdir_ / "bm25.ckpt"), base_v1)
         << "delta 保存不应动 base";
     put_batch_n(30, 40);
     ASSERT_TRUE((*c)->checkpoint());  // #4：链满 → 强制 base 坍缩
-    EXPECT_FALSE(fs::exists(tmpdir_ / "search.ckpt.d1"))
+    EXPECT_FALSE(fs::exists(tmpdir_ / "docmap.ckpt.d1"))
         << "base 落成后链应被清扫";
-    EXPECT_FALSE(fs::exists(tmpdir_ / "search.ckpt.d2"));
-    EXPECT_NE(read_file(tmpdir_ / "search.ckpt"), base_v1)
+    EXPECT_FALSE(fs::exists(tmpdir_ / "docmap.ckpt.d2"));
+    EXPECT_FALSE(fs::exists(tmpdir_ / "bm25.ckpt.d1"));
+    EXPECT_FALSE(fs::exists(tmpdir_ / "bm25.ckpt.d2"));
+    EXPECT_NE(read_file(tmpdir_ / "bm25.ckpt"), base_v1)
         << "链满应重写 base";
-    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.prev")) << "代际应刷新";
+    EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt.prev")) << "代际应刷新";
     // 坍缩后从 d1 重新起链。
     put_batch_n(40, 50);
     ASSERT_TRUE((*c)->checkpoint());
-    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt.d1"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "docmap.ckpt.d1"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt.d1"));
 
     // 崩溃镜像重开：新 base + 新链合成完整状态。
     auto img = crash_image(tmpdir_, "bound");
@@ -3765,7 +3793,7 @@ TEST_F(CaskDocValueTest, AutoCheckpointDisabledByDefault) {
                                   static_cast<std::uint32_t>(4000 + i)));
     }
     (*c)->flush_index();
-    EXPECT_FALSE(fs::exists(tmpdir_ / "search.ckpt"));
+    EXPECT_FALSE(fs::exists(tmpdir_ / "bm25.ckpt"));
     EXPECT_FALSE(fs::exists(tmpdir_ / "kv.keydir.ckpt"));
     (*c)->close();
 }
@@ -3789,13 +3817,13 @@ TEST_F(CaskDocValueTest, OpenAfterCrashResavesCheckpoint) {
     // （新建库首次 open 重分析量 0，不触发回存）。
     auto img = crash_image(tmpdir_, "resave");
     (*c)->close();
-    ASSERT_FALSE(fs::exists(img / "search.ckpt"));
+    ASSERT_FALSE(fs::exists(img / "bm25.ckpt"));
 
     {
         auto r = Cask::open(img.string(), opts, &test_registry());
         ASSERT_TRUE(r);
         // ①：重建（1500 docs > 阈值）完成后 open 已回存两份成对文件。
-        EXPECT_TRUE(fs::exists(img / "search.ckpt"));
+        EXPECT_TRUE(fs::exists(img / "bm25.ckpt"));
         EXPECT_TRUE(fs::exists(img / "kv.keydir.ckpt"));
         auto hits = (*r)->search_text("cherry", 2000);
         ASSERT_TRUE(hits);
@@ -4031,7 +4059,7 @@ TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
     // 验证 search.ckpt 文件确实存在
     {
         namespace fs = std::filesystem;
-        EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt"))
+        EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt"))
             << "search.ckpt should exist after merge";
     }
 }

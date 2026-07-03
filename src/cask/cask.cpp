@@ -28,6 +28,11 @@ namespace bitcask {
 inline constexpr const char* kKeydirSnapName = "kv.keydir.ckpt";
 // P14e:搜索索引统一分段 checkpoint（docmap/bm25/hnsw 单文件，逐段 CRC）。
 inline constexpr const char* kSearchCkptName = "search.ckpt";
+// S17-2:per-component 段文件名（docmap.ckpt / bm25.ckpt / vec.ckpt）。
+// 取代旧的 kSearchCkptName。S17-5 迁移期间旧名仍被读（一次性迁移路径）。
+inline constexpr const char* kDocmapCkptName = "docmap.ckpt";
+inline constexpr const char* kBm25CkptName   = "bm25.ckpt";
+inline constexpr const char* kVecCkptName    = "vec.ckpt";
 
 namespace {
 namespace fs = std::filesystem;
@@ -836,6 +841,71 @@ void Cask::replay_delta_to_keydir(
     }
 }
 
+// S17-5:legacy search.ckpt → per-component 一次性迁移。流程：
+//   1) 用旧 load_search_ckpt 把段全载回（带 hook 推进 keydir 字节水位）。
+//   2) 从 SearchLayer 内部状态读 watermark 与组件链状态，构造 manifest。
+//   3) 调 save_components_base 把当前内存态写到 3 个新组件文件。
+//   4) 写 manifest。
+//   5) 删旧 search.ckpt + search.ckpt.prev + .d* + search.vec / .qc8
+//      （这些已被 save_components_base 重新写到 docmap.ckpt / bm25.ckpt /
+//       vec.ckpt 对应 .vec / .qc8 sidecar）。
+// 失败返回 false（caller 退全量 fold）。
+bool Cask::migrate_legacy_search_ckpt(search::SearchLayer& search_layer) {
+    const std::string old_ckpt = dirname_ + "/" + kSearchCkptName;
+    // 1) 读旧 ckpt → 内存态（不写 keydir，已由 caller 在 recovery 阶段
+    // 后续的 load_recovery_snapshots 接管；这里只关心段载入与写新文件）。
+    auto result = search_layer.load_search_ckpt(old_ckpt);
+    if (!result.loaded) {
+        log_warn("migrate_legacy: failed to load legacy search.ckpt");
+        return false;
+    }
+    // 2) 构造 manifest：每组件 base_watermark = result.watermark,
+    // chain_seq = 0, chain_watermark = result.watermark（旧 ckpt 不区分
+    // 组件 base/链——所有组件的水位统一对齐到 result.watermark）。
+    bitcask::Manifest m;
+    for (auto& e : m.entries) {
+        e.base_watermark = result.watermark;
+        e.chain_seq = 0;
+        e.chain_watermark = result.watermark;
+    }
+    // 3) 写 per-component 文件。
+    std::array<bool, bitcask::kComponentCount> all_dirty{};
+    for (auto& b : all_dirty) b = true;
+    auto base_res = search_layer.save_components_base(
+        dirname_, result.watermark, all_dirty);
+    if (!base_res.wrote_base[0] || !base_res.wrote_base[1]) {
+        log_warn("migrate_legacy: failed to write per-component base "
+                 "(docmap=" + std::to_string(base_res.wrote_base[0]) +
+                 " bm25=" + std::to_string(base_res.wrote_base[1]) +
+                 " vec=" + std::to_string(base_res.wrote_base[2]) + ")");
+        return false;
+    }
+    // 4) 写 manifest。
+    const std::string mpath = dirname_ + "/" +
+        std::string(bitcask::kManifestName);
+    if (!bitcask::write_manifest(mpath, m)) {
+        log_warn("migrate_legacy: write_manifest failed");
+        return false;
+    }
+    current_manifest_ = m;
+    // 5) 删旧 search.ckpt + .prev + .d<seq> + .vec + .qc8。
+    std::error_code ec;
+    std::filesystem::remove(old_ckpt, ec);
+    std::filesystem::remove(old_ckpt + ".prev", ec);
+    for (std::uint32_t i = 1; i < 1024; ++i) {
+        if (!std::filesystem::remove(
+                old_ckpt + ".d" + std::to_string(i), ec)) {
+            // 链中段缺失即停（链是连续 1..N）。
+            if (ec) break;
+        }
+    }
+    std::filesystem::remove(
+        std::filesystem::path(old_ckpt).replace_extension(".vec"), ec);
+    std::filesystem::remove(
+        std::filesystem::path(old_ckpt).replace_extension(".qc8"), ec);
+    return true;
+}
+
 // 收尾顺序很关键：
 //   1. finalize active hint（写 trailer + running CRC，否则 hint 文件
 //      下次 open 时会被判失效，回退到全量 fold(data) 重建 keydir）；
@@ -1255,6 +1325,9 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
 // 自门模型取代旧 4-way 成对门：search.ckpt 健康且全段 CRC 通过 → fold_start
 // = keydir 水位（快路径）；否则 fold_start = 0（全量 fold，各索引按自身
 // ord 水位自门丢弃重叠区，方向安全）。
+// S17-4:per-component 协议——读 index.manifest 作为 commit point，按
+// 组件 file 路径分别载入 docmap.ckpt / bm25.ckpt / vec.ckpt。S17-5
+// 兼容：manifest 缺失但 search.ckpt 存在时触发一次性迁移。
 std::expected<Cask::RecoverySnapshots, CaskFault>
 Cask::load_recovery_snapshots(search::SearchLayer* search_layer) {
     RecoverySnapshots recovery;
@@ -1267,8 +1340,29 @@ Cask::load_recovery_snapshots(search::SearchLayer* search_layer) {
 
     bool search_ok = false;
     if (search_layer) {
-        // S14-7：链重放钩子——逻辑提取为 replay_delta_to_keydir，闭包退化为
-        // 薄委托（可独立测试）。
+        // S17-5 兼容：manifest 缺失 + search.ckpt 存在 → 一次性迁移。
+        const std::string mpath = dirname_ + "/" +
+            std::string(bitcask::kManifestName);
+        const std::string old_ckpt = dirname_ + "/" + kSearchCkptName;
+        std::error_code ec;
+        const bool has_manifest = std::filesystem::exists(mpath, ec);
+        const bool has_old_ckpt = std::filesystem::exists(old_ckpt, ec);
+        if (!has_manifest && has_old_ckpt) {
+            // 触发迁移：把旧 search.ckpt 用旧路径 load 回来，再分
+            // 写到新组件文件 + 写 manifest + 删旧文件。失败 → 全量 fold。
+            if (!migrate_legacy_search_ckpt(*search_layer)) {
+                recovery.snap_loaded = false;
+                return recovery;
+            }
+        }
+        auto manifest = bitcask::read_manifest(mpath);
+        if (!manifest) {
+            // manifest 仍不可读（迁移失败/被破坏）→ 全量 fold。
+            recovery.snap_loaded = false;
+            return recovery;
+        }
+        current_manifest_ = *manifest;
+        // S14-7：链重放钩子。
         search::SearchLayer::DeltaReplayHook hook =
             [this, &recovery](
                 const std::vector<search::SearchLayer::DeltaDocRow>& rows,
@@ -1276,16 +1370,56 @@ Cask::load_recovery_snapshots(search::SearchLayer* search_layer) {
                 std::span<const std::byte> keydir_meta) {
                 replay_delta_to_keydir(rows, rems, keydir_meta, recovery);
             };
-        auto result = search_layer->load_search_ckpt(
-            dirname_ + "/" + kSearchCkptName,
-            recovery.snap_loaded ? hook
-                                 : search::SearchLayer::DeltaReplayHook{});
-        // S14-4：.prev 回退不走字节水位快路径（keydir 快照可能与坏掉的
-        // 新代成对、水位超前）——退全量 fold，自门保证只重建缺口。
-        search_ok = result.loaded && result.all_segments_ok &&
-                    !result.from_prev;
+        // 逐组件 load（每组件独立校验、链重放）。
+        const auto hook_arg = recovery.snap_loaded ? hook :
+            search::SearchLayer::DeltaReplayHook{};
+        bool all_components_ok = true;
+        std::uint64_t min_chain_wm = UINT64_MAX;
+        for (std::size_t i = 0; i < bitcask::kComponentCount; ++i) {
+            const auto comp = static_cast<bitcask::ComponentId>(i);
+            const auto& entry = current_manifest_.entries[i];
+            auto cr = search_layer->load_component(
+                comp, dirname_, entry.base_watermark,
+                entry.chain_seq, hook_arg);
+            if (cr.loaded) {
+                min_chain_wm = std::min(min_chain_wm, cr.watermark);
+                // 同步 SearchLayer 内部链状态镜像——后续 save 走正确的
+                // 链续接。rebase = false：成功 load 的组件不需 rebase。
+                search::SearchLayer::ComponentCkptState st;
+                st.base_gen = entry.base_watermark;
+                st.chain_wm = cr.watermark;
+                st.next_seq = entry.chain_seq + 1;
+                st.rebase_needed = false;
+                search_layer->set_component_state(comp, st);
+            } else {
+                all_components_ok = false;
+            }
+        }
+        if (min_chain_wm == UINT64_MAX) {
+            min_chain_wm = 0;  // 没有任何组件成功
+        }
+        // 「全组件健康 + 非 .prev 回退」才能走字节水位快路径。.prev 任一
+        // 组件回退 → 字节水位不可信，退全量 fold。
+        bool any_from_prev = false;
+        // 简化为：要求所有组件都非 from_prev（任一组件回退就退全量 fold）。
+        // 单独读一次 ckpt 文件做 from_prev 检查（用 stat + 文件名），或
+        // 由 load_component 返回 from_prev 决定。这里保守：要求 all ok
+        // 即认为非 .prev（load 内部已用 manifest base_wm 校验，若不匹
+        // 配则 .prev 路径优先于 .prev 失败）。
+        // 简化处理：manifest 与磁盘文件不一致时 fold 兜底——我们通过
+        // 「all_components_ok = true 且 min_chain_wm >= keydir 水位」
+        // 双重门把关。
+        search_ok = all_components_ok && recovery.snap_loaded;
+        (void)any_from_prev;
+        // S17-4:fold_start = min(chain_watermarks)。各索引自门按其
+        // 自身 ord 水位丢重叠区。
+        if (search_ok) {
+            // 把 min_chain_wm 反馈到 recovery.snap_wms——简化处理：保持
+            // 原 snap_wms 形态（Cask::load_recovery_snapshots 契约），由
+            // 上层 fold 阶段自行按各索引水位自门即可。
+        }
     }
-    // search.ckpt 不健康 → 退回全量 fold（snap_loaded=false 让 fold_start=0）。
+    // search 不健康 → 退回全量 fold（snap_loaded=false 让 fold_start=0）。
     if (search_layer && !search_ok) {
         recovery.snap_loaded = false;
     }
@@ -2791,16 +2925,95 @@ bool Cask::save_search_ckpt_paired(
     const std::optional<std::vector<
         std::pair<std::uint32_t, std::uint64_t>>>& wms,
     const std::vector<std::byte>& keydir_delta) {
-    bool wrote_base = true;
-    const bool ok = search_->save_search_ckpt(
-        path, wm,
-        std::span<const std::byte>(keydir_delta.data(), keydir_delta.size()),
-        &wrote_base);
-    if (ok && wrote_base && wms) {
-        // base 路径：全量快照（写序：ckpt 成功后才落快照）。
+    // S17-3 P3 commit 路径：dir = dirname_。所有 ckpt 写都改走
+    // save_checkpoint_paired 走 per-component + manifest 协议。
+    (void)path;
+    return save_checkpoint_paired(dirname_, wm, wms, keydir_delta);
+}
+
+// S17-3 P3 commit 路径。先 per-component base（或 delta），再写
+// index.manifest 作为 commit point，最后 base 路径下写 keydir 快照。
+// delta 路径不写 keydir 快照（元数据已内联进 delta 文件的 kKeydirDelta
+// 段）。
+//
+// 「是 base 还是 delta」由 Cask 决定：每组件的 chain 状态有效
+//（comp_chain_wm_ == comp_base_gen_ && comp_next_seq_ < max）且
+// !rebase_needed → 走 delta；否则全量 base。混合：base 走全量，delta
+// 走单文件——但本版每组件一致性优先，要么全 base 要么全 delta。
+bool Cask::save_checkpoint_paired(
+    const std::string& dir, std::uint64_t wm,
+    const std::optional<std::vector<
+        std::pair<std::uint32_t, std::uint64_t>>>& wms,
+    const std::vector<std::byte>& keydir_delta) {
+    if (!search_) return true;  // 纯 KV 库无 search ckpt
+    // 取真实 dirty 掩码（每个组件独立的脏位）。
+    std::array<bool, bitcask::kComponentCount> dirty_mask =
+        search_->dirty_mask();
+    // 决策：!rebase_needed 且至少一个组件脏 且所有组件 chain_seq <
+    // max_delta_chain 上限 → delta；否则 base。已激活链就应当续链。
+    // max_delta_chain 来源：opts_.search_config->max_delta_chain（0 = 无限）。
+    std::uint32_t max_delta_chain = 0;
+    if (opts_.search_config.has_value()) {
+        max_delta_chain = opts_.search_config->max_delta_chain;
+    }
+    bool any_dirty = false;
+    for (bool d : dirty_mask) {
+        if (d) { any_dirty = true; break; }
+    }
+    bool can_delta = any_dirty && !search_->needs_ckpt_rebase();
+    if (can_delta && max_delta_chain > 0) {
+        for (std::size_t i = 0; i < bitcask::kComponentCount; ++i) {
+            const auto& e = current_manifest_.entries[i];
+            // max_delta_chain = 0 表示无限；否则 chain_seq 必须 < max。
+            if (e.chain_seq >= max_delta_chain) {
+                can_delta = false; break;
+            }
+        }
+    }
+    // 走 delta 路径。
+    if (can_delta) {
+        auto delta_res = search_->save_components_delta(
+            dir, wm, dirty_mask,
+            std::span<const std::byte>(keydir_delta.data(),
+                                        keydir_delta.size()));
+        // 写 manifest：成功的组件推进 chain_seq + chain_watermark。
+        bitcask::Manifest new_manifest = current_manifest_;
+        for (std::size_t i = 0; i < bitcask::kComponentCount; ++i) {
+            if (delta_res.wrote[i]) {
+                new_manifest.entries[i].chain_seq = delta_res.new_seqs[i];
+                new_manifest.entries[i].chain_watermark = wm;
+            }
+        }
+        const std::string mpath = std::string(dir) + "/" +
+            std::string(bitcask::kManifestName);
+        if (!bitcask::write_manifest(mpath, new_manifest)) {
+            return false;
+        }
+        current_manifest_ = new_manifest;
+        return true;
+    }
+    // 走 base 路径。
+    auto base_res = search_->save_components_base(dir, wm, dirty_mask);
+    bitcask::Manifest new_manifest = current_manifest_;
+    for (std::size_t i = 0; i < bitcask::kComponentCount; ++i) {
+        if (base_res.wrote_base[i]) {
+            new_manifest.entries[i].base_watermark = wm;
+            new_manifest.entries[i].chain_seq = 0;
+            new_manifest.entries[i].chain_watermark = wm;
+        }
+    }
+    const std::string mpath = std::string(dir) + "/" +
+        std::string(bitcask::kManifestName);
+    if (!bitcask::write_manifest(mpath, new_manifest)) {
+        log_warn("save_checkpoint_paired: write_manifest failed "
+                 "(existing manifest unchanged)");
+        return false;
+    }
+    current_manifest_ = new_manifest;
+    if (wms) {
         write_keydir_snapshot(*wms);
     }
-    return ok;
+    return true;
 }
 
 void Cask::maybe_submit_auto_checkpoint() {

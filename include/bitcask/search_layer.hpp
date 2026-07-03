@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -39,6 +40,7 @@
 #include "bitcask/highlighter.hpp"
 #include "bitcask/hnsw.hpp"
 #include "bitcask/index.hpp"
+#include "bitcask/index_manifest.hpp"  // S17-2:per-component manifest
 #include "bitcask/search_checkpoint.hpp"  // S14-4
 #include "bitcask/inverted.hpp"
 #include "bitcask/meta_file.hpp"
@@ -431,6 +433,85 @@ public:
     [[nodiscard]] CkptLoadResult load_search_ckpt(
         std::string_view path, const DeltaReplayHook& hook = {});
 
+    // ---- S17-2:per-component 持久化（P3 checkpoint 拆分）----
+    // 把上面 save/load 的单文件契约展开为 3 个组件文件（docmap.ckpt /
+    // bm25.ckpt / vec.ckpt）+ 配套 .prev 代际 + 链（.d<seq>），由 Cask 侧
+    // 写入 manifest 作为 commit point。SearchLayer 自身不维护 manifest——
+    // 这是 P3 设计：SearchLayer 只认组件文件，Cask 维护跨组件的 commit 簿。
+    //
+    // dirty_mask: 哪些组件脏（需要写）。bit 0=docmap, 1=bm25, 2=vec。
+    // 脏位只在 save 时清零（与 S14-3 既有契约一致）。
+    struct ComponentSaveResult {
+        std::array<bool, kComponentCount> wrote_base{};
+        // base 路径下哪个组件没写出有效段（结构/序列化失败或被跳过的
+        // ——如 vec 缺配置）。Cask 用此决定 manifest 入口的 chain_watermark
+        // 推进与否。
+    };
+    // Base 写：每个组件内部走「rename old → .prev, 写新 base」。dir 是
+    // 组件文件所在目录。watermark 是统一的提交水位。
+    [[nodiscard]] ComponentSaveResult save_components_base(
+        std::string_view dir, std::uint64_t watermark,
+        std::array<bool, kComponentCount> dirty_mask);
+    // Delta 写：只写脏组件的 .d<seq>，每个组件独立推进 chain_seq。
+    // chain_seqs 初值 = 各自当前 seq（首次写 → 1）；返回每组件写入是否成功
+    // ——失败时 caller 回退到 base。
+    struct ComponentDeltaResult {
+        std::array<bool, kComponentCount> wrote{};
+        std::array<std::uint32_t, kComponentCount> new_seqs{};
+    };
+    [[nodiscard]] ComponentDeltaResult save_components_delta(
+        std::string_view dir, std::uint64_t watermark,
+        std::array<bool, kComponentCount> dirty_mask,
+        std::span<const std::byte> keydir_delta);
+
+    // 组件载入结果。
+    struct ComponentLoadResult {
+        bool loaded = false;           // 文件结构完整 + header.watermark == expected
+        std::uint64_t watermark = 0;   // 实际 header.watermark
+        bool from_prev = false;        // 落在 .prev
+        bool all_segments_ok = false;  // 段级 CRC 全过（delta 链分段的健康判断）
+    };
+    // 从 dir/comp.ckpt（或 .prev）载入一个组件，校验 header.watermark 与
+    // expected_base_wm。base 异常时 fold 阶段从 0 重放（comp watermark=0）。
+    // 链（.d1..d{chain_seq}）在组件内连续重放，hook 透传到 keydir。
+    [[nodiscard]] ComponentLoadResult load_component(
+        bitcask::ComponentId comp, std::string_view dir,
+        std::uint64_t expected_base_wm, std::uint32_t chain_seq,
+        const DeltaReplayHook& hook);
+
+    // 链状态 setter（Cask 维护 manifest 时同步）——SearchLayer 不再自管链。
+    // 主要在 load 后回写「本组件当前已 commit 的链状态」。
+    struct ComponentCkptState {
+        std::uint64_t base_gen = 0;
+        std::uint64_t chain_wm = 0;
+        std::uint32_t next_seq = 1;
+        bool rebase_needed = false;
+    };
+    void set_component_state(bitcask::ComponentId comp,
+                             const ComponentCkptState& st);
+    [[nodiscard]] ComponentCkptState
+    get_component_state(bitcask::ComponentId comp) const;
+
+    // 是否需要 rebase（close/merge/compact 后强制走 base 路径）。Cask
+    // 在 save_checkpoint_paired 决策 base vs delta 时调用。
+    [[nodiscard]] bool needs_ckpt_rebase() const {
+        return ckpt_rebase_needed_.load(std::memory_order_relaxed);
+    }
+
+    // 当前各组件的脏位掩码（true = 该组件自上次 save 以来有变化）。
+    // Cask 决策每个组件是 base 还是 delta 时调用。
+    [[nodiscard]] std::array<bool, kComponentCount> dirty_mask() const {
+        std::array<bool, kComponentCount> m{};
+        m[static_cast<std::size_t>(bitcask::ComponentId::kDocmap)] =
+            dirty_docmap_.load(std::memory_order_relaxed);
+        m[static_cast<std::size_t>(bitcask::ComponentId::kBm25)] =
+            dirty_bm25_default_.load(std::memory_order_relaxed) ||
+            dirty_bm25_fields_.load(std::memory_order_relaxed);
+        m[static_cast<std::size_t>(bitcask::ComponentId::kVec)] =
+            dirty_hnsw_.load(std::memory_order_relaxed);
+        return m;
+    }
+
     // S14-4：强制下次 save 写全量 base（链坍缩）。close 前调用——干净关闭
     // 收敛为单一 base 文件：.prev 代际随之刷新，链不跨干净重启累积
     // （delta 链的预期存续范围 = 两次 base 之间的运行期窗口）。
@@ -630,6 +711,14 @@ private:
     // 向量插入 (ord, f32)——hnsw 无不可变旧段（插入改写旧邻接），delta 用
     // 插入日志重放（insert 有 ord 水位自门）。只记 ord ≥ chain_wm 的。
     std::vector<std::pair<std::uint64_t, std::vector<float>>> delta_vecs_;
+
+    // S17-2:per-component 链状态——与 Cask 侧 manifest 同步。索引同
+    // ComponentId（0=docmap, 1=bm25, 2=vec）。ckpt_rebase_needed_ 为
+    // 全局开关（旧路径遗留），仍被 save_search_ckpt 的 rebase 路径读。
+    std::array<std::uint64_t, kComponentCount> comp_base_gen_{};
+    std::array<std::uint64_t, kComponentCount> comp_chain_wm_{};
+    std::array<std::uint32_t, kComponentCount> comp_next_seq_{};
+    static_assert(kComponentCount == 3, "comp_*_ size must match ComponentId");
 
     // delta 保存/应用（save_search_ckpt / load_search_ckpt 内部）。
     [[nodiscard]] bool save_delta_ckpt(const std::string& base_path,
