@@ -2539,6 +2539,11 @@ std::expected<void, CaskFault> Cask::backup(std::string_view dst_dir) {
     (void)link_or_copy(base / "field.schema");
     (void)link_or_copy(base / kKeydirSnapName);
     (void)link_or_copy(base / kSearchCkptName);
+    // S14-8：向量 payload 一并带上（此前漏 .vec——缺失仅降级为 fold 重建，
+    // 但备份目录首次 open 会付全量重建代价）。delta 链文件不带：备份点的
+    // base+快照自洽，链属运行期窗口。
+    (void)link_or_copy(base / "search.vec");
+    (void)link_or_copy(base / "search.qc8");
     return {};
 }
 

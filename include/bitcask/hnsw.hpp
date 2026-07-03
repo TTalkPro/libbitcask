@@ -155,6 +155,25 @@ public:
     // 只要求文件持有 [0, n) 前缀字节。version 1/2 均接受。
     [[nodiscard]] bool load_vec_payload(std::string_view path);
 
+    // ---- S14-8:int8 码字外置（search.qc8，BCQ8 v1）----
+    // qcodes/qscale/qsum（dim+8 B/节点，高维 int8 部署下占 BVH2 的 ~95%）
+    // 拆出 append-only 文件，与 .vec 同款前缀契约/身份收养/追加机制：
+    // 非 rebuild 的 base 保存（close/链满 rebase）只追加窗口，免全量重写。
+    // BVH2 v3 段不再内嵌码字（ord/level/邻接留在段内——邻接可变无法外置）。
+    // needs_qcodes_ 为假（kL2/无 int8 内核）不产生 qc8 文件。
+    //
+    // **payload 代号（generation nonce）**：v3 段头与 .vec/.qc8 头共同携带
+    // payload_gen——rebuild 全量重写 payload 后若走 .prev 回退，旧图配新
+    // payload（node id 已重映射）而单纯的「前缀 count ≥ n」会错误接受；
+    // 代号不匹配即拒载（gen==0 的 legacy 文件跳过校验，首次 rebuild 后
+    // 自动进入保护）。此校验同时闭合 S14-2 时代 .vec 的同型隐患。
+    [[nodiscard]] bool save_qc_payload(std::string_view path) const;
+    [[nodiscard]] bool load_qc_payload(std::string_view path);
+    // v3 反序列化后是否还欠 qc8 载入（v2 内嵌码字 / 无码字配置 → false）。
+    [[nodiscard]] bool qc_payload_pending() const noexcept {
+        return qc_pending_;
+    }
+
     // serialize:V2 header → buf(供 search.ckpt kHnsw 段嵌入)。
     // 含 qcodes/qscales/qsums 直存 + has_payload 标志 + payload 基本元信息
     // (dim/count/watermark 供 load_vec_payload 交叉校验)。不含 vecs_ 字节。
@@ -400,6 +419,18 @@ private:
         std::uint32_t count    = 0;   // 已在文件中的向量数
     };
     mutable VecFileState vec_file_{};
+    // S14-8:qc8 追加状态（同 VecFileState 语义）。
+    mutable VecFileState qc_file_{};
+    // S14-8:payload 代号（v3 段头 + .vec/.qc8 头配对校验；0 = legacy 不校验）。
+    // 全量重写 payload / 首次 serialize 时惰性分配；append 继承。mutable：
+    // save 路径 const。
+    mutable std::uint64_t payload_gen_ = 0;
+    // v3 反序列化后、load_qc_payload 前为 true（码字尚未就位）。
+    bool qc_pending_ = false;
+
+    void ensure_payload_gen() const;
+    [[nodiscard]] bool try_append_qc_payload(std::string_view path,
+                                             std::uint32_t n) const;
 
     // S14-2:追加路径本体。前置条件由 caller（save_vec_payload）检查
     // （vec_file_.valid 且 count_ ≥ vec_file_.count）；本函数再做文件身份

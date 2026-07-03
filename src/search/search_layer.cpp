@@ -1735,7 +1735,10 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
         if (hnsw) {
             const std::string vec_path =
                 std::filesystem::path(fp).replace_extension(".vec").string();
-            if (hnsw->save_vec_payload(vec_path)) {
+            const std::string qc_path =
+                std::filesystem::path(fp).replace_extension(".qc8").string();
+            if (hnsw->save_vec_payload(vec_path) &&
+                hnsw->save_qc_payload(qc_path)) {
                 std::vector<std::uint8_t> buf;
                 if (hnsw->serialize(buf)) {
                     add_u8_sec(
@@ -1923,8 +1926,14 @@ SearchLayer::load_search_ckpt(std::string_view path,
                 if (fresh->deserialize({raw, ls.payload.size()})) {
                     // V7:mmap vec payload(search.vec)。inmem_int8 无 payload
                     // (has_payload=false);否则 mmap,失败则段坏 → fold 重建。
-                    if (fresh->config().inmem_int8 ||
-                        fresh->load_vec_payload(vec_path)) {
+                    // S14-8:v3 再补 qc8 码字（自门，v2/无码字 no-op）。
+                    const std::string qc_path =
+                        std::filesystem::path(vec_path)
+                            .replace_extension(".qc8")
+                            .string();
+                    if ((fresh->config().inmem_int8 ||
+                         fresh->load_vec_payload(vec_path)) &&
+                        fresh->load_qc_payload(qc_path)) {
                         hnsw_.store(std::move(fresh),
                                     std::memory_order_release);
                         hnsw_loaded = true;

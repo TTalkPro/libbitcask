@@ -1882,9 +1882,31 @@ W4 ✅（parallel_scan 并行全表扫描）。
     僵尸/删后重写不误杀/窗口新增可读）；**反向验证**：断开链推进钩子，
     僵尸断言立即抓到。clang 513/513、TSan 511/511。
 
+- [x] **S14-8【P2·M】int8 码字外置（search.qc8 + BVH2 v3 + payload 代号）** — 已完成（2026-07-03）
+  - **ROI 决定性场景**：高维 int8-only 部署（P5c 按 qwen3-embedding dim=2560
+    校准）——码字 10M×2560B ≈ 25.6GB，占 BVH2 的 ~95%，此前每次 close/链满
+    rebase 全量重写；外置后变窗口追加。
+  - **格式**：`search.qc8`（BCQ8 v1，64B 头 + 定长 stride=dim+8 记录区，按
+    node id 索引）——S14-2 .vec 的同款前缀契约/dev-ino 身份收养/追加机制；
+    BVH2 升 v3：段内仅 ord/level/邻接（邻接可变无法外置）+ payload 代号，
+    flags bit1 = 有 qc8。v2 旧文件照常载入（内嵌码字路径保留）；
+    needs_qcodes_ 为假（kL2/无 int8 内核）不产 qc8。rebuild → 新对象无追加
+    状态 → 自动全量重写（= rebase 收缩，与 .vec 同构）。
+  - **payload 代号（gen nonce）——顺手闭合 S14-2 同型隐患**：rebuild 全量
+    重写 payload 后走 .prev 回退时，旧图配新 payload（node id 已重映射）而
+    「前缀 count ≥ n」检查会**错误接受**（v1 时代靠等值检查偶然安全，S14-2
+    放宽为 ≥ 后暴露）。v3 段头与 .vec/.qc8 头共同携带 gen，双方非零即配对
+    校验；legacy gen==0 跳过（首次 rebuild 后自动进入保护）。
+  - **顺手修复**：backup 清单此前漏 `search.vec`（缺失仅降级 fold 重建，但
+    备份目录首次 open 付全量重建）——.vec/.qc8 一并纳入；delta 链文件刻意
+    不带（备份点 base+快照自洽）。
+  - 测试：`HnswQc8Append.AppendGenGuardRoundTrip`（inmem_int8 纯 qc8 路径：
+    追加 inode 稳定 + 尺寸精确增长 + v3 轮回检索 + **gen 守卫**——旧代
+    ckpt 配重建后 count≥n 的 qc8 拒载）；既有全部向量测试自动覆盖 v3+qc8
+    端到端。clang 514/514、TSan 512/512。
+
 > **建议执行顺序（全批完成）**：S14-1 ✅ → S14-2 ✅ → S14-3 ✅ → S14-6 ✅ →
 > S14-4 ✅（含成对写序修复 + .prev 加固）→ S14-5 ✅（重估收敛为链长上限）→
-> S14-7 ✅（keydir 增量化收口）。
-> **剩余候选**：S14-8 int8 码字拆分（见 S14-5 内 ROI 记录，等链满 rebase
-> 频率数据）。每步独立可交付；S14-1 落地后 ②③ 即形成完整的「手动 + 自动」
+> S14-7 ✅（keydir 增量化收口）→ S14-8 ✅（qc8 外置 + gen 配对）。
+> **S14 批次全部收官。**每步独立可交付；S14-1 落地后 ②③ 即形成完整的「手动 + 自动」
 > ckpt 节奏。

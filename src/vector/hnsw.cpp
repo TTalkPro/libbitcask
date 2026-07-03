@@ -1200,6 +1200,19 @@ namespace {
 // V7:BCVS v2 段头 magic/version(search.ckpt kHnsw 段内嵌)。
 constexpr std::uint32_t kBcvhMagic   = 0x32485642;  // "BVH2" (LE)
 constexpr std::uint32_t kBcvhVersion = 2;
+// S14-8:v3——码字外置 search.qc8，段内仅 ord/level/邻接 + payload_gen。
+constexpr std::uint32_t kBcvhVersion3 = 3;
+
+// S14-8:BCQ8 码字 payload 文件（append-only，前缀契约同 .vec）。
+// 64B 头：magic|ver u32|dim u16|count u32|gen u64|rec_off u64|total u64
+// |reserved|hcrc u32@60。记录区 rec_off=64 起，定长 stride = dim+8
+// （qcodes int8[dim] | qscale f32 | qsum i32），按 node id 索引。
+constexpr char          kBcq8Magic[4] = {'B', 'C', 'Q', '8'};
+constexpr std::uint32_t kBcq8Version = 1;
+constexpr std::size_t   kBcq8HeaderSize = 64;
+constexpr std::uint32_t kBcq8HeaderCrcOff = kBcq8HeaderSize - 4;
+// BCVP 头 reserved 区里 gen 的落位（[46..54)，v1 旧文件读出为 0 = 不校验）。
+constexpr std::size_t   kBcvpGenOff = 46;
 
 // V7:BCVS v2 payload 文件(独立 .vec)magic/version。
 constexpr char          kBcvpMagic[4] = {'B', 'C', 'V', 'P'};
@@ -1278,7 +1291,10 @@ bool HnswIndex::save_vec_payload(std::string_view path) const {
     std::memcpy(head.data() + 26, &vecs_off,        8);
     std::memcpy(head.data() + 34, &total_vecs,      8);
     std::memcpy(head.data() + 42, &crc_count,       4);
-    // bytes 46..59:保留为 0(初始化已零);header_crc 落在 offset 60-63。
+    // S14-8:payload 代号入 reserved 区（v1 旧文件此处为 0 = 不校验）。
+    ensure_payload_gen();
+    std::memcpy(head.data() + kBcvpGenOff, &payload_gen_, 8);
+    // bytes 54..59:保留为 0(初始化已零);header_crc 落在 offset 60-63。
     const std::uint32_t header_crc = bitcask::codec::crc32(
         std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(head.data()),
@@ -1365,6 +1381,228 @@ bool pwrite_all(int fd, const void* buf, std::size_t len, std::uint64_t off) {
 }
 }  // namespace
 
+// S14-8:payload 代号惰性分配（幂等）。熵源：时刻 + 实例地址 + 节点数——
+// 防御 rebuild 重映射后 .prev 回退误配，非加密用途。
+void HnswIndex::ensure_payload_gen() const {
+    if (payload_gen_ != 0) return;
+    payload_gen_ =
+        (static_cast<std::uint64_t>(::time(nullptr)) << 24) ^
+        (reinterpret_cast<std::uintptr_t>(this) >> 4) ^
+        count_.load(std::memory_order_relaxed);
+    if (payload_gen_ == 0) payload_gen_ = 1;  // 0 保留为「不校验」
+}
+
+// S14-8:qc8 保存——同 .vec 的「优先追加、全量兜底」结构。
+bool HnswIndex::save_qc_payload(std::string_view path) const {
+    if (!needs_qcodes_) return true;  // 无码字配置：无 qc8 文件
+    const std::uint32_t n = count_.load(std::memory_order_acquire);
+    const std::string fp(path);
+    if (qc_file_.valid && n >= qc_file_.count) {
+        if (try_append_qc_payload(path, n)) return true;
+        qc_file_.valid = false;
+    }
+
+    // 全量重写：tmp+rename，分批流式（高维下单批 ≤ ~4K 节点防大缓冲）。
+    ensure_payload_gen();
+    const std::size_t stride =
+        static_cast<std::size_t>(cfg_.dim) + sizeof(float) +
+        sizeof(std::int32_t);
+    std::uint8_t hdr[kBcq8HeaderSize] = {0};
+    std::memcpy(hdr + 0, kBcq8Magic, 4);
+    std::memcpy(hdr + 4, &kBcq8Version, 4);
+    std::memcpy(hdr + 8, &cfg_.dim, 2);
+    std::memcpy(hdr + 10, &n, 4);
+    std::memcpy(hdr + 14, &payload_gen_, 8);
+    const std::uint64_t rec_off = kBcq8HeaderSize;
+    std::memcpy(hdr + 22, &rec_off, 8);
+    const std::uint64_t total = static_cast<std::uint64_t>(n) * stride;
+    std::memcpy(hdr + 30, &total, 8);
+    const std::uint32_t hcrc = bitcask::codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(hdr), kBcq8HeaderCrcOff));
+    std::memcpy(hdr + kBcq8HeaderCrcOff, &hcrc, 4);
+
+    const std::string tmp = fp + ".tmp";
+    struct FileCloser {
+        void operator()(std::FILE* fh) const noexcept {
+            if (fh) std::fclose(fh);
+        }
+    };
+    std::unique_ptr<std::FILE, FileCloser> f(std::fopen(tmp.c_str(), "wb"));
+    if (!f) return false;
+    bool ok = std::fwrite(hdr, 1, kBcq8HeaderSize, f.get()) == kBcq8HeaderSize;
+    std::vector<std::uint8_t> batch;
+    batch.reserve(std::min<std::size_t>(4096, n ? n : 1) * stride);
+    for (std::uint32_t id = 0; ok && id < n; ++id) {
+        const NodeChunk* c = chunk_of(id);
+        const std::uint32_t slot = id & kChunkMask;
+        const auto* q = reinterpret_cast<const std::uint8_t*>(
+            c->qcodes.data() + static_cast<std::size_t>(slot) * cfg_.dim);
+        batch.insert(batch.end(), q, q + cfg_.dim);
+        const auto* sp =
+            reinterpret_cast<const std::uint8_t*>(&c->qscales[slot]);
+        batch.insert(batch.end(), sp, sp + sizeof(float));
+        const auto* zp =
+            reinterpret_cast<const std::uint8_t*>(&c->qsums[slot]);
+        batch.insert(batch.end(), zp, zp + sizeof(std::int32_t));
+        if (batch.size() >= 4096 * stride || id + 1 == n) {
+            ok = std::fwrite(batch.data(), 1, batch.size(), f.get()) ==
+                 batch.size();
+            batch.clear();
+        }
+    }
+    f.reset();
+    if (!ok || std::rename(tmp.c_str(), fp.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        qc_file_.valid = false;
+        return false;
+    }
+    struct stat st;
+    if (::stat(fp.c_str(), &st) == 0) {
+        qc_file_ = VecFileState{true, st.st_dev, st.st_ino, rec_off, n};
+    } else {
+        qc_file_.valid = false;
+    }
+    return true;
+}
+
+// S14-8:qc8 增量追加（前缀不变契约同 try_append_vec_payload）。
+bool HnswIndex::try_append_qc_payload(std::string_view path,
+                                      std::uint32_t n) const {
+    const std::size_t stride =
+        static_cast<std::size_t>(cfg_.dim) + sizeof(float) +
+        sizeof(std::int32_t);
+    const std::string fp(path);
+    const int fd = ::open(fp.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st;
+    if (::fstat(fd, &st) != 0 ||
+        st.st_dev != qc_file_.dev || st.st_ino != qc_file_.ino) {
+        ::close(fd);
+        return false;
+    }
+    const std::uint64_t old_end =
+        qc_file_.data_off +
+        static_cast<std::uint64_t>(qc_file_.count) * stride;
+    if (static_cast<std::uint64_t>(st.st_size) < old_end) {
+        ::close(fd);
+        return false;
+    }
+    bool ok = true;
+    if (n > qc_file_.count) {
+        std::vector<std::uint8_t> batch;
+        std::uint64_t off = old_end;
+        for (std::uint32_t id = qc_file_.count; ok && id < n; ++id) {
+            const NodeChunk* c = chunk_of(id);
+            const std::uint32_t slot = id & kChunkMask;
+            const auto* q = reinterpret_cast<const std::uint8_t*>(
+                c->qcodes.data() + static_cast<std::size_t>(slot) * cfg_.dim);
+            batch.insert(batch.end(), q, q + cfg_.dim);
+            const auto* sp =
+                reinterpret_cast<const std::uint8_t*>(&c->qscales[slot]);
+            batch.insert(batch.end(), sp, sp + sizeof(float));
+            const auto* zp =
+                reinterpret_cast<const std::uint8_t*>(&c->qsums[slot]);
+            batch.insert(batch.end(), zp, zp + sizeof(std::int32_t));
+            if (batch.size() >= 4096 * stride || id + 1 == n) {
+                ok = pwrite_all(fd, batch.data(), batch.size(), off);
+                off += batch.size();
+                batch.clear();
+            }
+        }
+        if (ok) ok = ::fdatasync(fd) == 0;
+        if (ok) {
+            (void)::ftruncate(fd, static_cast<off_t>(
+                qc_file_.data_off + static_cast<std::uint64_t>(n) * stride));
+        }
+    } else if (n == qc_file_.count) {
+        ::close(fd);
+        return true;  // 无新节点，无事可做
+    }
+    if (ok) {
+        std::uint8_t hdr[kBcq8HeaderSize] = {0};
+        std::memcpy(hdr + 0, kBcq8Magic, 4);
+        std::memcpy(hdr + 4, &kBcq8Version, 4);
+        std::memcpy(hdr + 8, &cfg_.dim, 2);
+        std::memcpy(hdr + 10, &n, 4);
+        std::memcpy(hdr + 14, &payload_gen_, 8);
+        std::memcpy(hdr + 22, &qc_file_.data_off, 8);
+        const std::uint64_t total = static_cast<std::uint64_t>(n) * stride;
+        std::memcpy(hdr + 30, &total, 8);
+        const std::uint32_t hcrc =
+            bitcask::codec::crc32(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(hdr), kBcq8HeaderCrcOff));
+        std::memcpy(hdr + kBcq8HeaderCrcOff, &hcrc, 4);
+        ok = pwrite_all(fd, hdr, kBcq8HeaderSize, 0) && ::fdatasync(fd) == 0;
+    }
+    ::close(fd);
+    if (ok) qc_file_.count = n;
+    return ok;
+}
+
+// S14-8:qc8 载入（v3 且 needs_qcodes_ 时）。前缀契约 + gen 配对。
+bool HnswIndex::load_qc_payload(std::string_view path) {
+    if (!qc_pending_) return true;
+    const std::size_t stride =
+        static_cast<std::size_t>(cfg_.dim) + sizeof(float) +
+        sizeof(std::int32_t);
+    const std::string fp(path);
+    struct FileCloser {
+        void operator()(std::FILE* fh) const noexcept {
+            if (fh) std::fclose(fh);
+        }
+    };
+    std::unique_ptr<std::FILE, FileCloser> f(std::fopen(fp.c_str(), "rb"));
+    if (!f) return false;
+    std::uint8_t hdr[kBcq8HeaderSize];
+    if (std::fread(hdr, 1, kBcq8HeaderSize, f.get()) != kBcq8HeaderSize) {
+        return false;
+    }
+    if (std::memcmp(hdr, kBcq8Magic, 4) != 0) return false;
+    std::uint32_t ver = 0, count = 0;
+    std::uint16_t dim = 0;
+    std::uint64_t gen = 0, rec_off = 0;
+    std::memcpy(&ver, hdr + 4, 4);
+    std::memcpy(&dim, hdr + 8, 2);
+    std::memcpy(&count, hdr + 10, 4);
+    std::memcpy(&gen, hdr + 14, 8);
+    std::memcpy(&rec_off, hdr + 22, 8);
+    std::uint32_t stored = 0;
+    std::memcpy(&stored, hdr + kBcq8HeaderCrcOff, 4);
+    const std::uint32_t calc = bitcask::codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(hdr), kBcq8HeaderCrcOff));
+    if (ver != kBcq8Version || dim != cfg_.dim || stored != calc) {
+        return false;
+    }
+    const std::uint32_t n = count_.load(std::memory_order_relaxed);
+    if (count < n) return false;  // 前缀不足
+    // gen 配对：双方非零才校验（legacy 0 跳过）。
+    if (gen != 0 && payload_gen_ != 0 && gen != payload_gen_) return false;
+
+    if (std::fseek(f.get(), static_cast<long>(rec_off), SEEK_SET) != 0) {
+        return false;
+    }
+    std::vector<std::uint8_t> rec(stride);
+    for (std::uint32_t id = 0; id < n; ++id) {
+        if (std::fread(rec.data(), 1, stride, f.get()) != stride) {
+            return false;
+        }
+        NodeChunk* c = chunks_[id >> kChunkBits].load(std::memory_order_relaxed);
+        const std::uint32_t slot = id & kChunkMask;
+        std::memcpy(c->qcodes.data() +
+                        static_cast<std::size_t>(slot) * cfg_.dim,
+                    rec.data(), cfg_.dim);
+        std::memcpy(&c->qscales[slot], rec.data() + cfg_.dim, sizeof(float));
+        std::memcpy(&c->qsums[slot], rec.data() + cfg_.dim + sizeof(float),
+                    sizeof(std::int32_t));
+    }
+    struct stat st;
+    if (::stat(fp.c_str(), &st) == 0) {
+        qc_file_ = VecFileState{true, st.st_dev, st.st_ino, rec_off, n};
+    }
+    qc_pending_ = false;
+    return true;
+}
+
 // S14-2:.vec 增量追加。只写 [vec_file_.count, n) 的新向量（前缀不变契约：
 // offset < 旧数据尾的字节一律不碰，torn append 不伤 ckpt 声称的有效前缀）。
 // 顺序：数据 pwrite → fdatasync → header 原地重写（version=2）→ fdatasync。
@@ -1441,7 +1679,9 @@ bool HnswIndex::try_append_vec_payload(std::string_view path,
         const std::uint64_t total =
             static_cast<std::uint64_t>(n) * vec_bytes;
         std::memcpy(hdr + 34, &total, 8);
-        // hdr+42 crc_count = 0（零初始化）；46..59 保留 0。
+        // hdr+42 crc_count = 0（零初始化）。
+        // S14-8:gen 印章（追加继承 payload_gen_——可能为 0 = legacy 链）。
+        std::memcpy(hdr + kBcvpGenOff, &payload_gen_, 8);
         const std::uint32_t hcrc = bitcask::codec::crc32(
             std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(hdr), kBcvpHeaderCrcOff));
@@ -1501,6 +1741,14 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
     std::memcpy(&vecs_off_u64, hdr + 26, 8);
     std::uint64_t vecs_len_u64;
     std::memcpy(&vecs_len_u64, hdr + 34, 8);
+    // S14-8:payload 代号配对（双方非零才校验）——闭合「rebuild 全量重写后
+    // .prev 回退，旧图配新 payload（id 已重映射）被前缀检查误收」的隐患。
+    std::uint64_t file_gen = 0;
+    std::memcpy(&file_gen, hdr + kBcvpGenOff, 8);
+    if (file_gen != 0 && payload_gen_ != 0 && file_gen != payload_gen_) {
+        ::close(fd);
+        return false;
+    }
 
     // 与 deserialize() 状态交叉校验。S14-2 前缀契约：文件物理持有量
     // （header.count）允许 ≥ ckpt 声称的 n——.prev 回退时 .vec 已被新代
@@ -1575,8 +1823,10 @@ bool HnswIndex::serialize(std::vector<std::uint8_t>& buf) const {
                          (24 + static_cast<std::size_t>(cfg_.dim) +
                           (1 + cfg_.M * 2) * 4 * 8));
     vs_put32(buf, kBcvhMagic);
-    vs_put32(buf, kBcvhVersion);
-    const std::uint32_t flags = cfg_.inmem_int8 ? 0u : 1u;  // bit 0 = has_payload
+    // S14-8:v3——码字外置 qc8，段内不再内嵌（bit1 = 有 qc8 文件）。
+    vs_put32(buf, kBcvhVersion3);
+    const std::uint32_t flags = (cfg_.inmem_int8 ? 0u : 1u) |   // bit0 has_payload
+                                (needs_qcodes_ ? 2u : 0u);      // bit1 has_qc8
     vs_put32(buf, flags);
     vs_put16(buf, cfg_.dim);
     buf.push_back(static_cast<std::uint8_t>(cfg_.metric));
@@ -1588,35 +1838,19 @@ bool HnswIndex::serialize(std::vector<std::uint8_t>& buf) const {
     // 落盘水位 = 已保存节点的最大 ord(见 hpp:不抄 max_inserted_ord_ 原子,
     // 防 mid-insert 领先 count 的窗口;ord 按插入序单调 → 尾节点即最大)。
     vs_put64(buf, n > 0 ? ord_of(n - 1) : static_cast<std::uint64_t>(-1));
+    // S14-8:payload 代号（与 .vec/.qc8 头配对；save 流程先落 payload 后
+    // serialize，二者取同一 gen）。
+    ensure_payload_gen();
+    vs_put64(buf, payload_gen_);
 
     std::vector<std::uint32_t> scratch(1 + cfg_.M * 2);
-    const std::size_t qbytes =
-        static_cast<std::size_t>(cfg_.dim) * sizeof(std::int8_t);
     for (std::uint32_t id = 0; id < n; ++id) {
         const NodeChunk* c = chunk_of(id);
         const std::uint32_t slot = id & kChunkMask;
         vs_put64(buf, c->ords[slot]);
         const std::uint8_t level = c->levels[slot];
         buf.push_back(level);
-        // V7:直存 qcodes/qscale/qsum——省启动量化 pass(V1 是读盘后量化)。
-        // needs_qcodes_ 为假(kL2/无 VNNI)时三段未分配:写零占位,保持盘上
-        // 格式定长不变(读端按 needs_qcodes_ 决定存或跳)。
-        if (needs_qcodes_) {
-            const std::int8_t* qcodes =
-                c->qcodes.data() + static_cast<std::size_t>(slot) * cfg_.dim;
-            buf.insert(buf.end(),
-                       reinterpret_cast<const std::uint8_t*>(qcodes),
-                       reinterpret_cast<const std::uint8_t*>(qcodes) + qbytes);
-            const auto* sp =
-                reinterpret_cast<const std::uint8_t*>(&c->qscales[slot]);
-            buf.insert(buf.end(), sp, sp + sizeof(float));
-            const auto* zp =
-                reinterpret_cast<const std::uint8_t*>(&c->qsums[slot]);
-            buf.insert(buf.end(), zp, zp + sizeof(std::int32_t));
-        } else {
-            buf.insert(buf.end(), qbytes + sizeof(float) + sizeof(std::int32_t),
-                       std::uint8_t{0});
-        }
+        // S14-8:v3 不内嵌码字——qcodes/qscale/qsum 在 search.qc8。
         for (std::uint32_t l = 0; l <= level; ++l) {
             // 持节点锁拷邻接(与并发写者互斥);≥ n 的邻居(快照水位外的
             // 反向边)滤掉,保证文件内不变量 id < count。
@@ -1646,6 +1880,7 @@ bool HnswIndex::save(std::string_view base_path) const {
     const std::string bp(base_path);
     const std::string vec_path = bp + ".vec";
     if (!save_vec_payload(vec_path)) return false;
+    if (!save_qc_payload(bp + ".qc8")) return false;  // S14-8
     std::vector<std::uint8_t> buf;
     if (!serialize(buf)) return false;
     const std::string tmp = bp + ".tmp";
@@ -1686,6 +1921,11 @@ bool HnswIndex::load(std::string_view base_path) {
         const std::string vec_path = bp + ".vec";
         if (!load_vec_payload(vec_path)) return false;
     }
+    // S14-8:v3 码字外置——qc_pending_ 自门（v2/无码字为 no-op）。
+    if (count_.load(std::memory_order_relaxed) > 0 &&
+        !load_qc_payload(bp + ".qc8")) {
+        return false;
+    }
     return true;
 }
 
@@ -1711,7 +1951,11 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         std::memcpy(&v, buf.data() + off, 4);
         return v;
     };
-    if (rd32at(0) != kBcvhMagic || rd32at(4) != kBcvhVersion) return false;
+    const std::uint32_t file_ver = rd32at(4);
+    if (rd32at(0) != kBcvhMagic ||
+        (file_ver != kBcvhVersion && file_ver != kBcvhVersion3)) {
+        return false;
+    }
 
     std::uint32_t stored_crc = 0;
     std::memcpy(&stored_crc, buf.data() + buf.size() - 4, 4);
@@ -1749,6 +1993,15 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
     std::memcpy(&cnt, p, 4); p += 4;
     std::memcpy(&em, p, 8); p += 8;
     std::memcpy(&max_ord, p, 8); p += 8;
+    // S14-8:v3 头多带 payload 代号；码字待 load_qc_payload 补（flags bit1
+    // 为假 = 写端无码字 → 与 v2 零占位同语义，本地保持零）。
+    payload_gen_ = 0;
+    qc_pending_ = false;
+    if (file_ver == kBcvhVersion3) {
+        if (!need(8)) return false;
+        std::memcpy(&payload_gen_, p, 8); p += 8;
+        qc_pending_ = needs_qcodes_ && (flags & 2u) != 0;
+    }
     if (cnt > kMaxChunks * static_cast<std::uint64_t>(kChunkSize)) return false;
     if (cnt == 0) {
         // 空图:entry 必须也为空,水位必须为 -1。
@@ -1779,7 +2032,7 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         }
         const std::uint32_t slot = id & kChunkMask;
 
-        if (!need(13 + qbytes)) return false;
+        if (!need(file_ver == kBcvhVersion3 ? 13 : 13 + qbytes)) return false;
         std::uint64_t ord;
         std::memcpy(&ord, p, 8); p += 8;
         // ord 严格递增是写者不变量(插入序分配),也是水位幂等的前提。
@@ -1790,7 +2043,10 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         if (level > 31) return false;
         // V7:直读 qcodes(免去 V1 的启动量化 pass)。needs_qcodes_ 为假时
         // 盘上是零占位且本地未分配——跳过存储,仅推进游标。
-        if (needs_qcodes_) {
+        // S14-8:v3 段内无码字（qc8 外置），本块仅 v2 走。
+        if (file_ver == kBcvhVersion3) {
+            // no inline codes
+        } else if (needs_qcodes_) {
             std::memcpy(c->qcodes.data() +
                             static_cast<std::size_t>(slot) * cfg_.dim,
                         p, qbytes);

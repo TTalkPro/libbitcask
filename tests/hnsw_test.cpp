@@ -664,3 +664,89 @@ TEST(HnswVecAppend, AppendRoundTripPrefixContract) {
     fs::remove(old_ckpt);
     fs::remove(vec_path);
 }
+
+// ── S14-8：int8 码字外置（search.qc8）─────────────────────────────────────
+
+// inmem_int8（无 .vec，码字即全部向量数据）下验证：v3 双文件轮回、二次 save
+// 追加（inode 不变、尺寸精确增长）、payload 代号守卫——模拟「rebuild 全量
+// 重写 payload 后 .prev 回退」：旧代 ckpt 配新代 qc8（node id 已重映射且
+// count 满足前缀长度检查），没有 gen 配对会被错误接受，有则拒载。
+TEST(HnswQc8Append, AppendGenGuardRoundTrip) {
+    namespace fs = std::filesystem;
+    const std::size_t dim = 32;
+    HnswConfig cfg;
+    cfg.dim = static_cast<std::uint16_t>(dim);
+    cfg.metric = HnswMetric::kDot;
+    cfg.inmem_int8 = true;
+
+    auto vec_i = [&](std::size_t i, std::uint32_t salt) {
+        std::mt19937 rng(static_cast<std::uint32_t>(i) * 2654435761u + salt);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> v(dim);
+        double sq = 0;
+        for (auto& x : v) { x = nd(rng); sq += static_cast<double>(x) * x; }
+        const float inv = 1.0f / static_cast<float>(std::sqrt(sq));
+        for (auto& x : v) x *= inv;
+        return v;
+    };
+
+    HnswIndex idx(cfg);
+    for (std::size_t i = 0; i < 100; ++i) {
+        auto v = vec_i(i, 7);
+        idx.insert(i, std::span<const float>(v.data(), dim));
+    }
+    const auto base =
+        (fs::temp_directory_path() / "bitcask_qc8_append_test.bcvs").string();
+    const std::string qc_path = base + ".qc8";
+    ASSERT_TRUE(idx.save(base));  // 首存：qc8 全量（收养 inode）
+    ASSERT_TRUE(fs::exists(qc_path));
+    // 留存旧代 ckpt 字节（gen A）。
+    const std::string old_ckpt = base + ".genA";
+    fs::copy_file(base, old_ckpt, fs::copy_options::overwrite_existing);
+    struct stat st1;
+    ASSERT_EQ(::stat(qc_path.c_str(), &st1), 0);
+
+    for (std::size_t i = 100; i < 150; ++i) {
+        auto v = vec_i(i, 7);
+        idx.insert(i, std::span<const float>(v.data(), dim));
+    }
+    ASSERT_TRUE(idx.save(base));  // 二存：qc8 应追加
+    struct stat st2;
+    ASSERT_EQ(::stat(qc_path.c_str(), &st2), 0);
+    EXPECT_EQ(st1.st_ino, st2.st_ino) << "二次 save 应追加 qc8 而非重写";
+    EXPECT_EQ(static_cast<std::size_t>(st2.st_size - st1.st_size),
+              50 * (dim + 8)) << "尺寸应精确增长 50 条码字记录";
+
+    // 轮回：v3 段 + qc8 载入，int8 检索语义完好。
+    {
+        HnswIndex r(cfg);
+        ASSERT_TRUE(r.load(base));
+        EXPECT_EQ(r.size(), 150u);
+        for (std::size_t i : {0u, 99u, 100u, 149u}) {
+            auto q = vec_i(i, 7);
+            auto hits = r.search(std::span<const float>(q.data(), dim), 1, 64);
+            ASSERT_FALSE(hits.empty());
+            EXPECT_EQ(hits[0].ord, i) << "码字 " << i << " 外置后内容错位";
+        }
+    }
+
+    // gen 守卫：另一个索引对象（模拟 rebuild——id 重映射、数据不同、
+    // count(200) ≥ 旧代 n(150) 使前缀长度检查通过）全量重写 payload，
+    // 然后把旧代 ckpt 恢复回来 → load 必须拒载（gen 不匹配）。
+    {
+        HnswIndex other(cfg);
+        for (std::size_t i = 0; i < 200; ++i) {
+            auto v = vec_i(i, 99);  // 不同数据
+            other.insert(i, std::span<const float>(v.data(), dim));
+        }
+        ASSERT_TRUE(other.save(base));  // 新 gen 全量重写 qc8 + 新 ckpt
+        fs::copy_file(old_ckpt, base, fs::copy_options::overwrite_existing);
+        HnswIndex r2(cfg);
+        EXPECT_FALSE(r2.load(base))
+            << "旧代 ckpt 配重建后的 qc8 必须被 gen 守卫拒载";
+    }
+
+    fs::remove(base);
+    fs::remove(old_ckpt);
+    fs::remove(qc_path);
+}
