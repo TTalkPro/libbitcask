@@ -4,7 +4,8 @@
 进度：**P1 已落地**（S15 批次，2026-07-03，TASK.md 第十五梯队）——plugin_api
 接口层 + thread_pool 去搜索化 + SearchLayerAdapter 唯一插件接入；clang 522/522、
 TSan 521/522（唯一失败为预存问题）、put_doc bench −0.3%。**P2 进行中**（S16
-批次，DocMap 宿主服务化）。
+批次，DocMap 宿主服务化）：S16-1 所有权上提已落地（Cask 持有 docmap_、
+SearchLayer 借用，同实例断言测试）；S16-2 写路径反转进行中。
 前置：S14 全系收官（增量 checkpoint、keydir 快照增量化、int8 码字外置）
 
 ---

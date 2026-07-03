@@ -583,11 +583,24 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
                 return preps;
             },
             // Reduce fn（串行 reducer，per-lane ord 序）：ReorderEntry →
-            // 按注册序广播给各插件。
-            [plugins = cask->plugins_](ReorderEntry& entry) {
-                std::visit([&plugins](auto& e) {
+            // S16-2 写路径反转：宿主**先 apply DocMap**（身份/存活/meta），
+            // 再按注册序广播给各插件（设计 §4：DocMap 恒在所有插件之前）。
+            // 顺序安全性：docmap 先亮 live、postings/向量后加（与旧「postings
+            // 先、live 后」互换）——两序下并发查询都不可能命中「半个文档」
+            // （postings 无 → 不命中；live 无 → 过滤），且 reducer 单写者保证
+            // 同 ord 两步间无写交错。doc_len 是分析产物，宿主以 0 落行、
+            // BM25 侧经 set_doc_len 回填（S16 批次头②的缓行通道）。
+            [plugins = cask->plugins_, docmap = cask->docmap_](ReorderEntry& entry) {
+                std::visit([&plugins, &docmap](auto& e) {
                     using T = std::decay_t<decltype(e)>;
                     if constexpr (std::is_same_v<T, PutEntry>) {
+                        const auto& t = e.task;
+                        docmap->put_doc(t.key(), t.ord,
+                                        index::DocSlot{
+                                            index::DocLoc{t.file_id, t.offset,
+                                                          t.total_sz},
+                                            t.tstamp, /*doc_len=*/0});
+                        if (!t.meta.empty()) docmap->set_meta(t.ord, t.meta);
                         const plugin::DocView  doc = make_doc_view(e.task);
                         const plugin::PutEvent ev  = make_put_event(e.task, &doc);
                         for (std::size_t i = 0; i < plugins.size(); ++i) {
@@ -596,8 +609,16 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
                                                        : plugin::PreparedPtr{});
                         }
                     } else if constexpr (std::is_same_v<T, DeleteEntry>) {
+                        // prior_ord 在 remove **前**捕获（删除统计需要旧 ord，
+                        // 插件不能反查已删行）；key 不存在 → 不动 docmap、
+                        // 广播哨兵（历史「删不存在」语义 = 插件侧 no-op）。
+                        std::uint64_t prior = plugin::kNoPriorOrd;
+                        if (auto slot = docmap->get(e.key)) {
+                            prior = slot->ord;
+                            docmap->remove(e.key, e.ord);
+                        }
                         for (auto* p : plugins) {
-                            p->on_delete(plugin::DeleteEvent{e.ord, e.key});
+                            p->on_delete(plugin::DeleteEvent{e.ord, e.key, prior});
                         }
                     } else if constexpr (std::is_same_v<T, SkipEntry>) {
                         // no-op（ord 空洞填充）

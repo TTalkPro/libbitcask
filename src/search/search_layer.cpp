@@ -428,8 +428,22 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
                            std::string_view text,
                            std::uint32_t file_id, std::uint64_t offset,
                            std::uint32_t total_sz, std::uint32_t tstamp) {
-    // S14-3：单文本路径恒触 docmap；默认域倒排仅在真有词项时标脏
-    // （向量-only 文档 text 为空，不碰 bm25——add_doc 有空词集门）。
+    // S16-2：legacy/standalone 入口——自落 docmap 行（doc_len 由 apply_text
+    // 分析后经 set_doc_len 回填），随后跑单文本核心。流水线路径不走本方法。
+    index_.put_doc(key, ord,
+                   index::DocSlot{
+                       index::DocLoc{file_id, offset, total_sz},
+                       tstamp,
+                       /*doc_len=*/0});
+    apply_text(key, ord, text);
+}
+
+void SearchLayer::apply_text(std::string_view key, std::uint64_t ord,
+                             std::string_view text) {
+    (void)key;
+    // S14-3：单文本路径恒触 docmap（doc_len 回填也变更 docmap 字节）；默认域
+    // 倒排仅在真有词项时标脏（向量-only 文档 text 为空，不碰 bm25——add_doc
+    // 有空词集门）。S16-2：docmap 行本体由宿主/caller 先落，本函数不写行。
     dirty_docmap_.store(true, std::memory_order_relaxed);
     auto term_data = analyzer_->analyze_with_positions(text);
 
@@ -440,12 +454,7 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
         doc_len += data.first;
         changed_terms.push_back(term);
     }
-
-    index_.put_doc(key, ord,
-                   index::DocSlot{
-                       index::DocLoc{file_id, offset, total_sz},
-                       tstamp,
-                       doc_len});
+    index_.set_doc_len(ord, doc_len);
 
     if (!term_data.empty()) {
         dirty_bm25_default_.store(true, std::memory_order_relaxed);  // S14-3
@@ -527,18 +536,18 @@ ReduceJob SearchLayer::map_analyze(
 // **ord 序**调用本函数（reorder buffer 把并行 map 的乱序结果拗回 ord 序）——
 // 这是「到达序 LWW 等价 ord 序 LWW」正确性的关键（否则被删 key 复活，§3 F4∧F5）。
 // 锁序：fields_mu_ → index_.mutex_（类级不变量，无死锁）。
-// 步骤：① 侧表 ord_field_lens_ 记字段长 ② 各字段 add_doc 进倒排
-//       ③ catch-all 合并默认字段 ④ index_.put_doc 落 DocSlot ⑤ 高亮原文 / meta /
-//       向量（on_vector → HNSW，单写者=本 reducer）⑥ 失效查询缓存。
-void SearchLayer::reduce_apply(const ReduceJob& job,
-                               std::span<const std::byte> meta,
-                               std::span<const float> vec) {
-    // S6-P2: 空 job 守卫（map_fn_ 抛异常时 reducer 收到空 ReduceEntry）。
+// 步骤（S16-2 后）：① 侧表 ord_field_lens_ 记字段长 ② 各字段 add_doc 进倒排
+//       ③ catch-all 合并默认字段 ④ set_doc_len 回填分析产物（docmap 行本体
+//       与 meta 由宿主/caller 先落，本函数不写）⑤ 高亮原文 / 向量
+//       （on_vector → HNSW，单写者=本 reducer）⑥ 失效查询缓存。
+void SearchLayer::reduce_apply(const ReduceJob& job, std::span<const float> vec) {
+    // S14-3：docmap 恒触（宿主已落行 + 本函数回填 doc_len）。置于空 job 守卫
+    // **之前**——prepare 异常路径宿主同样已写 docmap 行，脏位不能漏
+    //（漏标仅靠水位自门兜底，语义仍安全但没必要依赖它）。
+    dirty_docmap_.store(true, std::memory_order_relaxed);
+    // S6-P2: 空 job 守卫（prepare 抛异常时 adapter 送来空 job）。
     // key+fields 都空 = map_analyze 未产出，跳过 apply；reducer 仍推进 ord。
     if (job.key.empty() && job.fields.empty()) return;
-    // S14-3：docmap 恒触（put_doc 在下方无条件执行）；bm25 按实际写到的
-    // 域精确标脏——recover 路径也走本函数（单默认域），不误脏 fields 段。
-    dirty_docmap_.store(true, std::memory_order_relaxed);
     auto& field_lens = ord_field_lens_[job.ord];
     field_lens.reserve(job.fields.size() + 1);
     for (const auto& f : job.fields) {
@@ -564,16 +573,11 @@ void SearchLayer::reduce_apply(const ReduceJob& job,
         field_lens.emplace_back(intern_field_name(kDefaultField), job.ca_len);
     }
 
-    index_.put_doc(job.key, job.ord,
-                   index::DocSlot{
-                       index::DocLoc{job.file_id, job.offset, job.total_sz},
-                       job.tstamp,
-                       job.total_doc_len});
+    // S16-2：docmap 行与 meta 由宿主（流水线）/caller（standalone・recover）
+    // 先落；分析产物 doc_len 在此回填（宿主不做分析拿不到 token 数）。
+    index_.set_doc_len(job.ord, job.total_doc_len);
     if (!job.doc_text.empty()) {
         doc_texts_.put(job.ord, job.doc_text);
-    }
-    if (!meta.empty()) {
-        index_.set_meta(job.ord, meta);
     }
     if (!vec.empty()) {
         on_vector(job.ord, vec);
@@ -610,12 +614,29 @@ void SearchLayer::on_write_fields(
         fvs.emplace_back(name, text);
     }
     auto job = map_analyze(key, ord, fvs, file_id, offset, total_sz, tstamp);
-    reduce_apply(job, {}, {});
+    // S16-2：standalone 同步路径自落 docmap 行（doc_len 直接用分析产物）。
+    index_.put_doc(key, ord,
+                   index::DocSlot{index::DocLoc{file_id, offset, total_sz},
+                                  tstamp, job.total_doc_len});
+    reduce_apply(job, {});
 }
 
 std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::uint64_t tomb_ord) {
+    // S16-2：legacy/standalone 入口——自查旧行 + 自删 docmap，再跑共享核心。
+    // 流水线路径不走本方法（宿主捕获 prior_ord 并 remove，adapter 调三参版）。
     auto slot = index_.get(key);
     if (!slot) return std::nullopt;
+    index_.remove(key, tomb_ord);
+    on_delete(key, tomb_ord, slot->ord);
+    return tomb_ord;
+}
+
+void SearchLayer::on_delete(std::string_view key, std::uint64_t tomb_ord,
+                            std::uint64_t prior_ord) {
+    // 前置条件：docmap 行已删（宿主或二参版）。doc_len 经 prior_ord 从
+    // doc_lens_ SoA 读取——Index::remove 只翻 live/ext2ord，不清 SoA，
+    // 删除后仍可读（S16-2 侦查坐实）。
+    const std::uint32_t prior_doc_len = index_.doc_len(prior_ord);
     // S14-3：删除触 docmap（live 翻转）+ 全部 bm25 段（remove_doc 调整各域
     // N/sum_doc_len 全局统计，序列化字节随之变化）。
     dirty_docmap_.store(true, std::memory_order_relaxed);
@@ -629,7 +650,7 @@ std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::u
     std::vector<std::string> changed_terms;
     bool have_terms = false;
     if (cache_.size() > 0) {
-        auto text = doc_texts_.get(slot->ord);  // 拷贝(C1:并发安全,见 DocTextLru)
+        auto text = doc_texts_.get(prior_ord);  // 拷贝(C1:并发安全,见 DocTextLru)
         if (text) {
             auto tf = analyzer_->analyze(*text);
             changed_terms.reserve(tf.size());
@@ -642,7 +663,7 @@ std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::u
 
     // 删除该文档在各字段的统计。多字段路径用 ord_field_lens_ 精确扣减各字段
     // doc_len（R3）；单 text 路径无此表，按默认字段用 slot->doc_len。
-    if (auto it = ord_field_lens_.find(slot->ord); it != ord_field_lens_.end()) {
+    if (auto it = ord_field_lens_.find(prior_ord); it != ord_field_lens_.end()) {
         for (auto& [field, flen] : it->second) {
             field_index(field).remove_doc(flen, {});
         }
@@ -650,23 +671,21 @@ std::optional<std::uint64_t> SearchLayer::on_delete(std::string_view key, std::u
     } else {
         std::shared_lock lk(fields_mu_);  // 只读 map 结构;remove_doc 自带并发
         for (auto& [_, inv] : fields_) {
-            inv->remove_doc(slot->doc_len, {});
+            inv->remove_doc(prior_doc_len, {});
         }
     }
-    index_.remove(key, tomb_ord);
     // S14-4：窗口删除日志（docmap delta 的 remove 半边；bm25 统计效果由
     // delta 头的绝对 N/sdl 覆盖）。
     if (tomb_ord >= ckpt_chain_wm_) {
         delta_removals_.emplace_back(std::string(key), tomb_ord);
     }
-    doc_texts_.erase(slot->ord);
+    doc_texts_.erase(prior_ord);
     if (have_terms) {
         cache_.invalidate_terms(changed_terms);  // 空缓存时为 no-op
     } else {
         cache_.invalidate();  // 原文 LRU miss：降级整缓存失效（S9.2）
     }
     maybe_auto_compact();  // S12-2
-    return tomb_ord;
 }
 
 void SearchLayer::on_relocate(std::string_view key, std::uint64_t ord,
@@ -951,7 +970,12 @@ void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
     std::vector<std::pair<std::string_view, std::string_view>> fields;
     fields.emplace_back(kDefaultField, text);
     auto job = map_analyze(key, ord, fields, file_id, offset, total_sz, tstamp);
-    reduce_apply(job, {}, vector);
+    // S16-2：恢复路径自落 docmap 行（SearchLayer 借用宿主实例；持久化载入
+    // 仍归本层直到 P3）。
+    index_.put_doc(key, ord,
+                   index::DocSlot{index::DocLoc{file_id, offset, total_sz},
+                                  tstamp, job.total_doc_len});
+    reduce_apply(job, vector);
 }
 
 // S3:批量恢复——并行 analyze + 串行有序插入（见头文件注释的正确性论证）。
@@ -989,7 +1013,13 @@ void SearchLayer::recover_doc_batch(std::vector<RecoverDoc>& batch) {
     // 性能影响可忽略；最终状态与旧版完全一致。
     for (std::size_t i = 0; i < n; ++i) {
         const auto& d = batch[i];
-        reduce_apply(jobs[i], {}, d.vector);
+        // S16-2：恢复路径自落 docmap 行（同 recover_doc；行先于 postings，
+        // 与流水线的宿主先落序一致）。
+        index_.put_doc(d.key, d.ord,
+                       index::DocSlot{
+                           index::DocLoc{d.file_id, d.offset, d.total_sz},
+                           d.tstamp, jobs[i].total_doc_len});
+        reduce_apply(jobs[i], d.vector);
     }
 }
 

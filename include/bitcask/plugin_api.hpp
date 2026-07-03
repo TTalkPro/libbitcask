@@ -84,9 +84,15 @@ struct PutEvent {
     std::uint32_t    tstamp = 0;
 };
 
+// S16-2：prior_ord = 被删文档原 ord，宿主在 docmap remove **前**捕获
+// （删除统计调整需要旧 ord，插件不必也不能反查已删行）；key 原不存在 =
+// kNoPriorOrd（插件应跳过，与「删不存在的 key」的历史语义一致）。
+inline constexpr std::uint64_t kNoPriorOrd = ~std::uint64_t{0};
+
 struct DeleteEvent {
     std::uint64_t    ord = 0;   // 墓碑 record 的 ord
     std::string_view key;
+    std::uint64_t    prior_ord = kNoPriorOrd;
 };
 
 // merge 搬迁事件：ord 不变、只换存储定位。value 视图免费附带——merge fold

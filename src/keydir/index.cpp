@@ -170,6 +170,15 @@ bool Index::eval_meta(std::uint64_t ord, const meta::MetaFilter& filter) const {
     return filter.evaluate(std::span<const std::byte>(blob));
 }
 
+void Index::set_doc_len(std::uint64_t ord, std::uint32_t len) {
+    std::unique_lock lk(mutex_);
+    if (ord >= doc_lens_.size()) return;  // 未登记（空 job 守卫路径）：no-op
+    doc_lens_[ord] = len;
+    const auto ci = ord / kChunkOrds;
+    const auto si = ord % kChunkOrds;
+    if (ci < chunks_.size() && chunks_[ci]) chunks_[ci]->slots[si].doc_len = len;
+}
+
 void Index::set_meta(std::uint64_t ord, std::span<const std::byte> blob) {
     std::unique_lock lk(mutex_);
     ensure_capacity_locked(ord);

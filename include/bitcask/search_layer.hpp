@@ -193,10 +193,18 @@ public:
     // ---- 文档写入：建立索引 ----
     // key: 外部 key, ord: 文档序号, text: 文档文本,
     // file_id/offset/total_sz: 存储定位, tstamp: 时间戳
+    // S16-2：legacy/standalone 入口——自写 docmap 行 + apply_text。
+    // 流水线路径**不走本方法**（docmap 行由宿主先落，adapter 调 apply_text）。
     void on_write(std::string_view key, std::uint64_t ord,
                   std::string_view text,
                   std::uint32_t file_id, std::uint64_t offset,
                   std::uint32_t total_sz, std::uint32_t tstamp);
+
+    // S16-2：单文本写入核心（流水线版）。前置条件：docmap 行已就位（宿主
+    // put_doc）。分析 text、回填 doc_len（set_doc_len）、默认域倒排、高亮
+    // 原文、缓存失效——**不写 docmap 行**。reducer 单写者上下文。
+    void apply_text(std::string_view key, std::uint64_t ord,
+                    std::string_view text);
 
     // ---- 多字段写入（S8.6）----
     // fields: (字段名, 文本) 列表，每字段独立分词建索引。空字段名映射到默认字段。
@@ -216,17 +224,24 @@ public:
         std::uint32_t file_id, std::uint64_t offset,
         std::uint32_t total_sz, std::uint32_t tstamp) const;
 
-    // S6-P0: 状态变更阶段 — 把 ReduceJob apply 到索引（add_doc/put_doc/set_meta/on_vector/cache invalidate）。
-    // meta/vec 以 span 传入（P0 同线程免拷贝；P2+ 跨线程时由 MapJob 承载 owning 拷贝）。
-    void reduce_apply(const ReduceJob& job,
-                      std::span<const std::byte> meta,
-                      std::span<const float> vec);
+    // S6-P0: 状态变更阶段 — 把 ReduceJob apply 到索引（add_doc/set_doc_len/
+    // on_vector/cache invalidate）。S16-2 写路径反转：**不再写 docmap 行/meta**
+    // ——前置条件：docmap 行已就位（流水线=宿主 put_doc+set_meta；standalone/
+    // recover=caller put_doc）；本函数只回填 doc_len（分析产物，宿主拿不到）。
+    void reduce_apply(const ReduceJob& job, std::span<const float> vec);
 
     // ---- 文档删除：移除索引 ----
     // key: 要删除的 key
     // tomb_ord: 墓碑 record 的 ord（用于 index_.remove）
     // 返回被删除文档的 ord（用于 caller 跟踪）；key 不存在返回 nullopt。
     std::optional<std::uint64_t> on_delete(std::string_view key, std::uint64_t tomb_ord);
+
+    // S16-2：流水线版删除。前置条件：宿主已捕获 prior_ord 并完成 docmap
+    // remove；本方法只做 BM25 统计扣减 / 高亮 LRU / 缓存失效 / delta 记账
+    // ——不查不删 docmap。prior_ord 必须有效（宿主对不存在的 key 不广播删
+    // 除语义由 adapter 的 kNoPriorOrd 哨兵守卫）。
+    void on_delete(std::string_view key, std::uint64_t tomb_ord,
+                   std::uint64_t prior_ord);
 
     // ---- merge 后重定位：ord 不变，只更新存储定位 ----
     void on_relocate(std::string_view key, std::uint64_t ord,

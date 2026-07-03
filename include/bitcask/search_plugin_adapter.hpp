@@ -56,9 +56,9 @@ public:
         return p;
     }
 
+    // S16-2 前置条件：宿主已先 apply docmap（PutEntry 分支 put_doc+set_meta，
+    // DeleteEntry 分支捕 prior_ord + remove）——本 adapter 只做 BM25/HNSW 侧。
     void on_put(const plugin::PutEvent& e, plugin::PreparedPtr prep) override {
-        const std::span<const std::byte> meta = e.doc ? e.doc->meta
-                                                      : std::span<const std::byte>{};
         const std::span<const float> vec = e.doc ? e.doc->vec
                                                  : std::span<const float>{};
         if (e.doc && !e.doc->fields.empty()) {
@@ -67,23 +67,25 @@ public:
             // ——与旧版「map 异常收空 ReduceEntry」语义一致。
             auto* sp = static_cast<SearchPrepared*>(prep.get());
             if (sp) {
-                search_.reduce_apply(sp->job, meta, vec);
+                search_.reduce_apply(sp->job, vec);
             } else {
                 const ReduceJob empty{};
-                search_.reduce_apply(empty, meta, vec);
+                search_.reduce_apply(empty, vec);
             }
         } else {
             // 单文本（原 OnWriteEntry 语义）：分析在 reducer 内进行。
+            // docmap 行宿主已落——走 apply_text 核心，不走 legacy on_write
+            // （后者会重复 put_doc，误增 retired_since_compact_，S16-2 侦查）。
             const std::string_view text = e.doc ? e.doc->text : e.value;
-            search_.on_write(e.key, e.ord, text, e.loc.file_id, e.loc.offset,
-                             e.loc.total_sz, e.tstamp);
-            if (!meta.empty()) search_.index().set_meta(e.ord, meta);
+            search_.apply_text(e.key, e.ord, text);
             if (!vec.empty()) search_.on_vector(e.ord, vec);
         }
     }
 
     void on_delete(const plugin::DeleteEvent& e) override {
-        search_.on_delete(e.key, e.ord);  // 返回的旧 ord 此处无用途（旧版同）
+        // kNoPriorOrd = 删不存在的 key：宿主未动 docmap，历史语义为 no-op。
+        if (e.prior_ord == plugin::kNoPriorOrd) return;
+        search_.on_delete(e.key, e.ord, e.prior_ord);
     }
 
     void on_relocate(const plugin::RelocateEvent& e) override {

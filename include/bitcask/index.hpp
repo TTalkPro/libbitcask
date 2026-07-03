@@ -92,6 +92,13 @@ public:
     // 线程安全：unique_lock。
     bool remove(std::string_view ext_id, std::uint64_t tomb_ord);
 
+    // S16-2：单独回填 doc_len（BM25 token 数）。写路径反转后 DocSlot 由
+    // 宿主先落（doc_len=0，宿主不做分析拿不到 token 数），分析产物由
+    // BM25 侧（reducer 单写者）经本方法补写。同时更新 slots_ AoS 与
+    // doc_lens_ SoA（序列化读前者，SIMD gather 读后者）。ord 未登记则
+    // no-op（防御：空 job 守卫路径）。线程安全：unique_lock。
+    void set_doc_len(std::uint64_t ord, std::uint32_t len);
+
     // V5:存储 ord 的 meta blob(结构化 KV 二进制,可为空)。与 put_doc
     // 在同一 unique_lock 下调用——保证 meta 与定位/live 同写入原子点,
     // 后续读路径不必额外同步。blob 由 Index 内部拷贝(caller 可立即
