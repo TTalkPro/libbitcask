@@ -1676,3 +1676,65 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > **建议执行顺序**：F1（数据丢失）→ F2（永久挂起）→ F3/F4（TSan 干净化）→ P1/P2（两处
 > 一行级高收益）→ M1 → F5/F6 → F7+D3（文档漂移一并修）→ 其余按价值推进。
 > F1/F3 均配 build-tsan 并发压测验证。
+
+---
+
+## 待办：第十四梯队（S14 checkpoint 增量化 — 2026-07-03）
+
+> 来源：P1/H1 修复后的崩溃恢复讨论（s13-review §P1 后续）。现状 search.ckpt 只在
+> 干净 close / merge 收尾保存，长跑库崩溃后重放全部历史（10M 库重分词 + HNSW 串行
+> 重建可达小时级）。一次全量 ckpt 成本 ∝ 索引总量（10M/128d 估算 5–15GB：postings
+> GB 级 + docmap ~1GB + hnsw 邻接 ~1.3GB + int8 码字 ~1.3GB + .vec f32 ~5GB）——
+> 周期化必须配增量化，否则 roll 点 cadence 下写放大 5–10×。
+>
+> **方向判定（已论证，见 s13-review §P1 后续）**：hash 分片（term/key）对增量化
+> 收益恒为零（一个文档的 terms 散到所有分片 → 每写全脏）；**ord 时间轴分段**才是
+> append-only 负载的正确切法（写只脏 active 段）。**回收 = merge 点 rebase**（复用
+> `needs_merge` 的 dead_doc_rate 触发 + compact/rebuild_hnsw 的 reducer 静止点），
+> append 文件不打洞、整体重写——与 data 文件同生命周期哲学。**不引入逐条索引落盘**
+> （那是路线 A 砍掉的 bm25 WAL 双重日志回魂）；索引侧磁盘写只在 ckpt 点整批发生。
+> 依据：`doc/recovery-unified-checkpoint-design-zh.md`（路线 A）§5。
+>
+> **前置已完成（2026-07-03，本批前落地）**：
+> - [x] ① open 恢复后回存：fold 重分析 ≥ `kPostRecoveryCkptMinDocs`(1000) 时 open
+>   内直接回存 keydir 快照 + search.ckpt（重建成果落盘，再崩不全价重付）。
+> - [x] ② `Cask::checkpoint()` 公开 API：RunFn 在 reducer 线程序列化（S13-F6 机制），
+>   tri-state 原子只等自己的 RunFn（不等 flush(lane)，持续写入下等待有界）；
+>   与 close 竞态由 H1 WriteOpGate 收敛。
+
+- [ ] **S14-1【P0·S】roll 封口点异步自动 checkpoint（cadence 机制）**
+  - `CaskOptions::auto_checkpoint_min_docs = 0`（0=关闭，默认零行为变化）。
+    roll_active 置 pending 标记（原子）；写路径释放 write_mu_ 后的锁外提交点检测：
+    增量（peek_next_ord − last_ckpt_ord_）≥ 阈值且无在途 → fire-and-forget 提交
+    RunFn（keydir 快照 + search.ckpt 都在 reducer 线程内做，成对顺序保持），
+    **不阻塞任何写者**。仅索引模式生效（KV 恢复本就走 hint 快路径）。
+  - 防重入：`auto_ckpt_inflight_` 原子标志，RunFn 完成时清。
+  - 快照写并发统一：manual checkpoint() 的 write_keydir_snapshot 同步移进其 RunFn
+    （所有 ckpt 文件写统一到 reducer 单线程，消除 tmp 文件并发写窗口；merge 收尾
+    的快照仍在 caller 线程，靠 CRC 兜底 + 单实例运维约束）。
+- [ ] **S14-2【P0·M】search.vec / int8 码字按 ord 追加化（最大单点收益）**
+  - 向量 per-ord 不可变、删除是掩码 → 追加语义天然成立。ckpt 只 append
+    [上次水位, 本次水位) 的向量/码字（带帧头 count+CRC+水位），~5–6GB 全量重写
+    降为 MB 级 append。load 校验到最后完整帧，torn 尾截断、缺口 fold 补
+    （与 data 文件 torn-write 同型）。merge 点 rebase 全量重写收缩（清死向量）。
+- [ ] **S14-3【P1·M】段级 dirty-bit + 旧段字节前移（路线 A §5）**
+  - 写路径维护 per-type 脏标记（bm25 默认域/字段域/hnsw/docmap）；save 时干净段
+    从旧 search.ckpt 按页脚目录原字节拷贝前移（连旧 CRC），只重序列化脏段。
+    无向量写周期 hnsw 段零成本；纯向量负载 bm25 段零成本。文本持续写入下 bm25
+    仍全量——本项是机制骨架，主力负载增量化靠 S14-4。
+- [ ] **S14-4【P1·L】bm25/docmap ord-delta 段 + merge 点 rebase**
+  - 持久化层分段（**非** Lucene 运行时段——内存仍单一索引，查询零改动）：ckpt 写
+    delta 段 = 每 term 中 ord ∈ (上次水位, 本次水位] 的 posting 尾巴 + 新 vocab 项
+    （posting items 由 reducer 单写者按 ord 追加 → 区间恰为每条 list 的后缀）。
+    load = base + 按序 apply deltas（尾部追加）。**rebase 条件**：compact/merge
+    重写 posting 破坏可重构性 → merge 收尾存全量 base（位置现成），delta 链坍缩。
+    日常 roll 点 ckpt 写入量从 GB 级降到 ∝ 增量。
+- [ ] **S14-5【P2·M】HNSW 邻接段低频保存 + 载入尾部 insert 追平**
+  - HNSW 违反 append-only 前提（插入改写旧节点邻居表）→ 无不可变旧段。混频策略：
+    邻接段每 K 次 ckpt（或仅 merge 点）保存；恢复时图水位 wm_g < 向量水位 wm →
+    载旧图 + [wm_g, wm) 逐条 insert 追平（fold 尾部重放既有形态，per-section
+    水位自门已支持段间不一致）。K 间隔的增量插入分钟内，替代小时级全量重建。
+
+> **建议执行顺序**：S14-1（cadence 机制，小）→ S14-2（性价比最高的一刀）→
+> S14-3（段复用骨架）→ S14-4（主力负载增量化，大）→ S14-5（图的混频收尾）。
+> 每步独立可交付；S14-1 落地后 ②③ 即形成完整的「手动 + 自动」ckpt 节奏。

@@ -78,6 +78,12 @@ struct CaskOptions {
     // 兼顾持久性与吞吐（区别于 o_sync 的每条 durable）。0 = 关闭（默认）。
     // o_sync 为真时本项无意义（已逐条 durable）。
     std::uint32_t sync_every_n     = 0;
+    // S14-1 自动 checkpoint：roll 封口点若自上次 ckpt 以来的 ord 增量 ≥ 本值，
+    // 异步（reducer 线程 RunFn，fire-and-forget，不阻塞写者）落 keydir 快照 +
+    // search.ckpt——把崩溃恢复重放窗口钳制在 ~本值 + 一个文件的写入量内。
+    // 0 = 关闭（默认）。仅索引模式生效（纯 KV 恢复本就走 hint 快路径）；
+    // 精细节奏控制用 checkpoint() API。
+    std::uint32_t auto_checkpoint_min_docs = 0;
     bool          require_hint_crc = false;  // legacy 默认 false；M5 之后可能改 true
     // tstamp < (now - expiry_secs) 的 record 在 get/fold 中被过滤，
     // 同时进入「过期触发 merge」的候选。0 = 禁用。
@@ -661,6 +667,28 @@ public:
     // （put 被 write_mu_ 挡在备份期间外，get 不受影响）。
     [[nodiscard]] std::expected<void, CaskFault> backup(std::string_view dst_dir);
 
+    // 手动 checkpoint（s13-review §P1 后续②）：把 keydir 快照 + search.ckpt
+    // 主动落盘，把崩溃恢复的重放窗口收敛到「自本次调用以来的增量」——否则
+    // ckpt 只在干净 close / merge 收尾保存，长期运行不重启的大库崩溃后要
+    // 重放全部历史（10M 级库重分词 + HNSW 重建可达小时级）。调用节奏由
+    // caller 决定（每 N 万写 / 定时 / 业务低峰），库内不做周期策略。
+    // 保存顺序与 merge 收尾一致（成对性）：先落 keydir 快照（较早水位），
+    // 后存 search.ckpt（覆盖必然 ≥ 快照水位）——并发写入下方向安全（下次
+    // open 从快照水位重放尾部，重叠区由各索引 ord 自门幂等丢弃）。
+    // 阻塞语义：search.ckpt 序列化经 RunFn 在 reducer 线程按 ord 序执行
+    // （S13-F6：concurrent_hash_map 遍历只允许发生在 reducer），本调用等待
+    // **自己的 RunFn** 完成（其 ord 之前的索引事件此时必然已全部 apply），
+    // 不等整条队列排空——持续写入下等待仍有界。大库序列化可达秒~分钟级，
+    // 期间 reducer 停摆、队列积压（H1 后背压只阻塞提交中的写者）。
+    // 纯 KV 库（无 search）只落 keydir 快照。
+    // 线程安全: **是**。checkpoint 间由内部 ckpt_mu_ 串行；与 put/get 并发
+    // 安全（不取 write_mu_）；与 close 并发由 WriteOpGate 收敛（close 等待
+    // 本调用完成）。与 merge 收尾并发时快照/ckpt 为最后写者赢——两者内容
+    // 皆自洽无损坏风险（ckpt 有 .prev 代际回退，快照损坏退全量 fold），但
+    // 建议与 merge 同一运维线程串行调度。
+    // 只读 / merge_only 句柄返回 kReadOnly。
+    [[nodiscard]] std::expected<void, CaskFault> checkpoint();
+
     // 线程安全: 是；不需任何锁。返回的 CaskIter 自身非线程安全。
     [[nodiscard]] std::unique_ptr<CaskIter> make_iter() {
         return std::make_unique<CaskIter>(this);
@@ -723,8 +751,8 @@ private:
     }
 
     // H1（s13-review §P1）：在途写操作计数。写路径（put/put_batch/remove/
-    // put_doc）在整个调用期间持有 WriteOpGate——含释放 write_mu_ 之后的
-    // 索引提交尾段。close() 置 closed_ 后等待归零，才注销 index lane /
+    // put_doc）与 checkpoint() 在整个调用期间持有 WriteOpGate——含释放
+    // write_mu_ 之后的索引提交尾段。close() 置 closed_ 后等待归零，才注销 index lane /
     // 清空 index_pool_ 指针；否则锁外的 submit_index_task 可能解引用已
     // erase 的 lane（UAF）。这是对「close 时刻无在途调用」契约（见上）的
     // 防御性收敛：违约的并发 close 从 UB 变为阻塞等待写者退出。收敛性：
@@ -733,6 +761,23 @@ private:
     // 内存序：fetch_add/fetch_sub 与 close 侧 load 均 seq_cst——写者
     // 「inc 后读 closed_」与 close「写 closed_ 后读计数」构成 store-buffer
     // 形状，RMW 的全序 + seq_cst load 保证两侧不会同时读到旧值。
+    // checkpoint() 调用间互斥（并发手动 checkpoint 串行化；ckpt 文件的实际
+    // 写入统一在 reducer 线程 RunFn 内做，见 checkpoint()/S14-1 注释）。
+    // 不与 write_mu_ 交叉：checkpoint 不取 write_mu_，写路径不取本锁。
+    std::mutex ckpt_mu_;
+
+    // S14-1 自动 checkpoint 状态。pending：roll_active 置位（有文件封口），
+    // 写路径锁外提交点消费；inflight：防重入（一次只挂一个 RunFn），RunFn
+    // 完成时清；last_ckpt_ord_：上次 ckpt 覆盖水位（open 末尾初始化为当前
+    // next_ord，RunFn/checkpoint() 保存成功后推进），增量 = peek_next_ord −
+    // 本值，达 opts_.auto_checkpoint_min_docs 才真正提交。
+    std::atomic<bool> auto_ckpt_pending_{false};
+    std::atomic<bool> auto_ckpt_inflight_{false};
+    std::atomic<std::uint64_t> last_ckpt_ord_{0};
+    // 写路径释放 write_mu_ 后调用（WriteOpGate 持有中 → close 竞态安全）：
+    // 消费 pending 标记，增量达阈值则 fire-and-forget 提交 ckpt RunFn。
+    void maybe_submit_auto_checkpoint();
+
     std::atomic<std::uint32_t> writes_in_flight_{0};
     struct WriteOpGate {
         Cask* cask;

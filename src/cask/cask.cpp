@@ -606,6 +606,10 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
             cask->keydir_->peek_next_ord()
         );
     }
+    // S14-1：自动 ckpt 增量基线 = 当前水位（open 恢复路径①已按需回存，
+    // 从零起算会导致老库首个 roll 必触发一次全量 ckpt）。
+    cask->last_ckpt_ord_.store(cask->keydir_->peek_next_ord(),
+                               std::memory_order_relaxed);
     return cask;
 }
 
@@ -901,8 +905,14 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
     // 插入序 == fold 序 → 与逐条 recover 结果一致。墓碑前必 flush 以保相对序。
     constexpr std::size_t kRecoverBatch = 1024;
     std::vector<search::SearchLayer::RecoverDoc> recover_batch;
+    // ①（s13-review §P1 后续）：统计本次恢复重分析的文档数——它度量的是
+    // 「若现在不回存 checkpoint，下次崩溃要白付多少重放」。计所有喂进
+    // recover 的文档（含被索引 ord 自门丢弃的重叠区：分析成本已经付了，
+    // 回存快照能让下次 fold 起点前移、免掉这部分）。
+    std::size_t recovered_docs = 0;
     auto flush_recover = [&] {
         if (search_layer && !recover_batch.empty()) {
+            recovered_docs += recover_batch.size();
             search_layer->recover_doc_batch(recover_batch);
             recover_batch.clear();
         }
@@ -1045,6 +1055,29 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
             if (auto r = fold_one(e); !r) return std::unexpected(r.error());
         }
         flush_recover();  // S3:落最后一个不满批
+        // ①（s13-review §P1 后续）：恢复期重分析量超过阈值时，立即回存
+        // checkpoint——否则重建成果只在内存，下次干净 close/merge 前再崩
+        // 一次就全价重付（10M 级库重分词 + HNSW 重建可达小时级）。
+        // 触发条件用**重分析文档数**而非「是否全量 fold」：快照/ckpt 健康
+        // 但陈旧（长期运行未 close 的库崩溃后）时 fold 起点旧、尾部重放
+        // 可能极大，同样值得回存；反之新建空库、小尾部增量不值得付大库
+        // 整体序列化的成本（回存成本 ∝ 索引总量，省下的 ∝ 重放量）。
+        // 精细节奏控制走 checkpoint() API（②）。
+        // 此刻 index lane 尚未注册（open 在 fold 之后才 register_lib）、
+        // 无并发写者，调用线程直接序列化即安全。best-effort：失败仅降级
+        // 下次启动速度，不阻断 open。
+        // 只读 / merge_only 不写（不持 write.lock，禁写共享目录文件）。
+        constexpr std::size_t kPostRecoveryCkptMinDocs = 1000;
+        if (search_layer && recovered_docs >= kPostRecoveryCkptMinDocs &&
+            opts_.read_write && !opts_.merge_only) {
+            write_keydir_snapshot();  // 成对：快路径要求快照与 ckpt 同时健康
+            if (!search_layer->save_search_ckpt(
+                    dirname_ + "/" + kSearchCkptName,
+                    keydir_->peek_next_ord())) {
+                log_warn("post-recovery search checkpoint save failed "
+                         "(next open will re-fold)");
+            }
+        }
         return {};
     }
 
@@ -1207,6 +1240,10 @@ std::expected<void, CaskFault> Cask::roll_active() {
         active_data_.reset();  // 在途读者持 shared_ptr,旧对象由引用计数续命
     }
     active_hint_.reset();
+    // S14-1：文件封口 = 自动 checkpoint 的天然锚点（sealed 文件不再变化，
+    // 按写入量周期触发）。此处仅置标记——实际提交在写路径释放 write_mu_
+    // 之后（maybe_submit_auto_checkpoint），锁内零开销。
+    auto_ckpt_pending_.store(true, std::memory_order_relaxed);
     return ensure_active_writer();
 }
 
@@ -1727,6 +1764,7 @@ Cask::put(std::span<const std::byte> key,
         std::string_view(reinterpret_cast<const char*>(value.data()),
                          value.size()),
         rec.file_id, rec.offset, rec.total_size, tstamp, 0));
+    maybe_submit_auto_checkpoint();  // S14-1：roll 封口的异步 ckpt（锁外）
     if (!gc) return std::unexpected(gc.error());
     return {};
 }
@@ -1913,6 +1951,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint32_t tstamp) {
     }
     wlk.unlock();  // H1：常规路径的 Add 全部在锁外提交
     flush_adds();
+    maybe_submit_auto_checkpoint();  // S14-1（锁外）
     if (!gc) return std::unexpected(gc.error());
     return {};
 }
@@ -1979,6 +2018,7 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
         submit_index_task(IndexTask::make(
             IndexOp::Delete, bytes_to_view(key), ord, {}, 0, 0, 0, tstamp, 0));
     }
+    maybe_submit_auto_checkpoint();  // S14-1（锁外）
     if (!gc) return std::unexpected(gc.error());
     return {};
 }
@@ -2098,6 +2138,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     }
     task.meta.assign(doc.meta.begin(), doc.meta.end());
     submit_index_task(std::move(task));
+    maybe_submit_auto_checkpoint();  // S14-1（锁外）
     if (!gc) return std::unexpected(gc.error());
     return {};
 }
@@ -2478,6 +2519,124 @@ Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
     for (const auto& f : d.files)         n.files.push_back(f.filename);
     for (const auto& f : d.expired_files) n.expired_files.push_back(f.filename);
     return n;
+}
+
+// 手动 checkpoint（s13-review §P1 后续②）。语义与并发契约见 cask.hpp 声明。
+// 与 merge 收尾（S13-F6）同机制：search.ckpt 序列化封装成 RunFn 经 reorder
+// buffer 在 reducer 线程按 ord 序执行。区别：不等 flush(lane)（持续写入下
+// in_flight 难归零，等待无界），只等自己的 RunFn 完成——reducer 严格按 ord
+// 序 apply，RunFn 执行时其 ord 之前的事件必然已全部应用，等待有界（此刻
+// 之前已提交的积压）。完成信号用 tri-state 原子（0=pending/1=ok/2=fail）+
+// atomic::wait；fn 内兜异常（reducer 的 catch 只计数不回传，若 fn 抛出而
+// 不置状态，本调用将永久挂起）。
+std::expected<void, CaskFault> Cask::checkpoint() {
+    WriteOpGate gate(this);  // H1：close() 等本调用（含 RunFn 等待）完成
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
+    if (!opts_.read_write || opts_.merge_only) {
+        return std::unexpected(err(CaskError::kReadOnly,
+                                     "checkpoint: read-only cask"));
+    }
+    std::lock_guard<std::mutex> lk(ckpt_mu_);
+    if (!search_) {
+        // 纯 KV 库：keydir 快照即全部（无 reducer，调用线程直写；并发调用
+        // 由 ckpt_mu_ 串行，快照 tmp+rename 不与自身竞争）。
+        write_keydir_snapshot();
+        return {};
+    }
+    const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
+    if (index_pool_ && index_lane_) {
+        auto done = std::make_shared<std::atomic<int>>(0);
+        IndexTask t;
+        t.op  = IndexOp::RunFn;
+        t.ord = keydir_->alloc_ord();
+        // S14-1：keydir 快照也移进 RunFn——所有 ckpt 文件写统一到 reducer
+        // 单线程，与自动 checkpoint 的 RunFn 天然串行（消除 .tmp 并发写
+        // 窗口，且不能在此持 ckpt_mu_ 等 reducer——会与手动调用互锁）。
+        // 成对性保持：RunFn 内先快照（较早时刻）后 search.ckpt。
+        t.fn  = [this, search_ckpt, done,
+                 wm = keydir_->peek_next_ord()] {
+            int result = 2;
+            try {
+                write_keydir_snapshot();  // best-effort（失败内部已上报）
+                result = search_->save_search_ckpt(search_ckpt, wm) ? 1 : 2;
+            } catch (...) {
+                // result 保持 2；异常本体由 reducer 的 error_fn 计数上报。
+            }
+            if (result == 1) {
+                last_ckpt_ord_.store(wm, std::memory_order_relaxed);
+            }
+            done->store(result, std::memory_order_release);
+            done->notify_all();
+        };
+        index_pool_->submit(index_lane_, std::move(t));
+        for (int v = done->load(std::memory_order_acquire); v == 0;
+             v = done->load(std::memory_order_acquire)) {
+            done->wait(0, std::memory_order_acquire);
+        }
+        if (done->load(std::memory_order_acquire) != 1) {
+            return std::unexpected(err(CaskError::kIo,
+                "checkpoint: search checkpoint save failed"));
+        }
+    } else {
+        // 无索引池（理论不可达：search_ 存在则 lane 已注册）——调用线程直跑，
+        // 行为同 merge 收尾的退化分支。
+        write_keydir_snapshot();
+        if (!search_->save_search_ckpt(search_ckpt, keydir_->peek_next_ord())) {
+            return std::unexpected(err(CaskError::kIo,
+                "checkpoint: search checkpoint save failed"));
+        }
+    }
+    return {};
+}
+
+// S14-1：自动 checkpoint 的提交点。写路径释放 write_mu_ 后调用（WriteOpGate
+// 持有中 → index_pool_/index_lane_ 读安全，close 等待本调用返回）。消费
+// roll_active 置下的 pending 标记；ord 增量达阈值且无在途 RunFn 才真正提交。
+// fire-and-forget：不等待完成，序列化在 reducer 线程进行（与手动 checkpoint
+// 的 RunFn 天然串行），失败仅 log_warn——自动路径是 best-effort 加速，
+// 正确性恒由 data fold 兜底。
+void Cask::maybe_submit_auto_checkpoint() {
+    if (opts_.auto_checkpoint_min_docs == 0) return;          // 未启用
+    if (!search_ || !index_pool_ || !index_lane_) return;     // 仅索引模式
+    if (!auto_ckpt_pending_.load(std::memory_order_relaxed)) return;
+    const std::uint64_t now_ord = keydir_->peek_next_ord();
+    if (now_ord - last_ckpt_ord_.load(std::memory_order_relaxed) <
+        opts_.auto_checkpoint_min_docs) {
+        // 增量不足：清标记，等下一次 roll 再评估。
+        auto_ckpt_pending_.store(false, std::memory_order_relaxed);
+        return;
+    }
+    if (auto_ckpt_inflight_.exchange(true, std::memory_order_acq_rel)) {
+        return;  // 已有在途 RunFn（保持 pending，完成后下个 roll 重试）
+    }
+    auto_ckpt_pending_.store(false, std::memory_order_relaxed);
+    IndexTask t;
+    t.op  = IndexOp::RunFn;
+    t.ord = keydir_->alloc_ord();
+    fprintf(stderr, "DBG auto-ckpt submit ord=%llu wm=%llu\n",
+            (unsigned long long)t.ord,
+            (unsigned long long)keydir_->peek_next_ord());
+    t.fn  = [this, wm = keydir_->peek_next_ord()] {
+        fprintf(stderr, "DBG auto-ckpt run wm=%llu live=%llu\n",
+                (unsigned long long)wm,
+                (unsigned long long)search_->index_info().live_docs);
+        try {
+            // 成对顺序（同 checkpoint()）：先 keydir 快照，后 search.ckpt。
+            write_keydir_snapshot();
+            if (search_->save_search_ckpt(dirname_ + "/" + kSearchCkptName,
+                                          wm)) {
+                last_ckpt_ord_.store(wm, std::memory_order_relaxed);
+            } else {
+                log_warn("auto checkpoint: search ckpt save failed "
+                         "(will retry at a later roll)");
+            }
+        } catch (...) {
+            log_error("auto checkpoint: exception during save (swallowed; "
+                      "recovery still covered by data fold)");
+        }
+        auto_ckpt_inflight_.store(false, std::memory_order_release);
+    };
+    submit_index_task(std::move(t));
 }
 
 // 合并执行。files 为空时先 needs_merge 决定要并什么；非空就直接用

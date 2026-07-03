@@ -3152,6 +3152,210 @@ TEST_F(CaskDocValueTest, H1CloseConvergesWithInflightWriters) {
     EXPECT_EQ(after.error().kind, bitcask::CaskError::kClosed);
 }
 
+// ── checkpoint()（s13-review §P1 后续①②）：崩溃恢复窗口收敛 ─────────────
+
+namespace {
+// 模拟崩溃现场：句柄仍打开（不 close）时把库目录按字节复制——等价于崩溃
+// 瞬间的磁盘状态（data 已 pwrite 可见；没有 close 才会补存的 ckpt/快照）。
+// 复制品里删掉 lock 文件：本进程 pid 仍活，stale 检测不会回收，需手动
+// 清理才能以 read_write 重新打开。
+std::filesystem::path crash_image(const std::filesystem::path& src,
+                                  const std::string& tag) {
+    namespace fs = std::filesystem;
+    auto dst = fs::temp_directory_path() /
+               (src.filename().string() + "_crash_" + tag);
+    std::error_code ec;
+    fs::remove_all(dst, ec);
+    fs::copy(src, dst, fs::copy_options::recursive, ec);
+    fs::remove(dst / "bitcask.write.lock", ec);
+    fs::remove(dst / "bitcask.merge.lock", ec);
+    return dst;
+}
+}  // namespace
+
+// ②：运行中 checkpoint() 落盘 ckpt + keydir 快照；崩溃镜像重开后，ckpt
+// 覆盖区 + fold 尾部重放合起来恢复全部文档（重叠区由 ord 自门幂等）。
+TEST_F(CaskDocValueTest, CheckpointCrashImageRecoversAllDocs) {
+    namespace fs = std::filesystem;
+    auto opts = v31_opts(0);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto put_n = [&](int from, int to) {
+        for (int i = from; i < to; ++i) {
+            bitcask::DocInput doc;
+            std::string text = "apple banana n" + std::to_string(i);
+            doc.text = sv_bytes(text);
+            ASSERT_TRUE((*c)->put_doc(sv_bytes("ck_" + std::to_string(i)), doc,
+                                      static_cast<std::uint32_t>(1000 + i)));
+        }
+    };
+    put_n(0, 120);
+    ASSERT_TRUE((*c)->checkpoint());
+    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "kv.keydir.ckpt"));
+    put_n(120, 160);  // ckpt 之后的尾部增量，崩溃时只存在于 data 文件
+
+    auto img = crash_image(tmpdir_, "ckpt");
+    (*c)->close();
+
+    auto r = Cask::open(img.string(), opts, &test_registry());
+    ASSERT_TRUE(r);
+    auto hits = (*r)->search_text("banana", 200);
+    ASSERT_TRUE(hits);
+    EXPECT_EQ(hits->hits.size(), 160u)
+        << "ckpt 覆盖区(120) + fold 尾部重放(40) 应全部可检索";
+    auto g = (*r)->get_owned(sv_bytes(std::string("ck_159")));
+    EXPECT_TRUE(g);
+    (*r)->close();
+    std::error_code ec;
+    fs::remove_all(img, ec);
+}
+
+// ②：checkpoint 与并发写零竞态（keydir 快照屏障 + RunFn 有界等待 +
+// WriteOpGate）。结果不可严格断言（near-real-time），只断言不崩、
+// checkpoint 全部成功——TSan 负责抓竞态。S14-1：同时开启小文件 roll +
+// 自动 checkpoint，让手动 RunFn、自动 RunFn 与并发写在 reducer 上交错。
+TEST_F(CaskDocValueTest, CheckpointConcurrentWithWrites) {
+    auto opts = v31_opts(0);
+    opts.max_file_size = 8 * 1024;        // 频繁 roll → 自动 ckpt 路径参战
+    opts.auto_checkpoint_min_docs = 50;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    std::atomic<bool> ok{true};
+    std::vector<std::thread> ts;
+    for (int w = 0; w < 2; ++w) {
+        ts.emplace_back([&, w] {
+            for (int i = 0; i < 300; ++i) {
+                bitcask::DocInput doc;
+                std::string text = "melon kiwi n" + std::to_string(i);
+                doc.text = sv_bytes(text);
+                std::string key =
+                    "cw_" + std::to_string(w) + "_" + std::to_string(i);
+                if (!(*c)->put_doc(sv_bytes(key), doc,
+                                   static_cast<std::uint32_t>(5000 + i))) {
+                    ok = false;
+                    return;
+                }
+            }
+        });
+    }
+    for (int k = 0; k < 5; ++k) {
+        if (!(*c)->checkpoint()) {
+            ok = false;
+            break;
+        }
+    }
+    for (auto& t : ts) t.join();
+    EXPECT_TRUE(ok.load()) << "并发写下 checkpoint 出现错误返回";
+    ASSERT_TRUE((*c)->checkpoint());  // 静止后收尾一份
+    EXPECT_TRUE(std::filesystem::exists(tmpdir_ / "search.ckpt"));
+    (*c)->close();
+}
+
+// S14-1：roll 封口点自动 checkpoint——无 close/merge/手动调用，写满若干
+// 文件后成对 ckpt 文件自动出现（RunFn 在 reducer 落盘，flush_index 排干
+// 即确定完成）；崩溃镜像重开可完整恢复。
+TEST_F(CaskDocValueTest, AutoCheckpointOnRoll) {
+    namespace fs = std::filesystem;
+    auto opts = v31_opts(0);
+    opts.max_file_size = 8 * 1024;       // 小文件强制频繁 roll
+    opts.auto_checkpoint_min_docs = 50;  // 低阈值
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < 400; ++i) {
+        bitcask::DocInput doc;
+        std::string text =
+            "lemon peach n" + std::to_string(i) + " " + std::string(64, 'x');
+        doc.text = sv_bytes(text);
+        ASSERT_TRUE((*c)->put_doc(sv_bytes("ac_" + std::to_string(i)), doc,
+                                  static_cast<std::uint32_t>(3000 + i)));
+    }
+    (*c)->flush_index();  // 排干 reducer → 在途自动 ckpt RunFn 必已执行
+    EXPECT_TRUE(fs::exists(tmpdir_ / "search.ckpt"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "kv.keydir.ckpt"));
+    {
+        auto live = (*c)->search_text("lemon", 500);
+        ASSERT_TRUE(live);
+        ASSERT_EQ(live->hits.size(), 400u) << "活索引在崩溃镜像前就不完整";
+    }
+
+    auto img = crash_image(tmpdir_, "auto");
+    (*c)->close();
+    auto r = Cask::open(img.string(), opts, &test_registry());
+    ASSERT_TRUE(r);
+    auto hits = (*r)->search_text("lemon", 500);
+    ASSERT_TRUE(hits);
+    // 临时诊断
+    for (const char* probe : {"n0", "n50", "n100", "n200", "n300", "n399"}) {
+        auto p = (*r)->search_text(probe, 5);
+        fprintf(stderr, "DBG probe %s -> %zu\n", probe,
+                p ? p->hits.size() : size_t(999));
+    }
+    EXPECT_EQ(hits->hits.size(), 400u);
+    (*r)->close();
+    // 临时诊断：保留 img 现场
+    fprintf(stderr, "DBG img=%s\n", img.string().c_str());
+}
+
+// S14-1：默认关闭（auto_checkpoint_min_docs=0）——即使频繁 roll 也零行为
+// 变化，不产生任何 ckpt 文件。
+TEST_F(CaskDocValueTest, AutoCheckpointDisabledByDefault) {
+    namespace fs = std::filesystem;
+    auto opts = v31_opts(0);
+    opts.max_file_size = 8 * 1024;  // 有 roll，但阈值未设
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < 200; ++i) {
+        bitcask::DocInput doc;
+        std::string text =
+            "quince fig n" + std::to_string(i) + " " + std::string(64, 'x');
+        doc.text = sv_bytes(text);
+        ASSERT_TRUE((*c)->put_doc(sv_bytes("ad_" + std::to_string(i)), doc,
+                                  static_cast<std::uint32_t>(4000 + i)));
+    }
+    (*c)->flush_index();
+    EXPECT_FALSE(fs::exists(tmpdir_ / "search.ckpt"));
+    EXPECT_FALSE(fs::exists(tmpdir_ / "kv.keydir.ckpt"));
+    (*c)->close();
+}
+
+// ①：崩溃镜像（无任何 ckpt/快照）重开触发重建，重分析量超过阈值
+// （kPostRecoveryCkptMinDocs=1000）时 open 内立即回存 checkpoint——
+// 重建成果落盘，再崩不再全价重付。
+TEST_F(CaskDocValueTest, OpenAfterCrashResavesCheckpoint) {
+    namespace fs = std::filesystem;
+    auto opts = v31_opts(0);
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < 1500; ++i) {  // > 回存阈值 1000
+        bitcask::DocInput doc;
+        std::string text = "cherry grape n" + std::to_string(i);
+        doc.text = sv_bytes(text);
+        ASSERT_TRUE((*c)->put_doc(sv_bytes("rs_" + std::to_string(i)), doc,
+                                  static_cast<std::uint32_t>(2000 + i)));
+    }
+    // 不 checkpoint、不 close——镜像里没有任何 ckpt/快照
+    // （新建库首次 open 重分析量 0，不触发回存）。
+    auto img = crash_image(tmpdir_, "resave");
+    (*c)->close();
+    ASSERT_FALSE(fs::exists(img / "search.ckpt"));
+
+    {
+        auto r = Cask::open(img.string(), opts, &test_registry());
+        ASSERT_TRUE(r);
+        // ①：重建（1500 docs > 阈值）完成后 open 已回存两份成对文件。
+        EXPECT_TRUE(fs::exists(img / "search.ckpt"));
+        EXPECT_TRUE(fs::exists(img / "kv.keydir.ckpt"));
+        auto hits = (*r)->search_text("cherry", 2000);
+        ASSERT_TRUE(hits);
+        EXPECT_EQ(hits->hits.size(), 1500u);
+        (*r)->close();
+    }
+    std::error_code ec;
+    fs::remove_all(img, ec);
+}
+
 // 边界：空批量 → 空；单条 → 走快路径（不进池）仍正确。
 TEST_F(CaskDocValueTest, S74SearchTextBatchEdgeCases) {
     auto opts = v31_opts(4);
