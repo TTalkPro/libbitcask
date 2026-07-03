@@ -286,6 +286,16 @@ target_link_libraries(bitcask_thread_pool_test PRIVATE
 )
 gtest_discover_tests(bitcask_thread_pool_test ${_bitcask_test_props})
 
+# S17-1：index.manifest 格式测试——header-only（只需 gtest + zlib via codec）。
+add_executable(bitcask_index_manifest_test index_manifest_test.cpp)
+target_link_libraries(bitcask_index_manifest_test PRIVATE
+    GTest::gtest_main
+    bitcask_format
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_index_manifest_test ${_bitcask_test_props})
+
 # ---------------------------------------------------------------------------
 # C API smoke test — 纯 C, 链接 libbitcask.so (bitcask_shared)
 # ---------------------------------------------------------------------------

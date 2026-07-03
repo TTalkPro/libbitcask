@@ -2123,3 +2123,94 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > S16-2 是 P2 的实质；若其 ckpt 记账迁移在评审中被判过重，可退化为
 > 「记账经 SearchLayer 暴露的 docmap 写门面代持」（宿主仍是唯一写发起方，
 > 记账物理位置暂留 SearchLayer，P3 一并迁）。
+
+---
+
+## 第十七梯队 S17：P3 — Checkpoint 拆分（manifest + 每组件独立文件族）
+
+> 来源：`doc/plugin-arch-split-design-zh.md` §5。目标：单一 `search.ckpt`
+> + 单 delta 链 → 3 个 per-component 文件族（docmap/bm25/vec 各自 base+delta
+> 链 + .prev）+ `index.manifest`（唯一 commit 点）。解耦痛点：① 任一子系统
+> rebase 强制全体 rebase；② BM/HNSW 无法独立装配。P3 是唯一高风险阶段——
+> 动 S14 全部持久化布局。
+>
+> **Manifest 格式**（Oracle 确认，~80 字节）：
+> ```
+> magic "BCMF"(4) | version u32 | component_count u32
+> per component [0=docmap, 1=bm25, 2=vec]:
+>   base_watermark u64 | chain_seq u32 | chain_watermark u64
+> footer_crc32 u32 | trailer "BCMF"(4)
+> ```
+> 无全局 watermark（recovery 取 `min(chain_watermark)`）。无 manifest .prev
+> （80 字节 + CRC + 原子 rename 足够；损坏退全量 fold）。
+>
+> **Commit 协议**：
+> - base 路径：组件文件各自 tmp+rename+fdatasync → manifest tmp+rename
+>   （commit 点）→ keydir 快照
+> - delta 路径：docmap.d\<seq\>（内联 kKeydirDelta，S14-7 原子性保留）
+>   → manifest（无 keydir 快照）
+> - 崩溃安全：组件文件 header watermark ≠ manifest → 用 per-component
+>   `.prev`；manifest 是唯一 commit 点
+>
+> **不变量证明**：
+> - delta 路径：所有组件 chain_wm 推进到同一 save-time watermark →
+>   `keydir_covered = watermark = min(chain_wms)` ✓
+> - base 路径：manifest 先于 keydir 快照 → crash 两者之间 keydir 旧 →
+>   `keydir_covered < min(chain_wms)` ✓
+>
+> **⚠️ fsync 纪律**：当前 checkpoint 代码完全跳过 fsync。manifest 必须
+> `fdatasync` + 目录 `fsync`，否则 rename 可能不持久化。
+>
+> **kKeydirDelta**：留在 docmap delta 文件内联（不进 manifest，不独立文件）。
+
+- [x] **S17-1【P0·S】`index.manifest` 格式 + read/write** — 已完成（2026-07-03）
+  - 新建 `include/bitcask/index_manifest.hpp`：`Manifest` 结构体（per-component
+    entries: `{base_watermark, chain_seq, chain_watermark}`）+ `write()`
+    （tmp+fdatasync+rename+dirfsync）+ `read()`（magic + CRC 校验）。
+  - ComponentId 枚举：`kDocmap=0, kBm25=1, kVec=2`。
+  - 测试：roundtrip + corruption injection + truncation + wrong magic + missing file（8/8 通过）。
+
+- [ ] **S17-2【P0·L】per-component save 路径拆分**
+  - `save_search_ckpt`（515 行）拆为 `save_component_base(comp_id, wm, secs)`
+    + `save_component_delta(comp_id, wm, secs)`——复用 `SearchCheckpoint::write`
+    不变。每组件独立 rename→`.prev` on base。
+  - 段分配：docmap→{kDocmap}，bm25→{kBm25Default, kBm25Fields}，
+    vec→{kHnsw} + `.vec`/`.qc8` 侧车。
+  - delta 段：docmap→{kDeltaInfo, kDocmapDelta, kKeydirDelta}，
+    bm25→{kDeltaInfo, kBm25DefaultDelta, kBm25FieldsDelta}，
+    vec→{kDeltaInfo, kHnswDelta}。
+
+- [ ] **S17-3【P0·M】manifest-driven commit 协议接线**
+  - `save_checkpoint_base` / `save_checkpoint_delta` 实现 Oracle §2 pseudocode：
+    组件文件先写（各自 tmp+rename+fdatasync）→ manifest（commit 点）→
+    keydir 快照（仅 base 路径）。
+  - 替换 `save_search_ckpt_paired` 为多文件版本。
+  - close / checkpoint() / auto_checkpoint / merge 收尾路径全部改经新协议。
+
+- [ ] **S17-4【P0·L】recovery 协议重写**
+  - `load_recovery_snapshots` 重写：读 manifest → per-component
+    `try_load_component`（header wm 匹配 manifest → 用；不匹配 → `.prev`；
+    都不行 → 水位归零 fold 重建）→ per-component delta replay。
+  - `fold_start = min(all component chain_watermarks)`。
+  - `all_healthy → fold fast path` 门控。
+
+- [ ] **S17-5【P1·S】旧 search.ckpt → 新格式迁移**
+  - 首次 open 若无 manifest 但有 search.ckpt：读旧文件 → 按 section type
+    拆分为 per-component 文件 → 写 manifest → rename 旧文件为 `.legacy`。
+  - 失败 → 全量 fold（安全兜底，一次性慢 open）。
+
+- [ ] **S17-7【P1·S】`.vec`/`.qc8` 侧车生命周期集成**
+  - vec 组件 base/delta 保存调 `save_vec_payload`/`save_qc_payload`（现有）。
+  - manifest 不跟踪侧车（load 时 `load_vec_payload` 失败 → vec 段标 corrupt
+    → fold 重建）。
+
+- [ ] **S17-6【P1·M】崩溃安全测试套**
+  - 模拟 Oracle §4 表的每个 crash 点：组件 rename 后 / manifest 后 /
+    delta 链中途 / manifest.tmp 损坏 / 侧车 torn。
+  - 断言 `keydir_covered ≤ min(chain_wms)` 恒成立。
+  - 断言单组件损坏只重建该组件（其他组件不受牵连）。
+  - 更新全部 26 个硬编码 "search.ckpt" 的既有 checkpoint/crash 测试。
+
+> **建议执行顺序**：S17-1（格式基础）→ S17-2（拆 save）→ S17-3（commit
+> 接线）→ S17-4（recovery）→ S17-5（迁移）→ S17-7（侧车）→ S17-6（崩溃测试）。
+> S17-2 + S17-3 + S17-4 是实质重头（动 save/load 全路径）；S17-6 依赖前 5 项。
