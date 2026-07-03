@@ -1910,3 +1910,115 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > S14-7 ✅（keydir 增量化收口）→ S14-8 ✅（qc8 外置 + gen 配对）。
 > **S14 批次全部收官。**每步独立可交付；S14-1 落地后 ②③ 即形成完整的「手动 + 自动」
 > ckpt 节奏。
+
+## 待办：第十五梯队（S15 插件化架构 P1 — 接口化 + thread_pool 去搜索化，2026-07-03）
+
+> 来源：`doc/plugin-arch-split-design-zh.md`（插件化架构拆分设计）§9 迁移阶段 P1。
+> 总目标（全五阶段）：依赖方向反转——Cask 只认识 `IndexPlugin` 回调接口，
+> BM25/HNSW 拆为互不感知的独立插件，解锁 KV-only / KV+BM25 / KV+HNSW 三种
+> 发布形态。本批 = P1，**零行为变化**：把现有 IndexPool 流水线的 lambda 接缝
+> （cask.cpp:562-608）固化成正式接口，SearchLayer 原样套 adapter 当「唯一插件」。
+>
+> **方向判定**：不发明新并发模型——map 并行纯函数 / reducer 单写者按 ord 序的
+> 现有 TSan-clean 契约原样接口化（设计 §3.1），reorder buffer / 保序机制一行不动。
+> 改动只发生在 payload 类型层（variant 塌缩 + 类型擦除）。
+> **与 2026-06-25「god class 拆分搁置」决策（本文件 :544-549）不冲突**：那次否决
+> 的是依赖方向不变的类内美学拆分；本批是依赖反转的第一步（能力变化，见设计 §2.3）。
+> **完成判据**：`thread_pool.hpp` 不再 include `search_layer.hpp`；IndexPool 通路
+> 全部经 `CaskPlugin` 接口分发；clang/TSan 全量回归零差异；put_doc bench 回退 ≤3%。
+> **接口词汇（v2，2026-07-03 评审修订）**：动词全部来自 KV 固有事件
+> （open/close/on_put/on_delete/on_relocate/maintain/flush），并行预处理降级为
+> 可选能力（wants_prepare/prepare），恢复重放复用 on_put + 水位自门、无 recover_*
+> 专用动词，查询不进通用接口。签名以设计 §3.1–§3.5 为准。
+> P1 不动 Cask 门面/恢复编排/checkpoint（那是 P3/P4/P5 的事），Cask 仍持
+> `unique_ptr<SearchLayer>`。
+
+- [ ] **S15-1【P0·S】plugin_api 接口层（`bitcask_plugin_api` INTERFACE 目标）**
+  - 新增 `include/bitcask/plugin_api.hpp`（KV 事件词汇，设计 §3.1/§3.2 签名为准）：
+    数据类型 `RecordLoc` / `FieldKV` / `DocView{text, fields, vec, meta}` /
+    `PutEvent{ord, key, value, doc*, loc, tstamp}`（原始 value 为主、DocView
+    为结构化附件，纯 KV 写时 doc=nullptr；全 view/span 语义，生命周期 =
+    回调期间）/ `DeleteEvent` / `RelocateEvent`（含 value 视图——merge fold
+    正持有记录缓冲，零成本附带，供插件借 merge 的 I/O 做影子重建）/
+    `MergeBeginEvent` / `MergeCommitEvent` / `MaintainEvent` /
+    `FlushRequest/FlushResult` / `Prepared`（虚基，prepare 相产物）；
+    接口 `CaskPlugin`（name / open / watermark / close / on_put / on_delete /
+    wants_prepare / prepare / on_relocate / on_merge_begin / on_merge_commit /
+    on_merge_abort / maintain / flush——merge 三事件默认空实现，参与协议见
+    设计 §3.9：插件在 merge 线程同步收事件、经影子构建+原子发布或
+    run_serialized 安全变异，收尾 GC 先于宿主成对保存点靠 RunFn FIFO 保序）、
+    `PluginHost`（read_at / **run_serialized**（reducer 静止点串行执行，
+    现 IndexOp::RunFn 的正式化）/ log；**不含** replay_rows——keydir delta
+    成对推进是宿主 docmap 内部协议，P1 过渡期作为 adapter 构造参数私有传递）。
+  - **契约文字化（写进头文件注释）**：prepare = 纯函数、任意线程、不得触碰
+    插件可变状态（现 map_analyze 契约，cask.cpp:566-567 注释）；on_put/
+    on_delete = reducer 单写者、ord 严格升序可有洞（现 reduce_apply 契约）；
+    恢复重放**复用 on_put/on_delete**，插件按 watermark() 自门幂等（现 HNSW
+    `max_inserted_ord_`/倒排 WAL 水位的隐式约定升格为接口义务，无 recover_*
+    专用动词）；on_relocate 与 reducer 并发（现状 merger.cpp:131 直调语义），
+    实现者自保线程安全；回调异常宿主吞并计数保活（S13-D7 语义）。
+  - ord 分配**不进接口**：宿主（keydir `alloc_ord`）分配、插件只消费（现状即
+    如此，固化为契约）。查询**不进接口**（插件私有能力，经类型化门面）。
+    flush/open 本批只定义契约，保存点/恢复编排接线延后（P3 落地），
+    adapter 先行委托实现。
+  - CMake：`bitcask_plugin_api` INTERFACE 目标，仅依赖 `bitcask_format`。
+  - 测试：头自包含编译单元（单独 TU include 即过编译）；CI 检查该头不引入
+    任何 search/bm25/vector 依赖。
+- [ ] **S15-2【P0·M】thread_pool 去搜索化（variant 塌缩 + 类型擦除）**
+  - 现状（源码已核实）：`thread_pool.hpp:51` include search_layer.hpp（ReduceJob
+    用于 ReduceEntry）；`ReorderEntry` variant 烧死六个搜索领域分支
+    （ReduceEntry/OnWriteEntry/DeleteEntry/SkipEntry/RebuildEntry/RunFnEntry），
+    cask.cpp:571-593 的 reduce lambda 逐一 `std::visit` 分发。
+  - 目标：variant 塌缩四类通用条目——
+    `PutEntry{owning 载体（现 IndexTask 字段即是）, small_vector<PreparedPtr>}`
+    （吸收 ReduceEntry/OnWriteEntry：单文本与多字段路径统一为 prepared 扇出组）、
+    `DeleteEntry{key, ord}`（广播全插件）、`SkipEntry`（ord 空洞填充，保留）、
+    `RunFnEntry`（吸收 RebuildEntry——rebuild_hnsw 本就是塞进 reducer 静止点
+    的闭包，无需专用分支；cask.cpp:2880-2887 的 `IndexOp::RebuildHnsw` 提交点
+    改为封 RunFn）。`MapFn/ReduceFn/ErrorFn` 签名形状不变，entry 类型泛化；
+    map 相只对 `wants_prepare()` 的插件调 `prepare`。
+  - `thread_pool.hpp` 只 include `plugin_api.hpp`，删 search include；
+    `IndexTask` 携带字段不变（它已是 PutEvent 的 owning 载体）。
+  - **热路径护栏**：每（任务×声明 prepare 的插件）新增一次堆分配 + 虚调用。
+    bench 基线先行（put_doc
+    吞吐 + 索引落后水位），回退 >3% 才上 arena/freelist（设计 §10-2，先测后
+    优化，不预优化）。
+  - 测试：thread_pool_test 全绿；TSan 全量（reorder/保序核心零改动，变的只是
+    payload 类型，但 unique_ptr 跨线程移交需 TSan 确认无新告警）。
+- [ ] **S15-3【P0·M】SearchLayerAdapter + Cask 装配点改造（唯一插件，零行为变化）**
+  - `SearchLayerAdapter : CaskPlugin`（放 bitcask_search 目标内，内持
+    `SearchLayer&`；DeltaReplayHook 经构造参数私有传入，不进通用接口）：
+    `wants_prepare()=true`、prepare → `map_analyze`（单文本路径同样产
+    Prepared，吸收原 OnWriteEntry 语义）；on_put → `reduce_apply` /
+    `on_write`+`set_meta`+`on_vector`（`doc==nullptr` 时 `text:=value`，
+    在 adapter 层保持「纯 put 也入全文索引」现行为）；on_delete /
+    on_relocate 直委托；maintain → `compact`/`compact_index_chunks`/
+    `rebuild_hnsw` 按 hint 分发；flush/open 暂委托现有
+    `save_search_ckpt`/`load_search_ckpt`（编排仍在 Cask，P3 收）。
+  - Cask 改造：新增 `std::vector<CaskPlugin*> plugins_`（P1 恒 = {adapter}）；
+    `register_lib` 的 map/reduce lambda（cask.cpp:562-608）改为遍历 plugins_
+    构造/分发扇出组，不再直呼 SearchLayer 方法。恢复（recover_doc_batch/
+    recover_tomb）、merge（on_relocate）、门面查询本批**照旧直调 search_**——
+    P1 只反转 IndexPool 这一条通路，控制爆炸半径。
+  - **顺手收敛 on_delete 双路径**：cask.cpp:2108-2110 的非池同步直调分支——
+    先核实不可达（search_ 强制 registry 非空 → index_pool 恒在，cask.hpp:370），
+    坐实后删分支改断言；若存在可达路径则收敛进池路径再删。
+  - 测试：全量回归 clang/TSan **零差异**（零行为变化是本批验收标准）；
+    smoke / cask_docvalue（含 S14 全部 ckpt 系列）/ crash_recovery /
+    checkpoint_recovery / merge_concurrent_writer 全绿；bench 对比 S15-2 基线。
+- [ ] **S15-4【P1·S】插件契约 Mock 测试（为 P2/P4 铺回归床）**
+  - `tests/plugin_contract_test.cpp` + `MockPlugin`（只链 bitcask_plugin_api +
+    thread_pool 相关目标，**不链 search**）：断言 on_put 按 ord 严格递增到达；
+    多插件按注册序固定分发（P2 的 DocMap 插队 reducer 首位、P4 的双插件扇出
+    都靠此回归）；`wants_prepare()=false` 的插件收到 prep=nullptr 且 prepare
+    不被调用；Skip 空洞不触发 on_put；Delete 广播全插件；RunFn 在静止点
+    执行（与在途 on_put 不交错）；prepare 抛异常走 ErrorFn 计数且 lane 存活
+    （cask.cpp:598-604 语义）。
+  - 附带一条 TSan 场景：双 Mock 插件并发写入下扇出组移交无 race。
+  - 测试：本条即测试；纳入 ctest 常规集。
+
+> **建议执行顺序**：S15-1 → S15-2 → S15-3（S15-4 可与 S15-3 并行，依赖 S15-2）。
+> 每步独立可交付、独立可回滚；S15-3 完成即达成 P1 验收判据。后续批次预告：
+> P2（DocMap 抽离为宿主服务）→ P3（checkpoint 拆分，高风险独立成批，设计 §5，
+> 附退化方案 B）→ P4（SearchLayer 拆 Text/Vector 插件 + hybrid 上移）→
+> P5（门面/C API/配置拆分收尾）。P1/P2/P4/P5 不依赖 P3。
