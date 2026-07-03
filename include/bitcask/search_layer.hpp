@@ -98,6 +98,12 @@ struct SearchLayerConfig {
     // 透传进来（同 vector_dim 的注入方式）。构造后只读 → 并发查询安全，无需锁。
     // 空 = 不展开同义词。
     std::shared_ptr<const text::SynonymMap> synonym_map;
+    // S14-5：delta 链长上限。链达到该长度后下次 save 强制全量 base（链坍缩
+    // 回收 delta 文件）——否则不 merge 的纯追加负载（无删除 ⇒ needs_merge
+    // 不触发）链随写入量线性堆积、永不回收（向量库尤甚：每个 delta 内联
+    // f32 向量）。上限权衡：小 → base 重序列化更频繁（∝ 索引总量）；
+    // 大 → 崩溃恢复要重放更长的链 + 磁盘冗余更多。0 = 不设限（不建议）。
+    std::uint32_t max_delta_chain = 64;
 };
 
 // 搜索结果条目。

@@ -1564,7 +1564,13 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
     // S14-4：增量路径——无 rebase 事件（compact/rebuild）且链状态有效时只
     // 写 delta 文件（search.ckpt.d<seq>），base 不重写：写 I/O 从 ∝ 索引
     // 总量降到 ∝ 窗口增量。失败落回全量 base（重建链，安全兜底）。
-    if (!ckpt_rebase_needed_.load(std::memory_order_relaxed) &&
+    // S14-5：链长达上限 → 强制 base（坍缩回收）——不 merge 的纯追加负载
+    // 否则链无界堆积（merge 的 rebase 只覆盖有删除的库）。
+    const bool chain_full =
+        config_.max_delta_chain != 0 &&
+        ckpt_next_seq_ > config_.max_delta_chain;
+    if (!chain_full &&
+        !ckpt_rebase_needed_.load(std::memory_order_relaxed) &&
         watermark >= ckpt_chain_wm_) {
         if (save_delta_ckpt(fp, watermark)) return true;
     }
