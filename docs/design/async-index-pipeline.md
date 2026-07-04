@@ -1,6 +1,9 @@
 # 设计评审稿：异步索引 MapReduce 流水线（全局双池）
 
-> 状态：**已落地**（代号 S6，P0–P4；本稿为原始评审设计，仅存历史）。
+> 状态：**已落地**（代号 S6，P0–P4；S18-4 搜索域迁 text_plugin/vector_plugin）。
+> 本稿为原始评审设计，仅存历史；正文行号保留为当时快照，**搜索域已迁 text_plugin/
+> vector_plugin**（搜索域 save/on_put/on_vector/rebuild 等迁移见 S18/S19，本稿不再
+> 逐处更新；仅顶注记一次）。
 > 更新（核实于 2026-07-01）：设计主体已在生产路径实现——全局共享 Map 池（并行分词）
 > + per-lane reorder buffer（`std::map<ord, ReduceJob> pending` + `next_apply_ord`
 > 严格 ord 序 drain，`thread_pool.hpp:253/521-565`）、skip-marker 填 ord 空洞

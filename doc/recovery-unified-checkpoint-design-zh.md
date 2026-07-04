@@ -1,5 +1,11 @@
 # 恢复持久化统一:checkpoint 命名 + 单趟尾部回放(路线 A)
 
+> **S20-7 顶部换代注记**：本稿的「统一 search.ckpt 单文件模型」已被 S17
+> per-component ckpt 取代（docmap/bm25/vec 各自 base+delta+.prev +
+> index.manifest 唯一 commit 点）。现行格式与恢复链详见
+> `format-zh.md §10.4` 与 `index_manifest.hpp`。本稿正文行号保留为
+> 设计当时快照，仅以本注记统一标记（参考 S17-2/3/4/5 commit）。
+>
 > 对应代码:`keydir.cpp`(save/load_snapshot)、`search_layer.cpp`
 > (save/load_index_sidecar、save/load_vec_snapshot、load_snapshot)、
 > `inverted.cpp`/`inverted_wal.cpp`(bm25 WAL)、`cask.cpp`

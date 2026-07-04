@@ -4,6 +4,11 @@
 > `concurrency-zh.md`（锁与不变量）、`recovery-unified-checkpoint-design-zh.md`（快照恢复流程）
 > 状态：设计分析（含两条方案路径 + 结论建议）。**实现现状：方案 B（分块数组 +
 > merge 释放全死 chunk）已落地（§5）；方案 A（seq + ord 回收）未做，结论不变。**
+>
+> **S20-7 顶部换代注记**：RRF ord 去重（§17 行）迁 HybridSearcher（`hybrid_searcher.cpp:45`），
+> TextPlugin::rebuild_index 仍存在（`text_plugin.cpp:295` 起的按需重建），merge 不调用——
+> merge 改走 `TextPlugin::on_merge_commit → compact(0.2)` 压实死 posting。本稿
+> 正文行号保留为设计当时快照，仅关键 API 名按上表映射替换。
 
 ## 1. 动机
 
@@ -45,7 +50,7 @@ ord 在当前架构中同时扮演三个角色，每一重都假设 ord 永不�
 | 14 | KeyDir | `alloc_ord()` 返回下一个未用值（无回收机制） | `keydir.cpp:333-335` | 无回收机制存在 |
 | 15 | KeyDir | `ord` 在 SingleEntry 中是属性，非索引 | `keydir.hpp:82-89` | 风险较低 |
 | 16 | Merge | ord 通过 merge 保持不变（不重编号） | `merger.cpp:99-131` | 无影响 |
-| 17 | Search | RRF 用 ord 作为去重键 | `search_layer.cpp:251` | 死+回收 ord 碰撞 → 错误融合分数 |
+| 17 | Search | RRF 用 ord 作为去重键 | `hybrid_searcher.cpp:45` | 死+回收 ord 碰撞 → 错误融合分数 |
 | 18 | 交集 | 输入必须严格升序无重复 | `intersect.hpp:11-12` | 回收 ord → 重复 → 错误交集结果 |
 | 19 | LiveChecker | `is_live(ord)` / `doc_len(ord)` | `live_checker.hpp:23-24` | 回收 ord 有 stale slot → 返回错误值 |
 | 20 | Format | "per-write, 永不复用"（格式头注释） | `format.hpp:25` | 磁盘格式契约违反 |
@@ -208,8 +213,9 @@ std::vector<std::unique_ptr<Chunk>> chunks_;  // chunk N 覆盖 [N*64K, (N+1)*64
 ```
 
 **关键发现（已随 V4 merge 重构更新）**：merge 管线**用 `compact()`**（阈值压实死
-posting，`cask.cpp:1767`）+ `rebuild_hnsw()`，**不再用 `rebuild_index()`**（全量重读+
-重分词的旧路径，现仅 `SearchLayer::rebuild_index` 定义存在、merge 不调用）。
+posting，`cask.cpp:1767`）+ `VectorPlugin::rebuild()`，**不再用 `rebuild_index()`**（全量重读+
+重分词的旧路径，现仅 `TextPlugin::rebuild_index` 定义存在
+@`text_plugin.cpp:295`、merge 不调用）。
 `compact()` 既是外部 API 也被 merge 调用。详见 [`merge-policy-zh.md` §4.2](merge-policy-zh.md)。
 
 ### WAL 字节级格式（回收方案需改动处）
@@ -405,7 +411,7 @@ put("foo") 更新 → ord=0 标死
 | 机制 | 触发方式 | 清理效果 | 位置 |
 |------|---------|---------|------|
 | `compact()` | 手动 API **+ merge 管线**（`dead_ratio=0.2`） | dead_ratio ≥ 阈值时移除死 posting | `inverted.cpp:1555`；merge 调用点 `cask.cpp:1767` |
-| `rebuild_index()` | **仅定义存在，merge 不调用**（旧全量重建路径） | 全量重读+重分词，无死 posting | `search_layer.cpp:864` |
+| `rebuild_index()` | **仅定义存在，merge 不调用**（旧全量重建路径） | 全量重读+重分词，无死 posting | `text_plugin.cpp:295`（TextPlugin::rebuild_index） |
 | 查询时过滤 | 每次 search | 不回收内存，只保证正确性 | 全搜索路径 |
 
 `compact()` 默认阈值 0.5（merge 用 0.2）。`compact_flags`（`inverted.hpp:182`）过滤死 posting、

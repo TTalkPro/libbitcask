@@ -2,6 +2,14 @@
 
 > 前置阅读：`hnsw-design-zh.md`（V3 HNSW 基础设计）、`int8-vnni-v4-zh.md`（V4.2 量化检索）
 > 状态：已实现（文档化梳理）
+>
+> **S18-3 顶部换代注记**：HNSW 域 S18-3 起迁 `VectorPlugin`——
+> SearchLayer::on_vector → VectorPlugin::on_put@vector_plugin.cpp；
+> rebuild_hnsw → VectorPlugin::rebuild@vector_plugin.cpp:240；
+> save/load_search_ckpt → per-component ckpt（vec.ckpt + .vec/.qc8 侧车，
+> 详见 `format-zh.md §10.4`）+ legacy 容器段由 `legacy_ckpt.cpp` 接管；
+> CkptLoadResult → ckpt::LoadResult（`component_ckpt.hpp`）。本稿正文
+> 行号保留为设计当时快照，**关键 API 名按上表映射替换**。
 
 ## 1. 概述
 
@@ -13,7 +21,7 @@ HNSW 多层图经历三个阶段：**增量构建**（put 时逐节点插入）�
 
 ```
 Cask::put_doc(vec)          [cask.cpp]
-  → SearchLayer::on_vector() [search_layer.cpp]
+  → VectorPlugin::on_put()  [vector_plugin.cpp]
     → HnswIndex::insert()    [hnsw.cpp:643]
 ```
 
@@ -36,8 +44,8 @@ insert(ord, vec):
   6. 发布节点：count_.store(id+1, release)
   7. 首节点 → 设 entry_meta_，return
   8. 从 entry point 贪心下降到 level+1 层（仅导航，不连边）
-  9. 逐层（min(level, max_level) → 0）：
-     a. search_layer() 找 ef_construction 个候选
+9. 逐层（min(level, max_level) → 0）：
+      a. HnswIndex::search_layer() 找 ef_construction 个候选
      b. select_neighbors()（HNSW Algorithm 4）选 M 条
         - 候选按到 query 距离排序
         - 仅保留比所有已选邻居更近于 query 的候选（多样性启发式）
@@ -67,24 +75,24 @@ Merge 物理压缩 data files 后触发图重建。Merge pipeline 中图重建�
 
 ```
 Phase 1: 重写活 record → 新 data files + CAS 更新 KeyDir
-Phase 2（search_ 存在时）:
+Phase 2（搜索插件存在时）:
   write_keydir_snapshot() + flush 索引队列
-  compact()            ← 阈值压实死 posting（不重读、不重分词，非全量 rebuild）
+  TextPlugin::on_merge_commit → compact()        ← 阈值压实死 posting
   compact_index_chunks()
-  rebuild_hnsw()       ← 提交 IndexPool worker 全量重建 HNSW 图（vector_dim>0）
-  save_search_ckpt()   ← 统一落盘 search.ckpt（hnsw 段）+ search.vec
+  VectorPlugin::rebuild()  ← 提交 IndexPool worker 全量重建 HNSW 图（vector_dim>0）
+  save_components_base()    ← per-component ckpt：docmap/bm25/vec + index.manifest
 Phase 3: 清理旧文件
 ```
 
 > 详见 [`merge-policy-zh.md` §4.2](merge-policy-zh.md) 的完整 V4 Pipeline Contract。
 > 注意 HNSW 重建在 IndexPool worker 内执行（维持单写者），`flush()` 阻塞等其完成。
 
-### 3.2 rebuild_hnsw() 实现
+### 3.2 VectorPlugin::rebuild() 实现
 
-`search_layer.cpp:55-66`
+`vector_plugin.cpp:240`
 
 ```cpp
-void SearchLayer::rebuild_hnsw() {
+void VectorPlugin::rebuild() {
     auto old = hnsw_.load(std::memory_order_acquire);
     if (!old) return;
     auto fresh = std::make_shared<vec::HnswIndex>(old->config());
@@ -113,17 +121,20 @@ HNSW 图删除节点会导致邻接表悬空边——需要级联修复邻居连
 HNSW 不再有独立 `hnsw.snap`。V7 起持久化为**两部分**（统一落进搜索 checkpoint，
 完整字节布局见 [`format-zh.md` §10](format-zh.md)）：
 
-1. **图头**：作为 `search.ckpt`（`kSearchCkptName`，`cask.cpp:27`）的 **hnsw 段**
-   （type 4），magic `"BVH2" = 0x32485642`、version 2。段内含 dim/metric/M/efc/seed/
-   count/entry_meta/max_ord，以及每节点 `ord | level | int8 qcodes[dim] | qscale f32
-   | qsum i32` + 各层邻接表，末尾段内 crc32。`HnswIndex::serialize`（`hnsw.cpp:1156`）。
-2. **向量 payload**：全精度 f32 向量外存到 `search.vec`（magic `"BCVP"`，version 1），
-   64B 头 + 每 4KB 页 CRC + 页对齐 f32；只读 `mmap`。`HnswIndex::save_vec_payload`
-   （`hnsw.cpp:981`）。`inmem_int8` 模式无常驻 f32 → 不产生 `.vec`。
+1. **图头**：作为 `vec.ckpt` 的 **hnsw 段**（per-component，S17-2/3/4/5 起），
+    magic `"BVH2" = 0x32485642`、version 2。段内含 dim/metric/M/efc/seed/
+    count/entry_meta/max_ord，以及每节点 `ord | level | int8 qcodes[dim] | qscale f32
+    | qsum i32` + 各层邻接表，末尾段内 crc32。`HnswIndex::serialize`（`hnsw.cpp:1156`）。
+    commit 点 = `index.manifest`（BCMF 80B，`index_manifest.hpp`，S17-3）。
+2. **向量 payload**：全精度 f32 向量外存到 `vec.ckpt.vec`（magic `"BCVP"`，version 1，
+    旧称 `search.vec`），64B 头 + 每 4KB 页 CRC + 页对齐 f32；只读 `mmap`。
+    `HnswIndex::save_vec_payload`（`hnsw.cpp:981`，S17-7 起由 per-component
+    `save_vec_payload` 接管）。`inmem_int8` 模式无常驻 f32 → 不产生 `.vec`。
 
-**写入**：`save_vec_payload(.vec)` → `serialize`（段）→ `SearchCheckpoint::write`，
-均 `tmp + rename` 原子。读者协议：先 acquire `count_`/`entry_meta_` 快照，邻接
-id ≥ count 一律跳过（防读到半发布状态）。
+**写入**：`save_vec_payload(.vec)` → `serialize`（段）→ `VectorPlugin::save_component_base`
+→ `index_manifest` commit → `keydir` 快照（仅 base）；均 `tmp + rename` 原子。
+读者协议：先 acquire `count_`/`entry_meta_` 快照，邻接 id ≥ count 一律跳过
+（防读到半发布状态）。
 
 **注意（V7 变更）**：int8 qcodes **直接持久化在 BVH2 段内**——load 时**不再**从
 f32 重新量化（省启动量化 pass）。f32 向量单独存 `search.vec`，按需 mmap。
@@ -132,22 +143,22 @@ f32 重新量化（省启动量化 pass）。f32 向量单独存 `search.vec`，
 
 | 时机 | 调用 | 位置 | 说明 |
 |---|---|---|---|
-| `close()` | `save_search_ckpt()` | `cask.cpp:694` | worker 已停 → 图静止，watermark = next_ord |
-| `merge()` Phase 2 | `save_search_ckpt()` | `cask.cpp:1779` | rebuild 后立即落盘，下次 open 走快照路径 |
+| `close()` | `save_components_base` → `index_manifest` commit | `cask.cpp:save_checkpoint_paired` | worker 已停 → 图静止，watermark = next_ord |
+| `merge()` Phase 2 | `save_components_base` | `cask.cpp:save_checkpoint_paired` | rebuild 后立即落盘，下次 open 走快照路径 |
 | `put()` | ❌ 不落盘 | — | 只更新内存图，data 文件（WAL）保证持久性 |
 
 ### 4.3 加载时机
 
 | 时机 | 调用 | 位置 | 说明 |
 |---|---|---|---|
-| `open()` | `load_search_ckpt()` → hnsw 段 `deserialize` + `load_vec_payload` | `cask.cpp:881`（`load_recovery_snapshots`） | search.ckpt 健康且全段 CRC 通过时走快照路径 |
-| `open()`（不健康/段坏） | 全量 fold + `on_vector()` | 回退路径 | 逐条遍历 data files 重建图 |
+| `open()` | `VectorPlugin::load_component` → hnsw 段 `deserialize` + `load_vec_payload` | `cask.cpp:881`（`load_recovery_snapshots`） | vec.ckpt 健康且全段 CRC 通过时走快照路径 |
+| `open()`（不健康/段坏） | 全量 fold + `VectorPlugin::on_put()` | 回退路径 | 逐条遍历 data files 重建图 |
 
 ### 4.4 覆盖性 Gate（统一 watermark 自门）
 
-V7 不再用 per-index 的 `hnsw_covers_next_ord()` 成对门。改为 `search.ckpt`
-容器头部单个 **watermark**（= 保存时 `next_ord`）+ **全段 CRC 通过**
-（`CkptLoadResult.all_segments_ok`，`search_layer.hpp:256-257`）共同判定：
+V7 不再用 per-index 的 `hnsw_covers_next_ord()` 成对门。改为 `vec.ckpt`
+组件段头部单个 **watermark**（= 保存时 `next_ord`）+ **全段 CRC 通过**
+（`ckpt::LoadResult.all_segments_ok`，`component_ckpt.hpp`）共同判定：
 
 ```
 search.ckpt 健康且 all_segments_ok ?
@@ -178,17 +189,17 @@ search.ckpt 健康且 all_segments_ok ?
       ·                  ·                  ·
   ┌───┴──────────────────┴──────────────────┘
   │
-  ├─ close() ──────────→ save_search_ckpt() ──→ search.ckpt(hnsw 段) + search.vec
+  ├─ close() ──────────→ save_components_base ──→ vec.ckpt(hnsw 段) + vec.ckpt.vec
   │                                                  │
   │                                        (进程退出)
   │                                                  │
-  ├─ open() ──────────→ load_search_ckpt() ←── search.ckpt + search.vec
+  ├─ open() ──────────→ VectorPlugin::load_component ←── vec.ckpt + vec.ckpt.vec
   │                       (watermark 自门 + 全段 CRC)
   │                         ├ pass → 快照加载（秒级）
   │                         └ fail → 全量 fold（O(N log N)）
   │
-  └─ merge() ──→ rebuild_hnsw() ──→ save_search_ckpt() ──→ search.ckpt + search.vec
-                   (物理清死)        (重建后落盘)
+  └─ merge() ──→ VectorPlugin::rebuild ──→ save_components_base ──→ vec.ckpt + vec.ckpt.vec
+                   (物理清死)              (重建后落盘)
 ```
 
 ## 6. 相关文件索引
@@ -201,8 +212,9 @@ search.ckpt 健康且 all_segments_ok ?
 | `src/vector/hnsw.cpp:1278` | `deserialize()` — BVH2 v2 段反序列化 + 校验 |
 | `src/vector/hnsw.cpp:981` | `save_vec_payload()` — BCVP `.vec` 写 |
 | `src/vector/hnsw.cpp:1062` | `load_vec_payload()` — BCVP `.vec` 读 + 校验 |
-| `src/search/search_layer.cpp:55-66` | `rebuild_hnsw()` — 全量重建 |
-| `src/search/search_layer.cpp:998` / `:1112` | `save_search_ckpt()` / `load_search_ckpt()` — 统一分段 checkpoint |
+| `src/search/vector_plugin.cpp:240` | `VectorPlugin::rebuild()` — 全量重建 |
+| `src/search/vector_plugin.cpp` / `src/keydir/docmap_ckpt.cpp` | per-component ckpt: vec/docmap/bm25 save+load |
+| `src/cask/cask.cpp:save_checkpoint_paired` | per-component flush + index.manifest commit |
 | `src/cask/cask.cpp:27` | `kSearchCkptName = "search.ckpt"` |
 | `src/cask/cask.cpp:694` | `close()` 落盘 |
 | `src/cask/cask.cpp:881` | `open()` 加载 + watermark 自门（`load_recovery_snapshots`） |

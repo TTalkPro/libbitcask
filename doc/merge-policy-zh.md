@@ -2,6 +2,12 @@
 
 > 前置阅读：`hnsw-lifecycle-zh.md`（HNSW 图生命周期）、`format-zh.md`（磁盘格式）
 > 状态：已实现
+>
+> **S20-7 顶部换代注记**：搜索域 S18-3/S18-4 起迁插件——on_delete →
+> TextPlugin::on_delete@text_plugin.cpp:243（BM25 扣减）、live callback
+> → `vector_plugin.cpp:216` 起的 `search_with_filter`、rebuild →
+> VectorPlugin::rebuild@vector_plugin.cpp:240。本稿正文行号保留为设计当时
+> 快照，仅关键 API 名按上表映射替换。
 
 ## 1. 概述
 
@@ -20,7 +26,7 @@ bitcask_delete(cask, key, 0, &fault)
   └→ Cask::remove(key)
        ├→ KeyDir: 写 tombstone entry（ord 分配不变）
        └→ IndexPool worker:
-            ├→ SearchLayer::on_delete(key, ord)
+            ├→ TextPlugin::on_delete(key, ord)
             │    ├→ BM25 倒排索引：移除词项统计（立即）
             │    ├→ index_.remove(key, tomb_ord)：标记 ord 为死（立即）
             │    ├→ doc_texts_.erase(ord)：清 LRU 原文（立即）
@@ -39,7 +45,7 @@ HNSW 删除节点会导致邻接表悬空边——需要级联修复邻居连接
 ### 2.3 搜索时：live callback 过滤
 
 ```cpp
-// search_layer.cpp:200-211（无 filter 分支）
+// vector_plugin.cpp:216 起的 search_with_filter（live callback 路径）
 live = [this](std::uint64_t ord) -> bool {
     return index_.is_live(ord);  // 死 ord → false
 };
@@ -116,12 +122,12 @@ needs_merge(Ref)
 
 ## 4. Merge 执行：HNSW 物理清死
 
-### 4.1 rebuild_hnsw()
+### 4.1 VectorPlugin::rebuild()
 
-merge 的 Phase 2 调用 `rebuild_hnsw()`（`search_layer.cpp:55-66`）：
+merge 的 Phase 2 调用 `VectorPlugin::rebuild()`（`vector_plugin.cpp:240`）：
 
 ```cpp
-void SearchLayer::rebuild_hnsw() {
+void VectorPlugin::rebuild() {
     auto fresh = std::make_shared<HnswIndex>(old->config());
     for (id = 0 .. old->size()-1) {
         ord = old->node_ord(id);
@@ -135,10 +141,11 @@ void SearchLayer::rebuild_hnsw() {
 - 新图只含活节点（零死节点）
 - 重建期间并发查询走旧图（含死节点，语义同软删）
 - 换入后旧图由在途读者 `shared_ptr` 续命（无锁回收）
-- `rebuild_hnsw()` 本身**不落盘**——重建后由 merge 流程的 `save_search_ckpt`
-  统一持久化（图头入 `search.ckpt` 的 hnsw 段，f32 向量入 `search.vec`，
-  见 [`format-zh.md` §10](format-zh.md)）。merge 中重建实际提交给 IndexPool
-  worker 执行（维持单写者），`flush()` 阻塞等其完成
+- `VectorPlugin::rebuild()` 本身**不落盘**——重建后由 merge 流程的
+  `save_components_base` 统一持久化（per-component：vec.ckpt + vec.ckpt.vec
+  + index.manifest commit，见 [`format-zh.md` §10.4](format-zh.md)）。
+  merge 中重建实际提交给 IndexPool worker 执行（维持单写者），
+  `flush()` 阻塞等其完成
 
 ### 4.2 完整 merge 流程
 
@@ -150,14 +157,15 @@ bitcask_merge(cask, &fault)
   └→ Cask::merge(files)        // files 为空先 needs_merge 决定
        Phase 1 — Data compaction:
          1. run_merge()              重写活 record 到新文件，CAS 更新 KeyDir
-       Phase 2 — Index maintenance（search_ 存在时）:
+       Phase 2 — Index maintenance（搜索插件存在时）:
          2. write_keydir_snapshot()  捕获 ord 水位
          3. IndexPool::flush()       排干在途索引任务
-         4. compact(0.2)             阈值压实死 posting（不重读、不重分词；
+         4. TextPlugin::on_merge_commit → compact(0.2)
+                                     阈值压实死 posting（不重读、不重分词；
                                      定位由 run_merge 的 on_relocate 已更新）
          5. compact_index_chunks()   释放全死 DocSlot chunk
-         6. rebuild_hnsw + flush     提交 worker 同步重建 HNSW（物理清死，vector_dim>0）
-         7. save_search_ckpt()       统一落盘 search.ckpt（docmap/bm25/hnsw 段）+ search.vec
+         6. VectorPlugin::rebuild + flush  提交 worker 同步重建 HNSW（物理清死，vector_dim>0）
+         7. save_components_base()   per-component ckpt：docmap/bm25/vec + index.manifest commit
        Phase 3 — Cleanup:
          8. erase read_files_ 缓存 + unlink 旧 data/hint
          9. trim_fstats
@@ -183,9 +191,11 @@ bitcask_merge(cask, &fault)
 |------|------|
 | `src/merge/merge_policy.cpp` | `decide()` — 两段式决策纯函数 |
 | `include/bitcask/merge_policy.hpp` | `PolicyOptions` — 默认值 + 参数定义 |
-| `src/search/search_layer.cpp:405` | `on_delete()` — BM25 清理（HNSW 不动） |
-| `src/search/search_layer.cpp:200-211` | search_vector live callback |
-| `src/search/search_layer.cpp:55-66` | `rebuild_hnsw()` — 物理清死 |
+| `src/search/text_plugin.cpp:243` | `TextPlugin::on_delete()` — BM25 清理 |
+| `src/search/vector_plugin.cpp:216` | `search_with_filter()` — search_vector live callback |
+| `src/search/vector_plugin.cpp:240` | `VectorPlugin::rebuild()` — 物理清死 |
+| `src/keydir/docmap_ckpt.cpp` | `Index::save_docmap_base/delta/load_docmap` |
+| `src/cask/cask.cpp:save_checkpoint_paired` | per-component flush + index.manifest commit |
 | `src/cask/cask.cpp` | `needs_merge()` + `merge()` 调用链（V4 Pipeline Contract 注释） |
 | `include/bitcask/merge_policy.hpp` | `PolicyOptions` 默认阈值（frag_merge_trigger 等） |
 | `doc/hnsw-lifecycle-zh.md` | HNSW 图完整生命周期（构建/持久化/恢复） |

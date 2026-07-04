@@ -1,5 +1,10 @@
 # put(K, V) 完整调用链
 
+> **S20-7 顶部换代注记**：S18-4/S18-5 起搜索域迁插件——
+> SearchLayer::on_write → reducer 扇出 `TextPlugin::apply_job` (analyze +
+> BM25 倒排) + `VectorPlugin::insert`（on_vector → VectorPlugin::on_put）。
+> 本稿正文行号保留为设计当时快照，仅关键 API 名按上表映射替换。
+
 从 C API 入口一路到磁盘字节落定。每一步都标了源码位置，方便对照阅读。
 本文描述的是 `bitcask_put()` 的成功路径与关键 race 处理；磁盘格式细节
 见 [`format-zh.md`](format-zh.md)。
@@ -62,8 +67,8 @@ worker 线程（或子进程）调 `bitcask_merge`。**写路径由库内 `write
    d. keydir 返回 kAlreadyExists（极少见的二段 race）→ roll_active + 重试一次；
       二次仍失败 → 上报 kAlreadyExists
 10. submit_index_task(IndexOp::Add, ...)
-    - 索引模式下入队 IndexPool（**N 个 map worker 并行分词 + reducer 按 ord 序串行 apply**，S6-P4；registry 共享池）；无 IndexPool 则 no-op
-    - 注意：put 路径**不**同步调 search_->on_write，全部异步（见 concurrency-zh §6）
+   - 索引模式下入队 IndexPool（**N 个 map worker 并行分词 + reducer 按 ord 序串行 apply**，S6-P4；registry 共享池）；无 IndexPool 则 no-op
+   - reducer 扇出 `TextPlugin::apply_job`（analyze + BM25 倒排）+ `VectorPlugin::insert`（on_vector → VectorPlugin::on_put），全程异步（见 concurrency-zh §6）
 11. maybe_group_commit()
     - sync_every_n>0 且非 o_sync 时：累计写满 N 条 → active_data_->sync() 组提交
 ```
@@ -205,8 +210,9 @@ bitcask_put(cask, K, V, 0, &fault)
               ├─→ KeyDir::put（持 K 所属分片锁）
               │     └─ entries_[K] = {fid,off,tsz,ep,ts,ord}
               ├─[可选]→ submit_index_task(IndexOp::Add)   ← 入队，不阻塞
-              │           └┄(异步) IndexPool worker → SearchLayer::on_write
-              │                                          └─ InvertedIndex::add_doc
+              │           └┄(异步) IndexPool worker (reducer 串行 apply)
+              │              ├─ TextPlugin::apply_job → InvertedIndex::add_doc
+              │              └─ VectorPlugin::insert (vec 不为空时)
               └─→ maybe_group_commit()  ← sync_every_n 组提交
         return BITCASK_OK
         （索引在 worker 线程异步建立；put 返回不代表索引已就绪，
@@ -281,4 +287,5 @@ put 返回后任何后续 `get(K)` 立刻能看到新值（即使 OS 还没刷�
   `encode_hint_record` — 字节编码
 - `src/keydir/keydir.cpp::KeyDir::put` — 内存索引更新
 - `src/keydir/keydir.cpp::KeyDir::alloc_ord` — ord 分配
-- `src/search/search_layer.cpp::SearchLayer::on_write` — 索引更新（索引模式）
+- `src/search/text_plugin.cpp::TextPlugin::apply_job` — analyze + BM25 倒排（reducer apply）
+- `src/search/vector_plugin.cpp::VectorPlugin::insert` — HNSW insert（on_vector → VectorPlugin::on_put）

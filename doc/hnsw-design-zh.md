@@ -1,5 +1,11 @@
 # V3:HNSW 向量检索设计(定稿待实施)
 
+> **S20-7 顶部换代注记**：HNSW 域 S18-3 起迁 `VectorPlugin`——on_vector →
+> VectorPlugin::on_put、图内过滤 → `vector_plugin.cpp:216`、rebuild →
+> `VectorPlugin::rebuild@vector_plugin.cpp:240`、HybridSearcher RRF →
+> `hybrid_searcher.cpp:45`。本稿为 S15-S19 前的设计文档，正文行号保留为
+> 设计当时快照，仅关键 API 名按上表映射替换。
+
 > 前置阅读:`vector-db-design-zh.md`(可行性探索与总体定位)、
 > `recovery-unified-checkpoint-design-zh.md`(checkpoint 体系 + 附录 A 快照模板,
 > 本设计的持久化模板)、`keydir-sharding-design-zh.md` §6(锁序纪律)。
@@ -108,7 +114,7 @@ AVX-VNNI 留给 V4 int8(vpdpbusd,32 元素/迭代 + 内存流量 4×↓)。
 1. **「读者可达邻居 id < 其 load 的 count」需要读侧显式定界**。设计稿
    的发布序论证只对"邻居发布先于边发布"成立;但读者的 count 快照可能
    **早于**反向边的追加——旧快照读者沿新追加的反向边可见 `id ≥ 本地
-   count`。故读侧(greedy/search_layer)对邻居 id 增加 `nid >= n` 跳过
+   count`。故读侧(HnswIndex::greedy_search / VectorPlugin search 路径)对邻居 id 增加 `nid >= n` 跳过
    (n = 本次 search 开头的 count 快照),visited 数组按 n 定界即安全。
    语义无损:该节点对此读者尚未发布,跳过等价于"晚一拍可见"。
 2. **entry 快照顺序**:search 先 load entry_meta_(acquire)再 load
@@ -120,8 +126,8 @@ AVX-VNNI 留给 V4 int8(vpdpbusd,32 元素/迭代 + 内存流量 4×↓)。
    owner 切换整组清零;同实例 epoch 自增免清零,回绕清一次。多实例被同
    线程交替查询时退化为每次清零,正确性不受影响(单集合单图常态零开销)。
 4. **写者插入时自身可见边界取 n_bound = id**(排除自己):反向边在低层
-   先行发布后,写者自己更低层的 search_layer 可能经它走回新节点,把自己
-   选成自己的邻居;以 id 为界一并剪掉。
+    先行发布后,写者自己更低层的 HnswIndex::search_layer 可能经它走回新节点,
+    把自己选成自己的邻居;以 id 为界一并剪掉。
 5. **超容收缩在持锁状态下做距离计算**(微秒级临界区,设计稿"~百 ns"仅
    对追加/拷贝成立)。读者只在 copy_neighbors 短暂争同一把锁,实测
    (20k×16d,1 写 4 读,TSan 插桩)无可观测停顿;锁外预选/arena 留 V3.x。
@@ -152,7 +158,8 @@ search_hybrid(query, qvec, k)     → BM25 top-K' ∥ HNSW top-K'
   公共接口 `search_vector(..., const meta::MetaFilter* filter = nullptr)`
   (`cask.hpp:449-451`,`cask.cpp:1796-1799` 透传);`filter` 与 `is_live` 组合成
   HNSW 遍历回调,被拒节点从图遍历源头即不入候选、无需 overfetch
-  (`search_layer.cpp:279-290`);hybrid 两路同样走 filter(`search_layer.cpp:308/334`)。
+  (`vector_plugin.cpp:216` 起的 `search_with_filter`);hybrid 两路同样走 filter
+  (`HybridSearcher` 路由至 `text::Searcher`/`vec::Searcher`，`hybrid_searcher.cpp:45`)。
   下方"V3 不做"为历史评审结论,现已过期。
 
 ### V3.6 落地记录(2026-06-12,search_hybrid + NIF/Erlang 接口)
@@ -251,9 +258,9 @@ close 保存顺序:bm25 → sidecar → **hnsw snap** → keydir snap(worker
   换出后由在途读者的引用计数续命。
 - merge 末尾(search 模式且 vector_dim>0)向 IndexPool 提交
   `IndexOp::RebuildHnsw` 任务,**由 worker 执行**——单写者论证:
-  worker 是 on_vector/recover-replay 之外唯一触图写者,重建(新图旁路
-  构建 + store 换指针)与后续 put 任务在同一线程串行,无写写并发;
-  重建期间查询走旧图(死节点照旧结果侧滤除,语义不变)。
+  worker 是 `VectorPlugin::on_put`/recover-replay 之外唯一触图写者,
+  重建(新图旁路构建 + store 换指针)与后续 put 任务在同一线程串行,
+  无写写并发;重建期间查询走旧图(死节点照旧结果侧滤除,语义不变)。
 - 重建 = 新建同 config 图,遍历旧图节点(0..count),跳过
   `!Index.live_(ord)`,重插活节点(vec 从旧图读),完毕换指针。
 - hnsw 快照不在 merge 点落盘(重建异步未完,落了也是旧图):留待
@@ -279,5 +286,5 @@ close 保存顺序:bm25 → sidecar → **hnsw snap** → keydir snap(worker
 - 多字段多图(接口留位,V3.x);
 - 量化(int8/PQ)与外存图(V4,DocValue 段已留版本位);
 - ~~过滤式向量检索的图内实现(V3.x 课题)~~ —— **已在 V5 落地**(图内过滤,
-  `search_layer.cpp:279-290`;详见 §4 更新);
+  `vector_plugin.cpp:216`;详见 §4 更新);
 - 多写者并发插入(全引擎统一约束)。
