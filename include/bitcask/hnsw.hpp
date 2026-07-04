@@ -107,7 +107,7 @@ public:
     }
     [[nodiscard]] const HnswConfig& config() const noexcept { return cfg_; }
 
-    // ---- V3.5:重建用只读访问(merge 物理清死,SearchLayer::rebuild_hnsw)----
+    // ---- V3.5:重建用只读访问(merge 物理清死,VectorPlugin 重建入口)----
     // 前置:id < size()(已发布节点)。vec 的底层存储地址稳定(chunk 定容)。
     [[nodiscard]] std::uint64_t node_ord(std::uint32_t id) const {
         return ord_of(id);

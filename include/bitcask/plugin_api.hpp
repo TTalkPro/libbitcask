@@ -186,6 +186,9 @@ class CaskPlugin {
 public:
     virtual ~CaskPlugin() = default;
 
+    // name() 是组件的**持久化/manifest 身份**（标识落盘算法与文件族），
+    // 与查询 API 的命名空间（text::/vec::）是两套词汇——前者按算法命名
+    // （"bm25"/"hnsw"），后者按领域命名。宿主用 name() 反查 ComponentId。
     virtual std::string_view name() const = 0;  // "bm25" / "hnsw" / "metrics" …
 
     // ---- 生命周期 ----

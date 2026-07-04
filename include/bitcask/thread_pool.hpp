@@ -12,7 +12,7 @@
 //   多 lib：每个 search 库注册一条 lane（register_lib/unregister_lib），按 task.lane
 //          路由；线程数 = N+1 与库数无关（G2）。详见 IndexPool 类注释的锁/RAII 约定。
 //
-// 注：查询/读侧的「Search Pool」是另一回事——见 search_layer.cpp 的 search_arena()
+// 注：查询/读侧的「Search Pool」是另一回事——见 search_arena.cpp 的 search_arena()
 // （进程级共享有界 arena，用于 inter-query 并发；单查询内并行实测净亏已不用，S7）。
 //
 // === 生命周期 ===
@@ -105,7 +105,7 @@ struct IndexTask {
     std::vector<char> fields_store;
     std::vector<std::pair<std::string_view, std::string_view>> fields;
     // V3.3:Add 任务的文档向量(已归一化;空 = 无)。worker 转交
-    // SearchLayer::on_vector → HNSW insert。
+    // VectorPlugin::on_put → HNSW insert。
     std::vector<float> vec;
     // V5:文档结构化 meta blob(可为空)。worker 转交 Index::set_meta,
     // 与 put_doc 同 unique_lock 路径——filter 读取时 meta 与定位/live

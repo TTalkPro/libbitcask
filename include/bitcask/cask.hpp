@@ -633,8 +633,8 @@ public:
     }
     // SearchError → CaskFault 翻译（Cask 门面与 Searcher 门面共享）。
     [[nodiscard]] static CaskFault search_error_fault(search::SearchError e);
-    // S16-1：DocMap 宿主服务句柄（索引模式下非空；与 search()->index()
-    // 同一实例——所有权在 Cask，SearchLayer 借用）。
+    // S16-1：DocMap 宿主服务句柄（索引模式下非空；与插件借用的 docmap
+    // 同一实例——所有权在 Cask，Text/Vector 插件借用）。
     [[nodiscard]] const std::shared_ptr<index::Index>& docmap() const {
         return docmap_;
     }
@@ -894,11 +894,11 @@ private:
     meta::MetaConfig meta_config_{};
 
     // S16-1：DocMap 宿主服务（ord↔ext/live/meta 身份表）。Cask 持有、
-    // SearchLayer 借用（设计 §4：docmap 属「文档身份」域而非「搜索」域）。
-    // P2 后续批次（S16-2）reducer 将先于插件 apply 它。
+    // Text/Vector 插件借用（设计 §4：docmap 属「文档身份」域而非「搜索」域）。
+    // reducer 先于插件 apply 它（S16-2）。
     std::shared_ptr<index::Index> docmap_;
 
-    // SearchLayer 实例（enable_search 时创建）
+    // 搜索插件（enable_search 时创建）。
     // S19-2：Cask 直持插件（SearchLayer shim 已降级为测试夹具）。声明序 =
     // 析构逆序：hybrid_ 引用两插件须先析构；插件借用 docmap_（shared_ptr）。
     std::unique_ptr<text::TextPlugin>  text_;
@@ -1049,7 +1049,7 @@ public:
     // 向量配置一致性校验)。必须先于 SearchLayer 创建。
     [[nodiscard]] std::expected<void, CaskFault> check_or_create_meta();
 
-    // T2.4:open 阶段三——SearchLayer + IndexPool 创建(只在 search_config
+    // T2.4:open 阶段三——搜索插件（Text/Vector）+ IndexPool 创建(只在 search_config
     // 配置时启动 worker)。opts 是 caller 的选项快照,内含 search_config。
     [[nodiscard]] std::expected<void, CaskFault>
     create_search_infra(const CaskOptions& opts);

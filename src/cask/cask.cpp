@@ -418,8 +418,8 @@ Cask::~Cask() { close(); }
 
 // 离线升级：将 KV 模式目录转为索引模式。
 // 不获取任何锁——要求目录处于离线状态（无活跃 writer/merger）。
-// 步骤：验证 meta 是 KV → 覆写 meta 为 kIndex → 创建 SearchLayer →
-//       新建 KeyDir + load_keydir_from_disk(search_layer) → mark_ready
+// 步骤：验证 meta 是 KV → 覆写 meta 为 kIndex → 创建搜索插件（Text/Vector）→
+//       新建 KeyDir + load_keydir_from_disk → mark_ready
 // 返回的 Cask 是只读的（无 active writer），调用方可以 close 后
 // 再用 open(dirname, {enable_search=true, read_write=true}) 正常使用。
 std::expected<std::unique_ptr<Cask>, CaskFault>
@@ -660,9 +660,9 @@ std::expected<void, CaskFault> Cask::acquire_open_locks() {
     return {};
 }
 
-// T2.4:open 阶段二——bitcask.meta 读取或创建。必须在 SearchLayer 创建
-// 之前——meta 决定 KV / 索引模式以及向量配置,SearchLayer 内部 HnswIndex
-// 创建依赖 meta_config_。vector_dim/metric 不符 → kModeMismatch。
+// T2.4:open 阶段二——bitcask.meta 读取或创建。必须在插件创建之前——meta
+// 决定 KV / 索引模式以及向量配置,VectorPlugin 内部 HnswIndex 创建依赖
+// meta_config_。vector_dim/metric 不符 → kModeMismatch。
 std::expected<void, CaskFault> Cask::check_or_create_meta() {
     // P5b:int8-only 仅 kDot(int8 距离=重建内积);kL2 不支持,干净拒绝。
     if (opts_.vector_dim > 0 && opts_.vector_inmem_int8 &&
@@ -717,7 +717,7 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
     return {};
 }
 
-// T2.4:open 阶段三——SearchLayer + IndexPool 创建。只在 search_config
+// T2.4:open 阶段三——搜索插件（Text/Vector）+ IndexPool 创建。只在 search_config
 // 配置时启动;worker 闭包内的所有 on_* / set_meta / on_vector 路径
 // 严格保持原顺序(单写者 = 本 worker 线程,与 on_vector 同线程维持
 // HNSW 单写者约束)。
@@ -811,7 +811,7 @@ Cask::create_search_infra(const CaskOptions& opts) {
         return {};
     }
     // V3.3:向量配置从 meta 透传进 SearchLayerConfig(dim>0 时
-    // SearchLayer 内部创建 HnswIndex)。以 meta 为准——open 已校验
+    // VectorPlugin 内部创建 HnswIndex)。以 meta 为准——open 已校验
     // opts 与 meta 一致。
     auto scfg = *opts.search_config;
     scfg.vector_dim = meta_config_.vector_dim;
@@ -935,7 +935,7 @@ void Cask::replay_delta_to_keydir(
 
 // S17-5:legacy search.ckpt → per-component 一次性迁移。流程：
 //   1) 用旧 load_search_ckpt 把段全载回（带 hook 推进 keydir 字节水位）。
-//   2) 从 SearchLayer 内部状态读 watermark 与组件链状态，构造 manifest。
+//   2) 从各插件读 watermark 与组件链状态，构造 manifest。
 //   3) 调 save_components_base 把当前内存态写到 3 个新组件文件。
 //   4) 写 manifest。
 //   5) 删旧 search.ckpt + search.ckpt.prev + .d* + search.vec / .qc8
@@ -2667,7 +2667,8 @@ Cask::run_search_one(
     return TextSearchResult{std::move(*hits)};
 }
 
-// search_vector：HNSW 向量检索(V3.3)。归一化/live 过滤/ord 翻译都在 SearchLayer。
+// search_vector：HNSW 向量检索(V3.3)。归一化/live 过滤/ord 翻译都在
+// VectorPlugin（live/ord 经 DocTable）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_vector(std::span<const float> query, std::size_t k,
                      std::size_t ef, const meta::MetaFilter* filter) {
@@ -2675,7 +2676,8 @@ Cask::search_vector(std::span<const float> query, std::size_t k,
         [&] { return vec_plugin_->search(query, k, ef, filter); });
 }
 
-// search_hybrid:RRF 混合检索(V3.6)。两路检索与 RRF 融合在 SearchLayer::search_hybrid。
+// search_hybrid:RRF 混合检索(V3.6)。两路检索与 RRF 融合在
+// search::HybridSearcher（Cask 门面只做校验 + 委托）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_hybrid(std::string_view text_query,
                      std::span<const float> vec_query, std::size_t k,
@@ -3140,8 +3142,9 @@ bool Cask::save_search_ckpt_paired(
 // 段）。
 //
 // 「是 base 还是 delta」由 Cask 决定：每组件的 chain 状态有效
-//（comp_chain_wm_ == comp_base_gen_ && comp_next_seq_ < max）且
-// !rebase_needed → 走 delta；否则全量 base。混合：base 走全量，delta
+//（chain_watermark == base_watermark 起始世代 && chain_seq < max）且
+// !rebase_needed → 走 delta；否则全量 base（docmap 侧经 docmap_chain_
+// 镜像、插件侧经各自 chain_state()）。混合：base 走全量，delta
 // 走单文件——但本版每组件一致性优先，要么全 base 要么全 delta。
 bool Cask::save_checkpoint_paired(
     const std::string& dir, std::uint64_t wm,

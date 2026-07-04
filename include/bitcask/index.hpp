@@ -266,7 +266,7 @@ private:
     std::uint64_t chunks_freed_   = 0;      // 被 compact_chunks 释放的 chunk 数
 
     // S18-2：docmap 持久化记账（见 public 段注释）。removals_ 受 mutex_
-    // 保护（remove 已持 unique_lock）；dirty_ 为 relaxed 原子（与旧
+    // 保护（remove 已持 unique_lock）；dirty_ 为 relaxed 原子（与原
     // SearchLayer::dirty_docmap_ 语义一致：写点已被 reducer/静止点串行化）。
     std::atomic<bool> dirty_{true};
     std::uint64_t delta_window_wm_ = 0;

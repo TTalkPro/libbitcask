@@ -313,7 +313,7 @@ public:
     //   短语叶子按 phrase_terms 的 positions 匹配（需 index_positions）。
     // 评分：候选按全部正向词（term 叶 + 正向短语成分词）的 BM25 贡献求和
     //   （term 叶乘 boost），top-k。集合式求值 O(Σ posting)——无新语法的
-    //   查询由 SearchLayer 路由到扁平 bool_search，性能不受影响。
+    //   查询由 TextPlugin 路由到扁平 bool_search，性能不受影响。
     [[nodiscard]] auto bool_search_tree(
         const QueryNode& root,
         std::size_t k,
