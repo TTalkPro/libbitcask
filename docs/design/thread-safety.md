@@ -240,7 +240,7 @@
   reader-vs-writer 竞态，W2 当时定为「配置类，须先于并发查询配置」）。
 - **现状（已落地）**：**移除 setter**，改为 `CaskOptions::synonym_map`
   （`shared_ptr<const SynonymMap>`）/ C 侧 `synonym_file_path`，在 `Cask::open` 时注入
-  `SearchLayer`，构造后**不可变**。`synonym_map_` 类型 `unique_ptr` → `shared_ptr<const>`。
+  `TextPlugin`（S18-4 起持有），构造后**不可变**。`synonym_map_` 类型 `shared_ptr<const>`。
   → **竞态从根上消除**（无写者）：契约从「文档口头约束」升级为「结构保证」；读路径
   `if (synonym_map_) ...->expand(...)` 全程只读，零锁零 atomic。运行期换词典 = 重开库。
 

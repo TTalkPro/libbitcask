@@ -35,16 +35,20 @@
 ├── bitcask.merge.lock        # 合并锁（active merger 持有）          §六
 │   # —— 以下为恢复 checkpoint / 索引文件（可 fold 重建，纯优化）——  §十
 ├── kv.keydir.ckpt            # keydir checkpoint（BCKS）                §十.1
-├── search.ckpt               # 搜索分段 checkpoint 容器（BCSC）         §十.2
-├── search.ckpt.prev          # 上一代 search.ckpt（代际回退）           §十.2
+├── index.manifest            # per-component checkpoint 提交点（BCMF）   §十.4
+├── docmap.ckpt[.prev/.d<n>]  # docmap 组件文件族（BCSC + delta 链）      §十.4
+├── bm25.ckpt[.prev/.d<n>]    # bm25 组件文件族                          §十.4
+├── vec.ckpt[.prev/.d<n>]     # hnsw 组件文件族（向量 payload 外存 .vec） §十.4
+├── search.ckpt[.prev]        # 旧单文件搜索容器（BCSC，legacy，迁移兜底）§十.2
 └── search.vec                # HNSW 向量 payload（BCVP，mmap）          §十.3
 ```
 
 > checkpoint/索引文件**全部可由 fold 数据文件重建**（纯优化），任何校验失败 →
-> 丢弃 → 回退全量 fold，绝不影响正确性。P14e 起搜索侧的 docmap / bm25 倒排 /
-> HNSW 图头统一为单个 **`search.ckpt`** 分段容器（每段独立 CRC）+ 一个外存
-> **`search.vec`** 向量 payload；旧的 `search.docmap.ckpt` / `search.vec.ckpt` /
-> `search.bm25.*` 多文件已不再产生。详见 §十与
+> 丢弃 → 回退全量 fold，绝不影响正确性。**S17 起**搜索侧 checkpoint 为
+> per-component 模型：`index.manifest`（唯一 commit 点）+ 每组件独立文件族
+> （`docmap.ckpt` / `bm25.ckpt` / `vec.ckpt`，各含 `.prev` + `.d<seq>` 链）。
+> P14e-S16 的单文件 `search.ckpt`（BCSC）降级为 legacy，仅 `legacy_ckpt` 读端
+> 做一次性迁移兜底。详见 §十与
 > [`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)。
 
 `<tstampN>` 是 file id，一个全局单调递增的十进制整数（内部 uint32，
@@ -481,13 +485,17 @@ NFS 上 `O_EXCL` 不可靠，但 bitcask 也不该跑在网络文件系统上。
 重建），是**纯优化**——任何校验失败 → 丢弃 → 回退全量 fold，绝不影响正确性。详见
 [`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)。
 
-当前共两类 checkpoint 文件：
+checkpoint 文件：
 
 - **`kv.keydir.ckpt`**（§10.1）：keydir 快照，独立单文件外壳
   `[Magic:u32 LE][Version:u32 LE][payload][CRC32(payload):u32 LE]`。
-- **`search.ckpt`**（§10.2，P14e）：搜索侧分段容器，docmap / bm25 倒排 / HNSW 图头
-  各为一段、**每段独立 CRC**；其 HNSW 向量 payload 外存到同目录 **`search.vec`**
-  （§10.3）。
+- **per-component 搜索 checkpoint**（§10.4，S17 生产格式）：`index.manifest`
+  （唯一 commit 点）+ 每组件独立文件族 `docmap.ckpt` / `bm25.ckpt` /
+  `vec.ckpt`（各含 `.prev` 代际回退 + `.d<seq>` delta 链）。每族文件仍是
+  §10.2 的 BCSC 分段容器。
+- **`search.ckpt`**（§10.2，P14e — **legacy**）：S17 前的单文件搜索容器；
+  现仅由 `legacy_ckpt` 读端做一次性迁移兜底，写端随 SearchLayer 降级为测试
+  夹具。其 HNSW 向量 payload 外存到同目录 **`search.vec`**（§10.3）。
 
 全部多字节整数小端，`tmp + rename` 原子落盘。
 
@@ -509,13 +517,15 @@ entry_n u64, 重复 entry_n 次:
 `covered_offset` 是尾部回放的水位：open 装载快照后只 fold 各文件该偏移之后的
 尾巴。来源 `src/keydir/keydir.cpp`（`save_snapshot`/`load_snapshot`）。
 
-### 10.2 search.ckpt — 搜索分段 checkpoint 容器（BCSC v1）
+### 10.2 BCSC 分段容器（search.ckpt / per-component ckpt 共用）
 
 自描述、分段、**每段独立 CRC**；页脚最后写（`tmp + rename` 原子）——页脚存在且
 `footerCrc` 通过 ⟺ 文件结构完整。容器只管头部 + 段载荷 + 页脚目录，段 payload 是
-不透明字节（由各索引序列化器产出/消费）。来源
-`include/bitcask/search_checkpoint.hpp`（`SearchCheckpoint::write`/`read`）+
-`src/search/search_layer.cpp`（`save_search_ckpt`/`load_search_ckpt`）。
+不透明字节（由各索引序列化器产出/消费）。此容器格式既是 legacy 单文件
+`search.ckpt` 的外壳，也是 S17 per-component 文件族（§10.4）每个 base/delta
+文件的外壳。来源 `include/bitcask/search_checkpoint.hpp`
+（`SearchCheckpoint::write`/`read`）；legacy 单文件读端（迁移兜底）在
+`src/cask/legacy_ckpt.cpp`，写端随 SearchLayer 降级为测试夹具。
 
 ```
 头部 (16B):  "BCSC"(4) | Version u32=1 (4) | watermark u64 (8)   ← 覆盖 next_ord 上界
@@ -591,3 +601,44 @@ posting）演进，以源码为准——`src/bm25/inverted.cpp` +
 写入顺序 `save_vec_payload(.vec)` → `serialize`（段头）→ `SearchCheckpoint::write`；
 读出顺序 `read(.ckpt)` → `deserialize` → `load_vec_payload(.vec)`。来源
 `src/vector/hnsw.cpp`（`save_vec_payload`/`load_vec_payload`）。
+
+### 10.4 index.manifest + per-component checkpoint（S17 生产格式）
+
+S17 把单文件 `search.ckpt` 拆为**每组件独立文件族** + 一个 `index.manifest`
+提交点。三组件：`docmap`（宿主 DocMap）、`bm25`（TextPlugin）、`vec`
+（VectorPlugin）。设计见
+[`plugin-arch-split-design-zh.md`](plugin-arch-split-design-zh.md) §5、
+[`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)。
+
+**`index.manifest`（唯一 commit 点，~80B，全小端）**：
+
+```
+magic "BCMF"(4) | Version u32=1 | component_count u32=3
+per component [0=docmap, 1=bm25, 2=vec]:
+    base_watermark u64 | chain_seq u32 | chain_watermark u64
+footer_crc32 u32（覆盖 magic..最后 chain_watermark）| trailer "BCMF"(4)
+```
+
+manifest 经 `tmp + fdatasync + rename + 目录 fsync` 原子写——它是唯一提交点，
+crash 前的未提交组件写入会被「header watermark ≠ manifest」拒绝。无 `.prev`
+（80B + CRC + 原子 rename 足够可靠；损坏 → 全量 fold）。来源
+`include/bitcask/index_manifest.hpp`（`write_manifest`/`read_manifest`）。
+
+**每组件文件族**：`<comp>.ckpt`（base）+ `<comp>.ckpt.prev`（代际回退）+
+`<comp>.ckpt.d<seq>`（delta 链，seq 从 1 连续递增）。各文件均为 §10.2 的
+BCSC 容器；组件名 `docmap` / `bm25` / `vec`。base 段沿用 §10.2 的段 1/2·3/4；
+delta 文件含以下段：
+
+- `kDeltaInfo=9`：链校验三元组 `base_gen u64 | prev_wm u64 | seq u32`。
+- `kBm25DefaultDelta=7` / `kBm25FieldsDelta=8`：bm25 增量倒排。
+- `kDocmapDelta=10`：docmap 窗口 live 行 + 删除日志（按 ord 交错重放）。
+- `kHnswDelta=11`：hnsw 窗口插入日志 `count u64; 每条 ord u64 | f32[dim]`。
+- `kKeydirDelta=12`：keydir 元数据（`"BKMD"`，S14-7 成对不变量——仅随
+  docmap delta 落，与搜索增量同文件原子成对）。
+
+**载入**：读 manifest → 各组件 base（`watermark == base_watermark` 校验，失败
+退 `.prev`）→ 连续重放 `.d1..d{chain_seq}`（`kDeltaInfo` 三元组逐段校验，任一
+断裂 → 该组件退全量 fold）。链走读逻辑收敛于
+`include/bitcask/ckpt_chain.hpp`（`walk_chain`，S20-2）；组件持久化来源
+`src/keydir/docmap_ckpt.cpp`（docmap，宿主侧）、`src/search/text_plugin.cpp`
+（bm25）、`src/search/vector_plugin.cpp`（vec）。

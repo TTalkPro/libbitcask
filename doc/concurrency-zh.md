@@ -299,38 +299,45 @@ keydir 会当 merge-race 拒掉（`kAlreadyExists`）→ 由主动 roll + put �
 
 ---
 
-## 6. 索引模式（SearchLayer）的并发
+## 6. 索引模式（Text/Vector 插件）的并发
 
-索引模式（`opts.enable_search = 1` + `opts.analyzer_type != NONE`）在 Cask 内部创建
-一个 `SearchLayer` 实例（BM25 全文索引 + 可选 HNSW 向量索引），外加一个
-**单 worker 线程的 `IndexPool`**（`include/bitcask/thread_pool.hpp`）。
+索引模式（`opts.enable_search = 1` + `opts.analyzer_type != NONE`）在 Cask 内部
+直持两个搜索插件——`text::TextPlugin`（BM25 全文索引）与可选的
+`vec::VectorPlugin`（HNSW 向量索引），RRF 融合归 `search::HybridSearcher`
+（S15-S19 插件化架构）。宿主服务 DocMap（`index::Index`）由插件借用。写入
+经一个 **N map worker + 1 reducer** 的 `IndexPool`（`include/bitcask/thread_pool.hpp`，
+S6-P4 并行 map）。
 
 ### 写路径其实是异步单写者
 
 索引的「单写者」**不是** `Cask::put` 的调用线程，而是 IndexPool 的那一个
-worker 线程：
+**reducer** 线程（map 阶段是 N 个 worker 并发跑纯函数 `prepare`，不碰共享
+可变态）：
 
 ```
 put/delete (调用方写线程)
-   └─ submit_index_task → IndexPool 有界队列（capacity 10240，满则 push 阻塞做背压）
-        └─ worker 线程串行执行 on_write / on_delete / on_vector
-                                  / Index::set_meta / InvertedIndex::add_doc
+   └─ submit_index_task → IndexPool 有界队列（满则 push 阻塞做背压）
+        └─ N 个 map worker：并发跑各插件 prepare 相（纯函数，真数据并行）
+             └─ per-lane reorder buffer（按 ord 暂存乱序结果）
+                  └─ 1 个 reducer（按 ord 严格升序）：宿主先落 DocMap 行/删除，
+                     再串行扇出各插件 on_put / on_delete（库内单写者 I3）
 ```
 
-所以所有索引结构的变更都在这一个 worker 线程上串行发生——写-写竞态天然
-不存在。调用线程只负责入队。
+所以所有索引结构的**变更**都在 reducer 这一个线程上串行发生——写-写竞态
+天然不存在。map 阶段只读不变的 analyzer 配置，可安全并发。
 
 ### 读路径与 worker 并发
 
 搜索（`search_text` / `search_vector` / `search_hybrid`）在**调用线程**上跑，
-与 worker 线程**并发**。`prepare_search` 先 `flush()` 排空在途任务再搜，
-但搜索进行中新来的 `put` 仍会让 worker 并发改索引。因此读路径必须对
-「与 worker 并发」鲁棒。
+与 reducer 线程**并发**。`drain_plugins()`（原 `prepare_search`）先 `flush()`
+排空在途任务再搜，但搜索进行中新来的 `put` 仍会让 reducer 并发改索引。因此
+读路径必须对「与 reducer 并发」鲁棒。
 
 | 组件            | 线程安全？ | 并发要求                                      |
 |---|---|---|
 | KeyDir          | ✅ 是      | 分片锁串行写，并发读（见 §2、§下方锁全序图）   |
-| SearchLayer    | ⚠️ 半     | 写经 IndexPool 单 worker 串行；读可与之并发    |
+| TextPlugin     | ⚠️ 半     | 写经 IndexPool reducer 串行；读可与之并发      |
+| VectorPlugin   | ⚠️ 半     | 写经 IndexPool reducer 串行；读可与之并发      |
 | InvertedIndex  | ✅ 是      | 内部分片锁 + tbb 桶锁 + CoW，搜索可并发        |
 | Index（meta/live） | ✅ 是   | `shared_mutex`，读拷贝出值后再用              |
 | SearchCache    | ✅ 是      | `shared_mutex`，读拷贝结果集后返回            |
@@ -365,7 +372,7 @@ merge 在调用方线程上跑，merge 末尾 `rebuild_index` + `save_snapshot`
 ### 与 KV 层的关系
 
 索引模式不改变 KeyDir 的共享语义——同一目录的多个 `bitcask_open` 仍共享
-KeyDir；SearchLayer 作为 `Cask` 成员只在 `put/delete`（入队）与搜索路径上
+KeyDir；搜索插件作为 `Cask` 成员只在 `put/delete`（入队）与搜索路径上
 被触碰，不影响 reader 对 KV 的并发读。
 
 ---
@@ -435,17 +442,17 @@ KeyDir；SearchLayer 作为 `Cask` 成员只在 `put/delete`（入队）与搜�
 | **KeyDir** | meta_mu_ | std::shared_mutex | include/bitcask/keydir.hpp:414 | pending_/iter 协调状态专用（仅 fold 期间触碰） |
 | **KeyDir** | shard[i].mu | std::mutex ×256 | include/bitcask/keydir.hpp:371（shards_ 数组 :383） | 分片锁（kShards=256），任意时刻至多持 1 把 |
 | **KeyDir** | fstats_grow_mu_ | std::mutex | include/bitcask/keydir.hpp:467 | 仅新 file_id 槽位构造（罕见） |
-| **Cask** | read_cache_mu_ | std::shared_mutex | (未在 keydir 中) | 独立，不与 KeyDir 或 SearchLayer 锁嵌套 |
+| **Cask** | read_cache_mu_ | std::shared_mutex | (未在 keydir 中) | 独立，不与 KeyDir 或搜索插件锁嵌套 |
 | **KeyDirRegistry** | mutex_ | std::mutex | (未在 keydir 中) | 独立 |
 | **Index** | mutex_ | std::shared_mutex | (未在 keydir 中) | 独立 |
-| **SearchLayer** | fields_mu_ | std::shared_mutex | (未在 keydir 中) | 独立 |
+| **TextPlugin** | fields_mu_ | std::shared_mutex | include/bitcask/text_plugin.hpp:360 | 独立（只保护 fields_ map 结构）|
 | **SearchCache** | mutex_ | std::shared_mutex | (未在 keydir 中) | 独立 |
 | **DocTextLru** | mu_ | std::mutex | (未在 keydir 中) | 独立 |
 | **InvertedIndex** | shards_[i].vocab_mtx_ | std::shared_mutex ×64 | include/bitcask/inverted.hpp:392（kShardCount=64 :402） | per-shard 排序词典重建锁（按 term hash 分片） |
 | **InvertedIndex** | shards_[i].inverted | tbb concurrent_hash_map 桶锁 | include/bitcask/inverted.hpp:381 | TBB 内部哈希表桶锁；posting 值用 shared_ptr CoW 发布 |
 | **HnswIndex** | chunks_ = atomic&lt;NodeChunk*&gt;×N | std::atomic | include/bitcask/hnsw.hpp:334 | 节点块无锁发布（裸指针，非 shared_ptr——避原子 refcount 开销） |
 | **HnswIndex** | per-node spinlock | std::atomic&lt;uint8_t&gt; | include/bitcask/hnsw.hpp:175 | 写者改某节点邻接时持有；内部，无外部锁嵌套 |
-| **SearchLayer** | hnsw_ = atomic&lt;shared_ptr&lt;HnswIndex&gt;&gt; | std::atomic | include/bitcask/search_layer.hpp:372 | 整图换指针（merge 重建旁路构建 + 原子换），旧图被 in-flight reader 续命 |
+| **VectorPlugin** | hnsw_ = atomic&lt;shared_ptr&lt;HnswIndex&gt;&gt; | std::atomic | include/bitcask/vector_plugin.hpp:173 | 整图换指针（merge 重建旁路构建 + 原子换），旧图被 in-flight reader 续命 |
 | **IndexPool** | queue_ + pending_ | tbb 有界队列 + atomic | thread_pool.hpp | 单 worker 串行消费；队列满时 push 阻塞做背压 |
 
 ### 2. 锁层级 ASCII 图
@@ -469,13 +476,13 @@ KeyDir；SearchLayer 作为 `Cask` 成员只在 `put/delete`（入队）与搜�
 │     Cask::read_cache_mu_      (shared_mutex)                               │
 │     KeyDirRegistry::mutex_    (mutex)                                      │
 │     Index::mutex_             (shared_mutex)                               │
-│     SearchLayer::fields_mu_   (shared_mutex)                               │
+│     TextPlugin::fields_mu_    (shared_mutex)                               │
 │     SearchCache::mutex_       (shared_mutex)                               │
 │     DocTextLru::mu_           (mutex)                                      │
 │     InvertedIndex::vocab_mtx_[i] (shared_mutex ×64)                        │
 │     HnswIndex::chunks_ = atomic<NodeChunk*>×N (无锁节点发布)               │
 │     HnswIndex::per-node spinlock (内部)                                    │
-│     SearchLayer::hnsw_ = atomic<shared_ptr<HnswIndex>> (整图换指针)        │
+│     VectorPlugin::hnsw_ = atomic<shared_ptr<HnswIndex>> (整图换指针)       │
 │     IndexPool::queue_ (tbb 有界队列) + pending_ (atomic)                   │
 │                                                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -525,7 +532,7 @@ barrier_mu_ → gate_mu_ → meta_mu_ → 单个 shard（≤1 把） → fstats_
 - 示例：Cask::read_cache_mu_ 独立持有，不与 KeyDir 锁嵌套
 
 **独立模块锁：**
-- KeyDirRegistry::mutex_、Index::mutex_、SearchLayer::fields_mu_ 等均独立
+- KeyDirRegistry::mutex_、Index::mutex_、TextPlugin::fields_mu_ 等均独立
 - 这些锁各自保护不重叠的数据结构，无全局锁序要求
 
 ### 4. 文档化的例外情况

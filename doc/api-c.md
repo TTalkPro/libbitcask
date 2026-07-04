@@ -297,6 +297,29 @@ bitcask_error_t bitcask_put(bitcask_t* cask,
 ```
 `tstamp=0` 用当前时间。
 
+### `bitcask_put_ex`（带 per-key TTL，S13-D5）
+```c
+bitcask_error_t bitcask_put_ex(bitcask_t* cask,
+                               bitcask_slice_t key,
+                               bitcask_slice_t value,
+                               uint32_t tstamp,
+                               uint32_t expiry_at,
+                               bitcask_fault_t* fault);
+```
+`expiry_at` = 绝对 unix 秒（`0`=永不过期，等价 `bitcask_put`）。过期后 get/iter 视作不存在，空间 merge 时回收。
+
+### `bitcask_put_batch`（批量写，S13-D1）
+```c
+typedef struct { bitcask_slice_t key; bitcask_slice_t value; } bitcask_kv_pair_t;
+
+bitcask_error_t bitcask_put_batch(bitcask_t* cask,
+                                  const bitcask_kv_pair_t* items,
+                                  size_t n,
+                                  uint32_t tstamp,
+                                  bitcask_fault_t* fault);
+```
+整批一次提交：单次 flush 后才更新 keydir 并返回——本进程内 all-or-nothing 可见。校验（key/value 大小）在任何写之前全批完成。`items` 借调用方存储。
+
 ### `bitcask_delete`
 ```c
 bitcask_error_t bitcask_delete(bitcask_t* cask,
@@ -349,6 +372,15 @@ bitcask_error_t bitcask_search_text(bitcask_t* cask, const char* query,
                                     size_t k, bitcask_search_result_t** out,
                                     bitcask_fault_t* fault);
 ```
+
+### `bitcask_search_text_filtered`（词袋 + meta 过滤，S13-D2）
+```c
+bitcask_error_t bitcask_search_text_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+```
+`filter==NULL` 退化为无过滤；非法 filter 返回 `BITCASK_ERR_INVALID_OPTION`。过滤树仅在调用期间读取（见 §4.x `bitcask_meta_filter_t`）。
 
 ### `bitcask_search_text_batch`（批量词袋）
 一次 `prepare_search` flush 覆盖全批，比逐条调用省重复索引 flush。`queries` 为 `n` 个
@@ -429,6 +461,15 @@ bitcask_error_t bitcask_search_vector_batch(bitcask_t* cask,
                                             bitcask_fault_t* fault);
 ```
 
+### `bitcask_search_vector_filtered`（向量 + meta 过滤，S13-D2）
+```c
+bitcask_error_t bitcask_search_vector_filtered(
+    bitcask_t* cask, const float* query, size_t query_len, size_t k, size_t ef,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+```
+过滤语义同 `bitcask_search_text_filtered`。
+
 ### `bitcask_search_hybrid`（RRF 混合）
 ```c
 bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
@@ -450,6 +491,16 @@ bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
                                             size_t k, bitcask_search_result_t*** out_results,
                                             bitcask_fault_t* fault);
 ```
+
+### `bitcask_search_hybrid_filtered`（混合 + meta 过滤，S13-D2）
+```c
+bitcask_error_t bitcask_search_hybrid_filtered(
+    bitcask_t* cask, const char* text_query,
+    const float* vec_query, size_t vec_len, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+```
+过滤语义同 `bitcask_search_text_filtered`；两路查询语义同 `bitcask_search_hybrid`。
 
 ### 同义词词典（open-time 配置）
 运行期 `bitcask_set_synonym_map` **已移除**。改在 open 时设
@@ -531,6 +582,13 @@ bitcask_error_t bitcask_parallel_scan(bitcask_t* cask, size_t n_threads,
 bitcask_error_t bitcask_status(bitcask_t* cask, bitcask_status_t* out,
                                bitcask_fault_t* fault);
 ```
+
+### `bitcask_status_ex`（扩展观测，S13-D8）
+```c
+bitcask_error_t bitcask_status_ex(bitcask_t* cask, bitcask_status_ex_t* out,
+                                  bitcask_fault_t* fault);
+```
+`bitcask_status_ex_t` 在 `bitcask_status_t` 基础上追加索引/缓存观测（如 `search_cache_entries`、`read_handles`）。见 §6.6。
 
 ### `bitcask_needs_merge`
 ```c

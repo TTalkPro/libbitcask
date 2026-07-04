@@ -323,7 +323,7 @@ auto vhits = vs.search(query_vec, 5);
 ├── c_api/             # libbitcask.so 的 C ABI（bitcask_c.{cpp,h}）
 ├── src/               # 实现：fileops / io / lock / keydir / merge /
 │                      #       cask / search / bm25 / text / vector
-├── tests/             # GoogleTest 单元 + 集成测试（26 个测试二进制）
+├── tests/             # GoogleTest 单元 + 集成测试（32 个测试二进制）
 ├── bench/             # Google Benchmark（keydir / cask / inverted / hnsw ...）
 ├── tools/             # migrate_le、gen_inert_table
 ├── cmake/             # BitcaskSanitizers 模块 + tsan.supp

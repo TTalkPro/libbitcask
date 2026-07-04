@@ -24,7 +24,9 @@ libbitcask 有两种工作模式，由打开选项决定：
 链接 `libbitcask`（静态聚合 `.a` 或共享 `.so`）。索引模式按需附带 include：
 
 ```cpp
-#include <bitcask/search_layer.hpp>   // SearchLayer / SearchLayerConfig / SearchHit
+#include <bitcask/searcher.hpp>       // Searcher 门面（text/vec/hybrid）
+#include <bitcask/search_config.hpp>  // SearchLayerConfig
+#include <bitcask/search_types.hpp>   // SearchHit / SearchError
 #include <bitcask/hnsw.hpp>           // HnswConfig / HnswMetric
 #include <bitcask/analyzer.hpp>       // AnalyzerType / AnalyzerConfig
 ```
@@ -48,7 +50,7 @@ libbitcask 有两种工作模式，由打开选项决定：
 | `tombstone_version` | `std::uint8_t` | `0` | 墓碑格式：`0`=17B 前缀；`2`=22B 含 FileId（支持并发 merge 精细回收）。读时三种都接受 |
 | `policy` | `merge::PolicyOptions` | `{}` | merge 触发策略（碎片率/死字节/过期阈值）|
 | `enable_search` | `bool` | `false` | 启用索引模式 |
-| `search_config` | `std::optional<search::SearchLayerConfig>` | `nullopt` | 有值时才创建 SearchLayer |
+| `search_config` | `std::optional<search::SearchLayerConfig>` | `nullopt` | 有值时才创建搜索插件（Text/Vector）|
 | `vector_dim` | `std::uint16_t` | `0` | 向量维度；`>0` 即启用向量，要求 `enable_search`；库内恒定 |
 | `vector_quantized` | `bool` | `false` | 向量落盘 int8 量化（4× 磁盘，有损）|
 | `vector_inmem_int8` | `bool` | `false` | HNSW int8-only 内存（约 −80% 向量内存，仅 kDot）；与 `quantized` 正交 |
@@ -191,7 +193,7 @@ open(std::string_view dirname, const CaskOptions& opts,
 static std::expected<std::unique_ptr<Cask>, CaskFault>
 upgrade(std::string_view dirname, const search::SearchLayerConfig& search_config);
 ```
-离线把 KV 模式目录升级为索引模式。前提：目录为 KV 模式且**离线**（无活跃 writer）。流程：读 meta 验证 → 写新 meta → 建 SearchLayer → 扫描全部数据文件重建索引 → 返回只读索引模式 Cask。
+离线把 KV 模式目录升级为索引模式。前提：目录为 KV 模式且**离线**（无活跃 writer）。流程：读 meta 验证 → 写新 meta → 建搜索插件（Text/Vector）→ 扫描全部数据文件重建索引 → 返回只读索引模式 Cask。
 - **线程安全**：是。
 
 #### `close`
@@ -363,10 +365,19 @@ auto c = Cask::open(dir, opts, &registry);
 
 ### 5.5 搜索基础设施访问
 
+S19-2 起 `SearchLayer` 门面已解体：`Cask` 直持 Text/Vector 插件，
+查询经 `Cask::search_*` 门面（源兼容）或 `Searcher` 类型化门面（§7.5，推荐）。
+底层访问器：
+
 ```cpp
-bool has_search() const;             // 是否启用索引模式
-search::SearchLayer* search();       // 访问内部 SearchLayer（高级用法 / C API 层用）
-void flush_index();                  // 排空异步索引队列
+bool has_search() const;                        // 是否启用索引模式
+void flush_index();                             // 排空异步索引队列
+std::expected<void, CaskFault> drain_plugins(); // 读屏障：submitted ⇒ applied
+
+// 插件句柄（高级用法 / Searcher 门面 / C API 层用；所有权在 Cask）
+const text::TextPlugin*      text_plugin() const;
+const vec::VectorPlugin*     vector_plugin() const;
+const search::HybridSearcher* hybrid_searcher() const;
 ```
 
 ### 5.6 持久化与写文件管理
@@ -482,7 +493,11 @@ bool is_iterating() const noexcept;
 
 ## 7. 检索子系统
 
-`Cask::search()` 返回内部 `SearchLayer` 指针（高级用法或 C API 层访问）。普通用户经 `Cask` 的 `search_*` 方法间接使用。
+插件化架构（S15-S19）：`Cask` 直持 `text::TextPlugin` / `vec::VectorPlugin`，
+RRF 融合由 `search::HybridSearcher` 承担。三条查询入口——`Cask::search_*`
+门面（源兼容薄委托）、`Searcher` 类型化门面（§7.5，推荐）、插件句柄直查
+（§5.5）。配置面仍是一份 `SearchLayerConfig`（§7.1），由 `text_config()` /
+`vector_config()` 拆分产出两插件配置。
 
 ### 7.1 `search::SearchLayerConfig`
 
@@ -496,7 +511,7 @@ bool is_iterating() const noexcept;
 | `vector_dim` | `std::uint16_t` | `0` | `>0` 时构造 HnswIndex |
 | `vector_metric` | `meta::VectorMetric` | `kNone` | `kCosineNormalized`/`kDot` → HNSW `kDot`；`kL2` → `kL2` |
 | `vector_inmem_int8` | `bool` | `false` | HNSW int8-only 内存（仅 `kDot`）|
-| `wal_batch_size` | `std::size_t` | `1` | WAL 批量刷新阈值；`1`=即时；`>1` 减少 sync 次数 |
+| `max_delta_chain` | `std::uint32_t` | `64` | delta 链长上限，达到后 flush 强制全量 base（坍缩链）；`0`=不设限 |
 
 ### 7.2 `search::SearchHit`
 
@@ -542,6 +557,33 @@ struct SearchHit {
 | `min_token_length` | `std::uint32_t` | `1` | 拉丁整词最小 codepoint 长度；`1`=不过滤 |
 | `enable_stemming` | `bool` | `false` | 启用 Porter 词干提取（`running`→`run`）|
 
+### 7.5 `Searcher` 类型化门面（推荐，S19-1）
+
+调用方自持插件句柄，查询走类型化门面：每次查询先经 `Cask::drain_plugins()`
+读屏障（read-your-writes：submitted ⇒ applied），再直调插件内核，错误统一
+翻译为 `CaskFault`。
+
+```cpp
+#include <bitcask/searcher.hpp>
+
+auto* tp = cask.text_plugin();
+text::Searcher ts(cask, *tp);
+auto hits = ts.search_text("query", 10);          // expected<TextSearchResult, CaskFault>
+
+auto* vp = cask.vector_plugin();
+vec::Searcher vs(cask, *vp);
+auto vhits = vs.search(query_vec, 10);
+
+search::CaskHybridSearcher hs(cask, *cask.hybrid_searcher());
+auto rrf = hs.search("text", vec_query, 10);      // RRF 融合
+```
+
+| 门面 | 主要方法 |
+|------|----------|
+| `text::Searcher` | `search_text` / `search_phrase` / `search_near` / `bool_search` / `search_fields` / `search_fuzzy` / `search_wildcard` / `search_text_highlight` / `search_text_batch` |
+| `vec::Searcher` | `search` / `search_batch` |
+| `search::CaskHybridSearcher` | `search`（文本+向量 RRF）|
+
 ---
 
 ## 8. 用法示例
@@ -579,7 +621,8 @@ int main() {
 
 ```cpp
 #include <bitcask/cask.hpp>
-#include <bitcask/search_layer.hpp>
+#include <bitcask/searcher.hpp>
+#include <bitcask/search_config.hpp>
 #include <bitcask/analyzer.hpp>
 
 using namespace bitcask;

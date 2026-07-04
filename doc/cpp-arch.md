@@ -41,7 +41,12 @@
 │   ├── intersect.hpp        # 倒排链交集（k-way / BlockMax 等）
 │   ├── vbyte.hpp            # varint / vbyte 编码
 │   ├── query.hpp            # 查询 AST（bool / phrase / near / fuzzy / wildcard）
-│   ├── search_layer.hpp     # SearchLayer：Index + InvertedIndex + HnswIndex + Analyzer
+│   ├── plugin_api.hpp       # CaskPlugin 接口 + PluginHost（插件化架构 S15）
+│   ├── text_plugin.hpp      # TextPlugin：BM25 文本域插件（倒排 + analyzer + 缓存 + 高亮）
+│   ├── vector_plugin.hpp    # VectorPlugin：HNSW 向量域插件
+│   ├── hybrid_searcher.hpp  # HybridSearcher：BM25 + 向量 RRF 融合
+│   ├── searcher.hpp         # Searcher 类型化查询门面（text/vec/hybrid）
+│   ├── search_config.hpp    # SearchLayerConfig（配置聚合，拆分产出两插件配置）
 │   ├── search_cache.hpp     # 查询侧缓存（分析结果 / term ord）
 │   ├── search_checkpoint.hpp # search.ckpt 分段快照（恢复用）
 │   ├── highlighter.hpp      # 搜索命中高亮
@@ -64,8 +69,11 @@
 │   ├── migrate.hpp          # 大端 → 小端离线迁移（migrate_le）
 │   └── file_lock.hpp        # FileLock：独占锁（O_CREAT|O_EXCL）
 ├── c_api/                   # libbitcask.so 的 C ABI（extern "C"，跨语言绑定）
-│   ├── bitcask_c.h          # 不透明句柄 / 错误码 / 切片 / 选项 / 函数原型
-│   └── bitcask_c.cpp        # C → Cask 转换层（句柄包装 / slice ↔ span / fault 翻译）
+│   ├── bitcask_kv.h/.cpp    # KV / 迭代 / meta 过滤 / 生命周期 / 配置（S19-5 分域）
+│   ├── bitcask_text.h/.cpp  # BM25 文本检索
+│   ├── bitcask_vec.h/.cpp   # 向量 / RRF 混合检索
+│   ├── bitcask_c.h          # 聚合 include（源兼容：一次拉全部三分域头）
+│   └── internal.h           # 三 TU 共享助手（句柄包装 / slice↔span / fault 翻译，visibility hidden）
 ├── src/                     # 实现（按子目录分库）
 │   ├── fileops/             # codec.cpp, data_file.cpp, hint_file.cpp, scanner.cpp, migrate.cpp
 │   ├── io/                  # posix_file.cpp
@@ -73,11 +81,11 @@
 │   ├── keydir/              # keydir.cpp, keydir_registry.cpp, index.cpp
 │   ├── merge/               # merger.cpp, merge_policy.cpp
 │   ├── cask/                # cask.cpp, meta_file.cpp
-│   ├── search/              # search_layer.cpp, search_cache.cpp, highlighter.cpp
+│   ├── search/              # text_plugin.cpp, vector_plugin.cpp, hybrid_searcher.cpp, search_arena.cpp, search_cache.cpp, highlighter.cpp
 │   ├── bm25/                # inverted.cpp, inverted_wal.cpp, intersect.cpp, query_parser.cpp
 │   ├── vector/              # hnsw.cpp
 │   └── text/                # analyzer.cpp, jieba_analyzer.cpp
-├── tests/                   # GoogleTest 单元 + 集成测试（22 个测试二进制）
+├── tests/                   # GoogleTest 单元 + 集成测试（32 个测试二进制）
 ├── bench/                   # Google Benchmark（cask / keydir / inverted / hnsw / gate /
 │                            #               intersect_u64_proto / crc32 / analyzer + bench_main）
 ├── tools/                   # migrate_le（大端→小端）、gen_inert_table（NFKC 惰性区间表生成）
@@ -90,7 +98,7 @@
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│  C API（c_api/bitcask_c.{h,cpp}）                         │
+│  C API（c_api/bitcask_{kv,text,vec}.{h,cpp} + bitcask_c.h）│
 │  libbitcask.so：extern "C" 不透明句柄 + slice + fault      │
 └────────────────────────────┬───────────────────────────────┘
                                │ PIMPL
@@ -201,8 +209,8 @@ open:
 运行时（每次 put）:
   put_doc(K, V)
     ├─ DataFile::write(kDoc)         ← 路径 1（KV 权威，追加）
-    └─ submit_index_task(Add)        ← 异步到 IndexPool worker
-         └─ SearchLayer::on_write()
+    └─ submit_index_task(Add)        ← 异步到 IndexPool（map worker → reducer）
+         └─ TextPlugin::on_put()      ← reducer 串行扇出
               └─ InvertedIndex::add_doc(ord, terms)
                    └─ wal_->append_add_doc()  ← 路径 2（索引 WAL）
 
@@ -250,13 +258,16 @@ WAL 帧格式：`[4B payload_len][payload][4B CRC32]`。CRC 仅覆盖 payload。
 KeyDir 全局标量（`epoch_` / `key_count_` / `key_bytes_` / `biggest_file_id_` / `next_ord_` / `keyfolders_`）全部 `std::atomic`，fstats 走无锁发布路径；`pending_` 与 iter 协调状态由独立的 `meta_mu_` 保护（仅 fold 期间触碰，冷路径）。
 
 **索引层是异步单写者**：索引模式下 `put/delete` 把任务入队到 `IndexPool`
-的有界队列（满则 push 阻塞做背压），由**单一 worker 线程**串行执行所有索引
-变更（`on_write`/`on_delete`/`on_vector`/`set_meta`/`add_doc`）。搜索在调用
-线程上跑，与 worker 并发——读路径靠「锁内拷贝、不逃逸指针、安全遍历 tbb 表、
-跨线程标量原子、消费者异常兜底」等不变量保证安全，详见
+的有界队列（满则 push 阻塞做背压）。IndexPool 是 **N map worker + 1 reducer**
+（S6-P4 并行 map）：map 阶段并发跑各插件 `prepare`（纯函数），reducer 按 ord
+严格升序串行扇出所有索引变更（宿主 DocMap 落行/删除 + 插件 `on_put`/
+`on_delete`/`set_meta`/`add_doc`）——库内单写者即 reducer。搜索在调用线程上跑，
+与 reducer 并发——读路径靠「锁内拷贝、不逃逸指针、安全遍历 tbb 表、跨线程
+标量原子、消费者异常兜底」等不变量保证安全，详见
 [`concurrency-zh.md` §6](concurrency-zh.md)。
 
-**SearchLayer** 自身非线程安全：写经 IndexPool 单 worker 串行，读可与之并发。
+**搜索插件（TextPlugin/VectorPlugin）** 自身非线程安全：写经 IndexPool
+reducer 串行，读可与之并发。
 
 **InvertedIndex** 线程安全：内部按词哈希分片锁 + `tbb::concurrent_hash_map`
 桶锁 + posting list 的 CoW —— 与 KeyDir 的分片锁是各自独立的体系。
@@ -279,7 +290,7 @@ KeyDir 全局标量（`epoch_` / `key_count_` / `key_bytes_` / `biggest_file_id_
 
 ## C API 导出
 
-`c_api/bitcask_c.{h,cpp}` 提供 `extern "C"` ABI，由 `libbitcask.so`（`SOVERSION=3`）导出，供跨语言绑定（Python / Rust / Go / Node …）使用。设计要点：
+`c_api/`（分域头 `bitcask_kv.h` / `bitcask_text.h` / `bitcask_vec.h` + 聚合 `bitcask_c.h`，实现 `bitcask_kv.cpp` / `bitcask_text.cpp` / `bitcask_vec.cpp` + 共享 `internal.h`）提供 `extern "C"` ABI，由 `libbitcask.so`（`SOVERSION=3`）导出，供跨语言绑定（Python / Rust / Go / Node …）使用。设计要点：
 
 - **不透明句柄**：`bitcask_t` / `bitcask_iter_t` 是 forward-declared struct，调用方只持有指针。
 - **显式内存配对**：每个返回堆分配的函数都有对应的 `*_free`（如 `bitcask_get_result_free`、`bitcask_search_result_free`、`bitcask_iter_entry_free`、`bitcask_needs_merge_free`）。
@@ -352,6 +363,6 @@ cmake --install build        # 头文件、libbitcask.{so,a}、bitcask_c.h
 4. 如果更改涉及 keydir 或 cask 热路径，在 `bench/` 中添加微基准。
 5. 如果更改需要暴露给 C / 跨语言绑定：
    - 在 `include/bitcask/cask.hpp`（或对应模块头）增加 C++ 接口；
-   - 在 `c_api/bitcask_c.h` 增加 `extern "C"` 函数原型 + 所需类型（错误码 / 选项字段）；
-   - 在 `c_api/bitcask_c.cpp` 实现句柄解包 / `slice ↔ span` / `fault` 翻译三件套；
+   - 在对应分域头（`bitcask_kv.h` / `bitcask_text.h` / `bitcask_vec.h`）增加 `extern "C"` 函数原型 + 所需类型（错误码 / 选项字段）；
+   - 在对应实现 TU（`bitcask_kv.cpp` / `bitcask_text.cpp` / `bitcask_vec.cpp`）实现句柄解包 / `slice ↔ span` / `fault` 翻译三件套（共享助手在 `internal.h`）；
    - 对返回堆分配的函数补 `*_free` 配对。
