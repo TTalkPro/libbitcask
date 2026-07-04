@@ -160,10 +160,20 @@ target_link_libraries(bitcask_inverted_wal_test PRIVATE
     bitcask_sanitizers
 )
 
+# S19-3：SearchLayer shim 测试夹具（原产品 bitcask_search 目标降级至此）。
+# 聚合 docmap+TextPlugin+VectorPlugin+HybridSearcher 的兼容门面 + legacy
+# 统一 search.ckpt 读写端——save 半边专供迁移测试生成 pre-S17 格式文件。
+add_library(bitcask_search_shim STATIC support/search_layer.cpp)
+target_include_directories(bitcask_search_shim PUBLIC support)
+target_link_libraries(bitcask_search_shim
+    PUBLIC  bitcask_hybrid
+    PRIVATE bitcask_warnings bitcask_sanitizers
+)
+
 add_executable(bitcask_search_layer_test search_layer_test.cpp)
 target_link_libraries(bitcask_search_layer_test PRIVATE
     GTest::gtest_main
-    bitcask_search
+    bitcask_search_shim
     bitcask_warnings
     bitcask_sanitizers
 )
@@ -171,7 +181,7 @@ target_link_libraries(bitcask_search_layer_test PRIVATE
 add_executable(bitcask_highlighter_test highlighter_test.cpp)
 target_link_libraries(bitcask_highlighter_test PRIVATE
     GTest::gtest_main
-    bitcask_search
+    bitcask_search_shim
     bitcask_warnings
     bitcask_sanitizers
 )
@@ -180,7 +190,7 @@ add_executable(bitcask_wildcard_test wildcard_test.cpp)
 target_link_libraries(bitcask_wildcard_test PRIVATE
     GTest::gtest_main
     bitcask_bm25
-    bitcask_search
+    bitcask_search_shim
     bitcask_text
     bitcask_warnings
     bitcask_sanitizers
@@ -189,7 +199,7 @@ target_link_libraries(bitcask_wildcard_test PRIVATE
 add_executable(bitcask_synonym_test synonym_test.cpp)
 target_link_libraries(bitcask_synonym_test PRIVATE
     GTest::gtest_main
-    bitcask_search
+    bitcask_search_shim
     bitcask_text
     bitcask_warnings
     bitcask_sanitizers
@@ -199,7 +209,7 @@ add_executable(bitcask_fuzzy_test fuzzy_test.cpp)
 target_link_libraries(bitcask_fuzzy_test PRIVATE
     GTest::gtest_main
     bitcask_bm25
-    bitcask_search
+    bitcask_search_shim
     bitcask_text
     bitcask_warnings
     bitcask_sanitizers
@@ -265,11 +275,45 @@ gtest_discover_tests(bitcask_plugin_api_test ${_bitcask_test_props})
 # S15-4：插件契约 Mock 测试——不链 search（thread_pool.hpp 已去搜索化），
 # 守护 IndexPool 分发通路对 CaskPlugin 的契约。S16-2 增链 bitcask_index
 # （docmap 宿主服务）以验证「宿主先 apply DocMap、再广播插件」顺序不变量。
+# S19-1：Searcher 门面等价测试。
+add_executable(bitcask_searcher_test searcher_test.cpp)
+target_link_libraries(bitcask_searcher_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_searcher_test ${_bitcask_test_props})
+
+# S18-11：插件级测试（flush/open 自治、replay 路由、归一化契约）。
+add_executable(bitcask_text_plugin_test text_plugin_test.cpp)
+target_link_libraries(bitcask_text_plugin_test PRIVATE
+    GTest::gtest_main
+    bitcask_text_plugin
+    bitcask_docmap
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_text_plugin_test ${_bitcask_test_props})
+
+add_executable(bitcask_vector_plugin_test vector_plugin_test.cpp)
+target_link_libraries(bitcask_vector_plugin_test PRIVATE
+    GTest::gtest_main
+    bitcask_vector_plugin
+    bitcask_bm25   # DocTable/meta_filter 头 + MetaFilter 求值符号
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_vector_plugin_test ${_bitcask_test_props})
+
 add_executable(bitcask_plugin_contract_test plugin_contract_test.cpp)
 target_link_libraries(bitcask_plugin_contract_test PRIVATE
     GTest::gtest_main
     bitcask_plugin_api
     bitcask_index
+    bitcask_merge     # S18-11：merge 广播契约（run_merge 直调 + mock 插件）
+    bitcask_keydir
+    bitcask_fileops
     bitcask_warnings
     bitcask_sanitizers
     TBB::tbb
@@ -279,7 +323,7 @@ gtest_discover_tests(bitcask_plugin_contract_test ${_bitcask_test_props})
 add_executable(bitcask_thread_pool_test thread_pool_test.cpp)
 target_link_libraries(bitcask_thread_pool_test PRIVATE
     GTest::gtest_main
-    bitcask_search
+    bitcask_hybrid
     bitcask_warnings
     bitcask_sanitizers
     TBB::tbb

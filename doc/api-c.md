@@ -31,6 +31,19 @@ gcc app.c -I<c_api 头文件目录> -L<lib 目录> -lbitcask -o app
 
 ---
 
+### 2.1 分域头文件（S19-5）
+
+`bitcask_c.h` 自 S19 起为**聚合头**（include 它获得全量 API，既有代码零改动）；
+按域拆分为：
+
+| 头文件 | 内容 |
+|---|---|
+| `bitcask_kv.h` | 基础类型/配置/生命周期/KV 读写/迭代/Meta 过滤/管理 |
+| `bitcask_text.h` | BM25 文本搜索（search_text/phrase/bool/fields/near/fuzzy/wildcard + 批量 + filtered） |
+| `bitcask_vec.h` | 向量与 RRF 混合检索（search_vector/hybrid + 批量 + filtered） |
+
+三头符号/签名/ABI 与拆分前逐一致；仅做 KV 的接入方可只 include `bitcask_kv.h`。
+
 ## 3. 版本信息
 
 ```c

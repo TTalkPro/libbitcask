@@ -468,3 +468,155 @@ TEST(PluginContract, DeleteEventPriorOrdReflectsLatestVersion) {
 }
 
 }  // namespace
+
+// ============================================================================
+// S18-11：merge 广播契约（S18-7 设计 §3.9）——run_merge 直调 + mock 插件。
+// 断言事件序 begin →（每条 live CAS 成功）relocate× N → commit；失败路径
+// begin → abort。run_serialized 先于宿主保存点的 FIFO 由上方
+// RunFnSerializedAtOrdPosition + merge 全系集成测试共同覆盖。
+// ============================================================================
+
+#include "bitcask/data_file.hpp"
+#include "bitcask/keydir.hpp"
+#include "bitcask/merger.hpp"
+
+#include <filesystem>
+
+namespace {
+
+class MergeEventRecorder final : public bp::CaskPlugin {
+public:
+    std::string_view name() const override { return "merge-recorder"; }
+    bp::PluginStatus open(const bp::OpenContext&) override {
+        return bp::PluginStatus::kOk;
+    }
+    std::uint64_t watermark() const override { return 0; }
+    bp::PluginStatus close() override { return bp::PluginStatus::kOk; }
+    void on_put(const bp::PutEvent&, bp::PreparedPtr) override {}
+    void on_delete(const bp::DeleteEvent&) override {}
+    bp::FlushResult flush(const bp::FlushRequest&) override {
+        return {bp::PluginStatus::kOk, 0, 0};
+    }
+    void on_merge_begin(const bp::MergeBeginEvent&) override {
+        events.push_back("begin");
+    }
+    void on_relocate(const bp::RelocateEvent& e) override {
+        events.push_back("relocate:" + std::string(e.key) + "@" +
+                         std::to_string(e.loc.file_id));
+        relocated_file_ids.push_back(e.loc.file_id);
+    }
+    void on_merge_commit(const bp::MergeCommitEvent& e) override {
+        events.push_back("commit");
+        output_ids.assign(e.output_file_ids.begin(),
+                          e.output_file_ids.end());
+    }
+    void on_merge_abort() override { events.push_back("abort"); }
+
+    std::vector<std::string> events;             // merge 线程单线程访问
+    std::vector<std::uint32_t> relocated_file_ids;
+    std::vector<std::uint32_t> output_ids;
+};
+
+}  // namespace
+
+// 契约⑪：merge 事件序 begin → relocate×N → commit；relocate 携带新定位。
+TEST(PluginMergeContract, BeginRelocateCommitOrder) {
+    namespace fs = std::filesystem;
+    const fs::path dir =
+        fs::temp_directory_path() / "bitcask_plugin_merge_contract";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    // 手工构造输入 data 文件 + keydir（3 条 live record）。
+    const std::string data_path =
+        bitcask::fileops::mk_data_filename(dir.string(), 1);
+    bitcask::keydir::KeyDir kd;
+    {
+        auto df = bitcask::fileops::DataFile::open(
+            data_path, bitcask::fileops::DataFile::Mode::kCreate);
+        ASSERT_TRUE(df.has_value());
+        for (int i = 0; i < 3; ++i) {
+            const std::string key = "mk" + std::to_string(i);
+            const std::string val = "value-" + std::to_string(i);
+            auto w = df->write(
+                bitcask::format::RecordType::kDoc,
+                static_cast<std::uint32_t>(1000 + i),
+                static_cast<std::uint64_t>(i),
+                std::as_bytes(std::span<const char>(key.data(), key.size())),
+                std::as_bytes(std::span<const char>(val.data(), val.size())));
+            ASSERT_TRUE(w.has_value());
+            kd.put(key, /*file_id=*/1, w->total_size, w->offset,
+                   static_cast<std::uint32_t>(1000 + i), /*now*/ 0,
+                   /*newest*/ true, 0, 0, static_cast<std::uint64_t>(i));
+        }
+        ASSERT_TRUE(df->sync().has_value());
+    }
+    kd.increment_file_id_at_least(1);
+    kd.mark_ready();
+
+    MergeEventRecorder rec;
+    bitcask::plugin::CaskPlugin* plugs[] = {&rec};
+    const std::string inputs[] = {data_path};
+    auto r = bitcask::merge::run_merge(inputs, dir.string(), kd,
+                                       /*sync*/ false, plugs, /*now*/ 0);
+    ASSERT_TRUE(r.has_value()) << r.error().detail;
+
+    ASSERT_EQ(rec.events.size(), 5u);  // begin + 3×relocate + commit
+    EXPECT_EQ(rec.events.front(), "begin");
+    EXPECT_EQ(rec.events.back(), "commit");
+    for (std::size_t i = 1; i <= 3; ++i) {
+        EXPECT_EQ(rec.events[i].rfind("relocate:", 0), 0u)
+            << "事件序中间必须是 relocate，实际: " << rec.events[i];
+    }
+    // 搬迁定位指向 merge 输出文件（≠ 输入 file_id 1），且 commit 携带之。
+    ASSERT_EQ(rec.output_ids.size(), 1u);
+    EXPECT_EQ(rec.output_ids[0], r->output_file_id);
+    for (auto fid : rec.relocated_file_ids) {
+        EXPECT_EQ(fid, r->output_file_id);
+        EXPECT_NE(fid, 1u);
+    }
+    fs::remove_all(dir);
+}
+
+// 契约⑫：失败路径 begin → abort（不发 relocate/commit）。失败注入：输出
+// 目录不存在 → 输出文件创建失败（缺失输入被 run_merge 宽容为无事可合，
+// 不构成失败）。
+TEST(PluginMergeContract, AbortOnFailure) {
+    namespace fs = std::filesystem;
+    const fs::path dir =
+        fs::temp_directory_path() / "bitcask_plugin_merge_abort";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    const std::string data_path =
+        bitcask::fileops::mk_data_filename(dir.string(), 1);
+    bitcask::keydir::KeyDir kd;
+    {
+        auto df = bitcask::fileops::DataFile::open(
+            data_path, bitcask::fileops::DataFile::Mode::kCreate);
+        ASSERT_TRUE(df.has_value());
+        const std::string key = "mk0";
+        const std::string val = "value-0";
+        auto w = df->write(
+            bitcask::format::RecordType::kDoc, 1000, 0,
+            std::as_bytes(std::span<const char>(key.data(), key.size())),
+            std::as_bytes(std::span<const char>(val.data(), val.size())));
+        ASSERT_TRUE(w.has_value());
+        kd.put(key, 1, w->total_size, w->offset, 1000, 0, true, 0, 0, 0);
+        ASSERT_TRUE(df->sync().has_value());
+    }
+    kd.increment_file_id_at_least(1);
+    kd.mark_ready();
+
+    MergeEventRecorder rec;
+    bitcask::plugin::CaskPlugin* plugs[] = {&rec};
+    const std::string inputs[] = {data_path};
+    const std::string bad_out = (dir / "no_such_subdir" / "x").string();
+    auto r = bitcask::merge::run_merge(inputs, bad_out, kd,
+                                       /*sync*/ false, plugs, /*now*/ 0);
+    EXPECT_FALSE(r.has_value());
+    ASSERT_EQ(rec.events.size(), 2u);
+    EXPECT_EQ(rec.events[0], "begin");
+    EXPECT_EQ(rec.events[1], "abort");
+    fs::remove_all(dir);
+}

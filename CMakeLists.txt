@@ -190,16 +190,20 @@ target_link_libraries(bitcask_keydir
 )
 
 # ---------------------------------------------------------------------------
-# bitcask_index — in-memory Index side tables (vector DB V1, §3.1).
+# bitcask_docmap — DocMap 宿主服务（ord↔ext/live/meta 身份表 + 组件 ckpt）。
+# S18-10：自 bitcask_index 改名（设计 §8/§10-4 终态名）；旧名 ALIAS 兼容
+# 一个版本期，下游链接名平滑迁移。
 # ---------------------------------------------------------------------------
-add_library(bitcask_index STATIC
+add_library(bitcask_docmap STATIC
     src/keydir/index.cpp
+    src/keydir/docmap_ckpt.cpp   # S18-2：docmap 组件 ckpt（宿主侧持久化）
 )
-target_include_directories(bitcask_index PUBLIC include)
-target_link_libraries(bitcask_index
-    PUBLIC  bitcask_text
+target_include_directories(bitcask_docmap PUBLIC include)
+target_link_libraries(bitcask_docmap
+    PUBLIC  bitcask_text bitcask_format   # format：sidecar/组件容器 CRC（S18-2）
     PRIVATE bitcask_warnings bitcask_sanitizers
 )
+add_library(bitcask_index ALIAS bitcask_docmap)  # 兼容别名（P5 撤）
 
 # ---------------------------------------------------------------------------
 # bitcask_plugin_api — KV 存储层插件回调接口（S15 P1，纯头文件、自包含：
@@ -240,16 +244,43 @@ target_link_libraries(bitcask_vector
 # ---------------------------------------------------------------------------
 # bitcask_search — SearchLayer (Index + InvertedIndex + Analyzer wrapper).
 # ---------------------------------------------------------------------------
-add_library(bitcask_search STATIC
+# S18-10（设计 §8 终态）：搜索域拆三目标——TextPlugin（BM25 全家）、
+# VectorPlugin（HNSW）、HybridSearcher（可选融合器）；bitcask_search 退化
+# 为 SearchLayer shim 过渡目标（P5 随 shim 删除）。解锁独立装配：
+# KV+BM25（链 text_plugin，无向量依赖）/ KV+HNSW（链 vector_plugin，
+# 无 jieba/utf8proc——经 bm25 的 DocTable 头只读消费，不链 bitcask_text）。
+add_library(bitcask_text_plugin STATIC
+    src/search/text_plugin.cpp
+    src/search/search_arena.cpp    # S19-1：inter-query Search 池（生产件）
     src/search/search_cache.cpp
-    src/search/search_layer.cpp
     src/search/highlighter.cpp
 )
-target_include_directories(bitcask_search PUBLIC include)
-target_link_libraries(bitcask_search
-    PUBLIC  bitcask_index bitcask_bm25 bitcask_text bitcask_vector
+target_include_directories(bitcask_text_plugin PUBLIC include)
+target_link_libraries(bitcask_text_plugin
+    PUBLIC  bitcask_docmap bitcask_bm25 bitcask_text bitcask_plugin_api
+    PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb  # TBB：search_arena
+)
+
+add_library(bitcask_vector_plugin STATIC
+    src/search/vector_plugin.cpp
+)
+target_include_directories(bitcask_vector_plugin PUBLIC include)
+target_link_libraries(bitcask_vector_plugin
+    PUBLIC  bitcask_vector bitcask_format bitcask_plugin_api
     PRIVATE bitcask_warnings bitcask_sanitizers
 )
+
+add_library(bitcask_hybrid STATIC
+    src/search/hybrid_searcher.cpp
+)
+target_include_directories(bitcask_hybrid PUBLIC include)
+target_link_libraries(bitcask_hybrid
+    PUBLIC  bitcask_text_plugin bitcask_vector_plugin
+    PRIVATE bitcask_warnings bitcask_sanitizers
+)
+
+# S19-3：bitcask_search（SearchLayer shim）已降级为测试夹具——源码移
+# tests/support/，目标定义在 tests/CMakeLists.txt（bitcask_search_shim）。
 
 # ---------------------------------------------------------------------------
 # bitcask_merge — merge 策略 + 执行。
@@ -260,7 +291,7 @@ add_library(bitcask_merge STATIC
 )
 target_include_directories(bitcask_merge PUBLIC include)
 target_link_libraries(bitcask_merge
-    PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_search
+    PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_plugin_api   # S18-7：merge 去搜索化（设计 §8）
     PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
@@ -270,10 +301,11 @@ target_link_libraries(bitcask_merge
 add_library(bitcask_cask STATIC
     src/cask/cask.cpp
     src/cask/meta_file.cpp
+    src/cask/legacy_ckpt.cpp   # S19-2：pre-S17 统一 ckpt 迁移读取器
 )
 target_include_directories(bitcask_cask PUBLIC include)
 target_link_libraries(bitcask_cask
-    PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_merge bitcask_search
+    PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_merge bitcask_hybrid  # S19-2：去 shim 依赖
     PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb
 )
 
@@ -368,7 +400,7 @@ if(BITCASK_PCH)
     set(_bitcask_pch_headers
         <algorithm> <cstdint> <expected> <memory> <optional>
         <span> <string> <string_view> <unordered_map> <vector>)
-    foreach(_t bitcask_cask bitcask_search bitcask_keydir bitcask_bm25 bitcask_text)
+    foreach(_t bitcask_cask bitcask_text_plugin bitcask_keydir bitcask_bm25 bitcask_text)
         target_precompile_headers(${_t} PRIVATE ${_bitcask_pch_headers})
     endforeach()
 endif()
@@ -378,7 +410,11 @@ endif()
 # ---------------------------------------------------------------------------
 
 # libbitcask.so — 共享库, C API (extern "C") 跨 ABI 稳定
-add_library(bitcask_shared SHARED c_api/bitcask_c.cpp)
+add_library(bitcask_shared SHARED
+    c_api/bitcask_kv.cpp     # S19-5：C API 分文件（KV/生命周期/迭代/管理）
+    c_api/bitcask_text.cpp   # S19-5：BM25 文本搜索
+    c_api/bitcask_vec.cpp    # S19-5：向量/混合检索
+)
 target_include_directories(bitcask_shared
     PUBLIC include c_api
     PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")  # 生成的 bitcask_version.h
@@ -413,11 +449,13 @@ add_custom_target(bitcask_static ALL
             $<TARGET_FILE:bitcask_io>
             $<TARGET_FILE:bitcask_fileops>
             $<TARGET_FILE:bitcask_keydir>
-            $<TARGET_FILE:bitcask_index>
+            $<TARGET_FILE:bitcask_docmap>
             $<TARGET_FILE:bitcask_bm25>
             $<TARGET_FILE:bitcask_vector>
             $<TARGET_FILE:bitcask_text>
-            $<TARGET_FILE:bitcask_search>
+            $<TARGET_FILE:bitcask_text_plugin>
+            $<TARGET_FILE:bitcask_vector_plugin>
+            $<TARGET_FILE:bitcask_hybrid>
             $<TARGET_FILE:bitcask_merge>
             $<TARGET_FILE:bitcask_cask>
     DEPENDS bitcask_cask bitcask_text

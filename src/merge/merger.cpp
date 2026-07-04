@@ -9,7 +9,7 @@
 #include "bitcask/data_file.hpp"
 #include "bitcask/format.hpp"
 #include "bitcask/hint_file.hpp"
-#include "bitcask/search_layer.hpp"
+#include "bitcask/plugin_api.hpp"  // S18-7：merge 参与协议（设计 §3.9）
 
 namespace bitcask::merge {
 
@@ -38,9 +38,10 @@ struct PendingUpdate {
 class MergeRunner {
 public:
     MergeRunner(keydir::KeyDir& keydir, bool sync_output,
-                search::SearchLayer* search_layer, std::uint32_t now_sec)
+                std::span<plugin::CaskPlugin* const> plugins,
+                std::uint32_t now_sec)
         : keydir_(keydir), sync_output_(sync_output),
-          search_layer_(search_layer), now_sec_(now_sec) {}
+          plugins_(plugins), now_sec_(now_sec) {}
 
     std::expected<MergeStats, MergeFault>
     run(std::span<const std::string> input_data_paths,
@@ -80,7 +81,10 @@ private:
 
     keydir::KeyDir&            keydir_;
     bool                       sync_output_;
-    search::SearchLayer*       search_layer_;
+    // S18-7：merge 参与插件（设计 §3.9）。首位约定为宿主的 DocmapRelocator
+    //（docmap 恒先于插件收到 relocate），其余按注册序。事件在 merge 线程
+    // 直接派发——实现者自保线程安全（docmap CAS/原子更新即满足）。
+    std::span<plugin::CaskPlugin* const> plugins_;
     std::uint32_t              now_sec_;
 
     MergeStats                                 stats_;
@@ -110,11 +114,15 @@ std::expected<void, MergeFault> MergeRunner::apply_pending() {
                               /*old_offset*/ u.old_offset,
                               /*ord*/ u.ord);
         if (pr == keydir::PutResult::kOk) {
-            if (search_layer_) {
-                search_layer_->on_relocate(u.key, u.ord,
-                                           stats_.output_file_id,
-                                           u.new_offset, u.new_total_size);
-            }
+            // S18-7：搬迁事件广播（原 search_layer_->on_relocate 直调）。
+            // value 视图：分批 apply 时记录缓冲已不在手（S13-P8），传空——
+            // RelocateEvent.value 本就是可选便利（设计 §3.9-5）。
+            const plugin::RelocateEvent ev{
+                u.ord, u.key,
+                plugin::RecordLoc{stats_.output_file_id, u.new_offset,
+                                  u.new_total_size},
+                std::string_view{}};
+            for (auto* p : plugins_) p->on_relocate(ev);
             continue;
         }
         auto cur = keydir_.get(u.key);
@@ -374,10 +382,26 @@ run_merge(std::span<const std::string> input_data_paths,
           std::string_view output_dir,
           keydir::KeyDir& keydir,
           bool sync_output,
-          search::SearchLayer* search_layer,
+          std::span<plugin::CaskPlugin* const> plugins,
           std::uint32_t now_sec) {
-    MergeRunner runner(keydir, sync_output, search_layer, now_sec);
-    return runner.run(input_data_paths, output_dir);
+    MergeRunner runner(keydir, sync_output, plugins, now_sec);
+    // S18-7：merge 生命周期事件（设计 §3.9）——begin 在 fold 前、commit 在
+    // keydir 批量切换完成后、abort 在任何失败路径。插件收尾（GC/rebase）经
+    // host->run_serialized 投递 reducer 静止点，先于宿主随后的成对保存点
+    // RunFn（同队列 FIFO 顺序涌现 = 旧硬编码序）。
+    {
+        const plugin::MergeBeginEvent ev{{}, keydir.peek_next_ord()};
+        for (auto* p : plugins) p->on_merge_begin(ev);
+    }
+    auto result = runner.run(input_data_paths, output_dir);
+    if (result) {
+        const std::uint32_t out_id = result->output_file_id;
+        const plugin::MergeCommitEvent ev{{&out_id, 1}, 0.0};
+        for (auto* p : plugins) p->on_merge_commit(ev);
+    } else {
+        for (auto* p : plugins) p->on_merge_abort();
+    }
+    return result;
 }
 
 }  // namespace bitcask::merge

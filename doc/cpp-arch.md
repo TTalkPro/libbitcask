@@ -1,5 +1,15 @@
 # C++ 架构
 
+> **架构换代（S18/S19，2026-07-04）**：原聚合类 `SearchLayer` 已按插件化
+> 设计（doc/plugin-arch-split-design-zh.md）一分为三——`text::TextPlugin`
+> （BM25 全家）、`vec::VectorPlugin`（HNSW）、`search::HybridSearcher`
+> （RRF 融合），Cask 经 `plugin::CaskPlugin` 接口在写/恢复/merge/checkpoint
+> 四条通路广播；DocMap（`index::Index`）为宿主服务；查询推荐走
+> `text::Searcher`/`vec::Searcher` 门面（searcher.hpp，Cask 的 search_*
+> 门面为兼容薄委托）。本文正文中对 SearchLayer 的既有叙述为历史行文——
+> 其职责按上述归属对号入座（SearchLayer 本体已降级为测试夹具
+> tests/support/）。
+
 本文档介绍 libbitcask 的 C++ 代码库，并说明各层之间如何协同工作。请结合 [`format-zh.md`](format-zh.md)（磁盘格式规范）一起阅读。
 
 ## 模块布局
@@ -92,10 +102,12 @@
 │  │       继承 bm25::LiveChecker；S16-3）                   │
 │  ├─ DataFile 缓存（pread 句柄 + 近似 LRU 淘汰）            │
 │  ├─ HintFile（活跃写入器；含整文件 CRC trailer）           │
-│  ├─ SearchLayer（仅索引模式，借用 DocMap）                 │
-│  │   ├─ InvertedIndex（按字段隔离的 BM25 倒排 + WAL）      │
-│  │   ├─ HnswIndex（单写者 + 多读者无锁发布协议）           │
-│  │   └─ Analyzer（ngram / whitespace / jieba / stemming） │
+│  ├─ plugins_（CaskPlugin 分发表：写/恢复/merge/ckpt 广播）│
+│  │   ├─ TextPlugin "bm25"（倒排/Analyzer/缓存/高亮/组件   │
+│  │   │   ckpt——bm25.ckpt 文件族；S18 拆分）               │
+│  │   └─ VectorPlugin "hnsw"（HNSW/归一化/vec.ckpt 族）     │
+│  ├─ HybridSearcher（RRF 融合器，持两插件引用）             │
+│  ├─ CaskPluginHost（read_at/run_serialized/log）           │
 │  └─ MetaConfig（bitcask.meta 模式 + 向量配置持久化）       │
 └────────────────────────────┬───────────────────────────────┘
                               │

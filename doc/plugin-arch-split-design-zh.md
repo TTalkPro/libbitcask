@@ -565,9 +565,9 @@ bitcask_search       （过渡期兼容 shim，迁移完成后删除）
 |---|---|---|
 | P1 ✅ | `bitcask_plugin_api` 头 + thread_pool 类型擦除（ReduceEntry 去 ReduceJob）；SearchLayer 原样套 adapter 变「唯一插件」 | 低：纯接口化，行为零变——已落地（S15，2026-07-03） |
 | P2 ✅ | DocMap 抽离为宿主服务，SearchLayer 改消费 `const DocTable&`；doc_len 迁 BM25 侧 | 中：动 reduce_apply 内部顺序，需 TSan + 恢复回归——已落地（S16，2026-07-03；含 prior_ord 修正 + doc_len 回填通道 + DocTable 查询面化） |
-| P3 | checkpoint 拆分（manifest + 每组件文件族 + min-水位恢复协议） | **高**：动 S14 全部成果的持久化布局，需 crash_recovery / checkpoint_recovery 全系 + 新增「单组件损坏」注错测试；提供旧 search.ckpt 一次性迁移器 |
-| P4 | SearchLayer 拆 TextPlugin/VectorPlugin，hybrid 上移；merge/恢复改插件广播 | 中：大搬家但 P1-P3 已备好落点 |
-| P5 | Cask 门面瘦身、C API 分文件、配置拆分、删 shim、文档（cpp-arch.md 分层图更新） | 低 |
+| P3 ✅ | checkpoint 拆分（manifest + 每组件文件族 + min-水位恢复协议） | **高**——已落地（S17，2026-07-03；含单组件注错测试与旧 search.ckpt 一次性迁移器） |
+| P4 ✅ | SearchLayer 拆 TextPlugin/VectorPlugin，hybrid 上移；merge/恢复改插件广播 | 中——已落地（S18，2026-07-04；11 子任务，归一化改同步调用等偏离见 TASK.md S18 批次头） |
+| P5 ✅ | Cask 门面瘦身、C API 分文件、配置拆分、删 shim、文档 | 低——已落地（S19，2026-07-04；门面取薄委托温和版 + Searcher 门面，shim 降级测试夹具，配置换代留待第三方插件需求） |
 
 P3 是唯一真正的高风险阶段，建议单独成批次（S15-x），
 且 P1/P2/P4/P5 均不依赖 P3 的文件布局——若 P3 评审不过，

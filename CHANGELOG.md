@@ -12,6 +12,51 @@
 
 ## [Unreleased]
 
+### Changed（S19：插件化架构 P5 — 门面收编与 shim 退役，2026-07-04）
+
+- **查询门面换代**：新增 `bitcask/searcher.hpp`——`text::Searcher` /
+  `vec::Searcher` / `search::CaskHybridSearcher` 类型化查询门面（查询前
+  自动 `Cask::drain_plugins()` 读屏障）；`Cask::search_*` 保留为兼容薄
+  委托（直调插件内核）。`Cask::search()` 访问器删除（改插件句柄
+  `text_plugin()/vector_plugin()/hybrid_searcher()`）。
+- **SearchLayer shim 退役**：产品库零 SearchLayer 符号——shim 整体降级为
+  测试夹具（tests/support/，include 名不变，测试零 diff）；
+  `SearchLayerConfig` 迁 `bitcask/search_config.hpp`（公开配置面不变）；
+  pre-S17 统一 search.ckpt 迁移经新 `legacy_ckpt` load-only 模块保活。
+- **C API 分文件**：`bitcask_kv.h`/`bitcask_text.h`/`bitcask_vec.h` +
+  `bitcask_c.h` 聚合（符号/签名/ABI 逐一致）；实现拆三 TU + internal.h。
+- **Removed**：`SearchLayerConfig::wal_batch_size`（dead config，从未接线）
+  及其伪基准 BM_Put_WalBatch。
+
+### Changed（S18：插件化架构 P4 — SearchLayer 拆分，2026-07-04）
+
+- **SearchLayer 一分为三**：`text::TextPlugin`（BM25 全家：倒排/analyzer/
+  查询缓存/高亮/同义词/bm25 组件 ckpt）、`vec::VectorPlugin`（HNSW/写入端
+  归一化/vec 组件 ckpt 含侧车）、`search::HybridSearcher`（RRF 融合器）。
+  SearchLayer 退化为兼容 shim（公共 API 面不变，P5 删除）。
+- **四条通路全部经 CaskPlugin 广播**：写路径（prepare/on_put/on_delete，
+  S15 起）+ checkpoint（flush/open 自治，base/delta 决策下沉每插件——
+  rebuild_hnsw 只 rebase vec 链）+ merge（`run_merge` 收
+  `span<CaskPlugin*>`，begin/relocate/commit/abort，收尾经
+  `host->run_serialized` FIFO）+ 恢复（fold 重放批内并行 prepare +
+  `PutEvent::replay`）。
+- **docmap 持久化归宿主**：`index::Index` 自记账（脏位/删除日志门限）+
+  `docmap_ckpt` 模块（base/delta/load 宿主直驱）；`DocLenWriter`/
+  `CompactionStats` 窄接口注入（不给插件 Index&）。
+- **CMake 目标终态**：新增 `bitcask_text_plugin` / `bitcask_vector_plugin` /
+  `bitcask_hybrid`；`bitcask_index` 改名 `bitcask_docmap`（旧名 ALIAS 兼容
+  一个版本期）；`bitcask_merge` 依赖降为 `bitcask_plugin_api`。依赖隔离：
+  vector_plugin 不链 jieba/text，text_plugin 不链 HNSW。
+- 磁盘格式与 C API 签名全程不变（P4 只移交持久化发起权）。
+
+### Fixed（S18）
+
+- **S17 回归：delta 日志门限失效**——per-component 路径不更新 legacy 链
+  水位（门恒 0），fold 重叠区旧墓碑误入删除日志，重放时误杀上一代 base
+  里的复活文档（S18-1，回归测试锁定）。
+- `SearchLayerConfig::wal_batch_size` 坐实为 dead config（从未接线
+  `enable_wal`），迁 `TextPluginConfig` 标 deprecated（P5 决）。
+
 S13 四维审查（内存/并发/性能/功能）首批修复。
 
 ### Fixed（并发正确性）

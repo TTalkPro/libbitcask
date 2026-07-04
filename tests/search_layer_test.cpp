@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "bitcask/search_layer.hpp"
+#include "bitcask/docmap_ckpt.hpp"  // S18-2：docmap 组件门限测试
 
 using namespace bitcask::search;
 
@@ -832,4 +833,90 @@ TEST(SearchLayer, NoAutoCompactWhenDisabledButSearchCorrect) {
     auto res = layer.search_text("hello", 100);
     ASSERT_TRUE(res.has_value());
     EXPECT_EQ(res->size(), static_cast<std::size_t>(K));
+}
+
+// ---- S18-1：per-component 链水位入账门 ----
+
+// S17 回归修复的护栏：fold 重叠区的旧墓碑不得进删除日志（S18-2 起日志由
+// Index::remove 自记账，门限 = delta 窗口水位；持久化经宿主侧 docmap_ckpt）。
+// 场景：k 在链窗口内经历 put(3)→tomb(4)→put(6) 复活，base(wm=7) 已含 k@6；
+// 重叠区重放 tomb(4) 若被误入账（门恒 0），下一条 docmap delta 会携带
+// (k,4)，重放时 plain remove 误杀上一代 base 里的 k@6（交错保护只覆盖同
+// 文件内的删后重写）。修复后门读窗口水位，4 < 7 → 跳过入账，k 存活。
+TEST(SearchLayer, S18StaleTombstoneNotReloggedAfterBase) {
+    namespace fs = std::filesystem;
+    const fs::path dir =
+        fs::temp_directory_path() / "bitcask_s18_gate_docmap";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    auto config = default_config();
+    {
+        SearchLayer a(config);
+        a.recover_doc("k", 3, "hello world", 1, 100, 50, 1000);
+        a.recover_tomb("k", 4);
+        a.recover_doc("k", 6, "hello again", 1, 200, 50, 1001);
+        ASSERT_TRUE(bitcask::index::save_docmap_base(a.index(), dir.string(),
+                                                     /*watermark=*/7));
+
+        // 模拟 fold 重叠区重放（keydir 字节水位落后于组件链水位）：
+        // 旧墓碑 + 复活行按原序重现。
+        a.recover_tomb("k", 4);
+        a.recover_doc("k", 6, "hello again", 1, 200, 50, 1001);
+        // 链窗口内的新写入（否则 docmap delta 无行可写）。
+        a.recover_doc("m", 8, "more text", 1, 300, 50, 1002);
+
+        ASSERT_TRUE(bitcask::index::save_docmap_delta(
+            a.index(), dir.string(), /*watermark=*/9, /*base_gen=*/7,
+            /*from=*/7, /*seq=*/1, {}));
+        ASSERT_TRUE(fs::exists(dir / "docmap.ckpt.d1"));
+    }
+
+    SearchLayer b(default_config());
+    auto lr = bitcask::index::load_docmap(b.index(), dir.string(),
+                                          /*expected_base_wm=*/7,
+                                          /*chain_seq=*/1, {});
+    ASSERT_TRUE(lr.loaded);
+    EXPECT_TRUE(lr.all_segments_ok);
+    // 修复前：delta 携带 stale removal (k,4) → k@6 被误杀。
+    EXPECT_TRUE(b.index().get("k").has_value());
+    EXPECT_TRUE(b.index().get("m").has_value());
+    fs::remove_all(dir);
+}
+
+// vec 组件门：base 覆盖区内的重放插入不入 delta_vecs_——链无新内容时
+// save_components_delta 跳过 vec 组件（不产 .d 文件）。
+TEST(SearchLayer, S18VecGateSkipsChainCoveredInserts) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "bitcask_s18_gate_vec";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    auto config = default_config();
+    config.vector_dim = 4;
+    config.vector_metric = bitcask::meta::VectorMetric::kDot;
+    SearchLayer a(config);
+
+    const std::vector<float> v{1.0F, 0.0F, 0.0F, 0.0F};
+    a.recover_doc("k0", 0, "t0", 1, 100, 50, 1000, v);
+    a.recover_doc("k1", 1, "t1", 1, 200, 50, 1000, v);
+    a.recover_doc("k2", 2, "t2", 1, 300, 50, 1000, v);
+    auto base = a.save_components_base(dir.string(), /*watermark=*/3,
+                                       {true, true, true});
+    ASSERT_TRUE(base.wrote_base[2]);
+
+    // 重叠区重放：ord 1 已被 vec 链覆盖 → 不入插入日志。
+    a.on_vector(1, v);
+    auto d1 = a.save_components_delta(dir.string(), /*watermark=*/5,
+                                      {false, false, true}, {});
+    EXPECT_FALSE(d1.wrote[2]);  // 空日志 → 跳过写入
+    EXPECT_FALSE(fs::exists(dir / "vec.ckpt.d1"));
+
+    // 链水位之上的新插入正常入账。
+    a.on_vector(4, v);
+    auto d2 = a.save_components_delta(dir.string(), /*watermark=*/5,
+                                      {false, false, true}, {});
+    EXPECT_TRUE(d2.wrote[2]);
+    EXPECT_TRUE(fs::exists(dir / "vec.ckpt.d1"));
+    fs::remove_all(dir);
 }

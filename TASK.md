@@ -2208,3 +2208,353 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > **建议执行顺序**：S17-1（格式基础）→ S17-2（拆 save）→ S17-3（commit
 > 接线）→ S17-4（recovery）→ S17-5（迁移）→ S17-7（侧车）→ S17-6（崩溃测试）。
 > S17-2 + S17-3 + S17-4 是实质重头（动 save/load 全路径）；S17-6 依赖前 5 项。
+
+---
+
+## 第十八梯队 S18：P4 — SearchLayer 拆 TextPlugin / VectorPlugin（2026-07-04）
+
+> 来源：`doc/plugin-arch-split-design-zh.md` §6/§7/§9 P4。P1-P3 已备好全部落点
+> （plugin_api 接口 / DocMap 宿主服务 + DocTable / per-component ckpt + manifest）。
+> 目标：SearchLayer 一分为三——TextPlugin（BM25）/ VectorPlugin（HNSW）/
+> HybridSearcher（RRF 门面）；merge/恢复/checkpoint 改插件广播；CMake 目标拆分。
+> P5（后续批）做 Cask 门面迁出、C API 分文件、配置公开面换代、删 shim。
+>
+> **开工侦查修正（2026-07-04，对设计稿的两点偏离）**：
+> - ① **归一化不可异步下沉**：cask.cpp `prepare_vector` 的归一化结果编码进
+>   data file（V3.1「存储即归一化」），校验错误同步返回 put 调用方——设计 §6
+>   「归一化作 VectorPlugin::prepare()（异步 map 相）」不可行。修正：函数搬
+>   VectorPlugin（领域逻辑回家），Cask put 路径**同步**调用（Cask 是装配方，
+>   认识具体插件对象；错误契约与磁盘语义不变）。
+> - ② **wal_batch_size 是 dead config**：SearchLayer 从不调 InvertedIndex::
+>   enable_wal（全仓调用点只在测试）。决定（用户拍板）：迁 TextPluginConfig
+>   标 deprecated，真接线 or 删留 P5。
+>
+> **既定决策**：SearchLayer 保留为兼容 shim（85 处测试引用 + Cask 13 门面
+> 零修改，P5 删）；doc_len 写通道 = 新 `bm25::DocLenWriter` 窄接口构造注入
+> （不进 PluginHost、不给 Index&，保 S16-3 只读纪律）；`delta_removals_` 归
+> Index 自记账（三条异构 remove 路径免同步改造）；恢复广播保 S3 并行
+> （宿主攒批 + parallel_for prepare + fold 序串行 on_put + `PutEvent::replay`
+> 标志）；merge 收尾 P4 保持无条件提交（dead_ratio 决策迁插件留 P5）；
+> `bitcask_index`→`bitcask_docmap` 改名配 ALIAS（用户拍板）。
+>
+> **硬约束（每步验收）**：reducer 单写者/ord 序/LWW/S14 delta 链/S17 manifest
+> commit 协议不破坏；**磁盘格式逐字节不变**（P4 只移交 save/load 发起权，
+> 脚本化场景新旧 ckpt 对拍）；C API 签名不变；put_doc bench 回退 ≤3%
+> （S18-5 检查点）；每子任务全量 ctest + TSan 全绿才进下一项。
+
+- [x] **S18-1【P0·S】链水位一分为三 + DocLenWriter 窄接口** — 已完成（2026-07-04）
+  - 窗口日志入账门从共享 `ckpt_chain_wm_` 改 per-component：`delta_vecs_`
+    用 `comp_chain_wm_[kVec]`，`delta_removals_`（on_delete/recover_tomb）用
+    `comp_chain_wm_[kDocmap]`；`save_components_delta` 日志清理按组件独立
+    （写成功才清各自日志）；base 落成同样按组件清日志（链坍缩，静止点
+    所有入账 ord < watermark）；legacy save/load 三处四水位联动置同值。
+  - 新 `bm25::DocLenWriter` 窄接口（doc_table.hpp），`index::Index` 多继承
+    实现（set_doc_len 补 override）；SearchLayer 增 `doc_len_writer_` 引用
+    成员（现绑 index_，S18-4 起 TextPlugin 构造注入），apply_text/
+    reduce_apply 改经窄接口回填。
+  - **后注（2026-07-04 收官核对）**：本条的门限载体与回填成员均已随后续
+    迁移易主——删除日志门限 → Index::delta_window_wm_（S18-2 自记账）、
+    向量日志门限 → VectorPlugin::delta_window_wm_（S18-3）、comp_* 数组
+    删除（S18-4）、SearchLayer 的 doc_len_writer_ 死成员移除（收官核对）。
+    本条保留为 S18-1 时点的落地记录。
+  - **顺手修复 S17 真实回归**：per-component 路径从不更新 legacy
+    `ckpt_chain_wm_`（恒 0）→ 三个入账门失效——fold 重叠区旧墓碑全部误入
+    delta_removals_，下一条 docmap delta 重放时 plain remove（无 ord 守卫，
+    交错保护只覆盖同文件）**误杀上一代 base 里的复活文档**。新增回归测试
+    `S18StaleTombstoneNotReloggedAfterBase`（已验证：门回退旧行为则转红）
+    + `S18VecGateSkipsChainCoveredInserts`（重叠区向量不入日志 → 空链跳写）。
+  - 验收：Debug 全量 **536/536**；TSan（search_layer/checkpoint_recovery/
+    crash_recovery 67 例）零 race。
+
+- [x] **S18-2【P0·M】docmap 持久化发起权上移宿主** — 已完成（2026-07-04）
+  - `serialize_docmap`/`deserialize_docmap` 下沉 `index::Index`（SearchLayer
+    留转发壳）；删除日志 + 脏位改 **Index 自记账**：`remove` 在 tomb_ord ≥
+    delta 窗口水位时内部入账（found-check 前，保 keydir 半边重放语义）、
+    `put_doc/set_doc_len/set_meta/compact_chunks` 自置脏；新 API
+    `begin_delta_window`/`removals_snapshot`/`clear_removals`/`dirty`/
+    `clear_dirty`。三条异构 remove 路径（流水线宿主 remove/legacy 2 参
+    on_delete/recover_tomb）免同步改造。
+  - 新 `include/bitcask/docmap_ckpt.hpp` + `src/keydir/docmap_ckpt.cpp`
+    （bitcask_index 目标）：`save_docmap_base/save_docmap_delta/load_docmap`
+    ——docmap 组件文件族（base+.prev+.d 链+内联 kKeydirDelta）宿主直驱，
+    格式逐字节不变；`DocmapReplayHook`（index:: 类型）收归宿主。
+  - Cask：`save_checkpoint_paired` base/delta 双路径 + `load_recovery_
+    snapshots` + `migrate_legacy_search_ckpt` 改宿主直驱 docmap；新增
+    `docmap_chain_` 链镜像成员（组件写成功即推进，独立于 manifest commit
+    成败——防 manifest 写失败重试时丢已清空的删除日志）。SearchLayer 的
+    `save_components_*`/`load_component` 收缩为 bm25+vec（ci=0 跳过）。
+  - 验收：Debug 全量 **536/536**；TSan（SearchLayer/Checkpoint/Crash/
+    CaskDocValue/PluginContract 154 例）零 race；S18 门限测试改写为宿主侧
+    `docmap_ckpt` API 后仍绿（误杀护栏语义不变）。
+
+- [x] **S18-3【P0·M】VectorPlugin 抽出（小而内聚先行）** — 已完成（2026-07-04）
+  - 新 `include/bitcask/vector_plugin.hpp` + `src/search/vector_plugin.cpp`
+    （暂挂 bitcask_search，目标拆分留 S18-10）：搬入 hnsw_/delta_vecs_/
+    dirty_hnsw_/kVec 链槽/on_vector→insert/search_vector→search/
+    rebuild_hnsw→rebuild/vec 组件 save-load（含 .vec/.qc8 侧车 + 链走读）/
+    SIMD 归一化内核。注入 `VectorPluginConfig{dim,metric,m,ef,int8}` +
+    `const DocTable&`；自持链状态与入账窗口（S18-1 门限语义随迁）。
+  - `Cask::prepare_vector` 领域核心下沉 `VectorPlugin::normalize_for_write`
+    （**同步调用**——V3.1「存储即归一化」+ put 同步错误契约不变，错误消息
+    逐字保留经 Cask 翻译 CaskFault）。
+  - 新 `include/bitcask/search_types.hpp`：SearchHit/SearchError 自
+    search_layer.hpp 抽出共享（插件头不反向依赖）。
+  - SearchLayer 变持有成员 + 全量委托（legacy 统一 ckpt 路径经
+    graph()/serialize_delta_log/apply_delta_log/load_graph_section 原语）；
+    set/get_component_state(kVec) 转发插件。
+  - **实现期修正**：脏位语义必须镜像旧「save 时无条件清」——dim=0 base
+    与空日志 delta 的跳写路径也要清 dirty，否则 vec 恒脏使 any_dirty 永真，
+    静止后收尾 ckpt 永走 delta、bm25.ckpt base 永不落盘
+    （CheckpointConcurrentWithWrites 抓出）。
+  - 验收：Debug 全量 **536/536**（既有测试零修改）；TSan 166 例零 race。
+
+- [x] **S18-4【P0·L】TextPlugin 抽出，SearchLayer 变纯 shim（本批最大搬迁）** — 已完成（2026-07-04）
+  - 新 `text_plugin.hpp/cpp`（~1100 行，暂挂 bitcask_search）：搬入 fields_/
+    analyzer_/ord_field_lens_/field_names_intern_/doc_texts_(DocTextLru)/
+    synonym_map_/cache_/map_analyze/apply_job（reduce BM25 相）/apply_text/
+    on_delete BM25 扣减半边/compact/rebuild_index（emit 回调形态，docmap
+    遍历+磁盘读回留宿主）/maybe_auto_compact/bm25 组件 save-load + legacy
+    容器原语（serialize/deserialize/apply_delta × default/fields +
+    truncate_wal）/全部文本查询面。注入 `TextPluginConfig` +
+    `const DocTable&` + `DocLenWriter&` + **`CompactionStats&`**（新窄接口，
+    doc_table.hpp——S12-2 节流统计不给 Index&）。
+  - reduce_apply 三域融合解体：shim 的 reduce_apply := text_.apply_job(job) +
+    vec_.insert(ord,vec)。`SearchLayerConfig::text_config()/vector_config()`
+    （= 计划的 split()）产两插件配置；wal_batch_size 迁 TextPluginConfig
+    标 deprecated。kDefaultField/ReduceJob/SearchHitEx 迁 search_types.hpp。
+    legacy 统一 ckpt 与 per-component 调度壳全部改经插件原语；comp_* 链
+    状态数组删除（各归持有方）。
+  - **计划偏差（核实后）**：「cache 失效修复」无需行为变化——S13-P1 的
+    选择性失效已实质解决 §2.2-5 伪共享（向量-only 文档词集空 →
+    invalidate_terms 空集 no-op）；S18-4 使之结构化（向量写不进 TextPlugin）。
+  - 验收：Debug 全量 **536/536**（search_layer_test 等既有测试零修改）；
+    TSan（含 text 域 Synonym/Highlighter/Wildcard/Fuzzy 共 190 例）零 race。
+
+- [x] **S18-5【P0·S】写路径直连双插件、adapter 退役、PluginHost 落地** — 已完成（2026-07-04）
+  - TextPlugin（name="bm25"）/VectorPlugin（name="hnsw"）直接实现
+    CaskPlugin：adapter 路由语义逐条移入（doc==nullptr 时 text:=value、
+    多字段走 prepare（TextPrepared 携 ReduceJob）、单文本 reducer 内分析、
+    kNoPriorOrd 守卫；vec on_put 直插 doc->vec，on_delete no-op——软删经
+    is_live）；open/close/watermark/flush 暂 stub（S18-6 实装）。
+  - `plugins_ = {&text_plugin(), &vector_plugin()}`（注册序 = 原 reduce_apply
+    内 add_doc→on_vector 顺序）；**删 search_plugin_adapter.hpp**；Cask 新增
+    嵌套 `CaskPluginHost`（read_at→read_file+DataFile::read、
+    run_serialized→RunFn 提交、log→log_warn/error），S18-6 经 OpenContext
+    注入。
+  - 验收：Debug 全量 **536/536**；TSan 158 例零 race；**put_doc bench 护栏
+    通过**：C API 端到端 200k docs ABBA×3（vs S17 基线 cecafde worktree
+    重建 so）——当前 ≈38.3k vs 基线 ≈38.5k docs/s（**−0.5%**，≤3%）；
+    池级 SubmitDrain 3.82M/s（基线 3.59M/s）。
+
+- [x] **S18-6【P0·M】checkpoint flush/open 接线** — 已完成（2026-07-04）
+  - 两插件实装 flush/open/watermark：`FlushRequest` 增 `watermark` 字段
+    （宿主提交时刻捕获的全局 ord 上界）；`OpenContext` 增 committed 三元组
+    提示（base_wm/chain_wm/chain_seq，通用字段）。**base/delta 决策下沉**：
+    force_rebase ‖ 插件自身 rebase 标志（compact/rebuild_index/rebuild 置位）
+    ‖ 自身链长上限（max_delta_chain 每插件化）→ base；否则脏才 delta——
+    旧「全体 base or 全体 delta」放宽为 per-component（rebase 解耦红利：
+    rebuild_hnsw 只 rebase vec 链）。
+  - `save_checkpoint_paired`：宿主 docmap（自决策 + keydir 快照与 docmap
+    base 成对）→ 逐插件 flush（covered_ord==wm 才推进 manifest 项，链状态
+    经 get_component_state 回读）→ manifest commit。`load_recovery_snapshots`：
+    open_plugins 注入器（**全部路径**——含 manifest 缺失/迁移失败早退，
+    零提示 = 插件降级自建；修「新库不 open → dir_ 空 → flush 写错目录」）；
+    健康判据 = watermark() == manifest chain_watermark；全健康才清 legacy
+    全局 rebase。base 轮落成清全局 rebase（修「新流程不再经
+    save_components_base → 标志永不清 → 恒 base 不走 delta」）。
+  - 验收：格式不变；Debug 全量 **536/536**（含 S17 注错/legacy 迁移/
+    VecPayloadAppends 链行为）；TSan 154 例零 race。
+
+- [x] **S18-7【P0·M】merge 广播接线** — 已完成（2026-07-04）
+  - `run_merge` 签名 SearchLayer* → `std::span<plugin::CaskPlugin* const>`；
+    wrapper 派发 begin → apply_pending 内逐条 on_relocate（value 传空——
+    分批 apply 时缓冲已不在手，本就是可选便利）→ commit/abort。Cask 内部
+    `DocmapRelocator`（不入注册表，置 span 首位，= 原 SearchLayer::
+    on_relocate 语义）。`bitcask_merge` PUBLIC 依赖降 plugin_api。
+  - merge 收尾硬编码解体：TextPlugin::on_merge_commit →
+    run_serialized([compact(0.2)])、VectorPlugin → run_serialized([rebuild])
+    ——FIFO 先于宿主成对保存点（顺序涌现 = 旧硬编码序）。**修正**：
+    compact_index_chunks 属 docmap（宿主服务，S16 后），归宿主保存点 RunFn
+    而非 TextPlugin（设计 §3.9-4 的映射按 P2 现实修订）；merge 恒 rebase
+    改在宿主保存点 RunFn 显式 force（原经 compact shim 顺带置位）。
+  - plugin_contract 的 merge 广播专项契约延至 S18-11 收口（顺序/abort/FIFO
+    当前由 merge 全系集成测试隐式覆盖）。
+  - 验收：Debug 全量 **536/536**；TSan（含 merge_concurrent_writer——merge
+    线程广播 vs reducer 本批头号场景）163 例零 race。
+
+- [x] **S18-8【P0·M】恢复广播接线** — 已完成（2026-07-04）
+  - fold 重放改插件广播：活记录 → 宿主 put_doc（doc_len=0 占位，S16-2
+    同构）+ 按注册序 on_put 广播；幂等靠既有水位自门（InvertedIndex::
+    add_doc / HnswIndex::insert / docmap LWW——S15-1 接口义务的落地形态）。
+    **保 S3 并行**：ReplayDoc 攒批（1024）→ 批内视图物化（FieldKV/DocView/
+    PutEvent，容器预 size 保地址稳定）→ tbb::parallel_for 并行 prepare →
+    fold 序串行 on_put。`PutEvent` 增 `replay` 字段：TextPlugin::prepare
+    在 replay 且单文本时走 kDefaultField 包装分析（镜像原 recover_doc），
+    活路径路由不动；on_put 改「有 prep 即 apply_job」三段式。
+  - **计划偏差（保历史语义）**：墓碑重放**不广播 on_delete**——原
+    recover_tomb 从不扣减倒排统计（统计基线随 ckpt 恢复，重放墓碑只翻
+    live），改为宿主 `docmap_->remove`（Index 自记账门限日志）。恢复起点
+    仍走 S17-4 字节水位 + 自门（min-wm 分段 fold = §10-1 followup 不变）。
+  - recover_doc/recover_doc_batch/recover_tomb 在 Cask 路径下架（SearchLayer
+    shim 保留供 standalone 测试）；**修 upgrade 路径**：手工装配不经
+    create_search_infra → plugins_ 空 → 重放喂空表（UpgradeKVToIndex 抓出），
+    补插件注册。
+  - 验收：Debug 全量 **536/536**（crash_recovery 全系对拍）；TSan（并行
+    prepare vs 串行 apply）163 例零 race。
+
+- [x] **S18-9【P1·S】HybridSearcher 上移** — 已完成（2026-07-04）
+  - 新 `hybrid_searcher.hpp/cpp`：`HybridSearcher{const TextPlugin&,
+    const VectorPlugin&}`，RRF（K'=max(4k,64)/RRF(60)/ord 决胜）逐行平移；
+    SearchLayer 增 `hybrid_` 成员并委托（Cask 门面经 shim 路由不变，P5
+    迁出）。零行为变化：Debug 全量 536/536。
+
+- [x] **S18-10【P1·M】CMake 目标拆分 + bitcask_docmap 改名** — 已完成（2026-07-04）
+  - 新目标（设计 §8 终态）：`bitcask_text_plugin`（text_plugin+highlighter+
+    search_cache → docmap/bm25/text/plugin_api）、`bitcask_vector_plugin`
+    （→ vector/format/plugin_api，**不链 bitcask_text**——DocTable 头只读
+    消费）、`bitcask_hybrid`（→ 两插件）；`bitcask_search` 退化 shim（仅
+    search_layer.cpp，P5 删）；`bitcask_merge` 已去 search（S18-7）；
+    `bitcask_cask` P4 期仍链 search（门面在，P5 摘）。
+  - `bitcask_index` → `bitcask_docmap` 改名 + 旧名 ALIAS（tests/bench 的
+    既有引用经别名零改动）；静态聚合脚本目标清单同步。
+  - 验收：全量 **536/536** + TSan 149 例零 race；**依赖隔离实证**（nm -u）：
+    libbitcask_vector_plugin.a 零 jieba/analyzer/nfkc 符号、
+    libbitcask_text_plugin.a 零 Hnsw 符号——KV+BM25 / KV+HNSW 独立装配
+    的链接基础就位（Cask 门面级 KV-only 摘除属 P5）。
+
+- [x] **S18-11【P1·M】插件级测试套与契约收官** — 已完成（2026-07-04）
+  - 新 `text_plugin_test`（3 例：FlushOpenRoundTrip / ReplayPrepareRouting /
+    FlushDeltaThenForcedBase）+ `vector_plugin_test`（3 例：归一化错误契约
+    逐字断言 / InsertFlushOpenRoundTrip 含侧车 / 重放幂等）——只链各自插件
+    目标（依赖隔离在测试链接层再次验证）。
+  - plugin_contract 补 **merge 广播契约**（S18-7 欠账）：契约⑪
+    BeginRelocateCommitOrder（手工构造 data 文件 + KeyDir + run_merge 直调
+    mock 插件——begin→relocate×3→commit 序 + 搬迁定位/输出 id 断言）、
+    契约⑫ AbortOnFailure（输出目录注错 → begin→abort；缺失输入被宽容为
+    无事可合，不构成失败——实现期侦查坐实）。
+  - search_layer_test 不迁（shim 兜住，P5 处理）；CHANGELOG/TASK.md 收口。
+  - 验收：Debug 全量 **544/544**（536 + 8 新）；TSan 145 例零 race。
+
+> **S18 批次收官（2026-07-04）**：P4 全部 11 项落地。SearchLayer 一分为三
+> （TextPlugin ~1170 行 / VectorPlugin ~600 行 / HybridSearcher + shim
+> ~1130 行——shim 体量大半是 legacy 统一 search.ckpt 容器，随 P5 收编后
+> 才真正缩壳），写/恢复/merge/
+> checkpoint 四条通路全部经 CaskPlugin 广播；docmap 持久化归宿主；CMake
+> 五目标终态（text_plugin/vector_plugin/hybrid/search-shim/docmap+ALIAS）。
+> 顺手修复：S17 门限失效回归（stale 墓碑误杀复活文档，S18-1）。
+> put_doc 端到端 bench −0.5%（≤3% 护栏）。后续：P5（Cask 门面迁出、
+> C API 分文件、配置公开面换代、删 shim、legacy 统一 ckpt 收编）。
+
+> **执行顺序**：S18-1 → S18-2 → S18-3 → S18-4 → S18-5 → S18-6 →
+> {S18-7, S18-8}（S18-9 可与 6-8 并行）→ S18-10 → S18-11。
+> 排序理由：1/2 先解「共享水位门」「delta_removals_ 错位」两耦合点（否则
+> 3/4 把耦合搬进插件再拆一次）；VectorPlugin 先行验证组件自治形状；
+> flush/open（6）先于 merge/恢复广播（7/8）——后者消费插件自治持久化状态。
+> **TSan 重点**：① merge 线程回调 vs reducer；② run_serialized/保存点 FIFO；
+> ③ 查询 vs reducer 写；④ 恢复期并行 prepare；⑤ close vs 在途查询。
+
+
+---
+
+## 第十九梯队 S19：P5 — 门面收编、删 shim、C API 分文件、文档换代（2026-07-04）
+
+> 来源：`doc/plugin-arch-split-design-zh.md` §7/§9 P5（收尾批，低风险）。
+> S18 后 SearchLayer 为纯委托 shim（hpp 581 + cpp 1137 行，~600 行是
+> legacy 统一 search.ckpt 容器）；cask.cpp 对 shim 28 处 `search_->`。
+>
+> **批次决策（2026-07-04，规划时用户未响应按推荐默认）**：
+> - **门面迁出取温和版**：新增 `text::Searcher`/`vec::Searcher` 门面 +
+>   `drain_plugins()`；Cask 13 个 search_* 降为薄委托直调插件（不经 shim）
+>   标 deprecated——源兼容保留（~200 处 facade 调用不动），彻底迁出留下个
+>   major。
+> - **配置面不换代**：`CaskOptions::search_config` 保留（`CaskOptions::
+>   plugins` 需两阶段插件构造——构造只收 config、宿主服务经 OpenContext
+>   注入——留待真有第三方插件需求）。
+> - **wal_batch_size 删字段**（dead config 从未生效；InvertedWal 机制保留）。
+> - `bitcask_index` ALIAS 保留（S18-10 承诺兼容一个版本期）。
+>
+> **核心策略：shim 整体降级为测试夹具**——search_layer.{hpp,cpp} 移入
+> tests/support/（类名/方法不变），5 个测试文件 65 个构造点零 diff；legacy
+> 统一 ckpt 的 save 半边随之变迁移测试夹具（生成 pre-S17 格式文件），load
+> 半边收编为生产 `legacy_ckpt.cpp`（migrate 依赖，插件原语组合重写）。
+
+- [x] **S19-1【P0·M】Searcher 门面 + drain_plugins + Cask 查询薄委托直连** — 已完成（2026-07-04）
+  - 新 `include/bitcask/searcher.hpp`（header-only）：`text::Searcher`
+    （文本查询全家 + 批量）、`vec::Searcher`（向量 + 批量）、
+    `search::CaskHybridSearcher`（RRF），查询前 `cask.drain_plugins()` 读
+    屏障，错误经 `Cask::search_error_fault` 共享翻译。
+  - Cask 公开 `drain_plugins()` + `text_plugin()/vector_plugin()/
+    hybrid_searcher()` 访问器（未启用搜索 = nullptr）；13 个 search_* 内核
+    改直调插件/融合器（跳过 shim 查询委托层），`search()` 访问器标
+    deprecated。**顺手**：`parallel_for_queries`/`search_arena` 抽出为
+    `search_arena.{hpp,cpp}`（挂 bitcask_text_plugin——shim 降级后仍是
+    生产件，S19-3 前置）。
+  - 验收：Debug 全量 **545/545**（+1 门面等价测试 SearcherFacade.
+    MatchesCaskFacade：text/vector/hybrid/批量四路逐 hit 对比）。
+
+- [x] **S19-2【P0·L】Cask 去 shim：直持插件 + legacy load 收编** — 已完成（2026-07-04）
+  - Cask 成员 `unique_ptr<SearchLayer>` → 直持 `unique_ptr<TextPlugin>` +
+    `unique_ptr<VectorPlugin>` + `optional<HybridSearcher>`；
+    `SearchLayerConfig` 移入新 `include/bitcask/search_config.hpp`
+    （公开配置面不变）；cask.hpp 删 search_layer include。
+  - 28 处 `search_->` 改直调（查询 13 → 插件/hybrid；ckpt 7 → dirty_mask
+    组装/双插件 rebase + Cask 自持 legacy 全局 rebase 标志/chain_state；
+    状态 3；setup 4；归一化 1）。
+  - `migrate_legacy_search_ckpt` 改用新 `src/cask/legacy_ckpt.cpp`
+    （load-only：容器段分发 → Index::deserialize_docmap /
+    TextPlugin::deserialize_* / VectorPlugin::load_graph_section + .d 链
+    重放喂 apply 原语 + DocmapReplayHook——自 shim 平移改造）。
+  - 验收：全量 **545/545** + TSan 166 例零 race；S17-5 迁移测试全绿
+    （legacy_ckpt 收编正确）；cask.cpp 零处 `search_->` 残留。**落地差异**：
+    `search()` 访问器直接删除（非 deprecate——shim 类型将随 S19-3 离开产品
+    库，返回类型无从保留）；cask_docvalue_test 11 处访问器用法与 gate_bench
+    2 处改写为插件句柄（docmap 同址断言随所有权唯一化改为可用性断言，
+    SearchTextAfterPut 的同步 on_write 直插改为插件查询内核直读）。
+
+- [x] **S19-3【P0·M】shim 移入 tests/support + 测试/bench 迁移** — 已完成（2026-07-04）
+  - `search_layer.hpp` → `tests/support/bitcask/`（**include 名不变** →
+    65 个构造点与 5 个测试文件零 diff）、`search_layer.cpp` →
+    `tests/support/`；新测试夹具目标 `bitcask_search_shim`（tests/
+    CMakeLists，PUBLIC include support/ + 链 bitcask_hybrid），5 测试换链
+    夹具、thread_pool_test 换链 bitcask_hybrid；产品 `bitcask_search` 目标
+    删除（PCH/聚合脚本清单同步）。
+  - c_api/gate_bench 的 include 改 search_config.hpp；a1/a4 bench 坐实为
+    **孤儿源**（不在任何目标，早已不编译）——原样保留不迁。
+  - 验收：全量 **545/545**（构造点零 diff）+ TSan 184 例零 race；
+    `nm` 证实产品 so 零 SearchLayer 符号。
+
+- [x] **S19-4【P1·S】wal_batch_size 删除** — 已完成（2026-07-04）
+  - 从 SearchLayerConfig（search_config.hpp）与 TextPluginConfig 删字段及
+    text_config() 传参（原位留删除说明注释）；**顺带删 BM_Put_WalBatch
+    bench**——它测的就是 dead config，两档跑同一路径，基准前提不成立。
+    inverted_wal 测试（直用 enable_wal）不受影响。全量 545/545。
+
+- [x] **S19-5【P1·M】C API 分文件** — 已完成（2026-07-04）
+  - 头拆 `bitcask_kv.h`（基础/配置/生命周期/KV/迭代/Meta 过滤/管理）/
+    `bitcask_text.h`（BM25 文本 + text_filtered）/ `bitcask_vec.h`
+    （向量/hybrid + filtered），`bitcask_c.h` 变聚合 include（符号/签名/
+    ABI 不变，既有用户零改动）；实现拆 `bitcask_kv.cpp`（32 函数）/
+    `bitcask_text.cpp`（9）/ `bitcask_vec.cpp`（6）+ 共享 `internal.h`
+    （助手 inline 进 bitcask::capi + **visibility hidden**——否则原匿名 ns
+    的内链接符号泄进动态表；具名 ns 保 c_api_registry 静态局部单实例）。
+  - 验收：`nm -D` 符号面拆分前后**逐符号一致**；全量 545/545（含 CApi
+    SmokeTest）。
+
+- [x] **S19-6【P1·M】文档换代 + 收官** — 已完成（2026-07-04）
+  - cpp-arch.md：分层图换代（plugins_ 分发表 + 三插件 + CaskPluginHost）+
+    文首「S18/S19 架构换代」总述（正文 116 处 SearchLayer 历史行文按归属
+    对号，不逐句重写）；README：框图换代 + Searcher 门面示例小节；
+    api-c.md：§2.1 分域头文件表；设计稿 §9 迁移表 P3/P4/P5 全标 ✅（含
+    落地偏离指引）；CHANGELOG 收官。
+
+> **S19 批次收官（2026-07-04）**：P5 全部 6 项落地，**插件化架构五阶段
+> （P1-P5）全线完成**。终态：产品库零 SearchLayer 符号（shim 降级测试
+> 夹具）；查询三入口——Cask 门面（兼容薄委托）/ Searcher 类型化门面
+> （推荐）/ 插件句柄直查；C API 三分域头 + 三实现 TU（ABI 逐符号一致）；
+> pre-S17 迁移路径经 legacy_ckpt 收编保活。遗留（P6+）：Cask search_*
+> 门面与 bitcask_index ALIAS 的正式退役（下个 major）、CaskOptions::plugins
+> 换代（待第三方插件需求）、legacy 统一 ckpt 支持退役。
+
+> **执行序**：S19-1 → S19-2 → S19-3 → S19-4 → S19-5 → S19-6（1-3 强依赖
+> 链）。硬约束：C API ABI 不变、磁盘格式不变、pre-S17 迁移路径保活
+> （S17-5 护栏）、热路径零回退。每步全量 + TSan 全绿才进下一步。

@@ -34,7 +34,7 @@
 
 #include "bitcask/keydir.hpp"
 
-namespace bitcask::search { class SearchLayer; }
+namespace bitcask::plugin { class CaskPlugin; }  // S18-7：merge 插件广播
 
 namespace bitcask::merge {
 
@@ -81,14 +81,17 @@ struct MergeStats {
 // 锁要求: 调用方需已持 bitcask.merge.lock（或同等仲裁），且 keydir 已就绪
 // （is_ready() == true）。本函数内不取任何 mutex，但会通过 keydir 公共
 // API 间接持锁。
-// search_layer: 可选的 SearchLayer 指针。非空时，merge 复制活 record 后
-// 会调用 on_relocate() 更新索引定位。空时跳过搜索通知（纯 KV merge）。
+// plugins（S18-7，设计 §3.9）：merge 参与插件。事件序 on_merge_begin →
+// 每条 live CAS 成功后 on_relocate → on_merge_commit / on_merge_abort，
+// 全部在 merge 线程直接派发（与 reducer 并发——实现者自保线程安全，
+// 变异单写者状态须经 host->run_serialized）。空 span = 纯 KV merge。
+// 约定：首位为宿主 DocmapRelocator（docmap 恒先于插件收到搬迁）。
 [[nodiscard]] std::expected<MergeStats, MergeFault>
 run_merge(std::span<const std::string> input_data_paths,
           std::string_view output_dir,
           keydir::KeyDir& keydir,
           bool sync_output = false,
-          search::SearchLayer* search_layer = nullptr,
+          std::span<plugin::CaskPlugin* const> plugins = {},
           std::uint32_t now_sec = 0);  // S13-D5：TTL 判定时刻（0 = 不判 TTL）
 
 }  // namespace bitcask::merge

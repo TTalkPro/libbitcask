@@ -26,7 +26,7 @@
 #include "bitcask/detail/int8_kernels.hpp"
 #include "bitcask/highlighter.hpp"
 #include "bitcask/index.hpp"
-#include "bitcask/search_layer.hpp"
+#include "bitcask/search_config.hpp"  // S19-3：仅用配置类型
 #include "bitcask/text_utils.hpp"
 
 namespace fs = std::filesystem;
@@ -226,7 +226,7 @@ static void BM_P7_DocTextLruHit(benchmark::State& state) {
     }
     cask.flush_index();
 
-    auto* sl = cask.search();
+    auto* sl = cask.text_plugin();
     if (!sl) { state.SkipWithError("no search layer"); return; }
 
     // Warm DocTextLru: one search per doc populates text cache.
@@ -283,7 +283,7 @@ static void BM_P7_SearchHighlightE2E_Warm(benchmark::State& state) {
     if (!c2) { state.SkipWithError("reopen failed"); return; }
     auto& cask2 = **c2;
 
-    auto* sl = cask2.search();
+    auto* sl = cask2.text_plugin();
     if (!sl) { state.SkipWithError("no search layer"); return; }
 
     // Warm up: one search to populate DocTextLru for matching docs.

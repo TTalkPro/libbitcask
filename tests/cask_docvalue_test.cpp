@@ -257,7 +257,8 @@ TEST_F(CaskDocValueTest, DocmapIsHostOwnedSharedInstance) {
     ASSERT_TRUE(c);
     ASSERT_TRUE((*c)->has_search());
     ASSERT_NE((*c)->docmap(), nullptr);
-    EXPECT_EQ((*c)->docmap().get(), &(*c)->search()->index());
+    // S19-2：shim 退役——docmap 即宿主唯一身份表实例，改断言其可用性。
+    EXPECT_NE((*c)->docmap().get(), nullptr);
 
     // 经宿主句柄可见的写入 == 经 SearchLayer 可见的写入（同一实例语义）。
     std::vector<std::byte> key{std::byte{'d'}, std::byte{'m'}};
@@ -265,7 +266,7 @@ TEST_F(CaskDocValueTest, DocmapIsHostOwnedSharedInstance) {
     ASSERT_TRUE((*c)->put(key, val, 1000));
     (*c)->flush_index();
     EXPECT_TRUE((*c)->docmap()->is_live(0));
-    EXPECT_TRUE((*c)->search()->index().is_live(0));
+    EXPECT_TRUE((*c)->docmap()->is_live(0));
     (*c)->close();
     EXPECT_EQ((*c)->docmap(), nullptr);  // close 清宿主句柄
 }
@@ -289,17 +290,13 @@ TEST_F(CaskDocValueTest, SearchTextAfterPut) {
 
     ASSERT_TRUE((*c)->put(key, val, 1000));
 
-    auto* search = (*c)->search();
-    ASSERT_NE(search, nullptr);
-
-    // 先等异步 IndexPool 消费完 put 的索引任务,再做同步 on_write——
-    // 否则两者赛跑 ord 0 的 add_doc 水位幂等,结果取决于时序
-    // (曾在 ASan 构建下偶发失败)。
+    // S19-2：shim 退役——原「同步 on_write 直插」改经插件查询内核直读
+    //（同一通路：Cask 门面即薄委托），put 的索引经 flush_index 排干。
     (*c)->flush_index();
 
-    search->on_write("testkey", 0, "hello world", 1, 100, 50, 1000);
-
-    auto r1 = search->search_text("hello", 10);
+    auto* tp = (*c)->text_plugin();
+    ASSERT_NE(tp, nullptr);
+    auto r1 = tp->search_text("hello", 10);
     ASSERT_TRUE(r1) << "search_text failed: SearchError="
                     << static_cast<int>(r1.error());
     EXPECT_EQ(r1->size(), 1u);
@@ -2200,7 +2197,7 @@ TEST_F(CaskDocValueTest, AutoCompactConcurrentReadersNoRace) {
     auto sr = (*c)->search_text("hello", 50);
     ASSERT_TRUE(sr);
     EXPECT_EQ(sr->hits.size(), static_cast<std::size_t>(K));   // 最终恰 K 篇 live
-    EXPECT_LT((*c)->search()->total_postings(), 2000u);        // 有界回收
+    EXPECT_LT((*c)->text_plugin()->total_postings(), 2000u);   // 有界回收
     (*c)->close();
 }
 
@@ -2771,7 +2768,7 @@ TEST_F(CaskDocValueTest, V35MergeRebuildEvictsDead) {
     ASSERT_TRUE(c);
     (*c)->flush_index();
     // merge 前:图含全部 50 节点(死节点只是结果侧滤除)。
-    EXPECT_EQ((*c)->search()->hnsw_size(), kN);
+    EXPECT_EQ((*c)->vector_plugin()->size(), kN);
     auto before = (*c)->search_vector(std::span<const float>(q.data(), kDim),
                                       10, /*ef=*/256);
     ASSERT_TRUE(before);
@@ -2792,7 +2789,7 @@ TEST_F(CaskDocValueTest, V35MergeRebuildEvictsDead) {
     (*c)->flush_index();   // 等 RebuildHnsw 任务被 worker 消化
 
     // 物理清死:图节点数 == 活文档数。
-    EXPECT_EQ((*c)->search()->hnsw_size(), kN / 2);
+    EXPECT_EQ((*c)->vector_plugin()->size(), kN / 2);
     auto after = (*c)->search_vector(std::span<const float>(q.data(), kDim),
                                      10, /*ef=*/256);
     ASSERT_TRUE(after);
@@ -2806,7 +2803,7 @@ TEST_F(CaskDocValueTest, V35MergeRebuildEvictsDead) {
                                    10, /*ef=*/256);
     ASSERT_TRUE(r2);
     EXPECT_EQ(v35_hit_keys(*r2), v35_hit_keys(*before));
-    EXPECT_EQ((*c2)->search()->hnsw_size(), kN / 2);
+    EXPECT_EQ((*c2)->vector_plugin()->size(), kN / 2);
     (*c2)->close();
 }
 
@@ -2851,8 +2848,9 @@ TEST_F(CaskDocValueTest, V35ConcurrentSearchDuringRebuild) {
                 for (auto& x : q) x = nd(rng);
                 // 直走 SearchLayer(避开 Cask::search_vector 的 flush 串行
                 // 化)——与 worker 的重建/插入真并发。
-                auto r = (*c)->search()->search_vector(
-                    std::span<const float>(q.data(), kDim), 10, 64);
+                auto r = (*c)->vector_plugin()->search(
+                    std::span<const float>(q.data(), kDim), 10, 64,
+                    nullptr);
                 if (!r) continue;
                 for (const auto& h : *r) {
                     const auto idx = std::stoul(h.key.substr(1));
@@ -2884,7 +2882,7 @@ TEST_F(CaskDocValueTest, V35ConcurrentSearchDuringRebuild) {
     EXPECT_FALSE(dead_leaked.load());
     EXPECT_GT(queries.load(), 0u);
     // 重建清死 + 新增 40:图 = 200 活 + 40。
-    EXPECT_EQ((*c)->search()->hnsw_size(), kN / 2 + 40);
+    EXPECT_EQ((*c)->vector_plugin()->size(), kN / 2 + 40);
     (*c)->close();
 }
 
@@ -4075,7 +4073,7 @@ TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
         ASSERT_TRUE(mr) << mr.error().detail;
 
         // merge 后图大小 = 活节点数(同步 rebuild 已完成)
-        EXPECT_EQ((*c)->search()->hnsw_size(), kN / 2);
+        EXPECT_EQ((*c)->vector_plugin()->size(), kN / 2);
         (*c)->close();
     }
 
@@ -4084,7 +4082,7 @@ TEST_F(CaskDocValueTest, V4HnswSnapSavedAtMerge) {
         auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
         // search.ckpt 被 merge 保存,open 时走快照路径,图大小 = kN/2
-        EXPECT_EQ((*c)->search()->hnsw_size(), kN / 2);
+        EXPECT_EQ((*c)->vector_plugin()->size(), kN / 2);
         auto r = (*c)->search_vector(std::span<const float>(q.data(), kDim),
                                      10, /*ef=*/256);
         ASSERT_TRUE(r);

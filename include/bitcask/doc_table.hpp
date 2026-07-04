@@ -37,4 +37,34 @@ public:
     ord_of(std::string_view ext_id) const = 0;
 };
 
+// CompactionStats — 文档退休统计窄接口（S18-4，S12-2 自动压实的节流输入）。
+//
+// TextPlugin 的 maybe_auto_compact 需要「自上次压实起退休的文档版本数」与
+// live 规模做节流决策——这是宿主 DocMap 的写路径统计，经本接口暴露，
+// 不给插件完整 Index&（保查询面只读纪律）。
+class CompactionStats {
+public:
+    virtual ~CompactionStats() = default;
+    [[nodiscard]] virtual std::uint64_t retired_since_compact() const = 0;
+    virtual void reset_retired_since_compact() = 0;
+    [[nodiscard]] virtual std::uint64_t live_docs() const = 0;
+};
+
+// DocLenWriter — doc_len 回填的窄写接口（S18-1，设计 §4「doc_len 缓行」）。
+//
+// doc_len 存储在 DocMap（DocSlot 行 + 平坦 SoA 支撑 SIMD gather），语义归
+// BM25：宿主 put_doc 时以 doc_len=0 占位，BM25 侧分析出 token 数后经本接口
+// 回填（S16-2 通道的接口化）。P4 拆分后 TextPlugin 构造注入本接口——不给
+// Index&（保 S16-3 查询面只读纪律），不进 PluginHost（text 域与宿主的构造期
+// 专属契约，不污染通用插件接口）。
+//
+// 契约：仅 reducer 单写者上下文可调（与 set_doc_len 原语义一致）。
+class DocLenWriter {
+public:
+    virtual ~DocLenWriter() = default;
+
+    // 回填 ord 的 doc_len。ord 未登记则 no-op（防御）。
+    virtual void set_doc_len(std::uint64_t ord, std::uint32_t len) = 0;
+};
+
 }  // namespace bitcask::bm25

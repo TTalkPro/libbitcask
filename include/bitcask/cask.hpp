@@ -45,6 +45,7 @@
 #include "bitcask/data_file.hpp"
 #include "bitcask/file_lock.hpp"
 #include "bitcask/hint_file.hpp"
+#include "bitcask/docmap_ckpt.hpp"    // S18-2:docmap 持久化归宿主
 #include "bitcask/index_manifest.hpp"  // S17-2:per-component commit
 #include "bitcask/keydir.hpp"
 #include "bitcask/merge_policy.hpp"
@@ -53,8 +54,10 @@
 #include "bitcask/field_schema.hpp"
 #include "bitcask/meta_filter.hpp"
 #include "bitcask/plugin_api.hpp"
-#include "bitcask/search_layer.hpp"
-#include "bitcask/search_plugin_adapter.hpp"
+#include "bitcask/hybrid_searcher.hpp"  // S19-2：Cask 直持融合器
+#include "bitcask/search_config.hpp"    // S19-2：公开配置面（SearchLayerConfig）
+#include "bitcask/text_plugin.hpp"
+#include "bitcask/vector_plugin.hpp"
 #include "bitcask/thread_pool.hpp"
 
 namespace bitcask {
@@ -609,9 +612,27 @@ public:
     // 同义词词典在 **open 时**经 `CaskOptions::synonym_map` 配置（不可变、并发安全）；
     // 运行期 setter 已移除（曾是配置项里唯一的竞态源，见 docs/design/thread-safety.md）。
 
-    // 访问内部 SearchLayer（用于 NIF 层）。
-    [[nodiscard]] bool has_search() const { return search_ != nullptr; }
-    [[nodiscard]] search::SearchLayer* search() { return search_.get(); }
+    // S19-2：`search()` 访问器已删（shim 降级测试夹具）；查询走 Searcher
+    // 门面或下方插件句柄。
+    [[nodiscard]] bool has_search() const { return text_ != nullptr; }
+
+    // ---- S19-1：插件句柄与读屏障（Searcher 门面的消费面，设计 §3.5）----
+    // 查询前的 read-your-writes 读屏障（原私有 prepare_search 公开化）：
+    // closed 检查 + flush 索引流水线（submitted ⇒ applied）。未启用搜索
+    // 返回 kNoIndex。
+    [[nodiscard]] std::expected<void, CaskFault> drain_plugins();
+    // 插件句柄（未启用搜索 = nullptr）。生命周期 = Cask open..close。
+    [[nodiscard]] const text::TextPlugin* text_plugin() const {
+        return text_.get();
+    }
+    [[nodiscard]] const vec::VectorPlugin* vector_plugin() const {
+        return vec_plugin_.get();
+    }
+    [[nodiscard]] const search::HybridSearcher* hybrid_searcher() const {
+        return hybrid_ ? &*hybrid_ : nullptr;
+    }
+    // SearchError → CaskFault 翻译（Cask 门面与 Searcher 门面共享）。
+    [[nodiscard]] static CaskFault search_error_fault(search::SearchError e);
     // S16-1：DocMap 宿主服务句柄（索引模式下非空；与 search()->index()
     // 同一实例——所有权在 Cask，SearchLayer 借用）。
     [[nodiscard]] const std::shared_ptr<index::Index>& docmap() const {
@@ -819,6 +840,12 @@ private:
     // 链状态也镜像一份（SearchLayer 内部维护，Cask 在 commit 时同步）。
     bitcask::Manifest current_manifest_;
 
+    // S18-2：docmap 组件链状态镜像（宿主直驱 docmap 持久化后，替代原
+    // SearchLayer comp_*[kDocmap]）。组件文件写成功即推进——独立于 manifest
+    // commit 成败：manifest 写失败后重试续写 .d{seq+1}，链走 .d1..dN 完整
+    // 重放（与旧 SearchLayer 行为一致，防止已清空的删除日志丢失）。
+    bitcask::ManifestEntry docmap_chain_{};
+
     std::atomic<std::uint32_t> writes_in_flight_{0};
     struct WriteOpGate {
         Cask* cask;
@@ -872,14 +899,33 @@ private:
     std::shared_ptr<index::Index> docmap_;
 
     // SearchLayer 实例（enable_search 时创建）
-    std::unique_ptr<search::SearchLayer> search_;
+    // S19-2：Cask 直持插件（SearchLayer shim 已降级为测试夹具）。声明序 =
+    // 析构逆序：hybrid_ 引用两插件须先析构；插件借用 docmap_（shared_ptr）。
+    std::unique_ptr<text::TextPlugin>  text_;
+    std::unique_ptr<vec::VectorPlugin> vec_plugin_;
+    std::optional<search::HybridSearcher> hybrid_;
+    // S14-4 legacy 全局 rebase 标志（自 shim 迁来）：管 docmap base 决策 +
+    // 收链联动（force_ckpt_rebase 同步两插件自持标志）。
+    std::atomic<bool> ckpt_rebase_needed_{true};
 
-    // S15-3：插件分发表。P1 恒 = {search_adapter_.get()}（SearchLayer 经
-    // adapter 作「唯一插件」接入）；IndexPool 写路径的 map/reduce 闭包只
-    // 认识 plugins_，不再直呼 SearchLayer 方法。生命周期：create_search_infra
-    // 装配，close 在 unregister_lib（flush 排空）后、search_ 之前重置。
-    std::unique_ptr<search::SearchLayerAdapter> search_adapter_;
+    // S18-5：插件分发表 = {TextPlugin, VectorPlugin}（实体归 search_ 持有，
+    // 指针注册；注册序 = reducer 扇出序 = 原 reduce_apply 内顺序）。
     std::vector<plugin::CaskPlugin*> plugins_;
+
+    // S18-5：plugin::PluginHost 落地——read_at（重建/回填读回）、
+    // run_serialized（RunFn 通道正式化：reducer 静止点串行，S18-7 merge
+    // 收尾经此变异单写者状态）、log。生命周期 = Cask（覆盖插件 open..close）；
+    // S18-6 经 OpenContext 注入插件。
+    class CaskPluginHost final : public plugin::PluginHost {
+    public:
+        explicit CaskPluginHost(Cask* c) : cask_(c) {}
+        std::optional<std::string> read_at(plugin::RecordLoc loc) override;
+        void run_serialized(std::function<void()> fn) override;
+        void log(plugin::LogLevel level, std::string_view msg) override;
+    private:
+        Cask* cask_;
+    };
+    CaskPluginHost plugin_host_{this};
 
     // S6-P3: 索引双池现由 registry 共享所有（非本 Cask 拥有）。index_pool_
     // 是借用指针（= registry_->index_pool()）；index_lane_ 是本库在共享池里
@@ -975,7 +1021,7 @@ public:
     [[nodiscard]] IndexPool* index_pool() { return index_pool_; }
 
     // 内部辅助
-    [[nodiscard]] std::expected<void, CaskFault> load_keydir_from_disk(search::SearchLayer* search_layer);
+    [[nodiscard]] std::expected<void, CaskFault> load_keydir_from_disk();
     [[nodiscard]] std::expected<void, CaskFault> ensure_active_writer();
 
     // P4：组提交。每次写后调用；sync_every_n>0 且累计写数达阈值时 fsync 一次
@@ -1016,13 +1062,14 @@ public:
         std::vector<std::pair<std::uint32_t, std::uint64_t>> snap_wms;
     };
     [[nodiscard]] std::expected<RecoverySnapshots, CaskFault>
-    load_recovery_snapshots(search::SearchLayer* search_layer);
+    load_recovery_snapshots();
 
     // checkpoint delta 链重放钩子——把 delta 行/删除/keydir 元数据应用到
-    // keydir，推进恢复水位。原 load_search_ckpt 内联 DeltaReplayHook 闭包提取。
+    // keydir，推进恢复水位。S18-2：类型换 index::（docmap 持久化归宿主，
+    // 钩子只被 index::load_docmap 消费）。
     void replay_delta_to_keydir(
-        const std::vector<search::SearchLayer::DeltaDocRow>& rows,
-        const std::vector<search::SearchLayer::DeltaRemoval>& rems,
+        const std::vector<index::DocmapDeltaRow>& rows,
+        const std::vector<index::DocmapDeltaRemoval>& rems,
         std::span<const std::byte> keydir_meta,
         RecoverySnapshots& recovery);
 
@@ -1030,8 +1077,9 @@ public:
     // 仅在 open 阶段、manifest 不存在但 search.ckpt 存在时触发。成功
     // 后写 index.manifest + docmap.ckpt/bm25.ckpt/vec.ckpt + 删旧文件。
     // 失败返回 false（caller 退全量 fold）。
-    [[nodiscard]] bool migrate_legacy_search_ckpt(
-        search::SearchLayer& search_layer);
+    [[nodiscard]] bool migrate_legacy_search_ckpt();
+    // S14-4/S19-2：merge/close 收链入口——置全局标志 + 联动两插件自持标志。
+    void force_ckpt_rebase();
 
     // ---- 搜索方法共用基础设施 ----
 

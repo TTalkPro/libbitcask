@@ -243,6 +243,22 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 
 ---
 
+### Searcher 查询门面（S19，推荐新代码使用）
+
+`Cask::search_*` 系列保留为兼容薄委托；新代码推荐类型化门面（查询前自动
+经 `drain_plugins()` 读屏障）：
+
+```cpp
+#include "bitcask/searcher.hpp"
+
+auto* tp = cask->text_plugin();          // 未启用搜索时为 nullptr
+bitcask::text::Searcher ts(*cask, *tp);
+auto hits = ts.search_text("hello", 10);
+
+bitcask::vec::Searcher vs(*cask, *cask->vector_plugin());
+auto vhits = vs.search(query_vec, 5);
+```
+
 ## 架构
 
 ```
@@ -251,11 +267,10 @@ C API 设计：不透明句柄、显式 `*_free` 配对、错误码 + `bitcask_f
 │  ├─ KeyDir（分片 shared_mutex + MVCC 迭代器）              │
 │  ├─ DataFile 缓存（pread 句柄 + 近似 LRU 淘汰）            │
 │  ├─ HintFile（活跃写入器；含整文件 CRC trailer）           │
-│  ├─ SearchLayer（仅索引模式）                              │
-│  │   ├─ Index（ext2ord / slots / ord2ext / live 侧表）    │
-│  │   ├─ InvertedIndex（按字段隔离的 BM25 倒排）             │
-│  │   ├─ HnswIndex（单写者 + 多读者无锁发布协议）            │
-│  │   └─ Analyzer（Ngram / Whitespace / Jieba）            │
+│  ├─ DocMap / Index（宿主服务：ext2ord / live / meta 侧表）│
+│  ├─ TextPlugin（BM25 倒排 + Analyzer + 缓存 + 高亮）       │
+│  ├─ VectorPlugin（HNSW，单写者 + 多读者无锁发布协议）      │
+│  ├─ HybridSearcher（RRF 融合）＋ Searcher 查询门面         │
 │  ├─ MetaConfig（bitcask.meta v3：magic + version + CRC32）  │
 │  └─ IndexLane*（借用句柄 → registry 共享 IndexPool）        │
 └───────────────────────────────────────────────────────────┘

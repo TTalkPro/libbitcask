@@ -1,6 +1,9 @@
 #include "bitcask/index.hpp"
 
+#include "bitcask/codec.hpp"  // S18-2：sidecar CRC
+
 #include <algorithm>
+#include <cstring>
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
@@ -92,12 +95,22 @@ void Index::put_doc(std::string_view ext_id, std::uint64_t ord,
     ++chunk->live_count;
     live_[ord]      = true;
     doc_lens_[ord]  = slot.doc_len;
+    dirty_.store(true, std::memory_order_relaxed);  // S18-2：自记账
 }
 
 bool Index::remove(std::string_view ext_id, std::uint64_t tomb_ord) {
     std::unique_lock lk(mutex_);
 
     next_ord_ = std::max(next_ord_, tomb_ord + 1);
+    dirty_.store(true, std::memory_order_relaxed);  // S18-2：自记账
+    // S18-2：delta 窗口删除日志自记账（S14-4 门限：链覆盖区内的旧墓碑不入，
+    // 防跨文件 stale removal 重放误杀复活文档）。在 found-check **之前**入账
+    // ——与旧 recover_tomb 语义一致（keydir 半边的 remove_if_older 重放可能
+    // 仍需要该条目，即使 docmap 已无此 key）。ckpt 载入重放产生的污染由
+    // 载入方收尾 clear_removals()。
+    if (tomb_ord >= delta_window_wm_) {
+        removals_.emplace_back(std::string(ext_id), tomb_ord);
+    }
 
     auto it = ext2ord_.find(ext_id);
     if (it == ext2ord_.end()) {
@@ -184,6 +197,7 @@ void Index::set_doc_len(std::uint64_t ord, std::uint32_t len) {
     const auto ci = ord / kChunkOrds;
     const auto si = ord % kChunkOrds;
     if (ci < chunks_.size() && chunks_[ci]) chunks_[ci]->slots[si].doc_len = len;
+    dirty_.store(true, std::memory_order_relaxed);  // S18-2：自记账
 }
 
 void Index::set_meta(std::uint64_t ord, std::span<const std::byte> blob) {
@@ -195,6 +209,7 @@ void Index::set_meta(std::uint64_t ord, std::span<const std::byte> blob) {
     } else {
         meta_blobs_[ord].assign(blob.begin(), blob.end());
     }
+    dirty_.store(true, std::memory_order_relaxed);  // S18-2：自记账
 }
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
@@ -286,7 +301,122 @@ std::uint64_t Index::compact_chunks() {
         }
     }
     chunks_freed_ += freed;
+    if (freed > 0) dirty_.store(true, std::memory_order_relaxed);  // S18-2
     return freed;
+}
+
+// ---- S18-2：docmap 持久化记账 ----
+
+void Index::begin_delta_window(std::uint64_t wm) {
+    std::unique_lock lk(mutex_);
+    delta_window_wm_ = wm;
+}
+
+std::vector<std::pair<std::string, std::uint64_t>>
+Index::removals_snapshot() const {
+    std::shared_lock lk(mutex_);
+    return removals_;
+}
+
+void Index::clear_removals() {
+    std::unique_lock lk(mutex_);
+    removals_.clear();
+}
+
+// ---- S18-2：docmap sidecar（"BCIS"）序列化（自 SearchLayer 平移）----
+
+namespace {
+constexpr std::uint32_t kSidecarMagic   = 0x42434953;  // "BCIS"
+constexpr std::uint32_t kSidecarVersion = 1;
+void sc_put32(std::vector<std::uint8_t>& b, std::uint32_t v) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
+    b.insert(b.end(), p, p + 4);
+}
+void sc_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
+    b.insert(b.end(), p, p + 8);
+}
+}  // namespace
+
+bool Index::serialize_docmap(std::vector<std::uint8_t>& buf,
+                             std::uint64_t covers_next_ord) const {
+    buf.clear();
+    // S4:预留容量——每行固定 34B + 变长 ext_id（按 48B/行估值），常态零
+    // realloc（偏小由几何增长兜底，reserve 仅设容量、绝不溢出）。
+    const std::uint64_t live = info().live_docs;
+    buf.reserve(28 + static_cast<std::size_t>(live) * (34 + 48));
+    sc_put32(buf, kSidecarMagic);
+    sc_put32(buf, kSidecarVersion);
+    sc_put64(buf, covers_next_ord);
+    // 行数占位,回填。
+    const std::size_t cnt_pos = buf.size();
+    sc_put64(buf, 0);
+    std::uint64_t rows = 0;
+    bool ok = true;
+    for_each_live([&](std::uint64_t ord, const std::string& ext,
+                      const DocSlot& slot) {
+        if (ext.size() > 0xFFFF) { ok = false; return; }
+        sc_put64(buf, ord);
+        const auto klen = static_cast<std::uint16_t>(ext.size());
+        const auto* kp = reinterpret_cast<const std::uint8_t*>(&klen);
+        buf.insert(buf.end(), kp, kp + 2);
+        const auto* kd = reinterpret_cast<const std::uint8_t*>(ext.data());
+        buf.insert(buf.end(), kd, kd + ext.size());
+        sc_put32(buf, slot.loc.file_id);
+        sc_put64(buf, slot.loc.offset);
+        sc_put32(buf, slot.loc.total_sz);
+        sc_put32(buf, slot.tstamp);
+        sc_put32(buf, slot.doc_len);
+        ++rows;
+    });
+    if (!ok) return false;
+    std::memcpy(buf.data() + cnt_pos, &rows, 8);
+    const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 8));
+    sc_put32(buf, crc);
+    return true;
+}
+
+std::optional<std::uint64_t>
+Index::deserialize_docmap(std::span<const std::uint8_t> buf) {
+    if (buf.size() < 28) return std::nullopt;
+    auto rd32 = [&](std::size_t off) {
+        std::uint32_t v; std::memcpy(&v, buf.data() + off, 4); return v;
+    };
+    if (rd32(0) != kSidecarMagic || rd32(4) != kSidecarVersion) {
+        return std::nullopt;
+    }
+    std::uint32_t stored_crc = 0;
+    std::memcpy(&stored_crc, buf.data() + buf.size() - 4, 4);
+    const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 12));
+    if (crc != stored_crc) return std::nullopt;
+
+    const std::uint8_t* p = buf.data() + 8;
+    const std::uint8_t* end = buf.data() + buf.size() - 4;
+    auto need = [&](std::size_t n) {
+        return static_cast<std::size_t>(end - p) >= n;
+    };
+    std::uint64_t covers = 0, rows = 0;
+    std::memcpy(&covers, p, 8); p += 8;
+    std::memcpy(&rows, p, 8); p += 8;
+    if (rows > (1ull << 40)) return std::nullopt;
+    for (std::uint64_t i = 0; i < rows; ++i) {
+        if (!need(10)) return std::nullopt;
+        std::uint64_t ord; std::memcpy(&ord, p, 8); p += 8;
+        std::uint16_t klen; std::memcpy(&klen, p, 2); p += 2;
+        if (!need(static_cast<std::size_t>(klen) + 20)) return std::nullopt;
+        std::string ext(reinterpret_cast<const char*>(p), klen); p += klen;
+        DocSlot slot;
+        std::memcpy(&slot.loc.file_id, p, 4); p += 4;
+        std::memcpy(&slot.loc.offset, p, 8); p += 8;
+        std::memcpy(&slot.loc.total_sz, p, 4); p += 4;
+        std::memcpy(&slot.tstamp, p, 4); p += 4;
+        std::memcpy(&slot.doc_len, p, 4); p += 4;
+        put_doc(ext, ord, slot);  // 重建 ext2ord/live/doc_lens/水位
+    }
+    if (p != end) return std::nullopt;
+    return covers;
 }
 
 }  // namespace bitcask::index

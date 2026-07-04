@@ -20,15 +20,18 @@
 #include "bitcask/string_hash.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace bitcask::index {
@@ -71,7 +74,9 @@ struct Chunk {
     std::uint32_t live_count = 0;                    // chunk 内存活 ord 数；== 0 可释放
 };
 
-class Index : public bm25::DocTable {
+class Index : public bm25::DocTable,
+              public bm25::DocLenWriter,
+              public bm25::CompactionStats {
 public:
     Index() = default;
     Index(const Index&) = delete;
@@ -98,13 +103,37 @@ public:
     // BM25 侧（reducer 单写者）经本方法补写。同时更新 slots_ AoS 与
     // doc_lens_ SoA（序列化读前者，SIMD gather 读后者）。ord 未登记则
     // no-op（防御：空 job 守卫路径）。线程安全：unique_lock。
-    void set_doc_len(std::uint64_t ord, std::uint32_t len);
+    // S18-1：override bm25::DocLenWriter——P4 起 TextPlugin 经窄接口回填。
+    void set_doc_len(std::uint64_t ord, std::uint32_t len) override;
 
     // V5:存储 ord 的 meta blob(结构化 KV 二进制,可为空)。与 put_doc
     // 在同一 unique_lock 下调用——保证 meta 与定位/live 同写入原子点,
     // 后续读路径不必额外同步。blob 由 Index 内部拷贝(caller 可立即
     // 释放源缓冲)。线程安全:unique_lock。
     void set_meta(std::uint64_t ord, std::span<const std::byte> blob);
+
+    // ---- S18-2：docmap 持久化记账（自记账原则：写它的人负责记账）----
+    //
+    // 脏位：put_doc/remove/set_doc_len/set_meta/compact_chunks 内部置位；
+    // docmap 保存方（宿主 Cask / legacy SearchLayer 路径）保存或载入成功后
+    // clear_dirty()。初值 true（未知状态一律重序列化）。
+    [[nodiscard]] bool dirty() const noexcept {
+        return dirty_.load(std::memory_order_relaxed);
+    }
+    void clear_dirty() noexcept {
+        dirty_.store(false, std::memory_order_relaxed);
+    }
+
+    // delta 窗口删除日志（docmap delta 的 remove 半边）。remove() 在
+    // tomb_ord ≥ 窗口水位时内部入账（S14-4 门限语义：fold 重叠区旧墓碑
+    // 不入，防跨文件 stale removal 重放误杀复活文档）。窗口水位由 docmap
+    // 保存方在 base/delta 落成或载入完成时经 begin_delta_window 推进；
+    // ckpt 载入重放产生的污染条目由载入方在收尾 clear_removals() 清除。
+    void begin_delta_window(std::uint64_t wm);
+    // 静止点快照（save 路径消费；拷贝返回，窗口内条目量小）。
+    [[nodiscard]] std::vector<std::pair<std::string, std::uint64_t>>
+    removals_snapshot() const;
+    void clear_removals();
 
     // ---- 读 ----
     // 取 ext_id 当前存活文档的定位；不存在/已删返回 nullopt。
@@ -157,7 +186,8 @@ public:
     [[nodiscard]] IndexInfo info() const;
 
     // 当前存活文档数（= ext2ord_.size()）。线程安全：shared_lock。
-    [[nodiscard]] std::uint64_t live_docs() const {
+    // S18-4：override bm25::CompactionStats。
+    [[nodiscard]] std::uint64_t live_docs() const override {
         std::shared_lock lk(mutex_);
         return live_docs_;
     }
@@ -166,11 +196,11 @@ public:
     // 与 remove 各计 1。用于后台自动 compaction 的节流触发。仅 reducer 线程读写
     // （put_doc/remove 在写路径、maybe_auto_compact 在同线程末尾），故非并发热点。
     // 线程安全：shared_lock 读 / unique_lock 重置（与 put_doc/remove 的 unique_lock 一致）。
-    [[nodiscard]] std::uint64_t retired_since_compact() const {
+    [[nodiscard]] std::uint64_t retired_since_compact() const override {
         std::shared_lock lk(mutex_);
         return retired_since_compact_;
     }
-    void reset_retired_since_compact() {
+    void reset_retired_since_compact() override {
         std::unique_lock lk(mutex_);
         retired_since_compact_ = 0;
     }
@@ -205,6 +235,18 @@ public:
         }
     }
 
+    // ---- S18-2：docmap sidecar（"BCIS"）序列化（自 SearchLayer 平移）----
+    // 把 ord → (ext_id, DocSlot) 活映射落进 checkpoint，避免冷启动全量 fold
+    // 重建。covers_next_ord 记录快照覆盖的 ord 水位（与后续 WAL/data 的衔接
+    // 点）。布局：header(magic+version+covers+行数) + 每活文档一行（固定
+    // 34B + 变长 ext_id）+ CRC。仅遍历 live（死文档由 keydir LWW 过滤）。
+    // serialize 返回 false 仅当某 ext 超 64KiB；deserialize 校验失败返回
+    // nullopt，成功返回 covers。
+    [[nodiscard]] bool serialize_docmap(std::vector<std::uint8_t>& out,
+                                        std::uint64_t covers_next_ord) const;
+    [[nodiscard]] std::optional<std::uint64_t>
+    deserialize_docmap(std::span<const std::uint8_t> bytes);
+
 private:
     mutable std::shared_mutex mutex_;
 
@@ -222,6 +264,13 @@ private:
     std::uint64_t retired_since_compact_ = 0;  // S12-2：自上次 compact 起退休的文档版本数
     std::uint64_t chunks_alloc_   = 0;      // 历史分配 chunk 数（内省用）
     std::uint64_t chunks_freed_   = 0;      // 被 compact_chunks 释放的 chunk 数
+
+    // S18-2：docmap 持久化记账（见 public 段注释）。removals_ 受 mutex_
+    // 保护（remove 已持 unique_lock）；dirty_ 为 relaxed 原子（与旧
+    // SearchLayer::dirty_docmap_ 语义一致：写点已被 reducer/静止点串行化）。
+    std::atomic<bool> dirty_{true};
+    std::uint64_t delta_window_wm_ = 0;
+    std::vector<std::pair<std::string, std::uint64_t>> removals_;
 
     void ensure_capacity_locked(std::uint64_t ord);
 };

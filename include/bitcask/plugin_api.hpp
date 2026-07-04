@@ -82,6 +82,10 @@ struct PutEvent {
     const DocView*   doc = nullptr;  // 结构化视图；纯 KV 写为 nullptr
     RecordLoc        loc;
     std::uint32_t    tstamp = 0;
+    // S18-8：恢复重放标记。恢复与在线写是同一事件（接口契约），但插件可
+    // 据此调整**执行策略**（非语义）：如 TextPlugin 在重放批里让单文本也走
+    // prepare 并行分析（S3 恢复期并行语义），活写路径路由不动。
+    bool             replay = false;
 };
 
 // S16-2：prior_ord = 被删文档原 ord，宿主在 docmap remove **前**捕获
@@ -128,6 +132,10 @@ struct FlushRequest {
     enum class Reason : std::uint8_t { kClose = 0, kMerge = 1, kAuto = 2, kManual = 3 };
     Reason reason       = Reason::kManual;
     bool   force_rebase = false;  // close 等要求收链的场合
+    // S18-6：本次落盘的覆盖水位（宿主在提交时刻捕获的全局 ord 上界——
+    // 各插件文件以同一水位 stamping，成对不变量「keydir 水位 ≤ min(各组件
+    // 覆盖水位)」由此成立）。
+    std::uint64_t watermark = 0;
 };
 struct FlushResult {
     PluginStatus  status      = PluginStatus::kOk;
@@ -160,6 +168,12 @@ public:
 struct OpenContext {
     std::string_view dir;            // 库目录；插件以 name() 为前缀自管文件
     PluginHost*      host = nullptr; // 宿主服务句柄
+    // S18-6：宿主 commit 簿（manifest）里本插件的已提交状态提示——插件据此
+    // 校验/续接自己的持久化代际。全零 = 无已提交状态（新库/损坏 → 插件
+    // 从零自建，watermark() 报 0 让宿主全量重放）。通用字段，无搜索概念。
+    std::uint64_t committed_base_watermark  = 0;
+    std::uint64_t committed_chain_watermark = 0;
+    std::uint32_t committed_chain_seq       = 0;
 };
 
 // KV 存储层插件接口。线程/顺序/错误契约见头注释。

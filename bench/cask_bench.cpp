@@ -415,38 +415,8 @@ static void BM_Cask_SearchHybrid(benchmark::State& state) {
 }
 BENCHMARK(BM_Cask_SearchHybrid)->Unit(benchmark::kMicrosecond);
 
-// V6.2.4: WAL batch flush throughput — batch_size=1 vs batch_size=64.
-// Opens a cask with search (analyzer=Whitespace) enabled so that put()
-// flows through the IndexPool worker and writes the InvertedIndex WAL.
-// batch_size=1 is the legacy immediate-flush path; batch_size=64
-// accumulates entries in batch_buf_ and fwrite+fflush once per 64.
-static void BM_Put_WalBatch(benchmark::State& state) {
-    auto batch_size = static_cast<std::size_t>(state.range(0));
-
-    TempDir td;
-    CaskOptions opts;
-    opts.read_write = true;
-    opts.enable_search = true;
-    bitcask::search::SearchLayerConfig sc;
-    sc.analyzer_config.type = bitcask::text::AnalyzerType::Whitespace;
-    sc.wal_batch_size = batch_size;
-    opts.search_config = sc;
-
-    auto c = Cask::open(td.path(), opts, &test_registry());
-    if (!c) state.SkipWithError("Cask::open failed");
-    auto& cask = **c;
-
-    const std::string text(64, 'x');  // simple text, no special chars
-    std::uint64_t ord = 0;
-
-    for (auto _ : state) {
-        auto key = "key" + std::to_string(ord++);
-        auto r = cask.put(as_bytes(key), as_bytes(text));
-        if (!r) state.SkipWithError("put failed");
-    }
-    state.SetItemsProcessed(state.iterations());
-}
-BENCHMARK(BM_Put_WalBatch)->Arg(1)->Arg(64);
+// BM_Put_WalBatch 已删除（S19-4）：wal_batch_size 是 dead config，两档
+// 测的是同一路径（S18 侦查坐实），基准前提不成立。
 
 // V6.2.4: 隔离 WAL 写入的微基准——绕过 full put path，直测 append_add_doc。
 // 这才是 batch flush 的直接收益面（full put 中 analyzer + index update 主导）。

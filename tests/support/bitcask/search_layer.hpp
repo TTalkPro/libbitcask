@@ -1,22 +1,18 @@
-// SearchLayer — Index + InvertedIndex + Analyzer 封装层。
+// SearchLayer — Index + InvertedIndex + Analyzer 的封装层。
 //
-// 将 BM25 集成逻辑抽取为可复用组件，供 Phase 4 集成使用。
-// SearchLayer 是独立模块，不依赖 Collection/Cask/KeyDir 等上层组件。
+// 把 BM25 集成逻辑抽成可复用组件（Phase 4 集成用），本层不依赖
+// Collection/Cask/KeyDir 等上层组件。
 //
 // === 数据流 ===
 //   写入：on_write(key, ord, text, ...) → analyze_with_positions → index_.put_doc + inverted_->add_doc
 //   删除：on_delete(key) → index_.get → inverted_->remove_doc → index_.remove
 //   查询：search_text(query, k) → analyzer_->analyze → inverted_->search → ord_to_ext → SearchHit
 //
-// === 约束(线程模型,C1 修订)===
-//   - 生产形态:单写者(IndexPool worker 串行消费 on_write/on_delete)
-//     + 多读者(查询线程)。曾声明"非线程安全,caller 串行化",与实际
-//     使用不符——TSan 全插桩后实测修复了 fields_ map 并发 emplace/find
-//     与 DocTextLru 并发 put/get 两处真竞态;现 fields_(shared_mutex)、
-//     doc_texts_(内置 mutex)、cache_(shared_mutex)、index_/InvertedIndex
-//     (自带锁/分片)在该模型下安全。**多写者仍未支持**。
-//   - ord 唯一且单调分配，不复用
-//   - analyzer_ 在构造时创建，失败则整个 SearchLayer 创建失败
+// === 线程模型（C1）===
+//   单写者（IndexPool worker 串行消费 on_write/on_delete）+ 多读者（查询线程）。
+//   该模型下并发安全的成员：fields_（shared_mutex）、doc_texts_（内置 mutex）、
+//   cache_（shared_mutex）、index_/InvertedIndex（各自带锁/分片）。**不支持多写者**。
+//   ord 单调唯一分配、不复用；analyzer_ 构造失败则整个 SearchLayer 构造失败。
 
 #pragma once
 
@@ -39,6 +35,11 @@
 #include "bitcask/analyzer.hpp"
 #include "bitcask/highlighter.hpp"
 #include "bitcask/hnsw.hpp"
+#include "bitcask/hybrid_searcher.hpp" // S18-9：RRF 融合器
+#include "bitcask/search_arena.hpp"    // S19-1：inter-query 并发入口
+#include "bitcask/search_config.hpp"   // S19-2：配置面独立头
+#include "bitcask/text_plugin.hpp"    // S18-4：文本域插件
+#include "bitcask/vector_plugin.hpp"  // S18-3：向量域插件
 #include "bitcask/index.hpp"
 #include "bitcask/index_manifest.hpp"  // S17-2:per-component manifest
 #include "bitcask/search_checkpoint.hpp"  // S14-4
@@ -46,135 +47,26 @@
 #include "bitcask/meta_file.hpp"
 #include "bitcask/meta_filter.hpp"  // V5：filter 表达树 + MetaOp/MetaCondition
 #include "bitcask/search_cache.hpp"
+#include "bitcask/search_types.hpp"   // S18-3：SearchHit/SearchError 共享类型
 #include "bitcask/string_hash.hpp"  // StringHash（透明 hash，fields_/field_names_intern_ 共用）
 #include "bitcask/synonym_map.hpp"
 
 namespace bitcask::search {
 
-// 默认字段名（S8.6）：旧单 text 文档 / 无字段限定查询都映射到此字段，
-// 使新旧路径收敛。用不可见控制字符前缀避免与用户字段名冲突。
-// 默认字段哨兵。历史：原意为 `\x01` + "default"，但 `\x` 转义会贪婪吞掉后续 hex 位
-// （"defa" 全是 hex）→ 实际编译为单字节 0xFA + "ult"（4 字节）。GCC 静默截断、clang
-// 直接报「hex escape out of range」。此值已作 fields_ 键 / 可能入 checkpoint，故**保留
-// 完全相同的 4 字节**（0xFA 'u' 'l' 't'），仅改写法让 clang 也能编译（相邻字面量断开转义）。
-inline constexpr std::string_view kDefaultField = "\xfa" "ult";
+// kDefaultField / ReduceJob / SearchHitEx：见 search_types.hpp（S18-4 迁出共享）。
 
-// SearchLayer 配置。
-struct SearchLayerConfig {
-    text::AnalyzerConfig analyzer_config;
-    bm25::Bm25Params     bm25_params;
-    std::size_t          cache_max_entries = 256;  // 缓存最大条目数，0 禁用
-    // 高亮原文 LRU 上限（S9.3）：只缓存最近写入/查询的文档原文，避免全文常驻。
-    // 0 表示不缓存（高亮恒拿不到原文 → 降级为无片段），默认 1024 篇。
-    std::size_t          doc_text_cache_max = 1024;
-    // 是否索引词位置（S10.10）。默认 true。置 false 时倒排不存 positions，
-    // 大幅省内存——代价：search_phrase / search_near 失效（无位置可匹配，返回空）。
-    // 仅做 search_text/bool/fuzzy/wildcard 的部署可关闭。
-    bool                 index_positions = true;
-    // V3.3:向量配置(Cask::open 从 meta 透传)。dim>0 时构造 HnswIndex;
-    // metric 映射:kCosineNormalized/kDot → HnswMetric::kDot(cosine 已在
-    // 写入端归一化),kL2 → kL2。
-    std::uint16_t        vector_dim = 0;
-    meta::VectorMetric   vector_metric = meta::VectorMetric::kNone;
-    // S13-D11：HNSW 建图参数透传（0 = 用 HnswConfig 默认：M=16、
-    // ef_construction=200）。高召回部署调大、低内存部署调小。注意：已有
-    // checkpoint 的图按建图时参数持久化——改参数影响新插入与 merge 期
-    // rebuild 出的图，不追溯改写既有 checkpoint（不入 meta 校验，属调优
-    // 参数而非格式参数）。
-    std::uint32_t        hnsw_m = 0;
-    std::uint32_t        hnsw_ef_construction = 0;
-    // P5b:HNSW int8-only 内存模式(Cask::open 从 meta 透传)。仅 kDot。
-    bool                 vector_inmem_int8 = false;
-    // V6.2:WAL 批量刷新阈值。1 = 即时模式(默认,与旧版行为完全一致)。
-    // >1 时积攒 entries 缓冲后单次 fwrite+fflush,减少 sync 调用次数。
-    std::size_t          wal_batch_size = 1;
-    // S12-2：后台自动 compaction 的 per-list 死占比阈值。
-    //   0（默认）  → **关**：行为与旧版完全一致，索引流水线零开销（仅一次 double 比较）；
-    //   (0,1]      → **开**：在写入流水线的 reducer 线程内，累计退休文档达节流阈值
-    //                （max(1024, live/2)）时对死占比 ≥ 本值的 posting list 触发一次
-    //                compact()。与 add_doc/put_doc 同线程串行 → 无并发窗口（见 S12-2）。
-    // 效果：posting list 内存随 churn 有界，不再依赖 merge 才回收。代价：触发时 reducer
-    // 短暂扫描压实，延迟后续文档的**索引可见性**（非 durability——数据已落 data file）。
-    double               auto_compact_dead_ratio = 0.0;
-    // 同义词词典（open-time，不可变）。由 Cask::open 从 CaskOptions::synonym_map
-    // 透传进来（同 vector_dim 的注入方式）。构造后只读 → 并发查询安全，无需锁。
-    // 空 = 不展开同义词。
-    std::shared_ptr<const text::SynonymMap> synonym_map;
-    // S14-5：delta 链长上限。链达到该长度后下次 save 强制全量 base（链坍缩
-    // 回收 delta 文件）——否则不 merge 的纯追加负载（无删除 ⇒ needs_merge
-    // 不触发）链随写入量线性堆积、永不回收（向量库尤甚：每个 delta 内联
-    // f32 向量）。上限权衡：小 → base 重序列化更频繁（∝ 索引总量）；
-    // 大 → 崩溃恢复要重放更长的链 + 磁盘冗余更多。0 = 不设限（不建议）。
-    std::uint32_t max_delta_chain = 64;
-};
+// SearchLayerConfig：见 search_config.hpp（S19-2 迁出公开配置面）。
 
-// 搜索结果条目。
-struct SearchHit {
-    std::string   key;   // 外部 key（由 caller 通过 index_.ord_to_ext 翻译）
-    std::uint64_t ord;   // 文档 ord
-    double        score; // BM25 分数
-};
+// SearchHit / SearchError：见 search_types.hpp（S18-3 抽出共享）。
 
-// S9-P2-d：搜索层错误类型。此前各搜索方法返回 `expected<…, std::string>`，
-// 把错误语义压成自由文本，迫使 Cask 边界**静态猜** CaskError 种类（leaky
-// abstraction）。改为强类型枚举：搜索层只表达「发生了哪类错误」，由 Cask 边界
-// （cask.cpp `search_fault`）翻译成 CaskFault（kind + 人类可读 detail）。
-// 全部三种当前都映射到 CaskError::kInvalidOption（见 search_fault）。
-enum class SearchError {
-    kNoVectorIndex,       // 无向量索引配置（hnsw_ 为空）
-    kVectorDimMismatch,   // 查询向量维度与配置不符
-    kEmptyHybridQuery,    // hybrid 两路皆空（无文本、无向量）
-};
 
-// 带高亮的搜索结果。
-struct SearchHitEx {
-    std::string              key;
-    std::uint64_t            ord;
-    double                   score;
-    std::vector<Snippet>     highlights;
-};
-
-// S6-P0: map_analyze 的产出 / reduce_apply 的输入。
-// 把「纯函数 analyze + catch-all 合并」的结果封装为一个 owning 结构，
-// 供 reduce_apply 在锁下逐字段 apply。P0 阶段 map/reduce 仍在同线程
-// 顺序调用；P2+ 将跨线程传递此结构。
-struct ReduceJob {
-    std::string          key;           // owning key (reduce_apply 要用)
-    std::uint64_t        ord = 0;
-
-    // 每字段的分词结果（field_name 已映射：空名 → kDefaultField）。
-    // terms 可能为空（该字段无有效 token）→ reduce_apply 跳过 add_doc。
-    struct FieldResult {
-        std::string                   field_name;
-        text::TermPositionsMap        terms;
-        std::uint32_t                 doc_len = 0;  // Σ tf
-    };
-    std::vector<FieldResult> fields;
-
-    std::uint32_t        total_doc_len = 0;
-
-    // catch-all 合并结果（非默认字段词项合并到默认字段，使 search_text 能命中多字段文档）
-    text::TermPositionsMap ca_data;      // 空 = 无需 catch-all add_doc
-    std::uint32_t        ca_len = 0;
-    bool                 wrote_default = false;  // 有字段直接写了默认字段 → 跳过 catch-all
-
-    // 高亮原文缓存（默认取第一个字段的 text，与现有 on_write_fields line 403 一致）
-    std::string          doc_text;
-
-    // DocSlot 定位数据
-    std::uint32_t        file_id = 0;
-    std::uint64_t        offset = 0;
-    std::uint32_t        total_sz = 0;
-    std::uint32_t        tstamp = 0;
-};
 
 class SearchLayer {
 public:
-    // 构造 analyzer（可能因无效配置失败）。caller 应检查返回值。
-    // S16-1：docmap 尾置注入参——nullptr = 自持（standalone/测试路径，行为
-    // 与旧版完全一致）；非空 = 借用宿主（Cask）持有的实例（设计
-    // doc/plugin-arch-split-design-zh.md §4：DocMap 是宿主服务，SearchLayer
-    // 是消费者）。生命周期：shared_ptr 共持，析构序无关。
+    // 构造（analyzer 可能因无效配置失败，caller 须查 has_analyzer()）。
+    // S16-1：docmap 注入——nullptr = 自持（standalone/测试）；非空 = 借用宿主
+    // （Cask）持有的实例（DocMap 是宿主服务、SearchLayer 是消费者，见
+    // doc/plugin-arch-split-design-zh.md §4）。shared_ptr 共持，析构序无关。
     explicit SearchLayer(const SearchLayerConfig& config,
                          std::shared_ptr<index::Index> docmap = nullptr);
 
@@ -190,7 +82,9 @@ public:
     // analyzer 是否构造成功。analyzer_config 无效 / 分词器未注册 /
     // 词典加载失败时为 false——caller（Cask::open）必须检查并拒绝打开，
     // 否则首次带 text 的 put 会解空指针段错误。
-    [[nodiscard]] bool has_analyzer() const noexcept { return analyzer_ != nullptr; }
+    [[nodiscard]] bool has_analyzer() const noexcept {
+        return text_.has_analyzer();  // S18-4：analyzer 归 TextPlugin
+    }
 
     // ---- 文档写入：建立索引 ----
     // key: 外部 key, ord: 文档序号, text: 文档文本,
@@ -216,10 +110,9 @@ public:
                          std::uint32_t total_sz, std::uint32_t tstamp);
 
     // S6-P0: 纯函数阶段 — analyze 各字段 + catch-all 合并，产 ReduceJob。
-    // 无锁、无共享状态变更（analyzer_ 是 const 线程安全）。
-    // S10-A5:fields 改 string_view 借用（IndexTask 打包进 fields_store；同步 caller 借 caller 的 string）。
-    // S15-3:参数放宽为 span——插件 adapter 的 DocView::fields（同元素类型）
-    // 可直传；既有 vector 调用点隐式转换，零行为变化。
+    // 无锁、无共享状态变更（analyzer_ const 线程安全）。fields 用 string_view 借用
+    // （S10-A5），参数为 span（S15-3：插件 adapter 的 DocView::fields 可直传，
+    // vector 调用点隐式转换）。
     [[nodiscard]] ReduceJob map_analyze(
         std::string_view key, std::uint64_t ord,
         std::span<const std::pair<std::string_view, std::string_view>> fields,
@@ -311,7 +204,7 @@ public:
     // 图节点数(含软删死节点;测试/观测用)。无向量配置 = 0。
     [[nodiscard]] std::size_t hnsw_size() const;
     // S13-D8：查询缓存当前条目数（观测用；SearchCache 自带锁，线程安全）。
-    [[nodiscard]] std::size_t cache_entries() const { return cache_.size(); }
+    [[nodiscard]] std::size_t cache_entries() const { return text_.cache_entries(); }
     // merge 重建(物理清除死节点)。**只能由 IndexPool worker 执行**
     // (与 on_vector 同线程 → 维持 HNSW 单写者约束):新建同 config 图,
     // 遍历旧图节点,跳过 !index_.is_live(ord),重插活节点,完毕原子换
@@ -331,16 +224,12 @@ public:
                   const meta::MetaFilter* filter = nullptr) const;
 
     // ---- V3.6:RRF 混合检索(hnsw-design §4)----
-    // 两路各取 K' = max(k×4, 64):BM25 词袋走 search_text 内核,向量走
-    // search_vector 内核(查询归一化/live 过滤/ord 翻译全部复用)。融合:
-    //   score(doc) = Σ_路 1/(60 + rank_路),rank 从 1 起;
-    // 单路出现的文档照常只累加该路项,无需分数归一化。**确定性平局序**:
-    // RRF 分相等 → ord 小者在前。text_query 空 → 纯向量(BM25 路空);
-    // vec_query 空 → 纯文本(RRF 重打分);两路都空 → 错误。vec 维度
-    // 不符 → 错误(经 search_vector)。返回 score = RRF 分。
-    // V5:filter 同时作用于两条路(text 路 overfetch 后过滤;vec 路
-    // 折进 HNSW live callback);只有同时通过两路 filter 的文档进 RRF 融合。
-    // 线程安全:同两条内核(text 路同 search_text,vec 路同 search_vector)。
+    // 两路各取 K'=max(k×4, 64)：文本走 search_text 内核、向量走 search_vector 内核
+    // （归一化/live 过滤/ord 翻译全复用）。融合 score(doc)=Σ_路 1/(60+rank_路)，rank
+    // 从 1 起，单路文档只累加该路项（无需分数归一化）。平局：RRF 分相等取 ord 小者。
+    // 一路空 → 退化为纯另一路，两路皆空或 vec 维度不符 → 错误。
+    // V5：filter 同时作用两路（text 路 overfetch 后过滤、vec 路折进 HNSW live callback），
+    // 只有两路都通过的文档进融合。线程安全同两条内核。
     [[nodiscard]] std::expected<std::vector<SearchHit>, SearchError>
     search_hybrid(std::string_view text_query,
                   std::span<const float> vec_query, std::size_t k,
@@ -503,12 +392,11 @@ public:
     [[nodiscard]] std::array<bool, kComponentCount> dirty_mask() const {
         std::array<bool, kComponentCount> m{};
         m[static_cast<std::size_t>(bitcask::ComponentId::kDocmap)] =
-            dirty_docmap_.load(std::memory_order_relaxed);
+            index_.dirty();  // S18-2：docmap 脏位由 Index 自记账
         m[static_cast<std::size_t>(bitcask::ComponentId::kBm25)] =
-            dirty_bm25_default_.load(std::memory_order_relaxed) ||
-            dirty_bm25_fields_.load(std::memory_order_relaxed);
+            text_.dirty();  // S18-4：bm25 脏位由 TextPlugin 自记账
         m[static_cast<std::size_t>(bitcask::ComponentId::kVec)] =
-            dirty_hnsw_.load(std::memory_order_relaxed);
+            vec_.dirty();  // S18-3：vec 脏位由 VectorPlugin 自记账
         return m;
     }
 
@@ -517,6 +405,14 @@ public:
     // （delta 链的预期存续范围 = 两次 base 之间的运行期窗口）。
     void force_ckpt_rebase() {
         ckpt_rebase_needed_.store(true, std::memory_order_relaxed);
+        // S18-6：插件自持 rebase 标志联动（close 收链语义覆盖全组件）。
+        text_.force_rebase();
+        vec_.force_rebase();
+    }
+    // S18-6：恢复载入全组件健康后清 legacy 全局 rebase（宿主 docmap 决策
+    // 与 legacy 路径消费；细粒度标志由各插件自管）。
+    void clear_ckpt_rebase() {
+        ckpt_rebase_needed_.store(false, std::memory_order_relaxed);
     }
 
     // 从磁盘重建倒排索引：遍历 Index 中所有 live 文档，通过 doc_reader 回调读取文本，
@@ -532,11 +428,19 @@ public:
     std::size_t compact(double dead_ratio_threshold = 0.5);
 
     std::uint64_t compact_index_chunks() {
-        dirty_docmap_.store(true, std::memory_order_relaxed);  // S14-3
+        // S18-2：docmap 脏位由 Index::compact_chunks 自记账。
         return index_.compact_chunks();
     }
 
     // ---- 访问内部组件（Phase 4 集成用）----
+    // S18-3/4：插件句柄（Cask 归一化下沉调用 / S18-5 起注册进 plugins_）。
+    [[nodiscard]] vec::VectorPlugin&        vector_plugin()       { return vec_; }
+    [[nodiscard]] const vec::VectorPlugin&  vector_plugin() const { return vec_; }
+    [[nodiscard]] text::TextPlugin&         text_plugin()         { return text_; }
+    [[nodiscard]] const text::TextPlugin&   text_plugin() const   { return text_; }
+    [[nodiscard]] const HybridSearcher&     hybrid_searcher() const {
+        return hybrid_;  // S19-1：Cask 门面直调融合器
+    }
     [[nodiscard]] index::Index&       index()       { return index_; }
     [[nodiscard]] const index::Index& index() const { return index_; }
     // S16-3：查询面只读身份表视图（Index IS-A DocTable）。查询代码经此消费
@@ -552,91 +456,17 @@ public:
     [[nodiscard]] std::size_t total_postings() const;
 
 private:
-    // 高亮原文 LRU（S9.3）：ord → 原文，带容量上限。只为高亮路径服务；
-    // 冷文档被挤出后高亮降级为无片段，不影响 BM25 检索本身。
-    // C1:内置 mutex——IndexPool 工作线程 put 与查询线程 get(高亮)并发,
-    // TSan 降噪后实测捕获竞态;原"caller 串行化"假设与生产线程模型不符。
-    // get 返回拷贝而非内部指针:旧接口指针在锁外可被并发淘汰释放(UAF 窗口)。
-    class DocTextLru {
-    public:
-        explicit DocTextLru(std::size_t cap) : cap_(cap) {}
+    // S18-4：DocTextLru 已迁 TextPlugin。
 
-        void put(std::uint64_t ord, std::string text) {
-            if (cap_ == 0) return;
-            std::lock_guard<std::mutex> lk(mu_);
-            if (auto it = map_.find(ord); it != map_.end()) {
-                it->second->second = std::move(text);
-                lru_.splice(lru_.begin(), lru_, it->second);
-                return;
-            }
-            lru_.emplace_front(ord, std::move(text));
-            map_[ord] = lru_.begin();
-            while (lru_.size() > cap_) {
-                map_.erase(lru_.back().first);
-                lru_.pop_back();
-            }
-        }
+    // S18-4：field_index/intern/auto-compact/物化骨架等私有 helper 已迁 TextPlugin。
 
-        // 命中返回原文拷贝并提升为最近使用；未命中返回 nullopt。
-        std::optional<std::string> get(std::uint64_t ord) {
-            std::lock_guard<std::mutex> lk(mu_);
-            auto it = map_.find(ord);
-            if (it == map_.end()) return std::nullopt;
-            lru_.splice(lru_.begin(), lru_, it->second);
-            return it->second->second;
-        }
 
-        void erase(std::uint64_t ord) {
-            std::lock_guard<std::mutex> lk(mu_);
-            auto it = map_.find(ord);
-            if (it == map_.end()) return;
-            lru_.erase(it->second);
-            map_.erase(it);
-        }
 
-        void clear() {
-            std::lock_guard<std::mutex> lk(mu_);
-            lru_.clear();
-            map_.clear();
-        }
 
-    private:
-        std::size_t cap_;
-        std::list<std::pair<std::uint64_t, std::string>> lru_;  // front=最近
-        std::unordered_map<std::uint64_t,
-            std::list<std::pair<std::uint64_t, std::string>>::iterator> map_;
-        std::mutex mu_;
-    };
 
-    // 取或建某字段的 InvertedIndex（S8.6 阶段2）。
-    bm25::InvertedIndex& field_index(std::string_view field);
-    // 取某字段的 InvertedIndex（只读，不存在返回 nullptr）。
-    const bm25::InvertedIndex* field_index(std::string_view field) const;
 
-    // S10-A4：把字段名 intern 进 field_names_intern_，返回稳定 string_view（node 不失效）。
-    std::string_view intern_field_name(std::string_view name);
 
-    // S12-2：写路径末尾（reducer 线程）的自动 compaction 触发。config_.auto_compact_dead_ratio
-    // <=0 时是单次 double 比较即返回（默认关，零开销）。开启后累计退休文档达节流阈值才
-    // 在本线程内 compact()——与 add_doc/put_doc 同线程，无并发窗口。由 reduce_apply /
-    // on_write / on_delete 末尾调用。
-    void maybe_auto_compact();
 
-    // D2：抽出 5+ 处 search_* 共有的「bm25 结果集物化为 SearchHit」骨架：
-    // 逐条 ord→ext 翻译（翻译失败跳过）+ 可选 MetaFilter 后过滤（空 meta 不通过）
-    // + 可选截断到 k（k==0 不截断，bm25 内核已 top-k 的路径用之）。
-    // S16-3：经 const DocTable& 形参消费 docmap（不直摸 index_ 具体类型）。
-    [[nodiscard]] std::vector<SearchHit> materialize_hits(
-        const std::vector<bm25::SearchResult>& results,
-        const bm25::DocTable& doc_table,
-        const meta::MetaFilter* filter = nullptr,
-        std::size_t k = 0) const;
-
-    // D2：抽出 search_phrase/search_near 共有的「按 position 还原 query 词序」：
-    // analyze_with_positions → 展开 (position, term) → 按位置排序 → terms 向量
-    // （phrase/near 依赖词序，analyze() 的 map 无序不可直接用）。空查询 → 空向量。
-    [[nodiscard]] std::vector<std::string> ordered_query_terms(
-        std::string_view query) const;
 
     SearchLayerConfig  config_;
     // S16-1：docmap 实体经 shared_ptr 持有（自持或宿主注入），index_ 是其
@@ -644,54 +474,25 @@ private:
     // 必须先于引用初始化。
     std::shared_ptr<index::Index> index_holder_;
     index::Index&     index_;
-    // S8.6：每字段一个 InvertedIndex（字段间 avgdl/idf 隔离）。
-    // 旧单 text 文档与无字段限定查询都走 kDefaultField。
-    // O8：透明 hash——field_index 查找直接吃 string_view，免临时 string。
-    // C1:fields_mu_ 保护 map 结构——IndexPool 工作线程首次写入新字段会
-    // emplace,与查询线程的 find 并发(TSan 降噪后实测捕获的真竞态)。
-    // InvertedIndex 本体地址稳定(unique_ptr)且内部自带分片并发,
-    // 锁只管 map;引用/指针可出锁使用。
-    mutable std::shared_mutex fields_mu_;
-    std::unordered_map<std::string, std::unique_ptr<bm25::InvertedIndex>,
-                       StringHash, std::equal_to<>> fields_;
-    // R3：ord → (字段名 → 该字段 doc_len)，供 on_delete 按字段精确扣减统计。
-    // 仅多字段路径填充；单 text 路径用 index_ 的 doc_len 即可（默认字段）。
-    // S10-A4：字段名借自 field_names_intern_，消除每文档每字段一次 owning string 分配。
-    std::unordered_map<std::uint64_t,
-                       std::vector<std::pair<std::string_view, std::uint32_t>>> ord_field_lens_;
-    // S10-A4:字段名 intern 池。unordered_set node 在 insert 后稳定 → string_view 安全。
-    // 透明 hash（StringHash）让 find 直接吃 string_view，免临时 string（与 fields_ 同）。
-    std::unordered_set<std::string, StringHash, std::equal_to<>> field_names_intern_;
-    mutable std::shared_mutex field_names_intern_mu_;
-    std::unique_ptr<text::Analyzer>      analyzer_;
-    // V3.3:HNSW 向量索引(config.vector_dim>0 时创建)。单写者
-    // (IndexPool worker 的 on_vector/recover_doc/rebuild_hnsw)+ 多读者
-    // (search_vector)并发安全,协议见 hnsw.hpp。
-    // V3.5:atomic<shared_ptr>——merge 重建以"新图旁路构建 + 原子换指针"
-    // 实现,读者每次操作开头 load 一次快照指针,旧图由引用计数续命;
-    // 写路径(worker 单线程)同样经 load 取图。指针仅在构造与
-    // rebuild_hnsw 的换入点变更。
-    std::atomic<std::shared_ptr<vec::HnswIndex>> hnsw_;
-    mutable SearchCache cache_;
-    mutable DocTextLru  doc_texts_;
-    // S11：open-time 注入的不可变同义词词典（来自 SearchLayerConfig::synonym_map）。
-    // shared_ptr<const> → 构造后只读，并发查询安全；移除了运行期 set_synonym_map
-    // setter（曾是配置项里唯一的 reader-vs-writer 竞态源）。
-    std::shared_ptr<const text::SynonymMap> synonym_map_;
+    // S18-1 的 doc_len_writer_ 引用成员已随 S18-4 移除——回填通道整体
+    // 迁入 TextPlugin（构造注入，见 doc_table.hpp DocLenWriter 契约）。
+    // S18-4：文本域整体抽出为 TextPlugin（倒排/analyzer/缓存/高亮 LRU/
+    // bm25 组件 ckpt）。声明序：需 index_holder_ 先初始化。
+    text::TextPlugin text_;
+    // S18-3：向量域整体抽出为 VectorPlugin（HNSW/插入日志/vec 组件 ckpt/
+    // 归一化）。声明序：需 index_holder_ 先初始化（注入 DocTable&）。
+    vec::VectorPlugin vec_;
+    // S18-9：RRF 融合器（持两插件引用；声明序：text_/vec_ 之后）。
+    HybridSearcher hybrid_{text_, vec_};
+    // S18-4：fields_/ord_field_lens_/intern 池/analyzer/缓存等文本域成员已迁 TextPlugin。
+
+
+
     // 注：查询并行用的「有界 Search 池」是**进程级共享**的（非 per-Cask），
     // 定义在 search_layer.cpp（search_arena()）。见 S7-2。
 
-    // S14-3：段级 dirty-bit（路线 A §5）。写路径置位，save_search_ckpt
-    // 消费：干净段从现有 search.ckpt 原字节前移（免重序列化，无向量写
-    // 周期 hnsw 段零 CPU；纯向量负载 bm25 段零 CPU），只重序列化脏段；
-    // 保存成功后清零，load 成功载入的段亦清零（此刻内存 == 文件）。
-    // 初值 true：未知状态一律重序列化。relaxed 原子：全部写点与 save 点
-    // 在现有路径中已被 reducer / 静止点串行化，原子仅为同步旁路（无池
-    // 模式的 on_write/on_delete）的形式安全。
-    std::atomic<bool> dirty_docmap_{true};
-    std::atomic<bool> dirty_bm25_default_{true};
-    std::atomic<bool> dirty_bm25_fields_{true};
-    std::atomic<bool> dirty_hnsw_{true};
+    // S18-4：bm25 段级脏位已迁 TextPlugin（S14-3 语义随迁）。
+    // S18-3：vec 脏位已迁 VectorPlugin（自记账）。
 
     // ---- S14-4：ord-delta 链状态（base + search.ckpt.d<seq> 文件链）----
     // 全部只在 save/load/reducer 上下文访问（现有路径已串行化）。
@@ -703,22 +504,11 @@ private:
     std::uint64_t ckpt_base_gen_ = 0;   // 当前 base 的 watermark（代 id）
     std::uint64_t ckpt_chain_wm_ = 0;   // base+链的覆盖水位（下个 delta 的 from）
     std::uint32_t ckpt_next_seq_ = 1;   // 下个 delta 文件序号
-    // 窗口日志（自上次 save 起，save 成功即清）：
-    // 删除 (key, tomb_ord)——docmap delta 的 remove 半边；bm25 统计效果由
-    // delta 头的绝对 N/sdl 覆盖，无需入日志。只记 tomb_ord ≥ chain_wm 的
-    // （fold 重叠区的旧墓碑不入——其目标可能已被链内更新的 put 复活）。
-    std::vector<std::pair<std::string, std::uint64_t>> delta_removals_;
-    // 向量插入 (ord, f32)——hnsw 无不可变旧段（插入改写旧邻接），delta 用
-    // 插入日志重放（insert 有 ord 水位自门）。只记 ord ≥ chain_wm 的。
-    std::vector<std::pair<std::uint64_t, std::vector<float>>> delta_vecs_;
+    // S18-2：docmap 窗口删除日志已迁 index::Index（remove 自记账）。
+    // S18-3：向量插入日志已迁 VectorPlugin。
 
-    // S17-2:per-component 链状态——与 Cask 侧 manifest 同步。索引同
-    // ComponentId（0=docmap, 1=bm25, 2=vec）。ckpt_rebase_needed_ 为
-    // 全局开关（旧路径遗留），仍被 save_search_ckpt 的 rebase 路径读。
-    std::array<std::uint64_t, kComponentCount> comp_base_gen_{};
-    std::array<std::uint64_t, kComponentCount> comp_chain_wm_{};
-    std::array<std::uint32_t, kComponentCount> comp_next_seq_{};
-    static_assert(kComponentCount == 3, "comp_*_ size must match ComponentId");
+    // S18-2/3/4：per-component 链状态归各持有方（docmap=宿主、bm25=TextPlugin、
+    // vec=VectorPlugin）；本层仅存 legacy 单链三元组（上方 ckpt_*）。
 
     // delta 保存/应用（save_search_ckpt / load_search_ckpt 内部）。
     [[nodiscard]] bool save_delta_ckpt(const std::string& base_path,
@@ -729,12 +519,6 @@ private:
         const DeltaReplayHook& hook);
 };
 
-// S7-4: 把 [0, n) 并发跑在进程级共享「有界 Search 池」上（inter-query 并发）。
-// body(i) 执行第 i 条**独立**查询，写各自结果槽（槽间不重叠 → 无需锁）。每条
-// 查询内部仍串行；并发发生在查询**之间**（多条独立重查询，总功/核数，无单查询
-// 两路并行的均衡/唤醒摊销问题）。n<=1 直跑（零池开销）。
-// 要求：body 之间不共享可变态（查询纯读各索引 shared_lock，安全）。
-void parallel_for_queries(std::size_t n,
-                          const std::function<void(std::size_t)>& body);
+// S19-1：parallel_for_queries 已迁 search_arena.hpp（本头 include 保兼容）。
 
 }  // namespace bitcask::search

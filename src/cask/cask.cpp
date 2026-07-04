@@ -1,5 +1,9 @@
 #include "bitcask/cask.hpp"
 
+#include "legacy_ckpt.hpp"  // S19-2：pre-S17 统一 ckpt 迁移读取器
+
+#include "bitcask/search_arena.hpp"  // S19-2：批量查询并发入口（原经 shim 头）
+
 #include <signal.h>     // ::kill for stale-lock detection
 #include <sys/resource.h>  // ::getrlimit, RLIMIT_NOFILE（S12-1 read 句柄默认上限）
 #include <unistd.h>     // ::getpid, ::unlink
@@ -20,11 +24,10 @@
 
 namespace bitcask {
 
-// P14a:恢复 checkpoint 文件名(目录级,与 bitcask.meta 同级)。
-// 命名契约 {kv|search}.{组件}.{ckpt|seg|wal|manifest},见
+// P14a:恢复 checkpoint 文件名(目录级,与 bitcask.meta 同级)。命名契约
+// {kv|search}.{组件}.{ckpt|seg|wal|manifest},见
 // doc/recovery-unified-checkpoint-design-zh.md §3。后缀 .ckpt = 可 fold
-// 重建的 checkpoint(纯优化)。旧名(bitcask.keydir.snap 等)不再读——
-// 这些文件可重建,升级后首次 open 走全量 fold,close 时落新名。
+// 重建的 checkpoint(纯优化);缺失/损坏时首次 open 走全量 fold 重建。
 inline constexpr const char* kKeydirSnapName = "kv.keydir.ckpt";
 // P14e:搜索索引统一分段 checkpoint（docmap/bm25/hnsw 单文件，逐段 CRC）。
 inline constexpr const char* kSearchCkptName = "search.ckpt";
@@ -120,11 +123,9 @@ parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
 }
 
 // 如果锁文件里记录的 pid 已死，尝试删掉它，让 caller 重试 O_EXCL acquire。
-// 对应 legacy bitcask_lockops:delete_stale_lock。
 //
-// 竞态窗口：从我们读 pid 到我们 unlink 之间，另一个 writer 可能写了新 lock；
-// 我们会误删他的。legacy 也有同样的 race，实际暴露面极小——只发生在
-// crash recovery 路径上，正常运行不会碰到。
+// 竞态窗口：从读 pid 到 unlink 之间，另一 writer 可能写了新 lock 而被误删；
+// 暴露面极小——只在 crash recovery 路径出现，正常运行不会碰到。
 [[nodiscard]] bool try_remove_stale_lock(const std::string& path) noexcept {
     auto rl = lock::FileLock::acquire(path, /*write*/ false);
     if (!rl) return false;  // file vanished or unreadable; the retry will surface the right error
@@ -457,11 +458,18 @@ Cask::upgrade(std::string_view dirname,
     }
 
     cask->docmap_ = std::make_shared<index::Index>();  // S16-1：宿主服务
-    cask->search_ = std::make_unique<search::SearchLayer>(search_config,
-                                                          cask->docmap_);
+    // S19-2：直构插件（shim 退役）。三个窄接口引用绑同一 Index 实例。
+    cask->text_ = std::make_unique<text::TextPlugin>(
+        search_config.text_config(), *cask->docmap_, *cask->docmap_,
+        *cask->docmap_);
+    cask->vec_plugin_ = std::make_unique<vec::VectorPlugin>(
+        search_config.vector_config(), *cask->docmap_);
+    cask->hybrid_.emplace(*cask->text_, *cask->vec_plugin_);
+    // S18-8：恢复重放经 plugins_ 广播——upgrade 手工装配路径同样要注册。
+    cask->plugins_ = {cask->text_.get(), cask->vec_plugin_.get()};
 
     cask->keydir_ = std::make_shared<keydir::KeyDir>();
-    if (auto r = cask->load_keydir_from_disk(cask->search_.get()); !r) {
+    if (auto r = cask->load_keydir_from_disk(); !r) {
         return std::unexpected(r.error());
     }
     cask->keydir_->mark_ready();
@@ -549,12 +557,12 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         }
         cask->keydir_ = a.keydir;
         if (a.status == keydir::AcquireStatus::kCreated) {
-            if (auto r = cask->load_keydir_from_disk(cask->search_.get()); !r) return std::unexpected(r.error());
+            if (auto r = cask->load_keydir_from_disk(); !r) return std::unexpected(r.error());
             cask->keydir_->mark_ready();
         }
     } else {
         cask->keydir_ = std::make_shared<keydir::KeyDir>();
-        if (auto r = cask->load_keydir_from_disk(cask->search_.get()); !r) return std::unexpected(r.error());
+        if (auto r = cask->load_keydir_from_disk(); !r) return std::unexpected(r.error());
         cask->keydir_->mark_ready();
     }
     // S6-P3: 仅 search 模式注册车道（KV 模式无 search_）。索引双池由 registry
@@ -568,14 +576,12 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     // 在 keydir_/registry_ 就绪后（create_search_infra 早于此装配）。
     //
     // S15-3：闭包按 CaskPlugin 接口分发（捕获 plugins_ 快照 by value；P1 恒
-    // = {SearchLayerAdapter}）。生命周期：close 先 unregister_lib（flush 排空
-    // ⇒ 闭包不再被调用）再 reset adapter/search_，与旧「捕获 *search_」等价。
-    if (cask->search_ && cask->registry_) {
+    // = {TextPlugin, VectorPlugin}，S18-5）。生命周期见 close()：先 unregister_lib（flush
+    // 排空 ⇒ 闭包不再被调用）再 reset adapter/search_/docmap_。
+    if (cask->text_ && cask->registry_) {
         cask->index_pool_ = cask->registry_->index_pool();
         // 分发逻辑提取为命名方法（prepare_index_task / reduce_index_entry /
-        // on_index_worker_error），闭包退化为薄捕获委托——可独立测试，消除
-        // 契约测试里的闭包复刻。生命周期：close 先 unregister_lib（flush 排空
-        // ⇒ 闭包不再被调用）再 reset adapter/search_/docmap_。
+        // on_index_worker_error），闭包退化为薄捕获委托。
         auto* c = cask.get();
         cask->index_lane_ = cask->index_pool_->register_lib(
             [c](const IndexTask& task) { return c->prepare_index_task(task); },
@@ -592,7 +598,7 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     return cask;
 }
 
-// T2.4:open 阶段一——锁分配。语义跟原 open() 内的锁块完全一致:
+// T2.4:open 阶段一——锁分配:
 //   - read_write → 拿 bitcask.write.lock（acquire_writer_lock 内部含 stale 检测）
 //   - merge_only → 拿 bitcask.merge.lock（独立文件,stale 检测 + 写 pid +
 //     拍 live writer 的 active file id 快照供 needs_merge 排除）
@@ -715,6 +721,90 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
 // 配置时启动;worker 闭包内的所有 on_* / set_meta / on_vector 路径
 // 严格保持原顺序(单写者 = 本 worker 线程,与 on_vector 同线程维持
 // HNSW 单写者约束)。
+// S18-6：插件名 → manifest 组件槽的固定映射（P4 期宿主记账仍按 3 组件
+// manifest；P5 泛化为按插件名的动态 manifest 再撤）。
+static std::optional<bitcask::ComponentId>
+component_of_plugin(std::string_view name) {
+    if (name == "bm25") return bitcask::ComponentId::kBm25;
+    if (name == "hnsw") return bitcask::ComponentId::kVec;
+    return std::nullopt;
+}
+
+// S18-7：docmap 的 merge 搬迁参与者（设计 §3.9）——不入 plugins_ 注册表，
+// 仅由 Cask::merge 置于 run_merge 插件 span 首位（docmap 恒先于插件收到
+// relocate）。语义 = 原 SearchLayer::on_relocate：get 旧 slot → put_doc 换
+// loc（tstamp/doc_len 保留）。Index 自带锁 → 与 reducer 并发安全（现状
+// merger 直调时代的并发面不变）。
+namespace {
+class DocmapRelocator final : public bitcask::plugin::CaskPlugin {
+public:
+    explicit DocmapRelocator(bitcask::index::Index* d) : docmap_(d) {}
+    std::string_view name() const override { return "docmap-relocator"; }
+    bitcask::plugin::PluginStatus
+    open(const bitcask::plugin::OpenContext&) override {
+        return bitcask::plugin::PluginStatus::kOk;
+    }
+    std::uint64_t watermark() const override { return 0; }
+    bitcask::plugin::PluginStatus close() override {
+        return bitcask::plugin::PluginStatus::kOk;
+    }
+    void on_put(const bitcask::plugin::PutEvent&,
+                bitcask::plugin::PreparedPtr) override {}
+    void on_delete(const bitcask::plugin::DeleteEvent&) override {}
+    bitcask::plugin::FlushResult
+    flush(const bitcask::plugin::FlushRequest&) override {
+        return {bitcask::plugin::PluginStatus::kOk, 0, 0};
+    }
+    void on_relocate(const bitcask::plugin::RelocateEvent& e) override {
+        auto slot = docmap_->get(e.key);
+        if (!slot) return;
+        docmap_->put_doc(e.key, e.ord,
+                         bitcask::index::DocSlot{
+                             bitcask::index::DocLoc{e.loc.file_id,
+                                                    e.loc.offset,
+                                                    e.loc.total_sz},
+                             slot->tstamp, slot->doc_len});
+    }
+private:
+    bitcask::index::Index* docmap_;
+};
+}  // namespace
+
+// ---- S18-5：CaskPluginHost（plugin::PluginHost 实现）----
+
+std::optional<std::string>
+Cask::CaskPluginHost::read_at(plugin::RecordLoc loc) {
+    auto df = cask_->read_file(loc.file_id);
+    if (!df) return std::nullopt;
+    auto rec = df->read(loc.offset, loc.total_sz);
+    if (!rec || rec->type == format::RecordType::kTombstone) {
+        return std::nullopt;
+    }
+    return std::string(reinterpret_cast<const char*>(rec->value.data()),
+                       rec->value.size());
+}
+
+void Cask::CaskPluginHost::run_serialized(std::function<void()> fn) {
+    Cask* c = cask_;
+    if (c->index_pool_ && c->index_lane_) {
+        IndexTask t;
+        t.op  = IndexOp::RunFn;
+        t.ord = c->keydir_->alloc_ord();
+        t.fn  = std::move(fn);
+        c->submit_index_task(std::move(t));
+    } else {
+        fn();  // 无池（纯 KV / 理论不可达）：调用线程直跑
+    }
+}
+
+void Cask::CaskPluginHost::log(plugin::LogLevel level, std::string_view msg) {
+    if (level == plugin::LogLevel::kError) {
+        cask_->log_error(msg);
+    } else {
+        cask_->log_warn(msg);
+    }
+}
+
 std::expected<void, CaskFault>
 Cask::create_search_infra(const CaskOptions& opts) {
     if (!opts.search_config) {
@@ -728,24 +818,26 @@ Cask::create_search_infra(const CaskOptions& opts) {
     scfg.vector_metric = meta_config_.vector_metric;
     scfg.vector_inmem_int8 = meta_config_.vector_inmem_int8;  // P5b
     scfg.synonym_map = opts.synonym_map;  // S11：Cask 级 open-time 同义词词典透传
-    // S16-1：docmap 宿主先建，注入 SearchLayer（同一实例，所有权在 Cask）。
+    // S16-1/S19-2：docmap 宿主先建，插件直构注入（shim 退役）。
     docmap_ = std::make_shared<index::Index>();
-    search_ = std::make_unique<search::SearchLayer>(scfg, docmap_);
+    text_ = std::make_unique<text::TextPlugin>(scfg.text_config(), *docmap_,
+                                               *docmap_, *docmap_);
     // analyzer 构造失败（无效配置 / 分词器未注册 / 词典加载失败）则 analyzer_
     // 为空——决不能带病打开，否则首次带 text 的 put 段错误。干净拒绝。
-    if (!search_->has_analyzer()) {
-        search_.reset();
+    if (!text_->has_analyzer()) {
+        text_.reset();
+        docmap_.reset();
         return std::unexpected(err(CaskError::kInvalidOption,
                                    "analyzer creation failed (check analyzer type / dict_path)"));
     }
-    // S15-3：SearchLayer 经 adapter 作「唯一插件」接入分发表——IndexPool
-    // 写路径的 map/reduce 闭包只认识 plugins_（CaskPlugin 接口），不再直呼
-    // SearchLayer 方法。
-    search_adapter_ = std::make_unique<search::SearchLayerAdapter>(*search_);
-    plugins_ = {search_adapter_.get()};
-    // S6-P3: 不再每库自建池。共享池借用 + 车道注册推迟到 keydir 就绪后
-    // （caller 在 create_search_infra 返回、registry_/keydir_ 装配完成后做）。
-    // 此处仅建好 search_，标记本库为 search 模式（search_ != nullptr）。
+    vec_plugin_ = std::make_unique<vec::VectorPlugin>(scfg.vector_config(),
+                                                      *docmap_);
+    hybrid_.emplace(*text_, *vec_plugin_);
+    // S18-5：TextPlugin/VectorPlugin 直接注册进分发表。注册序 text 先 vec
+    // 后 = 原 reduce_apply 内「add_doc → on_vector」顺序。
+    plugins_ = {text_.get(), vec_plugin_.get()};
+    // S6-P3: 不再每库自建池。共享池借用 + 车道注册推迟到 keydir 就绪后。
+    // 此处仅建好插件，标记本库为 search 模式（text_ != nullptr）。
     return {};
 }
 
@@ -762,12 +854,12 @@ Cask::prepare_index_task(const IndexTask& task) {
     return preps;
 }
 
-// S16-2 写路径反转：宿主**先 apply DocMap**（身份/存活/meta），再按注册序广播
+// S16-2 写路径：宿主**先 apply DocMap**（身份/存活/meta），再按注册序广播
 // 给各插件（设计 §4：DocMap 恒在所有插件之前）。
-// 顺序安全性：docmap 先亮 live、postings/向量后加（与旧「postings 先、live 后」
-// 互换）——两序下并发查询都不可能命中「半个文档」（postings 无 → 不命中；
-// live 无 → 过滤），且 reducer 单写者保证同 ord 两步间无写交错。doc_len 是
-// 分析产物，宿主以 0 落行、BM25 侧经 set_doc_len 回填（S16 批次头②的缓行通道）。
+// 顺序安全性：docmap 先亮 live、postings/向量后加——并发查询都不可能命中
+// 「半个文档」（postings 无 → 不命中；live 无 → 过滤），且 reducer 单写者
+// 保证同 ord 两步间无写交错。doc_len 是分析产物，宿主以 0 落行、BM25 侧经
+// set_doc_len 回填（S16 批次头②的缓行通道）。
 void Cask::reduce_index_entry(ReorderEntry& entry) {
     std::visit([this](auto& e) {
         using T = std::decay_t<decltype(e)>;
@@ -815,8 +907,8 @@ void Cask::on_index_worker_error() noexcept {
 }
 
 void Cask::replay_delta_to_keydir(
-    const std::vector<search::SearchLayer::DeltaDocRow>& rows,
-    const std::vector<search::SearchLayer::DeltaRemoval>& rems,
+    const std::vector<index::DocmapDeltaRow>& rows,
+    const std::vector<index::DocmapDeltaRemoval>& rems,
     std::span<const std::byte> keydir_meta,
     RecoverySnapshots& recovery) {
     // 链重放：行 → LWW put；删除 → remove_if_older，ord 守卫顺序无关；
@@ -850,11 +942,12 @@ void Cask::replay_delta_to_keydir(
 //      （这些已被 save_components_base 重新写到 docmap.ckpt / bm25.ckpt /
 //       vec.ckpt 对应 .vec / .qc8 sidecar）。
 // 失败返回 false（caller 退全量 fold）。
-bool Cask::migrate_legacy_search_ckpt(search::SearchLayer& search_layer) {
+bool Cask::migrate_legacy_search_ckpt() {
     const std::string old_ckpt = dirname_ + "/" + kSearchCkptName;
     // 1) 读旧 ckpt → 内存态（不写 keydir，已由 caller 在 recovery 阶段
     // 后续的 load_recovery_snapshots 接管；这里只关心段载入与写新文件）。
-    auto result = search_layer.load_search_ckpt(old_ckpt);
+    // S19-2：legacy 读取器收编（load-only；shim 已降级测试夹具）。
+    auto result = legacy_ckpt::load(old_ckpt, *docmap_, *text_, *vec_plugin_);
     if (!result.loaded) {
         log_warn("migrate_legacy: failed to load legacy search.ckpt");
         return false;
@@ -868,16 +961,26 @@ bool Cask::migrate_legacy_search_ckpt(search::SearchLayer& search_layer) {
         e.chain_seq = 0;
         e.chain_watermark = result.watermark;
     }
-    // 3) 写 per-component 文件。
+    // 3) 写 per-component 文件。S18-2：docmap 组件由宿主直写。
+    const bool docmap_ok = index::save_docmap_base(
+        *docmap_, dirname_, result.watermark);
+    if (docmap_ok) {
+        docmap_chain_ = bitcask::ManifestEntry{
+            result.watermark, 0, result.watermark};
+    }
     std::array<bool, bitcask::kComponentCount> all_dirty{};
     for (auto& b : all_dirty) b = true;
-    auto base_res = search_layer.save_components_base(
-        dirname_, result.watermark, all_dirty);
-    if (!base_res.wrote_base[0] || !base_res.wrote_base[1]) {
+    // S19-2：组件 base 直调插件（原 shim save_components_base 调度壳）。
+    (void)all_dirty;
+    const bool bm25_ok = text_->save_component_base(dirname_,
+                                                    result.watermark);
+    const bool vec_ok = vec_plugin_->save_component_base(dirname_,
+                                                         result.watermark);
+    if (!docmap_ok || !bm25_ok) {
         log_warn("migrate_legacy: failed to write per-component base "
-                 "(docmap=" + std::to_string(base_res.wrote_base[0]) +
-                 " bm25=" + std::to_string(base_res.wrote_base[1]) +
-                 " vec=" + std::to_string(base_res.wrote_base[2]) + ")");
+                 "(docmap=" + std::to_string(docmap_ok) +
+                 " bm25=" + std::to_string(bm25_ok) +
+                 " vec=" + std::to_string(vec_ok) + ")");
         return false;
     }
     // 4) 写 manifest。
@@ -943,24 +1046,24 @@ void Cask::close() noexcept {
             read_files_.clear();
         }
         // A4-P2/P3 顺序要点:先排干本库车道(flush → Index 覆盖全部已分配
-        // ord),再在 keydir 仍在手时做 search 双保存(bm25 + sidecar,
-        // 覆盖标记取 peek_next_ord),最后落 keydir 快照并释放——
-        // 旧版在 keydir_.reset() 之后才存 sidecar,恒被跳过(P3 测试抓出)。
+        // ord),再在 keydir 仍在手时做 search 双保存(bm25 + sidecar,覆盖标记
+        // 取 peek_next_ord),最后落 keydir 快照并释放。顺序不可颠倒:sidecar
+        // 存点须在 keydir_.reset() 之前，否则恒被跳过。
         //
         // S6-P3: 池由 registry 共享，close 只注销本库车道（flush 排空 + 从
         // lanes_ 移除），不停池（其它库仍在用）。unregister_lib 内含 flush，
-        // 保证 search_ 析构前本 lane 的 reduce 闭包（捕获 *search_）已不再被
-        // reducer 调用。整池停在 registry 析构。
+        // 保证 search_ 析构前本 lane 的 reduce 闭包已不再被 reducer 调用。
+        // 整池停在 registry 析构。
         if (index_pool_ && index_lane_) {
             index_pool_->unregister_lib(index_lane_);
             index_lane_ = nullptr;
             index_pool_ = nullptr;  // 仅清借用指针，不动共享池本体
         }
-        if (search_ && opts_.read_write && keydir_) {
+        if (text_ && opts_.read_write && keydir_) {
             // P14e:统一分段 search.ckpt（docmap + bm25 + hnsw 单文件）。
             // S14-4：close 强制全量 base——干净关闭收敛为单一 base，
             // .prev 代际刷新、delta 链坍缩（链不跨干净重启累积）。
-            search_->force_ckpt_rebase();
+            force_ckpt_rebase();
             const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
             (void)save_search_ckpt_paired(search_ckpt,
                                           keydir_->peek_next_ord(),
@@ -988,11 +1091,13 @@ void Cask::close() noexcept {
         keydir_name_.clear();
     }
     keydir_.reset();
-    // S15-3：adapter 引用 *search_，先于 search_ 重置（lane 已在上方
-    // unregister（含 flush），闭包不会再触碰二者）。
-    search_adapter_.reset();
+    // S18-5：plugins_ 指向 search_ 内部插件，先清分发表再重置 search_
+    // （lane 已在上方 unregister（含 flush），闭包不会再触碰）。
     plugins_.clear();
-    search_.reset();
+    // S19-2：析构序——融合器（引用两插件）先行，插件次之，docmap 最后。
+    hybrid_.reset();
+    text_.reset();
+    vec_plugin_.reset();
     docmap_.reset();  // S16-1：shared_ptr 共持，序无关；此处只清宿主句柄
     if (write_lock_) {
         write_lock_->release_quiet();
@@ -1007,9 +1112,9 @@ void Cask::close() noexcept {
 // 静止处：close / merge 末尾 / open 恢复①）；RunFn 路径（checkpoint()/
 // 自动 ckpt）在**提交时刻**捕获水位、reducer 执行时刻写快照本体——执行时
 // 取水位会被并发写者推进，反转「keydir_covered ≤ search_covered」保存序
-// 不变量（路线 A §4），fold 从超前的字节水位起跳、search 丢失
-// [ckpt_wm, 快照时刻) 区间（回归测试 AutoCheckpointOnRoll 抓过此反转）。
-// 快照 entries 比水位新无害：fold 尾部重放对 keydir 幂等覆盖。
+// 不变量（路线 A §4），fold 从超前字节水位起跳、search 丢失
+// [ckpt_wm, 快照时刻) 区间。快照 entries 比水位新无害：fold 尾部重放对
+// keydir 幂等覆盖。
 std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>>
 Cask::collect_snapshot_watermarks() const noexcept {
     if (!keydir_) return std::nullopt;
@@ -1055,13 +1160,15 @@ void Cask::submit_index_task(IndexTask task) {
 // 优先 fold(hint_file)，hint 缺失或 trailer CRC 校验不过时回退到 fold(data_file)
 // 重建。fold 顺序按 tstamp 升序——保证后写入的 entry 覆盖前面的。
 // search_layer 为空时跳过 SearchLayer 的恢复。
-std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* search_layer) {
+std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
+    // S19-2：搜索模式判定改成员（text_ 非空 = 索引模式）。
+    const bool search_on = text_ != nullptr;
     auto entries = fileops::scan_dir(dirname_);
     if (!entries) return std::unexpected(io_fault(entries.error().errnum, dirname_));
 
     // P14e:search.ckpt 分段快照快路径。search.ckpt 健康且全段 CRC 通过
     // 时，fold 从 keydir 水位起跳过已覆盖字节；否则全量 fold（各索引自门）。
-    auto recovery = load_recovery_snapshots(search_layer);
+    auto recovery = load_recovery_snapshots();
     if (!recovery) return std::unexpected(recovery.error());
     bool snap_loaded = recovery->snap_loaded;
     const auto& snap_wms = recovery->snap_wms;
@@ -1072,11 +1179,26 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
         return 0;  // 快照不认识的文件(快照后新建/merge 产物)→ 全量 fold
     };
 
-    // S3:search 恢复期把 recover_doc 攒成批，交 recover_doc_batch 并行 analyze
-    // + 串行有序插入（仅 search_layer!=null 的串行路径用；并行 KV 路径不碰）。
-    // 插入序 == fold 序 → 与逐条 recover 结果一致。墓碑前必 flush 以保相对序。
+    // S3/S18-8:search 恢复期攒批重放——批内**并行 prepare**（纯函数契约
+    // 允许任意线程；PutEvent.replay 让 TextPlugin 对单文本也走 prepare
+    // 并行分析）+ **fold 序串行 on_put 广播**（宿主 docmap 行先落，
+    // doc_len=0 占位——与活写路径 S16-2 同构）。幂等由各结构 ord 水位
+    // 自门兜底（InvertedIndex::add_doc / HnswIndex::insert / docmap LWW），
+    // 重叠区重放安全。插入序 == fold 序 → 与逐条 recover 结果一致。
+    // 墓碑前必 flush 以保相对序。
     constexpr std::size_t kRecoverBatch = 1024;
-    std::vector<search::SearchLayer::RecoverDoc> recover_batch;
+    struct ReplayDoc {
+        std::string key;
+        std::uint64_t ord = 0;
+        std::string text;
+        std::uint32_t file_id = 0;
+        std::uint64_t offset = 0;
+        std::uint32_t total_sz = 0;
+        std::uint32_t tstamp = 0;
+        std::vector<float> vector;
+        std::vector<std::pair<std::string, std::string>> fields;
+    };
+    std::vector<ReplayDoc> recover_batch;
     // ①（s13-review §P1 后续）：统计本次恢复重分析的文档数——它度量的是
     // 「若现在不回存 checkpoint，下次崩溃要白付多少重放」。计所有喂进
     // recover 的文档（含被索引 ord 自门丢弃的重叠区：分析成本已经付了，
@@ -1087,11 +1209,57 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
     // 跳过该字段（与"丢弃"同级的降级）+ 循环后聚合告警，可观测不刷屏。
     std::size_t dangling_field_ids = 0;
     auto flush_recover = [&] {
-        if (search_layer && !recover_batch.empty()) {
-            recovered_docs += recover_batch.size();
-            search_layer->recover_doc_batch(recover_batch);
-            recover_batch.clear();
+        if (!search_on || recover_batch.empty()) return;
+        recovered_docs += recover_batch.size();
+        const std::size_t n = recover_batch.size();
+        const std::size_t np = plugins_.size();
+        // 视图物化（owning → FieldKV/DocView/PutEvent；容器预 size，批内
+        // 地址稳定——ev 持 &dv 指针）。
+        struct ItemViews {
+            std::vector<plugin::FieldKV> fkv;
+            plugin::DocView dv;
+            plugin::PutEvent ev;
+        };
+        std::vector<ItemViews> views(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            auto& d = recover_batch[i];
+            auto& v = views[i];
+            v.fkv.reserve(d.fields.size());
+            for (auto& [fn, fv] : d.fields) v.fkv.emplace_back(fn, fv);
+            v.dv.text = d.text;
+            v.dv.fields = v.fkv;
+            v.dv.vec = d.vector;
+            v.ev.ord = d.ord;
+            v.ev.key = d.key;
+            v.ev.doc = &v.dv;
+            v.ev.loc = plugin::RecordLoc{d.file_id, d.offset, d.total_sz};
+            v.ev.tstamp = d.tstamp;
+            v.ev.replay = true;  // S18-8
         }
+        // S3：批内并行 prepare（TBB 全局线程池，无 per-batch 线程创建）。
+        std::vector<std::vector<plugin::PreparedPtr>> preps(n);
+        tbb::parallel_for(std::size_t{0}, n, [&](std::size_t i) {
+            preps[i].resize(np);
+            for (std::size_t pi = 0; pi < np; ++pi) {
+                if (plugins_[pi]->wants_prepare()) {
+                    preps[i][pi] = plugins_[pi]->prepare(views[i].ev);
+                }
+            }
+        });
+        // fold 序串行 apply：宿主 docmap 行先落（doc_len=0，BM25 侧回填），
+        // 再按注册序广播 on_put——与活写路径 reduce_index_entry 同构。
+        for (std::size_t i = 0; i < n; ++i) {
+            auto& d = recover_batch[i];
+            docmap_->put_doc(d.key, d.ord,
+                             index::DocSlot{
+                                 index::DocLoc{d.file_id, d.offset,
+                                               d.total_sz},
+                                 d.tstamp, /*doc_len=*/0});
+            for (std::size_t pi = 0; pi < np; ++pi) {
+                plugins_[pi]->on_put(views[i].ev, std::move(preps[i][pi]));
+            }
+        }
+        recover_batch.clear();
     };
 
     // R3:每个 data file 的 fold 抽成独立单元 fold_one(e)。纯 KV 恢复
@@ -1113,7 +1281,7 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
             snap_loaded ? wm_of(static_cast<std::uint32_t>(e.tstamp)) : 0;
 
         bool used_hint = false;
-        if (e.has_hint && !search_layer && !snap_loaded) {
+        if (e.has_hint && !search_on && !snap_loaded) {
             auto hf = fileops::HintFile::open(e.hint_path,
                                                 fileops::HintFile::Mode::kRead);
             if (hf) {
@@ -1152,11 +1320,15 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                 std::uint32_t total_size) {
                 if (view.type == format::RecordType::kTombstone) {
                     keydir_->remove(bytes_to_view(view.key), view.tstamp);
-                    if (search_layer) {
+                    if (search_on) {
                         // S3:墓碑前 flush 攒批，保「文档↔墓碑」相对序（否则墓碑
                         // 可能先于其要删的 batch 内文档插入而被无效化）。
+                        // S18-8：墓碑重放 = 宿主 docmap remove（Index 自记账：
+                        // 脏位 + S14-4 门限删除日志）。**不广播 on_delete**——
+                        // 历史语义（原 recover_tomb）：恢复期不扣减倒排统计
+                        //（统计基线随 ckpt 快照恢复，重放墓碑只翻 live）。
                         flush_recover();
-                        search_layer->recover_tomb(bytes_to_view(view.key), view.ord);
+                        docmap_->remove(bytes_to_view(view.key), view.ord);
                     }
                     return;
                 }
@@ -1164,7 +1336,7 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                              total_size, offset, view.tstamp, /*now*/ 0,
                              /*newest*/ false, 0, 0, view.ord);
                 keydir_->advance_ord(view.ord);
-                if (search_layer) {
+                if (search_on) {
                     auto dv = codec::decode_doc_value(std::span<const std::byte>(view.value));
                     // V3.3:带向量的文档即使 text 为空也要恢复(否则
                     // Index 无该 ord,live 过滤会把它当死文档)。
@@ -1175,9 +1347,9 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                     // bm25.fields 重建无从谈起。
                     if (dv && (!dv->text.empty() || dv_has_vec ||
                                dv->has_fields)) {
-                        // S3:攒进批，满 kRecoverBatch 即并行处理。RecoverDoc 持
+                        // S3:攒进批，满 kRecoverBatch 即并行处理。ReplayDoc 持
                         // owning 拷贝（fold 缓冲会复用，view 不可跨记录留存）。
-                        search::SearchLayer::RecoverDoc rd;
+                        ReplayDoc rd;
                         rd.key.assign(reinterpret_cast<const char*>(view.key.data()),
                                       view.key.size());
                         rd.ord      = view.ord;
@@ -1250,7 +1422,7 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
     const std::size_t nworkers =
         std::min<std::size_t>(nfiles, hw);
 
-    if (search_layer != nullptr || nfiles <= 1 || nworkers <= 1) {
+    if (search_on || nfiles <= 1 || nworkers <= 1) {
         for (const auto& e : *entries) {
             if (auto r = fold_one(e); !r) return std::unexpected(r.error());
         }
@@ -1262,20 +1434,16 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
                      "(field.schema tail lost; affected fields stay "
                      "unindexed until rewritten)");
         }
-        // ①（s13-review §P1 后续）：恢复期重分析量超过阈值时，立即回存
-        // checkpoint——否则重建成果只在内存，下次干净 close/merge 前再崩
-        // 一次就全价重付（10M 级库重分词 + HNSW 重建可达小时级）。
-        // 触发条件用**重分析文档数**而非「是否全量 fold」：快照/ckpt 健康
-        // 但陈旧（长期运行未 close 的库崩溃后）时 fold 起点旧、尾部重放
-        // 可能极大，同样值得回存；反之新建空库、小尾部增量不值得付大库
-        // 整体序列化的成本（回存成本 ∝ 索引总量，省下的 ∝ 重放量）。
-        // 精细节奏控制走 checkpoint() API（②）。
-        // 此刻 index lane 尚未注册（open 在 fold 之后才 register_lib）、
-        // 无并发写者，调用线程直接序列化即安全。best-effort：失败仅降级
-        // 下次启动速度，不阻断 open。
-        // 只读 / merge_only 不写（不持 write.lock，禁写共享目录文件）。
+        // ①（s13-review §P1 后续）：恢复期重分析量超阈值时立即回存
+        // checkpoint——否则重建成果只在内存，下次干净 close/merge 前再崩一次
+        // 就全价重付。触发条件用**重分析文档数**而非「是否全量 fold」：ckpt
+        // 健康但陈旧时 fold 起点旧、尾部重放大，同样值得回存；空库/小尾部
+        // 增量不值得付大库整体序列化（回存成本 ∝ 索引总量，省下的 ∝ 重放量）。
+        // 精细节奏走 checkpoint() API（②）。此刻 index lane 未注册、无并发
+        // 写者，调用线程直接序列化即安全。best-effort：失败仅降级下次启动
+        // 速度，不阻断 open。只读 / merge_only 不写（不持 write.lock）。
         constexpr std::size_t kPostRecoveryCkptMinDocs = 1000;
-        if (search_layer && recovered_docs >= kPostRecoveryCkptMinDocs &&
+        if (search_on && recovered_docs >= kPostRecoveryCkptMinDocs &&
             opts_.read_write && !opts_.merge_only) {
             // S14-7：经成对入口（fold 后链可能有效 → delta 回存更省）。
             std::vector<std::byte> kd;
@@ -1329,7 +1497,7 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk(search::SearchLayer* 
 // 组件 file 路径分别载入 docmap.ckpt / bm25.ckpt / vec.ckpt。S17-5
 // 兼容：manifest 缺失但 search.ckpt 存在时触发一次性迁移。
 std::expected<Cask::RecoverySnapshots, CaskFault>
-Cask::load_recovery_snapshots(search::SearchLayer* search_layer) {
+Cask::load_recovery_snapshots() {
     RecoverySnapshots recovery;
 
     // S14-7：keydir base 快照**先**载（链的行/删除要应用在 base 之上）。
@@ -1339,7 +1507,26 @@ Cask::load_recovery_snapshots(search::SearchLayer* search_layer) {
     }
 
     bool search_ok = false;
-    if (search_layer) {
+    if (text_) {
+        // S18-6：插件 open 注入器——manifest 提示 + dir/host。**所有路径**
+        // （含 manifest 缺失/迁移失败的全量 fold 早退）都必须调用：插件的
+        // dir_/host_ 在 open 时注入，flush 依赖之；零提示 = 插件降级自建
+        // （watermark 0，rebase 置位 → 首次 flush 全量 base）。
+        auto open_plugins = [&](const bitcask::Manifest& m) {
+            for (auto* p : plugins_) {
+                const auto comp = component_of_plugin(p->name());
+                if (!comp) continue;
+                const auto& entry =
+                    m.entries[static_cast<std::size_t>(*comp)];
+                plugin::OpenContext ctx;
+                ctx.dir = dirname_;
+                ctx.host = &plugin_host_;
+                ctx.committed_base_watermark  = entry.base_watermark;
+                ctx.committed_chain_watermark = entry.chain_watermark;
+                ctx.committed_chain_seq       = entry.chain_seq;
+                (void)p->open(ctx);
+            }
+        };
         // S17-5 兼容：manifest 缺失 + search.ckpt 存在 → 一次性迁移。
         const std::string mpath = dirname_ + "/" +
             std::string(bitcask::kManifestName);
@@ -1350,77 +1537,85 @@ Cask::load_recovery_snapshots(search::SearchLayer* search_layer) {
         if (!has_manifest && has_old_ckpt) {
             // 触发迁移：把旧 search.ckpt 用旧路径 load 回来，再分
             // 写到新组件文件 + 写 manifest + 删旧文件。失败 → 全量 fold。
-            if (!migrate_legacy_search_ckpt(*search_layer)) {
+            if (!migrate_legacy_search_ckpt()) {
+                open_plugins(bitcask::Manifest{});  // S18-6：零提示注入
                 recovery.snap_loaded = false;
                 return recovery;
             }
         }
         auto manifest = bitcask::read_manifest(mpath);
         if (!manifest) {
-            // manifest 仍不可读（迁移失败/被破坏）→ 全量 fold。
+            // manifest 仍不可读（迁移失败/被破坏/新库）→ 全量 fold。
+            open_plugins(bitcask::Manifest{});  // S18-6：零提示注入
             recovery.snap_loaded = false;
             return recovery;
         }
         current_manifest_ = *manifest;
-        // S14-7：链重放钩子。
-        search::SearchLayer::DeltaReplayHook hook =
+        // S14-7：链重放钩子（S18-2：index:: 类型，仅 docmap 消费）。
+        index::DocmapReplayHook hook =
             [this, &recovery](
-                const std::vector<search::SearchLayer::DeltaDocRow>& rows,
-                const std::vector<search::SearchLayer::DeltaRemoval>& rems,
+                const std::vector<index::DocmapDeltaRow>& rows,
+                const std::vector<index::DocmapDeltaRemoval>& rems,
                 std::span<const std::byte> keydir_meta) {
                 replay_delta_to_keydir(rows, rems, keydir_meta, recovery);
             };
-        // 逐组件 load（每组件独立校验、链重放）。
         const auto hook_arg = recovery.snap_loaded ? hook :
-            search::SearchLayer::DeltaReplayHook{};
+            index::DocmapReplayHook{};
         bool all_components_ok = true;
         std::uint64_t min_chain_wm = UINT64_MAX;
-        for (std::size_t i = 0; i < bitcask::kComponentCount; ++i) {
-            const auto comp = static_cast<bitcask::ComponentId>(i);
-            const auto& entry = current_manifest_.entries[i];
-            auto cr = search_layer->load_component(
-                comp, dirname_, entry.base_watermark,
-                entry.chain_seq, hook_arg);
-            if (cr.loaded) {
-                min_chain_wm = std::min(min_chain_wm, cr.watermark);
-                // 同步 SearchLayer 内部链状态镜像——后续 save 走正确的
-                // 链续接。rebase = false：成功 load 的组件不需 rebase。
-                search::SearchLayer::ComponentCkptState st;
-                st.base_gen = entry.base_watermark;
-                st.chain_wm = cr.watermark;
-                st.next_seq = entry.chain_seq + 1;
-                st.rebase_needed = false;
-                search_layer->set_component_state(comp, st);
+        // S18-2：docmap 组件由宿主直载（keydir 链重放钩子只在这里生效）。
+        {
+            const auto& entry = current_manifest_.entries[0];
+            auto dr = index::load_docmap(*docmap_, dirname_,
+                                         entry.base_watermark,
+                                         entry.chain_seq, hook_arg);
+            if (dr.loaded) {
+                min_chain_wm = std::min(min_chain_wm, dr.watermark);
+                docmap_chain_ = bitcask::ManifestEntry{
+                    entry.base_watermark, entry.chain_seq, dr.watermark};
+            } else {
+                all_components_ok = false;
+                docmap_chain_ = bitcask::ManifestEntry{};
+            }
+        }
+        // S18-6：bm25/vec 经插件 open()（组件载入 + 链续接 + 自身 rebase
+        // 自管）。健康判据：watermark() == manifest 的 chain_watermark
+        // （损坏/缺失 → 插件自降级报 0 ≠ 非零 entry → 判不健康；新库两侧
+        // 皆 0 → 健康）。
+        open_plugins(current_manifest_);
+        for (auto* p : plugins_) {
+            const auto comp = component_of_plugin(p->name());
+            if (!comp) continue;
+            const auto& entry =
+                current_manifest_.entries[static_cast<std::size_t>(*comp)];
+            const std::uint64_t pw = p->watermark();
+            if (pw == entry.chain_watermark) {
+                min_chain_wm = std::min(min_chain_wm, pw);
             } else {
                 all_components_ok = false;
             }
         }
+        // 全组件健康 → 清 legacy 全局 rebase（细粒度标志各插件 open 自管）。
+        if (all_components_ok) {
+            ckpt_rebase_needed_.store(false, std::memory_order_relaxed);
+        }
         if (min_chain_wm == UINT64_MAX) {
             min_chain_wm = 0;  // 没有任何组件成功
         }
-        // 「全组件健康 + 非 .prev 回退」才能走字节水位快路径。.prev 任一
-        // 组件回退 → 字节水位不可信，退全量 fold。
+        // 「全组件健康」才走字节水位快路径；任一组件 .prev 回退 → 字节水位
+        // 不可信，退全量 fold。保守以 all_components_ok 近似「非 .prev」
+        // （load 内部已用 manifest base_wm 校验），再叠加 snap_loaded 双重门。
         bool any_from_prev = false;
-        // 简化为：要求所有组件都非 from_prev（任一组件回退就退全量 fold）。
-        // 单独读一次 ckpt 文件做 from_prev 检查（用 stat + 文件名），或
-        // 由 load_component 返回 from_prev 决定。这里保守：要求 all ok
-        // 即认为非 .prev（load 内部已用 manifest base_wm 校验，若不匹
-        // 配则 .prev 路径优先于 .prev 失败）。
-        // 简化处理：manifest 与磁盘文件不一致时 fold 兜底——我们通过
-        // 「all_components_ok = true 且 min_chain_wm >= keydir 水位」
-        // 双重门把关。
         search_ok = all_components_ok && recovery.snap_loaded;
         (void)any_from_prev;
-        // S17-4:fold_start = min(chain_watermarks)。各索引自门按其
-        // 自身 ord 水位丢重叠区。
+        // S17-4:fold_start = min(chain_watermarks)，各索引自门按其自身 ord
+        // 水位丢重叠区；snap_wms 保持原形态，由上层 fold 阶段自门。
         if (search_ok) {
-            // 把 min_chain_wm 反馈到 recovery.snap_wms——简化处理：保持
-            // 原 snap_wms 形态（Cask::load_recovery_snapshots 契约），由
-            // 上层 fold 阶段自行按各索引水位自门即可。
+            // min_chain_wm 不回写 snap_wms（保持契约形态，自门已足够）。
         }
     }
     // search 不健康 → 退回全量 fold（snap_loaded=false 让 fold_start=0）。
-    if (search_layer && !search_ok) {
+    if (text_ && !search_ok) {
         recovery.snap_loaded = false;
     }
     return recovery;
@@ -1665,7 +1860,7 @@ void Cask::evict_read_handles_locked() {
 // ---- 搜索 / 写入共用辅助 ---------------------------------------------------
 
 std::expected<void, CaskFault> Cask::prepare_search() {
-    if (!search_) return std::unexpected(err(CaskError::kNoIndex));
+    if (!text_) return std::unexpected(err(CaskError::kNoIndex));
     flush_index();
     return {};
 }
@@ -1723,30 +1918,17 @@ Cask::write_and_keydir(std::span<const std::byte> key,
 std::expected<std::span<const float>, CaskFault>
 Cask::prepare_vector(std::span<const float> input,
                      std::vector<float>& norm_buf) const {
+    // S18-3：归一化领域核心下沉 VectorPlugin::normalize_for_write（V3.1
+    // 「存储即归一化」与同步错误契约不变——Cask 是装配方，同步调用具体
+    // 插件；错误消息逐字保留，翻译成 CaskFault）。
     if (input.empty()) return {};
-    if (meta_config_.vector_dim == 0) {
+    if (!vec_plugin_ || meta_config_.vector_dim == 0) {
         return std::unexpected(err(CaskError::kInvalidOption,
             "collection has no vector config"));
     }
-    if (input.size() != meta_config_.vector_dim) {
-        return std::unexpected(err(CaskError::kInvalidOption,
-            "vector dim mismatch"));
-    }
-    if (meta_config_.vector_metric ==
-        meta::VectorMetric::kCosineNormalized) {
-        double sq = 0.0;
-        for (float v : input) sq += static_cast<double>(v) * v;
-        if (sq <= 0.0) {
-            return std::unexpected(err(CaskError::kInvalidOption,
-                "zero vector not allowed under cosine metric"));
-        }
-        const float inv = static_cast<float>(1.0 / std::sqrt(sq));
-        norm_buf.clear();
-        norm_buf.reserve(input.size());
-        for (float v : input) norm_buf.push_back(v * inv);
-        return std::span<const float>(norm_buf);
-    }
-    return input;
+    auto r = vec_plugin_->normalize_for_write(input, norm_buf);
+    if (!r) return std::unexpected(err(CaskError::kInvalidOption, r.error()));
+    return *r;
 }
 
 // ---- get / put / delete ----------------------------------------------------
@@ -2253,7 +2435,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint32_t tstamp) {
 //   v2: 4-byte little-endian shadow file_id (tells merger "I exist because of
 //       an entry in file_id N; if that entry is gone, I'm meaningless").
 //       If key not in keydir or file_id==0, fall back to v0.
-//       (P：盘格式统一小端，flag-day 前为大端。)
+//       (P：盘格式统一小端。)
 std::expected<void, CaskFault>
 Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
     WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
@@ -2434,7 +2616,8 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
 // S9-P2-d: 搜索层 SearchError → CaskFault 边界翻译（消除 expected<,string> 的
 // leaky abstraction）。当前三种都映射 kInvalidOption，但语义集中在此一处、
 // detail 文案由枚举确定性派生——新增搜索错误时只改这里，不必各 caller 猜 kind。
-static CaskFault search_fault(search::SearchError e) {
+// S19-1：提为 Cask 静态成员（Searcher 门面共享同一翻译）。
+CaskFault Cask::search_error_fault(search::SearchError e) {
     switch (e) {
         case search::SearchError::kNoVectorIndex:
             return err(CaskError::kInvalidOption, "no vector index configured");
@@ -2445,6 +2628,26 @@ static CaskFault search_fault(search::SearchError e) {
                        "hybrid query empty (no text, no vector)");
     }
     return err(CaskError::kInvalidOption, "unknown search error");
+}
+
+static CaskFault search_fault(search::SearchError e) {
+    return Cask::search_error_fault(e);
+}
+
+// S14-4/S19-2：merge/close 收链入口（原 SearchLayer::force_ckpt_rebase）。
+void Cask::force_ckpt_rebase() {
+    ckpt_rebase_needed_.store(true, std::memory_order_relaxed);
+    if (text_) text_->force_rebase();
+    if (vec_plugin_) vec_plugin_->force_rebase();
+}
+
+// S19-1：查询读屏障公开化（Searcher 门面消费；语义 = closed 检查 +
+// prepare_search 的 flush 读屏障）。
+std::expected<void, CaskFault> Cask::drain_plugins() {
+    if (is_closed()) {
+        return std::unexpected(err(CaskError::kClosed, "cask is closed"));
+    }
+    return prepare_search();
 }
 
 // S8-R3: 单条搜索公共骨架。flush → 可选 vector 校验 → 跑内核 → 包错误/结果。
@@ -2469,7 +2672,7 @@ std::expected<TextSearchResult, CaskFault>
 Cask::search_vector(std::span<const float> query, std::size_t k,
                      std::size_t ef, const meta::MetaFilter* filter) {
     return run_search_one(/*require_vector=*/true,
-        [&] { return search_->search_vector(query, k, ef, filter); });
+        [&] { return vec_plugin_->search(query, k, ef, filter); });
 }
 
 // search_hybrid:RRF 混合检索(V3.6)。两路检索与 RRF 融合在 SearchLayer::search_hybrid。
@@ -2478,7 +2681,7 @@ Cask::search_hybrid(std::string_view text_query,
                      std::span<const float> vec_query, std::size_t k,
                      const meta::MetaFilter* filter) {
     return run_search_one(/*require_vector=*/true,
-        [&] { return search_->search_hybrid(text_query, vec_query, k, filter); });
+        [&] { return hybrid_->search(text_query, vec_query, k, filter); });
 }
 
 // search_text：BM25 词袋模式搜索。
@@ -2487,7 +2690,7 @@ Cask::search_text(std::string_view query, std::size_t k,
                   const meta::MetaFilter* filter, std::size_t offset) {
     return run_search_one(/*require_vector=*/false,
         [&] {
-            auto hits = search_->search_text(query, k + offset, nullptr, filter);
+            auto hits = text_->search_text(query, k + offset, nullptr, filter);
             if (hits && offset > 0) {  // S13-D10：overfetch 后丢前 offset 条
                 if (hits->size() > offset) {
                     hits->erase(hits->begin(),
@@ -2508,7 +2711,7 @@ Cask::search_text_highlight(std::string_view query, std::size_t k,
                             const search::HighlightOptions& opts) {
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
     if (auto g = prepare_search(); !g) return std::unexpected(g.error());
-    auto hits = search_->search_text_highlight(query, k, opts);
+    auto hits = text_->search_text_highlight(query, k, opts);
     if (!hits) return std::unexpected(search_fault(hits.error()));
     return HighlightSearchResult{std::move(*hits)};
 }
@@ -2549,7 +2752,7 @@ Cask::search_text_batch(std::span<const std::string_view> queries,
                         std::size_t k, const meta::MetaFilter* filter) {
     return run_search_batch(queries.size(), /*require_vector=*/false,
         [&](std::size_t i) -> std::expected<TextSearchResult, CaskFault> {
-            auto hits = search_->search_text(queries[i], k, nullptr, filter);
+            auto hits = text_->search_text(queries[i], k, nullptr, filter);
             if (!hits) return std::unexpected(search_fault(hits.error()));
             return TextSearchResult{std::move(*hits)};
         });
@@ -2562,7 +2765,7 @@ Cask::search_vector_batch(std::span<const std::span<const float>> queries,
                           const meta::MetaFilter* filter) {
     return run_search_batch(queries.size(), /*require_vector=*/true,
         [&](std::size_t i) -> std::expected<TextSearchResult, CaskFault> {
-            auto hits = search_->search_vector(queries[i], k, ef, filter);
+            auto hits = vec_plugin_->search(queries[i], k, ef, filter);
             if (!hits) return std::unexpected(search_fault(hits.error()));
             return TextSearchResult{std::move(*hits)};
         });
@@ -2574,7 +2777,7 @@ Cask::search_hybrid_batch(std::span<const HybridQuery> queries,
                           std::size_t k, const meta::MetaFilter* filter) {
     return run_search_batch(queries.size(), /*require_vector=*/true,
         [&](std::size_t i) -> std::expected<TextSearchResult, CaskFault> {
-            auto hits = search_->search_hybrid(queries[i].text, queries[i].vec, k, filter);
+            auto hits = hybrid_->search(queries[i].text, queries[i].vec, k, filter);
             if (!hits) return std::unexpected(search_fault(hits.error()));
             return TextSearchResult{std::move(*hits)};
         });
@@ -2586,7 +2789,7 @@ Cask::search_phrase(std::string_view query, std::size_t k,
                     std::size_t offset) {
     return run_search_one(/*require_vector=*/false,
         [&] {
-            auto hits = search_->search_phrase(query, k + offset);
+            auto hits = text_->search_phrase(query, k + offset);
             if (hits && offset > 0) {  // S13-D10
                 if (hits->size() > offset) {
                     hits->erase(hits->begin(),
@@ -2603,14 +2806,14 @@ Cask::search_phrase(std::string_view query, std::size_t k,
 std::expected<TextSearchResult, CaskFault>
 Cask::search_fields(std::string_view query, std::size_t k) {
     return run_search_one(/*require_vector=*/false,
-        [&] { return search_->search_fields(query, k); });
+        [&] { return text_->search_fields(query, k); });
 }
 
 // search_near：BM25 近邻搜索（S8.7）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_near(std::string_view query, std::uint32_t slop, std::size_t k) {
     return run_search_one(/*require_vector=*/false,
-        [&] { return search_->search_near(query, slop, k); });
+        [&] { return text_->search_near(query, slop, k); });
 }
 
 // bool_search：BM25 布尔搜索（AND/OR/NOT）。
@@ -2619,7 +2822,7 @@ Cask::bool_search(std::string_view query, std::size_t k,
                   std::size_t offset) {
     return run_search_one(/*require_vector=*/false,
         [&] {
-            auto hits = search_->bool_search(query, k + offset);
+            auto hits = text_->bool_search(query, k + offset);
             if (hits && offset > 0) {  // S13-D10
                 if (hits->size() > offset) {
                     hits->erase(hits->begin(),
@@ -2636,14 +2839,14 @@ Cask::bool_search(std::string_view query, std::size_t k,
 std::expected<TextSearchResult, CaskFault>
 Cask::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance) {
     return run_search_one(/*require_vector=*/false,
-        [&] { return search_->search_fuzzy(query, k, max_edit_distance); });
+        [&] { return text_->search_fuzzy(query, k, max_edit_distance); });
 }
 
 // S8.4：通配符搜索（* / ? 模式匹配）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_wildcard(std::string_view pattern, std::size_t k) {
     return run_search_one(/*require_vector=*/false,
-        [&] { return search_->search_wildcard(pattern, k); });
+        [&] { return text_->search_wildcard(pattern, k); });
 }
 
 std::expected<void, CaskFault> Cask::sync() {
@@ -2753,9 +2956,9 @@ StatusInfo Cask::status() {
     s.index_errors = index_errors_.load(std::memory_order_relaxed);
     // S13-D8：观测扩展（全部经线程安全访问器：HNSW 原子计数、cache 自带锁、
     // read_files_ shared_lock；不含需遍历 concurrent map 的指标，见 hpp 注）。
-    if (search_) {
-        s.hnsw_nodes = search_->hnsw_size();
-        s.search_cache_entries = search_->cache_entries();
+    if (text_) {
+        s.hnsw_nodes = vec_plugin_->size();
+        s.search_cache_entries = text_->cache_entries();
     }
     s.read_handles = read_handle_count();
     return s;
@@ -2798,8 +3001,8 @@ Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
     // dead_doc_rate = (total_ords - live_docs) * 100 / total_ords
     // total_ords==0 时跳过(无任何写入,谈不上删除率)。
     int dead_doc_rate = 0;
-    if (search_) {
-        auto idx_info = search_->index_info();
+    if (text_) {
+        auto idx_info = docmap_->info();
         if (idx_info.total_ords > 0) {
             dead_doc_rate = static_cast<int>(
                 (idx_info.total_ords - idx_info.live_docs) * 100
@@ -2830,7 +3033,7 @@ std::expected<void, CaskFault> Cask::checkpoint() {
                                      "checkpoint: read-only cask"));
     }
     std::lock_guard<std::mutex> lk(ckpt_mu_);
-    if (!search_) {
+    if (!text_) {
         // 纯 KV 库：keydir 快照即全部（无 reducer，调用线程直写；并发调用
         // 由 ckpt_mu_ 串行，快照 tmp+rename 不与自身竞争）。
         write_keydir_snapshot();
@@ -2945,62 +3148,82 @@ bool Cask::save_checkpoint_paired(
     const std::optional<std::vector<
         std::pair<std::uint32_t, std::uint64_t>>>& wms,
     const std::vector<std::byte>& keydir_delta) {
-    if (!search_) return true;  // 纯 KV 库无 search ckpt
-    // 取真实 dirty 掩码（每个组件独立的脏位）。
-    std::array<bool, bitcask::kComponentCount> dirty_mask =
-        search_->dirty_mask();
-    // 决策：!rebase_needed 且至少一个组件脏 且所有组件 chain_seq <
-    // max_delta_chain 上限 → delta；否则 base。已激活链就应当续链。
-    // max_delta_chain 来源：opts_.search_config->max_delta_chain（0 = 无限）。
-    std::uint32_t max_delta_chain = 0;
-    if (opts_.search_config.has_value()) {
-        max_delta_chain = opts_.search_config->max_delta_chain;
-    }
+    if (!text_) return true;  // 纯 KV 库无 search ckpt
+    // S18-6：base/delta 决策下沉——宿主只决策 docmap（自己的组件）+ 全局
+    // 收链提示（close/静止全量），插件在 flush() 内自决（自身 rebase 标志 +
+    // 链长上限）。旧「全体 base or 全体 delta」放宽为 per-component（S17
+    // manifest per-component 语义本就支持；rebase 解耦红利：rebuild_hnsw
+    // 只 rebase vec 链，bm25/docmap 链不动）。
+    // S19-2：脏掩码直接组装（原 shim dirty_mask()）。
+    std::array<bool, bitcask::kComponentCount> dirty_mask{};
+    dirty_mask[0] = docmap_->dirty();
+    dirty_mask[1] = text_->dirty();
+    dirty_mask[2] = vec_plugin_->dirty();
     bool any_dirty = false;
     for (bool d : dirty_mask) {
         if (d) { any_dirty = true; break; }
     }
-    bool can_delta = any_dirty && !search_->needs_ckpt_rebase();
-    if (can_delta && max_delta_chain > 0) {
-        for (std::size_t i = 0; i < bitcask::kComponentCount; ++i) {
-            const auto& e = current_manifest_.entries[i];
-            // max_delta_chain = 0 表示无限；否则 chain_seq 必须 < max。
-            if (e.chain_seq >= max_delta_chain) {
-                can_delta = false; break;
-            }
-        }
+    std::uint32_t max_delta_chain = 0;
+    if (opts_.search_config.has_value()) {
+        max_delta_chain = opts_.search_config->max_delta_chain;
     }
-    // 走 delta 路径。
-    if (can_delta) {
-        auto delta_res = search_->save_components_delta(
-            dir, wm, dirty_mask,
-            std::span<const std::byte>(keydir_delta.data(),
-                                        keydir_delta.size()));
-        // 写 manifest：成功的组件推进 chain_seq + chain_watermark。
-        bitcask::Manifest new_manifest = current_manifest_;
-        for (std::size_t i = 0; i < bitcask::kComponentCount; ++i) {
-            if (delta_res.wrote[i]) {
-                new_manifest.entries[i].chain_seq = delta_res.new_seqs[i];
-                new_manifest.entries[i].chain_watermark = wm;
-            }
-        }
-        const std::string mpath = std::string(dir) + "/" +
-            std::string(bitcask::kManifestName);
-        if (!bitcask::write_manifest(mpath, new_manifest)) {
-            return false;
-        }
-        current_manifest_ = new_manifest;
-        return true;
-    }
-    // 走 base 路径。
-    auto base_res = search_->save_components_base(dir, wm, dirty_mask);
+    const bool docmap_cap = max_delta_chain > 0 &&
+                            docmap_chain_.chain_seq >= max_delta_chain;
+    // 宿主全局判据（≈ 旧 can_delta）：无脏（静止收尾全量）或全局 rebase
+    // （close/compact/rebuild/legacy）→ 全量 base；docmap 链达上限 → docmap
+    // 走 base（插件自查各自上限）。
+    const bool global_base = !any_dirty ||
+        ckpt_rebase_needed_.load(std::memory_order_relaxed);
+
     bitcask::Manifest new_manifest = current_manifest_;
-    for (std::size_t i = 0; i < bitcask::kComponentCount; ++i) {
-        if (base_res.wrote_base[i]) {
-            new_manifest.entries[i].base_watermark = wm;
-            new_manifest.entries[i].chain_seq = 0;
-            new_manifest.entries[i].chain_watermark = wm;
+    bool docmap_base_taken = false;
+    if (global_base || docmap_cap) {
+        // docmap base（S18-2 宿主直驱）。
+        if (index::save_docmap_base(*docmap_, dir, wm)) {
+            docmap_chain_ = bitcask::ManifestEntry{wm, 0, wm};
+            new_manifest.entries[0] = docmap_chain_;
+            docmap_base_taken = true;
         }
+    } else if (dirty_mask[0]) {
+        const std::uint32_t seq = docmap_chain_.chain_seq + 1;
+        if (index::save_docmap_delta(
+                *docmap_, dir, wm, docmap_chain_.base_watermark,
+                docmap_chain_.chain_watermark, seq,
+                std::span<const std::byte>(keydir_delta.data(),
+                                            keydir_delta.size()))) {
+            docmap_chain_.chain_seq = seq;
+            docmap_chain_.chain_watermark = wm;
+            new_manifest.entries[0] = docmap_chain_;
+        }
+    }
+    // 插件 flush（S18-6）：force_rebase 传宿主全局判据；插件内部叠加自身
+    // rebase/链上限。成功（覆盖水位推进到 wm）才更新 manifest 对应项。
+    plugin::FlushRequest freq;
+    freq.reason = plugin::FlushRequest::Reason::kManual;
+    freq.force_rebase = global_base;
+    freq.watermark = wm;
+    for (auto* p : plugins_) {
+        const auto comp = component_of_plugin(p->name());
+        if (!comp) continue;
+        auto fr = p->flush(freq);
+        if (fr.status == plugin::PluginStatus::kOk && fr.covered_ord == wm) {
+            // S19-2：链状态直接从插件读（原 shim get_component_state）。
+            auto& e = new_manifest.entries[static_cast<std::size_t>(*comp)];
+            if (*comp == bitcask::ComponentId::kBm25) {
+                const auto cs = text_->chain_state();
+                e = bitcask::ManifestEntry{cs.base_gen, cs.next_seq - 1,
+                                           cs.chain_wm};
+            } else {
+                const auto cs = vec_plugin_->chain_state();
+                e = bitcask::ManifestEntry{cs.base_gen, cs.next_seq - 1,
+                                           cs.chain_wm};
+            }
+        }
+    }
+    // base 轮落成 → 清 legacy 全局 rebase（旧 save_components_base 尾部
+    // 语义；插件自身标志由各自 flush 成功时清）。
+    if (global_base) {
+        ckpt_rebase_needed_.store(false, std::memory_order_relaxed);
     }
     const std::string mpath = std::string(dir) + "/" +
         std::string(bitcask::kManifestName);
@@ -3010,7 +3233,9 @@ bool Cask::save_checkpoint_paired(
         return false;
     }
     current_manifest_ = new_manifest;
-    if (wms) {
+    // keydir 快照与 docmap base 成对（delta 路径下 keydir 元数据已内联进
+    // docmap delta 的 kKeydirDelta 段）。
+    if (docmap_base_taken && wms) {
         write_keydir_snapshot(*wms);
     }
     return true;
@@ -3018,7 +3243,7 @@ bool Cask::save_checkpoint_paired(
 
 void Cask::maybe_submit_auto_checkpoint() {
     if (opts_.auto_checkpoint_min_docs == 0) return;          // 未启用
-    if (!search_ || !index_pool_ || !index_lane_) return;     // 仅索引模式
+    if (!text_ || !index_pool_ || !index_lane_) return;     // 仅索引模式
     if (!auto_ckpt_pending_.load(std::memory_order_relaxed)) return;
     const std::uint64_t now_ord = keydir_->peek_next_ord();
     if (now_ord - last_ckpt_ord_.load(std::memory_order_relaxed) <
@@ -3097,14 +3322,25 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         }
         files = std::move(n.files);
     }
+    // S18-7：merge 参与插件 span——首位 DocmapRelocator（宿主 docmap 搬迁），
+    // 其余按注册序。纯 KV 库空 span。生命周期：栈上，覆盖 run_merge 全程
+    //（事件同步派发；插件收尾闭包经 run_serialized 已入 RunFn 队列，不引用
+    // relocator）。
+    DocmapRelocator relocator(docmap_.get());
+    std::vector<plugin::CaskPlugin*> merge_plugins;
+    if (text_) {
+        merge_plugins.reserve(plugins_.size() + 1);
+        merge_plugins.push_back(&relocator);
+        for (auto* p : plugins_) merge_plugins.push_back(p);
+    }
     auto r = merge::run_merge(files, dirname_, *keydir_, opts_.o_sync,
-                              search_.get(),
+                              merge_plugins,
                               now_sec ? now_sec : now_sec_default());
     if (!r) {
         return std::unexpected(err(CaskError::kIo, r.error().detail));
     }
 
-    if (search_) {
+    if (text_) {
         // P3 顺序约定（S14-4 修订）:**捕获**较早水位（此刻文件大小），但
         // 文件**写入**延后到 search.ckpt 保存成功之后——写序反了的话，
         // 两写之间崩溃会留下「新快照+旧 ckpt」，fold 从超前水位起跳、
@@ -3112,50 +3348,10 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         const auto merge_snap_wms = collect_snapshot_watermarks();
         if (index_pool_ && index_lane_) index_pool_->flush(index_lane_);
 
-        // P2:merge 不再全量重读+重分词重建倒排。merge::run_merge 已通过
-        // on_relocate 把每条 live 文档的存储定位更新到新文件;倒排 posting 以
-        // 稳定 ord 为键、与文件位置无关;死文档查询时由 is_live 过滤(正确性
-        // 不依赖压实)。这里只按阈值压实死 posting 回收空间——不读数据文件、
-        // 不重分词,省掉 merge 的全量 NLP 重算。死占比 < 阈值的 posting list
-        // 留待后续 merge 累积到阈值再压。
-        //
-        // S13-F6：compact 遍历 tbb::concurrent_hash_map——与 reducer 的
-        // add_doc 插入并发不安全（上面的 flush 只排干已提交任务，§7.6 允许
-        // 的并发 put 在 flush 之后仍持续提交）。故封装成 RunFn 任务经
-        // reorder buffer 在 reducer 线程内执行（同 RebuildHnsw 先例），
-        // 恢复 S12-2「遍历只发生在 reducer」的不变量。
-        constexpr double kMergeCompactDeadRatio = 0.2;
-        if (index_pool_ && index_lane_) {
-            IndexTask t;
-            t.op  = IndexOp::RunFn;
-            t.ord = keydir_->alloc_ord();
-            t.fn  = [this] {
-                search_->compact(kMergeCompactDeadRatio);
-                search_->compact_index_chunks();
-            };
-            index_pool_->submit(index_lane_, std::move(t));
-            index_pool_->flush(index_lane_);
-        } else {
-            // 无索引池（理论不可达：search_ 存在则 lane 已注册）——退化为
-            // 调用线程直跑，行为同旧版。
-            search_->compact(kMergeCompactDeadRatio);
-            search_->compact_index_chunks();
-        }
-
-        // V4:merge 后同步重建 HNSW（物理清除死节点）。重建在 reducer 线程
-        // 执行（单写者约束），flush 阻塞等待完成。S15-2：原专用 RebuildHnsw
-        // 操作并入 RunFn 通道——重建本就是塞进 reducer 静止点的闭包。ord
-        // 照旧 alloc_ord 占位，经 reorder buffer 与本 merge 期间累积的
-        // put/delete 同序串行 apply——保持 HNSW 单写者约束在 ord 维度上的
-        // 严格性。该 ord 在数据语义上不指向任何文档（类似 Skip）。
-        if (meta_config_.vector_dim > 0 && index_pool_ && index_lane_) {
-            IndexTask t;
-            t.op  = IndexOp::RunFn;
-            t.ord = keydir_->alloc_ord();
-            t.fn  = [this] { search_->rebuild_hnsw(); };
-            index_pool_->submit(index_lane_, std::move(t));
-            index_pool_->flush(index_lane_);
-        }
+        // S18-7：倒排压实与 HNSW 重建已随 on_merge_commit 由各插件自主
+        // 提交（run_serialized → RunFn FIFO，先于下方成对保存点执行——
+        // 顺序涌现 = 旧「compact → rebuild → ckpt」硬编码序）。宿主只剩
+        // docmap 侧收尾（chunk 回收）+ merge 恒 rebase + 成对保存点。
 
         // P14e:统一分段 search.ckpt 替代旧多文件保存。
         // best-effort:checkpoint 保存失败非致命——下次 open 回退到全量 fold 重建
@@ -3168,10 +3364,14 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
             IndexTask t;
             t.op  = IndexOp::RunFn;
             t.ord = keydir_->alloc_ord();
-            // S14-7：merge 恒 rebase（compact 已置位）→ paired 走 base +
-            // 全量快照（用早段捕获的水位）。
+            // S14-7：merge 恒 rebase → paired 走 base + 全量快照（用早段
+            // 捕获的水位）。S18-7：rebase 标志改在此显式置位（原经 compact
+            // shim 顺带置全局位；插件版 compact 只置自身位）；docmap chunk
+            // 回收（原 compact_index_chunks）一并收进本 RunFn。
             t.fn  = [this, search_ckpt, wms = merge_snap_wms,
                      wm = keydir_->peek_next_ord()] {
+                docmap_->compact_chunks();
+                force_ckpt_rebase();
                 if (!save_search_ckpt_paired(search_ckpt, wm, wms, {})) {
                     log_warn("search checkpoint save failed after merge "
                              "(will rebuild on next open)");  // S13-D7
@@ -3180,6 +3380,8 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
             index_pool_->submit(index_lane_, std::move(t));
             index_pool_->flush(index_lane_);
         } else {
+            docmap_->compact_chunks();
+            force_ckpt_rebase();
             if (!save_search_ckpt_paired(search_ckpt,
                                          keydir_->peek_next_ord(),
                                          merge_snap_wms, {})) {
