@@ -4,6 +4,7 @@
 
 #include "legacy_ckpt.hpp"
 
+#include "bitcask/ckpt_chain.hpp"        // S20-2：walk_chain
 #include "bitcask/search_checkpoint.hpp"
 
 #include <filesystem>
@@ -41,58 +42,13 @@ bool apply_delta_file(const std::vector<sc::LoadedSection>& sections,
         case sc::CkptSectionType::kBm25FieldsDelta:
             if (!text.apply_fields_delta(pl)) return false;
             break;
-        case sc::CkptSectionType::kDocmapDelta: {
-            const auto* p = ls.payload.data();
-            const auto* end = p + ls.payload.size();
-            if (end - p < 8) return false;
-            std::uint64_t rn = sc::detail::get_u64(p); p += 8;
-            hook_rows.reserve(rn);
-            for (std::uint64_t i = 0; i < rn; ++i) {
-                if (end - p < 10) return false;
-                index::DocmapDeltaRow r;
-                r.ord = sc::detail::get_u64(p); p += 8;
-                std::uint16_t klen = sc::detail::get_u16(p); p += 2;
-                if (end - p < klen + 24) return false;
-                r.ext.assign(reinterpret_cast<const char*>(p), klen);
-                p += klen;
-                r.slot.loc.file_id  = sc::detail::get_u32(p); p += 4;
-                r.slot.loc.offset   = sc::detail::get_u64(p); p += 8;
-                r.slot.loc.total_sz = sc::detail::get_u32(p); p += 4;
-                r.slot.tstamp       = sc::detail::get_u32(p); p += 4;
-                r.slot.doc_len      = sc::detail::get_u32(p); p += 4;
-                hook_rows.push_back(std::move(r));
-            }
-            if (end - p < 8) return false;
-            std::uint64_t mn = sc::detail::get_u64(p); p += 8;
-            hook_rems.reserve(mn);
-            for (std::uint64_t i = 0; i < mn; ++i) {
-                if (end - p < 10) return false;
-                index::DocmapDeltaRemoval m;
-                m.tomb = sc::detail::get_u64(p); p += 8;
-                std::uint16_t klen = sc::detail::get_u16(p); p += 2;
-                if (end - p < klen) return false;
-                m.key.assign(reinterpret_cast<const char*>(p), klen);
-                p += klen;
-                hook_rems.push_back(std::move(m));
-            }
-            if (p != end) return false;
-            std::size_t ri = 0, mi = 0;
-            while (ri < hook_rows.size() || mi < hook_rems.size()) {
-                const bool take_row =
-                    mi >= hook_rems.size() ||
-                    (ri < hook_rows.size() &&
-                     hook_rows[ri].ord < hook_rems[mi].tomb);
-                if (take_row) {
-                    docmap.put_doc(hook_rows[ri].ext, hook_rows[ri].ord,
-                                   hook_rows[ri].slot);
-                    ++ri;
-                } else {
-                    docmap.remove(hook_rems[mi].key, hook_rems[mi].tomb);
-                    ++mi;
-                }
+        case sc::CkptSectionType::kDocmapDelta:
+            // S20-2 R3：解析 + 交错重放收敛至 index::apply_docmap_delta_section。
+            if (!index::apply_docmap_delta_section(docmap, pl, hook_rows,
+                                                   hook_rems)) {
+                return false;
             }
             break;
-        }
         case sc::CkptSectionType::kHnswDelta:
             if (!vec.apply_delta_log(pl)) return false;
             break;
@@ -195,44 +151,19 @@ LoadResult load(std::string_view path, index::Index& docmap,
 
     // S14-4：delta 链重放。base 健康且非 .prev 回退才吃链；链在「文件缺失」
     // 处正常终止；「文件存在但无效」→ 保守判整体不健康（caller 退全量 fold）。
+    // S20-2 R2：无界走读（chain_seq=0）收敛至 sc::walk_chain。
     std::uint64_t chain_coverage = result.watermark;
     const std::uint64_t chain_base_gen = result.watermark;
     std::uint32_t chain_next_seq = 1;
     if (result.all_segments_ok && !from_prev) {
-        for (;; ++chain_next_seq) {
-            const std::string dpath =
-                fp + ".d" + std::to_string(chain_next_seq);
-            std::error_code ec;
-            if (!std::filesystem::exists(dpath, ec)) break;  // 正常链尾
-            auto dc = sc::SearchCheckpoint::read(dpath);
-            bool applied = false;
-            if (dc) {
-                const sc::LoadedSection* info = nullptr;
-                for (const auto& dls : dc->sections) {
-                    if (dls.type == static_cast<std::uint16_t>(
-                                        sc::CkptSectionType::kDeltaInfo)) {
-                        info = &dls;
-                        break;
-                    }
-                }
-                if (info && info->crc_ok && info->payload.size() == 20) {
-                    const auto* q = info->payload.data();
-                    const std::uint64_t gen = sc::detail::get_u64(q); q += 8;
-                    const std::uint64_t pw = sc::detail::get_u64(q); q += 8;
-                    const std::uint32_t seq = sc::detail::get_u32(q);
-                    if (gen == chain_base_gen && pw == chain_coverage &&
-                        seq == chain_next_seq) {
-                        applied = apply_delta_file(dc->sections, docmap,
-                                                   text, vec, hook);
-                    }
-                }
-            }
-            if (!applied) {
-                result.all_segments_ok = false;
-                break;
-            }
-            chain_coverage = dc->watermark;
-        }
+        const auto w = sc::walk_chain(
+            fp, chain_base_gen, /*base_coverage=*/chain_coverage,
+            /*chain_seq=*/0, [&](const sc::LoadedCheckpoint& dc) {
+                return apply_delta_file(dc.sections, docmap, text, vec, hook);
+            });
+        chain_coverage = w.coverage;
+        chain_next_seq = w.next_seq;
+        if (!w.ok) result.all_segments_ok = false;
     }
     result.watermark = chain_coverage;
 

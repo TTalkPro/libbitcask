@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "bitcask/component_ckpt.hpp"  // S20-1 R6：共用载入结果类型
 #include "bitcask/index.hpp"
 
 #include <cstdint>
@@ -45,6 +46,14 @@ using DocmapReplayHook = std::function<void(
     const std::vector<DocmapDeltaRemoval>&,
     std::span<const std::byte> keydir_meta)>;
 
+// kDocmapDelta 段解析 + 交错重放（S20-2 R3：docmap_ckpt 与 legacy_ckpt 共用）。
+// 窗口 live 行 + 删除日志按 ord 升序交错应用到 Index（「删后重写」场景删除
+// 必须先于同 key 新行）；解析出的行/删除追加进 rows/rems（供 caller 的 hook
+// 透传 keydir 半边）。载荷结构错误（长度不足/尾部残留）返回 false。
+[[nodiscard]] bool apply_docmap_delta_section(
+    Index& docmap, std::span<const std::byte> payload,
+    std::vector<DocmapDeltaRow>& rows, std::vector<DocmapDeltaRemoval>& rems);
+
 // base 写：dir/docmap.ckpt。rename 旧文件 → .prev，写新 base，删 .d 链文件，
 // 成功后 begin_delta_window(watermark) + clear_removals + clear_dirty。
 [[nodiscard]] bool save_docmap_base(Index& docmap, std::string_view dir,
@@ -59,13 +68,8 @@ using DocmapReplayHook = std::function<void(
                                      std::uint64_t from, std::uint32_t seq,
                                      std::span<const std::byte> keydir_delta);
 
-// 组件载入结果（形态与 SearchLayer::ComponentLoadResult 一致）。
-struct DocmapLoadResult {
-    bool loaded = false;           // base 结构完整 + wm 匹配 + 链完整
-    std::uint64_t watermark = 0;   // base+链覆盖水位
-    bool from_prev = false;
-    bool all_segments_ok = false;
-};
+// 组件载入结果：与 text/vector 组件同构（S20-1 R6 收敛至 ckpt::LoadResult）。
+using DocmapLoadResult = ckpt::LoadResult;
 
 // 载入：base（header.watermark == expected_base_wm，失败退 .prev）→ 链
 // .d1..d{chain_seq} 连续重放。成功后 begin_delta_window(覆盖水位) +

@@ -3,6 +3,7 @@
 // 的 kDocmap 分支平移——文件格式逐字节不变，只移交发起权到宿主侧。
 
 #include "bitcask/docmap_ckpt.hpp"
+#include "bitcask/ckpt_chain.hpp"        // S20-2：walk_chain / remove_chain_files
 #include "bitcask/search_checkpoint.hpp"
 
 #include <cstring>
@@ -21,26 +22,17 @@ std::string comp_path(std::string_view dir) {
     return (std::filesystem::path(dir) / kDocmapCkptName).string();
 }
 
-// .d 链清理（base 落成后链坍缩）。连续 miss 8 个序号即停（链连续 1..N）。
-void remove_chain_files(const std::string& fp) {
-    std::uint32_t misses = 0;
-    for (std::uint32_t i = 1; misses < 8; ++i) {
-        std::error_code ec;
-        if (std::filesystem::remove(fp + ".d" + std::to_string(i), ec)) {
-            misses = 0;
-        } else {
-            ++misses;
-        }
-    }
-}
+}  // namespace
 
-// kDocmapDelta 段解析 + 应用：窗口行 + 删除日志按 ord 交错重放到 Index
-// （「删后重写」场景删除必须先于同 key 新行），keydir 半边收集给 hook。
-bool apply_docmap_delta_section(Index& docmap, const sc::LoadedSection& ls,
+// kDocmapDelta 段解析 + 应用（S20-2 R3：公开供 legacy_ckpt 共用）。窗口行 +
+// 删除日志按 ord 交错重放到 Index（「删后重写」场景删除必须先于同 key 新行），
+// keydir 半边收集给 hook。
+bool apply_docmap_delta_section(Index& docmap,
+                                std::span<const std::byte> payload,
                                 std::vector<DocmapDeltaRow>& rows,
                                 std::vector<DocmapDeltaRemoval>& rems) {
-    const auto* p = ls.payload.data();
-    const auto* end = p + ls.payload.size();
+    const auto* p = payload.data();
+    const auto* end = p + payload.size();
     if (end - p < 8) return false;
     std::uint64_t rn = sc::detail::get_u64(p); p += 8;
     rows.reserve(rn);
@@ -90,6 +82,8 @@ bool apply_docmap_delta_section(Index& docmap, const sc::LoadedSection& ls,
     return true;
 }
 
+namespace {
+
 // 单个 delta 文件的段集应用（原 apply_delta_file 的 docmap 版）：先整体
 // CRC 预检（任何坏段 → 整个 delta 拒绝，不部分应用），再逐段应用 +
 // keydir 半边经 hook 一次性透传。
@@ -105,7 +99,11 @@ bool apply_delta_file(Index& docmap,
     for (const auto& ls : sections) {
         const auto st = static_cast<sc::CkptSectionType>(ls.type);
         if (st == sc::CkptSectionType::kDocmapDelta) {
-            if (!apply_docmap_delta_section(docmap, ls, rows, rems)) {
+            if (!apply_docmap_delta_section(
+                    docmap,
+                    std::span<const std::byte>(ls.payload.data(),
+                                               ls.payload.size()),
+                    rows, rems)) {
                 return false;
             }
         } else if (st == sc::CkptSectionType::kKeydirDelta) {
@@ -135,7 +133,7 @@ bool save_docmap_base(Index& docmap, std::string_view dir,
         std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(buf.data()), buf.size())};
     if (!sc::SearchCheckpoint::write(fp, watermark, {&sec, 1})) return false;
-    remove_chain_files(fp);
+    sc::remove_chain_files(fp);  // S20-2 R8
     // 记账收尾：base 落成 = 链坍缩（静止点所有已入账 ord < watermark）。
     docmap.begin_delta_window(watermark);
     docmap.clear_removals();
@@ -149,22 +147,14 @@ bool save_docmap_delta(Index& docmap, std::string_view dir,
                        std::span<const std::byte> keydir_delta) {
     const std::string fp = comp_path(dir);
     const std::string dpath = fp + ".d" + std::to_string(seq);
-    std::vector<sc::CkptSection> secs;
-    std::vector<std::vector<std::byte>> bufs;
-    auto add = [&](sc::CkptSectionType t, std::vector<std::byte> b) {
-        bufs.push_back(std::move(b));
-        secs.push_back(sc::CkptSection{
-            static_cast<std::uint16_t>(t), 0,
-            std::span<const std::byte>(bufs.back().data(),
-                                       bufs.back().size())});
-    };
+    sc::SectionWriter sw;  // S20-1 R4
     // kDeltaInfo：链校验三元组。
     {
         std::vector<std::byte> b;
         sc::detail::put_u64(b, base_gen);
         sc::detail::put_u64(b, from);
         sc::detail::put_u32(b, seq);
-        add(sc::CkptSectionType::kDeltaInfo, std::move(b));
+        sw.add(sc::CkptSectionType::kDeltaInfo, std::move(b));
     }
     // kDocmapDelta：窗口 live 行 + 删除日志。
     {
@@ -203,14 +193,16 @@ bool save_docmap_delta(Index& docmap, std::string_view dir,
                 reinterpret_cast<const std::byte*>(key.data()),
                 reinterpret_cast<const std::byte*>(key.data()) + key.size());
         }
-        add(sc::CkptSectionType::kDocmapDelta, std::move(b));
+        sw.add(sc::CkptSectionType::kDocmapDelta, std::move(b));
     }
     // keydir meta 仅在 docmap 组件落（S14-7 成对不变量）。
     if (!keydir_delta.empty()) {
         std::vector<std::byte> kb(keydir_delta.begin(), keydir_delta.end());
-        add(sc::CkptSectionType::kKeydirDelta, std::move(kb));
+        sw.add(sc::CkptSectionType::kKeydirDelta, std::move(kb));
     }
-    if (!sc::SearchCheckpoint::write(dpath, watermark, secs)) return false;
+    if (!sc::SearchCheckpoint::write(dpath, watermark, sw.sections())) {
+        return false;
+    }
     // 记账收尾：窗口推进 + 已序列化的删除日志清空。
     docmap.begin_delta_window(watermark);
     docmap.clear_removals();
@@ -261,41 +253,18 @@ DocmapLoadResult load_docmap(Index& docmap, std::string_view dir,
         // 旧文件可能含 meta/terms 等扩展段——忽略。
     }
     if (!any) segments_ok = false;
-    // 链重放（.prev 回退 = 链不可信，与 SearchLayer 版语义一致）。
+    // 链重放（.prev 回退 = 链不可信，与 SearchLayer 版语义一致）。S20-2 R2：
+    // 走读收敛至 sc::walk_chain（有界，apply = apply_delta_file 含 CRC 预检）。
     std::uint64_t coverage = lc->watermark;
     bool chain_ok = true;
     if (segments_ok && !from_prev) {
-        const std::uint64_t base_gen_for_chain = coverage;
-        for (std::uint32_t s = 1; s <= chain_seq; ++s) {
-            const std::string dpath = fp + ".d" + std::to_string(s);
-            std::error_code ec;
-            if (!std::filesystem::exists(dpath, ec)) { chain_ok = false; break; }
-            auto dc = sc::SearchCheckpoint::read(dpath);
-            if (!dc) { chain_ok = false; break; }
-            const sc::LoadedSection* info = nullptr;
-            for (const auto& dls : dc->sections) {
-                if (dls.type ==
-                    static_cast<std::uint16_t>(
-                        sc::CkptSectionType::kDeltaInfo)) {
-                    info = &dls; break;
-                }
-            }
-            if (!info || !info->crc_ok || info->payload.size() != 20) {
-                chain_ok = false; break;
-            }
-            const auto* q = info->payload.data();
-            const std::uint64_t gen = sc::detail::get_u64(q); q += 8;
-            const std::uint64_t prev_wm = sc::detail::get_u64(q); q += 8;
-            const std::uint32_t seq = sc::detail::get_u32(q);
-            if (gen != base_gen_for_chain || prev_wm != coverage ||
-                seq != s) {
-                chain_ok = false; break;
-            }
-            if (!apply_delta_file(docmap, dc->sections, hook)) {
-                chain_ok = false; break;
-            }
-            coverage = dc->watermark;
-        }
+        const auto w = sc::walk_chain(
+            fp, /*base_gen=*/coverage, /*base_coverage=*/coverage, chain_seq,
+            [&](const sc::LoadedCheckpoint& dc) {
+                return apply_delta_file(docmap, dc.sections, hook);
+            });
+        coverage = w.coverage;
+        chain_ok = w.ok;
     } else {
         chain_ok = false;
     }

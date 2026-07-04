@@ -2,6 +2,7 @@
 // Cask::prepare_vector 平移——行为与文件格式逐字节不变，只换持有方。
 
 #include "bitcask/vector_plugin.hpp"
+#include "bitcask/ckpt_chain.hpp"       // S20-2：walk_chain / remove_chain_files
 #include "bitcask/search_checkpoint.hpp"
 
 #include <cmath>
@@ -352,16 +353,7 @@ bool VectorPlugin::save_component_base(std::string_view dir,
     const bool ok = !secs.empty() &&
         sc::SearchCheckpoint::write(fp, watermark, secs);
     if (!ok) return false;
-    // 链坍缩：清 .d 链（连续序号 + 8 空洞 orphan 扫尾），重置链状态。
-    std::uint32_t misses = 0;
-    for (std::uint32_t i = 1; misses < 8; ++i) {
-        std::error_code ec2;
-        if (std::filesystem::remove(fp + ".d" + std::to_string(i), ec2)) {
-            misses = 0;
-        } else {
-            ++misses;
-        }
-    }
+    sc::remove_chain_files(fp);  // 链坍缩（S20-2 R8）
     chain_ = ChainState{watermark, watermark, 1};
     // S18-1：base 落成——窗口日志全量被 base 覆盖 → 清空；窗口推进。
     delta_window_wm_ = watermark;
@@ -384,29 +376,23 @@ VectorPlugin::save_component_delta(std::string_view dir,
     const std::string fp = comp_path(dir);
     const std::uint32_t seq = chain_.next_seq;
     const std::string dpath = fp + ".d" + std::to_string(seq);
-    std::vector<sc::CkptSection> secs;
-    std::vector<std::vector<std::byte>> bufs;
-    auto add = [&](sc::CkptSectionType t, std::vector<std::byte> b) {
-        bufs.push_back(std::move(b));
-        secs.push_back(sc::CkptSection{
-            static_cast<std::uint16_t>(t), 0,
-            std::span<const std::byte>(bufs.back().data(),
-                                       bufs.back().size())});
-    };
+    sc::SectionWriter sw;  // S20-1 R4
     // kDeltaInfo：链校验三元组。
     {
         std::vector<std::byte> b;
         sc::detail::put_u64(b, chain_.base_gen);
         sc::detail::put_u64(b, chain_.chain_wm);
         sc::detail::put_u32(b, seq);
-        add(sc::CkptSectionType::kDeltaInfo, std::move(b));
+        sw.add(sc::CkptSectionType::kDeltaInfo, std::move(b));
     }
     {
         std::vector<std::byte> b;
         serialize_delta_log(b);
-        add(sc::CkptSectionType::kHnswDelta, std::move(b));
+        sw.add(sc::CkptSectionType::kHnswDelta, std::move(b));
     }
-    if (!sc::SearchCheckpoint::write(dpath, watermark, secs)) return result;
+    if (!sc::SearchCheckpoint::write(dpath, watermark, sw.sections())) {
+        return result;
+    }
     chain_.chain_wm = watermark;
     chain_.next_seq = seq + 1;
     delta_window_wm_ = watermark;
@@ -464,59 +450,33 @@ VectorPlugin::load_component(std::string_view dir,
         }
     }
     if (config_.dim > 0 && !any) segments_ok = false;
-    // 链重放（.prev 回退 = 链不可信，与 SearchLayer 版语义一致）。
+    // 链重放（.prev 回退 = 链不可信，与 SearchLayer 版语义一致）。S20-2 R2：
+    // 走读收敛至 sc::walk_chain，仅「应用 kHnswDelta 段」定制。
     std::uint64_t coverage = lc->watermark;
     std::uint32_t next_seq = 1;
     bool chain_ok = true;
     if (segments_ok && !from_prev) {
-        const std::uint64_t base_gen_for_chain = coverage;
-        for (std::uint32_t s = 1; s <= chain_seq; ++s) {
-            const std::string dpath = fp + ".d" + std::to_string(s);
-            std::error_code ec;
-            if (!std::filesystem::exists(dpath, ec)) { chain_ok = false; break; }
-            auto dc = sc::SearchCheckpoint::read(dpath);
-            if (!dc) { chain_ok = false; break; }
-            const sc::LoadedSection* info = nullptr;
-            for (const auto& dls : dc->sections) {
-                if (dls.type ==
-                    static_cast<std::uint16_t>(
-                        sc::CkptSectionType::kDeltaInfo)) {
-                    info = &dls; break;
+        const auto w = sc::walk_chain(
+            fp, /*base_gen=*/coverage, /*base_coverage=*/coverage, chain_seq,
+            [&](const sc::LoadedCheckpoint& dc) -> bool {
+                for (const auto& dls : dc.sections) {
+                    if (!dls.crc_ok) return false;
                 }
-            }
-            if (!info || !info->crc_ok || info->payload.size() != 20) {
-                chain_ok = false; break;
-            }
-            const auto* q = info->payload.data();
-            const std::uint64_t gen = sc::detail::get_u64(q); q += 8;
-            const std::uint64_t prev_wm = sc::detail::get_u64(q); q += 8;
-            const std::uint32_t seq = sc::detail::get_u32(q);
-            if (gen != base_gen_for_chain || prev_wm != coverage ||
-                seq != s) {
-                chain_ok = false; break;
-            }
-            // 段级 CRC 预检 + kHnswDelta 应用。
-            bool applied = true;
-            for (const auto& dls : dc->sections) {
-                if (!dls.crc_ok) { applied = false; break; }
-            }
-            if (applied) {
-                for (const auto& dls : dc->sections) {
+                for (const auto& dls : dc.sections) {
                     if (dls.type ==
                         static_cast<std::uint16_t>(
                             sc::CkptSectionType::kHnswDelta)) {
                         if (!apply_delta_log(std::span<const std::byte>(
                                 dls.payload.data(), dls.payload.size()))) {
-                            applied = false;
-                            break;
+                            return false;
                         }
                     }
                 }
-            }
-            if (!applied) { chain_ok = false; break; }
-            coverage = dc->watermark;
-            next_seq = s + 1;
-        }
+                return true;
+            });
+        coverage = w.coverage;
+        next_seq = w.next_seq;
+        chain_ok = w.ok;
     } else {
         chain_ok = false;
     }
@@ -558,36 +518,34 @@ plugin::FlushResult VectorPlugin::flush(const plugin::FlushRequest& req) {
     if (want_base) {
         const bool ok = save_component_base(dir_, req.watermark);
         if (config_.dim == 0) {
-            // 无向量配置：清残留 + no-op 成功（宿主不为空组件记账）。
+            // 无向量配置：清残留 + no-op 成功（宿主不为空组件记账——
+            // covered_ord 停在链水位，与 req.watermark 不等则 entry 不更新）。
             rebase_needed_.store(false, std::memory_order_relaxed);
             res.covered_ord = chain_.chain_wm;
-            return res;
-        }
-        if (ok) {
+        } else if (ok) {
             rebase_needed_.store(false, std::memory_order_relaxed);
             res.covered_ord = req.watermark;
-            res.generation = chain_.base_gen;
         } else {
             res.status = plugin::PluginStatus::kFailed;
             res.covered_ord = chain_.chain_wm;
         }
-        return res;
-    }
-    if (!dirty() || delta_vecs_.empty()) {
+    } else if (!dirty() || delta_vecs_.empty()) {
         // 干净或空插入日志：no-op（脏位照清——镜像旧「save 时无条件清」）。
         dirty_.store(false, std::memory_order_relaxed);
         res.covered_ord = chain_.chain_wm;
-        res.generation = chain_.base_gen;
-        return res;
-    }
-    auto d = save_component_delta(dir_, req.watermark);
-    if (d.wrote) {
-        res.covered_ord = req.watermark;
     } else {
-        res.status = plugin::PluginStatus::kFailed;
-        res.covered_ord = chain_.chain_wm;
+        auto d = save_component_delta(dir_, req.watermark);
+        if (d.wrote) {
+            res.covered_ord = req.watermark;
+        } else {
+            res.status = plugin::PluginStatus::kFailed;
+            res.covered_ord = chain_.chain_wm;
+        }
     }
+    // S20-3 B-B2：链回执从 chain_（save 后已更新）统一回传。
     res.generation = chain_.base_gen;
+    res.chain_seq  = chain_.next_seq - 1;
+    res.chain_wm   = chain_.chain_wm;
     return res;
 }
 

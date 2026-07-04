@@ -3,6 +3,7 @@
 // 回填 → doc_len_writer_（S18-1 窄接口）、压实统计 → stats_（S18-4 窄接口）。
 
 #include "bitcask/text_plugin.hpp"
+#include "bitcask/ckpt_chain.hpp"       // S20-2：walk_chain / remove_chain_files
 #include "bitcask/search_checkpoint.hpp"
 #include "bitcask/text_utils.hpp"
 
@@ -710,19 +711,7 @@ TextPlugin::search_text_highlight(std::string_view query, std::size_t k,
 
 
 // ---- ckpt 原语（legacy 统一容器与 bm25 组件共用；S18-4）----
-
-namespace {
-// bm25.fields 段辅助（小端；与 search_checkpoint.hpp 编码一致）。
-void put_u16_b(std::vector<std::byte>& b, std::uint16_t v) {
-    sc::detail::put_u16(b, v);
-}
-void put_u32_b(std::vector<std::byte>& b, std::uint32_t v) {
-    sc::detail::put_u32(b, v);
-}
-void put_u64_b(std::vector<std::byte>& b, std::uint64_t v) {
-    sc::detail::put_u64(b, v);
-}
-}  // namespace
+// 小端字节编码统一用 sc::detail::put_u*（S20-1 R7：删除本文件的转发层）。
 
 bool TextPlugin::serialize_default(std::vector<std::byte>& out) const {
     std::shared_lock lk(fields_mu_);
@@ -741,15 +730,15 @@ bool TextPlugin::serialize_fields(std::vector<std::byte>& out) const {
         ++other_count;
     }
     if (other_count == 0) return false;
-    put_u32_b(out, other_count);
+    sc::detail::put_u32(out, other_count);
     for (auto& [field, inv] : fields_) {
         if (field == kDefaultField) continue;
-        put_u16_b(out, static_cast<std::uint16_t>(field.size()));
+        sc::detail::put_u16(out, static_cast<std::uint16_t>(field.size()));
         out.insert(out.end(),
             reinterpret_cast<const std::byte*>(field.data()),
             reinterpret_cast<const std::byte*>(field.data()) + field.size());
         std::uint64_t pos = out.size();
-        put_u64_b(out, 0);  // invLen 占位
+        sc::detail::put_u64(out, 0);  // invLen 占位
         inv->serialize(out);
         std::uint64_t inv_len = out.size() - pos - 8;
         std::memcpy(out.data() + pos, &inv_len, 8);
@@ -774,15 +763,15 @@ bool TextPlugin::serialize_fields_delta(std::vector<std::byte>& out,
         if (field != kDefaultField) ++other;
     }
     if (other == 0) return false;
-    put_u32_b(out, other);
+    sc::detail::put_u32(out, other);
     for (auto& [field, inv] : fields_) {
         if (field == kDefaultField) continue;
-        put_u16_b(out, static_cast<std::uint16_t>(field.size()));
+        sc::detail::put_u16(out, static_cast<std::uint16_t>(field.size()));
         out.insert(out.end(),
             reinterpret_cast<const std::byte*>(field.data()),
             reinterpret_cast<const std::byte*>(field.data()) + field.size());
         const std::uint64_t pos = out.size();
-        put_u64_b(out, 0);  // len 占位
+        sc::detail::put_u64(out, 0);  // len 占位
         inv->serialize_delta(out, from);
         const std::uint64_t len = out.size() - pos - 8;
         std::memcpy(out.data() + pos, &len, 8);
@@ -899,44 +888,23 @@ bool TextPlugin::save_component_base(std::string_view dir,
     if (std::filesystem::exists(fp, ec)) {
         std::filesystem::rename(fp, prev, ec);
     }
-    std::vector<sc::CkptSection> secs;
-    std::vector<std::vector<std::byte>> byte_bufs;
-    auto add_byte = [&](std::uint16_t type, std::vector<std::byte> buf) {
-        byte_bufs.push_back(std::move(buf));
-        secs.push_back(sc::CkptSection{
-            type, 0,
-            std::span<const std::byte>(byte_bufs.back().data(),
-                                        byte_bufs.back().size())});
-    };
+    sc::SectionWriter sw;  // S20-1 R4
     {
         std::vector<std::byte> buf;
         if (serialize_default(buf)) {
-            add_byte(static_cast<std::uint16_t>(
-                         sc::CkptSectionType::kBm25Default),
-                     std::move(buf));
+            sw.add(sc::CkptSectionType::kBm25Default, std::move(buf));
         }
     }
     {
         std::vector<std::byte> fbuf;
         if (serialize_fields(fbuf)) {
-            add_byte(static_cast<std::uint16_t>(
-                         sc::CkptSectionType::kBm25Fields),
-                     std::move(fbuf));
+            sw.add(sc::CkptSectionType::kBm25Fields, std::move(fbuf));
         }
     }
-    const bool ok = !secs.empty() &&
-        sc::SearchCheckpoint::write(fp, watermark, secs);
+    const bool ok = !sw.empty() &&
+        sc::SearchCheckpoint::write(fp, watermark, sw.sections());
     if (!ok) return false;
-    // 链坍缩：清 .d 链（连续序号 + 8 空洞 orphan 扫尾），重置链状态。
-    std::uint32_t misses = 0;
-    for (std::uint32_t i = 1; misses < 8; ++i) {
-        std::error_code ec2;
-        if (std::filesystem::remove(fp + ".d" + std::to_string(i), ec2)) {
-            misses = 0;
-        } else {
-            ++misses;
-        }
-    }
+    sc::remove_chain_files(fp);  // 链坍缩（S20-2 R8）
     chain_ = ChainState{watermark, watermark, 1};
     clear_dirty();
     return true;
@@ -950,37 +918,31 @@ TextPlugin::save_component_delta(std::string_view dir,
     const std::uint32_t seq = chain_.next_seq;
     const std::string dpath = fp + ".d" + std::to_string(seq);
     const std::uint64_t from = chain_.chain_wm;
-    std::vector<sc::CkptSection> secs;
-    std::vector<std::vector<std::byte>> bufs;
-    auto add = [&](sc::CkptSectionType t, std::vector<std::byte> b) {
-        bufs.push_back(std::move(b));
-        secs.push_back(sc::CkptSection{
-            static_cast<std::uint16_t>(t), 0,
-            std::span<const std::byte>(bufs.back().data(),
-                                       bufs.back().size())});
-    };
+    sc::SectionWriter sw;  // S20-1 R4
     // kDeltaInfo：链校验三元组。
     {
         std::vector<std::byte> b;
-        put_u64_b(b, chain_.base_gen);
-        put_u64_b(b, from);
-        put_u32_b(b, seq);
-        add(sc::CkptSectionType::kDeltaInfo, std::move(b));
+        sc::detail::put_u64(b, chain_.base_gen);
+        sc::detail::put_u64(b, from);
+        sc::detail::put_u32(b, seq);
+        sw.add(sc::CkptSectionType::kDeltaInfo, std::move(b));
     }
     // bm25 delta：default + fields（组件 delta 恒全量构造，S17 设计要点）。
     {
         std::vector<std::byte> b;
         if (serialize_default_delta(b, from)) {
-            add(sc::CkptSectionType::kBm25DefaultDelta, std::move(b));
+            sw.add(sc::CkptSectionType::kBm25DefaultDelta, std::move(b));
         }
     }
     {
         std::vector<std::byte> fb;
         if (serialize_fields_delta(fb, from)) {
-            add(sc::CkptSectionType::kBm25FieldsDelta, std::move(fb));
+            sw.add(sc::CkptSectionType::kBm25FieldsDelta, std::move(fb));
         }
     }
-    if (!sc::SearchCheckpoint::write(dpath, watermark, secs)) return result;
+    if (!sc::SearchCheckpoint::write(dpath, watermark, sw.sections())) {
+        return result;
+    }
     chain_.chain_wm = watermark;
     chain_.next_seq = seq + 1;
     clear_dirty();
@@ -1035,58 +997,33 @@ TextPlugin::load_component(std::string_view dir,
         }
     }
     if (!any) segments_ok = false;
-    // 链重放（.prev 回退 = 链不可信）。
+    // 链重放（.prev 回退 = 链不可信）。S20-2 R2：走读收敛至 sc::walk_chain，
+    // 仅「应用 bm25 delta 段」定制（段级 CRC 预检由本回调自理）。
     std::uint64_t coverage = lc->watermark;
     std::uint32_t next_seq = 1;
     bool chain_ok = true;
     if (segments_ok && !from_prev) {
-        const std::uint64_t base_gen_for_chain = coverage;
-        for (std::uint32_t seq = 1; seq <= chain_seq; ++seq) {
-            const std::string dpath = fp + ".d" + std::to_string(seq);
-            std::error_code ec;
-            if (!std::filesystem::exists(dpath, ec)) { chain_ok = false; break; }
-            auto dc = sc::SearchCheckpoint::read(dpath);
-            if (!dc) { chain_ok = false; break; }
-            const sc::LoadedSection* info = nullptr;
-            for (const auto& dls : dc->sections) {
-                if (dls.type ==
-                    static_cast<std::uint16_t>(
-                        sc::CkptSectionType::kDeltaInfo)) {
-                    info = &dls; break;
+        const auto w = sc::walk_chain(
+            fp, /*base_gen=*/coverage, /*base_coverage=*/coverage, chain_seq,
+            [&](const sc::LoadedCheckpoint& dc) -> bool {
+                for (const auto& dls : dc.sections) {
+                    if (!dls.crc_ok) return false;
                 }
-            }
-            if (!info || !info->crc_ok || info->payload.size() != 20) {
-                chain_ok = false; break;
-            }
-            const auto* q = info->payload.data();
-            const std::uint64_t gen = sc::detail::get_u64(q); q += 8;
-            const std::uint64_t prev_wm = sc::detail::get_u64(q); q += 8;
-            const std::uint32_t sq = sc::detail::get_u32(q);
-            if (gen != base_gen_for_chain || prev_wm != coverage ||
-                sq != seq) {
-                chain_ok = false; break;
-            }
-            // 段级 CRC 预检 + delta 应用。
-            bool applied = true;
-            for (const auto& dls : dc->sections) {
-                if (!dls.crc_ok) { applied = false; break; }
-            }
-            if (applied) {
-                for (const auto& dls : dc->sections) {
+                for (const auto& dls : dc.sections) {
                     auto dst = static_cast<sc::CkptSectionType>(dls.type);
                     std::span<const std::byte> pl(dls.payload.data(),
                                                   dls.payload.size());
                     if (dst == sc::CkptSectionType::kBm25DefaultDelta) {
-                        if (!apply_default_delta(pl)) { applied = false; break; }
+                        if (!apply_default_delta(pl)) return false;
                     } else if (dst == sc::CkptSectionType::kBm25FieldsDelta) {
-                        if (!apply_fields_delta(pl)) { applied = false; break; }
+                        if (!apply_fields_delta(pl)) return false;
                     }
                 }
-            }
-            if (!applied) { chain_ok = false; break; }
-            coverage = dc->watermark;
-            next_seq = seq + 1;
-        }
+                return true;
+            });
+        coverage = w.coverage;
+        next_seq = w.next_seq;
+        chain_ok = w.ok;
     } else {
         chain_ok = false;
     }
@@ -1129,27 +1066,26 @@ plugin::FlushResult TextPlugin::flush(const plugin::FlushRequest& req) {
         if (save_component_base(dir_, req.watermark)) {
             rebase_needed_.store(false, std::memory_order_relaxed);
             res.covered_ord = req.watermark;
-            res.generation = chain_.base_gen;
         } else {
             res.status = plugin::PluginStatus::kFailed;
             res.covered_ord = chain_.chain_wm;
         }
-        return res;
-    }
-    if (!dirty()) {
+    } else if (!dirty()) {
         // 干净：no-op，覆盖水位停在当前链水位（宿主不推进 manifest）。
         res.covered_ord = chain_.chain_wm;
-        res.generation = chain_.base_gen;
-        return res;
-    }
-    auto d = save_component_delta(dir_, req.watermark);
-    if (d.wrote) {
-        res.covered_ord = req.watermark;
     } else {
-        res.status = plugin::PluginStatus::kFailed;
-        res.covered_ord = chain_.chain_wm;
+        auto d = save_component_delta(dir_, req.watermark);
+        if (d.wrote) {
+            res.covered_ord = req.watermark;
+        } else {
+            res.status = plugin::PluginStatus::kFailed;
+            res.covered_ord = chain_.chain_wm;
+        }
     }
+    // S20-3 B-B2：链回执从 chain_（save 后已更新）统一回传。
     res.generation = chain_.base_gen;
+    res.chain_seq  = chain_.next_seq - 1;
+    res.chain_wm   = chain_.chain_wm;
     return res;
 }
 
