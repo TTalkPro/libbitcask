@@ -2558,3 +2558,215 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > **执行序**：S19-1 → S19-2 → S19-3 → S19-4 → S19-5 → S19-6（1-3 强依赖
 > 链）。硬约束：C API ABI 不变、磁盘格式不变、pre-S17 迁移路径保活
 > （S17-5 护栏）、热路径零回退。每步全量 + TSan 全绿才进下一步。
+
+## 第二十梯队 S20：全库重构 — 冗余收敛、最佳实践、注释与文档一致性（2026-07-04）
+
+> 来源：用户「对项目进行重构」六准则复审（最佳 C++ 实践 / 高内聚低耦合 /
+> 公共代码降冗余 / 完善且正确的中文注释 / 文档与代码一致）。三路并行审计
+> （冗余 R1-R9、最佳实践 B-*、注释与文档 C-*）汇总成八子任务。
+>
+> **审计正面结论**：S15-S19 新面无正确性隐患（RAII/extern "C" 边界/flush
+> 失败原子性/const 正确性全绿）；问题集中在结构性冗余（组件 ckpt 骨架 ×N、
+> delta 解析 ×2、结果结构三胞胎）与旧注释/文档未随迁移换代。
+>
+> **先例约束（S9 裁定续用）**：不做依赖方向不变的类内美学拆分；不动
+> TSan-clean 并发核心语义；冗余收敛类改动 = 行为零变化（ckpt 字节对拍）；
+> 每步全量 545 + TSan 全绿 + C ABI `nm` 逐符号对比。
+
+- [x] **S20-1【冗余·M】低风险公共代码收敛 R1/R4/R6/R7** — 已完成（2026-07-04）
+  - **R1** C API 单结果尾块 ×12 → `internal.h::finish_single()`（expected→C
+    物化 + 错误/OOM 翻译）；filtered 变体的过滤树三态转换 ×3 →
+    `parse_meta_filter()` + `ParsedFilter`（无过滤/成功/非法，storage 随对象
+    存活不悬垂）。bitcask_text.cpp/bitcask_vec.cpp 各入口收敛为「校验→委托→
+    finish_single」三行。
+  - **R4** ckpt 分段写「owned payload 缓冲 + 并行 CkptSection」骨架 ×5 →
+    `search_checkpoint.hpp::SectionWriter`（依赖 vector 移动语义保 span 不
+    悬垂）。落地：text 组件 base/delta、vector delta、docmap delta、测试 shim
+    delta。shim base-save（byte/uint8/carried 三缓冲混合）非此形态，保留。
+  - **R6** ChainState/DeltaSaveResult/LoadResult 三胞胎（text/vector/docmap）
+    → `component_ckpt.hpp::ckpt::{ChainState,DeltaSaveResult,LoadResult}`
+    单一真源；各类以嵌套 `using` 别名暴露（`TextPlugin::ChainState` 等名字
+    不变），差异化 setter（VectorPlugin 联动 delta_window_wm_）留各类。
+    DocmapLoadResult → `using = ckpt::LoadResult`。legacy_ckpt::LoadResult
+    字段序不同且属 P6 待删，不动。
+  - **R7** byte helper 收敛：删 text_plugin.cpp 的 put_u*_b 转发层 → 直用
+    `sc::detail::put_u*`；测试 shim 的 put/get_u*_byte 重实现删除 → 直用
+    `detail::*`（文件本在 namespace bitcask::search 内）。规范收敛为
+    sc::detail + byte_order 两套。
+  - 验收：全量 **545/545**；TSan 相关套件 **124/124**；`nm -D` C ABI 与基线
+    **逐符号一致**。
+
+- [x] **S20-2【冗余·L】ckpt 链走读公共化 R2/R3/R8低** — 已完成（2026-07-04）
+  - **R2** `.d` 链走读 ×5（text/vector/docmap load_component + legacy + 测试
+    shim load_search_ckpt）→ `ckpt_chain.hpp::sc::walk_chain(base_path,
+    base_gen, base_coverage, chain_seq, apply)` 模板。`chain_seq>0` 有界
+    （缺文件=链断）、`=0` 无界（缺文件=正常链尾）；kDeltaInfo 三元组校验
+    （gen/prev_wm/seq）内建，仅「如何应用一个 delta 文件」由 apply 回调定制。
+    返回 {coverage, next_seq, ok}。仅 .cpp 包含（不进公共头，隔离 <filesystem>）。
+  - **R3** kDocmapDelta 段解析 + 交错重放 ×2 → 公开 `index::
+    apply_docmap_delta_section(docmap, payload, rows, rems)`（自 docmap_ckpt
+    匿名 ns 提升），legacy_ckpt 的内联解析改调之（逐字节同构，已核对）。
+  - **R8 低风险半** `remove_chain_files` 8-miss 链坍缩 ×4（docmap helper +
+    text/vector 内联 + shim 内联）→ `ckpt_chain.hpp::sc::remove_chain_files`。
+  - 说明：shim 的 docmapDelta 解析用 shim 本地行类型（keydir hook 素材），
+    不在 R3（两处）范围；R8 的 save 骨架回调化（中风险）归 S20-5 评估。
+  - 验收：全量 **545/545**；TSan checkpoint/recovery/legacy/migrate/plugin
+    套件 **128/128**；C ABI `nm -D` 与基线**逐符号一致**。恢复链重放语义
+    零变化（既有 S17/S18 崩溃恢复与链测试全绿）。
+
+- [x] **S20-3【接口质量·S】B-B2 / B-B1 / R5** — 已完成（2026-07-04）
+  - **B-B2** `plugin::FlushResult` 加宽 `chain_seq`/`chain_wm`——manifest entry
+    三元组 {generation, chain_seq, chain_wm} 由 flush 直接回传。Text/Vector
+    flush 统一尾部从 chain_（save 后态）回填；`save_checkpoint_paired` 的
+    flush 轮询循环删去「按 `*comp` 分支下探 text_/vec_plugin_ 读 chain_state()」
+    ——保持多态，第三组件零 else。vec dim==0/空日志/失败分支行为逐一保真
+    （covered_ord≠wm ⇒ entry 不更新，chain 回执被忽略）。
+  - **B-B1** `index_manifest.hpp::write_manifest/read_manifest` 裸 fopen/fclose
+    → `manifest_io::FilePtr`（unique_ptr<FILE,FileCloser>，独立命名空间避与
+    field_schema.hpp 的 bitcask::detail::FileCloser 撞名）。fdatasync 在
+    显式 reset 前、rename 后 dirfsync 序不变。
+  - **R5** searcher.hpp 三门面单查/批量骨架 → `search::detail::run_query` /
+    `run_batch` 模板（读屏障 + 内核调用 + 错误翻译 + TextSearchResult 包装 /
+    并发保序批量）。text::Searcher 删私有 run()；vec::Searcher / hybrid 各
+    收敛。search_text_highlight 返回 SearchHitEx 向量（非 TextSearchResult），
+    形态不同，保留独立物化。
+  - 验收：全量 **545/545**；TSan 相关 **124/124**；C ABI `nm -D` 逐符号一致。
+
+- [x] **S20-4【内聚耦合·S】config 头拆分 B-C1** — 已完成（2026-07-04）
+  - 抽 `bm25_params.hpp`（Bm25Params，自 inverted.hpp）、`text_plugin_config.hpp`
+    （TextPluginConfig，仅依赖 analyzer/bm25_params/synonym_map）、
+    `vector_plugin_config.hpp`（VectorPluginConfig，仅依赖 meta_file）。
+    text_plugin.hpp/vector_plugin.hpp/inverted.hpp 改包含轻量头（既有使用点
+    零改动）；`search_config.hpp` 依赖从两插件完整定义换为两 config POD 头。
+  - 效果：配置聚合层与插件实现层**解耦**——`search_config.hpp` 独立包含时
+    的预处理树**不再含 inverted.hpp/hnsw.hpp**（`-H` 追踪证实）。
+  - 实事求是：`c_api/internal.h` 经 `cask.hpp`（持 unique_ptr<插件> 必含完整
+    定义）仍转译 inverted/hnsw，故 C-API 编译时间**未减**；本项价值在层次
+    解耦（为将来 CaskOptions::plugins 换代铺路），非审计初估的构建时收益。
+  - 验收：全量 **545/545**；TSan 编译通过 + plugin/ckpt 冒烟 41/41；
+    C ABI `nm -D` 逐符号一致。
+
+- [x] **S20-5【中风险评估·裁定】R8 save 骨架 / R9 flush 决策骨架 — 弃做** — 已完成（2026-07-04）
+  - 用户指令「纳入但保守评估：保真优先，收益不抵风险即弃」。逐项评估结论：
+    **两项均弃**，仅文档记裁定（无代码改动）。
+  - **R9 flush 决策骨架**：S20-3 后 Text/Vector flush 结构已相近，但三处差异
+    正落在 S18-3 vec dirty 回归的断层上——① vec `dim==0` 分支（save_base
+    返 false 却按「成功但不推进」处理，covered_ord 钉链水位）② no-op 条件
+    （text=`!dirty()`；vec=`!dirty()||delta_vecs_.empty()`）③ no-op 时 vec 无
+    条件清 dirty_（镜像旧「save 时无条件清」），text 为纯 no-op。共用骨架
+    须把这三处编码成回调/标志，抽象比现有线性可读的显式代码更漏；~25 行
+    收益不抵重触该区的回归风险。
+  - **R8 save_base/delta 骨架回调化**：save_component_base 的公共壳仅
+    「rename→.prev + write + remove_chain_files + 记账」，而 vec 有 dim==0
+    前置分支 + `.vec/.qc8` 侧车（uint8 载荷，非 SectionWriter 的 byte 形态，
+    S20-1 R4 已因此排除 vec base）；save_component_delta 的载荷构造 text/vec/
+    docmap >80% 不同（bm25 default+fields / hnsw 日志 / kDocmapDelta+keydir）。
+    公共骨架小、发散回调大，且记账语义三者各异——回调化得不偿失。
+  - 低风险部分（remove_chain_files ×4、SectionWriter ×5）已在 S20-1/S20-2
+    收割。裁定与 S9「不做依赖方向不变的美学拆分」及 S18-3 回归教训一致。
+
+- [x] **S20-6【注释·M】现状式误导注释换代（~17 处）** — 已完成（2026-07-04）
+  - 判据：「自/原 SearchLayer 平移/一致」= 历史归属**保留**；「由 X 调用 /
+    现状式描述 / 引已删符号」= 误导**改**。
+  - cask.cpp：open 阶段 banner（创建 SearchLayer → Text/Vector 插件）×4
+    （upgrade/meta/阶段三/config 透传）、save_checkpoint 读水位来源、
+    search_vector（→ VectorPlugin + DocTable）、search_hybrid（→ HybridSearcher）、
+    base/delta 决策注释旧成员名（comp_chain_wm_ → chain_watermark/docmap_chain_/
+    chain_state()）。
+  - cask.hpp：docmap 借用方（search()->index()/SearchLayer → 插件借用）×2、
+    open 阶段三 banner、成员注释「SearchLayer 实例」→「搜索插件」。
+  - thread_pool.hpp：search_layer.cpp → search_arena.cpp、on_vector →
+    VectorPlugin::on_put。query.hpp ×2 / inverted.hpp / hnsw.hpp：SearchLayer
+    路由/rebuild → TextPlugin/VectorPlugin。index.hpp：dirty_docmap_ 类比标
+    「原」。plugin_api.hpp：`name()` 加注——持久化/manifest 身份 vs API 命名
+    空间双词汇（C-B5）。text_plugin.hpp:52 的「见 search_layer.hpp」已在
+    S20-4 config 迁出时消解。
+  - 保留（历史归属）：search_types.hpp/search_config.hpp/search_arena.cpp 的
+    「自 search_layer 抽出/平移」provenance 注释；index.hpp「自 SearchLayer
+    平移」段。验收：编译通过 + plugin/smoke 全绿（注释改动不涉 ABI/行为）。
+
+- [x] **S20-7【文档·L】文档一致性换代** — 已完成（2026-07-04）
+  - **api-cpp.md**：include 换代（search_layer.hpp → searcher/search_config/
+    search_types.hpp）；§5.5 重写（删已删 `search()`，补 drain_plugins /
+    text_plugin / vector_plugin / hybrid_searcher）；§7 开篇插件化重写；§7.1
+    删 wal_batch_size 行、补 max_delta_chain；**新增 §7.5 Searcher 门面节**；
+    示例 include 换代。
+  - **concurrency-zh.md + thread-safety.md**：§6 重写（SearchLayer → Text/
+    Vector 双插件；「单 worker」失实 → **N map worker + 1 reducer**，单写者 =
+    reducer，据 thread_pool.hpp 核对）；锁层级表 + 全序图 + 跨模块规则换代
+    （SearchLayer::fields_mu_ → TextPlugin::fields_mu_@text_plugin.hpp:360、
+    hnsw_ → VectorPlugin@vector_plugin.hpp:173，失效 file:line 修正）；
+    thread-safety.md synonym_map_ 归属 TextPlugin。
+  - **cpp-arch.md**：模块清单（search_layer.hpp/cpp 已删 → plugin_api/
+    text_plugin/vector_plugin/hybrid_searcher/searcher/search_config +
+    text_plugin.cpp/vector_plugin.cpp/hybrid_searcher.cpp/search_arena.cpp）；
+    c_api 分域（bitcask_kv/text/vec + internal.h）；put_doc 流程 on_write →
+    TextPlugin::on_put；索引层叙述换代（N map + 1 reducer）；测试二进制数
+    22 → **32**（核对 tests/CMakeLists.txt）。
+  - **api-c.md**：正文补 6 个在册函数——put_ex / put_batch / status_ex /
+    search_{text,vector,hybrid}_filtered（签名核对 c_api 头）。
+  - **format-zh.md**：文件树 + §10 intro 补 per-component（index.manifest +
+    docmap/bm25/vec 文件族）；§10.2 标 BCSC 容器为 legacy/per-component 共用
+    外壳、失效路径 search_layer.cpp → legacy_ckpt.cpp；**新增 §10.4
+    index.manifest（BCMF 80B 格式）+ per-component ckpt + delta 段型
+    （kDeltaInfo/kBm25*Delta/kDocmapDelta/kHnswDelta/kKeydirDelta）**。
+  - **README.md**：测试二进制数 26 → 32。
+  - **recovery-unified-…-design-zh.md**：顶部换代注记——单文件模型已被 S17
+    per-component 取代（指向 format-zh §10.4 / index_manifest.hpp）。
+  - **已知残留（S20-7 范围外，据审计 Section C）**：深层设计/分析文档
+    （hnsw-design-zh / hnsw-lifecycle-zh / merge-policy-zh / ord-recycling-
+    design-zh / posting-zero-copy-design-zh / put-flow-zh / async-index-
+    pipeline / s13-review）仍含 `search_layer.cpp:NNN` 历史 file:line 指针。
+    这些为特定时点的设计决策档案（性质同 recovery-unified 历史行文），审计
+    未纳入换代清单；留待后续文档考古式清理批次。
+  - 验收：7 个换代目标文档 stale 模式扫描**全 0**；文档-only，不涉编译。
+
+- [x] **S20-8【收官】全量验证 + 批次收口** — 已完成（2026-07-04）
+  - **全量 ctest（Debug）**：**545/545** 全绿。
+  - **TSan**：**544/545**——唯一失败 `IndexPoolMultiLib.ThreadCountIndependentOfLibCount`
+    经确认为**先例 TSan 不兼容**（非 S20 回归）：该测数 `/proc/self/task` 线程，
+    gtest_discover 下每 case 独立进程 ⇒ 本 case 是其进程内首个 `pthread_create`，
+    TSan 运行时在此惰性起 background 线程被计入 delta（3 vs 期望 2）。S15-S19
+    的「TSan 全绿」跑的是 ~184 例相关子集，从未含本例；S20 对 thread_pool 仅
+    2 行注释改动（IndexPool 线程创建逻辑逐字节不变）。排除本例 **544/544 全绿**。
+  - **C ABI**：`nm -D` 与 S20 基线（scratchpad/abi-baseline-s20.txt，1281 符号）
+    **逐符号一致**——磁盘格式与 C 接口零变化贯穿全批。
+  - **审计「明确不动」项记录在案**：search_arena 有意泄漏进程单例、TextPlugin
+    三窄接口引用（ISP 正确形态）、searcher.hpp header-only 门面、B3 字符串
+    name→ComponentId 分发（仅两插件缓行）、`text_`/`vec_plugin_` 命名不对称、
+    cask.cpp 3442 行 TU 拆分（依赖方向不变的 watch item）——均按 S9 restraint
+    保留。
+
+> **S20 批次收官（2026-07-04）**：全库重构八子任务落地。**冗余收敛**
+> （R1 finish_single/R3 apply_docmap_delta_section/R4 SectionWriter/R6
+> component_ckpt/R7 byte helper/R2 walk_chain/R8 remove_chain_files）删净
+> ~5 处 ckpt 骨架 + 链走读 ×5 + delta 解析 ×2 拷贝；**接口质量**（FlushResult
+> 多态回执消下探、manifest RAII、Searcher run_query/run_batch）；**内聚耦合**
+> （config 头拆分——配置层与插件实现层解耦）；**注释/文档换代**（~17 处现状
+> 式误导注释 + 7 个 reference/design 文档）。中风险 R8-save/R9-flush 骨架经
+> 保守评估弃做（S18-3 脆弱区）。全程行为零变化：Debug 545/545、TSan 544/544
+> （排除 1 先例不兼容）、C ABI 逐符号一致、磁盘格式逐字节不变。遗留：深层
+> 设计文档的历史 file:line 指针（S20-7 已记）、R8/R9 骨架（P6+ 若重构 flush
+> 决策再议）。
+
+- [x] **S20-7 补：深层设计文档历史 search_layer 引用清理** — 已完成（2026-07-04）
+  - S20-7 记为残留的深层设计/分析文档 file:line 指针，逐处处理：
+    - **换代到现位（含现行行号）**：hnsw-lifecycle-zh（rebuild_hnsw →
+      VectorPlugin::rebuild@vector_plugin.cpp:240、on_vector → VectorPlugin、
+      save/load_search_ckpt → legacy_ckpt/per-component、CkptLoadResult →
+      ckpt::LoadResult）、merge-policy-zh（on_delete → text_plugin.cpp:243、
+      live callback → vector_plugin.cpp:216、rebuild → :240）、hnsw-design-zh
+      （图内过滤 → vector_plugin.cpp:216、RRF → HybridSearcher）、put-flow-zh
+      （on_write → reducer 扇出 TextPlugin::apply_job + VectorPlugin::insert）、
+      ord-recycling-design-zh（RRF ord 去重 → hybrid_searcher.cpp:45、
+      rebuild_index → text_plugin.cpp:295）。
+    - **顶部换代注记**（历史评审/设计稿，正文行号保留为当时快照）：
+      async-index-pipeline.md（S18-4：搜索域迁 text_plugin/vector_plugin）、
+      s13-review-2026-07-02.md（S18-3：hnsw_ → vector_plugin.hpp:173）。
+    - **保留（设计本意）**：plugin-arch-split-design-zh.md 的 search_layer.cpp
+      引用——该稿正是「拆分 search_layer 为插件」的设计本体，其 before-state
+      引用是叙事主体，不可改写；recovery-unified 已有 S17 顶部注记覆盖。
+  - 旁证：plugin-arch-split-design-zh.md 状态栏独立记载「TSan 523/523，唯一
+    失败为**既知预存项 ThreadCountIndependent**」——印证 S20-8 对该 TSan 失败
+    「先例、非本批回归」的判定。
+  - 文档-only，不涉编译/ABI。
