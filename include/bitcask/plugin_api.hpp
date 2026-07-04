@@ -141,6 +141,11 @@ struct FlushResult {
     PluginStatus  status      = PluginStatus::kOk;
     std::uint64_t covered_ord = 0;  // 本次落盘覆盖到的 ord 水位
     std::uint64_t generation  = 0;  // 插件自定义的代号（manifest 记录用）
+    // S20-3 B-B2：链回执——manifest entry 三元组 {generation, chain_seq,
+    // chain_wm} 由 flush 直接回传，宿主无须下探具体插件类型读 chain_state()。
+    // 仅在 status==kOk 且 covered_ord==req.watermark（entry 将被更新）时有意义。
+    std::uint32_t chain_seq   = 0;
+    std::uint64_t chain_wm    = 0;
 };
 
 // prepare 相产物（类型擦除；由产出它的插件在 on_put 中消费）。

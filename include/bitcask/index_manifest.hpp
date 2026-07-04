@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -152,6 +153,16 @@ deserialize_manifest(const std::byte* raw, std::size_t len) {
 
 // ---- 文件 I/O（tmp + fdatasync + rename + dirfsync）----
 
+// S20-3 B-B1：FILE* 走 RAII（与 search_checkpoint/field_schema/hnsw 先例一致，
+// 替代手工 fclose——早退/未来改动免泄漏）。独立命名空间避免与
+// field_schema.hpp 的 bitcask::detail::FileCloser 撞名。
+namespace manifest_io {
+struct FileCloser {
+    void operator()(std::FILE* f) const noexcept { if (f) std::fclose(f); }
+};
+using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
+}  // namespace manifest_io
+
 inline void fsync_directory_of(const std::string& path) {
     std::filesystem::path parent = std::filesystem::path(path).parent_path();
     if (parent.empty()) parent = ".";
@@ -163,12 +174,13 @@ inline void fsync_directory_of(const std::string& path) {
     auto buf = serialize_manifest(m);
     const std::string tmp = path + ".tmp";
 
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    manifest_io::FilePtr f(std::fopen(tmp.c_str(), "wb"));
     if (!f) return false;
-    const bool wrote = std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
-    std::fflush(f);
-    if (wrote) ::fdatasync(::fileno(f));
-    std::fclose(f);
+    const bool wrote =
+        std::fwrite(buf.data(), 1, buf.size(), f.get()) == buf.size();
+    std::fflush(f.get());
+    if (wrote) ::fdatasync(::fileno(f.get()));
+    f.reset();  // 显式 close（须在 rename 前 flush OS 缓冲）
     if (!wrote) { std::remove(tmp.c_str()); return false; }
 
     if (std::rename(tmp.c_str(), path.c_str()) != 0) {
@@ -181,11 +193,12 @@ inline void fsync_directory_of(const std::string& path) {
 
 [[nodiscard]] inline std::optional<Manifest>
 read_manifest(const std::string& path) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    manifest_io::FilePtr f(std::fopen(path.c_str(), "rb"));
     if (!f) return std::nullopt;
     std::array<std::byte, kManifestSize> buf{};
-    const bool read_ok = std::fread(buf.data(), 1, buf.size(), f) == buf.size();
-    std::fclose(f);
+    const bool read_ok =
+        std::fread(buf.data(), 1, buf.size(), f.get()) == buf.size();
+    f.reset();
     if (!read_ok) return std::nullopt;
     return deserialize_manifest(buf.data(), buf.size());
 }

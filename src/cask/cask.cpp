@@ -3207,17 +3207,10 @@ bool Cask::save_checkpoint_paired(
         if (!comp) continue;
         auto fr = p->flush(freq);
         if (fr.status == plugin::PluginStatus::kOk && fr.covered_ord == wm) {
-            // S19-2：链状态直接从插件读（原 shim get_component_state）。
-            auto& e = new_manifest.entries[static_cast<std::size_t>(*comp)];
-            if (*comp == bitcask::ComponentId::kBm25) {
-                const auto cs = text_->chain_state();
-                e = bitcask::ManifestEntry{cs.base_gen, cs.next_seq - 1,
-                                           cs.chain_wm};
-            } else {
-                const auto cs = vec_plugin_->chain_state();
-                e = bitcask::ManifestEntry{cs.base_gen, cs.next_seq - 1,
-                                           cs.chain_wm};
-            }
+            // S20-3 B-B2：链回执随 FlushResult 多态回传，宿主不再下探具体
+            // 插件类型读 chain_state()（第三组件零 else 分支即可接入）。
+            new_manifest.entries[static_cast<std::size_t>(*comp)] =
+                bitcask::ManifestEntry{fr.generation, fr.chain_seq, fr.chain_wm};
         }
     }
     // base 轮落成 → 清 legacy 全局 rebase（旧 save_components_base 尾部
