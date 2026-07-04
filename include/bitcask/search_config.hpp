@@ -7,11 +7,13 @@
 
 #pragma once
 
+// S20-4 B-C1：只依赖两插件的配置 POD 头（轻量），不再拖入完整插件定义
+// （inverted.hpp/hnsw.hpp）——配置聚合层与插件实现层解耦。
 #include "bitcask/analyzer.hpp"
 #include "bitcask/meta_file.hpp"
 #include "bitcask/synonym_map.hpp"
-#include "bitcask/text_plugin.hpp"
-#include "bitcask/vector_plugin.hpp"
+#include "bitcask/text_plugin_config.hpp"
+#include "bitcask/vector_plugin_config.hpp"
 
 #include <cstddef>
 #include <cstdint>

@@ -19,8 +19,10 @@
 #pragma once
 
 #include "bitcask/analyzer.hpp"
+#include "bitcask/component_ckpt.hpp"     // S20-1 R6：共用链状态/载入结果类型
 #include "bitcask/doc_table.hpp"
 #include "bitcask/highlighter.hpp"
+#include "bitcask/text_plugin_config.hpp"  // S20-4：TextPluginConfig（轻量头）
 #include "bitcask/inverted.hpp"
 #include "bitcask/plugin_api.hpp"    // S18-5：实现 CaskPlugin
 #include "bitcask/search_cache.hpp"
@@ -48,20 +50,7 @@
 
 namespace bitcask::text {
 
-// 文本插件配置（原 SearchLayerConfig 的文本相关字段，由
-// SearchLayerConfig::split() 产出）。各字段语义见 search_layer.hpp 原注释。
-struct TextPluginConfig {
-    AnalyzerConfig       analyzer_config;
-    bm25::Bm25Params     bm25_params;
-    std::size_t          cache_max_entries = 256;
-    std::size_t          doc_text_cache_max = 1024;
-    bool                 index_positions = true;
-    double               auto_compact_dead_ratio = 0.0;  // S12-2
-    std::shared_ptr<const SynonymMap> synonym_map;       // S11：open-time 不可变
-    // S18-6（S14-5 语义每插件化）：delta 链长上限，达到后 flush 强制 base。
-    // 0 = 不设限。
-    std::uint32_t        max_delta_chain = 64;
-};
+// TextPluginConfig 定义已迁 text_plugin_config.hpp（S20-4）。
 
 // prepare 相产物：map_analyze 的 ReduceJob（类型擦除跨线程移交；原
 // SearchLayerAdapter::SearchPrepared，S18-5 随 adapter 退役迁入）。
@@ -275,28 +264,17 @@ public:
     // ---- bm25 组件 checkpoint（bm25.ckpt 文件族；S18-6 收进 flush/open）----
     [[nodiscard]] bool save_component_base(std::string_view dir,
                                            std::uint64_t watermark);
-    struct DeltaSaveResult {
-        bool          wrote = false;
-        std::uint32_t new_seq = 0;
-    };
+    // 三组件同构，收敛至 ckpt:: 共用类型（S20-1 R6）。
+    using DeltaSaveResult = ckpt::DeltaSaveResult;
     [[nodiscard]] DeltaSaveResult save_component_delta(std::string_view dir,
                                                        std::uint64_t watermark);
-    struct LoadResult {
-        bool          loaded = false;
-        std::uint64_t watermark = 0;
-        bool          from_prev = false;
-        bool          all_segments_ok = false;
-    };
+    using LoadResult = ckpt::LoadResult;
     [[nodiscard]] LoadResult load_component(std::string_view dir,
                                             std::uint64_t expected_base_wm,
                                             std::uint32_t chain_seq);
 
-    // 链状态（Cask 经 SearchLayer 转发同步）。
-    struct ChainState {
-        std::uint64_t base_gen = 0;
-        std::uint64_t chain_wm = 0;
-        std::uint32_t next_seq = 1;
-    };
+    // 链状态（Cask 转发同步）。
+    using ChainState = ckpt::ChainState;
     [[nodiscard]] ChainState chain_state() const { return chain_; }
     void set_chain_state(const ChainState& st) { chain_ = st; }
 

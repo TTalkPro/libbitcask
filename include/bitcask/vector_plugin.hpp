@@ -17,8 +17,10 @@
 
 #pragma once
 
+#include "bitcask/component_ckpt.hpp"       // S20-1 R6：共用链状态/载入结果类型
 #include "bitcask/doc_table.hpp"
 #include "bitcask/hnsw.hpp"
+#include "bitcask/vector_plugin_config.hpp"  // S20-4：VectorPluginConfig（轻量头）
 #include "bitcask/meta_file.hpp"     // meta::VectorMetric
 #include "bitcask/meta_filter.hpp"
 #include "bitcask/plugin_api.hpp"    // S18-5：实现 CaskPlugin
@@ -36,18 +38,7 @@
 
 namespace bitcask::vec {
 
-// 向量插件配置（原 SearchLayerConfig 的 vector 相关字段，S18-4 起由
-// SearchLayerConfig::split() 产出）。
-struct VectorPluginConfig {
-    std::uint16_t      dim = 0;                               // 0 = 无向量
-    meta::VectorMetric metric = meta::VectorMetric::kNone;
-    // S13-D11：建图参数（0 = HnswConfig 默认）。
-    std::uint32_t      hnsw_m = 0;
-    std::uint32_t      hnsw_ef_construction = 0;
-    bool               inmem_int8 = false;                    // P5b
-    // S18-6（S14-5 语义每插件化）：delta 链长上限。0 = 不设限。
-    std::uint32_t      max_delta_chain = 64;
-};
+// VectorPluginConfig 定义已迁 vector_plugin_config.hpp（S20-4）。
 
 class VectorPlugin final : public plugin::CaskPlugin {
 public:
@@ -150,30 +141,19 @@ public:
     // 无向量配置时清残留文件并返回 false（与旧 save_components_base 一致）。
     [[nodiscard]] bool save_component_base(std::string_view dir,
                                            std::uint64_t watermark);
-    struct DeltaSaveResult {
-        bool          wrote = false;
-        std::uint32_t new_seq = 0;   // 本次写入的 .d 序号（manifest 用）
-    };
+    // 三组件同构，收敛至 ckpt:: 共用类型（S20-1 R6）。
+    using DeltaSaveResult = ckpt::DeltaSaveResult;
     // delta：插入日志非空才写 .d<seq>；成功推进自身链状态并清日志。
     [[nodiscard]] DeltaSaveResult save_component_delta(std::string_view dir,
                                                        std::uint64_t watermark);
-    struct LoadResult {
-        bool          loaded = false;
-        std::uint64_t watermark = 0;
-        bool          from_prev = false;
-        bool          all_segments_ok = false;
-    };
+    using LoadResult = ckpt::LoadResult;
     // 载入：base（wm 校验，失败退 .prev）→ 链 .d1..d{chain_seq} 重放。
     [[nodiscard]] LoadResult load_component(std::string_view dir,
                                             std::uint64_t expected_base_wm,
                                             std::uint32_t chain_seq);
 
-    // 链状态（Cask 经 SearchLayer 转发同步；与 manifest entry 对齐）。
-    struct ChainState {
-        std::uint64_t base_gen = 0;
-        std::uint64_t chain_wm = 0;
-        std::uint32_t next_seq = 1;
-    };
+    // 链状态（Cask 转发同步；与 manifest entry 对齐）。
+    using ChainState = ckpt::ChainState;
     [[nodiscard]] ChainState chain_state() const { return chain_; }
     void set_chain_state(const ChainState& st) {
         chain_ = st;

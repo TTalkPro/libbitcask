@@ -49,6 +49,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "bitcask/bm25_params.hpp"   // S20-4：Bm25Params 抽出的轻量头
 #include "bitcask/fuzzy_matcher.hpp"
 #include "bitcask/live_checker.hpp"
 #include "bitcask/query.hpp"
@@ -56,16 +57,6 @@
 #include "bitcask/inverted_wal.hpp"
 
 namespace bitcask::bm25 {
-
-// BM25 可调参数。
-struct Bm25Params {
-    float k1 = 1.2F;
-    float b  = 0.75F;
-    // BM25+ 的下界常数 δ（S8.10）：每个在文档中出现的 term 的 tf 归一化项加 δ，
-    // 缓解标准 BM25 对长文档的过度惩罚（Lv & Zhai 2011）。
-    // 默认 0 = 标准 BM25（向后兼容）。典型值 1.0。
-    float delta = 0.0F;
-};
 
 // Posting 分块元数据（Block-Max WAND 跳跃索引）。
 struct PostingBlock {
