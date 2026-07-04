@@ -5,7 +5,7 @@
 // inverted.hpp（BM25 内部实现）仅为了继承一个接口。
 //
 // ⚠️ v5 不变量:doc_len(ord) 必须等于该文档 add_doc 时的 Σtf
-// (SearchLayer 两者同源自同一次分词,天然成立)。块级分数上界用
+// (TextPlugin 两者同源自同一次分词,天然成立)。块级分数上界用
 // 索引时 min_dl 收紧——若自定义实现返回比索引时更小的 doc_len,
 // 上界不再 admissible,BMW 剪枝可能漏掉真 top-k(测试用 checker
 // 必须按此约定构造)。

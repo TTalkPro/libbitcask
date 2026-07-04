@@ -76,7 +76,7 @@ static const bool s_reg_ws = [] {
 // Jieba 注册放在工厂同一 TU（analyzer.cpp 必被链接）——而非 jieba_analyzer.cpp
 // 内自注册：bitcask_text 是 STATIC 库，若没有其它符号引用 jieba_analyzer.o，
 // 链接器会丢弃整个 TU，静态初始化不执行 → create(Jieba) 返回 nullptr →
-// SearchLayer::analyzer_ 为空 → 首次带 text 的 put 段错误。这里的 lambda 体
+// TextPlugin::analyzer_ 为空 → 首次带 text 的 put 段错误。这里的 lambda 体
 // 引用 JiebaAnalyzer 构造符号，强制把 jieba_analyzer.o 拉进链接并完成注册。
 static const bool s_reg_jieba = [] {
     AnalyzerFactory::register_creator(

@@ -119,8 +119,8 @@ struct CaskOptions {
     std::uint8_t  tombstone_version = 0;
 
     merge::PolicyOptions policy{};
-    // Phase 4: enable_search 用于 meta 检查；search_config 用于 SearchLayer 创建。
-    // search_config.has_value() 时才真正创建 SearchLayer。
+    // Phase 4: enable_search 用于 meta 检查；search_config 用于搜索插件创建。
+    // search_config.has_value() 时才真正创建搜索插件（Text/Vector）。
     bool enable_search = false;
     std::optional<search::SearchLayerConfig> search_config;
     // V3.1:向量配置(hnsw-design §1)。dim>0 即启用,要求 enable_search;
@@ -385,7 +385,7 @@ public:
     // 离线升级：将 KV 模式目录升级为索引模式。
     // 前提条件：目录必须存在且当前为 KV 模式；目录必须处于离线状态（无活跃 writer）。
     // 流程：读取 bitcask.meta 验证 KV 模式 → 写入新 meta 标记为索引模式 →
-    //       创建 SearchLayer → 扫描所有数据文件重建索引 → 返回只读索引模式 Cask。
+    //       创建搜索插件（Text/Vector）→ 扫描所有数据文件重建索引 → 返回只读索引模式 Cask。
     // 线程安全: 是（产生独立的 Cask 对象）。
     // 锁要求: 无（离线操作，不获取 write.lock 或 merge.lock）。
     [[nodiscard]] static std::expected<std::unique_ptr<Cask>, CaskFault>
@@ -837,7 +837,7 @@ private:
         const std::vector<std::byte>& keydir_delta);
 
     // S17-2:当前 manifest。save 时按组件结果更新；load 时初始化。每组件
-    // 链状态也镜像一份（SearchLayer 内部维护，Cask 在 commit 时同步）。
+    // 链状态也镜像一份（各插件内部维护，Cask 在 commit 时同步）。
     bitcask::Manifest current_manifest_;
 
     // S18-2：docmap 组件链状态镜像（宿主直驱 docmap 持久化后，替代原
@@ -1046,7 +1046,7 @@ public:
     [[nodiscard]] std::expected<void, CaskFault> acquire_open_locks();
 
     // T2.4:open 阶段二——bitcask.meta 读取或创建(决定 KV / 索引模式、
-    // 向量配置一致性校验)。必须先于 SearchLayer 创建。
+    // 向量配置一致性校验)。必须先于搜索插件创建。
     [[nodiscard]] std::expected<void, CaskFault> check_or_create_meta();
 
     // T2.4:open 阶段三——搜索插件（Text/Vector）+ IndexPool 创建(只在 search_config

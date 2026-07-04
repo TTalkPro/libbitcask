@@ -21,7 +21,7 @@
 
 namespace bitcask::search {
 
-// SearchLayer 配置。
+// 搜索配置聚合（拆分产出 Text/Vector 两插件配置；类型名沿用 SearchLayerConfig）。
 struct SearchLayerConfig {
     text::AnalyzerConfig analyzer_config;
     bm25::Bm25Params     bm25_params;

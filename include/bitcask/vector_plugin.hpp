@@ -2,8 +2,9 @@
 //
 // 自 SearchLayer 抽出的向量子系统：HNSW 图 + 写入端归一化 + 向量查询 +
 // merge 重建 + vec 组件 checkpoint（vec.ckpt 文件族含 .vec/.qc8 侧车 +
-// delta 插入日志）。S18-5 起实现 plugin::CaskPlugin（on_put/flush/open），
-// 本批先以具体类形态被 SearchLayer 持有并全量委托——外部 API 面零变化。
+// delta 插入日志）。S18-5 起实现 plugin::CaskPlugin（on_put/flush/open）；
+// S19 起由 Cask 直持（S18 期经 SearchLayer 委托，shim 已降级为测试夹具）
+// ——外部 API 面零变化。
 //
 // === 线程模型（与原 SearchLayer 向量域一致）===
 //   单写者（reducer：insert/rebuild/组件 save/load）+ 多读者（search）。

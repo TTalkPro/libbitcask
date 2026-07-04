@@ -3,8 +3,8 @@
 // 自 SearchLayer 抽出的文本子系统：per-field 倒排（InvertedIndex）+
 // analyzer + 查询缓存 + 高亮原文 LRU + 同义词 + bm25 组件 checkpoint
 //（bm25.ckpt 文件族 + delta 链）。S18-5 起实现 plugin::CaskPlugin
-//（prepare/on_put/flush/open），本批先以具体类形态被 SearchLayer 持有并
-// 全量委托——外部 API 面零变化。
+//（prepare/on_put/flush/open）；S19 起由 Cask 直持（S18 期经 SearchLayer
+// 委托，shim 已降级为测试夹具）——外部 API 面零变化。
 //
 // === 线程模型（与原 SearchLayer 文本域一致，C1）===
 //   单写者（reducer：apply_text/apply_job/on_delete/组件 save/load）+

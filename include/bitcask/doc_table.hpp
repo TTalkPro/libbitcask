@@ -1,8 +1,8 @@
 // DocTable — 查询面只读文档身份表接口（S16-3，设计 doc/plugin-arch-split-design-zh.md §4）。
 //
 // LiveChecker 只覆盖评分热路径需要的存活/doc_len 判定；DocTable 在其上扩展
-// 查询面身份翻译（ord↔ext）与 meta 过滤——SearchLayer 的查询代码、HNSW 的
-// live-callback、materialize_hits 经本接口消费 docmap，不再直摸 index::Index
+// 查询面身份翻译（ord↔ext）与 meta 过滤——插件（Text/Vector）的查询代码、
+// HNSW live-callback、materialize_hits 经本接口消费 docmap，不再直摸 index::Index
 // 具体类型。这是 P4 双插件（Text/Vector）拆分的前置：双方借同一 DocTable
 // 只读视图，不各持身份表。
 //
