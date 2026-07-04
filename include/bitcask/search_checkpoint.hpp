@@ -52,6 +52,32 @@ struct CkptSection {
     std::span<const std::byte> payload;
 };
 
+// 分段写入累加器（S20-1 R4）：delta/base 保存处「持有 owned payload 缓冲 +
+// 并行登记引用它的 CkptSection」的公共骨架。SearchCheckpoint::write 消费 span，
+// 故 payload 缓冲须活到写盘——本类接管所有权保证之。
+//
+// 不变量（依赖 std::vector 的移动语义）：外层 bufs_ 增长搬移内层 vector 时，
+// 内层 vector 的堆缓冲指针不变，故已登记 CkptSection 的 span 不悬垂。
+class SectionWriter {
+public:
+    // 追加一段：接管 payload 所有权，登记指向它的 CkptSection（flags=0）。
+    void add(CkptSectionType type, std::vector<std::byte> payload) {
+        bufs_.push_back(std::move(payload));
+        secs_.push_back(CkptSection{
+            static_cast<std::uint16_t>(type), 0,
+            std::span<const std::byte>(bufs_.back().data(),
+                                       bufs_.back().size())});
+    }
+    [[nodiscard]] const std::vector<CkptSection>& sections() const {
+        return secs_;
+    }
+    [[nodiscard]] bool empty() const noexcept { return secs_.empty(); }
+
+private:
+    std::vector<std::vector<std::byte>> bufs_;  // owned payload，活到 write()
+    std::vector<CkptSection>            secs_;  // span 引用 bufs_ 各元素
+};
+
 // 读取用:从文件载出的一段(payload owned;crc_ok 标记是否通过逐段校验)。
 struct LoadedSection {
     std::uint16_t type;
