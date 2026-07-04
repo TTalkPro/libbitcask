@@ -529,6 +529,11 @@ static int test_search_filtered(void) {
 // C++ 测试 CrashRecoveryTest.OperationsAfterCloseReturnErrorNotUb。
 
 int main(void) {
+    // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
+    // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
+    // 搜索命中 0）。运行前统一清空，保证 hermetic。
+    (void)system("rm -rf /tmp/bitcask_c_test_* 2>/dev/null");
+
     int failures = 0;
     failures += test_version();
     failures += test_kv_basic();
