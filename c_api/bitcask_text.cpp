@@ -1,4 +1,6 @@
 // C API — BM25 文本搜索（S19-5 自 bitcask_c.cpp 拆分，符号与实现不变）。
+// 单查询入口统一形态（S20-1 R1）：参数校验 → 委托 C++ 查询 →
+// internal.h::finish_single 物化结果/翻译错误。
 #include "internal.h"
 
 using namespace bitcask::capi;
@@ -19,17 +21,7 @@ BITCASK_API bitcask_error_t bitcask_search_text(bitcask_t* cask,
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
-
-    auto result = as_cpp_cask(cask)->search_text(query, k);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    return finish_single(as_cpp_cask(cask)->search_text(query, k), out, fault);
     });
 }
 
@@ -68,17 +60,8 @@ BITCASK_API bitcask_error_t bitcask_search_phrase(bitcask_t* cask,
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
-
-    auto result = as_cpp_cask(cask)->search_phrase(query, k);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    return finish_single(as_cpp_cask(cask)->search_phrase(query, k), out,
+                         fault);
     });
 }
 
@@ -91,17 +74,7 @@ BITCASK_API bitcask_error_t bitcask_bool_search(bitcask_t* cask,
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
-
-    auto result = as_cpp_cask(cask)->bool_search(query, k);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    return finish_single(as_cpp_cask(cask)->bool_search(query, k), out, fault);
     });
 }
 
@@ -114,17 +87,8 @@ BITCASK_API bitcask_error_t bitcask_search_fields(bitcask_t* cask,
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
-
-    auto result = as_cpp_cask(cask)->search_fields(query, k);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    return finish_single(as_cpp_cask(cask)->search_fields(query, k), out,
+                         fault);
     });
 }
 
@@ -138,17 +102,8 @@ BITCASK_API bitcask_error_t bitcask_search_near(bitcask_t* cask,
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
-
-    auto result = as_cpp_cask(cask)->search_near(query, slop, k);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    return finish_single(as_cpp_cask(cask)->search_near(query, slop, k), out,
+                         fault);
     });
 }
 
@@ -162,17 +117,9 @@ BITCASK_API bitcask_error_t bitcask_search_fuzzy(bitcask_t* cask,
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
-
-    auto result = as_cpp_cask(cask)->search_fuzzy(query, k, max_edit_distance);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    return finish_single(
+        as_cpp_cask(cask)->search_fuzzy(query, k, max_edit_distance), out,
+        fault);
     });
 }
 
@@ -185,17 +132,8 @@ BITCASK_API bitcask_error_t bitcask_search_wildcard(bitcask_t* cask,
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !pattern || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
-
-    auto result = as_cpp_cask(cask)->search_wildcard(pattern, k);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    return finish_single(as_cpp_cask(cask)->search_wildcard(pattern, k), out,
+                         fault);
     });
 }
 
@@ -211,21 +149,10 @@ BITCASK_API bitcask_error_t bitcask_search_text_filtered(
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
-    meta::MetaFilter mf;
-    if (filter && !to_cpp_meta_filter(*filter, mf, 0)) {
-        return BITCASK_ERR_INVALID_OPTION;
-    }
-    auto result = as_cpp_cask(cask)->search_text(query, k,
-                                                 filter ? &mf : nullptr);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
+    return finish_single(as_cpp_cask(cask)->search_text(query, k, pf.get()),
+                         out, fault);
     });
 }
 

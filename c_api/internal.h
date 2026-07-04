@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <span>
@@ -176,6 +177,22 @@ inline bool to_search_result(bitcask::TextSearchResult&& src, bitcask_search_res
     }
     *out = r;
     return true;
+}
+
+// 单结果检索尾块（S20-1 R1）：C++ expected → C 结果物化 + 错误/OOM 翻译。
+// 12 个单查询入口（text ×8 / vec ×4）共用；caller 已做参数校验并置 *out=NULL。
+inline bitcask_error_t finish_single(
+    std::expected<bitcask::TextSearchResult, bitcask::CaskFault>&& result,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
+    return BITCASK_OK;
 }
 
 // 把 C++ 批量搜索的 n 个 expected 物化为 malloc 的 n 元结果数组（S12-5）。三种批量
@@ -353,6 +370,29 @@ inline bool to_cpp_meta_filter(const bitcask_meta_filter_t& src,
         out.children.push_back(std::move(child));
     }
     return true;
+}
+
+// filtered 检索变体前导（S20-1 R1）：C 过滤树转换三态——
+// 无过滤（filter==NULL，get()=nullptr）/ 转换成功 / 非法（ok=false，
+// caller 返回 INVALID_OPTION）。storage 随本对象存活，get() 不悬垂。
+struct ParsedFilter {
+    meta::MetaFilter storage;
+    bool has = false;
+    bool ok = true;
+    [[nodiscard]] const meta::MetaFilter* get() const {
+        return has ? &storage : nullptr;
+    }
+};
+
+inline ParsedFilter parse_meta_filter(const bitcask_meta_filter_t* filter) {
+    ParsedFilter r;
+    if (!filter) return r;
+    if (!to_cpp_meta_filter(*filter, r.storage, 0)) {
+        r.ok = false;
+        return r;
+    }
+    r.has = true;
+    return r;
 }
 
 // S13-P8.9：从零拷贝 GetResultView 直接 malloc+memcpy（跳过 to_owned 的

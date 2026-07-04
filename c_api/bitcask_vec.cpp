@@ -1,4 +1,6 @@
 // C API — 向量/混合检索（S19-5 自 bitcask_c.cpp 拆分，符号与实现不变）。
+// 单查询入口统一形态（S20-1 R1）：参数校验 → 委托 C++ 查询 →
+// internal.h::finish_single 物化结果/翻译错误。
 #include "internal.h"
 
 using namespace bitcask::capi;
@@ -23,16 +25,8 @@ BITCASK_API bitcask_error_t bitcask_search_vector(bitcask_t* cask,
     *out = nullptr;
 
     std::span<const float> query_span{query, query_len};
-    auto result = as_cpp_cask(cask)->search_vector(query_span, k, ef);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    return finish_single(as_cpp_cask(cask)->search_vector(query_span, k, ef),
+                         out, fault);
     });
 }
 
@@ -53,16 +47,8 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
     std::span<const float> vec_span;
     if (vec_query && vec_len > 0) vec_span = {vec_query, vec_len};
 
-    auto result = as_cpp_cask(cask)->search_hybrid(text_sv, vec_span, k);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    return finish_single(as_cpp_cask(cask)->search_hybrid(text_sv, vec_span, k),
+                         out, fault);
     });
 }
 
@@ -129,22 +115,12 @@ BITCASK_API bitcask_error_t bitcask_search_vector_filtered(
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
-    meta::MetaFilter mf;
-    if (filter && !to_cpp_meta_filter(*filter, mf, 0)) {
-        return BITCASK_ERR_INVALID_OPTION;
-    }
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
     std::span<const float> query_span{query, query_len};
-    auto result = as_cpp_cask(cask)->search_vector(query_span, k, ef,
-                                                   filter ? &mf : nullptr);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    return finish_single(
+        as_cpp_cask(cask)->search_vector(query_span, k, ef, pf.get()), out,
+        fault);
     });
 }
 
@@ -158,26 +134,16 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
     if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
-    meta::MetaFilter mf;
-    if (filter && !to_cpp_meta_filter(*filter, mf, 0)) {
-        return BITCASK_ERR_INVALID_OPTION;
-    }
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
     std::string_view text_sv;
     if (text_query) text_sv = text_query;
     std::span<const float> vec_span;
     if (vec_query && vec_len > 0) vec_span = {vec_query, vec_len};
 
-    auto result = as_cpp_cask(cask)->search_hybrid(text_sv, vec_span, k,
-                                                   filter ? &mf : nullptr);
-    if (!result) {
-        to_c_error(result.error(), fault);
-        return to_c_error_kind(result.error().kind);
-    }
-    if (!to_search_result(std::move(*result), out)) {
-        set_oom_fault(fault);
-        return BITCASK_ERR_IO;
-    }
-    return BITCASK_OK;
+    return finish_single(
+        as_cpp_cask(cask)->search_hybrid(text_sv, vec_span, k, pf.get()), out,
+        fault);
     });
 }
 
