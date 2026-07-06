@@ -340,7 +340,21 @@ private:
 
     // S11-W4：排干所有 live key（仅 key 拷贝，**不读 value**——走 keydir proxy）。
     // 供 Cask::parallel_scan 取快照后分区并行 get。start() 之后调用,消费迭代器。
-    [[nodiscard]] std::vector<std::vector<std::byte>> drain_live_keys();
+    // S24-M7：扁平承载（单缓冲 + N+1 偏移哨兵）——原 vector<vector<byte>>
+    // 每 key 一个堆 vector（24B 头 + malloc），百万 key 快照 N 次分配 →
+    // 恒 2 次，峰值内存约减半。切片经 operator[] 以 span 消费。
+    struct FlatKeys {
+        std::vector<std::byte>   buf;
+        std::vector<std::size_t> offs;  // N+1 哨兵；empty = 空集
+        [[nodiscard]] std::size_t size() const noexcept {
+            return offs.empty() ? 0 : offs.size() - 1;
+        }
+        [[nodiscard]] std::span<const std::byte>
+        operator[](std::size_t i) const noexcept {
+            return {buf.data() + offs[i], offs[i + 1] - offs[i]};
+        }
+    };
+    [[nodiscard]] FlatKeys drain_live_keys();
 
     // S13：fold 启动时 pin 一份「目录下全部 data file」的只读句柄快照。
     // 并发 merge 在 fold 期间 unlink 旧文件时，已 open 的 fd 让 inode 在

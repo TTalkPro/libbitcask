@@ -180,7 +180,8 @@ void VectorPlugin::insert(std::uint64_t ord, std::span<const float> v) {
     // S14-4：窗口插入日志（图无不可变旧段，delta 用插入日志重放）。只记
     // 窗口水位之上的（fold 重叠区的重放向量已在链里，S18-1 门限语义）。
     if (ord >= delta_window_wm_) {
-        delta_vecs_.emplace_back(ord, std::vector<float>(v.begin(), v.end()));
+        delta_ords_.push_back(ord);
+        delta_data_.insert(delta_data_.end(), v.begin(), v.end());
     }
     hnsw->insert(ord, v);
 }
@@ -255,14 +256,15 @@ std::size_t VectorPlugin::size() const {
 }
 
 void VectorPlugin::serialize_delta_log(std::vector<std::byte>& out) const {
-    sc::detail::put_u64(out, static_cast<std::uint64_t>(delta_vecs_.size()));
+    sc::detail::put_u64(out, static_cast<std::uint64_t>(delta_ords_.size()));
     sc::detail::put_u16(out, config_.dim);
-    for (const auto& [ord, v] : delta_vecs_) {
-        sc::detail::put_u64(out, ord);
+    const std::size_t dim = config_.dim;
+    for (std::size_t i = 0; i < delta_ords_.size(); ++i) {
+        sc::detail::put_u64(out, delta_ords_[i]);
+        const float* v = delta_data_.data() + i * dim;
         out.insert(out.end(),
-            reinterpret_cast<const std::byte*>(v.data()),
-            reinterpret_cast<const std::byte*>(v.data()) +
-                v.size() * sizeof(float));
+            reinterpret_cast<const std::byte*>(v),
+            reinterpret_cast<const std::byte*>(v) + dim * sizeof(float));
     }
 }
 
@@ -357,7 +359,7 @@ bool VectorPlugin::save_component_base(std::string_view dir,
     chain_ = ChainState{watermark, watermark, 1};
     // S18-1：base 落成——窗口日志全量被 base 覆盖 → 清空；窗口推进。
     delta_window_wm_ = watermark;
-    delta_vecs_.clear();
+    clear_delta_log();
     dirty_.store(false, std::memory_order_relaxed);
     return true;
 }
@@ -369,7 +371,7 @@ VectorPlugin::save_component_delta(std::string_view dir,
     // 插入日志为空 → 跳过本组件写入（与旧 save_components_delta 一致）。
     // 脏位照清（旧代码 dirty_mask[2] 为真即清，与是否写入无关）——防
     // 空链的 vec 恒脏卡死 any_dirty 决策。
-    if (delta_vecs_.empty()) {
+    if (delta_ords_.empty()) {
         dirty_.store(false, std::memory_order_relaxed);
         return result;
     }
@@ -396,7 +398,7 @@ VectorPlugin::save_component_delta(std::string_view dir,
     chain_.chain_wm = watermark;
     chain_.next_seq = seq + 1;
     delta_window_wm_ = watermark;
-    delta_vecs_.clear();      // S18-1：写入成功才清
+    clear_delta_log();        // S18-1：写入成功才清
     dirty_.store(false, std::memory_order_relaxed);
     result.wrote = true;
     result.new_seq = seq;
@@ -458,6 +460,7 @@ VectorPlugin::load_component(std::string_view dir,
     if (segments_ok && !from_prev) {
         const auto w = sc::walk_chain(
             fp, /*base_gen=*/coverage, /*base_coverage=*/coverage, chain_seq,
+            /*unbounded=*/false,
             [&](const sc::LoadedCheckpoint& dc) -> bool {
                 for (const auto& dls : dc.sections) {
                     if (!dls.crc_ok) return false;
@@ -487,7 +490,7 @@ VectorPlugin::load_component(std::string_view dir,
     if (result.loaded) {
         chain_ = ChainState{expected_base_wm, coverage, next_seq};
         delta_window_wm_ = coverage;
-        delta_vecs_.clear();
+        clear_delta_log();
         dirty_.store(false, std::memory_order_relaxed);
     } else {
         return fail();
@@ -529,7 +532,7 @@ plugin::FlushResult VectorPlugin::flush(const plugin::FlushRequest& req) {
             res.status = plugin::PluginStatus::kFailed;
             res.covered_ord = chain_.chain_wm;
         }
-    } else if (!dirty() || delta_vecs_.empty()) {
+    } else if (!dirty() || delta_ords_.empty()) {
         // 干净或空插入日志：no-op（脏位照清——镜像旧「save 时无条件清」）。
         dirty_.store(false, std::memory_order_relaxed);
         res.covered_ord = chain_.chain_wm;

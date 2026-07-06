@@ -189,3 +189,103 @@ TEST(KeyDir, AllocOrdThreadSafety) {
         EXPECT_EQ(ords[i], static_cast<std::uint64_t>(i));
     }
 }
+// ---- S21-2 A3：快照 v2（entries 块 vbyte）----
+
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+
+#include "bitcask/codec.hpp"
+
+namespace {
+namespace fs = std::filesystem;
+
+void le32(std::vector<std::uint8_t>& b, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) b.push_back((v >> (8 * i)) & 0xFF);
+}
+void le64(std::vector<std::uint8_t>& b, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i) b.push_back((v >> (8 * i)) & 0xFF);
+}
+}  // namespace
+
+// v2 写读 roundtrip：save → 全新 KeyDir load → entry 字段/水位/标量逐项一致。
+TEST(KeyDirSnapshot, V2RoundTrip) {
+    const fs::path p =
+        fs::temp_directory_path() / "bitcask_kd_snap_v2.ckpt";
+    fs::remove(p);
+    KeyDir kd;
+    ASSERT_EQ(kd.put("alpha", /*file_id*/ 3, /*total_sz*/ 40, /*offset*/ 1000,
+                     /*tstamp*/ 1700000000, 0, true, 0, 0, /*ord*/ 7),
+              PutResult::kOk);
+    ASSERT_EQ(kd.put("k-long-" + std::string(200, 'x'), 4, 50, 2000,
+                     1700000001, 0, true, 0, 0, 8),
+              PutResult::kOk);
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> wms{{4, 12345}};
+    ASSERT_TRUE(kd.save_snapshot(p.string(), wms));
+
+    KeyDir kd2;
+    auto loaded = kd2.load_snapshot(p.string());
+    ASSERT_TRUE(loaded.has_value());
+    ASSERT_EQ(loaded->size(), 1u);
+    EXPECT_EQ((*loaded)[0].first, 4u);
+    EXPECT_EQ((*loaded)[0].second, 12345u);
+    auto e = kd2.get("alpha");
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->file_id, 3u);
+    EXPECT_EQ(e->total_sz, 40u);
+    EXPECT_EQ(e->offset, 1000u);
+    EXPECT_EQ(e->tstamp, 1700000000u);
+    EXPECT_EQ(e->ord, 7u);
+    EXPECT_TRUE(kd2.get("k-long-" + std::string(200, 'x')).has_value());
+    fs::remove(p);
+}
+
+// v1（定宽 entries）兼容读：手工构造 v1 字节流——写端已恒写 v2，此路径
+// 无自然覆盖，防回归。
+TEST(KeyDirSnapshot, V1CompatRead) {
+    const fs::path p =
+        fs::temp_directory_path() / "bitcask_kd_snap_v1.ckpt";
+    std::vector<std::uint8_t> b;
+    le32(b, 0x42434B53);  // "BCKS"
+    le32(b, 1);           // v1
+    le64(b, 10);          // next_ord
+    le64(b, 2);           // epoch
+    le32(b, 5);           // biggest_file_id
+    le64(b, 1);           // key_count
+    le64(b, 5);           // key_bytes
+    le32(b, 0);           // fstats_n
+    le32(b, 1);           // wm_n
+    le32(b, 5); le64(b, 999);  // watermark {5, 999}
+    le64(b, 1);           // entry_n
+    const char* key = "kv1ky";
+    b.push_back(5); b.push_back(0);  // klen u16
+    b.insert(b.end(), key, key + 5);
+    le32(b, 5);            // file_id
+    le32(b, 40);           // total_sz
+    le64(b, 4096);         // offset
+    le64(b, 2);            // epoch
+    le32(b, 1700000000);   // tstamp
+    le64(b, 9);            // ord
+    const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(b.data() + 8), b.size() - 8));
+    le32(b, crc);
+    {
+        std::ofstream f(p, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(b.data()),
+                static_cast<std::streamsize>(b.size()));
+    }
+    KeyDir kd;
+    auto loaded = kd.load_snapshot(p.string());
+    ASSERT_TRUE(loaded.has_value()) << "v1 快照必须仍可读（兼容分支）";
+    ASSERT_EQ(loaded->size(), 1u);
+    EXPECT_EQ((*loaded)[0].first, 5u);
+    EXPECT_EQ((*loaded)[0].second, 999u);
+    auto e = kd.get("kv1ky");
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->file_id, 5u);
+    EXPECT_EQ(e->total_sz, 40u);
+    EXPECT_EQ(e->offset, 4096u);
+    EXPECT_EQ(e->tstamp, 1700000000u);
+    EXPECT_EQ(e->ord, 9u);
+    fs::remove(p);
+}

@@ -93,7 +93,9 @@ void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
     // 分析后经 set_doc_len 回填），随后跑单文本核心。流水线路径不走本方法。
     index_.put_doc(key, ord,
                    index::DocSlot{
-                       index::DocLoc{file_id, offset, total_sz},
+                       index::DocLoc{.offset   = offset,
+                                     .file_id  = file_id,
+                                     .total_sz = total_sz},
                        tstamp,
                        /*doc_len=*/0});
     apply_text(key, ord, text);
@@ -138,7 +140,9 @@ void SearchLayer::on_write_fields(
     auto job = map_analyze(key, ord, fvs, file_id, offset, total_sz, tstamp);
     // S16-2：standalone 同步路径自落 docmap 行（doc_len 直接用分析产物）。
     index_.put_doc(key, ord,
-                   index::DocSlot{index::DocLoc{file_id, offset, total_sz},
+                   index::DocSlot{index::DocLoc{.offset   = offset,
+                                                .file_id  = file_id,
+                                                .total_sz = total_sz},
                                   tstamp, job.total_doc_len});
     reduce_apply(job, {});
 }
@@ -168,7 +172,9 @@ void SearchLayer::on_relocate(std::string_view key, std::uint64_t ord,
     // S18-2：docmap 脏位由 Index::put_doc 自记账（loc 列刷新）。
     index_.put_doc(key, ord,
                    index::DocSlot{
-                       index::DocLoc{new_file_id, new_offset, new_total_sz},
+                       index::DocLoc{.offset   = new_offset,
+                                     .file_id  = new_file_id,
+                                     .total_sz = new_total_sz},
                        slot->tstamp,
                        slot->doc_len});
 }
@@ -240,7 +246,9 @@ void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
     // S16-2：恢复路径自落 docmap 行（SearchLayer 借用宿主实例；持久化载入
     // 仍归本层直到 P3）。
     index_.put_doc(key, ord,
-                   index::DocSlot{index::DocLoc{file_id, offset, total_sz},
+                   index::DocSlot{index::DocLoc{.offset   = offset,
+                                                .file_id  = file_id,
+                                                .total_sz = total_sz},
                                   tstamp, job.total_doc_len});
     reduce_apply(job, vector);
 }
@@ -282,7 +290,9 @@ void SearchLayer::recover_doc_batch(std::vector<RecoverDoc>& batch) {
         // 与流水线的宿主先落序一致）。
         index_.put_doc(d.key, d.ord,
                        index::DocSlot{
-                           index::DocLoc{d.file_id, d.offset, d.total_sz},
+                           index::DocLoc{.offset   = d.offset,
+                                         .file_id  = d.file_id,
+                                         .total_sz = d.total_sz},
                            d.tstamp, jobs[i].total_doc_len});
         reduce_apply(jobs[i], d.vector);
     }
@@ -761,8 +771,8 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
     vec_.set_chain_state({watermark, watermark, 1});
     vec_.clear_delta_log();
 
-    // 保存成功后截断 WAL（与旧 save_snapshot 行为一致；S18-4 经 TextPlugin）。
-    text_.truncate_wal();
+    // S22-B2：WAL 已退役（S14-4 delta 链取代；enable_wal 生产零调用）——
+    // 旧「保存成功后截断 WAL」步骤删除。
     return true;
 }
 
@@ -888,7 +898,8 @@ SearchLayer::load_search_ckpt(std::string_view path,
     if (result.all_segments_ok && !from_prev) {
         const auto w = sc::walk_chain(
             fp, chain_base_gen, /*base_coverage=*/chain_coverage,
-            /*chain_seq=*/0, [&](const sc::LoadedCheckpoint& dc) {
+            /*chain_seq=*/0, /*unbounded=*/true,
+            [&](const sc::LoadedCheckpoint& dc) {
                 return apply_delta_file(dc.sections, hook);
             });
         chain_coverage = w.coverage;

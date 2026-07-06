@@ -427,6 +427,10 @@ TEST(HintFileGolden, ReadsGoldenEncodedFile) {
 
 // Inverse direction: bytes our HintFile produces must match the pinned LE
 // golden for the same logical inputs (drift guard).
+// S23-A1：写端换 v3——golden 同步换代（v2 golden 保留在
+// ReadsGoldenEncodedFile 锁定兼容读分支）。布局见 format.hpp：
+// header "BCH3" + 每条 [vbyte gap][vbyte total_sz][vbyte keysz<<1|tomb]
+// [tstamp u32][key] + trailer "BCHE"+CRC。三条连续记录 gap 恒 0（1B）。
 TEST(HintFileGolden, EncodingMatchesGoldenByteForByte) {
     TempDir td;
     const auto path = td / "ours.bitcask.hint";
@@ -447,7 +451,23 @@ TEST(HintFileGolden, EncodingMatchesGoldenByteForByte) {
     ASSERT_EQ(std::fread(got.data(), 1, sz, fp), sz);
     std::fclose(fp);
 
-    auto expected = hex_to_bytes(kGoldenHintHex);
+    // v3 golden：header(4) + 9 + 10 + 12 记录字节 + trailer(8) = 43B
+    // （v2 同载荷 79B，−45%）。trailer CRC 用 codec::crc32 计算拼接
+    // （CRC 实现自身有独立 golden 锁定）。
+    auto expected = hex_to_bytes(
+        "42434833"                       // "BCH3"
+        "80" "93" "82" "64000000" "61"   // R1: gap0,sz19,k1,ts100,"a"
+        "80" "94" "85" "65000000" "6262" // R2: gap0,sz20,k2|tomb,ts101,"bb"
+        "80" "96" "88" "66000000" "63636363");  // R3
+    {
+        const std::uint32_t crc = bitcask::codec::crc32(
+            std::span<const std::byte>(expected.data(), expected.size()));
+        auto tr = hex_to_bytes("42434845");  // "BCHE"
+        expected.insert(expected.end(), tr.begin(), tr.end());
+        for (int i = 0; i < 4; ++i) {
+            expected.push_back(static_cast<std::byte>((crc >> (8 * i)) & 0xFF));
+        }
+    }
     ASSERT_EQ(got.size(), expected.size());
     for (std::size_t i = 0; i < got.size(); ++i) {
         EXPECT_EQ(got[i], expected[i])
@@ -714,7 +734,10 @@ TEST(SearchCheckpoint, FooterCorruptRejected) {
 TEST(SearchCheckpoint, TruncatedRejected) {
     TempDir td;
     const std::string path = td / "search.ckpt";
-    std::vector<CkptSection> secs = {{1, 0, sp(std::string("payload"))}};
+    // S24 补（ASan 实证）：span 源必须具名——sp(临时 string) 在整表达式末
+    // 即悬垂，write 读到已亡栈帧。
+    const std::string payload = "payload";
+    std::vector<CkptSection> secs = {{1, 0, sp(payload)}};
     ASSERT_TRUE(SearchCheckpoint::write(path, 1, secs));
     const long sz = file_size(path);
     std::filesystem::resize_file(path, static_cast<std::uintmax_t>(sz / 2));
@@ -859,4 +882,105 @@ TEST(FieldSchema, ToleratesTornTailNewFormat) {
     ASSERT_TRUE(fs2.open(path));   // torn tail 容忍
     EXPECT_EQ(fs2.size(), 2u);     // 只保留两条完整 entry
     EXPECT_EQ(fs2.name_of(0).value(), "title");
+}
+
+// ---------------------------------------------------------------------------
+// HintFile v3（S23-A1）+ v2 兼容读
+// ---------------------------------------------------------------------------
+
+// v3 非连续 offset（gap≠0，模拟未来写端跳记录）：正确性不依赖连续性。
+TEST(HintFile, V3NonContiguousOffsets) {
+    TempDir td;
+    const auto path = td / "gap.bitcask.hint";
+    auto h = HintFile::open(path, HintFile::Mode::kCreate);
+    ASSERT_TRUE(h);
+    ASSERT_TRUE(h->write(1, 30, /*off*/ 0,   false, as_bytes("a")));
+    ASSERT_TRUE(h->write(2, 40, /*off*/ 100, false, as_bytes("bb")));  // 洞
+    ASSERT_TRUE(h->write(3, 50, /*off*/ 140, true,  as_bytes("ccc")));
+    ASSERT_TRUE(h->finalize());
+
+    auto r = HintFile::open(path, HintFile::Mode::kRead);
+    ASSERT_TRUE(r);
+    std::vector<std::uint64_t> offs;
+    std::vector<bool> tombs;
+    auto fr = r->fold_validated([&](const auto& rec) {
+        offs.push_back(rec.offset);
+        tombs.push_back(rec.tombstone);
+    });
+    ASSERT_TRUE(fr);
+    EXPECT_TRUE(*fr);
+    EXPECT_EQ(offs, (std::vector<std::uint64_t>{0, 100, 140}));
+    EXPECT_EQ(tombs, (std::vector<bool>{false, false, true}));
+}
+
+// v2（18B 定宽 + EOF sentinel）兼容读：写端已恒 v3，手工构造 v2 字节流
+// 防兼容分支回归。fold / fold_validated / validate_trailer 三入口全验。
+TEST(HintFile, V2LegacyFileStillReadable) {
+    TempDir td;
+    const auto path = td / "legacy.bitcask.hint";
+    {
+        namespace codec = bitcask::codec;
+        std::vector<std::byte> buf;
+        codec::encode_hint_record(buf, 1, 30, 0,  false, as_bytes("a"));
+        codec::encode_hint_record(buf, 2, 40, 30, true,  as_bytes("bb"));
+        const std::uint32_t crc = codec::crc32(
+            std::span<const std::byte>(buf.data(), buf.size()));
+        codec::encode_hint_eof(buf, crc);
+        std::ofstream f(std::string(path), std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(buf.data()),
+                static_cast<std::streamsize>(buf.size()));
+    }
+    auto r = HintFile::open(path, HintFile::Mode::kRead);
+    ASSERT_TRUE(r);
+    auto v = r->validate_trailer();
+    ASSERT_TRUE(v);
+    EXPECT_TRUE(*v) << "v2 trailer 校验必须仍通过";
+
+    std::vector<std::string> keys;
+    std::vector<bool> tombs;
+    auto fr = r->fold_validated([&](const auto& rec) {
+        keys.push_back(view_str(rec.key));
+        tombs.push_back(rec.tombstone);
+    });
+    ASSERT_TRUE(fr);
+    EXPECT_TRUE(*fr);
+    EXPECT_EQ(keys, (std::vector<std::string>{"a", "bb"}));
+    EXPECT_EQ(tombs, (std::vector<bool>{false, true}));
+
+    keys.clear();
+    auto fo = r->fold([&](const auto& rec) {
+        keys.push_back(view_str(rec.key));
+    });
+    ASSERT_TRUE(fo);
+    EXPECT_EQ(keys, (std::vector<std::string>{"a", "bb"}));
+}
+
+// v3 未封口（崩溃丢 trailer）：validate/fold_validated 拒绝 → fold(data) 兜底。
+TEST(HintFile, V3UnfinalizedRejected) {
+    TempDir td;
+    const auto path = td / "torn.bitcask.hint";
+    {
+        auto h = HintFile::open(path, HintFile::Mode::kCreate);
+        ASSERT_TRUE(h);
+        ASSERT_TRUE(h->write(1, 30, 0, false, as_bytes("a")));
+        // 手动 flush 但不 finalize（模拟崩溃）——sync 触发不了 pending 落盘，
+        // 直接析构会丢缓冲；这里用 finalize 前的 write 大小不足以自动 flush，
+        // 故重开写一批超过缓冲阈值不现实——改为 finalize 后截尾 8B。
+        ASSERT_TRUE(h->finalize());
+    }
+    // 截掉 trailer 模拟未封口。
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(std::string(path), ec);
+    ASSERT_FALSE(ec);
+    std::filesystem::resize_file(std::string(path), sz - 8, ec);
+    ASSERT_FALSE(ec);
+
+    auto r = HintFile::open(path, HintFile::Mode::kRead);
+    ASSERT_TRUE(r);
+    auto v = r->validate_trailer();
+    ASSERT_TRUE(v);
+    EXPECT_FALSE(*v);
+    auto fr = r->fold_validated([&](const auto&) {});
+    ASSERT_TRUE(fr);
+    EXPECT_FALSE(*fr);
 }

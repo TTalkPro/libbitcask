@@ -45,7 +45,7 @@ namespace bitcask::fileops {
 // keydir 拿这两个值建索引（offset 给 get 用，total_size 给 read 用）。
 struct WriteResult {
     std::uint64_t offset;     // 文件内字节偏移
-    std::uint32_t total_size; // 实际写入的字节数（含 14 字节 header）
+    std::uint32_t total_size; // 实际写入的字节数（含 format::kHeaderSize=23B header）
 };
 
 // read() 的结果：解码完整的一条 record。key/value 是 owned vector
@@ -128,7 +128,7 @@ public:
     // ---- 读取 ----
 
     // 在 offset 处读一条 record，size 必须等于当时写入时记录的 total_size
-    // （即 14 + key_sz + value_sz）。CRC 会校验；不通过返回 kBadCrc。
+    // （即 kHeaderSize(23) + key_sz + value_sz）。CRC 会校验；不通过返回 kBadCrc。
     // 线程安全: 是（pread 不动 fd offset）；多读者并发 OK，且与并发的
     // write()/truncate_*() 仅在「读到刚被改写的偏移段」时不一致——cask 通过
     // 「读只读老文件」「写仅写 active」的拓扑避免该情况。

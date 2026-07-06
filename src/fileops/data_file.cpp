@@ -277,7 +277,7 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
     int crc_errors = 0;
 
     // S13-P6：流式 chunked pread（照搬 hint_file.cpp 的 refill 模式）——
-    // 原实现每条 record 2 次 pread（header 14B + 整条 body），百万条即两百万
+    // 原实现每条 record 2 次 pread（header 23B + 整条 body），百万条即两百万
     // 次 syscall；现 256 KiB 一块 + 跨 record 复用，syscall 数降 3 个数量级。
     // 影响面：merge 全部输入文件扫描、搜索模式恢复（有 search 时 hint 快路径
     // 被跳过恒走 data fold）、纯 KV 无 hint 回退。buffer thread_local：fold
@@ -321,7 +321,7 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
     };
 
     while (offset + format::kHeaderSize <= total) {
-        // 1) header（14 字节）就位。
+        // 1) header（kHeaderSize=23 字节）就位。
         if (buf_len - buf_pos < format::kHeaderSize) {
             auto r = refill(offset, format::kHeaderSize);
             if (!r) return std::unexpected(r.error());

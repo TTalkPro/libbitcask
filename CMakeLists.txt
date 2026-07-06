@@ -218,7 +218,6 @@ target_include_directories(bitcask_plugin_api INTERFACE include)
 add_library(bitcask_bm25 STATIC
     src/bm25/intersect.cpp
     src/bm25/inverted.cpp
-    src/bm25/inverted_wal.cpp
     src/bm25/query_parser.cpp
 )
 target_include_directories(bitcask_bm25 PUBLIC include)
@@ -300,6 +299,9 @@ target_link_libraries(bitcask_merge
 # ---------------------------------------------------------------------------
 add_library(bitcask_cask STATIC
     src/cask/cask.cpp
+    src/cask/cask_iter.cpp     # S21-3 B1：CaskIter（fold 迭代器）拆分 TU
+    src/cask/cask_search.cpp   # S21-3 B1：搜索门面拆分 TU
+    src/cask/cask_recovery.cpp # S21-3 B1：恢复域拆分 TU
     src/cask/meta_file.cpp
     src/cask/legacy_ckpt.cpp   # S19-2：pre-S17 统一 ckpt 迁移读取器
 )

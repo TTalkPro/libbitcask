@@ -1,27 +1,56 @@
 #include <gtest/gtest.h>
 
-#include "bitcask/search_layer.hpp"
+#include "bitcask/index.hpp"
+#include "bitcask/text_plugin.hpp"
 #include "bitcask/highlighter.hpp"
 
 #include <string_view>
 
+using namespace bitcask;
 using namespace bitcask::search;
 
 namespace {
 
-SearchLayerConfig whitespace_config() {
-    return SearchLayerConfig{
-        .analyzer_config = bitcask::text::AnalyzerConfig{
-            .type = bitcask::text::AnalyzerType::Whitespace
-        },
-        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
-    };
+text::TextPluginConfig whitespace_config() {
+    text::TextPluginConfig c;
+    c.analyzer_config = text::AnalyzerConfig{
+        .type = text::AnalyzerType::Whitespace};
+    c.bm25_params = bm25::Bm25Params{1.2F, 0.75F};
+    return c;
 }
+
+// S24-B4：docmap（宿主行）+ TextPlugin 直连组合，替代原 shim SearchLayer
+// ——on_write(key, ord, text, file_id, offset, total_sz, tstamp) 等价体：
+// 先落 docmap 行（doc_len 由 apply_text 分析后回填），再跑单文本核心。
+struct TextHost {
+    index::Index idx;
+    text::TextPlugin plugin;
+
+    explicit TextHost(const text::TextPluginConfig& cfg)
+        : plugin(cfg, idx, idx, idx) {}
+
+    void on_write(std::string_view key, std::uint64_t ord,
+                  std::string_view text, std::uint32_t file_id,
+                  std::uint64_t offset, std::uint32_t total_sz,
+                  std::uint32_t tstamp) {
+        idx.put_doc(key, ord,
+                    index::DocSlot{index::DocLoc{.offset   = offset,
+                                                 .file_id  = file_id,
+                                                 .total_sz = total_sz},
+                                   tstamp, /*doc_len=*/0});
+        plugin.apply_text(key, ord, text);
+    }
+
+    auto search_text_highlight(std::string_view query, std::size_t k,
+                               const HighlightOptions& opts = {}) const {
+        return plugin.search_text_highlight(query, k, opts);
+    }
+};
 
 }  // namespace
 
 TEST(Highlighter, BasicEnglish) {
-    auto layer = SearchLayer(whitespace_config());
+    TextHost layer(whitespace_config());
     layer.on_write("key1", 0, "hello world foo bar", 1, 100, 50, 1000);
 
     auto result = layer.search_text_highlight("foo", 10);
@@ -35,7 +64,7 @@ TEST(Highlighter, BasicEnglish) {
 }
 
 TEST(Highlighter, MultipleTerms) {
-    auto layer = SearchLayer(whitespace_config());
+    TextHost layer(whitespace_config());
     layer.on_write("key1", 0, "the quick brown fox jumps over the lazy dog", 1, 100, 50, 1000);
 
     auto result = layer.search_text_highlight("quick fox", 10);
@@ -50,7 +79,7 @@ TEST(Highlighter, MultipleTerms) {
 }
 
 TEST(Highlighter, NoMatch) {
-    auto layer = SearchLayer(whitespace_config());
+    TextHost layer(whitespace_config());
     layer.on_write("key1", 0, "hello world", 1, 100, 50, 1000);
 
     auto result = layer.search_text_highlight("xyz", 10);
@@ -59,7 +88,7 @@ TEST(Highlighter, NoMatch) {
 }
 
 TEST(Highlighter, FragmentSize) {
-    auto layer = SearchLayer(whitespace_config());
+    TextHost layer(whitespace_config());
     std::string long_text = "hello world foo bar baz qux quux corge grault garply waldo "
                            "fred plugh xyzzy thud hoge fuga piyo";
     layer.on_write("key1", 0, long_text, 1, 100, 50, 1000);
@@ -76,7 +105,7 @@ TEST(Highlighter, FragmentSize) {
 }
 
 TEST(Highlighter, MultipleFragments) {
-    auto layer = SearchLayer(whitespace_config());
+    TextHost layer(whitespace_config());
     layer.on_write("key1", 0, "foo bar foo baz foo qux", 1, 100, 50, 1000);
 
     HighlightOptions opts;
@@ -90,7 +119,7 @@ TEST(Highlighter, MultipleFragments) {
 }
 
 TEST(Highlighter, SearchTextHighlightIntegration) {
-    auto layer = SearchLayer(whitespace_config());
+    TextHost layer(whitespace_config());
 
     layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
     layer.on_write("doc2", 1, "hello bitcask search", 1, 200, 50, 1001);
@@ -118,7 +147,7 @@ TEST(Highlighter, SearchTextHighlightIntegration) {
 // 修复前 select_best_fragments 每轮在不变的 range 集上选同一窗口，
 // 产出 max_fragments(默认3) 个完全相同的片段。
 TEST(Highlighter, NoDuplicateFragmentsForSingleOccurrence) {
-    auto layer = SearchLayer(whitespace_config());
+    TextHost layer(whitespace_config());
     layer.on_write("key1", 0, "hello world foo bar", 1, 100, 50, 1000);
 
     auto result = layer.search_text_highlight("world", 10);
@@ -129,7 +158,7 @@ TEST(Highlighter, NoDuplicateFragmentsForSingleOccurrence) {
 
 // 远距两次出现应产出 2 个不同片段（确认去重未退化成永远只 1 个）。
 TEST(Highlighter, TwoFarApartOccurrencesGiveTwoFragments) {
-    auto layer = SearchLayer(whitespace_config());
+    TextHost layer(whitespace_config());
     std::string text = "world ";
     for (int i = 0; i < 40; ++i) text += "xpad ";  // ~200 字节填充 > fragment_size(120)
     text += "world tail";

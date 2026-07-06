@@ -46,8 +46,9 @@ struct SearchLayerConfig {
     // P5b:HNSW int8-only 内存模式(Cask::open 从 meta 透传)。仅 kDot。
     bool                 vector_inmem_int8 = false;
     // wal_batch_size 已删除（S19-4）：S18 侦查坐实 dead config——从未接线
-    // InvertedIndex::enable_wal，两档行为相同。WAL 机制本体保留（倒排内部
-    // + 测试直用 enable_wal），将来真接线时以新字段回归。
+    // InvertedIndex::enable_wal，两档行为相同。S22-B2：WAL 机制本体亦已
+    // 退役删除（bm25 增量持久化由 S14-4 delta 链承担；若需断电增量能力，
+    // 以 git 历史 inverted_wal.* 为底重新接线）。
     // S12-2：后台自动 compaction 的 per-list 死占比阈值。
     //   0（默认） → 关：索引流水线零开销（仅一次 double 比较）。
     //   (0,1]     → 开：reducer 线程内累计退休文档达节流阈值（max(1024, live/2)）时，

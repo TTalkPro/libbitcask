@@ -2,22 +2,49 @@
 
 #include "bitcask/fuzzy_matcher.hpp"
 #include "bitcask/inverted.hpp"
-#include "bitcask/search_layer.hpp"
+#include "bitcask/index.hpp"
+#include "bitcask/text_plugin.hpp"
 #include "bitcask/analyzer.hpp"
 #include "test_support.hpp"
 
+using namespace bitcask;
 using namespace bitcask::bm25;
 using namespace bitcask::text;
 using namespace bitcask::search;
 
 namespace {
 
-SearchLayerConfig default_config() {
-    return SearchLayerConfig{
-        .analyzer_config = AnalyzerConfig{
-            .type = AnalyzerType::Whitespace},
-        .bm25_params = Bm25Params{1.2F, 0.75F}
-    };
+TextPluginConfig default_config() {
+    TextPluginConfig c;
+    c.analyzer_config = AnalyzerConfig{.type = AnalyzerType::Whitespace};
+    c.bm25_params = Bm25Params{1.2F, 0.75F};
+    return c;
+}
+
+// S24-B4：原 shim SearchLayer::on_write(key, ord, text, file_id, offset,
+// total_sz, tstamp) 的 TextPlugin 直连等价体——宿主先落 docmap 行
+// （doc_len=0，由 apply_text 分析后经 set_doc_len 回填），再跑单文本核心。
+void host_put_text(index::Index& idx, TextPlugin& plugin,
+                   std::string_view key, std::uint64_t ord,
+                   std::string_view text, std::uint32_t file_id,
+                   std::uint64_t offset, std::uint32_t total_sz,
+                   std::uint32_t tstamp) {
+    idx.put_doc(key, ord,
+                index::DocSlot{index::DocLoc{.offset   = offset,
+                                             .file_id  = file_id,
+                                             .total_sz = total_sz},
+                               tstamp, /*doc_len=*/0});
+    plugin.apply_text(key, ord, text);
+}
+
+// 原 shim SearchLayer::on_delete(key, tomb_ord) 的直连等价体：宿主查旧行
+// + 删 docmap 行，再做 BM25 统计扣减半边。
+void host_delete(index::Index& idx, TextPlugin& plugin,
+                 std::string_view key, std::uint64_t tomb_ord) {
+    auto slot = idx.get(key);
+    ASSERT_TRUE(slot.has_value());
+    idx.remove(key, tomb_ord);
+    plugin.on_delete(key, tomb_ord, slot->ord);
 }
 
 }
@@ -123,43 +150,44 @@ TEST(InvertedIndexFuzzy, NoDoubleCountWhenTwoQueryTermsMatchSameTerm) {
     EXPECT_NEAR(single[0].score, doubled[0].score, 1e-5F);
 }
 
-TEST(SearchLayerFuzzy, FindsDocsWithTypos) {
-    auto config = default_config();
-    SearchLayer layer(config);
+TEST(TextPluginFuzzy, FindsDocsWithTypos) {
+    index::Index idx;
+    TextPlugin plugin(default_config(), idx, idx, idx);
+    ASSERT_TRUE(plugin.has_analyzer());
 
-    layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
-    layer.on_write("doc2", 1, "foo bar", 1, 200, 50, 1001);
+    host_put_text(idx, plugin, "doc1", 0, "hello world", 1, 100, 50, 1000);
+    host_put_text(idx, plugin, "doc2", 1, "foo bar", 1, 200, 50, 1001);
 
-    auto result = layer.search_fuzzy("helo", 10, 1);
+    auto result = plugin.search_fuzzy("helo", 10, 1);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1u);
     EXPECT_EQ(result->at(0).key, "doc1");
 }
 
-TEST(SearchLayerFuzzy, NoMatchBeyondDistance) {
-    auto config = default_config();
-    SearchLayer layer(config);
+TEST(TextPluginFuzzy, NoMatchBeyondDistance) {
+    index::Index idx;
+    TextPlugin plugin(default_config(), idx, idx, idx);
 
-    layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
+    host_put_text(idx, plugin, "doc1", 0, "hello world", 1, 100, 50, 1000);
 
-    auto result = layer.search_fuzzy("world", 10, 0);
+    auto result = plugin.search_fuzzy("world", 10, 0);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->size(), 1u);
 
-    auto result2 = layer.search_fuzzy("xyz", 10, 1);
+    auto result2 = plugin.search_fuzzy("xyz", 10, 1);
     ASSERT_TRUE(result2.has_value());
     EXPECT_TRUE(result2->empty());
 }
 
-TEST(SearchLayerFuzzy, DeletedDocSkipped) {
-    auto config = default_config();
-    SearchLayer layer(config);
+TEST(TextPluginFuzzy, DeletedDocSkipped) {
+    index::Index idx;
+    TextPlugin plugin(default_config(), idx, idx, idx);
 
-    layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
-    layer.on_write("doc2", 1, "help me", 1, 200, 50, 1001);
-    layer.on_delete("doc1", 2);
+    host_put_text(idx, plugin, "doc1", 0, "hello world", 1, 100, 50, 1000);
+    host_put_text(idx, plugin, "doc2", 1, "help me", 1, 200, 50, 1001);
+    host_delete(idx, plugin, "doc1", 2);
 
-    auto result = layer.search_fuzzy("helo", 10, 1);
+    auto result = plugin.search_fuzzy("helo", 10, 1);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1u);
     EXPECT_EQ(result->at(0).key, "doc2");

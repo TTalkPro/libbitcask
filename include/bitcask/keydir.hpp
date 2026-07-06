@@ -160,7 +160,7 @@ class KeyDir;
 // === 线程模型 ===
 //   - 单 handle 内：start / release 自行对 parent 做写者闸门屏障
 //     （BarrierGuard + meta_mu_），next 只拿目标 key 的分片锁；handle
-//     自身字段（iterating_/iter_epoch_/keys_snapshot_/cursor_）
+//     自身字段（iterating_/iter_epoch_/keys_buf_/key_offs_/cursor_）
 //     不受任何锁保护——caller 必须保证「不要在多线程同时调用同一个
 //     IterHandle 的方法」。
 //   - 多 handle 之间：parent 共享但每个 handle 独立；可并行 fold。
@@ -210,7 +210,11 @@ private:
     // 迭代位置用 key copy 来表示，比 legacy 的 bucket index 多一点拷贝
     // 开销，但对 rehash 完全免疫。pin unordered_map 迭代器要求严格控
     // 制 load factor——M5 不愿意多花精力在那里。
-    std::vector<std::string> keys_snapshot_;
+    // S24-M7：扁平化——单一拼接缓冲 + N+1 偏移哨兵（原 vector<string>
+    // 百万 key = N 次 malloc + 每 key 32B 头；现每 fold 恒 2 次分配，
+    // 峰值内存约减半）。切片经 string_view 消费（entries 透明查找）。
+    std::string keys_buf_;
+    std::vector<std::size_t> key_offs_;  // N+1 哨兵；empty = 无快照
     std::size_t cursor_ = 0;
 };
 

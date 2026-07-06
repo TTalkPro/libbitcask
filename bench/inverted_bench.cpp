@@ -402,7 +402,8 @@ void BM_Inverted_SearchIndexChecker(benchmark::State& state) {
     bitcask::index::Index side;
     for (std::uint64_t ord = 0; ord < 1000000; ++ord) {
         side.put_doc("k" + std::to_string(ord), ord,
-                     bitcask::index::DocSlot{{}, 0, 8, 0});
+                     // S21-1：DocSlot 去 ord 字段（{loc, tstamp, doc_len}）。
+                     bitcask::index::DocSlot{{}, 0, 8});
         if (ord % 10 == 0) {
             idx->add_doc(ord, doc_with("hot"));
         }

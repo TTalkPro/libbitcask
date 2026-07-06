@@ -17,7 +17,6 @@
 
 #include "bitcask/cask.hpp"
 #include <bitcask/keydir_registry.hpp>
-#include "bitcask/inverted_wal.hpp"
 
 namespace fs = std::filesystem;
 using bitcask::Cask;
@@ -418,22 +417,3 @@ BENCHMARK(BM_Cask_SearchHybrid)->Unit(benchmark::kMicrosecond);
 // BM_Put_WalBatch 已删除（S19-4）：wal_batch_size 是 dead config，两档
 // 测的是同一路径（S18 侦查坐实），基准前提不成立。
 
-// V6.2.4: 隔离 WAL 写入的微基准——绕过 full put path，直测 append_add_doc。
-// 这才是 batch flush 的直接收益面（full put 中 analyzer + index update 主导）。
-static void BM_Wal_AppendOnly(benchmark::State& state) {
-    auto batch_size = static_cast<std::size_t>(state.range(0));
-    TempDir td;
-    std::string wal_path = std::string(td.path()) + "/wal_only.wal";
-
-    bitcask::bm25::WalTermPositions term_data;
-    term_data.emplace("alpha", std::make_pair(std::uint32_t(1), std::vector<std::uint32_t>{0}));
-    term_data.emplace("beta", std::make_pair(std::uint32_t(1), std::vector<std::uint32_t>{1}));
-
-    bitcask::bm25::InvertedWal wal(wal_path, batch_size);
-    std::uint64_t ord = 0;
-    for (auto _ : state) {
-        wal.append_add_doc(ord++, term_data);
-    }
-    state.SetItemsProcessed(state.iterations());
-}
-BENCHMARK(BM_Wal_AppendOnly)->Arg(1)->Arg(64);

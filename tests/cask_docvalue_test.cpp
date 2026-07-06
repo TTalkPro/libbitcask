@@ -1544,7 +1544,11 @@ TEST(FieldSchema, PersistsAcrossReopen) {
 // ── A4:keydir 段快照 + 尾部回放(doc/recovery-snapshot-design-zh.md)──────
 
 namespace {
-std::span<const std::byte> sv_bytes(const std::string& s) {
+// S24 补（ASan 实证）：收 string_view——const string& 版对字面量会生成
+// 临时 string，`doc.text = sv_bytes("...")` 存 span 后临时即亡（悬垂）。
+// string_view 直接绑定字面量（静态存储）/具名缓冲，杜绝该类。注意仍不可
+// 对 sv_bytes(std::string(...)) 的**存储**用法——span 源必须比使用点长寿。
+std::span<const std::byte> sv_bytes(std::string_view s) {
     return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
 }
 }  // namespace
@@ -3458,7 +3462,8 @@ TEST_F(CaskDocValueTest, CheckpointDeltaChainSelectiveSections) {
         }
         return types;
     };
-    constexpr std::uint16_t kBm25D = 7, kInfo = 9, kDocD = 10, kHnswD = 11;
+    // S21-2 A2：docmap delta 段型换 gap+vbyte 的 v2（=13）。
+    constexpr std::uint16_t kBm25D = 7, kInfo = 9, kHnswD = 11, kDocD = 13;
 
     // A：文本+向量 → 全量 base。
     // S17-2：per-component 路径——base 是 bm25.ckpt（docmap+bm25+hnsw
@@ -3977,8 +3982,10 @@ TEST_F(CaskMergeSearchTest, DeletionRateTrigger) {
             char k[8], v[16];
             std::snprintf(k, sizeof k, "k%02zu", i);
             std::snprintf(v, sizeof v, "doc%02zu text", i);
-            auto val = sv_bytes(std::string(v));
-            auto key = sv_bytes(std::string(k));
+            // S24 补：直接绑定局部 char 缓冲（本迭代内存活）——原
+            // std::string(v) 临时在语句末即亡，存下的 span 悬垂。
+            auto val = sv_bytes(std::string_view(v));
+            auto key = sv_bytes(std::string_view(k));
             ASSERT_TRUE((*c)->put(key, val, 1000 + static_cast<std::uint32_t>(i)));
         }
         (*c)->close();

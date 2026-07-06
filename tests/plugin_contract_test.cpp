@@ -149,7 +149,9 @@ static bitcask::ReduceFn host_reduce_docmap(std::vector<bp::CaskPlugin*> plugins
             if constexpr (std::is_same_v<T, PutEntry>) {
                 const auto& t = e.task;
                 docmap.put_doc(t.key(), t.ord,
-                                DocSlot{DocLoc{t.file_id, t.offset, t.total_sz},
+                                DocSlot{DocLoc{.offset   = t.offset,
+                                               .file_id  = t.file_id,
+                                               .total_sz = t.total_sz},
                                         t.tstamp, /*doc_len=*/0});
                 if (!t.meta.empty()) docmap.set_meta(t.ord, t.meta);
                 const bp::DocView  doc = bitcask::make_doc_view(t);

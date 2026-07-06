@@ -2,11 +2,62 @@
 #include <fstream>
 #include <gtest/gtest.h>
 
-#include "bitcask/search_layer.hpp"
+#include "bitcask/index.hpp"
+#include "bitcask/text_plugin.hpp"
 #include "bitcask/synonym_map.hpp"
 
 using namespace bitcask::text;
 using namespace bitcask::search;
+
+namespace {
+
+// S24-B4：docmap + TextPlugin 直连组合，替代原 shim SearchLayer（写法与
+// highlighter_test 的 TextHost 一致；on_write 语义等价体见其注释）。
+struct TextHost {
+    bitcask::index::Index idx;
+    TextPlugin plugin;
+
+    explicit TextHost(const TextPluginConfig& cfg)
+        : plugin(cfg, idx, idx, idx) {}
+
+    void on_write(std::string_view key, std::uint64_t ord,
+                  std::string_view text, std::uint32_t file_id,
+                  std::uint64_t offset, std::uint32_t total_sz,
+                  std::uint32_t tstamp) {
+        idx.put_doc(key, ord,
+                    bitcask::index::DocSlot{
+                        bitcask::index::DocLoc{.offset   = offset,
+                                               .file_id  = file_id,
+                                               .total_sz = total_sz},
+                        tstamp, /*doc_len=*/0});
+        plugin.apply_text(key, ord, text);
+    }
+
+    auto search_text(std::string_view q, std::size_t k) const {
+        return plugin.search_text(q, k);
+    }
+    auto search_phrase(std::string_view q, std::size_t k) const {
+        return plugin.search_phrase(q, k);
+    }
+    auto search_near(std::string_view q, std::uint32_t slop,
+                     std::size_t k) const {
+        return plugin.search_near(q, slop, k);
+    }
+    auto search_fields(std::string_view q, std::size_t k) const {
+        return plugin.search_fields(q, k);
+    }
+};
+
+TextPluginConfig ws_config(std::shared_ptr<const SynonymMap> sm = nullptr) {
+    TextPluginConfig c;
+    c.analyzer_config =
+        AnalyzerConfig{.type = AnalyzerType::Whitespace};
+    c.bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F};
+    c.synonym_map = std::move(sm);
+    return c;
+}
+
+}  // namespace
 
 TEST(SynonymMap, AddGroupAndExpand) {
     SynonymMap map;
@@ -85,15 +136,10 @@ TEST(SynonymMap, LoadFromFileEmptyLine) {
     std::filesystem::remove(path);
 }
 
-TEST(SearchLayerSynonym, SearchTextWithSynonym) {
+TEST(TextPluginSynonym, SearchTextWithSynonym) {
     // 基线（无同义词词典）：只命中 1 篇。
     {
-        SearchLayerConfig config{
-            .analyzer_config = bitcask::text::AnalyzerConfig{
-                .type = bitcask::text::AnalyzerType::Whitespace},
-            .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
-        };
-        SearchLayer layer(config);
+        TextHost layer(ws_config());
         layer.on_write("doc1", 0, "nyc is great", 1, 100, 50, 1000);
         layer.on_write("doc2", 1, "automobile is great", 1, 200, 50, 1001);
         auto r = layer.search_text("nyc", 10);
@@ -103,13 +149,7 @@ TEST(SearchLayerSynonym, SearchTextWithSynonym) {
     // S11：同义词词典经 open-time config 注入（不可变）→ 展开命中 2 篇。
     auto sm = std::make_shared<SynonymMap>();
     sm->add_group({"nyc", "automobile"});
-    SearchLayerConfig config{
-        .analyzer_config = bitcask::text::AnalyzerConfig{
-            .type = bitcask::text::AnalyzerType::Whitespace},
-        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F},
-        .synonym_map = sm
-    };
-    SearchLayer layer(config);
+    TextHost layer(ws_config(sm));
     layer.on_write("doc1", 0, "nyc is great", 1, 100, 50, 1000);
     layer.on_write("doc2", 1, "automobile is great", 1, 200, 50, 1001);
 
@@ -118,16 +158,10 @@ TEST(SearchLayerSynonym, SearchTextWithSynonym) {
     EXPECT_EQ(result_after->size(), 2u);
 }
 
-TEST(SearchLayerSynonym, SearchTextWithSynonymViaAlias) {
+TEST(TextPluginSynonym, SearchTextWithSynonymViaAlias) {
     auto sm = std::make_shared<SynonymMap>();
     sm->add_group({"hi", "hello"});
-    SearchLayerConfig config{
-        .analyzer_config = bitcask::text::AnalyzerConfig{
-            .type = bitcask::text::AnalyzerType::Whitespace},
-        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F},
-        .synonym_map = sm
-    };
-    SearchLayer layer(config);
+    TextHost layer(ws_config(sm));
 
     layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
 
@@ -138,16 +172,10 @@ TEST(SearchLayerSynonym, SearchTextWithSynonymViaAlias) {
     EXPECT_EQ(result->at(0).key, "doc1");
 }
 
-TEST(SearchLayerSynonym, PhraseSearchDoesNotExpand) {
+TEST(TextPluginSynonym, PhraseSearchDoesNotExpand) {
     auto sm = std::make_shared<SynonymMap>();
     sm->add_group({"hi", "hello"});
-    SearchLayerConfig config{
-        .analyzer_config = bitcask::text::AnalyzerConfig{
-            .type = bitcask::text::AnalyzerType::Whitespace},
-        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F},
-        .synonym_map = sm
-    };
-    SearchLayer layer(config);
+    TextHost layer(ws_config(sm));
 
     layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
     layer.on_write("doc2", 1, "hi world", 1, 200, 50, 1001);
@@ -159,16 +187,10 @@ TEST(SearchLayerSynonym, PhraseSearchDoesNotExpand) {
     EXPECT_EQ(result->at(0).key, "doc2");
 }
 
-TEST(SearchLayerSynonym, NearSearchDoesNotExpand) {
+TEST(TextPluginSynonym, NearSearchDoesNotExpand) {
     auto sm = std::make_shared<SynonymMap>();
     sm->add_group({"hi", "hello"});
-    SearchLayerConfig config{
-        .analyzer_config = bitcask::text::AnalyzerConfig{
-            .type = bitcask::text::AnalyzerType::Whitespace},
-        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F},
-        .synonym_map = sm
-    };
-    SearchLayer layer(config);
+    TextHost layer(ws_config(sm));
 
     layer.on_write("doc1", 0, "hello world", 1, 100, 50, 1000);
     layer.on_write("doc2", 1, "hi world", 1, 200, 50, 1001);
@@ -180,16 +202,10 @@ TEST(SearchLayerSynonym, NearSearchDoesNotExpand) {
     EXPECT_EQ(result->at(0).key, "doc2");
 }
 
-TEST(SearchLayerSynonym, SearchFieldsWithSynonym) {
+TEST(TextPluginSynonym, SearchFieldsWithSynonym) {
     auto sm = std::make_shared<SynonymMap>();
     sm->add_group({"nyc", "automobile"});
-    SearchLayerConfig config{
-        .analyzer_config = bitcask::text::AnalyzerConfig{
-            .type = bitcask::text::AnalyzerType::Whitespace},
-        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F},
-        .synonym_map = sm
-    };
-    SearchLayer layer(config);
+    TextHost layer(ws_config(sm));
 
     layer.on_write("doc1", 0, "nyc is great", 1, 100, 50, 1000);
     layer.on_write("doc2", 1, "automobile is great", 1, 200, 50, 1001);

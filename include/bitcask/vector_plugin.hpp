@@ -129,8 +129,11 @@ public:
         dirty_.store(false, std::memory_order_relaxed);
     }
     void begin_delta_window(std::uint64_t wm) { delta_window_wm_ = wm; }
-    [[nodiscard]] bool delta_log_empty() const { return delta_vecs_.empty(); }
-    void clear_delta_log() { delta_vecs_.clear(); }
+    [[nodiscard]] bool delta_log_empty() const { return delta_ords_.empty(); }
+    void clear_delta_log() {
+        delta_ords_.clear();
+        delta_data_.clear();
+    }
     // kHnswDelta 段序列化：count u64 | dim u16 | 每条 ord u64 + f32[dim]。
     void serialize_delta_log(std::vector<std::byte>& out) const;
     // kHnswDelta 段重放：直插（不入日志、不标脏——链内容本就已持久化），
@@ -174,8 +177,12 @@ private:
     std::atomic<std::shared_ptr<HnswIndex>> hnsw_;
     std::atomic<bool> dirty_{true};
     // S14-4/S18-1：delta 插入日志 + 入账窗口（单写者上下文访问）。
+    // S21-1：平行数组——dim 库内恒定，delta_data_ 按 dim 步长紧凑拼接
+    // （下标 i 的向量 = delta_data_[i*dim, (i+1)*dim)），免每条日志一次
+    // 独立堆 vector（24B 头 + malloc 圆整）。
     std::uint64_t delta_window_wm_ = 0;
-    std::vector<std::pair<std::uint64_t, std::vector<float>>> delta_vecs_;
+    std::vector<std::uint64_t> delta_ords_;
+    std::vector<float>         delta_data_;
     ChainState chain_{};
     // S18-6：flush/open 自治状态。
     std::string dir_;

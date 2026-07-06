@@ -24,7 +24,9 @@ text::TextPluginConfig make_cfg() {
 void host_put_row(index::Index& idx, const std::string& key,
                   std::uint64_t ord) {
     idx.put_doc(key, ord,
-                index::DocSlot{index::DocLoc{1, ord * 100, 50},
+                index::DocSlot{index::DocLoc{.offset   = ord * 100,
+                                             .file_id  = 1,
+                                             .total_sz = 50},
                                static_cast<std::uint32_t>(1000 + ord), 0});
 }
 
@@ -146,5 +148,53 @@ TEST(TextPlugin, FlushDeltaThenForcedBase) {
     ASSERT_EQ(p.flush(r3).status, plugin::PluginStatus::kOk);
     EXPECT_FALSE(fs::exists(dir / "bm25.ckpt.d1"))
         << "base 落成后 delta 链应被清扫";
+    fs::remove_all(dir);
+}
+
+// S20 回归：bounded chain_seq==0 必须零迭代，绝不当作无界扫盘重放 orphan delta。
+// 场景：base 落成（committed chain_seq==0）后写了 delta .d1，但 manifest 未提交
+// （crash 于「先写 delta、后提交 manifest」窗口）。恢复时以 committed chain_seq==0
+// 载入——必须忽略 orphan .d1（与 pre-S20 逐字节一致）。
+// walk_chain 曾把 chain_seq==0 误判为无界（扫盘直到文件缺失），会重放 orphan。
+TEST(TextPlugin, OrphanDeltaNotReplayedWhenChainSeqZero) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_textplugin_orphan";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    // 盘上写 base（wm=1，committed chain_seq=0）+ 一个 delta .d1（wm=2）。
+    index::Index idx;
+    text::TextPlugin p(make_cfg(), idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
+    host_put_row(idx, "a", 0);
+    p.apply_text("a", 0, "alpha doc");
+    plugin::FlushRequest r1;
+    r1.watermark = 1;
+    ASSERT_EQ(p.flush(r1).status, plugin::PluginStatus::kOk);  // base
+    host_put_row(idx, "b", 1);
+    p.apply_text("b", 1, "beta doc");
+    plugin::FlushRequest r2;
+    r2.watermark = 2;
+    ASSERT_EQ(p.flush(r2).status, plugin::PluginStatus::kOk);  // delta .d1
+    ASSERT_TRUE(fs::exists(dir / "bm25.ckpt.d1"));
+
+    // 恢复：manifest 只提交了 base（chain_seq==0），.d1 为未提交 orphan。
+    // 宿主重建 base+delta 覆盖的 docmap 行（若 .d1 被误重放，beta 才有活翻译）。
+    index::Index idx2;
+    host_put_row(idx2, "a", 0);
+    host_put_row(idx2, "b", 1);
+    text::TextPlugin b(make_cfg(), idx2, idx2, idx2);
+    auto lr = b.load_component(dir_s, /*expected_base_wm=*/1, /*chain_seq=*/0);
+    ASSERT_TRUE(lr.loaded);
+    EXPECT_EQ(lr.watermark, 1u)
+        << "orphan .d1 未提交，须忽略——覆盖水位应停在 base(1) 而非 delta(2)";
+    auto ra = b.search_text("alpha", 10);
+    ASSERT_TRUE(ra.has_value());
+    EXPECT_EQ(ra->size(), 1u) << "base 文档应载入";
+    auto rb = b.search_text("beta", 10);
+    ASSERT_TRUE(rb.has_value());
+    EXPECT_EQ(rb->size(), 0u) << "orphan delta 的文档不得进入索引";
     fs::remove_all(dir);
 }

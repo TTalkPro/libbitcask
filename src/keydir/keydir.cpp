@@ -1,9 +1,12 @@
 #include "bitcask/keydir.hpp"
 #include "bitcask/byte_order.hpp"
 #include "bitcask/codec.hpp"
+#include "bitcask/vbyte.hpp"  // S21-2 A3: 快照 v2 entries 变长编码
 
 #include <cstdio>
 #include <cstring>
+
+#include <unistd.h>  // S21-2 A4: fdatasync
 
 #include <algorithm>
 #include <cassert>
@@ -803,7 +806,7 @@ IterHandle::~IterHandle() noexcept {
 //   2. pending 太老（age > maxage 或 updated > maxputs）——返回
 //      kOutOfDate，让 caller 等待 pending 排空再重试。
 //   3. 通过的话拍一个 keys snapshot：按分片下标序枚举所有 entries 的
-//      key，copy 进 keys_snapshot_。next() 后续从这个 snapshot 走，对
+//      key，copy 进扁平快照（keys_buf_+key_offs_）。next() 后续从这个 snapshot 走，对
 //      rehash 完全免疫。
 StartIterResult IterHandle::start(std::uint32_t now_sec,
                                    int maxage, int maxputs) {
@@ -842,13 +845,22 @@ StartIterResult IterHandle::start(std::uint32_t now_sec,
     // 之后对 entries 的 rehash 免疫。屏障内写者已出清,遍历各分片
     // entries **不需要分片锁**（并发的 get/next 只读,unordered_map
     // 并发只读安全;写者出清的 HB 由排干循环的 mutex 配对保证）。
-    keys_snapshot_.clear();
-    std::size_t total = 0;
-    for (const auto& sh : parent_->shards_) total += sh.entries.size();
-    keys_snapshot_.reserve(total);
+    // S24-M7：扁平缓冲——先一遍求 (条数, 字节和) 精确 reserve，再一遍
+    // 拼接；每 fold 分配 N+1 → 2。
+    keys_buf_.clear();
+    key_offs_.clear();
+    std::size_t total = 0, total_bytes = 0;
+    for (const auto& sh : parent_->shards_) {
+        total += sh.entries.size();
+        for (const auto& [k, _] : sh.entries) total_bytes += k.size();
+    }
+    keys_buf_.reserve(total_bytes);
+    key_offs_.reserve(total + 1);
+    key_offs_.push_back(0);
     for (const auto& sh : parent_->shards_) {
         for (const auto& [k, _] : sh.entries) {
-            keys_snapshot_.push_back(k);
+            keys_buf_.append(k);
+            key_offs_.push_back(keys_buf_.size());
         }
     }
     cursor_ = 0;
@@ -856,15 +868,17 @@ StartIterResult IterHandle::start(std::uint32_t now_sec,
 }
 
 // 取下一项。对 cursor 指向的 key:其分片 shared → 查 entries →
-// entry_at_epoch。cursor_ 是 per-handle 状态（不共享）;keys_snapshot_
+// entry_at_epoch。cursor_ 是 per-handle 状态（不共享）;扁平 key 快照
 // 全部来自 entries,所以这里不需要触碰 pending_（fold 期间 entries 的
 // key 集只增不减——remove 走 sibling 墓碑,不 erase）。
 // snapshot 期间被折叠 erase 的 key（不可能在 fold 中,防御）直接跳过。
 std::optional<EntryProxy> IterHandle::next(bool include_tombstones) {
     if (!iterating_) return std::nullopt;
 
-    while (cursor_ < keys_snapshot_.size()) {
-        const std::string& k = keys_snapshot_[cursor_++];
+    while (cursor_ + 1 < key_offs_.size()) {
+        const std::string_view k(keys_buf_.data() + key_offs_[cursor_],
+                                 key_offs_[cursor_ + 1] - key_offs_[cursor_]);
+        ++cursor_;
         const auto& sh = parent_->shards_[KeyDir::shard_for(k)];
         std::unique_lock lock(sh.mu);
         auto it = sh.entries.find(k);
@@ -897,7 +911,10 @@ void IterHandle::release() {
     BarrierGuard barrier(*parent_);
     iterating_ = false;
     iter_epoch_ = kMaxEpoch;
-    keys_snapshot_.clear();
+    keys_buf_.clear();
+    keys_buf_.shrink_to_fit();   // S24-M7：fold 结束不留大缓冲常驻
+    key_offs_.clear();
+    key_offs_.shrink_to_fit();
     cursor_ = 0;
 
     // 阶段一[meta unique]:keyfolders_--。
@@ -1099,14 +1116,19 @@ KeyDir::KeyLenHistogram KeyDir::key_length_histogram() const {
 
 // ============================================================================
 // A4:keydir 段快照(设计 doc/recovery-unified-checkpoint-design-zh.md 附录 A)
-// 格式:[magic "BCKS"][ver=1][payload][crc32(payload)],LE,tmp+rename。
+// 格式:[magic "BCKS"][ver][payload][crc32(payload)],LE,tmp+rename。
 // 磁盘格式无分片概念（重分片自由）,S2 只改内存侧的读写路径。
+// S21-2 A3:v2 起 entries 块变长编码——klen/file_id/total_sz/offset/epoch/ord
+// 走 vbyte(tstamp 保持定宽 4B:unix 秒级时间戳 vbyte 需 5B 反而更大),
+// ~38B/条 → 典型 15-20B/条,GB 级 keydir 快照读写 I/O 近半。写端恒写 v2;
+// 读端 v1/v2 双分支(快照可重建,无迁移——旧库首次 save 即升 v2)。
 // ============================================================================
 
 namespace {
 
 constexpr std::uint32_t kSnapMagic   = 0x42434B53;  // "BCKS"
-constexpr std::uint32_t kSnapVersion = 1;
+constexpr std::uint32_t kSnapVersion   = 2;  // S21-2 A3:entries 块 vbyte
+constexpr std::uint32_t kSnapVersionV1 = 1;  // 兼容读:定宽 entries
 
 void snap_put32(std::vector<std::uint8_t>& b, std::uint32_t v) {
     const auto sz = b.size();
@@ -1117,6 +1139,10 @@ void snap_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
     const auto sz = b.size();
     b.resize(sz + 8);
     bitcask::le_store_u64(reinterpret_cast<std::byte*>(b.data() + sz), v);
+}
+// S21-2 A3:v2 entries 块变长标量。
+void snap_put_vb(std::vector<std::uint8_t>& b, std::uint64_t v) {
+    bitcask::codec::vbyte_encode(v, b);
 }
 
 struct SnapCursor {
@@ -1130,6 +1156,18 @@ struct SnapCursor {
     std::uint16_t u16() { std::uint16_t v = 0; if (need(2)) { std::memcpy(&v, p, 2); p += 2; } return v; }
     std::uint32_t u32() { std::uint32_t v = 0; if (need(4)) { std::memcpy(&v, p, 4); p += 4; } return v; }
     std::uint64_t u64() { std::uint64_t v = 0; if (need(8)) { std::memcpy(&v, p, 8); p += 8; } return v; }
+    // S21-2 A3:边界安全 vbyte(vbyte_decode 不查界,损坏文件不能越读)。
+    std::uint64_t vb() {
+        std::uint64_t v = 0, shift = 0;
+        while (true) {
+            if (!need(1)) return 0;
+            const std::uint8_t byte = *p++;
+            v |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
+            if (byte & 0x80) return v;
+            shift += 7;
+            if (shift > 63) { fail = true; return 0; }  // 超长=损坏
+        }
+    }
     bool bytes(void* dst, std::size_t n) {
         if (!need(n)) return false;
         std::memcpy(dst, p, n);
@@ -1311,12 +1349,13 @@ bool KeyDir::save_snapshot(
     }
 
     // 头(magic+ver=8)+5 标量(36)+fstats(4+52·n)+watermarks(4+12·m)
-    //   +entries(8 + 38/条 + key 字节)+crc(4)。
+    //   +entries(8 + v2 变长典型 ≤20/条 + key 字节)+crc(4)。按 20/条估
+    //   （偏大→略浪费,偏小由几何增长兜底,不影响正确性）。
     const std::size_t est_size =
         8 + 36
         + 4 + static_cast<std::size_t>(fstats_n) * 52
         + 4 + watermarks.size() * 12
-        + 8 + entries_total * 38
+        + 8 + entries_total * 20
         + static_cast<std::size_t>(key_bytes_.load(std::memory_order_relaxed))
         + 4;
 
@@ -1358,17 +1397,15 @@ bool KeyDir::save_snapshot(
             const auto* se = std::get_if<SingleEntry>(&entry);
             if (se == nullptr) return false;  // 防御:不应出现(keyfolders_==0)
             if (key.size() > 0xFFFF) return false;
-            const auto klen = static_cast<std::uint16_t>(key.size());
-            const auto* kp = reinterpret_cast<const std::uint8_t*>(&klen);
-            buf.insert(buf.end(), kp, kp + 2);
+            snap_put_vb(buf, key.size());
             const auto* kd = reinterpret_cast<const std::uint8_t*>(key.data());
             buf.insert(buf.end(), kd, kd + key.size());
-            snap_put32(buf, se->file_id);
-            snap_put32(buf, se->total_sz);
-            snap_put64(buf, se->offset);
-            snap_put64(buf, se->epoch);
-            snap_put32(buf, se->tstamp);
-            snap_put64(buf, se->ord);
+            snap_put_vb(buf, se->file_id);
+            snap_put_vb(buf, se->total_sz);
+            snap_put_vb(buf, se->offset);
+            snap_put_vb(buf, se->epoch);
+            snap_put32(buf, se->tstamp);   // 定宽:unix 时间戳 vbyte 需 5B
+            snap_put_vb(buf, se->ord);
         }
     }
 
@@ -1381,8 +1418,15 @@ bool KeyDir::save_snapshot(
     const std::string tmp_path = final_path + ".tmp";
     std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
     if (!f) return false;
-    const bool wrote =
+    bool wrote =
         std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+    // S21-2 A4：rename 前 fdatasync——快照虽可重建（fold 兜底），但断电丢
+    // 快照页 = 下次冷启动退全量 fold，启动加速失效。与 SearchCheckpoint/
+    // write_manifest 同款语义。
+    if (wrote) {
+        std::fflush(f);
+        wrote = ::fdatasync(::fileno(f)) == 0;
+    }
     std::fclose(f);
     if (!wrote) {
         std::remove(tmp_path.c_str());
@@ -1418,7 +1462,9 @@ auto KeyDir::load_snapshot(std::string_view path)
     if (!rd) return std::nullopt;
 
     SnapCursor c{buf.data(), buf.data() + buf.size()};
-    if (c.u32() != kSnapMagic || c.u32() != kSnapVersion) return std::nullopt;
+    if (c.u32() != kSnapMagic) return std::nullopt;
+    const std::uint32_t ver = c.u32();
+    if (ver != kSnapVersion && ver != kSnapVersionV1) return std::nullopt;
     // CRC 覆盖 [8, size-4)。
     std::uint32_t stored_crc = 0;
     std::memcpy(&stored_crc, buf.data() + buf.size() - 4, 4);  // 未对齐安全
@@ -1500,17 +1546,33 @@ auto KeyDir::load_snapshot(std::string_view path)
     for (auto& sh : shards_) {
         sh.entries.reserve(static_cast<std::size_t>(entry_n) / kShards + 1);
     }
+    const bool v2 = ver >= kSnapVersion;
     for (std::uint64_t i = 0; i < entry_n; ++i) {
-        const std::uint16_t klen = c.u16();
-        std::string key(klen, '\0');
+        const std::uint64_t klen = v2 ? c.vb() : c.u16();
+        if (c.fail || klen > 0xFFFF) { reset_all(); return std::nullopt; }
+        std::string key(static_cast<std::size_t>(klen), '\0');
         if (!c.bytes(key.data(), klen)) { reset_all(); return std::nullopt; }
         SingleEntry se;
-        se.file_id  = c.u32();
-        se.total_sz = c.u32();
-        se.offset   = c.u64();
-        se.epoch    = c.u64();
-        se.tstamp   = c.u32();
-        se.ord      = c.u64();
+        if (v2) {
+            // S21-2 A3:vbyte 块(字段序与写端一致)。u32 域越界=损坏。
+            const std::uint64_t fid = c.vb(), tsz = c.vb();
+            se.offset = c.vb();
+            se.epoch  = c.vb();
+            se.tstamp = c.u32();
+            se.ord    = c.vb();
+            if (fid > 0xFFFFFFFFull || tsz > 0xFFFFFFFFull) {
+                reset_all(); return std::nullopt;
+            }
+            se.file_id  = static_cast<std::uint32_t>(fid);
+            se.total_sz = static_cast<std::uint32_t>(tsz);
+        } else {
+            se.file_id  = c.u32();
+            se.total_sz = c.u32();
+            se.offset   = c.u64();
+            se.epoch    = c.u64();
+            se.tstamp   = c.u32();
+            se.ord      = c.u64();
+        }
         if (c.fail) { reset_all(); return std::nullopt; }
         // entries 按 shard_for 分发（磁盘格式无分片概念）。
         Shard& sh = shards_[shard_for(key)];

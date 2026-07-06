@@ -165,6 +165,9 @@ public:
         std::uint32_t file_id, std::uint64_t offset,
         std::uint32_t total_sz, std::uint32_t tstamp) const;
     // Reduce 阶段（原 reduce_apply 的 BM25 半边；向量半边归 VectorPlugin）。
+    // S23-M4：非 const 版 move doc_text 进原文 LRU（生产流水线路径）；
+    // const 版兼容 shim/降级路径（仅 doc_text 多一次拷贝）。
+    void apply_job(search::ReduceJob& job);
     void apply_job(const search::ReduceJob& job);
     // 删除的 BM25 统计扣减半边（docmap 删除/日志由宿主 Index 自记账）。
     void on_delete(std::string_view key, std::uint64_t tomb_ord,
@@ -259,11 +262,12 @@ public:
     // delta 段重放。
     [[nodiscard]] bool apply_default_delta(std::span<const std::byte> payload);
     [[nodiscard]] bool apply_fields_delta(std::span<const std::byte> payload);
-    void truncate_wal();
 
     // ---- bm25 组件 checkpoint（bm25.ckpt 文件族；S18-6 收进 flush/open）----
     [[nodiscard]] bool save_component_base(std::string_view dir,
                                            std::uint64_t watermark);
+    // S23-M4：apply_job 双入口的共享实现（doc_text 所有权经右值参数注入）。
+    void apply_job_impl(const search::ReduceJob& job, std::string&& doc_text);
     // 三组件同构，收敛至 ckpt:: 共用类型（S20-1 R6）。
     using DeltaSaveResult = ckpt::DeltaSaveResult;
     [[nodiscard]] DeltaSaveResult save_component_delta(std::string_view dir,

@@ -151,14 +151,6 @@ target_link_libraries(bitcask_checkpoint_recovery_test PRIVATE
     bitcask_sanitizers
 )
 
-add_executable(bitcask_inverted_wal_test inverted_wal_test.cpp)
-target_link_libraries(bitcask_inverted_wal_test PRIVATE
-    GTest::gtest_main
-    bitcask_bm25
-    bitcask_text
-    bitcask_warnings
-    bitcask_sanitizers
-)
 
 # S19-3：SearchLayer shim 测试夹具（原产品 bitcask_search 目标降级至此）。
 # 聚合 docmap+TextPlugin+VectorPlugin+HybridSearcher 的兼容门面 + legacy
@@ -181,7 +173,7 @@ target_link_libraries(bitcask_search_layer_test PRIVATE
 add_executable(bitcask_highlighter_test highlighter_test.cpp)
 target_link_libraries(bitcask_highlighter_test PRIVATE
     GTest::gtest_main
-    bitcask_search_shim
+    bitcask_text_plugin   # S24-B4：TextPlugin 直连（docmap 经 PUBLIC 传递）
     bitcask_warnings
     bitcask_sanitizers
 )
@@ -190,7 +182,7 @@ add_executable(bitcask_wildcard_test wildcard_test.cpp)
 target_link_libraries(bitcask_wildcard_test PRIVATE
     GTest::gtest_main
     bitcask_bm25
-    bitcask_search_shim
+    bitcask_text_plugin   # S24-B4：TextPlugin 直连（docmap 经 PUBLIC 传递）
     bitcask_text
     bitcask_warnings
     bitcask_sanitizers
@@ -199,7 +191,7 @@ target_link_libraries(bitcask_wildcard_test PRIVATE
 add_executable(bitcask_synonym_test synonym_test.cpp)
 target_link_libraries(bitcask_synonym_test PRIVATE
     GTest::gtest_main
-    bitcask_search_shim
+    bitcask_text_plugin   # S24-B4：TextPlugin 直连（docmap 经 PUBLIC 传递）
     bitcask_text
     bitcask_warnings
     bitcask_sanitizers
@@ -209,7 +201,7 @@ add_executable(bitcask_fuzzy_test fuzzy_test.cpp)
 target_link_libraries(bitcask_fuzzy_test PRIVATE
     GTest::gtest_main
     bitcask_bm25
-    bitcask_search_shim
+    bitcask_text_plugin   # S24-B4：TextPlugin 直连（docmap 经 PUBLIC 传递）
     bitcask_text
     bitcask_warnings
     bitcask_sanitizers
@@ -254,7 +246,6 @@ gtest_discover_tests(bitcask_crash_recovery_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_merge_concurrent_writer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_checkpoint_recovery_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_search_layer_test ${_bitcask_test_props})
-gtest_discover_tests(bitcask_inverted_wal_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_highlighter_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_wildcard_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_synonym_test ${_bitcask_test_props})
@@ -349,4 +340,9 @@ add_executable(bitcask_c_api_test c_api_test.c)
 # 插桩。否则 sanitize 构建下，未插桩的 C 主程序链接已插桩的 .so，一旦 .so 内部起线程
 # （如 search 模式的 IndexPool worker）就会因运行时缺失而 SEGV（S12-5 修）。
 target_link_libraries(bitcask_c_api_test PRIVATE bitcask_shared bitcask_sanitizers)
+# S24 补：强制 CXX 链接器——clang 下 C 驱动器只链 UBSan 的 C runtime，
+# 缺 .so 内 vptr 检查引用的 C++ 符号（__ubsan_vptr_type_cache 等）致链接
+# 失败；clang++ 驱动链 ubsan_standalone_cxx 补齐。对 gcc/非 sanitizer
+# 构建无影响（C 程序用 C++ 链接器无害）。
+set_target_properties(bitcask_c_api_test PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME CApi.SmokeTest COMMAND bitcask_c_api_test)
