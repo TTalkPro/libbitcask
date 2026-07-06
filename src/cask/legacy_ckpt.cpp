@@ -19,49 +19,35 @@ namespace sc = bitcask::search;
 
 namespace {
 
-// 单个 delta 文件的段集应用（原 SearchLayer::apply_delta_file）：先整体
-// CRC 预检（任何坏段 → 整个 delta 拒绝，不部分应用），再逐段应用；
-// docmap 行/删除按 ord 交错重放（「删后重写」场景删除先于同 key 新行），
-// keydir 半边一次性透传 hook。
+// 单个 delta 文件的段集应用（原 SearchLayer::apply_delta_file）。
+// S21-3 B3：CRC 预检 + hook 收尾骨架收敛至 index::apply_delta_sections
+// （与 docmap_ckpt 共用），此处只留 legacy 段分发（bm25/hnsw/docmap v1；
+// legacy 链在 v2 段型引入前落笔，永不含 kDocmapDeltaV2）。
 bool apply_delta_file(const std::vector<sc::LoadedSection>& sections,
                       index::Index& docmap, text::TextPlugin& text,
                       vec::VectorPlugin& vec,
                       const index::DocmapReplayHook& hook) {
-    for (const auto& ls : sections) {
-        if (!ls.crc_ok) return false;
-    }
-    std::vector<index::DocmapDeltaRow> hook_rows;
-    std::vector<index::DocmapDeltaRemoval> hook_rems;
-    std::span<const std::byte> hook_meta;
-    for (const auto& ls : sections) {
-        std::span<const std::byte> pl(ls.payload.data(), ls.payload.size());
-        switch (static_cast<sc::CkptSectionType>(ls.type)) {
-        case sc::CkptSectionType::kBm25DefaultDelta:
-            if (!text.apply_default_delta(pl)) return false;
-            break;
-        case sc::CkptSectionType::kBm25FieldsDelta:
-            if (!text.apply_fields_delta(pl)) return false;
-            break;
-        case sc::CkptSectionType::kDocmapDelta:
-            // S20-2 R3：解析 + 交错重放收敛至 index::apply_docmap_delta_section。
-            if (!index::apply_docmap_delta_section(docmap, pl, hook_rows,
-                                                   hook_rems)) {
-                return false;
+    return index::apply_delta_sections(
+        sections, hook,
+        [&](sc::CkptSectionType st, std::span<const std::byte> pl,
+            std::vector<index::DocmapDeltaRow>& rows,
+            std::vector<index::DocmapDeltaRemoval>& rems) {
+            switch (st) {
+            case sc::CkptSectionType::kBm25DefaultDelta:
+                return text.apply_default_delta(pl);
+            case sc::CkptSectionType::kBm25FieldsDelta:
+                return text.apply_fields_delta(pl);
+            case sc::CkptSectionType::kDocmapDelta:
+                // S20-2 R3：解析 + 交错重放收敛至 apply_docmap_delta_section。
+                return index::apply_docmap_delta_section(docmap, pl, rows,
+                                                         rems);
+            case sc::CkptSectionType::kHnswDelta:
+                return vec.apply_delta_log(pl);
+            case sc::CkptSectionType::kDeltaInfo:
+            default:
+                return true;  // info 由 caller 校验；未知段忽略（前向兼容）。
             }
-            break;
-        case sc::CkptSectionType::kHnswDelta:
-            if (!vec.apply_delta_log(pl)) return false;
-            break;
-        case sc::CkptSectionType::kKeydirDelta:
-            hook_meta = pl;
-            break;
-        case sc::CkptSectionType::kDeltaInfo:
-        default:
-            break;  // info 由 caller 校验；未知段忽略（前向兼容）。
-        }
-    }
-    if (hook) hook(hook_rows, hook_rems, hook_meta);
-    return true;
+        });
 }
 
 }  // namespace
@@ -158,7 +144,8 @@ LoadResult load(std::string_view path, index::Index& docmap,
     if (result.all_segments_ok && !from_prev) {
         const auto w = sc::walk_chain(
             fp, chain_base_gen, /*base_coverage=*/chain_coverage,
-            /*chain_seq=*/0, [&](const sc::LoadedCheckpoint& dc) {
+            /*chain_seq=*/0, /*unbounded=*/true,
+            [&](const sc::LoadedCheckpoint& dc) {
                 return apply_delta_file(dc.sections, docmap, text, vec, hook);
             });
         chain_coverage = w.coverage;

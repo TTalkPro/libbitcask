@@ -66,6 +66,25 @@ inline constexpr std::uint64_t kMaxOffsetV2 = 0x7FFF'FFFF'FFFF'FFFFull;
 inline constexpr std::uint64_t kTombMaskV2 = 0x8000'0000'0000'0000ull;
 
 // ---------------------------------------------------------------------------
+// hint 文件 v3 布局（S23-A1）。v2 是 18B 定宽裸记录流（无文件头），v3：
+//   [0..3]           magic "BCH3"
+//   记录流（变长）    [vbyte gap][vbyte total_sz][vbyte keysz<<1|tomb]
+//                    [tstamp u32 小端][key]
+//   [size-8..size-1] trailer: magic "BCHE" u32 + running_crc u32
+//                    （CRC 覆盖 [0, size-8)，含文件头与全部记录字节）
+// gap = offset − prev_end（prev_end = 上条 offset+total_sz，首条为 0）。
+// 记录按 data append 序写且连续无洞时 gap==0（1 字节）；语义经 u64 二补数
+// 回绕无损还原，正确性**不依赖**连续性假设。典型记录 ~8-9B（v2 定宽 18B）。
+// 兼容：写端恒 v3；读端按文件头 magic 分派（v2 首 4 字节是 tstamp，与
+// magic 撞值概率 ~2^-32 且后果仅 CRC 失败 → fold(data) 兜底）。旧 v2 文件
+// merge/roll 后自然消亡；migrate 从不迁 hint。
+// ---------------------------------------------------------------------------
+inline constexpr std::uint32_t kHintMagicV3        = 0x33484342;  // "BCH3" LE
+inline constexpr std::uint32_t kHintTrailerMagicV3 = 0x45484342;  // "BCHE" LE
+inline constexpr std::size_t   kHintHeaderV3       = 4;
+inline constexpr std::size_t   kHintTrailerV3      = 8;
+
+// ---------------------------------------------------------------------------
 // kDoc value 打包布局（写在 kDoc record 的 VALUE 段）。设计见 §2.4。
 //
 // DocValue 格式为本项目自定义格式（无公开规范），但设计灵感来源于：

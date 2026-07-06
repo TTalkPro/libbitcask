@@ -18,11 +18,14 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>  // S14-3: read_selected 的段选择谓词
+#include <memory>      // S21-3：unique_ptr（曾靠传递包含，B3 新包含点暴露）
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <unistd.h>  // S21-2 A4: fdatasync
 
 #include "bitcask/codec.hpp"  // crc32
 
@@ -43,6 +46,11 @@ enum class CkptSectionType : std::uint16_t {
     kDocmapDelta      = 10,  // 窗口 live 行 + 删除日志（按 ord 交错重放）
     kHnswDelta        = 11,  // 插入日志：count u64; 每条 ord u64 | f32[dim]
     kKeydirDelta      = 12,  // S14-7：keydir 元数据（"BKMD"：水位/标量/fstats）
+    // S21-2 A2：gap+vbyte 行编码的 docmap delta（v1 的 kDocmapDelta 定宽版
+    // 保留兼容读）。含本段的文件以 file version 2 写出——旧读端（只认
+    // version 1）整文件拒收 → 链断 → 退 fold；若只加段型不升文件版本，
+    // 旧读端会静默忽略未知段、丢行推进水位（数据洞）。
+    kDocmapDeltaV2    = 13,
 };
 
 // 写入用:caller 持有 payload 字节。
@@ -99,6 +107,9 @@ struct FileCloser {
 
 constexpr char kCkptMagic[4] = {'B', 'C', 'S', 'C'};
 constexpr std::uint32_t kCkptVersion = 1;
+// S21-2 A2：v2 段型（kDocmapDeltaV2）所在文件的头版本。读端 1/2 双收；
+// 写端仅在文件确含 v2 段型时用 2（见 kDocmapDeltaV2 注释的降级安全论证）。
+constexpr std::uint32_t kCkptVersion2 = 2;
 constexpr std::size_t kHeaderLen = 16;  // magic(4)+ver(4)+watermark(8)
 constexpr std::size_t kTrailerLen = 12;  // footerCrc(4)+dirLen(4)+trailer(4)
 
@@ -139,14 +150,15 @@ public:
     // 写 header + sections + footer,tmp+rename 原子落盘。成功返回 true。
     [[nodiscard]] static bool write(std::string_view path,
                                     std::uint64_t watermark,
-                                    std::span<const CkptSection> sections) {
+                                    std::span<const CkptSection> sections,
+                                    std::uint32_t version = detail::kCkptVersion) {
         using namespace detail;
         std::vector<std::byte> buf;
         // 头部。
         buf.insert(buf.end(),
                    reinterpret_cast<const std::byte*>(kCkptMagic),
                    reinterpret_cast<const std::byte*>(kCkptMagic) + 4);
-        put_u32(buf, kCkptVersion);
+        put_u32(buf, version);
         put_u64(buf, watermark);
         // 段载荷区(记录每段 offset/len/crc 供页脚)。
         struct DirEnt { std::uint16_t type, flags; std::uint64_t off, len;
@@ -183,9 +195,18 @@ public:
         const std::string tmp = fp + ".tmp";
         std::unique_ptr<std::FILE, FileCloser> f(std::fopen(tmp.c_str(), "wb"));
         if (!f) return false;
-        const bool wrote =
+        bool wrote =
             std::fwrite(buf.data(), 1, buf.size(), f.get()) == buf.size();
-        f.reset();  // close before rename（须 flush OS buffer）
+        // S21-2 A4：rename 前 fdatasync（对齐 write_manifest）。manifest 是唯一
+        // commit 点且自带目录 fsync；但组件文件本身不落盘的话，断电后 manifest
+        // 已提交而组件页丢失 → CRC 坏 → 整组件退全量 fold，checkpoint 的启动
+        // 加速在断电场景整体失效。fdatasync 把「组件数据先于 manifest 落盘」
+        // 变成保证而非运气。
+        if (wrote) {
+            std::fflush(f.get());
+            wrote = ::fdatasync(::fileno(f.get())) == 0;
+        }
+        f.reset();  // close before rename
         if (!wrote || std::rename(tmp.c_str(), fp.c_str()) != 0) {
             std::remove(tmp.c_str());
             return false;
@@ -218,7 +239,8 @@ public:
             return std::nullopt;
         }
         if (std::memcmp(head, kCkptMagic, 4) != 0) return std::nullopt;
-        if (get_u32(head + 4) != kCkptVersion) return std::nullopt;
+        const std::uint32_t ver = get_u32(head + 4);
+        if (ver != kCkptVersion && ver != kCkptVersion2) return std::nullopt;
 
         std::byte tail[kTrailerLen];
         std::fseek(f.get(), static_cast<long>(n - kTrailerLen), SEEK_SET);
@@ -303,7 +325,10 @@ public:
         const std::size_t n = buf.size();
         // 头部 magic/version。
         if (std::memcmp(base, kCkptMagic, 4) != 0) return std::nullopt;
-        if (get_u32(base + 4) != kCkptVersion) return std::nullopt;
+        {
+            const std::uint32_t ver = get_u32(base + 4);
+            if (ver != kCkptVersion && ver != kCkptVersion2) return std::nullopt;
+        }
         // 页脚(从尾倒走)。
         if (std::memcmp(base + n - 4, kCkptMagic, 4) != 0) return std::nullopt;
         const std::uint32_t dir_len = get_u32(base + n - 8);

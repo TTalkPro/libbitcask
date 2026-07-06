@@ -1,6 +1,7 @@
 #include "bitcask/index.hpp"
 
 #include "bitcask/codec.hpp"  // S18-2：sidecar CRC
+#include "bitcask/vbyte.hpp"   // S21-2 A2：sidecar v2 行 gap+vbyte
 
 #include <algorithm>
 #include <cstring>
@@ -43,12 +44,18 @@ inline void fill_is_live_inbounds_avx2(const std::uint8_t* live_arr,
 
 }
 
+// S21-1：布局契约——DocLoc 消 padding 后 16B，DocSlot 去 ord 后 24B。
+// serialize_docmap/deserialize_docmap 逐字段读写，不受内存布局影响。
+static_assert(sizeof(DocLoc) == 16, "DocLoc 应为 16B（offset 前置消 padding）");
+static_assert(sizeof(DocSlot) == 24, "DocSlot 应为 24B（ord 不常驻 slots_）");
+
 void Index::ensure_capacity_locked(std::uint64_t ord) {
     const std::size_t want = static_cast<std::size_t>(ord) + 1;
     if (live_.size() < want) {
         live_.resize(want, false);
         doc_lens_.resize(want, 0);
-        meta_blobs_.resize(want);
+        // S21-1：meta 惰性——未启用（首个非空 set_meta 前）不跟平。
+        if (!meta_blobs_.empty()) meta_blobs_.resize(want);
     }
     const std::size_t ci = static_cast<std::size_t>(ord) / kChunkOrds;
     if (chunks_.size() <= ci) {
@@ -128,7 +135,7 @@ bool Index::remove(std::string_view ext_id, std::uint64_t tomb_ord) {
     return true;
 }
 
-std::optional<DocSlot> Index::get(std::string_view ext_id) const {
+std::optional<DocHit> Index::get(std::string_view ext_id) const {
     std::shared_lock lk(mutex_);
     auto it = ext2ord_.find(ext_id);
     if (it == ext2ord_.end()) {
@@ -137,9 +144,7 @@ std::optional<DocSlot> Index::get(std::string_view ext_id) const {
     const std::uint64_t ord = it->second;
     const auto ci = ord / kChunkOrds;
     const auto si = ord % kChunkOrds;
-    DocSlot s = chunks_[ci]->slots[si];
-    s.ord = ord;
-    return s;
+    return DocHit{chunks_[ci]->slots[si], ord};
 }
 
 std::optional<std::uint64_t> Index::ord_of(std::string_view ext_id) const {
@@ -205,8 +210,11 @@ void Index::set_meta(std::uint64_t ord, std::span<const std::byte> blob) {
     ensure_capacity_locked(ord);
     // 与 put_doc 共锁：调用顺序保证 ord 此前已在 slots_/live_/doc_lens_ 注册。
     if (blob.empty()) {
-        meta_blobs_[ord].clear();
+        // S21-1：meta 未启用时无槽可清——ord >= size() 本就是空 blob 语义。
+        if (ord < meta_blobs_.size()) meta_blobs_[ord].clear();
     } else {
+        // S21-1：首个非空 blob 才启用 meta 列（跟平到 live_ 现宽）。
+        if (meta_blobs_.size() < live_.size()) meta_blobs_.resize(live_.size());
         meta_blobs_[ord].assign(blob.begin(), blob.end());
     }
     dirty_.store(true, std::memory_order_relaxed);  // S18-2：自记账
@@ -327,7 +335,11 @@ void Index::clear_removals() {
 
 namespace {
 constexpr std::uint32_t kSidecarMagic   = 0x42434953;  // "BCIS"
-constexpr std::uint32_t kSidecarVersion = 1;
+// S21-2 A2：v2 行编码 gap+vbyte（ord 差分 + 标量 vbyte，tstamp 保持定宽
+// 4B），固定 34B/行 → 典型 12-15B/行。写端恒写 v2；读端 v1/v2 双收。
+// 旧读端遇 v2 → version 不符拒收 → 组件退 fold（可重建，降级安全）。
+constexpr std::uint32_t kSidecarVersion   = 2;
+constexpr std::uint32_t kSidecarVersionV1 = 1;
 void sc_put32(std::vector<std::uint8_t>& b, std::uint32_t v) {
     const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
     b.insert(b.end(), p, p + 4);
@@ -341,10 +353,10 @@ void sc_put64(std::vector<std::uint8_t>& b, std::uint64_t v) {
 bool Index::serialize_docmap(std::vector<std::uint8_t>& buf,
                              std::uint64_t covers_next_ord) const {
     buf.clear();
-    // S4:预留容量——每行固定 34B + 变长 ext_id（按 48B/行估值），常态零
-    // realloc（偏小由几何增长兜底，reserve 仅设容量、绝不溢出）。
+    // S4:预留容量——v2 变长典型 ≤15B/行 + 变长 ext_id（按 48B/行估值），
+    // 常态零 realloc（偏小由几何增长兜底，reserve 仅设容量、绝不溢出）。
     const std::uint64_t live = info().live_docs;
-    buf.reserve(28 + static_cast<std::size_t>(live) * (34 + 48));
+    buf.reserve(28 + static_cast<std::size_t>(live) * (15 + 48));
     sc_put32(buf, kSidecarMagic);
     sc_put32(buf, kSidecarVersion);
     sc_put64(buf, covers_next_ord);
@@ -353,20 +365,20 @@ bool Index::serialize_docmap(std::vector<std::uint8_t>& buf,
     sc_put64(buf, 0);
     std::uint64_t rows = 0;
     bool ok = true;
+    std::uint64_t prev_ord = 0;
     for_each_live([&](std::uint64_t ord, const std::string& ext,
                       const DocSlot& slot) {
         if (ext.size() > 0xFFFF) { ok = false; return; }
-        sc_put64(buf, ord);
-        const auto klen = static_cast<std::uint16_t>(ext.size());
-        const auto* kp = reinterpret_cast<const std::uint8_t*>(&klen);
-        buf.insert(buf.end(), kp, kp + 2);
+        codec::vbyte_encode(ord - prev_ord, buf);  // gap：live 按 ord 升序遍历
+        prev_ord = ord;
+        codec::vbyte_encode(ext.size(), buf);
         const auto* kd = reinterpret_cast<const std::uint8_t*>(ext.data());
         buf.insert(buf.end(), kd, kd + ext.size());
-        sc_put32(buf, slot.loc.file_id);
-        sc_put64(buf, slot.loc.offset);
-        sc_put32(buf, slot.loc.total_sz);
-        sc_put32(buf, slot.tstamp);
-        sc_put32(buf, slot.doc_len);
+        codec::vbyte_encode(slot.loc.file_id, buf);
+        codec::vbyte_encode(slot.loc.offset, buf);
+        codec::vbyte_encode(slot.loc.total_sz, buf);
+        sc_put32(buf, slot.tstamp);   // 定宽：unix 时间戳 vbyte 需 5B
+        codec::vbyte_encode(slot.doc_len, buf);
         ++rows;
     });
     if (!ok) return false;
@@ -383,7 +395,9 @@ Index::deserialize_docmap(std::span<const std::uint8_t> buf) {
     auto rd32 = [&](std::size_t off) {
         std::uint32_t v; std::memcpy(&v, buf.data() + off, 4); return v;
     };
-    if (rd32(0) != kSidecarMagic || rd32(4) != kSidecarVersion) {
+    if (rd32(0) != kSidecarMagic) return std::nullopt;
+    const std::uint32_t ver = rd32(4);
+    if (ver != kSidecarVersion && ver != kSidecarVersionV1) {
         return std::nullopt;
     }
     std::uint32_t stored_crc = 0;
@@ -401,18 +415,57 @@ Index::deserialize_docmap(std::span<const std::uint8_t> buf) {
     std::memcpy(&covers, p, 8); p += 8;
     std::memcpy(&rows, p, 8); p += 8;
     if (rows > (1ull << 40)) return std::nullopt;
+    bool vfail = false;
+    auto vb = [&]() -> std::uint64_t {  // 边界安全 vbyte
+        std::uint64_t v = 0, shift = 0;
+        while (true) {
+            if (p >= end || shift > 63) { vfail = true; return 0; }
+            const std::uint8_t byte = *p++;
+            v |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
+            if (byte & 0x80) return v;
+            shift += 7;
+        }
+    };
+    const bool v2 = ver >= kSidecarVersion;
+    std::uint64_t prev_ord = 0;
     for (std::uint64_t i = 0; i < rows; ++i) {
-        if (!need(10)) return std::nullopt;
-        std::uint64_t ord; std::memcpy(&ord, p, 8); p += 8;
-        std::uint16_t klen; std::memcpy(&klen, p, 2); p += 2;
-        if (!need(static_cast<std::size_t>(klen) + 20)) return std::nullopt;
+        std::uint64_t ord = 0;
+        std::uint64_t klen = 0;
+        if (v2) {
+            ord = prev_ord + vb();  // gap（二补数回绕，正确性不依赖升序）
+            prev_ord = ord;
+            klen = vb();
+            if (vfail || klen > 0xFFFF) return std::nullopt;
+        } else {
+            if (!need(10)) return std::nullopt;
+            std::memcpy(&ord, p, 8); p += 8;
+            std::uint16_t k16; std::memcpy(&k16, p, 2); p += 2;
+            klen = k16;
+        }
+        if (!need(static_cast<std::size_t>(klen))) return std::nullopt;
         std::string ext(reinterpret_cast<const char*>(p), klen); p += klen;
         DocSlot slot;
-        std::memcpy(&slot.loc.file_id, p, 4); p += 4;
-        std::memcpy(&slot.loc.offset, p, 8); p += 8;
-        std::memcpy(&slot.loc.total_sz, p, 4); p += 4;
-        std::memcpy(&slot.tstamp, p, 4); p += 4;
-        std::memcpy(&slot.doc_len, p, 4); p += 4;
+        if (v2) {
+            const std::uint64_t fid = vb(), off = vb(), tsz = vb();
+            if (vfail || !need(4)) return std::nullopt;
+            std::memcpy(&slot.tstamp, p, 4); p += 4;
+            const std::uint64_t dl = vb();
+            if (vfail || fid > 0xFFFFFFFFull || tsz > 0xFFFFFFFFull ||
+                dl > 0xFFFFFFFFull) {
+                return std::nullopt;
+            }
+            slot.loc.offset   = off;
+            slot.loc.file_id  = static_cast<std::uint32_t>(fid);
+            slot.loc.total_sz = static_cast<std::uint32_t>(tsz);
+            slot.doc_len      = static_cast<std::uint32_t>(dl);
+        } else {
+            if (!need(20)) return std::nullopt;
+            std::memcpy(&slot.loc.file_id, p, 4); p += 4;
+            std::memcpy(&slot.loc.offset, p, 8); p += 8;
+            std::memcpy(&slot.loc.total_sz, p, 4); p += 4;
+            std::memcpy(&slot.tstamp, p, 4); p += 4;
+            std::memcpy(&slot.doc_len, p, 4); p += 4;
+        }
         put_doc(ext, ord, slot);  // 重建 ext2ord/live/doc_lens/水位
     }
     if (p != end) return std::nullopt;

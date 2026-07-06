@@ -32,7 +32,10 @@
 #include <unordered_set>
 #include <vector>
 
+#include <span>
+
 #include "bitcask/inverted.hpp"  // SearchResult
+#include "bitcask/string_hash.hpp"  // S21-1：term_index_ 透明查找
 
 namespace bitcask::search {
 
@@ -72,9 +75,11 @@ public:
     void invalidate();
 
     // 选择性失效：移除「查询词与 changed_terms 有交集」的缓存条目（S9.2）。
-    // changed_terms 为被写入/删除文档的词集。
+    // changed_terms 为被写入/删除文档的词集。S21-1：收 string_view（借用
+    // caller 的 term 存储，生命周期覆盖本调用即可）——免每写一篇文档把全部
+    // 词深拷成 owning string 只为一次交集判定。
     // 线程安全。
-    void invalidate_terms(const std::vector<std::string>& changed_terms);
+    void invalidate_terms(std::span<const std::string_view> changed_terms);
 
     // 调试统计。
     [[nodiscard]] std::size_t size() const;
@@ -100,7 +105,8 @@ private:
     // S13-P8：term → 含该词的条目 hash 集（反向索引）。invalidate_terms 从
     // O(全部条目×词) 降为 O(变更词 + 受害条目)——它跑在每次写入的 reducer
     // 路径上、持独占锁。put/erase/invalidate 同步维护。
-    mutable std::unordered_map<std::string, std::unordered_set<std::uint64_t>>
+    mutable std::unordered_map<std::string, std::unordered_set<std::uint64_t>,
+                               StringHash, std::equal_to<>>
         term_index_;
 
     // 摘除一个条目（term_index_ 反链 + map_ + lru_list_）。锁要求：mutex_ 独占。

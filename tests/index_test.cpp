@@ -12,7 +12,8 @@ namespace {
 
 DocSlot slot(std::uint32_t file_id, std::uint64_t off, std::uint32_t sz,
              std::uint32_t ts = 0) {
-    return DocSlot{DocLoc{file_id, off, sz}, ts, /*doc_len*/ 0};
+    return DocSlot{DocLoc{.offset = off, .file_id = file_id, .total_sz = sz},
+                   ts, /*doc_len*/ 0};
 }
 
 }  // namespace
@@ -236,4 +237,81 @@ TEST(Index, ForEachLiveAcrossChunks) {
     EXPECT_EQ(seen[1].second, "b");
     EXPECT_EQ(seen[2].first, N + 1);
     EXPECT_EQ(seen[2].second, "c");
+}
+
+// ---- S21-2 A2：BCIS sidecar v2（行 gap+vbyte）----
+
+#include <span>
+
+#include "bitcask/codec.hpp"
+
+namespace {
+
+void bcis_le32(std::vector<std::uint8_t>& b, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) b.push_back((v >> (8 * i)) & 0xFF);
+}
+void bcis_le64(std::vector<std::uint8_t>& b, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i) b.push_back((v >> (8 * i)) & 0xFF);
+}
+
+}  // namespace
+
+// v2 roundtrip：serialize → 全新 Index deserialize → 行字段一致。
+TEST(Index, SidecarV2RoundTrip) {
+    Index idx;
+    idx.put_doc("doc-a", 0, slot(1, 100, 50, 1111));
+    idx.put_doc("doc-b", 5, slot(2, 4096, 80, 2222));
+    idx.remove("doc-a", 6);
+    std::vector<std::uint8_t> buf;
+    ASSERT_TRUE(idx.serialize_docmap(buf, /*covers*/ 7));
+
+    Index idx2;
+    auto covers = idx2.deserialize_docmap(
+        std::span<const std::uint8_t>(buf.data(), buf.size()));
+    ASSERT_TRUE(covers.has_value());
+    EXPECT_EQ(*covers, 7u);
+    EXPECT_FALSE(idx2.get("doc-a").has_value()) << "已删行不应出现";
+    auto s = idx2.get("doc-b");
+    ASSERT_TRUE(s.has_value());
+    EXPECT_EQ(s->ord, 5u);
+    EXPECT_EQ(s->loc.file_id, 2u);
+    EXPECT_EQ(s->loc.offset, 4096u);
+    EXPECT_EQ(s->loc.total_sz, 80u);
+    EXPECT_EQ(s->tstamp, 2222u);
+}
+
+// v1（定宽行）兼容读：手工构造 v1 字节流——写端已恒写 v2，此路径无自然
+// 覆盖，防回归。
+TEST(Index, SidecarV1CompatRead) {
+    std::vector<std::uint8_t> b;
+    bcis_le32(b, 0x42434953);  // "BCIS"
+    bcis_le32(b, 1);           // v1
+    bcis_le64(b, 3);           // covers
+    bcis_le64(b, 1);           // rows
+    bcis_le64(b, 2);           // ord
+    const char* ext = "v1doc";
+    b.push_back(5); b.push_back(0);  // klen u16
+    b.insert(b.end(), ext, ext + 5);
+    bcis_le32(b, 7);           // file_id
+    bcis_le64(b, 512);         // offset
+    bcis_le32(b, 64);          // total_sz
+    bcis_le32(b, 3333);        // tstamp
+    bcis_le32(b, 12);          // doc_len
+    const std::uint32_t crc = bitcask::codec::crc32(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(b.data() + 8), b.size() - 8));
+    bcis_le32(b, crc);
+
+    Index idx;
+    auto covers = idx.deserialize_docmap(
+        std::span<const std::uint8_t>(b.data(), b.size()));
+    ASSERT_TRUE(covers.has_value()) << "v1 sidecar 必须仍可读（兼容分支）";
+    EXPECT_EQ(*covers, 3u);
+    auto s = idx.get("v1doc");
+    ASSERT_TRUE(s.has_value());
+    EXPECT_EQ(s->ord, 2u);
+    EXPECT_EQ(s->loc.file_id, 7u);
+    EXPECT_EQ(s->loc.offset, 512u);
+    EXPECT_EQ(s->loc.total_sz, 64u);
+    EXPECT_EQ(s->tstamp, 3333u);
+    EXPECT_EQ(s->doc_len, 12u);
 }

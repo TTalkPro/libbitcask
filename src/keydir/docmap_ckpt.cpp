@@ -5,6 +5,7 @@
 #include "bitcask/docmap_ckpt.hpp"
 #include "bitcask/ckpt_chain.hpp"        // S20-2：walk_chain / remove_chain_files
 #include "bitcask/search_checkpoint.hpp"
+#include "bitcask/vbyte.hpp"             // S21-2 A2：v2 行 gap+vbyte
 
 #include <cstring>
 #include <filesystem>
@@ -82,38 +83,118 @@ bool apply_docmap_delta_section(Index& docmap,
     return true;
 }
 
+// S21-2 A2：kDocmapDeltaV2 解析 + 应用。与 v1 定宽版语义一致，行编码换
+// gap+vbyte：ord/tomb 为窗口内单调升序 → 差分后典型 1-2B；klen/file_id/
+// offset/total_sz/doc_len 走标量 vbyte；tstamp 保持定宽 4B（unix 秒级时间戳
+// vbyte 需 5B 反而更大）。gap 用 u64 二补数回绕（prev + (v - prev) ≡ v），
+// 正确性不依赖升序——乱序只损压缩率不损数据。
+bool apply_docmap_delta_section_v2(Index& docmap,
+                                   std::span<const std::byte> payload,
+                                   std::vector<DocmapDeltaRow>& rows,
+                                   std::vector<DocmapDeltaRemoval>& rems) {
+    const auto* p = payload.data();
+    const auto* end = p + payload.size();
+    bool fail = false;
+    auto vb = [&]() -> std::uint64_t {  // 边界安全 vbyte
+        std::uint64_t v = 0, shift = 0;
+        while (true) {
+            if (p >= end || shift > 63) { fail = true; return 0; }
+            const auto byte = static_cast<std::uint8_t>(*p++);
+            v |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
+            if (byte & 0x80) return v;
+            shift += 7;
+        }
+    };
+    auto u32 = [&]() -> std::uint32_t {
+        if (end - p < 4) { fail = true; return 0; }
+        std::uint32_t v = sc::detail::get_u32(p); p += 4;
+        return v;
+    };
+    const std::uint64_t rn = vb();
+    if (fail || rn > (1ull << 40)) return false;
+    rows.reserve(rn);
+    std::uint64_t prev_ord = 0;
+    for (std::uint64_t i = 0; i < rn; ++i) {
+        DocmapDeltaRow r;
+        r.ord = prev_ord + vb();  // gap（二补数回绕安全）
+        prev_ord = r.ord;
+        const std::uint64_t klen = vb();
+        if (fail || klen > 0xFFFF ||
+            static_cast<std::uint64_t>(end - p) < klen) {
+            return false;
+        }
+        r.ext.assign(reinterpret_cast<const char*>(p), klen);
+        p += klen;
+        const std::uint64_t fid = vb(), off = vb(), tsz = vb();
+        r.slot.tstamp  = u32();
+        const std::uint64_t dl = vb();
+        if (fail || fid > 0xFFFFFFFFull || tsz > 0xFFFFFFFFull ||
+            dl > 0xFFFFFFFFull) {
+            return false;
+        }
+        r.slot.loc.offset   = off;
+        r.slot.loc.file_id  = static_cast<std::uint32_t>(fid);
+        r.slot.loc.total_sz = static_cast<std::uint32_t>(tsz);
+        r.slot.doc_len      = static_cast<std::uint32_t>(dl);
+        rows.push_back(std::move(r));
+    }
+    const std::uint64_t mn = vb();
+    if (fail || mn > (1ull << 40)) return false;
+    rems.reserve(mn);
+    std::uint64_t prev_tomb = 0;
+    for (std::uint64_t i = 0; i < mn; ++i) {
+        DocmapDeltaRemoval m;
+        m.tomb = prev_tomb + vb();
+        prev_tomb = m.tomb;
+        const std::uint64_t klen = vb();
+        if (fail || klen > 0xFFFF ||
+            static_cast<std::uint64_t>(end - p) < klen) {
+            return false;
+        }
+        m.key.assign(reinterpret_cast<const char*>(p), klen);
+        p += klen;
+        rems.push_back(std::move(m));
+    }
+    if (fail || p != end) return false;
+    // 按 ord 交错重放（与 v1 同一不变量：删后重写场景删除先于同 key 新行）。
+    std::size_t ri = 0, mi = 0;
+    while (ri < rows.size() || mi < rems.size()) {
+        const bool take_row =
+            mi >= rems.size() ||
+            (ri < rows.size() && rows[ri].ord < rems[mi].tomb);
+        if (take_row) {
+            docmap.put_doc(rows[ri].ext, rows[ri].ord, rows[ri].slot);
+            ++ri;
+        } else {
+            docmap.remove(rems[mi].key, rems[mi].tomb);
+            ++mi;
+        }
+    }
+    return true;
+}
+
 namespace {
 
-// 单个 delta 文件的段集应用（原 apply_delta_file 的 docmap 版）：先整体
-// CRC 预检（任何坏段 → 整个 delta 拒绝，不部分应用），再逐段应用 +
-// keydir 半边经 hook 一次性透传。
+// 单个 delta 文件的段集应用（原 apply_delta_file 的 docmap 版）。
+// S21-3 B3：CRC 预检 + hook 收尾骨架收敛至 apply_delta_sections（与
+// legacy_ckpt 共用），此处只留段分发。
 bool apply_delta_file(Index& docmap,
                       const std::vector<sc::LoadedSection>& sections,
                       const DocmapReplayHook& hook) {
-    for (const auto& ls : sections) {
-        if (!ls.crc_ok) return false;
-    }
-    std::vector<DocmapDeltaRow> rows;
-    std::vector<DocmapDeltaRemoval> rems;
-    std::span<const std::byte> keydir_meta;
-    for (const auto& ls : sections) {
-        const auto st = static_cast<sc::CkptSectionType>(ls.type);
-        if (st == sc::CkptSectionType::kDocmapDelta) {
-            if (!apply_docmap_delta_section(
-                    docmap,
-                    std::span<const std::byte>(ls.payload.data(),
-                                               ls.payload.size()),
-                    rows, rems)) {
-                return false;
+    return apply_delta_sections(
+        sections, hook,
+        [&](sc::CkptSectionType st, std::span<const std::byte> pl,
+            std::vector<DocmapDeltaRow>& rows,
+            std::vector<DocmapDeltaRemoval>& rems) {
+            switch (st) {
+            case sc::CkptSectionType::kDocmapDelta:
+                return apply_docmap_delta_section(docmap, pl, rows, rems);
+            case sc::CkptSectionType::kDocmapDeltaV2:
+                return apply_docmap_delta_section_v2(docmap, pl, rows, rems);
+            default:
+                return true;  // kDeltaInfo 由链校验消费；其余段型忽略。
             }
-        } else if (st == sc::CkptSectionType::kKeydirDelta) {
-            keydir_meta = std::span<const std::byte>(ls.payload.data(),
-                                                     ls.payload.size());
-        }
-        // kDeltaInfo 由链校验消费；其余段型忽略。
-    }
-    if (hook) hook(rows, rems, keydir_meta);
-    return true;
+        });
 }
 
 }  // namespace
@@ -156,51 +237,62 @@ bool save_docmap_delta(Index& docmap, std::string_view dir,
         sc::detail::put_u32(b, seq);
         sw.add(sc::CkptSectionType::kDeltaInfo, std::move(b));
     }
-    // kDocmapDelta：窗口 live 行 + 删除日志。
+    // kDocmapDeltaV2（S21-2 A2）：窗口 live 行 + 删除日志，gap+vbyte 编码
+    // （布局见 apply_docmap_delta_section_v2 注释）。行数不可先知（回调产出）
+    // → 先收集行字节再前置 vbyte 计数（v1 是定宽占位回填，vbyte 变长没法
+    // 占位）。
     {
-        std::vector<std::byte> b;
-        const std::size_t cnt_pos = b.size();
-        sc::detail::put_u64(b, 0);
+        std::vector<std::byte> rows_buf;
         std::uint64_t rows = 0;
+        std::uint64_t prev_ord = 0;
         bool ok = true;
         docmap.for_each_live_in(
             from, watermark,
             [&](std::uint64_t ord, const std::string& ext,
                 const DocSlot& slot) {
                 if (ext.size() > 0xFFFF) { ok = false; return; }
-                sc::detail::put_u64(b, ord);
-                sc::detail::put_u16(b, static_cast<std::uint16_t>(ext.size()));
-                b.insert(b.end(),
+                codec::vbyte_encode(ord - prev_ord, rows_buf);
+                prev_ord = ord;
+                codec::vbyte_encode(ext.size(), rows_buf);
+                rows_buf.insert(rows_buf.end(),
                     reinterpret_cast<const std::byte*>(ext.data()),
                     reinterpret_cast<const std::byte*>(ext.data()) +
                         ext.size());
-                sc::detail::put_u32(b, slot.loc.file_id);
-                sc::detail::put_u64(b, slot.loc.offset);
-                sc::detail::put_u32(b, slot.loc.total_sz);
-                sc::detail::put_u32(b, slot.tstamp);
-                sc::detail::put_u32(b, slot.doc_len);
+                codec::vbyte_encode(slot.loc.file_id, rows_buf);
+                codec::vbyte_encode(slot.loc.offset, rows_buf);
+                codec::vbyte_encode(slot.loc.total_sz, rows_buf);
+                sc::detail::put_u32(rows_buf, slot.tstamp);
+                codec::vbyte_encode(slot.doc_len, rows_buf);
                 ++rows;
             });
         if (!ok) return false;
-        std::memcpy(b.data() + cnt_pos, &rows, 8);
+        std::vector<std::byte> b;
+        b.reserve(rows_buf.size() + 64);
+        codec::vbyte_encode(rows, b);
+        b.insert(b.end(), rows_buf.begin(), rows_buf.end());
         const auto removals = docmap.removals_snapshot();
-        sc::detail::put_u64(b, static_cast<std::uint64_t>(removals.size()));
+        codec::vbyte_encode(removals.size(), b);
+        std::uint64_t prev_tomb = 0;
         for (const auto& [key, tomb] : removals) {
             if (key.size() > 0xFFFF) return false;
-            sc::detail::put_u64(b, tomb);
-            sc::detail::put_u16(b, static_cast<std::uint16_t>(key.size()));
+            codec::vbyte_encode(tomb - prev_tomb, b);
+            prev_tomb = tomb;
+            codec::vbyte_encode(key.size(), b);
             b.insert(b.end(),
                 reinterpret_cast<const std::byte*>(key.data()),
                 reinterpret_cast<const std::byte*>(key.data()) + key.size());
         }
-        sw.add(sc::CkptSectionType::kDocmapDelta, std::move(b));
+        sw.add(sc::CkptSectionType::kDocmapDeltaV2, std::move(b));
     }
     // keydir meta 仅在 docmap 组件落（S14-7 成对不变量）。
     if (!keydir_delta.empty()) {
         std::vector<std::byte> kb(keydir_delta.begin(), keydir_delta.end());
         sw.add(sc::CkptSectionType::kKeydirDelta, std::move(kb));
     }
-    if (!sc::SearchCheckpoint::write(dpath, watermark, sw.sections())) {
+    // S21-2 A2：文件版本 2——旧读端整文件拒收 → 链断退 fold（降级安全，
+    // 见 kDocmapDeltaV2 注释）。
+    if (!sc::SearchCheckpoint::write(dpath, watermark, sw.sections(),
+                                     sc::detail::kCkptVersion2)) {
         return false;
     }
     // 记账收尾：窗口推进 + 已序列化的删除日志清空。
@@ -260,7 +352,7 @@ DocmapLoadResult load_docmap(Index& docmap, std::string_view dir,
     if (segments_ok && !from_prev) {
         const auto w = sc::walk_chain(
             fp, /*base_gen=*/coverage, /*base_coverage=*/coverage, chain_seq,
-            [&](const sc::LoadedCheckpoint& dc) {
+            /*unbounded=*/false, [&](const sc::LoadedCheckpoint& dc) {
                 return apply_delta_file(docmap, dc.sections, hook);
             });
         coverage = w.coverage;

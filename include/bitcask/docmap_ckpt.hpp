@@ -18,6 +18,7 @@
 #pragma once
 
 #include "bitcask/component_ckpt.hpp"  // S20-1 R6：共用载入结果类型
+#include "bitcask/search_checkpoint.hpp"  // S21-3 B3：apply_delta_sections 骨架
 #include "bitcask/index.hpp"
 
 #include <cstdint>
@@ -53,6 +54,37 @@ using DocmapReplayHook = std::function<void(
 [[nodiscard]] bool apply_docmap_delta_section(
     Index& docmap, std::span<const std::byte> payload,
     std::vector<DocmapDeltaRow>& rows, std::vector<DocmapDeltaRemoval>& rems);
+
+// S21-3 B3：单 delta 文件段集应用的共享骨架（docmap_ckpt 与 legacy_ckpt
+// 各自的 apply_delta_file 曾逐字节重复此结构，仅段分发集不同）。不变量
+// 收敛于一处：① 全段 CRC 预检——任何坏段整个 delta 拒绝，绝不部分应用；
+// ② keydir 半边（rows/rems/meta）收集后 hook **收尾一次性**透传。
+// fn(type, payload, rows, rems, keydir_meta) 处理一个段：kKeydirDelta 由
+// 骨架代管（fn 不会收到）；kDeltaInfo 由链校验消费，fn 应忽略；返回 false
+// 断链。
+template <typename SectionFn>
+[[nodiscard]] bool apply_delta_sections(
+    const std::vector<search::LoadedSection>& sections,
+    const DocmapReplayHook& hook, SectionFn&& fn) {
+    for (const auto& ls : sections) {
+        if (!ls.crc_ok) return false;
+    }
+    std::vector<DocmapDeltaRow> rows;
+    std::vector<DocmapDeltaRemoval> rems;
+    std::span<const std::byte> keydir_meta;
+    for (const auto& ls : sections) {
+        const std::span<const std::byte> pl(ls.payload.data(),
+                                            ls.payload.size());
+        const auto st = static_cast<search::CkptSectionType>(ls.type);
+        if (st == search::CkptSectionType::kKeydirDelta) {
+            keydir_meta = pl;
+            continue;
+        }
+        if (!fn(st, pl, rows, rems)) return false;
+    }
+    if (hook) hook(rows, rems, keydir_meta);
+    return true;
+}
 
 // base 写：dir/docmap.ckpt。rename 旧文件 → .prev，写新 base，删 .d 链文件，
 // 成功后 begin_delta_window(watermark) + clear_removals + clear_dirty。

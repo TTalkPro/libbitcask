@@ -40,18 +40,28 @@ namespace bitcask::index {
 using bitcask::StringHash;
 
 // 一条文档在磁盘上的定位（pread 整条 kDoc 用）。
+// S21-1：字段按对齐降序排（offset 在前），sizeof 24→16（消 8B padding）。
+// 构造点一律 designated initializer——位置式聚合初始化在字段重排下会静默错位。
 struct DocLoc {
-    std::uint32_t file_id  = 0;
     std::uint64_t offset   = 0;
+    std::uint32_t file_id  = 0;
     std::uint32_t total_sz = 0;
 };
 
 // 按 ord 存的每文档元信息（slots[ord]）。
+// S21-1：不含 ord——slots_ 本身按 ord 下标寻址，存 ord 是每槽 8B 死重
+// （原注释自证「仅 get() 返回时填充」）。get() 返回带 ord 的 DocHit。
+// sizeof 40→24（连同 DocLoc 重排），每 chunk 槽数组 2.5MB→1.5MB。
 struct DocSlot {
     DocLoc        loc;
     std::uint32_t tstamp  = 0;
     std::uint32_t doc_len = 0;   // BM25 token 数（V2 由 analyzer 填）
-    std::uint64_t ord     = 0;   // 该文档的 ord（仅 get() 返回时填充；slots_ 内存的副本不依赖此值）
+};
+
+// get() 的返回形态：存储槽字段 + 查询时现填的 ord。聚合继承使既有
+// 消费点（slot->loc / slot->tstamp / slot->ord）全部无感。
+struct DocHit : DocSlot {
+    std::uint64_t ord = 0;
 };
 
 struct IndexInfo {
@@ -69,7 +79,7 @@ struct IndexInfo {
 static constexpr std::size_t kChunkOrds = 65536;   // 每 chunk 64K 个 ord
 
 struct Chunk {
-    std::array<DocSlot,     kChunkOrds> slots;      // 32B × 64K = 2 MB
+    std::array<DocSlot,     kChunkOrds> slots;      // 24B × 64K = 1.5 MB
     std::array<std::string, kChunkOrds> ord2ext;    // ~32B × 64K = 2 MB (SSO)
     std::uint32_t live_count = 0;                    // chunk 内存活 ord 数；== 0 可释放
 };
@@ -136,9 +146,9 @@ public:
     void clear_removals();
 
     // ---- 读 ----
-    // 取 ext_id 当前存活文档的定位；不存在/已删返回 nullopt。
+    // 取 ext_id 当前存活文档的定位（含现填的 ord）；不存在/已删返回 nullopt。
     // 线程安全：shared_lock。
-    [[nodiscard]] std::optional<DocSlot> get(std::string_view ext_id) const;
+    [[nodiscard]] std::optional<DocHit> get(std::string_view ext_id) const;
 
     // ord → ext_id（检索结果翻译用；V1 主要给调试/恢复）。越界返回 nullopt。
     // S16-3：override DocTable::ord_to_ext。
@@ -257,7 +267,10 @@ private:
 
     std::vector<std::uint8_t>  live_;       // 下标 = ord;0/1。平坦保持以兼容 SIMD gather。
     std::vector<std::uint32_t> doc_lens_;   // P2.4 SoA 副本;平坦保持以兼容 SIMD gather。
-    std::vector<std::vector<std::byte>> meta_blobs_;  // V5 per-ord meta;sparse,保持平坦。
+    // V5 per-ord meta。S21-1 惰性化：首个非空 set_meta 前恒 empty（不随 ord
+    // 增长），无 meta 部署零常驻（改前每 ord 白付 24B 空 vector 头）。启用后
+    // 与 live_ 同步跟平。读路径经 ord >= size() 门禁天然得到「空 blob」语义。
+    std::vector<std::vector<std::byte>> meta_blobs_;
 
     std::uint64_t next_ord_       = 0;
     std::uint64_t live_docs_      = 0;

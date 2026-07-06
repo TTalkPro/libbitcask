@@ -29,8 +29,14 @@ struct ChainWalk {
 // 走 base_path.d1, .d2, … 链，逐文件校验 kDeltaInfo 三元组后调 apply 应用。
 //   base_gen      —— 链校验基准世代（= base 覆盖水位）
 //   base_coverage —— 链起点覆盖水位（首个 delta 的 prev_wm 须等于它）
-//   chain_seq     —— >0 有界（须存在且连续 1..chain_seq，缺文件=链断=ok:false）；
-//                    0 无界（走到文件缺失为正常链尾，ok 保持 true）
+//   chain_seq     —— 有界模式的链长（走 1..chain_seq）；unbounded 时忽略。
+//                    **注意 chain_seq==0 在有界模式表示「零已提交 delta」→ 零迭代**，
+//                    绝不能与无界混淆——manifest 记 chain_seq==0 但盘上残留未提交的
+//                    orphan .d1（crash 于「先写 delta 后提交 manifest」窗口）时，
+//                    有界须忽略之（与 pre-S20 逐字节一致），无界才会扫盘重放。
+//   unbounded     —— false=有界（缺文件=链断=ok:false，manifest 提示链长可信时用，
+//                    text/vector/docmap load_component）；true=无界（走到文件缺失为
+//                    正常链尾，ok 保持 true，legacy/shim 无 manifest 链长提示时用）
 //   apply         —— (const LoadedCheckpoint&) -> bool：应用一个 delta 文件的
 //                    段集（段级 CRC 预检由 apply 自理），失败返回 false 断链
 //
@@ -38,14 +44,13 @@ struct ChainWalk {
 template <typename Apply>
 ChainWalk walk_chain(const std::string& base_path, std::uint64_t base_gen,
                      std::uint64_t base_coverage, std::uint32_t chain_seq,
-                     Apply&& apply) {
+                     bool unbounded, Apply&& apply) {
     ChainWalk w{base_coverage, 1, true};
-    const bool bounded = chain_seq != 0;
-    for (std::uint32_t s = 1; !bounded || s <= chain_seq; ++s) {
+    for (std::uint32_t s = 1; unbounded || s <= chain_seq; ++s) {
         const std::string dpath = base_path + ".d" + std::to_string(s);
         std::error_code ec;
         if (!std::filesystem::exists(dpath, ec)) {
-            if (bounded) w.ok = false;  // 有界：缺文件=链断；无界：正常链尾
+            if (!unbounded) w.ok = false;  // 有界：缺文件=链断；无界：正常链尾
             break;
         }
         auto dc = SearchCheckpoint::read(dpath);

@@ -92,7 +92,8 @@ void SearchCache::remove_entry_locked(std::list<ListNode>::iterator it) {
     lru_list_.erase(it);
 }
 
-void SearchCache::invalidate_terms(const std::vector<std::string>& changed_terms) {
+void SearchCache::invalidate_terms(
+    std::span<const std::string_view> changed_terms) {
     if (changed_terms.empty()) return;
 
     std::unique_lock lock(mutex_);
