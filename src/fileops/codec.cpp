@@ -415,4 +415,70 @@ bool is_hint_eof(const HintRecord& r) noexcept {
     return r.tstamp == 0 && r.key.empty() && r.offset == format::kMaxOffsetV2;
 }
 
+// ---- hint v3（S23-A1）----
+
+std::uint64_t encode_hint_record_v3(std::vector<std::byte>& out,
+                                    std::uint32_t tstamp,
+                                    std::uint32_t total_sz,
+                                    std::uint64_t offset, bool tombstone,
+                                    std::span<const std::byte> key,
+                                    std::uint64_t prev_end) {
+    assert(key.size() <= format::kMaxKeySize);
+    // gap 经 u64 二补数回绕：decode 侧 prev_end + gap ≡ offset (mod 2^64)，
+    // 正确性不依赖 offset ≥ prev_end；正常连续追加 gap==0 → 1 字节。
+    vbyte_encode(offset - prev_end, out);
+    vbyte_encode(total_sz, out);
+    vbyte_encode((static_cast<std::uint64_t>(key.size()) << 1) |
+                     (tombstone ? 1u : 0u),
+                 out);
+    const std::size_t base = out.size();
+    out.resize(base + 4);
+    le_store_u32(out.data() + base, tstamp);
+    if (!key.empty()) {
+        out.insert(out.end(), key.begin(), key.end());
+    }
+    return offset + total_sz;
+}
+
+std::expected<HintRecord, DecodeError>
+decode_hint_record_v3(std::span<const std::byte> buf, std::uint64_t& prev_end) {
+    // 边界安全 vbyte（buf 可能只含半条记录，短读返回 kBufferTooShort）。
+    std::size_t pos = 0;
+    auto vb = [&](std::uint64_t& v) -> bool {
+        v = 0;
+        std::uint64_t shift = 0;
+        while (true) {
+            if (pos >= buf.size() || shift > 63) return false;
+            const auto byte = static_cast<std::uint8_t>(buf[pos++]);
+            v |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
+            if (byte & 0x80) return true;
+            shift += 7;
+        }
+    };
+    std::uint64_t gap = 0, tsz = 0, kt = 0;
+    if (!vb(gap) || !vb(tsz) || !vb(kt)) {
+        return std::unexpected(DecodeError::kBufferTooShort);
+    }
+    const std::uint64_t key_sz = kt >> 1;
+    if (tsz > 0xFFFFFFFFull || key_sz > format::kMaxKeySize) {
+        return std::unexpected(DecodeError::kKeySizeOverflow);
+    }
+    if (buf.size() < pos + 4 + key_sz) {
+        return std::unexpected(DecodeError::kBufferTooShort);
+    }
+    const std::uint32_t tstamp = le_load_u32(buf.data() + pos);
+    pos += 4;
+    const std::uint64_t offset = prev_end + gap;  // 回绕还原
+    HintRecord rec{
+        .tstamp = tstamp,
+        .total_sz = static_cast<std::uint32_t>(tsz),
+        .offset = offset,
+        .tombstone = (kt & 1) != 0,
+        .key = buf.subspan(pos, static_cast<std::size_t>(key_sz)),
+        .consumed = pos + static_cast<std::size_t>(key_sz),
+    };
+    prev_end = offset + rec.total_sz;
+    return rec;
+}
+
 }  // namespace bitcask::codec

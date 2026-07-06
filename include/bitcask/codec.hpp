@@ -169,6 +169,20 @@ decode_hint_record(std::span<const std::byte> buf);
 // 线程安全: 是；不需任何锁。
 [[nodiscard]] bool is_hint_eof(const HintRecord& r) noexcept;
 
+// ---- hint v3（S23-A1，变长编码；文件级布局见 format.hpp）----
+// 编码一条 v3 记录（append 进 out），返回新的 prev_end（= offset+total_sz），
+// caller 串联传给下一条。
+std::uint64_t encode_hint_record_v3(std::vector<std::byte>& out,
+                                    std::uint32_t tstamp,
+                                    std::uint32_t total_sz,
+                                    std::uint64_t offset, bool tombstone,
+                                    std::span<const std::byte> key,
+                                    std::uint64_t prev_end);
+// 从 buf 头部解一条 v3 记录；prev_end 传入并在成功时更新。字节不足返回
+// kBufferTooShort（流式 caller 据此 refill 重试）。
+[[nodiscard]] std::expected<HintRecord, DecodeError>
+decode_hint_record_v3(std::span<const std::byte> buf, std::uint64_t& prev_end);
+
 // ---------------------------------------------------------------------------
 // CRC32 (zlib / IEEE 802.3 多项式，跟 erlang:crc32/1 一致)
 // 全部为纯函数，线程安全、可重入，不需任何锁。

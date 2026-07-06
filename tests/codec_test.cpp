@@ -706,3 +706,73 @@ TEST(MetaFilterCompileCheck, HeaderOnlyRoundtrip) {
     MetaFilter empty;
     EXPECT_TRUE(empty.evaluate(sp));
 }
+
+// ---------------------------------------------------------------------------
+// Hint record v3（S23-A1：vbyte + gap 差分；文件级布局见 format.hpp）。
+// ---------------------------------------------------------------------------
+namespace {
+std::string hint_key_str(std::span<const std::byte> k) {
+    return {reinterpret_cast<const char*>(k.data()), k.size()};
+}
+}  // namespace
+
+TEST(HintRecordV3, GoldenLayoutContiguous) {
+    std::vector<std::byte> out;
+    // 连续追加（offset == prev_end=0）：gap=0(1B) + total_sz=0x10(1B) +
+    // keysz<<1|0=4(1B) + tstamp 4B + "ab" = 9B（v2 定宽 20B 同载荷）。
+    auto pe = codec::encode_hint_record_v3(out, 0xDEADBEEF, 0x10, 0, false,
+                                           as_bytes("ab"), /*prev_end=*/0);
+    EXPECT_EQ(pe, 0x10u);
+    auto expected = hex_to_bytes("80" "90" "84" "efbeadde" "6162");
+    ASSERT_EQ(out.size(), expected.size());
+    EXPECT_EQ(bytes_to_hex(out), bytes_to_hex(expected));
+
+    std::uint64_t prev_end = 0;
+    auto rec = codec::decode_hint_record_v3(out, prev_end);
+    ASSERT_TRUE(rec.has_value());
+    EXPECT_EQ(rec->tstamp, 0xDEADBEEFu);
+    EXPECT_EQ(rec->total_sz, 0x10u);
+    EXPECT_EQ(rec->offset, 0u);
+    EXPECT_FALSE(rec->tombstone);
+    EXPECT_EQ(hint_key_str(rec->key), "ab");
+    EXPECT_EQ(rec->consumed, out.size());
+    EXPECT_EQ(prev_end, 0x10u);
+}
+
+TEST(HintRecordV3, TombstoneBitAndGap) {
+    std::vector<std::byte> out;
+    // 非零 gap（offset=100, prev_end=64 → gap=36）+ tomb 位。
+    auto pe = codec::encode_hint_record_v3(out, 7, 22, 100, true,
+                                           as_bytes("k"), /*prev_end=*/64);
+    EXPECT_EQ(pe, 122u);
+    std::uint64_t prev_end = 64;
+    auto rec = codec::decode_hint_record_v3(out, prev_end);
+    ASSERT_TRUE(rec.has_value());
+    EXPECT_EQ(rec->offset, 100u);
+    EXPECT_TRUE(rec->tombstone);
+    EXPECT_EQ(prev_end, 122u);
+}
+
+TEST(HintRecordV3, GapWraparoundOffsetLessThanPrevEnd) {
+    // offset < prev_end（不应出现，但语义须无损）：u64 二补数回绕还原。
+    std::vector<std::byte> out;
+    codec::encode_hint_record_v3(out, 1, 8, /*offset=*/16, false,
+                                 as_bytes("x"), /*prev_end=*/100);
+    std::uint64_t prev_end = 100;
+    auto rec = codec::decode_hint_record_v3(out, prev_end);
+    ASSERT_TRUE(rec.has_value());
+    EXPECT_EQ(rec->offset, 16u);
+    EXPECT_EQ(prev_end, 24u);
+}
+
+TEST(HintRecordV3, ShortBufferReturnsTooShort) {
+    std::vector<std::byte> out;
+    codec::encode_hint_record_v3(out, 1, 30, 0, false, as_bytes("abc"), 0);
+    for (std::size_t cut = 0; cut < out.size(); ++cut) {
+        std::uint64_t prev_end = 0;
+        auto rec = codec::decode_hint_record_v3(
+            std::span<const std::byte>(out.data(), cut), prev_end);
+        ASSERT_FALSE(rec.has_value()) << "cut=" << cut;
+        EXPECT_EQ(rec.error(), codec::DecodeError::kBufferTooShort);
+    }
+}

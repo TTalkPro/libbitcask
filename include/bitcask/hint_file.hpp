@@ -1,9 +1,10 @@
 // bitcask hint file：data file 的并行索引。
 //
-// 每条 hint record 编码靠 codec::encode_hint_record。文件末尾有一条特殊的
-// EOF sentinel record，里头存了整文件的 running CRC，给 has_valid_hintfile
-// 用——hint 文件的完整性靠这个 trailer CRC 来验证（不像 data file 是
-// 每条 record 自带 CRC）。
+// S23-A1 起写端恒为 v3（文件头 magic + 变长 vbyte 记录 + 8B trailer，
+// ~8-9B/条；布局见 format.hpp）；读端按文件头 magic 分派 v2/v3。
+// v2：codec::encode_hint_record 定宽 18B 记录 + EOF sentinel（内嵌整文件
+// running CRC）。两版完整性都靠 trailer CRC 一次性兜底（不像 data file
+// 每条 record 自带 CRC），校验不过 → caller 退 fold(data) 重建。
 //
 // 用途：keydir 重建加速。完整跑 fold(data_file) 重建 keydir 需要读全部
 // value bytes；fold(hint_file) 只读 key + 元数据，省掉绝大部分 I/O。
@@ -104,6 +105,10 @@ private:
     // 把 pending_ 的内容一次性 write 到 fd 并清空（pending 为空则 no-op）。
     [[nodiscard]] std::expected<void, DataFileFault> flush_pending();
 
+    // S23-A1：v3 流式 fold（fold() 按文件头 magic 分派至此）。
+    [[nodiscard]] std::expected<void, DataFileFault>
+    fold_v3(std::uint64_t total, FoldFn fn);
+
     // 攒满多少字节就 flush 一次（hint 可重建，丢缓冲只触发 fold(data) 回退）。
     // P2:64KiB→1MiB——merge/active 写 hint 的 pwrite 次数 16×↓。hint 非 WAL，
     // 加大缓冲只增大「崩溃丢 hint → fold(data) 回退」的窗口，不影响正确性。
@@ -113,6 +118,8 @@ private:
     std::string   path_;
     std::uint32_t running_crc_ = 0;
     Mode          mode_        = Mode::kRead;
+    // S23-A1：v3 gap 差分编码的串联状态（= 上条 offset+total_sz）。
+    std::uint64_t prev_end_    = 0;
     std::vector<std::byte> pending_;  // 攒批写缓冲（write 追加，flush/finalize 落盘）
 };
 

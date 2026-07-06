@@ -6,6 +6,7 @@
 #include <cstring>
 #include <utility>
 
+#include "bitcask/byte_order.hpp"  // S23-A1: le_load_u32/le_store_u32
 #include "bitcask/format.hpp"
 #include "bitcask/detail/thread_local_buffer.hpp"  // S9-P1-d
 
@@ -24,7 +25,19 @@ HintFile::open(std::string_view path, Mode mode, bool sync) {
 
     auto f = io::PosixFile::open(path, flags);
     if (!f) return std::unexpected(io_fault(f.error()));
-    return HintFile(std::move(*f), std::string(path), 0, mode);
+    HintFile hf(std::move(*f), std::string(path), 0, mode);
+    // S23-A1：新建文件先在缓冲种入 v3 文件头 magic（随首批记录落盘），
+    // running CRC 覆盖之（trailer CRC 语义 = [0, size-8) 全字节）。
+    // kAppend 不种头（生产零调用；对既有文件追加本就不维护 CRC 连续性）。
+    if (mode == Mode::kCreate) {
+        const std::size_t base = hf.pending_.size();
+        hf.pending_.resize(base + format::kHintHeaderV3);
+        le_store_u32(hf.pending_.data() + base, format::kHintMagicV3);
+        hf.running_crc_ = codec::crc32_update(
+            0, std::span<const std::byte>(hf.pending_.data() + base,
+                                          format::kHintHeaderV3));
+    }
+    return hf;
 }
 
 // ---------------------------------------------------------------------------
@@ -54,7 +67,10 @@ HintFile::write(std::uint32_t tstamp, std::uint32_t total_sz,
         return std::unexpected(DataFileFault{DataFileError::kTooLarge});
     }
     const std::size_t before = pending_.size();
-    codec::encode_hint_record(pending_, tstamp, total_sz, offset, tombstone, key);
+    // S23-A1：v3 变长编码（gap 差分串联经 prev_end_）。
+    prev_end_ = codec::encode_hint_record_v3(pending_, tstamp, total_sz,
+                                             offset, tombstone, key,
+                                             prev_end_);
     running_crc_ = codec::crc32_update(
         running_crc_,
         std::span<const std::byte>(pending_.data() + before,
@@ -70,8 +86,12 @@ HintFile::write(std::uint32_t tstamp, std::uint32_t total_sz,
 // 这是 hint 文件的「封口」操作；没封口的 hint 文件下次 open 会被
 // validate_trailer() 判失败，cask 会 fallback 到 fold(data) 重建——慢但可靠。
 std::expected<void, DataFileFault> HintFile::finalize() {
-    codec::encode_hint_eof(pending_, running_crc_);  // 追加 sentinel
-    return flush_pending();                          // 缓冲 record + sentinel 一次写
+    // S23-A1：v3 trailer（8B：magic + running CRC；CRC 覆盖 [0, size-8)）。
+    const std::size_t base = pending_.size();
+    pending_.resize(base + format::kHintTrailerV3);
+    le_store_u32(pending_.data() + base, format::kHintTrailerMagicV3);
+    le_store_u32(pending_.data() + base + 4, running_crc_);
+    return flush_pending();  // 缓冲 record + trailer 一次写
 }
 
 std::expected<void, DataFileFault> HintFile::sync() {
@@ -88,6 +108,17 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
     auto end = file_.seek(0, SEEK_END);
     if (!end) return std::unexpected(io_fault(end.error()));
     const std::uint64_t total = *end;
+
+    // S23-A1：按文件头 magic 分派 v3（变长记录流）。
+    if (total >= format::kHintHeaderV3) {
+        auto h = file_.pread(0, format::kHintHeaderV3);
+        if (!h) return std::unexpected(io_fault(h.error()));
+        if (!std::holds_alternative<io::ReadEof>(*h) &&
+            le_load_u32(std::get<io::ReadOk>(*h).data.data()) ==
+                format::kHintMagicV3) {
+            return fold_v3(total, std::move(fn));
+        }
+    }
 
     std::uint64_t offset = 0;
 
@@ -187,6 +218,82 @@ std::expected<void, DataFileFault> HintFile::fold(FoldFn fn) {
     return {};
 }
 
+// S23-A1：v3 流式 fold（变长记录：try-decode，字节不足则 refill 重试）。
+// body_end：有 trailer 时为 total-8；未封口（崩溃）文件读到 decode 短缺
+// 即停（与 v2「短读当 EOF」语义一致）。
+std::expected<void, DataFileFault>
+HintFile::fold_v3(std::uint64_t total, FoldFn fn) {
+    std::uint64_t body_end = total;
+    if (total >= format::kHintHeaderV3 + format::kHintTrailerV3) {
+        auto t = file_.pread(total - format::kHintTrailerV3, 4);
+        if (!t) return std::unexpected(io_fault(t.error()));
+        if (!std::holds_alternative<io::ReadEof>(*t) &&
+            le_load_u32(std::get<io::ReadOk>(*t).data.data()) ==
+                format::kHintTrailerMagicV3) {
+            body_end = total - format::kHintTrailerV3;
+        }
+    }
+
+    static thread_local detail::ThreadLocalBuffer buf;
+    constexpr std::size_t kChunkBytes = 256 * 1024;
+    buf.ensure(kChunkBytes);
+    std::size_t buf_pos = 0;
+    std::size_t buf_len = 0;
+
+    // refill 语义同 v2 fold（残留 memmove 到头部 + 续读一块）。
+    auto refill = [&](std::uint64_t file_off, std::size_t read_size_hint)
+        -> std::expected<std::size_t, DataFileFault> {
+        const std::size_t leftover = buf_len - buf_pos;
+        if (leftover > 0 && buf_pos > 0) {
+            std::memmove(buf.data(), buf.data() + buf_pos, leftover);
+        }
+        buf_pos = 0;
+        buf_len = leftover;
+        const std::size_t desired = buf_len + kChunkBytes;
+        const std::size_t need = std::max(desired, buf_len + read_size_hint);
+        buf.ensure(need);
+        const std::uint64_t file_remaining =
+            body_end > (file_off + buf_len) ? body_end - (file_off + buf_len)
+                                            : 0;
+        if (file_remaining == 0) return static_cast<std::size_t>(0);
+        const std::size_t to_read = static_cast<std::size_t>(
+            std::min<std::uint64_t>(buf.size() - buf_len, file_remaining));
+        if (to_read == 0) return static_cast<std::size_t>(0);
+        auto n = file_.pread_into(
+            file_off + buf_len, std::span(buf.data() + buf_len, to_read));
+        if (!n) return std::unexpected(io_fault(n.error()));
+        buf_len += *n;
+        return *n;
+    };
+
+    std::uint64_t offset = format::kHintHeaderV3;  // 跳过文件头
+    std::uint64_t prev_end = 0;
+    while (offset < body_end) {
+        const std::size_t avail = buf_len - buf_pos;
+        const std::uint64_t region_left = body_end - offset;
+        auto rec = codec::decode_hint_record_v3(
+            std::span<const std::byte>(
+                buf.data() + buf_pos,
+                static_cast<std::size_t>(
+                    std::min<std::uint64_t>(avail, region_left))),
+            prev_end);
+        if (!rec) {
+            if (rec.error() != codec::DecodeError::kBufferTooShort) {
+                return std::unexpected(DataFileFault{DataFileError::kShortRead});
+            }
+            auto r = refill(offset, /*read_size_hint=*/64);
+            if (!r) return std::unexpected(r.error());
+            if (*r == 0) break;  // 尾部截断（未封口）→ 当 EOF
+            continue;            // 重试解码
+        }
+        fn(*rec);
+        offset += rec->consumed;
+        buf_pos += rec->consumed;
+    }
+    buf.maybe_shrink();
+    return {};
+}
+
 // 单独验 trailer CRC：先读末尾的 sentinel 拿到 expected_crc，再从头流式
 // 算一遍前面所有字节的 CRC。两者一致才算 hint 文件健康，可以直接 fold；
 // 否则 caller 应该 fall back 到 fold(data_file) 重建。
@@ -194,6 +301,48 @@ std::expected<bool, DataFileFault> HintFile::validate_trailer() {
     auto end = file_.seek(0, SEEK_END);
     if (!end) return std::unexpected(io_fault(end.error()));
     const std::uint64_t total = *end;
+
+    // S23-A1：v3 分派（文件头 magic）。CRC 覆盖 [0, total-8)。
+    if (total >= format::kHintHeaderV3) {
+        auto h = file_.pread(0, format::kHintHeaderV3);
+        if (!h) return std::unexpected(io_fault(h.error()));
+        if (!std::holds_alternative<io::ReadEof>(*h) &&
+            le_load_u32(std::get<io::ReadOk>(*h).data.data()) ==
+                format::kHintMagicV3) {
+            if (total < format::kHintHeaderV3 + format::kHintTrailerV3) {
+                return false;  // 未封口
+            }
+            auto t = file_.pread(total - format::kHintTrailerV3,
+                                 format::kHintTrailerV3);
+            if (!t) return std::unexpected(io_fault(t.error()));
+            if (std::holds_alternative<io::ReadEof>(*t)) return false;
+            const auto& tb = std::get<io::ReadOk>(*t).data;
+            if (le_load_u32(tb.data()) != format::kHintTrailerMagicV3) {
+                return false;
+            }
+            const std::uint32_t expected_crc = le_load_u32(tb.data() + 4);
+            std::uint64_t remaining = total - format::kHintTrailerV3;
+            std::uint64_t off = 0;
+            std::uint32_t crc = 0;
+            constexpr std::size_t kChunk = 65536;
+            std::vector<std::byte> cbuf;
+            while (remaining > 0) {
+                const std::size_t n = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(kChunk, remaining));
+                if (cbuf.size() < n) cbuf.resize(n);
+                auto r = file_.pread_into(off, std::span(cbuf.data(), n));
+                if (!r) return std::unexpected(io_fault(r.error()));
+                const std::size_t got = *r;
+                if (got == 0) break;
+                crc = codec::crc32_update(
+                    crc, std::span<const std::byte>(cbuf.data(), got));
+                remaining -= got;
+                off += got;
+                if (got < n) break;
+            }
+            return crc == expected_crc;
+        }
+    }
     if (total < format::kHintRecordSize) return false;
 
     // 1) 先读末尾的 sentinel record 拿 expected_crc。
@@ -236,7 +385,7 @@ std::expected<bool, DataFileFault> HintFile::fold_validated(FoldFn fn) {
     auto end = file_.seek(0, SEEK_END);
     if (!end) return std::unexpected(io_fault(end.error()));
     const std::uint64_t total = *end;
-    if (total < format::kHintRecordSize) return false;
+    if (total < format::kHintHeaderV3) return false;
 
     // 整文件一次读入（单 I/O 遍 + 单 CRC 遍 + 内存解析）。
     std::vector<std::byte> buf(static_cast<std::size_t>(total));
@@ -250,6 +399,41 @@ std::expected<bool, DataFileFault> HintFile::fold_validated(FoldFn fn) {
         got_total += *r;
     }
     if (got_total < buf.size()) return false;
+
+    // S23-A1：v3 分派（文件头 magic）。CRC 覆盖 [0, size-8)。
+    if (le_load_u32(buf.data()) == format::kHintMagicV3) {
+        if (total < format::kHintHeaderV3 + format::kHintTrailerV3) {
+            return false;  // 未封口
+        }
+        const std::size_t body_end =
+            buf.size() - format::kHintTrailerV3;
+        if (le_load_u32(buf.data() + body_end) !=
+            format::kHintTrailerMagicV3) {
+            return false;
+        }
+        const std::uint32_t expected_crc =
+            le_load_u32(buf.data() + body_end + 4);
+        const std::uint32_t crc = codec::crc32(
+            std::span<const std::byte>(buf.data(), body_end));
+        if (crc != expected_crc) return false;
+
+        std::size_t off = format::kHintHeaderV3;
+        std::uint64_t prev_end = 0;
+        while (off < body_end) {
+            auto rec = codec::decode_hint_record_v3(
+                std::span<const std::byte>(buf.data() + off, body_end - off),
+                prev_end);
+            if (!rec) {
+                // CRC 已过仍解不动 = 防御性短路（不应发生）。
+                return std::unexpected(
+                    DataFileFault{DataFileError::kShortRead});
+            }
+            fn(*rec);
+            off += rec->consumed;
+        }
+        return true;
+    }
+    if (total < format::kHintRecordSize) return false;
 
     // trailer sentinel + CRC 判定（与 validate_trailer 逐字节一致）。
     const std::size_t body = buf.size() - format::kHintRecordSize;

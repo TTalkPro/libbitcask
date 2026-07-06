@@ -104,7 +104,9 @@ void TextPlugin::apply_text(std::string_view key, std::uint64_t ord,
     auto term_data = analyzer_->analyze_with_positions(text);
 
     std::uint32_t doc_len = 0;
-    std::vector<std::string> changed_terms;
+    // S21-1：借用 term_data 的 key（本函数内存活到 invalidate_terms 之后），
+    // 免每词一次 owning string 深拷。
+    std::vector<std::string_view> changed_terms;
     changed_terms.reserve(term_data.size());
     for (auto& [term, data] : term_data) {
         doc_len += data.first;
@@ -189,7 +191,18 @@ ReduceJob TextPlugin::map_analyze(
 // 步骤：① 侧表 ord_field_lens_ 记字段长 ② 各字段 add_doc 进倒排 ③ catch-all
 // 合并默认字段 ④ doc_len 回填（docmap 行本体与 meta 由宿主先落）⑤ 高亮原文
 // ⑥ 失效查询缓存。
+// S23-M4：双入口共享 impl——生产流水线（on_put 持有可变 TextPrepared::job）
+// 走非 const 版把 doc_text move 进原文 LRU（每文档省一次全文深拷）；shim/
+// 空 job 降级走 const 版，仅 doc_text 付一次拷贝，其余行为零差异。
+void TextPlugin::apply_job(ReduceJob& job) {
+    apply_job_impl(job, std::move(job.doc_text));
+}
+
 void TextPlugin::apply_job(const ReduceJob& job) {
+    apply_job_impl(job, std::string(job.doc_text));
+}
+
+void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
     // S6-P2: 空 job 守卫（prepare 抛异常时 adapter 送来空 job）。
     // key+fields 都空 = map_analyze 未产出，跳过 apply；reducer 仍推进 ord。
     if (job.key.empty() && job.fields.empty()) return;
@@ -221,12 +234,13 @@ void TextPlugin::apply_job(const ReduceJob& job) {
     // S16-2：docmap 行与 meta 由宿主（流水线）/caller（standalone・recover）
     // 先落；分析产物 doc_len 在此回填（宿主不做分析拿不到 token 数）。
     doc_len_writer_.set_doc_len(job.ord, job.total_doc_len);
-    if (!job.doc_text.empty()) {
-        doc_texts_.put(job.ord, job.doc_text);
+    if (!doc_text.empty()) {
+        doc_texts_.put(job.ord, std::move(doc_text));
     }
     // S13-P1：S9.2 选择性失效——job 已物化本文档全部词集（各字段 terms +
     // catch-all）。BM25 全局统计漂移是 S9.2 已接受的 near-real-time 近似。
-    std::vector<std::string> changed_terms;
+    // S21-1：借用 job 的 term key（job 存活覆盖本调用），免 owning 深拷。
+    std::vector<std::string_view> changed_terms;
     {
         std::size_t est = job.ca_data.size();
         for (const auto& f : job.fields) est += f.terms.size();
@@ -256,12 +270,15 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
     // S9.2：取被删文档词集做选择性失效。原文 LRU 命中则精确 analyze；
     // miss（冷文档被挤出）则降级为整缓存失效（安全但粗粒度）。
     // S13-P8.5：缓存本就为空时跳过整个「LRU 拷原文 + NFKC + 分词」。
-    std::vector<std::string> changed_terms;
+    // S21-1：changed_terms 借用 tf 的 key——tf 须提出块外，存活覆盖下方
+    // invalidate_terms 调用（块内声明会让 view 悬垂）。
+    text::TermFreqMap tf;
+    std::vector<std::string_view> changed_terms;
     bool have_terms = false;
     if (cache_.size() > 0) {
         auto text = doc_texts_.get(prior_ord);  // 拷贝(C1:并发安全)
         if (text) {
-            auto tf = analyzer_->analyze(*text);
+            tf = analyzer_->analyze(*text);
             changed_terms.reserve(tf.size());
             for (auto& [term, _] : tf) changed_terms.push_back(term);
             have_terms = true;
@@ -871,13 +888,6 @@ bool TextPlugin::apply_fields_delta(std::span<const std::byte> payload) {
     return true;
 }
 
-void TextPlugin::truncate_wal() {
-    std::shared_lock lk(fields_mu_);
-    for (auto& [_, inv] : fields_) {
-        inv->truncate_wal();
-    }
-}
-
 // ---- bm25 组件 checkpoint（bm25.ckpt 文件族；S17 格式不变）----
 
 bool TextPlugin::save_component_base(std::string_view dir,
@@ -1005,6 +1015,7 @@ TextPlugin::load_component(std::string_view dir,
     if (segments_ok && !from_prev) {
         const auto w = sc::walk_chain(
             fp, /*base_gen=*/coverage, /*base_coverage=*/coverage, chain_seq,
+            /*unbounded=*/false,
             [&](const sc::LoadedCheckpoint& dc) -> bool {
                 for (const auto& dls : dc.sections) {
                     if (!dls.crc_ok) return false;

@@ -1,6 +1,5 @@
 #include "bitcask/intersect.hpp"
 #include "bitcask/inverted.hpp"
-#include "bitcask/inverted_wal.hpp"
 #include "bitcask/myers.hpp"
 #include "bitcask/wildcard_matcher.hpp"
 #include "bitcask/bm25_kernels.hpp"
@@ -31,18 +30,16 @@ namespace bitcask::bm25 {
 // ===========================================================================
 
 auto PostingList::find(std::uint64_t ord) const -> std::size_t {
-    auto it = std::lower_bound(items.begin(), items.end(), ord,
-                               [](const Posting& p, std::uint64_t o) {
-                                   return p.ord < o;
-                               });
-    if (it != items.end() && it->ord == ord) {
-        return static_cast<std::size_t>(it - items.begin());
+    // S22-M6：直接对 SoA 的 ords 数组二分（免逐 Posting 结构跳读）。
+    auto it = std::lower_bound(ords.begin(), ords.end(), ord);
+    if (it != ords.end() && *it == ord) {
+        return static_cast<std::size_t>(it - ords.begin());
     }
-    return items.size();  // not found
+    return ords.size();  // not found
 }
 
 bool PostingList::has(std::uint64_t ord) const {
-    return find(ord) != items.size();
+    return find(ord) != ords.size();
 }
 
 namespace {
@@ -93,7 +90,7 @@ struct ScoredTerm {
 // 小顶堆 top-k」。提取单一实现，BM25 公式与「分数位级不变 / 无分支可向量化」
 // 两条不变量只此一处（避免改公式时漏改某条低频路径致评分不一致）。
 std::vector<SearchResult> score_bow_topk(
-    const std::vector<ScoredTerm>& tps, std::size_t k,
+    std::span<const ScoredTerm> tps, std::size_t k,
     std::uint64_t N, std::uint64_t sum_dl,
     const Bm25Params& params, const LiveChecker& live_checker) {
     const double avgdl =
@@ -108,12 +105,15 @@ std::vector<SearchResult> score_bow_topk(
     // 在高读并发下过度订阅）。大查询走 WAND（串行），BOW 无任何需要并行的区间，
     // 故彻底串行化。附带收益：评分浮点累加序确定（不再分片相关）。
     using Hit = std::pair<std::uint64_t, float>;
-    std::vector<Hit> hits;
+    // S23-M3：工作数组 thread_local 复用（原每查询 4 次分配 → 稳态 0）。
+    // 安全性：本函数彻底串行（T6 决策，无 TBB spawn → 无 work-stealing
+    // 重入窗口）；批量查询按线程隔离（thread_local 每 TBB worker 独立）。
+    static thread_local std::vector<Hit> hits;
+    hits.clear();
     {
-        // 工作数组提到 term 循环外复用(原实现每 term 3 次分配)。
-        std::vector<char> live;
-        std::vector<std::uint32_t> dls;
-        std::vector<float> contrib;
+        static thread_local std::vector<char> live;
+        static thread_local std::vector<std::uint32_t> dls;
+        static thread_local std::vector<float> contrib;
         for (std::size_t ti = 0; ti < tps.size(); ++ti) {
             const auto& fp = tps[ti].fp;
             const std::size_t n = fp.size();
@@ -233,19 +233,16 @@ auto PostingList::block_for_ord(std::uint64_t ord) const -> const PostingBlock* 
 }
 
 auto PostingList::block_upper_bound(float idf, const Bm25Params& params, double avgdl) const -> float {
-    if (items.empty()) return 0.0f;
+    if (ords.empty()) return 0.0f;
     // S10.9：直接读缓存的 global max_tf（note_appended 增量维护 / load 后重算），
-    // 不再每次重扫全 items。
+    // 不再每次重扫全表。
     return upper_bound_from(max_tf, idf, params, avgdl);
 }
 
 void PostingList::snapshot_flat(FlatPostings& out) const {
-    out.ords.resize(items.size());
-    out.tfs.resize(items.size());
-    for (std::size_t i = 0; i < items.size(); ++i) {
-        out.ords[i] = items[i].ord;
-        out.tfs[i]  = items[i].tf;
-    }
+    // S22-M6：SoA 后退化为整列拷贝（assign = memcpy，复用 out 容量）。
+    out.ords.assign(ords.begin(), ords.end());
+    out.tfs.assign(tfs.begin(), tfs.end());
     out.blocks = blocks;
     out.max_tf = max_tf;
 }
@@ -284,42 +281,68 @@ auto InvertedIndex::shard_for(std::string_view term) const -> const Shard& {
 // release-store false，与后续 add_doc 的 release-store true 形成 release/acquire
 // 配对——读者之后 acquire-load 必看到 false → 进入 fast path 时 vocab_ 已含
 // 该次 add_doc 新增的 key。
-auto InvertedIndex::ensure_vocab(std::size_t shard_idx) const
-    -> std::shared_ptr<const std::vector<std::string>> {
+auto InvertedIndex::ensure_vocab(std::size_t shard_idx) const -> VocabView {
     auto& shard = shards_[shard_idx];
 
     if (!shard.vocab_dirty_.load(std::memory_order_acquire)) {
         std::shared_lock rlock(shard.vocab_mtx_);
-        return shard.vocab_;
+        return {shard.vocab_, shard.vocab_extra_};
     }
 
     std::unique_lock wlock(shard.vocab_mtx_);
     // Double-check：持写锁时已 barrier 此前所有 release-store=true，relaxed
     // load 即可看到最新值；若已被并发线程重建则直接取现成快照。
     if (!shard.vocab_dirty_.load(std::memory_order_relaxed)) {
-        return shard.vocab_;
+        return {shard.vocab_, shard.vocab_extra_};
     }
 
     // S13-F6：不再遍历 shard.inverted（本函数跑在查询线程，与 reducer 的
-    // add_doc 插入并发——TBB 明确不支持遍历与插入并发）。重建 = 旧 vocab_
-    // ∪ vocab_delta_（add_doc/deserialize 对每个新 term 在 vocab_mtx_ 下
-    // 记账；term 永不从 map 删除，故并集恒等于 map 的 key 全集）。
-    std::vector<std::string> keys;
-    keys.reserve((shard.vocab_ ? shard.vocab_->size() : 0) +
-                 shard.vocab_delta_.size());
-    if (shard.vocab_) {
-        keys.insert(keys.end(), shard.vocab_->begin(), shard.vocab_->end());
+    // add_doc 插入并发——TBB 明确不支持遍历与插入并发）。key 全集 =
+    // vocab_ ∪ vocab_extra_ ∪ vocab_delta_（add_doc/apply_delta/deserialize
+    // 对每个新 term 在 vocab_mtx_ 下记账；term 永不从 map 删除）。
+    //
+    // S24-M9：重建只重排增量层（旧 extra + raw delta，O(extra+delta) 拷贝，
+    // 阈值封顶）——base 不再逐串深拷（此前每次新词后的首查询全量 O(V)）。
+    // 唯一性：is_new_term 只在 map 首插时为真 ⟹ delta ∩ (base ∪ extra) = ∅，
+    // unique() 仅防御。
+    std::vector<std::string> ex;
+    ex.reserve((shard.vocab_extra_ ? shard.vocab_extra_->size() : 0) +
+               shard.vocab_delta_.size());
+    if (shard.vocab_extra_) {
+        ex.insert(ex.end(), shard.vocab_extra_->begin(),
+                  shard.vocab_extra_->end());
     }
-    keys.insert(keys.end(),
-                std::make_move_iterator(shard.vocab_delta_.begin()),
-                std::make_move_iterator(shard.vocab_delta_.end()));
+    ex.insert(ex.end(),
+              std::make_move_iterator(shard.vocab_delta_.begin()),
+              std::make_move_iterator(shard.vocab_delta_.end()));
     shard.vocab_delta_.clear();
-    std::sort(keys.begin(), keys.end());
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    std::sort(ex.begin(), ex.end());
+    ex.erase(std::unique(ex.begin(), ex.end()), ex.end());
 
-    shard.vocab_ = std::make_shared<const std::vector<std::string>>(std::move(keys));
+    const std::size_t base_n = shard.vocab_ ? shard.vocab_->size() : 0;
+    if (!shard.vocab_ ||
+        ex.size() > std::max(kVocabExtraMergeFloor, base_n / 8)) {
+        // 无基线（首建/load 后）或增量层超阈：付一次 O(V) 归并成新基线
+        // （两有序序列 std::merge，摊还频率 O(V/阈值)）。
+        std::vector<std::string> merged;
+        merged.reserve(base_n + ex.size());
+        if (shard.vocab_) {
+            std::merge(shard.vocab_->begin(), shard.vocab_->end(),
+                       std::make_move_iterator(ex.begin()),
+                       std::make_move_iterator(ex.end()),
+                       std::back_inserter(merged));
+        } else {
+            merged = std::move(ex);
+        }
+        shard.vocab_ =
+            std::make_shared<const std::vector<std::string>>(std::move(merged));
+        shard.vocab_extra_.reset();
+    } else {
+        shard.vocab_extra_ =
+            std::make_shared<const std::vector<std::string>>(std::move(ex));
+    }
     shard.vocab_dirty_.store(false, std::memory_order_release);
-    return shard.vocab_;
+    return {shard.vocab_, shard.vocab_extra_};
 }
 
 // ---- 写 ----
@@ -348,11 +371,9 @@ void InvertedIndex::add_doc(
         const bool is_new_term = shard.inverted.insert(acc, term);  // true = 新 key
         PostingList& pl = mutable_pl(acc->second);  // P2-min：有 phrase 读者持引用时 CoW
         // S10.10：index_positions_=false 时不存 positions（省内存，短语/近邻失效）。
-        if (index_positions_) {
-            pl.items.push_back({ord, tf, doc_len, positions});
-        } else {
-            pl.items.push_back({ord, tf, doc_len, {}});
-        }
+        pl.append(ord, tf, doc_len,
+                  index_positions_ ? std::span<const std::uint32_t>(positions)
+                                   : std::span<const std::uint32_t>{});
         pl.note_appended();  // S10.6：增量封块，在线索引也吃 WAND 块跳跃
         // V6.3.1：仅当新 key 时标脏——旧 term 的 posting list 增删不影响已排序
         // 的 vocab_ 集合。
@@ -370,9 +391,6 @@ void InvertedIndex::add_doc(
     live_doc_count_.fetch_add(1, std::memory_order_relaxed);
     sum_doc_len_.fetch_add(doc_len, std::memory_order_relaxed);
 
-    // TermPositions 与 WalTermPositions 是同一类型,直接传引用,
-    // 不再为 WAL 深拷贝整个 term map(字符串 + positions 全量)。
-    if (wal_) wal_->append_add_doc(ord, term_data);
 }
 
 void InvertedIndex::remove_doc(
@@ -386,7 +404,6 @@ void InvertedIndex::remove_doc(
         sum_doc_len_.fetch_sub(doc_len, std::memory_order_relaxed);
     }
 
-    if (wal_) wal_->append_remove_doc(doc_len, term_freqs);
 }
 
 // ---- 查询 ----
@@ -407,7 +424,7 @@ auto InvertedIndex::search(
         auto& shard = shard_for(term);
         PostingMap::const_accessor acc;
         if (shard.inverted.find(acc, term)) {
-            total_postings += acc->second->items.size();
+            total_postings += acc->second->size();
         }
     }
     if (total_postings == 0) return {};
@@ -416,23 +433,29 @@ auto InvertedIndex::search(
     }
 
     // 标量路径：现在才快照。
+    // S23-M3：per-term 快照 scratch thread_local 池——原每查询每 term 新建
+    // ScoredTerm（fp.ords/tfs/blocks 3 次分配），改按下标复用内层容量，
+    // 稳态零分配。池长只增（查询词数级，个位数），超出本查询词数的池尾
+    // 槽位经 span 截断不参与评分。本路径全程串行（见 score_bow_topk 注）。
     using TermPostings = ScoredTerm;  // 共用条目（term + 扁平快照）
-    std::vector<TermPostings> tps;
-    tps.reserve(query_terms.size());
+    static thread_local std::vector<TermPostings> tps_pool;
+    std::size_t n_tps = 0;
     for (auto& term : query_terms) {
         auto& shard = shard_for(term);
         PostingMap::const_accessor acc;
         if (shard.inverted.find(acc, term)) {
-            TermPostings tp;
-            tp.term = term;
+            if (n_tps == tps_pool.size()) tps_pool.emplace_back();
+            TermPostings& tp = tps_pool[n_tps];
+            tp.term.assign(term);
             acc->second->snapshot_flat(tp.fp);
-            tps.push_back(std::move(tp));
+            ++n_tps;
         }
     }
-    if (tps.empty()) return {};
+    if (n_tps == 0) return {};
 
     // bag-of-words 评分 + top-k（共享 kernel score_bow_topk）。
-    return score_bow_topk(tps, k,
+    return score_bow_topk(std::span<const TermPostings>(tps_pool.data(), n_tps),
+                          k,
                           live_doc_count_.load(std::memory_order_relaxed),
                           sum_doc_len_.load(std::memory_order_relaxed),
                           params, live_checker);
@@ -470,10 +493,10 @@ auto InvertedIndex::explain(
         }
         const PostingList& pl = *acc->second;
 
-        // 与 search() 一致地算 live df（O3：直接读 items[].ord，免物化 ords）。
+        // 与 search() 一致地算 live df（O3：直接读 ords[]，免物化拷贝）。
         std::size_t live_df = 0;
-        for (std::size_t i = 0; i < pl.items.size(); ++i) {
-            if (live_checker.is_live(pl.items[i].ord)) ++live_df;
+        for (std::size_t i = 0; i < pl.size(); ++i) {
+            if (live_checker.is_live(pl.ords[i])) ++live_df;
         }
         ts.df = live_df;
         if (live_df == 0) { out.terms.push_back(std::move(ts)); continue; }
@@ -483,8 +506,8 @@ auto InvertedIndex::explain(
 
         // 找该 ord 的 posting 取 tf（不在该文档则 tf=0，贡献 0）。
         auto idx = pl.find(ord);
-        if (idx < pl.items.size()) {
-            ts.tf = pl.items[idx].tf;
+        if (idx < pl.size()) {
+            ts.tf = pl.tfs[idx];
             ts.tf_norm = static_cast<float>(ts.tf) * (params.k1 + 1.0F) /
                          (static_cast<float>(ts.tf) + params.k1 *
                           (1.0F - params.b + params.b *
@@ -523,20 +546,32 @@ auto InvertedIndex::search_wand(
         // max_tf/min_dl 索引时确定 → block_upper 整个查询期间不变，初始化一次算好。
         std::vector<float> block_upper_bounds;
     };
-    std::vector<TermPostings> tps;
-    tps.reserve(query_terms.size());
-
+    // S23-M3：thread_local 池复用（每 term 7 个内层 vector：fp.ords/tfs/
+    // blocks + live/dls/dls_filled/block_upper_bounds，原每查询全新分配）。
+    // WAND 主循环只经 order 索引数组排序、从不搬移/增删 tps 元素，池槽稳定；
+    // 全程串行无 TBB spawn（无 work-stealing 重入窗口）。标量字段逐一重置，
+    // block_upper_bounds 为 push_back 增长必须 clear；live/dls/dls_filled
+    // 由下方 resize+fill/assign 整段覆盖。
+    static thread_local std::vector<TermPostings> tps_pool;
+    std::size_t n_tps = 0;
     for (auto& term : query_terms) {
         auto& shard = shard_for(term);
         PostingMap::const_accessor acc;
         if (shard.inverted.find(acc, term)) {
-            TermPostings tp;
-            tp.term = term;
+            if (n_tps == tps_pool.size()) tps_pool.emplace_back();
+            TermPostings& tp = tps_pool[n_tps];
+            tp.term.assign(term);
             acc->second->snapshot_flat(tp.fp);
-            tps.push_back(std::move(tp));
+            tp.dls_all = false;
+            tp.cursor = 0;
+            tp.idf = 0.0f;
+            tp.list_upper_bound = 0.0f;
+            tp.block_upper_bounds.clear();
+            ++n_tps;
         }
     }
-    if (tps.empty()) return {};
+    if (n_tps == 0) return {};
+    const std::span<TermPostings> tps(tps_pool.data(), n_tps);
 
     auto N = live_doc_count_.load(std::memory_order_relaxed);
     auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
@@ -801,16 +836,14 @@ auto InvertedIndex::search_phrase_impl(
     // first term 的 live_df（评分公式不变）。
     std::size_t drv = 0;
     for (std::size_t t = 1; t < tps.size(); ++t) {
-        if (tps[t].pl->items.size() < tps[drv].pl->items.size()) drv = t;
+        if (tps[t].pl->size() < tps[drv].pl->size()) drv = t;
     }
     auto& cand_pl = *tps[drv].pl;
-    const std::size_t n_cand = cand_pl.items.size();
+    const std::size_t n_cand = cand_pl.size();
 
     // live/doc_len 批量取一次（Index 侧各一次锁），主循环复用（P2.1/S7-5）。
-    std::vector<std::uint64_t> cand_ords(n_cand);
-    for (std::size_t j = 0; j < n_cand; ++j) {
-        cand_ords[j] = cand_pl.items[j].ord;
-    }
+    // S22-M6：SoA 后 ords 列本身即所需数组，直接整列拷贝。
+    std::vector<std::uint64_t> cand_ords(cand_pl.ords);
     std::vector<char> cand_live(n_cand);
     live_checker.fill_is_live(cand_ords, cand_live);
     std::vector<std::uint32_t> cand_dls(n_cand);
@@ -822,10 +855,7 @@ auto InvertedIndex::search_phrase_impl(
     if (drv == 0) {
         for (char c : cand_live) live_df += static_cast<std::size_t>(c);
     } else {
-        std::vector<std::uint64_t> first_ords(first_pl.items.size());
-        for (std::size_t j = 0; j < first_ords.size(); ++j) {
-            first_ords[j] = first_pl.items[j].ord;
-        }
+        std::vector<std::uint64_t> first_ords(first_pl.ords);
         std::vector<char> first_live(first_ords.size());
         live_checker.fill_is_live(first_ords, first_live);
         for (char c : first_live) live_df += static_cast<std::size_t>(c);
@@ -838,42 +868,44 @@ auto InvertedIndex::search_phrase_impl(
     // 故 0 可作哨兵无歧义。
     auto score_one = [&](std::size_t i) -> float {
         if (!cand_live[i]) return 0.0F;
-        const auto posting_ord = cand_pl.items[i].ord;
+        const auto posting_ord = cand_pl.ords[i];
 
         // 把「在各 term 的 posting list 里定位本 doc」提到 start_pos 循环外：
         // idx 对固定 (doc, term) 不变（S9.7）。任一 term 在本 doc 不存在 →
         // 整 doc 不可能成短语，直接返回 0。
         // S13-P8.1：other_pos 改 thread_local（此前每候选一次堆分配，且在
         // tbb::parallel_for 内 → 分配器争用）。
-        thread_local std::vector<const std::vector<std::uint32_t>*> other_pos;
-        other_pos.assign(tps.size(), nullptr);
+        // S22-M6：positions 扁平化后持 span（CoW 冻结语义下读者持
+        // shared_ptr<const PostingList>，span 生命周期安全）。
+        thread_local std::vector<std::span<const std::uint32_t>> other_pos;
+        other_pos.assign(tps.size(), {});
         // 链式匹配从 term 0 的 positions 起步（驱动词只负责候选枚举）。
-        const std::vector<std::uint32_t>* anchor = nullptr;
+        std::span<const std::uint32_t> anchor;
         if (drv == 0) {
-            anchor = &cand_pl.items[i].positions;
+            anchor = cand_pl.positions(i);
         } else {
             auto idx0 = first_pl.find(posting_ord);
-            if (idx0 >= first_pl.items.size()) return 0.0F;
-            anchor = &first_pl.items[idx0].positions;
+            if (idx0 >= first_pl.size()) return 0.0F;
+            anchor = first_pl.positions(idx0);
         }
         for (std::size_t t = 1; t < tps.size(); ++t) {
             if (t == drv) {
-                other_pos[t] = &cand_pl.items[i].positions;
+                other_pos[t] = cand_pl.positions(i);
                 continue;
             }
             auto& other_pl = *tps[t].pl;
             auto idx = other_pl.find(posting_ord);
-            if (idx >= other_pl.items.size()) return 0.0F;
-            other_pos[t] = &other_pl.items[idx].positions;
+            if (idx >= other_pl.size()) return 0.0F;
+            other_pos[t] = other_pl.positions(idx);
         }
 
         std::uint32_t phrase_tf = 0;
-        for (auto start_pos : *anchor) {
+        for (auto start_pos : anchor) {
             // 有序匹配：term t 必须在 (prev, prev+1+slop] 内出现（slop=0 即精确相邻）。
             bool match = true;
             std::uint32_t prev = start_pos;
             for (std::size_t t = 1; t < tps.size(); ++t) {
-                const auto& pos_list = *other_pos[t];
+                const auto pos_list = other_pos[t];
                 const std::uint32_t lo = prev + 1;
                 const std::uint32_t hi = prev + 1 + slop;  // 闭区间上界
                 // 找 >= lo 的第一个 position。
@@ -911,7 +943,7 @@ auto InvertedIndex::search_phrase_impl(
     for (std::size_t i = 0; i < n_cand; ++i) {
         float score = cand_scores[i];
         if (score <= 0.0F) continue;  // 0 = 非短语（见 score_one 哨兵契约）
-        std::uint64_t ord = cand_pl.items[i].ord;
+        std::uint64_t ord = cand_pl.ords[i];
         if (heap.size() < k) {
             heap.push({score, ord});
         } else if (score > heap.top().first) {
@@ -989,30 +1021,40 @@ auto InvertedIndex::search_wildcard(
         std::vector<TermPostings>{},
         [&](const tbb::blocked_range<std::size_t>& range, std::vector<TermPostings> local) {
             for (std::size_t s = range.begin(); s < range.end(); ++s) {
-                auto vocab = ensure_vocab(s);
-                const auto& v = *vocab;
+                // S24-M9：两层视图（base + extra 各自有序）——层间无序不影响
+                // 结果（tps 是集合，BM25 按 term 求和顺序无关），逐层独立
+                // 二分/扫即可。base ∩ extra = ∅（is_new_term 唯一性）。
+                const auto view = ensure_vocab(s);
+                for (const auto* vp : {view.base.get(), view.extra.get()}) {
+                    if (!vp) continue;
+                    const auto& v = *vp;
 
-                // 候选区间：prefix 模式用 [lower_bound(prefix), upper_bound(prefix_upper))，
-                // 其它模式（无 prefix）用全 vocab。
-                auto begin = v.begin();
-                auto end   = v.end();
-                if (!prefix.empty()) {
-                    begin = std::lower_bound(v.begin(), v.end(), prefix);
-                    end   = std::upper_bound(v.begin(), v.end(), prefix_upper);
-                }
+                    // 候选区间：prefix 模式用 [lower_bound(prefix),
+                    // upper_bound(prefix_upper))，其它模式（无 prefix）用全层。
+                    auto begin = v.begin();
+                    auto end   = v.end();
+                    if (!prefix.empty()) {
+                        begin = std::lower_bound(v.begin(), v.end(), prefix);
+                        end   = std::upper_bound(v.begin(), v.end(),
+                                                 prefix_upper);
+                    }
 
-                // 两阶段：先在排序区间内跑 lit 预过滤 + wildcard_match 收 key；
-                // 再逐 key 经 const_accessor 取值（并发不变量见 collect_term_keys）。
-                for (auto it = begin; it != end; ++it) {
-                    const std::string& t = *it;
-                    if (!lit.empty() && t.find(lit) == std::string::npos) continue;
-                    if (!wildcard_match(pattern, t)) continue;
-                    PostingMap::const_accessor acc;
-                    if (!shards_[s].inverted.find(acc, t)) continue;
-                    TermPostings tp;
-                    tp.term = t;
-                    acc->second->snapshot_flat(tp.fp);
-                    local.push_back(std::move(tp));
+                    // 两阶段：先在排序区间内跑 lit 预过滤 + wildcard_match
+                    // 收 key；再逐 key 经 const_accessor 取值（并发不变量见
+                    // collect_term_keys）。
+                    for (auto it = begin; it != end; ++it) {
+                        const std::string& t = *it;
+                        if (!lit.empty() && t.find(lit) == std::string::npos) {
+                            continue;
+                        }
+                        if (!wildcard_match(pattern, t)) continue;
+                        PostingMap::const_accessor acc;
+                        if (!shards_[s].inverted.find(acc, t)) continue;
+                        TermPostings tp;
+                        tp.term = t;
+                        acc->second->snapshot_flat(tp.fp);
+                        local.push_back(std::move(tp));
+                    }
                 }
             }
             return local;
@@ -1049,31 +1091,36 @@ auto InvertedIndex::bool_search(
         std::vector<char> live;          // P2.1：live 批量取一次，多阶段复用
         std::vector<std::uint32_t> dls;  // P2.1：doc_len 批量取一次，评分循环复用
     };
-    // 收集一个 term 的 posting 到 dst（accessor 下拷扁平快照）。
+    // 收集一个 term 的 posting（accessor 下拷扁平快照）。
+    // S23-M3：三组 thread_local 池复用（原每查询每 term 5 个内层 vector）。
+    // 收集后三向量只读不增删（BMW 持 &must_tps[i] 指针在收集完成后取得，
+    // 池不再增长 → 指针稳定）；live/dls 由 fill_live 整段 resize+fill 覆盖
+    // （must_not 不填 dls，其池槽陈旧 dls 在 must_not 路径永不被读）。
+    // 全程串行（BMW/交并/评分均无 TBB spawn）。
     auto collect = [&](const std::string& term, bool is_must,
-                       std::vector<TermPostings>& dst) {
+                       std::vector<TermPostings>& pool, std::size_t& n) {
         auto& shard = shard_for(term);
         PostingMap::const_accessor acc;
         if (shard.inverted.find(acc, term)) {
-            TermPostings tp;
-            tp.term = term;
+            if (n == pool.size()) pool.emplace_back();
+            TermPostings& tp = pool[n];
+            tp.term.assign(term);
             acc->second->snapshot_flat(tp.fp);
             tp.is_must = is_must;
-            dst.push_back(std::move(tp));
+            ++n;
         }
     };
 
-    std::vector<TermPostings> must_tps;
-    must_tps.reserve(must_terms.size());
-    for (auto& term : must_terms) collect(term, true, must_tps);
-
-    std::vector<TermPostings> should_tps;
-    should_tps.reserve(should_terms.size());
-    for (auto& term : should_terms) collect(term, false, should_tps);
-
-    std::vector<TermPostings> must_not_tps;
-    must_not_tps.reserve(must_not_terms.size());
-    for (auto& term : must_not_terms) collect(term, false, must_not_tps);
+    static thread_local std::vector<TermPostings> must_pool;
+    static thread_local std::vector<TermPostings> should_pool;
+    static thread_local std::vector<TermPostings> not_pool;
+    std::size_t n_must = 0, n_should = 0, n_not = 0;
+    for (auto& term : must_terms) collect(term, true, must_pool, n_must);
+    for (auto& term : should_terms) collect(term, false, should_pool, n_should);
+    for (auto& term : must_not_terms) collect(term, false, not_pool, n_not);
+    const std::span<TermPostings> must_tps(must_pool.data(), n_must);
+    const std::span<TermPostings> should_tps(should_pool.data(), n_should);
+    const std::span<TermPostings> must_not_tps(not_pool.data(), n_not);
 
     // ── B1:must-only 合取 Block-Max 剪枝(设计:doc/kway-blockmax-bmw-zh.md §6)
     // top-k 驱动:K1 leapfrog 对齐候选;堆满后用块级分数上界跳过注定
@@ -1266,7 +1313,7 @@ auto InvertedIndex::bool_search(
     // 五个阶段各自逐 posting 重扫 is_live——既重复又每次一锁）。
     // must/should 进评分循环，需 doc_len 批量（with_dls）；must_not 只用 live
     // 建排除集，免去 doc_len 取数。
-    auto fill_live = [&](std::vector<TermPostings>& v, bool with_dls) {
+    auto fill_live = [&](std::span<TermPostings> v, bool with_dls) {
         for (auto& tp : v) {
             tp.live.resize(tp.fp.size());
             live_checker.fill_is_live(tp.fp.ords, tp.live);
@@ -1564,10 +1611,7 @@ auto InvertedIndex::bool_search_tree(
         PostingMap::const_accessor acc;
         if (!shard.inverted.find(acc, term)) return out;
         const PostingList& pl = *acc->second;
-        std::vector<std::uint64_t> ords(pl.items.size());
-        for (std::size_t i = 0; i < pl.items.size(); ++i) {
-            ords[i] = pl.items[i].ord;
-        }
+        std::vector<std::uint64_t> ords(pl.ords);  // S22-M6：整列拷贝
         std::vector<char> live(ords.size());
         acc.release();
         live_checker.fill_is_live(ords, live);
@@ -1690,12 +1734,9 @@ auto InvertedIndex::bool_search_tree(
         PostingMap::const_accessor acc;
         if (!shard.inverted.find(acc, st.term)) continue;
         const PostingList& pl = *acc->second;
-        ords_buf.resize(pl.items.size());
-        tfs_buf.resize(pl.items.size());
-        for (std::size_t i = 0; i < pl.items.size(); ++i) {
-            ords_buf[i] = pl.items[i].ord;
-            tfs_buf[i]  = pl.items[i].tf;
-        }
+        // S22-M6：整列 assign（memcpy，复用 buf 容量）。
+        ords_buf.assign(pl.ords.begin(), pl.ords.end());
+        tfs_buf.assign(pl.tfs.begin(), pl.tfs.end());
         acc.release();
         live_buf.resize(ords_buf.size());
         live_checker.fill_is_live(ords_buf, live_buf);
@@ -1782,8 +1823,11 @@ auto InvertedIndex::search_fuzzy(
         [&](const tbb::blocked_range<std::size_t>& range,
             std::vector<TermPostings> local) {
             for (std::size_t si = range.begin(); si < range.end(); ++si) {
-                auto vocab = ensure_vocab(si);
-                for (const auto& term : *vocab) {
+                // S24-M9：两层线性扫（编辑距离不保序，本就全扫）。
+                const auto view = ensure_vocab(si);
+                for (const auto* vp : {view.base.get(), view.extra.get()}) {
+                if (!vp) continue;
+                for (const auto& term : *vp) {
                     bool hit = false;
                     for (std::size_t qi = 0; qi < query_terms.size(); ++qi) {
                         auto& query_term = query_terms[qi];
@@ -1803,6 +1847,7 @@ auto InvertedIndex::search_fuzzy(
                     tp.term = term;
                     acc->second->snapshot_flat(tp.fp);
                     local.push_back(std::move(tp));
+                }
                 }
             }
             return local;
@@ -1843,7 +1888,7 @@ auto InvertedIndex::df(std::string_view term) const -> std::size_t {
     auto& shard = shard_for(term);
     PostingMap::const_accessor acc;
     if (!shard.inverted.find(acc, std::string(term))) return 0;
-    return acc->second->items.size();
+    return acc->second->size();
 }
 
 auto InvertedIndex::df_live(std::string_view term, const LiveChecker& live_checker) const -> std::size_t {
@@ -1851,8 +1896,8 @@ auto InvertedIndex::df_live(std::string_view term, const LiveChecker& live_check
     PostingMap::const_accessor acc;
     if (!shard.inverted.find(acc, std::string(term))) return 0;
     std::size_t count = 0;
-    for (auto& posting : acc->second->items) {
-        if (live_checker.is_live(posting.ord)) ++count;
+    for (auto ord : acc->second->ords) {
+        if (live_checker.is_live(ord)) ++count;
     }
     return count;
 }
@@ -1877,7 +1922,7 @@ std::size_t InvertedIndex::total_postings() const {
     std::size_t n = 0;
     for (const auto& shard : shards_) {
         for (auto it = shard.inverted.begin(); it != shard.inverted.end(); ++it) {
-            n += it->second->items.size();
+            n += it->second->size();
         }
     }
     return n;
@@ -1898,14 +1943,12 @@ auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_t
             PostingMap::accessor acc;
             if (!shard.inverted.find(acc, key)) continue;
             const PostingList& pl = *acc->second;
-            if (pl.items.empty()) continue;
+            if (pl.empty()) continue;
 
             // P2.4：live 批量取一次——此前死点统计与压实各自逐 posting
             // 一次带锁虚调用（大列表 = 数十万次锁）。
-            ords_buf.resize(pl.items.size());
-            for (std::size_t i = 0; i < pl.items.size(); ++i) {
-                ords_buf[i] = pl.items[i].ord;
-            }
+            // S22-M6：整列 assign。
+            ords_buf.assign(pl.ords.begin(), pl.ords.end());
             live_buf.resize(ords_buf.size());
             live_checker.fill_is_live(ords_buf, live_buf);
 
@@ -1914,11 +1957,11 @@ auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_t
                 dead += static_cast<std::size_t>(!live_buf[i]);
             }
             if (dead == 0) continue;
-            double ratio = static_cast<double>(dead) / static_cast<double>(pl.items.size());
+            double ratio = static_cast<double>(dead) / static_cast<double>(pl.size());
             if (ratio < dead_ratio_threshold) continue;
 
             // mutable_pl 可能因 phrase 读者持引用而克隆——克隆保序保内容，
-            // live_buf 与 items 的下标对齐不受影响。
+            // live_buf 与行的下标对齐不受影响。
             if (mutable_pl(acc->second).compact_flags(live_buf)) {
                 ++compacted;
             }
@@ -2059,7 +2102,7 @@ void InvertedIndex::serialize(std::vector<std::byte>& out) const {
     auto write_u8  = [&](std::uint8_t  v) { put(&v, 1); };
 
     // positions：沿用 v4+ 的 gap+VByte 压缩（u32 原始个数 + u32 压缩字节数 + 字节流）。
-    auto write_positions = [&](const std::vector<std::uint32_t>& positions) {
+    auto write_positions = [&](std::span<const std::uint32_t> positions) {
         write_u32(static_cast<std::uint32_t>(positions.size()));
         std::vector<std::uint64_t> tmp(positions.begin(), positions.end());
         auto comp = codec::gap_encode(tmp);
@@ -2100,26 +2143,21 @@ void InvertedIndex::serialize(std::vector<std::byte>& out) const {
             write_u32(tlen);
             put(term.data(), tlen);
 
-            auto pc = static_cast<std::uint32_t>(pl.items.size());
+            auto pc = static_cast<std::uint32_t>(pl.size());
             write_u32(pc);
 
             // v6：ord 改用 FOR 块压缩（128/块）。
             std::size_t ord_block_count = (pc + kBlock - 1) / kBlock;
             write_u32(static_cast<std::uint32_t>(ord_block_count));
-            // ⑭ 块间复用缓冲（容量只增）：for_encode_block 内部自 clear/assign，
-            // ords_view 每块 resize 覆盖；替代每块两次 new。
+            // ⑭ 块间复用缓冲（容量只增）：for_encode_block 内部自 clear/assign。
+            // S22-M6：SoA 后 ords 列直接按块喂编码器，免 ords_view 物化拷贝。
             std::vector<std::uint8_t> packed;
-            std::vector<std::uint64_t> ords_view;
             for (std::size_t b = 0; b < ord_block_count; ++b) {
                 std::size_t start = b * kBlock;
                 std::size_t cnt = std::min(kBlock, static_cast<std::size_t>(pc) - start);
                 std::uint64_t frame;
                 std::uint8_t  bits;
-                ords_view.resize(cnt);
-                for (std::size_t i = 0; i < cnt; ++i) {
-                    ords_view[i] = pl.items[start + i].ord;
-                }
-                for_encode_block(ords_view.data(), cnt, frame, bits, packed);
+                for_encode_block(pl.ords.data() + start, cnt, frame, bits, packed);
                 auto packed_len = static_cast<std::uint32_t>(packed.size());
                 write_u64(frame);
                 write_u8(bits);
@@ -2132,8 +2170,8 @@ void InvertedIndex::serialize(std::vector<std::byte>& out) const {
             {
                 std::vector<std::uint8_t> tf_buf;
                 tf_buf.reserve(pc);
-                for (auto& posting : pl.items) {
-                    codec::vbyte_encode(posting.tf, tf_buf);
+                for (auto tf : pl.tfs) {
+                    codec::vbyte_encode(tf, tf_buf);
                 }
                 write_u32(static_cast<std::uint32_t>(tf_buf.size()));
                 if (!tf_buf.empty()) put(tf_buf.data(), tf_buf.size());
@@ -2141,16 +2179,16 @@ void InvertedIndex::serialize(std::vector<std::byte>& out) const {
             {
                 std::vector<std::uint8_t> dl_buf;
                 dl_buf.reserve(pc);
-                for (auto& posting : pl.items) {
-                    codec::vbyte_encode(posting.dl, dl_buf);
+                for (auto dl : pl.dls) {
+                    codec::vbyte_encode(dl, dl_buf);
                 }
                 write_u32(static_cast<std::uint32_t>(dl_buf.size()));
                 if (!dl_buf.empty()) put(dl_buf.data(), dl_buf.size());
             }
 
             // positions：保持 v4+ 的逐 posting gap+VByte 格式不变。
-            for (auto& posting : pl.items) {
-                write_positions(posting.positions);
+            for (std::size_t i = 0; i < pc; ++i) {
+                write_positions(pl.positions(i));
             }
 
             // Block-Max WAND 元数据：保持 v5 结构。
@@ -2268,7 +2306,11 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
             }
 
             PostingList pl;
-            pl.items.resize(pc);
+            // S22-M6：SoA 三列直接 resize，各列分趟回填（原 items.resize 后
+            // 逐字段写，盘格式本就列式）。
+            pl.ords.resize(pc);
+            pl.tfs.resize(pc);
+            pl.dls.resize(pc);
 
             // v6：ord 走 FOR 块压缩。
             auto ord_block_count = read_u32();
@@ -2289,11 +2331,9 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
                 if (packed_len > 0 && !read_bytes(packed.data(), packed_len)) {
                     return false;
                 }
-                std::vector<std::uint64_t> ords_buf(cnt);
-                for_decode_block(frame, bits, packed.data(), cnt, ords_buf.data());
-                for (std::size_t i = 0; i < cnt; ++i) {
-                    pl.items[start + i].ord = ords_buf[i];
-                }
+                // S22-M6：直接解码进 ords 列（免 ords_buf 中转拷贝）。
+                for_decode_block(frame, bits, packed.data(), cnt,
+                                 pl.ords.data() + start);
             }
 
             // v6：TFs 整组 VByte 解码。
@@ -2307,7 +2347,7 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
                 std::size_t tf_pos = 0;
                 for (std::uint32_t p = 0; p < pc; ++p) {
                     auto [val, np] = codec::vbyte_decode(tf_buf.data(), tf_pos);
-                    pl.items[p].tf = static_cast<std::uint32_t>(val);
+                    pl.tfs[p] = static_cast<std::uint32_t>(val);
                     tf_pos = np;
                 }
                 if (tf_pos != tf_csize) { return false; }
@@ -2324,13 +2364,15 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
                 std::size_t dl_pos = 0;
                 for (std::uint32_t p = 0; p < pc; ++p) {
                     auto [val, np] = codec::vbyte_decode(dl_buf.data(), dl_pos);
-                    pl.items[p].dl = static_cast<std::uint32_t>(val);
+                    pl.dls[p] = static_cast<std::uint32_t>(val);
                     dl_pos = np;
                 }
                 if (dl_pos != dl_csize) { return false; }
             }
 
             // positions：与 v4+ 同——每 posting (u32 个数 + u32 压缩字节数 + 字节流)。
+            // S22-M6：流式灌进扁平 pos_data；pos_off 惰性——首个非空才物化
+            // （此前各条起点全 0），保持 append() 同款状态机。
             for (std::uint32_t p = 0; p < pc; ++p) {
                 auto posc = read_u32();
                 if (posc == kReadFail32 || posc > kMaxPositionsPerPosting) {
@@ -2344,9 +2386,14 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
                 }
                 auto vals = codec::gap_decode(comp);
                 if (vals.size() != posc) { return false; }
-                pl.items[p].positions.resize(posc);
-                for (std::uint32_t i = 0; i < posc; ++i) {
-                    pl.items[p].positions[i] = static_cast<std::uint32_t>(vals[i]);
+                if (posc > 0 && pl.pos_off.empty()) {
+                    pl.pos_off.assign(p + 1, 0);
+                }
+                if (!pl.pos_off.empty()) {
+                    for (std::uint32_t i = 0; i < posc; ++i) {
+                        pl.pos_data.push_back(static_cast<std::uint32_t>(vals[i]));
+                    }
+                    pl.pos_off.push_back(pl.pos_data.size());
                 }
             }
 
@@ -2368,12 +2415,12 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
             // S10.9：load 后重算缓存的 global max_tf（落盘格式不含此字段，派生量）。
             // 同时重建 add_doc 水位 = 全局最大 ord（落盘亦不含，派生量）；
             // 用 -1 哨兵区分「未索引任何」与「ord=0」。
-            for (auto& p : pl.items) {
-                if (p.tf > pl.max_tf) pl.max_tf = p.tf;
+            for (std::size_t i = 0; i < pl.size(); ++i) {
+                if (pl.tfs[i] > pl.max_tf) pl.max_tf = pl.tfs[i];
                 // load 单线程,relaxed 足够。
                 const std::uint64_t wm = max_indexed_ord_.load(std::memory_order_relaxed);
-                if (wm == static_cast<std::uint64_t>(-1) || p.ord > wm) {
-                    max_indexed_ord_.store(p.ord, std::memory_order_relaxed);
+                if (wm == static_cast<std::uint64_t>(-1) || pl.ords[i] > wm) {
+                    max_indexed_ord_.store(pl.ords[i], std::memory_order_relaxed);
                 }
             }
             // S13-F6：load 单线程（reducer 车道尚未注册），但 ensure_vocab
@@ -2419,7 +2466,7 @@ void InvertedIndex::serialize_delta(std::vector<std::byte>& out,
     };
     auto write_u32 = [&](std::uint32_t v) { put(&v, 4); };
     auto write_u64 = [&](std::uint64_t v) { put(&v, 8); };
-    auto write_positions = [&](const std::vector<std::uint32_t>& positions) {
+    auto write_positions = [&](std::span<const std::uint32_t> positions) {
         write_u32(static_cast<std::uint32_t>(positions.size()));
         std::vector<std::uint64_t> tmp(positions.begin(), positions.end());
         auto comp = codec::gap_encode(tmp);
@@ -2447,25 +2494,24 @@ void InvertedIndex::serialize_delta(std::vector<std::byte>& out,
             if (!shard.inverted.find(acc, key)) continue;
             std::shared_ptr<PostingList> plsp = acc->second;
             const PostingList& pl = *plsp;
-            if (pl.items.empty() || pl.items.back().ord < from_ord) continue;
-            // 后缀起点：第一个 ord ≥ from_ord（items 按 ord 升序）。
-            auto it = std::lower_bound(
-                pl.items.begin(), pl.items.end(), from_ord,
-                [](const Posting& a, std::uint64_t v) { return a.ord < v; });
+            if (pl.empty() || pl.ords.back() < from_ord) continue;
+            // 后缀起点：第一个 ord ≥ from_ord（ords 按升序）。
+            // S22-M6：直接对 ords 列二分。
+            auto it = std::lower_bound(pl.ords.begin(), pl.ords.end(),
+                                       from_ord);
             const auto start =
-                static_cast<std::size_t>(it - pl.items.begin());
-            const auto n = pl.items.size() - start;
+                static_cast<std::size_t>(it - pl.ords.begin());
+            const auto n = pl.size() - start;
             if (n == 0) continue;
             ++term_cnt;
             write_u32(static_cast<std::uint32_t>(key.size()));
             put(key.data(), key.size());
             write_u32(static_cast<std::uint32_t>(n));
-            for (std::size_t i = start; i < pl.items.size(); ++i) {
-                const auto& item = pl.items[i];
-                write_u64(item.ord);
-                write_u32(item.tf);
-                write_u32(item.dl);
-                write_positions(item.positions);
+            for (std::size_t i = start; i < pl.size(); ++i) {
+                write_u64(pl.ords[i]);
+                write_u32(pl.tfs[i]);
+                write_u32(pl.dls[i]);
+                write_positions(pl.positions(i));
             }
         }
     }
@@ -2535,8 +2581,8 @@ bool InvertedIndex::apply_delta(std::span<const std::byte> bytes) {
             p += csize;
             // 幂等守卫：陈旧/重叠条目（ord ≤ 列尾）拒绝——维持「按 ord
             // 升序、同 ord 不重复」不变量（陈旧 delta 误 apply 的防线）。
-            if (!pl.items.empty() && ord <= pl.items.back().ord) continue;
-            pl.items.push_back({ord, tf, dl, std::move(positions)});
+            if (!pl.empty() && ord <= pl.ords.back()) continue;
+            pl.append(ord, tf, dl, positions);
             pl.note_appended();
             if (ord > max_ord_seen) max_ord_seen = ord;
             any_item = true;
@@ -2561,33 +2607,6 @@ bool InvertedIndex::apply_delta(std::span<const std::byte> bytes) {
         }
     }
     return true;
-}
-
-void InvertedIndex::enable_wal(std::string_view path, std::size_t batch_size) {
-    wal_path_ = path;
-    wal_ = std::make_unique<InvertedWal>(path, batch_size);
-}
-
-void InvertedIndex::disable_wal() {
-    if (wal_) {
-        wal_->truncate();
-        wal_.reset();
-    }
-}
-
-void InvertedIndex::truncate_wal() {
-    if (wal_) wal_->truncate();
-}
-
-int InvertedIndex::replay_wal() {
-    if (!wal_) return 0;
-    // 重放时临时移交 WAL 所有权，避免 add_doc → wal_->append 的递归写入死循环。
-    auto saved = std::move(wal_);
-    int count = saved->replay(*this);
-    wal_ = std::move(saved);
-    // 重放完成后截断 WAL（条目已进入内存索引，不再需要）。
-    if (count >= 0) wal_->truncate();
-    return count;
 }
 
 }  // namespace bitcask::bm25
