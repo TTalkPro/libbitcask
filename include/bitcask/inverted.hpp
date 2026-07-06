@@ -54,7 +54,6 @@
 #include "bitcask/live_checker.hpp"
 #include "bitcask/query.hpp"
 #include "bitcask/vbyte.hpp"
-#include "bitcask/inverted_wal.hpp"
 
 namespace bitcask::bm25 {
 
@@ -72,57 +71,95 @@ struct PostingBlock {
     std::size_t   count;
 };
 
-// 一条 posting 记录：文档 ord + 该 term 在文档中的词频。
-struct Posting {
-    std::uint64_t ord;
-    std::uint32_t tf;
-    // 索引时 doc_len(v5 impacts;落在原 4B padding 槽,内存零增量)。
-    // 0 = 未知(旧快照载入)——封块求 min 时跳过,全 0 回退 min_dl=1。
-    std::uint32_t dl = 0;
-    std::vector<std::uint32_t> positions;
-};
+// S22-M6：posting 行已 SoA 化（见 PostingList）——原 `Posting{ord,tf,dl,
+// positions}` AoS 结构 40B/条（含 24B positions vector 头）+ 每条独立堆块，
+// 改平行数组后 16B/条（无位置）/ 24B+紧凑数据（有位置）。
 
 struct FlatPostings;  // 前向声明（定义在 PostingList 之后）
 
 // 一个 term 对应的 posting 列表，按 ord 严格升序排列、同一 ord 不重复。
 // 该不变量由 InvertedIndex::add_doc 的水位幂等保护（max_indexed_ord_）维持，
 // 是 find 二分 / note_appended 封块 / intersect_u64 求交的共同前提。
+//
+// S22-M6 SoA 布局：下标 i 对应原 items[i]，ords/tfs/dls 平行；positions
+// 扁平化为 pos_data + pos_off（第 i 条的位置 = pos_data[pos_off[i],
+// pos_off[i+1])，哨兵尾）。pos_off **惰性物化**：首个非空 positions 追加前
+// 恒 empty（index_positions=false 的库 16B/条零 positions 开销），物化后
+// size == 条数+1。落盘 v6 格式本就列式（ord 列/tf 列/dl 列分开编码），
+// SoA 是其天然内存镜像，字节零变化。
 struct PostingList {
     static constexpr std::size_t kBlockSize = 128;
 
-    std::vector<Posting> items;
+    std::vector<std::uint64_t> ords;  // 严格升序无重复
+    std::vector<std::uint32_t> tfs;
+    // 索引时 doc_len(v5 impacts)。0 = 未知(旧快照载入)——封块求 min 时
+    // 跳过,全 0 回退 min_dl=1。
+    std::vector<std::uint32_t> dls;
+    // positions 扁平存储（pos_off 用 u64：2^24 posting × 2^20 pos 理论
+    // 总量可超 u32；8B/条仍远小于原 24B vector 头 + 独立堆块）。
+    std::vector<std::uint32_t> pos_data;
+    std::vector<std::uint64_t> pos_off;
 
     // Block-Max WAND 跳跃索引（增量 seal_full_blocks + finalize 补尾块）。
-    // 注：O3 后 items[].ord 恒为 ord 的唯一事实来源；VByte 压缩只在落盘格式
-    // 里现场编码（save），内存不再常驻压缩副本。
+    // 注：O3 后 ords[] 恒为 ord 的唯一事实来源；VByte 压缩只在落盘格式
+    // 里现场编码（save），内存不再常驻压缩副本。start_idx/count 是行下标
+    // 区间，对平行数组同样成立。
     std::vector<PostingBlock> blocks;
 
-    // 全局最大 tf 缓存（S10.9）：block_upper_bound 此前每次重扫全 items 求最大 tf；
+    // 全局最大 tf 缓存（S10.9）：block_upper_bound 此前每次重扫全表求最大 tf；
     // 改为增量维护（note_appended 追加时更新，load 后重算），查询直接读。
     std::uint32_t max_tf = 0;
 
+    [[nodiscard]] std::size_t size() const noexcept { return ords.size(); }
+    [[nodiscard]] bool empty() const noexcept { return ords.empty(); }
+
+    // 第 i 条 posting 的位置区间（未物化/无位置 → 空 span）。CoW 冻结语义
+    // （读者持 shared_ptr<const PostingList>）保证 span 生命周期安全。
+    [[nodiscard]] std::span<const std::uint32_t>
+    positions(std::size_t i) const noexcept {
+        if (pos_off.empty()) return {};
+        return {pos_data.data() + pos_off[i],
+                static_cast<std::size_t>(pos_off[i + 1] - pos_off[i])};
+    }
+
+    // 唯一追加入口（收敛 add_doc/apply_delta，防平行数组漏列错位）。
+    // caller 随后照旧调 note_appended()。
+    void append(std::uint64_t ord, std::uint32_t tf, std::uint32_t dl,
+                std::span<const std::uint32_t> pos) {
+        const std::size_t idx = ords.size();
+        ords.push_back(ord);
+        tfs.push_back(tf);
+        dls.push_back(dl);
+        // 惰性物化：首个非空 positions 才建 pos_off（此前各条起点全 0）。
+        if (!pos.empty() && pos_off.empty()) pos_off.assign(idx + 1, 0);
+        if (!pos_off.empty()) {
+            pos_data.insert(pos_data.end(), pos.begin(), pos.end());
+            pos_off.push_back(pos_data.size());
+        }
+    }
+
     // 计算块元数据（含部分尾块）。幂等：重复调用重算同一结果。
     void finalize() {
-        if (items.empty()) return;
+        if (ords.empty()) return;
 
         // 计算 Block-Max WAND 元数据。S10.6：先 clear——增量封块（seal_full_blocks）
         // 可能已建若干满块，这里重建为含「部分尾块」的规范集（覆盖之），避免重复追加。
         blocks.clear();
-        if (items.size() >= kBlockSize) {
-            std::size_t n = items.size();
+        if (ords.size() >= kBlockSize) {
+            std::size_t n = ords.size();
             std::size_t block_count = (n + kBlockSize - 1) / kBlockSize;
             blocks.reserve(block_count);
             for (std::size_t b = 0; b < block_count; ++b) {
                 std::size_t start = b * kBlockSize;
                 std::size_t end = std::min(start + kBlockSize, n);
-                std::uint64_t base = items[start].ord;
-                std::uint64_t last = items[end - 1].ord;
+                std::uint64_t base = ords[start];
+                std::uint64_t last = ords[end - 1];
                 std::uint32_t blk_max_tf = 0;
                 std::uint32_t min_dl = 0xFFFFFFFF;
                 for (std::size_t i = start; i < end; ++i) {
-                    if (items[i].tf > blk_max_tf) blk_max_tf = items[i].tf;
-                    if (items[i].dl > 0 && items[i].dl < min_dl) {
-                        min_dl = items[i].dl;
+                    if (tfs[i] > blk_max_tf) blk_max_tf = tfs[i];
+                    if (dls[i] > 0 && dls[i] < min_dl) {
+                        min_dl = dls[i];
                     }
                 }
                 if (min_dl == 0xFFFFFFFF) min_dl = 1;  // dl 全未知 → 回退
@@ -136,19 +173,19 @@ struct PostingList {
     // 不变量：增量阶段 blocks 仅含满块（count==kBlockSize）；部分尾块只由 finalize 产生。
     void seal_full_blocks() {
         std::size_t sealed = blocks.size() * kBlockSize;
-        while (items.size() - sealed >= kBlockSize) {
+        while (ords.size() - sealed >= kBlockSize) {
             std::size_t start = sealed;
             std::size_t end = start + kBlockSize;
             std::uint32_t blk_max_tf = 0;
             std::uint32_t min_dl = 0xFFFFFFFF;
             for (std::size_t i = start; i < end; ++i) {
-                if (items[i].tf > blk_max_tf) blk_max_tf = items[i].tf;
-                if (items[i].dl > 0 && items[i].dl < min_dl) {
-                    min_dl = items[i].dl;
+                if (tfs[i] > blk_max_tf) blk_max_tf = tfs[i];
+                if (dls[i] > 0 && dls[i] < min_dl) {
+                    min_dl = dls[i];
                 }
             }
             if (min_dl == 0xFFFFFFFF) min_dl = 1;
-            blocks.push_back({items[start].ord, items[end - 1].ord, blk_max_tf,
+            blocks.push_back({ords[start], ords[end - 1], blk_max_tf,
                               min_dl, start, kBlockSize});
             sealed += kBlockSize;
         }
@@ -157,7 +194,7 @@ struct PostingList {
     // add_doc 追加一条 posting 后调用（S10.6）：让在线索引也具备 WAND 块跳跃。
     void note_appended() {
         // S10.9：增量维护全局 max_tf（新 posting 必在末尾）。
-        if (!items.empty() && items.back().tf > max_tf) max_tf = items.back().tf;
+        if (!tfs.empty() && tfs.back() > max_tf) max_tf = tfs.back();
         // finalize 可能留下不满的尾块；增量封块要求 blocks 仅含满块，先弹掉它。
         if (!blocks.empty() && blocks.back().count < kBlockSize) {
             blocks.pop_back();
@@ -166,23 +203,50 @@ struct PostingList {
     }
 
     // 死点压实（S10.11）：删除 live 标志为 0 的 posting，重建派生态。
-    // items 原本按 ord 升序，过滤保序 → 压实后仍有序。返回是否实际删了。
+    // 行原本按 ord 升序，过滤保序 → 压实后仍有序。返回是否实际删了。
     // 分数无关：live_df/idf/avgdl 都只数 live，压实只是不再扫死点。
-    // P2.4：flags 版本——live 与 items 按下标对齐（批量 fill_is_live 产物，
+    // P2.4：flags 版本——live 与行按下标对齐（批量 fill_is_live 产物，
     // 免每 posting 一次带锁虚调用）。
+    // S22-M6：SoA 原地双指针压实；positions 显式搬移 + pos_off 重写（每轮
+    // 迭代先读 pos_off[i]/[i+1] 再写 pos_off[w]，w ≤ i 保证读写不冲突）。
     bool compact_flags(std::span<const char> live) {
-        std::vector<Posting> kept;
-        kept.reserve(items.size());
-        for (std::size_t i = 0; i < items.size(); ++i) {
-            if (live[i]) kept.push_back(std::move(items[i]));
+        const std::size_t n = ords.size();
+        const bool have_pos = !pos_off.empty();
+        std::size_t w = 0;
+        std::uint64_t wpos = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!live[i]) continue;
+            if (have_pos) {
+                const std::uint64_t b = pos_off[i], e = pos_off[i + 1];
+                if (wpos != b) {
+                    std::copy(pos_data.begin() + static_cast<std::ptrdiff_t>(b),
+                              pos_data.begin() + static_cast<std::ptrdiff_t>(e),
+                              pos_data.begin() + static_cast<std::ptrdiff_t>(wpos));
+                }
+                pos_off[w] = wpos;
+                wpos += e - b;
+            }
+            if (w != i) {
+                ords[w] = ords[i];
+                tfs[w]  = tfs[i];
+                dls[w]  = dls[i];
+            }
+            ++w;
         }
-        if (kept.size() == items.size()) return false;  // 无死点，不动
-        items = std::move(kept);
+        if (w == n) return false;  // 无死点，不动
+        ords.resize(w);
+        tfs.resize(w);
+        dls.resize(w);
+        if (have_pos) {
+            pos_off[w] = wpos;  // 哨兵
+            pos_off.resize(w + 1);
+            pos_data.resize(static_cast<std::size_t>(wpos));
+        }
         // 重建派生态（blocks/max_tf）。
         blocks.clear();
         max_tf = 0;
-        for (auto& p : items) {
-            if (p.tf > max_tf) max_tf = p.tf;
+        for (auto tf : tfs) {
+            if (tf > max_tf) max_tf = tf;
         }
         seal_full_blocks();  // 仅封满块（与增量一致，尾部留给后续 finalize）
         return true;
@@ -385,14 +449,6 @@ public:
     auto compact(const LiveChecker& live_checker, double dead_ratio_threshold = 0.5)
         -> std::size_t;
 
-    // WAL 支持（S8.9）：启用后 add_doc/remove_doc 自动追加到 WAL 文件。
-    // V6.2：batch_size>1 时积攒 entries 缓冲后批量 fwrite+fflush。
-    void enable_wal(std::string_view path, std::size_t batch_size = 1);
-    void disable_wal();
-    void truncate_wal();
-    bool has_wal() const { return wal_ != nullptr; }
-    int replay_wal();
-
     // 内部分片结构（公开用于测试）。
     // P2-min：map 值为 shared_ptr<PostingList>（CoW 发布，见 inverted.cpp
     // mutable_pl）。phrase/near 读者持引用零拷贝读；写者 use_count==1 时
@@ -417,6 +473,9 @@ public:
         // 该不变量是本设计的前提）。
         mutable std::shared_mutex vocab_mtx_;
         mutable std::shared_ptr<const std::vector<std::string>> vocab_;
+        // S24-M9：排序增量层（base 之上、raw delta 之下）——重建时只重排
+        // 这一层，base 不再逐串深拷。发布协议同 vocab_（shared_ptr 换指针）。
+        mutable std::shared_ptr<const std::vector<std::string>> vocab_extra_;
         mutable std::vector<std::string> vocab_delta_;  // 由 vocab_mtx_ 保护
         mutable std::atomic<bool> vocab_dirty_{true};
     };
@@ -453,10 +512,6 @@ private:
     // atomic:worker 线程写,搜索线程经 max_indexed_ord() 读,跨线程访问。
     std::atomic<std::uint64_t> max_indexed_ord_{static_cast<std::uint64_t>(-1)};
 
-    // WAL（S8.9）。
-    std::unique_ptr<InvertedWal> wal_;
-    std::string wal_path_;
-
     // Block-Max WAND 算法。
     auto search_wand(
         const std::vector<std::string>& query_terms,
@@ -474,8 +529,20 @@ private:
         const Bm25Params* params_override) const -> std::vector<SearchResult>;
 
     // V6.3.1：确保指定 shard 的排序词典可用。脏则重建（写锁），否则直接返回快照（读锁）。
-    auto ensure_vocab(std::size_t shard_idx) const
-        -> std::shared_ptr<const std::vector<std::string>>;
+    // S24-M9：两层视图——base（大基线，重建时**不再拷贝**）+ extra（排序
+    // 增量层，重建只拷 O(extra+delta)，阈值封顶）。base ∪ extra = key 全集
+    // （集合语义；wildcard/fuzzy 消费顺序无关，两层各自独立扫/二分）。
+    struct VocabView {
+        std::shared_ptr<const std::vector<std::string>> base;   // 可空
+        std::shared_ptr<const std::vector<std::string>> extra;  // 可空
+    };
+    auto ensure_vocab(std::size_t shard_idx) const -> VocabView;
+
+private:
+    // S24-M9：增量层并入基线的阈值——extra 超过 max(1024, base/8) 时付一次
+    // O(V) 合并（摊还频率 O(V/阈值)）；此前**每次**有新词后的首查询都全量
+    // 深拷 vocab_（高写入负载下反复 O(V) string 拷贝）。
+    static constexpr std::size_t kVocabExtraMergeFloor = 1024;
 };
 
 }  // namespace bitcask::bm25

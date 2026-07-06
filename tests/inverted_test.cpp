@@ -978,8 +978,11 @@ TEST(InvertedIndex, IndexPositionsDisabled) {
         auto& shard = idx.shard_for("quick");
         InvertedIndex::PostingMap::const_accessor acc;
         ASSERT_TRUE(shard.inverted.find(acc, "quick"));
-        for (auto& p : acc->second->items) {
-            EXPECT_TRUE(p.positions.empty());
+        // S22-M6：SoA 后无位置 = pos_data/pos_off 恒空（惰性未物化）。
+        EXPECT_TRUE(acc->second->pos_data.empty());
+        EXPECT_TRUE(acc->second->pos_off.empty());
+        for (std::size_t i = 0; i < acc->second->size(); ++i) {
+            EXPECT_TRUE(acc->second->positions(i).empty());
         }
     }
 
@@ -1107,15 +1110,15 @@ TEST(InvertedIndex, CowClonesWhenReaderHoldsReference) {
         ASSERT_TRUE(idx.shard_for("hot").inverted.find(acc, "hot"));
         held = acc->second;
     }
-    ASSERT_EQ(held->items.size(), 1u);
+    ASSERT_EQ(held->size(), 1u);
 
     // 写者追加同 term → CoW：held 冻结，索引换新对象。
     idx.add_doc(1, {{"hot", tp(1, {0})}});
-    EXPECT_EQ(held->items.size(), 1u);  // 读者视图不变
+    EXPECT_EQ(held->size(), 1u);        // 读者视图不变
     {
         InvertedIndex::PostingMap::const_accessor acc;
         ASSERT_TRUE(idx.shard_for("hot").inverted.find(acc, "hot"));
-        EXPECT_EQ(acc->second->items.size(), 2u);   // 索引侧已更新
+        EXPECT_EQ(acc->second->size(), 2u);         // 索引侧已更新
         EXPECT_NE(acc->second.get(), held.get());   // 确实是克隆出的新对象
     }
 
@@ -1132,7 +1135,7 @@ TEST(InvertedIndex, CowClonesWhenReaderHoldsReference) {
         InvertedIndex::PostingMap::const_accessor acc;
         ASSERT_TRUE(idx.shard_for("hot").inverted.find(acc, "hot"));
         EXPECT_EQ(acc->second.get(), before);       // 同一对象（原地追加）
-        EXPECT_EQ(acc->second->items.size(), 3u);
+        EXPECT_EQ(acc->second->size(), 3u);
     }
 }
 
