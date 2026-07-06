@@ -2770,3 +2770,253 @@ W4 ✅（parallel_scan 并行全表扫描）。
     失败为**既知预存项 ThreadCountIndependent**」——印证 S20-8 对该 TSan 失败
     「先例、非本批回归」的判定。
   - 文档-only，不涉编译/ABI。
+
+- [x] **S20-2 补：walk_chain `chain_seq==0` 语义修正（对抗性审查发现的真 bug）** — 已完成（2026-07-04）
+  - **背景**：S20 收官后对「行为零变化」做对抗性等价审查（我 + 2 个独立
+    审查代理逐处比对 pre-S20 基线 5fca39a），在最高风险的 R2 walk_chain 发现
+    一处**真实等价性破坏**。其余全部重构（walk_chain 另 5 核对点、FlushResult
+    多态回执含 dim==0/空日志/失败边界、R1/R4/R6/R7/B-B1/B-C1）确认逐字节等价。
+  - **bug**：`walk_chain` 用 `bounded = chain_seq != 0` 从计数推断有界性——
+    `chain_seq==0` 被当作**无界扫盘**。但三个有界调用点（text/vector/docmap
+    load_component）改前是 `for s=1; s<=chain_seq`，`chain_seq==0` 时**零迭代**；
+    而 base-only 组件（0 已提交 delta）与新库的 committed chain_seq 恒为 0。
+  - **危害**：delta `.d<seq>` 先写盘、manifest 最后提交（唯一 commit 点）。
+    崩溃于「写完 .d1、提交 manifest 之前」的窗口，或 write_manifest 失败
+    （ENOSPC）→ 盘上残留 manifest 未记录的 orphan .d1。恢复时改前零迭代
+    正确忽略，改后无界扫盘 → orphan .d1 kDeltaInfo 恰过校验 → **重放未提交
+    delta**，覆盖水位越过 committed：插件端 → 健康检查失败触发无谓全量
+    rebase；docmap 端 → orphan 行/删除经 keydir hook 灌入活 keydir（幽灵条目）。
+  - **545 未捕获原因**：正常 base-only 盘上无 .d 文件（remove_chain_files
+    已清），走不到分歧；bug 仅在 crash 窗口的特定盘上残留态现形——无既有
+    测试构造该态。
+  - **修复**：walk_chain 加显式 `bool unbounded` 参数（不再从 chain_seq==0
+    推断）。text/vector/docmap 传 `false`（有界，chain_seq==0 → 零迭代），
+    legacy/shim 传 `true`（无界）。
+  - **回归测试**：`TextPlugin.OrphanDeltaNotReplayedWhenChainSeqZero`——构造
+    base(wm=1, committed chain_seq=0) + orphan .d1(wm=2)，断言载入覆盖水位停
+    在 1、orphan 文档不进索引。**临时还原 buggy 逻辑验证：bug 版失败、修复
+    版通过**。
+  - 验收：Debug **546/546**（545 + 新回归）、TSan checkpoint/recovery/plugin
+    **122/122**；不改磁盘格式与 C ABI。
+
+---
+
+## S21 批次：结构 / 存储 / 内存三轴优化（2026-07-06）
+
+> 来源：用户指令「继续优化：①结构不合理处 ②存储结构 ③内存使用效率（不引入
+> 额外内存分配器）」。两个独立审计代理全库扫描（内存效率 12 靶点、存储/结构
+> A×7+B×7 靶点），已对照历史批次去重；按 ROI 择优落地如下。
+
+- [x] **S21-1a Index 常驻内存收缩（DocSlot 40→24B + meta_blobs_ 惰性化）** — 已完成
+  - `DocLoc` 重排 `{offset,file_id,total_sz}` 消 8B padding（24→16B）；`DocSlot`
+    去掉 ord 死重字段（原注释自证「仅 get() 返回时填充」），`get()` 改返回
+    `DocHit : DocSlot`（聚合继承，`slot->ord/loc/tstamp` 消费点全部无感）。
+    每 ord 常驻 40→24B（slots 数组 −40%，每 chunk 2.5MB→1.5MB）。
+  - 全部 `DocLoc{}` 构造点改 **designated initializer**——位置式聚合初始化在
+    字段重排下会静默错位（`DocLoc{1,100,50}` 三个字面量可无警告编译成错值）。
+  - `meta_blobs_` 惰性化：首个非空 `set_meta` 前不随 ord 增长——无 meta 部署
+    零常驻（改前每 ord 白付 24B 空 vector 头，千万 ord = 240MB）。读路径经
+    `ord >= size()` 门禁天然空 blob 语义，启用后与 live_ 同步跟平。
+  - `static_assert(sizeof)` 锁定布局；serialize/deserialize_docmap 逐字段
+    读写，磁盘格式不变。
+- [x] **S21-1b VectorPlugin delta 插入日志平行数组化** — 已完成
+  - `delta_vecs_`（`vector<pair<u64,vector<float>>>`）拆 `delta_ords_` +
+    `delta_data_`（dim 步长紧凑拼接）。每向量写入 −1 次堆分配，窗口常驻
+    −(24B 头 + malloc 圆整)/条。kHnswDelta 段序列化字节不变。
+- [x] **S21-1c 缓存失效路径 term 零拷贝** — 已完成
+  - `invalidate_terms` 收 `span<const string_view>`（借用 caller 的 term 存储），
+    `term_index_` 换 StringHash 透明查找。三个调用点（apply_text/apply_job/
+    on_delete）原每写/删一篇文档把全部词深拷成 owning string 只为一次交集
+    判定。on_delete 的 `tf` 提出块外保证 view 生命周期覆盖 invalidate 调用。
+- [x] **S21-1d 注释漂移订正**：data record header「14 字节」→ kHeaderSize=23（3 处）。
+- [x] **S21-2 A4 checkpoint 落盘补 fdatasync** — 已完成
+  - `SearchCheckpoint::write` 与 `KeyDir::save_snapshot` rename 前 fdatasync
+    （对齐 write_manifest）。manifest 是唯一 commit 点且自带目录 fsync，但组件
+    数据页不落盘的话，断电后 manifest 已提交而组件 CRC 坏 → 整组件退全量
+    fold——checkpoint 的启动加速在断电场景整体失效。flush 低频，成本可忽略。
+- [x] **S21-2 A3 keydir 快照 v2（entries 块 vbyte）** — 已完成
+  - kSnapVersion 1→2：klen/file_id/total_sz/offset/epoch/ord 换 vbyte，tstamp
+    保持定宽 4B（unix 秒级时间戳 vbyte 需 5B 反而更大）。~38B/条 → 典型
+    15-20B/条，GB 级快照读写 I/O 近半。读端 v1/v2 双分支；快照可重建，零迁移。
+  - 回归：`KeyDirSnapshot.V2RoundTrip` + `V1CompatRead`（写端已恒写 v2，v1 读
+    分支无自然覆盖 → 手工构造 v1 字节流防回归）。
+- [x] **S21-2 A2 docmap 行编码 v2（gap+vbyte）** — 已完成
+  - base：BCIS sidecar 版本 1→2，行 `[gap vbyte ord][vbyte klen][ext][vbyte
+    file_id/offset/total_sz][u32 tstamp][vbyte doc_len]`，34B 定宽 → 典型
+    12-15B/行。delta：新段型 `kDocmapDeltaV2`(=13) 同款编码，30B → ~10-12B/行。
+    gap 用 u64 二补数回绕（`prev + (v−prev) ≡ v`），正确性不依赖升序。
+  - **降级安全论证**：旧二进制对未知**段型**是「静默忽略」而非链断——若只加
+    段型不升文件版本，降级后 v2 delta 的行被丢弃且水位照常推进（数据洞）。
+    故 v2 delta 文件头写 **file version 2**（`SearchCheckpoint::write` 加
+    version 参数；读端 1/2 双收），旧读端整文件拒收 → 链断退 fold（安全慢）。
+    base 侧 BCIS version 不符本就拒收退 fold，无需升文件版本。
+  - 回归：`Index.SidecarV2RoundTrip` + `SidecarV1CompatRead`（手工 v1 字节流）；
+    `cask_docvalue_test` 段型断言 kDocD 10→13。
+- [x] **S21-3 B3 delta 段集应用骨架去重** — 已完成
+  - docmap_ckpt / legacy_ckpt 两处 `apply_delta_file` 的「全段 CRC 预检 +
+    rows/rems/meta 收集 + hook 收尾一次性透传」逐字节同构（S20-2 收敛解析后
+    残留），抽 `index::apply_delta_sections` 模板骨架，两侧只留段分发 switch。
+    不变量（坏段整 delta 拒绝、hook 恰好一次）收敛单点。行为零变化。
+  - 顺带：search_checkpoint.hpp 补缺失的 `<memory>`（曾靠传递包含掩盖）。
+- [x] **S21-3 B1 cask.cpp 物理拆分** — 已完成
+  - 3441 行按功能域**纯平移**拆四份：cask.cpp 2300（open/close/写路径/get/
+    checkpoint/merge/backup 留守）+ cask_iter.cpp 240（CaskIter 全族）+
+    cask_search.cpp 250（search 门面）+ cask_recovery.cpp 656（upgrade/
+    replay_delta_to_keydir/migrate_legacy_search_ckpt/load_keydir_from_disk/
+    load_recovery_snapshots）。类与 API 不变（≠ 已搁置的 P2-a 拆类）。
+  - 跨 TU 共用助手抽 src/cask/cask_internal.hpp（内部头，不进 include/）：
+    5 个 ckpt 文件名常量 + io_fault/err/now_sec_default/bytes_to_view/
+    component_of_plugin（anon/static → inline，函数体不动）。单 TU 助手
+    （writer lock 族、DocmapRelocator）留守 cask.cpp 匿名 namespace。
+  - **纯度核验**：脚本比对 git HEAD 版 cask.cpp——每个搬移段在新 TU 逐字节
+    原样出现，唯一非原文行是 cask.cpp 的 `#include "cask_internal.hpp"` 与
+    内部头的 `inline` 前缀。
+  - 收益：最大 TU 3441→2300 行，增量编译与导航双收；恢复域/查询门面各自
+    独立演进。
+
+### S21 挂账（审计已确认、本批未做）
+
+- [x] **S21-M6 PostingList AoS→SoA** — **已完成（S22，2026-07-06）**，见下方 S22 段。
+- [x] **S21-M3 BM25 查询期 per-term 快照 scratch 复用** — **已完成（S23）**，见下方 S23 段。
+- [x] **S21-M4 索引写路径 move 化** — **已完成（S23，positions 半边被 M6 SoA 吸收）**，见下方 S23 段。
+- [x] **S21-M7 fold/scan key 快照扁平化** — **已完成（S24）**，见下方 S24 段。
+- [x] **S21-M9 ensure_vocab 增量化** — **已完成（S24，两层视图半）**；view 化
+  消双份常驻（TBB 节点稳定性验证）仍挂账，见下方 S24 段。
+- [ ] **S21-M10 ord_field_lens_ 单字段文档跳过登记**（~80-100B/文档，删除
+  统计语义需对拍测试）。
+- [x] **S21-A1 hint record 格式 vbyte 化** — **已完成（S23，实现为 gap 差分而非纯推导）**，见下方 S23 段。
+- [ ] **S21-A6 sealed-mmap 可信读跳 CRC**（opt-in，先 bench 定量）。
+- [x] **S21-B2 inverted_wal 退役** — **用户拍板删除，已完成（S22，2026-07-06）**，见下方 S22 段。
+- [~] **S21-B4 tests/support shim 渐进收缩** — **首批已完成（S24）**：
+  wildcard/fuzzy/highlighter 15 例迁 TextPlugin 直连，锁定 9→6；余量
+  inverted/synonym/searcher/checkpoint_recovery/cask_docvalue/
+  search_layer_test，见下方 S24 段。
+- [ ] **S21-B6/B7 低优先**：cask.hpp 前置声明化（收益仅 C API TU）；sidecar
+  I/O 统一走 io 层 whole-file helper。
+- **P3 维持暂留**（nfkc_fold view 化，lifetime 复杂收益边际）；**S13-M4 维持
+  信息级**（fstats_ 收缩需扩展 RCU 发布协议，增长极慢不值当）。
+
+
+---
+
+## S22 批次：M6 PostingList SoA + B2 WAL 退役（2026-07-06）
+
+- [x] **S22-B2 inverted_wal 正式退役（用户拍板删除）**
+  - `enable_wal` 生产零调用（仅 tests/bench 直用）；bm25 增量持久化自 S14-4
+    起由 delta 链承担。删 inverted_wal.{cpp,hpp}（465 行）+ 13 例测试；剥
+    InvertedIndex 的 wal_ 成员/五方法/两写入钩子；删 TextPlugin::truncate_wal
+    包装、shim 调用点、bench BM_Wal_AppendOnly。若需断电增量能力，以 git
+    历史 inverted_wal.* 为底重新接线（search_config.hpp 注释已记）。
+  - 验收：Debug 537/537（550−13 WAL 例）、Release(LTO+bench) 构建绿。
+- [x] **S22-M6 PostingList AoS→SoA（倒排最大常驻结构）**
+  - 前置：测绘代理全库扫描确认——无 memcpy/指针算术/span<Posting> 连续布局
+    假设；v6 落盘本就列式（ord FOR 块/tf 组/dl 组分开），SoA 是其天然内存
+    镜像，**字节零变化**；唯一深度 AoS 依赖是 phrase 路径持
+    `vector<u32>*`（改 span，CoW 冻结语义保生命周期）。
+  - 布局：`ords/tfs/dls` 平行数组 + positions 扁平化（pos_data + pos_off
+    u64 哨兵尾，惰性物化——index_positions=false 恒空）。40B/条 + 每条独立
+    positions 堆块 → **16B/条（无位置，−60%）/ 24B+紧凑数据（有位置）**；
+    千万 posting 级库常驻省数百 MB；CoW 克隆 N+1 次堆分配 → 6 次。
+  - 关键点：`append()` 唯一追加入口防漏列错位；`compact_flags` 原地双指针
+    压实（每轮先读 pos_off[i]/[i+1] 再写 [w]，w≤i 无冲突）；find/
+    serialize_delta 改对 ords 列直接二分；snapshot_flat 退化整列 assign；
+    serialize 免 ords_view 物化；bm25_kernels/intersect_u64/FlatPostings
+    消费面零改动。
+  - 验收：Debug **537/537**、TSan 并发子集（CoW/phrase/并发查询）**91/91**
+    零 race、Release bench 全跑通。落盘格式与 C ABI 不变。
+  - 后续演进方向（挂账）：snapshot_flat 的整列拷贝可再演进为 CoW 零拷贝共享
+    （FlatPostings 持 shared_ptr 列引用）；S21-M3 的 per-term 快照 scratch
+    复用与此正交，仍在挂账单。
+
+
+---
+
+## S23 批次：M3 查询 scratch 池 + M4 写路径 move + A1 hint v3（2026-07-06）
+
+- [x] **S23-M3 BM25 查询期 per-term 快照 scratch thread_local 池化**
+  - search 标量/WAND/bool_search 三路径的 per-term 快照容器（3-7 个内层
+    vector/term）改 thread_local 池按下标复用；score_bow_topk 改收 span +
+    内部 hits/live/dls/contrib 同池化。稳态查询零堆分配。
+  - **安全性论证**：三路径全程串行（BOW 经 T6 决策、WAND/BMW 无 TBB
+    spawn）→ 无 work-stealing 重入窗口；批量查询按 TBB worker 线程隔离。
+    复用槽重置清单：block_upper_bounds（push_back 增长）必须 clear；
+    live/dls/dls_filled 由 resize+fill/assign 整段覆盖；must_not 槽的陈旧
+    dls 永不被读。WAND 经 order 索引数组排序不搬元素、bool BMW 指针在池
+    停增后取得——池槽地址稳定。
+  - **实测**（Release 同机对比）：QueryThroughputBOW 1 线程 −24%
+    （9.2→7.0µs）、**16 线程 −81%**（95→18µs，分配器争用即多线程瓶颈）；
+    SearchHotTerm −15%；BoolMustHot −23%。
+- [x] **S23-M4 apply_job 双入口（doc_text move 进原文 LRU）**
+  - 生产 on_put（持可变 TextPrepared::job）走 `apply_job(ReduceJob&)`
+    move doc_text；shim/降级走 const 版（仅 doc_text 一次拷贝）。共享
+    apply_job_impl。每文档省一次全文深拷。原审计的 positions move 半边
+    已被 S22-M6 SoA 吸收（span 拷入扁平数组，无 per-term malloc）。
+- [x] **S23-A1 hint 文件格式 v3（18B 定宽/条 → 典型 8-9B，−50%+）**
+  - 布局（format.hpp）：magic "BCH3" + `[vbyte gap][vbyte total_sz]
+    [vbyte keysz<<1|tomb][tstamp u32][key]` + 8B trailer（"BCHE"+CRC 覆盖
+    [0,size-8)）。**offset 存 gap 差分**而非纯前缀和推导——连续追加恒
+    0（1B），u64 二补数回绕保证正确性不依赖连续性假设。tstamp 保持定宽
+    （unix 秒级 vbyte 5B 反而更大）。
+  - 兼容：写端恒 v3（cask/merge/migrate 三写点全经 HintFile）；读端三入口
+    按文件头 magic 双分派；v2 与 magic 撞值概率 ~2^-32 且后果仅 CRC 失败
+    退 fold(data)。hint 可重建零迁移，旧文件 merge/roll 后自然消亡。
+  - 测试：v3 golden 字节锁定（43B vs v2 同载荷 79B）+ gap≠0 + u64 回绕 +
+    逐字节截断 + v2 兼容读三入口 + 未封口拒收；writer golden 换代 v3。
+  - 收益：keydir 启动重建 hint I/O 近半。
+- 验收：Debug **544/544**（537+7 新测试）、TSan 子集 **251/251** 零 race、
+  Release(LTO+bench) 绿且 bench 实测收益如上。
+
+
+---
+
+## S24 批次：M7 key 快照扁平化 + M9 vocab 增量化 + B4 shim 收缩首批（2026-07-06）
+
+- [x] **S24-M7 fold/scan key 快照扁平化**
+  - keydir `keys_snapshot_`（vector<string>）→ `keys_buf_`（单一拼接）+
+    `key_offs_`（N+1 哨兵）；两遍构建（先精确字节和 reserve 再拼接），
+    `next()` 按 string_view 切片消费（entries 透明查找）；release
+    shrink_to_fit 不留常驻。`CaskIter::drain_live_keys` 同款 →
+    `FlatKeys{buf, offs}`，parallel_scan 经 `operator[]` span 消费。
+  - 收益：每快照分配 N+1 → 2、峰值内存约减半（每 key 省 32B 头 + malloc）；
+    fold/merge/backup/parallel_scan 都在此路径上。
+- [x] **S24-M9 ensure_vocab 增量化（两层视图）**
+  - `VocabView{base, extra}`：base 大基线重建不拷；extra 排序增量层，重建
+    只重排旧 extra ∪ raw delta（O(extra+delta)，阈值封顶）；extra 超
+    max(1024, base/8) 才付一次 O(V) `std::merge` 并入基线（摊还 O(V/阈值)）。
+    唯一性由 is_new_term（map 首插恰一次）保证 delta ∩ (base∪extra)=∅。
+  - 消费方：wildcard 两层各自独立二分区间、fuzzy 两层线性扫——层间无序
+    不影响结果（集合语义 + BM25 按 term 求和）。发布协议（vocab_dirty_
+    acquire/release + shared_ptr 换指针）不变。
+  - **仍挂账（M9 后半）**：词典字符串双份常驻（vocab_ 与 TBB map key）的
+    view 化——需先验证 oneTBB concurrent_hash_map rehash 的节点地址稳定性。
+- [x] **S24-B4 shim 收缩首批（15 例迁 TextPlugin 直连）**
+  - wildcard 4 + fuzzy 3 + highlighter 8，断言集逐条不变；驱动层
+    on_write → put_doc+apply_text（host_put_row 同构），双参 on_delete →
+    host_delete 逐行复刻；analyzer 配置逐一核对等价；CMake 三目标
+    shim → bitcask_text_plugin。**shim 锁定 9→6**。
+  - **余量核实（S24 续）**：审计所称 9 个锁定中，inverted/searcher/
+    checkpoint_recovery/cask_docvalue 实为只用公开 SearchLayerConfig
+    （S19 已解耦）——非真实锁定。synonym_test 已迁（5 例 TextHost 直连）。
+    真实锁定 9 → **1**：仅剩 search_layer_test（shim 自测）。
+  - **留守判定**：shim + search_layer_test 保留至 legacy_ckpt 退役（P6+）
+    ——它是 legacy 统一 search.ckpt 的唯一写端夹具，并以 legacy 输入覆盖
+    生产共享解码（apply_docmap_delta_section/walk_chain）；届时 shim
+    1038 行 + 测试 922 行一并删除。B4 至此**实质收官**。
+- 验收：Debug **544/544**（组合树两次独立全量）+ TSan 子集 **93/93**
+  零 race + Release(LTO+bench) 构建绿。
+
+### S24 尾：三 sanitizer 全量正确性验证（2026-07-06）
+
+- **Debug 全量 544/544**；**TSan 全量 543/544**——唯一失败
+  `IndexPoolMultiLib.ThreadCountIndependentOfLibCount` 为既知预存项
+  （S15 era 已记录「git stash 后未改动 HEAD 同样失败」，S20-8 复核同判）。
+- **ASan+UBSan 全量 543/543**（本机**首次**跑该组合；新建 build-asan 树，
+  address,undefined）。首跑揪出 6 个失败，全部 blame 定性为**预存 UB**
+  （非 S21-24 引入）并已修复：
+  - 生产：GetResultView 向量字节 misaligned float* 解引（加对齐守卫，
+    未对齐拷入拥有缓冲）；
+  - 测试：sv_bytes(临时 string) 存 span 悬垂 ×2 类（helper 改
+    string_view + 具名化 3 处）。
+- 已知豁免：c_api_test 在 ASan 树链接失败（C 驱动缺 UBSan C++ runtime，
+  临时树基建项，CI 矩阵/Debug 树覆盖该测试）；TSan 预存项如上。
+- **结论：S21-S24 全部 26 个 commit 在三 sanitizer 下零回归。**

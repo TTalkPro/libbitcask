@@ -12,6 +12,80 @@
 
 ## [Unreleased]
 
+### Changed（S24：key 快照扁平化 + vocab 增量化 + shim 收缩首批，2026-07-06）
+
+- **fold/scan key 快照扁平化**：keydir 迭代快照与 `drain_live_keys` 从
+  逐 key 堆分配（百万 key = N 次 malloc + 32B/头）改单缓冲 + 偏移哨兵，
+  每快照恒 2 次分配、峰值内存约减半（fold/merge/backup/parallel_scan
+  同路径受益）。
+- **ensure_vocab 增量化**：两层视图（基线 + 排序增量层），有新词后的
+  首查询重建从全量 O(V) string 深拷降为 O(extra+delta)（阈值封顶，超阈
+  一次 std::merge 摊还并入）；wildcard/fuzzy 两层独立二分/线性扫，结果
+  集合不变。
+- **测试 shim 收缩（实质收官）**：wildcard/fuzzy/highlighter/synonym
+  20 例迁 TextPlugin 直连（断言逐条不变）；核实其余 4 个"锁定"实为公开
+  配置类型误报。shim 锁定 9→**1**（自测 search_layer_test，作为 legacy
+  ckpt 写端夹具留守至 legacy_ckpt 退役）。
+- 验收：Debug 544/544、TSan 子集 93/93、Release(LTO) 绿。
+
+### Changed（S23：查询 scratch 池 + 写路径 move + hint v3，2026-07-06）
+
+- **BM25 查询稳态零分配**：search 标量/WAND/bool_search 的 per-term 快照
+  scratch（3-7 vector/term）thread_local 池化。实测 BOW 吞吐 1 线程
+  −24%、**16 线程 −81%**（分配器争用即多线程瓶颈）；热词查询 −15%。
+- **写路径 doc_text move**：apply_job 双入口，生产流水线免每文档一次全文
+  深拷。
+- **hint 文件格式 v3**：18B 定宽/条 → 典型 8-9B（magic 文件头 + vbyte +
+  offset gap 差分 + 8B trailer）。keydir 启动重建 hint I/O 近半；读端
+  v2/v3 双分派，hint 可重建零迁移。golden 测试换代 + v2 兼容读锁定。
+- 验收：Debug 544/544、TSan 251/251、Release bench 实测如上。
+
+### Changed（S22：PostingList SoA + WAL 退役，2026-07-06）
+
+- **PostingList AoS→SoA**（倒排索引最大常驻结构）：`Posting{ord,tf,dl,
+  positions}` 40B/条 + 每条独立 positions 堆块 → 平行数组 `ords/tfs/dls`
+  + 扁平 `pos_data/pos_off`（惰性物化）。无位置库 **16B/条（−60%）**、
+  有位置库 24B/条 + 紧凑数据；千万 posting 级库常驻省数百 MB；CoW 克隆
+  N+1 次堆分配 → 6 次。phrase/near 持针改 span。**落盘 v6/delta 格式
+  字节零变化**（盘上本就列式）。Debug 537/537 + TSan 91/91 + bench 全绿。
+- **Removed：inverted_wal（用户拍板退役）**——`enable_wal` 生产零调用，
+  增量持久化由 S14-4 delta 链承担；删模块（465 行）+ 13 例测试 + 全部
+  钩子。需要时以 git 历史为底重新接线。
+
+### Changed（S21：结构 / 存储 / 内存三轴优化，2026-07-06）
+
+- **内存（不引入额外分配器）**：
+  - `DocSlot` 40→24B（`DocLoc` 重排消 padding 24→16B + 去 ord 死重字段，
+    `get()` 改返回 `DocHit : DocSlot` 聚合继承，消费点无感）；每 chunk
+    slots 数组 2.5MB→1.5MB。全部 `DocLoc{}` 构造点改 designated
+    initializer（防字段重排下位置式初始化静默错位）。
+  - `meta_blobs_` 惰性化：无 meta 部署零常驻（改前每 ord 24B 空 vector 头，
+    千万 ord = 240MB）。
+  - `VectorPlugin` delta 插入日志平行数组化（每向量写入 −1 次堆分配）；
+    `SearchCache::invalidate_terms` 收 `span<string_view>`（每写/删一篇文档
+    省全词集 owning 深拷）。
+- **存储**：
+  - `SearchCheckpoint::write` / `KeyDir::save_snapshot` rename 前补
+    **fdatasync**——断电后 manifest 已提交而组件页丢失 → CRC 坏 → 退全量
+    fold，checkpoint 启动加速失效；现为保证而非运气。
+  - keydir 快照 **v2**（entries 块 vbyte，~38B→15-20B/条，快照 I/O 近半）；
+    docmap 行编码 **v2**（BCIS v2 + 段型 `kDocmapDeltaV2` gap+vbyte，
+    34B→12-15B/行）。读端全部双版本兼容；**v2 delta 文件头版本升 2**——
+    旧二进制对未知段型静默忽略会造成数据洞，版本拒收使其安全退 fold。
+    回归测试含手工构造的 v1 字节流（v1 读分支无自然覆盖）。
+- **结构**：
+  - **cask.cpp 物理拆分**（纯平移，类与 API 不变）：3441→2300 行，切出
+    cask_iter.cpp（CaskIter）/ cask_search.cpp（搜索门面）/
+    cask_recovery.cpp（升级迁移 + keydir/快照恢复）+ cask_internal.hpp
+    （跨 TU 共用助手内部头）。逐字节纯度经脚本核验。
+  - docmap_ckpt / legacy_ckpt 两处 `apply_delta_file` 的 CRC 预检 + hook
+    收尾骨架去重为 `index::apply_delta_sections`（不变量收敛单点）。
+  - data record header 注释漂移订正（14B→kHeaderSize=23，3 处）；
+    search_checkpoint.hpp 补缺失 `<memory>`。
+- 验收：Debug **550/550**（546 + 4 个新格式回归）+ TSan checkpoint/并发
+  子集 **131/131** + Release(LTO) 构建绿；磁盘格式变更均为可重建文件
+  （快照/checkpoint），零迁移成本。
+
 ### Changed（S19：插件化架构 P5 — 门面收编与 shim 退役，2026-07-04）
 
 - **查询门面换代**：新增 `bitcask/searcher.hpp`——`text::Searcher` /
@@ -106,6 +180,23 @@
 - 全程行为零变化：Debug 545/545 全绿、TSan 544/544（排除 1 先例
   ThreadCountIndependentOfLibCount 不兼容）、C ABI `nm -D` 与基线
   逐符号一致、磁盘格式逐字节不变。
+
+### Fixed（S20）
+
+- **walk_chain `chain_seq==0` 语义修正（S20-2 补，对抗性等价审查发现）**：
+  `walk_chain`（R2 抽出的链走读）用 `bounded = chain_seq != 0` 从计数推断
+  有界性，把 `chain_seq==0` 当作**无界扫盘**——与三个有界调用点（text/
+  vector/docmap `load_component`）的合法输入冲突：base-only 组件（0 已提交
+  delta）与新库的 committed `chain_seq` 恒为 0，改前是零迭代。**危害**：delta
+  先写盘、manifest 最后提交；崩溃于「写完 .d1、提交 manifest 之前」窗口或
+  `write_manifest` 失败（ENOSPC）时盘上残留 manifest 未记录的 orphan .d1，
+  改后无界扫盘会**重放该未提交 delta**（插件端触发无谓全量 rebase，docmap
+  端 orphan 行/删除灌入活 keydir）。修复：加显式 `bool unbounded` 参数
+  （text/vector/docmap 传 false 有界、legacy/shim 传 true 无界），不再从
+  `chain_seq==0` 推断。回归测试 `TextPlugin.OrphanDeltaNotReplayedWhenChainSeqZero`
+  （bug 版失败、修复版通过）。**注**：磁盘格式与 C ABI 不变；正常路径
+  （base-only 盘上无 .d 文件）本就无分歧，故 545 套件未触发——bug 仅在
+  crash 窗口的特定盘上残留态现形。Debug 546/546、TSan 122/122（checkpoint 子集）。
 
 
 
