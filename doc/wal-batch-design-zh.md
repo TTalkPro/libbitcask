@@ -1,159 +1,313 @@
-# WAL 批量 flush 设计（V6.2）
+# 批量 flush 设计（当前代码版）
 
-> 状态：已实施（V6.2.2–V6.2.4）。默认 batch_size=1（零风险），隔离微基准 2.1x 提速。
+本文档描述 libbitcask **当前** 代码中所有「批量缓冲 + 一次落盘」的路径，
+并把原 V6.2 文档里描述的 `InvertedWal::seal_and_write` 批量改造标注为
+**已退役**——`InvertedWal` 模块已在 S22 拍板删除（CHANGELOG `Removed`
+段，2026-07-06），`enable_wal` / `wal_batch_size` 配置管道整体摘除。
 
-## 1. 问题
+---
 
-`InvertedWal` 每条 `append_add_doc` / `append_remove_doc` 调用都执行
-`fwrite + fflush`。`fflush` 强制 OS buffer 刷到内核 page cache，单次约 1–3μs。
-高写入场景（批量索引重建、大量 `put`）下，逐条 fflush 是吞吐瓶颈。
+## 1. 现状速览
 
-**目标**：缓冲 N 条 entry 到内存 batch_buf，一次 `fwrite` 写出全部，一次
-`fflush` 刷盘。`batch_size` 可配，默认=1（等价当前行为）。
+| 路径 | 触发场景 | 缓冲粒度 | 单次落盘单元 | 文件 |
+|------|----------|----------|-------------|------|
+| data file 块写 | `Cask::put_batch`、merge 输出 | `DataFile::batch_buf_`（≥ `kBatchFlushBytes`） | 一次 `pwrite(2)` | `include/bitcask/data_file.hpp` / `src/fileops/data_file.cpp` |
+| data file 组提交 | `Cask::maybe_group_commit` | `writes_since_sync_` 计数 | `fsync(2)`（fsync 不缓冲，仅触发落盘） | `src/cask/cask.cpp::Cask::maybe_group_commit` |
+| 索引任务队列 | `Cask::put` / `put_doc` / `put_batch` / `remove` → 异步索引 | `tbb::concurrent_bounded_queue<IndexTask>`（容量 10240） | reducer 单线程 apply | `include/bitcask/thread_pool.hpp` / `src/keydir/key_pool.cpp` |
+| ~~InvertedWal 批量 flush~~ | ~~`append_add_doc` / `append_remove_doc` 缓冲 N 条再写~~ | — | — | **已退役**（见 §2） |
 
-## 2. 设计
+---
 
-### 2.1 帧格式不变
+## 2. InvertedWal 批量 flush（V6.2 设计，已退役）
 
-现有 O11 framing `[4B len][payload][4B crc32]` 保持不变。批量模式下，
-多条 framed entry 拼接在 `batch_buf_` 中，一次 `fwrite` 写出整块。
-replay 侧逐条解析，不感知批量边界。
+**状态**：S22 用户拍板删除；模块文件 `inverted_wal.{cpp,hpp}`（465 行）
++ 13 例测试 + 全部钩子已摘除，理由：
 
+- `enable_wal` 生产零调用 —— S14-4 之后 delta 链已经承担增量持久化，
+  维护「WAL + 全量 ckpt」双轨没收益。
+- 测试夹具不依赖（inverted_wal_test 跟着删）。
+- 落盘字节层已被 data file 吞掉（data file 本身已是带 ord 的全量 WAL，
+  bm25 重新打 WAL 等于把同一笔写两遍）。
+
+代码中无残留：
+
+```bash
+$ grep -rn 'class InvertedWal\|InvertedWal(' src/ include/
+# 无匹配
 ```
-batch_buf_ layout (batch_size=3):
-┌──────────────┬──────────────┬──────────────┐
-│ entry 0 完整 │ entry 1 完整 │ entry 2 完整 │
-│ [len][pl][crc]│ [len][pl][crc]│ [len][pl][crc]│
-└──────────────┴──────────────┴──────────────┘
-         ↕ 一次 fwrite + 一次 fflush
-```
 
-### 2.2 InvertedWal 新增字段
+唯一相关的是 `search_config.hpp` 与本目录历史文档里提及的「以 git 历史
+`inverted_wal.*` 为底重新接线」注释。S22 设计备忘见 `TASK.md` §22-B2。
+
+### 2.1 V6.2 历史设计要点（供 git 历史 / 重新接线时参考）
+
+原 V6.2 提出的方案（详见 git 历史 / 本文档旧版）：
+
+- 帧格式不变：现有 `[4B len][payload][4B crc32]` O11 framing，多条
+  framed entry 拼在 `batch_buf_`，一次 `fwrite` 写出整块，`replay`
+  侧逐条解析，不感知批量边界。
+- 阈值：`batch_size` 可配，默认 1（等价旧行为）。
+- 崩溃窗口：`batch_size = 1` 不丢；`batch_size = N > 1` 最多丢 N-1 条；
+  已 `fflush` 的 entry 一定持久化；不丢「已持久化但未 replay」的 entry
+  语义。
+- 安全性：`batch_buf_` 中的 entry 尚未进入 WAL 持久化边界 → 对应文档
+  不会出现在倒排中 → 与数据文件中记录一致（data file 与 WAL 是同一 put
+  调用链，crash 前 data file 的 fwrite 也可能丢失），不降低系统级一致性。
+
+这些要点在 S22 退役时已被 delta 链吸收。
+
+---
+
+## 3. 当前批量路径一：data file 块写
+
+符号：`include/bitcask/data_file.hpp::DataFile::write_buffered` /
+`DataFile::flush_batch` / `DataFile::kBatchFlushBytes`
+
+### 3.1 常量
+
+| 常量 | 值 | 位置 |
+|------|----|------|
+| `DataFile::kBatchFlushBytes` | `1u << 20`（1 MiB） | `include/bitcask/data_file.hpp` |
+
+### 3.2 接口
 
 ```cpp
-class InvertedWal {
-    // ... 现有字段 ...
-    std::vector<std::uint8_t> batch_buf_;   // 批量缓冲（复用容量）
-    std::size_t batch_count_ = 0;           // 当前 batch 已缓冲条数
-    std::size_t batch_size_  = 1;           // 配置：每 batch 最多多少条
+class DataFile {
+    // 累积缓冲：编码后的 record 追加到 batch_buf_，
+    // 累计 ≥ kBatchFlushBytes 才触发一次 pwrite。
+    // 返回的 offset 是逻辑偏移（含未落盘缓冲），确定性不依赖落盘时机。
+    std::expected<WriteResult, DataFileFault>
+    write_buffered(RecordType type, uint32_t tstamp, uint64_t ord,
+                   span<const std::byte> key, span<const std::byte> value);
+
+    // 把 batch_buf_ 里尚未落盘的字节一次 pwrite 到磁盘并清空。
+    std::expected<void, DataFileFault> flush_batch();
+
+private:
+    std::vector<std::byte> batch_buf_;
+    static constexpr std::size_t kBatchFlushBytes = 1u << 20;
 };
 ```
 
-### 2.3 构造函数签名变更
+约束（`data_file.hpp` 注释）：
+
+- **仅用于「flush（+按策略 sync）之后才被 caller 采信」的场景**：
+  merge 输出、`put_batch`（flush 后才 apply keydir）。
+- **单条 `put` 不可用本 API** —— WAL 语义要求每条立即 pwrite（详见
+  `data_file.hpp::write_buffered` 注释 ⑪ 否决记录）。
+- `flush_batch()` 空缓冲是 no-op；`write()` 路径从不缓冲，调本函数恒
+  为 no-op。
+- `sync()` 内部已兜底调用 `flush_batch()`。
+
+### 3.3 调用方
+
+| 调用方 | 时机 | 持久化 |
+|--------|------|--------|
+| `Cask::put_batch` | 每条 record 入 `batch_buf_`；批末尾 `flush_batch()` | 批的提交点（见 §4） |
+| `merge`（`Merger::run_merge`） | merge 输出累积 | merge 收尾统一 sync |
+
+### 3.4 `Cask::put_batch` 的批量持久化
+
+符号：`src/cask/cask.cpp::Cask::put_batch`
+
+批的提交流程（关键路径）：
+
+```
+1. 全批前置校验（key / value 大小）         ← 校验失败零副作用
+2. roll_active_if_needed(about)
+   race 检查 (file_id < biggest) → roll_active()
+3. for each item:
+     ord = keydir_->alloc_ord()
+     encode_doc_value(encoded, {.text=value})
+     active_data_->write_buffered(kDoc, tstamp, ord, key, encoded)
+4. active_data_->flush_batch()               ← 批的提交点
+5. !opts_.o_sync && opts_.sync_every_n > 0:
+     active_data_->sync()                    ← fdatasync，整批视作一次组提交
+     writes_since_sync_ = 0
+6. for each item:
+     active_hint_->write(tstamp, total_size, offset, tomb=false, key)
+7. for each item:
+     keydir_->put(...)                       ← keydir apply 在 flush 之后
+     kAlreadyExists → 单条 write_and_keydir 重写（内部 roll + 重试）
+8. flush_adds() 锁外：submit_index_task(IndexOp::Add)
+```
+
+durability 与单条 put 的 sync 策略对齐：
+
+- `o_sync`：fd 是 O_DSYNC，`write_buffered` 的 pwrite 即 durable；
+- `sync_every_n > 0`：整批视作一次组提交，立即 `fdatasync`；
+- 其余（`sync_every_n == 0`）：与单条 put 相同，由 caller 的 `sync()`
+  控制。
+
+批语义契约：
+
+- **成功 ⟹ 整批已写入且全部可见**（keydir apply 在 flush 之后，本进程
+  内 all-or-nothing）。
+- **失败 ⟹ 整批在本进程内不可见**（keydir 未动）。磁盘上可能残留批的
+  前缀（每条 record 独立自洽，崩溃重启 fold 后可见）——与连续单条 put
+  崩溃语义一致；本 API 不提供跨崩溃的原子性。
+
+详见 [`put-flow-zh.md` §8](./put-flow-zh.md)。
+
+---
+
+## 4. 当前批量路径二：data file 组提交
+
+符号：`src/cask/cask.cpp::Cask::maybe_group_commit`
+
+P4 单写者组提交：`put` / `put_doc` / `remove` 每次写后调用。
 
 ```cpp
-explicit InvertedWal(std::string_view path, std::size_t batch_size = 1);
+std::expected<void, CaskFault> Cask::maybe_group_commit(bool force = false) {
+    if (opts_.o_sync || opts_.sync_every_n == 0 || !active_data_) return {};
+    if (!force) ++writes_since_sync_;
+    const bool flush_now =
+        force ? (writes_since_sync_ > 0)
+              : (writes_since_sync_ >= opts_.sync_every_n);
+    if (!flush_now) return {};
+    if (auto r = active_data_->sync(); !r) return unexpected(io_fault(...));
+    writes_since_sync_ = 0;
+    return {};
+}
 ```
 
-`batch_size = 1`：每次 append 立即 `fwrite + fflush`（当前行为）。
-`batch_size > 1`：缓冲到 batch_buf_，满后一次性 `fwrite + fflush`。
+`CaskOptions::sync_every_n` 默认 0（关闭）；`o_sync` 默认 false。
+组提交只对 **active data file** 调 fsync；hint 不在此 fsync（可由
+`fold(data)` 重建，崩溃回退）。`force = true` 用于 `roll_active()` /
+`put_batch` 重写路径的尾批落盘。
 
-### 2.4 seal_and_write 改造
+写路径单线程（库内 `write_mu_` 串行化），`writes_since_sync_` 无需原子
+计数。
+
+---
+
+## 5. 当前批量路径三：异步索引任务队列
+
+符号：`include/bitcask/thread_pool.hpp::IndexTaskQueue` /
+`IndexPool::submit` / `IndexOp`
+
+异步索引流水线本身就是一个批量背压系统：生产者（写路径）入队，消费者
+（map worker × N + reducer × 1）按 ord 序串行 apply。
+
+### 5.1 队列容量
+
+| 常量 | 值 | 位置 |
+|------|----|------|
+| `IndexTaskQueue` 默认 capacity | `10240` | `include/bitcask/thread_pool.hpp` |
+| 队列实现 | `tbb::concurrent_bounded_queue<IndexTask>` | 同上 |
+
+`concurrent_bounded_queue` 在 `push` 满时阻塞生产者 → 写路径在索引管
+线堵时自然背压，无需额外信号量。
+
+### 5.2 任务类型
 
 ```cpp
-void InvertedWal::seal_and_write() {
-    // --- 封口（不变）---
-    const auto payload_len = enc_buf_.size() - kWalLenPrefix;
-    const auto len32 = static_cast<std::uint32_t>(payload_len);
-    std::memcpy(enc_buf_.data(), &len32, kWalLenPrefix);
-    const auto crc = crc_of(enc_buf_.data() + kWalLenPrefix, payload_len);
-    put_u32(enc_buf_, crc);
-
-    if (batch_size_ <= 1) {
-        // 即时模式：逐条 fwrite + fflush（当前行为）
-        std::fwrite(enc_buf_.data(), 1, enc_buf_.size(), file_);
-        std::fflush(file_);
-        return;
-    }
-
-    // 批量模式：追加到 batch_buf_
-    batch_buf_.insert(batch_buf_.end(), enc_buf_.begin(), enc_buf_.end());
-    ++batch_count_;
-    if (batch_count_ >= batch_size_) {
-        flush_batch();
-    }
-}
-
-void InvertedWal::flush_batch() {
-    if (batch_buf_.empty() || !file_) return;
-    std::fwrite(batch_buf_.data(), 1, batch_buf_.size(), file_);
-    std::fflush(file_);
-    batch_buf_.clear();
-    batch_count_ = 0;
-}
+enum class IndexOp : uint8_t {
+    Add,        // 记录写入（map 各插件 prepare，reduce 广播 on_put）
+    Delete,     // 记录删除（reduce 广播 on_delete）
+    Skip,       // S6-P1：ord 空洞填充
+    RunFn,      // S13-F6：reducer 内执行任意回调
+    Sentinel,   // 停止信号
+};
 ```
 
-### 2.5 析构函数
-
-析构时必须 flush 剩余 batch，否则未刷盘的 entry 丢失：
-
-```cpp
-InvertedWal::~InvertedWal() {
-    if (file_) {
-        flush_batch();  // 刷残余
-        std::fclose(file_);
-    }
-}
-```
-
-### 2.6 truncate() 改造
-
-清空文件前先清 batch_buf_：
-
-```cpp
-bool InvertedWal::truncate() {
-    batch_buf_.clear();
-    batch_count_ = 0;
-    // ... 现有 reopen "wb" 逻辑 ...
-}
-```
-
-### 2.7 replay() 不变
-
-replay 逐条读取 `[4B len][payload][4B crc]`，不感知写入时是否批量。
-CRC 校验 + 截断至 last_good 的逻辑完全复用。
-
-## 3. 崩溃窗口分析
-
-| batch_size | 崩溃时丢失 | 说明 |
-|------------|-----------|------|
-| 1（当前） | 0 条 | 每条 fflush，崩溃不丢 |
-| N > 1 | ≤ N-1 条 | 未 flush 的 batch_buf_ 内容丢失 |
-
-**不变量保持**：已 `fflush` 的 entry 一定持久化。replay 的 CRC 校验会
-自动截断半条 entry。batch 模式下丢失的是「缓冲中尚未写出的 entry」，
-等价于这些 entry 从未 append 过——语义上与「put 尚未到达 WAL」一致。
-
-**安全性**：batch_buf_ 中的 entry 尚未进入 WAL 持久化边界。崩溃恢复时
-replay 看不到它们 → 对应文档不会出现在倒排索引中 → 与数据文件中的记录
-一致（data file 写入和 WAL 写入是同一个 put 调用链，crash 前 data file
-的 fwrite 也可能丢失）。因此 batch WAL 不降低系统级一致性。
-
-## 4. 配置管道
+### 5.3 流水线
 
 ```
-CaskOptions
-  └→ SearchLayerConfig
-       └→ wal_batch_size (新增字段, 默认=1)
-            └→ SearchLayer::enable_wal(path, batch_size)
-                 └→ InvertedIndex::enable_wal(path, batch_size)
-                      └→ InvertedWal(path, batch_size)
+写线程                IndexTaskQueue            N 个 map worker         reducer
+──┬────────────  ────────────────────  ────────────────────────  ──────────
+  │submit(Add) → →bounded_queue →     prepare_index_task(task) → reorder
+  │                capacity=10240       (TextPlugin + VectorPlugin  buffer
+  │                                       并行 prepare)         按 ord 序
+  │                                                                   │
+  │                                                              on_put
+  │                                                          (TextPlugin +
+  │                                                           VectorPlugin)
+  │                                                                   ↓
+  │                                                              apply 完成
 ```
 
-`batch_size=1` 时行为完全等价当前，零风险默认。
+- `prepare_index_task`：N 个 map worker 并行调（注册序闭包），每条
+  IndexTask 产出 `plugin::PreparedPtr`（Text 切词 + BM25 posting +
+  Vector 量化）。
+- per-lane reorder buffer：按 `ord` 排序（保证 reducer 按写序 apply，
+  与 `ord` 单调递增不变量一致）。
+- reducer：单线程串行 apply，调用 `TextPlugin::on_put` 与
+  `VectorPlugin::on_put`。
+- 失败语义：worker 抛异常 → `on_index_worker_error()` 自增
+  `index_errors` 计数，`status()` 暴露；写入仍成功（put 已持久化）。
+- 可见性：`Cask::flush_index()` / `Cask::drain_plugins()` 排空在途任务
+  → 查询前 read-your-writes 屏障。
 
-## 5. 子任务拆分
+完整设计见 [`async-index-pipeline.md`](../docs/design/async-index-pipeline.md)。
 
-| # | 内容 | 依赖 |
-|---|------|------|
-| V6.2.1 | 设计文档（本文档） | — |
-| V6.2.2 | InvertedWal 批量缓冲实现 + 配置管道 | V6.2.1 |
-| V6.2.3 | CrashRecoveryBatched 测试 | V6.2.2 |
-| V6.2.4 | 基准 BM_Put_WalBatch：batch_size=64 目标 > 2× throughput | V6.2.2 |
+---
 
-## 6. 不做的事
+## 6. 批量 flush 阈值常量汇总
 
-- **不做异步 flush 线程**——batch flush 仍同步（append 到 N 条后同步 flush），
-  异步引入线程安全复杂度，归入 V7+
-- **不做 WAL 跨线程 group-commit**——WAL 非线程安全，caller 串行化
-- **不改 replay 逻辑**——帧格式不变，replay 完全复用
+| 常量 | 值 | 位置 | 触发 |
+|------|----|------|------|
+| `DataFile::kBatchFlushBytes` | `1u << 20`（1 MiB） | `include/bitcask/data_file.hpp` | data file `batch_buf_` 累积 ≥ 1 MiB 触发一次 pwrite |
+| `CaskOptions::sync_every_n` | `0`（默认） | `include/bitcask/cask.hpp` | 累计 N 次写后 `maybe_group_commit` 对 active data fsync |
+| `IndexTaskQueue::capacity` | `10240` | `include/bitcask/thread_pool.hpp` | 索引任务队列 bounded 上限；满则生产者背压 |
+
+**注**：`inverted.hpp` / `inverted.cpp` 内**不存在**任何 `kBatchFlushThreshold`
+之类常量 —— 旧 V6.2 文档里的 `InvertedWal::batch_buf_` / `batch_count_`
+字段及对应阈值随模块退役已移除。`InvertedIndex::add_doc` / `remove_doc`
+当前直接入内存 posting 列表，无中间缓冲层。
+
+---
+
+## 7. 崩溃窗口与一致性
+
+| 路径 | 崩溃时丢失 | 系统级一致性 |
+|------|-----------|--------------|
+| data file 块写（`write_buffered`） | `batch_buf_` 中未 `flush_batch()` 的字节 | 不变 —— flush 前的 record 对应 keydir 也未 apply |
+| data file 组提交（`maybe_group_commit`） | 自上次 fsync 以来的写入（默认下 fsync 关闭，丢失整段 page cache） | 同上 |
+| 索引任务队列 | reducer 未 apply 的 task | 索引滞后于数据文件；下次 `drain_plugins` / `flush_index` 可见 |
+| ~~InvertedWal 批量 flush~~ | ~~batch_buf 中未 flush 的 entry~~ | **已退役**；S14-4 delta 链取代 |
+
+---
+
+## 8. 配置管道
+
+| 配置 | 路径 | 默认 | 备注 |
+|------|------|------|------|
+| `CaskOptions::max_file_size` | `cask.hpp` | `2 GiB` | active file 软上限；`put_batch` 巨批可突破 |
+| `CaskOptions::o_sync` | `cask.hpp` | `false` | O_SYNC 打开 fd |
+| `CaskOptions::sync_every_n` | `cask.hpp` | `0`（关闭） | 组提交触发频率 |
+| `IndexPool::queue_capacity` | `thread_pool.hpp` | `10240` | 异步索引队列容量 |
+| ~~`SearchLayerConfig::wal_batch_size`~~ | — | — | **已退役**（V6.2 引入，S22 删除） |
+
+`wal_batch_size` 字段在 V6.2 引入但「生产零调用」（CHANGELOG S22-B2），
+与 `SearchLayerConfig::enable_wal` / `InvertedWal` 一起退役。
+
+---
+
+## 9. 不做的事
+
+- **不做异步 flush 线程** —— data file `flush_batch` 仍同步（`put_batch`
+  写满 1 MiB 或批末尾同步 flush）；索引任务的 apply 已由 IndexPool
+  reducer 线程异步跑（见 §5）。
+- **不做 WAL 跨线程 group-commit** —— 不存在 WAL（inverted_wal 退役）；
+  data file 写由库内 `write_mu_` 串行化，单 append WAL 单写者。
+- **不改 IndexTask 帧格式** —— `IndexTask` 字段（`buf/ord/key_len/...`）
+  是进程内内存对象，不存在「帧格式」概念；入队 / 出队由
+  `tbb::concurrent_bounded_queue` + TSan 标注同步（`annotate_release` /
+  `annotate_acquire`）。
+
+---
+
+## 10. 源码导航
+
+| 符号 | 角色 |
+|------|------|
+| `include/bitcask/data_file.hpp::DataFile::write_buffered` | data file 块写（累积到 `batch_buf_`） |
+| `include/bitcask/data_file.hpp::DataFile::flush_batch` | data file 一次 pwrite + 清空 |
+| `include/bitcask/data_file.hpp::DataFile::kBatchFlushBytes` | `1u << 20`（1 MiB）触发阈值 |
+| `src/cask/cask.cpp::Cask::put_batch` | 1 MiB 块批写主路径 |
+| `src/cask/cask.cpp::Cask::maybe_group_commit` | P4 单写者组提交（fsync 触发） |
+| `src/cask/cask.cpp::Cask::roll_active` | 文件封口（`force = true` 触发尾批落盘） |
+| `include/bitcask/thread_pool.hpp::IndexTaskQueue` | 索引任务 bounded 队列 |
+| `include/bitcask/thread_pool.hpp::IndexTask` / `IndexOp` | 任务类型与构造 |
+| `include/bitcask/cask.hpp::CaskOptions::sync_every_n` / `o_sync` / `max_file_size` | 配置面 |

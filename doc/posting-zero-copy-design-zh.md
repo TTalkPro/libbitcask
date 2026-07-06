@@ -1,169 +1,414 @@
-# 查询路径 PostingList 零拷贝设计（P1）
+# 查询路径 PostingList 数据布局与零拷贝（P1 / P2-min / S22-M6 现状）
 
-> 状态：Phase 1（方案 D）已实施——基准 -60~72%；Phase 2-min（phrase/near
-> 持 shared_ptr + use_count CoW 协议）已实施——phrase -25~32%，详见 TASK.md
-> P1 节。完整 Phase 2（published_count 前缀只读 + deque）按 §6 判据暂不启动。
+> 范围：**已落地实现文档**——`bm25/inverted.cpp` 与
+> `include/bitcask/inverted.hpp` 的 PostingList 数据布局、查询路径的
+> 读取协议、CoW 写路径、块级元数据维护。**不再**讨论未启动的「远期
+> 形态」（Lucene segment / deque + `published_count` / mmap 直读
+> disk）——未来若启动走专用设计稿。
 >
-> 实施备注（Phase 2-min 与 §4.2 的差异）：未做 deque/published_count，
-> 而是用「写者持写 accessor 时 use_count()==1 → 原地改，>1 → 克隆替换」
-> 的 CoW 协议保证读者持引用期间对象不被修改（裸 shared_ptr + 原地追加
-> 是不安全的——vector 扩容搬迁会让读者悬空）。代价：仅当 phrase 查询与
-> 同 term 写入重叠时发生整列表克隆，常态写零开销。另：实施中发现并修复
-> 「遍历 concurrent_hash_map 期间调 find 触发懒 rehash 致迭代器重复访问
-> 节点」的坑（wildcard/fuzzy 改两阶段收集，详见 TASK.md P2.3）。
+> 实施批次对应：
+>
+> - **P1**：`PostingList::snapshot_flat`（扁平快照：拷 `ords` /
+>   `tfs` 列 + `blocks` / `max_tf`，不拷 `positions` / 不拷 `dl`）；
+>   5 条非-phrase 查询路径（`search` / `search_wand` / `bool_search` /
+>   `search_fuzzy` / `search_wildcard`）消费 `FlatPostings`。
+> - **P2-min**：phrase / near 持 `std::shared_ptr<const PostingList>`
+>   引用 + `use_count()` CoW 协议（写者见 `mutable_pl`）。
+> - **S22-M6**（commit `bf4da8c`）：`PostingList` 内存布局
+>   **`AoS → SoA`**——`Posting{ord, tf, dl, positions}` 单条 40B
+>   加独立堆块改成 `ords[]` / `tfs[]` / `dls[]`（无位置库 16B/条，
+>   有位置库 24B/条 + 紧凑 `pos_data` / `pos_off`）平行数组。
+>   `inverted_wal` 模块同 commit 退役（S14-4 delta 链承担增量
+>   持久化）。
+> - **S16-2 / S18-1**：DocMap 端 `doc_lens_` SoA 副本（`fill_doc_lens`
+>   SIMD gather 与 `OrdSeq::set_doc_len` 配套）。
 
-## 1. 问题
+## 1. 当前两套读取接口：`FlatPostings` 与 `shared_ptr<const PostingList>`
 
-`inverted.cpp` 的 6 个查询路径（search / search_wand / search_phrase_impl /
-bool_search / search_fuzzy / search_wildcard）都通过
+| 接口 | 形态 | 行数拷贝 | 位置 (positions) | 块元数据 | 适用路径 |
+|---|---|---|---|---|---|
+| `FlatPostings` | 拷 `ords`/`tfs` 列（`assign` = memcpy，**2 次堆分配**）+ `blocks` 浅拷 + `max_tf` | 是（仅 (ord, tf)） | 无 | 浅拷 | `search` / `search_wand` / `bool_search` / `search_fuzzy` / `search_wildcard` |
+| `shared_ptr<const PostingList>` | 仅持 `shared_ptr`（O(1) atomic 增减） | 零 | 原始 | 原始 | `search_phrase` / `search_near` / `explain` |
 
-```cpp
-tbb::concurrent_hash_map<...>::const_accessor acc;
-shard.inverted.find(acc, term);
-tp.pl_copy = acc->second;          // ← 整个 PostingList 深拷贝
-```
+**两种接口的来源不同**：P1 是「accessor 下深拷出扁平快照即可释放桶
+锁」的扁平路径；P2-min 是「accessor 下拷 `shared_ptr` 引用（CoW
+协议靠 `use_count()`）即可释放桶锁」的引用路径——后者必须保证读
+者持引用期间对象不被突变。
 
-把命中的 PostingList **整体深拷贝**后再释放 accessor。拷贝内容包括：
-
-- `items`：每条 `Posting{ord(8B), tf(4B), positions(vector, 24B 头 + 独立堆块)}`
-  —— **每条 posting 一次堆分配**；
-- `blocks` / `max_tf`（派生态，量小）。
-  （注：写作时还有常驻 `compressed_ords` 压缩副本，已于 O3 移除——VByte 压缩
-  改为 save 时现场编码，内存不再常驻；见 `inverted.hpp` PostingList 注释。）
-
-热词 10 万 posting ≈ 4MB 拷贝 + 10 万次小分配，**每次查询、每个命中词**都付一遍。
-这是当前查询路径上最大的单项开销，超过 O 系列已优化项的总和。
-
-拷贝存在的原因（必须在新设计中继续满足）：
-
-1. 尽早释放 concurrent_hash_map 的桶锁——评分（含 TBB parallel_reduce）耗时
-   毫秒级，持 accessor 全程会饿死写线程、且跨任务持多个 accessor 有死锁风险；
-2. 写线程（add_doc）可能在查询进行中追加同一 term 的 posting / 触发
-   `note_appended()` 重整派生态——读者需要一份不被突变的视图。
-
-## 2. 并发模型（设计输入）
-
-| 角色 | 线程 | 对 PostingList 的操作 |
-|---|---|---|
-| 索引写者 | IndexPool 单 worker 线程（`thread_pool.hpp`，concurrency=1） | **追加型**：`items.push_back` + `note_appended()`（封满块、弹部分尾块、失效 compressed、更新 max_tf） |
-| 搜索读者 | NIF dirty 线程，多个并发 | 只读（当前靠深拷贝隔离） |
-| 维护 | merge / open 路径 | **替换型**：`compact()` 原地重写、`load()` 整表重建、`rebuild_index()` 换整个 InvertedIndex、`finalize_all_postings()` 重算派生态 |
-
-关键不变量：
-- ord 全局单调分配 → add_doc 的追加**必然落在 items 尾部**，已发布前缀的
-  (ord, tf) 永不改写；positions 一旦入列也不再改。
-- `SearchLayer` 单写者由 IndexPool 保证（concurrency-zh.md §6）；
-  rebuild/load 与并发搜索的互斥由上层 merge 路径保证（本设计不放宽该前提，
-  但替换机制刻意做成与之兼容的指针发布）。
-- 例外突变：`note_appended()` 在「finalize 过的列表上首次追加」时会
-  **弹掉部分尾块**（blocks.pop_back）——这是唯一会回退已发布派生态的操作，
-  Phase 2 需要单独处理（见 §4.2）。
-
-## 3. 方案对比
-
-### 方案 A：`shared_ptr<const PostingList>` + 写时全量克隆（经典 COW）
-
-读者 accessor 下拷 shared_ptr（O(1)）即走；任何突变都克隆整个列表再换指针。
-
-- ✅ 读零拷贝；compact/load/finalize 本来就是整体替换，天然适配。
-- ❌ **add_doc 每追加一条 posting 克隆全列表**：热词追加是常态负载，
-  写放大 O(N)/条，写吞吐不可接受。
-- 结论：仅保留其「替换型突变走指针发布」的机制（Phase 2 采用），
-  不能用于追加路径。
-
-### 方案 B：不可变分段 + mutable tail（Lucene segment 式）
-
-posting 切成 immutable sealed segments，追加只进 tail；读者拷段指针数组。
-
-- ✅ 读零拷贝、写 O(1) 摊还，理论终态。
-- ❌ `find()` 二分、`compact`、`save/load`、WAND blocks 全部按段重写，
-  磁盘格式与查询遍历逻辑同时动，一步到位风险过高。
-- 结论：作为远期形态参考，不直接实施。
-
-### 方案 C：读者持 accessor 全程（去拷贝、不去锁）
-
-- ❌ 热词查询持桶锁毫秒级，单写线程在该桶饿死；parallel_reduce 内跨任务
-  持多个 accessor，TBB 文档明确警告死锁。否决。
-
-### 方案 D：扁平快照（消除逐 posting 堆分配，拷贝降到 12B/posting）
-
-观察：6 条路径里 **5 条只需要 (ord, tf)**（search/wand/bool/fuzzy/wildcard），
-只有 phrase/near 需要 positions。
-
-accessor 下把 items 压成两个扁平数组：
+### 1.1 P1 的 `FlatPostings` 与 `snapshot_flat`
 
 ```cpp
 struct FlatPostings {
-    std::vector<std::uint64_t> ords;   // 1 次分配
-    std::vector<std::uint32_t> tfs;    // 1 次分配
-    std::vector<PostingBlock>  blocks; // 量小（N/128）
-    std::uint32_t              max_tf;
+    std::vector<std::uint64_t> ords;
+    std::vector<std::uint32_t> tfs;
+    std::vector<PostingBlock>  blocks;   // 浅拷（N/128 量）
+    std::uint32_t              max_tf = 0;
 };
-void PostingList::snapshot_flat(FlatPostings& out) const;  // 顺序紧循环
+
+void PostingList::snapshot_flat(FlatPostings& out) const;
 ```
 
-- ✅ 分配次数 N+1 → 2；拷贝量 ~40B+positions堆块 → 12B/posting；
-  评分循环改读连续数组，cache 友好（wand 的 `tp.ords` 游标天然适配）。
-- ✅ **不改并发模型、不改磁盘格式、不动写路径**——风险最低、可独立回归。
-- ❌ 仍是 O(N) 带宽拷贝，不是零拷贝；phrase/near 维持现状（深拷，低频）。
+`PostingList::snapshot_flat`（`bm25/inverted.cpp` 全文一处定义）实现
+退化为 SoA 列的整列拷贝：
 
-## 4. 推荐：两阶段
+- `out.ords.assign(ords.begin(), ords.end())` —— 单趟 memcpy。
+- `out.tfs.assign(tfs.begin(), tfs.end())`。
+- `out.blocks = blocks` —— 浅拷，里头是 POD 索引块，没有共享指针。
+- `out.max_tf = max_tf` —— 整数赋值。
 
-### Phase 1 = 方案 D（先做，预计收益占八成）
+注：**`dls` 不拷**（v5 impacts 字段在 `PostingList` 留作索引时元数据，
+查询期由 `live_checker.fill_doc_lens(tp.fp.ords, tp.dls)` 在路径内
+独立批量取，且 `dls` 之于计算 BM25 tf 归一化分母是查询期每 doc 重
+读而非副本缓存）。**`pos_data` / `pos_off` 不拷**（phrase 路径不
+走 FlatPostings 也不需要它们）。
 
-改动面：
-1. `inverted.hpp` 加 `FlatPostings` + `PostingList::snapshot_flat()`；
-2. 5 条非 positions 路径的 `TermPostings{term, pl_copy, ords}` →
-   `TermPostings{term, FlatPostings fp}`，评分循环 `items[i].tf` → `fp.tfs[i]`；
-3. phrase/near 与 explain 不动（explain 本就持 accessor 短读、无拷贝）。
+### 1.2 P2-min 的 `shared_ptr<const PostingList>` + `mutable_pl`
 
-验收：ctest 全量 + 新增「查询中并发 add_doc 同 term」TSan 用例；
-基准（见 §6）给出 before/after。
+词桶 map 值类型为 `std::shared_ptr<PostingList>`（`include/bitcask/
+inverted.hpp::InvertedIndex::PostingMap`）。`bool_search` / `search_fuzzy` /
+`search_wildcard` / `search` / `search_wand` 在读路径中持
+`const_accessor` 拿到引用（轻）；`phrase` / `near` 同样持 `const
+_accessor` 拿到引用，把 `acc->second` 拷到本地 `std::shared_ptr<const
+PostingList>`（共享引用计数的累加），**整个评分循环期间不再触桶**。
 
-### Phase 2 = 指针发布 + 已发布前缀只读（按基准证据决定是否做）
+写者（`add_doc` / `apply_delta` / `compact` / `finalize_all_postings`/
+`rebuild_*`）经 `mutable_pl` 拿可写引用：
 
-目标：读路径完全零拷贝（含 phrase 的 positions）。
+```cpp
+PostingList& mutable_pl(std::shared_ptr<PostingList>& sp) {
+    if (!sp) sp = std::make_shared<PostingList>();
+    else if (sp.use_count() > 1) sp = std::make_shared<PostingList>(*sp);
+    else std::atomic_thread_fence(std::memory_order_acquire);
+    return *sp;
+}
+```
 
-1. map 值改 `std::shared_ptr<PostingList>`（非 const——尾部追加仍原地）；
-   读者 accessor 下拷 shared_ptr 即释放桶锁。
-2. `PostingList` 加 `std::atomic<std::uint32_t> published_count`：
-   - 写者 `items.push_back(...)` **完成后** release-store count+1；
-   - 读者 acquire-load 后只读 `[0, published_count)` 前缀。
-   单写者 + release/acquire → 前缀内容的写入 happens-before 读者可见，无锁安全。
-3. `items` 由 `vector` 改 `std::deque`（或自实现 chunked array）：
-   追加不搬移已发布元素——这是前缀只读成立的前提
-   （vector 扩容会整体搬迁，读者悬空）。
-4. `blocks` 同理加 `published_blocks` 原子；**finalized 列表上的首次追加**
-   （唯一的弹尾突变）改走「克隆 → 修改 → 换指针」的替换路径，规避对已
-   发布 blocks 的回退（频率低：仅 load 后每词一次）。
-5. `max_tf` → `atomic<uint32_t>` relaxed。
-6. `compact()` / `load()` / `finalize_all_postings()` 统一改为
-   「构造新 PostingList → accessor 下换 shared_ptr」；旧版本由在读快照的
-   shared_ptr 引用计数自然续命，读完释放。
-7. phrase/near 改为：拿 shared_ptr 后直接在 `[0, published_count)` 上
-   `find()` + 读 positions，零拷贝。
+- `use_count() == 1` ⇒ 无 phrase/near 读者持引用 → 原地改（`append`
+  + `note_appended`）。
+- `use_count() > 1` ⇒ 克隆替换（CoW），旧版本由读者引用计数自然续命。
+- `use_count() == 0` ⇒ 第一次建空表。
 
-Phase 2 的代价：`deque` 的二分/遍历比 vector 略慢（间接寻址）、
-save/load/compact 全要过一遍、内存序推理需要 TSan 背书。
-**仅当 Phase 1 后基准显示拷贝带宽仍是瓶颈时启动。**
+`use_count()` 是 `relaxed` 减；观察到 1 后补 `acquire` fence，与读者
+析构 `shared_ptr` 的 `release` 递减配对——保证读者的最后一次数据读
+`happens-before` 写者的后续原地修改。**注意**：`PostingList::append`
+内部**保留**写入者侧的对称 fence（详见 §3 的字段布局）：读者只是
+持有 `shared_ptr<const>`，写者不直接读到 reader 状态但通过 `use_count`
+共时序对偶。
 
-## 5. 明确不做 / 边界
+## 2. S22-M6 内存布局：AoS → SoA 对比
 
-- 不动 `rebuild_index()` 换整个 InvertedIndex 的上层互斥假设（fields_ 的
-  发布是另一个独立问题，见审计报告 §健壮性）；
-- 不动磁盘格式（Phase 2 的 deque 仅内存形态，save 仍按序写）；
-- ~~`compressed_ords` 的内存冗余（审计 #2）与本设计正交：Phase 2 落地后
-  顺手把内存中的 `compressed_ords` 砍掉（save 时现编码）收益更顺。~~
-  **已完成（O3，独立于 Phase 2）**：内存不再常驻压缩副本，VByte 仅 save 时现编码。
+### 2.1 旧（AoS，commit bf4da8c 之前）
 
-## 6. 基准先行（依赖审计 #7）
+```
+struct Posting {
+    uint64_t  ord;             // 8B
+    uint32_t  tf;              // 4B
+    uint32_t  dl;              // 4B (v5 padding 槽)
+    std::vector<uint32_t>      // 24B (libstdc++ vector 头)
+        positions;             // + 每条 posting 一次堆块分配
+};
+// sizeof(Posting) ≈ 40B（positions 为空），追加即 push_back(moved)
+//                      ≈ 64B（含 vector 头 + 首次分配）。
+// std::vector<Posting> items; // 紧凑 vector of struct，cache 友好
+```
 
-实施前先落地两个固定基准，Phase 1/2 各拿数字：
+特点：单条 posting 一次堆分配（`positions` 头次 push 时分配底层
+`uint32_t[]`）。`compact_flags` 走 `Posting` 级 move。CoW 克隆走
+`vector<Posting>` 的 `copy` ⇒ 「N+1 元素 + N 条 posting positions」
+的堆分配（N 次 element 拷贝 + N 次 vector 拷贝）。
 
-1. `search_hot_term`：100k posting 热词，单线程 QPS + p99；
-2. `search_while_indexing`：4 dirty 线程查询 × IndexPool 持续 add_doc 同
-   一批热词，查询 p99 + 索引吞吐双指标。
+### 2.2 新（SoA，commit bf4da8c 之后）
 
-判定标准：Phase 1 预期 search_hot_term 延迟降 50%+（分配主导时更多）；
-若 Phase 1 后 profile 显示 snapshot_flat 的 memcpy 仍占查询时间 >30%，
-启动 Phase 2。
+```cpp
+struct PostingList {
+    std::vector<std::uint64_t> ords;      // 8B/条 (strict ascending)
+    std::vector<std::uint32_t> tfs;       // 4B/条
+    std::vector<std::uint64_t> pos_off;   // 8B/条 (惰性：空 positions
+                                          //      库恒为 empty)
+    std::vector<std::uint32_t> pos_data;  // 0B/条均值（累加进各条）
+    std::vector<uint32_t>       dls;      // 4B/条 (v5 impacts 索引时存)
+    std::vector<PostingBlock>  blocks;    // 28B/块 (1/128 条)
+    uint32_t                   max_tf = 0;
+};
+```
+
+| 形态 | 行大小 | 总分配 |
+|---|---|---|
+| 无位置库（`index_positions_ = false`） | 16B/条（`ords` + `tfs` + `dls`） | 4 次堆分配 |
+| 有位置库（`index_positions_ = true`） | 24B/条 + 紧凑 `pos_data` | 6 次堆分配 |
+
+**关键 S22 变化**：
+
+- `dls` 列从 0 → 4B/条：在原 AoS 的 `padding` 槽落地，**内存零增量**
+  （v5 impacts 本来就准备这个字段，只是 AoS 时期被压缩到 4B padding
+  里；SoA 化后独立成列，物理摊到每条仍是 4B，cache line 内仍与
+  `tfs` 同列连续）。`min_dl` 在 `seal_full_blocks` / `finalize` 内
+  按块聚合时直接读 `dls[i]` 即可，无需重新遍历原始 `tf`。
+- `pos_off` **惰性物化**：增量为空库的 `index_positions_ = false`
+  路径零 `positions` 开销。首个非空 `positions` 追加前恒为 `empty`
+  —— 这意味着无位置库的词**永远不会**为 `pos_off` 付 8B/条的开销。
+- `compaction` 走原地双指针：
+
+```cpp
+bool compact_flags(std::span<const char> live) {
+    // 原地双指针 w/i；pos_data 显式搬移 + pos_off 重写
+    // 每轮迭代先读 pos_off[i]/[i+1] 再写 pos_off[w]，w ≤ i 保证读写不冲突
+    ...
+}
+```
+
+- CoW 克隆走 `vector<uint64_t>` / `vector<uint32_t>` 的列式 `copy`
+  ——「N+1 元素」N 次拷贝，**每列独立堆分配**，比 AoS 「N+1 + N 条
+  positions」少一组分配（节省 N/N+1 ≈ 50%）。
+
+### 2.3 与 v6 落盘格式的对齐
+
+v6 落盘（`bm25/inverted.cpp` 内 `kInvVersion = 6`，`save` / `load`）
+本就列式：
+
+- ord 列 —— `FOR`（Frame-of-Reference）128/块（每块 frame + bits +
+  packed bytes）；
+- tf 列 —— `VByte` varint 整组编码；
+- dl 列 —— `VByte` varint 整组编码；
+- positions 列 —— 单独 `VByte` 段。
+
+SoA 内存布局是其天然镜像——`save()` 的「按列依次写」与内存排布
+**字节零转化**，`load()` 的「按列依次读」是单趟 memcpy 后立即上
+SoA。S22 这一改**没有序列化层迁移**——加载老版快照（v1..v5）已
+不再支持（v6 起断代，旧库需外部迁移工具或重建）。
+
+> 注：`kInvVersion` 同 commit 已升级（`inverted.cpp` 内
+> `static constexpr std::uint32_t kInvVersion = 6`），不接受旧版文件
+> 头。注释与 `restore_unified_checkpoint` 的失败降级路径需特别注意。
+
+## 3. `PostingList::append` —— 唯一追加入口
+
+`append(ord, tf, dl, positions)`（`include/bitcask/inverted.hpp`）收敛
+add_doc / apply_delta 的写入面——保证 SoA 五列不会漏列错位：
+
+```cpp
+void append(uint64_t ord, uint32_t tf, uint32_t dl,
+            span<const uint32_t> pos) {
+    size_t idx = ords.size();           // 同步记录
+    ords.push_back(ord);
+    tfs.push_back(tf);
+    dls.push_back(dl);
+    // 惰性物化:首个非空 positions 才建 pos_off
+    if (!pos.empty() && pos_off.empty())
+        pos_off.assign(idx + 1, 0);
+    if (!pos_off.empty()) {
+        pos_data.insert(pos_data.end(), pos.begin(), pos.end());
+        pos_off.push_back(pos_data.size());
+    }
+}
+```
+
+调用方随后照旧调 `note_appended()`：
+
+- `note_appended` 做两件事——增量维护 `max_tf`（new row 必在末尾，
+  `tfs.back() > max_tf` 才更新），并把已满的整块封进 `blocks[]`（满
+  块通过 `seal_full_blocks` 单趟扫描 + push_back）。
+- `finalize` 用在「可能含不满尾块」的场景（load 后、compact 后）——
+  先 `clear` 已有块（消除增量阶段可能封入的满块），再按统一规范重
+  建含部分尾块的规范集。
+
+## 4. `PostingBlock`：块级元数据布局
+
+```cpp
+struct PostingBlock {
+    uint64_t base_ord;
+    uint64_t end_ord;       // 块最后一条 posting 的 ord
+    uint32_t max_tf;        // v5 保留：块内 tf 上界
+    uint32_t min_dl;        // v5 impacts：块内最小 dl
+                             // 1 = 旧快照/dl 未知回退 (admissible)
+    size_t   start_idx;     // 行下标区间起点
+    size_t   count;         // 行数 (满块 = kBlockSize = 128)
+};
+```
+
+`block_for_ord(ord)`（`PostingList::block_for_ord` 与
+`FlatPostings::block_for_ord` 共用 `bm25/inverted.cpp` 内匿名命名空间
+的 `block_for_ord_in` 函数）：`blocks[]` 按 `end_ord` 二分（`lower_bound`
+），落到 `[base_ord, end_ord]` 区间内的块即所求。
+
+`block_upper_bound(idf, params, avgdl)`：读缓存 `max_tf`（SoA 后
+不再重扫全表，详见 commit `bf4da8c` 的 message），经 `upper_bound_from`
+（`bm25/inverted.cpp` 匿名命名空间闭包）算出包含 δ 下界项的
+`idf * (tf_norm_max_tf + params.delta)`，admissible 块级分数上界。
+
+## 5. 查询路径的零拷贝读取链
+
+### 5.1 5 条非 phrase 路径：`FlatPostings` 链
+
+以 `InvertedIndex::search_wand` 为例：
+
+1. **accessor 取 PostingMap 引用**：
+   `PostingMap::const_accessor acc; shard.inverted.find(acc, term);`
+2. **扁平快照**（accessor 持锁期间）：
+   `acc->second->snapshot_flat(tp.fp);` —— 单趟列拷贝，O(ord 列字节)。
+3. **`accessor` 立刻析构**（走出 const_accessor 作用域），桶锁释放。
+4. **主循环**（无锁 / 无虚调用）：
+   `tp.live` / `tp.dls` 由 `live_checker.fill_*` 一次性批量取；
+   `tp.block_upper_bounds` 一次性按块算好。
+5. **共享 top-k 小顶堆**与 path 间 `std::priority_queue` 标准器：
+   `std::priority_queue<Entry, std::vector<Entry>, std::greater<>>`。
+
+P1 的「零拷贝」是**单趟列 memcpy**（2 次堆分配：ords + tfs），与
+「整列表深拷含每条 posting positions」相比是数量级的字节量差距——
+对热词 100K posting 从 ~4MB + 100K positions 堆块降到 ~1.2MB
+（`ords` 800KB + `tfs` 400KB）。
+
+### 5.2 phrase / near 路径：`shared_ptr<const PostingList>` 链
+
+以 `InvertedIndex::search_phrase_impl`（`slop = 0` 表严格短语，
+`slop > 0` 表有序近邻）为例：
+
+1. **每 term 持 `const_accessor`**：
+   `tps.push_back({term, acc->second});` —— 拷 `shared_ptr`，O(1) 原子
+   加 1。
+2. **`accessor` 立刻析构**，桶锁释放。
+3. **短语候选集**取自**最稀有词**（`drv` 索引：`fp.size()` 最小的
+   term），其 `PostingList` 的 `ords` 列本身就是主驱：
+   `std::vector<std::uint64_t> cand_ords(cand_pl.ords);`（SoA 后
+   整列拷贝）。
+4. **`fill_is_live` / `fill_doc_lens`**：与 `tps[i]` 的 `ords` 列一次
+   性批量取。
+5. **短语位置匹配**：每候选 ord 上对**所有**查询 term 取
+   `pl.positions(i)` 返回的 `std::span<const uint32_t>`（`PostingList::
+   positions(std::size_t)` 在 `include/bitcask/inverted.hpp` 内定义，
+   无 positions 或未物化时返空 `span`）——**直接读** PostingsList 内
+   紧凑的 `pos_data[]`，零拷贝。
+
+### 5.3 块元数据在查询期的访问路径
+
+`block_for_ord(pivot_ord)` 单趟二分 → 取 `block.max_tf` 与 `block.
+min_dl` → 经 `upper_bound_from(...)` 算块级上界。**`search_wand` 进
+一步预计算** `tp.block_upper_bounds`（`bm25/inverted.cpp` 内 `search_wand`
+初始化阶段），主循环读 `block_upper_bounds[block_idx]` 即可避免每
+pivot 重算 6 FMA + 1 div（AVX-512 kernel 调用一次的开销）。
+
+**`PostingBlock` 字段说明（紧凑 ABI）**：`28B/块（base + end + max_tf
++ min_dl + start_idx + count，8+8+4+4+8+8 跨 32/64 位布局对齐）`
+—— `FlatPostings::blocks` 一行 `std::vector<PostingBlock>` 浅拷，
+访问期间 0 字节额外分配。
+
+## 6. live / doc_len 批量接口（`LiveChecker`）
+
+`include/bitcask/live_checker.hpp`：
+
+```cpp
+class LiveChecker {
+public:
+    virtual ~LiveChecker() = default;
+    virtual bool is_live(uint64_t ord) const = 0;
+    virtual uint32_t doc_len(uint64_t ord) const = 0;
+    // P2.1：批量接口
+    virtual void fill_is_live(span<const uint64_t> ords,
+                              span<char> out) const;
+    virtual void fill_doc_lens(span<const uint64_t> ords,
+                               span<uint32_t> out) const;
+};
+```
+
+P2.1 的批量接口默认实现是逐元素退化，**不要求外部实现者改动**；
+`include/bitcask/index.hpp` 内 `Index` 类（同时是 `LiveChecker` 实现
+者）覆写为：一次 `shared_lock`，读 `live_[]` 与 `doc_lens_[]`（SoA
+副本，平坦保持兼容 SIMD gather）整段直写。
+
+⚠️ **v5 不变量**：`doc_len(ord)` 必须等于该文档 `add_doc` 时的
+`Σtf`（`TextPlugin` 两者同源自同一次分词，天然成立）。块级分数
+上界用索引时 `min_dl` 收紧——若自定义实现返回比索引时更小的
+`doc_len`，上界不再 admissible，BMW 剪枝可能漏掉真 top-k。
+
+## 7. 同步面（index.hpp ↔ inverted.hpp）
+
+- `Index::live_`（`std::vector<char>`）与 `Index::doc_lens_`（`std::vector
+  <uint32_t>`，与 `live_` 同长度、对齐可 SIMD 化）由 `Index` 类拥有；
+  `InvertedIndex` 仅在每查询入口取**只读快照**（`fill_is_live` /
+  `fill_doc_lens` 一次性写入调用者提供的 scratch buffer）。
+- `InvertedIndex` 自身不复制 ord ↔ key 映射；`extract_doc_table` /
+  `apply_doc_table_delta` 等跨接口通过 `Bitcask` 协调，本文档
+  不展开（详见 `recovery-unified-checkpoint-design-zh.md`）。
+- `AppendableIndex` / `meta_codec` 等与 S22-M6 关系：`bitcask.meta`
+  v3 编码只动 DocMap 物理 layout，与倒排 PostingList SoA 化无耦合。
+
+## 8. 写入面：写者侧 CoW 触发条件
+
+`add_doc`（`bm25/inverted.cpp` 全文一处主入口）：
+
+```cpp
+for (auto& [term, data] : term_data) {
+    auto& [tf, positions] = data;
+    auto& shard = shard_for(term);
+    PostingMap::accessor acc;
+    const bool is_new_term = shard.inverted.insert(acc, term);
+    PostingList& pl = mutable_pl(acc->second);  // ← P2-min CoW
+    pl.append(ord, tf, doc_len,
+              index_positions_ ? span<const uint32_t>(positions)
+                               : span<const uint32_t>{});
+    pl.note_appended();
+    ...
+}
+```
+
+`mutable_pl`（详 §1.2）：`use_count() > 1` ⇒ 整表克隆替换。**触发
+场景**：phrase/near 查询与同 term 写入重叠。**常态开销**：词命中
+相位无 phrase/near 引用时 `use_count() == 1`，`acquire fence` 单次，
+原地 `append`。
+
+> Phase 2-min 与 §4.2「deque + published_count」的差异：实施时走
+> 「shared_ptr + use_count CoW」而非 published_count 前缀只读。
+> 优势：vector 保留（cache 友好）+ 复杂度最低；劣势：罕见 CoW 时
+> 整表克隆——但冷路径，常态零开销。**未来若启动 Phase 2**：将走
+> `deque` 化与 `atomic published_count` 的 release/acquire 协议，
+> 与本 §1.2 的 CoW 协议**位级兼容**（reader 视对象为不可变接口不变）。
+
+## 9. 关键代码符号索引
+
+| 概念 | 符号 | 位置 |
+|---|---|---|
+| SoA `PostingList` 主类型 | `struct PostingList` | `include/bitcask/inverted.hpp` |
+| 块元数据 | `struct PostingBlock` | `include/bitcask/inverted.hpp` |
+| 扁平查询快照 | `struct FlatPostings` | `include/bitcask/inverted.hpp` |
+| 唯一追加入口 | `PostingList::append(ord, tf, dl, pos)` | `include/bitcask/inverted.hpp` |
+| 块级元数据三阶段 | `seal_full_blocks` / `note_appended` / `finalize` | `include/bitcask/inverted.hpp` |
+| 死点压实（SoA 双指针） | `PostingList::compact_flags(live)` | `include/bitcask/inverted.hpp` |
+| 块二分查找 | `block_for_ord_in`（匿名） + `PostingList::block_for_ord` / `FlatPostings::block_for_ord` | `bm25/inverted.cpp` |
+| 列表级上界计算 | `upper_bound_from`(max_tf, idf, params, avgdl, min_dl) | `bm25/inverted.cpp` 匿名命名空间 |
+| 缓存的全局上界 | `PostingList::max_tf`（note_appended 增量、compact_flags 重算） | `include/bitcask/inverted.hpp` |
+| FlatPostings 生成 | `PostingList::snapshot_flat(FlatPostings&)` | `bm25/inverted.cpp` |
+| P2-min CoW 协议 | `mutable_pl(shared_ptr<PostingList>&)` | `bm25/inverted.cpp` 匿名命名空间 |
+| 桶 map 值类型 | `using PostingMap = tbb::concurrent_hash_map<...>` | `include/bitcask/inverted.hpp` |
+| live / doc_len 批量接口 | `LiveChecker::fill_is_live` / `fill_doc_lens` | `include/bitcask/live_checker.hpp` |
+| 5 条扁平快照消费者 | `search` / `search_wand` / `bool_search` / `search_fuzzy` / `search_wildcard` | `bm25/inverted.cpp` |
+| 2 条 Phrase 路径消费者 | `search_phrase` / `search_near`（`search_phrase_impl` 共享实现） | `bm25/inverted.cpp` |
+| v6 落盘版本号 | `static constexpr std::uint32_t kInvVersion = 6` | `bm25/inverted.cpp` |
+
+## 10. 关键不变式（评审 checklist）
+
+- `PostingList::ords[]` 严格升序无重复（`add_doc` 的水位幂等保护 +
+  `apply_delta` 的「ord > 列尾」守卫）。
+- `PostingBlock::end_ord` 必须等于 `ords[start_idx + count - 1]`（与
+  `base_ord` 即 `ords[start_idx]` 共同定义块边界；`search_wand` /
+  `bool_search` 的 `block_end()` 与 `block_for_ord()` 二分依赖）。
+- `PostingList::max_tf` 必须等于 `tfs[]` 全局最大值（`note_appended`
+  增量、`compact_flags` 重算；`find`/`block_for_ord` 不参与维护）。
+- `pos_off.size() == ords.size() + 1` 当且仅当**至少一次**非空
+  positions 追加之后（惰性物化未触发时 `pos_off.empty()`）。
+- `use_count() == 1` 是 `mutable_pl` 选择原地改的**唯一依据**——
+  失去该不变量会让 phrase/near 读取到不一致的中间状态（持有
+  `shared_ptr<const>` 但写者原地动了它）。
+
+## 11. 相关文档
+
+- `doc/kway-blockmax-bmw-zh.md` —— k-way 交集 + 块级元数据 + BMW
+  的设计路线与现状（含本数据结构 §3 的关联段）。
+- `doc/wand-blockmax-zh.md` —— Block-Max WAND 的算法讲解与符号
+  映射表，与本数据结构 §5.1 的 `search_wand` 路径互引。
+- `doc/inoue-simd-intersection-zh.md` —— SIMD 块过滤 + Inoue
+  permutation 内核（`intersect.cpp`）；消费本数据结构的 `ords[]`
+  平行数组（必升序去重不变量）。
+- `doc/concurrency-zh.md` —— `tbb::concurrent_hash_map` 的桶锁粒
+  度与 `mutable_pl` 的 memory order 协议。
+- `doc/format-zh.md` —— v6 落盘字节布局；本 §2.3 描其与 SoA 内存
+  镜像。

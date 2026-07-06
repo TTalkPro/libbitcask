@@ -1,394 +1,445 @@
-# 恢复持久化统一:checkpoint 命名 + 单趟尾部回放(路线 A)
+# 恢复持久化：搜索索引分段 checkpoint + 统一 manifest commit
 
-> **S20-7 顶部换代注记**：本稿的「统一 search.ckpt 单文件模型」已被 S17
-> per-component ckpt 取代（docmap/bm25/vec 各自 base+delta+.prev +
-> index.manifest 唯一 commit 点）。现行格式与恢复链详见
-> `format-zh.md §10.4` 与 `index_manifest.hpp`。本稿正文行号保留为
-> 设计当时快照，仅以本注记统一标记（参考 S17-2/3/4/5 commit）。
->
-> 对应代码:`keydir.cpp`(save/load_snapshot)、`search_layer.cpp`
-> (save/load_index_sidecar、save/load_vec_snapshot、load_snapshot)、
-> `inverted.cpp`/`inverted_wal.cpp`(bm25 WAL)、`cask.cpp`
-> (`load_recovery_snapshots`/`load_keydir_from_disk`/写入点)。
-> 背景:本文取代并收敛原 `recovery-snapshot-design-zh.md`(A4)的命名与
-> 多写者日志策略;其仍生效的快照不变量、`kv.keydir.ckpt` 格式与写入点已并入
-> 本文**附录 A**(原文档已删除)。搜索快照的**单文件分段 +
-> 逐段 CRC + 代际回退 + docmap 可选缓存**与姊妹引擎 `cellar`
-> (`design-cellar-search.md`)**已全面收敛到路线 A**(对比见 §10):两引擎
-> 都以 data 为唯一 WAL、砍搜索 WAL、`.prev` 用 data 尾巴追平,仅命名/magic 不同。
+> 前置阅读：[`format-zh.md`](format-zh.md)（ckpt 容器与段类型字节级格式）、
+> [`concurrency-zh.md`](concurrency-zh.md)（合并 / 写者并发契约）、
+> [`merge-policy-zh.md`](merge-policy-zh.md)（merge 触发与执行）
+> 状态：已实现（S17-S22）
 
-## 1. 问题
+## 1. 设计目标
 
-现状三个痛点,根因都是**持久化契约没有显式化在文件名/格式上**:
+open 时重建 keydir 与搜索索引（docmap / bm25 / hnsw）需要 fold data 文件
+到尾部，纯 fold 路径 O(全库)——大库崩溃后启动慢。Checkpoint 是**纯优化**：
+落盘一个能 fold 尾巴就追平的快照，使 open 跳过大段历史字节。
 
-1. **命名混乱**:`.snap` 后缀同时盖在裸 checkpoint(keydir/index/hnsw,
-   无 WAL)与 checkpoint+WAL(bm25)上;bm25 又不带 `bitcask.` 前缀,
-   塞了 `_snapshot`+`.inv` 两层语义。读名字看不出耐久契约。
-2. **IO 浪费(双重日志)**:一次搜索 put 把 value(text+vector)写进
-   data 文件——data 文件**本身已是一条带 ord 的全量 WAL**——又把分析后
-   的 term 追加进 bm25 WAL(`inverted.cpp:358`)。同一笔写记两遍。
-3. **重用率 ≈ 0**:checkpoint 只在 close/merge 落盘,无周期性。崩溃后
-   keydir/docmap/hnsw 三块必陈旧 → 旧 4-way 成对门按**最弱环**判定 →
-   全量 fold。此时 bm25 WAL 被丢弃重建,**等于白记**。
-   (此成对门已被 P14e 的单 watermark 自门取代,见现 `load_recovery_snapshots`
-   `cask.cpp:873`;本节为重构前的问题陈述。)
+设计要点：
 
-## 2. 核心决策
+- **单 watermark 自门模型**：仅以各组件链覆盖水位的最小值定 fold 起点；
+  缺文件/CRC 坏 → 该组件退水位 0 自门、其余组件不受影响
+- **损坏隔离到段**：`SearchCheckpoint` 容器每段独立 CRC，坏段单独重建
+- **统一 commit point**：`index.manifest` 是三组件 ckpt 的**唯一**提交点
+  （tmp+rename 原子写），crash 在「先写组件后写 manifest」窗口则整组件
+  退全量 fold——不出现「manifest 已提交但组件页丢失」的脏状态
+- **paired save 语义**：keydir 快照 + 三组件 manifest + 各组件 base/delta
+  在同一临界区协调，保证 `keydir_covered ≤ search_covered`
+- **legacy fallback**：pre-S17 单文件 `search.ckpt` 一次性迁移到 per-component
+  协议，迁移失败 → 全量 fold（fallback 安全网）
 
-- **data 文件是唯一 WAL。** 所有派生索引(keydir / docmap / bm25 / hnsw)
-  统一为「周期性 checkpoint + open 时单趟 fold 尾部回放」。
-- **砍掉 bm25 独立 WAL。** 其唯一收益是 replay 免重新分词;改为可选的
-  「分析后 term 缓存」(§6),而非一条完整 WAL,消除双重日志。
-- **搜索索引合并为单个分段自描述文件 `search.ckpt`**(借鉴 cellar 提案
-  `design-cellar-search.md`):docmap / bm25 / hnsw 各为一个**段**,**逐段
-  独立 CRC**、页脚目录定位;替代 P14a 的多文件(`search.docmap.ckpt` +
-  `search.vec.ckpt` + `search.bm25.manifest` + `search.bm25.f{i}.seg`)。
-  收益:文件数大降、损坏隔离到段(只重建坏的那种索引)、加新索引类型只
-  登记 type 不新增文件、未脏的段拷贝前移省写放大。
-- **保留上一代 `search.ckpt.prev`(代际回退)。** 最新 `search.ckpt` 整体
-  位腐时回退上一代,再 fold data 尾巴追平——**回退的增量源是 data 文件
-  (我们的 WAL),不依赖搜索 WAL**(论证见 §6.5)。在本架构里 `.prev` 是
-  恢复**提速**项(把"最新损坏"从全库重建降到尾巴重放),非 durability 必需。
-- **重用率靠 checkpoint 频率提升,不靠加 WAL。** 给 keydir/docmap/hnsw
-  补 WAL 是反方向(更多文件+fsync,且 hnsw WAL ≈ 重新 insert,无收益)。
-- **keydir 仍独立 `kv.keydir.ckpt`**(KV 层,非搜索)——纯 KV 库不产生
-  `search.ckpt`,与 cellar 把 keydir/hint 与 search 分层一致。
-- **后缀编码契约**:`.ckpt`=可重建 checkpoint(分段或单块),`.prev`=上一代,
-  `.wal`=日志(仅 data/hint)。所有派生文件可删,删后 fold 重建。
+## 2. 文件总览
 
-## 3. 文件总览与 `search.ckpt` 分段格式
+数据目录在索引模式下包含：
 
-### 3.1 目标文件布局
+| 文件 | 用途 |
+|------|------|
+| `<tstamp>.bitcask.data` / `.hint` | 唯一 WAL（KV + 索引 payload） |
+| `bitcask.meta` | 目录配置 v3（magic + version + mode + 向量配置 + CRC） |
+| `field.schema` | 字段名注册表 |
+| `kv.keydir.ckpt` | keydir 快照（`SearchCheckpoint` 容器，单段） |
+| `docmap.ckpt` / `.prev` / `.d<seq>` | docmap 组件 base 与 delta 链 |
+| `bm25.ckpt` / `.prev` / `.d<seq>` | bm25 组件 base 与 delta 链 |
+| `vec.ckpt` / `.prev` / `.d<seq>` | hnsw 组件 base 与 delta 链 |
+| `index.manifest` | 三组件 ckpt 的统一 commit point（80 字节） |
+| `search.ckpt` / `.prev` | legacy 单文件 ckpt（S17-5 后仅作迁移源） |
+| `search.vec` / `search.qc8` | hnsw 外部 payload（f32 / int8 量化码字） |
 
-```
-N.bitcask.data / .hint   数据日志(唯一 WAL)+ key→位置 加速(不变)
-bitcask.meta             目录配置(不变,meta v2 小端)
-field.schema             字段注册表(不变)
-kv.keydir.ckpt           KV keydir checkpoint(BCKS,单块,独立)
-search.ckpt        ← 新  搜索索引快照(分段:docmap/bm25/hnsw,逐段 CRC)
-search.ckpt.prev   ← 新  上一代搜索快照(代际回退)
-search.vec         ← V7  HNSW f32 向量 payload(BCVP,mmap;hnsw 段外存,见下)
-```
+后缀契约：`.ckpt` = 可重建的检查点；`.prev` = 上一代回退目标；`.d<seq>` =
+delta 链文件；`search.ckpt` = 旧单文件格式（迁移一次性）。所有派生文件
+可删——删后 open 走全量 fold 重建。
 
-`.prev` 只对 `search.ckpt` 设(搜索段重建最贵、最值得回退提速);keydir
-重建便宜,不设 `.prev`。无 `*.wal`(路线 A)。
+## 3. checkpoint 容器与段类型
 
-> **实现现状(V7)**:本设计原把 HNSW 图(含 f32 向量)整体放进 `search.ckpt` 的
-> hnsw 段。V7 起做了**双文件拆分**:hnsw 段只存 BVH2 v2 图头(int8 量化码字 +
-> 邻接/ord/level),全精度 f32 向量外存到同目录 `search.vec`(BCVP,只读 mmap);
-> `inmem_int8` 模式无常驻 f32 → 不产生 `.vec`。字节级布局以
-> [`format-zh.md` §10](format-zh.md) 为准。
-
-> **取代关系(P14a → P14e)**:P14a 已落地的多文件搜索命名
-> (`search.docmap.ckpt` / `search.vec.ckpt` / `search.bm25.manifest` /
-> `search.bm25.f{i}.seg`)是**过渡态**,被本节单文件 `search.ckpt` 收编。
-> 旧名不再读(可 fold 重建,flag-day,见 §8 P14e)。`kv.keydir.ckpt`
-> 保留(它不是搜索段)。
-
-### 3.2 `search.ckpt` 格式(自描述、分段、逐段 CRC,全小端)
+`SearchCheckpoint`（`include/bitcask/search_checkpoint.hpp`）是所有
+`*.ckpt` / `*.d<seq>` 文件的统一容器，自描述、分段、每段独立 CRC，
+页脚目录定位：
 
 ```
 == 头部 (16 B) ==
-[0..3]   magic     "BCSC"   4 ASCII
-[4..7]   version   u32 = 1
-[8..15]  watermark u64      本快照覆盖到的 next_ord 上界(成对门/回放用)
+  [0..3]   magic    "BCSC"  (kCkptMagic)
+  [4..7]   version  u32     (kCkptVersion=1 / kCkptVersion2=2)
+  [8..15]  watermark u64    本快照覆盖到的 next_ord 上界
 
 == 段载荷区 ==
-各段 payload 顺序拼接(无内联段头;位置/校验由页脚目录给出)。
-段 payload 沿用现有内部序列化(InvertedIndex / HnswIndex / DocIndex),
-仅由"独立文件"变为"文件内的段"——字节级不变(跨引擎一致性保留)。
+  各段 payload 顺序拼接(无内联段头;位置/校验由页脚目录给出)
 
 == 页脚 ==
-directory(dirLen 字节):
-  sectionCount u32
-  每段: type u16 | flags u16 | offset u64 | len u64 | crc32 u32  (crc 覆盖该段 payload)
-footerCrc u32     CRC 覆盖 directory 字节
-dirLen    u32     directory 字节长度
-trailer   "BCSC"  4 ASCII
+  directory(dirLen 字节):
+    sectionCount u32
+    每段: type u16 | flags u16 | offset u64 | len u64 | crc32 u32
+        (crc 覆盖该段 payload)
+  footerCrc u32   CRC 覆盖 directory 字节
+  dirLen    u32   directory 字节长度
+  trailer   "BCSC" (4 ASCII)
 ```
 
-**定位页脚(从文件尾倒走)**:`[EOF-4..]`=trailer;`[EOF-8..EOF-4]`=dirLen;
-`[EOF-12..EOF-8]`=footerCrc;directory=`[EOF-12-dirLen .. EOF-12]`,按 footerCrc 校验。
-页脚最后写(tmp+rename 原子)——**页脚存在且 footerCrc 通过 = 文件结构完整**。
+`SearchCheckpoint::write` 走 `tmp + fdatasync + rename` 原子写
+（`include/bitcask/search_checkpoint.hpp`）；`SearchCheckpoint::read` 整文件
+读入后从尾倒走 footer 校验，逐段 CRC 写入 `LoadedSection::crc_ok`。
+read_selected（`include/bitcask/search_checkpoint.hpp`）支持按段类型过滤
+读取——脏段重序列化时不重读、干净段零拷贝搬入新 ckpt。
 
-### 3.3 段类型(type,与姊妹引擎 cellar 对齐)
+### 3.1 段类型
 
-| type | 名称 | 必需性 | payload |
-|---|---|---|---|
-| 1 | `docmap` | **可选加速** | `ord → key/loc/live/doc_len`(原 BCIS sidecar 内容) |
-| 2 | `bm25.default` | 必需 | 默认域 `InvertedIndex` |
-| 3 | `bm25.fields` | 有字段时 | `u32 fieldCount; [name; InvertedIndex]×` |
-| 4 | `hnsw` | 有向量时 | `HnswIndex` 图头(V7:BVH2 v2,int8 码字内嵌;f32 向量外存 `search.vec`) |
-| 5 | `meta` | **可选加速** | `u32 count; [ord; blob]×`(过滤搜索免按 ord 读 data;缺失则按需读) |
-| 6 | `terms` | **可选加速** | `ord → 分析后 term`(回放/重建免重分词;缺失则 fold 原文重分词) |
+| `CkptSectionType` | 数值 | 用途 |
+|-------------------|------|------|
+| `kDocmap` | 1 | docmap base 段（v2 gap+vbyte 行编码） |
+| `kBm25Default` | 2 | bm25 默认域 `InvertedIndex` |
+| `kBm25Fields` | 3 | bm25 多字段 |
+| `kHnsw` | 4 | hnsw 段（V7 header，f32 payload 外置） |
+| `kMeta` | 5 | 可选加速缓存 |
+| `kTerms` | 6 | 可选加速缓存（terms-cache，替代旧 bm25 WAL） |
+| `kBm25DefaultDelta` | 7 | bm25 默认域 delta |
+| `kBm25FieldsDelta` | 8 | bm25 多字段 delta |
+| `kDeltaInfo` | 9 | 链校验三元组（`base_gen u64` / `prev_wm u64` / `seq u32`） |
+| `kDocmapDelta` | 10 | docmap delta（v1 定宽；保留兼容读） |
+| `kHnswDelta` | 11 | hnsw 插入日志 |
+| `kKeydirDelta` | 12 | keydir 元数据（`"BKMD"`：标量/fstats/字节水位） |
+| `kDocmapDeltaV2` | 13 | docmap delta v2（gap+vbyte 行编码） |
 
-新增索引类型只登记新 type,**不新增文件**。
+段类型定义于 `include/bitcask/search_checkpoint.hpp` 的
+`CkptSectionType` 枚举。
 
-**type 1/5/6 是纯加速缓存(可删、不参与正确性)**:
-- `docmap`(type 1):在 → 直接载入 `docs/_docs`;**不在 → 从 `keydir(ord→key) ⋈
-  bm25 postings(ord→doc_len) + fold 尾巴` 现场推导**——bitcask 的 v5 impacts 已在
-  posting 持久化 per-doc `doc_len`(`inverted.hpp:88`,`doc_len=Σtf`),`live` 由
-  keydir(ord==keydir[key].ord)定,纯向量/空文本文档(无 postings)由 keydir 覆盖、
-  dl=0。两条路结果等价。**故 docmap 不再是真相、不与 keydir 抢权威**(化解
-  keydir/docmap 重复 + loc 分叉,见 §6.6)。
-- `terms`(type 6)取代旧 bm25 WAL 的"免重分词"价值,但与"WAL=耐久日志"语义分离(§6)。
+### 3.2 checkpoint v2 文件版本
 
-**不再设 `coverage` 段**:完整性由 watermark + fold 兜底(§4);存活 ord 集已由
-docmap(含 live)或 keydir 推导覆盖,无需单列。
+`kCkptVersion2 = 2` 仅用于**含 `kDocmapDeltaV2` 段**的文件：
 
-## 4. 恢复模型:分段载入 + 单趟尾部回放
+- 写端：含 v2 段型则用 `kCkptVersion2` 写出（`SearchCheckpoint::write`
+  的 `version` 入参默认 `kCkptVersion`，caller 显式传 `kCkptVersion2`）
+- 读端：`read` / `read_selected` 双收 `kCkptVersion` 与 `kCkptVersion2`
+- 旧读端（只认 `kCkptVersion`）整文件拒收 → 链断 → 退 fold——这是
+  「降级安全」设计：含 v2 段的文件不会被旧读端静默忽略丢行推进水位
 
-open 流程(取代 `load_recovery_snapshots` + `load_keydir_from_disk` 双轨):
+## 4. 组件 ckpt 数据结构
 
-1. **载 keydir**:`kv.keydir.ckpt`(单块,CRC 校验)。失败 → keydir 视为空,
-   其水位 = 0。
-2. **载 search.ckpt(分段)**:
-   - 读页脚 footerCrc:**结构完整**才继续;结构损坏(页脚缺失/footerCrc
-     失败,tmp+rename 已基本杜绝)→ **回退 `search.ckpt.prev`**(同样校验);
-     都不行 → 整个 search 视为空(水位 0,全量重建兜底)。
-   - 遍历目录**逐段校验 CRC**:CRC 通过 → 载入该段(docmap/bm25/hnsw);
-     **CRC 失败 → 仅标记该 type「待重建」,其余段照常载入**(损坏隔离)。
-3. **重建 `docs/_docs`(ord→doc)**:
-   - `docmap` 段在且 CRC 通过 → **直接载入**(key/loc/live/doc_len,免推导)。
-   - 否则 → 从 **keydir(ord→key) ⋈ bm25 postings(ord→doc_len)** 现场推导;
-     纯向量/空文本文档由 keydir 覆盖、dl=0;未覆盖的 ord 由第 4 步 fold 补全。
-     (docmap 是纯加速缓存,缺失不影响正确性——见 §3.3、§6.6。)
-4. **水位模型(简化:单 ord watermark + keydir 字节水位 + 保存序不变量)**:
-   - `kv.keydir.ckpt` 带 **per-file 字节水位**(fold 的 `start_offset` 驱动,不变)。
-   - `search.ckpt` 头部只带**单个 ord watermark** = 保存时 `next_ord`(它覆盖的
-     搜索 ord 上界);**不需要** per-file 字节水位。
-   - **保存序不变量**:`keydir_covered ≤ search_covered`——close 端两者同点(相等)、
-     merge 端 keydir 水位在 flush 前捕获(≤ 搜索覆盖)。现存代码已维持(§5)。
-   - **fold 下界**:`fold_start(fid) = (search.ckpt 健康且全段 CRC 通过) ?
-     keydir_wm(fid) : 0`。因不变量 `keydir_covered ≤ search_covered`,从
-     keydir_wm 起 fold 给出的 `[keydir_covered, end)` **必覆盖搜索所需的
-     `[search_covered, end)`**——搜索各索引按自身 ord 水位**自门**丢弃
-     `[keydir_covered, search_covered)` 的重叠。
-5. **单趟 fold**:对每个 data 文件从 `fold_start(fid)` fold 到尾,**一个回调**
-   同时喂 `keydir.put/remove` + `DocIndex.put_doc` + `bm25.add_doc/remove`
-   + `hnsw.insert`(沿用现 fold 回调结构;不再走「有 search_layer 跳过 hint」特判)。
-   - **自门**:bm25/hnsw/docmap 均 ord 水位幂等(add_doc 丢 ord≤floor、insert 丢
-     ord≤水位、put_doc 覆盖),keydir put 覆盖——故重喂恒安全,无需逐索引显式门。
-   - **段级重建**:某搜索段 CRC 坏/缺(第 2 步)→ 内存为空、需 `[0,end)`;此时
-     `fold_start` 取 **0**(健康段已载入,fold 中靠自门跳过其重应用,**只有坏段
-     真正重建** → bm25 坏只重分词、hnsw 坏只重插)。即 I/O 不省但 CPU 只付坏段。
-6. **幂等收敛**:回放区每条都是重 put/重 insert,与全量 fold 同语义
-   (附录 A·不变量 1),方向安全。
+`include/bitcask/component_ckpt.hpp` 收敛三组件（docmap / bm25 / vec）
+共同的链状态与载入结果类型。各插件类以 `using` 别名暴露
+（`TextPlugin::ChainState` 等既有名字不变），差异化的 setter 语义
+（如 `VectorPlugin::set_chain_state` 联动 `delta_window_wm_`）仍留在各类。
 
-**无成对门、无悬崖**:健康路径 `fold_start=keydir_wm`(跳 I/O、各索引自门);仅当
-keydir.ckpt 缺失**或**某搜索段坏/缺(且 keydir 水位>0)才回退 `fold_start=0`——
-后者 I/O 不省,但 CPU 只付"坏段重建",健康段自门跳过。**罕见损坏 ≠ 全库全量重建。**
+```cpp
+// 组件链状态：base 世代 | 链覆盖水位 | 下一 delta 序号
+struct ChainState {
+    std::uint64_t base_gen = 0;
+    std::uint64_t chain_wm = 0;
+    std::uint32_t next_seq = 1;
+};
 
-## 5. 写入(snapshot)流程 + 周期 checkpoint
+// delta 写结果
+struct DeltaSaveResult {
+    bool          wrote = false;
+    std::uint32_t new_seq = 0;
+};
 
-现仅 close(`cask.cpp:664`：search.ckpt `:694`、keydir `:697`)/merge
-(`Cask::merge` `:1739`：keydir `:1757`、search.ckpt `:1779`、收尾 keydir `:1812`)。
-新增周期触发,把 `wm_min` 拉近尾部、限定崩溃后回放量。`search.ckpt` 单文件分段写流程:
-
-```
-1. drain 异步索引(IndexPool 静止);watermark = keydir.next_ord。
-2. 逐段 type:
-   - 该段自上次 checkpoint「脏」(有相应写入)→ 重新序列化 payload + 算 crc。
-   - 否则【段级复用】→ 从旧 search.ckpt 按旧目录把该段原始字节拷贝前移
-     (含旧 crc),不重序列化。
-3. 写 temp:头部 + 各段 payload + 页脚目录(每段 offset/len/crc) + footerCrc
-   + dirLen + trailer。fsync temp。
-4.【代际】把现有 search.ckpt 重命名为 search.ckpt.prev(覆盖旧 .prev)。
-5. rename(temp → search.ckpt)(原子)。
-6. keydir.ckpt 单块照常 tmp+rename(独立)。
+// 组件载入结果
+struct LoadResult {
+    bool          loaded = false;
+    std::uint64_t watermark = 0;
+    bool          from_prev = false;
+    bool          all_segments_ok = false;
+};
 ```
 
-- **脏标记**:写路径维护 4 个 dirty bit(bm25 写 / 字段写 / 向量写 / docmap
-  写),落快照后清零。无向量写的周期里 `hnsw` 段**零成本前移**——砍写放大。
-- **触发**:写入字节/文档累计超阈值(`checkpoint_interval`),在 worker
-  静止窗口执行。
-- **静止性**:沿用「写者静止点才 dump」(附录 A·不变量 4)。
-- **顺序**:watermark **先于** payload 捕获(水位 ≤ 覆盖点 ⟹ 回放区与快照
-  重叠,幂等安全);keydir.ckpt 与 search.ckpt 落盘顺序无关(回放取 wm_min)。
+链走读由 `bitcask::search::walk_chain`（`include/bitcask/ckpt_chain.hpp`）
+统一管理：
 
-## 6. 删 bm25 WAL 的论证与替代
-
-- **可删性**:bm25 增量已在 data 文件(text 段)持久化;fold 尾部经
-  analyzer 重建倒排,与现 `recover_doc` 路径一致。WAL 非真相源。
-- **唯一损失**:replay 免重新分词。量级 = 「两次 checkpoint 间新增文档」
-  的 tokenization,被 §5 周期阈值限定有界。
-- **替代(可选,profiling 驱动)**:若实测 tokenization 占回放主成本,
-  引入 `search.bm25.f{i}.terms`——只缓存「ord → 分析后 term」,回放时
-  命中则免分词,缺失则 fold 原文。它是**纯加速缓存**(可删、不参与门),
-  与「WAL=耐久日志」语义分离,不恢复双重日志。
-- **迁移**:`enable_wal/replay_wal/truncate_wal` 调用点摘除;`InvertedWal`
-  保留为 terms-cache 的载体或整体下线(二期决定)。
-
-## 6.5 代际回退(`.prev`)——增量源是 data 文件,不是搜索 WAL
-
-`.prev` 是上一代 `search.ckpt`(覆盖较老 watermark)。最新 `search.ckpt`
-**整体**位腐(footerCrc 失败)时回退它,再追平到当前:
-
-```
-最新 search.ckpt footerCrc 失败
-  → 载 search.ckpt.prev(逐段 CRC 同样校验)
-  → fold data 尾巴(从 .prev 的 per-file 水位起)补 [watermark_prev, now) 增量
-  → 恢复到当前
+```cpp
+template <typename Apply>
+ChainWalk walk_chain(const std::string& base_path, std::uint64_t base_gen,
+                     std::uint64_t base_coverage, std::uint32_t chain_seq,
+                     bool unbounded, Apply&& apply);
 ```
 
-**关键**:追平的增量来自 **data 文件尾巴(我们的 WAL)**,不需要搜索 WAL。
-因此「砍搜索 WAL」与「保留 `.prev`」**互不冲突、各自独立**(cellar 更新版
-已与此完全一致:同样砍搜索 WAL、`.prev` 用 data 尾巴追平)。
+行为：
 
-- 在本架构里 `.prev` 是**纯恢复提速**:把"最新损坏"从全库重建降到尾巴重放;
-  正确性始终由 data 文件兜底,非 durability 必需。
-- 增量"保留"免费:data 记录在 merge 前一直在;merge 搬走的记录换新
-  ord/位置后 fold 当前文件照样重放(成对门处理"不在水位表→从 0 fold",
-  见 §7.3)。**无需"WAL 保留到最老代际"那种截断策略**。
-- 段级 CRC(§3.2)与 `.prev` 互补:**单段坏**→ 当代按段重建(§4.2);
-  **整文件结构坏**→ 回退 `.prev`。二者覆盖不同损坏粒度。
+- 从 `<base>.d1` 逐个递增 `seq`，到 `chain_seq`（有界）或首缺文件（无界）
+- 每个 `.d<seq>` 调 `SearchCheckpoint::read`；校验 `kDeltaInfo` 段三元组
+  `base_gen / prev_wm / seq` 必须与 `base_gen` / 当前 coverage / 当前 seq
+  一致
+- 通过则调 caller 的 `apply(LoadedCheckpoint)`；失败（read 坏 / 三元组错 /
+  apply 假）→ 断链返回 `ok=false`
 
-## 6.6 docmap 是纯缓存,不与 keydir 抢权威(去重)
+`unbounded == true` 时缺文件 = 正常链尾（legacy / shim 无 manifest 链长
+提示时用）；`false` 时缺文件 = 链断（manifest 提示链长可信时用）。
 
-docmap 每行 7 个字段与 keydir **6 个重合**(key/file_id/offset/total_sz/tstamp/ord),
-唯一独有的是 `doc_len`。本设计(采纳 cellar 更新版)把 docmap 段做成**可选加速
-缓存**,所有字段都有派生来源,故**不再独立持久化、不与 keydir 抢真相**:
+`remove_chain_files`（同头）实现 base 落成后的链坍缩：连续 8 个 miss
+序号即停（链恒连续 `1..N`，8 空洞 orphan 扫尾足够）。
 
-- `ord→key`、`live`(ord==keydir[key].ord)← **keydir**。
-- `doc_len` ← **bm25 postings**(bitcask v5 impacts 已存 per-doc dl,`doc_len=Σtf`)。
-- 无 postings 的纯向量/空文本文档 ← **keydir** 覆盖,dl=0。
+## 5. manifest 协议
 
-收益:① 消除 keydir/docmap 的字段重复与"两份 loc 因 merge 分叉"风险(单一真相
-= keydir+bm25);② docmap 在 → 省一次 join+postings 扫描的载入加速;不在 → §4.3
-现场推导,正确性不依赖它。这也是为什么 **keydir 不并进 `search.ckpt`**:它是 KV
-层、纯 KV 库也有,docmap 反过来从它派生即可。
+`include/bitcask/index_manifest.hpp` 定义 per-component 协议的**唯一
+commit point**：
 
-## 7. 关键不变量
-
-1. **wm_min 安全**:回放下界取各块水位最小 ⟹ 任一块的尾巴都被覆盖;
-   某块 checkpoint 缺失(水位=0)⟹ 该块从头重建,其余块多读尾巴无害
-   (幂等)。
-2. **崩溃任意点**:checkpoint 偏旧或部分写(tmp 未 rename)⟹ 对应块退回
-   旧态/空态,wm_min 下移,fold 补齐。无「门失败 → 全量 fold」悬崖。
-3. **merge unlink 竞争**:沿用 附录 A·不变量 3——
-   指向已 unlink 文件的 entry 被 merge 输出文件以同 ord 重 put 覆盖。
-4. **ord 单调**:回放 `advance_ord(view.ord)` 重建 next_ord;checkpoint
-   的 next_ord 仅作上界校验(`peek_next_ord`)。
-
-## 8. 阶段划分(诚实边界)
-
-> 路线图编号见 `ROADMAP.md` P14;子阶段 P14a–d 与本节一一对应
-> (避免与 2.1.0 的 P1–P4 撞号)。开发顺序(与 P5–P13 交织)见 ROADMAP「开发顺序」。
-
-- **P14a**(已落地):纯重命名 + 文件契约文档化。`.snap→.ckpt`、bm25
-  base `bm25_snapshot.inv→search.bm25`、段 `.f{i}.inv→.f{i}.seg`、
-  WAL `.f{i}.inv.wal→.f{i}.wal`;代码常量(`kKeydirSnapName` 等)与
-  写/读路径同步;**无格式/逻辑变更**。
-  迁移(不考虑可重建文件兼容,见原始约束):**旧名不再读**——升级后
-  首次 open 因找不到新名 checkpoint 走一次全量 fold,close 落新名;
-  旧名文件成孤儿(无害,可手删)。meta/field.schema/data/hint 不动。
-  验证:`cpp/` 全量 410 测试通过。
-- **P14b**:统一 wm_min 单趟回放,替换双轨 + 成对门悬崖。删除「有
-  search_layer 跳过快路径」逻辑。
-- **P14c**:周期性 checkpoint(`checkpoint_interval` 配置 + worker 静止窗口)。
-- **P14d**:摘除 bm25 WAL;按 profiling 决定是否引入 `terms` 缓存。
-- **P14e**(新增,与 cellar 全面收敛):把 P14a 的多文件搜索 checkpoint 收编为
-  单个分段 `search.ckpt`(§3.2:页脚目录 + 逐段 CRC + 段级脏位复用)+ 代际
-  `search.ckpt.prev`(§6.5)。`kv.keydir.ckpt` 保留独立。恢复改为分段载入 +
-  段级重建 + `.prev` 回退(§4)。**docmap/meta/terms 做成可选加速缓存**:
-  docmap 缺失时从 `keydir⋈bm25 postings + fold` 派生 `docs/_docs`(§4.3、§6.6)——
-  需给恢复路径加这条派生路。旧多文件名不再读(可 fold 重建,flag-day)。
-- 各阶段独立可上线、独立验收;P14a 即可消除命名混乱,P14e 收口为单文件。
-
-## 9. 验收
-
-- **等价性**:任意阶段后,「checkpoint 路径 reopen」与「删全部 .ckpt
-  全量 fold reopen」键集/值/删除/检索结果一致(KV + bm25 + 向量三模)。
-- **重用率**:崩溃注入(kill -9 于持续写入中)后 reopen,P2 起**不再
-  全量 fold**,fold 区间 ≈ `tail_from(wm_min)`;P3 后该区间被周期阈值限定。
-- **IO 下降**:P4 后单次搜索 put 的写放大从 2(data+WAL)降到 1;
-  统计稳态文件数减少(无 `.wal`)。
-- **损坏注入(P14e 段级)**:翻转 `search.ckpt` **单段** payload 字节 → 仅该
-  type 走重建、其余段正常载入(验证损坏隔离);翻转**页脚** → 回退 `.prev`
-  + fold 尾巴追平;两者数据/检索结果均与全量 fold 等价。
-- **代际回退**:会话2写入后 kill,损坏最新 `search.ckpt` → reopen 用 `.prev`
-  + data 尾巴恢复,会话2 的写/删可见。
-- **段级复用**:无向量写的周期落 checkpoint → `hnsw` 段字节与上代逐字节相同
-  (未重序列化)。
-- **基准**:`BM_Cask_Open` 三模 × {clean close / crash} × {有无周期
-  checkpoint};写放大 / 稳态文件数对照。
-
-## 10. 与 cellar 提案(`design-cellar-search.md`)对比——已全面收敛
-
-cellar(JDK/.NET 姊妹引擎)更新版**已和本设计完全收敛到路线 A**:两引擎在
-搜索持久化上一致——单文件分段 + 逐段 CRC + 页脚目录 + 段级脏位复用 + 代际
-回退 + 周期 checkpoint,且**都以 data 文件为唯一 WAL、砍掉搜索 WAL、`.prev`
-用 data 尾巴追平**。docmap/meta/terms 同为可选加速缓存,均无 `coverage` 段。
-
-| 维度 | 本设计 | cellar(更新版) |
-|---|---|---|
-| 搜索快照 | `search.ckpt` 分段 + 逐段 CRC + 页脚目录 | `cellar.search`,**同** |
-| 段编号 | 1 docmap·2 bm25.default·3 bm25.fields·4 hnsw·5 meta·6 terms | **同** |
-| docmap/meta/terms | 可选加速缓存,缺失从 keydir⋈postings+fold 派生 | **同** |
-| 搜索 WAL | **无**(data 即 WAL) | **无**,**同** |
-| `.prev` 追平增量源 | data 尾巴 | data 尾巴,**同** |
-| 完整性守卫 | watermark + fold(无 coverage 段) | **同** |
-| keydir/hint | 与 search 分层(`kv.keydir.ckpt` 独立) | 与 search 分层,**同** |
-
-**唯一差异 = 命名/magic**:本设计 `search.ckpt` / `BCSC`,cellar `cellar.search`
-/ `CSCH`——**当前不互通**(搜索 checkpoint 是各自本地缓存,本就不要求跨引擎
-互读;跨引擎互读的是 data/hint/meta/DocValue 等**真相源**)。段 payload 沿用
-各自中立小端序列化;若未来要让 checkpoint 也跨引擎互读,再统一 magic/前缀/
-段编号。
-
----
-
-## 附录 A:keydir 段快照——不变量、格式、写入点(原 A4 设计并入)
-
-> 原 `recovery-snapshot-design-zh.md`(A4:keydir 段快照 + 尾部回放)已被本文取代
-> 并删除。其中仍生效的部分——快照不变量(被 §4/§5/§7 引用)、`kv.keydir.ckpt`
-> 字节格式、写入触发点——收录于此。对应代码:`keydir.cpp` 的
-> `save_snapshot/load_snapshot`、`data_file.cpp` 的 `fold(start_offset)`、
-> `cask.cpp` 的写入/加载点。
-
-### A.1 问题与方案
-
-open 重建 keydir 本需 fold 全部 data(或 hint)文件,O(全库)。方案:在**写者
-静止点**(close、merge 末尾)把 keydir 内存态整体落盘,附带 **per-file 字节水位**;
-open 时加载快照,再只 fold 各文件水位之后的尾巴。快照是**纯优化**:任何校验
-失败 → 丢弃,走原全量 fold。
-
-### A.2 关键不变量与论证
-
-1. **水位先于 dump 捕获**:水位 ≤ 快照覆盖点 ⟹ 尾部回放区间与快照有重叠,
-   重放是重 put/重 remove——keydir fold 语义本就幂等(全量 fold 同样反复覆盖),
-   方向安全。
-2. **快照 = keydir 精确状态**:覆盖区内的墓碑已体现为「键不存在」,无需重放;
-   水位后的墓碑由尾部 fold 正常执行。
-3. **崩溃于 merge unlink 与快照写之间**(快照偏旧):快照里指向已 unlink 文件的
-   entry,其 key 必然被 merge 输出文件(不在水位表 → 从 0 全量 fold)以同 ord
-   重 put 覆盖;与现状「old+merge 文件并存崩溃」同一恢复语义。
-4. **活跃 fold(MultiEntry 存在)时拒绝快照**:save 返回 false,本次放弃——
-   快照点都在写者静止处,正常不会撞上。
-
-### A.3 格式(`kv.keydir.ckpt`,BCKS,LE,tmp+rename 原子写)
+- 文件大小：80 字节（`kManifestSize = 12 + kComponentCount * 20 + 8`）
+- magic：`"BCMF"`（`kManifestMagic`，文件头与文件尾双重）
+- version：1（`kManifestVersion`）
+- 组件 ID：`kDocmap=0` / `kBm25=1` / `kVec=2`（`ComponentId` 枚举，
+  `kComponentCount = 3`）
+- 每组件 entry：`(base_watermark u64, chain_seq u32, chain_watermark u64)`
+- 尾部：footer CRC32 覆盖 header + body + trailer magic
 
 ```
-[magic "BCKS"][ver=1]
-payload:
-  next_ord u64 | epoch u64 | biggest_file_id u32 | key_count u64 | key_bytes u64
-  fstats_n u32 × {file_id,live_keys,total_keys,live_bytes,total_bytes,
-                  oldest,newest,expiration}
-  wm_n u32 × {file_id u32, covered_offset u64}
-  entry_n u64 × {klen u16, key, file_id u32, total_sz u32,
-                 offset u64, epoch u64, tstamp u32, ord u64}
-[crc32(payload)]
+[magic "BCMF"(4)][version u32=1][component_count u32=3]
+per component [0=docmap, 1=bm25, 2=vec]:
+  base_watermark u64 | chain_seq u32 | chain_watermark u64
+[footer_crc32 u32][trailer "BCMF"(4)]
 ```
 
-防御:长度/CRC 校验失败、截断、版本不识 → load 返回 nullopt 并清空状态,
-调用方全量 fold。
+`write_manifest`（同头）走 `tmp + fdatasync + rename + 目录 fsync`；损坏
+（含 CRC 失败）退全量 fold——80 字节 + CRC + 原子 rename 足够可靠，无
+`*.manifest.prev`。
 
-### A.4 写入点与触发
+`Manifest::min_chain_watermark()` 返回所有组件 `chain_watermark` 的最小值
+（任意一条 0 则返 0）——fold 起点候选。
 
-- `Cask::close()`:close_write_file 之后(写者静止),best-effort;
-- `Cask::merge()` 末尾:trim_fstats 之后(水位取 unlink 后的现存文件);
-- 水位 = scan_dir 各 data 文件当前字节大小(pwrite 无缓冲,fs size 精确)。
+## 6. paired save 语义
 
-> 搜索模式下早期(2026-06)曾尝试以独立 `bm25`/`index` sidecar 快照打通 search 快
-> 路径并经历多次门控调整;该过渡历史已被正文「单文件分段 `search.ckpt` + 单趟
-> 尾部回放」整体取代,不再保留细节。
+`Cask::save_checkpoint_paired`（`src/cask/cask.cpp`）是所有搜索模式 ckpt
+保存的**统一入口**（手动 / 自动 / 收尾 / merge / ①均经此）。`dir` 固定
+为 `dirname_`，写序不变量 `keydir_covered ≤ search_covered` 集中在一处
+维护。
+
+### 6.1 决策路径
+
+1. 脏掩码组装：`docmap_->dirty()` / `text_->dirty()` / `vec_plugin_->dirty()`
+2. 全局判据 `global_base = !any_dirty || ckpt_rebase_needed_`（close /
+   compact / rebuild / legacy / merge 走 base；脏但无 rebase 走 delta）
+3. 链上限：`docmap_cap = (max_delta_chain > 0 && docmap_chain_.chain_seq
+   >= max_delta_chain)`——docmap 走 base，插件自查各自上限
+4. 走 base 还是 delta 由每组件自决（S18-6）：docmap 走 `save_docmap_base` /
+   `save_docmap_delta`；bm25 / vec 经 `plugin::flush` 自决（rebase 标志 +
+   链长上限）
+
+### 6.2 docmap 侧
+
+- `index::save_docmap_base`（`include/bitcask/docmap_ckpt.hpp` /
+  `src/keydir/docmap_ckpt.cpp`）：`rename(base, base.prev)` + 写新 base +
+  `remove_chain_files` 清链文件 + `Index::begin_delta_window(watermark)` +
+  `clear_removals` + `clear_dirty` 收尾
+- `index::save_docmap_delta`（同上）：写 `<base>.d<seq>`，含 `kDeltaInfo` +
+  `kDocmapDeltaV2` 段（窗口 live 行 + 删除日志按 ord 升序交错）+ 可选
+  `kKeydirDelta` 段（keydir 半边元数据内联进 delta 文件，delta 路径不
+  写独立 keydir 快照）
+
+### 6.3 插件侧
+
+`plugin::FlushRequest` 经各插件 `flush()`：返回 `FlushResult{ status,
+covered_ord, generation, chain_seq, chain_wm }`。宿主把 `chain_seq` /
+`chain_wm` / `generation` 写入 `new_manifest.entries[comp]`。
+
+### 6.4 keydir 快照成对
+
+`global_base` 走时（docmap base 已落成）→ 调 `write_keydir_snapshot(*wms)`
+写 `kv.keydir.ckpt`。Delta 路径不写 keydir 快照——keydir 元数据已内联
+进 docmap delta 的 `kKeydirDelta` 段。
+
+### 6.5 写序不变量
+
+`write_manifest` 是**唯一 commit point**，且走 `fdatasync + 目录 fsync`——
+保证组件数据先于 manifest 落盘（manifest 在 `SearchCheckpoint::write`
+的同名 fdatasync 屏障后写入）。崩溃窗口处理：
+
+- 已写组件 / 未写 manifest → manifest 仍指旧代，链走读退回 `chain_seq=0`
+  起点、缺文件即停
+- 已写 manifest / 未写 keydir 快照 → keydir 快照在下一次 close / merge
+  末尾 `write_keydir_snapshot()` 兜底（best-effort）
+
+## 7. 恢复时序
+
+`Cask::load_keydir_from_disk`（`src/cask/cask_recovery.cpp`）是 open 期
+keydir 与索引统一恢复入口。完整流程：
+
+```
+open(dirname, opts, &registry)
+  └─→ meta 读取（bitcask.meta v3 → MetaConfig：mode / 向量配置）
+  └─→ keydir::open → KeyDir 实例
+  └─→ load_recovery_snapshots                       # 见 §7.1
+  └─→ load_keydir_from_disk → 调 fold_one(e) × N    # 见 §7.2
+       └─→ ① 收尾 save_search_ckpt_paired           # 见 §7.3
+```
+
+### 7.1 `load_recovery_snapshots` —— 快照快路径
+
+`src/cask/cask_recovery.cpp::Cask::load_recovery_snapshots` 流程：
+
+1. **keydir 快照先载**：`keydir_->load_snapshot(dirname_/kKeydirSnapName)`。
+   返回 `RecoverySnapshots::snap_wms`（per-file 字节水位）与
+   `snap_loaded = true`。
+2. **legacy 一次性迁移**：`!has_manifest && has_old_ckpt` 时
+   `migrate_legacy_search_ckpt()`——读旧 `search.ckpt` 段集、改写为
+   per-component 文件族 + `index.manifest` + 删旧文件（`.prev` / `.d<seq>`
+   / `.vec` / `.qc8`）。
+3. **manifest 读**：`bitcask::read_manifest(mpath)`。读不到 → 全量 fold。
+4. **docmap 组件直载**：`index::load_docmap`（`include/bitcask/docmap_ckpt.hpp`）
+   以 `entry.base_watermark` 校验 base，失败退 `.prev`；成功后链重放
+   （`DocmapReplayHook` 透传 `kKeydirDelta` 段到宿主 keydir LWW put 与
+   标量/fstats/字节水位更新）。
+5. **插件 open**：经 `plugin::OpenContext` 注入器注入 `dir` / `host` /
+   `committed_{base,chain}_watermark` / `committed_chain_seq`；所有路径
+   （含 manifest 缺失 / 迁移失败的全量 fold 早退）都必须调用——零提示
+   时插件自降级（`watermark 0` + rebase 置位 → 首次 flush 全量 base）。
+6. **健康判据**：每组件 `plugin->watermark() == entry.chain_watermark` 即
+   健康。所有组件健康 → 清 `ckpt_rebase_needed_`。
+7. **快路径门**：`search_ok = all_components_ok && recovery.snap_loaded`。
+   任一组件 `.prev` 回退 → 字节水位不可信 → 退全量 fold。
+
+### 7.2 `load_keydir_from_disk` —— fold 主体
+
+`src/cask/cask_recovery.cpp::Cask::load_keydir_from_disk` 流程：
+
+1. `fileops::scan_dir(dirname_)` 列出 sealed data 文件（按 tstamp 升序）
+2. `load_recovery_snapshots()` 拿 `snap_wms` 与 `snap_loaded` 标志
+3. `fold_start(fid) = snap_loaded ? wm_of(fid) : 0`
+4. 对每个文件 `fold_one(e)`：
+   - `keydir_->increment_file_id_at_least(tstamp)`——保证后续 file_id 不撞
+   - 有 hint 且无 search 模式且无 snap_loaded → 走 hint fold（单遍校验
+     + fold，trailer CRC 不过时回调零次零污染）
+   - 否则走 data fold：`DataFile::fold(..., start_offset = fold_start, ...)`
+   - search 模式：每条 record 经 `decode_doc_value` → 攒批到
+     `recover_batch`（`kRecoverBatch = 1024`）→ 满批调 `flush_recover`：
+     批内 `tbb::parallel_for` 跑 `plugin::prepare`（分析并行），然后
+     fold 序串行 apply `docmap_->put_doc` + `plugins_[pi]->on_put`——
+     与活写路径 `reduce_index_entry` 同构
+   - 墓碑前必 flush 攒批（保「文档↔墓碑」相对序）
+   - search 模式墓碑重放：仅宿主 `docmap_->remove`（**不广播
+     `on_delete`**——恢复期不扣减倒排统计，统计基线随 ckpt 恢复）
+5. 调度：search 模式或单文件 → 串行 fold；纯 KV 库多文件 → 按硬件并发
+   数并行 fold（`JoiningPool` RAII 防 `terminate`）
+6. ① 收尾（post-recovery ckpt）：search 模式 + `recovered_docs >=
+   1000` + 读写模式 → 调 `save_search_ckpt_paired` 把刚 fold 出的成果
+   落盘。best-effort，失败仅降级下次启动速度
+
+### 7.3 崩溃恢复时序图
+
+```
+open(dirname)
+   │
+   ├─ read meta (bitcask.meta v3)         ←── §1 MetaConfig
+   │
+   ├─ keydir_->load_snapshot
+   │     └─ BCKS v2 校验失败 → snap_wms = {} (snap_loaded = false)
+   │
+   ├─ has_manifest ?                      ←── §5 manifest 协议
+   │     ├─ yes: read_manifest
+   │     │       └─ CRC 失败 → 全量 fold
+   │     └─ no + has_old_ckpt: migrate_legacy_search_ckpt
+   │             └─ 失败 → open_plugins(空 manifest) + 全量 fold
+   │
+   ├─ per-component load:
+   │     ├─ docmap::load_docmap ──> DocmapReplayHook → keydir 半边
+   │     └─ plugin->open (per-component chain state 注入)
+   │
+   ├─ watermark 对齐：
+   │     all_components_ok && snap_loaded → fold_start = keydir_wm(fid)
+   │     else                              → fold_start = 0
+   │
+   ├─ fold_one(e) × N                     ←── §7.2 fold 主体
+   │     ├─ data fold (search mode 攒批并行 prepare + 串行 apply)
+   │     └─ hint fold (纯 KV 无 search / 无 snapshot 时)
+   │
+   └─ ① post-recovery paired save        ←── §7.2 step 6
+         (search mode + docs ≥ 1000 时立即回存 ckpt)
+```
+
+`fold_one` 内的 hint fold 路径仅在「无 search 模式且无快照」时启用
+（`cask_recovery.cpp` 的 `fold_one`：e.has_hint && !search_on && !snap_loaded）；
+其他情况走 data fold 兜底。torn-write 恢复：`last_valid_end <
+actual_size` 且 `read_write && !merge_only` → `truncate_to(last_valid_end)`
+（best-effort，best-effort 不影响正确性）。
+
+## 8. legacy ckpt —— backward-compat fallback
+
+`src/cask/legacy_ckpt.{hpp,cpp}`（S19-2）是 pre-S17 统一 `search.ckpt` 的
+**load-only 读取器**，唯一生产用途是 `Cask::migrate_legacy_search_ckpt`。
+读端用旧路径 `load` 把段集载回，分发到 `Index` / `TextPlugin` /
+`VectorPlugin` 原语；链走读经 `sc::walk_chain`（unbounded，因为旧 ckpt
+无 manifest 链长提示）。实现从 `SearchLayer::load_search_ckpt` +
+`apply_delta_file` 平移，段分发与链重放语义逐字节一致。
+
+写端（`save_search_ckpt` / `save_delta_ckpt`）不在生产侧——随
+`SearchLayer` shim 降级为测试夹具（生成旧格式文件喂本读取器的迁移测试）。
+旧格式支持整体退役时本模块删除。
+
+`migrate_legacy_search_ckpt` 流程（`src/cask/cask_recovery.cpp`）：
+
+1. `legacy_ckpt::load(old_ckpt, *docmap_, *text_, *vec_plugin_)` 读段集
+2. 构造 `Manifest`——每组件 `base_watermark / chain_seq / chain_watermark`
+   统一对齐到 `result.watermark`（旧 ckpt 不区分组件 base / 链）
+3. 写 per-component 文件：
+   - `index::save_docmap_base` 写 `docmap.ckpt` + `docmap_chain_` 镜像
+   - `text_->save_component_base` 写 `bm25.ckpt`
+   - `vec_plugin_->save_component_base` 写 `vec.ckpt`
+4. `write_manifest(mpath, m)` 写 `index.manifest` 提交点
+5. 删旧 `search.ckpt` / `.prev` / `.d<seq>` / `.vec` / `.qc8`
+
+任一环节失败 → 返回 false，caller 退全量 fold（迁移失败安全降级）。
+
+## 9. 关键不变量
+
+1. **paired save 写序**：`global_base` 路径下 docmap base 落成后写
+   `kv.keydir.ckpt`；delta 路径下 keydir 元数据内联进 `kKeydirDelta` 段。
+   两路径均维持 `keydir_covered ≤ search_covered`。
+2. **commit point 单向性**：`index.manifest` 是三组件 ckpt 唯一提交点；
+   组件数据先于 manifest 落盘（`fdatasync` 屏障）——断电后 manifest 已
+   提交但组件页丢失 → CRC 坏 → 整组件退全量 fold，不会出现「manifest
+   OK 但组件坏」的混合态。
+3. **回退完备性**：`search.ckpt` / 三组件 base 均带 `.prev`；链走读
+   `chain_seq == 0` 表示零已提交 delta，孤儿 `.d1`（crash 在「先写 delta
+   后提交 manifest」窗口）被有界模式忽略（与 pre-S20 逐字节一致），
+   无界模式才会扫盘重放。
+4. **fold 起点自门**：`fold_start = snap_loaded ? keydir_wm(fid) : 0`。
+   `search_covered ≤ keydir_covered` 不变量保证 `[keydir_covered, end)`
+   覆盖搜索所需；搜索各索引按自身 ord 水位自门丢弃重叠区，幂等安全。
+5. **链校验三元组**：每个 `.d<seq>` 的 `kDeltaInfo` 段声明
+   `(base_gen, prev_wm, seq)`，必须与基准世代 / 当前 coverage / 当前
+   seq 一致——保证链是 `1..N` 连续、单调覆盖。
+6. **崩溃任意点安全**：checkpoint 偏旧或部分写（tmp 未 rename）→ 对应
+   块退回旧态 / 空态，watermark 下移，fold 补齐。无「门失败 → 全量
+   fold」悬崖。
+7. **墓碑前必 flush**：search 模式恢复 fold 时遇到 `kTombstone` → 先
+   flush 攒批（保「文档↔墓碑」相对序），再 `docmap_->remove`。墓碑不
+   广播 `on_delete`——历史语义保留（恢复期不扣减倒排统计，基线随
+   ckpt 恢复）。
+
+## 10. 关键写入点
+
+- `Cask::close()`：`Cask::write_keydir_snapshot()` + paired save
+- `Cask::merge()`：merge 末尾 `compact_chunks` + `force_ckpt_rebase` +
+  paired save（`save_search_ckpt_paired(search_ckpt, wm, wms, {})`，
+  merge 恒 rebase → 走 base + 全量快照）+ `write_keydir_snapshot` 兜底
+- `Cask::checkpoint()`：手动 checkpoint API，paired save
+- `Cask::maybe_submit_auto_checkpoint()`：周期自动触发（写者静止时
+  RunFn；`auto_checkpoint_min_docs` 阈值），保持 pending + in-flight 互斥
+- `Cask::recover` 末尾 ①：post-recovery paired save，把刚 fold 出的成
+  果落盘（避免下次崩溃再白付一次 fold）
+
+## 11. 验证矩阵
+
+| 场景 | 行为 |
+|------|------|
+| clean close → reopen | 走 paired save 路径；fold 从 keydir 字节水位起 |
+| kill -9 写入中 → reopen | manifest 仍指上一代；缺文件链走读断链 OK；fold 起点 0 |
+| 单段 CRC 坏 | 仅该 type 走重建（损坏隔离）；其余段照常载入 |
+| 整文件 footer 坏 | 回退 `.prev`；fold 尾巴追平到当前 |
+| manifest CRC 坏 | 全量 fold（manifest 自身是 commit point） |
+| legacy `search.ckpt` 单库 | 一次性迁移到 per-component + manifest；删旧文件 |
+| 迁移失败 | `migrate_legacy_search_ckpt()` 返回 false → open_plugins 空提示 + 全量 fold |
+| `deletion_rate_trigger` 兜底 | trigger 命中但 per-file 阶段无文件 → 全部非活跃文件入选 |
+| v1 / v2 ckpt 文件 | read 双收；含 `kDocmapDeltaV2` 段的文件以 v2 写出，旧读端整文件拒收（降级安全） |
+| active writer 文件出现在 fstats | `needs_merge` 排除；`fold` 不触碰 |
+
+## 12. 相关文件索引
+
+| 文件 | 内容 |
+|------|------|
+| `include/bitcask/search_checkpoint.hpp` | `SearchCheckpoint` 容器 + `CkptSectionType` 段类型 + kCkptVersion/kCkptVersion2 |
+| `include/bitcask/ckpt_chain.hpp` | `walk_chain` / `remove_chain_files` 链走读与坍缩 |
+| `include/bitcask/component_ckpt.hpp` | `ChainState` / `DeltaSaveResult` / `LoadResult` 公共类型 |
+| `include/bitcask/index_manifest.hpp` | `Manifest` / `ManifestEntry` / `kManifestName` / `ComponentId` / `kManifestSize` + `write_manifest` / `read_manifest` |
+| `include/bitcask/docmap_ckpt.hpp` | `save_docmap_base` / `save_docmap_delta` / `load_docmap` + `DocmapReplayHook` + `apply_delta_sections` 共享骨架 |
+| `include/bitcask/keydir.hpp` + `src/keydir/keydir.cpp` | `save_snapshot` / `load_snapshot` / `serialize_meta_delta` / `apply_meta_delta` |
+| `src/cask/cask_recovery.cpp` | `Cask::upgrade` / `load_keydir_from_disk` / `load_recovery_snapshots` / `migrate_legacy_search_ckpt` / `replay_delta_to_keydir` |
+| `src/cask/legacy_ckpt.{hpp,cpp}` | pre-S17 单文件 ckpt load-only 读取器（迁移 fallback） |
+| `src/cask/cask.cpp::save_checkpoint_paired` | paired save 唯一入口（脏掩码 / 决策 / commit） |
+| `src/cask/cask.cpp::Cask::merge` | merge 末尾 paired save 触发点（V4 Pipeline Contract） |
+| `src/cask/cask.cpp::Cask::write_keydir_snapshot` | keydir 快照落盘入口（成对） |
+| `src/cask/cask_internal.hpp` | `kKeydirSnapName` / `kSearchCkptName` / `kDocmapCkptName` / `kBm25CkptName` / `kVecCkptName` 文件名常量 |
+| `doc/format-zh.md` | ckpt 容器字节级格式 + 段类型详表 + v1/v2 文件版本 |
+| `doc/merge-policy-zh.md` | merge 触发与执行；本设计的 merge 写点 |

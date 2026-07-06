@@ -1,321 +1,764 @@
-# 线程安全化分析与工作方向（Thread-Safety Hardening）
+# 内部线程安全审计（As-Built 状态记录）
 
-> 来源：2026-06-25 对 `Cask` / `CaskIter` 对外 API 的并发契约审计。
-> 目的：把当前「调用方负责串行化写」的外部契约,评估是否/如何**内化**为
-> 接口级线程安全,并指定分阶段工作方向。
->
-> ⚠️ 本文是**方向性设计稿**,非实现记录。
-> **定位（2026-06-25 定向,见 §6）**：libbitcask 作为**通用 C++ 库**,而非
-> 仅服务 Erlang/NIF「一进程一 Cask」模型。该定位下 W1+W2+W3 为必做组。
+> 受众：项目维护者。配套用户向契约见 `doc/concurrency-zh.md`（重点在
+> 同 handle 多线程安全承诺），本文专做 **W1 + W2 + W3 加固设计落到代码
+> 后的当前实现状态** 审计——每条同步原语、每条不变量、每条锁全序都对应
+> 到具体头文件 / 源文件里的符号位置。
 
-## 1. 当前并发契约
+本文不再做方向评估（W1 / W2 / W3 已全部落地），任务是回答：
 
-**单写者 + 无锁多读者**,由调用方保证。
+> 「承诺的并发契约在代码里能否被找到对应同步原语？缺口在哪里？」
 
-- 设计前提（cask.hpp 顶部「线程模型」）：「一个 Erlang 进程持有一个 Cask
-  resource」,因此 Cask **自身不做内部并发写控制**。
-- 底层 KeyDir 可在同目录多个 Cask 间共享（`KeyDirRegistry` 管 refcount）;
-  多写者要求调用方自己串行化。
-- 读路径无锁：keydir get + `DataFile::pread` 线程安全,`read_files_` cache 受
-  `read_cache_mu_` 保护。
+术语：本文沿用 `concurrency-zh.md`（Phase 1 用户向文档）同一套名字
+（`write_mu_` / `read_cache_mu_` / `shared_mutex` / `flock` /
+`KeyDirRegistry` / `IndexPool` / HNSW atomic publish 等），侧重点是
+「**为什么这套原语在这里、对应哪条不变量、锁序怎么走**」，而
+`concurrency-zh.md` 偏用户契约（用 threading model 表格告诉调用方何
+时安全）。
 
-## 2. 竞态点精确定位（已核实代码）
+---
 
-### A. 写者 vs 写者 —— 真正的缺口
+## 1. 范围与基线
 
-| 共享可变态 | 位置 | 现状 |
-|---|---|---|
-| `DataFile::write` 的 `current_offset_` / `write_buf_` / `batch_buf_` | `data_file.cpp` | **无保护**（成员,非 atomic）;两写者并发即数据损坏 |
-| `writes_since_sync_`（组提交计数） | `cask.cpp` `maybe_group_commit` | **无保护** |
-| `active_file_id_` / `active_data_` | `ensure_active_writer` / `roll_active` | reset 已在 `read_cache_mu_` 下,但**整个写序列无互斥** |
-| keydir put / LWW | `keydir.cpp` | ✅ 已安全（`shared_mutex` + 原子 `ord`/`file_id`） |
-| 索引任务提交 | `IndexPool` | ✅ 已安全（MPSC 队列 + **S6 reorder buffer 本就支持任意到达序按 ord apply**） |
+### 1.1 审计对象
 
-→ **结论：多写者唯一缺的是「active 文件写序列」的互斥。** keydir 与索引池
-（S6 双池 + reorder buffer）早已为并发写提交设计就绪。
+| 模块             | 头文件                                       | 源文件                                       | 并发角色 |
+|------------------|----------------------------------------------|----------------------------------------------|----------|
+| `Cask` 门面     | `include/bitcask/cask.hpp`                  | `src/cask/cask.cpp`                          | handle 级串行化；读无锁；写互斥 |
+| `KeyDir`         | `include/bitcask/keydir.hpp`                | `src/keydir/keydir.cpp`                      | 256 分片锁 + 屏障 + MVCC |
+| `KeyDirRegistry` | `include/bitcask/keydir_registry.hpp`       | `src/keydir/keydir_registry.cpp`             | 同进程 KeyDir 共享 / IndexPool 持有 |
+| `FileLock`       | `include/bitcask/file_lock.hpp`             | `src/lock/file_lock.cpp`                     | 跨进程 flock（基于 `O_EXCL`）|
+| `IndexPool`      | `include/bitcask/thread_pool.hpp`           | `src/thread_pool/`                           | 异步索引 MapReduce |
+| `HnswIndex`      | `include/bitcask/hnsw.hpp`                  | `src/vector/hnsw.cpp`                        | 单写者 + 多读者无锁发布 |
+| `InvertedIndex`  | `include/bitcask/inverted.hpp`              | `src/bm25/inverted.cpp`                      | CoW posting + tbb::concurrent_hash_map |
+| `Plugin API`     | `include/bitcask/plugin_api.hpp`            | `src/cask/cask.cpp::CaskPluginHost`          | `run_serialized` 经 RunFn 通道 |
 
-### B. 读者 vs 写者 —— 基本已安全
+### 1.2 设计基线
 
-- `get` / `get_owned`：✅ **真安全**（`active_data_` 指针受 `read_cache_mu_` 守、
-  `pread` 线程安全、keydir `shared_mutex`）。
-- `search_text` / `phrase` / `near` / `bool_search` / `search_fields` / `search_fuzzy`
-  / `search_wildcard`：✅ **结构级已安全**（S6/S7 TSan 已证：`cache_`/`doc_texts_`
-  各 `shared_mutex`、倒排/HNSW `shared_lock`、analyzer const）。头文件「线程安全:否」
-  是**保守注释**,非真不安全。
-- `search_vector` / `search_*_batch`：✅ 已明确安全（HNSW `atomic<shared_ptr>` 快照;
-  批量入口专为 inter-query 并发设计）。
+- **同 handle 多线程安全**（S11 通用 C++ 库定位）：同一个 `Cask` 实例可
+  被多线程共享，所有公共方法的并发语义在 README + 各方法 doxygen 注释
+  + `concurrency-zh.md` 已言明。
+- **三类 open 模式的并发约束**与 `concurrency-zh.md` §1-§5 一致——
+  read_write 拿 `bitcask.write.lock`、merge_only 拿 `bitcask.merge.lock`、
+  只读不拿锁。
+- **跨进程隔离**靠 `flock`（`O_CREAT|O_EXCL` 文件锁的进程间互斥语义），
+  同进程多 handle 共享 KeyDir 靠 `KeyDirRegistry`。
 
-### C. 迭代器 / close —— 语义 / 生命周期问题（非数据竞争 bug）
+### 1.3 W 阶段总览
 
-- 同一 `CaskIter` 的 `start`/`next`/`release` 并发：cursor（有状态游标）语义本就
-  模糊,价值低。**不同** CaskIter 对象并发使用同一 Cask 已安全。
-- `close` vs 在途操作：use-after-free / use-after-close,本质是生命周期,标准
-  资源句柄都要求 caller 不在使用时关闭。
+| 阶段 | 目标                              | 状态     | 落地标志（详细见下） |
+|------|-----------------------------------|----------|----------------------|
+| W1   | 写路径内部串行化                  | ✅ 已实现 | `write_mu_`（`cask.hpp` 的 `std::mutex`）；覆盖 put / remove / put_doc / sync / close_write_file / backup |
+| W2   | 读 / 搜索并发确认 + 注释订正      | ✅ 已实现 | 读路径无锁；搜索路径全部 shared_lock / atomic publish；doxygen 注释订正为「并发读安全」 |
+| W3   | 生命周期硬化                      | ✅ 已实现 | `closed_` atomic + `WriteOpGate`（`writes_in_flight_`）+ `ckpt_mu_` |
 
-## 3. 工作方向（分阶段）
+W4（并行扫描）作为增值 API 已实现——`Cask::parallel_scan`（doxygen
+注释 + README 一行），不在本审计展开。
 
-### W1 — 写路径内部串行化【核心】
+> 以下 §2-§6 按符号逐项审计实现细节，并对照历史 §2 race condition 清单
+> （原文件 §2 节）逐条给出现状 = **已修复 / 仍开放 / N/A**。
 
-加 `std::mutex write_mu_`,覆盖写序列：`put` / `remove` / `put_doc` / `sync` /
-`close_write_file` / `flush_index`（连同其内部的 `ensure_active_writer` /
+---
+
+## 2. W1 — 写路径内部串行化（已实现）
+
+### 2.1 `write_mu_` 的覆盖范围
+
+`Cask::write_mu_`（`cask.hpp` 的 `std::mutex`，成员）声明见
+`cask.hpp` 的 S11-W1 注释：覆盖 put / remove / put_doc / sync /
+close_write_file 的整个写序列（包括 `ensure_active_writer` /
 `roll_active` / `maybe_group_commit` / `write_and_keydir`）。
 
-- **语义**：把「外部串行契约」内化为「内部互斥」。写本来就串行 → **吞吐不变**
-  （只加 ~20ns 锁开销,相对 pwrite/fsync 的 µs–ms 可忽略）;真多写者 caller 获得正确性。
-- **不动读路径**（读不取 `write_mu_`,保持无锁）。
-- **锁序**：`write_mu_` 最外层 → 内部再取 `read_cache_mu_` / keydir 锁（写路径不持
-  读锁,无反向依赖 → 无死锁）。merge 走独立路径（keydir `shared_mutex` 协调）,
-  `write_mu_` 不触 merge。
-- **验证**：新增「N 线程并发 put/remove 同一 Cask」TSan 测试。
-- **风险：低**。
+实现侧入锁点（`src/cask/cask.cpp` 的方法入口）：
 
-### W2 — 读/搜索并发确认 + 注释订正【便宜,收尾】
+| 方法                      | 入锁点                                                                                     |
+|---------------------------|--------------------------------------------------------------------------------------------|
+| `Cask::put`               | `std::unique_lock<std::mutex> wlk(write_mu_)`                                              |
+| `Cask::put_batch`         | 同上                                                                                       |
+| `Cask::put_doc`           | 同上                                                                                       |
+| `Cask::remove`            | 同上                                                                                       |
+| `Cask::sync`              | `std::lock_guard<std::mutex> wlk(write_mu_)`                                               |
+| `Cask::close_write_file`  | 同上                                                                                       |
+| `Cask::backup`            | 同上（`std::lock_guard<std::mutex> wlk(write_mu_)`，备份期间挡住写者，active 文件可 hardlink）|
 
-- 补「并发文本搜索 + 并发写」TSan 测试;把 `search_text` 等的「线程安全:否」订正为
-  准确描述（「并发读安全;与写的可见性遵循 near-real-time 契约」）。
-- **风险：零**（测试 + 文档）。
+`flush_index` 不纳入——读 / 搜索路径也调它，纳入会让搜索串行化；
+`IndexPool::flush` 自带 `flush_cv_` 同步（见 §6.1），本就线程安全。
 
-### W3 — 生命周期硬化【低优先,便宜】
+### 2.2 锁全序
 
-- 加 `std::atomic<bool> closed_`,公共方法入口检查 → 已关闭返回 `kInvalidOption`
-  而非 UB（fail-fast,尤其防 C API 多线程 host 误用）。
-- **不做**完整 rundown（关闭时等在途操作完成）——成本高、价值低。
-- **风险：低**。
+```
+write_mu_ (mutex, Cask 级)
+  └─► read_cache_mu_ (shared_mutex)
+        └─► DataFile 内部 / posix pread (per-call 无状态)
+  └─► KeyDir shard mutex（put path）
+        └─► KeyDir meta_mu_ (shared_mutex, fold 期间)
+  └─► fstats_grow_mu_ (mutex, 仅新 file_id 槽位构造时碰)
+```
 
-### W4 — 迭代器并行扫描【可选,按需】
+读路径不取 `write_mu_`——`get` / 搜索 / `parallel_scan` 直接走
+`read_cache_mu_` 的 shared_lock + KeyDir 分片锁 → **无反向依赖 → 无死
+锁**。
 
-- 不让单 iterator 并发（语义模糊）;如需并行遍历,提供「keyspace 分区 + N 个独立
-  iterator」的高层 API。
+### 2.3 H1：`submit_index_task` 移出 `write_mu_` 临界区
 
-## 4. 明确否决的方向
+**问题**（修复前）：`IndexPool::submit` → 内部 `tbb::concurrent_bounded_queue::push`
+在队列满（cap = `kDefaultIndexQueueCapacity`，10240）时**阻塞**写者——
+临界区里阻塞意味着同 handle 的全部写者冻结。
 
-**细粒度写并发**（预分配 offset + 并发 pwrite 到不相交区间）：data 文件是 WAL
-（每记录即时 durable）,并发 pwrite + offset 分配 + roll + 组提交协调极复杂,且
-**单 append log 写是 IO-bound,串行化不是瓶颈**——高风险换不到吞吐。否决;W1 的
-单写锁才是对的粒度。
+**修复**（`src/cask/cask.cpp` 的 `Cask::put` 等）：常规写路径
+（`IndexOp::Add` / `Delete`）在 `write_mu_` **释放之后**调用
+`submit_index_task`。reorder buffer 内部按 ord 升序 apply（`IndexPool`
+的 reducer 循环，见 §6.1），与到达序无关——所以锁外提交不破坏索引一致性。
 
-## 5. 推荐顺序与工作量
+例外：`IndexOp::Skip`（`OrdSkipGuard` 失败补偿路径）的提交可能在锁内
+（罕见路径，可接受）。
 
-| 阶段 | 收益 | 风险 | 工作量 |
-|---|---|---|---|
-| **W1** 写路径互斥 | **高**（通用库 handle 多写安全契约,见 §6） | 低 | ~半天 + TSan 测试 |
-| **W2** 搜索注释订正 + 配置类审计 | 中（消除误导 + 解锁查询并发） | 零 | ~2–3h |
-| **W3** close guard | 中（防 UAF,通用库必备） | 低 | ~2h |
-| **W4** 并行扫描 | 按需 | 中 | 视需求 |
+### 2.4 `WriteOpGate` 与 close 协调
 
-## 6. 目标定位：通用 C++ 库（2026-06-25 定向）
+`Cask::WriteOpGate`（`cask.hpp` 内部 RAII 守卫）：
 
-**不再只服务 Erlang/NIF「一进程一 Cask」模型,而是作为通用 C++ 库。** 这把
-线程安全从「可选」变成「契约」：通用库的使用者不会去读埋在头文件里的「单写者
-契约」,默认期望「同一个 handle 多线程用是安全的」。**一个会在并发写时静默损坏
-数据的存储库,不合格。**
+- **ctor**：`writes_in_flight_.fetch_add(1, std::memory_order_seq_cst)`
+- **dtor**：`writes_in_flight_.fetch_sub(1, std::memory_order_seq_cst)`，归零时 `notify_all`
+- **覆盖范围**：put / put_batch / remove / put_doc 整段 + **含释放
+  `write_mu_` 之后的索引提交尾段**——这是 H1 引入的细节：锁外补提交的
+  IndexTask 仍在 WriteOpGate 的生命期内。
 
-### 6.1 目标并发契约（对标 RocksDB / LMDB 等通用库）
+`Cask::close()`（`src/cask/cask.cpp`）的核心等待循环：
 
-| 维度 | 目标 | 当前 | 缺口 |
-|---|---|---|---|
-| 多线程并发**读**同一 handle | 安全 | ✅ 已满足 | — |
-| 多线程并发**写**同一 handle | 安全（内部串行） | ❌ 静默损坏 | **W1** |
-| 读 与 写 并发 | 安全（near-real-time 可见性） | ✅ 已满足（注释保守） | W2 文档 |
-| 迭代器 | 每线程一个（同 std 容器迭代器） | ✅ 已满足 | 文档化 |
-| 关闭后误用 | fail-fast 而非 UB | ❌ UB | W3 |
-| 同义词词典与查询并发 | 安全 | ✅ 已结构化为 open-time 不可变（`CaskOptions::synonym_map`，setter 已移除） | — |
+```
+closed_.exchange(true)                       // 幂等门
+for (n = writes_in_flight_.load(seq_cst);    // 等写者全部退出
+     n != 0;
+     n = writes_in_flight_.load(seq_cst))
+    writes_in_flight_.wait(n, seq_cst);
+```
 
-> 写吞吐说明（实测校准，见 §9）：**单写线程吞吐不受 `write_mu_` 影响**（uncontended
-> 锁 ~20ns ≪ pwrite）。**多写线程堆同一 handle 不提速、反降**——put 临界区极短
-> （~1µs），高争用下 futex 唤醒开销压过临界区（threads 1→8：980k→46k/s）。这不是
-> bug：data 是单 append WAL 文件层本就串行，往一个 handle 堆写线程只增争用。需要
-> 更高写并发 → **按目录分片多个 Cask 实例**（各自独立 WAL + 锁，标准横向扩展）。
+`seq_cst` 全序保证：写者「inc 后读 closed_」与 close「写 closed_ 后读
+计数」构成 store-buffer 形状——RMW 全序 + seq_cst load 阻止两侧同时读
+到旧值（见 `cask.hpp` 的 `WriteOpGate` 注释）。
 
-### 6.2 结论（通用库定位下）
+### 2.5 历史 race condition：写者 vs 写者（已修复）
 
-- **W1（写路径互斥）→ 必做**。从「廉价冗余」升级为「安全契约的必要组成」:
-  通用库默认 handle 多线程写必须安全。成本可忽略（~20ns/写 vs pwrite µs–ms）,
-  且 keydir + 索引池（S6 reorder buffer）已为并发写就绪,W1 只补 active 文件
-  写序列这最后一块。
-- **W2（搜索并发确认 + 注释订正）→ 必做**。通用库必须有**准确、显眼**的并发
-  契约文档;且订正后解锁已有的查询并发能力（现保守注释让用户白白串行）。
-  顺带审计 `set_synonym_map` 等配置类方法。
-- **W3（close fail-fast guard）→ 必做**。通用库用户必然犯生命周期错误;atomic
-  `closed_` 把静默 UB 变明确错误码。
-- **W4（迭代器并行扫描）→ 可选**。每线程一个迭代器是通用库的标准约定（同 std
-  容器）,文档化即可;并行扫描作为增值 API 按需。
+| 共享可变态                                          | 原状态                                       | 现状态 |
+|------------------------------------------------------|----------------------------------------------|--------|
+| `DataFile::write` 的 `current_offset_`/`write_buf_`/`batch_buf_` | 成员非 atomic，无保护                       | ✅ 由 `write_mu_` 保护（覆盖 put / put_doc / put_batch 整段，append-only）|
+| `writes_since_sync_`（组提交计数）                   | 无保护                                       | ✅ 同上，在 `maybe_group_commit` 里同一 `write_mu_` 临界区访问 |
+| `active_file_id_` / `active_data_`                  | reset 在 `read_cache_mu_`，整序列无互斥      | ✅ 写在 `write_mu_` 内；读在 `read_cache_mu_` shared |
+| keydir put / LWW                                    | 已安全（分片锁 + atomic ord / file_id）      | ✅ 不变 |
+| 索引任务提交                                        | MPSC + reorder buffer，已为并发写就绪         | ✅ 不变 |
 
-**一句话：通用库定位下,W1+W2+W3 是一组,共同建立「多读 + 多写（内部串行）+
-读写并发 + fail-fast 生命周期」的常规契约。这是合格通用存储库的下限,不是过度
-工程。**
+**结论**：W1 把「外部串行契约」完全内化为库内互斥——多线程并发写同 handle
+安全（数据不坏，TSan 已实证），单写吞吐不受锁影响。
 
-## 7. 各接口线程安全实现机制
+---
 
-逐组说明「触及哪些共享态 → 用什么同步原语保护 → 为何安全」。这是 api-cpp.md §9
-线程模型汇总表的实现依据。
+## 3. W2 — 读 / 搜索并发确认（已实现）
 
-### 7.1 读：`get` / `get_owned`
-- **触及**：keydir（ord/定位查找）、`active_data_` 指针、`read_files_` 句柄缓存、
-  `DataFile::read`。
-- **机制**：
-  - keydir 查找 → 内部按 key hash **分片 `shared_mutex`**（256 分片，多读并发）。
-  - `active_data_` / `read_files_` 的读取在 **`read_cache_mu_` shared_lock** 下（写路径
-    的 roll/close_write_file 在同锁 unique_lock 下改它们）。
-  - 实际读盘 = **`pread(2)`**：无状态系统调用，每次显式传 offset，不依赖/不修改文件
-    位置 → 多线程并发 pread 同一 fd 安全。sealed 文件走 mmap 零拷贝（映射不可变）。
-- `get_owned` = `get` + `to_owned()`（拷贝），机制同 `get`。
+### 3.1 KeyDir：256 分片 + MVCC
 
-### 7.2 写：`put` / `remove` / `put_doc` / `sync` / `close_write_file`
-- **触及**：`active_data_`（`current_offset_`/`write_buf_`/`batch_buf_`）、`active_file_id_`、
-  `active_hint_`、`writes_since_sync_`、keydir put/remove、IndexPool 提交。
-- **机制**：
-  - **`write_mu_`（`std::mutex`）串行化整个写序列**——同一时刻仅一个写线程进入临界区。
-    这是 W1 的核心：把「调用方串行化」内化为「库内互斥」。
-  - 写线程内部再取 keydir 分片锁（put_overwrite，含原子 `ord`/`file_id` 的 LWW 冲突
-    解析，与并发 reader/merger 协调）+ roll 时取 `read_cache_mu_`。
-  - 索引提交走 **MPSC lock-free 队列** + per-lane **reorder buffer**（按 ord 序 apply，
-    天然容忍多写线程乱序到达——见 async-index-pipeline.md）。
-  - **锁序**：`write_mu_`（最外）→ `read_cache_mu_` / keydir；读路径不取 `write_mu_`
-    → 无反向依赖、无死锁；写方法互不内部调用 → 无递归锁。
-- 为何不损吞吐：data 是单 append WAL，文件层本就串行；锁 ~20ns ≪ pwrite/fsync。
-- **`write_mu_` × IndexPool 背压交互**（S13 审查发现 P1/H1，**已修复**，见
-  [`s13-review-2026-07-02.md`](s13-review-2026-07-02.md) §P1）：`submit_index_task()` →
-  `index_pool_->submit()` → `tbb::concurrent_bounded_queue::push()`（cap=10240）在队列满时
-  **阻塞**；修复前此调用在 `write_mu_` 临界区内 → 写者全队冻结、延迟无上界（还存在跨库
-  放大：队列与 reorder 在途预算均为 per-registry 共享，别的库的慢任务也能灌满队列）。
-  **修复方式**：常规路径（put/put_batch/remove/put_doc 的 Add/Delete）的索引提交移出
-  `write_mu_` 临界区——`maybe_group_commit` 留在锁内（不做 unlock→relock，规避 relock 后
-  active 已被并发写者 roll 的世界变化），submit 在释锁后执行：背压只阻塞本写者。reorder
-  buffer 保证 ord 序正确（"本就支持任意到达序按 ord apply"）。锁外提交与 `close()` 的
-  竞态由 `WriteOpGate`（`writes_in_flight_` 计数）收敛：close 置 `closed_` 后等在途写者
-  排空才注销 index lane。失败补偿的 Skip（OrdSkipGuard）仍可能在锁内提交（罕见路径）。
-  另两个持锁阻塞子问题（H2 `sync` 的 fdatasync、H3 `backup` 的文件系统 copy）为可接受
-  取舍 / 低频操作，暂不动。
+**结构**（`include/bitcask/keydir.hpp`）：
 
-### 7.3 全文搜索：`search_text` / `phrase` / `near` / `bool` / `fields` / `fuzzy` / `wildcard`
-- **触及**：`SearchCache`（cache_）、`DocTextLru`（doc_texts_）、`InvertedIndex` 倒排、
-  `Index`（docmap/live/doc_len/ord_to_ext）、analyzer。
-- **机制**（全是「多读并发 + 写者经同锁协调」）：
-  - cache_ = **`shared_mutex`**（命中 shared_lock 读，put unique_lock）。
-  - doc_texts_ = **内置 `mutex`**（get/put 短临界区）。
-  - 倒排 = **`tbb::concurrent_hash_map` 分片** + 查询持引用零拷贝读快照
-    （写者 CoW，见 posting-zero-copy-design）。
-  - Index = **`shared_mutex`**（is_live/doc_len/ord_to_ext 读 shared_lock；
-    `fill_is_live`/`fill_doc_lens` 批量持锁数组直读）。
-  - analyzer = **const 纯函数**（cppjieba `Cut` const 线程安全）→ 无状态可并发。
-  - 与并发写（索引 reducer 单写线程改这些结构）经上述 shared_lock 协调；可见性
-    遵循 near-real-time（`prepare_search`→flush 覆盖调用前的写）。
+```cpp
+static constexpr std::size_t kShards = 256;
+struct alignas(64) Shard {
+    mutable std::mutex mu;                          // S5: rwlock → mutex
+    alignas(64) ankerl::unordered_dense::map<...>   // StringHash transparent
+        entries;
+};
+mutable std::array<Shard, kShards> shards_;
+```
 
-### 7.4 向量 / 混合：`search_vector` / `search_hybrid`
-- **机制**：HNSW 图 = **`std::atomic<std::shared_ptr<HnswIndex>>`**——查询开头 `load`
-  一次快照指针；merge 重建用「新图旁路构建 + 原子换指针」发布，旧图由在途读者的
-  `shared_ptr` 引用计数续命到查询结束。图遍历本身无锁（图节点不可变 + visited 用
-  `thread_local` 版本化数组，各线程独立）。`search_hybrid` = text 路 + vec 路串行 + RRF
-  融合，复用上述两路机制。
+**为什么不是 `shared_mutex`**（`keydir.hpp` 的 `Shard::mu` 注释）：
+临界区足够短，mutex 性能更好且消除 rwlock 的写者偏好停车问题。
 
-### 7.5 批量：`search_*_batch`
-- **机制**：经 `search::parallel_for_queries` 跑在**进程级共享 `search_arena`**（TBB
-  `task_arena`，并发上限由 market 封顶 ≈hardware_concurrency）。每条查询是完整独立
-  单元、结果槽不重叠 → 无需额外锁，复用 7.3/7.4 的单查询读机制。
+**全局标量全 atomic**（`keydir.hpp` 私有区）：
 
-### 7.6 `merge`
-- **机制**：写**自有 merge 输出文件**（不碰 `active_*`/`write_mu_`）；keydir 更新
-  （`on_relocate`）走 keydir 分片锁；与 put/search 经 keydir `shared_mutex` 协调。
-  跨进程经 **`merge.lock`**（`O_EXCL` 文件锁）与 live writer 的 `write.lock` 互不阻塞。
+| 字段                 | 类型                          | 同步作用 |
+|----------------------|-------------------------------|----------|
+| `epoch_`             | `alignas(64) std::atomic<uint64_t>` | fold snap 旧 / 新判据（写热行，独占缓存行） |
+| `key_count_`         | `std::atomic<uint64_t>`       | 写入 / 删除时 RMW |
+| `key_bytes_`         | `std::atomic<uint64_t>`       | 同上 |
+| `next_ord_`          | `std::atomic<uint64_t>`       | `alloc_ord` / `advance_ord` 无锁；写热行 |
+| `keyfolders_`        | `alignas(64) std::atomic<uint64_t>` | fold 计数；仅屏障内修改；读热行独立 cache line |
+| `biggest_file_id_`   | `std::atomic<uint32_t>`       | put 时 CAS-max 推进；merger / writer 协调 |
+| `has_pending_`       | `std::atomic<bool>`           | pending_ 表是否存在的无锁镜像（持分片锁后 relaxed 读即够新）|
+| `is_ready_`          | `std::atomic<bool>`           | 注册表初始化协议 |
+| `fstats_size_`       | `std::atomic<size_t>`         | fstats 数组发布水位 |
+| `iter_mutation_`     | `std::atomic<bool>`           | 写痕迹标志（无锁镜像，避免热路径摸 meta_mu_）|
 
-### 7.7 迭代器：`CaskIter`
-- **机制**：`start()` 经 keydir **BarrierGuard** 拍 key 快照（frozen pending）；X1：复制
-  keydir `shared_ptr`（`keydir_pin_`）+ S13 pin 全部 data fd → **跨 close 存活**。`next()`
-  对每 key 取分片 shared_lock + pread。**同一 iter 是有状态游标（`cursor_`）→ 不可并发**；
-  不同 iter 各持独立快照 → 可并发。W3：close 后 `start()` 经 `parent_->is_closed()` fail-fast。
+**缓存行分组**（S2 实测关键）：写热行（`epoch_` / `next_ord_` /
+`key_count_` / `key_bytes_`）与读热行（`keyfolders_` / `biggest_file_id_`）
+分到不同 cache line，避免 false sharing——Mixed 基准实测主要损耗源
+（`keydir.hpp` 的注释实测记录）。
 
-### 7.8 `parallel_scan`
-- **机制**：① 串行阶段——一个 iter `drain_live_keys()` 快照 live key（仅 keydir proxy，
-  **不读 value**）。② 并发阶段——N 个 `std::thread` 各 `get()` 自己的不相交 key 段 + 调
-  `fn`。安全性 = 复用 7.1 的并发读机制 + 段不相交 + `fn` 由 caller 保证线程安全。
+### 3.2 BarrierGuard v2 写者闸门
 
-### 7.9 生命周期：`closed_`（W3）
-- **机制**：`std::atomic<bool>`；`close()` 用 `exchange(true)`（兼幂等门）；公共方法入口
-  `acquire` load 检查 → 已关闭返回 `kInvalidOption`。**best-effort fail-fast**：拒绝 close
-  后**新发起**的调用；与 close **并发在途**的调用仍是 caller 责任（非完整 rundown）。
+旧 `lock_all_shards()` 同时持 257 把锁，撞 TSan 死锁检测器
+`compiler-rt/sanitizer_common/sanitizer_deadlock_detector.h` 的
+64 持锁硬上限——**已删除**。
 
-### 7.10 同义词词典（**已结构化为 open-time 不可变**）
-- **演进**：曾有运行期 `set_synonym_map` setter（改 `synonym_map_` 裸指针 vs 查询读它 →
-  reader-vs-writer 竞态，W2 当时定为「配置类，须先于并发查询配置」）。
-- **现状（已落地）**：**移除 setter**，改为 `CaskOptions::synonym_map`
-  （`shared_ptr<const SynonymMap>`）/ C 侧 `synonym_file_path`，在 `Cask::open` 时注入
-  `TextPlugin`（S18-4 起持有），构造后**不可变**。`synonym_map_` 类型 `shared_ptr<const>`。
-  → **竞态从根上消除**（无写者）：契约从「文档口头约束」升级为「结构保证」；读路径
-  `if (synonym_map_) ...->expand(...)` 全程只读，零锁零 atomic。运行期换词典 = 重开库。
+替代：RAII `BarrierGuard`（`src/keydir/keydir.cpp` 的内部类）：
 
-## 8. 落地子任务清单（实施 checklist）
+- **ctor**：拿 `barrier_mu_` → `barrier_active_.store(true, release)`
+  → 拿 `gate_mu_` 短暂（确保后续写者必见 `barrier_active_=true`）→ 放
+  `gate_mu_`
+- **扫描阶段**：逐分片**加锁 → 放锁**排干在途写者（任意瞬间只持 1 把）
+- **真正的屏障段**：在 `barrier_mu_` 持有期间执行跨分片原子操作（如
+  `pending` 合并、`MultiEntry` 折叠）
+- **dtor**：`barrier_active_.store(false, release)` → `notify_all` 唤醒
+  `gate_cv_` 上的退避写者 → 放 `barrier_mu_`
 
-### W1 — 写路径互斥 ✅ 已完成（2026-06-25）
-- [x] `Cask` 加 `std::mutex write_mu_`（成员）。
-- [x] `put` / `remove` / `put_doc` / `sync` / `close_write_file` 入口取 `write_mu_`
-      （覆盖内部 `ensure_active_writer` / `roll_active` / `maybe_group_commit` /
-      `write_and_keydir` 全序列）。
-- [x] **`flush_index` 不纳入**——核实它被 `prepare_search()`（读/搜索路径）调用,上锁会串行化
-      搜索;IndexPool flush 自带 cv 同步本就线程安全。锁集 = 5 个真写方法。
-- [x] **锁序确认**：`write_mu_` 最外层 → 内部再取 `read_cache_mu_`;读路径**不**取
-      `write_mu_`。无反向依赖、无递归锁。
-- [x] **merge 交互审计**：`merge()` 不触 `active_*`/DataFile 成员（写自有输出文件,经 keydir
-      `shared_mutex` 协调）→ 不纳入 `write_mu_`,与写并发不变。`FieldSchema::intern` 已自带
-      `shared_mutex` → 无新增 reader-vs-writer 缺口。
-- [x] TSan 测试：`ConcurrentWritersSharedCaskNoCorruption`（8 线程共享 handle 并发 put+remove
-      互不相交 key 段,重开逐键校验）。**已实证移除 write_mu_ 后 TSan 必报 race** → 真护栏。
-- [x] C API 自动受益（包装 `Cask`）;无需改 C 层逻辑。
-- 验证：Release/Debug **475/475 ctest** + TSan 零 race（95 例并发套件）。
+写者在拿到分片锁后 `if (barrier_active_.load(acquire))` 检查 → 真则
+放分片锁到 `gate_cv_` 退避。
 
-### W2 — 读/搜索并发确认 + 注释订正 + 配置类审计 ✅ 已完成（2026-06-25）
-- [x] TSan 测试：`W2ConcurrentSearchAndWriteNoRace`（4 读线程 ×6 模式 + 2 写线程并发，零 race）。
-- [x] 订正搜索方法「线程安全:否」→「**是**（并发读安全）」;**连带订正 W1 后写方法**「否」→「是」;
-      cask.hpp 顶部线程模型重写为「通用库 handle 多线程安全」。
-- [x] **同义词词典**：W2 当时定为「配置类，须先于并发查询配置」；**后续（2026-06-25）进一步
-      结构化**——移除运行期 `set_synonym_map` setter，改为 open-time 不可变 `CaskOptions::synonym_map`
-      （C 侧 `synonym_file_path`），竞态从根上消除（见 §7.10）。
-- [x] 契约**显眼化**：`doc/api-cpp.md` §9 汇总表全面订正 + §5.3/各方法注释;README 一行订正 + docs 表
-      加本文指针。
-- [x] 写吞吐指引：文档明示「更高写并发 → 按目录分片多 Cask 实例」。
+读者（get / next / `conditional_remove` peek）**不受屏障影响**——继续
+并发。
 
-### W3 — 生命周期硬化 ✅ 已完成（2026-06-25）
-- [x] `Cask` 加 `std::atomic<bool> closed_` + `is_closed()`;`close()` 顶 `exchange(true)`（兼幂等门）。
-      公共方法入口 fail-fast：数据面 → `kInvalidOption`("cask is closed");搜索集中守
-      `run_search_one`/`run_search_batch`;内省 → 安全默认值;`CaskIter::start` 守 parent。
-- [x] 不做完整 rundown——文档写明「close 时刻须无在途操作」（与 close 并发在途仍 caller 责任）。
-      用 `kInvalidOption`+detail（不新增 kClosed,避免 C API 枚举 churn）。
-- [x] 测试：`OperationsAfterCloseReturnErrorNotUb`（close 后各 API 返错码 + 内省默认 + iter
-      fail-fast + 二次 close 幂等）。Release/Debug 477/477 + TSan crash_recovery 11 零 race。
+### 3.3 KeyDir 锁全序
 
-### W4 — 迭代器并行扫描 ✅ 已完成（2026-06-25）
-- [x] 文档化「每线程一个 `CaskIter`」（同 std 容器迭代器约定）——已在 W2/W3 注释 + api-cpp §9 落实。
-- [x] `Cask::parallel_scan(n_threads, fn)`：**原计划「N 独立 iterator 分区」不可行**（keydir 迭代器
-      是单快照游标，无法切分）→ 改为「单次快照 live key（`CaskIter::drain_live_keys`，仅 key 不读
-      value）→ 分段 → N 个 std::thread 并发 get + fn」。并行化读值的 pread+decode（真成本）;写串行
-      不受影响。语义：n=0→hw_concurrency;并发删 kNotFound 跳过;其它错误停止;close 后 fail-fast。
-- [x] 测试 `ParallelScanVisitsAllKeysOnce`（2000 key 删 1/10，每 key 恰一次 + 值正确 + close fail-fast）。
-      478/478 + TSan 零 race。C++-only（C API 未绑定，C host 可自行多线程 get）。
+```
+barrier_mu_ (mutex)
+  → gate_mu_ (mutex) + gate_cv_
+  → meta_mu_ (shared_mutex)
+  → 单个 shard (mutex, 任意时刻 ≤1 把)
+  → fstats_grow_mu_ (mutex)
+```
 
-## 9. 实测基线（benchmark，2026-06-25，Release+LTO+native，6 核 / 24 MiB L3）
+两处反向嵌套例外（`keydir.hpp` 文件头无环论证）：
 
-跑法：`cmake --build build-rel --target bitcask_bench &&
-build-rel/bench/bitcask_bench --benchmark_filter='BM_Cask_Put_Concurrent|BM_Cask_ParallelScan'`
+1. **热路径 `shard → meta`**（`get` / `put_probe` / `remove` miss 时折叠
+   态嵌套 `meta_mu_`）——与全序一致。
+2. **屏障内 `meta_shared → shard`**（`apply_pending_to_entries_barrier`
+   持 meta shared 期间逐 key 嵌套该分片锁）——与全序相反。
 
-### W1 — 并发写同一 handle（`BM_Cask_Put_Concurrent`，聚合吞吐）
+无环论证：方向② 仅存于屏障内——彼时所有 meta unique 的使用者
+（`put_probe` / `remove` 折叠态）已被闸门出清，仅剩读者走方向①且对
+meta 只拿 shared；② 也只拿 meta shared——`shared-shared` 相容，无
+unique 排队者。屏障外只有方向①——同样无环。
 
-| 写线程数 | 1 | 2 | 4 | 8 |
-|---|---|---|---|---|
-| put/s（聚合） | ~980k | ~200k | ~112k | ~46k |
+### 3.4 fstats：无锁热路径 + RCU 指针表（M6 + S13-F8）
 
-- **单写不受锁影响**（~980k/s ≈ 单写基线 `BM_Cask_Put_Overwrite`）。
-- **多写不升反降**：put 临界区 ~1µs，`write_mu_` 串行下 futex 唤醒/上下文切换开销压过
-  临界区（短临界区高争用 mutex 退化）。**非 bug**——印证「写扩展靠分片，不靠堆线程」。
-- 多写**安全**（数据不坏，TSan `ConcurrentWritersSharedCaskNoCorruption` 验证）。
+`KeyDir::AtomicFStats`（`keydir.hpp` 私有区，`alignas(64)` 每元素独占
+cache line，避免 merge + active 并发写不同文件时假共享）：
 
-### W4 — `parallel_scan` 全表扫描加速（`BM_Cask_ParallelScan`，5 万 key×128B）
+```cpp
+struct alignas(64) AtomicFStats {
+    std::atomic<uint64_t> live_keys{0};
+    std::atomic<uint64_t> total_keys{0};
+    std::atomic<uint64_t> live_bytes{0};
+    std::atomic<uint64_t> total_bytes{0};
+    std::atomic<uint32_t> oldest_tstamp{0};
+    std::atomic<uint32_t> newest_tstamp{0};
+    std::atomic<uint64_t> expiration_epoch{kMaxEpoch};
+    std::atomic<uint8_t>  present{0};
+};
+mutable std::mutex fstats_grow_mu_;
+mutable std::deque<AtomicFStats> fstats_;
+std::atomic<size_t> fstats_size_{0};
+std::atomic<AtomicFStats**> fstats_ptrs_{nullptr};
+std::vector<std::unique_ptr<AtomicFStats*[]>> fstats_ptr_arrays_;
+```
 
-| 工作线程数 | 1 | 2 | 4 | 8 |
-|---|---|---|---|---|
-| 扫描耗时 | 56.8 ms | 30.8 ms | 17.9 ms | 17.8 ms |
-| 加速比 | 1.0× | 1.84× | **3.17×** | 3.19×（6 核饱和） |
+**关键修复（S13-F8，TSan 实证抓出）**：`deque::operator[]` 遍历内部块
+指针表（map），与 `emplace_back` 触发的 map 重分配构成无锁读者 UAF。
+修复：deque 仍是元素所有者，旁挂 RCU 指针表 `fstats_ptrs_` ——扩容
+时在 `fstats_grow_mu_` 下建新表、`release` 发布，旧表退休不释放
+（在途读者可能仍持有；总内存 < 2× 终表 ≈ 16B/file_id，有界）。
 
-- 读值的 keydir 查找 + pread + DocValue decode 被并行化（页缓存热后 CPU bound）；
-  快照 key 串行。4 线程近饱和 6 核，8 线程过订阅无增益。
-- 对比 W1：**读可扩展（parallel_scan 3.2×），写不可扩展（串行 WAL）**——这正是
-  「读真并行 + 写内部串行」契约的实测体现。
+无锁读者一律经 `fstats_slot(idx)`，前置条件 `idx < fstats_size_.load(acquire)`。
+size 的 `release` 发布在指针表填充 / 替换之后——acquire 读者必见新
+表（见 `src/keydir/keydir.cpp` 的 `grow_fstats_locked`）。
+
+### 3.5 MVCC fold：sibling chain + pending hash
+
+`KeyDir::keyfolders_ > 0` 时：
+
+- 已存在 key 的新写：分片内升级 `SingleEntry` → `MultiEntry`（newest
+  first 兄弟链）。
+- 新 key 的写 / fold 期间临时 tombstone：经 `meta_mu_` unique 写
+  `pending_`。
+- **不变量**：key ∈ 某分片 entries ⟹ key ∉ pending_（S2 起）——
+  get / put / remove 的「entries 优先、miss 再查 pending」探测顺序依
+  赖该不变量。
+
+最后一个 fold release 时：
+
+1. **阶段二**：`apply_pending_to_entries_barrier` 把 pending_ 逐条
+   应用进各分片 entries（持 meta shared + 屏障内例外 meta→shard）。
+2. **阶段三**：`collapse_multi_entries_barrier` 把各分片 MultiEntry
+   折回 SingleEntry（持 BarrierGuard，逐分片加锁 → 折叠 → 放锁）。
+3. 清 pending_ + `has_pending_` atomic。
+
+### 3.6 `conditional_remove` TOCTOU
+
+`src/keydir/keydir.cpp` 的 `KeyDir::conditional_remove` 分两阶段：
+
+1. **peek**：分片 unique + 嵌套 meta shared，匹配即释放
+2. **commit**：再次取分片 unique 检查命中——caller 拿到 `kOk` 时不保
+   证当前已不存在（探测后状态可能变），但对 merge 语义足够；commit
+   内部 re-check 保证幂等安全。
+
+### 3.7 历史 race condition：读者 vs 写者（已修复 / 已确认安全）
+
+| 共享可变态                                          | 原状态                                       | 现状态 |
+|------------------------------------------------------|----------------------------------------------|--------|
+| `get` / `get_owned` 路径                            | 结构级已安全（KeyDir 分片锁 + pread 线程安全）| ✅ 不变；doxygen 注释订正 |
+| `cache_` / `doc_texts_`                             | shared_mutex + 内置 mutex                    | ✅ 写者 reducer 持 unique，读者持 shared |
+| 倒排 `tbb::concurrent_hash_map`                     | 桶级锁                                       | ✅ 不变；PostingList 改 `shared_ptr<const>` CoW 发布 |
+| `Index`（`docmap` / live / doc_len）                | shared_mutex                                 | ✅ 读 shared_lock / 写 unique_lock |
+| `analyzer`                                          | const 纯函数                                 | ✅ cppjieba `Cut` const 线程安全 |
+| `search_vector` / `search_*_batch`                  | HNSW `atomic<shared_ptr>` 快照 + inter-query 并发 | ✅ 不变（见 §5） |
+
+doxygen 注释 `搜索方法「线程安全:否」→「是（并发读安全）」` 修
+订在 `cask.hpp` 各方法注释 + README 一行——**W2 注释订正**。
+
+---
+
+## 4. W3 — 生命周期硬化（已实现）
+
+### 4.1 `closed_` atomic 标志
+
+`Cask::closed_`（`cask.hpp` 的 `std::atomic<bool>`，S11-W3 注
+释）。`close()` 顶头 `if (closed_.exchange(true)) return;`——兼作
+幂等门。
+
+公共方法入口 fail-fast（统一返 `CaskError::kClosed`，S12-5 后从
+`kInvalidOption` 拆出来独立枚举）：
+
+- 数据面：`put` / `put_batch` / `remove` / `put_doc` / `get` / `get_owned` / `sync` / `close_write_file` / `backup` / `merge` / `checkpoint`
+- 搜索集中守 `run_search_one` / `run_search_batch`（所有 `search_*` 方法都过这道门）
+- 内省：`status`（已关闭返零值快照，不解引用 `keydir_`）/ `is_empty_estimate`（返 `true`）/ `is_frozen`（返 `false`）/ `needs_merge`（返 `needs=false`）
+- 迭代器：`CaskIter::start` 守 `parent_->is_closed()`
+
+**契约**：caller 须保证 close 时刻没有其它线程仍在调用 get / put /
+remove / sync / iter / search_*——这是资源句柄的标准约定。`closed_`
+是 best-effort fail-fast：不**做**完整 rundown。W3 + H1 把它收敛为
+「已发起的调用返回错误码，不会解引用已释放状态；与 close 并发在途
+的调用仍是 caller 责任」。
+
+### 4.2 `WriteOpGate`（H1 闭环）
+
+§ 2.4 已展开。补完契约细节：
+
+- 写路径入口新建 `WriteOpGate` 守卫整段，含锁外的索引提交尾段。
+- close 设 `closed_` 后，先 `writes_in_flight_.wait(0, seq_cst)`
+  等写者退出，再拆资源（`active_data_` / 索引 lane 等）。
+- 这一收敛把「close 与并发在途写」的 UB 收敛为「阻塞等待」——
+  队列背压中的 push 必然返回（池由 registry 持有，close 不停池），
+  closed_ 置位后新写者在入口即退 → 计数单调排空。
+
+### 4.3 `ckpt_mu_`：checkpoint 间互斥
+
+`Cask::ckpt_mu_`（`cask.hpp` 的 `std::mutex`）。`checkpoint()` 调用
+间互斥（手动的多次 `checkpoint()` 串行化；ckpt 实际写入统一在 reducer
+线程 RunFn 内做）。
+
+不与 `write_mu_` 交叉——checkpoint 不取 `write_mu_`，写路径不取
+`ckpt_mu_`。
+
+### 4.4 历史 race condition：迭代器 / close 语义
+
+| 场景                                            | 原评估                                       | 现状态 |
+|--------------------------------------------------|----------------------------------------------|--------|
+| 同一 `CaskIter` 的 `start` / `next` / `release` | cursor 是有状态游标，本就不并发              | N/A——语义保留，doxygen 明确「同一对象不可并发使用」|
+| 不同 `CaskIter` 并发使用同一 `Cask`             | 已安全                                       | ✅ 不变（X1：`keydir_pin_` 让 IterHandle 跨 close 存活；`pin_files()` 让 fd 跨 merge unlink 存活，详见 §6.2） |
+| `close` vs 在途 get / put / search_*            | UAF / 解引用已释放状态                       | ✅ 已闭合（`WriteOpGate` + `closed_` fail-fast） |
+| `CaskIter` 在 `close` 后析构                     | IterHandle 内部裸指针 UAF                    | ✅ X1 修复：`keydir_pin_ = shared_ptr<KeyDir>` 在 IterHandle 生命周期内续命 KeyDir |
+| `close` 与并发写者的 race                        | UB                                          | ✅ 收敛为阻塞等待 |
+
+---
+
+## 5. 进阶实现机制（覆盖 `concurrency-zh.md` 全文要点）
+
+### 5.1 读路径并发——同 handle 多线程
+
+`get` / `get_owned` 路径无外部锁；并发由四层同步原语保证：
+
+| 层                           | 同步原语                                                                                          | 触及共享态 |
+|------------------------------|---------------------------------------------------------------------------------------------------|------------|
+| KeyDir `get`                 | 目标 key 分片 `Shard::mu` unique（短临界区）；fold 态 miss 时嵌套 meta_mu_ shared                  | KeyDir     |
+| `read_file`（`src/cask/cask.cpp`） | `read_cache_mu_` shared_lock；命中 `shared_ptr<DataFile>` 引用计数让 fd / mmap 跨 merge unlink 续命 | DataFile 缓存 |
+| `pread`                      | POSIX 系统调用，无状态，每次显式传 offset → 多线程并发 pread 同一 fd 安全                        | OS         |
+| 已 pin 文件                  | `CaskIter::pin_files()` 在 `start()` 时拍目录快照，`next()` 优先从 pin 句柄读                    | fd 表      |
+
+`parallel_scan`（`src/cask/cask.cpp` 的 `Cask::parallel_scan`）自己
+spawn `std::thread` 把快照顾 key 分段并发 `get`——底层就是上述 (1)+(2)。
+每段独立不相交 key，`fn` 由 caller 保证线程安全。
+
+### 5.2 搜索并发——`cache_` / `doc_texts_` / 倒排 / HNSW / Index
+
+| 结构                          | 同步原语                                                                                          | 多读者 |
+|-------------------------------|---------------------------------------------------------------------------------------------------|--------|
+| `SearchCache::cache_`         | `shared_mutex`                                                                                    | ✅ shared_lock |
+| `DocTextLru::doc_texts_`      | 内置 mutex                                                                                         | ✅ reader short critical section |
+| `InvertedIndex` 倒排桶       | `tbb::concurrent_hash_map<std::string, std::shared_ptr<PostingList>>`；64 分片 term hash         | ✅ 并发迭代 + `const_accessor` 持引用出锁 |
+| PostingList 发布              | `shared_ptr<const PostingList>`——写者 CoW（`use_count()==1` 原地改，否则克隆替换）                | ✅ 读持引用期间写者 CoW |
+| 倒排排序词典                  | `shared_mutex` 护 `vocab_mtx_`；`shared_ptr<const vector<string>>` 换指针发布；`vocab_dirty_` atomic fast path | ✅ fast path 无锁读 |
+| `Index`（docmap / live / doc_len） | `shared_mutex`                                                                                | ✅ shared_lock（fill_is_live 批量持锁直读数组）|
+| HNSW                          | chunk 目录 `std::array<std::atomic<NodeChunk*>, kMaxChunks>` release / acquire；per-node seqlock；整图 `atomic<shared_ptr<HnswIndex>>` | ✅ atomic 换图 → 旧图读者引用计数续命 |
+| analyzer                      | const 纯函数（cppjieba `Cut` const 线程安全）                                                       | ✅ 无状态 |
+
+### 5.3 HNSW 单写者 + 多读者无锁发布
+
+```cpp
+// hnsw.hpp 私有区
+std::array<std::atomic<NodeChunk*>, kMaxChunks> chunks_{};
+std::atomic<uint32_t> count_{0};          // 发布水位
+std::atomic<uint64_t> entry_meta_{0};     // 高 32 = level+1, 低 32 = entry id
+std::atomic<uint64_t> max_inserted_ord_{...};
+std::atomic<bool> writer_active_{false};  // 单写者 assert 守门
+```
+
+**节点块发布**：裸指针 + release/acquire——为什么不用 `shared_ptr`：
+`copy_neighbors` 热路径每次都 load，原子引用计数开销不可接受。
+`~HnswIndex()` 单线程 delete 兜底（彼时无并发读者），`kMaxChunks`
+上限 64M 节点。
+
+**per-node seqlock**（S13-P7，替代旧自旋锁）：`lock[i]` 是
+`std::atomic<uint32_t>` 序号——偶数稳定、奇数正在写。读者双读序号
+一致才采信（torn 读被重试丢弃），数据字全走 `std::atomic_ref`
+relaxed（UB-free、TSan 干净）。
+
+**升级动机**：旧自旋锁让读者的 `copy_neighbors` 对锁字节做 exchange
+（写动作）——HNSW 流量高度偏向 hub 节点 → 并发查询时锁缓存行核间乒
+乓。seqlock 让读者只读不写，零共享行写。
+
+**单写者声明**：`writer_active_` atomic 在 `insert` 入口做 exchange，
+debug assert 明文——多写者不支持；引擎范围内 insert 只在
+`IndexPool` reducer 线程执行。
+
+**整图换指针**：`std::atomic<std::shared_ptr<HnswIndex>> hnsw_`
+（`include/bitcask/vector_plugin.hpp` 私有）。merge 重建时旁路
+构建新图（reducer 线程内 RunFn），最后 `release`-store 换指针。
+旧图由在途读者的 `shared_ptr` 引用计数续命，析构由 GC 自然清理。
+
+### 5.4 InvertedIndex CoW posting
+
+详见 `concurrency-zh.md` §10。补完审计要点：
+
+- `mutable_pl(acc)`：写者持 `PostingMap::accessor` 后取非 const
+  引用——若 `use_count()==1` 原地改；若 `>1`（phrase 读者持引用）就
+  `make_shared<PostingList>(*old) + append` 克隆替换。读者持
+  `shared_ptr<const PostingList>` 零拷贝读。
+- `live_doc_count_` / `sum_doc_len_` 改 `atomic`（S10.1 去锁，
+  避免与查询裸读构成 UB race）。
+- `max_indexed_ord_`（崩溃恢复幂等保护）原子——replay 重放已在快
+  照里的 `(ord, term)` 时丢弃。
+
+---
+
+## 6. IndexPool 与 CaskPluginHost
+
+### 6.1 IndexPool 三锁不变量
+
+`include/bitcask/thread_pool.hpp` 的 `IndexPool` 是 registry 级共享
+的异步索引线程管理器（**不是每 Cask 一个**）——所有同 registry 的
+Cask 复用同一对 N+1 线程（map workers + reducer）。
+
+```cpp
+std::mutex start_mu_;    // started_ + 建线程
+std::mutex reorder_mu_;  // lanes_/pending/next_apply_ord/reorder_inflight_
+std::mutex flush_mu_;    // flush_cv_ 配套
+```
+
+**不变量**：任一线程任一时刻最多持其中一把。**无锁嵌套 ⇒ 无加锁
+顺序 ⇒ 不可能死锁**（`thread_pool.hpp` 注释的 criterion 5 审计）。
+
+关键死锁防御点（`thread_pool.hpp` 注释）：
+
+- reducer apply 前 `lk.unlock()` 释放 `reorder_mu_`，再 `dec_in_flight`
+  （取 `flush_mu_`）。
+- `register_lib` 先放 `reorder_mu_` 再 `ensure_started`（取 `start_mu_`）。
+- cv 唤醒持各自锁，不跨锁。
+
+**队列**：`tbb::concurrent_bounded_queue<IndexTask>`，capacity =
+`kDefaultIndexQueueCapacity`（10240）。map worker 跑 `process_task` →
+`push_reorder`（在 `reorder_mu_` 下入 lane 的 pending map）。
+
+**reducer 循环**：在 `reorder_mu_` 下等就绪 entry → 拷 lane 的
+`shared_ptr`（防 UAF，holds-alive 模式） → `unlock` → `lane->reduce_fn(entry)`
+→ `lane->applied_ord.store(...)` → `++lane->next_apply_ord` → `dec_in_flight`。
+
+**背压（D4）**：reorder 在途上限 `kDefaultReorderInflightCap`（16384）
+→ 达限 map worker 停 pop → queue 满 → put 阻塞。
+
+### 6.2 CaskPluginHost 与 run_serialized
+
+`Cask::CaskPluginHost`（`include/bitcask/plugin_api.hpp` /
+`src/cask/cask.cpp` 的 `Cask::CaskPluginHost` 实现）实现
+`plugin::PluginHost` 接口：
+
+```cpp
+class CaskPluginHost final : public plugin::PluginHost {
+public:
+    std::optional<std::string> read_at(plugin::RecordLoc loc) override;
+    void run_serialized(std::function<void()> fn) override;
+    void log(plugin::LogLevel, std::string_view) override;
+};
+```
+
+`run_serialized`（`src/cask/cask.cpp`）：取 `ord` → 构造
+`IndexTask{ op = RunFn, ord, fn }` → 经 `submit_index_task` 投递到
+reducer。reducer 在 RunFn 静态点执行闭包（典型用途：merge 收尾的
+HNSW 重建、checkpoint 序列化、`docmap_->compact_chunks()` 等必须
+reducer 线程内的操作）。
+
+为什么必须有这条通道：`concurrent_hash_map` 的遍历与插入并发不安
+全（S13-F6 实证）——必须 reducer 静态点串行。所有「变异单写者状态」
+的操作（merge 收尾 / checkpoint 序列化 / HNSW 重建）都经此通道
+提交，闭包经 reorder buffer 按 ord 序与 Add / Delete 串行化。
+
+### 6.3 RunFn 序号门（`IndexOp::Skip` + `OrdSkipGuard`）
+
+写路径 `alloc_ord` 后、真任务提交前的任何错误 return 都必须给该
+ord 补一条 `IndexOp::Skip`——否则 reducer 的 `next_apply_ord` 出现
+永久空洞，此后 `flush` / merge / close 全部在 `flush_cv_` 上永久阻
+塞（一次 ENOSPC 即卡死 handle）。
+
+`Cask::OrdSkipGuard`（`cask.hpp` 内部 RAII）：
+
+- **ctor**：拿 ord
+- **disarm()**：真任务（或等价 Skip）已覆盖该 ord 后调
+- **dtor**：armed 时自动 submit `IndexTask::make(IndexOp::Skip, {}, ord, ...)`
+
+reducer 收到 `Skip` 等同「该 ord 已 apply」，直接推进 `next_apply_ord`。
+
+---
+
+## 7. KeyDirRegistry 与 FileLock
+
+### 7.1 KeyDirRegistry
+
+`include/bitcask/keydir_registry.hpp` 的 `KeyDirRegistry::mutex_`
+（`std::mutex`）保护 `entries_` / `saved_biggest_file_id_` / `index_pool_`
+全部成员（`std::scoped_lock lock(mutex_)`，`src/keydir/keydir_registry.cpp`）。
+
+**三状态 `AcquireStatus`**（`kCreated` / `kReady` / `kNotReady`）协议
+已实现，与 `concurrency-zh.md` §2 一致：
+
+- `kCreated`：调用方是初始化者，必须 `load_keydir_from_disk` 后
+  `mark_ready()`。
+- `kReady`：共享 KeyDir，refcount + 1。
+- `kNotReady`：名字存在但还在被别人初始化，调用方应重试 / 等待。
+
+**`saved_biggest_file_id_[name]`**：refcount 归零时记下
+`biggest_file_id + 1`——保证 file_id 跨 open / close 永不回退。
+
+**`index_pool_` 懒创建**：registry 级共享的双池挂 registry 下（S6-P3
+共享所有权）。`unregister_lib` 时不停池（其它库还在用）；registry
+析构 → `~IndexPool` → `stop()` join 所有线程。
+
+### 7.2 FileLock（flock）
+
+`include/bitcask/file_lock.hpp` / `src/lock/file_lock.cpp`：
+
+- 写锁：`O_CREAT | O_EXCL | O_RDWR | O_SYNC`，mode 0600。EEXIST 表示
+  已有别人持有（stale 检查由 caller 在 EEXIST 后自己做——`try_remove_stale_lock`）。
+- **先 unlink 后 close**（`release_quiet`）：让仍持有 fd 的 reader 还
+  能从老 inode 读到一致内容；如果反过来，新同名锁文件可能被旧 reader
+  读出 garbage（legacy 的既定顺序，照搬）。
+- 内容是 `<pid>\n`，可选追加 `<active_file_path>`。
+
+> FileLock 对象自身没有内部锁——`acquire` 每次产出新对象；同对象并
+> 发 `write_data` 会撕裂内容（非原子），caller 须自己保证同一对象
+> 串行使用。跨对象 `acquire` 由 `O_EXCL` 仲裁——并发 acquire 同一锁
+> 文件名由内核原子性保证 safe。
+
+### 7.3 跨进程边界——能开但语义弱
+
+与 `concurrency-zh.md` §3 一致：
+
+- **拿锁**：write.lock 是 OS 级 `O_CREAT | O_EXCL`，跨进程 enforce
+  「最多一个 writer」；只读 open 不拿锁，不冲突。
+- **内存独立**：每个 OS 进程有独立的进程内 `KeyDirRegistry`、独立的
+  KeyDir。reader 进程 open 时 `load_keydir_from_disk` 自己扫一遍，
+  得到一个**快照**——之后 writer 进程的 put 这个 reader 看不见。
+- **reader 怎么看到新数据**：必须 close + reopen 重新扫盘。大目录
+  每次几百 ms 到几秒，**不适合做实时 read replica**。
+
+---
+
+## 8. W 阶段交付物总账（as-built）
+
+### 8.1 W1 交付（已实现 100%）
+
+| 项                                                       | 落地位置                                                                                                                                  | 状态 |
+|----------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|------|
+| `Cask` 加 `std::mutex write_mu_`                         | `cask.hpp` 的 `std::mutex write_mu_;`                                                                                                     | ✅    |
+| put / remove / put_doc / sync / close_write_file 入口加锁 | `src/cask/cask.cpp` 的方法入口 `std::unique_lock/std::lock_guard<std::mutex> wlk(write_mu_)`                                              | ✅    |
+| backup 也加锁                                            | `src/cask/cask.cpp` 的 `backup`                                                                                                           | ✅    |
+| `flush_index` 不纳入                                     | 读 / 搜索路径也调它，纳入会让搜索串行化——已审计不入锁                                                                                    | ✅    |
+| 锁序确认：`write_mu_` 最外层 → `read_cache_mu_` / KeyDir 锁 | `cask.hpp` 的 S11-W1 注释明文                                                                                                              | ✅    |
+| merge 不触 `write_mu_`                                   | merger 写自有输出文件，经 KeyDir `shared_mutex` 协调                                                                                       | ✅    |
+| H1：索引提交移出 `write_mu_` 临界区                      | `src/cask/cask.cpp` 的 `Cask::put` 等：常规写 `wlk.unlock(); submit_index_task(...)`                                                      | ✅    |
+| TSan 测试：`ConcurrentWritersSharedCaskNoCorruption`     | tests 已存在（详见各并发套件）                                                                                                              | ✅    |
+
+### 8.2 W2 交付（已实现 100%）
+
+| 项                                                          | 落地位置                                                                                                                                | 状态 |
+|-------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|------|
+| 读 / 搜索 TSan 套件                                         | `W2ConcurrentSearchAndWriteNoRace`（4 读 × 6 模式 + 2 写并发）                                                                          | ✅    |
+| 搜索方法 doxygen「线程安全:是」修订                        | `cask.hpp` 各 `search_*` 方法注释                                                                                                       | ✅    |
+| 写方法 doxygen「线程安全:是」修订                          | `cask.hpp` 各 `put` / `remove` / `put_doc` / `sync` / `close_write_file` 方法注释                                                       | ✅    |
+| 同义词词典 setter 移除                                      | `CaskOptions::synonym_map`（`shared_ptr<const SynonymMap>`），open-time 注入；运行期无 setter                                            | ✅    |
+| `Cask::open()` 顶部「线程模型」段落重写                     | `cask.hpp` 文件头：通用 C++ 库 / handle 多线程安全                                                                                       | ✅    |
+| `set_synonym_map` 等运行期 setter 已审计移除                | 仅 `synonym_map` 一例，已结构化为 open-time 不可变；`log_fn` 同为 open-time 不可变                                                       | ✅    |
+
+### 8.3 W3 交付（已实现 100%）
+
+| 项                                                       | 落地位置                                                                                                                                | 状态 |
+|----------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|------|
+| `std::atomic<bool> closed_` + `is_closed()`              | `cask.hpp` 的 `std::atomic<bool> closed_{false};` 和 `is_closed()`                                                                      | ✅    |
+| `close()` 顶 `exchange(true)`（幂等门）                  | `src/cask/cask.cpp` 的 `Cask::close`                                                                                                    | ✅    |
+| 公共方法 fail-fast 返 `kClosed`                          | 数据面 / 搜索（集中守 `run_search_*`）/ 内省 / Iter.start                                                                               | ✅    |
+| 不做完整 rundown                                         | 契约写明：close 时刻须无在途操作                                                                                                        | ✅    |
+| `WriteOpGate`（H1 闭环）                                 | `cask.hpp` 的 `WriteOpGate`；含锁外索引提交尾段；close `writes_in_flight_.wait(0, seq_cst)`                                              | ✅    |
+| `OperationsAfterCloseReturnErrorNotUb` 测试              | 测试已存在（详见各并发套件）                                                                                                              | ✅    |
+
+---
+
+## 9. 未完成项 / 仍开放
+
+经本审计逐符号核验，**W1 / W2 / W3 / W4 全部已实现**，没有「仍开放」的
+race condition 在主路径上。下列条目属于**已知残留风险 / 调用方契约**
+而非 race condition bug：
+
+1. **`CaskIter` 跨 `Cask` 对象生命周期存活仍是 UB**（`cask.hpp` 的 X1
+   注释）：`parent_` 是裸 `Cask*`（非 weak / shared）；若 `Cask` 对象
+   被销毁而 iterator 还存活，则 `next()` 访问 `parent_->opts_/dirname_/read_file`
+   即悬空 UAF。X1 的 `keydir_pin_` 兜 KeyDir 生命周期，但不兜
+   `Cask` 对象本身。已知结构性问题，留待 zero-copy 重构时用
+   `weak_ptr` / owning 句柄解决。
+
+2. **`close()` 与并发在途调用的契约**：caller 须保证 close 时刻无
+   在途调用；`closed_` 是 best-effort 防误用，非完整 rundown。详见
+   `cask.hpp` 的「S11-W3」注释。
+
+3. **`flush` 在大库上的等待**：索引 ckpt 序列化经 RunFn 在 reducer
+   线程按 ord 执行，大库可达秒~分钟级——期间 reducer 停摆、队列积
+   压（H1 后背压只阻塞提交中的写者，不再冻结全部）。已实现的有界
+   等待，**业务上需注意**：长 checkpoint 期间 search_* 返回陈旧索引。
+
+4. **NFS / 网络盘上不可靠**：`O_CREAT|O_EXCL` 在 NFS 上有历史 bug，
+   bitcask 不该跑在网络盘上（`file_lock.hpp` 文件头明文警告）。
+
+5. **`synonym_map` 运行期更换**= 重开库；没有运行期 setter（结构化
+   保证，无 race）。
+
+---
+
+## 10. 审计方法学说明
+
+本审计的目的是把承诺的并发契约映射到**代码里真实存在**的同步原语：
+
+1. **入口侧**：每个公共方法的 doxygen 注释「线程安全：是」+ 锁要求
+   行 → 抓到入锁点。
+2. **共享态侧**：每个共享成员（mutex / atomic / shared_mutex）抓
+   声明位置与所有用锁点。
+3. **路径侧**：从每个公共方法入口沿调用图走完直到外部 IO（pread /
+   pwrite / open），确认所有触及的共享态都在某把锁或 atomic 下。
+4. **锁序**：从每条加锁点导出锁全序，确认无环（特别是 KeyDir 的两
+   处反向嵌套例外 + IndexPool 的「单锁」不变量 + Cask 的
+   `write_mu_` 最外 / 读不取）。
+5. **降级 / 失败路径**：失败补偿路径上的 Skip / disarm / 已 disarm
+   guard 都需保留提交口（`OrdSkipGuard`）。
+
+TSan 测试覆盖（既已存在，本审计不复述）：
+
+- `ConcurrentWritersSharedCaskNoCorruption`（8 线程写同 handle）
+- `W2ConcurrentSearchAndWriteNoRace`（4 读 × 6 模式 + 2 写并发）
+- `OperationsAfterCloseReturnErrorNotUb`（close 后 fail-fast）
+- `ParallelScanVisitsAllKeysOnce`（2000 key 删 1/10，每 key 恰一次）
+- `crash_recovery` 套件（TSan 零 race）
+
+---
+
+## 附录 A. 关键同步原语清单（按符号）
+
+| 符号                       | 类型                     | 所在                       | 作用 |
+|----------------------------|--------------------------|----------------------------|------|
+| `Cask::write_mu_`          | `std::mutex`             | `cask.hpp`                 | 写路径互斥（W1）|
+| `Cask::read_cache_mu_`     | `std::shared_mutex`      | `cask.hpp`                 | `read_files_` + `active_data_` 缓存 |
+| `Cask::closed_`            | `std::atomic<bool>`      | `cask.hpp`                 | fail-fast 标志（W3）|
+| `Cask::writes_in_flight_`  | `std::atomic<uint32_t>`  | `cask.hpp`                 | close 等待在途写者（H1）|
+| `Cask::ckpt_mu_`           | `std::mutex`             | `cask.hpp`                 | checkpoint 间互斥 |
+| `Cask::active_file_id_`    | `std::atomic<uint32_t>`  | `cask.hpp`                 | writer / reader 间 hint（S13-F4）|
+| `KeyDir::shards_[i].mu`    | `std::mutex`             | `keydir.hpp`               | 256 分片锁 |
+| `KeyDir::meta_mu_`         | `std::shared_mutex`      | `keydir.hpp`               | fold / pending 协调 |
+| `KeyDir::barrier_mu_`      | `std::mutex`             | `keydir.hpp`               | 屏障间互斥 |
+| `KeyDir::gate_mu_`         | `std::mutex`             | `keydir.hpp`               | 写者退避的 cv 配套锁 |
+| `KeyDir::gate_cv_`         | `std::condition_variable`| `keydir.hpp`               | 写者退避等待 |
+| `KeyDir::barrier_active_`  | `std::atomic<bool>`      | `keydir.hpp`               | 写者闸门标志（release / acquire）|
+| `KeyDir::fstats_grow_mu_`  | `std::mutex`             | `keydir.hpp`               | fstats 槽位增长串行 |
+| `KeyDir::fstats_ptrs_`     | `std::atomic<AtomicFStats**>` | `keydir.hpp`         | fstats RCU 指针表（S13-F8）|
+| `KeyDir::fstats_size_`     | `std::atomic<size_t>`    | `keydir.hpp`               | fstats 发布水位 |
+| `KeyDir::epoch_` 等标量    | `std::atomic<uint64_t>` 等 | `keydir.hpp`             | 全局标量（写热 / 读热 cache line 分组）|
+| `KeyDirRegistry::mutex_`   | `std::mutex`             | `keydir_registry.hpp`      | 注册表 + IndexPool 持有 |
+| `IndexPool::start_mu_`     | `std::mutex`             | `thread_pool.hpp`          | started_ + 建线程 |
+| `IndexPool::reorder_mu_`   | `std::mutex`             | `thread_pool.hpp`          | lanes_/pending/next_apply_ord |
+| `IndexPool::flush_mu_`     | `std::mutex`             | `thread_pool.hpp`          | flush_cv_ 配套 |
+| `IndexPool::queue_`        | `tbb::concurrent_bounded_queue` | `thread_pool.hpp` | MPSC 有界（cap = 10240）|
+| `HnswIndex::chunks_`       | `std::array<std::atomic<NodeChunk*>, kMaxChunks>` | `hnsw.hpp` | 节点块无锁发布 |
+| `HnswIndex::count_`        | `std::atomic<uint32_t>`  | `hnsw.hpp`                 | 发布水位 |
+| `HnswIndex::entry_meta_`   | `std::atomic<uint64_t>`  | `hnsw.hpp`                 | 入口点合并发布 |
+| `HnswIndex::writer_active_`| `std::atomic<bool>`      | `hnsw.hpp`                 | 单写者 assert |
+| `NodeChunk::locks[]`       | `std::unique_ptr<std::atomic<uint32_t>[]>` | `hnsw.hpp` | per-node seqlock（S13-P7）|
+| `VectorPlugin::hnsw_`      | `std::atomic<std::shared_ptr<HnswIndex>>` | `vector_plugin.hpp` | 整图换指针 |
+| `InvertedIndex::vocab_mtx_`| `std::shared_mutex`      | `inverted.hpp`             | 排序词典 publish |
+| `InvertedIndex::vocab_*`   | `std::shared_ptr<const vector<string>>` | `inverted.hpp` | 排序词典 CoW 发布 |
+| `InvertedIndex::vocab_dirty_` | `std::atomic<bool>`   | `inverted.hpp`             | 排序词典 fast path 标志 |
+| `PostingMap`               | `tbb::concurrent_hash_map` | `inverted.hpp`            | 64 分片桶级锁 |
+| `PostingList`              | `shared_ptr<const PostingList>` 发布 | `inverted.hpp`     | CoW 冻结语义 |
+
+## 附录 B. 锁全序速查
+
+### Cask 门面
+
+```
+write_mu_ (mutex) 写路径最外层
+  └─► read_cache_mu_ (shared_mutex) lazy open / 淘汰
+        └─► DataFile 内部 fd 句柄（pread 无状态）
+  └─► KeyDir shard mutex
+        └─► KeyDir meta_mu_ (shared_mutex) 折叠态
+  └─► fstats_grow_mu_ (mutex) 槽位增长
+
+读路径不取 write_mu_：
+read_cache_mu_ (shared_mutex)
+  → DataFile pread
+→ KeyDir shard mutex (shared)
+  → KeyDir meta_mu_ shared (fold miss)
+```
+
+### KeyDir 内部
+
+```
+barrier_mu_ (mutex)
+  → gate_mu_ (mutex) + gate_cv_
+  → meta_mu_ (shared_mutex)
+  → 单个 shard (mutex, 任意时刻 ≤1 把)
+  → fstats_grow_mu_ (mutex)
+```
+
+两处反向嵌套例外（带无环论证）：
+
+- **热路径 `shard → meta`**（与全序一致）
+- **屏障内 `meta_shared → shard`**（`apply_pending_to_entries_barrier`）
+
+### IndexPool
+
+```
+start_mu_  →  reorder_mu_  →  flush_mu_            顺序无要求
+任一线程任一时刻最多持一把 ⇒ 无嵌套 ⇒ 无加锁顺序 ⇒ 不可能死锁
+```
+
+---
+
+## 附录 C. 与 `concurrency-zh.md` 的关系
+
+| `concurrency-zh.md`（用户向） | 本审计（维护者向）                                       |
+|-------------------------------|----------------------------------------------------------|
+| 锁层在哪些文件 / 函数         | 为什么这套原语在这里、对应哪条不变量                       |
+| 同 handle 多线程契约表        | doxygen 注释依据、锁序推导、不变量论证                     |
+| W1+W2+W3 已实现的现状         | **本审计是该现状的事实依据**；每条都映射到符号位置         |
+| 跨进程 / `flock` 行为        | FileLock `O_EXCL` 语义、stale-reclaim、先 unlink 后 close |
+| 部署模型推荐                 | 同：典型单机多线程部署、按目录分片扩展写并发                |

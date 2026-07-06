@@ -141,10 +141,13 @@ Google 搜索 / YouTube 推荐 / Google Photos 的生产算法。
 | 维度 | 本实现 (libbitcask HNSW) | 行业主流 |
 |------|--------------------------|----------|
 | 算法 | HNSW | HNSW（Qdrant / Weaviate / ES / pgvector 同选） |
-| 量化 | int8 对称量化 + VNNI 粗筛 | Qdrant(Rust) 同路；ES 用 BBQ 二值；Milvus 用 PQ |
+| 量化（粗筛） | int8 对称量化 + VNNI 内联（`detail/int8_kernels.hpp`） | Qdrant(Rust) 同路；ES 用 BBQ 二值；Milvus 用 PQ |
+| 量化（内存） | int8-only 模式已落地（P5b，`HnswConfig::inmem_int8` / `CaskOptions::vector_inmem_int8`） | Qdrant 同样支持 int8-only；Weaviate / Milvus 按段配置 |
+| 量化（落盘） | int8 opt-in（`CaskOptions::vector_quantized`，DocValue `kFlagVecQuantized=0x08`） | Qdrant / Milvus 支持；pgvector 仍偏 f32 |
+| 距离内核 | AVX-512 VNNI → AVX-VNNI → scalar 三级 runtime dispatch | 同 Qdrant；hnswlib 多为 scalar |
 | 并发 | 单写者 + 多读者无锁发布 | Qdrant 同（Rust atomic）；hnswlib 无并发 |
 | 删除 | 软删除 + merge 重建 | 行业标准做法（Qdrant / Weaviate 同） |
-| 磁盘 | 全内存（BCVS 快照持久化） | 同 HNSW 默认；DiskANN 是另一条路线 |
+| 磁盘 | 全内存 + search.ckpt 序列化；落盘 int8 opt-in 减少 data file 体积 ~4× | 同 HNSW 默认；DiskANN 是另一条路线 |
 | 缺什么 | 无 DiskANN / 无 GPU / 无 PQ | Milvus 全有；Qdrant 有 on-disk HNSW |
 
-**结论**：本实现在 <5000 万向量 + 内存型场景下与 Qdrant / Weaviate / Elasticsearch 处于同一技术路线（HNSW + int8 量化 + 无锁并发读），选型正确。若未来需要超内存规模，可加 DiskANN 路线（单层 Vamana 图 + SSD 存全精度向量 + RAM 存 PQ 压缩）。
+**结论**：本实现在 <5000 万向量 + 内存型场景下与 Qdrant / Weaviate / Elasticsearch 处于同一技术路线（HNSW + int8 量化 + 无锁并发读），选型正确。Phase 2a 落地的 int8-only 模式把向量常驻内存砍到 f32 的 ~20%，与 Qdrant 的内存墙策略对齐。若未来需要超内存规模，可加 DiskANN 路线（单层 Vamana 图 + SSD 存全精度向量 + RAM 存 PQ 压缩）。

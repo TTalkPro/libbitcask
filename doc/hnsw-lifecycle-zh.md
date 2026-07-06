@@ -1,222 +1,400 @@
 # HNSW 图生命周期：构建、持久化与恢复
 
-> 前置阅读：`hnsw-design-zh.md`（V3 HNSW 基础设计）、`int8-vnni-v4-zh.md`（V4.2 量化检索）
-> 状态：已实现（文档化梳理）
->
-> **S18-3 顶部换代注记**：HNSW 域 S18-3 起迁 `VectorPlugin`——
-> SearchLayer::on_vector → VectorPlugin::on_put@vector_plugin.cpp；
-> rebuild_hnsw → VectorPlugin::rebuild@vector_plugin.cpp:240；
-> save/load_search_ckpt → per-component ckpt（vec.ckpt + .vec/.qc8 侧车，
-> 详见 `format-zh.md §10.4`）+ legacy 容器段由 `legacy_ckpt.cpp` 接管；
-> CkptLoadResult → ckpt::LoadResult（`component_ckpt.hpp`）。本稿正文
-> 行号保留为设计当时快照，**关键 API 名按上表映射替换**。
+> 前置阅读：`hnsw-design-zh.md`（V3 HNSW 基础设计）、`hnsw-graph-construction-zh.md`（建图算法）、`hnsw-int8-only-design-zh.md`（int8-only 模式）、`int8-vnni-v4-zh.md`（V4.2 量化检索）
+> 持有方：`bitcask::vec::VectorPlugin`（`include/bitcask/vector_plugin.hpp`，实现 `src/search/vector_plugin.cpp`）；底层图对象为 `bitcask::vec::HnswIndex`（`include/bitcask/hnsw.hpp`，实现 `src/vector/hnsw.cpp`）
+> 状态：已实现。
 
 ## 1. 概述
 
-HNSW 多层图经历三个阶段：**增量构建**（put 时逐节点插入）、**全量重建**（merge 时物理清死）、**快照持久化**（close/merge 后落盘）。本文档梳理完整生命周期。
-
-## 2. 增量构建（put 路径）
-
-### 2.1 调用链
+HNSW 多层图在 `VectorPlugin` 这一层经历三个生命周期阶段，对应三个核心状态：
 
 ```
-Cask::put_doc(vec)          [cask.cpp]
-  → VectorPlugin::on_put()  [vector_plugin.cpp]
-    → HnswIndex::insert()    [hnsw.cpp:643]
+        未初始化              live                sealed               rebuild
+          │                   │                    │                    │
+   构造后未 open       接受 insert + search   close()/rebase 后      merge 收尾
+   hnsw_ = nullptr    增量构建，链表账 hnsw_  原子换指针（只读挂起）    旁路重建
+          │                   │                    │                    │
+          └──── open() ──────►├──── flush(rebase) ─►├──── on_merge_commit ─►
+                              │     (save_component_delta 或 base)  │     (run_serialized 投递 reducer)
+                              └◄─────────── atomic<shared_ptr> 换指针 ────┘
 ```
 
-索引任务在 IndexPool worker 线程串行执行（单写者约束）。put 返回前不阻塞等图构建完成——向量已随 DocValue 落入 data 文件（唯一 WAL），插图任务入 IndexPool 队列由 worker 线程异步消费。
+具体而言：
 
-### 2.2 insert() 内部流程
+1. **live（增量构建）**：`on_put` → `HnswIndex::insert` 逐点加入；`search` 多读者并发。
+2. **sealed（持久化收尾）**：`close` 或 `flush` 触发 `save_component_base` 或 `save_component_delta` 落盘；此期间图对象本身仍可读，挂起新一轮写入或交付 `merge`。
+3. **rebuild（全量重建）**：`on_merge_commit` 触发 `run_serialized` 投递 `VectorPlugin::rebuild` → `HnswIndex::clone_live` 做结构化活子图拷贝，原子换指针。
 
-`hnsw.cpp:643`
+持久化与恢复走 `vec.ckpt`（头段嵌入 BVH2 v3）+ `.vec` payload（f32 字节流）+ `.qc8` payload（int8 码字）三件套；增量更新经 `.d<seq>` 链文件累积。
 
-```
-insert(ord, vec):
-  1. 水位幂等检查：ord <= max_inserted_ord_ → 拒绝（防重复）
-  2. 分配 node id，定位 NodeChunk（地址稳定的定容块）
-  3. 随机采样层数：
-     u ~ Uniform(0, 1)
-     level = floor(-ln(u) * inv_log_m_)   // inv_log_m_ = 1/ln(M)，M=16 → mL≈0.36
-     cap at 31
-  4. 写入：vec f32 + int8 量化副本 + ord + level
-  5. 分配邻接表空间：(1 + 2M) + level × (1 + M)
-  6. 发布节点：count_.store(id+1, release)
-  7. 首节点 → 设 entry_meta_，return
-  8. 从 entry point 贪心下降到 level+1 层（仅导航，不连边）
-9. 逐层（min(level, max_level) → 0）：
-      a. HnswIndex::search_layer() 找 ef_construction 个候选
-     b. select_neighbors()（HNSW Algorithm 4）选 M 条
-        - 候选按到 query 距离排序
-        - 仅保留比所有已选邻居更近于 query 的候选（多样性启发式）
-     c. 双向连边；对方超容量(2M)则裁剪最远边
-  10. level > max_level → 更新 entry_meta_（新 entry point）
-```
+## 2. 状态机
 
-### 2.3 层级分布
+### 2.1 未初始化 → live（`VectorPlugin` 构造）
 
-采样公式 `level = floor(-ln(U) / ln(M))` 实现指数衰减：
+`VectorPlugin::VectorPlugin` 构造函数（`src/search/vector_plugin.cpp`）：
 
-| 层 | M=16 时占比 | 角色 |
-|---|---|---|
-| L0 | 100% | 全量节点，密图精筛 |
-| L1 | ~36% | 区域导航 |
-| L2 | ~13% | 大区导航 |
-| L3 | ~5% | 全局入口层 |
-| L4+ | 递减 | 更稀疏 |
-
-检索时从最高层逐层下降——上层稀疏图快速定位目标区域，下层密图精筛候选。
-
-## 3. 全量重建（merge 路径）
-
-### 3.1 触发条件
-
-Merge 物理压缩 data files 后触发图重建。Merge pipeline 中图重建是 Phase 2 的一部分（`Cask::merge`，`cask.cpp:1739`；rebuild 提交点 `:1772-1775`）：
-
-```
-Phase 1: 重写活 record → 新 data files + CAS 更新 KeyDir
-Phase 2（搜索插件存在时）:
-  write_keydir_snapshot() + flush 索引队列
-  TextPlugin::on_merge_commit → compact()        ← 阈值压实死 posting
-  compact_index_chunks()
-  VectorPlugin::rebuild()  ← 提交 IndexPool worker 全量重建 HNSW 图（vector_dim>0）
-  save_components_base()    ← per-component ckpt：docmap/bm25/vec + index.manifest
-Phase 3: 清理旧文件
+```cpp
+VectorPlugin::VectorPlugin(const VectorPluginConfig& config,
+                           const bm25::DocTable& docs)
+    : config_(config), docs_(docs) {
+    if (config_.dim > 0) {
+        HnswConfig hc;
+        hc.dim = config_.dim;
+        hc.metric = (config_.metric == meta::VectorMetric::kL2)
+                        ? HnswMetric::kL2 : HnswMetric::kDot;
+        hc.inmem_int8 = config_.inmem_int8;          // P5b 透传
+        if (config_.hnsw_m > 0) hc.M = config_.hnsw_m;
+        if (config_.hnsw_ef_construction > 0) {
+            hc.ef_construction = config_.hnsw_ef_construction;
+        }
+        hnsw_.store(std::make_shared<HnswIndex>(hc),
+                    std::memory_order_release);
+    }
+}
 ```
 
-> 详见 [`merge-policy-zh.md` §4.2](merge-policy-zh.md) 的完整 V4 Pipeline Contract。
-> 注意 HNSW 重建在 IndexPool worker 内执行（维持单写者），`flush()` 阻塞等其完成。
+`hnsw_` 是 `std::atomic<std::shared_ptr<HnswIndex>>`（`vector_plugin.hpp` 的 `VectorPlugin` 私有区）——`live` 阶段初始 graph 句柄。dim=0 时不创建图（无向量配置的集合）。
 
-### 3.2 VectorPlugin::rebuild() 实现
+### 2.2 live → live（增量构建）
 
-`vector_plugin.cpp:240`
+`put_doc(vec)` 落盘后，事件 `on_put`（`VectorPlugin::on_put`，`vector_plugin.hpp`）进入 reducer 路径（`IndexPool` 单写者）：
+
+```cpp
+void VectorPlugin::on_put(const plugin::PutEvent& e, plugin::PreparedPtr) {
+    if (e.doc && !e.doc->vec.empty()) {
+        insert(e.ord, e.doc->vec);
+    }
+}
+```
+
+`VectorPlugin::insert`（`vector_plugin.cpp`）：
+
+```cpp
+void VectorPlugin::insert(std::uint64_t ord, std::span<const float> v) {
+    auto hnsw = hnsw_.load(std::memory_order_acquire);
+    if (!hnsw || v.size() != config_.dim) return;
+    dirty_.store(true, std::memory_order_relaxed);
+    // S14-4:窗口插入日志（fold 重叠区幂等：只在 ord ≥ delta_window_wm_ 时入账）
+    if (ord >= delta_window_wm_) {
+        delta_ords_.push_back(ord);
+        delta_data_.insert(delta_data_.end(), v.begin(), v.end());
+    }
+    hnsw->insert(ord, v);                            // 单写者调用 HnswIndex::insert
+}
+```
+
+**S14-4 窗口入账**：写入端归一化后，ord 全局单调。`delta_window_wm_` 由 `save_component_base`/`save_component_delta`/`load_component` 维护，重叠区已持久化则不再入账——fold 重放时 `HnswIndex::insert` 自带 `max_inserted_ord_` 水位幂等门（`hnsw.cpp` 内 `insert`），双层防护。
+
+`on_delete` 是空实现——HNSW 软删经 `DocTable::is_live` 过滤（`search` 入口的 live callback），物理清理延迟到 merge。
+
+### 2.3 live → sealed（持久化收尾）
+
+两条触发路径：
+
+1. **正常关闭**（`Cask::close` → `VectorPlugin::close`）：仅返回 `kOk`，实际落盘由前序 `flush` 完成。
+2. **水位触发 flush**（`Cask::flush` → `VectorPlugin::flush`，`vector_plugin.cpp`）：
+
+```cpp
+plugin::FlushResult VectorPlugin::flush(const plugin::FlushRequest& req) {
+    const bool cap_hit = config_.max_delta_chain > 0 &&
+                         chain_.next_seq > config_.max_delta_chain;
+    const bool want_base = req.force_rebase ||
+                           rebase_needed_.load(std::memory_order_relaxed) ||
+                           cap_hit;
+    if (want_base) {
+        save_component_base(dir_, req.watermark);
+        ...
+    } else if (!dirty() || delta_ords_.empty()) {
+        dirty_.store(false, std::memory_order_relaxed);   // 空日志：no-op
+        ...
+    } else {
+        save_component_delta(dir_, req.watermark);
+        ...
+    }
+}
+```
+
+- **base 路径**：`save_component_base`（`vector_plugin.cpp`）写 `vec.ckpt` + `.vec` + `.qc8`，链坍缩（`remove_chain_files`），`delta_window_wm_` 推到当前水位。
+- **delta 路径**：`save_component_delta`（`vector_plugin.cpp`）写 `.d<seq>` 链文件，含 `kDeltaInfo`（三元组 base_gen/chain_wm/seq）+ `kHnswDelta`（插入日志），成功才清 `delta_ords_`/`delta_data_`。
+- **rebase**：`rebase_needed_` 在 `rebuild` 后置位，强制下一次 flush 走 base——重建后旧 delta 链语义不再成立。
+
+`sealed` 实际含义：flush 返回后 `chain_` 已更新到新水位、`dirty_` 已清；图对象本身继续可读，写入由上层调度决定是否暂停（典型实现：close 后调用方 fail-fast 拒新写）。
+
+### 2.4 sealed → rebuild（merge 物理清死）
+
+`on_merge_commit`（`vector_plugin.cpp`）：
+
+```cpp
+void VectorPlugin::on_merge_commit(const plugin::MergeCommitEvent&) {
+    if (!enabled()) return;
+    if (host_) {
+        host_->run_serialized([this] { rebuild(); });  // reducer 静止点
+    } else {
+        rebuild();
+    }
+}
+```
+
+`run_serialized` 把 lambda 投递到 `IndexPool` reducer 静止点执行，维持单写者约束。
+
+`VectorPlugin::rebuild`（`vector_plugin.cpp`）：
 
 ```cpp
 void VectorPlugin::rebuild() {
     auto old = hnsw_.load(std::memory_order_acquire);
     if (!old) return;
-    auto fresh = std::make_shared<vec::HnswIndex>(old->config());
-    for (id = 0 .. old->size()-1) {
-        ord = old->node_ord(id);
-        if (!index_.is_live(ord)) continue;  // 物理清死
-        fresh->insert(ord, old->node_vec(id));
-    }
-    hnsw_.store(std::move(fresh), std::memory_order_release);  // 原子换入
+    dirty_.store(true, std::memory_order_relaxed);
+    rebase_needed_.store(true, std::memory_order_relaxed);    // S18-6：自置 rebase
+    auto fresh = old->clone_live(
+        [this](std::uint64_t ord) { return docs_.is_live(ord); });
+    hnsw_.store(std::move(fresh), std::memory_order_release);
 }
 ```
 
-**语义保证**：
-- 重建期间并发查询走旧图（含死节点，语义同 V3.4 软删）
-- 换入后旧图由在途读者 `shared_ptr` 续命（无锁回收）
-- 新图保证零死节点（merge 承诺）
+**关键**：`clone_live` 是结构化活子图拷贝（详见 §3.3），不是从零重插。原子 `release` 换指针后旧图由在途读者 `shared_ptr` 续命，无锁回收。返回后查询即走新图（live 节点无死）。
 
-### 3.3 为什么不增量删除死节点
+### 2.5 状态汇总
 
-HNSW 图删除节点会导致邻接表悬空边——需要级联修复邻居连接，复杂度 O(dead_count × M × ef_construction)。全量重建虽然 O(N log N)，但只在 merge（低频批处理）时执行，且能重排图结构获得更优拓扑。
+| 状态 | `hnsw_` 句柄 | 写入 | 查询 | 落盘时机 |
+|---|---|---|---|---|
+| 未初始化 | `nullptr`（`dim=0` 时构造） | ❌ | ❌ | n/a |
+| live | `shared_ptr<HnswIndex>` 指向当前图 | `on_put` 触发 insert | `search` 走图 | 增量为 delta；水位达上限或 rebase 触发 base |
+| sealed | 同上，挂起新一轮写 | ❌（上层调度暂停） | ✅（旧图仍可读） | flush 已落 base/delta |
+| rebuild | 旧图指针持有中 + 新图构造中 | ❌（reducer 单写者） | ✅（旧图） | rebuild 内部不写盘；结束后下次 flush 走 base |
 
-## 4. 持久化
+## 3. 重建路径：`clone_live` 的 COW 语义
 
-### 4.1 格式：V7 双文件（BVH2 v2 段 + BCVP payload）
+### 3.1 为什么不用「从零重插」
 
-HNSW 不再有独立 `hnsw.snap`。V7 起持久化为**两部分**（统一落进搜索 checkpoint，
-完整字节布局见 [`format-zh.md` §10](format-zh.md)）：
+旧实现是遍历 `old` 图每个节点 → `fresh->insert(ord, old->node_vec(id))`。每点要做一次 `ef_construction` 宽的束搜索（默认 200）→ 1M 节点分钟级、阻塞 merge。
 
-1. **图头**：作为 `vec.ckpt` 的 **hnsw 段**（per-component，S17-2/3/4/5 起），
-    magic `"BVH2" = 0x32485642`、version 2。段内含 dim/metric/M/efc/seed/
-    count/entry_meta/max_ord，以及每节点 `ord | level | int8 qcodes[dim] | qscale f32
-    | qsum i32` + 各层邻接表，末尾段内 crc32。`HnswIndex::serialize`（`hnsw.cpp:1156`）。
-    commit 点 = `index.manifest`（BCMF 80B，`index_manifest.hpp`，S17-3）。
-2. **向量 payload**：全精度 f32 向量外存到 `vec.ckpt.vec`（magic `"BCVP"`，version 1，
-    旧称 `search.vec`），64B 头 + 每 4KB 页 CRC + 页对齐 f32；只读 `mmap`。
-    `HnswIndex::save_vec_payload`（`hnsw.cpp:981`，S17-7 起由 per-component
-    `save_vec_payload` 接管）。`inmem_int8` 模式无常驻 f32 → 不产生 `.vec`。
+`HnswIndex::clone_live`（`hnsw.hpp` 声明，`hnsw.cpp` 实现）改为结构化拷贝：
 
-**写入**：`save_vec_payload(.vec)` → `serialize`（段）→ `VectorPlugin::save_component_base`
-→ `index_manifest` commit → `keydir` 快照（仅 base）；均 `tmp + rename` 原子。
-读者协议：先 acquire `count_`/`entry_meta_` 快照，邻接 id ≥ count 一律跳过
-（防读到半发布状态）。
+- **保留原图拓扑**：层数与邻接结构原样搬过来，仅做 id 重映射 + 死邻过滤。
+- **O(节点 + 边)** 的 memcpy 级拷贝，**无距离计算**。
+- **int8-only 直接拷 qcodes/scale/sum**，消掉旧重插路径的反量化→再量化往返。
 
-**注意（V7 变更）**：int8 qcodes **直接持久化在 BVH2 段内**——load 时**不再**从
-f32 重新量化（省启动量化 pass）。f32 向量单独存 `search.vec`，按需 mmap。
+### 3.2 三遍 pass
 
-### 4.2 落盘时机
+**Pass 0 — id 重映射**：活节点按 id 序紧凑编号 = ord 序保持。
 
-| 时机 | 调用 | 位置 | 说明 |
+**Pass 1 — 节点数据 + 邻接块分配**：
+
+```cpp
+for (old_id = 0..n-1) {
+    new_id = remap[old_id];
+    if (new_id == kDead) continue;
+    // 拷 vec（int8-only 跳过）→ qcodes 直拷 → ords/levels 拷 → 邻接块从 arena alloc
+    ...
+}
+```
+
+**Pass 2 — 邻接重映射 + 死邻过滤 + 一跳路径收缩**：
+
+```cpp
+for (each layer l of each node) {
+    merged.clear();
+    for (n in 旧邻居) {
+        if (n >= n) continue;                            // 越界：跳过
+        r = remap[n];
+        if (r != kDead && r != new_id) merged.push_back(r);
+    }
+    if (merged.empty() && 旧邻居数 > 0) {
+        // 一跳路径收缩：借道死邻的活邻居补边，去重、限 cap
+        for (dead_n in 旧邻居, remap[dead_n] == kDead) {
+            for (nn in dead_n 的同层邻居) {
+                r2 = remap[nn];
+                if (r2 != kDead && r2 != new_id && 不在 merged) merged.push_back(r2);
+            }
+        }
+    }
+    dst[0] = merged.size();
+    for (i) dst[1+i] = merged[i];
+}
+```
+
+**最终发布**（pass 2 完成后，函数返回前）：
+
+```cpp
+fresh->entry_meta_.store(
+    (static_cast<std::uint64_t>(best_level + 1) << 32) | best_new_id,
+    std::memory_order_release);
+fresh->count_.store(nn, std::memory_order_release);
+return fresh;                                          // 调用方原子换 hnsw_
+```
+
+**约束**（实现注释 `hnsw.cpp` 内 `clone_live`）：
+
+- 调用方须为单写者（reducer）。旧图并发读者只读不冲突。
+- 死邻过滤的极端情况下（某层邻居全死且一跳无补），个别节点该层出边为空——下一轮 merge 或重插自愈。
+- int8-only 模式下 `qcodes/qscales/qsums` 直拷（无损），旧路径的反量化→再量化往返完全消失。
+
+### 3.3 与原子换指针的关系
+
+`VectorPlugin::rebuild` 持 `old` 的 `shared_ptr` 局部副本——保证 `clone_live` 期间旧图不被析构。`hnsw_.store(fresh, release)` 后，新查询 load 拿到 `fresh`，旧查询持有的 `old` 副本继续使用直至退出，无锁回收（控制块引用计数 atomic 增减）。
+
+## 4. 持久化格式与链
+
+### 4.1 三件套：`.ckpt` + `.vec` + `.qc8`
+
+V7 起 HNSW 持久化为**三件套**（完整字节布局见 `format-zh.md`）：
+
+| 文件 | 内容 | 写入入口 | 备注 |
 |---|---|---|---|
-| `close()` | `save_components_base` → `index_manifest` commit | `cask.cpp:save_checkpoint_paired` | worker 已停 → 图静止，watermark = next_ord |
-| `merge()` Phase 2 | `save_components_base` | `cask.cpp:save_checkpoint_paired` | rebuild 后立即落盘，下次 open 走快照路径 |
-| `put()` | ❌ 不落盘 | — | 只更新内存图，data 文件（WAL）保证持久性 |
+| `vec.ckpt` | BVH2 v3 头段（含 `dim/metric/M/efc/seed/count/entry_meta/max_ord/payload_gen`） + 每节点 `ord/level/邻接`，末尾段内 crc32 | `HnswIndex::serialize`（`hnsw.cpp`） | 嵌入 `vec.ckpt` 的 `kHnsw` 段 |
+| `vec.ckpt.vec` | BCVP f32 字节流（64B 头 + 页 CRC 表 v1 或 v2 追加） | `HnswIndex::save_vec_payload`（`hnsw.cpp`） | `inmem_int8` 模式不产生（无常驻 f32） |
+| `vec.ckpt.qc8` | BCQ8 int8 码字（64B 头 + 记录区 `[qcodes int8[dim] \| qscale f32 \| qsum i32]`） | `HnswIndex::save_qc_payload`（`hnsw.cpp`） | v3 起码字外置；`needs_qcodes_` 为假时无 qc8 |
 
-### 4.3 加载时机
+`save_component_base` 顺序（`vector_plugin.cpp`）：
 
-| 时机 | 调用 | 位置 | 说明 |
-|---|---|---|---|
-| `open()` | `VectorPlugin::load_component` → hnsw 段 `deserialize` + `load_vec_payload` | `cask.cpp:881`（`load_recovery_snapshots`） | vec.ckpt 健康且全段 CRC 通过时走快照路径 |
-| `open()`（不健康/段坏） | 全量 fold + `VectorPlugin::on_put()` | 回退路径 | 逐条遍历 data files 重建图 |
+1. `save_vec_payload(.vec)`：优先追加（S14-2，前缀不变契约），失败退全量重写。
+2. `save_qc_payload(.qc8)`：同上结构。
+3. `serialize` → `kHnsw` 段拼入 `vec.ckpt`。
+4. `SearchCheckpoint::write(vec.ckpt, watermark, sections)`：`tmp + rename` 原子。
+5. `remove_chain_files(vec.ckpt)`：链坍缩。
+6. `chain_` 推进、`delta_window_wm_ = watermark`、`clear_delta_log()`、`dirty_ = false`。
 
-### 4.4 覆盖性 Gate（统一 watermark 自门）
+### 4.2 链文件 `.d<seq>`
 
-V7 不再用 per-index 的 `hnsw_covers_next_ord()` 成对门。改为 `vec.ckpt`
-组件段头部单个 **watermark**（= 保存时 `next_ord`）+ **全段 CRC 通过**
-（`ckpt::LoadResult.all_segments_ok`，`component_ckpt.hpp`）共同判定：
+`save_component_delta` 写 `.d<seq>`，内容：
 
-```
-search.ckpt 健康且 all_segments_ok ?
-   fold_start(fid) = keydir_wm(fid)   // 各索引按自身 ord 水位自门跳重叠
- : fold_start(fid) = 0                // 全量 fold 兜底
-```
+- `kDeltaInfo` 段：三元组 `base_gen | chain_wm | seq`，加载时校验链连续性。
+- `kHnswDelta` 段：`count u64 | dim u16 | 每条 ord u64 + f32[dim]`，按插入序紧凑。
 
-各索引（hnsw `insert` 丢 ord≤max_inserted_ord_、bm25 `add_doc` 丢 ord≤水位）
-重放幂等——详见 [`recovery-unified-checkpoint-design-zh.md` §4](recovery-unified-checkpoint-design-zh.md)。
+`VectorPlugin::apply_delta_log`（`vector_plugin.cpp`）：
 
-### 4.5 Load 的整体拒绝语义
-
-`HnswIndex::deserialize`（`hnsw.cpp:1278`，BVH2 v2 段）+ `load_vec_payload`
-（`hnsw.cpp:1062`，.vec）：magic/version 不符、CRC 不匹配、config 不一致
-（dim/metric/M）、邻接 id 越界、层级覆盖不完整——**任一违规整图拒绝**，
-调用方弃实例回退 fold。绝不半载示人。容器层另有**段级隔离**：单 hnsw 段坏只
-重建 hnsw，其余段照常载入。
-
-## 5. 完整生命周期图
-
-```
-    put(vec)           put(vec)           put(vec)
-      │                  │                  │
-      ▼                  ▼                  ▼
-  insert(内存)       insert(内存)       insert(内存)
-      │                  │                  │
-      ·                  ·                  ·
-      ·                  ·                  ·
-  ┌───┴──────────────────┴──────────────────┘
-  │
-  ├─ close() ──────────→ save_components_base ──→ vec.ckpt(hnsw 段) + vec.ckpt.vec
-  │                                                  │
-  │                                        (进程退出)
-  │                                                  │
-  ├─ open() ──────────→ VectorPlugin::load_component ←── vec.ckpt + vec.ckpt.vec
-  │                       (watermark 自门 + 全段 CRC)
-  │                         ├ pass → 快照加载（秒级）
-  │                         └ fail → 全量 fold（O(N log N)）
-  │
-  └─ merge() ──→ VectorPlugin::rebuild ──→ save_components_base ──→ vec.ckpt + vec.ckpt.vec
-                   (物理清死)              (重建后落盘)
+```cpp
+for (每条 (ord, vec)) {
+    if (hnsw) hnsw->insert(ord, vec);    // insert 自带水位幂等（不写 delta 链）
+}
 ```
 
-## 6. 相关文件索引
+**约束**：直插而非再入账——链内容本就已持久化，重放时不标脏、不入 delta 日志。
 
-| 文件 | 内容 |
-|---|---|
-| `src/vector/hnsw.cpp:643` | `insert()` — 增量插入 + 层采样 + 连边 |
-| `src/vector/hnsw.cpp:577` | `select_neighbors()` — HNSW Algorithm 4（int8 版 :614） |
-| `src/vector/hnsw.cpp:1156` | `serialize()` — BVH2 v2 段序列化 |
-| `src/vector/hnsw.cpp:1278` | `deserialize()` — BVH2 v2 段反序列化 + 校验 |
-| `src/vector/hnsw.cpp:981` | `save_vec_payload()` — BCVP `.vec` 写 |
-| `src/vector/hnsw.cpp:1062` | `load_vec_payload()` — BCVP `.vec` 读 + 校验 |
-| `src/search/vector_plugin.cpp:240` | `VectorPlugin::rebuild()` — 全量重建 |
-| `src/search/vector_plugin.cpp` / `src/keydir/docmap_ckpt.cpp` | per-component ckpt: vec/docmap/bm25 save+load |
-| `src/cask/cask.cpp:save_checkpoint_paired` | per-component flush + index.manifest commit |
-| `src/cask/cask.cpp:27` | `kSearchCkptName = "search.ckpt"` |
-| `src/cask/cask.cpp:694` | `close()` 落盘 |
-| `src/cask/cask.cpp:881` | `open()` 加载 + watermark 自门（`load_recovery_snapshots`） |
-| `src/cask/cask.cpp:1739` | `merge()` rebuild + 落盘 |
-| `include/bitcask/hnsw.hpp:337` | `entry_meta_` 定义 |
+### 4.3 写入顺序契约（崩溃安全）
+
+V7 写入顺序（`save_component_base`）：
+
+1. **`.vec` 先**：通过 `pwrite + fdatasync` 落盘数据 → header 原地重写 → fdatasync。
+2. **`.qc8` 同上结构**。
+3. **`.ckpt` 后**：`tmp + rename` 原子发布。
+
+**S14-2 前缀不变契约**：`.vec`/`.qc8` 追加只写 `offset ≥ 旧 count` 的尾区——文件里声称的 `[0, n)` 前缀在 torn append 下保持完好。配合「先 payload 后 ckpt 原子发布」顺序，崩溃后要么用旧 n（尾部垃圾被忽略）要么用新 n（数据已 fdatasync），方向恒安全。
+
+**S14-8 payload 代号**：`BVH2 v3` 段头与 `.vec`/`.qc8` 头共同携带 `payload_gen`——rebuild 全量重写 payload 后若走 `.prev` 回退，旧图配新 payload（node id 已重映射）会被「前缀 `count ≥ n`」误收。代号不匹配即拒载（`gen == 0` 的 legacy 文件跳过校验）。
+
+## 5. crash 后 `load_component` 恢复路径
+
+`VectorPlugin::load_component`（`vector_plugin.cpp`）：
+
+```cpp
+LoadResult VectorPlugin::load_component(std::string_view dir,
+                                       std::uint64_t expected_base_wm,
+                                       std::uint32_t chain_seq) {
+    auto lc = sc::SearchCheckpoint::read(fp);
+    bool from_prev = false;
+    if (lc && lc->watermark != expected_base_wm) lc.reset();
+    if (!lc) {
+        lc = sc::SearchCheckpoint::read(prev_path);
+        if (lc && lc->watermark != expected_base_wm) lc.reset();
+        if (lc) from_prev = true;
+    }
+    if (!lc) return fail();
+
+    // kHnsw 段应用
+    for (const auto& ls : lc->sections) {
+        if (ls.type == kHnsw) load_graph_section(ls.payload, vec_path, qc_path);
+    }
+
+    // 链重放（.prev 回退 = 链不可信，跳过）
+    if (segments_ok && !from_prev) {
+        walk_chain(fp, base_gen=coverage, base_coverage=coverage,
+                   chain_seq, unbounded=false, callback);
+    }
+    ...
+}
+```
+
+**核心契约**：
+
+1. **base 校验**：`vec.ckpt` 段头 `watermark` 必须等于 `expected_base_wm`（来自 host 的 keydir 快照）；不符读 `.prev`；两者都不符 → 整图拒绝。
+2. **段级隔离**：单 `kHnsw` 段坏只重建向量索引，其余段照常载入；容器层 `all_segments_ok` 决策 fold 起始点（见 `recovery-unified-checkpoint-design-zh.md`）。
+3. **链回放**：`from_prev` 表示回了 `.prev`，链不可信，跳过；否则按 `base_gen/chain_wm/seq` 三元组逐 `.d<seq>` 走 `walk_chain`，`kHnswDelta` 段经 `apply_delta_log` 直插（`HnswIndex::insert` 水位幂等）。
+4. **payload 加载**：`load_graph_section` 调 `HnswIndex::deserialize`（段头） → `load_vec_payload(.vec)` → `load_qc_payload(.qc8)`。前两步失败则图整体拒载回退 fold；第三步在 `qc_pending_` 为真时执行（v3 自门）。
+
+### 5.1 三种 fallback
+
+| 情形 | 行为 | 后果 |
+|---|---|---|
+| `vec.ckpt` 健康 + 段 CRC 通过 + `.vec`/`.qc8` 前缀满足 + `payload_gen` 配对 | 快照加载（秒级） | 走 snapshot 路径 |
+| `vec.ckpt` 缺失 / watermark 不符 / 段 CRC 失败 / payload 不匹配 | 拒载 + `rebase_needed_=true` | fold 起点水位由 host 决策（典型：本插件返回 0，让 BM25/DocMap 的 fold 起点同样回退到 0）；下一次写触发 rebase |
+| `.prev` 回退 | 链不重放 | fold 起点同上；下一次 write 触发 base |
+
+### 5.2 watermark 自门
+
+V7 不再用 per-index 的 `hnsw_covers_next_ord()` 成对门，改为 `vec.ckpt` 组件段头部单个 **watermark**（= 保存时 `next_ord`）+ **全段 CRC 通过**（`ckpt::LoadResult.all_segments_ok`，定义于 `component_ckpt.hpp`）共同判定：
+
+- 各索引（hnsw `insert` 丢 `ord ≤ max_inserted_ord_`、bm25 `add_doc` 丢 `ord ≤ 水位`）重放幂等。
+- 详见 `recovery-unified-checkpoint-design-zh.md`。
+
+## 6. 完整生命周期 ASCII 图
+
+```
+                       live（接受 insert + search）
+                              ▲
+                              │ HnswIndex::insert
+                              │ (single writer, atomic publish)
+  put_doc ──► on_put ──┐    [VectorPlugin::insert]    [delta_ords_ / delta_data_]
+                       ├──────────────────────────────►
+                       │
+                       │ dirty_=true, rebase_needed_ 走攒账
+                       ▼
+              flush: save_component_delta  ◄──── 增量累积
+                       │ (写 .d<seq> 链文件)
+                       │ chain_ 推进, delta_window_wm_ 推进
+                       │
+                       │ rebase_needed_ / cap_hit / force_rebase
+                       ▼
+              flush: save_component_base  ◄──── sealed
+                       │ (写 vec.ckpt + .vec + .qc8, 链坍缩)
+                       │ chain_ = {wm, wm, 1}
+                       ▼
+   close() / fork-fork-process exit ──────────► [进程退出]
+
+                       重新 open()  ──► load_component
+                       │  base 校验 → 段应用 → payload 装载 → 链重放
+                       │
+                       │ 健康 → 快照加载（live 重启）
+                       │ 失败 → fold 起点回 0（触发下一次 rebase）
+
+   merge 收尾 ─► on_merge_commit ──► run_serialized ──► VectorPlugin::rebuild
+                       │
+                       ▼
+              clone_live(is_live) ──► atomic<shared_ptr> 换指针
+                       │
+                       ▼
+              rebuild 后脏位置位 → 下次 flush 走 base（rebase_needed_）
+```
+
+## 7. 关键符号索引
+
+| 阶段 | 函数 / 字段 | 文件 |
+|---|---|---|
+| 图句柄 | `VectorPlugin::hnsw_`（`atomic<shared_ptr<HnswIndex>>`） | `include/bitcask/vector_plugin.hpp` 的 `VectorPlugin` 私有区 |
+| 构造 + 初始图 | `VectorPlugin::VectorPlugin` | `src/search/vector_plugin.cpp` |
+| 增量插入 | `VectorPlugin::on_put` / `VectorPlugin::insert` | `src/search/vector_plugin.cpp` |
+| 增量查询 | `VectorPlugin::search` | `src/search/vector_plugin.cpp` |
+| Flush 决策 | `VectorPlugin::flush` | `src/search/vector_plugin.cpp` |
+| Base 落盘 | `VectorPlugin::save_component_base` | `src/search/vector_plugin.cpp` |
+| Delta 落盘 | `VectorPlugin::save_component_delta` | `src/search/vector_plugin.cpp` |
+| 序列化段 | `HnswIndex::serialize` / `HnswIndex::deserialize` | `src/vector/hnsw.cpp` |
+| f32 payload | `HnswIndex::save_vec_payload` / `HnswIndex::load_vec_payload` | `src/vector/hnsw.cpp` |
+| int8 payload | `HnswIndex::save_qc_payload` / `HnswIndex::load_qc_payload` | `src/vector/hnsw.cpp` |
+| Delta 日志序列化 | `VectorPlugin::serialize_delta_log` / `VectorPlugin::apply_delta_log` | `src/search/vector_plugin.cpp` |
+| 加载 + 链重放 | `VectorPlugin::load_component` | `src/search/vector_plugin.cpp` |
+| Merge 重建 | `VectorPlugin::on_merge_commit` / `VectorPlugin::rebuild` | `src/search/vector_plugin.cpp` |
+| 结构化活子图拷贝 | `HnswIndex::clone_live` | `src/vector/hnsw.cpp` |
+| 链文件清理 | `sc::remove_chain_files` / `sc::walk_chain` | `src/search`（S20-2 R8/R2） |
+| 链状态 | `VectorPlugin::chain_`（`ChainState`，定义于 `component_ckpt.hpp`） | `include/bitcask/vector_plugin.hpp` |
+| 水位幂等 | `HnswIndex::insert` 内 `max_inserted_ord_` | `src/vector/hnsw.cpp` |
+| 写者原子发布 | `HnswIndex::count_` / `HnswIndex::entry_meta_` | `include/bitcask/hnsw.hpp` |

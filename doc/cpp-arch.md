@@ -1,15 +1,5 @@
 # C++ 架构
 
-> **架构换代（S18/S19，2026-07-04）**：原聚合类 `SearchLayer` 已按插件化
-> 设计（doc/plugin-arch-split-design-zh.md）一分为三——`text::TextPlugin`
-> （BM25 全家）、`vec::VectorPlugin`（HNSW）、`search::HybridSearcher`
-> （RRF 融合），Cask 经 `plugin::CaskPlugin` 接口在写/恢复/merge/checkpoint
-> 四条通路广播；DocMap（`index::Index`）为宿主服务；查询推荐走
-> `text::Searcher`/`vec::Searcher` 门面（searcher.hpp，Cask 的 search_*
-> 门面为兼容薄委托）。本文正文中对 SearchLayer 的既有叙述为历史行文——
-> 其职责按上述归属对号入座（SearchLayer 本体已降级为测试夹具
-> tests/support/）。
-
 本文档介绍 libbitcask 的 C++ 代码库，并说明各层之间如何协同工作。请结合 [`format-zh.md`](format-zh.md)（磁盘格式规范）一起阅读。
 
 ## 模块布局
@@ -17,119 +7,241 @@
 ```
 .
 ├── include/bitcask/         # 公共头文件（API 接口）
-│   ├── format.hpp           # 磁盘格式常量（带类型记录：kDoc/kTombstone + ord）
-│   ├── codec.hpp            # 数据/提示记录编解码（23B 数据头，18B 提示）
-│   ├── io.hpp               # PosixFile + IoError
-│   ├── data_file.hpp        # DataFile：追加/读取/折叠带类型记录
-│   ├── hint_file.hpp        # HintFile：写入/验证提示记录
-│   ├── scanner.hpp          # scan_dir：列出 .bitcask.data 文件
-│   ├── keydir.hpp           # KeyDir：内存键目录 + 迭代器（MVCC 兄弟链，256 分片）
-│   ├── keydir_registry.hpp  # KeyDirRegistry：命名 keydir 缓存（引用计数共享）
-│   ├── merge_policy.hpp     # decide() 规则 + 每文件阈值
-│   ├── merger.hpp           # Merger：合并执行（重写活跃记录）
-│   ├── cask.hpp             # Cask：终端用户 KV + 搜索门面（open/get/put/remove/put_doc/search*/merge/make_iter）
-│   ├── meta_file.hpp        # bitcask.meta：模式 + 向量配置持久化（18 B）
-│   ├── meta_codec.hpp       # DocValue v3 编解码（text/meta/vector/fields 段）
-│   ├── meta_filter.hpp      # meta 字段过滤表达式（搜索后过滤）
-│   ├── field_schema.hpp     # FieldSchema：字段名↔id 追加注册表（DocValue v3 字段）
-│   ├── index.hpp            # Index：内存文档侧表（ext2ord/slots/ord2ext/live）
-│   ├── live_checker.hpp     # live 集合批量维护（HNSW / 搜索死文档过滤）
-│   ├── doc_table.hpp        # DocTable : LiveChecker 查询面只读身份表（S16-3）
-│   ├── inverted.hpp         # InvertedIndex：BM25 倒排索引（按字段隔离 + 分片锁）
-│   ├── inverted_wal.hpp     # InvertedWal：倒排索引 WAL + 批量刷新
-│   ├── bm25_kernels.hpp     # DAAT BM25 评分内核
-│   ├── intersect.hpp        # 倒排链交集（k-way / BlockMax 等）
-│   ├── vbyte.hpp            # varint / vbyte 编码
-│   ├── query.hpp            # 查询 AST（bool / phrase / near / fuzzy / wildcard）
-│   ├── plugin_api.hpp       # CaskPlugin 接口 + PluginHost（插件化架构 S15）
-│   ├── text_plugin.hpp      # TextPlugin：BM25 文本域插件（倒排 + analyzer + 缓存 + 高亮）
-│   ├── vector_plugin.hpp    # VectorPlugin：HNSW 向量域插件
-│   ├── hybrid_searcher.hpp  # HybridSearcher：BM25 + 向量 RRF 融合
-│   ├── searcher.hpp         # Searcher 类型化查询门面（text/vec/hybrid）
-│   ├── search_config.hpp    # SearchLayerConfig（配置聚合，拆分产出两插件配置）
-│   ├── search_cache.hpp     # 查询侧缓存（分析结果 / term ord）
-│   ├── search_checkpoint.hpp # search.ckpt 分段快照（恢复用）
-│   ├── highlighter.hpp      # 搜索命中高亮
-│   ├── synonym_map.hpp      # 同义词词典（查询时展开）
-│   ├── fuzzy_matcher.hpp    # Levenshtein 编辑距离匹配
-│   ├── wildcard_matcher.hpp # `*?` 通配符匹配（基于 trie）
-│   ├── myers.hpp            # Myers 差分算法（fuzzy 用）
-│   ├── porter_stemmer.hpp   # Porter 词干提取
-│   ├── stemming_analyzer.hpp # 词干分析器 wrapper
-│   ├── analyzer.hpp         # text::Analyzer 抽象基类 + 工厂 + AnalyzerConfig
-│   ├── ngram_analyzer.hpp   # NgramAnalyzer：CJK 二/三元词 + Latin 空白分词
-│   ├── jieba_analyzer.hpp   # JiebaAnalyzer：中文分词（cppjieba）
-│   ├── whitespace_analyzer.hpp # WhitespaceAnalyzer：纯空白分词
-│   ├── cjk_detect.hpp       # CJK 字符检测工具
-│   ├── text_utils.hpp       # NFKC 标准化 + 文本工具
-│   ├── hnsw.hpp             # HnswIndex：HNSW 向量索引（单写者 + 多读者无锁发布）
-│   ├── thread_pool.hpp      # IndexPool：异步索引有界队列（背压）
-│   ├── hw_crc32.hpp         # 硬件加速 CRC32（zlib + SIMD fallback）
-│   ├── string_hash.hpp      # 字符串 hash 工具
-│   ├── migrate.hpp          # 大端 → 小端离线迁移（migrate_le）
-│   └── file_lock.hpp        # FileLock：独占锁（O_CREAT|O_EXCL）
-├── c_api/                   # libbitcask.so 的 C ABI（extern "C"，跨语言绑定）
-│   ├── bitcask_kv.h/.cpp    # KV / 迭代 / meta 过滤 / 生命周期 / 配置（S19-5 分域）
-│   ├── bitcask_text.h/.cpp  # BM25 文本检索
-│   ├── bitcask_vec.h/.cpp   # 向量 / RRF 混合检索
-│   ├── bitcask_c.h          # 聚合 include（源兼容：一次拉全部三分域头）
-│   └── internal.h           # 三 TU 共享助手（句柄包装 / slice↔span / fault 翻译，visibility hidden）
+│   ├── detail/              # 实现细节（内嵌头）
+│   │   ├── file_fault.hpp        # data/hint 文件共用错误类型
+│   │   ├── inert_table.hpp       # NFKC 惰性区间表（构建期生成）
+│   │   ├── int8_kernels.hpp      # int8 对称量化 + VNNI 距离内核
+│   │   ├── scanner.hpp           # scan_dir：bitcask 目录扫描
+│   │   ├── stop_words.hpp        # 默认停用词表（中英）
+│   │   └── thread_local_buffer.hpp # 热路径读缓冲 thread_local 复用
+│   ├── byte_order.hpp        # 小端 load/store 辅助（盘格式统一 LE）
+│   ├── codec.hpp             # data/hint 记录编解码 + DocValue v3 + CRC32
+│   ├── format.hpp            # 磁盘格式常量（header 布局 / RecordType / DocValue flags）
+│   ├── io.hpp                # PosixFile（pread/pwrite/fsync/lseek）+ IoError
+│   ├── data_file.hpp         # DataFile：append/kRead/fold/sealed-mmap 零拷贝
+│   ├── hint_file.hpp         # HintFile：keydir 重建加速（v3 变长 + trailer CRC）
+│   ├── keydir.hpp            # KeyDir：256 分片 + 屏障 v2 + MVCC 迭代器
+│   ├── keydir_registry.hpp   # KeyDirRegistry：同目录共享 keydir（refcount）
+│   ├── index.hpp             # Index：DocMap（ord↔ext/live/meta）+ DocTable
+│   ├── doc_table.hpp         # DocTable：查询面只读身份表接口（插件借用）
+│   ├── live_checker.hpp      # LiveChecker：ord 存活/doc_len 接口
+│   ├── file_lock.hpp         # FileLock：O_CREAT|O_EXCL 进程间锁
+│   ├── file_fault.hpp        # （已迁 detail/file_fault.hpp，保留兼容）
+│   ├── meta_file.hpp         # bitcask.meta v2：模式 + 向量配置（18B）
+│   ├── meta_codec.hpp        # DocValue meta 段：key-sorted KV 二进制格式
+│   ├── meta_filter.hpp       # MetaFilter：AND/OR 复合过滤树
+│   ├── field_schema.hpp      # FieldSchema：字段名↔id 注册表（schema interning）
+│   ├── inverted.hpp          # InvertedIndex：BM25 倒排 + WAND + postings
+│   ├── bm25_params.hpp       # Bm25Params：k1/b/δ 等可调参数
+│   ├── bm25_kernels.hpp      # SIMD 向量化 BM25 tf_norm 评分内核
+│   ├── intersect.hpp         # k-way posting 交集（galloping / Inoue SIMD）
+│   ├── vbyte.hpp             # VByte 变长整数编解码
+│   ├── query.hpp             # 查询 AST（MUST/SHOULD/MUST_NOT + 短语叶）
+│   ├── plugin_api.hpp        # CaskPlugin 接口 + PluginHost + OpenContext
+│   ├── text_plugin.hpp       # TextPlugin：BM25 文本域插件（impl CaskPlugin）
+│   ├── text_plugin_config.hpp # TextPluginConfig 配置 POD（轻量头）
+│   ├── vector_plugin.hpp     # VectorPlugin：HNSW 向量域插件（impl CaskPlugin）
+│   ├── vector_plugin_config.hpp # VectorPluginConfig 配置 POD
+│   ├── hybrid_searcher.hpp   # HybridSearcher：BM25 + 向量 RRF 融合
+│   ├── searcher.hpp          # text::Searcher / vec::Searcher / CaskHybridSearcher
+│   ├── search_config.hpp     # SearchLayerConfig 聚合配置（拆分产出两插件）
+│   ├── search_arena.hpp      # 进程级共享 Search 池（inter-query 并发）
+│   ├── search_cache.hpp      # 查询结果 LRU（选择性失效）
+│   ├── search_checkpoint.hpp # search.ckpt 分段容器（每段 CRC + footer）
+│   ├── search_types.hpp      # SearchHit / SearchError / ReduceJob / kDefaultField
+│   ├── ckpt_chain.hpp        # 组件 checkpoint .d 链走读/坍缩（模板收敛）
+│   ├── component_ckpt.hpp    # 组件 ckpt 共用类型：ChainState / DeltaSaveResult
+│   ├── docmap_ckpt.hpp       # docmap 组件 ckpt：宿主侧持久化
+│   ├── index_manifest.hpp    # index.manifest：per-component commit 点
+│   ├── highlighter.hpp       # 搜索命中 snippet 截取
+│   ├── synonym_map.hpp       # 同义词词典（open-time 不可变）
+│   ├── fuzzy_matcher.hpp     # Levenshtein 编辑距离
+│   ├── wildcard_matcher.hpp  # * / ? 通配符匹配
+│   ├── myers.hpp             # Myers 位并行编辑距离（fuzzy 加速）
+│   ├── porter_stemmer.hpp    # Porter 词干提取
+│   ├── stemming_analyzer.hpp # StemmingAnalyzer wrapper（Porter）
+│   ├── analyzer.hpp          # Analyzer 抽象基类 + 工厂 + AnalyzerConfig
+│   ├── ngram_analyzer.hpp    # NgramAnalyzer：CJK n-gram + 拉丁空白切分
+│   ├── jieba_analyzer.hpp    # JiebaAnalyzer：中文分词（cppjieba）
+│   ├── whitespace_analyzer.hpp # WhitespaceAnalyzer：纯空白切分
+│   ├── cjk_detect.hpp        # CJK 字符检测（Unicode 15.0 范围）
+│   ├── text_utils.hpp        # NFKC 标准化 + 文本工具
+│   ├── hnsw.hpp              # HnswIndex：HNSW 图 + int8 量化 + mmap payload
+│   ├── thread_pool.hpp       # IndexPool：MapReduce 异步索引流水线
+│   ├── hw_crc32.hpp          # CRC32 IEEE 802.3（PCLMULQDQ + zlib fallback）
+│   ├── string_hash.hpp       # 透明 hash（string_view 异构查找）
+│   ├── cask.hpp              # Cask：KV + 搜索门面 + 生命周期
+│   ├── merger.hpp            # Merger：合并 + CAS 重定位 + 插件广播
+│   ├── merge_policy.hpp      # 纯函数策略：decide/summarize/per_file_reasons
+│   └── migrate.hpp           # bitcask::migrate::migrate_be_to_le 大小端迁移
+├── c_api/                   # libbitcask.so 的 C ABI（extern "C"）
+│   ├── bitcask_kv.{h,cpp}    # KV / 迭代 / meta 过滤 / 生命周期 / 配置
+│   ├── bitcask_text.{h,cpp}  # BM25 文本检索
+│   ├── bitcask_vec.{h,cpp}   # 向量 / RRF 混合检索
+│   ├── bitcask_c.h           # 聚合 include（源兼容）
+│   ├── bitcask_version.h.in  # 版本头 configure_file 模板
+│   └── internal.h            # 三 TU 共享助手（handle / slice↔span / fault）
 ├── src/                     # 实现（按子目录分库）
 │   ├── fileops/             # codec.cpp, data_file.cpp, hint_file.cpp, scanner.cpp, migrate.cpp
 │   ├── io/                  # posix_file.cpp
 │   ├── lock/                # file_lock.cpp
-│   ├── keydir/              # keydir.cpp, keydir_registry.cpp, index.cpp
+│   ├── keydir/              # keydir.cpp, keydir_registry.cpp, index.cpp, docmap_ckpt.cpp
 │   ├── merge/               # merger.cpp, merge_policy.cpp
-│   ├── cask/                # cask.cpp, meta_file.cpp
-│   ├── search/              # text_plugin.cpp, vector_plugin.cpp, hybrid_searcher.cpp, search_arena.cpp, search_cache.cpp, highlighter.cpp
-│   ├── bm25/                # inverted.cpp, inverted_wal.cpp, intersect.cpp, query_parser.cpp
-│   ├── vector/              # hnsw.cpp
-│   └── text/                # analyzer.cpp, jieba_analyzer.cpp
-├── tests/                   # GoogleTest 单元 + 集成测试（32 个测试二进制）
-├── bench/                   # Google Benchmark（cask / keydir / inverted / hnsw / gate /
-│                            #               intersect_u64_proto / crc32 / analyzer + bench_main）
-├── tools/                   # migrate_le（大端→小端）、gen_inert_table（NFKC 惰性区间表生成）
+│   ├── cask/                # cask.cpp, cask_iter.cpp, cask_search.cpp,
+│   │                        # cask_recovery.cpp, meta_file.cpp,
+│   │                        # cask_internal.hpp, legacy_ckpt.{hpp,cpp}
+│   ├── search/              # text_plugin.cpp, vector_plugin.cpp,
+│   │                        # hybrid_searcher.cpp, search_arena.cpp,
+│   │                        # search_cache.cpp, highlighter.cpp
+│   ├── bm25/                # intersect.cpp, inverted.cpp, query_parser.cpp
+│   ├── text/                # analyzer.cpp, jieba_analyzer.cpp
+│   └── vector/              # hnsw.cpp, hnsw_kernels.hpp（内部分距离内核声明）
+├── tests/                   # GoogleTest 单元 + 集成测试
+│   ├── support/             # bitcask/search_layer.{hpp,cpp}（shim 测试夹具）
+│   └── 32 个测试二进制（参见 tests/CMakeLists.txt）
+├── bench/                   # Google Benchmark（cask/keydir/inverted/hnsw …）
+├── tools/                   # migrate_le、gen_inert_table
 ├── cmake/                   # BitcaskSanitizers 模块 + tsan.supp
-├── third_party/             # 第三方依赖（git submodule，vendored，构建无需联网）
+├── third_party/             # 第三方依赖（git submodule，vendored）
 └── doc/                     # 架构 / 格式 / 设计文档
 ```
 
-## 分层结构
+整个代码树使用 C++23，不依赖 Boost / abseil。第三方库（utf8proc / cppjieba / limonp / googletest / google-benchmark / oneTBB / unordered_dense）均以 **git submodule** 形式 vendored 在 `third_party/`，clone 后无需手动安装，构建无需联网。GoogleTest 与 Google Benchmark 仅在 `BUILD_TESTING=ON` / `BITCASK_BUILD_BENCHMARKS=ON` 开启时编译。
+
+## 分层结构与依赖
+
+下图是各层的逻辑分层与编译期依赖关系（PUBLIC 链传播，PRIVATE 不外露）。命名空间在头文件里已显式标注。
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│  C API（c_api/bitcask_{kv,text,vec}.{h,cpp} + bitcask_c.h）│
-│  libbitcask.so：extern "C" 不透明句柄 + slice + fault      │
-└────────────────────────────┬───────────────────────────────┘
-                               │ PIMPL
-┌────────────────────────────▼───────────────────────────────┐
-│  Cask (KV + 搜索门面)                                     │
-│  ├─ KeyDir（256 分片 shared_mutex + MVCC 迭代器）          │
-│  ├─ DocMap / Index（宿主服务：ord↔ext/live/meta，S16）     │
-│  │   └─ DocTable（查询面只读接口：ord_to_ext/eval_meta，   │
-│  │       继承 bm25::LiveChecker；S16-3）                   │
-│  ├─ DataFile 缓存（pread 句柄 + 近似 LRU 淘汰）            │
-│  ├─ HintFile（活跃写入器；含整文件 CRC trailer）           │
-│  ├─ plugins_（CaskPlugin 分发表：写/恢复/merge/ckpt 广播）│
-│  │   ├─ TextPlugin "bm25"（倒排/Analyzer/缓存/高亮/组件   │
-│  │   │   ckpt——bm25.ckpt 文件族；S18 拆分）               │
-│  │   └─ VectorPlugin "hnsw"（HNSW/归一化/vec.ckpt 族）     │
-│  ├─ HybridSearcher（RRF 融合器，持两插件引用）             │
-│  ├─ CaskPluginHost（read_at/run_serialized/log）           │
-│  └─ MetaConfig（bitcask.meta 模式 + 向量配置持久化）       │
-└────────────────────────────┬───────────────────────────────┘
-                              │
-┌────────────────────────────▼───────────────────────────────┐
-│  fileops (codec, data_file, hint_file, scanner, migrate)   │
-│  io (PosixFile, FileLock)                                  │
-│  merge (Merger, PolicyOptions)                             │
-│  bm25 (InvertedIndex, InvertedWal, intersect, query_parser)│
-│  vector (HnswIndex)                                        │
-│  text (Analyzer, NgramAnalyzer, JiebaAnalyzer)             │
-└────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  C API（c_api/bitcask_kv.{h,cpp} + bitcask_text + bitcask_vec +    │
+│        bitcask_c.h 聚合头 + internal.h 共享助手）                  │
+│  libbitcask.so：extern "C" 不透明句柄 + slice + fault（PIMPL）      │
+└────────────────────────────┬────────────────────────────────────────┘
+                               │ PIMPL：持 bitcask::Cask
+┌────────────────────────────▼────────────────────────────────────────┐
+│  Cask（KV + 搜索门面）                                              │
+│  include/bitcask/cask.hpp（Cask / CaskOptions / CaskFault /          │
+│  CaskIter / GetResult[View] / DocInput / StatusInfo / …）            │
+│  src/cask/{cask,cask_iter,cask_search,cask_recovery}.cpp + meta_file│
+│                                                                     │
+│  ├─ KeyDir（256 分片 shared_mutex + MVCC 迭代器）                  │
+│  │   include/bitcask/keydir.hpp（SingleEntry/MultiEntry/EntryProxy │
+│  │   /IterHandle/KeyDirInfo/FStatsEntry）+ keydir_registry.hpp      │
+│  │   src/keydir/keydir.cpp + keydir_registry.cpp                   │
+│  ├─ DataFile 缓存（pread 句柄 + 近似 LRU 淘汰）                    │
+│  │   include/bitcask/data_file.hpp（DataFile/ReadRecord/WriteResult）│
+│  │   src/fileops/data_file.cpp                                     │
+│  ├─ HintFile（活跃写入器 + v3 trailer CRC + sealed-mmap hint）      │
+│  │   include/bitcask/hint_file.hpp                                 │
+│  │   src/fileops/hint_file.cpp                                     │
+│  ├─ DocMap（Index：ord↔ext/live/meta 宿主服务；查询面 DocTable）   │
+│  │   include/bitcask/index.hpp + doc_table.hpp + live_checker.hpp  │
+│  │   src/keydir/index.cpp + keydir/docmap_ckpt.cpp（宿主侧持久化） │
+│  ├─ 插件分发表 plugins_（CaskPlugin ×：写/恢复/merge/ckpt 广播）   │
+│  │   include/bitcask/plugin_api.hpp                                │
+│  │   ├─ TextPlugin  "bm25"   src/search/text_plugin.cpp            │
+│  │   │   （倒排/Analyzer/缓存/高亮/bm25.ckpt 文件族）             │
+│  │   └─ VectorPlugin "hnsw"  src/search/vector_plugin.cpp          │
+│  │       （HNSW/归一化/vec.ckpt 族 + .vec/.qc8 侧车）             │
+│  ├─ HybridSearcher（RRF 融合器；持两插件引用）                     │
+│  │   include/bitcask/hybrid_searcher.hpp + src/search/hybrid_searcher.cpp│
+│  ├─ CaskPluginHost（read_at / run_serialized / log 窄反向接口）    │
+│  ├─ MetaConfig（bitcask.meta v2 + 向量配置 + CRC32）               │
+│  │   include/bitcask/meta_file.hpp + meta_codec.hpp                │
+│  │   src/cask/meta_file.cpp                                        │
+│  └─ IndexPool（异步索引 MapReduce，借自 KeyDirRegistry）           │
+│      include/bitcask/thread_pool.hpp                                │
+└────────────────────────────┬────────────────────────────────────────┘
+                               │
+┌────────────────────────────▼────────────────────────────────────────┐
+│  查询门面（推荐新代码使用）                                        │
+│  include/bitcask/searcher.hpp                                      │
+│  text::Searcher / vec::Searcher / search::CaskHybridSearcher       │
+│  （每次查询先 drain_plugins() 读屏障 → 直调插件内核）              │
+└────────────────────────────┬────────────────────────────────────────┘
+                               │
+┌────────────────────────────▼────────────────────────────────────────┐
+│  基础实现层                                                         │
+│                                                                     │
+│  fileops        include/{codec,data_file,hint_file}.hpp             │
+│                 + detail/{file_fault,scanner}.hpp                   │
+│                 src/fileops/{codec,data_file,hint_file,             │
+│                              scanner,migrate}.cpp                  │
+│                 → codec 纯函数 + 文件抽象 + 目录扫描 + 大端迁移     │
+│                                                                     │
+│  io / lock      include/bitcask/{io,file_lock}.hpp                 │
+│                 src/io/posix_file.cpp + src/lock/file_lock.cpp      │
+│                 → PosixFile + FileLock（O_EXCL 仲裁）               │
+│                                                                     │
+│  merge          include/bitcask/{merger,merge_policy}.hpp           │
+│                 src/merge/{merger,merge_policy}.cpp                 │
+│                 → 纯函数策略 + 执行（CAS 重定位 + 插件广播）        │
+│                                                                     │
+│  bm25           include/bitcask/{inverted,bm25_params,              │
+│                                  bm25_kernels,intersect,            │
+│                                  vbyte,query}.hpp                   │
+│                 src/bm25/{inverted,intersect,query_parser}.cpp     │
+│                 → 倒排 + WAND + k-way 交集 + 查询 AST               │
+│                                                                     │
+│  text           include/bitcask/{analyzer,ngram_analyzer,           │
+│                                  jieba_analyzer,whitespace_analyzer,│
+│                                  stemming_analyzer,porter_stemmer,  │
+│                                  cjk_detect,text_utils}.hpp        │
+│                 src/text/{analyzer,jieba_analyzer}.cpp              │
+│                 → Analyzer 实现 + 工厂 + 停用词                     │
+│                                                                     │
+│  vector         include/bitcask/{hnsw}.hpp + detail/int8_kernels.hpp│
+│                 src/vector/{hnsw.cpp, hnsw_kernels.hpp}             │
+│                 → HNSW 图 + int8 量化 + mmap payload + 距离内核     │
+│                                                                     │
+│  工具           include/bitcask/{hw_crc32,string_hash,               │
+│                                  highlighter,synonym_map,           │
+│                                  fuzzy_matcher,myers,               │
+│                                  wildcard_matcher,                  │
+│                                  search_arena,search_cache,         │
+│                                  search_checkpoint,ckpt_chain,      │
+│                                  component_ckpt,index_manifest,     │
+│                                  docmap_ckpt,byte_order,migrate}.hpp │
+│                 → 校验/缓存/高亮/查询基础设施                       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-整个代码树使用 C++23，不依赖 Boost / abseil。第三方库（utf8proc / cppjieba / limonp / googletest / google-benchmark / oneTBB）均以 **git submodule** 形式 vendored 在 `third_party/`，clone 后无需手动安装，构建无需联网。GoogleTest 与 Google Benchmark 仅在 `BUILD_TESTING=ON` / `BITCASK_BUILD_BENCHMARKS=ON` 开启时编译。
+### 关键依赖图
+
+```
+Cask (cask.hpp)
+ ├─ KeyDir/KeyDirRegistry ────────┐
+ ├─ DataFile/HintFile ────────────┤── fileops ──┬── codec (纯函数)
+ ├─ DocMap (Index/DocTable) ──────┤              ├── PosixFile (io)
+ ├─ TextPlugin ───────────────────┤              └── FileLock (lock)
+ │    └─ InvertedIndex ───────────┤── bm25
+ │    └─ Analyzer ────────────────┤── text (ngram/jieba/whitespace)
+ │    └─ SearchCache/Highlighter ─┤── 工具
+ ├─ VectorPlugin ─────────────────┤
+ │    └─ HnswIndex ───────────────┤── vector
+ ├─ HybridSearcher ───────────────┘── 持两插件引用
+ ├─ IndexPool (MapReduce) ────────┘── thread_pool
+ ├─ Merger ───────────────────────┘── merge
+ └─ MetaFile ─────────────────────┘── meta_file/meta_codec
+```
+
+- **插件化架构**（`plugin_api.hpp`）：`CaskPlugin` 接口是 KV 存储层与索引层之间的唯一契约。`Cask` 在写/恢复/merge/checkpoint 四条通路上向注册的插件广播事件；插件要变异自身单写者状态时经 `PluginHost::run_serialized` 投递到 reducer 静止点。Text/Vector 是当前两个内建插件；新增插件（TTL、metrics、CDC）只需实现此接口。
+- **DocMap 宿主服务**：所有插件都借用 `Cask::docmap()`（实现为 `index::Index`）做身份翻译（ord↔ext、live 过滤、meta 过滤）。reducer 在插件之前先 apply docmap，保证插件收到的事件里 docmap 行已落地。
+- **配置拆分**：`CaskOptions::search_config`（`SearchLayerConfig`）由 `text_config()` / `vector_config()` 拆成两插件独立配置，分别喂给 `TextPluginConfig` / `VectorPluginConfig`。配置层只依赖 POD 头（`text_plugin_config.hpp` / `vector_plugin_config.hpp`），不拖入插件实现。
+
+## 插件架构（S18/S19 拆分）
+
+聚合类 `SearchLayer` 已按插件化设计（设计稿 [`plugin-arch-split-design-zh.md`](plugin-arch-split-design-zh.md)）拆分为三个目标：
+
+| 目标 | 头 | 实现 | 职责 |
+|---|---|---|---|
+| `bitcask_text_plugin` | `text_plugin.hpp` + `text_plugin_config.hpp` | `src/search/text_plugin.cpp` + `search_cache.cpp` + `highlighter.cpp` + `search_arena.cpp` | BM25 全家：per-field 倒排（`InvertedIndex`）+ Analyzer + 查询缓存 + 高亮原文 LRU + 同义词 + `bm25.ckpt` 文件族。`name() = "bm25"` |
+| `bitcask_vector_plugin` | `vector_plugin.hpp` + `vector_plugin_config.hpp` | `src/search/vector_plugin.cpp` | HNSW 图 + 写入端归一化 + merge 重建 + `vec.ckpt` 文件族 + `.vec`/`.qc8` 侧车。`name() = "hnsw"` |
+| `bitcask_hybrid` | `hybrid_searcher.hpp` | `src/search/hybrid_searcher.cpp` | RRF 融合器（非插件）：持两插件引用，两路各超采 `max(k×4, 64)`，RRF(60) 融合，ord 决胜 |
+| `bitcask_search` shim | （已降级为测试夹具 `tests/support/`） | `bitcask_search_shim` 仅 `tests/CMakeLists.txt` 引用 | 不再是生产库目标；保留 shim 仅供 `search_layer_test.cpp` 与 legacy 迁移测试使用 |
+
+Cask 经 `plugin::CaskPlugin` 接口（`plugin_api.hpp`）在写/恢复/merge/checkpoint 四条通路广播事件。插件在 `on_put` / `on_delete` / `on_relocate` / `on_merge_commit` / `flush` 等回调里被 reducer 单写者驱动，事件严格按 ord 升序到达。
 
 ## 磁盘文件清单
 
@@ -146,37 +258,48 @@
 ├── field.schema                # 字段名→id 注册表（仅索引模式）
 ├── bitcask.write.lock          # 由活跃写入器持有（独占）
 ├── bitcask.merge.lock          # 由活跃合并器持有（独占）
-├── bitcask.keydir.snap         # keydir 段快照（A4，可选）
-├── search.ckpt                 # 索引层分段 checkpoint（P14e/P14b，可选）
-├── <base>.f<N>.inv.snap        # 每字段倒排索引快照（索引模式，可选）
-└── <base>.f<N>.inv.wal         # 每字段倒排索引 WAL（索引模式，可选）
+├── kv.keydir.ckpt              # keydir 段快照（A4，可选）
+├── docmap.ckpt                 # docmap 组件 checkpoint（S17-2，可选）
+├── docmap.ckpt.d<seq>          # docmap delta 链（可选）
+├── bm25.ckpt                   # BM25 组件 checkpoint（可选）
+├── bm25.ckpt.d<seq>            # BM25 delta 链（可选）
+├── vec.ckpt                    # HNSW 组件 checkpoint（可选）
+├── vec.ckpt.d<seq>             # HNSW delta 链（可选）
+├── <dir>.vec                   # HNSW 向量 payload（V7 BCVS v2，mmap）
+├── <dir>.qc8                   # HNSW int8 码字 payload（可选）
+├── index.manifest              # per-component commit point（S17-2）
+└── search.ckpt                 # 旧统一容器（P14e/P14b，S17-5 一次性迁移后消失）
 ```
+
+> S17-2 之前是单一 `search.ckpt`；S17-2 拆为 per-component 三件套 + `index.manifest` commit 点；旧库 open 时触发 `Cask::migrate_legacy_search_ckpt` 一次性迁移。详细设计见 [`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)。
 
 ### 文件详解
 
 | 文件 | 数量 | 生命周期 | 用途 |
-|------|-------|----------|---------|
-| `bitcask.meta` | 1 | 持久化 | 魔术数 `BCME` + 版本 + 模式（0=KV，1=Index/search）+ 向量配置（VecMetric/VecDim/VecQuant）。来源：`meta_file.hpp`。18 字节。 |
+|------|-------|----------|------|
+| `bitcask.meta` | 1 | 持久化 | 魔术数 `BCME` + version=2 + 模式（0=KV，1=Index/search）+ 向量配置（VecMetric/VecDim/VecQuant/InmemInt8）。来源：`meta_file.hpp`。18 字节，最后 4 字节是覆盖前 14 字节的 CRC32。 |
 | `<tstamp>.bitcask.data` | 多个 | 持久化，旧文件由 merge 删除 | 核心数据。记录序列：`CRC(4)+Type(1)+Tstamp(4)+Ord(8)+KeySz(2)+ValueSz(4)+Key+Value`（23 B 头）。追加方式，无文件级头。`<tstamp>` = 单调递增的 uint32 文件 id，永不重用。 |
-| `<tstamp>.bitcask.hint` | 0..N | 持久化，与数据文件 1:1 配对 | 附带给定索引：键 + 偏移 + 总大小（无值）。加速打开时的 keydir 重建 —— 只读取键，不读取值。以 18 B 哨兵结束，其 `TotalSz` 字段携带整个文件的 CRC32。如果 CRC 校验失败，则忽略 hint 并从数据文件重建 keydir。 |
-| `field.schema` | 0 或 1 | 持久化 | 仅索引模式。追加式字段名→id 注册表。每个条目：`[NameLen:u16 LE][name]`，id = 出现顺序（从 0 开始）。DocValue v3 存储字段 id 而不是内联名称。 |
+| `<tstamp>.bitcask.hint` | 0..N | 持久化，与数据文件 1:1 配对 | 附带给定索引：键 + 偏移 + 总大小（无值）。S23-A1 起写端恒 v3（文件头 magic "BCH3" + 变长 vbyte 记录 + 8 B trailer "BCHE" + running_crc）；读端按文件头 magic 分派 v2/v3。校验不过 → caller 退回 fold(data) 重建。 |
+| `field.schema` | 0 或 1 | 持久化 | 仅索引模式。追加式字段名→id 注册表。S12-3 起 8 B 文件头 `[magic:"FSCH" u32 LE][version:1 u32 LE]` + 每条 `[NameLen:u16 LE][name][CRC32:u32 LE]`；CRC 覆盖 `[len\|name]`。来源：`field_schema.hpp`。open 时识别 legacy 无头格式并原子升级到带头格式。 |
 | `bitcask.write.lock` | 0 或 1 | 运行时（以 RW 模式打开时创建，关闭时删除） | 通过 `O_CREAT|O_EXCL` 独占写锁。内容：`<pid> <active_data_file_path>\n`。合并器读取此文件以了解活跃写入器的活动文件并将其从合并候选中排除。过时锁通过 `kill(pid, 0)` 探测自动回收。 |
 | `bitcask.merge.lock` | 0 或 1 | 运行时（合并期间持有） | 独占合并锁。**有意独立**于 write.lock —— 写入器和合并器并发运行，互不竞争。 |
-| `bitcask.keydir.snap` | 0 或 1 | 持久化 | KeyDir 段快照（A4 特性）。通过避免完整数据文件扫描来加速打开。 |
-| `<dir>/search.ckpt` | 0 或 1 | 持久化 | 索引层分段 checkpoint（keydir 水位 + Index 侧表 + 各字段倒排）。详见 [`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)。 |
-| `<base>.f<N>.inv.snap` | 0..N | 持久化 | 每字段倒排索引完整快照（仅索引模式）。`<N>` = 字段 id（0=default）。由 `InvertedIndex::save()` 写入，打开时加载。 |
-| `<base>.f<N>.inv.wal` | 0..N | 持久化 | 每字段倒排索引 WAL（仅索引模式）。自上次快照以来的 add_doc/remove_doc 追加日志。快照保存后截断。 |
+| `kv.keydir.ckpt` | 0 或 1 | 持久化 | KeyDir 段快照（A4 特性）。通过避免完整数据文件扫描来加速打开。 |
+| `docmap.ckpt` / `docmap.ckpt.d<seq>` | 各 0..1 | 持久化 | DocMap 组件 checkpoint 与 delta 链（S17-2 拆分）。宿主侧驱动，写入 docmap + keydir 元数据 delta。 |
+| `bm25.ckpt` / `bm25.ckpt.d<seq>` | 各 0..1 | 持久化 | BM25 倒排组件 checkpoint 与 delta 链。 |
+| `vec.ckpt` / `vec.ckpt.d<seq>` | 各 0..1 | 持久化 | HNSW 图组件 checkpoint 与 delta 链。 |
+| `<base>.vec` / `<base>.qc8` | 各 0..1 | 持久化 | HNSW 向量 f32 payload + int8 码字 payload（V7 BCVS v2）。S14-2/S14-8 引入前缀不变追加契约 + payload 代号校验。 |
+| `index.manifest` | 1 | 持久化 | per-component commit 点。magic "BCMF"，记录每个组件的 `{base_watermark, chain_seq, chain_watermark}` + footer CRC；唯一原子提交点（tmp+rename）。 |
 
 ### 操作如何接触文件
 
 | 操作 | 接触的文件 |
 |-----------|---------------|
-| `put(K,V)` | 追加记录到活跃 `.data` + 追加 hint 到活跃 `.hint` + 更新内存 keydir。索引模式：同时异步提交 IndexTask → `add_doc` → `.inv.wal` 追加 |
-| `get(K)` | 查找内存 keydir → 从一个 `.data` 文件 `pread(file_id, offset)` |
-| `delete(K)` | 追加墓碑记录（`type=kTombstone`）到活跃 `.data` + 墓碑 hint |
-| `open` | 读取 `bitcask.meta` → 扫描所有 `.data` 文件（优先使用 `.hint` 加速，回退到完整数据扫描）→ 重建内存 keydir。索引模式：加载 `.inv.snap` + 回放 `.inv.wal` |
-| `merge` | 获取 `merge.lock` → 读取 `write.lock` 获取活跃文件 id → 选择高碎片化候选 → 复制活跃记录到新的 `.data`+`.hint` 对 → CAS 更新 keydir → 删除旧文件 |
-| `close` | 释放 `write.lock`（删除） |
+| `put(K,V)` | 追加记录到活跃 `.data` + 追加 hint 到活跃 `.hint` + 更新内存 keydir。索引模式：同时异步提交 IndexTask → reducer 单写者广播到 plugins（docmap 行/删 + TextPlugin on_put/VectorPlugin on_put） |
+| `get(K)` | 查找内存 keydir → 从一个 `.data` 文件 `pread(file_id, offset)`（sealed-mmap 命中时走 mmap 零拷贝读，否则 pread） |
+| `delete(K)` | 追加墓碑记录（`type=kTombstone`）到活跃 `.data` + 墓碑 hint + 索引模式异步 docmap 软删 |
+| `open` | 读取 `bitcask.meta` → 扫描所有 `.data` 文件（优先使用 `.hint` 加速，回退到完整数据扫描）→ 重建内存 keydir。索引模式：加载 `index.manifest` → per-component ckpt 链重放 → 从 keydir 水位起 fold(data) 增量补齐 |
+| `merge` | 获取 `merge.lock` → 读取 `write.lock` 获取活跃文件 id → 选择高碎片化候选 → 复制活跃记录到新的 `.data`+`.hint` 对 → CAS 更新 keydir → 触发插件 on_merge_commit（VectorPlugin rebuild + TextPlugin compact）→ 删除旧文件 |
+| `close` | 释放 `write.lock`（删除）+ 自动 ckpt（触发 flush + 各组件 ckpt 落盘 + index.manifest commit + keydir 快照） |
 
 ### 关键设计要点
 
@@ -184,6 +307,8 @@
 - **追加方式**：每个 put/delete 追加一个新记录；旧版本成为死字节。
 - **两个独立锁**：写入器持有 `write.lock`，合并器持有 `merge.lock` —— 它们从不互相阻塞。
 - **提示是可选/防御性的**：损坏或缺失的提示只会触发较慢的数据文件完整扫描重建。正确性从不依赖于提示。
+- **插件 checkpoint 自洽**：每个组件自己管自己的 base + delta 链 + 记账；宿主只驱动 docmap 持久化，bm25/vec 由各自插件在 `flush()` 里落盘 + 回执 `chain_seq/chain_wm` 给宿主写 manifest。
+- **payload 前缀不变契约**：`.vec` / `.qc8` 走追加路径时仅写 `[vec_file_.count, count_)` 区间，崩溃残留的尾部垃圾在下次 `save` 时被覆盖。
 
 ## 双持久化：数据文件 vs 倒排 WAL
 
@@ -193,49 +318,44 @@ Bitcask 有**两条独立的持久化路径**，服务不同的目的。在接�
 
 每个 `put(K,V)` 向活跃 `.data` 文件追加一个带类型记录。这就是权威的 KV 存储。在 `open` 时，扫描所有 `.data` 文件（优先通过 `.hint` 附带文件）并重建内存 KeyDir。KV 数据不需要单独的 WAL —— 追加日志本身就是 WAL。
 
-### 路径 2：倒排 WAL + 快照 —— BM25 索引恢复
+### 路径 2：插件组件 checkpoint（base + delta 链）—— 索引恢复
 
-BM25 倒排索引（倒排列表、词词典、位置）是 `InvertedIndex` 内部的复杂内存结构。每次重启从头重建需要重读所有数据文件并重新分析所有文本 —— 大规模下代价高昂（例如 200K 文档约需 2–5 秒）。
+BM25 倒排索引（倒排列表、词词典、位置）和 HNSW 图是 `TextPlugin` / `VectorPlugin` 内部的复杂内存结构。每次重启从头重建需要重读所有数据文件并重新分析所有文本 —— 大规模下代价高昂（例如 200K 文档约需 2–5 秒）。
 
-为了避免完整重建，索引使用**快照 + WAL** 模式：
+为了避免完整重建，索引使用**per-component base + delta 链 + manifest commit**模式：
 
 ```
-open:
-  load_snapshot()    → InvertedIndex::load(.inv.snap)
-  enable_wal()       → 打开 .inv.wal 用于追加
-  replay_wal()       → 回放自快照以来的增量 add_doc/remove_doc
-                      → 成功回放后截断 WAL
+open (索引模式):
+  read_meta               → 决定模式 + 向量配置
+  read_manifest           → 加载 index.manifest 取得每组件 {base_wm, chain_seq, chain_wm}
+  load_component_base     → TextPlugin::load_component() / VectorPlugin::load_component()
+                            / docmap_ckpt::load()（base wm 校验，失败退 .prev）
+  load_component_delta    → ckpt_chain 走读 .d1..d<chain_seq>（每条 delta 含
+                            kDeltaInfo 三元组校验）
+  replay 重叠区           → 从 keydir 水位起 fold(data) 增量补齐
+  watermark               → 报告给 reducer：≥ watermark 的事件需 fold 重放
 
-运行时（每次 put）:
-  put_doc(K, V)
+运行时（每次 put_doc）:
+  put_doc(K, DocInput)
     ├─ DataFile::write(kDoc)         ← 路径 1（KV 权威，追加）
-    └─ submit_index_task(Add)        ← 异步到 IndexPool（map worker → reducer）
-         └─ TextPlugin::on_put()      ← reducer 串行扇出
-              └─ InvertedIndex::add_doc(ord, terms)
-                   └─ wal_->append_add_doc()  ← 路径 2（索引 WAL）
+    └─ submit_index_task(Add)        ← 异步到 IndexPool（MapReduce）
+         └─ map worker (并行分词)
+              └─ TextPlugin::prepare()  → 各插件 produce TextPrepared
+         └─ reducer 单写者按 ord 序 apply
+              └─ docmap.put_doc / remove（reducer 起点：宿主先 apply）
+              └─ TextPlugin::on_put() / VectorPlugin::on_put()
 
 周期性保存:
-  InvertedIndex::save(.inv.snap)    ← 完整状态到磁盘
-  truncate_wal()                     ← 快照是权威的，WAL 清空
+  flush()                  → 各 plugin::FlushRequest → 落盘 ckpt + 写 manifest commit
+                            （keydir 快照仅 base 路径下写）
 
 崩溃恢复:
-  load_snapshot() + replay_wal()    → 索引当前到崩溃点
+  read_manifest + 链重放 + keydir 水位后 fold 重叠区 → 索引当前到崩溃点
 ```
 
-**为什么索引需要单独的 WAL？** 数据文件记录包含 DocValue 编码的文本 —— 分析器的原始输入。但倒排索引是一个*派生*结构（已分词、位置索引、词排序）。WAL 捕获*分析结果*（ord + 词位置），以便恢复跳过重新分析所有文本。没有 WAL，重启要么丢失自上次快照以来添加的索引条目（搜索结果陈旧），要么需要从数据文件完整重建。
+**为什么索引需要单独的 checkpoint？** 数据文件记录包含 DocValue 编码的文本 —— 分析器的原始输入。但倒排索引是一个*派生*结构（已分词、位置索引、词排序）。checkpoint 链捕获*分析结果*（ord + 词位置），以便恢复跳过重新分析所有文本。没有 checkpoint 链，重启要么丢失自上次 base 以来添加的索引条目（搜索结果陈旧），要么需要从数据文件完整重建。
 
 **这反映了标准搜索引擎架构**：Elasticsearch 有 translog，Lucene 有段级 WAL —— 都服务于相同的目的，即在内存索引状态和周期性完整快照之间建立桥梁。
-
-### WAL 批量刷新（V6.2）
-
-`InvertedWal` 支持可配置的 `batch_size`（默认=1）：
-
-- **batch_size=1**（默认）：每个 `append_add_doc` 立即执行 `fwrite + fflush`。最大持久性，最大 `fflush` 开销。
-- **batch_size>1**：条目在内存中缓冲；达到阈值时单个 `fwrite + fflush` 刷新整个批次。析构函数刷新任何剩余缓冲区。
-
-崩溃语义：未刷新的缓冲条目会丢失。这是安全的，因为数据文件（路径 1）是 KV 权威 —— 缺失的 WAL 条目意味着索引在下次快照保存之前不会有该文档，这与不运行 WAL 时的陈旧窗口相同。
-
-WAL 帧格式：`[4B payload_len][payload][4B CRC32]`。CRC 仅覆盖 payload。`replay()` 验证每个条目并自动截断损坏的尾部（崩溃残留的半写入最后条目）。
 
 ## 并发模型
 
@@ -272,6 +392,8 @@ reducer 串行，读可与之并发。
 **InvertedIndex** 线程安全：内部按词哈希分片锁 + `tbb::concurrent_hash_map`
 桶锁 + posting list 的 CoW —— 与 KeyDir 的分片锁是各自独立的体系。
 
+**HnswIndex**（V3.3）单写者 + 多读者：`atomic<NodeChunk*>` 发布协议 + per-node seqlock；rebuild 走 `atomic<shared_ptr<HnswIndex>>` 旁路建图 + 原子换指针，旧图由引用计数续命。
+
 ## 迭代器语义（兄弟链 + 待定哈希）
 
 当至少一个 `IterHandle` 正在迭代时（`keyfolders_ > 0`）：
@@ -290,7 +412,7 @@ reducer 串行，读可与之并发。
 
 ## C API 导出
 
-`c_api/`（分域头 `bitcask_kv.h` / `bitcask_text.h` / `bitcask_vec.h` + 聚合 `bitcask_c.h`，实现 `bitcask_kv.cpp` / `bitcask_text.cpp` / `bitcask_vec.cpp` + 共享 `internal.h`）提供 `extern "C"` ABI，由 `libbitcask.so`（`SOVERSION=3`）导出，供跨语言绑定（Python / Rust / Go / Node …）使用。设计要点：
+`c_api/`（分域头 `bitcask_kv.h` / `bitcask_text.h` / `bitcask_vec.h` + 聚合 `bitcask_c.h`，实现 `bitcask_kv.cpp` / `bitcask_text.cpp` / `bitcask_vec.cpp` + 共享 `internal.h`）提供 `extern "C"` ABI，由 `libbitcask.so`（`SOVERSION=3`，版本由根 `CMakeLists.txt` 的 `project(VERSION 3.1.0)` 单一真源生成）导出，供跨语言绑定（Python / Rust / Go / Node …）使用。设计要点：
 
 - **不透明句柄**：`bitcask_t` / `bitcask_iter_t` 是 forward-declared struct，调用方只持有指针。
 - **显式内存配对**：每个返回堆分配的函数都有对应的 `*_free`（如 `bitcask_get_result_free`、`bitcask_search_result_free`、`bitcask_iter_entry_free`、`bitcask_needs_merge_free`）。
@@ -320,7 +442,39 @@ reducer 串行，读可与之并发。
 - **例外**：`bitcask_close`（生命周期，close 即 free 句柄，须无在途调用）；同一 `bitcask_iter_t` 不可并发（每线程一个）。（同义词词典已改为 open-time 不可变配置 `options.synonym_file_path`，无并发竞态。）
 - 并行全表扫描：C++ `Cask::parallel_scan`（C-only host 可自行多线程 `bitcask_get`）。
 
-完整契约见 [`design/thread-safety.md`](design/thread-safety.md)；原型见 [`api-c.md`](api-c.md) 与 `c_api/bitcask_c.h`。
+完整契约见 `docs/design/thread-safety.md`；原型见 [`api-c.md`](api-c.md) 与 `c_api/bitcask_c.h`。
+
+## CMake target 列表
+
+根 `CMakeLists.txt` 定义的库目标（PUBLIC 链接传播头路径与依赖；PRIVATE 仅内部使用）：
+
+| 目标 | 类型 | 源文件 | 公共依赖 | 用途 |
+|---|---|---|---|---|
+| `bitcask_format` | STATIC | `src/fileops/codec.cpp` | ZLIB::ZLIB | codec 纯函数（data/hint 编解码、CRC32、DocValue v3） |
+| `bitcask_io` | STATIC | `src/io/posix_file.cpp`, `src/lock/file_lock.cpp` | — | PosixFile + FileLock 原语 |
+| `bitcask_fileops` | STATIC | `src/fileops/{data_file,hint_file,scanner,migrate}.cpp` | `bitcask_format`, `bitcask_io` | DataFile / HintFile / scanner / 大端迁移 |
+| `bitcask_keydir` | STATIC | `src/keydir/{keydir,keydir_registry}.cpp` | `bitcask_fileops`, `bitcask_io`, `unordered_dense` | KeyDir + KeyDirRegistry |
+| `bitcask_docmap` | STATIC | `src/keydir/index.cpp`, `src/keydir/docmap_ckpt.cpp` | `bitcask_text`, `bitcask_format` | DocMap 宿主服务 + 组件 ckpt（别名 `bitcask_index` 兼容） |
+| `bitcask_plugin_api` | INTERFACE | 纯头 | — | `plugin_api.hpp`（CaskPlugin 接口） |
+| `bitcask_bm25` | STATIC | `src/bm25/{intersect,inverted,query_parser}.cpp` | `bitcask_format`, TBB | 倒排索引 + WAND + k-way 交集 + 查询 AST |
+| `bitcask_vector` | STATIC | `src/vector/hnsw.cpp` | `bitcask_format`, TBB | HnswIndex（HNSW 图 + int8 + mmap payload） |
+| `bitcask_text_plugin` | STATIC | `src/search/{text_plugin,search_arena,search_cache,highlighter}.cpp` | `bitcask_docmap`, `bitcask_bm25`, `bitcask_text`, `bitcask_plugin_api`, TBB | TextPlugin（BM25 域）+ inter-query 搜索池 + 查询缓存 + 高亮 |
+| `bitcask_vector_plugin` | STATIC | `src/search/vector_plugin.cpp` | `bitcask_vector`, `bitcask_format`, `bitcask_plugin_api` | VectorPlugin（HNSW 域） |
+| `bitcask_hybrid` | STATIC | `src/search/hybrid_searcher.cpp` | `bitcask_text_plugin`, `bitcask_vector_plugin` | HybridSearcher（RRF 融合器） |
+| `bitcask_merge` | STATIC | `src/merge/{merger,merge_policy}.cpp` | `bitcask_keydir`, `bitcask_fileops`, `bitcask_io`, `bitcask_format`, `bitcask_plugin_api` | 合并执行 + 纯函数策略 |
+| `bitcask_text` | STATIC | `src/text/{analyzer,jieba_analyzer}.cpp` | utf8proc, cppjieba, `generate_inert_table` | Analyzer 抽象基类 + Ngram + Jieba + 工厂 + 停用词 |
+| `bitcask_cask` | STATIC | `src/cask/{cask,cask_iter,cask_search,cask_recovery,meta_file,legacy_ckpt}.cpp` | `bitcask_keydir`, `bitcask_fileops`, `bitcask_io`, `bitcask_format`, `bitcask_merge`, `bitcask_hybrid`, TBB | Cask 高层门面（KV + 搜索 + 生命周期 + 元数据） |
+| `bitcask_shared` | SHARED | `c_api/{bitcask_kv,bitcask_text,bitcask_vec}.cpp` | `bitcask_cask` | `libbitcask.so`（C ABI，SOVERSION 3） |
+| `bitcask_static` | CUSTOM | 合并上述所有 STATIC 为单一 `libbitcask.a` | — | 静态归档 |
+| `migrate_le` | EXECUTABLE | `tools/migrate_le.cpp` | `bitcask_fileops`, `bitcask_format`, `bitcask_io` | 大端 → 小端离线迁移工具（详见 `migrate-le.md`） |
+| `gen_inert_table` | EXECUTABLE | `tools/gen_inert_table.cpp` | utf8proc | 构建期 NFKC 惰性区间表生成器 |
+
+附加构建选项与目标：
+
+- `bitcask_warnings` (INTERFACE)：所有 first-party 目标的统一告警集合（`-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wnon-virtual-dtor -Wold-style-cast -Wcast-align -Woverloaded-virtual -fvisibility=hidden`）。
+- `bitcask_sanitizers` (INTERFACE)：由 `cmake/BitcaskSanitizers.cmake` 提供；`-DBITCASK_SANITIZE=address,undefined` 或 `=thread` 时注入 ASan/UBSan/TSan 标志（ASan 与 TSan 互斥）。
+- `bitcask_search_shim` (STATIC)：仅在 `tests/CMakeLists.txt` 内定义（`tests/support/search_layer.cpp`），作为 shim 测试夹具；不参与生产库链接。
+- 预编译头（PCH，默认 `BITCASK_PCH=ON`）：`bitcask_cask` / `bitcask_text_plugin` / `bitcask_keydir` / `bitcask_bm25` / `bitcask_text` 共享同一组 STL 头（`<algorithm> <cstdint> <expected> <memory> <optional> <span> <string> <string_view> <unordered_map> <vector>`）。
 
 ## 构建入口
 
@@ -344,15 +498,24 @@ cmake -S . -B build/tsan -DCMAKE_BUILD_TYPE=Debug \
     -DBITCASK_SANITIZE=thread -DBUILD_TESTING=ON
 cmake --build build/tsan -j
 
+# -Werror 库构建（first-party 护栏，CI `werror-lib` job 开启）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    -DBITCASK_WERROR=ON -DBUILD_TESTING=OFF
+cmake --build build -j --target bitcask_static bitcask_shared
+
+# 仅构建大小端迁移工具
+cmake -S . -B build -DBUILD_TESTING=ON
+cmake --build build -j --target migrate_le
+
 # 安装
 cmake --install build        # 头文件、libbitcask.{so,a}、bitcask_c.h
 ```
 
 产物：
 
-- `libbitcask.so` — 共享库，导出 C API（`SOVERSION=3`）
+- `libbitcask.so` — 共享库，导出 C API（`SOVERSION=3`，版本由 `project(VERSION ...)` 派生）
 - `libbitcask.a` — 把全部静态归档合并为单一 `.a`
-- `migrate_le` — 旧大端目录 → 小端目录的离线迁移工具
+- `migrate_le` — 旧大端目录 → 小端目录的离线迁移工具（详见 [`migrate-le.md`](migrate-le.md)）
 - `gen_inert_table` — NFKC 惰性区间表代码生成器（构建期自动执行）
 
 ## 添加新的 C++ 特性
