@@ -3020,3 +3020,66 @@ W4 ✅（parallel_scan 并行全表扫描）。
 - 已知豁免：c_api_test 在 ASan 树链接失败（C 驱动缺 UBSan C++ runtime，
   临时树基建项，CI 矩阵/Debug 树覆盖该测试）；TSan 预存项如上。
 - **结论：S21-S24 全部 26 个 commit 在三 sanitizer 下零回归。**
+
+
+---
+
+## 待办：第十五梯队（S25 内存/线程/格式三维度安全审计 — 2026-07-08）
+
+> 来源：2026-07-08 全代码库安全审计。3 个并行 explore agent（内存安全 / 线程管理 /
+> 存储文件格式）+ 直接精读 codec/posix_file/data_file/hint_file/meta_file/keydir/
+> cask/merger/hnsw/thread_pool/C API 全核心文件。
+>
+> **总体结论**：代码库质量高——S11-S24 已系统性修复了大部分并发/格式/生命周期
+> 问题（S13-F1~F8 并发 bug 全修、S12-3/3b field.schema/meta CRC 已加、S13-M2 C API
+> malloc 检查已加、S13-F2 ord 泄漏已修）。本轮发现的**真实新缺口**集中在：
+> ① 几处整数溢出 UB（理论性，FFI 恶意输入可触发）；② parallel_scan 的 RAII 遗漏
+> （cask_recovery 已修同型但 parallel_scan 漏了）；③ C API slice 校验缺口；
+> ④ close() 等待无超时兜底。
+
+### P0 内存安全（立即可修，投入小）
+
+- [x] **S25-M1 `parallel_scan` 线程创建缺少 RAII join 保护** — 已完成（2026-07-08）· `src/cask/cask.cpp:1187`
+  - 加 `JoiningPool` RAII 结构（照搬 `cask_recovery.cpp:500` 同模式），`emplace_back`
+    抛异常时已创建的线程在栈展开时自动 join。显式 join 保留（错误在 return 前传播）。
+  - 验证：全量 544/544 ctest 通过。
+
+- [x] **S25-M2 C API slice 未校验 `nullptr + size>0`** — 已完成（2026-07-08）· `c_api/internal.h` + `c_api/bitcask_kv.cpp`
+  - 新增 `slice_valid()` helper（`internal.h`）。`bitcask_get`/`put`/`put_ex`/`delete`/
+    `put_doc`/`put_batch` 六个入口全部加校验：`data==nullptr && size>0` → `BITCASK_ERR_INVALID_OPTION`。
+
+### P1 内存安全（整数溢出 UB，理论性但 FFI 场景不可忽视）
+
+- [x] **S25-M3 `read_bytes_section` + 向量 dim 整数溢出** — 已完成（2026-07-08）· `src/fileops/codec.cpp`
+  - 三处修复：① `read_bytes_section` 的 `pos+len` 改 `len > buf.size()-pos`（减法不溢出）；
+    ② 量化向量段的 `need = 1+sizeof(float)+dim` 改拆步减法检查；③ f32 向量段的
+    `dim*sizeof(float)` 乘法改 `dim > (remaining)/sizeof(float)` 除法检查。
+  - 验证：全量 544/544。
+
+- [x] **S25-M4 `parse_leading_pid` 有符号整数溢出 UB** — 已完成（2026-07-08）· `src/cask/cask.cpp:75`
+  - 溢出检查从乘法**之后**移到**之前**（`if (pid > (1<<30)) return -1;` 先判再乘）。
+
+- [x] **S25-M5 HNSW buffer reserve 整数溢出** — 已完成（2026-07-08）· `src/vector/hnsw.cpp:1822`
+  - `(1 + cfg_.M * 2) * 4 * 8` 从 int 域改全程 `static_cast<std::size_t>` 运算。
+
+### P1 线程管理
+
+- [x] **S25-T1 `close()` 等待 `writes_in_flight_` 无超时** — 已完成（2026-07-08）· `src/cask/cask.cpp:594`
+  - 加 30s `wait_for` 超时兜底。超时后 `log_error` 并强制继续释放资源（接受潜在
+    UAF 风险优于进程永久挂死）。`writes_in_flight_.wait(n, seq_cst)` 在计数变化时
+    唤醒，外层 `for` 检查 `elapsed >= 30s` 则 break。
+
+### 已核实为安全（无需修复，避免重复审计）
+
+- **`data_file.cpp:110` mmap span 悬垂**（代理报告 CRITICAL）—— **误报**。
+  `cask.cpp:1094` 的 `GetResultView(std::move(df), ...)` 持有 `shared_ptr<DataFile>`
+  锚定 mmap 生命周期，view 存活期间映射不撤。安全。
+- **`cask.cpp:1268` GetResultView 移动构造读 moved-from**（代理报告 CRITICAL）—— **误报**。
+  mmap 路径下地址稳定（MAP_SHARED 不因 shared_ptr 移动而变），注释已正确解释。安全。
+- **field.schema 无 CRC**（代理报告 HIGH）—— **S12-3 已修**（2026-07-01）。
+- **bitcask.meta 无 CRC**（代理报告 HIGH）—— **S12-3b 已修**（2026-07-01，v3 加 CRC）。
+- **hint v3 trailer CRC** —— **S23-A1 已实现**（2026-07-06）。
+- **data record CRC 覆盖** —— 正确（覆盖 Type..Value，标准做法）。
+- **torn-write 截断恢复** —— 正确（`fold` + `truncate_to(last_valid_end)`）。
+- **vbyte_read shift>=64 防御** —— 正确。
+- **IndexPool 生命周期 / HNSW seqlock / KeyDir 屏障协议** —— 均已 TSan 验证正确。
