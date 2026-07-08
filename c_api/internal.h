@@ -438,6 +438,12 @@ inline bool fill_get_result_view(const bitcask::GetResultView& src,
     return true;
 }
 
+// S25-M2:校验 C slice 的前置不变量——data 非空或 size 为零。
+// 违反时 C++ span 构造为 UB（data()==nullptr && size()!=0 非法）。
+inline bool slice_valid(const bitcask_slice_t& s) noexcept {
+    return s.data != nullptr || s.size == 0;
+}
+
 inline bitcask::Cask* as_cpp_cask(bitcask_t* h) {
     return reinterpret_cast<bitcask_impl_t*>(h)->cask.get();
 }

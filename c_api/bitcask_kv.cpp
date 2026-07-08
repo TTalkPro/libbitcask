@@ -144,12 +144,13 @@ BITCASK_API void bitcask_close(bitcask_t* cask) {
 }
 
 BITCASK_API bitcask_error_t bitcask_get(bitcask_t* cask,
-                                          bitcask_slice_t key,
-                                          bitcask_get_result_t** out,
-                                          bitcask_fault_t* fault) {
+                                           bitcask_slice_t key,
+                                           bitcask_get_result_t** out,
+                                           bitcask_fault_t* fault) {
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
+    if (!slice_valid(key)) return BITCASK_ERR_INVALID_OPTION;  // S25-M2
     *out = nullptr;
 
     std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
@@ -180,6 +181,7 @@ BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    if (!slice_valid(key) || !slice_valid(value)) return BITCASK_ERR_INVALID_OPTION;  // S25-M2
 
     std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
     std::span<const std::byte> value_span{static_cast<const std::byte*>(value.data), value.size};
@@ -202,6 +204,7 @@ BITCASK_API bitcask_error_t bitcask_put_ex(bitcask_t* cask,
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    if (!slice_valid(key) || !slice_valid(value)) return BITCASK_ERR_INVALID_OPTION;  // S25-M2
     std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
     std::span<const std::byte> value_span{static_cast<const std::byte*>(value.data), value.size};
     auto result = as_cpp_cask(cask)->put(key_span, value_span, tstamp, expiry_at);
@@ -220,6 +223,7 @@ BITCASK_API bitcask_error_t bitcask_delete(bitcask_t* cask,
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    if (!slice_valid(key)) return BITCASK_ERR_INVALID_OPTION;  // S25-M2
 
     std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
     auto result = as_cpp_cask(cask)->remove(key_span, tstamp);
@@ -275,6 +279,8 @@ BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !doc) return BITCASK_ERR_INVALID_OPTION;
+    if (!slice_valid(key) || !slice_valid(doc->text) ||
+        !slice_valid(doc->meta)) return BITCASK_ERR_INVALID_OPTION;  // S25-M2
 
     std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
     bitcask::DocInput doc_input;
@@ -318,6 +324,8 @@ BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
     std::vector<bitcask::Cask::BatchItem> batch;
     batch.reserve(n);
     for (size_t i = 0; i < n; ++i) {
+        if (!slice_valid(items[i].key) || !slice_valid(items[i].value))  // S25-M2
+            return BITCASK_ERR_INVALID_OPTION;
         batch.push_back(bitcask::Cask::BatchItem{
             {static_cast<const std::byte*>(items[i].key.data),
              items[i].key.size},
