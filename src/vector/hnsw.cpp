@@ -1818,10 +1818,12 @@ bool HnswIndex::serialize(std::vector<std::uint8_t>& buf) const {
     }
 
     buf.clear();
-    // 粗估:头 64B + 每节点 17+dim + 邻接上限 ~ (1+M*2)*4*(level+1)
-    buf.reserve(64 + static_cast<std::size_t>(n) *
-                         (24 + static_cast<std::size_t>(cfg_.dim) +
-                          (1 + cfg_.M * 2) * 4 * 8));
+    // S25-M5:全程 size_t 运算，避免 int 域乘法溢出（cfg_.M 大时
+    // (1+M*2)*4*8 在 int/uint32 域溢出 → reserve 远小于实际写入量）。
+    const std::size_t per_node =
+        24 + static_cast<std::size_t>(cfg_.dim) +
+        (1 + static_cast<std::size_t>(cfg_.M) * 2) * 4 * 8;
+    buf.reserve(64 + static_cast<std::size_t>(n) * per_node);
     vs_put32(buf, kBcvhMagic);
     // S14-8:v3——码字外置 qc8，段内不再内嵌（bit1 = 有 qc8 文件）。
     vs_put32(buf, kBcvhVersion3);

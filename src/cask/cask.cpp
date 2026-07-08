@@ -72,9 +72,10 @@ parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
     for (auto byte : bytes) {
         char c = static_cast<char>(byte);
         if (c >= '0' && c <= '9') {
+            // S25-M4:先检查再乘，避免有符号整数溢出 UB。
+            if (pid > (1 << 30)) return -1;
             pid = pid * 10 + (c - '0');
             any_digit = true;
-            if (pid > (1 << 30)) return -1;  // overflow guard
         } else {
             break;
         }
@@ -591,9 +592,24 @@ void Cask::close() noexcept {
     // 契约上 close 时刻不应有在途写调用（closed_ 注释），此处防御性收敛：
     // 违约时 close 阻塞等待而非 UAF。被队列背压挡住的写者也会收敛——池由
     // registry 持有仍在消费，push 必然返回；closed_ 已置位，新写者入口即退。
-    for (auto n = writes_in_flight_.load(std::memory_order_seq_cst); n != 0;
-         n = writes_in_flight_.load(std::memory_order_seq_cst)) {
-        writes_in_flight_.wait(n, std::memory_order_seq_cst);
+    // S25-T1:加 30s 超时兜底——若写线程被 kill（pthread_cancel/信号）致
+    // writes_in_flight_ 卡在非零，close 不再永久阻塞；超时后 log_error 并
+    // 强制继续释放（接受潜在 UAF 风险优于进程永久挂死）。
+    {
+        constexpr auto kCloseWaitTimeout = std::chrono::seconds(30);
+        auto start = std::chrono::steady_clock::now();
+        for (auto n = writes_in_flight_.load(std::memory_order_seq_cst); n != 0;
+             n = writes_in_flight_.load(std::memory_order_seq_cst)) {
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            if (elapsed >= kCloseWaitTimeout) {
+                log_error("close: writes_in_flight_=" + std::to_string(n) +
+                          " after 30s — proceeding with teardown (write thread "
+                          "may have been killed; potential UAF risk)");
+                break;
+            }
+            // 等到计数变化或超时
+            writes_in_flight_.wait(n, std::memory_order_seq_cst);
+        }
     }
     // close 内部步骤（save_ckpt/snapshot 的 vector 操作）可能抛 bad_alloc；
     // noexcept 函数抛出 → std::terminate。整个 body 包 try/catch 兜底：吞掉
@@ -1184,15 +1200,24 @@ Cask::parallel_scan(std::size_t n_threads, const ScanFn& fn,
     if (nthr <= 1) {
         worker(0, total);
     } else {
-        std::vector<std::thread> ws;
-        ws.reserve(nthr);
+        // S25-M1:RAII join guard——emplace_back 抛异常（资源耗尽）时已创建的
+        // joinable 线程会被析构自动 join（否则 std::terminate）。与 cask_recovery.cpp
+        // 的 JoiningPool 同模式。
+        struct JoiningPool {
+            std::vector<std::thread> threads;
+            ~JoiningPool() {
+                for (auto& t : threads) if (t.joinable()) t.join();
+            }
+        } ws;
+        ws.threads.reserve(nthr);
         const std::size_t chunk = (total + nthr - 1) / nthr;
         for (std::size_t t = 0; t < nthr; ++t) {
             const std::size_t b = t * chunk;
             if (b >= total) break;
-            ws.emplace_back(worker, b, std::min(b + chunk, total));
+            ws.threads.emplace_back(worker, b, std::min(b + chunk, total));
         }
-        for (auto& w : ws) w.join();
+        // 显式 join（ws 析构也兜底，但显式 join 让错误在 return 前传播）
+        for (auto& w : ws.threads) w.join();
     }
     if (!ok.load()) return std::unexpected(first_err);
     return total;

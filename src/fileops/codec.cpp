@@ -233,7 +233,7 @@ decode_doc_value(std::span<const std::byte> buf) {
         [&buf, &pos](std::span<const std::byte>& out_span) -> bool {
         std::uint64_t len = 0;
         if (!vbyte_read(buf, pos, len)) return false;
-        if (buf.size() < pos + len) return false;
+        if (len > buf.size() - pos) return false;  // S25-M3:减法避溢出
         out_span = buf.subspan(pos, len);
         pos += len;
         return true;
@@ -246,8 +246,10 @@ decode_doc_value(std::span<const std::byte> buf) {
         if (!vbyte_read(buf, pos, dim)) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
-        const std::size_t need = 1 + sizeof(float) + static_cast<std::size_t>(dim);
-        if (buf.size() < pos + need) {
+        // S25-M3:need = 1 + sizeof(float) + dim。dim 来自不可信 vbyte，
+        // 可能大到令 need 溢出。改用减法：dim + 5 必须 ≤ 剩余字节。
+        constexpr std::size_t kQuantOverhead = 1 + sizeof(float);
+        if (dim > buf.size() - pos || kQuantOverhead > buf.size() - pos - dim) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
         const std::uint8_t scheme = static_cast<std::uint8_t>(buf[pos]);
@@ -265,6 +267,11 @@ decode_doc_value(std::span<const std::byte> buf) {
         // vector 段：[Dim:varint 元素个数][f32×Dim 小端]。Dim 是元素数、非字节数。
         std::uint64_t dim = 0;
         if (!vbyte_read(buf, pos, dim)) {
+            return std::unexpected(DecodeError::kBufferTooShort);
+        }
+        // S25-M3:dim * sizeof(float) 可乘法溢出。改用除法：dim 不得超过
+        // 剩余字节 / sizeof(float)。
+        if (dim > (buf.size() - pos) / sizeof(float)) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
         const std::size_t bytes = static_cast<std::size_t>(dim) * sizeof(float);
