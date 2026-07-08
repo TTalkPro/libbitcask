@@ -30,8 +30,10 @@ add_executable(bitcask_bench
     merge_bench.cpp          # B1
     index_pool_bench.cpp     # B2
     checkpoint_bench.cpp     # B4 （B3 扩展在 keydir_bench.cpp 内）
+    avx512_verify_bench.cpp  # AVX-512 启用验证（scalar vs SIMD 对拍）
     bench_main.cpp
 )
+target_include_directories(bitcask_bench PRIVATE "${CMAKE_SOURCE_DIR}/src/vector")
 target_link_libraries(bitcask_bench
     PRIVATE
         benchmark::benchmark
