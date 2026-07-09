@@ -33,6 +33,10 @@ struct SearchLayerConfig {
     // 大幅省内存——代价：search_phrase / search_near 失效（无位置可匹配，返回空）。
     // 仅做 search_text/bool/fuzzy/wildcard 的部署可关闭。
     bool                 index_positions = true;
+    // S26-2：catch-all 开关（默认 true = 既有行为）。false 时非默认字段词项不再
+    // 合并进默认字段——多字段库倒排量/内存/ckpt ~减半，代价 search_text 不再命中
+    // 多字段文档（改走 search_fields）。详见 text_plugin_config.hpp。
+    bool                 index_catch_all = true;
     // V3.3:向量配置(Cask::open 从 meta 透传)。dim>0 时构造 HnswIndex;
     // metric 映射:kCosineNormalized/kDot → HnswMetric::kDot(cosine 已在
     // 写入端归一化),kL2 → kL2。
@@ -71,7 +75,7 @@ struct SearchLayerConfig {
     // 面（CaskOptions::search_config）本批不变，P5 换代。
     [[nodiscard]] text::TextPluginConfig text_config() const {
         return {analyzer_config, bm25_params, cache_max_entries,
-                doc_text_cache_max, index_positions,
+                doc_text_cache_max, index_positions, index_catch_all,
                 auto_compact_dead_ratio, synonym_map, max_delta_chain};
     }
     [[nodiscard]] vec::VectorPluginConfig vector_config() const {

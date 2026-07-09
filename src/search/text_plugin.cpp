@@ -158,7 +158,9 @@ ReduceJob TextPlugin::map_analyze(
 
         if (field == kDefaultField) {
             job.wrote_default = true;
-        } else if (!term_data.empty()) {
+        } else if (config_.index_catch_all && !term_data.empty()) {
+            // S26-2：catch-all 关闭时不累积 ca_data → 每词只 add_doc 一遍
+            // （apply_job_impl 见 ca_data 空即跳过默认字段合并）。
             std::uint32_t field_max_pos = 0;
             for (auto& [term, data] : term_data) {
                 auto& [tf, positions] = data;

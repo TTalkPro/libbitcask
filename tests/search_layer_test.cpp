@@ -494,6 +494,39 @@ TEST(SearchLayer, MultiFieldVisibleToPlainSearch) {
     EXPECT_EQ(rf->at(0).key, "doc1");
 }
 
+// S26-2：index_catch_all=false 时，非默认字段词项**不**合并进默认字段——
+// 多字段文档对 search_text（只查默认字段）不再可见，但 search_fields 字段
+// 限定仍精确命中。这是 MultiFieldVisibleToPlainSearch 的对照（catch-all 关）。
+TEST(SearchLayer, CatchAllDisabled) {
+    SearchLayerConfig config{
+        .analyzer_config = bitcask::text::AnalyzerConfig{
+            .type = bitcask::text::AnalyzerType::Whitespace},
+        .bm25_params = bitcask::bm25::Bm25Params{1.2F, 0.75F}
+    };
+    config.index_catch_all = false;
+    SearchLayer layer(config);
+    layer.on_write_fields("doc1", 0,
+        {{"title", "quick brown"}, {"body", "lazy dog"}}, 1, 100, 50, 1000);
+    layer.on_write_fields("doc2", 1,
+        {{"title", "lazy cat"}, {"body", "quick fox"}}, 1, 200, 50, 1001);
+
+    // catch-all 关：默认字段无词项 → search_text 对多字段文档不再命中。
+    auto r = layer.search_text("quick", 10);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 0u);
+
+    // 字段限定仍精确：title:quick 命中 doc1、body:quick 命中 doc2。
+    auto rf = layer.search_fields("title:quick", 10);
+    ASSERT_TRUE(rf.has_value());
+    ASSERT_EQ(rf->size(), 1u);
+    EXPECT_EQ(rf->at(0).key, "doc1");
+
+    auto rb = layer.search_fields("body:quick", 10);
+    ASSERT_TRUE(rb.has_value());
+    ASSERT_EQ(rb->size(), 1u);
+    EXPECT_EQ(rb->at(0).key, "doc2");
+}
+
 // S8.6：跨字段查询 + boost 影响排序。
 TEST(SearchLayer, MultiFieldBoostRanking) {
     SearchLayerConfig config{

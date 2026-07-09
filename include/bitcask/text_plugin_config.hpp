@@ -24,6 +24,11 @@ struct TextPluginConfig {
     std::size_t          cache_max_entries = 256;
     std::size_t          doc_text_cache_max = 1024;
     bool                 index_positions = true;
+    // S26-2：是否把非默认字段词项合并进默认字段（catch-all）。true（默认）=
+    // 既有行为，search_text 能命中多字段文档，代价每词 add_doc 两遍。false =
+    // 只建各命名字段倒排（省 reducer/内存/ckpt ~半），多字段文档只能经
+    // search_fields 字段限定命中。纯默认字段写入不受影响。
+    bool                 index_catch_all = true;
     double               auto_compact_dead_ratio = 0.0;  // S12-2
     std::shared_ptr<const SynonymMap> synonym_map;       // S11：open-time 不可变
     // S18-6（S14-5 语义每插件化）：delta 链长上限，达到后 flush 强制 base。
