@@ -856,6 +856,46 @@ TEST_F(CaskDocValueTest, MultiFieldPutAndSearch) {
     (*c)->close();
 }
 
+TEST_F(CaskDocValueTest, DocTextIndexedAsDefaultInMultiFieldMode) {
+    // S28-1: doc.text 在多字段模式下应索引为 kDefaultField
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = sl_cfg;
+
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+
+    auto bytes = [](std::string_view s) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s.data()), s.size());
+    };
+
+    bitcask::DocInput d;
+    d.text = bytes("unique alpha keywords");
+    d.fields.push_back({"title", bytes("special beta terms")});
+    ASSERT_TRUE((*c)->put_doc(bytes("k1"), d, 1000));
+
+    // doc.text 的词项应进默认字段索引(S28-1 修复前丢失)
+    auto r1 = (*c)->search_text("alpha", 10);
+    ASSERT_TRUE(r1);
+    EXPECT_EQ(r1->hits.size(), 1u) << "doc.text 应进默认字段索引(S28-1)";
+
+    // title 经 catch-all 也应命中默认字段
+    auto r2 = (*c)->search_text("beta", 10);
+    ASSERT_TRUE(r2);
+    EXPECT_EQ(r2->hits.size(), 1u) << "title 经 catch-all 应命中";
+
+    // search_fields 验证命名字段仍独立可查
+    auto r3 = (*c)->search_fields("title:special", 10);
+    ASSERT_TRUE(r3);
+    EXPECT_EQ(r3->hits.size(), 1u);
+
+    (*c)->close();
+}
+
 TEST_F(CaskDocValueTest, SearchTextEmptyAfterRemove) {
     CaskOptions opts;
     opts.read_write = true;

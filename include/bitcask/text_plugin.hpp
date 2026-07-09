@@ -112,8 +112,20 @@ public:
             return p;
         }
         auto p = std::make_unique<TextPrepared>();
-        p->job = map_analyze(e.key, e.ord, e.doc->fields, e.loc.file_id,
-                             e.loc.offset, e.loc.total_sz, e.tstamp);
+        // S28-1: doc.text 非空时前置 kDefaultField,使正文经 catch-all 进默认字段索引。
+        // prepare() 是 const + inline;augmented 是局部 vector,map_analyze 内部
+        // 已 owning 拷贝 term 数据,vector 在 return 后不需存活。
+        if (e.doc && !e.doc->text.empty()) {
+            std::vector<std::pair<std::string_view, std::string_view>> augmented;
+            augmented.reserve(1 + e.doc->fields.size());
+            augmented.emplace_back(search::kDefaultField, e.doc->text);
+            for (const auto& fld : e.doc->fields) augmented.push_back(fld);
+            p->job = map_analyze(e.key, e.ord, augmented, e.loc.file_id,
+                                 e.loc.offset, e.loc.total_sz, e.tstamp);
+        } else {
+            p->job = map_analyze(e.key, e.ord, e.doc->fields, e.loc.file_id,
+                                 e.loc.offset, e.loc.total_sz, e.tstamp);
+        }
         return p;
     }
     // S16-2 前置条件：宿主已先 apply docmap——本插件只做 BM25 侧。

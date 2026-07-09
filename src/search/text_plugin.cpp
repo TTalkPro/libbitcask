@@ -184,11 +184,16 @@ ReduceJob TextPlugin::map_analyze(
         std::uint32_t flen = 0;
         for (auto& [_, data] : term_data) flen += data.first;
 
-        if (field == kDefaultField) {
+        const bool is_default = (field == kDefaultField);
+
+        if (is_default && !config_.index_catch_all) {
+            // catch-all 关闭:kDefaultField 走直接写入(保持 S26-2 语义)
             job.wrote_default = true;
         } else if (config_.index_catch_all && !term_data.empty()) {
-            // S26-2：catch-all 关闭时不累积 ca_data → 每词只 add_doc 一遍
-            // （apply_job_impl 见 ca_data 空即跳过默认字段合并）。
+            // S28-1 + S8.6:catch-all 合并(kDefaultField + 命名字段统一进 ca_data)。
+            // S28-1 修复:catch-all 开启时 kDefaultField 词项(doc.text)也合并进
+            // ca_data → apply_job_impl 单次 add_doc(kDefaultField, ca_data) 写入
+            // 全部词项(doc.text + 命名字段),避免水位幂等保护冲突。
             std::uint32_t field_max_pos = 0;
             for (auto& [term, data] : term_data) {
                 auto& [tf, positions] = data;
@@ -203,8 +208,13 @@ ReduceJob TextPlugin::map_analyze(
             ca_pos_base += field_max_pos + 1;
         }
 
-        job.fields.push_back(ReduceJob::FieldResult{
-            std::string(field), std::move(term_data), flen});
+        // S28-1:catch-all 开启时 kDefaultField 不 push job.fields(catch-all
+        // 统一写 ca_data);否则 push(命名字段直接写入 + catch-all 关闭时
+        // kDefaultField 直接写入)。
+        if (!(is_default && config_.index_catch_all)) {
+            job.fields.push_back(ReduceJob::FieldResult{
+                std::string(field), std::move(term_data), flen});
+        }
         job.total_doc_len += flen;
     }
 
