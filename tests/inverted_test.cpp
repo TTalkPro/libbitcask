@@ -1740,3 +1740,107 @@ TEST(InvertedIndex, V6SnapshotRoundtripWithPositions) {
 
     std::filesystem::remove(tmp);
 }
+
+// ==========================================================================
+// S27-2：ExtStats 外部统计注入（G-on-the-fly enabling primitive）
+// ==========================================================================
+
+namespace {
+// 直接构造一篇文档的 term→(tf, 无 position) 映射。
+TermPositions mk_terms(
+    std::initializer_list<std::pair<const char*, std::uint32_t>> ts) {
+    TermPositions m;
+    for (auto& [t, tf] : ts) m[std::string(t)] = {tf, {}};
+    return m;
+}
+}  // namespace
+
+// 无删除时 doc_freq==live_df、self-stats 与本地统计的 N/sum_dl/df 完全相同 →
+// idf/avgdl 相同 → 打分逐位一致。标量路径（posting 少，不走 WAND）。
+TEST(InvertedIndex, ExtStatsSelfEquivalenceScalar) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    idx.add_doc(0, mk_terms({{"apple", 2}, {"banana", 1}}));
+    idx.add_doc(1, mk_terms({{"banana", 1}, {"cherry", 3}}));
+    idx.add_doc(2, mk_terms({{"apple", 1}, {"cherry", 1}, {"date", 1}}));
+    idx.add_doc(3, mk_terms({{"apple", 1}}));
+    checker.doc_lens[0] = 3; checker.doc_lens[1] = 4;
+    checker.doc_lens[2] = 3; checker.doc_lens[3] = 1;
+
+    std::vector<std::string> terms = {"apple", "cherry"};
+    auto base = idx.search(terms, 10, checker);
+    ASSERT_FALSE(base.empty());
+
+    ExtStats ext;
+    ext.N = idx.live_doc_count();
+    ext.sum_dl = idx.sum_doc_len();
+    std::unordered_map<std::string, std::uint64_t> df;
+    for (auto& t : terms) df[t] = idx.doc_freq(t);
+    ext.df = &df;
+    auto inj = idx.search(terms, 10, checker, nullptr, &ext);
+
+    ASSERT_EQ(base.size(), inj.size());
+    for (std::size_t i = 0; i < base.size(); ++i) {
+        EXPECT_EQ(base[i].ord, inj[i].ord);
+        EXPECT_FLOAT_EQ(base[i].score, inj[i].score);
+    }
+}
+
+// 同上但 posting 数跨过 kWandThreshold → 走 search_wand，验证 WAND 路径的
+// idf 注入也保持等价（注入 idf 同时用于块上界与打分 → 剪枝仍正确）。
+TEST(InvertedIndex, ExtStatsSelfEquivalenceWand) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    constexpr std::uint64_t kN = 1200;  // "common" 有 1200 posting > 1024
+    for (std::uint64_t i = 0; i < kN; ++i) {
+        TermPositions m;
+        m["common"] = {static_cast<std::uint32_t>(1 + (i % 7)), {}};
+        m["u" + std::to_string(i)] = {1, {}};
+        idx.add_doc(i, m);
+        checker.doc_lens[i] = 2 + static_cast<std::uint32_t>(i % 3);
+    }
+    std::vector<std::string> terms = {"common"};
+    auto base = idx.search(terms, 20, checker);
+    ASSERT_EQ(base.size(), 20u);
+
+    ExtStats ext;
+    ext.N = idx.live_doc_count();
+    ext.sum_dl = idx.sum_doc_len();
+    std::unordered_map<std::string, std::uint64_t> df;
+    df["common"] = idx.doc_freq("common");
+    ext.df = &df;
+    auto inj = idx.search(terms, 20, checker, nullptr, &ext);
+
+    ASSERT_EQ(base.size(), inj.size());
+    for (std::size_t i = 0; i < base.size(); ++i) {
+        EXPECT_EQ(base[i].ord, inj[i].ord);
+        EXPECT_FLOAT_EQ(base[i].score, inj[i].score);
+    }
+}
+
+// 注入不同的全局统计确实改变 idf → 证明注入被真正采纳（非静默忽略）。
+TEST(InvertedIndex, ExtStatsInjectionAffectsScore) {
+    InvertedIndex idx;
+    FakeLiveChecker checker;
+    idx.add_doc(0, mk_terms({{"apple", 2}}));
+    idx.add_doc(1, mk_terms({{"apple", 1}}));
+    checker.doc_lens[0] = 2; checker.doc_lens[1] = 1;
+
+    std::vector<std::string> terms = {"apple"};
+    auto base = idx.search(terms, 10, checker);  // 本地：N=2, df=2 → idf 很小
+    ASSERT_EQ(base.size(), 2u);
+
+    // 只注入更小的 df，N/sum_dl 保持本地 → avgdl 不变、隔离 idf 效应。
+    // base: df=2,N=2 → idf=log(1+0.5/2.5)≈0.182；inj: df=1,N=2 → idf=log(2)≈0.693。
+    ExtStats ext;
+    ext.N = idx.live_doc_count();
+    ext.sum_dl = idx.sum_doc_len();
+    std::unordered_map<std::string, std::uint64_t> df;
+    df["apple"] = 1;
+    ext.df = &df;
+    auto inj = idx.search(terms, 10, checker, nullptr, &ext);
+
+    ASSERT_EQ(inj.size(), 2u);
+    EXPECT_EQ(base[0].ord, inj[0].ord);          // 同文档集 → 排序不变
+    EXPECT_GT(inj[0].score, base[0].score);      // idf 抬升 → 分更高
+}

@@ -92,7 +92,10 @@ struct ScoredTerm {
 std::vector<SearchResult> score_bow_topk(
     std::span<const ScoredTerm> tps, std::size_t k,
     std::uint64_t N, std::uint64_t sum_dl,
-    const Bm25Params& params, const LiveChecker& live_checker) {
+    const Bm25Params& params, const LiveChecker& live_checker,
+    const std::unordered_map<std::string, std::uint64_t>* global_df = nullptr) {
+    // S27-2：global_df 非空 → idf 用全局 df（G-on-the-fly）；N/sum_dl 亦已由
+    // caller 传全局值。本地 live_df 仍用于跳空/reserve。
     const double avgdl =
         N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
@@ -128,7 +131,15 @@ std::vector<SearchResult> score_bow_topk(
             }
             if (live_df == 0) continue;
 
-            auto idf = std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) / (static_cast<double>(live_df) + 0.5));
+            // S27-2：idf 的 df——全局注入优先，回退本段 live_df。
+            double df_idf = static_cast<double>(live_df);
+            if (global_df) {
+                auto it = global_df->find(tps[ti].term);
+                if (it != global_df->end() && it->second > 0) {
+                    df_idf = static_cast<double>(it->second);
+                }
+            }
+            auto idf = std::log(1.0 + (static_cast<double>(N) - df_idf + 0.5) / (df_idf + 0.5));
 
             dls.resize(n);
             live_checker.fill_doc_lens(fp.ords, dls);
@@ -408,11 +419,23 @@ void InvertedIndex::remove_doc(
 
 // ---- 查询 ----
 
+// S27-2：term 的 doc frequency（posting list 长度；含未 merge 的已删，
+// Lucene-style df，§4 接受该近似）。宿主跨段求和得全局 df。
+std::uint64_t InvertedIndex::doc_freq(std::string_view term) const {
+    auto& shard = shard_for(term);
+    PostingMap::const_accessor acc;
+    if (shard.inverted.find(acc, std::string(term))) {
+        return static_cast<std::uint64_t>(acc->second->size());
+    }
+    return 0;
+}
+
 auto InvertedIndex::search(
     const std::vector<std::string>& query_terms,
     std::size_t k,
     const LiveChecker& live_checker,
-    const Bm25Params* params_override) const -> std::vector<SearchResult> {
+    const Bm25Params* params_override,
+    const ExtStats* ext) const -> std::vector<SearchResult> {
     const Bm25Params& params = params_override ? *params_override : params_;
     // P1：accessor 下只拷扁平快照（ords/tfs），不再深拷整个 PostingList。
     // WAND 路由判定只需 posting 总量——在 accessor 下读 items.size() 即可，
@@ -429,7 +452,7 @@ auto InvertedIndex::search(
     }
     if (total_postings == 0) return {};
     if (total_postings >= kWandThreshold) {
-        return search_wand(query_terms, k, live_checker, params);
+        return search_wand(query_terms, k, live_checker, params, ext);
     }
 
     // 标量路径：现在才快照。
@@ -454,11 +477,14 @@ auto InvertedIndex::search(
     if (n_tps == 0) return {};
 
     // bag-of-words 评分 + top-k（共享 kernel score_bow_topk）。
+    // S27-2：ext 非空 → 用全局 N/sum_dl/df（G-on-the-fly）。
+    const std::uint64_t N =
+        ext ? ext->N : live_doc_count_.load(std::memory_order_relaxed);
+    const std::uint64_t sum_dl =
+        ext ? ext->sum_dl : sum_doc_len_.load(std::memory_order_relaxed);
     return score_bow_topk(std::span<const TermPostings>(tps_pool.data(), n_tps),
-                          k,
-                          live_doc_count_.load(std::memory_order_relaxed),
-                          sum_doc_len_.load(std::memory_order_relaxed),
-                          params, live_checker);
+                          k, N, sum_dl, params, live_checker,
+                          ext ? ext->df : nullptr);
 }
 
 // ===========================================================================
@@ -528,7 +554,8 @@ auto InvertedIndex::search_wand(
     const std::vector<std::string>& query_terms,
     std::size_t k,
     const LiveChecker& live_checker,
-    const Bm25Params& params) const -> std::vector<SearchResult> {
+    const Bm25Params& params,
+    const ExtStats* ext) const -> std::vector<SearchResult> {
     struct TermPostings {
         std::string term;
         FlatPostings fp;   // P1：扁平快照，ords/tfs 兼任 DAAT 游标数组
@@ -573,8 +600,9 @@ auto InvertedIndex::search_wand(
     if (n_tps == 0) return {};
     const std::span<TermPostings> tps(tps_pool.data(), n_tps);
 
-    auto N = live_doc_count_.load(std::memory_order_relaxed);
-    auto sum_dl = sum_doc_len_.load(std::memory_order_relaxed);
+    // S27-2：ext 非空 → 全局 N/sum_dl（G-on-the-fly）；否则本地统计（现行为）。
+    auto N = ext ? ext->N : live_doc_count_.load(std::memory_order_relaxed);
+    auto sum_dl = ext ? ext->sum_dl : sum_doc_len_.load(std::memory_order_relaxed);
     auto avgdl = N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
 
     // 计算每个 term 的 IDF 和上界分数。
@@ -606,8 +634,15 @@ auto InvertedIndex::search_wand(
             tp.list_upper_bound = 0.0f;
             continue;
         }
-        tp.idf = static_cast<float>(std::log(1.0 + (static_cast<double>(N) - static_cast<double>(live_df) + 0.5) /
-                                             (static_cast<double>(live_df) + 0.5)));
+        // S27-2：idf 的 df——全局注入优先，回退本段 live_df（同 score_bow_topk）。
+        // idf 一致地用于块上界与实际打分 → WAND 剪枝仍正确。
+        double df_idf = static_cast<double>(live_df);
+        if (ext && ext->df) {
+            auto it = ext->df->find(tp.term);
+            if (it != ext->df->end() && it->second > 0) df_idf = static_cast<double>(it->second);
+        }
+        tp.idf = static_cast<float>(std::log(1.0 + (static_cast<double>(N) - df_idf + 0.5) /
+                                             (df_idf + 0.5)));
         tp.list_upper_bound = tp.fp.block_upper_bound(tp.idf, params, avgdl);
         // S10-A2:per-block 上界一次算好，WAND 内层循环免每次 pivot 重算。
         tp.block_upper_bounds.reserve(tp.fp.blocks.size());

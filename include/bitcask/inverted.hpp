@@ -291,8 +291,19 @@ using TermPositions = std::unordered_map<std::string, std::pair<std::uint32_t, s
 
 // 搜索结果条目。
 struct SearchResult {
-    std::uint64_t ord;
+    Lsn           ord;   // S27-1：段内命中当前 == DocId==LSN
     float         score;
+};
+
+// S27-2：G-on-the-fly 外部 collection 统计注入（分段查询用）。
+// nullptr（search 默认）= 用本索引本地统计——**现行为，零变更**。
+// 分段查询时宿主先跨段聚合出全局 N/sum_dl + per-term 全局 df，令每段用**同一
+// idf/avgdl** 打分（对标 ES 段级，见 doc/segment-index-design-zh.md §4）。
+// df 用「跨段 doc_freq 求和」预建好的 map；某 term 缺失 → 回退本段本地 live_df。
+struct ExtStats {
+    std::uint64_t N      = 0;   // 全局文档数
+    std::uint64_t sum_dl = 0;   // 全局 Σdoc_len（→ 全局 avgdl）
+    const std::unordered_map<std::string, std::uint64_t>* df = nullptr;  // term→全局 df
 };
 
 // BM25 评分解释的单 term 分项（S8.8）。
@@ -348,11 +359,19 @@ public:
     // 线程安全：持所有分片 shared_lock。
     // params_override 非空时覆盖默认 Bm25Params（查询期 k1/b 调参，S8.5）；
     // 为空则用构造时的 params_。WAND 上界估算也用同一组参数，保证剪枝正确。
+    // S27-2：某 term 的 doc frequency（= posting list 长度，**含未 merge 的已删**，
+    // Lucene-style df；§4 接受该近似，merge 自愈）。宿主用它跨段求和得全局 df。
+    // 不存在 → 0。线程安全：term 分片 shared_lock。
+    [[nodiscard]] std::uint64_t doc_freq(std::string_view term) const;
+
+    // ext 非空时走 G-on-the-fly：用 ext->N/sum_dl 定 avgdl、ext->df 定 idf 的 df
+    // （回退本地 live_df）；nullptr = 本地统计（现行为）。见 ExtStats。
     [[nodiscard]] auto search(
         const std::vector<std::string>& query_terms,
         std::size_t k,
         const LiveChecker& live_checker,
-        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+        const Bm25Params* params_override = nullptr,
+        const ExtStats* ext = nullptr) const -> std::vector<SearchResult>;
 
     [[nodiscard]] auto search_phrase(
         const std::vector<std::string>& query_terms,
@@ -523,12 +542,13 @@ private:
     // atomic:worker 线程写,搜索线程经 max_indexed_ord() 读,跨线程访问。
     std::atomic<std::uint64_t> max_indexed_ord_{static_cast<std::uint64_t>(-1)};
 
-    // Block-Max WAND 算法。
+    // Block-Max WAND 算法。S27-2：ext 非空走 G-on-the-fly（同 search）。
     auto search_wand(
         const std::vector<std::string>& query_terms,
         std::size_t k,
         const LiveChecker& live_checker,
-        const Bm25Params& params) const -> std::vector<SearchResult>;
+        const Bm25Params& params,
+        const ExtStats* ext = nullptr) const -> std::vector<SearchResult>;
 
     // search_phrase / search_near 的共同实现（S8.7）：slop=0 为严格短语，
     // slop>0 允许相邻 term 间隙 ≤ slop（有序近邻）。
