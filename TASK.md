@@ -3211,7 +3211,16 @@ W4 ✅（parallel_scan 并行全表扫描）。
       与 whole.search **逐位同 key 同分**（含 lsn_of 还原全局 LSN）；反证段本地统计（ext=nullptr）
       idf 与单索引不同→分数不一致（证 G-on-the-fly 必要性）。
     - 验证：build-clang 549/549、build-rel 构建通过。
-  - [ ] **Slice 3** 段落盘格式（复用 InvertedIndex base + doc_store 段）round-trip + §3.4 平坦 doc_store。
+  - [x] **Slice 3 SealedSegment 落盘 round-trip** — 已完成（2026-07-09）·
+    新增 `include/bitcask/segment.hpp`（header-only）+ `search_checkpoint.hpp`（+kSegDocStore=14）+ `inverted_test.cpp`
+    - `SealedSegment`（IS-A LiveChecker）= 段内 `InvertedIndex`（默认字段）+ **平坦定长 doc_store**
+      （docid→{key, lsn, DocSlot, live}，§3.4 chunk 退役）。`add()` 构建、`view()` 出 SegmentView、
+      `save()`/`load()` 复用 SearchCheckpoint 段级 CRC 容器（section kBm25Default=InvertedIndex::serialize、
+      kSegDocStore=平坦 doc_store 编码）。多字段/向量段化后续。
+    - 测试 `SealedSegmentRoundTrip`（内存段 → save → load → `multi_segment_search` 结果逐位一致，
+      含 lsn 还原）+ `SealedSegmentCrcReject`（篡改字节 → 段级 CRC 失败 → load 返回 nullptr）。
+    - 验证：build-clang 551/551、build-rel 构建通过。
+  - [ ] **Slice 4** 段管理器 / 活跃段清单（manifest 演进 + 段生命周期 Building→Flushed→Merging→Dropped）。
   - [ ] **Slice 3** 段落盘格式（复用 InvertedIndex base + doc_store 段）round-trip。
   - [ ] **Slice 4** 段管理器 / 活跃段清单。
 - [ ] **S27-3 段累积替换 delta 链**：checkpoint flush 新段 + 后台 merge。删 delta 链 + 死内存回收。仍单写者。
