@@ -51,6 +51,9 @@ enum class CkptSectionType : std::uint16_t {
     // version 1）整文件拒收 → 链断 → 退 fold；若只加段型不升文件版本，
     // 旧读端会静默忽略未知段、丢行推进水位（数据洞）。
     kDocmapDeltaV2    = 13,
+    // S27-2 Slice 3：分段索引的段本地 doc_store（只出现在段文件里，非 bm25.ckpt）。
+    // 平坦 docid→{key, lsn, DocSlot, live}（§3.4）。旧读端不读段文件，故仅追加安全。
+    kSegDocStore      = 14,
 };
 
 // 写入用:caller 持有 payload 字节。

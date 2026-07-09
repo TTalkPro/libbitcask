@@ -11,6 +11,7 @@
 #include "bitcask/analyzer.hpp"
 #include "bitcask/inverted.hpp"
 #include "bitcask/segment_query.hpp"  // S27-2 Slice 2：多段查询归并
+#include "bitcask/segment.hpp"        // S27-2 Slice 3：SealedSegment 落盘
 #include "test_support.hpp"
 
 using namespace bitcask::bm25;
@@ -1926,4 +1927,88 @@ TEST(InvertedIndex, SegmentMergeEquivalence) {
     for (auto& r : base) if (r.ord == 0) whole_doc0 = r.score;
     for (auto& r : localA) if (r.ord == 0) localA_doc0 = r.score;
     EXPECT_NE(static_cast<float>(whole_doc0), static_cast<float>(localA_doc0));
+}
+
+// ==========================================================================
+// S27-2 Slice 3：SealedSegment 落盘 round-trip（复用 SearchCheckpoint 段级 CRC）
+// ==========================================================================
+
+TEST(InvertedIndex, SealedSegmentRoundTrip) {
+    using bitcask::search::SealedSegment;
+    using bitcask::search::SegmentView;
+    using bitcask::search::multi_segment_search;
+
+    auto mk = [](std::initializer_list<std::pair<const char*, std::uint32_t>> ts) {
+        TermPositions m;
+        for (auto& [t, tf] : ts) m[std::string(t)] = {tf, {}};
+        return m;
+    };
+    auto mem = std::make_unique<SealedSegment>();
+    mem->add("doc0", 100, mk({{"apple", 2}, {"banana", 1}}));
+    mem->add("doc1", 101, mk({{"banana", 1}, {"cherry", 3}}));
+    mem->add("doc2", 102, mk({{"apple", 1}, {"cherry", 1}}));
+    mem->add("doc3", 103, mk({{"apple", 3}}));
+    ASSERT_EQ(mem->doc_count(), 4u);
+
+    std::vector<std::string> terms = {"apple", "cherry"};
+    std::vector<SegmentView> memSegs = {mem->view()};
+    auto base = multi_segment_search(memSegs, terms, 10);
+    ASSERT_FALSE(base.empty());
+
+    auto path =
+        (std::filesystem::temp_directory_path() / "bitcask_seg_rt.seg").string();
+    std::filesystem::remove(path);
+    ASSERT_TRUE(mem->save(path, /*watermark=*/104));
+
+    auto loaded = SealedSegment::load(path);
+    ASSERT_NE(loaded, nullptr);
+    EXPECT_EQ(loaded->doc_count(), 4u);
+    EXPECT_EQ(loaded->key_at(0), "doc0");
+    EXPECT_EQ(loaded->lsn_at(3), 103u);
+
+    std::vector<SegmentView> ldSegs = {loaded->view()};
+    auto after = multi_segment_search(ldSegs, terms, 10);
+
+    ASSERT_EQ(base.size(), after.size());
+    for (std::size_t i = 0; i < base.size(); ++i) {
+        EXPECT_EQ(base[i].key, after[i].key) << "i=" << i;
+        EXPECT_EQ(base[i].ord, after[i].ord) << "i=" << i;  // lsn 还原
+        EXPECT_FLOAT_EQ(static_cast<float>(base[i].score),
+                        static_cast<float>(after[i].score))
+            << "i=" << i;
+    }
+    std::filesystem::remove(path);
+}
+
+// 段级 CRC：篡改文件任一字节 → load 整段拒收（nullptr），退全量重建。
+TEST(InvertedIndex, SealedSegmentCrcReject) {
+    using bitcask::search::SealedSegment;
+    auto seg = std::make_unique<SealedSegment>();
+    TermPositions m;
+    m["apple"] = {2, {}};
+    seg->add("doc0", 7, m);
+    seg->add("doc1", 8, m);
+
+    auto path =
+        (std::filesystem::temp_directory_path() / "bitcask_seg_crc.seg").string();
+    std::filesystem::remove(path);
+    ASSERT_TRUE(seg->save(path, 9));
+
+    // 翻转中部一个字节。
+    {
+        std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+        ASSERT_TRUE(f.good());
+        f.seekg(0, std::ios::end);
+        const auto sz = f.tellg();
+        ASSERT_GT(sz, 32);
+        const auto pos = sz / 2;
+        f.seekg(pos);
+        char c = 0;
+        f.read(&c, 1);
+        c = static_cast<char>(~c);
+        f.seekp(pos);
+        f.write(&c, 1);
+    }
+    EXPECT_EQ(SealedSegment::load(path), nullptr);
+    std::filesystem::remove(path);
 }
