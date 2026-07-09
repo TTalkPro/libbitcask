@@ -3220,9 +3220,20 @@ W4 ✅（parallel_scan 并行全表扫描）。
     - 测试 `SealedSegmentRoundTrip`（内存段 → save → load → `multi_segment_search` 结果逐位一致，
       含 lsn 还原）+ `SealedSegmentCrcReject`（篡改字节 → 段级 CRC 失败 → load 返回 nullptr）。
     - 验证：build-clang 551/551、build-rel 构建通过。
-  - [ ] **Slice 4** 段管理器 / 活跃段清单（manifest 演进 + 段生命周期 Building→Flushed→Merging→Dropped）。
-  - [ ] **Slice 3** 段落盘格式（复用 InvertedIndex base + doc_store 段）round-trip。
-  - [ ] **Slice 4** 段管理器 / 活跃段清单。
+  - [x] **Slice 4 SegmentSet 段管理器 / 活跃段清单** — 已完成（2026-07-09）·
+    新增 `include/bitcask/segment_set.hpp`（header-only）+ `search_checkpoint.hpp`（+kSegManifest=15）+ `inverted_test.cpp`
+    - `SegmentSet`：管理目录下一批活跃 `SealedSegment` + `segments.manifest`（唯一原子提交点，复用
+      SearchCheckpoint tmp+rename + 段级 CRC）。`open`（读清单→载各段，缺清单=空集，段损坏→nullptr）/
+      `add`（落盘段文件+提交清单，提交失败回滚）/ `search`（跨段 G-on-the-fly 归并）/ `drop`（删文件+提交）/
+      `next_seg_id` 单调。
+    - 测试 `SegmentSetAddQueryReopen`（add 2 段→查询→**重开逐位一致**）+ `SegmentSetDrop`（drop 后只剩
+      存留段、重开仍生效、next_seg_id 不回退）。
+    - 验证：build-clang 553/553、build-rel 构建通过。
+    - 注：仍为**隔离基础设施**（未接入 Cask/IndexPool/plugin）；live 路径接线 = S27-3。
+
+  **S27-2 收官**：段已是能查、能落盘、能校验恢复、能管理生命周期的持久化实体；多段查询与单索引
+  逐位等价（G-on-the-fly）。全 4 slice header-only、零回归（553/553 双树）、**未触碰任何现有 live 路径**。
+
 - [ ] **S27-3 段累积替换 delta 链**：checkpoint flush 新段 + 后台 merge。删 delta 链 + 死内存回收。仍单写者。
 - [ ] **S27-4 并行 builder（DWPT）**：多段内单线程 builder，文档分派。**吞吐红利落地。**
 
@@ -3232,3 +3243,28 @@ W4 ✅（parallel_scan 并行全表扫描）。
 - [`recovery-unified-checkpoint-design-zh.md`](doc/recovery-unified-checkpoint-design-zh.md)：
   当前 base+delta 链（S27-3 替换目标）。
 - [`merge-policy-zh.md`](doc/merge-policy-zh.md)：merge 触发/执行（S27-3 段级 merge 复用基础）。
+
+---
+
+## 待办：S28 doc.text 多字段模式下未索引为默认字段（Bug — 2026-07-09）
+
+> 来源：wiser-cpp 移植实测——`put_doc` 同时设置 `text`（正文）与 `fields`（命名字段）后，
+> `search_text` 无法命中正文。详见 [`docs/design/bug-doctext-ignored-multifield.md`](docs/design/bug-doctext-ignored-multifield.md)。
+>
+> **根因三层**：① `prepare()` 多字段路径只传 `doc.fields`，丢弃 `doc.text`；
+> ② `InvertedIndex::add_doc` 水位幂等保护阻止对同一 (field, ord) 调两次；
+> ③ `wrote_default` 标志使 catch-all 合并被跳过 → kDefaultField 只有部分词元。
+>
+> `DocInput.text` 注释（`cask.hpp:233`）写"作默认字段"，实现未兑现 → **API 契约违背**。
+
+- [ ] **S28-1 `doc.text` 在多字段模式下索引为 kDefaultField** · `src/search/text_plugin.cpp` + `include/bitcask/text_plugin.hpp`
+  - **prepare()**：多字段路径中 `doc.text` 非空时前置 `{kDefaultField, doc.text}` 到传入 `map_analyze` 的 fields 列表。
+  - **map_analyze()**：`index_catch_all` 开启时 kDefaultField 词项也纳入 `ca_data`（不设 `wrote_default`），
+    使 `apply_job_impl` 单次 `add_doc(kDefaultField, ca_data)` 写入 doc.text + 命名字段的全部词元；
+    `index_catch_all` 关闭时 kDefaultField 走直接写入（保持现有 `wrote_default` 语义）。
+  - **on_put()**：单文本兜底分支同步——fields 非空且 doc.text 非空时不只调 `apply_text`（会撞水位）。
+  - **约束**：kDefaultField 的所有词元必须在**单次 `add_doc**` 中写入（水位幂等保护硬约束）。
+  - **关联**：S26-2 `index_catch_all` 配置开关——关闭时 doc.text 仍需能进 kDefaultField（走直接写入）。
+  - **测试**：多字段 + doc.text → `search_text` 同时命中 title（经 catch-all）和 body（doc.text）；
+    反向验证 `index_catch_all=false` 时 body 命中、title 不进默认字段（走 `search_fields`）；
+    checkpoint round-trip 后行为不变。
