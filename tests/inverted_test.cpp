@@ -10,6 +10,7 @@
 
 #include "bitcask/analyzer.hpp"
 #include "bitcask/inverted.hpp"
+#include "bitcask/segment_query.hpp"  // S27-2 Slice 2：多段查询归并
 #include "test_support.hpp"
 
 using namespace bitcask::bm25;
@@ -1843,4 +1844,86 @@ TEST(InvertedIndex, ExtStatsInjectionAffectsScore) {
     ASSERT_EQ(inj.size(), 2u);
     EXPECT_EQ(base[0].ord, inj[0].ord);          // 同文档集 → 排序不变
     EXPECT_GT(inj[0].score, base[0].score);      // idf 抬升 → 分更高
+}
+
+// ==========================================================================
+// S27-2 Slice 2：多段查询归并（§3.5）+ G-on-the-fly 单索引等价
+// ==========================================================================
+
+// 同一批文档：① 全量放进单索引 whole；② 均分两段（各自本地 docid）。
+// multi_segment_search（内部 G-on-the-fly）应与 whole.search 逐位同 key 同分。
+// 反证：段本地统计（ext=nullptr）的 idf 与单索引不同 → 分数不一致（证明必要性）。
+TEST(InvertedIndex, SegmentMergeEquivalence) {
+    using bitcask::search::SegmentView;
+    using bitcask::search::multi_segment_search;
+    constexpr std::uint64_t kNAll = 8;
+    auto keyname = [](std::uint64_t g) { return "doc" + std::to_string(g); };
+
+    // whole：单索引，全局 docid 0..7，"q" 的 tf 各异（→ 分数互异，无并列）。
+    InvertedIndex whole;
+    FakeLiveChecker wholeChk;
+    std::vector<std::string> wholeKeys(kNAll);
+    for (std::uint64_t g = 0; g < kNAll; ++g) {
+        TermPositions m;
+        m["q"] = {static_cast<std::uint32_t>(g + 1), {}};
+        whole.add_doc(g, m);
+        wholeChk.doc_lens[g] = 10;
+        wholeKeys[g] = keyname(g);
+    }
+
+    // 两段：A=前 4（本地 docid 0..3），B=后 4（本地 docid 0..3）。
+    InvertedIndex segA, segB;
+    FakeLiveChecker chkA, chkB;
+    std::vector<std::string> keysA(4), keysB(4);
+    std::vector<bitcask::Lsn> lsnA(4), lsnB(4);
+    for (std::uint64_t g = 0; g < kNAll; ++g) {
+        TermPositions m;
+        m["q"] = {static_cast<std::uint32_t>(g + 1), {}};
+        if (g < 4) {
+            segA.add_doc(g, m);
+            chkA.doc_lens[g] = 10;
+            keysA[g] = keyname(g);
+            lsnA[g] = g;
+        } else {
+            const std::uint64_t l = g - 4;
+            segB.add_doc(l, m);
+            chkB.doc_lens[l] = 10;
+            keysB[l] = keyname(g);
+            lsnB[l] = g;
+        }
+    }
+
+    std::vector<SegmentView> segs = {
+        SegmentView{&segA, &chkA,
+                    [&](bitcask::DocId d) { return keysA[d]; },
+                    [&](bitcask::DocId d) { return lsnA[d]; }},
+        SegmentView{&segB, &chkB,
+                    [&](bitcask::DocId d) { return keysB[d]; },
+                    [&](bitcask::DocId d) { return lsnB[d]; }},
+    };
+
+    std::vector<std::string> terms = {"q"};
+    const std::size_t k = kNAll;  // 全量 → 无 top-k 边界并列问题
+
+    auto base = whole.search(terms, k, wholeChk);
+    ASSERT_EQ(base.size(), kNAll);
+    auto merged = multi_segment_search(segs, terms, k);
+    ASSERT_EQ(merged.size(), kNAll);
+
+    // 逐位：同 key 序 + 同分（G-on-the-fly → idf/avgdl 与单索引一致）。
+    for (std::size_t i = 0; i < base.size(); ++i) {
+        EXPECT_EQ(wholeKeys[base[i].ord], merged[i].key) << "i=" << i;
+        EXPECT_FLOAT_EQ(static_cast<float>(base[i].score),
+                        static_cast<float>(merged[i].score))
+            << "i=" << i;
+        EXPECT_EQ(merged[i].ord, base[i].ord);  // lsn_of 还原全局 LSN
+    }
+
+    // 必要性反证：段 A 用本地统计（ext=nullptr）→ df=4/N=4，idf 与单索引 df=8/N=8
+    // 不同 → 同一 doc 分数不一致。这正是需要 G-on-the-fly 的原因。
+    auto localA = segA.search(terms, 4, chkA);
+    double whole_doc0 = 0.0, localA_doc0 = 0.0;
+    for (auto& r : base) if (r.ord == 0) whole_doc0 = r.score;
+    for (auto& r : localA) if (r.ord == 0) localA_doc0 = r.score;
+    EXPECT_NE(static_cast<float>(whole_doc0), static_cast<float>(localA_doc0));
 }
