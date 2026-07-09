@@ -33,6 +33,8 @@
 
 #include <oneapi/tbb/concurrent_hash_map.h>
 
+#include "bitcask/index_ids.hpp"  // S27-1：Lsn/DocId 角色别名
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -322,15 +324,17 @@ public:
 
     [[nodiscard]] bool index_positions() const { return index_positions_; }
     // A4-P2:已索引最大 ord 水位(u64(-1)=尚无文档)。快照成对性门用。
-    [[nodiscard]] std::uint64_t max_indexed_ord() const {
+    // S27-1：这是 **LSN 幂等水位**（拒绝重放旧序）；posting 存的是 DocId，
+    // 当前 docid==lsn 故用同一值比较，分段化后水位归 Lsn、posting 键归 DocId。
+    [[nodiscard]] Lsn max_indexed_ord() const {
         return max_indexed_ord_.load(std::memory_order_relaxed);
     }
 
     // ---- 写 ----
 
     // 添加一篇文档的 posting。term_freqs 来自 analyzer。
-    // 线程安全：按 term hash 分片锁。
-    void add_doc(std::uint64_t ord, const TermPositions& term_data);
+    // 线程安全：按 term hash 分片锁。S27-1：posting 存 DocId（分段化后段内本地）。
+    void add_doc(DocId docid, const TermPositions& term_data);
 
     // 删除一篇文档的 posting。V2 实际不删除 posting 行（靠 live 过滤），
     // 但减少 live_doc_count_ / sum_doc_len_ 以保持统计准确。

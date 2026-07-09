@@ -16,6 +16,7 @@
 
 #include "bitcask/live_checker.hpp"
 #include "bitcask/doc_table.hpp"  // S16-3：Index 实现 DocTable（查询面只读身份表）
+#include "bitcask/index_ids.hpp"  // S27-1：Lsn/DocId 角色别名
 #include "bitcask/meta_filter.hpp"  // S13-P8：eval_meta 锁内求值
 #include "bitcask/string_hash.hpp"
 
@@ -93,20 +94,21 @@ public:
     Index& operator=(const Index&) = delete;
 
     // ---- ord 分配 ----
-    // 拿下一个 ord（写 record header 前调用）。线程安全：unique_lock。
-    std::uint64_t alloc_ord();
+    // 拿下一个 ord（写 record header 前调用）。S27-1：产出 LSN。线程安全：unique_lock。
+    Lsn alloc_ord();
 
     // ---- 写 ----
     // 登记一条文档（append 落盘后调用）。若 ext_id 已存在 → update：旧 ord
     // 在 live 中清 0（软删），ext2ord 改指新 ord。内部把 next_ord 推到
     // max(next_ord, ord+1)，故恢复时按 ord 序回放亦走此方法。
-    // 线程安全：unique_lock。
-    void put_doc(std::string_view ext_id, std::uint64_t ord, const DocSlot& slot);
+    // S27-1：`docid` 既是数组下标又推进 LSN 水位（当前 docid==lsn）；分段化后
+    // 数组下标语义归 DocId、水位推进另由 LSN 承担。线程安全：unique_lock。
+    void put_doc(std::string_view ext_id, DocId docid, const DocSlot& slot);
 
     // 删除：软删 ext_id 当前文档（清 live）、erase ext2ord。tomb_ord 是墓碑
-    // record 自身的 ord（仅用于推进 next_ord）。返回原本是否存在。
+    // record 自身的 ord（仅用于推进 next_ord）→ 纯 LSN 角色。返回原本是否存在。
     // 线程安全：unique_lock。
-    bool remove(std::string_view ext_id, std::uint64_t tomb_ord);
+    bool remove(std::string_view ext_id, Lsn tomb_ord);
 
     // S16-2：单独回填 doc_len（BM25 token 数）。写路径反转后 DocSlot 由
     // 宿主先落（doc_len=0，宿主不做分析拿不到 token 数），分析产物由
@@ -114,13 +116,14 @@ public:
     // doc_lens_ SoA（序列化读前者，SIMD gather 读后者）。ord 未登记则
     // no-op（防御：空 job 守卫路径）。线程安全：unique_lock。
     // S18-1：override bm25::DocLenWriter——P4 起 TextPlugin 经窄接口回填。
-    void set_doc_len(std::uint64_t ord, std::uint32_t len) override;
+    // S27-1：按 DocId(数组下标) 定位。
+    void set_doc_len(DocId docid, std::uint32_t len) override;
 
     // V5:存储 ord 的 meta blob(结构化 KV 二进制,可为空)。与 put_doc
     // 在同一 unique_lock 下调用——保证 meta 与定位/live 同写入原子点,
     // 后续读路径不必额外同步。blob 由 Index 内部拷贝(caller 可立即
     // 释放源缓冲)。线程安全:unique_lock。
-    void set_meta(std::uint64_t ord, std::span<const std::byte> blob);
+    void set_meta(DocId docid, std::span<const std::byte> blob);
 
     // ---- S18-2：docmap 持久化记账（自记账原则：写它的人负责记账）----
     //
@@ -151,19 +154,19 @@ public:
     [[nodiscard]] std::optional<DocHit> get(std::string_view ext_id) const;
 
     // ord → ext_id（检索结果翻译用；V1 主要给调试/恢复）。越界返回 nullopt。
-    // S16-3：override DocTable::ord_to_ext。
-    [[nodiscard]] std::optional<std::string> ord_to_ext(std::uint64_t ord) const override;
+    // S16-3：override DocTable::ord_to_ext。S27-1：按 DocId 定位。
+    [[nodiscard]] std::optional<std::string> ord_to_ext(DocId docid) const override;
 
     // 某 ord 是否存活。越界返回 false。线程安全：shared_lock。
-    // 同时实现 LiveChecker::is_live。
-    [[nodiscard]] bool is_live(std::uint64_t ord) const override;
+    // 同时实现 LiveChecker::is_live。S27-1：按 DocId 定位。
+    [[nodiscard]] bool is_live(DocId docid) const override;
 
     // LiveChecker::doc_len — 返回 ord 对应文档的 token 数，越界返回 0。
-    [[nodiscard]] std::uint32_t doc_len(std::uint64_t ord) const override;
+    [[nodiscard]] std::uint32_t doc_len(DocId docid) const override;
 
     // S16-3：DocTable::ord_of — ext_id → ord（explain 等 key→ord 反查）。
-    // get() 的窄投影，避免查询面暴露完整 DocSlot。
-    [[nodiscard]] std::optional<std::uint64_t>
+    // get() 的窄投影，避免查询面暴露完整 DocSlot。S27-1：返回当前版本 DocId。
+    [[nodiscard]] std::optional<DocId>
     ord_of(std::string_view ext_id) const override;
 
     // V5:取 ord 的原始 meta blob(结构化 KV 二进制)。越界或空 → 空 vector,
@@ -171,13 +174,13 @@ public:
     // 线程安全:shared_lock。返回**拷贝**而非 span——读路径无锁并发,而
     // set_meta(worker 线程)会重分配底层 vector;若返回内部 span 会在锁外
     // 被并发 set_meta 释放(use-after-free)。锁内拷贝杜绝逃逸。
-    [[nodiscard]] std::vector<std::byte> meta_blob(std::uint64_t ord) const;
+    [[nodiscard]] std::vector<std::byte> meta_blob(DocId docid) const;
 
     // S13-P8：meta filter 锁内求值——省去 meta_blob 的锁内堆拷贝（过滤查询
     // 每候选一次，overfetch K'=4k 时最多 4k 次拷贝/查询）。evaluate 是纯读
     // 无 IO（meta_filter.hpp），shared_lock 内直接跑安全。
     // 语义与「meta_blob 后 evaluate」一致：无 meta（空 blob）恒 false。
-    [[nodiscard]] bool eval_meta(std::uint64_t ord,
+    [[nodiscard]] bool eval_meta(DocId docid,
                                  const meta::MetaFilter& filter) const override;
 
     // P2.1 批量版本：一次 shared_lock 完成整个数组（逐 posting 版本每条

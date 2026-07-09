@@ -7,6 +7,7 @@
 
 #include "bitcask/analyzer.hpp"     // TermPositionsMap（ReduceJob 载荷）
 #include "bitcask/highlighter.hpp"  // Snippet（SearchHitEx）
+#include "bitcask/index_ids.hpp"    // S27-1：Lsn/DocId 角色别名
 
 #include <cstdint>
 #include <string>
@@ -24,7 +25,7 @@ inline constexpr std::string_view kDefaultField = "\xfa" "ult";
 // 搜索结果条目。
 struct SearchHit {
     std::string   key;   // 外部 key（由 ord 经 DocTable::ord_to_ext 翻译）
-    std::uint64_t ord;   // 文档 ord
+    Lsn           ord;   // 文档 ord。S27-1：对外语义 = LSN（版本键；RRF 并桶键）
     double        score; // BM25 / 距离 / RRF 分数（按查询类型）
 };
 
@@ -40,7 +41,7 @@ enum class SearchError {
 // 带高亮的搜索结果。
 struct SearchHitEx {
     std::string              key;
-    std::uint64_t            ord;
+    Lsn                      ord;   // S27-1：对外语义 = LSN
     double                   score;
     std::vector<Snippet>     highlights;
 };
@@ -50,7 +51,7 @@ struct SearchHitEx {
 // 供 reducer 在锁下逐字段 apply（跨线程传递）。
 struct ReduceJob {
     std::string          key;           // owning key (apply 要用)
-    std::uint64_t        ord = 0;
+    Lsn                  ord = 0;        // S27-1：写入序列号 = LSN
 
     // 每字段的分词结果（field_name 已映射：空名 → kDefaultField）。
     // terms 可能为空（该字段无有效 token）→ apply 跳过 add_doc。

@@ -49,6 +49,7 @@
 #pragma once
 
 #include "bitcask/string_hash.hpp"
+#include "bitcask/index_ids.hpp"  // S27-1：Lsn/DocId 角色别名
 
 #include <ankerl/unordered_dense.h>
 
@@ -282,13 +283,14 @@ public:
     // 线程安全: 是。无锁（atomic 读）。
     [[nodiscard]] std::uint64_t get_epoch() const;
 
-    // 分配一个新的全局 ord 值（单调递增）。
+    // 分配一个新的全局 ord 值（单调递增）。S27-1：这是 **LSN 的唯一发番点**
+    // （写入序列号；恢复/MVCC/幂等水位）。返回类型 Lsn 标注角色，值语义不变。
     // 线程安全: 是。无锁（atomic fetch_add）。
-    [[nodiscard]] std::uint64_t alloc_ord();
+    [[nodiscard]] Lsn alloc_ord();
 
-    // 把 next_ord_ 至少推到 ord + 1（用于 merge 后恢复 ord 状态）。
+    // 把 next_ord_ 至少推到 lsn + 1（用于 merge 后恢复 ord 状态）。
     // 线程安全: 是。无锁（atomic CAS-max）。
-    void advance_ord(std::uint64_t ord);
+    void advance_ord(Lsn lsn);
 
     // ---- 迭代器工厂 ----
     // 线程安全: 是（仅构造一个 IterHandle 对象，未触碰共享状态）。
@@ -312,8 +314,8 @@ public:
     // 线程安全: 是。无锁（atomic CAS-max）。
     std::uint32_t increment_file_id_at_least(std::uint32_t conditional_id);
 
-    // A4-P2:当前 next_ord(成对性门比较用;原子读,无锁)。
-    [[nodiscard]] std::uint64_t peek_next_ord() const {
+    // A4-P2:当前 next_ord(成对性门比较用;原子读,无锁)。S27-1：LSN 水位。
+    [[nodiscard]] Lsn peek_next_ord() const {
         return next_ord_.load(std::memory_order_relaxed);
     }
 

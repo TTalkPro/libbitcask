@@ -3153,3 +3153,50 @@ W4 ✅（parallel_scan 并行全表扫描）。
     ——链完整性本就由调用方 `walk_chain`（kDeltaInfo 三元组）独家保证，本层无法本地断言。恢复
     正确性由用例自身断言（reopen 后 search 命中数）验证。
   - 验证：4 用例转绿，全量 545/545。
+
+---
+
+## 待办：第十七梯队（S27 分段索引 — LSN/docid 解耦 + 并行构建 — 2026-07-09）
+
+> 设计文档：[`doc/segment-index-design-zh.md`](doc/segment-index-design-zh.md)（本梯队的完整设计）。
+>
+> **背景**：S26 会话把「索引吞吐 ≪ KV 写」的优化路径推进到架构层。经与 Lucene/ES 对照，
+> 确认正解不是 S26 梯队的 ① term-sharded 多 reducer（踩 per-field 幂等水位 / 跨 shard 原子性 /
+> 全局统计竞争），而是**分段（segment）模型**：多个不可变段 + 后台 merge。段模型一次性收敛
+> 三个已知痛点——ord 死内存回收（[ord-recycling] §5 方案 A 未做）、索引并行吞吐、delta 链复杂度
+> （S26-B 误报即其副作用）。**S27 取代 S26 ①。**
+>
+> 核心决定：identity(key) / LSN(ord，不变) / docid(段内本地，新增) 三分；docid 随段 drop 自然回收；
+> 段替换 delta 链。
+
+### Stage 2 设计基线已闭合（详见设计文档 §3.4/§3.5/§4）
+
+- [x] **BM25 跨段统计** = **G-on-the-fly**（对标 ES 单节点/段级：查询时段本地 df 求和算一次全局 idf，
+  零漂移、不维护全局表）。设计文档 §4。
+- [x] **段本地 doc_store** = 封口段平坦定长（chunk 退役）承载 R2/R3/R4；全局 resolver `key→(seg,docid)`
+  （B1）担 R1；保留 `lsn[docid]` 供 RRF。设计文档 §3.4。
+- [x] **多段查询归并** = 串行逐段 + 全局第 k 名阈值传播 + 大小 k 的 min-heap 并集；查询独立于
+  IndexPool；作 `search_fields` 内层。设计文档 §3.5。
+
+### 分阶段实现（详见设计文档 §5/§7）
+
+- [x] **S27-1 LSN/docid 概念拆分** — 已完成（2026-07-09）· 新增 `include/bitcask/index_ids.hpp`
+  + 接缝注解 `keydir.hpp`/`index.hpp`/`inverted.hpp`/`search_types.hpp`
+  - 采**方案 A（接缝处窄拆分）**：中央头定义 `Lsn`（全局单调；恢复/MVCC/幂等水位；`alloc_ord`
+    产出）与 `DocId`（倒排存储值/数组下标；将来段内本地、merge 可重编）**弱别名**（同型 uint64、
+    数值相等、零行为/性能变更）。只在关键接缝标注角色：keydir `alloc_ord/advance_ord/peek_next_ord`
+    → Lsn；docmap `Index` 写/读接口（`put_doc`/`set_doc_len`/`is_live`/`ord_to_ext`/…）→ DocId、
+    `remove` tomb_ord → Lsn；`InvertedIndex::add_doc` → DocId、`max_indexed_ord` → Lsn 水位；
+    `SearchHit/ReduceJob.ord` → Lsn。深层内部（posting 编码/SIMD/HNSW/format）暂留生 uint64，
+    强类型强制留待 Stage 3 docid 真正发散时按段代码局部上。
+  - 验证：build-clang 545/545、build-rel 构建通过（双树）。零行为变更（别名同型，全调用点无改动即编译）。
+- [ ] **S27-2 段抽象 + 多段读**：复用 InvertedIndex base 当段格式；实装 §3.4 doc_store + §3.5 查询归并。
+- [ ] **S27-3 段累积替换 delta 链**：checkpoint flush 新段 + 后台 merge。删 delta 链 + 死内存回收。仍单写者。
+- [ ] **S27-4 并行 builder（DWPT）**：多段内单线程 builder，文档分派。**吞吐红利落地。**
+
+### 关联既有设计（勿重复造轮子）
+- [`ord-recycling-design-zh.md`](doc/ord-recycling-design-zh.md)：ord 三角色 / per-write 硬约束 /
+  方案 A（seq/ord 解耦，段模型让其免费发生）。
+- [`recovery-unified-checkpoint-design-zh.md`](doc/recovery-unified-checkpoint-design-zh.md)：
+  当前 base+delta 链（S27-3 替换目标）。
+- [`merge-policy-zh.md`](doc/merge-policy-zh.md)：merge 触发/执行（S27-3 段级 merge 复用基础）。
