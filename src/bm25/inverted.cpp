@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -2545,6 +2546,28 @@ bool InvertedIndex::apply_delta(std::span<const std::byte> bytes) {
         !rd_u64(term_cnt)) {
         return false;
     }
+
+    // 契约（承重，勿绕过）：调用方必须按 from_ord 单调、经 walk_chain 链接校验
+    // （kDeltaInfo 的 prev_wm == 当前累计 coverage、seq 严格连续、base_gen 匹配）
+    // 的顺序喂入 delta。本函数**无法验证完整性**：下方 per-term 守卫
+    // （ord ≤ 列尾 → continue）为了幂等/防重叠会**静默丢弃**在范围条目——这对
+    // 「边界 ord 重复导出 / 崩溃后重放同段」是正确且必需的，但若 delta 被乱序或
+    // 跳段应用，被跳过区间的 ord 会**永久丢失且无任何报错**。因此绝不能绕过
+    // walk_chain 直接喂 apply_delta（手工重放 / 测试 helper / 新插件路径同理）。
+    //
+    // DEBUG 断言只能兜住「跳段」这一可本地检测的子集：from_ord 不得越过当前 ord
+    // 水位 + 1 而留下空洞（wm == (uint64_t)-1 为空索引哨兵，首段 from_ord==0
+    // 合法；重放旧段令 from_ord ≤ wm，由守卫幂等处理，不触发）。
+#ifndef NDEBUG
+    {
+        const std::uint64_t wm_dbg =
+            max_indexed_ord_.load(std::memory_order_relaxed);
+        assert((wm_dbg == static_cast<std::uint64_t>(-1) ||
+                from_ord <= wm_dbg + 1) &&
+               "apply_delta: from_ord 越过 ord 水位——delta 被跳段/乱序应用，"
+               "在范围 ord 将被守卫静默丢弃（见上方契约注释）");
+    }
+#endif
 
     std::uint64_t max_ord_seen = 0;
     bool any_item = false;
