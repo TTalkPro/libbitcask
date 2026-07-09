@@ -54,6 +54,8 @@ enum class CkptSectionType : std::uint16_t {
     // S27-2 Slice 3：分段索引的段本地 doc_store（只出现在段文件里，非 bm25.ckpt）。
     // 平坦 docid→{key, lsn, DocSlot, live}（§3.4）。旧读端不读段文件，故仅追加安全。
     kSegDocStore      = 14,
+    // S27-2 Slice 4：活跃段清单（segments.manifest 唯一 section）。
+    kSegManifest      = 15,
 };
 
 // 写入用:caller 持有 payload 字节。

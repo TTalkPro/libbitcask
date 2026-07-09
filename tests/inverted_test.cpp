@@ -12,6 +12,7 @@
 #include "bitcask/inverted.hpp"
 #include "bitcask/segment_query.hpp"  // S27-2 Slice 2：多段查询归并
 #include "bitcask/segment.hpp"        // S27-2 Slice 3：SealedSegment 落盘
+#include "bitcask/segment_set.hpp"    // S27-2 Slice 4：段管理器 / 清单
 #include "test_support.hpp"
 
 using namespace bitcask::bm25;
@@ -2011,4 +2012,87 @@ TEST(InvertedIndex, SealedSegmentCrcReject) {
     }
     EXPECT_EQ(SealedSegment::load(path), nullptr);
     std::filesystem::remove(path);
+}
+
+// ==========================================================================
+// S27-2 Slice 4：SegmentSet 段管理器 / 活跃段清单（原子提交 + 重开持久化）
+// ==========================================================================
+
+TEST(InvertedIndex, SegmentSetAddQueryReopen) {
+    using bitcask::search::SealedSegment;
+    using bitcask::search::SegmentSet;
+
+    const auto dir = (std::filesystem::temp_directory_path() /
+                      "bitcask_segset_rt").string();
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    auto set = SegmentSet::open(dir);
+    ASSERT_NE(set, nullptr);
+    EXPECT_EQ(set->segment_count(), 0u);  // 首次 open：空集
+
+    auto s1 = std::make_unique<SealedSegment>();
+    s1->add("a", 1, mk_terms({{"apple", 2}}));
+    s1->add("b", 2, mk_terms({{"banana", 1}}));
+    ASSERT_TRUE(set->add(std::move(s1), /*hi_lsn=*/3));
+
+    auto s2 = std::make_unique<SealedSegment>();
+    s2->add("c", 3, mk_terms({{"apple", 1}, {"cherry", 1}}));
+    ASSERT_TRUE(set->add(std::move(s2), /*hi_lsn=*/4));
+
+    EXPECT_EQ(set->segment_count(), 2u);
+    EXPECT_EQ(set->total_docs(), 3u);
+
+    auto r = set->search({"apple"}, 10);  // apple 在 a(seg1) + c(seg2)
+    ASSERT_EQ(r.size(), 2u);
+
+    // 重开：读 manifest → 载入两段 → 查询逐位一致（持久化 + 跨段 G-on-the-fly）。
+    auto set2 = SegmentSet::open(dir);
+    ASSERT_NE(set2, nullptr);
+    EXPECT_EQ(set2->segment_count(), 2u);
+    EXPECT_EQ(set2->total_docs(), 3u);
+    auto r2 = set2->search({"apple"}, 10);
+    ASSERT_EQ(r2.size(), r.size());
+    for (std::size_t i = 0; i < r.size(); ++i) {
+        EXPECT_EQ(r[i].key, r2[i].key) << "i=" << i;
+        EXPECT_EQ(r[i].ord, r2[i].ord) << "i=" << i;
+        EXPECT_FLOAT_EQ(static_cast<float>(r[i].score),
+                        static_cast<float>(r2[i].score)) << "i=" << i;
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(InvertedIndex, SegmentSetDrop) {
+    using bitcask::search::SealedSegment;
+    using bitcask::search::SegmentSet;
+
+    const auto dir = (std::filesystem::temp_directory_path() /
+                      "bitcask_segset_drop").string();
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    auto set = SegmentSet::open(dir);
+    ASSERT_NE(set, nullptr);
+    auto s1 = std::make_unique<SealedSegment>();  // seg_id 0
+    s1->add("a", 1, mk_terms({{"apple", 2}}));
+    ASSERT_TRUE(set->add(std::move(s1), 2));
+    auto s2 = std::make_unique<SealedSegment>();  // seg_id 1
+    s2->add("c", 3, mk_terms({{"apple", 1}}));
+    ASSERT_TRUE(set->add(std::move(s2), 4));
+    ASSERT_EQ(set->search({"apple"}, 10).size(), 2u);
+
+    ASSERT_TRUE(set->drop(0));                     // 删 seg1（含 "a"）
+    EXPECT_EQ(set->segment_count(), 1u);
+    auto r = set->search({"apple"}, 10);
+    ASSERT_EQ(r.size(), 1u);
+    EXPECT_EQ(r[0].key, "c");
+
+    // 重开后 drop 仍生效（manifest 已原子提交）。
+    auto set2 = SegmentSet::open(dir);
+    ASSERT_NE(set2, nullptr);
+    EXPECT_EQ(set2->segment_count(), 1u);
+    EXPECT_EQ(set2->search({"apple"}, 10).size(), 1u);
+    // next_seg_id 单调（不因 drop 回退）→ 新段不会撞已删 seg_id。
+    EXPECT_EQ(set2->next_seg_id(), 2u);
+    std::filesystem::remove_all(dir);
 }
