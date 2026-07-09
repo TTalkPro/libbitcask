@@ -3191,6 +3191,20 @@ W4 ✅（parallel_scan 并行全表扫描）。
     强类型强制留待 Stage 3 docid 真正发散时按段代码局部上。
   - 验证：build-clang 545/545、build-rel 构建通过（双树）。零行为变更（别名同型，全调用点无改动即编译）。
 - [ ] **S27-2 段抽象 + 多段读**：复用 InvertedIndex base 当段格式；实装 §3.4 doc_store + §3.5 查询归并。
+  分 4 slice：
+  - [x] **Slice 1 外部统计注入（G-on-the-fly enabling primitive）** — 已完成（2026-07-09）·
+    `inverted.hpp`/`inverted.cpp` + `inverted_test.cpp`
+    - `InvertedIndex` 新增 `ExtStats{N, sum_dl, term→全局 df 的 map}` + `doc_freq(term)` 访问器；
+      `search`/`search_wand` 加 `const ExtStats* ext=nullptr`（默认 nullptr=本地统计，**零行为变更**）。
+      ext 非空时 idf 用全局 df（回退本地 live_df）、avgdl 用全局 N/sum_dl；idf 一致用于块上界与
+      打分 → WAND 剪枝仍正确。`score_bow_topk` 加 `global_df` 参数。
+    - 测试：`ExtStatsSelfEquivalenceScalar`/`...Wand`（self-stats 注入与本地打分逐位一致，覆盖标量+WAND）
+      + `ExtStatsInjectionAffectsScore`（只注入更小 df → idf 抬升→分更高，证明注入被采纳）。
+    - 验证：build-clang 548/548（既有 545 + 新 3，证零回归）、build-rel 构建通过。
+  - [ ] **Slice 2** `SealedSegment`（InvertedIndex + doc_store）+ 多段查询归并（§3.5，G-on-the-fly）。
+    等价测试：N 文档分 2 段 == 1 索引同一排序。
+  - [ ] **Slice 3** 段落盘格式（复用 InvertedIndex base + doc_store 段）round-trip。
+  - [ ] **Slice 4** 段管理器 / 活跃段清单。
 - [ ] **S27-3 段累积替换 delta 链**：checkpoint flush 新段 + 后台 merge。删 delta 链 + 死内存回收。仍单写者。
 - [ ] **S27-4 并行 builder（DWPT）**：多段内单线程 builder，文档分派。**吞吐红利落地。**
 
