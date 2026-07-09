@@ -3083,3 +3083,73 @@ W4 ✅（parallel_scan 并行全表扫描）。
 - **torn-write 截断恢复** —— 正确（`fold` + `truncate_to(last_valid_end)`）。
 - **vbyte_read shift>=64 防御** —— 正确。
 - **IndexPool 生命周期 / HNSW seqlock / KeyDir 屏障协议** —— 均已 TSan 验证正确。
+
+---
+
+## 待办：第十六梯队（S26 索引写入吞吐优化 — 2026-07-09）
+
+> **背景**：wiser-cpp（Wikipedia 全文索引，jieba 分词）实测「索引吞吐 ≪ KV 写吞吐，
+> 且随文档正文 V 增大急剧恶化」。根因分析（本会话）：
+>
+> `put_doc` 相较纯 KV `put` 多背一条异步索引流水线（thread_pool.hpp：queue → N 个
+> map worker 并行分词 → reorder buffer → **单 reducer 串行插倒排**）。写路径经背压
+> （submit_index_task 阻塞，cask.cpp:730）被这条流水线的吞吐钳住。倒排本体已是
+> `tbb::concurrent_hash_map`（桶级锁，inverted.hpp:25）→ **串行不是数据结构限制，是
+> 「单 reducer」的刻意设计**。
+>
+> **优化梯队**（按性价比排序，本批先做 ②③——库内、低风险、见效快）：
+>   - ① 并行化 reduce：term-hash 分片多 reducer（最大杠杆，抬天花板；工程量大）——**待评估**
+>   - ② catch-all 可配置开关（多字段场景倒排量直接减半）——**本批**
+>   - ③ 削减每文档分配抖动（大 V 尤甚）——**本批**
+>   - ④ reducer 内批量/排序插入（吞吐 + 局部性）——待办
+>   - ⑤ position delta-varint 编码（省内存/ckpt/IO）——待办
+>   - ⑥ checkpoint 序列化并行/流式（缓解 1.7GB flush 停顿）——待办
+
+### P1 ② catch-all 可配置（多字段倒排减半）
+
+- [ ] **S26-2 `index_catch_all` 配置开关** · `text_plugin_config.hpp` + `search_config.hpp` + `src/search/text_plugin.cpp`
+  - 现状：`map_analyze`（text_plugin.cpp:145-181）**无条件**把非默认字段词项合并进
+    默认字段（catch-all），使 `search_text/phrase/near`（只查默认字段）也能命中多字段
+    文档。代价：每个词 `add_doc` 两遍 → reducer 工作量 ×2、posting 内存 ×2、`bm25.ckpt` ×2。
+  - 改动：`TextPluginConfig` / `SearchLayerConfig` 新增 `bool index_catch_all = true`（默认
+    保持既有行为），经 `text_config()` 透传。`map_analyze` 的 catch-all 累积分支加
+    `config_.index_catch_all &&` 守卫；关闭时 `ca_data` 恒空 → `apply_job_impl`（:228）的
+    默认字段合并自动跳过，无需二改。
+  - 语义：关闭后 `search_text` 对多字段文档不再命中（只走 `search_fields` 字段限定）——
+    调用方按查询形态自选。纯默认字段写入（field 名为空）不受影响（走 `wrote_default`）。
+
+### P1 ③ 削减每文档分配抖动
+
+- [ ] **S26-3a `map_analyze` 高亮正文深拷按需化** · `src/search/text_plugin.cpp`
+  - 现状：`job.doc_text = std::string(fields.front().second)`（:183）**无条件深拷整段正文**
+    （O(V)/doc），即便高亮 LRU 关闭（`doc_text_cache_max==0`，`apply_job_impl` put 恒被丢弃）。
+  - 改动：`doc_text_cache_max==0` 时跳过该拷贝（置空）。config 语义本就是「0 → 高亮降级
+    无片段」，行为不变；大 V 下省一次整文档 memcpy + 分配。
+- [ ] **S26-3b `job.fields.reserve`** · `src/search/text_plugin.cpp`
+  - `map_analyze` 循环前 `job.fields.reserve(fields.size())`，免 vector 逐字段扩容。
+- [ ] **S26-3c（待办，未纳本批）`ord_field_lens_` 结构** · `text_plugin.hpp:368`
+  - 按 ord 单调递增的 `unordered_map<uint64_t, vector<...>>`，随 live doc 线性堆积（on_delete
+    字段精确扣减依赖）。改扁平结构/分段是内存优化，但触删除记账，风险较高，另批处理。
+
+### 验证
+- [x] `search_layer_test` 新增 `CatchAllDisabled`：`index_catch_all=false` + 多字段写入 →
+  `search_text` 不命中、`search_fields` 命中；对照默认（catch-all 开）`search_text` 命中。—— 通过。
+- [x] 全量 ctest 回归（build-rel + build-clang 双树，见 [三构建树分工]）。—— build-clang 545/545、
+  build-rel 构建通过。
+
+### P0 ②③ 落地时发现的既存缺陷（本批顺带修复）
+
+- [x] **S26-B `apply_delta` DEBUG 跳段断言恒误报** — 已完成（2026-07-09）· `src/bm25/inverted.cpp:2561`
+    + `include/bitcask/inverted.hpp:426`
+  - 现象：`bitcask_cask_docvalue_test` 4 个 checkpoint 用例（CheckpointVecPayloadAppends /
+    DeltaChainSelectiveSections / DeltaChainDeletesAndOverwrites / DeltaChainLengthBound）在
+    Debug 树 `apply_delta` 断言 abort。git stash 核实 clean tree 同样失败——**非 S26-2/3 引入**，
+    是上一提交 `f2f56d3`（名为 docs，实加了 DEBUG 断言）。
+  - 根因：断言 `from_ord ≤ max_indexed_ord_ + 1` 把**全局链 coverage 水位**（from_ord）与
+    **每字段 posting 最大 ord**（max_indexed_ord_）当成差 ≤1。二者差着「不产生本字段 posting
+    的 ord」数——checkpoint/skip 的 RunFn ord、删除墓碑、向量-only 文档、稀疏命名字段，正常
+    负载必然发散。实测 `from_ord=61 vs wm=59`（ord60 被 checkpoint RunFn 吃掉）。
+  - 修复：移除该断言（+ 随之无用的 `#include <cassert>`），保留契约文档并改写描述断言的段落
+    ——链完整性本就由调用方 `walk_chain`（kDeltaInfo 三元组）独家保证，本层无法本地断言。恢复
+    正确性由用例自身断言（reopen 后 search 命中数）验证。
+  - 验证：4 用例转绿，全量 545/545。
