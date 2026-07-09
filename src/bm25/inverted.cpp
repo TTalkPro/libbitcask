@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
-#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -2555,19 +2554,13 @@ bool InvertedIndex::apply_delta(std::span<const std::byte> bytes) {
     // 跳段应用，被跳过区间的 ord 会**永久丢失且无任何报错**。因此绝不能绕过
     // walk_chain 直接喂 apply_delta（手工重放 / 测试 helper / 新插件路径同理）。
     //
-    // DEBUG 断言只能兜住「跳段」这一可本地检测的子集：from_ord 不得越过当前 ord
-    // 水位 + 1 而留下空洞（wm == (uint64_t)-1 为空索引哨兵，首段 from_ord==0
-    // 合法；重放旧段令 from_ord ≤ wm，由守卫幂等处理，不触发）。
-#ifndef NDEBUG
-    {
-        const std::uint64_t wm_dbg =
-            max_indexed_ord_.load(std::memory_order_relaxed);
-        assert((wm_dbg == static_cast<std::uint64_t>(-1) ||
-                from_ord <= wm_dbg + 1) &&
-               "apply_delta: from_ord 越过 ord 水位——delta 被跳段/乱序应用，"
-               "在范围 ord 将被守卫静默丢弃（见上方契约注释）");
-    }
-#endif
+    // S26-B：链完整性由调用方的 walk_chain 独家保证（kDeltaInfo 三元组）。本层
+    // **不能**再用 `from_ord ≤ max_indexed_ord_ + 1` 做本地跳段断言：from_ord 是
+    // **全局链 coverage 水位**，max_indexed_ord_ 是**本字段实际 posting 的最大
+    // ord**——二者差着「不产生本字段 posting 的 ord」数（checkpoint/skip 的 RunFn
+    // ord、删除墓碑、向量-only 文档、稀疏命名字段），正常负载下必然发散。该断言
+    // （f2f56d3 引入）对合法链恢复恒误报（如 base 覆盖到 ord59、下一 delta from=61
+    // 因 ord60 被 checkpoint RunFn 吃掉），已移除。
 
     std::uint64_t max_ord_seen = 0;
     bool any_item = false;

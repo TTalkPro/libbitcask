@@ -426,8 +426,9 @@ public:
     // 【调用契约，承重】必须经 walk_chain 按 from_ord 单调、链接校验
     // （prev_wm==coverage / seq 连续 / base_gen 匹配）的顺序喂入。守卫只保证
     // PostingList 不变量与幂等，**不保证完整性**：乱序/跳段应用会让被跳过的
-    // ord 被静默丢弃且无报错。切勿绕过 walk_chain 直接调用（实现入口有 DEBUG
-    // 断言兜「跳段」子集，详见 inverted.cpp 中 apply_delta 注释）。
+    // ord 被静默丢弃且无报错。切勿绕过 walk_chain 直接调用。完整性只能由
+    // walk_chain 在调用方保证——本层无法本地断言（from_ord 是全局链 coverage，
+    // 与本字段 posting 水位天然发散，详见 inverted.cpp 中 apply_delta 注释）。
     [[nodiscard]] bool apply_delta(std::span<const std::byte> bytes);
     // 从字节缓冲反序列化(search.ckpt 段)。语义同 load:任何越界/校验违例
     // 整体拒绝返回 false。
