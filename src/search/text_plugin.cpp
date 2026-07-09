@@ -149,6 +149,7 @@ ReduceJob TextPlugin::map_analyze(
     // 间隔取「字段最大 position + 1」。
     TermPositionsMap ca_data;
     std::uint32_t ca_pos_base = 0;
+    job.fields.reserve(fields.size());  // S26-3b：免逐字段扩容
 
     for (auto& [fname, ftext] : fields) {
         const std::string_view field = fname.empty() ? kDefaultField : fname;
@@ -182,8 +183,11 @@ ReduceJob TextPlugin::map_analyze(
 
     job.ca_data = std::move(ca_data);
     // 高亮：默认字段原文（多字段高亮的精细化留待后续）。
-    job.doc_text = fields.empty() ? std::string{}
-                                  : std::string(fields.front().second);
+    // S26-3a：高亮 LRU 关闭（doc_text_cache_max==0，apply_job_impl put 恒丢弃）
+    // 时跳过整段正文深拷（O(V)/doc）——config 语义本就是「0 → 无高亮片段」。
+    job.doc_text = (config_.doc_text_cache_max == 0 || fields.empty())
+                       ? std::string{}
+                       : std::string(fields.front().second);
     return job;
 }
 
