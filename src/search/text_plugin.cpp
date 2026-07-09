@@ -119,6 +119,33 @@ void TextPlugin::apply_text(std::string_view key, std::uint64_t ord,
         field_index(kDefaultField).add_doc(ord, term_data);
     }
     doc_texts_.put(ord, std::string(text));
+
+    // S27-3 Slice B1：镜像写入 building_（fields_ 权威，building_ 影子）+
+    // B2a 修复：覆盖写先 mark_dead 旧 docid（段级 is_live 不知道宿主覆盖）。
+    if (building_ && !term_data.empty()) {
+        if (auto it = key_to_location_.find(std::string(key));
+            it != key_to_location_.end()) {
+            if (it->second.in_building) {
+                (void)building_->mark_dead(it->second.docid);
+            } else if (segment_set_) {
+                if (auto* seg = segment_set_->segment(it->second.seg_id)) {
+                    (void)seg->mark_dead(it->second.docid);
+                }
+            }
+        }
+        const TermPositionsMap* borrowed = &term_data;
+        const search::SealedSegment::FieldInput fin{search::kDefaultField,
+                                                     borrowed};
+        const DocId docid = building_->add(
+            std::string(key), ord,
+            std::span<const search::SealedSegment::FieldInput>(&fin, 1),
+            doc_len);
+        key_to_location_[std::string(key)] = KeyLocation{true, 0, docid};
+        if (building_->doc_count() >= kBuildingFlushDocThreshold) {
+            flush_building();
+        }
+    }
+
     // S9.2：只失效查询词与本文档词集有交集的缓存条目。
     cache_.invalidate_terms(changed_terms);
     maybe_auto_compact();  // S12-2
@@ -256,6 +283,40 @@ void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
         for (const auto& [term, data] : f.terms) changed_terms.push_back(term);
     }
     for (const auto& [term, data] : job.ca_data) changed_terms.push_back(term);
+
+    // S27-3 Slice B1：镜像写入 building_ + B2a 修复：覆盖写先 mark_dead。
+    if (building_) {
+        if (auto it = key_to_location_.find(std::string(job.key));
+            it != key_to_location_.end()) {
+            if (it->second.in_building) {
+                (void)building_->mark_dead(it->second.docid);
+            } else if (segment_set_) {
+                if (auto* seg = segment_set_->segment(it->second.seg_id)) {
+                    (void)seg->mark_dead(it->second.docid);
+                }
+            }
+        }
+        std::vector<search::SealedSegment::FieldInput> fin;
+        fin.reserve(job.fields.size() + 1);
+        for (const auto& f : job.fields) {
+            if (!f.terms.empty()) {
+                fin.push_back({intern_field_name(f.field_name), &f.terms});
+            }
+        }
+        if (!job.wrote_default && !job.ca_data.empty()) {
+            fin.push_back({search::kDefaultField, &job.ca_data});
+        }
+        if (!fin.empty()) {
+            const DocId docid = building_->add(std::string(job.key), job.ord,
+                                                fin, job.total_doc_len);
+            key_to_location_[std::string(job.key)] =
+                KeyLocation{true, 0, docid};
+            if (building_->doc_count() >= kBuildingFlushDocThreshold) {
+                flush_building();
+            }
+        }
+    }
+
     cache_.invalidate_terms(changed_terms);
     maybe_auto_compact();  // S12-2：本 reducer 线程内，达阈值则压实死 posting
 }
@@ -312,6 +373,20 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
     } else {
         cache_.invalidate();  // 原文 LRU miss：降级整缓存失效（S9.2）
     }
+
+    // S27-3 Slice B1：段级删除镜像（fields_ remove_doc 上面已做）。
+    if (auto it = key_to_location_.find(std::string(key));
+        it != key_to_location_.end()) {
+        if (it->second.in_building) {
+            if (building_) (void)building_->mark_dead(it->second.docid);
+        } else if (segment_set_) {
+            if (auto* seg = segment_set_->segment(it->second.seg_id)) {
+                (void)seg->mark_dead(it->second.docid);
+            }
+        }
+        key_to_location_.erase(it);
+    }
+
     maybe_auto_compact();  // S12-2
 }
 
@@ -380,9 +455,8 @@ void TextPlugin::maybe_auto_compact() {
 
 // ---- 查询面（自 SearchLayer 平移，S18-4）----
 
-// D2：bm25 结果集 → SearchHit 物化骨架（5+ 处共用）。filter 非空时按 meta_blob
-// 后过滤（空 blob 不通过）；k>0 时截断到 k（text 的 overfetch 路径用之，其余
-// bm25 内核已返回 top-k 的路径传 0 不截断）。
+// D2：bm25 结果集 → SearchHit 物化骨架。filter 非空时按 meta_blob 后过滤；
+// k>0 时截断。S27-3 Slice B2a：加全局 is_live 兜底（段级 is_live 不知道宿主墓碑）。
 std::vector<SearchHit> TextPlugin::materialize_hits(
     const std::vector<bm25::SearchResult>& results,
     const bm25::DocTable& doc_table,
@@ -390,8 +464,8 @@ std::vector<SearchHit> TextPlugin::materialize_hits(
     std::vector<SearchHit> hits;
     hits.reserve(results.size());
     for (auto& r : results) {
+        if (!doc_table.is_live(r.ord)) continue;  // B2a：全局兜底（S18-8 段级盲区）
         if (filter) {
-            // S13-P8：锁内求值，免每候选一次 blob 堆拷贝。
             if (!doc_table.eval_meta(r.ord, *filter)) continue;
         }
         auto ext_id = doc_table.ord_to_ext(r.ord);
@@ -400,6 +474,78 @@ std::vector<SearchHit> TextPlugin::materialize_hits(
     }
     if (k > 0 && hits.size() > k) hits.resize(k);
     return hits;
+}
+
+// ---- S27-3 Slice B2a：[SegmentSet + Building] 多段视图收集 ----
+std::vector<search::SegmentView>
+TextPlugin::collect_default_segment_views() const {
+    std::vector<search::SegmentView> views;
+    std::size_t seg_total = 0;
+    if (segment_set_) {
+        const auto segs = segment_set_->segments_view();
+        views.reserve(segs.size() + (building_ ? 1 : 0));
+        for (const auto& s : segs) {
+            const search::SealedSegment* seg = s.get();
+            views.push_back(search::SegmentView{
+                &s->inverted(), seg,
+                [seg](DocId d) -> const std::string& { return seg->key_at(d); },
+                [seg](DocId d) -> Lsn { return seg->lsn_at(d); }});
+            seg_total += s->doc_count();
+        }
+    }
+    if (building_ && building_->doc_count() > 0) {
+        const search::SealedSegment* seg = building_.get();
+        views.push_back(search::SegmentView{
+            &building_->inverted(), seg,
+            [seg](DocId d) -> const std::string& { return seg->key_at(d); },
+            [seg](DocId d) -> Lsn { return seg->lsn_at(d); }});
+        seg_total += building_->doc_count();
+    }
+    // 退化：fields_.live > 段总 → recovery 后 fields_ 有 ckpt 数据但段集不全。
+    if (!views.empty()) {
+        const auto* def_inv = field_index(kDefaultField);
+        if (def_inv && def_inv->live_doc_count() > seg_total) {
+            views.clear();
+        }
+    }
+    if (views.empty()) {
+        const auto* inv = field_index(kDefaultField);
+        if (inv) {
+            const auto* dt = &docs_;
+            views.push_back(search::SegmentView{
+                inv, dt,
+                [dt](DocId d) -> std::string {
+                    auto ext = dt->ord_to_ext(d);
+                    return ext ? std::move(*ext) : std::string{};
+                },
+                [](DocId d) -> Lsn { return d; }});
+        }
+    }
+    return views;
+}
+
+std::vector<search::MultiFieldSegmentView>
+TextPlugin::collect_multi_field_segment_views() const {
+    std::vector<search::MultiFieldSegmentView> views;
+    std::size_t seg_total = 0;
+    if (segment_set_) {
+        for (const auto& s : segment_set_->segments_view()) {
+            views.push_back(s->multi_view());
+            seg_total += s->doc_count();
+        }
+    }
+    if (building_ && building_->doc_count() > 0) {
+        views.push_back(building_->multi_view());
+        seg_total += building_->doc_count();
+    }
+    // 退化：fields_.live > 段总 → recovery 后 fields_ 有 ckpt 数据但段集不全。
+    if (!views.empty()) {
+        const auto* def_inv = field_index(kDefaultField);
+        if (def_inv && def_inv->live_doc_count() > seg_total) {
+            views.clear();
+        }
+    }
+    return views;
 }
 
 // D2：phrase/near 共用——analyze_with_positions 还原 query 词序。
@@ -451,8 +597,24 @@ TextPlugin::search_text(std::string_view query, std::size_t k,
             terms = synonym_map_->expand_terms(terms);
         }
 
-        const auto* inv = field_index(kDefaultField);
-        if (inv) results = inv->search(terms, k_req, docs_, params_override);
+        // S27-3 Slice B2a：走 [SegmentSet + Building] 多段 G-on-the-fly 归并。
+        auto views = collect_default_segment_views();
+        if (!views.empty()) {
+            const auto hits = search::multi_segment_search(
+                views, terms, k_req, params_override);
+            results.reserve(hits.size());
+            for (const auto& h : hits) {
+                results.push_back({h.ord, static_cast<float>(h.score)});
+            }
+            std::sort(results.begin(), results.end(),
+                      [](const bm25::SearchResult& a,
+                         const bm25::SearchResult& b) {
+                          if (a.score != b.score) return a.score > b.score;
+                          return a.ord > b.ord;
+                      });
+        } else if (const auto* inv = field_index(kDefaultField)) {
+            results = inv->search(terms, k_req, docs_, params_override);
+        }
         if (!params_override) cache_.put(cache_key, results, terms);
     }
 
@@ -479,8 +641,24 @@ TextPlugin::search_phrase(std::string_view query, std::size_t k,
         auto terms = ordered_query_terms(query);
         if (terms.empty()) return std::vector<SearchHit>{};
 
-        const auto* inv = field_index(kDefaultField);
-        if (inv) results = inv->search_phrase(terms, k, docs_, params_override);
+        // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
+        auto views = collect_default_segment_views();
+        if (!views.empty()) {
+            for (const auto& s : views) {
+                auto seg_hits = s.inv->search_phrase(terms, k, *s.live, params_override);
+                for (auto& h : seg_hits) {
+                    results.push_back({s.lsn_of(h.ord), h.score});
+                }
+            }
+            std::sort(results.begin(), results.end(),
+                      [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
+                          if (a.score != b.score) return a.score > b.score;
+                          return a.ord > b.ord;
+                      });
+            if (results.size() > k) results.resize(k);
+        } else if (const auto* inv = field_index(kDefaultField)) {
+            results = inv->search_phrase(terms, k, docs_, params_override);
+        }
         if (!params_override) cache_.put(cache_key, results, terms);
     }
 
@@ -495,8 +673,24 @@ TextPlugin::search_near(std::string_view query, std::uint32_t slop, std::size_t 
     if (terms.empty()) return std::vector<SearchHit>{};
 
     std::vector<bm25::SearchResult> results;
-    const auto* inv = field_index(kDefaultField);
-    if (inv) results = inv->search_near(terms, k, slop, docs_, params_override);
+    // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
+    auto views = collect_default_segment_views();
+    if (!views.empty()) {
+        for (const auto& s : views) {
+            auto seg_hits = s.inv->search_near(terms, k, slop, *s.live, params_override);
+            for (auto& h : seg_hits) {
+                results.push_back({s.lsn_of(h.ord), h.score});
+            }
+        }
+        std::sort(results.begin(), results.end(),
+                  [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
+                      if (a.score != b.score) return a.score > b.score;
+                      return a.ord > b.ord;
+                  });
+        if (results.size() > k) results.resize(k);
+    } else if (const auto* inv = field_index(kDefaultField)) {
+        results = inv->search_near(terms, k, slop, docs_, params_override);
+    }
 
     return materialize_hits(results, docs_);
 }
@@ -514,8 +708,24 @@ TextPlugin::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t ma
     }
 
     std::vector<bm25::SearchResult> results;
-    const auto* inv = field_index(kDefaultField);
-    if (inv) results = inv->search_fuzzy(terms, k, max_edit_distance, docs_, params_override);
+    // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
+    auto views = collect_default_segment_views();
+    if (!views.empty()) {
+        for (const auto& s : views) {
+            auto seg_hits = s.inv->search_fuzzy(terms, k, max_edit_distance, *s.live, params_override);
+            for (auto& h : seg_hits) {
+                results.push_back({s.lsn_of(h.ord), h.score});
+            }
+        }
+        std::sort(results.begin(), results.end(),
+                  [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
+                      if (a.score != b.score) return a.score > b.score;
+                      return a.ord > b.ord;
+                  });
+        if (results.size() > k) results.resize(k);
+    } else if (const auto* inv = field_index(kDefaultField)) {
+        results = inv->search_fuzzy(terms, k, max_edit_distance, docs_, params_override);
+    }
 
     return materialize_hits(results, docs_);
 }
@@ -558,13 +768,27 @@ TextPlugin::bool_search(std::string_view query, std::size_t k,
             fill(query_node);
         }
 
-        const auto* inv = field_index(kDefaultField);
-        if (inv) {
+        // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
+        auto views = collect_default_segment_views();
+        if (!views.empty()) {
+            for (const auto& s : views) {
+                auto seg_hits = tree_syntax
+                                    ? s.inv->bool_search_tree(query_node, k, *s.live, params_override)
+                                    : s.inv->bool_search(query_node, k, *s.live, params_override);
+                for (auto& h : seg_hits) {
+                    results.push_back({s.lsn_of(h.ord), h.score});
+                }
+            }
+            std::sort(results.begin(), results.end(),
+                      [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
+                          if (a.score != b.score) return a.score > b.score;
+                          return a.ord > b.ord;
+                      });
+            if (results.size() > k) results.resize(k);
+        } else if (const auto* inv = field_index(kDefaultField)) {
             results = tree_syntax
-                          ? inv->bool_search_tree(query_node, k, docs_,
-                                                  params_override)
-                          : inv->bool_search(query_node, k, docs_,
-                                             params_override);
+                          ? inv->bool_search_tree(query_node, k, docs_, params_override)
+                          : inv->bool_search(query_node, k, docs_, params_override);
         }
         if (!params_override && !results.empty()) {
             // 收集 MUST/SHOULD/MUST_NOT 全部叶子词，作为该缓存条目的词集。
@@ -591,6 +815,22 @@ TextPlugin::explain(std::string_view query, std::string_view key,
     terms.reserve(term_freqs.size());
     for (auto& [term, _] : term_freqs) terms.push_back(term);
 
+    // S27-3 Slice B2a：段级 explain（用 key_to_location_ 找段，段内 LiveChecker）。
+    // drain_plugins 提供 HB（reducer 写 key_to_location_ 先于查询读）。
+    if (auto it = key_to_location_.find(std::string(key));
+        it != key_to_location_.end()) {
+        const search::SealedSegment* seg = nullptr;
+        if (it->second.in_building) {
+            seg = building_.get();
+        } else if (segment_set_) {
+            seg = segment_set_->segment(it->second.seg_id);
+        }
+        if (seg) {
+            return seg->inverted().explain(terms, it->second.docid, *seg,
+                                            params_override);
+        }
+    }
+    // Fallback：fields_（recovery 后 key_to_location_ 未重建时）。
     const auto* inv = field_index(kDefaultField);
     if (!inv) return bm25::ScoreExplanation{};
     return inv->explain(terms, *ord, docs_, params_override);
@@ -600,8 +840,25 @@ std::expected<std::vector<SearchHit>, SearchError>
 TextPlugin::search_wildcard(std::string_view pattern, std::size_t k,
                              const bm25::Bm25Params* params_override) const {
     std::vector<bm25::SearchResult> results;
-    const auto* inv = field_index(kDefaultField);
-    if (inv) results = inv->search_wildcard(std::string(pattern), k, docs_, params_override);
+    // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
+    auto views = collect_default_segment_views();
+    if (!views.empty()) {
+        const std::string pat(pattern);
+        for (const auto& s : views) {
+            auto seg_hits = s.inv->search_wildcard(pat, k, *s.live, params_override);
+            for (auto& h : seg_hits) {
+                results.push_back({s.lsn_of(h.ord), h.score});
+            }
+        }
+        std::sort(results.begin(), results.end(),
+                  [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
+                      if (a.score != b.score) return a.score > b.score;
+                      return a.ord > b.ord;
+                  });
+        if (results.size() > k) results.resize(k);
+    } else if (const auto* inv = field_index(kDefaultField)) {
+        results = inv->search_wildcard(std::string(pattern), k, docs_, params_override);
+    }
 
     return materialize_hits(results, docs_);
 }
@@ -629,26 +886,47 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
         }
     }
 
+    // S27-3 Slice B2a：逐段逐字段 + boost 累加（同 fields_ 逻辑，换段集源）。
     std::unordered_map<std::uint64_t, double> acc;
-    for (auto& [field, term_boosts] : by_field) {
-        const auto* inv = field_index(field);
-        if (!inv) continue;
-        // S13-P8：按 boost 分组，同 boost 词（含同义词扩展）合并为一次
-        // search（BM25 逐词贡献求和公式不变），组级 top-k 截断，内核调用数
-        // O(boost 组)。避免逐词各自截断到 k 时丢失「单词排名 >k 但跨词组合
-        // 分高」的文档。
-        std::map<float, std::vector<std::string>> boost_groups;
-        for (auto& [t, boost] : term_boosts) {
-            auto expanded = synonym_map_ ? synonym_map_->expand(t)
-                                         : std::span<const std::string>{};
-            if (expanded.empty()) expanded = {&t, 1};
-            auto& g = boost_groups[boost];
-            g.insert(g.end(), expanded.begin(), expanded.end());
+    auto seg_views = collect_multi_field_segment_views();
+    if (!seg_views.empty()) {
+        for (const auto& sv : seg_views) {
+            for (const auto& fv : sv.fields) {
+                auto fbi = by_field.find(std::string(fv.field_name));
+                if (fbi == by_field.end()) continue;
+                std::map<float, std::vector<std::string>> boost_groups;
+                for (auto& [t, boost] : fbi->second) {
+                    auto expanded = synonym_map_ ? synonym_map_->expand(t)
+                                                 : std::span<const std::string>{};
+                    if (expanded.empty()) expanded = {&t, 1};
+                    auto& g = boost_groups[boost];
+                    g.insert(g.end(), expanded.begin(), expanded.end());
+                }
+                for (auto& [boost, gterms] : boost_groups) {
+                    auto res = fv.inv->search(gterms, k, *sv.seg, params_override);
+                    for (auto& r : res) {
+                        acc[sv.seg->lsn_at(r.ord)] += static_cast<double>(r.score) * boost;
+                    }
+                }
+            }
         }
-        for (auto& [boost, gterms] : boost_groups) {
-            auto res = inv->search(gterms, k, docs_, params_override);
-            for (auto& r : res) {
-                acc[r.ord] += static_cast<double>(r.score) * boost;
+    } else {
+        for (auto& [field, term_boosts] : by_field) {
+            const auto* inv = field_index(field);
+            if (!inv) continue;
+            std::map<float, std::vector<std::string>> boost_groups;
+            for (auto& [t, boost] : term_boosts) {
+                auto expanded = synonym_map_ ? synonym_map_->expand(t)
+                                             : std::span<const std::string>{};
+                if (expanded.empty()) expanded = {&t, 1};
+                auto& g = boost_groups[boost];
+                g.insert(g.end(), expanded.begin(), expanded.end());
+            }
+            for (auto& [boost, gterms] : boost_groups) {
+                auto res = inv->search(gterms, k, docs_, params_override);
+                for (auto& r : res) {
+                    acc[r.ord] += static_cast<double>(r.score) * boost;
+                }
             }
         }
     }
@@ -664,6 +942,7 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
     std::vector<SearchHit> hits;
     hits.reserve(ranked.size());
     for (auto& [ord, score] : ranked) {
+        if (!docs_.is_live(ord)) continue;  // B2a：全局兜底（S18-8 段级盲区）
         auto ext_id = docs_.ord_to_ext(ord);
         if (!ext_id) continue;
         hits.push_back(SearchHit{std::move(*ext_id), ord, score});
@@ -690,8 +969,22 @@ TextPlugin::search_text_highlight(std::string_view query, std::size_t k,
             terms.push_back(term);
         }
 
-        const auto* inv = field_index(kDefaultField);
-        if (inv) results = inv->search(terms, k, docs_);
+        // S27-3 Slice B2a：走 [SegmentSet + Building] 多段归并（同 search_text）。
+        auto views = collect_default_segment_views();
+        if (!views.empty()) {
+            const auto hh = search::multi_segment_search(views, terms, k);
+            results.reserve(hh.size());
+            for (const auto& h : hh) {
+                results.push_back({h.ord, static_cast<float>(h.score)});
+            }
+            std::sort(results.begin(), results.end(),
+                      [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
+                          if (a.score != b.score) return a.score > b.score;
+                          return a.ord > b.ord;
+                      });
+        } else if (const auto* inv = field_index(kDefaultField)) {
+            results = inv->search(terms, k, docs_);
+        }
         cache_.put(cache_key, results, terms);
     }
 
@@ -1013,43 +1306,15 @@ TextPlugin::load_component(std::string_view dir,
         }
     }
     if (!any) segments_ok = false;
-    // 链重放（.prev 回退 = 链不可信）。S20-2 R2：走读收敛至 sc::walk_chain，
-    // 仅「应用 bm25 delta 段」定制（段级 CRC 预检由本回调自理）。
-    std::uint64_t coverage = lc->watermark;
-    std::uint32_t next_seq = 1;
-    bool chain_ok = true;
-    if (segments_ok && !from_prev) {
-        const auto w = sc::walk_chain(
-            fp, /*base_gen=*/coverage, /*base_coverage=*/coverage, chain_seq,
-            /*unbounded=*/false,
-            [&](const sc::LoadedCheckpoint& dc) -> bool {
-                for (const auto& dls : dc.sections) {
-                    if (!dls.crc_ok) return false;
-                }
-                for (const auto& dls : dc.sections) {
-                    auto dst = static_cast<sc::CkptSectionType>(dls.type);
-                    std::span<const std::byte> pl(dls.payload.data(),
-                                                  dls.payload.size());
-                    if (dst == sc::CkptSectionType::kBm25DefaultDelta) {
-                        if (!apply_default_delta(pl)) return false;
-                    } else if (dst == sc::CkptSectionType::kBm25FieldsDelta) {
-                        if (!apply_fields_delta(pl)) return false;
-                    }
-                }
-                return true;
-            });
-        coverage = w.coverage;
-        next_seq = w.next_seq;
-        chain_ok = w.ok;
-    } else {
-        chain_ok = false;
-    }
+    // S27-3 Slice C：delta 链重放退役。只读 base，chain_seq 恒 0。
+    const std::uint64_t coverage = lc->watermark;
+    const bool chain_ok = segments_ok && !from_prev;
     result.loaded = segments_ok && chain_ok;
     result.watermark = coverage;
     result.from_prev = from_prev;
     result.all_segments_ok = segments_ok && chain_ok;
     if (result.loaded) {
-        chain_ = ChainState{expected_base_wm, coverage, next_seq};
+        chain_ = ChainState{expected_base_wm, coverage, /*next_seq=*/1};
         clear_dirty();
     } else {
         return fail();
@@ -1069,39 +1334,38 @@ plugin::PluginStatus TextPlugin::open(const plugin::OpenContext& ctx) {
     //（下次 flush 全量 base）。loaded → 续链。
     watermark_ = r.loaded ? r.watermark : 0;
     rebase_needed_.store(!r.loaded, std::memory_order_relaxed);
+
+    // S27-3 Slice B1：初始化 Building 段 + SegmentSet。
+    if (!dir_.empty()) {
+        const std::string segs_dir = dir_ + "/bm25_segments/";
+        std::error_code ec;
+        std::filesystem::create_directories(segs_dir, ec);
+        auto opened = search::SegmentSet::open(segs_dir);
+        if (opened) {
+            segment_set_ = std::move(opened);
+        } else {
+            segment_set_ = std::make_unique<search::SegmentSet>();
+        }
+    }
+    building_ = std::make_unique<search::SealedSegment>();
+
     return plugin::PluginStatus::kOk;
 }
 
 plugin::FlushResult TextPlugin::flush(const plugin::FlushRequest& req) {
+    // S27-3 Slice C：delta 链退役，只走 base（全量序列化 fields_）。
+    // S27-3 Slice B2b 步骤 1：同时封口 building_ 到段集（段集持久化源）。
     plugin::FlushResult res;
-    const bool cap_hit = config_.max_delta_chain > 0 &&
-                         chain_.next_seq > config_.max_delta_chain;
-    const bool want_base = req.force_rebase ||
-                           rebase_needed_.load(std::memory_order_relaxed) ||
-                           cap_hit;
-    if (want_base) {
-        if (save_component_base(dir_, req.watermark)) {
-            rebase_needed_.store(false, std::memory_order_relaxed);
-            res.covered_ord = req.watermark;
-        } else {
-            res.status = plugin::PluginStatus::kFailed;
-            res.covered_ord = chain_.chain_wm;
-        }
-    } else if (!dirty()) {
-        // 干净：no-op，覆盖水位停在当前链水位（宿主不推进 manifest）。
+    if (!dirty() && !req.force_rebase) {
         res.covered_ord = chain_.chain_wm;
+    } else if (save_component_base(dir_, req.watermark)) {
+        res.covered_ord = req.watermark;
     } else {
-        auto d = save_component_delta(dir_, req.watermark);
-        if (d.wrote) {
-            res.covered_ord = req.watermark;
-        } else {
-            res.status = plugin::PluginStatus::kFailed;
-            res.covered_ord = chain_.chain_wm;
-        }
+        res.status = plugin::PluginStatus::kFailed;
+        res.covered_ord = chain_.chain_wm;
     }
-    // S20-3 B-B2：链回执从 chain_（save 后已更新）统一回传。
     res.generation = chain_.base_gen;
-    res.chain_seq  = chain_.next_seq - 1;
+    res.chain_seq  = 0;
     res.chain_wm   = chain_.chain_wm;
     return res;
 }
@@ -1117,6 +1381,38 @@ void TextPlugin::on_merge_commit(const plugin::MergeCommitEvent&) {
     } else {
         compact(kMergeCompactDeadRatio);  // 无宿主（standalone 测试）：直跑
     }
+}
+
+// S27-3 Slice B1：Building 段阈值封口。
+// 契约：reducer 单写者（apply_text / apply_job_impl 内），故内部无须锁。
+// 空 building_ / 无 segment_set_ 直接 no-op。失败兜底：add 失败（盘错误等）
+// → building_ 物归原主，下次再试；不抛异常（reducer 不能挂）。
+void TextPlugin::flush_building() {
+    if (!building_ || building_->doc_count() == 0) return;
+    if (!segment_set_) return;
+
+    std::uint64_t hi_lsn = 0;
+    if (building_->doc_count() > 0) {
+        hi_lsn = building_->lsn_at(
+            static_cast<DocId>(building_->doc_count() - 1));
+    }
+
+    auto sealed = std::move(building_);
+    if (!segment_set_->add(std::move(sealed), hi_lsn)) {
+        building_ = std::move(sealed);  // 物归原主
+        return;
+    }
+
+    // 推进 key_to_location_：所有 in_building=true 的项改 in_building=false。
+    const std::uint64_t sealed_seg_id = segment_set_->next_seg_id() - 1;
+    for (auto& [k, loc] : key_to_location_) {
+        if (loc.in_building) {
+            loc.in_building = false;
+            loc.seg_id      = sealed_seg_id;
+        }
+    }
+
+    building_ = std::make_unique<search::SealedSegment>();
 }
 
 }  // namespace bitcask::text

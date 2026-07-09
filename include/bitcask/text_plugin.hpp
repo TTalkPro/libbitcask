@@ -27,6 +27,8 @@
 #include "bitcask/plugin_api.hpp"    // S18-5：实现 CaskPlugin
 #include "bitcask/search_cache.hpp"
 #include "bitcask/search_types.hpp"
+#include "bitcask/segment.hpp"       // S27-3 Slice B1：SealedSegment 镜像
+#include "bitcask/segment_set.hpp"   // S27-3 Slice B1：SegmentSet 段集
 #include "bitcask/string_hash.hpp"
 #include "bitcask/synonym_map.hpp"
 
@@ -224,6 +226,21 @@ public:
     [[nodiscard]] std::size_t total_postings() const;
     [[nodiscard]] std::size_t cache_entries() const { return cache_.size(); }
 
+    // ---- Slice B1 testing-only flush 入口 ----
+    // B1 阶段 flush_building 仅由 64K 阈值触发，单测不便写满 64K。
+    // 这里暴露显式入口供 Slice B1 单测用；生产路径不会调（仍走阈值）。
+    void flush_building_now() { flush_building(); }
+
+    // ---- Slice B1 测试 / 内省访问器 ----
+    // building_/segment_set_ 是 fields_ 的**镜像**（B1 阶段查询仍走 fields_，
+    // B2 才切换）。测试用只读视图验证镜像一致性、flush 触发、段级删除。
+    [[nodiscard]] const search::SealedSegment* building_segment() const {
+        return building_.get();
+    }
+    [[nodiscard]] const search::SegmentSet* segment_set() const {
+        return segment_set_.get();
+    }
+
     // ---- 记账（S14-3 语义；default/fields 两段独立脏位）----
     [[nodiscard]] bool dirty() const noexcept {
         return dirty_default_.load(std::memory_order_relaxed) ||
@@ -344,6 +361,8 @@ private:
     std::string_view intern_field_name(std::string_view name);
     // S12-2：写路径末尾的自动 compaction 触发（reducer 线程内）。
     void maybe_auto_compact();
+    // S27-3 Slice B1：Building 段阈值封口。空段 / 无 segment_set_ 直接 no-op。
+    void flush_building();
     // D2：bm25 结果集 → SearchHit 物化骨架。
     [[nodiscard]] std::vector<search::SearchHit> materialize_hits(
         const std::vector<bm25::SearchResult>& results,
@@ -353,6 +372,12 @@ private:
     // D2：phrase/near 共用——按 position 还原 query 词序。
     [[nodiscard]] std::vector<std::string> ordered_query_terms(
         std::string_view query) const;
+    // S27-3 Slice B2a：收集 [SegmentSet 全段 + Building 段] 的默认字段
+    // SegmentView 列表，供 search_text/phrase 等走 multi_segment_search。
+    [[nodiscard]] std::vector<search::SegmentView>
+    collect_default_segment_views() const;
+    [[nodiscard]] std::vector<search::MultiFieldSegmentView>
+    collect_multi_field_segment_views() const;
 
     TextPluginConfig       config_;
     const bm25::DocTable&  docs_;
@@ -385,6 +410,28 @@ private:
     plugin::PluginHost* host_ = nullptr;  // open 时注入（S18-7 merge 收尾用）
     std::uint64_t watermark_ = 0;   // open 后的覆盖水位（宿主定恢复起点）
     std::atomic<bool> rebase_needed_{true};  // 初值 true：未知状态一律 base
+
+    // ---- Slice B1：Building 段镜像（为 B2 切换查询路径做准备）----
+    // building_/segment_set_ 是 fields_ 的**影子**：apply_* 同时写 fields_
+    // （权威）+ building_（影子）；查询仍走 fields_（B1 行为零变化），B2 才
+    // 切到 [SegmentSet + Building] 归并查询（设计 §3.5）。
+    //
+    // key_to_location_ 用于 on_delete 段级删除定位（段内 docid 是本地序号，
+    // 删除要查到该 key 当前所在的段 + 段内 docid）。在 building_ 内 →
+    // building_->mark_dead；已封口入 segment_set_ → segment_set_->segment(...)->
+    // mark_dead（设计 §3.4 接受 df 高估，merge 自愈）。
+    static constexpr std::size_t kBuildingFlushDocThreshold = 65536;  // 可调
+
+    struct KeyLocation {
+        bool          in_building = true;  // true: 在 building_；false: 已封口
+        std::uint64_t seg_id      = 0;     // 仅 in_building=false 时有效
+        DocId         docid       = 0;     // 段内本地 docid
+    };
+
+    std::unique_ptr<search::SealedSegment>   building_;     // 当前 Building 段
+    std::unique_ptr<search::SegmentSet>      segment_set_;  // 已封口活跃段集
+    std::unordered_map<std::string, KeyLocation,
+                       StringHash, std::equal_to<>> key_to_location_;
 };
 
 }  // namespace bitcask::text

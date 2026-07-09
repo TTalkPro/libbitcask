@@ -109,10 +109,20 @@ TEST(TextPlugin, ReplayPrepareRouting) {
     EXPECT_EQ((*r)[0].key, "k0");
 }
 
-// S18-6：base/delta 决策——首次 base 后脏增量走 delta（.d1），force_rebase
-// 收链回 base（.d 链清扫）。
-TEST(TextPlugin, FlushDeltaThenForcedBase) {
-    const fs::path dir = fs::temp_directory_path() / "bitcask_textplugin_fd";
+// S27-3 Slice C：FlushDeltaThenForcedBase + OrphanDeltaNotReplayedWhenChainSeqZero
+// 退役——delta 链已删除，相关测试不再适用。
+
+// ===========================================================================
+// S27-3 Slice B1：Building 段镜像（fields_ 权威 / building_ 影子）单元测试。
+// 验证 apply_* 同时写 fields_ + building_、flush 触发段封口、on_delete 段级
+// 删除双路径（in_building / in_segment_set）。零行为变化：B1 阶段查询仍走
+// fields_，building_ 是为 B2 切换查询路径预埋的影子。
+// ===========================================================================
+
+// 镜像一致性：apply_job 多字段后，fields_（权威）与 building_（影子）的
+// doc_count / df / live_doc_count 一致。
+TEST(TextPlugin, BuildingMirrorApplyJobConsistent) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_textplugin_b1_mirror";
     fs::remove_all(dir);
     fs::create_directories(dir);
     const std::string dir_s = dir.string();
@@ -123,78 +133,183 @@ TEST(TextPlugin, FlushDeltaThenForcedBase) {
     ctx.dir = dir_s;
     ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
 
-    host_put_row(idx, "a", 0);
-    p.apply_text("a", 0, "alpha doc");
-    plugin::FlushRequest r1;
-    r1.watermark = 1;
-    ASSERT_EQ(p.flush(r1).status, plugin::PluginStatus::kOk);  // base
-    EXPECT_TRUE(fs::exists(dir / "bm25.ckpt"));
-    EXPECT_FALSE(fs::exists(dir / "bm25.ckpt.d1"));
+    constexpr std::size_t N = 5;
+    for (std::uint64_t ord = 0; ord < N; ++ord) {
+        const std::string key = "k" + std::to_string(ord);
+        host_put_row(idx, key, ord);
+        // owning 字符串保活 —— `"x" + std::to_string(ord)` 是 prvalue 临时,
+        // 借给 string_view 后立即析构 → UAF(TSan 下暴露为乱码 token)。
+        const std::string title_str = "alpha " + std::to_string(ord);
+        const std::string body_str = "beta gamma " + std::to_string(ord);
+        const std::pair<std::string_view, std::string_view> fields[] = {
+            {"title", title_str},
+            {"body",  body_str},
+        };
+        auto job = p.map_analyze(key, ord, fields,
+                                 /*file_id=*/1, /*offset=*/ord * 100,
+                                 /*total_sz=*/50, /*tstamp=*/1000);
+        p.apply_job(job);
+    }
 
-    host_put_row(idx, "b", 1);
-    p.apply_text("b", 1, "beta doc");
-    plugin::FlushRequest r2;
-    r2.watermark = 2;
-    auto f2 = p.flush(r2);  // rebase 已清 + 脏 → delta
-    ASSERT_EQ(f2.status, plugin::PluginStatus::kOk);
-    EXPECT_EQ(f2.covered_ord, 2u);
-    EXPECT_TRUE(fs::exists(dir / "bm25.ckpt.d1"));
+    const auto* bld = p.building_segment();
+    const auto* sset = p.segment_set();
+    ASSERT_NE(bld, nullptr);
+    ASSERT_NE(sset, nullptr);
 
-    host_put_row(idx, "c", 2);
-    p.apply_text("c", 2, "gamma doc");
-    plugin::FlushRequest r3;
-    r3.watermark = 3;
-    r3.force_rebase = true;  // close 收链语义
-    ASSERT_EQ(p.flush(r3).status, plugin::PluginStatus::kOk);
-    EXPECT_FALSE(fs::exists(dir / "bm25.ckpt.d1"))
-        << "base 落成后 delta 链应被清扫";
+    EXPECT_EQ(bld->doc_count(), N);
+    EXPECT_EQ(bld->live_doc_count(), N);
+
+    // 默认字段 df：title "alpha" + body "beta"/"gamma" 都走 catch-all 进入
+    // 默认字段 → df == N。注：SealedSegment 的默认字段在 inv_（非 fields_ map），
+    // 用 inverted() 取。Ngram 在 min_n=2/max_n=3/min_token_length=1 下对 4-5 字符
+    // 拉丁词稳定 emit 为整词（Slice A 测试已验证）。
+    const auto& bld_default = bld->inverted();
+    EXPECT_EQ(bld_default.doc_freq("alpha"), N)
+        << "building_ 影子：'alpha' df == N（catch-all 合并入默认字段）";
+    EXPECT_EQ(bld_default.doc_freq("beta"), N)
+        << "building_ 影子：'beta' df == N（body 经 catch-all 合并入默认字段）";
+    EXPECT_EQ(bld_default.doc_freq("gamma"), N)
+        << "building_ 影子：'gamma' df == N（body 经 catch-all 合并入默认字段）";
+
+    // 未触发 flush → 段集仍空。
+    EXPECT_EQ(sset->segment_count(), 0u);
+
     fs::remove_all(dir);
 }
 
-// S20 回归：bounded chain_seq==0 必须零迭代，绝不当作无界扫盘重放 orphan delta。
-// 场景：base 落成（committed chain_seq==0）后写了 delta .d1，但 manifest 未提交
-// （crash 于「先写 delta、后提交 manifest」窗口）。恢复时以 committed chain_seq==0
-// 载入——必须忽略 orphan .d1（与 pre-S20 逐字节一致）。
-// walk_chain 曾把 chain_seq==0 误判为无界（扫盘直到文件缺失），会重放 orphan。
-TEST(TextPlugin, OrphanDeltaNotReplayedWhenChainSeqZero) {
-    const fs::path dir = fs::temp_directory_path() / "bitcask_textplugin_orphan";
+// Flush：apply_job → flush_building_now() → building_ 空、segment_set_ 1 段。
+TEST(TextPlugin, FlushBuildingToSegmentSet) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_textplugin_b1_flush";
     fs::remove_all(dir);
     fs::create_directories(dir);
     const std::string dir_s = dir.string();
 
-    // 盘上写 base（wm=1，committed chain_seq=0）+ 一个 delta .d1（wm=2）。
     index::Index idx;
     text::TextPlugin p(make_cfg(), idx, idx, idx);
     plugin::OpenContext ctx;
     ctx.dir = dir_s;
     ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
-    host_put_row(idx, "a", 0);
-    p.apply_text("a", 0, "alpha doc");
-    plugin::FlushRequest r1;
-    r1.watermark = 1;
-    ASSERT_EQ(p.flush(r1).status, plugin::PluginStatus::kOk);  // base
-    host_put_row(idx, "b", 1);
-    p.apply_text("b", 1, "beta doc");
-    plugin::FlushRequest r2;
-    r2.watermark = 2;
-    ASSERT_EQ(p.flush(r2).status, plugin::PluginStatus::kOk);  // delta .d1
-    ASSERT_TRUE(fs::exists(dir / "bm25.ckpt.d1"));
 
-    // 恢复：manifest 只提交了 base（chain_seq==0），.d1 为未提交 orphan。
-    // 宿主重建 base+delta 覆盖的 docmap 行（若 .d1 被误重放，beta 才有活翻译）。
-    index::Index idx2;
-    host_put_row(idx2, "a", 0);
-    host_put_row(idx2, "b", 1);
-    text::TextPlugin b(make_cfg(), idx2, idx2, idx2);
-    auto lr = b.load_component(dir_s, /*expected_base_wm=*/1, /*chain_seq=*/0);
-    ASSERT_TRUE(lr.loaded);
-    EXPECT_EQ(lr.watermark, 1u)
-        << "orphan .d1 未提交，须忽略——覆盖水位应停在 base(1) 而非 delta(2)";
-    auto ra = b.search_text("alpha", 10);
-    ASSERT_TRUE(ra.has_value());
-    EXPECT_EQ(ra->size(), 1u) << "base 文档应载入";
-    auto rb = b.search_text("beta", 10);
-    ASSERT_TRUE(rb.has_value());
-    EXPECT_EQ(rb->size(), 0u) << "orphan delta 的文档不得进入索引";
+    constexpr std::size_t N = 3;
+    for (std::uint64_t ord = 0; ord < N; ++ord) {
+        const std::string key = "k" + std::to_string(ord);
+        host_put_row(idx, key, ord);
+        const std::pair<std::string_view, std::string_view> fields[] = {
+            {"title", "alpha"},
+            {"body",  "beta gamma"},
+        };
+        auto job = p.map_analyze(key, ord, fields, 1, ord * 100, 50, 1000);
+        p.apply_job(job);
+    }
+
+    // 显式触发 flush（不依赖 64K 阈值）。
+    p.flush_building_now();
+
+    EXPECT_EQ(p.building_segment()->doc_count(), 0u);
+    const auto* sset = p.segment_set();
+    ASSERT_NE(sset, nullptr);
+    ASSERT_EQ(sset->segment_count(), 1u);
+
+    const auto* seg = sset->segment(0);
+    ASSERT_NE(seg, nullptr);
+    EXPECT_EQ(seg->doc_count(), N);
+    EXPECT_EQ(seg->live_doc_count(), N);
+
+    fs::remove_all(dir);
+}
+
+// on_delete（building_ 内删除）：docid 在 building_ → mark_dead 翻位。
+TEST(TextPlugin, OnDeleteFromBuilding) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_textplugin_b1_del_bld";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    text::TextPlugin p(make_cfg(), idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
+
+    constexpr std::size_t N = 4;
+    for (std::uint64_t ord = 0; ord < N; ++ord) {
+        const std::string key = "k" + std::to_string(ord);
+        host_put_row(idx, key, ord);
+        const std::string title_str = "alpha " + std::to_string(ord);  // owning 保活
+        const std::pair<std::string_view, std::string_view> fields[] = {
+            {"title", title_str},
+            {"body",  "beta"},
+        };
+        auto job = p.map_analyze(key, ord, fields, 1, ord * 100, 50, 1000);
+        p.apply_job(job);
+    }
+
+    const auto* bld = p.building_segment();
+    ASSERT_NE(bld, nullptr);
+    EXPECT_EQ(bld->doc_count(), N);
+    EXPECT_EQ(bld->live_doc_count(), N);
+
+    // 删第 2 篇（ord=1 → building_ 段内 docid=1）。
+    p.on_delete("k1", /*tomb_ord=*/100, /*prior_ord=*/1);
+
+    EXPECT_FALSE(bld->is_live(1)) << "OnDelete 应翻 live_[1]=0";
+    EXPECT_TRUE(bld->is_live(0));
+    EXPECT_TRUE(bld->is_live(2));
+    EXPECT_TRUE(bld->is_live(3));
+    EXPECT_EQ(bld->live_doc_count(), N - 1);
+
+    EXPECT_EQ(p.segment_set()->segment_count(), 0u)
+        << "building_ 内删除不触发 flush";
+
+    fs::remove_all(dir);
+}
+
+// on_delete（segment_set_ 内删除）：flush 后删 → 走 segment_set_->segment 路径。
+TEST(TextPlugin, OnDeleteFromSegmentSet) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_textplugin_b1_del_seg";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    text::TextPlugin p(make_cfg(), idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
+
+    constexpr std::size_t N = 3;
+    for (std::uint64_t ord = 0; ord < N; ++ord) {
+        const std::string key = "k" + std::to_string(ord);
+        host_put_row(idx, key, ord);
+        const std::string title_str = "alpha " + std::to_string(ord);  // owning 保活
+        const std::pair<std::string_view, std::string_view> fields[] = {
+            {"title", title_str},
+        };
+        auto job = p.map_analyze(key, ord, fields, 1, ord * 100, 50, 1000);
+        p.apply_job(job);
+    }
+    EXPECT_EQ(p.building_segment()->doc_count(), N);
+
+    p.flush_building_now();
+
+    const auto* sset = p.segment_set();
+    ASSERT_NE(sset, nullptr);
+    ASSERT_EQ(sset->segment_count(), 1u);
+    const auto* seg = sset->segment(0);
+    ASSERT_NE(seg, nullptr);
+    EXPECT_EQ(seg->doc_count(), N);
+    EXPECT_EQ(seg->live_doc_count(), N);
+
+    // 删第 2 篇（ord=1 → 已封口段内 docid=1）。
+    p.on_delete("k1", /*tomb_ord=*/100, /*prior_ord=*/1);
+
+    EXPECT_FALSE(seg->is_live(1)) << "段级删除应翻 live_[1]=0";
+    EXPECT_TRUE(seg->is_live(0));
+    EXPECT_TRUE(seg->is_live(2));
+    EXPECT_EQ(seg->live_doc_count(), N - 1);
+
+    EXPECT_EQ(p.building_segment()->doc_count(), 0u);
+    EXPECT_EQ(p.building_segment()->live_doc_count(), 0u);
+
     fs::remove_all(dir);
 }

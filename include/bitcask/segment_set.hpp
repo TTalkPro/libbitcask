@@ -13,9 +13,11 @@
 #include "bitcask/segment.hpp"
 #include "bitcask/segment_query.hpp"
 
+#include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -108,6 +110,27 @@ public:
         for (const auto& s : segments_) n += s->doc_count();
         return n;
     }
+
+    // ---- S27-3 Slice B1 接入 ----
+    // 按 seg_id 查段（in-memory 访问，O(N) 扫——段集通常 <一二十）；不存在
+    // 返回 nullptr。**返回非 const**——caller 可能调 mark_dead（设计 §3.4
+    // 允许的封口后 mutation）。
+    [[nodiscard]] SealedSegment* segment(std::uint64_t seg_id) {
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].seg_id == seg_id) return segments_[i].get();
+        }
+        return nullptr;
+    }
+    // const 重载（只读访问）。
+    [[nodiscard]] const SealedSegment* segment(std::uint64_t seg_id) const {
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].seg_id == seg_id) return segments_[i].get();
+        }
+        return nullptr;
+    }
+    // 当前活跃段列表（只读视图，查询归并 / 测试用）。
+    [[nodiscard]] std::span<const std::unique_ptr<SealedSegment>>
+    segments_view() const { return segments_; }
 
 private:
     static constexpr std::uint32_t kManifestMagic = 0x464D4753;  // 'SGMF'
