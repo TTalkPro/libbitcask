@@ -56,6 +56,12 @@ enum class CkptSectionType : std::uint16_t {
     kSegDocStore      = 14,
     // S27-2 Slice 4：活跃段清单（segments.manifest 唯一 section）。
     kSegManifest      = 15,
+    // S27-3 Slice A：封口段（SealedSegment）的多字段倒排。仅当段有非默认
+    // 字段写入时才出现此段型；格式见 segment.hpp `kSegFieldsMagic` 注释。
+    // 由 SealedSegment::save 写、由 SealedSegment::load 读。旧读端不识别段
+    // 文件 → 安全忽略（未知段类型跳过语义对 SealedSegment::load 不适用，
+    // 因 load 路径只识别已知段型；新写端在 kSegFields 不识别时应整体拒收）。
+    kSegFields        = 16,
 };
 
 // 写入用:caller 持有 payload 字节。

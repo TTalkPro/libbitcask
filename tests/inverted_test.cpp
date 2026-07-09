@@ -2096,3 +2096,296 @@ TEST(InvertedIndex, SegmentSetDrop) {
     EXPECT_EQ(set2->next_seg_id(), 2u);
     std::filesystem::remove_all(dir);
 }
+
+// ==========================================================================
+// S27-3 Slice A：SealedSegment 多字段扩展（round-trip + 字段数/内容一致）
+// ==========================================================================
+
+// 多字段段：title + body 两个字段。add() 多字段重载；save→load→multi_view→
+// multi_field_segment_search 与内存基线逐位一致。验证 ① 字段数 ② 每字段
+// doc_count ③ posting 内容 ④ 篡改任一字段段字节 → CRC 拒收。
+TEST(InvertedIndex, SealedSegmentMultiFieldRoundTrip) {
+    using bitcask::search::SealedSegment;
+    using bitcask::search::MultiFieldSegmentView;
+    using bitcask::search::FieldSegmentView;
+    using bitcask::search::multi_field_segment_search;
+    using bitcask::search::kDefaultField;
+
+    auto mk = [](std::initializer_list<std::pair<const char*, std::uint32_t>> ts) {
+        TermPositions m;
+        for (auto& [t, tf] : ts) m[std::string(t)] = {tf, {}};
+        return m;
+    };
+
+    auto mem = std::make_unique<SealedSegment>();
+    // 5 文档，每篇：默认字段 + title + body 三处。total_doc_len = Σ 各字段。
+    // doc0: 默认=apple, title=rust, body=memory
+    // doc1: 默认=apple, title=memory, body=rust
+    // doc2: 默认=apple, title=garbage collection, body=systems
+    // doc3: 默认=banana, title=memory, body=garbage
+    // doc4: 默认=apple, title=systems, body=memory
+    struct Doc {
+        std::string key;
+        std::uint64_t lsn;
+        TermPositions def, title, body;
+        std::uint32_t total;
+    };
+    std::vector<Doc> docs = {
+        {"d0", 100, mk({{"apple", 1}}), mk({{"rust", 1}}), mk({{"memory", 1}}), 3},
+        {"d1", 101, mk({{"apple", 1}}), mk({{"memory", 1}}), mk({{"rust", 1}}), 3},
+        {"d2", 102, mk({{"apple", 1}}),
+                    mk({{"garbage", 1}, {"collection", 1}}),
+                    mk({{"systems", 1}}), 5},
+        {"d3", 103, mk({{"banana", 1}}), mk({{"memory", 1}}),
+                    mk({{"garbage", 1}}), 3},
+        {"d4", 104, mk({{"apple", 1}}), mk({{"systems", 1}}),
+                    mk({{"memory", 1}}), 3},
+    };
+    for (const auto& d : docs) {
+        std::array<SealedSegment::FieldInput, 3> fs{{
+            {kDefaultField, &d.def},
+            {"title", &d.title},
+            {"body",  &d.body},
+        }};
+        mem->add(d.key, d.lsn, std::span<const SealedSegment::FieldInput>(fs),
+                 d.total);
+    }
+    ASSERT_EQ(mem->doc_count(), 5u);
+    // 命名字段已建立（与默认字段并列共 3 个：默认 / title / body）。
+    EXPECT_NE(mem->field_index("title"), nullptr);
+    EXPECT_NE(mem->field_index("body"), nullptr);
+    EXPECT_EQ(mem->field_index("title")->live_doc_count(), 5u);
+    EXPECT_EQ(mem->field_index("body")->live_doc_count(), 5u);
+
+    // 内存基线查询：title:rust body:memory → d0 (rust+memory) + d1 (memory+rust)
+    // + d4 (memory in body) 命中；d0/d1 各双字段命中 → 分数累加。
+    std::unordered_map<std::string, std::vector<std::string>> field_terms{
+        {"title", {"rust"}},
+        {"body",  {"memory"}},
+    };
+    std::vector<MultiFieldSegmentView> memSegs = {mem->multi_view()};
+    auto base = multi_field_segment_search(memSegs, field_terms, 10);
+    ASSERT_FALSE(base.empty());
+
+    // 落盘 → 重载 → 内容一致。
+    auto path = (std::filesystem::temp_directory_path() /
+                 "bitcask_seg_mf_rt.seg").string();
+    std::filesystem::remove(path);
+    ASSERT_TRUE(mem->save(path, /*watermark=*/105));
+
+    auto loaded = SealedSegment::load(path);
+    ASSERT_NE(loaded, nullptr) << "load failed for " << path;
+    EXPECT_EQ(loaded->doc_count(), 5u);
+    EXPECT_EQ(loaded->key_at(0), "d0");
+    EXPECT_EQ(loaded->key_at(4), "d4");
+    EXPECT_EQ(loaded->lsn_at(2), 102u);
+    // 字段倒排 round-trip：每字段 doc_count 与 posting 一致。
+    ASSERT_NE(loaded->field_index("title"), nullptr);
+    ASSERT_NE(loaded->field_index("body"), nullptr);
+    EXPECT_EQ(loaded->field_index("title")->live_doc_count(), 5u);
+    EXPECT_EQ(loaded->field_index("body")->live_doc_count(), 5u);
+    // posting 抽样：title 字段 "rust" 仅在 d0（本地 docid=0）；title 字段
+    // "memory" 在 d1 / d3 两篇（docid 1, 3）。body 字段 "memory" 在 d0 / d4
+    // 两篇（docid 0, 4）。body 字段 "systems" 仅在 d2。
+    auto* ti = loaded->field_index("title");
+    auto* bi = loaded->field_index("body");
+    EXPECT_EQ(ti->doc_freq("rust"), 1u);     // 仅 d0
+    EXPECT_EQ(ti->doc_freq("memory"), 2u);   // d1, d3
+    EXPECT_EQ(bi->doc_freq("memory"), 2u);   // d0, d4
+    EXPECT_EQ(bi->doc_freq("systems"), 1u);  // d2
+
+    // 加载后查询与内存基线逐位一致。
+    std::vector<MultiFieldSegmentView> ldSegs = {loaded->multi_view()};
+    auto after = multi_field_segment_search(ldSegs, field_terms, 10);
+    ASSERT_EQ(base.size(), after.size());
+    for (std::size_t i = 0; i < base.size(); ++i) {
+        EXPECT_EQ(base[i].key, after[i].key) << "i=" << i;
+        EXPECT_EQ(base[i].ord, after[i].ord) << "i=" << i;
+        EXPECT_FLOAT_EQ(static_cast<float>(base[i].score),
+                        static_cast<float>(after[i].score))
+            << "i=" << i;
+    }
+
+    // 段级 CRC：篡改文件任一字节 → load 拒收（多字段段在 kSegFields 内的字节
+    // 同样受 CRC 保护；切中部任一位置都会让 CRC 失败）。
+    {
+        std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+        ASSERT_TRUE(f.good());
+        f.seekg(0, std::ios::end);
+        const auto sz = f.tellg();
+        ASSERT_GT(sz, 64);
+        // 选 file 中部（kSegFields 段内位置）翻转一个字节。
+        const auto pos = sz * 3 / 4;
+        f.seekg(pos);
+        char c = 0;
+        f.read(&c, 1);
+        c = static_cast<char>(~c);
+        f.seekp(pos);
+        f.write(&c, 1);
+    }
+    EXPECT_EQ(SealedSegment::load(path), nullptr);
+    std::filesystem::remove(path);
+}
+
+// ==========================================================================
+// S27-3 Slice A：跨段跨字段 BM25 累加归并，与单索引多字段算法逐位等价
+// ==========================================================================
+//
+// 同 8 篇文档（title + body 两个字段）均分两段构建。
+// ① multi_field_segment_search（跨段 G-on-the-fly + 跨字段累加）
+// ② 对照基线：把同样 8 篇文档喂「单 InvertedIndex 每字段」的合成索引，用与
+//    TextPlugin::search_fields 同构的算法（每字段 search + acc[ord]+=score），
+//    doc_len 用 LiveChecker 集中维护 → 这是单索引下 TextPlugin 的行为上界。
+// 两路 hit 数、key、score 应逐位一致（证明 G-on-the-fly 跨段聚合与单字段单
+// 索引聚合在 BM25 dl/idf 上语义等价）。
+// 反证：让段本地统计（ext=nullptr）→ idf 用段本地 df/N → 与基线全局统计不
+// 同 → 分数不一致（证 G-on-the-fly 必要性，与 SegmentMergeEquivalence 同款）。
+TEST(InvertedIndex, MultiFieldSegmentMergeEquivalence) {
+    using bitcask::search::SealedSegment;
+    using bitcask::search::MultiFieldSegmentView;
+    using bitcask::search::multi_field_segment_search;
+    using bitcask::search::kDefaultField;
+    using bitcask::search::SearchHit;
+
+    constexpr std::uint64_t kNAll = 8;
+    // 8 篇文档：d0..d3 入 segA；d4..d7 入 segB。title/body 各含若干词。
+    // 用 rust/memory/garbage/collection/systems 五个 term，df 各异 → 分数互异。
+    const char* titles[kNAll] = {
+        "rust rust memory",          // d0: title rust×2, memory×1
+        "garbage collection rust",   // d1: title garbage, collection, rust
+        "memory garbage",            // d2: title memory, garbage
+        "memory systems",            // d3: title memory, systems
+        "rust garbage",              // d4: title rust, garbage
+        "memory memory memory",      // d5: title memory×3
+        "systems rust",              // d6: title systems, rust
+        "garbage rust memory",       // d7: title garbage, rust, memory
+    };
+    const char* bodies[kNAll] = {
+        "memory systems garbage",    // d0: body memory, systems, garbage
+        "rust memory",               // d1: body rust, memory
+        "collection memory garbage", // d2: body collection, memory, garbage
+        "rust rust memory",          // d3: body rust×2, memory
+        "memory",                    // d4: body memory
+        "systems garbage memory",    // d5: body systems, garbage, memory
+        "rust memory systems",       // d6: body rust, memory, systems
+        "garbage collection rust",   // d7: body garbage, collection, rust
+    };
+
+    // 两个段：各装 4 篇文档（docid 段内 0..3）。
+    auto segA = std::make_unique<SealedSegment>();
+    auto segB = std::make_unique<SealedSegment>();
+    // 基线：每字段一份单 InvertedIndex（8 篇文档，docid 全局 0..7）+ FakeLiveChecker。
+    InvertedIndex whole_title, whole_body;
+    FakeLiveChecker whole_chk;
+    for (std::uint64_t g = 0; g < kNAll; ++g) {
+        // 把 title/body 字符串（空格分词）转 TermPositions。
+        auto split_add = [](TermPositions& m, const std::string& s) {
+            std::uint32_t tf = 0;
+            for (std::size_t i = 0; i < s.size(); ++i) {
+                if (s[i] == ' ') {
+                    if (tf > 0) m[s.substr(i - tf, tf)] = {tf, {}};
+                    tf = 0;
+                } else {
+                    ++tf;
+                }
+            }
+            if (tf > 0) m[s.substr(s.size() - tf, tf)] = {tf, {}};
+        };
+        TermPositions tTPM, bTPM;
+        split_add(tTPM, titles[g]);
+        split_add(bTPM, bodies[g]);
+        std::uint32_t ttl_d = 0;
+        for (const auto& [k, v] : tTPM) ttl_d += v.first;
+        for (const auto& [k, v] : bTPM) ttl_d += v.first;
+
+        // 喂两段。
+        std::array<SealedSegment::FieldInput, 2> fs{{
+            {"title", &tTPM},
+            {"body",  &bTPM},
+        }};
+        if (g < 4) {
+            segA->add("doc" + std::to_string(g), g, fs, ttl_d);
+        } else {
+            segB->add("doc" + std::to_string(g), g, fs, ttl_d);
+        }
+
+        // 喂基线（每字段单 InvertedIndex，全局 docid）。
+        whole_title.add_doc(g, tTPM);
+        whole_body.add_doc(g, bTPM);
+        whole_chk.doc_lens[g] = ttl_d;
+    }
+    ASSERT_EQ(segA->doc_count(), 4u);
+    ASSERT_EQ(segB->doc_count(), 4u);
+
+    // 基线：与 TextPlugin::search_fields 同构的算法（每字段 search +
+    // acc[ord]+=score，boost=1.0）。不调 TextPlugin（构造链路过重），用同样
+    // 算法的纯函数实现作为对照——这恰是 search_fields 在单索引上的展开。
+    auto baseline_search = [&](const std::unordered_map<std::string,
+            std::vector<std::string>>& qft, std::size_t k) {
+        std::unordered_map<std::uint64_t, double> acc;
+        for (const auto& [fname, terms] : qft) {
+            const InvertedIndex* inv = nullptr;
+            if (fname == "title") inv = &whole_title;
+            else if (fname == "body") inv = &whole_body;
+            else continue;
+            auto hits = inv->search(terms, k, whole_chk);
+            for (const auto& h : hits) acc[h.ord] += h.score;
+        }
+        std::vector<std::pair<std::uint64_t, double>> ranked(acc.begin(),
+                                                             acc.end());
+        std::partial_sort(ranked.begin(),
+            ranked.begin() +
+                static_cast<std::ptrdiff_t>(std::min(k, ranked.size())),
+            ranked.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+        if (ranked.size() > k) ranked.resize(k);
+        std::vector<SearchHit> out;
+        out.reserve(ranked.size());
+        for (const auto& [ord, sc] : ranked) {
+            out.push_back(SearchHit{"doc" + std::to_string(ord), ord, sc});
+        }
+        return out;
+    };
+
+    // 查询：title 找 rust（多文档命中，df 跨段聚合），body 找 memory（更广命中）。
+    // 两路都要求 k=8 → 无 top-k 截断（hit 数 ~8，逐位对比稳定）。
+    std::unordered_map<std::string, std::vector<std::string>> qft{
+        {"title", {"rust"}},
+        {"body",  {"memory"}},
+    };
+    const std::size_t k = kNAll;
+
+    auto base = baseline_search(qft, k);
+    std::vector<MultiFieldSegmentView> segs = {segA->multi_view(),
+                                               segB->multi_view()};
+    auto merged = multi_field_segment_search(segs, qft, k);
+
+    ASSERT_EQ(base.size(), merged.size());
+    for (std::size_t i = 0; i < base.size(); ++i) {
+        EXPECT_EQ(base[i].key, merged[i].key) << "i=" << i;
+        EXPECT_EQ(base[i].ord, merged[i].ord) << "i=" << i;
+        EXPECT_FLOAT_EQ(static_cast<float>(base[i].score),
+                        static_cast<float>(merged[i].score))
+            << "i=" << i;
+    }
+
+    // 反证 G-on-the-fly 必要性：只跑 segA（单段）→ N=4/avgdl=某值，与两段
+    // 全局 N=8/avgdl 不同 → BM25 idf + dl/avgdl 缩放必然不同 → 至少一条命中
+    // 的分数与两段合并后同 doc 的分数不同（证明不跨段聚合会漂移分数）。
+    std::vector<MultiFieldSegmentView> onlyA = {segA->multi_view()};
+    auto oneSeg = multi_field_segment_search(onlyA, qft, k);
+    bool diff_found = false;
+    for (const auto& oh : oneSeg) {
+        for (const auto& mh : merged) {
+            if (oh.ord == mh.ord &&
+                std::abs(static_cast<float>(oh.score) -
+                         static_cast<float>(mh.score)) > 1e-6F) {
+                diff_found = true;
+                break;
+            }
+        }
+        if (diff_found) break;
+    }
+    EXPECT_TRUE(diff_found)
+        << "G-on-the-fly 必要性反证失败：单段本地统计应与跨段全局统计分数不同";
+}
