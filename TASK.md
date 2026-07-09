@@ -3201,8 +3201,17 @@ W4 ✅（parallel_scan 并行全表扫描）。
     - 测试：`ExtStatsSelfEquivalenceScalar`/`...Wand`（self-stats 注入与本地打分逐位一致，覆盖标量+WAND）
       + `ExtStatsInjectionAffectsScore`（只注入更小 df → idf 抬升→分更高，证明注入被采纳）。
     - 验证：build-clang 548/548（既有 545 + 新 3，证零回归）、build-rel 构建通过。
-  - [ ] **Slice 2** `SealedSegment`（InvertedIndex + doc_store）+ 多段查询归并（§3.5，G-on-the-fly）。
-    等价测试：N 文档分 2 段 == 1 索引同一排序。
+  - [x] **Slice 2 多段查询归并（§3.5，G-on-the-fly）** — 已完成（2026-07-09）·
+    新增 `include/bitcask/segment_query.hpp`（header-only）+ `inverted_test.cpp`
+    - `SegmentView{inv, live, key_of, lsn_of}`（段最小只读查询视图，本地 docid）+
+      `multi_segment_search()`：① 跨段聚合全局 N/sum_dl/df（G-on-the-fly）② 串行逐段用同一 idf
+      打分（`search(...,&ext)`）③ 大小 k 并集归并（一 doc 只在一段，不求和）。阈值传播（WAND floor）
+      属纯剪枝优化、不改结果，留待后续 slice。
+    - 测试 `SegmentMergeEquivalence`：8 文档「单索引 whole」vs「均分 2 段」→ multi_segment_search
+      与 whole.search **逐位同 key 同分**（含 lsn_of 还原全局 LSN）；反证段本地统计（ext=nullptr）
+      idf 与单索引不同→分数不一致（证 G-on-the-fly 必要性）。
+    - 验证：build-clang 549/549、build-rel 构建通过。
+  - [ ] **Slice 3** 段落盘格式（复用 InvertedIndex base + doc_store 段）round-trip + §3.4 平坦 doc_store。
   - [ ] **Slice 3** 段落盘格式（复用 InvertedIndex base + doc_store 段）round-trip。
   - [ ] **Slice 4** 段管理器 / 活跃段清单。
 - [ ] **S27-3 段累积替换 delta 链**：checkpoint flush 新段 + 后台 merge。删 delta 链 + 死内存回收。仍单写者。
