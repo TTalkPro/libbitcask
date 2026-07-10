@@ -105,7 +105,8 @@ void TextPlugin::apply_text(std::string_view key, std::uint64_t ord,
     // 使旧副本可定位,mark_dead 后恒一份 live,无需 ord 显式门。
     auto bld = building_.load(std::memory_order_acquire);
     if (bld && !term_data.empty()) {
-        seg_dirty_ = true;  // 步骤 3:段侧脏标记(flush 决策)
+        seg_dirty_.store(true, std::memory_order_relaxed);
+        // S27-4 P1:LSN 守卫 upsert(任意到达序安全,设计 §2)。
         KeyLocation prior{};
         bool have_prior = false;
         {
@@ -116,14 +117,13 @@ void TextPlugin::apply_text(std::string_view key, std::uint64_t ord,
                 have_prior = true;
             }
         }
-        if (have_prior) {
-            if (prior.in_building) {
-                (void)bld->mark_dead(prior.docid);
-            } else if (segment_set_) {
-                if (auto* seg = segment_set_->segment(prior.seg_id)) {
-                    (void)seg->mark_dead(prior.docid);
-                }
-            }
+        if (have_prior && prior.ord > ord) {
+            // 更新版本已在(乱序到达的旧 put)→ 本版本不索引。
+            cache_.invalidate_terms(changed_terms);
+            return;
+        }
+        if (have_prior && !prior.tomb && prior.seg) {
+            (void)prior.seg->mark_dead(prior.docid);
         }
         const TermPositionsMap* borrowed = &term_data;
         const search::SealedSegment::FieldInput fin{search::kDefaultField,
@@ -134,7 +134,8 @@ void TextPlugin::apply_text(std::string_view key, std::uint64_t ord,
             doc_len);
         {
             std::unique_lock lk(key_loc_mu_);
-            key_to_location_[std::string(key)] = KeyLocation{true, 0, docid};
+            auto& e = key_to_location_[std::string(key)];
+            if (e.ord <= ord) e = KeyLocation{bld, docid, ord, false};
         }
         if (bld->doc_count() >= kBuildingFlushDocThreshold) {
             flush_building();
@@ -270,7 +271,8 @@ void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
     // S27-3 步骤 3:唯一写入路径(原 B1「镜像」转正)+ B2a:覆盖写先 mark_dead。
     auto bld = building_.load(std::memory_order_acquire);
     if (bld) {
-        seg_dirty_ = true;
+        seg_dirty_.store(true, std::memory_order_relaxed);
+        // S27-4 P1:LSN 守卫 upsert(同 apply_text,设计 §2)。
         KeyLocation prior{};
         bool have_prior = false;
         {
@@ -281,14 +283,12 @@ void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
                 have_prior = true;
             }
         }
-        if (have_prior) {
-            if (prior.in_building) {
-                (void)bld->mark_dead(prior.docid);
-            } else if (segment_set_) {
-                if (auto* seg = segment_set_->segment(prior.seg_id)) {
-                    (void)seg->mark_dead(prior.docid);
-                }
-            }
+        if (have_prior && prior.ord > job.ord) {
+            cache_.invalidate_terms(changed_terms);
+            return;  // 乱序到达的旧版本,不索引
+        }
+        if (have_prior && !prior.tomb && prior.seg) {
+            (void)prior.seg->mark_dead(prior.docid);
         }
         std::vector<search::SealedSegment::FieldInput> fin;
         fin.reserve(job.fields.size() + 1);
@@ -305,8 +305,8 @@ void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
                                           fin, job.total_doc_len);
             {
                 std::unique_lock lk(key_loc_mu_);
-                key_to_location_[std::string(job.key)] =
-                    KeyLocation{true, 0, docid};
+                auto& e = key_to_location_[std::string(job.key)];
+                if (e.ord <= job.ord) e = KeyLocation{bld, docid, job.ord, false};
             }
             if (bld->doc_count() >= kBuildingFlushDocThreshold) {
                 flush_building();
@@ -328,7 +328,7 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
     (void)prior_ord;
     // S27-3 步骤 3:fields_ 退役——删除只走段级 mark_dead(下方);段内
     // N/sum_dl 统计经 LiveChecker 排除死文档,df 高估由 merge 自愈(§3.4)。
-    seg_dirty_ = true;
+    seg_dirty_.store(true, std::memory_order_relaxed);
 
     // S9.2：取被删文档词集做选择性失效。原文 LRU 命中则精确 analyze；
     // miss（冷文档被挤出）则降级为整缓存失效（安全但粗粒度）。
@@ -358,27 +358,20 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
     }
 
     // S27-3 Slice B1：段级删除镜像（fields_ remove_doc 上面已做）。
+    // S27-4 P1:墓碑保留 + LSN 守卫(erase 会让乱序到达的旧 put 复活;
+    // 墓碑条目重启随 rebuild_key_locations 消失,设计 §2)。
     KeyLocation prior{};
     bool have_prior = false;
     {
         std::unique_lock lk(key_loc_mu_);
-        if (auto it = key_to_location_.find(std::string(key));
-            it != key_to_location_.end()) {
-            prior = it->second;
-            have_prior = true;
-            key_to_location_.erase(it);
-        }
+        auto& e = key_to_location_[std::string(key)];
+        if (e.ord > tomb_ord) return;  // 已有更新版本(put/墓碑),本删除过期
+        prior = e;
+        have_prior = (e.seg != nullptr || e.tomb);
+        e = KeyLocation{nullptr, 0, tomb_ord, true};
     }
-    if (have_prior) {
-        if (prior.in_building) {
-            if (auto bld = building_.load(std::memory_order_acquire)) {
-                (void)bld->mark_dead(prior.docid);
-            }
-        } else if (segment_set_) {
-            if (auto* seg = segment_set_->segment(prior.seg_id)) {
-                (void)seg->mark_dead(prior.docid);
-            }
-        }
+    if (have_prior && !prior.tomb && prior.seg) {
+        (void)prior.seg->mark_dead(prior.docid);
     }
 
     maybe_auto_compact();  // S12-2
@@ -404,7 +397,7 @@ void TextPlugin::rebuild_index(
     }
     building_.store(std::make_shared<search::SealedSegment>(),
                     std::memory_order_release);
-    seg_dirty_ = true;
+    seg_dirty_.store(true, std::memory_order_relaxed);
 
     for_each_doc([&](std::uint64_t ord, const std::string& text) {
         auto term_data = analyzer_->analyze_with_positions(text);
@@ -423,7 +416,7 @@ void TextPlugin::rebuild_index(
             doc_len);
         {
             std::unique_lock lk(key_loc_mu_);
-            key_to_location_[*key] = KeyLocation{true, 0, docid};
+            key_to_location_[*key] = KeyLocation{bld, docid, ord, false};
         }
         doc_texts_.put(ord, text);
         if (bld->doc_count() >= kBuildingFlushDocThreshold) {
@@ -463,7 +456,7 @@ std::size_t TextPlugin::compact(double dead_ratio_threshold) {
     }
     if (total > 0) {
         rebase_needed_.store(true, std::memory_order_relaxed);
-        seg_dirty_ = true;
+        seg_dirty_.store(true, std::memory_order_relaxed);
         cache_.invalidate();
     }
     return total;
@@ -841,17 +834,10 @@ TextPlugin::explain(std::string_view query, std::string_view key,
             have_loc = true;
         }
     }
-    if (have_loc) {
-        std::shared_ptr<const search::SealedSegment> seg;
-        if (loc.in_building) {
-            seg = building_.load(std::memory_order_acquire);
-        } else if (segment_set_) {
-            seg = segment_set_->segment_ref(loc.seg_id);
-        }
-        if (seg) {
-            return seg->inverted().explain(terms, loc.docid, *seg,
-                                            params_override);
-        }
+    if (have_loc && !loc.tomb && loc.seg) {
+        // S27-4 P1:loc.seg 即段对象 shared_ptr(天然 pin)。
+        const auto& seg = *loc.seg;
+        return seg.inverted().explain(terms, loc.docid, seg, params_override);
     }
     // S27-3 步骤 3:fields_ fallback 删除——key_to_location_ 由 recovery
     // 重建(步骤 4),未命中即该 key 无文本索引。
@@ -1182,16 +1168,17 @@ void TextPlugin::rebuild_key_locations() {
     std::unique_lock lk(key_loc_mu_);
     key_to_location_.clear();
     if (!segment_set_) return;
-    const auto entries = segment_set_->entries_view();
-    const auto segs = segment_set_->segments_view();
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-        const auto& seg = *segs[i];
+    const auto segs = segment_set_->segments_view();  // open 单线程上下文
+    for (const auto& sp : segs) {
+        const auto& seg = *sp;
         const auto n = seg.doc_count();
         for (std::size_t d = 0; d < n; ++d) {
             const auto docid = static_cast<DocId>(d);
             if (!seg.is_live(docid)) continue;
+            // 段序=seg_id 升序、段内 docid 升序=LSN 升序 → 直接覆盖即
+            // 后写胜;S27-4 P1 起条目带 ord(LSN 守卫)与段对象指针。
             key_to_location_[seg.key_at(docid)] =
-                KeyLocation{false, entries[i].seg_id, docid};
+                KeyLocation{sp, docid, seg.lsn_at(docid), false};
         }
     }
 }
@@ -1256,18 +1243,9 @@ void TextPlugin::flush_building() {
         return;
     }
 
-    // 推进 key_to_location_：所有 in_building=true 的项改 in_building=false。
-    const std::uint64_t sealed_seg_id = segment_set_->next_seg_id() - 1;
-    {
-        std::unique_lock lk(key_loc_mu_);
-        for (auto& [k, loc] : key_to_location_) {
-            if (loc.in_building) {
-                loc.in_building = false;
-                loc.seg_id      = sealed_seg_id;
-            }
-        }
-    }
-    seg_dirty_ = true;
+    // S27-4 P1:封口零清扫——KeyLocation 持段**对象**指针,building 封口后
+    // 对象身份不变(shared_ptr 移入段集),定位天然继续有效。
+    seg_dirty_.store(true, std::memory_order_relaxed);
 }
 
 }  // namespace bitcask::text

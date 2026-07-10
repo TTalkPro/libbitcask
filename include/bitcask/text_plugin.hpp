@@ -257,8 +257,12 @@ public:
     // ---- 记账（S27-3 步骤 3:fields_ 退役,单一段侧脏位）----
     // seg_dirty_:building_ 有新文档 / 段有新 mark_dead / 段集成员变动。
     // reducer 单写者置位;flush(reducer RunFn)读 + save 成功清零。
-    [[nodiscard]] bool dirty() const noexcept { return seg_dirty_; }
-    void clear_dirty() noexcept { seg_dirty_ = false; }
+    [[nodiscard]] bool dirty() const noexcept {
+        return seg_dirty_.load(std::memory_order_relaxed);
+    }
+    void clear_dirty() noexcept {
+        seg_dirty_.store(false, std::memory_order_relaxed);
+    }
 
     // ---- bm25 组件 checkpoint（bm25.ckpt 文件族；S18-6 收进 flush/open）----
     [[nodiscard]] bool save_component_base(std::string_view dir,
@@ -370,9 +374,9 @@ private:
     mutable search::SearchCache cache_;
     mutable DocTextLru doc_texts_;
     std::shared_ptr<const SynonymMap> synonym_map_;
-    // S27-3 步骤 3:段侧脏位(初值 true——新 open 后首次 flush 恒 base,
-    // 与旧 dirty_default_/dirty_fields_ 初值语义一致)。reducer 单写者。
-    bool seg_dirty_ = true;
+    // S27-3 步骤 3:段侧脏位(初值 true——新 open 后首次 flush 恒 base)。
+    // S27-4:原子化(P2 起多 builder 置位)。
+    std::atomic<bool> seg_dirty_{true};
     ChainState chain_{};
     // S18-6：flush/open 自治状态。
     std::string dir_;               // open 时记录（flush 复用）
@@ -391,10 +395,18 @@ private:
     // mark_dead（设计 §3.4 接受 df 高估，merge 自愈）。
     static constexpr std::size_t kBuildingFlushDocThreshold = 65536;  // 可调
 
+    // S27-4 P1:对象指针化 + LSN 守卫(docs/design/s27-4-dwpt-design.md §2)。
+    // seg 统一指向 building/sealed 段对象(封口不改变对象身份 → 封口零清扫;
+    // shared_ptr 钉住,全死段 drop 前其 key 必已被覆盖/删除改写,无残留)。
+    // ord 用于任意到达序仲裁(旧版本 put/delete 到达即跳过——P2 并行
+    // builder 的正确性核心;P1 单 reducer 全局序下为冗余保险)。
+    // tomb 墓碑**保留**而非 erase——否则更旧的 put 复活成幽灵;重启随
+    // rebuild_key_locations 消失。
     struct KeyLocation {
-        bool          in_building = true;  // true: 在 building_；false: 已封口
-        std::uint64_t seg_id      = 0;     // 仅 in_building=false 时有效
-        DocId         docid       = 0;     // 段内本地 docid
+        std::shared_ptr<search::SealedSegment> seg;  // null ⟺ tomb
+        DocId docid = 0;   // 段内本地 docid
+        Lsn   ord   = 0;   // 本版本 LSN(仲裁键)
+        bool  tomb  = false;
     };
 
     // S27-3 B2b 步骤 4:recovery 主路径辅件——load_component 捕获 bm25.ckpt
