@@ -3249,6 +3249,20 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - [ ] **剩余 B2b/D/E**：删 fields_ + flush 走段集 + recovery 重写 + legacy 迁移 + 段级 merge。
     设计已闭合（双 manifest 冲突分析 + 方案 A + 5 步实现计划）：
     [`docs/design/s27-3-b2b-recovery-design.md`](docs/design/s27-3-b2b-recovery-design.md)。
+    - [x] **步骤 1 已完成（2026-07-10）：SegmentSet 持久化解耦（零行为变化）**。
+      `add`/`drop` 拆 `add_pending`/`drop_pending` + `commit`（兼容包装保留,
+      既有测试零改动）；`flush_building` 改 add_pending（清单提交延后到
+      checkpoint）；`save_component_base` 写 kSegManifest section 进 bm25.ckpt
+      （步骤 4 的 recovery 读取源）+ 过渡期仍 commit segments.manifest（open
+      兼容,步骤 4 后退役）。顺带修两个既存缺陷：① flush_building 失败路径
+      「物归原主」的是 moved-from 空指针（建段丢失 + 后续 apply 空解引用）→
+      add_pending 仅成功时取走所有权；② drop 原「先删文件后提清单」崩溃窗口
+      致 open 整体拒收退全量重建 → 反转为「先清单后删文件」（孤儿文件 open
+      忽略）。
+      验收：clang 560/560；TSan crash/checkpoint/recovery/segment 74/74；rel 构建过。
+    - [ ] **步骤 4**：recovery 重写（**下一步**,先于删 fields_——设计 §7 双路径并行验证）
+    - [ ] **步骤 3**：删 fields_ map + apply/on_delete 改造
+    - [ ] **步骤 5**：段级 merge（Slice D）+ legacy 迁移
 - [ ] **S27-4 并行 builder（DWPT）**：多段内单线程 builder，文档分派。**吞吐红利落地。**依赖 S27-3 收官。
 
 ### 关联既有设计（勿重复造轮子）
@@ -3348,7 +3362,7 @@ W4 ✅（parallel_scan 并行全表扫描）。
 
 ### P1 结构性（量级改变，需设计，各自独立可做）
 
-- [ ] **S29-6 读路径「零共享写」改造（epoch-RCU + 乐观读）**（**设计已闭合** 2026-07-10）·
+- [x] **S29-6 读路径「零共享写」改造（epoch-RCU + 乐观读）**——**全四相完成（2026-07-10）**·
     `src/keydir/keydir.cpp` + `include/bitcask/keydir.hpp` + `include/bitcask/inverted.hpp:486`
   - 病根：读路径每次对共享锁字原子 RMW——`KeyDir::get` 拿 shard 独占 `std::mutex`（S5 实验
     遗留）；TBB `const_accessor` 读也写桶锁字。换 shared_mutex 无效（reader 计数同样写
@@ -3412,7 +3426,7 @@ W4 ✅（parallel_scan 并行全表扫描）。
     sweep——内存有界（≤1/8 表长 + sweep 滞后量），语义无损。
   - 二期：倒排桶锁复用同一套 epoch 注册表（TBB 桶锁不可下探 → 换表或 thread_local
     term→snapshot 缓存）。
-- [ ] **S29-7 Put 写路径 group commit（单 handle 多写者扩展）** · `src/cask/cask.cpp:1319-1378`
+- [x] **S29-7 Put 写路径 group commit（单 handle 多写者扩展）**——**铺垫+主体完成（2026-07-10）**· `src/cask/cask.cpp`
     + `include/bitcask/data_file.hpp`
   - 病根：`write_mu_`（`cask.hpp:785`）包住 encode + pwrite + hint + keydir 全序列，短临界区
     高争用 = 经典 mutex collapse（1→2 线程即 902k→175k）。fsync 不在 bench 路径内
