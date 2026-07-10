@@ -3260,7 +3260,21 @@ W4 ✅（parallel_scan 并行全表扫描）。
       致 open 整体拒收退全量重建 → 反转为「先清单后删文件」（孤儿文件 open
       忽略）。
       验收：clang 560/560；TSan crash/checkpoint/recovery/segment 74/74；rel 构建过。
-    - [ ] **步骤 4**：recovery 重写（**下一步**,先于删 fields_——设计 §7 双路径并行验证）
+    - [x] **步骤 4 已完成（2026-07-10）：recovery 重写（双路径并行期）**。
+      ① `flush()` 保存前先封口 building_（段集覆盖到 watermark,否则 recovery
+      后段集永远落后 fields_）;② `load_component` 捕获 bm25.ckpt 内嵌
+      kSegManifest → `open()` 优先 `SegmentSet::open_from_payload`（单一
+      commit point 主路径）,回退过渡期 segments.manifest → 空集+fields_
+      退化;③ **死亡位持久化**：`SealedSegment::dead_dirty` 标记 +
+      `SegmentSet::resave_dead_dirty`（ckpt 时重存有新 mark_dead 的段——
+      审计发现:live_ 位虽在 kSegDocStore 但封口段从不重存,ckpt **之前**的
+      删除在 recovery 后会复活为幽灵）;④ `rebuild_key_locations`（open 时
+      从段集重建 key→(seg_id,docid),否则 reopen 后对 ckpt 前文档的删除/覆盖
+      mark_dead 落空）。watermark 仍取 ckpt（双路径期,fields_ 为权威;
+      max(hi_lsn) 切换随步骤 3）。
+      验收：新测 `SegmentSetRecoveryRoundTrip`（删 segments.manifest 强制走
+      内嵌清单 + 幽灵检验 + 定位重建检验）;clang 561/561;TSan
+      crash/checkpoint/recovery/segment 91/91;ASan 59/59;rel 构建过。
     - [ ] **步骤 3**：删 fields_ map + apply/on_delete 改造
     - [ ] **步骤 5**：段级 merge（Slice D）+ legacy 迁移
 - [ ] **S27-4 并行 builder（DWPT）**：多段内单线程 builder，文档分派。**吞吐红利落地。**依赖 S27-3 收官。
