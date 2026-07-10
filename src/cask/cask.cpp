@@ -1033,6 +1033,226 @@ Cask::write_and_keydir(std::span<const std::byte> key,
     return PersistedRecord{ord2, w2->offset, w2->total_size, active_file_id_};
 }
 
+// ---------------------------------------------------------------------------
+// S29-7:组提交(设计见 cask.hpp GcRequest 注释)
+// ---------------------------------------------------------------------------
+
+std::expected<Cask::PersistedRecord, CaskFault>
+Cask::submit_group_commit(GcRequest& req) {
+    {
+        std::lock_guard<std::mutex> g(gc_mu_);
+        gc_queue_.push_back(&req);
+    }
+    for (;;) {
+        if (req.done.load(std::memory_order_acquire)) break;
+        if (write_mu_.try_lock()) {
+            // 我是 leader:循环整批处理(必含自己——入队先于 try_lock 成功)。
+            process_gc_batch_locked();
+            write_mu_.unlock();
+            gc_cv_.notify_all();
+            continue;  // 回到循环头取结果
+        }
+        // follower 先自旋(~几 µs):leader 每记录 ~1.5µs,绝大多数请求在
+        // 自旋窗口内完成——cv futex 睡/醒一轮 ~10-20µs,直接睡会把组提交
+        // 的收益全部吃掉(首版实测 4/8 线程反而 3× 恶化)。
+        bool spun_done = false;
+        for (int i = 0; i < 4096; ++i) {
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+            if (req.done.load(std::memory_order_acquire)) {
+                spun_done = true;
+                break;
+            }
+        }
+        if (spun_done) break;
+        // 退化:cv 睡,100µs 超时兜底(write_mu_ 可能被 remove/put_batch/
+        // merge 等非组提交持有者占着——它们不 notify,超时自转 leader)。
+        std::unique_lock<std::mutex> g(gc_mu_);
+        if (req.done.load(std::memory_order_acquire)) break;
+        gc_cv_.wait_for(g, std::chrono::microseconds(100), [&] {
+            return req.done.load(std::memory_order_acquire);
+        });
+        if (req.done.load(std::memory_order_acquire)) break;
+    }
+    if (!req.ok) return std::unexpected(req.err);
+    return req.rec;
+}
+
+// 前置:持 write_mu_。按队列序整批:逐条 alloc_ord + patch + 累积 →
+// 一次 pwrite → 逐条 hint/keydir/组提交计数。队列序 == ord 序 == 文件序
+// (恢复硬不变量)。失败的请求补 Skip(ord 必须被 Add 或 Skip 覆盖,防
+// reorder stall——与旧 OrdSkipGuard 同义,含 in-lock 提交的既有行为)。
+void Cask::process_gc_batch_locked() {
+    // Leader 循环 re-drain:处理一批期间新到的请求由**当前** leader 继续
+    // 消化(否则批大小恒 ≈1——请求总是错过 drain 点,组提交名存实亡,
+    // 首版实测仅 +10%)。批大小随争用自然增长:N 并发 → 上一批处理期间
+    // 积累 ~N-1 条 → 每 pwrite 合并 ~N 条。
+    for (;;) {
+        process_one_gc_round_locked();
+        std::lock_guard<std::mutex> g(gc_mu_);
+        if (gc_queue_.empty()) return;
+    }
+}
+
+void Cask::process_one_gc_round_locked() {
+    static thread_local std::vector<GcRequest*> batch;  // 稳态零分配
+    batch.clear();
+    {
+        std::lock_guard<std::mutex> g(gc_mu_);
+        std::swap(batch, gc_queue_);
+        // swap 后 gc_queue_ 拿走了 batch 的旧容量——留给下轮复用亦可;
+        // 但 thread_local 容量在两个容器间往返,均摊仍零分配。
+    }
+    if (batch.empty()) return;
+
+    auto finish_all = [&] {
+        // done 是发布点:结果字段已写毕,release 发布;自旋 follower 免锁
+        // 立即可见。cv 兜底睡眠者仍需 notify。
+        for (auto* r : batch) r->done.store(true, std::memory_order_release);
+        gc_cv_.notify_all();
+    };
+    auto fail = [](GcRequest* r, CaskFault e) {
+        r->ok = false;
+        r->err = std::move(e);
+    };
+    auto skip_ord = [this](std::uint64_t ord) {
+        submit_index_task(
+            IndexTask::make(IndexOp::Skip, {}, ord, {}, 0, 0, 0, 0, 0));
+    };
+
+    if (is_closed()) {
+        for (auto* r : batch) fail(r, err(CaskError::kClosed, "cask is closed"));
+        finish_all();
+        return;
+    }
+
+    // merge race:并发 merger 顶过 active_file_id_ → 先 roll(同旧 put)。
+    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
+        if (auto r = roll_active(); !r) {
+            for (auto* q : batch) fail(q, r.error());
+            finish_all();
+            return;
+        }
+    }
+
+    // 累积批:combine 是本批所有 record 的连续拼接(同一文件内);跨
+    // max_file_size 边界时先落当前段再 roll。
+    thread_local std::vector<std::byte> combine;
+    combine.clear();
+    static thread_local std::vector<GcRequest*> sub;  // 与 combine 对应(队列序)
+    sub.clear();
+    bool io_dead = false;
+    CaskFault io_err{};
+
+    // 落当前段:一次 pwrite + 逐条 hint/keydir/组提交。返回 false = IO 故障
+    // (sub 内全部已 fail + Skip;调用方停止整批)。
+    auto flush_sub = [&]() -> bool {
+        if (sub.empty()) return true;
+        auto w = active_data_->write_encoded(combine);
+        if (!w) {
+            const auto e = io_fault(w.error().errnum,
+                                    std::string(active_data_->path()));
+            for (auto* r : sub) {
+                fail(r, e);
+                skip_ord(r->rec.ord);
+            }
+            sub.clear();
+            combine.clear();
+            return false;
+        }
+        std::uint64_t off = w->offset;
+        bool tail_dead = false;  // hint 流故障 → 保守 fail 本段剩余
+        CaskFault tail_err{};
+        for (auto* r : sub) {
+            const auto sz = static_cast<std::uint32_t>(r->record.size());
+            if (tail_dead) {
+                fail(r, tail_err);
+                skip_ord(r->rec.ord);
+                off += sz;
+                continue;
+            }
+            auto h = active_hint_->write(r->tstamp, sz, off, /*tomb*/ false,
+                                         r->key);
+            if (!h) {
+                tail_dead = true;
+                tail_err = io_fault(h.error().errnum,
+                                    std::string(active_hint_->path()));
+                fail(r, tail_err);
+                skip_ord(r->rec.ord);
+                off += sz;
+                continue;
+            }
+            auto pr = keydir_->put(bytes_to_view(r->key), active_file_id_, sz,
+                                   off, r->tstamp, /*now*/ 0, /*newest*/ true,
+                                   0, 0, r->rec.ord);
+            if (pr == keydir::PutResult::kAlreadyExists) {
+                // merge race(罕见):单条重写路径(内部 roll + ord2 +
+                // 原 ord 的 Skip 语义;见 write_and_keydir)。
+                auto p2 = write_and_keydir(r->key, r->record, r->tstamp,
+                                           r->rec.ord);
+                if (!p2) {
+                    fail(r, p2.error());
+                    skip_ord(r->rec.ord);
+                } else {
+                    r->rec = *p2;
+                    r->ok = true;
+                }
+            } else {
+                r->rec.offset = off;
+                r->rec.total_size = sz;
+                r->rec.file_id = active_file_id_;
+                r->ok = true;
+            }
+            if (r->ok) {
+                // 组提交计数与旧单条 put 逐一对齐(数据已持久,fsync 失败
+                // 沿旧语义:Add 照提、error 照返——post_err)。
+                if (auto gcr = maybe_group_commit(); !gcr) {
+                    r->post_err = gcr.error();
+                }
+            }
+            off += sz;
+        }
+        sub.clear();
+        combine.clear();
+        return true;
+    };
+
+    for (auto* r : batch) {
+        if (io_dead) {
+            fail(r, io_err);
+            continue;  // 未分配 ord,无需 Skip
+        }
+        // roll 判断含未落盘的 combine 尺寸(同段字节必须进同一文件)。
+        const bool would_roll =
+            !active_data_ ||
+            active_data_->size() + combine.size() + r->record.size() >
+                opts_.max_file_size;
+        if (would_roll) {
+            if (!flush_sub()) {
+                io_dead = true;
+                io_err = err(CaskError::kIo, "group commit flush failed");
+                fail(r, io_err);
+                continue;
+            }
+            if (auto rr = roll_active_if_needed(r->record.size()); !rr) {
+                io_dead = true;
+                io_err = rr.error();
+                fail(r, io_err);
+                continue;
+            }
+        }
+        const std::uint64_t ord = keydir_->alloc_ord();
+        r->rec.ord = ord;
+        codec::patch_data_record_ord(r->record, ord);
+        combine.insert(combine.end(), r->record.begin(), r->record.end());
+        sub.push_back(r);
+    }
+    if (!io_dead) (void)flush_sub();
+
+    finish_all();
+}
+
 std::expected<std::span<const float>, CaskFault>
 Cask::prepare_vector(std::span<const float> input,
                      std::vector<float>& norm_buf) const {
@@ -1349,43 +1569,27 @@ Cask::put(std::span<const std::byte> key,
     codec::encode_data_record(record_buf, format::RecordType::kDoc, tstamp,
                               /*ord 占位*/ 0, key, encoded);
 
-    std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
-    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
-
-    if (auto r = roll_active_if_needed(record_buf.size()); !r) return std::unexpected(r.error());
-
-    // M5.1 task 2 关键 race：并发 merger 可能已经把 keydir.biggest_file_id
-    // 推过了我们的 active_file_id_。如果直接写，keydir 的 merge-race 检测
-    // (file_id < biggest_file_id_) 会返回 kAlreadyExists，put 就被静默丢了。
-    // 提前主动 roll 一次保证 active_file_id_ >= biggest，避免 silent drop。
-    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
-        if (auto r = roll_active(); !r) return std::unexpected(r.error());
-    }
-
-    const std::uint64_t ord = keydir_->alloc_ord();
-    OrdSkipGuard og(this, ord);  // S13-F2: 失败路径补 Skip 防 reorder stall
-
-    auto persisted = write_and_keydir(key, record_buf, tstamp, ord);
+    // S29-7:组提交——入队 + leader/follower(闭锁检查/roll/merge-race/
+    // alloc_ord/pwrite/hint/keydir/组提交计数全部 leader 侧,见
+    // process_gc_batch_locked)。字节仍在返回前持久(仅合并 syscall)。
+    GcRequest req;
+    req.key = key;
+    req.record = record_buf;
+    req.tstamp = tstamp;
+    auto persisted = submit_group_commit(req);
     if (!persisted) return std::unexpected(persisted.error());
-    // S13-F2: 成功 ⇒ ord 已有归宿——非重试路径由下面的 Add 覆盖
-    // （persisted->ord == ord），重试路径由 write_and_keydir 内部 Skip 覆盖。
-    og.disarm();
-    // H1（s13-review §P1）：索引提交移出 write_mu_ 临界区——组提交留在
-    // 锁内（不做 relock，规避 relock 后 active 已被并发写者 roll 的世界
-    // 变化），Add 在释锁后提交：队列背压只阻塞本写者，不再冻结全部写路径。
-    // 数据此刻已持久化（pwrite + keydir），reorder buffer 按 ord 乱序
-    // apply，到达序无关。gc 失败也先提交 Add——ord 必须被真任务覆盖，
-    // 与旧序（先 submit 后 group_commit）的对外语义一致。
+
+    // H1(不变):索引提交在锁外——leader 已释放 write_mu_,队列背压只
+    // 阻塞本写者。ord 已由 Add 覆盖(失败路径 leader 补 Skip)。
     const PersistedRecord rec = *persisted;
-    auto gc = maybe_group_commit();
-    wlk.unlock();
     submit_index_task(IndexTask::make(
         IndexOp::Add, bytes_to_view(key), rec.ord,
         std::string_view(reinterpret_cast<const char*>(value.data()),
                          value.size()),
         rec.file_id, rec.offset, rec.total_size, tstamp, 0));
     maybe_submit_auto_checkpoint();  // S14-1：roll 封口的异步 ckpt（锁外）
-    if (!gc) return std::unexpected(gc.error());
+    // 旧语义:组提交 fsync 失败 → Add 照提、error 照返。
+    if (req.post_err) return std::unexpected(*req.post_err);
     return {};
 }
 
@@ -1728,29 +1932,16 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     codec::encode_data_record(record_buf, format::RecordType::kDoc, tstamp,
                               /*ord 占位*/ 0, key, encoded);
 
-    std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
-    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
-
-    if (auto r = roll_active_if_needed(record_buf.size()); !r) {
-        return std::unexpected(r.error());
-    }
-    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
-        if (auto r = roll_active(); !r) return std::unexpected(r.error());
-    }
-
-    const std::uint64_t ord = keydir_->alloc_ord();
-    OrdSkipGuard og(this, ord);  // S13-F2: 失败路径补 Skip 防 reorder stall
-
-    auto persisted = write_and_keydir(key, record_buf, tstamp, ord);
+    // S29-7:组提交(同 put——leader 侧统一处理,见 process_gc_batch_locked)。
+    GcRequest req;
+    req.key = key;
+    req.record = record_buf;
+    req.tstamp = tstamp;
+    auto persisted = submit_group_commit(req);
     if (!persisted) return std::unexpected(persisted.error());
-    // S13-F2: 成功 ⇒ ord 已有归宿（同 put：Add 或内部 Skip）。
-    og.disarm();
-    // H1：组提交留在锁内，任务构造（fields 打包、vec 移交、meta 拷贝）与
-    // 提交移出临界区（同 put）。所需数据（doc/persisted/vec_norm）均为
-    // caller 参数或函数局部，锁外访问安全。
+
+    // H1(不变):任务构造(fields 打包、vec 移交、meta 拷贝)与提交在锁外。
     const PersistedRecord rec = *persisted;
-    auto gc = maybe_group_commit();
-    wlk.unlock();
     auto task = IndexTask::make(
         IndexOp::Add, bytes_to_view(key), rec.ord,
         std::string_view(reinterpret_cast<const char*>(doc.text.data()),
@@ -1773,7 +1964,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     task.meta.assign(doc.meta.begin(), doc.meta.end());
     submit_index_task(std::move(task));
     maybe_submit_auto_checkpoint();  // S14-1（锁外）
-    if (!gc) return std::unexpected(gc.error());
+    if (req.post_err) return std::unexpected(*req.post_err);  // 旧组提交语义
     return {};
 }
 

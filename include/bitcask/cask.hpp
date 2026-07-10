@@ -33,6 +33,7 @@
 #include <functional>
 #include <memory>
 #include <shared_mutex>
+#include <condition_variable>  // S29-7:组提交 follower 等待
 #include <mutex>
 #include <optional>
 #include <span>
@@ -1118,6 +1119,45 @@ public:
     write_and_keydir(std::span<const std::byte> key,
                      std::span<std::byte> record,
                      std::uint32_t tstamp, std::uint64_t ord);
+
+    // ---- S29-7:put 写路径组提交(flat-combining leader-follower) ----
+    //
+    // 病根:write_mu_ 短临界区 + 高争用 = mutex collapse(1→2 线程即
+    // 902k→175k ops/s)。方案:并发 put 把「锁外预编码的 record + 结果槽」
+    // 入队;拿到 write_mu_ 者为 leader,按**队列序**整批处理——逐条
+    // alloc_ord + patch + 累积,一次 pwrite 落盘整批(合并 syscall,字节仍
+    // 在各 caller 返回前持久 → [WAL data file = immediate durable] 语义
+    // 不变),再逐条 hint/keydir/收尾;follower 只在自己的结果槽上等
+    // (gc_cv_,100µs 超时兜底自转 leader——避免给所有 write_mu_ 释放点
+    // 加通知)。**队列序 == ord 序 == 文件序**(恢复硬不变量)由「leader
+    // 独占 write_mu_ + 按队列序 alloc_ord + 顺序追加」保证。
+    // remove/put_batch/merge 照旧直接拿 write_mu_,与批处理天然互斥。
+    struct GcRequest {
+        // 输入(caller 线程栈/thread_local 缓冲;等待期间稳定)
+        std::span<const std::byte> key;
+        std::span<std::byte>       record;  // 预编码(占位 ord),leader patch
+        std::uint32_t              tstamp = 0;
+        // 结果:done 为发布点(原子,acquire/release)——follower 自旋
+        // 读免锁;其余字段 leader 在 done=true 前独占写,follower 在
+        // done=true 后独占读,无并发。
+        std::atomic<bool> done{false};
+        bool ok   = false;
+        CaskFault err{};
+        // 数据已持久但组提交 fsync 失败:沿旧语义 Add 照提、error 照返。
+        std::optional<CaskFault> post_err;
+        PersistedRecord rec{};
+    };
+    std::mutex              gc_mu_;      // 护 gc_queue_ 与各请求 done/结果
+    std::condition_variable gc_cv_;
+    std::vector<GcRequest*> gc_queue_;
+
+    // 入队 + leader/follower 循环;返回本请求最终结果(post_err 见 GcRequest)。
+    [[nodiscard]] std::expected<PersistedRecord, CaskFault>
+    submit_group_commit(GcRequest& req);
+    // 前置:持 write_mu_。leader 循环 re-drain 队列直到空(批随争用增长)。
+    void process_gc_batch_locked();
+    // 前置:持 write_mu_。处理一轮(单次 drain 的批)。
+    void process_one_gc_round_locked();
 
     // 向量校验 + 可选 L2 归一化。norm_buf 仅在 cosine 指标时填充；
     // 非 cosine 返回的 span 直接指向 input（零拷贝）。
