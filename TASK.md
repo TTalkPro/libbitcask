@@ -2888,8 +2888,9 @@ W4 ✅（parallel_scan 并行全表扫描）。
 - [x] **S21-M7 fold/scan key 快照扁平化** — **已完成（S24）**，见下方 S24 段。
 - [x] **S21-M9 ensure_vocab 增量化** — **已完成（S24，两层视图半）**；view 化
   消双份常驻（TBB 节点稳定性验证）仍挂账，见下方 S24 段。
-- [ ] **S21-M10 ord_field_lens_ 单字段文档跳过登记**（~80-100B/文档，删除
-  统计语义需对拍测试）。
+- [~] **S21-M10 ord_field_lens_ 单字段文档跳过登记** — **已过时（2026-07-10）**：
+  `ord_field_lens_` 随 S27-3 步骤 3（fields_ 退役,段集唯一真相源）整体删除,
+  字段统计已段内自含,本项无实体可改。
 - [x] **S21-A1 hint record 格式 vbyte 化** — **已完成（S23，实现为 gap 差分而非纯推导）**，见下方 S23 段。
 - [ ] **S21-A6 sealed-mmap 可信读跳 CRC**（opt-in，先 bench 定量）。
 - [x] **S21-B2 inverted_wal 退役** — **用户拍板删除，已完成（S22，2026-07-06）**，见下方 S22 段。
@@ -3134,9 +3135,8 @@ W4 ✅（parallel_scan 并行全表扫描）。
     无片段」，行为不变；大 V 下省一次整文档 memcpy + 分配。
 - [x] **S26-3b `job.fields.reserve`** — 已完成（2026-07-09，`text_plugin.cpp:179`）· `src/search/text_plugin.cpp`
   - `map_analyze` 循环前 `job.fields.reserve(fields.size())`，免 vector 逐字段扩容。
-- [ ] **S26-3c（待办，未纳本批）`ord_field_lens_` 结构** · `text_plugin.hpp:368`
-  - 按 ord 单调递增的 `unordered_map<uint64_t, vector<...>>`，随 live doc 线性堆积（on_delete
-    字段精确扣减依赖）。改扁平结构/分段是内存优化，但触删除记账，风险较高，另批处理。
+- [~] **S26-3c `ord_field_lens_` 结构** — **已过时（2026-07-10）**：结构随
+  S27-3 步骤 3 退役删除（同 S21-M10 注），线性堆积问题连根消失。
 
 ### 验证
 - [x] `search_layer_test` 新增 `CatchAllDisabled`：`index_catch_all=false` + 多字段写入 →
