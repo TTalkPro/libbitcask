@@ -616,6 +616,9 @@ TextPlugin::search_text(std::string_view query, std::size_t k,
             for (const auto& h : hits) {
                 results.push_back({h.ord, static_cast<float>(h.score)});
             }
+            // S29-5 评估后保留：非冗余排序——multi_segment_search 返回并列
+            // 以 key 升序，此处重排为 ord 降序，对齐单索引路径（score_bow_topk
+            // 堆序 → 并列 ord 降序）与缓存语义；≤k_req 个元素，成本可忽略。
             std::sort(results.begin(), results.end(),
                       [](const bm25::SearchResult& a,
                          const bm25::SearchResult& b) {

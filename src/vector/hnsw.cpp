@@ -778,9 +778,15 @@ void HnswIndex::select_neighbors(
     // Algorithm 4 简化版:cands 按 dist 升序;候选与已选集逐一比较,
     // 离 query 更近于离任何已选者才保留——分散方向,聚簇数据下保召回。
     if (cands.size() <= m) return;
-    std::vector<std::pair<float, std::uint32_t>> picked;
+    // S29-3:thread_local 复用(对齐本文件 t_visited/pool/tl_cands_buf 模式)。
+    // 每插入调用 ~10-18 次(自身选边 + 溢出邻居收缩),原每次 2 个 vector
+    // 堆分配是插入路径最后的分配热点。尾部 swap 让两个缓冲轮换复用。
+    // 单写者协议(insert 断言)保证无重入。
+    static thread_local std::vector<std::pair<float, std::uint32_t>> picked;
+    picked.clear();
     picked.reserve(m);
-    std::vector<const float*> picked_vecs;  // D6:缓存 vec_of，免内层循环冗余取指。
+    static thread_local std::vector<const float*> picked_vecs;  // D6:缓存 vec_of，免内层循环冗余取指。
+    picked_vecs.clear();
     picked_vecs.reserve(m);
     for (const auto& [d, id] : cands) {
         if (picked.size() >= m) break;
@@ -808,7 +814,7 @@ void HnswIndex::select_neighbors(
             }
         }
     }
-    cands = std::move(picked);
+    std::swap(cands, picked);  // S29-3:swap 而非 move,旧缓冲留池内轮换。
 }
 
 // P5:int8-only 版 select_neighbors。与 f32 版同启发式(Algorithm 4),
@@ -816,7 +822,9 @@ void HnswIndex::select_neighbors(
 void HnswIndex::select_neighbors_int8(
     std::vector<std::pair<float, std::uint32_t>>& cands, std::uint32_t m) const {
     if (cands.size() <= m) return;
-    std::vector<std::pair<float, std::uint32_t>> picked;
+    // S29-3:同 select_neighbors,thread_local 复用。
+    static thread_local std::vector<std::pair<float, std::uint32_t>> picked;
+    picked.clear();
     picked.reserve(m);
     for (const auto& [d, id] : cands) {
         if (picked.size() >= m) break;
@@ -839,7 +847,7 @@ void HnswIndex::select_neighbors_int8(
             }
         }
     }
-    cands = std::move(picked);
+    std::swap(cands, picked);  // S29-3:swap 而非 move,旧缓冲留池内轮换。
 }
 
 void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
