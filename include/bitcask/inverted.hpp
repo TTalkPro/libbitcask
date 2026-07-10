@@ -299,11 +299,14 @@ struct SearchResult {
 // nullptr（search 默认）= 用本索引本地统计——**现行为，零变更**。
 // 分段查询时宿主先跨段聚合出全局 N/sum_dl + per-term 全局 df，令每段用**同一
 // idf/avgdl** 打分（对标 ES 段级，见 doc/segment-index-design-zh.md §4）。
-// df 用「跨段 doc_freq 求和」预建好的 map；某 term 缺失 → 回退本段本地 live_df。
+// df 用「跨段 doc_freq 求和」预建好的列表；某 term 缺失 → 回退本段本地 live_df。
+// S29-5：df 从 unordered_map 改扁平 pair 列表——查询词个位数，消费侧线性
+// 扫描优于 hash find，生产侧免每查询 map 节点分配（可 thread_local 槽位
+// 复用）。契约：term 无重复（重复时取首个匹配）。
 struct ExtStats {
     std::uint64_t N      = 0;   // 全局文档数
     std::uint64_t sum_dl = 0;   // 全局 Σdoc_len（→ 全局 avgdl）
-    const std::unordered_map<std::string, std::uint64_t>* df = nullptr;  // term→全局 df
+    const std::vector<std::pair<std::string, std::uint64_t>>* df = nullptr;  // term→全局 df
 };
 
 // BM25 评分解释的单 term 分项（S8.8）。
@@ -543,8 +546,11 @@ private:
     std::atomic<std::uint64_t> max_indexed_ord_{static_cast<std::uint64_t>(-1)};
 
     // Block-Max WAND 算法。S27-2：ext 非空走 G-on-the-fly（同 search）。
+    // S29-1：pls 与 query_terms 按下标平行（未命中词为 nullptr），由 search()
+    // 单趟 find 预取——本函数不再触碰桶锁。
     auto search_wand(
         const std::vector<std::string>& query_terms,
+        const std::vector<std::shared_ptr<const PostingList>>& pls,
         std::size_t k,
         const LiveChecker& live_checker,
         const Bm25Params& params,

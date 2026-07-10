@@ -18,7 +18,7 @@
 #include <functional>
 #include <span>
 #include <string>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace bitcask::search {
@@ -44,13 +44,22 @@ struct SegmentView {
     if (terms.empty() || k == 0) return {};
 
     // ---- 阶段 1：G-on-the-fly 全局统计 ----
+    // S29-5：global_df 扁平化 + thread_local 槽位复用（原每查询新建
+    // unordered_map + 每 term 一个节点分配）。resize 到本查询词数（收缩即
+    // 截掉上次查询的残留槽，防止消费侧误匹配），槽内 string assign 复用
+    // 容量——稳态零分配。
     bm25::ExtStats ext;
-    std::unordered_map<std::string, std::uint64_t> global_df;
-    for (const auto& t : terms) global_df.emplace(t, 0);
+    static thread_local std::vector<std::pair<std::string, std::uint64_t>>
+        global_df;
+    global_df.resize(terms.size());
+    for (std::size_t i = 0; i < terms.size(); ++i) {
+        global_df[i].first.assign(terms[i]);
+        global_df[i].second = 0;
+    }
     for (const auto& s : segs) {
         ext.N += s.inv->live_doc_count();
         ext.sum_dl += s.inv->sum_doc_len();
-        for (const auto& t : terms) global_df[t] += s.inv->doc_freq(t);
+        for (auto& [t, df] : global_df) df += s.inv->doc_freq(t);
     }
     ext.df = &global_df;
 

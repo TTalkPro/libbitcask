@@ -93,7 +93,7 @@ std::vector<SearchResult> score_bow_topk(
     std::span<const ScoredTerm> tps, std::size_t k,
     std::uint64_t N, std::uint64_t sum_dl,
     const Bm25Params& params, const LiveChecker& live_checker,
-    const std::unordered_map<std::string, std::uint64_t>* global_df = nullptr) {
+    const std::vector<std::pair<std::string, std::uint64_t>>* global_df = nullptr) {  // S29-5：扁平化
     // S27-2：global_df 非空 → idf 用全局 df（G-on-the-fly）；N/sum_dl 亦已由
     // caller 传全局值。本地 live_df 仍用于跳空/reserve。
     const double avgdl =
@@ -132,11 +132,14 @@ std::vector<SearchResult> score_bow_topk(
             if (live_df == 0) continue;
 
             // S27-2：idf 的 df——全局注入优先，回退本段 live_df。
+            // S29-5：扁平列表线性扫（词数个位数，快于 hash find）。
             double df_idf = static_cast<double>(live_df);
             if (global_df) {
-                auto it = global_df->find(tps[ti].term);
-                if (it != global_df->end() && it->second > 0) {
-                    df_idf = static_cast<double>(it->second);
+                for (const auto& [t, v] : *global_df) {
+                    if (t == tps[ti].term) {
+                        if (v > 0) df_idf = static_cast<double>(v);
+                        break;
+                    }
                 }
             }
             auto idf = std::log(1.0 + (static_cast<double>(N) - df_idf + 0.5) / (df_idf + 0.5));
@@ -419,12 +422,24 @@ void InvertedIndex::remove_doc(
 
 // ---- 查询 ----
 
+namespace {
+// S29-4：string_view → PostingMap key 的查找缓冲。tbb find 只收
+// const std::string&，每调用 std::string(term) 在跨段×字段×term 聚合循环
+// （multi_field_segment_search）下是纯增量堆分配——thread_local 复用容量，
+// 稳态零分配。
+const std::string& tls_term_key(std::string_view term) {
+    static thread_local std::string buf;
+    buf.assign(term);
+    return buf;
+}
+}  // namespace
+
 // S27-2：term 的 doc frequency（posting list 长度；含未 merge 的已删，
 // Lucene-style df，§4 接受该近似）。宿主跨段求和得全局 df。
 std::uint64_t InvertedIndex::doc_freq(std::string_view term) const {
     auto& shard = shard_for(term);
     PostingMap::const_accessor acc;
-    if (shard.inverted.find(acc, std::string(term))) {
+    if (shard.inverted.find(acc, tls_term_key(term))) {
         return static_cast<std::uint64_t>(acc->second->size());
     }
     return 0;
@@ -438,24 +453,35 @@ auto InvertedIndex::search(
     const ExtStats* ext) const -> std::vector<SearchResult> {
     const Bm25Params& params = params_override ? *params_override : params_;
     // P1：accessor 下只拷扁平快照（ords/tfs），不再深拷整个 PostingList。
-    // WAND 路由判定只需 posting 总量——在 accessor 下读 items.size() 即可，
-    // 不必先 snapshot_flat（原实现对每 term 拷 ords/tfs/blocks 三个 vector，
-    // 走 WAND 时整组作废、search_wand 再快照一遍，是触发条件最大的查询上的
-    // 双倍拷贝）。标量路径才在确定后快照。
+    // S29-1：单趟 find——accessor 下拷出 shared_ptr（P2-min CoW 协议：读者
+    // 持引用 → 写者见 use_count>1 时克隆替换，被引用的 PostingList 对本查询
+    // 期间 immutable，与 phrase/near 读者同模式）。WAND 路由判定读 size()、
+    // 标量/WAND 快照均复用该指针 → 每词桶锁 RMW 从 2 次降到 1 次（热词并发
+    // 查询下桶锁 cacheline 弹跳是 BOW 扩展性主瓶颈）。查询结束必须释放引用
+    // （guard 兜住所有出口），否则旧版本被长期钉住且迫使写者恒克隆。
+    static thread_local std::vector<std::shared_ptr<const PostingList>> pls_pool;
+    pls_pool.clear();
+    struct ReleaseRefs {
+        std::vector<std::shared_ptr<const PostingList>>& v;
+        ~ReleaseRefs() { v.clear(); }
+    } release_refs{pls_pool};
     std::size_t total_postings = 0;
     for (auto& term : query_terms) {
         auto& shard = shard_for(term);
         PostingMap::const_accessor acc;
         if (shard.inverted.find(acc, term)) {
-            total_postings += acc->second->size();
+            pls_pool.push_back(acc->second);
+            total_postings += pls_pool.back()->size();
+        } else {
+            pls_pool.push_back(nullptr);
         }
     }
     if (total_postings == 0) return {};
     if (total_postings >= kWandThreshold) {
-        return search_wand(query_terms, k, live_checker, params, ext);
+        return search_wand(query_terms, pls_pool, k, live_checker, params, ext);
     }
 
-    // 标量路径：现在才快照。
+    // 标量路径：现在才快照（从已持有的指针，免第二趟 find）。
     // S23-M3：per-term 快照 scratch thread_local 池——原每查询每 term 新建
     // ScoredTerm（fp.ords/tfs/blocks 3 次分配），改按下标复用内层容量，
     // 稳态零分配。池长只增（查询词数级，个位数），超出本查询词数的池尾
@@ -463,14 +489,12 @@ auto InvertedIndex::search(
     using TermPostings = ScoredTerm;  // 共用条目（term + 扁平快照）
     static thread_local std::vector<TermPostings> tps_pool;
     std::size_t n_tps = 0;
-    for (auto& term : query_terms) {
-        auto& shard = shard_for(term);
-        PostingMap::const_accessor acc;
-        if (shard.inverted.find(acc, term)) {
+    for (std::size_t i = 0; i < query_terms.size(); ++i) {
+        if (const auto& pl = pls_pool[i]) {
             if (n_tps == tps_pool.size()) tps_pool.emplace_back();
             TermPostings& tp = tps_pool[n_tps];
-            tp.term.assign(term);
-            acc->second->snapshot_flat(tp.fp);
+            tp.term.assign(query_terms[i]);
+            pl->snapshot_flat(tp.fp);
             ++n_tps;
         }
     }
@@ -552,6 +576,7 @@ auto InvertedIndex::explain(
 
 auto InvertedIndex::search_wand(
     const std::vector<std::string>& query_terms,
+    const std::vector<std::shared_ptr<const PostingList>>& pls,
     std::size_t k,
     const LiveChecker& live_checker,
     const Bm25Params& params,
@@ -581,14 +606,13 @@ auto InvertedIndex::search_wand(
     // 由下方 resize+fill/assign 整段覆盖。
     static thread_local std::vector<TermPostings> tps_pool;
     std::size_t n_tps = 0;
-    for (auto& term : query_terms) {
-        auto& shard = shard_for(term);
-        PostingMap::const_accessor acc;
-        if (shard.inverted.find(acc, term)) {
+    // S29-1：从 search() 单趟 find 已持有的指针快照，免第二趟桶锁。
+    for (std::size_t i = 0; i < query_terms.size(); ++i) {
+        if (const auto& pl = pls[i]) {
             if (n_tps == tps_pool.size()) tps_pool.emplace_back();
             TermPostings& tp = tps_pool[n_tps];
-            tp.term.assign(term);
-            acc->second->snapshot_flat(tp.fp);
+            tp.term.assign(query_terms[i]);
+            pl->snapshot_flat(tp.fp);
             tp.dls_all = false;
             tp.cursor = 0;
             tp.idf = 0.0f;
@@ -638,8 +662,12 @@ auto InvertedIndex::search_wand(
         // idf 一致地用于块上界与实际打分 → WAND 剪枝仍正确。
         double df_idf = static_cast<double>(live_df);
         if (ext && ext->df) {
-            auto it = ext->df->find(tp.term);
-            if (it != ext->df->end() && it->second > 0) df_idf = static_cast<double>(it->second);
+            for (const auto& [t, v] : *ext->df) {  // S29-5：扁平列表线性扫
+                if (t == tp.term) {
+                    if (v > 0) df_idf = static_cast<double>(v);
+                    break;
+                }
+            }
         }
         tp.idf = static_cast<float>(std::log(1.0 + (static_cast<double>(N) - df_idf + 0.5) /
                                              (df_idf + 0.5)));
@@ -1922,14 +1950,14 @@ auto InvertedIndex::avg_doc_len() const -> double {
 auto InvertedIndex::df(std::string_view term) const -> std::size_t {
     auto& shard = shard_for(term);
     PostingMap::const_accessor acc;
-    if (!shard.inverted.find(acc, std::string(term))) return 0;
+    if (!shard.inverted.find(acc, tls_term_key(term))) return 0;  // S29-4
     return acc->second->size();
 }
 
 auto InvertedIndex::df_live(std::string_view term, const LiveChecker& live_checker) const -> std::size_t {
     auto& shard = shard_for(term);
     PostingMap::const_accessor acc;
-    if (!shard.inverted.find(acc, std::string(term))) return 0;
+    if (!shard.inverted.find(acc, tls_term_key(term))) return 0;  // S29-4
     std::size_t count = 0;
     for (auto ord : acc->second->ords) {
         if (live_checker.is_live(ord)) ++count;

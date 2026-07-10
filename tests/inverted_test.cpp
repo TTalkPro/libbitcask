@@ -1777,8 +1777,8 @@ TEST(InvertedIndex, ExtStatsSelfEquivalenceScalar) {
     ExtStats ext;
     ext.N = idx.live_doc_count();
     ext.sum_dl = idx.sum_doc_len();
-    std::unordered_map<std::string, std::uint64_t> df;
-    for (auto& t : terms) df[t] = idx.doc_freq(t);
+    std::vector<std::pair<std::string, std::uint64_t>> df;  // S29-5：扁平化
+    for (auto& t : terms) df.emplace_back(t, idx.doc_freq(t));
     ext.df = &df;
     auto inj = idx.search(terms, 10, checker, nullptr, &ext);
 
@@ -1809,8 +1809,8 @@ TEST(InvertedIndex, ExtStatsSelfEquivalenceWand) {
     ExtStats ext;
     ext.N = idx.live_doc_count();
     ext.sum_dl = idx.sum_doc_len();
-    std::unordered_map<std::string, std::uint64_t> df;
-    df["common"] = idx.doc_freq("common");
+    std::vector<std::pair<std::string, std::uint64_t>> df;  // S29-5：扁平化
+    df.emplace_back("common", idx.doc_freq("common"));
     ext.df = &df;
     auto inj = idx.search(terms, 20, checker, nullptr, &ext);
 
@@ -1838,8 +1838,8 @@ TEST(InvertedIndex, ExtStatsInjectionAffectsScore) {
     ExtStats ext;
     ext.N = idx.live_doc_count();
     ext.sum_dl = idx.sum_doc_len();
-    std::unordered_map<std::string, std::uint64_t> df;
-    df["apple"] = 1;
+    std::vector<std::pair<std::string, std::uint64_t>> df;  // S29-5：扁平化
+    df.emplace_back("apple", 1);
     ext.df = &df;
     auto inj = idx.search(terms, 10, checker, nullptr, &ext);
 

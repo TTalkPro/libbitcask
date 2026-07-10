@@ -470,17 +470,20 @@ private:
 
     // 阶段 1：跨段跨字段聚合每字段的 G-on-the-fly 全局统计。
     // per-field：每字段独立一份 N / sum_dl / per-term df。
+    // S29-5：per-term df 从 unordered_map 改扁平 pair 列表（ExtStats::df
+    // 类型变更，词数个位数场景线性扫描 + 免节点分配）。
     std::unordered_map<std::string, bm25::ExtStats,
                        StringHash, std::equal_to<>> per_field_ext;
     std::unordered_map<std::string,
-                       std::unordered_map<std::string, std::uint64_t>,
+                       std::vector<std::pair<std::string, std::uint64_t>>,
                        StringHash, std::equal_to<>> per_field_df;
     for (const auto& [fname, terms] : field_terms) {
         if (terms.empty()) continue;
         auto& ext = per_field_ext[fname];
         auto& dfm = per_field_df[fname];
         ext.df = nullptr;  // 阶段 2 才回填
-        for (const auto& t : terms) dfm.emplace(t, 0);
+        dfm.reserve(terms.size());
+        for (const auto& t : terms) dfm.emplace_back(t, 0);
     }
 
     for (const auto& s : segs) {
