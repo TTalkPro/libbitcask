@@ -3435,9 +3435,23 @@ W4 ✅（parallel_scan 并行全表扫描）。
       `BM_Cask_Put_*`（128B 值）持平——预期内，小值时编码仅占临界区 ~2%,
       collapse 主因是锁交接；铺垫收益随值增大（O(V) 出锁），且
       `write_encoded`/`patch_data_record_ord` 即 group-commit leader 所需原语。
-  - **主体（待做）**：leader-follower 组提交本身。注意 leader 设计必须保持
-    「入队序 == ord 序 == 文件序」（在入队点原子分配 ord，或 leader 统一分配后
-    patch——铺垫的 patch 原语已就位）。
+  - [x] **主体已完成（2026-07-10）：flat-combining 组提交**。`GcRequest` 队列 +
+    `submit_group_commit`（入队 → try_lock 成 leader / 自旋 4096 pause →
+    cv 100µs 兜底退化）+ `process_gc_batch_locked`（leader **循环 re-drain 至
+    队列空**——批随争用自然增长）：按队列序 alloc_ord + patch + 拼接,每段
+    **一次 pwrite**,再逐条 hint/keydir/组提交计数;跨 max_file_size 分段
+    flush+roll;失败请求补 Skip;merge-race 单条走 write_and_keydir 重写;
+    fsync 失败沿旧语义(post_err:Add 照提 error 照返)。
+    「入队序 == ord 序 == 文件序」由 leader 独占 write_mu_ + 队列序分配保证。
+  - **实测（BM_Cask_Put_Concurrent,128B tmpfs）**：2 线程 175k→358k(**2.0×**)、
+    4 线程 107k→244k(**2.3×**,聚合 428k→976k/s,已贴近 leader 单流处理上限)、
+    8 线程 48.6k→71.6k(1.5×,6 核超订阅自旋有代价);单线程 863k(-1.3%,噪声级)。
+  - **调优教训（两轮实测迭代）**：① leader 必须循环 re-drain——只 drain 一次则
+    处理期间到达的请求全部错过,批恒 ≈1,组提交名存实亡(首版仅 +10%)；
+    ② follower 必须先自旋再睡——cv futex 睡/醒一轮 ~10-20µs,直接睡比基线还慢
+    3×(次版实测)。done 为原子发布点,自旋免锁读。
+  - **验收**：clang 560/560；TSan cask/put/merge/close/keydir 130/130；
+    **ASan 全量 560/560**；build-rel 构建通过。
   - **禁区**：任何把 put 的 data pwrite 延迟到返回之后的方案（破坏 WAL 语义）；
     `write_buffered`/`batch_buf_` 明确禁用于单条 put（`data_file.hpp` ⑪ 否决记录）。
   - 备选零代码方案：按 key 分片多 Cask 实例（设计文档既有结论，`cask.hpp:13-14`），
@@ -3519,9 +3533,11 @@ W4 ✅（parallel_scan 并行全表扫描）。
 2. ~~S29-9 + S29-8~~ **已完成 2026-07-10**（MapSpeedup/8 +30% 平台突破、MultiLib +14~28%、
    AnalyzeNgramCjk -10%；TSan 并发子集 65/65。注意 S29-8 修正原估：双重解码非主瓶颈，
    CJK 再提速需动 inert 查询/聚合结构。第七梯队 P3 的 `nfkc_fold` API 关联仍在）
-3. S29-6 KeyDir seqlock 先行 → 倒排 epoch 二期（BOW 扩展性根治在此，S29-1 只减半 RMW）
-4. S29-7 group commit（先做 encode 出锁铺垫）
-5. S29-10 / S29-11 按需（CRC 流式场景是否真实存在、HNSW 召回预算)
+3. ~~S29-6 全四相~~ **已完成 2026-07-10**（SeqShardTable + epoch-RCU；Get 8 线程 +43% 平坦扩展）
+4. ~~S29-7 铺垫+主体~~ **已完成 2026-07-10**（flat-combining 组提交；Put 并发 2-2.3×,聚合 976k/s）
+5. ~~S29-10~~ **已完成**；S29-11 按需（HNSW 召回预算）
+6. **下一步候选**：倒排桶锁二期（复用 SeqShardTable + epoch 注册表,BOW 查询扩展性)、
+   S27-3 B2b/D/E、S27-4 DWPT、S29-11、S29-T（TSan 既存失败,低优先）
 
 **与 S27 的关系**：S29 结构性各项与 S27-3 剩余（B2b/D/E recovery 重写）独立可并行；
 S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同属索引吞吐轴,
