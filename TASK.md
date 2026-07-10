@@ -3324,7 +3324,27 @@ W4 ✅（parallel_scan 并行全表扫描）。
       (回收等效,段数不收敛);② legacy 段化迁移(老 kBm25Default/kBm25Fields
       ckpt → 初始段)——现行为:老格式不认 → 退全量 fold 重建段集
       (安全慢,升级一次性成本,设计 §5 既定回退)。
-- [ ] **S27-4 并行 builder（DWPT）**：多段内单线程 builder，文档分派。**吞吐红利落地。**依赖 S27-3 收官。
+- [ ] **S27-4 并行 builder（DWPT）**（**P1 完成** 2026-07-10）：多段内单线程 builder,
+  文档分派。**吞吐红利落地。**实现设计:
+  [`docs/design/s27-4-dwpt-design.md`](docs/design/s27-4-dwpt-design.md)
+  （reducer 退化轻路由 + B 个 builder 线程各持 building 段;正确性核心 =
+  **LSN 守卫 upsert**——KeyLocation 带 ord 仲裁,任意分派/到达序安全;
+  可见性 refresh 语义 + drain_builders 屏障保 read-your-writes）。
+  - [x] **P1 已完成（2026-07-10）：LSN 守卫 upsert + KeyLocation 对象指针化**
+    （单 reducer 上行为等价落地）。KeyLocation → {shared_ptr<段对象>, docid,
+    ord, tomb}:① 段对象指针统一 building/sealed(封口后身份不变 →
+    **封口 O(map) 清扫消失**;shared_ptr 天然 pin,explain 直用);② put/delete
+    均按 ord 仲裁——乱序到达的旧版本跳过(P2 并行 builder 的正确性地基,
+    P1 全局序下为冗余保险);③ 删除改**墓碑保留**(erase 会让乱序旧 put
+    复活;重启随 rebuild_key_locations 消失);④ seg_dirty_/dead_dirty_
+    原子化(P2-proof)。
+    验收:clang 562/562;TSan 子集 180/180 + 生命周期压力 ×2;ASan 全量
+    562/562;rel 构建过。
+  - [ ] **P2**:BuilderPool(线程 + MPSC 队列 + drain)+ on_put/apply_text
+    派发 + 插件 drain 钩子接 Cask(flush_index/prepare_search);默认 B=1
+    串行等价。
+  - [ ] **P3**:B>1 开放 + 并发 builder 定向压力 + 三 sanitizer + 端到端
+    put_doc 吞吐 bench(对照单 reducer 基线)。
 
 ### 关联既有设计（勿重复造轮子）
 - [`ord-recycling-design-zh.md`](doc/ord-recycling-design-zh.md)：ord 三角色 / per-write 硬约束 /
