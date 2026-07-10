@@ -3376,11 +3376,25 @@ W4 ✅（parallel_scan 并行全表扫描）。
     连续 record，完成后逐条 apply keydir + 唤醒 waiter。**字节仍在返回前落盘，不违反
     [WAL data file = immediate durable] 语义**（只合并 syscall，非延迟持久化）。`put_batch`
     （`cask.cpp:1386`）已实现同思路可参考。
-  - 低风险铺垫（可单做）：encode 移出锁——`DataFile::write` 的成员 `write_buf_`
-    （`data_file.cpp:146`）改 caller 传入已编码 span，锁内只剩 reserve-offset + pwrite +
-    keydir。
+  - [x] **铺垫已完成（2026-07-10）：encode 移出锁**。审计发现硬不变量：**文件序 ==
+    ord 序**（恢复按 fold 序回放 + `add_doc`/HNSW ord 水位自门 ⇒ ord 必须锁内分配，
+    record 不能带真 ord 预编码）。方案：record 锁外用**占位 ord=0** 完整编码
+    （O(V) memcpy 出锁），锁内 `codec::patch_data_record_ord`（补 8 字节 + 一次
+    CRC 扫描）+ 新 API `DataFile::write_encoded`（纯 pwrite + 偏移推进）。
+    - 改动：`put`/`put_doc` 的校验/tstamp/向量归一化/字段 intern（自带
+      shared_mutex）/DocValue 编码/record 预编码全部前置锁外；`write_and_keydir`
+      改收可变 record span（重试路径 patch ord2 复用同 buffer）；put_batch
+      merge-race 重试点就地编码适配。附带修正：put_doc 的 roll `about` 从低估
+      （漏 vector/fields 段）变为 record 精确长度。
+    - 验收：双树 + ctest 555/555 + TSan cask/put/merge/crash 子集 117/117。
+      `BM_Cask_Put_*`（128B 值）持平——预期内，小值时编码仅占临界区 ~2%,
+      collapse 主因是锁交接；铺垫收益随值增大（O(V) 出锁），且
+      `write_encoded`/`patch_data_record_ord` 即 group-commit leader 所需原语。
+  - **主体（待做）**：leader-follower 组提交本身。注意 leader 设计必须保持
+    「入队序 == ord 序 == 文件序」（在入队点原子分配 ord，或 leader 统一分配后
+    patch——铺垫的 patch 原语已就位）。
   - **禁区**：任何把 put 的 data pwrite 延迟到返回之后的方案（破坏 WAL 语义）；
-    `write_buffered`/`batch_buf_` 明确禁用于单条 put（`data_file.hpp:101-103`）。
+    `write_buffered`/`batch_buf_` 明确禁用于单条 put（`data_file.hpp` ⑪ 否决记录）。
   - 备选零代码方案：按 key 分片多 Cask 实例（设计文档既有结论，`cask.hpp:13-14`），
     若业务可接受则优先。
 - [x] **S29-8 CJK 分词双重解码融合 + tf-only 免 positions** —— 已完成（2026-07-10）·
