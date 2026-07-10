@@ -704,3 +704,180 @@ TEST(TextPlugin, BuilderModeConcurrentQueryStress) {
     ASSERT_EQ(p.close(), plugin::PluginStatus::kOk);
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// S27-4 P3:B>1(每 builder 一个 building 段)。round-robin 使同 key 各版本
+// 落不同 builder/段,乱序 apply 由 LSN 守卫仲裁;查询归并 [段集 + B 个
+// building];ckpt 封口全部 builder 段。
+// ===========================================================================
+
+// 跨 builder 覆盖链:同 key 20 个版本轮转落 2 个 builder,drain 后恰好
+// 最新版本可见(旧版本无论 apply 先后均被 mark_dead / 守卫跳过)。
+TEST(TextPlugin, BuilderModeB2CrossBuilderOverwriteChain) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_b2_chain";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.builder_threads = 2;
+    text::TextPlugin p(cfg, idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
+
+    constexpr std::uint64_t kVersions = 20;
+    for (std::uint64_t ord = 0; ord < kVersions; ++ord) {
+        host_put_row(idx, "hotkey", ord);
+        plugin::DocView dv;
+        const std::string text = "version v" + std::to_string(ord) + " common";
+        dv.text = text;
+        plugin::PutEvent e;
+        e.ord = ord;
+        e.key = "hotkey";
+        e.doc = &dv;
+        e.loc = plugin::RecordLoc{1, ord * 100, 50};
+        e.tstamp = static_cast<std::uint32_t>(1000 + ord);
+        p.on_put(e, nullptr);
+    }
+    p.drain();
+
+    // 最新版本词可见,且 common 词只 1 hit(旧 19 版全死)。
+    auto rl = p.search_text("v" + std::to_string(kVersions - 1), 10);
+    ASSERT_TRUE(rl.has_value());
+    ASSERT_EQ(rl->size(), 1u);
+    EXPECT_EQ((*rl)[0].key, "hotkey");
+    EXPECT_EQ((*rl)[0].ord, kVersions - 1);
+    auto rc = p.search_text("common", 10);
+    ASSERT_TRUE(rc.has_value());
+    ASSERT_EQ(rc->size(), 1u);
+    EXPECT_EQ((*rc)[0].ord, kVersions - 1);
+    // 旧版本词不可见。
+    auto ro = p.search_text("v0", 10);
+    ASSERT_TRUE(ro.has_value());
+    EXPECT_TRUE(ro->empty());
+    ASSERT_EQ(p.close(), plugin::PluginStatus::kOk);
+    fs::remove_all(dir);
+}
+
+// B=2 flush round-trip:ckpt 封口**两个** builder 段 → 重开(B=0)全量可见。
+TEST(TextPlugin, BuilderModeB2FlushSealsAllBuilders) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_b2_rt";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.builder_threads = 2;
+    text::TextPlugin a(cfg, idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+
+    constexpr std::uint64_t kN = 10;  // round-robin → 两 builder 各 ~5
+    for (std::uint64_t ord = 0; ord < kN; ++ord) {
+        const std::string key = "k" + std::to_string(ord);
+        host_put_row(idx, key, ord);
+        plugin::DocView dv;
+        const std::string text = "delta wing " + std::to_string(ord);
+        dv.text = text;
+        plugin::PutEvent e;
+        e.ord = ord;
+        e.key = key;
+        e.doc = &dv;
+        e.loc = plugin::RecordLoc{1, ord * 100, 50};
+        e.tstamp = static_cast<std::uint32_t>(1000 + ord);
+        a.on_put(e, nullptr);
+    }
+    plugin::FlushRequest req;
+    req.watermark = kN;
+    auto fr = a.flush(req);
+    ASSERT_EQ(fr.status, plugin::PluginStatus::kOk);
+    EXPECT_EQ(fr.covered_ord, kN);
+    const auto st = a.chain_state();
+    ASSERT_EQ(a.close(), plugin::PluginStatus::kOk);
+
+    index::Index idx2;
+    for (std::uint64_t ord = 0; ord < kN; ++ord) {
+        host_put_row(idx2, "k" + std::to_string(ord), ord);
+    }
+    text::TextPlugin b(make_cfg(), idx2, idx2, idx2);
+    plugin::OpenContext c2;
+    c2.dir = dir_s;
+    c2.committed_base_watermark = st.base_gen;
+    c2.committed_chain_watermark = st.chain_wm;
+    c2.committed_chain_seq = st.next_seq - 1;
+    ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+    EXPECT_EQ(b.watermark(), kN);
+    auto r = b.search_text("delta", kN + 5);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), static_cast<std::size_t>(kN));
+    fs::remove_all(dir);
+}
+
+// B=4 并发压力:4 builder 并行 apply(4 段并发建)+ 覆盖 + 删除 + 2 查询
+// 线程不 drain 直查。终态计数逐点校验。
+TEST(TextPlugin, BuilderModeB4ConcurrentStress) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_b4_stress";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.builder_threads = 4;
+    text::TextPlugin p(cfg, idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
+
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> anomalies{0};
+    std::vector<std::thread> readers;
+    readers.reserve(2);
+    for (int t = 0; t < 2; ++t) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto r = p.search_text("mesh", 5);
+                if (!r.has_value()) anomalies.fetch_add(1);
+            }
+        });
+    }
+    // 每 key 两版本(ord, ord+kDocs):第二版应恒胜;ord%5==0 再删。
+    constexpr std::uint64_t kDocs = 1500;
+    for (std::uint64_t i = 0; i < kDocs; ++i) {
+        const std::string key = "m" + std::to_string(i);
+        for (int v = 0; v < 2; ++v) {
+            const std::uint64_t ord = i + (v ? kDocs : 0);
+            host_put_row(idx, key, ord);
+            plugin::DocView dv;
+            const std::string text =
+                (v ? "mesh new " : "mesh old ") + std::to_string(i);
+            dv.text = text;
+            plugin::PutEvent e;
+            e.ord = ord;
+            e.key = key;
+            e.doc = &dv;
+            e.loc = plugin::RecordLoc{1, ord * 100, 50};
+            e.tstamp = static_cast<std::uint32_t>(1000 + ord);
+            p.on_put(e, nullptr);
+        }
+        if (i % 5 == 0) p.on_delete(key, i + 2 * kDocs, i + kDocs);
+    }
+    p.drain();
+    stop.store(true);
+    for (auto& r : readers) r.join();
+    EXPECT_EQ(anomalies.load(), 0u);
+
+    constexpr std::uint64_t kDeleted = (kDocs + 4) / 5;
+    auto rn = p.search_text("new", kDocs + 10);
+    ASSERT_TRUE(rn.has_value());
+    EXPECT_EQ(rn->size(), kDocs - kDeleted);  // 新版本存活(除被删)
+    auto ro = p.search_text("old", kDocs + 10);
+    ASSERT_TRUE(ro.has_value());
+    EXPECT_TRUE(ro->empty());  // 旧版本全死
+    ASSERT_EQ(p.close(), plugin::PluginStatus::kOk);
+    fs::remove_all(dir);
+}

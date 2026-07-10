@@ -81,6 +81,12 @@ std::string_view TextPlugin::intern_field_name(std::string_view name) {
 
 void TextPlugin::apply_text(std::string_view key, std::uint64_t ord,
                             std::string_view text) {
+    apply_text_in(building_, key, ord, text);  // inline/历史路径:目标恒 building_
+}
+
+void TextPlugin::apply_text_in(BuildingSlot& slot, std::string_view key,
+                               std::uint64_t ord,
+                            std::string_view text) {
     (void)key;
     // docmap 脏位由 Index 自记账（宿主 put_doc/set_doc_len 内部置位）。
     // 默认域倒排仅在真有词项时标脏（向量-only 文档 text 为空，不碰 bm25）。
@@ -103,27 +109,19 @@ void TextPlugin::apply_text(std::string_view key, std::uint64_t ord,
     // 覆盖写先 mark_dead 旧 docid（段级 is_live 不知道宿主覆盖,B2a）。
     // 重放幂等:恢复重放 = 同 key 重加——rebuild_key_locations(步骤 4)
     // 使旧副本可定位,mark_dead 后恒一份 live,无需 ord 显式门。
-    auto bld = building_.load(std::memory_order_acquire);
+    auto bld = slot.load(std::memory_order_acquire);
     if (bld && !term_data.empty()) {
         seg_dirty_.store(true, std::memory_order_relaxed);
-        // S27-4 P1:LSN 守卫 upsert(任意到达序安全,设计 §2)。
-        KeyLocation prior{};
-        bool have_prior = false;
+        // S27-4 P1/P3:LSN 守卫 upsert(任意到达序安全,设计 §2)。早读仅作
+        // 跳过**优化**(已见更高版本则免 add);正确性全由下方终检承担。
         {
             std::shared_lock lk(key_loc_mu_);
             if (auto it = key_to_location_.find(std::string(key));
-                it != key_to_location_.end()) {
-                prior = it->second;
-                have_prior = true;
+                it != key_to_location_.end() && it->second.ord > ord) {
+                lk.unlock();
+                cache_.invalidate_terms(changed_terms);
+                return;  // 乱序到达的旧版本,不索引
             }
-        }
-        if (have_prior && prior.ord > ord) {
-            // 更新版本已在(乱序到达的旧 put)→ 本版本不索引。
-            cache_.invalidate_terms(changed_terms);
-            return;
-        }
-        if (have_prior && !prior.tomb && prior.seg) {
-            (void)prior.seg->mark_dead(prior.docid);
         }
         const TermPositionsMap* borrowed = &term_data;
         const search::SealedSegment::FieldInput fin{search::kDefaultField,
@@ -132,13 +130,29 @@ void TextPlugin::apply_text(std::string_view key, std::uint64_t ord,
             std::string(key), ord,
             std::span<const search::SealedSegment::FieldInput>(&fin, 1),
             doc_len);
+        // 终检登记 = 唯一 mark_dead 责任点(S27-4 P3):B>1 时「读 prior →
+        // 标死 prior → 登记」三步间隙可被并发 put/delete 插入——早标死会
+        // 漏掉间隙登记的中间版本,终检败者若不自标则成无人指向的幽灵。
+        // unique 锁内裁决:胜 → 捕获被顶替者锁外标死;败 → 自标刚 add 行。
+        KeyLocation displaced{};
+        bool lost = false;
         {
             std::unique_lock lk(key_loc_mu_);
             auto& e = key_to_location_[std::string(key)];
-            if (e.ord <= ord) e = KeyLocation{bld, docid, ord, false};
+            if (e.ord <= ord) {
+                displaced = e;
+                e = KeyLocation{bld, docid, ord, false};
+            } else {
+                lost = true;
+            }
+        }
+        if (lost) {
+            (void)bld->mark_dead(docid);
+        } else if (!displaced.tomb && displaced.seg) {
+            (void)displaced.seg->mark_dead(displaced.docid);
         }
         if (bld->doc_count() >= kBuildingFlushDocThreshold) {
-            flush_building();
+            flush_building_slot(slot);
         }
     }
 
@@ -234,14 +248,19 @@ ReduceJob TextPlugin::map_analyze(
 // 走非 const 版把 doc_text move 进原文 LRU（每文档省一次全文深拷）；shim/
 // 空 job 降级走 const 版，仅 doc_text 付一次拷贝，其余行为零差异。
 void TextPlugin::apply_job(ReduceJob& job) {
-    apply_job_impl(job, std::move(job.doc_text));
+    apply_job_impl_in(building_, job, std::move(job.doc_text));
 }
 
 void TextPlugin::apply_job(const ReduceJob& job) {
-    apply_job_impl(job, std::string(job.doc_text));
+    apply_job_impl_in(building_, job, std::string(job.doc_text));
 }
 
-void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
+void TextPlugin::apply_job_in(BuildingSlot& slot, ReduceJob& job) {
+    apply_job_impl_in(slot, job, std::move(job.doc_text));
+}
+
+void TextPlugin::apply_job_impl_in(BuildingSlot& slot, const ReduceJob& job,
+                                   std::string&& doc_text) {
     // S6-P2: 空 job 守卫（prepare 抛异常时 adapter 送来空 job）。
     // key+fields 都空 = map_analyze 未产出，跳过 apply；reducer 仍推进 ord。
     if (job.key.empty() && job.fields.empty()) return;
@@ -269,26 +288,19 @@ void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
     for (const auto& [term, data] : job.ca_data) changed_terms.push_back(term);
 
     // S27-3 步骤 3:唯一写入路径(原 B1「镜像」转正)+ B2a:覆盖写先 mark_dead。
-    auto bld = building_.load(std::memory_order_acquire);
+    auto bld = slot.load(std::memory_order_acquire);
     if (bld) {
         seg_dirty_.store(true, std::memory_order_relaxed);
-        // S27-4 P1:LSN 守卫 upsert(同 apply_text,设计 §2)。
-        KeyLocation prior{};
-        bool have_prior = false;
+        // S27-4 P1/P3:LSN 守卫 upsert(同 apply_text_in——早读纯优化,
+        // 终检 = 唯一 mark_dead 责任点,论证见彼处)。
         {
             std::shared_lock lk(key_loc_mu_);
             if (auto it = key_to_location_.find(std::string(job.key));
-                it != key_to_location_.end()) {
-                prior = it->second;
-                have_prior = true;
+                it != key_to_location_.end() && it->second.ord > job.ord) {
+                lk.unlock();
+                cache_.invalidate_terms(changed_terms);
+                return;  // 乱序到达的旧版本,不索引
             }
-        }
-        if (have_prior && prior.ord > job.ord) {
-            cache_.invalidate_terms(changed_terms);
-            return;  // 乱序到达的旧版本,不索引
-        }
-        if (have_prior && !prior.tomb && prior.seg) {
-            (void)prior.seg->mark_dead(prior.docid);
         }
         std::vector<search::SealedSegment::FieldInput> fin;
         fin.reserve(job.fields.size() + 1);
@@ -303,13 +315,25 @@ void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
         if (!fin.empty()) {
             const DocId docid = bld->add(std::string(job.key), job.ord,
                                           fin, job.total_doc_len);
+            KeyLocation displaced{};
+            bool lost = false;
             {
                 std::unique_lock lk(key_loc_mu_);
                 auto& e = key_to_location_[std::string(job.key)];
-                if (e.ord <= job.ord) e = KeyLocation{bld, docid, job.ord, false};
+                if (e.ord <= job.ord) {
+                    displaced = e;
+                    e = KeyLocation{bld, docid, job.ord, false};
+                } else {
+                    lost = true;
+                }
+            }
+            if (lost) {
+                (void)bld->mark_dead(docid);
+            } else if (!displaced.tomb && displaced.seg) {
+                (void)displaced.seg->mark_dead(displaced.docid);
             }
             if (bld->doc_count() >= kBuildingFlushDocThreshold) {
-                flush_building();
+                flush_building_slot(slot);
             }
         }
     }
@@ -386,6 +410,13 @@ void TextPlugin::rebuild_index(
     // 下一次 checkpoint commit 时删)+ 全新 building_,回调喂入的文档进
     // building_(key 经 docmap ord→ext 反查——回调只给 (ord, text))。
     rebase_needed_.store(true, std::memory_order_relaxed);  // S18-6/S14-4
+    // S27-4 P3:重建前 builder 静止 + 弃其在建段(重建喂入走 inline
+    // building_;不排干会与下方清 map/段集竞态,残留段则成幽灵)。
+    drain_builders();
+    for (auto& b : builders_) {
+        b->building.store(std::make_shared<search::SealedSegment>(),
+                          std::memory_order_release);
+    }
     doc_texts_.clear();
     {
         std::unique_lock lk(key_loc_mu_);
@@ -439,6 +470,12 @@ std::size_t TextPlugin::compact(double dead_ratio_threshold) {
     if (auto bld = building_.load(std::memory_order_acquire)) {
         total += bld->compact_postings(dead_ratio_threshold);
     }
+    // S27-4 P3:builder 段(调用契约已含 builder 静止——drain 前置)。
+    for (auto& b : builders_) {
+        if (auto bld = b->building.load(std::memory_order_acquire)) {
+            total += bld->compact_postings(dead_ratio_threshold);
+        }
+    }
     if (segment_set_) {
         std::vector<std::uint64_t> dead_ids;
         const auto entries = segment_set_->entries_view();
@@ -473,6 +510,11 @@ std::size_t TextPlugin::total_postings() const {
     }
     if (auto bld = building_.load(std::memory_order_acquire)) {
         n += bld->inverted().total_postings();
+    }
+    for (const auto& b : builders_) {
+        if (auto bld = b->building.load(std::memory_order_acquire)) {
+            n += bld->inverted().total_postings();
+        }
     }
     return n;
 }
@@ -544,6 +586,19 @@ TextPlugin::collect_default_segment_views() const {
             [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
             std::move(bld)});
     }
+    // S27-4 P3:各 builder 的 building 段(builders_ 结构 open 后不变,
+    // 查询线程只读遍历安全;段内容并发读契约同 building_)。
+    for (const auto& b : builders_) {
+        if (auto bld = b->building.load(std::memory_order_acquire);
+            bld && bld->doc_count() > 0) {
+            const search::SealedSegment* seg = bld.get();
+            views.push_back(search::SegmentView{
+                &seg->inverted(), seg,
+                [seg](DocId d) -> const std::string& { return seg->key_at(d); },
+                [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
+                std::move(bld)});
+        }
+    }
     return views;
 }
 
@@ -563,6 +618,15 @@ TextPlugin::collect_multi_field_segment_views() const {
         auto v = bld->multi_view();
         v.pin = std::move(bld);
         views.push_back(std::move(v));
+    }
+    // S27-4 P3:各 builder 的 building 段(同 collect_default_segment_views)。
+    for (const auto& b : builders_) {
+        if (auto bld = b->building.load(std::memory_order_acquire);
+            bld && bld->doc_count() > 0) {
+            auto v = bld->multi_view();
+            v.pin = std::move(bld);
+            views.push_back(std::move(v));
+        }
     }
     return views;
 }
@@ -1231,49 +1295,59 @@ void TextPlugin::on_merge_commit(const plugin::MergeCommitEvent&) {
     }
 }
 
-// S27-3 Slice B1：Building 段阈值封口。
-// 契约：reducer 单写者（apply_text / apply_job_impl 内），故内部无须锁。
-// 空 building_ / 无 segment_set_ 直接 no-op。失败兜底：add 失败（盘错误等）
-// → building_ 物归原主，下次再试；不抛异常（reducer 不能挂）。
-void TextPlugin::flush_building() {
-    auto sealed = building_.load(std::memory_order_acquire);
+// S27-3 Slice B1：Building 段阈值封口。S27-4 P3 泛化为「槽」:inline 的
+// building_ 与各 builder 的 building 同构。
+// 契约:槽的**单写者**调用(inline = reducer;builder 槽 = 该 builder 线程
+// 自封口,或 ckpt 静止点的 reducer)。add_pending 内部 unique 锁——多 builder
+// 并发封口互相安全。空槽 / 无 segment_set_ 直接 no-op。失败兜底:add 失败
+// (盘错误等)→ 段物归原主,下次再试;不抛异常(builder/reducer 不能挂)。
+void TextPlugin::flush_building_slot(BuildingSlot& slot) {
+    auto sealed = slot.load(std::memory_order_acquire);
     if (!sealed || sealed->doc_count() == 0) return;
     if (!segment_set_) return;
 
+    // 段内 LSN 单调:inline=全局序;builder 队列 FIFO、派发在 reducer 序 →
+    // 尾行即段内最高 LSN。
     const std::uint64_t hi_lsn =
         sealed->lsn_at(static_cast<DocId>(sealed->doc_count() - 1));
 
     // S27-3 步骤 5 并发序:先切空 building(查询对 sealed 内文档出现微秒级
     // 不可见窗口——NRT 语义可接受;反序会出现「building+段集同现」的双份
-    // 命中,更糟)。add_pending 失败回滚恢复可见(reducer 单写者,无并发
-    // add 丢失)。步骤 1 缺陷修正保留:失败时段不丢失。
-    building_.store(std::make_shared<search::SealedSegment>(),
-                    std::memory_order_release);
+    // 命中,更糟)。add_pending 失败回滚恢复可见(槽单写者,无并发 add 丢失)。
+    slot.store(std::make_shared<search::SealedSegment>(),
+               std::memory_order_release);
     auto pending = sealed;  // add_pending 成功时取走;失败时本地引用仍在
     if (!segment_set_->add_pending(pending, hi_lsn)) {
-        building_.store(std::move(sealed), std::memory_order_release);  // 回滚
+        slot.store(std::move(sealed), std::memory_order_release);  // 回滚
         return;
     }
 
     // S27-4 P1:封口零清扫——KeyLocation 持段**对象**指针,building 封口后
-    // 对象身份不变(shared_ptr 移入段集),定位天然继续有效。
+    // 对象身份不变(shared_ptr 移入段集,身份不变),定位天然继续有效。
     seg_dirty_.store(true, std::memory_order_relaxed);
 }
 
+// 全量封口(checkpoint 路径):inline building_ + 各 builder 段。契约:
+// builder 静止(flush 已前置 drain_builders)。
+void TextPlugin::flush_building() {
+    flush_building_slot(building_);
+    for (auto& b : builders_) flush_building_slot(b->building);
+}
 
 // ===========================================================================
 // S27-4 P2:BuilderPool(设计 docs/design/s27-4-dwpt-design.md §1/§3)
 // ===========================================================================
 
 void TextPlugin::start_builders() {
-    // P2 钳制:B 上限 1(串行等价——所有 builder 共享单一 building_,
-    // SealedSegment::add 是单写者契约)。P3 落地每 builder 一段后开放 B>1
-    // (设计 §1)。
-    const std::size_t n = std::min<std::size_t>(config_.builder_threads, 1);
+    const std::size_t n = config_.builder_threads;
     if (n == 0 || !builders_.empty()) return;
     builders_.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
         auto b = std::make_unique<Builder>();
+        // S27-4 P3:每 builder 一个 building 段(段内单写者;查询经
+        // 收集器 load+pin 并发读,与 building_ 同款契约)。
+        b->building.store(std::make_shared<search::SealedSegment>(),
+                          std::memory_order_release);
         Builder* raw = b.get();
         b->th = std::thread([this, raw] { builder_loop(*raw); });
         builders_.push_back(std::move(b));
@@ -1293,16 +1367,22 @@ void TextPlugin::stop_builders() {
     builders_.clear();
 }
 
-// 生产者 = reducer 单线程;round-robin + 容量背压。
+// 生产者 = reducer 单线程;round-robin + 容量背压。唤醒协议(P3 吞吐):
+// 只在 builder 真睡(waiting)时 notify——稳态(队列非空,builder 自转
+// 取活)每 job 零 futex 唤醒。
 void TextPlugin::dispatch_job(BuilderJob&& j) {
     Builder& b = *builders_[rr_next_];
     rr_next_ = (rr_next_ + 1) % builders_.size();
-    std::unique_lock<std::mutex> lk(b.mu);
-    b.cv_push.wait(lk, [&] { return b.q.size() < kBuilderQueueCap || b.stop; });
-    if (b.stop) return;  // 关停中:丢弃(close 前必有 drain,此处防御)
-    b.q.push_back(std::move(j));
-    lk.unlock();
-    b.cv_idle.notify_all();
+    bool wake = false;
+    {
+        std::unique_lock<std::mutex> lk(b.mu);
+        b.cv_push.wait(lk,
+                       [&] { return b.q.size() < kBuilderQueueCap || b.stop; });
+        if (b.stop) return;  // 关停中:丢弃(close 前必有 drain,此处防御)
+        b.q.push_back(std::move(j));
+        wake = b.waiting;
+    }
+    if (wake) b.cv_idle.notify_all();
 }
 
 void TextPlugin::builder_loop(Builder& b) {
@@ -1310,7 +1390,11 @@ void TextPlugin::builder_loop(Builder& b) {
         BuilderJob j;
         {
             std::unique_lock<std::mutex> lk(b.mu);
-            b.cv_idle.wait(lk, [&] { return !b.q.empty() || b.stop; });
+            if (b.q.empty() && !b.stop) {
+                b.waiting = true;
+                b.cv_idle.wait(lk, [&] { return !b.q.empty() || b.stop; });
+                b.waiting = false;
+            }
             if (b.q.empty() && b.stop) return;
             j = std::move(b.q.front());
             b.q.pop_front();
@@ -1320,18 +1404,26 @@ void TextPlugin::builder_loop(Builder& b) {
         // 空 job 降级;宿主错误计数不可达,接受)。
         try {
             if (j.is_raw) {
-                apply_text(j.raw_key, j.raw_ord, j.raw_text);
+                apply_text_in(b.building, j.raw_key, j.raw_ord, j.raw_text);
             } else {
-                apply_job(j.job);
+                apply_job_in(b.building, j.job);
             }
         } catch (...) {
         }
+        // 完工通知按需(P3 吞吐:稳态零 futex):队空 → drain 等待者可能
+        // 达静止;从满附近下来 → 背压生产者可能在等。
+        bool notify_drain = false;
+        bool notify_push = false;
         {
             std::lock_guard<std::mutex> lk(b.mu);
             b.busy = false;
+            notify_drain = b.q.empty();
+            // 背压迟滞:唤醒点 = 半满(而非 cap-1)。饱和时若逐 pop 逐醒,
+            // 生产者每 job 一次 futex 往返;半满唤醒让其一口气推 cap/2 个。
+            notify_push = (b.q.size() == kBuilderQueueCap / 2);
         }
-        b.cv_idle.notify_all();  // drain 等待者 + 潜在下一任务(自唤醒无害)
-        b.cv_push.notify_all();  // 背压等待的生产者
+        if (notify_drain) b.cv_idle.notify_all();
+        if (notify_push) b.cv_push.notify_all();
     }
 }
 
