@@ -3268,3 +3268,145 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - **测试**：多字段 + doc.text → `search_text` 同时命中 title（经 catch-all）和 body（doc.text）；
     反向验证 `index_catch_all=false` 时 body 命中、title 不进默认字段（走 `search_fields`）；
     checkpoint round-trip 后行为不变。
+
+---
+
+## 待办：S29 批次（全量 bench 复测 + 四路热点分析 — 2026-07-10）
+
+> **来源**：build-rel 全量 131 项 benchmark 复测（S28 代码，6 核 @3.0GHz，无 AVX-512，
+> 运行时派发 avx2+fma / avxvnni）+ 四路并行代码分析（Cask 写路径 / 查询扩展性 / HNSW 插入 /
+> 通用热路径）。结果 JSON 已存 scratchpad。
+>
+> **基线关键数字**（回归对照用）：
+> - `BM_Cask_Put_Concurrent` 1→8 线程 902k→48k ops/s（**负扩展 18×**）
+> - `BM_Inverted_QueryThroughputBOW` 1→4 线程 7.22→7.47us（**零扩展**，6 核机）
+> - `BM_KeyDir_Get_MultiThreaded` 1→8 线程 CPU 37.8→63.7ns（共享读退化）
+> - `BM_Hnsw_Insert/100000` 82s（1.2k/s；10k 时 3.0k/s → 超线性变慢）
+> - `BM_Text_AnalyzeNgramCjk` 40 MiB/s；`BM_Crc32_Hw_Streaming` 500 MiB/s（非流式 32 GiB/s）
+> - `BM_IndexPool_MapSpeedup` 4 线程即平台化（484k/s）
+>
+> **三大病根**：① 逻辑只读路径对共享 cacheline 做原子 RMW（TBB 桶锁 / KeyDir 独占 mutex）
+> → cacheline 弹跳；② 短临界区 mutex collapse（`write_mu_` 包住 encode+pwrite+keydir）；
+> ③ HNSW f32 导航工作集 153MB 打穿 L3（cache-miss bound）。
+
+### P0 快赢（小 diff，现有 bench 直接验收）
+
+- [ ] **S29-1 `InvertedIndex::search` 两趟 find 合并为一趟** · `src/bm25/inverted.cpp:445-476`
+  - 现状：每查询词先 `find` 数 total_postings（WAND 路由判断），再 `find` 取快照 →
+    每词 2 次 TBB `const_accessor` 桶锁原子 RMW。热词固定 → 同几条 cacheline 核间弹跳,
+    这是 BOW 零扩展的直接主因之一。
+  - 改动：第一趟即把快照指针（`acc->second`）暂存进 thread_local 数组，第二趟复用。
+    桶锁 RMW 减半，零语义风险。
+  - 验收：`BM_Inverted_QueryThroughputBOW` 2-4 线程应现扩展斜率。
+- [ ] **S29-2 `meta_lookup` 去每调用堆分配 + 提前退出** · `include/bitcask/meta_codec.hpp:335`
+  - 现状：每次调用 `vector<size_t> offsets` 堆分配 + O(n) 全量线性预扫建 offset 表后再二分
+    ——二分建立在强制线性预扫之上，纯额外开销。key 在 blob 内按字典序升序（格式不变式）。
+  - 改动：删 offsets，单趟扫描中直接 `ek.compare(key)`，命中即返回，`ek > key` 提前 break。
+    零分配 + 平均半程退出。过滤向量检索每节点一次调用，最热元数据路径。
+  - 验收：`BM_P12_MetaBlobAccess` 各规格。
+- [ ] **S29-3 HNSW `select_neighbors` 内部 vector 改 thread_local** · `src/vector/hnsw.cpp:781-784`
+  - 现状：`picked`/`picked_vecs` 每次调用堆分配；每插入约 10-18 次调用（自身选边 + 溢出邻居
+    收缩）→ 100k 插入约 1.8M 次 malloc/free。文件内其他热缓冲（`t_visited`、`pool`、
+    `tl_cands_buf`）均已 thread_local 池化，唯独此处遗漏，风格不一致。
+  - 改动：对齐既有 thread_local 模式。预估建图 5-15%。
+  - 验收：`BM_Hnsw_Insert/10000`（100k 太慢，用 10k 对比）。
+- [ ] **S29-4 `doc_freq`/`df`/`df_live` 去 `std::string(term)` 构造** · `src/bm25/inverted.cpp:427,1925,1932`
+  - 现状：接受 `string_view` 却为 tbb find 现造 `std::string`；S27 `multi_field_segment_search`
+    按 段×字段×term 循环调用（`segment.hpp:497`）→ 每次一堆分配 + 一次额外桶锁。
+  - 改动：调用侧保留 owning string 传入，或 PostingMap 自定义 `HashCompare` 支持
+    string_view 异构查找。
+- [ ] **S29-5 S27 分段查询层去双重排序 + 临时容器复用** · `include/bitcask/segment_query.hpp:47-80`
+    + `src/search/text_plugin.cpp:490-535,619-624`
+  - 现状三项：① 段内子查询已排序，跨段归并后又 `std::sort` 一遍（双重排序）；
+    ② `multi_segment_search` 每查询新建 `unordered_map<string,uint64_t> global_df`
+    （堆分配 + 每 term 一个 string）；③ `collect_default_segment_views` 每查询构造
+    `vector<SegmentView>` + 每段 2 个 `std::function` 闭包。
+  - 改动：段内返回未排候选、只在归并后排一次；global_df/views 用 thread_local 或
+    `search_arena.hpp` 复用（arena 目前只服务 inter-query 并行，查询内临时容器未覆盖）。
+  - 附带（可选）：阶段 1 doc_freq 与阶段 2 search 对同段同词各 find 一次，可合并为
+    单次遍历同时拿 df + 快照。
+
+### P1 结构性（量级改变，需设计，各自独立可做）
+
+- [ ] **S29-6 读路径「零共享写」改造（seqlock / epoch）** · `src/keydir/keydir.cpp:335` +
+    `include/bitcask/keydir.hpp:399` + `include/bitcask/inverted.hpp:486`
+  - 病根：读路径每次对共享锁字原子 RMW——`KeyDir::get` 拿 shard 独占 `std::mutex`（S5 实验
+    遗留）；TBB `const_accessor` 读也写桶锁字。换 shared_mutex 无效（reader 计数同样写
+    cacheline）。
+  - 方向：KeyDir 每 shard seqlock（entry 是 POD `SingleEntry`，乐观拷贝理想；fold 态
+    `keyfolders_/has_pending_` 分支回退加锁）；posting map 已是 CoW（`mutable_pl`），
+    读者可走 epoch-based reclamation 或 thread_local term→snapshot 缓存（generation 失效）。
+  - 收益：`BM_KeyDir_Get_MultiThreaded` 与 BOW 理论线性扩展。改造面大，建议 KeyDir 先行
+    （面小、模式清晰），倒排桶锁二期。
+- [ ] **S29-7 Put 写路径 group commit（单 handle 多写者扩展）** · `src/cask/cask.cpp:1319-1378`
+    + `include/bitcask/data_file.hpp`
+  - 病根：`write_mu_`（`cask.hpp:785`）包住 encode + pwrite + hint + keydir 全序列，短临界区
+    高争用 = 经典 mutex collapse（1→2 线程即 902k→175k）。fsync 不在 bench 路径内
+    （`o_sync=0`），纯锁交接开销。
+  - 方向：leader-follower 批量 pwrite——并发 put 编码后入队，leader 一次 pwrite 覆盖多条
+    连续 record，完成后逐条 apply keydir + 唤醒 waiter。**字节仍在返回前落盘，不违反
+    [WAL data file = immediate durable] 语义**（只合并 syscall，非延迟持久化）。`put_batch`
+    （`cask.cpp:1386`）已实现同思路可参考。
+  - 低风险铺垫（可单做）：encode 移出锁——`DataFile::write` 的成员 `write_buf_`
+    （`data_file.cpp:146`）改 caller 传入已编码 span，锁内只剩 reserve-offset + pwrite +
+    keydir。
+  - **禁区**：任何把 put 的 data pwrite 延迟到返回之后的方案（破坏 WAL 语义）；
+    `write_buffered`/`batch_buf_` 明确禁用于单条 put（`data_file.hpp:101-103`）。
+  - 备选零代码方案：按 key 分片多 Cask 实例（设计文档既有结论，`cask.hpp:13-14`），
+    若业务可接受则优先。
+- [ ] **S29-8 CJK 分词双重解码融合 + tf-only 免 positions** · `include/bitcask/text_utils.hpp:47-128`
+    + `src/text/analyzer.cpp:97,170-217`
+  - 病根 ①：纯 CJK 文本每码点被 utf8proc 解码两遍——`nfkc_fold` 快路径整趟 `decode_one`
+    只为校验 inert 随即丢弃字节，`to_codepoints` 再解一遍。直接对应
+    `BM_Text_AnalyzeNgramCjk` 40 MiB/s。
+  - 病根 ②：BM25 tf-only 路径（`Analyzer::analyze` / `index_positions_==false`）从
+    `analyze_with_positions` 派生后丢弃 positions——每唯一 n-gram 一个
+    `vector<uint32_t>` 的构造与分配纯浪费（一篇 CJK 文档数千个）。
+  - 改动：① 融合入口——fold 校验趟直接产出 `CpInfo`（一次解码共用）；② 提供免 positions
+    的 term→tf 计数路径。
+  - 验收：`BM_Text_AnalyzeNgramCjk` / `BM_Text_AnalyzeNgramMixed`。
+- [ ] **S29-9 IndexPool reorder buffer：map → 环形缓冲 + 分配出锁** · `include/bitcask/thread_pool.hpp:274,488-495,535-577,630`
+  - 现状：`IndexLane::pending` 是 `std::map<uint64_t,ReorderEntry>`，每任务在**全局
+    `reorder_mu_` 锁内**做红黑树节点分配（含大对象 IndexTask）；ord 单调递增、reducer 按序
+    消费——环形/滑动窗口教科书场景。附带：reducer `count()`+`extract()` 两次查找；每 apply
+    一条 break 重扫全 lane。
+  - 改动：`(ord - base)` 索引的 deque/环形缓冲（O(1) 免节点分配）；entry 锁外构造、锁内挂接;
+    count+extract 合一次 find。二期：per-lane 锁或 SPSC 回填队列（注释已自认「P4+ 可分片」）。
+  - 对应 `BM_IndexPool_MapSpeedup` 4 线程平台化 + S26-① 并行 reduce 的前置清障。
+- [ ] **S29-10 CRC32 流式小块：16-63B CLMUL 内核** · `include/bitcask/hw_crc32.hpp:342,378`
+  - 病根已查明：PCLMUL 路径有 `len >= 64` 下限，16B 增量块（hint/WAL 帧场景，
+    `crc32_bench.cpp:149`）恒退化为字节表 + 每调用 `has_pclmul_crc32()` 探测/misalign 计算
+    开销 → 500 MiB/s vs 大块 32 GiB/s（60×）。
+  - 改动：(a) 加 16-63B 单次 `_mm_clmulepi64` 折叠内核；或 (b) 调用侧对更大连续区间一次
+    CRC。附带：探测结果缓存为函数级 static。
+  - 验收：`BM_Crc32_Hw_Streaming` 各规格。
+- [ ] **S29-11（待评估）HNSW 深层优化** · `src/vector/hnsw.cpp` + `include/bitcask/hnsw.hpp:69-70`
+  - 超线性根因：f32 导航工作集 100k×384d×4B ≈ 153MB 打穿 L3（本机无 VNNI，
+    `pick_int8_dot_kernel()` 返 nullptr → 建图全程 f32）。
+  - 梯队：① ef_construction 200→128 / M 16→12（配置级，建图 1.5-2×，召回略降，需召回
+    评估）；② 建图导航 int8 粗筛（153MB→38MB，需 AVX2 int8 内核，L0 精算保精度）；
+    ③ 并行插入（6 核全闲置，收益最大但要打破 V3.3 单写者协议 `writer_active_`
+    （`hnsw.cpp:845-854`），参考 hnswlib per-node lock，工程量最大）；④ devirtualize
+    `dist_` 函数指针（几 %）。
+  - 已到位勿动：visited list 版本化复用、邻接 bump-arena、优先队列缓冲池、导航 prefetch。
+
+### 已核实「无需改动」（本轮四路分析结论,避免重复审计）
+
+- `bm25_kernels.hpp`：AVX-512/AVX2/scalar 三层派发 + FMA 链，已优。
+- `intersect.cpp`：预 resize + 裸指针游标 + Inoue 块过滤 + SIMD，已优。
+- `score_bow_topk`/`search_wand`（inverted.cpp:92,553）：thread_local 工作数组池、块上界
+  预算、惰性 dls——**稳态零分配**，BOW 不扩展与分配无关（纯桶锁争用）。
+- `snapshot_flat`（inverted.cpp:253）：SoA 后已是 memcpy 式 assign + 容量复用。
+- 生产查询已用批量 `fill_is_live/fill_doc_lens`（每列 2 次锁）；
+  `BM_Inverted_SearchLockedScalar` 3132us vs Batch 169us（18.5×）是护栏基准，
+  量化「per-element 锁 ≈ 15ns/次」——任何新代码禁止逐元素加锁。
+- keydir 分片锁、`alloc_ord` relaxed 原子：非写路径瓶颈（瓶颈在 `write_mu_`）。
+- `vbyte.hpp`：编码无分配；`gap_decode` 在载入期非热路径。
+
+### 建议执行顺序
+
+1. S29-1..5（快赢批，均小 diff，一轮 bench 验收）
+2. S29-9（IndexPool，兼为 S26-① 并行 reduce 清障）+ S29-8（CJK，独立）
+3. S29-6 KeyDir seqlock 先行 → 倒排 epoch 二期
+4. S29-7 group commit（先做 encode 出锁铺垫）
+5. S29-10 / S29-11 按需（CRC 流式场景是否真实存在、HNSW 召回预算)
