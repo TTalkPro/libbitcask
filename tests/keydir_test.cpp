@@ -289,3 +289,70 @@ TEST(KeyDirSnapshot, V1CompatRead) {
     EXPECT_EQ(e->ord, 9u);
     fs::remove(p);
 }
+
+// ---- S29-6 P1:remove 墓碑化（erase → tombstone-in-place + 增量 sweep）----
+// 背景:remove 无 fold 分支不再物理 erase（为 P3 乐观读者保住 key 缓冲/槽位），
+// 改留 sibling sentinel 墓碑;物理回收走写者增量 sweep + quiescent 点全量清。
+// 详见 docs/design/s29-6-keydir-lockfree-read.md §2.1。
+
+// 删除后不可见、重复删除 false、put 复活（走 put_insert 的 Single 墓碑覆写分支）。
+TEST(KeyDirTombstone, RemoveHidesAndPutRevives) {
+    KeyDir kd;
+    ASSERT_EQ(kd.put("k", 1, 10, 100, 1000, 0, true, 0, 0, 1), PutResult::kOk);
+    ASSERT_TRUE(kd.remove("k", 2000));
+    EXPECT_FALSE(kd.get("k").has_value()) << "墓碑必须不可见";
+    EXPECT_FALSE(kd.remove("k", 2001)) << "重复删除应返回 false";
+
+    ASSERT_EQ(kd.put("k", 2, 20, 200, 3000, 0, true, 0, 0, 2), PutResult::kOk);
+    auto e = kd.get("k");
+    ASSERT_TRUE(e.has_value()) << "put 应复活墓碑 key";
+    EXPECT_EQ(e->file_id, 2u);
+    EXPECT_EQ(e->ord, 2u);
+    EXPECT_EQ(kd.info().key_count, 1u);
+}
+
+// delete-heavy:交错删一半，可见性/计数/直方图口径全程一致（增量 sweep 在
+// 写操作中被反复触发——本用例即 sweep 路径的回归护栏）。
+TEST(KeyDirTombstone, DeleteHeavyVisibilityAndCounts) {
+    KeyDir kd;
+    constexpr int N = 2000;
+    for (int i = 0; i < N; ++i) {
+        ASSERT_EQ(kd.put("key" + std::to_string(i), 1, 10,
+                         static_cast<std::uint64_t>(i), 1000, 0, true, 0, 0,
+                         static_cast<std::uint64_t>(i)),
+                  PutResult::kOk);
+    }
+    for (int i = 0; i < N; i += 2) {
+        ASSERT_TRUE(kd.remove("key" + std::to_string(i), 2000));
+    }
+    EXPECT_EQ(kd.info().key_count, static_cast<std::uint64_t>(N / 2));
+    for (int i = 0; i < N; ++i) {
+        const bool live = (i % 2) == 1;
+        EXPECT_EQ(kd.get("key" + std::to_string(i)).has_value(), live)
+            << "key" << i;
+    }
+    auto h = kd.key_length_histogram();
+    EXPECT_EQ(h.total, static_cast<std::size_t>(N / 2)) << "直方图只计活 key";
+}
+
+// 墓碑在场时快照往返:墓碑不入快照（count 与写出条目严格一致），load 后
+// 等价不存在;活 key 完整还原。
+TEST(KeyDirTombstone, SnapshotSkipsTombstones) {
+    const fs::path p =
+        fs::temp_directory_path() / "bitcask_kd_snap_tomb.ckpt";
+    fs::remove(p);
+    KeyDir kd;
+    ASSERT_EQ(kd.put("live1", 1, 10, 100, 1000, 0, true, 0, 0, 1), PutResult::kOk);
+    ASSERT_EQ(kd.put("dead1", 1, 10, 200, 1000, 0, true, 0, 0, 2), PutResult::kOk);
+    ASSERT_EQ(kd.put("live2", 1, 10, 300, 1000, 0, true, 0, 0, 3), PutResult::kOk);
+    ASSERT_TRUE(kd.remove("dead1", 2000));
+
+    ASSERT_TRUE(kd.save_snapshot(p.string(), {}));
+    KeyDir kd2;
+    ASSERT_TRUE(kd2.load_snapshot(p.string()).has_value());
+    EXPECT_TRUE(kd2.get("live1").has_value());
+    EXPECT_TRUE(kd2.get("live2").has_value());
+    EXPECT_FALSE(kd2.get("dead1").has_value()) << "墓碑不应进快照";
+    EXPECT_EQ(kd2.info().key_count, 2u);
+    fs::remove(p);
+}

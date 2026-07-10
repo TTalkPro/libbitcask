@@ -100,6 +100,76 @@ struct MultiEntry {
 // entries_ map 中存的实际类型；用 variant 避免每个 key 都背 vector 开销。
 using Entry = std::variant<SingleEntry, MultiEntry>;
 
+// ---------------------------------------------------------------------------
+// S29-6 P2:epoch-limbo 延迟回收（设计 §2.2）。
+// P3 乐观读者在**不持分片锁**的情况下探测 entries map——期间任何可达内存
+// 的 free 都是 UAF 源(设计 §1.1/§1.2)。三类内存全部改道 limbo,待
+// epoch::Registry::min_active() 越过其戳后才物理 free:
+//   raw     — ankerl map 的两个内部数组(经 LimboAllocator::deallocate 进来:
+//             rehash/grow/析构时的旧数组);
+//   keys    — 物理 erase 前**move 出来**的 key string 遗骸(erase 只析构
+//             moved-from 空壳,不 free 堆缓冲——免改 map key 类型);
+//   entries — 同上,可能持堆的 Entry(MultiEntry 链)遗骸。
+// 访问约定:Limbo 仅在持有所属 Shard::mu 时读写(析构除外——彼时无并发)。
+// P2 期(读者仍加锁)min_active 恒为 max → retire 后首个 reclaim 即释放,
+// 行为等价即时 free,零语义变化。
+// ---------------------------------------------------------------------------
+struct Limbo {
+    struct Raw {
+        void* p = nullptr;
+        std::size_t bytes = 0;
+    };
+    std::vector<std::pair<std::uint64_t, Raw>>         raw;
+    std::vector<std::pair<std::uint64_t, std::string>> keys;
+    std::vector<std::pair<std::uint64_t, Entry>>       entries;
+
+    [[nodiscard]] bool empty() const noexcept {
+        return raw.empty() && keys.empty() && entries.empty();
+    }
+    [[nodiscard]] std::size_t items() const noexcept {
+        return raw.size() + keys.size() + entries.size();
+    }
+
+    void retire_raw(void* p, std::size_t bytes);
+    void retire_key(std::string&& k);
+    void retire_entry(Entry&& e);
+    // 释放所有 stamp < safe 的项(safe = Registry::min_active())。
+    void reclaim(std::uint64_t safe) noexcept;
+    ~Limbo() { reclaim(std::numeric_limits<std::uint64_t>::max()); }
+};
+
+// ankerl map 定制 allocator:allocate = 普通 new;deallocate 改道 limbo。
+// 有状态(绑定所属分片的 Limbo);map 对象与 Limbo 同 Shard 且 map 声明
+// 在后(先析构)——析构期 deallocate 进 limbo 仍安全。
+template <class T>
+struct LimboAllocator {
+    using value_type = T;
+    static_assert(alignof(T) <= alignof(std::max_align_t),
+                  "LimboAllocator: 超对齐类型需显式处理");
+
+    Limbo* limbo = nullptr;
+
+    LimboAllocator() noexcept = default;
+    explicit LimboAllocator(Limbo* l) noexcept : limbo(l) {}
+    template <class U>
+    LimboAllocator(const LimboAllocator<U>& o) noexcept : limbo(o.limbo) {}
+
+    [[nodiscard]] T* allocate(std::size_t n) {
+        return static_cast<T*>(::operator new(n * sizeof(T)));
+    }
+    void deallocate(T* p, std::size_t n) noexcept {
+        if (limbo != nullptr) {
+            limbo->retire_raw(p, n * sizeof(T));
+        } else {
+            ::operator delete(p);
+        }
+    }
+    template <class U>
+    bool operator==(const LimboAllocator<U>& o) const noexcept {
+        return limbo == o.limbo;
+    }
+};
+
 // 查询返回的「展开视图」。对应 legacy 的 bitcask_keydir_entry_proxy 结构。
 // key 字段是 zero-copy view——指向 KeyDir 内部存储，仅在持锁期间有效；
 // 调用方要保留必须自己 copy。
@@ -397,6 +467,10 @@ private:
         // 分片锁。主 hash 的值是 variant;判别用 std::get_if<Single|Multi>。
         // 透明 hash:get/put/remove 热路径用 string_view 直接查,零拷贝(O1)。
         mutable std::mutex mu;  // S5 实验:rwlock→mutex(消写者偏好停车;短临界区)
+        // S29-6 P2:本分片 limbo(延迟回收池)。声明**先于** entries——map
+        // 析构时其数组经 LimboAllocator 进 limbo,limbo 必须后析构。
+        // 仅在持 mu 下读写(析构除外)。
+        Limbo limbo;
         // ⑤ 开放寻址 + 稠密存储扁平表(ankerl::unordered_dense）替代
         // std::unordered_map：消除每键节点 malloc + 每次 find 的指针追逐 cache
         // miss。透明 hash（StringHash::is_transparent）→ string_view 热路径零拷
@@ -405,10 +479,31 @@ private:
         // 与使用之间无 insert/erase（已审计），故安全。
         // map 头独占缓存行:find 路径读 map 头,别让它与锁字(每次加解锁
         // RMW)同行。
-        alignas(64) ankerl::unordered_dense::map<std::string, Entry, StringHash,
-                                                  std::equal_to<>> entries;
+        // S29-6 P2:allocator 绑定本分片 limbo——rehash/grow/析构的旧数组
+        // 不再立即 free(P3 乐观读者 UAF 防护,设计 §1.1)。
+        using EntryMap = ankerl::unordered_dense::map<
+            std::string, Entry, StringHash, std::equal_to<>,
+            LimboAllocator<std::pair<std::string, Entry>>>;
+        alignas(64) EntryMap entries;
+
+        Shard() : entries(EntryMap::allocator_type{&limbo}) {}
+        // S29-6 P1:remove 无 fold 分支不再物理 erase,改留墓碑 SingleEntry
+        // (sibling sentinel 判据)——为 P3 乐观读者保住 key string 缓冲与
+        // map 槽位不被热路径 free。tombstones 计当前墓碑数,超 1/8 表长后
+        // 每次写操作增量清扫 kTombstoneSweepBatch 槽(sweep_cursor 续扫);
+        // fold release / barrier 的 quiescent 点全量清。两字段仅在持本分片
+        // mu 下读写。
+        std::size_t tombstones   = 0;
+        std::size_t sweep_cursor = 0;
     };
     mutable std::array<Shard, kShards> shards_;
+
+    // S29-6 P1:增量墓碑清扫(前置:持 sh.mu 且 fold 未激活——fold 期间
+    // entries key 集必须只增不减,见 IterHandle::next 注释)。
+    static void sweep_tombstones_locked(Shard& sh);
+
+    // S29-6 P2:攒批回收本分片 limbo(前置:持 sh.mu)。
+    static void maybe_reclaim_locked(Shard& sh);
 
     // put() 三阶段拆分的共享上下文。锁随 ctx 移动，raw pointer
     // 指向的数据结构在对应锁释放前保持有效。
