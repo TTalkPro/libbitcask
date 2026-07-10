@@ -213,6 +213,11 @@ public:
     virtual void on_relocate(const RelocateEvent& e) { (void)e; }
     virtual void on_merge_begin(const MergeBeginEvent& e) { (void)e; }
     virtual void on_merge_commit(const MergeCommitEvent& e) { (void)e; }
+
+    // S27-4 P2:读屏障钩子——宿主在查询前(prepare_search,已 flush 索引
+    // 流水线之后)调用;插件内部若有异步 apply(如 DWPT builder),须在返回
+    // 前排干,保证 read-your-writes。默认 no-op。
+    virtual void drain() {}
     virtual void on_merge_abort() {}
     virtual void maintain(const MaintainEvent& e) { (void)e; }
 

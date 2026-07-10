@@ -29,6 +29,10 @@ struct TextPluginConfig {
     // 只建各命名字段倒排（省 reducer/内存/ckpt ~半），多字段文档只能经
     // search_fields 字段限定命中。纯默认字段写入不受影响。
     bool                 index_catch_all = true;
+    // S27-4 P2:builder 线程数。0 = 内联(apply 在 reducer 内,历史行为,
+    // 默认);>=1 = DWPT 并行 builder(文档 round-robin 派发,refresh 可见性
+    // + drain 屏障)。P3 验证后评估默认值翻转。
+    std::size_t          builder_threads = 0;
     double               auto_compact_dead_ratio = 0.0;  // S12-2
     std::shared_ptr<const SynonymMap> synonym_map;       // S11：open-time 不可变
     // S18-6（S14-5 语义每插件化）：delta 链长上限，达到后 flush 强制 base。

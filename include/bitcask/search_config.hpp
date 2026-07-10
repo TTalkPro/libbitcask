@@ -71,12 +71,17 @@ struct SearchLayerConfig {
     // 频繁（∝ 索引总量）；大 → 崩溃恢复重放更长、磁盘冗余更多。0 = 不设限（不建议）。
     std::uint32_t max_delta_chain = 64;
 
+    // S27-4 P2:文本插件 builder 线程数。0 = 内联(历史行为,默认);>=1 =
+    // DWPT 并行 builder。语义详见 text_plugin_config.hpp。
+    std::size_t builder_threads = 0;
+
     // S18-3/4：配置拆分（设计 §6）——产出两插件各自的配置子集。公共 API
     // 面（CaskOptions::search_config）本批不变，P5 换代。
     [[nodiscard]] text::TextPluginConfig text_config() const {
         return {analyzer_config, bm25_params, cache_max_entries,
                 doc_text_cache_max, index_positions, index_catch_all,
-                auto_compact_dead_ratio, synonym_map, max_delta_chain};
+                builder_threads, auto_compact_dead_ratio, synonym_map,
+                max_delta_chain};
     }
     [[nodiscard]] vec::VectorPluginConfig vector_config() const {
         return {vector_dim, vector_metric, hnsw_m, hnsw_ef_construction,
