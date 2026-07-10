@@ -49,7 +49,11 @@ TextPlugin::TextPlugin(const TextPluginConfig& config,
     , analyzer_(AnalyzerFactory::create(config.analyzer_config))
     , cache_(config.cache_max_entries)
     , doc_texts_(config.doc_text_cache_max)
-    , synonym_map_(config.synonym_map) {}
+    , synonym_map_(config.synonym_map) {
+    // S27-3 步骤 3:building_ 在构造期即建——fields_ 退役后它是唯一写入
+    // 目标,独立用法(shim/单测,不走 plugin open)也必须可写。
+    building_ = std::make_unique<search::SealedSegment>();
+}
 
 TextPlugin::TextPlugin(const TextPluginConfig& config,
                        const bm25::DocTable& docs,
@@ -60,29 +64,7 @@ TextPlugin::TextPlugin(const TextPluginConfig& config,
     if (injected_analyzer) analyzer_ = std::move(injected_analyzer);
 }
 
-bm25::InvertedIndex& TextPlugin::field_index(std::string_view field) {
-    // 双检:常态(字段已存在)只拿共享锁;首次出现的字段才升级独占建索引。
-    {
-        std::shared_lock lk(fields_mu_);
-        auto it = fields_.find(field);
-        if (it != fields_.end()) return *it->second;
-    }
-    std::unique_lock lk(fields_mu_);
-    auto it = fields_.find(field);
-    if (it == fields_.end()) {
-        it = fields_.emplace(std::string(field),
-                             std::make_unique<bm25::InvertedIndex>(
-                                 config_.bm25_params,
-                                 config_.index_positions)).first;
-    }
-    return *it->second;
-}
-
-const bm25::InvertedIndex* TextPlugin::field_index(std::string_view field) const {
-    std::shared_lock lk(fields_mu_);
-    auto it = fields_.find(field);
-    return it == fields_.end() ? nullptr : it->second.get();
-}
+// S27-3 步骤 3:field_index/fields_ 退役(段集是唯一索引载体)。
 
 std::string_view TextPlugin::intern_field_name(std::string_view name) {
     // S10-A4:双检。常态(字段名已 intern)只共享锁;首次出现升级独占 emplace。
@@ -114,15 +96,14 @@ void TextPlugin::apply_text(std::string_view key, std::uint64_t ord,
     }
     doc_len_writer_.set_doc_len(ord, doc_len);  // S18-1：经窄接口回填
 
-    if (!term_data.empty()) {
-        dirty_default_.store(true, std::memory_order_relaxed);  // S14-3
-        field_index(kDefaultField).add_doc(ord, term_data);
-    }
     doc_texts_.put(ord, std::string(text));
 
-    // S27-3 Slice B1：镜像写入 building_（fields_ 权威，building_ 影子）+
-    // B2a 修复：覆盖写先 mark_dead 旧 docid（段级 is_live 不知道宿主覆盖）。
+    // S27-3 B2b 步骤 3:fields_ 退役——building_/段集是唯一写入目标。
+    // 覆盖写先 mark_dead 旧 docid（段级 is_live 不知道宿主覆盖,B2a）。
+    // 重放幂等:恢复重放 = 同 key 重加——rebuild_key_locations(步骤 4)
+    // 使旧副本可定位,mark_dead 后恒一份 live,无需 ord 显式门。
     if (building_ && !term_data.empty()) {
+        seg_dirty_ = true;  // 步骤 3:段侧脏标记(flush 决策)
         if (auto it = key_to_location_.find(std::string(key));
             it != key_to_location_.end()) {
             if (it->second.in_building) {
@@ -249,30 +230,8 @@ void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
     // S6-P2: 空 job 守卫（prepare 抛异常时 adapter 送来空 job）。
     // key+fields 都空 = map_analyze 未产出，跳过 apply；reducer 仍推进 ord。
     if (job.key.empty() && job.fields.empty()) return;
-    auto& field_lens = ord_field_lens_[job.ord];
-    field_lens.reserve(job.fields.size() + 1);
-    for (const auto& f : job.fields) {
-        // S10-A4:intern 取稳定 string_view，免 owning string 分配。
-        field_lens.emplace_back(intern_field_name(f.field_name), f.doc_len);
-    }
-
-    for (const auto& f : job.fields) {
-        if (!f.terms.empty()) {
-            if (f.field_name == kDefaultField) {
-                dirty_default_.store(true, std::memory_order_relaxed);
-            } else {
-                dirty_fields_.store(true, std::memory_order_relaxed);
-            }
-            field_index(f.field_name).add_doc(job.ord, f.terms);
-        }
-    }
-
-    // 若已有字段直接写默认字段，则不重复合并（避免双写）。
-    if (!job.wrote_default && !job.ca_data.empty()) {
-        dirty_default_.store(true, std::memory_order_relaxed);  // S14-3
-        field_index(kDefaultField).add_doc(job.ord, job.ca_data);
-        field_lens.emplace_back(intern_field_name(kDefaultField), job.ca_len);
-    }
+    // S27-3 B2b 步骤 3:fields_/ord_field_lens_ 退役——building_/段集是唯一
+    // 写入目标(倒排 + 字段统计都在段内 InvertedIndex 自含)。
 
     // S16-2：docmap 行与 meta 由宿主（流水线）/caller（standalone・recover）
     // 先落；分析产物 doc_len 在此回填（宿主不做分析拿不到 token 数）。
@@ -294,8 +253,9 @@ void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
     }
     for (const auto& [term, data] : job.ca_data) changed_terms.push_back(term);
 
-    // S27-3 Slice B1：镜像写入 building_ + B2a 修复：覆盖写先 mark_dead。
+    // S27-3 步骤 3:唯一写入路径(原 B1「镜像」转正)+ B2a:覆盖写先 mark_dead。
     if (building_) {
+        seg_dirty_ = true;
         if (auto it = key_to_location_.find(std::string(job.key));
             it != key_to_location_.end()) {
             if (it->second.in_building) {
@@ -338,11 +298,10 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
     // 前置条件：docmap 行已删（宿主或 SearchLayer 二参版）。doc_len 经
     // prior_ord 从 SoA 读取——Index::remove 只翻 live/ext2ord，不清 SoA，
     // 删除后仍可读（S16-2 侦查坐实）。
-    const std::uint32_t prior_doc_len = docs_.doc_len(prior_ord);
-    // S14-3：删除触全部 bm25 段（remove_doc 调整各域 N/sum_doc_len 全局
-    // 统计）。docmap 脏位/删除日志由宿主 Index::remove 自记账（S18-2）。
-    dirty_default_.store(true, std::memory_order_relaxed);
-    dirty_fields_.store(true, std::memory_order_relaxed);
+    (void)prior_ord;
+    // S27-3 步骤 3:fields_ 退役——删除只走段级 mark_dead(下方);段内
+    // N/sum_dl 统计经 LiveChecker 排除死文档,df 高估由 merge 自愈(§3.4)。
+    seg_dirty_ = true;
 
     // S9.2：取被删文档词集做选择性失效。原文 LRU 命中则精确 analyze；
     // miss（冷文档被挤出）则降级为整缓存失效（安全但粗粒度）。
@@ -364,19 +323,6 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
         have_terms = true;  // 空缓存：invalidate_terms(空) 即 no-op，语义等价
     }
 
-    // 删除该文档在各字段的统计。多字段路径用 ord_field_lens_ 精确扣减各字段
-    // doc_len（R3）；单 text 路径无此表，按默认字段用 prior_doc_len。
-    if (auto it = ord_field_lens_.find(prior_ord); it != ord_field_lens_.end()) {
-        for (auto& [field, flen] : it->second) {
-            field_index(field).remove_doc(flen, {});
-        }
-        ord_field_lens_.erase(it);
-    } else {
-        std::shared_lock lk(fields_mu_);  // 只读 map 结构;remove_doc 自带并发
-        for (auto& [_, inv] : fields_) {
-            inv->remove_doc(prior_doc_len, {});
-        }
-    }
     doc_texts_.erase(prior_ord);
     if (have_terms) {
         cache_.invalidate_terms(changed_terms);  // 空缓存时为 no-op
@@ -404,63 +350,64 @@ void TextPlugin::rebuild_index(
     const std::function<void(
         const std::function<void(std::uint64_t, const std::string&)>&)>&
         for_each_doc) {
-    // 阶段2a：仍按默认字段重建。caller（SearchLayer/宿主）负责 legacy
-    // rebase 标志与 docmap 遍历 + 磁盘读回（emit 回调喂 (ord, text)）。
+    // S27-3 步骤 3:重建目标从 fields_ 换为段世界——丢弃全部旧段(文件在
+    // 下一次 checkpoint commit 时删)+ 全新 building_,回调喂入的文档进
+    // building_(key 经 docmap ord→ext 反查——回调只给 (ord, text))。
     rebase_needed_.store(true, std::memory_order_relaxed);  // S18-6/S14-4
-    auto new_inv = std::make_unique<bm25::InvertedIndex>(
-        config_.bm25_params, config_.index_positions);
     doc_texts_.clear();
-    ord_field_lens_.clear();  // 否则旧 ord 的多字段统计跨重建残留→无界增长。
+    key_to_location_.clear();
+    if (segment_set_) {
+        std::vector<std::uint64_t> ids;
+        for (const auto& e : segment_set_->entries_view()) ids.push_back(e.seg_id);
+        for (auto id : ids) (void)segment_set_->drop_pending(id);
+    }
+    building_ = std::make_unique<search::SealedSegment>();
+    seg_dirty_ = true;
 
     for_each_doc([&](std::uint64_t ord, const std::string& text) {
         auto term_data = analyzer_->analyze_with_positions(text);
         if (term_data.empty()) return;
-        new_inv->add_doc(ord, term_data);
+        auto key = docs_.ord_to_ext(ord);
+        if (!key) return;  // docmap 无行(理论不可达:caller 遍历 docmap)
+        std::uint32_t doc_len = 0;
+        for (const auto& [t, d] : term_data) doc_len += d.first;
+        const TermPositionsMap* borrowed = &term_data;
+        const search::SealedSegment::FieldInput fin{search::kDefaultField,
+                                                     borrowed};
+        const DocId docid = building_->add(
+            *key, ord,
+            std::span<const search::SealedSegment::FieldInput>(&fin, 1),
+            doc_len);
+        key_to_location_[*key] = KeyLocation{true, 0, docid};
         doc_texts_.put(ord, text);
+        if (building_->doc_count() >= kBuildingFlushDocThreshold) {
+            flush_building();
+        }
     });
-
-    new_inv->finalize_all_postings();
-
-    fields_.clear();
-    fields_.emplace(kDefaultField, std::move(new_inv));
 
     cache_.invalidate();
 }
 
-std::size_t TextPlugin::compact(double dead_ratio_threshold) {
-    // S14-3：压实物理重排 posting，两个 bm25 段序列化字节都会变。
-    // S14-4：压实破坏 base+delta 可重构性 → 自身 rebase（legacy 全局标志
-    // 仍由 SearchLayer shim 维护）。无 fields_mu_ 锁——reducer 单写者上下文，
-    // map 结构在本调用期间稳定（与原 SearchLayer::compact 一致）。
-    rebase_needed_.store(true, std::memory_order_relaxed);  // S18-6
-    dirty_default_.store(true, std::memory_order_relaxed);
-    dirty_fields_.store(true, std::memory_order_relaxed);
-    std::size_t total = 0;
-    for (auto& [field, inv] : fields_) {
-        total += inv->compact(docs_, dead_ratio_threshold);
-    }
-    if (total > 0) cache_.invalidate();  // posting 行变了，缓存可能含陈旧结果
-    return total;
+// S27-3 步骤 3:fields_ 压实退役——段模型下死文档回收 = 段级 merge
+// (步骤 5,on_merge_commit 接线);保留 API(shim/测试)恒零。
+std::size_t TextPlugin::compact(double) {
+    return 0;
 }
 
 std::size_t TextPlugin::total_postings() const {
-    std::shared_lock lk(fields_mu_);
+    // 步骤 3:统计源换段集 + building(默认字段口径,与旧 fields_ 相当)。
     std::size_t n = 0;
-    for (const auto& [field, inv] : fields_) n += inv->total_postings();
+    if (segment_set_) {
+        for (const auto& s : segment_set_->segments_view()) {
+            n += s->inverted().total_postings();
+        }
+    }
+    if (building_) n += building_->inverted().total_postings();
     return n;
 }
 
 void TextPlugin::maybe_auto_compact() {
-    const double thr = config_.auto_compact_dead_ratio;
-    if (thr <= 0.0) return;  // opt-in 关（默认）→ 零开销
-
-    const std::uint64_t retired = stats_.retired_since_compact();
-    if (retired < kAutoCompactMinDeaths) return;      // 常态早退
-    // 节流阈值随 live 规模缩放：大库摊薄扫描成本，小库用下限。
-    if (retired < stats_.live_docs() / 2) return;
-
-    compact(thr);  // reducer 线程内串行 → 与 add_doc/put_doc 无并发窗口
-    stats_.reset_retired_since_compact();
+    // 步骤 3:随 compact 退役(死回收改由段级 merge 承担,步骤 5)。
 }
 
 // ---- 查询面（自 SearchLayer 平移，S18-4）----
@@ -511,26 +458,9 @@ TextPlugin::collect_default_segment_views() const {
             [seg](DocId d) -> Lsn { return seg->lsn_at(d); }});
         seg_total += building_->doc_count();
     }
-    // 退化：fields_.live > 段总 → recovery 后 fields_ 有 ckpt 数据但段集不全。
-    if (!views.empty()) {
-        const auto* def_inv = field_index(kDefaultField);
-        if (def_inv && def_inv->live_doc_count() > seg_total) {
-            views.clear();
-        }
-    }
-    if (views.empty()) {
-        const auto* inv = field_index(kDefaultField);
-        if (inv) {
-            const auto* dt = &docs_;
-            views.push_back(search::SegmentView{
-                inv, dt,
-                [dt](DocId d) -> std::string {
-                    auto ext = dt->ord_to_ext(d);
-                    return ext ? std::move(*ext) : std::string{};
-                },
-                [](DocId d) -> Lsn { return d; }});
-        }
-    }
+    // S27-3 步骤 3:fields_ 退化路径删除——段集(+recovery 重写,步骤 4)
+    // 已是唯一真相源;段/清单损坏在 open 时即退全量 fold 重建段集。
+    (void)seg_total;
     return views;
 }
 
@@ -548,13 +478,8 @@ TextPlugin::collect_multi_field_segment_views() const {
         views.push_back(building_->multi_view());
         seg_total += building_->doc_count();
     }
-    // 退化：fields_.live > 段总 → recovery 后 fields_ 有 ckpt 数据但段集不全。
-    if (!views.empty()) {
-        const auto* def_inv = field_index(kDefaultField);
-        if (def_inv && def_inv->live_doc_count() > seg_total) {
-            views.clear();
-        }
-    }
+    // S27-3 步骤 3:fields_ 退化路径删除(同 collect_default_segment_views)。
+    (void)seg_total;
     return views;
 }
 
@@ -625,9 +550,7 @@ TextPlugin::search_text(std::string_view query, std::size_t k,
                           if (a.score != b.score) return a.score > b.score;
                           return a.ord > b.ord;
                       });
-        } else if (const auto* inv = field_index(kDefaultField)) {
-            results = inv->search(terms, k_req, docs_, params_override);
-        }
+        }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
         if (!params_override) cache_.put(cache_key, results, terms);
     }
 
@@ -669,9 +592,7 @@ TextPlugin::search_phrase(std::string_view query, std::size_t k,
                           return a.ord > b.ord;
                       });
             if (results.size() > k) results.resize(k);
-        } else if (const auto* inv = field_index(kDefaultField)) {
-            results = inv->search_phrase(terms, k, docs_, params_override);
-        }
+        }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
         if (!params_override) cache_.put(cache_key, results, terms);
     }
 
@@ -701,9 +622,7 @@ TextPlugin::search_near(std::string_view query, std::uint32_t slop, std::size_t 
                       return a.ord > b.ord;
                   });
         if (results.size() > k) results.resize(k);
-    } else if (const auto* inv = field_index(kDefaultField)) {
-        results = inv->search_near(terms, k, slop, docs_, params_override);
-    }
+    }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
 
     return materialize_hits(results, docs_);
 }
@@ -736,9 +655,7 @@ TextPlugin::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t ma
                       return a.ord > b.ord;
                   });
         if (results.size() > k) results.resize(k);
-    } else if (const auto* inv = field_index(kDefaultField)) {
-        results = inv->search_fuzzy(terms, k, max_edit_distance, docs_, params_override);
-    }
+    }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
 
     return materialize_hits(results, docs_);
 }
@@ -798,11 +715,7 @@ TextPlugin::bool_search(std::string_view query, std::size_t k,
                           return a.ord > b.ord;
                       });
             if (results.size() > k) results.resize(k);
-        } else if (const auto* inv = field_index(kDefaultField)) {
-            results = tree_syntax
-                          ? inv->bool_search_tree(query_node, k, docs_, params_override)
-                          : inv->bool_search(query_node, k, docs_, params_override);
-        }
+        }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
         if (!params_override && !results.empty()) {
             // 收集 MUST/SHOULD/MUST_NOT 全部叶子词，作为该缓存条目的词集。
             std::vector<std::string> must, should, must_not;
@@ -843,10 +756,9 @@ TextPlugin::explain(std::string_view query, std::string_view key,
                                             params_override);
         }
     }
-    // Fallback：fields_（recovery 后 key_to_location_ 未重建时）。
-    const auto* inv = field_index(kDefaultField);
-    if (!inv) return bm25::ScoreExplanation{};
-    return inv->explain(terms, *ord, docs_, params_override);
+    // S27-3 步骤 3:fields_ fallback 删除——key_to_location_ 由 recovery
+    // 重建(步骤 4),未命中即该 key 无文本索引。
+    return bm25::ScoreExplanation{};
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
@@ -869,9 +781,7 @@ TextPlugin::search_wildcard(std::string_view pattern, std::size_t k,
                       return a.ord > b.ord;
                   });
         if (results.size() > k) results.resize(k);
-    } else if (const auto* inv = field_index(kDefaultField)) {
-        results = inv->search_wildcard(std::string(pattern), k, docs_, params_override);
-    }
+    }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
 
     return materialize_hits(results, docs_);
 }
@@ -923,26 +833,7 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
                 }
             }
         }
-    } else {
-        for (auto& [field, term_boosts] : by_field) {
-            const auto* inv = field_index(field);
-            if (!inv) continue;
-            std::map<float, std::vector<std::string>> boost_groups;
-            for (auto& [t, boost] : term_boosts) {
-                auto expanded = synonym_map_ ? synonym_map_->expand(t)
-                                             : std::span<const std::string>{};
-                if (expanded.empty()) expanded = {&t, 1};
-                auto& g = boost_groups[boost];
-                g.insert(g.end(), expanded.begin(), expanded.end());
-            }
-            for (auto& [boost, gterms] : boost_groups) {
-                auto res = inv->search(gterms, k, docs_, params_override);
-                for (auto& r : res) {
-                    acc[r.ord] += static_cast<double>(r.score) * boost;
-                }
-            }
-        }
-    }
+    }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
 
     std::vector<std::pair<std::uint64_t,double>> ranked(acc.begin(), acc.end());
     std::partial_sort(ranked.begin(),
@@ -995,9 +886,7 @@ TextPlugin::search_text_highlight(std::string_view query, std::size_t k,
                           if (a.score != b.score) return a.score > b.score;
                           return a.ord > b.ord;
                       });
-        } else if (const auto* inv = field_index(kDefaultField)) {
-            results = inv->search(terms, k, docs_);
-        }
+        }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
         cache_.put(cache_key, results, terms);
     }
 
@@ -1042,163 +931,8 @@ TextPlugin::search_text_highlight(std::string_view query, std::size_t k,
 // ---- ckpt 原语（legacy 统一容器与 bm25 组件共用；S18-4）----
 // 小端字节编码统一用 sc::detail::put_u*（S20-1 R7：删除本文件的转发层）。
 
-bool TextPlugin::serialize_default(std::vector<std::byte>& out) const {
-    std::shared_lock lk(fields_mu_);
-    auto dit = fields_.find(kDefaultField);
-    if (dit == fields_.end()) return false;
-    dit->second->serialize(out);
-    return true;
-}
-
-bool TextPlugin::serialize_fields(std::vector<std::byte>& out) const {
-    // 格式:u32 fieldCount; 每字段 [u16 nameLen][name][u64 invLen][inv bytes]。
-    std::shared_lock lk(fields_mu_);
-    std::uint32_t other_count = 0;
-    for (auto& [field, inv] : fields_) {
-        if (field == kDefaultField) continue;
-        ++other_count;
-    }
-    if (other_count == 0) return false;
-    sc::detail::put_u32(out, other_count);
-    for (auto& [field, inv] : fields_) {
-        if (field == kDefaultField) continue;
-        sc::detail::put_u16(out, static_cast<std::uint16_t>(field.size()));
-        out.insert(out.end(),
-            reinterpret_cast<const std::byte*>(field.data()),
-            reinterpret_cast<const std::byte*>(field.data()) + field.size());
-        std::uint64_t pos = out.size();
-        sc::detail::put_u64(out, 0);  // invLen 占位
-        inv->serialize(out);
-        std::uint64_t inv_len = out.size() - pos - 8;
-        std::memcpy(out.data() + pos, &inv_len, 8);
-    }
-    return true;
-}
-
-bool TextPlugin::serialize_default_delta(std::vector<std::byte>& out,
-                                         std::uint64_t from) const {
-    std::shared_lock lk(fields_mu_);
-    auto dit = fields_.find(kDefaultField);
-    if (dit == fields_.end()) return false;
-    dit->second->serialize_delta(out, from);
-    return true;
-}
-
-bool TextPlugin::serialize_fields_delta(std::vector<std::byte>& out,
-                                        std::uint64_t from) const {
-    std::shared_lock lk(fields_mu_);
-    std::uint32_t other = 0;
-    for (auto& [field, inv] : fields_) {
-        if (field != kDefaultField) ++other;
-    }
-    if (other == 0) return false;
-    sc::detail::put_u32(out, other);
-    for (auto& [field, inv] : fields_) {
-        if (field == kDefaultField) continue;
-        sc::detail::put_u16(out, static_cast<std::uint16_t>(field.size()));
-        out.insert(out.end(),
-            reinterpret_cast<const std::byte*>(field.data()),
-            reinterpret_cast<const std::byte*>(field.data()) + field.size());
-        const std::uint64_t pos = out.size();
-        sc::detail::put_u64(out, 0);  // len 占位
-        inv->serialize_delta(out, from);
-        const std::uint64_t len = out.size() - pos - 8;
-        std::memcpy(out.data() + pos, &len, 8);
-    }
-    return true;
-}
-
-bool TextPlugin::deserialize_default(std::span<const std::byte> payload) {
-    std::unique_lock lk(fields_mu_);
-    auto it = fields_.find(std::string(kDefaultField));
-    std::unique_ptr<bm25::InvertedIndex> inv;
-    if (it == fields_.end()) {
-        inv = std::make_unique<bm25::InvertedIndex>(config_.bm25_params,
-                                                    config_.index_positions);
-        if (inv->deserialize(payload)) {
-            fields_.emplace(kDefaultField, std::move(inv));
-            dirty_default_.store(false, std::memory_order_relaxed);
-            return true;
-        }
-        return false;
-    }
-    if (it->second->deserialize(payload)) {
-        dirty_default_.store(false, std::memory_order_relaxed);
-        return true;
-    }
-    return false;
-}
-
-bool TextPlugin::deserialize_fields(std::span<const std::byte> payload) {
-    const auto* p = payload.data();
-    const auto* end = p + payload.size();
-    if (end - p < 4) return false;
-    std::uint32_t cnt = sc::detail::get_u32(p); p += 4;
-    std::unique_lock lk(fields_mu_);
-    bool any = false;
-    bool ok = true;
-    for (std::uint32_t i = 0; i < cnt; ++i) {
-        if (end - p < 2) { ok = false; break; }
-        std::uint16_t nlen = sc::detail::get_u16(p); p += 2;
-        if (end - p < nlen + 8) { ok = false; break; }
-        std::string name(reinterpret_cast<const char*>(p), nlen);
-        p += nlen;
-        std::uint64_t ilen = sc::detail::get_u64(p); p += 8;
-        if (end - p < static_cast<std::ptrdiff_t>(ilen)) { ok = false; break; }
-        auto inv = std::make_unique<bm25::InvertedIndex>(
-            config_.bm25_params, config_.index_positions);
-        if (inv->deserialize(std::span<const std::byte>(p, ilen))) {
-            fields_.emplace(std::move(name), std::move(inv));
-            any = true;
-        } else {
-            ok = false;
-        }
-        p += ilen;
-    }
-    if (any && ok) {
-        dirty_fields_.store(false, std::memory_order_relaxed);
-    }
-    return any && ok;
-}
-
-bool TextPlugin::apply_default_delta(std::span<const std::byte> payload) {
-    std::unique_lock lk(fields_mu_);
-    auto it = fields_.find(std::string(kDefaultField));
-    if (it == fields_.end()) {
-        auto inv = std::make_unique<bm25::InvertedIndex>(
-            config_.bm25_params, config_.index_positions);
-        it = fields_.emplace(kDefaultField, std::move(inv)).first;
-    }
-    return it->second->apply_delta(payload);
-}
-
-bool TextPlugin::apply_fields_delta(std::span<const std::byte> payload) {
-    const auto* p = payload.data();
-    const auto* end = p + payload.size();
-    if (end - p < 4) return false;
-    std::uint32_t cnt = sc::detail::get_u32(p); p += 4;
-    std::unique_lock lk(fields_mu_);
-    for (std::uint32_t i = 0; i < cnt; ++i) {
-        if (end - p < 2) return false;
-        std::uint16_t nlen = sc::detail::get_u16(p); p += 2;
-        if (end - p < nlen + 8) return false;
-        std::string name(reinterpret_cast<const char*>(p), nlen);
-        p += nlen;
-        std::uint64_t ilen = sc::detail::get_u64(p); p += 8;
-        if (end - p < static_cast<std::ptrdiff_t>(ilen)) return false;
-        auto it = fields_.find(name);
-        if (it == fields_.end()) {
-            auto inv = std::make_unique<bm25::InvertedIndex>(
-                config_.bm25_params, config_.index_positions);
-            it = fields_.emplace(std::move(name), std::move(inv)).first;
-        }
-        if (!it->second->apply_delta(std::span<const std::byte>(p, ilen))) {
-            return false;
-        }
-        p += ilen;
-    }
-    return true;
-}
+// S27-3 步骤 3:fields_ 序列化/反序列化/delta 家族退役——bm25.ckpt 只剩
+// kSegManifest(段自含 kBm25Default/kSegFields/kSegDocStore,见 segment.hpp)。
 
 // ---- bm25 组件 checkpoint（bm25.ckpt 文件族；S17 格式不变）----
 
@@ -1211,18 +945,8 @@ bool TextPlugin::save_component_base(std::string_view dir,
         std::filesystem::rename(fp, prev, ec);
     }
     sc::SectionWriter sw;  // S20-1 R4
-    {
-        std::vector<std::byte> buf;
-        if (serialize_default(buf)) {
-            sw.add(sc::CkptSectionType::kBm25Default, std::move(buf));
-        }
-    }
-    {
-        std::vector<std::byte> fbuf;
-        if (serialize_fields(fbuf)) {
-            sw.add(sc::CkptSectionType::kBm25Fields, std::move(fbuf));
-        }
-    }
+    // S27-3 步骤 3:kBm25Default/kBm25Fields 退役——倒排数据在各段文件内
+    // 自含,bm25.ckpt 只承载段清单(kSegManifest)。
     // S27-3 B2b 步骤 1:段清单进 bm25.ckpt(kSegManifest,recovery 重写
     // 步骤 4 的读取源;先于 index.manifest 提交,单一 commit point 不变量
     // 见设计 §4.1)。过渡期仍提交 segments.manifest(SegmentSet::open 兼容,
@@ -1244,46 +968,8 @@ bool TextPlugin::save_component_base(std::string_view dir,
     return true;
 }
 
-TextPlugin::DeltaSaveResult
-TextPlugin::save_component_delta(std::string_view dir,
-                                 std::uint64_t watermark) {
-    DeltaSaveResult result;
-    const std::string fp = comp_path(dir);
-    const std::uint32_t seq = chain_.next_seq;
-    const std::string dpath = fp + ".d" + std::to_string(seq);
-    const std::uint64_t from = chain_.chain_wm;
-    sc::SectionWriter sw;  // S20-1 R4
-    // kDeltaInfo：链校验三元组。
-    {
-        std::vector<std::byte> b;
-        sc::detail::put_u64(b, chain_.base_gen);
-        sc::detail::put_u64(b, from);
-        sc::detail::put_u32(b, seq);
-        sw.add(sc::CkptSectionType::kDeltaInfo, std::move(b));
-    }
-    // bm25 delta：default + fields（组件 delta 恒全量构造，S17 设计要点）。
-    {
-        std::vector<std::byte> b;
-        if (serialize_default_delta(b, from)) {
-            sw.add(sc::CkptSectionType::kBm25DefaultDelta, std::move(b));
-        }
-    }
-    {
-        std::vector<std::byte> fb;
-        if (serialize_fields_delta(fb, from)) {
-            sw.add(sc::CkptSectionType::kBm25FieldsDelta, std::move(fb));
-        }
-    }
-    if (!sc::SearchCheckpoint::write(dpath, watermark, sw.sections())) {
-        return result;
-    }
-    chain_.chain_wm = watermark;
-    chain_.next_seq = seq + 1;
-    clear_dirty();
-    result.wrote = true;
-    result.new_seq = seq;
-    return result;
-}
+// S27-3 步骤 3:save_component_delta 退役(Slice C 已停用 delta 链,
+// fields_ 删除后 delta 序列化源不复存在)。
 
 TextPlugin::LoadResult
 TextPlugin::load_component(std::string_view dir,
@@ -1308,30 +994,18 @@ TextPlugin::load_component(std::string_view dir,
         return result;
     };
     if (!lc) return fail();
-    // kBm25Default / kBm25Fields 段应用。
+    // S27-3 步骤 3:只认 kSegManifest(倒排在段文件内自含)。老格式 ckpt
+    // (仅 kBm25Default/kBm25Fields,无 kSegManifest)→ 不认 → 退全量 fold
+    // 重建段集(安全慢;legacy 迁移见步骤 5)。
     bool segments_ok = true;
     bool any = false;
     for (const auto& ls : lc->sections) {
         if (!ls.crc_ok) { segments_ok = false; continue; }
         auto st = static_cast<sc::CkptSectionType>(ls.type);
-        if (st == sc::CkptSectionType::kBm25Default) {
-            if (deserialize_default(std::span<const std::byte>(
-                    ls.payload.data(), ls.payload.size()))) {
-                any = true;
-            } else {
-                segments_ok = false;
-            }
-        } else if (st == sc::CkptSectionType::kBm25Fields) {
-            if (deserialize_fields(std::span<const std::byte>(
-                    ls.payload.data(), ls.payload.size()))) {
-                any = true;
-            } else {
-                segments_ok = false;
-            }
-        } else if (st == sc::CkptSectionType::kSegManifest) {
-            // S27-3 B2b 步骤 4:捕获内嵌段清单,open() 从它开段集
-            // (recovery 主路径;单一 commit point 语义)。
+        if (st == sc::CkptSectionType::kSegManifest) {
+            // 捕获内嵌段清单,open() 从它开段集(步骤 4 recovery 主路径)。
             pending_seg_manifest_.assign(ls.payload.begin(), ls.payload.end());
+            any = true;
         }
     }
     if (!any) segments_ok = false;
@@ -1348,7 +1022,35 @@ TextPlugin::load_component(std::string_view dir,
     } else {
         return fail();
     }
+    // S27-3 步骤 3:段集装载下沉到此(原在 open())——shim/独立调用
+    // load_component 的路径同样恢复段集。dir 为空(纯内存用法)跳过。
+    if (!dir.empty()) {
+        init_segment_set(dir, /*loaded=*/true);
+    }
     return result;
+}
+
+// S27-3 步骤 3/4:初始化段集——优先 bm25.ckpt 内嵌 kSegManifest(单一
+// commit point 主路径),回退过渡期 segments.manifest,再回退空集。装载后
+// 重建 key→(seg_id, docid) 定位。
+void TextPlugin::init_segment_set(std::string_view dir, bool loaded) {
+    const std::string segs_dir = std::string(dir) + "/bm25_segments/";
+    std::error_code ec;
+    std::filesystem::create_directories(segs_dir, ec);
+    std::unique_ptr<search::SegmentSet> opened;
+    if (loaded && !pending_seg_manifest_.empty()) {
+        opened = search::SegmentSet::open_from_payload(segs_dir,
+                                                       pending_seg_manifest_);
+    }
+    if (!opened) opened = search::SegmentSet::open(segs_dir);  // 过渡回退
+    if (opened) {
+        segment_set_ = std::move(opened);
+    } else {
+        segment_set_ = std::make_unique<search::SegmentSet>();
+    }
+    pending_seg_manifest_.clear();
+    pending_seg_manifest_.shrink_to_fit();
+    rebuild_key_locations();
 }
 
 
@@ -1364,31 +1066,11 @@ plugin::PluginStatus TextPlugin::open(const plugin::OpenContext& ctx) {
     watermark_ = r.loaded ? r.watermark : 0;
     rebase_needed_.store(!r.loaded, std::memory_order_relaxed);
 
-    // S27-3 Slice B1：初始化 Building 段 + SegmentSet。
-    // S27-3 B2b 步骤 4:recovery 主路径——**优先**从 bm25.ckpt 内嵌的
-    // kSegManifest 开段集(与 index.manifest 同一 commit point,无双清单
-    // 冲突);载入失败/无内嵌清单 → 回退过渡期 segments.manifest → 空集
-    // (fields_ 退化路径兜底,查询侧 degrade guard 已有)。
-    if (!dir_.empty()) {
-        const std::string segs_dir = dir_ + "/bm25_segments/";
-        std::error_code ec;
-        std::filesystem::create_directories(segs_dir, ec);
-        std::unique_ptr<search::SegmentSet> opened;
-        if (r.loaded && !pending_seg_manifest_.empty()) {
-            opened = search::SegmentSet::open_from_payload(
-                segs_dir, pending_seg_manifest_);
-        }
-        if (!opened) opened = search::SegmentSet::open(segs_dir);  // 过渡回退
-        if (opened) {
-            segment_set_ = std::move(opened);
-        } else {
-            segment_set_ = std::make_unique<search::SegmentSet>();
-        }
-        pending_seg_manifest_.clear();
-        pending_seg_manifest_.shrink_to_fit();
-        // 步骤 4:重建 key→(seg_id, docid)——否则 recovery 后对 ckpt 前
-        // 文档的删除/覆盖 mark_dead 落空(段内幽灵直到 merge)。
-        rebuild_key_locations();
+    // S27-3 步骤 3/4:段集初始化。loaded 情形已由 load_component 完成
+    // (内嵌 kSegManifest 主路径);此处兜底未 loaded(ckpt 缺失/损坏 →
+    // 空段集 + 全量重放重建)。building_ 已在构造期建好。
+    if (!dir_.empty() && !r.loaded) {
+        init_segment_set(dir_, /*loaded=*/false);
     }
     building_ = std::make_unique<search::SealedSegment>();
 

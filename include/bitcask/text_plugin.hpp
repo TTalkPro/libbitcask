@@ -253,44 +253,11 @@ public:
         return segment_set_.get();
     }
 
-    // ---- 记账（S14-3 语义；default/fields 两段独立脏位）----
-    [[nodiscard]] bool dirty() const noexcept {
-        return dirty_default_.load(std::memory_order_relaxed) ||
-               dirty_fields_.load(std::memory_order_relaxed);
-    }
-    [[nodiscard]] bool dirty_default() const noexcept {
-        return dirty_default_.load(std::memory_order_relaxed);
-    }
-    [[nodiscard]] bool dirty_fields() const noexcept {
-        return dirty_fields_.load(std::memory_order_relaxed);
-    }
-    void clear_dirty() noexcept {
-        dirty_default_.store(false, std::memory_order_relaxed);
-        dirty_fields_.store(false, std::memory_order_relaxed);
-    }
-    void clear_dirty_default() noexcept {
-        dirty_default_.store(false, std::memory_order_relaxed);
-    }
-    void clear_dirty_fields() noexcept {
-        dirty_fields_.store(false, std::memory_order_relaxed);
-    }
-
-    // ---- legacy 统一 ckpt 容器原语（SearchLayer 的 search.ckpt 路径消费；
-    //      P5 随 legacy 收编后删除）----
-    // base 段序列化：段不存在/为空返回 false（caller 省段）。
-    [[nodiscard]] bool serialize_default(std::vector<std::byte>& out) const;
-    [[nodiscard]] bool serialize_fields(std::vector<std::byte>& out) const;
-    // delta 段序列化（窗口 [from, ...)）。
-    [[nodiscard]] bool serialize_default_delta(std::vector<std::byte>& out,
-                                               std::uint64_t from) const;
-    [[nodiscard]] bool serialize_fields_delta(std::vector<std::byte>& out,
-                                              std::uint64_t from) const;
-    // base 段反序列化（成功清对应脏位）。
-    [[nodiscard]] bool deserialize_default(std::span<const std::byte> payload);
-    [[nodiscard]] bool deserialize_fields(std::span<const std::byte> payload);
-    // delta 段重放。
-    [[nodiscard]] bool apply_default_delta(std::span<const std::byte> payload);
-    [[nodiscard]] bool apply_fields_delta(std::span<const std::byte> payload);
+    // ---- 记账（S27-3 步骤 3:fields_ 退役,单一段侧脏位）----
+    // seg_dirty_:building_ 有新文档 / 段有新 mark_dead / 段集成员变动。
+    // reducer 单写者置位;flush(reducer RunFn)读 + save 成功清零。
+    [[nodiscard]] bool dirty() const noexcept { return seg_dirty_; }
+    void clear_dirty() noexcept { seg_dirty_ = false; }
 
     // ---- bm25 组件 checkpoint（bm25.ckpt 文件族；S18-6 收进 flush/open）----
     [[nodiscard]] bool save_component_base(std::string_view dir,
@@ -298,9 +265,8 @@ public:
     // S23-M4：apply_job 双入口的共享实现（doc_text 所有权经右值参数注入）。
     void apply_job_impl(const search::ReduceJob& job, std::string&& doc_text);
     // 三组件同构，收敛至 ckpt:: 共用类型（S20-1 R6）。
-    using DeltaSaveResult = ckpt::DeltaSaveResult;
-    [[nodiscard]] DeltaSaveResult save_component_delta(std::string_view dir,
-                                                       std::uint64_t watermark);
+    // S27-3 步骤 3:save_component_delta 退役(delta 链 Slice C 已停,
+    // fields_ 删除后序列化源不复存在)。
     using LoadResult = ckpt::LoadResult;
     [[nodiscard]] LoadResult load_component(std::string_view dir,
                                             std::uint64_t expected_base_wm,
@@ -367,8 +333,8 @@ private:
     };
 
     // 取或建某字段的 InvertedIndex（S8.6）。
-    bm25::InvertedIndex& field_index(std::string_view field);
-    const bm25::InvertedIndex* field_index(std::string_view field) const;
+    // S27-3 步骤 3:field_index/fields_ 退役——段集(SealedSegment 内自含
+    // per-field InvertedIndex)是唯一索引载体。
     // S10-A4：字段名 intern（node 稳定 → string_view 安全）。
     std::string_view intern_field_name(std::string_view name);
     // S12-2：写路径末尾的自动 compaction 触发（reducer 线程内）。
@@ -395,16 +361,6 @@ private:
     const bm25::DocTable&  docs_;
     bm25::DocLenWriter&    doc_len_writer_;
     bm25::CompactionStats& stats_;
-    // S8.6：每字段一个 InvertedIndex（字段间 avgdl/idf 隔离）。O8：透明
-    // hash。C1：fields_mu_ 只保护 map 结构（写线程首次 emplace vs 查询
-    // find）；InvertedIndex 本体地址稳定且自带分片并发 → 引用可出锁用。
-    mutable std::shared_mutex fields_mu_;
-    std::unordered_map<std::string, std::unique_ptr<bm25::InvertedIndex>,
-                       StringHash, std::equal_to<>> fields_;
-    // R3：ord → (字段名 → 该字段 doc_len)，on_delete 按字段精确扣减。
-    std::unordered_map<std::uint64_t,
-                       std::vector<std::pair<std::string_view, std::uint32_t>>>
-        ord_field_lens_;
     // S10-A4：字段名 intern 池（unordered_set node 稳定）。
     std::unordered_set<std::string, StringHash, std::equal_to<>>
         field_names_intern_;
@@ -413,9 +369,9 @@ private:
     mutable search::SearchCache cache_;
     mutable DocTextLru doc_texts_;
     std::shared_ptr<const SynonymMap> synonym_map_;
-    // S14-3：段级 dirty-bit（写路径置位，save/load 成功清零；初值 true）。
-    std::atomic<bool> dirty_default_{true};
-    std::atomic<bool> dirty_fields_{true};
+    // S27-3 步骤 3:段侧脏位(初值 true——新 open 后首次 flush 恒 base,
+    // 与旧 dirty_default_/dirty_fields_ 初值语义一致)。reducer 单写者。
+    bool seg_dirty_ = true;
     ChainState chain_{};
     // S18-6：flush/open 自治状态。
     std::string dir_;               // open 时记录（flush 复用）
@@ -446,6 +402,8 @@ private:
     // 找不到段位,mark_dead 落空)。
     std::vector<std::byte> pending_seg_manifest_;
     void rebuild_key_locations();
+    // 段集初始化(load_component loaded 情形 / open 未 loaded 兜底共用)。
+    void init_segment_set(std::string_view dir, bool loaded);
 
     std::unique_ptr<search::SealedSegment>   building_;     // 当前 Building 段
     std::unique_ptr<search::SegmentSet>      segment_set_;  // 已封口活跃段集

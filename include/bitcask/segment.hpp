@@ -27,7 +27,9 @@
 #include "bitcask/segment_query.hpp"   // SegmentView
 #include "bitcask/string_hash.hpp"     // StringHash（透明 hash）
 
+#include <atomic>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -74,12 +76,14 @@ public:
         const DocId docid = static_cast<DocId>(keys_.size());
         std::uint32_t dl = 0;
         for (const auto& [t, d] : terms) dl += d.first;
-        inv_.add_doc(docid, terms);
+        // 写序(并发契约,见 live_/count_pub_ 注释):行 → 发布 → 倒排。
         keys_.push_back(std::move(key));
         lsns_.push_back(lsn);
         slots_.push_back(index::DocSlot{.loc = loc, .tstamp = tstamp, .doc_len = dl});
         doc_lens_.push_back(dl);
-        live_.push_back(1);
+        live_.emplace_back(1);
+        count_pub_.store(docid + 1, std::memory_order_release);
+        inv_.add_doc(docid, terms);
         return docid;
     }
 
@@ -104,6 +108,14 @@ public:
               std::uint32_t total_doc_len,
               index::DocLoc loc = {}, std::uint32_t tstamp = 0) {
         const DocId docid = static_cast<DocId>(keys_.size());
+        // 写序(并发契约):行 → 发布 → 各字段倒排。
+        keys_.push_back(std::move(key));
+        lsns_.push_back(lsn);
+        slots_.push_back(index::DocSlot{.loc = loc, .tstamp = tstamp,
+                                        .doc_len = total_doc_len});
+        doc_lens_.push_back(total_doc_len);  // 段级 total（不是 per-field）
+        live_.emplace_back(1);
+        count_pub_.store(docid + 1, std::memory_order_release);
         // 各字段写倒排（默认 → inv_，其余 → fields_ map）。
         for (const auto& f : fields) {
             if (f.field_name == kDefaultField) {
@@ -133,21 +145,18 @@ public:
                 inv->add_doc(docid, *f.terms);
             }
         }
-        keys_.push_back(std::move(key));
-        lsns_.push_back(lsn);
-        slots_.push_back(index::DocSlot{.loc = loc, .tstamp = tstamp,
-                                        .doc_len = total_doc_len});
-        doc_lens_.push_back(total_doc_len);  // 段级 total（不是 per-field）
-        live_.push_back(1);
         return docid;
     }
 
     // ---- LiveChecker（按段内 docid） ----
     [[nodiscard]] bool is_live(std::uint64_t docid) const override {
-        return docid < live_.size() && live_[docid] != 0;
+        return docid < count_pub_.load(std::memory_order_acquire) &&
+               live_[docid].load(std::memory_order_relaxed) != 0;
     }
     [[nodiscard]] std::uint32_t doc_len(std::uint64_t docid) const override {
-        return docid < doc_lens_.size() ? doc_lens_[docid] : 0;
+        return docid < count_pub_.load(std::memory_order_acquire)
+                   ? doc_lens_[docid]
+                   : 0;
     }
 
     // ---- 段级删除（设计文档 §3.4：封口段仅 live_docs 可变）----
@@ -167,8 +176,8 @@ public:
     // 拿到非 const SealedSegment*（SegmentSet::segment() 显式返回非 const
     // 访问，或经 const_cast 显式 cast，二者都表明「删除是 mutation」）。
     [[nodiscard]] bool mark_dead(DocId docid) {
-        if (docid >= live_.size()) return false;
-        live_[docid] = 0;
+        if (docid >= count_pub_.load(std::memory_order_acquire)) return false;
+        live_[docid].store(0, std::memory_order_relaxed);
         dead_dirty_ = true;  // S27-3 B2b 步骤 4:待重存(见 dead_dirty 注释)
         return true;
     }
@@ -181,12 +190,17 @@ public:
     void clear_dead_dirty() { dead_dirty_ = false; }
     // 活文档计数（live_==1 的数量）——测试 / 内省用。
     [[nodiscard]] std::size_t live_doc_count() const {
+        const auto cnt = count_pub_.load(std::memory_order_acquire);
         std::size_t n = 0;
-        for (auto v : live_) if (v) ++n;
+        for (std::uint64_t i = 0; i < cnt; ++i) {
+            if (live_[i].load(std::memory_order_relaxed) != 0) ++n;
+        }
         return n;
     }
 
-    [[nodiscard]] std::size_t doc_count() const { return keys_.size(); }
+    [[nodiscard]] std::size_t doc_count() const {
+        return count_pub_.load(std::memory_order_acquire);
+    }
     [[nodiscard]] const bm25::InvertedIndex& inverted() const { return inv_; }
     [[nodiscard]] const std::string& key_at(DocId d) const { return keys_[d]; }
     [[nodiscard]] Lsn lsn_at(DocId d) const { return lsns_[d]; }
@@ -353,8 +367,9 @@ private:
         std::vector<std::byte> b;
         put_u32(b, kDocStoreMagic);
         put_u32(b, kDocStoreVersion);
-        put_u32(b, static_cast<std::uint32_t>(keys_.size()));
-        for (std::size_t i = 0; i < keys_.size(); ++i) {
+        const auto n_docs = count_pub_.load(std::memory_order_acquire);
+        put_u32(b, static_cast<std::uint32_t>(n_docs));
+        for (std::size_t i = 0; i < n_docs; ++i) {
             put_u32(b, static_cast<std::uint32_t>(keys_[i].size()));
             b.insert(b.end(),
                      reinterpret_cast<const std::byte*>(keys_[i].data()),
@@ -366,7 +381,8 @@ private:
             put_u32(b, slots_[i].loc.total_sz);
             put_u32(b, slots_[i].tstamp);
             put_u32(b, slots_[i].doc_len);
-            b.push_back(static_cast<std::byte>(live_[i]));
+            b.push_back(static_cast<std::byte>(
+                live_[i].load(std::memory_order_relaxed)));
         }
         return b;
     }
@@ -392,8 +408,6 @@ private:
         if (!rd_u32(n)) return false;
         keys_.clear(); lsns_.clear(); slots_.clear();
         doc_lens_.clear(); live_.clear();
-        keys_.reserve(n); lsns_.reserve(n); slots_.reserve(n);
-        doc_lens_.reserve(n); live_.reserve(n);
         for (std::uint32_t i = 0; i < n; ++i) {
             std::uint32_t klen = 0;
             if (!rd_u32(klen)) return false;
@@ -414,21 +428,28 @@ private:
                 .loc = index::DocLoc{.offset = off, .file_id = fid, .total_sz = tsz},
                 .tstamp = ts, .doc_len = dl});
             doc_lens_.push_back(dl);
-            live_.push_back(lv);
+            live_.emplace_back(lv);
         }
+        count_pub_.store(n, std::memory_order_release);  // load 单线程,尾部发布
         return true;
     }
 
     // ---- 段内存储 ----
     bm25::InvertedIndex        inv_;       // 默认字段（kDefaultField）
-    std::vector<std::string>   keys_;
-    std::vector<Lsn>           lsns_;
-    std::vector<index::DocSlot> slots_;
-    std::vector<std::uint32_t> doc_lens_;   // 段级 total doc_len（Σ 各字段 dl）
+    std::deque<std::string>     keys_;
+    std::deque<Lsn>            lsns_;
+    std::deque<index::DocSlot> slots_;
+    std::deque<std::uint32_t>  doc_lens_;   // 段级 total doc_len（Σ 各字段 dl）
     // mutable：设计文档 §3.4「封口段仅 live_docs 可变」。mark_dead 翻位删
     // 除是封口后唯一允许的 mutation；接口本身已显式标注非常量（caller 须
     // 取到非 const SealedSegment*，见 mark_dead 注释）。
-    mutable std::vector<std::uint8_t> live_;
+    // S27-3 步骤 3:Building 段查询并发化——doc_store 数组 vector→deque
+    // (增长不搬移既有元素,免读者 realloc-UAF),已发布行数经 count_pub_
+    // (release 发布/acquire 读)界定读者可达范围;live_ 元素原子(mark_dead
+    // 翻位 vs 读者 is_live,TSan 干净)。写序:先追加行,再发布计数,最后
+    // add_doc 进倒排——读者经 posting 拿到的 docid 必有已发布的行。
+    mutable std::deque<std::atomic<std::uint8_t>> live_;
+    std::atomic<std::uint64_t> count_pub_{0};
     bool dead_dirty_ = false;  // S27-3 B2b 步骤 4:save 后有新 mark_dead
 
     // 命名字段（除默认）：字段名 → InvertedIndex。
