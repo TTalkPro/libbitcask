@@ -458,3 +458,249 @@ TEST(TextPlugin, SegmentLifecycleVsQueryStress) {
     EXPECT_EQ(anomalies.load(), 0u);
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// S27-4 P2:BuilderPool(B=1,串行等价)。on_put 路由派发 → builder 线程
+// apply;drain() 补 read-your-writes;flush 前置 drain;LSN 守卫仲裁
+// 在途 put vs 删除。
+// ===========================================================================
+
+// 基本可见性 + 覆盖 + 删除:全部经 on_put 事件路由(builder 派发),drain
+// 后查询结果与内联模式逐点一致。
+TEST(TextPlugin, BuilderModeVisibilityOverwriteDelete) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_builder_vis";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.builder_threads = 1;
+    text::TextPlugin p(cfg, idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
+
+    for (std::uint64_t ord = 0; ord < 3; ++ord) {
+        const std::string key = "k" + std::to_string(ord);
+        host_put_row(idx, key, ord);
+        plugin::DocView dv;
+        const std::string text = "hello world " + std::to_string(ord);
+        dv.text = text;
+        plugin::PutEvent e;
+        e.ord = ord;
+        e.key = key;
+        e.doc = &dv;
+        e.loc = plugin::RecordLoc{1, ord * 100, 50};
+        e.tstamp = static_cast<std::uint32_t>(1000 + ord);
+        p.on_put(e, nullptr);  // 单文本活写:prep 为空 → raw 路径派发
+    }
+    p.drain();
+    {
+        auto r = p.search_text("hello", 10);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), 3u);
+    }
+
+    // 覆盖 k1(ord=3):旧版本 mark_dead,新词可查、旧独有词消失。
+    {
+        host_put_row(idx, "k1", 3);
+        plugin::DocView dv;
+        dv.text = "banana split";
+        plugin::PutEvent e;
+        e.ord = 3;
+        e.key = "k1";
+        e.doc = &dv;
+        e.loc = plugin::RecordLoc{1, 300, 50};
+        e.tstamp = 2000;
+        p.on_put(e, nullptr);
+        p.drain();
+        auto rb = p.search_text("banana", 10);
+        ASSERT_TRUE(rb.has_value());
+        ASSERT_EQ(rb->size(), 1u);
+        EXPECT_EQ((*rb)[0].key, "k1");
+        auto rh = p.search_text("hello", 10);
+        ASSERT_TRUE(rh.has_value());
+        EXPECT_EQ(rh->size(), 2u);  // k0/k2
+    }
+
+    // 删除 vs 在途 put(LSN 守卫):k9 的 put(ord=9)入队后立刻删(tomb=10,
+    // reducer 内联)——无论 apply 先后,墓碑 ord 胜出,drain 后不可见。
+    {
+        host_put_row(idx, "k9", 9);
+        plugin::DocView dv;
+        dv.text = "zebra quark";
+        plugin::PutEvent e;
+        e.ord = 9;
+        e.key = "k9";
+        e.doc = &dv;
+        e.loc = plugin::RecordLoc{1, 900, 50};
+        e.tstamp = 3000;
+        p.on_put(e, nullptr);
+        p.on_delete("k9", /*tomb_ord=*/10, /*prior_ord=*/9);
+        p.drain();
+        auto r = p.search_text("zebra", 10);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_TRUE(r->empty());
+    }
+    ASSERT_EQ(p.close(), plugin::PluginStatus::kOk);
+    fs::remove_all(dir);
+}
+
+// 多字段 job 路径:prepare(map 阶段分析)产物经 on_put 派发 builder,
+// search_fields 命中。
+TEST(TextPlugin, BuilderModeMultiFieldJobDispatch) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_builder_mf";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.builder_threads = 1;
+    text::TextPlugin p(cfg, idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
+
+    const std::vector<plugin::FieldKV> fields = {{"title", "quantum leap"},
+                                                 {"body", "engine room"}};
+    plugin::DocView dv;
+    dv.fields = fields;
+    plugin::PutEvent e;
+    e.ord = 0;
+    e.key = "doc0";
+    e.doc = &dv;
+    e.loc = plugin::RecordLoc{1, 0, 80};
+    e.tstamp = 1000;
+    auto prep = p.prepare(e);
+    ASSERT_NE(prep, nullptr);
+    host_put_row(idx, "doc0", 0);
+    p.on_put(e, std::move(prep));
+    p.drain();
+
+    auto rt = p.search_fields("title:quantum", 10);
+    ASSERT_TRUE(rt.has_value());
+    ASSERT_EQ(rt->size(), 1u);
+    EXPECT_EQ((*rt)[0].key, "doc0");
+    auto rc = p.search_text("engine", 10);  // catch-all 合并
+    ASSERT_TRUE(rc.has_value());
+    EXPECT_EQ(rc->size(), 1u);
+    ASSERT_EQ(p.close(), plugin::PluginStatus::kOk);
+    fs::remove_all(dir);
+}
+
+// flush 前置 drain(在途 job 计入 ckpt)+ 跨模式重开:B=1 写入 → flush →
+// B=0 重开查询命中(段格式与模式无关)。
+TEST(TextPlugin, BuilderModeFlushRoundTrip) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_builder_rt";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.builder_threads = 1;
+    text::TextPlugin a(cfg, idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+
+    for (std::uint64_t ord = 0; ord < 5; ++ord) {
+        const std::string key = "k" + std::to_string(ord);
+        host_put_row(idx, key, ord);
+        plugin::DocView dv;
+        const std::string text = "gamma ray " + std::to_string(ord);
+        dv.text = text;
+        plugin::PutEvent e;
+        e.ord = ord;
+        e.key = key;
+        e.doc = &dv;
+        e.loc = plugin::RecordLoc{1, ord * 100, 50};
+        e.tstamp = static_cast<std::uint32_t>(1000 + ord);
+        a.on_put(e, nullptr);
+    }
+    // 不显式 drain——flush 自身必须先排干(否则 covered_ord 撒谎)。
+    plugin::FlushRequest req;
+    req.watermark = 5;
+    auto fr = a.flush(req);
+    ASSERT_EQ(fr.status, plugin::PluginStatus::kOk);
+    EXPECT_EQ(fr.covered_ord, 5u);
+    const auto st = a.chain_state();
+    ASSERT_EQ(a.close(), plugin::PluginStatus::kOk);
+
+    index::Index idx2;
+    for (std::uint64_t ord = 0; ord < 5; ++ord) {
+        host_put_row(idx2, "k" + std::to_string(ord), ord);
+    }
+    text::TextPlugin b(make_cfg(), idx2, idx2, idx2);  // B=0 内联模式重开
+    plugin::OpenContext c2;
+    c2.dir = dir_s;
+    c2.committed_base_watermark = st.base_gen;
+    c2.committed_chain_watermark = st.chain_wm;
+    c2.committed_chain_seq = st.next_seq - 1;
+    ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+    EXPECT_EQ(b.watermark(), 5u);
+    auto r = b.search_text("gamma", 10);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 5u);
+    fs::remove_all(dir);
+}
+
+// 并发面:writer 经 on_put 持续派发(builder 线程 apply)+ 2 个查询线程
+// 不 drain 直查(refresh 语义:结果可滞后,不可崩/不可见异常计数)。
+TEST(TextPlugin, BuilderModeConcurrentQueryStress) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_builder_stress";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.builder_threads = 1;
+    text::TextPlugin p(cfg, idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
+
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> anomalies{0};
+    std::vector<std::thread> readers;
+    readers.reserve(2);
+    for (int t = 0; t < 2; ++t) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto r = p.search_text("stress", 5);
+                if (!r.has_value()) anomalies.fetch_add(1);
+            }
+        });
+    }
+    constexpr std::uint64_t kDocs = 2000;
+    for (std::uint64_t ord = 0; ord < kDocs; ++ord) {
+        const std::string key = "s" + std::to_string(ord);
+        host_put_row(idx, key, ord);
+        plugin::DocView dv;
+        const std::string text = "stress doc " + std::to_string(ord);
+        dv.text = text;
+        plugin::PutEvent e;
+        e.ord = ord;
+        e.key = key;
+        e.doc = &dv;
+        e.loc = plugin::RecordLoc{1, ord * 100, 50};
+        e.tstamp = static_cast<std::uint32_t>(1000 + ord);
+        p.on_put(e, nullptr);
+        if (ord % 7 == 0) {  // 混入删除(reducer 内联,LSN 守卫仲裁)
+            p.on_delete(key, ord + kDocs, ord);
+        }
+    }
+    p.drain();
+    stop.store(true);
+    for (auto& r : readers) r.join();
+    EXPECT_EQ(anomalies.load(), 0u);
+
+    auto r = p.search_text("stress", static_cast<std::size_t>(kDocs));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), kDocs - (kDocs + 6) / 7);  // 删除的 ord%7==0 不可见
+    ASSERT_EQ(p.close(), plugin::PluginStatus::kOk);
+    fs::remove_all(dir);
+}

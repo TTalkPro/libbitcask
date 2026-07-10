@@ -443,3 +443,72 @@ TEST_F(CheckpointRecoveryTest, S3BatchedRecoveryMatchesSerial) {
 }
 
 }
+
+// S27-4 P2:builder 模式端到端——builder_threads=1 经 SearchLayerConfig 流入
+// TextPlugin,put_doc 派发 builder 线程 apply;search_text(prepare_search 内
+// drain 钩子)保 read-your-writes;删除/覆盖经 LSN 守卫;close 落 ckpt 后
+// 分别以 B=0/B=1 重开验证(段格式与模式无关 + fold 续接)。
+TEST_F(CheckpointRecoveryTest, BuilderModeEndToEndAndReopen) {
+  constexpr int kN = 50;
+  auto opts = make_search_options(8);
+  opts.search_config->builder_threads = 1;
+
+  {
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c) << "open failed: " << c.error().detail;
+    for (int i = 0; i < kN; ++i) {
+      bitcask::DocInput doc;
+      const std::string text = "hello builder doc" + std::to_string(i);
+      doc.text = sv_bytes(text);
+      const auto v = vector_for(i, 8);
+      doc.vector = std::span<const float>(v);
+      ASSERT_TRUE((*c)->put_doc(sv_bytes(key_for(i)), doc,
+                                static_cast<std::uint32_t>(1000 + i)));
+    }
+    // read-your-writes:不显式 flush_index——search_text 内 prepare_search
+    // 必须先排干 reducer + builder。
+    auto r = (*c)->search_text("hello", kN + 10);
+    ASSERT_TRUE(r);
+    EXPECT_EQ(r->hits.size(), static_cast<std::size_t>(kN));
+
+    // 覆盖 + 删除(LSN 守卫路径)。
+    {
+      bitcask::DocInput doc;
+      doc.text = sv_bytes("banana override");
+      const auto v = vector_for(0, 8);
+      doc.vector = std::span<const float>(v);
+      ASSERT_TRUE((*c)->put_doc(sv_bytes(key_for(0)), doc, 2000));
+    }
+    ASSERT_TRUE((*c)->remove(sv_bytes(key_for(1)), 2001));
+    auto r2 = (*c)->search_text("hello", kN + 10);
+    ASSERT_TRUE(r2);
+    EXPECT_EQ(r2->hits.size(), static_cast<std::size_t>(kN - 2));  // k0 改词,k1 删
+    auto rb = (*c)->search_text("banana", 10);
+    ASSERT_TRUE(rb);
+    ASSERT_EQ(rb->hits.size(), 1u);
+    EXPECT_EQ(rb->hits[0].key, key_for(0));
+    (*c)->close();  // flush drains builders → ckpt 覆盖全部在途
+  }
+
+  // B=1 重开(ckpt 载入 + fold 续接)。
+  {
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c) << "reopen(B=1) failed: " << c.error().detail;
+    auto r = (*c)->search_text("hello", kN + 10);
+    ASSERT_TRUE(r);
+    EXPECT_EQ(r->hits.size(), static_cast<std::size_t>(kN - 2));
+    (*c)->close();
+  }
+
+  // B=0 重开(跨模式:段文件与模式无关)。
+  {
+    auto opts0 = opts;
+    opts0.search_config->builder_threads = 0;
+    auto c = Cask::open(tmpdir_.string(), opts0, &test_registry());
+    ASSERT_TRUE(c) << "reopen(B=0) failed: " << c.error().detail;
+    auto rb = (*c)->search_text("banana", 10);
+    ASSERT_TRUE(rb);
+    EXPECT_EQ(rb->hits.size(), 1u);
+    (*c)->close();
+  }
+}
