@@ -91,6 +91,16 @@ std::size_t encode_data_record(std::vector<std::byte>& out,
     return total;
 }
 
+// S29-7 铺垫：改写已编码 record 的 Ord 字段并重算 CRC（布局同上）。
+void patch_data_record_ord(std::span<std::byte> record, std::uint64_t ord) {
+    assert(record.size() >= format::kHeaderSize);
+    std::byte* p = record.data();
+    le_store_u64(p + format::kOrdOffset, ord);
+    const std::span<const std::byte> covered{p + format::kTypeOffset,
+                                              record.size() - format::kTypeOffset};
+    le_store_u32(p + format::kCrcOffset, crc32(covered));
+}
+
 // 从 buf 头部解一条 data record，校验 CRC 后返回 view（zero-copy）。
 // 不修改 buf；caller 负责用 result.total_size 推进自己的指针。
 std::expected<DataRecordView, DecodeError>

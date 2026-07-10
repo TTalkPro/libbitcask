@@ -983,10 +983,12 @@ std::expected<void, CaskFault> Cask::prepare_search() {
 
 std::expected<Cask::PersistedRecord, CaskFault>
 Cask::write_and_keydir(std::span<const std::byte> key,
-                       std::span<const std::byte> encoded,
+                       std::span<std::byte> record,
                        std::uint32_t tstamp, std::uint64_t ord) {
-    auto w = active_data_->write(format::RecordType::kDoc, tstamp, ord,
-                                  key, encoded);
+    // S29-7 铺垫：record 已在锁外编码（占位 ord）——此处补真实 ord + CRC
+    // 后直接 pwrite。锁内 O(V) 工作从「编码 memcpy + CRC」降为一次 CRC 扫描。
+    codec::patch_data_record_ord(record, ord);
+    auto w = active_data_->write_encoded(record);
     if (!w) return std::unexpected(io_fault(w.error().errnum,
                                              std::string(active_data_->path())));
     auto h = active_hint_->write(tstamp, w->total_size, w->offset,
@@ -1007,8 +1009,8 @@ Cask::write_and_keydir(std::span<const std::byte> key,
     // S13-F2: ord2 守卫——重试路径任何失败 return 都补 Skip，防 reorder
     // buffer 空洞（ord 本身由 caller 的守卫覆盖）。
     OrdSkipGuard g2(this, ord2);
-    auto w2 = active_data_->write(format::RecordType::kDoc, tstamp, ord2,
-                                   key, encoded);
+    codec::patch_data_record_ord(record, ord2);  // S29-7：重试换 ord2 重 patch
+    auto w2 = active_data_->write_encoded(record);
     if (!w2) return std::unexpected(io_fault(w2.error().errnum,
                                               std::string(active_data_->path())));
     auto h2 = active_hint_->write(tstamp, w2->total_size, w2->offset,
@@ -1320,8 +1322,10 @@ Cask::put(std::span<const std::byte> key,
           std::span<const std::byte> value,
           std::uint32_t tstamp, std::uint32_t expiry_at) {
     WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
-    std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
-    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
+    // S29-7 铺垫：校验/tstamp/DocValue 编码/record 预编码全部**锁外**完成
+    // （纯函数或 const 配置读，均不依赖 write_mu_ 保护的状态）。ord 必须锁
+    // 内分配（恢复按 fold 序回放 + add_doc 水位自门 ⇒ 文件序 == ord 序是
+    // 硬不变量），故 record 先用占位 ord=0 编码，锁内 patch。
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly));
     }
@@ -1329,20 +1333,7 @@ Cask::put(std::span<const std::byte> key,
     if (value.size() > format::kMaxValueSize) return std::unexpected(err(CaskError::kValueTooLarge));
 
     if (tstamp == 0) tstamp = now_sec_default();
-    const std::size_t about = format::kHeaderSize + key.size() + value.size();
-    if (auto r = roll_active_if_needed(about); !r) return std::unexpected(r.error());
 
-    // M5.1 task 2 关键 race：并发 merger 可能已经把 keydir.biggest_file_id
-    // 推过了我们的 active_file_id_。如果直接写，keydir 的 merge-race 检测
-    // (file_id < biggest_file_id_) 会返回 kAlreadyExists，put 就被静默丢了。
-    // 提前主动 roll 一次保证 active_file_id_ >= biggest，避免 silent drop。
-    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
-        if (auto r = roll_active(); !r) return std::unexpected(r.error());
-    }
-
-    // 分配 ord + 编码 DocValue（text 段 = 原始 value）
-    const std::uint64_t ord = keydir_->alloc_ord();
-    OrdSkipGuard og(this, ord);  // S13-F2: 失败路径补 Skip 防 reorder stall
     // ⑩ thread_local 复用：encode_doc_value 是 append 语义，clear 后重填；
     // 并发 put 各线程独占一份，消除每次 put 的 encoded 堆分配。
     thread_local std::vector<std::byte> encoded;
@@ -1352,8 +1343,29 @@ Cask::put(std::span<const std::byte> key,
     parts.text = value;
     parts.expiry_at = expiry_at;  // S13-D5
     codec::encode_doc_value(encoded, parts);
+    // record 预编码（占位 ord；锁内 write_and_keydir 补真实 ord + CRC）。
+    thread_local std::vector<std::byte> record_buf;
+    record_buf.clear();
+    codec::encode_data_record(record_buf, format::RecordType::kDoc, tstamp,
+                              /*ord 占位*/ 0, key, encoded);
 
-    auto persisted = write_and_keydir(key, encoded, tstamp, ord);
+    std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
+
+    if (auto r = roll_active_if_needed(record_buf.size()); !r) return std::unexpected(r.error());
+
+    // M5.1 task 2 关键 race：并发 merger 可能已经把 keydir.biggest_file_id
+    // 推过了我们的 active_file_id_。如果直接写，keydir 的 merge-race 检测
+    // (file_id < biggest_file_id_) 会返回 kAlreadyExists，put 就被静默丢了。
+    // 提前主动 roll 一次保证 active_file_id_ >= biggest，避免 silent drop。
+    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
+        if (auto r = roll_active(); !r) return std::unexpected(r.error());
+    }
+
+    const std::uint64_t ord = keydir_->alloc_ord();
+    OrdSkipGuard og(this, ord);  // S13-F2: 失败路径补 Skip 防 reorder stall
+
+    auto persisted = write_and_keydir(key, record_buf, tstamp, ord);
     if (!persisted) return std::unexpected(persisted.error());
     // S13-F2: 成功 ⇒ ord 已有归宿——非重试路径由下面的 Add 覆盖
     // （persisted->ord == ord），重试路径由 write_and_keydir 内部 Skip 覆盖。
@@ -1527,9 +1539,14 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint32_t tstamp) {
             codec::DocValueParts parts;
             parts.text = items[i].value;
             codec::encode_doc_value(encoded, parts);
+            // S29-7：write_and_keydir 改收预编码 record——罕见路径，就地编码
+            // （占位 ord，函数内 patch）。
+            std::vector<std::byte> record;
+            codec::encode_data_record(record, format::RecordType::kDoc, tstamp,
+                                      /*ord 占位*/ 0, items[i].key, encoded);
             const std::uint64_t ord2 = keydir_->alloc_ord();
             OrdSkipGuard g2(this, ord2);
-            auto p2 = write_and_keydir(items[i].key, encoded, tstamp, ord2);
+            auto p2 = write_and_keydir(items[i].key, record, tstamp, ord2);
             if (!p2) {
                 flush_adds();  // 先前条目 keydir 已收录 → 锁内补交 Add（同旧版）
                 return std::unexpected(p2.error());
@@ -1635,8 +1652,10 @@ std::expected<void, CaskFault>
 Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
               std::uint32_t tstamp) {
     WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
-    std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
-    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
+    // S29-7 铺垫：校验/tstamp/向量归一化/字段 intern/DocValue 编码/record
+    // 预编码全部**锁外**完成——prepare_vector 读 const 配置、intern 自带
+    // shared_mutex、编码是纯函数，均不依赖 write_mu_。ord 锁内分配（文件序
+    // == ord 序不变量），record 占位 ord 编码、锁内 patch（同 put）。
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly));
     }
@@ -1648,11 +1667,6 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     }
 
     if (tstamp == 0) tstamp = now_sec_default();
-    const std::size_t about =
-        format::kHeaderSize + key.size() + doc.text.size() + doc.meta.size();
-    if (auto r = roll_active_if_needed(about); !r) {
-        return std::unexpected(r.error());
-    }
 
     // #1：把 DocInput 的多字段名 intern 成 id，填进 DocValueParts.fields。
     // 字段名只在 field.schema 存一份，DocValue 里存小整数 id（varint）。
@@ -1684,10 +1698,6 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
         return std::pair{std::move(store), std::move(views)};
     };
 
-    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
-        if (auto r = roll_active(); !r) return std::unexpected(r.error());
-    }
-
     // V3.1:向量校验 + cosine 写入归一化(存储即归一化值,merge/恢复
     // 不再重算;hnsw-design §1)。归一化缓冲在双编码点(roll 重试)间复用。
     std::vector<float> vec_norm;
@@ -1695,8 +1705,6 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     if (!vec_result) return std::unexpected(vec_result.error());
     auto vec_out = *vec_result;
 
-    const std::uint64_t ord = keydir_->alloc_ord();
-    OrdSkipGuard og(this, ord);  // S13-F2: 失败路径补 Skip 防 reorder stall
     std::vector<std::byte> encoded;
     encoded.reserve(doc.text.size() + doc.meta.size() +
                     vec_out.size() * sizeof(float) + 16);
@@ -1712,8 +1720,28 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     }
     fill_parts(parts);
     codec::encode_doc_value(encoded, parts);
+    // record 预编码（占位 ord；锁内 write_and_keydir 补真实 ord + CRC）。
+    // 附带修正：roll 的 about 从「header+key+text+meta 估算」（低估——漏
+    // vector/fields 段）变为 record 精确长度。
+    thread_local std::vector<std::byte> record_buf;
+    record_buf.clear();
+    codec::encode_data_record(record_buf, format::RecordType::kDoc, tstamp,
+                              /*ord 占位*/ 0, key, encoded);
 
-    auto persisted = write_and_keydir(key, encoded, tstamp, ord);
+    std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
+
+    if (auto r = roll_active_if_needed(record_buf.size()); !r) {
+        return std::unexpected(r.error());
+    }
+    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
+        if (auto r = roll_active(); !r) return std::unexpected(r.error());
+    }
+
+    const std::uint64_t ord = keydir_->alloc_ord();
+    OrdSkipGuard og(this, ord);  // S13-F2: 失败路径补 Skip 防 reorder stall
+
+    auto persisted = write_and_keydir(key, record_buf, tstamp, ord);
     if (!persisted) return std::unexpected(persisted.error());
     // S13-F2: 成功 ⇒ ord 已有归宿（同 put：Add 或内部 Skip）。
     og.disarm();

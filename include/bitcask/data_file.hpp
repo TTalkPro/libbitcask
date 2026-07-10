@@ -94,6 +94,14 @@ public:
           std::span<const std::byte> key,
           std::span<const std::byte> value);
 
+    // S29-7 铺垫：append 一条 **caller 已编码**的完整 record（布局/CRC 由
+    // caller 保证——encode_data_record [+ patch_data_record_ord] 产物）。
+    // 与 write() 差别仅在编码位置：写路径把 O(V) 编码移出 write_mu_，锁内
+    // 只剩本函数的 pwrite + 偏移推进（每条立即 pwrite，WAL 语义不变）。
+    // 线程安全: 否（修改 current_offset_）；caller 串行化。
+    [[nodiscard]] std::expected<WriteResult, DataFileFault>
+    write_encoded(std::span<const std::byte> record);
+
     // S2:批量 append。语义同 write()，但把编码后的 record 累积到 batch_buf_，
     // 累计 ≥ kBatchFlushBytes 才一次 pwrite——把 N 条 pwrite 降到 N/batch。
     // 返回的 offset 是逻辑偏移（current_offset_，含尚未落盘的缓冲），确定性

@@ -73,6 +73,14 @@ std::size_t encode_data_record(std::vector<std::byte>& out,
                                std::span<const std::byte> key,
                                std::span<const std::byte> value);
 
+// S29-7 铺垫：把已编码 record 的 Ord 字段改写为 ord，并重算 CRC。
+// 用途：写路径把 O(V) 的 record 编码（memcpy key/value + header）移出
+// write_mu_——锁外用占位 ord 预编码，锁内 alloc_ord 后仅 patch 8 字节 +
+// 一次 CRC 扫描（文件序 == ord 序的恢复不变量要求 ord 必须锁内分配）。
+// record 必须是一条完整的 encode_data_record 产物（长度 ≥ kHeaderSize）。
+// 线程安全: 是（只写 caller 的 record）；不需任何锁。
+void patch_data_record_ord(std::span<std::byte> record, std::uint64_t ord);
+
 // 从 buf 头部读一条 data record。CRC 会校验；不通过返回 kBadCrc。
 // 不修改 buf；caller 用 result.total_size 自己 advance。
 // 线程安全: 是（纯函数，只读 buf）；不需任何锁。

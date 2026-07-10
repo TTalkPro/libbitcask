@@ -1105,6 +1105,9 @@ public:
     // write_and_keydir：写 data record + hint record + keydir put，
     // 若 keydir put 返回 kAlreadyExists 则 roll_active 后重试一次。
     // 返回最终使用的 ord / offset / total_size（供 caller 构造 IndexTask）。
+    // S29-7 铺垫：record 是 caller **锁外预编码**的完整 data record（可变
+    // ——本函数用 patch_data_record_ord 补真实 ord/重试 ord2 后 pwrite），
+    // 锁内不再做 O(V) 编码。key 仅用于 hint/keydir。
     struct PersistedRecord {
         std::uint64_t ord;
         std::uint64_t offset;
@@ -1113,7 +1116,7 @@ public:
     };
     [[nodiscard]] std::expected<PersistedRecord, CaskFault>
     write_and_keydir(std::span<const std::byte> key,
-                     std::span<const std::byte> encoded,
+                     std::span<std::byte> record,
                      std::uint32_t tstamp, std::uint64_t ord);
 
     // 向量校验 + 可选 L2 归一化。norm_buf 仅在 cosine 指标时填充；

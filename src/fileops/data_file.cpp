@@ -154,6 +154,20 @@ DataFile::write(format::RecordType type,
     return WriteResult{off, static_cast<std::uint32_t>(total)};
 }
 
+// S29-7 铺垫：写入 caller 已编码的完整 record（编码在 write_mu_ 外完成，
+// 本函数在锁内只做 pwrite + 偏移推进；每条立即 pwrite，WAL 语义同 write()）。
+std::expected<WriteResult, DataFileFault>
+DataFile::write_encoded(std::span<const std::byte> record) {
+    if (mode_ == Mode::kRead) {
+        return std::unexpected(DataFileFault{DataFileError::kIo, 0});
+    }
+    const std::uint64_t off = current_offset_;
+    auto w = file_.pwrite(off, record);
+    if (!w) return std::unexpected(io_fault(w.error()));
+    current_offset_ += record.size();
+    return WriteResult{off, static_cast<std::uint32_t>(record.size())};
+}
+
 // S2:批量 append——编码进 batch_buf_，越过阈值才一次 pwrite。offset 取
 // current_offset_（逻辑位置，含缓冲），与落盘时机解耦。
 std::expected<WriteResult, DataFileFault>
