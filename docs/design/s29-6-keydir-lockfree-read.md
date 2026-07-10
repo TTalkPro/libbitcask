@@ -1,8 +1,12 @@
 # S29-6 设计:KeyDir 读路径「零共享写」(epoch-RCU + 乐观读)
 
-> 状态:**设计草案(待评审/待实现)**。2026-07-10 实现前审计发现原 TASK.md sketch
-> (「每 shard seqlock + POD 乐观拷贝,fold 态回退加锁」)**不成立**——本文记录三个
-> 致命场景、修正后的设计与分相计划。
+> 状态:**已评审(2026-07-10),P1+P2 已落地(558/558;ASan 137/137;
+> TSan 135/135;bench 零回归),P3+P4 待实施**。评审决议见 §5。
+> P2 产物:`include/bitcask/epoch_reclaim.hpp`(通用注册表,seq_cst 交错
+> 论证见其文件头)+ Shard::Limbo 三池 + LimboAllocator + erase 零 free 化。
+> 2026-07-10 实现前审计发现原 TASK.md sketch(「每 shard seqlock + POD 乐观
+> 拷贝,fold 态回退加锁」)**不成立**——本文记录三个致命场景、修正后的设计
+> 与分相计划。
 >
 > 背景:`BM_KeyDir_Get_MultiThreaded` 1→8 线程 CPU 37.8→63.7ns。根因非阻塞争用
 > (256 分片 × 短临界区,同分片碰撞率 <1%),而是**每次 get 对分片锁字做原子 RMW**
@@ -98,3 +102,17 @@ CoW(`mutable_pl`),读者理论可零锁——但 TBB 桶锁不可下探,方案�
   thread-safety.md 历史)。**必须整批评审 + 三 sanitizer 全量**后合入;
   任何一相单独合入无收益且引入墓碑内存开销。
 - 回退开关:乐观快路径可加编译期/运行期开关(默认开),出问题一键退回纯锁。
+
+## 5. 评审决议(2026-07-10,用户确认)
+
+1. **TSan 策略:选 b**——乐观快路径函数标 `__attribute__((no_sanitize("thread")))`
+   + 注释论证(seqlock 业界标准做法,Linux 内核同款)。代价:该函数在 TSan 树免检,
+   由 ASan + 定向压力测试兜底;**写者侧不加豁免**(写者全程持锁,TSan 照常查)。
+   豁免范围必须收窄到单个快路径函数,不得扩散。
+2. **路线:KeyDir 先行**(本文 P1-P4),倒排桶锁二期复用 epoch 基建。
+3. **墓碑回收:增量 sweep**——per-shard 墓碑计数超阈值(1/8 表长)后,后续每次
+   **写操作**在分片锁内顺手清扫 K 个槽位(K=8,均摊 O(1),无单次延迟尖刺),
+   叠加既有 quiescent 点(fold release / barrier)全量清。P1 期 sweep 直接 free
+   (读者仍持锁,安全);P3 上线后 sweep 的 free 一律改走 limbo。
+4. **回退开关:运行期**——`std::atomic<bool>`(默认开),每 get 一次分支(可忽略),
+   线上出问题免重编译一键退回纯锁路径。

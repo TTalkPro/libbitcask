@@ -3362,9 +3362,36 @@ W4 ✅（parallel_scan 并行全表扫描）。
     （物理回收挪 quiescent 点 + 写者 sweep）；P2 epoch 读者注册表 + per-shard limbo 延迟回收
     + ankerl 自定义 allocator；P3 get 乐观快路径（per-shard seq 校验 + fold/Multi 回退 +
     重试上限 + 运行期回退开关）；P4 TSan/ASan 定向压力 + bench 验收。
-    详见 [`docs/design/s29-6-keydir-lockfree-read.md`](docs/design/s29-6-keydir-lockfree-read.md)。
-  - 工作量：~3 会话（P1 语义审计 / P2 基建 / P3+P4 收口）。KeyDir 是全库最核心并发结构,
-    须整批评审 + 三 sanitizer 全量后合入。
+    详见 [`docs/design/s29-6-keydir-lockfree-read.md`](docs/design/s29-6-keydir-lockfree-read.md)
+    （**§5 评审决议已确认**：TSan 豁免选 b、KeyDir 先行、增量 sweep、运行期开关）。
+  - [x] **P1 已完成（2026-07-10）**：`remove` 无 fold 分支 erase → sibling sentinel 墓碑覆写
+    （`entry_at_epoch` 的 Single 分支上报 is_tombstone——原「Single 从不表示墓碑」不变量
+    解除）；`put_insert` 原「理论不可达」的 Single 覆写分支变为复活路径（epoch 守卫使 fold
+    迭代器语义不变）；写者增量 sweep（阈值 1/8 表长、每写扫 8 槽、cursor 续扫）+
+    `collapse_multi_entries_barrier` quiescent 点全量清；snapshot 跳墓碑（count 与写出严格
+    一致）+ histogram/apply_pending 计数口径同步。Shard 新增 `tombstones`/`sweep_cursor`
+    （仅锁下读写）。
+    - 验收：clang 全量 **558/558**（含新增 `KeyDirTombstone` 定向 ×3：删除不可见/复活、
+      delete-heavy 2000 键 sweep 回归、快照跳墓碑往返）；TSan keydir/iter/merge/fold 58/58；
+      ASan keydir/cask 132/132；build-rel 构建通过。
+  - [x] **P2 已完成（2026-07-10）：epoch 读者注册表 + limbo + ankerl allocator**。
+    - 新增 `include/bitcask/epoch_reclaim.hpp`（通用,倒排二期复用）：进程级
+      `epoch::Registry`——64 个 cacheline 对齐读者槽（进入 seq_cst store 自线程槽、
+      退出 store 0,零共享 RMW）、`advance()`/`min_active()`（seq_cst 交错论证见文件头）、
+      thread_local 槽位 RAII（耗尽 → nullptr → 回退加锁,恒正确）。
+    - `Shard` 新增 `Limbo`（raw 数组 / key 遗骸 / Entry 遗骸三池,仅锁下访问,声明先于
+      entries 保证析构序）；map 换 `LimboAllocator`（deallocate → retire,覆盖 rehash/grow/
+      析构的旧数组,设计 §1.1）；**erase 零 free 化**：sweep/collapse/apply_pending 三处
+      erase 前把 key/Entry **move 进 limbo**——erase 只析构 moved-from 空壳（免改 map key
+      类型即覆盖设计 §1.2）。回收：写者攒批（≥8 项,put/remove 尾部）+ collapse quiescent
+      点全量,stamp 前缀释放（advance 全局单调）。
+    - P2 期读者未注册 → min_active 恒 max → 达阈值即全清,行为等价即时 free,零语义变化。
+    - 验收：clang 558/558；ASan keydir/cask/snapshot 137/137；TSan 135/135；
+      `BM_KeyDir_*` 全部在基线噪声带内（Get 32ns / Put 61ns,零回归）。
+  - [ ] **P3 get 乐观快路径 + 运行期开关**；**P4 定向压力 + bench 验收**（随 P3,下一会话；
+    P3 上线前 limbo/registry 均为 dormant 基建）
+  - ⚠️ P1 单独上线的既知代价：delete-heavy 且长期无写/无 fold 的库,墓碑驻留至下次写触发
+    sweep——内存有界（≤1/8 表长 + sweep 滞后量），语义无损。
   - 二期：倒排桶锁复用同一套 epoch 注册表（TBB 桶锁不可下探 → 换表或 thread_local
     term→snapshot 缓存）。
 - [ ] **S29-7 Put 写路径 group commit（单 handle 多写者扩展）** · `src/cask/cask.cpp:1319-1378`
