@@ -417,3 +417,69 @@ BENCHMARK(BM_Cask_SearchHybrid)->Unit(benchmark::kMicrosecond);
 // BM_Put_WalBatch 已删除（S19-4）：wal_batch_size 是 dead config，两档
 // 测的是同一路径（S18 侦查坐实），基准前提不成立。
 
+
+// -----------------------------------------------------------------------------
+// S27-4 P3:DWPT builder 索引吞吐——单文本 put_doc 活写路径的分析+建段在
+// apply 内(B=0 在 reducer 内联 = 串行瓶颈;B>=1 连分析一起下放 builder,
+// round-robin 并行)。每轮:新库 → kDocs 篇 put_doc → flush_index(排干
+// reducer + builder)= 端到端索引吞吐。arg = builder_threads。
+// -----------------------------------------------------------------------------
+static void BM_Cask_PutDocTextIndex(benchmark::State& state) {
+    const auto B = static_cast<std::size_t>(state.range(0));
+    constexpr int kDocs = 20000;
+    constexpr int kWords = 30;
+    // 预生成语料(词表 4k,30 词/篇)——生成成本不入计时。
+    static const std::vector<std::string>* corpus = [] {
+        auto* v = new std::vector<std::string>();
+        v->reserve(kDocs);
+        std::mt19937 rng(0x274B);
+        std::uniform_int_distribution<int> wd(0, 3999);
+        for (int i = 0; i < kDocs; ++i) {
+            std::string t;
+            t.reserve(kWords * 7);
+            for (int w = 0; w < kWords; ++w) {
+                t += "w" + std::to_string(wd(rng));
+                t += ' ';
+            }
+            v->push_back(std::move(t));
+        }
+        return v;
+    }();
+
+    CaskOptions o;
+    o.read_write = true;
+    o.enable_search = true;
+    bitcask::search::SearchLayerConfig sc;
+    sc.analyzer_config.type = bitcask::text::AnalyzerType::Whitespace;
+    sc.builder_threads = B;
+    o.search_config = sc;
+
+    std::size_t total = 0;
+    for (auto _ : state) {
+        state.PauseTiming();
+        TempDir td;
+        auto c = Cask::open(td.path(), o, &test_registry());
+        if (!c) { state.SkipWithError("open failed"); break; }
+        state.ResumeTiming();
+
+        for (int i = 0; i < kDocs; ++i) {
+            bitcask::DocInput doc;
+            doc.text = as_bytes((*corpus)[static_cast<std::size_t>(i)]);
+            const std::string key = "k" + std::to_string(i);
+            (void)(*c)->put_doc(as_bytes(key), doc,
+                                static_cast<std::uint32_t>(i));
+        }
+        (*c)->flush_index();  // 排干 map/reducer/builder → 端到端索引完成
+
+        state.PauseTiming();
+        (*c)->close();
+        state.ResumeTiming();
+        total += kDocs;
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(total));
+}
+BENCHMARK(BM_Cask_PutDocTextIndex)
+    ->Arg(0)->Arg(1)->Arg(2)->Arg(4)
+    ->Unit(benchmark::kMillisecond)
+    ->MeasureProcessCPUTime()
+    ->UseRealTime();

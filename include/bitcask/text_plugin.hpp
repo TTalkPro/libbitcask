@@ -298,7 +298,7 @@ public:
     [[nodiscard]] bool save_component_base(std::string_view dir,
                                            std::uint64_t watermark);
     // S23-M4：apply_job 双入口的共享实现（doc_text 所有权经右值参数注入）。
-    void apply_job_impl(const search::ReduceJob& job, std::string&& doc_text);
+    // S27-4 P3:目标槽参数化为 apply_job_impl_in(见 BuilderPool 节)。
     // 三组件同构，收敛至 ckpt:: 共用类型（S20-1 R6）。
     // S27-3 步骤 3:save_component_delta 退役(delta 链 Slice C 已停,
     // fields_ 删除后序列化源不复存在)。
@@ -466,6 +466,10 @@ private:
         std::deque<BuilderJob>  q;
         bool busy = false;
         bool stop = false;
+        bool waiting = false;  // builder 睡在 cv_idle(生产者据此免 notify)
+        // S27-4 P3:每 builder 一个 building 段(设计 §1——不共享可变态,
+        // 段内单写者;查询与 building_ 同款 load+pin)。
+        std::atomic<std::shared_ptr<search::SealedSegment>> building;
     };
     static constexpr std::size_t kBuilderQueueCap = 1024;
     std::vector<std::unique_ptr<Builder>> builders_;
@@ -475,6 +479,16 @@ private:
     void builder_loop(Builder& b);
     void dispatch_job(BuilderJob&& j);
     void drain_builders();
+    // S27-4 P3:apply/封口按「目标 building 槽」参数化——inline 路径用
+    // building_,builder 线程用自己的槽。公开 apply_* 保持旧签名(恒指
+    // building_,既有测试/standalone 语义不变)。
+    using BuildingSlot = std::atomic<std::shared_ptr<search::SealedSegment>>;
+    void apply_text_in(BuildingSlot& slot, std::string_view key,
+                       std::uint64_t ord, std::string_view text);
+    void apply_job_in(BuildingSlot& slot, search::ReduceJob& job);
+    void apply_job_impl_in(BuildingSlot& slot, const search::ReduceJob& job,
+                           std::string&& doc_text);
+    void flush_building_slot(BuildingSlot& slot);
     // reducer 侧压实触发(builder 模式下 apply 路径的 maybe_auto_compact
     // 为 no-op——compact 需 builder 静止;见各自注释)。
     void maybe_auto_compact_reducer();
