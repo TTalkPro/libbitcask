@@ -390,3 +390,71 @@ TEST(TextPlugin, SegmentSetRecoveryRoundTrip) {
 
     fs::remove_all(dir);
 }
+
+// ---- S27-3 步骤 5:段生命周期 vs 查询并发(pin 机制定向压力)----
+// 写者线程(模拟 reducer):apply → 周期性封口(flush_building_now)→ 删除
+// 制造全死段 → compact 触发 drop;读者线程并发 search/explain。段封口切换、
+// 列表增删、段对象析构全部与查询交叠——pin(shared_ptr 钉住)+ snapshot
+// (列表锁)+ building 原子 shared_ptr 保证无 UAF/race(TSan/ASan 树跑本例)。
+#include <thread>
+
+TEST(TextPlugin, SegmentLifecycleVsQueryStress) {
+    const fs::path dir =
+        fs::temp_directory_path() / "bitcask_textplugin_seg_stress";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.auto_compact_dead_ratio = 0.3;  // 开启:删除堆积触发段压实/drop
+    text::TextPlugin p(cfg, idx, idx, idx);
+    const std::string dir_s = dir.string();  // string_view 指向须存活
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
+
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> anomalies{0};
+
+    std::thread writer([&] {
+        std::uint64_t ord = 0;
+        int round = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            // 一批文档 → 封口成段 → 全部删除(制造全死段) → 下一轮
+            // compact(经 apply 内 maybe_auto_compact)可 drop 之。
+            const int base = round * 8;
+            for (int i = 0; i < 8; ++i) {
+                const std::string key = "k" + std::to_string(base + i);
+                host_put_row(idx, key, ord);
+                p.apply_text(key, ord, "stress common word" + std::to_string(i));
+                ++ord;
+            }
+            p.flush_building_now();
+            for (int i = 0; i < 8; ++i) {
+                p.on_delete("k" + std::to_string(base + i), ord + 100,
+                            static_cast<std::uint64_t>(ord - 8 + i));
+            }
+            ++round;
+        }
+    });
+
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 3; ++t) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto r = p.search_text("common", 20);
+                if (!r.has_value()) anomalies.fetch_add(1);
+                (void)p.search_text("word3", 5);
+                (void)p.explain("stress", "k1");
+            }
+        });
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    stop.store(true);
+    writer.join();
+    for (auto& r : readers) r.join();
+
+    EXPECT_EQ(anomalies.load(), 0u);
+    fs::remove_all(dir);
+}

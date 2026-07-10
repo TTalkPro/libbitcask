@@ -834,10 +834,8 @@ TEST(SearchLayer, AutoCompactBoundsPostingGrowth) {
                            static_cast<std::uint32_t>(1001 + r));
         }
     }
-    // S27-3 步骤 3:auto-compact 随 fields_ 退役——死回收职责转段级 merge
-    // (步骤 5 接 on_merge_commit 后在此恢复有界断言)。本用例保留高 churn
-    // 下的正确性护栏。
-    // EXPECT_LT(layer.total_postings(), 2000u);  // 步骤 5 恢复
+    // S27-3 步骤 5:auto-compact 复活(段世界:building 原地删死 posting)。
+    EXPECT_LT(layer.total_postings(), 2000u);
     // 搜索仍正确：恰 20 篇 live。
     auto res = layer.search_text("hello", 100);
     ASSERT_TRUE(res.has_value());

@@ -2241,8 +2241,7 @@ TEST_F(CaskDocValueTest, AutoCompactConcurrentReadersNoRace) {
     auto sr = (*c)->search_text("hello", 50);
     ASSERT_TRUE(sr);
     EXPECT_EQ(sr->hits.size(), static_cast<std::size_t>(K));   // 最终恰 K 篇 live
-    // S27-3 步骤 3:auto-compact 退役,回收断言挂段级 merge(步骤 5 恢复)。
-    // EXPECT_LT((*c)->text_plugin()->total_postings(), 2000u);
+    EXPECT_LT((*c)->text_plugin()->total_postings(), 2000u);  // S27-3 步骤 5 复活
     (*c)->close();
 }
 
