@@ -103,6 +103,42 @@ CoW(`mutable_pl`),读者理论可零锁——但 TBB 桶锁不可下探,方案�
   任何一相单独合入无收益且引入墓碑内存开销。
 - 回退开关:乐观快路径可加编译期/运行期开关(默认开),出问题一键退回纯锁。
 
+## 6. P3 实现前审计(2026-07-10):发现第二个设计缺口
+
+§2.3 的乐观 find 有一个 §1 未覆盖的致命场景与一个实现阻断点:
+
+### 6.1 混代越界(OOB-mixing,致命)
+
+seqlock 校验发生在 deref **之后**。乐观读者可能把**不同世代**的指针/下标混用:
+grow 时读到新桶数组的 value_idx(上界 = 新表长)× 旧 values 数组指针(容量 =
+旧表长)→ 越界读出**旧分配块之外**。limbo 只保证「已 retire 的块本身存活」,
+不保证「越界读落在块内」——跨页即段错误,校验救不了。同类:torn 的 string
+对象字节给出野指针,比较时 deref 即 fault。
+
+### 6.2 健全配方:逐跳 copy → seq 验证 → 使用
+
+x86 TSO 下成立的安全模式(每跳一次 seq 重载,无写者时该行 SHARED,代价可忽略):
+1. 拷指针/尺寸组 → 验 seq==s1(偶)→ 该组**互相一致**(TSO:写者 seq++ 先于
+   其变更可见);
+2. 桶探测得 idx → 验 seq → idx 与步 1 的数组一致且 in-bounds;
+3. 拷 pair 的 key 对象字节 + Entry 字节 → 验 seq → 拷贝未撕裂 → **此时才**
+   deref key 缓冲比较(存活性:读者槽 active ⇒ 其后 retire 的 stamp ≥ 读者
+   epoch ⇒ limbo 不回收 → 恒安全);
+4. 终验 s2==s1 → 采纳 Entry 拷贝。
+
+### 6.3 实现阻断点:ankerl 桶数组不可达
+
+配方需要桶数组指针 + 探测布局(fingerprint/shift)——`unordered_dense` 全部
+private,仅 `values()` 公开;它是 git submodule(v4.8.1),打补丁 = fork。
+**P3 无法在 ankerl 之上健全实现**。三个出路:
+
+- **A(建议):自建开放寻址 shard 表**——self-describing 分配块(块头带
+  mask,指针与界天然一致)、pow2 掩码探测(deref 恒 in-bounds)、seqlock
+  原生设计。即把原留给倒排二期的「换表」前置;两处共用同一张表实现,
+  一次投入两处收益。~1-2 会话。
+- B:fork unordered_dense 暴露内部——最快但跟 upstream 脱钩,长期负债。
+- C:冻结在 P1+P2(两相独立无害:墓碑化 + dormant 基建),读扩展性搁置。
+
 ## 5. 评审决议(2026-07-10,用户确认)
 
 1. **TSan 策略:选 b**——乐观快路径函数标 `__attribute__((no_sanitize("thread")))`

@@ -3388,8 +3388,15 @@ W4 ✅（parallel_scan 并行全表扫描）。
     - P2 期读者未注册 → min_active 恒 max → 达阈值即全清,行为等价即时 free,零语义变化。
     - 验收：clang 558/558；ASan keydir/cask/snapshot 137/137；TSan 135/135；
       `BM_KeyDir_*` 全部在基线噪声带内（Get 32ns / Put 61ns,零回归）。
-  - [ ] **P3 get 乐观快路径 + 运行期开关**；**P4 定向压力 + bench 验收**（随 P3,下一会话；
-    P3 上线前 limbo/registry 均为 dormant 基建）
+  - [ ] **P3 get 乐观快路径 + 运行期开关**——⚠️ **实现前审计（2026-07-10）发现第二个
+    设计缺口,已阻断**：① 混代越界（OOB-mixing）——seq 校验在 deref 之后,grow 时
+    新桶 idx × 旧 values 指针可越界到 limbo 块之外 → 段错误,limbo 只保证块存活不保证
+    越界落在块内；② 健全配方 = 逐跳 copy→seq 验证→使用（x86 TSO,详设计 §6.2），但
+    需要桶数组指针/探测布局——**ankerl 全 private 且是 submodule,无法健全实现**。
+    出路（设计 §6.3）：A（建议）自建开放寻址 shard 表（seqlock 原生、self-describing
+    块,即倒排二期「换表」前置,一次投入两处收益,~1-2 会话）/ B fork ankerl（长期
+    负债）/ C 冻结在 P1+P2（两相独立无害）。**待用户决策。**
+  - [ ] **P4 定向压力 + bench 验收**（随 P3）
   - ⚠️ P1 单独上线的既知代价：delete-heavy 且长期无写/无 fold 的库,墓碑驻留至下次写触发
     sweep——内存有界（≤1/8 表长 + sweep 滞后量），语义无损。
   - 二期：倒排桶锁复用同一套 epoch 注册表（TBB 桶锁不可下探 → 换表或 thread_local
