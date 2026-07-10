@@ -32,6 +32,24 @@ using Utf8ProcBuf = std::unique_ptr<uint8_t[], Utf8ProcDeleter>;
     return {static_cast<char32_t>(cp), static_cast<std::size_t>(consumed)};
 }
 
+// 慢路径：utf8proc_map 全量 NFKC_Casefold（快路径未命中时的回退）。
+// utf8proc_map 接受显式长度（utf8proc_NFKC_Casefold 即它加 NULLTERM 的
+// 包装）——免去此前「输入拷贝求 null 终止」与「输出 strlen」两次全串遍历。
+// 行为差异仅在含内嵌 \0 的输入：旧版在 \0 截断，本版处理全长（更正确）。
+inline void nfkc_map_slow(std::string_view input, std::string& out) {
+    utf8proc_uint8_t* mapped = nullptr;
+    auto n = utf8proc_map(
+        reinterpret_cast<const utf8proc_uint8_t*>(input.data()),
+        static_cast<utf8proc_ssize_t>(input.size()), &mapped,
+        static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE |
+                                       UTF8PROC_COMPAT | UTF8PROC_CASEFOLD |
+                                       UTF8PROC_IGNORE));
+    if (n < 0 || mapped == nullptr) return;  // out 已 clear
+    Utf8ProcBuf guard(mapped);
+    out.assign(reinterpret_cast<const char*>(mapped),
+               static_cast<std::size_t>(n));
+}
+
 // P6:出参版——写入 caller 缓冲（clear 保留容量），热路径稳态零分配。
 // caller 用 thread_local 复用（如 jieba 逐词归一化）。语义与返回值版完全一致。
 inline void nfkc_fold(std::string_view input, std::string& out) {
@@ -76,21 +94,7 @@ inline void nfkc_fold(std::string_view input, std::string& out) {
         return;
     }
 
-    // 非 ASCII：utf8proc_map 接受显式长度（utf8proc_NFKC_Casefold 即
-    // 它加 NULLTERM 的包装）——免去此前「输入拷贝求 null 终止」与
-    // 「输出 strlen」两次全串遍历。选项与 NFKC_Casefold 完全一致。
-    // 行为差异仅在含内嵌 \0 的输入：旧版在 \0 截断，本版处理全长（更正确）。
-    utf8proc_uint8_t* mapped = nullptr;
-    auto n = utf8proc_map(
-        reinterpret_cast<const utf8proc_uint8_t*>(input.data()),
-        static_cast<utf8proc_ssize_t>(input.size()), &mapped,
-        static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE |
-                                       UTF8PROC_COMPAT | UTF8PROC_CASEFOLD |
-                                       UTF8PROC_IGNORE));
-    if (n < 0 || mapped == nullptr) return;  // out 已 clear
-    Utf8ProcBuf guard(mapped);
-    out.assign(reinterpret_cast<const char*>(mapped),
-               static_cast<std::size_t>(n));
+    nfkc_map_slow(input, out);
 }
 
 [[nodiscard]] inline std::string nfkc_fold(std::string_view input) {
@@ -145,6 +149,77 @@ inline void to_codepoints(std::string_view text, std::vector<CpInfo>& cps) {
     constexpr std::size_t kRetain = 1u << 16;  // 65536 CpInfo
     if (tls.capacity() > kRetain && tls.size() <= kRetain) {
         tls.shrink_to_fit();  // 收到 size()（≤kRetain），内容保留
+    }
+    return tls;
+}
+
+// S29-8：nfkc_fold + to_codepoints 融合入口。
+//
+// 原两段式对 CJK 文本每码点解码**两遍**：nfkc_fold 快路径校验趟逐码点
+// decode_one 只为判 nfkc_casefold_inert、产出字节与输入相同（纯拷贝），
+// to_codepoints 又对同样的字节全量重解。本函数在校验的同一趟里直接产出
+// CpInfo（ASCII 记 tolower 后的码点——与「解码 out」逐位一致；inert 非
+// ASCII 原样），快路径命中即省整趟解码。回退慢路径时（utf8proc_map 产出
+// 与输入不同的字节）行为同旧两段式：map 后对映射串全量解码。
+// 语义契约：(out, cps) 与 `nfkc_fold(input,out); to_codepoints(out,cps)`
+// 逐位一致（analyzer_test 黑盒对拍覆盖）。
+inline void nfkc_fold_codepoints(std::string_view input, std::string& out,
+                                 std::vector<CpInfo>& cps) {
+    out.clear();
+    cps.clear();
+    if (input.empty()) return;
+    cps.reserve(input.size() / 2);
+
+    bool fast = true;
+    std::size_t off = 0;
+    while (off < input.size()) {
+        const auto b = static_cast<unsigned char>(input[off]);
+        if (b < 0x80) {
+            if (!((b >= 0x20 && b <= 0x7E) ||
+                  b == 0x09 || b == 0x0A || b == 0x0D)) {
+                fast = false;
+                break;
+            }
+            // out = 原串 tolower ⇒ 码点也记折叠后的（与重解 out 一致）。
+            const auto cp = (b >= 'A' && b <= 'Z')
+                                ? static_cast<char32_t>(b - 'A' + 'a')
+                                : static_cast<char32_t>(b);
+            cps.push_back({cp, off, 1});
+            ++off;
+            continue;
+        }
+        auto [cp, consumed] = decode_one(input.substr(off));
+        if (consumed == 0 || !nfkc_casefold_inert(cp)) {
+            fast = false;
+            break;
+        }
+        cps.push_back({cp, off, consumed});
+        off += consumed;
+    }
+    if (fast) {
+        out.assign(input);
+        for (auto& c : out) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        }
+        return;
+    }
+
+    // 慢路径：半程 cps 作废，map 后全量重解（同旧两段式）。
+    cps.clear();
+    nfkc_map_slow(input, out);
+    to_codepoints(out, cps);
+}
+
+// S29-8：融合版的 thread_local 复用形态（对齐 to_codepoints_reuse——含同款
+// 防膨胀守卫与「同线程不可同时持两份返回引用」约束；normalized 出参由
+// caller 持有，term string_view 借其字节）。
+[[nodiscard]] inline const std::vector<CpInfo>& nfkc_fold_codepoints_reuse(
+    std::string_view text, std::string& normalized_out) {
+    thread_local std::vector<CpInfo> tls;
+    nfkc_fold_codepoints(text, normalized_out, tls);
+    constexpr std::size_t kRetain = 1u << 16;  // 65536 CpInfo
+    if (tls.capacity() > kRetain && tls.size() <= kRetain) {
+        tls.shrink_to_fit();
     }
     return tls;
 }

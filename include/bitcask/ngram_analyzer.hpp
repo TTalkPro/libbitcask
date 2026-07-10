@@ -26,6 +26,11 @@ public:
                            std::vector<std::string> custom_stop_words = {},
                            std::uint32_t min_token_length = 1);
 
+    // S29-8：tf-only 覆写——不构造 per-term positions vector（基类默认从
+    // analyze_with_positions 派生后丢弃）。term 集与 tf 与派生版逐位一致。
+    [[nodiscard]] auto analyze(std::string_view text) const
+        -> TermFreqMap override;
+
     [[nodiscard]] auto analyze_with_positions(std::string_view text) const
         -> TermPositionsMap override;
 

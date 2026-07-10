@@ -130,17 +130,15 @@ auto JiebaAnalyzer::collect_tokens(std::string_view text, bool need_offsets) con
     // Step 1: NFKC 归一化（n-gram 回退路径 + 高亮 offset 的统一坐标系）。
     // P6:thread_local 复用归一化缓冲。函数内不重入，cps/term 引用它期间稳定；
     // term 在末尾 copy-out，函数返回后无悬垂。每线程独立（S3 并行 analyze 安全）。
+    // S29-8:融合解码——归一化校验趟直接产出 codepoint 序列（原 Step 3 的
+    // to_codepoints 对同字节第二遍全量重解），CJK 快路径每码点省一次解码。
     thread_local std::string normalized;
-    detail::nfkc_fold(text, normalized);
+    thread_local std::vector<detail::CpInfo> cps;
+    detail::nfkc_fold_codepoints(text, normalized, cps);
     if (normalized.empty()) return tokens;
 
     // Step 2: jieba CutForSearch 切词。
     auto jieba_words = jieba_cut(text);
-
-    // Step 3: 在归一化文本上做 codepoint 分析（定位 jieba 词 + 检测未覆盖 CJK 段）。
-    // P4:thread_local 复用 codepoint 缓冲（与逐词 word_cps 用不同缓冲，避免别名）。
-    thread_local std::vector<detail::CpInfo> cps;
-    detail::to_codepoints(normalized, cps);
 
     std::uint32_t pos = 0;
     std::vector<bool> cjk_covered(cps.size(), false);
@@ -169,8 +167,7 @@ auto JiebaAnalyzer::collect_tokens(std::string_view text, bool need_offsets) con
     thread_local std::string word_norm;
     thread_local std::vector<detail::CpInfo> word_cps;
     for (auto& [word, _] : jieba_words) {
-        detail::nfkc_fold(word, word_norm);
-        detail::to_codepoints(word_norm, word_cps);
+        detail::nfkc_fold_codepoints(word, word_norm, word_cps);  // S29-8:融合
         if (word_cps.empty()) continue;
 
         // S9.26：jieba CutForSearch 偶尔把空格/标点也输出为词，过滤掉纯噪声词

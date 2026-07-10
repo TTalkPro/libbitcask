@@ -30,10 +30,10 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -270,9 +270,67 @@ struct IndexLane {
     ReduceFn reduce_fn;
     ErrorFn  error_fn;
 
-    // reorder buffer（受 IndexPool::reorder_mu_ 保护——与所有 lane 共享一把锁）
-    std::map<std::uint64_t, ReorderEntry> pending;
-    std::uint64_t next_apply_ord = 0;   // 下一个应 apply 的 ord（仅 reducer 推进）
+    // reorder buffer（受 IndexPool::reorder_mu_ 保护——与所有 lane 共享一把锁）。
+    // S29-9：std::map（每任务锁内一次 rb-tree 节点分配 + O(log n)）→ 环形滑动
+    // 窗口。依据不变量：① per-lane ord 稠密（Skip 占位）且 reducer 严格 +1
+    // 消费 → 在途 ord 恒为 [ring_base, ring_base+窗口) 连续区间的子集；
+    // ② 容量恒为 2 的幂 → slot = ord & (cap-1) 在窗口内唯一，免 head 指针。
+    // entry 由 map worker **锁外** make_unique，锁内仅挂指针（O(1)、零分配）；
+    // 空洞 slot = nullptr（该 ord 未到达）。窗口上界 ≈ queue 容量 + reorder
+    // 在途上限（背压封顶）→ 指针数组最多 ~数百 KiB/lane。
+    std::vector<std::unique_ptr<ReorderEntry>> ring;  // 惰性建（首 put 时 64 起）
+    std::uint64_t ring_base  = 0;   // 窗口起点 ord（仅锁下读写；take 时 +1）
+    std::size_t   ring_count = 0;   // 环内 entry 数（仅锁下读写）
+    std::uint64_t next_apply_ord = 0;   // 下一个应 apply 的 ord（仅 reducer 推进；
+                                        // apply 后锁外 +1，下次持锁点已与 ring_base 追平）
+
+    // 锁下调：挂 entry 到 ord 槽位。ord < ring_base（已消费区间）或槽位已占
+    // （重复 ord）均为上游 bug——debug 断言，release 丢弃新 entry（保序不腐化）。
+    // 返回 false 表示被丢弃（调用方补偿 in_flight，防 flush 悬挂）。
+    bool ring_put(std::uint64_t ord, std::unique_ptr<ReorderEntry> e) {
+        assert(ord >= ring_base && "reorder ring: ord 早于窗口起点（重复/回退 ord？）");
+        if (ord < ring_base) return false;
+        const std::uint64_t off = ord - ring_base;
+        if (off >= ring.size()) ring_grow(static_cast<std::size_t>(off) + 1);
+        auto& slot = ring[ord & (ring.size() - 1)];
+        assert(!slot && "reorder ring: 槽位已占（重复 ord？）");
+        if (slot) return false;
+        slot = std::move(e);
+        ++ring_count;
+        return true;
+    }
+
+    // 锁下调：取出窗口头（ring_base）的 entry；未到达返回 nullptr。
+    // 成功取出即推进 ring_base（与 reducer 的 next_apply_ord 配对推进）。
+    std::unique_ptr<ReorderEntry> ring_take_front() {
+        if (ring_count == 0 || ring.empty()) return nullptr;
+        auto& slot = ring[ring_base & (ring.size() - 1)];
+        if (!slot) return nullptr;
+        auto out = std::move(slot);
+        ++ring_base;
+        --ring_count;
+        return out;
+    }
+
+    // 锁下调：窗口头 entry 是否已到达（reducer 就绪谓词）。
+    bool ring_front_ready() const {
+        return ring_count > 0 && !ring.empty() &&
+               ring[ring_base & (ring.size() - 1)] != nullptr;
+    }
+
+    // 锁下调：扩容到 ≥need 的 2 的幂并按新 mask 重排（罕见：仅窗口首次拉宽时，
+    // 摊销后每 lane 常数次）。旧窗口按 ord 遍历搬迁——slot 下标由 ord 派生，
+    // 新旧 mask 各自定位。
+    void ring_grow(std::size_t need) {
+        std::size_t cap = ring.empty() ? 64 : ring.size();
+        while (cap < need) cap <<= 1;
+        std::vector<std::unique_ptr<ReorderEntry>> nr(cap);
+        for (std::uint64_t o = ring_base; o < ring_base + ring.size(); ++o) {
+            auto& s = ring[o & (ring.size() - 1)];
+            if (s) nr[o & (cap - 1)] = std::move(s);
+        }
+        ring = std::move(nr);
+    }
 
     // ord 水位（atomic；flush 无锁读）。语义同 P2 的 per-pool 版本，下沉到 lane。
     std::atomic<std::uint64_t> submitted_ord_hwm{0};  // 已 submit 的最大 ord
@@ -336,6 +394,7 @@ public:
             lane->reduce_fn     = std::move(reduce_fn);
             lane->error_fn      = std::move(error_fn);
             lane->next_apply_ord = init_ord;
+            lane->ring_base      = init_ord;  // S29-9：窗口起点与消费水位对齐
             raw = lane.get();
             lanes_.emplace(lane->id, std::move(lane));
         }
@@ -469,29 +528,44 @@ private:
             }
             const std::uint64_t ord = task.ord;
             push_reorder(lane, ord,
-                         ReorderEntry{PutEntry{std::move(task), std::move(preps)}});
+                         std::make_unique<ReorderEntry>(
+                             PutEntry{std::move(task), std::move(preps)}));
         } else if (task.op == IndexOp::Delete) {
             DeleteEntry de;
             de.key = std::string(task.key());
             de.ord = task.ord;
-            push_reorder(lane, task.ord, ReorderEntry{std::move(de)});
+            push_reorder(lane, task.ord,
+                         std::make_unique<ReorderEntry>(std::move(de)));
         } else if (task.op == IndexOp::Skip) {
-            push_reorder(lane, task.ord, ReorderEntry{SkipEntry{}});
+            push_reorder(lane, task.ord,
+                         std::make_unique<ReorderEntry>(SkipEntry{}));
         } else {
             // S13-F6：RunFn 回调经 reorder buffer 送 reducer 线程按 ord 序执行。
             push_reorder(lane, task.ord,
-                         ReorderEntry{RunFnEntry{std::move(task.fn)}});
+                         std::make_unique<ReorderEntry>(
+                             RunFnEntry{std::move(task.fn)}));
         }
     }
 
     // 推一条 entry 进 lane 的 reorder buffer，并计入全局在途计数（背压）。
-    void push_reorder(IndexLane* lane, std::uint64_t ord, ReorderEntry entry) {
+    // S29-9：entry 在调用侧（map worker）**锁外**构造，锁内仅 O(1) 挂指针
+    // ——原 map 版在锁内做 rb-tree 节点分配，放大全 lane 共享锁的持锁时长。
+    void push_reorder(IndexLane* lane, std::uint64_t ord,
+                      std::unique_ptr<ReorderEntry> entry) {
+        bool accepted;
         {
             std::lock_guard<std::mutex> lk(reorder_mu_);
-            lane->pending.emplace(ord, std::move(entry));
-            ++reorder_inflight_;
+            accepted = lane->ring_put(ord, std::move(entry));
+            if (accepted) ++reorder_inflight_;
         }
-        reorder_cv_.notify_one();
+        if (accepted) {
+            reorder_cv_.notify_one();
+        } else {
+            // 重复/回退 ord（上游 bug，debug 已断言）：entry 已丢弃——补偿
+            // in_flight 防 flush 悬挂，并上报 error_fn。
+            if (lane->error_fn) lane->error_fn();
+            dec_in_flight(lane);
+        }
     }
 
     // 惰性启动 N 个 map worker + 1 个 reducer（首次 register_lib 调）。幂等。
@@ -550,13 +624,15 @@ private:
                 progressed = false;
                 for (auto& [id, lane_sp] : lanes_) {
                     std::shared_ptr<IndexLane> lane = lane_sp;  // 锁下拷活 lane
-                    if (lane->pending.count(lane->next_apply_ord) == 0) continue;
-                    auto node  = lane->pending.extract(lane->next_apply_ord);
-                    auto& entry = node.mapped();
+                    // S29-9：单次 O(1) 槽位取出（原 count+extract 两次 rb-tree
+                    // 查找）。take 成功即锁下推进 ring_base；next_apply_ord 在
+                    // apply 后锁外 +1（reducer 私有），下次持锁点二者追平。
+                    auto entry_up = lane->ring_take_front();
+                    if (!entry_up) continue;
                     lk.unlock();
 
                     try {
-                        lane->reduce_fn(entry);
+                        lane->reduce_fn(*entry_up);
                     } catch (...) {
                         if (lane->error_fn) lane->error_fn();
                     }
@@ -581,14 +657,14 @@ private:
     // 谓词（持 reorder_mu_ 调）：任一 lane 的下一个 ord 已就绪。
     bool any_lane_ready_locked() const {
         for (const auto& [id, lane] : lanes_) {
-            if (lane->pending.count(lane->next_apply_ord) > 0) return true;
+            if (lane->ring_front_ready()) return true;
         }
         return false;
     }
     // 谓词（持 reorder_mu_ 调）：所有 lane 的 reorder buffer 均空。
     bool all_lanes_empty_locked() const {
         for (const auto& [id, lane] : lanes_) {
-            if (!lane->pending.empty()) return false;
+            if (lane->ring_count != 0) return false;
         }
         return true;
     }
