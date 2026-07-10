@@ -978,6 +978,9 @@ void Cask::evict_read_handles_locked() {
 std::expected<void, CaskFault> Cask::prepare_search() {
     if (!text_) return std::unexpected(err(CaskError::kNoIndex));
     flush_index();
+    // S27-4 P2:reducer 排干只保证 job 已**派发**;builder 模式下 apply 可能
+    // 仍在途。drain 钩子补齐 read-your-writes(设计 §3;内联模式为空操作)。
+    for (auto* p : plugins_) p->drain();
     return {};
 }
 
