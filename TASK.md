@@ -3324,7 +3324,7 @@ W4 ✅（parallel_scan 并行全表扫描）。
       (回收等效,段数不收敛);② legacy 段化迁移(老 kBm25Default/kBm25Fields
       ckpt → 初始段)——现行为:老格式不认 → 退全量 fold 重建段集
       (安全慢,升级一次性成本,设计 §5 既定回退)。
-- [ ] **S27-4 并行 builder（DWPT）**（**P1 完成** 2026-07-10）：多段内单线程 builder,
+- [ ] **S27-4 并行 builder（DWPT）**（**P1+P2 完成** 2026-07-10）：多段内单线程 builder,
   文档分派。**吞吐红利落地。**实现设计:
   [`docs/design/s27-4-dwpt-design.md`](docs/design/s27-4-dwpt-design.md)
   （reducer 退化轻路由 + B 个 builder 线程各持 building 段;正确性核心 =
@@ -3340,11 +3340,38 @@ W4 ✅（parallel_scan 并行全表扫描）。
     原子化(P2-proof)。
     验收:clang 562/562;TSan 子集 180/180 + 生命周期压力 ×2;ASan 全量
     562/562;rel 构建过。
-  - [ ] **P2**:BuilderPool(线程 + MPSC 队列 + drain)+ on_put/apply_text
-    派发 + 插件 drain 钩子接 Cask(flush_index/prepare_search);默认 B=1
-    串行等价。
-  - [ ] **P3**:B>1 开放 + 并发 builder 定向压力 + 三 sanitizer + 端到端
-    put_doc 吞吐 bench(对照单 reducer 基线)。
+  - [x] **P2 已完成（2026-07-10）：BuilderPool + 派发 + drain 屏障**。
+    - 配置:`TextPluginConfig::builder_threads`(经 SearchLayerConfig 透传;
+      **默认 0 = 内联,偏离设计的 B=1**——安全灰度,P3 评估翻转;P2 内部
+      钳制 B≤1,B>1 需每 builder 一段,归 P3)。
+    - 派发:on_put 路由——TextPrepared job 与单文本 raw(**连分析一起下放**
+      builder,额外并行度)均 round-robin 入队(cap 1024 背压);on_delete 仍
+      reducer 直做(LSN 守卫仲裁在途 put,P1 地基);builder_loop 吞异常、
+      stop 前自然排干残留队列。
+    - 屏障:插件 API 增 `virtual void drain()`;Cask::prepare_search 在
+      flush_index 后逐插件 drain(read-your-writes);TextPlugin::flush 前置
+      drain_builders(ckpt 覆盖在途);on_merge_commit 压实前 drain。
+    - 压实触发迁移:builder 模式下 apply 路径 maybe_auto_compact no-op
+      (builder 不可 compact——遍历他人 building 的 tbb map 与并发 add 不
+      兼容),改由 reducer 侧 maybe_auto_compact_reducer(阈值 → drain →
+      compact)在 on_put/on_delete 末尾触发。
+    - **抓获并修复潜伏并发 bug:doc_store 的 std::deque 底座对并发读者
+      不安全**——deque 元素引用稳定但内部节点指针表(map)push_back 扩容
+      时整表重分配,读者 operator[] 两级寻址走旧表 = UAF(S27-3 的
+      vector→deque 只修了元素一半;新增 TSan 压力测试稳定复现)。修复:
+      新容器 `RowChunks`([`row_chunks.hpp`](include/bitcask/row_chunks.hpp),
+      固定 chunk 永不搬移 + spine 原子 release 发布 + 旧 spine graveyard
+      至析构),替换段 doc_store 全部五数组;顺手修 multi_view 无锁读
+      fields_.size()。
+    - 测试:插件级 4 个(可见性/覆盖/删除守卫、多字段 job 派发、flush
+      round-trip 跨模式重开、并发查询压力 2000 docs)+ Cask 端到端 1 个
+      (B=1 写查删 → B=1/B=0 双模式重开)。
+    - 验收:clang 567/567;TSan 并发子集 30/30 + 压力 ×5;ASan 全量
+      567/567;rel 构建过 + 查询 bench 无回归。
+  - [ ] **P3**:B>1 开放(**每 builder 一个 building 段** + 查询多 building
+    归并 + flush 逐段封口;解除 P2 的 B≤1 钳制)+ 并发 builder 定向压力 +
+    三 sanitizer + 端到端 put_doc 吞吐 bench(对照单 reducer 基线)+ 评估
+    默认 builder_threads 翻转。
 
 ### 关联既有设计（勿重复造轮子）
 - [`ord-recycling-design-zh.md`](doc/ord-recycling-design-zh.md)：ord 三角色 / per-write 硬约束 /
