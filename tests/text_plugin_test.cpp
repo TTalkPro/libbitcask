@@ -313,3 +313,80 @@ TEST(TextPlugin, OnDeleteFromSegmentSet) {
 
     fs::remove_all(dir);
 }
+
+// ---- S27-3 B2b 步骤 4:段集 recovery round-trip ----
+// 覆盖三件事:① flush 先封口 building → kSegManifest 进 bm25.ckpt,新插件
+// open 从**内嵌清单**开段集(单一 commit point 主路径);② 封口后、ckpt 前
+// 的 mark_dead 经脏段重存持久化——reopen 无幽灵;③ key_to_location_ 从段集
+// 重建——reopen 后对 ckpt 前文档的删除仍能段级定位。
+TEST(TextPlugin, SegmentSetRecoveryRoundTrip) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_textplugin_seg_rt";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    constexpr std::size_t N = 5;
+    text::TextPlugin::ChainState st{};
+    {
+        index::Index idx;
+        text::TextPlugin a(make_cfg(), idx, idx, idx);
+        plugin::OpenContext ctx;
+        ctx.dir = dir_s;
+        ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+        for (std::uint64_t ord = 0; ord < N; ++ord) {
+            const std::string key = "k" + std::to_string(ord);
+            host_put_row(idx, key, ord);
+            a.apply_text(key, ord, "common word" + std::to_string(ord));
+        }
+        a.flush_building_now();  // 先封口:随后的删除走「封口段 mark_dead」路径
+        ASSERT_EQ(a.segment_set()->segment_count(), 1u);
+        // 封口后、checkpoint 前删除 k1——live_ 位只翻内存,依赖脏段重存持久化。
+        a.on_delete("k1", /*tomb_ord=*/100, /*prior_ord=*/1);
+        ASSERT_EQ(a.segment_set()->segment(0)->live_doc_count(), N - 1);
+
+        plugin::FlushRequest req;
+        req.watermark = N;
+        auto fr = a.flush(req);
+        ASSERT_EQ(fr.status, plugin::PluginStatus::kOk);
+        st = a.chain_state();
+    }
+
+    // 抹掉过渡期 segments.manifest——强制走 bm25.ckpt 内嵌 kSegManifest 主路径。
+    fs::remove(dir / "bm25_segments" / "segments.manifest");
+
+    index::Index idx2;
+    for (std::uint64_t ord = 0; ord < N; ++ord) {
+        host_put_row(idx2, "k" + std::to_string(ord), ord);
+    }
+    text::TextPlugin b(make_cfg(), idx2, idx2, idx2);
+    plugin::OpenContext c2;
+    c2.dir = dir_s;
+    c2.committed_base_watermark = st.base_gen;
+    c2.committed_chain_watermark = st.chain_wm;
+    c2.committed_chain_seq = st.next_seq - 1;
+    ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+
+    // ① 段集从内嵌清单恢复。
+    const auto* sset = b.segment_set();
+    ASSERT_NE(sset, nullptr);
+    ASSERT_EQ(sset->segment_count(), 1u);
+    const auto* seg = sset->segment(0);
+    ASSERT_NE(seg, nullptr);
+    EXPECT_EQ(seg->doc_count(), N);
+    // ② ckpt 前的删除已持久化(无幽灵)。
+    EXPECT_EQ(seg->live_doc_count(), N - 1) << "封口后 ckpt 前的删除复活成幽灵";
+    EXPECT_FALSE(seg->is_live(1));
+    // 查询侧:k1 专属词不可命中,其余命中。
+    auto r_dead = b.search_text("word1", 10);
+    ASSERT_TRUE(r_dead.has_value());
+    EXPECT_TRUE(r_dead->empty()) << "已删除文档不应命中";
+    auto r_live = b.search_text("word2", 10);
+    ASSERT_TRUE(r_live.has_value());
+    EXPECT_EQ(r_live->size(), 1u);
+    // ③ key_to_location_ 已重建:对 ckpt 前文档的删除能段级定位。
+    b.on_delete("k2", /*tomb_ord=*/101, /*prior_ord=*/2);
+    EXPECT_FALSE(seg->is_live(2)) << "reopen 后 mark_dead 落空(key 定位未重建)";
+    EXPECT_EQ(seg->live_doc_count(), N - 2);
+
+    fs::remove_all(dir);
+}

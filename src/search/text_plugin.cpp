@@ -1228,6 +1228,9 @@ bool TextPlugin::save_component_base(std::string_view dir,
     // 见设计 §4.1)。过渡期仍提交 segments.manifest(SegmentSet::open 兼容,
     // 步骤 4 后退役)。commit 失败 → 本次 base 保存失败(盘错误,flush 上报)。
     if (segment_set_) {
+        // 步骤 4:先重存有新 mark_dead 的段(live_ 位持久化——否则 ckpt 前
+        // 的删除在 recovery 后复活为幽灵),再提交清单。
+        if (!segment_set_->resave_dead_dirty()) return false;
         if (!segment_set_->commit()) return false;
         sw.add(sc::CkptSectionType::kSegManifest,
                segment_set_->manifest_payload());
@@ -1325,6 +1328,10 @@ TextPlugin::load_component(std::string_view dir,
             } else {
                 segments_ok = false;
             }
+        } else if (st == sc::CkptSectionType::kSegManifest) {
+            // S27-3 B2b 步骤 4:捕获内嵌段清单,open() 从它开段集
+            // (recovery 主路径;单一 commit point 语义)。
+            pending_seg_manifest_.assign(ls.payload.begin(), ls.payload.end());
         }
     }
     if (!any) segments_ok = false;
@@ -1358,20 +1365,54 @@ plugin::PluginStatus TextPlugin::open(const plugin::OpenContext& ctx) {
     rebase_needed_.store(!r.loaded, std::memory_order_relaxed);
 
     // S27-3 Slice B1：初始化 Building 段 + SegmentSet。
+    // S27-3 B2b 步骤 4:recovery 主路径——**优先**从 bm25.ckpt 内嵌的
+    // kSegManifest 开段集(与 index.manifest 同一 commit point,无双清单
+    // 冲突);载入失败/无内嵌清单 → 回退过渡期 segments.manifest → 空集
+    // (fields_ 退化路径兜底,查询侧 degrade guard 已有)。
     if (!dir_.empty()) {
         const std::string segs_dir = dir_ + "/bm25_segments/";
         std::error_code ec;
         std::filesystem::create_directories(segs_dir, ec);
-        auto opened = search::SegmentSet::open(segs_dir);
+        std::unique_ptr<search::SegmentSet> opened;
+        if (r.loaded && !pending_seg_manifest_.empty()) {
+            opened = search::SegmentSet::open_from_payload(
+                segs_dir, pending_seg_manifest_);
+        }
+        if (!opened) opened = search::SegmentSet::open(segs_dir);  // 过渡回退
         if (opened) {
             segment_set_ = std::move(opened);
         } else {
             segment_set_ = std::make_unique<search::SegmentSet>();
         }
+        pending_seg_manifest_.clear();
+        pending_seg_manifest_.shrink_to_fit();
+        // 步骤 4:重建 key→(seg_id, docid)——否则 recovery 后对 ckpt 前
+        // 文档的删除/覆盖 mark_dead 落空(段内幽灵直到 merge)。
+        rebuild_key_locations();
     }
     building_ = std::make_unique<search::SealedSegment>();
 
     return plugin::PluginStatus::kOk;
+}
+
+// S27-3 B2b 步骤 4:从段集重建 key_to_location_(open 尾部调,单线程)。
+// 按段集序(seg_id 升序 == 清单序)遍历,段内 docid 升序 == LSN 升序 →
+// 同 key 后写天然覆盖前写;只登记 live 文档(dead 槽位无删除/覆盖价值)。
+void TextPlugin::rebuild_key_locations() {
+    key_to_location_.clear();
+    if (!segment_set_) return;
+    const auto entries = segment_set_->entries_view();
+    const auto segs = segment_set_->segments_view();
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const auto& seg = *segs[i];
+        const auto n = seg.doc_count();
+        for (std::size_t d = 0; d < n; ++d) {
+            const auto docid = static_cast<DocId>(d);
+            if (!seg.is_live(docid)) continue;
+            key_to_location_[seg.key_at(docid)] =
+                KeyLocation{false, entries[i].seg_id, docid};
+        }
+    }
 }
 
 plugin::FlushResult TextPlugin::flush(const plugin::FlushRequest& req) {
@@ -1380,7 +1421,12 @@ plugin::FlushResult TextPlugin::flush(const plugin::FlushRequest& req) {
     plugin::FlushResult res;
     if (!dirty() && !req.force_rebase) {
         res.covered_ord = chain_.chain_wm;
-    } else if (save_component_base(dir_, req.watermark)) {
+    } else if ((flush_building(),
+                save_component_base(dir_, req.watermark))) {
+        // S27-3 B2b 步骤 4:保存前先封口 building_ → kSegManifest 覆盖到本次
+        // watermark 的全部已 apply 文档(否则 recovery 后段集落后 fields_,
+        // 查询永久走退化路径)。flush 经 RunFn 在 reducer 线程执行(S13-F6),
+        // 与 apply/flush_building 同一单写者上下文,直接调用安全。
         res.covered_ord = req.watermark;
     } else {
         res.status = plugin::PluginStatus::kFailed;

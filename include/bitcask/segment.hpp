@@ -169,8 +169,16 @@ public:
     [[nodiscard]] bool mark_dead(DocId docid) {
         if (docid >= live_.size()) return false;
         live_[docid] = 0;
+        dead_dirty_ = true;  // S27-3 B2b 步骤 4:待重存(见 dead_dirty 注释)
         return true;
     }
+
+    // S27-3 B2b 步骤 4:自上次 save 后是否有新的 mark_dead。live_ 位随
+    // kSegDocStore 持久化,但封口段不会自动重存——不在 checkpoint 时重存
+    // 脏段,ckpt **之前**的删除会在 recovery 后复活为幽灵(fold 只补 ckpt
+    // 之后的窗口)。SegmentSet::resave_dead_dirty 消费本标记。
+    [[nodiscard]] bool dead_dirty() const { return dead_dirty_; }
+    void clear_dead_dirty() { dead_dirty_ = false; }
     // 活文档计数（live_==1 的数量）——测试 / 内省用。
     [[nodiscard]] std::size_t live_doc_count() const {
         std::size_t n = 0;
@@ -421,6 +429,7 @@ private:
     // 除是封口后唯一允许的 mutation；接口本身已显式标注非常量（caller 须
     // 取到非 const SealedSegment*，见 mark_dead 注释）。
     mutable std::vector<std::uint8_t> live_;
+    bool dead_dirty_ = false;  // S27-3 B2b 步骤 4:save 后有新 mark_dead
 
     // 命名字段（除默认）：字段名 → InvertedIndex。
     // fields_mu_ 只护 map 结构（与 TextPlugin::fields_ 同款约定：本体地址稳定，

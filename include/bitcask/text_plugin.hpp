@@ -440,6 +440,13 @@ private:
         DocId         docid       = 0;     // 段内本地 docid
     };
 
+    // S27-3 B2b 步骤 4:recovery 主路径辅件——load_component 捕获 bm25.ckpt
+    // 内嵌的 kSegManifest 载荷(open 消费,从中开段集);段集载入后重建
+    // key→(seg_id, docid) 定位(否则 recovery 后对 ckpt 前文档的删除/覆盖
+    // 找不到段位,mark_dead 落空)。
+    std::vector<std::byte> pending_seg_manifest_;
+    void rebuild_key_locations();
+
     std::unique_ptr<search::SealedSegment>   building_;     // 当前 Building 段
     std::unique_ptr<search::SegmentSet>      segment_set_;  // 已封口活跃段集
     std::unordered_map<std::string, KeyLocation,

@@ -170,6 +170,47 @@ public:
     // 当前活跃段列表（只读视图，查询归并 / 测试用）。
     [[nodiscard]] std::span<const std::unique_ptr<SealedSegment>>
     segments_view() const { return segments_; }
+    // 清单条目视图(与 segments_view 平行;key_to_location_ 重建需 seg_id)。
+    [[nodiscard]] std::span<const Entry> entries_view() const { return entries_; }
+
+    // ---- S27-3 B2b 步骤 4:recovery 主路径 + 死亡位重存 ----
+
+    // 从 bm25.ckpt 内嵌的 kSegManifest 载荷打开(单一 commit point 语义:
+    // 清单随 index.manifest 原子提交)。任一段载入失败 → nullptr(caller
+    // 回退:过渡期 segments.manifest → 空集 + fields_ 退化路径)。
+    // next_seg_id 取清单内最大 seg_id+1——崩溃残留的孤儿段文件(add_pending
+    // 后未 commit)可能与新 id 同名,save 的 tmp+rename 原子覆盖,无害。
+    [[nodiscard]] static std::unique_ptr<SegmentSet> open_from_payload(
+        const std::string& dir, std::span<const std::byte> payload) {
+        auto set = std::make_unique<SegmentSet>();
+        set->dir_ = dir;
+        if (!set->decode_manifest(payload)) return nullptr;
+        for (const auto& e : set->entries_) {
+            auto seg = SealedSegment::load(join(dir, e.filename));
+            if (!seg) return nullptr;
+            set->segments_.push_back(std::move(seg));
+        }
+        std::uint64_t nid = 0;
+        for (const auto& e : set->entries_) nid = std::max(nid, e.seg_id + 1);
+        set->next_seg_id_ = nid;
+        return set;
+    }
+
+    // 重存有新 mark_dead 的段(live_ 位随 kSegDocStore 持久化,但封口段不
+    // 自动重存——不重存则 ckpt 之前的删除在 recovery 后复活为幽灵)。
+    // tmp+rename 原子替换同名文件;watermark 沿用该段 hi_lsn。
+    [[nodiscard]] bool resave_dead_dirty() {
+        for (std::size_t i = 0; i < segments_.size(); ++i) {
+            auto& seg = segments_[i];
+            if (!seg->dead_dirty()) continue;
+            if (!seg->save(join(dir_, entries_[i].filename),
+                           entries_[i].hi_lsn)) {
+                return false;
+            }
+            seg->clear_dead_dirty();
+        }
+        return true;
+    }
 
 private:
     static constexpr std::uint32_t kManifestMagic = 0x464D4753;  // 'SGMF'
