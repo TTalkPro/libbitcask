@@ -115,42 +115,6 @@ struct EntryAt {
 }  // namespace
 
 // =============================================================================
-// S29-6 P2:Limbo(epoch 延迟回收池)。访问约定见 keydir.hpp 声明处。
-// =============================================================================
-
-void Limbo::retire_raw(void* p, std::size_t bytes) {
-    raw.emplace_back(epoch::Registry::instance().advance(), Raw{p, bytes});
-}
-void Limbo::retire_key(std::string&& k) {
-    keys.emplace_back(epoch::Registry::instance().advance(), std::move(k));
-}
-void Limbo::retire_entry(Entry&& e) {
-    entries.emplace_back(epoch::Registry::instance().advance(), std::move(e));
-}
-
-// 释放所有 stamp < safe 的项。advance() 全局单调 → 单个 vector 内 stamp
-// 升序 → 前缀即可释放整段。keys/entries 的前缀 erase 本身析构 payload
-// (string/vector 堆缓冲随之 free);raw 需显式 operator delete。
-void Limbo::reclaim(std::uint64_t safe) noexcept {
-    auto prefix_len = [safe](const auto& v) {
-        std::size_t n = 0;
-        while (n < v.size() && v[n].first < safe) ++n;
-        return n;
-    };
-    if (const auto n = prefix_len(raw); n > 0) {
-        for (std::size_t i = 0; i < n; ++i) ::operator delete(raw[i].second.p);
-        raw.erase(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(n));
-    }
-    if (const auto n = prefix_len(keys); n > 0) {
-        keys.erase(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(n));
-    }
-    if (const auto n = prefix_len(entries); n > 0) {
-        entries.erase(entries.begin(),
-                      entries.begin() + static_cast<std::ptrdiff_t>(n));
-    }
-}
-
-// =============================================================================
 // 屏障 v2:写者闸门（RAII;替代旧 lock_all_shards/lock_all_shards_shared）。
 //
 // 旧方案在屏障期间同时持有全部 kShards+1=257 把锁,撞 TSan 死锁检测器
@@ -372,6 +336,43 @@ std::uint32_t KeyDir::trim_fstats(std::span<const std::uint32_t> ids) {
 std::optional<EntryProxy> KeyDir::get(std::string_view key,
                                        std::uint64_t target_epoch) const {
     const Shard& sh = shards_[shard_for(key)];
+
+    // ---- S29-6 P3:乐观快路径(零共享写——不碰分片锁字) ----
+    // 条件:开关开 && 非 fold 态(fold/pending 语义走锁路径;relaxed 读与
+    // 既有锁路径同款,竞态窗口内的 miss 可线性化为「读在写前」)&& 槽可用。
+    // 存活性:先注册 epoch 槽(seq_cst)再乐观读——其后 retire 的 stamp >
+    // 注册时 epoch → limbo 不回收 → 表内配方(seq_shard_table.hpp)的
+    // deref 恒安全。命中判别 == Single 才采纳(POD,无指针);Multi/重试
+    // 超限回退加锁。proxy.key 用 caller 的 key(同字节,免借表内部存储)。
+    if (optimistic_reads_.load(std::memory_order_relaxed) &&
+        keyfolders_.load(std::memory_order_relaxed) == 0 &&
+        !has_pending_.load(std::memory_order_relaxed)) {
+        if (auto* slot = epoch::thread_slot()) {
+            slot->active.store(epoch::Registry::instance().current(),
+                               std::memory_order_seq_cst);
+            struct SlotClear {
+                epoch::Registry::Slot* s;
+                ~SlotClear() { s->active.store(0, std::memory_order_release); }
+            } sc{slot};
+
+            using OptResult = detail::SeqShardTable<Entry>::OptResult;
+            alignas(Entry) std::byte raw[sizeof(Entry)];
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                const auto r = sh.entries.try_get_optimistic(key, raw);
+                if (r == OptResult::kMiss) return std::nullopt;
+                if (r == OptResult::kRetry) continue;
+                // kHit:字节拷贝已经 seq 终验(未撕裂的 Entry 镜像)。
+                const auto* e = reinterpret_cast<const Entry*>(raw);
+                if (const auto* s = std::get_if<SingleEntry>(e)) {
+                    if (target_epoch < s->epoch) return std::nullopt;
+                    if (is_sibling_tombstone(*s)) return std::nullopt;
+                    return to_proxy(key, *s, /*tombstone*/ false);
+                }
+                break;  // MultiEntry(fold 竞态窗口)→ 回退加锁
+            }
+        }
+    }
+
     std::unique_lock slock(sh.mu);
 
     auto it = sh.entries.find(key);
@@ -447,12 +448,18 @@ PutResult KeyDir::put(std::string_view key,
     ctx.now_sec = now_sec;
 
     PutResult r;
-    if (!ctx.found || ctx.current_is_tombstone) {
-        r = put_insert(ctx, key, file_id, total_sz, offset, tstamp,
-                       newest_put, old_file_id, ord);
-    } else {
-        r = put_overwrite(ctx, key, file_id, total_sz, offset, tstamp,
-                          newest_put, old_file_id, old_offset, ord);
+    {
+        // S29-6 P3:两分支均含经 entries_entry 指针的就地改写(复活覆写/
+        // 链升级/case B 覆写)——统一包 seqlock 写窗口(表方法的嵌套 bump
+        // 无害,窗口结束恒偶)。
+        auto ws = ctx.shard->entries.write_section();
+        if (!ctx.found || ctx.current_is_tombstone) {
+            r = put_insert(ctx, key, file_id, total_sz, offset, tstamp,
+                           newest_put, old_file_id, ord);
+        } else {
+            r = put_overwrite(ctx, key, file_id, total_sz, offset, tstamp,
+                              newest_put, old_file_id, old_offset, ord);
+        }
     }
     // S29-6 P1:写者顺手增量清扫墓碑(ctx.slock 仍持有;fold 期间禁扫——
     // entries key 集只增不减是迭代器不变量)。
@@ -467,8 +474,8 @@ PutResult KeyDir::put(std::string_view key,
 // 达阈值即全清,行为等价即时 free。
 void KeyDir::maybe_reclaim_locked(Shard& sh) {
     constexpr std::size_t kReclaimThreshold = 8;
-    if (sh.limbo.items() < kReclaimThreshold) return;
-    sh.limbo.reclaim(epoch::Registry::instance().min_active());
+    if (sh.entries.limbo_items() < kReclaimThreshold) return;
+    sh.entries.limbo_reclaim(epoch::Registry::instance().min_active());
 }
 
 // ---- put 阶段 1：探测当前状态 ----
@@ -746,6 +753,8 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
         if (fold_active) {
             iter_mutation_.store(true, std::memory_order_relaxed);
             // 升 sibling 链插墓碑,旧 revision 留给迭代器。
+            // S29-6 P3:就地改写走 seqlock 写窗口。
+            auto ws = sh.entries.write_section();
             SingleEntry t = make_sibling_tombstone(this_epoch, remove_time);
             if (auto* multi = std::get_if<MultiEntry>(&it->second)) {
                 multi->revisions.insert(multi->revisions.begin(), t);
@@ -762,7 +771,11 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
             // docs/design/s29-6-keydir-lockfree-read.md §1.2)。改覆写为墓碑
             // sentinel:get/iter/put 经 entry_at_epoch 的 is_tombstone 上报
             // 各自处理;物理回收走增量 sweep(下)+ quiescent 点全量清。
-            it->second = make_sibling_tombstone(this_epoch, remove_time);
+            {
+                // S29-6 P3:就地改写走 seqlock 写窗口。
+                auto ws = sh.entries.write_section();
+                it->second = make_sibling_tombstone(this_epoch, remove_time);
+            }
             ++sh.tombstones;
             sweep_tombstones_locked(sh);
             maybe_reclaim_locked(sh);  // S29-6 P2
@@ -1060,11 +1073,10 @@ void KeyDir::apply_pending_to_entries_barrier() {
             const bool old_was_tomb =
                 old_se != nullptr && is_sibling_tombstone(*old_se);
             if (is_tomb) {
-                // S29-6 P2:key/Entry 遗骸进 limbo(erase 零 free)。
-                sh.limbo.retire_key(std::move(it->first));
-                sh.limbo.retire_entry(std::move(it->second));
-                sh.entries.erase(it);
+                sh.entries.erase(it);  // 遗骸自动进表 limbo,零 free
             } else {
+                // S29-6 P3:就地改写走 seqlock 写窗口。
+                auto ws = sh.entries.write_section();
                 it->second = Entry{p_entry};
             }
             if (old_was_tomb && sh.tombstones > 0) --sh.tombstones;
@@ -1087,10 +1099,8 @@ void KeyDir::sweep_tombstones_locked(Shard& sh) {
                   static_cast<std::ptrdiff_t>(sh.sweep_cursor);
         const auto* se = std::get_if<SingleEntry>(&it->second);
         if (se != nullptr && is_sibling_tombstone(*se)) {
-            // S29-6 P2:erase 前把 key 遗骸 move 进 limbo——erase 只析构
-            // moved-from 空壳(SSO,无 free)+ swap-with-last 指针搬移,
-            // 全程不释放 P3 乐观读者可能正在比较的 key 堆缓冲(设计 §1.2)。
-            sh.limbo.retire_key(std::move(it->first));
+            // S29-6 P3:表内 erase 恒零 free(key/值遗骸自动进表 limbo,
+            // swap-with-last 只搬指针)——乐观读者 deref 安全(设计 §1.2)。
             sh.entries.erase(it);
             --sh.tombstones;
         } else {
@@ -1109,13 +1119,12 @@ void KeyDir::sweep_tombstones_locked(Shard& sh) {
 void KeyDir::collapse_multi_entries_barrier() {
     for (auto& sh : shards_) {
         std::lock_guard<std::mutex> sg(sh.mu);
+        // S29-6 P3:就地改写(winner 折叠)在 seqlock 写窗口内(erase 自带)。
+        auto ws = sh.entries.write_section();
         for (auto it = sh.entries.begin(); it != sh.entries.end(); ) {
             if (auto* m = std::get_if<MultiEntry>(&it->second)) {
                 if (m->revisions.empty() || is_sibling_tombstone(m->revisions.front())) {
-                    // S29-6 P2:key/Entry 遗骸进 limbo(erase 零 free,同 sweep)。
-                    sh.limbo.retire_key(std::move(it->first));
-                    sh.limbo.retire_entry(std::move(it->second));
-                    it = sh.entries.erase(it);
+                    it = sh.entries.erase(it);  // 遗骸自动进表 limbo
                     continue;
                 }
                 // 关键：必须先把 front 拷出来再覆盖回 variant！直接
@@ -1127,9 +1136,7 @@ void KeyDir::collapse_multi_entries_barrier() {
                 continue;
             }
             if (is_sibling_tombstone(*std::get_if<SingleEntry>(&it->second))) {
-                // S29-6 P1/P2:no-fold 墓碑全量清,key 遗骸进 limbo。
-                sh.limbo.retire_key(std::move(it->first));
-                it = sh.entries.erase(it);
+                it = sh.entries.erase(it);  // S29-6 P1:no-fold 墓碑全量清
                 continue;
             }
             ++it;
@@ -1137,8 +1144,8 @@ void KeyDir::collapse_multi_entries_barrier() {
         sh.tombstones   = 0;  // S29-6 P1:本分片墓碑已清空,计数/游标复位
         sh.sweep_cursor = 0;
         // S29-6 P2:quiescent 点顺手回收(min_active 之前的一切)。
-        if (!sh.limbo.empty()) {
-            sh.limbo.reclaim(epoch::Registry::instance().min_active());
+        if (sh.entries.limbo_items() > 0) {
+            sh.entries.limbo_reclaim(epoch::Registry::instance().min_active());
         }
     }
 }

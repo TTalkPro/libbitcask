@@ -356,3 +356,85 @@ TEST(KeyDirTombstone, SnapshotSkipsTombstones) {
     EXPECT_EQ(kd2.info().key_count, 2u);
     fs::remove(p);
 }
+
+// ---- S29-6 P3/P4:get 乐观快路径(SeqShardTable + epoch-limbo)压力 ----
+// 三类并发压力同开:① stable key 覆写(检测撕裂:写者恒保持 offset==ord,
+// 读者命中即断言相等——采纳撕裂 Entry 必破)② volatile key put/remove 交替
+// (墓碑/复活/sweep/backward-shift)③ 新 key 持续插入(触发 grow/rehash →
+// 旧数组 retire → 混代路径)。ASan 下跑 = 对「deref 恒 in-bounds 且存活」
+// 设计的真实检验(乐观读未豁免 ASan)。
+#include <atomic>
+#include <thread>
+
+TEST(KeyDirOptimisticRead, ConcurrentGetPutRemoveGrowStress) {
+    KeyDir kd;
+    ASSERT_TRUE(kd.optimistic_reads());
+    constexpr int kStable = 512;
+    auto stable_key = [](int i) { return "stable" + std::to_string(i); };
+    auto vol_key = [](int i) { return "vol" + std::to_string(i); };
+    for (int i = 0; i < kStable; ++i) {
+        ASSERT_EQ(kd.put(stable_key(i), 1, 10, static_cast<std::uint64_t>(i),
+                         1000, 0, true, 0, 0, static_cast<std::uint64_t>(i)),
+                  PutResult::kOk);
+    }
+
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> torn{0}, stable_miss{0};
+
+    std::thread writer([&] {
+        std::uint64_t x = kStable;
+        int grow_i = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            // ① stable 覆写:offset == ord 恒成立(撕裂检测不变量)。
+            const int s = static_cast<int>(x % kStable);
+            (void)kd.put(stable_key(s), 1, 10, x, 1000, 0, true, 0, 0, x);
+            // ② volatile:put → remove(墓碑 + sweep 路径)。
+            const int v = static_cast<int>(x % 64);
+            (void)kd.put(vol_key(v), 1, 10, x, 1000, 0, true, 0, 0, x + 1);
+            (void)kd.remove(vol_key(v), 2000);
+            // ③ 新 key:驱动 values/buckets grow → 旧数组 retire。
+            (void)kd.put("grow" + std::to_string(grow_i++), 1, 10, x, 1000, 0,
+                         true, 0, 0, x + 2);
+            x += 3;
+        }
+    });
+
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&, t] {
+            std::uint64_t seed = 0x9E3779B97F4A7C15ull * (t + 1);
+            while (!stop.load(std::memory_order_relaxed)) {
+                seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+                const int s = static_cast<int>((seed >> 33) % kStable);
+                if (auto e = kd.get(stable_key(s))) {
+                    if (e->offset != e->ord) torn.fetch_add(1);
+                } else {
+                    stable_miss.fetch_add(1);  // stable 永不删除:必命中
+                }
+                (void)kd.get(vol_key(static_cast<int>((seed >> 20) % 64)));
+                (void)kd.get("nonexistent" + std::to_string(seed % 97));
+            }
+        });
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    stop.store(true);
+    writer.join();
+    for (auto& r : readers) r.join();
+
+    EXPECT_EQ(torn.load(), 0u) << "乐观读采纳了撕裂的 Entry(seq 校验失效)";
+    EXPECT_EQ(stable_miss.load(), 0u) << "stable key 出现 miss(探测/混代缺陷)";
+}
+
+// 开关关闭 → 纯锁路径,行为不变(回退开关回归护栏)。
+TEST(KeyDirOptimisticRead, RuntimeSwitchFallback) {
+    KeyDir kd;
+    kd.set_optimistic_reads(false);
+    ASSERT_FALSE(kd.optimistic_reads());
+    ASSERT_EQ(kd.put("k", 1, 10, 100, 1000, 0, true, 0, 0, 1), PutResult::kOk);
+    auto e = kd.get("k");
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->ord, 1u);
+    ASSERT_TRUE(kd.remove("k", 2000));
+    EXPECT_FALSE(kd.get("k").has_value());
+}
