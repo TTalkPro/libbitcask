@@ -3275,8 +3275,30 @@ W4 ✅（parallel_scan 并行全表扫描）。
       验收：新测 `SegmentSetRecoveryRoundTrip`（删 segments.manifest 强制走
       内嵌清单 + 幽灵检验 + 定位重建检验）;clang 561/561;TSan
       crash/checkpoint/recovery/segment 91/91;ASan 59/59;rel 构建过。
-    - [ ] **步骤 3**：删 fields_ map + apply/on_delete 改造
-    - [ ] **步骤 5**：段级 merge（Slice D）+ legacy 迁移
+    - [x] **步骤 3 已完成（2026-07-10）：删 fields_,段集成为唯一真相源**。
+      ① fields_/field_index/ord_field_lens_/dirty_default_/dirty_fields_/fields_mu_
+      全部退役;apply_text/apply_job_impl 只写 building_(重放幂等 = key 覆盖写
+      mark_dead 旧副本,无需 ord 门);on_delete 只走段级 mark_dead;
+      ② 7 个查询回退分支 + 2 个 degrade guard + explain/search_fields fallback
+      删除;③ serialize/deserialize/delta 家族 + save_component_delta 退役,
+      bm25.ckpt 只剩 kSegManifest,load_component 只认 kSegManifest(老格式 →
+      退全量 fold,legacy 段化迁移=步骤 5);④ compact/maybe_auto_compact 退役
+      为 no-op(死回收职责转段级 merge,两处「有界回收」断言挂步骤 5 恢复);
+      ⑤ rebuild_index 重建目标改段世界(drop 全部旧段 + 新 building,key 经
+      docmap ord→ext 反查);⑥ building_ 构造期即建 + 段集装载下沉
+      load_component(shim/独立用法同样可写可恢复);⑦ dirty 换单一 seg_dirty_。
+    - **步骤 3 抓获并修复的并发缺陷（TSan 实测,B2a 即潜伏）**：查询线程遍历
+      building_ 的 plain vector doc_store vs reducer add 的 push_back——realloc
+      即 UAF。修复:doc_store 数组 vector→**deque**(增长不搬移)+
+      **count_pub_ 原子发布计数**(写序:行→发布→倒排,读者经 posting 拿到的
+      docid 必有已发布行)+ live_ 元素原子化(mark_dead vs is_live 无 race)。
+      legacy 面:legacy_ckpt/测试 shim 的文本段路径退役(fail → 全量 fold,
+      与 production 语义一致);SnapshotSaveLoad/CheckpointRoundTrip/PrevFallback
+      三测试更新为「文本不经 legacy 容器持久化」语义。
+      验收:clang **561/561**;TSan 定向并发 ×3 + 子集 185/185;
+      **ASan 全量 561/561**;rel 构建过。
+    - [ ] **步骤 5**：段级 merge（Slice D,接 on_merge_commit + 恢复有界回收
+      断言 ×2）+ legacy 段化迁移(老 bm25.ckpt → 初始段)
 - [ ] **S27-4 并行 builder（DWPT）**：多段内单线程 builder，文档分派。**吞吐红利落地。**依赖 S27-3 收官。
 
 ### 关联既有设计（勿重复造轮子）
