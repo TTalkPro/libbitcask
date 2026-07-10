@@ -152,10 +152,12 @@ TEST(SearchLayer, SnapshotSaveLoad) {
     ASSERT_TRUE(result.loaded);
     ASSERT_TRUE(result.all_segments_ok);
 
+    // S27-3 步骤 3:文本段退役——legacy 单文件容器不再承载文本索引
+    // (文本持久化走 bm25.ckpt + 段集,见 TextPlugin.SegmentSetRecoveryRoundTrip)。
+    // 本用例保留验证容器本身(docmap/hnsw 段)round-trip 机制。
     auto search_result = layer2.search_text("hello", 10);
     ASSERT_TRUE(search_result.has_value());
-    ASSERT_EQ(search_result->size(), 1u);
-    EXPECT_EQ(search_result->at(0).key, "key1");
+    EXPECT_TRUE(search_result->empty()) << "文本不经 legacy 容器持久化";
 
     std::filesystem::remove(snapshot_path);
     std::filesystem::remove(std::string(snapshot_path.string()) + ".prev");
@@ -635,15 +637,10 @@ TEST(SearchLayer, CheckpointRoundTrip) {
     ASSERT_TRUE(result.loaded);
     ASSERT_TRUE(result.all_segments_ok);
 
+    // S27-3 步骤 3:文本段退役(同 SnapshotSaveLoad 注)。
     auto search_hello = layer2.search_text("hello", 10);
     ASSERT_TRUE(search_hello.has_value());
-    ASSERT_EQ(search_hello->size(), 1u);
-    EXPECT_EQ(search_hello->at(0).key, "doc1");
-
-    auto search_foo = layer2.search_text("foo", 10);
-    ASSERT_TRUE(search_foo.has_value());
-    ASSERT_EQ(search_foo->size(), 1u);
-    EXPECT_EQ(search_foo->at(0).key, "doc2");
+    EXPECT_TRUE(search_hello->empty()) << "文本不经 legacy 容器持久化";
 
     std::filesystem::remove(ckpt_path);
     std::filesystem::remove(std::string(ckpt_path.string()) + ".prev");
@@ -720,11 +717,11 @@ TEST(SearchLayer, CheckpointPrevFallback) {
     EXPECT_TRUE(result.all_segments_ok) << ".prev should be healthy";
     EXPECT_EQ(result.watermark, 3u) << ".prev has watermark from first save";
 
-    // k1/k2/k3 在 .prev 中；k4/k5 不在（需要 fold 回放）。
+    // S27-3 步骤 3:文本段退役——.prev 回退验证的是容器机制(docmap/hnsw),
+    // 文本不经 legacy 容器持久化。
     auto sr = layer2.search_text("hello", 10);
     ASSERT_TRUE(sr.has_value());
-    ASSERT_EQ(sr->size(), 1u);
-    EXPECT_EQ(sr->at(0).key, "k1");
+    EXPECT_TRUE(sr->empty()) << "文本不经 legacy 容器持久化";
 
     std::filesystem::remove(path);
     std::filesystem::remove(prev);
@@ -837,8 +834,10 @@ TEST(SearchLayer, AutoCompactBoundsPostingGrowth) {
                            static_cast<std::uint32_t>(1001 + r));
         }
     }
-    // 总写入 = 20 + 6000 = 6020；posting 被有界回收，远低于总写入。
-    EXPECT_LT(layer.total_postings(), 2000u);
+    // S27-3 步骤 3:auto-compact 随 fields_ 退役——死回收职责转段级 merge
+    // (步骤 5 接 on_merge_commit 后在此恢复有界断言)。本用例保留高 churn
+    // 下的正确性护栏。
+    // EXPECT_LT(layer.total_postings(), 2000u);  // 步骤 5 恢复
     // 搜索仍正确：恰 20 篇 live。
     auto res = layer.search_text("hello", 100);
     ASSERT_TRUE(res.has_value());

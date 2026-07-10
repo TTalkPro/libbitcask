@@ -378,20 +378,8 @@ bool SearchLayer::save_delta_ckpt(const std::string& base_path,
         sw.add(sc::CkptSectionType::kDeltaInfo, std::move(b));
     }
 
-    // bm25 delta（default / fields）——脏才有内容；干净直接省段（S18-4：
-    // 经 TextPlugin 原语）。
-    if (text_.dirty_default()) {
-        std::vector<std::byte> b;
-        if (text_.serialize_default_delta(b, from)) {
-            sw.add(sc::CkptSectionType::kBm25DefaultDelta, std::move(b));
-        }
-    }
-    if (text_.dirty_fields()) {
-        std::vector<std::byte> fb;
-        if (text_.serialize_fields_delta(fb, from)) {
-            sw.add(sc::CkptSectionType::kBm25FieldsDelta, std::move(fb));
-        }
-    }
+    // S27-3 步骤 3:文本段退役——TextPlugin 持久化走自家 bm25.ckpt/段集
+    // (shim save/load 另行委托 flush/open,见下),legacy 容器不再承载文本。
 
     // docmap delta：窗口 live 行 + 删除日志。恒写（可能为空，几十字节）。
     {
@@ -489,21 +477,10 @@ bool SearchLayer::apply_delta_file(
     std::span<const std::byte> hook_meta;
     for (const auto& ls : sections) {
         switch (static_cast<sc::CkptSectionType>(ls.type)) {
-        case sc::CkptSectionType::kBm25DefaultDelta: {
-            // S18-4：bm25 delta 重放归 TextPlugin 原语。
-            if (!text_.apply_default_delta(std::span<const std::byte>(
-                    ls.payload.data(), ls.payload.size()))) {
-                return false;
-            }
-            break;
-        }
-        case sc::CkptSectionType::kBm25FieldsDelta: {
-            if (!text_.apply_fields_delta(std::span<const std::byte>(
-                    ls.payload.data(), ls.payload.size()))) {
-                return false;
-            }
-            break;
-        }
+        case sc::CkptSectionType::kBm25DefaultDelta:
+        case sc::CkptSectionType::kBm25FieldsDelta:
+            // S27-3 步骤 3:fields_ 退役——文本 delta 无处可入,链不采信。
+            return false;
         case sc::CkptSectionType::kDocmapDelta: {
             const auto* p = ls.payload.data();
             const auto* end = p + ls.payload.size();
@@ -638,20 +615,15 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
     const bool chain_active = ckpt_chain_wm_ > ckpt_base_gen_;
     const bool d_doc =
         chain_active || index_.dirty();  // S18-2：docmap 脏位经 Index
-    const bool d_bd =
-        chain_active || text_.dirty_default();  // S18-4：脏位经 TextPlugin
-    const bool d_bf =
-        chain_active || text_.dirty_fields();
+    // S27-3 步骤 3:文本段退役,carry 决策只剩 docmap/hnsw。
     const bool d_h =
         chain_active || vec_.dirty();  // S18-3：vec 脏位经 VectorPlugin
     std::vector<sc::LoadedSection> carried;  // 须活到 write() 完成
-    if (!(d_doc && d_bd && d_bf && d_h)) {
+    if (!(d_doc && d_h)) {
         auto sel = sc::SearchCheckpoint::read_selected(
-            fp, [&](std::uint16_t t) {
+            fp, [&](std::uint16_t t) -> bool {
                 switch (static_cast<sc::CkptSectionType>(t)) {
                 case sc::CkptSectionType::kDocmap:      return !d_doc;
-                case sc::CkptSectionType::kBm25Default: return !d_bd;
-                case sc::CkptSectionType::kBm25Fields:  return !d_bf;
                 case sc::CkptSectionType::kHnsw:        return !d_h;
                 default:                                return false;
                 }
@@ -687,30 +659,8 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
 
     // 段 2 + 3: bm25.default + bm25.fields。S14-3：各自独立前移（S18-4：
     // 序列化经 TextPlugin 原语）。
-    if (const auto* ls = d_bd
-            ? nullptr
-            : carried_sec(sc::CkptSectionType::kBm25Default)) {
-        add_carried(*ls);
-    } else {
-        std::vector<std::byte> buf;
-        if (text_.serialize_default(buf)) {
-            add_byte_sec(
-                static_cast<std::uint16_t>(sc::CkptSectionType::kBm25Default),
-                std::move(buf));
-        }
-    }
-    if (const auto* ls = d_bf
-            ? nullptr
-            : carried_sec(sc::CkptSectionType::kBm25Fields)) {
-        add_carried(*ls);
-    } else {
-        std::vector<std::byte> fbuf;
-        if (text_.serialize_fields(fbuf)) {
-            add_byte_sec(
-                static_cast<std::uint16_t>(sc::CkptSectionType::kBm25Fields),
-                std::move(fbuf));
-        }
-    }
+    // S27-3 步骤 3:kBm25Default/kBm25Fields 段退役(文本持久化走 TextPlugin
+    // 自家 bm25.ckpt/段集,shim save/load 委托 flush/open)。
 
     // 段 4: hnsw (type 4)。V7:BCVS v2 双文件——vecs_ 先落 search.vec
     // (save_vec_payload, S14-2 起常规为追加),再 serialize header 入 ckpt 段。
@@ -819,27 +769,12 @@ SearchLayer::load_search_ckpt(std::string_view path,
             continue;
         }
         switch (st) {
-        case sc::CkptSectionType::kBm25Default: {
-            // S18-4：反序列化归 TextPlugin 原语（成功即自清对应脏位）。
-            if (text_.deserialize_default(std::span<const std::byte>(
-                    ls.payload.data(), ls.payload.size()))) {
-                bm25_loaded = true;
-                default_sec_ok = true;  // S14-3
-            } else {
-                result.all_segments_ok = false;
-            }
+        case sc::CkptSectionType::kBm25Default:
+        case sc::CkptSectionType::kBm25Fields:
+            // S27-3 步骤 3:fields_ 退役——legacy 容器文本段无处可入,
+            // 标记段不齐(退全量重建,与 production legacy_ckpt 一致)。
+            result.all_segments_ok = false;
             break;
-        }
-        case sc::CkptSectionType::kBm25Fields: {
-            if (text_.deserialize_fields(std::span<const std::byte>(
-                    ls.payload.data(), ls.payload.size()))) {
-                bm25_loaded = true;
-                fields_sec_ok = true;  // S14-3
-            } else {
-                result.all_segments_ok = false;
-            }
-            break;
-        }
         case sc::CkptSectionType::kDocmap: {
             auto covers = deserialize_docmap(std::span<const std::uint8_t>(
                 reinterpret_cast<const std::uint8_t*>(ls.payload.data()),
@@ -877,7 +812,10 @@ SearchLayer::load_search_ckpt(std::string_view path,
     // 如果 docmap 未载入,标记 all_segments_ok=false（需要 fold 补全 Index 侧表）。
     if (!docmap_loaded) result.all_segments_ok = false;
     // bm25 至少要有一个字段载入才算成功。
-    if (!bm25_loaded) result.all_segments_ok = false;
+    // S27-3 步骤 3:文本段退役——legacy 容器不再承载文本,bm25 缺席是
+    // 新常态(不再拉低 all_segments_ok;老文件带 kBm25 段的 case 已在
+    // switch 中标不齐)。
+    (void)bm25_loaded;
     // 有向量配置但 hnsw 未载入 → 需要重建。
     if (vec_.enabled() && !hnsw_loaded) result.all_segments_ok = false;
 
@@ -1004,11 +942,8 @@ SearchLayer::ComponentDeltaResult SearchLayer::save_components_delta(
     std::span<const std::byte> keydir_delta) {
     (void)keydir_delta;  // S18-2 起 keydir 段随宿主 docmap delta 落
     ComponentDeltaResult result{};
-    if (dirty_mask[1]) {
-        auto t = text_.save_component_delta(dir, watermark);
-        result.wrote[1] = t.wrote;
-        result.new_seqs[1] = t.new_seq;
-    }
+    // S27-3 步骤 3:text delta 退役(save_component_delta 已删)。
+    (void)dirty_mask;
     if (dirty_mask[2]) {
         auto v = vec_.save_component_delta(dir, watermark);
         result.wrote[2] = v.wrote;

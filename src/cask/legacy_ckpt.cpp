@@ -34,9 +34,12 @@ bool apply_delta_file(const std::vector<sc::LoadedSection>& sections,
             std::vector<index::DocmapDeltaRemoval>& rems) {
             switch (st) {
             case sc::CkptSectionType::kBm25DefaultDelta:
-                return text.apply_default_delta(pl);
             case sc::CkptSectionType::kBm25FieldsDelta:
-                return text.apply_fields_delta(pl);
+                // S27-3 步骤 3:fields_ 退役——legacy 文本 delta 无处可入,
+                // 迁移失败 → caller 退全量 fold(设计既定安全慢路径;
+                // 段化 legacy 迁移见步骤 5)。
+                (void)text;
+                return false;
             case sc::CkptSectionType::kDocmapDelta:
                 // S20-2 R3：解析 + 交错重放收敛至 apply_docmap_delta_section。
                 return index::apply_docmap_delta_section(docmap, pl, rows,
@@ -87,18 +90,10 @@ LoadResult load(std::string_view path, index::Index& docmap,
         std::span<const std::byte> pl(ls.payload.data(), ls.payload.size());
         switch (st) {
         case sc::CkptSectionType::kBm25Default:
-            if (text.deserialize_default(pl)) {
-                bm25_loaded = true;
-            } else {
-                result.all_segments_ok = false;
-            }
-            break;
         case sc::CkptSectionType::kBm25Fields:
-            if (text.deserialize_fields(pl)) {
-                bm25_loaded = true;
-            } else {
-                result.all_segments_ok = false;
-            }
+            // S27-3 步骤 3:fields_ 退役——legacy 文本 base 无处可入。标记
+            // 段不齐 → 迁移不采信文本部分,退全量 fold(段化迁移见步骤 5)。
+            result.all_segments_ok = false;
             break;
         case sc::CkptSectionType::kDocmap: {
             auto covers = docmap.deserialize_docmap(
