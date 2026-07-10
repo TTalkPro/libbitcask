@@ -222,7 +222,9 @@ public:
         std::uint64_t i = h & mask;
         for (std::uint64_t probes = 0; probes <= mask; ++probes) {
             // 跳 2:桶项拷贝 + 验证(idx1 与快照同世代 → in-bounds)。
-            const Bucket bk = bb->b[i];  // 恒 in-bounds:i ≤ bb->mask
+            Bucket bk;  // 恒 in-bounds:i ≤ bb->mask
+            static_assert(sizeof(Bucket) == 8);
+            opt_copy_bytes(&bk, &bb->b[i], sizeof(Bucket));
             if (seq_changed(s1)) {
                 return OptResult::kRetry;
             }
@@ -235,14 +237,15 @@ public:
                 // 跳 3:key 对象字节拷贝 + 验证 → 拷贝未撕裂 → 才可按其
                 // 内容 deref(缓冲存活:limbo + 读者活跃槽)。
                 alignas(std::string) std::byte kraw[sizeof(std::string)];
-                std::memcpy(kraw, &p.first, sizeof(std::string));
+                static_assert(sizeof(std::string) % 8 == 0);
+                opt_copy_bytes(kraw, &p.first, sizeof(std::string));
                 if (seq_changed(s1)) {
                     return OptResult::kRetry;
                 }
                 const auto* kobj = reinterpret_cast<const std::string*>(kraw);
                 const bool key_eq =
                     kobj->size() == key.size() &&
-                    std::memcmp(kobj->data(), key.data(), key.size()) == 0;
+                    opt_bytes_equal(kobj->data(), key.data(), key.size());
                 // ⚠️ SSO 陷阱:拷贝对象字节后 data() 对短串仍指向**原位**
                 // 内部缓冲(拷贝的是指针语义,不是内容)——比较输入可能被
                 // 写者的 swap-move 弄脏。**mismatch 也必须验证**:否则把
@@ -253,7 +256,8 @@ public:
                 }
                 if (key_eq) {
                     // 跳 4:值字节拷贝 + 终验。
-                    std::memcpy(out, &p.second, sizeof(T));
+                    static_assert(sizeof(T) % 8 == 0 && alignof(T) >= 8);
+                    opt_copy_bytes(out, &p.second, sizeof(T));
                     if (seq_changed(s1)) {
                         return OptResult::kRetry;
                     }
@@ -308,8 +312,14 @@ private:
     };
 
     // raw 块 limbo(供 LimboAllocator 与桶块替换共用)。
+    // 自带析构释放:values_ 的**最终**数组在其 vector 析构时才 retire 进来
+    // (晚于 ~SeqShardTable 函数体)——靠声明序(limbo_raw_ 先声明 → 最后
+    // 析构)兜底,否则泄漏(ASan/LSan 实测抓到)。
     struct RawLimbo {
         std::vector<std::pair<std::uint64_t, void*>> items;
+        ~RawLimbo() {
+            for (auto& [st, p] : items) ::operator delete(p);
+        }
     };
     template <class U>
     struct LimboAllocator {
@@ -349,6 +359,56 @@ private:
     [[nodiscard]] bool seq_changed(std::uint64_t s1) const noexcept {
         std::atomic_thread_fence(std::memory_order_acquire);
         return seq_.load(std::memory_order_relaxed) != s1;
+    }
+
+    // 乐观路径专用拷贝/比较。**不得用 std::memcpy/memcmp**:它们是真实
+    // libc 调用,被 TSan 拦截器记录访问——函数级 no_sanitize 只压制编译器
+    // 插桩,压不住拦截器(TSan 树实测报 race)。volatile 逐字装载同时阻止
+    // 编译器把循环聚合回 memcpy libcall(loop-idiom 识别)。
+#if defined(__clang__) || defined(__GNUC__)
+    __attribute__((no_sanitize("thread")))  // 独立函数,须自带豁免(非内联时
+                                            // 不继承 caller 的豁免——TSan 实测)
+#endif
+    // 逐 8 字节 __atomic_load_n(relaxed):① TBAA 豁免——曾用 uint64_t*
+    // 直读,严格别名违规,GCC -O2 判定与 Bucket/string 的写不别名读到陈旧
+    // 零值(单线程 100% 伪 miss,clang 恰好宽容);② 编译为普通 mov,无
+    // libcall/无拦截器;③ TSan 原生理解原子。前置:两侧 8 对齐、bytes%8==0
+    // (调用点 static_assert)。relaxed 足够——序由 seq_changed 的 fence 背书。
+    // (曾用 volatile 逐字节:正确但 Get 热路径 +30ns、长 key 比较 3×。)
+    static inline void opt_copy_bytes(void* dst, const void* src,
+                                      std::size_t bytes) noexcept {
+        auto* d = static_cast<std::uint64_t*>(dst);
+        const auto* s = static_cast<const std::uint64_t*>(src);
+        for (std::size_t i = 0; i < bytes / 8; ++i) {
+            d[i] = __atomic_load_n(s + i, __ATOMIC_RELAXED);
+        }
+    }
+    [[nodiscard]]
+#if defined(__clang__) || defined(__GNUC__)
+    __attribute__((no_sanitize("thread")))
+#endif
+    static inline bool opt_bytes_equal(const void* shared,
+                                       const void* own,
+                                       std::size_t n) noexcept {
+        // 8 字块比较:__builtin_memcpy 定长 8 → 单条(非对齐)mov,别名豁免、
+        // 无 libcall(std::memcmp 是真实 libc 调用,会被 TSan 拦截器记录,
+        // 函数级 no_sanitize 压不住——实测报 race)。shared 侧可能是脏数据,
+        // 结果由 caller 的 seq 校验背书。
+        const auto* x = static_cast<const unsigned char*>(shared);
+        const auto* y = static_cast<const unsigned char*>(own);
+        std::uint64_t acc = 0;
+        std::size_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            std::uint64_t a;
+            std::uint64_t b;
+            __builtin_memcpy(&a, x + i, 8);
+            __builtin_memcpy(&b, y + i, 8);
+            acc |= a ^ b;
+        }
+        for (; i < n; ++i) {
+            acc |= static_cast<std::uint64_t>(x[i] ^ y[i]);
+        }
+        return acc == 0;
     }
 
     [[nodiscard]] static std::size_t bucket_need(std::size_t n) noexcept {
