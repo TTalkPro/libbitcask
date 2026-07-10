@@ -3289,42 +3289,47 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > → cacheline 弹跳；② 短临界区 mutex collapse（`write_mu_` 包住 encode+pwrite+keydir）；
 > ③ HNSW f32 导航工作集 153MB 打穿 L3（cache-miss bound）。
 
-### P0 快赢（小 diff，现有 bench 直接验收）
+### P0 快赢（小 diff，现有 bench 直接验收）—— 已完成（2026-07-10）
 
-- [ ] **S29-1 `InvertedIndex::search` 两趟 find 合并为一趟** · `src/bm25/inverted.cpp:445-476`
-  - 现状：每查询词先 `find` 数 total_postings（WAND 路由判断），再 `find` 取快照 →
-    每词 2 次 TBB `const_accessor` 桶锁原子 RMW。热词固定 → 同几条 cacheline 核间弹跳,
-    这是 BOW 零扩展的直接主因之一。
-  - 改动：第一趟即把快照指针（`acc->second`）暂存进 thread_local 数组，第二趟复用。
-    桶锁 RMW 减半，零语义风险。
-  - 验收：`BM_Inverted_QueryThroughputBOW` 2-4 线程应现扩展斜率。
-- [ ] **S29-2 `meta_lookup` 去每调用堆分配 + 提前退出** · `include/bitcask/meta_codec.hpp:335`
-  - 现状：每次调用 `vector<size_t> offsets` 堆分配 + O(n) 全量线性预扫建 offset 表后再二分
-    ——二分建立在强制线性预扫之上，纯额外开销。key 在 blob 内按字典序升序（格式不变式）。
-  - 改动：删 offsets，单趟扫描中直接 `ek.compare(key)`，命中即返回，`ek > key` 提前 break。
-    零分配 + 平均半程退出。过滤向量检索每节点一次调用，最热元数据路径。
-  - 验收：`BM_P12_MetaBlobAccess` 各规格。
-- [ ] **S29-3 HNSW `select_neighbors` 内部 vector 改 thread_local** · `src/vector/hnsw.cpp:781-784`
-  - 现状：`picked`/`picked_vecs` 每次调用堆分配；每插入约 10-18 次调用（自身选边 + 溢出邻居
-    收缩）→ 100k 插入约 1.8M 次 malloc/free。文件内其他热缓冲（`t_visited`、`pool`、
-    `tl_cands_buf`）均已 thread_local 池化，唯独此处遗漏，风格不一致。
-  - 改动：对齐既有 thread_local 模式。预估建图 5-15%。
-  - 验收：`BM_Hnsw_Insert/10000`（100k 太慢，用 10k 对比）。
-- [ ] **S29-4 `doc_freq`/`df`/`df_live` 去 `std::string(term)` 构造** · `src/bm25/inverted.cpp:427,1925,1932`
-  - 现状：接受 `string_view` 却为 tbb find 现造 `std::string`；S27 `multi_field_segment_search`
-    按 段×字段×term 循环调用（`segment.hpp:497`）→ 每次一堆分配 + 一次额外桶锁。
-  - 改动：调用侧保留 owning string 传入，或 PostingMap 自定义 `HashCompare` 支持
-    string_view 异构查找。
-- [ ] **S29-5 S27 分段查询层去双重排序 + 临时容器复用** · `include/bitcask/segment_query.hpp:47-80`
-    + `src/search/text_plugin.cpp:490-535,619-624`
-  - 现状三项：① 段内子查询已排序，跨段归并后又 `std::sort` 一遍（双重排序）；
-    ② `multi_segment_search` 每查询新建 `unordered_map<string,uint64_t> global_df`
-    （堆分配 + 每 term 一个 string）；③ `collect_default_segment_views` 每查询构造
-    `vector<SegmentView>` + 每段 2 个 `std::function` 闭包。
-  - 改动：段内返回未排候选、只在归并后排一次；global_df/views 用 thread_local 或
-    `search_arena.hpp` 复用（arena 目前只服务 inter-query 并行，查询内临时容器未覆盖）。
-  - 附带（可选）：阶段 1 doc_freq 与阶段 2 search 对同段同词各 find 一次，可合并为
-    单次遍历同时拿 df + 快照。
+> **落地验收**：build-rel 全量构建通过（bench 树抓 API 破坏）+ build-clang ctest
+> **555/555 全绿**。bench 复跑：`BM_Hnsw_Insert/10000` 3375→3030ms（**-10%**，两次
+> 复跑一致）；`BM_P12_MetaBlobAccess`/`QueryThroughputBOW` 波动在噪声带内（±10-15%）
+> ——BOW 扩展性未解（预期内：剩余的每词 1 次 find 仍弹 cacheline，根治在 S29-6
+> epoch/RCU），本批收益主体是**结构性消分配**（S27 分段聚合路径的 string/map 节点
+> 分配全清零）。
+
+- [x] **S29-1 `InvertedIndex::search` 两趟 find 合并为一趟** —— 已完成 · `src/bm25/inverted.cpp:445`
+  - 单趟 find 时在 accessor 下拷出 `shared_ptr<const PostingList>`（P2-min CoW 协议：
+    读者持引用 → 写者 use_count>1 时克隆替换，与 phrase/near 读者同模式），暂存
+    thread_local 数组；WAND 路由读 size()、标量/WAND 快照均复用指针 → 每词桶锁
+    RMW 2→1 次。`search_wand` 加 `pls` 参数（私有、唯一调用方是 search），其内部
+    find 趟一并消除。ReleaseRefs guard 兜住所有出口释放引用（防旧版本钉住 + 写者恒克隆）。
+- [x] **S29-2 `meta_lookup` 去每调用堆分配 + 提前退出** —— 已完成 · `include/bitcask/meta_codec.hpp`
+  - 删 offsets vector 与二分（二分建立在强制 O(n) 线性预扫上，纯额外开销），单趟
+    扫描边解析边比较：命中就地 decode 返回；key 升序（encode_meta assert 的格式
+    不变式）→ `ek > key` 提前 break。零分配 + 平均半程退出。
+- [x] **S29-3 HNSW `select_neighbors`/`_int8` 内部 vector 改 thread_local** —— 已完成 · `src/vector/hnsw.cpp`
+  - `picked`/`picked_vecs` 池化（对齐 t_visited/pool/tl_cands_buf 既有模式），尾部
+    `std::swap` 替代 move 让两缓冲轮换复用。单写者协议保证无重入。实测建图 -10%。
+- [x] **S29-4 `doc_freq`/`df`/`df_live` 去 `std::string(term)` 构造** —— 已完成 · `src/bm25/inverted.cpp`
+  - 新增 `tls_term_key(string_view)`：thread_local string 复用容量，稳态零分配
+    （不依赖 TBB 异构查找支持，零版本风险）。
+- [x] **S29-5 S27 分段查询层容器复用（范围调整）** —— 已完成 · `include/bitcask/segment_query.hpp`
+    + `include/bitcask/inverted.hpp` + `include/bitcask/segment.hpp`
+  - **做了**：`ExtStats::df` 类型从 `unordered_map*` 改扁平
+    `vector<pair<string,uint64_t>>*`——查询词个位数：消费侧（score_bow_topk /
+    search_wand）线性扫描优于 hash find；生产侧 `multi_segment_search` 的 global_df
+    thread_local 槽位复用（resize 截断残留槽 + string assign 复用容量，稳态零分配），
+    `multi_field_segment_search` 的 per_field_df 同步扁平化。附带修正：原 map 版对
+    重复 term 会重复累加 df（emplace 去重 + `[t]+=` 撞同一 entry），扁平版每槽独立、
+    消费取首匹配，语义更正。测试 3 处适配。
+  - **评估后不做**：① 双重排序——`text_plugin.cpp:619` 的重排**语义必需**（把
+    multi_segment_search 的 key-asc 并列序对齐单索引路径 score_bow_topk 堆序的
+    ord-desc + 缓存语义），≤k_req 个元素成本可忽略，已加注释防误删；② views 池化
+    ——`std::function` 单指针捕获走 SSO 不分配，实际仅省每查询 1 次 vector 分配，
+    不值得引入「返回 thread_local 引用」的重入隐患。
+  - **遗留（并入 S29-6 或独立）**：阶段 1 doc_freq 与阶段 2 search 对同段同词各
+    find 一次——合并需 search-with-pls 公开变体，超快赢范围。
 
 ### P1 结构性（量级改变，需设计，各自独立可做）
 
