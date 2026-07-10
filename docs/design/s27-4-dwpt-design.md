@@ -32,18 +32,28 @@ round-robin 下同 key 的 v1(ord5)/v2(ord9) 可能落不同 builder、乱序 ap
 KeyLocation { shared_ptr<SealedSegment> seg;  // building 与 sealed 统一为对象指针
               DocId docid; Lsn ord; bool tomb; }
 upsert(key, my_ord, add 动作):
-  key_loc_mu_ unique:
-    prior = find(key)
-    if (prior && prior.ord > my_ord) return SKIP   // 我是旧版本,不索引
-    占位/更新 entry{my_ord,...}
-  if (prior && !prior.tomb) prior.seg->mark_dead(prior.docid)   // 原子位
+  key_loc_mu_ shared: prior = find(key)
+    if (prior && prior.ord > my_ord) return SKIP   // 纯优化:已见更高版本免 add
   docid = my_building->add(...)
-  key_loc_mu_ unique: entry.seg = my_building; entry.docid = docid
+  key_loc_mu_ unique(终检登记 = **唯一 mark_dead 责任点**):
+    e = entry(key)
+    if (e.ord <= my_ord): displaced = e; e = {my_building, docid, my_ord}
+    else: lost = true
+  锁外: lost → my_building->mark_dead(docid)          // 败者自标
+       else displaced 非墓碑 → displaced.seg->mark_dead(displaced.docid)
 on_delete(key, tomb_ord)(reducer 直做):
-  同守卫;胜出 → mark_dead prior + entry 置 {tomb, tomb_ord}(墓碑**保留**——
-  erase 会让更旧的 put 复活成幽灵;墓碑条目重启时随 rebuild_key_locations
-  消失,运行期增长 = 删除的 distinct key 数,可接受)
+  同款终检:胜出 → 锁内捕获 displaced + entry 置 {tomb, tomb_ord},锁外
+  mark_dead displaced(墓碑**保留**——erase 会让更旧的 put 复活成幽灵;
+  墓碑条目重启时随 rebuild_key_locations 消失,运行期增长 = 删除的
+  distinct key 数,可接受)
 ```
+
+> **P3 教训(早标死协议的幽灵窗口)**:P1 原稿是「读 prior → 标死 prior →
+> add → 终检登记」。B>1 时三步间隙可被并发 put/delete 插入:终检**败者**的
+> 行无人再指向(登记被拒但行已 add)、**胜者**读 prior 时对手尚未登记(双方
+> 都 have_prior=false,谁也不标谁)——两种幽灵存活,B=4 压力测试 +2 计数
+> 坐实。修正后 mark_dead 全部收敛到终检临界区裁决(胜→顶替者/败→自身),
+> 每行恰好一个归宿,unique 锁串行化链条。
 
 关键简化(源自对象指针统一):**封口不再改 key_to_location_**——building
 对象封口后即 sealed 段对象本身(shared_ptr 移入段集,身份不变),O(map) 的
@@ -76,10 +86,15 @@ location 必已被覆盖/删除改写 → 无残留引用,内存即释。
 - **P1(本会话)**:KeyLocation 对象指针化 + LSN 守卫 upsert + 墓碑保留,
   在**现单 reducer**上落地(全局序仍在 → 行为等价,守卫成为冗余保险),
   全量回归验证语义。
-- **P2**:BuilderPool(线程 + MPSC 队列 + drain)+ on_put/apply_text 派发 +
-  插件 drain 钩子接 Cask;默认 B=1(串行等价)。
-- **P3**:B>1 配置开放 + 定向压力(并发 builder vs 查询 vs 封口)+ 三
-  sanitizer + 吞吐 bench(端到端 put_doc/s,对照单 reducer 基线)。
+- **P2(完成 2026-07-10)**:BuilderPool(线程 + MPSC 队列 + drain)+
+  on_put/apply_text 派发 + 插件 drain 钩子接 Cask;默认 **B=0**(内联,
+  偏离原稿 B=1——安全灰度)。
+- **P3(完成 2026-07-10)**:每 builder 一个 building 段(apply/封口按
+  「目标槽」参数化)+ B>1 开放 + upsert 协议修正(见 §2 教训)+ 唤醒协议
+  (waiting 标记 + 背压半满迟滞,稳态零 futex)+ 三 sanitizer + bench:
+  20k 篇 30 词单文本 put_doc→flush_index 端到端,B=0 基线 ~95-103k docs/s,
+  B=1 ~105k(+10~15%),B=2 ~180k(1.9×),B=4 ~198k(2.1×,put 前端成新
+  瓶颈——WAL 写 + 组提交,加 B 不再涨)。
 
 ## 6. 风险
 

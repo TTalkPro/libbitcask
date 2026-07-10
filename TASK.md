@@ -3324,7 +3324,7 @@ W4 ✅（parallel_scan 并行全表扫描）。
       (回收等效,段数不收敛);② legacy 段化迁移(老 kBm25Default/kBm25Fields
       ckpt → 初始段)——现行为:老格式不认 → 退全量 fold 重建段集
       (安全慢,升级一次性成本,设计 §5 既定回退)。
-- [ ] **S27-4 并行 builder（DWPT）**（**P1+P2 完成** 2026-07-10）：多段内单线程 builder,
+- [x] **S27-4 并行 builder（DWPT）**（**全三相完成** 2026-07-10）：多段内单线程 builder,
   文档分派。**吞吐红利落地。**实现设计:
   [`docs/design/s27-4-dwpt-design.md`](docs/design/s27-4-dwpt-design.md)
   （reducer 退化轻路由 + B 个 builder 线程各持 building 段;正确性核心 =
@@ -3368,10 +3368,30 @@ W4 ✅（parallel_scan 并行全表扫描）。
       (B=1 写查删 → B=1/B=0 双模式重开)。
     - 验收:clang 567/567;TSan 并发子集 30/30 + 压力 ×5;ASan 全量
       567/567;rel 构建过 + 查询 bench 无回归。
-  - [ ] **P3**:B>1 开放(**每 builder 一个 building 段** + 查询多 building
-    归并 + flush 逐段封口;解除 P2 的 B≤1 钳制)+ 并发 builder 定向压力 +
-    三 sanitizer + 端到端 put_doc 吞吐 bench(对照单 reducer 基线)+ 评估
-    默认 builder_threads 翻转。
+  - [x] **P3 已完成（2026-07-10）：B>1 开放 + upsert 协议修正 + 吞吐落地**。
+    - 每 builder 一个 building 段:apply/封口按「目标槽」参数化
+      (apply_text_in/apply_job_impl_in/flush_building_slot;公开 apply_*
+      签名不变恒指 building_),查询收集器归并 [段集 + building_ + B 个
+      builder 段],ckpt flush_building 封口全部槽,compact/total_postings/
+      rebuild_index 覆盖 builder 段(rebuild 前置 drain + 弃在建段)。
+    - **抓获并修复 P1 upsert 协议的幽灵窗口**(B=4 压力 +2 计数坐实):
+      原「读 prior → 早标死 → add → 终检」在 B>1 下,终检败者的行无人指向、
+      并发双写时胜者读不到对手 → 两类幽灵存活。修正:mark_dead 全部收敛到
+      终检临界区(胜 → 锁内捕获被顶替者锁外标死;败 → 自标刚 add 的行),
+      每行恰好一个归宿;on_delete 原本已是此形态。早读降级为纯跳过优化。
+    - 唤醒协议(bench 驱动两轮):① waiting 标记——生产者只在 builder 真睡
+      时 notify,builder 完工只在队空(drain)或背压点 notify;② 背压迟滞
+      ——唤醒点从 cap-1 改半满(饱和时每 job 一次 futex 往返 → 一次唤醒换
+      cap/2 推送空间)。B=1 从 -36% 修到 +10~15%。
+    - bench(build-rel,BM_Cask_PutDocTextIndex,20k 篇 30 词单文本
+      put_doc → flush_index 端到端):B=0 基线 ~95-103k docs/s;B=1 ~105k;
+      B=2 ~180k(**1.9x**);B=4 ~198k(2.1x,put 前端 WAL/组提交成新瓶颈)。
+    - 测试:+3(B=2 跨 builder 同 key 20 版本覆盖链、B=2 flush 封口双段
+      round-trip、B=4 两版本+删除并发压力);TSan 8 项 x10 轮干净。
+    - 验收:clang 570/570;TSan 子集 33/33;ASan 全量 570/570;rel 过。
+    - **默认值决策:保持 builder_threads=0**(内联)。理由:B=1 收益小
+      (+10~15%),B>=2 的 1.9x 需要文本索引确为瓶颈的负载;由使用方按
+      负载显式开启(向量重负载 HNSW 单写者不受益,纯 KV 无关)。
 
 ### 关联既有设计（勿重复造轮子）
 - [`ord-recycling-design-zh.md`](doc/ord-recycling-design-zh.md)：ord 三角色 / per-write 硬约束 /
@@ -3658,8 +3678,11 @@ W4 ✅（parallel_scan 并行全表扫描）。
 3. ~~S29-6 全四相~~ **已完成 2026-07-10**（SeqShardTable + epoch-RCU；Get 8 线程 +43% 平坦扩展）
 4. ~~S29-7 铺垫+主体~~ **已完成 2026-07-10**（flat-combining 组提交；Put 并发 2-2.3×,聚合 976k/s）
 5. ~~S29-10~~ **已完成**；S29-11 按需（HNSW 召回预算）
-6. **下一步候选**：倒排桶锁二期（复用 SeqShardTable + epoch 注册表,BOW 查询扩展性)、
-   S27-3 B2b/D/E、S27-4 DWPT、S29-11、S29-T（TSan 既存失败,低优先）
+6. ~~S27-4 DWPT~~ **全三相完成 2026-07-10**（BuilderPool + 每 builder 一段;B=2 文本索引 1.9x,
+   默认保持 0 由使用方开启;详见 S27-4 条目）
+7. **下一步候选**：倒排桶锁二期（复用 SeqShardTable + epoch 注册表,BOW 查询扩展性)、
+   跨段 consolidation + legacy 段迁移（需 InvertedIndex 词表遍历原语）、C4/C5/C6 SOTA、
+   S29-11、S29-T（TSan 既存失败,低优先）
 
 **与 S27 的关系**：S29 结构性各项与 S27-3 剩余（B2b/D/E recovery 重写）独立可并行；
 S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同属索引吞吐轴,
