@@ -3430,13 +3430,21 @@ W4 ✅（parallel_scan 并行全表扫描）。
     ThreadCountIndependentOfLibCount` 在 build-tsan 稳定失败（`after_first-before`=3≠2，
     /proc/self/task 线程计数在 TSan 运行时下多 1）——**git stash 后同样失败，非 S29 引入**。
     build-clang/build-rel 均绿。疑 TSan 运行时线程计入。低优先：加 TSan 下跳过或放宽断言。
-- [ ] **S29-10 CRC32 流式小块：16-63B CLMUL 内核** · `include/bitcask/hw_crc32.hpp:342,378`
-  - 病根已查明：PCLMUL 路径有 `len >= 64` 下限，16B 增量块（hint/WAL 帧场景，
-    `crc32_bench.cpp:149`）恒退化为字节表 + 每调用 `has_pclmul_crc32()` 探测/misalign 计算
-    开销 → 500 MiB/s vs 大块 32 GiB/s（60×）。
-  - 改动：(a) 加 16-63B 单次 `_mm_clmulepi64` 折叠内核；或 (b) 调用侧对更大连续区间一次
-    CRC。附带：探测结果缓存为函数级 static。
-  - 验收：`BM_Crc32_Hw_Streaming` 各规格。
+- [x] **S29-10 CRC32 流式小块：16-63B CLMUL 内核** —— 已完成（2026-07-10）·
+    `include/bitcask/hw_crc32.hpp` + `bench/crc32_bench.cpp`
+  - 病根两层：① PCLMUL 大内核 `len >= 64` 下限（Step 1 无条件读 4×16B）；② 头对齐步骤
+    会把 16-63B 小块拆碎到全 bytewise（而 `_mm_loadu_si128` 本不要求对齐）。
+    16B 增量流（hint/WAL 帧）恒落字节表 → 500 MiB/s。
+  - **做了**：新增 `crc32_pclmul_small`（16..63B，loadu 免对齐；首块 XOR seed +
+    逐块 (k3,k4) 单折叠 + 与大内核完全一致的 Step 5-7 收尾）；`crc32_update`
+    的 <64 分支与「对齐消耗后 48..63B body」分支接入。探测缓存原本已是 static（免改）。
+  - **实测**：`BM_Crc32_Hw_Streaming/256` 450→71.8ns（544 MiB/s → **3.33 GiB/s，6.3×**）；
+    /4096、/65536 各 **4.9×**（→2.39 GiB/s）；附带 `BM_Crc32_Hw/23` 3×（16B 块过内核）。
+    大块无回归（4096/65536 持平）。剩余与一次性 32 GiB/s 的差距 = 每调用固定开销 +
+    16B 粒度无跨块 ILP（增量语义固有）。
+  - **验证**：独立对拍（长度 0-300 × 偏移 0-16 × 3 seeds = 15300 点 + 200 随机流式
+    trial）全过；bench 自测补「16..63 × 非零 seed × 非对齐」定向覆盖（原自测只有
+    seed=0 + 对齐起点）；双树构建 + ctest 555/555。
 - [ ] **S29-11（待评估）HNSW 深层优化** · `src/vector/hnsw.cpp` + `include/bitcask/hnsw.hpp:69-70`
   - 超线性根因：f32 导航工作集 100k×384d×4B ≈ 153MB 打穿 L3（本机无 VNNI，
     `pick_int8_dot_kernel()` 返 nullptr → 建图全程 f32）。
