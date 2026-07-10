@@ -318,6 +318,60 @@ inline std::uint32_t crc32_pclmul(std::uint32_t crc_internal,
     }
 }
 
+// S29-10：16..63 字节小块 PCLMULQDQ 内核。大内核（crc32_pclmul）Step 1 无条件
+// 读 4×16 字节 → 有 64B 下限；流式增量场景（hint/WAL 帧,每次 16-48B）恒落
+// bytewise 表路径。本内核处理 nblocks16 个 16 字节块（loadu,**无对齐要求**
+// ——小块走头对齐反而会把整块拆碎成 bytewise）：首块 XOR seed,后续块各一次
+// (k3,k4) 折叠,收尾与大内核 Step 5-7 完全一致（128→64→32 + Barrett）。
+// 返回新的非取反内部状态（同 crc32_pclmul 契约）。
+[[gnu::target("sse4.2,pclmul")]]
+inline std::uint32_t crc32_pclmul_small(std::uint32_t crc_internal,
+                                        const std::byte* buf,
+                                        std::size_t nblocks16) noexcept {
+    const __m128i k3k4   = _mm_load_si128(reinterpret_cast<const __m128i*>(kK3K4Bytes));
+    const __m128i k5     = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(kK5K0Bytes));
+    const __m128i mask32 = _mm_load_si128(reinterpret_cast<const __m128i*>(kMask32Bytes));
+    const __m128i mupoly = _mm_load_si128(reinterpret_cast<const __m128i*>(kMuPolyBytes));
+
+    __m128i xmm1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf));
+    xmm1 = _mm_xor_si128(xmm1, _mm_cvtsi32_si128(static_cast<int>(crc_internal)));
+
+    const std::byte* p = buf + 0x10;
+    for (std::size_t i = 1; i < nblocks16; ++i) {
+        __m128i tmp;
+        tmp  = _mm_clmulepi64_si128(xmm1, k3k4, 0x00);
+        xmm1 = _mm_clmulepi64_si128(xmm1, k3k4, 0x11);
+        xmm1 = _mm_xor_si128(xmm1, tmp);
+        xmm1 = _mm_xor_si128(
+            xmm1, _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+        p += 0x10;
+    }
+
+    // 128 → 64 fold（同大内核 Step 5）。
+    {
+        __m128i tmp = _mm_clmulepi64_si128(xmm1, k3k4, 0x10);
+        xmm1 = _mm_srli_si128(xmm1, 8);
+        xmm1 = _mm_xor_si128(xmm1, tmp);
+    }
+    // 64 → 32 fold（同 Step 6）。
+    {
+        __m128i hi32 = _mm_srli_si128(xmm1, 4);
+        __m128i lo32 = _mm_and_si128(xmm1, mask32);
+        __m128i fold = _mm_clmulepi64_si128(lo32, k5, 0x00);
+        xmm1 = _mm_xor_si128(fold, hi32);
+    }
+    // Barrett 64 → 32（同 Step 7）。
+    {
+        const __m128i state = xmm1;
+        __m128i tmp = _mm_and_si128(state, mask32);
+        tmp = _mm_clmulepi64_si128(tmp, mupoly, 0x10);
+        tmp = _mm_and_si128(tmp, mask32);
+        tmp = _mm_clmulepi64_si128(tmp, mupoly, 0x00);
+        tmp = _mm_xor_si128(tmp, state);
+        return static_cast<std::uint32_t>(_mm_extract_epi32(tmp, 1));
+    }
+}
+
 // True iff CPU supports both sse4.2 and pclmul. Cached after first call.
 inline bool has_pclmul_crc32() noexcept {
 #if defined(__GNUC__) || defined(__clang__)
@@ -360,11 +414,24 @@ inline std::uint32_t crc32_update(std::uint32_t seed,
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     if (detail::has_pclmul_crc32()) {
+        std::uint32_t c = inv_seed;
+
+        // S29-10：16..63 字节走小块内核——无对齐步骤（loadu 不要求对齐;
+        // 原实现头对齐会把小块拆碎到全 bytewise），整 16B 块单折叠 CLMUL,
+        // 尾部 <16B bytewise。流式增量（hint/WAL 帧）的主命中路径。
+        if (len < 64) {
+            const std::size_t nblk = len / 16;  // ≥1（<16 已在上面走 zlib）
+            c = detail::crc32_pclmul_small(c, p, nblk);
+            p   += nblk * 16;
+            len -= nblk * 16;
+            if (len) c = detail::crc32_bytewise(c, p, len);
+            return ~c;
+        }
+
         // Step A: process 0..15 leading bytes bytewise to align p to 16.
         // Mirrors the Linux kernel's crc32_le_arch() head-alignment step.
         const std::uintptr_t misalign =
             (16u - (reinterpret_cast<std::uintptr_t>(p) & 15u)) & 15u;
-        std::uint32_t c = inv_seed;
         if (misalign) {
             const std::size_t take = std::min<std::size_t>(misalign, len);
             c = detail::crc32_bytewise(c, p, take);
@@ -373,16 +440,19 @@ inline std::uint32_t crc32_update(std::uint32_t seed,
         }
         // Step B: PCLMULQDQ on the aligned body. The hardware kernel
         // requires at least 64 bytes (Step 1 reads 4 × 16 unconditionally).
-        // Smaller aligned bodies fall through to bytewise — still vectorized
-        // by the compiler as a tight loop over the 1 KB table, no big deal.
+        // 对齐消耗后小于 64 的 body（48..63）走小块内核（同上）。
         if (len >= 64) {
             const std::size_t body = len & ~std::size_t{15};
             c = detail::crc32_pclmul(c, p, body);
             p   += body;
             len -= body;
+        } else if (len >= 16) {
+            const std::size_t nblk = len / 16;
+            c = detail::crc32_pclmul_small(c, p, nblk);
+            p   += nblk * 16;
+            len -= nblk * 16;
         }
-        // Step C: trailing bytes (< 16) handled bytewise. Also covers the
-        // small-aligned case (16..63) where we skipped the hardware path.
+        // Step C: trailing bytes (< 16) handled bytewise.
         if (len) {
             c = detail::crc32_bytewise(c, p, len);
         }

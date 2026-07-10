@@ -94,6 +94,29 @@ void self_test() {
                      z_whole, z_step2, h_step2);
         std::abort();
     }
+
+    // S29-10：小块内核（16..63B）定向覆盖——非零 seed × 非对齐偏移。
+    // 上面 0..256 一次性只测 seed=0 + malloc 对齐起点；流式增量场景恰是
+    // 「带 seed 的短块、任意偏移」。逐组合对拍 zlib。
+    std::vector<std::byte> pool(512);
+    fill(pool);
+    for (std::size_t len = 16; len < 64; ++len) {
+        for (std::size_t off = 0; off <= 16; ++off) {
+            const auto seed = static_cast<std::uint32_t>(rng());
+            const auto z = static_cast<std::uint32_t>(
+                ::crc32(seed, reinterpret_cast<const Bytef*>(pool.data() + off),
+                        static_cast<uInt>(len)));
+            const auto h = bitcask::hw::crc32_update(
+                seed, std::span<const std::byte>(pool.data() + off, len));
+            if (z != h) {
+                std::fprintf(stderr,
+                             "CRC32 small-block self-test FAILED: len=%zu off=%zu "
+                             "seed=0x%08X zlib=0x%08X hw=0x%08X\n",
+                             len, off, seed, z, h);
+                std::abort();
+            }
+        }
+    }
 }
 
 }  // namespace
