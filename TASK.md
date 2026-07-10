@@ -3348,16 +3348,25 @@ W4 ✅（parallel_scan 并行全表扫描）。
 
 ### P1 结构性（量级改变，需设计，各自独立可做）
 
-- [ ] **S29-6 读路径「零共享写」改造（seqlock / epoch）** · `src/keydir/keydir.cpp:335` +
-    `include/bitcask/keydir.hpp:399` + `include/bitcask/inverted.hpp:486`
+- [ ] **S29-6 读路径「零共享写」改造（epoch-RCU + 乐观读）**（**设计已闭合** 2026-07-10）·
+    `src/keydir/keydir.cpp` + `include/bitcask/keydir.hpp` + `include/bitcask/inverted.hpp:486`
   - 病根：读路径每次对共享锁字原子 RMW——`KeyDir::get` 拿 shard 独占 `std::mutex`（S5 实验
     遗留）；TBB `const_accessor` 读也写桶锁字。换 shared_mutex 无效（reader 计数同样写
-    cacheline）。
-  - 方向：KeyDir 每 shard seqlock（entry 是 POD `SingleEntry`，乐观拷贝理想；fold 态
-    `keyfolders_/has_pending_` 分支回退加锁）；posting map 已是 CoW（`mutable_pl`），
-    读者可走 epoch-based reclamation 或 thread_local term→snapshot 缓存（generation 失效）。
-  - 收益：`BM_KeyDir_Get_MultiThreaded` 与 BOW 理论线性扩展。改造面大，建议 KeyDir 先行
-    （面小、模式清晰），倒排桶锁二期。
+    cacheline）。8 线程退化 = 每 acquire 一次锁字 RFO 缓存缺失（~26ns），非阻塞争用。
+  - ⚠️ **实现前审计（2026-07-10）推翻原 sketch**：naive「每 shard seqlock + POD 乐观拷贝」
+    **不成立**——seqlock 事后校验兜不住 UAF/段错误。三个致命场景：① ankerl map grow/rehash
+    立即 free 旧数组（读者正遍历）；② `remove` 无 fold 分支热路径物理 erase（`keydir.cpp:699`,
+    free key string 缓冲，读者 find 正比较）；③ variant Single→Multi 升级（可判别回退，唯一
+    能安全处理的一类）。
+  - **修正设计**（四件套缺一不可，P1-P3 必须整批上线）：P1 热路径 erase → tombstone-in-place
+    （物理回收挪 quiescent 点 + 写者 sweep）；P2 epoch 读者注册表 + per-shard limbo 延迟回收
+    + ankerl 自定义 allocator；P3 get 乐观快路径（per-shard seq 校验 + fold/Multi 回退 +
+    重试上限 + 运行期回退开关）；P4 TSan/ASan 定向压力 + bench 验收。
+    详见 [`docs/design/s29-6-keydir-lockfree-read.md`](docs/design/s29-6-keydir-lockfree-read.md)。
+  - 工作量：~3 会话（P1 语义审计 / P2 基建 / P3+P4 收口）。KeyDir 是全库最核心并发结构,
+    须整批评审 + 三 sanitizer 全量后合入。
+  - 二期：倒排桶锁复用同一套 epoch 注册表（TBB 桶锁不可下探 → 换表或 thread_local
+    term→snapshot 缓存）。
 - [ ] **S29-7 Put 写路径 group commit（单 handle 多写者扩展）** · `src/cask/cask.cpp:1319-1378`
     + `include/bitcask/data_file.hpp`
   - 病根：`write_mu_`（`cask.hpp:785`）包住 encode + pwrite + hint + keydir 全序列，短临界区
