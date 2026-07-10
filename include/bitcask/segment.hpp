@@ -24,12 +24,12 @@
 #include "bitcask/inverted.hpp"        // InvertedIndex / TermPositions / LiveChecker
 #include "bitcask/search_checkpoint.hpp"
 #include "bitcask/search_types.hpp"    // kDefaultField
+#include "bitcask/row_chunks.hpp"      // RowChunks（并发 doc_store 底座）
 #include "bitcask/segment_query.hpp"   // SegmentView
 #include "bitcask/string_hash.hpp"     // StringHash（透明 hash）
 
 #include <atomic>
 #include <cstring>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -82,7 +82,7 @@ public:
         lsns_.push_back(lsn);
         slots_.push_back(index::DocSlot{.loc = loc, .tstamp = tstamp, .doc_len = dl});
         doc_lens_.push_back(dl);
-        live_.emplace_back(1);
+        live_.push_back(std::uint8_t{1});
         count_pub_.store(docid + 1, std::memory_order_release);
         inv_.add_doc(docid, terms);
         return docid;
@@ -115,7 +115,7 @@ public:
         slots_.push_back(index::DocSlot{.loc = loc, .tstamp = tstamp,
                                         .doc_len = total_doc_len});
         doc_lens_.push_back(total_doc_len);  // 段级 total（不是 per-field）
-        live_.emplace_back(1);
+        live_.push_back(std::uint8_t{1});
         count_pub_.store(docid + 1, std::memory_order_release);
         // 各字段写倒排（默认 → inv_，其余 → fields_ map）。
         for (const auto& f : fields) {
@@ -179,7 +179,7 @@ public:
     [[nodiscard]] bool mark_dead(DocId docid) {
         if (docid >= count_pub_.load(std::memory_order_acquire)) return false;
         live_[docid].store(0, std::memory_order_relaxed);
-        dead_dirty_ = true;  // S27-3 B2b 步骤 4:待重存(见 dead_dirty 注释)
+        dead_dirty_.store(true, std::memory_order_relaxed);  // S27-3 B2b 步骤 4:待重存
         return true;
     }
 
@@ -196,7 +196,7 @@ public:
                 n += inv->compact(*this, dead_ratio_threshold);
             }
         }
-        if (n > 0) dead_dirty_ = true;
+        if (n > 0) dead_dirty_.store(true, std::memory_order_relaxed);
         return n;
     }
 
@@ -204,8 +204,10 @@ public:
     // kSegDocStore 持久化,但封口段不会自动重存——不在 checkpoint 时重存
     // 脏段,ckpt **之前**的删除会在 recovery 后复活为幽灵(fold 只补 ckpt
     // 之后的窗口)。SegmentSet::resave_dead_dirty 消费本标记。
-    [[nodiscard]] bool dead_dirty() const { return dead_dirty_; }
-    void clear_dead_dirty() { dead_dirty_ = false; }
+    [[nodiscard]] bool dead_dirty() const {
+        return dead_dirty_.load(std::memory_order_relaxed);
+    }
+    void clear_dead_dirty() { dead_dirty_.store(false, std::memory_order_relaxed); }
     // 活文档计数（live_==1 的数量）——测试 / 内省用。
     [[nodiscard]] std::size_t live_doc_count() const {
         const auto cnt = count_pub_.load(std::memory_order_acquire);
@@ -239,9 +241,9 @@ public:
     // 不会被移动，唯一指针在 map 内不动），view 持有方持本段活过查询即可。
     [[nodiscard]] MultiFieldSegmentView multi_view() const {
         std::vector<FieldSegmentView> fvs;
+        std::shared_lock lk(fields_mu_);  // S27-4 P2:size() 读也须在锁内
         fvs.reserve(1 + fields_.size());
         fvs.push_back(FieldSegmentView{kDefaultField, &inv_});
-        std::shared_lock lk(fields_mu_);
         for (const auto& [name, inv] : fields_) {
             fvs.push_back(FieldSegmentView{name, inv.get()});
         }
@@ -430,7 +432,7 @@ private:
             std::uint32_t klen = 0;
             if (!rd_u32(klen)) return false;
             if (static_cast<std::size_t>(end - p) < klen) return false;
-            keys_.emplace_back(reinterpret_cast<const char*>(p), klen);
+            keys_.push_back(std::string(reinterpret_cast<const char*>(p), klen));
             p += klen;
             std::uint64_t lsn = 0, off = 0;
             std::uint32_t fid = 0, tsz = 0, ts = 0, dl = 0;
@@ -446,7 +448,7 @@ private:
                 .loc = index::DocLoc{.offset = off, .file_id = fid, .total_sz = tsz},
                 .tstamp = ts, .doc_len = dl});
             doc_lens_.push_back(dl);
-            live_.emplace_back(lv);
+            live_.push_back(lv);
         }
         count_pub_.store(n, std::memory_order_release);  // load 单线程,尾部发布
         return true;
@@ -454,21 +456,23 @@ private:
 
     // ---- 段内存储 ----
     bm25::InvertedIndex        inv_;       // 默认字段（kDefaultField）
-    std::deque<std::string>     keys_;
-    std::deque<Lsn>            lsns_;
-    std::deque<index::DocSlot> slots_;
-    std::deque<std::uint32_t>  doc_lens_;   // 段级 total doc_len（Σ 各字段 dl）
-    // mutable：设计文档 §3.4「封口段仅 live_docs 可变」。mark_dead 翻位删
-    // 除是封口后唯一允许的 mutation；接口本身已显式标注非常量（caller 须
+    // mutable live_：设计文档 §3.4「封口段仅 live_docs 可变」。mark_dead 翻位
+    // 删除是封口后唯一允许的 mutation；接口本身已显式标注非常量（caller 须
     // 取到非 const SealedSegment*，见 mark_dead 注释）。
-    // S27-3 步骤 3:Building 段查询并发化——doc_store 数组 vector→deque
-    // (增长不搬移既有元素,免读者 realloc-UAF),已发布行数经 count_pub_
+    // S27-3 步骤 3 + S27-4 P2:Building 段查询并发化——doc_store 底座
+    // RowChunks(chunk 永不搬移 + spine 原子发布,deque 的节点指针表扩容
+    // 对并发读者不安全,见 row_chunks.hpp 头注),已发布行数经 count_pub_
     // (release 发布/acquire 读)界定读者可达范围;live_ 元素原子(mark_dead
     // 翻位 vs 读者 is_live,TSan 干净)。写序:先追加行,再发布计数,最后
     // add_doc 进倒排——读者经 posting 拿到的 docid 必有已发布的行。
-    mutable std::deque<std::atomic<std::uint8_t>> live_;
+    RowChunks<std::string>     keys_;
+    RowChunks<Lsn>             lsns_;
+    RowChunks<index::DocSlot>  slots_;
+    RowChunks<std::uint32_t>   doc_lens_;   // 段级 total doc_len（Σ 各字段 dl）
+    mutable RowChunks<std::atomic<std::uint8_t>> live_;
     std::atomic<std::uint64_t> count_pub_{0};
-    bool dead_dirty_ = false;  // S27-3 B2b 步骤 4:save 后有新 mark_dead
+    // S27-4 P2:原子——builder(覆盖 mark_dead)与 reducer(on_delete)并发翻位。
+    std::atomic<bool> dead_dirty_{false};  // S27-3 B2b 步骤 4:save 后有新 mark_dead
 
     // 命名字段（除默认）：字段名 → InvertedIndex。
     // fields_mu_ 只护 map 结构（与 TextPlugin::fields_ 同款约定：本体地址稳定，

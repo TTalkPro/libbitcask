@@ -33,8 +33,10 @@
 #include "bitcask/synonym_map.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <functional>
 #include <list>
@@ -45,6 +47,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -94,7 +97,13 @@ public:
     [[nodiscard]] std::uint64_t watermark() const override {
         return watermark_;
     }
-    plugin::PluginStatus close() override { return plugin::PluginStatus::kOk; }
+    plugin::PluginStatus close() override {
+        stop_builders();  // S27-4 P2:幂等;排干后停线程
+        return plugin::PluginStatus::kOk;
+    }
+    // S27-4 P2:读屏障钩子(宿主 prepare_search 调)。
+    void drain() override { drain_builders(); }
+    ~TextPlugin() override { stop_builders(); }
     [[nodiscard]] bool wants_prepare() const override { return true; }
     [[nodiscard]] plugin::PreparedPtr
     prepare(const plugin::PutEvent& e) const override {
@@ -130,9 +139,19 @@ public:
     }
     // S16-2 前置条件：宿主已先 apply docmap——本插件只做 BM25 侧。
     void on_put(const plugin::PutEvent& e, plugin::PreparedPtr prep) override {
+        // S27-4 P2:builder 模式下路由派发(refresh 可见性,drain 保
+        // read-your-writes);B=0 内联(历史行为)。压实触发在 reducer 侧
+        // (builder 不可 compact——遍历他人 building 的 tbb map 与并发 add
+        // 不兼容)。
         if (auto* sp = static_cast<TextPrepared*>(prep.get())) {
-            // prepare 相产物（多字段活写 / 重放批含单文本）→ 直接 apply。
-            apply_job(sp->job);
+            if (!builders_.empty()) {
+                BuilderJob bj;
+                bj.job = std::move(sp->job);
+                dispatch_job(std::move(bj));
+            } else {
+                apply_job(sp->job);
+            }
+            maybe_auto_compact_reducer();
             return;
         }
         if (e.doc && !e.doc->fields.empty()) {
@@ -142,9 +161,20 @@ public:
             apply_job(empty);
             return;
         }
-        // 单文本（原 OnWriteEntry 语义）：分析在 reducer 内进行。
+        // 单文本（原 OnWriteEntry 语义）：内联时 reducer 内分析;builder
+        // 模式下连分析一起下放 builder(额外并行度)。
         const std::string_view t = e.doc ? e.doc->text : e.value;
-        apply_text(e.key, e.ord, t);
+        if (!builders_.empty()) {
+            BuilderJob bj;
+            bj.is_raw = true;
+            bj.raw_key.assign(e.key);
+            bj.raw_text.assign(t);
+            bj.raw_ord = e.ord;
+            dispatch_job(std::move(bj));
+        } else {
+            apply_text(e.key, e.ord, t);
+        }
+        maybe_auto_compact_reducer();
     }
     void on_delete(const plugin::DeleteEvent& e) override {
         // kNoPriorOrd = 删不存在的 key：宿主未动 docmap，历史语义为 no-op。
@@ -417,6 +447,37 @@ private:
     void rebuild_key_locations();
     // 段集初始化(load_component loaded 情形 / open 未 loaded 兜底共用)。
     void init_segment_set(std::string_view dir, bool loaded);
+
+    // ---- S27-4 P2:BuilderPool(设计 docs/design/s27-4-dwpt-design.md)----
+    // 生产者恒为 reducer 单线程(on_put 路由),每 builder 一条 SPSC 队列
+    // (mutex+cv,容量上限 = 背压)。B=0(默认)= 内联,零行为变化。
+    struct BuilderJob {
+        search::ReduceJob job;        // 多字段(map 阶段已分析)
+        std::string       raw_key;    // 单文本路径(builder 内分析)
+        std::string       raw_text;
+        std::uint64_t     raw_ord = 0;
+        bool              is_raw = false;
+    };
+    struct Builder {
+        std::thread             th;
+        std::mutex              mu;
+        std::condition_variable cv_push;  // 生产者等空位
+        std::condition_variable cv_idle;  // 消费者取任务 / drain 等静止
+        std::deque<BuilderJob>  q;
+        bool busy = false;
+        bool stop = false;
+    };
+    static constexpr std::size_t kBuilderQueueCap = 1024;
+    std::vector<std::unique_ptr<Builder>> builders_;
+    std::size_t rr_next_ = 0;  // round-robin 游标(reducer 单线程)
+    void start_builders();
+    void stop_builders();
+    void builder_loop(Builder& b);
+    void dispatch_job(BuilderJob&& j);
+    void drain_builders();
+    // reducer 侧压实触发(builder 模式下 apply 路径的 maybe_auto_compact
+    // 为 no-op——compact 需 builder 静止;见各自注释)。
+    void maybe_auto_compact_reducer();
 
     // S27-3 步骤 5:building_ 原子 shared_ptr——封口切换(reducer store)与
     // 查询读(load)并发;查询经 pin 钉住段对象跨越切换/drop。

@@ -374,7 +374,8 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
         (void)prior.seg->mark_dead(prior.docid);
     }
 
-    maybe_auto_compact();  // S12-2
+    maybe_auto_compact();          // S12-2(内联模式)
+    maybe_auto_compact_reducer();  // S27-4 P2(builder 模式;on_delete 恒在 reducer)
 }
 
 void TextPlugin::rebuild_index(
@@ -478,6 +479,10 @@ std::size_t TextPlugin::total_postings() const {
 
 void TextPlugin::maybe_auto_compact() {
     // S27-3 步骤 5:复活(S12-2 原节流逻辑,目标换段世界 compact)。
+    // S27-4 P2:builder 模式下本函数在 builder 线程被调 → 必须 no-op
+    // (compact 遍历他人 building 的 tbb map 与并发 add 不兼容);压实
+    // 触发改由 reducer 侧 maybe_auto_compact_reducer 承担。
+    if (!builders_.empty()) return;
     const double thr = config_.auto_compact_dead_ratio;
     if (thr <= 0.0) return;  // opt-in 关（默认）→ 零开销
 
@@ -1158,6 +1163,8 @@ plugin::PluginStatus TextPlugin::open(const plugin::OpenContext& ctx) {
     building_.store(std::make_shared<search::SealedSegment>(),
                     std::memory_order_release);
 
+    start_builders();  // S27-4 P2:B>0 才起线程(默认 0 = 内联)
+
     return plugin::PluginStatus::kOk;
 }
 
@@ -1187,6 +1194,7 @@ plugin::FlushResult TextPlugin::flush(const plugin::FlushRequest& req) {
     // S27-3 Slice C：delta 链退役，只走 base（全量序列化 fields_）。
     // S27-3 Slice B2b 步骤 1：同时封口 building_ 到段集（段集持久化源）。
     plugin::FlushResult res;
+    drain_builders();  // S27-4 P2:ckpt 覆盖到 watermark 需在途 apply 完成
     if (!dirty() && !req.force_rebase) {
         res.covered_ord = chain_.chain_wm;
     } else if ((flush_building(),
@@ -1213,8 +1221,12 @@ void TextPlugin::on_merge_commit(const plugin::MergeCommitEvent&) {
     // RunFn 的插件自治版）。merge 后压实恒 rebase（compact 内自置标志）。
     constexpr double kMergeCompactDeadRatio = 0.2;
     if (host_) {
-        host_->run_serialized([this] { compact(kMergeCompactDeadRatio); });
+        host_->run_serialized([this] {
+            drain_builders();  // S27-4 P2:压实需 builder 静止
+            compact(kMergeCompactDeadRatio);
+        });
     } else {
+        drain_builders();
         compact(kMergeCompactDeadRatio);  // 无宿主（standalone 测试）：直跑
     }
 }
@@ -1246,6 +1258,105 @@ void TextPlugin::flush_building() {
     // S27-4 P1:封口零清扫——KeyLocation 持段**对象**指针,building 封口后
     // 对象身份不变(shared_ptr 移入段集),定位天然继续有效。
     seg_dirty_.store(true, std::memory_order_relaxed);
+}
+
+
+// ===========================================================================
+// S27-4 P2:BuilderPool(设计 docs/design/s27-4-dwpt-design.md §1/§3)
+// ===========================================================================
+
+void TextPlugin::start_builders() {
+    // P2 钳制:B 上限 1(串行等价——所有 builder 共享单一 building_,
+    // SealedSegment::add 是单写者契约)。P3 落地每 builder 一段后开放 B>1
+    // (设计 §1)。
+    const std::size_t n = std::min<std::size_t>(config_.builder_threads, 1);
+    if (n == 0 || !builders_.empty()) return;
+    builders_.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        auto b = std::make_unique<Builder>();
+        Builder* raw = b.get();
+        b->th = std::thread([this, raw] { builder_loop(*raw); });
+        builders_.push_back(std::move(b));
+    }
+}
+
+void TextPlugin::stop_builders() {
+    for (auto& b : builders_) {
+        {
+            std::lock_guard<std::mutex> lk(b->mu);
+            b->stop = true;
+        }
+        b->cv_idle.notify_all();
+        b->cv_push.notify_all();
+        if (b->th.joinable()) b->th.join();
+    }
+    builders_.clear();
+}
+
+// 生产者 = reducer 单线程;round-robin + 容量背压。
+void TextPlugin::dispatch_job(BuilderJob&& j) {
+    Builder& b = *builders_[rr_next_];
+    rr_next_ = (rr_next_ + 1) % builders_.size();
+    std::unique_lock<std::mutex> lk(b.mu);
+    b.cv_push.wait(lk, [&] { return b.q.size() < kBuilderQueueCap || b.stop; });
+    if (b.stop) return;  // 关停中:丢弃(close 前必有 drain,此处防御)
+    b.q.push_back(std::move(j));
+    lk.unlock();
+    b.cv_idle.notify_all();
+}
+
+void TextPlugin::builder_loop(Builder& b) {
+    for (;;) {
+        BuilderJob j;
+        {
+            std::unique_lock<std::mutex> lk(b.mu);
+            b.cv_idle.wait(lk, [&] { return !b.q.empty() || b.stop; });
+            if (b.q.empty() && b.stop) return;
+            j = std::move(b.q.front());
+            b.q.pop_front();
+            b.busy = true;
+        }
+        // 执行(builder 不可抛——吞异常,语义同 reducer 对 apply 异常的
+        // 空 job 降级;宿主错误计数不可达,接受)。
+        try {
+            if (j.is_raw) {
+                apply_text(j.raw_key, j.raw_ord, j.raw_text);
+            } else {
+                apply_job(j.job);
+            }
+        } catch (...) {
+        }
+        {
+            std::lock_guard<std::mutex> lk(b.mu);
+            b.busy = false;
+        }
+        b.cv_idle.notify_all();  // drain 等待者 + 潜在下一任务(自唤醒无害)
+        b.cv_push.notify_all();  // 背压等待的生产者
+    }
+}
+
+// 读屏障:全部 builder 队列空 + 非 busy。可从 reducer(flush/compact)与
+// 查询线程(plugin drain 钩子)并发调用。
+void TextPlugin::drain_builders() {
+    for (auto& b : builders_) {
+        std::unique_lock<std::mutex> lk(b->mu);
+        b->cv_idle.wait(lk, [&] { return b->q.empty() && !b->busy; });
+    }
+}
+
+// reducer 侧压实触发:阈值判定(便宜,常态早退)→ drain(builder 静止,
+// compact 的 tbb 遍历契约)→ compact。B=0 时 apply 路径的 maybe_auto_compact
+// 已覆盖,这里直接返回避免双触发。
+void TextPlugin::maybe_auto_compact_reducer() {
+    if (builders_.empty()) return;  // 内联模式走 apply 路径既有触发
+    const double thr = config_.auto_compact_dead_ratio;
+    if (thr <= 0.0) return;
+    const std::uint64_t retired = stats_.retired_since_compact();
+    if (retired < kAutoCompactMinDeaths) return;
+    if (retired < stats_.live_docs() / 2) return;
+    drain_builders();
+    compact(thr);
+    stats_.reset_retired_since_compact();
 }
 
 }  // namespace bitcask::text
