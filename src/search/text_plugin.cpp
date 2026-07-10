@@ -1223,6 +1223,15 @@ bool TextPlugin::save_component_base(std::string_view dir,
             sw.add(sc::CkptSectionType::kBm25Fields, std::move(fbuf));
         }
     }
+    // S27-3 B2b 步骤 1:段清单进 bm25.ckpt(kSegManifest,recovery 重写
+    // 步骤 4 的读取源;先于 index.manifest 提交,单一 commit point 不变量
+    // 见设计 §4.1)。过渡期仍提交 segments.manifest(SegmentSet::open 兼容,
+    // 步骤 4 后退役)。commit 失败 → 本次 base 保存失败(盘错误,flush 上报)。
+    if (segment_set_) {
+        if (!segment_set_->commit()) return false;
+        sw.add(sc::CkptSectionType::kSegManifest,
+               segment_set_->manifest_payload());
+    }
     const bool ok = !sw.empty() &&
         sc::SearchCheckpoint::write(fp, watermark, sw.sections());
     if (!ok) return false;
@@ -1410,8 +1419,13 @@ void TextPlugin::flush_building() {
             static_cast<DocId>(building_->doc_count() - 1));
     }
 
+    // S27-3 B2b 步骤 1:add_pending——段文件落盘 + 内存登记,清单提交延后
+    // 到 checkpoint(save_component_base 统一 commit)。add_pending 仅成功时
+    // 取走所有权,失败路径 building_ 真·物归原主(原 add 按值取走,失败时
+    // 这里恢复的是 moved-from 空指针——建段丢失 + 后续 apply 解引用空
+    // building_,既存缺陷顺带修正)。
     auto sealed = std::move(building_);
-    if (!segment_set_->add(std::move(sealed), hi_lsn)) {
+    if (!segment_set_->add_pending(sealed, hi_lsn)) {
         building_ = std::move(sealed);  // 物归原主
         return;
     }

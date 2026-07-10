@@ -63,16 +63,62 @@ public:
         return set;
     }
 
-    // 追加一个封口段（接管所有权）：落盘段文件 + 原子提交 manifest。
-    [[nodiscard]] bool add(std::unique_ptr<SealedSegment> seg,
-                           std::uint64_t hi_lsn) {
+    // ---- S27-3 B2b 步骤 1:持久化解耦(设计 s27-3-b2b-recovery-design §3) ----
+    // add/drop 拆为 pending(段文件落盘 + 内存登记,**不提交清单**)与
+    // commit(清单提交)。过渡期 TextPlugin 在 checkpoint(save_component_base)
+    // 统一 commit + 把清单写入 bm25.ckpt(kSegManifest);recovery 重写(步骤 4)
+    // 后 segments.manifest 退役,index.manifest 成为唯一 commit point。
+
+    // 落盘段文件 + 内存登记。**仅成功时取走所有权**——失败时 seg 留在 caller
+    // 手里(修正原 add 按值取走的缺陷:失败路径 caller 拿回的是空指针,
+    // Building 段丢失且后续 apply 解引用空 building_)。
+    [[nodiscard]] bool add_pending(std::unique_ptr<SealedSegment>& seg,
+                                   std::uint64_t hi_lsn) {
         const std::uint64_t id = next_seg_id_;
         const std::string fname = "seg-" + std::to_string(id) + ".seg";
         if (!seg->save(join(dir_, fname), hi_lsn)) return false;
         entries_.push_back(Entry{fname, id, hi_lsn, seg->doc_count()});
         segments_.push_back(std::move(seg));
         ++next_seg_id_;
-        if (!commit_manifest()) {  // 提交失败 → 回滚内存态（段文件残留由下次 open 忽略）
+        return true;
+    }
+
+    // 内存态移除;段文件 unlink 延后到 commit **之后**(先清单后删文件——
+    // 崩溃窗口只留孤儿段文件,open 忽略;原 drop 反序有「清单仍列已删文件
+    // → open 整体拒收 → 退全量重建」窗口,顺带修正)。
+    [[nodiscard]] bool drop_pending(std::uint64_t seg_id) {
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].seg_id != seg_id) continue;
+            pending_unlink_.push_back(entries_[i].filename);
+            entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
+            segments_.erase(segments_.begin() + static_cast<std::ptrdiff_t>(i));
+            return true;
+        }
+        return false;
+    }
+
+    // 提交清单(segments.manifest,过渡期)+ 清理已 drop 的段文件。
+    [[nodiscard]] bool commit() {
+        if (!commit_manifest()) return false;
+        for (const auto& f : pending_unlink_) {
+            std::error_code ec;
+            std::filesystem::remove(join(dir_, f), ec);
+        }
+        pending_unlink_.clear();
+        return true;
+    }
+
+    // 段清单编码(bm25.ckpt 的 kSegManifest section 载荷;与
+    // segments.manifest 内容同格式——步骤 4 recovery 从这里读)。
+    [[nodiscard]] std::vector<std::byte> manifest_payload() const {
+        return encode_manifest();
+    }
+
+    // 兼容包装(既有测试/独立使用):pending + 立即 commit。
+    [[nodiscard]] bool add(std::unique_ptr<SealedSegment> seg,
+                           std::uint64_t hi_lsn) {
+        if (!add_pending(seg, hi_lsn)) return false;
+        if (!commit()) {  // 提交失败 → 回滚内存态（段文件残留由下次 open 忽略）
             entries_.pop_back();
             segments_.pop_back();
             return false;
@@ -90,17 +136,10 @@ public:
         return multi_segment_search(views, terms, k, params);
     }
 
-    // 移除一个段：删段文件 + 原子提交 manifest。
+    // 移除一个段（兼容包装）：pending + 立即 commit（清单先行,再删文件）。
     [[nodiscard]] bool drop(std::uint64_t seg_id) {
-        for (std::size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].seg_id != seg_id) continue;
-            std::error_code ec;
-            std::filesystem::remove(join(dir_, entries_[i].filename), ec);
-            entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
-            segments_.erase(segments_.begin() + static_cast<std::ptrdiff_t>(i));
-            return commit_manifest();
-        }
-        return false;
+        if (!drop_pending(seg_id)) return false;
+        return commit();
     }
 
     [[nodiscard]] std::size_t segment_count() const { return segments_.size(); }
@@ -208,6 +247,7 @@ private:
     std::uint64_t next_seg_id_ = 0;
     std::vector<Entry> entries_;                              // 与 segments_ 平行
     std::vector<std::unique_ptr<SealedSegment>> segments_;
+    std::vector<std::string> pending_unlink_;  // drop_pending → commit 后删
 };
 
 }  // namespace bitcask::search
