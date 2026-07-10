@@ -599,6 +599,9 @@
 - [ ] **P3 `nfkc_fold` ASCII fast path 仍 std::string 拷贝** — `include/bitcask/text_utils.hpp`
   - 暂留：fast path 必须返回 owning string（要 tolower），拷贝固有；省拷贝需改 API
     （string_view + caller 保活 / in-place），lifetime 复杂、收益边际。低优先。
+  - **关联 S29-8**（2026-07-10）：同文件更大的问题是 CJK 快路径整趟 decode 只为校验
+    inert 随即丢弃、`to_codepoints` 再解一遍（双重解码）——若做 S29-8 融合入口，本项
+    的 API 改造应一并设计，勿分两次动 `nfkc_fold` 签名。
 - [x] **P4 `to_codepoints` 必堆分配 vector** — `include/bitcask/text_utils.hpp`、`src/text/analyzer.cpp`
   - **已完成（2026-06-23）**：加出参版 `to_codepoints(text, out&)` + `to_codepoints_reuse()`
     （thread_local 复用 + 防膨胀 shrink 守卫，对齐 read_buf 策略）。Ngram/Whitespace
@@ -765,6 +768,9 @@
 ---
 
 ## 建议执行顺序
+
+> **⚠️ 本节为历史记录（截至 2026-06-25，所列各波均已完成）。当前执行顺序见文末
+> 「S29 批次 → 建议执行顺序」（2026-07-10）。**
 
 **下一波建议（按依赖关系）**：
 
@@ -3107,7 +3113,8 @@ W4 ✅（parallel_scan 并行全表扫描）。
 
 ### P1 ② catch-all 可配置（多字段倒排减半）
 
-- [ ] **S26-2 `index_catch_all` 配置开关** · `text_plugin_config.hpp` + `search_config.hpp` + `src/search/text_plugin.cpp`
+- [x] **S26-2 `index_catch_all` 配置开关** — 已完成（2026-07-09，`text_plugin_config.hpp:31` +
+  CatchAllDisabled 测试，见下方验证节）· `text_plugin_config.hpp` + `search_config.hpp` + `src/search/text_plugin.cpp`
   - 现状：`map_analyze`（text_plugin.cpp:145-181）**无条件**把非默认字段词项合并进
     默认字段（catch-all），使 `search_text/phrase/near`（只查默认字段）也能命中多字段
     文档。代价：每个词 `add_doc` 两遍 → reducer 工作量 ×2、posting 内存 ×2、`bm25.ckpt` ×2。
@@ -3120,12 +3127,12 @@ W4 ✅（parallel_scan 并行全表扫描）。
 
 ### P1 ③ 削减每文档分配抖动
 
-- [ ] **S26-3a `map_analyze` 高亮正文深拷按需化** · `src/search/text_plugin.cpp`
+- [x] **S26-3a `map_analyze` 高亮正文深拷按需化** — 已完成（2026-07-09，`text_plugin.cpp:223`）· `src/search/text_plugin.cpp`
   - 现状：`job.doc_text = std::string(fields.front().second)`（:183）**无条件深拷整段正文**
     （O(V)/doc），即便高亮 LRU 关闭（`doc_text_cache_max==0`，`apply_job_impl` put 恒被丢弃）。
   - 改动：`doc_text_cache_max==0` 时跳过该拷贝（置空）。config 语义本就是「0 → 高亮降级
     无片段」，行为不变；大 V 下省一次整文档 memcpy + 分配。
-- [ ] **S26-3b `job.fields.reserve`** · `src/search/text_plugin.cpp`
+- [x] **S26-3b `job.fields.reserve`** — 已完成（2026-07-09，`text_plugin.cpp:179`）· `src/search/text_plugin.cpp`
   - `map_analyze` 循环前 `job.fields.reserve(fields.size())`，免 vector 逐字段扩容。
 - [ ] **S26-3c（待办，未纳本批）`ord_field_lens_` 结构** · `text_plugin.hpp:368`
   - 按 ord 单调递增的 `unordered_map<uint64_t, vector<...>>`，随 live doc 线性堆积（on_delete
@@ -3190,8 +3197,8 @@ W4 ✅（parallel_scan 并行全表扫描）。
     `SearchHit/ReduceJob.ord` → Lsn。深层内部（posting 编码/SIMD/HNSW/format）暂留生 uint64，
     强类型强制留待 Stage 3 docid 真正发散时按段代码局部上。
   - 验证：build-clang 545/545、build-rel 构建通过（双树）。零行为变更（别名同型，全调用点无改动即编译）。
-- [ ] **S27-2 段抽象 + 多段读**：复用 InvertedIndex base 当段格式；实装 §3.4 doc_store + §3.5 查询归并。
-  分 4 slice：
+- [x] **S27-2 段抽象 + 多段读** — 已完成（2026-07-09，全 4 slice 见下）：复用 InvertedIndex base
+  当段格式；实装 §3.4 doc_store + §3.5 查询归并。分 4 slice：
   - [x] **Slice 1 外部统计注入（G-on-the-fly enabling primitive）** — 已完成（2026-07-09）·
     `inverted.hpp`/`inverted.cpp` + `inverted_test.cpp`
     - `InvertedIndex` 新增 `ExtStats{N, sum_dl, term→全局 df 的 map}` + `doc_freq(term)` 访问器；
@@ -3234,8 +3241,15 @@ W4 ✅（parallel_scan 并行全表扫描）。
   **S27-2 收官**：段已是能查、能落盘、能校验恢复、能管理生命周期的持久化实体；多段查询与单索引
   逐位等价（G-on-the-fly）。全 4 slice header-only、零回归（553/553 双树）、**未触碰任何现有 live 路径**。
 
-- [ ] **S27-3 段累积替换 delta 链**：checkpoint flush 新段 + 后台 merge。删 delta 链 + 死内存回收。仍单写者。
-- [ ] **S27-4 并行 builder（DWPT）**：多段内单线程 builder，文档分派。**吞吐红利落地。**
+- [ ] **S27-3 段累积替换 delta 链**（**部分完成** 2026-07-09）：checkpoint flush 新段 + 后台 merge。
+  删 delta 链 + 死内存回收。仍单写者。
+  - [x] Slice A/B1/B2a/C 已落地（`ea7794f`/`6148e04`/`3be3f6c`）：SealedSegment 多字段扩展
+    （fields_ map + 多字段 save/load + multi_field_segment_search + mark_dead）、Building 段镜像 +
+    查询 9/9 走 [SegmentSet+Building] 多段归并、delta 链退役（CheckpointDeltaChain×3 测试删除）。
+  - [ ] **剩余 B2b/D/E**：删 fields_ + flush 走段集 + recovery 重写 + legacy 迁移 + 段级 merge。
+    设计已闭合（双 manifest 冲突分析 + 方案 A + 5 步实现计划）：
+    [`docs/design/s27-3-b2b-recovery-design.md`](docs/design/s27-3-b2b-recovery-design.md)。
+- [ ] **S27-4 并行 builder（DWPT）**：多段内单线程 builder，文档分派。**吞吐红利落地。**依赖 S27-3 收官。
 
 ### 关联既有设计（勿重复造轮子）
 - [`ord-recycling-design-zh.md`](doc/ord-recycling-design-zh.md)：ord 三角色 / per-write 硬约束 /
@@ -3257,7 +3271,8 @@ W4 ✅（parallel_scan 并行全表扫描）。
 >
 > `DocInput.text` 注释（`cask.hpp:233`）写"作默认字段"，实现未兑现 → **API 契约违背**。
 
-- [ ] **S28-1 `doc.text` 在多字段模式下索引为 kDefaultField** · `src/search/text_plugin.cpp` + `include/bitcask/text_plugin.hpp`
+- [x] **S28-1 `doc.text` 在多字段模式下索引为 kDefaultField** — 已完成（2026-07-09，`95631e5`，
+  测试 `cask_docvalue_test.cpp` S28-1 用例 + 全量回归绿）· `src/search/text_plugin.cpp` + `include/bitcask/text_plugin.hpp`
   - **prepare()**：多字段路径中 `doc.text` 非空时前置 `{kDefaultField, doc.text}` 到传入 `map_analyze` 的 fields 列表。
   - **map_analyze()**：`index_catch_all` 开启时 kDefaultField 词项也纳入 `ca_data`（不设 `wrote_default`），
     使 `apply_job_impl` 单次 `add_doc(kDefaultField, ca_data)` 写入 doc.text + 命名字段的全部词元；
@@ -3359,25 +3374,39 @@ W4 ✅（parallel_scan 并行全表扫描）。
     `write_buffered`/`batch_buf_` 明确禁用于单条 put（`data_file.hpp:101-103`）。
   - 备选零代码方案：按 key 分片多 Cask 实例（设计文档既有结论，`cask.hpp:13-14`），
     若业务可接受则优先。
-- [ ] **S29-8 CJK 分词双重解码融合 + tf-only 免 positions** · `include/bitcask/text_utils.hpp:47-128`
-    + `src/text/analyzer.cpp:97,170-217`
-  - 病根 ①：纯 CJK 文本每码点被 utf8proc 解码两遍——`nfkc_fold` 快路径整趟 `decode_one`
-    只为校验 inert 随即丢弃字节，`to_codepoints` 再解一遍。直接对应
-    `BM_Text_AnalyzeNgramCjk` 40 MiB/s。
-  - 病根 ②：BM25 tf-only 路径（`Analyzer::analyze` / `index_positions_==false`）从
-    `analyze_with_positions` 派生后丢弃 positions——每唯一 n-gram 一个
-    `vector<uint32_t>` 的构造与分配纯浪费（一篇 CJK 文档数千个）。
-  - 改动：① 融合入口——fold 校验趟直接产出 `CpInfo`（一次解码共用）；② 提供免 positions
-    的 term→tf 计数路径。
-  - 验收：`BM_Text_AnalyzeNgramCjk` / `BM_Text_AnalyzeNgramMixed`。
-- [ ] **S29-9 IndexPool reorder buffer：map → 环形缓冲 + 分配出锁** · `include/bitcask/thread_pool.hpp:274,488-495,535-577,630`
-  - 现状：`IndexLane::pending` 是 `std::map<uint64_t,ReorderEntry>`，每任务在**全局
-    `reorder_mu_` 锁内**做红黑树节点分配（含大对象 IndexTask）；ord 单调递增、reducer 按序
-    消费——环形/滑动窗口教科书场景。附带：reducer `count()`+`extract()` 两次查找；每 apply
-    一条 break 重扫全 lane。
-  - 改动：`(ord - base)` 索引的 deque/环形缓冲（O(1) 免节点分配）；entry 锁外构造、锁内挂接;
-    count+extract 合一次 find。二期：per-lane 锁或 SPSC 回填队列（注释已自认「P4+ 可分片」）。
-  - 对应 `BM_IndexPool_MapSpeedup` 4 线程平台化 + S26-① 并行 reduce 的前置清障。
+- [x] **S29-8 CJK 分词双重解码融合 + tf-only 免 positions** —— 已完成（2026-07-10）·
+    `include/bitcask/text_utils.hpp` + `src/text/analyzer.cpp` + `src/text/jieba_analyzer.cpp`
+    + `include/bitcask/ngram_analyzer.hpp`
+  - **做了**：① 慢路径抽为 `nfkc_map_slow`；新增融合入口 `nfkc_fold_codepoints[_reuse]`
+    ——fold 快路径校验趟直接产出 `CpInfo`（ASCII 记 tolower 后码点，与重解 out 逐位
+    一致），命中即免第二遍 `to_codepoints` 全量重解。接入 Ngram/Whitespace 全部 4 个
+    analyze 入口 + jieba 全文与逐词 2 处。② Ngram 分词主循环抽为共享 `ngram_tokenize`
+    模板，`NgramAnalyzer::analyze` 覆写 tf-only 版（不构造 per-term positions vector；
+    term 集与 tf 与派生版逐位一致，min_token_length/停用词语义共享）。
+  - **实测**：`BM_Text_AnalyzeNgramCjk` 25.1→22.5µs（**-10%**，3 次重复 mean）；
+    CjkHalfwidth -4%；`BM_P7_AnalyzeWithOffsets_Mixed1K` 10.5→9.55µs（-9%）；Mixed 持平。
+  - **修正原估**：`BM_Text_ToCodepointsCjk`=0.86µs vs `NfkcFoldCjk`=5.9µs（同 1K 文本）
+    ——被消的第二遍解码本身只占 analyze 总成本 ~3%，fold 主成本在 **inert 表查询**，
+    analyze 大头在 tokenize+hash 聚合。原分析「双重解码=主瓶颈」高估；-10% 已含
+    tf-only 的分配削减。CJK 分词若要再上量级需动 inert 查询（bitmap/SIMD 化）或
+    n-gram 聚合结构，另立任务评估。
+- [x] **S29-9 IndexPool reorder buffer：map → 环形缓冲 + 分配出锁** —— 已完成（2026-07-10）·
+    `include/bitcask/thread_pool.hpp`
+  - **做了**：`IndexLane::pending`（std::map，每任务锁内 rb-tree 节点分配）→ 环形滑动
+    窗口 `vector<unique_ptr<ReorderEntry>>`：容量 2 的幂 → slot = `ord & (cap-1)`（窗口
+    ≤ 容量 ⇒ 唯一，免 head 指针）；entry 由 map worker **锁外** `make_unique`，锁内 O(1)
+    挂指针；reducer `ring_take_front` 单次槽位取出（原 count+extract 两次查找），锁下
+    推进 ring_base 与 reducer 私有 next_apply_ord 配对。ord < base / 重复 ord 守卫：
+    debug 断言 + release 丢弃并补偿 in_flight（防 flush 悬挂）。窗口上界 ≈ queue 容量 +
+    reorder 在途上限（背压封顶）。
+  - **实测**：`BM_IndexPool_MapSpeedup/8` 41.2→31.6ms（485k→632k/s，**+30%，4 线程
+    平台突破**）；`MultiLibThroughput/1..8` +14~28%；SubmitDrain 116→110ms。
+  - **验收**：build-rel + build-clang 双树 555/555；TSan 树相关并发子集 65/65。
+  - **二期仍开**：per-lane 锁或 SPSC 回填队列（reorder_mu_ 仍全 lane 共享）。
+- [ ] **S29-T（新发现，与本批无关）TSan 树既存失败**：`IndexPoolMultiLib.
+    ThreadCountIndependentOfLibCount` 在 build-tsan 稳定失败（`after_first-before`=3≠2，
+    /proc/self/task 线程计数在 TSan 运行时下多 1）——**git stash 后同样失败，非 S29 引入**。
+    build-clang/build-rel 均绿。疑 TSan 运行时线程计入。低优先：加 TSan 下跳过或放宽断言。
 - [ ] **S29-10 CRC32 流式小块：16-63B CLMUL 内核** · `include/bitcask/hw_crc32.hpp:342,378`
   - 病根已查明：PCLMUL 路径有 `len >= 64` 下限，16B 增量块（hint/WAL 帧场景，
     `crc32_bench.cpp:149`）恒退化为字节表 + 每调用 `has_pclmul_crc32()` 探测/misalign 计算
@@ -3410,8 +3439,14 @@ W4 ✅（parallel_scan 并行全表扫描）。
 
 ### 建议执行顺序
 
-1. S29-1..5（快赢批，均小 diff，一轮 bench 验收）
-2. S29-9（IndexPool，兼为 S26-① 并行 reduce 清障）+ S29-8（CJK，独立）
-3. S29-6 KeyDir seqlock 先行 → 倒排 epoch 二期
+1. ~~S29-1..5（快赢批）~~ **已完成 2026-07-10**（555/555 全绿，HNSW 建图 -10%）
+2. ~~S29-9 + S29-8~~ **已完成 2026-07-10**（MapSpeedup/8 +30% 平台突破、MultiLib +14~28%、
+   AnalyzeNgramCjk -10%；TSan 并发子集 65/65。注意 S29-8 修正原估：双重解码非主瓶颈，
+   CJK 再提速需动 inert 查询/聚合结构。第七梯队 P3 的 `nfkc_fold` API 关联仍在）
+3. S29-6 KeyDir seqlock 先行 → 倒排 epoch 二期（BOW 扩展性根治在此，S29-1 只减半 RMW）
 4. S29-7 group commit（先做 encode 出锁铺垫）
 5. S29-10 / S29-11 按需（CRC 流式场景是否真实存在、HNSW 召回预算)
+
+**与 S27 的关系**：S29 结构性各项与 S27-3 剩余（B2b/D/E recovery 重写）独立可并行；
+S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同属索引吞吐轴,
+建议 S29-9 先行（小)、S27-4 收大头。
