@@ -247,7 +247,8 @@ public:
     // building_/segment_set_ 是 fields_ 的**镜像**（B1 阶段查询仍走 fields_，
     // B2 才切换）。测试用只读视图验证镜像一致性、flush 触发、段级删除。
     [[nodiscard]] const search::SealedSegment* building_segment() const {
-        return building_.get();
+        // 测试钩子:返回裸指针——对象由成员持有,temp shared_ptr 析构无碍。
+        return building_.load(std::memory_order_acquire).get();
     }
     [[nodiscard]] const search::SegmentSet* segment_set() const {
         return segment_set_.get();
@@ -405,8 +406,13 @@ private:
     // 段集初始化(load_component loaded 情形 / open 未 loaded 兜底共用)。
     void init_segment_set(std::string_view dir, bool loaded);
 
-    std::unique_ptr<search::SealedSegment>   building_;     // 当前 Building 段
+    // S27-3 步骤 5:building_ 原子 shared_ptr——封口切换(reducer store)与
+    // 查询读(load)并发;查询经 pin 钉住段对象跨越切换/drop。
+    std::atomic<std::shared_ptr<search::SealedSegment>> building_;
     std::unique_ptr<search::SegmentSet>      segment_set_;  // 已封口活跃段集
+    // S27-3 步骤 5:key_loc_mu_ 保护 map 结构——写者全在 reducer(unique,
+    // 无竞争零代价),explain 在查询线程 find(shared)。search 路径不读此表。
+    mutable std::shared_mutex key_loc_mu_;
     std::unordered_map<std::string, KeyLocation,
                        StringHash, std::equal_to<>> key_to_location_;
 };

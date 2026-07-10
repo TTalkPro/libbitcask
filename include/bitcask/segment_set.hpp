@@ -17,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -56,7 +57,8 @@ public:
         }
         if (!decoded) return nullptr;
         for (const auto& e : set->entries_) {
-            auto seg = SealedSegment::load(join(dir, e.filename));
+            std::shared_ptr<SealedSegment> seg =
+                SealedSegment::load(join(dir, e.filename));
             if (!seg) return nullptr;  // 段损坏 → 整体拒收
             set->segments_.push_back(std::move(seg));
         }
@@ -72,11 +74,12 @@ public:
     // 落盘段文件 + 内存登记。**仅成功时取走所有权**——失败时 seg 留在 caller
     // 手里(修正原 add 按值取走的缺陷:失败路径 caller 拿回的是空指针,
     // Building 段丢失且后续 apply 解引用空 building_)。
-    [[nodiscard]] bool add_pending(std::unique_ptr<SealedSegment>& seg,
+    [[nodiscard]] bool add_pending(std::shared_ptr<SealedSegment>& seg,
                                    std::uint64_t hi_lsn) {
         const std::uint64_t id = next_seg_id_;
         const std::string fname = "seg-" + std::to_string(id) + ".seg";
         if (!seg->save(join(dir_, fname), hi_lsn)) return false;
+        std::unique_lock lk(list_mu_);  // 结构变更 vs 查询 snapshot
         entries_.push_back(Entry{fname, id, hi_lsn, seg->doc_count()});
         segments_.push_back(std::move(seg));
         ++next_seg_id_;
@@ -87,10 +90,12 @@ public:
     // 崩溃窗口只留孤儿段文件,open 忽略;原 drop 反序有「清单仍列已删文件
     // → open 整体拒收 → 退全量重建」窗口,顺带修正)。
     [[nodiscard]] bool drop_pending(std::uint64_t seg_id) {
+        std::unique_lock lk(list_mu_);  // 结构变更 vs 查询 snapshot
         for (std::size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].seg_id != seg_id) continue;
             pending_unlink_.push_back(entries_[i].filename);
             entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
+            // 段对象由在途查询的 shared_ptr 引用续命(pin),此处只摘列表。
             segments_.erase(segments_.begin() + static_cast<std::ptrdiff_t>(i));
             return true;
         }
@@ -115,10 +120,11 @@ public:
     }
 
     // 兼容包装(既有测试/独立使用):pending + 立即 commit。
-    [[nodiscard]] bool add(std::unique_ptr<SealedSegment> seg,
+    [[nodiscard]] bool add(std::shared_ptr<SealedSegment> seg,
                            std::uint64_t hi_lsn) {
         if (!add_pending(seg, hi_lsn)) return false;
         if (!commit()) {  // 提交失败 → 回滚内存态（段文件残留由下次 open 忽略）
+            std::unique_lock lk(list_mu_);
             entries_.pop_back();
             segments_.pop_back();
             return false;
@@ -167,9 +173,29 @@ public:
         }
         return nullptr;
     }
-    // 当前活跃段列表（只读视图，查询归并 / 测试用）。
-    [[nodiscard]] std::span<const std::unique_ptr<SealedSegment>>
+    // 当前活跃段列表原始视图——**仅限 reducer/单线程上下文**(rebuild/
+    // compact/save;查询线程必须走 snapshot(),否则与 add/drop 并发 UAF)。
+    [[nodiscard]] std::span<const std::shared_ptr<SealedSegment>>
     segments_view() const { return segments_; }
+
+    // S27-3 步骤 5:查询侧按 seg_id 取段(shared 锁 + shared_ptr 钉住)。
+    [[nodiscard]] std::shared_ptr<const SealedSegment>
+    segment_ref(std::uint64_t seg_id) const {
+        std::shared_lock lk(list_mu_);
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].seg_id == seg_id) return segments_[i];
+        }
+        return nullptr;
+    }
+
+    // S27-3 步骤 5:查询侧快照——shared 锁下拷贝 shared_ptr 列表,查询全程
+    // 钉住段对象(并发 drop 只摘列表,对象由引用续命)。
+    [[nodiscard]] std::vector<std::shared_ptr<const SealedSegment>>
+    snapshot() const {
+        std::shared_lock lk(list_mu_);
+        return std::vector<std::shared_ptr<const SealedSegment>>(
+            segments_.begin(), segments_.end());
+    }
     // 清单条目视图(与 segments_view 平行;key_to_location_ 重建需 seg_id)。
     [[nodiscard]] std::span<const Entry> entries_view() const { return entries_; }
 
@@ -186,7 +212,8 @@ public:
         set->dir_ = dir;
         if (!set->decode_manifest(payload)) return nullptr;
         for (const auto& e : set->entries_) {
-            auto seg = SealedSegment::load(join(dir, e.filename));
+            std::shared_ptr<SealedSegment> seg =
+                SealedSegment::load(join(dir, e.filename));
             if (!seg) return nullptr;
             set->segments_.push_back(std::move(seg));
         }
@@ -286,8 +313,14 @@ private:
 
     std::string   dir_;
     std::uint64_t next_seg_id_ = 0;
+    // S27-3 步骤 5:并发契约——entries_/segments_ 的**结构**变更(add/drop)
+    // 由 list_mu_ 保护 vs 查询线程 snapshot;段本体 shared_ptr(查询快照
+    // 钉住,drop 后对象由在途查询的引用续命——UAF 防护:flush_building 封口
+    // /段压实 drop 都可能与查询并发)。值内操作(mark_dead/compact/add_doc)
+    // 是 reducer 单写者,不经此锁。
+    mutable std::shared_mutex list_mu_;
     std::vector<Entry> entries_;                              // 与 segments_ 平行
-    std::vector<std::unique_ptr<SealedSegment>> segments_;
+    std::vector<std::shared_ptr<SealedSegment>> segments_;
     std::vector<std::string> pending_unlink_;  // drop_pending → commit 后删
 };
 

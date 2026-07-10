@@ -59,6 +59,7 @@ struct FieldSegmentView {
 struct MultiFieldSegmentView {
     const SealedSegment*         seg;        // 段（LiveChecker + docid→key/lsn）
     std::vector<FieldSegmentView> fields;    // 该段所有字段倒排
+    std::shared_ptr<const void>  pin;        // S27-3 步骤 5:段生命周期钉住
 };
 
 class SealedSegment : public bm25::LiveChecker {
@@ -180,6 +181,23 @@ public:
         live_[docid].store(0, std::memory_order_relaxed);
         dead_dirty_ = true;  // S27-3 B2b 步骤 4:待重存(见 dead_dirty 注释)
         return true;
+    }
+
+    // S27-3 步骤 5:原地 posting 压实——postings 删死 docid(doc_store 行
+    // 不动,docid 稠密不变量保持;df/N/sum_dl 随 compact 归正)。字节变了 →
+    // 置 dead_dirty_ 令下次 checkpoint 重存。调用契约:reducer 静止点
+    // (compact 遍历 tbb map 与并发 add_doc 不兼容,同旧 fields_ 约束;
+    // 并发**查询**安全——CoW posting)。返回压实掉的 posting 数。
+    std::size_t compact_postings(double dead_ratio_threshold) {
+        std::size_t n = inv_.compact(*this, dead_ratio_threshold);
+        {
+            std::shared_lock lk(fields_mu_);
+            for (auto& [name, inv] : fields_) {
+                n += inv->compact(*this, dead_ratio_threshold);
+            }
+        }
+        if (n > 0) dead_dirty_ = true;
+        return n;
     }
 
     // S27-3 B2b 步骤 4:自上次 save 后是否有新的 mark_dead。live_ 位随

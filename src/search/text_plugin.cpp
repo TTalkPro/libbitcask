@@ -52,7 +52,8 @@ TextPlugin::TextPlugin(const TextPluginConfig& config,
     , synonym_map_(config.synonym_map) {
     // S27-3 步骤 3:building_ 在构造期即建——fields_ 退役后它是唯一写入
     // 目标,独立用法(shim/单测,不走 plugin open)也必须可写。
-    building_ = std::make_unique<search::SealedSegment>();
+    building_.store(std::make_shared<search::SealedSegment>(),
+                    std::memory_order_release);
 }
 
 TextPlugin::TextPlugin(const TextPluginConfig& config,
@@ -102,27 +103,40 @@ void TextPlugin::apply_text(std::string_view key, std::uint64_t ord,
     // 覆盖写先 mark_dead 旧 docid（段级 is_live 不知道宿主覆盖,B2a）。
     // 重放幂等:恢复重放 = 同 key 重加——rebuild_key_locations(步骤 4)
     // 使旧副本可定位,mark_dead 后恒一份 live,无需 ord 显式门。
-    if (building_ && !term_data.empty()) {
+    auto bld = building_.load(std::memory_order_acquire);
+    if (bld && !term_data.empty()) {
         seg_dirty_ = true;  // 步骤 3:段侧脏标记(flush 决策)
-        if (auto it = key_to_location_.find(std::string(key));
-            it != key_to_location_.end()) {
-            if (it->second.in_building) {
-                (void)building_->mark_dead(it->second.docid);
+        KeyLocation prior{};
+        bool have_prior = false;
+        {
+            std::shared_lock lk(key_loc_mu_);
+            if (auto it = key_to_location_.find(std::string(key));
+                it != key_to_location_.end()) {
+                prior = it->second;
+                have_prior = true;
+            }
+        }
+        if (have_prior) {
+            if (prior.in_building) {
+                (void)bld->mark_dead(prior.docid);
             } else if (segment_set_) {
-                if (auto* seg = segment_set_->segment(it->second.seg_id)) {
-                    (void)seg->mark_dead(it->second.docid);
+                if (auto* seg = segment_set_->segment(prior.seg_id)) {
+                    (void)seg->mark_dead(prior.docid);
                 }
             }
         }
         const TermPositionsMap* borrowed = &term_data;
         const search::SealedSegment::FieldInput fin{search::kDefaultField,
                                                      borrowed};
-        const DocId docid = building_->add(
+        const DocId docid = bld->add(
             std::string(key), ord,
             std::span<const search::SealedSegment::FieldInput>(&fin, 1),
             doc_len);
-        key_to_location_[std::string(key)] = KeyLocation{true, 0, docid};
-        if (building_->doc_count() >= kBuildingFlushDocThreshold) {
+        {
+            std::unique_lock lk(key_loc_mu_);
+            key_to_location_[std::string(key)] = KeyLocation{true, 0, docid};
+        }
+        if (bld->doc_count() >= kBuildingFlushDocThreshold) {
             flush_building();
         }
     }
@@ -254,15 +268,25 @@ void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
     for (const auto& [term, data] : job.ca_data) changed_terms.push_back(term);
 
     // S27-3 步骤 3:唯一写入路径(原 B1「镜像」转正)+ B2a:覆盖写先 mark_dead。
-    if (building_) {
+    auto bld = building_.load(std::memory_order_acquire);
+    if (bld) {
         seg_dirty_ = true;
-        if (auto it = key_to_location_.find(std::string(job.key));
-            it != key_to_location_.end()) {
-            if (it->second.in_building) {
-                (void)building_->mark_dead(it->second.docid);
+        KeyLocation prior{};
+        bool have_prior = false;
+        {
+            std::shared_lock lk(key_loc_mu_);
+            if (auto it = key_to_location_.find(std::string(job.key));
+                it != key_to_location_.end()) {
+                prior = it->second;
+                have_prior = true;
+            }
+        }
+        if (have_prior) {
+            if (prior.in_building) {
+                (void)bld->mark_dead(prior.docid);
             } else if (segment_set_) {
-                if (auto* seg = segment_set_->segment(it->second.seg_id)) {
-                    (void)seg->mark_dead(it->second.docid);
+                if (auto* seg = segment_set_->segment(prior.seg_id)) {
+                    (void)seg->mark_dead(prior.docid);
                 }
             }
         }
@@ -277,11 +301,14 @@ void TextPlugin::apply_job_impl(const ReduceJob& job, std::string&& doc_text) {
             fin.push_back({search::kDefaultField, &job.ca_data});
         }
         if (!fin.empty()) {
-            const DocId docid = building_->add(std::string(job.key), job.ord,
-                                                fin, job.total_doc_len);
-            key_to_location_[std::string(job.key)] =
-                KeyLocation{true, 0, docid};
-            if (building_->doc_count() >= kBuildingFlushDocThreshold) {
+            const DocId docid = bld->add(std::string(job.key), job.ord,
+                                          fin, job.total_doc_len);
+            {
+                std::unique_lock lk(key_loc_mu_);
+                key_to_location_[std::string(job.key)] =
+                    KeyLocation{true, 0, docid};
+            }
+            if (bld->doc_count() >= kBuildingFlushDocThreshold) {
                 flush_building();
             }
         }
@@ -331,16 +358,27 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
     }
 
     // S27-3 Slice B1：段级删除镜像（fields_ remove_doc 上面已做）。
-    if (auto it = key_to_location_.find(std::string(key));
-        it != key_to_location_.end()) {
-        if (it->second.in_building) {
-            if (building_) (void)building_->mark_dead(it->second.docid);
+    KeyLocation prior{};
+    bool have_prior = false;
+    {
+        std::unique_lock lk(key_loc_mu_);
+        if (auto it = key_to_location_.find(std::string(key));
+            it != key_to_location_.end()) {
+            prior = it->second;
+            have_prior = true;
+            key_to_location_.erase(it);
+        }
+    }
+    if (have_prior) {
+        if (prior.in_building) {
+            if (auto bld = building_.load(std::memory_order_acquire)) {
+                (void)bld->mark_dead(prior.docid);
+            }
         } else if (segment_set_) {
-            if (auto* seg = segment_set_->segment(it->second.seg_id)) {
-                (void)seg->mark_dead(it->second.docid);
+            if (auto* seg = segment_set_->segment(prior.seg_id)) {
+                (void)seg->mark_dead(prior.docid);
             }
         }
-        key_to_location_.erase(it);
     }
 
     maybe_auto_compact();  // S12-2
@@ -355,13 +393,17 @@ void TextPlugin::rebuild_index(
     // building_(key 经 docmap ord→ext 反查——回调只给 (ord, text))。
     rebase_needed_.store(true, std::memory_order_relaxed);  // S18-6/S14-4
     doc_texts_.clear();
-    key_to_location_.clear();
+    {
+        std::unique_lock lk(key_loc_mu_);
+        key_to_location_.clear();
+    }
     if (segment_set_) {
         std::vector<std::uint64_t> ids;
         for (const auto& e : segment_set_->entries_view()) ids.push_back(e.seg_id);
         for (auto id : ids) (void)segment_set_->drop_pending(id);
     }
-    building_ = std::make_unique<search::SealedSegment>();
+    building_.store(std::make_shared<search::SealedSegment>(),
+                    std::memory_order_release);
     seg_dirty_ = true;
 
     for_each_doc([&](std::uint64_t ord, const std::string& text) {
@@ -374,13 +416,17 @@ void TextPlugin::rebuild_index(
         const TermPositionsMap* borrowed = &term_data;
         const search::SealedSegment::FieldInput fin{search::kDefaultField,
                                                      borrowed};
-        const DocId docid = building_->add(
+        auto bld = building_.load(std::memory_order_acquire);
+        const DocId docid = bld->add(
             *key, ord,
             std::span<const search::SealedSegment::FieldInput>(&fin, 1),
             doc_len);
-        key_to_location_[*key] = KeyLocation{true, 0, docid};
+        {
+            std::unique_lock lk(key_loc_mu_);
+            key_to_location_[*key] = KeyLocation{true, 0, docid};
+        }
         doc_texts_.put(ord, text);
-        if (building_->doc_count() >= kBuildingFlushDocThreshold) {
+        if (bld->doc_count() >= kBuildingFlushDocThreshold) {
             flush_building();
         }
     });
@@ -388,10 +434,39 @@ void TextPlugin::rebuild_index(
     cache_.invalidate();
 }
 
-// S27-3 步骤 3:fields_ 压实退役——段模型下死文档回收 = 段级 merge
-// (步骤 5,on_merge_commit 接线);保留 API(shim/测试)恒零。
-std::size_t TextPlugin::compact(double) {
-    return 0;
+// S27-3 步骤 5:段世界压实——① building 原地删死 posting;② 全死段整段
+// drop(posting 全量回收;文件在下一次 checkpoint commit 删);③ 带死段原地
+// 压实(dead_dirty → 下次 checkpoint 重存)。跨段合并(Lucene consolidation,
+// 段数收敛)与 legacy 段化迁移留待 S27-4 era(需 InvertedIndex 词表遍历原语)。
+// 调用契约:reducer 静止点(compact 遍历 tbb map 与并发 add_doc 不兼容——
+// on_merge_commit 经 run_serialized、auto 路径在 apply 内,均满足)。
+std::size_t TextPlugin::compact(double dead_ratio_threshold) {
+    std::size_t total = 0;
+    if (auto bld = building_.load(std::memory_order_acquire)) {
+        total += bld->compact_postings(dead_ratio_threshold);
+    }
+    if (segment_set_) {
+        std::vector<std::uint64_t> dead_ids;
+        const auto entries = segment_set_->entries_view();
+        const auto segs = segment_set_->segments_view();  // reducer 上下文
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            if (segs[i]->live_doc_count() == 0) {
+                total += segs[i]->inverted().total_postings();
+                dead_ids.push_back(entries[i].seg_id);
+            } else {
+                total += segs[i]->compact_postings(dead_ratio_threshold);
+            }
+        }
+        for (auto id : dead_ids) {
+            (void)segment_set_->drop_pending(id);  // 清单/文件随下次 ckpt commit
+        }
+    }
+    if (total > 0) {
+        rebase_needed_.store(true, std::memory_order_relaxed);
+        seg_dirty_ = true;
+        cache_.invalidate();
+    }
+    return total;
 }
 
 std::size_t TextPlugin::total_postings() const {
@@ -402,12 +477,23 @@ std::size_t TextPlugin::total_postings() const {
             n += s->inverted().total_postings();
         }
     }
-    if (building_) n += building_->inverted().total_postings();
+    if (auto bld = building_.load(std::memory_order_acquire)) {
+        n += bld->inverted().total_postings();
+    }
     return n;
 }
 
 void TextPlugin::maybe_auto_compact() {
-    // 步骤 3:随 compact 退役(死回收改由段级 merge 承担,步骤 5)。
+    // S27-3 步骤 5:复活(S12-2 原节流逻辑,目标换段世界 compact)。
+    const double thr = config_.auto_compact_dead_ratio;
+    if (thr <= 0.0) return;  // opt-in 关（默认）→ 零开销
+
+    const std::uint64_t retired = stats_.retired_since_compact();
+    if (retired < kAutoCompactMinDeaths) return;      // 常态早退
+    if (retired < stats_.live_docs() / 2) return;     // 随 live 规模缩放
+
+    compact(thr);  // reducer 线程内串行 → 与 add_doc/put_doc 无并发窗口
+    stats_.reset_retired_since_compact();
 }
 
 // ---- 查询面（自 SearchLayer 平移，S18-4）----
@@ -436,50 +522,50 @@ std::vector<SearchHit> TextPlugin::materialize_hits(
 // ---- S27-3 Slice B2a：[SegmentSet + Building] 多段视图收集 ----
 std::vector<search::SegmentView>
 TextPlugin::collect_default_segment_views() const {
+    // S27-3 步骤 5:查询侧走 snapshot(shared 锁下拷 shared_ptr)+ pin——
+    // 段封口(building 切换)/段压实 drop 与查询并发,对象由 pin 续命。
     std::vector<search::SegmentView> views;
-    std::size_t seg_total = 0;
     if (segment_set_) {
-        const auto segs = segment_set_->segments_view();
-        views.reserve(segs.size() + (building_ ? 1 : 0));
-        for (const auto& s : segs) {
-            const search::SealedSegment* seg = s.get();
+        auto snap = segment_set_->snapshot();
+        views.reserve(snap.size() + 1);
+        for (auto& sp : snap) {
+            const search::SealedSegment* seg = sp.get();
             views.push_back(search::SegmentView{
-                &s->inverted(), seg,
+                &seg->inverted(), seg,
                 [seg](DocId d) -> const std::string& { return seg->key_at(d); },
-                [seg](DocId d) -> Lsn { return seg->lsn_at(d); }});
-            seg_total += s->doc_count();
+                [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
+                sp});
         }
     }
-    if (building_ && building_->doc_count() > 0) {
-        const search::SealedSegment* seg = building_.get();
+    if (auto bld = building_.load(std::memory_order_acquire);
+        bld && bld->doc_count() > 0) {
+        const search::SealedSegment* seg = bld.get();
         views.push_back(search::SegmentView{
-            &building_->inverted(), seg,
+            &seg->inverted(), seg,
             [seg](DocId d) -> const std::string& { return seg->key_at(d); },
-            [seg](DocId d) -> Lsn { return seg->lsn_at(d); }});
-        seg_total += building_->doc_count();
+            [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
+            std::move(bld)});
     }
-    // S27-3 步骤 3:fields_ 退化路径删除——段集(+recovery 重写,步骤 4)
-    // 已是唯一真相源;段/清单损坏在 open 时即退全量 fold 重建段集。
-    (void)seg_total;
     return views;
 }
 
 std::vector<search::MultiFieldSegmentView>
 TextPlugin::collect_multi_field_segment_views() const {
+    // S27-3 步骤 5:同 collect_default_segment_views——snapshot + pin。
     std::vector<search::MultiFieldSegmentView> views;
-    std::size_t seg_total = 0;
     if (segment_set_) {
-        for (const auto& s : segment_set_->segments_view()) {
-            views.push_back(s->multi_view());
-            seg_total += s->doc_count();
+        for (auto& sp : segment_set_->snapshot()) {
+            auto v = sp->multi_view();
+            v.pin = sp;
+            views.push_back(std::move(v));
         }
     }
-    if (building_ && building_->doc_count() > 0) {
-        views.push_back(building_->multi_view());
-        seg_total += building_->doc_count();
+    if (auto bld = building_.load(std::memory_order_acquire);
+        bld && bld->doc_count() > 0) {
+        auto v = bld->multi_view();
+        v.pin = std::move(bld);
+        views.push_back(std::move(v));
     }
-    // S27-3 步骤 3:fields_ 退化路径删除(同 collect_default_segment_views)。
-    (void)seg_total;
     return views;
 }
 
@@ -743,16 +829,27 @@ TextPlugin::explain(std::string_view query, std::string_view key,
 
     // S27-3 Slice B2a：段级 explain（用 key_to_location_ 找段，段内 LiveChecker）。
     // drain_plugins 提供 HB（reducer 写 key_to_location_ 先于查询读）。
-    if (auto it = key_to_location_.find(std::string(key));
-        it != key_to_location_.end()) {
-        const search::SealedSegment* seg = nullptr;
-        if (it->second.in_building) {
-            seg = building_.get();
+    // S27-3 步骤 5:key_loc_mu_ shared 下取定位快照 + shared_ptr 钉住段
+    // 对象(查询线程 vs reducer 写表/封口/drop 全并发安全)。
+    KeyLocation loc{};
+    bool have_loc = false;
+    {
+        std::shared_lock lk(key_loc_mu_);
+        if (auto it = key_to_location_.find(std::string(key));
+            it != key_to_location_.end()) {
+            loc = it->second;
+            have_loc = true;
+        }
+    }
+    if (have_loc) {
+        std::shared_ptr<const search::SealedSegment> seg;
+        if (loc.in_building) {
+            seg = building_.load(std::memory_order_acquire);
         } else if (segment_set_) {
-            seg = segment_set_->segment(it->second.seg_id);
+            seg = segment_set_->segment_ref(loc.seg_id);
         }
         if (seg) {
-            return seg->inverted().explain(terms, it->second.docid, *seg,
+            return seg->inverted().explain(terms, loc.docid, *seg,
                                             params_override);
         }
     }
@@ -1072,7 +1169,8 @@ plugin::PluginStatus TextPlugin::open(const plugin::OpenContext& ctx) {
     if (!dir_.empty() && !r.loaded) {
         init_segment_set(dir_, /*loaded=*/false);
     }
-    building_ = std::make_unique<search::SealedSegment>();
+    building_.store(std::make_shared<search::SealedSegment>(),
+                    std::memory_order_release);
 
     return plugin::PluginStatus::kOk;
 }
@@ -1081,6 +1179,7 @@ plugin::PluginStatus TextPlugin::open(const plugin::OpenContext& ctx) {
 // 按段集序(seg_id 升序 == 清单序)遍历,段内 docid 升序 == LSN 升序 →
 // 同 key 后写天然覆盖前写;只登记 live 文档(dead 槽位无删除/覆盖价值)。
 void TextPlugin::rebuild_key_locations() {
+    std::unique_lock lk(key_loc_mu_);
     key_to_location_.clear();
     if (!segment_set_) return;
     const auto entries = segment_set_->entries_view();
@@ -1138,36 +1237,37 @@ void TextPlugin::on_merge_commit(const plugin::MergeCommitEvent&) {
 // 空 building_ / 无 segment_set_ 直接 no-op。失败兜底：add 失败（盘错误等）
 // → building_ 物归原主，下次再试；不抛异常（reducer 不能挂）。
 void TextPlugin::flush_building() {
-    if (!building_ || building_->doc_count() == 0) return;
+    auto sealed = building_.load(std::memory_order_acquire);
+    if (!sealed || sealed->doc_count() == 0) return;
     if (!segment_set_) return;
 
-    std::uint64_t hi_lsn = 0;
-    if (building_->doc_count() > 0) {
-        hi_lsn = building_->lsn_at(
-            static_cast<DocId>(building_->doc_count() - 1));
-    }
+    const std::uint64_t hi_lsn =
+        sealed->lsn_at(static_cast<DocId>(sealed->doc_count() - 1));
 
-    // S27-3 B2b 步骤 1:add_pending——段文件落盘 + 内存登记,清单提交延后
-    // 到 checkpoint(save_component_base 统一 commit)。add_pending 仅成功时
-    // 取走所有权,失败路径 building_ 真·物归原主(原 add 按值取走,失败时
-    // 这里恢复的是 moved-from 空指针——建段丢失 + 后续 apply 解引用空
-    // building_,既存缺陷顺带修正)。
-    auto sealed = std::move(building_);
-    if (!segment_set_->add_pending(sealed, hi_lsn)) {
-        building_ = std::move(sealed);  // 物归原主
+    // S27-3 步骤 5 并发序:先切空 building(查询对 sealed 内文档出现微秒级
+    // 不可见窗口——NRT 语义可接受;反序会出现「building+段集同现」的双份
+    // 命中,更糟)。add_pending 失败回滚恢复可见(reducer 单写者,无并发
+    // add 丢失)。步骤 1 缺陷修正保留:失败时段不丢失。
+    building_.store(std::make_shared<search::SealedSegment>(),
+                    std::memory_order_release);
+    auto pending = sealed;  // add_pending 成功时取走;失败时本地引用仍在
+    if (!segment_set_->add_pending(pending, hi_lsn)) {
+        building_.store(std::move(sealed), std::memory_order_release);  // 回滚
         return;
     }
 
     // 推进 key_to_location_：所有 in_building=true 的项改 in_building=false。
     const std::uint64_t sealed_seg_id = segment_set_->next_seg_id() - 1;
-    for (auto& [k, loc] : key_to_location_) {
-        if (loc.in_building) {
-            loc.in_building = false;
-            loc.seg_id      = sealed_seg_id;
+    {
+        std::unique_lock lk(key_loc_mu_);
+        for (auto& [k, loc] : key_to_location_) {
+            if (loc.in_building) {
+                loc.in_building = false;
+                loc.seg_id      = sealed_seg_id;
+            }
         }
     }
-
-    building_ = std::make_unique<search::SealedSegment>();
+    seg_dirty_ = true;
 }
 
 }  // namespace bitcask::text

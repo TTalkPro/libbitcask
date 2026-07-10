@@ -222,6 +222,23 @@ std::vector<std::string> collect_term_keys(
     return keys;
 }
 
+// S27-3 步骤 5:TSan 注解——mutable_pl 的 CoW 协议(use_count==1 + acquire
+// fence,与读者 shared_ptr 析构的 release 递减配对)语义正确,但 TSan 不建模
+// atomic_thread_fence → 持引用出锁的读者(S29-1 BOW 快照 / phrase 零拷贝读)
+// 与写者原地追加被误报 race。注解把协议边显式告知 TSan,零行为变化。
+#if defined(__SANITIZE_THREAD__) || \
+    (defined(__has_feature) && __has_feature(thread_sanitizer))
+extern "C" void __tsan_acquire(void*);
+extern "C" void __tsan_release(void*);
+#define BITCASK_PL_TSAN_ACQUIRE(p) \
+    __tsan_acquire(const_cast<void*>(static_cast<const void*>(p)))
+#define BITCASK_PL_TSAN_RELEASE(p) \
+    __tsan_release(const_cast<void*>(static_cast<const void*>(p)))
+#else
+#define BITCASK_PL_TSAN_ACQUIRE(p) (void)(p)
+#define BITCASK_PL_TSAN_RELEASE(p) (void)(p)
+#endif
+
 // P2-min CoW：返回可安全原地修改的 PostingList。调用方必须持有该桶的写
 // accessor。读者只能在桶读锁下取得 shared_ptr 引用（与写 accessor 互斥），
 // 因此 use_count()==1 ⟺ 当前无 phrase/near 读者持引用 → 原地改安全；
@@ -236,6 +253,7 @@ PostingList& mutable_pl(std::shared_ptr<PostingList>& sp) {
         sp = std::make_shared<PostingList>(*sp);
     } else {
         std::atomic_thread_fence(std::memory_order_acquire);
+        BITCASK_PL_TSAN_ACQUIRE(sp.get());  // fence 协议对 TSan 显式化
     }
     return *sp;
 }
@@ -463,7 +481,13 @@ auto InvertedIndex::search(
     pls_pool.clear();
     struct ReleaseRefs {
         std::vector<std::shared_ptr<const PostingList>>& v;
-        ~ReleaseRefs() { v.clear(); }
+        ~ReleaseRefs() {
+            // TSan 注解:最后一次数据读 → release → 写者 fence-acquire 配对。
+            for (const auto& p : v) {
+                if (p) BITCASK_PL_TSAN_RELEASE(p.get());
+            }
+            v.clear();
+        }
     } release_refs{pls_pool};
     std::size_t total_postings = 0;
     for (auto& term : query_terms) {
@@ -878,6 +902,14 @@ auto InvertedIndex::search_phrase_impl(
         std::shared_ptr<const PostingList> pl;
     };
     std::vector<TermPostings> tps;
+    struct ReleaseTps {  // TSan 注解(同 search 的 ReleaseRefs)
+        std::vector<TermPostings>& v;
+        ~ReleaseTps() {
+            for (const auto& t : v) {
+                if (t.pl) BITCASK_PL_TSAN_RELEASE(t.pl.get());
+            }
+        }
+    } release_tps{tps};
     tps.reserve(query_terms.size());
 
     for (auto& term : query_terms) {

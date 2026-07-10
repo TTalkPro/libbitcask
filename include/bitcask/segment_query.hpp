@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <span>
 #include <string>
 #include <utility>
@@ -31,6 +32,9 @@ struct SegmentView {
     const bm25::LiveChecker*          live;    // 段内 live/doc_len（本地 docid）
     std::function<std::string(DocId)> key_of;  // 本地 docid → 外部 key
     std::function<Lsn(DocId)>         lsn_of;  // 本地 docid → 全局 LSN
+    // S27-3 步骤 5:段生命周期钉住——查询期间段可能被并发 drop(段压实)/
+    // 封口替换,view 持 shared_ptr 保段存活(见 SegmentSet 快照 API)。
+    std::shared_ptr<const void>       pin;
 };
 
 // §3.5 多段查询：① 跨段聚合全局 N/sum_dl/df（G-on-the-fly）② 串行逐段用**同一
