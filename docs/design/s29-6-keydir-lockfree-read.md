@@ -1,9 +1,12 @@
 # S29-6 设计:KeyDir 读路径「零共享写」(epoch-RCU + 乐观读)
 
-> 状态:**已评审(2026-07-10),P1+P2 已落地(558/558;ASan 137/137;
-> TSan 135/135;bench 零回归),P3+P4 待实施**。评审决议见 §5。
-> P2 产物:`include/bitcask/epoch_reclaim.hpp`(通用注册表,seq_cst 交错
-> 论证见其文件头)+ Shard::Limbo 三池 + LimboAllocator + erase 零 free 化。
+> 状态:**全部落地(2026-07-10)**。P1+P2+P3+P4 完成,§6.3 评审选 A(自建表
+> `seq_shard_table.hpp`)。实测:Get 多线程 CPU 1→8 线程 43.9→44.6ns 完全平坦
+> (原 37.8→63.7 退化),8 线程吞吐 +43%;单线程 +16% 固定成本(运行期开关
+> 可退)。验收:clang 560/560、TSan 123/123 零 race、ASan 125/125、GCC -O2
+> 独立压力 55M gets 零异常。实现期抓获 5 缺陷(嵌套 seq 偶数破洞 / SSO
+> mismatch 未验 / GCC TBAA 陈旧读 / TSan 拦截器绕豁免 / 析构序泄漏),
+> 详见 TASK.md S29-6 条目与表头注释。倒排桶锁二期可复用本表 + epoch 注册表。
 > 2026-07-10 实现前审计发现原 TASK.md sketch(「每 shard seqlock + POD 乐观
 > 拷贝,fold 态回退加锁」)**不成立**——本文记录三个致命场景、修正后的设计
 > 与分相计划。

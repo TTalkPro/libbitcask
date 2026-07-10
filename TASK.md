@@ -3388,15 +3388,26 @@ W4 ✅（parallel_scan 并行全表扫描）。
     - P2 期读者未注册 → min_active 恒 max → 达阈值即全清,行为等价即时 free,零语义变化。
     - 验收：clang 558/558；ASan keydir/cask/snapshot 137/137；TSan 135/135；
       `BM_KeyDir_*` 全部在基线噪声带内（Get 32ns / Put 61ns,零回归）。
-  - [ ] **P3 get 乐观快路径 + 运行期开关**——⚠️ **实现前审计（2026-07-10）发现第二个
-    设计缺口,已阻断**：① 混代越界（OOB-mixing）——seq 校验在 deref 之后,grow 时
-    新桶 idx × 旧 values 指针可越界到 limbo 块之外 → 段错误,limbo 只保证块存活不保证
-    越界落在块内；② 健全配方 = 逐跳 copy→seq 验证→使用（x86 TSO,详设计 §6.2），但
-    需要桶数组指针/探测布局——**ankerl 全 private 且是 submodule,无法健全实现**。
-    出路（设计 §6.3）：A（建议）自建开放寻址 shard 表（seqlock 原生、self-describing
-    块,即倒排二期「换表」前置,一次投入两处收益,~1-2 会话）/ B fork ankerl（长期
-    负债）/ C 冻结在 P1+P2（两相独立无害）。**待用户决策。**
-  - [ ] **P4 定向压力 + bench 验收**（随 P3）
+  - [x] **P3+P4 已完成（2026-07-10,评审选 A：自建表）**。新增
+    `include/bitcask/seq_shard_table.hpp`——seqlock 原生开放寻址表替换 Shard 的
+    ankerl map（§6.3 阻断:ankerl 桶内部 private 且是 submodule）：self-describing
+    桶块（块头带 mask,指针/界恒一致,deref 恒 in-bounds）、稠密 pair 数组、
+    backward-shift 删除、表内置 limbo（erase 恒零 free）、深度感知 WriteSection、
+    `try_get_optimistic` 逐跳 copy→seq 验证→使用配方；`KeyDir::get` 快路径
+    （开关/fold 检查 → epoch 槽注册 → 乐观读,Single 判别采纳,Multi/重试 ×3 回退加锁）。
+  - **实测（BM_KeyDir_Get_MultiThreaded CPU）**：1→8 线程 43.9→44.6ns **完全平坦**
+    （基线 37.8→63.7ns 退化 +69%）；4 线程吞吐 +30%、8 线程 **+43%**。单线程 +16%
+    （37.6→43.7ns,槽注册 seq_cst + 拷贝校验固定成本;2 线程起反超,有运行期开关）。
+  - **验收**：clang 全量 560/560（含新 `KeyDirOptimisticRead` 压力 ×2:4 读者 vs
+    put/remove/grow 写者,撕裂检测不变量 offset==ord）；TSan 123/123（零 race）；
+    ASan 125/125；GCC -O2 独立压力 55M gets 零 miss 零 torn。
+  - **实现期抓获并修复的 5 个缺陷**（各有防回归注释/断言,教训已写入表头注释）：
+    ① 嵌套 WriteSection 使 seq 变偶(内层 +1+1)→ 深度感知只最外层 bump;
+    ② SSO 陷阱:key 比较 mismatch 分支未验 seq → 撕裂误判「不同 key」伪 miss;
+    ③ **严格别名违规**:uint64_t* 直读 Bucket/string,GCC -O2 TBAA 读陈旧零值
+    （单线程 100% 伪 miss,clang 宽容差点漏网）→ `__atomic_load_n` 豁免;
+    ④ TSan libc 拦截器:no_sanitize 压不住 memcpy/memcmp 真实调用 → builtin 定长;
+    ⑤ LSan:析构序——values 终末数组 retire 晚于手动 drain → RawLimbo 自析构。
   - ⚠️ P1 单独上线的既知代价：delete-heavy 且长期无写/无 fold 的库,墓碑驻留至下次写触发
     sweep——内存有界（≤1/8 表长 + sweep 滞后量），语义无损。
   - 二期：倒排桶锁复用同一套 epoch 注册表（TBB 桶锁不可下探 → 换表或 thread_local
