@@ -319,9 +319,11 @@ decode_meta(std::span<const std::byte> buf) {
 // 在 meta blob 中查找单个 key，不全量 decode。这是 hot path——
 // HNSW 每访问一个节点过滤时调用一次。
 //
-// 实现策略：一次性线性扫一遍，建立「entry 起始 offset」表；然后在这个
-// offset 表上二分定位 key。对每次调用是 O(n) 预扫 + O(log n) 二分，
-// 整体开销远小于全量 decode（后者还要为每条 string 分配堆内存）。
+// 实现策略（S29-2）：单趟线性扫描，边解析边比较 key。变长编码下任何查找
+// 都必须从头解析（无随机访问），原「预扫建 offset 表 + 二分」的二分建立在
+// 强制 O(n) 预扫之上，纯属额外开销，且每次调用堆分配一个 offsets vector。
+// 现直接在扫描中比较：命中即返回；key 升序（格式不变式，encode_meta
+// assert 兜底）→ 遇 entry key > 目标即可提前退出，平均只扫半程，零分配。
 //
 // 未找到返回 std::monostate。线程安全：是（纯函数，只读 blob）；不需任何锁。
 inline MetaValue meta_lookup(std::span<const std::byte> blob,
@@ -332,15 +334,13 @@ inline MetaValue meta_lookup(std::span<const std::byte> blob,
     }
     auto [n, pos] = detail::vbyte_read(blob, 1);
 
-    std::vector<std::size_t> offsets;
-    offsets.reserve(static_cast<std::size_t>(n));
-
     auto read_varint = [&blob](std::size_t p, std::uint64_t& out) -> std::size_t {
         std::uint64_t v = 0;
         std::uint64_t shift = 0;
         std::size_t q = p;
         while (q < blob.size()) {
-            const auto b = static_cast<std::uint8_t>(blob[q++]);
+            const auto b = static_cast<std::uint8_t>(blob[q]);
+            ++q;
             v |= static_cast<std::uint64_t>(b & 0x7Fu) << shift;
             if (b & 0x80u) { out = v; return q; }
             shift += 7;
@@ -352,16 +352,72 @@ inline MetaValue meta_lookup(std::span<const std::byte> blob,
     std::size_t cur = pos;
     for (std::uint64_t i = 0; i < n; ++i) {
         if (cur >= blob.size()) break;
-        const std::size_t entry_start = cur;
 
         std::uint64_t kl = 0;
         std::size_t p = read_varint(cur, kl);
         if (p == blob.size() || kl > blob.size() - p) break;
+        const std::string_view ek(
+            reinterpret_cast<const char*>(blob.data() + p),
+            static_cast<std::size_t>(kl));
+        const int cmp = ek.compare(key);
+        if (cmp > 0) break;  // key 升序：后续只会更大，提前退出。
         cur = p + static_cast<std::size_t>(kl);
 
         if (cur >= blob.size()) break;
         const auto tag = static_cast<MetaType>(
-            static_cast<std::uint8_t>(blob[cur++]));
+            static_cast<std::uint8_t>(blob[cur]));
+        ++cur;
+
+        if (cmp == 0) {
+            // 命中：就地 decode 单值返回。
+            switch (tag) {
+                case MetaType::Null:
+                    return std::monostate{};
+                case MetaType::Bool:
+                    if (cur >= blob.size()) return std::monostate{};
+                    return static_cast<std::uint8_t>(blob[cur]) != 0;
+                case MetaType::Int64:
+                    if (blob.size() - cur < 8) return std::monostate{};
+                    {
+                        std::uint64_t bits = 0;
+                        for (std::size_t j = 0; j < 8; ++j) {
+                            bits |= static_cast<std::uint64_t>(
+                                        static_cast<std::uint8_t>(blob[cur + j]))
+                                    << (8 * j);
+                        }
+                        std::int64_t v;
+                        std::memcpy(&v, &bits, sizeof(v));
+                        return v;
+                    }
+                case MetaType::Float64:
+                    if (blob.size() - cur < 8) return std::monostate{};
+                    {
+                        std::uint64_t bits = 0;
+                        for (std::size_t j = 0; j < 8; ++j) {
+                            bits |= static_cast<std::uint64_t>(
+                                        static_cast<std::uint8_t>(blob[cur + j]))
+                                    << (8 * j);
+                        }
+                        double v;
+                        std::memcpy(&v, &bits, sizeof(v));
+                        return v;
+                    }
+                case MetaType::String: {
+                    std::uint64_t sl = 0;
+                    std::size_t q = read_varint(cur, sl);
+                    if (q == blob.size() || sl > blob.size() - q) {
+                        return std::monostate{};
+                    }
+                    return std::string(
+                        reinterpret_cast<const char*>(blob.data() + q),
+                        static_cast<std::size_t>(sl));
+                }
+                default:
+                    return std::monostate{};
+            }
+        }
+
+        // cmp < 0：跳过本 entry 的 value，继续扫。
         switch (tag) {
             case MetaType::Null:   break;
             case MetaType::Bool:   if (cur < blob.size()) ++cur; break;
@@ -380,80 +436,6 @@ inline MetaValue meta_lookup(std::span<const std::byte> blob,
                 break;
             }
             default: cur = blob.size(); break;
-        }
-        offsets.push_back(entry_start);
-    }
-
-    const std::size_t m = offsets.size();
-    if (m == 0) return std::monostate{};
-
-    std::size_t lo = 0, hi = m;
-    while (lo < hi) {
-        const std::size_t mid = lo + (hi - lo) / 2;
-        std::uint64_t kl = 0;
-        std::size_t p = read_varint(offsets[mid], kl);
-        if (p == blob.size() || kl > blob.size() - p) {
-            return std::monostate{};
-        }
-        const std::string_view ek(
-            reinterpret_cast<const char*>(blob.data() + p),
-            static_cast<std::size_t>(kl));
-        const int cmp = ek.compare(key);
-        if (cmp == 0) {
-            p += static_cast<std::size_t>(kl);
-            if (p >= blob.size()) return std::monostate{};
-            const auto tag = static_cast<MetaType>(
-                static_cast<std::uint8_t>(blob[p++]));
-            switch (tag) {
-                case MetaType::Null:
-                    return std::monostate{};
-                case MetaType::Bool:
-                    if (p >= blob.size()) return std::monostate{};
-                    return static_cast<std::uint8_t>(blob[p]) != 0;
-                case MetaType::Int64:
-                    if (blob.size() - p < 8) return std::monostate{};
-                    {
-                        std::uint64_t bits = 0;
-                        for (std::size_t j = 0; j < 8; ++j) {
-                            bits |= static_cast<std::uint64_t>(
-                                        static_cast<std::uint8_t>(blob[p + j]))
-                                    << (8 * j);
-                        }
-                        std::int64_t v;
-                        std::memcpy(&v, &bits, sizeof(v));
-                        return v;
-                    }
-                case MetaType::Float64:
-                    if (blob.size() - p < 8) return std::monostate{};
-                    {
-                        std::uint64_t bits = 0;
-                        for (std::size_t j = 0; j < 8; ++j) {
-                            bits |= static_cast<std::uint64_t>(
-                                        static_cast<std::uint8_t>(blob[p + j]))
-                                    << (8 * j);
-                        }
-                        double v;
-                        std::memcpy(&v, &bits, sizeof(v));
-                        return v;
-                    }
-                case MetaType::String: {
-                    std::uint64_t sl = 0;
-                    std::size_t q = read_varint(p, sl);
-                    if (q == blob.size() || sl > blob.size() - q) {
-                        return std::monostate{};
-                    }
-                    return std::string(
-                        reinterpret_cast<const char*>(blob.data() + q),
-                        static_cast<std::size_t>(sl));
-                }
-                default:
-                    return std::monostate{};
-            }
-        } else if (cmp < 0) {
-            lo = mid + 1;
-        } else {
-            if (mid == 0) break;
-            hi = mid;
         }
     }
     return std::monostate{};
