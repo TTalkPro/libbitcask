@@ -3241,8 +3241,10 @@ W4 ✅（parallel_scan 并行全表扫描）。
   **S27-2 收官**：段已是能查、能落盘、能校验恢复、能管理生命周期的持久化实体；多段查询与单索引
   逐位等价（G-on-the-fly）。全 4 slice header-only、零回归（553/553 双树）、**未触碰任何现有 live 路径**。
 
-- [ ] **S27-3 段累积替换 delta 链**（**部分完成** 2026-07-09）：checkpoint flush 新段 + 后台 merge。
-  删 delta 链 + 死内存回收。仍单写者。
+- [x] **S27-3 段累积替换 delta 链**——**收官（2026-07-10,5 步全落地）**：checkpoint
+  flush 新段 + 段级压实回收。删 delta 链 + fields_ 退役 + recovery 重写 + 死内存
+  回收(原地压实/全死段 drop)。仍单写者。两项挂账(consolidation/legacy 段化
+  迁移)见步骤 5 注,归 S27-4 era。
   - [x] Slice A/B1/B2a/C 已落地（`ea7794f`/`6148e04`/`3be3f6c`）：SealedSegment 多字段扩展
     （fields_ map + 多字段 save/load + multi_field_segment_search + mark_dead）、Building 段镜像 +
     查询 9/9 走 [SegmentSet+Building] 多段归并、delta 链退役（CheckpointDeltaChain×3 测试删除）。
@@ -3297,8 +3299,31 @@ W4 ✅（parallel_scan 并行全表扫描）。
       三测试更新为「文本不经 legacy 容器持久化」语义。
       验收:clang **561/561**;TSan 定向并发 ×3 + 子集 185/185;
       **ASan 全量 561/561**;rel 构建过。
-    - [ ] **步骤 5**：段级 merge（Slice D,接 on_merge_commit + 恢复有界回收
-      断言 ×2）+ legacy 段化迁移(老 bm25.ckpt → 初始段)
+    - [x] **步骤 5 已完成（2026-07-10）：段级压实 + 段生命周期并发化**。
+      ① **compact 复活(段世界)**:building 原地删死 posting
+      (`SealedSegment::compact_postings`——InvertedIndex::compact 以段自身为
+      LiveChecker,doc_store 行不动、docid 稠密不变量保持);全死段整段
+      drop_pending(posting 全量回收,文件随下次 ckpt commit 删);带死段原地
+      压实 + dead_dirty → 重存。maybe_auto_compact 复活(S12-2 原节流逻辑),
+      on_merge_commit 沿用 compact(0.2);两处「有界回收」断言恢复。
+      ② **段生命周期 vs 查询并发化**(新增压力测试逮出 3 个 B2a 即潜伏的
+      UAF/race):段列表 shared_ptr 化 + list_mu_ + 查询走 snapshot()/
+      segment_ref()(pin 钉住段对象,drop 只摘列表);building_ 原子
+      shared_ptr(封口切换 vs 查询 load;先切空再入段——微秒级 NRT 不可见
+      窗口,优于反序的双份命中);key_to_location_ 加 key_loc_mu_
+      (explain 查询线程 shared / reducer unique)。
+      ③ **TSan fence 盲区注解**:mutable_pl 的 CoW 协议(use_count+acquire
+      fence)语义正确但 TSan 不建模 fence——S29-1 持引用出锁后被误报;
+      `BITCASK_PL_TSAN_ACQUIRE/RELEASE` 注解将协议边显式化(零行为变化,
+      覆盖 BOW ReleaseRefs 与 phrase 零拷贝读者)。
+      验收:clang 562/562;TSan 压力 ×4 + 子集 202/202;**ASan 全量
+      562/562**(顺带修测试自身 string_view 悬垂);rel 构建过。
+      新测:`SegmentLifecycleVsQueryStress`(封口/删除/压实 drop vs 3 读者)。
+    - **有意偏离设计并挂账(需 InvertedIndex 词表遍历原语,S27-4 era)**:
+      ① 跨段合并(Lucene consolidation,段数收敛)——本步以原地压实替代
+      (回收等效,段数不收敛);② legacy 段化迁移(老 kBm25Default/kBm25Fields
+      ckpt → 初始段)——现行为:老格式不认 → 退全量 fold 重建段集
+      (安全慢,升级一次性成本,设计 §5 既定回退)。
 - [ ] **S27-4 并行 builder（DWPT）**：多段内单线程 builder，文档分派。**吞吐红利落地。**依赖 S27-3 收官。
 
 ### 关联既有设计（勿重复造轮子）
