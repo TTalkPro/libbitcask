@@ -85,12 +85,15 @@ struct CaskOptions {
     // 兼顾持久性与吞吐（区别于 o_sync 的每条 durable）。0 = 关闭（默认）。
     // o_sync 为真时本项无意义（已逐条 durable）。
     std::uint32_t sync_every_n     = 0;
-    // S14-1 自动 checkpoint：roll 封口点若自上次 ckpt 以来的 ord 增量 ≥ 本值，
-    // 异步（reducer 线程 RunFn，fire-and-forget，不阻塞写者）落 keydir 快照 +
-    // search.ckpt——把崩溃恢复重放窗口钳制在 ~本值 + 一个文件的写入量内。
-    // 0 = 关闭（默认）。仅索引模式生效（纯 KV 恢复本就走 hint 快路径）；
+    // S14-1/S31.5 自动 checkpoint：自上次 ckpt 以来 ord 增量 ≥ 本值即异步
+    // （reducer RunFn，fire-and-forget，不阻塞写者）落 keydir 快照 +
+    // search ckpt——崩溃恢复重放窗口恒 ≤ 本值(分词重放是恢复的主成本,
+    // 下游 zhwiki 实测反馈)。S31.5 起锚点为 ord 增量本身(原需数据文件
+    // roll 配合——字节锚点与分词算力脱钩,大文档语料下窗口失控)。
+    // 默认 65536 与 building 段封口阈值对齐(封口后一个阈值内清单必提交);
+    // 0 = 关闭。仅索引模式生效(纯 KV 恢复本就走 hint 快路径);
     // 精细节奏控制用 checkpoint() API。
-    std::uint32_t auto_checkpoint_min_docs = 0;
+    std::uint32_t auto_checkpoint_min_docs = 65536;
     bool          require_hint_crc = false;  // legacy 默认 false；M5 之后可能改 true
     // tstamp < (now - expiry_secs) 的 record 在 get/fold 中被过滤，
     // 同时进入「过期触发 merge」的候选。0 = 禁用。
@@ -810,12 +813,11 @@ private:
     // 不与 write_mu_ 交叉：checkpoint 不取 write_mu_，写路径不取本锁。
     std::mutex ckpt_mu_;
 
-    // S14-1 自动 checkpoint 状态。pending：roll_active 置位（有文件封口），
-    // 写路径锁外提交点消费；inflight：防重入（一次只挂一个 RunFn），RunFn
-    // 完成时清；last_ckpt_ord_：上次 ckpt 覆盖水位（open 末尾初始化为当前
-    // next_ord，RunFn/checkpoint() 保存成功后推进），增量 = peek_next_ord −
-    // 本值，达 opts_.auto_checkpoint_min_docs 才真正提交。
-    std::atomic<bool> auto_ckpt_pending_{false};
+    // S14-1/S31.5 自动 checkpoint 状态。inflight：防重入（一次只挂一个
+    // RunFn），RunFn 完成时清；last_ckpt_ord_：上次 ckpt 覆盖水位（open 末尾
+    // 初始化为当前 next_ord，RunFn/checkpoint() 保存成功后推进），增量 =
+    // peek_next_ord − 本值，达 opts_.auto_checkpoint_min_docs 即提交
+    // （S31.5:ord 增量自锚点,原 roll-pending 标记退役）。
     std::atomic<bool> auto_ckpt_inflight_{false};
     std::atomic<std::uint64_t> last_ckpt_ord_{0};
     // 写路径释放 write_mu_ 后调用（WriteOpGate 持有中 → close 竞态安全）：

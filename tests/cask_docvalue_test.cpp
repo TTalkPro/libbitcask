@@ -4214,3 +4214,62 @@ TEST(V61BatchFold, NextBatchReturnsMultiple) {
     EXPECT_EQ(got, expected);
     fs::remove_all(tmpdir, ec);
 }
+
+// S31.5(下游 zhwiki 反馈跟进):自动 checkpoint 的锚点改为 ord 增量本身
+// ——无数据文件 roll、无 close,写满阈值后 ckpt 也必须自动落盘。分词是
+// 恢复重放的主成本,窗口必须钳在 min_docs 内,不能依赖字节锚点(大文档
+// 语料下 roll 周期与 analyze 工作量完全脱钩)。
+TEST_F(CaskDocValueTest, S31AutoCheckpointByOrdDeltaWithoutRoll) {
+    namespace fs = std::filesystem;
+    auto opts = v31_opts(0);
+    opts.auto_checkpoint_min_docs = 16;  // 小阈值:60 篇内必然多次跨越
+    // max_file_size 保持默认(大)——全程**不发生 roll**,锚点只剩 ord 增量。
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < 60; ++i) {
+        bitcask::DocInput doc;
+        std::string text = "autockpt corpus n" + std::to_string(i);
+        doc.text = sv_bytes(text);
+        ASSERT_TRUE((*c)->put_doc(sv_bytes("ak_" + std::to_string(i)), doc,
+                                  static_cast<std::uint32_t>(1000 + i)));
+    }
+    // 排干 reducer(fire-and-forget 的 ckpt RunFn 在 reducer 序列内执行)。
+    (*c)->flush_index();
+    // 关键断言:无 roll 无 close,ckpt 文件已在盘上。
+    EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt"))
+        << "ord 增量锚点未触发自动 checkpoint";
+    EXPECT_TRUE(fs::exists(tmpdir_ / "index.manifest"));
+
+    // crash-image:未 close 的镜像重开——已 ckpt 的部分免重放,尾部由
+    // fold 补,全量可检索。
+    auto img = crash_image(tmpdir_, "autockpt");
+    (*c)->close();
+    auto r = Cask::open(img.string(), opts, &test_registry());
+    ASSERT_TRUE(r);
+    auto hits = (*r)->search_text("autockpt", 100);
+    ASSERT_TRUE(hits);
+    EXPECT_EQ(hits->hits.size(), 60u);
+    (*r)->close();
+    std::error_code ec;
+    fs::remove_all(img, ec);
+}
+
+// 对照:auto_checkpoint_min_docs=0(关闭)→ 无 roll 无 close 恒不落 ckpt
+// (旧行为可回退)。
+TEST_F(CaskDocValueTest, S31AutoCheckpointDisabledNoFiles) {
+    namespace fs = std::filesystem;
+    auto opts = v31_opts(0);
+    opts.auto_checkpoint_min_docs = 0;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < 40; ++i) {
+        bitcask::DocInput doc;
+        std::string text = "noauto n" + std::to_string(i);
+        doc.text = sv_bytes(text);
+        ASSERT_TRUE((*c)->put_doc(sv_bytes("na_" + std::to_string(i)), doc,
+                                  static_cast<std::uint32_t>(1000 + i)));
+    }
+    (*c)->flush_index();
+    EXPECT_FALSE(fs::exists(tmpdir_ / "bm25.ckpt"));
+    (*c)->close();
+}

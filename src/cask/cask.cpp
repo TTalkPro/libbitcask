@@ -841,10 +841,9 @@ std::expected<void, CaskFault> Cask::roll_active() {
         active_data_.reset();  // 在途读者持 shared_ptr,旧对象由引用计数续命
     }
     active_hint_.reset();
-    // S14-1：文件封口 = 自动 checkpoint 的天然锚点（sealed 文件不再变化，
-    // 按写入量周期触发）。此处仅置标记——实际提交在写路径释放 write_mu_
-    // 之后（maybe_submit_auto_checkpoint），锁内零开销。
-    auto_ckpt_pending_.store(true, std::memory_order_relaxed);
+    // S14-1 曾在此置 auto-ckpt pending(roll = 字节锚点);S31.5 改为写路径
+    // 直接按 ord 增量评估(字节锚点与分词算力脱钩,见
+    // maybe_submit_auto_checkpoint 注),roll 点无需再做任何事。
     return ensure_active_writer();
 }
 
@@ -2360,18 +2359,23 @@ bool Cask::save_checkpoint_paired(
 void Cask::maybe_submit_auto_checkpoint() {
     if (opts_.auto_checkpoint_min_docs == 0) return;          // 未启用
     if (!text_ || !index_pool_ || !index_lane_) return;     // 仅索引模式
-    if (!auto_ckpt_pending_.load(std::memory_order_relaxed)) return;
+    // S31.5(下游反馈跟进):ord 增量**本身**即锚点。原先还要求数据文件
+    // roll 置 pending 标记——roll 按 KV 字节触发,与分词算力完全脱钩:
+    // 大文档语料(zhwiki 单篇数百 KB)一个 roll 周期可积累数万篇 analyze
+    // 工作量,崩溃后全部重放(且 S30 后段文件在预算/阈值封口时已在盘上,
+    // 只差清单提交,重放纯属浪费)。改为每写评估 ord 增量(两次 relaxed
+    // load,热路径零 RMW),恢复重放窗口恒 ≤ min_docs。
     const std::uint64_t now_ord = keydir_->peek_next_ord();
     if (now_ord - last_ckpt_ord_.load(std::memory_order_relaxed) <
         opts_.auto_checkpoint_min_docs) {
-        // 增量不足：清标记，等下一次 roll 再评估。
-        auto_ckpt_pending_.store(false, std::memory_order_relaxed);
         return;
     }
+    // 在途窗口先 relaxed 预检再 exchange——防「达阈值后每写一次 RMW」
+    // 打在共享 cacheline(S29-6/7 教训:热路径共享 RMW 即弹跳)。
+    if (auto_ckpt_inflight_.load(std::memory_order_relaxed)) return;
     if (auto_ckpt_inflight_.exchange(true, std::memory_order_acq_rel)) {
-        return;  // 已有在途 RunFn（保持 pending，完成后下个 roll 重试）
+        return;  // 已有在途 RunFn,完成后由后续写触发重试
     }
-    auto_ckpt_pending_.store(false, std::memory_order_relaxed);
     IndexTask t;
     t.op  = IndexOp::RunFn;
     t.ord = keydir_->alloc_ord();
