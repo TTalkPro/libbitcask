@@ -1076,7 +1076,11 @@
   - **来源**：Lemire et al. SIMD Compression (2016)；ClickHouse 已采用。
   - **风险**：高（新编码 + 兼容老 checkpoint）。建议作为新存储格式 v4 一部分。
 
-- [ ] **C6 SOTA：Roaring Bitmap 用于 filter / posting** — `src/bm25/`、`include/bitcask/meta_filter.hpp`
+- [ ] **C6 SOTA：Roaring Bitmap 用于 filter / posting** — **完整设计已写
+  ([`doc/roaring-meta-bitmap-design-zh.md`](doc/roaring-meta-bitmap-design-zh.md),
+  2026-07-11 重估):真实价值载体 = per-segment 元数据位图索引(新功能),
+  非 bool_search 数据结构替换;触发条件(分面过滤负载/eval_meta 热点)
+  成立前封存** — `src/bm25/`、`include/bitcask/meta_filter.hpp`
   - 当前 filter 用 `MetaFilter::evaluate(blob)`；posting 用 vector。dense block + rank
     优化可加速多字段 AND/OR 与 bool_search。
   - **来源**：ES / Weaviate / Quickwit 均采用。
@@ -3725,7 +3729,11 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - **验证**：独立对拍（长度 0-300 × 偏移 0-16 × 3 seeds = 15300 点 + 200 随机流式
     trial）全过；bench 自测补「16..63 × 非零 seed × 非对齐」定向覆盖（原自测只有
     seed=0 + 对齐起点）；双树构建 + ctest 555/555。
-- [ ] **S29-11（待评估）HNSW 深层优化** · `src/vector/hnsw.cpp` + `include/bitcask/hnsw.hpp:69-70`
+- [ ] **S29-11（待评估）HNSW 深层优化** — **完整设计已写
+  ([`doc/s29-11-hnsw-deep-opt-design-zh.md`](doc/s29-11-hnsw-deep-opt-design-zh.md),
+  2026-07-11,含四梯队详设 + 向量驻留路线与 DiskANN 逐维对比):前置 =
+  召回评估基建;②(AVX2 int8 混合精度导航)是建图提速与「向量出内存」
+  (DiskANN-lite on mmap,S32 候选)的共同前置** · `src/vector/hnsw.cpp` + `include/bitcask/hnsw.hpp:69-70`
   - 超线性根因：f32 导航工作集 100k×384d×4B ≈ 153MB 打穿 L3（本机无 VNNI，
     `pick_int8_dot_kernel()` 返 nullptr → 建图全程 f32）。
   - 梯队：① ef_construction 200→128 / M 16→12（配置级，建图 1.5-2×，召回略降，需召回
