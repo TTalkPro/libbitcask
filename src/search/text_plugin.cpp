@@ -1183,8 +1183,11 @@ TextPlugin::load_component(std::string_view dir,
     }
     // S27-3 步骤 3:段集装载下沉到此(原在 open())——shim/独立调用
     // load_component 的路径同样恢复段集。dir 为空(纯内存用法)跳过。
-    if (!dir.empty()) {
-        init_segment_set(dir, /*loaded=*/true);
+    // S31:段载入失败(清单声明了段但载不出)→ **响亮降级**:watermark 0 +
+    // rebase,宿主全量重放重建索引(坏库自愈)。原静默空集 + 高水位会让
+    // 全库查询永久返回 0 且无任何报错(下游 zhwiki 实测,libbitcask.md)。
+    if (!dir.empty() && !init_segment_set(dir, /*loaded=*/true)) {
+        return fail();
     }
     return result;
 }
@@ -1192,12 +1195,15 @@ TextPlugin::load_component(std::string_view dir,
 // S27-3 步骤 3/4:初始化段集——优先 bm25.ckpt 内嵌 kSegManifest(单一
 // commit point 主路径),回退过渡期 segments.manifest,再回退空集。装载后
 // 重建 key→(seg_id, docid) 定位。
-void TextPlugin::init_segment_set(std::string_view dir, bool loaded) {
+bool TextPlugin::init_segment_set(std::string_view dir, bool loaded) {
     const std::string segs_dir = std::string(dir) + "/bm25_segments/";
     std::error_code ec;
     std::filesystem::create_directories(segs_dir, ec);
+    // S31:是否「清单声明了段」——非空 payload 意味着必须载出段,失败要上抛
+    // (原实现静默落空集,配合高水位 = 永久静默空索引,下游 zhwiki 实测踩中)。
+    const bool expect_segments = loaded && !pending_seg_manifest_.empty();
     std::unique_ptr<search::SegmentSet> opened;
-    if (loaded && !pending_seg_manifest_.empty()) {
+    if (expect_segments) {
         opened = search::SegmentSet::open_from_payload(
             segs_dir, pending_seg_manifest_, config_.mmap_verify_crc);
     }
@@ -1205,6 +1211,7 @@ void TextPlugin::init_segment_set(std::string_view dir, bool loaded) {
         opened = search::SegmentSet::open(segs_dir,
                                           config_.mmap_verify_crc);  // 过渡回退
     }
+    const bool ok = opened != nullptr || !expect_segments;
     if (opened) {
         segment_set_ = std::move(opened);
     } else {
@@ -1214,6 +1221,7 @@ void TextPlugin::init_segment_set(std::string_view dir, bool loaded) {
     pending_seg_manifest_.clear();
     pending_seg_manifest_.shrink_to_fit();
     rebuild_key_locations();
+    return ok;
 }
 
 
@@ -1318,7 +1326,7 @@ plugin::PluginStatus TextPlugin::open(const plugin::OpenContext& ctx) {
     // (内嵌 kSegManifest 主路径);此处兜底未 loaded(ckpt 缺失/损坏 →
     // 空段集 + 全量重放重建)。building_ 已在构造期建好。
     if (!dir_.empty() && !r.loaded) {
-        init_segment_set(dir_, /*loaded=*/false);
+        (void)init_segment_set(dir_, /*loaded=*/false);  // 重建路径:空集正确
     }
     building_.store(std::make_shared<search::SealedSegment>(),
                     std::memory_order_release);

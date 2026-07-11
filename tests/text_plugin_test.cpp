@@ -1207,3 +1207,125 @@ TEST(TextPlugin, S30MergeConvergesAndReclaims) {
     }
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// S31(下游反馈 libbitcask.md):超长 term 静默炸段——三层修复的端到端复现。
+// ===========================================================================
+
+// wiser 形态:文本含 >1024B 连续 token(长 URL/模板块)。修复后:
+// ① 分析器源头过滤(max_token_bytes)——段内不再有超长 term;
+// ② v1 封口 + 重开:正常词照常命中(修复前:整段拒载 → 高水位 + 空集 →
+//    全库查询永久静默 0 命中);③ v2 模式同样健康。
+TEST(TextPlugin, S31OversizedTokenDoesNotKillSegment) {
+    for (const bool v2 : {false, true}) {
+        const fs::path dir = fs::temp_directory_path() /
+                             (v2 ? "bitcask_tp_s31_v2" : "bitcask_tp_s31_v1");
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        const std::string dir_s = dir.string();
+
+        index::Index idx;
+        auto cfg = make_cfg();
+        cfg.seal_v2_segments = v2;
+        std::uint64_t wm = 0;
+        {
+            text::TextPlugin a(cfg, idx, idx, idx);
+            plugin::OpenContext ctx;
+            ctx.dir = dir_s;
+            ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+            const std::string monster(1500, 'x');  // >1024B 连续 token
+            for (std::uint64_t ord = 0; ord < 5; ++ord) {
+                const std::string key = "k" + std::to_string(ord);
+                host_put_row(idx, key, ord);
+                a.apply_text(key, ord,
+                             "normal words here " + monster + " tail" +
+                                 std::to_string(ord));
+            }
+            // 源头过滤:超长 token 不进倒排(负查询),正常词照常。
+            {
+                auto r = a.search_text("normal", 10);
+                ASSERT_TRUE(r.has_value());
+                EXPECT_EQ(r->size(), 5u);
+                auto rm = a.search_text(monster, 10);
+                ASSERT_TRUE(rm.has_value());
+                EXPECT_TRUE(rm->empty());
+            }
+            plugin::FlushRequest req;
+            req.watermark = 5;
+            ASSERT_EQ(a.flush(req).status, plugin::PluginStatus::kOk);
+            wm = 5;
+        }
+        // 重开(修复前 v1 模式在此静默死亡:tlen>1024 → 整段拒载)。
+        index::Index idx2;
+        for (std::uint64_t ord = 0; ord < 5; ++ord) {
+            host_put_row(idx2, "k" + std::to_string(ord), ord);
+        }
+        text::TextPlugin b(cfg, idx2, idx2, idx2);
+        plugin::OpenContext c2;
+        c2.dir = dir_s;
+        c2.committed_base_watermark = wm;
+        c2.committed_chain_watermark = wm;
+        c2.committed_chain_seq = 0;
+        ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+        EXPECT_EQ(b.watermark(), wm) << (v2 ? "v2" : "v1");
+        auto r = b.search_text("normal", 10);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), 5u) << (v2 ? "v2" : "v1");
+        fs::remove_all(dir);
+    }
+}
+
+// A3b:段文件损坏 → 重开必须**响亮降级**(watermark 0 → 宿主全量重放
+// 重建/自愈),绝不允许「高水位 + 空段集」的永久静默空索引。
+TEST(TextPlugin, S31SegmentLoadFailureDegradesLoudly) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_s31_loud";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    std::uint64_t wm = 0;
+    {
+        text::TextPlugin a(cfg, idx, idx, idx);
+        plugin::OpenContext ctx;
+        ctx.dir = dir_s;
+        ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+        for (std::uint64_t ord = 0; ord < 4; ++ord) {
+            const std::string key = "k" + std::to_string(ord);
+            host_put_row(idx, key, ord);
+            a.apply_text(key, ord, "loud corpus " + std::to_string(ord));
+        }
+        plugin::FlushRequest req;
+        req.watermark = 4;
+        ASSERT_EQ(a.flush(req).status, plugin::PluginStatus::kOk);
+        wm = 4;
+    }
+    // 把段文件截断成垃圾(清单仍声明它)。
+    bool truncated = false;
+    for (const auto& e :
+         fs::directory_iterator(dir / "bm25_segments")) {
+        const auto name = e.path().filename().string();
+        if (name.rfind("seg-", 0) == 0 && name.find("manifest") == std::string::npos &&
+            name.find(".live") == std::string::npos) {
+            std::filesystem::resize_file(e.path(), 8);
+            truncated = true;
+        }
+    }
+    ASSERT_TRUE(truncated);
+
+    index::Index idx2;
+    for (std::uint64_t ord = 0; ord < 4; ++ord) {
+        host_put_row(idx2, "k" + std::to_string(ord), ord);
+    }
+    text::TextPlugin b(cfg, idx2, idx2, idx2);
+    plugin::OpenContext c2;
+    c2.dir = dir_s;
+    c2.committed_base_watermark = wm;
+    c2.committed_chain_watermark = wm;
+    c2.committed_chain_seq = 0;
+    ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+    // 关键断言:watermark 必须归 0(触发宿主全量重放重建),而非高水位+空集。
+    EXPECT_EQ(b.watermark(), 0u);
+    fs::remove_all(dir);
+}

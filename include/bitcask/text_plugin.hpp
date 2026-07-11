@@ -446,7 +446,11 @@ private:
     std::vector<std::byte> pending_seg_manifest_;
     void rebuild_key_locations();
     // 段集初始化(load_component loaded 情形 / open 未 loaded 兜底共用)。
-    void init_segment_set(std::string_view dir, bool loaded);
+    // S31:返回 false = 清单声明了段但载入失败(段文件损坏/缺失)——caller
+    // (load_component)必须降级 watermark 0 触发全量重放重建;**不得**静默
+    // 落空集(下游实测:空集 + 高水位 = 全库查询永久静默 0 命中,
+    // libbitcask.md)。清单为空/不存在 → 空集是正确状态,返回 true。
+    [[nodiscard]] bool init_segment_set(std::string_view dir, bool loaded);
 
     // ---- S27-4 P2:BuilderPool(设计 docs/design/s27-4-dwpt-design.md)----
     // 生产者恒为 reducer 单线程(on_put 路由),每 builder 一条 SPSC 队列
