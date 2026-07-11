@@ -3909,10 +3909,24 @@ W4 ✅（parallel_scan 并行全表扫描）。
     管道;v1 段容器恒校验不受影响。
   - **三 sanitizer 全量**:clang 607/607;ASan 607/607;TSan 606/607
     (唯一失败 = S29-T 在案既存,与 S30 无关)。
-- **S30 批次收官(2026-07-11,P1[缺 WAND 块游标]+P2+P3+P4)**。剩余
-  挂账:**WAND 块游标**(mmap 大词查询现为全量解码 interim——正确、逐位
-  一致、与内存版快照拷贝同量级;块游标按跳表逐块解码才免大词 O(df) 解码,
-  性能优化项,可与后续批次穿插)。
+- [x] **S30-P5(2026-07-11):TermSnapshotCache 接入 MmapSegment + WAND
+  挂账数据定案**。
+  - **缓存接线**(设计 §2 承诺的 S29-6B 段协同兑现):MmapSegment 字段持
+    cache_id(与 InvertedIndex **共用 id 序列**,防跨索引 key 冲突——
+    next_index_id 公开);search/doc_freq 镜像 InvertedIndex 缓存两相,
+    **gen 恒 0**(封口段 posting 永不变;merge/重开产新对象新 id,旧条目
+    自然失配)→ 热词**解码一次永久命中**;标量分支解码结果 swap 转移进
+    缓存(零拷贝);缺席负缓存;全局开关共用。
+  - **实测**(新增 [`segment_v2_bench.cpp`](bench/segment_v2_bench.cpp)):
+    BOW 重复查询 11.6→8.54µs(**-26%**,命中免整趟词典二分+解码);
+    分段查询 stage-1 doc_freq 同享条目。
+  - **WAND 块游标挂账关闭(数据定案)**:mmap WAND(2 词 × 20k postings)
+    691µs vs 内存段 616µs——全量解码 interim 净开销 **+12%**,即块游标
+    100% 跳块的收益上限;打分主导成本,不值得为其重构 search_wand 为游标
+    形态。若未来 posting 规模/剪枝率量级变化可重开。
+  - 验收:等价测试(重复查询位级/跨段隔离/开关对照/负缓存);clang 全量
+    **608/608**;ASan/TSan 子集绿;build-rel 过。
+- **S30 批次收官(2026-07-11,P1+P2+P3+P4+P5)——无遗留挂账**。
 - 收编挂账：S26-⑤⑥(positions 编码/ckpt 停顿)、S21-A6、S24-M9 后半
   (封口段词典双份)、S27-3 挂账(consolidation + legacy 迁移)。
 - 明确非目标：KV 主路径零变化;HNSW 常驻另立项;key→location resolver

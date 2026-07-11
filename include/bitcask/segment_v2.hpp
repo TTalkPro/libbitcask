@@ -257,6 +257,10 @@ private:
 
     struct Field {
         std::string name;
+        // S30-P5:TermSnapshotCache key(与 InvertedIndex 同一 id 序列;
+        // 封口段 posting 永不变 ⇒ 缓存 gen 恒 0 = 永久命中;merge/重开
+        // 产新对象新 id,旧条目自然失配淘汰)。
+        std::uint64_t cache_id = 0;
         segv2::FieldStats stats{};
         const std::byte* dict = nullptr;      // TermRec 数组
         std::uint64_t    dict_count = 0;

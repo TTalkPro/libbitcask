@@ -4,6 +4,7 @@
 #include "bitcask/segment_v2.hpp"
 
 #include "bitcask/hw_crc32.hpp"
+#include "bitcask/term_snapshot_cache.hpp"  // S30-P5:查询快照缓存
 #include "bitcask/myers.hpp"
 #include "bitcask/vbyte.hpp"
 #include "bitcask/wildcard_matcher.hpp"
@@ -553,6 +554,11 @@ std::unique_ptr<MmapSegment> MmapSegment::open(const std::string& path,
         if (f.stats.term_count != f.dict_count) return nullptr;
     }
 
+    // S30-P5:字段缓存 id(与 InvertedIndex 共用序列,防 key 冲突)。
+    for (auto& f : seg->fields_) {
+        f.cache_id = bm25::InvertedIndex::next_index_id();
+    }
+
     // ---- live 位图(初始全活;sidecar 由 caller 叠加) ----
     seg->live_ =
         std::make_unique<std::atomic<std::uint8_t>[]>(seg->doc_count_);
@@ -697,10 +703,36 @@ bool MmapSegment::decode_postings(std::string_view field,
     return decode_rec(*f, rec, out);
 }
 
+namespace {
+// 镜像 inverted.cpp 的同名 helper(缓存条目 fp 清空复用容量)。
+void clear_fp(FlatPostings& fp) {
+    fp.ords.clear();
+    fp.tfs.clear();
+    fp.blocks.clear();
+    fp.max_tf = 0;
+}
+}  // namespace
+
 std::uint64_t MmapSegment::doc_freq(std::string_view field,
                                     std::string_view term) const {
     const Field* f = field_of(field);
     if (f == nullptr) return 0;
+    // S30-P5:缓存快路径(gen 恒 0——封口段 posting 永不变)。分段查询
+    // stage-1 逐段逐词调用本函数,与 stage-2 search 共享同一条目。
+    if (bm25::InvertedIndex::query_cache_enabled()) {
+        auto& cache = bm25::TermSnapshotCache::tls_instance();
+        if (const auto* e = cache.probe(f->cache_id, term, 0)) return e->df;
+        segv2::TermRec rec{};
+        const bool found = find_term(*f, term, rec);
+        if (auto* e = cache.upsert(f->cache_id, term, 0)) {
+            e->df = found ? rec.df : 0;
+            if (!found) {
+                clear_fp(e->fp);
+                e->has_rows = true;  // 缺席负缓存
+            }
+        }
+        return found ? rec.df : 0;
+    }
     segv2::TermRec rec{};
     return find_term(*f, term, rec) ? rec.df : 0;
 }
@@ -729,6 +761,45 @@ std::vector<bm25::SearchResult> MmapSegment::search(
     const std::uint64_t N = ext ? ext->N : f->stats.live_doc_count;
     const std::uint64_t sum_dl = ext ? ext->sum_dl : f->stats.sum_doc_len;
 
+    // ---- S30-P5 Phase 1:TermSnapshotCache 探测(镜像 InvertedIndex::
+    // search;gen 恒 0 = 封口段永久命中——缓存从省 RMW 升格为**省整趟
+    // 解码**,S29-6B 设计的段协同兑现) ----
+    const bool use_cache = bm25::InvertedIndex::query_cache_enabled();
+    auto& cache = bm25::TermSnapshotCache::tls_instance();
+    static thread_local std::vector<bm25::detail::ScoredTermView> views;
+    if (use_cache) {
+        cache.begin_query();
+        static thread_local std::vector<const FlatPostings*> hit_fps;
+        hit_fps.assign(query_terms.size(), nullptr);
+        bool all_hit = true;
+        std::size_t cached_total = 0;
+        for (std::size_t i = 0; i < query_terms.size(); ++i) {
+            const auto* e = cache.probe(f->cache_id, query_terms[i], 0);
+            if (e != nullptr && e->has_rows) {
+                hit_fps[i] = &e->fp;
+                cached_total += e->fp.size();
+            } else {
+                all_hit = false;
+            }
+        }
+        if (all_hit) {
+            if (cached_total == 0) return {};  // 全缺席(负缓存)
+            if (cached_total < bm25::detail::kWandRouteThreshold) {
+                views.clear();
+                for (std::size_t i = 0; i < query_terms.size(); ++i) {
+                    if (hit_fps[i] != nullptr && !hit_fps[i]->empty()) {
+                        views.push_back({&query_terms[i], hit_fps[i]});
+                    }
+                }
+                return bm25::detail::score_bow_topk(
+                    views, k, N, sum_dl, params, live_checker,
+                    ext ? ext->df : nullptr);
+            }
+            // WAND 规模:仍需全量解码,落 Phase 2(有意不缓存大词)。
+        }
+    }
+
+    // ---- Phase 2:解码路径 ----
     // 逐词按需解码进 thread_local 池(mmap → FlatPostings;池指针在两趟间
     // 稳定:先全部填充,再收集指针——emplace 增长会搬移元素)。
     static thread_local std::vector<FlatPostings> fp_pool;
@@ -745,6 +816,21 @@ std::vector<bm25::SearchResult> MmapSegment::search(
         total += rec.df;
         ++n;
     }
+    // 缺席词落负缓存(重复的缺席查询下次走零解码快路径)。
+    if (use_cache) {
+        std::size_t j = 0;
+        for (std::size_t i = 0; i < query_terms.size(); ++i) {
+            if (j < hit_idx.size() && hit_idx[j] == i) {
+                ++j;
+                continue;
+            }
+            if (auto* e = cache.upsert(f->cache_id, query_terms[i], 0)) {
+                clear_fp(e->fp);
+                e->df = 0;
+                e->has_rows = true;
+            }
+        }
+    }
     if (total == 0) return {};
 
     if (total >= bm25::detail::kWandRouteThreshold) {
@@ -752,19 +838,29 @@ std::vector<bm25::SearchResult> MmapSegment::search(
         static thread_local std::vector<std::string_view> term_views;
         fp_ptrs.clear();
         term_views.clear();
-        for (std::size_t j = 0; j < n; ++j) {
-            fp_ptrs.push_back(&fp_pool[j]);
-            term_views.push_back(query_terms[hit_idx[j]]);
+        for (std::size_t j2 = 0; j2 < n; ++j2) {
+            fp_ptrs.push_back(&fp_pool[j2]);
+            term_views.push_back(query_terms[hit_idx[j2]]);
         }
         return bm25::detail::search_wand_impl(
             term_views, fp_ptrs, k, live_checker, params, N, sum_dl,
             ext ? ext->df : nullptr, query_terms.size());
     }
 
-    static thread_local std::vector<bm25::detail::ScoredTermView> views;
+    // 标量路径:解码结果落缓存(swap 转移,零拷贝;upsert 失败回退池槽)。
     views.clear();
-    for (std::size_t j = 0; j < n; ++j) {
-        views.push_back({&query_terms[hit_idx[j]], &fp_pool[j]});
+    for (std::size_t j2 = 0; j2 < n; ++j2) {
+        if (use_cache) {
+            if (auto* e = cache.upsert(f->cache_id,
+                                       query_terms[hit_idx[j2]], 0)) {
+                std::swap(e->fp, fp_pool[j2]);
+                e->df = e->fp.size();
+                e->has_rows = true;
+                views.push_back({&query_terms[hit_idx[j2]], &e->fp});
+                continue;
+            }
+        }
+        views.push_back({&query_terms[hit_idx[j2]], &fp_pool[j2]});
     }
     return bm25::detail::score_bow_topk(views, k, N, sum_dl, params,
                                         live_checker,

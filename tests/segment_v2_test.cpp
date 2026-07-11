@@ -1044,3 +1044,48 @@ TEST(SegmentV2P3, MergePhraseOnNamedField) {
     const auto hits = body->search_phrase({"alpha", "beta"}, 100, *merged);
     EXPECT_EQ(hits.size(), 80u);  // 每文档 body 都含相邻 "alpha beta"
 }
+
+// ===========================================================================
+// S30-P5:TermSnapshotCache 接入 MmapSegment——封口段 gen 恒 0,重复查询
+// 走零解码命中路径;跨段隔离;开关等价;doc_freq 共享条目。
+// ===========================================================================
+
+TEST(SegmentV2P5, MmapQueryCacheBitIdenticalAndIsolated) {
+    auto cpa = build_corpus(60, "p5a");
+    auto& ca = *cpa;
+    auto cpb = build_corpus(90, "p5b");
+    auto& cb = *cpb;
+    auto sa = write_and_open(ca);
+    auto sb = write_and_open(cb);
+    ASSERT_NE(sa, nullptr);
+    ASSERT_NE(sb, nullptr);
+
+    const std::vector<std::string> q = {"hot", "mid3", "ghost"};
+    // 首查(解码+填缓存)与重复查询(命中路径)位级一致;两段交错不串味。
+    const auto a1 = sa->search(kField, q, 10, ca.live);
+    const auto b1 = sb->search(kField, q, 10, cb.live);
+    const auto a2 = sa->search(kField, q, 10, ca.live);
+    const auto b2 = sb->search(kField, q, 10, cb.live);
+    expect_same_results(a1, a2, "repeatA");
+    expect_same_results(b1, b2, "repeatB");
+    ASSERT_FALSE(a1.empty());
+    // 两段分数分布不同(N 不同 → idf 不同):首位分数不等即证不串味。
+    ASSERT_FALSE(b1.empty());
+    EXPECT_NE(a1[0].score, b1[0].score);
+
+    // 关缓存对照(字节级同路径语义)。
+    InvertedIndex::set_query_cache_enabled(false);
+    const auto a3 = sa->search(kField, q, 10, ca.live);
+    InvertedIndex::set_query_cache_enabled(true);
+    expect_same_results(a1, a3, "cache-off");
+
+    // doc_freq:重复走缓存;缺席负缓存。
+    EXPECT_EQ(sa->doc_freq(kField, "hot"), 60u);
+    EXPECT_EQ(sa->doc_freq(kField, "hot"), 60u);
+    EXPECT_EQ(sb->doc_freq(kField, "hot"), 90u);  // 隔离
+    EXPECT_EQ(sa->doc_freq(kField, "ghost"), 0u);
+    EXPECT_EQ(sa->doc_freq(kField, "ghost"), 0u);
+    // 全缺席查询两遍(负缓存快路径)。
+    EXPECT_TRUE(sa->search(kField, {"ghost", "phantom"}, 10, ca.live).empty());
+    EXPECT_TRUE(sa->search(kField, {"ghost", "phantom"}, 10, ca.live).empty());
+}
