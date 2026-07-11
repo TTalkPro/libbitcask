@@ -1034,7 +1034,33 @@
     极快（960 hits 仅 3.3µs），hash map 的 hashing/probing 开销不划算。**sort+merge+heap
     已是该规模最优**，保留原实现。inverted.cpp 注释登记评估结论防重复尝试。
 
-- [ ] **C4 SOTA：Block-Max MaxScore（Lucene 9.9 自适应合取）** — `src/bm25/inverted.cpp`（WAND 路径）
+- [x] **C4 SOTA：Block-Max MaxScore（Lucene 9.9 自适应合取）已完成
+  （2026-07-11,并**默认启用**）** — `src/bm25/bm25_search_impl.hpp`
+  - **方法论:先立标尺**——无剪枝穷举参照(镜像 WAND 标量公式/取数/堆
+    语义的规范实现,tests/inverted_test)+ 三方随机对拍 200 轮(偏斜语料
+    ×死亡 1/3×ext 注入×ghost/重复词×k∈{1,3,10,50}):穷举 ≡ WAND ≡
+    MaxScore **位级相同**。
+  - **标尺立刻抓获 WAND 既存正确性 bug(S8/S10 era 起潜伏)**:pivot 选定
+    后落后列表未对齐即评分+越过 ⟹ ① 命中文档以部分分数进堆;② 「部分分
+    < θ ≤ 真分」的文档被**整个丢弃**(top-k 集合错误)。历史对拍全是
+    WAND-vs-WAND(两侧同 bug)故从未暴露。修复 = 规范对齐步(落后列表
+    galloping 推进到 pivot 后重选)。
+  - **MaxScore 实现**:ub 升序前缀(non-essential)/后缀(essential)划分,
+    θ 升级词降级;essential 最小游标驱动;块上界二级预判(BMW 元数据)
+    整块跳;dls 惰性按块填充(同 wand;此项 v1→v2 即 -30%+)。**位级同果
+    三约束**(候选升序/命中分按原词序求和/同源取数+堆语义)写入实现头。
+  - **A/B 实测**(10 万 doc 偏斜语料,segment_v2_bench BM_TopK_*):
+    2/4/6 词 **-46%/-39%/-21%**;既有 WAND 档基准直接受益:
+    BM_MmapSeg_WANDQuery 691→533µs(-23%)、BM_InMemSeg 616→448µs
+    (-27%);BOW/SearchHybrid 噪声带内。据此**默认翻转 MaxScore**
+    (`g_topk_use_maxscore=1`;`InvertedIndex::set_topk_use_maxscore(false)`
+    一键回退 WAND);统一分发器 search_topk_impl,内存段与 mmap 段共享。
+  - **测试语料修正**:随机对拍语料的 checker doc_lens 必须等于索引时
+    Σtf——v5 impacts 前提(块 min_dl 取索引 dl,打分 dl 取 checker;
+    不一致 ⟹ 块上界失效「合法」误跳;生产路径 doc_len_writer 恒同源)。
+  - 验收:clang 全量 **616/616**;ASan 616/616;TSan 子集 178/178;
+    build-rel + bench 过。
+  - 原文:
   - Lucene 9.9 (2023)：term 按 max_score 排序，随 min-competitive-score 上升把
     非本质子句转合取评估。
   - **来源**：Elasticsearch Labs MAXSCORE 博客；Lucene story paper PMC7148045。
