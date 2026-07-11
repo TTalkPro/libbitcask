@@ -3552,8 +3552,36 @@ W4 ✅（parallel_scan 并行全表扫描）。
     ⑤ LSan:析构序——values 终末数组 retire 晚于手动 drain → RawLimbo 自析构。
   - ⚠️ P1 单独上线的既知代价：delete-heavy 且长期无写/无 fold 的库,墓碑驻留至下次写触发
     sweep——内存有界（≤1/8 表长 + sweep 滞后量），语义无损。
-  - 二期：倒排桶锁复用同一套 epoch 注册表（TBB 桶锁不可下探 → 换表或 thread_local
-    term→snapshot 缓存）。
+  - [x] **二期已完成（2026-07-11,S29-6B）：倒排读路径 thread_local term 快照
+    缓存(generation 失效)——评估后选缓存而非换表**。设计+路线论证:
+    [`docs/design/s29-6b-inverted-term-cache.md`](docs/design/s29-6b-inverted-term-cache.md)
+    （换表只消桶锁、shared_ptr 控制块 RMW 仍弹;BOW 按定义 <1024 postings,
+    缓存条目天然封顶;S27 封口段 gen 永不变 → 永久命中）。
+    - **⚠️ 修正原估（重要）**:基线「BOW 1→4 线程零扩展」是对 bench 计数器
+      的**误读**——google benchmark 线程化基准的 items_per_second ≡ 1/每线程
+      每迭代 real time,**不是聚合 QPS**（bench 注释已订正,固定迭代数×墙钟
+      实证）。复核基线:4 线程聚合扩展已有 ~3.6×/4;真实病灶是桶锁+引用计数
+      RMW 弹跳造成的 **5-18% 查询延迟膨胀**,非灾难性串行化。
+    - 实现:新增 [`term_snapshot_cache.hpp`](include/bitcask/term_snapshot_cache.hpp)
+      （线程私有 256 槽开放寻址;全量/缺席负缓存/df-only 三类条目;同查询
+      use_seq 钉住,窗口钉满回退私有槽）;`Shard` 增 alignas(64) `gen_`
+      （add_doc/apply_delta/compact/finalize_all_postings/deserialize 全部
+      变更点 bump,remove_doc 有意不 bump——只改统计不碰 posting）;
+      `search` 全命中 → 零锁零 RMW 零拷贝评分（`score_bow_topk` 改收视图
+      `ScoredTermView`）,miss 走原路径顺带填缓存;`doc_freq` 同享（分段
+      查询 stage-1/stage-2 同段同词稳态 0 次 find,S29-5 遗留项一并了结）;
+      WAND/phrase 有意不缓存（计算主导,不做无谓大拷贝）。运行期开关
+      `set_query_cache_enabled` 一键回退。index_id 进程级单调永不复用
+      （残留条目对已析构索引永不假命中）。
+    - 实测（3 reps 空闲机,real/query）:BOW 1t 7.43→6.75µs（**-9%**）、
+      4t 7.42→6.46µs（**-13%**,1→4 线程延迟完全平坦=零争用）、16t -17%;
+      SearchWhileIndexing（恒 miss+WAND）97.5→99.5µs（+2%,噪声边缘）;
+      SearchHybrid 持平（248 vs 基线 251µs）。
+    - 验收:clang 全量 580/580（新增 TermCache 定向 ×9 + 并发压力 ×1）;
+      TSan 倒排/段/搜索子集 95/95 + 并发压力 ×8 轮;ASan 全量 580/580;
+      build-rel 构建过。
+    - 仍开（升格条件）:WAND 大查询/phrase/bool 的桶锁+引用计数保持现状
+      ——若实测成瓶颈,换表方案（一期设计 §6.3-A）可叠加。
 - [x] **S29-7 Put 写路径 group commit（单 handle 多写者扩展）**——**铺垫+主体完成（2026-07-10）**· `src/cask/cask.cpp`
     + `include/bitcask/data_file.hpp`
   - 病根：`write_mu_`（`cask.hpp:785`）包住 encode + pwrite + hint + keydir 全序列，短临界区
@@ -3680,9 +3708,11 @@ W4 ✅（parallel_scan 并行全表扫描）。
 5. ~~S29-10~~ **已完成**；S29-11 按需（HNSW 召回预算）
 6. ~~S27-4 DWPT~~ **全三相完成 2026-07-10**（BuilderPool + 每 builder 一段;B=2 文本索引 1.9x,
    默认保持 0 由使用方开启;详见 S27-4 条目）
-7. **下一步候选**：倒排桶锁二期（复用 SeqShardTable + epoch 注册表,BOW 查询扩展性)、
-   跨段 consolidation + legacy 段迁移（需 InvertedIndex 词表遍历原语）、C4/C5/C6 SOTA、
-   S29-11、S29-T（TSan 既存失败,低优先）
+7. ~~倒排桶锁二期~~ **已完成 2026-07-11（S29-6B thread_local term 快照缓存;
+   BOW 4t -13% 延迟平坦;⚠️ 修正原估:基线并非零扩展,系 bench 计数器误读,
+   详见 S29-6 二期条目）**
+8. **下一步候选**：跨段 consolidation + legacy 段迁移（需 InvertedIndex 词表
+   遍历原语）、C4/C5/C6 SOTA、S29-11、S29-T（TSan 既存失败,低优先）
 
 **与 S27 的关系**：S29 结构性各项与 S27-3 剩余（B2b/D/E recovery 重写）独立可并行；
 S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同属索引吞吐轴,
