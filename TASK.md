@@ -596,7 +596,11 @@
   - **已完成（2026-06-23）**：常量改 `1024*1024`。merge/active 写 hint 的 pwrite 次数
     16×↓。hint 非 WAL（可重建），加大缓冲只增大「崩溃丢 hint → fold(data) 回退」窗口，
     不影响正确性。Release 445/445 通过。
-- [ ] **P3 `nfkc_fold` ASCII fast path 仍 std::string 拷贝** — `include/bitcask/text_utils.hpp`
+- [~] **P3 `nfkc_fold` ASCII fast path 仍 std::string 拷贝** — **放弃
+  （2026-07-11 审计关闭）**:S29-8 定量修正后 fold 主成本在 inert 表查询而
+  非拷贝(双重解码已消,-10% 已收);view 化 API 改造 lifetime 复杂、收益
+  边际,不值得 churn。CJK 再提速的正解是 inert 查询 bitmap/SIMD 化(见
+  S29-8 注),与本项无关。原文:
   - 暂留：fast path 必须返回 owning string（要 tolower），拷贝固有；省拷贝需改 API
     （string_view + caller 保活 / in-place），lifetime 复杂、收益边际。低优先。
   - **关联 S29-8**（2026-07-10）：同文件更大的问题是 CJK 快路径整趟 decode 只为校验
@@ -1038,7 +1042,11 @@
   - **风险**：中-高（核心评分路径重构）。建议 A2 落地后再评估。
 
 - [ ] **C5 SOTA：SIMD Posting 压缩（FastPFOR / SIMD-BP128）** — `src/bm25/inverted.cpp` + `inverted.hpp`
-  - posting list 未压缩存 `vector<Posting>`。Lemire SIMD-BP128⋆ ~0.7 cycles/int。
+  - ⚠️ **动机已被 S30 重估(2026-07-11)**:封口段(数据主体)已是 v2 位打包
+    块 + mmap 按需解码,「省内存」动机消失;仅剩「解码提速」(BitReader
+    标量 → SIMD 批量解包)且 WAND interim 实测解码只占 +12%——**做之前
+    必须重新立项论证**,大概率降级为 v2 解码内核优化而非新存储格式。
+  - posting list 未压缩存 `vector<Posting>`(仅 building 段;封口段已压缩)。Lemire SIMD-BP128⋆ ~0.7 cycles/int。
   - **来源**：Lemire et al. SIMD Compression (2016)；ClickHouse 已采用。
   - **风险**：高（新编码 + 兼容老 checkpoint）。建议作为新存储格式 v4 一部分。
 
@@ -1351,7 +1359,8 @@ W4 ✅（parallel_scan 并行全表扫描）。
     （GCC 静默、clang 报错）；改 `"\xfa" "ult"` **保留完全相同字节**（已入 checkpoint，零 on-disk 变化）。
     **本地验证**：clang Debug 全量 486/486 通过（GCC 亦 486/486）。CI 用 Debug（clang+Release LTO
     需 gold 插件/lld，Debug 无 LTO 规避）。
-  - [ ] **macOS / ARM64 job** — 需对应 runner + 本地无法验证的交叉构建，留待。ARM64 尤有价值
+  - [~] **macOS / ARM64 job** — **搁置（2026-07-11 审计关闭:无 runner,条件
+    不具备且无行动路径;具备 runner 时重开）**。ARM64 尤有价值
     （验证 NEON/非 VNNI 标量路径 `detail/int8_kernels.hpp`）。
   - 注：端序已安全（整数可移植位移；float 向量有 `static_assert(endian==little)`，`codec.cpp:139`）。
 
@@ -1500,7 +1509,9 @@ W4 ✅（parallel_scan 并行全表扫描）。
 - [x] **S13-M3【低·异常路径】5 处 fopen 与 fclose 间 vector 分配可抛 → FILE* 泄漏** — 已完成（2026-07-02，5 处全改 `unique_ptr<FILE, FileCloser>`；migrate.cpp 复用 field_schema 的 detail::FileCloser，其余局部定义）
     · `keydir.cpp:1242`、`hnsw.cpp:1318`、`inverted.cpp:1866`、`inverted_wal.cpp:409`、`migrate.cpp:46`
   - 修：照搬库内既有 `unique_ptr<FILE, FileCloser>` 模式（`field_schema.hpp:47` 先例）。
-- [ ] **S13-M4【信息】`fstats_` 按 file_id 下标永不收缩**（长寿进程缓慢增长）· `keydir.cpp:196-200,254`
+- [~] **S13-M4【信息】`fstats_` 按 file_id 下标永不收缩** — **信息级归档
+  （2026-07-11 审计关闭:无行动项——收缩需扩展 RCU 发布协议,增长极慢
+  不值当,S21 复审同一结论）** · `keydir.cpp:196-200,254`
   - 低优先：考虑稀疏化或周期压缩。registry 目录记录只增为有意设计，不动。
 
 ### C. 性能（按性价比排序）
@@ -1541,7 +1552,8 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - 补 `BM_Hnsw_SearchConcurrent`（100k/ef64 × Threads 1/4/8，UseRealTime）：
     实测 1→4 线程延迟持平（147→135µs）、8 线程 CPU 时间不涨（无锁争用）。
   - 验证：HNSW 15/15（含 recall）、TSan 并发批零告警。
-- [~] **S13-P8【中批】** — 部分完成（2026-07-02，6/14 项落地）：
+- [x] **S13-P8【中批】** — 全部落地（原「6/14」计数陈旧——后续批次陆续
+  补齐,2026-07-11 审计核对下列子项全 [x]）：
   - [x] 短语打分每候选堆分配 → `other_pos` thread_local（parallel_for 内免分配器争用）
   - [x] 短语驱动词选最稀有（"the quantum" 不再遍历 "the" 大表；候选集/分数/平分
     决策逐字节同果——两列表均 ord 升序，idf 仍取 first term 语义）
@@ -2892,14 +2904,18 @@ W4 ✅（parallel_scan 并行全表扫描）。
   `ord_field_lens_` 随 S27-3 步骤 3（fields_ 退役,段集唯一真相源）整体删除,
   字段统计已段内自含,本项无实体可改。
 - [x] **S21-A1 hint record 格式 vbyte 化** — **已完成（S23，实现为 gap 差分而非纯推导）**，见下方 S23 段。
-- [ ] **S21-A6 sealed-mmap 可信读跳 CRC**（opt-in，先 bench 定量）。
+- [x] **S21-A6 sealed-mmap 可信读跳 CRC** — **由 S30-P4 承接完成
+  （2026-07-11）**:`mmap_verify_crc` 配置(默认恒校验,false = 可信盘跳
+  v2 段载入 CRC)全管道落地;v1 段容器恒校验(legacy,不再单独做)。
 - [x] **S21-B2 inverted_wal 退役** — **用户拍板删除，已完成（S22，2026-07-06）**，见下方 S22 段。
 - [~] **S21-B4 tests/support shim 渐进收缩** — **首批已完成（S24）**：
   wildcard/fuzzy/highlighter 15 例迁 TextPlugin 直连，锁定 9→6；余量
   inverted/synonym/searcher/checkpoint_recovery/cask_docvalue/
   search_layer_test，见下方 S24 段。
-- [ ] **S21-B6/B7 低优先**：cask.hpp 前置声明化（收益仅 C API TU）；sidecar
-  I/O 统一走 io 层 whole-file helper。
+- [~] **S21-B6/B7 低优先** — **放弃（2026-07-11 审计关闭:五个批次未触,
+  纯卫生项收益不抵 churn——B6 只省 C API TU 编译时间;B7 统一 helper 无
+  行为收益且 S30 新增 sidecar 已有独立实现）**。原文:cask.hpp 前置声明化;
+  sidecar I/O 统一走 io 层 whole-file helper。
 - **P3 维持暂留**（nfkc_fold view 化，lifetime 复杂收益边际）；**S13-M4 维持
   信息级**（fstats_ 收缩需扩展 RCU 发布协议，增长极慢不值当）。
 
@@ -2931,9 +2947,10 @@ W4 ✅（parallel_scan 并行全表扫描）。
     消费面零改动。
   - 验收：Debug **537/537**、TSan 并发子集（CoW/phrase/并发查询）**91/91**
     零 race、Release bench 全跑通。落盘格式与 C ABI 不变。
-  - 后续演进方向（挂账）：snapshot_flat 的整列拷贝可再演进为 CoW 零拷贝共享
-    （FlatPostings 持 shared_ptr 列引用）；S21-M3 的 per-term 快照 scratch
-    复用与此正交，仍在挂账单。
+  - ~~后续演进方向（挂账）：snapshot_flat 的整列拷贝可再演进为 CoW 零拷贝共享~~
+    **挂账关闭（2026-07-11）**:S29-6B 后 BOW 热路径走 TermSnapshotCache
+    (命中零快照)、S30 后封口段走 mmap 按需解码——snapshot_flat 只剩
+    miss/内存段路径,CoW 化残值不抵复杂度。
 
 
 ---
@@ -2994,8 +3011,10 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - 消费方：wildcard 两层各自独立二分区间、fuzzy 两层线性扫——层间无序
     不影响结果（集合语义 + BM25 按 term 求和）。发布协议（vocab_dirty_
     acquire/release + shared_ptr 换指针）不变。
-  - **仍挂账（M9 后半）**：词典字符串双份常驻（vocab_ 与 TBB map key）的
-    view 化——需先验证 oneTBB concurrent_hash_map rehash 的节点地址稳定性。
+  - ~~仍挂账（M9 后半）:词典字符串双份常驻的 view 化~~ **挂账关闭
+    （2026-07-11）**:封口段(词典主体)已由 S30 mmap 排序词典消灭双份
+    (vocab_ 侧表整套退役);仅剩 building 段(小、短命),残值不抵
+    「验证 TBB rehash 节点稳定性」的审计成本。
 - [x] **S24-B4 shim 收缩首批（15 例迁 TextPlugin 直连）**
   - wildcard 4 + fuzzy 3 + highlighter 8，断言集逐条不变；驱动层
     on_write → put_doc+apply_text（host_put_row 同构），双参 on_delete →
@@ -3108,9 +3127,12 @@ W4 ✅（parallel_scan 并行全表扫描）。
 >   - ① 并行化 reduce：term-hash 分片多 reducer（最大杠杆，抬天花板；工程量大）——**待评估**
 >   - ② catch-all 可配置开关（多字段场景倒排量直接减半）——**本批**
 >   - ③ 削减每文档分配抖动（大 V 尤甚）——**本批**
->   - ④ reducer 内批量/排序插入（吞吐 + 局部性）——待办
->   - ⑤ position delta-varint 编码（省内存/ckpt/IO）——待办
->   - ⑥ checkpoint 序列化并行/流式（缓解 1.7GB flush 停顿）——待办
+>   - ④ reducer 内批量/排序插入——**放弃(2026-07-11 审计:S27-4 DWPT 已
+>     用并行 builder 抬吞吐天花板 2.1×,批量插入残值低)**
+>   - ⑤ position delta-varint 编码——**已由 S30 承接(v2 段盘上 gap-varint
+>     且内存不再常驻)**
+>   - ⑥ checkpoint 序列化并行/流式——**已由 S30 承接(封口即流式落盘,
+>     ckpt 收窄为清单+sidecar,1.7GB 停顿消解)**
 
 ### P1 ② catch-all 可配置（多字段倒排减半）
 
@@ -3248,7 +3270,8 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - [x] Slice A/B1/B2a/C 已落地（`ea7794f`/`6148e04`/`3be3f6c`）：SealedSegment 多字段扩展
     （fields_ map + 多字段 save/load + multi_field_segment_search + mark_dead）、Building 段镜像 +
     查询 9/9 走 [SegmentSet+Building] 多段归并、delta 链退役（CheckpointDeltaChain×3 测试删除）。
-  - [ ] **剩余 B2b/D/E**：删 fields_ + flush 走段集 + recovery 重写 + legacy 迁移 + 段级 merge。
+  - [x] **剩余 B2b/D/E（5 步全落地,2026-07-11 补记——父项早已收官,本框
+    漏勾;两项挂账 consolidation/legacy 迁移已由 S30-P3 了结）**：删 fields_ + flush 走段集 + recovery 重写 + legacy 迁移 + 段级 merge。
     设计已闭合（双 manifest 冲突分析 + 方案 A + 5 步实现计划）：
     [`docs/design/s27-3-b2b-recovery-design.md`](docs/design/s27-3-b2b-recovery-design.md)。
     - [x] **步骤 1 已完成（2026-07-10）：SegmentSet 持久化解耦（零行为变化）**。
@@ -3655,7 +3678,9 @@ W4 ✅（parallel_scan 并行全表扫描）。
     平台突破**）；`MultiLibThroughput/1..8` +14~28%；SubmitDrain 116→110ms。
   - **验收**：build-rel + build-clang 双树 555/555；TSan 树相关并发子集 65/65。
   - **二期仍开**：per-lane 锁或 SPSC 回填队列（reorder_mu_ 仍全 lane 共享）。
-- [ ] **S29-T（新发现，与本批无关）TSan 树既存失败**：`IndexPoolMultiLib.
+- [x] **S29-T 已修（2026-07-11）**:按既定修法 TSan 下 GTEST_SKIP
+  (thread_pool_test.cpp 注释详述;build-clang/build-rel 继续守护该结构性
+  断言)。TSan 全量自此恒绿。原文:TSan 树既存失败:`IndexPoolMultiLib.
     ThreadCountIndependentOfLibCount` 在 build-tsan 稳定失败（`after_first-before`=3≠2，
     /proc/self/task 线程计数在 TSan 运行时下多 1）——**git stash 后同样失败，非 S29 引入**。
     build-clang/build-rel 均绿。疑 TSan 运行时线程计入。低优先：加 TSan 下跳过或放宽断言。
@@ -3711,8 +3736,12 @@ W4 ✅（parallel_scan 并行全表扫描）。
 7. ~~倒排桶锁二期~~ **已完成 2026-07-11（S29-6B thread_local term 快照缓存;
    BOW 4t -13% 延迟平坦;⚠️ 修正原估:基线并非零扩展,系 bench 计数器误读,
    详见 S29-6 二期条目）**
-8. **下一步候选**：S30 段 mmap 化（含跨段 consolidation,见下方 S30 批次）、
-   C4/C5/C6 SOTA、S29-11、S29-T（TSan 既存失败,低优先）
+8. ~~S30 段 mmap 化~~ **已收官(2026-07-11,P1-P5 全落地,见 S30 批次)**;
+   ~~S29-T~~ **已修**。
+9. **下一步候选(2026-07-11 审计后存量)**:C4 Block-Max MaxScore、
+   C6 Roaring Bitmap(bool_search 成瓶颈时)、C5(需重新立项论证,见其
+   注记)、S29-11 HNSW(含「向量出内存」侦查——S30 后向量图是最后的
+   全量驻留大轴)。
 
 ---
 
@@ -3734,9 +3763,9 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > TermSnapshotCache(S29-6B)自动升格为解码缓存(封口段 gen 恒 0 → 热词
 > 解码一次永久命中)、段 pin/孤儿忽略/流式 CRC 全现成。
 
-- [~] **S30-P1 盘格式 v2 + 只读 MmapSegmentReader**——**Slice 1/3/4 已完成
-  (2026-07-11):格式+writer+reader 全查询面+TermIndex 接线,P2 前置全部
-  就绪**;唯余 Slice 2(WAND 块游标,非阻塞优化项)。
+- [x] **S30-P1 盘格式 v2 + 只读 MmapSegmentReader**——**全部完成
+  (2026-07-11):格式+writer+reader 全查询面+TermIndex 接线;Slice 2
+  WAND 块游标经 P5 量化关闭(见下)**。
   - [x] **Slice 1:共享实现抽取 + 格式 + 流式 writer + reader 核心**
     - **抽取**:inverted.cpp 匿名 ns 的 score_bow_topk/ScoredTerm(View)/
       upper_bound_from/block_for_ord_in/**search_wand 主体**移入
@@ -3789,10 +3818,10 @@ W4 ✅（parallel_scan 并行全表扫描）。
       浮点累加序有别,用容差断言(内存版 parallel_reduce 采集序本即非
       确定)。clang 全量 **595/595**;ASan 全量 595/595;TSan 查询子集
       130/130;build-rel 构建过。
-  - [ ] **Slice 2(现唯一剩余优化项):WAND 块游标**——当前 WAND 档 mmap
-    查询是**全量解码 interim**(正确、逐位一致,但大词 O(df) 解码/查询;
-    与内存版 snapshot_flat 整列拷贝同量级,**非阻塞项**)。块游标按跳表
-    逐块解码(128/scratch)才兑现「大词不全量驻留/解码」。可延后到 P2 后。
+  - [~] **Slice 2:WAND 块游标** — **量化关闭(S30-P5,2026-07-11)**:
+    实测全量解码 interim 仅 +12% vs 内存段(打分主导;live_df 位级契约
+    本就要求 docid 列全解码),块游标收益上限即此,不值得游标化重构。
+    posting 规模/剪枝率量级变化时重开。
   - [x] **Slice 4 已完成(2026-07-11):TermIndex 接口接线**。
     - 新增 [`term_index.hpp`](include/bitcask/term_index.hpp):段内单字段
       **纯查询接口**(统计 ×3 + 查询面 ×8,写路径/持久化/内省有意不入);
