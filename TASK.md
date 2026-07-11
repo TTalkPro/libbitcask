@@ -3711,8 +3711,58 @@ W4 ✅（parallel_scan 并行全表扫描）。
 7. ~~倒排桶锁二期~~ **已完成 2026-07-11（S29-6B thread_local term 快照缓存;
    BOW 4t -13% 延迟平坦;⚠️ 修正原估:基线并非零扩展,系 bench 计数器误读,
    详见 S29-6 二期条目）**
-8. **下一步候选**：跨段 consolidation + legacy 段迁移（需 InvertedIndex 词表
-   遍历原语）、C4/C5/C6 SOTA、S29-11、S29-T（TSan 既存失败,低优先）
+8. **下一步候选**：S30 段 mmap 化（含跨段 consolidation,见下方 S30 批次）、
+   C4/C5/C6 SOTA、S29-11、S29-T（TSan 既存失败,低优先）
+
+---
+
+## 待办：S30 批次（封口段 mmap 化 + 写路径 RAM 预算封口 — 2026-07-11）
+
+> 设计文档：[`docs/design/s30-mmap-segments.md`](docs/design/s30-mmap-segments.md)
+> （盘格式 v2 / MmapSegmentReader / 预算封口 / tiered merge 全案）。
+>
+> **动机**：倒排全量驻留内存——≈16-20B/posting,1M 文档 × 500 词 ≈ 8-10GB;
+> wiser-cpp 实测 ckpt 单次 flush 1.7GB。写入期间 building 无大小预算(只在
+> ckpt 封口)+ save() 全段序列化进内存缓冲(双份驻留)——**写路径同样过量
+> 用内存**(用户提出的硬需求:写入时也不得全量驻留)。
+>
+> **目标内存模型**(Lucene 形态)：封口段 = 不可变盘文件 + mmap 按需解码
+> (page cache 管冷热);building ≤ RAM 预算(超即封口换 mmap);落盘流式
+> (无全段缓冲);ckpt 只提交清单(1.7GB 停顿消失)。改造后常驻 = building
+> 预算 × B + 每段 live 位图/词典块索引 + resolver(O(keys),本批不动)。
+> 前提全部已具备:段不可变(S27)、盘格式已列式压缩(v6)、BOW 本就拷快照、
+> TermSnapshotCache(S29-6B)自动升格为解码缓存(封口段 gen 恒 0 → 热词
+> 解码一次永久命中)、段 pin/孤儿忽略/流式 CRC 全现成。
+
+- [ ] **S30-P1 盘格式 v2 + 只读 MmapSegmentReader**（~2-3 会话）·
+  新 writer 流式写(排序词典目录 + u32 docid FOR 块 + WAND 跳表节 +
+  positions 节 + doc_store 节 + live sidecar 分离);reader 全查询面
+  (BOW 解码进 FlatPostings→现内核零改动 / **WAND 块游标(最大单项)** /
+  phrase / doc_freq / explain / wildcard-fuzzy 走 mmap 词典区间扫,封口段
+  ensure_vocab/vocab_ 侧表就此退役)。隔离验收:round-trip 与内存段逐位
+  一致 + WAND 剪枝对拍 + CRC 拒载。live 路径不动(双实现并存)。
+- [ ] **S30-P2 写路径接线（用户硬需求）**（~1-2 会话）·
+  `seal_ram_budget`(默认 64MB/builder,0=沿用现行为)——building 记账
+  超预算就地封口(flush_building_slot 现成)→ 流式落盘 → add_pending →
+  换入 mmap reader → **释放内存副本**;mark_dead 改 RAM 位图 + ckpt 落
+  live sidecar(替代 resave_dead_dirty 整段重存);ckpt 收窄为「封尾段 +
+  sidecar + 提交清单」。验收:写入压力 RSS 封顶于预算(新 bench 记
+  max RSS)、crash 矩阵(封口后-ckpt 前 kill → 孤儿清理 + WAL 重放等价,
+  沿用「孤儿段 open 忽略」不变量)、TSan 换入 vs 并发查询。
+- [ ] **S30-P3 tiered merge + legacy 段化迁移**（~2 会话,收编 S27-3 两项
+  挂账）· size-tiered 触发;流式 k-way merge(词典有序归并 + docid 重编 +
+  死行物理回收,有界内存);resolver 批量改指 + 清单一次提交;老格式 ckpt
+  首次 open 流式转写 v2 段(替代退全量 fold)。「词表遍历原语」由 mmap
+  排序词典免费满足。验收:合并前后查询逐位一致、死点回收计量、段数收敛。
+- [ ] **S30-P4 收尾**（~1 会话）· 三 sanitizer 全量;查询/索引 bench 无
+  回归 + 新增冷/热查询延迟与 RSS bench;S21-A6 opt-in 跳 CRC 顺带。
+- 收编挂账：S26-⑤⑥(positions 编码/ckpt 停顿)、S21-A6、S24-M9 后半
+  (封口段词典双份)、S27-3 挂账(consolidation + legacy 迁移)。
+- 明确非目标：KV 主路径零变化;HNSW 常驻另立项;key→location resolver
+  的 O(keys) RAM 不在本批。
+- 风险：冷查询 page-miss 长尾(Lucene 同款,madvise/缓存兜)、WAND 游标
+  复杂度(先对拍再切换)、SIGBUS(段文件一次写永不改 + open 验 CRC,残余
+  与读 data file 同级)。
 
 **与 S27 的关系**：S29 结构性各项与 S27-3 剩余（B2b/D/E recovery 重写）独立可并行；
 S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同属索引吞吐轴,
