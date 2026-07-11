@@ -3772,6 +3772,22 @@ W4 ✅（parallel_scan 并行全表扫描）。
 - 注:已落盘的坏 v1 段经 A3a 自愈可读;要物理清除盘上超长 term 可重建或
   等段 merge(v2 输出)自然重写。
 
+- [x] **S31.5 跟进(2026-07-11):自动 checkpoint 锚点改 ord 增量,默认开启**
+  · 用户指出:ckpt 若只在 roll/close 落盘,大文档语料崩溃后要重放巨量
+  **分词**(恢复主成本;S30 后段文件在预算/阈值封口时早已在盘上,只差
+  清单提交,重放纯属浪费)。
+  - 原机制:roll 置 pending(**字节锚点**)+ ord 增量阈值,`min_docs`
+    默认 0(关)——KV 字节与 analyze 算力脱钩,zhwiki 形态下窗口失控。
+  - 改动:`maybe_submit_auto_checkpoint` 去 roll 门,**每写评估 ord 增量**
+    (两次 relaxed load,热路径零 RMW;在途窗口 relaxed 预检再 exchange,
+    防达阈值后 RMW 弹跳——S29 教训);`auto_ckpt_pending_` 退役;
+    `auto_checkpoint_min_docs` **默认 0 → 65536**(与 building 封口阈值
+    对齐:封口后一个阈值内清单必提交,恢复重放窗口恒 ≤ 64K 文档)。
+  - 验收:新测 ×2——无 roll 无 close 写 60 篇(阈值 16)→ bm25.ckpt/
+    index.manifest 自动在盘 + crash-image 重开全量可检索;min_docs=0
+    对照(旧行为可回退)。clang 全量 **615/615**;ASan/TSan 子集绿;
+    build-rel 过。
+
 9. **下一步候选(2026-07-11 审计后存量)**:C4 Block-Max MaxScore、
    C6 Roaring Bitmap(bool_search 成瓶颈时)、C5(需重新立项论证,见其
    注记)、S29-11 HNSW(含「向量出内存」侦查——S30 后向量图是最后的

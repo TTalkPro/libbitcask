@@ -180,3 +180,16 @@ wiser query /tmp/db499 的      # → 10 hits
 复现测试已入库：分析器过滤 ×3、v1 跳词容错、wiser 形态 e2e（v1/v2 双模）、
 段损坏响亮降级，共 5 例（`analyzer_test` / `jieba_analyzer_test` /
 `inverted_test` / `text_plugin_test`）。
+
+## 八、跟进（2026-07-11，S31.5）：自动 checkpoint 锚点修正
+
+下游进一步指出：ckpt 若只锚在数据文件 roll / close，大文档语料崩溃后需重放
+巨量**分词**（恢复的主成本）。已修正：
+
+- 自动 checkpoint 的锚点从「roll（字节）」改为 **ord 增量本身**——每写评估，
+  自上次 ckpt 起增量 ≥ `auto_checkpoint_min_docs` 即异步提交（reducer 内
+  fire-and-forget，不阻塞写者）；
+- `auto_checkpoint_min_docs` **默认从 0（关）改为 65536**，与 building 段
+  封口阈值对齐——段封口后至多一个阈值周期，清单必然提交；
+- 效果：崩溃恢复的重放（重分词）窗口恒 ≤ 64K 文档，与语料单篇大小无关。
+  wiser 场景下可按需调小（如 8192）进一步收紧窗口。
