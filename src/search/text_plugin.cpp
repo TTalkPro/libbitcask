@@ -482,7 +482,7 @@ std::size_t TextPlugin::compact(double dead_ratio_threshold) {
         const auto segs = segment_set_->segments_view();  // reducer 上下文
         for (std::size_t i = 0; i < entries.size(); ++i) {
             if (segs[i]->live_doc_count() == 0) {
-                total += segs[i]->inverted().total_postings();
+                total += segs[i]->default_total_postings();
                 dead_ids.push_back(entries[i].seg_id);
             } else {
                 total += segs[i]->compact_postings(dead_ratio_threshold);
@@ -505,15 +505,15 @@ std::size_t TextPlugin::total_postings() const {
     std::size_t n = 0;
     if (segment_set_) {
         for (const auto& s : segment_set_->segments_view()) {
-            n += s->inverted().total_postings();
+            n += s->default_total_postings();
         }
     }
     if (auto bld = building_.load(std::memory_order_acquire)) {
-        n += bld->inverted().total_postings();
+        n += bld->default_total_postings();
     }
     for (const auto& b : builders_) {
         if (auto bld = b->building.load(std::memory_order_acquire)) {
-            n += bld->inverted().total_postings();
+            n += bld->default_total_postings();
         }
     }
     return n;
@@ -572,7 +572,7 @@ TextPlugin::collect_default_segment_views() const {
             const search::SealedSegment* seg = sp.get();
             views.push_back(search::SegmentView{
                 &seg->inverted(), seg,
-                [seg](DocId d) -> const std::string& { return seg->key_at(d); },
+                [seg](DocId d) { return std::string(seg->key_at(d)); },
                 [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
                 sp});
         }
@@ -582,7 +582,7 @@ TextPlugin::collect_default_segment_views() const {
         const search::SealedSegment* seg = bld.get();
         views.push_back(search::SegmentView{
             &seg->inverted(), seg,
-            [seg](DocId d) -> const std::string& { return seg->key_at(d); },
+            [seg](DocId d) { return std::string(seg->key_at(d)); },
             [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
             std::move(bld)});
     }
@@ -594,7 +594,7 @@ TextPlugin::collect_default_segment_views() const {
             const search::SealedSegment* seg = bld.get();
             views.push_back(search::SegmentView{
                 &seg->inverted(), seg,
-                [seg](DocId d) -> const std::string& { return seg->key_at(d); },
+                [seg](DocId d) { return std::string(seg->key_at(d)); },
                 [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
                 std::move(bld)});
         }
@@ -906,7 +906,8 @@ TextPlugin::explain(std::string_view query, std::string_view key,
     if (have_loc && !loc.tomb && loc.seg) {
         // S27-4 P1:loc.seg 即段对象 shared_ptr(天然 pin)。
         const auto& seg = *loc.seg;
-        return seg.inverted().explain(terms, loc.docid, seg, params_override);
+        return seg.default_term_index().explain(terms, loc.docid, seg,
+                                                 params_override);
     }
     // S27-3 步骤 3:fields_ fallback 删除——key_to_location_ 由 recovery
     // 重建(步骤 4),未命中即该 key 无文本索引。
@@ -1248,7 +1249,7 @@ void TextPlugin::rebuild_key_locations() {
             if (!seg.is_live(docid)) continue;
             // 段序=seg_id 升序、段内 docid 升序=LSN 升序 → 直接覆盖即
             // 后写胜;S27-4 P1 起条目带 ord(LSN 守卫)与段对象指针。
-            key_to_location_[seg.key_at(docid)] =
+            key_to_location_[std::string(seg.key_at(docid))] =
                 KeyLocation{sp, docid, seg.lsn_at(docid), false};
         }
     }

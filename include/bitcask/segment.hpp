@@ -26,10 +26,12 @@
 #include "bitcask/search_types.hpp"    // kDefaultField
 #include "bitcask/row_chunks.hpp"      // RowChunks（并发 doc_store 底座）
 #include "bitcask/segment_query.hpp"   // SegmentView
+#include "bitcask/segment_v2.hpp"      // S30-P2:mmap 背衬(MmapSegment/MmapFieldIndex)
 #include "bitcask/string_hash.hpp"     // StringHash（透明 hash）
 
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -152,10 +154,12 @@ public:
 
     // ---- LiveChecker（按段内 docid） ----
     [[nodiscard]] bool is_live(std::uint64_t docid) const override {
+        if (mmap_) return mmap_->is_live(docid);
         return docid < count_pub_.load(std::memory_order_acquire) &&
                live_[docid].load(std::memory_order_relaxed) != 0;
     }
     [[nodiscard]] std::uint32_t doc_len(std::uint64_t docid) const override {
+        if (mmap_) return mmap_->doc_len(docid);
         return docid < count_pub_.load(std::memory_order_acquire)
                    ? doc_lens_[docid]
                    : 0;
@@ -178,6 +182,14 @@ public:
     // 拿到非 const SealedSegment*（SegmentSet::segment() 显式返回非 const
     // 访问，或经 const_cast 显式 cast，二者都表明「删除是 mutation」）。
     [[nodiscard]] bool mark_dead(DocId docid) {
+        // S30-P2:mmap 背衬——翻 MmapSegment 的 RAM 位图(段文件不动),
+        // dead_dirty 语义变为「待落 live sidecar」(v1 段仍是整段重存)。
+        if (mmap_) {
+            if (docid >= mmap_->doc_count()) return false;
+            mmap_->mark_dead(docid);
+            dead_dirty_.store(true, std::memory_order_relaxed);
+            return true;
+        }
         if (docid >= count_pub_.load(std::memory_order_acquire)) return false;
         live_[docid].store(0, std::memory_order_relaxed);
         dead_dirty_.store(true, std::memory_order_relaxed);  // S27-3 B2b 步骤 4:待重存
@@ -190,6 +202,10 @@ public:
     // (compact 遍历 tbb map 与并发 add_doc 不兼容,同旧 fields_ 约束;
     // 并发**查询**安全——CoW posting)。返回压实掉的 posting 数。
     std::size_t compact_postings(double dead_ratio_threshold) {
+        // S30-P2:mmap 段不可原地压实(段文件一次写永不改)——物理回收归
+        // P3 段级 merge(重写新段)。no-op 使 maybe_auto_compact 对 mmap 段
+        // 自然失效,不误触发。
+        if (mmap_) return 0;
         std::size_t n = inv_.compact(*this, dead_ratio_threshold);
         {
             std::shared_lock lk(fields_mu_);
@@ -211,6 +227,7 @@ public:
     void clear_dead_dirty() { dead_dirty_.store(false, std::memory_order_relaxed); }
     // 活文档计数（live_==1 的数量）——测试 / 内省用。
     [[nodiscard]] std::size_t live_doc_count() const {
+        if (mmap_) return mmap_->live_count();
         const auto cnt = count_pub_.load(std::memory_order_acquire);
         std::size_t n = 0;
         for (std::uint64_t i = 0; i < cnt; ++i) {
@@ -220,18 +237,42 @@ public:
     }
 
     [[nodiscard]] std::size_t doc_count() const {
+        if (mmap_) return mmap_->doc_count();
         return count_pub_.load(std::memory_order_acquire);
     }
+    // ⚠️ 仅内存态可用(building/legacy v1 段)。mmap 段无 InvertedIndex 本体,
+    // 查询面请走 default_term_index()(TermIndex,两种形态皆有效)。
     [[nodiscard]] const bm25::InvertedIndex& inverted() const { return inv_; }
-    [[nodiscard]] const std::string& key_at(DocId d) const { return keys_[d]; }
-    [[nodiscard]] Lsn lsn_at(DocId d) const { return lsns_[d]; }
+    // S30-P2:默认字段查询面(形态无关)。explain 等消费方用此替代 inverted()。
+    [[nodiscard]] const bm25::TermIndex& default_term_index() const {
+        if (mmap_) return *mmap_default_;
+        return inv_;
+    }
+    // 默认字段 posting 总量(auto-compact 记账用)。mmap 段返回 0——不可原地
+    // 压实,不参与 compact 阈值记账(回收归 P3 merge)。
+    [[nodiscard]] std::size_t default_total_postings() const {
+        return mmap_ ? 0 : inv_.total_postings();
+    }
+    [[nodiscard]] bool is_mmap_backed() const noexcept { return mmap_ != nullptr; }
+    // S30-P2:key_at 改 string_view——mmap 背衬的 key 直指映射区(零拷贝),
+    // 内存态指 keys_ 行(RowChunks 元素稳定)。持有期 ≤ 段 pin 生命周期。
+    [[nodiscard]] std::string_view key_at(DocId d) const {
+        if (mmap_) return mmap_->key_of(d);
+        return keys_[d];
+    }
+    [[nodiscard]] Lsn lsn_at(DocId d) const {
+        if (mmap_) return mmap_->lsn_of(d);
+        return lsns_[d];
+    }
 
     // 单字段默认视图（multi_segment_search 用；向后兼容）。
     [[nodiscard]] SegmentView view() const {
         return SegmentView{
-            &inv_, this,
-            [this](DocId d) { return keys_[d]; },
-            [this](DocId d) { return lsns_[d]; }};
+            mmap_ ? static_cast<const bm25::TermIndex*>(mmap_default_)
+                  : static_cast<const bm25::TermIndex*>(&inv_),
+            this,
+            [this](DocId d) { return std::string(key_at(d)); },
+            [this](DocId d) { return lsn_at(d); }};
     }
 
     // 多字段视图（multi_field_segment_search 用）：把本段所有字段（含默认）汇总。
@@ -242,6 +283,15 @@ public:
     // 不会被移动，唯一指针在 map 内不动），view 持有方持本段活过查询即可。
     [[nodiscard]] MultiFieldSegmentView multi_view() const {
         std::vector<FieldSegmentView> fvs;
+        // S30-P2:mmap 背衬——字段清单来自 v2 文件,适配器 open_v2 时建好
+        // (地址稳定,活到段析构)。
+        if (mmap_) {
+            fvs.reserve(mmap_fields_.size());
+            for (const auto& fi : mmap_fields_) {
+                fvs.push_back(FieldSegmentView{fi->field(), fi.get()});
+            }
+            return MultiFieldSegmentView{this, std::move(fvs)};
+        }
         std::shared_lock lk(fields_mu_);  // S27-4 P2:size() 读也须在锁内
         fvs.reserve(1 + fields_.size());
         fvs.push_back(FieldSegmentView{kDefaultField, &inv_});
@@ -261,8 +311,11 @@ public:
     }
 
     // ---- 落盘 / 载入（复用 SearchCheckpoint 段级 CRC 容器） ----
+    // ⚠️ v1 格式,仅内存态段可写;mmap 段的文件即真相源,重存无意义 →
+    // false(dead 位持久化走 save_live_sidecar)。
     [[nodiscard]] bool save(const std::string& path,
                             std::uint64_t watermark) const {
+        if (mmap_) return false;
         SectionWriter sw;
         {
             std::vector<std::byte> b;
@@ -306,6 +359,83 @@ public:
         if (!have_inv || !have_ds) return nullptr;
         (void)have_fields;  // 可选；不强制要求
         return seg;
+    }
+
+    // ---- S30-P2:v2(mmap)落盘 / 载入 ----
+
+    // 把内存态段流式写成 v2 文件(格式见 segment_v2.hpp)。若有已删文档,
+    // 同时落 `<path>.live` sidecar(v2 主文件不含 live 位,一次写永不改)。
+    // 仅内存态段可调;封口点/迁移用。
+    [[nodiscard]] bool save_v2(const std::string& path,
+                               std::uint64_t seg_id) const {
+        if (mmap_) return false;
+        const auto n_docs = static_cast<std::uint32_t>(
+            count_pub_.load(std::memory_order_acquire));
+        std::vector<std::pair<std::string_view, const bm25::InvertedIndex*>>
+            fields;
+        {
+            std::shared_lock lk(fields_mu_);
+            fields.reserve(1 + fields_.size());
+            fields.emplace_back(kDefaultField, &inv_);
+            for (const auto& [name, inv] : fields_) {
+                fields.emplace_back(name, inv.get());
+            }
+            std::uint64_t total_dl = 0;
+            for (std::uint32_t d = 0; d < n_docs; ++d) total_dl += doc_lens_[d];
+            if (!write_segment_v2(
+                    path, seg_id, fields, n_docs,
+                    [this](std::uint32_t d) {
+                        return SegV2DocRow{keys_[d], lsns_[d], slots_[d]};
+                    },
+                    total_dl)) {
+                return false;
+            }
+        }
+        // dead 位:任何已删 → 落 sidecar(全活则省略,open_v2 缺省全活)。
+        bool any_dead = false;
+        for (std::uint32_t d = 0; d < n_docs && !any_dead; ++d) {
+            any_dead = live_[d].load(std::memory_order_relaxed) == 0;
+        }
+        if (any_dead) {
+            auto tmp_seg = MmapSegment::open(path);
+            if (!tmp_seg) return false;
+            for (std::uint32_t d = 0; d < n_docs; ++d) {
+                if (live_[d].load(std::memory_order_relaxed) == 0) {
+                    tmp_seg->mark_dead(d);
+                }
+            }
+            if (!tmp_seg->save_live_sidecar(path + ".live")) return false;
+        }
+        return true;
+    }
+
+    // 打开 v2 段文件为 mmap 背衬段:查询面/liveness/doc_store 全部委托
+    // MmapSegment(内存态字段恒空)。`<path>.live` sidecar 存在则叠加。
+    // 失败(IO/CRC/坏 sidecar)→ nullptr。
+    [[nodiscard]] static std::unique_ptr<SealedSegment> open_v2(
+        const std::string& path) {
+        auto m = MmapSegment::open(path);
+        if (!m) return nullptr;
+        const std::string side = path + ".live";
+        if (std::filesystem::exists(side)) {
+            if (!m->load_live_sidecar(side)) return nullptr;  // 坏 sidecar:拒载
+        }
+        auto seg = std::make_unique<SealedSegment>();
+        seg->mmap_ = std::move(m);
+        for (auto name : seg->mmap_->field_names()) {
+            seg->mmap_fields_.push_back(std::make_unique<MmapFieldIndex>(
+                seg->mmap_.get(), std::string(name)));
+            if (name == kDefaultField) {
+                seg->mmap_default_ = seg->mmap_fields_.back().get();
+            }
+        }
+        if (seg->mmap_default_ == nullptr) return nullptr;  // v2 恒写默认字段
+        return seg;
+    }
+
+    // dead 位持久化(mmap 段;ckpt 时消费 dead_dirty 调用)。
+    [[nodiscard]] bool save_live_sidecar(const std::string& path) const {
+        return mmap_ ? mmap_->save_live_sidecar(path) : false;
     }
 
 private:
@@ -481,6 +611,14 @@ private:
     mutable std::shared_mutex fields_mu_;
     std::unordered_map<std::string, std::unique_ptr<bm25::InvertedIndex>,
                        StringHash, std::equal_to<>> fields_;
+
+    // ---- S30-P2:mmap 背衬(open_v2 产物) ----
+    // 非空 ⇒ 本段由 v2 段文件支撑:上方内存态成员恒为空,查询面/liveness/
+    // doc_store 全部委托。适配器 open_v2 一次建好(unique_ptr 地址稳定,
+    // 活到段析构;view/multi_view 出借裸指针,持有方 pin 段即可)。
+    std::unique_ptr<MmapSegment> mmap_;
+    std::vector<std::unique_ptr<MmapFieldIndex>> mmap_fields_;
+    const MmapFieldIndex* mmap_default_ = nullptr;
 };
 
 // ===========================================================================
@@ -589,7 +727,7 @@ private:
         merged.reserve(merged.size() + acc_local.size());
         for (const auto& [docid, score] : acc_local) {
             merged.push_back(SearchHit{
-                seg->key_at(docid),
+                std::string(seg->key_at(docid)),
                 seg->lsn_at(docid),
                 score});
         }

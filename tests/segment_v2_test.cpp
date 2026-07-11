@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "bitcask/inverted.hpp"
+#include "bitcask/segment.hpp"        // P2:SealedSegment(mmap 背衬)
 #include "bitcask/segment_query.hpp"  // Slice 4:SegmentView / multi_segment_search
 #include "bitcask/segment_v2.hpp"
 #include "test_support.hpp"
@@ -694,4 +695,161 @@ TEST(SegmentV2Slice4, PolymorphicSurfaceEquivalence) {
     const auto ea = tmm->explain(q, 3, c.live);
     const auto eb = tmem->explain(q, 3, c.live);
     EXPECT_EQ(ea.total, eb.total);
+}
+
+// ===========================================================================
+// S30-P2 Slice A：SealedSegment mmap 背衬——save_v2/open_v2 双形态段级等价。
+// ===========================================================================
+
+namespace {
+
+using bitcask::search::MultiFieldSegmentView;
+using bitcask::search::SealedSegment;
+using bitcask::search::multi_field_segment_search;
+
+// 构建多字段内存段:默认字段 + title/body 命名字段,交错文档。
+std::unique_ptr<SealedSegment> build_sealed(std::uint32_t docs) {
+    auto seg = std::make_unique<SealedSegment>();
+    for (std::uint32_t d = 0; d < docs; ++d) {
+        TermPositions def;
+        def["hot"] = {1 + d % 3, {0}};
+        def["mid" + std::to_string(d % 10)] = {1, {1}};
+        TermPositions title;
+        title["t" + std::to_string(d % 5)] = {1, {0}};
+        TermPositions body;
+        body["shared"] = {2, {0, 4}};
+        std::vector<SealedSegment::FieldInput> fs;
+        fs.push_back({bitcask::search::kDefaultField, &def});
+        fs.push_back({"title", &title});
+        fs.push_back({"body", &body});
+        std::uint32_t total_dl = 0;
+        for (const auto& f : fs) {
+            for (const auto& [t, pd] : *f.terms) total_dl += pd.first;
+        }
+        (void)seg->add("k" + std::to_string(d), 5000 + d, fs, total_dl,
+                       bitcask::index::DocLoc{.offset = d * 32,
+                                              .file_id = 3,
+                                              .total_sz = 32},
+                       /*tstamp=*/7);
+    }
+    return seg;
+}
+
+}  // namespace
+
+// 内存段 vs save_v2→open_v2 的 mmap 背衬段:doc_store 访问器、单段/多字段
+// 查询流全部等价(mmap 侧走 MmapFieldIndex 适配器,消费方无感)。
+TEST(SegmentV2P2, SealedSegmentMmapBackedEquivalence) {
+    auto mem = build_sealed(200);
+    const auto path = (std::filesystem::temp_directory_path() /
+                       "segv2_p2_sealed.seg")
+                          .string();
+    std::filesystem::remove(path);
+    std::filesystem::remove(path + ".live");
+    ASSERT_TRUE(mem->save_v2(path, /*seg_id=*/42));
+    auto mm = SealedSegment::open_v2(path);
+    ASSERT_NE(mm, nullptr);
+    ASSERT_TRUE(mm->is_mmap_backed());
+    EXPECT_FALSE(mem->is_mmap_backed());
+
+    // doc_store / liveness 面。
+    ASSERT_EQ(mm->doc_count(), 200u);
+    for (std::uint32_t d = 0; d < 200; d += 17) {
+        EXPECT_EQ(mm->key_at(d), mem->key_at(d));
+        EXPECT_EQ(mm->lsn_at(d), mem->lsn_at(d));
+        EXPECT_EQ(mm->doc_len(d), mem->doc_len(d));
+        EXPECT_TRUE(mm->is_live(d));
+    }
+    EXPECT_EQ(mm->live_doc_count(), mem->live_doc_count());
+    EXPECT_EQ(mm->default_total_postings(), 0u);  // mmap 不参与 compact 记账
+
+    // 单段查询流(view → multi_segment_search)。
+    for (const auto& q : std::vector<std::vector<std::string>>{
+             {"hot"}, {"mid3", "mid7"}, {"hot", "ghost"}}) {
+        std::vector<SegmentView> vm{mem->view()};
+        std::vector<SegmentView> vx{mm->view()};
+        expect_same_hits(multi_segment_search(vm, q, 10),
+                         multi_segment_search(vx, q, 10), "view:" + q[0]);
+    }
+
+    // 多字段查询流(multi_view → multi_field_segment_search)。
+    std::unordered_map<std::string, std::vector<std::string>> ft;
+    ft["title"] = {"t2"};
+    ft["body"] = {"shared"};
+    ft[std::string(bitcask::search::kDefaultField)] = {"hot"};
+    std::vector<MultiFieldSegmentView> mvm;
+    mvm.push_back(mem->multi_view());
+    std::vector<MultiFieldSegmentView> mvx;
+    mvx.push_back(mm->multi_view());
+    expect_same_hits(multi_field_segment_search(mvm, ft, 15),
+                     multi_field_segment_search(mvx, ft, 15), "multifield");
+
+    // default_term_index(形态无关查询面)+ explain。
+    FakeLiveChecker all;
+    for (std::uint32_t d = 0; d < 200; ++d) all.doc_lens[d] = mem->doc_len(d);
+    const std::vector<std::string> eq = {"hot", "mid1"};
+    const auto ea = mm->default_term_index().explain(eq, 9, all);
+    const auto eb = mem->default_term_index().explain(eq, 9, all);
+    EXPECT_EQ(ea.total, eb.total);
+}
+
+// mmap 段的删除:mark_dead 翻 RAM 位图 → 查询即时反映;dead_dirty →
+// save_live_sidecar → 重开还原;compact_postings 恒 no-op;save(v1) 拒绝。
+TEST(SegmentV2P2, MmapBackedMarkDeadAndSidecar) {
+    auto mem = build_sealed(60);
+    const auto path = (std::filesystem::temp_directory_path() /
+                       "segv2_p2_dead.seg")
+                          .string();
+    std::filesystem::remove(path);
+    std::filesystem::remove(path + ".live");
+    ASSERT_TRUE(mem->save_v2(path, 1));
+    auto mm = SealedSegment::open_v2(path);
+    ASSERT_NE(mm, nullptr);
+
+    EXPECT_FALSE(mm->dead_dirty());
+    ASSERT_TRUE(mm->mark_dead(10));
+    ASSERT_TRUE(mm->mark_dead(20));
+    EXPECT_FALSE(mm->mark_dead(60));  // 越界
+    EXPECT_TRUE(mm->dead_dirty());
+    EXPECT_FALSE(mm->is_live(10));
+    EXPECT_EQ(mm->live_doc_count(), 58u);
+
+    // 删除即时反映到查询(live 过滤)。
+    std::vector<SegmentView> v{mm->view()};
+    const auto hits = multi_segment_search(v, {"hot"}, 60);
+    for (const auto& h : hits) {
+        EXPECT_NE(h.key, "k10");
+        EXPECT_NE(h.key, "k20");
+    }
+
+    // sidecar 持久化 → 重开还原。
+    ASSERT_TRUE(mm->save_live_sidecar(path + ".live"));
+    mm->clear_dead_dirty();
+    auto mm2 = SealedSegment::open_v2(path);
+    ASSERT_NE(mm2, nullptr);
+    EXPECT_FALSE(mm2->is_live(10));
+    EXPECT_FALSE(mm2->is_live(20));
+    EXPECT_EQ(mm2->live_doc_count(), 58u);
+
+    EXPECT_EQ(mm2->compact_postings(0.0), 0u);  // 不可原地压实
+    EXPECT_FALSE(mm2->save("/tmp/should_not_write.v1", 0));  // v1 拒绝
+}
+
+// save_v2 时已有死文档 → 自动落 sidecar,open_v2 直接还原(v1→v2 迁移形态)。
+TEST(SegmentV2P2, SaveV2CarriesDeadBits) {
+    auto mem = build_sealed(30);
+    ASSERT_TRUE(mem->mark_dead(3));
+    ASSERT_TRUE(mem->mark_dead(7));
+    const auto path = (std::filesystem::temp_directory_path() /
+                       "segv2_p2_carry.seg")
+                          .string();
+    std::filesystem::remove(path);
+    std::filesystem::remove(path + ".live");
+    ASSERT_TRUE(mem->save_v2(path, 2));
+    EXPECT_TRUE(std::filesystem::exists(path + ".live"));
+    auto mm = SealedSegment::open_v2(path);
+    ASSERT_NE(mm, nullptr);
+    EXPECT_FALSE(mm->is_live(3));
+    EXPECT_FALSE(mm->is_live(7));
+    EXPECT_EQ(mm->live_doc_count(), 28u);
 }

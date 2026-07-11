@@ -3810,7 +3810,33 @@ W4 ✅（parallel_scan 并行全表扫描）。
     - 注:MultiFieldSegmentView::seg 仍为 `const SealedSegment*`(LiveChecker
       + key/lsn 源)——mmap 多字段流随 P2 的 SealedSegment mmap 背衬自然
       覆盖,无需此处泛化。
-- [ ] **S30-P2 写路径接线（用户硬需求）**（~1-2 会话）·
+- [~] **S30-P2 写路径接线（用户硬需求）**——**Slice A 已完成(2026-07-11)**:
+  - [x] **Slice A:SealedSegment mmap 背衬模式**(封口段对象可由 v2 文件支撑,
+    写路径换入的对象层弹药)。
+    - `SealedSegment` 增 `mmap_` 背衬:`open_v2(path)` 工厂(载 v2 + 自动叠
+      `<path>.live` sidecar,坏 sidecar 拒载)/`save_v2(path, seg_id)`(内存态
+      流式写 v2;有死文档自动落 sidecar——v1→v2 迁移形态)。背衬段的
+      LiveChecker/mark_dead/doc_count/key_at/lsn_at/view/multi_view/
+      live_doc_count 全部委托 MmapSegment;`compact_postings` 恒 no-op
+      (段文件一次写永不改,物理回收归 P3 merge);v1 `save()` 拒绝。
+    - `key_at` 改 `string_view`(mmap 零拷贝直指映射区);新
+      `default_term_index()`(TermIndex,双形态有效)替代 explain 处的
+      `inverted()` 直调;`default_total_postings()`(mmap→0,不参与
+      auto-compact 记账)替代 4 处 `inverted().total_postings()`。
+      text_plugin 迁移 ×9 处,语义零变化。
+    - 验收:新测 ×3——双形态段级等价(doc_store 访问器 + view→
+      multi_segment_search + multi_view→multi_field_segment_search +
+      explain 逐位)、mmap 段 mark_dead→查询即时反映→sidecar 往返→压实
+      no-op、save_v2 带死位迁移。clang 全量 **600/600**;ASan 600/600;
+      TSan 段/搜索/恢复子集 123/123;build-rel 过。
+  - [ ] **Slice B:写路径换入 + 预算封口 + ckpt 收窄**(P2 主体,剩余项):
+    ① `flush_building_slot` 封口改走 save_v2 → open_v2 → SegmentSet 登记
+    mmap 段 → key_to_location_ 批量重指新对象 → 内存段随 pin 排干释放;
+    ② SegmentSet::open 识别 v2 段文件(双格式并存);resave_dead_dirty 对
+    mmap 段改落 sidecar;③ `seal_ram_budget` 配置——building 记账超预算
+    就地封口(不等 ckpt);④ crash 矩阵(封口后-ckpt 前 kill → 孤儿清理 +
+    WAL 重放等价)+ RSS 封顶 bench + TSan 换入 vs 并发查询。
+  原计划全文（供 Slice B 对照）:（~1-2 会话）·
   `seal_ram_budget`(默认 64MB/builder,0=沿用现行为)——building 记账
   超预算就地封口(flush_building_slot 现成)→ 流式落盘 → add_pending →
   换入 mmap reader → **释放内存副本**;mark_dead 改 RAM 位图 + ckpt 落
