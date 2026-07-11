@@ -1,6 +1,7 @@
 #include "bitcask/intersect.hpp"
 #include "bitcask/inverted.hpp"
 #include "bitcask/myers.hpp"
+#include "bitcask/term_snapshot_cache.hpp"
 #include "bitcask/wildcard_matcher.hpp"
 #include "bitcask/bm25_kernels.hpp"
 
@@ -85,12 +86,21 @@ struct ScoredTerm {
     FlatPostings fp;
 };
 
+// S29-6B：score_bow_topk 改收视图——search 命中路径的 fp 常驻 thread_local
+// TermSnapshotCache 条目（零拷贝消费），wildcard/fuzzy 套一层视图数组。
+// 指向物在评分期间稳定：缓存条目被 use_seq 钉住（同查询不淘汰），
+// tps_pool/tps 为调用方栈上/线程私有容器。
+struct ScoredTermView {
+    const std::string*  term;
+    const FlatPostings* fp;
+};
+
 // bag-of-words 评分 + top-k：三条路径（search 标量 / wildcard / fuzzy）此前
 // 各自内联一份逐字相同的「批量 live/doc_len + 两阶段评分 parallel_reduce +
 // 小顶堆 top-k」。提取单一实现，BM25 公式与「分数位级不变 / 无分支可向量化」
 // 两条不变量只此一处（避免改公式时漏改某条低频路径致评分不一致）。
 std::vector<SearchResult> score_bow_topk(
-    std::span<const ScoredTerm> tps, std::size_t k,
+    std::span<const ScoredTermView> tps, std::size_t k,
     std::uint64_t N, std::uint64_t sum_dl,
     const Bm25Params& params, const LiveChecker& live_checker,
     const std::vector<std::pair<std::string, std::uint64_t>>* global_df = nullptr) {  // S29-5：扁平化
@@ -118,7 +128,7 @@ std::vector<SearchResult> score_bow_topk(
         static thread_local std::vector<std::uint32_t> dls;
         static thread_local std::vector<float> contrib;
         for (std::size_t ti = 0; ti < tps.size(); ++ti) {
-            const auto& fp = tps[ti].fp;
+            const auto& fp = *tps[ti].fp;
             const std::size_t n = fp.size();
 
             // P2.1：live/doc_len 批量取——一次虚调用（Index 侧一次锁）完成
@@ -136,7 +146,7 @@ std::vector<SearchResult> score_bow_topk(
             double df_idf = static_cast<double>(live_df);
             if (global_df) {
                 for (const auto& [t, v] : *global_df) {
-                    if (t == tps[ti].term) {
+                    if (t == *tps[ti].term) {
                         if (v > 0) df_idf = static_cast<double>(v);
                         break;
                     }
@@ -418,6 +428,8 @@ void InvertedIndex::add_doc(
             shard.vocab_delta_.push_back(term);
             shard.vocab_dirty_.store(true, std::memory_order_release);
         }
+        // S29-6B：posting 变更完成 → 失效查询线程的 term 快照缓存。
+        shard.gen_.fetch_add(1, std::memory_order_release);
     }
 
     live_doc_count_.fetch_add(1, std::memory_order_relaxed);
@@ -452,10 +464,42 @@ const std::string& tls_term_key(std::string_view term) {
 }
 }  // namespace
 
+namespace {
+// S29-6B：清空缓存条目的 fp（保留 vector 容量复用）。
+void clear_fp(FlatPostings& fp) {
+    fp.ords.clear();
+    fp.tfs.clear();
+    fp.blocks.clear();
+    fp.max_tf = 0;
+}
+}  // namespace
+
 // S27-2：term 的 doc frequency（posting list 长度；含未 merge 的已删，
 // Lucene-style df，§4 接受该近似）。宿主跨段求和得全局 df。
+// S29-6B：快照缓存快路径——gen 相等 ⇒ 自快照以来本 shard 无 posting 变更
+// ⇒ 缓存 df 即当前列长，零锁零 RMW（分段查询 stage-1 逐段逐词调用本函数，
+// 与 stage-2 search 共享同一条目，同段同词稳态 0 次 find）。
 std::uint64_t InvertedIndex::doc_freq(std::string_view term) const {
     auto& shard = shard_for(term);
+    if (query_cache_enabled()) {
+        auto& cache = TermSnapshotCache::tls_instance();
+        const std::uint64_t gen = shard.gen_.load(std::memory_order_acquire);
+        if (const auto* e = cache.probe(index_id_, term, gen)) return e->df;
+        PostingMap::const_accessor acc;
+        const bool found = shard.inverted.find(acc, tls_term_key(term));
+        const std::uint64_t df =
+            found ? static_cast<std::uint64_t>(acc->second->size()) : 0;
+        // 落缓存：present ⇒ df-only（不搬行，大 term 快照不划算；行由 search
+        // 标量分支按需补齐）；absent ⇒ 缺席负缓存（has_rows=true + 空 fp）。
+        if (auto* e = cache.upsert(index_id_, term, gen)) {
+            e->df = df;
+            if (!found) {
+                clear_fp(e->fp);
+                e->has_rows = true;
+            }
+        }
+        return df;
+    }
     PostingMap::const_accessor acc;
     if (shard.inverted.find(acc, tls_term_key(term))) {
         return static_cast<std::uint64_t>(acc->second->size());
@@ -470,13 +514,66 @@ auto InvertedIndex::search(
     const Bm25Params* params_override,
     const ExtStats* ext) const -> std::vector<SearchResult> {
     const Bm25Params& params = params_override ? *params_override : params_;
+    const std::uint64_t N =
+        ext ? ext->N : live_doc_count_.load(std::memory_order_relaxed);
+    const std::uint64_t sum_dl =
+        ext ? ext->sum_dl : sum_doc_len_.load(std::memory_order_relaxed);
+
+    // ---- S29-6B Phase 1：thread_local 快照缓存探测（零锁零 RMW） ----
+    // 全词命中且 BOW 规模 ⇒ 直接从缓存条目评分：整条路径唯一的共享触点是
+    // 每词一次 shard gen_ 的 acquire load（纯读,read-only 稳态下 cacheline
+    // 保持 SHARED,线性扩展）——桶锁 RMW 与 shared_ptr 引用计数 RMW 全免
+    //（此前每词 4 次共享 cacheline RMW 是 BOW 并发零扩展的根因）。
+    // 设计:docs/design/s29-6b-inverted-term-cache.md。
+    const bool use_cache = query_cache_enabled();
+    auto& cache = TermSnapshotCache::tls_instance();
+    static thread_local std::vector<const FlatPostings*> hit_fps;
+    static thread_local std::vector<std::uint64_t> term_gens;
+    static thread_local std::vector<ScoredTermView> views;
+    if (use_cache) {
+        cache.begin_query();
+        hit_fps.assign(query_terms.size(), nullptr);
+        term_gens.resize(query_terms.size());
+        bool all_hit = true;
+        std::size_t cached_total = 0;
+        for (std::size_t i = 0; i < query_terms.size(); ++i) {
+            auto& shard = shard_for(query_terms[i]);
+            // gen 先于 find 读取(Phase 2 落缓存沿用):快照内容 ≥ gen 时刻
+            // 状态,缓存声称的版本恒不晚于实际内容——过保守方向,安全。
+            term_gens[i] = shard.gen_.load(std::memory_order_acquire);
+            const auto* e = cache.probe(index_id_, query_terms[i], term_gens[i]);
+            if (e != nullptr && e->has_rows) {
+                hit_fps[i] = &e->fp;
+                cached_total += e->fp.size();
+            } else {
+                all_hit = false;  // miss 或 df-only(行未搬)
+            }
+        }
+        if (all_hit) {
+            if (cached_total == 0) return {};  // 全缺席(负缓存)
+            if (cached_total < kWandThreshold) {
+                views.clear();
+                for (std::size_t i = 0; i < query_terms.size(); ++i) {
+                    if (hit_fps[i] != nullptr && !hit_fps[i]->empty()) {
+                        views.push_back({&query_terms[i], hit_fps[i]});
+                    }
+                }
+                return score_bow_topk(views, k, N, sum_dl, params,
+                                      live_checker, ext ? ext->df : nullptr);
+            }
+            // WAND 规模：评分需 PostingList 指针,落 Phase 2(计算主导,
+            // 每词几次 RMW 占比可忽略,有意不为其搬大快照进缓存)。
+        }
+    }
+
+    // ---- Phase 2：慢路径 ----
     // P1：accessor 下只拷扁平快照（ords/tfs），不再深拷整个 PostingList。
     // S29-1：单趟 find——accessor 下拷出 shared_ptr（P2-min CoW 协议：读者
     // 持引用 → 写者见 use_count>1 时克隆替换，被引用的 PostingList 对本查询
     // 期间 immutable，与 phrase/near 读者同模式）。WAND 路由判定读 size()、
-    // 标量/WAND 快照均复用该指针 → 每词桶锁 RMW 从 2 次降到 1 次（热词并发
-    // 查询下桶锁 cacheline 弹跳是 BOW 扩展性主瓶颈）。查询结束必须释放引用
-    // （guard 兜住所有出口），否则旧版本被长期钉住且迫使写者恒克隆。
+    // 标量/WAND 快照均复用该指针 → 每词桶锁 RMW 从 2 次降到 1 次。查询结束
+    // 必须释放引用（guard 兜住所有出口），否则旧版本被长期钉住且迫使写者
+    // 恒克隆。
     static thread_local std::vector<std::shared_ptr<const PostingList>> pls_pool;
     pls_pool.clear();
     struct ReleaseRefs {
@@ -500,38 +597,59 @@ auto InvertedIndex::search(
             pls_pool.push_back(nullptr);
         }
     }
+    // S29-6B：缺席词落负缓存（含 total==0 早退与 WAND 分支——重复的
+    // 全缺席查询下次走零锁快路径）。
+    if (use_cache) {
+        for (std::size_t i = 0; i < query_terms.size(); ++i) {
+            if (pls_pool[i]) continue;
+            if (auto* e = cache.upsert(index_id_, query_terms[i],
+                                       term_gens[i])) {
+                clear_fp(e->fp);
+                e->df = 0;
+                e->has_rows = true;
+            }
+        }
+    }
     if (total_postings == 0) return {};
     if (total_postings >= kWandThreshold) {
         return search_wand(query_terms, pls_pool, k, live_checker, params, ext);
     }
 
     // 标量路径：现在才快照（从已持有的指针，免第二趟 find）。
-    // S23-M3：per-term 快照 scratch thread_local 池——原每查询每 term 新建
-    // ScoredTerm（fp.ords/tfs/blocks 3 次分配），改按下标复用内层容量，
-    // 稳态零分配。池长只增（查询词数级，个位数），超出本查询词数的池尾
-    // 槽位经 span 截断不参与评分。本路径全程串行（见 score_bow_topk 注）。
+    // S29-6B：快照优先落缓存条目（下次同 gen 查询零锁命中）；upsert 失败
+    //（探测窗口全被本查询钉住,罕见）回退 tps_pool 私有槽。
+    // S23-M3：tps_pool thread_local 复用,稳态零分配;预 reserve 保证 views
+    // 持有的槽地址在本查询内稳定（emplace 不再触发搬移）。
     using TermPostings = ScoredTerm;  // 共用条目（term + 扁平快照）
     static thread_local std::vector<TermPostings> tps_pool;
+    tps_pool.reserve(query_terms.size());
     std::size_t n_tps = 0;
+    views.clear();
     for (std::size_t i = 0; i < query_terms.size(); ++i) {
-        if (const auto& pl = pls_pool[i]) {
-            if (n_tps == tps_pool.size()) tps_pool.emplace_back();
-            TermPostings& tp = tps_pool[n_tps];
-            tp.term.assign(query_terms[i]);
-            pl->snapshot_flat(tp.fp);
-            ++n_tps;
+        const auto& pl = pls_pool[i];
+        if (!pl) continue;
+        if (use_cache) {
+            if (auto* e = cache.upsert(index_id_, query_terms[i],
+                                       term_gens[i])) {
+                pl->snapshot_flat(e->fp);
+                e->df = e->fp.size();
+                e->has_rows = true;
+                views.push_back({&query_terms[i], &e->fp});
+                continue;
+            }
         }
+        if (n_tps == tps_pool.size()) tps_pool.emplace_back();
+        TermPostings& tp = tps_pool[n_tps];
+        tp.term.assign(query_terms[i]);
+        pl->snapshot_flat(tp.fp);
+        views.push_back({&tp.term, &tp.fp});
+        ++n_tps;
     }
-    if (n_tps == 0) return {};
+    if (views.empty()) return {};
 
     // bag-of-words 评分 + top-k（共享 kernel score_bow_topk）。
     // S27-2：ext 非空 → 用全局 N/sum_dl/df（G-on-the-fly）。
-    const std::uint64_t N =
-        ext ? ext->N : live_doc_count_.load(std::memory_order_relaxed);
-    const std::uint64_t sum_dl =
-        ext ? ext->sum_dl : sum_doc_len_.load(std::memory_order_relaxed);
-    return score_bow_topk(std::span<const TermPostings>(tps_pool.data(), n_tps),
-                          k, N, sum_dl, params, live_checker,
+    return score_bow_topk(views, k, N, sum_dl, params, live_checker,
                           ext ? ext->df : nullptr);
 }
 
@@ -1162,7 +1280,11 @@ auto InvertedIndex::search_wildcard(
     if (tps.empty()) return {};
 
     // bag-of-words 评分 + top-k（共享 kernel score_bow_topk）。
-    return score_bow_topk(tps, k,
+    // S29-6B：内核收视图——tps 为本函数局部容器,评分期间地址稳定。
+    std::vector<ScoredTermView> tv;
+    tv.reserve(tps.size());
+    for (const auto& tp : tps) tv.push_back({&tp.term, &tp.fp});
+    return score_bow_topk(tv, k,
                           live_doc_count_.load(std::memory_order_relaxed),
                           sum_doc_len_.load(std::memory_order_relaxed),
                           params, live_checker);
@@ -1957,7 +2079,11 @@ auto InvertedIndex::search_fuzzy(
     if (tps.empty()) return {};
 
     // bag-of-words 评分 + top-k（共享 kernel score_bow_topk）。
-    return score_bow_topk(tps, k,
+    // S29-6B：内核收视图——tps 为本函数局部容器,评分期间地址稳定。
+    std::vector<ScoredTermView> tv;
+    tv.reserve(tps.size());
+    for (const auto& tp : tps) tv.push_back({&tp.term, &tp.fp});
+    return score_bow_topk(tv, k,
                           live_doc_count_.load(std::memory_order_relaxed),
                           sum_doc_len_.load(std::memory_order_relaxed),
                           params, live_checker);
@@ -2010,6 +2136,10 @@ void InvertedIndex::finalize_all_postings() {
         }
         // S13-F6：finalize 不改 key 集合，vocab_ 无需失效（曾保守标脏；
         // 增量 delta 设计下 dirty+空 delta 只会触发一次无谓的全量拷贝重建）。
+        // S29-6B：blocks 重建进快照（fp.blocks）→ 失效缓存。
+        if (!keys.empty()) {
+            shard.gen_.fetch_add(1, std::memory_order_release);
+        }
     }
 }
 
@@ -2059,6 +2189,9 @@ auto InvertedIndex::compact(const LiveChecker& live_checker, double dead_ratio_t
             // live_buf 与行的下标对齐不受影响。
             if (mutable_pl(acc->second).compact_flags(live_buf)) {
                 ++compacted;
+                // S29-6B：posting 行删除 → 失效缓存（逐 key bump 而非逐
+                // shard 汇总——compact 非热路径,简单优先）。
+                shard.gen_.fetch_add(1, std::memory_order_release);
             }
         }
         // V6.3.1：compact 不删 key（保留空 posting list 是有意设计——避免与
@@ -2338,6 +2471,16 @@ auto InvertedIndex::load(std::string_view path) -> bool {
 }
 
 auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
+    // S29-6B：整体重灌 → 出口(含失败半填路径)全量失效 term 快照缓存。
+    struct BumpAllGens {
+        std::array<Shard, kShardCount>& shards;
+        ~BumpAllGens() {
+            for (auto& s : shards) {
+                s.gen_.fetch_add(1, std::memory_order_release);
+            }
+        }
+    } bump_gens{shards_};
+
     // P14e:从字节缓冲反序列化,游标带界检查;读越界返回哨兵(同旧 fread 短读
     // 语义,下游既有哨兵判定捕获)。原生小端,字节与 save() 一致。
     const std::byte* d = bytes.data();
@@ -2704,6 +2847,8 @@ bool InvertedIndex::apply_delta(std::span<const std::byte> bytes) {
             shard.vocab_delta_.push_back(term);
             shard.vocab_dirty_.store(true, std::memory_order_release);
         }
+        // S29-6B：posting 变更 → 失效查询线程的 term 快照缓存（镜像 add_doc）。
+        shard.gen_.fetch_add(1, std::memory_order_release);
     }
     if (p != end) return false;
 

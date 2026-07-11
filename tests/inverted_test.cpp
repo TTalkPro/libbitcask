@@ -13,6 +13,7 @@
 #include "bitcask/segment_query.hpp"  // S27-2 Slice 2：多段查询归并
 #include "bitcask/segment.hpp"        // S27-2 Slice 3：SealedSegment 落盘
 #include "bitcask/segment_set.hpp"    // S27-2 Slice 4：段管理器 / 清单
+#include "bitcask/term_snapshot_cache.hpp"  // S29-6B：查询快照缓存
 #include "test_support.hpp"
 
 using namespace bitcask::bm25;
@@ -2388,4 +2389,216 @@ TEST(InvertedIndex, MultiFieldSegmentMergeEquivalence) {
     }
     EXPECT_TRUE(diff_found)
         << "G-on-the-fly 必要性反证失败：单段本地统计应与跨段全局统计分数不同";
+}
+
+// ===========================================================================
+// S29-6B：查询线程 term 快照缓存（TermSnapshotCache + per-shard gen 失效）
+// 设计:docs/design/s29-6b-inverted-term-cache.md;风险清单 §3 逐条对位。
+// ===========================================================================
+
+// 命中路径与慢路径快照字节同源（snapshot_flat）→ 分数必须位级一致。
+TEST(TermCache, RepeatQueryBitIdentical) {
+    InvertedIndex idx;
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        idx.add_doc(i, {{"alpha", tp(1 + static_cast<std::uint32_t>(i % 3), {0})},
+                        {"beta", tp(1, {1})}});
+    }
+    FakeLiveChecker live;
+    for (std::uint64_t i = 0; i < 50; ++i) live.doc_lens[i] = 2;
+    const std::vector<std::string> q = {"alpha", "beta"};
+    auto r1 = idx.search(q, 10, live);  // 慢路径（首查，填缓存）
+    auto r2 = idx.search(q, 10, live);  // 零锁命中路径
+    ASSERT_EQ(r1.size(), r2.size());
+    ASSERT_FALSE(r1.empty());
+    for (std::size_t i = 0; i < r1.size(); ++i) {
+        EXPECT_EQ(r1[i].ord, r2[i].ord);
+        EXPECT_EQ(r1[i].score, r2[i].score);
+    }
+}
+
+// 漏 bump ⇒ 永久陈旧——add_doc 失效路径。
+TEST(TermCache, InvalidationOnAddDoc) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"alpha", tp(1, {0})}});
+    FakeLiveChecker live;
+    live.doc_lens[0] = 1;
+    ASSERT_EQ(idx.search({"alpha"}, 10, live).size(), 1u);  // 填缓存
+    idx.add_doc(1, {{"alpha", tp(1, {0})}});
+    live.doc_lens[1] = 1;
+    EXPECT_EQ(idx.search({"alpha"}, 10, live).size(), 2u);  // gen 失效 → 见新文档
+    EXPECT_EQ(idx.search({"alpha"}, 10, live).size(), 2u);  // 刷新后的命中路径
+}
+
+// 负缓存不得挡新词（add_doc 插新 term 也 bump shard）。
+TEST(TermCache, NegativeEntryThenTermAppears) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"alpha", tp(1, {0})}});
+    FakeLiveChecker live;
+    live.doc_lens[0] = 1;
+    live.doc_lens[1] = 1;
+    EXPECT_TRUE(idx.search({"ghost"}, 10, live).empty());  // 缺席 → 负缓存
+    EXPECT_TRUE(idx.search({"ghost"}, 10, live).empty());  // 负缓存命中
+    idx.add_doc(1, {{"ghost", tp(1, {0})}});
+    auto r = idx.search({"ghost"}, 10, live);
+    ASSERT_EQ(r.size(), 1u);
+    EXPECT_EQ(r[0].ord, 1u);
+}
+
+// index_id 隔离：两索引同 term 交错查询不串味。
+TEST(TermCache, CrossIndexIsolation) {
+    InvertedIndex a;
+    InvertedIndex b;
+    a.add_doc(0, {{"alpha", tp(1, {0})}});
+    b.add_doc(0, {{"alpha", tp(1, {0})}});
+    b.add_doc(1, {{"alpha", tp(1, {0})}});
+    FakeLiveChecker live;
+    live.doc_lens[0] = 1;
+    live.doc_lens[1] = 1;
+    EXPECT_EQ(a.search({"alpha"}, 10, live).size(), 1u);
+    EXPECT_EQ(b.search({"alpha"}, 10, live).size(), 2u);
+    EXPECT_EQ(a.search({"alpha"}, 10, live).size(), 1u);
+    EXPECT_EQ(b.search({"alpha"}, 10, live).size(), 2u);
+}
+
+// doc_freq 的 df-only/缺席条目 + 失效;df-only 不阻碍 search 行补齐。
+TEST(TermCache, DocFreqCachedAndInvalidated) {
+    InvertedIndex idx;
+    idx.add_doc(0, {{"alpha", tp(1, {0})}});
+    idx.add_doc(1, {{"alpha", tp(1, {0})}});
+    EXPECT_EQ(idx.doc_freq("alpha"), 2u);
+    EXPECT_EQ(idx.doc_freq("alpha"), 2u);  // df-only 命中
+    EXPECT_EQ(idx.doc_freq("ghost"), 0u);
+    EXPECT_EQ(idx.doc_freq("ghost"), 0u);  // 缺席负缓存命中
+    idx.add_doc(2, {{"alpha", tp(1, {0})}});
+    EXPECT_EQ(idx.doc_freq("alpha"), 3u);  // gen 失效 → 现值
+    FakeLiveChecker live;
+    for (std::uint64_t i = 0; i < 3; ++i) live.doc_lens[i] = 1;
+    EXPECT_EQ(idx.search({"alpha"}, 10, live).size(), 3u);  // df-only → 行补齐
+    EXPECT_EQ(idx.search({"alpha"}, 10, live).size(), 3u);  // 命中路径
+}
+
+// compact 删行 → 失效（df 与结果都要反映压实后状态）。
+TEST(TermCache, CompactInvalidates) {
+    InvertedIndex idx;
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        idx.add_doc(i, {{"alpha", tp(1, {0})}});
+    }
+    FakeLiveChecker live;
+    for (std::uint64_t i = 0; i < 10; ++i) live.doc_lens[i] = 1;
+    EXPECT_EQ(idx.search({"alpha"}, 20, live).size(), 10u);
+    EXPECT_EQ(idx.doc_freq("alpha"), 10u);
+    live.doc_lens.clear();
+    live.doc_lens[0] = 1;
+    live.doc_lens[9] = 1;
+    EXPECT_EQ(idx.compact(live, 0.5), 1u);
+    EXPECT_EQ(idx.doc_freq("alpha"), 2u);  // 失效 → 压实后列长
+    EXPECT_EQ(idx.search({"alpha"}, 20, live).size(), 2u);
+}
+
+// deserialize 全量失效（负缓存被重灌覆盖的场景）。
+TEST(TermCache, DeserializeInvalidatesNegativeEntry) {
+    InvertedIndex a;
+    a.add_doc(0, {{"alpha", tp(1, {0})}});
+    std::vector<std::byte> bytes;
+    a.serialize(bytes);
+
+    InvertedIndex b;
+    FakeLiveChecker live;
+    live.doc_lens[0] = 1;
+    EXPECT_TRUE(b.search({"alpha"}, 10, live).empty());   // 负缓存
+    ASSERT_TRUE(b.deserialize(bytes));
+    EXPECT_EQ(b.search({"alpha"}, 10, live).size(), 1u);  // 失效 → 命中
+}
+
+// 运行期开关：关闭后行为等价（回退路径）。
+TEST(TermCache, RuntimeSwitchOff) {
+    InvertedIndex::set_query_cache_enabled(false);
+    InvertedIndex idx;
+    idx.add_doc(0, {{"alpha", tp(1, {0})}});
+    FakeLiveChecker live;
+    live.doc_lens[0] = 1;
+    EXPECT_EQ(idx.search({"alpha"}, 10, live).size(), 1u);
+    EXPECT_EQ(idx.search({"alpha"}, 10, live).size(), 1u);
+    EXPECT_EQ(idx.doc_freq("alpha"), 1u);
+    InvertedIndex::set_query_cache_enabled(true);
+    EXPECT_EQ(idx.search({"alpha"}, 10, live).size(), 1u);
+}
+
+// 同查询钉住：已发放条目不得被同一查询内后续 upsert 覆写
+// （评分视图正引用它们）;窗口全钉住时 upsert 拒绝(caller 回退私有槽)。
+TEST(TermCache, PinnedEntriesSurviveSameQueryInserts) {
+    auto& cache = bitcask::bm25::TermSnapshotCache::tls_instance();
+    cache.begin_query();
+    // 高位假 id,不与真实 index_id(进程级小整数单调)相撞。
+    constexpr std::uint64_t kFakeId = 0xFFFFFFFF00000001ull;
+    std::vector<std::pair<bitcask::bm25::TermSnapshotCache::Entry*, std::string>>
+        got;
+    std::size_t rejected = 0;
+    for (int i = 0; i < 400; ++i) {  // > kSlots → 窗口必然填满钉住条目
+        std::string term = "t" + std::to_string(i);
+        auto* e = cache.upsert(kFakeId, term, 7);
+        if (e == nullptr) {
+            ++rejected;
+            continue;
+        }
+        e->df = static_cast<std::uint64_t>(i);
+        e->has_rows = true;
+        got.emplace_back(e, term);
+    }
+    EXPECT_GE(rejected, 400u - bitcask::bm25::TermSnapshotCache::kSlots);
+    for (auto& [e, term] : got) {
+        EXPECT_EQ(e->term, term);
+        EXPECT_EQ(e->index_id, kFakeId);
+    }
+    cache.begin_query();  // 解钉,后续测试正常复用槽
+}
+
+// 并发：读者热词查询（命中/失效交替 + BOW→WAND 跨阈值）vs 单写者持续
+// add_doc——TSan 靶;功能断言宽松（hot 恒 ≥ 初始 200 docs）。
+TEST(TermCacheConcurrency, SearchWhileIndexing) {
+    InvertedIndex idx;
+    for (std::uint64_t i = 0; i < 200; ++i) {
+        idx.add_doc(i, {{"hot", tp(1, {0})}});
+    }
+    class AllLive : public LiveChecker {
+    public:
+        [[nodiscard]] bool is_live(std::uint64_t) const override { return true; }
+        [[nodiscard]] std::uint32_t doc_len(std::uint64_t) const override {
+            return 2;
+        }
+    };
+    AllLive live;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> ok{true};
+    std::thread writer([&] {
+        std::uint64_t ord = 200;
+        std::uint64_t i = 0;
+        // 封顶 20k 文档：防 hot posting 无界增长把测试拖成分钟级
+        // （封顶后 gen 停变 → 读者转入纯命中路径,同样是覆盖目标）。
+        while (!stop.load(std::memory_order_relaxed) && i < 20000) {
+            idx.add_doc(ord++, {{"hot", tp(1, {0})},
+                                {"cold" + std::to_string(i % 64), tp(1, {1})}});
+            ++i;
+        }
+    });
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 3; ++r) {
+        readers.emplace_back([&] {
+            for (int it = 0; it < 1500; ++it) {
+                auto res = idx.search({"hot", "cold1"}, 10, live);
+                if (res.empty()) {
+                    ok.store(false);
+                    return;
+                }
+                if (idx.doc_freq("hot") < 200) {
+                    ok.store(false);
+                    return;
+                }
+            }
+        });
+    }
+    for (auto& t : readers) t.join();
+    stop.store(true);
+    writer.join();
+    EXPECT_TRUE(ok.load());
 }
