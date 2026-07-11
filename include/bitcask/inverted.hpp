@@ -484,6 +484,11 @@ public:
     [[nodiscard]] auto deserialize(std::span<const std::byte> bytes) -> bool;
 
     // ---- 统计 ----
+    // S31:v1 载入时跳过的超长 term 数(0 = 干净;>0 提示历史坏库,建议
+    // 重建索引以物理清除盘上超长 term)。
+    [[nodiscard]] std::uint64_t load_skipped_oversized_terms() const {
+        return load_skipped_oversized_terms_.load(std::memory_order_relaxed);
+    }
     [[nodiscard]] auto live_doc_count() const -> std::uint64_t override;
     [[nodiscard]] auto sum_doc_len() const -> std::uint64_t override;
     [[nodiscard]] auto avg_doc_len() const -> double;
@@ -588,6 +593,10 @@ private:
     // remove_doc 的 guard 用 load+fetch_sub 即可）。
     std::atomic<std::uint64_t> live_doc_count_{0};
     std::atomic<std::uint64_t> sum_doc_len_{0};
+
+    // S31:v1 载入时因超长(>1024B)被跳过的 term 数(容错可见性;
+    // 详见 inverted.cpp deserialize 注)。
+    std::atomic<std::uint64_t> load_skipped_oversized_terms_{0};
 
     // 已索引文档的最大 ord 水位（add_doc 幂等保护）。ord 由引擎单调分配、
     // add_doc 调用序保持单调（IndexPool 单消费者 + 恢复按 ord 序回放），故

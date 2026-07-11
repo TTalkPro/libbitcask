@@ -2602,3 +2602,26 @@ TEST(TermCacheConcurrency, SearchWhileIndexing) {
     writer.join();
     EXPECT_TRUE(ok.load());
 }
+
+// ===========================================================================
+// S31(下游反馈):v1 deserialize 超长 term 跳过不炸段(容错 + 计数可见)。
+// ===========================================================================
+TEST(InvertedIndex, S31OversizedTermSkippedOnLoad) {
+    InvertedIndex a;
+    const std::string monster(1500, 'z');  // 绕过分析器直插(历史坏库形态)
+    a.add_doc(0, {{"alpha", tp(1, {0})}, {monster, tp(1, {1})}});
+    a.add_doc(1, {{"alpha", tp(2, {0, 1})}, {"beta", tp(1, {2})}});
+    std::vector<std::byte> bytes;
+    a.serialize(bytes);
+
+    InvertedIndex b;
+    ASSERT_TRUE(b.deserialize(bytes));  // 修复前:整段 false
+    EXPECT_EQ(b.load_skipped_oversized_terms(), 1u);  // 可见性
+    EXPECT_EQ(b.doc_freq("alpha"), 2u);               // 其余 term 完好
+    EXPECT_EQ(b.doc_freq("beta"), 1u);
+    EXPECT_EQ(b.doc_freq(monster), 0u);               // 超长者被剔除
+    FakeLiveChecker live;
+    live.doc_lens[0] = 2;
+    live.doc_lens[1] = 3;
+    EXPECT_EQ(b.search({"alpha"}, 10, live).size(), 2u);
+}

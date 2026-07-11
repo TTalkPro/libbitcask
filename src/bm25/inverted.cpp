@@ -1021,6 +1021,9 @@ static constexpr std::uint32_t kInvMagic   = 0x494E5632;
 static constexpr std::uint32_t kInvVersion = 6;
 
 // load() 反序列化上限：防止损坏或恶意文件触发 OOM。
+// S31:单 term 字节上限——超限跳过插入(容错),不再整段拒收。与
+// AnalyzerConfig::max_token_bytes 默认一致(写端过滤 + 读端容错双保险)。
+static constexpr std::uint32_t kMaxTermBytes           = 1024;
 static constexpr std::uint32_t kMaxPostingsPerTerm     = 1u << 24;  // ~16M
 static constexpr std::uint32_t kMaxPositionsPerPosting = 1u << 20;  // ~1M
 static constexpr std::uint32_t kMaxBlocksPerTerm       = 1u << 17;  // ~131k
@@ -1344,7 +1347,16 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
 
         for (std::uint32_t t = 0; t < term_count; ++t) {
             auto tlen = read_u32();
-            if (tlen == kReadFail32 || tlen > 1024) { return false; }
+            if (tlen == kReadFail32) { return false; }
+            // S31(下游反馈 libbitcask.md):写端历史上不限 term 长而读端此处
+            // 曾设 1024 硬上限——一个超长 term(zhwiki 实测 jieba 切出 1477B)
+            // 使**整段**载入失败,层层上抛成「全库查询静默 0 命中」。修正:
+            // ① 超长 term 完整解析后**跳过插入**(容错,不炸段——载荷已经
+            //   段级 CRC 背书,tlen 是真实值,损坏由 read_bytes 界检查兜住);
+            // ② 计数暴露(load_skipped_oversized_terms);
+            // ③ 源头由 AnalyzerConfig::max_token_bytes 过滤,正常流程不再
+            //   产生超长 term。v2(mmap)格式读端无此上限,天然免疫。
+            const bool oversized = tlen > kMaxTermBytes;
 
             std::string term(tlen, '\0');
             if (!read_bytes(term.data(), tlen)) return false;
@@ -1471,6 +1483,12 @@ auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {
                 if (wm == static_cast<std::uint64_t>(-1) || pl.ords[i] > wm) {
                     max_indexed_ord_.store(pl.ords[i], std::memory_order_relaxed);
                 }
+            }
+            // S31:超长 term 已完整解析(游标推进正确),仅跳过插入。
+            if (oversized) {
+                load_skipped_oversized_terms_.fetch_add(
+                    1, std::memory_order_relaxed);
+                continue;
             }
             // S13-F6：load 单线程（reducer 车道尚未注册），但 ensure_vocab
             // 已改为「vocab_ ∪ delta」增量重建、不再遍历 map——load 直填的
