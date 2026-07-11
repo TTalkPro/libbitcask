@@ -124,3 +124,80 @@ static void BM_InMemSeg_WANDQuery(benchmark::State& state) {
     }
 }
 BENCHMARK(BM_InMemSeg_WANDQuery)->Unit(benchmark::kMicrosecond);
+
+// ===========================================================================
+// C4:WAND vs MaxScore A/B(结果位级相同——三方对拍守护;此处纯量性能)。
+// 偏斜语料:t0 全命中(热),t1 半频,t2 1/8,t3.. 1/32——多词偏斜是
+// MaxScore 的甜区(essential 收缩)。
+// ===========================================================================
+
+namespace {
+
+std::unique_ptr<InvertedIndex> build_skewed(int docs) {
+    auto idx = std::make_unique<InvertedIndex>();
+    for (int i = 0; i < docs; ++i) {
+        TermPositions tp;
+        tp["t0"] = {1 + static_cast<std::uint32_t>(i % 3), {0}};
+        if (i % 2 == 0) tp["t1"] = {1, {1}};
+        if (i % 8 == 0) tp["t2"] = {2, {2}};
+        if (i % 32 == 0) tp["t3"] = {1, {3}};
+        if (i % 32 == 5) tp["t4"] = {1, {4}};
+        if (i % 32 == 9) tp["t5"] = {1, {5}};
+        idx->add_doc(static_cast<std::uint64_t>(i), tp);
+    }
+    return idx;
+}
+
+class SumDlLive final : public bm25::LiveChecker {  // dl 与索引一致(impacts 前提)
+public:
+    explicit SumDlLive(const InvertedIndex&) {}
+    [[nodiscard]] bool is_live(std::uint64_t) const override { return true; }
+    [[nodiscard]] std::uint32_t doc_len(std::uint64_t d) const override {
+        std::uint32_t dl = 1 + static_cast<std::uint32_t>(d % 3);
+        if (d % 2 == 0) dl += 1;
+        if (d % 8 == 0) dl += 2;
+        if (d % 32 == 0) dl += 1;
+        if (d % 32 == 5) dl += 1;
+        if (d % 32 == 9) dl += 1;
+        return dl;
+    }
+};
+
+void run_topk_bench(benchmark::State& state,
+                    const std::vector<std::string>& q, bool maxscore) {
+    static const auto idx = build_skewed(100000);
+    SumDlLive live(*idx);
+    InvertedIndex::set_topk_use_maxscore(maxscore);
+    for (auto _ : state) {
+        auto r = idx->search(q, 10, live);
+        benchmark::DoNotOptimize(r);
+    }
+    InvertedIndex::set_topk_use_maxscore(false);
+}
+
+}  // namespace
+
+static void BM_TopK_2term_Wand(benchmark::State& s) {
+    run_topk_bench(s, {"t0", "t2"}, false);
+}
+static void BM_TopK_2term_MaxScore(benchmark::State& s) {
+    run_topk_bench(s, {"t0", "t2"}, true);
+}
+static void BM_TopK_4term_Wand(benchmark::State& s) {
+    run_topk_bench(s, {"t0", "t1", "t2", "t3"}, false);
+}
+static void BM_TopK_4term_MaxScore(benchmark::State& s) {
+    run_topk_bench(s, {"t0", "t1", "t2", "t3"}, true);
+}
+static void BM_TopK_6term_Wand(benchmark::State& s) {
+    run_topk_bench(s, {"t0", "t1", "t2", "t3", "t4", "t5"}, false);
+}
+static void BM_TopK_6term_MaxScore(benchmark::State& s) {
+    run_topk_bench(s, {"t0", "t1", "t2", "t3", "t4", "t5"}, true);
+}
+BENCHMARK(BM_TopK_2term_Wand)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_TopK_2term_MaxScore)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_TopK_4term_Wand)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_TopK_4term_MaxScore)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_TopK_6term_Wand)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_TopK_6term_MaxScore)->Unit(benchmark::kMicrosecond);
