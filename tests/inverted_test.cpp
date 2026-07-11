@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <queue>
 #include <random>
 #include <set>
 #include <filesystem>
@@ -2624,4 +2625,188 @@ TEST(InvertedIndex, S31OversizedTermSkippedOnLoad) {
     live.doc_lens[0] = 2;
     live.doc_lens[1] = 3;
     EXPECT_EQ(b.search({"alpha"}, 10, live).size(), 2u);
+}
+
+// ===========================================================================
+// C4:Block-Max MaxScore——三方随机对拍:无剪枝穷举参照 ≡ WAND ≡ MaxScore
+// **位级相同**(两剪枝算法 admissible + 分数按原词序求和 + 同堆语义)。
+// ===========================================================================
+
+namespace {
+
+// 无剪枝穷举参照:镜像 search_wand_impl 的取数与标量公式(idf 用 live_df/
+// 全局 df、dl 每文档取一次、匹配词按原词序累加、>=θ 进堆/满后 >top 换)。
+// 这是 top-k 语义的**规范实现**——剪枝算法必须与其逐位一致。
+std::vector<SearchResult> exhaustive_topk_reference(
+    const InvertedIndex& idx, const std::vector<std::string>& terms,
+    std::size_t k, const LiveChecker& live,
+    const Bm25Params& params, std::uint64_t N, std::uint64_t sum_dl,
+    const std::vector<std::pair<std::string, std::uint64_t>>* global_df) {
+    struct T {
+        PostingList pl;
+        std::vector<char> lv;
+        float idf = 0.0F;
+        bool present = false;
+    };
+    std::vector<T> ts(terms.size());
+    const double avgdl =
+        N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
+    std::vector<std::uint64_t> all_ords;
+    for (std::size_t i = 0; i < terms.size(); ++i) {
+        if (!idx.snapshot_postings(terms[i], ts[i].pl)) continue;
+        ts[i].present = true;
+        ts[i].lv.resize(ts[i].pl.size());
+        live.fill_is_live(ts[i].pl.ords, ts[i].lv);
+        std::size_t live_df = 0;
+        for (char c : ts[i].lv) live_df += static_cast<std::size_t>(c);
+        if (live_df == 0) continue;
+        double dfv = static_cast<double>(live_df);
+        if (global_df) {
+            for (const auto& [t, v] : *global_df) {
+                if (t == terms[i]) {
+                    if (v > 0) dfv = static_cast<double>(v);
+                    break;
+                }
+            }
+        }
+        ts[i].idf = static_cast<float>(std::log(
+            1.0 + (static_cast<double>(N) - dfv + 0.5) / (dfv + 0.5)));
+        all_ords.insert(all_ords.end(), ts[i].pl.ords.begin(),
+                        ts[i].pl.ords.end());
+    }
+    std::sort(all_ords.begin(), all_ords.end());
+    all_ords.erase(std::unique(all_ords.begin(), all_ords.end()),
+                   all_ords.end());
+
+    using Entry = std::pair<float, std::uint64_t>;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+    float threshold = 0.0F;
+    for (auto d : all_ords) {
+        if (!live.is_live(d)) continue;
+        const auto dl = live.doc_len(d);
+        float score = 0.0F;
+        bool any = false;
+        for (std::size_t i = 0; i < terms.size(); ++i) {
+            if (!ts[i].present) continue;
+            const auto idxp = ts[i].pl.find(d);
+            if (idxp >= ts[i].pl.size()) continue;
+            any = true;
+            const auto tf = static_cast<float>(ts[i].pl.tfs[idxp]);
+            const float tf_norm =
+                tf * (params.k1 + 1.0F) /
+                (tf + params.k1 *
+                          (1.0F - params.b +
+                           params.b * static_cast<float>(dl) /
+                               static_cast<float>(avgdl)));
+            score += ts[i].idf * (tf_norm + params.delta);
+        }
+        if (!any) continue;
+        if (score >= threshold) {
+            if (heap.size() < k) {
+                heap.push({score, d});
+            } else if (score > heap.top().first) {
+                heap.pop();
+                heap.push({score, d});
+            }
+            if (heap.size() >= k) threshold = heap.top().first;
+        }
+    }
+    std::vector<SearchResult> out;
+    out.reserve(heap.size());
+    while (!heap.empty()) {
+        out.push_back({heap.top().second, heap.top().first});
+        heap.pop();
+    }
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+void expect_bitwise_equal(const std::vector<SearchResult>& a,
+                          const std::vector<SearchResult>& b,
+                          const std::string& what) {
+    ASSERT_EQ(a.size(), b.size()) << what;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        EXPECT_EQ(a[i].ord, b[i].ord) << what << " @" << i;
+        EXPECT_EQ(a[i].score, b[i].score) << what << " @" << i;
+    }
+}
+
+struct MaxScoreToggle {  // RAII:测试内切算法,退出恢复
+    explicit MaxScoreToggle(bool on) { InvertedIndex::set_topk_use_maxscore(on); }
+    ~MaxScoreToggle() { InvertedIndex::set_topk_use_maxscore(false); }
+};
+
+}  // namespace
+
+TEST(MaxScore, ThreeWayRandomizedBitwiseEquivalence) {
+    // 偏斜语料:hot(全命中)/mid×10/rare×100 + 变 tf——都路由 WAND 档
+    // (查询含 hot ⇒ total ≥ docs ≥ 1024)。
+    constexpr std::uint32_t kDocs = 4000;
+    InvertedIndex idx;
+    FakeLiveChecker live;
+    std::vector<std::string> vocab = {"hot", "hot2"};
+    for (int i = 0; i < 10; ++i) vocab.push_back("mid" + std::to_string(i));
+    for (int i = 0; i < 100; ++i) vocab.push_back("rare" + std::to_string(i));
+    for (std::uint32_t d = 0; d < kDocs; ++d) {
+        TermPositions tp;
+        tp["hot"] = {1 + d % 5, {0}};
+        if (d % 2 == 0) tp["hot2"] = {1 + d % 3, {1}};
+        tp["mid" + std::to_string(d % 10)] = {1 + d % 2, {2}};
+        tp["rare" + std::to_string(d % 100)] = {1, {3}};
+        idx.add_doc(d, tp);
+        // dl 必须与索引时 add_doc 记录的 Σtf 一致——v5 impacts 前提
+        // (块 min_dl 来自索引 dl,打分 dl 来自 checker;两者不一致会让
+        // 块上界失效 → 「合法」误跳。生产路径 doc_len_writer 恒同源)。
+        std::uint32_t dl = 0;
+        for (auto& [t, pd] : tp) dl += pd.first;
+        live.doc_lens[d] = dl;
+    }
+    // 三分之一文档死亡(live_df/idf 路径 + 死点跳过)。
+    for (std::uint32_t d = 0; d < kDocs; d += 3) live.doc_lens.erase(d);
+
+    std::mt19937 rng(0xC4);
+    std::uniform_int_distribution<std::size_t> vpick(0, vocab.size() - 1);
+    std::uniform_int_distribution<int> nterms(1, 8);
+    std::uniform_int_distribution<int> kcase(0, 3);
+    const std::size_t kk[4] = {1, 3, 10, 50};
+    const Bm25Params params{1.2F, 0.75F};
+
+    for (int trial = 0; trial < 200; ++trial) {
+        std::vector<std::string> q = {"hot"};  // 保证 WAND 档
+        const int n = nterms(rng);
+        for (int i = 1; i < n; ++i) q.push_back(vocab[vpick(rng)]);
+        if (trial % 7 == 0) q.push_back("ghost");     // 缺席词
+        if (trial % 11 == 0) q.push_back(q.back());   // 重复词
+        const std::size_t k = kk[static_cast<std::size_t>(kcase(rng))];
+
+        // ext 注入(G-on-the-fly 语义)每 5 轮一次。
+        std::vector<std::pair<std::string, std::uint64_t>> dfv;
+        ExtStats ext;
+        const ExtStats* extp = nullptr;
+        if (trial % 5 == 0) {
+            for (const auto& t : q) dfv.emplace_back(t, idx.doc_freq(t));
+            ext.N = idx.live_doc_count();
+            ext.sum_dl = idx.sum_doc_len();
+            ext.df = &dfv;
+            extp = &ext;
+        }
+        const std::uint64_t N = extp ? ext.N : idx.live_doc_count();
+        const std::uint64_t sdl = extp ? ext.sum_dl : idx.sum_doc_len();
+
+        const auto ref = exhaustive_topk_reference(idx, q, k, live, params, N,
+                                                   sdl, extp ? ext.df : nullptr);
+        std::vector<SearchResult> wand;
+        {
+            MaxScoreToggle t(false);
+            wand = idx.search(q, k, live, &params, extp);
+        }
+        std::vector<SearchResult> ms;
+        {
+            MaxScoreToggle t(true);
+            ms = idx.search(q, k, live, &params, extp);
+        }
+        expect_bitwise_equal(ref, wand, "ref-vs-wand t" + std::to_string(trial));
+        expect_bitwise_equal(ref, ms, "ref-vs-ms t" + std::to_string(trial));
+        if (::testing::Test::HasFailure()) break;
+    }
 }

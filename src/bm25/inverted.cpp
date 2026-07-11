@@ -148,6 +148,13 @@ InvertedIndex::~InvertedIndex() = default;
 InvertedIndex::InvertedIndex(Bm25Params params, bool index_positions)
     : params_(params), index_positions_(index_positions) {}
 
+void InvertedIndex::set_topk_use_maxscore(bool on) noexcept {
+    detail::g_topk_use_maxscore.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+bool InvertedIndex::topk_use_maxscore() noexcept {
+    return detail::g_topk_use_maxscore.load(std::memory_order_relaxed) != 0;
+}
+
 auto InvertedIndex::shard_for(std::string_view term) -> Shard& {
     auto h = std::hash<std::string_view>{}(term);
     return shards_[h % kShardCount];
@@ -575,7 +582,7 @@ auto InvertedIndex::search_wand(
     const auto N = ext ? ext->N : live_doc_count_.load(std::memory_order_relaxed);
     const auto sum_dl =
         ext ? ext->sum_dl : sum_doc_len_.load(std::memory_order_relaxed);
-    return detail::search_wand_impl(term_views, fp_ptrs, k, live_checker,
+    return detail::search_topk_impl(term_views, fp_ptrs, k, live_checker,
                                     params, N, sum_dl,
                                     ext ? ext->df : nullptr,
                                     query_terms.size());

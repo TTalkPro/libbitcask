@@ -566,6 +566,12 @@ public:
         return query_cache_enabled_.load(std::memory_order_relaxed);
     }
 
+    // C4:top-k 大查询算法开关(进程级;false=Block-Max WAND 默认,true=
+    // Block-Max MaxScore)。两算法 admissible 且分数求和保持原词序 → 结果
+    // **位级相同**(对拍测试守护),切换只影响性能。内存段与 mmap 段共用。
+    static void set_topk_use_maxscore(bool on) noexcept;
+    [[nodiscard]] static bool topk_use_maxscore() noexcept;
+
     // S29-6B/S30-P5:TermIndex 实例 id 分配(进程级单调,永不复用)——
     // TermSnapshotCache 的 key 成分。InvertedIndex 与 MmapSegment 字段
     // **必须共用同一序列**(各自计数会撞 id → 跨索引缓存串味)。

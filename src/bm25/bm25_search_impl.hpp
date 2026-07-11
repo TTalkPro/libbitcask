@@ -47,6 +47,13 @@ namespace bitcask::bm25::detail {
 // 查询在内存段与 mmap 段可能走不同算法——结果仍等价,但违反位级一致契约)。
 inline constexpr std::size_t kWandRouteThreshold = 1024;
 
+// C4:top-k 大查询算法开关(1=Block-Max MaxScore **默认**,0=Block-Max
+// WAND 回退)。两算法均为 admissible 剪枝且分数求和保持原词序 → **结果位级
+// 相同**(三方对拍测试守护),切换只影响性能。默认 MaxScore 依据 A/B 实测:
+// 偏斜多词 2/4/6 词 -46%/-39%/-21%(segment_v2_bench BM_TopK_*,惰性 dls
+// 后),对标 Lucene 9.9 同向决策。运行期可切,读侧 relaxed。
+inline std::atomic<int> g_topk_use_maxscore{1};
+
 // S7-5：短语/近邻查询候选数（驱动词 posting 数）≥ 此阈值才并行评分。
 // 甜区是大候选集（热词短语，~8.7ms）；小候选集并行 task spawn 开销 > 收益，
 // 走串行（同 S7-1 BOW 串行化的教训）。
@@ -1451,5 +1458,337 @@ inline std::vector<SearchResult> bool_tree_impl(
     return results;
 }
 
+
+// ===========================================================================
+// C4:Block-Max MaxScore(Turtle & Flood 1995;Lucene 9.9 主力 top-k 算法)。
+//
+// 思路:按「列表分数上界 ub」升序排词,θ(当前第 k 名分数)把词切成两组——
+// 前缀(non-essential:Σub ≤ θ,单靠它们凑不出进榜分)与后缀(essential)。
+// 候选只由 essential 列表驱动;non-essential 按需 galloping seek 补分。
+// θ 抬升 → 前缀变长(词"降级"),驱动集收缩,热词多词查询下候选枚举远少
+// 于 WAND 的全列表 pivot 轮换。块上界(BMW 元数据)做二级预判:块内
+// essential 上界 + non-essential Σub ≤ θ ⟹ 整块跳过。
+//
+// === 与 WAND 位级同果的三个约束(对拍测试的依据,勿破坏) ===
+// 1. 候选按 docid 升序产出(essential 最小游标驱动)→ 堆决策序一致;
+// 2. 命中文档的分数按**原始词序**(tps 下标序)求和——与 WAND 的 pivot
+//    打分循环逐运算一致(essential/non-essential 划分只决定"评估哪些文档",
+//    不改求和序);
+// 3. idf/live/dl 取数与 WAND 同源(live_df 定 idf、pivot 列表 live 位、
+//    fill_doc_lens 值);堆语义(>= θ 进/满后 > top 换)逐字相同。
+// ===========================================================================
+inline std::vector<SearchResult> search_maxscore_impl(
+    std::span<const std::string_view> terms,
+    std::span<const FlatPostings* const> fps,
+    std::size_t k,
+    const LiveChecker& live_checker,
+    const Bm25Params& params,
+    std::uint64_t N,
+    std::uint64_t sum_dl,
+    const std::vector<std::pair<std::string, std::uint64_t>>* global_df,
+    std::size_t query_term_count) {
+    (void)query_term_count;
+    struct Tp {
+        std::string_view term;
+        const FlatPostings* fp = nullptr;
+        std::vector<char> live;
+        std::vector<std::uint32_t> dls;
+        std::vector<char> dls_filled;       // 每 kBlockSize 一位(惰性,同 wand)
+        bool dls_all = false;
+        std::size_t cursor = 0;
+        float idf = 0.0F;
+        float ub = 0.0F;                    // 列表级分数上界
+        std::vector<float> block_ub;        // per-block 上界(块跳跃预判)
+    };
+    // thread_local 池(同 wand:主循环不搬移元素,池槽稳定;全程串行)。
+    static thread_local std::vector<Tp> tps_pool;
+    std::size_t n_tps = 0;
+    for (std::size_t i = 0; i < terms.size(); ++i) {
+        if (n_tps == tps_pool.size()) tps_pool.emplace_back();
+        Tp& tp = tps_pool[n_tps];
+        tp.term = terms[i];
+        tp.fp = fps[i];
+        tp.cursor = 0;
+        tp.idf = 0.0F;
+        tp.ub = 0.0F;
+        tp.block_ub.clear();
+        ++n_tps;
+    }
+    if (n_tps == 0) return {};
+    const std::span<Tp> tps(tps_pool.data(), n_tps);
+
+    const double avgdl =
+        N > 0 ? static_cast<double>(sum_dl) / static_cast<double>(N) : 1.0;
+
+    // 初始化(与 search_wand_impl 同源:live 全量、idf 用 live_df 或全局 df、
+    // 上界同公式)。dls v1 全量填充——MaxScore 评估的候选远少于全表,惰性
+    // 分块填充留作后续优化(值与 wand 逐位相同,不影响对拍)。
+    for (auto& tp : tps) {
+        tp.live.resize(tp.fp->size());
+        live_checker.fill_is_live(tp.fp->ords, tp.live);
+        // dls 惰性按块填充(与 wand 同款:值 = fill_doc_lens,填充时机无关
+        // 正确性;中小列表直接全量,大列表按访问填,MaxScore 评估的候选
+        // 远少于全表,惰性收益更大)。
+        constexpr std::size_t kB = PostingList::kBlockSize;
+        tp.dls.resize(tp.fp->size());
+        if (tp.fp->size() <= 32 * kB) {
+            live_checker.fill_doc_lens(tp.fp->ords, tp.dls);
+            tp.dls_filled.assign(1, 1);
+            tp.dls_all = true;
+        } else {
+            tp.dls_filled.assign((tp.fp->size() + kB - 1) / kB, 0);
+            tp.dls_all = false;
+        }
+        std::size_t live_df = 0;
+        for (std::size_t i = 0; i < tp.live.size(); ++i) {
+            live_df += static_cast<std::size_t>(tp.live[i]);
+        }
+        if (live_df == 0) {
+            tp.idf = 0.0F;
+            tp.ub = 0.0F;
+            tp.block_ub.assign(tp.fp->blocks.size(), 0.0F);
+            continue;
+        }
+        double df_idf = static_cast<double>(live_df);
+        if (global_df) {
+            for (const auto& [t, v] : *global_df) {
+                if (t == tp.term) {
+                    if (v > 0) df_idf = static_cast<double>(v);
+                    break;
+                }
+            }
+        }
+        tp.idf = static_cast<float>(std::log(
+            1.0 + (static_cast<double>(N) - df_idf + 0.5) / (df_idf + 0.5)));
+        tp.ub = tp.fp->block_upper_bound(tp.idf, params, avgdl);
+        tp.block_ub.reserve(tp.fp->blocks.size());
+        for (const auto& blk : tp.fp->blocks) {
+            tp.block_ub.push_back(
+                upper_bound_from(blk.max_tf, tp.idf, params, avgdl,
+                                 blk.min_dl));
+        }
+    }
+
+    // ub 升序排(稳定:平局按原下标,决定性)。prefix[j] = Σ_{i≤j} ub。
+    std::vector<std::size_t> order(n_tps);
+    for (std::size_t i = 0; i < n_tps; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&tps](std::size_t a, std::size_t b) {
+                         return tps[a].ub < tps[b].ub;
+                     });
+    std::vector<float> prefix(n_tps);
+    {
+        float acc = 0.0F;
+        for (std::size_t j = 0; j < n_tps; ++j) {
+            acc += tps[order[j]].ub;
+            prefix[j] = acc;
+        }
+    }
+
+    using Entry = std::pair<float, std::uint64_t>;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+    float threshold = 0.0F;
+    // 边界 p:order[0..p) 为 non-essential(prefix[p-1] ≤ θ)。θ 单调升
+    // ⇒ p 单调升(降级不可逆)。θ=0 时仅 ub==0 的死列表落入前缀。
+    std::size_t p = 0;
+    auto promote_boundary = [&] {
+        while (p < n_tps && prefix[p] <= threshold) ++p;
+    };
+    promote_boundary();
+
+    // galloping seek(与 wand::advance 同型):游标推到首个 ord ≥ target。
+    auto advance = [](Tp& t, std::uint64_t target) {
+        const auto* o = t.fp->ords.data();
+        const std::size_t n = t.fp->size();
+        std::size_t lo = t.cursor;
+        if (lo >= n || o[lo] >= target) return;
+        std::size_t step = 1;
+        std::size_t hi = lo + 1;
+        while (hi < n && o[hi] < target) {
+            lo = hi;
+            hi += step;
+            step <<= 1;
+        }
+        if (hi > n) hi = n;
+        t.cursor = static_cast<std::size_t>(
+            std::lower_bound(o + lo + 1, o + hi, target) - o);
+    };
+
+    auto ensure_dls = [&](Tp& t, std::size_t idx) {
+        if (t.dls_all) return;
+        constexpr std::size_t kB = PostingList::kBlockSize;
+        const std::size_t b = idx / kB;
+        if (t.dls_filled[b]) return;
+        const std::size_t start = b * kB;
+        const std::size_t cnt = std::min(kB, t.fp->size() - start);
+        live_checker.fill_doc_lens(
+            std::span<const std::uint64_t>(t.fp->ords.data() + start, cnt),
+            std::span<std::uint32_t>(t.dls.data() + start, cnt));
+        t.dls_filled[b] = 1;
+    };
+
+    while (p < n_tps) {  // essential 集非空
+        // 候选 = essential 列表当前最小 docid。
+        std::uint64_t d = std::numeric_limits<std::uint64_t>::max();
+        for (std::size_t j = p; j < n_tps; ++j) {
+            const Tp& t = tps[order[j]];
+            if (t.cursor < t.fp->size() && t.fp->ords[t.cursor] < d) {
+                d = t.fp->ords[t.cursor];
+            }
+        }
+        if (d == std::numeric_limits<std::uint64_t>::max()) break;  // 全耗尽
+
+        // 块级预判(Block-Max):essential 各列当前块上界 + non-essential
+        // Σub ≤ θ ⟹ d 所在的这段块区间整体无望——跳到各块末尾最小值 +1
+        // (镜像 wand 的 admissible 块跳跃;θ 满堆才启用)。
+        if (heap.size() >= k) {
+            float blk_bound = p > 0 ? prefix[p - 1] : 0.0F;
+            std::uint64_t min_block_end =
+                std::numeric_limits<std::uint64_t>::max();
+            for (std::size_t j = p; j < n_tps; ++j) {
+                const Tp& t = tps[order[j]];
+                if (t.cursor >= t.fp->size()) continue;
+                const auto* blk = t.fp->block_for_ord(d);
+                if (blk != nullptr && t.fp->ords[t.cursor] <= blk->end_ord) {
+                    const auto bi = static_cast<std::size_t>(
+                        blk - t.fp->blocks.data());
+                    blk_bound += t.block_ub[bi];
+                    if (blk->end_ord < min_block_end) {
+                        min_block_end = blk->end_ord;
+                    }
+                } else {
+                    blk_bound += t.ub;  // 无块元数据(小列表/尾块):列表级回退
+                    if (t.cursor < t.fp->size() &&
+                        t.fp->ords[t.cursor] < min_block_end) {
+                        // 无块可跳:以当前 docid 为界(至少推进 1)。
+                        min_block_end = t.fp->ords[t.cursor];
+                    }
+                }
+            }
+            if (blk_bound <= threshold &&
+                min_block_end != std::numeric_limits<std::uint64_t>::max() &&
+                min_block_end >= d) {
+                for (std::size_t j = p; j < n_tps; ++j) {
+                    advance(tps[order[j]], min_block_end + 1);
+                }
+                continue;
+            }
+        }
+
+        // 文档级预判:essential 实际得分 + non-essential Σub ≤ θ ⟹ 跳过。
+        // (求和序此处无关——只作 bound,不进结果;命中文档的最终分在下方
+        // 按原词序重算,保证位级同果。)
+        bool doc_dead = false;
+        bool live_known = false;
+        float ess_score = 0.0F;
+        std::uint32_t dl = 0;
+        bool dl_known = false;
+        for (std::size_t j = p; j < n_tps; ++j) {
+            Tp& t = tps[order[j]];
+            if (t.cursor >= t.fp->size() || t.fp->ords[t.cursor] != d) continue;
+            if (!live_known) {
+                live_known = true;
+                doc_dead = t.live[t.cursor] == 0;
+                if (!doc_dead) {
+                    ensure_dls(t, t.cursor);
+                    dl = t.dls[t.cursor];
+                    dl_known = true;
+                }
+            }
+            if (doc_dead) break;
+            ensure_dls(t, t.cursor);
+            const auto tf = static_cast<float>(t.fp->tfs[t.cursor]);
+            const float tf_norm =
+                tf * (params.k1 + 1.0F) /
+                (tf + params.k1 *
+                          (1.0F - params.b +
+                           params.b * static_cast<float>(t.dls[t.cursor]) /
+                               static_cast<float>(avgdl)));
+            ess_score += t.idf * (tf_norm + params.delta);
+        }
+        const float ne_bound = p > 0 ? prefix[p - 1] : 0.0F;
+        if (!doc_dead &&
+            !(heap.size() >= k && ess_score + ne_bound <= threshold)) {
+            // 完整评估:non-essential seek 到 d,全词按**原始下标序**求和
+            // (与 wand pivot 打分循环逐运算一致 → 位级同果)。
+            for (std::size_t j = 0; j < p; ++j) {
+                advance(tps[order[j]], d);
+            }
+            float score = 0.0F;
+            for (std::size_t i = 0; i < n_tps; ++i) {
+                Tp& t = tps[i];
+                if (t.cursor >= t.fp->size() || t.fp->ords[t.cursor] != d) {
+                    continue;
+                }
+                if (!dl_known) {
+                    ensure_dls(t, t.cursor);
+                    dl = t.dls[t.cursor];
+                    dl_known = true;
+                }
+                const auto tf = static_cast<float>(t.fp->tfs[t.cursor]);
+                const float tf_norm =
+                    tf * (params.k1 + 1.0F) /
+                    (tf + params.k1 *
+                              (1.0F - params.b +
+                               params.b * static_cast<float>(dl) /
+                                   static_cast<float>(avgdl)));
+                score += t.idf * (tf_norm + params.delta);
+            }
+            if (score >= threshold) {
+                if (heap.size() < k) {
+                    heap.push({score, d});
+                } else if (score > heap.top().first) {
+                    heap.pop();
+                    heap.push({score, d});
+                }
+                if (heap.size() >= k) {
+                    const float new_theta = heap.top().first;
+                    if (new_theta > threshold) {
+                        threshold = new_theta;
+                        promote_boundary();  // θ 升 → 前缀(降级集)扩大
+                    }
+                }
+            }
+        }
+
+        // 推进所有停在 d 的游标(essential 必然;non-essential 若被 seek 到 d)。
+        for (std::size_t i = 0; i < n_tps; ++i) {
+            Tp& t = tps[i];
+            if (t.cursor < t.fp->size() && t.fp->ords[t.cursor] == d) {
+                ++t.cursor;
+            }
+        }
+    }
+
+    std::vector<SearchResult> results;
+    results.reserve(heap.size());
+    while (!heap.empty()) {
+        auto& [score, ord] = heap.top();
+        results.push_back({ord, score});
+        heap.pop();
+    }
+    std::reverse(results.begin(), results.end());
+    return results;
+}
+
+// top-k 大查询统一分发(InvertedIndex 与 MmapSegment 共用;算法开关见
+// g_topk_use_maxscore)。
+inline std::vector<SearchResult> search_topk_impl(
+    std::span<const std::string_view> terms,
+    std::span<const FlatPostings* const> fps,
+    std::size_t k,
+    const LiveChecker& live_checker,
+    const Bm25Params& params,
+    std::uint64_t N,
+    std::uint64_t sum_dl,
+    const std::vector<std::pair<std::string, std::uint64_t>>* global_df,
+    std::size_t query_term_count) {
+    if (g_topk_use_maxscore.load(std::memory_order_relaxed) != 0) {
+        return search_maxscore_impl(terms, fps, k, live_checker, params, N,
+                                    sum_dl, global_df, query_term_count);
+    }
+    return search_wand_impl(terms, fps, k, live_checker, params, N, sum_dl,
+                            global_df, query_term_count);
+}
 
 }  // namespace bitcask::bm25::detail

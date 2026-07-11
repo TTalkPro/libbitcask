@@ -842,7 +842,7 @@ std::vector<bm25::SearchResult> MmapSegment::search(
             fp_ptrs.push_back(&fp_pool[j2]);
             term_views.push_back(query_terms[hit_idx[j2]]);
         }
-        return bm25::detail::search_wand_impl(
+        return bm25::detail::search_topk_impl(
             term_views, fp_ptrs, k, live_checker, params, N, sum_dl,
             ext ? ext->df : nullptr, query_terms.size());
     }
