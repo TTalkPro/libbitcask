@@ -3734,8 +3734,9 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > TermSnapshotCache(S29-6B)自动升格为解码缓存(封口段 gen 恒 0 → 热词
 > 解码一次永久命中)、段 pin/孤儿忽略/流式 CRC 全现成。
 
-- [~] **S30-P1 盘格式 v2 + 只读 MmapSegmentReader**——**Slice 1 已完成
-  (2026-07-11),核心 round-trip 逐位等价达成**;剩余见下。
+- [~] **S30-P1 盘格式 v2 + 只读 MmapSegmentReader**——**Slice 1/3/4 已完成
+  (2026-07-11):格式+writer+reader 全查询面+TermIndex 接线,P2 前置全部
+  就绪**;唯余 Slice 2(WAND 块游标,非阻塞优化项)。
   - [x] **Slice 1:共享实现抽取 + 格式 + 流式 writer + reader 核心**
     - **抽取**:inverted.cpp 匿名 ns 的 score_bow_topk/ScoredTerm(View)/
       upper_bound_from/block_for_ord_in/**search_wand 主体**移入
@@ -3792,9 +3793,23 @@ W4 ✅（parallel_scan 并行全表扫描）。
     查询是**全量解码 interim**(正确、逐位一致,但大词 O(df) 解码/查询;
     与内存版 snapshot_flat 整列拷贝同量级,**非阻塞项**)。块游标按跳表
     逐块解码(128/scratch)才兑现「大词不全量驻留/解码」。可延后到 P2 后。
-  - [ ] **Slice 4:SealedSegment 双实现接线**(查询面走 MmapSegment,
-    live 路径仍不动——P2 前置)。SegmentView/MultiFieldSegmentView 需从
-    `const InvertedIndex*` 泛化(接口或变体);全查询面已备齐。
+  - [x] **Slice 4 已完成(2026-07-11):TermIndex 接口接线**。
+    - 新增 [`term_index.hpp`](include/bitcask/term_index.hpp):段内单字段
+      **纯查询接口**(统计 ×3 + 查询面 ×8,写路径/持久化/内省有意不入);
+      `InvertedIndex` 直接继承(签名逐一相同,查询面方法标 override,
+      **构造点零改动**——`&inv_` 隐式上转);`MmapFieldIndex`(segment_v2.hpp)
+      per-field 薄适配折叠 (field, ...) 委托。
+    - `SegmentView::inv`/`FieldSegmentView::inv` → `const TermIndex*`——
+      multi_segment_search / multi_field_segment_search / TextPlugin 逐段
+      查询消费方**一行不改**(同名虚调用);默认实参契约(接口与实现逐一
+      相同)写入接口头注释。
+    - 验收:新测 ×2——**混合段集 multi_segment_search**(全内存 vs 全 mmap
+      vs 内存+mmap 混合,BOW/WAND/含缺席词三组查询逐位一致,G-on-the-fly
+      聚合统计经接口无感)+ 基类指针全查询面虚派发等价。clang 全量
+      **597/597**;ASan 全量 597/597;TSan 段/搜索子集 174/174;build-rel 过。
+    - 注:MultiFieldSegmentView::seg 仍为 `const SealedSegment*`(LiveChecker
+      + key/lsn 源)——mmap 多字段流随 P2 的 SealedSegment mmap 背衬自然
+      覆盖,无需此处泛化。
 - [ ] **S30-P2 写路径接线（用户硬需求）**（~1-2 会话）·
   `seal_ram_budget`(默认 64MB/builder,0=沿用现行为)——building 记账
   超预算就地封口(flush_building_slot 现成)→ 流式落盘 → add_pending →

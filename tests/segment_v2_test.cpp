@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "bitcask/inverted.hpp"
+#include "bitcask/segment_query.hpp"  // Slice 4:SegmentView / multi_segment_search
 #include "bitcask/segment_v2.hpp"
 #include "test_support.hpp"
 
@@ -566,4 +567,131 @@ TEST(SegmentV2Slice3, BoolTreeWithPhraseEquivalence) {
     root2.children.push_back(grp);
     expect_same_results(seg->bool_search_tree(kField, root2, 20, c.live),
                         c.idx.bool_search_tree(root2, 20, c.live), "tree2");
+}
+
+// ===========================================================================
+// S30-P1 Slice 4：TermIndex 接口接线——SegmentView 经同一指针指内存段与
+// mmap 段,multi_segment_search 消费方无感;混合段集逐位等价。
+// ===========================================================================
+
+namespace {
+
+using bitcask::search::MmapFieldIndex;
+using bitcask::search::SegmentView;
+using bitcask::search::multi_segment_search;
+
+// 内存侧视图(合成 doc_store 与 writer 输入同源:key<d> / lsn 1000+d)。
+SegmentView mem_view(const Corpus& c) {
+    return SegmentView{&c.idx, &c.live,
+                       [](bitcask::DocId d) {
+                           return "key" + std::to_string(d);
+                       },
+                       [](bitcask::DocId d) -> bitcask::Lsn {
+                           return 1000 + d;
+                       },
+                       nullptr};
+}
+
+// mmap 侧视图(key/lsn 走段 doc_store;live 用同一 FakeLiveChecker 保证
+// 两侧删除语义一致)。
+SegmentView mmap_view(const MmapFieldIndex& fi, const Corpus& c) {
+    const auto* seg = fi.segment();
+    return SegmentView{&fi, &c.live,
+                       [seg](bitcask::DocId d) {
+                           return std::string(seg->key_of(
+                               static_cast<std::uint32_t>(d)));
+                       },
+                       [seg](bitcask::DocId d) -> bitcask::Lsn {
+                           return seg->lsn_of(static_cast<std::uint32_t>(d));
+                       },
+                       nullptr};
+}
+
+void expect_same_hits(const std::vector<bitcask::search::SearchHit>& a,
+                      const std::vector<bitcask::search::SearchHit>& b,
+                      const std::string& what) {
+    ASSERT_EQ(a.size(), b.size()) << what;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        EXPECT_EQ(a[i].key, b[i].key) << what << " @" << i;
+        EXPECT_EQ(a[i].ord, b[i].ord) << what << " @" << i;
+        EXPECT_EQ(a[i].score, b[i].score) << what << " @" << i;
+    }
+}
+
+}  // namespace
+
+// 双段 multi_segment_search:全内存 vs 全 mmap vs 混合——三者逐位一致
+// (G-on-the-fly 聚合统计 + 逐段打分 + 并集归并全经 TermIndex 接口)。
+TEST(SegmentV2Slice4, MultiSegmentSearchMemMmapMixedEquivalence) {
+    auto cpa = build_corpus(60, "s4a");
+    auto& ca = *cpa;
+    auto cpb = build_corpus(3000, "s4b");  // B 段 hot df=3000 → WAND 档
+    auto& cb = *cpb;
+    auto sega = write_and_open(ca);
+    auto segb = write_and_open(cb);
+    ASSERT_NE(sega, nullptr);
+    ASSERT_NE(segb, nullptr);
+    MmapFieldIndex fia(sega.get(), std::string(kField));
+    MmapFieldIndex fib(segb.get(), std::string(kField));
+
+    for (const auto& q : std::vector<std::vector<std::string>>{
+             {"hot"},
+             {"mid1", "rare42"},
+             {"hot", "mid3", "ghost"},
+         }) {
+        std::vector<SegmentView> mem;
+        mem.push_back(mem_view(ca));
+        mem.push_back(mem_view(cb));
+        std::vector<SegmentView> mm;
+        mm.push_back(mmap_view(fia, ca));
+        mm.push_back(mmap_view(fib, cb));
+        std::vector<SegmentView> mixed;
+        mixed.push_back(mem_view(ca));
+        mixed.push_back(mmap_view(fib, cb));
+
+        const auto h_mem = multi_segment_search(mem, q, 10);
+        const auto h_mm = multi_segment_search(mm, q, 10);
+        const auto h_mixed = multi_segment_search(mixed, q, 10);
+        expect_same_hits(h_mem, h_mm, "mm:" + q[0]);
+        expect_same_hits(h_mem, h_mixed, "mixed:" + q[0]);
+        ASSERT_FALSE(h_mem.empty());
+    }
+}
+
+// 经 TermIndex 基类指针调用全部查询面(虚派发路径)——与具体类型直调一致。
+TEST(SegmentV2Slice4, PolymorphicSurfaceEquivalence) {
+    auto cp = build_phrase_corpus(120, "s4poly");
+    auto& c = *cp;
+    auto seg = write_and_open(c);
+    ASSERT_NE(seg, nullptr);
+    MmapFieldIndex fi(seg.get(), std::string(kField));
+
+    const bitcask::bm25::TermIndex* tmem = &c.idx;
+    const bitcask::bm25::TermIndex* tmm = &fi;
+
+    EXPECT_EQ(tmem->live_doc_count(), tmm->live_doc_count());
+    EXPECT_EQ(tmem->sum_doc_len(), tmm->sum_doc_len());
+    EXPECT_EQ(tmem->doc_freq("alpha"), tmm->doc_freq("alpha"));
+
+    const std::vector<std::string> q = {"alpha", "beta"};
+    expect_same_results(tmm->search(q, 10, c.live), tmem->search(q, 10, c.live),
+                        "search");
+    expect_same_results(tmm->search_phrase(q, 10, c.live),
+                        tmem->search_phrase(q, 10, c.live), "phrase");
+    expect_same_results(tmm->search_near(q, 10, 2, c.live),
+                        tmem->search_near(q, 10, 2, c.live), "near");
+    expect_same_results_approx(tmm->search_wildcard("fill1*", 10, c.live),
+                               tmem->search_wildcard("fill1*", 10, c.live),
+                               "wildcard");
+    expect_same_results_approx(tmm->search_fuzzy({"alpha"}, 10, 1, c.live),
+                               tmem->search_fuzzy({"alpha"}, 10, 1, c.live),
+                               "fuzzy");
+    using bitcask::bm25::QueryNode;
+    auto bq = QueryNode::must_all(
+        {QueryNode::must_term("alpha"), QueryNode::must_not_term("fill7")});
+    expect_same_results(tmm->bool_search(bq, 10, c.live),
+                        tmem->bool_search(bq, 10, c.live), "bool");
+    const auto ea = tmm->explain(q, 3, c.live);
+    const auto eb = tmem->explain(q, 3, c.live);
+    EXPECT_EQ(ea.total, eb.total);
 }

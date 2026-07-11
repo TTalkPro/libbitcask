@@ -279,4 +279,98 @@ private:
     bm25::Bm25Params params_{};
 };
 
+// per-field 查询适配器:把 MmapSegment 的 (field, ...) 查询面折成 TermIndex
+// ——SegmentView/FieldSegmentView 经同一接口指内存段与 mmap 段(Slice 4)。
+// 生命周期:持 MmapSegment 裸指针,caller 保证段活过本对象(段对象内嵌或
+// view pin 连带)。
+class MmapFieldIndex final : public bm25::TermIndex {
+public:
+    MmapFieldIndex(const MmapSegment* seg, std::string field)
+        : seg_(seg), field_(std::move(field)) {}
+
+    [[nodiscard]] std::uint64_t live_doc_count() const override {
+        return seg_->live_doc_count(field_);
+    }
+    [[nodiscard]] std::uint64_t sum_doc_len() const override {
+        return seg_->sum_doc_len(field_);
+    }
+    [[nodiscard]] std::uint64_t doc_freq(std::string_view term) const override {
+        return seg_->doc_freq(field_, term);
+    }
+    [[nodiscard]] auto search(const std::vector<std::string>& query_terms,
+                              std::size_t k,
+                              const bm25::LiveChecker& live_checker,
+                              const bm25::Bm25Params* params_override = nullptr,
+                              const bm25::ExtStats* ext = nullptr) const
+        -> std::vector<bm25::SearchResult> override {
+        return seg_->search(field_, query_terms, k, live_checker,
+                            params_override, ext);
+    }
+    [[nodiscard]] auto search_phrase(
+        const std::vector<std::string>& query_terms, std::size_t k,
+        const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const
+        -> std::vector<bm25::SearchResult> override {
+        return seg_->search_phrase(field_, query_terms, k, live_checker,
+                                   params_override);
+    }
+    [[nodiscard]] auto search_near(
+        const std::vector<std::string>& query_terms, std::size_t k,
+        std::uint32_t slop, const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const
+        -> std::vector<bm25::SearchResult> override {
+        return seg_->search_near(field_, query_terms, k, slop, live_checker,
+                                 params_override);
+    }
+    [[nodiscard]] auto bool_search(
+        const bm25::QueryNode& query, std::size_t k,
+        const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const
+        -> std::vector<bm25::SearchResult> override {
+        return seg_->bool_search(field_, query, k, live_checker,
+                                 params_override);
+    }
+    [[nodiscard]] auto bool_search_tree(
+        const bm25::QueryNode& root, std::size_t k,
+        const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const
+        -> std::vector<bm25::SearchResult> override {
+        return seg_->bool_search_tree(field_, root, k, live_checker,
+                                      params_override);
+    }
+    [[nodiscard]] auto search_fuzzy(
+        const std::vector<std::string>& query_terms, std::size_t k,
+        std::uint32_t max_edit_distance,
+        const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const
+        -> std::vector<bm25::SearchResult> override {
+        return seg_->search_fuzzy(field_, query_terms, k, max_edit_distance,
+                                  live_checker, params_override);
+    }
+    [[nodiscard]] auto search_wildcard(
+        const std::string& pattern, std::size_t k,
+        const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const
+        -> std::vector<bm25::SearchResult> override {
+        return seg_->search_wildcard(field_, pattern, k, live_checker,
+                                     params_override);
+    }
+    [[nodiscard]] auto explain(const std::vector<std::string>& query_terms,
+                               std::uint64_t ord,
+                               const bm25::LiveChecker& live_checker,
+                               const bm25::Bm25Params* params_override =
+                                   nullptr) const
+        -> bm25::ScoreExplanation override {
+        return seg_->explain(field_, query_terms, ord, live_checker,
+                             params_override);
+    }
+
+    [[nodiscard]] const MmapSegment* segment() const noexcept { return seg_; }
+    [[nodiscard]] std::string_view field() const noexcept { return field_; }
+
+private:
+    const MmapSegment* seg_;
+    std::string field_;
+};
+
 }  // namespace bitcask::search

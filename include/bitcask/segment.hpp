@@ -49,8 +49,9 @@ class SealedSegment;  // 前向声明（multi_field_segment_search 视图需要�
 // 单字段视图（multi-field 形态）：指向一个 InvertedIndex（段内某字段）+ 字段名。
 // LiveChecker / key / lsn 由所属段（MultiFieldSegmentView::seg）统一提供。
 struct FieldSegmentView {
-    std::string_view           field_name;   // 含 kDefaultField
-    const bm25::InvertedIndex* inv;          // 段内该字段倒排（本地 docid）
+    std::string_view       field_name;   // 含 kDefaultField
+    // S30-P1 Slice 4:查询接口指针(同 SegmentView::inv)。
+    const bm25::TermIndex* inv;          // 段内该字段倒排查询面（本地 docid）
 };
 
 // 多字段段视图：把 SealedSegment 的多字段状态暴露给 multi_field_segment_search。

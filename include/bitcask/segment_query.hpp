@@ -28,7 +28,9 @@ namespace bitcask::search {
 // 把本地 docid 翻成外部 key（结果水合）与全局 LSN（版本/RRF 键，见 §3.4）。
 // 分段化落地后由段 doc_store 承担这两个映射；此处闭包化以便先驱动查询归并。
 struct SegmentView {
-    const bm25::InvertedIndex*        inv;     // 段内倒排（本地 docid）
+    // S30-P1 Slice 4:查询接口指针——内存段(InvertedIndex)与 mmap 段
+    // (MmapFieldIndex)同型接入,消费方无感。
+    const bm25::TermIndex*            inv;     // 段内倒排查询面（本地 docid）
     const bm25::LiveChecker*          live;    // 段内 live/doc_len（本地 docid）
     std::function<std::string(DocId)> key_of;  // 本地 docid → 外部 key
     std::function<Lsn(DocId)>         lsn_of;  // 本地 docid → 全局 LSN

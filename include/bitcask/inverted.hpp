@@ -53,6 +53,7 @@
 
 #include "bitcask/bm25_params.hpp"   // S20-4：Bm25Params 抽出的轻量头
 #include "bitcask/fuzzy_matcher.hpp"
+#include "bitcask/term_index.hpp"    // S30-P1 Slice 4：段查询接口
 #include "bitcask/live_checker.hpp"
 #include "bitcask/query.hpp"
 #include "bitcask/vbyte.hpp"
@@ -328,11 +329,13 @@ struct ScoreExplanation {
 // live 文档检查器接口（由 Index 侧表提供）。
 // search() 调用它跳过已删除的 ord。
 //
-// 倒排索引。
-class InvertedIndex {
+// 倒排索引。S30-P1 Slice 4:实现 TermIndex(段查询接口,SegmentView 经
+// `const TermIndex*` 同时指内存段与 mmap 段;查询面方法即接口 override,
+// 默认实参与接口逐一相同——契约见 term_index.hpp)。
+class InvertedIndex : public TermIndex {
 public:
     InvertedIndex() = default;
-    ~InvertedIndex();
+    ~InvertedIndex() override;
     // index_positions=false 时不存 positions（S10.10，省内存，短语/近邻失效）。
     explicit InvertedIndex(Bm25Params params, bool index_positions = true);
 
@@ -365,7 +368,7 @@ public:
     // S27-2：某 term 的 doc frequency（= posting list 长度，**含未 merge 的已删**，
     // Lucene-style df；§4 接受该近似，merge 自愈）。宿主用它跨段求和得全局 df。
     // 不存在 → 0。线程安全：term 分片 shared_lock。
-    [[nodiscard]] std::uint64_t doc_freq(std::string_view term) const;
+    [[nodiscard]] std::uint64_t doc_freq(std::string_view term) const override;
 
     // ext 非空时走 G-on-the-fly：用 ext->N/sum_dl 定 avgdl、ext->df 定 idf 的 df
     // （回退本地 live_df）；nullptr = 本地统计（现行为）。见 ExtStats。
@@ -374,13 +377,14 @@ public:
         std::size_t k,
         const LiveChecker& live_checker,
         const Bm25Params* params_override = nullptr,
-        const ExtStats* ext = nullptr) const -> std::vector<SearchResult>;
+        const ExtStats* ext = nullptr) const -> std::vector<SearchResult> override;
 
     [[nodiscard]] auto search_phrase(
         const std::vector<std::string>& query_terms,
         std::size_t k,
         const LiveChecker& live_checker,
-        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+        const Bm25Params* params_override = nullptr) const
+        -> std::vector<SearchResult> override;
 
     // 近邻搜索（S8.7）：term 按查询顺序出现，相邻 term 间隙 ≤ slop。
     // slop=0 等价于 search_phrase（严格相邻）。复用 positions。
@@ -389,13 +393,15 @@ public:
         std::size_t k,
         std::uint32_t slop,
         const LiveChecker& live_checker,
-        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+        const Bm25Params* params_override = nullptr) const
+        -> std::vector<SearchResult> override;
 
     [[nodiscard]] auto bool_search(
         const QueryNode& query,
         std::size_t k,
         const LiveChecker& live_checker,
-        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+        const Bm25Params* params_override = nullptr) const
+        -> std::vector<SearchResult> override;
 
     // S13-D9：树形布尔求值（括号嵌套 + 引号短语）。语义：
     //   组内 MUST 子项交集为基集（无 MUST 则 SHOULD 并集），MUST_NOT 差集；
@@ -408,20 +414,23 @@ public:
         const QueryNode& root,
         std::size_t k,
         const LiveChecker& live_checker,
-        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+        const Bm25Params* params_override = nullptr) const
+        -> std::vector<SearchResult> override;
 
     [[nodiscard]] auto search_fuzzy(
         const std::vector<std::string>& query_terms,
         std::size_t k,
         std::uint32_t max_edit_distance,
         const LiveChecker& live_checker,
-        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+        const Bm25Params* params_override = nullptr) const
+        -> std::vector<SearchResult> override;
 
     [[nodiscard]] auto search_wildcard(
         const std::string& pattern,
         std::size_t k,
         const LiveChecker& live_checker,
-        const Bm25Params* params_override = nullptr) const -> std::vector<SearchResult>;
+        const Bm25Params* params_override = nullptr) const
+        -> std::vector<SearchResult> override;
 
     // 解释 query_terms 对文档 ord 的 BM25 评分（S8.8，调试/调优用）。
     // 用与 search() 完全相同的 idf/tf_norm 公式，逐 term 给出分项。
@@ -430,7 +439,8 @@ public:
         const std::vector<std::string>& query_terms,
         std::uint64_t ord,
         const LiveChecker& live_checker,
-        const Bm25Params* params_override = nullptr) const -> ScoreExplanation;
+        const Bm25Params* params_override = nullptr) const
+        -> ScoreExplanation override;
 
     auto save(std::string_view path) const -> bool;
     auto load(std::string_view path) -> bool;
@@ -469,8 +479,8 @@ public:
     [[nodiscard]] auto deserialize(std::span<const std::byte> bytes) -> bool;
 
     // ---- 统计 ----
-    [[nodiscard]] auto live_doc_count() const -> std::uint64_t;
-    [[nodiscard]] auto sum_doc_len() const -> std::uint64_t;
+    [[nodiscard]] auto live_doc_count() const -> std::uint64_t override;
+    [[nodiscard]] auto sum_doc_len() const -> std::uint64_t override;
     [[nodiscard]] auto avg_doc_len() const -> double;
     // 所有 posting list 的 items 总数（含尚未压实的死点）。内省/测试用：
     // 观测 compaction 效果与 posting 膨胀。非并发安全遍历——须在静止时调用。
