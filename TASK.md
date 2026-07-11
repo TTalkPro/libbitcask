@@ -3738,6 +3738,40 @@ W4 ✅（parallel_scan 并行全表扫描）。
    详见 S29-6 二期条目）**
 8. ~~S30 段 mmap 化~~ **已收官(2026-07-11,P1-P5 全落地,见 S30 批次)**;
    ~~S29-T~~ **已修**。
+---
+
+## S31 批次：下游缺陷修复——超长 term 静默炸段（2026-07-11）
+
+> 来源:wiser-cpp 真实 zhwiki 索引反馈([`libbitcask.md`](libbitcask.md))。
+> 第 500 篇「清华大学」的 wikitext 长模板被 jieba 切出 **1477 字节单 token**
+> → v1 段写端不限长、读端 1024 上限 → **一个坏词整段拒载** → 更致命的第二层:
+> `load_component` 已按清单置高水位,段集装载失败后**静默落空集** → 宿主不
+> 重放 → **全库查询永久静默 0 命中,无任何报错**。三层修复(A1+A3 组合,
+> 采纳反馈方案):
+
+- [x] **A1 源头过滤:`AnalyzerConfig::max_token_bytes`(默认 1024,0=不限)**
+  · 三分析器(Ngram×2 路径/Whitespace×2/Jieba)发射点统一守卫——超长
+  token(长 URL/模板块/base64 = 检索噪声)丢弃,pos 仍递增(位置语义同
+  min_token_length)。正常流程从此不产生超长 term。
+- [x] **A3a 读端容错:v1 deserialize 超长 term 跳过不炸段** · `tlen > 1024`
+  从「整段 return false」改「完整解析后跳过插入」(载荷已段级 CRC 背书,
+  tlen 为真实值,损坏由界检查兜住);计数经
+  `InvertedIndex::load_skipped_oversized_terms()` 暴露(>0 提示历史坏库,
+  建议重建)。**下游现存坏库(2000 篇 wiki)升级后直接自愈可读**(仅缺
+  那 1 个噪声词)。v2(mmap)读端无此上限,天然免疫。
+- [x] **A3b 响亮降级:段集装载失败 → watermark 0 全量重放自愈** ·
+  `init_segment_set` 返回 bool(清单声明了段但载不出 = false),
+  `load_component` 失败即 fail()(watermark 0 + rebase)→ 宿主全量重放
+  重建索引——**消灭「高水位 + 空段集」静默死亡模式**(对任意段损坏成因
+  普适,不止超长 term)。
+- 验收:新测 ×5——分析器过滤(ngram/ws/jieba,含 0=不限回退)、v1 跳词
+  容错 + 计数、**wiser 形态 e2e**(>1024B token 写入 → v1/v2 双模封口重开
+  → 正常词命中,修复前 v1 静默死亡)、段文件截断 → 重开 watermark==0
+  响亮降级。clang 全量 **613/613**;ASan 188/188、TSan 116/116 子集;
+  build-rel 过。
+- 注:已落盘的坏 v1 段经 A3a 自愈可读;要物理清除盘上超长 term 可重建或
+  等段 merge(v2 输出)自然重写。
+
 9. **下一步候选(2026-07-11 审计后存量)**:C4 Block-Max MaxScore、
    C6 Roaring Bitmap(bool_search 成瓶颈时)、C5(需重新立项论证,见其
    注记)、S29-11 HNSW(含「向量出内存」侦查——S30 后向量图是最后的
