@@ -89,6 +89,14 @@ target_link_libraries(bitcask_stemming_analyzer_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_segment_v2_test segment_v2_test.cpp)
+target_link_libraries(bitcask_segment_v2_test PRIVATE
+    GTest::gtest_main
+    bitcask_bm25
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 add_executable(bitcask_inverted_test inverted_test.cpp)
 target_link_libraries(bitcask_inverted_test PRIVATE
     GTest::gtest_main
@@ -239,6 +247,7 @@ gtest_discover_tests(bitcask_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_porter_stemmer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_stemming_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_inverted_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_segment_v2_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_jieba_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_keydir_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_cask_docvalue_test ${_bitcask_test_props})

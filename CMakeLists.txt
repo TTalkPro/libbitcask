@@ -219,6 +219,7 @@ add_library(bitcask_bm25 STATIC
     src/bm25/intersect.cpp
     src/bm25/inverted.cpp
     src/bm25/query_parser.cpp
+    src/bm25/segment_v2.cpp
 )
 target_include_directories(bitcask_bm25 PUBLIC include)
 target_link_libraries(bitcask_bm25

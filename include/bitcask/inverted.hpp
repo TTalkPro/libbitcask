@@ -438,6 +438,14 @@ public:
     // (自带 INV 框架、原生小端)。serialize 仅追加缓冲、不会失败。
     void serialize(std::vector<std::byte>& out) const;
 
+    // S30-P1:导出遍历——按 term 字节序升序逐个访问 posting list(v2 段
+    // writer 的词典/posting 流式导出原语;S27-4 era 挂账的「词表遍历原语」)。
+    // 并发安全同 serialize(key 快照 + 逐 key const_accessor);设计上在
+    // 静止(封口)索引上调用。
+    void visit_postings_sorted(
+        const std::function<void(std::string_view term, const PostingList& pl)>&
+            fn) const;
+
     // S14-4：增量（delta）序列化——只导出 ord ≥ from_ord 的 posting 后缀
     // （items 按 ord 升序不变量 → 后缀连续，见 PostingList 头注释）+ 绝对
     // 全局统计（N/sdl：删除只改统计不碰 posting，随 delta 整体覆盖）。
@@ -540,7 +548,8 @@ public:
 
 private:
     static constexpr std::size_t kShardCount = 64;
-    static constexpr std::size_t kWandThreshold = 1024;
+    // S30-P1:BOW/WAND 路由阈值移至 bm25_search_impl.hpp
+    // (detail::kWandRouteThreshold)——MmapSegment 路由必须与本类一致。
     // S7-5：短语/近邻查询候选数（first term posting 数）≥ 此阈值才并行评分。
     // 甜区是大候选集（热词短语，~8.7ms）；小候选集并行 task spawn 开销 > 收益，
     // 走串行（同 S7-1 BOW 串行化的教训）。

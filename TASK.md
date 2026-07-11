@@ -3734,13 +3734,44 @@ W4 ✅（parallel_scan 并行全表扫描）。
 > TermSnapshotCache(S29-6B)自动升格为解码缓存(封口段 gen 恒 0 → 热词
 > 解码一次永久命中)、段 pin/孤儿忽略/流式 CRC 全现成。
 
-- [ ] **S30-P1 盘格式 v2 + 只读 MmapSegmentReader**（~2-3 会话）·
-  新 writer 流式写(排序词典目录 + u32 docid FOR 块 + WAND 跳表节 +
-  positions 节 + doc_store 节 + live sidecar 分离);reader 全查询面
-  (BOW 解码进 FlatPostings→现内核零改动 / **WAND 块游标(最大单项)** /
-  phrase / doc_freq / explain / wildcard-fuzzy 走 mmap 词典区间扫,封口段
-  ensure_vocab/vocab_ 侧表就此退役)。隔离验收:round-trip 与内存段逐位
-  一致 + WAND 剪枝对拍 + CRC 拒载。live 路径不动(双实现并存)。
+- [~] **S30-P1 盘格式 v2 + 只读 MmapSegmentReader**——**Slice 1 已完成
+  (2026-07-11),核心 round-trip 逐位等价达成**;剩余见下。
+  - [x] **Slice 1:共享实现抽取 + 格式 + 流式 writer + reader 核心**
+    - **抽取**:inverted.cpp 匿名 ns 的 score_bow_topk/ScoredTerm(View)/
+      upper_bound_from/block_for_ord_in/**search_wand 主体**移入
+      [`src/bm25/bm25_search_impl.hpp`](src/bm25/bm25_search_impl.hpp)
+      (detail::,含 kWandRouteThreshold);InvertedIndex::search_wand 变薄
+      包装(快照 + N/sum_dl 解析)。**mmap 段与内存段分数位级一致由「同一
+      实现」保证而非对拍维持**。纯代码搬移,580/580 零回归。
+    - **格式**([`segment_v2.hpp`](include/bitcask/segment_v2.hpp)):
+      Header/Footer/Tail + 节表(节级 CRC);每字段排序词典 TermRec(48B,
+      mmap 二分)+ term blob + **u32 docid** 块打包 posting(128/块:
+      FOR-from-base docid + 位打包 tf/dl,BlockMeta 20B 跳表带块内偏移)+
+      positions 内联(off 数组 + gap-varint);doc_store 定长行 48B + key
+      blob;live 位图**独立 sidecar**(段文件一次写永不改)。
+    - **writer**(`write_segment_v2`,[`segment_v2.cpp`](src/bm25/segment_v2.cpp)):
+      流式(posting/positions/doc_store 直写文件 + 增量 CRC,瞬态仅
+      O(词典+块表);doc_store key 两趟免缓冲);tmp+rename + fdatasync。
+      新原语 `InvertedIndex::visit_postings_sorted`(词表升序遍历——S27-3
+      挂账所需原语顺带落地)。
+    - **reader**(`MmapSegment`):open 全节 CRC 验证(verify_crc=false =
+      S21-A6 opt-in)+ 越界节拒载;词典 mmap 二分;doc_freq;search =
+      按需解码 FlatPostings → 共享 score_bow_topk / search_wand_impl
+      (路由阈值同源);多字段;doc_store 访问器;IS-A LiveChecker
+      (原子 live 位图 + sidecar save/load,tmp+rename+CRC)。
+    - **验收**:新增 `tests/segment_v2_test.cpp` ×9——BOW 全词典对拍、
+      **200 轮随机 WAND 查询逐位一致**(5000 docs)、ExtStats(G-on-the-fly)
+      注入等价、live 过滤等价、decode vs snapshot_flat 逐位(含 finalize
+      后块元数据)、doc_store/元信息 round-trip、sidecar 往返+篡改拒载、
+      4 点位 CRC 篡改拒载+截断拒载、多字段隔离。clang 全量 **589/589**;
+      ASan 全量 589/589;TSan 子集绿;build-rel 构建过。
+  - [ ] **Slice 2:WAND 块游标**——当前 WAND 档 mmap 查询是**全量解码
+    interim**(正确、逐位一致,但大词 O(df) 解码/查询);块游标按跳表逐块
+    解码(128/scratch)才兑现「大词不全量驻留/解码」。P1 最大剩余单项。
+  - [ ] **Slice 3:phrase/near(positions 解码)+ explain + wildcard/fuzzy
+    (mmap 词典区间扫,封口段 vocab_ 侧表退役)**。
+  - [ ] **Slice 4:SealedSegment 双实现接线**(查询面走 MmapSegment,
+    live 路径仍不动——P2 前置)。
 - [ ] **S30-P2 写路径接线（用户硬需求）**（~1-2 会话）·
   `seal_ram_budget`(默认 64MB/builder,0=沿用现行为)——building 记账
   超预算就地封口(flush_building_slot 现成)→ 流式落盘 → add_pending →
