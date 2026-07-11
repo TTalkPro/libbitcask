@@ -3810,7 +3810,7 @@ W4 ✅（parallel_scan 并行全表扫描）。
     - 注:MultiFieldSegmentView::seg 仍为 `const SealedSegment*`(LiveChecker
       + key/lsn 源)——mmap 多字段流随 P2 的 SealedSegment mmap 背衬自然
       覆盖,无需此处泛化。
-- [~] **S30-P2 写路径接线（用户硬需求）**——**Slice A 已完成(2026-07-11)**:
+- [x] **S30-P2 写路径接线（用户硬需求）已完成(2026-07-11,Slice A+B)**:
   - [x] **Slice A:SealedSegment mmap 背衬模式**(封口段对象可由 v2 文件支撑,
     写路径换入的对象层弹药)。
     - `SealedSegment` 增 `mmap_` 背衬:`open_v2(path)` 工厂(载 v2 + 自动叠
@@ -3829,13 +3829,35 @@ W4 ✅（parallel_scan 并行全表扫描）。
       explain 逐位)、mmap 段 mark_dead→查询即时反映→sidecar 往返→压实
       no-op、save_v2 带死位迁移。clang 全量 **600/600**;ASan 600/600;
       TSan 段/搜索/恢复子集 123/123;build-rel 过。
-  - [ ] **Slice B:写路径换入 + 预算封口 + ckpt 收窄**(P2 主体,剩余项):
-    ① `flush_building_slot` 封口改走 save_v2 → open_v2 → SegmentSet 登记
-    mmap 段 → key_to_location_ 批量重指新对象 → 内存段随 pin 排干释放;
-    ② SegmentSet::open 识别 v2 段文件(双格式并存);resave_dead_dirty 对
-    mmap 段改落 sidecar;③ `seal_ram_budget` 配置——building 记账超预算
-    就地封口(不等 ckpt);④ crash 矩阵(封口后-ckpt 前 kill → 孤儿清理 +
-    WAL 重放等价)+ RSS 封顶 bench + TSan 换入 vs 并发查询。
+  - [x] **Slice B 已完成(2026-07-11):写路径换入 + 预算封口 + ckpt 收窄
+    ——S30 主目标落地,v2 封口默认开启**。
+    - **封口换入**:`SegmentSet::add_pending` v2 路径(默认,
+      `TextPluginConfig::seal_v2_segments` 可回退 v1)——save_v2 流式落盘
+      → open_v2 换入 mmap 背衬对象登记 → **内存副本随 pin 排干释放**;
+      `flush_building_slot` 封口后在 key_loc_mu_ 独占下 ① 补拷 save 窗口
+      内落在旧对象上的 mark_dead(防换入窗口丢删)② 批量重指本段 key 定位
+      (O(段文档),与封口本身同量级;v1 路径同指针零成本短路)。
+    - **恢复/ckpt**:`SealedSegment::load_any` 探 magic 双格式分发(v1 段
+      永续可读,混合清单支持);`resave_dead_dirty` 对 mmap 段改落 live
+      sidecar(KB 级 tmp+rename,原整段重存);drop 顺带清 sidecar。
+      ckpt 语义自动收窄:段文件封口时已在盘上,ckpt 只写 sidecar+尾段+清单
+      (S26-⑥ 大 flush 停顿就此消解)。
+    - **预算封口**:`TextPluginConfig::seal_ram_budget_bytes`(0=关,默认)
+      ——SealedSegment 逐 add 增量记账(approx_ram_bytes),apply 路径超
+      预算**就地封口**(不等 ckpt);写入期 RSS ≈ 预算 × (1+builders)。
+    - **顺带修复既存 bug ×2**:① `add_pending` 的 seg_id 锁外分配——B>1
+      两 builder 阈值封口并发 → 同 id 同文件名 tmp+rename 互覆 = 静默丢段
+      → id 改 list_mu_ 下分配;② **共享 WAND 的 OOB(S10-A2 起潜伏)**:
+      live_df==0 的词留空 block_upper_bounds 但游标仍参与块跳跃 → 空数组
+      越界读(触发:≥128 posting 词全死 + WAND 查询;ASan 于 mmap 恢复
+      场景实测抓获)→ 填 0(与 idf=0 逐块计算位级一致)。
+    - **验收**:既有全量测试群(crash/checkpoint/builder/merge/docvalue)
+      **默认跑在 v2 封口路径上**全绿;新测 ×4——预算封口端到端(多段自动
+      生成 + read-your-writes + 跨换入删除重指 + sidecar 重开)、v1/v2 混合
+      段集、孤儿段忽略(封口未 ckpt = 崩溃语义)、builder B=2 并发预算封口
+      压力(封口换入 vs 并发查询 + 覆盖/删除 + 重开)。clang 全量
+      **604/604**;ASan 全量 604/604;TSan 段/恢复/并发子集 118/118;
+      build-rel 过。RSS 定量 bench 归 P4。
   原计划全文（供 Slice B 对照）:（~1-2 会话）·
   `seal_ram_budget`(默认 64MB/builder,0=沿用现行为)——building 记账
   超预算就地封口(flush_building_slot 现成)→ 流式落盘 → add_pending →

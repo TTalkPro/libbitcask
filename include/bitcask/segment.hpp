@@ -79,7 +79,12 @@ public:
               index::DocLoc loc = {}, std::uint32_t tstamp = 0) {
         const DocId docid = static_cast<DocId>(keys_.size());
         std::uint32_t dl = 0;
-        for (const auto& [t, d] : terms) dl += d.first;
+        std::size_t mem = key.size() + kApproxRowBytes;  // S30-P2:预算记账
+        for (const auto& [t, d] : terms) {
+            dl += d.first;
+            mem += t.size() + kApproxPostingBytes + d.second.size() * 4;
+        }
+        approx_bytes_.fetch_add(mem, std::memory_order_relaxed);
         // 写序(并发契约,见 live_/count_pub_ 注释):行 → 发布 → 倒排。
         keys_.push_back(std::move(key));
         lsns_.push_back(lsn);
@@ -112,6 +117,15 @@ public:
               std::uint32_t total_doc_len,
               index::DocLoc loc = {}, std::uint32_t tstamp = 0) {
         const DocId docid = static_cast<DocId>(keys_.size());
+        {   // S30-P2:预算记账(近似字节,见 approx_ram_bytes)。
+            std::size_t mem = key.size() + kApproxRowBytes;
+            for (const auto& f : fields) {
+                for (const auto& [t, d] : *f.terms) {
+                    mem += t.size() + kApproxPostingBytes + d.second.size() * 4;
+                }
+            }
+            approx_bytes_.fetch_add(mem, std::memory_order_relaxed);
+        }
         // 写序(并发契约):行 → 发布 → 各字段倒排。
         keys_.push_back(std::move(key));
         lsns_.push_back(lsn);
@@ -438,6 +452,30 @@ public:
         return mmap_ ? mmap_->save_live_sidecar(path) : false;
     }
 
+    // S30-P2:building 段近似 RAM 占用(预算封口判据)。逐 add 增量累加:
+    // key + 定长行 + Σ(term 字节 + posting 行摊销 + positions×4)。近似值
+    // ——词典去重/容量倍增/TBB 节点开销不计,量级正确即可(预算是软阈值)。
+    [[nodiscard]] std::size_t approx_ram_bytes() const {
+        return approx_bytes_.load(std::memory_order_relaxed);
+    }
+
+    // S30-P2:格式分发载入——v2(mmap 背衬,探头 4 字节 magic)或 v1
+    // (SearchCheckpoint 容器,全量解码进内存)。双格式并存:老库的 v1 段
+    // 继续可读,新封口走 v2(SegmentSet 按配置)。失败 → nullptr。
+    [[nodiscard]] static std::unique_ptr<SealedSegment> load_any(
+        const std::string& path) {
+        std::uint32_t magic = 0;
+        {
+            std::FILE* f = std::fopen(path.c_str(), "rb");
+            if (f == nullptr) return nullptr;
+            const bool ok = std::fread(&magic, 1, 4, f) == 4;
+            std::fclose(f);
+            if (!ok) return nullptr;
+        }
+        if (magic == segv2::kMagic) return open_v2(path);
+        return load(path);
+    }
+
 private:
     static constexpr std::uint32_t kDocStoreMagic = 0x54534453;  // 'SDST'
     static constexpr std::uint32_t kDocStoreVersion = 1;
@@ -602,6 +640,10 @@ private:
     RowChunks<std::uint32_t>   doc_lens_;   // 段级 total doc_len（Σ 各字段 dl）
     mutable RowChunks<std::atomic<std::uint8_t>> live_;
     std::atomic<std::uint64_t> count_pub_{0};
+    // S30-P2:预算封口记账(原子:builder 写 vs 预算检查读)。
+    static constexpr std::size_t kApproxRowBytes = 96;      // 行 + RowChunks 摊销
+    static constexpr std::size_t kApproxPostingBytes = 40;  // posting 行 + 词典摊销
+    std::atomic<std::size_t> approx_bytes_{0};
     // S27-4 P2:原子——builder(覆盖 mark_dead)与 reducer(on_delete)并发翻位。
     std::atomic<bool> dead_dirty_{false};  // S27-3 B2b 步骤 4:save 后有新 mark_dead
 

@@ -35,6 +35,16 @@ struct TextPluginConfig {
     // upsert 仲裁;可见性 = refresh 语义(在途 job 微秒级不可见),
     // prepare_search/flush 经 drain 屏障保 read-your-writes 与 ckpt 覆盖。
     std::size_t          builder_threads = 0;
+    // S30-P2:封口段格式。true(默认)= v2 mmap 段——封口即流式落盘、查询
+    // 走 mmap 按需解码,**内存副本释放**(倒排出内存的主开关);false = v1
+    // 全量驻留(回退开关)。两格式恢复期均可读(load_any 探 magic)。
+    bool                 seal_v2_segments = true;
+    // S30-P2:building 段 RAM 预算(字节,近似记账见
+    // SealedSegment::approx_ram_bytes)。>0 时 apply 路径超预算**就地封口**
+    // (不等 checkpoint)→ 写入期 RSS ≈ 预算 × (1+builder_threads);
+    // 0(默认)= 关闭,沿用 64K 文档阈值 + ckpt 封口。段数随之增长,
+    // 收敛依赖段 merge(S30-P3)。
+    std::size_t          seal_ram_budget_bytes = 0;
     double               auto_compact_dead_ratio = 0.0;  // S12-2
     std::shared_ptr<const SynonymMap> synonym_map;       // S11：open-time 不可变
     // S18-6（S14-5 语义每插件化）：delta 链长上限，达到后 flush 强制 base。

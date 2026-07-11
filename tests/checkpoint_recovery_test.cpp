@@ -512,3 +512,70 @@ TEST_F(CheckpointRecoveryTest, BuilderModeEndToEndAndReopen) {
     (*c)->close();
   }
 }
+
+// S30-P2:builder 模式(B=2)+ RAM 预算封口——builder 线程并发触发
+// flush_building_slot(v2 落盘 + mmap 换入 + key 定位重指;并发 seg_id 分配
+// 走锁下,防同名互覆),期间并发查询/覆盖/删除;ckpt 重开全量还原。
+TEST_F(CheckpointRecoveryTest, S30BudgetSealBuilderConcurrent) {
+  constexpr int kN = 300;
+  auto opts = make_search_options(8);
+  opts.search_config->builder_threads = 2;
+  opts.search_config->seal_ram_budget_bytes = 4096;  // 极小预算:频繁封口
+
+  {
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c) << "open failed: " << c.error().detail;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> ok{true};
+    // 并发读者:写入全程查询(封口换入 vs 查询收集器)。
+    std::thread reader([&] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        auto r = (*c)->search_text("hello", kN + 10);
+        if (!r) {
+          ok.store(false);
+          return;
+        }
+      }
+    });
+    for (int i = 0; i < kN; ++i) {
+      bitcask::DocInput doc;
+      const std::string text =
+          "hello budget builder payload filler doc" + std::to_string(i);
+      doc.text = sv_bytes(text);
+      const auto v = vector_for(i, 8);
+      doc.vector = std::span<const float>(v);
+      ASSERT_TRUE((*c)->put_doc(sv_bytes(key_for(i)), doc,
+                                static_cast<std::uint32_t>(1000 + i)));
+    }
+    stop.store(true);
+    reader.join();
+    ASSERT_TRUE(ok.load());
+
+    // 覆盖 + 删除(命中已被预算封口的 mmap 段——重指后 mark_dead 路由)。
+    {
+      bitcask::DocInput doc;
+      doc.text = sv_bytes("banana override");
+      const auto v = vector_for(0, 8);
+      doc.vector = std::span<const float>(v);
+      ASSERT_TRUE((*c)->put_doc(sv_bytes(key_for(0)), doc, 5000));
+    }
+    ASSERT_TRUE((*c)->remove(sv_bytes(key_for(1)), 5001));
+    auto r = (*c)->search_text("hello", kN + 10);
+    ASSERT_TRUE(r);
+    EXPECT_EQ(r->hits.size(), static_cast<std::size_t>(kN - 2));
+    (*c)->close();
+  }
+  // 重开:预算封的多段 + sidecar 死位全量还原。
+  {
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    auto r = (*c)->search_text("hello", kN + 10);
+    ASSERT_TRUE(r);
+    EXPECT_EQ(r->hits.size(), static_cast<std::size_t>(kN - 2));
+    for (const auto& h : r->hits) {
+      EXPECT_NE(h.key, key_for(0));
+      EXPECT_NE(h.key, key_for(1));
+    }
+    (*c)->close();
+  }
+}

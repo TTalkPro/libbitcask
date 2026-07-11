@@ -75,13 +75,19 @@ struct SearchLayerConfig {
     // DWPT 并行 builder。语义详见 text_plugin_config.hpp。
     std::size_t builder_threads = 0;
 
+    // S30-P2:封口段格式(true=v2 mmap,封口即出内存;false=v1 全量驻留回退)
+    // 与 building 段 RAM 预算(>0 超预算就地封口;0=关)。语义详见
+    // text_plugin_config.hpp。
+    bool        seal_v2_segments = true;
+    std::size_t seal_ram_budget_bytes = 0;
+
     // S18-3/4：配置拆分（设计 §6）——产出两插件各自的配置子集。公共 API
     // 面（CaskOptions::search_config）本批不变，P5 换代。
     [[nodiscard]] text::TextPluginConfig text_config() const {
         return {analyzer_config, bm25_params, cache_max_entries,
                 doc_text_cache_max, index_positions, index_catch_all,
-                builder_threads, auto_compact_dead_ratio, synonym_map,
-                max_delta_chain};
+                builder_threads, seal_v2_segments, seal_ram_budget_bytes,
+                auto_compact_dead_ratio, synonym_map, max_delta_chain};
     }
     [[nodiscard]] vec::VectorPluginConfig vector_config() const {
         return {vector_dim, vector_metric, hnsw_m, hnsw_ef_construction,

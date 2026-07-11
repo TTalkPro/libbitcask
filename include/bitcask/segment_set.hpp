@@ -58,7 +58,7 @@ public:
         if (!decoded) return nullptr;
         for (const auto& e : set->entries_) {
             std::shared_ptr<SealedSegment> seg =
-                SealedSegment::load(join(dir, e.filename));
+                SealedSegment::load_any(join(dir, e.filename));  // S30-P2:v1/v2 双格式
             if (!seg) return nullptr;  // 段损坏 → 整体拒收
             set->segments_.push_back(std::move(seg));
         }
@@ -71,20 +71,42 @@ public:
     // 统一 commit + 把清单写入 bm25.ckpt(kSegManifest);recovery 重写(步骤 4)
     // 后 segments.manifest 退役,index.manifest 成为唯一 commit point。
 
-    // 落盘段文件 + 内存登记。**仅成功时取走所有权**——失败时 seg 留在 caller
-    // 手里(修正原 add 按值取走的缺陷:失败路径 caller 拿回的是空指针,
-    // Building 段丢失且后续 apply 解引用空 building_)。
+    // 落盘段文件 + 内存登记。契约(S30-P2 修订):
+    // - 成功:`seg` 变为**已登记对象**——v1 = 原对象(身份不变);v2 =
+    //   换入的 mmap 背衬对象(caller 据此重指 key 定位,见 TextPlugin
+    //   flush_building_slot)。失败:`seg` 不变,caller 回滚(原契约保留)。
+    // - seg_id 在 list_mu_ 下分配(S30-P2 顺带修复:原先锁外读
+    //   next_seg_id_,B>1 时两 builder 阈值封口并发 → 同 id 同文件名,
+    //   后者 tmp+rename 覆盖前者 = 静默丢段)。
+    // - v2 路径:save_v2(流式,含 dead 位 sidecar)→ open_v2 换入 mmap
+    //   背衬 → **内存副本随 caller 释放**(封口即出内存,S30 主目标)。
     [[nodiscard]] bool add_pending(std::shared_ptr<SealedSegment>& seg,
                                    std::uint64_t hi_lsn) {
-        const std::uint64_t id = next_seg_id_;
+        std::uint64_t id = 0;
+        {
+            std::unique_lock lk(list_mu_);
+            id = next_seg_id_++;  // 失败留空洞,无害(id 只需单调唯一)
+        }
         const std::string fname = "seg-" + std::to_string(id) + ".seg";
-        if (!seg->save(join(dir_, fname), hi_lsn)) return false;
+        std::shared_ptr<SealedSegment> reg = seg;  // 待登记对象(v1=原对象)
+        if (seal_v2_) {
+            if (!seg->save_v2(join(dir_, fname), id)) return false;
+            std::shared_ptr<SealedSegment> m =
+                SealedSegment::open_v2(join(dir_, fname));
+            if (!m) return false;  // 写成读败(盘错):保守失败,caller 回滚
+            reg = std::move(m);
+        } else {
+            if (!seg->save(join(dir_, fname), hi_lsn)) return false;
+        }
         std::unique_lock lk(list_mu_);  // 结构变更 vs 查询 snapshot
-        entries_.push_back(Entry{fname, id, hi_lsn, seg->doc_count()});
-        segments_.push_back(std::move(seg));
-        ++next_seg_id_;
+        entries_.push_back(Entry{fname, id, hi_lsn, reg->doc_count()});
+        segments_.push_back(reg);
+        seg = std::move(reg);
         return true;
     }
+
+    // S30-P2:封口格式开关(TextPlugin 按配置设置;默认 v2)。
+    void set_seal_v2(bool on) noexcept { seal_v2_ = on; }
 
     // 内存态移除;段文件 unlink 延后到 commit **之后**(先清单后删文件——
     // 崩溃窗口只留孤儿段文件,open 忽略;原 drop 反序有「清单仍列已删文件
@@ -94,6 +116,7 @@ public:
         for (std::size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].seg_id != seg_id) continue;
             pending_unlink_.push_back(entries_[i].filename);
+            pending_unlink_.push_back(entries_[i].filename + ".live");  // v2 sidecar(缺失无害)
             entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
             // 段对象由在途查询的 shared_ptr 引用续命(pin),此处只摘列表。
             segments_.erase(segments_.begin() + static_cast<std::ptrdiff_t>(i));
@@ -213,7 +236,7 @@ public:
         if (!set->decode_manifest(payload)) return nullptr;
         for (const auto& e : set->entries_) {
             std::shared_ptr<SealedSegment> seg =
-                SealedSegment::load(join(dir, e.filename));
+                SealedSegment::load_any(join(dir, e.filename));  // S30-P2:v1/v2 双格式
             if (!seg) return nullptr;
             set->segments_.push_back(std::move(seg));
         }
@@ -230,8 +253,15 @@ public:
         for (std::size_t i = 0; i < segments_.size(); ++i) {
             auto& seg = segments_[i];
             if (!seg->dead_dirty()) continue;
-            if (!seg->save(join(dir_, entries_[i].filename),
-                           entries_[i].hi_lsn)) {
+            // S30-P2:mmap 背衬段只落 live sidecar(KB 级,tmp+rename)——
+            // 段主文件一次写永不改;v1 段沿用整段重存。
+            if (seg->is_mmap_backed()) {
+                if (!seg->save_live_sidecar(
+                        join(dir_, entries_[i].filename) + ".live")) {
+                    return false;
+                }
+            } else if (!seg->save(join(dir_, entries_[i].filename),
+                                  entries_[i].hi_lsn)) {
                 return false;
             }
             seg->clear_dead_dirty();
@@ -313,6 +343,7 @@ private:
 
     std::string   dir_;
     std::uint64_t next_seg_id_ = 0;
+    bool          seal_v2_ = true;  // S30-P2:封口格式(默认 v2 = mmap 出内存)
     // S27-3 步骤 5:并发契约——entries_/segments_ 的**结构**变更(add/drop)
     // 由 list_mu_ 保护 vs 查询线程 snapshot;段本体 shared_ptr(查询快照
     // 钉住,drop 后对象由在途查询的引用续命——UAF 防护:flush_building 封口

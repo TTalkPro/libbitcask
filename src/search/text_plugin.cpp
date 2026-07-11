@@ -151,8 +151,10 @@ void TextPlugin::apply_text_in(BuildingSlot& slot, std::string_view key,
         } else if (!displaced.tomb && displaced.seg) {
             (void)displaced.seg->mark_dead(displaced.docid);
         }
-        if (bld->doc_count() >= kBuildingFlushDocThreshold) {
-            flush_building_slot(slot);
+        if (bld->doc_count() >= kBuildingFlushDocThreshold ||
+            (config_.seal_ram_budget_bytes > 0 &&
+             bld->approx_ram_bytes() >= config_.seal_ram_budget_bytes)) {
+            flush_building_slot(slot);  // S30-P2:RAM 预算就地封口
         }
     }
 
@@ -332,8 +334,10 @@ void TextPlugin::apply_job_impl_in(BuildingSlot& slot, const ReduceJob& job,
             } else if (!displaced.tomb && displaced.seg) {
                 (void)displaced.seg->mark_dead(displaced.docid);
             }
-            if (bld->doc_count() >= kBuildingFlushDocThreshold) {
-                flush_building_slot(slot);
+            if (bld->doc_count() >= kBuildingFlushDocThreshold ||
+                (config_.seal_ram_budget_bytes > 0 &&
+                 bld->approx_ram_bytes() >= config_.seal_ram_budget_bytes)) {
+                flush_building_slot(slot);  // S30-P2:RAM 预算就地封口
             }
         }
     }
@@ -571,7 +575,7 @@ TextPlugin::collect_default_segment_views() const {
         for (auto& sp : snap) {
             const search::SealedSegment* seg = sp.get();
             views.push_back(search::SegmentView{
-                &seg->inverted(), seg,
+                &seg->default_term_index(), seg,
                 [seg](DocId d) { return std::string(seg->key_at(d)); },
                 [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
                 sp});
@@ -581,7 +585,7 @@ TextPlugin::collect_default_segment_views() const {
         bld && bld->doc_count() > 0) {
         const search::SealedSegment* seg = bld.get();
         views.push_back(search::SegmentView{
-            &seg->inverted(), seg,
+            &seg->default_term_index(), seg,
             [seg](DocId d) { return std::string(seg->key_at(d)); },
             [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
             std::move(bld)});
@@ -593,7 +597,7 @@ TextPlugin::collect_default_segment_views() const {
             bld && bld->doc_count() > 0) {
             const search::SealedSegment* seg = bld.get();
             views.push_back(search::SegmentView{
-                &seg->inverted(), seg,
+                &seg->default_term_index(), seg,
                 [seg](DocId d) { return std::string(seg->key_at(d)); },
                 [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
                 std::move(bld)});
@@ -1201,6 +1205,7 @@ void TextPlugin::init_segment_set(std::string_view dir, bool loaded) {
     } else {
         segment_set_ = std::make_unique<search::SegmentSet>();
     }
+    segment_set_->set_seal_v2(config_.seal_v2_segments);  // S30-P2
     pending_seg_manifest_.clear();
     pending_seg_manifest_.shrink_to_fit();
     rebuild_key_locations();
@@ -1323,8 +1328,26 @@ void TextPlugin::flush_building_slot(BuildingSlot& slot) {
         return;
     }
 
-    // S27-4 P1:封口零清扫——KeyLocation 持段**对象**指针,building 封口后
-    // 对象身份不变(shared_ptr 移入段集,身份不变),定位天然继续有效。
+    // S27-4 P1(v1 路径):封口零清扫——对象身份不变,定位天然有效。
+    // S30-P2(v2 路径):add_pending 把段换入为 mmap 背衬对象(身份变更)——
+    // 在 key_loc_mu_ 独占下 ① 补拷 save_v2 之后落在旧对象上的 mark_dead
+    // (on_delete 经旧定位打在旧对象,窗口内会丢)② 批量重指本段 key 定位。
+    // 锁独占 ⇒ 与 on_delete/upsert 串行:补拷时刻后的删除必经重指后的
+    // 新定位路由到新对象,无丢删窗口。v1 路径同指针,零成本短路。
+    if (pending != sealed) {
+        std::unique_lock lk(key_loc_mu_);
+        const auto n = static_cast<DocId>(pending->doc_count());
+        for (DocId d = 0; d < n; ++d) {
+            if (!sealed->is_live(d) && pending->is_live(d)) {
+                (void)pending->mark_dead(d);
+            }
+            auto it = key_to_location_.find(pending->key_at(d));
+            if (it != key_to_location_.end() && it->second.seg == sealed &&
+                it->second.docid == d) {
+                it->second.seg = pending;
+            }
+        }
+    }
     seg_dirty_.store(true, std::memory_order_relaxed);
 }
 

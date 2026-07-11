@@ -881,3 +881,242 @@ TEST(TextPlugin, BuilderModeB4ConcurrentStress) {
     ASSERT_EQ(p.close(), plugin::PluginStatus::kOk);
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// S30-P2 Slice B:v2 mmap 封口写路径。
+// ===========================================================================
+
+namespace {
+
+// 读段目录下 seg 文件的头 4 字节 magic(0x42534732='BSG2' ⇒ v2)。
+std::uint32_t seg_file_magic(const fs::path& p) {
+    std::uint32_t m = 0;
+    std::FILE* f = std::fopen(p.string().c_str(), "rb");
+    if (f) {
+        (void)!std::fread(&m, 1, 4, f);
+        std::fclose(f);
+    }
+    return m;
+}
+
+std::vector<fs::path> seg_files(const fs::path& dir) {
+    std::vector<fs::path> out;
+    const fs::path sd = dir / "bm25_segments";
+    if (!fs::exists(sd)) return out;
+    for (const auto& e : fs::directory_iterator(sd)) {
+        const auto name = e.path().filename().string();
+        if (name.rfind("seg-", 0) == 0 && name.find(".live") == std::string::npos &&
+            name.find(".tmp") == std::string::npos && name.find("manifest") == std::string::npos) {
+            out.push_back(e.path());
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+// RAM 预算封口:小预算 → 多段自动生成(不等 ckpt);写后立即可查
+// (read-your-writes);段文件为 v2 magic;删除跨越「预算封口换入」仍生效
+// (key 定位重指正确性);ckpt→重开全量还原。
+TEST(TextPlugin, S30BudgetSealV2EndToEnd) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_s30_budget";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.seal_ram_budget_bytes = 4096;  // 极小预算:几篇文档即封口
+    const std::string dir_s = dir.string();
+    text::TextPlugin a(cfg, idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+
+    constexpr std::uint64_t kDocs = 60;
+    for (std::uint64_t ord = 0; ord < kDocs; ++ord) {
+        const std::string key = "k" + std::to_string(ord);
+        host_put_row(idx, key, ord);
+        a.apply_text(key, ord,
+                     "budget seal stream doc payload word" +
+                         std::to_string(ord) + " filler alpha beta gamma");
+    }
+    // 预算封口应已产生多个段文件(无 ckpt),且全部 v2。
+    auto files = seg_files(dir);
+    ASSERT_GE(files.size(), 2u) << "预算封口未触发";
+    for (const auto& f : files) {
+        EXPECT_EQ(seg_file_magic(f), 0x42534732u) << f;
+    }
+    // read-your-writes:全部可查。
+    {
+        auto r = a.search_text("budget", kDocs);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), kDocs);
+    }
+    // 删除一个「已被预算封口进段」的早期文档——验证 key 定位重指到
+    // mmap 背衬对象后 mark_dead 正确路由。
+    a.on_delete("k1", kDocs + 1, 1);
+    a.on_delete("k2", kDocs + 2, 2);
+    {
+        auto r = a.search_text("budget", kDocs);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), kDocs - 2);
+        for (const auto& h : *r) {
+            EXPECT_NE(h.key, "k1");
+            EXPECT_NE(h.key, "k2");
+        }
+    }
+
+    // ckpt(死位落 sidecar)→ 新插件重开 → 计数/删除全还原。
+    plugin::FlushRequest req;
+    req.watermark = kDocs + 3;
+    ASSERT_EQ(a.flush(req).status, plugin::PluginStatus::kOk);
+    const auto st = a.chain_state();
+
+    index::Index idx2;
+    for (std::uint64_t ord = 0; ord < kDocs; ++ord) {
+        host_put_row(idx2, "k" + std::to_string(ord), ord);
+    }
+    text::TextPlugin b(cfg, idx2, idx2, idx2);
+    plugin::OpenContext c2;
+    c2.dir = dir_s;
+    c2.committed_base_watermark = st.base_gen;
+    c2.committed_chain_watermark = st.chain_wm;
+    c2.committed_chain_seq = st.next_seq - 1;
+    ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+    auto r = b.search_text("budget", kDocs);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), kDocs - 2);  // 删除经 sidecar 持久化,无幽灵
+    fs::remove_all(dir);
+}
+
+// v1→v2 混合段集:v1 关闭封口的既有段 + 换 v2 配置后的新段共存于同一
+// 清单,双格式恢复(load_any 探 magic)、查询归并无差别。
+TEST(TextPlugin, S30MixedV1V2Segments) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_s30_mixed";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    index::Index idx;
+    const std::string dir_s = dir.string();
+    auto cfg1 = make_cfg();
+    cfg1.seal_v2_segments = false;  // 先用 v1 封口
+    {
+        text::TextPlugin a(cfg1, idx, idx, idx);
+        plugin::OpenContext ctx;
+        ctx.dir = dir_s;
+        ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+        for (std::uint64_t ord = 0; ord < 3; ++ord) {
+            const std::string key = "v1k" + std::to_string(ord);
+            host_put_row(idx, key, ord);
+            a.apply_text(key, ord, "legacy corpus " + std::to_string(ord));
+        }
+        plugin::FlushRequest req;
+        req.watermark = 3;
+        ASSERT_EQ(a.flush(req).status, plugin::PluginStatus::kOk);
+    }
+    auto files1 = seg_files(dir);
+    ASSERT_EQ(files1.size(), 1u);
+    EXPECT_NE(seg_file_magic(files1[0]), 0x42534732u);  // v1
+
+    // v2 配置重开:老 v1 段可读;新增文档 → 新段 v2。
+    const auto st = [&] {
+        text::TextPlugin probe(cfg1, idx, idx, idx);
+        return probe.chain_state();
+    }();
+    (void)st;
+    index::Index idx2;
+    for (std::uint64_t ord = 0; ord < 3; ++ord) {
+        host_put_row(idx2, "v1k" + std::to_string(ord), ord);
+    }
+    auto cfg2 = make_cfg();  // seal_v2 默认 true
+    text::TextPlugin b(cfg2, idx2, idx2, idx2);
+    plugin::OpenContext c2;
+    c2.dir = dir_s;
+    c2.committed_base_watermark = 3;
+    c2.committed_chain_watermark = 3;
+    c2.committed_chain_seq = 0;
+    ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+    {
+        auto r = b.search_text("legacy", 10);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), 3u);  // v1 段照常可查
+    }
+    for (std::uint64_t ord = 3; ord < 6; ++ord) {
+        const std::string key = "v2k" + std::to_string(ord);
+        host_put_row(idx2, key, ord);
+        b.apply_text(key, ord, "legacy fresh " + std::to_string(ord));
+    }
+    plugin::FlushRequest req2;
+    req2.watermark = 6;
+    ASSERT_EQ(b.flush(req2).status, plugin::PluginStatus::kOk);
+    auto files2 = seg_files(dir);
+    ASSERT_EQ(files2.size(), 2u);
+    std::size_t v2n = 0;
+    for (const auto& f : files2) {
+        if (seg_file_magic(f) == 0x42534732u) ++v2n;
+    }
+    EXPECT_EQ(v2n, 1u);  // 混合:一 v1 一 v2
+    auto r = b.search_text("legacy", 10);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 6u);  // 跨格式归并
+    fs::remove_all(dir);
+}
+
+// 崩溃语义:预算封口产生段文件但 ckpt 未提交 → 段文件是孤儿;按旧链状态
+// 重开 → 孤儿忽略(清单里没有),不重不漏(文档由宿主 WAL 重放补,此处
+// 只验插件侧:open 不拒收、不吞孤儿)。
+TEST(TextPlugin, S30OrphanSegmentIgnoredOnReopen) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_s30_orphan";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.seal_ram_budget_bytes = 2048;
+    const std::string dir_s = dir.string();
+    // 第一阶段:写 3 篇 + ckpt(清单含段 A)。
+    std::uint64_t base_wm = 0;
+    {
+        text::TextPlugin a(cfg, idx, idx, idx);
+        plugin::OpenContext ctx;
+        ctx.dir = dir_s;
+        ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+        for (std::uint64_t ord = 0; ord < 3; ++ord) {
+            const std::string key = "k" + std::to_string(ord);
+            host_put_row(idx, key, ord);
+            a.apply_text(key, ord, "orphan committed " + std::to_string(ord));
+        }
+        plugin::FlushRequest req;
+        req.watermark = 3;
+        ASSERT_EQ(a.flush(req).status, plugin::PluginStatus::kOk);
+        base_wm = 3;
+        // 第二阶段:继续狂写触发预算封口(段文件落盘)但**不 ckpt** → 孤儿。
+        for (std::uint64_t ord = 3; ord < 40; ++ord) {
+            const std::string key = "k" + std::to_string(ord);
+            host_put_row(idx, key, ord);
+            a.apply_text(key, ord,
+                         "orphan uncommitted payload filler words " +
+                             std::to_string(ord));
+        }
+        // 析构不 flush(模拟崩溃:段文件在,清单没更新)。
+    }
+    const auto files = seg_files(dir);
+    ASSERT_GE(files.size(), 2u);  // 已提交段 + ≥1 孤儿
+
+    index::Index idx2;
+    for (std::uint64_t ord = 0; ord < 3; ++ord) {
+        host_put_row(idx2, "k" + std::to_string(ord), ord);
+    }
+    text::TextPlugin b(cfg, idx2, idx2, idx2);
+    plugin::OpenContext c2;
+    c2.dir = dir_s;
+    c2.committed_base_watermark = base_wm;
+    c2.committed_chain_watermark = base_wm;
+    c2.committed_chain_seq = 0;
+    ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+    EXPECT_EQ(b.watermark(), 3u);  // 只认已提交清单
+    auto r = b.search_text("orphan", 50);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 3u);  // 孤儿段不被吞入(ord>=3 由宿主重放走正常写路径)
+    fs::remove_all(dir);
+}

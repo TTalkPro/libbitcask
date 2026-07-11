@@ -306,6 +306,12 @@ inline std::vector<SearchResult> search_wand_impl(
         if (live_df == 0) {
             tp.idf = 0.0f;
             tp.list_upper_bound = 0.0f;
+            // S30-P2 修复(既存潜伏 bug,S10-A2 起):全死词此前留空
+            // block_upper_bounds 便 continue,但其游标仍参与下方块跳跃判定
+            // → 空数组按 block_idx 越界读(触发条件:≥kBlockSize posting 的
+            // 词全部死亡 + WAND 档查询;ASan 于 mmap 段恢复场景实测抓获)。
+            // 填 0 与「idf=0 时逐块计算」位级一致(上界 = idf×… = 0)。
+            tp.block_upper_bounds.assign(tp.fp->blocks.size(), 0.0F);
             continue;
         }
         // S27-2：idf 的 df——全局注入优先，回退本段 live_df（同 score_bow_topk）。
