@@ -427,8 +427,8 @@ public:
     // MmapSegment(内存态字段恒空)。`<path>.live` sidecar 存在则叠加。
     // 失败(IO/CRC/坏 sidecar)→ nullptr。
     [[nodiscard]] static std::unique_ptr<SealedSegment> open_v2(
-        const std::string& path) {
-        auto m = MmapSegment::open(path);
+        const std::string& path, bool verify_crc = true) {
+        auto m = MmapSegment::open(path, bm25::Bm25Params{}, verify_crc);
         if (!m) return nullptr;
         const std::string side = path + ".live";
         if (std::filesystem::exists(side)) {
@@ -516,8 +516,10 @@ public:
     // S30-P2:格式分发载入——v2(mmap 背衬,探头 4 字节 magic)或 v1
     // (SearchCheckpoint 容器,全量解码进内存)。双格式并存:老库的 v1 段
     // 继续可读,新封口走 v2(SegmentSet 按配置)。失败 → nullptr。
+    // verify_crc=false = S21-A6 可信读 opt-in(只对 v2 mmap 生效;v1 段的
+    // SearchCheckpoint 容器恒校验)。
     [[nodiscard]] static std::unique_ptr<SealedSegment> load_any(
-        const std::string& path) {
+        const std::string& path, bool verify_crc = true) {
         std::uint32_t magic = 0;
         {
             std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -526,7 +528,7 @@ public:
             std::fclose(f);
             if (!ok) return nullptr;
         }
-        if (magic == segv2::kMagic) return open_v2(path);
+        if (magic == segv2::kMagic) return open_v2(path, verify_crc);
         return load(path);
     }
 

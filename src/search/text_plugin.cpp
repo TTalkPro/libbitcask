@@ -1198,10 +1198,13 @@ void TextPlugin::init_segment_set(std::string_view dir, bool loaded) {
     std::filesystem::create_directories(segs_dir, ec);
     std::unique_ptr<search::SegmentSet> opened;
     if (loaded && !pending_seg_manifest_.empty()) {
-        opened = search::SegmentSet::open_from_payload(segs_dir,
-                                                       pending_seg_manifest_);
+        opened = search::SegmentSet::open_from_payload(
+            segs_dir, pending_seg_manifest_, config_.mmap_verify_crc);
     }
-    if (!opened) opened = search::SegmentSet::open(segs_dir);  // 过渡回退
+    if (!opened) {
+        opened = search::SegmentSet::open(segs_dir,
+                                          config_.mmap_verify_crc);  // 过渡回退
+    }
     if (opened) {
         segment_set_ = std::move(opened);
     } else {

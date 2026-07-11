@@ -39,9 +39,11 @@ public:
 
     // 打开目录：读 manifest → 载入各活跃段。无 manifest → 空集。
     // manifest CRC 坏 / 任一段载入失败 → nullptr（保守：退全量重建）。
-    [[nodiscard]] static std::unique_ptr<SegmentSet> open(const std::string& dir) {
+    [[nodiscard]] static std::unique_ptr<SegmentSet> open(
+        const std::string& dir, bool verify_crc = true) {
         auto set = std::make_unique<SegmentSet>();
         set->dir_ = dir;
+        set->verify_crc_ = verify_crc;
         auto lc = SearchCheckpoint::read(manifest_path(dir));
         if (!lc) return set;  // 无清单 = 空段集（首次 open）
         set->next_seg_id_ = lc->watermark;
@@ -58,7 +60,8 @@ public:
         if (!decoded) return nullptr;
         for (const auto& e : set->entries_) {
             std::shared_ptr<SealedSegment> seg =
-                SealedSegment::load_any(join(dir, e.filename));  // S30-P2:v1/v2 双格式
+                SealedSegment::load_any(join(dir, e.filename),
+                                        set->verify_crc_);  // v1/v2 双格式
             if (!seg) return nullptr;  // 段损坏 → 整体拒收
             set->segments_.push_back(std::move(seg));
         }
@@ -107,6 +110,9 @@ public:
 
     // S30-P2:封口格式开关(TextPlugin 按配置设置;默认 v2)。
     void set_seal_v2(bool on) noexcept { seal_v2_ = on; }
+    // S21-A6:载入时跳 v2 段 CRC(可信盘 opt-in;默认恒校验)。须在
+    // open/open_from_payload **之前**设置(静态工厂场景经参数)。
+    void set_verify_crc(bool on) noexcept { verify_crc_ = on; }
 
     // ---- S30-P3:merge 换入原语 ----
     // 预留 seg_id + 文件名(merge 先写文件后登记;id 锁下分配防并发撞号)。
@@ -249,13 +255,16 @@ public:
     // next_seg_id 取清单内最大 seg_id+1——崩溃残留的孤儿段文件(add_pending
     // 后未 commit)可能与新 id 同名,save 的 tmp+rename 原子覆盖,无害。
     [[nodiscard]] static std::unique_ptr<SegmentSet> open_from_payload(
-        const std::string& dir, std::span<const std::byte> payload) {
+        const std::string& dir, std::span<const std::byte> payload,
+        bool verify_crc = true) {
         auto set = std::make_unique<SegmentSet>();
         set->dir_ = dir;
+        set->verify_crc_ = verify_crc;
         if (!set->decode_manifest(payload)) return nullptr;
         for (const auto& e : set->entries_) {
             std::shared_ptr<SealedSegment> seg =
-                SealedSegment::load_any(join(dir, e.filename));  // S30-P2:v1/v2 双格式
+                SealedSegment::load_any(join(dir, e.filename),
+                                        set->verify_crc_);  // v1/v2 双格式
             if (!seg) return nullptr;
             set->segments_.push_back(std::move(seg));
         }
@@ -363,6 +372,7 @@ private:
     std::string   dir_;
     std::uint64_t next_seg_id_ = 0;
     bool          seal_v2_ = true;  // S30-P2:封口格式(默认 v2 = mmap 出内存)
+    bool          verify_crc_ = true;  // S21-A6:载入校验(false=可信读)
     // S27-3 步骤 5:并发契约——entries_/segments_ 的**结构**变更(add/drop)
     // 由 list_mu_ 保护 vs 查询线程 snapshot;段本体 shared_ptr(查询快照
     // 钉住,drop 后对象由在途查询的引用续命——UAF 防护:flush_building 封口

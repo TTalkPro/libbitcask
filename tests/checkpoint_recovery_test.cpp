@@ -579,3 +579,60 @@ TEST_F(CheckpointRecoveryTest, S30BudgetSealBuilderConcurrent) {
     (*c)->close();
   }
 }
+
+// S30-P4:RSS 探针(手动实验,CI 恒跳过)。协议:BITCASK_RSS_PROBE=v1|v2
+// 各跑一次——两模式同预算封口节奏(段数一致),仅 seal_v2_segments 不同,
+// VmHWM 差值即「封口段 mmap 出内存」的净收益。
+// 用法:BITCASK_RSS_PROBE=v2 ./bitcask_checkpoint_recovery_test \
+//        --gtest_filter='*S30RssProbe*' --gtest_also_run_disabled_tests
+namespace {
+long read_status_kb(const char* key) {
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind(key, 0) == 0) {
+            long v = 0;
+            std::sscanf(line.c_str() + std::strlen(key), " %ld", &v);
+            return v;
+        }
+    }
+    return -1;
+}
+}  // namespace
+
+TEST_F(CheckpointRecoveryTest, DISABLED_S30RssProbe) {
+    const char* mode = std::getenv("BITCASK_RSS_PROBE");
+    ASSERT_NE(mode, nullptr) << "设 BITCASK_RSS_PROBE=v1|v2";
+    const bool v2 = std::string_view(mode) == "v2";
+
+    auto opts = make_search_options(8);
+    opts.search_config->seal_v2_segments = v2;
+    opts.search_config->seal_ram_budget_bytes = 8u << 20;  // 两模式同节奏
+    opts.search_config->merge_fan_in = 0;  // 关 merge:纯比常驻形态
+
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    const int kN = std::getenv("BITCASK_RSS_DOCS")
+                       ? std::atoi(std::getenv("BITCASK_RSS_DOCS"))
+                       : 60000;
+    std::string text;
+    for (int i = 0; i < kN; ++i) {
+        text.clear();
+        for (int j = 0; j < 40; ++j) {
+            text += "w" + std::to_string((i * 7 + j * 131) % 5000) + " ";
+        }
+        text += "common tail";
+        bitcask::DocInput doc;
+        doc.text = sv_bytes(text);
+        ASSERT_TRUE((*c)->put_doc(sv_bytes(key_for(i)), doc,
+                                  static_cast<std::uint32_t>(i)));
+    }
+    auto r = (*c)->search_text("common", 10);
+    ASSERT_TRUE(r);
+    const long hwm = read_status_kb("VmHWM:");
+    const long rss = read_status_kb("VmRSS:");
+    std::fprintf(stderr,
+                 "[rss-probe] mode=%s docs=%d VmHWM=%ld MB VmRSS=%ld MB\n",
+                 mode, kN, hwm / 1024, rss / 1024);
+    (*c)->close();
+}

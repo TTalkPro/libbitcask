@@ -3893,8 +3893,26 @@ W4 ✅（parallel_scan 并行全表扫描）。
     build-rel 过。
   - 注:pre-segment 老格式 ckpt(kBm25Default 系)仍退全量 fold(既定
     回退,一次性升级成本);段级 v1→v2 由 merge 自愈,无需独立迁移器。
-- [ ] **S30-P4 收尾**（~1 会话）· 三 sanitizer 全量;查询/索引 bench 无
-  回归 + 新增冷/热查询延迟与 RSS bench;S21-A6 opt-in 跳 CRC 顺带。
+- [x] **S30-P4 收尾已完成(2026-07-11)**:
+  - **RSS 定量实验**(DISABLED_S30RssProbe 探针,双进程同预算封口节奏、
+    仅 seal_v2 不同,VmHWM 差 = mmap 净收益):60k 文档 **165→84MB
+    (-49%)**;120k 文档 **301→137MB(-55%)**——v1 每 60k +136MB 线性,
+    v2 +53MB(其中 mmap 页计入 RSS 但**可回收**,硬驻留更低;残余增长 =
+    keydir/key_to_location_ 的 O(keys) 轴,本批明确非目标)。探针保留为
+    手动实验(BITCASK_RSS_PROBE=v1|v2 + BITCASK_RSS_DOCS)。
+  - **bench 回归**(build-rel):`BM_Cask_PutDocTextIndex` B=0/1/2/4 =
+    96/109/183/190k docs/s(S27-4 基线 95-103/105/180/198k,噪声带内);
+    QueryThroughputBOW 4t、SearchHybrid 持平。**v2 封口/合并对写查吞吐
+    零回归**。
+  - **S21-A6 落地**:`mmap_verify_crc` 配置(默认恒校验;false = 可信盘
+    跳 v2 段载入 CRC)经 SearchConfig→TextPlugin→SegmentSet→load_any 全
+    管道;v1 段容器恒校验不受影响。
+  - **三 sanitizer 全量**:clang 607/607;ASan 607/607;TSan 606/607
+    (唯一失败 = S29-T 在案既存,与 S30 无关)。
+- **S30 批次收官(2026-07-11,P1[缺 WAND 块游标]+P2+P3+P4)**。剩余
+  挂账:**WAND 块游标**(mmap 大词查询现为全量解码 interim——正确、逐位
+  一致、与内存版快照拷贝同量级;块游标按跳表逐块解码才免大词 O(df) 解码,
+  性能优化项,可与后续批次穿插)。
 - 收编挂账：S26-⑤⑥(positions 编码/ckpt 停顿)、S21-A6、S24-M9 后半
   (封口段词典双份)、S27-3 挂账(consolidation + legacy 迁移)。
 - 明确非目标：KV 主路径零变化;HNSW 常驻另立项;key→location resolver

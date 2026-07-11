@@ -1,5 +1,10 @@
 # S30 设计:封口段 mmap 化 + 写路径 RAM 预算封口(倒排索引出内存)
 
+> **批次收官(2026-07-11)**:P1(格式/reader/TermIndex 接线,WAND 块游标
+> 留作优化挂账)+ P2(封口即 mmap 出内存 + 预算封口,默认开启)+ P3
+> (tiered merge,S27-3 consolidation 了结)+ P4(RSS 实测 60k/120k 文档
+> **-49%/-55%**,bench 零回归,S21-A6 落地,三 sanitizer 全量)。
+
 > 状态:**P1 Slice 1 已落地(2026-07-11)**——共享评分实现抽取(bm25_search_impl.hpp)
 > + v2 格式/流式 writer/MmapSegment reader 核心(segment_v2.hpp/.cpp),round-trip
 > 与内存段**逐位一致**(200 轮随机 WAND 对拍),clang/ASan 全量 589/589。

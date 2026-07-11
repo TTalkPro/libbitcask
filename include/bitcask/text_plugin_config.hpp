@@ -50,6 +50,9 @@ struct TextPluginConfig {
     // ② 同量级(log2 doc_count 层)段数 ≥ fan_in → 合并该层最老 fan_in 个。
     // 每次 flush 至多一组(摊销)。0 = 关闭(段数只增,不建议)。
     std::size_t          merge_fan_in = 8;
+    // S21-A6:载入 v2 段时跳过 CRC 校验(可信盘/大库加速冷启动的 opt-in;
+    // 默认恒校验。跳过后盘损坏由 mmap 读出错误数据,风险自担)。
+    bool                 mmap_verify_crc = true;
     double               auto_compact_dead_ratio = 0.0;  // S12-2
     std::shared_ptr<const SynonymMap> synonym_map;       // S11：open-time 不可变
     // S18-6（S14-5 语义每插件化）：delta 链长上限，达到后 flush 强制 base。
