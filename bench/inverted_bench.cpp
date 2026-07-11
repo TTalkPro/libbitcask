@@ -277,7 +277,9 @@ BENCHMARK(BM_Inverted_SearchWhileIndexing)->Threads(4)
 
 // BOW 查询并发吞吐回归基准（T6 测量遗留）。多个调用线程并发跑同一小 BOW
 // 查询（8 词 × 120 postings = 960 总 < 1024 kWandThreshold → 走 score_bow_topk）。
-// items/s = 聚合 QPS（benchmark 跨线程自动汇总），随调用线程数（读并发）变化。
+// ⚠️ 指标语义（S29-6B 实证订正,固定迭代数×墙钟核实）：Time/items_per_second
+// 是**每线程每迭代** real time 及其倒数,**不是聚合 QPS**——聚合 QPS =
+// threads / Time。读扩展性看「Time 随线程数是否平坦」（平坦 = 线性扩展）。
 //
 // 【背景】score_bow_topk 原用 tbb::parallel_reduce（grainsize=1）做查询内并行，
 // 本基准 + BITCASK_BM25_GRAIN 对拍实测：BOW 小查询上并行净亏（单线程 1.6×、
