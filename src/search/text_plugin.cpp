@@ -3,6 +3,8 @@
 // 回填 → doc_len_writer_（S18-1 窄接口）、压实统计 → stats_（S18-4 窄接口）。
 
 #include "bitcask/text_plugin.hpp"
+
+#include "bitcask/segment_merge.hpp"  // S30-P3:k-way 段合并
 #include "bitcask/ckpt_chain.hpp"       // S20-2：walk_chain / remove_chain_files
 #include "bitcask/search_checkpoint.hpp"
 #include "bitcask/text_utils.hpp"
@@ -1212,6 +1214,91 @@ void TextPlugin::init_segment_set(std::string_view dir, bool loaded) {
 }
 
 
+
+// S30-P3:checkpoint 静止点的 tiered 段合并。策略(每 flush 至多一组,摊销):
+// ① 死点回收:live ≤ 1/2 doc_count 的段(mmap 段不可原地压实,merge 是
+//    唯一物理回收路径;单段自合并也值得);
+// ② 同层收敛:tier = bit_width(doc_count) 同层段数 ≥ merge_fan_in →
+//    该层最老 fan_in 个(entries 序 = 年龄序)。
+// 换入协议:静止点无并发写/删(flush 契约)→ 无死位补拷窗口;查询并发
+// 安全(输入段在 drop_pending 前持续可查,之后由 pin 续命;清单提交随
+// 本次 ckpt 的 save_component_base,崩溃 = 回退合并前状态,输出文件成
+// 孤儿被忽略)。key 定位批量重指 O(输出文档),与合并本身同量级。
+void TextPlugin::maybe_merge_segments() {
+    if (!segment_set_ || config_.merge_fan_in == 0) return;
+    const auto segs = segment_set_->segments_view();      // reducer 静止点安全
+    const auto entries = segment_set_->entries_view();
+
+    std::vector<std::size_t> pick;
+    // ① 死点回收优先。
+    for (std::size_t i = 0; i < segs.size(); ++i) {
+        const auto dc = segs[i]->doc_count();
+        if (dc > 0 && segs[i]->live_doc_count() * 2 <= dc) pick.push_back(i);
+        if (pick.size() >= config_.merge_fan_in) break;
+    }
+    // ② 同层收敛(仅当无死点回收组)。
+    if (pick.empty()) {
+        std::unordered_map<unsigned, std::vector<std::size_t>> tiers;
+        for (std::size_t i = 0; i < segs.size(); ++i) {
+            const auto dc = segs[i]->doc_count();
+            if (dc == 0) continue;
+            tiers[static_cast<unsigned>(std::bit_width(dc))].push_back(i);
+        }
+        for (auto& [t, v] : tiers) {
+            if (v.size() >= config_.merge_fan_in) {
+                v.resize(config_.merge_fan_in);  // 最老 fan_in 个(entries 序)
+                pick = std::move(v);
+                break;
+            }
+        }
+    }
+    if (pick.empty()) return;
+
+    std::vector<std::shared_ptr<const search::SealedSegment>> inputs;
+    std::vector<std::uint64_t> input_ids;
+    inputs.reserve(pick.size());
+    for (auto i : pick) {
+        inputs.push_back(segs[i]);
+        input_ids.push_back(entries[i].seg_id);
+    }
+
+    const auto [new_id, fname] = segment_set_->reserve_seg_file();
+    const std::string path =
+        (std::filesystem::path(segment_set_->dir()) / fname).string();
+    search::MergeResult mr;
+    if (!search::merge_segments_v2(path, new_id, inputs, mr)) {
+        return;  // 合并失败:输入原样保留(输出残留 tmp 已由 writer 清理)
+    }
+    std::shared_ptr<search::SealedSegment> merged =
+        search::SealedSegment::open_v2(path);
+    if (!merged) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        return;
+    }
+
+    // 换入:登记输出 → key 定位重指 → 摘除输入。
+    segment_set_->add_prebuilt_pending(merged, fname, new_id, mr.out_hi_lsn);
+    {
+        std::unique_lock lk(key_loc_mu_);
+        for (std::size_t si = 0; si < inputs.size(); ++si) {
+            const auto& map = mr.docid_map[si];
+            for (std::uint32_t od = 0; od < map.size(); ++od) {
+                const auto nd = map[od];
+                if (nd == search::MergeResult::kDead) continue;
+                auto it = key_to_location_.find(merged->key_at(nd));
+                if (it != key_to_location_.end() &&
+                    it->second.seg == inputs[si] && it->second.docid == od) {
+                    it->second.seg = merged;
+                    it->second.docid = nd;
+                }
+            }
+        }
+    }
+    for (auto id : input_ids) (void)segment_set_->drop_pending(id);
+    seg_dirty_.store(true, std::memory_order_relaxed);
+}
+
 // ---- S18-6：CaskPlugin flush/open 实装 ----
 
 plugin::PluginStatus TextPlugin::open(const plugin::OpenContext& ctx) {
@@ -1267,7 +1354,7 @@ plugin::FlushResult TextPlugin::flush(const plugin::FlushRequest& req) {
     drain_builders();  // S27-4 P2:ckpt 覆盖到 watermark 需在途 apply 完成
     if (!dirty() && !req.force_rebase) {
         res.covered_ord = chain_.chain_wm;
-    } else if ((flush_building(),
+    } else if ((flush_building(), maybe_merge_segments(),
                 save_component_base(dir_, req.watermark))) {
         // S27-3 B2b 步骤 4:保存前先封口 building_ → kSegManifest 覆盖到本次
         // watermark 的全部已 apply 文档(否则 recovery 后段集落后 fields_,

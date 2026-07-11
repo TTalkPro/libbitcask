@@ -108,6 +108,25 @@ public:
     // S30-P2:封口格式开关(TextPlugin 按配置设置;默认 v2)。
     void set_seal_v2(bool on) noexcept { seal_v2_ = on; }
 
+    // ---- S30-P3:merge 换入原语 ----
+    // 预留 seg_id + 文件名(merge 先写文件后登记;id 锁下分配防并发撞号)。
+    [[nodiscard]] std::pair<std::uint64_t, std::string> reserve_seg_file() {
+        std::unique_lock lk(list_mu_);
+        const auto id = next_seg_id_++;
+        return {id, "seg-" + std::to_string(id) + ".seg"};
+    }
+    // 登记已写好的段文件(merge 产物;文件由 caller 经 reserve_seg_file 命名
+    // 并已 tmp+rename 落盘)。清单提交仍延后到 commit(孤儿语义不变)。
+    void add_prebuilt_pending(std::shared_ptr<SealedSegment> seg,
+                              std::string fname, std::uint64_t seg_id,
+                              std::uint64_t hi_lsn) {
+        std::unique_lock lk(list_mu_);
+        entries_.push_back(
+            Entry{std::move(fname), seg_id, hi_lsn, seg->doc_count()});
+        segments_.push_back(std::move(seg));
+    }
+    [[nodiscard]] const std::string& dir() const noexcept { return dir_; }
+
     // 内存态移除;段文件 unlink 延后到 commit **之后**(先清单后删文件——
     // 崩溃窗口只留孤儿段文件,open 忽略;原 drop 反序有「清单仍列已删文件
     // → open 整体拒收 → 退全量重建」窗口,顺带修正)。

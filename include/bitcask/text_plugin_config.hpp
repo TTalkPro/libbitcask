@@ -45,6 +45,11 @@ struct TextPluginConfig {
     // 0(默认)= 关闭,沿用 64K 文档阈值 + ckpt 封口。段数随之增长,
     // 收敛依赖段 merge(S30-P3)。
     std::size_t          seal_ram_budget_bytes = 0;
+    // S30-P3:段合并扇入。checkpoint 静止点触发 tiered merge:① 死点占比
+    // ≥1/2 的段(物理回收——mmap 段不可原地压实,merge 是唯一回收路径)
+    // ② 同量级(log2 doc_count 层)段数 ≥ fan_in → 合并该层最老 fan_in 个。
+    // 每次 flush 至多一组(摊销)。0 = 关闭(段数只增,不建议)。
+    std::size_t          merge_fan_in = 8;
     double               auto_compact_dead_ratio = 0.0;  // S12-2
     std::shared_ptr<const SynonymMap> synonym_map;       // S11：open-time 不可变
     // S18-6（S14-5 语义每插件化）：delta 链长上限，达到后 flush 强制 base。

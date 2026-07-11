@@ -903,6 +903,15 @@ auto InvertedIndex::df_live(std::string_view term, const LiveChecker& live_check
     return count;
 }
 
+bool InvertedIndex::snapshot_postings(std::string_view term,
+                                      PostingList& out) const {
+    const auto& shard = shard_for(term);
+    PostingMap::const_accessor acc;
+    if (!shard.inverted.find(acc, tls_term_key(term))) return false;
+    out = *acc->second;  // 深拷(merge 消费静止段;含 positions)
+    return true;
+}
+
 void InvertedIndex::visit_postings_sorted(
     const std::function<void(std::string_view term, const PostingList& pl)>& fn)
     const {

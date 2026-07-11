@@ -452,6 +452,60 @@ public:
         return mmap_ ? mmap_->save_live_sidecar(path) : false;
     }
 
+    // ---- S30-P3:merge 导出面(双形态;调用契约 = 静止段/封口段) ----
+
+    [[nodiscard]] index::DocSlot slot_at(DocId d) const {
+        if (mmap_) return mmap_->slot_of(d);
+        return slots_[d];
+    }
+
+    // 本段字段名全集(升序;含 kDefaultField)。
+    [[nodiscard]] std::vector<std::string> merge_field_names() const {
+        std::vector<std::string> out;
+        if (mmap_) {
+            for (auto n : mmap_->field_names()) out.emplace_back(n);
+        } else {
+            out.emplace_back(kDefaultField);
+            std::shared_lock lk(fields_mu_);
+            for (const auto& [name, inv] : fields_) out.push_back(name);
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    // 字段词表(升序;跳过空 posting list——对齐 v2 词典语义)。字段缺席
+    // 返回空表。
+    [[nodiscard]] std::vector<std::string> merge_field_terms(
+        std::string_view field) const {
+        std::vector<std::string> out;
+        if (mmap_) {
+            const auto n = mmap_->term_count(field);
+            out.reserve(n);
+            for (std::uint64_t i = 0; i < n; ++i) {
+                out.emplace_back(mmap_->term_at(field, i));
+            }
+            return out;
+        }
+        const bm25::InvertedIndex* inv =
+            field == kDefaultField ? &inv_ : field_index(field);
+        if (inv == nullptr) return out;
+        inv->visit_postings_sorted(
+            [&out](std::string_view t, const bm25::PostingList& pl) {
+                if (!pl.empty()) out.emplace_back(t);
+            });
+        return out;
+    }
+
+    // 单 term posting 深拷(含 positions/dls)。
+    [[nodiscard]] bool merge_field_postings(std::string_view field,
+                                            std::string_view term,
+                                            bm25::PostingList& out) const {
+        if (mmap_) return mmap_->decode_postings_list(field, term, out);
+        const bm25::InvertedIndex* inv =
+            field == kDefaultField ? &inv_ : field_index(field);
+        return inv != nullptr && inv->snapshot_postings(term, out);
+    }
+
     // S30-P2:building 段近似 RAM 占用(预算封口判据)。逐 add 增量累加:
     // key + 定长行 + Σ(term 字节 + posting 行摊销 + positions×4)。近似值
     // ——词典去重/容量倍增/TBB 节点开销不计,量级正确即可(预算是软阈值)。

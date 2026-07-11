@@ -13,6 +13,7 @@
 
 #include "bitcask/inverted.hpp"
 #include "bitcask/segment.hpp"        // P2:SealedSegment(mmap 背衬)
+#include "bitcask/segment_merge.hpp"   // P3:k-way 段合并
 #include "bitcask/segment_query.hpp"  // Slice 4:SegmentView / multi_segment_search
 #include "bitcask/segment_v2.hpp"
 #include "test_support.hpp"
@@ -852,4 +853,194 @@ TEST(SegmentV2P2, SaveV2CarriesDeadBits) {
     EXPECT_FALSE(mm->is_live(3));
     EXPECT_FALSE(mm->is_live(7));
     EXPECT_EQ(mm->live_doc_count(), 28u);
+}
+
+// ===========================================================================
+// S30-P3 Slice 1:k-way 段合并——金标:merge(inputs) ≡ 把 live 文档按
+// (输入序,段内序) 直接 add 进单段(docid 稠密重编的定义即此)。双侧都走
+// v2 mmap,查询/doc_store/统计逐位一致;死行物理回收;v1/v2 混合输入。
+// ===========================================================================
+
+namespace {
+
+using bitcask::search::MergeResult;
+using bitcask::search::merge_segments_v2;
+
+// 全局编号 g 的一篇多字段文档。
+void add_merge_doc(SealedSegment& seg, std::uint32_t g) {
+    TermPositions def;
+    def["hot"] = {1 + g % 3, {0, 2}};
+    def["mid" + std::to_string(g % 7)] = {1, {1}};
+    TermPositions title;
+    title["t" + std::to_string(g % 5)] = {1, {0}};
+    TermPositions body;
+    body["shared"] = {2, {0, 4}};
+    body["alpha"] = {1, {1}};
+    body["beta"] = {1, {2}};  // "alpha beta" 相邻 → 短语金标
+    std::vector<SealedSegment::FieldInput> fs;
+    fs.push_back({bitcask::search::kDefaultField, &def});
+    fs.push_back({"title", &title});
+    fs.push_back({"body", &body});
+    std::uint32_t total_dl = 0;
+    for (const auto& f : fs) {
+        for (const auto& [t, pd] : *f.terms) total_dl += pd.first;
+    }
+    (void)seg.add("k" + std::to_string(g), 1000 + g, fs, total_dl,
+                  bitcask::index::DocLoc{.offset = g * 16,
+                                         .file_id = 2,
+                                         .total_sz = 16},
+                  g);
+}
+
+}  // namespace
+
+TEST(SegmentV2P3, KWayMergeGoldenEquivalence) {
+    const auto tmp = std::filesystem::temp_directory_path();
+    // 三个输入段:[0,100) / [100,180) / [180,240),每输入杀部分文档。
+    const std::uint32_t bounds[4] = {0, 100, 180, 240};
+    std::vector<std::shared_ptr<SealedSegment>> ins;
+    std::vector<std::uint32_t> live_globals;
+    for (int i = 0; i < 3; ++i) {
+        auto seg = std::make_shared<SealedSegment>();
+        for (std::uint32_t g = bounds[i]; g < bounds[i + 1]; ++g) {
+            add_merge_doc(*seg, g);
+        }
+        // 杀 g%9==i 的文档(各输入不同模式)。
+        for (std::uint32_t g = bounds[i]; g < bounds[i + 1]; ++g) {
+            if (g % 9 == static_cast<std::uint32_t>(i)) {
+                ASSERT_TRUE(seg->mark_dead(g - bounds[i]));
+            } else {
+                live_globals.push_back(g);
+            }
+        }
+        ins.push_back(std::move(seg));
+    }
+    // 输入 1 转 v2 mmap(混合格式覆盖:v1 内存 ×2 + v2 mmap ×1)。
+    {
+        const auto p = (tmp / "segv2_p3_in1.seg").string();
+        std::filesystem::remove(p);
+        std::filesystem::remove(p + ".live");
+        ASSERT_TRUE(ins[1]->save_v2(p, 91));
+        auto m = SealedSegment::open_v2(p);
+        ASSERT_NE(m, nullptr);
+        ins[1] = std::shared_ptr<SealedSegment>(std::move(m));
+    }
+
+    // 金标:live 文档按同序直建大段 → v2。
+    auto golden_mem = std::make_shared<SealedSegment>();
+    for (auto g : live_globals) add_merge_doc(*golden_mem, g);
+    const auto golden_path = (tmp / "segv2_p3_golden.seg").string();
+    std::filesystem::remove(golden_path);
+    ASSERT_TRUE(golden_mem->save_v2(golden_path, 90));
+    auto golden = SealedSegment::open_v2(golden_path);
+    ASSERT_NE(golden, nullptr);
+
+    // 合并。
+    const auto merged_path = (tmp / "segv2_p3_merged.seg").string();
+    std::filesystem::remove(merged_path);
+    std::vector<std::shared_ptr<const SealedSegment>> cins(ins.begin(),
+                                                           ins.end());
+    MergeResult mr;
+    ASSERT_TRUE(merge_segments_v2(merged_path, 99, cins, mr));
+    EXPECT_EQ(mr.out_docs, live_globals.size());
+    EXPECT_EQ(mr.out_hi_lsn, 1000u + live_globals.back());
+    auto merged = SealedSegment::open_v2(merged_path);
+    ASSERT_NE(merged, nullptr);
+
+    // 映射正确性:live → 新 docid 的 key 一致;dead → kDead。
+    for (int i = 0; i < 3; ++i) {
+        for (std::uint32_t g = bounds[i]; g < bounds[i + 1]; ++g) {
+            const auto old_d = g - bounds[i];
+            const auto nd = mr.docid_map[static_cast<std::size_t>(i)][old_d];
+            if (g % 9 == static_cast<std::uint32_t>(i)) {
+                EXPECT_EQ(nd, MergeResult::kDead);
+            } else {
+                ASSERT_NE(nd, MergeResult::kDead);
+                EXPECT_EQ(merged->key_at(nd), "k" + std::to_string(g));
+            }
+        }
+    }
+
+    // doc_store 逐行金标。
+    ASSERT_EQ(merged->doc_count(), golden->doc_count());
+    for (std::uint32_t d = 0; d < merged->doc_count(); ++d) {
+        EXPECT_EQ(merged->key_at(d), golden->key_at(d));
+        EXPECT_EQ(merged->lsn_at(d), golden->lsn_at(d));
+        EXPECT_EQ(merged->doc_len(d), golden->doc_len(d));
+        const auto sa = merged->slot_at(d);
+        const auto sb = golden->slot_at(d);
+        EXPECT_EQ(sa.loc.offset, sb.loc.offset);
+        EXPECT_EQ(sa.tstamp, sb.tstamp);
+    }
+
+    // 查询金标(单段 view / 多字段 multi_view / 短语 / 通配)逐位。
+    for (const auto& q : std::vector<std::vector<std::string>>{
+             {"hot"}, {"mid3", "mid5"}, {"hot", "ghost"}}) {
+        std::vector<SegmentView> vm{merged->view()};
+        std::vector<SegmentView> vg{golden->view()};
+        expect_same_hits(multi_segment_search(vm, q, 25),
+                         multi_segment_search(vg, q, 25), "merge:" + q[0]);
+    }
+    {
+        std::unordered_map<std::string, std::vector<std::string>> ft;
+        ft["title"] = {"t3"};
+        ft["body"] = {"shared"};
+        std::vector<MultiFieldSegmentView> mm{merged->multi_view()};
+        std::vector<MultiFieldSegmentView> gg{golden->multi_view()};
+        expect_same_hits(multi_field_segment_search(mm, ft, 30),
+                         multi_field_segment_search(gg, ft, 30), "mf");
+    }
+    {
+        // 短语(positions 重编保真)+ 通配(词典完整性)。
+        FakeLiveChecker all;
+        for (std::uint32_t d = 0; d < merged->doc_count(); ++d) {
+            all.doc_lens[d] = merged->doc_len(d);
+        }
+        const std::vector<std::string> pq = {"alpha", "beta"};
+        expect_same_results(
+            merged->default_term_index().search_phrase(pq, 20, *merged),
+            golden->default_term_index().search_phrase(pq, 20, *golden),
+            "phrase");
+        expect_same_results_approx(
+            merged->default_term_index().search_wildcard("mid*", 20, *merged),
+            golden->default_term_index().search_wildcard("mid*", 20, *golden),
+            "wildcard");
+    }
+    // 统计金标(df/N/sum_dl 现算 == 直建)。
+    for (const char* f : {"title", "body"}) {
+        std::vector<MultiFieldSegmentView> mm{merged->multi_view()};
+        std::vector<MultiFieldSegmentView> gg{golden->multi_view()};
+        const bitcask::bm25::TermIndex* a = nullptr;
+        const bitcask::bm25::TermIndex* b = nullptr;
+        for (auto& fv : mm[0].fields) if (fv.field_name == f) a = fv.inv;
+        for (auto& fv : gg[0].fields) if (fv.field_name == f) b = fv.inv;
+        ASSERT_NE(a, nullptr);
+        ASSERT_NE(b, nullptr);
+        EXPECT_EQ(a->live_doc_count(), b->live_doc_count()) << f;
+        EXPECT_EQ(a->sum_doc_len(), b->sum_doc_len()) << f;
+    }
+}
+
+// 短语在合并段上的 positions 保真(默认字段 "alpha beta" 相邻仅存在于
+// body 字段——default 无;此测直接在 body 上跑 near/phrase)。
+TEST(SegmentV2P3, MergePhraseOnNamedField) {
+    const auto tmp = std::filesystem::temp_directory_path();
+    std::vector<std::shared_ptr<const SealedSegment>> cins;
+    for (int i = 0; i < 2; ++i) {
+        auto seg = std::make_shared<SealedSegment>();
+        for (std::uint32_t g = 0; g < 40; ++g) add_merge_doc(*seg, g + i * 40);
+        cins.push_back(std::move(seg));
+    }
+    const auto p = (tmp / "segv2_p3_phrase.seg").string();
+    std::filesystem::remove(p);
+    MergeResult mr;
+    ASSERT_TRUE(merge_segments_v2(p, 7, cins, mr));
+    auto merged = SealedSegment::open_v2(p);
+    ASSERT_NE(merged, nullptr);
+    std::vector<MultiFieldSegmentView> mv{merged->multi_view()};
+    const bitcask::bm25::TermIndex* body = nullptr;
+    for (auto& fv : mv[0].fields) if (fv.field_name == "body") body = fv.inv;
+    ASSERT_NE(body, nullptr);
+    const auto hits = body->search_phrase({"alpha", "beta"}, 100, *merged);
+    EXPECT_EQ(hits.size(), 80u);  // 每文档 body 都含相邻 "alpha beta"
 }

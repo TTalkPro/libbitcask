@@ -80,6 +80,7 @@ struct SearchLayerConfig {
     // text_plugin_config.hpp。
     bool        seal_v2_segments = true;
     std::size_t seal_ram_budget_bytes = 0;
+    std::size_t merge_fan_in = 8;
 
     // S18-3/4：配置拆分（设计 §6）——产出两插件各自的配置子集。公共 API
     // 面（CaskOptions::search_config）本批不变，P5 换代。
@@ -87,7 +88,8 @@ struct SearchLayerConfig {
         return {analyzer_config, bm25_params, cache_max_entries,
                 doc_text_cache_max, index_positions, index_catch_all,
                 builder_threads, seal_v2_segments, seal_ram_budget_bytes,
-                auto_compact_dead_ratio, synonym_map, max_delta_chain};
+                merge_fan_in, auto_compact_dead_ratio, synonym_map,
+                max_delta_chain};
     }
     [[nodiscard]] vec::VectorPluginConfig vector_config() const {
         return {vector_dim, vector_metric, hnsw_m, hnsw_ef_construction,

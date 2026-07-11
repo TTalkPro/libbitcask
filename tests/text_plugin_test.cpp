@@ -1120,3 +1120,90 @@ TEST(TextPlugin, S30OrphanSegmentIgnoredOnReopen) {
     EXPECT_EQ(r->size(), 3u);  // 孤儿段不被吞入(ord>=3 由宿主重放走正常写路径)
     fs::remove_all(dir);
 }
+
+// S30-P3:tiered merge e2e——预算封口产生的碎段在 flush 收敛;删除跨
+// merge 换入仍生效(key 重指);死点经 merge 物理回收;重开全量还原。
+TEST(TextPlugin, S30MergeConvergesAndReclaims) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_s30_merge";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.seal_ram_budget_bytes = 2048;  // 碎段制造机
+    cfg.merge_fan_in = 4;
+    text::TextPlugin a(cfg, idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+
+    constexpr std::uint64_t kDocs = 120;
+    for (std::uint64_t ord = 0; ord < kDocs; ++ord) {
+        const std::string key = "k" + std::to_string(ord);
+        host_put_row(idx, key, ord);
+        a.apply_text(key, ord,
+                     "merge converge corpus payload filler word" +
+                         std::to_string(ord) + " tail piece");
+    }
+    const auto before = a.segment_set()->segment_count();
+    ASSERT_GE(before, 4u);  // 预算封口产生了 ≥fan_in 个碎段
+
+    plugin::FlushRequest req;
+    req.watermark = kDocs;
+    ASSERT_EQ(a.flush(req).status, plugin::PluginStatus::kOk);
+    const auto after = a.segment_set()->segment_count();
+    EXPECT_LT(after, before);  // 同层收敛发生
+
+    // 查询完好 + 删除(命中已被 merge 换入的文档 → key 重指正确性)。
+    {
+        auto r = a.search_text("merge", kDocs + 5);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), kDocs);
+    }
+    a.on_delete("k3", kDocs + 1, 3);
+    a.on_delete("k77", kDocs + 2, 77);
+    {
+        auto r = a.search_text("merge", kDocs + 5);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), kDocs - 2);
+    }
+
+    // 死点回收:删掉前 90 篇 → 某段死占比 >1/2 → 下次 flush 触发回收组;
+    // 合并后段集总 doc_count 物理缩水(死行不进输出)。
+    for (std::uint64_t ord = 0; ord < 90; ++ord) {
+        if (ord == 3 || ord == 77) continue;
+        a.on_delete("k" + std::to_string(ord), kDocs + 10 + ord, ord);
+    }
+    const auto docs_before = a.segment_set()->total_docs();
+    plugin::FlushRequest req2;
+    req2.watermark = kDocs + 300;
+    ASSERT_EQ(a.flush(req2).status, plugin::PluginStatus::kOk);
+    EXPECT_LT(a.segment_set()->total_docs(), docs_before);  // 物理回收
+    {
+        auto r = a.search_text("merge", kDocs + 5);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), kDocs - 90);
+    }
+    const auto st = a.chain_state();
+
+    // 重开:合并后清单 + sidecar 全还原。
+    index::Index idx2;
+    for (std::uint64_t ord = 0; ord < kDocs; ++ord) {
+        host_put_row(idx2, "k" + std::to_string(ord), ord);
+    }
+    text::TextPlugin b(cfg, idx2, idx2, idx2);
+    plugin::OpenContext c2;
+    c2.dir = dir_s;
+    c2.committed_base_watermark = st.base_gen;
+    c2.committed_chain_watermark = st.chain_wm;
+    c2.committed_chain_seq = st.next_seq - 1;
+    ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+    auto r = b.search_text("merge", kDocs + 5);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), kDocs - 90);
+    for (const auto& h : *r) {
+        EXPECT_NE(h.key, "k5");  // 已删示例
+    }
+    fs::remove_all(dir);
+}

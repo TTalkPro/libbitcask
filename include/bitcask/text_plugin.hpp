@@ -492,6 +492,10 @@ private:
     // reducer 侧压实触发(builder 模式下 apply 路径的 maybe_auto_compact
     // 为 no-op——compact 需 builder 静止;见各自注释)。
     void maybe_auto_compact_reducer();
+    // S30-P3:checkpoint 静止点的段合并(策略见 text_plugin_config.hpp
+    // merge_fan_in)。契约:reducer 上下文 + builder 已排干(与
+    // flush_building 同点)——合并期间无并发写/删,查询经 pin 并发安全。
+    void maybe_merge_segments();
 
     // S27-3 步骤 5:building_ 原子 shared_ptr——封口切换(reducer store)与
     // 查询读(load)并发;查询经 pin 钉住段对象跨越切换/drop。

@@ -3866,11 +3866,33 @@ W4 ✅（parallel_scan 并行全表扫描）。
   sidecar + 提交清单」。验收:写入压力 RSS 封顶于预算(新 bench 记
   max RSS)、crash 矩阵(封口后-ckpt 前 kill → 孤儿清理 + WAL 重放等价,
   沿用「孤儿段 open 忽略」不变量)、TSan 换入 vs 并发查询。
-- [ ] **S30-P3 tiered merge + legacy 段化迁移**（~2 会话,收编 S27-3 两项
-  挂账）· size-tiered 触发;流式 k-way merge(词典有序归并 + docid 重编 +
-  死行物理回收,有界内存);resolver 批量改指 + 清单一次提交;老格式 ckpt
-  首次 open 流式转写 v2 段(替代退全量 fold)。「词表遍历原语」由 mmap
-  排序词典免费满足。验收:合并前后查询逐位一致、死点回收计量、段数收敛。
+- [x] **S30-P3 tiered merge 已完成(2026-07-11,收编 S27-3 consolidation
+  挂账)**:
+  - **合并原语**([`segment_merge.hpp`](include/bitcask/segment_merge.hpp)):
+    流式 k-way——词典升序归并逐 term 现产 posting,**docid 重编**(live 行
+    按 (输入序,段内序) 取稠密新 id ⇒ 重编后天然升序免排序)、**死行物理
+    回收**(posting/doc_store/positions 同步收敛)、字段统计现算归正
+    (df/N/sum_dl 不再含死点,设计 §4「merge 自愈」落地)。内存上界 =
+    O(词典+映射+单 term 工作集),主体全流式。v1/v2 混合输入 → v2 输出
+    (**v1 段随 merge 自然迁移 v2**,显式迁移不再需要)。
+  - **基建**:writer 泛化为 `SegV2FieldSource` 流(visit+stats 回调,封口
+    与合并共用);`InvertedIndex::snapshot_postings`、SealedSegment merge
+    导出面(field_names/terms/postings/slot_at,双形态)、MmapSegment 词典
+    枚举(term_count/term_at)。
+  - **策略+接线**:`merge_fan_in`(默认 8;0=关)——flush 静止点(reducer
+    +builder 已排干 ⇒ **无删除窗口,免死位补拷**)触发:① 死占比 ≥1/2 段
+    回收组优先(mmap 段唯一物理回收路径)② 同层(bit_width(doc_count))
+    段数 ≥ fan_in 收敛组;每 flush 至多一组摊销。换入 = 登记输出 →
+    key_loc_mu_ 下批量重指(O(输出文档))→ drop_pending 输入;清单随本次
+    ckpt 原子提交,崩溃回退合并前(输出成孤儿被忽略,不变量沿用)。
+  - **验收**:金标测试——**merge(inputs) ≡ live 文档同序直建单段,双侧
+    v2 逐位一致**(查询/多字段/短语 positions/统计/doc_store 全比;含
+    v1+v2 混输入、三种死亡模式);e2e——预算碎段 flush 收敛、跨 merge
+    换入删除(重指)、死点物理回收计量(total_docs 缩水)、重开还原。
+    clang 全量 **607/607**;ASan 607/607;TSan 段/恢复子集 121/121;
+    build-rel 过。
+  - 注:pre-segment 老格式 ckpt(kBm25Default 系)仍退全量 fold(既定
+    回退,一次性升级成本);段级 v1→v2 由 merge 自愈,无需独立迁移器。
 - [ ] **S30-P4 收尾**（~1 会话）· 三 sanitizer 全量;查询/索引 bench 无
   回归 + 新增冷/热查询延迟与 RSS bench;S21-A6 opt-in 跳 CRC 顺带。
 - 收编挂账：S26-⑤⑥(positions 编码/ckpt 停顿)、S21-A6、S24-M9 后半

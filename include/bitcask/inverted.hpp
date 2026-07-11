@@ -456,6 +456,11 @@ public:
         const std::function<void(std::string_view term, const PostingList& pl)>&
             fn) const;
 
+    // S30-P3:单 term posting 深拷(含 positions/dls;段合并的 v1 输入按需
+    // 取数)。不存在返回 false。线程安全:const_accessor 读锁下整体拷贝。
+    [[nodiscard]] bool snapshot_postings(std::string_view term,
+                                         PostingList& out) const;
+
     // S14-4：增量（delta）序列化——只导出 ord ≥ from_ord 的 posting 后缀
     // （items 按 ord 升序不变量 → 后缀连续，见 PostingList 头注释）+ 绝对
     // 全局统计（N/sdl：删除只改统计不碰 posting，随 delta 整体覆盖）。

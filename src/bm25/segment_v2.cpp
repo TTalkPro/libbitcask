@@ -149,11 +149,10 @@ static_assert(sizeof(BlockHeader) == 4);
 // writer
 // ===========================================================================
 
-bool write_segment_v2(
+bool write_segment_v2_streams(
     const std::string& path,
     std::uint64_t seg_id,
-    std::span<const std::pair<std::string_view, const bm25::InvertedIndex*>>
-        fields,
+    std::span<const SegV2FieldSource> fields,
     std::uint32_t doc_count,
     const std::function<SegV2DocRow(std::uint32_t docid)>& doc_row,
     std::uint64_t total_doc_len) {
@@ -180,7 +179,8 @@ bool write_segment_v2(
     //      kFieldStats → kFieldName ----
     bool field_ok = true;
     for (std::uint32_t fi = 0; fi < fields.size(); ++fi) {
-        const auto& [fname, inv] = fields[fi];
+        const auto& fsrc = fields[fi];
+        const std::string_view fname = fsrc.name;
         // 瞬态缓冲:O(词典 + 块表)(posting/positions 全流式)。
         std::vector<segv2::TermRec> dict;
         std::vector<segv2::BlockMeta> metas;
@@ -191,8 +191,7 @@ bool write_segment_v2(
         std::vector<std::uint32_t> pos_offs;  // 单 term 行偏移(df+1)
 
         w.begin(static_cast<std::uint32_t>(segv2::Section::kPostings), fi);
-        inv->visit_postings_sorted([&](std::string_view term,
-                                       const PostingList& pl) {
+        fsrc.visit([&](std::string_view term, const PostingList& pl) {
             if (!field_ok || pl.empty()) return;  // 空列表不入 v2 词典
             const std::size_t n = pl.size();
             if (pl.ords.back() > 0xFFFFFFFFull) {
@@ -305,8 +304,9 @@ bool write_segment_v2(
         w.end();
 
         segv2::FieldStats st{};
-        st.live_doc_count = inv->live_doc_count();
-        st.sum_doc_len = inv->sum_doc_len();
+        const auto [n_live, sum_dl] = fsrc.stats();
+        st.live_doc_count = n_live;
+        st.sum_doc_len = sum_dl;
         st.term_count = dict.size();
         st.has_positions = any_positions ? 1 : 0;
         w.begin(static_cast<std::uint32_t>(segv2::Section::kFieldStats), fi);
@@ -386,6 +386,33 @@ bool write_segment_v2(
         return false;
     }
     return true;
+}
+
+bool write_segment_v2(
+    const std::string& path,
+    std::uint64_t seg_id,
+    std::span<const std::pair<std::string_view, const bm25::InvertedIndex*>>
+        fields,
+    std::uint32_t doc_count,
+    const std::function<SegV2DocRow(std::uint32_t docid)>& doc_row,
+    std::uint64_t total_doc_len) {
+    std::vector<SegV2FieldSource> srcs;
+    srcs.reserve(fields.size());
+    for (const auto& [name, inv] : fields) {
+        SegV2FieldSource src;
+        src.name = name;
+        src.visit = [inv](const std::function<void(
+                              std::string_view, const PostingList&)>& fn) {
+            inv->visit_postings_sorted(fn);
+        };
+        src.stats = [inv] {
+            return std::pair<std::uint64_t, std::uint64_t>{
+                inv->live_doc_count(), inv->sum_doc_len()};
+        };
+        srcs.push_back(std::move(src));
+    }
+    return write_segment_v2_streams(path, seg_id, srcs, doc_count, doc_row,
+                                    total_doc_len);
 }
 
 // ===========================================================================
@@ -643,6 +670,21 @@ bool MmapSegment::decode_rec(const Field& f, const segv2::TermRec& rec,
         }
     }
     return true;
+}
+
+std::uint64_t MmapSegment::term_count(std::string_view field) const {
+    const Field* f = field_of(field);
+    return f != nullptr ? f->dict_count : 0;
+}
+
+std::string_view MmapSegment::term_at(std::string_view field,
+                                      std::uint64_t idx) const {
+    const Field* f = field_of(field);
+    if (f == nullptr || idx >= f->dict_count) return {};
+    const auto r =
+        load_pod<segv2::TermRec>(f->dict + idx * sizeof(segv2::TermRec));
+    if (r.term_off + r.term_len > f->blob_len) return {};
+    return {reinterpret_cast<const char*>(f->blob + r.term_off), r.term_len};
 }
 
 bool MmapSegment::decode_postings(std::string_view field,

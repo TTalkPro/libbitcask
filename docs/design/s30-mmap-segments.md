@@ -6,8 +6,11 @@
 > **P1(Slice 1/3/4)+ P2 已落地(2026-07-11)**:v2 格式/reader 全查询面/
 > TermIndex 接线/SealedSegment mmap 背衬/**写路径换入 + 预算封口 + ckpt 收窄
 > (v2 封口默认开启)**。既有 crash/checkpoint/builder 全量测试群默认跑在新
-> 写路径上,clang/ASan 604/604。剩余:WAND 块游标(interim,非阻塞)、
-> P3 tiered merge、P4 RSS bench 收尾。进度详见 TASK.md S30。
+> 写路径上,clang/ASan 604/604。**P3 tiered merge 亦已落地(2026-07-11)**:
+> k-way 流式合并(docid 重编+死行物理回收+统计自愈,金标位级等价)+
+> fan_in 策略 flush 静止点换入,S27-3 consolidation 挂账就此了结,v1 段随
+> merge 自然迁移 v2(clang/ASan 607/607)。剩余:WAND 块游标(interim,
+> 非阻塞)、P4 RSS bench 收尾。进度详见 TASK.md S30。
 > 对标 Lucene/ES 段式索引的标准内存模型。
 >
 > **动机**:倒排索引当前全量驻留内存——SoA 后仍 ≈16B/posting(+positions

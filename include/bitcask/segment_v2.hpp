@@ -116,13 +116,35 @@ struct SegV2DocRow {
     index::DocSlot  slot{};
 };
 
+// S30-P3:字段级流式输入源(writer 泛化)——InvertedIndex 包装与段合并
+// (k-way 归并现产 posting)共用同一 writer。
+struct SegV2FieldSource {
+    std::string_view name;
+    // 单次遍历:按 term 字节序升序逐个回调(term, 完整 PostingList)。
+    // 空 PostingList 会被 writer 跳过(不入词典)。
+    std::function<void(
+        const std::function<void(std::string_view, const bm25::PostingList&)>&)>
+        visit;
+    // 字段统计 {live_doc_count(N), sum_doc_len}——在 visit 完成**之后**调用
+    // (合并场景统计在归并中现算;term_count/has_positions 由 writer 自记)。
+    std::function<std::pair<std::uint64_t, std::uint64_t>()> stats;
+};
+
 // 流式写 v2 段文件(tmp+rename 原子)。
-// - fields:{字段名, 该字段倒排} 列表(含 kDefaultField);
 // - doc_row:按 docid 取行,**会被调用两遍**(行 + key blob 两趟流式,免
 //   key 缓冲),须纯函数;
 // - 内存占用:O(词典 + 块表)瞬态(posting/positions/doc_store 全流式),
 //   无 O(postings) 缓冲;
 // - 约束:所有 posting docid 必须 < 2^32(段内本地 docid;越界返回 false)。
+[[nodiscard]] bool write_segment_v2_streams(
+    const std::string& path,
+    std::uint64_t seg_id,
+    std::span<const SegV2FieldSource> fields,
+    std::uint32_t doc_count,
+    const std::function<SegV2DocRow(std::uint32_t docid)>& doc_row,
+    std::uint64_t total_doc_len);
+
+// 便捷包装:字段来自内存 InvertedIndex(封口路径)。
 [[nodiscard]] bool write_segment_v2(
     const std::string& path,
     std::uint64_t seg_id,
@@ -163,6 +185,12 @@ public:
         const bm25::LiveChecker& live_checker,
         const bm25::Bm25Params* params_override = nullptr,
         const bm25::ExtStats* ext = nullptr) const;
+    // ---- S30-P3:词典枚举(段合并的 k-way 归并输入) ----
+    [[nodiscard]] std::uint64_t term_count(std::string_view field) const;
+    // 第 i 个词(词典升序;返回视图借 mmap 区,段 pin 期间稳定)。
+    [[nodiscard]] std::string_view term_at(std::string_view field,
+                                           std::uint64_t idx) const;
+
     // 解码单 term 的扁平快照(测试/上层组合用)。term 不存在返回 false。
     [[nodiscard]] bool decode_postings(std::string_view field,
                                        std::string_view term,
