@@ -3765,13 +3765,36 @@ W4 ✅（parallel_scan 并行全表扫描）。
       后块元数据)、doc_store/元信息 round-trip、sidecar 往返+篡改拒载、
       4 点位 CRC 篡改拒载+截断拒载、多字段隔离。clang 全量 **589/589**;
       ASan 全量 589/589;TSan 子集绿;build-rel 构建过。
-  - [ ] **Slice 2:WAND 块游标**——当前 WAND 档 mmap 查询是**全量解码
-    interim**(正确、逐位一致,但大词 O(df) 解码/查询);块游标按跳表逐块
-    解码(128/scratch)才兑现「大词不全量驻留/解码」。P1 最大剩余单项。
-  - [ ] **Slice 3:phrase/near(positions 解码)+ explain + wildcard/fuzzy
-    (mmap 词典区间扫,封口段 vocab_ 侧表退役)**。
+  - [x] **Slice 3 已完成(2026-07-11):全查询面上 mmap——phrase/near/
+    explain/wildcard/fuzzy/bool/bool_tree**。
+    - **继续抽共享核**(bm25_search_impl.hpp,全部逐字搬移):
+      `phrase_search_impl`(收 PostingList 指针,含 positions 链式匹配 +
+      并行候选评分)、`explain_impl`(FlatPostings 视图)、
+      `bool_search_impl`/`bool_tree_impl`(**fetch 回调参数化**——采集是
+      两个消费方唯一差异点,BMW/K1 leapfrog/SIMD pairwise/集合求值全共享);
+      kPhraseParallelThreshold 一并下沉。InvertedIndex 对应方法全部变薄包装。
+    - **MmapSegment 新查询面**:`decode_postings_list`(完整解码含 tf/dl/
+      positions,gap-varint 还原)+ search_phrase/near、explain、
+      search_wildcard(mmap 排序词典 prefix 二分区间 + 最长字面量预过滤 +
+      wildcard_match——**封口段侧的 vocab_ 侧表机制被 mmap 词典取代**)、
+      search_fuzzy(词典全扫 + 长度差剪枝 + Myers 位并行,匹配逻辑与内存版
+      同源)、bool_search/bool_search_tree(fetch=find_term+decode_rec)。
+    - **实现期抓获并修复**:explain 采集「边 emplace 边取池元素指针」——
+      池扩容搬移致视图悬垂(垃圾 size → 死循环;mmap 版实测挂起,内存版
+      同型隐患)→ 双侧改两趟收集(先解码后建视图)。
+    - 验收:segment_v2_test 新增 ×6(phrase/near 4 档 slop、explain 逐项
+      位级、wildcard 5 形态、fuzzy 多词、bool 4 组合 + BMW 档、树形嵌套 +
+      短语叶)——确定性路径**位级相等**;wildcard/fuzzy 因采集顺序不同
+      浮点累加序有别,用容差断言(内存版 parallel_reduce 采集序本即非
+      确定)。clang 全量 **595/595**;ASan 全量 595/595;TSan 查询子集
+      130/130;build-rel 构建过。
+  - [ ] **Slice 2(现唯一剩余优化项):WAND 块游标**——当前 WAND 档 mmap
+    查询是**全量解码 interim**(正确、逐位一致,但大词 O(df) 解码/查询;
+    与内存版 snapshot_flat 整列拷贝同量级,**非阻塞项**)。块游标按跳表
+    逐块解码(128/scratch)才兑现「大词不全量驻留/解码」。可延后到 P2 后。
   - [ ] **Slice 4:SealedSegment 双实现接线**(查询面走 MmapSegment,
-    live 路径仍不动——P2 前置)。
+    live 路径仍不动——P2 前置)。SegmentView/MultiFieldSegmentView 需从
+    `const InvertedIndex*` 泛化(接口或变体);全查询面已备齐。
 - [ ] **S30-P2 写路径接线（用户硬需求）**（~1-2 会话）·
   `seal_ram_budget`(默认 64MB/builder,0=沿用现行为)——building 记账
   超预算就地封口(flush_building_slot 现成)→ 流式落盘 → add_pending →

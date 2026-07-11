@@ -4,7 +4,9 @@
 #include "bitcask/segment_v2.hpp"
 
 #include "bitcask/hw_crc32.hpp"
+#include "bitcask/myers.hpp"
 #include "bitcask/vbyte.hpp"
+#include "bitcask/wildcard_matcher.hpp"
 #include "bm25_search_impl.hpp"
 
 #include <fcntl.h>
@@ -14,6 +16,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <limits>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -847,6 +850,397 @@ bool MmapSegment::load_live_sidecar(const std::string& path) {
     }
     dead_count_.store(dead, std::memory_order_relaxed);
     return true;
+}
+
+// ---- 完整解码(含 tf/dl/positions;phrase/near 与将来 merge 用) ----
+
+bool MmapSegment::decode_rec_list(const Field& f, const segv2::TermRec& rec,
+                                  PostingList& out) const {
+    out.ords.clear();
+    out.tfs.clear();
+    out.dls.clear();
+    out.pos_data.clear();
+    out.pos_off.clear();
+    out.blocks.clear();
+    out.max_tf = rec.max_tf;
+    out.ords.reserve(rec.df);
+    out.tfs.reserve(rec.df);
+    out.dls.reserve(rec.df);
+
+    const std::uint64_t metas_end =
+        rec.blocks_off +
+        static_cast<std::uint64_t>(rec.block_count) * sizeof(segv2::BlockMeta);
+    if (metas_end > f.blocks_len) return false;
+
+    for (std::uint32_t bi = 0; bi < rec.block_count; ++bi) {
+        const auto bm = load_pod<segv2::BlockMeta>(
+            f.blocks + rec.blocks_off + bi * sizeof(segv2::BlockMeta));
+        const std::size_t cnt =
+            (bi + 1 < rec.block_count)
+                ? segv2::kBlockSize
+                : rec.df - static_cast<std::size_t>(rec.block_count - 1) *
+                               segv2::kBlockSize;
+        const std::uint64_t data = rec.postings_off + bm.data_off;
+        if (data + sizeof(BlockHeader) > f.postings_len) return false;
+        const auto bh = load_pod<BlockHeader>(f.postings + data);
+        const std::size_t need = sizeof(BlockHeader) +
+                                 packed_bytes(cnt, bh.docid_bits) +
+                                 packed_bytes(cnt, bh.tf_bits) +
+                                 packed_bytes(cnt, bh.dl_bits);
+        if (data + need > f.postings_len) return false;
+
+        const auto* p = reinterpret_cast<const std::uint8_t*>(
+            f.postings + data + sizeof(BlockHeader));
+        {
+            BitReader br{p};
+            for (std::size_t i = 0; i < cnt; ++i) {
+                out.ords.push_back(bm.first_docid + br.get(bh.docid_bits));
+            }
+        }
+        p += packed_bytes(cnt, bh.docid_bits);
+        {
+            BitReader br{p};
+            for (std::size_t i = 0; i < cnt; ++i) {
+                out.tfs.push_back(br.get(bh.tf_bits));
+            }
+        }
+        p += packed_bytes(cnt, bh.tf_bits);
+        {
+            BitReader br{p};
+            for (std::size_t i = 0; i < cnt; ++i) {
+                out.dls.push_back(br.get(bh.dl_bits));
+            }
+        }
+    }
+
+    // positions(gap-varint 还原为绝对位置;pos_off 语义与内存版一致——
+    // 无 positions 的 term 保持 empty ⇒ positions(i) 返回空 span)。
+    if (rec.pos_off != static_cast<std::uint64_t>(-1)) {
+        const std::uint64_t offs = rec.pos_off;
+        const std::uint64_t arr_bytes =
+            (static_cast<std::uint64_t>(rec.df) + 1) * 4;
+        if (offs + arr_bytes > f.postings_len) return false;
+        const std::byte* offp = f.postings + offs;
+        const std::uint64_t data_base = offs + arr_bytes;
+        const auto data_len =
+            load_pod<std::uint32_t>(offp + rec.df * 4);  // 末哨兵=总字节
+        if (data_base + data_len > f.postings_len) return false;
+        const auto* data =
+            reinterpret_cast<const std::uint8_t*>(f.postings + data_base);
+        out.pos_off.reserve(rec.df + 1);
+        for (std::uint32_t i = 0; i < rec.df; ++i) {
+            out.pos_off.push_back(out.pos_data.size());
+            const auto row_beg = load_pod<std::uint32_t>(offp + i * 4);
+            const auto row_end = load_pod<std::uint32_t>(offp + (i + 1) * 4);
+            if (row_beg > row_end || row_end > data_len) return false;
+            std::size_t pos = row_beg;
+            std::uint32_t prev = 0;
+            while (pos < row_end) {
+                auto [delta, np] = codec::vbyte_decode(data, pos);
+                pos = np;
+                if (pos > row_end) return false;  // 跨行 varint = 损坏
+                prev += static_cast<std::uint32_t>(delta);
+                out.pos_data.push_back(prev);
+            }
+        }
+        out.pos_off.push_back(out.pos_data.size());
+    }
+    return true;
+}
+
+bool MmapSegment::decode_postings_list(std::string_view field,
+                                       std::string_view term,
+                                       PostingList& out) const {
+    const Field* f = field_of(field);
+    if (f == nullptr) return false;
+    segv2::TermRec rec{};
+    if (!find_term(*f, term, rec)) return false;
+    return decode_rec_list(*f, rec, out);
+}
+
+// ---- phrase / near ----
+
+std::vector<bm25::SearchResult> MmapSegment::phrase_common(
+    std::string_view field,
+    const std::vector<std::string>& query_terms,
+    std::size_t k,
+    std::uint32_t slop,
+    const bm25::LiveChecker& live_checker,
+    const bm25::Bm25Params* params_override) const {
+    if (query_terms.empty()) return {};
+    const Field* f = field_of(field);
+    if (f == nullptr) return {};
+    const bm25::Bm25Params& params =
+        params_override ? *params_override : params_;
+
+    // 逐词完整解码(含 positions)进 thread_local 池;任一词缺席 → 空结果
+    // (与 InvertedIndex::search_phrase_impl 同语义)。指针在池填毕后收集。
+    static thread_local std::vector<PostingList> pl_pool;
+    std::size_t n = 0;
+    for (const auto& term : query_terms) {
+        segv2::TermRec rec{};
+        if (!find_term(*f, term, rec)) return {};
+        if (n == pl_pool.size()) pl_pool.emplace_back();
+        if (!decode_rec_list(*f, rec, pl_pool[n])) return {};
+        ++n;
+    }
+    std::vector<const PostingList*> pls;
+    pls.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) pls.push_back(&pl_pool[i]);
+    return bm25::detail::phrase_search_impl(pls, k, slop, live_checker,
+                                            params, f->stats.live_doc_count,
+                                            f->stats.sum_doc_len);
+}
+
+std::vector<bm25::SearchResult> MmapSegment::search_phrase(
+    std::string_view field, const std::vector<std::string>& query_terms,
+    std::size_t k, const bm25::LiveChecker& live_checker,
+    const bm25::Bm25Params* params_override) const {
+    return phrase_common(field, query_terms, k, /*slop=*/0, live_checker,
+                         params_override);
+}
+
+std::vector<bm25::SearchResult> MmapSegment::search_near(
+    std::string_view field, const std::vector<std::string>& query_terms,
+    std::size_t k, std::uint32_t slop, const bm25::LiveChecker& live_checker,
+    const bm25::Bm25Params* params_override) const {
+    return phrase_common(field, query_terms, k, slop, live_checker,
+                         params_override);
+}
+
+// ---- explain ----
+
+bm25::ScoreExplanation MmapSegment::explain(
+    std::string_view field, const std::vector<std::string>& query_terms,
+    std::uint64_t docid, const bm25::LiveChecker& live_checker,
+    const bm25::Bm25Params* params_override) const {
+    const bm25::Bm25Params& params =
+        params_override ? *params_override : params_;
+    const Field* f = field_of(field);
+    static const FlatPostings kEmptyFp;
+    static thread_local std::vector<FlatPostings> fp_pool;
+    // 两趟:先全部解码(emplace 扩容会搬移元素),后取指针建视图。
+    std::vector<std::size_t> slot_of_term(query_terms.size(),
+                                          static_cast<std::size_t>(-1));
+    std::size_t n = 0;
+    for (std::size_t qi = 0; qi < query_terms.size(); ++qi) {
+        segv2::TermRec rec{};
+        if (f == nullptr || !find_term(*f, query_terms[qi], rec)) continue;
+        if (n == fp_pool.size()) fp_pool.emplace_back();
+        if (!decode_rec(*f, rec, fp_pool[n])) continue;
+        slot_of_term[qi] = n;
+        ++n;
+    }
+    std::vector<bm25::detail::ScoredTermView> views;
+    views.reserve(query_terms.size());
+    for (std::size_t qi = 0; qi < query_terms.size(); ++qi) {
+        views.push_back({&query_terms[qi],
+                         slot_of_term[qi] == static_cast<std::size_t>(-1)
+                             ? &kEmptyFp
+                             : &fp_pool[slot_of_term[qi]]});
+    }
+    return bm25::detail::explain_impl(
+        views, docid, live_checker, params,
+        f != nullptr ? f->stats.live_doc_count : 0,
+        f != nullptr ? f->stats.sum_doc_len : 0);
+}
+
+// ---- wildcard / fuzzy(mmap 排序词典区间/全扫) ----
+
+std::size_t MmapSegment::dict_lower_bound(const Field& f,
+                                          std::string_view key) const {
+    std::size_t lo = 0;
+    std::size_t hi = f.dict_count;
+    while (lo < hi) {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        const auto r =
+            load_pod<segv2::TermRec>(f.dict + mid * sizeof(segv2::TermRec));
+        const std::string_view t(
+            reinterpret_cast<const char*>(f.blob + r.term_off), r.term_len);
+        if (t < key) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+std::size_t MmapSegment::dict_upper_bound(const Field& f,
+                                          std::string_view key) const {
+    std::size_t lo = 0;
+    std::size_t hi = f.dict_count;
+    while (lo < hi) {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        const auto r =
+            load_pod<segv2::TermRec>(f.dict + mid * sizeof(segv2::TermRec));
+        const std::string_view t(
+            reinterpret_cast<const char*>(f.blob + r.term_off), r.term_len);
+        if (t <= key) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+std::vector<bm25::SearchResult> MmapSegment::search_wildcard(
+    std::string_view field, const std::string& pattern, std::size_t k,
+    const bm25::LiveChecker& live_checker,
+    const bm25::Bm25Params* params_override) const {
+    const Field* f = field_of(field);
+    if (f == nullptr) return {};
+    const bm25::Bm25Params& params =
+        params_override ? *params_override : params_;
+
+    // 候选筛选逻辑与 InvertedIndex::search_wildcard 一致(prefix 二分区间 +
+    // 最长字面量预过滤 + wildcard_match);mmap 词典本身有序,单区间串行扫
+    // (内存版按 shard 并行扫 vocab_ 侧表——mmap 端词典即索引,侧表退役)。
+    // ⚠️ 采集顺序差异:内存版 tps 序 = shard 归并序,本端 = 字典序——集合
+    // 相同;score_bow_topk 对同 ord 的多词贡献按 hits 序求和,浮点累加序
+    // 不同可产生**末位 ulp 差**(等价性测试用容差断言)。
+    const std::string_view lit = bm25::longest_literal(pattern);
+    std::string prefix;
+    if (!pattern.empty() && pattern[0] != '*') {
+        for (char c : pattern) {
+            if (c == '*' || c == '?') break;
+            prefix.push_back(c);
+        }
+    }
+    std::size_t lo = 0;
+    std::size_t hi = f->dict_count;
+    if (!prefix.empty()) {
+        std::string prefix_upper = prefix;
+        prefix_upper.back() = static_cast<char>(
+            static_cast<unsigned char>(prefix_upper.back()) + 1);
+        lo = dict_lower_bound(*f, prefix);
+        hi = dict_upper_bound(*f, prefix_upper);
+    }
+
+    static thread_local std::vector<bm25::detail::ScoredTerm> tps_pool;
+    std::size_t n = 0;
+    for (std::size_t i = lo; i < hi; ++i) {
+        const auto rec =
+            load_pod<segv2::TermRec>(f->dict + i * sizeof(segv2::TermRec));
+        const std::string_view t(
+            reinterpret_cast<const char*>(f->blob + rec.term_off),
+            rec.term_len);
+        if (!lit.empty() && t.find(lit) == std::string_view::npos) continue;
+        if (!bm25::wildcard_match(pattern, t)) continue;
+        if (n == tps_pool.size()) tps_pool.emplace_back();
+        if (!decode_rec(*f, rec, tps_pool[n].fp)) continue;
+        tps_pool[n].term.assign(t);
+        ++n;
+    }
+    if (n == 0) return {};
+    std::vector<bm25::detail::ScoredTermView> views;
+    views.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        views.push_back({&tps_pool[i].term, &tps_pool[i].fp});
+    }
+    return bm25::detail::score_bow_topk(views, k, f->stats.live_doc_count,
+                                        f->stats.sum_doc_len, params,
+                                        live_checker);
+}
+
+std::vector<bm25::SearchResult> MmapSegment::search_fuzzy(
+    std::string_view field, const std::vector<std::string>& query_terms,
+    std::size_t k, std::uint32_t max_edit_distance,
+    const bm25::LiveChecker& live_checker,
+    const bm25::Bm25Params* params_override) const {
+    if (query_terms.empty()) return {};
+    const Field* f = field_of(field);
+    if (f == nullptr) return {};
+    const bm25::Bm25Params& params =
+        params_override ? *params_override : params_;
+
+    // 匹配逻辑与 InvertedIndex::search_fuzzy 一致(长度差剪枝 + Myers 位并行,
+    // 每 vocab term 至多入选一次);mmap 词典全扫串行。采集顺序差异同
+    // wildcard(见上注)。
+    std::vector<bm25::MyersMatcher> matchers;
+    matchers.reserve(query_terms.size());
+    for (const auto& q : query_terms) matchers.emplace_back(q);
+
+    static thread_local std::vector<bm25::detail::ScoredTerm> tps_pool;
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < f->dict_count; ++i) {
+        const auto rec =
+            load_pod<segv2::TermRec>(f->dict + i * sizeof(segv2::TermRec));
+        const std::string_view t(
+            reinterpret_cast<const char*>(f->blob + rec.term_off),
+            rec.term_len);
+        bool hit = false;
+        for (std::size_t qi = 0; qi < query_terms.size(); ++qi) {
+            const auto& query_term = query_terms[qi];
+            const auto len_diff = t.size() > query_term.size()
+                                      ? t.size() - query_term.size()
+                                      : query_term.size() - t.size();
+            if (len_diff > max_edit_distance) continue;
+            if (matchers[qi].within(t, max_edit_distance)) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) continue;
+        if (n == tps_pool.size()) tps_pool.emplace_back();
+        if (!decode_rec(*f, rec, tps_pool[n].fp)) continue;
+        tps_pool[n].term.assign(t);
+        ++n;
+    }
+    if (n == 0) return {};
+    std::vector<bm25::detail::ScoredTermView> views;
+    views.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        views.push_back({&tps_pool[i].term, &tps_pool[i].fp});
+    }
+    return bm25::detail::score_bow_topk(views, k, f->stats.live_doc_count,
+                                        f->stats.sum_doc_len, params,
+                                        live_checker);
+}
+
+// ---- bool(扁平 + 树形;共享 detail::bool_search_impl / bool_tree_impl) ----
+
+std::vector<bm25::SearchResult> MmapSegment::bool_search(
+    std::string_view field, const bm25::QueryNode& query, std::size_t k,
+    const bm25::LiveChecker& live_checker,
+    const bm25::Bm25Params* params_override) const {
+    const Field* f = field_of(field);
+    if (f == nullptr) return {};
+    const bm25::Bm25Params& params =
+        params_override ? *params_override : params_;
+    auto fetch = [this, f](std::string_view term, FlatPostings& out) {
+        segv2::TermRec rec{};
+        if (!find_term(*f, term, rec)) return false;
+        return decode_rec(*f, rec, out);
+    };
+    return bm25::detail::bool_search_impl(query, k, live_checker, params,
+                                          f->stats.live_doc_count,
+                                          f->stats.sum_doc_len, fetch);
+}
+
+std::vector<bm25::SearchResult> MmapSegment::bool_search_tree(
+    std::string_view field, const bm25::QueryNode& root, std::size_t k,
+    const bm25::LiveChecker& live_checker,
+    const bm25::Bm25Params* params_override) const {
+    const Field* f = field_of(field);
+    if (f == nullptr) return {};
+    const bm25::Bm25Params& params =
+        params_override ? *params_override : params_;
+    auto fetch = [this, f](std::string_view term, FlatPostings& out) {
+        segv2::TermRec rec{};
+        if (!find_term(*f, term, rec)) return false;
+        return decode_rec(*f, rec, out);
+    };
+    auto phrase_fn = [&](const std::vector<std::string>& terms) {
+        return phrase_common(field, terms,
+                             std::numeric_limits<std::size_t>::max(),
+                             /*slop=*/0, live_checker, params_override);
+    };
+    return bm25::detail::bool_tree_impl(root, k, live_checker, params,
+                                        f->stats.live_doc_count,
+                                        f->stats.sum_doc_len, fetch,
+                                        phrase_fn);
 }
 
 }  // namespace bitcask::search

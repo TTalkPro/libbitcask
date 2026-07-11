@@ -3,8 +3,11 @@
 > 状态:**P1 Slice 1 已落地(2026-07-11)**——共享评分实现抽取(bm25_search_impl.hpp)
 > + v2 格式/流式 writer/MmapSegment reader 核心(segment_v2.hpp/.cpp),round-trip
 > 与内存段**逐位一致**(200 轮随机 WAND 对拍),clang/ASan 全量 589/589。
-> 剩余:WAND 块游标(现为全量解码 interim)、phrase/explain/wildcard、
-> SealedSegment 接线(进度详见 TASK.md S30-P1)。对标 Lucene/ES 段式索引的标准内存模型。
+> **Slice 3 已落地(2026-07-11)**:全查询面上 mmap(phrase/near/explain/
+> wildcard/fuzzy/bool/bool_tree,继续抽共享核 + fetch 回调参数化),
+> clang/ASan 595/595。剩余:Slice 4 SealedSegment 接线(P2 前置)、
+> WAND 块游标(全量解码 interim,非阻塞优化项)。进度详见 TASK.md S30-P1。
+> 对标 Lucene/ES 段式索引的标准内存模型。
 >
 > **动机**:倒排索引当前全量驻留内存——SoA 后仍 ≈16B/posting(+positions
 > ~4-5B/词位),1M 文档 × 500 唯一词 ≈ 8-10GB;wiser-cpp 实测 checkpoint 单次

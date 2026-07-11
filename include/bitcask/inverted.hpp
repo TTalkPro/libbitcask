@@ -550,10 +550,7 @@ private:
     static constexpr std::size_t kShardCount = 64;
     // S30-P1:BOW/WAND 路由阈值移至 bm25_search_impl.hpp
     // (detail::kWandRouteThreshold)——MmapSegment 路由必须与本类一致。
-    // S7-5：短语/近邻查询候选数（first term posting 数）≥ 此阈值才并行评分。
-    // 甜区是大候选集（热词短语，~8.7ms）；小候选集并行 task spawn 开销 > 收益，
-    // 走串行（同 S7-1 BOW 串行化的教训）。
-    static constexpr std::size_t kPhraseParallelThreshold = 2048;
+    // S30-P1:kPhraseParallelThreshold 移至 bm25_search_impl.hpp(detail::)。
 
     // S29-6B:实例 id 分配(见 index_id())。
     [[nodiscard]] static std::uint64_t next_index_id() noexcept {

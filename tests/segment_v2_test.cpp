@@ -360,3 +360,210 @@ TEST(SegmentV2, MultiFieldRoundTrip) {
                         body.search({"shared", "b3"}, 10, live), "body");
     EXPECT_TRUE(seg->search("nofield", {"x"}, 10, live).empty());
 }
+
+// ===========================================================================
+// S30-P1 Slice 3：其余查询面等价性(phrase/near/explain/wildcard/fuzzy/bool)
+// ===========================================================================
+
+namespace {
+
+// 带 positions 的短语语料:"alpha beta"(相邻)出现于 d%3==0 的文档,
+// "alpha ... beta"(隔 2)出现于 d%3==1,只有 alpha 的 d%3==2。
+std::unique_ptr<Corpus> build_phrase_corpus(std::uint32_t docs,
+                                            const std::string& tag) {
+    auto cp = std::make_unique<Corpus>();
+    Corpus& c = *cp;
+    c.doc_count = docs;
+    for (std::uint32_t d = 0; d < docs; ++d) {
+        TermPositions tp;
+        switch (d % 3) {
+            case 0:
+                tp["alpha"] = {1, {0}};
+                tp["beta"] = {1, {1}};
+                break;
+            case 1:
+                tp["alpha"] = {1, {0}};
+                tp["beta"] = {1, {3}};
+                break;
+            default:
+                tp["alpha"] = {2, {0, 5}};
+                break;
+        }
+        tp["fill" + std::to_string(d % 20)] = {1, {9}};
+        c.idx.add_doc(d, tp);
+        c.live.doc_lens[d] = 4;
+    }
+    c.path = (std::filesystem::temp_directory_path() /
+              ("segv2_" + tag + ".seg"))
+                 .string();
+    std::filesystem::remove(c.path);
+    return cp;
+}
+
+// 无序容差比较(wildcard/fuzzy:采集顺序差 → 浮点累加序差 → 末位 ulp 差;
+// 近平分还可能重排)。按 ord 归并后逐分数近似比较。
+void expect_same_results_approx(const std::vector<SearchResult>& a,
+                                const std::vector<SearchResult>& b,
+                                const std::string& what) {
+    ASSERT_EQ(a.size(), b.size()) << what;
+    auto key_sorted = [](std::vector<SearchResult> v) {
+        std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) {
+            return x.ord < y.ord;
+        });
+        return v;
+    };
+    const auto sa = key_sorted(a);
+    const auto sb = key_sorted(b);
+    for (std::size_t i = 0; i < sa.size(); ++i) {
+        EXPECT_EQ(sa[i].ord, sb[i].ord) << what << " @" << i;
+        EXPECT_NEAR(sa[i].score, sb[i].score,
+                    std::abs(sa[i].score) * 1e-5F + 1e-7F)
+            << what << " @" << i;
+    }
+}
+
+}  // namespace
+
+TEST(SegmentV2Slice3, PhraseAndNearEquivalence) {
+    auto cp = build_phrase_corpus(120, "phrase");
+    auto& c = *cp;
+    auto seg = write_and_open(c);
+    ASSERT_NE(seg, nullptr);
+
+    const std::vector<std::string> pq = {"alpha", "beta"};
+    expect_same_results(seg->search_phrase(kField, pq, 10, c.live),
+                        c.idx.search_phrase(pq, 10, c.live), "phrase");
+    for (std::uint32_t slop : {0u, 1u, 2u, 5u}) {
+        expect_same_results(
+            seg->search_near(kField, pq, 10, slop, c.live),
+            c.idx.search_near(pq, 10, slop, c.live),
+            "near slop=" + std::to_string(slop));
+    }
+    // 缺词 → 双侧空。
+    EXPECT_TRUE(seg->search_phrase(kField, {"alpha", "ghost"}, 10, c.live)
+                    .empty());
+    EXPECT_TRUE(c.idx.search_phrase({"alpha", "ghost"}, 10, c.live).empty());
+}
+
+TEST(SegmentV2Slice3, ExplainEquivalence) {
+    auto cp = build_corpus(90, "explain");
+    auto& c = *cp;
+    auto seg = write_and_open(c);
+    ASSERT_NE(seg, nullptr);
+
+    const std::vector<std::string> q = {"hot", "mid3", "ghost"};
+    for (std::uint64_t docid : {0ull, 13ull, 89ull}) {
+        const auto a = seg->explain(kField, q, docid, c.live);
+        const auto b = c.idx.explain(q, docid, c.live);
+        ASSERT_EQ(a.terms.size(), b.terms.size());
+        EXPECT_EQ(a.total, b.total) << docid;
+        for (std::size_t i = 0; i < a.terms.size(); ++i) {
+            EXPECT_EQ(a.terms[i].term, b.terms[i].term);
+            EXPECT_EQ(a.terms[i].df, b.terms[i].df);
+            EXPECT_EQ(a.terms[i].idf, b.terms[i].idf);
+            EXPECT_EQ(a.terms[i].tf, b.terms[i].tf);
+            EXPECT_EQ(a.terms[i].tf_norm, b.terms[i].tf_norm);
+            EXPECT_EQ(a.terms[i].contribution, b.terms[i].contribution);
+        }
+    }
+}
+
+TEST(SegmentV2Slice3, WildcardEquivalence) {
+    auto cp = build_corpus(150, "wildcard");
+    auto& c = *cp;
+    auto seg = write_and_open(c);
+    ASSERT_NE(seg, nullptr);
+
+    // 前缀 / 中缀 / 全扫 / 问号 各形态。
+    for (const char* pat : {"mid*", "rare1*", "*id3", "m?d4", "*are99*"}) {
+        expect_same_results_approx(
+            seg->search_wildcard(kField, pat, 20, c.live),
+            c.idx.search_wildcard(pat, 20, c.live),
+            std::string("pat=") + pat);
+    }
+    EXPECT_TRUE(seg->search_wildcard(kField, "zzz*", 10, c.live).empty());
+}
+
+TEST(SegmentV2Slice3, FuzzyEquivalence) {
+    auto cp = build_corpus(150, "fuzzy");
+    auto& c = *cp;
+    auto seg = write_and_open(c);
+    ASSERT_NE(seg, nullptr);
+
+    for (std::uint32_t maxd : {1u, 2u}) {
+        expect_same_results_approx(
+            seg->search_fuzzy(kField, {"mid3"}, 20, maxd, c.live),
+            c.idx.search_fuzzy({"mid3"}, 20, maxd, c.live),
+            "fuzzy d=" + std::to_string(maxd));
+    }
+    // 多查询词:同一 vocab term 至多入选一次的语义。
+    expect_same_results_approx(
+        seg->search_fuzzy(kField, {"mid1", "mid2"}, 20, 1, c.live),
+        c.idx.search_fuzzy({"mid1", "mid2"}, 20, 1, c.live), "fuzzy multi");
+}
+
+TEST(SegmentV2Slice3, BoolEquivalence) {
+    auto cp = build_corpus(400, "bool");
+    auto& c = *cp;
+    auto seg = write_and_open(c);
+    ASSERT_NE(seg, nullptr);
+
+    using bitcask::bm25::QueryNode;
+    // 扁平:MUST 交集 / SHOULD 加分 / MUST_NOT 排除 各组合。
+    std::vector<QueryNode> cases;
+    cases.push_back(QueryNode::must_all(
+        {QueryNode::must_term("hot"), QueryNode::must_term("mid3")}));
+    cases.push_back(QueryNode::must_all({QueryNode::must_term("hot"),
+                                         QueryNode::must_term("mid3"),
+                                         QueryNode::must_not_term("rare13")}));
+    cases.push_back(QueryNode::should_any({QueryNode::should_term("mid1"),
+                                           QueryNode::should_term("rare42")}));
+    cases.push_back(QueryNode::must_all({QueryNode::must_term("mid5"),
+                                         QueryNode::should_term("rare55")}));
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        expect_same_results(seg->bool_search(kField, cases[i], 15, c.live),
+                            c.idx.bool_search(cases[i], 15, c.live),
+                            "bool" + std::to_string(i));
+    }
+
+    // BMW must-only 大列表分支(hot df=400 且纯 MUST → 走块跳跃路径)。
+    auto bmw = QueryNode::must_all(
+        {QueryNode::must_term("hot"), QueryNode::must_term("mid7")});
+    expect_same_results(seg->bool_search(kField, bmw, 5, c.live),
+                        c.idx.bool_search(bmw, 5, c.live), "bmw");
+}
+
+TEST(SegmentV2Slice3, BoolTreeWithPhraseEquivalence) {
+    auto cp = build_phrase_corpus(150, "booltree");
+    auto& c = *cp;
+    auto seg = write_and_open(c);
+    ASSERT_NE(seg, nullptr);
+
+    using bitcask::bm25::QueryNode;
+    using bitcask::bm25::QueryOp;
+    // 树:(必须短语 "alpha beta") + (SHOULD fill3) - (MUST_NOT fill7)。
+    QueryNode phrase;
+    phrase.op = QueryOp::MUST;
+    phrase.is_phrase = true;
+    phrase.phrase_terms = {"alpha", "beta"};
+    QueryNode root;
+    root.op = QueryOp::SHOULD;
+    root.children.push_back(phrase);
+    root.children.push_back(QueryNode::should_term("fill3"));
+    root.children.push_back(QueryNode::must_not_term("fill7"));
+
+    expect_same_results(seg->bool_search_tree(kField, root, 20, c.live),
+                        c.idx.bool_search_tree(root, 20, c.live), "tree");
+
+    // 嵌套组:( +alpha ( fill1 fill2 ) )。
+    QueryNode grp;
+    grp.op = QueryOp::SHOULD;
+    grp.children.push_back(QueryNode::should_term("fill1"));
+    grp.children.push_back(QueryNode::should_term("fill2"));
+    QueryNode root2;
+    root2.op = QueryOp::SHOULD;
+    root2.children.push_back(QueryNode::must_term("alpha"));
+    root2.children.push_back(grp);
+    expect_same_results(seg->bool_search_tree(kField, root2, 20, c.live),
+                        c.idx.bool_search_tree(root2, 20, c.live), "tree2");
+}

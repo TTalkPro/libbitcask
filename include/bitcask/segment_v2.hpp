@@ -167,6 +167,44 @@ public:
     [[nodiscard]] bool decode_postings(std::string_view field,
                                        std::string_view term,
                                        bm25::FlatPostings& out) const;
+    // 完整解码(含 tf/dl/positions 列)——phrase/near 与将来 merge 用。
+    [[nodiscard]] bool decode_postings_list(std::string_view field,
+                                            std::string_view term,
+                                            bm25::PostingList& out) const;
+
+    // ---- 其余查询面(语义与 InvertedIndex 同名方法逐位一致,共享
+    //      bm25_search_impl 核;wildcard/fuzzy 因采集顺序不同,浮点累加序
+    //      可有末位差,见实现注) ----
+    [[nodiscard]] std::vector<bm25::SearchResult> search_phrase(
+        std::string_view field, const std::vector<std::string>& query_terms,
+        std::size_t k, const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const;
+    [[nodiscard]] std::vector<bm25::SearchResult> search_near(
+        std::string_view field, const std::vector<std::string>& query_terms,
+        std::size_t k, std::uint32_t slop,
+        const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const;
+    [[nodiscard]] bm25::ScoreExplanation explain(
+        std::string_view field, const std::vector<std::string>& query_terms,
+        std::uint64_t docid, const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const;
+    [[nodiscard]] std::vector<bm25::SearchResult> search_wildcard(
+        std::string_view field, const std::string& pattern, std::size_t k,
+        const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const;
+    [[nodiscard]] std::vector<bm25::SearchResult> search_fuzzy(
+        std::string_view field, const std::vector<std::string>& query_terms,
+        std::size_t k, std::uint32_t max_edit_distance,
+        const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const;
+    [[nodiscard]] std::vector<bm25::SearchResult> bool_search(
+        std::string_view field, const bm25::QueryNode& query, std::size_t k,
+        const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const;
+    [[nodiscard]] std::vector<bm25::SearchResult> bool_search_tree(
+        std::string_view field, const bm25::QueryNode& root, std::size_t k,
+        const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override = nullptr) const;
 
     // ---- 字段统计(写出时快照) ----
     [[nodiscard]] std::uint64_t live_doc_count(std::string_view field) const;
@@ -208,6 +246,19 @@ private:
                                  segv2::TermRec& rec) const;
     [[nodiscard]] bool decode_rec(const Field& f, const segv2::TermRec& rec,
                                   bm25::FlatPostings& out) const;
+    [[nodiscard]] bool decode_rec_list(const Field& f,
+                                       const segv2::TermRec& rec,
+                                       bm25::PostingList& out) const;
+    // 词典有序区间端点(term 字节序;二分)。
+    [[nodiscard]] std::size_t dict_lower_bound(const Field& f,
+                                               std::string_view key) const;
+    [[nodiscard]] std::size_t dict_upper_bound(const Field& f,
+                                               std::string_view key) const;
+    [[nodiscard]] std::vector<bm25::SearchResult> phrase_common(
+        std::string_view field, const std::vector<std::string>& query_terms,
+        std::size_t k, std::uint32_t slop,
+        const bm25::LiveChecker& live_checker,
+        const bm25::Bm25Params* params_override) const;
 
     // mmap 区
     const std::byte* base_ = nullptr;
