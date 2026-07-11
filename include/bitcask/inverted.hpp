@@ -511,11 +511,32 @@ public:
         mutable std::shared_ptr<const std::vector<std::string>> vocab_extra_;
         mutable std::vector<std::string> vocab_delta_;  // 由 vocab_mtx_ 保护
         mutable std::atomic<bool> vocab_dirty_{true};
+
+        // S29-6B:分片 posting 世代——写者对本 shard 任一 posting list 可见
+        // 变更(add_doc/apply_delta/compact/finalize/deserialize)完成后
+        // fetch_add(release);查询线程 acquire load 后用于 TermSnapshotCache
+        // 命中判据(entry.gen == gen_)。remove_doc 不 bump(只改全局统计,
+        // 不碰 posting;删除由 live_checker 查询期过滤,与缓存正交)。
+        // 独占 cacheline:写者 bump 不得连带失效读者正在读的邻接字段。
+        alignas(64) std::atomic<std::uint64_t> gen_{0};
     };
 
     // 获取内部 shard（用于测试）。
     [[nodiscard]] auto shard_for(std::string_view term) -> Shard&;
     [[nodiscard]] auto shard_for(std::string_view term) const -> const Shard&;
+
+    // S29-6B:本索引实例 id(进程级单调分配,永不复用)——TermSnapshotCache
+    // 的 key 成分,保证指向已析构索引的残留缓存条目永不假命中。
+    [[nodiscard]] std::uint64_t index_id() const noexcept { return index_id_; }
+
+    // S29-6B:查询快照缓存运行期开关(进程级,默认开)。关闭 ⇒ probe 恒
+    // miss、不产生条目 ⇒ 字节级回到无缓存路径(线上出问题免重编译回退)。
+    static void set_query_cache_enabled(bool on) noexcept {
+        query_cache_enabled_.store(on, std::memory_order_relaxed);
+    }
+    [[nodiscard]] static bool query_cache_enabled() noexcept {
+        return query_cache_enabled_.load(std::memory_order_relaxed);
+    }
 
 private:
     static constexpr std::size_t kShardCount = 64;
@@ -525,7 +546,15 @@ private:
     // 走串行（同 S7-1 BOW 串行化的教训）。
     static constexpr std::size_t kPhraseParallelThreshold = 2048;
 
+    // S29-6B:实例 id 分配(见 index_id())。
+    [[nodiscard]] static std::uint64_t next_index_id() noexcept {
+        static std::atomic<std::uint64_t> counter{1};
+        return counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    inline static std::atomic<bool> query_cache_enabled_{true};
+
     std::array<Shard, kShardCount> shards_;
+    const std::uint64_t index_id_ = next_index_id();
     Bm25Params params_;
     bool index_positions_ = true;  // S10.10：false 时 add_doc 丢弃 positions
 
