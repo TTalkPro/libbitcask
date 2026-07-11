@@ -433,3 +433,33 @@ TEST(NfkcInert, TargetedCases) {
     EXPECT_EQ(nfkc_fold("全角，逗号"), "全角,逗号");      // 回退路径折叠
     EXPECT_EQ(nfkc_fold("ＧＰＵ测试"), "gpu测试");        // 全角字母回退折叠
 }
+
+// S31(下游反馈):max_token_bytes——超长 token(长 URL/模板块噪声)源头
+// 丢弃,pos 仍递增(位置语义同 min 过滤);0 = 不限。
+TEST(AnalyzerMaxTokenBytes, NgramAndWhitespaceDropOversized) {
+    const std::string monster(1500, 'x');
+    const std::string text = "aa " + monster + " bb";
+    for (auto type : {AnalyzerType::Ngram, AnalyzerType::Whitespace}) {
+        AnalyzerConfig c;
+        c.type = type;
+        auto an = AnalyzerFactory::create(c);
+        ASSERT_NE(an, nullptr);
+        auto tf = an->analyze_with_positions(text);
+        EXPECT_EQ(tf.count(monster), 0u) << static_cast<int>(type);
+        ASSERT_EQ(tf.count("aa"), 1u);
+        ASSERT_EQ(tf.count("bb"), 1u);
+        // pos 语义:aa=0,monster 占位=1,bb=2(丢词不塌缩位置)。
+        EXPECT_EQ(tf["aa"].second[0], 0u);
+        EXPECT_EQ(tf["bb"].second[0], 2u);
+        // tf-only 路径同语义。
+        auto tf2 = an->analyze(text);
+        EXPECT_EQ(tf2.count(monster), 0u);
+        EXPECT_EQ(tf2.count("aa"), 1u);
+        // 0 = 不限(回退旧行为)。
+        AnalyzerConfig c0 = c;
+        c0.max_token_bytes = 0;
+        auto an0 = AnalyzerFactory::create(c0);
+        auto tf0 = an0->analyze_with_positions(text);
+        EXPECT_EQ(tf0.count(monster), 1u);
+    }
+}

@@ -59,7 +59,7 @@ static const bool s_reg_ngram = [] {
             if (c.min_n < 1 || c.max_n < c.min_n) return nullptr;
             return std::make_unique<NgramAnalyzer>(
                 c.min_n, c.max_n, c.enable_stop_words, c.stop_words,
-                c.min_token_length);
+                c.min_token_length, c.max_token_bytes);
         });
     return true;
 }();
@@ -68,7 +68,8 @@ static const bool s_reg_ws = [] {
     AnalyzerFactory::register_creator(
         AnalyzerType::Whitespace,
         [](const AnalyzerConfig& c) -> std::unique_ptr<Analyzer> {
-            return std::make_unique<WhitespaceAnalyzer>(c.min_token_length);
+            return std::make_unique<WhitespaceAnalyzer>(c.min_token_length,
+                                                        c.max_token_bytes);
         });
     return true;
 }();
@@ -85,7 +86,7 @@ static const bool s_reg_jieba = [] {
             return std::make_unique<JiebaAnalyzer>(
                 c.dict_path, c.min_n, c.max_n,
                 c.enable_stop_words, c.stop_words,
-                c.min_token_length);
+                c.min_token_length, c.max_token_bytes);
         });
     return true;
 }();
@@ -193,9 +194,11 @@ void ngram_tokenize(const std::vector<detail::CpInfo>& cps,
 NgramAnalyzer::NgramAnalyzer(std::uint32_t min_n, std::uint32_t max_n,
                              bool enable_stop_words,
                              std::vector<std::string> custom_stop_words,
-                             std::uint32_t min_token_length)
+                             std::uint32_t min_token_length,
+                             std::uint32_t max_token_bytes)
     : min_n_(min_n), max_n_(max_n), enable_stop_words_(enable_stop_words),
-      min_token_length_(min_token_length) {
+      min_token_length_(min_token_length),
+      max_token_bytes_(max_token_bytes) {
     if (enable_stop_words_) {
         const auto& defaults = bitcask::detail::default_stop_words();
         const auto& src = custom_stop_words.empty()
@@ -241,7 +244,11 @@ auto NgramAnalyzer::analyze_with_positions(std::string_view text) const -> TermP
 
     auto emit_word = [&](std::size_t start, std::size_t end) {
         // S9.8：拉丁整词按 codepoint 长度过滤；短词丢弃但 pos 仍递增（位置语义不变）。
-        if (end - start >= min_token_length_) {
+        if (end - start >= min_token_length_ &&
+            (max_token_bytes_ == 0 ||
+             (cps[end - 1].byte_off + cps[end - 1].byte_len) -
+                     cps[start].byte_off <=
+                 max_token_bytes_)) {  // S31:超长 token 丢弃(pos 语义不变)
             auto& first = cps[start];
             auto& last = cps[end - 1];
             std::string_view term(
@@ -307,7 +314,11 @@ auto NgramAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
     };
 
     auto emit_word = [&](std::size_t start, std::size_t end) {
-        if (end - start >= min_token_length_) {
+        if (end - start >= min_token_length_ &&
+            (max_token_bytes_ == 0 ||
+             (cps[end - 1].byte_off + cps[end - 1].byte_len) -
+                     cps[start].byte_off <=
+                 max_token_bytes_)) {  // S31:超长 token 丢弃(pos 语义不变)
             auto& first = cps[start];
             auto& last = cps[end - 1];
             std::string_view term(
@@ -364,7 +375,11 @@ auto WhitespaceAnalyzer::analyze_with_positions(std::string_view text) const -> 
             ++i;
         }
         // S9.8：按 codepoint 长度过滤短词；短词丢弃但 pos 仍递增。
-        if (i - word_start >= min_token_length_) {
+        if (i - word_start >= min_token_length_ &&
+            (max_token_bytes_ == 0 ||
+             (cps[i - 1].byte_off + cps[i - 1].byte_len) -
+                     cps[word_start].byte_off <=
+                 max_token_bytes_)) {  // S31:超长 token 丢弃(pos 语义不变)
             auto& first = cps[word_start];
             auto& last = cps[i - 1];
             auto term = std::string(
@@ -404,7 +419,11 @@ auto WhitespaceAnalyzer::analyze_with_offsets(std::string_view text) const -> Te
             ++i;
         }
         // S9.8：按 codepoint 长度过滤短词；短词丢弃但 pos 仍递增。
-        if (i - word_start >= min_token_length_) {
+        if (i - word_start >= min_token_length_ &&
+            (max_token_bytes_ == 0 ||
+             (cps[i - 1].byte_off + cps[i - 1].byte_len) -
+                     cps[word_start].byte_off <=
+                 max_token_bytes_)) {  // S31:超长 token 丢弃(pos 语义不变)
             auto& first = cps[word_start];
             auto& last = cps[i - 1];
             auto term = std::string(

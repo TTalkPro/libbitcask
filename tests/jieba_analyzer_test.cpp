@@ -167,3 +167,25 @@ TEST(JiebaAnalyzer, JapaneseFallbackNgram) {
     // bi-gram 回退应产出"東京"等
     EXPECT_NE(tfs.find("東京"), tfs.end());
 }
+
+// S31(下游反馈 libbitcask.md):jieba 对 zhwiki 长模板/URL 可切出 >1024B
+// 单 token(实测 1477B)——历史上写进 v1 段后整段拒载。max_token_bytes
+// 源头丢弃(pos 仍递增);0=不限。
+TEST(JiebaAnalyzer, S31OversizedTokenDropped) {
+    AnalyzerConfig c;
+    c.type = AnalyzerType::Jieba;
+    c.dict_path = BITCASK_JIEBA_DICT_DIR;
+    auto an = AnalyzerFactory::create(c);
+    ASSERT_NE(an, nullptr);
+    const std::string monster(1500, 'q');  // 无空白连续拉丁串,jieba 整词输出
+    const std::string text = "清华大学 " + monster + " 计算机";
+    auto tf = an->analyze_with_positions(text);
+    EXPECT_EQ(tf.count(monster), 0u);
+    EXPECT_GE(tf.count("清华大学") + tf.count("清华") + tf.count("大学"), 1u);
+
+    AnalyzerConfig c0 = c;
+    c0.max_token_bytes = 0;  // 不限 → 旧行为
+    auto an0 = AnalyzerFactory::create(c0);
+    auto tf0 = an0->analyze_with_positions(text);
+    EXPECT_EQ(tf0.count(monster), 1u);
+}

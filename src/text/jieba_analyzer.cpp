@@ -74,9 +74,11 @@ JiebaAnalyzer::JiebaAnalyzer(const std::string& dict_dir,
                              std::uint32_t min_n, std::uint32_t max_n,
                              bool enable_stop_words,
                              std::vector<std::string> custom_stop_words,
-                             std::uint32_t min_token_length)
+                             std::uint32_t min_token_length,
+                             std::uint32_t max_token_bytes)
     : min_n_(min_n), max_n_(max_n), enable_stop_words_(enable_stop_words),
-      min_token_length_(min_token_length) {
+      min_token_length_(min_token_length),
+      max_token_bytes_(max_token_bytes) {
     jieba_ = std::make_unique<JiebaImpl>(dict_dir);
 
     if (enable_stop_words_) {
@@ -188,6 +190,13 @@ auto JiebaAnalyzer::collect_tokens(std::string_view text, bool need_offsets) con
         // S9.8：非 CJK 的短拉丁词按 codepoint 长度过滤（CJK 词不受限）；
         // 跳过该词但 pos 仍递增，保持位置语义一致。
         if (!has_cjk && word_cps.size() < min_token_length_) {
+            ++pos;
+            continue;
+        }
+        // S31:超长 token(长 URL/模板块——zhwiki 实测 jieba 可切出 1477B
+        // 单词)是检索噪声,且曾触发 v1 段读端上限 → 整段静默报废
+        // (libbitcask.md)。丢弃,pos 仍递增。
+        if (max_token_bytes_ != 0 && word_norm.size() > max_token_bytes_) {
             ++pos;
             continue;
         }

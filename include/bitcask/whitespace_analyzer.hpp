@@ -14,8 +14,10 @@ namespace bitcask::text {
 class WhitespaceAnalyzer final : public Analyzer {
 public:
     WhitespaceAnalyzer() = default;
-    explicit WhitespaceAnalyzer(std::uint32_t min_token_length)
-        : min_token_length_(min_token_length) {}
+    explicit WhitespaceAnalyzer(std::uint32_t min_token_length,
+                                std::uint32_t max_token_bytes = 1024)
+        : min_token_length_(min_token_length),
+          max_token_bytes_(max_token_bytes) {}
 
     [[nodiscard]] auto analyze_with_positions(std::string_view text) const
         -> TermPositionsMap override;
@@ -29,6 +31,8 @@ public:
 
 private:
     std::uint32_t min_token_length_ = 1;   // 整词最小 codepoint 长度（S9.8），1=不过滤
+public:  // analyzer.cpp 的两个 analyze 实现直接读(同 TU 权衡:免 getter 样板)
+    std::uint32_t max_token_bytes_ = 1024;  // S31:单 token 字节上限,0=不限
 };
 
 }  // namespace bitcask::text

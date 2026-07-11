@@ -25,7 +25,8 @@ public:
                            std::uint32_t min_n = 2, std::uint32_t max_n = 3,
                            bool enable_stop_words = false,
                            std::vector<std::string> custom_stop_words = {},
-                           std::uint32_t min_token_length = 1);
+                           std::uint32_t min_token_length = 1,
+                           std::uint32_t max_token_bytes = 1024);
 
     ~JiebaAnalyzer() override;
 
@@ -71,6 +72,7 @@ private:
     bool enable_stop_words_;
     std::unordered_set<std::string> stop_words_;
     std::uint32_t min_token_length_ = 1;   // 拉丁整词最小 codepoint 长度（S9.8），1=不过滤
+    std::uint32_t max_token_bytes_ = 1024;  // S31:单 token 字节上限,0=不限
 };
 
 }  // namespace bitcask::text

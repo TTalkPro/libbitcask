@@ -24,7 +24,8 @@ public:
     explicit NgramAnalyzer(std::uint32_t min_n = 2, std::uint32_t max_n = 3,
                            bool enable_stop_words = false,
                            std::vector<std::string> custom_stop_words = {},
-                           std::uint32_t min_token_length = 1);
+                           std::uint32_t min_token_length = 1,
+                           std::uint32_t max_token_bytes = 1024);
 
     // S29-8：tf-only 覆写——不构造 per-term positions vector（基类默认从
     // analyze_with_positions 派生后丢弃）。term 集与 tf 与派生版逐位一致。
@@ -50,6 +51,7 @@ private:
     bool enable_stop_words_;
     std::unordered_set<std::string> stop_words_;
     std::uint32_t min_token_length_;   // 拉丁整词最小 codepoint 长度（S9.8），1=不过滤
+    std::uint32_t max_token_bytes_;    // S31:单 token 字节上限,0=不限
 };
 
 }  // namespace bitcask::text

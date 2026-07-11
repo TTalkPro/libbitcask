@@ -68,6 +68,10 @@ struct AnalyzerConfig {
     // 仅作用于拉丁/空白切分的整词路径，CJK 的 n-gram 不受影响。
     // 默认 1 = 不过滤（向后兼容）。索引与查询两侧一致生效。
     std::uint32_t min_token_length = 1;
+    // S31(下游反馈):单 token 字节上限——超长 token(长 URL/模板块/base64)
+    // 是检索噪声,且曾触发 v1 段读端 1024 上限 → 整段静默报废(libbitcask.md)。
+    // 丢弃超限 token(pos 仍递增,位置语义同 min 过滤);0 = 不限(不建议)。
+    std::uint32_t max_token_bytes = 1024;
     // 英文词干提取（S8.1）：对各分词结果做 Porter 词干化处理。"running" → "run"。默认关闭。
     bool enable_stemming = false;
 };
