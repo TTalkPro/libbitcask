@@ -407,6 +407,37 @@ inline std::vector<SearchResult> search_wand_impl(
         auto& pivot_tp = tps[order[pivot_pos]];
         auto pivot_ord = pivot_tp.fp->ords[pivot_tp.cursor];
 
+        // C4 修复(既存正确性 bug,S8/S10 era 起潜伏):规范 WAND 要求评分前
+        // **对齐**——排序在 pivot 之前、docid < pivot_ord 的列表必须先推进到
+        // ≥ pivot_ord 并重选 pivot。原实现缺此步:落后列表被跳过评分后又被
+        // 尾部推进越过 pivot ⟹ ① 命中文档以**部分分数**进堆;② 更糟,
+        // 「部分分 < θ ≤ 真分」的文档被整个丢弃(top-k 集合错误)。三方对拍
+        // (穷举参照)实测抓获:ord 252 丢失 hot 贡献。galloping 推进与
+        // bool_search BMW 的 advance 同型。
+        {
+            bool lagged = false;
+            for (std::size_t i = 0; i < pivot_pos; ++i) {
+                auto& tp = tps[order[i]];
+                if (tp.cursor >= tp.fp->ords.size()) continue;
+                if (tp.fp->ords[tp.cursor] >= pivot_ord) continue;
+                const auto* o = tp.fp->ords.data();
+                const std::size_t n = tp.fp->size();
+                std::size_t lo = tp.cursor;
+                std::size_t step = 1;
+                std::size_t hi = lo + 1;
+                while (hi < n && o[hi] < pivot_ord) {
+                    lo = hi;
+                    hi += step;
+                    step <<= 1;
+                }
+                if (hi > n) hi = n;
+                tp.cursor = static_cast<std::size_t>(
+                    std::lower_bound(o + lo + 1, o + hi, pivot_ord) - o);
+                lagged = true;
+            }
+            if (lagged) continue;  // 游标变了:重排序、重选 pivot(不评分)
+        }
+
         // A1:非耗尽词的列表上界总和——块跳跃判定的保守"其余词"上界
         // (含 pivot 之后 cursor 恰为 pivot_ord 的词,admissible)。
         float total_ub = 0.0f;
