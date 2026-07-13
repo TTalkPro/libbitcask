@@ -4290,5 +4290,30 @@ S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同�
   (含 ef 参数在磁盘引擎下的 nprobe/beam-L 语义注记)。验收:新 C 测
   test_vector_engine_ivfrq(IVFRQ 建库/写查/引擎不符 MODE_MISMATCH/
   一致重开)——C 套件全过;gcc 全量 **640/640**;build-rel 过。
+- [x] **内存/并发/UB 审计已完成(2026-07-13)**:
+  · **修复 ×2(真实 OOB UB)**:两个磁盘段的**结构边界校验误挂
+  verify_crc 门**——可信盘模式(verify_crc=false)下损坏文件的 IVF
+  cidx off/count 或 DiskANN 邻接 id 越界 → mmap 界外读。修复:IVF
+  cidx 边界校验无条件化(O(nlist) 纯头查零 IO);DiskANN 查询侧
+  use-site guard(ncnt clamp + id<count,每邻居一次比较,open 侧全量
+  校验需 touch 全部块页违背懒加载故保持挂门)。**原则:内存安全前置
+  不是完整性选项,CRC 可选、边界不可选。**
+  · **经验层零检出**:ASan 全量 **641/641**(LeakSanitizer 默认启用,
+  无泄漏);TSan merge 并发/恢复链/S32 e2e/三插件子集全绿;fd 收支
+  审计(两段 open 的 early-return 12/12、14/14 全配对释放)。
+  · **死锁面**:向量子系统无新增互斥(hnsw per-node seqlock 单写者
+  顺序取放无嵌套;IVF/DiskANN 段只读;插件 atomic<shared_ptr>);
+  run_serialized FIFO 契约未变。
+  · **后续修复(2026-07-13 第二轮,②③④ 全部落地)**:② IO 循环 EINTR
+  重试(diskint::pwrite_all/pread_all + hnsw 本地 pwrite_all;w==0 仍
+  判失败防磁盘满死循环);③ parallel_for 异常安全——worker 内异常捕
+  为 exception_ptr、join 后调用方线程重抛(此前逃逸 → std::terminate),
+  两段 build 加函数级 try/catch + `diskint::TmpFile` RAII(异常/早退
+  时 close(fd)+删 tmp——此前 build 中途 bad_alloc 泄 fd 残留 tmp);
+  ④ tls_tid 换 `parallel_for_worker(n, fn(i, wid))` 稳定工位号。
+  验收:gcc 全量 **641/641**;ASan 段测 10/10;build-rel 过。
+  · **记录不修(决策已定/分析性)**:① C ABI 无 size 字段——用户拍板
+  走版本纪律路线(2026-07-13);⑤ mmap 页 SIGBUS 面复核:段文件一次写
+  永不改 ✓,qc8/vec 追加 ftruncate 恒 ≥ 有效前缀 ✓(与 S30 结论一致)。
 - ⚠️ 风险挂账:100M 档 keydir 自身 5-8G(50-80B/key)撑爆预算——KV 层
   独立大轴,若 100M 为认真目标须另行立项(设计 §6.1)。
