@@ -4197,8 +4197,13 @@ S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同�
   build-rel 过。
   · 后续候选(非挂账):质心/组心 int8 化(再 4× 字节,VNNI 机收益);
   10M 档实测验证投影。
-- [ ] M0b DeltaLog 抽取(VectorPlugin/IvfPlugin 插入日志三处重复
-  ~70 行,纯重构,随下批清理做)。
+- [x] **M0b 已完成(2026-07-13)DeltaLog 抽取**:
+  `include/bitcask/vector_delta_log.hpp`——插入日志单一真源(record
+  窗口门 + kHnswDelta 序列化 + parse 回调式重放;字节格式与历史逐字
+  一致,盘上兼容硬约束)。VectorPlugin/IvfPlugin 双双换用(成员三件套
+  ×2 + 编解码 ×2 共 ~140 行重复消除),公共 API 薄包装零变化。
+  验收:纯重构——gcc 全量 **631/631**(既有轮回/重放测试位级守护);
+  build-rel 过。
 - [x] **M4 转换工具已完成(2026-07-13)** `tools/vec_engine_migrate`:
   · **实现比设计更简**:核心属性 = data file 是向量权威 → 工具只改
   meta.vector_engine,目标引擎组件缺失由**首次 open 全量 fold 重建**
