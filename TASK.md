@@ -4160,10 +4160,32 @@ S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同�
     封顶 0.66(nprobe 32→64 无改善)——非簇漏,是**簇内边际低于 int8
     噪声底**(HNSW 本机 f32 评分不受影响,0.946)。该语料对 int8 评分
     引擎过度对抗;真实嵌入边际更健康。
-- [ ] **M3.5(新挂账)**:① harness 语料 v2(健康边际 + int8 真值
-  counter,两引擎公平对账);② RaBitQ 1-bit 粗筛层(format 位已留)——
-  由 v2 语料出数决定;③ IVF build 全量 assign O(N·nlist·dim) 加速
-  (质心图/层次分配,1M+ 时)。RaBitQ popcount 内核供 HNSW P2 同此项。
+- [x] **M3.5-①② 已完成(2026-07-13)**:
+  - **① harness 语料 v2**:簇规模随 n 缩放(~128 成员/簇,
+    `default_truth_params`)——v1 固定 nc=64 在 100k 规模簇内 top-10
+    边际跌破 int8 噪声底(确诊 M3 基线 0.66 封顶为语料问题);
+    TruthParams 增 `int8_scored` 真值(量化码预计算 + 整数 dot,与内核
+    同算式,缓存独立键)+ 两 bench `recall@10_i8` counter。
+    **v2 基线**:HNSW(f32 评分)recall@10 = 1.000 vs f32 真值;
+    IVF(int8 评分)recall@10_i8 = **1.000 全档(nprobe=8 起)**——两引擎
+    各自评分域内零损失;交叉 0.785 对称出现 = 评分域差(框架自洽)。
+  - **② RaBitQ-lite 1-bit 粗筛已实现**(BIV ver=2,v1 兼容读):bits 区
+    = 每记录 sign bits(ceil(dim/8)B)+ μ=mean|v| 校正,bits_crc 头部
+    护体;两段扫——A 段对称 XOR+popcount(est=μ·(d−2h))取 top-C
+    (coarse_c,auto=max(8k,128)),B 段仅 C 个候选 int8 精排。
+    **实测(100k/384d)**:召回零损失(recall@10_i8 仍全档 1.000),
+    QPS nprobe=64 308→224µs(**-27%**),nprobe=8 -4%——收益 ∝ 扫描量,
+    posting 字节 7.7× 缩减兑现。验收:两段扫 coarse_c=n 精确退化
+    穷举对拍 + 默认 C 召回门 ≥0.97 + v1 单段兼容对拍 + bits CRC
+    损坏拒载——gcc 全量 **630/630**;build-rel 过。
+  - **新发现(数据驱动)**:两段扫后**质心暴扫成为新瓶颈**(nlist×dim×4B
+    ≈1.9MB/查询,nprobe=8 档 195µs 几乎全是它);10M×1024d 投影质心区
+    51MB > posting 扫描量——③ 升格为「质心侧整体优化」。
+- [ ] **M3.5-③(升格)质心侧优化 + assign 加速**:质心 int8 量化
+  (4× 字节 + VNNI,复用现有内核)或分层质心(粗→细);build 全量
+  assign O(N·nlist·dim) 同根同治。10M 档的真正前置。
+- [ ] M0b DeltaLog 抽取(VectorPlugin/IvfPlugin 插入日志三处重复
+  ~70 行,纯重构,随下批清理做)。
 - [x] **M4 转换工具已完成(2026-07-13)** `tools/vec_engine_migrate`:
   · **实现比设计更简**:核心属性 = data file 是向量权威 → 工具只改
   meta.vector_engine,目标引擎组件缺失由**首次 open 全量 fold 重建**
