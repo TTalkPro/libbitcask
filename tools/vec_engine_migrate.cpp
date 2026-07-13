@@ -40,14 +40,18 @@ const char* engine_name(VectorEngine e) {
 // 各引擎的组件文件族（清理/统计用；.d 链按前缀匹配）。
 std::vector<fs::path> engine_files(const fs::path& dir, VectorEngine e) {
     std::vector<fs::path> out;
-    const char* base = e == VectorEngine::kHnsw ? "vec.ckpt" : "ivf.ckpt";
+    const char* base = e == VectorEngine::kHnsw    ? "vec.ckpt"
+                       : e == VectorEngine::kIvfRq ? "ivf.ckpt"
+                                                   : "diskann.ckpt";
     out.push_back(dir / base);
     out.push_back(dir / (std::string(base) + ".prev"));
     if (e == VectorEngine::kHnsw) {
         out.push_back(dir / "vec.vec");
         out.push_back(dir / "vec.qc8");
-    } else {
+    } else if (e == VectorEngine::kIvfRq) {
         out.push_back(dir / "ivf.biv");
+    } else {
+        out.push_back(dir / "diskann.bda");
     }
     // .d 链。
     std::error_code ec;
@@ -83,9 +87,10 @@ int main(int argc, char** argv) {
             break;
         }
     }
-    if (dir.empty() || (to != "hnsw" && to != "ivfrq")) {
+    if (dir.empty() || (to != "hnsw" && to != "ivfrq" && to != "diskann")) {
         std::fprintf(stderr,
-            "usage: %s --dir <db> --to hnsw|ivfrq [--purge-old] [--dry-run]\n"
+            "usage: %s --dir <db> --to hnsw|ivfrq|diskann [--purge-old] "
+            "[--dry-run]\n"
             "  switch the vector engine of a bitcask dir (offline).\n"
             "  the target engine's index is rebuilt by full fold on the\n"
             "  next open (duration ~ store size). old engine's component\n"
@@ -95,7 +100,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     const VectorEngine target =
-        to == "hnsw" ? VectorEngine::kHnsw : VectorEngine::kIvfRq;
+        to == "hnsw"    ? VectorEngine::kHnsw
+        : to == "ivfrq" ? VectorEngine::kIvfRq
+                        : VectorEngine::kDiskann;
 
     // 排他：write.lock（与在线写进程同一把锁）。
     const std::string lock_path = (fs::path(dir) / "write.lock").string();
@@ -123,10 +130,11 @@ int main(int argc, char** argv) {
         std::printf("already on engine %s — no-op\n", engine_name(target));
         return 0;
     }
-    if (target == VectorEngine::kIvfRq &&
+    if (target != VectorEngine::kHnsw &&
         mc->vector_metric == bitcask::meta::VectorMetric::kL2) {
         std::fprintf(stderr,
-                     "ivfrq requires kDot/cosine metric (store is kL2)\n");
+                     "disk engines require kDot/cosine metric (store is "
+                     "kL2)\n");
         return 1;
     }
     const VectorEngine old_engine = mc->vector_engine;

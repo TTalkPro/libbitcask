@@ -66,6 +66,10 @@ enum class CkptSectionType : std::uint16_t {
     // dim u16 | nlist u32——与 ivf.biv 侧车头交叉校验（gen 守卫同 kHnsw
     // payload 语义）。delta 链复用 kHnswDelta（通用向量插入日志，格式同）。
     kIvf              = 17,
+    // S32-M5：DiskANN 引擎 base 段（只出现在 diskann.ckpt）：gen u64 |
+    // count u64 | max_ord u64 | dim u16 | R u32——与 diskann.bda 侧车头
+    // 交叉校验。delta 链同样复用 kHnswDelta 通用向量插入日志。
+    kDiskann          = 18,
 };
 
 // 写入用:caller 持有 payload 字节。

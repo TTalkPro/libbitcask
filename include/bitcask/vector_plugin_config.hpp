@@ -32,6 +32,10 @@ struct VectorPluginConfig {
     // （nlist = 4·√N；nprobe = max(nlist/32, 8)）。
     std::uint32_t      ivf_nlist = 0;
     std::uint32_t      ivf_nprobe = 0;
+    // S32-M5：DiskANN 引擎参数（engine=kDiskann 时生效）。0 = 自动
+    // （r=32；l_build=max(64,2r)）。查询宽度走 search 的 ef 参数。
+    std::uint32_t      diskann_r = 0;
+    std::uint32_t      diskann_l_build = 0;
 };
 
 }  // namespace bitcask::vec

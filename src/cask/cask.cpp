@@ -1,4 +1,5 @@
 #include "bitcask/cask.hpp"
+#include "bitcask/diskann_plugin.hpp"  // S32-M5：DiskANN 引擎工厂
 #include "bitcask/ivf_plugin.hpp"  // S32-M3：IVF 引擎工厂
 
 #include <signal.h>     // ::kill for stale-lock detection
@@ -350,8 +351,9 @@ Cask::create_vector_plugin(const search::SearchLayerConfig& scfg) const {
         case meta::VectorEngine::kIvfRq:
             return std::make_unique<vec::IvfPlugin>(scfg.vector_config(),
                                                     *docmap_);
-        case meta::VectorEngine::kDiskann:
-            break;  // S32-M5：实现落地前 check_or_create_meta 已拒绝
+        case meta::VectorEngine::kDiskann:  // S32-M5
+            return std::make_unique<vec::DiskannPlugin>(scfg.vector_config(),
+                                                        *docmap_);
     }
     return std::make_unique<vec::VectorPlugin>(scfg.vector_config(),
                                                *docmap_);
@@ -364,18 +366,12 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
         return std::unexpected(err(CaskError::kInvalidOption,
             "vector_inmem_int8 requires kDot/cosine metric (kL2 unsupported)"));
     }
-    // S32-M3:kIvfRq 已落地;kDiskann 留 S32-M5,落地前干净拒绝。
+    // S32-M3/M5:磁盘档引擎（ivfrq/diskann）仅 kDot/cosine（int8 内积语义）。
     if (opts_.vector_dim > 0 &&
-        opts_.vector_engine == meta::VectorEngine::kDiskann) {
-        return std::unexpected(err(CaskError::kInvalidOption,
-            "vector_engine diskann not implemented yet (S32-M5)"));
-    }
-    // IVF v1 仅 kDot/cosine（posting 扫描与窗口图共用 int8 内积语义）。
-    if (opts_.vector_dim > 0 &&
-        opts_.vector_engine == meta::VectorEngine::kIvfRq &&
+        opts_.vector_engine != meta::VectorEngine::kHnsw &&
         opts_.vector_metric == meta::VectorMetric::kL2) {
         return std::unexpected(err(CaskError::kInvalidOption,
-            "vector_engine ivf_rq requires kDot/cosine metric (kL2 unsupported)"));
+            "disk vector engines require kDot/cosine metric (kL2 unsupported)"));
     }
     if (meta::meta_exists(dirname_)) {
         auto mc = meta::read_meta(dirname_);

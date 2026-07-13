@@ -2083,16 +2083,18 @@ TEST_F(CaskDocValueTest, S32M0VectorEngineMetaWiring) {
         ASSERT_TRUE(mc);
         EXPECT_EQ(mc->vector_engine, bitcask::meta::VectorEngine::kHnsw);
     }
-    // 未实现引擎（kDiskann，S32-M5）：open 干净拒绝。kIvfRq 已落地
-    // （S32-M3）→ 建库成功且 meta 持久化引擎标识。
+    // 三引擎全落地（S32-M3/M5）：kDiskann 建库成功 + meta 持久化。
     {
         auto tmp = tmpdir_ / "eng_dann";
         std::filesystem::create_directories(tmp);
         auto opts = v31_opts(4);
         opts.vector_engine = bitcask::meta::VectorEngine::kDiskann;
         auto c = Cask::open(tmp.string(), opts, &test_registry());
-        ASSERT_FALSE(c);
-        EXPECT_EQ(c.error().kind, bitcask::CaskError::kInvalidOption);
+        ASSERT_TRUE(c);
+        (*c)->close();
+        auto mc = bitcask::meta::read_meta(tmp.string());
+        ASSERT_TRUE(mc);
+        EXPECT_EQ(mc->vector_engine, bitcask::meta::VectorEngine::kDiskann);
     }
     {
         auto tmp = tmpdir_ / "eng_ivf";
@@ -2219,6 +2221,70 @@ TEST_F(CaskDocValueTest, S32M3IvfEngineEndToEnd) {
         ASSERT_TRUE(rd);
         for (const auto& h : rd->hits) EXPECT_NE(h.key, "k5");  // 删除持久
         put_all(**c, kN, kN + 4);  // 续写进窗口
+        (*c)->flush_index();
+        auto r3 = (*c)->search_vector(
+            std::span<const float>(vec_of(kN + 2).data(), 4), 3);
+        ASSERT_TRUE(r3);
+        ASSERT_GE(r3->hits.size(), 1u);
+        EXPECT_EQ(r3->hits[0].key, "k" + std::to_string(kN + 2));
+        (*c)->close();
+    }
+}
+
+// S32-M5:DiskANN 引擎 Cask 全链路 e2e（形态同 S32M3IvfEngineEndToEnd）。
+TEST_F(CaskDocValueTest, S32M5DiskannEngineEndToEnd) {
+    auto opts = v31_opts(4);
+    opts.vector_engine = bitcask::meta::VectorEngine::kDiskann;
+    const std::size_t kN = 24;
+    auto vec_of = [](std::size_t i) {
+        std::vector<float> v(4, 0.05f);
+        v[i % 3] = 1.0f;
+        v[3] = 0.01f * static_cast<float>(i);
+        return v;
+    };
+    auto put_all = [&](Cask& c, std::size_t from, std::size_t to) {
+        for (std::size_t i = from; i < to; ++i) {
+            bitcask::DocInput doc;
+            const std::string text = "da doc " + std::to_string(i);
+            doc.text = sv_bytes(text);
+            auto v = vec_of(i);
+            doc.vector = std::span<const float>(v.data(), 4);
+            ASSERT_TRUE(c.put_doc(sv_bytes("k" + std::to_string(i)), doc,
+                                  1000));
+        }
+    };
+    {
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        put_all(**c, 0, kN);
+        (*c)->flush_index();
+        auto r = (*c)->search_vector(
+            std::span<const float>(vec_of(5).data(), 4), 3);
+        ASSERT_TRUE(r);
+        ASSERT_GE(r->hits.size(), 1u);
+        EXPECT_EQ(r->hits[0].key, "k5");
+        ASSERT_TRUE((*c)->remove(sv_bytes("k5"), 2000));
+        (*c)->flush_index();
+        auto r2 = (*c)->search_vector(
+            std::span<const float>(vec_of(5).data(), 4), kN);
+        ASSERT_TRUE(r2);
+        for (const auto& h : r2->hits) EXPECT_NE(h.key, "k5");
+        (*c)->close();
+    }
+    {
+        auto mc = bitcask::meta::read_meta(tmpdir_.string());
+        ASSERT_TRUE(mc);
+        EXPECT_EQ(mc->vector_engine, bitcask::meta::VectorEngine::kDiskann);
+    }
+    {
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        auto r = (*c)->search_vector(
+            std::span<const float>(vec_of(7).data(), 4), 3);
+        ASSERT_TRUE(r);
+        ASSERT_GE(r->hits.size(), 1u);
+        EXPECT_EQ(r->hits[0].key, "k7");
+        put_all(**c, kN, kN + 4);
         (*c)->flush_index();
         auto r3 = (*c)->search_vector(
             std::span<const float>(vec_of(kN + 2).data(), 4), 3);

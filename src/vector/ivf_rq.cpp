@@ -19,6 +19,7 @@
 
 #include "bitcask/codec.hpp"                 // codec::crc32
 #include "bitcask/detail/int8_kernels.hpp"   // 量化/int8 dot（与 HNSW 同源）
+#include "vec_disk_internal.hpp"             // S32-M5 抽取:共用内部件
 
 namespace bitcask::vec {
 
@@ -32,83 +33,11 @@ constexpr std::size_t   kCidxEntrySize = 16;  // off u64 | count u32 | crc u32
 constexpr std::uint32_t kIvfVersion2 = 2;     // S32-M3.5-②:+1-bit 码区
 constexpr std::uint32_t kFlagBits    = 1u;    // flags bit0 = bits 区存在
 
-bool pwrite_all(int fd, const void* buf, std::size_t len, std::uint64_t off) {
-    const auto* p = static_cast<const std::uint8_t*>(buf);
-    while (len > 0) {
-        const ssize_t w = ::pwrite(fd, p, len, static_cast<off_t>(off));
-        if (w <= 0) return false;
-        p   += w;
-        off += static_cast<std::uint64_t>(w);
-        len -= static_cast<std::size_t>(w);
-    }
-    return true;
-}
-
-// f32 内积（编译器自动向量化；质心暴扫用——nlist 有限，非热点瓶颈）。
-inline float dot_f32(const float* a, const float* b, std::size_t dim) {
-    float acc = 0.0f;
-    for (std::size_t d = 0; d < dim; ++d) acc += a[d] * b[d];
-    return acc;
-}
-
-// 并行 for：[0, n) 均匀分片到 hardware_concurrency 线程。
-template <typename Fn>
-void parallel_for(std::size_t n, Fn&& fn) {
-    const std::size_t nt = std::min<std::size_t>(
-        std::max<std::size_t>(1, std::thread::hardware_concurrency()),
-        n == 0 ? 1 : n);
-    if (nt <= 1) {
-        for (std::size_t i = 0; i < n; ++i) fn(i);
-        return;
-    }
-    std::atomic<std::size_t> next{0};
-    constexpr std::size_t kBatch = 256;
-    std::vector<std::thread> pool;
-    pool.reserve(nt);
-    for (std::size_t t = 0; t < nt; ++t) {
-        pool.emplace_back([&]() {
-            for (;;) {
-                const std::size_t b = next.fetch_add(kBatch);
-                if (b >= n) return;
-                const std::size_t e = std::min(n, b + kBatch);
-                for (std::size_t i = b; i < e; ++i) fn(i);
-            }
-        });
-    }
-    for (auto& th : pool) th.join();
-}
-
-// S32-M3.5-②:1-bit sign 编码（bit j = v[j] >= 0）+ μ = mean|v|。
-// 尾部补零位（两侧同 pad → XOR 后为 0,不扰 hamming）。
-inline void sign_encode(const float* v, std::size_t dim, std::uint8_t* out,
-                        float* mu) {
-    const std::size_t nbytes = (dim + 7) / 8;
-    std::memset(out, 0, nbytes);
-    double asum = 0.0;
-    for (std::size_t j = 0; j < dim; ++j) {
-        asum += std::fabs(static_cast<double>(v[j]));
-        if (v[j] >= 0.0f) out[j >> 3] |= static_cast<std::uint8_t>(1u << (j & 7));
-    }
-    *mu = static_cast<float>(asum / static_cast<double>(dim));
-}
-
-inline std::uint32_t hamming_bytes(const std::uint8_t* a,
-                                   const std::uint8_t* b,
-                                   std::size_t nbytes) {
-    std::uint32_t h = 0;
-    std::size_t i = 0;
-    for (; i + 8 <= nbytes; i += 8) {
-        std::uint64_t x, y;
-        std::memcpy(&x, a + i, 8);
-        std::memcpy(&y, b + i, 8);
-        h += static_cast<std::uint32_t>(__builtin_popcountll(x ^ y));
-    }
-    for (; i < nbytes; ++i) {
-        h += static_cast<std::uint32_t>(
-            __builtin_popcount(static_cast<unsigned>(a[i] ^ b[i])));
-    }
-    return h;
-}
+using diskint::pwrite_all;
+using diskint::dot_f32;
+using diskint::parallel_for;
+using diskint::sign_encode;
+using diskint::hamming_bytes;
 
 // S32-M3.5-③:两级质心分组参数。nlist < 64 不分组（组区仅 nc2=0 标记）。
 constexpr std::uint32_t kGroupMinNlist = 64;
