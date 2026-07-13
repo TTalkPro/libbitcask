@@ -309,6 +309,11 @@ RAM   质心表（nlist × dim int8 + f32 norm；SIMD 暴扫 <1ms @ nlist≤64k�
 - **关键决策：精排 int8 码内联在 posting**（磁盘 +13%），换精排零随机 IO
   （否则每查询 100-200 次 `read_at` 随机读，顺序 IO 优势尽失）。int8 精排
   召回 ~97%+（§6 harness 同型数据）；
+- **落地勘误（2026-07-13，S32-M3 v1）**：实现为 int8 码字单遍扫（粗筛 =
+  精排一遍过），RaBitQ 1-bit 码区在 BIV1 格式留位（flags bit0）未启用——
+  是否引入由召回 harness 出数决定（TASK.md M3.5）。v1 磁盘 = N×(dim+16)；
+  基线发现：紧簇合成语料的簇内边际低于 int8 噪声底，跨引擎召回对账需
+  harness 语料 v2（M3.5-①）；
 - **查询**：质心暴扫 top-nprobe(16-64) → 顺序读 nprobe 段（100M/40k≈2.5k
   条/簇 ×~150B ≈ 400KB/段）→ RaBitQ popcount 粗筛 → 段内 int8 精排 →
   delta 窗口归并 → live 过滤。p99 ≈ 10-30ms；
