@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <bitcask/hnsw.hpp>
+#include <bitcask/diskann.hpp>  // S32-M5:DiskANN 召回三元组
 #include <bitcask/ivf_rq.hpp>  // S32-M3:IVF 召回三元组
 
 #include "ann_recall_harness.hpp"  // S32-M0c:召回三元组基建
@@ -332,6 +333,97 @@ static void BM_Ivf_RecallQps(benchmark::State& state) {
     state.counters["build_docs_per_s"] = slot.second;
     state.counters["nlist"] = seg.nlist();
 }
+// ---------------------------------------------------------------------------
+// S32-M5:DiskANN 段召回三元组——与 HNSW/IVF 同语料同真值。Args = {规模, L}。
+// ---------------------------------------------------------------------------
+static void BM_Diskann_RecallQps(benchmark::State& state) {
+    namespace ba = bitcask::bench_ann;
+    using bitcask::vec::DiskannSegment;
+    using bitcask::vec::IvfBuildSource;
+    const auto n = static_cast<std::size_t>(state.range(0));
+    const auto L = static_cast<std::uint32_t>(state.range(1));
+    constexpr std::size_t kNq = 500;
+
+    const ba::TruthParams tp = ba::default_truth_params(n, kDim, kNq);
+    static std::map<std::size_t, std::vector<float>> base_cache;
+    auto& base = base_cache[n];
+    if (base.empty()) {
+        base = ba::make_corpus(n, kDim, tp.nc, tp.sigma, tp.base_seed,
+                               tp.center_seed);
+    }
+    static std::map<std::size_t, std::vector<float>> query_cache;
+    auto& queries = query_cache[n];
+    if (queries.empty()) {
+        queries = ba::make_corpus(kNq, kDim, tp.nc, tp.sigma, tp.query_seed,
+                                  tp.center_seed);
+    }
+    const auto gt = ba::load_or_build_truth(
+        tp, std::span<const float>(base), std::span<const float>(queries));
+    ba::TruthParams tp_i8 = tp;
+    tp_i8.int8_scored = true;
+    const auto gt_i8 = ba::load_or_build_truth(
+        tp_i8, std::span<const float>(base), std::span<const float>(queries));
+
+    static std::map<std::size_t,
+                    std::pair<std::unique_ptr<DiskannSegment>, double>>
+        segs;
+    auto& slot = segs[n];
+    if (!slot.first) {
+        const std::string path =
+            "/tmp/bitcask_bench_diskann_" + std::to_string(n) + ".bda";
+        IvfBuildSource src;
+        src.count = static_cast<std::uint32_t>(n);
+        src.get = [&](std::uint32_t i, std::uint64_t& ord,
+                      const float*& vec) {
+            ord = i;
+            vec = base.data() + static_cast<std::size_t>(i) * kDim;
+        };
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!DiskannSegment::build(path, kDim, src, 0, 0, 1)) {
+            state.SkipWithError("diskann build failed");
+            return;
+        }
+        const std::chrono::duration<double> dt =
+            std::chrono::steady_clock::now() - t0;
+        slot.first = std::make_unique<DiskannSegment>();
+        if (!slot.first->open(path, kDim, 1)) {
+            state.SkipWithError("diskann open failed");
+            return;
+        }
+        slot.second = static_cast<double>(n) / dt.count();
+    }
+    const DiskannSegment& seg = *slot.first;
+
+    std::size_t qi = 0;
+    for (auto _ : state) {
+        auto hits = seg.search(
+            std::span<const float>(&queries[(qi++ % kNq) * kDim], kDim), 10,
+            L);
+        benchmark::DoNotOptimize(hits);
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()));
+
+    auto run_k = [&](const ba::GroundTruth& g2, std::size_t k) {
+        return ba::recall_at(g2, k, [&](std::size_t q) {
+            auto hs = seg.search(
+                std::span<const float>(&queries[q * kDim], kDim), k, L);
+            std::vector<std::uint64_t> ords;
+            ords.reserve(hs.size());
+            for (const auto& h : hs) ords.push_back(h.ord);
+            return ords;
+        });
+    };
+    state.counters["recall@10"]    = run_k(gt, 10);
+    state.counters["recall@100"]   = run_k(gt, 100);
+    state.counters["recall@10_i8"] = run_k(gt_i8, 10);
+    state.counters["build_docs_per_s"] = slot.second;
+}
+BENCHMARK(BM_Diskann_RecallQps)
+    ->Args({100000, 32})
+    ->Args({100000, 64})
+    ->Args({100000, 128})
+    ->Unit(benchmark::kMicrosecond);
+
 BENCHMARK(BM_Ivf_RecallQps)
     ->Args({100000, 8})
     ->Args({100000, 16})
