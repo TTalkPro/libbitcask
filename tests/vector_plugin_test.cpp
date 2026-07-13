@@ -131,6 +131,121 @@ TEST(VectorPlugin, InsertFlushOpenRoundTrip) {
     fs::remove_all(dir);
 }
 
+// S32-M1：base rebase 窗口门——自 base 以来入图向量数达 rebase_min_docs
+// 即在下次 flush 强制 base（链坍缩，next_seq 回 1）；未达阈值走 delta；
+// 阈值 0 = 关（对照：恒 delta，仅链长门）。
+TEST(VectorPlugin, RebaseMinDocsWindowTriggersBase) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_vecplugin_win";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    FakeDocTable dt;
+    auto cfg = make_cfg(4, meta::VectorMetric::kDot);
+    cfg.rebase_min_docs = 4;
+    vec::VectorPlugin p(cfg, dt);
+    plugin::OpenContext ctx;
+    const std::string dir_s = dir.string();
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
+
+    const float v[4] = {1, 0, 0, 0};
+    plugin::FlushRequest req;
+
+    // 首次 flush：fresh open（无已提交状态）→ 必 base，窗口归零。
+    p.insert(0, {v, 4});
+    p.insert(1, {v, 4});
+    req.watermark = 2;
+    ASSERT_EQ(p.flush(req).status, plugin::PluginStatus::kOk);
+    EXPECT_EQ(p.chain_state().next_seq, 1u);  // base：链坍缩
+
+    // 窗口 2 < 4：delta。
+    p.insert(2, {v, 4});
+    p.insert(3, {v, 4});
+    req.watermark = 4;
+    ASSERT_EQ(p.flush(req).status, plugin::PluginStatus::kOk);
+    EXPECT_EQ(p.chain_state().next_seq, 2u);  // delta：.d1 入链
+    EXPECT_TRUE(fs::exists(dir / "vec.ckpt.d1"));
+
+    // 窗口 2+2 = 4 ≥ 4：强制 base（非 force、非 rebuild、链远未满）。
+    p.insert(4, {v, 4});
+    p.insert(5, {v, 4});
+    req.watermark = 6;
+    ASSERT_EQ(p.flush(req).status, plugin::PluginStatus::kOk);
+    EXPECT_EQ(p.chain_state().next_seq, 1u);   // base：链再坍缩
+    EXPECT_FALSE(fs::exists(dir / "vec.ckpt.d1"));  // .d 链已回收
+
+    // 对照：阈值 0 = 关，同节奏恒 delta。
+    const fs::path dir0 = fs::temp_directory_path() / "bitcask_vecplugin_win0";
+    fs::remove_all(dir0);
+    fs::create_directories(dir0);
+    auto cfg0 = make_cfg(4, meta::VectorMetric::kDot);
+    cfg0.rebase_min_docs = 0;
+    vec::VectorPlugin q(cfg0, dt);
+    plugin::OpenContext c0;
+    const std::string dir0_s = dir0.string();
+    c0.dir = dir0_s;
+    ASSERT_EQ(q.open(c0), plugin::PluginStatus::kOk);
+    q.insert(0, {v, 4});
+    req.watermark = 1;
+    ASSERT_EQ(q.flush(req).status, plugin::PluginStatus::kOk);  // 首次 base
+    for (std::uint64_t i = 1; i <= 8; ++i) {
+        q.insert(i, {v, 4});
+        req.watermark = i + 1;
+        ASSERT_EQ(q.flush(req).status, plugin::PluginStatus::kOk);
+    }
+    EXPECT_EQ(q.chain_state().next_seq, 9u);  // 8 个 delta，无窗口收链
+
+    fs::remove_all(dir);
+    fs::remove_all(dir0);
+}
+
+// S32-M1：重开后链重放计入窗口——恢复即"欠账"可见，无需新写入即可在
+// 下次 flush 收链（崩溃恢复窗口有界的另一半保证）。
+TEST(VectorPlugin, RebaseWindowSurvivesReopen) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_vecplugin_wrr";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    FakeDocTable dt;
+    auto cfg = make_cfg(4, meta::VectorMetric::kDot);
+    cfg.rebase_min_docs = 100;  // a 写入期间不触发
+    vec::VectorPlugin a(cfg, dt);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+
+    const float v[4] = {0, 1, 0, 0};
+    plugin::FlushRequest req;
+    a.insert(0, {v, 4});
+    req.watermark = 1;
+    ASSERT_EQ(a.flush(req).status, plugin::PluginStatus::kOk);  // base
+    a.insert(1, {v, 4});
+    a.insert(2, {v, 4});
+    req.watermark = 3;
+    ASSERT_EQ(a.flush(req).status, plugin::PluginStatus::kOk);  // delta(2 条)
+    const auto st = a.chain_state();
+    ASSERT_EQ(st.next_seq, 2u);
+
+    // b 以更小阈值重开：链重放 2 条 ≥ 2 → 无新写入，下次 flush 即收链。
+    auto cfg_b = make_cfg(4, meta::VectorMetric::kDot);
+    cfg_b.rebase_min_docs = 2;
+    vec::VectorPlugin b(cfg_b, dt);
+    plugin::OpenContext c2;
+    c2.dir = dir_s;
+    c2.committed_base_watermark = st.base_gen;
+    c2.committed_chain_watermark = st.chain_wm;
+    c2.committed_chain_seq = st.next_seq - 1;
+    ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+    EXPECT_EQ(b.size(), 3u);
+    req.watermark = 3;
+    ASSERT_EQ(b.flush(req).status, plugin::PluginStatus::kOk);
+    EXPECT_EQ(b.chain_state().next_seq, 1u);   // 重放欠账触发 base
+    EXPECT_FALSE(fs::exists(dir / "vec.ckpt.d1"));  // 链已回收
+
+    fs::remove_all(dir);
+}
+
 // 重放幂等：同 ord 重插被水位门丢弃（fold 重叠区安全的结构基础）。
 TEST(VectorPlugin, ReplayInsertIdempotent) {
     FakeDocTable dt;

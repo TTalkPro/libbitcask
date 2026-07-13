@@ -183,7 +183,10 @@ void VectorPlugin::insert(std::uint64_t ord, std::span<const float> v) {
         delta_ords_.push_back(ord);
         delta_data_.insert(delta_data_.end(), v.begin(), v.end());
     }
+    // S32-M1：按图节点数增量计入 base 窗口（幂等门丢弃的重放不计）。
+    const std::size_t before = hnsw->size();
     hnsw->insert(ord, v);
+    vec_docs_since_base_ += hnsw->size() - before;
 }
 
 std::expected<std::vector<search::SearchHit>, search::SearchError>
@@ -278,6 +281,9 @@ bool VectorPlugin::apply_delta_log(std::span<const std::byte> payload) {
     auto hnsw = hnsw_.load(std::memory_order_acquire);
     const std::size_t vb = static_cast<std::size_t>(dim) * sizeof(float);
     std::vector<float> v(dim);
+    // S32-M1：链重放同样计入 base 窗口——重放条数就是崩溃恢复的重建图
+    // 代价，载入后窗口已"欠账"多少一目了然（继续写入会尽早触发 base）。
+    const std::size_t before = hnsw ? hnsw->size() : 0;
     for (std::uint64_t i = 0; i < cnt; ++i) {
         if (end - p < static_cast<std::ptrdiff_t>(8 + vb)) {
             return false;
@@ -291,6 +297,7 @@ bool VectorPlugin::apply_delta_log(std::span<const std::byte> payload) {
             hnsw->insert(ord, std::span<const float>(v.data(), dim));
         }
     }
+    if (hnsw) vec_docs_since_base_ += hnsw->size() - before;
     return p == end;
 }
 
@@ -515,9 +522,13 @@ plugin::FlushResult VectorPlugin::flush(const plugin::FlushRequest& req) {
     plugin::FlushResult res;
     const bool cap_hit = config_.max_delta_chain > 0 &&
                          chain_.next_seq > config_.max_delta_chain;
+    // S32-M1：窗口门——自 base 以来入图向量数达阈值即收链（恢复链重放 =
+    // 重新建图，仅靠链长门最坏重放 max_delta_chain × auto 阈值条）。
+    const bool window_hit = config_.rebase_min_docs > 0 &&
+                            vec_docs_since_base_ >= config_.rebase_min_docs;
     const bool want_base = req.force_rebase ||
                            rebase_needed_.load(std::memory_order_relaxed) ||
-                           cap_hit;
+                           cap_hit || window_hit;
     if (want_base) {
         const bool ok = save_component_base(dir_, req.watermark);
         if (config_.dim == 0) {
@@ -527,6 +538,7 @@ plugin::FlushResult VectorPlugin::flush(const plugin::FlushRequest& req) {
             res.covered_ord = chain_.chain_wm;
         } else if (ok) {
             rebase_needed_.store(false, std::memory_order_relaxed);
+            vec_docs_since_base_ = 0;  // S32-M1：窗口自 base 重新起算
             res.covered_ord = req.watermark;
         } else {
             res.status = plugin::PluginStatus::kFailed;

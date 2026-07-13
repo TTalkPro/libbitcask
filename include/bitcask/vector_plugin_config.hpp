@@ -23,6 +23,11 @@ struct VectorPluginConfig {
     bool               inmem_int8 = false;                    // P5b
     // S18-6（S14-5 语义每插件化）：delta 链长上限。0 = 不设限。
     std::uint32_t      max_delta_chain = 64;
+    // S32-M1：base rebase 的窗口门槛——自上次 base 以来**实际入图向量数**
+    // 达此值即在下次 flush 强制全量 base（与链长上限双门槛取或）。计数
+    // = 崩溃恢复链重放的直接代价（重放即重新建图），纯 KV 写不误触发。
+    // 0 = 关（退回仅链长门，恢复窗口最坏 max_delta_chain × auto 阈值）。
+    std::uint32_t      rebase_min_docs = 262144;
 };
 
 }  // namespace bitcask::vec

@@ -183,6 +183,11 @@ private:
     std::uint64_t delta_window_wm_ = 0;
     std::vector<std::uint64_t> delta_ords_;
     std::vector<float>         delta_data_;
+    // S32-M1：自上次成功 base 以来实际入图的向量数（insert 与链重放均按
+    // 图节点数增量计——hnsw 水位幂等门丢弃的重放不计）。达
+    // config_.rebase_min_docs 时 flush 强制 base（与链长上限双门槛），
+    // 恢复链重放窗口有界。单写者上下文访问（同 delta_ords_）。
+    std::uint64_t vec_docs_since_base_ = 0;
     ChainState chain_{};
     // S18-6：flush/open 自治状态。
     std::string dir_;

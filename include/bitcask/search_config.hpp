@@ -70,6 +70,14 @@ struct SearchLayerConfig {
     // 永不回收（向量库尤甚：每 delta 内联 f32 向量）。权衡：小 → base 重序列化更
     // 频繁（∝ 索引总量）；大 → 崩溃恢复重放更长、磁盘冗余更多。0 = 不设限（不建议）。
     std::uint32_t max_delta_chain = 64;
+    // S32-M1：向量组件 base rebase 的窗口门槛（设计
+    // doc/vector-dual-engine-selection-zh.md §6.2）。向量链重放 = 重新建图
+    // （每条一次 ef_construction 搜索），仅靠链长门最坏重放
+    // max_delta_chain × auto_checkpoint 阈值 ≈ 4.2M 条（小时级）。本值按
+    // 「自 base 以来实际入图向量数」设第二道门，恢复重放窗口恒
+    // ≤ 本值 + auto 阈值。base 成本已被 S14-2/S14-8 追加摊薄（全量重写仅
+    // BVH2 header ≈165B/节点）。0 = 关。
+    std::uint32_t vector_rebase_min_docs = 262144;
 
     // S27-4 P2:文本插件 builder 线程数。0 = 内联(历史行为,默认);>=1 =
     // DWPT 并行 builder。语义详见 text_plugin_config.hpp。
@@ -94,7 +102,7 @@ struct SearchLayerConfig {
     }
     [[nodiscard]] vec::VectorPluginConfig vector_config() const {
         return {vector_dim, vector_metric, hnsw_m, hnsw_ef_construction,
-                vector_inmem_int8, max_delta_chain};
+                vector_inmem_int8, max_delta_chain, vector_rebase_min_docs};
     }
 };
 
