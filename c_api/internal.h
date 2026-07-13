@@ -133,6 +133,15 @@ inline void set_oom_fault(bitcask_fault_t* fault) {
     snprintf(fault->detail, BITCASK_DETAIL_MAX, "out of memory");
 }
 
+inline meta::VectorEngine to_cpp_vector_engine(bitcask_vector_engine_t e) {
+    switch (e) {
+        case BITCASK_VECTOR_ENGINE_HNSW:    return meta::VectorEngine::kHnsw;
+        case BITCASK_VECTOR_ENGINE_IVFRQ:   return meta::VectorEngine::kIvfRq;
+        case BITCASK_VECTOR_ENGINE_DISKANN: return meta::VectorEngine::kDiskann;
+    }
+    return meta::VectorEngine::kHnsw;
+}
+
 inline meta::VectorMetric to_cpp_vector_metric(bitcask_vector_metric_t m) {
     switch (m) {
         case BITCASK_VECTOR_METRIC_NONE:    return meta::VectorMetric::kNone;

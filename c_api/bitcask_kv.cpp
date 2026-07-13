@@ -38,8 +38,14 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts) {
     opts->vector_metric = BITCASK_VECTOR_METRIC_NONE;
     opts->vector_quantized = 0;
     opts->vector_inmem_int8 = 0;
+    opts->vector_engine = BITCASK_VECTOR_ENGINE_HNSW;  // S32：默认 HNSW
     opts->hnsw_m = 0;                 // S13-D11：0 = HnswConfig 默认
     opts->hnsw_ef_construction = 0;
+    opts->vector_rebase_min_docs = 262144;  // S32-M1：恢复窗口默认 256K
+    opts->vector_ivf_nlist = 0;             // S32-M3：0 = 自动
+    opts->vector_ivf_nprobe = 0;
+    opts->vector_diskann_r = 0;             // S32-M5：0 = 自动
+    opts->vector_diskann_l_build = 0;
     opts->log_fn = NULL;              // S13-D7：默认不上报
     opts->log_ctx = NULL;
 }
@@ -67,6 +73,7 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
         cpp_opts.vector_metric = to_cpp_vector_metric(opts->vector_metric);
         cpp_opts.vector_quantized = opts->vector_quantized != 0;
         cpp_opts.vector_inmem_int8 = opts->vector_inmem_int8 != 0;
+        cpp_opts.vector_engine = to_cpp_vector_engine(opts->vector_engine);
         // S13-D7：C 函数指针 + ctx 包成 std::function（open-time 不可变）。
         if (opts->log_fn) {
             cpp_opts.log_fn =
@@ -88,6 +95,12 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
             search_cfg.analyzer_config.enable_stemming = opts->enable_stemming != 0;
             search_cfg.hnsw_m = opts->hnsw_m;                              // S13-D11
             search_cfg.hnsw_ef_construction = opts->hnsw_ef_construction;  // S13-D11
+            // S32：向量引擎调优透传（0 = 各自动默认）。
+            search_cfg.vector_rebase_min_docs = opts->vector_rebase_min_docs;
+            search_cfg.vector_ivf_nlist = opts->vector_ivf_nlist;
+            search_cfg.vector_ivf_nprobe = opts->vector_ivf_nprobe;
+            search_cfg.vector_diskann_r = opts->vector_diskann_r;
+            search_cfg.vector_diskann_l_build = opts->vector_diskann_l_build;
             if (opts->jieba_dict_path) {
                 search_cfg.analyzer_config.dict_path = opts->jieba_dict_path;
             }

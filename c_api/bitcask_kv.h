@@ -107,6 +107,15 @@ typedef enum {
     BITCASK_VECTOR_METRIC_DOT     = 3,  // 内积
 } bitcask_vector_metric_t;
 
+/* S32-M0/M3/M5：向量引擎（对应 bitcask::meta::VectorEngine）。建库时一次性
+   选定并持久化进 bitcask.meta；重开不一致 → BITCASK_ERR_MODE_MISMATCH。
+   运行期不可切换——唯一切换路径是离线工具 vec_engine_migrate。 */
+typedef enum {
+    BITCASK_VECTOR_ENGINE_HNSW    = 0,  /* 内存图（默认；≤2-4M 向量、µs 级延迟） */
+    BITCASK_VECTOR_ENGINE_IVFRQ   = 1,  /* IVF 磁盘段（磁盘档推荐；10M-100M） */
+    BITCASK_VECTOR_ENGINE_DISKANN = 2,  /* DiskANN（实验性——真实语料验证前不建议生产） */
+} bitcask_vector_engine_t;
+
 // 打开选项（对应 bitcask::CaskOptions + search config 扁平化）
 // 用 bitcask_options_init() 初始化为默认值，再按需修改字段
 typedef struct {
@@ -140,12 +149,27 @@ typedef struct {
     uint16_t  vector_dim;        // 向量维度（0 = 无向量）
     bitcask_vector_metric_t vector_metric;
     int       vector_quantized;  // 落盘 int8 量化
-    int       vector_inmem_int8; // HNSW int8-only 内存模式
+    int       vector_inmem_int8; // HNSW int8-only 内存模式（仅 hnsw 引擎）
+    /* S32：向量引擎选择（默认 HNSW；磁盘档引擎要求 COSINE/DOT 度量，
+       L2 组合返回 BITCASK_ERR_INVALID_OPTION）。 */
+    bitcask_vector_engine_t vector_engine;
 
     /* S13-D11：HNSW 建图参数（0 = 默认：M=16 / ef_construction=200）。
        仅影响新插入与 merge 期重建出的图。 */
     uint32_t  hnsw_m;
     uint32_t  hnsw_ef_construction;
+
+    /* S32-M1：向量组件 base rebase 窗口门槛（崩溃恢复重放上界；全引擎）。
+       0 = 关（仅链长门）；不设默认 262144。 */
+    uint32_t  vector_rebase_min_docs;
+    /* S32-M3：IVF 引擎参数（engine=IVFRQ 时生效；0 = 自动：
+       nlist = 4·√N，nprobe = max(nlist/32, 8)）。 */
+    uint32_t  vector_ivf_nlist;
+    uint32_t  vector_ivf_nprobe;
+    /* S32-M5：DiskANN 引擎参数（engine=DISKANN 时生效；0 = 自动：
+       r = 32，l_build = max(64, 2r)）。 */
+    uint32_t  vector_diskann_r;
+    uint32_t  vector_diskann_l_build;
 
     /* S13-D7：日志回调（open-time 不可变）。库内 best-effort 静默失败点
        （checkpoint 保存失败、索引 worker 异常、merge 收尾异常等）经此上报。

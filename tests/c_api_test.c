@@ -197,6 +197,83 @@ static int test_search_text_batch(void) {
     return 0;
 }
 
+/* S32：C API 向量引擎选择——IVFRQ 建库/写查/重开一致性/引擎不符拒开。 */
+static int test_vector_engine_ivfrq(void) {
+    const char* dir = "/tmp/bitcask_c_test_veng";
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    (void)system(cmd);
+
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.enable_search = 1;
+    opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+    opts.vector_dim = 4;
+    opts.vector_metric = BITCASK_VECTOR_METRIC_COSINE;
+    opts.vector_engine = BITCASK_VECTOR_ENGINE_IVFRQ;  /* S32 */
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    bitcask_error_t err = bitcask_open(dir, &opts, &cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_vector_engine_ivfrq: open: %s\n",
+                fault.detail);
+        return 1;
+    }
+    float vecs[3][4] = {{1, 0.1f, 0, 0}, {0, 1, 0.1f, 0}, {0, 0.1f, 1, 0}};
+    const char* keys[3] = {"e0", "e1", "e2"};
+    const char* texts[3] = {"one", "two", "three"};
+    for (int i = 0; i < 3; i++) {
+        bitcask_doc_input_t doc;
+        memset(&doc, 0, sizeof(doc));
+        doc.text.data = texts[i];
+        doc.text.size = strlen(texts[i]);
+        doc.vector = vecs[i];
+        doc.vector_len = 4;
+        bitcask_slice_t key = {keys[i], strlen(keys[i])};
+        err = bitcask_put_doc(cask, key, &doc, 0, &fault);
+        assert(err == BITCASK_OK);
+    }
+    bitcask_flush_index(cask);
+    {
+        bitcask_search_result_t* res = NULL;
+        err = bitcask_search_vector(cask, vecs[1], 4, 1, 0, &res, &fault);
+        assert(err == BITCASK_OK && res && res->count >= 1);
+        assert(strcmp(res->hits[0].key, "e1") == 0);
+        bitcask_search_result_free(res);
+    }
+    bitcask_close(cask);
+
+    /* 引擎不符（默认 HNSW）重开 → MODE_MISMATCH（meta 持久化生效）。 */
+    {
+        bitcask_options_t bad = opts;
+        bad.vector_engine = BITCASK_VECTOR_ENGINE_HNSW;
+        bitcask_t* c2 = NULL;
+        err = bitcask_open(dir, &bad, &c2, &fault);
+        if (err != BITCASK_ERR_MODE_MISMATCH) {
+            fprintf(stderr,
+                    "FAIL test_vector_engine_ivfrq: mismatch err=%d\n", err);
+            if (c2) bitcask_close(c2);
+            return 1;
+        }
+    }
+    /* 一致引擎重开 → 组件恢复 + 检索可用。 */
+    {
+        bitcask_t* c2 = NULL;
+        err = bitcask_open(dir, &opts, &c2, &fault);
+        assert(err == BITCASK_OK);
+        bitcask_search_result_t* res = NULL;
+        err = bitcask_search_vector(c2, vecs[2], 4, 1, 0, &res, &fault);
+        assert(err == BITCASK_OK && res && res->count >= 1);
+        assert(strcmp(res->hits[0].key, "e2") == 0);
+        bitcask_search_result_free(res);
+        bitcask_close(c2);
+    }
+    printf("PASS test_vector_engine_ivfrq\n");
+    return 0;
+}
+
 static int test_search_vector_hybrid_batch(void) {
     bitcask_options_t opts;
     bitcask_options_init(&opts);
@@ -541,6 +618,7 @@ int main(void) {
     failures += test_iteration();
     failures += test_search_text_batch();
     failures += test_search_vector_hybrid_batch();
+    failures += test_vector_engine_ivfrq();
     failures += test_parallel_scan();
     failures += test_put_batch();
     failures += test_status_ex_and_log();
