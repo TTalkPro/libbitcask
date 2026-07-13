@@ -4164,9 +4164,17 @@ S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同�
   counter,两引擎公平对账);② RaBitQ 1-bit 粗筛层(format 位已留)——
   由 v2 语料出数决定;③ IVF build 全量 assign O(N·nlist·dim) 加速
   (质心图/层次分配,1M+ 时)。RaBitQ popcount 内核供 HNSW P2 同此项。
-- [ ] **M4 转换工具** `tools/vec_engine_migrate`(依赖 M3;设计 §6.4):
-  data file 为权威、离线重建目标索引 + meta 原子切换;→hnsw 方向按
-  N×D 内存预检。
+- [x] **M4 转换工具已完成(2026-07-13)** `tools/vec_engine_migrate`:
+  · **实现比设计更简**:核心属性 = data file 是向量权威 → 工具只改
+  meta.vector_engine,目标引擎组件缺失由**首次 open 全量 fold 重建**
+  (无需离线建索引/无内存预检——重建走既有恢复机制,窗口内存有界)。
+  旧引擎组件默认保留(回滚 = 反向再跑一次;新旧水位差由恢复自愈),
+  --purge-old 释放磁盘;write.lock 排他防在线并跑;--dry-run 出计划。
+  · 验收:属性测试 S32M4EngineSwitchViaMetaRebuild(hnsw→ivfrq→hnsw
+  双向 + 删除保持 + 过期旧组件自愈)+ 工具 CLI 冒烟(dry-run/switch/
+  no-op/rollback+purge/bad-args/锁自动释放)——gcc 全量 **630/630**;
+  build-rel(含工具)过。设计 §6.4 的「→hnsw 按 N×D 预检」不再需要
+  (fold 重建的 HNSW 内存与正常 open 相同,非离线全图峰值)。
 - [ ] **M5(条件触发)DiskannPlugin**:「p99<10ms 且 ≥95% 召回 @50M+」
   硬指标出现才立项(设计 §5.2/§7)。
 - ⚠️ 风险挂账:100M 档 keydir 自身 5-8G(50-80B/key)撑爆预算——KV 层
