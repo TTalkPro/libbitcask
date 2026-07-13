@@ -4181,9 +4181,22 @@ S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同�
   - **新发现(数据驱动)**:两段扫后**质心暴扫成为新瓶颈**(nlist×dim×4B
     ≈1.9MB/查询,nprobe=8 档 195µs 几乎全是它);10M×1024d 投影质心区
     51MB > posting 扫描量——③ 升格为「质心侧整体优化」。
-- [ ] **M3.5-③(升格)质心侧优化 + assign 加速**:质心 int8 量化
-  (4× 字节 + VNNI,复用现有内核)或分层质心(粗→细);build 全量
-  assign O(N·nlist·dim) 同根同治。10M 档的真正前置。
+- [x] **M3.5-③ 已完成(2026-07-13)两级质心索引（查询 + assign 同治）**:
+  · BIV v2 组区(cidx 后,自描述:nc2 | CSR group_off/members | gcent;
+  nlist < 64 不分组 nc2=0;ver=1 文件无组区,位级兼容);质心再聚
+  nc2=2√nlist 组(小 k-means ×4 迭代);查询质心选择 O(nlist·dim) →
+  O((nc2 + G·组均)·dim),G = 覆盖 top-nprobe 的 2× 冗余;
+  **nprobe ≥ nlist 走全簇捷径**(免排序,穷举对拍精确性保留);build
+  全量 assign 同结构两级路由(亚优落簇无正确性影响,查询多簇冗余兜)。
+  · **实测(100k/384d,三项优化累计 vs M3 v1)**:nprobe=8 查询
+  203→**36.5µs(5.6×)**,QPS 27.6k(已超 HNSW ef64 的 21.8k);
+  nprobe=64 308→74.7µs(4.1×);召回损失 ≤0.08pt(recall@10_i8
+  0.9992@np8,1.000@np32+);build 8.06k docs/s(+27%)。
+  · 验收:组路径全 probe 穷举对拍 + 两级路由召回门 ≥0.9 + 组区
+  CSR/长度严格校验拒载——gcc 全量 **631/631**;ASan IVF 子集 8/8;
+  build-rel 过。
+  · 后续候选(非挂账):质心/组心 int8 化(再 4× 字节,VNNI 机收益);
+  10M 档实测验证投影。
 - [ ] M0b DeltaLog 抽取(VectorPlugin/IvfPlugin 插入日志三处重复
   ~70 行,纯重构,随下批清理做)。
 - [x] **M4 转换工具已完成(2026-07-13)** `tools/vec_engine_migrate`:
