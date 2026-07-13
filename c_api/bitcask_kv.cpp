@@ -41,6 +41,7 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts) {
     opts->vector_engine = BITCASK_VECTOR_ENGINE_HNSW;  // S32：默认 HNSW
     opts->hnsw_m = 0;                 // S13-D11：0 = HnswConfig 默认
     opts->hnsw_ef_construction = 0;
+    opts->hnsw_build_nav_int8 = 1;    // S29-11-②：默认开
     opts->vector_rebase_min_docs = 262144;  // S32-M1：恢复窗口默认 256K
     opts->vector_ivf_nlist = 0;             // S32-M3：0 = 自动
     opts->vector_ivf_nprobe = 0;
@@ -95,6 +96,7 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
             search_cfg.analyzer_config.enable_stemming = opts->enable_stemming != 0;
             search_cfg.hnsw_m = opts->hnsw_m;                              // S13-D11
             search_cfg.hnsw_ef_construction = opts->hnsw_ef_construction;  // S13-D11
+            search_cfg.hnsw_build_nav_int8 = opts->hnsw_build_nav_int8 != 0;  // S29-11-②
             // S32：向量引擎调优透传（0 = 各自动默认）。
             search_cfg.vector_rebase_min_docs = opts->vector_rebase_min_docs;
             search_cfg.vector_ivf_nlist = opts->vector_ivf_nlist;

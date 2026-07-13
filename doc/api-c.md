@@ -281,6 +281,7 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts);
 |------|------|------|------|
 | `hnsw_m`              | `uint32_t` | `0` | `M`（`0`=默认 16）|
 | `hnsw_ef_construction` | `uint32_t` | `0` | `ef_construction`（`0`=默认 200）|
+| `hnsw_build_nav_int8`  | `int`      | `1` | S29-11-②：建图导航 int8 混合精度（入选邻居 f32 精选，召回零损失实测；`0`=全 f32 回退闸）|
 
 **向量引擎调优（S32）**
 

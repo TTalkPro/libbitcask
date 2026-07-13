@@ -158,6 +158,10 @@ typedef struct {
        仅影响新插入与 merge 期重建出的图。 */
     uint32_t  hnsw_m;
     uint32_t  hnsw_ef_construction;
+    /* S29-11-②：HNSW 建图导航 int8 混合精度（默认 1 = 开；仅 COSINE/DOT +
+       int8 SIMD 内核可用时生效，入选邻居仍 f32 精选、召回零损失实测。
+       0 = 回退全 f32 导航（召回门逃生闸）。 */
+    int       hnsw_build_nav_int8;
 
     /* S32-M1：向量组件 base rebase 窗口门槛（崩溃恢复重放上界；全引擎）。
        0 = 关（仅链长门）；不设默认 262144。 */
