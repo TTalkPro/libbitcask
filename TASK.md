@@ -4254,5 +4254,12 @@ S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同�
   「实验性」标注的前置);③ 病态聚簇形态的 Vamana 适配研究(或文档化
   「该形态请选 ivfrq」的选型指引);④ beam 块读的 io_uring 并发(冷查询
   延迟)。
+- [x] **C API 补齐已完成(2026-07-13)**:`bitcask_vector_engine_t` 枚举
+  (HNSW/IVFRQ/DISKANN)+ `vector_engine` 字段 + S32 调优五字段
+  (rebase_min_docs/ivf_nlist/ivf_nprobe/diskann_r/diskann_l_build)
+  经 `bitcask_options_t` → SearchLayerConfig 全透传;api-c.md 同步
+  (含 ef 参数在磁盘引擎下的 nprobe/beam-L 语义注记)。验收:新 C 测
+  test_vector_engine_ivfrq(IVFRQ 建库/写查/引擎不符 MODE_MISMATCH/
+  一致重开)——C 套件全过;gcc 全量 **640/640**;build-rel 过。
 - ⚠️ 风险挂账:100M 档 keydir 自身 5-8G(50-80B/key)撑爆预算——KV 层
   独立大轴,若 100M 为认真目标须另行立项(设计 §6.1)。
