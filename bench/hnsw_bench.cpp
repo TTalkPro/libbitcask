@@ -5,6 +5,7 @@
 
 #include <benchmark/benchmark.h>
 
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -13,6 +14,8 @@
 #include <vector>
 
 #include <bitcask/hnsw.hpp>
+
+#include "ann_recall_harness.hpp"  // S32-M0c:召回三元组基建
 
 namespace {
 
@@ -131,3 +134,87 @@ BENCHMARK(BM_Hnsw_SearchConcurrent)
     ->Threads(8)
     ->Unit(benchmark::kMicrosecond)
     ->UseRealTime();
+
+// ---------------------------------------------------------------------------
+// S32-M0c:召回三元组基准（设计 vector-dual-engine-selection §7 M0;基建
+// bench/ann_recall_harness.hpp,真值缓存盘上、两引擎共用同一标尺）。
+// 输出:计时区 = 查询延迟/QPS(k=10);counters = recall@10/recall@100
+// (同 ef,查询集全量)+ build_docs_per_s(建图吞吐)。
+// 验收门:任何改动 recall@10 降幅 > 1pt 须显式声明并提供配置回退。
+// Args = {规模, ef}。跑法:--benchmark_filter='BM_Hnsw_RecallQps'。
+// ---------------------------------------------------------------------------
+static void BM_Hnsw_RecallQps(benchmark::State& state) {
+    namespace ba = bitcask::bench_ann;
+    const auto n  = static_cast<std::size_t>(state.range(0));
+    const auto ef = static_cast<std::size_t>(state.range(1));
+    constexpr std::size_t kNq = 500;
+
+    ba::TruthParams tp;
+    tp.n = n;
+    tp.dim = kDim;
+    tp.nq = kNq;
+    static std::map<std::size_t, std::vector<float>> base_cache;
+    auto& base = base_cache[n];
+    if (base.empty()) {
+        base = ba::make_corpus(n, kDim, tp.nc, tp.sigma, tp.base_seed,
+                               tp.center_seed);
+    }
+    // query 与 base 共享簇心（center_seed 同）、成员噪声独立——查询落在
+    // 簇附近才有可分的真近邻（真值边际健康,召回数字才有意义）。
+    static std::vector<float> queries;
+    if (queries.empty()) {
+        queries = ba::make_corpus(kNq, kDim, tp.nc, tp.sigma, tp.query_seed,
+                                  tp.center_seed);
+    }
+    const auto gt = ba::load_or_build_truth(
+        tp, std::span<const float>(base), std::span<const float>(queries));
+
+    // 图按规模缓存（与 shared_graph 独立:语料是聚簇合成,非其随机高斯）;
+    // 建图吞吐在首建时测取。
+    static std::map<std::size_t, std::pair<std::unique_ptr<HnswIndex>, double>>
+        graphs;
+    auto& slot = graphs[n];
+    if (!slot.first) {
+        slot.first = std::make_unique<HnswIndex>(bench_cfg());
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n; ++i) {
+            slot.first->insert(
+                i, std::span<const float>(&base[i * kDim], kDim));
+        }
+        const std::chrono::duration<double> dt =
+            std::chrono::steady_clock::now() - t0;
+        slot.second = static_cast<double>(n) / dt.count();
+    }
+    const HnswIndex& g = *slot.first;
+
+    // 计时区:k=10 查询轮转（QPS/延迟）。
+    std::size_t qi = 0;
+    for (auto _ : state) {
+        auto hits = g.search(
+            std::span<const float>(&queries[(qi++ % kNq) * kDim], kDim), 10,
+            ef);
+        benchmark::DoNotOptimize(hits);
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()));
+
+    // 召回（计时区外,同 ef 全查询集）。
+    auto run_k = [&](std::size_t k) {
+        return ba::recall_at(gt, k, [&](std::size_t q) {
+            auto hs = g.search(
+                std::span<const float>(&queries[q * kDim], kDim), k, ef);
+            std::vector<std::uint64_t> ords;
+            ords.reserve(hs.size());
+            for (const auto& h : hs) ords.push_back(h.ord);
+            return ords;
+        });
+    };
+    state.counters["recall@10"]  = run_k(10);
+    state.counters["recall@100"] = run_k(100);
+    state.counters["build_docs_per_s"] = slot.second;
+}
+BENCHMARK(BM_Hnsw_RecallQps)
+    ->Args({10000, 64})
+    ->Args({10000, 256})
+    ->Args({100000, 64})
+    ->Args({100000, 256})
+    ->Unit(benchmark::kMicrosecond);
