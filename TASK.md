@@ -4095,11 +4095,44 @@ S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同�
     **619/619**;build-rel 过。
   - [ ] M0b 共享域件抽取(normalize/`vec::DeltaLog`/量化器)——可顺延至
     M3 首批(IvfPlugin 落地时才有第二个消费方,提前抽取是无对手重构)。
-  - [ ] M0c 召回 harness(S29-11 §2,两引擎共用):固定语料 + 暴力精确
-    top-k 真值缓存盘上;recall@10/100 × QPS × 建图耗时三元组进 bench。
-- [ ] **M2 HNSW 线 P0/P1**:qc8 mmap 化(qcodes_of 按 checkpoint_count_
-  路由,与 vec_of 同型)+ clone_live 峰值治理(needs_vecs=false + f32
-  旧 mmap 流式写新 .vec,消 2× 重建峰值)——主引擎舒适区推 ~2-4M@1024d。
+  - [x] **M0c 召回 harness 已完成(2026-07-13)**:
+    `bench/ann_recall_harness.hpp`(引擎无关——聚簇合成语料
+    make_corpus(**簇心种子独立**,base/query 共享簇心、成员噪声独立;
+    query 用随机簇心是召回评估经典错误,已在首跑踩到并修正)+ 暴力
+    真值多线程构建 + BCGT 盘上缓存(参数键入文件名 + 头部/CRC 校验,
+    目录可经 BITCASK_ANN_TRUTH_DIR 覆盖)+ recall_at(回调式,
+    IvfPlugin 直接复用同一真值))。`hnsw_bench.cpp` 增
+    BM_Hnsw_RecallQps 三元组基准(计时区=QPS@k10;counters=
+    recall@10/100 + build_docs_per_s)。
+    首采基线(384d 聚簇 nc=64,gcc build-rel,无 VNNI 机):
+    | 规模/ef | recall@10 | recall@100 | QPS | 建图/s |
+    | 10k/64 | 0.9998 | 0.937 | 27.3k | 6.3k |
+    | 10k/256 | 0.9998 | 1.000 | 8.3k | 6.3k |
+    | 100k/64 | 0.946 | 0.771 | 9.2k | 3.2k |
+    | 100k/256 | 0.999 | 0.989 | 3.6k | 3.2k |
+    **验收门生效:自此任何向量改动 recall@10 降幅 > 1pt 须显式声明并
+    提供配置回退。**
+- [x] **M2 已完成(2026-07-13)HNSW 线 P1:qc8 mmap 化 + clone_live 峰值治理**
+  - **M2a qc8 mmap 化**:`load_qc_payload` 由 fread+memcpy 进堆改
+    MAP_SHARED 只读 mmap(+MADV_RANDOM);`qcodes_of/qscale_of/qsum_of`
+    按 `id < qc_checkpoint_count_` 路由(与 vec_of 同型;BCQ8 定长
+    stride 按 id 寻址,scale/sum memcpy 取免对齐问题,int8 内核全
+    loadu);deserialize v3+qc_pending 的 chunk 以 needs_qcodes=false
+    创建,boundary chunk 首插懒分配(与 vecs 同协议);save/append 聚合
+    循环改走访问器(mmap 段 + chunk 段合并)。**int8 码字(D+8 B/节点,
+    高维下占堆 ~95%)出堆**——堆常驻降至 ~165B/节点,内存不足退化为慢
+    而非 OOM。
+  - **M2b clone_live 峰值治理**:格式实现抽 `write_bcvp_file`/
+    `write_bcq8_file`(全量兜底与外溢共用,位级同源);clone_live 增
+    spill 路径参数——活集 f32/码字从旧图(含 mmap 段)按 remap 直接
+    流式写新 payload(新 gen)+ fresh mmap attach,**重建堆峰值从
+    「旧图+新图全量」降到「旧图+新图邻接/元数据」**;外溢失败自动回退
+    堆拷贝;crash 窗口与旧「rebuild 后 flush 全量重写」等同(gen 守卫
+    拒载 → fold 重建)。`VectorPlugin::rebuild` 传 .vec/.qc8 路径。
+  - 验收:新测 ×2(MmapLoadHotInsertAppendReload:mmap 载入/热插懒分配/
+    追加/重载;HnswCloneSpill.SpillAttachAdoptAndReload:双模式外溢/
+    inode 收养/重载)——gcc 全量 **621/621**;ASan hnsw+vecplugin
+    24/24;TSan 并发子集 10/10;build-rel 过。
 - [ ] **M3 IvfPlugin v1**(IVF-RaBitQ,~3k LOC,独立插件;设计 §5.1):
   质心 RAM + posting 盘上顺序扫(RaBitQ 粗筛 + int8 精排内联)+ delta
   窗口复用 HnswIndex(inmem_int8);RaBitQ popcount 内核顺手供 HNSW P2。
