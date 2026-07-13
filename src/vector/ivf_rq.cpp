@@ -29,6 +29,8 @@ constexpr std::uint32_t kIvfVersion  = 1;
 constexpr std::size_t   kIvfHeaderSize = 96;
 constexpr std::size_t   kIvfHeaderCrcOff = 92;
 constexpr std::size_t   kCidxEntrySize = 16;  // off u64 | count u32 | crc u32
+constexpr std::uint32_t kIvfVersion2 = 2;     // S32-M3.5-②:+1-bit 码区
+constexpr std::uint32_t kFlagBits    = 1u;    // flags bit0 = bits 区存在
 
 bool pwrite_all(int fd, const void* buf, std::size_t len, std::uint64_t off) {
     const auto* p = static_cast<const std::uint8_t*>(buf);
@@ -76,6 +78,38 @@ void parallel_for(std::size_t n, Fn&& fn) {
     for (auto& th : pool) th.join();
 }
 
+// S32-M3.5-②:1-bit sign 编码（bit j = v[j] >= 0）+ μ = mean|v|。
+// 尾部补零位（两侧同 pad → XOR 后为 0,不扰 hamming）。
+inline void sign_encode(const float* v, std::size_t dim, std::uint8_t* out,
+                        float* mu) {
+    const std::size_t nbytes = (dim + 7) / 8;
+    std::memset(out, 0, nbytes);
+    double asum = 0.0;
+    for (std::size_t j = 0; j < dim; ++j) {
+        asum += std::fabs(static_cast<double>(v[j]));
+        if (v[j] >= 0.0f) out[j >> 3] |= static_cast<std::uint8_t>(1u << (j & 7));
+    }
+    *mu = static_cast<float>(asum / static_cast<double>(dim));
+}
+
+inline std::uint32_t hamming_bytes(const std::uint8_t* a,
+                                   const std::uint8_t* b,
+                                   std::size_t nbytes) {
+    std::uint32_t h = 0;
+    std::size_t i = 0;
+    for (; i + 8 <= nbytes; i += 8) {
+        std::uint64_t x, y;
+        std::memcpy(&x, a + i, 8);
+        std::memcpy(&y, b + i, 8);
+        h += static_cast<std::uint32_t>(__builtin_popcountll(x ^ y));
+    }
+    for (; i < nbytes; ++i) {
+        h += static_cast<std::uint32_t>(
+            __builtin_popcount(static_cast<unsigned>(a[i] ^ b[i])));
+    }
+    return h;
+}
+
 // 自动 nlist：4·√N，clamp [16, 65536]，再保簇均 ≥ 8。
 std::uint32_t auto_nlist(std::uint32_t n) {
     if (n == 0) return 16;
@@ -104,13 +138,15 @@ void IvfSegment::close() {
     centroids_ = nullptr;
     cidx_      = nullptr;
     post_off_  = 0;
+    bits_      = nullptr;
     count_ = 0;
     nlist_ = 0;
 }
 
 bool IvfSegment::build(std::string_view path, std::uint16_t dim,
                        const IvfBuildSource& src, std::uint32_t nlist,
-                       std::uint64_t gen, std::uint64_t seed) {
+                       std::uint64_t gen, std::uint64_t seed,
+                       bool with_bits) {
     if (dim == 0) return false;
     const std::uint32_t n = src.count;
     if (n > 0 && !src.get) return false;
@@ -219,11 +255,16 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
     const std::size_t stride = static_cast<std::size_t>(dim) + 16;
     std::vector<std::uint32_t> ccount(nlist, 0);
     for (std::uint32_t i = 0; i < n; ++i) ++ccount[cid[i]];
+    const std::size_t sbits =
+        (static_cast<std::size_t>(dim) + 7) / 8 + sizeof(float);
     const std::uint64_t cent_off = kIvfHeaderSize;
     const std::uint64_t cidx_off =
         cent_off + static_cast<std::uint64_t>(nlist) * d * sizeof(float);
-    const std::uint64_t post_off =
+    const std::uint64_t bits_off =
         cidx_off + static_cast<std::uint64_t>(nlist) * kCidxEntrySize;
+    const std::uint64_t bits_len =
+        with_bits ? static_cast<std::uint64_t>(n) * sbits : 0;
+    const std::uint64_t post_off = bits_off + bits_len;
     std::vector<std::uint64_t> cbase(nlist, 0);
     {
         std::uint64_t off = post_off;
@@ -251,6 +292,7 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
     if (ok) {
         std::vector<std::uint64_t> cursor(cbase);
         std::vector<std::uint8_t> rec(stride);
+        std::vector<std::uint8_t> brec(sbits);
         int8::QVector qv;
         for (std::uint32_t i = 0; ok && i < n; ++i) {
             std::uint64_t ord;
@@ -263,6 +305,16 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
             std::memcpy(rec.data() + 8 + d, &qv.scale, 4);
             std::memcpy(rec.data() + 8 + d + 4, &qv.sum_codes, 4);
             ok = pwrite_all(fd, rec.data(), stride, cursor[cid[i]]);
+            if (ok && with_bits) {
+                // bits 记录与 posting 记录同槽位（同序偏移换 stride）。
+                float mu = 0.0f;
+                sign_encode(v, d, brec.data(), &mu);
+                std::memcpy(brec.data() + sbits - 4, &mu, 4);
+                const std::uint64_t rec_idx =
+                    (cursor[cid[i]] - post_off) / stride;
+                ok = pwrite_all(fd, brec.data(), sbits,
+                                bits_off + rec_idx * sbits);
+            }
             cursor[cid[i]] += stride;
         }
     }
@@ -295,12 +347,26 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
             }
         }
     }
+    // bits 区 CRC（顺序回读；页缓存已热）。
+    std::uint32_t bits_crc = 0;
+    if (ok && with_bits && bits_len > 0) {
+        std::vector<std::uint8_t> bbuf(static_cast<std::size_t>(bits_len));
+        ok = ::pread(fd, bbuf.data(), bbuf.size(),
+                     static_cast<off_t>(bits_off)) ==
+             static_cast<ssize_t>(bbuf.size());
+        if (ok) {
+            bits_crc = bitcask::codec::crc32(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(bbuf.data()),
+                bbuf.size()));
+        }
+    }
     // header（字段全就位后 CRC）。
     if (ok) {
         std::uint8_t hdr[kIvfHeaderSize] = {0};
         std::memcpy(hdr + 0, kIvfMagic, 4);
-        std::memcpy(hdr + 4, &kIvfVersion, 4);
-        const std::uint32_t flags = 0;  // bit0 = 1-bit 码区（M3.5 预留）
+        const std::uint32_t ver = with_bits ? kIvfVersion2 : kIvfVersion;
+        std::memcpy(hdr + 4, &ver, 4);
+        const std::uint32_t flags = with_bits ? kFlagBits : 0;
         std::memcpy(hdr + 8, &flags, 4);
         std::memcpy(hdr + 12, &dim, 2);
         std::memcpy(hdr + 16, &nlist, 4);
@@ -312,6 +378,10 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
         std::memcpy(hdr + 56, &cidx_off, 8);
         std::memcpy(hdr + 64, &post_off, 8);
         std::memcpy(hdr + 72, &file_len, 8);
+        if (with_bits) {
+            std::memcpy(hdr + 80, &bits_off, 8);
+            std::memcpy(hdr + 88, &bits_crc, 4);
+        }
         const std::uint32_t hcrc =
             bitcask::codec::crc32(std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(hdr), kIvfHeaderCrcOff));
@@ -358,14 +428,22 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
     std::memcpy(&cidx_off, hdr + 56, 8);
     std::memcpy(&post_off, hdr + 64, 8);
     std::memcpy(&file_len, hdr + 72, 8);
+    std::uint64_t bits_off = 0;
+    std::uint32_t bits_crc = 0;
+    std::memcpy(&bits_off, hdr + 80, 8);
+    std::memcpy(&bits_crc, hdr + 88, 4);
     std::uint32_t stored = 0;
     std::memcpy(&stored, hdr + kIvfHeaderCrcOff, 4);
     const std::uint32_t calc = bitcask::codec::crc32(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(hdr), kIvfHeaderCrcOff));
-    if (ver != kIvfVersion || flags != 0 || fdim != dim || stored != calc) {
+    const bool ver_ok =
+        (ver == kIvfVersion && flags == 0) ||
+        (ver == kIvfVersion2 && (flags & ~kFlagBits) == 0);
+    if (!ver_ok || fdim != dim || stored != calc) {
         ::close(fd);
         return false;
     }
+    const bool has_bits = (flags & kFlagBits) != 0;
     if (expected_gen != 0 && gen != 0 && gen != expected_gen) {
         ::close(fd);
         return false;
@@ -378,12 +456,17 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
     }
     // 布局自洽性（防越界寻址——mmap 后所有区指针由这些偏移导出）。
     const std::size_t stride = static_cast<std::size_t>(dim) + 16;
+    const std::size_t sbits =
+        (static_cast<std::size_t>(dim) + 7) / 8 + sizeof(float);
     const std::uint64_t cent_bytes =
         static_cast<std::uint64_t>(nlist) * dim * sizeof(float);
     const std::uint64_t cidx_bytes =
         static_cast<std::uint64_t>(nlist) * kCidxEntrySize;
+    const std::uint64_t bits_len = has_bits ? count * sbits : 0;
+    const std::uint64_t want_bits_off = cidx_off + cidx_bytes;
     if (cent_off != kIvfHeaderSize || cidx_off != cent_off + cent_bytes ||
-        post_off != cidx_off + cidx_bytes ||
+        (has_bits && bits_off != want_bits_off) ||
+        post_off != want_bits_off + bits_len ||
         file_len != post_off + count * stride) {
         ::close(fd);
         return false;
@@ -406,7 +489,18 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
     centroids_ = reinterpret_cast<const float*>(base_ + cent_off);
     cidx_ = base_ + cidx_off;
     post_off_ = post_off;
+    bits_ = has_bits ? base_ + bits_off : nullptr;
 
+    if (verify_crc && has_bits && bits_len > 0) {
+        const std::uint32_t got =
+            bitcask::codec::crc32(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(bits_),
+                static_cast<std::size_t>(bits_len)));
+        if (got != bits_crc) {
+            close();
+            return false;
+        }
+    }
     if (verify_crc) {
         // 逐簇 CRC + cidx 边界校验（S30 封口段 open 验 CRC 同款）。
         for (std::uint32_t c = 0; c < nlist_; ++c) {
@@ -440,7 +534,8 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
 
 std::vector<IvfSegment::Hit> IvfSegment::search(
     std::span<const float> query, std::size_t k, std::uint32_t nprobe,
-    const std::function<bool(std::uint64_t)>* live) const {
+    const std::function<bool(std::uint64_t)>* live,
+    std::uint32_t coarse_c) const {
     std::vector<Hit> out;
     if (!opened() || count_ == 0 || k == 0 || query.size() != dim_) return out;
     if (nprobe == 0) nprobe = std::max<std::uint32_t>(nlist_ / 32, 8);
@@ -466,38 +561,96 @@ std::vector<IvfSegment::Hit> IvfSegment::search(
     int8::Int8DotFn kern = int8::pick_int8_dot_kernel();
     if (kern == nullptr) kern = &int8::dot_scalar_raw;
 
-    // 3) posting 顺序扫 + 小顶堆 top-k（live 过滤在入堆前惰性调用——
+    // 3) posting 扫描 + 小顶堆 top-k（live 过滤在入堆前惰性调用——
     //    仅当分数进得了堆才付回调成本）。
     std::vector<std::pair<float, std::uint64_t>> heap;  // (score, ord) 小顶
     heap.reserve(k + 1);
     auto cmp = [](const auto& a, const auto& b) { return a.first > b.first; };
-    for (std::uint32_t pi = 0; pi < nprobe; ++pi) {
-        const std::uint32_t c = cs[pi].second;
-        const std::uint8_t* e =
-            cidx_ + static_cast<std::size_t>(c) * kCidxEntrySize;
-        std::uint64_t off = 0;
-        std::uint32_t cnt = 0;
-        std::memcpy(&off, e, 8);
-        std::memcpy(&cnt, e + 8, 4);
-        const std::uint8_t* rec = base_ + off;
-        for (std::uint32_t i = 0; i < cnt; ++i, rec += stride) {
-            const auto* codes =
-                reinterpret_cast<const std::int8_t*>(rec + 8);
-            float scale;
-            std::int32_t sum;
-            std::memcpy(&scale, rec + 8 + d, 4);
-            std::memcpy(&sum, rec + 8 + d + 4, 4);
-            const float score =
-                kern(qv.codes.data(), codes, sum, qv.scale, scale, d);
-            if (heap.size() >= k && score <= heap.front().first) continue;
-            std::uint64_t ord;
-            std::memcpy(&ord, rec, 8);
-            if (live != nullptr && *live && !(*live)(ord)) continue;
-            heap.push_back({score, ord});
-            std::push_heap(heap.begin(), heap.end(), cmp);
-            if (heap.size() > k) {
-                std::pop_heap(heap.begin(), heap.end(), cmp);
-                heap.pop_back();
+
+    // 阶段 B 共用的 int8 精排入堆。
+    auto score_record = [&](const std::uint8_t* rec) {
+        const auto* codes = reinterpret_cast<const std::int8_t*>(rec + 8);
+        float scale;
+        std::int32_t sum;
+        std::memcpy(&scale, rec + 8 + d, 4);
+        std::memcpy(&sum, rec + 8 + d + 4, 4);
+        const float score =
+            kern(qv.codes.data(), codes, sum, qv.scale, scale, d);
+        if (heap.size() >= k && score <= heap.front().first) return;
+        std::uint64_t ord;
+        std::memcpy(&ord, rec, 8);
+        if (live != nullptr && *live && !(*live)(ord)) return;
+        heap.push_back({score, ord});
+        std::push_heap(heap.begin(), heap.end(), cmp);
+        if (heap.size() > k) {
+            std::pop_heap(heap.begin(), heap.end(), cmp);
+            heap.pop_back();
+        }
+    };
+
+    if (bits_ != nullptr) {
+        // S32-M3.5-②:两段扫——阶段 A 对称 1-bit popcount 粗筛（字节量
+        // 8× 缩,est = μ_v·(d − 2·hamming),μ_q/常数不影响排序）取 top-C,
+        // 阶段 B 仅对 C 个候选 int8 精排。est 有损,召回由 C 冗余兜底。
+        const std::size_t sbits = bits_stride();
+        const std::size_t nbytes = sbits - sizeof(float);
+        thread_local std::vector<std::uint8_t> qbits;
+        qbits.resize(nbytes);
+        {
+            float mu_q_unused = 0.0f;
+            sign_encode(query.data(), d, qbits.data(), &mu_q_unused);
+        }
+        const std::size_t cc =
+            coarse_c != 0 ? coarse_c
+                          : std::max<std::size_t>(8 * k, 128);
+        // (est, 全局记录序) 小顶堆。
+        std::vector<std::pair<float, std::uint64_t>> coarse;
+        coarse.reserve(cc + 1);
+        for (std::uint32_t pi = 0; pi < nprobe; ++pi) {
+            const std::uint32_t c = cs[pi].second;
+            const std::uint8_t* e =
+                cidx_ + static_cast<std::size_t>(c) * kCidxEntrySize;
+            std::uint64_t off = 0;
+            std::uint32_t cnt = 0;
+            std::memcpy(&off, e, 8);
+            std::memcpy(&cnt, e + 8, 4);
+            const std::uint64_t prefix = (off - post_off_) / stride;
+            const std::uint8_t* b = bits_ + prefix * sbits;
+            for (std::uint32_t i = 0; i < cnt; ++i, b += sbits) {
+                const std::uint32_t h =
+                    hamming_bytes(qbits.data(), b, nbytes);
+                float mu;
+                std::memcpy(&mu, b + nbytes, 4);
+                const float est =
+                    mu * static_cast<float>(static_cast<std::int32_t>(d) -
+                                            2 * static_cast<std::int32_t>(h));
+                if (coarse.size() >= cc && est <= coarse.front().first) {
+                    continue;
+                }
+                coarse.push_back({est, prefix + i});
+                std::push_heap(coarse.begin(), coarse.end(), cmp);
+                if (coarse.size() > cc) {
+                    std::pop_heap(coarse.begin(), coarse.end(), cmp);
+                    coarse.pop_back();
+                }
+            }
+        }
+        for (const auto& [est, idx] : coarse) {
+            score_record(base_ + post_off_ + idx * stride);
+        }
+    } else {
+        // v1 文件:单段 int8 全量扫。
+        for (std::uint32_t pi = 0; pi < nprobe; ++pi) {
+            const std::uint32_t c = cs[pi].second;
+            const std::uint8_t* e =
+                cidx_ + static_cast<std::size_t>(c) * kCidxEntrySize;
+            std::uint64_t off = 0;
+            std::uint32_t cnt = 0;
+            std::memcpy(&off, e, 8);
+            std::memcpy(&cnt, e + 8, 4);
+            const std::uint8_t* rec = base_ + off;
+            for (std::uint32_t i = 0; i < cnt; ++i, rec += stride) {
+                score_record(rec);
             }
         }
     }

@@ -130,12 +130,14 @@ TEST(IvfSegment, BuildOpenSearchRecall) {
         EXPECT_EQ(hits[0].ord, i);
     }
 
-    // 正确性主断言：全扫（nprobe=nlist）≡ int8 暴扫穷举对拍——分簇/布局/
-    // 内核任何一环丢数据或算错都在此暴露（量化误差被同侧抵消，非门槛）。
+    // 正确性主断言：全扫（nprobe=nlist,coarse_c=n → 两段扫精确退化）≡
+    // int8 暴扫穷举对拍——分簇/布局/内核任何一环丢数据或算错都在此暴露
+    //（量化误差被同侧抵消，非门槛）。
     for (std::size_t qi = 0; qi < nq; ++qi) {
         const float* q = queries.data() + qi * dim;
         auto truth = brute_topk_int8(base, n, dim, q, k);
-        auto got = seg.search(std::span<const float>(q, dim), k, 32);
+        auto got = seg.search(std::span<const float>(q, dim), k, 32, nullptr,
+                              static_cast<std::uint32_t>(n));
         ASSERT_EQ(got.size(), k);
         std::vector<std::uint64_t> gids(k);
         for (std::size_t i = 0; i < k; ++i) gids[i] = got[i].ord;
@@ -164,6 +166,30 @@ TEST(IvfSegment, BuildOpenSearchRecall) {
         return static_cast<double>(hit) / static_cast<double>(nq * k);
     };
     EXPECT_GE(recall_vs_int8(8), 0.90) << "nprobe=8/32 簇路由召回不达标";
+    // S32-M3.5-②:两段扫默认 C（max(8k,128)）的 1-bit 粗筛召回门——est
+    // 有损排序由 C 冗余兜底,跌破此线说明粗筛层丢真近邻。
+    EXPECT_GE(recall_vs_int8(32), 0.97) << "两段扫默认 C 召回门不达标";
+
+    // v1 兼容:with_bits=false → 单段扫,默认参数即精确(对拍同门)。
+    {
+        const auto fp1 = tmp_path("bitcask_ivf_v1.biv");
+        ASSERT_TRUE(IvfSegment::build(fp1, dim, src_of(base, dim), 32, 778,
+                                      0x5EEDF00D, /*with_bits=*/false));
+        IvfSegment s1;
+        ASSERT_TRUE(s1.open(fp1, dim, 778));
+        for (std::size_t qi = 0; qi < 10; ++qi) {
+            const float* q = queries.data() + qi * dim;
+            auto truth = brute_topk_int8(base, n, dim, q, k);
+            auto got = s1.search(std::span<const float>(q, dim), k, 32);
+            ASSERT_EQ(got.size(), k);
+            std::vector<std::uint64_t> gids(k);
+            for (std::size_t i = 0; i < k; ++i) gids[i] = got[i].ord;
+            std::sort(truth.begin(), truth.end());
+            std::sort(gids.begin(), gids.end());
+            EXPECT_EQ(gids, truth) << "v1 单段扫 ≠ int8 暴扫 @ " << qi;
+        }
+        fs::remove(fp1);
+    }
 
     // 分数降序。
     auto hits = seg.search(std::span<const float>(queries.data(), dim), k, 8);
@@ -208,6 +234,27 @@ TEST(IvfSegment, GenGuardDimMismatchAndCorruption) {
     EXPECT_TRUE(seg.open(fp, dim, 0)) << "expected_gen=0 = 不校验";
     EXPECT_TRUE(seg.open(fp, dim, 42));
     seg.close();
+
+    // bits 区损坏 → bits_crc 拒载（v2;偏移 = header + cent + cidx 起首字节）。
+    {
+        std::FILE* f = std::fopen(fp.c_str(), "r+b");
+        ASSERT_NE(f, nullptr);
+        const long bits_at = 96 + 8L * dim * 4 + 8 * 16;  // nlist=8
+        std::fseek(f, bits_at, SEEK_SET);
+        int ch = std::fgetc(f);
+        std::fseek(f, bits_at, SEEK_SET);
+        std::fputc(ch ^ 0x3C, f);
+        std::fclose(f);
+        EXPECT_FALSE(seg.open(fp, dim, 42)) << "bits 区损坏必须被 CRC 检出";
+        // 还原（后续 header 损坏用例要在干净体上做）。
+        f = std::fopen(fp.c_str(), "r+b");
+        ASSERT_NE(f, nullptr);
+        std::fseek(f, bits_at, SEEK_SET);
+        std::fputc(ch, f);
+        std::fclose(f);
+        EXPECT_TRUE(seg.open(fp, dim, 42));
+        seg.close();
+    }
 
     // 篡改 posting 一字节 → 逐簇 CRC 拒载；verify_crc=false 放行（可信盘）。
     {
