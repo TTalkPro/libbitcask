@@ -227,10 +227,11 @@ target_link_libraries(bitcask_bm25
     PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb)
 
 # ---------------------------------------------------------------------------
-# bitcask_vector — HNSW 向量索引。
+# bitcask_vector — 向量索引（HNSW + IVF 段，S32-M3）。
 # ---------------------------------------------------------------------------
 add_library(bitcask_vector STATIC
     src/vector/hnsw.cpp
+    src/vector/ivf_rq.cpp
 )
 target_include_directories(bitcask_vector
     PUBLIC  include
@@ -263,6 +264,7 @@ target_link_libraries(bitcask_text_plugin
 
 add_library(bitcask_vector_plugin STATIC
     src/search/vector_plugin.cpp
+    src/search/ivf_plugin.cpp
 )
 target_include_directories(bitcask_vector_plugin PUBLIC include)
 target_link_libraries(bitcask_vector_plugin

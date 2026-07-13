@@ -2083,15 +2083,28 @@ TEST_F(CaskDocValueTest, S32M0VectorEngineMetaWiring) {
         ASSERT_TRUE(mc);
         EXPECT_EQ(mc->vector_engine, bitcask::meta::VectorEngine::kHnsw);
     }
-    // 未实现引擎：open 干净拒绝（防止建出无法服务的库）。
+    // 未实现引擎（kDiskann，S32-M5）：open 干净拒绝。kIvfRq 已落地
+    // （S32-M3）→ 建库成功且 meta 持久化引擎标识。
+    {
+        auto tmp = tmpdir_ / "eng_dann";
+        std::filesystem::create_directories(tmp);
+        auto opts = v31_opts(4);
+        opts.vector_engine = bitcask::meta::VectorEngine::kDiskann;
+        auto c = Cask::open(tmp.string(), opts, &test_registry());
+        ASSERT_FALSE(c);
+        EXPECT_EQ(c.error().kind, bitcask::CaskError::kInvalidOption);
+    }
     {
         auto tmp = tmpdir_ / "eng_ivf";
         std::filesystem::create_directories(tmp);
         auto opts = v31_opts(4);
         opts.vector_engine = bitcask::meta::VectorEngine::kIvfRq;
         auto c = Cask::open(tmp.string(), opts, &test_registry());
-        ASSERT_FALSE(c);
-        EXPECT_EQ(c.error().kind, bitcask::CaskError::kInvalidOption);
+        ASSERT_TRUE(c);
+        (*c)->close();
+        auto mc = bitcask::meta::read_meta(tmp.string());
+        ASSERT_TRUE(mc);
+        EXPECT_EQ(mc->vector_engine, bitcask::meta::VectorEngine::kIvfRq);
     }
     // 引擎不符：meta 声明 kIvfRq（模拟未来引擎写的库）、opts 默认 kHnsw
     // → kModeMismatch（绝不按 HNSW 静默误开别家引擎的库）。
@@ -2132,6 +2145,87 @@ TEST_F(CaskDocValueTest, S32M0VectorEngineMetaWiring) {
         std::fclose(f);
         auto rd = bitcask::meta::read_meta(tmp.string());
         EXPECT_FALSE(rd) << "未知 vector_engine 必须 fail-fast";
+    }
+}
+
+// S32-M3:IVF 引擎 Cask 全链路 e2e——建库(engine=kIvfRq)→ 写查 → 删除 →
+// 重开(meta 引擎校验 + 组件链恢复)→ 检索等价。
+TEST_F(CaskDocValueTest, S32M3IvfEngineEndToEnd) {
+    auto opts = v31_opts(4);
+    opts.vector_engine = bitcask::meta::VectorEngine::kIvfRq;
+    const std::size_t kN = 24;
+    auto vec_of = [](std::size_t i) {
+        // 三簇轴对齐向量 + 小扰动（cosine 归一化由写入端做）。
+        std::vector<float> v(4, 0.05f);
+        v[i % 3] = 1.0f;
+        v[3] = 0.01f * static_cast<float>(i);
+        return v;
+    };
+    auto put_all = [&](Cask& c, std::size_t from, std::size_t to) {
+        for (std::size_t i = from; i < to; ++i) {
+            bitcask::DocInput doc;
+            const std::string text = "ivf doc " + std::to_string(i);
+            doc.text = sv_bytes(text);
+            auto v = vec_of(i);
+            doc.vector = std::span<const float>(v.data(), 4);
+            ASSERT_TRUE(c.put_doc(sv_bytes("k" + std::to_string(i)), doc,
+                                  1000));
+        }
+    };
+    {
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        put_all(**c, 0, kN);
+        (*c)->flush_index();
+        EXPECT_EQ((*c)->vector_plugin()->size(), kN);  // 探针:插入到达
+        auto r = (*c)->search_vector(
+            std::span<const float>(vec_of(5).data(), 4), 3);
+        ASSERT_TRUE(r);
+        ASSERT_GE(r->hits.size(), 1u);
+        EXPECT_EQ(r->hits[0].key, "k5");  // 自匹配 top1
+        // 删除后查询侧立即滤除。
+        ASSERT_TRUE((*c)->remove(sv_bytes("k5"), 2000));
+        (*c)->flush_index();
+        auto r2 = (*c)->search_vector(
+            std::span<const float>(vec_of(5).data(), 4), kN);
+        ASSERT_TRUE(r2);
+        for (const auto& h : r2->hits) EXPECT_NE(h.key, "k5");
+        (*c)->close();
+    }
+    // meta 持久化引擎标识。
+    {
+        auto mc = bitcask::meta::read_meta(tmpdir_.string());
+        ASSERT_TRUE(mc);
+        EXPECT_EQ(mc->vector_engine, bitcask::meta::VectorEngine::kIvfRq);
+    }
+    // 以 HNSW 默认重开 → 引擎不符拒绝。
+    {
+        auto bad = Cask::open(tmpdir_.string(), v31_opts(4),
+                              &test_registry());
+        ASSERT_FALSE(bad);
+        EXPECT_EQ(bad.error().kind, bitcask::CaskError::kModeMismatch);
+    }
+    // 正确引擎重开：组件恢复 + 检索等价 + 续写。
+    {
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        auto r = (*c)->search_vector(
+            std::span<const float>(vec_of(7).data(), 4), 3);
+        ASSERT_TRUE(r);
+        ASSERT_GE(r->hits.size(), 1u);
+        EXPECT_EQ(r->hits[0].key, "k7");
+        auto rd = (*c)->search_vector(
+            std::span<const float>(vec_of(5).data(), 4), kN);
+        ASSERT_TRUE(rd);
+        for (const auto& h : rd->hits) EXPECT_NE(h.key, "k5");  // 删除持久
+        put_all(**c, kN, kN + 4);  // 续写进窗口
+        (*c)->flush_index();
+        auto r3 = (*c)->search_vector(
+            std::span<const float>(vec_of(kN + 2).data(), 4), 3);
+        ASSERT_TRUE(r3);
+        ASSERT_GE(r3->hits.size(), 1u);
+        EXPECT_EQ(r3->hits[0].key, "k" + std::to_string(kN + 2));
+        (*c)->close();
     }
 }
 

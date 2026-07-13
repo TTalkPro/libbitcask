@@ -1,4 +1,5 @@
 #include "bitcask/cask.hpp"
+#include "bitcask/ivf_plugin.hpp"  // S32-M3：IVF 引擎工厂
 
 #include <signal.h>     // ::kill for stale-lock detection
 #include <sys/resource.h>  // ::getrlimit, RLIMIT_NOFILE（S12-1 read 句柄默认上限）
@@ -338,6 +339,24 @@ std::expected<void, CaskFault> Cask::acquire_open_locks() {
 // T2.4:open 阶段二——bitcask.meta 读取或创建。必须在插件创建之前——meta
 // 决定 KV / 索引模式以及向量配置,VectorPlugin 内部 HnswIndex 创建依赖
 // meta_config_。vector_dim/metric 不符 → kModeMismatch。
+// S32-M3：向量引擎工厂——meta_config_.vector_engine 分发（建库时定死；
+// 非法组合已被 check_or_create_meta 拒绝）。open 与 upgrade 构造路径共用。
+std::unique_ptr<vec::VectorEnginePlugin>
+Cask::create_vector_plugin(const search::SearchLayerConfig& scfg) const {
+    switch (meta_config_.vector_engine) {
+        case meta::VectorEngine::kHnsw:
+            return std::make_unique<vec::VectorPlugin>(scfg.vector_config(),
+                                                       *docmap_);
+        case meta::VectorEngine::kIvfRq:
+            return std::make_unique<vec::IvfPlugin>(scfg.vector_config(),
+                                                    *docmap_);
+        case meta::VectorEngine::kDiskann:
+            break;  // S32-M5：实现落地前 check_or_create_meta 已拒绝
+    }
+    return std::make_unique<vec::VectorPlugin>(scfg.vector_config(),
+                                               *docmap_);
+}
+
 std::expected<void, CaskFault> Cask::check_or_create_meta() {
     // P5b:int8-only 仅 kDot(int8 距离=重建内积);kL2 不支持,干净拒绝。
     if (opts_.vector_dim > 0 && opts_.vector_inmem_int8 &&
@@ -345,12 +364,18 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
         return std::unexpected(err(CaskError::kInvalidOption,
             "vector_inmem_int8 requires kDot/cosine metric (kL2 unsupported)"));
     }
-    // S32-M0:引擎接线先行,实现后置——非 HNSW 引擎在插件落地前干净拒绝
-    // (kIvfRq = S32-M3,kDiskann = S32-M5),防止建出无法服务的库。
+    // S32-M3:kIvfRq 已落地;kDiskann 留 S32-M5,落地前干净拒绝。
     if (opts_.vector_dim > 0 &&
-        opts_.vector_engine != meta::VectorEngine::kHnsw) {
+        opts_.vector_engine == meta::VectorEngine::kDiskann) {
         return std::unexpected(err(CaskError::kInvalidOption,
-            "vector_engine ivf_rq/diskann not implemented yet (S32-M3/M5)"));
+            "vector_engine diskann not implemented yet (S32-M5)"));
+    }
+    // IVF v1 仅 kDot/cosine（posting 扫描与窗口图共用 int8 内积语义）。
+    if (opts_.vector_dim > 0 &&
+        opts_.vector_engine == meta::VectorEngine::kIvfRq &&
+        opts_.vector_metric == meta::VectorMetric::kL2) {
+        return std::unexpected(err(CaskError::kInvalidOption,
+            "vector_engine ivf_rq requires kDot/cosine metric (kL2 unsupported)"));
     }
     if (meta::meta_exists(dirname_)) {
         auto mc = meta::read_meta(dirname_);
@@ -510,11 +535,7 @@ Cask::create_search_infra(const CaskOptions& opts) {
         return std::unexpected(err(CaskError::kInvalidOption,
                                    "analyzer creation failed (check analyzer type / dict_path)"));
     }
-    // S32-M0：向量引擎工厂点——meta_config_.vector_engine 分发插件实现。
-    // 当前仅 kHnsw（非 HNSW 已在 check_or_create_meta 干净拒绝）；IvfPlugin
-    // 落地（S32-M3）时在此按引擎实例化对应 CaskPlugin。
-    vec_plugin_ = std::make_unique<vec::VectorPlugin>(scfg.vector_config(),
-                                                      *docmap_);
+    vec_plugin_ = create_vector_plugin(scfg);
     hybrid_.emplace(*text_, *vec_plugin_);
     // S18-5：TextPlugin/VectorPlugin 直接注册进分发表。注册序 text 先 vec
     // 后 = 原 reduce_apply 内「add_doc → on_vector」顺序。

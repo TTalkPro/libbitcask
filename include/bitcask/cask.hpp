@@ -648,7 +648,8 @@ public:
     [[nodiscard]] const text::TextPlugin* text_plugin() const {
         return text_.get();
     }
-    [[nodiscard]] const vec::VectorPlugin* vector_plugin() const {
+    // S32-M3：返回引擎契约基类（实现按 meta.vector_engine 定——HNSW/IVF）。
+    [[nodiscard]] const vec::VectorEnginePlugin* vector_plugin() const {
         return vec_plugin_.get();
     }
     [[nodiscard]] const search::HybridSearcher* hybrid_searcher() const {
@@ -923,8 +924,15 @@ private:
     // 搜索插件（enable_search 时创建）。
     // S19-2：Cask 直持插件（SearchLayer shim 已降级为测试夹具）。声明序 =
     // 析构逆序：hybrid_ 引用两插件须先析构；插件借用 docmap_（shared_ptr）。
+    // S32-M3：向量引擎工厂（meta_config_.vector_engine 分发；cask.cpp 定义，
+    // open 与 upgrade 两条构造路径共用）。
+    [[nodiscard]] std::unique_ptr<vec::VectorEnginePlugin>
+    create_vector_plugin(const search::SearchLayerConfig& scfg) const;
+
     std::unique_ptr<text::TextPlugin>  text_;
-    std::unique_ptr<vec::VectorPlugin> vec_plugin_;
+    // S32-M3：引擎契约基类持有（工厂按 meta_config_.vector_engine 实例化；
+    // legacy 统一 ckpt 路径以 engine==kHnsw 为门 static_cast 取具体类型）。
+    std::unique_ptr<vec::VectorEnginePlugin> vec_plugin_;
     std::optional<search::HybridSearcher> hybrid_;
     // S14-4 legacy 全局 rebase 标志（自 shim 迁来）：管 docmap base 决策 +
     // 收链联动（force_ckpt_rebase 同步两插件自持标志）。

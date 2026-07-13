@@ -69,8 +69,7 @@ Cask::upgrade(std::string_view dirname,
     cask->text_ = std::make_unique<text::TextPlugin>(
         search_config.text_config(), *cask->docmap_, *cask->docmap_,
         *cask->docmap_);
-    cask->vec_plugin_ = std::make_unique<vec::VectorPlugin>(
-        search_config.vector_config(), *cask->docmap_);
+    cask->vec_plugin_ = cask->create_vector_plugin(search_config);
     cask->hybrid_.emplace(*cask->text_, *cask->vec_plugin_);
     // S18-8：恢复重放经 plugins_ 广播——upgrade 手工装配路径同样要注册。
     cask->plugins_ = {cask->text_.get(), cask->vec_plugin_.get()};
@@ -125,7 +124,14 @@ bool Cask::migrate_legacy_search_ckpt() {
     // 1) 读旧 ckpt → 内存态（不写 keydir，已由 caller 在 recovery 阶段
     // 后续的 load_recovery_snapshots 接管；这里只关心段载入与写新文件）。
     // S19-2：legacy 读取器收编（load-only；shim 已降级测试夹具）。
-    auto result = legacy_ckpt::load(old_ckpt, *docmap_, *text_, *vec_plugin_);
+    // legacy 统一 ckpt 是 HNSW 纪元产物（IVF 库按构造无 legacy 形态）；
+    // 非 HNSW 引擎直接判失败退全量 fold（防御，不可达）。
+    if (meta_config_.vector_engine != meta::VectorEngine::kHnsw) {
+        log_warn("migrate_legacy: non-hnsw engine cannot own legacy ckpt");
+        return false;
+    }
+    auto& hnsw_vp = static_cast<vec::VectorPlugin&>(*vec_plugin_);
+    auto result = legacy_ckpt::load(old_ckpt, *docmap_, *text_, hnsw_vp);
     if (!result.loaded) {
         log_warn("migrate_legacy: failed to load legacy search.ckpt");
         return false;
@@ -152,8 +158,8 @@ bool Cask::migrate_legacy_search_ckpt() {
     (void)all_dirty;
     const bool bm25_ok = text_->save_component_base(dirname_,
                                                     result.watermark);
-    const bool vec_ok = vec_plugin_->save_component_base(dirname_,
-                                                         result.watermark);
+    const bool vec_ok = hnsw_vp.save_component_base(dirname_,
+                                                    result.watermark);
     if (!docmap_ok || !bm25_ok) {
         log_warn("migrate_legacy: failed to write per-component base "
                  "(docmap=" + std::to_string(docmap_ok) +

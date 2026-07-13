@@ -78,6 +78,9 @@ struct SearchLayerConfig {
     // ≤ 本值 + auto 阈值。base 成本已被 S14-2/S14-8 追加摊薄（全量重写仅
     // BVH2 header ≈165B/节点）。0 = 关。
     std::uint32_t vector_rebase_min_docs = 262144;
+    // S32-M3：IVF 引擎参数（vector_engine=kIvfRq 时生效）。0 = 自动。
+    std::uint32_t vector_ivf_nlist = 0;
+    std::uint32_t vector_ivf_nprobe = 0;
 
     // S27-4 P2:文本插件 builder 线程数。0 = 内联(历史行为,默认);>=1 =
     // DWPT 并行 builder。语义详见 text_plugin_config.hpp。
@@ -102,7 +105,8 @@ struct SearchLayerConfig {
     }
     [[nodiscard]] vec::VectorPluginConfig vector_config() const {
         return {vector_dim, vector_metric, hnsw_m, hnsw_ef_construction,
-                vector_inmem_int8, max_delta_chain, vector_rebase_min_docs};
+                vector_inmem_int8, max_delta_chain, vector_rebase_min_docs,
+                vector_ivf_nlist, vector_ivf_nprobe};
     }
 };
 

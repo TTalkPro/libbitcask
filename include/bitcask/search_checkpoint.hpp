@@ -62,6 +62,10 @@ enum class CkptSectionType : std::uint16_t {
     // 文件 → 安全忽略（未知段类型跳过语义对 SealedSegment::load 不适用，
     // 因 load 路径只识别已知段型；新写端在 kSegFields 不识别时应整体拒收）。
     kSegFields        = 16,
+    // S32-M3：IVF 引擎 base 段（只出现在 ivf.ckpt）：gen u64 | count u64 |
+    // dim u16 | nlist u32——与 ivf.biv 侧车头交叉校验（gen 守卫同 kHnsw
+    // payload 语义）。delta 链复用 kHnswDelta（通用向量插入日志，格式同）。
+    kIvf              = 17,
 };
 
 // 写入用:caller 持有 payload 字节。

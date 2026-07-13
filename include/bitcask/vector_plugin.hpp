@@ -26,6 +26,7 @@
 #include "bitcask/meta_filter.hpp"
 #include "bitcask/plugin_api.hpp"    // S18-5：实现 CaskPlugin
 #include "bitcask/search_types.hpp"  // search::SearchHit / SearchError
+#include "bitcask/vector_engine_plugin.hpp"  // S32-M3：引擎契约基类
 
 #include <atomic>
 #include <cstddef>
@@ -41,7 +42,7 @@ namespace bitcask::vec {
 
 // VectorPluginConfig 定义已迁 vector_plugin_config.hpp（S20-4）。
 
-class VectorPlugin final : public plugin::CaskPlugin {
+class VectorPlugin final : public VectorEnginePlugin {
 public:
     // dim>0 时构造 HNSW 图。metric 映射：kCosineNormalized/kDot →
     // HnswMetric::kDot（cosine 已在写入端归一化），kL2 → kL2。
@@ -51,8 +52,12 @@ public:
     VectorPlugin(const VectorPlugin&) = delete;
     VectorPlugin& operator=(const VectorPlugin&) = delete;
 
-    [[nodiscard]] bool enabled() const noexcept { return config_.dim > 0; }
-    [[nodiscard]] std::uint16_t dim() const noexcept { return config_.dim; }
+    [[nodiscard]] bool enabled() const noexcept override {
+        return config_.dim > 0;
+    }
+    [[nodiscard]] std::uint16_t dim() const noexcept override {
+        return config_.dim;
+    }
 
     // ---- plugin::CaskPlugin（S18-5：写路径直连；flush/open 实装在 S18-6）----
     // 写入端归一化已在宿主 put 路径同步完成（normalize_for_write），事件里
@@ -79,7 +84,7 @@ public:
     // run_serialized 投递 reducer 静止点（单写者约束保持；rebuild 内部
     // 自置 rebase 标志）。无向量配置 no-op。
     void on_merge_commit(const plugin::MergeCommitEvent&) override;
-    void force_rebase() noexcept {
+    void force_rebase() noexcept override {
         rebase_needed_.store(true, std::memory_order_relaxed);
     }
     [[nodiscard]] bool rebase_needed() const noexcept {
@@ -92,11 +97,11 @@ public:
     // 边界翻译成 CaskFault（消息逐字保留）。空输入 → 空 span（合法：无向量）。
     [[nodiscard]] std::expected<std::span<const float>, const char*>
     normalize_for_write(std::span<const float> input,
-                        std::vector<float>& norm_buf) const;
+                        std::vector<float>& norm_buf) const override;
 
     // ---- 写（reducer 单写者）----
     // 防御：无图 / dim 不符直接忽略。ord ≥ delta 窗口水位才入插入日志。
-    void insert(std::uint64_t ord, std::span<const float> v);
+    void insert(std::uint64_t ord, std::span<const float> v) override;
 
     // ---- 查询（线程安全）----
     // cosine 配置时内部归一化查询向量（零向量返回空）；ef=0 → max(k,64)。
@@ -104,14 +109,14 @@ public:
     [[nodiscard]] std::expected<std::vector<search::SearchHit>,
                                 search::SearchError>
     search(std::span<const float> query, std::size_t k, std::size_t ef,
-           const meta::MetaFilter* filter) const;
+           const meta::MetaFilter* filter) const override;
 
     // merge 重建（物理清死节点；单写者上下文）。S13-P8：clone_live 结构化
     // 拷贝 + 原子换指针。调用方负责 ckpt rebase 标志（legacy 全局语义）。
-    void rebuild();
+    void rebuild() override;
 
     // 图节点数（含软删死节点；观测用）。无图 = 0。
-    [[nodiscard]] std::size_t size() const;
+    [[nodiscard]] std::size_t size() const override;
 
     // 图句柄（legacy 统一 ckpt 容器路径用；P5 随 legacy 收编后删除）。
     [[nodiscard]] std::shared_ptr<HnswIndex> graph() const {
@@ -122,7 +127,7 @@ public:
     }
 
     // ---- 记账 ----
-    [[nodiscard]] bool dirty() const noexcept {
+    [[nodiscard]] bool dirty() const noexcept override {
         return dirty_.load(std::memory_order_relaxed);
     }
     void clear_dirty() noexcept {

@@ -28,6 +28,10 @@ struct VectorPluginConfig {
     // = 崩溃恢复链重放的直接代价（重放即重新建图），纯 KV 写不误触发。
     // 0 = 关（退回仅链长门，恢复窗口最坏 max_delta_chain × auto 阈值）。
     std::uint32_t      rebase_min_docs = 262144;
+    // S32-M3：IVF 引擎参数（engine=kIvfRq 时生效；HNSW 忽略）。0 = 自动
+    // （nlist = 4·√N；nprobe = max(nlist/32, 8)）。
+    std::uint32_t      ivf_nlist = 0;
+    std::uint32_t      ivf_nprobe = 0;
 };
 
 }  // namespace bitcask::vec

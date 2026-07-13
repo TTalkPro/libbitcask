@@ -63,7 +63,9 @@ inline std::string_view bytes_to_view(std::span<const std::byte> b) {
 inline std::optional<bitcask::ComponentId>
 component_of_plugin(std::string_view name) {
     if (name == "bm25") return bitcask::ComponentId::kBm25;
-    if (name == "hnsw") return bitcask::ComponentId::kVec;
+    // kVec 槽 = 向量组件（引擎无关）：每库仅一个向量插件（建库时经
+    // meta.vector_engine 选定），HNSW/IVF 共用同一 manifest 槽（S32-M3）。
+    if (name == "hnsw" || name == "ivfrq") return bitcask::ComponentId::kVec;
     return std::nullopt;
 }
 

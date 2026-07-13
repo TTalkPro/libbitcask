@@ -223,6 +223,22 @@ target_link_libraries(bitcask_hnsw_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_ivf_rq_test ivf_rq_test.cpp)
+target_link_libraries(bitcask_ivf_rq_test PRIVATE
+    GTest::gtest_main
+    bitcask_vector
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
+add_executable(bitcask_ivf_plugin_test ivf_plugin_test.cpp)
+target_link_libraries(bitcask_ivf_plugin_test PRIVATE
+    GTest::gtest_main
+    bitcask_vector_plugin
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 include(GoogleTest)
 
 # C1:TSan 下给所有测试注入 suppression 文件(见 cmake/tsan.supp 头注释:
@@ -260,6 +276,8 @@ gtest_discover_tests(bitcask_wildcard_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_synonym_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_fuzzy_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_hnsw_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_ivf_rq_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_ivf_plugin_test ${_bitcask_test_props})
 
 # S15-1：plugin_api 头自包含测试——只链 bitcask_plugin_api（+gtest），
 # 编译通过即证明接口层对 search/bm25/vector 零依赖。

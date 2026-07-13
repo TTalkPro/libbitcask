@@ -154,10 +154,10 @@ private:
 
 namespace bitcask::vec {
 
-// HNSW 向量查询门面。
+// 向量查询门面（S32-M3：吃引擎契约基类，HNSW/IVF 同门面）。
 class Searcher {
 public:
-    Searcher(Cask& cask, const VectorPlugin& plugin)
+    Searcher(Cask& cask, const VectorEnginePlugin& plugin)
         : cask_(cask), plugin_(plugin) {}
 
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
@@ -177,8 +177,8 @@ public:
     }
 
 private:
-    Cask&               cask_;
-    const VectorPlugin& plugin_;
+    Cask&                     cask_;
+    const VectorEnginePlugin& plugin_;
 };
 
 }  // namespace bitcask::vec

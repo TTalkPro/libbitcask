@@ -9,7 +9,7 @@
 #pragma once
 
 #include "bitcask/text_plugin.hpp"
-#include "bitcask/vector_plugin.hpp"
+#include "bitcask/vector_engine_plugin.hpp"  // S32-M3：引擎契约
 
 #include <cstddef>
 #include <expected>
@@ -21,7 +21,8 @@ namespace bitcask::search {
 
 class HybridSearcher {
 public:
-    HybridSearcher(const text::TextPlugin& text, const vec::VectorPlugin& vec)
+    HybridSearcher(const text::TextPlugin& text,
+                   const vec::VectorEnginePlugin& vec)
         : text_(text), vec_(vec) {}
 
     // V3.6：RRF 混合检索（hnsw-design §4）。两路各取 K'=max(k×4, 64)；
@@ -37,7 +38,7 @@ public:
 
 private:
     const text::TextPlugin&  text_;
-    const vec::VectorPlugin& vec_;
+    const vec::VectorEnginePlugin& vec_;
 };
 
 }  // namespace bitcask::search
