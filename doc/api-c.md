@@ -272,7 +272,8 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts);
 | `vector_dim`         | `uint16_t`            | `0`     | 向量维度（`0`=无向量）|
 | `vector_metric`      | `bitcask_vector_metric_t` | `NONE` | 距离度量 |
 | `vector_quantized`   | `int`                 | `0`     | 落盘 int8 量化 |
-| `vector_inmem_int8`  | `int`                 | `0`     | HNSW int8-only 内存模式 |
+| `vector_inmem_int8`  | `int`                 | `0`     | HNSW int8-only 内存模式（仅 hnsw 引擎） |
+| `vector_engine`      | `bitcask_vector_engine_t` | `HNSW` | **S32：向量引擎**。`HNSW`（默认，≤2-4M 向量内存档）/ `IVFRQ`（磁盘档推荐，10M-100M）/ `DISKANN`（实验性）。建库时一次性选定、持久化进 `bitcask.meta`；重开不一致 → `BITCASK_ERR_MODE_MISMATCH`；运行期切换用离线工具 `vec_engine_migrate`。磁盘档引擎要求 COSINE/DOT 度量（L2 → `INVALID_OPTION`） |
 
 **HNSW 建图（S13-D11）**
 
@@ -280,6 +281,16 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts);
 |------|------|------|------|
 | `hnsw_m`              | `uint32_t` | `0` | `M`（`0`=默认 16）|
 | `hnsw_ef_construction` | `uint32_t` | `0` | `ef_construction`（`0`=默认 200）|
+
+**向量引擎调优（S32）**
+
+| 字段 | 类型 | 默认 | 含义 |
+|------|------|------|------|
+| `vector_rebase_min_docs` | `uint32_t` | `262144` | 向量组件 base rebase 窗口门（崩溃恢复重放上界；全引擎；`0`=关，仅链长门） |
+| `vector_ivf_nlist`   | `uint32_t` | `0` | IVFRQ：簇数（`0`=自动 4·√N） |
+| `vector_ivf_nprobe`  | `uint32_t` | `0` | IVFRQ：查询探簇数（`0`=自动；`bitcask_search_vector` 的 `ef` 参数非 0 时按 nprobe 解释） |
+| `vector_diskann_r`   | `uint32_t` | `0` | DISKANN：邻接容量（`0`=32） |
+| `vector_diskann_l_build` | `uint32_t` | `0` | DISKANN：建图 beam 宽（`0`=max(64, 2r)；查询 beam 宽走 `ef` 参数） |
 
 **日志回调（S13-D7）**
 
