@@ -6,7 +6,7 @@ C API 是 C++ `bitcask::Cask` 的薄 `extern "C"` 包装，编译产物：
 
 | 产物 | 说明 |
 |------|------|
-| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=3`，`VERSION=3.1.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 3.1.0)` 单一真源派生）|
+| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=4`，`VERSION=4.0.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 4.0.0)` 单一真源派生）|
 | `libbitcask.a` | 合并全部静态归档的单一 `.a`（定义 `BITCASK_STATIC_LIB` 去掉导出修饰）|
 
 符号导出由 `BITCASK_API` 宏控制（`bitcask_kv.h` §符号导出宏），Windows 下退化为 `__declspec(dllimport/dllexport)`，其它平台默认 `__attribute__((visibility("default")))`。
@@ -74,7 +74,7 @@ gcc -DBITCASK_STATIC_LIB app.c -I<c_api 头目录> libbitcask.a -o app
 
 ## 3. 版本信息
 
-版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 3.1.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
+版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 4.0.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
 
 ```c
 BITCASK_API int          bitcask_version_major(void);
@@ -84,7 +84,7 @@ BITCASK_API const char*  bitcask_version_string(void);   // "major.minor.patch"�
 ```
 
 - `bitcask_version_string()` 返回的是库内静态字符串（指向 `BITCASK_VERSION_STRING` 宏展开的字符串字面量），**不需要 free**。
-- 运行时返回值与 `libbitcask.so.3.1.0` 文件名完全对应；SOVERSION 是 `3`（大版本号），反映 ABI 兼容性。
+- 运行时返回值与 `libbitcask.so.4.0.0` 文件名完全对应；SOVERSION 是 `4`（大版本号），反映 ABI 兼容性。
 
 ---
 
@@ -924,9 +924,11 @@ BITCASK_API void bitcask_search_result_batch_free(bitcask_search_result_t** resu
 
 ---
 
-## 14. HNSW 向量检索与 RRF 混合检索
+## 14. 向量检索（HNSW / IVF-RaBitQ / DiskANN）与 RRF 混合检索
 
-### 14.1 `bitcask_search_vector`（HNSW 向量 ANN）
+> 向量引擎由 `bitcask_options_t::vector_engine` 建库时选定（见 [§6.5](#65-bitcask_options_t打开选项)），持久化进 `bitcask.meta`。`HNSW`（默认，内存图）/ `IVFRQ`（IVF 磁盘段，10M-100M 推荐）/ `DISKANN`（Vamana 图，实验性）。以下接口对三引擎统一——查询参数 `ef` 在 IVF 引擎下按 `nprobe` 解释。
+
+### 14.1 `bitcask_search_vector`（向量 ANN）
 
 ```c
 BITCASK_API bitcask_error_t bitcask_search_vector(bitcask_t* cask,
@@ -1068,7 +1070,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 | `bitcask_get` | ✅（读路径无锁）|
 | `bitcask_put` / `bitcask_put_ex` / `bitcask_put_doc` / `bitcask_put_batch` / `bitcask_delete` / `bitcask_sync` / `bitcask_close_write_file` | ✅（内部 `write_mu_` 串行化；同一 handle 多线程写安全。单写吞吐不受锁影响；多写**安全但不提速**——更高写并发按目录分片多实例横向扩展）|
 | `bitcask_search_text` / `_phrase` / `_bool` / `_fields` / `_near` / `_fuzzy` / `_wildcard` / `_filtered` | ✅（并发读安全，shared_lock / 无锁）|
-| `bitcask_search_vector` / `_hybrid` 及对应 `_filtered` / `_batch` | ✅（HNSW 读路径；批量接口走共享 `search_arena` inter-query 并行）|
+| `bitcask_search_vector` / `_hybrid` 及对应 `_filtered` / `_batch` | ✅（向量引擎读路径；批量接口走共享 `search_arena` inter-query 并行）|
 | 同义词词典（`options.synonym_file_path`，open-time） | ✅（不可变 → 并发查询安全；无运行期 setter）|
 | `bitcask_iter_*` | ⚠️（同一 iter 不可并发；每线程一个迭代器；不同 iter 之间并发安全）|
 | `bitcask_parallel_scan` | ✅（内部多线程并发 `get`；**回调可能多线程并发触发**——回调须线程安全）|

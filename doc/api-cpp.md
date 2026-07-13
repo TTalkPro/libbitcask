@@ -35,7 +35,10 @@ libbitcask 有两种工作模式，由 `CaskOptions` 决定：
 #include <bitcask/ngram_analyzer.hpp>  // text::NgramAnalyzer
 #include <bitcask/stemming_analyzer.hpp>    // text::StemmingAnalyzer
 #include <bitcask/text_plugin.hpp>     // text::TextPlugin
-#include <bitcask/vector_plugin.hpp>   // vec::VectorPlugin
+#include <bitcask/vector_plugin.hpp>   // vec::VectorPlugin（HNSW 引擎）
+#include <bitcask/vector_engine_plugin.hpp>  // vec::VectorEnginePlugin（引擎契约基类，S32）
+#include <bitcask/ivf_plugin.hpp>     // vec::IvfPlugin（IVF-RaBitQ 引擎，S32-M3）
+#include <bitcask/diskann_plugin.hpp> // vec::DiskannPlugin（DiskANN 引擎，S32-M5，实验性）
 #include <bitcask/hybrid_searcher.hpp> // search::HybridSearcher
 #include <bitcask/plugin_api.hpp>      // plugin::CaskPlugin / PluginHost / OpenContext
 #include <bitcask/merge_policy.hpp>    // merge::PolicyOptions / Decision / FileStatus
@@ -61,7 +64,7 @@ libbitcask 有两种工作模式，由 `CaskOptions` 决定：
 | `max_read_handles` | `std::size_t` | `0` | read 句柄缓存上限；`0`=由 RLIMIT_NOFILE 推导的安全默认；`kUnlimitedReadHandles`=不设上限；其它 N=显式上限；超额近似 LRU 淘汰空闲句柄 | `cask.hpp` |
 | `o_sync` | `bool` | `false` | 每条写 durable（`O_SYNC`）；为真时 `sync_every_n` 无意义 | `cask.hpp` |
 | `sync_every_n` | `std::uint32_t` | `0` | 单写者组提交：每 N 次写 fsync 一次；`0`=关闭 | `cask.hpp` |
-| `auto_checkpoint_min_docs` | `std::uint32_t` | `0` | 自动 checkpoint 阈值：自上次 ckpt 起 ord 增量 ≥ 本值则异步落快照；`0`=关闭；仅索引模式生效 | `cask.hpp` |
+| `auto_checkpoint_min_docs` | `std::uint32_t` | `65536` | 自动 checkpoint 阈值：自上次 ckpt 起 ord 增量 ≥ 本值则异步落快照；`0`=关闭；仅索引模式生效 | `cask.hpp` |
 | `require_hint_crc` | `bool` | `false` | 是否要求 hint trailer CRC 通过 | `cask.hpp` |
 | `expiry_secs` | `std::uint32_t` | `0` | TTL：tstamp < now − expiry_secs 的 record 在 get / fold 中被过滤，并触发 merge；`0`=禁用 | `cask.hpp` |
 | `merge_only` | `bool` | `false` | merge-only 模式：拿 `bitcask.merge.lock`，不创建 active writer；可与 live writer 并行 merge | `cask.hpp` |
@@ -73,6 +76,7 @@ libbitcask 有两种工作模式，由 `CaskOptions` 决定：
 | `vector_quantized` | `bool` | `false` | 向量落盘 int8 量化（4× 磁盘，有损） | `cask.hpp` |
 | `vector_inmem_int8` | `bool` | `false` | HNSW int8-only 内存（约 −80% 向量内存，仅 kDot）；与 `vector_quantized` 正交 | `cask.hpp` |
 | `vector_metric` | `meta::VectorMetric` | `kCosineNormalized` | 向量距离度量 | `cask.hpp` / `meta_file.hpp` |
+| `vector_engine` | `meta::VectorEngine` | `kHnsw` | **S32：向量引擎**。建库时一次性选定、写入 `bitcask.meta`，重开不符 → `kModeMismatch`，运行期不可切换（离线切换用 `vec_engine_migrate`）。`kHnsw`（默认，内存档）/ `kIvfRq`（IVF 磁盘段，10M-100M 推荐）/ `kDiskann`（Vamana 图，实验性）。磁盘档要求 `kCosineNormalized`/`kDot` 度量 | `cask.hpp` / `meta_file.hpp` |
 | `synonym_map` | `std::shared_ptr<const text::SynonymMap>` | `nullptr` | 同义词词典（open-time、不可变）；查询时自动展开 | `cask.hpp` / `synonym_map.hpp` |
 | `log_fn` | `std::function<void(LogLevel, std::string_view)>` | `nullptr` | 日志回调（open-time、不可变）；空=不回调 | `cask.hpp` |
 
@@ -81,7 +85,7 @@ libbitcask 有两种工作模式，由 `CaskOptions` 决定：
 - `CaskOptions::kUnlimitedReadHandles`：静态常量 `static constexpr std::size_t kUnlimitedReadHandles = static_cast<std::size_t>(-1);`
 - `enum class CaskOptions::LogLevel : std::uint8_t { kWarn = 0, kError = 1 };`
 
-> 向量配置（`vector_dim` / `vector_metric` / `vector_quantized` / `vector_inmem_int8`）创建即固定，写入 `bitcask.meta`；重开校验不符 → `kModeMismatch`。
+> 向量配置（`vector_dim` / `vector_metric` / `vector_quantized` / `vector_inmem_int8` / `vector_engine`）创建即固定，写入 `bitcask.meta`；重开校验不符 → `kModeMismatch`。
 
 ### 3.2 `bitcask::CaskError`（错误码枚举，`cask.hpp`）
 
@@ -138,6 +142,7 @@ struct MetaConfig {
     std::uint16_t vector_dim       = 0;     // 0 = 无向量
     bool          vector_quantized = false; // P3b：向量落盘 int8 量化
     bool          vector_inmem_int8 = false;// P5b：HNSW int8-only 内存
+    VectorEngine  vector_engine    = VectorEngine::kHnsw; // S32-M0：向量引擎
 };
 ```
 
@@ -152,6 +157,18 @@ struct MetaConfig {
 
 struct MetaError { int errnum = 0; std::string message; };
 ```
+
+### 3.7 `bitcask::meta::VectorEngine`（`meta_file.hpp`）
+
+S32-M0 向量引擎枚举。建库时一次性选定、持久化进 `bitcask.meta`；重开不一致 → `kModeMismatch`。运行期不可切换——离线切换用 `vec_engine_migrate` 工具（只改 meta，首次 open 全量 fold 重建，可回滚）。`kHnsw = 0` 使旧 meta 保留区全零自然解码为 HNSW（与 `VectorMetric::kNone` 同款零升级）。
+
+| 值 | 含义 |
+|----|------|
+| `kHnsw` | 内存图（≤数 M 向量档；现行实现）|
+| `kIvfRq` | IVF-RaBitQ 磁盘档（S32-M3；10M-100M）：k-means 分簇 + int8 posting + 1-bit RaBitQ-lite 粗筛 + 两级质心索引 |
+| `kDiskann` | DiskANN / Vamana 单层图（S32-M5；**实验性**，真实语料验证前不建议生产）|
+
+> 磁盘档引擎（`kIvfRq` / `kDiskann`）要求 `kCosineNormalized` 或 `kDot` 度量（`kL2` → `kInvalidOption`）。
 
 ---
 
@@ -565,7 +582,7 @@ search_wildcard(std::string_view pattern, std::size_t k);
 
 S8.4：`*` / `?` 模式匹配。
 
-#### `Cask::search_vector`（HNSW 向量 ANN）
+#### `Cask::search_vector`（向量 ANN）
 
 ```cpp
 [[nodiscard]] std::expected<TextSearchResult, CaskFault>
@@ -574,9 +591,9 @@ search_vector(std::span<const float> query, std::size_t k = 10,
               const meta::MetaFilter* filter = nullptr);
 ```
 
-`query.size()` 必须 == `vector_dim`；`cosine` 配置时内部归一化（零向量返回空命中）；`ef = 0` → `max(k, 64)`。结果按相似度降序（`kDot`=内积；`kL2`=负平方距离），死文档经 live 过滤不出现。`filter` 非空时与 `is_live` 组合成 HNSW live callback（无需 overfetch），结果可能少于 `k`。
+向量 ANN 检索——引擎由 `CaskOptions::vector_engine` 建库时选定（`kHnsw` / `kIvfRq` / `kDiskann`）。`query.size()` 必须 == `vector_dim`；`cosine` 配置时内部归一化（零向量返回空命中）；`ef = 0` → `max(k, 64)`（IVF 引擎下 `ef` 按 `nprobe` 解释）。结果按相似度降序（`kDot`=内积；`kL2`=负平方距离），死文档经 live 过滤不出现。`filter` 非空时与 `is_live` 组合成 live callback（无需 overfetch），结果可能少于 `k`。
 
-#### `Cask::search_vector_batch`（批量 HNSW）
+#### `Cask::search_vector_batch`（批量向量）
 
 ```cpp
 [[nodiscard]] std::vector<std::expected<TextSearchResult, CaskFault>>
@@ -585,7 +602,7 @@ search_vector_batch(std::span<const std::span<const float>> queries,
                     const meta::MetaFilter* filter = nullptr);
 ```
 
-S7-4：K 条独立向量查询并发跑共享 Search 池，保序返回。
+S7-4：K 条独立向量查询并发跑共享 Search 池，保序返回。引擎由 `vector_engine` 选定（同 `search_vector`）。
 
 #### `Cask::search_hybrid`（RRF 混合检索）
 
@@ -651,9 +668,9 @@ void                     flush_index();                        // 排空异步�
                           search_error_fault(search::SearchError e);  // SearchError → CaskFault
 
 // 插件句柄（高级用法 / Searcher 门面 / C API 层用；所有权在 Cask；未启用搜索 = nullptr）
-[[nodiscard]] const text::TextPlugin*        text_plugin()        const;
-[[nodiscard]] const vec::VectorPlugin*       vector_plugin()      const;
-[[nodiscard]] const search::HybridSearcher*  hybrid_searcher()    const;
+[[nodiscard]] const text::TextPlugin*             text_plugin()        const;
+[[nodiscard]] const vec::VectorEnginePlugin*      vector_plugin()      const;  // S32-M3：引擎契约基类（HNSW/IVF/DiskANN 按 meta.vector_engine 定）
+[[nodiscard]] const search::HybridSearcher*       hybrid_searcher()    const;
 
 // S16-1：DocMap 宿主服务句柄（索引模式下非空；与插件借用的 docmap 同一实例）
 [[nodiscard]] const std::shared_ptr<index::Index>& docmap()     const;
@@ -848,11 +865,23 @@ public:
 | `cache_max_entries` | `std::size_t` | `256` | 查询缓存上限；`0`=禁用 |
 | `doc_text_cache_max` | `std::size_t` | `1024` | 高亮原文 LRU 上限；`0`=不缓存（高亮降级为无片段）|
 | `index_positions` | `bool` | `true` | 是否索引词位置；`false` 时省内存但 `search_phrase` / `search_near` 失效 |
-| `vector_dim` | `std::uint16_t` | `0` | `>0` 时构造 HnswIndex |
+| `index_catch_all` | `bool` | `true` | S26-2：catch-all 开关。`false` 时非默认字段词项不合并进默认字段（多字段库倒排量/内存/ckpt ~减半），代价 `search_text` 不再命中多字段文档 |
+| `vector_dim` | `std::uint16_t` | `0` | `>0` 时构造向量索引 |
 | `vector_metric` | `meta::VectorMetric` | `kNone` | `kCosineNormalized`/`kDot` → HNSW `kDot`；`kL2` → `kL2` |
 | `hnsw_m` | `std::uint32_t` | `0` | HNSW 建图参数（0=HnswConfig 默认 M=16）|
 | `hnsw_ef_construction` | `std::uint32_t` | `0` | HNSW 建图参数（0=HnswConfig 默认 ef_construction=200）|
 | `vector_inmem_int8` | `bool` | `false` | HNSW int8-only 内存（仅 kDot）|
+| `vector_rebase_min_docs` | `std::uint32_t` | `262144` | S32-M1：向量组件 base rebase 窗口门（崩溃恢复重放上界；全引擎）；`0`=关，仅链长门 |
+| `vector_ivf_nlist` | `std::uint32_t` | `0` | S32-M3：IVF 簇数（`0`=自动 4·√N）|
+| `vector_ivf_nprobe` | `std::uint32_t` | `0` | S32-M3：IVF 查询探簇数（`0`=自动）|
+| `vector_diskann_r` | `std::uint32_t` | `0` | S32-M5：DiskANN 邻接容量（`0`=32）|
+| `vector_diskann_l_build` | `std::uint32_t` | `0` | S32-M5：DiskANN 建图 beam 宽（`0`=max(64, 2r)）|
+| `hnsw_build_nav_int8` | `bool` | `true` | S29-11-②：HNSW 建图导航 int8 混合精度（入选邻居 f32 精选，召回零损失；`false`=全 f32 回退闸）|
+| `builder_threads` | `std::size_t` | `0` | S27-4 P2：文本插件 builder 线程数。`0`=内联（默认）；`>=1`=DWPT 并行 builder |
+| `seal_v2_segments` | `bool` | `true` | S30-P2：封口段格式（`true`=v2 mmap 零驻留；`false`=v1 全量驻留回退）|
+| `seal_ram_budget_bytes` | `std::size_t` | `0` | S30-P2：building 段 RAM 预算（`>0` 超预算就地封口；`0`=关）|
+| `merge_fan_in` | `std::size_t` | `8` | 段 merge fan-in |
+| `mmap_verify_crc` | `bool` | `true` | mmap 段是否校验 CRC |
 | `auto_compact_dead_ratio` | `double` | `0.0` | 后台自动 compaction 的 per-list 死占比阈值；`0`=关闭 |
 | `synonym_map` | `std::shared_ptr<const text::SynonymMap>` | `nullptr` | 同义词词典（open-time、不可变）|
 | `max_delta_chain` | `std::uint32_t` | `64` | delta 链长上限，达到后 flush 强制全量 base（坍缩链）；`0`=不设限 |
@@ -1300,7 +1329,19 @@ public:
 };
 ```
 
-### 7.11 `bitcask::vec::VectorPlugin`（`vector_plugin.hpp`）
+### 7.11 `bitcask::vec::VectorEnginePlugin`（引擎契约基类）与三引擎实现
+
+S32-M3 起向量引擎抽象为 `VectorEnginePlugin` 契约基类（`vector_engine_plugin.hpp`）——`Cask::vector_plugin()` 返回此基类指针，实际实现按 `meta.vector_engine` 选定：
+
+| 引擎 | `meta::VectorEngine` | 实现类 | 头文件 | 定位 |
+|------|---------------------|--------|--------|------|
+| HNSW | `kHnsw`（默认）| `vec::VectorPlugin` | `vector_plugin.hpp` | 内存图（≤数 M 向量）|
+| IVF-RaBitQ | `kIvfRq` | `vec::IvfPlugin` | `ivf_plugin.hpp` | IVF 磁盘段（10M-100M 推荐）|
+| DiskANN | `kDiskann`（实验性）| `vec::DiskannPlugin` | `diskann_plugin.hpp` | Vamana 单层图 |
+
+> 下方 `VectorPlugin` 文档以 HNSW 实现为代表；IVF/DiskANN 实现同一 `CaskPlugin` 接口契约，差异在内部段结构与查询内核。
+
+### 7.11a `bitcask::vec::VectorPlugin`（HNSW 引擎，`vector_plugin.hpp`）
 
 `plugin::CaskPlugin` 实现。reducer 单写者 + 查询线程多读者（`hnsw_` 为 `atomic<shared_ptr>`：rebuild 旁路建新图 + 原子换指针，旧图由引用计数续命）。
 
@@ -1378,12 +1419,12 @@ public:
 
 ### 7.12 `bitcask::search::HybridSearcher`（`hybrid_searcher.hpp`）
 
-RRF 融合器。持 `TextPlugin` / `VectorPlugin` 的查询接口引用，两路各超采 `K' = max(4k, 64)`，RRF(60) 融合，ord 决胜。**非插件**（只装一个插件的部署不链接）。
+RRF 融合器。持 `TextPlugin` / `VectorEnginePlugin` 的查询接口引用，两路各超采 `K' = max(4k, 64)`，RRF(60) 融合，ord 决胜。**非插件**（只装一个插件的部署不链接）。
 
 ```cpp
 class HybridSearcher {
 public:
-    HybridSearcher(const text::TextPlugin& text, const vec::VectorPlugin& vec);
+    HybridSearcher(const text::TextPlugin& text, const vec::VectorEnginePlugin& vec);
 
     [[nodiscard]] std::expected<std::vector<SearchHit>, SearchError>
     search(std::string_view text_query, std::span<const float> vec_query,
@@ -1534,12 +1575,22 @@ struct TextPluginConfig {
 
 // vector_plugin_config.hpp
 struct VectorPluginConfig {
-    std::uint16_t dim               = 0;   // 0 = 无向量
-    meta::VectorMetric metric       = meta::VectorMetric::kNone;
-    std::uint32_t hnsw_m            = 0;   // 0 = HnswConfig 默认
-    std::uint32_t hnsw_ef_construction = 0;
-    bool          inmem_int8        = false;
-    std::uint32_t max_delta_chain   = 64;
+    std::uint16_t      dim = 0;                               // 0 = 无向量
+    meta::VectorMetric metric = meta::VectorMetric::kNone;
+    std::uint32_t      hnsw_m = 0;                            // 0 = HnswConfig 默认
+    std::uint32_t      hnsw_ef_construction = 0;
+    bool               inmem_int8 = false;                    // P5b：HNSW int8-only 内存
+    std::uint32_t      max_delta_chain = 64;                  // delta 链长上限
+    // S32-M1：base rebase 窗口门（自 base 起实际入图向量数达此值即强制全量 base）
+    std::uint32_t      rebase_min_docs = 262144;              // 0 = 关，仅链长门
+    // S32-M3：IVF 引擎参数（engine=kIvfRq 时生效；HNSW 忽略）。0 = 自动
+    std::uint32_t      ivf_nlist = 0;                         //   nlist = 4·√N
+    std::uint32_t      ivf_nprobe = 0;                        //   nprobe = max(nlist/32, 8)
+    // S32-M5：DiskANN 引擎参数（engine=kDiskann 时生效）。0 = 自动
+    std::uint32_t      diskann_r = 0;                         //   r = 32（邻接容量）
+    std::uint32_t      diskann_l_build = 0;                   //   l_build = max(64, 2r)
+    // S29-11-②：HNSW 建图导航 int8 混合精度（默认开；false = 全 f32 回退闸）
+    bool               hnsw_build_nav_int8 = true;
 };
 ```
 

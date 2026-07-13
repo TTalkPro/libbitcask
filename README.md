@@ -25,7 +25,8 @@
 | 模糊 / 通配符 | `search_fuzzy` / `search_wildcard` | Levenshtein / `*?` 模式 | [`api-cpp.md`](doc/api-cpp.md) |
 | 高亮 | `search_text_highlight` | 命中片段截取 | [`api-cpp.md`](doc/api-cpp.md) |
 | 批量检索 | `search_text_batch` / `search_vector_batch` / `search_hybrid_batch` | 多条独立查询并发跑共享 Search 池（inter-query 并行），保序返回 | [`api-cpp.md`](doc/api-cpp.md) |
-| 向量 ANN | `search_vector` | HNSW，支持 int8 量化与 int8-only 内存 | [`hnsw-overview-zh.md`](doc/hnsw-overview-zh.md) |
+| 向量 ANN | `search_vector` | 三引擎可选：`hnsw`（默认，内存档）/ `ivfrq`（IVF 磁盘段，10M-100M 推荐）/ `diskann`（Vamana 图，实验性）；HNSW 支持 int8 量化与 int8-only 内存 | [`hnsw-overview-zh.md`](doc/hnsw-overview-zh.md) / [`vector-dual-engine-selection-zh.md`](doc/vector-dual-engine-selection-zh.md) |
+| 向量引擎迁移 | `vec_engine_migrate`（CLI） | 离线切换向量引擎（只改 meta，首次 open 全量 fold 重建，可回滚） | [`vector-dual-engine-selection-zh.md`](doc/vector-dual-engine-selection-zh.md) |
 | 混合检索 | `search_hybrid` | BM25 + 向量 RRF(60) 融合 | [`hybrid_searcher.hpp`](include/bitcask/hybrid_searcher.hpp) |
 | 同义词 | `CaskOptions::synonym_map`（open-time） | 查询时自动展开，不可变、并发安全 | [`synonym_map.hpp`](include/bitcask/synonym_map.hpp) |
 | 迭代 | `make_iter` | MVCC 快照（兄弟链 + pending 哈希） | [`keydir-sharding-design-zh.md`](doc/keydir-sharding-design-zh.md) |
@@ -241,11 +242,11 @@ cmake --build build -j --target bitcask_static bitcask_shared
 | `BITCASK_LTO` | ON | Release 启用 LTO / IPO；sanitizer 构建自动关闭 |
 | `BITCASK_PCH` | ON | 预编译头加速编译；排查 PCH 异常可临时关闭 |
 
-版本信息由 `CMakeLists.txt` 的 `project(libbitcask VERSION 3.1.0)` 单一真源派生：`libbitcask.so` 的 `SOVERSION=3`，`VERSION=3.1.0`，C 端 `bitcask_version_{major,minor,patch,string}()` 同步。
+版本信息由 `CMakeLists.txt` 的 `project(libbitcask VERSION 4.0.0)` 单一真源派生：`libbitcask.so` 的 `SOVERSION=4`，`VERSION=4.0.0`，C 端 `bitcask_version_{major,minor,patch,string}()` 同步。
 
 ### 产物
 
-- `libbitcask.so` — 共享库，导出 C API（`extern "C"`，`SOVERSION=3`）
+- `libbitcask.so` — 共享库，导出 C API（`extern "C"`，`SOVERSION=4`）
 - `libbitcask.a` — 把全部静态归档合并为单一 `.a`
 - `migrate_le` — 旧大端目录 → 小端目录的离线迁移工具
 - `gen_inert_table` — NFKC 惰性区间表代码生成器（构建期自动执行）
@@ -278,7 +279,8 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 │  ├─ HintFile（活跃写入器 + v3 trailer CRC + sealed-mmap hint）      │
 │  ├─ DocMap（Index：ord↔ext/live/meta 宿主服务；查询面 DocTable）   │
 │  ├─ TextPlugin "bm25"（倒排/Analyzer/缓存/高亮/bm25.ckpt 文件族）  │
-│  ├─ VectorPlugin "hnsw"（HNSW/归一化/vec.ckpt 族 + .vec/.qc8 侧车）│
+│  ├─ VectorPlugin "hnsw"（VectorEnginePlugin 契约：HNSW/IVF-RaBitQ/DiskANN │
+│  │   三引擎按 meta.vector_engine 选定；归一化/vec.ckpt 族 + .vec/.qc8 侧车）│
 │  ├─ HybridSearcher（RRF 融合器；持两插件引用）                     │
 │  ├─ CaskPluginHost（read_at / run_serialized / log 窄反向接口）    │
 │  ├─ MetaConfig（bitcask.meta v2：magic + version + CRC32）         │
@@ -310,6 +312,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 - **双锁模型**：`bitcask.write.lock`（writer）与 `bitcask.merge.lock`（merger）独立，周期 merge 与 live writer 并行不互斥。merger 通过读取 `write.lock` 内容排除 live writer 的活动文件。
 - **异步索引 MapReduce**：`put_doc` 入队有界 `IndexPool`（满则 push 阻塞做背压）→ N 个 map worker 并行分词（`hardware_concurrency` 真数据并行）→ per-lane reorder buffer（按 ord 排序）→ 单 reducer 串行 apply（库内单写者）。池由 `KeyDirRegistry` 共享，线程数 = N+1 与库数无关。详见 [`docs/design/async-index-pipeline.md`](docs/design/async-index-pipeline.md)。
 - **查询并发**：批量查询接口（`search_*_batch`）在进程级共享 `search_arena`（TBB `task_arena`）上 inter-query 并行；单查询内部仍串行（WAND 顺序依赖、HNSW 图遍历）。
+- **向量双引擎**（S32）：`vector_engine` 建库时一次性选定并持久化进 `bitcask.meta`——`hnsw`（内存图，≤数 M 向量）/ `ivfrq`（IVF-RaBitQ 磁盘段，10M-100M 推荐）/ `diskann`（Vamana 图，实验性）。引擎不符重开 → `kModeMismatch`；离线切换用 `vec_engine_migrate`（只改 meta，首次 open 全量 fold 重建，可回滚）。详见 [`vector-dual-engine-selection-zh.md`](doc/vector-dual-engine-selection-zh.md)。
 - **小端 only**：所有多字节整数小端（LE 主机原生零转换）；不再与 legacy 大端 Erlang 字节互通，迁移用 [`migrate_le`](doc/migrate-le.md)。
 - **插件化**：`CaskPlugin` 接口（`plugin_api.hpp`）是 KV 存储层与索引层的唯一契约，Cask 在写/恢复/merge/checkpoint 四条通路上向注册的插件广播事件。Text/Vector 是当前两个内建插件；新增插件（TTL、metrics、CDC）只需实现此接口。详见 [`plugin-arch-split-design-zh.md`](doc/plugin-arch-split-design-zh.md)。
 
@@ -354,6 +357,11 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 | [`docs/design/thread-safety.md`](docs/design/thread-safety.md) | 内部线程安全审计（as-built 状态记录） |
 | [`docs/design/async-index-pipeline.md`](docs/design/async-index-pipeline.md) | 异步索引 MapReduce 流水线设计稿（S6） |
 | [`docs/design/s13-review-2026-07-02.md`](docs/design/s13-review-2026-07-02.md) | S12/S13 批次审查纪要 |
+| [`docs/design/s27-3-b2b-recovery-design.md`](docs/design/s27-3-b2b-recovery-design.md) | S27-3 B2B 恢复设计 |
+| [`docs/design/s27-4-dwpt-design.md`](docs/design/s27-4-dwpt-design.md) | S27-4 DWPT 并行 builder 设计 |
+| [`docs/design/s29-6-keydir-lockfree-read.md`](docs/design/s29-6-keydir-lockfree-read.md) | S29-6 KeyDir 无锁读设计 |
+| [`docs/design/s29-6b-inverted-term-cache.md`](docs/design/s29-6b-inverted-term-cache.md) | S29-6B 倒排 term 缓存设计 |
+| [`docs/design/s30-mmap-segments.md`](docs/design/s30-mmap-segments.md) | S30 mmap 段设计 |
 
 ### HNSW / 向量
 
@@ -361,6 +369,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 |------|------|
 | [`doc/vector-db-design-zh.md`](doc/vector-db-design-zh.md) | 向量库设计：在 Bitcask 上原生扩展 |
 | [`doc/vector-db-ann-landscape-zh.md`](doc/vector-db-ann-landscape-zh.md) | ANN 算法全景与 HNSW 定位 |
+| [`doc/vector-dual-engine-selection-zh.md`](doc/vector-dual-engine-selection-zh.md) | S32 向量双引擎选择（HNSW / IVF-RaBitQ / DiskANN 定位与切换） |
 | [`doc/hnsw-overview-zh.md`](doc/hnsw-overview-zh.md) | HNSW 算法全景与本实现优化点 |
 | [`doc/hnsw-design-zh.md`](doc/hnsw-design-zh.md) | HNSW V3 设计定稿（并发协议、持久化） |
 | [`doc/hnsw-graph-theory-zh.md`](doc/hnsw-graph-theory-zh.md) | HNSW 多层图原理与量化必要性 |
@@ -371,6 +380,8 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 | [`doc/int8-vnni-v4-zh.md`](doc/int8-vnni-v4-zh.md) | int8 量化 + AVX-VNNI 距离内核 |
 | [`doc/simd-vnni-internals-zh.md`](doc/simd-vnni-internals-zh.md) | VNNI dpbusd 与偏置补偿指令内幕 |
 | [`doc/vector-ondisk-quant-design-zh.md`](doc/vector-ondisk-quant-design-zh.md) | 向量落盘 int8 量化设计 |
+| [`doc/s29-11-hnsw-deep-opt-design-zh.md`](doc/s29-11-hnsw-deep-opt-design-zh.md) | S29-11 HNSW 深度优化（AVX2 int8 内核 + 混合精度建图导航） |
+| [`doc/rabitq-theory-zh.md`](doc/rabitq-theory-zh.md) | RaBitQ 量化理论（无偏估计、误差界、lite→full 升级路径） |
 
 ### BM25 / 倒排
 
@@ -381,6 +392,8 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 | [`doc/intersect-kernel-internals-zh.md`](doc/intersect-kernel-internals-zh.md) | 旋转法交集内核内幕与输出段微优化 |
 | [`doc/kway-blockmax-bmw-zh.md`](doc/kway-blockmax-bmw-zh.md) | k-way 交集 + 块级元数据 + BMW |
 | [`doc/wand-blockmax-zh.md`](doc/wand-blockmax-zh.md) | WAND / BlockMax-WAND top-k 动态剪枝 |
+| [`doc/segment-index-design-zh.md`](doc/segment-index-design-zh.md) | 封口段格式设计（v2 mmap 零驻留 / v1 全量回退） |
+| [`doc/roaring-meta-bitmap-design-zh.md`](doc/roaring-meta-bitmap-design-zh.md) | Roaring bitmap 加速 meta 过滤设计 |
 
 ### KeyDir / 恢复 / Merge / 插件
 
