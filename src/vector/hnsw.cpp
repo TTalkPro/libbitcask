@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1534,6 +1535,7 @@ bool pwrite_all(int fd, const void* buf, std::size_t len, std::uint64_t off) {
     const auto* p = static_cast<const std::uint8_t*>(buf);
     while (len > 0) {
         const ssize_t w = ::pwrite(fd, p, len, static_cast<off_t>(off));
+        if (w < 0 && errno == EINTR) continue;  // 审计修复:EINTR 重试
         if (w <= 0) return false;
         p   += w;
         off += static_cast<std::uint64_t>(w);

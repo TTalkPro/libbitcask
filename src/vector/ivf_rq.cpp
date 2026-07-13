@@ -91,7 +91,7 @@ void IvfSegment::close() {
 bool IvfSegment::build(std::string_view path, std::uint16_t dim,
                        const IvfBuildSource& src, std::uint32_t nlist,
                        std::uint64_t gen, std::uint64_t seed,
-                       bool with_bits) {
+                       bool with_bits) try {
     if (dim == 0) return false;
     const std::uint32_t n = src.count;
     if (n > 0 && !src.get) return false;
@@ -336,10 +336,12 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
 
     // ---- 4) 写文件（tmp；记录按簇槽位 pwrite，页缓存吸收乱序）----
     const std::string fp(path);
-    const std::string tmp = fp + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC,
-                          0644);
-    if (fd < 0) return false;
+    diskint::TmpFile tf;
+    tf.path = fp + ".tmp";
+    tf.fd = ::open(tf.path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC,
+                   0644);
+    if (tf.fd < 0) return false;
+    const int fd = tf.fd;
     bool ok = true;
     std::uint64_t max_ord = 0;
     // 质心区。
@@ -404,9 +406,7 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
             std::uint32_t crc = 0;
             if (bytes > 0) {
                 buf.resize(bytes);
-                ssize_t rd = ::pread(fd, buf.data(), bytes,
-                                     static_cast<off_t>(cbase[c]));
-                ok = rd == static_cast<ssize_t>(bytes);
+                ok = diskint::pread_all(fd, buf.data(), bytes, cbase[c]);
                 if (ok) {
                     crc = bitcask::codec::crc32(std::span<const std::byte>(
                         reinterpret_cast<const std::byte*>(buf.data()),
@@ -427,9 +427,7 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
     std::uint32_t bits_crc = 0;
     if (ok && with_bits && bits_len > 0) {
         std::vector<std::uint8_t> bbuf(static_cast<std::size_t>(bits_len));
-        ok = ::pread(fd, bbuf.data(), bbuf.size(),
-                     static_cast<off_t>(bits_off)) ==
-             static_cast<ssize_t>(bbuf.size());
+        ok = diskint::pread_all(fd, bbuf.data(), bbuf.size(), bits_off);
         if (ok) {
             bits_crc = bitcask::codec::crc32(std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(bbuf.data()),
@@ -464,13 +462,14 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
         std::memcpy(hdr + kIvfHeaderCrcOff, &hcrc, 4);
         ok = pwrite_all(fd, hdr, kIvfHeaderSize, 0);
     }
-    if (ok) ok = ::fdatasync(fd) == 0;
-    ::close(fd);
-    if (!ok || std::rename(tmp.c_str(), fp.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        return false;
+    if (ok) ok = tf.sync_close();
+    if (!ok || std::rename(tf.path.c_str(), fp.c_str()) != 0) {
+        return false;  // TmpFile 析构清 tmp
     }
+    tf.committed = true;
     return true;
+} catch (...) {
+    return false;  // bad_alloc 等;TmpFile 析构保证 fd/tmp 清理（审计修复）
 }
 
 bool IvfSegment::open(std::string_view path, std::uint16_t dim,
@@ -621,31 +620,31 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
             return false;
         }
     }
-    if (verify_crc) {
-        // 逐簇 CRC + cidx 边界校验（S30 封口段 open 验 CRC 同款）。
-        for (std::uint32_t c = 0; c < nlist_; ++c) {
-            const std::uint8_t* e = cidx_ + static_cast<std::size_t>(c) *
-                                                kCidxEntrySize;
-            std::uint64_t off = 0;
-            std::uint32_t cnt = 0, crc = 0;
-            std::memcpy(&off, e, 8);
-            std::memcpy(&cnt, e + 8, 4);
-            std::memcpy(&crc, e + 12, 4);
-            const std::uint64_t bytes =
-                static_cast<std::uint64_t>(cnt) * stride;
-            if (off < post_off || off + bytes > file_len) {
+    // cidx 边界校验**无条件**（审计修复 2026-07-13）：此前误挂 verify_crc
+    // 门——可信盘模式（verify_crc=false）下损坏 cidx 的 off/count 会把
+    // 查询扫描指出 mmap 界外（OOB 读 UB）。内存安全前置不是完整性选项，
+    // O(nlist) 纯头查无 IO 代价；CRC（逐簇全量读）保持可选。
+    for (std::uint32_t c = 0; c < nlist_; ++c) {
+        const std::uint8_t* e =
+            cidx_ + static_cast<std::size_t>(c) * kCidxEntrySize;
+        std::uint64_t off = 0;
+        std::uint32_t cnt = 0, crc = 0;
+        std::memcpy(&off, e, 8);
+        std::memcpy(&cnt, e + 8, 4);
+        std::memcpy(&crc, e + 12, 4);
+        const std::uint64_t bytes = static_cast<std::uint64_t>(cnt) * stride;
+        if (off < post_off || off + bytes > file_len) {
+            close();
+            return false;
+        }
+        if (verify_crc && bytes > 0) {
+            const std::uint32_t got =
+                bitcask::codec::crc32(std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(base_ + off),
+                    static_cast<std::size_t>(bytes)));
+            if (got != crc) {
                 close();
                 return false;
-            }
-            if (bytes > 0) {
-                const std::uint32_t got =
-                    bitcask::codec::crc32(std::span<const std::byte>(
-                        reinterpret_cast<const std::byte*>(base_ + off),
-                        static_cast<std::size_t>(bytes)));
-                if (got != crc) {
-                    close();
-                    return false;
-                }
             }
         }
     }

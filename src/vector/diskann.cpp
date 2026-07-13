@@ -195,7 +195,7 @@ void DiskannSegment::close() {
 bool DiskannSegment::build(std::string_view path, std::uint16_t dim,
                            const IvfBuildSource& src, std::uint32_t r,
                            std::uint32_t l_build, std::uint64_t gen,
-                           std::uint64_t seed) {
+                           std::uint64_t seed) try {
     if (dim == 0) return false;
     const std::uint32_t n = src.count;
     if (n > 0 && !src.get) return false;
@@ -225,32 +225,27 @@ bool DiskannSegment::build(std::string_view path, std::uint16_t dim,
         std::max<std::size_t>(1, std::thread::hardware_concurrency());
     std::vector<std::vector<double>> mean_parts(
         nthreads, std::vector<double>(d, 0.0));
-    {
-        std::atomic<std::size_t> tid_seq{0};
-        thread_local std::size_t tls_tid = SIZE_MAX;
-        parallel_for(n, [&](std::size_t i) {
-            thread_local int8::QVector qv;
-            if (tls_tid == SIZE_MAX) {
-                tls_tid = tid_seq.fetch_add(1) % nthreads;
-            }
-            std::uint64_t ord;
-            const float* v = nullptr;
-            src.get(static_cast<std::uint32_t>(i), ord, v);
-            ords[i] = ord;
-            int8::quantize_into(v, d, qv);
-            std::memcpy(c.codes.data() + i * d, qv.codes.data(), d);
-            c.scales[i] = qv.scale;
-            c.sums[i]   = qv.sum_codes;
-            // nav 记录 = int8 三件套（v1;M5.5 换 PQ 时 bump ver）。
-            std::memcpy(nav.data() + i * snav, qv.codes.data(), d);
-            std::memcpy(nav.data() + i * snav + d, &qv.scale, 4);
-            std::memcpy(nav.data() + i * snav + d + 4, &qv.sum_codes, 4);
-            auto& mp = mean_parts[tls_tid];
-            for (std::size_t j = 0; j < d; ++j) {
-                mp[j] += static_cast<double>(v[j]);
-            }
-        });
-    }
+    // 工位号 wid 替代旧 thread_local tls_tid 方案（审计脆弱性修复
+    // 2026-07-13:tls 跨调用残留仅在 nthreads 恒定时安全）。
+    diskint::parallel_for_worker(n, [&](std::size_t i, std::size_t wid) {
+        thread_local int8::QVector qv;
+        std::uint64_t ord;
+        const float* v = nullptr;
+        src.get(static_cast<std::uint32_t>(i), ord, v);
+        ords[i] = ord;
+        int8::quantize_into(v, d, qv);
+        std::memcpy(c.codes.data() + i * d, qv.codes.data(), d);
+        c.scales[i] = qv.scale;
+        c.sums[i]   = qv.sum_codes;
+        // nav 记录 = int8 三件套（v1;M5.5 换 PQ 时 bump ver）。
+        std::memcpy(nav.data() + i * snav, qv.codes.data(), d);
+        std::memcpy(nav.data() + i * snav + d, &qv.scale, 4);
+        std::memcpy(nav.data() + i * snav + d + 4, &qv.sum_codes, 4);
+        auto& mp = mean_parts[wid];
+        for (std::size_t j = 0; j < d; ++j) {
+            mp[j] += static_cast<double>(v[j]);
+        }
+    });
     std::uint64_t max_ord = 0;
     for (std::uint32_t i = 0; i < n; ++i) max_ord = std::max(max_ord, ords[i]);
 
@@ -403,10 +398,12 @@ bool DiskannSegment::build(std::string_view path, std::uint16_t dim,
         blocks_off + static_cast<std::uint64_t>(n) * bstride;
 
     const std::string fp(path);
-    const std::string tmp = fp + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC,
-                          0644);
-    if (fd < 0) return false;
+    diskint::TmpFile tf;
+    tf.path = fp + ".tmp";
+    tf.fd = ::open(tf.path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC,
+                   0644);
+    if (tf.fd < 0) return false;
+    const int fd = tf.fd;
     bool ok = true;
     const std::uint32_t nav_crc =
         n > 0 ? bitcask::codec::crc32(std::span<const std::byte>(
@@ -461,13 +458,15 @@ bool DiskannSegment::build(std::string_view path, std::uint16_t dim,
         std::memcpy(hdr + kBdaHeaderCrcOff, &hcrc, 4);
         ok = pwrite_all(fd, hdr, kBdaHeaderSize, 0);
     }
-    if (ok) ok = ::fdatasync(fd) == 0;
-    ::close(fd);
-    if (!ok || std::rename(tmp.c_str(), fp.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        return false;
+    if (ok) ok = tf.sync_close();
+    if (!ok || std::rename(tf.path.c_str(), fp.c_str()) != 0) {
+        return false;  // TmpFile 析构清 tmp
     }
+    tf.committed = true;
     return true;
+} catch (...) {
+    return false;  // bad_alloc 等（parallel_for_worker 重抛/本线程分配）;
+                   // TmpFile 析构保证 fd/tmp 清理（审计修复 2026-07-13）
 }
 
 bool DiskannSegment::open(std::string_view path, std::uint16_t dim,
@@ -698,13 +697,19 @@ std::vector<DiskannSegment::Hit> DiskannSegment::search(
                 }
             }
         }
-        // 扩展邻接。
+        // 扩展邻接。use-site 越界防御（审计修复 2026-07-13）：邻接 id/ncnt
+        // 的全量校验在 open 时挂 verify_crc 门（无条件校验需 touch 全部
+        // 块页,违背 mmap 懒加载）——可信盘模式下损坏块的 id ≥ count 会
+        // 把 nav_est/块读指出界外（OOB UB）。此处每邻居一次比较,代价
+        // 相对 est 计算可忽略。
         std::uint32_t cnt = 0;
         std::memcpy(&cnt, blk + 8 + d + 8, 4);
+        if (cnt > r_) cnt = r_;
         const std::uint8_t* nb = blk + 8 + d + 12;
         for (std::uint32_t j = 0; j < cnt; ++j) {
             std::uint32_t id = 0;
             std::memcpy(&id, nb + 4 * j, 4);
+            if (id >= count_) continue;
             push_pool(id);
         }
     }
