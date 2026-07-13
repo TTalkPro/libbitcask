@@ -4084,10 +4084,19 @@ S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同�
   · 明确不做:邻接增量落盘(反向边可变,hnsw.hpp 头注既判)。
   · 验收:小阈值下 flush(kAuto) 自动 base(链坍缩/base_gen 递增)+
   阈值 0 对照 + 重开链重放计入窗口;恢复窗口上界测试。
-- [ ] **M0 引擎接线基建**:`CaskOptions::vector_engine`(kHnsw/kIvfRq,
-  预留 kDiskann)→ meta 持久化 + mode_mismatch 校验(cask.cpp 现有
-  vector_* 检查组扩一项)+ open 工厂;共享域件抽取(normalize/
-  `vec::DeltaLog`/量化器)+ 召回 harness(S29-11 §2,两引擎共用)。
+- [ ] **M0 引擎接线基建**（M0a 已完成 2026-07-13）:
+  - [x] **M0a `vector_engine` 接线**:`meta::VectorEngine`(kHnsw=0/
+    kIvfRq/kDiskann;meta 字节 [11],旧文件全零=kHnsw 零升级,CRC 覆盖
+    区内;未知值 read_meta fail-fast)+ `CaskOptions::vector_engine` +
+    check_or_create_meta 校验(非 kHnsw 落地前 kInvalidOption 干净拒绝;
+    meta/opts 引擎不符 → kModeMismatch,绝不静默误开)+ 工厂点注释
+    (cask.cpp 阶段三)。验收:新测 S32M0VectorEngineMetaWiring(往返/
+    默认持久化/未实现拒绝/不符拒绝/未知值 fail-fast)——gcc 全量
+    **619/619**;build-rel 过。
+  - [ ] M0b 共享域件抽取(normalize/`vec::DeltaLog`/量化器)——可顺延至
+    M3 首批(IvfPlugin 落地时才有第二个消费方,提前抽取是无对手重构)。
+  - [ ] M0c 召回 harness(S29-11 §2,两引擎共用):固定语料 + 暴力精确
+    top-k 真值缓存盘上;recall@10/100 × QPS × 建图耗时三元组进 bench。
 - [ ] **M2 HNSW 线 P0/P1**:qc8 mmap 化(qcodes_of 按 checkpoint_count_
   路由,与 vec_of 同型)+ clone_live 峰值治理(needs_vecs=false + f32
   旧 mmap 流式写新 .vec,消 2× 重建峰值)——主引擎舒适区推 ~2-4M@1024d。
