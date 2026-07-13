@@ -4133,9 +4133,37 @@ S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同�
     追加/重载;HnswCloneSpill.SpillAttachAdoptAndReload:双模式外溢/
     inode 收养/重载)——gcc 全量 **621/621**;ASan hnsw+vecplugin
     24/24;TSan 并发子集 10/10;build-rel 过。
-- [ ] **M3 IvfPlugin v1**(IVF-RaBitQ,~3k LOC,独立插件;设计 §5.1):
-  质心 RAM + posting 盘上顺序扫(RaBitQ 粗筛 + int8 精排内联)+ delta
-  窗口复用 HnswIndex(inmem_int8);RaBitQ popcount 内核顺手供 HNSW P2。
+- [x] **M3 IvfPlugin v1 已完成(2026-07-13;三阶段 S1/S2a/S2b)**:
+  - **S1 IvfSegment**(`ivf_rq.hpp/.cpp`,~700 行):不可变 IVF 段——
+    build(采样球面 k-means + 全量并行分簇 + tmp+rename)/open(mmap +
+    header CRC + gen 守卫 + 逐簇 CRC 可关)/search(质心暴扫 top-nprobe →
+    posting 顺序扫 int8 内核 → 小顶堆 + 惰性 live)。BIV1 格式;
+    **v1 范围裁剪(明示)**:记录 = int8 码字单遍扫,RaBitQ 1-bit 码区
+    留 format 位(flags bit0)——是否引入由召回 harness 在 M3.5 出数。
+    验收:4 测含**全扫 ≡ int8 暴扫穷举对拍**(对拍哲学)。
+  - **S2a VectorEnginePlugin 接口抽取**(`vector_engine_plugin.hpp`):
+    宿主运行期调用面收敛(enabled/dim/normalize/insert/search/rebuild/
+    size/dirty/force_rebase);VectorPlugin 派生;Cask/Hybrid/Searcher
+    门面改基类;legacy 统一 ckpt 路径 engine==kHnsw 门 + static_cast;
+    工厂 `Cask::create_vector_plugin`。零行为变化(625/625)。
+  - **S2b IvfPlugin**(`ivf_plugin.hpp/.cpp`,~600 行):sealed 段 +
+    delta 窗口 HnswIndex(inmem_int8)双路归并(同 int8 分数可比,换代
+    瞬间去重);组件链 ivf.ckpt(kIvf 段 gen/count 交叉校验)+ ivf.biv
+    侧车 + .d 链(kHnswDelta 通用插入日志);base = 全量重建(活集过滤
+    内建 = 物理清死;merge 收尾仅置 rebase,无 eager 工作);S32-M1
+    双门槛同款;重放幂等门 = open 覆盖水位。工厂解锁 kIvfRq(kL2 拒);
+    `component_of_plugin` "ivfrq"→kVec(槽位引擎无关)。
+  - 验收:段 4 测 + 插件 3 测 + Cask e2e(建库/写查/删/引擎不符拒/
+    重开链恢复/续写)——gcc 全量 **629/629**;ASan 子集 9/9;TSan 7/7;
+    build-rel 过。`BM_Ivf_RecallQps` 与 HNSW 同语料同真值对账。
+  - ⚠️ **基线发现(如实记录)**:100k/384d/nc=64 语料上 IVF recall@10
+    封顶 0.66(nprobe 32→64 无改善)——非簇漏,是**簇内边际低于 int8
+    噪声底**(HNSW 本机 f32 评分不受影响,0.946)。该语料对 int8 评分
+    引擎过度对抗;真实嵌入边际更健康。
+- [ ] **M3.5(新挂账)**:① harness 语料 v2(健康边际 + int8 真值
+  counter,两引擎公平对账);② RaBitQ 1-bit 粗筛层(format 位已留)——
+  由 v2 语料出数决定;③ IVF build 全量 assign O(N·nlist·dim) 加速
+  (质心图/层次分配,1M+ 时)。RaBitQ popcount 内核供 HNSW P2 同此项。
 - [ ] **M4 转换工具** `tools/vec_engine_migrate`(依赖 M3;设计 §6.4):
   data file 为权威、离线重建目标索引 + meta 原子切换;→hnsw 方向按
   N×D 内存预检。
