@@ -110,6 +110,22 @@ inline std::uint32_t hamming_bytes(const std::uint8_t* a,
     return h;
 }
 
+// S32-M3.5-③:两级质心分组参数。nlist < 64 不分组（组区仅 nc2=0 标记）。
+constexpr std::uint32_t kGroupMinNlist = 64;
+inline std::uint32_t group_count(std::uint32_t nlist) {
+    if (nlist < kGroupMinNlist) return 0;
+    return std::clamp<std::uint32_t>(
+        static_cast<std::uint32_t>(
+            2.0 * std::sqrt(static_cast<double>(nlist))),
+        8, 1024);
+}
+// 查询/assign 的探组数:覆盖 top-want 质心所需组数 ×2 冗余。
+inline std::uint32_t probe_groups(std::uint32_t want, std::uint32_t nlist,
+                                  std::uint32_t nc2) {
+    const std::uint32_t avg = std::max<std::uint32_t>(1, nlist / nc2);
+    return std::clamp<std::uint32_t>((want + avg - 1) / avg * 2 + 2, 4, nc2);
+}
+
 // 自动 nlist：4·√N，clamp [16, 65536]，再保簇均 ≥ 8。
 std::uint32_t auto_nlist(std::uint32_t n) {
     if (n == 0) return 16;
@@ -235,18 +251,122 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
         }
     }
 
-    // ---- 2) 全量分簇（并行；cid 表 N×4B）----
+    // ---- 1b) 质心两级分组（S32-M3.5-③）:质心再聚 nc2 组——assign 与
+    // 查询的质心选择都从 O(nlist) 降到 O(nc2 + G·组均)。
+    const std::uint32_t nc2 = with_bits ? group_count(nlist) : 0;
+    std::vector<float> gcent;
+    std::vector<std::uint32_t> group_off;   // nc2+1
+    std::vector<std::uint32_t> group_members;  // nlist
+    if (nc2 > 0) {
+        gcent.assign(static_cast<std::size_t>(nc2) * d, 0.0f);
+        std::vector<std::uint32_t> ga(nlist, 0);
+        std::mt19937_64 grng(seed ^ 0x9E3779B97F4A7C15ull);
+        // 初始化:均匀取质心为组心。
+        for (std::uint32_t g = 0; g < nc2; ++g) {
+            const std::uint32_t c =
+                static_cast<std::uint32_t>(
+                    (static_cast<std::uint64_t>(g) * nlist) / nc2);
+            std::memcpy(gcent.data() + static_cast<std::size_t>(g) * d,
+                        centers.data() + static_cast<std::size_t>(c) * d,
+                        d * sizeof(float));
+        }
+        for (int iter = 0; iter < 4; ++iter) {
+            parallel_for(nlist, [&](std::size_t c) {
+                const float* v =
+                    centers.data() + static_cast<std::size_t>(c) * d;
+                float best = -2.0f;
+                std::uint32_t bg = 0;
+                for (std::uint32_t g = 0; g < nc2; ++g) {
+                    const float sc = dot_f32(
+                        gcent.data() + static_cast<std::size_t>(g) * d, v, d);
+                    if (sc > best) { best = sc; bg = g; }
+                }
+                ga[c] = bg;
+            });
+            std::vector<double> acc(static_cast<std::size_t>(nc2) * d, 0.0);
+            std::vector<std::uint32_t> cnt2(nc2, 0);
+            for (std::uint32_t c = 0; c < nlist; ++c) {
+                const float* v =
+                    centers.data() + static_cast<std::size_t>(c) * d;
+                double* a = acc.data() + static_cast<std::size_t>(ga[c]) * d;
+                for (std::size_t j = 0; j < d; ++j) a[j] += v[j];
+                ++cnt2[ga[c]];
+            }
+            for (std::uint32_t g = 0; g < nc2; ++g) {
+                float* gc = gcent.data() + static_cast<std::size_t>(g) * d;
+                if (cnt2[g] == 0) {
+                    const auto rc = static_cast<std::uint32_t>(grng() % nlist);
+                    std::memcpy(gc,
+                                centers.data() +
+                                    static_cast<std::size_t>(rc) * d,
+                                d * sizeof(float));
+                    continue;
+                }
+                const double* a = acc.data() + static_cast<std::size_t>(g) * d;
+                double sq = 0.0;
+                for (std::size_t j = 0; j < d; ++j) sq += a[j] * a[j];
+                const double inv = sq > 0.0 ? 1.0 / std::sqrt(sq) : 0.0;
+                for (std::size_t j = 0; j < d; ++j) {
+                    gc[j] = static_cast<float>(a[j] * inv);
+                }
+            }
+        }
+        // CSR。
+        group_off.assign(nc2 + 1, 0);
+        group_members.assign(nlist, 0);
+        for (std::uint32_t c = 0; c < nlist; ++c) ++group_off[ga[c] + 1];
+        for (std::uint32_t g = 0; g < nc2; ++g) {
+            group_off[g + 1] += group_off[g];
+        }
+        std::vector<std::uint32_t> cur(group_off.begin(),
+                                       group_off.end() - 1);
+        for (std::uint32_t c = 0; c < nlist; ++c) {
+            group_members[cur[ga[c]]++] = c;
+        }
+    }
+
+    // ---- 2) 全量分簇（并行；cid 表 N×4B）。nc2>0 走两级路由:先组后
+    // 组内质心——assign 亚优落簇无正确性影响(查询 probe 多簇冗余)。----
     std::vector<std::uint32_t> cid(n, 0);
+    const std::uint32_t g_probe =
+        nc2 > 0 ? probe_groups(1, nlist, nc2) : 0;
     parallel_for(n, [&](std::size_t i) {
         std::uint64_t ord;
         const float* v = nullptr;
         src.get(static_cast<std::uint32_t>(i), ord, v);
         float best = -2.0f;
         std::uint32_t bc = 0;
-        for (std::uint32_t c = 0; c < nlist; ++c) {
-            const float sc = dot_f32(
-                centers.data() + static_cast<std::size_t>(c) * d, v, d);
-            if (sc > best) { best = sc; bc = c; }
+        if (nc2 > 0) {
+            // 两级:top-g_probe 组 → 组内质心。
+            thread_local std::vector<std::pair<float, std::uint32_t>> gs;
+            gs.resize(nc2);
+            for (std::uint32_t g = 0; g < nc2; ++g) {
+                gs[g] = {dot_f32(gcent.data() +
+                                     static_cast<std::size_t>(g) * d,
+                                 v, d),
+                         g};
+            }
+            std::partial_sort(gs.begin(), gs.begin() + g_probe, gs.end(),
+                              [](const auto& a, const auto& b) {
+                                  return a.first > b.first;
+                              });
+            for (std::uint32_t gi = 0; gi < g_probe; ++gi) {
+                const std::uint32_t g = gs[gi].second;
+                for (std::uint32_t m = group_off[g]; m < group_off[g + 1];
+                     ++m) {
+                    const std::uint32_t c = group_members[m];
+                    const float sc = dot_f32(
+                        centers.data() + static_cast<std::size_t>(c) * d, v,
+                        d);
+                    if (sc > best) { best = sc; bc = c; }
+                }
+            }
+        } else {
+            for (std::uint32_t c = 0; c < nlist; ++c) {
+                const float sc = dot_f32(
+                    centers.data() + static_cast<std::size_t>(c) * d, v, d);
+                if (sc > best) { best = sc; bc = c; }
+            }
         }
         cid[i] = bc;
     });
@@ -260,8 +380,17 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
     const std::uint64_t cent_off = kIvfHeaderSize;
     const std::uint64_t cidx_off =
         cent_off + static_cast<std::uint64_t>(nlist) * d * sizeof(float);
-    const std::uint64_t bits_off =
+    const std::uint64_t gidx_off =
         cidx_off + static_cast<std::uint64_t>(nlist) * kCidxEntrySize;
+    const std::uint64_t gidx_len =
+        !with_bits ? 0
+                   : 4 + (nc2 > 0
+                              ? (static_cast<std::uint64_t>(nc2) + 1) * 4 +
+                                    static_cast<std::uint64_t>(nlist) * 4 +
+                                    static_cast<std::uint64_t>(nc2) * d *
+                                        sizeof(float)
+                              : 0);
+    const std::uint64_t bits_off = gidx_off + gidx_len;
     const std::uint64_t bits_len =
         with_bits ? static_cast<std::uint64_t>(n) * sbits : 0;
     const std::uint64_t post_off = bits_off + bits_len;
@@ -288,6 +417,24 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
     ok = pwrite_all(fd, centers.data(),
                     static_cast<std::size_t>(nlist) * d * sizeof(float),
                     cent_off);
+    // 组区（S32-M3.5-③;仅 ver=2）。
+    if (ok && with_bits) {
+        std::vector<std::uint8_t> gbuf;
+        gbuf.reserve(static_cast<std::size_t>(gidx_len));
+        auto putb = [&gbuf](const void* src2, std::size_t len) {
+            const auto* b = static_cast<const std::uint8_t*>(src2);
+            gbuf.insert(gbuf.end(), b, b + len);
+        };
+        putb(&nc2, 4);
+        if (nc2 > 0) {
+            putb(group_off.data(), (static_cast<std::size_t>(nc2) + 1) * 4);
+            putb(group_members.data(), static_cast<std::size_t>(nlist) * 4);
+            putb(gcent.data(),
+                 static_cast<std::size_t>(nc2) * d * sizeof(float));
+        }
+        ok = gbuf.size() == gidx_len &&
+             pwrite_all(fd, gbuf.data(), gbuf.size(), gidx_off);
+    }
     // 记录区（单线程顺序过源——量化 + 定位写；游标按簇推进）。
     if (ok) {
         std::vector<std::uint64_t> cursor(cbase);
@@ -463,10 +610,15 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
     const std::uint64_t cidx_bytes =
         static_cast<std::uint64_t>(nlist) * kCidxEntrySize;
     const std::uint64_t bits_len = has_bits ? count * sbits : 0;
-    const std::uint64_t want_bits_off = cidx_off + cidx_bytes;
+    const std::uint64_t gidx_off = cidx_off + cidx_bytes;
+    // ver=1:无组区无 bits;ver=2:组区 [gidx_off, bits_off)（自描述,mmap
+    // 后二次校验 nc2/CSR）,bits [bits_off, post_off)。
+    const bool v2 = ver == kIvfVersion2;
+    const std::uint64_t gidx_end = v2 ? bits_off : gidx_off;
     if (cent_off != kIvfHeaderSize || cidx_off != cent_off + cent_bytes ||
-        (has_bits && bits_off != want_bits_off) ||
-        post_off != want_bits_off + bits_len ||
+        (v2 && (bits_off < gidx_off + 4 || !has_bits)) ||
+        (!v2 && (bits_off != 0 || has_bits)) ||
+        post_off != gidx_end + bits_len ||
         file_len != post_off + count * stride) {
         ::close(fd);
         return false;
@@ -490,6 +642,45 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
     cidx_ = base_ + cidx_off;
     post_off_ = post_off;
     bits_ = has_bits ? base_ + bits_off : nullptr;
+    // 组区解析（S32-M3.5-③;自描述,长度/CSR 严格校验）。
+    nc2_ = 0;
+    group_off_ = nullptr;
+    group_members_ = nullptr;
+    gcent_ = nullptr;
+    if (v2) {
+        const std::uint8_t* g = base_ + gidx_off;
+        std::uint32_t nc2 = 0;
+        std::memcpy(&nc2, g, 4);
+        const std::uint64_t want_len =
+            4 + (nc2 > 0
+                     ? (static_cast<std::uint64_t>(nc2) + 1) * 4 +
+                           static_cast<std::uint64_t>(nlist) * 4 +
+                           static_cast<std::uint64_t>(nc2) * dim *
+                               sizeof(float)
+                     : 0);
+        if (bits_off - gidx_off != want_len) {
+            close();
+            return false;
+        }
+        if (nc2 > 0) {
+            group_off_ = reinterpret_cast<const std::uint32_t*>(g + 4);
+            group_members_ = group_off_ + nc2 + 1;
+            gcent_ = reinterpret_cast<const float*>(
+                g + 4 + (static_cast<std::size_t>(nc2) + 1) * 4 +
+                static_cast<std::size_t>(nlist) * 4);
+            if (group_off_[0] != 0 || group_off_[nc2] != nlist) {
+                close();
+                return false;
+            }
+            for (std::uint32_t gi = 0; gi < nc2; ++gi) {
+                if (group_off_[gi] > group_off_[gi + 1]) {
+                    close();
+                    return false;
+                }
+            }
+            nc2_ = nc2;
+        }
+    }
 
     if (verify_crc && has_bits && bits_len > 0) {
         const std::uint32_t got =
@@ -543,17 +734,51 @@ std::vector<IvfSegment::Hit> IvfSegment::search(
     const std::size_t d = dim_;
     const std::size_t stride = rec_stride();
 
-    // 1) 质心暴扫 top-nprobe。
-    std::vector<std::pair<float, std::uint32_t>> cs(nlist_);
-    for (std::uint32_t c = 0; c < nlist_; ++c) {
-        cs[c] = {dot_f32(centroids_ + static_cast<std::size_t>(c) * d,
-                         query.data(), d),
-                 c};
+    // 1) 质心选择:top-nprobe。nprobe ≥ nlist → 全簇捷径（免排序,对拍
+    // 精确）;组区在 → 两级（组心扫 + top-G 组成员扫,S32-M3.5-③）;
+    // 否则全量暴扫。
+    auto by_score = [](const auto& a, const auto& b) {
+        return a.first > b.first;
+    };
+    std::vector<std::pair<float, std::uint32_t>> cs;
+    if (nprobe >= nlist_) {
+        cs.resize(nlist_);
+        for (std::uint32_t c = 0; c < nlist_; ++c) cs[c] = {0.0f, c};
+    } else if (nc2_ > 0) {
+        const std::uint32_t g_probe = probe_groups(nprobe, nlist_, nc2_);
+        std::vector<std::pair<float, std::uint32_t>> gs(nc2_);
+        for (std::uint32_t g = 0; g < nc2_; ++g) {
+            gs[g] = {dot_f32(gcent_ + static_cast<std::size_t>(g) * d,
+                             query.data(), d),
+                     g};
+        }
+        std::partial_sort(gs.begin(), gs.begin() + g_probe, gs.end(),
+                          by_score);
+        for (std::uint32_t gi = 0; gi < g_probe; ++gi) {
+            const std::uint32_t g = gs[gi].second;
+            for (std::uint32_t m = group_off_[g]; m < group_off_[g + 1];
+                 ++m) {
+                const std::uint32_t c = group_members_[m];
+                cs.push_back(
+                    {dot_f32(centroids_ + static_cast<std::size_t>(c) * d,
+                             query.data(), d),
+                     c});
+            }
+        }
+        nprobe = std::min<std::uint32_t>(
+            nprobe, static_cast<std::uint32_t>(cs.size()));
+        std::partial_sort(cs.begin(), cs.begin() + nprobe, cs.end(),
+                          by_score);
+    } else {
+        cs.resize(nlist_);
+        for (std::uint32_t c = 0; c < nlist_; ++c) {
+            cs[c] = {dot_f32(centroids_ + static_cast<std::size_t>(c) * d,
+                             query.data(), d),
+                     c};
+        }
+        std::partial_sort(cs.begin(), cs.begin() + nprobe, cs.end(),
+                          by_score);
     }
-    std::partial_sort(cs.begin(), cs.begin() + nprobe, cs.end(),
-                      [](const auto& a, const auto& b) {
-                          return a.first > b.first;
-                      });
 
     // 2) 查询量化一次（thread_local 复用）。
     thread_local int8::QVector qv;

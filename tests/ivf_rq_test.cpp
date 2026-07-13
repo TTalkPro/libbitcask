@@ -239,7 +239,8 @@ TEST(IvfSegment, GenGuardDimMismatchAndCorruption) {
     {
         std::FILE* f = std::fopen(fp.c_str(), "r+b");
         ASSERT_NE(f, nullptr);
-        const long bits_at = 96 + 8L * dim * 4 + 8 * 16;  // nlist=8
+        // nlist=8 → 组区仅 nc2=0 标记 4B。
+        const long bits_at = 96 + 8L * dim * 4 + 8 * 16 + 4;
         std::fseek(f, bits_at, SEEK_SET);
         int ch = std::fgetc(f);
         std::fseek(f, bits_at, SEEK_SET);
@@ -279,6 +280,48 @@ TEST(IvfSegment, GenGuardDimMismatchAndCorruption) {
         std::fclose(f);
     }
     EXPECT_FALSE(seg.open(fp, dim, 42));
+    fs::remove(fp);
+}
+
+// S32-M3.5-③:两级质心索引（nlist ≥ 64 启用）——全 probe 捷径对拍精确 +
+// 两级路由召回门。
+TEST(IvfSegment, TwoLevelCentroidGroups) {
+    const std::size_t n = 6400, dim = 32, k = 10, nq = 30;
+    auto base = make_clustered(n, dim, 64, 0.15f, 0xE1, 0xF2);
+    auto queries = make_clustered(nq, dim, 64, 0.15f, 0xE9, 0xF2);
+    const auto fp = tmp_path("bitcask_ivf_groups.biv");
+    ASSERT_TRUE(IvfSegment::build(fp, dim, src_of(base, dim), 64, 900));
+    IvfSegment seg;
+    ASSERT_TRUE(seg.open(fp, dim, 900));
+    EXPECT_EQ(seg.nlist(), 64u);
+
+    // 全 probe（捷径,跳过质心选择）+ coarse_c=n → 与 int8 暴扫穷举对拍。
+    for (std::size_t qi = 0; qi < 10; ++qi) {
+        const float* q = queries.data() + qi * dim;
+        auto truth = brute_topk_int8(base, n, dim, q, k);
+        auto got = seg.search(std::span<const float>(q, dim), k, 64, nullptr,
+                              static_cast<std::uint32_t>(n));
+        ASSERT_EQ(got.size(), k);
+        std::vector<std::uint64_t> gids(k);
+        for (std::size_t i = 0; i < k; ++i) gids[i] = got[i].ord;
+        std::sort(truth.begin(), truth.end());
+        std::sort(gids.begin(), gids.end());
+        EXPECT_EQ(gids, truth) << "组路径全扫 ≠ int8 暴扫 @ " << qi;
+    }
+    // 两级路由 + 默认 C 的召回门（nprobe=8/64,经组选择）。
+    std::size_t hit = 0;
+    for (std::size_t qi = 0; qi < nq; ++qi) {
+        const float* q = queries.data() + qi * dim;
+        auto truth = brute_topk_int8(base, n, dim, q, k);
+        auto got = seg.search(std::span<const float>(q, dim), k, 8);
+        for (const auto& h : got) {
+            if (std::find(truth.begin(), truth.end(), h.ord) != truth.end()) {
+                ++hit;
+            }
+        }
+    }
+    EXPECT_GE(static_cast<double>(hit) / static_cast<double>(nq * k), 0.90)
+        << "两级质心路由召回不达标";
     fs::remove(fp);
 }
 

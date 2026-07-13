@@ -26,6 +26,11 @@
 //     [92]    hcrc u32（覆盖 [0,92)）
 //   cent 区:  nlist × dim × f32（质心，已归一化——球面 k-means）
 //   cidx 区:  nlist × 16B { off u64（绝对偏移，指记录区）, count u32, crc u32 }
+//   组区（ver=2，cidx 后）: 两级质心索引（S32-M3.5-③）——质心再聚 nc2 组，
+//     查询/建库的质心选择从 O(nlist·dim) 降到 O((nc2 + G·组均)·dim)：
+//     { nc2 u32 | group_off (nc2+1)×u32（members 前缀和）|
+//       members nlist×u32（按组连续的质心 id）| gcent nc2×dim×f32 }
+//     nc2 = 0（nlist < 64 不分组）时组区仅 4 字节，两级路径关闭。
 //   bits 区（flags bit0）: 与记录区同序的 1-bit 粗筛码，每记录
 //     { sign bits ceil(dim/8)B（不足补零） | mu f32（mean|v|，est 校正）}
 //     —— 簇 c 的 bits 基址由 cidx off 推导（记录区连续同序）。
@@ -154,6 +159,11 @@ private:
     std::uint64_t post_off_ = 0;          // post 区起始（record_at 用）
     // S32-M3.5-②:1-bit 粗筛码区（ver=2 flags bit0;v1 文件为空 = 单段扫）。
     const std::uint8_t* bits_ = nullptr;
+    // S32-M3.5-③:两级质心索引（ver=2 组区;nc2_=0 = 关闭,全量质心扫）。
+    std::uint32_t        nc2_ = 0;
+    const std::uint32_t* group_off_ = nullptr;   // nc2_+1 前缀和
+    const std::uint32_t* group_members_ = nullptr;  // nlist,按组连续
+    const float*         gcent_ = nullptr;       // nc2_ × dim
     [[nodiscard]] std::size_t bits_stride() const noexcept {
         return (static_cast<std::size_t>(dim_) + 7) / 8 + sizeof(float);
     }
