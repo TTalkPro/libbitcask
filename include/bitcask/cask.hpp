@@ -133,6 +133,11 @@ struct CaskOptions {
     bool          vector_quantized = false;  // P3b：向量落盘 int8 量化（4× 磁盘，有损）
     bool          vector_inmem_int8 = false; // P5b：HNSW int8-only 内存（−80% 向量内存，仅 kDot；与 quantized 正交）
     meta::VectorMetric vector_metric = meta::VectorMetric::kCosineNormalized;
+    // S32-M0：向量引擎（设计 doc/vector-dual-engine-selection-zh.md §4）。
+    // 建库时一次性选定、写入 meta；重开不符 → kModeMismatch；运行期不可
+    // 切换（唯一切换路径 = 离线转换工具）。当前仅 kHnsw 已实现，其余值
+    // open 返回 kInvalidOption（kIvfRq = S32-M3，kDiskann = S32-M5）。
+    meta::VectorEngine vector_engine = meta::VectorEngine::kHnsw;
     // 同义词词典（**Cask 级、open-time、不可变**）。查询时 search_text/search_fields
     // 自动展开同义词。构造后只读 → 并发查询安全（取代了曾经的运行期
     // set_synonym_map setter，那是配置项里唯一的 reader-vs-writer 竞态源）。

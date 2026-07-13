@@ -21,6 +21,7 @@ inline constexpr std::size_t kMetaVecMetricOffset = 6;
 inline constexpr std::size_t kMetaVecDimOffset    = 7;  // u16 LE
 inline constexpr std::size_t kMetaVecQuantOffset  = 9;  // P3b：u8 0/1（旧文件全零=否）
 inline constexpr std::size_t kMetaVecInmemInt8Offset = 10;  // P5b：u8 0/1（旧文件全零=否）
+inline constexpr std::size_t kMetaVecEngineOffset = 11;  // S32-M0：u8（旧文件全零=kHnsw）
 // v3(S12)：保留区偏移 14 起放 CRC32(u32 LE)，覆盖前 14 字节(magic+version+mode+
 // 向量配置+保留 11-13)。CRC 字段自身不被覆盖。
 inline constexpr std::size_t kMetaCrcOffset   = 14;
@@ -106,6 +107,14 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
         static_cast<std::uint8_t>(header[kMetaVecQuantOffset]) != 0;
     cfg.vector_inmem_int8 =
         static_cast<std::uint8_t>(header[kMetaVecInmemInt8Offset]) != 0;
+    // S32-M0：向量引擎（旧文件全零 → kHnsw，零升级）。未知值 fail-fast——
+    // 新引擎写的库绝不能被旧读端按 HNSW 静默误开。
+    const auto engine_val =
+        static_cast<std::uint8_t>(header[kMetaVecEngineOffset]);
+    if (engine_val > static_cast<std::uint8_t>(VectorEngine::kDiskann)) {
+        return std::unexpected(MetaError{0, "unknown vector engine"});
+    }
+    cfg.vector_engine = static_cast<VectorEngine>(engine_val);
     return cfg;
 }
 
@@ -124,6 +133,8 @@ std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaCo
     header[kMetaVecQuantOffset] = static_cast<char>(config.vector_quantized ? 1 : 0);
     header[kMetaVecInmemInt8Offset] =
         static_cast<char>(config.vector_inmem_int8 ? 1 : 0);
+    header[kMetaVecEngineOffset] =
+        static_cast<char>(config.vector_engine);  // S32-M0（CRC 覆盖区内）
     header[kMetaVersionOffset] = static_cast<char>(kMetaVersion);
     header[kMetaModeOffset] = static_cast<char>(
         config.mode == Mode::kKV ? 0 : 1);

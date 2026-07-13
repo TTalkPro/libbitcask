@@ -7,6 +7,7 @@
 #include <bitcask/search_checkpoint.hpp>  // S14-3 段 carry 断言
 #include <bitcask/codec.hpp>
 #include <bitcask/data_file.hpp>  // parse_data_tstamp（S13 测试枚举 data 文件）
+#include <bitcask/hw_crc32.hpp>   // S32-M0 meta 手改字节重算 CRC
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -2054,6 +2055,84 @@ TEST_F(CaskDocValueTest, P5bInmemInt8ComposesWithQuantized) {
     ASSERT_EQ(r->hits.size(), 1u);
     EXPECT_EQ(r->hits[0].key, "k1");
     (*c)->close();
+}
+
+// S32-M0:vector_engine 接线——meta 往返 + 旧全零解码 kHnsw + 未实现引擎
+// open 干净拒绝 + 引擎不符 mode_mismatch。
+TEST_F(CaskDocValueTest, S32M0VectorEngineMetaWiring) {
+    // meta 往返：kIvfRq 写读保真（纯 meta 层，不经 Cask）。
+    {
+        auto tmp = tmpdir_ / "eng_rt";
+        std::filesystem::create_directories(tmp);
+        bitcask::meta::MetaConfig cfg;
+        cfg.mode = bitcask::meta::Mode::kIndex;
+        cfg.vector_metric = bitcask::meta::VectorMetric::kCosineNormalized;
+        cfg.vector_dim = 4;
+        cfg.vector_engine = bitcask::meta::VectorEngine::kIvfRq;
+        ASSERT_TRUE(bitcask::meta::write_meta(tmp.string(), cfg));
+        auto rd = bitcask::meta::read_meta(tmp.string());
+        ASSERT_TRUE(rd);
+        EXPECT_EQ(rd->vector_engine, bitcask::meta::VectorEngine::kIvfRq);
+    }
+    // 建库默认引擎 → meta 持久化 kHnsw（保留字节零语义）。
+    {
+        auto c = Cask::open(tmpdir_.string(), v31_opts(4), &test_registry());
+        ASSERT_TRUE(c);
+        (*c)->close();
+        auto mc = bitcask::meta::read_meta(tmpdir_.string());
+        ASSERT_TRUE(mc);
+        EXPECT_EQ(mc->vector_engine, bitcask::meta::VectorEngine::kHnsw);
+    }
+    // 未实现引擎：open 干净拒绝（防止建出无法服务的库）。
+    {
+        auto tmp = tmpdir_ / "eng_ivf";
+        std::filesystem::create_directories(tmp);
+        auto opts = v31_opts(4);
+        opts.vector_engine = bitcask::meta::VectorEngine::kIvfRq;
+        auto c = Cask::open(tmp.string(), opts, &test_registry());
+        ASSERT_FALSE(c);
+        EXPECT_EQ(c.error().kind, bitcask::CaskError::kInvalidOption);
+    }
+    // 引擎不符：meta 声明 kIvfRq（模拟未来引擎写的库）、opts 默认 kHnsw
+    // → kModeMismatch（绝不按 HNSW 静默误开别家引擎的库）。
+    {
+        auto tmp = tmpdir_ / "eng_mm";
+        std::filesystem::create_directories(tmp);
+        bitcask::meta::MetaConfig cfg;
+        cfg.mode = bitcask::meta::Mode::kIndex;
+        cfg.vector_metric = bitcask::meta::VectorMetric::kCosineNormalized;
+        cfg.vector_dim = 4;
+        cfg.vector_engine = bitcask::meta::VectorEngine::kIvfRq;
+        ASSERT_TRUE(bitcask::meta::write_meta(tmp.string(), cfg));
+        auto c = Cask::open(tmp.string(), v31_opts(4), &test_registry());
+        ASSERT_FALSE(c);
+        EXPECT_EQ(c.error().kind, bitcask::CaskError::kModeMismatch);
+    }
+    // 未知引擎值：read_meta fail-fast（新读端才认识的值绝不静默过）。
+    {
+        auto tmp = tmpdir_ / "eng_bad";
+        std::filesystem::create_directories(tmp);
+        bitcask::meta::MetaConfig cfg;
+        cfg.mode = bitcask::meta::Mode::kIndex;
+        cfg.vector_metric = bitcask::meta::VectorMetric::kCosineNormalized;
+        cfg.vector_dim = 4;
+        ASSERT_TRUE(bitcask::meta::write_meta(tmp.string(), cfg));
+        const auto path = (tmp / "bitcask.meta").string();
+        // 手改 offset[11] 为未知值 + 重算 CRC（CRC 覆盖 [0,14)）。
+        std::FILE* f = std::fopen(path.c_str(), "r+b");
+        ASSERT_NE(f, nullptr);
+        unsigned char hdr[18];
+        ASSERT_EQ(std::fread(hdr, 1, sizeof(hdr), f), sizeof(hdr));
+        hdr[11] = 99;
+        const std::uint32_t crc = bitcask::hw::crc32(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(hdr), 14));
+        std::memcpy(hdr + 14, &crc, 4);
+        std::rewind(f);
+        ASSERT_EQ(std::fwrite(hdr, 1, sizeof(hdr), f), sizeof(hdr));
+        std::fclose(f);
+        auto rd = bitcask::meta::read_meta(tmp.string());
+        EXPECT_FALSE(rd) << "未知 vector_engine 必须 fail-fast";
+    }
 }
 
 // LE flag-day 护栏:旧 v1(大端 legacy)meta 在 open 时被干净拒绝,而非静默把

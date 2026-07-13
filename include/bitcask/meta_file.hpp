@@ -8,7 +8,8 @@
 //   [7..8]   VecDim       uint16 LE (V3.1)
 //   [9]      VecQuant     uint8 = 0/1（P3b：向量落盘 int8 量化；旧文件全零=否）
 //   [10]     VecInmemInt8 uint8 = 0/1（P5b：HNSW int8-only 内存；旧文件全零=否）
-//   [11..17] Reserved     7 bytes zeros（future use）
+//   [11]     VecEngine    uint8（S32-M0：向量引擎；0=HNSW，旧文件全零=HNSW）
+//   [12..17] Reserved     6 bytes zeros（future use；[14..17] 为 v3 CRC32）
 //
 // === 线程模型 ===
 // 所有函数均为纯函数：线程安全、可重入、无锁。
@@ -37,6 +38,16 @@ enum class VectorMetric : std::uint8_t {
     kDot = 3,
 };
 
+// S32-M0:向量引擎(设计 doc/vector-dual-engine-selection-zh.md §4)。
+// 建库时一次性选定、持久化进 meta;重开不一致 → mode_mismatch。运行期
+// 不可切换,唯一切换路径 = 离线转换工具(设计 §6.4)。kHnsw = 0 使旧
+// meta 保留区全零自然解码为 HNSW(与 VectorMetric::kNone 同款零升级)。
+enum class VectorEngine : std::uint8_t {
+    kHnsw = 0,     // 内存图(≤ 数 M 向量档;现行实现)
+    kIvfRq = 1,    // IVF-RaBitQ 磁盘档(S32-M3;10M-100M)
+    kDiskann = 2,  // DiskANN(S32-M5 条件触发;预留)
+};
+
 // bitcask.meta 配置内容。
 // V3.1:vector 配置占用原保留区 [6]=metric、[7..8]=dim(LE u16)——
 // 库内 dim 恒定、初始化显式配置、重开校验(hnsw-design §1)。
@@ -46,6 +57,8 @@ struct MetaConfig {
     std::uint16_t vector_dim = 0;   // 0 = 无向量
     bool vector_quantized = false;  // P3b：向量落盘 int8 量化（仅 vector_dim>0 有意义）
     bool vector_inmem_int8 = false; // P5b：HNSW int8-only 内存模式（仅 vector_dim>0 + kDot）
+    // S32-M0：向量引擎（仅 vector_dim>0 有意义；无向量恒 kHnsw/0）。
+    VectorEngine vector_engine = VectorEngine::kHnsw;
 };
 
 // meta 文件操作错误

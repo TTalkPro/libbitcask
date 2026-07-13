@@ -345,6 +345,13 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
         return std::unexpected(err(CaskError::kInvalidOption,
             "vector_inmem_int8 requires kDot/cosine metric (kL2 unsupported)"));
     }
+    // S32-M0:引擎接线先行,实现后置——非 HNSW 引擎在插件落地前干净拒绝
+    // (kIvfRq = S32-M3,kDiskann = S32-M5),防止建出无法服务的库。
+    if (opts_.vector_dim > 0 &&
+        opts_.vector_engine != meta::VectorEngine::kHnsw) {
+        return std::unexpected(err(CaskError::kInvalidOption,
+            "vector_engine ivf_rq/diskann not implemented yet (S32-M3/M5)"));
+    }
     if (meta::meta_exists(dirname_)) {
         auto mc = meta::read_meta(dirname_);
         if (!mc) return std::unexpected(err(CaskError::kIo, "read meta failed"));
@@ -363,12 +370,17 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
         const bool want_quant = opts_.vector_dim > 0 && opts_.vector_quantized;
         const bool want_inmem_int8 =
             opts_.vector_dim > 0 && opts_.vector_inmem_int8;
+        // S32-M0:引擎同组校验(无向量时归一 kHnsw——保留字节全零语义)。
+        const auto want_engine = opts_.vector_dim > 0
+                                     ? opts_.vector_engine
+                                     : meta::VectorEngine::kHnsw;
         if (mc->vector_dim != opts_.vector_dim ||
             mc->vector_metric != want_metric ||
             mc->vector_quantized != want_quant ||
-            mc->vector_inmem_int8 != want_inmem_int8) {
+            mc->vector_inmem_int8 != want_inmem_int8 ||
+            mc->vector_engine != want_engine) {
             return std::unexpected(err(CaskError::kModeMismatch,
-                "vector config mismatch (meta dim/metric/quantized/inmem_int8 vs options)"));
+                "vector config mismatch (meta dim/metric/quantized/inmem_int8/engine vs options)"));
         }
         meta_config_ = *mc;
         return {};
@@ -385,6 +397,7 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
         mc.vector_metric = opts_.vector_metric;
         mc.vector_quantized = opts_.vector_quantized;  // P3b
         mc.vector_inmem_int8 = opts_.vector_inmem_int8;  // P5b
+        mc.vector_engine = opts_.vector_engine;  // S32-M0
     }
     auto wr = meta::write_meta(dirname_, mc);
     if (!wr) return std::unexpected(err(CaskError::kIo, "write meta failed"));
@@ -497,6 +510,9 @@ Cask::create_search_infra(const CaskOptions& opts) {
         return std::unexpected(err(CaskError::kInvalidOption,
                                    "analyzer creation failed (check analyzer type / dict_path)"));
     }
+    // S32-M0：向量引擎工厂点——meta_config_.vector_engine 分发插件实现。
+    // 当前仅 kHnsw（非 HNSW 已在 check_or_create_meta 干净拒绝）；IvfPlugin
+    // 落地（S32-M3）时在此按引擎实例化对应 CaskPlugin。
     vec_plugin_ = std::make_unique<vec::VectorPlugin>(scfg.vector_config(),
                                                       *docmap_);
     hybrid_.emplace(*text_, *vec_plugin_);
