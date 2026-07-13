@@ -248,8 +248,23 @@ void VectorPlugin::rebuild() {
     // S14-4/S18-6：图重建后旧链插入日志语义不再成立 → 自身 rebase。
     rebase_needed_.store(true, std::memory_order_relaxed);
     // S13-P8：clone_live 结构化拷贝替代从零重插——O(节点+边)，无距离计算。
+    // S32-M2b：payload 外溢——活集 f32/码字直接流式写 .vec/.qc8（新 gen）
+    // 并 mmap attach，重建期堆峰值不再翻倍。旧图并发读者读旧 mmap（inode
+    // 由旧 fd 续命，rename 不影响）；crash 窗口 = 新 payload 已落而新 ckpt
+    // 未落 → gen 守卫拒载 → fold 重建（与旧「rebuild 后 flush 全量重写」
+    // 同窗口；宿主在 merge 收尾后 FIFO 紧跟成对保存点）。dir_ 未知
+    // （standalone 测试未 open）时退堆拷贝旧行为。
+    std::string vec_path, qc_path;
+    if (!dir_.empty()) {
+        const std::string fp = comp_path(dir_);
+        vec_path =
+            std::filesystem::path(fp).replace_extension(".vec").string();
+        qc_path =
+            std::filesystem::path(fp).replace_extension(".qc8").string();
+    }
     auto fresh = old->clone_live(
-        [this](std::uint64_t ord) { return docs_.is_live(ord); });
+        [this](std::uint64_t ord) { return docs_.is_live(ord); },
+        vec_path, qc_path);
     hnsw_.store(std::move(fresh), std::memory_order_release);
 }
 

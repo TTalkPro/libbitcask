@@ -47,6 +47,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <cstring>  // S32-M2:qc8 mmap 记录尾 scale/sum 的 memcpy 取值
 #include <functional>
 #include <memory>
 #include <random>
@@ -125,8 +126,21 @@ public:
     // int8-only 模式直接拷 qcodes/scale/sum——顺带消掉旧重插路径的
     // 反量化→再量化往返（audit P8 项）。
     // 线程模型：调用方须为单写者（reducer）；旧图并发读者不受影响（只读）。
+    //
+    // S32-M2b：payload 外溢模式（设计 vector-dual-engine-selection §6.2 前
+    // 提、§1.2 P1）。spill_vec_path/spill_qc_path 非空时，活集 f32/int8
+    // 码字**不进 fresh 堆**——从旧图（含 mmap 段）按 remap 直接流式写新
+    // payload 文件（tmp+rename、新 payload_gen），fresh 以 mmap attach
+    // （checkpoint_count_ = 活节点数）。堆峰值从「旧图 + 新图全量」降到
+    // 「旧图 + 新图邻接/元数据（~165B/节点）」。外溢失败自动回退堆拷贝
+    // （行为同旧版）。空路径 = 旧行为（测试/standalone）。
+    // 崩溃窗口：新 payload 已 rename 而新 ckpt 未落 → gen 守卫拒载 →
+    // fold 全量重建（与旧「rebuild 后 flush 全量重写」同窗口，宿主在
+    // merge 收尾后 FIFO 紧跟成对保存点，窗口极窄）。
     [[nodiscard]] std::shared_ptr<HnswIndex>
-    clone_live(const std::function<bool(std::uint64_t)>& is_live) const;
+    clone_live(const std::function<bool(std::uint64_t)>& is_live,
+               std::string_view spill_vec_path = {},
+               std::string_view spill_qc_path = {}) const;
 
     // ---- V7:BCVS v2 快照(header in search.ckpt + vecs_ in search.vec mmap)----
     //
@@ -270,15 +284,45 @@ private:
     // V4.2:量化副本访问器。两阶段检索的 int8 粗筛用,与 f32 路径并行
     // 而不互相干扰;QVector 的 sum_codes 由 quantize() 预算好供 VNNI 偏置
     // 补偿。
+    // S32-M2:与 vec_of 同型路由——id < qc_checkpoint_count_ 走 .qc8 mmap
+    // (BCQ8 记录 [codes dim | scale f32 | sum i32] 定长 stride,页缓存可
+    // 回收,堆零驻留),≥ 走 hot chunk 堆数组。scale/sum 在记录尾部,偏移
+    // 任意对齐 → memcpy 取(int8 codes 指针无对齐要求,内核全 loadu)。
+    [[nodiscard]] std::size_t qc_stride() const noexcept {
+        return static_cast<std::size_t>(cfg_.dim) + sizeof(float) +
+               sizeof(std::int32_t);
+    }
     [[nodiscard]] const std::int8_t* qcodes_of(std::uint32_t id) const {
+        if (id < qc_checkpoint_count_) {
+            return reinterpret_cast<const std::int8_t*>(
+                qc_mmap_recs_ + static_cast<std::size_t>(id) * qc_stride());
+        }
         const NodeChunk* c = chunk_of(id);
         return c->qcodes.data() +
                static_cast<std::size_t>(id & kChunkMask) * cfg_.dim;
     }
     [[nodiscard]] float qscale_of(std::uint32_t id) const {
+        if (id < qc_checkpoint_count_) {
+            float s;
+            std::memcpy(&s,
+                        qc_mmap_recs_ +
+                            static_cast<std::size_t>(id) * qc_stride() +
+                            cfg_.dim,
+                        sizeof(float));
+            return s;
+        }
         return chunk_of(id)->qscales[id & kChunkMask];
     }
     [[nodiscard]] std::int32_t qsum_of(std::uint32_t id) const {
+        if (id < qc_checkpoint_count_) {
+            std::int32_t z;
+            std::memcpy(&z,
+                        qc_mmap_recs_ +
+                            static_cast<std::size_t>(id) * qc_stride() +
+                            cfg_.dim + sizeof(float),
+                        sizeof(std::int32_t));
+            return z;
+        }
         return chunk_of(id)->qsums[id & kChunkMask];
     }
     [[nodiscard]] std::uint64_t ord_of(std::uint32_t id) const {
@@ -403,6 +447,20 @@ private:
     int                vecs_payload_fd_ = -1;
     std::size_t        vecs_mmap_len_   = 0;
     std::uint32_t      checkpoint_count_ = 0;
+
+    // S32-M2:.qc8 mmap 化（设计 doc/vector-dual-engine-selection-zh.md
+    // §1.2 P1）。此前 load_qc_payload 是 fread+memcpy 进堆——int8 码字
+    // （D+8 B/节点，高维下占堆的 ~95%）硬驻留。改 mmap 后前
+    // qc_checkpoint_count_ 条记录由页缓存管理（可回收，内存不足退化成慢
+    // 而非 OOM），堆上只剩 hot chunk 的新插入码字。deserialize v3 +
+    // qc_pending 路径的 chunk 以 needs_qcodes=false 创建（容量 0），
+    // 首次热插入懒分配（与 vecs 懒分配同协议——boundary chunk 内已发布
+    // 节点全部 < qc_checkpoint_count_ 走 mmap，assign 无并发读者）。
+    const std::uint8_t* qc_mmap_recs_ = nullptr;  // 记录区基址（含 stride）
+    void*               qc_mmap_raw_  = nullptr;
+    int                 qc_payload_fd_ = -1;
+    std::size_t         qc_mmap_len_  = 0;
+    std::uint32_t       qc_checkpoint_count_ = 0;
 
     // S14-2:.vec 追加状态——与 mmap 解耦（追加读内存 vec_of、写文件，不需要
     // 目标文件被 mmap；全量重写换 inode 后也能收养新文件继续追加）。

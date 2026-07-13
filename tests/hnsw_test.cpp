@@ -750,3 +750,164 @@ TEST(HnswQc8Append, AppendGenGuardRoundTrip) {
     fs::remove(old_ckpt);
     fs::remove(qc_path);
 }
+
+// S32-M2:qc8 mmap 化后的 boundary chunk 热插入——load 后 chunk 无堆
+// qcodes(容量 0,码字在 mmap),继续 insert 走懒分配;新旧节点检索、
+// 追加保存(mmap 段 + chunk 段聚合)、重载全链等价。
+TEST(HnswQc8Append, MmapLoadHotInsertAppendReload) {
+    namespace fs = std::filesystem;
+    const std::size_t dim = 32;
+    HnswConfig cfg;
+    cfg.dim = static_cast<std::uint16_t>(dim);
+    cfg.metric = HnswMetric::kDot;
+    cfg.inmem_int8 = true;  // 无 VNNI 机器上强制 needs_qcodes(标量回退)
+
+    auto vec_i = [&](std::size_t i) {
+        std::mt19937 rng(static_cast<std::uint32_t>(i) * 2654435761u + 13);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> v(dim);
+        double sq = 0;
+        for (auto& x : v) { x = nd(rng); sq += static_cast<double>(x) * x; }
+        const float inv = 1.0f / static_cast<float>(std::sqrt(sq));
+        for (auto& x : v) x *= inv;
+        return v;
+    };
+    const auto base =
+        (fs::temp_directory_path() / "bitcask_qc8_mmap_hot.bcvs").string();
+
+    // 建 120 条 → save → 新对象 load(qc8 走 mmap,chunk 无堆码字)。
+    {
+        HnswIndex idx(cfg);
+        for (std::size_t i = 0; i < 120; ++i) {
+            auto v = vec_i(i);
+            idx.insert(i, std::span<const float>(v.data(), dim));
+        }
+        ASSERT_TRUE(idx.save(base));
+    }
+    HnswIndex r(cfg);
+    ASSERT_TRUE(r.load(base));
+    ASSERT_EQ(r.size(), 120u);
+
+    // mmap 段检索等价(码字全在页缓存,不在堆)。
+    for (std::size_t i : {0u, 63u, 119u}) {
+        auto q = vec_i(i);
+        auto hits = r.search(std::span<const float>(q.data(), dim), 1, 64);
+        ASSERT_FALSE(hits.empty());
+        EXPECT_EQ(hits[0].ord, i);
+    }
+
+    // 热插入 boundary chunk(懒分配堆 qcodes;已发布节点仍走 mmap)。
+    for (std::size_t i = 120; i < 180; ++i) {
+        auto v = vec_i(i);
+        r.insert(i, std::span<const float>(v.data(), dim));
+    }
+    for (std::size_t i : {5u, 119u, 120u, 179u}) {  // 新旧混查
+        auto q = vec_i(i);
+        auto hits = r.search(std::span<const float>(q.data(), dim), 1, 64);
+        ASSERT_FALSE(hits.empty());
+        EXPECT_EQ(hits[0].ord, i) << "mmap/堆两段路由错位 @ " << i;
+    }
+
+    // 追加保存(源 = mmap 段之后的 chunk 段)→ 重载 → 全段等价。
+    ASSERT_TRUE(r.save(base));
+    HnswIndex r2(cfg);
+    ASSERT_TRUE(r2.load(base));
+    EXPECT_EQ(r2.size(), 180u);
+    for (std::size_t i : {0u, 119u, 120u, 179u}) {
+        auto q = vec_i(i);
+        auto hits = r2.search(std::span<const float>(q.data(), dim), 1, 64);
+        ASSERT_FALSE(hits.empty());
+        EXPECT_EQ(hits[0].ord, i);
+    }
+
+    fs::remove(base);
+    fs::remove(base + ".vec");
+    fs::remove(base + ".qc8");
+}
+
+// S32-M2b:clone_live payload 外溢——活集数据不进 fresh 堆,直接流盘 +
+// mmap attach;后续 save 收养文件身份走追加(inode 不变);重载等价。
+// 两种模式各验一遍:int8-only(qc8 外溢)与 f32(vec 外溢,本机无 VNNI →
+// needs_qcodes=false)。
+TEST(HnswCloneSpill, SpillAttachAdoptAndReload) {
+    namespace fs = std::filesystem;
+    const std::size_t dim = 32;
+
+    auto vec_i = [&](std::size_t i) {
+        std::mt19937 rng(static_cast<std::uint32_t>(i) * 2654435761u + 29);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> v(dim);
+        double sq = 0;
+        for (auto& x : v) { x = nd(rng); sq += static_cast<double>(x) * x; }
+        const float inv = 1.0f / static_cast<float>(std::sqrt(sq));
+        for (auto& x : v) x *= inv;
+        return v;
+    };
+    const auto live_even = [](std::uint64_t ord) { return ord % 2 == 0; };
+
+    for (const bool int8_only : {true, false}) {
+        HnswConfig cfg;
+        cfg.dim = static_cast<std::uint16_t>(dim);
+        cfg.metric = HnswMetric::kDot;
+        cfg.inmem_int8 = int8_only;
+
+        HnswIndex idx(cfg);
+        for (std::size_t i = 0; i < 200; ++i) {
+            auto v = vec_i(i);
+            idx.insert(i, std::span<const float>(v.data(), dim));
+        }
+
+        const auto base = (fs::temp_directory_path() /
+                           (int8_only ? "bitcask_clone_spill_i8.bcvs"
+                                      : "bitcask_clone_spill_f32.bcvs"))
+                              .string();
+        const std::string vec_path = base + ".vec";
+        const std::string qc_path  = base + ".qc8";
+
+        // 外溢克隆:偶数 ord 存活(100 个)。
+        auto fresh = idx.clone_live(live_even, vec_path, qc_path);
+        ASSERT_EQ(fresh->size(), 100u);
+
+        // 外溢文件已落盘且尺寸精确(int8-only 无 .vec;f32 无 VNNI 无 .qc8)。
+        if (int8_only) {
+            ASSERT_TRUE(fs::exists(qc_path));
+            EXPECT_EQ(fs::file_size(qc_path), 64u + 100u * (dim + 8));
+        } else {
+            ASSERT_TRUE(fs::exists(vec_path));
+        }
+
+        // fresh 检索等价(数据在 mmap,非堆拷贝)。
+        for (std::size_t i : {0u, 98u, 198u}) {
+            auto q = vec_i(i);
+            auto hits = fresh->search(std::span<const float>(q.data(), dim),
+                                      1, 64);
+            ASSERT_FALSE(hits.empty());
+            EXPECT_EQ(hits[0].ord, i) << "外溢后检索错位 @ " << i
+                                      << " int8=" << int8_only;
+        }
+
+        // save:身份已收养 → 追加路径(inode 不变)。
+        struct stat st1{}, st2{};
+        const std::string adopt_path = int8_only ? qc_path : vec_path;
+        ASSERT_EQ(::stat(adopt_path.c_str(), &st1), 0);
+        ASSERT_TRUE(fresh->save(base));
+        ASSERT_EQ(::stat(adopt_path.c_str(), &st2), 0);
+        EXPECT_EQ(st1.st_ino, st2.st_ino)
+            << "外溢文件身份未被收养(save 走了全量重写)";
+
+        // 重载等价。
+        HnswIndex r(cfg);
+        ASSERT_TRUE(r.load(base));
+        EXPECT_EQ(r.size(), 100u);
+        for (std::size_t i : {0u, 98u, 198u}) {
+            auto q = vec_i(i);
+            auto hits = r.search(std::span<const float>(q.data(), dim), 1, 64);
+            ASSERT_FALSE(hits.empty());
+            EXPECT_EQ(hits[0].ord, i);
+        }
+
+        fs::remove(base);
+        fs::remove(vec_path);
+        fs::remove(qc_path);
+    }
+}
