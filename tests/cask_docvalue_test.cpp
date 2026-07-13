@@ -2229,6 +2229,89 @@ TEST_F(CaskDocValueTest, S32M3IvfEngineEndToEnd) {
     }
 }
 
+// S32-M4:引擎切换的核心属性——data file 是向量权威:只改 meta.vector_engine,
+// 目标引擎组件缺失 → open 时 watermark 0 → 全量 fold 重建。双向验证
+// (hnsw→ivfrq→hnsw),含"旧组件文件保留但过期 → 恢复机制自愈水位差"
+// (回滚安全性)。vec_engine_migrate 工具即此属性的 CLI 皮。
+TEST_F(CaskDocValueTest, S32M4EngineSwitchViaMetaRebuild) {
+    const std::size_t kN = 12;
+    auto vec_of = [](std::size_t i) {
+        std::vector<float> v(4, 0.05f);
+        v[i % 3] = 1.0f;
+        v[3] = 0.02f * static_cast<float>(i);
+        return v;
+    };
+    auto put_docs = [&](Cask& c, std::size_t from, std::size_t to) {
+        for (std::size_t i = from; i < to; ++i) {
+            bitcask::DocInput doc;
+            const std::string text = "sw doc " + std::to_string(i);
+            doc.text = sv_bytes(text);
+            auto v = vec_of(i);
+            doc.vector = std::span<const float>(v.data(), 4);
+            ASSERT_TRUE(c.put_doc(sv_bytes("k" + std::to_string(i)), doc,
+                                  1000));
+        }
+    };
+    auto check_top1 = [&](Cask& c, std::size_t i) {
+        auto r = c.search_vector(
+            std::span<const float>(vec_of(i).data(), 4), 1);
+        ASSERT_TRUE(r);
+        ASSERT_GE(r->hits.size(), 1u);
+        EXPECT_EQ(r->hits[0].key, "k" + std::to_string(i));
+    };
+
+    // 1) HNSW 库：写 kN 条 + 删 k3 + close（组件落盘）。
+    auto hnsw_opts = v31_opts(4);
+    {
+        auto c = Cask::open(tmpdir_.string(), hnsw_opts, &test_registry());
+        ASSERT_TRUE(c);
+        put_docs(**c, 0, kN);
+        ASSERT_TRUE((*c)->remove(sv_bytes("k3"), 2000));
+        (*c)->flush_index();
+        check_top1(**c, 5);
+        (*c)->close();
+    }
+    // 2) 「工具」动作：只改 meta 引擎（vec.* 旧组件文件原地保留）。
+    {
+        auto mc = bitcask::meta::read_meta(tmpdir_.string());
+        ASSERT_TRUE(mc);
+        mc->vector_engine = bitcask::meta::VectorEngine::kIvfRq;
+        ASSERT_TRUE(bitcask::meta::write_meta(tmpdir_.string(), *mc));
+    }
+    // 3) 以 ivfrq 重开：组件缺失 → fold 全量重建；检索等价（含删除）。
+    auto ivf_opts = v31_opts(4);
+    ivf_opts.vector_engine = bitcask::meta::VectorEngine::kIvfRq;
+    {
+        auto c = Cask::open(tmpdir_.string(), ivf_opts, &test_registry());
+        ASSERT_TRUE(c);
+        check_top1(**c, 5);
+        auto rd = (*c)->search_vector(
+            std::span<const float>(vec_of(3).data(), 4), kN);
+        ASSERT_TRUE(rd);
+        for (const auto& h : rd->hits) EXPECT_NE(h.key, "k3");
+        put_docs(**c, kN, kN + 3);  // ivf 纪元续写（制造新旧水位差）
+        (*c)->flush_index();
+        (*c)->close();
+    }
+    // 4) 切回 hnsw：旧 vec.ckpt 仍在但**过期**（manifest 水位已被 ivf 纪元
+    //    推进）→ 载入拒绝 → fold 全量重建 → 新旧文档全可查（回滚自愈）。
+    {
+        auto mc = bitcask::meta::read_meta(tmpdir_.string());
+        ASSERT_TRUE(mc);
+        mc->vector_engine = bitcask::meta::VectorEngine::kHnsw;
+        ASSERT_TRUE(bitcask::meta::write_meta(tmpdir_.string(), *mc));
+        auto c = Cask::open(tmpdir_.string(), hnsw_opts, &test_registry());
+        ASSERT_TRUE(c);
+        check_top1(**c, 5);           // hnsw 纪元旧文档
+        check_top1(**c, kN + 1);      // ivf 纪元新文档
+        auto rd = (*c)->search_vector(
+            std::span<const float>(vec_of(3).data(), 4), kN);
+        ASSERT_TRUE(rd);
+        for (const auto& h : rd->hits) EXPECT_NE(h.key, "k3");
+        (*c)->close();
+    }
+}
+
 // LE flag-day 护栏:旧 v1(大端 legacy)meta 在 open 时被干净拒绝,而非静默把
 // 大端字节读成小端 → 全 record CRC 失败 → 恢复成空库。bump kMetaVersion=2。
 TEST_F(CaskDocValueTest, LegacyV1MetaRejectedCleanly) {

@@ -344,6 +344,13 @@ target_link_libraries(migrate_le
     PRIVATE bitcask_fileops bitcask_format bitcask_io
             bitcask_warnings bitcask_sanitizers)
 
+# vec_engine_migrate — 向量引擎离线切换（S32-M4;设计 §6.4）。只改 meta,
+# 目标引擎索引由首次 open 全量 fold 重建（属性测试守护）。
+add_executable(vec_engine_migrate tools/vec_engine_migrate.cpp)
+target_link_libraries(vec_engine_migrate
+    PRIVATE bitcask_cask bitcask_io
+            bitcask_warnings bitcask_sanitizers)
+
 set(INERT_TABLE_HPP
     "${CMAKE_CURRENT_SOURCE_DIR}/include/bitcask/detail/inert_table.hpp")
 add_custom_command(
