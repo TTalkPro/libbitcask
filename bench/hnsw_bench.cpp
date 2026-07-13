@@ -150,10 +150,9 @@ static void BM_Hnsw_RecallQps(benchmark::State& state) {
     const auto ef = static_cast<std::size_t>(state.range(1));
     constexpr std::size_t kNq = 500;
 
-    ba::TruthParams tp;
-    tp.n = n;
-    tp.dim = kDim;
-    tp.nq = kNq;
+    // v2 语料:簇规模随 n 缩放（~128 成员/簇,边际健康）;f32 + int8 双真值
+    //（后者对 int8 评分引擎公平,差值 ≈ 量化代价）。
+    const ba::TruthParams tp = ba::default_truth_params(n, kDim, kNq);
     static std::map<std::size_t, std::vector<float>> base_cache;
     auto& base = base_cache[n];
     if (base.empty()) {
@@ -162,13 +161,18 @@ static void BM_Hnsw_RecallQps(benchmark::State& state) {
     }
     // query 与 base 共享簇心（center_seed 同）、成员噪声独立——查询落在
     // 簇附近才有可分的真近邻（真值边际健康,召回数字才有意义）。
-    static std::vector<float> queries;
+    static std::map<std::size_t, std::vector<float>> query_cache;
+    auto& queries = query_cache[n];
     if (queries.empty()) {
         queries = ba::make_corpus(kNq, kDim, tp.nc, tp.sigma, tp.query_seed,
                                   tp.center_seed);
     }
     const auto gt = ba::load_or_build_truth(
         tp, std::span<const float>(base), std::span<const float>(queries));
+    ba::TruthParams tp_i8 = tp;
+    tp_i8.int8_scored = true;
+    const auto gt_i8 = ba::load_or_build_truth(
+        tp_i8, std::span<const float>(base), std::span<const float>(queries));
 
     // 图按规模缓存（与 shared_graph 独立:语料是聚簇合成,非其随机高斯）;
     // 建图吞吐在首建时测取。
@@ -209,8 +213,19 @@ static void BM_Hnsw_RecallQps(benchmark::State& state) {
             return ords;
         });
     };
-    state.counters["recall@10"]  = run_k(10);
-    state.counters["recall@100"] = run_k(100);
+    auto run_k_i8 = [&](std::size_t k) {
+        return ba::recall_at(gt_i8, k, [&](std::size_t q) {
+            auto hs = g.search(
+                std::span<const float>(&queries[q * kDim], kDim), k, ef);
+            std::vector<std::uint64_t> ords;
+            ords.reserve(hs.size());
+            for (const auto& h : hs) ords.push_back(h.ord);
+            return ords;
+        });
+    };
+    state.counters["recall@10"]     = run_k(10);
+    state.counters["recall@100"]    = run_k(100);
+    state.counters["recall@10_i8"]  = run_k_i8(10);
     state.counters["build_docs_per_s"] = slot.second;
 }
 BENCHMARK(BM_Hnsw_RecallQps)
@@ -233,23 +248,25 @@ static void BM_Ivf_RecallQps(benchmark::State& state) {
     const auto nprobe = static_cast<std::uint32_t>(state.range(1));
     constexpr std::size_t kNq = 500;
 
-    ba::TruthParams tp;
-    tp.n = n;
-    tp.dim = kDim;
-    tp.nq = kNq;
+    const ba::TruthParams tp = ba::default_truth_params(n, kDim, kNq);
     static std::map<std::size_t, std::vector<float>> base_cache;
     auto& base = base_cache[n];
     if (base.empty()) {
         base = ba::make_corpus(n, kDim, tp.nc, tp.sigma, tp.base_seed,
                                tp.center_seed);
     }
-    static std::vector<float> queries;
+    static std::map<std::size_t, std::vector<float>> query_cache;
+    auto& queries = query_cache[n];
     if (queries.empty()) {
         queries = ba::make_corpus(kNq, kDim, tp.nc, tp.sigma, tp.query_seed,
                                   tp.center_seed);
     }
     const auto gt = ba::load_or_build_truth(
         tp, std::span<const float>(base), std::span<const float>(queries));
+    ba::TruthParams tp_i8 = tp;
+    tp_i8.int8_scored = true;
+    const auto gt_i8 = ba::load_or_build_truth(
+        tp_i8, std::span<const float>(base), std::span<const float>(queries));
 
     static std::map<std::size_t, std::pair<std::unique_ptr<IvfSegment>, double>>
         segs;
@@ -299,8 +316,19 @@ static void BM_Ivf_RecallQps(benchmark::State& state) {
             return ords;
         });
     };
-    state.counters["recall@10"]  = run_k(10);
-    state.counters["recall@100"] = run_k(100);
+    auto run_k_i8 = [&](std::size_t k) {
+        return ba::recall_at(gt_i8, k, [&](std::size_t q) {
+            auto hs = seg.search(
+                std::span<const float>(&queries[q * kDim], kDim), k, nprobe);
+            std::vector<std::uint64_t> ords;
+            ords.reserve(hs.size());
+            for (const auto& h : hs) ords.push_back(h.ord);
+            return ords;
+        });
+    };
+    state.counters["recall@10"]    = run_k(10);
+    state.counters["recall@100"]   = run_k(100);
+    state.counters["recall@10_i8"] = run_k_i8(10);
     state.counters["build_docs_per_s"] = slot.second;
     state.counters["nlist"] = seg.nlist();
 }

@@ -33,6 +33,7 @@
 #include <thread>
 #include <vector>
 
+#include <bitcask/detail/int8_kernels.hpp>  // v2:int8 真值（与引擎同算式）
 #include <bitcask/hw_crc32.hpp>
 
 namespace bitcask::bench_ann {
@@ -84,7 +85,26 @@ struct TruthParams {
     std::uint64_t base_seed   = 0xBA5E5EED;   // base 成员噪声种子
     std::uint64_t query_seed  = 0xC0DE5EED;   // query 成员噪声种子
     std::uint64_t center_seed = 0xCE27E25D;   // 簇心种子（base/query 共享）
+    // v2:真值评分域。false = f32 精确;true = int8 量化评分（quantize +
+    // 整数 dot,与引擎内核同算式）——隔离「引擎自身损失」与「量化损失」:
+    // recall_vs_f32 − recall_vs_int8 ≈ 量化代价,对 int8 评分引擎
+    // (inmem_int8 HNSW / IVF)按 int8 真值对账才公平。
+    bool int8_scored = false;
 };
+
+// v2 默认参数:簇规模随 n 缩放（~128 成员/簇）——v1 固定 nc=64 在 100k+
+// 规模下簇内 top-10 边际跌破 int8 噪声底（紧簇过度对抗,任何 int8 评分
+// 引擎都测得崩）,v2 保持簇密度恒定、边际健康。
+inline TruthParams default_truth_params(std::size_t n, std::size_t dim,
+                                        std::size_t nq) {
+    TruthParams p;
+    p.n = n;
+    p.dim = dim;
+    p.nq = nq;
+    p.nc = static_cast<std::uint32_t>(
+        std::max<std::size_t>(64, n / 128));
+    return p;
+}
 
 // nq × k 的真值 ord 表（行主序）。
 struct GroundTruth {
@@ -98,7 +118,7 @@ struct GroundTruth {
 namespace detail {
 
 inline constexpr char kGtMagic[4] = {'B', 'C', 'G', 'T'};
-inline constexpr std::uint32_t kGtVersion = 1;
+inline constexpr std::uint32_t kGtVersion = 2;  // v2:+int8_scored 标志
 
 inline std::string cache_path(const TruthParams& p) {
     const char* env = std::getenv("BITCASK_ANN_TRUTH_DIR");
@@ -108,11 +128,12 @@ inline std::string cache_path(const TruthParams& p) {
             : std::filesystem::temp_directory_path();
     char name[192];
     std::snprintf(name, sizeof(name),
-                  "bcgt_n%zu_d%zu_nq%zu_k%zu_c%u_s%llx_%llx_%llx.bin",
+                  "bcgt_n%zu_d%zu_nq%zu_k%zu_c%u_s%llx_%llx_%llx%s.bin",
                   p.n, p.dim, p.nq, p.k, p.nc,
                   static_cast<unsigned long long>(p.base_seed),
                   static_cast<unsigned long long>(p.query_seed),
-                  static_cast<unsigned long long>(p.center_seed));
+                  static_cast<unsigned long long>(p.center_seed),
+                  p.int8_scored ? "_i8" : "");
     return (dir / name).string();
 }
 
@@ -126,7 +147,7 @@ inline bool load_truth_cache(const std::string& fp, const TruthParams& p,
     const long sz = std::ftell(f);
     std::fseek(f, 0, SEEK_SET);
     const std::size_t want =
-        4 + 4 + 8 * 6 + 4 + 4 + p.nq * p.k * 8 + 4;
+        4 + 4 + 8 * 6 + 4 + 4 + 4 + p.nq * p.k * 8 + 4;
     if (sz < 0 || static_cast<std::size_t>(sz) != want) {
         std::fclose(f);
         return false;
@@ -153,10 +174,13 @@ inline bool load_truth_cache(const std::string& fp, const TruthParams& p,
     std::uint32_t sigma_bits = 0, want_sigma_bits = 0;
     std::memcpy(&sigma_bits, q, 4); q += 4;
     std::memcpy(&want_sigma_bits, &p.sigma, 4);
+    std::uint32_t i8_flag = 0;
+    std::memcpy(&i8_flag, q, 4); q += 4;
     if (vals[0] != p.n || vals[1] != p.dim || vals[2] != p.nq ||
         vals[3] != p.base_seed || vals[4] != p.query_seed ||
         vals[5] != p.center_seed || nc != p.nc ||
-        sigma_bits != want_sigma_bits) {
+        sigma_bits != want_sigma_bits ||
+        i8_flag != (p.int8_scored ? 1u : 0u)) {
         return false;
     }
     ids.resize(p.nq * p.k);
@@ -179,6 +203,8 @@ inline void save_truth_cache(const std::string& fp, const TruthParams& p,
     put(vals, 48);
     put(&p.nc, 4);
     put(&p.sigma, 4);
+    const std::uint32_t i8_flag = p.int8_scored ? 1u : 0u;
+    put(&i8_flag, 4);
     put(ids.data(), ids.size() * 8);
     const std::uint32_t crc = bitcask::hw::crc32(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(buf.data()), buf.size()));
@@ -210,27 +236,72 @@ inline GroundTruth load_or_build_truth(const TruthParams& p,
     gt.ids.assign(p.nq * p.k, 0);
     const std::size_t nthreads =
         std::max<std::size_t>(1, std::thread::hardware_concurrency());
+
+    // v2:int8 真值——base 量化码预计算一次（并行），逐查询整数 dot
+    // （dot_scalar_raw,与引擎内核同算式:VNNI 的整数部分与 scalar 精确
+    // 一致,真值跨机稳定）。
+    std::vector<std::int8_t> qc;
+    std::vector<float>       qscale;
+    std::vector<std::int32_t> qsum;
+    if (p.int8_scored) {
+        qc.resize(p.n * p.dim);
+        qscale.resize(p.n);
+        qsum.resize(p.n);
+        std::atomic<std::size_t> qi{0};
+        std::vector<std::thread> qpool;
+        qpool.reserve(nthreads);
+        for (std::size_t t = 0; t < nthreads; ++t) {
+            qpool.emplace_back([&]() {
+                bitcask::vec::int8::QVector qv;
+                for (;;) {
+                    const std::size_t i = qi.fetch_add(1);
+                    if (i >= p.n) return;
+                    bitcask::vec::int8::quantize_into(
+                        base.data() + i * p.dim, p.dim, qv);
+                    std::memcpy(qc.data() + i * p.dim, qv.codes.data(),
+                                p.dim);
+                    qscale[i] = qv.scale;
+                    qsum[i]   = qv.sum_codes;
+                }
+            });
+        }
+        for (auto& th : qpool) th.join();
+    }
+
     std::vector<std::thread> pool;
     pool.reserve(nthreads);
     std::atomic<std::size_t> next{0};
     for (std::size_t t = 0; t < nthreads; ++t) {
         pool.emplace_back([&]() {
             std::vector<std::pair<float, std::uint64_t>> all(p.n);
+            bitcask::vec::int8::QVector qv;
             for (;;) {
-                const std::size_t qi = next.fetch_add(1);
-                if (qi >= p.nq) return;
-                const float* q = queries.data() + qi * p.dim;
-                for (std::size_t i = 0; i < p.n; ++i) {
-                    const float* v = base.data() + i * p.dim;
-                    float dot = 0.0f;
-                    for (std::size_t d = 0; d < p.dim; ++d) dot += v[d] * q[d];
-                    all[i] = {dot, static_cast<std::uint64_t>(i)};
+                const std::size_t qi2 = next.fetch_add(1);
+                if (qi2 >= p.nq) return;
+                const float* q = queries.data() + qi2 * p.dim;
+                if (p.int8_scored) {
+                    bitcask::vec::int8::quantize_into(q, p.dim, qv);
+                    for (std::size_t i = 0; i < p.n; ++i) {
+                        const float s = bitcask::vec::int8::dot_scalar_raw(
+                            qv.codes.data(), qc.data() + i * p.dim, qsum[i],
+                            qv.scale, qscale[i], p.dim);
+                        all[i] = {s, static_cast<std::uint64_t>(i)};
+                    }
+                } else {
+                    for (std::size_t i = 0; i < p.n; ++i) {
+                        const float* v = base.data() + i * p.dim;
+                        float dot = 0.0f;
+                        for (std::size_t d = 0; d < p.dim; ++d) {
+                            dot += v[d] * q[d];
+                        }
+                        all[i] = {dot, static_cast<std::uint64_t>(i)};
+                    }
                 }
                 std::partial_sort(all.begin(),
                                   all.begin() + static_cast<long>(p.k),
                                   all.end(), std::greater<>());
                 for (std::size_t j = 0; j < p.k; ++j) {
-                    gt.ids[qi * p.k + j] = all[j].second;
+                    gt.ids[qi2 * p.k + j] = all[j].second;
                 }
             }
         });
