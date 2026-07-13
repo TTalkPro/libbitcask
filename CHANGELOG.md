@@ -5,8 +5,56 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`3.1.0`**；库 `SOVERSION` = **`3`**（= major，ABI 兼容不变）；
+`bitcask_version_*` = **`4.0.0`**；库 `SOVERSION` = **`4`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v3`**（含 CRC32），`field.schema` = **FSCH v1**。
+
+---
+
+## [4.0.0] - 2026-07-13
+
+### ⚠️ ABI 破坏（major bump 的原因）
+
+- **`bitcask_options_t` 布局/大小变更 ×2**（S32 引擎字段 + S29-11-②
+  导航开关）——旧编译二进制与新库二进制不兼容（旧结构体传新库 = 越界
+  读）。SONAME `libbitcask.so.3` → **`.so.4`**，链接器层面隔离旧二进制。
+  **源码级完全向后兼容**：新字段全部尾部追加、`bitcask_options_init()`
+  全量初始化，旧代码重编即正确。
+
+### Added（S32 向量双引擎 + S29-11-②④ + M5）
+
+- **向量双引擎**：`vector_engine`（C/C++ API）建库时选定并持久化进
+  `bitcask.meta`——`hnsw`（默认，内存档）/ `ivfrq`（IVF 磁盘段，磁盘档
+  推荐，10M-100M）/ `diskann`（Vamana 图，**实验性**，真实语料验证前不
+  建议生产）。引擎不符重开 → `MODE_MISMATCH`；离线切换工具
+  `vec_engine_migrate`（只改 meta，首次 open 全量 fold 重建，可回滚）。
+- **IVF 引擎**（BIV v2）：k-means 分簇 + int8 posting 顺序扫 + 1-bit
+  RaBitQ-lite 两段粗筛 + 两级质心索引——100k/384d 查询 36.5µs、
+  召回损失 ≤0.08pt（三级优化累计 5.6×）。
+- **DiskANN 引擎**（BDA1）：Vamana 单层图 + 盘上节点块共置 + beam
+  search；实验性定级（极端聚簇合成语料为单层图病态形态，连续分布对照
+  达标；解除标注前置 = 真实语料验证）。
+- **AVX2 int8 内核**（S29-11-②）：sign 技巧防 vpmaddubsw 饱和；分发链
+  VNNI512→VNNI256→AVX2→标量——非 VNNI 机器（Haswell+）全 int8 路径
+  激活。HNSW 混合精度建图导航：插入 +29%~+75%（100k 82s→48s），
+  **recall@10 零损失**（`hnsw_build_nav_int8=0` 回退闸）。
+- 召回评估基建（`bench/ann_recall_harness.hpp`：盘上真值缓存 + f32/int8
+  双真值 + 三元组 bench）；`vec::DeltaLog` 插入日志单一真源。
+
+### Changed
+
+- **向量 ckpt 崩溃恢复有界**（S32-M1）：base rebase 双门槛
+  （`vector_rebase_min_docs`，默认 256K）——恢复链重放从最坏 ~4.2M 条
+  （小时级）收到 ≤320K 条（分钟级）。
+- **HNSW 内存**（S32-M2）：`.qc8` 码字 mmap 化（堆 ~165B/节点，高维
+  int8 码字出堆）；`clone_live` payload 外溢——merge 重建堆峰值不再
+  翻倍。
+
+### Fixed（审计 2026-07-13）
+
+- 磁盘段结构边界校验误挂 `verify_crc` 门（可信盘模式下损坏文件 →
+  mmap OOB 读 UB）：IVF cidx 无条件校验、DiskANN 查询侧 use-site guard。
+- IO 循环 EINTR 重试；`parallel_for` 异常安全（捕获重抛替代
+  `std::terminate`）+ build 的 fd/tmp RAII 清理。
 
 ---
 
