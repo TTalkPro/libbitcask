@@ -3752,8 +3752,11 @@ W4 ✅（parallel_scan 并行全表扫描）。
   - **④ dist 去虚:评估后搁置**——混合导航后 f32 dist_ 只剩精选路径
     (非热点),int8 kern 为稳定间接目标(分支预测友好),模板去虚
     收益预期 <2% 不值重构;若 ③ 并行插入后 profile 翻案再开。
-  - 验收:gcc 全量 **641/641**(AVX2 激活态);ASan 12/12;TSan 2/2;
-    build-rel 过。
+  - 验收:gcc 全量 **641/641** + **clang 全量 641/641**(均 AVX2 激活
+    态);ASan 12/12 + cask S32 子集 8/8 + C 套件;TSan 内核/并发 2/2 +
+    三插件 11/11;build-rel 过。**C API 同步**:`hnsw_build_nav_int8`
+    (默认 1;0 = 回退闸)入 `bitcask_options_t` + api-c.md,C 套件
+    gcc/ASan 双过。
 - [ ] **S29-11 剩余:① 调参矩阵(纯数据)、③ 并行插入(独立大批次,
   全库最高风险并发改动;建议真实语料验证轮后再立项)** — **完整设计已写
   ([`doc/s29-11-hnsw-deep-opt-design-zh.md`](doc/s29-11-hnsw-deep-opt-design-zh.md),
