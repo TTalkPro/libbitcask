@@ -137,6 +137,7 @@ VectorPlugin::VectorPlugin(const VectorPluginConfig& config,
                         ? HnswMetric::kL2
                         : HnswMetric::kDot;
         hc.inmem_int8 = config_.inmem_int8;  // P5b
+        hc.build_nav_int8 = config_.hnsw_build_nav_int8;  // S29-11-②
         // S13-D11：建图参数透传（0 = 保持 HnswConfig 默认）。rebuild
         // 复用 old->config() → 本处设置对重建图同样生效。
         if (config_.hnsw_m > 0) hc.M = config_.hnsw_m;

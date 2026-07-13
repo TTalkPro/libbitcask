@@ -1221,22 +1221,27 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
     scratch.resize(1 + cfg_.M * 2);
 
     // P5:int8-only 用本节点量化副本作建图 query(无常驻 f32);默认用 f32。
+    // S29-11-②:混合精度——默认模式下**导航**(贪心 + 逐层 ef 搜索)也走
+    // int8(工作集 4× 塌缩,打掉建图超线性),入选邻居仍 f32 精选(见下)。
     const bool i8 = cfg_.inmem_int8;
+    const bool nav_i8 =
+        i8 || (cfg_.build_nav_int8 && needs_qcodes_ &&
+               cfg_.metric == HnswMetric::kDot && int8_dot_ != nullptr);
     // V7:vecs_ 已走 hot_vecs_;vec_of(id) 路由(< checkpoint_count_ → mmap,
     // ≥ → hot_vecs_)。本节点是刚插入的 id,hot_vecs_ 末尾正是其 vec。
     const float* q = i8 ? nullptr : vec_of(id);
-    const std::int8_t* qc = i8 ? qcodes_of(id) : nullptr;
-    const float        qs = i8 ? qscale_of(id) : 0.0f;
-    const std::int32_t qsum = i8 ? qsum_of(id) : 0;
+    const std::int8_t* qc = nav_i8 ? qcodes_of(id) : nullptr;
+    const float        qs = nav_i8 ? qscale_of(id) : 0.0f;
+    const std::int32_t qsum = nav_i8 ? qsum_of(id) : 0;
 
     // 上层贪心下降到 level+1。
     for (std::int32_t l = max_level;
          l > static_cast<std::int32_t>(level); --l) {
-        cur = i8 ? greedy_closest_int8(qc, qs, qsum, cur,
-                                       static_cast<std::uint32_t>(l), n_bound,
-                                       scratch.data())
-                 : greedy_closest(q, cur, static_cast<std::uint32_t>(l), n_bound,
-                                  scratch.data());
+        cur = nav_i8 ? greedy_closest_int8(qc, qs, qsum, cur,
+                                           static_cast<std::uint32_t>(l),
+                                           n_bound, scratch.data())
+                     : greedy_closest(q, cur, static_cast<std::uint32_t>(l),
+                                      n_bound, scratch.data());
     }
 
     // 3) level..0:efConstruction 搜索 + 启发式选边 + 双向连边 + 邻居收缩。
@@ -1246,7 +1251,7 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
              static_cast<std::int32_t>(level), max_level);
          l >= 0; --l) {
         const auto lay = static_cast<std::uint32_t>(l);
-        if (i8) {
+        if (nav_i8) {
             search_layer_int8(qc, qs, qsum, cur, cfg_.ef_construction, lay,
                               n_bound, scratch.data(), found);
         } else {
@@ -1256,8 +1261,18 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
         cur = found.front().second;  // 下层入口 = 本层最近
 
         auto picked = found;
-        if (i8) select_neighbors_int8(picked, cfg_.M);
-        else    select_neighbors(q, picked, cfg_.M);  // L0 也选 M,容量 2M 留收缩余量
+        if (i8) {
+            select_neighbors_int8(picked, cfg_.M);
+        } else {
+            // S29-11-②:混合精度的精选侧——ef 候选(≤ef_construction 条)
+            // 重算 f32 距离后走 f32 启发式选边(候选重算成本 ≪ 导航
+            // 全程,召回损失被压到入选边界的重排噪声)。
+            if (nav_i8) {
+                for (auto& pr : picked) pr.first = dist_id(q, pr.second);
+                std::sort(picked.begin(), picked.end());
+            }
+            select_neighbors(q, picked, cfg_.M);  // L0 也选 M,容量 2M 留收缩余量
+        }
 
         // 正向边:本节点已发布,读者可能在拷它的邻居 → 持自身锁写。
         {

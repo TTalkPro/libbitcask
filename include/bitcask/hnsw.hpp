@@ -74,6 +74,12 @@ struct HnswConfig {
     // 建图/查询全程 int8,向量内存 ~−80%。仅 kDot(int8 距离=重建内积);
     // kL2 不支持(上游 open 接线拒绝)。设计 doc/hnsw-int8-only-design-zh.md。
     bool          inmem_int8 = false;
+    // S29-11-②:建图导航 int8 混合精度(默认开;仅 kDot + int8 内核在时
+    // 生效)。导航(上层贪心 + 逐层 ef 搜索)用 int8 副本——工作集 4×
+    // 塌缩打掉建图超线性;**入选邻居仍 f32 精选**(与 inmem_int8 的纯
+    // int8 端到端不同,召回损失远小)。false = 回退全 f32 导航
+    // (S32 召回门:recall@10 降 >1pt 须可回退,本开关即回退闸)。
+    bool          build_nav_int8 = true;
 };
 
 class HnswIndex {
