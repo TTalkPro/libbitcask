@@ -829,6 +829,50 @@ TEST(HnswQc8Append, MmapLoadHotInsertAppendReload) {
 // mmap attach;后续 save 收养文件身份走追加(inode 不变);重载等价。
 // 两种模式各验一遍:int8-only(qc8 外溢)与 f32(vec 外溢,本机无 VNNI →
 // needs_qcodes=false)。
+// S29-11-②:int8 内核对拍——pick 出的 SIMD 内核(本机 AVX2/VNNI)与标量
+// 参照在**整数域**精确一致(契约即此;全值域随机 + 奇数维尾部路径)。
+// float 侧允许 ≤4 ULP:target 属性函数内编译器可做 FMA contraction,
+// 缩放乘除的舍入路径与 baseline 标量不同(实测 1 ULP;top-k 排序不受
+// 影响,由三引擎穷举对拍另行守护)。饱和防护的回归红线:vpmaddubsw
+// 偏置法会在大值域静默饱和(错出整数域,远超 4 ULP),sign 技巧不会。
+TEST(Int8Kernel, SimdMatchesScalarExactly) {
+    namespace i8 = bitcask::vec::int8;
+    i8::Int8DotFn kern = i8::pick_int8_dot_kernel();
+    if (kern == nullptr) GTEST_SKIP() << "无 SIMD int8 内核（非 x86/无 AVX2）";
+    std::mt19937_64 rng(0xC0DE);
+    // 全值域（±127 极值优先——饱和最易触发处）+ 奇数维尾部。
+    for (const std::size_t dim : {3u, 31u, 32u, 33u, 96u, 384u, 1000u, 2560u}) {
+        for (int it = 0; it < 20; ++it) {
+            std::vector<std::int8_t> a(dim), b(dim);
+            std::int32_t sum_b = 0;
+            for (std::size_t j = 0; j < dim; ++j) {
+                // 1/4 概率取 ±127 极值,其余均匀。
+                const int r = static_cast<int>(rng() % 4);
+                a[j] = static_cast<std::int8_t>(
+                    r == 0 ? (rng() % 2 ? 127 : -127)
+                           : static_cast<int>(rng() % 255) - 127);
+                b[j] = static_cast<std::int8_t>(
+                    r == 1 ? (rng() % 2 ? 127 : -127)
+                           : static_cast<int>(rng() % 255) - 127);
+                sum_b += b[j];
+            }
+            const float ref = i8::dot_scalar_raw(a.data(), b.data(), sum_b,
+                                                 0.5f, 0.25f, dim);
+            const float got = kern(a.data(), b.data(), sum_b, 0.5f, 0.25f,
+                                   dim);
+            // ≤4 ULP 判定（float 逐位步进）。
+            float lo = ref, hi = ref;
+            for (int u = 0; u < 4; ++u) {
+                lo = std::nextafterf(lo, -3.4e38f);
+                hi = std::nextafterf(hi, 3.4e38f);
+            }
+            ASSERT_TRUE(got >= lo && got <= hi)
+                << "SIMD 超出 4 ULP @ dim=" << dim << " iter=" << it
+                << " ref=" << ref << " got=" << got;
+        }
+    }
+}
+
 TEST(HnswCloneSpill, SpillAttachAdoptAndReload) {
     namespace fs = std::filesystem;
     const std::size_t dim = 32;

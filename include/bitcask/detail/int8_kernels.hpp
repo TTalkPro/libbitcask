@@ -400,12 +400,56 @@ inline float l2_vnni512(const std::int8_t* query_codes,
     return static_cast<float>(dot_codes);
 }
 
+// ---------------------------------------------------------------------------
+// dot_avx2 — S29-11-②:无 VNNI 机器的缺口补齐（AVX2 自 2013 Haswell 起
+// 普及）。经典两步 vpmaddubsw(u8×s8→s16 对和) + vpmaddwd(s16→s32 横加)。
+//
+// **sign 技巧防饱和**（与 VNNI 的 XOR-0x80 偏置法不同）:vpmaddubsw 的
+// s16 对和会饱和——若走偏置法,u8∈[1,255] × s8∈[-127,127] 的对和上界
+// 2·255·127 = 64770 > 32767,静默饱和 = 静默错分。改用恒等式
+// q·d = |d| ⊙ sign(q, d):|d| ≤ 127 作 u8 操作数、sign(q,d) ∈ [-127,127]
+// 作 s8 操作数 → 对和上界 2·127·127 = 32258 < 32767,**永不饱和**。
+// 整数部分与 dot_scalar_raw 精确一致(kernel 对拍契约;sum_db 无用——
+// 无偏置需补偿)。s32 lane 累计上界 (dim/32)·64516,dim ≤ 65535 时
+// ≈1.3e8 ≪ 2^31,安全。
+// ---------------------------------------------------------------------------
+__attribute__((target("avx2")))
+inline float dot_avx2(const std::int8_t* query_codes,
+                      const std::int8_t* db_codes,
+                      std::int32_t /*sum_db*/, float scale_q, float scale_db,
+                      std::size_t dim) noexcept {
+    __m256i acc = _mm256_setzero_si256();
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    std::size_t i = 0;
+    constexpr std::size_t kStride = 32;
+    for (; i + kStride <= dim; i += kStride) {
+        const __m256i q = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(query_codes + i));
+        const __m256i d = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(db_codes + i));
+        const __m256i ad = _mm256_abs_epi8(d);       // u8 ∈ [0,127]
+        const __m256i sq = _mm256_sign_epi8(q, d);   // d==0 → 0(乘积本为 0)
+        const __m256i p16 = _mm256_maddubs_epi16(ad, sq);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, ones16));
+    }
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc),
+                              _mm256_extracti128_si256(acc, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+    std::int64_t raw = _mm_cvtsi128_si32(s);
+    for (; i < dim; ++i) {  // 尾部标量（dim 非 32 倍数）
+        raw += static_cast<std::int32_t>(query_codes[i]) *
+               static_cast<std::int32_t>(db_codes[i]);
+    }
+    return static_cast<float>(raw) * (scale_q * scale_db) / (127.0f * 127.0f);
+}
+
 #endif  // __x86_64__ && (GCC || Clang)
 
 // ---------------------------------------------------------------------------
 // Runtime dispatcher. Returns the best int8 dot kernel for this CPU.
-// Returns nullptr if no VNNI is available (caller falls back to
-// scalar path / f32 reference).
+// S29-11-②:三级 SIMD 分发 VNNI512 → VNNI256 → AVX2;全部缺席才 nullptr
+// (调用方退 f32 / 标量)。
 // ---------------------------------------------------------------------------
 using Int8DotFn = float (*)(const std::int8_t*, const std::int8_t*,
                             std::int32_t, float, float, std::size_t);
@@ -416,6 +460,7 @@ inline Int8DotFn pick_int8_dot_kernel() noexcept {
         __builtin_cpu_init();
         if (__builtin_cpu_supports("avx512vnni")) return &dot_vnni512;
         if (__builtin_cpu_supports("avxvnni"))     return &dot_vnni;
+        if (__builtin_cpu_supports("avx2"))        return &dot_avx2;  // S29-11-②
         return nullptr;
     }();
     return kFn;
