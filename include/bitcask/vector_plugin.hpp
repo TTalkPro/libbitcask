@@ -26,6 +26,7 @@
 #include "bitcask/meta_filter.hpp"
 #include "bitcask/plugin_api.hpp"    // S18-5：实现 CaskPlugin
 #include "bitcask/search_types.hpp"  // search::SearchHit / SearchError
+#include "bitcask/vector_delta_log.hpp"      // S32-M0b：插入日志单一真源
 #include "bitcask/vector_engine_plugin.hpp"  // S32-M3：引擎契约基类
 
 #include <atomic>
@@ -133,12 +134,9 @@ public:
     void clear_dirty() noexcept {
         dirty_.store(false, std::memory_order_relaxed);
     }
-    void begin_delta_window(std::uint64_t wm) { delta_window_wm_ = wm; }
-    [[nodiscard]] bool delta_log_empty() const { return delta_ords_.empty(); }
-    void clear_delta_log() {
-        delta_ords_.clear();
-        delta_data_.clear();
-    }
+    void begin_delta_window(std::uint64_t wm) { delta_.set_window(wm); }
+    [[nodiscard]] bool delta_log_empty() const { return delta_.empty(); }
+    void clear_delta_log() { delta_.clear(); }
     // kHnswDelta 段序列化：count u64 | dim u16 | 每条 ord u64 + f32[dim]。
     void serialize_delta_log(std::vector<std::byte>& out) const;
     // kHnswDelta 段重放：直插（不入日志、不标脏——链内容本就已持久化），
@@ -166,7 +164,7 @@ public:
     [[nodiscard]] ChainState chain_state() const { return chain_; }
     void set_chain_state(const ChainState& st) {
         chain_ = st;
-        delta_window_wm_ = st.chain_wm;  // 入账门与链水位同步
+        delta_.set_window(st.chain_wm);  // 入账门与链水位同步
     }
 
     // legacy 统一 ckpt 的 kHnsw 段载入（图 + .vec/.qc8 payload）。
@@ -182,12 +180,8 @@ private:
     std::atomic<std::shared_ptr<HnswIndex>> hnsw_;
     std::atomic<bool> dirty_{true};
     // S14-4/S18-1：delta 插入日志 + 入账窗口（单写者上下文访问）。
-    // S21-1：平行数组——dim 库内恒定，delta_data_ 按 dim 步长紧凑拼接
-    // （下标 i 的向量 = delta_data_[i*dim, (i+1)*dim)），免每条日志一次
-    // 独立堆 vector（24B 头 + malloc 圆整）。
-    std::uint64_t delta_window_wm_ = 0;
-    std::vector<std::uint64_t> delta_ords_;
-    std::vector<float>         delta_data_;
+    // S32-M0b：抽为 vec::DeltaLog（与 IvfPlugin 共用单一真源）。
+    DeltaLog delta_;
     // S32-M1：自上次成功 base 以来实际入图的向量数（insert 与链重放均按
     // 图节点数增量计——hnsw 水位幂等门丢弃的重放不计）。达
     // config_.rebase_min_docs 时 flush 强制 base（与链长上限双门槛），

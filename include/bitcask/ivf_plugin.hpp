@@ -36,6 +36,7 @@
 #include "bitcask/ivf_rq.hpp"
 #include "bitcask/meta_file.hpp"
 #include "bitcask/meta_filter.hpp"
+#include "bitcask/vector_delta_log.hpp"  // S32-M0b：插入日志单一真源
 #include "bitcask/vector_engine_plugin.hpp"
 #include "bitcask/vector_plugin_config.hpp"
 
@@ -120,10 +121,7 @@ private:
     // 每条 ord u64 + f32[dim]）。
     void serialize_delta_log(std::vector<std::byte>& out) const;
     [[nodiscard]] bool apply_delta_log(std::span<const std::byte> payload);
-    void clear_delta_log() {
-        delta_ords_.clear();
-        delta_data_.clear();
-    }
+    void clear_delta_log() { delta_.clear(); }
     [[nodiscard]] std::shared_ptr<HnswIndex> make_window() const;
 
     VectorPluginConfig    config_;
@@ -136,9 +134,8 @@ private:
     // 重放幂等门：open 载入覆盖水位之下的事件已在 sealed/链里（宿主从
     // min(全插件水位) 起 fold，本插件跳过 ord ≤ 此值；uint64(-1) = 无）。
     std::uint64_t replay_gate_ = static_cast<std::uint64_t>(-1);
-    std::uint64_t delta_window_wm_ = 0;
-    std::vector<std::uint64_t> delta_ords_;
-    std::vector<float>         delta_data_;
+    // S32-M0b：插入日志（与 VectorPlugin 共用 vec::DeltaLog 单一真源）。
+    DeltaLog delta_;
     // S32-M1 同款：自 base 以来入窗向量数（恢复链重放代价的直接度量）。
     std::uint64_t vec_docs_since_base_ = 0;
     ChainState chain_{};

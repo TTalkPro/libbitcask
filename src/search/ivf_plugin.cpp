@@ -100,10 +100,7 @@ void IvfPlugin::insert(std::uint64_t ord, std::span<const float> v) {
         return;
     }
     dirty_.store(true, std::memory_order_relaxed);
-    if (ord >= delta_window_wm_) {
-        delta_ords_.push_back(ord);
-        delta_data_.insert(delta_data_.end(), v.begin(), v.end());
-    }
+    delta_.record(ord, v);  // 窗口门内建（S32-M0b）
     const std::size_t before = w->size();
     w->insert(ord, v);
     vec_docs_since_base_ += w->size() - before;
@@ -221,39 +218,21 @@ std::size_t IvfPlugin::window_size() const {
 // ---- delta 日志（kHnswDelta 通用格式，与 VectorPlugin 位级同构）----
 
 void IvfPlugin::serialize_delta_log(std::vector<std::byte>& out) const {
-    sc::detail::put_u64(out, static_cast<std::uint64_t>(delta_ords_.size()));
-    sc::detail::put_u16(out, config_.dim);
-    const std::size_t dim = config_.dim;
-    for (std::size_t i = 0; i < delta_ords_.size(); ++i) {
-        sc::detail::put_u64(out, delta_ords_[i]);
-        const float* v = delta_data_.data() + i * dim;
-        out.insert(out.end(), reinterpret_cast<const std::byte*>(v),
-                   reinterpret_cast<const std::byte*>(v) +
-                       dim * sizeof(float));
-    }
+    delta_.serialize(config_.dim, out);  // S32-M0b：格式单一真源
 }
 
 bool IvfPlugin::apply_delta_log(std::span<const std::byte> payload) {
-    const auto* p = payload.data();
-    const auto* end = p + payload.size();
-    if (end - p < 10) return false;
-    std::uint64_t cnt = sc::detail::get_u64(p); p += 8;
-    std::uint16_t dim = sc::detail::get_u16(p); p += 2;
-    if (dim != config_.dim) return false;
     auto w = window_.load(std::memory_order_acquire);
-    const std::size_t vb = static_cast<std::size_t>(dim) * sizeof(float);
-    std::vector<float> v(dim);
     const std::size_t before = w ? w->size() : 0;
-    for (std::uint64_t i = 0; i < cnt; ++i) {
-        if (end - p < static_cast<std::ptrdiff_t>(8 + vb)) return false;
-        const std::uint64_t ord = sc::detail::get_u64(p); p += 8;
-        std::memcpy(v.data(), p, vb);
-        p += vb;
-        if (w) w->insert(ord, std::span<const float>(v.data(), dim));
-    }
-    // 链重放计入 base 窗口（恢复欠账可见，S32-M1 同款）。
+    // 解析走 DeltaLog::parse（S32-M0b 格式单一真源）;重放条数计入 base
+    // 窗口（恢复欠账可见，S32-M1 同款）。
+    const bool ok = DeltaLog::parse(
+        payload, config_.dim,
+        [&](std::uint64_t ord, std::span<const float> v) {
+            if (w) w->insert(ord, v);
+        });
     if (w) vec_docs_since_base_ += w->size() - before;
-    return p == end;
+    return ok;
 }
 
 // ---- 组件链 ----
@@ -345,7 +324,7 @@ bool IvfPlugin::save_component_base(std::string_view dir,
     }
     sc::remove_chain_files(fp);
     chain_ = ChainState{watermark, watermark, 1};
-    delta_window_wm_ = watermark;
+    delta_.set_window(watermark);
     clear_delta_log();
     dirty_.store(false, std::memory_order_relaxed);
     // 换代发布：先 sealed 后 window（瞬间双持同 ord 由 search 去重兜住）。
@@ -358,7 +337,7 @@ IvfPlugin::DeltaSaveResult
 IvfPlugin::save_component_delta(std::string_view dir,
                                 std::uint64_t watermark) {
     DeltaSaveResult result;
-    if (delta_ords_.empty()) {
+    if (delta_.empty()) {
         dirty_.store(false, std::memory_order_relaxed);
         return result;
     }
@@ -383,7 +362,7 @@ IvfPlugin::save_component_delta(std::string_view dir,
     }
     chain_.chain_wm = watermark;
     chain_.next_seq = seq + 1;
-    delta_window_wm_ = watermark;
+    delta_.set_window(watermark);
     clear_delta_log();
     dirty_.store(false, std::memory_order_relaxed);
     result.wrote = true;
@@ -408,7 +387,7 @@ IvfPlugin::load_component(std::string_view dir,
     auto fail = [&]() {
         result = LoadResult{};
         chain_ = ChainState{};
-        delta_window_wm_ = 0;
+        delta_.set_window(0);
         return result;
     };
     if (!lc) {
@@ -476,7 +455,7 @@ IvfPlugin::load_component(std::string_view dir,
     result.all_segments_ok = segments_ok && chain_ok;
     if (!result.loaded) return fail();
     chain_ = ChainState{expected_base_wm, coverage, next_seq};
-    delta_window_wm_ = coverage;
+    delta_.set_window(coverage);
     clear_delta_log();
     dirty_.store(false, std::memory_order_relaxed);
     return result;
@@ -518,7 +497,7 @@ plugin::FlushResult IvfPlugin::flush(const plugin::FlushRequest& req) {
             res.status = plugin::PluginStatus::kFailed;
             res.covered_ord = chain_.chain_wm;
         }
-    } else if (!dirty() || delta_ords_.empty()) {
+    } else if (!dirty() || delta_.empty()) {
         dirty_.store(false, std::memory_order_relaxed);
         res.covered_ord = chain_.chain_wm;
     } else {
