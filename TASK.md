@@ -4051,3 +4051,53 @@ W4 ✅（parallel_scan 并行全表扫描）。
 **与 S27 的关系**：S29 结构性各项与 S27-3 剩余（B2b/D/E recovery 重写）独立可并行；
 S27-4（DWPT 并行 builder）与 S29-9（reorder 环形缓冲/分片锁）同属索引吞吐轴,
 建议 S29-9 先行（小)、S27-4 收大头。
+
+---
+
+## 待办：S32 批次（向量双引擎 + ckpt 恢复有界 — 2026-07-13）
+
+> 设计文档：[`doc/vector-dual-engine-selection-zh.md`](doc/vector-dual-engine-selection-zh.md)
+> （部署前提 8-16G 机器/本库可用 1-6G、三流派对比、IVF-RaBitQ v1 选型、
+> ckpt 改进 §6.2、独立插件 §4、转换工具 §6.4、分期 §7）。
+> 已定方向：① HNSW 为主引擎；② 崩溃恢复代价必须有界；③ 磁盘档引擎做
+> **独立插件**（建库时 `vector_engine` 选定、存 meta）；④ 提供引擎间盘上
+> 内容转换工具。收编 S29-11 的「向量出内存」侦查线。
+
+- [x] **M1 已完成（2026-07-13）ckpt 改进：向量 base rebase 双门槛**（设计 §6.2）
+  · 落地:`VectorPluginConfig::rebase_min_docs` / `SearchConfig::
+  vector_rebase_min_docs`(默认 256K;0=关)+ `vec_docs_since_base_`
+  计数(insert/apply_delta_log 按图节点增量计,base 成功清零;链重放
+  计入窗口 → 重开欠账可见,无新写入也收链)+ flush `窗口≥阈值‖链满`
+  双门槛。
+  · 验收:新测 ×2(RebaseMinDocsWindowTriggersBase:窗口触发 base 链
+  坍缩+阈值 0 对照恒 delta;RebaseWindowSurvivesReopen:重开链重放
+  计入窗口)——gcc 全量 **618/618**;build-rel(bench)过。
+  · 现状:auto ckpt(S31.5)每 64K 只落 vector delta,base 仅链满
+  `max_delta_chain=64`/close/rebuild 收敛 ⇒ 崩溃恢复=链重放重新建图,
+  最坏 64×64K≈4.2M 条重插(高维小时级)。
+  · 改动:`VectorPluginConfig::rebase_min_docs`(默认 256K;0=关)+
+  `SearchConfig::vector_rebase_min_docs` 透传;VectorPlugin 记
+  「自 base 以来实际入图向量数」(insert/链重放按图节点增量计——纯 KV
+  写不误触发,计数=恢复重放代价的直接度量),flush 时
+  `窗口 ≥ 阈值 ‖ 链满` 即 base。base 成本已被 S14-2/S14-8 摊薄
+  (.vec/.qc8 追加,全量重写仅 BVH2 header ≈165B/节点)。
+  · 明确不做:邻接增量落盘(反向边可变,hnsw.hpp 头注既判)。
+  · 验收:小阈值下 flush(kAuto) 自动 base(链坍缩/base_gen 递增)+
+  阈值 0 对照 + 重开链重放计入窗口;恢复窗口上界测试。
+- [ ] **M0 引擎接线基建**:`CaskOptions::vector_engine`(kHnsw/kIvfRq,
+  预留 kDiskann)→ meta 持久化 + mode_mismatch 校验(cask.cpp 现有
+  vector_* 检查组扩一项)+ open 工厂;共享域件抽取(normalize/
+  `vec::DeltaLog`/量化器)+ 召回 harness(S29-11 §2,两引擎共用)。
+- [ ] **M2 HNSW 线 P0/P1**:qc8 mmap 化(qcodes_of 按 checkpoint_count_
+  路由,与 vec_of 同型)+ clone_live 峰值治理(needs_vecs=false + f32
+  旧 mmap 流式写新 .vec,消 2× 重建峰值)——主引擎舒适区推 ~2-4M@1024d。
+- [ ] **M3 IvfPlugin v1**(IVF-RaBitQ,~3k LOC,独立插件;设计 §5.1):
+  质心 RAM + posting 盘上顺序扫(RaBitQ 粗筛 + int8 精排内联)+ delta
+  窗口复用 HnswIndex(inmem_int8);RaBitQ popcount 内核顺手供 HNSW P2。
+- [ ] **M4 转换工具** `tools/vec_engine_migrate`(依赖 M3;设计 §6.4):
+  data file 为权威、离线重建目标索引 + meta 原子切换;→hnsw 方向按
+  N×D 内存预检。
+- [ ] **M5(条件触发)DiskannPlugin**:「p99<10ms 且 ≥95% 召回 @50M+」
+  硬指标出现才立项(设计 §5.2/§7)。
+- ⚠️ 风险挂账:100M 档 keydir 自身 5-8G(50-80B/key)撑爆预算——KV 层
+  独立大轴,若 100M 为认真目标须另行立项(设计 §6.1)。
