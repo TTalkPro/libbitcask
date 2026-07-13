@@ -140,7 +140,9 @@
 
 32× 压缩（f32→1 bit/维）；Extended RaBitQ 可调 2-8 bit/维换精度。
 采用者：LanceDB IVF-RQ、Milvus 2.6、Elasticsearch BBQ（衍生自 RaBitQ）。
-（与 PQ 的码宽/甜区对比见 §3.5 末。）
+（与 PQ 的码宽/甜区对比见 §3.5 末；**完整理论推导**——无偏估计量/误差界/
+非对称位平面/残差化/与本库 lite 版的差距——见
+[`rabitq-theory-zh.md`](rabitq-theory-zh.md)。）
 
 ### 3.4 SPANN（微软，NeurIPS 2021）——质心图 + 磁盘倒排流派（已排除）
 
