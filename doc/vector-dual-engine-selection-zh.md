@@ -454,6 +454,13 @@ file lock 独占 → 读 meta → 流式 fold data files（复用恢复扫描器
   引擎共用量化器的设计红利）；
 - 工具运行期间库必须关闭（file lock 排他，与在线 merge 互斥）。
 
+**落地勘误（2026-07-13，S32-M4）**：实现比上述设计更简——工具**只改
+meta.vector_engine**，不做离线重建：目标引擎组件缺失 → 首次 open 的
+watermark-0 全量 fold 就是重建本身（既有恢复机制，窗口内存有界，
+「→hnsw 预检」不再需要——fold 重建的内存曲线与正常 open 相同）。旧引擎
+组件默认保留（回滚 = 反向再跑；新旧水位差由恢复自愈），`--purge-old`
+释放磁盘。核心属性由 `S32M4EngineSwitchViaMetaRebuild` 测试守护。
+
 ## 7. 结论与分期（v2）
 
 **磁盘档 v1 选 IVF-RaBitQ**——不是折衷而是本约束下的正解：DiskANN 仅存的
