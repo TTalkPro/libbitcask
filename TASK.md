@@ -252,7 +252,7 @@ submit 抛出 → 栈回退中析构再抛 → `std::terminate()`（进程立即
 - **工作量**：15 分钟
 - **验收**：641/641 ctest；merge 后自动 ckpt 不再立即触发（可加计数断言）
 
-### T16 — P5-DL-3：删除 flush_upto + reducer 每任务通知块 🟡 MED（复核升档）
+### T16 — P5-DL-3：删除 flush_upto + reducer 每任务通知块 🟡 MED（复核升档）✅
 
 **症状**：`flush_upto`（`thread_pool.hpp:447`）T8 revert 后零调用；
 `reducer_loop:653-656` 每 apply 一个索引事件取一次全局 `flush_mu_` + `notify_all`，
@@ -347,7 +347,7 @@ T7 完成后：
 | T12 HNSW ckpt 去重 | ⚠️ 已精确审计 | 已验证 VectorPlugin::flush 与 SealedSegmentVectorPlugin::flush 逐字节相同；待独立分支执行（须向量三引擎测试全过 + 新建 VectorCkptDriver 非模板基类） |
 | T14 OrdSkipGuard 析构异常安全 | ✅ done | cask.hpp 析构 try-catch + log_warn 兜底；ASan smoke/checkpoint/crash/merge_concurrent 全过（一处修复覆盖 7 使用点） |
 | T15 last_ckpt_ord_ 三处漏更新 | ✅ done | 三处补 store（is_stopped/无池/merge 两分支）+ 修矛盾注释；确认纯 KV 早返回无需（auto ckpt 仅 text_ 模式）；ASan checkpoint/merge/keydir/cask_docvalue 全过 |
-| T16 flush_upto + 每任务通知块删除 | 🟡 待修 | Phase 5 复核升档（reducer 热路径每任务全局锁开销） |
+| T16 flush_upto + 每任务通知块删除 | ✅ done | 删 flush_upto + reducer:653-656 通知块；前置确认 flush()/unregister_lib 只依赖 dec_in_flight 归零通知；ASan+TSan 全过 + TSan ×5 无挂起 |
 | T17 T10 收尾（FilePtr 别名 + pwrite_all） | 🟢 待修 | Phase 5 复核确认 |
 | T18 thread-safety 文档化 | 🟢 待做 | T16 之后执行（DL-2 部分随 T16 免除） |
 
