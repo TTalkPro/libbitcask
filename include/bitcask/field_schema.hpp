@@ -69,9 +69,8 @@ public:
 
         // MEM-LOW-1 修复：用 FilePtr RAII 包裹读句柄——load_new_format_ /
         // load_legacy_ 内的 vector/string/map 分配可能抛 bad_alloc，
-        // 裸 FILE* 跳过 fclose → fd 泄漏。FileCloser 已在本文件 detail 命名空间。
-        using ReadFilePtr = std::unique_ptr<std::FILE, detail::FileCloser>;
-        if (ReadFilePtr rf{std::fopen(path.c_str(), "rb")}) {
+        // 裸 FILE* 跳过 fclose → fd 泄漏。detail::FilePtr 见 file_util.hpp。
+        if (detail::FilePtr rf{std::fopen(path.c_str(), "rb")}) {
             std::FILE* raw = rf.get();
             std::byte magic_buf[4];
             const std::size_t got = std::fread(magic_buf, 1, 4, raw);
@@ -227,8 +226,7 @@ private:
     bool upgrade_legacy_to_new_() {
         const std::string tmp = path_ + ".upgrade.tmp";
         // MEM-LOW-1：encode_entry_ 内的 string 构造可抛 → 裸 wf 跳过 fclose。
-        using WriteFilePtr = std::unique_ptr<std::FILE, detail::FileCloser>;
-        WriteFilePtr wf{std::fopen(tmp.c_str(), "wb")};
+        detail::FilePtr wf{std::fopen(tmp.c_str(), "wb")};
         if (!wf) return false;
         std::FILE* raw = wf.get();
         bool ok = write_header_(raw);

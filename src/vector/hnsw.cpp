@@ -5,6 +5,7 @@
 #include "bitcask/codec.hpp"
 #include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
 #include "hnsw_kernels.hpp"
+#include "vec_disk_internal.hpp"  // diskint::pwrite_all（RED-7 归并）
 
 #include <oneapi/tbb/parallel_for.h>       // S7-6：int8 路径 f32 精排距离批算并行
 
@@ -1520,21 +1521,8 @@ bool HnswIndex::save_vec_payload(std::string_view path) const {
     return true;
 }
 
-namespace {
-// 循环处理 partial write 的 pwrite。
-bool pwrite_all(int fd, const void* buf, std::size_t len, std::uint64_t off) {
-    const auto* p = static_cast<const std::uint8_t*>(buf);
-    while (len > 0) {
-        const ssize_t w = ::pwrite(fd, p, len, static_cast<off_t>(off));
-        if (w < 0 && errno == EINTR) continue;  // 审计修复:EINTR 重试
-        if (w <= 0) return false;
-        p   += w;
-        off += static_cast<std::uint64_t>(w);
-        len -= static_cast<std::size_t>(w);
-    }
-    return true;
-}
-}  // namespace
+// RED-7：本地 pwrite_all 已删——统一用 vec_disk_internal.hpp 的
+// diskint::pwrite_all（同签名，含 EINTR 重试审计修复）。
 
 // S14-8:payload 代号惰性分配（幂等）。熵源：时刻 + 实例地址 + 节点数——
 // 防御 rebuild 重映射后 .prev 回退误配，非加密用途。
@@ -1617,7 +1605,7 @@ bool HnswIndex::try_append_qc_payload(std::string_view path,
             const auto* zp = reinterpret_cast<const std::uint8_t*>(&z);
             batch.insert(batch.end(), zp, zp + sizeof(std::int32_t));
             if (batch.size() >= 4096 * stride || id + 1 == n) {
-                ok = pwrite_all(fd, batch.data(), batch.size(), off);
+                ok = diskint::pwrite_all(fd, batch.data(), batch.size(), off);
                 off += batch.size();
                 batch.clear();
             }
@@ -1645,7 +1633,7 @@ bool HnswIndex::try_append_qc_payload(std::string_view path,
             bitcask::codec::crc32(std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(hdr), kBcq8HeaderCrcOff));
         std::memcpy(hdr + kBcq8HeaderCrcOff, &hcrc, 4);
-        ok = pwrite_all(fd, hdr, kBcq8HeaderSize, 0) && ::fdatasync(fd) == 0;
+        ok = diskint::pwrite_all(fd, hdr, kBcq8HeaderSize, 0) && ::fdatasync(fd) == 0;
     }
     ::close(fd);
     if (ok) qc_file_.count = n;
@@ -1787,7 +1775,7 @@ bool HnswIndex::try_append_vec_payload(std::string_view path,
             const std::uint32_t run_end = std::min(n, chunk_end);
             const std::size_t len =
                 static_cast<std::size_t>(run_end - id) * vec_bytes;
-            ok = pwrite_all(fd, vec_of(id), len, off);
+            ok = diskint::pwrite_all(fd, vec_of(id), len, off);
             off += len;
             id = run_end;
         }
@@ -1825,7 +1813,7 @@ bool HnswIndex::try_append_vec_payload(std::string_view path,
             std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(hdr), kBcvpHeaderCrcOff));
         std::memcpy(hdr + kBcvpHeaderCrcOff, &hcrc, 4);
-        ok = pwrite_all(fd, hdr, kBcvpHeaderSize, 0) && ::fdatasync(fd) == 0;
+        ok = diskint::pwrite_all(fd, hdr, kBcvpHeaderSize, 0) && ::fdatasync(fd) == 0;
     }
     ::close(fd);
     if (ok) vec_file_.count = n;

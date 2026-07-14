@@ -267,7 +267,7 @@ submit 抛出 → 栈回退中析构再抛 → `std::terminate()`（进程立即
 - **工作量**：1 小时（含前置确认 + 并发测试回归）
 - **验收**：641/641 ctest + TSan 树通过；merge_concurrent_writer_test 等并发套件重点回归
 
-### T17 — NEW-P4-1 + RED-7残：T10 收尾 🟢 LOW
+### T17 — NEW-P4-1 + RED-7残：T10 收尾 🟢 LOW ✅
 
 - `field_schema.hpp:73/230` 本地别名 ReadFilePtr/WriteFilePtr → 直接用
   `detail::FilePtr`（file_util.hpp:31 已存在）
@@ -277,7 +277,7 @@ submit 抛出 → 栈回退中析构再抛 → `std::terminate()`（进程立即
 - **工作量**：30 分钟
 - **验收**：641/641 ctest
 
-### T18 — P5-DL-1/2：thread-safety 文档化模式偏离 🟢 LOW
+### T18 — P5-DL-1/2：thread-safety 文档化模式偏离 🟢 LOW ✅
 
 - P5-DL-1：checkpoint() 在 **ckpt_mu_ 临界区内**（函数级 lock_guard，`cask.cpp:2203`）
   做 30s 有界 cv 等待，WriteOpGate 同时持有——reducer 卡住时 close() 与后续
@@ -348,8 +348,8 @@ T7 完成后：
 | T14 OrdSkipGuard 析构异常安全 | ✅ done | cask.hpp 析构 try-catch + log_warn 兜底；ASan smoke/checkpoint/crash/merge_concurrent 全过（一处修复覆盖 7 使用点） |
 | T15 last_ckpt_ord_ 三处漏更新 | ✅ done | 三处补 store（is_stopped/无池/merge 两分支）+ 修矛盾注释；确认纯 KV 早返回无需（auto ckpt 仅 text_ 模式）；ASan checkpoint/merge/keydir/cask_docvalue 全过 |
 | T16 flush_upto + 每任务通知块删除 | ✅ done | 删 flush_upto + reducer:653-656 通知块；前置确认 flush()/unregister_lib 只依赖 dec_in_flight 归零通知；ASan+TSan 全过 + TSan ×5 无挂起 |
-| T17 T10 收尾（FilePtr 别名 + pwrite_all） | 🟢 待修 | Phase 5 复核确认 |
-| T18 thread-safety 文档化 | 🟢 待做 | T16 之后执行（DL-2 部分随 T16 免除） |
+| T17 T10 收尾（FilePtr 别名 + pwrite_all） | ✅ done | field_schema 用 detail::FilePtr；hnsw 用 diskint::pwrite_all（含 vec_disk_internal.hpp）；ASan hnsw(20)/vector_plugin/cask_docvalue/text_plugin/smoke 全过 |
+| T18 thread-safety 文档化 | ✅ done | doc/concurrency-zh.md 补 P5-DL-1（ckpt_mu_ 跨 30s 有界等待）+ P5-DL-2（随 T16 消解）；无代码改动 |
 
 ---
 
