@@ -3,6 +3,7 @@
 #include "bitcask/codec.hpp"
 #include "bitcask/epoch_reclaim.hpp"  // S29-6 P2: epoch 读者注册表
 #include "bitcask/vbyte.hpp"  // S21-2 A3: 快照 v2 entries 变长编码
+#include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
 
 #include <cstdio>
 #include <cstring>
@@ -1584,12 +1585,7 @@ auto KeyDir::load_snapshot(std::string_view path)
     -> std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> {
     // S13-M3：RAII 持 FILE*——fsz 来自可能损坏的文件（可为巨值），下方
     // vector 分配可抛 bad_alloc，裸 FILE* 在异常路径泄漏。
-    struct FileCloser {
-        void operator()(std::FILE* fp) const noexcept {
-            if (fp) std::fclose(fp);
-        }
-    };
-    std::unique_ptr<std::FILE, FileCloser> f(
+    bitcask::detail::FilePtr f(
         std::fopen(std::string(path).c_str(), "rb"));
     if (!f) return std::nullopt;
     std::fseek(f.get(), 0, SEEK_END);

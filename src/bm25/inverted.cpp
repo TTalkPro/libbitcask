@@ -5,6 +5,7 @@
 #include "bitcask/term_snapshot_cache.hpp"
 #include "bitcask/wildcard_matcher.hpp"
 #include "bitcask/bm25_kernels.hpp"
+#include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
 
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/parallel_for.h>       // S7-5：短语候选评分并行
@@ -1268,12 +1269,7 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
 auto InvertedIndex::load(std::string_view path) -> bool {
     // S13-M3：RAII 持 FILE*——fsz 来自可能损坏的文件，resize 可抛 bad_alloc，
     // 裸 FILE* 在异常路径泄漏。
-    struct FileCloser {
-        void operator()(std::FILE* fp) const noexcept {
-            if (fp) std::fclose(fp);
-        }
-    };
-    std::unique_ptr<std::FILE, FileCloser> f(
+    bitcask::detail::FilePtr f(
         std::fopen(std::string(path).c_str(), "rb"));
     if (!f) return false;
     std::fseek(f.get(), 0, SEEK_END);

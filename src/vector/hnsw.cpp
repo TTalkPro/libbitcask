@@ -3,6 +3,7 @@
 
 #include "bitcask/hnsw.hpp"
 #include "bitcask/codec.hpp"
+#include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
 #include "hnsw_kernels.hpp"
 
 #include <oneapi/tbb/parallel_for.h>       // S7-6：int8 路径 f32 精排距离批算并行
@@ -486,12 +487,7 @@ bool write_bcvp_file(const std::string& fp, std::uint16_t dim, std::uint32_t n,
     std::memcpy(head.data() + kBcvpHeaderCrcOff, &header_crc, 4);
 
     const std::string tmp = fp + ".tmp";
-    struct FileCloser {
-        void operator()(std::FILE* fh) const noexcept {
-            if (fh) std::fclose(fh);
-        }
-    };
-    std::unique_ptr<std::FILE, FileCloser> f(std::fopen(tmp.c_str(), "wb"));
+    bitcask::detail::FilePtr f(std::fopen(tmp.c_str(), "wb"));
     if (!f) return false;
 
     bool ok = true;
@@ -564,12 +560,7 @@ bool write_bcq8_file(const std::string& fp, std::uint16_t dim, std::uint32_t n,
     std::memcpy(hdr + kBcq8HeaderCrcOff, &hcrc, 4);
 
     const std::string tmp = fp + ".tmp";
-    struct FileCloser {
-        void operator()(std::FILE* fh) const noexcept {
-            if (fh) std::fclose(fh);
-        }
-    };
-    std::unique_ptr<std::FILE, FileCloser> f(std::fopen(tmp.c_str(), "wb"));
+    bitcask::detail::FilePtr f(std::fopen(tmp.c_str(), "wb"));
     if (!f) return false;
     bool ok = std::fwrite(hdr, 1, kBcq8HeaderSize, f.get()) == kBcq8HeaderSize;
     std::vector<std::uint8_t> batch;
@@ -2049,12 +2040,7 @@ bool HnswIndex::load(std::string_view base_path) {
     const std::string bp(base_path);
     // S13-M3：RAII 持 FILE*——fsz 来自可能损坏的文件，下方 vector 分配可抛
     // bad_alloc，裸 FILE* 在异常路径泄漏。
-    struct FileCloser {
-        void operator()(std::FILE* fp) const noexcept {
-            if (fp) std::fclose(fp);
-        }
-    };
-    std::unique_ptr<std::FILE, FileCloser> f(std::fopen(bp.c_str(), "rb"));
+    bitcask::detail::FilePtr f(std::fopen(bp.c_str(), "rb"));
     if (!f) return false;
     std::fseek(f.get(), 0, SEEK_END);
     const long fsz = std::ftell(f.get());

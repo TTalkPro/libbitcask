@@ -37,7 +37,8 @@ std::uint64_t be_u64(const std::byte* p) {
     return v;
 }
 
-// S13-M3：RAII 持 FILE*（复用 field_schema.hpp 的 detail::FileCloser）——
+// S13-M3：RAII 持 FILE*（detail::FileCloser 经 field_schema.hpp 间接包含，
+// 定义在 bitcask/detail/file_util.hpp）——
 // buf 分配（大小来自文件）与 unexpected 的 string 拼接均可抛，裸 FILE*
 // 在异常路径泄漏。
 std::expected<std::vector<std::byte>, std::string>

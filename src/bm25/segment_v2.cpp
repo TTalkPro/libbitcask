@@ -4,6 +4,7 @@
 #include "bitcask/segment_v2.hpp"
 
 #include "bitcask/codec.hpp"
+#include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
 #include "bitcask/term_snapshot_cache.hpp"  // S30-P5:查询快照缓存
 #include "bitcask/myers.hpp"
 #include "bitcask/vbyte.hpp"
@@ -125,12 +126,6 @@ private:
     bool ok_ = true;
 };
 
-struct FileCloser {
-    void operator()(std::FILE* fp) const noexcept {
-        if (fp) std::fclose(fp);
-    }
-};
-
 // 每 posting 块头(打包宽度;pad 保留)。
 struct BlockHeader {
     std::uint8_t docid_bits;
@@ -158,7 +153,7 @@ bool write_segment_v2_streams(
     const std::function<SegV2DocRow(std::uint32_t docid)>& doc_row,
     std::uint64_t total_doc_len) {
     const std::string tmp = path + ".tmp";
-    std::unique_ptr<std::FILE, FileCloser> f(std::fopen(tmp.c_str(), "wb"));
+    bitcask::detail::FilePtr f(std::fopen(tmp.c_str(), "wb"));
     if (!f) return false;
     StreamWriter w(f.get());
 
@@ -924,7 +919,7 @@ std::uint64_t MmapSegment::live_count() const noexcept {
 
 bool MmapSegment::save_live_sidecar(const std::string& path) const {
     const std::string tmp = path + ".tmp";
-    std::unique_ptr<std::FILE, FileCloser> f(std::fopen(tmp.c_str(), "wb"));
+    bitcask::detail::FilePtr f(std::fopen(tmp.c_str(), "wb"));
     if (!f) return false;
     std::vector<std::byte> buf;
     auto put = [&buf](const void* p, std::size_t nn) {
@@ -956,7 +951,7 @@ bool MmapSegment::save_live_sidecar(const std::string& path) const {
 }
 
 bool MmapSegment::load_live_sidecar(const std::string& path) {
-    std::unique_ptr<std::FILE, FileCloser> f(std::fopen(path.c_str(), "rb"));
+    bitcask::detail::FilePtr f(std::fopen(path.c_str(), "rb"));
     if (!f) return false;
     std::fseek(f.get(), 0, SEEK_END);
     const long sz = std::ftell(f.get());
