@@ -1104,7 +1104,7 @@ barrier_mu_ (mutex) → gate_mu_ (mutex) + gate_cv_ → meta_mu_ (shared_mutex) 
 |---|---|---|
 | `write_mu_`              | `std::mutex`    | put/remove/put_doc/sync/close_write_file/backup 的整个写序列（`cask.hpp` 中 `Cask::write_mu_` 成员） |
 | `read_cache_mu_`         | `std::shared_mutex` | `read_files_` map 结构 + `active_data_` 替换（`cask.hpp` 中 `Cask::read_cache_mu_` 成员）             |
-| `ckpt_mu_`               | `std::mutex`    | `checkpoint()` 调用间互斥（`cask.hpp` 中 `Cask::ckpt_mu_` 成员）                                  |
+| `ckpt_mu_`               | `std::mutex`    | `checkpoint()` 调用间互斥（`cask.hpp` 中 `Cask::ckpt_mu_` 成员；异步 RunFn 路径下持锁跨越有界 cv 等待，见下方 P5-DL-1 说明） |
 | `closed_`                | `atomic<bool>`  | close 后 fail-fast 标志（`cask.hpp` 中 `Cask::closed_` 成员）                                    |
 | `active_file_id_`        | `atomic<uint32_t>` | active writer 当前 file id；写者持 write_mu_，读者 relaxed 读            |
 | `writes_in_flight_`      | `atomic<uint32_t>` | WriteOpGate 写操作计数，close 用 seq_cst wait 排空                        |
@@ -1133,6 +1133,29 @@ barrier_mu_ (mutex) → gate_mu_ (mutex) + gate_cv_ → meta_mu_ (shared_mutex) 
 
 **单锁不变量**：任一线程任一时刻最多持 `start_mu_` / `reorder_mu_` /
 `flush_mu_` 之一——无锁嵌套 ⇒ 无加锁顺序 ⇒ 不可能死锁。
+
+> **P5-DL-2（已消解，2026-07-14）**：reducer_loop 曾在每 apply 一个索引事件后
+> 立即取一次 `flush_mu_` + `notify_all`（服务已删除的 `flush_upto`），再紧接
+> `dec_in_flight` 又取一次——同一线程连取同锁两次，形式上偏离本不变量的
+> 「释放 → 工作 → 取下一把」表述。T16（P5-DL-3）删除该 per-apply 通知块后，
+> reducer 对 `flush_mu_` 的唯一触点回到 `dec_in_flight` 归零时的单次 notify。
+> 之所以安全：`flush()`/`unregister_lib` 只等最终态（`in_flight==0 &&
+> applied_ord>=hwm`），而 `applied_ord` 在 `dec_in_flight` 之前 store，故归零
+> notify 时两谓词同时成立，无丢失唤醒。
+
+> **P5-DL-1（有意设计，文档固化）**：`Cask::checkpoint()` 的异步 RunFn 路径
+> 在**持 `ckpt_mu_`（函数级 `lock_guard`）且 WriteOpGate 在持**的临界区内，
+> 对一个 per-call 局部 `done_mu`/`done_cv` 做**最长 30s 的有界 cv 等待**
+> （`cask.cpp` DL-MED-2）。这偏离「`ckpt_mu_` 仅用于串行化 checkpoint 调用、
+> 瞬时持有」的朴素语义——持锁跨越了一次跨线程等待。
+>
+> **为何不是死锁**：① `done_mu` 是每次调用新建的局部 `shared_ptr`，除本调用
+> 与其提交的 RunFn 外无任何代码路径获取它，不参与任何锁序；② 等待有 30s
+> 硬上界（超时即返回 kIo 错误，不永久挂死）。**后果**：reducer 线程若卡死，
+> 后续 checkpoint 调用者（排队于 `ckpt_mu_`）与 `close()`（经 WriteOpGate 等
+> 本调用返回）最坏被拖满 30s。**契约**：不得从 reducer 上下文调用
+> `checkpoint()`——否则 RunFn 永不被执行，必然走满 30s 超时（与
+> `plugin_api.hpp` 的 `run_serialized` reducer 禁令同源，见 T13）。
 
 ### HNSW
 
