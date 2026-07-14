@@ -28,6 +28,7 @@
 #include <unistd.h>  // S21-2 A4: fdatasync
 
 #include "bitcask/codec.hpp"  // crc32
+#include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
 
 namespace bitcask::search {
 
@@ -120,10 +121,6 @@ struct LoadedCheckpoint {
 
 namespace detail {
 
-struct FileCloser {
-    void operator()(std::FILE* f) const noexcept { if (f) std::fclose(f); }
-};
-
 constexpr char kCkptMagic[4] = {'B', 'C', 'S', 'C'};
 constexpr std::uint32_t kCkptVersion = 1;
 // S21-2 A2：v2 段型（kDocmapDeltaV2）所在文件的头版本。读端 1/2 双收；
@@ -212,7 +209,7 @@ public:
 
         const std::string fp(path);
         const std::string tmp = fp + ".tmp";
-        std::unique_ptr<std::FILE, FileCloser> f(std::fopen(tmp.c_str(), "wb"));
+        std::unique_ptr<std::FILE, ::bitcask::detail::FileCloser> f(std::fopen(tmp.c_str(), "wb"));
         if (!f) return false;
         bool wrote =
             std::fwrite(buf.data(), 1, buf.size(), f.get()) == buf.size();
@@ -242,7 +239,7 @@ public:
     read_selected(std::string_view path,
                   const std::function<bool(std::uint16_t)>& want) {
         using namespace detail;
-        std::unique_ptr<std::FILE, FileCloser> f(
+        std::unique_ptr<std::FILE, ::bitcask::detail::FileCloser> f(
             std::fopen(std::string(path).c_str(), "rb"));
         if (!f) return std::nullopt;
         std::fseek(f.get(), 0, SEEK_END);
@@ -326,7 +323,7 @@ public:
     [[nodiscard]] static std::optional<LoadedCheckpoint>
     read(std::string_view path) {
         using namespace detail;
-        std::unique_ptr<std::FILE, FileCloser> f(
+        std::unique_ptr<std::FILE, ::bitcask::detail::FileCloser> f(
             std::fopen(std::string(path).c_str(), "rb"));
         if (!f) return std::nullopt;
         std::fseek(f.get(), 0, SEEK_END);

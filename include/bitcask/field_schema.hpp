@@ -39,14 +39,9 @@
 
 #include "bitcask/byte_order.hpp"
 #include "bitcask/codec.hpp"
+#include "bitcask/detail/file_util.hpp"  // detail::FileCloser / FilePtr（RED-2 归并）
 
 namespace bitcask {
-
-namespace detail {
-struct FileCloser {
-    void operator()(std::FILE* f) const noexcept { if (f) std::fclose(f); }
-};
-}  // namespace detail
 
 class FieldSchema {
 public:
@@ -72,32 +67,35 @@ public:
         bool fresh = true;         // 无既有内容（新文件/空文件）→ 需写文件头
         bool need_upgrade = false; // 读到 legacy 无头内容 → 尝试升级为新格式
 
-        if (std::FILE* rf = std::fopen(path.c_str(), "rb")) {
+        // MEM-LOW-1 修复：用 FilePtr RAII 包裹读句柄——load_new_format_ /
+        // load_legacy_ 内的 vector/string/map 分配可能抛 bad_alloc，
+        // 裸 FILE* 跳过 fclose → fd 泄漏。FileCloser 已在本文件 detail 命名空间。
+        using ReadFilePtr = std::unique_ptr<std::FILE, detail::FileCloser>;
+        if (ReadFilePtr rf{std::fopen(path.c_str(), "rb")}) {
+            std::FILE* raw = rf.get();
             std::byte magic_buf[4];
-            const std::size_t got = std::fread(magic_buf, 1, 4, rf);
+            const std::size_t got = std::fread(magic_buf, 1, 4, raw);
             if (got == 0) {
                 // 空文件：当作新文件（下方补写文件头）。
             } else if (got == 4 && le_load_u32(magic_buf) == kMagic) {
                 fresh = false;
                 std::byte ver_buf[4];
-                if (std::fread(ver_buf, 1, 4, rf) != 4 ||
+                if (std::fread(ver_buf, 1, 4, raw) != 4 ||
                     le_load_u32(ver_buf) != kVersion) {
-                    std::fclose(rf);
                     return false;  // 未知/更新版本 → fail-fast
                 }
-                if (!load_new_format_(rf)) {
-                    std::fclose(rf);
+                if (!load_new_format_(raw)) {
                     return false;  // 某条 entry CRC 不符 → 真损坏 → fail-fast
                 }
             } else {
                 // 无 magic → legacy 无头文件。回卷按旧格式解析。
                 fresh = false;
-                std::rewind(rf);
-                load_legacy_(rf);
+                std::rewind(raw);
+                load_legacy_(raw);
                 legacy_ = true;
                 need_upgrade = true;
             }
-            std::fclose(rf);
+            // rf 析构自动 fclose，抛出路径也覆盖
         }
         // 文件不存在 → fresh 保持 true，空注册表。
 
@@ -228,19 +226,22 @@ private:
     // 返回 false = 无法写（只读目录/IO 失败）→ caller 退回 legacy 追加。
     bool upgrade_legacy_to_new_() {
         const std::string tmp = path_ + ".upgrade.tmp";
-        std::FILE* wf = std::fopen(tmp.c_str(), "wb");
+        // MEM-LOW-1：encode_entry_ 内的 string 构造可抛 → 裸 wf 跳过 fclose。
+        using WriteFilePtr = std::unique_ptr<std::FILE, detail::FileCloser>;
+        WriteFilePtr wf{std::fopen(tmp.c_str(), "wb")};
         if (!wf) return false;
-        bool ok = write_header_(wf);
+        std::FILE* raw = wf.get();
+        bool ok = write_header_(raw);
         for (const auto& name : id_to_name_) {
             if (!ok) break;
             const auto buf = encode_entry_(name);
-            ok = std::fwrite(buf.data(), 1, buf.size(), wf) == buf.size();
+            ok = std::fwrite(buf.data(), 1, buf.size(), raw) == buf.size();
         }
         if (ok) {
-            std::fflush(wf);
-            ::fsync(::fileno(wf));  // 数据落盘后才允许 rename 覆盖
+            std::fflush(raw);
+            ::fsync(::fileno(raw));  // 数据落盘后才允许 rename 覆盖
         }
-        std::fclose(wf);
+        wf.reset();  // fclose 在 rename 前完成（Linux rename 不要求 fd 关闭，但 fsync 已保数据）
         if (!ok || std::rename(tmp.c_str(), path_.c_str()) != 0) {
             std::remove(tmp.c_str());
             return false;

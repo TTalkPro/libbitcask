@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include "bitcask/codec.hpp"  // crc32
+#include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
 
 namespace bitcask {
 
@@ -153,16 +154,9 @@ deserialize_manifest(const std::byte* raw, std::size_t len) {
 
 // ---- 文件 I/O（tmp + fdatasync + rename + dirfsync）----
 
-// S20-3 B-B1：FILE* 走 RAII（与 search_checkpoint/field_schema/hnsw 先例一致，
-// 替代手工 fclose——早退/未来改动免泄漏）。独立命名空间避免与
-// field_schema.hpp 的 bitcask::detail::FileCloser 撞名。
-namespace manifest_io {
-struct FileCloser {
-    void operator()(std::FILE* f) const noexcept { if (f) std::fclose(f); }
-};
-using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
-}  // namespace manifest_io
-
+// S20-3 B-B1：FILE* 走 RAII。RED-2 归并后统一用 bitcask::detail::FilePtr
+// （原 manifest_io 命名空间是为避免与 field_schema 撞名而存在——单一真相源
+// 后已无必要）。
 inline void fsync_directory_of(const std::string& path) {
     std::filesystem::path parent = std::filesystem::path(path).parent_path();
     if (parent.empty()) parent = ".";
@@ -174,7 +168,7 @@ inline void fsync_directory_of(const std::string& path) {
     auto buf = serialize_manifest(m);
     const std::string tmp = path + ".tmp";
 
-    manifest_io::FilePtr f(std::fopen(tmp.c_str(), "wb"));
+    detail::FilePtr f(std::fopen(tmp.c_str(), "wb"));
     if (!f) return false;
     const bool wrote =
         std::fwrite(buf.data(), 1, buf.size(), f.get()) == buf.size();
@@ -193,7 +187,7 @@ inline void fsync_directory_of(const std::string& path) {
 
 [[nodiscard]] inline std::optional<Manifest>
 read_manifest(const std::string& path) {
-    manifest_io::FilePtr f(std::fopen(path.c_str(), "rb"));
+    detail::FilePtr f(std::fopen(path.c_str(), "rb"));
     if (!f) return std::nullopt;
     std::array<std::byte, kManifestSize> buf{};
     const bool read_ok =
