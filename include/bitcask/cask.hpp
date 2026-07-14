@@ -996,6 +996,13 @@ private:
     // 出现永久空洞，此后 flush/merge/close 全部在 flush_cv_ 上永久阻塞
     // （一次 ENOSPC 即卡死句柄）。析构时未 disarm 则自动提交 Skip；
     // 真任务（Add/Delete）或等价 Skip 已覆盖该 ord 后调 disarm()。
+    //
+    // P5-MEM-1：析构隐式 noexcept，但 IndexTask::make（buf 分配）与
+    // submit_index_task→queue_.push（TBB 有界队列内部分配）均可抛 bad_alloc。
+    // 若在栈回退（另一异常正在传播，如 submit 首次抛出触发本 guard 析构）中
+    // 再次抛出，直接 std::terminate。此处吞掉分配异常：代价是极端 OOM 下泄漏
+    // 该 ord（可恢复——checkpoint/close 走 30s 超时路径而非永久挂死），
+    // 收益是避免不可恢复的进程终止。
     struct OrdSkipGuard {
         Cask* cask;
         std::uint64_t ord;
@@ -1005,9 +1012,14 @@ private:
         OrdSkipGuard& operator=(const OrdSkipGuard&) = delete;
         void disarm() { armed = false; }
         ~OrdSkipGuard() {
-            if (armed) {
+            if (!armed) return;
+            try {
                 cask->submit_index_task(
                     IndexTask::make(IndexOp::Skip, {}, ord, {}, 0, 0, 0, 0, 0));
+            } catch (...) {
+                // ord 泄漏：reducer 该 ord 处留空洞，依赖下游有界超时兜底。
+                cask->log_warn(
+                    "OrdSkipGuard: failed to submit Skip (OOM); ord leaked");
             }
         }
     };

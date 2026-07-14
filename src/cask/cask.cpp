@@ -2210,18 +2210,20 @@ std::expected<void, CaskFault> Cask::checkpoint() {
     const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
     if (index_pool_ && index_lane_) {
         // DL-MED-2: pool is stopped → synchronous fallback (no submit, no
-        // ord leak, no done-wait). Guard not needed; synchronous path sets
-        // last_ckpt_ord itself.
+        // ord leak, no done-wait). Guard not needed.
         if (index_pool_->is_stopped()) {
             std::vector<std::byte> kd;
             auto wms0 = collect_snapshot_watermarks();
             if (wms0) keydir_->serialize_meta_delta(kd, *wms0);
-            if (!save_search_ckpt_paired(search_ckpt, keydir_->peek_next_ord(),
-                                         wms0, kd)) {
+            const std::uint64_t wm = keydir_->peek_next_ord();
+            if (!save_search_ckpt_paired(search_ckpt, wm, wms0, kd)) {
                 return std::unexpected(err(CaskError::kIo,
                     "checkpoint: search checkpoint save failed (stopped pool "
                     "synchronous path)"));
             }
+            // P5-MEM-2: 同步路径必须自己推进水位——否则 last_ckpt_ord_ 停滞，
+            // 下次写入立刻触发一次冗余自动 ckpt（异步 RunFn 路径在 fn 内 store）。
+            last_ckpt_ord_.store(wm, std::memory_order_relaxed);
         } else {
             // DL-MED-2: 用 mutex+cv 替代 atomic+wait —— atomic::wait 无 timeout
             // 变体（C++20/23 没有 atomic_wait_for/until 自由函数），checkpoint
@@ -2313,11 +2315,13 @@ std::expected<void, CaskFault> Cask::checkpoint() {
         std::vector<std::byte> kd;
         auto wms0 = collect_snapshot_watermarks();
         if (wms0) keydir_->serialize_meta_delta(kd, *wms0);
-        if (!save_search_ckpt_paired(search_ckpt, keydir_->peek_next_ord(),
-                                     wms0, kd)) {
+        const std::uint64_t wm = keydir_->peek_next_ord();
+        if (!save_search_ckpt_paired(search_ckpt, wm, wms0, kd)) {
             return std::unexpected(err(CaskError::kIo,
                 "checkpoint: search checkpoint save failed"));
         }
+        // P5-MEM-2: 同步直跑路径同样自己推进水位（防冗余自动 ckpt）。
+        last_ckpt_ord_.store(wm, std::memory_order_relaxed);
     }
     return {};
 }
@@ -2584,6 +2588,10 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
                 if (!save_search_ckpt_paired(search_ckpt, wm, wms, {})) {
                     log_warn("search checkpoint save failed after merge "
                              "(will rebuild on next open)");  // S13-D7
+                } else {
+                    // P5-MEM-2: merge 后 rebase 全量 ckpt 已落盘 → 推进水位，
+                    // 否则紧随的写入立刻触发一次冗余自动 ckpt。
+                    last_ckpt_ord_.store(wm, std::memory_order_relaxed);
                 }
             };
             t.ord = ord;
@@ -2593,11 +2601,13 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         } else {
             docmap_->compact_chunks();
             force_ckpt_rebase();
-            if (!save_search_ckpt_paired(search_ckpt,
-                                         keydir_->peek_next_ord(),
-                                         merge_snap_wms, {})) {
+            const std::uint64_t wm = keydir_->peek_next_ord();
+            if (!save_search_ckpt_paired(search_ckpt, wm, merge_snap_wms, {})) {
                 log_warn("search checkpoint save failed after merge "
                          "(will rebuild on next open)");  // S13-D7
+            } else {
+                // P5-MEM-2: 同上（无索引池的同步 merge 收尾路径）。
+                last_ckpt_ord_.store(wm, std::memory_order_relaxed);
             }
         }
         // 快照已由 paired 入口在 ckpt 成功后落盘（写序不变量集中维护）；
