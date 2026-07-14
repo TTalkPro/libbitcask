@@ -234,57 +234,6 @@ inline bitcask_error_t fill_batch_results(
     return BITCASK_OK;
 }
 
-// S13-M2：malloc 检查——OOM 时释放已分配段并返回 false（此前直接
-// memcpy 到 nullptr）。
-inline bool fill_get_result(const bitcask::GetResult& src, bitcask_get_result_t* out) {
-    out->value.data = nullptr;
-    out->value.size = 0;
-    out->meta.data = nullptr;
-    out->meta.size = 0;
-    out->vector = nullptr;
-    out->vector_len = 0;
-
-    auto cleanup = [out]() {
-        if (out->value.data) std::free(const_cast<void*>(out->value.data));
-        if (out->meta.data) std::free(const_cast<void*>(out->meta.data));
-        if (out->vector) std::free(const_cast<float*>(out->vector));
-    };
-
-    if (!src.value.empty()) {
-        auto* p = std::malloc(src.value.size());
-        if (!p) return false;
-        std::memcpy(p, src.value.data(), src.value.size());
-        out->value.data = p;
-        out->value.size = src.value.size();
-    }
-
-    if (!src.meta.empty()) {
-        auto* p = std::malloc(src.meta.size());
-        if (!p) {
-            cleanup();
-            return false;
-        }
-        std::memcpy(p, src.meta.data(), src.meta.size());
-        out->meta.data = p;
-        out->meta.size = src.meta.size();
-    }
-
-    if (!src.vector.empty()) {
-        auto* p = std::malloc(sizeof(float) * src.vector.size());
-        if (!p) {
-            cleanup();
-            return false;
-        }
-        std::memcpy(p, src.vector.data(), sizeof(float) * src.vector.size());
-        out->vector = static_cast<const float*>(p);
-        out->vector_len = src.vector.size();
-    }
-
-    out->tstamp = src.tstamp;
-    out->ord = src.ord;
-    return true;
-}
-
 // S13-M2：iter entry 填充公共 helper（iter_next / iter_next_batch 共用），
 // malloc 检查——OOM 时释放半成品并返回 false。
 inline bool fill_iter_entry(const bitcask::CaskIter::Entry& e,

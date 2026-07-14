@@ -137,22 +137,6 @@ inline void to_codepoints(std::string_view text, std::vector<CpInfo>& cps) {
     return cps;
 }
 
-// P4:thread_local 复用版——返回对每线程复用缓冲的引用，分词热路径稳态零分配。
-// 并发安全（thread_local 每线程独立；S3 恢复的 parallel analyze 各线程互不干扰）。
-// ⚠️ 同一线程不可同时持有两份返回引用（会别名同一缓冲）——分词器每次只用一份。
-[[nodiscard]] inline const std::vector<CpInfo>& to_codepoints_reuse(
-    std::string_view text) {
-    thread_local std::vector<CpInfo> tls;
-    to_codepoints(text, tls);
-    // 防膨胀:一次超大文本后不让缓冲长期占住线程内存（对齐 read_buf 策略）。
-    // size 是本次内容、capacity 是历史峰值；峰值远超阈值且本次很小才回收。
-    constexpr std::size_t kRetain = 1u << 16;  // 65536 CpInfo
-    if (tls.capacity() > kRetain && tls.size() <= kRetain) {
-        tls.shrink_to_fit();  // 收到 size()（≤kRetain），内容保留
-    }
-    return tls;
-}
-
 // S29-8：nfkc_fold + to_codepoints 融合入口。
 //
 // 原两段式对 CJK 文本每码点解码**两遍**：nfkc_fold 快路径校验趟逐码点

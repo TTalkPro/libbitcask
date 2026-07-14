@@ -77,14 +77,6 @@ inline constexpr std::uint8_t kMetaFormatVersion = 1;
 
 namespace detail {
 
-inline void vbyte_append(std::vector<std::byte>& out, std::uint64_t val) {
-    while (val >= 128) {
-        out.push_back(static_cast<std::byte>(val & 0x7Fu));
-        val >>= 7;
-    }
-    out.push_back(static_cast<std::byte>(val | 0x80u));
-}
-
 // 把 VByte 写入 [p, p+n)，返回写入字节数。供 encode_meta 直接顺序写，
 // 不再触发 vector 的 push_back realloc。
 inline std::size_t vbyte_store(std::byte* p, std::uint64_t val) noexcept {
