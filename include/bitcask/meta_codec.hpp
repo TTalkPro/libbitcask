@@ -44,6 +44,8 @@
 #include <variant>
 #include <vector>
 
+#include "bitcask/vbyte.hpp"
+
 namespace bitcask::meta {
 
 // meta 二进制格式的 value type tag——直接落盘 u8，禁止重排/重用。
@@ -75,29 +77,12 @@ inline constexpr std::uint8_t kMetaFormatVersion = 1;
 
 namespace detail {
 
-// VByte 变长整数：低 7 位数据 + 最高位 1=终止字节。与 codec.cpp 同算法。
 inline void vbyte_append(std::vector<std::byte>& out, std::uint64_t val) {
     while (val >= 128) {
         out.push_back(static_cast<std::byte>(val & 0x7Fu));
         val >>= 7;
     }
     out.push_back(static_cast<std::byte>(val | 0x80u));
-}
-
-// VByte 解码：返回 {value, new_pos}；越界或非法编码返回 {0, buf.size()}。
-inline std::pair<std::uint64_t, std::size_t>
-vbyte_read(std::span<const std::byte> buf, std::size_t pos) {
-    std::uint64_t result = 0;
-    std::uint64_t shift  = 0;
-    while (true) {
-        if (pos >= buf.size()) return {0, buf.size()};
-        const auto b = static_cast<std::uint8_t>(buf[pos++]);
-        result |= static_cast<std::uint64_t>(b & 0x7Fu) << shift;
-        if (b & 0x80u) break;
-        shift += 7;
-        if (shift >= 64) return {0, buf.size()};
-    }
-    return {result, pos};
 }
 
 // 把 VByte 写入 [p, p+n)，返回写入字节数。供 encode_meta 直接顺序写，
@@ -226,7 +211,10 @@ decode_meta(std::span<const std::byte> buf) {
     if (static_cast<std::uint8_t>(buf[0]) != kMetaFormatVersion) {
         return std::unexpected("meta: unsupported version");
     }
-    auto [n, pos] = detail::vbyte_read(buf, 1);
+    auto n_vr = codec::vbyte_read_checked(buf, 1);
+    if (!n_vr) return std::unexpected("meta: truncated header");
+    auto pos = n_vr->second;
+    const auto n = n_vr->first;
 
     std::vector<MetaEntry> out;
     out.reserve(static_cast<std::size_t>(n));
@@ -235,8 +223,10 @@ decode_meta(std::span<const std::byte> buf) {
         if (pos >= buf.size()) {
             return std::unexpected("meta: truncated at entry keylen");
         }
-        auto [klen, p2] = detail::vbyte_read(buf, pos);
-        pos = p2;
+        auto klen_vr = codec::vbyte_read_checked(buf, pos);
+        if (!klen_vr) return std::unexpected("meta: truncated keylen");
+        const auto klen = klen_vr->first;
+        pos = klen_vr->second;
         if (klen > buf.size() - pos) {
             return std::unexpected("meta: truncated key bytes");
         }
@@ -297,8 +287,10 @@ decode_meta(std::span<const std::byte> buf) {
                 if (pos >= buf.size()) {
                     return std::unexpected("meta: truncated string len");
                 }
-                auto [slen, p3] = detail::vbyte_read(buf, pos);
-                pos = p3;
+                auto slen_vr = codec::vbyte_read_checked(buf, pos);
+                if (!slen_vr) return std::unexpected("meta: truncated string len");
+                const auto slen = slen_vr->first;
+                pos = slen_vr->second;
                 if (slen > buf.size() - pos) {
                     return std::unexpected("meta: truncated string bytes");
                 }
@@ -332,30 +324,19 @@ inline MetaValue meta_lookup(std::span<const std::byte> blob,
     if (static_cast<std::uint8_t>(blob[0]) != kMetaFormatVersion) {
         return std::monostate{};
     }
-    auto [n, pos] = detail::vbyte_read(blob, 1);
+    auto n_vr = codec::vbyte_read_checked(blob, 1);
+    if (!n_vr) return std::monostate{};
+    const auto n = n_vr->first;
+    std::size_t cur = n_vr->second;
 
-    auto read_varint = [&blob](std::size_t p, std::uint64_t& out) -> std::size_t {
-        std::uint64_t v = 0;
-        std::uint64_t shift = 0;
-        std::size_t q = p;
-        while (q < blob.size()) {
-            const auto b = static_cast<std::uint8_t>(blob[q]);
-            ++q;
-            v |= static_cast<std::uint64_t>(b & 0x7Fu) << shift;
-            if (b & 0x80u) { out = v; return q; }
-            shift += 7;
-            if (shift >= 64) return blob.size();
-        }
-        return blob.size();
-    };
-
-    std::size_t cur = pos;
     for (std::uint64_t i = 0; i < n; ++i) {
         if (cur >= blob.size()) break;
 
-        std::uint64_t kl = 0;
-        std::size_t p = read_varint(cur, kl);
-        if (p == blob.size() || kl > blob.size() - p) break;
+        auto kl_vr = codec::vbyte_read_checked(blob, cur);
+        if (!kl_vr) break;
+        const auto kl = kl_vr->first;
+        const std::size_t p = kl_vr->second;
+        if (kl > blob.size() - p) break;
         const std::string_view ek(
             reinterpret_cast<const char*>(blob.data() + p),
             static_cast<std::size_t>(kl));
@@ -403,14 +384,13 @@ inline MetaValue meta_lookup(std::span<const std::byte> blob,
                         return v;
                     }
                 case MetaType::String: {
-                    std::uint64_t sl = 0;
-                    std::size_t q = read_varint(cur, sl);
-                    if (q == blob.size() || sl > blob.size() - q) {
+                    auto sl_vr = codec::vbyte_read_checked(blob, cur);
+                    if (!sl_vr || sl_vr->first > blob.size() - sl_vr->second) {
                         return std::monostate{};
                     }
                     return std::string(
-                        reinterpret_cast<const char*>(blob.data() + q),
-                        static_cast<std::size_t>(sl));
+                        reinterpret_cast<const char*>(blob.data() + sl_vr->second),
+                        static_cast<std::size_t>(sl_vr->first));
                 }
                 default:
                     return std::monostate{};
@@ -426,12 +406,11 @@ inline MetaValue meta_lookup(std::span<const std::byte> blob,
             case MetaType::Float64:
                 if (blob.size() - cur >= 8) cur += 8; else cur = blob.size(); break;
             case MetaType::String: {
-                std::uint64_t sl = 0;
-                std::size_t q = read_varint(cur, sl);
-                if (q == blob.size() || sl > blob.size() - q) {
+                auto sl_vr = codec::vbyte_read_checked(blob, cur);
+                if (!sl_vr || sl_vr->first > blob.size() - sl_vr->second) {
                     cur = blob.size();
                 } else {
-                    cur = q + static_cast<std::size_t>(sl);
+                    cur = sl_vr->second + static_cast<std::size_t>(sl_vr->first);
                 }
                 break;
             }

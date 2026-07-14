@@ -165,6 +165,47 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # clang-tidy 静态分析（Google Style 基线，.clang-tidy 配置驱动）。
+  # 非门控（continue-on-error）——首次启用会暴露预存告警；待存量清零后改门控。
+  # 范围：first-party .cpp/.hpp（src/、include/、c_api/），third_party 经
+  # HeaderFilterRegex 排除。用 clang-tidy 18（Ubuntu 24.04 默认）。
+  # ---------------------------------------------------------------------------
+  clang-tidy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Clang + clang-tidy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tidy
+      - name: Configure (export compile_commands)
+        run: |
+          cmake -S . -B build-tidy \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_CXX_COMPILER=clang++
+      - name: Run clang-tidy (first-party)
+        run: |
+          set -o pipefail
+          # 收集 first-party .cpp 文件（third_party/tests/bench 排除）
+          files=$(find src c_api -name '*.cpp' | sort)
+          echo "Linting ${#files[@]} files..."
+          clang-tidy -p build-tidy --quiet --warnings-as-errors='' \
+            $(echo "$files" | tr '\n' ' ') 2>&1 | tee tidy-output.txt
+      - name: Upload tidy output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-${{ github.sha }}
+          path: tidy-output.txt
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
   # CI3:Benchmark 追踪。构建并跑 B1-B4 + 既有微基准，产出 JSON artifact 供
   # 人工/趋势比对。**非门控**——GitHub 共享 runner CPU 噪声大，自动 >10% 回归
   # 报警会频繁误报；artifact 留作离线比对（CI3 的自动回归检测维度留待专用稳定机）。

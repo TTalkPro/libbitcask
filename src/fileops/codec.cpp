@@ -12,30 +12,6 @@
 
 namespace bitcask::codec {
 
-namespace {
-
-// VByte 变长整数读取（DocValue v3 的段长度/计数/字段 id 用，#1/#2）。
-// 写端用 vbyte.hpp 的 vbyte_encode（S9-P1-b 合并）；读端保留本地版——它对
-// std::byte 缓冲做 **bounds-checked + 溢出防御**（返回 bool），契约严于
-// vbyte.hpp 的 vbyte_decode（裸指针、无越界检查）。
-// 从 buf[pos] 读一个 VByte，成功写出 val 并推进 pos；越界/编码过长返回 false。
-inline bool vbyte_read(std::span<const std::byte> buf, std::size_t& pos, std::uint64_t& val) {
-    std::uint64_t result = 0;
-    std::uint64_t shift  = 0;
-    while (true) {
-        if (pos >= buf.size()) return false;
-        const auto byte = static_cast<std::uint8_t>(buf[pos++]);
-        result |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
-        if (byte & 0x80) break;
-        shift += 7;
-        if (shift >= 64) return false;  // 防御：超过 u64 的非法编码
-    }
-    val = result;
-    return true;
-}
-
-}  // namespace
-
 // 一次性算 CRC——薄包装 hw::crc32_update(0, ...)。
 std::uint32_t crc32(std::span<const std::byte> data) noexcept {
     return crc32_update(0, data);
@@ -241,8 +217,10 @@ decode_doc_value(std::span<const std::byte> buf) {
     // 读一个 [varint 字节长度][payload] 段（text/meta/字段值用），推进 pos。
     auto read_bytes_section =
         [&buf, &pos](std::span<const std::byte>& out_span) -> bool {
-        std::uint64_t len = 0;
-        if (!vbyte_read(buf, pos, len)) return false;
+        auto vr = vbyte_read_checked(buf, pos);
+        if (!vr) return false;
+        const auto len = vr->first;
+        pos = vr->second;
         if (len > buf.size() - pos) return false;  // S25-M3:减法避溢出
         out_span = buf.subspan(pos, len);
         pos += len;
@@ -252,10 +230,12 @@ decode_doc_value(std::span<const std::byte> buf) {
     if (v.vec_quantized) {
         // P3a：[Dim:varint][SchemeVer:u8][scale:f32 LE][int8×Dim]。vector_raw =
         // int8 codes（零拷贝），配 vec_scale 用 doc_vector_f32() 还原。
-        std::uint64_t dim = 0;
-        if (!vbyte_read(buf, pos, dim)) {
+        auto dim_vr = vbyte_read_checked(buf, pos);
+        if (!dim_vr) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
+        pos = dim_vr->second;
+        const auto dim = dim_vr->first;
         // S25-M3:need = 1 + sizeof(float) + dim。dim 来自不可信 vbyte，
         // 可能大到令 need 溢出。改用减法：dim + 5 必须 ≤ 剩余字节。
         constexpr std::size_t kQuantOverhead = 1 + sizeof(float);
@@ -275,10 +255,12 @@ decode_doc_value(std::span<const std::byte> buf) {
     }
     if (v.has_vector) {
         // vector 段：[Dim:varint 元素个数][f32×Dim 小端]。Dim 是元素数、非字节数。
-        std::uint64_t dim = 0;
-        if (!vbyte_read(buf, pos, dim)) {
+        auto dim_vr = vbyte_read_checked(buf, pos);
+        if (!dim_vr) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
+        pos = dim_vr->second;
+        const auto dim = dim_vr->first;
         // S25-M3:dim * sizeof(float) 可乘法溢出。改用除法：dim 不得超过
         // 剩余字节 / sizeof(float)。
         if (dim > (buf.size() - pos) / sizeof(float)) {
@@ -300,18 +282,21 @@ decode_doc_value(std::span<const std::byte> buf) {
     }
     // fields 段（#1）：[FieldCount:varint] × { [FieldId:varint][ValLen:varint][value] }
     if (v.has_fields) {
-        std::uint64_t fc = 0;
-        if (!vbyte_read(buf, pos, fc)) {
+        auto fc_vr = vbyte_read_checked(buf, pos);
+        if (!fc_vr) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
-        v.fields.reserve(fc);
+        pos = fc_vr->second;
+        const auto fc = fc_vr->first;
+        v.fields.reserve(static_cast<std::size_t>(fc));
         for (std::uint64_t i = 0; i < fc; ++i) {
-            std::uint64_t id = 0;
-            if (!vbyte_read(buf, pos, id)) {
+            auto id_vr = vbyte_read_checked(buf, pos);
+            if (!id_vr) {
                 return std::unexpected(DecodeError::kBufferTooShort);
             }
+            pos = id_vr->second;
             DocField f;
-            f.id = static_cast<std::uint32_t>(id);
+            f.id = static_cast<std::uint32_t>(id_vr->first);
             if (!read_bytes_section(f.value)) {
                 return std::unexpected(DecodeError::kBufferTooShort);
             }

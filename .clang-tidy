@@ -1,0 +1,54 @@
+# clang-tidy 配置（Google C++ Style 基线）。
+#
+# 范围：first-party 代码（src/、include/、c_api/）。third_party / build / tests
+# 经 HeaderFilterRegex 与 CI 路径过滤排除。
+#
+# 策略：以 google-* + modernize-* + bugprone-* + performance-* 为基线，
+# 关闭与本项目 C++23 风格冲突的检查；其余默认开启。新增告警应在 PR 中修正，
+# 而非本地关闭检查（除非有文档化的理由）。
+
+Checks:
+  - google-*                   # Google C++ Style 全集
+  - modernize-*                # C++11/14/17/23 现代化建议
+  - bugprone-*                 # 易错模式
+  - performance-*              # 性能建议
+  - readability-*              # 可读性
+  - cert-*                     # CERT 安全建议
+  - cppcoreguidelines-*        # C++ Core Guidelines（部分）
+  ###############################
+  # 关闭的检查（与本项目风格/约束冲突）
+  ###############################
+  - -google-readability-todo       # 不强制 TODO 格式
+  - -google-readability-braces-around-statements  # 单行 if 不强制大括号
+  - -modernize-use-trailing-return-type  # 不强制尾置返回类型
+  - -readability-named-parameter    # 不强制命名所有参数
+  - -readability-identifier-naming  # 命名规则由 .clang-format + review 守
+  - -readability-identifier-length  # 短变量名（p/s/i）是项目惯例
+  - -readability-braces-around-statements  # 单行 if 不强制大括号（项目惯例）
+  - -readability-simplify-subscript-expr   # buf.data()[i] 是 mmap/裸指针场景的可读性偏好
+  - -readability-uppercase-literal-suffix   # 0.0f vs 0.0F 不强制
+  - -readability-magic-numbers      # 大量位运算常量误报
+  - -readability-function-cognitive-complexity  # 复杂度阈值与算法代码冲突
+  - -bugprone-easily-swappable-parameters  # 整数参数类型相似告警过多
+  - -bugprone-narrowing-conversions  # 已由 -Wconversion 编译期捕获
+  - -cppcoreguidelines-avoid-magic-numbers  # 同 magic-numbers
+  - -cppcoreguidelines-pro-bounds-pointer-arithmetic  # SIMD/mmap 必需
+  - -cppcoreguidelines-non-private-member-variables-in-classes  # POD 数据结构需要
+  - -cppcoreguidelines-avoid-non-const-global-variables  # Meyer singleton 等
+  - -google-runtime-references      # 函数参数传 non-const 引用是项目惯例
+  - -modernize-use-designated-initializers  # C++23 designated initializers 已用
+  - -performance-unnecessary-value-param  # 已有 -Wnon-virtual-dtor 类编译护栏
+
+CheckOptions:
+  - key:   HeaderFilterRegex
+    value: 'bitcask/.*\.hpp$'     # 仅 lint first-party 头（third_party 被滤掉）
+  - key:   readability-braces-around-statements.ShortStatementOnSameLine
+    value: 'true'
+  - key:   modernize-use-default-member-init.UseAssignment
+    value: 'true'
+  - key:   performance-unnecessary-value-param.AllowedTypes
+    value: 'std::string_view;std::span'
+
+WarningsAsErrors: ''              # 默认不升错；CI 可单独加 -Werror
+
+FormatStyle: file                 # 用 .clang-format（如有）或 LLVM 默认

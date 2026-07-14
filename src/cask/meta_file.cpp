@@ -5,7 +5,7 @@
 #include <fstream>
 #include <span>
 
-#include "bitcask/hw_crc32.hpp"
+#include "bitcask/codec.hpp"
 
 namespace bitcask::meta {
 
@@ -36,7 +36,7 @@ inline constexpr char kMetaMagic[kMetaMagicSize + 1] = "BCME";
 
 // header 前 kMetaCrcCoverLen 字节的 CRC32（与 data/hint/field.schema 同多项式）。
 inline std::uint32_t meta_crc(const char* header) {
-    return hw::crc32(std::span<const std::byte>(
+    return codec::crc32(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(header), kMetaCrcCoverLen));
 }
 

@@ -38,7 +38,7 @@
 #include <unistd.h>  // ::fsync / ::fileno（升级时 rename 前的持久化屏障）
 
 #include "bitcask/byte_order.hpp"
-#include "bitcask/hw_crc32.hpp"
+#include "bitcask/codec.hpp"
 
 namespace bitcask {
 
@@ -169,7 +169,7 @@ private:
         le_store_u16(buf.data(), nlen);
         if (!name.empty()) std::memcpy(buf.data() + 2, name.data(), name.size());
         const std::uint32_t crc =
-            hw::crc32(std::span<const std::byte>(buf.data(), 2 + name.size()));
+            codec::crc32(std::span<const std::byte>(buf.data(), 2 + name.size()));
         le_store_u32(buf.data() + 2 + name.size(), crc);
         return buf;
     }
@@ -196,9 +196,9 @@ private:
             }
             std::byte cb[4];
             if (std::fread(cb, 1, 4, rf) != 4) return true;  // torn tail（缺 CRC）
-            std::uint32_t have = hw::crc32_update(0, std::span<const std::byte>(lb, 2));
+            std::uint32_t have = codec::crc32_update(0, std::span<const std::byte>(lb, 2));
             if (nlen > 0) {
-                have = hw::crc32_update(
+                have = codec::crc32_update(
                     have, std::span<const std::byte>(namebuf.data(), nlen));
             }
             if (le_load_u32(cb) != have) return false;  // 完整 entry + 坏 CRC → fail-fast

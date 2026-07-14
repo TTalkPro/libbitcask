@@ -17,8 +17,11 @@
 #pragma once
 
 #include <cstdint>
-#include <vector>
 #include <cstddef>
+#include <optional>
+#include <span>
+#include <utility>
+#include <vector>
 
 namespace bitcask::codec {
 
@@ -38,6 +41,10 @@ inline void vbyte_encode(std::uint64_t val, std::vector<Byte>& buf) {
 
 // VByte 解码：从 data[pos] 开始读取一个 VByte 编码的无符号整数。
 // 返回 {解码值, 新位置}。
+//
+// **无边界检查**（热路径契约）：caller 须保证 data 在编码完整范围内。
+// 用于 bm25 posting 落盘 / 段 mmap 解码等已由段级 CRC 背书的数据；损坏由
+// 界检查兜住，单字节无开销。S21-2 A3 既定。
 inline std::pair<std::uint64_t, std::size_t> vbyte_decode(const std::uint8_t* data, std::size_t pos) {
     std::uint64_t result = 0;
     std::uint64_t shift = 0;
@@ -48,6 +55,27 @@ inline std::pair<std::uint64_t, std::size_t> vbyte_decode(const std::uint8_t* da
         shift += 7;
     }
     return {result, pos};
+}
+
+// VByte 解码（带边界检查 + 溢出防御）：从 buf[pos] 读一个 VByte。
+// 成功返回 {value, new_pos}；越界或编码过长（shift ≥ 64）返回 std::nullopt。
+//
+// 与 vbyte_decode 的关系：本函数是**带检查**权威实现，服务 DocValue/meta
+// 等不可信输入的解码路径；vbyte_decode 是**无检查**热路径版（段内已 CRC 背书）。
+// 两套契约各有定位，不要合并到单一函数（详见 S21-2 A3）。
+[[nodiscard]] inline std::optional<std::pair<std::uint64_t, std::size_t>>
+vbyte_read_checked(std::span<const std::byte> buf, std::size_t pos) noexcept {
+    std::uint64_t result = 0;
+    std::uint64_t shift  = 0;
+    while (true) {
+        if (pos >= buf.size()) return std::nullopt;
+        const auto b = static_cast<std::uint8_t>(buf[pos++]);
+        result |= static_cast<std::uint64_t>(b & 0x7Fu) << shift;
+        if (b & 0x80u) break;
+        shift += 7;
+        if (shift >= 64) return std::nullopt;  // 防御：超过 u64 的非法编码
+    }
+    return std::make_pair(result, pos);
 }
 
 // Gap 编码：对已排序的 ord 数组做差值编码后 VByte 压缩。

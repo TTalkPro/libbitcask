@@ -3,7 +3,7 @@
 
 #include "bitcask/segment_v2.hpp"
 
-#include "bitcask/hw_crc32.hpp"
+#include "bitcask/codec.hpp"
 #include "bitcask/term_snapshot_cache.hpp"  // S30-P5:查询快照缓存
 #include "bitcask/myers.hpp"
 #include "bitcask/vbyte.hpp"
@@ -100,7 +100,7 @@ public:
             ok_ = false;
             return;
         }
-        cur_.crc = hw::crc32_update(
+        cur_.crc = codec::crc32_update(
             cur_.crc,
             std::span<const std::byte>(static_cast<const std::byte*>(p), n));
         cur_.len += n;
@@ -367,7 +367,7 @@ bool write_segment_v2_streams(
             put(&r.len, 8);
             put(&r.crc, 4);
         }
-        const std::uint32_t fcrc = hw::crc32_update(0, fb);
+        const std::uint32_t fcrc = codec::crc32_update(0, fb);
         put(&fcrc, 4);
         const auto flen = static_cast<std::uint32_t>(fb.size());
         ok = std::fwrite(fb.data(), 1, fb.size(), f.get()) == fb.size();
@@ -468,7 +468,7 @@ std::unique_ptr<MmapSegment> MmapSegment::open(const std::string& path,
     const std::size_t entry_sz = 4 + 4 + 8 + 8 + 4;
     if (footer_len != 8 + scount * entry_sz + 4) return nullptr;
     const auto fcrc = load_pod<std::uint32_t>(fb + footer_len - 4);
-    if (hw::crc32_update(
+    if (codec::crc32_update(
             0, std::span<const std::byte>(fb, footer_len - 4)) != fcrc) {
         return nullptr;
     }
@@ -496,7 +496,7 @@ std::unique_ptr<MmapSegment> MmapSegment::open(const std::string& path,
         const auto crc = load_pod<std::uint32_t>(e + 24);
         if (off + len > footer_off) return nullptr;  // 节必在 footer 之前
         if (verify_crc &&
-            hw::crc32_update(0, std::span<const std::byte>(b + off, len)) !=
+            codec::crc32_update(0, std::span<const std::byte>(b + off, len)) !=
                 crc) {
             return nullptr;
         }
@@ -942,7 +942,7 @@ bool MmapSegment::save_live_sidecar(const std::string& path) const {
         }
     }
     put(bits.data(), bits.size());
-    const std::uint32_t crc = hw::crc32_update(0, buf);
+    const std::uint32_t crc = codec::crc32_update(0, buf);
     put(&crc, 4);
     const bool ok =
         std::fwrite(buf.data(), 1, buf.size(), f.get()) == buf.size() &&
@@ -973,7 +973,7 @@ bool MmapSegment::load_live_sidecar(const std::string& path) {
     if (load_pod<std::uint32_t>(buf.data() + 4) != segv2::kVersion) return false;
     if (load_pod<std::uint64_t>(buf.data() + 8) != doc_count_) return false;
     const auto crc = load_pod<std::uint32_t>(buf.data() + buf.size() - 4);
-    if (hw::crc32_update(0, std::span<const std::byte>(buf.data(),
+    if (codec::crc32_update(0, std::span<const std::byte>(buf.data(),
                                                        buf.size() - 4)) !=
         crc) {
         return false;
