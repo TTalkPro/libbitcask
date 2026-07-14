@@ -165,6 +165,16 @@ public:
     // 在 reducer 静止点串行执行 fn（单写者上下文）。fire-and-forget；
     // 同一提交序 FIFO 执行。插件在 merge 线程等并发上下文要变异自身
     // 单写者状态时，必须经此通道。
+    //
+    // ⚠️ 死锁陷阱（DL 陷阱 6，RISK_REPORT v2）：
+    // 严禁在 reducer 上下文（on_put / on_delete / RunFn 闭包内）调用本方法——
+    // 构成环死锁：调用者线程已持有 reducer 单写者，但 run_serialized
+    // 提交的 fn 又需排队进同一 reducer。当 queue 满（10240）+ reorder 在途
+    // 达上限（16384）时，submit 阻塞调用者；reducer 等调用者释放单写者——
+    // 环闭合，进程级挂死。
+    // 当前实现所有调用点均在 merge 线程（不在 reducer 上下文），此契约仅作
+    // 防回归固化。新增插件若需在 reducer 内变异状态，改用原子发布 / shadow
+    // build 模式，不得调本方法。
     virtual void run_serialized(std::function<void()> fn) = 0;
 
     virtual void log(LogLevel level, std::string_view msg) = 0;
