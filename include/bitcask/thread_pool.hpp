@@ -442,6 +442,16 @@ public:
         });
     }
 
+    // DL-MED-3 修复：快照水位有界等待——只等到 applied_ord >= upto_ord，
+    // 不要求 in_flight==0、不动态重读 hwm。供 prepare_search 等读屏障使用。
+    void flush_upto(IndexLane* lane, std::uint64_t upto_ord) {
+        if (!lane) return;
+        std::unique_lock<std::mutex> lk(flush_mu_);
+        flush_cv_.wait(lk, [lane, upto_ord] {
+            return lane->applied_ord.load(std::memory_order_acquire) >= upto_ord;
+        });
+    }
+
     // ===== 向后兼容 facade（单 lane；现有测试 + 单元基准用）=====
     // set_initial_ord → start 注册「默认车道」时的起始 ord。
     void set_initial_ord(std::uint64_t init_ord) {
@@ -640,6 +650,10 @@ private:
                     lane->applied_ord.store(lane->next_apply_ord,
                                             std::memory_order_release);
                     ++lane->next_apply_ord;
+                    {
+                        std::lock_guard<std::mutex> fl(flush_mu_);
+                        flush_cv_.notify_all();  // flush_upto 需 applied_ord 推进通知
+                    }
                     dec_in_flight(lane.get());  // 必然执行：异常也推进 ord
 
                     lk.lock();

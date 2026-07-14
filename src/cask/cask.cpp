@@ -218,13 +218,21 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     //
     // 不走 registry：每个 cask 独占一个 keydir（unit test 常见）。
     if (registry != nullptr) {
-        cask->registry_    = registry;
-        cask->keydir_name_ = std::string(dirname);
-        auto a = registry->acquire(cask->keydir_name_);
+        // MEM-MED-1 修复：先在局部变量上完成 acquire（含失败重试），
+        // 仅当确认 acquire 成功后才把 registry_ / keydir_name_ 提交给 cask。
+        //
+        // 原 bug：先设 registry_/keydir_name_ 再 acquire。kNotReady 路径
+        // acquire 不增 refcount，2 秒超时返回后 ~Cask→close() 仍会执行
+        // registry_->release()——把初始化方的活动 slot refcount 从 1 减到 0
+        // 并 erase。后果：biggest_file_id 持久化被跳过 → 老文件 ID 复用 →
+        // keydir 误判旧 entry 为最新（tombstone-resurrection 等价类）。
+        // 报告 MEM-MED-1；触发条件：同进程并发 open + 初始化 >2s（大库冷启动）。
+        std::string keydir_name(dirname);
+        auto a = registry->acquire(keydir_name);
         if (a.status == keydir::AcquireStatus::kNotReady) {
             for (int i = 0; i < 40; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                a = registry->acquire(cask->keydir_name_);
+                a = registry->acquire(keydir_name);
                 if (a.status != keydir::AcquireStatus::kNotReady) break;
             }
             if (a.status == keydir::AcquireStatus::kNotReady) {
@@ -232,6 +240,9 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
                     "keydir not_ready after wait"));
             }
         }
+        // acquire 成功后才登记到 cask——close() 的 release 现严格配对
+        cask->registry_    = registry;
+        cask->keydir_name_ = std::move(keydir_name);
         cask->keydir_ = a.keydir;
         if (a.status == keydir::AcquireStatus::kCreated) {
             if (auto r = cask->load_keydir_from_disk(); !r) return std::unexpected(r.error());
@@ -490,9 +501,12 @@ void Cask::CaskPluginHost::run_serialized(std::function<void()> fn) {
     if (c->index_pool_ && c->index_lane_) {
         IndexTask t;
         t.op  = IndexOp::RunFn;
-        t.ord = c->keydir_->alloc_ord();
+        const std::uint64_t ord = c->keydir_->alloc_ord();
+        OrdSkipGuard og(c, ord);
+        t.ord = ord;
         t.fn  = std::move(fn);
         c->submit_index_task(std::move(t));
+        og.disarm();
     } else {
         fn();  // 无池（纯 KV / 理论不可达）：调用线程直跑
     }
@@ -2195,64 +2209,104 @@ std::expected<void, CaskFault> Cask::checkpoint() {
     }
     const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
     if (index_pool_ && index_lane_) {
-        auto done = std::make_shared<std::atomic<int>>(0);
-        IndexTask t;
-        t.op  = IndexOp::RunFn;
-        t.ord = keydir_->alloc_ord();
-        // S14-1：keydir 快照也移进 RunFn——所有 ckpt 文件写统一到 reducer
-        // 单线程，与自动 checkpoint 的 RunFn 天然串行（消除 .tmp 并发写
-        // 窗口，且不能在此持 ckpt_mu_ 等 reducer——会与手动调用互锁）。
-        // 成对性：字节水位在**提交时刻**捕获（wms 先于 wm，保证水位覆盖的
-        // 记录 ord < wm ≤ search 覆盖）；RunFn 执行时刻取水位会被并发写者
-        // 推进而反转不变量（见 collect_snapshot_watermarks 注释）。
-        // S14-7：keydir 元数据 payload 于提交时刻构建（wms 同刻捕获，
-        // 成对一致）；delta 路径内联进 delta 文件，base 路径落全量快照。
-        std::vector<std::byte> kd;
-        if (auto wms0 = collect_snapshot_watermarks()) {
-            keydir_->serialize_meta_delta(kd, *wms0);
-            t.fn = [this, search_ckpt, done, wms = std::move(wms0),
-                    kd = std::move(kd), wm = keydir_->peek_next_ord()] {
+        // DL-MED-2: pool is stopped → synchronous fallback (no submit, no
+        // ord leak, no done-wait). Guard not needed; synchronous path sets
+        // last_ckpt_ord itself.
+        if (index_pool_->is_stopped()) {
+            std::vector<std::byte> kd;
+            auto wms0 = collect_snapshot_watermarks();
+            if (wms0) keydir_->serialize_meta_delta(kd, *wms0);
+            if (!save_search_ckpt_paired(search_ckpt, keydir_->peek_next_ord(),
+                                         wms0, kd)) {
+                return std::unexpected(err(CaskError::kIo,
+                    "checkpoint: search checkpoint save failed (stopped pool "
+                    "synchronous path)"));
+            }
+        } else {
+            // DL-MED-2: 用 mutex+cv 替代 atomic+wait —— atomic::wait 无 timeout
+            // 变体（C++20/23 没有 atomic_wait_for/until 自由函数），checkpoint
+            // 需要有界等待防 stopped_ pool 丢弃任务后永久挂死。
+            auto done_mu = std::make_shared<std::mutex>();
+            auto done_cv = std::make_shared<std::condition_variable>();
+            auto done_val = std::make_shared<int>(0);
+            IndexTask t;
+            t.op  = IndexOp::RunFn;
+            const std::uint64_t ord = keydir_->alloc_ord();
+            OrdSkipGuard og(this, ord);  // DL-MED-1: 失败路径补 Skip 防 ord 空洞
+            // S14-1：keydir 快照也移进 RunFn——所有 ckpt 文件写统一到 reducer
+            // 单线程，与自动 checkpoint 的 RunFn 天然串行（消除 .tmp 并发写
+            // 窗口，且不能在此持 ckpt_mu_ 等 reducer——会与手动调用互锁）。
+            // 成对性：字节水位在**提交时刻**捕获（wms 先于 wm，保证水位覆盖的
+            // 记录 ord < wm ≤ search 覆盖）；RunFn 执行时刻取水位会被并发写者
+            // 推进而反转不变量（见 collect_snapshot_watermarks 注释）。
+            // S14-7：keydir 元数据 payload 于提交时刻构建（wms 同刻捕获，
+            // 成对一致）；delta 路径内联进 delta 文件，base 路径落全量快照。
+            std::vector<std::byte> kd;
+            if (auto wms0 = collect_snapshot_watermarks()) {
+                keydir_->serialize_meta_delta(kd, *wms0);
+                t.fn = [this, search_ckpt, done_mu, done_cv, done_val,
+                        wms = std::move(wms0),
+                        kd = std::move(kd), wm = keydir_->peek_next_ord()] {
+                    int result = 2;
+                    try {
+                        result = save_search_ckpt_paired(search_ckpt, wm, wms, kd)
+                                     ? 1
+                                     : 2;
+                    } catch (...) {
+                        // result 保持 2；异常由 reducer error_fn 计数上报。
+                    }
+                    if (result == 1) {
+                        last_ckpt_ord_.store(wm, std::memory_order_relaxed);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(*done_mu);
+                        *done_val = result;
+                    }
+                    done_cv->notify_all();
+                };
+            } else
+            t.fn  = [this, search_ckpt, done_mu, done_cv, done_val,
+                     wms = collect_snapshot_watermarks(),
+                     wm = keydir_->peek_next_ord()] {
                 int result = 2;
                 try {
-                    result = save_search_ckpt_paired(search_ckpt, wm, wms, kd)
-                                 ? 1
-                                 : 2;
+                    // 水位捕获失败（文件态不稳定）：无 keydir payload，delta
+                    // 的字节水位不推进（方向安全）；base 路径也无快照可写。
+                    result = save_search_ckpt_paired(
+                                 search_ckpt, wm, wms, {}) ? 1 : 2;
                 } catch (...) {
-                    // result 保持 2；异常由 reducer error_fn 计数上报。
+                    // result 保持 2；异常本体由 reducer 的 error_fn 计数上报。
                 }
                 if (result == 1) {
                     last_ckpt_ord_.store(wm, std::memory_order_relaxed);
                 }
-                done->store(result, std::memory_order_release);
-                done->notify_all();
+                {
+                    std::lock_guard<std::mutex> lk(*done_mu);
+                    *done_val = result;
+                }
+                done_cv->notify_all();
             };
-        } else
-        t.fn  = [this, search_ckpt, done,
-                 wms = collect_snapshot_watermarks(),
-                 wm = keydir_->peek_next_ord()] {
-            int result = 2;
-            try {
-                // 水位捕获失败（文件态不稳定）：无 keydir payload，delta
-                // 的字节水位不推进（方向安全）；base 路径也无快照可写。
-                result = save_search_ckpt_paired(
-                             search_ckpt, wm, wms, {}) ? 1 : 2;
-            } catch (...) {
-                // result 保持 2；异常本体由 reducer 的 error_fn 计数上报。
+            t.ord = ord;
+            index_pool_->submit(index_lane_, std::move(t));
+            og.disarm();  // DL-MED-1: RunFn 已携带 ord，guard 不再需要兜底
+            // DL-MED-2: 有界等待——30s 超时后报告失败（不再永久挂死）。
+            // 超时根因：pool 已 stop 且 submit 静默丢弃任务（理论上 is_stopped()
+            // 已拦截，但双保险）；或 reducer 线程异常卡死。
+            int wait_result = 0;
+            {
+                std::unique_lock<std::mutex> lk(*done_mu);
+                done_cv->wait_for(lk, std::chrono::seconds(30),
+                                  [&] { return *done_val != 0; });
+                wait_result = *done_val;
             }
-            if (result == 1) {
-                last_ckpt_ord_.store(wm, std::memory_order_relaxed);
+            if (wait_result == 0) {
+                return std::unexpected(err(CaskError::kIo,
+                    "checkpoint: timed out waiting for ckpt RunFn"));
             }
-            done->store(result, std::memory_order_release);
-            done->notify_all();
-        };
-        index_pool_->submit(index_lane_, std::move(t));
-        for (int v = done->load(std::memory_order_acquire); v == 0;
-             v = done->load(std::memory_order_acquire)) {
-            done->wait(0, std::memory_order_acquire);
-        }
-        if (done->load(std::memory_order_acquire) != 1) {
-            return std::unexpected(err(CaskError::kIo,
-                "checkpoint: search checkpoint save failed"));
+            if (wait_result != 1) {
+                return std::unexpected(err(CaskError::kIo,
+                    "checkpoint: search checkpoint save failed"));
+            }
         }
     } else {
         // 无索引池（理论不可达：search_ 存在则 lane 已注册）——调用线程直跑。
@@ -2411,9 +2465,8 @@ void Cask::maybe_submit_auto_checkpoint() {
     }
     IndexTask t;
     t.op  = IndexOp::RunFn;
-    t.ord = keydir_->alloc_ord();
-    // 成对性：字节水位与 keydir 元数据 payload 都在提交时刻捕获（wms 先
-    // 于 wm），保存本体在 reducer 执行（同 checkpoint()）。
+    const std::uint64_t ord = keydir_->alloc_ord();
+    OrdSkipGuard og(this, ord);  // DL-MED-1
     std::vector<std::byte> auto_kd;
     auto auto_wms = collect_snapshot_watermarks();
     if (auto_wms) keydir_->serialize_meta_delta(auto_kd, *auto_wms);
@@ -2433,7 +2486,9 @@ void Cask::maybe_submit_auto_checkpoint() {
         }
         auto_ckpt_inflight_.store(false, std::memory_order_release);
     };
+    t.ord = ord;
     submit_index_task(std::move(t));
+    og.disarm();  // DL-MED-1
 }
 
 // 合并执行。files 为空时先 needs_merge 决定要并什么；非空就直接用
@@ -2516,7 +2571,8 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
         if (index_pool_ && index_lane_) {
             IndexTask t;
             t.op  = IndexOp::RunFn;
-            t.ord = keydir_->alloc_ord();
+            const std::uint64_t ord = keydir_->alloc_ord();
+            OrdSkipGuard og(this, ord);  // DL-MED-1
             // S14-7：merge 恒 rebase → paired 走 base + 全量快照（用早段
             // 捕获的水位）。S18-7：rebase 标志改在此显式置位（原经 compact
             // shim 顺带置全局位；插件版 compact 只置自身位）；docmap chunk
@@ -2530,7 +2586,9 @@ Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
                              "(will rebuild on next open)");  // S13-D7
                 }
             };
+            t.ord = ord;
             index_pool_->submit(index_lane_, std::move(t));
+            og.disarm();  // DL-MED-1
             index_pool_->flush(index_lane_);
         } else {
             docmap_->compact_chunks();
