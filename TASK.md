@@ -1,7 +1,7 @@
 # Google C++ Style 规范化修复任务清单
 
-> 来源：`RISK_REPORT.md`（2026-07-14 v2 深度审计）
-> 范围：5 项 Phase 1-3 行动建议 + 7 项 Phase 4 资源/并发修复
+> 来源：`RISK_REPORT.md`（2026-07-14 v2 深度审计 + Phase 5 审计 + 三次复核）
+> 范围：5 项 Phase 1-3 行动建议 + 7 项 Phase 4 资源/并发修复 + 5 项 Phase 5 复核确认任务
 > 基线测试：641/641 ctest 通过（1 个 S30RssProbe 预存 Disabled）
 > 验收标准：每项改动后 ctest 全绿 + 编译无新告警 + lsp_diagnostics 无新错误
 
@@ -208,6 +208,104 @@ override 真正差异化的 save/load hook（base 写法、delta 序列化、loa
 
 ---
 
+## 🔴 Phase 5：复核确认的修复任务（2026-07-14 三次核对后定稿）
+
+> 来源：Phase 5 审计（4 路并行）+ 主 Agent 逐条重读代码复核。
+> 复核修订要点：P5-MEM-1 使用点 7 处非 4 处且模式源自 S13-F2；
+> P5-MEM-2 新增第三处漏点；P5-DL-3 升档（死代码在热路径留有真实开销）。
+
+### T14 — P5-MEM-1：OrdSkipGuard 析构异常安全 🔴 HIGH ✅
+
+**症状**：`~OrdSkipGuard()`（`include/bitcask/cask.hpp:1007-1012`）隐式 noexcept，
+内部调用链 `submit_index_task → IndexPool::submit → queue_.push`
+（`thread_pool.hpp:431`，TBB 有界队列内部分配可抛 bad_alloc）无一处 noexcept。
+submit 抛出 → 栈回退中析构再抛 → `std::terminate()`（进程立即死亡，不可恢复）。
+
+**范围（复核修订）**：**7 个使用点**共享同一析构——
+`src/cask/cask.cpp:505 / 1060 / 1801 / 1877 / 2235 / 2469 / 2575`。
+模式自 S13-F2 起即存在（1060/1801/1877），T7 新增 4 处（505/2235/2469/2575）。
+
+**修复方向**：析构内
+`try { cask->submit_index_task(...); } catch (...) { /* 记录 ord 泄漏,不抛 */ }`。
+代价：极端 bad_alloc 下泄漏 1 个 ord（可恢复，触发 30s 超时路径）；
+收益：消除 terminate（不可恢复）。一处修改覆盖全部 7 个使用点。
+
+- **位置**：`include/bitcask/cask.hpp:1007-1012`
+- **工作量**：30 分钟
+- **验收**：641/641 ctest；建议补 log_warn 记录兜底触发
+
+### T15 — P5-MEM-2：checkpoint 三处漏更新 last_ckpt_ord_ 🟡 MED ✅
+
+**症状**：`last_ckpt_ord_` 唯一消费点是自动 ckpt 阈值判断（`cask.cpp:2456`）。
+三处成功保存 ckpt 却不推进水位 → 下次写入触发冗余 ckpt（重复劳动+日志噪音）：
+
+1. `cask.cpp:2215-2224` is_stopped 同步分支——注释声称 "synchronous path sets
+   last_ckpt_ord itself"，**与代码直接矛盾**
+2. `cask.cpp:2311-2321` 无索引池分支（理论不可达，同样漏）——复核新增
+3. `cask.cpp:2580-2601` merge 的 RunFn 与 else 两分支——merge 后 rebase 全量
+   ckpt 已落盘却不推进水位，紧随的写入立刻触发一次冗余自动 ckpt
+
+**修复方向**：三处成功路径后补
+`last_ckpt_ord_.store(<对应 wm>, std::memory_order_relaxed);`；
+同步分支的矛盾注释一并修正。
+
+- **工作量**：15 分钟
+- **验收**：641/641 ctest；merge 后自动 ckpt 不再立即触发（可加计数断言）
+
+### T16 — P5-DL-3：删除 flush_upto + reducer 每任务通知块 🟡 MED（复核升档）
+
+**症状**：`flush_upto`（`thread_pool.hpp:447`）T8 revert 后零调用；
+`reducer_loop:653-656` 每 apply 一个索引事件取一次全局 `flush_mu_` + `notify_all`，
+注释明示专为 flush_upto 服务——即死代码在 reducer 热路径留有**每任务全局锁开销**。
+常规 `flush()` 的唤醒由 `dec_in_flight` 归零通知完全覆盖
+（applied_ord 在 dec 之前 store，无丢失唤醒窗口）。
+
+**修复方向**：删 flush_upto 定义 + 删 :653-656 通知块。
+**前置确认**：unregister_lib 等待路径不依赖 per-apply 通知（只依赖 in_flight 归零）。
+若 T8 重设计仍需 flush_upto，届时从 git 历史恢复。
+
+- **工作量**：1 小时（含前置确认 + 并发测试回归）
+- **验收**：641/641 ctest + TSan 树通过；merge_concurrent_writer_test 等并发套件重点回归
+
+### T17 — NEW-P4-1 + RED-7残：T10 收尾 🟢 LOW
+
+- `field_schema.hpp:73/230` 本地别名 ReadFilePtr/WriteFilePtr → 直接用
+  `detail::FilePtr`（file_util.hpp:31 已存在）
+- `hnsw.cpp:1525` 本地 `pwrite_all` → 消费 `vec_disk_internal.hpp:25`
+  的 `diskint::pwrite_all`（同目录内部头，5 个调用点）
+
+- **工作量**：30 分钟
+- **验收**：641/641 ctest
+
+### T18 — P5-DL-1/2：thread-safety 文档化模式偏离 🟢 LOW
+
+- P5-DL-1：checkpoint() 在 **ckpt_mu_ 临界区内**（函数级 lock_guard，`cask.cpp:2203`）
+  做 30s 有界 cv 等待，WriteOpGate 同时持有——reducer 卡住时 close() 与后续
+  checkpoint 调用者最坏拖 30s。非死锁（done_mu 为 per-call 局部 + 30s 上界），
+  但须在 docs/design/thread-safety.md 记录此例外及其安全论证
+- P5-DL-2：reducer_loop 连续两次取 flush_mu_（notify + dec_in_flight）偏离
+  "任一时刻至多持一把锁"文档模式——T16 删除通知块后自然消失，届时只需
+  文档化 dec_in_flight 单点通知
+
+- **工作量**：30 分钟（若 T16 先行，P5-DL-2 部分免除）
+- **验收**：文档更新，无代码变更（或随 T16 合并）
+
+### Phase 5 执行序
+
+```
+T14 (30min) ──┐
+T15 (15min) ──┼── 可同一 commit（均为 cask 行级修改，互不冲突）
+              │
+T16 (1h)    ──┴── 独立 commit（须 TSan 回归），完成后 T18 的 DL-2 部分免除
+T17 (30min) ───── 独立小 commit
+T18 (30min) ───── 文档 commit（T16 之后做）
+```
+
+**Phase 5 不做**（转入 backlog）：RED-1（T12 独立分支既定）、RED-3/5/6/10
+（冗余去重非 bug，随后续重构自然消化）、T8 重设计（须失败注入测试先行）。
+
+---
+
 ## Phase 4 执行序与依赖图
 
 ```
@@ -247,6 +345,11 @@ T7 完成后：
 | T10 file_util.hpp | ✅ done | 641/641 ctest（9 FileCloser → 1 detail/file_util.hpp；含 field_schema MEM-LOW-1 闭合） |
 | T11 MmapRegion 决策 | ✅ done | 641/641 ctest（删除建而未用的 mmap_handle.hpp，71 行；可从 git 历史恢复） |
 | T12 HNSW ckpt 去重 | ⚠️ 已精确审计 | 已验证 VectorPlugin::flush 与 SealedSegmentVectorPlugin::flush 逐字节相同；待独立分支执行（须向量三引擎测试全过 + 新建 VectorCkptDriver 非模板基类） |
+| T14 OrdSkipGuard 析构异常安全 | ✅ done | cask.hpp 析构 try-catch + log_warn 兜底；ASan smoke/checkpoint/crash/merge_concurrent 全过（一处修复覆盖 7 使用点） |
+| T15 last_ckpt_ord_ 三处漏更新 | ✅ done | 三处补 store（is_stopped/无池/merge 两分支）+ 修矛盾注释；确认纯 KV 早返回无需（auto ckpt 仅 text_ 模式）；ASan checkpoint/merge/keydir/cask_docvalue 全过 |
+| T16 flush_upto + 每任务通知块删除 | 🟡 待修 | Phase 5 复核升档（reducer 热路径每任务全局锁开销） |
+| T17 T10 收尾（FilePtr 别名 + pwrite_all） | 🟢 待修 | Phase 5 复核确认 |
+| T18 thread-safety 文档化 | 🟢 待做 | T16 之后执行（DL-2 部分随 T16 免除） |
 
 ---
 

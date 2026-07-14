@@ -9,6 +9,23 @@
 > （HIGH-1 diff 行数、MED-4 guarded 计数、cv.wait 处数），补充两处遗漏
 > （MED-3 增补 `field_schema.hpp`；MED-1 增补 hnsw 重载路径与 data_file
 > 错误回退路径），修正 MED-2 的合并方案（须保留两种解码契约）。
+>
+> ---
+>
+> **Phase 4-5 修订（2026-07-14，本报告下半部分）**：
+> Phase 1-3（T1-T5）落地后进行 v2 深度审计（3 路深读 agent，~200 次工具调用）；
+> Phase 4（T6-T13）修复了 v2 标定的 1 HIGH + 3 MED + 多项 LOW；
+> Phase 5 在 Phase 4 完成后再次进行 4 路并行审计（3 explore + 1 librarian）。
+> 下半部分记录 v2 深度审计、Phase 4 修复落地、Phase 5 新发现三段。
+> **当前风险摘要见文末「Phase 5 风险摘要」表。**
+>
+> **Phase 5 复核修订（2026-07-14 三次核对）**：主 Agent 对 Phase 5 全部开放
+> 发现逐条重读代码复核。核心结论全部属实（P5-MEM-1/2、P5-DL-2/3、冗余残留
+> 项逐一确认仍在），但修正 4 处：① P5-MEM-1 使用点为 **7 处非 4 处**，且模式
+> 源自 S13-F2 而非 Phase 4 引入；② P5-MEM-2 **新增第三处漏点**（无索引池分支）；
+> ③ P5-DL-1 场景描述反了——等待发生在 ckpt_mu_ **临界区内**；④ P5-DL-3 升档：
+> 死代码 flush_upto 在 reducer 热路径上留有**每任务全局锁开销**。详见各小节
+> 内嵌的「复核修订」标注。
 
 ---
 
@@ -315,3 +332,336 @@ std::string comp_path(std::string_view dir) {
 **关键教训**：模式匹配式的静态扫描（grep / AST-grep）在规范化的代码库上误报率极高（本库 ~95%）；真正的判断必须依赖**对代码注释和所有权文档的阅读**。`keydir.cpp:1034-1045` 的无环证明是典型案例——agent 只看到 `shared_lock` + `lock_guard` 嵌套就报 HIGH，但注释里已有严格的不变量论证。
 
 未来在 CI 中引入 clang-tidy + 静态分析时，应同样配套**人工 review 通道**，避免告警泛滥稀释信号。
+
+---
+
+# Phase 4-5 修订（2026-07-14）
+
+本部分接续 v1/v2 内容。先记录 v2 深度审计的发现（驱动了 Phase 4 的 T6-T13
+修复），再追踪 Phase 4 修复落地情况，最后给出 Phase 5（post-Phase-4）审计
+的新发现。
+
+## v2 深度审计摘要（驱动 Phase 4）
+
+v2 在 T1-T5 落地后，针对异常路径做了逐调用链深读。**核心方法学升级**：
+"常态路径干净不等于异常路径干净"——bad_alloc/kNotReady/契约违反三类路径
+需要专项追踪不变量是否维持。
+
+### v2 发现（已被 Phase 4 处理）
+
+| 编号 | 严重度 | 描述 | Phase 4 处理 |
+|---|---|---|---|
+| MEM-MED-1 | MED（升档 HIGH） | Registry acquire/release 不配对——kNotReady 路径漏增 refcount，close 误减初始化方 refcount 至 0 并 erase，破坏 biggest_file_id 单调性（tombstone-resurrection 等价类） | ✅ T6（commit cc30b6c） |
+| DL-MED-1 | MED（升档 HIGH） | 四个 RunFn 提交点（run_serialized / 手动 ckpt / 自动 ckpt / merge）alloc_ord 与 submit 之间可抛 bad_alloc 泄漏 ord → reducer lane 永久空洞 → 进程级挂死 | ✅ T7（cc30b6c） |
+| DL-MED-2 | MED（升档 HIGH） | checkpoint() 的 done->wait(0) 无超时；IndexPool::submit 在 stopped_ 时静默丢弃任务，done 永不置位 → ckpt_mu_ 级联锁死 | ✅ T7（cc30b6c） |
+| DL-MED-3 | MED | prepare_search() 调用 flush_index()，谓词要求 in_flight==0 && applied>=hwm，持续写入下查询线程无界等待 | ⚠️ T8 初版 snapshot-hwm 方案在 4 测场景产生搜索漏召，已 revert；thread_pool.hpp 保留 flush_upto 工具方法供重新设计 |
+| MEM-LOW-1 | LOW | field_schema.hpp 裸 FILE* 在 bad_alloc 路径泄漏 fd（同仓库其他文件已改 unique_ptr） | ✅ T10（commit 8206aed，file_util.hpp 一并收口） |
+| RED-2 | MED | FileCloser 定义 9 份 + fopen/SEEK_END/fread 整读样板 6 份 + tmp+fsync+rename 原子写 ~7 处 | ✅ T10（8206aed + c4045e4） |
+| RED-4 | MED | 死代码 fill_get_result（零调用，被 view 版取代） | ✅ T9（commit 4dba518） |
+| RED-8 | SMALL | 死代码 to_codepoints_reuse（零调用） | ✅ T9（4dba518） |
+| RED-9 | SMALL | 建而未用 MmapRegion（T4 新建 RAII 基建，8 处 mmap 站点零采用） | ✅ T11（commit de448c4，整文件删除） |
+| RED-11 | SMALL | 死代码 detail::vbyte_append（零调用且与 codec::vbyte_encode 逐字相同） | ✅ T9（4dba518） |
+| DL 陷阱 6 | LOW | plugin_api.hpp 未明文禁止 reducer 上下文调用 run_serialized | ✅ T13（de448c4，注释固化契约） |
+
+### v2 已核实非问题（保留记录供后续审计复用）
+
+- C API 句柄生命周期、fd/mmap/FILE*/文件锁、线程、shared_ptr 循环引用、
+  epoch/延迟回收、search_arena never-destroyed 单例——逐点核对无发现
+- KeyDir barrier 内 meta→shard 反序：闸门协议 + shared-shared 相容，无环论证成立
+- IndexPool "任一时刻至多持一把锁"不变量：cv 通知配对正确
+- 组提交 follower 丢失唤醒：理论窗口被 wait_for 100µs 超时兜底
+- 读写锁升级、递归加锁、线程池自死锁——未发现
+
+---
+
+## Phase 4 落地清单（commit b0cda22 截止）
+
+| Commit | 内容 | 文件数 | 验证 |
+|---|---|---|---|
+| `cc30b6c` | T6 MEM-MED-1 + T7 DL-MED-1/2 | 2 | 641/641 ctest |
+| `4dba518` | T9 死代码清理（RED-4/8/11） | 3 | 641/641 ctest |
+| `8206aed` | T10①file_util.hpp + 头文件迁移（含 MEM-LOW-1） | 4 | 641/641 ctest |
+| `c4045e4` | T10②cpp 站点迁移 | 5 | 641/641 ctest |
+| `de448c4` | T11 删 MmapRegion + T13 plugin_api 契约注释 | 2 | 641/641 ctest |
+| `b0cda22` | docs: TASK.md 更新 | 1 | — |
+
+**未完成**：
+- T8 DL-MED-3：revert，待重新设计
+- T12 RED-1（HNSW ckpt 去重）：已精确审计，待独立分支（须向量三引擎测试门槛）
+- RED-3/5/6/7残/10/13：v2 残留冗余，未在 Phase 4 处理
+
+---
+
+## Phase 5 风险摘要（post-Phase-4 状态）
+
+| 维度 | 高危 | 中危 | 低危 | 总评 |
+|---|---|---|---|---|
+| 内存/异常安全 | **1**（P5-MEM-1） | 1（P5-MEM-2） | 2（P5-MEM-4/5） | ⚠️ HIGH 模式源自 S13-F2，Phase 4 扩散（复核修订） |
+| 死锁/并发 | 0 | 3（P5-DL-1/2/3，DL-3 复核升档） | 1（P5-DL-4） | ✅ 无实际死锁；偏离是模式非 bug |
+| 代码冗余 | 0 | 3（RED-1/5/6） | 4（RED-7残/10/13/NEW-P4） | ⚠️ 可清理 ~280 行；T10 收尾欠 1 处 |
+| Google Style | 0 | 0 | 3（C++23/std::expected/#pragma） | ✅ 表面合规优秀 |
+
+---
+
+## 七、Phase 5 — 内存与异常安全（1 HIGH + 1 MED）
+
+### 🔴 P5-MEM-1：OrdSkipGuard 析构在异常路径可触发 std::terminate()
+
+- **位置**：`include/bitcask/cask.hpp:1007-1012`；**7 个使用点**
+  `src/cask/cask.cpp:505 / 1060 / 1801 / 1877 / 2235 / 2469 / 2575`
+- **Phase 4 引入**：**否（复核修订）**——`cask.cpp:1877` 带注释 "S13-F2"，
+  noexcept 析构 + 可抛 submit 的模式**从 S13-F2 起即存在**于写路径 3 个使用点
+  （1060/1801/1877）；T7（cc30b6c）复制既有模式新增 4 个 RunFn 使用点
+  （505/2235/2469/2575）。v2 与初版审计均未捕获。修复在析构一处即覆盖全部 7 点
+- **触发条件**：`submit_index_task()` 抛 bad_alloc（TBB queue push 失败）
+- **场景**：
+  ```cpp
+  OrdSkipGuard og(this, ord);
+  // ... 任务构造 ...
+  c->submit_index_task(std::move(t));  // ← 可抛 bad_alloc
+  og.disarm();                          // ← 抛出则不到达
+  // 析构：~OrdSkipGuard() → armed==true → submit_index_task() 再抛 → terminate()
+  ```
+- **后果**：`std::terminate()` = 进程立即死亡，不可恢复。Linux overcommit 下
+  罕见但不可消除
+- **证据**：`~OrdSkipGuard()` 隐式 noexcept，但 `submit_index_task()`
+  调 `tbb::concurrent_bounded_queue::push` 非 noexcept
+- **修复方向**：析构内 `try { submit_index_task(...); } catch (...) { /* 记录 ord 泄漏，不抛 */ }`。
+  代价：极端 bad_alloc 下泄漏 1 个 ord（可恢复）；收益：避免 terminate（不可恢复）
+
+### 🟡 P5-MEM-2：checkpoint() 同步回退路径漏更新 last_ckpt_ord_
+
+- **位置（复核修订：三处漏点）**：
+  1. `src/cask/cask.cpp:2215-2224`（is_stopped 同步分支——注释声称
+     "synchronous path sets last_ckpt_ord itself"，与代码直接矛盾）
+  2. `:2311-2321`（无索引池分支，理论不可达但同样漏 store）——复核新增
+  3. merge 路径 `:2580-2601`（RunFn 与 else 两分支均漏；merge 后 rebase 全量
+     ckpt 已落盘却不推进水位 → 紧随的写入立刻触发一次冗余自动 ckpt）
+- **消费点核对**：`last_ckpt_ord_` 唯一消费点是自动 ckpt 阈值判断
+  （`cask.cpp:2456`）；store 点现仅 open（:284）与两个异步 RunFn 成功路径
+  （:2259/:2281/:2478）
+- **Phase 4 引入**：是（T7 DL-MED-2 修复的副作用；merge/无池分支属遗漏而非引入）
+- **问题**：注释自相矛盾
+  ```cpp
+  // DL-MED-2: ... 同步路径 sets last_ckpt_ord itself.   ← 注释如此声称
+  if (index_pool_->is_stopped()) {
+      ...
+      if (!save_search_ckpt_paired(...)) { return unexpected(...); }
+      // BUG: 缺少 last_ckpt_ord_.store(peek_next_ord, relaxed)
+      return {};
+  }
+  ```
+- **后果**：`last_ckpt_ord_` 是自动 ckpt 阈值的输入。漏更新 → 下次写时触发
+  冗余 ckpt（重复劳动 + 日志噪音）。非崩溃，非数据损坏
+- **修复方向**：成功路径加 `last_ckpt_ord_.store(keydir_->peek_next_ord(), std::memory_order_relaxed);`
+
+### 🟢 P5-MEM-3（核验否定）：field_schema wf.reset() 顺序问题
+
+agent 初版报告称 `wf.reset()` 在 fflush/fsync 之前导致 use-after-close。
+**直接核验代码顺序**：flush/sync 在 line 241-242（wf 存活），reset 在 line 244。
+**agent 误读了代码顺序**。✅ 安全。
+
+### 🟢 P5-MEM-4：checkpoint() 30s 超时后 RunFn 异步继续
+
+- **位置**：`src/cask/cask.cpp:2295-2309`
+- **性质**：**接受的 trade-off**（commit message 已说明）；调用方应处理
+  "先错后成功"语义
+
+### 🟢 P5-MEM-5：OrdSkipGuard::disarm() 非 atomic
+
+- **位置**：`include/bitcask/cask.hpp:1006`
+- **性质**：当前使用模式均为单线程（构造/disarm/析构在同一线程），技术上
+  非数据竞争。Google Style 建议加注释固化契约
+
+### 干净项（Phase 5 直接核验无问题）
+
+- ✅ **零** first-party `.release()` / `dynamic_cast` / `reinterpret_cast` /
+  `goto` / `using namespace std` / `std::endl` / 动态异常规格 / `NULL` 宏 /
+  `typedef`
+- ✅ 零 first-party `printf`/`scanf` 在 src/include（仅在 tools/ 合理）
+- ✅ T9 死代码删除：核验零残留引用
+- ✅ T11 mmap_handle.hpp 删除：核验零残留引用
+- ✅ T10 FilePtr 在 8 个迁移站点：`.get()` 使用均在 FilePtr 存活范围
+- ✅ T6 MEM-MED-1 修复：局部变量暂存 + 成功后 std::move 赋值——RAII 顺序正确
+- ✅ T7 DL-MED-2 shared_ptr by-value 捕获：lambda 持有副本，生命周期延长正确
+- ✅ FileCloser::operator() noexcept——unique_ptr 析构安全
+
+---
+
+## 八、Phase 5 — 死锁与并发（无实际死锁；2 项模式偏离）
+
+### 🟡 P5-DL-1：checkpoint() 持 ckpt_mu_ 后扩展到局部 done_mu 的 cv 等待
+
+- **位置**：`src/cask/cask.cpp:2203, 2229-2305`
+- **性质**：**非死锁**，但偏离 v2 thread-safety.md 文档化的"ckpt_mu_ 简单串行化"语义
+- **场景（复核修订：原描述反了）**：`ckpt_mu_` 是函数级 `lock_guard`
+  （`cask.cpp:2203`），30 秒 cv 等待（:2296-2301）发生在 ckpt_mu_
+  **临界区内**，且 WriteOpGate（:2197）同时持有——即「持锁 A 等待条件 B」
+  的嵌套等待，而非原文所述"在释放边界外等待"。后果：reducer 卡住时，
+  后续 checkpoint 调用者与 close()（经 WriteOpGate）最坏被拖满 30 秒
+- **为何不是死锁**：done_mu 是 per-call 局部 shared_ptr，无任何其他代码路径
+  获取它；且等待有 30s 超时上界
+- **为何仍是 MED**：偏离文档不变量；未来若 reducer 上下文错误调用 checkpoint()
+  会立即构成死环
+- **修复方向**：在 docs/design/thread-safety.md 补充记录此模式，或重构成
+  纯 atomic+超时（须等 C++26 的 atomic_wait_for 提案）
+
+### 🟡 P5-DL-2：reducer_loop 在 applied_ord 推进后立刻取 flush_mu_，紧接 dec_in_flight 又取
+
+- **位置**：`include/bitcask/thread_pool.hpp:653-657`
+- **性质**：**非死锁**（两次锁不重叠），但偏离"释放 A → 工作 → 取 B"的单锁文档模式
+- **场景**：
+  ```cpp
+  lane->applied_ord.store(...); ++lane->next_apply_ord;
+  { std::lock_guard fl(flush_mu_); flush_cv_.notify_all(); }  // 第一次取 flush_mu_
+  dec_in_flight(lane.get());                                   // 第二次取 flush_mu_
+  ```
+- **为何仍是 MED**：文档化的不变量是"任一线程任一时刻最多持一把锁"——这里两次
+  取同一锁违反"释放 → 工作"模式；未来误读此模式可能引入真锁序问题
+- **修复方向**：合并为单次 dec_in_flight 内部通知，或文档化此例外
+
+### 🟡 P5-DL-3：flush_upto() 死代码在 reducer 热路径留有每任务全局锁开销（复核升档 🟢→🟡）
+
+- **位置**：`thread_pool.hpp:447`（flush_upto 定义，零调用）；
+  `:653-656`（reducer_loop 每 apply 一个索引事件即取一次全局 `flush_mu_`
+  + `notify_all`，注释明示专为 flush_upto 的 applied_ord 推进通知服务）
+- **复核升档理由**：不只是死代码——常规 `flush()` 的唤醒已由 `dec_in_flight`
+  归零通知完全覆盖（applied_ord 在 dec 之前 store，谓词在 flush_mu_ 下检查，
+  无丢失唤醒窗口）。即 :653-656 是**纯开销**：reducer 每 apply 一个任务白付
+  一次全局 mutex 加锁 + notify_all
+- **修复方向**：删除 flush_upto + 连带删除 :653-656 通知块（动手前需确认
+  unregister_lib 等待路径不依赖 per-apply 通知），从"5 分钟标注"变为有实际
+  吞吐收益的清理项
+
+### 🟢 P5-DL-4：v2 的 15 组件审计未覆盖 S32 新增组件
+
+DiskANN/IVF/VectorDeltaLog/SearchCheckpoint/IndexManifest——未审计≠有 bug，
+但建议下轮专项覆盖
+
+### 已排除的疑点
+
+- ✅ `run_serialized` 在 reducer 上下文调用：grep 全部 caller（TextPlugin/
+  VectorPlugin 的 on_merge_commit）均在 merge 线程，不在 reducer。T13 文档
+  契约未被违反
+- ✅ `flush_cv_` 双 notify（applied_ord 推进 + in_flight==0）：谓词正确处理
+  spurious wake，无丢失唤醒
+
+---
+
+## 九、Phase 5 — 代码冗余（v2 残留 + Phase 4 新增）
+
+### v2 残留（Phase 4 未处理）
+
+| # | 项 | 位置 | 规模 | 状态 |
+|---|---|---|---|---|
+| RED-1 | HNSW flush() 与 SealedSegmentVectorPlugin flush() 逐字节相同 | `vector_plugin.cpp:511-555` vs `sealed_segment_vector_plugin.hpp:670-710` | ~90 行 | T12 待独立分支 |
+| RED-3 | 小端编解码三套并行 | `byte_order.hpp:14-48` vs `search_checkpoint.hpp:135-163` vs `index_manifest.hpp:75-99` | ~55 行 | 未处理 |
+| RED-5 | hnsw.cpp search_layer / search_layer_int8 成对复制 | `hnsw.cpp:846-910 / 952-1023` | ~130 行 | 未处理 |
+| RED-6 | IvfSegment::open vs DiskannSegment::open 骨架同构 | `ivf_rq.cpp:475-549` vs `diskann.cpp:472-569` | ~45 行 | 未处理 |
+| RED-7（残） | hnsw.cpp 仍有本地 pwrite_all，未消费 diskint::pwrite_all | `hnsw.cpp:1523-1536` vs `vec_disk_internal.hpp:25-37` | ~14 行 | T10 未覆盖 |
+| RED-10 | SnapCursor::vb() 与 codec::vbyte_read_checked 语义等价 | `keydir.cpp:1297-1307` | ~11 行 | 未处理 |
+| RED-12 | Manifest::min_chain_watermark 生产零调用（仅测试引用） | `index_manifest.hpp:61-65` | ~5 行 | 维持 |
+| RED-13 | c_api 错误翻译样板 ×16 | `bitcask_kv.cpp` 等 | ~32 行 | **有意保留**（C ABI 隔离代价） |
+
+### Phase 4 新增（已核验）
+
+| # | 项 | 位置 | 规模 |
+|---|---|---|---|
+| **NEW-P4-1** | field_schema.hpp 重复本地别名 ReadFilePtr/WriteFilePtr，等价于 detail::FilePtr | `field_schema.hpp:73, 230` | 2 行 |
+| **NEW-P4-2** | hnsw.cpp 未使用 diskint::pwrite_all（与 RED-7 残同根） | `hnsw.cpp:1523-1536` | ~14 行 |
+
+### 已核实非冗余（保留记录）
+
+- inverted 的 MSB-first FOR 与 segment_v2 的 LSB-first BitWriter 分属两个已定盘格式
+  （字节序相反），合并破坏兼容
+- `vbyte_decode`（无检查，热路径）与 `vbyte_read_checked`（带检查）双版本契约明确
+- bm25 三层已经 bm25_search_impl.hpp/walk_chain/SectionWriter 充分共享
+
+---
+
+## 十、Phase 5 — Google C++ Style 合规
+
+### 表面合规（直接工具核验，全部 ✅）
+
+- 零 first-party `goto` / `NULL` / `typedef` / 动态异常规格 / `using namespace std` / `std::endl`
+- 零 first-party `dynamic_cast` / `reinterpret_cast`（Google Style 限制 RTTI）
+- 零 first-party `.release()` on smart pointer（无所有权逃逸）
+- `.clang-tidy` 配置完备，关闭项均有文档化理由
+
+### 🟢 低危（有意识偏离，建议文档化）
+
+| # | 项 | Google Style | libbitcask 现状 | 评估 |
+|---|---|---|---|---|
+| GS-1 | C++ 版本 | C++20（C++23 features 禁用） | **C++23**（CMakeLists 强制） | 有意识偏离。独立项目非 Google 内部，可接受 |
+| GS-2 | std::expected | 禁用（C++23 特性） | 重度使用（103 处，10 文件） | 同上。是核心 API 设计支柱，不可回退 |
+| GS-3 | #pragma once vs #define 守卫 | 推荐 #define 守卫 | 全用 #pragma once | 主流编译器全支持，可接受 |
+| GS-4 | `<filesystem>` 头 | **禁用**（安全/可移植性） | 生产代码 **零使用**；15 处全在 tests/ | ✅ 合规 |
+
+### 2025 Google Style 更新（lib-bitcask 影响）
+
+- **PR #937**：`int* p` 而非 `int *p`——libbitcask 已合规
+- **PR #914**：模板参数命名规范——需专项审
+
+---
+
+## 十一、Phase 5 行动建议（按 ROI 排序）
+
+| # | 行动 | 对应发现 | 工作量 | ROI |
+|---|---|---|---|---|
+| 1 | **修 OrdSkipGuard 析构异常安全**（try-catch 包 submit；析构一处覆盖全部 7 使用点） | P5-MEM-1（HIGH） | 30 分钟 | 🔴 极高（消除 terminate 风险） |
+| 2 | **修 checkpoint 漏更新 last_ckpt_ord_**（三处：is_stopped 同步分支 / 无池分支 / merge 两分支） | P5-MEM-2（MED） | 15 分钟 | 🔴 高（消除冗余 ckpt 触发） |
+| 3 | **field_schema 去冗余别名 + hnsw.cpp 用 diskint::pwrite_all** | NEW-P4-1 + RED-7 残 | 30 分钟 | 🟡 中（T10 收尾） |
+| 4 | **删除 flush_upto + reducer_loop:653-656 每任务通知块**（需先确认 unregister 路径不依赖） | P5-DL-3（复核升档） | 1 小时 | 🟡 中（reducer 热路径去每任务全局锁） |
+| 5 | **thread-safety.md 文档化 done_mu/双-flush_mu_ 模式偏离** | P5-DL-1 + P5-DL-2 | 30 分钟 | 🟡 中（防回归） |
+| 6 | **RED-5 搜索内核模板化**（须基准测试） | v2-leftover | 1 天 | 🟡 中（-130 行，热路径） |
+| 7 | **RED-10 SnapCursor::vb 重构** | v2-leftover | 2 小时 | 🟢 低 |
+| 8 | **RED-6 IVF/DiskANN open 骨架抽取** | v2-leftover | 半天 | 🟢 低 |
+| 9 | **T12 HNSW ckpt 去重**（独立分支 + 三引擎测试门槛） | v2-leftover | 1 天 | 🟡 中 |
+
+---
+
+## 十二、Phase 5 — 验证方法学
+
+1. **4 路并行深读 agent**：内存安全（10m42s）、死锁/并发（5m45s）、
+   代码冗余（4m47s）、Google Style 最佳实践（2m29s，librarian）
+2. **主 Agent 直接工具核验**：grep 全树检查 9 类 Google Style 表面合规项
+   （goto/NULL/typedef/using namespace std/std::endl/dynamic_cast/
+   reinterpret_cast/.release()/printf in src），全部 ✅
+3. **关键发现交叉验证**：
+   - P5-MEM-1（OrdSkipGuard 析构）：主 Agent 重读 `cask.hpp:1007-1012` + 4 个
+     使用点逐个验证 armed 状态机
+   - P5-MEM-2（last_ckpt_ord_ 漏更新）：主 Agent 重读 `cask.cpp:2215-2224`
+     注释与代码逐行对比
+   - P5-MEM-3（agent 误报 fflush/fsync 顺序）：主 Agent 重读
+     `field_schema.hpp:240-249` 否定 agent 结论
+4. **Phase 4 commit 逐一审计**：cc30b6c / 4dba518 / 8206aed / c4045e4 / de448c4
+   每个 commit 的 diff 均经过内存 agent 深读
+
+**核心教训（Phase 5 新增）**：
+
+1. **"修一处带一处"是修复阶段的经典风险**：OrdSkipGuard 是 T7 的核心 fix，
+   其析构却是新引入的 terminate 风险。RAII guard 的析构默认 noexcept，但调用
+   了可抛的 submit。**根因：析构异常安全未在 review checklist 中**
+2. **表面合规≠深层语义安全**：所有表面 idiom 检查全过，但异常路径不变量、
+   文档化锁序模式偏离仍可被深读发现
+3. **agent 也会误报**：P5-MEM-3（fflush/fsync 顺序）是 agent 误读代码顺序
+   的典型案例。**主 Agent 必须复核关键 HIGH/MED 发现，不能全盘接受 agent 输出**
+4. **Phase 4 → Phase 5 的最大价值是发现了共同盲区**：v2 不审异常路径不变量；
+   Phase 4 修复时也未审"修复本身的异常安全"。下一轮（Phase 6）应建立
+   "修复后回归审计"制度——每个修复 commit 必须经异常安全专项 review
+
+---
+
+## 十三、协议盲区（Phase 6 候选）
+
+报告聚焦资源管理与并发，但 **Bitcask 协议正确性维度存在系统性盲区**——
+basho/bitcask 生产史上最严重 bug 的来源。建议 Phase 6 专项审计：
+
+1. **🔴 Tombstone/Merge 语义正确性**（basho #82 删除复活类、#149/174/175
+   merge 竞态）
+2. **🟠 fsync/fdatasync 纪律审计**（WAL 持久性、meta/ckpt 原子性、backup 一致点）
+3. **🟠 Lock 文件健壮性**（空文件、PID 复用、disk-full 失败传播）
+4. **🟡 CRC 回退路径完整性**（hint 失败回退扫描时是否做 CRC 校验）
+
+这些是真正的 Bitcask 协议正确性问题，远比资源管理更危险。资源管理修复
+（Phase 1-5）让代码库的"骨架"健康；Phase 6 应专注于"灵魂"。
