@@ -283,7 +283,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 │  │   三引擎按 meta.vector_engine 选定；归一化/vec.ckpt 族 + .vec/.qc8 侧车）│
 │  ├─ HybridSearcher（RRF 融合器；持两插件引用）                     │
 │  ├─ CaskPluginHost（read_at / run_serialized / log 窄反向接口）    │
-│  ├─ MetaConfig（bitcask.meta v2：magic + version + CRC32）         │
+│  ├─ MetaConfig（bitcask.meta v3：magic + version + CRC32）         │
 │  └─ IndexPool（异步索引 MapReduce，借自 KeyDirRegistry）           │
 └────────────────────────────┬────────────────────────────────────────┘
                                │
@@ -326,7 +326,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 ├── c_api/             # libbitcask.so 的 C ABI（bitcask_kv / text / vec + 聚合 bitcask_c.h）
 ├── src/               # 实现：fileops / io / lock / keydir / merge /
 │                      #       cask / search / bm25 / text / vector
-├── tests/             # GoogleTest 单元 + 集成测试（32 个测试二进制）
+├── tests/             # GoogleTest 单元 + 集成测试（35 个测试二进制）
 ├── bench/             # Google Benchmark（keydir / cask / inverted / hnsw …）
 ├── tools/             # migrate_le、gen_inert_table
 ├── cmake/             # BitcaskSanitizers 模块 + tsan.supp

@@ -60,6 +60,59 @@
 
 ## [Unreleased]
 
+### Fixed（Phase 5/6 深度审计：资源泄漏 / 进程挂死 / 持久性，2026-07-15）
+
+三路深读 agent + 对抗复核（推翻 1 项、细化 2 项触发窗口、亲验
+fdatasync / reinterpret_cast 关键断言）。基线 641/641 ctest，落地后
+ASan **644/644** + TSan 全量零告警。
+
+- **P6-MEM-1 + P6-DL-1（进程级永久挂死，两条独立进入路径同一点）**：
+  `IndexPool::submit` 先 `in_flight.fetch_add` 再 `queue_.push`（TBB
+  有界队列分配可抛 bad_alloc），抛出即泄漏计数 → `flush()` 谓词永假。
+  加上 `close()` 的 30s 逃生门后紧接 `unregister_lib` 无超时 `flush()`，
+  逃生门被 25 行后的等待抵消。**修复**：submit 的 push 套 try/catch、
+  catch 内 `dec_in_flight(lane)` 后重抛（照抄既有补偿）；`flush` 加
+  `optional<ms>` 超时参数，拆卸路径 `unregister_lib` 传 30s（搜索读
+  屏障语义不变——超时只上在拆卸路径，不做全局）；超时路径归还 ring
+  占用的全局名额防池损坏。
+- **P6-MEM-2**：`RowChunks::ensure_slot` 用 `unique_ptr` 暂存再
+  `release`，防 `push_back` 抛出时已分配槽泄漏。
+- **P6-MEM-3**：`MmapSegment::open` 的 `new` 提至 `::open` **之前**
+  （非 RISK_REPORT 建议的 mmap 之前——fd 已在手、close 在 mmap 之后，
+  提到 mmap 前仍漏 fd；提到 open 前才无窗口，new 是本函数唯一抛出点）。
+- **P6-DUR-1（持久性）**：`hnsw.cpp` 三处 FILE* 原子写
+  （`save` / `save_vec_payload` / `write_bcq8`）rename 前补
+  `fflush` + `::fdatasync(::fileno(f))` 且**两个返回值都检查**
+  （disk-full 下 fflush 失败而 fdatasync 对已落盘部分成功 → 静默
+  rename 出半截文件）。此前全库 9 站点中 6 个遵守 sync 纪律、唯独
+  hnsw 这 3 处无任何 sync——崩溃后旧好文件已被 rename 覆盖。
+- **P5-MEM-1**：`OrdSkipGuard` 析构 try-catch 防 `std::terminate`
+  （析构期间 predicate 抛出）。
+- **P5-MEM-2**：`last_ckpt_ord_` 三处漏更新（checkpoint 水位推进
+  不一致）。
+- **P5-DL-3**：删除死代码 `flush_upto`（无引用）+ reducer 每任务
+  通知块（`flush_cv_` 仅剩 `dec_in_flight` 1→0 单点 notify，恢复
+  方法体谓词也无人唤醒）。
+
+### Changed（Phase 5/6 深度审计：冗余收敛 / 死代码，2026-07-15）
+
+- **file_util.hpp 归并（T21，P6-RED-1/2）**：新增 `read_file_bytes`
+  + `atomic_write_bytes` + `AtomicFileWriter` RAII（header-only
+  inline，33 → 175 行）。整读 ×6 站点 + 原子写 ×9 站点归并；**fsync
+  纪律从 4 套收敛为 1 套**（fflush 与 fdatasync 两个返回值都检查；
+  field_schema 的 `::fsync` → `fdatasync`）。刻意不做目录 fsync
+  全面铺开——保持纯重构，留 Phase 7 专项。~100 行回收。
+- **Analyzer 双出口归并（T22，P6-RED-4）**：抽 `ngram_collect`
+  （含全部过滤语义）+ `materialize_and_filter` + `whitespace_tokenize`，
+  把 S29-8 注释断言「term 集与 tf 值逐位一致」变成 **+3 对拍测试**
+  （覆盖 CJK/拉丁/混排/标点 + 停用词 + min/max 参数矩阵），**经变异
+  测试验证有效**（三种单边分叉全抓）。明确否决 Jieba 先例的物化 token
+  向量——会抵消 S29-8 的全部收益。
+- **本地别名收口（T17）**：`field_schema` + `hnsw` 消除本地 `FilePtr`
+  / `pwrite_all` 别名（T10 RED-2 真正收尾）。
+- **死代码清理（T25，P6-RED-6）**：删 `ends_with_vowel` /
+  `newest_folder_epoch_` / `kValueSizeOverflow`（全树仅定义零读）。
+
 ### Changed（S24：key 快照扁平化 + vocab 增量化 + shim 收缩首批，2026-07-06）
 
 - **fold/scan key 快照扁平化**：keydir 迭代快照与 `drain_live_keys` 从
