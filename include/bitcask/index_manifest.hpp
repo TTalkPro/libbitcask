@@ -157,32 +157,13 @@ deserialize_manifest(const std::byte* raw, std::size_t len) {
 // S20-3 B-B1：FILE* 走 RAII。RED-2 归并后统一用 bitcask::detail::FilePtr
 // （原 manifest_io 命名空间是为避免与 field_schema 撞名而存在——单一真相源
 // 后已无必要）。
-inline void fsync_directory_of(const std::string& path) {
-    std::filesystem::path parent = std::filesystem::path(path).parent_path();
-    if (parent.empty()) parent = ".";
-    int fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
-    if (fd >= 0) { ::fsync(fd); ::close(fd); }
-}
-
+// T21：原子写归 detail::atomic_write_bytes。manifest 是**唯一 commit 点**，
+// 故 fsync_dir=true（rename 本身也须持久，否则断电后组件已落盘而 manifest
+// 的目录项丢失）。原实现丢弃 fdatasync 返回值——归并后统一检查（disk-full
+// 下不再静默 rename 出半截 manifest）。
 [[nodiscard]] inline bool write_manifest(const std::string& path, const Manifest& m) {
     auto buf = serialize_manifest(m);
-    const std::string tmp = path + ".tmp";
-
-    detail::FilePtr f(std::fopen(tmp.c_str(), "wb"));
-    if (!f) return false;
-    const bool wrote =
-        std::fwrite(buf.data(), 1, buf.size(), f.get()) == buf.size();
-    std::fflush(f.get());
-    if (wrote) ::fdatasync(::fileno(f.get()));
-    f.reset();  // 显式 close（须在 rename 前 flush OS 缓冲）
-    if (!wrote) { std::remove(tmp.c_str()); return false; }
-
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        return false;
-    }
-    fsync_directory_of(path);
-    return true;
+    return detail::atomic_write_bytes(path, buf, /*fsync_dir=*/true);
 }
 
 [[nodiscard]] inline std::optional<Manifest>

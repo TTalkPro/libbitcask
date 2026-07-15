@@ -35,7 +35,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <unistd.h>  // ::fsync / ::fileno（升级时 rename 前的持久化屏障）
 
 #include "bitcask/byte_order.hpp"
 #include "bitcask/codec.hpp"
@@ -224,27 +223,22 @@ private:
     // 崩溃安全：fsync 后再 rename，故要么旧文件完好（下次 open 重试升级），要么新文件完整。
     // 返回 false = 无法写（只读目录/IO 失败）→ caller 退回 legacy 追加。
     bool upgrade_legacy_to_new_() {
-        const std::string tmp = path_ + ".upgrade.tmp";
-        // MEM-LOW-1：encode_entry_ 内的 string 构造可抛 → 裸 wf 跳过 fclose。
-        detail::FilePtr wf{std::fopen(tmp.c_str(), "wb")};
-        if (!wf) return false;
-        std::FILE* raw = wf.get();
-        bool ok = write_header_(raw);
+        // T21：原子写归 detail::AtomicFileWriter（tmp 后缀保留 .upgrade.tmp 的
+        // 诊断价值）。MEM-LOW-1：encode_entry_ 内的 string 构造可抛——writer
+        // 析构负责 fclose + 清 tmp，异常路径不留垃圾。
+        // 原用 ::fsync，归并后统一 fdatasync：新文件的尺寸元数据属于「取回
+        // 数据所必需」，fdatasync 同样保证，差别只在 mtime（无人依赖）。
+        detail::AtomicFileWriter w(path_, ".upgrade.tmp");
+        if (!w) return false;
+        std::FILE* raw = w.get();
+        if (!write_header_(raw)) return false;
         for (const auto& name : id_to_name_) {
-            if (!ok) break;
             const auto buf = encode_entry_(name);
-            ok = std::fwrite(buf.data(), 1, buf.size(), raw) == buf.size();
+            if (std::fwrite(buf.data(), 1, buf.size(), raw) != buf.size()) {
+                return false;
+            }
         }
-        if (ok) {
-            std::fflush(raw);
-            ::fsync(::fileno(raw));  // 数据落盘后才允许 rename 覆盖
-        }
-        wf.reset();  // fclose 在 rename 前完成（Linux rename 不要求 fd 关闭，但 fsync 已保数据）
-        if (!ok || std::rename(tmp.c_str(), path_.c_str()) != 0) {
-            std::remove(tmp.c_str());
-            return false;
-        }
-        return true;
+        return w.commit();
     }
 
     mutable std::shared_mutex mu_;

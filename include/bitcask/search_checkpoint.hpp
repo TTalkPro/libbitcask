@@ -25,7 +25,6 @@
 #include <string_view>
 #include <vector>
 
-#include <unistd.h>  // S21-2 A4: fdatasync
 
 #include "bitcask/codec.hpp"  // crc32
 #include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
@@ -207,27 +206,12 @@ public:
                    reinterpret_cast<const std::byte*>(kCkptMagic),
                    reinterpret_cast<const std::byte*>(kCkptMagic) + 4);
 
-        const std::string fp(path);
-        const std::string tmp = fp + ".tmp";
-        std::unique_ptr<std::FILE, ::bitcask::detail::FileCloser> f(std::fopen(tmp.c_str(), "wb"));
-        if (!f) return false;
-        bool wrote =
-            std::fwrite(buf.data(), 1, buf.size(), f.get()) == buf.size();
         // S21-2 A4：rename 前 fdatasync（对齐 write_manifest）。manifest 是唯一
         // commit 点且自带目录 fsync；但组件文件本身不落盘的话，断电后 manifest
         // 已提交而组件页丢失 → CRC 坏 → 整组件退全量 fold，checkpoint 的启动
         // 加速在断电场景整体失效。fdatasync 把「组件数据先于 manifest 落盘」
-        // 变成保证而非运气。
-        if (wrote) {
-            std::fflush(f.get());
-            wrote = ::fdatasync(::fileno(f.get())) == 0;
-        }
-        f.reset();  // close before rename
-        if (!wrote || std::rename(tmp.c_str(), fp.c_str()) != 0) {
-            std::remove(tmp.c_str());
-            return false;
-        }
-        return true;
+        // 变成保证而非运气。（T21 起纪律由 atomic_write_bytes 统一承载。）
+        return ::bitcask::detail::atomic_write_bytes(std::string(path), buf);
     }
 
     // S14-3:只载入 want(type) 选中的段——段级 dirty-bit 前移用（干净段原
@@ -323,19 +307,10 @@ public:
     [[nodiscard]] static std::optional<LoadedCheckpoint>
     read(std::string_view path) {
         using namespace detail;
-        std::unique_ptr<std::FILE, ::bitcask::detail::FileCloser> f(
-            std::fopen(std::string(path).c_str(), "rb"));
-        if (!f) return std::nullopt;
-        std::fseek(f.get(), 0, SEEK_END);
-        const long fsz = std::ftell(f.get());
-        std::fseek(f.get(), 0, SEEK_SET);
-        if (fsz < static_cast<long>(kHeaderLen + kTrailerLen)) {
-            return std::nullopt;
-        }
-        std::vector<std::byte> buf(static_cast<std::size_t>(fsz));
-        const bool rd =
-            std::fread(buf.data(), 1, buf.size(), f.get()) == buf.size();
-        if (!rd) return std::nullopt;
+        auto buf_opt = ::bitcask::detail::read_file_bytes<>(std::string(path));
+        if (!buf_opt) return std::nullopt;
+        const auto& buf = *buf_opt;
+        if (buf.size() < kHeaderLen + kTrailerLen) return std::nullopt;
 
         const std::byte* base = buf.data();
         const std::size_t n = buf.size();
