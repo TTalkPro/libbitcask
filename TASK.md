@@ -209,6 +209,35 @@ index_manifest / segment_v2 ×2 / field_schema / hnsw ×3）。
 - **验收**：641/641 ctest + text 套件重点回归 + 4a 的对拍测试
 - **优先级**：🟡 中（4a 是"等着被踩的雷"——过滤语义单边修改即静默分叉）
 
+#### ✅ T22 落地记录（2026-07-15）
+
+**4b（WhitespaceAnalyzer）**：抽 `whitespace_tokenize(cps, normalized,
+min_len, max_bytes, sink)`，两个出口各剩 ~8 行。**未照搬 Jieba
+collect_tokens 的物化 token 向量**——直接回调省一次中间分配（Jieba 那样做
+可接受是因为词数少；见 4a 的理由）。
+
+**4a（NgramAnalyzer）**：抽 `ngram_collect`（含**全部过滤语义**）+
+`materialize_and_filter`（含物化与停用词）。tf 版 sink 忽略 pos 形参 →
+**零 positions 分配，S29-8 的性能取舍完整保留**。
+**明确否决 Jieba 先例**：物化 token 向量会抵消 S29-8 的全部收益——一篇
+CJK 文档数千个 n-gram，正是该覆写存在的理由。
+
+**对拍测试**（`tests/analyzer_test.cpp`，+3 测试 ~95 行）：把 S29-8 注释里
+「term 集与 tf 值逐位一致」的断言变成可执行断言——覆盖 ngram_tokenize 每条
+分支（CJK/拉丁/空白/CJK 标点/ASCII 标点/混排/重复/单字/纯标点/空输入）、
+停用词、以及 min_token_length × max_token_bytes 的 3×3 参数矩阵。
+额外断言 `tf == positions.size()`（positions 版自身一致性）。
+
+**变异测试验证测试有效性**（"在正确代码上通过"不等于"抓得住回归"）：
+注入三种单边分叉——① tf 版多一条过滤、② positions 版多一条过滤、
+③ tf 版 min_token_length 门槛 off-by-one——**新对拍三种全抓**。
+诚实记录：三种变异**旧测试也各抓到 1 个**，故新测试的增量不是"从 0 到 1"，
+而是①直接定位分叉点（旧测试只报某个具体值不符）②覆盖旧测试没有的 9 组
+参数矩阵③即使将来有人重新拆开两版也立刻失败。变异残留已确认清零。
+
+- **验收**：ASan **644/644** ✅（641 基线 + 3 新测试）| TSan 642/642 零告警 ✅
+  | Debug/ASan/TSan/Release 四树编译，analyzer 零新告警 ✅
+
 ### T23 — P6-RED-3：ChunkedReader 归并 refill ×3 🟡 MED
 
 `hint_file.cpp:143-173 / :244-267`、`data_file.cpp:309-335` 三份 refill,
@@ -312,7 +341,7 @@ RED-10（SnapCursor::vb,价值低）。
 | T19 flush 有界等待 + submit 补偿 | ✅ done（含 P6-MEM-2/3;两处计划偏离见落地记录） |
 | T20 hnsw fdatasync ×3 | ✅ done（ASan hnsw/vector/segment 105/105） |
 | T21 read_file_bytes + AtomicFileWriter | ✅ done（整读 ×6 + 原子写 ×9 归并;四套 fsync 纪律收敛为一） |
-| T22 Analyzer 双出口 ×2 | 🟡 待做 |
+| T22 Analyzer 双出口 ×2 | ✅ done（4a+4b 归并;+3 对拍测试,经变异测试验证有效） |
 | T23 ChunkedReader | 🟡 待做 |
 | T24 decode_rec 模板 | 🟢 待做 |
 | T25 死代码 7 行 | ✅ done（ends_with_vowel / newest_folder_epoch_ / kValueSizeOverflow） |
