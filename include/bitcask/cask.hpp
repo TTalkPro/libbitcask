@@ -1001,8 +1001,15 @@ private:
     // submit_index_task→queue_.push（TBB 有界队列内部分配）均可抛 bad_alloc。
     // 若在栈回退（另一异常正在传播，如 submit 首次抛出触发本 guard 析构）中
     // 再次抛出，直接 std::terminate。此处吞掉分配异常：代价是极端 OOM 下泄漏
-    // 该 ord（可恢复——checkpoint/close 走 30s 超时路径而非永久挂死），
-    // 收益是避免不可恢复的进程终止。
+    // 该 ord，收益是避免不可恢复的进程终止。
+    //
+    // P6-MEM-1 修正：原注释称该泄漏「可恢复——checkpoint/close 走 30s 超时
+    // 路径」，**对 ord 成立，但当时漏了 in_flight**——首次抛出的那次
+    // submit 已递增 in_flight（IndexPool::submit 内 push 之前），本 catch
+    // 救不了它，而 close 路径的 flush 当时无超时 → 永久挂死。现已双向闭合：
+    // ① IndexPool::submit 自身补偿 dec_in_flight 后重抛（根因）；
+    // ② unregister_lib 的 flush 有界 30s（兜底）。故此处泄漏的 ord 只在
+    // reducer 留一个空洞，不再阻塞拆卸。
     struct OrdSkipGuard {
         Cask* cask;
         std::uint64_t ord;

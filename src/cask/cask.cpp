@@ -683,7 +683,15 @@ void Cask::close() noexcept {
         // 保证 search_ 析构前本 lane 的 reduce 闭包已不再被 reducer 调用。
         // 整池停在 registry 析构。
         if (index_pool_ && index_lane_) {
-            index_pool_->unregister_lib(index_lane_);
+            // P6-DL-1：unregister_lib 内含 30s 有界 flush。超时 = 索引车道未
+            // 排空（写线程被 kill 于 submit 中途，或 in_flight 泄漏）——此时
+            // lane 仍被 erase，与在途 map worker 可能竞态。取舍同上方
+            // writes_in_flight_ 逃生门（S25-T1）：潜在 UAF 优于永久挂死。
+            if (!index_pool_->unregister_lib(index_lane_)) {
+                log_error("close: index lane not drained after 30s — "
+                          "proceeding with teardown (potential UAF risk; "
+                          "index may be incomplete)");
+            }
             index_lane_ = nullptr;
             index_pool_ = nullptr;  // 仅清借用指针，不动共享池本体
         }

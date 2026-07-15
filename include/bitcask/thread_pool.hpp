@@ -31,6 +31,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>  // P6-DL-1: unregister_lib 的有界 flush
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -377,6 +378,10 @@ public:
     IndexPool(const IndexPool&) = delete;
     IndexPool& operator=(const IndexPool&) = delete;
 
+    // P6-DL-1：拆卸路径 flush 上界。与 Cask::close 第一段（S25-T1）及
+    // checkpoint（T7）的 30s 同款量级——三者串在同一条 close 链上。
+    static constexpr std::chrono::seconds kUnregisterFlushTimeout{30};
+
     // ===== S6-P3: 多 lib 共享池 API =====
 
     // 注册一条库车道：注入回调 + reorder buffer 起始 ord，返回稳定句柄。
@@ -404,11 +409,21 @@ public:
 
     // 注销一条库车道：先 flush 排空（保证 in_flight==0 ⇒ 队列/reorder 中
     // 无引用本 lane 的任务），再从 lanes_ 移除。不停池（其它库仍在用）。
-    void unregister_lib(IndexLane* lane) {
-        if (!lane) return;
-        flush(lane);
+    //
+    // P6-DL-1：flush 在此**有界**（30s）。无界版会让 Cask::close 的 30s 逃生
+    // 门（S25-T1）形同虚设——写线程若在 in_flight++（submit 内）与 push 返回
+    // 之间被 kill，writes_in_flight_ 与 lane->in_flight **双双**卡住，close
+    // 第一段超时放行后立刻挂死在本函数的 flush 上。队列满时 push 阻塞会显著
+    // 拉长该窗口。
+    // 返回 false = 超时未排空：此时 erase 与在途 map worker 的 task.lane 可能
+    // 竞态（UAF）。沿用 S25-T1 既定取舍——接受潜在 UAF 优于进程永久挂死；
+    // 由调用方记录日志（本头在 Cask 之下，无 log 设施）。
+    [[nodiscard]] bool unregister_lib(IndexLane* lane) {
+        if (!lane) return true;
+        const bool drained = flush(lane, kUnregisterFlushTimeout);
         std::lock_guard<std::mutex> lk(reorder_mu_);
         lanes_.erase(lane->id);
+        return drained;
     }
 
     // 提交任务到指定车道。背压由有界队列提供（满则 push 阻塞 put 线程）。
@@ -416,7 +431,8 @@ public:
         if (!lane || stopped_.load(std::memory_order_acquire)) return;
         // RebuildHnsw 携带 ord（merge 路径 alloc_ord），纳入 hwm 跟踪；
         // Sentinel 不携带 ord，跳过（且 Sentinel 不走本路径）。
-        if (task.op != IndexOp::Sentinel) {
+        const bool tracked = task.op != IndexOp::Sentinel;
+        if (tracked) {
             auto prev = lane->submitted_ord_hwm.load(std::memory_order_relaxed);
             while (task.ord > prev &&
                    !lane->submitted_ord_hwm.compare_exchange_weak(
@@ -428,18 +444,42 @@ public:
             lane->in_flight.fetch_add(1, std::memory_order_relaxed);
         }
         task.lane = lane;
-        queue_.push(std::move(task));
+        try {
+            queue_.push(std::move(task));
+        } catch (...) {
+            // P6-MEM-1：TBB 有界队列 push 内部分配可抛 bad_alloc。in_flight
+            // 已在上方递增，抛出即永久泄漏该计数（全类仅两处 dec：ring_put
+            // 拒收补偿与 reducer apply，均不覆盖本窗口）→ flush() 谓词
+            // in_flight==0 永假 → close()/~Cask 挂死。补偿后重抛，模式同
+            // push_reorder 的拒收补偿。tracked 在 move 前取——move 后不得读
+            // task.op。
+            if (tracked) dec_in_flight(lane);
+            throw;
+        }
     }
 
     // 等待指定车道追平：该 lane 全部已 submit 的索引事件已完全 apply。
-    void flush(IndexLane* lane) {
-        if (!lane) return;
-        std::unique_lock<std::mutex> lk(flush_mu_);
-        flush_cv_.wait(lk, [lane] {
+    //
+    // timeout=nullopt（默认）为**无界**等待——搜索读屏障（Cask::flush_index →
+    // prepare_search）依赖此语义：谓词含 in_flight==0，它同时兼任索引可见性
+    // 屏障，有界化会让 prepare_search 静默返回未排空的索引 → 漏召（T8 初版
+    // 即栽在此，根因未定位前不得放宽，见 TASK.md T8）。
+    // 传入 timeout 则有界等待，返回 false 表示超时未排空（拆卸路径专用，
+    // 见 unregister_lib）。
+    bool flush(IndexLane* lane,
+               std::optional<std::chrono::milliseconds> timeout = std::nullopt) {
+        if (!lane) return true;
+        auto drained = [lane] {
             return lane->in_flight.load(std::memory_order_acquire) == 0
                 && lane->applied_ord.load(std::memory_order_acquire) >=
                    lane->submitted_ord_hwm.load(std::memory_order_acquire);
-        });
+        };
+        std::unique_lock<std::mutex> lk(flush_mu_);
+        if (!timeout) {
+            flush_cv_.wait(lk, drained);
+            return true;
+        }
+        return flush_cv_.wait_for(lk, *timeout, drained);
     }
 
     // ===== 向后兼容 facade（单 lane；现有测试 + 单元基准用）=====
@@ -453,7 +493,7 @@ public:
                                      std::move(error_fn), pending_initial_ord_);
     }
     void submit(IndexTask task) { submit(default_lane_, std::move(task)); }
-    void flush() { flush(default_lane_); }
+    void flush() { (void)flush(default_lane_); }  // 无界，语义同上
 
     // 停整池（registry 析构 / facade 测试收尾）。所有库车道都被排空。
     void stop() {
