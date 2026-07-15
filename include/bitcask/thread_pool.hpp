@@ -359,17 +359,27 @@ inline constexpr std::size_t kDefaultReorderInflightCap = 16384;  // reorder 在
 // === RAII / 生命周期（criterion 4，已审计）===
 // 线程：ensure_started 建，stop() join（幂等，CAS stopped_），~IndexPool 调 stop()
 // ⇒ 线程必被 join，无 detach 泄漏。lane：lanes_ 持 shared_ptr，reducer apply 前拷
-// 活防 UAF；unregister_lib 先 flush（in_flight==0 ⇒ 无在途引用）再 erase。
+// 活防 UAF；unregister_lib 先 flush 再 erase。
+// ⚠ P6-DL-1 起 unregister_lib 的 flush **有界**（30s），故「flush 返回 ⇒
+// in_flight==0 ⇒ 无在途引用」**不再恒成立**：超时路径下 erase 与在途 map
+// worker 的 task.lane 存在竞态（已知取舍，见 unregister_lib 注释），且必须
+// 显式归还该 lane 未 apply entry 占用的 reorder_inflight_ 名额。
 class IndexPool {
 public:
     // S6-P4: concurrency = map worker 线程数（真数据并行：N 个 worker 从 queue
     // 并发拉取跑 map_analyze）。reorder_cap = 全局 reorder buffer 在途上限
     // （背压：达上限 map worker 停 pop → queue 满 → put 阻塞；防 OOM，D4）。
+    // unregister_flush_timeout 可注入：默认 30s（与 close/checkpoint 同量级），
+    // 测试注入毫秒级以覆盖超时路径——该路径是 P6-DL-1 复审揪出 ring 名额泄漏
+    // 的地方，30s 硬编码曾是它无法被测的唯一原因。
     explicit IndexPool(int concurrency = 1,
                        std::size_t queue_capacity = kDefaultIndexQueueCapacity,
-                       std::size_t reorder_cap = kDefaultReorderInflightCap)
+                       std::size_t reorder_cap = kDefaultReorderInflightCap,
+                       std::chrono::milliseconds unregister_flush_timeout =
+                           kUnregisterFlushTimeout)
         : map_concurrency_(concurrency > 0 ? concurrency : 1)
         , reorder_cap_(reorder_cap)
+        , unregister_flush_timeout_(unregister_flush_timeout)
         , queue_(queue_capacity)
     {}
 
@@ -418,11 +428,27 @@ public:
     // 返回 false = 超时未排空：此时 erase 与在途 map worker 的 task.lane 可能
     // 竞态（UAF）。沿用 S25-T1 既定取舍——接受潜在 UAF 优于进程永久挂死；
     // 由调用方记录日志（本头在 Cask 之下，无 log 设施）。
+    //
+    // ⚠ 超时路径必须归还 ring 名额（P6-DL-1 复审补）：`reorder_inflight_` 是
+    // **池全局**背压计数，只在 push_reorder 加、只在 reducer apply 后减；而
+    // ring 是 lane 成员，erase 即析构。有界化之前 flush 无界 ⇒ 返回时 ring 必
+    // 空 ⇒ erase 不泄漏；有界化之后超时即 ring 非空，若直接 erase，那 K 个名额
+    // **永久**泄漏。池由 registry 跨库共享（Cask::close 只清借用指针不停池），
+    // 故泄漏会拖垮同进程**其它库**的索引——比本函数认下的 UAF 取舍更糟：
+    // 那个有界且概率性，这个确定、永久、跨库。
     [[nodiscard]] bool unregister_lib(IndexLane* lane) {
         if (!lane) return true;
-        const bool drained = flush(lane, kUnregisterFlushTimeout);
-        std::lock_guard<std::mutex> lk(reorder_mu_);
-        lanes_.erase(lane->id);
+        const bool drained = flush(lane, unregister_flush_timeout_);
+        {
+            std::lock_guard<std::mutex> lk(reorder_mu_);
+            if (!drained && lane->ring_count != 0) {
+                // 归还未 apply 的 entry 占用的全局名额，并唤醒被背压挡住的
+                // map worker（reorder_cap_ 是硬等待条件，非软提示）。
+                reorder_inflight_ -= lane->ring_count;
+                map_cv_.notify_all();
+            }
+            lanes_.erase(lane->id);
+        }
         return drained;
     }
 
@@ -529,6 +555,14 @@ public:
 
     bool is_stopped() const {
         return stopped_.load(std::memory_order_acquire);
+    }
+
+    // 测试用：读池全局 reorder 在途计数。P6-DL-1 回归断言直接查这个不变量
+    // ——「所有 lane 注销后计数必归零」，比经背压卡死做端到端推断可靠得多
+    // （单轮泄漏量 < reorder_cap_ 时不足以卡死，端到端断言会漏报）。
+    [[nodiscard]] std::size_t reorder_inflight_for_test() {
+        std::lock_guard<std::mutex> lk(reorder_mu_);
+        return reorder_inflight_;
     }
 
     IndexTaskQueue&       queue()       { return queue_; }
@@ -756,6 +790,7 @@ private:
     // reorder_mu_ 保护。push 时 ++，apply 后 --；达 cap 时 map worker 停 pop。
     std::size_t                      reorder_inflight_ = 0;
     const std::size_t                reorder_cap_;
+    const std::chrono::milliseconds  unregister_flush_timeout_;
 
     // 控制
     std::atomic<bool>                stopped_{false};

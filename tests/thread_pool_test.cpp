@@ -742,3 +742,106 @@ TEST(IndexPoolMultiLib, ReorderBackpressureBoundsMemoryThenDrains) {
 }
 
 }  // namespace
+// ===========================================================================
+// P6-DL-1 复审：unregister_lib 超时路径
+//
+// T19 把 unregister_lib 的 flush 从无界改为有界(30s)，为的是不让 Cask::close
+// 的 30s 逃生门形同虚设。但有界化**打破了原本使 erase 安全的不变量**——
+// 无界 flush 返回 ⇒ in_flight==0 ⇒ ring 必空 ⇒ erase 不泄漏任何东西。
+// 超时后 ring 非空却照样 erase，其中 K 个 entry 占用的 `reorder_inflight_`
+// （**池全局**背压计数，只在 reducer apply 后减）就永久泄漏了。
+//
+// 后果比 unregister_lib 认下的 UAF 取舍更糟：池由 registry 跨库共享，
+// A 库一次慢关闭会拖垮同进程 B..Z 所有库的索引——且 reorder_cap_ 是硬等待
+// 条件（map worker 达限即停 pop），不是软提示。
+//
+// 这条路径此前零覆盖（30s 硬编码使其不可测，故超时逻辑从未被执行过）。
+// 现超时可注入，本组测试把它钉死。
+// ===========================================================================
+
+// 卡住 reducer，让 entry 堆在 ring 里出不去。
+struct ReducerGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool open = false;
+    void wait() {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [this] { return open; });
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            open = true;
+        }
+        cv.notify_all();
+    }
+};
+
+TEST(IndexPoolUnregister, TimeoutReturnsFalseAndDoesNotHang) {
+    // 超时注入 100ms：reducer 被卡死 → flush 必然超时。
+    IndexPool pool(1, 64, 16, std::chrono::milliseconds(100));
+    ReducerGate gate;
+    auto* lane = pool.register_lib(
+        no_preps, [&](ReorderEntry&) { gate.wait(); }, [] {});
+    ASSERT_NE(lane, nullptr);
+
+    for (std::size_t i = 0; i < 4; ++i) {
+        pool.submit(lane, IndexTask::make(IndexOp::Add, std::to_string(i), i,
+                                          "text", 1, 0, 0, 0, 0));
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool drained = pool.unregister_lib(lane);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    EXPECT_FALSE(drained) << "reducer 卡死时 flush 必须超时返回 false";
+    // 有界性本身：不得退化回无界等待。
+    EXPECT_LT(elapsed, std::chrono::seconds(5)) << "超时未生效——退化为无界等待";
+
+    gate.release();  // 放行 reducer，让 stop() 能 join
+}
+
+TEST(IndexPoolUnregister, TimeoutDoesNotLeakGlobalReorderBudget) {
+    // 核心回归，直接钉不变量：**所有 lane 注销、在途 apply 收尾后，全局
+    // reorder_inflight_ 必须归零**。
+    //
+    // 为何不用「lane B 被卡死」做端到端断言：map worker 撞到
+    // reorder_inflight_ >= cap 就停 push，故单轮最多堆 cap-1 条在 ring
+    // （另一条已被 reducer 取走）。单轮泄漏 cap-1 < cap ⇒ 后续 lane 仍剩
+    // 1 个名额、能跑完只是变慢 ⇒ 端到端断言**漏报**（实测如此：注掉修复
+    // 后那版测试照样绿）。要卡死须累积多轮，脆弱且依赖算术。直接查计数
+    // 精确、无时序依赖。
+    constexpr std::size_t kCap = 4;
+    IndexPool pool(1, 64, kCap, std::chrono::milliseconds(100));
+
+    // gate 用 shared_ptr：lane 被 erase 后 reducer 可能仍在其 reduce_fn 内，
+    // 捕获副本保证 gate 生命周期覆盖到 reducer 退出。
+    auto gate = std::make_shared<ReducerGate>();
+    auto* lane_a = pool.register_lib(
+        no_preps, [gate](ReorderEntry&) { gate->wait(); }, [] {});
+    ASSERT_NE(lane_a, nullptr);
+
+    for (std::size_t i = 0; i < kCap; ++i) {
+        pool.submit(lane_a, IndexTask::make(IndexOp::Add, std::to_string(i), i,
+                                            "text", 1, 0, 0, 0, 0));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // 待其入 ring
+
+    // reducer 卡在 gate 里 → flush 超时 → ring 非空即被 erase。
+    EXPECT_FALSE(pool.unregister_lib(lane_a));
+
+    // 放行 reducer，让它手里那条（已离开 ring）走完并归还自己的名额。
+    gate->release();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (pool.reorder_inflight_for_test() != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // 此刻池内已无任何 lane，在途 apply 也已收尾 → 计数必须归零。
+    // 不归零 = 那些随 lane 析构而消失的 ring entry 的名额被永久吞掉；
+    // 池由 registry 跨库共享，反复慢关闭会把同进程其它库的索引拖死。
+    EXPECT_EQ(pool.reorder_inflight_for_test(), 0u)
+        << "超时注销泄漏了全局 reorder 名额（未归还 ring 中未 apply 的 entry）";
+}
