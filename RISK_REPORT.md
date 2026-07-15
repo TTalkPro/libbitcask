@@ -26,6 +26,14 @@
 > ③ P5-DL-1 场景描述反了——等待发生在 ckpt_mu_ **临界区内**；④ P5-DL-3 升档：
 > 死代码 flush_upto 在 reducer 热路径上留有**每任务全局锁开销**。详见各小节
 > 内嵌的「复核修订」标注。
+>
+> **Phase 6 修订（2026-07-15，文末新增）**：Phase 5 落地（T14-T18）后第三轮
+> 3 路深读审计 + 主 Agent 对全部 HIGH/MED 发现逐条对抗复核。新增 2 项并发
+> 确认发现（P6-MEM-1 / P6-DL-1，同根于 `IndexPool::flush()` 无界等待）、
+> 1 项持久性发现（P6-DUR-1：hnsw 三处原子写缺 fdatasync）、6 项冗余；
+> **推翻 1 项 agent 发现**（P6-DL-2，主 Agent 穷举论证不成立）；**修正本报告
+> 自身 2 处基线错误**（reinterpret_cast「零」断言假阴性、RED-1 行数）。
+> 详见文末「Phase 6 修订」段。
 
 ---
 
@@ -475,9 +483,12 @@ agent 初版报告称 `wf.reset()` 在 fflush/fsync 之前导致 use-after-close
 
 ### 干净项（Phase 5 直接核验无问题）
 
-- ✅ **零** first-party `.release()` / `dynamic_cast` / `reinterpret_cast` /
+- ✅ **零** first-party `.release()` / `dynamic_cast` /
   `goto` / `using namespace std` / `std::endl` / 动态异常规格 / `NULL` 宏 /
   `typedef`
+- ❌ ~~零 first-party `reinterpret_cast`~~ **Phase 6 修正：假阴性**——实测
+  **183 处 / 33 文件**（POD 字节视图、SIMD 内核为主，用法本身多数合理，
+  但「零」断言错误，见文末「基线修正」）
 - ✅ 零 first-party `printf`/`scanf` 在 src/include（仅在 tools/ 合理）
 - ✅ T9 死代码删除：核验零残留引用
 - ✅ T11 mmap_handle.hpp 删除：核验零残留引用
@@ -554,7 +565,7 @@ DiskANN/IVF/VectorDeltaLog/SearchCheckpoint/IndexManifest——未审计≠有 b
 
 | # | 项 | 位置 | 规模 | 状态 |
 |---|---|---|---|---|
-| RED-1 | HNSW flush() 与 SealedSegmentVectorPlugin flush() 逐字节相同 | `vector_plugin.cpp:511-555` vs `sealed_segment_vector_plugin.hpp:670-710` | ~90 行 | T12 待独立分支 |
+| RED-1 | HNSW flush() 与 SealedSegmentVectorPlugin flush() 逐字节相同 | `vector_plugin.cpp:511-555` vs `sealed_segment_vector_plugin.hpp:670-710` | ~115 行（Phase 6 实测修正：flush 35 + delta 31 + load ~50；原 ~90 系跨度重计） | T12 待独立分支 |
 | RED-3 | 小端编解码三套并行 | `byte_order.hpp:14-48` vs `search_checkpoint.hpp:135-163` vs `index_manifest.hpp:75-99` | ~55 行 | 未处理 |
 | RED-5 | hnsw.cpp search_layer / search_layer_int8 成对复制 | `hnsw.cpp:846-910 / 952-1023` | ~130 行 | 未处理 |
 | RED-6 | IvfSegment::open vs DiskannSegment::open 骨架同构 | `ivf_rq.cpp:475-549` vs `diskann.cpp:472-569` | ~45 行 | 未处理 |
@@ -584,7 +595,8 @@ DiskANN/IVF/VectorDeltaLog/SearchCheckpoint/IndexManifest——未审计≠有 b
 ### 表面合规（直接工具核验，全部 ✅）
 
 - 零 first-party `goto` / `NULL` / `typedef` / 动态异常规格 / `using namespace std` / `std::endl`
-- 零 first-party `dynamic_cast` / `reinterpret_cast`（Google Style 限制 RTTI）
+- 零 first-party `dynamic_cast`（Google Style 限制 RTTI）；
+  ❌ ~~零 `reinterpret_cast`~~ **Phase 6 修正：实测 183 处 / 33 文件**（假阴性）
 - 零 first-party `.release()` on smart pointer（无所有权逃逸）
 - `.clang-tidy` 配置完备，关闭项均有文档化理由
 
@@ -627,6 +639,9 @@ DiskANN/IVF/VectorDeltaLog/SearchCheckpoint/IndexManifest——未审计≠有 b
 2. **主 Agent 直接工具核验**：grep 全树检查 9 类 Google Style 表面合规项
    （goto/NULL/typedef/using namespace std/std::endl/dynamic_cast/
    reinterpret_cast/.release()/printf in src），全部 ✅
+   （**Phase 6 修正**：其中 reinterpret_cast 一项为假阴性——实测 183 处，
+   当时的 grep 未实际执行或统计口径错误。教训：核验清单里每一项都要留
+   命令与输出存档，「✅」不能只凭记忆勾选）
 3. **关键发现交叉验证**：
    - P5-MEM-1（OrdSkipGuard 析构）：主 Agent 重读 `cask.hpp:1007-1012` + 4 个
      使用点逐个验证 armed 状态机
@@ -665,3 +680,302 @@ basho/bitcask 生产史上最严重 bug 的来源。建议 Phase 6 专项审计�
 
 这些是真正的 Bitcask 协议正确性问题，远比资源管理更危险。资源管理修复
 （Phase 1-5）让代码库的"骨架"健康；Phase 6 应专注于"灵魂"。
+
+---
+
+# Phase 6 修订（2026-07-15）
+
+> 方法：3 路并行深读 agent（内存 / 死锁 / 冗余，Google C++ Style 透镜，
+> 明确排除 Phase 1-5 已修项）+ **主 Agent 对全部 HIGH/MED 发现逐环节对抗
+> 复核**（本轮推翻 1 项、细化 1 项触发窗口——延续 Phase 5 教训 3）。
+> 基线：Phase 5 落地后（commit 57b9878），641/641 ctest。
+> 生产代码实测规模：src/ + include/ + c_api/ 共 **133 文件 / 41,466 行**
+> （首页「208 文件 / ~74K 行」含 tests/tools/bench）。
+
+## Phase 6 风险摘要
+
+| 维度 | 高危 | 中危 | 低危 | 总评 |
+|---|---|---|---|---|
+| 内存/资源 | 0 | 1 | 2 | 无常态可达泄漏；bad_alloc 路径 1 处后果不可恢复 |
+| 死锁 | 0 | 1 | 0 | 无新增可达死锁；close 逃生门存在结构缺口 |
+| 持久性 | 0 | 1 | 0 | hnsw 三处原子写偏离全库 fdatasync 规范 |
+| 冗余 | 0 | 3 | 3 | RED-2 残留 ~280 行，其中 3 处已实际漂移 |
+
+**核心结构性结论（三路独立收敛）**：内存与死锁维度的全部确认发现落在
+**同一个函数**——`IndexPool::flush()`（`thread_pool.hpp:435-443`）是全池
+唯一既**无超时**、又**无 stopped_ 旁路**、且谓词依赖两个由不同站点维护的
+原子变量的等待点。同池对照：`map_cv_` 有 stopped_ 旁路（:591-594，注释明言
+"防与 sentinel 死锁"）、`checkpoint()` 有 T7 的 30s 超时、`close()` 第一段
+有 S25-T1 的 30s 超时——唯独 `flush()` 三样都没有。一处修复（有界超时 +
+stopped_ 旁路 + submit 异常补偿）同时消解 P6-MEM-1 与 P6-DL-1。
+
+---
+
+## 十四、Phase 6 — 内存与资源
+
+### 🟠 P6-MEM-1：`IndexPool::submit` 的 in_flight 泄漏 → close() 永久挂死（MED，CONFIRMED）
+
+**证据链（主 Agent 逐环节复核）**：
+1. `thread_pool.hpp:428` 先 `in_flight.fetch_add(1)`，`:431` 才 `queue_.push`；
+2. `queue_` 是 `tbb::concurrent_bounded_queue`（:217），push 内部按需分配
+   segment，可抛 bad_alloc；
+3. 上游无兜底：`Cask::submit_index_task`（`cask.cpp:782-785`）直通，put 路径
+   全部调用点无 try/catch；
+4. 泄漏后 `flush()` 谓词 `in_flight==0` 永假、wait 无超时、唯一 notify 站点
+   `dec_in_flight`（:681）的配对 dec 永不到来 → `close()`/`~Cask` 永久挂死。
+
+**对 T14 结论的修正**：T14 的 catch 防住了 terminate，但 in_flight 在抛出
+**之前**已递增，catch 救不了它。T14 记录的代价「泄漏 1 个 ord（**可恢复**，
+触发 30s 超时路径）」（`cask.hpp:1019-1023`）对 ord 成立、**对 in_flight
+不成立**——后果是永久挂死，不可恢复。
+
+**佐证**：`:565-567` 对 ring_put 拒收路径已有完全相同的补偿模式（注释
+「补偿 in_flight，防 flush 悬挂」）——失效模式已被维护者理解，只是未覆盖
+push 抛出窗口。
+
+**修复方向**：`submit` 的 push 套 try/catch，catch 内 `dec_in_flight(lane)`
+后重抛；同时给 `flush()` 加 30s 有界超时 + `|| stopped_` 旁路（与 T7 的
+checkpoint 30s、map_cv_ 旁路同款模式）。
+
+### 🟢 P6-MEM-2：`RowChunks::ensure_slot` 分配到接管之间两个异常窗口（LOW）
+
+`row_chunks.hpp:81-93`：`new T[kChunkSize]` 后 `chunks_.push_back` 扩容可抛
+→ chunk 无人持有；spine 表 `new T*[cap]` 后 `graveyard_.push_back` 可抛 →
+ns 泄漏。`destroy()` 只遍历 chunks_/graveyard_/spine_pub_，泄漏对象从未进入
+三者。触发限 bad_alloc。修法：`unique_ptr` 暂存再 `release()`。
+
+### 🟢 P6-MEM-3：`MmapSegment::open` 在 `new` 抛出时泄漏整文件映射（LOW）
+
+`segment_v2.cpp:444-448`：mmap 成功、fd 已关后，
+`new MmapSegment()` 抛 bad_alloc → 映射（可达 GB 级虚拟地址空间）永久泄漏。
+窗口仅 :444→:448 之间（其后所有早返回由 `~MmapSegment` 的 munmap 兜住，
+那部分正确）。修法：把 `new` 提到 mmap 之前。
+
+### 已排除嫌疑（主动否决记录，供后续审计复用）
+
+- 裸 `FILE*` 写站点（hnsw.cpp:2016 / keydir.cpp:1561 / inverted.cpp:1261 /
+  segment.hpp:525）：serialize 全在 fopen 之前，fopen→fclose 之间无抛出点
+  → 风格问题非泄漏
+- IvfSegment::open / HNSW load_vec_payload / load_qc_payload：逐条早返回
+  核对，失败分支全部 close → 干净
+- NodeChunk：locks 按声明序早于可抛成员初始化，成员回退正确 delete[]
+- DataFile 移动语义：源 map_base_ 置空、赋值前 munmap → 无双重释放
+- 循环引用：CaskPluginHost 持 Cask* 裸指针，插件持 PluginHost* 裸指针 → 无环
+- read_files_ LRU / keydir limbo / text_plugin tomb 保留：文档化有意软上限
+  （P9 / S29-6 / S27-4）
+
+---
+
+## 十五、Phase 6 — 死锁与并发
+
+### 🟡 P6-DL-1：close() 的 30s 逃生门被紧随的无超时 flush() 抵消（MED，CONFIRMED-结构性）
+
+`cask.cpp:645-660` 为 close 加 30s 超时（S25-T1，注释宣称"close 不再永久
+阻塞"），超时 `break` 后 `:685-689` 的 `unregister_lib` 内含**无超时**
+`flush(lane)`——挂死不是异常，外层 try/catch 兜不住。
+
+**主 Agent 细化触发窗口**（`writes_in_flight_` 卡住 ≠ `lane->in_flight` 卡住）：
+- 写线程被 kill 在 submit **之前** → 仅 writes_in_flight_ 卡住，逃生门有效；
+- kill 在 `in_flight++`（:428）之后、push 返回之前 → **两计数俱卡，逃生门
+  失效，永久挂死**；
+- kill 在 push 之后 → 任务已入队，池照常消费，无事。
+
+中间窗口有放大器：队列满（容量 10240）时 push **阻塞**，写者长时间停留在
+该窗口内——而"线程看起来卡死所以被 kill"恰恰最易发生在此时。close 注释
+自己论证的"被背压挡住的写者也会收敛，push 必然返回"（:641-643）以写者
+存活为前提。另外 P6-MEM-1 的 bad_alloc 泄漏也进入同一挂死点。
+
+**修复方向**：与 P6-MEM-1 同一处——flush() 有界超时 + stopped_ 旁路。
+
+### ❌ P6-DL-2（主 Agent 推翻）：push_reorder 拒绝路径谓词永久不可满足——**不成立**
+
+审计 agent 报告（PLAUSIBLE）：`:561-568` 拒绝分支 dec_in_flight 但不推进
+applied_ord，而 submit 已 CAS 抬 hwm → 谓词永久不可满足。
+**主 Agent 读 `ring_put`（:290-301）后穷举推翻**：
+- **拒绝原因 A（`ord < ring_base` 回退）**：ring_base 只在 apply 时推进，
+  故该 ord **已被 apply**，applied_ord ≥ ord；hwm 本次不会被抬（若该 ord 为
+  历史最高早已在 hwm 内）。反证：要让本次把 hwm 抬到 X 且被回退拒绝，需
+  X 为历史最高且 X < ring_base ≤ applied+1 → applied ≥ X = hwm，谓词为真。
+- **拒绝原因 B（槽位已占，重复 ord）**：原始 entry 仍在 ring 中待 apply，
+  其自身的 in_flight++ 尚未释放 → 此刻 in_flight ≥ 1，不存在"归零时带永假
+  谓词 notify"的时刻；原始 entry apply 后 applied 恰推到 X = hwm。
+- 无第三种拒绝：ord 超前走 `ring_grow`（:294）不拒绝。
+
+agent 混淆了"这份副本被丢"与"这个 ord 无人 apply"。真正的 ord 空洞
+（alloc 后从未 submit）是 T7/T14 已处理的已知类。**从发现清单划除，
+记录在案防止后续轮次重报。**
+
+### 已排除疑点（全部核实为真才排除）
+
+- 锁序反转：无。concurrency-zh.md:530 两处反向嵌套的无环论证成立；
+  BarrierGuard 逐分片排干协议正确（keydir.cpp:149-160 / 493-500 / 724-733）
+- 持锁外调：无。reducer apply 前 unlock（thread_pool.hpp:632）、error_fn 在
+  lock_guard 作用域外（:566）、builder 弹出 job 后即释放 b.mu
+  （text_plugin.cpp:1514-1530）
+- run_serialized 环死锁：契约「所有调用点均在 merge 线程」逐点核实为真
+  （text_plugin.cpp:1392 / vector_plugin.cpp:564 /
+  sealed_segment_vector_plugin.hpp:395 均在 on_merge_commit 内；
+  merger.cpp:400 派发时不持 keydir 锁）
+- BuilderPool cv 协议：所有唤醒点一律 notify_all，无丢唤醒
+
+---
+
+## 十六、Phase 6 — 持久性（对应「十三、协议盲区」第 2 项的提前兑现）
+
+### 🟠 P6-DUR-1：hnsw 三处原子写缺 fdatasync——同文件两套持久性纪律（MED，CONFIRMED，主 Agent 亲验）
+
+全库原子写规范由 `keydir.cpp:1565-1567` 定义并预先驳回"可重建就不用 sync"
+的抗辩（「可重建 ≠ 可以不 fdatasync」，与 SearchCheckpoint / write_manifest
+同款语义）。9 个原子写站点中 6 个遵守，**hnsw.cpp 三处偏离且无豁免注释**：
+
+| 站点 | rename 前同步 |
+|---|---|
+| `keydir.cpp:1559-1581` | fflush + fdatasync ✅ |
+| `search_checkpoint.hpp:210-230` | fflush + fdatasync ✅ |
+| `index_manifest.hpp:167-186` | fdatasync + 目录 fsync ✅（唯一做目录 sync 的） |
+| `field_schema.hpp:228-243` | ::fsync ✅（唯一用 fsync 非 fdatasync） |
+| `segment_v2.cpp:942-949` / `:376-382` | fflush + fdatasync ✅ |
+| **`hnsw.cpp:2015-2023`（save）** | **无** ❌ |
+| **`hnsw.cpp:491-538`（save_vec_payload）** | **无** ❌ |
+| **`hnsw.cpp:564-588`（write_bcq8_file）** | **无** ❌ |
+
+**同文件自相矛盾（决定性证据）**：hnsw.cpp 的 fd 增量追加路径
+（:1613 / :1636 / :1782 / :1816）**全部 fdatasync**；FILE* save 路径全不做。
+
+**后果比"少一次加速"重**：rename 前不 sync，崩溃后**最终文件名下可能是
+零长/半截文件，而旧的好文件已被 rename 覆盖**。实际严重度取决于 load 对
+损坏文件的容错（CRC 失败退回重建则为重建成本，否则为 load 失败），但与
+规范的偏离确凿。
+
+**修复方向**：三处补 fflush + fdatasync（30 分钟）；结构性防复发见 P6-RED-1。
+
+---
+
+## 十七、Phase 6 — 代码冗余（RED-2 残留 + 新发现）
+
+> 根因单一：**T10 只做了 RED-2 的一半**。`file_util.hpp` 仅 33 行
+> （FileCloser + FilePtr），其头注释 :12-13 自承欠 `read_file_bytes` /
+> `atomic_write_bytes`——两者全仓库不存在。「漂移温床」预言已兑现三处
+> （P6-DUR-1 的 fsync 分叉、P6-RED-3 的 need 公式漂移、P6-RED-4 的注释断言
+> 失去结构保证）。
+
+### 🔴 P6-RED-1：原子写样板 ×9，fsync 策略已分叉（~55-70 行，CONFIRMED）
+
+站点清单见 P6-DUR-1 表。归并需**两个** helper：
+`atomic_write_bytes(path, span)`（4 份 buffer 式）+ `AtomicFileWriter` RAII
+（5 份流式：构造开 tmp，commit() 做 flush+fdatasync+rename，析构未 commit
+则 remove）。收益不止行数：sync 策略从 9 处可审收敛为 1 处可审。
+
+### 🔴 P6-RED-2：整文件读样板 ×6，轮子已造好被关在 migrate.cpp（~49 行，CONFIRMED）
+
+`migrate.cpp:45-59` 的 `read_all(path) -> expected<vector<byte>, string>`
+**就是**缺失的 read_file_bytes，困在匿名 namespace。其余 5 站点：
+hnsw.cpp:2031-2041 / keydir.cpp:1588-1599 / inverted.cpp:1272-1286 /
+segment_v2.cpp:954-966 / search_checkpoint.hpp:326-338。
+障碍（小）：元素类型分叉 `vector<uint8_t>` vs `vector<byte>`，零
+reinterpret_cast 策略下需 `template <class Byte>`。
+已排除：search_checkpoint 的 read_selected 按 section seek 非整读；
+segment.hpp:525 是 4 字节 magic 探针。
+
+### 🟡 P6-RED-3：chunked-pread refill lambda ×3，已漂移（~55 行，CONFIRMED）
+
+hint_file.cpp:143-173 / :244-267、data_file.cpp:309-335。两份注释自承抄袭
+（data_file.cpp:295「照搬 hint_file.cpp 的 refill 模式」）。
+**漂移实证**：`need` 公式 data_file.cpp:322 掉了 `buf_len +`
+（hint_file 两份均为 `std::max(desired, buf_len + read_size_hint)`）。
+逐行核实**当前无害**（memmove 后 record 从 buf 头起算），但证明三份在被
+分别维护。归并：`detail::ChunkedReader{file_, end_bound}`，唯一参数化点是
+文件末界。
+
+### 🟡 P6-RED-4：Analyzer 双出口成对复制 ×2 组（~88 行，CONFIRMED）
+
+- **4a** `NgramAnalyzer::analyze_with_positions`（analyzer.cpp:211-285）vs
+  `analyze`（:292-350）：~48 行重复。**真实风险在注释**——:287-291 的 S29-8
+  注释断言两版「term 集与 tf 值逐位一致」，这是索引路径（positions 版）与
+  BOW 查询路径（tf 版）必须成立的不变量，却靠复制粘贴维护——改一处过滤
+  语义忘另一处 → 索引与查询 term 集静默分叉，评分错误无人察觉。
+  S29-8 对双入口的性能论证成立（tf 版避免每 n-gram 一次 positions 堆分配），
+  归并用 `template <class Sink>` + `if constexpr` 可保零分配。
+- **4b** `WhitespaceAnalyzer::analyze_with_positions`（:356-398）vs
+  `analyze_with_offsets`（:400-443）：前 39 行完全相同，仅 4 行 sink 差异。
+  **仓库内已有先例**：JiebaAnalyzer 的 `collect_tokens(text, need_offsets)`
+  （jieba_analyzer.cpp:126）已解决同一问题，两个公开入口各剩 8 行。
+  ~40 行，照抄先例 1 小时。
+
+### 🟡 P6-RED-5：`decode_rec` vs `decode_rec_list` 共享解包段（~35 行，CONFIRMED）
+
+segment_v2.cpp:619-653 vs :1007-1041 逐字节相同（块循环 + BitReader 解包 +
+全部边界守卫）。`PostingList` 是 `FlatPostings` 的结构超集（ords/tfs/blocks/
+max_tf 同名同类型），`template <class Out>` 单态化零性能代价，
+`if constexpr (requires { out.dls; })` 保住热路径 dl 跳过。真分叉部分
+（blocks 重建 vs dls+positions 解码）留在 helper 外。
+
+### 🟢 P6-RED-6：死代码 7 行（全部 exact-grep 验证）
+
+| 项 | 位置 | 行 |
+|---|---|---|
+| `detail::ends_with_vowel` | porter_stemmer.hpp:52-55 | 4（全树仅定义） |
+| `KeyDir::newest_folder_epoch_` | keydir.hpp:585 + keydir.cpp:923 | 2（仅写零读；疑为漏掉的 IterInfo 导出字段而非有意诊断位） |
+| `codec::DecodeError::kValueSizeOverflow` | codec.hpp:34 | 1（构造不可达，codec.cpp:465-467 折进 kKeySizeOverflow） |
+
+### backlog 复核（RED-3/5/6/10 全部仍成立）
+
+- RED-3：三份 LE 编解码并存（byte_order.hpp:14-48 / search_checkpoint.hpp:136-163 /
+  index_manifest.hpp:76-99），byte_order.hpp 补 vector-append 形态即可归并
+- RED-5：hnsw.cpp:847 / :953 成对复制（:951 注释自承）
+- RED-6：ivf_rq.cpp:475 / diskann.cpp:472 骨架同构
+- RED-10：keydir.cpp:1297-1307 SnapCursor::vb，价值低维持 LOW
+
+### 已核实非冗余（新增记录）
+
+- SIMD 内核家族（bm25_kernels / int8_kernels / hw_crc32）：每份挂不同
+  `target()` 属性、用不同 intrinsic 类型——非冗余
+- 冗余状态维度零发现：dead_count_ / has_pending_ / row_chunks::size_ 等
+  嫌疑点均为 O(1) 缓存或无锁发布点，且注释预先驳回了归并方案
+  （keydir.hpp:576-579 典型）
+
+---
+
+## 十八、基线修正（对本报告与 TASK.md 自身）
+
+1. **reinterpret_cast 假阴性**：「零 first-party reinterpret_cast」（原
+   §干净项、§十、§十二）实测为 **183 处 / 33 文件**。dynamic_cast 确为 0。
+   已在原文标注修正。教训：核验清单每项须留命令与输出存档。
+2. **RED-1 行数**：原 ~90 行系对 35 行函数的跨度重计；实测可回收 ~115 行
+   （flush 35 + save_component_delta 31 + load_component ~50，其中链重放
+   lambda 逐字节相同）。已在 §九 表格标注修正。
+3. **T14「可恢复」表述**：TASK.md 与 cask.hpp:1019-1023 记录的「泄漏 1 个
+   ord（可恢复，触发 30s 超时路径）」对 in_flight 计数器不成立
+   （见 P6-MEM-1）。TASK.md 已随 Phase 6 重写修正；cask.hpp 注释随 T19 修正。
+4. **规模口径**：首页「208 文件 / ~74K 行」含 tests/tools/bench；生产代码
+   实测 133 文件 / 41,466 行。
+
+---
+
+## 十九、Phase 6 行动建议（按 ROI 排序）
+
+| # | 行动 | 对应发现 | 工作量 | ROI |
+|---|---|---|---|---|
+| 1 | **flush() 有界超时 + stopped_ 旁路；submit push 异常补偿 dec** | P6-MEM-1 + P6-DL-1（一处修复双消解） | 半天 | 🔴 极高（消除两条永久挂死路径；顺带补齐 T8 重设计欠缺的超时基建） |
+| 2 | **hnsw 三处补 fdatasync** | P6-DUR-1 | 30 分钟 | 🔴 高（独立持久性修复，不依赖重构） |
+| 3 | **T10 收尾：read_file_bytes + AtomicFileWriter** | P6-RED-1/2 | 1 天 | 🟡 高（sync 纪律 9 处→1 处可审，结构性防 P6-DUR-1 复发） |
+| 4 | **WhitespaceAnalyzer 照 Jieba collect_tokens 先例归并** | P6-RED-4b | 1 小时 | 🟡 中 |
+| 5 | **NgramAnalyzer sink 模板归并**（保零分配，须对拍 term/tf 逐位一致） | P6-RED-4a | 半天 | 🟡 中（把注释断言变成结构保证） |
+| 6 | **ChunkedReader 归并 refill ×3** | P6-RED-3 | 半天 | 🟡 中 |
+| 7 | **decode_rec 模板归并**（须基准回归） | P6-RED-5 | 半天 | 🟢 低 |
+| 8 | **死代码 7 行删除** | P6-RED-6 | 10 分钟 | 🟢 低 |
+| 9 | RowChunks / MmapSegment 异常窗口修补 | P6-MEM-2/3 | 各 15 分钟 | 🟢 低（可随 #1 同 commit） |
+
+**Phase 6 不做**：T8 重设计（前置：可复现饥饿的失败注入测试 + applied_ord
+与搜索可见性根因调查——#1 的超时基建是其前置之一）、T12（独立分支既定）、
+RED-3/5/6/10（backlog 维持）。
+
+**方法学教训（Phase 6 新增）**：
+1. **agent 发现必须逐环节对抗复核**：P6-DL-2 推理链条看似完整（拒绝分支
+   确实不推进 applied_ord），但对 ring_put 拒绝语义做穷举后两个分支均
+   构造不出终态——"这份副本被丢"≠"这个 ord 无人 apply"。
+2. **冗余审计能挖出正确性问题**：P6-DUR-1（fdatasync 分叉）是"找重复代码"
+   的副产物——样板未归并导致纪律靠人肉复制，复制必漂移。
+3. **超时/旁路要按等待点清点，不能按函数清点**：close() 有超时、checkpoint()
+   有超时、map_cv_ 有旁路，全部单独看都"已修"——但同一线程先后两个等待点，
+   只要有一个无界，前面所有超时都归零。

@@ -1,364 +1,293 @@
 # Google C++ Style 规范化修复任务清单
 
-> 来源：`RISK_REPORT.md`（2026-07-14 v2 深度审计 + Phase 5 审计 + 三次复核）
-> 范围：5 项 Phase 1-3 行动建议 + 7 项 Phase 4 资源/并发修复 + 5 项 Phase 5 复核确认任务
+> 来源：`RISK_REPORT.md`（2026-07-14 v2 深度审计 + Phase 5 审计 + **Phase 6 审计 2026-07-15**）
+> 当前活跃范围：**Phase 6（T19-T26）** + 2 项遗留（T8、T12）
 > 基线测试：641/641 ctest 通过（1 个 S30RssProbe 预存 Disabled）
 > 验收标准：每项改动后 ctest 全绿 + 编译无新告警 + lsp_diagnostics 无新错误
 
 ---
 
-## ✅ Phase 1：低风险快速修复（已完成）
+## ✅ Phase 1-5 归档（T1-T18，全部落地或明确处置）
 
-### T1 — CRC32 入口统一（MED-3） ✅
+> 详细记录见 git 历史（本文件在 commit 57b9878 之前的版本）与 RISK_REPORT.md 对应章节。
 
-把 3 个文件直接调 `hw::crc32*` 的 10 处改为 `codec::crc32*`，让硬件派发藏在 codec 内部。
+| 项 | 内容 | 状态 |
+|---|---|---|
+| T1 | CRC32 入口统一（codec:: 收口） | ✅ 641/641 |
+| T2 | vbyte 带检查版本归并（vbyte_read_checked） | ✅ 641/641 |
+| T3 | .clang-tidy 配置 + CI job | ✅ |
+| T4 | MmapRegion RAII 基建 | ✅（后由 T11 决策删除） |
+| T5 | SealedSegmentVectorPlugin 抽取（IVF/DiskANN ~950 行回收） | ✅ commit ba99af2 |
+| T6 | MEM-MED-1 Registry acquire/release 配对 | ✅ 641/641 |
+| T7 | DL-MED-1/2 RunFn ord 泄漏 + checkpoint 30s 超时 | ✅ 641/641 |
+| T9 | 死代码清理（fill_get_result 等 ~71 行） | ✅ 641/641 |
+| T10 | file_util.hpp（9 份 FileCloser → 1）+ MEM-LOW-1 闭合 | ✅ 641/641（**RED-2 另两个模板未做 → T21**） |
+| T11 | mmap_handle.hpp 删除（建而未用） | ✅ |
+| T13 | plugin_api run_serialized 契约注释 | ✅ |
+| T14 | OrdSkipGuard 析构 try-catch 防 terminate | ✅（**表述修正见下**） |
+| T15 | last_ckpt_ord_ 三处漏更新 | ✅ ASan 全过 |
+| T16 | flush_upto 死代码 + reducer 每任务通知块删除 | ✅ ASan+TSan×5 |
+| T17 | FilePtr 别名 + diskint::pwrite_all 收口 | ✅ ASan 全过 |
+| T18 | thread-safety 文档化 P5-DL-1/2 | ✅ doc/concurrency-zh.md |
 
-- ✅ `src/bm25/segment_v2.cpp`（6 处）
-- ✅ `src/cask/meta_file.cpp`（1 处）
-- ✅ `include/bitcask/field_schema.hpp`（3 处）
-- ✅ 641/641 ctest 通过
-
-### T2 — vbyte 带检查版本归并（MED-2） ✅
-
-三份带边界检查的 vbyte 解码归并到 `vbyte.hpp::vbyte_read_checked`
-（`std::optional<pair<u64, size_t>>` 返回，无歧义）。无检查版 `vbyte_decode`
-保持独立（热路径契约，S21-2 A3 既定）。
-
-- ✅ `vbyte.hpp` 增加 `vbyte_read_checked` 权威实现
-- ✅ `codec.cpp` 删本地 vbyte_read，5 处调用迁移
-- ✅ `meta_codec.hpp` 删 detail::vbyte_read + 内联 lambda，6 处调用迁移
-- ✅ 641/641 ctest 通过
-
----
-
-## ✅ Phase 2：基础设施（已完成）
-
-### T3 — `.clang-tidy` 配置 ✅
-
-- ✅ `.clang-tidy`（google-* + modernize/bugprone/performance/readability/cert/cppcoreguidelines 基线，关闭与项目风格冲突的 ~15 项）
-- ✅ `.github/workflows/ci.yml` 加 `clang-tidy` job（continue-on-error，待存量清零改门控）
-- ✅ 本地 clang-tidy 21 验证：codec.cpp 从数百告警降到 7 条真问题
-
-### T4 — `MmapRegion` RAII 基础设施 ✅（渐进式应用）
-
-- ✅ `include/bitcask/detail/mmap_handle.hpp` 创建（MmapRegion 类 + 析构序安全文档）
-- ⏩ 全量应用到 8 处 mmap 站点改为**渐进式**——每处需成员布局重写（30+ 访问点/文件），
-  风险/收益不划算。后续随其他重构（如 T5、引擎迭代）自然推广。
+**⚠️ T14 表述修正（Phase 6 / P6-MEM-1）**：T14 记录的代价「泄漏 1 个 ord
+（可恢复，触发 30s 超时路径）」只对 ord 成立。同一次 push 抛出**同时**泄漏
+`in_flight` 计数，而 `IndexPool::flush()` 无超时 → `close()`/`~Cask` 永久
+挂死，**不可恢复**。修复归入 T19；`cask.hpp:1019-1023` 注释随 T19 一并修正。
 
 ---
 
-## ✅ Phase 3：高风险高价值（已完成）
+## 🔴 Phase 6：新任务（来自 RISK_REPORT「Phase 6 修订」段，2026-07-15）
 
-### T5 — `SealedSegmentVectorPlugin` 抽取（HIGH-1） ✅
+> 审计方法：3 路深读 agent + 主 Agent 逐环节对抗复核（推翻 1 项 P6-DL-2、
+> 细化 1 项触发窗口、亲验 fdatasync 与 reinterpret_cast 两条关键断言）。
 
-IVF/DiskANN 插件 ~950 行近乎完全重复。抽 Template Method 中间基类，
-子类只 override 差异点（search_sealed / ckpt_name / blob_size 等钩子）。
+### T19 — P6-MEM-1 + P6-DL-1：IndexPool::flush 有界等待 + submit 异常补偿 🔴 HIGH
 
-- ✅ `include/bitcask/detail/sealed_segment_vector_plugin.hpp` 创建
-- ✅ `ivf_plugin.cpp` / `diskann_plugin.cpp` 收缩
-- ✅ commit `ba99af2`
-- ⚠️ HNSW 侧同构代码未回收 → 转入 T8（RED-1）
+**症状（两条独立进入路径，同一挂死点）**：
+- P6-MEM-1：`submit()` 先 `in_flight.fetch_add`（`thread_pool.hpp:428`）再
+  `queue_.push`（:431，TBB 有界队列分配可抛 bad_alloc），抛出即泄漏计数，
+  全类仅两处 dec（:567/:648）均不覆盖此窗口 → `flush()` 谓词永假。
+- P6-DL-1：`close()` 的 30s 逃生门（`cask.cpp:645-660`）break 后紧接
+  `unregister_lib` → 无超时 `flush()`（`cask.cpp:685-689`）——逃生门被
+  25 行后的等待抵消。触发窗口：写线程在 `in_flight++` 与 push 返回之间被
+  kill（含背压阻塞期,队列满时 push 阻塞、窗口拉长）。
 
----
-
-## 🔴 Phase 4：资源管理与并发修复（来自 RISK_REPORT v2 深度审计）
-
-> 来源：3 路深读 agent（内存泄露 / 死锁 / 冗余），~200 次工具调用，
-> 异常路径上确认 1 中危逻辑缺陷 + 3 中危死锁 + 3 低危内存。
-> 主 Agent 复核裁决：**3 项升档为 HIGH**（MEM-MED-1、DL-MED-1、DL-MED-2）。
-
-### T6 — MEM-MED-1：Registry acquire/release 不配对修复 🔴 HIGH
-
-**症状**：`Cask::open` 在 `registry->acquire()` **之前**就设置了 `registry_`/`keydir_name_`；
-kNotReady 失败路径经 `~Cask→close()` 无条件 `release()`，把初始化方的 refcount
-从 1 减到 0 并 erase 槽位 → `biggest_file_id` 持久化被跳过 → 老文件 ID 复用
-→ keydir 把旧 entry 误判为最新（**tombstone-resurrection 等价类**，basho/bitcask #82）。
-
-**修复方向**：只在 acquire 成功（kReady/kCreated）后才把 `registry_`/`keydir_name_` 赋给 `cask`。
-
-- **位置**：`src/cask/cask.cpp:220-244`
-- **工作量**：1 小时
-- **验收**：新增并发 open + 慢初始化测试（注入 sleep 模拟大库冷启动）→ 641+/ctest 通过
-- **优先级**：🔴 极高（唯一常态可达的逻辑缺陷）
-
-### T7 — DL-MED-1 + DL-MED-2：RunFn 路径 ord 泄漏 + 无超时等待 🔴 HIGH
-
-**症状（双根同终态）**：
-- DL-MED-1：四个 RunFn 提交点（手动 ckpt / 自动 ckpt / merge 收尾 / run_serialized）
-  在 `alloc_ord()` 与 `submit()` 之间有可抛分配（snapshot vector、serialize_meta_delta、
-  std::function 构造），任一抛 bad_alloc 即泄漏该 ord → reducer lane 永久空洞 →
-  `flush()`/`close()`/`~Cask` 永久挂死。
-- DL-MED-2：`checkpoint()` 的 `done->wait(0)` 无超时；`IndexPool::submit` 在 `stopped_`
-  时静默丢弃任务，done 永不置位 → 持 `ckpt_mu_` 级联锁死。
+**结构根因**：`flush()`（`thread_pool.hpp:435-443`）是全池唯一既无超时、
+又无 `stopped_` 旁路的等待点（对比：map_cv_ :591 有旁路、checkpoint 有
+30s、close 第一段有 30s）。
 
 **修复方向**：
-1. 四个 RunFn 提交点套 `OrdSkipGuard`（沿用写路径既有模式）
-2. `done->wait` 加 30s 超时 + 日志兜底
-3. `IndexPool::submit` 在 `stopped_` 丢弃时返回错误或主动置位 done（最小入侵：检测后 log + 让调用方自行超时恢复）
+1. `submit` 的 `queue_.push` 套 try/catch，catch 内 `dec_in_flight(lane)` 后
+   重抛（模式照抄 :565-567 既有补偿）
+2. `flush()` 改有界等待，超时上报
+3. 修正 `cask.hpp:1019-1023` T14 注释的「可恢复」表述
+4. （顺手，同 commit）P6-MEM-2：`row_chunks.hpp:81-93` 用 unique_ptr 暂存再
+   release；P6-MEM-3：`segment_v2.cpp:444-448` 把 `new` 提到 mmap 之前
 
-- **位置**：`src/cask/cask.cpp:493-495, 2201-2248, 2414-2437, 2519-2533`；
-  `include/bitcask/thread_pool.hpp:415-432`
+- **位置**：`include/bitcask/thread_pool.hpp:415-443`；`include/bitcask/cask.hpp:1019-1023`；
+  `include/bitcask/row_chunks.hpp:81-93`；`src/bm25/segment_v2.cpp:444-448`
 - **工作量**：半天
-- **验收**：故障注入测试（bad_alloc mock、stopped_ pool）→ ctest 通过
-- **优先级**：🔴 高（消除进程级不可恢复挂死根因）
+- **验收**：641/641 ctest + TSan 树；建议故障注入（mock push 抛 bad_alloc →
+  close 在 30s 超时后仍能返回）
+- **备注**：此超时基建同时是 T8 重设计的前置之一
+- **优先级**：🔴 极高（消除两条进程级永久挂死路径）
 
-### T8 — DL-MED-3：搜索读屏障无界等待 🟡 MED ⚠️ reverted
+#### ✅ T19 落地记录（2026-07-15）
 
-**症状**：`prepare_search()` 调用 `flush_index()`，其谓词要求整条索引流水线排空
-（`in_flight==0 && applied>=hwm`），持续写入下查询线程无界等待。
+**两处与原计划的偏离，均为实施中发现的更优/更安全解**：
 
-**初版修复尝试（已 revert）**：在 `IndexPool` 加 `flush_upto(lane, snapshot_hwm)` 方法，
-谓词改为 `applied_ord >= snap_hwm`（不再要求 in_flight==0、不动态重读 hwm）。
-**问题**：在 4 个非并发测试场景下产生搜索漏召（search 返回 0 hits 而非 1），
-根因待查——可能涉及 DWPT builder 模式与 reducer apply 之间的发布时序、
-或 applied_ord 推进与实际索引可见性之间的微妙错位。
-thread_pool.hpp 保留 `flush_upto` 工具方法（已验证单独工作正常），
-后续重新设计时复用。
+1. **超时只上在拆卸路径，不做全局**。原计划「flush() 改 wait_for 30s」会
+   连带 `Cask::flush_index()`（`cask.hpp:667` → `prepare_search` 的搜索读
+   屏障）——谓词里的 `in_flight==0` **兼任索引可见性屏障**，有界化 =
+   prepare_search 静默返回未排空的索引 = **漏召**，正是 T8 初版翻车的形状。
+   故 `flush(lane, timeout=nullopt)` 默认仍为无界（搜索路径语义不变），
+   仅 `unregister_lib` 传 30s。P6-MEM-1 的根因由 submit 的补偿 dec 独立闭合，
+   不依赖超时；超时是 P6-DL-1（写线程被 kill）的兜底。
+2. **不加 `|| stopped_` 旁路**（原计划有）。核实后否决：`stopped_=true` 到
+   `stop()` join 完 map worker 之间存在窗口，此时旁路会让 `unregister_lib`
+   提前 erase lane，而在途 map worker 仍持 `task.lane` 裸指针 → **新引入
+   UAF**（reducer 有 shared_ptr 拷活保护，map worker 没有）。30s 超时已覆盖
+   该场景的活性需求（stopped_ 后 submit 本就早返回、不再累加 in_flight），
+   旁路只省一次边缘场景的 30s 等待，不值这个风险。
 
-**待重新设计的方向**：
-- 调查 applied_ord 与搜索可见性的精确关系（是否 reducer apply 后还需 drain）
-- 考虑带超时但保留 in_flight==0 谓词（仅放宽 hwm 动态重读）
-- 失败注入测试覆盖持续写 + 查询并发场景
+- **改动**：`thread_pool.hpp`（submit try/catch + dec 重抛；flush 加
+  `optional<ms>` 参数；`unregister_lib` 改 `[[nodiscard]] bool`；
+  `kUnregisterFlushTimeout` 常量；`<chrono>`）；`cask.cpp:686` 超时 log_error；
+  `cask.hpp` T14 注释修正；`row_chunks.hpp` unique_ptr 暂存 + `<memory>`；
+  `segment_v2.cpp` new 提到 **open 之前**（提到 mmap 前仍会漏 fd——见下）
+- **P6-MEM-3 实施修正**：RISK_REPORT 建议「把 new 提到 mmap 之前」**不充分**
+  ——fd 在 :436 已打开、close 在 mmap 之后，new 抛出仍泄漏 fd（只是从泄漏
+  映射降级为泄漏 fd）。实际提到 `::open` **之前**才无窗口（new 是本函数唯一
+  抛出点，此时无任何 OS 资源在手）。
+- **验收**：ASan 641/641 ✅ | TSan 全量 0 告警 ✅（按 CI 门控排除两项既知
+  假阳性）| TSan 并发套件 ×3 各 86/86 无挂起 ✅ | Debug/Release/ASan/TSan
+  四树编译零新告警 ✅
 
-- **位置**：`src/cask/cask.cpp:1010-1016`；`include/bitcask/thread_pool.hpp:435-443`（原代码）；
-  `:445-454`（保留的 flush_upto 方法）
-- **工作量**：半天（须含失败注入测试设计）
-- **验收**：641+/ctest 通过 + 新增持续写 + 并发查询测试
-- **优先级**：🟡 高（高写入负载下搜索停顿）
+### T20 — P6-DUR-1：hnsw 三处原子写补 fdatasync 🔴 HIGH
 
-### T9 — RED-4/8/11：死代码清理 🟢 LOW
+**症状**：全库原子写规范（`keydir.cpp:1565-1567`，「可重建 ≠ 可以不
+fdatasync」）9 站点中 6 个遵守；`hnsw.cpp` 三处 FILE* save 路径
+（`:2015-2023` save / `:491-538` save_vec_payload / `:564-588`
+write_bcq8_file）rename 前**无任何 sync**，且无豁免注释。同文件 fd 增量
+路径（:1613/:1636/:1782/:1816）全部 fdatasync——一个文件两套纪律。
+后果：崩溃后最终文件名下可能是半截文件，**旧的好文件已被 rename 覆盖**。
 
-- **RED-4**：`c_api/internal.h:239-286` `fill_get_result`（零调用，view 版取代）
-- **RED-8**：`include/bitcask/text_utils.hpp:143-155` `to_codepoints_reuse`（零调用）
-- **RED-11**：`include/bitcask/meta_codec.hpp:80-87` `detail::vbyte_append`（零调用）
+**修复方向**：三处在 fclose 前补 `fflush` + `::fdatasync(::fileno(f))`，
+失败走既有 remove(tmp) 路径。与 keydir.cpp:1568-1571 逐字同款。
 
-- **工作量**：2 小时（合计 ~71 行删除）
-- **验收**：全量编译 + ctest 通过
+- **位置**：`src/vector/hnsw.cpp:2015-2023, 491-538, 564-588`
+- **工作量**：30 分钟
+- **验收**：641/641 ctest（hnsw/vector_plugin 套件重点）
+- **优先级**：🔴 高（独立持久性修复，不依赖任何重构）
 
-### T10 — RED-2/7 + MEM-LOW-1：`detail/file_util.hpp` 公共归宿 🟡 MED
+#### ✅ T20 落地记录（2026-07-15）
 
-**症状**：FileCloser 定义 9 份 + fread 整读样板 6 份 + tmp+fsync+rename 原子写 ~7 处；
-`field_schema.hpp` 的裸 FILE* 在 bad_alloc 路径泄漏（MEM-LOW-1）正因未消费同一基建。
+三处均在 rename 前补 `fflush` + `::fdatasync(::fileno(f))`，失败走既有
+remove(tmp) 路径。`<unistd.h>` 原已 include（hnsw.cpp:26），无新依赖。
+**比 keydir 原型多一处加固**：`keydir.cpp:1568` 忽略 `fflush` 返回值
+（disk-full 时 fflush 失败但 fdatasync 可能对已落盘部分成功 → rename 出
+半截文件）；三处新代码均检查 `fflush() == 0 && fdatasync() == 0`。
+建议 T21 归并 `AtomicFileWriter` 时把这个加固回灌 keydir。
 
-**修复方向**：新建 `include/bitcask/detail/file_util.hpp`：
-- `FilePtr` = `unique_ptr<FILE, FileCloser>`（统一 closer）
-- `read_file_bytes(path)` 替代 6 份样板
-- `atomic_write_bytes(path, bytes)` 替代 ~7 处 tmp+fsync+rename
-- 顺带闭合 MEM-LOW-1（field_schema.hpp 改用 FilePtr）
+- **验收**：ASan `Hnsw|Vector|Ivf|Diskann|SegmentV2|Checkpoint` 105/105 ✅
+  （零 ASan 报告）| ASan 全量 641/641 ✅
 
-- **位置**：新建 `detail/file_util.hpp`；改 `field_schema.hpp` / `hnsw.cpp` / `keydir.cpp` / `inverted.cpp` / `segment_v2.cpp` 等
+### T21 — P6-RED-1/2：T10 真正收尾——read_file_bytes + AtomicFileWriter 🟡 MED
+
+**症状**：`file_util.hpp` 头注释 :12-13 自承的欠债兑现为三处漂移
+（T20 的 fsync 分叉、T23 的 need 公式、T22 的注释断言）。
+
+**修复方向**（`detail/file_util.hpp` 扩展）：
+1. `read_file_bytes`：把 `migrate.cpp:45-59` 现成的 `read_all` 搬进
+   file_util.hpp,`template <class Byte>` 吸收 uint8_t/byte 分叉;迁移 5 站点
+   （hnsw.cpp:2031 / keydir.cpp:1588 / inverted.cpp:1272 / segment_v2.cpp:954 /
+   search_checkpoint.hpp:326）,尺寸谓词由调用方查 `.size()` 保留
+2. `atomic_write_bytes(path, span)`：迁移 4 份 buffer 式（keydir /
+   search_checkpoint / index_manifest（保留其目录 fsync 增强）/ segment_v2:942）
+3. `AtomicFileWriter` RAII：迁移 5 份流式（field_schema / segment_v2:376 /
+   hnsw ×3——T20 先行后此处是纯收编）
+
+- **工作量**：1 天
+- **验收**：641/641 ctest;sync 纪律从 9 处可审收敛为 1 处可审
+- **依赖**：T20 先行(持久性修复不等重构)
+- **优先级**：🟡 高（结构性防 P6-DUR-1 类漂移复发,~100 行回收）
+
+### T22 — P6-RED-4：Analyzer 双出口归并 ×2 组 🟡 MED
+
+- **4b（先做,1 小时)**：`WhitespaceAnalyzer` 照抄 JiebaAnalyzer 既有先例
+  （`jieba_analyzer.cpp:126` `collect_tokens(text, need_offsets)`）,
+  `analyzer.cpp:356-398` 与 `:400-443` 前 39 行完全相同,仅 4 行 sink 差异。
+- **4a（半天)**：`NgramAnalyzer::analyze_with_positions`（:211-285）与
+  `analyze`（:292-350）——S29-8 注释断言两版「term 集与 tf 值逐位一致」,
+  该不变量是索引路径与 BOW 查询路径的一致性前提,目前靠复制粘贴维护。
+  `template <class Sink>` + `if constexpr` 归并,保住 tf 版零 positions
+  分配特性。**验收须含 term/tf 逐位一致对拍测试**（把注释断言变成测试断言）。
+
+- **位置**：`src/text/analyzer.cpp`
+- **工作量**：合计 1 天内
+- **验收**：641/641 ctest + text 套件重点回归 + 4a 的对拍测试
+- **优先级**：🟡 中（4a 是"等着被踩的雷"——过滤语义单边修改即静默分叉）
+
+### T23 — P6-RED-3：ChunkedReader 归并 refill ×3 🟡 MED
+
+`hint_file.cpp:143-173 / :244-267`、`data_file.cpp:309-335` 三份 refill,
+注释自承抄袭,`need` 公式已漂移（data_file.cpp:322 掉了 `buf_len +`,
+当前无害但证明分别维护）。归并为 `detail::ChunkedReader{file_, end_bound}`,
+唯一参数化点是文件末界（total vs body_end）。
+
 - **工作量**：半天
-- **验收**：ctest 通过；ASan 下 field_schema 异常路径无 fd 泄漏
-- **优先级**：🟡 中
+- **验收**：641/641 ctest（fold/恢复路径套件重点）
+- **优先级**：🟡 中（~55 行,冷启动路径无性能顾虑）
 
-### T11 — RED-9：MmapRegion 推广或删除 🟡 MED
+### T24 — P6-RED-5：decode_rec 共享解包段模板归并 🟢 LOW
 
-T4 建了 RAII 基建但 8 处 mmap 站点零采用。
+`segment_v2.cpp:619-653` vs `:1007-1041` 逐字节相同。`template <class Out>`
+（PostingList 是 FlatPostings 结构超集）+ `if constexpr (requires { out.dls; })`
+保住热路径 dl 跳过,单态化零开销。真分叉部分（blocks 重建 vs dls+positions）
+留在 helper 外。
 
-**决策**：
-- 若 T10 期间发现只读 mmap 站点（ivf/diskann/segment_v2）易迁移 → 推广
-- 否则删除待用时再建（保留为零引用代码是漂移温床）
+- **工作量**：半天
+- **验收**：641/641 ctest + **bench 基准回归**（decode_rec 在 WAND/bool/
+  wildcard 热路径,:809 等 6 调用点）;须 build-rel 双树验证（见 memory:
+  build-rel 编 bench 能抓 Debug 套件漏掉的问题）
+- **优先级**：🟢 低（重复确凿但有基准门槛）
 
-- **位置**：`include/bitcask/detail/mmap_handle.hpp`
-- **工作量**：5 分钟（删）或半天（推广）
-- **验收**：0 引用确认 / 改造站点 ctest 通过
+### T25 — P6-RED-6：死代码 7 行删除 🟢 LOW
 
-### T12 — RED-1：HNSW ckpt 去重（T5 收尾）🟡 MED（已精确审计，待独立分支）
+- `porter_stemmer.hpp:52-55` `detail::ends_with_vowel`（4 行,全树仅定义）
+- `keydir.hpp:585` + `keydir.cpp:923` `newest_folder_epoch_`（2 行,仅写零读;
+  删除前确认:疑为漏掉的 IterInfo 导出字段,若是补导出而非删除——问一下
+  设计意图或查 S 系列注释）
+- `codec.hpp:34` `kValueSizeOverflow`（1 行,构造不可达）
 
-T5 抽取了 IVF/DiskANN 但 HNSW 侧同构代码未回收。**已精确核实重复范围**：
-- `VectorPlugin::flush`（`src/search/vector_plugin.cpp:511-555`，~45 行）
-  与 `SealedSegmentVectorPlugin<SealedT>::flush`
-  （`include/bitcask/detail/sealed_segment_vector_plugin.hpp:672-709`）
-  **逐字节相同**——`cap_hit` / `window_hit` / `want_base` 三门决策 + dirty/delta
-  跳过 + delta 落盘 + 链回执整段结构同构。
-- save_component_delta（~40 行）高度相似（kDeltaInfo + 段型 + chain 三元组）。
-- load_component / save_component_base 结构同构但段类型不同（HNSW 走 base+payload，
-  sealed 走 base+sidecar）。
+- **工作量**：10 分钟（+ newest_folder_epoch_ 的 5 分钟考据）
+- **验收**：全量编译 + ctest
 
-**约束**：`sealed_segment_vector_plugin.hpp:33-36` 头注释明确 HNSW 不应继承
-SealedSegmentVectorPlugin——HNSW 无 sealed/window 双路径（HNSW 即是 window 本身）。
-正确去重方向：新建**非模板** `VectorCkptDriver` 基类（持 chain_/config_/
-vec_docs_since_base_/rebase_needed_/delta_ 共享状态 + final flush() 方法），
-HNSW VectorPlugin 与 SealedSegmentVectorPlugin<SealedT> 均继承之，派生类只
-override 真正差异化的 save/load hook（base 写法、delta 序列化、load 段类型）。
+### T26 — 文档收尾 🟢 LOW
 
-**风险与门槛**：
-- 涉及 VectorPlugin / IvfPlugin / DiskannPlugin 三者的继承链改造
-- 必须 HNSW + IVF + DiskANN 三引擎测试全过（参考 T5 commit `ba99af2` 工作量）
-- 预估 1 天工作量
-
-**为何不在本分支完成**：T8 教训显示无充分失败注入测试覆盖时的重构风险高，
-且向量子系统为代码库最复杂部分（~5000+ 行）。本任务应独立分支、独立深度 agent、
-独立测试周期完成。
-
-- **位置**：`src/search/vector_plugin.cpp` + `include/bitcask/vector_plugin.hpp`；
-  新基类建议放 `include/bitcask/detail/vector_ckpt_driver.hpp`
-- **工作量**：1 天（须向量三引擎测试全过）
-- **验收**：HNSW + IVF + DiskANN 测试套件全过；flush/save_delta/load 重复行归零
-- **优先级**：🟡 中（已确认重复，但去重非紧迫——current code 641/641 干净运行）
-
-### T13 — DL 陷阱 6：插件契约文档固化 🟢 LOW
-
-`plugin_api.hpp` 明文禁止在 reducer 上下文（on_put/on_delete/RunFn 内）调用
-`PluginHost::run_serialized`——当前不可达，但缺乏编译期/文档约束。
-
-- **位置**：`include/bitcask/plugin_api.hpp`
-- **工作量**：10 分钟
-- **验收**：注释 + 断言（debug 模式检测调用者线程上下文）
+- RISK_REPORT.md 基线修正 ✅（随本次 Phase 6 更新已完成:reinterpret_cast
+  假阴性 ×2 处、RED-1 行数、方法学备注）
+- TASK.md T14 表述修正 ✅（本文件归档表已注明）
+- 剩余：`cask.hpp:1019-1023` 注释修正 → 归入 T19 第 3 步
 
 ---
 
-## 🔴 Phase 5：复核确认的修复任务（2026-07-14 三次核对后定稿）
-
-> 来源：Phase 5 审计（4 路并行）+ 主 Agent 逐条重读代码复核。
-> 复核修订要点：P5-MEM-1 使用点 7 处非 4 处且模式源自 S13-F2；
-> P5-MEM-2 新增第三处漏点；P5-DL-3 升档（死代码在热路径留有真实开销）。
-
-### T14 — P5-MEM-1：OrdSkipGuard 析构异常安全 🔴 HIGH ✅
-
-**症状**：`~OrdSkipGuard()`（`include/bitcask/cask.hpp:1007-1012`）隐式 noexcept，
-内部调用链 `submit_index_task → IndexPool::submit → queue_.push`
-（`thread_pool.hpp:431`，TBB 有界队列内部分配可抛 bad_alloc）无一处 noexcept。
-submit 抛出 → 栈回退中析构再抛 → `std::terminate()`（进程立即死亡，不可恢复）。
-
-**范围（复核修订）**：**7 个使用点**共享同一析构——
-`src/cask/cask.cpp:505 / 1060 / 1801 / 1877 / 2235 / 2469 / 2575`。
-模式自 S13-F2 起即存在（1060/1801/1877），T7 新增 4 处（505/2235/2469/2575）。
-
-**修复方向**：析构内
-`try { cask->submit_index_task(...); } catch (...) { /* 记录 ord 泄漏,不抛 */ }`。
-代价：极端 bad_alloc 下泄漏 1 个 ord（可恢复，触发 30s 超时路径）；
-收益：消除 terminate（不可恢复）。一处修改覆盖全部 7 个使用点。
-
-- **位置**：`include/bitcask/cask.hpp:1007-1012`
-- **工作量**：30 分钟
-- **验收**：641/641 ctest；建议补 log_warn 记录兜底触发
-
-### T15 — P5-MEM-2：checkpoint 三处漏更新 last_ckpt_ord_ 🟡 MED ✅
-
-**症状**：`last_ckpt_ord_` 唯一消费点是自动 ckpt 阈值判断（`cask.cpp:2456`）。
-三处成功保存 ckpt 却不推进水位 → 下次写入触发冗余 ckpt（重复劳动+日志噪音）：
-
-1. `cask.cpp:2215-2224` is_stopped 同步分支——注释声称 "synchronous path sets
-   last_ckpt_ord itself"，**与代码直接矛盾**
-2. `cask.cpp:2311-2321` 无索引池分支（理论不可达，同样漏）——复核新增
-3. `cask.cpp:2580-2601` merge 的 RunFn 与 else 两分支——merge 后 rebase 全量
-   ckpt 已落盘却不推进水位，紧随的写入立刻触发一次冗余自动 ckpt
-
-**修复方向**：三处成功路径后补
-`last_ckpt_ord_.store(<对应 wm>, std::memory_order_relaxed);`；
-同步分支的矛盾注释一并修正。
-
-- **工作量**：15 分钟
-- **验收**：641/641 ctest；merge 后自动 ckpt 不再立即触发（可加计数断言）
-
-### T16 — P5-DL-3：删除 flush_upto + reducer 每任务通知块 🟡 MED（复核升档）✅
-
-**症状**：`flush_upto`（`thread_pool.hpp:447`）T8 revert 后零调用；
-`reducer_loop:653-656` 每 apply 一个索引事件取一次全局 `flush_mu_` + `notify_all`，
-注释明示专为 flush_upto 服务——即死代码在 reducer 热路径留有**每任务全局锁开销**。
-常规 `flush()` 的唤醒由 `dec_in_flight` 归零通知完全覆盖
-（applied_ord 在 dec 之前 store，无丢失唤醒窗口）。
-
-**修复方向**：删 flush_upto 定义 + 删 :653-656 通知块。
-**前置确认**：unregister_lib 等待路径不依赖 per-apply 通知（只依赖 in_flight 归零）。
-若 T8 重设计仍需 flush_upto，届时从 git 历史恢复。
-
-- **工作量**：1 小时（含前置确认 + 并发测试回归）
-- **验收**：641/641 ctest + TSan 树通过；merge_concurrent_writer_test 等并发套件重点回归
-
-### T17 — NEW-P4-1 + RED-7残：T10 收尾 🟢 LOW ✅
-
-- `field_schema.hpp:73/230` 本地别名 ReadFilePtr/WriteFilePtr → 直接用
-  `detail::FilePtr`（file_util.hpp:31 已存在）
-- `hnsw.cpp:1525` 本地 `pwrite_all` → 消费 `vec_disk_internal.hpp:25`
-  的 `diskint::pwrite_all`（同目录内部头，5 个调用点）
-
-- **工作量**：30 分钟
-- **验收**：641/641 ctest
-
-### T18 — P5-DL-1/2：thread-safety 文档化模式偏离 🟢 LOW ✅
-
-- P5-DL-1：checkpoint() 在 **ckpt_mu_ 临界区内**（函数级 lock_guard，`cask.cpp:2203`）
-  做 30s 有界 cv 等待，WriteOpGate 同时持有——reducer 卡住时 close() 与后续
-  checkpoint 调用者最坏拖 30s。非死锁（done_mu 为 per-call 局部 + 30s 上界），
-  但须在 docs/design/thread-safety.md 记录此例外及其安全论证
-- P5-DL-2：reducer_loop 连续两次取 flush_mu_（notify + dec_in_flight）偏离
-  "任一时刻至多持一把锁"文档模式——T16 删除通知块后自然消失，届时只需
-  文档化 dec_in_flight 单点通知
-
-- **工作量**：30 分钟（若 T16 先行，P5-DL-2 部分免除）
-- **验收**：文档更新，无代码变更（或随 T16 合并）
-
-### Phase 5 执行序
+## Phase 6 执行序
 
 ```
-T14 (30min) ──┐
-T15 (15min) ──┼── 可同一 commit（均为 cask 行级修改，互不冲突）
-              │
-T16 (1h)    ──┴── 独立 commit（须 TSan 回归），完成后 T18 的 DL-2 部分免除
-T17 (30min) ───── 独立小 commit
-T18 (30min) ───── 文档 commit（T16 之后做）
-```
-
-**Phase 5 不做**（转入 backlog）：RED-1（T12 独立分支既定）、RED-3/5/6/10
-（冗余去重非 bug，随后续重构自然消化）、T8 重设计（须失败注入测试先行）。
-
----
-
-## Phase 4 执行序与依赖图
-
-```
-并行启动（互不依赖）：
-  ├── Track A: T6  (MEM-MED-1，1h，主 Agent 直接修，最小补丁)
-  ├── Track B: T9  (死代码清理，2h，主 Agent 直接修)
-  └── Track C: T7  (DL-MED-1/2，半天，委派 deep agent)
-
-T7 完成后：
-  └── T8  (DL-MED-3，半天，依赖 T7 的 timeout 基建)
-
-独立但需配合：
-  ├── T10 + T11 (file_util.hpp + MmapRegion 推广/删，合并执行半天)
-  └── T13 (10 min 注释加固)
-
-最后（独立分支）：
-  └── T12 (HNSW 去重，须三引擎测试全过)
+T20 (30min) ───── 最先,独立 commit（持久性修复,不等任何重构）
+T19 (半天)  ───── 独立 commit（须 TSan 回归;含 P6-MEM-2/3 顺手项 + T14 注释修正）
+T25 (10min) ───── 随手,可并入任意 commit
+T21 (1天)   ───── T20 之后（hnsw 三处变纯收编）
+T22 (1天)   ───── 4b 先行 1 小时,4a 须对拍测试
+T23 (半天)  ───── 独立
+T24 (半天)  ───── 最后（须 bench 基准 + build-rel 双树）
 ```
 
 ---
 
-## 当前状态快照
+## ⏸ 遗留任务（Phase 6 明确不做,前置条件未满足）
 
-| 项 | 状态 | 验证 |
-|---|---|---|
-| T1 CRC32 入口统一 | ✅ done | 641/641 ctest |
-| T2 vbyte 归并 | ✅ done | 641/641 ctest |
-| T3 .clang-tidy | ✅ done | 本地 clang-tidy 21 验证 |
-| T4 MmapRegion 基础设施 | ✅ done | 类已创建，渐进式应用 |
-| T5 SealedSegmentVectorPlugin | ✅ done | commit ba99af2 |
-| T6 MEM-MED-1 修复 | ✅ done | 641/641 ctest（cask.cpp acquire 后置位） |
-| T7 DL-MED-1/2 修复 | ✅ done | 641/641 ctest（OrdSkipGuard ×4 + cv+mutex 有界等待 + is_stopped 同步回退） |
-| T9 死代码清理 | ✅ done | 641/641 ctest（fill_get_result / to_codepoints_reuse / vbyte_append） |
-| T13 插件契约文档 | ✅ done | plugin_api.hpp run_serialized 死锁陷阱注释 |
-| MEM-LOW-1 field_schema FILE* | ✅ done | 641/641 ctest（裸 FILE* → FilePtr RAII） |
-| T8 DL-MED-3 修复 | ⚠️ revert | 初版 snapshot-hwm 方案在非并发场景下产生搜索漏召（4 测失败）；thread_pool.hpp 保留 flush_upto 工具方法供后续重新设计使用 |
-| T10 file_util.hpp | ✅ done | 641/641 ctest（9 FileCloser → 1 detail/file_util.hpp；含 field_schema MEM-LOW-1 闭合） |
-| T11 MmapRegion 决策 | ✅ done | 641/641 ctest（删除建而未用的 mmap_handle.hpp，71 行；可从 git 历史恢复） |
-| T12 HNSW ckpt 去重 | ⚠️ 已精确审计 | 已验证 VectorPlugin::flush 与 SealedSegmentVectorPlugin::flush 逐字节相同；待独立分支执行（须向量三引擎测试全过 + 新建 VectorCkptDriver 非模板基类） |
-| T14 OrdSkipGuard 析构异常安全 | ✅ done | cask.hpp 析构 try-catch + log_warn 兜底；ASan smoke/checkpoint/crash/merge_concurrent 全过（一处修复覆盖 7 使用点） |
-| T15 last_ckpt_ord_ 三处漏更新 | ✅ done | 三处补 store（is_stopped/无池/merge 两分支）+ 修矛盾注释；确认纯 KV 早返回无需（auto ckpt 仅 text_ 模式）；ASan checkpoint/merge/keydir/cask_docvalue 全过 |
-| T16 flush_upto + 每任务通知块删除 | ✅ done | 删 flush_upto + reducer:653-656 通知块；前置确认 flush()/unregister_lib 只依赖 dec_in_flight 归零通知；ASan+TSan 全过 + TSan ×5 无挂起 |
-| T17 T10 收尾（FilePtr 别名 + pwrite_all） | ✅ done | field_schema 用 detail::FilePtr；hnsw 用 diskint::pwrite_all（含 vec_disk_internal.hpp）；ASan hnsw(20)/vector_plugin/cask_docvalue/text_plugin/smoke 全过 |
-| T18 thread-safety 文档化 | ✅ done | doc/concurrency-zh.md 补 P5-DL-1（ckpt_mu_ 跨 30s 有界等待）+ P5-DL-2（随 T16 消解）；无代码改动 |
+### T8 — DL-MED-3：搜索读屏障无界等待（⚠️ 暂缓,前置未满足）
+
+`prepare_search()` → `flush()` 谓词 `in_flight==0 && applied>=hwm`,hwm
+**活读**无自然终止边界;饱和写入下为**饥饿**（非死锁,写方停手即恢复）。
+现有 3 个持续写+并发查询测试全过（写者磁盘 IO 主导,天然慢于索引排空,
+触发需索引侧成为瓶颈）。初版 snapshot-hwm 方案曾致 4 个非并发测试漏召
+（测试名未留档,改动未进 git）——说明 `applied>=hwm` **不蕴含可搜**,
+`in_flight==0` 兼任可见性屏障,放宽谓词的前提本身待证。
+
+**重启前置（缺一不可）**：
+1. 可复现饥饿的失败注入测试（多写线程/大文档/重 analyzer 让索引侧成瓶颈）
+2. applied_ord 推进与搜索可见性精确关系调查（DWPT builder 发布时序）
+3. T19 的 flush 超时基建（已排入本轮）
+4. 若恢复 flush_upto,须**连同** reducer 每任务通知块一起恢复（T16 删除后
+   flush_cv_ 仅剩 dec_in_flight 1→0 单点 notify,光恢复方法体谓词无人唤醒）
+
+### T12 — RED-1：HNSW ckpt 去重（独立分支既定）
+
+重复已精确核实 ~115 行（flush 35 逐字节 + delta 31 + load ~50）。
+非模板 `VectorCkptDriver` 基类**无技术障碍**（SealedT 不进入共享方法,
+10 个共享成员全为具体类型;replay_gate_ 留派生类）。
+**默认不做**——115 行换 1 天 + 磁盘格式兼容面风险,不划算,且不修任何 bug。
+**替代动作（5 分钟,建议随 T20 顺手做）**：把三门决策的理由注释
+（S32-M1/S20-3 B-B2）从 vector_plugin.cpp 同步到 sealed 侧,双向标注
+「改此处须同步另一处」——拿走大部分漂移风险,零测试成本。
+若未来真做：独立分支 + HNSW/IVF/DiskANN 三引擎测试全过。
+
+### Backlog（随后续重构自然消化,Phase 6 复核全部仍成立）
+
+RED-3（三份 LE 编解码,byte_order.hpp 补 vector-append 形态）、
+RED-5（search_layer f32/int8 成对,须基准）、RED-6（IVF/DiskANN open 骨架）、
+RED-10（SnapCursor::vb,价值低）。
 
 ---
 
-## 下一轮审计目标（来自主 Agent 综合分析的盲区）
+## 当前状态快照（Phase 6 起点）
 
-报告聚焦资源管理，但 **Bitcask 协议正确性维度存在系统性盲区**——
-basho/bitcask 生产史上最严重 bug 的来源。建议 Phase 5 专项审计：
+| 项 | 状态 |
+|---|---|
+| T1-T18 | ✅ 归档（见上表;T14 表述已修正） |
+| T19 flush 有界等待 + submit 补偿 | ✅ done（含 P6-MEM-2/3;两处计划偏离见落地记录） |
+| T20 hnsw fdatasync ×3 | ✅ done（ASan hnsw/vector/segment 105/105） |
+| T21 read_file_bytes + AtomicFileWriter | 🟡 待做 |
+| T22 Analyzer 双出口 ×2 | 🟡 待做 |
+| T23 ChunkedReader | 🟡 待做 |
+| T24 decode_rec 模板 | 🟢 待做 |
+| T25 死代码 7 行 | 🟢 待做 |
+| T26 文档收尾 | 🟢 大部分已随本次更新完成 |
+| T8 | ⏸ 暂缓（4 项前置见上） |
+| T12 | ⏸ 默认不做（注释同步替代） |
 
-1. **🔴 Tombstone/Merge 语义正确性**（basho #82 删除复活类、#149/174/175 merge 竞态）
-2. **🟠 fsync/fdatasync 纪律审计**（WAL 持久性、meta/ckpt 原子性、backup 一致点）
+---
+
+## 下一轮审计目标（Phase 7 候选,继承自 Phase 5 提出的协议盲区）
+
+1. **🔴 Tombstone/Merge 语义正确性**（basho #82 删除复活类、#149/174/175
+   merge 竞态）——仍是最大盲区
+2. **🟠 fsync/fdatasync 纪律审计**——P6-DUR-1 已提前兑现一部分（原子写
+   站点清点完毕）;剩余:WAL put 路径持久性、backup 一致点、**目录 fsync**
+   （9 站点中仅 index_manifest 做了,rename 的目录项持久性普遍缺失,值得专项）
 3. **🟠 Lock 文件健壮性**（空文件、PID 复用、disk-full 失败传播）
 4. **🟡 CRC 回退路径完整性**（hint 失败回退扫描时是否做 CRC 校验）
