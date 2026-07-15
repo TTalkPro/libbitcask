@@ -433,6 +433,12 @@ T load_pod(const std::byte* p) {
 std::unique_ptr<MmapSegment> MmapSegment::open(const std::string& path,
                                                bm25::Bm25Params params,
                                                bool verify_crc) {
+    // P6-MEM-3：对象先于任何 OS 资源建立——operator new 是本函数唯一的抛出点，
+    // 提到 open/mmap 之前则抛出时无资源在手。原序（mmap → close(fd) → new）下
+    // new 抛出会泄漏整个映射（fd 已关，map 是唯一句柄，无人 munmap，可达 GB 级
+    // 虚拟地址空间）。建后所有早返回均由 ~MmapSegment 的 munmap 兜住。
+    auto seg = std::unique_ptr<MmapSegment>(new MmapSegment());
+
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return nullptr;
     struct stat st{};
@@ -445,7 +451,6 @@ std::unique_ptr<MmapSegment> MmapSegment::open(const std::string& path,
     ::close(fd);  // mmap 后 fd 可关(纯映射读,无 pread 路径)
     if (map == MAP_FAILED) return nullptr;
 
-    auto seg = std::unique_ptr<MmapSegment>(new MmapSegment());
     seg->base_ = static_cast<const std::byte*>(map);
     seg->len_ = fsize;
     const std::byte* b = seg->base_;
