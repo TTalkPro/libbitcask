@@ -185,6 +185,122 @@ void ngram_tokenize(const std::vector<detail::CpInfo>& cps,
     }
 }
 
+// T22-4a：Ngram 词项产出，analyze_with_positions 与 analyze（tf-only）共享。
+// 在 ngram_tokenize 之上再包一层，把**过滤语义**（min_token_length /
+// max_token_bytes / 空 term）也纳入共享——原两份各写一遍，而 S29-8 注释
+// 断言两版「term 集与 tf 值逐位一致」，该不变量是索引路径（positions 版）
+// 与 BOW 查询路径（tf 版）的一致性前提，却全靠复制粘贴维护。此处把断言
+// 变成结构保证（对拍测试见 analyzer_test 的 NgramTfMatchesPositions*）。
+//
+// sink(term, pos) 按值收 pos：tf 版直接忽略形参 → 零 positions 分配，
+// S29-8 的性能取舍（一篇 CJK 文档数千唯一 n-gram，每个一次 vector 堆分配）
+// 完整保留。故此处不采用 Jieba collect_tokens 的物化 token 向量方案。
+template <class Sink>
+void ngram_collect(const std::vector<detail::CpInfo>& cps,
+                   const std::string& normalized, std::uint32_t min_n,
+                   std::uint32_t max_n, std::uint32_t min_token_length,
+                   std::uint32_t max_token_bytes, Sink&& sink) {
+    std::uint32_t pos = 0;
+
+    auto emit_ngrams = [&](std::size_t start, std::size_t end) {
+        const auto n = end - start;
+        for (std::size_t gram = min_n; gram <= max_n; ++gram) {
+            if (gram > n) break;
+            for (std::size_t j = start; j + gram <= end; ++j) {
+                const auto& first_cp = cps[j];
+                const auto& last_cp = cps[j + gram - 1];
+                std::string_view term(
+                    normalized.data() + first_cp.byte_off,
+                    (last_cp.byte_off + last_cp.byte_len) - first_cp.byte_off);
+                sink(term, pos);
+            }
+        }
+        ++pos;
+    };
+
+    auto emit_word = [&](std::size_t start, std::size_t end) {
+        // S9.8：拉丁整词按 codepoint 长度过滤；短词丢弃但 pos 仍递增。
+        if (end - start >= min_token_length &&
+            (max_token_bytes == 0 ||
+             (cps[end - 1].byte_off + cps[end - 1].byte_len) -
+                     cps[start].byte_off <=
+                 max_token_bytes)) {  // S31:超长 token 丢弃(pos 语义不变)
+            const auto& first = cps[start];
+            const auto& last = cps[end - 1];
+            std::string_view term(
+                normalized.data() + first.byte_off,
+                (last.byte_off + last.byte_len) - first.byte_off);
+            if (!term.empty()) sink(term, pos);
+        }
+        ++pos;
+    };
+
+    ngram_tokenize(cps, emit_ngrams, emit_word);  // S29-8：共享主循环
+}
+
+// T22-4a：view-map → string-map 物化 + 停用词过滤，两版共享。
+// W1：内部以 string_view 去重，仅在此对每个唯一 term 分配一次 std::string。
+// 停用词按最终 string key 查（两版一致）。
+template <class OutMap, class ViewMap>
+OutMap materialize_and_filter(ViewMap& vm, bool enable_stop_words,
+                              const std::unordered_set<std::string>& stops) {
+    OutMap out;
+    out.reserve(vm.size());
+    for (auto& [view, val] : vm) {
+        out.emplace(std::string(view), std::move(val));
+    }
+    if (enable_stop_words && !stops.empty()) {
+        for (auto it = out.begin(); it != out.end();) {
+            if (stops.count(it->first) != 0) {
+                it = out.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    return out;
+}
+
+// T22-4b：空白分词主循环，analyze_with_positions 与 analyze_with_offsets
+// 共享（原两份前 39 行逐字相同，仅末尾 4 行 sink 不同 → 过滤语义单边修改
+// 即静默分叉）。sink(term, pos, start_byte, end_byte) 只在词通过全部过滤后
+// 调用；短词/超长词丢弃但 pos 仍递增（S9.8/S31 位置语义）。
+// 参照 JiebaAnalyzer::collect_tokens 的双出口先例，但不物化 token 向量——
+// 直接回调，省一次中间分配。
+template <class Sink>
+void whitespace_tokenize(const std::vector<detail::CpInfo>& cps,
+                         const std::string& normalized,
+                         std::uint32_t min_token_length,
+                         std::uint32_t max_token_bytes, Sink&& sink) {
+    std::size_t i = 0;
+    std::uint32_t pos = 0;
+    while (i < cps.size()) {
+        if (detail::is_unicode_space(cps[i].cp)) {
+            ++i;
+            continue;
+        }
+        const std::size_t word_start = i;
+        while (i < cps.size() && !detail::is_unicode_space(cps[i].cp)) {
+            ++i;
+        }
+        // S9.8：按 codepoint 长度过滤短词；短词丢弃但 pos 仍递增。
+        if (i - word_start >= min_token_length &&
+            (max_token_bytes == 0 ||
+             (cps[i - 1].byte_off + cps[i - 1].byte_len) -
+                     cps[word_start].byte_off <=
+                 max_token_bytes)) {  // S31:超长 token 丢弃(pos 语义不变)
+            const auto& first = cps[word_start];
+            const auto& last = cps[i - 1];
+            const std::size_t start_byte = first.byte_off;
+            const std::size_t end_byte = last.byte_off + last.byte_len;
+            std::string_view term(normalized.data() + start_byte,
+                                  end_byte - start_byte);
+            if (!term.empty()) sink(term, pos, start_byte, end_byte);
+        }
+        ++pos;
+    }
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -219,76 +335,27 @@ auto NgramAnalyzer::analyze_with_positions(std::string_view text) const -> TermP
 
     // W1：内部以 string_view 去重，仅在末尾对每个唯一 term 分配一次 std::string。
     // 安全前提：normalized 在本函数内持有全部字节，vpm 不超过其生命周期。
-    using ViewMap = std::unordered_map<std::string_view,
-                                       std::pair<std::uint32_t, std::vector<std::uint32_t>>>;
-    ViewMap vpm;
-    std::uint32_t pos = 0;
-
-    auto emit_ngrams = [&](std::size_t start, std::size_t end) {
-        auto n = end - start;
-        for (std::size_t gram = min_n_; gram <= max_n_; ++gram) {
-            if (gram > n) break;
-            for (std::size_t j = start; j + gram <= end; ++j) {
-                auto& first_cp = cps[j];
-                auto& last_cp = cps[j + gram - 1];
-                std::string_view term(
-                    normalized.data() + first_cp.byte_off,
-                    (last_cp.byte_off + last_cp.byte_len) - first_cp.byte_off);
-                auto& [tf, positions] = vpm[term];
-                ++tf;
-                positions.push_back(pos);
-            }
-        }
-        ++pos;
-    };
-
-    auto emit_word = [&](std::size_t start, std::size_t end) {
-        // S9.8：拉丁整词按 codepoint 长度过滤；短词丢弃但 pos 仍递增（位置语义不变）。
-        if (end - start >= min_token_length_ &&
-            (max_token_bytes_ == 0 ||
-             (cps[end - 1].byte_off + cps[end - 1].byte_len) -
-                     cps[start].byte_off <=
-                 max_token_bytes_)) {  // S31:超长 token 丢弃(pos 语义不变)
-            auto& first = cps[start];
-            auto& last = cps[end - 1];
-            std::string_view term(
-                normalized.data() + first.byte_off,
-                (last.byte_off + last.byte_len) - first.byte_off);
-            if (!term.empty()) {
-                auto& [tf, positions] = vpm[term];
-                ++tf;
-                positions.push_back(pos);
-            }
-        }
-        ++pos;
-    };
-
-    ngram_tokenize(cps, emit_ngrams, emit_word);  // S29-8：共享主循环
-
-    TermPositionsMap tpm;
-    tpm.reserve(vpm.size());
-    for (auto& [view, data] : vpm) {
-        tpm.emplace(std::string(view), std::move(data));
-    }
-
-    if (enable_stop_words_ && !stop_words_.empty()) {
-        for (auto it = tpm.begin(); it != tpm.end();) {
-            if (stop_words_.count(it->first)) {
-                it = tpm.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    return tpm;
+    std::unordered_map<std::string_view,
+                       std::pair<std::uint32_t, std::vector<std::uint32_t>>>
+        vpm;
+    ngram_collect(cps, normalized, min_n_, max_n_, min_token_length_,
+                  max_token_bytes_,
+                  [&](std::string_view term, std::uint32_t pos) {
+                      auto& [tf, positions] = vpm[term];
+                      ++tf;
+                      positions.push_back(pos);
+                  });
+    return materialize_and_filter<TermPositionsMap>(vpm, enable_stop_words_,
+                                                    stop_words_);
 }
 
 // S29-8：tf-only 覆写。基类默认从 analyze_with_positions 派生后丢弃
 // positions——一篇 CJK 文档数千个唯一 n-gram，每个一次 positions vector
 // 堆分配，BOW 查询（search_text 的 analyzer_->analyze）等 tf 消费方随即
-// 全部丢弃。本覆写与 positions 版共享 ngram_tokenize + 全部过滤语义
-// （min_token_length / 停用词），仅聚合 tf——term 集与 tf 值逐位一致。
+// 全部丢弃。本覆写与 positions 版共享 ngram_collect（含全部过滤语义）+
+// materialize_and_filter（含停用词），仅 sink 不同——**term 集与 tf 值
+// 逐位一致由结构保证**（T22-4a：原两版各写一遍过滤，该不变量靠复制粘贴
+// 维护）。sink 忽略 pos 形参 → 零 positions 分配，本覆写的性能理由不变。
 auto NgramAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
     if (text.empty()) return {};
 
@@ -297,56 +364,11 @@ auto NgramAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
     if (cps.empty()) return {};
 
     std::unordered_map<std::string_view, std::uint32_t> vfm;
-
-    auto emit_ngrams = [&](std::size_t start, std::size_t end) {
-        auto n = end - start;
-        for (std::size_t gram = min_n_; gram <= max_n_; ++gram) {
-            if (gram > n) break;
-            for (std::size_t j = start; j + gram <= end; ++j) {
-                auto& first_cp = cps[j];
-                auto& last_cp = cps[j + gram - 1];
-                std::string_view term(
-                    normalized.data() + first_cp.byte_off,
-                    (last_cp.byte_off + last_cp.byte_len) - first_cp.byte_off);
-                ++vfm[term];
-            }
-        }
-    };
-
-    auto emit_word = [&](std::size_t start, std::size_t end) {
-        if (end - start >= min_token_length_ &&
-            (max_token_bytes_ == 0 ||
-             (cps[end - 1].byte_off + cps[end - 1].byte_len) -
-                     cps[start].byte_off <=
-                 max_token_bytes_)) {  // S31:超长 token 丢弃(pos 语义不变)
-            auto& first = cps[start];
-            auto& last = cps[end - 1];
-            std::string_view term(
-                normalized.data() + first.byte_off,
-                (last.byte_off + last.byte_len) - first.byte_off);
-            if (!term.empty()) ++vfm[term];
-        }
-    };
-
-    ngram_tokenize(cps, emit_ngrams, emit_word);
-
-    TermFreqMap tfs;
-    tfs.reserve(vfm.size());
-    for (auto& [view, tf] : vfm) {
-        tfs.emplace(std::string(view), tf);
-    }
-
-    if (enable_stop_words_ && !stop_words_.empty()) {
-        for (auto it = tfs.begin(); it != tfs.end();) {
-            if (stop_words_.count(it->first)) {
-                it = tfs.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    return tfs;
+    ngram_collect(cps, normalized, min_n_, max_n_, min_token_length_,
+                  max_token_bytes_,
+                  [&](std::string_view term, std::uint32_t) { ++vfm[term]; });
+    return materialize_and_filter<TermFreqMap>(vfm, enable_stop_words_,
+                                               stop_words_);
 }
 
 // ===========================================================================
@@ -362,38 +384,13 @@ auto WhitespaceAnalyzer::analyze_with_positions(std::string_view text) const -> 
     if (cps.empty()) return {};
 
     TermPositionsMap tpm;
-    std::size_t i = 0;
-    std::uint32_t pos = 0;
-
-    while (i < cps.size()) {
-        if (detail::is_unicode_space(cps[i].cp)) {
-            ++i;
-            continue;
-        }
-        std::size_t word_start = i;
-        while (i < cps.size() && !detail::is_unicode_space(cps[i].cp)) {
-            ++i;
-        }
-        // S9.8：按 codepoint 长度过滤短词；短词丢弃但 pos 仍递增。
-        if (i - word_start >= min_token_length_ &&
-            (max_token_bytes_ == 0 ||
-             (cps[i - 1].byte_off + cps[i - 1].byte_len) -
-                     cps[word_start].byte_off <=
-                 max_token_bytes_)) {  // S31:超长 token 丢弃(pos 语义不变)
-            auto& first = cps[word_start];
-            auto& last = cps[i - 1];
-            auto term = std::string(
-                normalized.data() + first.byte_off,
-                (last.byte_off + last.byte_len) - first.byte_off);
-            if (!term.empty()) {
-                auto& [tf, positions] = tpm[std::move(term)];
-                ++tf;
-                positions.push_back(pos);
-            }
-        }
-        ++pos;
-    }
-
+    whitespace_tokenize(cps, normalized, min_token_length_, max_token_bytes_,
+                        [&](std::string_view term, std::uint32_t pos,
+                            std::size_t, std::size_t) {
+                            auto& [tf, positions] = tpm[std::string(term)];
+                            ++tf;
+                            positions.push_back(pos);
+                        });
     return tpm;
 }
 
@@ -406,39 +403,13 @@ auto WhitespaceAnalyzer::analyze_with_offsets(std::string_view text) const -> Te
     if (cps.empty()) return {};
 
     TermTokenMap ttm;
-    std::size_t i = 0;
-    std::uint32_t pos = 0;
-
-    while (i < cps.size()) {
-        if (detail::is_unicode_space(cps[i].cp)) {
-            ++i;
-            continue;
-        }
-        std::size_t word_start = i;
-        while (i < cps.size() && !detail::is_unicode_space(cps[i].cp)) {
-            ++i;
-        }
-        // S9.8：按 codepoint 长度过滤短词；短词丢弃但 pos 仍递增。
-        if (i - word_start >= min_token_length_ &&
-            (max_token_bytes_ == 0 ||
-             (cps[i - 1].byte_off + cps[i - 1].byte_len) -
-                     cps[word_start].byte_off <=
-                 max_token_bytes_)) {  // S31:超长 token 丢弃(pos 语义不变)
-            auto& first = cps[word_start];
-            auto& last = cps[i - 1];
-            auto term = std::string(
-                normalized.data() + first.byte_off,
-                (last.byte_off + last.byte_len) - first.byte_off);
-            if (!term.empty()) {
-                auto& infos = ttm[std::move(term)];
-                infos.push_back(TokenInfo{pos,
-                                          static_cast<std::uint32_t>(first.byte_off),
-                                          static_cast<std::uint32_t>(last.byte_off + last.byte_len)});
-            }
-        }
-        ++pos;
-    }
-
+    whitespace_tokenize(cps, normalized, min_token_length_, max_token_bytes_,
+                        [&](std::string_view term, std::uint32_t pos,
+                            std::size_t start_byte, std::size_t end_byte) {
+                            ttm[std::string(term)].push_back(TokenInfo{
+                                pos, static_cast<std::uint32_t>(start_byte),
+                                static_cast<std::uint32_t>(end_byte)});
+                        });
     return ttm;
 }
 

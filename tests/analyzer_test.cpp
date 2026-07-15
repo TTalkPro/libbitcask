@@ -463,3 +463,99 @@ TEST(AnalyzerMaxTokenBytes, NgramAndWhitespaceDropOversized) {
         EXPECT_EQ(tf0.count(monster), 1u);
     }
 }
+
+// ===========================================================================
+// T22-4a：analyze()（tf-only 覆写）与 analyze_with_positions() 的对拍
+//
+// S29-8 的注释声称两版「term 集与 tf 值逐位一致」。该不变量是**索引路径**
+// （positions 版，写入倒排）与 **BOW 查询路径**（tf 版，search_text）的一致
+// 性前提：一旦分叉，查询算出的 term 集与索引里的对不上 → 评分错误且静默。
+// 归并前两版各写一份过滤逻辑，此断言全靠复制粘贴维护；T22 把它变成结构
+// 保证（共享 ngram_collect + materialize_and_filter），本组测试则把它变成
+// **可执行断言**——即使将来有人重新拆开两版，这里也会立刻抓到。
+// ===========================================================================
+
+namespace {
+
+// tf 版与 positions 版必须产出同一 term 集，且 tf == positions.size()。
+void ExpectNgramTfMatchesPositions(const NgramAnalyzer& a,
+                                   std::string_view text,
+                                   std::string_view case_name) {
+    const auto tfs = a.analyze(text);
+    const auto tpm = a.analyze_with_positions(text);
+
+    EXPECT_EQ(tfs.size(), tpm.size()) << "term 集大小分叉 @ " << case_name;
+    for (const auto& [term, tf] : tfs) {
+        auto it = tpm.find(term);
+        ASSERT_NE(it, tpm.end())
+            << "tf 版有而 positions 版无: '" << term << "' @ " << case_name;
+        EXPECT_EQ(tf, it->second.first)
+            << "tf 值分叉: '" << term << "' @ " << case_name;
+        // positions 版自身的一致性：tf 必须等于记录的位置数。
+        EXPECT_EQ(tf, it->second.second.size())
+            << "tf 与 positions 数不符: '" << term << "' @ " << case_name;
+    }
+    for (const auto& [term, data] : tpm) {
+        EXPECT_EQ(tfs.count(term), 1u)
+            << "positions 版有而 tf 版无: '" << term << "' @ " << case_name;
+    }
+}
+
+}  // namespace
+
+TEST(NgramAnalyzer, TfMatchesPositionsAcrossInputShapes) {
+    NgramAnalyzer a(2, 3);
+    // 覆盖 ngram_tokenize 的每条分支：CJK run / 拉丁 run / 空白 / CJK 标点 /
+    // ASCII 标点 / 混排 / 重复 n-gram（tf > 1）/ 单字 / 纯标点。
+    const std::string_view cases[] = {
+        "北京市",
+        "哈哈哈哈",                    // 重复 → tf > 1
+        "hello world",
+        "北京市hello世界",             // CJK/拉丁混排
+        "北京，上海。广州",            // CJK 标点分隔
+        "a,b.c!d?e",                   // ASCII 标点
+        "中",                          // 单 CJK 字（短于 min_n）
+        "，。！",                      // 纯标点
+        "  多  空格  混排  test  ",
+        "",                            // 空输入
+        "ab cd ab cd ab",              // 拉丁重复 → tf > 1
+    };
+    for (auto text : cases) {
+        ExpectNgramTfMatchesPositions(a, text, text);
+    }
+}
+
+TEST(NgramAnalyzer, TfMatchesPositionsWithStopWords) {
+    // 停用词过滤在 materialize_and_filter 内，两版共享——但历史上是各写一遍。
+    NgramAnalyzer a(2, 2, /*enable_stop_words=*/true,
+                    {"the", "北京"}, /*min_token_length=*/1);
+    const std::string_view cases[] = {
+        "the quick brown fox",
+        "北京市上海",
+        "the the the",       // 全部被过滤 → 两版都应为空
+    };
+    for (auto text : cases) {
+        ExpectNgramTfMatchesPositions(a, text, text);
+    }
+}
+
+TEST(NgramAnalyzer, TfMatchesPositionsWithLengthFilters) {
+    // min_token_length / max_token_bytes 是最容易单边改错的两个门槛
+    // （S9.8 / S31）——原两版各写一遍同样的 if。
+    for (std::uint32_t min_len : {1u, 3u, 5u}) {
+        for (std::uint32_t max_bytes : {0u, 4u, 16u}) {
+            NgramAnalyzer a(2, 3, /*enable_stop_words=*/false, {},
+                            min_len, max_bytes);
+            const std::string label = "min_len=" + std::to_string(min_len) +
+                                      ",max_bytes=" + std::to_string(max_bytes);
+            const std::string_view cases[] = {
+                "a bb ccc dddd eeeee",
+                "short verylongtokenhere x",
+                "北京市 hello 世界 test",
+            };
+            for (auto text : cases) {
+                ExpectNgramTfMatchesPositions(a, text, label);
+            }
+        }
+    }
+}
