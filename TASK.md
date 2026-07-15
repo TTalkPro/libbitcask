@@ -153,6 +153,46 @@ remove(tmp) 路径。`<unistd.h>` 原已 include（hnsw.cpp:26），无新依赖
 - **依赖**：T20 先行(持久性修复不等重构)
 - **优先级**：🟡 高（结构性防 P6-DUR-1 类漂移复发,~100 行回收）
 
+#### ✅ T21 落地记录（2026-07-15）
+
+**归并前实测四套 fsync 纪律**（比 RISK_REPORT 记的三套还多一层）：
+① keydir/search_checkpoint 检查 fdatasync 但丢弃 fflush 返回值；
+② **`index_manifest.hpp:176` 连 fdatasync 返回值都丢弃**（`if (wrote) ::fdatasync(...)`）；
+③ field_schema 用 `::fsync`；④ hnsw ×3 完全不 sync（T20 已修）。
+仅 segment_v2 两处两个返回值都检查。
+
+**新增基建**（`detail/file_util.hpp`，33 → 175 行，header-only inline，
+沿用 index_manifest 既有风格，不动 CMakeLists）：
+- `read_file_bytes<Byte>(path)` → `optional<vector<Byte>>`；`Byte` 模板化
+  （keydir/hnsw 的 deserialize 吃 uint8_t，其余吃 byte，统一类型反而逼出
+  更多 cast）；**尺寸谓词留给调用方**查 `.size()`（各站点门槛互不相同）
+- `atomic_write_bytes(path, span, fsync_dir=false)` — buffer 式 ×4
+- `AtomicFileWriter` RAII — 流式 ×3（tmp 后缀可定制，保住 `.upgrade.tmp`
+  的诊断价值：残留文件名一眼指认是 schema 升级路径崩的）
+- `flush_and_sync()` / `fsync_parent_dir()`
+
+**统一后的纪律**：fflush 与 fdatasync **两个返回值都检查**（disk-full 下
+fflush 失败而 fdatasync 对已落盘部分成功 → 静默 rename 出半截文件）。
+field_schema 的 `::fsync` → `fdatasync`：新文件的尺寸元数据属「取回数据
+所必需」，fdatasync 同样保证，差别仅 mtime（无人依赖）。
+
+**刻意不做的**：目录 fsync 未全面铺开，`fsync_dir` 默认 false，仅
+`write_manifest`（唯一 commit 点）传 true——保持 T21 为**纯重构**，
+不夹带性能/行为变更。是否铺开属 Phase 7「目录 fsync 专项」。
+
+**迁移站点**：整读 ×6（hnsw.cpp:2031 / keydir.cpp:1588 / inverted.cpp:1272 /
+segment_v2.cpp:954 / search_checkpoint.hpp:326 / migrate.cpp 的 read_all 由
+原型降为 expected 语义的薄包装）；原子写 ×9（keydir / search_checkpoint /
+index_manifest / segment_v2 ×2 / field_schema / hnsw ×3）。
+`index_manifest::fsync_directory_of` 随 write_manifest 归并后零残留，已删。
+`uint8_t` 缓冲区经 `std::as_bytes(std::span(buf))` 转换——C++20 惯用法，
+**未新增 reinterpret_cast**。
+
+- **验收**：ASan 全量 641/641 ✅ | 落盘/载入路径套件 219/219 + **零 .tmp
+  残留** ✅（AtomicFileWriter 失败路径新契约）| TSan 639/639 零告警 ✅ |
+  Debug/ASan/TSan/Release 四树编译，改动文件零新告警 ✅
+  （Release 的 ftruncate/unused-param/memaccess 告警经日志对比确认为预存）
+
 ### T22 — P6-RED-4：Analyzer 双出口归并 ×2 组 🟡 MED
 
 - **4b（先做,1 小时)**：`WhitespaceAnalyzer` 照抄 JiebaAnalyzer 既有先例
@@ -271,11 +311,11 @@ RED-10（SnapCursor::vb,价值低）。
 | T1-T18 | ✅ 归档（见上表;T14 表述已修正） |
 | T19 flush 有界等待 + submit 补偿 | ✅ done（含 P6-MEM-2/3;两处计划偏离见落地记录） |
 | T20 hnsw fdatasync ×3 | ✅ done（ASan hnsw/vector/segment 105/105） |
-| T21 read_file_bytes + AtomicFileWriter | 🟡 待做 |
+| T21 read_file_bytes + AtomicFileWriter | ✅ done（整读 ×6 + 原子写 ×9 归并;四套 fsync 纪律收敛为一） |
 | T22 Analyzer 双出口 ×2 | 🟡 待做 |
 | T23 ChunkedReader | 🟡 待做 |
 | T24 decode_rec 模板 | 🟢 待做 |
-| T25 死代码 7 行 | 🟢 待做 |
+| T25 死代码 7 行 | ✅ done（ends_with_vowel / newest_folder_epoch_ / kValueSizeOverflow） |
 | T26 文档收尾 | 🟢 大部分已随本次更新完成 |
 | T8 | ⏸ 暂缓（4 项前置见上） |
 | T12 | ⏸ 默认不做（注释同步替代） |
