@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <memory>  // P6-MEM-2: unique_ptr 暂存分配到接管
 #include <utility>
 #include <vector>
 
@@ -78,19 +79,24 @@ private:
     T& ensure_slot(std::size_t i) {
         const std::size_t ci = i >> kChunkBits;
         if (ci == chunks_.size()) {
-            T* chunk = new T[kChunkSize]();  // value-init（atomic 零初始化）
-            chunks_.push_back(chunk);
+            // P6-MEM-2：unique_ptr 暂存到接管为止——裸指针在 push_back 扩容
+            // 抛 bad_alloc 时无人持有（destroy() 只遍历 chunks_/graveyard_/
+            // spine_pub_，泄漏对象从未进入三者）。
+            auto chunk_own = std::unique_ptr<T[]>(new T[kChunkSize]());  // value-init
+            chunks_.push_back(chunk_own.get());
+            T* chunk = chunk_own.release();  // 已入 chunks_，所有权移交
             T** spine = spine_pub_.load(std::memory_order_relaxed);
             if (chunks_.size() > spine_cap_) {
                 // spine 扩容：新表拷指针 → release 发布；旧表进 graveyard
                 //（在途读者可能仍持有,至析构才释放）。
                 const std::size_t cap = spine_cap_ ? spine_cap_ * 2 : 8;
-                T** ns = new T*[cap];
+                auto ns_own = std::unique_ptr<T*[]>(new T*[cap]);
                 for (std::size_t k = 0; k < chunks_.size(); ++k) {
-                    ns[k] = chunks_[k];
+                    ns_own[k] = chunks_[k];
                 }
+                // graveyard_ 扩容可抛——须在 release() 之前完成（同上）。
                 if (spine) graveyard_.push_back(spine);
-                spine_pub_.store(ns, std::memory_order_release);
+                spine_pub_.store(ns_own.release(), std::memory_order_release);
                 spine_cap_ = cap;
             } else {
                 // 槽位纯写（读者尚不可达此下标——计数未发布）。
