@@ -30,8 +30,7 @@ namespace bitcask::codec {
 enum class DecodeError {
     kBufferTooShort,      // 输入不够长，连 header 都读不全
     kBadCrc,              // CRC32 校验失败（数据损坏 / 写入到一半被 kill）
-    kKeySizeOverflow,     // KeySz 字段读出来后跟 buffer 实际长度不符
-    kValueSizeOverflow,   // ValueSz 同上
+    kKeySizeOverflow,     // KeySz/ValueSz 字段读出来后跟 buffer 实际长度不符
     kUnsupportedVersion,  // kDoc value 的 Ver 字段不被支持
 };
 

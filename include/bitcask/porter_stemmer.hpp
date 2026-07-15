@@ -49,11 +49,6 @@ inline std::string_view stem_of(const std::string& w, std::size_t suffix_len) {
     return std::string_view(w).substr(0, w.size() - suffix_len);
 }
 
-inline bool ends_with_vowel(std::string_view s) {
-    if (s.empty()) return false;
-    return !is_consonant(s, s.size() - 1);
-}
-
 inline bool ends_with_double_consonant(std::string_view s) {
     return s.size() >= 2 &&
            s[s.size() - 1] == s[s.size() - 2] &&

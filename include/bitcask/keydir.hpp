@@ -582,7 +582,6 @@ private:
 
     // 迭代协调冷状态(meta_mu_;独立行,避免污染上面两条热行)。
     alignas(64) std::uint64_t iter_generation_ = 0;  // 单调 ++(fold release 归零时 +1)
-    std::uint64_t newest_folder_epoch_ = 0;  // 最近启动的 folder 的 iter_epoch
     // 写痕迹标志。当前没有读者(纯诊断位);做成 atomic 以免 sibling 升链
     // 热分支为了它单独去拿 meta_mu_(S2 设计偏差,见 keydir.cpp 注释)。
     std::atomic<bool> iter_mutation_{false};

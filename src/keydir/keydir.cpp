@@ -919,7 +919,6 @@ StartIterResult IterHandle::start(std::uint32_t now_sec,
 
     iterating_ = true;
     iter_epoch_ = parent_->epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
-    parent_->newest_folder_epoch_ = iter_epoch_;
     // keyfolders_ 只在屏障内修改（此处与 release 阶段一）。
     parent_->keyfolders_.fetch_add(1, std::memory_order_relaxed);
 
