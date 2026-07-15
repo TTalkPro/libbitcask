@@ -37,25 +37,14 @@ std::uint64_t be_u64(const std::byte* p) {
     return v;
 }
 
-// S13-M3：RAII 持 FILE*（detail::FileCloser 经 field_schema.hpp 间接包含，
-// 定义在 bitcask/detail/file_util.hpp）——
-// buf 分配（大小来自文件）与 unexpected 的 string 拼接均可抛，裸 FILE*
-// 在异常路径泄漏。
+// T21：整读归 detail::read_file_bytes（本函数原为其原型）。此处仅补本模块的
+// expected<string> 错误语义——nullopt 无法区分开不了 / 短读，故只给一条
+// 合并诊断（migrate 是离线工具路径，诊断粒度够用）。
 std::expected<std::vector<std::byte>, std::string>
 read_all(const fs::path& path) {
-    std::unique_ptr<std::FILE, detail::FileCloser> f(
-        std::fopen(path.c_str(), "rb"));
-    if (!f) return std::unexpected("cannot open " + path.string());
-    std::fseek(f.get(), 0, SEEK_END);
-    const long sz = std::ftell(f.get());
-    std::fseek(f.get(), 0, SEEK_SET);
-    std::vector<std::byte> buf(sz > 0 ? static_cast<std::size_t>(sz) : 0);
-    const bool ok =
-        buf.empty() ||
-        std::fread(buf.data(), 1, buf.size(), f.get()) == buf.size();
-    f.reset();
-    if (!ok) return std::unexpected("short read " + path.string());
-    return buf;
+    auto buf = detail::read_file_bytes<>(path.string());
+    if (!buf) return std::unexpected("cannot read " + path.string());
+    return *std::move(buf);
 }
 
 std::expected<void, std::string>
