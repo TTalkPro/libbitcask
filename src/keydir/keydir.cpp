@@ -8,7 +8,6 @@
 #include <cstdio>
 #include <cstring>
 
-#include <unistd.h>  // S21-2 A4: fdatasync
 
 #include <algorithm>
 #include <cassert>
@@ -1556,47 +1555,20 @@ bool KeyDir::save_snapshot(
         buf.size() - payload_begin));
     snap_put32(buf, crc);
 
-    const std::string final_path(path);
-    const std::string tmp_path = final_path + ".tmp";
-    std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
-    if (!f) return false;
-    bool wrote =
-        std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
     // S21-2 A4：rename 前 fdatasync——快照虽可重建（fold 兜底），但断电丢
-    // 快照页 = 下次冷启动退全量 fold，启动加速失效。与 SearchCheckpoint/
-    // write_manifest 同款语义。
-    if (wrote) {
-        std::fflush(f);
-        wrote = ::fdatasync(::fileno(f)) == 0;
-    }
-    std::fclose(f);
-    if (!wrote) {
-        std::remove(tmp_path.c_str());
-        return false;
-    }
-    if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
-        std::remove(tmp_path.c_str());
-        return false;
-    }
-    return true;
+    // 快照页 = 下次冷启动退全量 fold，启动加速失效。T21 起该纪律由
+    // detail::atomic_write_bytes 统一承载（本注释是全库约定的原始出处）。
+    return bitcask::detail::atomic_write_bytes(
+        std::string(path), std::as_bytes(std::span(buf)));
 }
 
 auto KeyDir::load_snapshot(std::string_view path)
     -> std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> {
-    // S13-M3：RAII 持 FILE*——fsz 来自可能损坏的文件（可为巨值），下方
-    // vector 分配可抛 bad_alloc，裸 FILE* 在异常路径泄漏。
-    bitcask::detail::FilePtr f(
-        std::fopen(std::string(path).c_str(), "rb"));
-    if (!f) return std::nullopt;
-    std::fseek(f.get(), 0, SEEK_END);
-    const long fsz = std::ftell(f.get());
-    std::fseek(f.get(), 0, SEEK_SET);
-    if (fsz < 16) return std::nullopt;
-    std::vector<std::uint8_t> buf(static_cast<std::size_t>(fsz));
-    const bool rd =
-        std::fread(buf.data(), 1, buf.size(), f.get()) == buf.size();
-    f.reset();
-    if (!rd) return std::nullopt;
+    auto buf_opt =
+        bitcask::detail::read_file_bytes<std::uint8_t>(std::string(path));
+    if (!buf_opt) return std::nullopt;
+    const auto& buf = *buf_opt;
+    if (buf.size() < 16) return std::nullopt;  // 头部最小尺寸（本站点谓词）
 
     SnapCursor c{buf.data(), buf.data() + buf.size()};
     if (c.u32() != kSnapMagic) return std::nullopt;
