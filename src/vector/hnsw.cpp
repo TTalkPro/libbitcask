@@ -487,9 +487,10 @@ bool write_bcvp_file(const std::string& fp, std::uint16_t dim, std::uint32_t n,
             kBcvpHeaderCrcOff));
     std::memcpy(head.data() + kBcvpHeaderCrcOff, &header_crc, 4);
 
-    const std::string tmp = fp + ".tmp";
-    bitcask::detail::FilePtr f(std::fopen(tmp.c_str(), "wb"));
-    if (!f) return false;
+    // T21：流式（分页 CRC + 回头补头）→ AtomicFileWriter；析构自动清 tmp。
+    bitcask::detail::AtomicFileWriter w(fp);
+    if (!w) return false;
+    auto& f = w;
 
     bool ok = true;
     if (total_vecs > 0) {
@@ -531,13 +532,7 @@ bool write_bcvp_file(const std::string& fp, std::uint16_t dim, std::uint32_t n,
     if (ok) ok = std::fseek(f.get(), 0, SEEK_SET) == 0;
     if (ok) ok = std::fwrite(head.data(), 1, head.size(), f.get()) ==
                  head.size();
-    // P6-DUR-1：rename 前 fdatasync（语义同 HnswIndex::save）。
-    if (ok) ok = std::fflush(f.get()) == 0 && ::fdatasync(::fileno(f.get())) == 0;
-    f.reset();
-    if (!ok || std::rename(tmp.c_str(), fp.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        return false;
-    }
+    if (!ok || !w.commit()) return false;  // commit 内含 P6-DUR-1 的 fdatasync
     if (out_vecs_off != nullptr) *out_vecs_off = vecs_off;
     return true;
 }
@@ -562,9 +557,10 @@ bool write_bcq8_file(const std::string& fp, std::uint16_t dim, std::uint32_t n,
         reinterpret_cast<const std::byte*>(hdr), kBcq8HeaderCrcOff));
     std::memcpy(hdr + kBcq8HeaderCrcOff, &hcrc, 4);
 
-    const std::string tmp = fp + ".tmp";
-    bitcask::detail::FilePtr f(std::fopen(tmp.c_str(), "wb"));
-    if (!f) return false;
+    // T21：流式（批量 append）→ AtomicFileWriter；析构自动清 tmp。
+    bitcask::detail::AtomicFileWriter w(fp);
+    if (!w) return false;
+    auto& f = w;
     bool ok = std::fwrite(hdr, 1, kBcq8HeaderSize, f.get()) == kBcq8HeaderSize;
     std::vector<std::uint8_t> batch;
     batch.reserve(std::min<std::size_t>(4096, n ? n : 1) * stride);
@@ -583,14 +579,7 @@ bool write_bcq8_file(const std::string& fp, std::uint16_t dim, std::uint32_t n,
             batch.clear();
         }
     }
-    // P6-DUR-1：rename 前 fdatasync（语义同 HnswIndex::save）。
-    if (ok) ok = std::fflush(f.get()) == 0 && ::fdatasync(::fileno(f.get())) == 0;
-    f.reset();
-    if (!ok || std::rename(tmp.c_str(), fp.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        return false;
-    }
-    return true;
+    return ok && w.commit();  // commit 内含 P6-DUR-1 的 fdatasync
 }
 
 }  // namespace
@@ -2016,40 +2005,18 @@ bool HnswIndex::save(std::string_view base_path) const {
     if (!save_qc_payload(bp + ".qc8")) return false;  // S14-8
     std::vector<std::uint8_t> buf;
     if (!serialize(buf)) return false;
-    const std::string tmp = bp + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (!f) return false;
-    bool wrote = std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
-    // P6-DUR-1：rename 前 fdatasync——与 keydir 快照 / SearchCheckpoint /
-    // write_manifest 同款语义。图虽可从向量重建，但断电丢页 ≠ 无害：rename
-    // 已覆盖旧 base，最终路径下留半截文件，load 端 CRC 拒收后退全量重建。
-    if (wrote) {
-        wrote = std::fflush(f) == 0 && ::fdatasync(::fileno(f)) == 0;
-    }
-    std::fclose(f);
-    if (!wrote || std::rename(tmp.c_str(), bp.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        return false;
-    }
-    return true;
+    // P6-DUR-1：rename 前 fdatasync——图虽可从向量重建，但断电丢页 ≠ 无害：
+    // rename 已覆盖旧 base，最终路径下留半截文件，load 端 CRC 拒收后退全量
+    // 重建。T21 起该纪律由 detail::atomic_write_bytes 统一承载。
+    return bitcask::detail::atomic_write_bytes(
+        bp, std::as_bytes(std::span(buf)));
 }
 
 bool HnswIndex::load(std::string_view base_path) {
     const std::string bp(base_path);
-    // S13-M3：RAII 持 FILE*——fsz 来自可能损坏的文件，下方 vector 分配可抛
-    // bad_alloc，裸 FILE* 在异常路径泄漏。
-    bitcask::detail::FilePtr f(std::fopen(bp.c_str(), "rb"));
-    if (!f) return false;
-    std::fseek(f.get(), 0, SEEK_END);
-    const long fsz = std::ftell(f.get());
-    std::fseek(f.get(), 0, SEEK_SET);
-    if (fsz < 0) return false;
-    std::vector<std::uint8_t> buf(static_cast<std::size_t>(fsz));
-    const bool rd =
-        std::fread(buf.data(), 1, buf.size(), f.get()) == buf.size();
-    f.reset();
-    if (!rd) return false;
-    if (!deserialize(buf)) return false;
+    auto buf = bitcask::detail::read_file_bytes<std::uint8_t>(bp);
+    if (!buf) return false;
+    if (!deserialize(*buf)) return false;
     // V7:deserialize 之后装 payload。inmem_int8 或 count=0 不读 .vec。
     if (!cfg_.inmem_int8 && count_.load(std::memory_order_relaxed) > 0) {
         const std::string vec_path = bp + ".vec";
