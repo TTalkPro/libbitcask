@@ -1267,24 +1267,9 @@ auto InvertedIndex::save(std::string_view path) const -> bool {
 }
 
 auto InvertedIndex::load(std::string_view path) -> bool {
-    // S13-M3：RAII 持 FILE*——fsz 来自可能损坏的文件，resize 可抛 bad_alloc，
-    // 裸 FILE* 在异常路径泄漏。
-    bitcask::detail::FilePtr f(
-        std::fopen(std::string(path).c_str(), "rb"));
-    if (!f) return false;
-    std::fseek(f.get(), 0, SEEK_END);
-    const long fsz = std::ftell(f.get());
-    std::fseek(f.get(), 0, SEEK_SET);
-    std::vector<std::byte> buf;
-    bool rd = (fsz >= 0);
-    if (rd) {
-        buf.resize(static_cast<std::size_t>(fsz));
-        rd = buf.empty() ||
-             std::fread(buf.data(), 1, buf.size(), f.get()) == buf.size();
-    }
-    f.reset();
-    if (!rd) return false;
-    return deserialize(buf);
+    auto buf = bitcask::detail::read_file_bytes<>(std::string(path));
+    if (!buf) return false;
+    return deserialize(*buf);
 }
 
 auto InvertedIndex::deserialize(std::span<const std::byte> bytes) -> bool {

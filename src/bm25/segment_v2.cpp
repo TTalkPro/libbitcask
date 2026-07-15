@@ -152,9 +152,10 @@ bool write_segment_v2_streams(
     std::uint32_t doc_count,
     const std::function<SegV2DocRow(std::uint32_t docid)>& doc_row,
     std::uint64_t total_doc_len) {
-    const std::string tmp = path + ".tmp";
-    bitcask::detail::FilePtr f(std::fopen(tmp.c_str(), "wb"));
-    if (!f) return false;
+    // T21：流式（分节 CRC + 回头补页脚）→ AtomicFileWriter；析构自动清 tmp。
+    bitcask::detail::AtomicFileWriter aw(path);
+    if (!aw) return false;
+    auto& f = aw;
     StreamWriter w(f.get());
 
     // ---- Header(64B,伪节 kind=0 只记 CRC) ----
@@ -373,15 +374,7 @@ bool write_segment_v2_streams(
         }
     }
 
-    if (ok) {
-        ok = std::fflush(f.get()) == 0 && ::fdatasync(fileno(f.get())) == 0;
-    }
-    f.reset();
-    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        return false;
-    }
-    return true;
+    return ok && aw.commit();
 }
 
 bool write_segment_v2(
@@ -923,9 +916,6 @@ std::uint64_t MmapSegment::live_count() const noexcept {
 // ---- live sidecar ----
 
 bool MmapSegment::save_live_sidecar(const std::string& path) const {
-    const std::string tmp = path + ".tmp";
-    bitcask::detail::FilePtr f(std::fopen(tmp.c_str(), "wb"));
-    if (!f) return false;
     std::vector<std::byte> buf;
     auto put = [&buf](const void* p, std::size_t nn) {
         const auto* bb = static_cast<const std::byte*>(p);
@@ -944,31 +934,16 @@ bool MmapSegment::save_live_sidecar(const std::string& path) const {
     put(bits.data(), bits.size());
     const std::uint32_t crc = codec::crc32_update(0, buf);
     put(&crc, 4);
-    const bool ok =
-        std::fwrite(buf.data(), 1, buf.size(), f.get()) == buf.size() &&
-        std::fflush(f.get()) == 0 && ::fdatasync(fileno(f.get())) == 0;
-    f.reset();
-    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        return false;
-    }
-    return true;
+    return bitcask::detail::atomic_write_bytes(path, buf);
 }
 
 bool MmapSegment::load_live_sidecar(const std::string& path) {
-    bitcask::detail::FilePtr f(std::fopen(path.c_str(), "rb"));
-    if (!f) return false;
-    std::fseek(f.get(), 0, SEEK_END);
-    const long sz = std::ftell(f.get());
-    std::fseek(f.get(), 0, SEEK_SET);
+    auto buf_opt = bitcask::detail::read_file_bytes<>(path);
+    if (!buf_opt) return false;
+    const auto& buf = *buf_opt;
+    // 本站点谓词：精确尺寸（头 16 + 位图 + crc 4）。
     const std::size_t bits_len = (doc_count_ + 7) / 8;
-    if (sz < 0 || static_cast<std::size_t>(sz) != 16 + bits_len + 4) {
-        return false;
-    }
-    std::vector<std::byte> buf(static_cast<std::size_t>(sz));
-    if (std::fread(buf.data(), 1, buf.size(), f.get()) != buf.size()) {
-        return false;
-    }
+    if (buf.size() != 16 + bits_len + 4) return false;
     if (load_pod<std::uint32_t>(buf.data()) != segv2::kLiveMagic) return false;
     if (load_pod<std::uint32_t>(buf.data() + 4) != segv2::kVersion) return false;
     if (load_pod<std::uint64_t>(buf.data() + 8) != doc_count_) return false;
