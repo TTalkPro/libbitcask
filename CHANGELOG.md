@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`4.0.0`**；库 `SOVERSION` = **`4`**（= major）；
+`bitcask_version_*` = **`4.1.0`**；库 `SOVERSION` = **`4`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v3`**（含 CRC32），`field.schema` = **FSCH v1**。
 
 ---
@@ -59,6 +59,10 @@
 ---
 
 ## [Unreleased]
+
+---
+
+## [4.1.0] - 2026-07-15
 
 ### Fixed（Phase 5/6 深度审计：资源泄漏 / 进程挂死 / 持久性，2026-07-15）
 
