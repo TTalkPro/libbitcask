@@ -531,6 +531,8 @@ bool write_bcvp_file(const std::string& fp, std::uint16_t dim, std::uint32_t n,
     if (ok) ok = std::fseek(f.get(), 0, SEEK_SET) == 0;
     if (ok) ok = std::fwrite(head.data(), 1, head.size(), f.get()) ==
                  head.size();
+    // P6-DUR-1：rename 前 fdatasync（语义同 HnswIndex::save）。
+    if (ok) ok = std::fflush(f.get()) == 0 && ::fdatasync(::fileno(f.get())) == 0;
     f.reset();
     if (!ok || std::rename(tmp.c_str(), fp.c_str()) != 0) {
         std::remove(tmp.c_str());
@@ -581,6 +583,8 @@ bool write_bcq8_file(const std::string& fp, std::uint16_t dim, std::uint32_t n,
             batch.clear();
         }
     }
+    // P6-DUR-1：rename 前 fdatasync（语义同 HnswIndex::save）。
+    if (ok) ok = std::fflush(f.get()) == 0 && ::fdatasync(::fileno(f.get())) == 0;
     f.reset();
     if (!ok || std::rename(tmp.c_str(), fp.c_str()) != 0) {
         std::remove(tmp.c_str());
@@ -2015,7 +2019,13 @@ bool HnswIndex::save(std::string_view base_path) const {
     const std::string tmp = bp + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) return false;
-    const bool wrote = std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+    bool wrote = std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+    // P6-DUR-1：rename 前 fdatasync——与 keydir 快照 / SearchCheckpoint /
+    // write_manifest 同款语义。图虽可从向量重建，但断电丢页 ≠ 无害：rename
+    // 已覆盖旧 base，最终路径下留半截文件，load 端 CRC 拒收后退全量重建。
+    if (wrote) {
+        wrote = std::fflush(f) == 0 && ::fdatasync(::fileno(f)) == 0;
+    }
     std::fclose(f);
     if (!wrote || std::rename(tmp.c_str(), bp.c_str()) != 0) {
         std::remove(tmp.c_str());
