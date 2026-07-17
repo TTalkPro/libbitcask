@@ -40,20 +40,21 @@ inline CaskFault err(CaskError k, std::string detail = {}) {
     return CaskFault{k, 0, std::move(detail)};
 }
 
-inline std::uint32_t now_sec_default() {
+// 真实 unix 秒,64 位不截断。过期判定（tstamp+expiry_secs / expiry_at 与
+// now 的比较）一律用它,避免 u32 算术 wrap。
+inline std::uint64_t now_sec_default() {
 #ifdef CLOCK_REALTIME_COARSE
     // 每次 get/put 都要取秒级时间戳:COARSE 时钟走 vDSO 无 syscall,
     // 粒度为内核 tick(1-4ms),对秒级语义无损。
     timespec ts;
     ::clock_gettime(CLOCK_REALTIME_COARSE, &ts);
-    return static_cast<std::uint32_t>(ts.tv_sec);
+    return static_cast<std::uint64_t>(ts.tv_sec);
 #else
-    return static_cast<std::uint32_t>(
+    return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
 #endif
 }
-
 inline std::string_view bytes_to_view(std::span<const std::byte> b) {
     return {reinterpret_cast<const char*>(b.data()), b.size()};
 }

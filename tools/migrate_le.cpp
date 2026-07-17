@@ -1,4 +1,6 @@
-// migrate_le — 把 v1 大端 bitcask 目录离线迁移成 v2 小端目录。
+// migrate_le — 把 v1 大端 bitcask 目录离线迁移成当前纪元（meta v4,
+// 64 位时间戳）目录。保留的旧入口;统一入口（含 u32→u64 迁移与纪元检测）
+// 见 tools/bitcask_migrate.cpp。
 //
 //   用法:  migrate_le <src_dir> <dst_dir>
 //
@@ -15,8 +17,10 @@ int main(int argc, char** argv) {
     if (argc != 3) {
         std::fprintf(stderr,
                      "usage: %s <src_dir> <dst_dir>\n"
-                     "  migrate a v1 big-endian bitcask dir to v2 "
-                     "little-endian (non-destructive: src read-only)\n",
+                     "  migrate a v1 big-endian bitcask dir to the current "
+                     "era (meta v4, 64-bit timestamps;\n"
+                     "  non-destructive: src read-only). for u32-era dirs "
+                     "(meta v2/v3) use: bitcask_migrate tstamp64\n",
                      argv[0]);
         return 2;
     }

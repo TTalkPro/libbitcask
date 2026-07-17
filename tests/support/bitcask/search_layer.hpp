@@ -94,7 +94,7 @@ public:
     void on_write(std::string_view key, std::uint64_t ord,
                   std::string_view text,
                   std::uint32_t file_id, std::uint64_t offset,
-                  std::uint32_t total_sz, std::uint32_t tstamp);
+                  std::uint32_t total_sz, std::uint64_t tstamp);
 
     // S16-2：单文本写入核心（流水线版）。前置条件：docmap 行已就位（宿主
     // put_doc）。分析 text、回填 doc_len（set_doc_len）、默认域倒排、高亮
@@ -107,7 +107,7 @@ public:
     void on_write_fields(std::string_view key, std::uint64_t ord,
                          const std::vector<std::pair<std::string, std::string>>& fields,
                          std::uint32_t file_id, std::uint64_t offset,
-                         std::uint32_t total_sz, std::uint32_t tstamp);
+                         std::uint32_t total_sz, std::uint64_t tstamp);
 
     // S6-P0: 纯函数阶段 — analyze 各字段 + catch-all 合并，产 ReduceJob。
     // 无锁、无共享状态变更（analyzer_ const 线程安全）。fields 用 string_view 借用
@@ -117,7 +117,7 @@ public:
         std::string_view key, std::uint64_t ord,
         std::span<const std::pair<std::string_view, std::string_view>> fields,
         std::uint32_t file_id, std::uint64_t offset,
-        std::uint32_t total_sz, std::uint32_t tstamp) const;
+        std::uint32_t total_sz, std::uint64_t tstamp) const;
 
     // S6-P0: 状态变更阶段 — 把 ReduceJob apply 到索引（add_doc/set_doc_len/
     // on_vector/cache invalidate）。S16-2 写路径反转：**不再写 docmap 行/meta**
@@ -241,7 +241,7 @@ public:
     void recover_doc(std::string_view key, std::uint64_t ord,
                      std::string_view text,
                      std::uint32_t file_id, std::uint64_t offset,
-                     std::uint32_t total_sz, std::uint32_t tstamp,
+                     std::uint32_t total_sz, std::uint64_t tstamp,
                      std::span<const float> vector = {});
 
     // S3:批量恢复。一批文档的 analyze 在 TBB 线程池并行（analyzer 无可变
@@ -255,7 +255,7 @@ public:
         std::uint32_t      file_id = 0;
         std::uint64_t      offset = 0;
         std::uint32_t      total_sz = 0;
-        std::uint32_t      tstamp = 0;
+        std::uint64_t      tstamp = 0;
         std::vector<float> vector;  // 空 = 无向量
         // S14-6：命名字段（名字已由 caller 经 field.schema 还原；owning
         // 拷贝——fold 缓冲复用）。非空时镜像活写路径语义：map 只喂 fields、

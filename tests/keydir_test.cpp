@@ -240,8 +240,8 @@ TEST(KeyDirSnapshot, V2RoundTrip) {
     fs::remove(p);
 }
 
-// v1（定宽 entries）兼容读：手工构造 v1 字节流——写端已恒写 v2，此路径
-// 无自然覆盖，防回归。
+// v1（定宽 entries，u32-tstamp 纪元）：64 位时间戳 flag-day 后读端仅收
+// v3——旧版本必须被干净拒收（返回 nullopt → 退全量 fold），绝不误读。
 TEST(KeyDirSnapshot, V1CompatRead) {
     const fs::path p =
         fs::temp_directory_path() / "bitcask_kd_snap_v1.ckpt";
@@ -276,17 +276,9 @@ TEST(KeyDirSnapshot, V1CompatRead) {
     }
     KeyDir kd;
     auto loaded = kd.load_snapshot(p.string());
-    ASSERT_TRUE(loaded.has_value()) << "v1 快照必须仍可读（兼容分支）";
-    ASSERT_EQ(loaded->size(), 1u);
-    EXPECT_EQ((*loaded)[0].first, 5u);
-    EXPECT_EQ((*loaded)[0].second, 999u);
-    auto e = kd.get("kv1ky");
-    ASSERT_TRUE(e.has_value());
-    EXPECT_EQ(e->file_id, 5u);
-    EXPECT_EQ(e->total_sz, 40u);
-    EXPECT_EQ(e->offset, 4096u);
-    EXPECT_EQ(e->tstamp, 1700000000u);
-    EXPECT_EQ(e->ord, 9u);
+    EXPECT_FALSE(loaded.has_value())
+        << "u32 纪元 v1 快照必须被干净拒收（退全量 fold）";
+    EXPECT_FALSE(kd.get("kv1ky").has_value()) << "拒收后不得残留半解析状态";
     fs::remove(p);
 }
 

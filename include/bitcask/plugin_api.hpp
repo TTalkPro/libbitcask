@@ -81,7 +81,7 @@ struct PutEvent {
     std::string_view value;     // 原始 value 字节（KV 视角）
     const DocView*   doc = nullptr;  // 结构化视图；纯 KV 写为 nullptr
     RecordLoc        loc;
-    std::uint32_t    tstamp = 0;
+    std::uint64_t    tstamp = 0;
     // S18-8：恢复重放标记。恢复与在线写是同一事件（接口契约），但插件可
     // 据此调整**执行策略**（非语义）：如 TextPlugin 在重放批里让单文本也走
     // prepare 并行分析（S3 恢复期并行语义），活写路径路由不动。

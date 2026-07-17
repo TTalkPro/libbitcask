@@ -72,7 +72,7 @@
 namespace bitcask::keydir {
 
 // 跟 legacy bitcask_nifs.c 完全对齐的 sentinel 值，用于「无限」/ unset。
-inline constexpr std::uint32_t kMaxTime    = std::numeric_limits<std::uint32_t>::max();
+inline constexpr std::uint64_t kMaxTime    = std::numeric_limits<std::uint64_t>::max();
 inline constexpr std::uint64_t kMaxEpoch   = std::numeric_limits<std::uint64_t>::max();
 inline constexpr std::uint32_t kMaxSize    = std::numeric_limits<std::uint32_t>::max();
 inline constexpr std::uint32_t kMaxFileId  = std::numeric_limits<std::uint32_t>::max();
@@ -86,7 +86,7 @@ struct SingleEntry {
     std::uint32_t total_sz = 0;
     std::uint64_t offset   = 0;
     std::uint64_t epoch    = 0;
-    std::uint32_t tstamp   = 0;
+    std::uint64_t tstamp   = 0;
     std::uint64_t ord      = 0;  // 全局单调递增写序号
 };
 
@@ -112,7 +112,7 @@ struct EntryProxy {
     std::uint32_t total_sz = 0;
     std::uint64_t offset   = 0;
     std::uint64_t epoch    = 0;
-    std::uint32_t tstamp   = 0;
+    std::uint64_t tstamp   = 0;
     std::uint64_t ord      = 0;  // 全局单调递增写序号
     bool is_tombstone      = false;
     std::string_view key;
@@ -125,8 +125,8 @@ struct FStatsEntry {
     std::uint64_t total_keys       = 0;  // 历史写入的 key 数
     std::uint64_t live_bytes       = 0;
     std::uint64_t total_bytes      = 0;
-    std::uint32_t oldest_tstamp    = 0;
-    std::uint32_t newest_tstamp    = 0;
+    std::uint64_t oldest_tstamp    = 0;
+    std::uint64_t newest_tstamp    = 0;
     std::uint64_t expiration_epoch = kMaxEpoch;  // pending delete 截止 epoch
 };
 
@@ -187,7 +187,7 @@ public:
     // 线程安全: 否（修改 handle 自身字段）；同一 handle 不可并发调用。
     // 锁: 内部对 parent_ 做写者闸门屏障（BarrierGuard + meta unique）。
     // caller 不要持有任何 keydir 锁。
-    StartIterResult start(std::uint32_t now_sec, int maxage, int maxputs);
+    StartIterResult start(std::uint64_t now_sec, int maxage, int maxputs);
 
     // 取下一项。默认跳过墓碑（legacy fold 语义）；include_tombstones=true
     // 时墓碑也作为 EntryProxy 返回（is_tombstone=true 字段）——给 fold/6
@@ -252,15 +252,15 @@ public:
     // 可重入: 否（递归会死锁）。
     PutResult put(std::string_view key,
                   std::uint32_t file_id, std::uint32_t total_sz,
-                  std::uint64_t offset, std::uint32_t tstamp,
-                  std::uint32_t now_sec,
+                  std::uint64_t offset, std::uint64_t tstamp,
+                  std::uint64_t now_sec,
                   bool newest_put,
                   std::uint32_t old_file_id, std::uint64_t old_offset,
                   std::uint64_t ord = 0);
 
     // 无条件删除。返回 true 表示原本有这条 key。
     // 线程安全: 是。锁: key 分片 unique;fold 态按需嵌套 meta unique。
-    bool remove(std::string_view key, std::uint32_t remove_time);
+    bool remove(std::string_view key, std::uint64_t remove_time);
 
     // 条件删除（CAS）：只有 (tstamp, file_id, offset) 匹配当前 entry
     // 才删。给 merge 跟 cask put 路径之间的 race 防护用。
@@ -268,10 +268,10 @@ public:
     // 取分片 unique；这两阶段之间存在「探测后状态变化」的窗口（caller
     // 拿到 kOk 时不保证当前已不存在），但对 merge 的语义足够。
     PutResult conditional_remove(std::string_view key,
-                                 std::uint32_t tstamp,
+                                 std::uint64_t tstamp,
                                  std::uint32_t file_id,
                                  std::uint64_t offset,
-                                 std::uint32_t remove_time);
+                                 std::uint64_t remove_time);
 
     // ---- 查询 ----
 
@@ -454,18 +454,18 @@ private:
         bool current_is_tombstone = false;
         bool fold_active = false;
         std::uint64_t this_epoch = 0;
-        std::uint32_t now_sec = 0;
+        std::uint64_t now_sec = 0;
     };
     PutResult put_probe(PutCtx& ctx, std::string_view key,
                          std::uint32_t old_file_id);
     PutResult put_insert(PutCtx& ctx, std::string_view key,
                           std::uint32_t file_id, std::uint32_t total_sz,
-                          std::uint64_t offset, std::uint32_t tstamp,
+                          std::uint64_t offset, std::uint64_t tstamp,
                           bool newest_put, std::uint32_t old_file_id,
                           std::uint64_t ord);
     PutResult put_overwrite(PutCtx& ctx, std::string_view key,
                              std::uint32_t file_id, std::uint32_t total_sz,
-                             std::uint64_t offset, std::uint32_t tstamp,
+                             std::uint64_t offset, std::uint64_t tstamp,
                              bool newest_put,
                              std::uint32_t old_file_id, std::uint64_t old_offset,
                              std::uint64_t ord);
@@ -527,8 +527,8 @@ private:
         std::atomic<std::uint64_t> total_keys{0};
         std::atomic<std::uint64_t> live_bytes{0};
         std::atomic<std::uint64_t> total_bytes{0};
-        std::atomic<std::uint32_t> oldest_tstamp{0};
-        std::atomic<std::uint32_t> newest_tstamp{0};
+        std::atomic<std::uint64_t> oldest_tstamp{0};
+        std::atomic<std::uint64_t> newest_tstamp{0};
         std::atomic<std::uint64_t> expiration_epoch{kMaxEpoch};
         std::atomic<std::uint8_t>  present{0};
     };
@@ -589,7 +589,7 @@ private:
     // fstats 增量更新。S1 起内部即无锁(增长走 fstats_grow_mu_),caller
     // 无需持有任何锁;锁序上 fstats_grow_mu_ 排最末,持分片锁/meta 时
     // 调用均合法。
-    void update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
+    void update_fstats(std::uint32_t file_id, std::uint64_t tstamp,
                        std::uint64_t expiration_epoch,
                        std::int32_t live_inc, std::int32_t total_inc,
                        std::int32_t live_bytes_inc,

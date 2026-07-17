@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # 版本单一真源（S12-7）：project(VERSION ...) 是唯一手写版本处。
 # 库 SOVERSION 与 C API bitcask_version_* 均从此派生，杜绝三处手工同步漂移。
-project(libbitcask VERSION 4.1.0 LANGUAGES CXX)
+project(libbitcask VERSION 5.0.0 LANGUAGES CXX)
 
 # 由 project 版本生成 C API 版本头（configure 时展开 @PROJECT_VERSION*@）。
 configure_file(
@@ -339,10 +339,19 @@ add_executable(gen_inert_table tools/gen_inert_table.cpp)
 target_link_libraries(gen_inert_table PRIVATE ${UTF8PROC_TARGET})
 
 # ---------------------------------------------------------------------------
-# migrate_le — v1 大端 → v2 小端离线迁移工具。
+# migrate_le — v1 大端 → 当前纪元离线迁移工具（旧入口,保留兼容;新增迁移
+# 请走统一入口 bitcask_migrate）。
 # ---------------------------------------------------------------------------
 add_executable(migrate_le tools/migrate_le.cpp)
 target_link_libraries(migrate_le
+    PRIVATE bitcask_fileops bitcask_format bitcask_io
+            bitcask_warnings bitcask_sanitizers)
+
+# ---------------------------------------------------------------------------
+# bitcask_migrate — 格式纪元统一迁移入口（detect / be2le / tstamp64）。
+# ---------------------------------------------------------------------------
+add_executable(bitcask_migrate tools/bitcask_migrate.cpp)
+target_link_libraries(bitcask_migrate
     PRIVATE bitcask_fileops bitcask_format bitcask_io
             bitcask_warnings bitcask_sanitizers)
 

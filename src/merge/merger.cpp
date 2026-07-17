@@ -28,7 +28,7 @@ struct PendingUpdate {
     std::uint64_t  old_offset;
     std::uint32_t  new_total_size;
     std::uint64_t  new_offset;
-    std::uint32_t  tstamp;
+    std::uint64_t  tstamp;
     std::uint64_t  ord;
 };
 
@@ -39,7 +39,7 @@ class MergeRunner {
 public:
     MergeRunner(keydir::KeyDir& keydir, bool sync_output,
                 std::span<plugin::CaskPlugin* const> plugins,
-                std::uint32_t now_sec)
+                std::uint64_t now_sec)
         : keydir_(keydir), sync_output_(sync_output),
           plugins_(plugins), now_sec_(now_sec) {}
 
@@ -85,7 +85,7 @@ private:
     //（docmap 恒先于插件收到 relocate），其余按注册序。事件在 merge 线程
     // 直接派发——实现者自保线程安全（docmap CAS/原子更新即满足）。
     std::span<plugin::CaskPlugin* const> plugins_;
-    std::uint32_t              now_sec_;
+    std::uint64_t              now_sec_;
 
     MergeStats                                 stats_;
     std::optional<fileops::DataFile>           out_data_;
@@ -383,7 +383,7 @@ run_merge(std::span<const std::string> input_data_paths,
           keydir::KeyDir& keydir,
           bool sync_output,
           std::span<plugin::CaskPlugin* const> plugins,
-          std::uint32_t now_sec) {
+          std::uint64_t now_sec) {
     MergeRunner runner(keydir, sync_output, plugins, now_sec);
     // S18-7：merge 生命周期事件（设计 §3.9）——begin 在 fold 前、commit 在
     // keydir 批量切换完成后、abort 在任何失败路径。插件收尾（GC/rebase）经

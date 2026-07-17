@@ -40,10 +40,10 @@ namespace {
 //                                                     防止刚到 expiry 边界就
 //                                                     频繁触发整次 merge）
 struct ExpiryCutoffs {
-    std::uint32_t threshold_cutoff = 0;
-    std::uint32_t trigger_cutoff   = 0;
+    std::uint64_t threshold_cutoff = 0;
+    std::uint64_t trigger_cutoff   = 0;
 };
-ExpiryCutoffs expiry_cutoffs(const PolicyOptions& opts, std::uint32_t now_sec) {
+ExpiryCutoffs expiry_cutoffs(const PolicyOptions& opts, std::uint64_t now_sec) {
     ExpiryCutoffs out;
     if (opts.expiry_secs == 0 || now_sec == 0) return out;
     if (now_sec > opts.expiry_secs) {
@@ -53,7 +53,7 @@ ExpiryCutoffs expiry_cutoffs(const PolicyOptions& opts, std::uint32_t now_sec) {
         static_cast<std::uint64_t>(opts.expiry_secs) +
         static_cast<std::uint64_t>(opts.expiry_grace_time);
     if (now_sec > grace_off) {
-        out.trigger_cutoff = static_cast<std::uint32_t>(now_sec - grace_off);
+        out.trigger_cutoff = now_sec - grace_off;
     }
     return out;
 }
@@ -61,7 +61,7 @@ ExpiryCutoffs expiry_cutoffs(const PolicyOptions& opts, std::uint32_t now_sec) {
 // 单文件是否「触发整次 merge」。任一规则成立即可。
 bool any_trigger_fires(const FileStatus& f,
                        const PolicyOptions& opts,
-                       std::uint32_t trigger_cutoff) {
+                       std::uint64_t trigger_cutoff) {
     if (f.fragmented   >= opts.frag_merge_trigger)        return true;
     if (f.dead_bytes   >= opts.dead_bytes_merge_trigger)  return true;
     // 过期触发（legacy: `oldest_tstamp > 0` 确保不是空文件）。
@@ -77,7 +77,7 @@ bool any_trigger_fires(const FileStatus& f,
 
 std::vector<Reason>
 per_file_reasons(const FileStatus& f, const PolicyOptions& opts,
-                  std::uint32_t now_sec) {
+                  std::uint64_t now_sec) {
     std::vector<Reason> out;
     if (f.fragmented >= opts.frag_threshold) {
         out.push_back({Reason::Kind::kFragmented,
@@ -100,7 +100,7 @@ per_file_reasons(const FileStatus& f, const PolicyOptions& opts,
 
 Decision decide(const std::vector<FileStatus>& summary,
                 const PolicyOptions& opts,
-                std::uint32_t now_sec,
+                std::uint64_t now_sec,
                 int dead_doc_rate) {
     Decision d;
     if (summary.empty()) return d;

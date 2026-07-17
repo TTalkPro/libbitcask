@@ -98,7 +98,7 @@ struct IndexTask {
     std::uint32_t        file_id   = 0;
     std::uint64_t        offset    = 0;
     std::uint32_t        total_sz  = 0;
-    std::uint32_t        tstamp    = 0;
+    std::uint64_t        tstamp    = 0;
     std::uint32_t doc_len   = 0; // token 总数（BM25 统计用）
     // S10-A5:多字段名+值打包进 fields_store(一次分配),fields 持 string_view 借自其中。
     // vector<char> move 必为指针转移(无 SSO)→跨 IndexTask 移动后 view 仍有效。
@@ -127,7 +127,7 @@ struct IndexTask {
     static IndexTask make(IndexOp op_, std::string_view key_,
                           std::uint64_t ord_, std::string_view text_,
                           std::uint32_t file_id_, std::uint64_t offset_,
-                          std::uint32_t total_sz_, std::uint32_t tstamp_,
+                          std::uint32_t total_sz_, std::uint64_t tstamp_,
                           std::uint32_t doc_len_) {
         IndexTask t;
         t.op = op_;

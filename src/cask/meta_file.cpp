@@ -28,10 +28,12 @@ inline constexpr std::size_t kMetaCrcOffset   = 14;
 inline constexpr std::size_t kMetaCrcCoverLen = 14;  // CRC 覆盖 [0, 14)
 inline constexpr std::size_t kMetaFileSize = kMetaMagicSize + 1 + 1 + kMetaReservedSize;  // 18 bytes
 
-// v1 = 大端纪元(legacy);v2 = 小端 flag-day 起;v3(S12) = 加 CRC32 校验和。
-// 读端：v1 干净拒绝(大端,提示重建);v2 向后兼容读(无 CRC,旧库不破坏);v3 校验 CRC。
-// 写端恒写 v3(带 CRC)。见 doc/format-zh.md 字节序说明。
-inline constexpr std::uint8_t kMetaVersion = 3;
+// v1 = 大端纪元(legacy);v2 = 小端 flag-day 起;v3(S12) = 加 CRC32 校验和;
+// v4 = record 时间戳 u64 flag-day（data header 27B / hint BCH4 / doc value v4）。
+// 读端：v1 干净拒绝(大端,提示重建);v2/v3 干净拒绝(u32-tstamp 纪元,record
+// 布局不兼容,提示重建——绝不按新偏移把旧字节静默读坏);v4 校验 CRC。
+// 写端恒写 v4(带 CRC)。见 doc/format-zh.md 字节序说明。
+inline constexpr std::uint8_t kMetaVersion = 4;
 inline constexpr char kMetaMagic[kMetaMagicSize + 1] = "BCME";
 
 // header 前 kMetaCrcCoverLen 字节的 CRC32（与 data/hint/field.schema 同多项式）。
@@ -71,12 +73,18 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
             "incompatible legacy big-endian format (meta v1); "
             "little-endian flag-day requires rebuild — re-ingest data"});
     }
-    if (ver != 2 && ver != 3) {
+    // v2/v3 = u32-tstamp 纪元：record 布局(23B header/hint v3/doc value v3)与
+    // 当前 64 位时间戳布局二进制不兼容。干净拒绝,提示重建——与 v1 大端同策略。
+    if (ver == 2 || ver == 3) {
+        return std::unexpected(MetaError{0,
+            "incompatible u32-tstamp era format (meta v2/v3); "
+            "64-bit tstamp flag-day requires rebuild — re-ingest data"});
+    }
+    if (ver != 4) {
         return std::unexpected(MetaError{0, "unsupported meta version"});
     }
-    // v3：校验 CRC32（检出位翻转/损坏 → fail-fast）。v2：无 CRC 字段，向后兼容读
-    // （旧库不破坏；写端恒写 v3）。
-    if (ver == 3) {
+    // v4：校验 CRC32（检出位翻转/损坏 → fail-fast）。
+    {
         std::uint32_t stored = 0;
         std::memcpy(&stored, header + kMetaCrcOffset, 4);
         if (stored != meta_crc(header)) {

@@ -48,7 +48,7 @@ namespace {
 // sibling-tombstone：fold 期间删除已存在 key 时，往 sibling 链头部插入的
 // 「墓碑 revision」。三个 sentinel 字段同时取 MAX 是 legacy is_sib_tombstone
 // 的判别约定，沿用以保证跨实现互通。
-SingleEntry make_sibling_tombstone(std::uint64_t epoch, std::uint32_t tstamp) noexcept {
+SingleEntry make_sibling_tombstone(std::uint64_t epoch, std::uint64_t tstamp) noexcept {
     return SingleEntry{kMaxFileId, kMaxSize, kMaxOffset, epoch, tstamp, 0};
 }
 [[nodiscard]] bool is_sibling_tombstone(const SingleEntry& s) noexcept {
@@ -217,7 +217,7 @@ void KeyDir::grow_fstats_locked(std::size_t need_size) {
     fstats_size_.store(n, std::memory_order_release);
 }
 
-void KeyDir::update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
+void KeyDir::update_fstats(std::uint32_t file_id, std::uint64_t tstamp,
                            std::uint64_t expiration_epoch,
                            std::int32_t live_inc, std::int32_t total_inc,
                            std::int32_t live_bytes_inc,
@@ -255,12 +255,12 @@ void KeyDir::update_fstats(std::uint32_t file_id, std::uint32_t tstamp,
                cur, expiration_epoch, std::memory_order_relaxed)) {
     }
     if (tstamp != 0) {
-        std::uint32_t o = f.oldest_tstamp.load(std::memory_order_relaxed);
+        std::uint64_t o = f.oldest_tstamp.load(std::memory_order_relaxed);
         while ((o == 0 || tstamp < o) &&
                !f.oldest_tstamp.compare_exchange_weak(
                    o, tstamp, std::memory_order_relaxed)) {
         }
-        std::uint32_t n = f.newest_tstamp.load(std::memory_order_relaxed);
+        std::uint64_t n = f.newest_tstamp.load(std::memory_order_relaxed);
         while ((n == 0 || tstamp > n) &&
                !f.newest_tstamp.compare_exchange_weak(
                    n, tstamp, std::memory_order_relaxed)) {
@@ -435,8 +435,8 @@ void KeyDir::advance_ord(std::uint64_t ord) {
 // merger 跳过——避免跟并发 put 抢同一个 key。
 PutResult KeyDir::put(std::string_view key,
                        std::uint32_t file_id, std::uint32_t total_sz,
-                       std::uint64_t offset, std::uint32_t tstamp,
-                       std::uint32_t now_sec,
+                       std::uint64_t offset, std::uint64_t tstamp,
+                       std::uint64_t now_sec,
                        bool newest_put,
                        std::uint32_t old_file_id, std::uint64_t old_offset,
                        std::uint64_t ord) {
@@ -541,7 +541,7 @@ PutResult KeyDir::put_probe(PutCtx& ctx, std::string_view key,
 // ---- put 分支 (A)：key 不存在或当前是墓碑 ----
 PutResult KeyDir::put_insert(PutCtx& ctx, std::string_view key,
                               std::uint32_t file_id, std::uint32_t total_sz,
-                              std::uint64_t offset, std::uint32_t tstamp,
+                              std::uint64_t offset, std::uint64_t tstamp,
                               bool newest_put, std::uint32_t old_file_id,
                               std::uint64_t ord) {
     Shard& sh = *ctx.shard;
@@ -616,7 +616,7 @@ PutResult KeyDir::put_insert(PutCtx& ctx, std::string_view key,
 // ---- put 分支 (B)/(C)：key 当前是活的，可能要覆盖 ----
 PutResult KeyDir::put_overwrite(PutCtx& ctx, [[maybe_unused]] std::string_view key,
                                  std::uint32_t file_id, std::uint32_t total_sz,
-                                 std::uint64_t offset, std::uint32_t tstamp,
+                                 std::uint64_t offset, std::uint64_t tstamp,
                                  bool newest_put,
                                  std::uint32_t old_file_id, std::uint64_t old_offset,
                                  std::uint64_t ord) {
@@ -715,7 +715,7 @@ PutResult KeyDir::put_overwrite(PutCtx& ctx, [[maybe_unused]] std::string_view k
 //     探测顺序依赖它）。语义对迭代器等价（旧 revision 都保留）,且修复了
 //     旧实现「freeze 复用的后启 fold 看不到 remove」的不一致。
 //   - entries miss + pending 命中：pending 内原地改墓碑（meta unique）。
-bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
+bool KeyDir::remove(std::string_view key, std::uint64_t remove_time) {
     Shard& sh = shards_[shard_for(key)];
     std::unique_lock slock(sh.mu);
 
@@ -823,10 +823,10 @@ bool KeyDir::remove(std::string_view key, std::uint32_t remove_time) {
 // 屏障闸门(v2):只读 peek 阶段**不**检查闸门(读不受限,屏障期间照常
 // 并发);写阶段走 remove(),其内部自带闸门检查。
 PutResult KeyDir::conditional_remove(std::string_view key,
-                                      std::uint32_t tstamp,
+                                      std::uint64_t tstamp,
                                       std::uint32_t file_id,
                                       std::uint64_t offset,
-                                      std::uint32_t remove_time) {
+                                      std::uint64_t remove_time) {
     {
         // 探测阶段：只读。探测顺序与 get/remove 一致:entries 优先,miss
         // 再嵌套 meta shared 查 pending（锁序分片→meta）。
@@ -890,7 +890,7 @@ IterHandle::~IterHandle() noexcept {
 //   3. 通过的话拍一个 keys snapshot：按分片下标序枚举所有 entries 的
 //      key，copy 进扁平快照（keys_buf_+key_offs_）。next() 后续从这个 snapshot 走，对
 //      rehash 完全免疫。
-StartIterResult IterHandle::start(std::uint32_t now_sec,
+StartIterResult IterHandle::start(std::uint64_t now_sec,
                                    int maxage, int maxputs) {
     if (iterating_) return StartIterResult::kAlreadyIterating;
     // 屏障 v2:写者出清,读者照常并发。屏障内全是纯读 + meta 状态修改:
@@ -1262,8 +1262,9 @@ KeyDir::KeyLenHistogram KeyDir::key_length_histogram() const {
 namespace {
 
 constexpr std::uint32_t kSnapMagic   = 0x42434B53;  // "BCKS"
-constexpr std::uint32_t kSnapVersion   = 2;  // S21-2 A3:entries 块 vbyte
-constexpr std::uint32_t kSnapVersionV1 = 1;  // 兼容读:定宽 entries
+// v3:tstamp 域定宽 8B（64 位时间戳 flag-day）。读端仅收 v3——v1/v2 属
+// u32-tstamp 纪元,version 不符拒收 → 退全量 fold 重建（降级安全）。
+constexpr std::uint32_t kSnapVersion   = 3;
 
 void snap_put32(std::vector<std::uint8_t>& b, std::uint32_t v) {
     const auto sz = b.size();
@@ -1316,7 +1317,9 @@ struct SnapCursor {
 // ---- S14-7：keydir 元数据 delta ------------------------------------------
 namespace {
 constexpr std::uint32_t kMetaDeltaMagic   = 0x444D4B42;  // "BKMD"
-constexpr std::uint32_t kMetaDeltaVersion = 1;
+// v2:fstats 的 oldest/newest_tstamp 定宽 4B→8B（64 位时间戳 flag-day）。
+// 读端仅收 v2——v1 属 u32 纪元,version 不符拒收 → 链断退 fold（降级安全）。
+constexpr std::uint32_t kMetaDeltaVersion = 2;
 inline void md_put32(std::vector<std::byte>& b, std::uint32_t v) {
     const auto* p = reinterpret_cast<const std::byte*>(&v);
     b.insert(b.end(), p, p + 4);
@@ -1352,8 +1355,8 @@ void KeyDir::serialize_meta_delta(
         md_put64(out, f.total_keys.load(std::memory_order_relaxed));
         md_put64(out, f.live_bytes.load(std::memory_order_relaxed));
         md_put64(out, f.total_bytes.load(std::memory_order_relaxed));
-        md_put32(out, f.oldest_tstamp.load(std::memory_order_relaxed));
-        md_put32(out, f.newest_tstamp.load(std::memory_order_relaxed));
+        md_put64(out, f.oldest_tstamp.load(std::memory_order_relaxed));
+        md_put64(out, f.newest_tstamp.load(std::memory_order_relaxed));
         md_put64(out, f.expiration_epoch.load(std::memory_order_relaxed));
     }
 
@@ -1404,10 +1407,11 @@ KeyDir::apply_meta_delta(std::span<const std::byte> bytes) {
     increment_file_id_at_least(biggest);
 
     for (std::uint32_t i = 0; i < fstats_n; ++i) {
-        std::uint32_t fid = 0, oldest = 0, newest = 0;
+        std::uint32_t fid = 0;
+        std::uint64_t oldest = 0, newest = 0;
         std::uint64_t lk = 0, tk = 0, lb = 0, tb = 0, ee = 0;
         if (!rd32(fid) || fid > (1u << 24) || !rd64(lk) || !rd64(tk) ||
-            !rd64(lb) || !rd64(tb) || !rd32(oldest) || !rd32(newest) ||
+            !rd64(lb) || !rd64(tb) || !rd64(oldest) || !rd64(newest) ||
             !rd64(ee)) {
             return std::nullopt;
         }
@@ -1487,14 +1491,14 @@ bool KeyDir::save_snapshot(
         if (fstats_slot(i).present.load(std::memory_order_relaxed)) ++fstats_n;
     }
 
-    // 头(magic+ver=8)+5 标量(36)+fstats(4+52·n)+watermarks(4+12·m)
-    //   +entries(8 + v2 变长典型 ≤20/条 + key 字节)+crc(4)。按 20/条估
+    // 头(magic+ver=8)+5 标量(36)+fstats(4+60·n)+watermarks(4+12·m)
+    //   +entries(8 + v3 变长典型 ≤24/条 + key 字节)+crc(4)。按 24/条估
     //   （偏大→略浪费,偏小由几何增长兜底,不影响正确性）。
     const std::size_t est_size =
         8 + 36
-        + 4 + static_cast<std::size_t>(fstats_n) * 52
+        + 4 + static_cast<std::size_t>(fstats_n) * 60
         + 4 + watermarks.size() * 12
-        + 8 + entries_total * 20
+        + 8 + entries_total * 24
         + static_cast<std::size_t>(key_bytes_.load(std::memory_order_relaxed))
         + 4;
 
@@ -1519,8 +1523,8 @@ bool KeyDir::save_snapshot(
         snap_put64(buf, f.total_keys.load(std::memory_order_relaxed));
         snap_put64(buf, f.live_bytes.load(std::memory_order_relaxed));
         snap_put64(buf, f.total_bytes.load(std::memory_order_relaxed));
-        snap_put32(buf, f.oldest_tstamp.load(std::memory_order_relaxed));
-        snap_put32(buf, f.newest_tstamp.load(std::memory_order_relaxed));
+        snap_put64(buf, f.oldest_tstamp.load(std::memory_order_relaxed));
+        snap_put64(buf, f.newest_tstamp.load(std::memory_order_relaxed));
         snap_put64(buf, f.expiration_epoch.load(std::memory_order_relaxed));
     }
 
@@ -1544,7 +1548,7 @@ bool KeyDir::save_snapshot(
             snap_put_vb(buf, se->total_sz);
             snap_put_vb(buf, se->offset);
             snap_put_vb(buf, se->epoch);
-            snap_put32(buf, se->tstamp);   // 定宽:unix 时间戳 vbyte 需 5B
+            snap_put64(buf, se->tstamp);   // 定宽 8B:u64 unix 秒（v3）
             snap_put_vb(buf, se->ord);
         }
     }
@@ -1572,7 +1576,7 @@ auto KeyDir::load_snapshot(std::string_view path)
     SnapCursor c{buf.data(), buf.data() + buf.size()};
     if (c.u32() != kSnapMagic) return std::nullopt;
     const std::uint32_t ver = c.u32();
-    if (ver != kSnapVersion && ver != kSnapVersionV1) return std::nullopt;
+    if (ver != kSnapVersion) return std::nullopt;
     // CRC 覆盖 [8, size-4)。
     std::uint32_t stored_crc = 0;
     std::memcpy(&stored_crc, buf.data() + buf.size() - 4, 4);  // 未对齐安全
@@ -1624,8 +1628,8 @@ auto KeyDir::load_snapshot(std::string_view path)
         fe.total_keys       = c.u64();
         fe.live_bytes       = c.u64();
         fe.total_bytes      = c.u64();
-        fe.oldest_tstamp    = c.u32();
-        fe.newest_tstamp    = c.u32();
+        fe.oldest_tstamp    = c.u64();
+        fe.newest_tstamp    = c.u64();
         fe.expiration_epoch = c.u64();
         if (c.fail || fe.file_id > (1u << 24)) { reset_all(); return std::nullopt; }
         {
@@ -1658,33 +1662,23 @@ auto KeyDir::load_snapshot(std::string_view path)
     for (auto& sh : shards_) {
         sh.entries.reserve(static_cast<std::size_t>(entry_n) / kShards + 1);
     }
-    const bool v2 = ver >= kSnapVersion;
     for (std::uint64_t i = 0; i < entry_n; ++i) {
-        const std::uint64_t klen = v2 ? c.vb() : c.u16();
+        const std::uint64_t klen = c.vb();
         if (c.fail || klen > 0xFFFF) { reset_all(); return std::nullopt; }
         std::string key(static_cast<std::size_t>(klen), '\0');
         if (!c.bytes(key.data(), klen)) { reset_all(); return std::nullopt; }
         SingleEntry se;
-        if (v2) {
-            // S21-2 A3:vbyte 块(字段序与写端一致)。u32 域越界=损坏。
-            const std::uint64_t fid = c.vb(), tsz = c.vb();
-            se.offset = c.vb();
-            se.epoch  = c.vb();
-            se.tstamp = c.u32();
-            se.ord    = c.vb();
-            if (fid > 0xFFFFFFFFull || tsz > 0xFFFFFFFFull) {
-                reset_all(); return std::nullopt;
-            }
-            se.file_id  = static_cast<std::uint32_t>(fid);
-            se.total_sz = static_cast<std::uint32_t>(tsz);
-        } else {
-            se.file_id  = c.u32();
-            se.total_sz = c.u32();
-            se.offset   = c.u64();
-            se.epoch    = c.u64();
-            se.tstamp   = c.u32();
-            se.ord      = c.u64();
+        // S21-2 A3:vbyte 块(字段序与写端一致)。u32 域越界=损坏。
+        const std::uint64_t fid = c.vb(), tsz = c.vb();
+        se.offset = c.vb();
+        se.epoch  = c.vb();
+        se.tstamp = c.u64();
+        se.ord    = c.vb();
+        if (fid > 0xFFFFFFFFull || tsz > 0xFFFFFFFFull) {
+            reset_all(); return std::nullopt;
         }
+        se.file_id  = static_cast<std::uint32_t>(fid);
+        se.total_sz = static_cast<std::uint32_t>(tsz);
         if (c.fail) { reset_all(); return std::nullopt; }
         // entries 按 shard_for 分发（磁盘格式无分片概念）。
         Shard& sh = shards_[shard_for(key)];

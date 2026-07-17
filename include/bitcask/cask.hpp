@@ -200,9 +200,9 @@ public:
     std::span<const std::byte> value{};    // text 段（指向底层字节内部）
     std::span<const std::byte> meta{};     // meta 段（可为空）
     std::span<const float> vector{};       // 向量段（空=无向量）
-    std::uint32_t tstamp = 0;
+    std::uint64_t tstamp = 0;
     std::uint64_t ord = 0;
-    std::uint32_t expiry_at = 0;           // S13-D5：per-key 过期时刻（0=永不）
+    std::uint64_t expiry_at = 0;           // S13-D5：per-key 过期时刻（0=永不）
 
     /// 拷贝为 owned 版本
     GetResult to_owned() const;
@@ -218,7 +218,7 @@ private:
     GetResultView(std::shared_ptr<fileops::DataFile> holder,
                   std::span<const std::byte> value_bytes,
                   format::RecordType type,
-                  std::uint32_t tstamp, std::uint64_t ord);
+                  std::uint64_t tstamp, std::uint64_t ord);
     // 从 value_bytes_ 解出 value/meta/vector span（量化则 dequant 进
     // vector_dequant_）。三个 ctor 共用，避免漂移。
     void derive_from_storage();
@@ -228,7 +228,7 @@ struct GetResult {
     std::vector<std::byte> value;  // DocValue 解码后的 text 段（纯 binary）
     std::vector<std::byte> meta;   // DocValue 解码后的 meta 段（可为空）
     std::vector<float> vector;     // V3.1:向量段(空 = 该文档无向量)
-    std::uint32_t tstamp = 0;
+    std::uint64_t tstamp = 0;
     std::uint64_t ord = 0;
 };
 
@@ -245,7 +245,7 @@ struct DocInput {
     // cosine_normalized 度量下引擎写入前归一化(存储的即归一化值)。
     std::span<const float> vector{};
     std::vector<std::pair<std::string, std::span<const std::byte>>> fields;  // S8.6
-    std::uint32_t expiry_at = 0;  // S13-D5：per-key 过期时刻（0 = 永不）
+    std::uint64_t expiry_at = 0;  // S13-D5：per-key 过期时刻（0 = 永不）
 };
 
 struct StatusInfo {
@@ -313,7 +313,7 @@ public:
     // caller 全表扫 + 自行过滤。keydir 是哈希表，过滤版仍是 O(全表) 扫描
     // （省的是 value 读取与跨界拷贝）；有序范围扫描需有序索引，见 TASK.md。
     [[nodiscard]] std::expected<keydir::StartIterResult, CaskFault>
-    start(int maxage = -1, int maxputs = -1, std::uint32_t now_sec = 0,
+    start(int maxage = -1, int maxputs = -1, std::uint64_t now_sec = 0,
           bool see_tombstones = false,
           std::span<const std::byte> key_prefix = {});
 
@@ -322,7 +322,7 @@ public:
     struct Entry {
         std::vector<std::byte> key;
         std::vector<std::byte> value;
-        std::uint32_t tstamp = 0;
+        std::uint64_t tstamp = 0;
         std::uint32_t file_id = 0;
         std::uint64_t offset = 0;
         std::uint32_t total_sz = 0;
@@ -482,8 +482,8 @@ public:
     [[nodiscard]] std::expected<void, CaskFault>
     put(std::span<const std::byte> key,
         std::span<const std::byte> value,
-        std::uint32_t tstamp = 0,
-        std::uint32_t expiry_at = 0);
+        std::uint64_t tstamp = 0,
+        std::uint64_t expiry_at = 0);
 
     // S13-D1：批量写（语义同 put 的 KV 路径）。整批一次提交：记录经
     // write_buffered 聚合成 1MiB 块 pwrite、单次 flush **之后**才 apply
@@ -505,18 +505,18 @@ public:
         std::span<const std::byte> value;
     };
     [[nodiscard]] std::expected<void, CaskFault>
-    put_batch(std::span<const BatchItem> items, std::uint32_t tstamp = 0);
+    put_batch(std::span<const BatchItem> items, std::uint64_t tstamp = 0);
 
     // 软删除：写一条墓碑 record。空间在下一次 merge 时回收。
     // 线程安全: **是**（同 put，内部 write_mu_）。
     [[nodiscard]] std::expected<void, CaskFault>
-    remove(std::span<const std::byte> key, std::uint32_t tstamp = 0);
+    remove(std::span<const std::byte> key, std::uint64_t tstamp = 0);
 
     // 写入结构化文档（text + 选填 meta）。用于索引模式。
     // 线程安全: **是**（同 put，内部 write_mu_）。
     [[nodiscard]] std::expected<void, CaskFault>
     put_doc(std::span<const std::byte> key, const DocInput& doc,
-            std::uint32_t tstamp = 0);
+            std::uint64_t tstamp = 0);
 
     // BM25 文本搜索（词袋模式）。
     // 线程安全: **是**（并发读安全：cache_/doc_texts_ 各 shared_mutex、倒排/HNSW
@@ -694,7 +694,7 @@ public:
         std::vector<std::string> expired_files;
     };
     // 线程安全: 是（读 keydir info 拿快照 + 纯函数策略）；不需外部锁。
-    [[nodiscard]] NeedsMerge needs_merge(std::uint32_t now_sec = 0);
+    [[nodiscard]] NeedsMerge needs_merge(std::uint64_t now_sec = 0);
 
     // 在指定文件上跑 merge。files 为空时先调 needs_merge。caller 自己负责
     // 外部调度 / 锁——这个方法只是把 run_merge 包了一层。
@@ -707,7 +707,7 @@ public:
     //     的遍历与 add_doc 插入始终同线程串行，无并发窗口。
     // 锁要求: caller 须保证同一 dirname 上同时仅一次 merge 在跑。
     [[nodiscard]] std::expected<merge::MergeStats, CaskFault>
-    merge(std::vector<std::string> files = {}, std::uint32_t now_sec = 0);
+    merge(std::vector<std::string> files = {}, std::uint64_t now_sec = 0);
 
     // S13-D6：不停机备份到 dst_dir（不存在则创建）。流程：持 write_mu_ 关闭
     // active writer（finalize hint trailer，下一次 put 自动重建）→ 快照文件
@@ -1152,7 +1152,7 @@ public:
     [[nodiscard]] std::expected<PersistedRecord, CaskFault>
     write_and_keydir(std::span<const std::byte> key,
                      std::span<std::byte> record,
-                     std::uint32_t tstamp, std::uint64_t ord);
+                     std::uint64_t tstamp, std::uint64_t ord);
 
     // ---- S29-7:put 写路径组提交(flat-combining leader-follower) ----
     //
@@ -1170,7 +1170,7 @@ public:
         // 输入(caller 线程栈/thread_local 缓冲;等待期间稳定)
         std::span<const std::byte> key;
         std::span<std::byte>       record;  // 预编码(占位 ord),leader patch
-        std::uint32_t              tstamp = 0;
+        std::uint64_t              tstamp = 0;
         // 结果:done 为发布点(原子,acquire/release)——follower 自旋
         // 读免锁;其余字段 leader 在 done=true 前独占写,follower 在
         // done=true 后独占读,无并发。

@@ -207,7 +207,7 @@ public:
         std::string_view key, std::uint64_t ord,
         std::span<const std::pair<std::string_view, std::string_view>> fields,
         std::uint32_t file_id, std::uint64_t offset,
-        std::uint32_t total_sz, std::uint32_t tstamp) const;
+        std::uint32_t total_sz, std::uint64_t tstamp) const;
     // Reduce 阶段（原 reduce_apply 的 BM25 半边；向量半边归 VectorPlugin）。
     // S23-M4：非 const 版 move doc_text 进原文 LRU（生产流水线路径）；
     // const 版兼容 shim/降级路径（仅 doc_text 多一次拷贝）。

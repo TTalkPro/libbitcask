@@ -52,10 +52,11 @@ struct DocLoc {
 // 按 ord 存的每文档元信息（slots[ord]）。
 // S21-1：不含 ord——slots_ 本身按 ord 下标寻址，存 ord 是每槽 8B 死重
 // （原注释自证「仅 get() 返回时填充」）。get() 返回带 ord 的 DocHit。
-// sizeof 40→24（连同 DocLoc 重排），每 chunk 槽数组 2.5MB→1.5MB。
+// S21-1 曾借 DocLoc 重排收到 24B；tstamp 随 64 位时间戳 flag-day 扩为
+// u64 后回到 32B（尾部 4B padding），每 chunk 槽数组 1.5MB→2MB。
 struct DocSlot {
     DocLoc        loc;
-    std::uint32_t tstamp  = 0;
+    std::uint64_t tstamp  = 0;
     std::uint32_t doc_len = 0;   // BM25 token 数（V2 由 analyzer 填）
 };
 

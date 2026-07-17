@@ -18,28 +18,29 @@
 namespace bitcask::format {
 
 // ---------------------------------------------------------------------------
-// 数据文件 record 布局（向量库 typed record，V1）：
+// 数据文件 record 布局（向量库 typed record，V2：Tstamp 扩为 u64）：
 //   [0..3]   CRC32       (覆盖 Type..Value 区段，即 [4..] 全部)
 //   [4]      Type        u8   (RecordType：kDoc / kTombstone)
-//   [5..8]   Tstamp      u32 小端
-//   [9..16]  Ord         u64 小端 (引擎单调分配的写入序号，per-write，永不复用)
-//   [17..18] KeySz       u16 小端 (key == ext_id)
-//   [19..22] ValueSz     u32 小端 (kDoc 时是打包 value；kTombstone 时通常为 0)
-//   [23..]   Key | Value
+//   [5..12]  Tstamp      u64 小端 (绝对 unix 秒；u32 时代上限 2106，flag-day 扩宽)
+//   [13..20] Ord         u64 小端 (引擎单调分配的写入序号，per-write，永不复用)
+//   [21..22] KeySz       u16 小端 (key == ext_id)
+//   [23..26] ValueSz     u32 小端 (kDoc 时是打包 value；kTombstone 时通常为 0)
+//   [27..]   Key | Value
 // 总长 = kHeaderSize + KeySz + ValueSz
 //
 // 设计依据见 doc/vector-db-design-zh.md §2.2。CRC 覆盖范围从 Type 开始
 // （含 ord），而非 legacy 的 Tstamp 起。
 // 字节序：P 起全盘统一小端(LE-only 主机，原生零转换 + mmap 零拷贝)。
-// flag-day 切换，旧大端文件不可读(需重建)，见 doc/format-zh.md。
+// flag-day 切换先例：大端旧文件不可读(需重建)；Tstamp u32→u64 同为
+// flag-day（meta v4 门禁，旧库干净拒开），见 doc/format-zh.md。
 // ---------------------------------------------------------------------------
-inline constexpr std::size_t kHeaderSize = 23;  // 4 + 1 + 4 + 8 + 2 + 4
+inline constexpr std::size_t kHeaderSize = 27;  // 4 + 1 + 8 + 8 + 2 + 4
 inline constexpr std::size_t kCrcOffset = 0;
 inline constexpr std::size_t kTypeOffset = 4;
 inline constexpr std::size_t kTstampOffset = 5;
-inline constexpr std::size_t kOrdOffset = 9;
-inline constexpr std::size_t kKeySzOffset = 17;
-inline constexpr std::size_t kValueSzOffset = 19;
+inline constexpr std::size_t kOrdOffset = 13;
+inline constexpr std::size_t kKeySzOffset = 21;
+inline constexpr std::size_t kValueSzOffset = 23;
 
 inline constexpr std::uint16_t kMaxKeySize = 0xFFFF;          // 16-bit 字段上限
 inline constexpr std::uint32_t kMaxValueSize = 0xFFFF'FFFFu;  // 32-bit 字段上限
@@ -66,23 +67,23 @@ inline constexpr std::uint64_t kMaxOffsetV2 = 0x7FFF'FFFF'FFFF'FFFFull;
 inline constexpr std::uint64_t kTombMaskV2 = 0x8000'0000'0000'0000ull;
 
 // ---------------------------------------------------------------------------
-// hint 文件 v3 布局（S23-A1）。v2 是 18B 定宽裸记录流（无文件头），v3：
-//   [0..3]           magic "BCH3"
+// hint 文件 v4 布局（S23-A1 的 v3 变长格式 + Tstamp u64 flag-day）。
+// v2 是 18B 定宽裸记录流（无文件头），v4：
+//   [0..3]           magic "BCH4"
 //   记录流（变长）    [vbyte gap][vbyte total_sz][vbyte keysz<<1|tomb]
-//                    [tstamp u32 小端][key]
+//                    [tstamp u64 小端][key]
 //   [size-8..size-1] trailer: magic "BCHE" u32 + running_crc u32
 //                    （CRC 覆盖 [0, size-8)，含文件头与全部记录字节）
 // gap = offset − prev_end（prev_end = 上条 offset+total_sz，首条为 0）。
 // 记录按 data append 序写且连续无洞时 gap==0（1 字节）；语义经 u64 二补数
-// 回绕无损还原，正确性**不依赖**连续性假设。典型记录 ~8-9B（v2 定宽 18B）。
-// 兼容：写端恒 v3；读端按文件头 magic 分派（v2 首 4 字节是 tstamp，与
-// magic 撞值概率 ~2^-32 且后果仅 CRC 失败 → fold(data) 兜底）。旧 v2 文件
-// merge/roll 后自然消亡；migrate 从不迁 hint。
+// 回绕无损还原，正确性**不依赖**连续性假设。典型记录 ~12-13B（v2 定宽 18B）。
+// 兼容：写端恒 v4；读端按文件头 magic 分派。v2/v3 旧文件属 u32-tstamp 纪元，
+// 已被 meta v4 门禁整体拒开（重建），不再有读端；migrate 从不迁 hint。
 // ---------------------------------------------------------------------------
-inline constexpr std::uint32_t kHintMagicV3        = 0x33484342;  // "BCH3" LE
-inline constexpr std::uint32_t kHintTrailerMagicV3 = 0x45484342;  // "BCHE" LE
-inline constexpr std::size_t   kHintHeaderV3       = 4;
-inline constexpr std::size_t   kHintTrailerV3      = 8;
+inline constexpr std::uint32_t kHintMagicV4        = 0x34484342;  // "BCH4" LE
+inline constexpr std::uint32_t kHintTrailerMagicV4 = 0x45484342;  // "BCHE" LE
+inline constexpr std::size_t   kHintHeaderV4       = 4;
+inline constexpr std::size_t   kHintTrailerV4      = 8;
 
 // ---------------------------------------------------------------------------
 // kDoc value 打包布局（写在 kDoc record 的 VALUE 段）。设计见 §2.4。
@@ -91,7 +92,7 @@ inline constexpr std::size_t   kHintTrailerV3      = 8;
 //   - Apache Lucene 的 stored fields 格式（字段值紧凑打包）
 //   - Tantivy 的 field value 编码（varint 长度前缀 + 字段值）
 //   核心思路：按 Flags 分段、varint 压缩长度、向量段靠前便于 HNSW 重建切片。
-//   [0]      Ver         u8   (布局版本号，当前 = kDocValueVersion = 3)
+//   [0]      Ver         u8   (布局版本号，当前 = kDocValueVersion = 4)
 //   [1]      Flags       u8   (见下方 kFlag* 位)
 //   [可选] vector 段：  [Dim:varint][ f32×Dim 小端  或  量化码字 ]
 //   [可选] text   段：  [Len:varint][ utf8 字节 ]
@@ -107,10 +108,11 @@ inline constexpr std::size_t   kHintTrailerV3      = 8;
 // 字段名 ↔ id 映射由 Cask 的 append-only field.schema 注册表维护，避免每条
 // record 重复内联字段名。decode 是纯函数、只还原 id，由上层用 schema 译回名字。
 //
-// 版本：v3 统一格式（不再有 v1/v2 的 fields 区分，fields 仅由 Flags 标记）。
-// 项目不考虑向后兼容；decode 只接受 Ver==3。
+// 版本：v3 统一格式（不再有 v1/v2 的 fields 区分，fields 仅由 Flags 标记）；
+// v4 = v3 + ExpiryAt 段 u32→u64（tstamp 64 位 flag-day）。
+// 项目不考虑向后兼容；decode 只接受 Ver==4。
 // ---------------------------------------------------------------------------
-inline constexpr std::uint8_t kDocValueVersion    = 3;  // varint 长度 + fieldId（#1/#2）
+inline constexpr std::uint8_t kDocValueVersion    = 4;  // v4：ExpiryAt u64
 inline constexpr std::size_t  kDocValueHeaderSize = 2;  // Ver + Flags
 
 inline constexpr std::uint8_t kFlagHasVector    = 0x01;
@@ -118,9 +120,9 @@ inline constexpr std::uint8_t kFlagHasText      = 0x02;
 inline constexpr std::uint8_t kFlagHasMeta      = 0x04;
 inline constexpr std::uint8_t kFlagVecQuantized = 0x08;
 inline constexpr std::uint8_t kFlagHasFields    = 0x10;  // fields 段存在（S8.6）
-// S13-D5：per-key TTL。置位时 value 末尾追加 [ExpiryAt:u32 LE]（绝对 unix 秒，
-// 恒非 0）。段追加在既有全部段之后 ⟹ 旧读端（不识别本位）按位忽略、跳过
-// 尾部字节——旧库读带 TTL 的记录 = 永不过期（静默降级，非拒绝）。
+// S13-D5：per-key TTL。置位时 value 末尾追加 [ExpiryAt:u64 LE]（绝对 unix 秒，
+// 恒非 0；v4 起 u64）。段追加在既有全部段之后 ⟹ 旧读端（不识别本位）按位
+// 忽略、跳过尾部字节——旧库读带 TTL 的记录 = 永不过期（静默降级，非拒绝）。
 inline constexpr std::uint8_t kFlagHasExpiry    = 0x20;
 
 // P3a 量化向量码字（kFlagVecQuantized 段，per-vector 对称 int8）。布局：

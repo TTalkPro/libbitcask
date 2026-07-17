@@ -68,8 +68,8 @@ struct FileStatus {
     int           fragmented;        // 0..100，碎片率百分比
     std::uint64_t dead_bytes;        // total_bytes - live_bytes
     std::uint64_t total_bytes;
-    std::uint32_t oldest_tstamp;
-    std::uint32_t newest_tstamp;
+    std::uint64_t oldest_tstamp;
+    std::uint64_t newest_tstamp;
     std::uint64_t expiration_epoch;
 };
 
@@ -103,7 +103,7 @@ summarize(std::string_view dirname, const keydir::FStatsEntry& f);
 // Policy::decide 内部用；测试 + log_needs_merge 也调它。
 [[nodiscard]] std::vector<Reason>
 per_file_reasons(const FileStatus& f, const PolicyOptions& opts,
-                 std::uint32_t now_sec);
+                 std::uint64_t now_sec);
 
 // 完整决策。now_sec 是 wall-clock 秒（0 表示无视 expiry，单测可用）；
 // summary 一般由 summarize() 在 fstats 上批量算出来——caller 通常先把
@@ -114,7 +114,7 @@ per_file_reasons(const FileStatus& f, const PolicyOptions& opts,
 [[nodiscard]] Decision
 decide(const std::vector<FileStatus>& summary,
        const PolicyOptions& opts,
-       std::uint32_t now_sec,
+       std::uint64_t now_sec,
        int dead_doc_rate = 0);
 
 // 应用 max_merge_size 上限：累加文件大小，超过上限就停（严格遵守 legacy

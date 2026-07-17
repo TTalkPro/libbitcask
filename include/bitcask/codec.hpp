@@ -39,7 +39,7 @@ enum class DecodeError {
 struct DataRecordView {
     std::uint32_t      crc;
     format::RecordType type;
-    std::uint32_t      tstamp;
+    std::uint64_t      tstamp;
     std::uint64_t      ord;
     std::span<const std::byte> key;
     std::span<const std::byte> value;
@@ -49,7 +49,7 @@ struct DataRecordView {
 // 解码后的 hint record。consumed 是消耗的字节数（== kHintRecordSize + key），
 // caller 用它推进 buf 指针读下一条。
 struct HintRecord {
-    std::uint32_t tstamp;
+    std::uint64_t tstamp;   // v4 起盘上 u64；v2 旧格式解码时零扩展
     std::uint32_t total_sz;
     std::uint64_t offset;   // 63-bit；最高位被 tombstone 标志占用
     bool tombstone;
@@ -67,7 +67,7 @@ struct HintRecord {
 // 线程安全: 是（纯函数，但写入 out 由 caller 串行保证）；不需任何锁。
 std::size_t encode_data_record(std::vector<std::byte>& out,
                                format::RecordType type,
-                               std::uint32_t tstamp,
+                               std::uint64_t tstamp,
                                std::uint64_t ord,
                                std::span<const std::byte> key,
                                std::span<const std::byte> value);
@@ -106,8 +106,8 @@ struct DocValueParts {
     std::optional<std::span<const std::byte>>  meta;
     std::vector<DocField>                      fields;  // 空 = 不写 fields 段
     bool                                      vec_quantized = false;  // V6.4.1 stub
-    // S13-D5：per-key 过期时刻（绝对 unix 秒；0 = 永不过期，不写段）。
-    std::uint32_t                             expiry_at = 0;
+    // S13-D5：per-key 过期时刻（绝对 unix 秒；0 = 永不过期，不写段）。v4 起 u64。
+    std::uint64_t                             expiry_at = 0;
 };
 
 // 解码后的 kDoc value 视图。各段是 zero-copy span，生命周期跟着输入 buf。
@@ -129,7 +129,7 @@ struct DocValueView {
     std::span<const std::byte> text;
     std::span<const std::byte> meta;
     std::vector<DocField>      fields;      // 解出的字段（id + zero-copy value span）
-    std::uint32_t expiry_at = 0;            // S13-D5：0 = 无 per-key TTL
+    std::uint64_t expiry_at = 0;            // S13-D5：0 = 无 per-key TTL（v4 起 u64）
 };
 
 // 把 {vector,text,meta} 打包成 kDoc value，append 到 out。返回写入字节数。
@@ -179,8 +179,8 @@ decode_hint_record(std::span<const std::byte> buf);
 // ---- hint v3（S23-A1，变长编码；文件级布局见 format.hpp）----
 // 编码一条 v3 记录（append 进 out），返回新的 prev_end（= offset+total_sz），
 // caller 串联传给下一条。
-std::uint64_t encode_hint_record_v3(std::vector<std::byte>& out,
-                                    std::uint32_t tstamp,
+std::uint64_t encode_hint_record_v4(std::vector<std::byte>& out,
+                                    std::uint64_t tstamp,
                                     std::uint32_t total_sz,
                                     std::uint64_t offset, bool tombstone,
                                     std::span<const std::byte> key,
@@ -188,7 +188,7 @@ std::uint64_t encode_hint_record_v3(std::vector<std::byte>& out,
 // 从 buf 头部解一条 v3 记录；prev_end 传入并在成功时更新。字节不足返回
 // kBufferTooShort（流式 caller 据此 refill 重试）。
 [[nodiscard]] std::expected<HintRecord, DecodeError>
-decode_hint_record_v3(std::span<const std::byte> buf, std::uint64_t& prev_end);
+decode_hint_record_v4(std::span<const std::byte> buf, std::uint64_t& prev_end);
 
 // ---------------------------------------------------------------------------
 // CRC32 (zlib / IEEE 802.3 多项式，跟 erlang:crc32/1 一致)

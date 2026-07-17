@@ -37,7 +37,7 @@ std::uint32_t crc32_update(std::uint32_t seed,
 // caller 用 assert 兜底大小限制——超出 uint16/uint32 字段范围是 caller bug。
 std::size_t encode_data_record(std::vector<std::byte>& out,
                                format::RecordType type,
-                               std::uint32_t tstamp,
+                               std::uint64_t tstamp,
                                std::uint64_t ord,
                                std::span<const std::byte> key,
                                std::span<const std::byte> value) {
@@ -53,7 +53,7 @@ std::size_t encode_data_record(std::vector<std::byte>& out,
     // 布局: [CRC|Type|Tstamp|Ord|KeySz|ValueSz|Key|Value]。
     // CRC 覆盖它自身之后的全部字节（即 Type..Value）。
     p[format::kTypeOffset] = static_cast<std::byte>(type);
-    le_store_u32(p + format::kTstampOffset, tstamp);
+    le_store_u64(p + format::kTstampOffset, tstamp);
     le_store_u64(p + format::kOrdOffset, ord);
     le_store_u16(p + format::kKeySzOffset, static_cast<std::uint16_t>(key.size()));
     le_store_u32(p + format::kValueSzOffset, static_cast<std::uint32_t>(value.size()));
@@ -88,7 +88,7 @@ decode_data_record(std::span<const std::byte> buf) {
     const std::uint32_t crc      = le_load_u32(buf.data() + format::kCrcOffset);
     const auto          type     = static_cast<format::RecordType>(
                                        buf.data()[format::kTypeOffset]);
-    const std::uint32_t tstamp   = le_load_u32(buf.data() + format::kTstampOffset);
+    const std::uint64_t tstamp   = le_load_u64(buf.data() + format::kTstampOffset);
     const std::uint64_t ord      = le_load_u64(buf.data() + format::kOrdOffset);
     const std::uint16_t key_sz   = le_load_u16(buf.data() + format::kKeySzOffset);
     const std::uint32_t value_sz = le_load_u32(buf.data() + format::kValueSzOffset);
@@ -183,11 +183,11 @@ std::size_t encode_doc_value(std::vector<std::byte>& out, const DocValueParts& p
             append_bytes(f.value);
         }
     }
-    // S13-D5：expiry 段固定追加在最后（旧读端按位忽略尾部字节）。
+    // S13-D5：expiry 段固定追加在最后（旧读端按位忽略尾部字节）。v4：u64 LE。
     if (parts.expiry_at != 0) {
         const std::size_t at = out.size();
-        out.resize(at + sizeof(std::uint32_t));
-        std::memcpy(out.data() + at, &parts.expiry_at, sizeof(std::uint32_t));
+        out.resize(at + sizeof(std::uint64_t));
+        std::memcpy(out.data() + at, &parts.expiry_at, sizeof(std::uint64_t));
     }
     return out.size() - base;
 }
@@ -303,13 +303,13 @@ decode_doc_value(std::span<const std::byte> buf) {
             v.fields.push_back(f);
         }
     }
-    // S13-D5：expiry 段（flag 0x20，末尾 u32 LE 绝对 unix 秒）。
+    // S13-D5：expiry 段（flag 0x20，末尾 u64 LE 绝对 unix 秒；v4 起 u64）。
     if ((flags & format::kFlagHasExpiry) != 0) {
-        if (pos + sizeof(std::uint32_t) > buf.size()) {
+        if (pos + sizeof(std::uint64_t) > buf.size()) {
             return std::unexpected(DecodeError::kBufferTooShort);
         }
-        std::memcpy(&v.expiry_at, buf.data() + pos, sizeof(std::uint32_t));
-        pos += sizeof(std::uint32_t);
+        std::memcpy(&v.expiry_at, buf.data() + pos, sizeof(std::uint64_t));
+        pos += sizeof(std::uint64_t);
     }
     return v;
 }
@@ -419,8 +419,8 @@ bool is_hint_eof(const HintRecord& r) noexcept {
 
 // ---- hint v3（S23-A1）----
 
-std::uint64_t encode_hint_record_v3(std::vector<std::byte>& out,
-                                    std::uint32_t tstamp,
+std::uint64_t encode_hint_record_v4(std::vector<std::byte>& out,
+                                    std::uint64_t tstamp,
                                     std::uint32_t total_sz,
                                     std::uint64_t offset, bool tombstone,
                                     std::span<const std::byte> key,
@@ -434,8 +434,8 @@ std::uint64_t encode_hint_record_v3(std::vector<std::byte>& out,
                      (tombstone ? 1u : 0u),
                  out);
     const std::size_t base = out.size();
-    out.resize(base + 4);
-    le_store_u32(out.data() + base, tstamp);
+    out.resize(base + 8);
+    le_store_u64(out.data() + base, tstamp);  // v4：tstamp u64 LE
     if (!key.empty()) {
         out.insert(out.end(), key.begin(), key.end());
     }
@@ -443,7 +443,7 @@ std::uint64_t encode_hint_record_v3(std::vector<std::byte>& out,
 }
 
 std::expected<HintRecord, DecodeError>
-decode_hint_record_v3(std::span<const std::byte> buf, std::uint64_t& prev_end) {
+decode_hint_record_v4(std::span<const std::byte> buf, std::uint64_t& prev_end) {
     // 边界安全 vbyte（buf 可能只含半条记录，短读返回 kBufferTooShort）。
     std::size_t pos = 0;
     auto vb = [&](std::uint64_t& v) -> bool {
@@ -465,11 +465,11 @@ decode_hint_record_v3(std::span<const std::byte> buf, std::uint64_t& prev_end) {
     if (tsz > 0xFFFFFFFFull || key_sz > format::kMaxKeySize) {
         return std::unexpected(DecodeError::kKeySizeOverflow);
     }
-    if (buf.size() < pos + 4 + key_sz) {
+    if (buf.size() < pos + 8 + key_sz) {
         return std::unexpected(DecodeError::kBufferTooShort);
     }
-    const std::uint32_t tstamp = le_load_u32(buf.data() + pos);
-    pos += 4;
+    const std::uint64_t tstamp = le_load_u64(buf.data() + pos);  // v4：u64 LE
+    pos += 8;
     const std::uint64_t offset = prev_end + gap;  // 回绕还原
     HintRecord rec{
         .tstamp = tstamp,

@@ -402,7 +402,7 @@ TEST(HintFileGolden, ReadsGoldenEncodedFile) {
     ASSERT_TRUE(valid);
     EXPECT_TRUE(*valid) << "trailer CRC must validate against golden LE bytes";
 
-    struct R { std::string key; std::uint32_t ts; std::uint32_t sz;
+    struct R { std::string key; std::uint64_t ts; std::uint32_t sz;
                std::uint64_t off; bool tomb; };
     std::vector<R> seen;
     auto fr = h->fold([&](const auto& rec) {
@@ -427,10 +427,11 @@ TEST(HintFileGolden, ReadsGoldenEncodedFile) {
 
 // Inverse direction: bytes our HintFile produces must match the pinned LE
 // golden for the same logical inputs (drift guard).
-// S23-A1：写端换 v3——golden 同步换代（v2 golden 保留在
-// ReadsGoldenEncodedFile 锁定兼容读分支）。布局见 format.hpp：
-// header "BCH3" + 每条 [vbyte gap][vbyte total_sz][vbyte keysz<<1|tomb]
-// [tstamp u32][key] + trailer "BCHE"+CRC。三条连续记录 gap 恒 0（1B）。
+// S23-A1 写端换 v3；64 位时间戳 flag-day 后换 v4——golden 同步换代
+// （v2 golden 保留在 ReadsGoldenEncodedFile 锁定兼容读分支）。布局见
+// format.hpp：header "BCH4" + 每条 [vbyte gap][vbyte total_sz]
+// [vbyte keysz<<1|tomb][tstamp u64][key] + trailer "BCHE"+CRC。
+// 三条连续记录 gap 恒 0（1B）。
 TEST(HintFileGolden, EncodingMatchesGoldenByteForByte) {
     TempDir td;
     const auto path = td / "ours.bitcask.hint";
@@ -451,14 +452,14 @@ TEST(HintFileGolden, EncodingMatchesGoldenByteForByte) {
     ASSERT_EQ(std::fread(got.data(), 1, sz, fp), sz);
     std::fclose(fp);
 
-    // v3 golden：header(4) + 9 + 10 + 12 记录字节 + trailer(8) = 43B
-    // （v2 同载荷 79B，−45%）。trailer CRC 用 codec::crc32 计算拼接
+    // v4 golden：header(4) + 13 + 14 + 16 记录字节 + trailer(8) = 55B
+    // （v2 同载荷 79B）。trailer CRC 用 codec::crc32 计算拼接
     // （CRC 实现自身有独立 golden 锁定）。
     auto expected = hex_to_bytes(
-        "42434833"                       // "BCH3"
-        "80" "93" "82" "64000000" "61"   // R1: gap0,sz19,k1,ts100,"a"
-        "80" "94" "85" "65000000" "6262" // R2: gap0,sz20,k2|tomb,ts101,"bb"
-        "80" "96" "88" "66000000" "63636363");  // R3
+        "42434834"                               // "BCH4"
+        "80" "93" "82" "6400000000000000" "61"   // R1: gap0,sz19,k1,ts100,"a"
+        "80" "94" "85" "6500000000000000" "6262" // R2: gap0,sz20,k2|tomb,ts101,"bb"
+        "80" "96" "88" "6600000000000000" "63636363");  // R3
     {
         const std::uint32_t crc = bitcask::codec::crc32(
             std::span<const std::byte>(expected.data(), expected.size()));
@@ -574,14 +575,15 @@ TEST(MigrateBEtoLE, RoundTrip) {
     EXPECT_TRUE(res->meta_migrated);
     EXPECT_TRUE(res->field_schema_migrated);
 
-    // dst meta：version 3（S12：LE + CRC）、dim 小端 = 4、CRC 覆盖 [0,14) 正确。
+    // dst meta：version 4（LE + CRC + u64 tstamp 纪元）、dim 小端 = 4、
+    // CRC 覆盖 [0,14) 正确。
     {
         std::FILE* f = std::fopen((fs::path(dst) / "bitcask.meta").c_str(), "rb");
         ASSERT_NE(f, nullptr);
         unsigned char m[18];
         ASSERT_EQ(std::fread(m, 1, 18, f), 18u);
         std::fclose(f);
-        EXPECT_EQ(m[4], 3u);
+        EXPECT_EQ(m[4], 4u);
         EXPECT_EQ(static_cast<std::uint16_t>(m[7] | (m[8] << 8)), 4u);
         const std::uint32_t crc = bitcask::codec::crc32(
             std::span<const std::byte>(reinterpret_cast<const std::byte*>(m), 14));
@@ -596,7 +598,7 @@ TEST(MigrateBEtoLE, RoundTrip) {
         auto df = DataFile::open((fs::path(dst) / "1.bitcask.data").string(),
                                  DataFile::Mode::kRead, false, false);
         ASSERT_TRUE(df);
-        struct Rec { RecordType type; std::uint32_t ts; std::uint64_t ord;
+        struct Rec { RecordType type; std::uint64_t ts; std::uint64_t ord;
                      std::string key; std::string val; };
         std::vector<Rec> recs;
         auto fr = df->fold([&](const bitcask::codec::DataRecordView& v,
@@ -646,6 +648,221 @@ TEST(MigrateBEtoLE, RejectsAlreadyV2) {
     write_file_bytes((fs::path(src) / "bitcask.meta").string(), m);
     auto res = bitcask::migrate::migrate_be_to_le(src, td / "dst2");
     EXPECT_FALSE(res);
+}
+
+// ---------------------------------------------------------------------------
+// migrate_u32_to_u64：u32 时间戳纪元（meta v2/v3,23B 头,DocValue v3）
+// → 当前纪元（meta v4,27B 头,DocValue v4,tstamp/expiry u64）。
+// ---------------------------------------------------------------------------
+namespace {
+
+void le_put16(std::vector<std::byte>& b, std::uint16_t v) {
+    b.push_back(static_cast<std::byte>(v & 0xFF));
+    b.push_back(static_cast<std::byte>((v >> 8) & 0xFF));
+}
+void le_put32(std::vector<std::byte>& b, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i)
+        b.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+}
+void le_put64(std::vector<std::byte>& b, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i)
+        b.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+}
+
+// u32 纪元 data record（23B 小端头,布局同大端 v1 仅字节序不同）。
+std::vector<std::byte> le_u32era_data_record(bitcask::format::RecordType type,
+                                             std::uint32_t ts,
+                                             std::uint64_t ord,
+                                             std::string_view key,
+                                             std::span<const std::byte> val) {
+    std::vector<std::byte> covered;
+    covered.push_back(static_cast<std::byte>(type));
+    le_put32(covered, ts);
+    le_put64(covered, ord);
+    le_put16(covered, static_cast<std::uint16_t>(key.size()));
+    le_put32(covered, static_cast<std::uint32_t>(val.size()));
+    auto kb = as_bytes(key);
+    covered.insert(covered.end(), kb.begin(), kb.end());
+    covered.insert(covered.end(), val.begin(), val.end());
+    std::vector<std::byte> rec;
+    le_put32(rec, bitcask::codec::crc32(covered));
+    rec.insert(rec.end(), covered.begin(), covered.end());
+    return rec;
+}
+
+// DocValue v3 字节：[Ver=3][Flags] + text 段（varint len + bytes）
+// + 可选 expiry 段（u32 LE 追加在最后）。
+std::vector<std::byte> docvalue_v3(std::string_view text,
+                                   std::uint32_t expiry32) {
+    std::vector<std::byte> v;
+    v.push_back(std::byte{3});  // Ver = 3（u32 纪元）
+    std::uint8_t flags = 0x02;  // kFlagHasText
+    if (expiry32 != 0) flags |= 0x20;  // kFlagHasExpiry
+    v.push_back(static_cast<std::byte>(flags));
+    // 测试辅助只处理单字节 varint（text < 128B）。
+    v.push_back(static_cast<std::byte>(text.size() | 0x80));  // varint 终止位
+    auto tb = as_bytes(text);
+    v.insert(v.end(), tb.begin(), tb.end());
+    if (expiry32 != 0) le_put32(v, expiry32);
+    return v;
+}
+
+}  // namespace
+
+TEST(MigrateU32toU64, RoundTrip) {
+    using bitcask::format::RecordType;
+    TempDir td;
+    const std::string src = td / "u32src";
+    const std::string dst = td / "u32dst";
+    fs::create_directories(src);
+
+    // u32 纪元 meta v3：mode=index、metric=cosine(1)、dim=4（全小端 + CRC）。
+    {
+        std::vector<std::byte> m(18, std::byte{0});
+        std::memcpy(m.data(), "BCME", 4);
+        m[4] = static_cast<std::byte>(3);  // version 3（u32 纪元,带 CRC）
+        m[5] = static_cast<std::byte>(1);  // mode = index
+        m[6] = static_cast<std::byte>(1);  // metric = cosine
+        m[7] = static_cast<std::byte>(4);  // dim = 4（小端 lo）
+        const std::uint32_t crc = bitcask::codec::crc32(
+            std::span<const std::byte>(m.data(), 14));
+        std::vector<std::byte> tail;
+        le_put32(tail, crc);
+        std::copy(tail.begin(), tail.end(), m.begin() + 14);
+        write_file_bytes((fs::path(src) / "bitcask.meta").string(), m);
+    }
+    // field.schema：当前格式（本次 flag-day 未变）,应被原样拷贝。
+    const std::vector<std::byte> schema_bytes = {std::byte{0xAA},
+                                                 std::byte{0xBB}};
+    write_file_bytes((fs::path(src) / "field.schema").string(), schema_bytes);
+
+    // data：带 TTL 的 doc、无 TTL 的 doc、墓碑（4B 小端 shadow）。
+    std::vector<std::byte> dv1, dv2;
+    docvalue_v3("aa", /*expiry32=*/0xDEADBEEFu).swap(dv1);
+    docvalue_v3("bb", /*expiry32=*/0).swap(dv2);
+    {
+        std::vector<std::byte> data;
+        auto r1 = le_u32era_data_record(RecordType::kDoc, 100, 1, "k1", dv1);
+        auto r2 = le_u32era_data_record(RecordType::kDoc, 101, 2, "k2", dv2);
+        const std::vector<std::byte> shadow = {std::byte{1}, std::byte{0},
+                                               std::byte{0}, std::byte{0}};
+        auto r3 = le_u32era_data_record(RecordType::kTombstone, 102, 3, "k1",
+                                        shadow);
+        for (auto* r : {&r1, &r2, &r3})
+            data.insert(data.end(), r->begin(), r->end());
+        write_file_bytes((fs::path(src) / "1.bitcask.data").string(), data);
+    }
+
+    auto res = bitcask::migrate::migrate_u32_to_u64(src, dst);
+    ASSERT_TRUE(res) << (res ? "" : res.error());
+    EXPECT_EQ(res->data_files, 1u);
+    EXPECT_EQ(res->records, 3u);
+    EXPECT_EQ(res->tombstones, 1u);
+    EXPECT_EQ(res->skipped_bad_crc, 0u);
+    EXPECT_EQ(res->skipped_bad_docvalue, 0u);
+    EXPECT_TRUE(res->meta_migrated);
+    EXPECT_TRUE(res->field_schema_migrated);
+
+    // dst meta：version 4,其余配置字节保留,CRC 重算正确（v4 门禁字节级
+    // 校验;与 MigrateBEtoLE.RoundTrip 同法,避免测试链接 cask 库）。
+    {
+        std::FILE* f = std::fopen((fs::path(dst) / "bitcask.meta").c_str(),
+                                  "rb");
+        ASSERT_NE(f, nullptr);
+        unsigned char m[18];
+        ASSERT_EQ(std::fread(m, 1, 18, f), 18u);
+        std::fclose(f);
+        EXPECT_EQ(m[4], 4u);   // version 4
+        EXPECT_EQ(m[5], 1u);   // mode = index 保留
+        EXPECT_EQ(m[6], 1u);   // metric = cosine 保留
+        EXPECT_EQ(static_cast<std::uint16_t>(m[7] | (m[8] << 8)), 4u);
+        const std::uint32_t crc = bitcask::codec::crc32(
+            std::span<const std::byte>(reinterpret_cast<const std::byte*>(m),
+                                       14));
+        const std::uint32_t stored =
+            static_cast<std::uint32_t>(m[14]) |
+            (static_cast<std::uint32_t>(m[15]) << 8) |
+            (static_cast<std::uint32_t>(m[16]) << 16) |
+            (static_cast<std::uint32_t>(m[17]) << 24);
+        EXPECT_EQ(stored, crc);
+    }
+    // field.schema 原样拷贝。
+    {
+        std::FILE* f = std::fopen((fs::path(dst) / "field.schema").c_str(),
+                                  "rb");
+        ASSERT_NE(f, nullptr);
+        unsigned char buf[4] = {0};
+        const auto got = std::fread(buf, 1, sizeof(buf), f);
+        std::fclose(f);
+        ASSERT_EQ(got, 2u);
+        EXPECT_EQ(buf[0], 0xAAu);
+        EXPECT_EQ(buf[1], 0xBBu);
+    }
+
+    // dst data：新读路径 fold;tstamp 零扩展、DocValue v4、expiry u64。
+    {
+        auto df = DataFile::open((fs::path(dst) / "1.bitcask.data").string(),
+                                 DataFile::Mode::kRead, false, false);
+        ASSERT_TRUE(df);
+        struct Rec { RecordType type; std::uint64_t ts; std::uint64_t ord;
+                     std::string key; std::vector<std::byte> val; };
+        std::vector<Rec> recs;
+        auto fr = df->fold([&](const bitcask::codec::DataRecordView& v,
+                               std::uint64_t, std::uint32_t) {
+            recs.push_back({v.type, v.tstamp, v.ord, view_str(v.key),
+                            {v.value.begin(), v.value.end()}});
+        });
+        ASSERT_TRUE(fr);
+        ASSERT_EQ(recs.size(), 3u);
+        EXPECT_EQ(recs[0].ts, 100u);
+        EXPECT_EQ(recs[0].key, "k1");
+        auto d1 = bitcask::codec::decode_doc_value(recs[0].val);
+        ASSERT_TRUE(d1) << "转码后必须是合法 DocValue v4";
+        EXPECT_EQ(d1->ver, 4u);
+        EXPECT_EQ(view_str(d1->text), "aa");
+        EXPECT_EQ(d1->expiry_at, 0xDEADBEEFull) << "expiry u32 → u64 零扩展";
+        auto d2 = bitcask::codec::decode_doc_value(recs[1].val);
+        ASSERT_TRUE(d2);
+        EXPECT_EQ(view_str(d2->text), "bb");
+        EXPECT_EQ(d2->expiry_at, 0u);
+        EXPECT_EQ(recs[2].type, RecordType::kTombstone);
+        EXPECT_EQ(recs[2].key, "k1");
+        ASSERT_EQ(recs[2].val.size(), 4u) << "墓碑 shadow 原样保留";
+    }
+
+    // dst hint：v4 重生成,trailer 校验通过,tstamp 不截断。
+    {
+        auto h = HintFile::open((fs::path(dst) / "1.bitcask.hint").string(),
+                                HintFile::Mode::kRead);
+        ASSERT_TRUE(h);
+        auto v = h->validate_trailer();
+        ASSERT_TRUE(v); EXPECT_TRUE(*v);
+        std::vector<std::uint64_t> ts;
+        auto fr = h->fold([&](const auto& rec) { ts.push_back(rec.tstamp); });
+        ASSERT_TRUE(fr);
+        EXPECT_EQ(ts, (std::vector<std::uint64_t>{100, 101, 102}));
+    }
+}
+
+// meta 版本门禁：v1 提示先走 be2le;v4 提示无需迁移。
+TEST(MigrateU32toU64, RejectsWrongEra) {
+    TempDir td;
+    auto mk_meta = [&](const std::string& dir, std::uint8_t ver) {
+        fs::create_directories(dir);
+        std::vector<std::byte> m(18, std::byte{0});
+        std::memcpy(m.data(), "BCME", 4);
+        m[4] = static_cast<std::byte>(ver);
+        write_file_bytes((fs::path(dir) / "bitcask.meta").string(), m);
+    };
+    mk_meta(td / "v1src", 1);
+    auto r1 = bitcask::migrate::migrate_u32_to_u64(td / "v1src", td / "o1");
+    ASSERT_FALSE(r1);
+    EXPECT_NE(r1.error().find("be2le"), std::string::npos);
+
+    mk_meta(td / "v4src", 4);
+    auto r4 = bitcask::migrate::migrate_u32_to_u64(td / "v4src", td / "o4");
+    ASSERT_FALSE(r4);
+    EXPECT_NE(r4.error().find("nothing to migrate"), std::string::npos);
 }
 
 // ---------------------------------------------------------------------------

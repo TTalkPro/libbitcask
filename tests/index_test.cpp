@@ -280,8 +280,8 @@ TEST(Index, SidecarV2RoundTrip) {
     EXPECT_EQ(s->tstamp, 2222u);
 }
 
-// v1（定宽行）兼容读：手工构造 v1 字节流——写端已恒写 v2，此路径无自然
-// 覆盖，防回归。
+// v1（定宽行，u32-tstamp 纪元）：64 位时间戳 flag-day 后读端仅收 v3——
+// 旧版本必须被干净拒收（返回 nullopt → 组件退 fold），绝不按新布局误读。
 TEST(Index, SidecarV1CompatRead) {
     std::vector<std::uint8_t> b;
     bcis_le32(b, 0x42434953);  // "BCIS"
@@ -304,14 +304,7 @@ TEST(Index, SidecarV1CompatRead) {
     Index idx;
     auto covers = idx.deserialize_docmap(
         std::span<const std::uint8_t>(b.data(), b.size()));
-    ASSERT_TRUE(covers.has_value()) << "v1 sidecar 必须仍可读（兼容分支）";
-    EXPECT_EQ(*covers, 3u);
-    auto s = idx.get("v1doc");
-    ASSERT_TRUE(s.has_value());
-    EXPECT_EQ(s->ord, 2u);
-    EXPECT_EQ(s->loc.file_id, 7u);
-    EXPECT_EQ(s->loc.offset, 512u);
-    EXPECT_EQ(s->loc.total_sz, 64u);
-    EXPECT_EQ(s->tstamp, 3333u);
-    EXPECT_EQ(s->doc_len, 12u);
+    EXPECT_FALSE(covers.has_value())
+        << "u32 纪元 v1 sidecar 必须被干净拒收（退 fold 重建）";
+    EXPECT_FALSE(idx.get("v1doc").has_value()) << "拒收后不得残留半解析状态";
 }

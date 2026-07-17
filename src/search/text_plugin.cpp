@@ -174,7 +174,7 @@ ReduceJob TextPlugin::map_analyze(
     std::string_view key, std::uint64_t ord,
     std::span<const std::pair<std::string_view, std::string_view>> fields,
     std::uint32_t file_id, std::uint64_t offset,
-    std::uint32_t total_sz, std::uint32_t tstamp) const {
+    std::uint32_t total_sz, std::uint64_t tstamp) const {
     ReduceJob job;
     job.key      = std::string(key);
     job.ord      = ord;

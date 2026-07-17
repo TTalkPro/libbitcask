@@ -46,7 +46,7 @@ inline constexpr std::uint32_t kMagic       = 0x42534732;  // 'BSG2'
 inline constexpr std::uint32_t kFooterMagic = 0x42534746;  // 'BSGF'
 inline constexpr std::uint32_t kTailMagic   = 0x42534754;  // 'BSGT'
 inline constexpr std::uint32_t kLiveMagic   = 0x42534C56;  // 'BSLV'
-inline constexpr std::uint32_t kVersion     = 1;
+inline constexpr std::uint32_t kVersion     = 2;  // v2:DocRow tstamp u64（行重排）
 inline constexpr std::size_t   kBlockSize   = 128;  // == PostingList::kBlockSize
 
 enum class Section : std::uint32_t {
@@ -94,16 +94,17 @@ static_assert(sizeof(FieldStats) == 32);
 
 // doc_store 定长行(48B)。节版式:[u64 doc_count][u64 key_blob_len]
 // [rows…][key blob]。
+// kVersion=2 起 tstamp 为 u64（64 位时间戳 flag-day）：原 4B pad 被吃掉、
+// 字段重排,总大小仍 48B;与 v1 行布局二进制不兼容(读端拒 v1)。
 struct DocRow {
     std::uint64_t lsn;
     std::uint64_t key_off;       // key blob 内偏移
     std::uint64_t loc_offset;    // DocSlot.loc.offset
+    std::uint64_t tstamp;
     std::uint32_t loc_file_id;
     std::uint32_t loc_total_sz;
-    std::uint32_t tstamp;
     std::uint32_t doc_len;
     std::uint32_t key_len;
-    std::uint32_t pad = 0;
 };
 static_assert(sizeof(DocRow) == 48);
 

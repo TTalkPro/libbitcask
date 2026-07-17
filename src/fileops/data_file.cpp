@@ -133,7 +133,7 @@ DataFile::read_mmap(std::uint64_t offset, std::uint32_t total_size) const {
 // offset 来支持「自己追踪写入位置」的语义（下一步 truncate_to 会用到）。
 std::expected<WriteResult, DataFileFault>
 DataFile::write(format::RecordType type,
-                std::uint32_t tstamp,
+                std::uint64_t tstamp,
                 std::uint64_t ord,
                 std::span<const std::byte> key,
                 std::span<const std::byte> value) {
@@ -172,7 +172,7 @@ DataFile::write_encoded(std::span<const std::byte> record) {
 // current_offset_（逻辑位置，含缓冲），与落盘时机解耦。
 std::expected<WriteResult, DataFileFault>
 DataFile::write_buffered(format::RecordType type,
-                         std::uint32_t tstamp,
+                         std::uint64_t tstamp,
                          std::uint64_t ord,
                          std::span<const std::byte> key,
                          std::span<const std::byte> value) {

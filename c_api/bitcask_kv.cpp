@@ -191,7 +191,7 @@ BITCASK_API bitcask_error_t bitcask_get(bitcask_t* cask,
 BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
                                           bitcask_slice_t key,
                                           bitcask_slice_t value,
-                                          uint32_t tstamp,
+                                          uint64_t tstamp,
                                           bitcask_fault_t* fault) {
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
@@ -213,8 +213,8 @@ BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
 BITCASK_API bitcask_error_t bitcask_put_ex(bitcask_t* cask,
                                            bitcask_slice_t key,
                                            bitcask_slice_t value,
-                                           uint32_t tstamp,
-                                           uint32_t expiry_at,
+                                           uint64_t tstamp,
+                                           uint64_t expiry_at,
                                            bitcask_fault_t* fault) {
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
@@ -233,7 +233,7 @@ BITCASK_API bitcask_error_t bitcask_put_ex(bitcask_t* cask,
 
 BITCASK_API bitcask_error_t bitcask_delete(bitcask_t* cask,
                                              bitcask_slice_t key,
-                                             uint32_t tstamp,
+                                             uint64_t tstamp,
                                              bitcask_fault_t* fault) {
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
@@ -289,7 +289,7 @@ BITCASK_API void bitcask_get_result_free(bitcask_get_result_t* result) {
 BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
                                               bitcask_slice_t key,
                                               const bitcask_doc_input_t* doc,
-                                              uint32_t tstamp,
+                                              uint64_t tstamp,
                                               bitcask_fault_t* fault) {
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
@@ -328,7 +328,7 @@ BITCASK_API void bitcask_search_result_batch_free(bitcask_search_result_t** resu
 BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
                                               const bitcask_kv_pair_t* items,
                                               size_t n,
-                                              uint32_t tstamp,
+                                              uint64_t tstamp,
                                               bitcask_fault_t* fault) {
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {

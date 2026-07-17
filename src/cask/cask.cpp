@@ -1041,7 +1041,7 @@ std::expected<void, CaskFault> Cask::prepare_search() {
 std::expected<Cask::PersistedRecord, CaskFault>
 Cask::write_and_keydir(std::span<const std::byte> key,
                        std::span<std::byte> record,
-                       std::uint32_t tstamp, std::uint64_t ord) {
+                       std::uint64_t tstamp, std::uint64_t ord) {
     // S29-7 铺垫：record 已在锁外编码（占位 ord）——此处补真实 ord + CRC
     // 后直接 pwrite。锁内 O(V) 工作从「编码 memcpy + CRC」降为一次 CRC 扫描。
     codec::patch_data_record_ord(record, ord);
@@ -1359,7 +1359,9 @@ Cask::get(std::span<const std::byte> key) {
 
     if (opts_.expiry_secs > 0) {
         const auto now = now_sec_default();
-        if (entry->tstamp + opts_.expiry_secs <= now) {
+        // 64 位求和：expiry_secs 极大（> 2^32 - now）时 u32 加法会 wrap 成
+        // 小值，把所有 key 误判为过期。merge_policy 的 cutoff 计算同款防御。
+        if (static_cast<std::uint64_t>(entry->tstamp) + opts_.expiry_secs <= now) {
             return std::unexpected(err(CaskError::kNotFound));
         }
     }
@@ -1550,7 +1552,7 @@ GetResultView::GetResultView(fileops::ReadRecord&& rec)
 GetResultView::GetResultView(std::shared_ptr<fileops::DataFile> holder,
                              std::span<const std::byte> value_bytes,
                              format::RecordType type,
-                             std::uint32_t ts, std::uint64_t o)
+                             std::uint64_t ts, std::uint64_t o)
     : map_holder_(std::move(holder))
     , value_bytes_(value_bytes)
     , rec_type_(type)
@@ -1597,7 +1599,7 @@ GetResult GetResultView::to_owned() const {
     std::expected<void, CaskFault>
 Cask::put(std::span<const std::byte> key,
           std::span<const std::byte> value,
-          std::uint32_t tstamp, std::uint32_t expiry_at) {
+          std::uint64_t tstamp, std::uint64_t expiry_at) {
     WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
     // S29-7 铺垫：校验/tstamp/DocValue 编码/record 预编码全部**锁外**完成
     // （纯函数或 const 配置读，均不依赖 write_mu_ 保护的状态）。ord 必须锁
@@ -1657,7 +1659,7 @@ Cask::put(std::span<const std::byte> key,
 // 被推过批文件）时被拒条目走 write_and_keydir 单条重写路径（内部 roll+重试），
 // 与单条 put 的 race 处理一致。
 std::expected<void, CaskFault>
-Cask::put_batch(std::span<const BatchItem> items, std::uint32_t tstamp) {
+Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
     WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
     std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
@@ -1851,7 +1853,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint32_t tstamp) {
 //       If key not in keydir or file_id==0, fall back to v0.
 //       (P：盘格式统一小端。)
 std::expected<void, CaskFault>
-Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
+Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
     WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
     std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
@@ -1911,7 +1913,7 @@ Cask::remove(std::span<const std::byte> key, std::uint32_t tstamp) {
 // 逻辑跟 put 类似，但 DocValue 编码包含 text 和 meta 两段。
 std::expected<void, CaskFault>
 Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
-              std::uint32_t tstamp) {
+              std::uint64_t tstamp) {
     WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
     // S29-7 铺垫：校验/tstamp/向量归一化/字段 intern/DocValue 编码/record
     // 预编码全部**锁外**完成——prepare_vector 读 const 配置、intern 自带
@@ -2156,7 +2158,7 @@ bool Cask::is_frozen() {
 //     前 active id」；为了应对「writer 在我们 snapshot 之后 roll 过去」，
 //     防御性地排除所有 file_id >= snapshot 的文件。代价是少并几个文件，
 //     下一轮 merge 自然处理。
-Cask::NeedsMerge Cask::needs_merge(std::uint32_t now_sec) {
+Cask::NeedsMerge Cask::needs_merge(std::uint64_t now_sec) {
     if (is_closed()) return {};  // S11-W3：needs=false
     auto info = keydir_->info();
     const std::uint32_t exclude_id =
@@ -2532,7 +2534,7 @@ void Cask::maybe_submit_auto_checkpoint() {
 //  - Phase 2 的 bm25/sidecar/hnsw snap 落盘顺序必须与 close() 一致(A4)
 //  - Phase 3 的 unlink 必须在 Phase 2 之后——否则 HNSW rebuild 读不到源数据
 std::expected<merge::MergeStats, CaskFault>
-Cask::merge(std::vector<std::string> files, std::uint32_t now_sec) {
+Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
     if (files.empty()) {
         auto n = needs_merge(now_sec);

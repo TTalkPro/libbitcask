@@ -92,6 +92,6 @@ run_merge(std::span<const std::string> input_data_paths,
           keydir::KeyDir& keydir,
           bool sync_output = false,
           std::span<plugin::CaskPlugin* const> plugins = {},
-          std::uint32_t now_sec = 0);  // S13-D5：TTL 判定时刻（0 = 不判 TTL）
+          std::uint64_t now_sec = 0);  // S13-D5：TTL 判定时刻（0 = 不判 TTL）
 
 }  // namespace bitcask::merge

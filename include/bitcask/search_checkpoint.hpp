@@ -70,6 +70,10 @@ enum class CkptSectionType : std::uint16_t {
     // count u64 | max_ord u64 | dim u16 | R u32——与 diskann.bda 侧车头
     // 交叉校验。delta 链同样复用 kHnswDelta 通用向量插入日志。
     kDiskann          = 18,
+    // 64 位时间戳 flag-day：行布局同 kDocmapDeltaV2，仅 tstamp 定宽 4B→8B。
+    // 含本段的文件以 file version 3 写出（同 V2 引入时的降级安全论证：
+    // 旧读端整文件拒收 → 链断 → 退 fold，绝不静默跳段丢行）。
+    kDocmapDeltaV3    = 19,
 };
 
 // 写入用:caller 持有 payload 字节。
@@ -122,9 +126,11 @@ namespace detail {
 
 constexpr char kCkptMagic[4] = {'B', 'C', 'S', 'C'};
 constexpr std::uint32_t kCkptVersion = 1;
-// S21-2 A2：v2 段型（kDocmapDeltaV2）所在文件的头版本。读端 1/2 双收；
+// S21-2 A2：v2 段型（kDocmapDeltaV2）所在文件的头版本。读端 1/2/3 三收；
 // 写端仅在文件确含 v2 段型时用 2（见 kDocmapDeltaV2 注释的降级安全论证）。
 constexpr std::uint32_t kCkptVersion2 = 2;
+// 64 位时间戳 flag-day：v3 段型（kDocmapDeltaV3）所在文件的头版本。
+constexpr std::uint32_t kCkptVersion3 = 3;
 constexpr std::size_t kHeaderLen = 16;  // magic(4)+ver(4)+watermark(8)
 constexpr std::size_t kTrailerLen = 12;  // footerCrc(4)+dirLen(4)+trailer(4)
 
@@ -240,7 +246,8 @@ public:
         }
         if (std::memcmp(head, kCkptMagic, 4) != 0) return std::nullopt;
         const std::uint32_t ver = get_u32(head + 4);
-        if (ver != kCkptVersion && ver != kCkptVersion2) return std::nullopt;
+        if (ver != kCkptVersion && ver != kCkptVersion2 &&
+                ver != kCkptVersion3) return std::nullopt;
 
         std::byte tail[kTrailerLen];
         std::fseek(f.get(), static_cast<long>(n - kTrailerLen), SEEK_SET);
@@ -318,7 +325,8 @@ public:
         if (std::memcmp(base, kCkptMagic, 4) != 0) return std::nullopt;
         {
             const std::uint32_t ver = get_u32(base + 4);
-            if (ver != kCkptVersion && ver != kCkptVersion2) return std::nullopt;
+            if (ver != kCkptVersion && ver != kCkptVersion2 &&
+                ver != kCkptVersion3) return std::nullopt;
         }
         // 页脚(从尾倒走)。
         if (std::memcmp(base + n - 4, kCkptMagic, 4) != 0) return std::nullopt;

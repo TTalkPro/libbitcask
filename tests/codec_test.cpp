@@ -73,7 +73,7 @@ TEST(Crc32, KnownVectors) {
 
 // ---------------------------------------------------------------------------
 // Data record golden: byte-by-byte layout for known input.
-//   [CRC(4)] [Type(1)] [Tstamp(4)] [Ord(8)] [KeySz(2)] [ValueSz(4)] [Key][Value]
+//   [CRC(4)] [Type(1)] [Tstamp(8)] [Ord(8)] [KeySz(2)] [ValueSz(4)] [Key][Value]
 //   CRC covers Type..Value.
 // ---------------------------------------------------------------------------
 TEST(DataRecord, GoldenLayout) {
@@ -85,13 +85,13 @@ TEST(DataRecord, GoldenLayout) {
     // Covered region (everything after the 4-byte CRC). P:小端盘格式——
     // 多字节字段低位在前。
     //   Type:    00
-    //   Tstamp:  78 56 34 12   (0x12345678 LE)
+    //   Tstamp:  78 56 34 12 00 00 00 00   (0x12345678 LE，u64)
     //   Ord:     01 00 00 00 00 00 00 00
     //   KeySz:   01 00
     //   ValueSz: 02 00 00 00
     //   Key:     6b
     //   Value:   76 76
-    auto covered = hex_to_bytes("00" "78563412" "0100000000000000"
+    auto covered = hex_to_bytes("00" "7856341200000000" "0100000000000000"
                                 "0100" "02000000" "6b" "7676");
     const std::uint32_t expected_crc = codec::crc32(covered);
 
@@ -106,7 +106,7 @@ TEST(DataRecord, GoldenLayout) {
 
 // Full pinned layout (incl. CRC) — any silent format drift fails here.
 // P:小端盘格式——从 covered(全小端字段)+ 计算 CRC(小端前置)独立重建期望,
-// 钉死「[crc:u32 LE][type][tstamp:u32 LE][ord:u64 LE][keysz:u16 LE][valsz:u32 LE][key][val]」。
+// 钉死「[crc:u32 LE][type][tstamp:u64 LE][ord:u64 LE][keysz:u16 LE][valsz:u32 LE][key][val]」。
 TEST(DataRecord, GoldenHex) {
     auto le_u32 = [](std::vector<std::byte>& b, std::uint32_t v) {
         for (int i = 0; i < 4; ++i)
@@ -119,14 +119,14 @@ TEST(DataRecord, GoldenHex) {
         return e;
     };
 
-    auto doc_covered = hex_to_bytes("00" "78563412" "0100000000000000"
+    auto doc_covered = hex_to_bytes("00" "7856341200000000" "0100000000000000"
                                     "0100" "02000000" "6b" "7676");
     std::vector<std::byte> doc;
     codec::encode_data_record(doc, RecordType::kDoc, 0x12345678, 1,
                               as_bytes("k"), as_bytes("vv"));
     EXPECT_EQ(doc, build(doc_covered));
 
-    auto tomb_covered = hex_to_bytes("01" "07000000" "0900000000000000"
+    auto tomb_covered = hex_to_bytes("01" "0700000000000000" "0900000000000000"
                                      "0100" "00000000" "6b");
     std::vector<std::byte> tomb;
     codec::encode_data_record(tomb, RecordType::kTombstone, 7, 9,
@@ -216,14 +216,14 @@ TEST(DocValue, GoldenHex) {
 
     std::vector<std::byte> out;
     codec::encode_doc_value(out, parts);
-    // 03           ver = 3（varint 长度 + fieldId）
+    // 04           ver = 4（v3 + ExpiryAt u64）
     // 03           flags = has_vector|has_text
     // 82           dim = 2（varint：末字节高位=终止标记，2|0x80=0x82）
     // 0000803f     1.0f little-endian
     // 00000040     2.0f little-endian
     // 82           text len = 2（varint）
     // 6869         "hi"
-    EXPECT_EQ(bytes_to_hex(out), "0303820000803f00000040826869");
+    EXPECT_EQ(bytes_to_hex(out), "0403820000803f00000040826869");
 }
 
 TEST(DocValue, RoundTripAllSections) {
@@ -556,13 +556,13 @@ TEST(HintRecord, RoundTripStreamOfRecords) {
 // Layout constants are part of the on-disk contract.
 // ---------------------------------------------------------------------------
 TEST(Layout, ConstantsLocked) {
-    EXPECT_EQ(format::kHeaderSize, 23u);  // 4+1+4+8+2+4
+    EXPECT_EQ(format::kHeaderSize, 27u);  // 4+1+8+8+2+4
     EXPECT_EQ(format::kCrcOffset, 0u);
     EXPECT_EQ(format::kTypeOffset, 4u);
     EXPECT_EQ(format::kTstampOffset, 5u);
-    EXPECT_EQ(format::kOrdOffset, 9u);
-    EXPECT_EQ(format::kKeySzOffset, 17u);
-    EXPECT_EQ(format::kValueSzOffset, 19u);
+    EXPECT_EQ(format::kOrdOffset, 13u);
+    EXPECT_EQ(format::kKeySzOffset, 21u);
+    EXPECT_EQ(format::kValueSzOffset, 23u);
     EXPECT_EQ(format::kHintRecordSize, 18u);
     EXPECT_EQ(format::kMaxOffsetV2, 0x7FFFFFFFFFFFFFFFull);
     EXPECT_EQ(format::kMaxKeySize, 0xFFFFu);
@@ -572,7 +572,7 @@ TEST(Layout, ConstantsLocked) {
 }
 
 // V3.1:vector 段黄金字节(锁定磁盘布局)。
-// [Ver=3][Flags=0x01 hasVector][Dim varint=2(VByte 终止位:0x82)]
+// [Ver=4][Flags=0x01 hasVector][Dim varint=2(VByte 终止位:0x82)]
 // [1.0f LE: 00 00 80 3F][2.0f LE: 00 00 00 40]
 TEST(DocValue, VectorSegmentGoldenHex) {
     const float vec[2] = {1.0f, 2.0f};
@@ -581,7 +581,7 @@ TEST(DocValue, VectorSegmentGoldenHex) {
     std::vector<std::byte> out;
     bitcask::codec::encode_doc_value(out, parts);
 
-    const std::uint8_t expect[] = {0x03, 0x01, 0x82,
+    const std::uint8_t expect[] = {0x04, 0x01, 0x82,
                                    0x00, 0x00, 0x80, 0x3F,
                                    0x00, 0x00, 0x00, 0x40};
     ASSERT_EQ(out.size(), sizeof(expect));
@@ -719,16 +719,16 @@ std::string hint_key_str(std::span<const std::byte> k) {
 TEST(HintRecordV3, GoldenLayoutContiguous) {
     std::vector<std::byte> out;
     // 连续追加（offset == prev_end=0）：gap=0(1B) + total_sz=0x10(1B) +
-    // keysz<<1|0=4(1B) + tstamp 4B + "ab" = 9B（v2 定宽 20B 同载荷）。
-    auto pe = codec::encode_hint_record_v3(out, 0xDEADBEEF, 0x10, 0, false,
+    // keysz<<1|0=4(1B) + tstamp 8B + "ab" = 13B（v2 定宽 20B 同载荷）。
+    auto pe = codec::encode_hint_record_v4(out, 0xDEADBEEF, 0x10, 0, false,
                                            as_bytes("ab"), /*prev_end=*/0);
     EXPECT_EQ(pe, 0x10u);
-    auto expected = hex_to_bytes("80" "90" "84" "efbeadde" "6162");
+    auto expected = hex_to_bytes("80" "90" "84" "efbeadde00000000" "6162");
     ASSERT_EQ(out.size(), expected.size());
     EXPECT_EQ(bytes_to_hex(out), bytes_to_hex(expected));
 
     std::uint64_t prev_end = 0;
-    auto rec = codec::decode_hint_record_v3(out, prev_end);
+    auto rec = codec::decode_hint_record_v4(out, prev_end);
     ASSERT_TRUE(rec.has_value());
     EXPECT_EQ(rec->tstamp, 0xDEADBEEFu);
     EXPECT_EQ(rec->total_sz, 0x10u);
@@ -742,11 +742,11 @@ TEST(HintRecordV3, GoldenLayoutContiguous) {
 TEST(HintRecordV3, TombstoneBitAndGap) {
     std::vector<std::byte> out;
     // 非零 gap（offset=100, prev_end=64 → gap=36）+ tomb 位。
-    auto pe = codec::encode_hint_record_v3(out, 7, 22, 100, true,
+    auto pe = codec::encode_hint_record_v4(out, 7, 22, 100, true,
                                            as_bytes("k"), /*prev_end=*/64);
     EXPECT_EQ(pe, 122u);
     std::uint64_t prev_end = 64;
-    auto rec = codec::decode_hint_record_v3(out, prev_end);
+    auto rec = codec::decode_hint_record_v4(out, prev_end);
     ASSERT_TRUE(rec.has_value());
     EXPECT_EQ(rec->offset, 100u);
     EXPECT_TRUE(rec->tombstone);
@@ -756,10 +756,10 @@ TEST(HintRecordV3, TombstoneBitAndGap) {
 TEST(HintRecordV3, GapWraparoundOffsetLessThanPrevEnd) {
     // offset < prev_end（不应出现，但语义须无损）：u64 二补数回绕还原。
     std::vector<std::byte> out;
-    codec::encode_hint_record_v3(out, 1, 8, /*offset=*/16, false,
+    codec::encode_hint_record_v4(out, 1, 8, /*offset=*/16, false,
                                  as_bytes("x"), /*prev_end=*/100);
     std::uint64_t prev_end = 100;
-    auto rec = codec::decode_hint_record_v3(out, prev_end);
+    auto rec = codec::decode_hint_record_v4(out, prev_end);
     ASSERT_TRUE(rec.has_value());
     EXPECT_EQ(rec->offset, 16u);
     EXPECT_EQ(prev_end, 24u);
@@ -767,10 +767,10 @@ TEST(HintRecordV3, GapWraparoundOffsetLessThanPrevEnd) {
 
 TEST(HintRecordV3, ShortBufferReturnsTooShort) {
     std::vector<std::byte> out;
-    codec::encode_hint_record_v3(out, 1, 30, 0, false, as_bytes("abc"), 0);
+    codec::encode_hint_record_v4(out, 1, 30, 0, false, as_bytes("abc"), 0);
     for (std::size_t cut = 0; cut < out.size(); ++cut) {
         std::uint64_t prev_end = 0;
-        auto rec = codec::decode_hint_record_v3(
+        auto rec = codec::decode_hint_record_v4(
             std::span<const std::byte>(out.data(), cut), prev_end);
         ASSERT_FALSE(rec.has_value()) << "cut=" << cut;
         EXPECT_EQ(rec.error(), codec::DecodeError::kBufferTooShort);

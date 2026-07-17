@@ -15,7 +15,7 @@
 
 | 能力 | 接口（`bitcask::Cask`） | 说明 | 文档 |
 |------|------------------------|------|------|
-| KV 读写 | `put` / `get` / `remove` / `put_batch` | DocValue v3 编码，纯 KV 的 binary 走 text 段 | [`api-cpp.md`](doc/api-cpp.md) |
+| KV 读写 | `put` / `get` / `remove` / `put_batch` | DocValue v4 编码（u64 tstamp），纯 KV 的 binary 走 text 段 | [`api-cpp.md`](doc/api-cpp.md) |
 | 零拷贝读 | `get`（`GetResultView`）/ `get_owned` | view 借 `pread` 缓冲或 sealed mmap，无堆分配 | [`getresult-view-design-zh.md`](doc/getresult-view-design-zh.md) |
 | 结构化文档 | `put_doc`（`DocInput`） | text + 可选 meta + 可选 vector + 多字段 | [`api-cpp.md`](doc/api-cpp.md) |
 | 词袋检索 | `search_text` | BM25 + meta 过滤，支持 `offset` 分页 | [`api-cpp.md`](doc/api-cpp.md) |
@@ -34,7 +34,7 @@
 | 合并 | `merge` / `needs_merge` | 与读写并发的独立 `merge.lock` 模型 | [`merge-policy-zh.md`](doc/merge-policy-zh.md) |
 | 备份 | 文件级拷贝 + `flush_index` | WAL 一致点落盘 | [`wal-batch-design-zh.md`](doc/wal-batch-design-zh.md) |
 | 升级 | `Cask::upgrade` | 离线把 KV 目录升为索引模式 | [`api-cpp.md`](doc/api-cpp.md) |
-| 迁移 | `migrate_le`（CLI） | 旧大端 → 小端目录的离线迁移 | [`migrate-le.md`](doc/migrate-le.md) |
+| 迁移 | `bitcask_migrate`（CLI） | 统一纪元迁移：`detect` / `be2le`（v1 大端）/ `tstamp64`（u32 → u64，5.0 flag-day）；非破坏性 | [`migrate-le.md`](doc/migrate-le.md) |
 | 状态 | `status` / `read_handle_count` | 内省 key 数 / fd 预算 / 索引错误计数 | [`api-cpp.md`](doc/api-cpp.md) |
 | C ABI | `libbitcask.so` | `extern "C"` 不透明句柄 + slice + fault，跨 ABI 稳定 | [`api-c.md`](doc/api-c.md) |
 
@@ -242,13 +242,15 @@ cmake --build build -j --target bitcask_static bitcask_shared
 | `BITCASK_LTO` | ON | Release 启用 LTO / IPO；sanitizer 构建自动关闭 |
 | `BITCASK_PCH` | ON | 预编译头加速编译；排查 PCH 异常可临时关闭 |
 
-版本信息由 `CMakeLists.txt` 的 `project(libbitcask VERSION 4.1.0)` 单一真源派生：`libbitcask.so` 的 `SOVERSION=4`，`VERSION=4.1.0`，C 端 `bitcask_version_{major,minor,patch,string}()` 同步。
+版本信息由 `CMakeLists.txt` 的 `project(libbitcask VERSION 5.0.0)` 单一真源派生：`libbitcask.so` 的 `SOVERSION=5`，`VERSION=5.0.0`，C 端 `bitcask_version_{major,minor,patch,string}()` 同步。
 
 ### 产物
 
-- `libbitcask.so` — 共享库，导出 C API（`extern "C"`，`SOVERSION=4`）
+- `libbitcask.so` — 共享库，导出 C API（`extern "C"`，`SOVERSION=5`）
 - `libbitcask.a` — 把全部静态归档合并为单一 `.a`
-- `migrate_le` — 旧大端目录 → 小端目录的离线迁移工具
+- `bitcask_migrate` — 统一纪元迁移入口：`detect` / `be2le`（v1 大端 → 当前）/ `tstamp64`（u32 → u64，5.0 flag-day）
+- `migrate_le` — v1 大端 → 当前纪元（旧入口，等价于 `bitcask_migrate be2le`）
+- `vec_engine_migrate` — HNSW / IVF-RaBitQ / DiskANN 离线引擎切换（S32-M4）
 - `gen_inert_table` — NFKC 惰性区间表代码生成器（构建期自动执行）
 
 ### 安装
@@ -276,14 +278,14 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 │                                                                     │
 │  ├─ KeyDir（256 分片 shared_mutex + MVCC 迭代器）                   │
 │  ├─ DataFile 缓存（pread 句柄 + 近似 LRU 淘汰）                    │
-│  ├─ HintFile（活跃写入器 + v3 trailer CRC + sealed-mmap hint）      │
+│  ├─ HintFile（活跃写入器 + v4 trailer CRC + sealed-mmap hint）      │
 │  ├─ DocMap（Index：ord↔ext/live/meta 宿主服务；查询面 DocTable）   │
 │  ├─ TextPlugin "bm25"（倒排/Analyzer/缓存/高亮/bm25.ckpt 文件族）  │
 │  ├─ VectorPlugin "hnsw"（VectorEnginePlugin 契约：HNSW/IVF-RaBitQ/DiskANN │
 │  │   三引擎按 meta.vector_engine 选定；归一化/vec.ckpt 族 + .vec/.qc8 侧车）│
 │  ├─ HybridSearcher（RRF 融合器；持两插件引用）                     │
 │  ├─ CaskPluginHost（read_at / run_serialized / log 窄反向接口）    │
-│  ├─ MetaConfig（bitcask.meta v3：magic + version + CRC32）         │
+│  ├─ MetaConfig（bitcask.meta v4：magic + version + CRC32 + u64 纪元门禁）│
 │  └─ IndexPool（异步索引 MapReduce，借自 KeyDirRegistry）           │
 └────────────────────────────┬────────────────────────────────────────┘
                                │
@@ -313,7 +315,8 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 - **异步索引 MapReduce**：`put_doc` 入队有界 `IndexPool`（满则 push 阻塞做背压）→ N 个 map worker 并行分词（`hardware_concurrency` 真数据并行）→ per-lane reorder buffer（按 ord 排序）→ 单 reducer 串行 apply（库内单写者）。池由 `KeyDirRegistry` 共享，线程数 = N+1 与库数无关。详见 [`docs/design/async-index-pipeline.md`](docs/design/async-index-pipeline.md)。
 - **查询并发**：批量查询接口（`search_*_batch`）在进程级共享 `search_arena`（TBB `task_arena`）上 inter-query 并行；单查询内部仍串行（WAND 顺序依赖、HNSW 图遍历）。
 - **向量双引擎**（S32）：`vector_engine` 建库时一次性选定并持久化进 `bitcask.meta`——`hnsw`（内存图，≤数 M 向量）/ `ivfrq`（IVF-RaBitQ 磁盘段，10M-100M 推荐）/ `diskann`（Vamana 图，实验性）。引擎不符重开 → `kModeMismatch`；离线切换用 `vec_engine_migrate`（只改 meta，首次 open 全量 fold 重建，可回滚）。详见 [`vector-dual-engine-selection-zh.md`](doc/vector-dual-engine-selection-zh.md)。
-- **小端 only**：所有多字节整数小端（LE 主机原生零转换）；不再与 legacy 大端 Erlang 字节互通，迁移用 [`migrate_le`](doc/migrate-le.md)。
+- **小端 only**：所有多字节整数小端（LE 主机原生零转换）；不再与 legacy 大端 Erlang 字节互通，迁移用 `bitcask_migrate be2le`（旧名 `migrate_le`，见 [`migrate-le.md`](doc/migrate-le.md)）。
+- **64 位时间戳（5.0 flag-day）**：`tstamp` / `expiry_at` 全链路扩为 `uint64_t`（C/C++ API + 盘上 record header 23B→27B + DocValue v4 + hint v4 + keydir 快照 v3 + docmap sidecar v3）。`bitcask.meta` v4 门禁**干净拒开** u32 纪元旧库（v1/v2/v3），提示 `rebuild — re-ingest data`；u32 纪元库可经 `bitcask_migrate tstamp64` **非破坏性离线迁移**到当前纪元（无需 re-ingest）。过期判定（`tstamp + expiry_secs`、`expiry_at` 与 `now` 比较）一律 u64 域算术，杜绝 u32 wrap 误判（极端 `expiry_secs ≈ 2^32` 此前会把全部 key 误判为已过期）。SONAME `libbitcask.so.4 → .so.5`，旧二进制由链接器层隔离。
 - **插件化**：`CaskPlugin` 接口（`plugin_api.hpp`）是 KV 存储层与索引层的唯一契约，Cask 在写/恢复/merge/checkpoint 四条通路上向注册的插件广播事件。Text/Vector 是当前两个内建插件；新增插件（TTL、metrics、CDC）只需实现此接口。详见 [`plugin-arch-split-design-zh.md`](doc/plugin-arch-split-design-zh.md)。
 
 ---
@@ -328,7 +331,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 │                      #       cask / search / bm25 / text / vector
 ├── tests/             # GoogleTest 单元 + 集成测试（35 个测试二进制）
 ├── bench/             # Google Benchmark（keydir / cask / inverted / hnsw …）
-├── tools/             # migrate_le、gen_inert_table
+├── tools/             # bitcask_migrate（统一）、migrate_le（旧）、vec_engine_migrate、gen_inert_table
 ├── cmake/             # BitcaskSanitizers 模块 + tsan.supp
 ├── third_party/       # 第三方依赖（git submodule，见「构建依赖」）
 ├── doc/               # 架构 / 格式 / API 参考 / 设计文档

@@ -52,7 +52,7 @@ struct WriteResult {
 // （不是 view），因为底层的 pread buffer 离开 read() 就析构了。
 struct ReadRecord {
     format::RecordType type;
-    std::uint32_t tstamp;
+    std::uint64_t tstamp;
     std::uint64_t ord;
     std::uint32_t total_size;
     std::vector<std::byte> key;
@@ -89,7 +89,7 @@ public:
     // 线程安全: 否（修改 current_offset_）；caller 串行化对同一对象的写。
     [[nodiscard]] std::expected<WriteResult, DataFileFault>
     write(format::RecordType type,
-          std::uint32_t tstamp,
+          std::uint64_t tstamp,
           std::uint64_t ord,
           std::span<const std::byte> key,
           std::span<const std::byte> value);
@@ -113,7 +113,7 @@ public:
     // 线程安全: 否（修改 current_offset_ + batch_buf_）；caller 串行化。
     [[nodiscard]] std::expected<WriteResult, DataFileFault>
     write_buffered(format::RecordType type,
-                   std::uint32_t tstamp,
+                   std::uint64_t tstamp,
                    std::uint64_t ord,
                    std::span<const std::byte> key,
                    std::span<const std::byte> value);

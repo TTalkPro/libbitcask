@@ -76,7 +76,7 @@ public:
     // 构建（内存段）：追加一篇文档到默认字段，返回段内本地 docid（自增）。
     // doc_len 取 Σtf，与 inv_ 内部统计一致（BM25 打分从 LiveChecker 读 doc_len）。
     DocId add(std::string key, Lsn lsn, const bm25::TermPositions& terms,
-              index::DocLoc loc = {}, std::uint32_t tstamp = 0) {
+              index::DocLoc loc = {}, std::uint64_t tstamp = 0) {
         const DocId docid = static_cast<DocId>(keys_.size());
         std::uint32_t dl = 0;
         std::size_t mem = key.size() + kApproxRowBytes;  // S30-P2:预算记账
@@ -115,7 +115,7 @@ public:
     DocId add(std::string key, Lsn lsn,
               std::span<const FieldInput> fields,
               std::uint32_t total_doc_len,
-              index::DocLoc loc = {}, std::uint32_t tstamp = 0) {
+              index::DocLoc loc = {}, std::uint64_t tstamp = 0) {
         const DocId docid = static_cast<DocId>(keys_.size());
         {   // S30-P2:预算记账(近似字节,见 approx_ram_bytes)。
             std::size_t mem = key.size() + kApproxRowBytes;
@@ -534,7 +534,9 @@ public:
 
 private:
     static constexpr std::uint32_t kDocStoreMagic = 0x54534453;  // 'SDST'
-    static constexpr std::uint32_t kDocStoreVersion = 1;
+    // v2:行内 tstamp 定宽 4B→8B（64 位时间戳 flag-day）。读端仅收 v2,
+    // 旧段 version 不符 → load 返回 nullptr → 退全量重建（降级安全）。
+    static constexpr std::uint32_t kDocStoreVersion = 2;
     // 多字段段型 magic = 'MFLS'（Multi-FieLd Segment），与 SearchCheckpoint 段
     // type 字段独立（后者只是枚举序号）；此处 magic 仅用于本段内容自描述与
     // 截断/混淆检测。
@@ -624,7 +626,7 @@ private:
             put_u64(b, slots_[i].loc.offset);
             put_u32(b, slots_[i].loc.file_id);
             put_u32(b, slots_[i].loc.total_sz);
-            put_u32(b, slots_[i].tstamp);
+            put_u64(b, slots_[i].tstamp);   // v2:定宽 8B
             put_u32(b, slots_[i].doc_len);
             b.push_back(static_cast<std::byte>(
                 live_[i].load(std::memory_order_relaxed)));
@@ -659,10 +661,10 @@ private:
             if (static_cast<std::size_t>(end - p) < klen) return false;
             keys_.push_back(std::string(reinterpret_cast<const char*>(p), klen));
             p += klen;
-            std::uint64_t lsn = 0, off = 0;
-            std::uint32_t fid = 0, tsz = 0, ts = 0, dl = 0;
+            std::uint64_t lsn = 0, off = 0, ts = 0;
+            std::uint32_t fid = 0, tsz = 0, dl = 0;
             if (!rd_u64(lsn) || !rd_u64(off) || !rd_u32(fid) || !rd_u32(tsz) ||
-                !rd_u32(ts) || !rd_u32(dl)) {
+                !rd_u64(ts) || !rd_u32(dl)) {
                 return false;
             }
             if (end - p < 1) return false;

@@ -21,6 +21,17 @@ namespace {
 
 // 旧格式（v1）是大端——本工具是唯一仍需读大端的地方,故 BE 解码器自带,
 // 不依赖 codec（codec 已 flag-day 切成小端）。
+//
+// 旧 v1 record 布局的偏移在此钉死：format:: 常量已随 Tstamp u32→u64
+// flag-day 漂移到 27B header,而本工具读的旧文件恒为 23B header
+// （CRC:4 | Type:1 | Tstamp:u32 | Ord:u64 | KeySz:u16 | ValueSz:u32）。
+inline constexpr std::size_t kLegacyHeaderSize    = 23;
+inline constexpr std::size_t kLegacyCrcOffset     = 0;
+inline constexpr std::size_t kLegacyTypeOffset    = 4;
+inline constexpr std::size_t kLegacyTstampOffset  = 5;
+inline constexpr std::size_t kLegacyOrdOffset     = 9;
+inline constexpr std::size_t kLegacyKeySzOffset   = 17;
+inline constexpr std::size_t kLegacyValueSzOffset = 19;
 std::uint16_t be_u16(const std::byte* p) {
     return static_cast<std::uint16_t>(
         (static_cast<std::uint16_t>(p[0]) << 8) | static_cast<std::uint16_t>(p[1]));
@@ -84,16 +95,16 @@ migrate_data_file(const fs::path& src_data, const fs::path& dst_dir,
     const std::byte* base = bytes->data();
     const std::uint64_t total = bytes->size();
     std::uint64_t off = 0;
-    while (off + format::kHeaderSize <= total) {
+    while (off + kLegacyHeaderSize <= total) {
         const std::byte* p = base + off;
-        const std::uint16_t key_sz = be_u16(p + format::kKeySzOffset);
-        const std::uint32_t value_sz = be_u32(p + format::kValueSzOffset);
+        const std::uint16_t key_sz = be_u16(p + kLegacyKeySzOffset);
+        const std::uint32_t value_sz = be_u32(p + kLegacyValueSzOffset);
         const std::uint64_t rec_total =
-            format::kHeaderSize + static_cast<std::uint64_t>(key_sz) + value_sz;
+            kLegacyHeaderSize + static_cast<std::uint64_t>(key_sz) + value_sz;
         if (off + rec_total > total) break;  // torn tail：尾部截断,停。
 
         // 旧 CRC 校验（大端存储,覆盖 Type..Value）。坏的跳过（与恢复同策略）。
-        const std::uint32_t stored_crc = be_u32(p + format::kCrcOffset);
+        const std::uint32_t stored_crc = be_u32(p + kLegacyCrcOffset);
         const std::uint32_t calc_crc = codec::crc32(std::span<const std::byte>(
             p + 4, static_cast<std::size_t>(rec_total) - 4));
         if (stored_crc != calc_crc) {
@@ -102,11 +113,11 @@ migrate_data_file(const fs::path& src_data, const fs::path& dst_dir,
             continue;
         }
 
-        const auto type = static_cast<format::RecordType>(p[format::kTypeOffset]);
-        const std::uint32_t tstamp = be_u32(p + format::kTstampOffset);
-        const std::uint64_t ord = be_u64(p + format::kOrdOffset);
-        std::span<const std::byte> key(p + format::kHeaderSize, key_sz);
-        std::span<const std::byte> value(p + format::kHeaderSize + key_sz,
+        const auto type = static_cast<format::RecordType>(p[kLegacyTypeOffset]);
+        const std::uint32_t tstamp = be_u32(p + kLegacyTstampOffset);
+        const std::uint64_t ord = be_u64(p + kLegacyOrdOffset);
+        std::span<const std::byte> key(p + kLegacyHeaderSize, key_sz);
+        std::span<const std::byte> value(p + kLegacyHeaderSize + key_sz,
                                          value_sz);
         const bool tomb = (type == format::RecordType::kTombstone);
 
@@ -156,11 +167,12 @@ migrate_meta(const fs::path& src_dir, const fs::path& dst_dir,
     }
     if (ver != 1) return std::unexpected("unknown meta version");
 
-    // v1 → v3（S12：LE + CRC）：version 改 3,VecDim u16 大端→小端,其余单字节照搬,
-    // 偏移 14 放 CRC32(覆盖前 14 字节),与 write_meta 一致。
+    // v1 → v4：version 改 4（data record 已按新 codec 重编码 = u64 tstamp
+    // 纪元）,VecDim u16 大端→小端,其余单字节照搬,偏移 14 放 CRC32
+    // (覆盖前 14 字节),与 write_meta 一致。
     std::byte out[18] = {};
     std::memcpy(out, "BCME", 4);
-    out[4] = static_cast<std::byte>(3);            // version 3（LE + CRC）
+    out[4] = static_cast<std::byte>(4);            // version 4（LE + CRC + u64 tstamp）
     out[5] = b[5];                                 // mode
     out[6] = b[6];                                 // vec metric
     const std::uint16_t dim = be_u16(b + 7);       // 旧大端 → 主机
@@ -218,6 +230,165 @@ migrate_field_schema(const fs::path& src_dir, const fs::path& dst_dir,
     return {};
 }
 
+// ---------------------------------------------------------------------------
+// u32 时间戳纪元（meta v2/v3）→ 当前纪元（meta v4,u64 时间戳）。
+// 与 v1 迁移同为「解旧头 → 当前 codec 重编码」,区别:旧头已是小端
+// （kLegacy* 偏移与 v1 相同,仅字节序不同）,且 kDoc 的 value 段须做
+// DocValue v3→v4 转码（Ver 字节 3→4;expiry 段 u32→u64,恒为 value 尾部）。
+// ---------------------------------------------------------------------------
+
+// DocValue v3 → v4 转码。v3 的 expiry 段（kFlagHasExpiry）固定是 value 的
+// 最后 4 字节（encode 恒最后追加）——转码只需改 Ver 字节 + 尾部 4B→8B 零
+// 扩展,各中间段（vector/text/meta/fields）布局未变,原样保留。
+// 返回 false = 不是合法 v3 DocValue（Ver 不符 / 长度不足）,caller 跳过。
+bool transcode_doc_value_v3_to_v4(std::span<const std::byte> in,
+                                  std::vector<std::byte>& out) {
+    constexpr std::uint8_t kLegacyDocValueVersion = 3;
+    if (in.size() < format::kDocValueHeaderSize) return false;
+    if (static_cast<std::uint8_t>(in[0]) != kLegacyDocValueVersion) {
+        return false;
+    }
+    const auto flags = static_cast<std::uint8_t>(in[1]);
+    const bool has_expiry = (flags & format::kFlagHasExpiry) != 0;
+    if (has_expiry && in.size() < format::kDocValueHeaderSize + 4) {
+        return false;  // 声称有 expiry 段却装不下 u32 → 损坏
+    }
+    out.assign(in.begin(), in.end());
+    out[0] = static_cast<std::byte>(format::kDocValueVersion);
+    if (has_expiry) {
+        const std::uint32_t expiry32 = le_load_u32(in.data() + in.size() - 4);
+        out.resize(out.size() - 4 + 8);
+        le_store_u64(out.data() + out.size() - 8,
+                     static_cast<std::uint64_t>(expiry32));
+    }
+    return true;
+}
+
+// 一个 data 文件：逐 record 解 u32 纪元小端头（23B,偏移同 kLegacy*）→
+// 当前 codec 重编码（27B 头,u64 tstamp）+ 重生成 hint。
+std::expected<void, std::string>
+migrate_u32_data_file(const fs::path& src_data, const fs::path& dst_dir,
+                      MigrateStats& st) {
+    auto bytes = read_all(src_data);
+    if (!bytes) return std::unexpected(bytes.error());
+
+    const auto name = src_data.filename().string();
+    const auto dst_data_path = (dst_dir / name).string();
+    const auto dst_hint_path = fileops::mk_hint_filename(dst_data_path);
+
+    auto dst_data = fileops::DataFile::open(
+        dst_data_path, fileops::DataFile::Mode::kCreate, /*sync*/ false,
+        /*mmap_enabled*/ false);
+    if (!dst_data) return std::unexpected("create dst data " + dst_data_path);
+    auto dst_hint = fileops::HintFile::open(
+        dst_hint_path, fileops::HintFile::Mode::kCreate);
+    if (!dst_hint) return std::unexpected("create dst hint " + dst_hint_path);
+
+    const std::byte* base = bytes->data();
+    const std::uint64_t total = bytes->size();
+    std::vector<std::byte> value_v4;  // 跨 record 复用容量
+    std::uint64_t off = 0;
+    while (off + kLegacyHeaderSize <= total) {
+        const std::byte* p = base + off;
+        const std::uint16_t key_sz = le_load_u16(p + kLegacyKeySzOffset);
+        const std::uint32_t value_sz = le_load_u32(p + kLegacyValueSzOffset);
+        const std::uint64_t rec_total =
+            kLegacyHeaderSize + static_cast<std::uint64_t>(key_sz) + value_sz;
+        if (off + rec_total > total) break;  // torn tail：尾部截断,停。
+
+        // 旧 CRC（小端存储,覆盖 Type..Value）。坏的跳过（与恢复同策略）。
+        const std::uint32_t stored_crc = le_load_u32(p + kLegacyCrcOffset);
+        const std::uint32_t calc_crc = codec::crc32(std::span<const std::byte>(
+            p + kLegacyTypeOffset,
+            static_cast<std::size_t>(rec_total) - kLegacyTypeOffset));
+        if (stored_crc != calc_crc) {
+            ++st.skipped_bad_crc;
+            off += rec_total;
+            continue;
+        }
+
+        const auto type = static_cast<format::RecordType>(p[kLegacyTypeOffset]);
+        // 时间戳 u32 → u64 零扩展（值域不变,仅位宽升级）。
+        const std::uint64_t tstamp = le_load_u32(p + kLegacyTstampOffset);
+        const std::uint64_t ord = le_load_u64(p + kLegacyOrdOffset);
+        std::span<const std::byte> key(p + kLegacyHeaderSize, key_sz);
+        std::span<const std::byte> value(p + kLegacyHeaderSize + key_sz,
+                                         value_sz);
+        const bool tomb = (type == format::RecordType::kTombstone);
+
+        // kDoc：DocValue v3→v4 转码。墓碑 value（空 / 4B 小端 shadow
+        // file_id）不是 DocValue,原样照搬。
+        if (!tomb) {
+            if (!transcode_doc_value_v3_to_v4(value, value_v4)) {
+                ++st.skipped_bad_docvalue;
+                off += rec_total;
+                continue;
+            }
+            value = std::span<const std::byte>(value_v4);
+        }
+
+        auto w = dst_data->write(type, tstamp, ord, key, value);
+        if (!w) return std::unexpected("write record to " + dst_data_path);
+        auto h = dst_hint->write(tstamp, w->total_size, w->offset, tomb, key);
+        if (!h) return std::unexpected("write hint to " + dst_hint_path);
+
+        ++st.records;
+        if (tomb) ++st.tombstones;
+        off += rec_total;
+    }
+    if (auto r = dst_hint->finalize(); !r) {
+        return std::unexpected("finalize hint " + dst_hint_path);
+    }
+    ++st.data_files;
+    return {};
+}
+
+// meta v2/v3（小端 u32 纪元）→ v4。除 version 字节与 CRC 外逐字节照搬
+// （mode / 向量配置在两纪元间布局未变）。v3 入口校验 CRC——迁移工具坚持
+// fail-fast,不把损坏的配置静默带进新库;v2 无 CRC 字段,跳过校验。
+std::expected<void, std::string>
+migrate_u32_meta(const fs::path& src_dir, const fs::path& dst_dir,
+                 MigrateStats& st) {
+    const auto src_meta = src_dir / "bitcask.meta";
+    if (!fs::exists(src_meta)) {
+        return std::unexpected("no bitcask.meta in src (not a bitcask dir)");
+    }
+    auto bytes = read_all(src_meta);
+    if (!bytes) return std::unexpected(bytes.error());
+    if (bytes->size() < 18) return std::unexpected("meta too short");
+    const std::byte* b = bytes->data();
+    if (std::memcmp(b, "BCME", 4) != 0) return std::unexpected("bad meta magic");
+    const auto ver = static_cast<std::uint8_t>(b[4]);
+    if (ver == 1) {
+        return std::unexpected(
+            "src meta is v1 (big-endian era); run the be2le migration first");
+    }
+    if (ver == 4) {
+        return std::unexpected(
+            "src meta already v4 (64-bit tstamp era); nothing to migrate");
+    }
+    if (ver != 2 && ver != 3) return std::unexpected("unknown meta version");
+    if (ver == 3) {
+        const std::uint32_t stored = le_load_u32(b + 14);
+        const std::uint32_t crc =
+            codec::crc32(std::span<const std::byte>(b, 14));
+        if (stored != crc) {
+            return std::unexpected("src bitcask.meta CRC mismatch (corrupt)");
+        }
+    }
+
+    std::byte out[18];
+    std::memcpy(out, b, 18);
+    out[4] = static_cast<std::byte>(4);  // version 4（u64 tstamp 纪元）
+    le_store_u32(out + 14, codec::crc32(std::span<const std::byte>(out, 14)));
+    if (auto r = write_all(dst_dir / "bitcask.meta",
+                           std::span<const std::byte>(out, 18)); !r) {
+        return std::unexpected(r.error());
+    }
+    st.meta_migrated = true;
+    return {};
+}
+
 }  // namespace
 
 std::expected<MigrateStats, std::string>
@@ -242,6 +413,42 @@ migrate_be_to_le(std::string_view src_dir, std::string_view dst_dir) {
         const auto fname = de.path().filename().string();
         if (fileops::parse_data_tstamp(fname).has_value()) {
             if (auto r = migrate_data_file(de.path(), dst, st); !r) {
+                return std::unexpected(r.error());
+            }
+        }
+    }
+    return st;
+}
+
+std::expected<MigrateStats, std::string>
+migrate_u32_to_u64(std::string_view src_dir, std::string_view dst_dir) {
+    const fs::path src(src_dir);
+    const fs::path dst(dst_dir);
+    if (!fs::exists(src)) return std::unexpected("src dir does not exist");
+    std::error_code ec;
+    fs::create_directories(dst, ec);
+    if (ec) return std::unexpected("cannot create dst dir: " + ec.message());
+
+    MigrateStats st;
+    // meta 先行（同时校验 src 确为 u32 纪元 v2/v3 目录）。
+    if (auto r = migrate_u32_meta(src, dst, st); !r) {
+        return std::unexpected(r.error());
+    }
+    // field.schema 格式在本次 flag-day 未变（S12-3 版式,不含时间戳）,
+    // 原样拷贝。
+    if (fs::exists(src / "field.schema")) {
+        fs::copy_file(src / "field.schema", dst / "field.schema",
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            return std::unexpected("copy field.schema: " + ec.message());
+        }
+        st.field_schema_migrated = true;
+    }
+    // 逐 data 文件（hint 由其重生成）。ckpt/seg/wal/旧 hint/锁不迁移。
+    for (const auto& de : fs::directory_iterator(src)) {
+        const auto fname = de.path().filename().string();
+        if (fileops::parse_data_tstamp(fname).has_value()) {
+            if (auto r = migrate_u32_data_file(de.path(), dst, st); !r) {
                 return std::unexpected(r.error());
             }
         }

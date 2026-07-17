@@ -23,7 +23,7 @@ namespace bitcask {
 CaskIter::~CaskIter() noexcept { release(); }
 
 std::expected<keydir::StartIterResult, CaskFault>
-CaskIter::start(int maxage, int maxputs, std::uint32_t now_sec,
+CaskIter::start(int maxage, int maxputs, std::uint64_t now_sec,
                 bool see_tombstones, std::span<const std::byte> key_prefix) {
     // S11-W3：parent Cask 已 close → keydir_ 已释放,fail-fast 而非解引用空指针。
     if (parent_->is_closed()) {
@@ -103,7 +103,9 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
         auto proxy = iter_->next(/*include_tombstones=*/ see_tombstones_);
         if (!proxy) return std::optional<Entry>{};
 
-        if (expiry > 0 && proxy->tstamp + expiry <= now) {
+        // 64 位求和防 u32 wrap（同 get 路径 / merge_policy cutoff）。
+        if (expiry > 0 &&
+            static_cast<std::uint64_t>(proxy->tstamp) + expiry <= now) {
             continue;  // expired; skip
         }
 

@@ -83,15 +83,17 @@ bool apply_docmap_delta_section(Index& docmap,
     return true;
 }
 
-// S21-2 A2：kDocmapDeltaV2 解析 + 应用。与 v1 定宽版语义一致，行编码换
+// S21-2 A2：kDocmapDeltaV2/V3 解析 + 应用。与 v1 定宽版语义一致，行编码换
 // gap+vbyte：ord/tomb 为窗口内单调升序 → 差分后典型 1-2B；klen/file_id/
-// offset/total_sz/doc_len 走标量 vbyte；tstamp 保持定宽 4B（unix 秒级时间戳
-// vbyte 需 5B 反而更大）。gap 用 u64 二补数回绕（prev + (v - prev) ≡ v），
+// offset/total_sz/doc_len 走标量 vbyte；tstamp 保持定宽（时间戳 vbyte 反而
+// 更大）——V2 为 4B，V3（64 位时间戳 flag-day）为 8B，由 tstamp64 区分。
+// gap 用 u64 二补数回绕（prev + (v - prev) ≡ v），
 // 正确性不依赖升序——乱序只损压缩率不损数据。
 bool apply_docmap_delta_section_v2(Index& docmap,
                                    std::span<const std::byte> payload,
                                    std::vector<DocmapDeltaRow>& rows,
-                                   std::vector<DocmapDeltaRemoval>& rems) {
+                                   std::vector<DocmapDeltaRemoval>& rems,
+                                   bool tstamp64) {
     const auto* p = payload.data();
     const auto* end = p + payload.size();
     bool fail = false;
@@ -110,6 +112,15 @@ bool apply_docmap_delta_section_v2(Index& docmap,
         std::uint32_t v = sc::detail::get_u32(p); p += 4;
         return v;
     };
+    auto u64 = [&]() -> std::uint64_t {
+        if (end - p < 8) { fail = true; return 0; }
+        std::uint64_t v = sc::detail::get_u64(p); p += 8;
+        return v;
+    };
+    // 定宽时间戳：V3 8B / V2 4B（旧纪元段，零扩展）。
+    auto tstamp_field = [&]() -> std::uint64_t {
+        return tstamp64 ? u64() : static_cast<std::uint64_t>(u32());
+    };
     const std::uint64_t rn = vb();
     if (fail || rn > (1ull << 40)) return false;
     rows.reserve(rn);
@@ -126,7 +137,7 @@ bool apply_docmap_delta_section_v2(Index& docmap,
         r.ext.assign(reinterpret_cast<const char*>(p), klen);
         p += klen;
         const std::uint64_t fid = vb(), off = vb(), tsz = vb();
-        r.slot.tstamp  = u32();
+        r.slot.tstamp  = tstamp_field();
         const std::uint64_t dl = vb();
         if (fail || fid > 0xFFFFFFFFull || tsz > 0xFFFFFFFFull ||
             dl > 0xFFFFFFFFull) {
@@ -190,7 +201,11 @@ bool apply_delta_file(Index& docmap,
             case sc::CkptSectionType::kDocmapDelta:
                 return apply_docmap_delta_section(docmap, pl, rows, rems);
             case sc::CkptSectionType::kDocmapDeltaV2:
-                return apply_docmap_delta_section_v2(docmap, pl, rows, rems);
+                return apply_docmap_delta_section_v2(docmap, pl, rows, rems,
+                                                     /*tstamp64=*/false);
+            case sc::CkptSectionType::kDocmapDeltaV3:
+                return apply_docmap_delta_section_v2(docmap, pl, rows, rems,
+                                                     /*tstamp64=*/true);
             default:
                 return true;  // kDeltaInfo 由链校验消费；其余段型忽略。
             }
@@ -261,7 +276,7 @@ bool save_docmap_delta(Index& docmap, std::string_view dir,
                 codec::vbyte_encode(slot.loc.file_id, rows_buf);
                 codec::vbyte_encode(slot.loc.offset, rows_buf);
                 codec::vbyte_encode(slot.loc.total_sz, rows_buf);
-                sc::detail::put_u32(rows_buf, slot.tstamp);
+                sc::detail::put_u64(rows_buf, slot.tstamp);  // V3：定宽 8B
                 codec::vbyte_encode(slot.doc_len, rows_buf);
                 ++rows;
             });
@@ -282,17 +297,17 @@ bool save_docmap_delta(Index& docmap, std::string_view dir,
                 reinterpret_cast<const std::byte*>(key.data()),
                 reinterpret_cast<const std::byte*>(key.data()) + key.size());
         }
-        sw.add(sc::CkptSectionType::kDocmapDeltaV2, std::move(b));
+        sw.add(sc::CkptSectionType::kDocmapDeltaV3, std::move(b));
     }
     // keydir meta 仅在 docmap 组件落（S14-7 成对不变量）。
     if (!keydir_delta.empty()) {
         std::vector<std::byte> kb(keydir_delta.begin(), keydir_delta.end());
         sw.add(sc::CkptSectionType::kKeydirDelta, std::move(kb));
     }
-    // S21-2 A2：文件版本 2——旧读端整文件拒收 → 链断退 fold（降级安全，
-    // 见 kDocmapDeltaV2 注释）。
+    // 文件版本 3（含 V3 段型）——旧读端整文件拒收 → 链断退 fold（降级安全，
+    // 见 kDocmapDeltaV3 注释）。
     if (!sc::SearchCheckpoint::write(dpath, watermark, sw.sections(),
-                                     sc::detail::kCkptVersion2)) {
+                                     sc::detail::kCkptVersion3)) {
         return false;
     }
     // 记账收尾：窗口推进 + 已序列化的删除日志清空。

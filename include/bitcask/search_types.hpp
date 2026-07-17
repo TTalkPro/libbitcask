@@ -76,7 +76,7 @@ struct ReduceJob {
     std::uint32_t        file_id = 0;
     std::uint64_t        offset = 0;
     std::uint32_t        total_sz = 0;
-    std::uint32_t        tstamp = 0;
+    std::uint64_t        tstamp = 0;
 };
 
 }  // namespace bitcask::search

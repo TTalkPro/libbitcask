@@ -231,7 +231,7 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
         std::uint32_t file_id = 0;
         std::uint64_t offset = 0;
         std::uint32_t total_sz = 0;
-        std::uint32_t tstamp = 0;
+        std::uint64_t tstamp = 0;
         std::vector<float> vector;
         std::vector<std::pair<std::string, std::string>> fields;
     };

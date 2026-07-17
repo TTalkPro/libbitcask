@@ -88,7 +88,7 @@ SearchLayer::search_hybrid(std::string_view text_query,
 void SearchLayer::on_write(std::string_view key, std::uint64_t ord,
                            std::string_view text,
                            std::uint32_t file_id, std::uint64_t offset,
-                           std::uint32_t total_sz, std::uint32_t tstamp) {
+                           std::uint32_t total_sz, std::uint64_t tstamp) {
     // S16-2：legacy/standalone 入口——自落 docmap 行（doc_len 由 apply_text
     // 分析后经 set_doc_len 回填），随后跑单文本核心。流水线路径不走本方法。
     index_.put_doc(key, ord,
@@ -110,7 +110,7 @@ ReduceJob SearchLayer::map_analyze(
     std::string_view key, std::uint64_t ord,
     std::span<const std::pair<std::string_view, std::string_view>> fields,
     std::uint32_t file_id, std::uint64_t offset,
-    std::uint32_t total_sz, std::uint32_t tstamp) const {
+    std::uint32_t total_sz, std::uint64_t tstamp) const {
     // S18-4：Map 阶段（纯函数并发）归 TextPlugin。
     return text_.map_analyze(key, ord, fields, file_id, offset, total_sz,
                              tstamp);
@@ -130,7 +130,7 @@ void SearchLayer::on_write_fields(
     std::string_view key, std::uint64_t ord,
     const std::vector<std::pair<std::string, std::string>>& fields,
     std::uint32_t file_id, std::uint64_t offset,
-    std::uint32_t total_sz, std::uint32_t tstamp) {
+    std::uint32_t total_sz, std::uint64_t tstamp) {
     // S10-A5:同步路径—fields 借 caller 的 string 构造 views（无堆分配）。
     std::vector<std::pair<std::string_view, std::string_view>> fvs;
     fvs.reserve(fields.size());
@@ -235,7 +235,7 @@ SearchLayer::search_fields(std::string_view query, std::size_t k,
 void SearchLayer::recover_doc(std::string_view key, std::uint64_t ord,
                               std::string_view text,
                               std::uint32_t file_id, std::uint64_t offset,
-                              std::uint32_t total_sz, std::uint32_t tstamp,
+                              std::uint32_t total_sz, std::uint64_t tstamp,
                               std::span<const float> vector) {
     // S6-P0:单字段(kDefaultField) 恢复——map_analyze + reduce_apply 复用。
     // map_analyze 在 default_field 上写出 → wrote_default=true,触发不到
@@ -402,7 +402,8 @@ bool SearchLayer::save_delta_ckpt(const std::string& base_path,
                 detail::put_u32(b, slot.loc.file_id);
                 detail::put_u64(b, slot.loc.offset);
                 detail::put_u32(b, slot.loc.total_sz);
-                detail::put_u32(b, slot.tstamp);
+                // legacy v1 段格式:tstamp 定宽 4B(与 v1 读端配对,仅测试用)。
+                detail::put_u32(b, static_cast<std::uint32_t>(slot.tstamp));
                 detail::put_u32(b, slot.doc_len);
                 ++rows;
             });

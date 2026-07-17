@@ -53,7 +53,7 @@ public:
     // 无 trailer → validate_trailer 失败 → fold(data) 回退，安全语义不变）。
     // 线程安全: 否（修改 pending_/running_crc_ 与底层 fd 顺序写状态）；caller 串行化。
     [[nodiscard]] std::expected<void, DataFileFault>
-    write(std::uint32_t tstamp, std::uint32_t total_sz,
+    write(std::uint64_t tstamp, std::uint32_t total_sz,
           std::uint64_t offset, bool tombstone,
           std::span<const std::byte> key);
 
@@ -107,7 +107,7 @@ private:
 
     // S23-A1：v3 流式 fold（fold() 按文件头 magic 分派至此）。
     [[nodiscard]] std::expected<void, DataFileFault>
-    fold_v3(std::uint64_t total, FoldFn fn);
+    fold_v4(std::uint64_t total, FoldFn fn);
 
     // 攒满多少字节就 flush 一次（hint 可重建，丢缓冲只触发 fold(data) 回退）。
     // P2:64KiB→1MiB——merge/active 写 hint 的 pwrite 次数 16×↓。hint 非 WAL，

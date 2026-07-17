@@ -5,8 +5,146 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`4.1.0`**；库 `SOVERSION` = **`4`**（= major）；
-盘上格式版本独立于库版本：`bitcask.meta` = **`v3`**（含 CRC32），`field.schema` = **FSCH v1**。
+`bitcask_version_*` = **`5.0.0`**；库 `SOVERSION` = **`5`**（= major）；
+盘上格式版本独立于库版本：`bitcask.meta` = **`v4`**（含 CRC32 + u64 纪元门禁），`field.schema` = **FSCH v1**。
+
+---
+
+## [5.0.0] - 2026-07-17
+
+### ⚠️ ABI / 盘上格式破坏（major bump 的原因）
+
+**64 位时间戳 flag-day**——`tstamp` / `expiry_at` 全链路 `uint32_t` → `uint64_t`，
+Y2038 前瞻；与 4.0.0 同款处置：SONAME `libbitcask.so.4` → **`.so.5`**，
+链接器层隔离旧二进制。**源码级不向后兼容**（u32 调用方重编即正确），
+**盘上格式不向后兼容**（`bitcask.meta` v4 门禁干净拒开 u32 纪元库——但**不必
+重建**，见下方 Added 的 `bitcask_migrate tstamp64` 非破坏性迁移路径）。
+
+- **C ABI 签名变更**（5 个导出函数）：`bitcask_put` / `bitcask_put_ex` /
+  `bitcask_delete` / `bitcask_put_doc` / `bitcask_put_batch` 的 `tstamp` /
+  `expiry_at` 形参 u32 → u64。
+- **C ABI 结构体字段宽度变更**：`bitcask_get_result_t` / `bitcask_kv_pair_t` /
+  `bitcask_doc_input_t` 的 `tstamp` / `expiry_at` 字段 u32 → u64（旧编译
+  二进制 + 新库 = 字段错位读，必须 bump SOVERSION 隔离）。
+- **C++ API 签名变更**：`bitcask::Cask` 全系写方法（`put` / `put_batch` /
+  `remove` / `put_doc` / `needs_merge` / `merge` / `start`）、
+  `keydir::KeyDir::put/remove/conditional_remove/start`、
+  `merge::run_merge`、`merge_policy::decide/per_file_reasons` 等同款 u32→u64。
+- **盘上格式整体 break**（meta v4 门禁）：详见下方 Changed。旧 u32 纪元
+  库（meta v2/v3）open 时干净拒开，error message 提示
+  `64-bit tstamp flag-day requires rebuild — re-ingest data`——与 4.0.0
+  大端 flag-day 同策略，**绝不按新偏移把旧字节静默读坏**。
+
+### Added（Y2038 readiness）
+
+- **64 位时间戳**：`tstamp` / `expiry_at` 全链路 `uint64_t`——可表达
+  unix 秒至远未来（u32 上限 2106-02-07）。C/C++ API + 盘上 record header
+  + DocValue + hint + keydir 快照 + docmap sidecar + IndexPool/ReduceJob
+  等所有 tstamp 载体同步扩宽。
+- **`now_sec_default()` 返回 u64**：`clock_gettime(CLOCK_REALTIME_COARSE)`
+  的 `tv_sec` 不再 `static_cast<u32>` 截断。
+- **过期判定 u64 域算术**：`tstamp + expiry_secs` 与 `expiry_at` vs `now`
+  的比较全部在 u64 域，杜绝 u32 wrap（见 Fixed）。
+- **新段型 `kDocmapDeltaV3`**（`search_checkpoint.hpp`）：与 V2 行布局
+  相同，仅 tstamp 定宽 4B→8B；含本段的 ckpt 文件以 `kCkptVersion3`
+  写出（旧读端整文件拒收 → 链断退 fold，降级安全）。
+
+### Added（迁移工具链——u32→u64 非破坏性路径）
+
+5.0 引入**统一迁移入口** `bitcask_migrate`（`tools/bitcask_migrate.cpp`），
+覆盖两次 flag-day 造就的全部三个纪元；旧库无须重建，离线迁移即可：
+
+| 子命令 | 入参纪元 | 出参纪元 | 对应库 API |
+|--------|---------|---------|-----------|
+| `detect <dir>` | 任意 | —（只报告 + 建议） | — |
+| `be2le <src> <dst>` | v1 大端（meta v1） | 当前（meta v4） | `migrate::migrate_be_to_le` |
+| `tstamp64 <src> <dst>` | u32 小端（meta v2/v3） | 当前（meta v4） | `migrate::migrate_u32_to_u64`（**新**） |
+
+- **`bitcask::migrate::migrate_u32_to_u64()`**（`include/bitcask/migrate.hpp`）：
+  u32 纪元（meta v2/v3）→ 当前纪元（meta v4）。非破坏性（只读 src、只写 dst）：
+  - meta v2/v3 → v4：除 version 字节与 CRC 外**逐字节照搬**（mode / 向量配置
+    两纪元布局未变）；v3 入口校验 CRC，v2 无 CRC 字段跳过校验。
+  - data record header 23B → 27B：解旧小端头 → 用当前 codec 重编码（CRC 重算），
+    tstamp u32 → u64 **零扩展**（值域不变，仅位宽升级）。
+  - DocValue v3 → v4 转码：仅改 Ver 字节 `0x03`→`0x04` + 末尾 expiry 段 u32→u64
+    零扩展（`transcode_doc_value_v3_to_v4`）；中间段（vector/text/meta/fields）
+    布局未变，原样保留。墓碑 value（空 / 4B 小端 shadow file_id）不是 DocValue，
+    原样照搬。
+  - `field.schema` 格式在本次 flag-day 未变，原样拷贝。
+  - hint 由迁移后的 data **重生成**；ckpt/seg/wal/旧 hint/锁不迁移（新库首开
+    自动 fold 重建）。
+  - `MigrateStats` 加 `skipped_bad_docvalue`：kDoc 的 value 段不是合法 DocValue v3
+    （Ver 字节不符 / 短于头部）的 record 数——这类 record 旧读端同样解不动。
+- **`migrate_be_to_le()`** 输出 meta 由 v3 → **v4**（输入仍是 v1 大端；
+  v1 record 解码改用工具内 `kLegacy*Offset` 钉死常量，不再借 `format::`——
+  因 `format::kHeaderSize` 等已随 u64 flag-day 漂移到 27B）。
+- **`migrate_le`**（旧入口）保留兼容，usage 提示指向统一入口 `bitcask_migrate`。
+
+### Added（回归测试 ×2，`tests/cask_docvalue_test.cpp`）
+
+- `HugeExpirySecsNoWrap`：`expiry_secs = 0xFFFFFFFF`（u32 max ≈ 136 年）
+  下 get/iter 不得因 u32 求和 wrap 误判过期。
+- `Post2106TimestampRoundTrip`：`tstamp = 5'000'000'000`（> 2^32，2128 年）
+  + `expiry_at` 同纪元，data record / hint / 恢复路径全链路落盘读回不截断。
+
+### Changed（盘上格式 flag-day）
+
+| 组件 | 旧（u32 纪元） | 新（u64 纪元） | 备注 |
+|------|---------------|---------------|------|
+| `bitcask.meta` | v3 | **v4** | 门禁：v1/v2/v3 全部拒开提示重建 |
+| data record header | 23B（Tstamp u32） | **27B（Tstamp u64）** | CRC 覆盖范围不变（Type..Value） |
+| DocValue | v3 | **v4** | ExpiryAt 段 u32 → u64；Ver 字节 `0x03` → `0x04` |
+| hint 文件 | v3（magic `BCH3`） | **v4（magic `BCH4`）** | trailer magic `BCHE` 不变；tstamp u32 → u64 |
+| keydir 快照（`kv.keydir.ckpt`） | BCKS v2 | **BCKS v3** | tstamp 定宽 4B→8B；v1/v2 拒收退 fold |
+| keydir `meta_delta`（docmap 段内） | v1 | **v2** | fstats `oldest/newest_tstamp` u32 → u64 |
+| docmap sidecar（`index::Index`） | v2 | **v3** | 行内 tstamp 定宽 4B→8B；v1 读分支删除 |
+| docmap delta 段型 | `kDocmapDeltaV2` | **`kDocmapDeltaV3`** | 旧 V2 段型解析仍收（tstamp64=false） |
+| ckpt 文件 version | `kCkptVersion2` | **`kCkptVersion3`** | 仅含 V3 段的文件用 3；旧读端整文件拒收 |
+| `segment_v2` DocRow | v1 | **v2** | 字段重排吃掉 pad，仍 48B；布局二进制不兼容 |
+| `DocStore`（`segment.hpp`） | v1 | **v2** | 行内 tstamp 4B → 8B |
+
+**`DocSlot` 内存布局**（`index.hpp`）：S21-1 曾借 DocLoc 重排收到 24B；
+tstamp u32→u64 后回到 32B（尾部 4B padding），每 chunk 槽数组 1.5MB→2MB。
+`serialize_docmap` / `deserialize_docmap` 逐字段读写，不受内存布局影响。
+
+**测试 golden 字节换代**：
+
+- `DataRecord.GoldenLayout` / `GoldenHex`：tstamp 4B → 8B（`78563412` →
+  `7856341200000000`）；`Layout.ConstantsLocked` 锁定 `kHeaderSize=27`、
+  `kOrdOffset=13`、`kKeySzOffset=21`、`kValueSzOffset=23`。
+- `DocValue.VectorSegmentGoldenHex` / `GoldenHex`：Ver 字节 `0x03` → `0x04`。
+- `HintRecordV3.GoldenLayoutContiguous`（测试名保留）：tstamp 4B → 8B；
+  v4 完整文件 `HintFileGolden.EncodingMatchesGoldenByteForByte` 55B
+  （v3 同载荷 43B；v2 同载荷 79B）。
+- `MigrateBEtoLE.RoundTrip`：dst meta 版本 3 → 4。
+
+**旧版本读端从「兼容读」翻为「干净拒收」**（与 4.0.0 大端 flag-day 同策略；
+meta v4 是统一门禁，组件层不再各自维护 u32 兼容分支）：
+
+- `Index.SidecarV1CompatRead`：v1 sidecar 必须返回 `nullopt` 退 fold
+  （改前断言「必须可读」+ 6 项字段值校验）。
+- `KeyDirSnapshot.V1CompatRead`：v1 快照必须返回 `nullopt` 退 fold
+  （改前断言「必须可读」+ 6 项字段值校验）。
+- `CaskDocValueTest.MetaV2BackwardCompatRead`：meta v2 必须被门禁拒开
+  并在 error message 中含 `rebuild`（改前断言「必须向后兼容读取」）。
+
+### Fixed
+
+- **u32 wrap 致全库 key 误判过期**：旧路径 `entry->tstamp + opts_.expiry_secs`
+  在 u32 域求和，`expiry_secs` 极大（接近 `0xFFFFFFFF`，约 136 年）时和值
+  mod 2^32 wrap 成小值，立即 ≤ `now`，**所有 key 被静默判为过期**（get 返回
+  `kNotFound`、iter 跳过）。修复：求和显式提升到 u64 域
+  （`static_cast<u64>(entry->tstamp) + expiry_secs <= now`）。
+  三处同款防御一并推进：
+  - `cask.cpp` `get()` 过期判定
+  - `cask_iter.cpp` 迭代器过期跳过
+  - `merge_policy.cpp` `expiry_cutoffs`（原代码本就借 u64 中间变量计算
+    `trigger_cutoff`，但 `static_cast<u32>(...)` 截断回写——已去截断）
+- **`Post2106TimestampRoundTrip` 揪出的潜在 u32 截断面**：恢复路径
+  （`cask_recovery.cpp`）、`ReduceJob.tstamp`（`search_types.hpp`）、
+  `IndexTask.tstamp`（`thread_pool.hpp`）、`PutEvent.tstamp`
+  （`plugin_api.hpp`）等全树 tstamp 载体一并 u32 → u64，杜绝任一环节把
+  2128 年时间戳静默截断。
 
 ---
 

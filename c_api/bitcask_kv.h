@@ -198,7 +198,7 @@ typedef struct {
     bitcask_slice_t meta;       // meta 段（可为空：data=NULL, size=0）
     const float*    vector;     // 向量段（可为 NULL）
     size_t          vector_len; // 向量元素数（vector_dim 或 0）
-    uint32_t        tstamp;     // 时间戳
+    uint64_t        tstamp;     // 时间戳
     uint64_t        ord;        // 写入序号
 } bitcask_get_result_t;
 
@@ -219,7 +219,7 @@ typedef struct {
 typedef struct {
     bitcask_slice_t key;        // 指向内部 malloc 缓冲
     bitcask_slice_t value;      // 指向内部 malloc 缓冲
-    uint32_t        tstamp;
+    uint64_t        tstamp;
     uint32_t        file_id;
     uint64_t        offset;
     uint32_t        total_sz;
@@ -292,7 +292,7 @@ BITCASK_API bitcask_error_t bitcask_get(bitcask_t* cask,
 BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
                                           bitcask_slice_t key,
                                           bitcask_slice_t value,
-                                          uint32_t tstamp,
+                                          uint64_t tstamp,
                                           bitcask_fault_t* fault);
 
 /* S13-D5：带 per-key TTL 的写入。expiry_at = 绝对 unix 秒（0 = 永不过期，
@@ -300,15 +300,15 @@ BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
 BITCASK_API bitcask_error_t bitcask_put_ex(bitcask_t* cask,
                                            bitcask_slice_t key,
                                            bitcask_slice_t value,
-                                           uint32_t tstamp,
-                                           uint32_t expiry_at,
+                                           uint64_t tstamp,
+                                           uint64_t expiry_at,
                                            bitcask_fault_t* fault);
 
 // 删除 key（写入墓碑）。
 // tstamp = 0 表示使用当前时间。
 BITCASK_API bitcask_error_t bitcask_delete(bitcask_t* cask,
                                              bitcask_slice_t key,
-                                             uint32_t tstamp,
+                                             uint64_t tstamp,
                                              bitcask_fault_t* fault);
 
 // fsync active data file。
@@ -332,14 +332,14 @@ typedef struct {
     bitcask_slice_t meta;       // optional（data=NULL 跳过）
     const float*    vector;     // optional（NULL = 无向量）
     size_t          vector_len; // 向量元素数
-    uint32_t        expiry_at;  // S13-D5：per-key 过期时刻（绝对 unix 秒；0=永不）
+    uint64_t        expiry_at;  // S13-D5：per-key 过期时刻（绝对 unix 秒；0=永不）
 } bitcask_doc_input_t;
 
 // 写入结构化文档（索引模式）。
 BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
                                               bitcask_slice_t key,
                                               const bitcask_doc_input_t* doc,
-                                              uint32_t tstamp,
+                                              uint64_t tstamp,
                                               bitcask_fault_t* fault);
 
 
@@ -357,7 +357,7 @@ typedef struct {
 BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
                                               const bitcask_kv_pair_t* items,
                                               size_t n,
-                                              uint32_t tstamp,
+                                              uint64_t tstamp,
                                               bitcask_fault_t* fault);
 
 /* ===========================================================================

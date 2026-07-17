@@ -8,6 +8,7 @@
 #include <bitcask/codec.hpp>
 #include <bitcask/data_file.hpp>  // parse_data_tstamp（S13 测试枚举 data 文件）
 #include <bitcask/hw_crc32.hpp>   // S32-M0 meta 手改字节重算 CRC
+#include <bitcask/migrate.hpp>    // u32 纪元迁移产物可开可读（集成测试）
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -565,6 +566,154 @@ TEST_F(CaskDocValueTest, PerKeyTtlExpiryAndMergeReclaim) {
     ASSERT_TRUE((*c2)->get_owned(bytes("t_future")));
     ASSERT_TRUE((*c2)->get_owned(bytes("t_none")));
     (*c2)->close();
+}
+
+// 回归:整库 expiry_secs 极大（u32 max ≈ 136 年）时 get/iter 不得误判过期。
+// 旧实现 `tstamp + expiry_secs` 为 u32 mod 2^32 算术,求和 wrap 成小值 →
+// 所有 key 立即"过期"。64 位时间戳后求和在 u64 域,永不 wrap。
+TEST_F(CaskDocValueTest, HugeExpirySecsNoWrap) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.expiry_secs = 0xFFFFFFFFu;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    auto bytes = [](std::string_view s2) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+    };
+    ASSERT_TRUE((*c)->put(bytes("wrapkey"), bytes("v")));
+    EXPECT_TRUE((*c)->get_owned(bytes("wrapkey")))
+        << "极大 expiry_secs 不得因求和 wrap 被误判过期";
+
+    auto it = (*c)->make_iter();
+    auto sr = it->start();
+    ASSERT_TRUE(sr);
+    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+    std::size_t n = 0;
+    while (true) {
+        auto e = it->next();
+        ASSERT_TRUE(e);
+        if (!e->has_value()) break;
+        ++n;
+    }
+    it->release();
+    EXPECT_EQ(n, 1u) << "迭代器同语义:不得跳过未过期 key";
+    (*c)->close();
+}
+
+// 64 位时间戳 flag-day:>2^32 秒（2106 年后）的 tstamp/expiry_at 全链路
+// （data record header / hint / keydir / per-key TTL 段）落盘读回不截断。
+TEST_F(CaskDocValueTest, Post2106TimestampRoundTrip) {
+    constexpr std::uint64_t kTs2128     = 5'000'000'000ull;  // > 2^32
+    constexpr std::uint64_t kExpiry2128 = 5'000'000'100ull;
+    CaskOptions opts;
+    opts.read_write = true;
+    auto bytes = [](std::string_view s2) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+    };
+    {
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        ASSERT_TRUE((*c)->put(bytes("far_future"), bytes("v"), kTs2128,
+                              kExpiry2128));
+        ASSERT_TRUE((*c)->get_owned(bytes("far_future")))
+            << "expiry_at > 2^32 且未到期:必须可读";
+        (*c)->close();
+    }
+    // 重启:恢复路径（hint/fold）读回 u64 tstamp 不截断。
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    ASSERT_TRUE((*c)->get_owned(bytes("far_future")));
+    auto it = (*c)->make_iter();
+    auto sr = it->start();
+    ASSERT_TRUE(sr);
+    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+    auto e = it->next();
+    ASSERT_TRUE(e);
+    ASSERT_TRUE(e->has_value());
+    EXPECT_EQ((*e)->tstamp, kTs2128)
+        << "恢复后 tstamp 必须保持 64 位原值（无 u32 截断）";
+    it->release();
+    (*c)->close();
+}
+
+// migrate_u32_to_u64 集成:手工构造 u32 纪元目录（meta v3 + 23B 头 record +
+// DocValue v3 带 expiry u32）→ 迁移 → 迁移产物必须能被 Cask::open 正常
+// 打开（过 meta v4 门禁 + hint 重建 keydir）且读回原值,TTL 语义保留。
+TEST_F(CaskDocValueTest, MigrateU32EraDirOpensAndReads) {
+    namespace fs = std::filesystem;
+    const auto src = tmpdir_ / "u32src";
+    const auto dst = tmpdir_ / "u64dst";
+    fs::create_directories(src);
+
+    auto wfile = [](const fs::path& p, const std::vector<unsigned char>& b) {
+        std::FILE* f = std::fopen(p.c_str(), "wb");
+        ASSERT_NE(f, nullptr);
+        ASSERT_EQ(std::fwrite(b.data(), 1, b.size(), f), b.size());
+        std::fclose(f);
+    };
+    auto put32 = [](std::vector<unsigned char>& b, std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) b.push_back((v >> (8 * i)) & 0xFF);
+    };
+    auto put64 = [](std::vector<unsigned char>& b, std::uint64_t v) {
+        for (int i = 0; i < 8; ++i) b.push_back((v >> (8 * i)) & 0xFF);
+    };
+    auto crc_of = [](const unsigned char* p, std::size_t n) {
+        return bitcask::codec::crc32(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(p), n));
+    };
+
+    // meta v3（u32 纪元,KV 模式,CRC 覆盖 [0,14)）。
+    {
+        std::vector<unsigned char> m(18, 0);
+        m[0] = 'B'; m[1] = 'C'; m[2] = 'M'; m[3] = 'E';
+        m[4] = 3; m[5] = 0;  // v3, mode=KV
+        const std::uint32_t crc = crc_of(m.data(), 14);
+        for (int i = 0; i < 4; ++i) m[14 + i] = (crc >> (8 * i)) & 0xFF;
+        wfile(src / "bitcask.meta", m);
+    }
+    // 一条 kDoc record（23B 小端头）：key="mykey",DocValue v3 text="hi",
+    // expiry = 4102444800（2100 年,未过期）。
+    {
+        std::vector<unsigned char> val = {3, 0x22};  // Ver=3, text|expiry
+        val.push_back(2 | 0x80);                     // text len varint
+        val.push_back('h'); val.push_back('i');
+        put32(val, 4102444800u);                     // expiry u32 LE
+        const std::string key = "mykey";
+        std::vector<unsigned char> covered = {0};    // Type=kDoc
+        put32(covered, 100);                         // Tstamp u32
+        put64(covered, 1);                           // Ord
+        covered.push_back(key.size() & 0xFF); covered.push_back(0);  // KeySz
+        put32(covered, static_cast<std::uint32_t>(val.size()));     // ValueSz
+        covered.insert(covered.end(), key.begin(), key.end());
+        covered.insert(covered.end(), val.begin(), val.end());
+        std::vector<unsigned char> rec;
+        put32(rec, crc_of(covered.data(), covered.size()));
+        rec.insert(rec.end(), covered.begin(), covered.end());
+        wfile(src / "1.bitcask.data", rec);
+    }
+
+    auto mig = bitcask::migrate::migrate_u32_to_u64(src.string(),
+                                                    dst.string());
+    ASSERT_TRUE(mig) << (mig ? "" : mig.error());
+    EXPECT_EQ(mig->records, 1u);
+    EXPECT_EQ(mig->skipped_bad_docvalue, 0u);
+
+    // 迁移产物用真实 Cask 打开并读回。
+    CaskOptions opts;
+    opts.read_write = false;
+    auto c = Cask::open(dst.string(), opts, &test_registry());
+    ASSERT_TRUE(c) << "迁移产物必须能过 meta v4 门禁并完成恢复";
+    auto bytes = [](std::string_view s2) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+    };
+    auto g = (*c)->get_owned(bytes("mykey"));
+    ASSERT_TRUE(g) << "迁移后的 key 必须可读（TTL 2100 年,未过期）";
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(g->value.data()),
+                               g->value.size()), "hi");
+    (*c)->close();
 }
 
 // S13-D6：备份——热拷贝到新目录，备份目录可独立 open；原库备份后继续可写。
@@ -2431,11 +2580,12 @@ TEST_F(CaskDocValueTest, MetaV3CrcRoundTripAndCorruption) {
         << "meta 覆盖区被篡改 → CRC 失配必须拒绝";
 }
 
-// v2（无 CRC 字段）向后兼容读取——旧库不破坏。
+// v2/v3 属 u32-tstamp 纪元：64 位时间戳 flag-day（meta v4 门禁）后必须
+// 干净拒开并提示重建——绝不按新 record 布局把旧库字节静默读坏。
 TEST_F(CaskDocValueTest, MetaV2BackwardCompatRead) {
     unsigned char hdr[18] = {0};
     hdr[0] = 'B'; hdr[1] = 'C'; hdr[2] = 'M'; hdr[3] = 'E';
-    hdr[4] = 2;  // version 2 = 旧格式（无 CRC），保留区全零
+    hdr[4] = 2;  // version 2 = u32 纪元旧格式（无 CRC），保留区全零
     hdr[5] = 1;  // mode = Index（向量配置全零 = kNone/dim0，一致）
     const auto path = (tmpdir_ / "bitcask.meta").string();
     std::FILE* f = std::fopen(path.c_str(), "wb");
@@ -2444,8 +2594,9 @@ TEST_F(CaskDocValueTest, MetaV2BackwardCompatRead) {
     std::fclose(f);
 
     auto rd = bitcask::meta::read_meta(tmpdir_.string());
-    ASSERT_TRUE(rd) << "v2 无 CRC meta 必须向后兼容读取";
-    EXPECT_EQ(rd->mode, bitcask::meta::Mode::kIndex);
+    ASSERT_FALSE(rd) << "u32 纪元 meta v2 必须被门禁拒开";
+    EXPECT_NE(rd.error().message.find("rebuild"), std::string::npos)
+        << "拒开信息应提示重建";
 }
 
 // P9:read 句柄缓存上限——读 > cap 个文件后常驻句柄数 ≤ cap;淘汰后再读正确;
