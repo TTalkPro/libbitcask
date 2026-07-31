@@ -143,6 +143,14 @@ target_link_libraries(bitcask_cask_docvalue_test PRIVATE
 target_compile_definitions(bitcask_cask_docvalue_test PRIVATE
     BITCASK_JIEBA_DICT_DIR="${BITCASK_JIEBA_DICT_DIR}")
 
+add_executable(bitcask_oki_recovery_test oki_recovery_test.cpp)
+target_link_libraries(bitcask_oki_recovery_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 add_executable(bitcask_crash_recovery_test crash_recovery_test.cpp)
 target_link_libraries(bitcask_crash_recovery_test PRIVATE
     GTest::gtest_main
@@ -283,6 +291,7 @@ gtest_discover_tests(bitcask_file_lock_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_index_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_oki_recovery_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_scanner_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_porter_stemmer_test ${_bitcask_test_props})

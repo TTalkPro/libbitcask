@@ -158,6 +158,7 @@ add_library(bitcask_fileops STATIC
     src/fileops/data_file.cpp
     src/fileops/hint_file.cpp
     src/fileops/oki_run.cpp
+    src/fileops/oki_state.cpp
     src/fileops/scanner.cpp
     src/fileops/migrate.cpp
 )
