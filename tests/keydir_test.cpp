@@ -142,6 +142,21 @@ TEST(KeyDir, KeyLengthHistogramBucketsAndSso) {
     for (std::size_t b = 0; b < 8; ++b) {
         EXPECT_EQ(h.buckets[b], 2u) << "桶 " << b << " 应有 2 个 key";
     }
+
+    // S33-1:内存估算字段口径。
+    std::uint64_t key_sum = 0, heap_sum = 0;
+    for (std::size_t L : lens) {
+        key_sum += L;
+        if (L > 15) heap_sum += L + 1;
+    }
+    EXPECT_EQ(h.key_bytes, key_sum);
+    EXPECT_EQ(h.heap_key_bytes, heap_sum);
+    // 稠密数组容量下界 = 已存条数 × pair 大小；桶块非空。
+    using Pair = std::pair<std::string, bitcask::keydir::Entry>;
+    EXPECT_GE(h.entry_slot_bytes, lens.size() * sizeof(Pair));
+    EXPECT_GT(h.bucket_bytes, 0u);
+    EXPECT_EQ(h.estimated_bytes,
+              h.entry_slot_bytes + h.bucket_bytes + h.heap_key_bytes);
 }
 
 // T5:空 keydir → 全零；墓碑（删除）不计入 entries 直方图。

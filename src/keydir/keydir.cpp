@@ -1225,6 +1225,13 @@ KeyDir::KeyLenHistogram KeyDir::key_length_histogram() const {
     // 逐分片取锁（任意时刻 ≤1 把，合锁序）；只读 key 长度，不碰 meta/计数。
     for (auto& sh : shards_) {
         std::lock_guard<std::mutex> lk(sh.mu);
+        // S33-1:容量口径的结构内存(capacity 而非 size——vector 空闲槽照样
+        // 占 RSS)。桶块 = 槽数 × 8B + 8B mask 头。
+        h.entry_slot_bytes +=
+            sh.entries.values_capacity() * sizeof(std::pair<std::string, Entry>);
+        if (const std::size_t bc = sh.entries.bucket_count(); bc > 0) {
+            h.bucket_bytes += bc * 8 + 8;
+        }
         for (const auto& kv : sh.entries) {
             // S29-6 P1:墓碑不计(统计口径与 key_count_ 一致——只算活 key)。
             if (const auto* se = std::get_if<SingleEntry>(&kv.second);
@@ -1233,7 +1240,8 @@ KeyDir::KeyLenHistogram KeyDir::key_length_histogram() const {
             }
             const std::size_t n = kv.first.size();
             ++h.total;
-            if (n <= 15) ++h.sso; else ++h.heap;
+            h.key_bytes += n;
+            if (n <= 15) ++h.sso; else { ++h.heap; h.heap_key_bytes += n + 1; }
             std::size_t b;
             if (n < 8) b = 0;
             else if (n < 16) b = 1;
@@ -1246,6 +1254,7 @@ KeyDir::KeyLenHistogram KeyDir::key_length_histogram() const {
             ++h.buckets[b];
         }
     }
+    h.estimated_bytes = h.entry_slot_bytes + h.bucket_bytes + h.heap_key_bytes;
     return h;
 }
 

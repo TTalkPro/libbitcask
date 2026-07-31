@@ -392,6 +392,14 @@ public:
         std::uint64_t heap  = 0;  // >15B：每键一次堆分配
         // 桶：[0,8) [8,16) [16,24) [24,32) [32,48) [48,64) [64,128) [128,∞)
         std::array<std::uint64_t, 8> buckets{};
+        // S33-1：keydir 常驻内存估算（诊断口径——entries 主结构，不含
+        // pending/sibling 链/limbo 遗骸/fstats）。Level B 门禁数据来源：
+        // estimated_bytes 对比进程 RSS 决定 keydir 磁盘驻留是否立项。
+        std::uint64_t key_bytes       = 0;  // 活 key 字节和
+        std::uint64_t entry_slot_bytes = 0; // 稠密数组容量 × sizeof(pair<string,Entry>)
+        std::uint64_t bucket_bytes    = 0;  // 桶块槽数 × sizeof(Bucket) + 块头
+        std::uint64_t heap_key_bytes  = 0;  // SSO 溢出 key 的堆分配估算（len+1）
+        std::uint64_t estimated_bytes = 0;  // slot + bucket + heap_key（SSO key 已含于 slot）
     };
     [[nodiscard]] KeyLenHistogram key_length_histogram() const;
 

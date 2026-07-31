@@ -69,6 +69,14 @@ public:
     // ---- 容量/迭代(caller 持锁) ----
     [[nodiscard]] std::size_t size() const noexcept { return values_.size(); }
     [[nodiscard]] bool empty() const noexcept { return values_.empty(); }
+    // S33-1 诊断:稠密数组容量与桶块槽数(keydir 内存估算探针用)。
+    [[nodiscard]] std::size_t values_capacity() const noexcept {
+        return values_.capacity();
+    }
+    [[nodiscard]] std::size_t bucket_count() const noexcept {
+        const BucketBlock* bb = buckets_.load(std::memory_order_relaxed);
+        return bb != nullptr ? bb->count() : 0;
+    }
     [[nodiscard]] iterator begin() noexcept { return values_.data(); }
     [[nodiscard]] iterator end() noexcept { return values_.data() + values_.size(); }
     [[nodiscard]] const_iterator begin() const noexcept { return values_.data(); }
