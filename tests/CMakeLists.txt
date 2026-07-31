@@ -55,6 +55,14 @@ target_link_libraries(bitcask_data_file_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_oki_run_test oki_run_test.cpp)
+target_link_libraries(bitcask_oki_run_test PRIVATE
+    GTest::gtest_main
+    bitcask_fileops
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 add_executable(bitcask_scanner_test scanner_test.cpp)
 target_link_libraries(bitcask_scanner_test PRIVATE
     GTest::gtest_main
@@ -274,6 +282,7 @@ gtest_discover_tests(bitcask_posix_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_file_lock_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_index_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_oki_run_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_scanner_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_porter_stemmer_test ${_bitcask_test_props})
