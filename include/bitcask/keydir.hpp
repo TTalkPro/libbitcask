@@ -52,6 +52,10 @@
 #include "bitcask/index_ids.hpp"  // S27-1：Lsn/DocId 角色别名
 #include "bitcask/seq_shard_table.hpp"  // S29-6 P3:seqlock 原生分片表
 
+namespace bitcask::oki {
+class OkiState;  // S33-4：OKI 运行态（挂 KeyDir 随 registry 共享）
+}
+
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -235,8 +239,8 @@ private:
 // 详见每个方法附近的注释。
 class KeyDir {
 public:
-    KeyDir() = default;
-    ~KeyDir() = default;
+    KeyDir();   // S33-4：构造 OkiState（定义在 .cpp——oki_state.hpp 不进本头）
+    ~KeyDir();
 
     KeyDir(const KeyDir&) = delete;
     KeyDir& operator=(const KeyDir&) = delete;
@@ -385,6 +389,11 @@ public:
     // 线程安全: 是。锁: meta shared（iter 状态）;计数走 atomic,fstats 无锁。
     [[nodiscard]] KeyDirInfo info() const;
 
+    // S33-4：OKI 运行态（memdelta/run 集合/水位）。随 KeyDir 在 registry
+    // 内共享；写挂钩在 put/remove 咽喉点（本类内部），目录路径由 Cask 在
+    // load/flush/rebuild 时注入。
+    [[nodiscard]] oki::OkiState& oki() noexcept { return *oki_; }
+
     // S29-6 P3:get 乐观快路径开关(默认开;false = 纯锁路径,回退用)。
     void set_optimistic_reads(bool on) noexcept {
         optimistic_reads_.store(on, std::memory_order_relaxed);
@@ -416,6 +425,10 @@ public:
 
 private:
     friend class IterHandle;
+
+    // remove 本体（remove() 是「本体 + OKI 挂钩」的薄包装）。
+    bool remove_impl(std::string_view key, std::uint64_t remove_time,
+                     std::uint64_t ord, bool insert_tombstone_if_absent);
 
     // === M6-S2:分片 ===
     // 锁全序（屏障 v2,严格遵守,详见文件头）:
@@ -581,6 +594,9 @@ private:
     // ord 分配器独立为 atomic:alloc_ord/advance_ord 不再抢全局锁
     // (put 热路径上每次写都要分配 ord)。
     std::atomic<std::uint64_t> next_ord_{0};
+
+    // S33-4：OKI 运行态（随 KeyDir 在 registry 内共享；ctor 构造，恒非空）。
+    std::shared_ptr<oki::OkiState> oki_;
 
     //   读热行——get/put 热路径每次 relaxed 读、写入罕见。与上面的写热
     //   行隔离,否则每个 put 的 epoch_ RMW 都会把读者需要的行打飞

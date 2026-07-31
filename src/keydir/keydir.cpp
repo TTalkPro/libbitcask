@@ -1,6 +1,7 @@
 #include "bitcask/keydir.hpp"
 #include "bitcask/byte_order.hpp"
 #include "bitcask/codec.hpp"
+#include "bitcask/oki_state.hpp"  // S33-4：OKI 运行态（挂 KeyDir）
 #include "bitcask/epoch_reclaim.hpp"  // S29-6 P2: epoch 读者注册表
 #include "bitcask/vbyte.hpp"  // S21-2 A3: 快照 v2 entries 变长编码
 #include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
@@ -38,6 +39,11 @@
 // =============================================================================
 
 namespace bitcask::keydir {
+
+// S33-4：ctor/dtor 出线——头文件只前置声明 oki::OkiState（shared_ptr 构造
+// 需要完整类型，析构经类型擦除的 deleter 不需要）。
+KeyDir::KeyDir() : oki_(std::make_shared<oki::OkiState>()) {}
+KeyDir::~KeyDir() = default;
 
 // =============================================================================
 // 内部辅助函数（不做锁；caller 必须已持对应分片 / meta 锁）
@@ -468,6 +474,16 @@ PutResult KeyDir::put(std::string_view key,
     // entries key 集只增不减是迭代器不变量)。
     if (!ctx.fold_active) sweep_tombstones_locked(*ctx.shard);
     maybe_reclaim_locked(*ctx.shard);  // S29-6 P2:攒批回收 limbo
+    // S33-4：OKI 挂钩在锁外（锁序：分片/meta 锁绝不嵌 oki mu）。
+    ctx.slock.unlock();
+    if (ctx.mlock.owns_lock()) ctx.mlock.unlock();
+
+    // S33-4 OKI 写挂钩（单一咽喉点，设计 §8 难点 1 对策）：成功的真实写
+    // 才记。old_file_id≠0 = merge 搬迁 CAS——key 集不变，不记；ord≤wm 的
+    // tail 重放旧行由 append 内部的水位门过滤。
+    if (r == PutResult::kOk && old_file_id == 0) {
+        oki_->append(key, ord, /*tomb=*/false);
+    }
     return r;
 }
 
@@ -732,6 +748,17 @@ PutResult KeyDir::put_overwrite(PutCtx& ctx, [[maybe_unused]] std::string_view k
 //   - entries miss + pending 命中：pending 内原地改墓碑（meta unique）。
 bool KeyDir::remove(std::string_view key, std::uint64_t remove_time,
                     std::uint64_t ord, bool insert_tombstone_if_absent) {
+    const bool had = remove_impl(key, remove_time, ord,
+                                 insert_tombstone_if_absent);
+    // S33-4 OKI 写挂钩（锁外；单一咽喉点）：墓碑行无论命中与否都记——
+    // 旧 run 里的同 key 需 tomb 抵消 / 回查过滤。wm 之下的重放旧行由
+    // append 内部水位门过滤（链重放 remove 的 ord=0 恒 < wm，天然不收）。
+    oki_->append(key, ord, /*tomb=*/true);
+    return had;
+}
+
+bool KeyDir::remove_impl(std::string_view key, std::uint64_t remove_time,
+                         std::uint64_t ord, bool insert_tombstone_if_absent) {
     Shard& sh = shards_[shard_for(key)];
     std::unique_lock slock(sh.mu);
 

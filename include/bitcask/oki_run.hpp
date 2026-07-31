@@ -202,12 +202,15 @@ private:
 // ---------------------------------------------------------------------------
 struct OkiManifestEntry {
     std::uint64_t gen = 0;        // run 文件代号（kv.oki.seg-<gen>）
-    std::uint64_t cover_ord = 0;  // 该 run 覆盖到的 LSN 上界
+    std::uint64_t cover_ord = 0;  // 该 run 的覆盖上界（**排他**：run 内最大 ord + 1）
 };
 
 struct OkiManifest {
     std::vector<OkiManifestEntry> runs;
-    std::uint64_t wm = 0;  // 联合覆盖水位（oki_wm；tail 重放起点）
+    // 联合覆盖水位（oki_wm，**排他上界** = 尚未覆盖的最小 ord；tail 重放
+    // 收 ord ≥ wm 的行）。排他语义是刻意的：alloc_ord 首个 LSN 为 0，
+    // 含上界表示不了「已覆盖 ord 0」与「什么都没覆盖」的区别。
+    std::uint64_t wm = 0;
 };
 
 // 唯一 commit point：atomic_write_bytes(fsync_dir=true)。
