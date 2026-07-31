@@ -161,6 +161,30 @@ public:
     AtomicFileWriter(const AtomicFileWriter&) = delete;
     AtomicFileWriter& operator=(const AtomicFileWriter&) = delete;
 
+    // 可移动（S33-3：OkiRunWriter 按值持有）。源移出后标记 committed_，
+    // 其析构不再清理 tmp——所有权完整转移。
+    AtomicFileWriter(AtomicFileWriter&& o) noexcept
+        : final_path_(std::move(o.final_path_)),
+          tmp_path_(std::move(o.tmp_path_)),
+          f_(std::move(o.f_)),
+          committed_(o.committed_) {
+        o.committed_ = true;
+    }
+    AtomicFileWriter& operator=(AtomicFileWriter&& o) noexcept {
+        if (this != &o) {
+            if (!committed_) {
+                f_.reset();
+                if (!tmp_path_.empty()) std::remove(tmp_path_.c_str());
+            }
+            final_path_ = std::move(o.final_path_);
+            tmp_path_   = std::move(o.tmp_path_);
+            f_          = std::move(o.f_);
+            committed_  = o.committed_;
+            o.committed_ = true;
+        }
+        return *this;
+    }
+
     explicit operator bool() const noexcept { return f_ != nullptr; }
     [[nodiscard]] std::FILE* get() const noexcept { return f_.get(); }
 
