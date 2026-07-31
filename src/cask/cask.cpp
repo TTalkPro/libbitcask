@@ -17,6 +17,7 @@
 #include "bitcask/format.hpp"
 #include "bitcask/keydir_registry.hpp"
 #include "bitcask/merger.hpp"
+#include "bitcask/oki_state.hpp"  // S33-4：flush 搭快照车 / 阈值 flush
 #include "bitcask/detail/scanner.hpp"
 #include "bitcask/codec.hpp"   // V6.1: GetResultView::ctor 解码 DocValue
 
@@ -778,12 +779,32 @@ void Cask::write_keydir_snapshot(
         // best-effort：失败下次 open 走全量 fold（仅慢一次启动）。S13-D7 上报。
         log_warn("keydir snapshot save failed (will rebuild on next open)");
     }
+    // S33-4：OKI flush 恒在 keydir 快照**之后**（同站点搭车：close/merge
+    // 收尾/成对 ckpt base）——快照跳过的字节区间必须已进 runs（wm ≥ 快照
+    // next_ord），否则崩溃后是数据洞；崩溃丢本次 flush 由 open 端缺口检查
+    // （finish_oki_recovery）整体重建兜底。best-effort：失败仅降级 OKI。
+    if (keydir_->oki().loaded() && !keydir_->oki().flush(dirname_)) {
+        log_warn("oki flush after keydir snapshot failed (rebuild on open)");
+    }
 }
 
 void Cask::write_keydir_snapshot() noexcept {
     auto wms = collect_snapshot_watermarks();
     if (!wms) return;
     write_keydir_snapshot(*wms);
+}
+
+// S33-4：写路径阈值 flush——memdelta 超限（1M 行 / 64MiB）时同步落 run，
+// 防长时间不 ckpt 的写负载把 memdelta 撑爆。写者线程内联执行（write_mu_
+// 已持有），代价有界且罕见；与 checkpoint 侧 flush 由 OkiState 内部
+// flush_mu_ 互斥。
+void Cask::maybe_flush_oki() noexcept {
+    auto& oki = keydir_->oki();
+    if (oki.loaded() && oki.should_flush()) {
+        if (!oki.flush(dirname_)) {
+            log_warn("oki threshold flush failed (will retry)");
+        }
+    }
 }
 
 // T3: 提交索引任务到 IndexPool。背压由有界队列提供：队列满（10240）时
@@ -1061,6 +1082,7 @@ Cask::write_and_keydir(std::span<const std::byte> key,
                             w->total_size, w->offset, tstamp,
                             /*now*/ 0, /*newest*/ true, 0, 0, ord);
     if (pr != keydir::PutResult::kAlreadyExists) {
+        maybe_flush_oki();  // S33-4：memdelta 阈值检查
         return PersistedRecord{ord, w->offset, w->total_size, active_file_id_};
     }
 
@@ -1091,6 +1113,7 @@ Cask::write_and_keydir(std::span<const std::byte> key,
     // 必须在 caller 提交 ord2 的真任务之前提交（队列 FIFO 保序）。
     submit_index_task(IndexTask::make(IndexOp::Skip, {}, ord, {}, 0, 0, 0, 0, 0));
     g2.disarm();  // S13-F2: ord2 将由 caller 的真任务（Add）覆盖
+    maybe_flush_oki();  // S33-4：memdelta 阈值检查
     return PersistedRecord{ord2, w2->offset, w2->total_size, active_file_id_};
 }
 

@@ -1055,6 +1055,12 @@ private:
 
     // A4:落 keydir 段快照(best-effort;close/merge 末尾调)。
     void write_keydir_snapshot() noexcept;
+
+    // S33-4：OKI 恢复收尾（缺口检查 + 全量重建；实现见 cask_recovery.cpp）
+    // 与写路径阈值 flush（memdelta 达阈值时同步落 run，罕见且有界）。
+    void finish_oki_recovery(bool snap_loaded,
+                             std::uint64_t snap_next_ord) noexcept;
+    void maybe_flush_oki() noexcept;
     // S14-1：水位捕获与快照写入拆分。RunFn 路径（checkpoint()/自动 ckpt）
     // 必须在**提交时刻**（writer 侧）捕获字节水位、reducer 执行时刻写快照
     // 本体——执行时取水位会被并发写者推进，反转「keydir_covered ≤
@@ -1109,6 +1115,9 @@ public:
     struct RecoverySnapshots {
         bool snap_loaded = false;
         std::vector<std::pair<std::uint32_t, std::uint64_t>> snap_wms;
+        // S33-4：快照自身的 next_ord（**链重放之前**捕获）。快照字节水位
+        // 跳过的行 ord 全部 < 此值——OKI 缺口检查（wm < 此值 → 重建）用。
+        std::uint64_t snap_next_ord = 0;
     };
     [[nodiscard]] std::expected<RecoverySnapshots, CaskFault>
     load_recovery_snapshots();

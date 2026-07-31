@@ -13,6 +13,7 @@
 
 #include "bitcask/codec.hpp"           // decode_doc_value / doc_vector_f32
 #include "bitcask/format.hpp"          // RecordType（fold 墓碑判定）
+#include "bitcask/oki_state.hpp"       // S33-4：OKI load/缺口检查/重建
 #include "bitcask/detail/scanner.hpp"  // scan_dir（fold 数据文件枚举）
 
 #include "cask_internal.hpp"  // err / io_fault / bytes_to_view / ckpt 常量 / component_of_plugin
@@ -205,6 +206,11 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
     const bool search_on = text_ != nullptr;
     auto entries = fileops::scan_dir(dirname_);
     if (!entries) return std::unexpected(io_fault(entries.error().errnum, dirname_));
+
+    // S33-4：OKI manifest 先载——wm 就位后，后续 fold/链重放经 keydir
+    // put/remove 咽喉点的挂钩自动只收 ord ≥ wm 的 tail 行（零逐点改动）。
+    // 缺失/损坏 → 未加载态，收尾 finish_oki_recovery 整体重建。
+    keydir_->oki().load(dirname_);
 
     // P14e:search.ckpt 分段快照快路径。search.ckpt 健康且全段 CRC 通过
     // 时，fold 从 keydir 水位起跳过已覆盖字节；否则全量 fold（各索引自门）。
@@ -514,6 +520,7 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                          "(next open will re-fold)");
             }
         }
+        finish_oki_recovery(snap_loaded, recovery->snap_next_ord);  // S33-4
         return {};
     }
 
@@ -544,7 +551,46 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
     for (auto& r : results) {
         if (!r) return std::unexpected(r.error());
     }
+    finish_oki_recovery(snap_loaded, recovery->snap_next_ord);  // S33-4
     return {};
+}
+
+// S33-4：恢复收尾——OKI 缺口检查与全量重建。
+//
+// 缺口来源：keydir 快照使 fold 跳过字节水位前的行，这些行 ord 全部 <
+// snap_next_ord（快照自身的 next_ord，链重放前捕获）。manifest 缺失/损坏，
+// 或 wm < snap_next_ord（快照写后、OKI flush 前崩溃的窗口）→ 无法靠 tail
+// 重放补齐 → 整体重建：迭代 keydir 活 key（快照语义）排序写单一 run，
+// cover = 当前 peek_next_ord()（open 单线程，无并发写者）。
+//
+// 只在可写句柄做（RO/merge_only 不持 write.lock，不产文件；OKI 保持未
+// 加载态，S33-5 的 range 查询届时按不可用降级）。best-effort：失败仅降级
+// OKI 可用性（下次 open 再试），不阻断 open。
+void Cask::finish_oki_recovery(bool snap_loaded,
+                               std::uint64_t snap_next_ord) noexcept {
+    if (!opts_.read_write || opts_.merge_only) return;
+    auto& oki = keydir_->oki();
+    const bool gap = snap_loaded && oki.wm() < snap_next_ord;
+    if (oki.loaded() && !gap) return;
+
+    std::vector<oki::OkiState::DeltaRow> rows;
+    rows.reserve(static_cast<std::size_t>(keydir_->info().key_count));
+    auto it = keydir_->make_iter();
+    if (it->start(/*now_sec*/ 0, /*maxage*/ -1, /*maxputs*/ -1) !=
+        keydir::StartIterResult::kOk) {
+        log_warn("oki rebuild: keydir iteration unavailable "
+                 "(oki disabled until next open)");
+        return;
+    }
+    while (auto p = it->next()) {
+        rows.push_back(oki::OkiState::DeltaRow{
+            std::string(p->key), p->ord, /*tomb=*/false});
+    }
+    it->release();
+    if (!keydir_->oki().rebuild(dirname_, std::move(rows),
+                                keydir_->peek_next_ord())) {
+        log_warn("oki rebuild failed (oki disabled until next open)");
+    }
 }
 
 // P14e/P14b:加载 keydir 快照 + search.ckpt 分段快照。用 watermark 单趟
@@ -562,6 +608,8 @@ Cask::load_recovery_snapshots() {
     if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
         recovery.snap_wms = std::move(*w);
         recovery.snap_loaded = true;
+        // S33-4：链重放前捕获快照自身的 next_ord（OKI 缺口检查基准）。
+        recovery.snap_next_ord = keydir_->peek_next_ord();
     }
 
     bool search_ok = false;
