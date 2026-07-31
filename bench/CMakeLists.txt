@@ -31,6 +31,7 @@ add_executable(bitcask_bench
     merge_bench.cpp          # B1
     index_pool_bench.cpp     # B2
     checkpoint_bench.cpp     # B4 （B3 扩展在 keydir_bench.cpp 内）
+    range_bench.cpp          # S33-1：prefix 扫描基线 + keydir 内存探针
     avx512_verify_bench.cpp  # AVX-512 启用验证（scalar vs SIMD 对拍）
     bench_main.cpp
 )
