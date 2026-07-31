@@ -29,11 +29,15 @@ inline constexpr std::size_t kMetaCrcCoverLen = 14;  // CRC 覆盖 [0, 14)
 inline constexpr std::size_t kMetaFileSize = kMetaMagicSize + 1 + 1 + kMetaReservedSize;  // 18 bytes
 
 // v1 = 大端纪元(legacy);v2 = 小端 flag-day 起;v3(S12) = 加 CRC32 校验和;
-// v4 = record 时间戳 u64 flag-day（data header 27B / hint BCH4 / doc value v4）。
+// v4 = record 时间戳 u64 flag-day（data header 27B / hint BCH4 / doc value v4）;
+// v5 = hint BCH5 flag-day（S33：hint 记录内嵌 ord;data/DocValue 布局与 v4
+// 完全相同,仅 hint 与本门禁变更,离线迁移 `bitcask_migrate hintord` 只重写
+// hint + meta——data 一字节不动）。
 // 读端：v1 干净拒绝(大端,提示重建);v2/v3 干净拒绝(u32-tstamp 纪元,record
-// 布局不兼容,提示重建——绝不按新偏移把旧字节静默读坏);v4 校验 CRC。
-// 写端恒写 v4(带 CRC)。见 doc/format-zh.md 字节序说明。
-inline constexpr std::uint8_t kMetaVersion = 4;
+// 布局不兼容,提示重建——绝不按新偏移把旧字节静默读坏);v4 干净拒绝(提示
+// 跑 hintord 迁移);v5 校验 CRC。
+// 写端恒写 v5(带 CRC)。见 doc/format-zh.md 字节序说明。
+inline constexpr std::uint8_t kMetaVersion = 5;
 inline constexpr char kMetaMagic[kMetaMagicSize + 1] = "BCME";
 
 // header 前 kMetaCrcCoverLen 字节的 CRC32（与 data/hint/field.schema 同多项式）。
@@ -80,10 +84,19 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
             "incompatible u32-tstamp era format (meta v2/v3); "
             "64-bit tstamp flag-day requires rebuild — re-ingest data"});
     }
-    if (ver != 4) {
+    // v4 = ord-less-hint 纪元：data/DocValue 布局与 v5 相同，仅 hint 格式
+    // 不同。离线迁移即可（不重建）——绝不静默按 v5 打开（否则 BCH4 hint
+    // 会被当校验失败逐文件退 fold(data)，掩盖纪元错位）。
+    if (ver == 4) {
+        return std::unexpected(MetaError{0,
+            "ord-less-hint era format (meta v4); "
+            "run `bitcask_migrate hintord <src> <dst>` to migrate "
+            "(data files are copied unchanged; only hints + meta rewritten)"});
+    }
+    if (ver != 5) {
         return std::unexpected(MetaError{0, "unsupported meta version"});
     }
-    // v4：校验 CRC32（检出位翻转/损坏 → fail-fast）。
+    // v5：校验 CRC32（检出位翻转/损坏 → fail-fast）。
     {
         std::uint32_t stored = 0;
         std::memcpy(&stored, header + kMetaCrcOffset, 4);

@@ -386,7 +386,11 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
     }
     if (meta::meta_exists(dirname_)) {
         auto mc = meta::read_meta(dirname_);
-        if (!mc) return std::unexpected(err(CaskError::kIo, "read meta failed"));
+        // S33：透传 MetaError 详情（纪元门禁的迁移提示必须到达用户）。
+        if (!mc) {
+            return std::unexpected(err(CaskError::kIo,
+                "read meta failed: " + mc.error().message));
+        }
         if (opts_.enable_search && mc->mode != meta::Mode::kIndex) {
             return std::unexpected(err(CaskError::kModeMismatch,
                 "directory is KV mode, cannot open with search"));
@@ -1049,7 +1053,7 @@ Cask::write_and_keydir(std::span<const std::byte> key,
     if (!w) return std::unexpected(io_fault(w.error().errnum,
                                              std::string(active_data_->path())));
     auto h = active_hint_->write(tstamp, w->total_size, w->offset,
-                                  /*tomb*/ false, key);
+                                  /*tomb*/ false, key, ord);
     if (!h) return std::unexpected(io_fault(h.error().errnum,
                                              std::string(active_hint_->path())));
 
@@ -1071,7 +1075,7 @@ Cask::write_and_keydir(std::span<const std::byte> key,
     if (!w2) return std::unexpected(io_fault(w2.error().errnum,
                                               std::string(active_data_->path())));
     auto h2 = active_hint_->write(tstamp, w2->total_size, w2->offset,
-                                   /*tomb*/ false, key);
+                                   /*tomb*/ false, key, ord2);
     if (!h2) return std::unexpected(io_fault(h2.error().errnum,
                                               std::string(active_hint_->path())));
     auto pr2 = keydir_->put(bytes_to_view(key), active_file_id_,
@@ -1230,7 +1234,7 @@ void Cask::process_one_gc_round_locked() {
                 continue;
             }
             auto h = active_hint_->write(r->tstamp, sz, off, /*tomb*/ false,
-                                         r->key);
+                                         r->key, r->rec.ord);
             if (!h) {
                 tail_dead = true;
                 tail_err = io_fault(h.error().errnum,
@@ -1754,7 +1758,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
     // ⑤ hint（可重建；失败语义与单条 put 一致：报错、keydir 未动）。
     for (std::size_t i = 0; i < items.size(); ++i) {
         auto h = active_hint_->write(tstamp, pw[i].total_size, pw[i].offset,
-                                     /*tomb*/ false, items[i].key);
+                                     /*tomb*/ false, items[i].key, pw[i].ord);
         if (!h) {
             return std::unexpected(io_fault(h.error().errnum,
                                             std::string(active_hint_->path())));
@@ -1890,7 +1894,7 @@ Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
     if (!w) return std::unexpected(io_fault(w.error().errnum));
     // hint 文件也要追一条墓碑——下次 open fold(hint) 重建时才能正确删 key。
     auto h = active_hint_->write(tstamp, w->total_size, w->offset,
-                                  /*tomb*/ true, key);
+                                  /*tomb*/ true, key, ord);
     if (!h) return std::unexpected(io_fault(h.error().errnum));
     keydir_->remove(bytes_to_view(key), tstamp);
     og.disarm();  // S13-F2: ord 由下面的 Delete 任务覆盖

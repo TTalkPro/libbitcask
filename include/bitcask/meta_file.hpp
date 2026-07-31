@@ -2,7 +2,8 @@
 //
 // 格式（18 bytes）：
 //   [0..3]   Magic        "BCME" (4 bytes)
-//   [4]      Version      uint8 = 2（kMetaVersion；v1 已不兼容，open 直接拒绝）
+//   [4]      Version      uint8 = 5（kMetaVersion；沿革与各版拒绝策略见
+//                          meta_file.cpp——v1/v2/v3/v4 均干净拒开）
 //   [5]      Mode         uint8 = 0(KV) or 1(Index)
 //   [6]      VecMetric    uint8 (V3.1)
 //   [7..8]   VecDim       uint16 LE (V3.1)

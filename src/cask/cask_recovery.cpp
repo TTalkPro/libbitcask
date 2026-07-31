@@ -42,7 +42,10 @@ Cask::upgrade(std::string_view dirname,
     }
     auto mc = meta::read_meta(std::string(dirname));
     if (!mc) {
-        return std::unexpected(err(CaskError::kIo, "read meta failed"));
+        // S33：透传 MetaError 详情——纪元门禁的迁移提示（如 v4 → hintord）
+        // 必须到达用户，不能吞成笼统的 "read meta failed"。
+        return std::unexpected(err(CaskError::kIo,
+                                   "read meta failed: " + mc.error().message));
     }
     if (mc->mode == meta::Mode::kIndex) {
         return std::unexpected(err(CaskError::kModeMismatch,
@@ -325,17 +328,22 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
             if (hf) {
                 // S13-P8：单遍校验+fold（原 validate_trailer 全文件读一遍、
                 // fold 再读一遍）。CRC 不过时回调零次，keydir 零污染。
+                // S33（hint v5）：记录带 ord——put 用真实 ord 并 advance，
+                // 与 fold(data) 路径恢复结果完全等价（v4 时代 ord 恒 0 的
+                // 怪癖随 flag-day 消除）。
                 auto fr = hf->fold_validated([&](const auto& rec) {
                         if (rec.tombstone) {
                             // 墓碑 hint 必须执行——否则前一个 file 里的同 key
                             // 活 entry 会被错误保留。
                             keydir_->remove(bytes_to_view(rec.key), rec.tstamp);
+                            keydir_->advance_ord(rec.ord);
                             return;
                         }
                         keydir_->put(bytes_to_view(rec.key),
                                      static_cast<std::uint32_t>(e.tstamp), rec.total_sz, rec.offset,
                                      rec.tstamp, /*now*/ 0,
-                                     /*newest*/ false, 0, 0, /*ord*/ 0);
+                                     /*newest*/ false, 0, 0, rec.ord);
+                        keydir_->advance_ord(rec.ord);
                 });
                 if (fr && *fr) used_hint = true;
             }
@@ -358,6 +366,10 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                 std::uint32_t total_size) {
                 if (view.type == format::RecordType::kTombstone) {
                     keydir_->remove(bytes_to_view(view.key), view.tstamp);
+                    // S33：墓碑 ord 也推进水位——否则文件末尾是墓碑时
+                    // next_ord 落后于盘上已用 ord，重启后 alloc_ord 复用
+                    // （与 hint v5 路径对齐；OKI max-ord-wins 依赖 ord 不重）。
+                    keydir_->advance_ord(view.ord);
                     if (search_on) {
                         // S3:墓碑前 flush 攒批，保「文档↔墓碑」相对序（否则墓碑
                         // 可能先于其要删的 batch 内文档插入而被无效化）。
