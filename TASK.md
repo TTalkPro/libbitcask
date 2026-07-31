@@ -208,6 +208,52 @@ flush/rebuild/水位）+ `tests/oki_recovery_test.cpp`（5 集成测试）。要
 - **工作量**：2 天
 - **验收**：对拍 + 完整性测试全过；TSan 树（writer + N range iter + merge 并发）
 
+#### ✅ S33-5 落地记录（2026-07-31）
+
+新增 `src/cask/cask_range_iter.cpp`（`CaskRangeIter` + `RangeOptions`，
+cask.hpp 公共 API）、OkiState `make_read_view()`（runs 共享 Reader +
+memdelta 排序去重快照）+ `tests/oki_range_test.cpp`（3 测试）+
+`range_bench` OKI 对比项。要点：
+
+- **run Reader 常驻缓存**：load 时全量 CRC 校验并打开（任一坏 → 整体未
+  加载态 → 重建，S33-3 eager 取舍的落点）；flush/rebuild 随 manifest 提交
+  同步维护；shared_ptr 使在途 ReadView 安全跨越 rebuild 的旧 run 删除
+  （POSIX unlink 后已开 fd 仍可读）——"pin" 即持句柄，无需显式引用计数。
+- 归并：各 run `seek(lo)` + memdelta `lower_bound(lo)`，逐 key 取 max-ord
+  （不依赖"memdelta 恒新"假设）、tomb 抵消、`get_owned` 回查（kNotFound
+  跳过 = 陈旧行无害）；Entry 的 tstamp/ord 取 keydir 权威值。
+- **三方对拍**：12 轮 × 120 随机操作（put/覆盖/删/merge/close-reopen/
+  checkpoint 交错）× 每轮全域 + 3 随机窗口，range vs 全表过滤 vs 影子
+  map 逐 key 逐 value 相等；完整性不变量由「全域 range == 影子 map」蕴含。
+- 并发 stress：writer(4000 ops) + 3 range 读者 + 中途 merge——严格升序 +
+  零错误断言，20 连跑稳过；TSan 树重点目标。TSan 下经 S29-6 回退开关关闭
+  乐观读快路径（与 CI 既知豁免同根因的 seqlock 误报；OKI 层并发仍全程
+  受检，**未新增豁免条目**）。
+- **`--prebuild-oki`（S33-4 遗留）确认不再需要**：hintord 迁移产物首开
+  自动重建已覆盖（MigrateHintOrdV4EraDirOpensAndReads 即证），从计划移除。
+- **bench（vs S33-1 基线，同参数）**：选择性 1/256 时 8.01ms → **0.534ms
+  （15×）**，1/16 大窗口 14.3ms → 7.80ms（1.8×，value 读取主导）；OKI 耗时
+  随选择性线性下降（基线持平）——**O(range) 实锤**，S33-1 立的靶命中。
+- **验收**：Debug 全量 **671/671**（20 连跑稳定）| **ASan 全量 671/671**
+  （首轮 1 个无关既有测试 IndexPoolUnregister.Timeout* 在同机双 sanitizer
+  高负载下时序 flaky，单独 12 连跑 0 失败，非 OKI 回归）| **TSan 并发套件
+  157/157**（CI 门控口径，未新增豁免）。
+
+### 🔴 S33-B2 —（S33-5 并发测试发现）mmap 窗口外读竞态修复
+
+**S30 mmap × S13 分批 CAS 的既有竞态**，并发 range 读者首次稳定复现
+（3/3 读者中招），普通 get 在多批次 merge 期间同样可踩：
+
+- **根因**：S30 的前提是「只映射 sealed 文件」，但 `read_file` 无从判定
+  封口——merge 输出在分批 CAS（`kApplyBatch`/逐输入文件 apply）期间仍在
+  增长，读者以打开时刻的尺寸 mmap 后，**后续批次 CAS 的条目落在映射窗口
+  之外** → `read_mmap` kShortRead → get 报 kIo。S13-F5 的重试只覆盖
+  open-ENOENT 窗口，不覆盖此分支。
+- **修复**：`Cask::get` mmap 分支收窄错误处理——kShortRead（= 窗口外）
+  **跌落 pread**（fd 本就保留未关，条目本身有效），kBadCrc/其余仍报错。
+  零拷贝路径对窗口内读不变。
+- **验收**：并发 stress 修前 3/3 读者报错 → 修后 0/20 全过。
+
 ### S33-6 — C API + 值预取 + bench + 文档 🟡 MED
 
 - C API：`bitcask_range_iter_*`（顺手补现缺的 `key_prefix` 能力）
@@ -259,6 +305,8 @@ S33-7 (评审)  ───── 依 S33-1 数据
 | S33-2 flag-day | ✅ done（Debug 650/650 + **ASan 全量 650/650** + build-rel 零错误）|
 | S33-3 OKI 格式 | ✅ done（10 测试；Debug 全量 663/663；ASan/TSan 见落地记录）|
 | S33-B1 墓碑复活修复 | ✅ done（并行恢复到达序无关；flaky 8/30 → 40/40 稳过）|
-| S33-4 memdelta + 写挂钩 | ✅ done（Debug 668/668；put 挂钩 ≈1.2% 达标；--prebuild-oki 推后）|
-| S33-5 Range 查询路径 | 🔴 下一步（OKI 数据面已齐：runs + memdelta + 水位）|
-| S33-6..7 | ⬜ 未开始 |
+| S33-4 memdelta + 写挂钩 | ✅ done（Debug 668/668；put 挂钩 ≈1.2% 达标）|
+| S33-5 Range 查询路径 | ✅ done（三方对拍 + 并发 stress；**1/256 选择性 8.01→0.53ms = 15×，耗时随选择性线性**；Debug 671/671）|
+| S33-B2 mmap 窗口外读修复 | ✅ done（S30×S13 既有竞态；kShortRead 跌落 pread；修前 3/3 中招 → 0/20）|
+| S33-6 C API + 文档收尾 | 🟡 下一步（--prebuild-oki 已确认不需要，从计划移除）|
+| S33-7 Level B 门禁评审 | ⬜ 未开始 |
