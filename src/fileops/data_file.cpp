@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "bitcask/format.hpp"
+#include "bitcask/detail/chunked_reader.hpp"       // T23
 #include "bitcask/detail/thread_local_buffer.hpp"  // S9-P1-d
 
 namespace bitcask::fileops {
@@ -290,62 +291,28 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
     std::uint64_t offset = start_offset;
     int crc_errors = 0;
 
-    // S13-P6：流式 chunked pread（照搬 hint_file.cpp 的 refill 模式）——
-    // 原实现每条 record 2 次 pread（header 23B + 整条 body），百万条即两百万
-    // 次 syscall；现 256 KiB 一块 + 跨 record 复用，syscall 数降 3 个数量级。
+    // S13-P6：流式 chunked pread——原实现每条 record 2 次 pread（header 23B
+    // + 整条 body），百万条即两百万次 syscall；现 256 KiB 一块 + 跨 record
+    // 复用，syscall 数降 3 个数量级。
     // 影响面：merge 全部输入文件扫描、搜索模式恢复（有 search 时 hint 快路径
     // 被跳过恒走 data fold）、纯 KV 无 hint 回退。buffer thread_local：fold
     // 可被多 reader 并发调同一 DataFile——pread 线程安全，buf 不能共享。
+    // T23：refill 归并进 detail::ChunkedReader（与 hint fold 共享实现）。
     static thread_local detail::ThreadLocalBuffer buf;
-    constexpr std::size_t kChunkBytes = 256 * 1024;  // 256 KiB
-    buf.ensure(kChunkBytes);
-
-    // buf 内有效数据区间 [buf_pos, buf_len)，对应文件 [offset, offset+len)。
-    std::size_t buf_pos = 0;
-    std::size_t buf_len = 0;
-
-    // refill：残留字节搬到 buf 头部，再续读一整块（或按 read_size_hint 扩容
-    // ——巨型 record 需要单缓冲装下整条）。返回新读字节数（0 = EOF）。
-    auto refill = [&](std::uint64_t file_off,
-                      std::size_t read_size_hint)
-        -> std::expected<std::size_t, DataFileFault> {
-        const std::size_t leftover = buf_len - buf_pos;
-        if (leftover > 0 && buf_pos > 0) {
-            std::memmove(buf.data(), buf.data() + buf_pos, leftover);
-        }
-        buf_pos = 0;
-        buf_len = leftover;
-
-        const std::size_t desired = buf_len + kChunkBytes;
-        const std::size_t need = std::max(desired, read_size_hint);
-        buf.ensure(need);
-
-        const std::uint64_t file_remaining =
-            total > (file_off + buf_len) ? total - (file_off + buf_len) : 0;
-        if (file_remaining == 0) return static_cast<std::size_t>(0);
-        const std::size_t to_read = static_cast<std::size_t>(
-            std::min<std::uint64_t>(buf.size() - buf_len, file_remaining));
-        if (to_read == 0) return static_cast<std::size_t>(0);
-
-        auto n = file_.pread_into(
-            file_off + buf_len, std::span(buf.data() + buf_len, to_read));
-        if (!n) return std::unexpected(io_fault(n.error()));
-        buf_len += *n;
-        return *n;
-    };
+    detail::ChunkedReader rd(file_, buf, total);
 
     while (offset + format::kHeaderSize <= total) {
-        // 1) header（kHeaderSize=23 字节）就位。
-        if (buf_len - buf_pos < format::kHeaderSize) {
-            auto r = refill(offset, format::kHeaderSize);
-            if (!r) return std::unexpected(r.error());
+        // 1) header（kHeaderSize 字节）就位。
+        if (rd.avail() < format::kHeaderSize) {
+            auto r = rd.refill(offset, format::kHeaderSize);
+            if (!r) return std::unexpected(io_fault(r.error()));
             if (*r == 0) break;  // EOF
         }
-        if (buf_len - buf_pos < format::kHeaderSize) break;  // 短读
+        if (rd.avail() < format::kHeaderSize) break;  // 短读
 
         // 只读出长度字段，CRC 等整条 record 就位再校验。盘格式为小端
         // (全引擎 LE-only 主机,见 codec 顶部 static_assert)→ 直接 memcpy。
-        const auto* p = buf.data() + buf_pos;
+        const auto* p = rd.cursor();
         std::uint16_t key_sz;
         std::uint32_t value_sz;
         std::memcpy(&key_sz,  p + format::kKeySzOffset,  sizeof(key_sz));
@@ -361,21 +328,21 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
         if (offset + rec_total > total) break;
 
         // 2) 整条 record 就位才 decode——缺就再 refill（含巨型 record 扩容）。
-        if (buf_len - buf_pos < rec_total) {
-            auto r = refill(offset, rec_total);
-            if (!r) return std::unexpected(r.error());
+        if (rd.avail() < rec_total) {
+            auto r = rd.refill(offset, rec_total);
+            if (!r) return std::unexpected(io_fault(r.error()));
         }
-        if (buf_len - buf_pos < rec_total) break;  // 短读当 EOF（同 hint fold）
+        if (rd.avail() < rec_total) break;  // 短读当 EOF（同 hint fold）
 
         auto rec = codec::decode_data_record(
-            std::span<const std::byte>(buf.data() + buf_pos, rec_total));
+            std::span<const std::byte>(rd.cursor(), rec_total));
         if (!rec) {
             if (rec.error() == codec::DecodeError::kBadCrc && tolerate_crc_errors) {
                 if (++crc_errors > kCrcSkipLimit) {
                     return std::unexpected(DataFileFault{DataFileError::kBadCrc});
                 }
                 offset += rec_total;
-                buf_pos += rec_total;
+                rd.consume(rec_total);
                 continue;
             }
             switch (rec.error()) {
@@ -387,11 +354,11 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
         }
         fn(*rec, offset, rec_total);
         offset += rec_total;
-        buf_pos += rec_total;
+        rd.consume(rec_total);
         if (out_last_valid_end) *out_last_valid_end = offset;
     }
     // 防线程内存膨胀：一次巨型 record 不应让 buffer 永久占住线程堆。
-    buf.maybe_shrink();
+    rd.shrink();
     return {};
 }
 

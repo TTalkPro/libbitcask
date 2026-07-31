@@ -197,7 +197,7 @@ void MergeRunner::fold_record(const codec::DataRecordView& view,
         return;
     }
     auto h = out_hint_->write(view.tstamp, w->total_size,
-                              w->offset, /*tomb*/ false, view.key);
+                              w->offset, /*tomb*/ false, view.key, view.ord);
     if (!h) {
         error = std::unexpected(io_fault(
             MergeError::kOutputWriteFailed, 0,

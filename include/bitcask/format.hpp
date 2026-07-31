@@ -52,38 +52,27 @@ enum class RecordType : std::uint8_t {
 };
 
 // ---------------------------------------------------------------------------
-// hint 文件 record 布局（用于 keydir 重建加速；不带 value）：
-//   [0..3]   Tstamp      u32 小端
-//   [4..5]   KeySz       u16 小端
-//   [6..9]   TotalSz     u32 小端 (对应 data file 里整条 record 的 total）
-//   [10..17] (Tomb:1<<63) | (Offset:63)，整体 u64 小端
-//   [18..]   Key (KeySz 字节)
-// 总长 = kHintRecordSize + KeySz
-//
-// 最高位用于 v2 墓碑标记，其余 63 位是 data file 内偏移（最大 8 EiB）。
-// ---------------------------------------------------------------------------
-inline constexpr std::size_t kHintRecordSize = 18;  // 4 + 2 + 4 + 8
-inline constexpr std::uint64_t kMaxOffsetV2 = 0x7FFF'FFFF'FFFF'FFFFull;
-inline constexpr std::uint64_t kTombMaskV2 = 0x8000'0000'0000'0000ull;
-
-// ---------------------------------------------------------------------------
-// hint 文件 v4 布局（S23-A1 的 v3 变长格式 + Tstamp u64 flag-day）。
-// v2 是 18B 定宽裸记录流（无文件头），v4：
-//   [0..3]           magic "BCH4"
+// hint 文件 v5 布局（S33 flag-day：v4 变长格式 + 记录内嵌 ord）：
+//   [0..3]           magic "BCH5"
 //   记录流（变长）    [vbyte gap][vbyte total_sz][vbyte keysz<<1|tomb]
-//                    [tstamp u64 小端][key]
+//                    [vbyte ord_delta][tstamp u64 小端][key]
 //   [size-8..size-1] trailer: magic "BCHE" u32 + running_crc u32
 //                    （CRC 覆盖 [0, size-8)，含文件头与全部记录字节）
-// gap = offset − prev_end（prev_end = 上条 offset+total_sz，首条为 0）。
-// 记录按 data append 序写且连续无洞时 gap==0（1 字节）；语义经 u64 二补数
-// 回绕无损还原，正确性**不依赖**连续性假设。典型记录 ~12-13B（v2 定宽 18B）。
-// 兼容：写端恒 v4；读端按文件头 magic 分派。v2/v3 旧文件属 u32-tstamp 纪元，
-// 已被 meta v4 门禁整体拒开（重建），不再有读端；migrate 从不迁 hint。
+// gap = offset − prev_end（prev_end = 上条 offset+total_sz，首条为 0）；
+// ord_delta = ord − prev_ord（prev_ord = 上条 ord，首条为 0）。二者均经
+// u64 二补数回绕无损还原，正确性**不依赖**单调性/连续性假设；正常 append
+// 序 gap==0（1 字节）、ord 递增（ord_delta 1-2 字节），典型记录 ~13-15B。
+// v5 使 hint 快路径恢复与 fold(data) 完全等价（ord 不再丢失，v4 时代 hint
+// 路径 ord 恒 0 的怪癖随之消除），也是 OKI（S33）tail 重放的前提。
+// 兼容：写端恒 v5；读端仅 v5——BCH4 及更早视作校验失败退 fold(data)
+// 重建（hint 是派生缓存），纪元硬门禁在 bitcask.meta v5（meta_file.cpp）。
+// 设计见 doc/ordered-key-index-design-zh.md §3.4。
 // ---------------------------------------------------------------------------
-inline constexpr std::uint32_t kHintMagicV4        = 0x34484342;  // "BCH4" LE
-inline constexpr std::uint32_t kHintTrailerMagicV4 = 0x45484342;  // "BCHE" LE
-inline constexpr std::size_t   kHintHeaderV4       = 4;
-inline constexpr std::size_t   kHintTrailerV4      = 8;
+inline constexpr std::uint32_t kHintMagicV5     = 0x35484342;  // "BCH5" LE
+inline constexpr std::uint32_t kHintMagicV4     = 0x34484342;  // "BCH4" LE（仅旧纪元识别/拒收）
+inline constexpr std::uint32_t kHintTrailerMagic = 0x45484342;  // "BCHE" LE
+inline constexpr std::size_t   kHintHeader       = 4;
+inline constexpr std::size_t   kHintTrailer      = 8;
 
 // ---------------------------------------------------------------------------
 // kDoc value 打包布局（写在 kDoc record 的 VALUE 段）。设计见 §2.4。
