@@ -1,17 +1,21 @@
 // bitcask_migrate — bitcask 目录格式纪元的统一离线迁移入口。
 //
-// 两次 flag-day 造就三个纪元（见 doc/format-zh.md 与 bitcask/migrate.hpp）：
+// 三次 flag-day 造就四个纪元（见 doc/format-zh.md 与 bitcask/migrate.hpp）：
 //   v1 纪元   : 大端（meta v1）
 //   u32 纪元  : 小端 + 32 位时间戳（meta v2/v3）
-//   当前纪元  : 小端 + 64 位时间戳（meta v4）
+//   u64 纪元  : 小端 + 64 位时间戳（meta v4,hint 无 ord）
+//   当前纪元  : 同 u64 的 data 布局,hint BCH5 内嵌 ord（meta v5）
 //
 // 子命令:
 //   detect   <dir>          读 bitcask.meta 报告纪元,并提示该用哪个迁移
-//   be2le    <src> <dst>    v1 大端      → 当前纪元（meta v4）
-//   tstamp64 <src> <dst>    u32 纪元 v2/v3 → 当前纪元（meta v4）
+//   be2le    <src> <dst>    v1 大端      → 当前纪元（meta v5）
+//   tstamp64 <src> <dst>    u32 纪元 v2/v3 → 当前纪元（meta v5）
+//   hintord  <src> <dst>    u64 纪元 v4  → 当前纪元（meta v5;data 硬链接
+//                           零改动,仅重生成 hint + meta）
 //
-// 非破坏性:只读 src、只写 dst（dst 不存在则创建）。data 重编码 + hint
-// 重生成;ckpt/seg/wal 等派生缓存不迁移,新库首开自动 fold 重建。
+// 非破坏性:只读 src、只写 dst（dst 不存在则创建）。data 重编码（hintord
+// 例外:硬链接零改动）+ hint 重生成;ckpt/seg/wal 等派生缓存不迁移,新库首开
+// 自动 fold 重建。
 
 #include <cstdio>
 #include <cstring>
@@ -29,22 +33,26 @@ constexpr const char* kUsage =
     "  detect   <dir>          detect the format era of a bitcask dir and\n"
     "                          suggest which migration (if any) to run\n"
     "  be2le    <src> <dst>    migrate a v1 big-endian dir (meta v1) to the\n"
-    "                          current era (meta v4, 64-bit timestamps)\n"
+    "                          current era (meta v5)\n"
     "  tstamp64 <src> <dst>    migrate a u32-timestamp little-endian dir\n"
-    "                          (meta v2/v3) to the current era (meta v4:\n"
+    "                          (meta v2/v3) to the current era (meta v5:\n"
     "                          record header 23B->27B, tstamp/expiry\n"
     "                          u32->u64, DocValue v3->v4)\n"
+    "  hintord  <src> <dst>    migrate an ord-less-hint dir (meta v4) to\n"
+    "                          the current era (meta v5): data files are\n"
+    "                          hard-linked UNCHANGED, only hints (BCH5,\n"
+    "                          ord embedded) and meta are rewritten\n"
     "\n"
     "era cheat sheet (bitcask.meta version byte):\n"
     "  v1    big-endian legacy            -> run: be2le\n"
     "  v2/v3 little-endian, u32 tstamp    -> run: tstamp64\n"
-    "  v4    current (u64 tstamp)         -> nothing to do\n"
+    "  v4    u64 tstamp, ord-less hints   -> run: hintord\n"
+    "  v5    current (BCH5 hints)         -> nothing to do\n"
     "\n"
-    "both migrations are non-destructive: src is opened read-only, output\n"
-    "is written to dst (created if missing). data files are re-encoded and\n"
-    "hint files regenerated; derived caches (keydir/search checkpoints,\n"
-    "segments) are NOT migrated -- the new library rebuilds them on first\n"
-    "open via fold.\n";
+    "all migrations are non-destructive: src is opened read-only, output\n"
+    "is written to dst (created if missing). derived caches (keydir/search\n"
+    "checkpoints, segments) are NOT migrated -- the new library rebuilds\n"
+    "them on first open via fold.\n";
 
 void print_stats(const char* src, const char* dst,
                  const bitcask::migrate::MigrateStats& s) {
@@ -107,7 +115,13 @@ int cmd_detect(const char* dir) {
                         dir);
             return 0;
         case 4:
-            std::printf("%s: meta v4 — current era (64-bit timestamps), "
+            std::printf("%s: meta v4 — u64-timestamp, ord-less-hint era\n",
+                        dir);
+            std::printf("  next step: bitcask_migrate hintord %s <dst>\n",
+                        dir);
+            return 0;
+        case 5:
+            std::printf("%s: meta v5 — current era (BCH5 hints), "
                         "nothing to migrate\n", dir);
             return 0;
         default:
@@ -140,7 +154,7 @@ int main(int argc, char** argv) {
         return cmd_detect(argv[2]);
     }
 
-    if (cmd == "be2le" || cmd == "tstamp64") {
+    if (cmd == "be2le" || cmd == "tstamp64" || cmd == "hintord") {
         if (argc != 4) {
             std::fprintf(stderr, "usage: %s %s <src_dir> <dst_dir>\n",
                          argv[0], argv[1]);
@@ -148,7 +162,9 @@ int main(int argc, char** argv) {
         }
         auto r = (cmd == "be2le")
                      ? bitcask::migrate::migrate_be_to_le(argv[2], argv[3])
-                     : bitcask::migrate::migrate_u32_to_u64(argv[2], argv[3]);
+                 : (cmd == "tstamp64")
+                     ? bitcask::migrate::migrate_u32_to_u64(argv[2], argv[3])
+                     : bitcask::migrate::migrate_hint_ord(argv[2], argv[3]);
         if (!r) {
             std::fprintf(stderr, "%s failed: %s\n", argv[1],
                          r.error().c_str());
