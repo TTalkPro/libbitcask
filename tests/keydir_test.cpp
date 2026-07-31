@@ -181,6 +181,54 @@ TEST(KeyDir, KeyLengthHistogramEmptyAndAfterRemove) {
     EXPECT_EQ(h2.heap, 1u);
 }
 
+// ---------------------------------------------------------------------------
+// S33：并行恢复的墓碑复活门（basho #82 删除复活类）。三条性质：
+// ① 缺席 remove 插 sentinel，晚到的旧 put 被 ord 门拦截；
+// ② 乱序双 remove 推进 sentinel ord 高水位，夹在中间的 put 仍被拦；
+// ③ ord=0 墓碑（运行期语义）不设门，旧行为不变。
+// ---------------------------------------------------------------------------
+
+TEST(KeyDir, TombstoneResurrectionGateOrdered) {
+    KeyDir kd;
+    // remove 先到（ord 9，key 缺席 → 插 sentinel）。
+    EXPECT_FALSE(kd.remove("k", 2000, 9, /*insert_tombstone_if_absent=*/true));
+    // 晚到的旧 put（ord 5，恢复语义 newest=false）必须被拦。
+    EXPECT_EQ(kd.put("k", 1, 10, 0, 1000, 0, false, 0, 0, 5),
+              PutResult::kAlreadyExists);
+    EXPECT_FALSE(kd.get("k").has_value());
+    // 真正更新的 put（ord 12 > 9）合法复活。
+    EXPECT_EQ(kd.put("k", 2, 10, 0, 3000, 0, false, 0, 0, 12), PutResult::kOk);
+    auto e = kd.get("k");
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->ord, 12u);
+}
+
+TEST(KeyDir, TombstoneOrdHighWaterAdvances) {
+    KeyDir kd;
+    // 真实历史：put(5) → remove(9)（另有更早的 remove(3)）。乱序到达
+    // remove(3) → remove(9) → put(5)：第二个 remove 命中已有墓碑必须推进
+    // sentinel ord，否则 put(5) 会过 3 的门错误复活。
+    EXPECT_FALSE(kd.remove("k", 100, 3, true));
+    EXPECT_FALSE(kd.remove("k", 300, 9, true));
+    EXPECT_EQ(kd.put("k", 1, 10, 0, 200, 0, false, 0, 0, 5),
+              PutResult::kAlreadyExists);
+    EXPECT_FALSE(kd.get("k").has_value());
+}
+
+TEST(KeyDir, RuntimeRemoveKeepsLegacySemantics) {
+    KeyDir kd;
+    // ord=0 墓碑（运行期 remove）：newest=false 的 put 不设门（旧行为——
+    // 链重放等路径依赖）。
+    ASSERT_EQ(kd.put("k", 1, 10, 0, 1000, 0, true, 0, 0, 1), PutResult::kOk);
+    EXPECT_TRUE(kd.remove("k", 2000));
+    EXPECT_EQ(kd.put("k", 1, 10, 50, 1500, 0, false, 0, 0, 2), PutResult::kOk);
+    EXPECT_TRUE(kd.get("k").has_value());
+    // 运行期写路径（newest=true）对带 ord 墓碑照样无门（write_mu_ 串行）。
+    EXPECT_TRUE(kd.remove("k", 3000, 7));
+    EXPECT_EQ(kd.put("k", 1, 10, 90, 3500, 0, true, 0, 0, 4), PutResult::kOk);
+    EXPECT_TRUE(kd.get("k").has_value());
+}
+
 TEST(KeyDir, AllocOrdThreadSafety) {
     KeyDir kd;
 

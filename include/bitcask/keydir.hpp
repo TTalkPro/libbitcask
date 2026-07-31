@@ -259,8 +259,19 @@ public:
                   std::uint64_t ord = 0);
 
     // 无条件删除。返回 true 表示原本有这条 key。
+    //
+    // S33（并行恢复 remove/put 到达序无关，见 put_insert 的复活门）：
+    //   ord：墓碑的全局写序号。非 0 时记入墓碑 sentinel——之后
+    //     newest_put=false 的 put 命中该墓碑，仅当 put.ord > 墓碑 ord 才
+    //     允许复活（否则 kAlreadyExists）。ord=0（运行期 remove / 链重放）
+    //     维持旧语义（无门禁）。
+    //   insert_tombstone_if_absent：key 不存在时也插入墓碑 sentinel（仅
+    //     非 fold 态生效）。并行恢复中「墓碑先于其 put 到达」的必要标记；
+    //     sentinel 由 S29-6 P1 的墓碑清扫机制回收。
     // 线程安全: 是。锁: key 分片 unique;fold 态按需嵌套 meta unique。
-    bool remove(std::string_view key, std::uint64_t remove_time);
+    bool remove(std::string_view key, std::uint64_t remove_time,
+                std::uint64_t ord = 0,
+                bool insert_tombstone_if_absent = false);
 
     // 条件删除（CAS）：只有 (tstamp, file_id, offset) 匹配当前 entry
     // 才删。给 merge 跟 cask put 路径之间的 race 防护用。

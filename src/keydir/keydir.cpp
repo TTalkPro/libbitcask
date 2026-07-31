@@ -48,8 +48,11 @@ namespace {
 // sibling-tombstone：fold 期间删除已存在 key 时，往 sibling 链头部插入的
 // 「墓碑 revision」。三个 sentinel 字段同时取 MAX 是 legacy is_sib_tombstone
 // 的判别约定，沿用以保证跨实现互通。
-SingleEntry make_sibling_tombstone(std::uint64_t epoch, std::uint64_t tstamp) noexcept {
-    return SingleEntry{kMaxFileId, kMaxSize, kMaxOffset, epoch, tstamp, 0};
+// S33：ord 字段记墓碑的全局写序号（非 0 时启用 put_insert 的复活门——
+// 并行恢复 remove/put 到达序无关的判据；0 = 运行期 remove，无门禁）。
+SingleEntry make_sibling_tombstone(std::uint64_t epoch, std::uint64_t tstamp,
+                                   std::uint64_t ord = 0) noexcept {
+    return SingleEntry{kMaxFileId, kMaxSize, kMaxOffset, epoch, tstamp, ord};
 }
 [[nodiscard]] bool is_sibling_tombstone(const SingleEntry& s) noexcept {
     return s.file_id == kMaxFileId && s.total_sz == kMaxSize && s.offset == kMaxOffset;
@@ -556,6 +559,18 @@ PutResult KeyDir::put_insert(PutCtx& ctx, std::string_view key,
         return PutResult::kAlreadyExists;
     }
 
+    // S33 复活门：命中带 ord 的墓碑（恢复期 remove 写入）时，newest_put=false
+    // 的 put 必须比墓碑新（ord 全序、无平局）才能复活——纯 KV 并行恢复
+    // remove/put 到达序无关的关键半边（另一半在 remove 的 sentinel 插入与
+    // 高水位推进）。newest_put（运行期写路径，write_mu_ 串行无乱序）与
+    // ord=0 墓碑（运行期 remove / 链重放）不设门，维持既有语义。pending
+    // 墓碑（fold 态）不参与——恢复期无 fold。
+    if (!newest_put && ctx.current_is_tombstone &&
+        ctx.pending_entry == nullptr &&
+        ctx.current_proxy.ord != 0 && ord <= ctx.current_proxy.ord) {
+        return PutResult::kAlreadyExists;
+    }
+
     SingleEntry s{file_id, total_sz, offset, ctx.this_epoch, tstamp, ord};
 
     if (ctx.pending_entry != nullptr) {
@@ -715,7 +730,8 @@ PutResult KeyDir::put_overwrite(PutCtx& ctx, [[maybe_unused]] std::string_view k
 //     探测顺序依赖它）。语义对迭代器等价（旧 revision 都保留）,且修复了
 //     旧实现「freeze 复用的后启 fold 看不到 remove」的不一致。
 //   - entries miss + pending 命中：pending 内原地改墓碑（meta unique）。
-bool KeyDir::remove(std::string_view key, std::uint64_t remove_time) {
+bool KeyDir::remove(std::string_view key, std::uint64_t remove_time,
+                    std::uint64_t ord, bool insert_tombstone_if_absent) {
     Shard& sh = shards_[shard_for(key)];
     std::unique_lock slock(sh.mu);
 
@@ -739,7 +755,21 @@ bool KeyDir::remove(std::string_view key, std::uint64_t remove_time) {
     auto it = sh.entries.find(key);
     if (it != sh.entries.end()) {
         auto at = entry_at_epoch(it->second, kMaxEpoch);
-        if (!at.found || at.is_tombstone) return false;  // 已是墓碑/不可见
+        if (!at.found || at.is_tombstone) {
+            // S33：已是墓碑——并行恢复下更晚的墓碑须推进 sentinel 的
+            // ord/tstamp 高水位，否则「remove(旧) → put(中) → remove(新)」
+            // 的乱序到达会让中间 ord 的 put 过复活门错误复活。
+            if (at.found && at.is_tombstone && ord != 0) {
+                if (auto* s = std::get_if<SingleEntry>(&it->second);
+                    s != nullptr && is_sibling_tombstone(*s) && s->ord < ord) {
+                    auto ws = sh.entries.write_section();
+                    s->ord = ord;
+                    s->tstamp = std::max(s->tstamp, remove_time);
+                    s->epoch = this_epoch;
+                }
+            }
+            return false;  // 已是墓碑/不可见
+        }
         const SingleEntry cur = at.rev;
 
         update_fstats(cur.file_id, cur.tstamp, kMaxEpoch,
@@ -755,7 +785,7 @@ bool KeyDir::remove(std::string_view key, std::uint64_t remove_time) {
             // 升 sibling 链插墓碑,旧 revision 留给迭代器。
             // S29-6 P3:就地改写走 seqlock 写窗口。
             auto ws = sh.entries.write_section();
-            SingleEntry t = make_sibling_tombstone(this_epoch, remove_time);
+            SingleEntry t = make_sibling_tombstone(this_epoch, remove_time, ord);
             if (auto* multi = std::get_if<MultiEntry>(&it->second)) {
                 multi->revisions.insert(multi->revisions.begin(), t);
             } else {
@@ -774,7 +804,7 @@ bool KeyDir::remove(std::string_view key, std::uint64_t remove_time) {
             {
                 // S29-6 P3:就地改写走 seqlock 写窗口。
                 auto ws = sh.entries.write_section();
-                it->second = make_sibling_tombstone(this_epoch, remove_time);
+                it->second = make_sibling_tombstone(this_epoch, remove_time, ord);
             }
             ++sh.tombstones;
             sweep_tombstones_locked(sh);
@@ -808,9 +838,20 @@ bool KeyDir::remove(std::string_view key, std::uint64_t remove_time) {
                 p->second.offset = kMaxOffset;
                 p->second.tstamp = remove_time;
                 p->second.epoch  = this_epoch;
+                p->second.ord    = ord;  // S33：墓碑 ord（0 = 无门禁）
                 return true;
             }
         }
+    }
+    // S33：key 不存在。恢复模式下插入墓碑 sentinel——并行恢复中「墓碑先于
+    // 其 put 到达」时，晚到的旧 put 靠复活门（比对 sentinel ord）拦截。
+    // 仅非 fold 态生效（冷启动恢复即此形态）；sentinel 走 S29-6 P1 既有的
+    // 墓碑清扫回收，不计 key_count（无活 key）。
+    if (insert_tombstone_if_absent && !fold_active) {
+        sh.entries.insert_or_assign(
+            std::string(key),
+            Entry{make_sibling_tombstone(this_epoch, remove_time, ord)});
+        ++sh.tombstones;
     }
     return false;
 }
