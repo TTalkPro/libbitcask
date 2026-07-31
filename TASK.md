@@ -110,6 +110,49 @@ fold / fold_v4 两份手抄随 flag-day 整体删除，三胞胎实际收敛为 
 - **工作量**：1.5 天
 - **验收**：round-trip / seek 边界 / 损坏拒收单元测试
 
+#### ✅ S33-3 落地记录（2026-07-31）
+
+新增 `include/bitcask/oki_run.hpp` + `src/fileops/oki_run.cpp`（挂
+`bitcask_fileops`）+ `tests/oki_run_test.cpp`（10 测试）。要点：
+
+- **格式简化**：块首条不设独立编码——每块解码状态复位（prev_key="" /
+  prev_ord=0），块首条自然退化为全量 key + 绝对 ord，读写两端同一条码路径。
+- trailer 扩为 24B（+entry_count u64）；ord 差分与 hint v5 同款回绕语义。
+- **flags 未知位 fail-fast**（Level B 扩展位预留），专项测试绕过 CRC
+  重算后单独验证该门。
+- reader open 时**全文件 eager CRC**（派生缓存，安全优先；惰性/分块校验
+  留作后续优化），稀疏索引载入内存，Cursor 按块 pread。
+- 顺手：`detail::AtomicFileWriter` 补移动语义（T21 基建缺口，OkiRunWriter
+  按值持有需要；源移出标记 committed_ 防双清理）。
+- 测试含：多块 round-trip（乱序 ord/墓碑/`prefix:id` 形态）、100 长公共
+  前缀 + 二进制 key、块界全覆盖 seek（每个存在 key 精确 seek + seek 后
+  顺序推进）、writer 乱序/重复/finish 后拒写、弃写不留残件、四区域翻
+  bit + 截尾拒收、manifest 逐字节翻 bit 全扫。
+- **验收**：OKI 10/10；Debug 全量 663/663；**ASan 全量 663/663**；
+  TSan 相关套件（KeyDir/Concurrent/Parallel/CaskDocValue/Oki）137/137
+  （按 CI 门控豁免 1 项既知 seqlock 误报，见 ci.yml TSan 豁免注释）。
+
+### 🔴 S33-B1 —（S33-3 期间发现）纯 KV 并行恢复墓碑复活 bug 修复
+
+**Phase 7 头号盲区（Tombstone 语义 / basho #82 删除复活类）的现行实例**，
+由 S33-2 新增的 `MigrateHintOrdV4EraDirOpensAndReads` 首次暴露（8/30 flaky）：
+
+- **根因**（两个缺口叠加，均为既有代码，非 flag-day 引入）：
+  ① `put_insert` 命中墓碑**无条件复活**（不比对任何新旧）；
+  ② key 尚未插入时 `remove` **不留任何标记**直接返回。
+  R3 的纯 KV 并行恢复（按文件并发 fold）下，「墓碑文件先于 put 文件完成」
+  或「remove 先到 + put 后到」皆复活——到达序依赖。串行恢复（按 tstamp
+  升序）从未触发，故一直潜伏。
+- **修复**（ord 全序判据——恢复两路 BCH5/data fold 皆有 ord，无平局）：
+  `KeyDir::remove` 增 `ord` + `insert_tombstone_if_absent` 参数（默认值
+  保持旧语义）；墓碑 sentinel 记 ord，重复 remove 推进 ord 高水位；
+  `put_insert` 复活门：`!newest_put` 且墓碑 ord≠0 时须 `put.ord > 墓碑 ord`。
+  运行期路径（newest_put、ord=0 墓碑、链重放）语义零变化。缺席 sentinel
+  走 S29-6 P1 既有墓碑清扫回收。
+- **验收**：flaky 复现 8/30 → 修后 40/40 稳过；keydir 新增 3 测试
+  （复活门 / 双 remove 高水位 / 运行期旧语义留存）；Debug 全量 663/663 +
+  ASan 全量 663/663 + TSan 相关套件 137/137（CI 门控口径）。
+
 ### S33-4 — memdelta + 写挂钩 + flush/恢复 🔴 HIGH
 
 - memdelta 单写者结构（锁独立于 keydir 分片锁全序）；put/remove 成功后单一挂钩点
@@ -181,5 +224,7 @@ S33-7 (评审)  ───── 依 S33-1 数据
 | S33-1 探针 + 基线 | ✅ done（O(全表) 实锤 + ~122B/key 锚点，见落地记录）|
 | T23（前置）| ✅ done（ChunkedReader；v2/v4 读端删除后收敛为 2 站点 1 实现）|
 | S33-2 flag-day | ✅ done（Debug 650/650 + **ASan 全量 650/650** + build-rel 零错误）|
-| S33-3 OKI 格式 | 🔴 下一步 |
-| S33-4..7 | ⬜ 未开始 |
+| S33-3 OKI 格式 | ✅ done（10 测试；Debug 全量 663/663；ASan/TSan 见落地记录）|
+| S33-B1 墓碑复活修复 | ✅ done（并行恢复到达序无关；flaky 8/30 → 40/40 稳过）|
+| S33-4 memdelta + 写挂钩 | 🔴 下一步 |
+| S33-5..7 | ⬜ 未开始 |
