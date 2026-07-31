@@ -163,6 +163,39 @@ fold / fold_v4 两份手抄随 flag-day 整体删除，三胞胎实际收敛为 
 - **工作量**：2 天
 - **验收**：crash 注入套件（flush/manifest 各阶段 kill）；put 回归达标
 
+#### ✅ S33-4 落地记录（2026-07-31）
+
+新增 `oki_state.hpp` + `src/fileops/oki_state.cpp`（OkiState：memdelta/
+flush/rebuild/水位）+ `tests/oki_recovery_test.cpp`（5 集成测试）。要点：
+
+- **挂钩收敛到 KeyDir::put/remove 咽喉点**（比原计划的"Cask 各写路径挂钩"
+  更深一层）——Cask 侧零逐点改动，未来新增写路径自动覆盖（设计 §8 难点 1
+  的结构性对策）。锁外执行（分片/meta 锁释放后），锁序不交叉。过滤规则：
+  merge 搬迁（old_file_id≠0）不收；`ord < wm` 的 tail 重放旧行由水位门
+  自动丢弃——**恢复路径因此零逐点改动**（fold/hint/链重放全自动生效）。
+- **wm 语义定为排他上界**（= 尚未覆盖的最小 ord）。发现并绕开一个 ±1 深坑：
+  `alloc_ord` 首个 LSN 是 **0**，含上界语义表示不了「已覆盖 ord 0」vs
+  「未覆盖任何」——排他语义下 ord 0 自然纳入，全部特判消失。
+- **快照崩溃窗口的闭环**：flush 恒在 write_keydir_snapshot 之后同站点搭车
+  （close/merge 收尾/成对 ckpt base）；快照自身 next_ord 在链重放前捕获
+  （RecoverySnapshots.snap_next_ord）；open 收尾 `wm < snap_next_ord` 或
+  manifest 缺失/损坏 → 全量重建（迭代 keydir 活 key 排序写单 run）。
+  重建只在 rw 句柄做，best-effort 不阻断 open。
+- 阈值 flush：写路径探询 `should_flush()`（1M 行/64MiB，无锁 hint），超限
+  同步落 run；flush 换出 memdelta，IO 期间 append 不被阻塞，失败放回队头。
+- **put 回归实测**：KeyDir 微基准 52→67ns（+29.6%——无 IO 口径放大，且
+  bench 中 memdelta 无界增长）；**Cask put 全路径 1246ns，挂钩 ≈15ns ≈
+  1.2% ≤ 3% 预算达标**（预算口径即 put 路径）。
+- **计划偏离**：`--prebuild-oki` 未实装（推 S33-5/6——迁移后首开的自动
+  重建已覆盖语义，prebuild 只是省一次重建耗时的锦上添花）。
+- 测试矩阵：干净关闭（run 内容/墓碑去重/wm 追平）；重开零重建（gen 集
+  不变 + memdelta 空）；**fork crash 后 tail 重放**（checkpoint 已 flush
+  一半 + 崩溃丢另一半 → 旧 run 保留 + 新行进 memdelta，不触发重建）；
+  manifest/runs 全删 → 全量重建（活 key 覆盖、删除键缺席）；快照缺口
+  （manifest 回滚 wm=0）→ 重建追平。
+- **验收**：Debug 全量 **668/668** | **ASan 全量 668/668** |
+  **TSan 并发套件 142/142**（CI 门控口径）| build-rel bench 零错误。
+
 ### S33-5 — Range 查询路径 🔴 HIGH
 
 - `Cask::make_range_iter(RangeOptions{lo,hi,...})`：manifest 快照 pin runs →
@@ -226,5 +259,6 @@ S33-7 (评审)  ───── 依 S33-1 数据
 | S33-2 flag-day | ✅ done（Debug 650/650 + **ASan 全量 650/650** + build-rel 零错误）|
 | S33-3 OKI 格式 | ✅ done（10 测试；Debug 全量 663/663；ASan/TSan 见落地记录）|
 | S33-B1 墓碑复活修复 | ✅ done（并行恢复到达序无关；flaky 8/30 → 40/40 稳过）|
-| S33-4 memdelta + 写挂钩 | 🔴 下一步 |
-| S33-5..7 | ⬜ 未开始 |
+| S33-4 memdelta + 写挂钩 | ✅ done（Debug 668/668；put 挂钩 ≈1.2% 达标；--prebuild-oki 推后）|
+| S33-5 Range 查询路径 | 🔴 下一步（OKI 数据面已齐：runs + memdelta + 水位）|
+| S33-6..7 | ⬜ 未开始 |
