@@ -1896,7 +1896,9 @@ Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
     auto h = active_hint_->write(tstamp, w->total_size, w->offset,
                                   /*tomb*/ true, key, ord);
     if (!h) return std::unexpected(io_fault(h.error().errnum));
-    keydir_->remove(bytes_to_view(key), tstamp);
+    // S33：墓碑记 ord（运行期 put 走 newest_put=true 不受复活门影响；
+    // 记下 ord 使崩溃前的内存态与恢复重建态一致）。
+    keydir_->remove(bytes_to_view(key), tstamp, ord);
     og.disarm();  // S13-F2: ord 由下面的 Delete 任务覆盖
     // H1：Delete 提交移出临界区（同 put）。S15-3：原「非池同步直调
     // on_delete」分支删除——open 强制 registry 非空（本文件 open() 首行

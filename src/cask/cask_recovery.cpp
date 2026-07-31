@@ -334,8 +334,12 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                 auto fr = hf->fold_validated([&](const auto& rec) {
                         if (rec.tombstone) {
                             // 墓碑 hint 必须执行——否则前一个 file 里的同 key
-                            // 活 entry 会被错误保留。
-                            keydir_->remove(bytes_to_view(rec.key), rec.tstamp);
+                            // 活 entry 会被错误保留。S33：携带 ord + 缺席即
+                            // 插 sentinel——并行恢复下 remove/put 到达序无关
+                            // （复活门见 keydir put_insert）。
+                            keydir_->remove(bytes_to_view(rec.key), rec.tstamp,
+                                            rec.ord,
+                                            /*insert_tombstone_if_absent=*/true);
                             keydir_->advance_ord(rec.ord);
                             return;
                         }
@@ -365,7 +369,11 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
             [&](const codec::DataRecordView& view, std::uint64_t offset,
                 std::uint32_t total_size) {
                 if (view.type == format::RecordType::kTombstone) {
-                    keydir_->remove(bytes_to_view(view.key), view.tstamp);
+                    // S33：携带 ord + 缺席即插 sentinel（并行恢复到达序无关，
+                    // 同 hint 路径）。
+                    keydir_->remove(bytes_to_view(view.key), view.tstamp,
+                                    view.ord,
+                                    /*insert_tombstone_if_absent=*/true);
                     // S33：墓碑 ord 也推进水位——否则文件末尾是墓碑时
                     // next_ord 落后于盘上已用 ord，重启后 alloc_ord 复用
                     // （与 hint v5 路径对齐；OKI max-ord-wins 依赖 ord 不重）。
