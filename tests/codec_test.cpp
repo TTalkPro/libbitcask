@@ -483,77 +483,8 @@ TEST(DocValue, QuantizedAcceptedAndUnknownSchemeRejected) {
 }
 
 // ---------------------------------------------------------------------------
-// Hint record golden (format unchanged in V1).
-// ---------------------------------------------------------------------------
-TEST(HintRecord, GoldenLayoutNonTombstone) {
-    std::vector<std::byte> out;
-    codec::encode_hint_record(out, 0xDEADBEEF, 0x00000010,
-                              0x0000000001020304ull, false, as_bytes("ab"));
-    // P:小端——Tstamp/KeySz/TotalSz/packed 全低位在前。
-    auto expected = hex_to_bytes("efbeadde" "0200" "10000000"
-                                 "0403020100000000" "6162");
-    ASSERT_EQ(out.size(), expected.size());
-    EXPECT_EQ(bytes_to_hex(out), bytes_to_hex(expected));
-}
-
-TEST(HintRecord, GoldenLayoutTombstoneSetsHighBit) {
-    std::vector<std::byte> out;
-    codec::encode_hint_record(out, 1, 22, 0x10, true, as_bytes("k"));
-    // P:packed u64 小端 → 最高位(bit63=tomb 标记)落在最后一字节 out[17]。
-    EXPECT_EQ(static_cast<std::uint8_t>(out[17]) & 0x80u, 0x80u);
-    auto rec = codec::decode_hint_record(out);
-    ASSERT_TRUE(rec.has_value());
-    EXPECT_TRUE(rec->tombstone);
-    EXPECT_EQ(rec->offset, 0x10u);
-}
-
-TEST(HintRecord, EofSentinel) {
-    std::vector<std::byte> out;
-    const std::uint32_t crc = 0xCAFEBABE;
-    codec::encode_hint_eof(out, crc);
-    ASSERT_EQ(out.size(), kHintRecordSize);
-
-    auto rec = codec::decode_hint_record(out);
-    ASSERT_TRUE(rec.has_value());
-    EXPECT_TRUE(codec::is_hint_eof(*rec));
-    EXPECT_EQ(rec->tstamp, 0u);
-    EXPECT_EQ(rec->total_sz, crc);
-    EXPECT_EQ(rec->offset, kMaxOffsetV2);
-    EXPECT_FALSE(rec->tombstone);
-    EXPECT_TRUE(rec->key.empty());
-}
-
-TEST(HintRecord, OffsetBoundaryMaxV2) {
-    std::vector<std::byte> out;
-    codec::encode_hint_record(out, 1, 14, kMaxOffsetV2, false, as_bytes("k"));
-    auto rec = codec::decode_hint_record(out);
-    ASSERT_TRUE(rec.has_value());
-    EXPECT_EQ(rec->offset, kMaxOffsetV2);
-    EXPECT_FALSE(rec->tombstone);
-}
-
-TEST(HintRecord, RoundTripStreamOfRecords) {
-    std::vector<std::byte> out;
-    codec::encode_hint_record(out, 1, 100, 0,   false, as_bytes("a"));
-    codec::encode_hint_record(out, 2, 200, 100, true,  as_bytes("bb"));
-    codec::encode_hint_record(out, 3, 300, 300, false, as_bytes("ccc"));
-
-    std::span<const std::byte> rest = out;
-    auto r1 = codec::decode_hint_record(rest); ASSERT_TRUE(r1);
-    rest = rest.subspan(r1->consumed);
-    auto r2 = codec::decode_hint_record(rest); ASSERT_TRUE(r2);
-    rest = rest.subspan(r2->consumed);
-    auto r3 = codec::decode_hint_record(rest); ASSERT_TRUE(r3);
-    rest = rest.subspan(r3->consumed);
-    EXPECT_TRUE(rest.empty());
-
-    EXPECT_EQ(r1->tstamp, 1u); EXPECT_EQ(r1->key.size(), 1u);
-    EXPECT_EQ(r2->tstamp, 2u); EXPECT_EQ(r2->key.size(), 2u); EXPECT_TRUE(r2->tombstone);
-    EXPECT_EQ(r3->tstamp, 3u); EXPECT_EQ(r3->key.size(), 3u);
-}
-
-// ---------------------------------------------------------------------------
 // Layout constants are part of the on-disk contract.
+// （v2 定宽 hint 常量已随 S33 flag-day 删除——hint 仅 v5，见下方 HintRecordV5。）
 // ---------------------------------------------------------------------------
 TEST(Layout, ConstantsLocked) {
     EXPECT_EQ(format::kHeaderSize, 27u);  // 4+1+8+8+2+4
@@ -563,8 +494,10 @@ TEST(Layout, ConstantsLocked) {
     EXPECT_EQ(format::kOrdOffset, 13u);
     EXPECT_EQ(format::kKeySzOffset, 21u);
     EXPECT_EQ(format::kValueSzOffset, 23u);
-    EXPECT_EQ(format::kHintRecordSize, 18u);
-    EXPECT_EQ(format::kMaxOffsetV2, 0x7FFFFFFFFFFFFFFFull);
+    EXPECT_EQ(format::kHintMagicV5, 0x35484342u);      // "BCH5" LE
+    EXPECT_EQ(format::kHintTrailerMagic, 0x45484342u); // "BCHE" LE
+    EXPECT_EQ(format::kHintHeader, 4u);
+    EXPECT_EQ(format::kHintTrailer, 8u);
     EXPECT_EQ(format::kMaxKeySize, 0xFFFFu);
     EXPECT_EQ(format::kMaxValueSize, 0xFFFFFFFFu);
     EXPECT_EQ(static_cast<std::uint8_t>(format::RecordType::kDoc), 0u);
@@ -708,7 +641,8 @@ TEST(MetaFilterCompileCheck, HeaderOnlyRoundtrip) {
 }
 
 // ---------------------------------------------------------------------------
-// Hint record v3（S23-A1：vbyte + gap 差分；文件级布局见 format.hpp）。
+// Hint record v5（S33 flag-day：vbyte + gap/ord 双差分；文件级布局见
+// format.hpp）。
 // ---------------------------------------------------------------------------
 namespace {
 std::string hint_key_str(std::span<const std::byte> k) {
@@ -716,62 +650,109 @@ std::string hint_key_str(std::span<const std::byte> k) {
 }
 }  // namespace
 
-TEST(HintRecordV3, GoldenLayoutContiguous) {
+TEST(HintRecordV5, GoldenLayoutContiguous) {
     std::vector<std::byte> out;
-    // 连续追加（offset == prev_end=0）：gap=0(1B) + total_sz=0x10(1B) +
-    // keysz<<1|0=4(1B) + tstamp 8B + "ab" = 13B（v2 定宽 20B 同载荷）。
-    auto pe = codec::encode_hint_record_v4(out, 0xDEADBEEF, 0x10, 0, false,
-                                           as_bytes("ab"), /*prev_end=*/0);
-    EXPECT_EQ(pe, 0x10u);
-    auto expected = hex_to_bytes("80" "90" "84" "efbeadde00000000" "6162");
+    // 连续追加（offset == prev_end=0，ord=5 相对 prev_ord=0）：gap=0(1B) +
+    // total_sz=0x10(1B) + keysz<<1|0=4(1B) + ord_delta=5(1B) + tstamp 8B +
+    // "ab" = 14B。
+    std::uint64_t prev_end = 0, prev_ord = 0;
+    codec::encode_hint_record_v5(out, 0xDEADBEEF, 0x10, 0, false,
+                                 as_bytes("ab"), /*ord=*/5,
+                                 prev_end, prev_ord);
+    EXPECT_EQ(prev_end, 0x10u);
+    EXPECT_EQ(prev_ord, 5u);
+    auto expected = hex_to_bytes("80" "90" "84" "85"
+                                 "efbeadde00000000" "6162");
     ASSERT_EQ(out.size(), expected.size());
     EXPECT_EQ(bytes_to_hex(out), bytes_to_hex(expected));
 
-    std::uint64_t prev_end = 0;
-    auto rec = codec::decode_hint_record_v4(out, prev_end);
+    std::uint64_t d_end = 0, d_ord = 0;
+    auto rec = codec::decode_hint_record_v5(out, d_end, d_ord);
     ASSERT_TRUE(rec.has_value());
     EXPECT_EQ(rec->tstamp, 0xDEADBEEFu);
     EXPECT_EQ(rec->total_sz, 0x10u);
     EXPECT_EQ(rec->offset, 0u);
+    EXPECT_EQ(rec->ord, 5u);
     EXPECT_FALSE(rec->tombstone);
     EXPECT_EQ(hint_key_str(rec->key), "ab");
     EXPECT_EQ(rec->consumed, out.size());
-    EXPECT_EQ(prev_end, 0x10u);
+    EXPECT_EQ(d_end, 0x10u);
+    EXPECT_EQ(d_ord, 5u);
 }
 
-TEST(HintRecordV3, TombstoneBitAndGap) {
+TEST(HintRecordV5, TombstoneBitAndGap) {
     std::vector<std::byte> out;
-    // 非零 gap（offset=100, prev_end=64 → gap=36）+ tomb 位。
-    auto pe = codec::encode_hint_record_v4(out, 7, 22, 100, true,
-                                           as_bytes("k"), /*prev_end=*/64);
-    EXPECT_EQ(pe, 122u);
-    std::uint64_t prev_end = 64;
-    auto rec = codec::decode_hint_record_v4(out, prev_end);
+    // 非零 gap（offset=100, prev_end=64 → gap=36）+ tomb 位 + ord 差分。
+    std::uint64_t prev_end = 64, prev_ord = 41;
+    codec::encode_hint_record_v5(out, 7, 22, 100, true, as_bytes("k"),
+                                 /*ord=*/42, prev_end, prev_ord);
+    EXPECT_EQ(prev_end, 122u);
+    EXPECT_EQ(prev_ord, 42u);
+    std::uint64_t d_end = 64, d_ord = 41;
+    auto rec = codec::decode_hint_record_v5(out, d_end, d_ord);
     ASSERT_TRUE(rec.has_value());
     EXPECT_EQ(rec->offset, 100u);
+    EXPECT_EQ(rec->ord, 42u);
     EXPECT_TRUE(rec->tombstone);
-    EXPECT_EQ(prev_end, 122u);
+    EXPECT_EQ(d_end, 122u);
 }
 
-TEST(HintRecordV3, GapWraparoundOffsetLessThanPrevEnd) {
-    // offset < prev_end（不应出现，但语义须无损）：u64 二补数回绕还原。
+TEST(HintRecordV5, WraparoundOffsetAndOrdRegression) {
+    // offset < prev_end / ord < prev_ord（merge 输出等场景不应出现，但语义
+    // 须无损）：u64 二补数回绕还原，正确性不依赖单调性。
     std::vector<std::byte> out;
-    codec::encode_hint_record_v4(out, 1, 8, /*offset=*/16, false,
-                                 as_bytes("x"), /*prev_end=*/100);
-    std::uint64_t prev_end = 100;
-    auto rec = codec::decode_hint_record_v4(out, prev_end);
+    std::uint64_t prev_end = 100, prev_ord = 50;
+    codec::encode_hint_record_v5(out, 1, 8, /*offset=*/16, false,
+                                 as_bytes("x"), /*ord=*/3,
+                                 prev_end, prev_ord);
+    std::uint64_t d_end = 100, d_ord = 50;
+    auto rec = codec::decode_hint_record_v5(out, d_end, d_ord);
     ASSERT_TRUE(rec.has_value());
     EXPECT_EQ(rec->offset, 16u);
-    EXPECT_EQ(prev_end, 24u);
+    EXPECT_EQ(rec->ord, 3u);
+    EXPECT_EQ(d_end, 24u);
+    EXPECT_EQ(d_ord, 3u);
 }
 
-TEST(HintRecordV3, ShortBufferReturnsTooShort) {
+TEST(HintRecordV5, StreamRoundTripChainsDeltas) {
+    // 三条流式串联：offset 连续、ord 递增——差分状态跨条传递。
     std::vector<std::byte> out;
-    codec::encode_hint_record_v4(out, 1, 30, 0, false, as_bytes("abc"), 0);
+    std::uint64_t prev_end = 0, prev_ord = 0;
+    codec::encode_hint_record_v5(out, 1, 100, 0,   false, as_bytes("a"),
+                                 10, prev_end, prev_ord);
+    codec::encode_hint_record_v5(out, 2, 200, 100, true,  as_bytes("bb"),
+                                 11, prev_end, prev_ord);
+    codec::encode_hint_record_v5(out, 3, 300, 300, false, as_bytes("ccc"),
+                                 12, prev_end, prev_ord);
+
+    std::span<const std::byte> rest = out;
+    std::uint64_t d_end = 0, d_ord = 0;
+    auto r1 = codec::decode_hint_record_v5(rest, d_end, d_ord);
+    ASSERT_TRUE(r1);
+    rest = rest.subspan(r1->consumed);
+    auto r2 = codec::decode_hint_record_v5(rest, d_end, d_ord);
+    ASSERT_TRUE(r2);
+    rest = rest.subspan(r2->consumed);
+    auto r3 = codec::decode_hint_record_v5(rest, d_end, d_ord);
+    ASSERT_TRUE(r3);
+    rest = rest.subspan(r3->consumed);
+    EXPECT_TRUE(rest.empty());
+
+    EXPECT_EQ(r1->ord, 10u); EXPECT_EQ(r1->offset, 0u);
+    EXPECT_EQ(r2->ord, 11u); EXPECT_EQ(r2->offset, 100u);
+    EXPECT_TRUE(r2->tombstone);
+    EXPECT_EQ(r3->ord, 12u); EXPECT_EQ(r3->offset, 300u);
+}
+
+TEST(HintRecordV5, ShortBufferReturnsTooShort) {
+    std::vector<std::byte> out;
+    std::uint64_t prev_end = 0, prev_ord = 0;
+    codec::encode_hint_record_v5(out, 1, 30, 0, false, as_bytes("abc"),
+                                 7, prev_end, prev_ord);
     for (std::size_t cut = 0; cut < out.size(); ++cut) {
-        std::uint64_t prev_end = 0;
-        auto rec = codec::decode_hint_record_v4(
-            std::span<const std::byte>(out.data(), cut), prev_end);
+        std::uint64_t d_end = 0, d_ord = 0;
+        auto rec = codec::decode_hint_record_v5(
+            std::span<const std::byte>(out.data(), cut), d_end, d_ord);
         ASSERT_FALSE(rec.has_value()) << "cut=" << cut;
         EXPECT_EQ(rec.error(), codec::DecodeError::kBufferTooShort);
     }

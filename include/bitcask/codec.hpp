@@ -46,12 +46,13 @@ struct DataRecordView {
     std::size_t total_size;  // kHeaderSize + key.size() + value.size()
 };
 
-// 解码后的 hint record。consumed 是消耗的字节数（== kHintRecordSize + key），
-// caller 用它推进 buf 指针读下一条。
+// 解码后的 hint record。consumed 是消耗的字节数，caller 用它推进 buf
+// 指针读下一条。
 struct HintRecord {
-    std::uint64_t tstamp;   // v4 起盘上 u64；v2 旧格式解码时零扩展
+    std::uint64_t tstamp;   // 盘上 u64（v4 起）
     std::uint32_t total_sz;
-    std::uint64_t offset;   // 63-bit；最高位被 tombstone 标志占用
+    std::uint64_t offset;
+    std::uint64_t ord = 0;  // S33 v5 起盘上有（vbyte delta）；见 format.hpp
     bool tombstone;
     std::span<const std::byte> key;
     std::size_t consumed;
@@ -150,45 +151,25 @@ decode_doc_value(std::span<const std::byte> buf);
 // hint 文件 record
 // ---------------------------------------------------------------------------
 
-// 编码一条 hint record。caller 必须保证 offset <= kMaxOffsetV2
-// （63-bit 上限）；超过的话 tombstone bit 会被覆盖污染。
-// 线程安全: 是（纯函数）；不需任何锁。
-std::size_t encode_hint_record(std::vector<std::byte>& out,
-                               std::uint32_t tstamp,
-                               std::uint32_t total_sz,
-                               std::uint64_t offset,
-                               bool tombstone,
-                               std::span<const std::byte> key);
-
-// 编码 hint 文件末尾的 EOF sentinel。布局复用普通 record 但语义特殊：
-//   Tstamp=0, KeySz=0, TotalSz=running_crc, Tomb=0, Offset=kMaxOffsetV2
-// 解析方靠 (KeySz==0 && Offset==kMaxOffsetV2) 识别 sentinel；TotalSz
-// 被借来放整文件的 running CRC，给 has_valid_hintfile 用。
-// 线程安全: 是（纯函数）；不需任何锁。
-std::size_t encode_hint_eof(std::vector<std::byte>& out, std::uint32_t running_crc);
-
-// 从 buf 头部读一条 hint record。EOF sentinel 也作为 HintRecord 返回，
-// 调用方用 is_hint_eof() 判断（key 为空 + offset==kMaxOffsetV2）。
-// 线程安全: 是（纯函数）；不需任何锁。
+// ---- hint v5（S33 flag-day：v4 变长编码 + vbyte ord_delta；文件级布局见
+// format.hpp）。v2 定宽 18B 与 v4 编解码已随 flag-day 整体退役——库内不再
+// 有任何旧格式 hint 读端（BCH4 在 HintFile 层按校验失败退 fold(data)）。----
+// 编码一条 v5 记录（append 进 out）。prev_end/prev_ord 是差分串联状态，
+// 传入并在返回时更新（prev_end ← offset+total_sz，prev_ord ← ord）。
+// 线程安全: 是（纯函数，串联状态由 caller 持有）；不需任何锁。
+void encode_hint_record_v5(std::vector<std::byte>& out,
+                           std::uint64_t tstamp,
+                           std::uint32_t total_sz,
+                           std::uint64_t offset, bool tombstone,
+                           std::span<const std::byte> key,
+                           std::uint64_t ord,
+                           std::uint64_t& prev_end,
+                           std::uint64_t& prev_ord);
+// 从 buf 头部解一条 v5 记录；prev_end/prev_ord 传入并在成功时更新。字节
+// 不足返回 kBufferTooShort（流式 caller 据此 refill 重试）。
 [[nodiscard]] std::expected<HintRecord, DecodeError>
-decode_hint_record(std::span<const std::byte> buf);
-
-// 线程安全: 是；不需任何锁。
-[[nodiscard]] bool is_hint_eof(const HintRecord& r) noexcept;
-
-// ---- hint v3（S23-A1，变长编码；文件级布局见 format.hpp）----
-// 编码一条 v3 记录（append 进 out），返回新的 prev_end（= offset+total_sz），
-// caller 串联传给下一条。
-std::uint64_t encode_hint_record_v4(std::vector<std::byte>& out,
-                                    std::uint64_t tstamp,
-                                    std::uint32_t total_sz,
-                                    std::uint64_t offset, bool tombstone,
-                                    std::span<const std::byte> key,
-                                    std::uint64_t prev_end);
-// 从 buf 头部解一条 v3 记录；prev_end 传入并在成功时更新。字节不足返回
-// kBufferTooShort（流式 caller 据此 refill 重试）。
-[[nodiscard]] std::expected<HintRecord, DecodeError>
-decode_hint_record_v4(std::span<const std::byte> buf, std::uint64_t& prev_end);
+decode_hint_record_v5(std::span<const std::byte> buf,
+                      std::uint64_t& prev_end, std::uint64_t& prev_ord);
 
 // ---------------------------------------------------------------------------
 // CRC32 (zlib / IEEE 802.3 多项式，跟 erlang:crc32/1 一致)

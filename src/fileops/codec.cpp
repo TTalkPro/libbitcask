@@ -336,114 +336,41 @@ std::vector<float> doc_vector_f32(const DocValueView& v) {
 }
 
 // ---------------------------------------------------------------------------
-// hint record 编解码
+// hint record 编解码（v5 唯一；v2 定宽/v4 无 ord 编解码已随 S33 flag-day
+// 删除——库内无旧格式读端，纪元门禁在 bitcask.meta v5）
 // ---------------------------------------------------------------------------
 
-// 编码一条 hint record。offset 必须 <= 2^63-1（最高位是 tombstone bit）。
-// 这两个 assert 失败都是 caller bug——data file 的 offset 不可能超过 8 EiB，
-// 但还是兜底校验，以防上层算 offset 时溢出。
-std::size_t encode_hint_record(std::vector<std::byte>& out,
-                               std::uint32_t tstamp,
-                               std::uint32_t total_sz,
-                               std::uint64_t offset,
-                               bool tombstone,
-                               std::span<const std::byte> key) {
-    assert(offset <= format::kMaxOffsetV2);
+void encode_hint_record_v5(std::vector<std::byte>& out,
+                           std::uint64_t tstamp,
+                           std::uint32_t total_sz,
+                           std::uint64_t offset, bool tombstone,
+                           std::span<const std::byte> key,
+                           std::uint64_t ord,
+                           std::uint64_t& prev_end,
+                           std::uint64_t& prev_ord) {
     assert(key.size() <= format::kMaxKeySize);
-
-    const std::size_t total = format::kHintRecordSize + key.size();
-    const std::size_t base = out.size();
-    out.resize(base + total);
-    std::byte* p = out.data() + base;
-
-    le_store_u32(p + 0, tstamp);
-    le_store_u16(p + 4, static_cast<std::uint16_t>(key.size()));
-    le_store_u32(p + 6, total_sz);
-
-    // 把 tombstone 标志压到 offset 的最高位——节省 1 字节，跟 legacy 完全
-    // 一致的 wire format。读取时反向 mask。
-    const std::uint64_t packed =
-        (tombstone ? format::kTombMaskV2 : 0ull) | offset;
-    le_store_u64(p + 10, packed);
-
-    if (!key.empty()) std::memcpy(p + format::kHintRecordSize, key.data(), key.size());
-    return total;
-}
-
-std::size_t encode_hint_eof(std::vector<std::byte>& out, std::uint32_t running_crc) {
-    // 布局跟普通 hint record 一致，但语义被特殊化：
-    //   Tstamp=0, KeySz=0, TotalSz 借用来放整文件 running CRC,
-    //   Tomb=0, Offset=kMaxOffsetV2, 无 key payload。
-    // 解码方靠 (KeySz==0 && Offset==kMaxOffsetV2) 识别 sentinel。
-    return encode_hint_record(out,
-                              /*tstamp*/ 0,
-                              /*total_sz*/ running_crc,
-                              /*offset*/ format::kMaxOffsetV2,
-                              /*tombstone*/ false,
-                              {});
-}
-
-// 从 buf 头部解一条 hint record；CRC 不在这里校验（hint 文件用 trailer
-// CRC 一次性兜底，不是逐条 CRC）。EOF sentinel 也作为 HintRecord 返回——
-// caller 用 is_hint_eof() 判断。
-std::expected<HintRecord, DecodeError>
-decode_hint_record(std::span<const std::byte> buf) {
-    if (buf.size() < format::kHintRecordSize) {
-        return std::unexpected(DecodeError::kBufferTooShort);
-    }
-    const std::uint32_t tstamp   = le_load_u32(buf.data() + 0);
-    const std::uint16_t key_sz   = le_load_u16(buf.data() + 4);
-    const std::uint32_t total_sz = le_load_u32(buf.data() + 6);
-    const std::uint64_t packed   = le_load_u64(buf.data() + 10);
-
-    // 反向解 packed：最高位 bit = tombstone，剩余 63 位 = offset。
-    const bool tomb = (packed & format::kTombMaskV2) != 0;
-    const std::uint64_t offset = packed & format::kMaxOffsetV2;
-
-    if (buf.size() < format::kHintRecordSize + key_sz) {
-        return std::unexpected(DecodeError::kBufferTooShort);
-    }
-    return HintRecord{
-        .tstamp = tstamp,
-        .total_sz = total_sz,
-        .offset = offset,
-        .tombstone = tomb,
-        .key = buf.subspan(format::kHintRecordSize, key_sz),
-        .consumed = format::kHintRecordSize + key_sz,
-    };
-}
-
-bool is_hint_eof(const HintRecord& r) noexcept {
-    return r.tstamp == 0 && r.key.empty() && r.offset == format::kMaxOffsetV2;
-}
-
-// ---- hint v3（S23-A1）----
-
-std::uint64_t encode_hint_record_v4(std::vector<std::byte>& out,
-                                    std::uint64_t tstamp,
-                                    std::uint32_t total_sz,
-                                    std::uint64_t offset, bool tombstone,
-                                    std::span<const std::byte> key,
-                                    std::uint64_t prev_end) {
-    assert(key.size() <= format::kMaxKeySize);
-    // gap 经 u64 二补数回绕：decode 侧 prev_end + gap ≡ offset (mod 2^64)，
-    // 正确性不依赖 offset ≥ prev_end；正常连续追加 gap==0 → 1 字节。
+    // gap/ord_delta 均经 u64 二补数回绕：decode 侧 prev + delta ≡ 真值
+    // (mod 2^64)，正确性不依赖单调性；正常 append 序 gap==0（1 字节）、
+    // ord 递增（delta 小 → 1-2 字节）。
     vbyte_encode(offset - prev_end, out);
     vbyte_encode(total_sz, out);
     vbyte_encode((static_cast<std::uint64_t>(key.size()) << 1) |
                      (tombstone ? 1u : 0u),
                  out);
+    vbyte_encode(ord - prev_ord, out);  // v5：ord 差分
     const std::size_t base = out.size();
     out.resize(base + 8);
-    le_store_u64(out.data() + base, tstamp);  // v4：tstamp u64 LE
+    le_store_u64(out.data() + base, tstamp);
     if (!key.empty()) {
         out.insert(out.end(), key.begin(), key.end());
     }
-    return offset + total_sz;
+    prev_end = offset + total_sz;
+    prev_ord = ord;
 }
 
 std::expected<HintRecord, DecodeError>
-decode_hint_record_v4(std::span<const std::byte> buf, std::uint64_t& prev_end) {
+decode_hint_record_v5(std::span<const std::byte> buf,
+                      std::uint64_t& prev_end, std::uint64_t& prev_ord) {
     // 边界安全 vbyte（buf 可能只含半条记录，短读返回 kBufferTooShort）。
     std::size_t pos = 0;
     auto vb = [&](std::uint64_t& v) -> bool {
@@ -457,8 +384,8 @@ decode_hint_record_v4(std::span<const std::byte> buf, std::uint64_t& prev_end) {
             shift += 7;
         }
     };
-    std::uint64_t gap = 0, tsz = 0, kt = 0;
-    if (!vb(gap) || !vb(tsz) || !vb(kt)) {
+    std::uint64_t gap = 0, tsz = 0, kt = 0, od = 0;
+    if (!vb(gap) || !vb(tsz) || !vb(kt) || !vb(od)) {
         return std::unexpected(DecodeError::kBufferTooShort);
     }
     const std::uint64_t key_sz = kt >> 1;
@@ -468,18 +395,20 @@ decode_hint_record_v4(std::span<const std::byte> buf, std::uint64_t& prev_end) {
     if (buf.size() < pos + 8 + key_sz) {
         return std::unexpected(DecodeError::kBufferTooShort);
     }
-    const std::uint64_t tstamp = le_load_u64(buf.data() + pos);  // v4：u64 LE
+    const std::uint64_t tstamp = le_load_u64(buf.data() + pos);
     pos += 8;
     const std::uint64_t offset = prev_end + gap;  // 回绕还原
     HintRecord rec{
         .tstamp = tstamp,
         .total_sz = static_cast<std::uint32_t>(tsz),
         .offset = offset,
+        .ord = prev_ord + od,  // 回绕还原
         .tombstone = (kt & 1) != 0,
         .key = buf.subspan(pos, static_cast<std::size_t>(key_sz)),
         .consumed = pos + static_cast<std::size_t>(key_sz),
     };
     prev_end = offset + rec.total_sz;
+    prev_ord = rec.ord;
     return rec;
 }
 
