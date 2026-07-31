@@ -307,6 +307,7 @@ target_link_libraries(bitcask_merge
 add_library(bitcask_cask STATIC
     src/cask/cask.cpp
     src/cask/cask_iter.cpp     # S21-3 B1：CaskIter（fold 迭代器）拆分 TU
+    src/cask/cask_range_iter.cpp  # S33-5：OKI 有序 Range 迭代器
     src/cask/cask_search.cpp   # S21-3 B1：搜索门面拆分 TU
     src/cask/cask_recovery.cpp # S21-3 B1：恢复域拆分 TU
     src/cask/meta_file.cpp
