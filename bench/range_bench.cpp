@@ -116,6 +116,57 @@ BENCHMARK(BM_Cask_PrefixScan_Baseline)
     ->Unit(benchmark::kMillisecond);
 
 // -----------------------------------------------------------------------------
+// S33-5：OKI 有序 range 扫描——与上面的 O(全表) 基线同参数对比。
+// checkpoint() 先行使 OKI 有 run 可归并（写后未 flush 的行走 memdelta 路径
+// 同样正确，但基准锚定「已 flush」的稳态形态）。
+// -----------------------------------------------------------------------------
+static void BM_Cask_RangeScan_OKI(benchmark::State& state) {
+    const int total  = static_cast<int>(state.range(0));
+    const int groups = static_cast<int>(state.range(1));
+    TempDir td;
+    auto c = Cask::open(td.path(), rw_opts(), &test_registry());
+    if (!c) { state.SkipWithError("Cask::open failed"); return; }
+    auto& cask = **c;
+
+    const std::string value(64, 'v');
+    for (int i = 0; i < total; ++i) {
+        if (!cask.put(as_bytes(mk_key(i % groups, i)), as_bytes(value))) {
+            state.SkipWithError("populate put failed");
+            return;
+        }
+    }
+    if (!cask.checkpoint()) { state.SkipWithError("checkpoint failed"); return; }
+
+    const std::string lo = "g000:";
+    const std::string hi = "g000;";  // ':' + 1
+    std::uint64_t matched = 0;
+    for (auto _ : state) {
+        bitcask::RangeOptions ro;
+        ro.lo = as_bytes(lo);
+        ro.hi = as_bytes(hi);
+        auto it = cask.make_range_iter(ro);
+        if (!it) { state.SkipWithError("make_range_iter failed"); return; }
+        std::uint64_t n = 0;
+        while (true) {
+            auto e = (*it)->next();
+            if (!e) { state.SkipWithError("range next failed"); return; }
+            if (!e->has_value()) break;
+            ++n;
+        }
+        matched = n;
+        benchmark::DoNotOptimize(n);
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<std::int64_t>(matched));
+    state.SetLabel("matched=" + std::to_string(matched) + "/" +
+                   std::to_string(total));
+    cask.close();
+}
+BENCHMARK(BM_Cask_RangeScan_OKI)
+    ->Args({100000, 16})   // 与基线同参：命中 ~6250
+    ->Args({100000, 256})  // 命中 ~390——时间应随选择性线性下降（对照基线持平）
+    ->Unit(benchmark::kMillisecond);
+
+// -----------------------------------------------------------------------------
 // S33-1 内存估算探针锚点：填 Arg0 个 key 后跑一次 key_length_histogram()，
 // 把估算字节数写进 counter（本身也顺带量了探针的遍历耗时）。
 // -----------------------------------------------------------------------------
