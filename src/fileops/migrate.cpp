@@ -134,7 +134,8 @@ migrate_data_file(const fs::path& src_data, const fs::path& dst_dir,
 
         auto w = dst_data->write(type, tstamp, ord, key, value);
         if (!w) return std::unexpected("write record to " + dst_data_path);
-        auto h = dst_hint->write(tstamp, w->total_size, w->offset, tomb, key);
+        auto h = dst_hint->write(tstamp, w->total_size, w->offset, tomb, key,
+                                 ord);
         if (!h) return std::unexpected("write hint to " + dst_hint_path);
 
         ++st.records;
@@ -167,12 +168,12 @@ migrate_meta(const fs::path& src_dir, const fs::path& dst_dir,
     }
     if (ver != 1) return std::unexpected("unknown meta version");
 
-    // v1 → v4：version 改 4（data record 已按新 codec 重编码 = u64 tstamp
-    // 纪元）,VecDim u16 大端→小端,其余单字节照搬,偏移 14 放 CRC32
+    // v1 → v5：version 改 5（data record 已按当前 codec 重编码,hint 已是
+    // BCH5）,VecDim u16 大端→小端,其余单字节照搬,偏移 14 放 CRC32
     // (覆盖前 14 字节),与 write_meta 一致。
     std::byte out[18] = {};
     std::memcpy(out, "BCME", 4);
-    out[4] = static_cast<std::byte>(4);            // version 4（LE + CRC + u64 tstamp）
+    out[4] = static_cast<std::byte>(5);            // version 5（当前纪元）
     out[5] = b[5];                                 // mode
     out[6] = b[6];                                 // vec metric
     const std::uint16_t dim = be_u16(b + 7);       // 旧大端 → 主机
@@ -329,7 +330,8 @@ migrate_u32_data_file(const fs::path& src_data, const fs::path& dst_dir,
 
         auto w = dst_data->write(type, tstamp, ord, key, value);
         if (!w) return std::unexpected("write record to " + dst_data_path);
-        auto h = dst_hint->write(tstamp, w->total_size, w->offset, tomb, key);
+        auto h = dst_hint->write(tstamp, w->total_size, w->offset, tomb, key,
+                                 ord);
         if (!h) return std::unexpected("write hint to " + dst_hint_path);
 
         ++st.records;
@@ -365,7 +367,11 @@ migrate_u32_meta(const fs::path& src_dir, const fs::path& dst_dir,
     }
     if (ver == 4) {
         return std::unexpected(
-            "src meta already v4 (64-bit tstamp era); nothing to migrate");
+            "src meta is v4 (ord-less-hint era); run the hintord migration");
+    }
+    if (ver == 5) {
+        return std::unexpected(
+            "src meta already v5 (current era); nothing to migrate");
     }
     if (ver != 2 && ver != 3) return std::unexpected("unknown meta version");
     if (ver == 3) {
@@ -379,7 +385,7 @@ migrate_u32_meta(const fs::path& src_dir, const fs::path& dst_dir,
 
     std::byte out[18];
     std::memcpy(out, b, 18);
-    out[4] = static_cast<std::byte>(4);  // version 4（u64 tstamp 纪元）
+    out[4] = static_cast<std::byte>(5);  // version 5（当前纪元）
     le_store_u32(out + 14, codec::crc32(std::span<const std::byte>(out, 14)));
     if (auto r = write_all(dst_dir / "bitcask.meta",
                            std::span<const std::byte>(out, 18)); !r) {
@@ -387,6 +393,97 @@ migrate_u32_meta(const fs::path& src_dir, const fs::path& dst_dir,
     }
     st.meta_migrated = true;
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// u64 纪元（meta v4）→ 当前纪元（meta v5,hint BCH5）。S33 flag-day。
+// data 一字节不动：硬链接进 dst（跨设备退化为拷贝）;hint 从 data 重扫生成
+// （ord 在 record header 内现成,DataFile::fold 直接给出）;meta 最后写
+// = dst 的 commit point（中途 kill 的 dst 无 meta → 不会被误开;重跑幂等）。
+// ---------------------------------------------------------------------------
+
+std::expected<void, std::string>
+hintord_link_and_rehint(const fs::path& src_data, const fs::path& dst_dir,
+                        MigrateStats& st) {
+    const auto name = src_data.filename().string();
+    const auto dst_data_path = (dst_dir / name).string();
+    const auto dst_hint_path = fileops::mk_hint_filename(dst_data_path);
+
+    std::error_code ec;
+    fs::create_hard_link(src_data, dst_data_path, ec);
+    if (ec) {  // 跨设备等 → 退化为拷贝
+        ec.clear();
+        fs::copy_file(src_data, dst_data_path,
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            return std::unexpected("copy data " + dst_data_path + ": " +
+                                   ec.message());
+        }
+    }
+
+    auto df = fileops::DataFile::open(dst_data_path,
+                                      fileops::DataFile::Mode::kRead,
+                                      /*sync*/ false, /*mmap_enabled*/ false);
+    if (!df) return std::unexpected("open data " + dst_data_path);
+    auto dst_hint = fileops::HintFile::open(
+        dst_hint_path, fileops::HintFile::Mode::kCreate);
+    if (!dst_hint) return std::unexpected("create dst hint " + dst_hint_path);
+
+    // tolerate_crc_errors：单条损坏跳过（与恢复同策略）——被跳过的 record
+    // hint 里也不会有,fold(data) 恢复同样读不到它,语义一致。
+    std::string werr;
+    auto fr = df->fold(
+        [&](const codec::DataRecordView& view, std::uint64_t offset,
+            std::uint32_t total_size) {
+            if (!werr.empty()) return;
+            const bool tomb =
+                view.type == format::RecordType::kTombstone;
+            auto h = dst_hint->write(view.tstamp, total_size, offset, tomb,
+                                     view.key, view.ord);
+            if (!h) { werr = "write hint to " + dst_hint_path; return; }
+            ++st.records;
+            if (tomb) ++st.tombstones;
+        },
+        /*tolerate_crc_errors*/ true);
+    if (!fr) return std::unexpected("fold data " + dst_data_path);
+    if (!werr.empty()) return std::unexpected(werr);
+    if (auto r = dst_hint->finalize(); !r) {
+        return std::unexpected("finalize hint " + dst_hint_path);
+    }
+    ++st.data_files;
+    return {};
+}
+
+// 前置校验（迁移开工前跑,任何数据工作之前 fail-fast）：src meta 必须是
+// 带合法 CRC 的 v4。返回原 18 字节,commit 时改 version + 重算 CRC 用。
+std::expected<std::vector<std::byte>, std::string>
+hintord_check_meta(const fs::path& src_dir) {
+    auto bytes = read_all(src_dir / "bitcask.meta");
+    if (!bytes) return std::unexpected(bytes.error());
+    if (bytes->size() < 18) return std::unexpected("meta too short");
+    const std::byte* b = bytes->data();
+    if (std::memcmp(b, "BCME", 4) != 0) return std::unexpected("bad meta magic");
+    const auto ver = static_cast<std::uint8_t>(b[4]);
+    if (ver == 1) {
+        return std::unexpected(
+            "src meta is v1 (big-endian era); run the be2le migration first");
+    }
+    if (ver == 2 || ver == 3) {
+        return std::unexpected(
+            "src meta is v2/v3 (u32-tstamp era); run the tstamp64 migration");
+    }
+    if (ver == 5) {
+        return std::unexpected(
+            "src meta already v5 (current era); nothing to migrate");
+    }
+    if (ver != 4) return std::unexpected("unknown meta version");
+    // v4 带 CRC——迁移工具坚持 fail-fast,不把损坏配置带进新库。
+    const std::uint32_t stored = le_load_u32(b + 14);
+    const std::uint32_t crc = codec::crc32(std::span<const std::byte>(b, 14));
+    if (stored != crc) {
+        return std::unexpected("src bitcask.meta CRC mismatch (corrupt)");
+    }
+    return *std::move(bytes);
 }
 
 }  // namespace
@@ -453,6 +550,53 @@ migrate_u32_to_u64(std::string_view src_dir, std::string_view dst_dir) {
             }
         }
     }
+    return st;
+}
+
+std::expected<MigrateStats, std::string>
+migrate_hint_ord(std::string_view src_dir, std::string_view dst_dir) {
+    const fs::path src(src_dir);
+    const fs::path dst(dst_dir);
+    if (!fs::exists(src)) return std::unexpected("src dir does not exist");
+
+    // 前置校验先行（任何数据工作之前）：src 确为 v4 且 meta CRC 合法。
+    auto meta_bytes = hintord_check_meta(src);
+    if (!meta_bytes) return std::unexpected(meta_bytes.error());
+
+    std::error_code ec;
+    fs::create_directories(dst, ec);
+    if (ec) return std::unexpected("cannot create dst dir: " + ec.message());
+
+    MigrateStats st;
+    // field.schema 格式未变,原样拷贝。
+    if (fs::exists(src / "field.schema")) {
+        fs::copy_file(src / "field.schema", dst / "field.schema",
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            return std::unexpected("copy field.schema: " + ec.message());
+        }
+        st.field_schema_migrated = true;
+    }
+    // 逐 data 文件：硬链接 + 从 data 重扫生成 BCH5 hint。
+    // ckpt/seg/wal/旧 hint/锁不迁移（新库首开 fold 重建,与既有迁移器同策略）。
+    for (const auto& de : fs::directory_iterator(src)) {
+        const auto fname = de.path().filename().string();
+        if (fileops::parse_data_tstamp(fname).has_value()) {
+            if (auto r = hintord_link_and_rehint(de.path(), dst, st); !r) {
+                return std::unexpected(r.error());
+            }
+        }
+    }
+    // meta 最后写 = commit point（version 4→5,CRC 重算,其余 14 字节照搬）。
+    std::byte out[18];
+    std::memcpy(out, meta_bytes->data(), 18);
+    out[4] = static_cast<std::byte>(5);
+    le_store_u32(out + 14, codec::crc32(std::span<const std::byte>(out, 14)));
+    if (auto r = write_all(dst / "bitcask.meta",
+                           std::span<const std::byte>(out, 18)); !r) {
+        return std::unexpected(r.error());
+    }
+    st.meta_migrated = true;
     return st;
 }
 
