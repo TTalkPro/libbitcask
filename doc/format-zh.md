@@ -64,7 +64,7 @@ Hint 文件与数据文件一一对应；hint 是可重建的派生索引，崩�
 
 | 文件 | 用途 |
 |------|------|
-| `bitcask.meta` | 库配置 v4：mode、向量 metric/dim、CRC32 校验（v4 = u64 tstamp 纪元门禁） |
+| `bitcask.meta` | 库配置 v5：mode、向量 metric/dim/engine、CRC32 校验（v5 = hint BCH5 纪元门禁，S33 flag-day） |
 | `bitcask.write.lock` | 单写者互斥（cask open 拿；merger 不抢） |
 | `bitcask.merge.lock` | merger 互斥（与 writer 独立） |
 | `field.schema` | 字段名 ↔ field id 注册表（schema interning） |
@@ -143,10 +143,9 @@ active 文件另由 cask 独占持有（`Cask::active_data_`），不参与扫�
 | `kCrcOffset` / `kTypeOffset` / `kTstampOffset` / `kOrdOffset` / `kKeySzOffset` / `kValueSzOffset` | header 内各字段的字节偏移 |
 | `RecordType::kDoc` / `kTombstone` | record type u8 取值 |
 | `kMaxKeySize` / `kMaxValueSize` | Key / Value 字段上限 |
-| `kHintRecordSize` | hint v2 单条 record 固定字节数 |
-| `kHintHeaderV4` / `kHintTrailerV4` | hint v4 文件头/trailer 字节数 |
-| `kHintMagicV4` / `kHintTrailerMagicV4` | hint v4 头部/trailer magic |
-| `kMaxOffsetV2` / `kTombMaskV2` | hint offset u64 的最高位墓碑标记 |
+| `kHintHeader` / `kHintTrailer` | hint 文件头/trailer 字节数 |
+| `kHintMagicV5` / `kHintTrailerMagic` | hint v5（"BCH5"）头部/trailer magic；v5 记录含 vbyte ord 差分（S33 flag-day，布局详注见 format.hpp） |
+| `kHintMagicV4` | 旧纪元（"BCH4"）识别用——库内无读端，仅拒收/工具 |
 | `kDocValueVersion` | DocValue 二进制格式版本（当前 = 4：ExpiryAt u64） |
 | `kDocValueHeaderSize` | DocValue 头字节数（Ver + Flags = 2） |
 | `kFlagHasVector` / `kFlagHasText` / `kFlagHasMeta` / `kFlagVecQuantized` / `kFlagHasFields` / `kFlagHasExpiry` | DocValue Flags 位 |
@@ -161,7 +160,7 @@ Hint CRC32 与 data CRC32 用同一多项式（zlib/IEEE 802.3），由 `bitcask
 | 文件族 | 用到的 format 常量 |
 |--------|-------------------|
 | `<tstamp>.bitcask.data` | `kHeaderSize`、`kMaxKeySize`、`kMaxValueSize`、`RecordType::*` |
-| `<tstamp>.bitcask.hint` | `kHintRecordSize` (v2) / `kHintHeaderV4` + `kHintTrailerV4` (v4) / `kMaxOffsetV2`、`kTombMaskV2` |
+| `<tstamp>.bitcask.hint` | `kHintMagicV5`、`kHintTrailerMagic`、`kHintHeader` + `kHintTrailer`（仅 v5；旧纪元无读端） |
 | DocValue（嵌在 data record value 段） | `kDocValueVersion`、`kDocValueHeaderSize`、`kFlag*`、`kQuantizedVersion` |
 | `bitcask.meta` | 用自己的 `kMetaMagicSize` 等（见 §三） |
 | `field.schema` | 用自己的 `kMagic` / `kVersion` / `kHeaderSize`（见 §八） |
@@ -183,7 +182,7 @@ Hint CRC32 与 data CRC32 用同一多项式（zlib/IEEE 802.3），由 `bitcask
 查表实现——两者输出 bit-identical，保证现有 data file / hint file 的 on-disk
 CRC 与历史数据兼容。
 
-## 三、`bitcask.meta` v3
+## 三、`bitcask.meta` v5
 
 目录级配置文件，定位库运行模式与向量配置。本节对应头 `bitcask/meta_file.hpp`
 与 `src/cask/meta_file.cpp` 的 `kMetaFileSize = 18`。
@@ -193,13 +192,14 @@ CRC 与历史数据兼容。
 ```
 偏移 字节  字段           编码         含义
  0   4    magic           ASCII       4 字节 "BCME"（无 null 终止符）
- 4   1    Version         u8          = 3（kMetaVersion）
+ 4   1    Version         u8          = 5（kMetaVersion）
  5   1    Mode            u8          0 = kKV / 1 = kIndex
  6   1    VecMetric       u8          见下表
  7   2    VecDim          u16 LE      向量维度，0 = 无向量
  9   1    VecQuant        u8          0/1，向量落盘 int8 量化
 10   1    VecInmemInt8    u8          0/1，HNSW int8-only 内存
-11   3    Reserved        全 0        保留位
+11   1    VecEngine       u8          0=HNSW / 1=IvfRq / 2=Diskann（S32-M0）
+12   2    Reserved        全 0        保留位
 14   4    CRC32           u32 LE      覆盖前 14 字节（不含 CRC 自身）
 ─────────────────────────────────────────
      18 字节合计（kMetaFileSize）
@@ -212,7 +212,7 @@ CRC 与历史数据兼容。
 - `kMetaVecMetricOffset = 6` / `kMetaVecDimOffset = 7` / `kMetaVecQuantOffset = 9`
   / `kMetaVecInmemInt8Offset = 10`
 - `kMetaReservedSize = 12` / `kMetaCrcOffset = 14` / `kMetaCrcCoverLen = 14`
-- `kMetaVersion = 3`（写端恒写 3）
+- `kMetaVersion = 5`（写端恒写 5）
 
 `VecMetric` 枚举（`namespace bitcask::meta::VectorMetric`）：
 
@@ -235,12 +235,13 @@ config"}`。
 |-----------|------|
 | 1 | 大端 legacy 格式 → 干净拒绝（错误码 `0`, message 提示重建） |
 | 2/3 | u32-tstamp 纪元（record 布局不兼容）→ 干净拒绝，message 提示重建 |
-| 4 | 校验 CRC32（前 14 字节覆盖）→ 不匹配返回「CRC mismatch (corrupt)」 |
+| 4 | ord-less-hint 纪元（data 布局相同，仅 hint 无 ord）→ 干净拒绝，message 提示 `bitcask_migrate hintord`（离线迁移即可，无需重建） |
+| 5 | 校验 CRC32（前 14 字节覆盖）→ 不匹配返回「CRC mismatch (corrupt)」 |
 
 字段校验顺序：
 
 1. magic（4 字节 `BCME`）
-2. Ver == 4，拒绝 1/2/3（u32 纪元）与未知版本
+2. Ver == 5，拒绝 1/2/3（u32 纪元）/4（ord-less-hint 纪元）与未知版本
 3. CRC32 必须匹配 `kMetaCrcCoverLen = 14`
 4. Mode ∈ {0, 1}，未知返回 `unknown mode`
 5. VecMetric ∈ {0, 1, 2, 3}，未知返回 `unknown vector metric`

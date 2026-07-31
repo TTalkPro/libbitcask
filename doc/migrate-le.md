@@ -1,5 +1,12 @@
 # 大端 → 小端目录迁移（`migrate_le`）
 
+> **统一入口提示**：当前迁移工具是 `bitcask_migrate`（`tools/bitcask_migrate.cpp`），
+> 三个子命令覆盖全部纪元：`be2le`（v1 大端，本文档主题）、`tstamp64`
+> （v2/v3 u32 时间戳纪元）、`hintord`（v4 → v5：S33 flag-day，data 文件
+> 硬链接零改动，仅重生成含 ord 的 BCH5 hint + meta，见
+> [`ordered-key-index-design-zh.md`](ordered-key-index-design-zh.md) §7）。
+> `detect <dir>` 自动报告纪元并提示该跑哪个。当前纪元 = **meta v5**。
+
 把**旧的大端（big-endian）bitcask 目录**离线迁移成**新的小端（little-endian）
 格式**的命令行工具。底层 API 是 `bitcask::migrate::migrate_be_to_le`（声明于 [`include/bitcask/migrate.hpp`](../include/bitcask/migrate.hpp)，实现于 [`src/fileops/migrate.cpp`](../src/fileops/migrate.cpp)）；本工具是这个 API 的 CLI 包装。
 
