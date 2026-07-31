@@ -15,9 +15,11 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>   // S33 hintord 迁移测试:data 文件字节比对
 #include <map>
 #include <random>
 #include <set>
+#include <sstream>   // S33 hintord 迁移测试
 #include <thread>
 #include <vector>
 
@@ -714,6 +716,221 @@ TEST_F(CaskDocValueTest, MigrateU32EraDirOpensAndReads) {
     EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(g->value.data()),
                                g->value.size()), "hi");
     (*c)->close();
+}
+
+// S33 flag-day：meta v4（ord-less-hint 纪元）必须被干净拒开，且错误信息
+// 指向 hintord 迁移——绝不静默按 v5 打开（BCH4 hint 会被逐文件当校验失败,
+// 掩盖纪元错位）。
+TEST_F(CaskDocValueTest, MetaV4CleanlyRejectedWithHintordHint) {
+    namespace fs = std::filesystem;
+    // 先用当前代码建库（meta v5），再把 version 字节改回 4 并重算 CRC，
+    // 模拟一个 v4 纪元目录的门禁形态。
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        auto bytes = [](std::string_view s2) {
+            return std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+        };
+        ASSERT_TRUE((*c)->put(bytes("k"), bytes("v"), 1000));
+        (*c)->close();
+    }
+    {
+        const auto mp = tmpdir_ / "bitcask.meta";
+        std::FILE* f = std::fopen(mp.c_str(), "rb+");
+        ASSERT_NE(f, nullptr);
+        unsigned char hdr[18];
+        ASSERT_EQ(std::fread(hdr, 1, 18, f), 18u);
+        hdr[4] = 4;
+        const std::uint32_t crc = bitcask::codec::crc32(
+            std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(hdr), 14));
+        for (int i = 0; i < 4; ++i) hdr[14 + i] = (crc >> (8 * i)) & 0xFF;
+        std::fseek(f, 0, SEEK_SET);
+        ASSERT_EQ(std::fwrite(hdr, 1, 18, f), 18u);
+        std::fclose(f);
+    }
+    CaskOptions ro;
+    ro.read_write = false;
+    auto c = Cask::open(tmpdir_.string(), ro, &test_registry());
+    ASSERT_FALSE(c) << "meta v4 必须拒开";
+    EXPECT_NE(c.error().detail.find("hintord"), std::string::npos)
+        << "拒开信息必须指向 hintord 迁移，实际：" << c.error().detail;
+}
+
+// S33：migrate_hint_ord 集成——模拟 v4 纪元目录（当前代码建库 → meta 改
+// v4 → 删 hint/派生缓存），迁移后 dst 过 v5 门禁、数据可读、hint 为合法
+// BCH5、data 文件内容零改动。重跑（删 dst）幂等。
+TEST_F(CaskDocValueTest, MigrateHintOrdV4EraDirOpensAndReads) {
+    namespace fs = std::filesystem;
+    const auto src = tmpdir_ / "v4src";
+    const auto dst = tmpdir_ / "v5dst";
+    fs::create_directories(src);
+    auto bytes = [](std::string_view s2) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+    };
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        opts.max_file_size = 512;  // 滚出多个 sealed 文件
+        auto c = Cask::open(src.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 20; ++i) {
+            ASSERT_TRUE((*c)->put(bytes("mk" + std::to_string(i)),
+                                  bytes("mv" + std::to_string(i)), 1000));
+        }
+        ASSERT_TRUE((*c)->remove(bytes("mk3"), 2000));
+        (*c)->close();
+    }
+    // 改 meta v4 + 删 hint 与派生缓存（v4 纪元目录的 hint 是 BCH4——迁移
+    // 从不读 src hint，删除即等价）。
+    {
+        const auto mp = src / "bitcask.meta";
+        std::FILE* f = std::fopen(mp.c_str(), "rb+");
+        ASSERT_NE(f, nullptr);
+        unsigned char hdr[18];
+        ASSERT_EQ(std::fread(hdr, 1, 18, f), 18u);
+        hdr[4] = 4;
+        const std::uint32_t crc = bitcask::codec::crc32(
+            std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(hdr), 14));
+        for (int i = 0; i < 4; ++i) hdr[14 + i] = (crc >> (8 * i)) & 0xFF;
+        std::fseek(f, 0, SEEK_SET);
+        ASSERT_EQ(std::fwrite(hdr, 1, 18, f), 18u);
+        std::fclose(f);
+        for (const auto& de : fs::directory_iterator(src)) {
+            const auto name = de.path().filename().string();
+            if (name.ends_with(".bitcask.hint") || name == "kv.keydir.ckpt") {
+                fs::remove(de.path());
+            }
+        }
+    }
+    auto mig = bitcask::migrate::migrate_hint_ord(src.string(), dst.string());
+    ASSERT_TRUE(mig) << (mig ? "" : mig.error());
+    EXPECT_GE(mig->data_files, 2u);
+    EXPECT_EQ(mig->records, 21u);  // 20 put + 1 墓碑
+    EXPECT_EQ(mig->tombstones, 1u);
+    EXPECT_TRUE(mig->meta_migrated);
+
+    // data 文件内容零改动（逐文件字节比对）。
+    for (const auto& de : fs::directory_iterator(src)) {
+        const auto name = de.path().filename().string();
+        if (!name.ends_with(".bitcask.data")) continue;
+        std::ifstream a(de.path(), std::ios::binary);
+        std::ifstream b(dst / name, std::ios::binary);
+        ASSERT_TRUE(a && b) << name;
+        std::stringstream sa, sb;
+        sa << a.rdbuf(); sb << b.rdbuf();
+        EXPECT_EQ(sa.str(), sb.str()) << name << " 内容必须零改动";
+    }
+
+    // dst 过 v5 门禁并读回；被删 key 不复活。
+    CaskOptions ro;
+    ro.read_write = false;
+    auto c = Cask::open(dst.string(), ro, &test_registry());
+    ASSERT_TRUE(c) << "迁移产物必须能过 meta v5 门禁并完成恢复";
+    for (int i = 0; i < 20; ++i) {
+        auto g = (*c)->get_owned(bytes("mk" + std::to_string(i)));
+        if (i == 3) {
+            EXPECT_FALSE(g) << "墓碑 key 不得复活";
+        } else {
+            ASSERT_TRUE(g) << "mk" << i;
+            EXPECT_EQ(std::string_view(
+                          reinterpret_cast<const char*>(g->value.data()),
+                          g->value.size()),
+                      "mv" + std::to_string(i));
+        }
+    }
+    (*c)->close();
+
+    // 幂等：删 dst 重跑结果一致。
+    fs::remove_all(dst);
+    auto mig2 = bitcask::migrate::migrate_hint_ord(src.string(), dst.string());
+    ASSERT_TRUE(mig2);
+    EXPECT_EQ(mig2->records, mig->records);
+    // 已是 v5 的目录拒绝再迁。
+    auto mig3 = bitcask::migrate::migrate_hint_ord(dst.string(),
+                                                   (tmpdir_ / "x").string());
+    ASSERT_FALSE(mig3);
+    EXPECT_NE(mig3.error().find("already v5"), std::string::npos);
+}
+
+// S33 验收：hint 快路径恢复与 fold(data) 恢复**逐 key ord 等价**（含 merge
+// 后的 hint）。v4 时代 hint 路径 ord 恒 0，flag-day 后两路必须完全一致，
+// 否则 OKI tail 重放的水位语义不成立。
+TEST_F(CaskDocValueTest, HintAndDataFoldRecoveryOrdEquivalent) {
+    namespace fs = std::filesystem;
+    auto bytes = [](std::string_view s2) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+    };
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        opts.max_file_size = 512;  // 多 sealed 文件 + 墓碑 + merge
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 30; ++i) {
+            ASSERT_TRUE((*c)->put(bytes("eq" + std::to_string(i)),
+                                  bytes("v" + std::to_string(i)), 1000));
+        }
+        for (int i = 0; i < 5; ++i) {
+            ASSERT_TRUE((*c)->remove(bytes("eq" + std::to_string(i)), 2000));
+        }
+        // 覆盖写一部分（制造死记录，给 merge 留活干）。
+        for (int i = 10; i < 20; ++i) {
+            ASSERT_TRUE((*c)->put(bytes("eq" + std::to_string(i)),
+                                  bytes("w" + std::to_string(i)), 3000));
+        }
+        ASSERT_TRUE((*c)->merge());  // merge 输出 hint 亦为 BCH5（带 ord）
+        (*c)->close();
+    }
+
+    auto collect = [&](const char* what) {
+        std::map<std::string, std::uint64_t> ords;
+        CaskOptions ro;
+        ro.read_write = false;
+        auto c = Cask::open(tmpdir_.string(), ro, &test_registry());
+        EXPECT_TRUE(c) << what;
+        if (!c) return std::pair{ords, std::uint64_t{0}};
+        auto it = (*c)->make_iter();
+        EXPECT_TRUE(it->start());
+        while (true) {
+            auto e = it->next();
+            EXPECT_TRUE(e) << what;
+            if (!e || !e->has_value()) break;
+            ords.emplace(std::string(reinterpret_cast<const char*>(
+                                         (*e)->key.data()),
+                                     (*e)->key.size()),
+                         (*e)->ord);
+        }
+        it->release();
+        const std::uint64_t next_ord = (*c)->keydir().peek_next_ord();
+        (*c)->close();
+        return std::pair{ords, next_ord};
+    };
+
+    // 路径 A：hint 快路径（删 keydir 快照强制走 hint；hint 全部 sealed 且
+    // 已 finalize）。
+    fs::remove(tmpdir_ / "kv.keydir.ckpt");
+    auto [ords_hint, next_hint] = collect("hint path");
+    ASSERT_FALSE(ords_hint.empty());
+
+    // 路径 B：fold(data)（hint 与快照全删）。
+    fs::remove(tmpdir_ / "kv.keydir.ckpt");
+    for (const auto& de : fs::directory_iterator(tmpdir_)) {
+        if (de.path().filename().string().ends_with(".bitcask.hint")) {
+            fs::remove(de.path());
+        }
+    }
+    auto [ords_data, next_data] = collect("data fold path");
+
+    EXPECT_EQ(ords_hint, ords_data)
+        << "hint 快路径与 fold(data) 恢复的逐 key ord 必须完全一致";
+    EXPECT_EQ(next_hint, next_data) << "next_ord 水位必须一致";
 }
 
 // S13-D6：备份——热拷贝到新目录，备份目录可独立 open；原库备份后继续可写。
