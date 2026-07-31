@@ -1404,24 +1404,29 @@ Cask::get(std::span<const std::byte> key) {
     // 持 df 的 shared_ptr 锚定映射,view 生命内映射不撤(即便并发 merge unlink)。
     if (df->mmapped()) {
         auto rv = df->read_mmap(entry->offset, entry->total_sz);
-        if (!rv) {
-            switch (rv.error().kind) {
-                case fileops::DataFileError::kBadCrc:
-                    return std::unexpected(err(CaskError::kBadCrc));
-                default:
-                    return std::unexpected(err(CaskError::kIo));
+        if (rv) {
+            if (rv->type == format::RecordType::kTombstone) {
+                return std::unexpected(err(CaskError::kNotFound));
             }
+            GetResultView view(std::move(df), rv->value, rv->type,
+                               rv->tstamp, rv->ord);
+            // S13-D5：per-key TTL——过期视作不存在（空间留给 merge 回收）。
+            if (view.expiry_at != 0 && view.expiry_at <= now_sec_default()) {
+                return std::unexpected(err(CaskError::kNotFound));
+            }
+            return view;
         }
-        if (rv->type == format::RecordType::kTombstone) {
-            return std::unexpected(err(CaskError::kNotFound));
+        if (rv.error().kind == fileops::DataFileError::kBadCrc) {
+            return std::unexpected(err(CaskError::kBadCrc));
         }
-        GetResultView view(std::move(df), rv->value, rv->type,
-                           rv->tstamp, rv->ord);
-        // S13-D5：per-key TTL——过期视作不存在（空间留给 merge 回收）。
-        if (view.expiry_at != 0 && view.expiry_at <= now_sec_default()) {
-            return std::unexpected(err(CaskError::kNotFound));
+        if (rv.error().kind != fileops::DataFileError::kShortRead) {
+            return std::unexpected(err(CaskError::kIo));
         }
-        return view;
+        // S33-5：kShortRead = 条目落在映射窗口之外。S30 的前提是「只映射
+        // sealed 文件」，但 read_file 无从判定封口——merge 输出在分批 CAS
+        // （S13 kApplyBatch/逐输入文件 apply）期间仍在增长，读者以旧尺寸
+        // mmap 后，后续批次的条目即越界。fd 保留未关（S30 既定），**跌落
+        // pread** 读窗口外记录——不报错、不重查（条目本身有效）。
     }
 
     auto rec = df->read(entry->offset, entry->total_sz);

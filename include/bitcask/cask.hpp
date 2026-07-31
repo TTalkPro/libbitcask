@@ -49,6 +49,7 @@
 #include "bitcask/docmap_ckpt.hpp"    // S18-2:docmap 持久化归宿主
 #include "bitcask/index_manifest.hpp"  // S17-2:per-component commit
 #include "bitcask/keydir.hpp"
+#include "bitcask/oki_state.hpp"  // S33-5：CaskRangeIter 的 ReadView/Cursor
 #include "bitcask/merge_policy.hpp"
 #include "bitcask/merger.hpp"
 #include "bitcask/meta_file.hpp"
@@ -384,6 +385,50 @@ private:
     std::string key_prefix_;  // S13-D4：空 = 不过滤
     std::unordered_map<std::uint32_t,
                        std::unique_ptr<fileops::DataFile>> pinned_files_;
+};
+
+// --- CaskRangeIter（S33-5：OKI 有序 Range 迭代器）--------------------------
+//
+// 按 key 字典序遍历 [lo, hi)：k 路归并 OKI runs + memdelta（同 key max-ord
+// 胜、墓碑抵消）→ **逐 key 回查哈希 keydir**（权威活性）→ 现有 get 路径
+// 取值。OKI 行允许陈旧——死 key 被回查过滤，merge 搬迁与本迭代器零交互
+// （设计 doc/ordered-key-index-design-zh.md §2.2/§4）。
+//
+// 一致性：**per-key 弱一致**（与 parallel_scan 同档）——迭代期间的并发写
+// 可能部分可见，不是 CaskIter 的 fold 快照语义；需要快照请先 CaskIter
+// 冻结。生命周期契约同 CaskIter：不可跨线程共享；须在 Cask::close 前
+// 用完（内部 pin KeyDir，但取值经 Cask 读路径）。
+struct RangeOptions {
+    std::span<const std::byte> lo{};  // inclusive；空 = 从头
+    std::span<const std::byte> hi{};  // exclusive；空 = 到尾
+};
+
+class CaskRangeIter {
+public:
+    struct Entry {
+        std::vector<std::byte> key;
+        std::vector<std::byte> value;   // DocValue text 段（纯 KV 即 value）
+        std::uint64_t tstamp = 0;
+        std::uint64_t ord = 0;          // keydir 权威 ord（非 OKI 行 ord）
+    };
+
+    // 下一条：有 → Entry；到尾（或越过 hi）→ nullopt；错误 → unexpected。
+    [[nodiscard]] std::expected<std::optional<Entry>, CaskFault> next();
+
+private:
+    friend class Cask;
+    CaskRangeIter() = default;
+
+    Cask* cask_ = nullptr;
+    std::shared_ptr<keydir::KeyDir> keydir_pin_;
+    oki::OkiState::ReadView view_;
+    std::vector<oki::OkiRunReader::Cursor> cursors_;
+    // 各 run 游标的当前头（nullopt = 该源已排空）。
+    std::vector<std::optional<oki::OkiRunReader::Entry>> heads_;
+    std::size_t delta_pos_ = 0;
+    std::string hi_;
+    bool has_hi_ = false;
+    bool done_ = false;
 };
 
 // --- Cask ------------------------------------------------------------------
@@ -746,6 +791,12 @@ public:
     [[nodiscard]] std::unique_ptr<CaskIter> make_iter() {
         return std::make_unique<CaskIter>(this);
     }
+
+    // S33-5：有序 Range 迭代器（语义/契约见 CaskRangeIter 类注释）。
+    // OKI 不可用（RO 打开无 OKI 的目录 / 重建失败）→ kNoIndex。
+    // 线程安全: 是（可多线程各自 make 并发迭代）；返回的迭代器自身非线程安全。
+    [[nodiscard]] std::expected<std::unique_ptr<CaskRangeIter>, CaskFault>
+    make_range_iter(const RangeOptions& opts);
 
     [[nodiscard]] std::string_view dirname() const noexcept { return dirname_; }
     [[nodiscard]] keydir::KeyDir&  keydir()  noexcept { return *keydir_; }

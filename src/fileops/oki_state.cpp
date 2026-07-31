@@ -19,7 +19,18 @@ void OkiState::load(std::string_view dir) {
     std::lock_guard<std::mutex> flk(flush_mu_);
     auto m = read_manifest(dir);
     if (!m) return;  // 缺失/损坏 → 未加载态（caller 决定重建）
+    // S33-5：随 load 打开全部 run Reader（全量 CRC eager 校验——S33-3 既定
+    // 取舍：派生缓存安全优先）。任一 run 坏 → 整体弃用（未加载态 → 重建）。
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<OkiRunReader>>> rds;
+    rds.reserve(m->runs.size());
+    for (const auto& r : m->runs) {
+        auto rd = OkiRunReader::open(mk_run_filename(dir, r.gen));
+        if (!rd) return;  // 未加载态
+        rds.emplace_back(r.gen,
+                         std::make_shared<OkiRunReader>(*std::move(rd)));
+    }
     manifest_ = *std::move(m);
+    readers_ = std::move(rds);
     wm_.store(manifest_.wm, std::memory_order_release);
     loaded_.store(true, std::memory_order_release);
 }
@@ -80,6 +91,16 @@ bool OkiState::flush(std::string_view dir) {
     if (io_ok && !w->finish(/*fsync_dir=*/true)) io_ok = false;
     if (!io_ok) { restore(); return false; }
 
+    // S33-5：manifest 提交前先开 Reader（刚写完页缓存热，CRC 校验便宜；
+    // 开失败按 IO 失败处理，不留半态）。
+    auto rd = OkiRunReader::open(mk_run_filename(dir, gen));
+    if (!rd) {
+        std::error_code ec;
+        std::filesystem::remove(mk_run_filename(dir, gen), ec);
+        restore();
+        return false;
+    }
+
     // manifest 提交（唯一 commit point）。失败则删刚写的 run 并放回。
     OkiManifest next = manifest_;
     next.runs.push_back({gen, cover});
@@ -91,6 +112,7 @@ bool OkiState::flush(std::string_view dir) {
         return false;
     }
     manifest_ = std::move(next);
+    readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
     wm_.store(manifest_.wm, std::memory_order_release);
     return true;
 }
@@ -118,6 +140,13 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
     }
     if (!w->finish(/*fsync_dir=*/true)) return false;
 
+    auto rd = OkiRunReader::open(mk_run_filename(dir, gen));  // S33-5
+    if (!rd) {
+        std::error_code ec;
+        std::filesystem::remove(mk_run_filename(dir, gen), ec);
+        return false;
+    }
+
     OkiManifest next;
     next.runs.push_back({gen, cover_ord});
     next.wm = cover_ord;
@@ -127,12 +156,15 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
         return false;
     }
 
-    // 提交后清理：旧 run 文件 + memdelta（内容已被全量快照覆盖）。
+    // 提交后清理：旧 run 文件 + memdelta（内容已被全量快照覆盖）。在途
+    // ReadView 经 shared_ptr 持旧 Reader，unlink 后 fd 仍可读——安全。
     for (const auto& r : manifest_.runs) {
         std::error_code ec;
         std::filesystem::remove(mk_run_filename(dir, r.gen), ec);
     }
     manifest_ = std::move(next);
+    readers_.clear();
+    readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
     wm_.store(manifest_.wm, std::memory_order_release);
     loaded_.store(true, std::memory_order_release);
     {
@@ -142,6 +174,35 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
         update_flush_hint_locked();
     }
     return true;
+}
+
+std::optional<OkiState::ReadView> OkiState::make_read_view() const {
+    if (!loaded_.load(std::memory_order_acquire)) return std::nullopt;
+    ReadView v;
+    {
+        // 锁序与 flush 一致：flush_mu_ → mu_。
+        std::lock_guard<std::mutex> flk(flush_mu_);
+        v.runs.reserve(readers_.size());
+        for (const auto& [gen, rd] : readers_) v.runs.push_back(rd);
+        std::lock_guard<std::mutex> lk(mu_);
+        v.delta = delta_;  // 拷贝快照（排序去重在锁外做）
+    }
+    std::sort(v.delta.begin(), v.delta.end(),
+              [](const DeltaRow& a, const DeltaRow& b) {
+                  if (a.key != b.key) return a.key < b.key;
+                  return a.ord < b.ord;
+              });
+    // 同 key 保留 max-ord（尾元素）。
+    std::vector<DeltaRow> dedup;
+    dedup.reserve(v.delta.size());
+    for (std::size_t i = 0; i < v.delta.size(); ++i) {
+        if (i + 1 < v.delta.size() && v.delta[i + 1].key == v.delta[i].key) {
+            continue;
+        }
+        dedup.push_back(std::move(v.delta[i]));
+    }
+    v.delta = std::move(dedup);
+    return v;
 }
 
 std::size_t OkiState::delta_rows() const {

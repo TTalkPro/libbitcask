@@ -32,6 +32,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -83,6 +84,18 @@ public:
                                std::vector<DeltaRow>&& rows,
                                std::uint64_t cover_ord);
 
+    // S33-5：range 读者视图——runs 的共享 Reader（不可变，多线程各持
+    // Cursor 并发读）+ memdelta 快照（已按 key 排序、同 key max-ord 去重，
+    // 墓碑保留）。**弱一致**：视图是创建时刻的近似（per-key 语义，非 fold
+    // 快照）。OKI 未加载 → nullopt（RO 打开无 OKI 的目录等）。
+    // shared_ptr 使在途视图安全跨越 rebuild 的旧 run 删除（POSIX unlink
+    // 后已开 fd 仍可读到 close）。
+    struct ReadView {
+        std::vector<std::shared_ptr<OkiRunReader>> runs;
+        std::vector<DeltaRow> delta;
+    };
+    [[nodiscard]] std::optional<ReadView> make_read_view() const;
+
     // 诊断。
     [[nodiscard]] std::size_t delta_rows() const;
     [[nodiscard]] std::size_t delta_bytes() const;
@@ -105,8 +118,12 @@ private:
     std::vector<DeltaRow> delta_;
     std::size_t delta_bytes_ = 0;
 
-    mutable std::mutex flush_mu_;  // flush/load/rebuild 串行；manifest_ 归其保护
+    mutable std::mutex flush_mu_;  // flush/load/rebuild 串行；manifest_/readers_ 归其保护
     OkiManifest manifest_;
+    // manifest_.runs 一一对应的常驻 Reader（load 全量 CRC 校验后开；
+    // flush/rebuild 产出新 run 时随 manifest 提交同步维护）。
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<OkiRunReader>>>
+        readers_;
 
     std::atomic<bool> loaded_{false};
     std::atomic<std::uint64_t> wm_{0};
