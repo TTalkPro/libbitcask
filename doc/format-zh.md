@@ -1168,6 +1168,15 @@ Count × { gen u64 LE | cover_ord u64 LE }   每 run 的代号与覆盖上界（
 - **重建**：open 收尾若 `wm < 快照 next_ord` 或 manifest 缺失/损坏 → 遍历
   keydir 活 key 排序写单 run（只在读写句柄做，best-effort 不阻断 open）。
   迁移产物（`hintord` 的 dst）首开即走这条路。
+- **run 归并**（「极简两层」）：flush 提交后 run 数 > 8（`kCompactRunLimit`）
+  → 把**全部** run k 路归并成单个新 run（同 key 取 max-ord），manifest 一次
+  提交。不做 leveled compaction——OKI 条目不含 value，全归并 1 亿 key 也就
+  ~1-2GB 顺序 IO。不归并的话 run 数 = flush 次数（close / merge 收尾 /
+  checkpoint 各一次）线性增长：每 run 一个常驻 fd + open 期全文件 CRC +
+  range 多一路归并。
+- **墓碑在全归并时真正丢弃**（其余时候以 tomb 行保留）。**仅全归并成立**：
+  同 key 的 put 行与 tomb 行必定同在本次归并里，胜出者是 tomb 则两行一起丢，
+  不会留下被抵消掉的陈旧 put 行。改成部分归并则此条必须收回。
 - **零活 key 的重建不落空 run**（空库 / 全删）：manifest 记 0 个 run +
   `wm = cover_ord` 即完整语义，不留空文件与常驻 fd。
 - rebuild 提交后**按目录扫描**清理一切非本次 run 的 `kv.oki.seg-*`（而非只

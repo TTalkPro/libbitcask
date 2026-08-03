@@ -308,6 +308,23 @@ C API `bitcask_range_iter_*`（6 个新导出 + 2 个新结构体）、
   新增测试 `RebuildWithNoLiveKeysWritesNoEmptyRun`（空库首开 + 全删后
   删 manifest 重建，双形态各验 manifest 0 run + 目录零 seg 文件 + 水位追平
   + 重建后 range 照常出货）。
+- **补实装 run 归并（设计 §5.2 的漏项，fd 探针实测发现）**：起因是复盘
+  「一个库同时开多少文件」——探针（scratchpad `fd_probe.cpp`）显示 1500 key /
+  37 个 data 文件的库共 45 个 fd（data read handle 37 个是大头且**有界**：
+  `max_read_handles=0` → RLIMIT_NOFILE 一半、下限 64），但 **OKI run 数 =
+  flush 次数线性增长且 merge 不回收**（5 次 checkpoint → 5 个 run），每 run
+  一个常驻 fd + open 期全文件 CRC + range 多一路归并，墓碑行还永远回收不掉。
+  设计文档 §5.2 本就写明「run 数 > N（默认 8）→ 归并成一个；全归并时墓碑真正
+  丢弃」，S33-4 首版只做了 flush 与 rebuild，这层漏了。现补
+  `OkiState::compact_all_locked`（k 路归并全部 run → 单 run，复用 range 同款
+  max-ord 归并；manifest 一次提交；旧 run 走 sweep_runs）+ 阈值常量
+  `kCompactRunLimit=8`。best-effort：归并失败不影响 flush 的成功语义。
+  **墓碑丢弃的正确性只在「全归并」下成立**（同 key 的 put 行与 tomb 行必定同在
+  本次归并里），已在头文件写明——将来若改部分归并必须收回此条。
+  探针复测：run 数呈锯齿 1→8→1，fd 有界。新增 2 测试
+  （`RunCompactionCollapsesRunsAtThreshold` 阈值内不归并/越阈值塌成 1 个 +
+  文件清理 + 水位不变 + 数据完整；`FullCompactionDropsTombstoneRows` 归并前
+  tomb 行在、归并后整条消失、活 key 齐全、**丢墓碑后重新 put 仍可见**）。
 - **CHANGELOG**：新增 `[5.1.0] - 未发布` 段（S33 全景：flag-day + OKI +
   C API + 两个 B 级修复）；`project(VERSION)` 已 bump 到 **5.1.0**，
   `SOVERSION` 随之保持 **5**（= major，CMakeLists 机械派生）。
@@ -319,8 +336,8 @@ C API `bitcask_range_iter_*`（6 个新导出 + 2 个新结构体）、
   布局）与 5.0.0（签名/字段宽度）才是真 ABI 破坏 → major。soname 换号挡的是
   「二进制 × 二进制」，而这里的不兼容是「二进制 × 数据」，由 meta v5 门禁
   承担，换号零收益却逼下游重链。
-- **验收**：Debug 全量 **672/672**（+1 新测试；1 预存 Disabled）|
-  **ASan 全量 672/672** | **TSan 相关套件 147/147**（CI 豁免口径，未新增
+- **验收**：Debug 全量 **675/675**（+4 新测试；1 预存 Disabled）|
+  **ASan 全量 675/675** | **TSan 相关套件 150/150**（CI 豁免口径，未新增
   豁免；C API 新路径含 prefetch 也在 TSan 下跑过）| build-rel 全树零错误
   （含 bench，公共结构体 `RangeOptions` 双树验证）。
 
@@ -369,7 +386,7 @@ S33-7 (评审)  ───── 依 S33-1 数据
 | S33-4 memdelta + 写挂钩 | ✅ done（Debug 668/668；put 挂钩 ≈1.2% 达标）|
 | S33-5 Range 查询路径 | ✅ done（三方对拍 + 并发 stress；**1/256 选择性 8.01→0.53ms = 15×，耗时随选择性线性**；Debug 671/671）|
 | S33-B2 mmap 窗口外读修复 | ✅ done（S30×S13 既有竞态；kShortRead 跌落 pread；修前 3/3 中招 → 0/20）|
-| S33-6 C API + 值预取 + bench + 文档 | ✅ done（range C API 6 导出；预取批 256×4 线程 1.4×；format-zh §六重写 + §十五 OKI；Debug/ASan 672/672）|
+| S33-6 C API + 值预取 + bench + 文档 | ✅ done（range C API 6 导出；预取批 256×4 线程 1.4×；format-zh §六重写 + §十五 OKI；顺带补实装 run 归并 + 两处重建疵；Debug/ASan **675/675**）|
 | S33-7 Level B 门禁评审 | 🟡 下一步（数据已齐：keydir ~122 B/key，见下）|
 
 ### S33-7 输入数据（S33-1 + S33-6 探针汇总）

@@ -58,6 +58,9 @@ magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁�
 - **写挂钩与恢复**：挂钩收敛在 `KeyDir::put/remove` 咽喉点（Cask 各写路径零
   改动）；flush 恒在 keydir 快照之后搭车；open 时 `wm < 快照 next_ord` 或
   manifest 缺失/损坏 → 全量重建兜底。put 路径实测回归 ≈1.2%（预算 ≤3%）。
+- **run 归并**：run 数 > 8 时全部归并成一个（同 key 取 max-ord），使常驻
+  fd 数与 range 的归并路数有界；**全归并时墓碑行真正丢弃**（其余时候保留
+  tomb 行以抵消旧 put 行）。
 - **C API（新增导出，ABI 纯增量）**：
   `bitcask_range_iter_start` / `_next` / `_next_batch` / `_release` /
   `bitcask_range_entry_free` / `bitcask_range_options_init` +
