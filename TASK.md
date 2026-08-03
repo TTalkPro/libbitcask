@@ -297,6 +297,17 @@ C API `bitcask_range_iter_*`（6 个新导出 + 2 个新结构体）、
   §6 CaskRangeIter + 线程表 + 示例）、`api-c.md`（§11.7 全套 + 所有权配对表
   + 线程表 + §4.1/§7.5b 类型）、`migrate-le.md`（纪元 v3→v5 陈旧修正 +
   OKI 不迁移行）、`README.md`（能力表 + 架构图）。
+- **顺手修（两处 OKI 重建的既有小疵，均为 S33-4 代码、未发布）**：
+  ① 零活 key（空库首开 / 全删后重建）仍落一个 entry_count=0 的空 run——
+  36B 文件 + 一个常驻 Reader fd，归并不出任何行，且要等下次 rebuild 才被
+  清；改为 manifest 记 0 run + `wm=cover_ord`（语义等价）。
+  ② 由 ① 的新测试逮出更实的一个：rebuild 的旧文件清理原本只遍历**内存
+  manifest 列出的 run**，而触发重建的典型场景恰恰是 **manifest 缺失/损坏**
+  （此时内存 manifest 为空）——那批 run 文件成了永不回收的孤儿，每重建一次
+  多一批。改为提交后按目录扫描删除一切非本次 run 的 `kv.oki.seg-*`。
+  新增测试 `RebuildWithNoLiveKeysWritesNoEmptyRun`（空库首开 + 全删后
+  删 manifest 重建，双形态各验 manifest 0 run + 目录零 seg 文件 + 水位追平
+  + 重建后 range 照常出货）。
 - **CHANGELOG**：新增 `[5.1.0] - 未发布` 段（S33 全景：flag-day + OKI +
   C API + 两个 B 级修复）；`project(VERSION)` 已 bump 到 **5.1.0**，
   `SOVERSION` 随之保持 **5**（= major，CMakeLists 机械派生）。

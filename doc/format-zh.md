@@ -1168,8 +1168,12 @@ Count × { gen u64 LE | cover_ord u64 LE }   每 run 的代号与覆盖上界（
 - **重建**：open 收尾若 `wm < 快照 next_ord` 或 manifest 缺失/损坏 → 遍历
   keydir 活 key 排序写单 run（只在读写句柄做，best-effort 不阻断 open）。
   迁移产物（`hintord` 的 dst）首开即走这条路。
-- 旧 run 文件在 rebuild 时 unlink；在途 ReadView 持 `shared_ptr<Reader>`，
-  POSIX 语义下已开 fd 仍可读完——无需显式引用计数。
+- **零活 key 的重建不落空 run**（空库 / 全删）：manifest 记 0 个 run +
+  `wm = cover_ord` 即完整语义，不留空文件与常驻 fd。
+- rebuild 提交后**按目录扫描**清理一切非本次 run 的 `kv.oki.seg-*`（而非只
+  删旧 manifest 列出的那些——manifest 缺失/损坏正是重建的触发场景，那批 run
+  不在内存里，只删列表会留下永不回收的孤儿）。在途 ReadView 持
+  `shared_ptr<Reader>`，POSIX 语义下已开 fd 仍可读完——无需显式引用计数。
 
 ## 附录 A：常量速查
 
