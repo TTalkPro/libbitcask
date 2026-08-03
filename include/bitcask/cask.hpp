@@ -401,6 +401,18 @@ private:
 struct RangeOptions {
     std::span<const std::byte> lo{};  // inclusive；空 = 从头
     std::span<const std::byte> hi{};  // exclusive；空 = 到尾
+
+    // S33-6：值预取。0/1 = 关闭（默认，逐 key 惰性 get）；>1 = 归并出至多
+    // prefetch 个 key 后一次性并发取值填缓冲，next() 从缓冲出货。收益来自
+    // value 的 pread 被并行化（与 parallel_scan 同款分段 std::thread），
+    // 对「窗口大 + 值不在页缓存」的扫描明显；小窗口/命中缓存时线程创建
+    // 成本可能反超，故默认关闭。
+    // 语义不变量：预取只改变取值时机，**输出序与内容与惰性路径一致**
+    // （仍是 per-key 弱一致——预取批内各 key 的取值时刻略早于出货时刻）。
+    std::size_t prefetch = 0;
+    // 预取线程数；0 = min(hardware_concurrency, 4)。批内 key 数不足时按
+    // key 数收窄（不会为 1 个 key 起一堆线程）。
+    std::size_t prefetch_threads = 0;
 };
 
 class CaskRangeIter {
@@ -419,6 +431,15 @@ private:
     friend class Cask;
     CaskRangeIter() = default;
 
+    // 归并层：产出下一个「胜出且非墓碑」的 key（尚未回查 keydir）；
+    // 到尾或越过 hi → nullopt。取值与预取都建在它之上。
+    [[nodiscard]] std::expected<std::optional<std::string>, CaskFault>
+    next_merged_key();
+
+    // S33-6：预取一批——归并至多 prefetch_ 个 key，并发回查取值填 buf_。
+    // 死 key（kNotFound）在批内被丢弃，故 buf_ 可能为空而迭代未结束。
+    [[nodiscard]] std::expected<void, CaskFault> fill_prefetch();
+
     Cask* cask_ = nullptr;
     std::shared_ptr<keydir::KeyDir> keydir_pin_;
     oki::OkiState::ReadView view_;
@@ -429,6 +450,12 @@ private:
     std::string hi_;
     bool has_hi_ = false;
     bool done_ = false;
+
+    // S33-6：预取缓冲（prefetch_ ≤ 1 时恒空，走惰性路径）。
+    std::size_t prefetch_ = 0;
+    std::size_t prefetch_threads_ = 0;
+    std::vector<Entry> buf_;
+    std::size_t buf_pos_ = 0;
 };
 
 // --- Cask ------------------------------------------------------------------
