@@ -29,7 +29,7 @@ CRC 多项式统一为 zlib / IEEE 802.3，与 `erlang:crc32/1` bit-identical，
   `bitcask.write.lock`、`bitcask.merge.lock`、`field.schema`
 - **派生缓存**（可 fold 重建）：`<tstamp>.bitcask.hint`、各 `*.ckpt` /
   `*.prev` / `*.d<seq>`、`index.manifest`、`kv.keydir.ckpt`、`search.vec`、
-  `search.qc8`
+  `search.qc8`、`kv.oki.seg-<gen>` / `kv.oki.manifest`（OKI 有序 key 索引）
 
 派生缓存的校验失败一律丢弃 → 退全量 fold，不会影响正确性。
 
@@ -93,6 +93,8 @@ stale 检测（写入者 PID）+ PID 行 + 持锁文件 fd 三要素。路径字
 | `kv.keydir.ckpt` | keydir 快照（BCKS v3：tstamp 定宽 8B） |
 | `search.vec` | HNSW f32 payload（BCVP） |
 | `search.qc8` | HNSW int8 量化码字 payload（BCQ8） |
+| `kv.oki.seg-<gen>` | OKI run：有序 key 索引段（BCOK v1，见 §十五） |
+| `kv.oki.manifest` | OKI 提交点：run 集合 + 覆盖水位（BCOM v1，见 §十五） |
 
 `*.ckpt` 走 `SearchCheckpoint` 容器（见 §九）；`*.d<seq>` 是组件 delta 文件，
 链校验三元组（base_gen / prev_wm / seq）由 `CkptSectionType::kDeltaInfo` 段承
@@ -165,6 +167,7 @@ Hint CRC32 与 data CRC32 用同一多项式（zlib/IEEE 802.3），由 `bitcask
 | `bitcask.meta` | 用自己的 `kMetaMagicSize` 等（见 §三） |
 | `field.schema` | 用自己的 `kMagic` / `kVersion` / `kHeaderSize`（见 §八） |
 | `*.ckpt` / `index.manifest` | 用 `search_checkpoint.hpp` 的 `kCkptMagic` / `kCkptVersion` |
+| `kv.oki.seg-<gen>` / `kv.oki.manifest` | 用 `oki_run.hpp` 的 `kRunMagic` / `kRunTrailerMagic` / `kRunVersion` / `kManifestMagic` / `kManifestVersion` / `kFlagTomb`（见 §十五）|
 
 ### 2.3 端序与 CRC 多项式
 
@@ -175,6 +178,7 @@ Hint CRC32 与 data CRC32 用同一多项式（zlib/IEEE 802.3），由 `bitcask
 | DocValue | 小端 + VByte | LE 整数 + varint 长度 | —（DocValue 自身不带 CRC，由 record CRC 兜底） |
 | `bitcask.meta` | 小端 | u8 / u16 / u32 LE | zlib CRC32（前 14 字节覆盖） |
 | `field.schema` | 小端 | u16 / u32 LE | zlib CRC32（每条 entry 单独） |
+| `kv.oki.seg-<gen>` / `kv.oki.manifest` | 小端 | u32 / u64 LE + VByte | zlib CRC32（整文件 `[0, size-8)`） |
 | `*.ckpt` 页脚 | 小端 | u16 / u32 / u64 LE | zlib CRC32（每段独立 + 整体 footer） |
 | DocMap sidecar（`BCIS`） | 小端 | u32 / u64 LE + VByte | zlib CRC32 |
 
@@ -504,127 +508,86 @@ ExpiryAt : u64 LE    绝对 unix 秒；0 = 永不（不写段）（v4 起 u64）
 - `expiry_at = 0` 不写 expiry 段（等价于「永不过期」，与解码端的 0 默认值
   一致）。
 
-## 六、Hint 文件：v2 与 v4
+## 六、Hint 文件：v5（BCH5）
 
 Hint 是 data file 的并行索引：fold(hint) 重建 keydir 只读 key + 元数据，省
 掉绝大部分 I/O。本节对应头 `bitcask/hint_file.hpp` 与 `format.hpp` 的 hint
 注释。
 
-### 6.1 v2 布局（18 字节定宽）
+**纪元**：S33 flag-day 起写端恒写 v5、读端**只认 v5**。v2（18B 定宽）/ v3
+（BCH3）/ v4（BCH4）的编解码已整体删除——`kHintMagicV4` 只保留作旧纪元的
+识别常量。旧纪元目录由 `bitcask.meta` v5 门禁整体拒开，迁移见
+[`migrate-le.md`](migrate-le.md)（`bitcask_migrate hintord`）。
 
-v2 是「无文件头、无 trailer magic」的定宽裸记录流，定义在
-`include/bitcask/format.hpp` 的「hint 文件 record 布局」注释里。
-
-```
-偏移  字节  字段     编码         含义
-  0     4   Tstamp   u32  LE      unix 秒
-  4     2   KeySz    u16  LE      Key 字节数
-  6     4   TotalSz  u32  LE      对应 data file 里整条 record 的 total
- 10     8   Packed   u64  LE      (Tomb ? kTombMaskV2 : 0) | Offset
-─────────────────────────────────────────
-       18 字节固定（kHintRecordSize）
-[18 .. 18+KeySz)     Key      Key 字节序列
-```
-
-`Offset` 含义：data file 内字节偏移。`Packed` 把墓碑标志压到 64 位最高位
-（`kTombMaskV2`），其余 63 位是 offset（`kMaxOffsetV2` 上限）。读取时反向
-`packed & kTombMaskV2` 得 tomb、`packed & kMaxOffsetV2` 得 offset——节省 1
-字节，跟 legacy wire format 一致。
-
-### 6.2 v4 布局（变长 + 头尾 magic）
-
-v4 = S23-A1 引入的 v3 变长格式 + tstamp u64（64 位时间戳 flag-day），
-定义在 `format.hpp` 的「hint 文件 v4 布局」注释里：
+### 6.1 v5 布局（变长 + 头尾 magic + 内嵌 ord）
 
 ```
-头部 4 字节（kHintHeaderV4）：
-  0..3   Magic   u32  LE   = kHintMagicV4  (ASCII "BCH4")
+头部 4 字节（kHintHeader）：
+  0..3   Magic   u32  LE   = kHintMagicV5  (ASCII "BCH5")
 
 记录流（变长，vbyte 编码）：
   每条 record：
-    gap       : VByte  offset − prev_end（首条 prev_end = 0，gap 经 u64 二
-                               补数回绕；连续追加时 gap == 0 → 1 字节）
+    gap       : VByte  offset − prev_end（首条 prev_end = 0；u64 二补数回绕）
     total_sz  : VByte  对应 data file record 总长
     kt        : VByte  (KeySz << 1) | (tomb ? 1 : 0)
-    tstamp    : u64 LE  （v3 时代为 u32；v4 起 8 字节）
+    ord_delta : VByte  ord − prev_ord（首条 prev_ord = 0；u64 二补数回绕）
+    tstamp    : u64 LE
     key       : [KeySz]   Key 字节
   prev_end 维护：encode 时返回 offset+total_sz 串联传下一条；
                 decode 时 prev_end = offset + total_sz。
+  prev_ord 维护：encode/decode 皆以本条 ord 串联传下一条。
 
-trailer 8 字节（kHintTrailerV4）：
-  [-8..-4]  Magic    u32 LE   = kHintTrailerMagicV4  (ASCII "BCHE")
+trailer 8 字节（kHintTrailer）：
+  [-8..-4]  Magic    u32 LE   = kHintTrailerMagic  (ASCII "BCHE")
   [-4..-1]  CRC32    u32 LE   覆盖 [0, size-8) 全字节（含文件头 + 所有记录）
 ```
 
-文件总大小 = `kHintHeaderV4 + records_len + kHintTrailerV4`。
+文件总大小 = `kHintHeader + records_len + kHintTrailer`。
 
-典型 v4 记录 ~12-13B（含 key 字节），与 v2 定宽 18B 相比仍显著更小
-（核心动机：减少 merge 输出写放大）。
+两个差分（gap / ord_delta）均按 u64 二补数回绕无损还原，正确性**不依赖**
+单调性或连续性假设：正常 append 序下 gap == 0（1 字节）、ord 递增
+（ord_delta 1~2 字节），典型记录 ~13-15B（含 key 字节）。
 
-### 6.3 v2 vs v4：读写分派
+**ord 内嵌的意义**（S33 的 flag-day 动机）：v4 时代 hint 不存 ord，hint 快
+路径恢复出来的 keydir 条目 ord 恒 0，与 fold(data) 不等价；v5 之后两条恢复
+路径逐 key 等价（测试 `HintAndDataFoldRecoveryOrdEquivalent`），这也是 OKI
+tail 重放（§十五）能同时吃 hint 与 data 两路的前提。
 
-读写分派逻辑（`HintFile::fold` / `validate_trailer` / `fold_validated` 共同）：
+### 6.2 读写分派与旧纪元处置
 
-1. 检查文件头 4 字节是否等于 `kHintMagicV4`。
-   - 命中 → 走 `fold_v4` / v4 trailer 校验路径。
-   - 不命中 → 走 v2 EOF sentinel + running CRC 路径。
+写端：`HintFile::open(Mode::kCreate)` 在缓冲里种入 `kHintMagicV5`，
+`write(..., ord)` 经 `codec::encode_hint_record_v5` 变长编码，`finalize()`
+落 8B trailer。`kAppend` 模式不重写头部（既有文件追加不维护 CRC 连续性）。
 
-2. v4 文件 < `kHintHeaderV4 + kHintTrailerV4`（即 12B）→ 视为未封口，返
-   回 `false`（不健康的 hint）。
-3. v2 文件 < `kHintRecordSize`（18B）→ 同上视为不健康。
+读端：`HintFile::fold_v5`（走 `detail::ChunkedReader`）是唯一读路径。文件头
+magic 非 `kHintMagicV5`（含 BCH4/BCH3/v2 裸记录流）时：
 
-写端：writer 恒写 v4——`HintFile::open(Mode::kCreate)` 在缓冲里
-种入 `kHintMagicV4`（`HintFile::open` 实现），`write()` 经
-`codec::encode_hint_record_v4` 变长编码，`finalize()` 落 8B trailer。
-`kAppend` 模式不重写头部（生产零调用；既有文件追加不维护 CRC 连续性）。
+- `validate_trailer` / `fold_validated` 返回 **false** → caller 退
+  `fold(data)` 重建。语义上「陈旧格式 = 缓存不可用」，与 CRC 失败同档。
+- 只有显式 `fold()` 会报错。
+- 纪元硬门禁由 `bitcask.meta` v5 承担——v5 目录里本不该出现 BCH4 hint。
 
-读端：按文件头 magic 分派。v2/v3（BCH3）属 u32-tstamp 纪元，已被 meta v4
-门禁整体拒开（重建），实际不再有读端；v2 分派代码保留为死路径。
+文件 < `kHintHeader + kHintTrailer`（12B）→ 视为未封口，返回 `false`。
 
-兼容策略：u32 纪元旧库须重建；`tools/migrate_le` 从不迁 hint
-（迁移输出的 hint 由 migrate 按 v4 重新生成）。
+`tools/bitcask_migrate` 从不搬运 hint：迁移输出的 hint 由 `DataFile::fold`
+重扫 data 后按 BCH5 重新生成。
 
-### 6.4 完整性保障：trailer CRC
+### 6.3 完整性保障：trailer CRC
 
 完整性靠 trailer CRC 一次性兜底（不像 data file 每条 record 自带 CRC）。
 失败时 `validate_trailer` 返回 `false`，caller 退 `fold(data)` 重建——
 hint 是派生索引，丢失不影响正确性。
 
-CRC 范围：
-
-- v2：覆盖「EOF sentinel 之前的全部字节」；sentinel 的 `TotalSz` 字段实际
-  放的是整文件 running CRC，由 `encode_hint_eof` 写入（复用
-  `encode_hint_record` 但 `Tstamp=0, KeySz=0, Offset=kMaxOffsetV2`）。
-- v4：覆盖 `[0, size-8)`，即文件头 + 所有记录字节；trailer 自身 8B 不在
-  CRC 覆盖内。
-
-HintFile 维护 `running_crc_` 状态字段：
+CRC 覆盖 `[0, size-8)`，即文件头 + 所有记录字节；trailer 自身 8B 不在覆盖
+范围内。HintFile 维护 `running_crc_` 状态字段：
 
 - 每次 `write` 把刚编码的字节段 `crc32_update` 累加进 `running_crc_`。
 - `finalize` 把 running CRC + magic 写入 trailer。
 - `validate_trailer` 从盘尾 8B 取出 expected CRC，再流式从头累加整文件
   字节比对。
 
-### 6.5 EOF sentinel（v2 独有）
-
-v2 末尾复用 hint record 格式表达 sentinel，依赖以下三个字段同时等于特定
-值识别：
-
-```
-Tstamp   = 0
-KeySz    = 0
-Offset   = kMaxOffsetV2
-TotalSz  = running_crc  （借用字段放整文件 CRC）
-Tomb     = false
-Key      = 空
-```
-
-读取方调用 `codec::is_hint_eof(HintRecord)` 判定
-（`HintRecord.tstamp == 0 && key.empty() && offset == format::kMaxOffsetV2`）。
-EOF sentinel 不作为正常 hint entry 回调给 `fold(FoldFn)`——`HintFile::fold`
-遇到 sentinel 就 break。
-
-v4 没有 EOF sentinel——trailer magic 充当文件结构定界符。
+v5 没有 EOF sentinel（那是 v2 独有的机制）——trailer magic 充当文件结构
+定界符。
 
 ## 七、墓碑（Tombstones）
 
@@ -1102,21 +1065,111 @@ requires rebuild — re-ingest data"——绝不静默把大端字节按小端�
 
 ```
 bitcask_migrate detect   <dir>          # 读 meta 版本报告纪元 + 提示下一步
-bitcask_migrate be2le    <src> <dst>    # v1 大端（meta v1）→ 当前纪元
+bitcask_migrate be2le    <src> <dst>    # v1 大端（meta v1）→ 当前纪元（meta v5）
 bitcask_migrate tstamp64 <src> <dst>    # u32 纪元（meta v2/v3）→ 当前纪元
+bitcask_migrate hintord  <src> <dst>    # 无 ord hint 纪元（meta v4）→ 当前纪元
 ```
 
-- `be2le`：解大端 23B record 头 → 当前 codec 重编码；meta 1→4、
+- `be2le`：解大端 23B record 头 → 当前 codec 重编码；meta 1→5、
   field.schema NameLen 大端→小端 + 补 CRC。
 - `tstamp64`：解小端 23B record 头 → 27B 重编码（tstamp u32→u64 零扩展）；
   kDoc 的 DocValue v3→v4 转码（Ver 字节 + 尾部 expiry 段 u32→u64）；
-  meta 2/3→4；field.schema 格式未变,原样拷贝。
-- 两者都从迁移后的 data 重生成 hint（v4）。
+  meta 2/3→5；field.schema 格式未变,原样拷贝。
+- `hintord`（S33 flag-day）：**data 字节零改动**——硬链接（跨设备退化为拷
+  贝）src 的 data 文件到 dst，再 `DataFile::fold` 重扫生成 BCH5 hint；
+  meta 4→5 最后写 = commit point（无 meta 的 dst 不可开 ⟹ 幂等，中途 kill
+  重跑即可）。
+- 三者都从迁移后的 data 重生成 hint（BCH5，§六）；OKI（§十五）是派生缓存，
+  不迁移——dst 首次以读写方式 open 时自动重建。
 
 均为非破坏性（只读 src、只写 dst）。迁移仅动 meta / data / hint /
 field.schema；ckpt / seg / wal 等可重建文件由新库首开走 fold 重建。
 详见 `include/bitcask/migrate.hpp`。（`tools/migrate_le` 是 be2le 的
 保留旧入口。）
+
+## 十五、OKI 有序 key 索引（BCOK run + BCOM manifest）
+
+S33 引入的**旁挂有序 key 索引**（WiscKey 式）：让 `[lo, hi)` 范围扫描从
+O(全表) 降到 O(range)。两类文件皆为**派生缓存**——任何校验不过一律整体
+弃用 + 重建，正确性由哈希 keydir 兜底。对应头 `bitcask/oki_run.hpp`，
+运行态见 `bitcask/oki_state.hpp`，设计见
+[`ordered-key-index-design-zh.md`](ordered-key-index-design-zh.md)。
+
+| 文件 | 角色 |
+|------|------|
+| `kv.oki.seg-<gen>` | run：按 key 升序的不可变条目流（"BCOK" v1）|
+| `kv.oki.manifest`  | run 集合 + 覆盖水位，**唯一 commit point**（"BCOM" v1）|
+
+**条目只存 `(key, ord, tomb)`，不存位置信息**——range 查询逐 key 回查哈希
+keydir 取权威位置与活性。因此 merge 搬迁与 OKI 零交互，run 允许陈旧。
+
+### 15.1 run 布局（`kv.oki.seg-<gen>`，"BCOK" v1）
+
+```
+头部 8 字节（kRunHeaderSize）：
+  0..3   Magic    u32 LE = kRunMagic  (ASCII "BCOK")
+  4..7   Version  u32 LE = kRunVersion = 1
+
+数据块区（块目标 ~4 KiB = kDefaultBlockBytes，块界由稀疏索引给出）：
+  **每块解码状态复位**（prev_key = "" / prev_ord = 0）——块首条自然退化为
+  全量 key + 绝对 ord，读写两端同一条码路径，无需块首特例。
+  每条：
+    shared_len : VByte  与 prev_key 的公共前缀长度
+    suffix_len : VByte  后缀字节数
+    suffix     : [suffix_len]
+    ord_delta  : VByte  ord − prev_ord（u64 二补数回绕，同 hint v5 语义）
+    flags      : u8     bit0 = tomb（kFlagTomb）；其余位保留
+
+稀疏索引区：
+  count u32 LE + count × { [VByte klen][块首 key 字节][block_off u64 LE] }
+
+trailer 24 字节（kRunTrailerSize）：
+  [-24..-17] entry_count u64 LE
+  [-16..-9]  index_off   u64 LE   稀疏索引区起始偏移
+  [-8..-5]   CRC32       u32 LE   覆盖 [0, size-8)
+  [-4..-1]   Magic       u32 LE = kRunTrailerMagic (ASCII "BCOE")
+```
+
+- **未知 flags 位 fail-fast**：读端遇 `flags & ~kKnownFlagsMask` 立刻
+  `kCorrupt`（整个 run 弃用重建），绝不静默跳过。保留位是 Level B（keydir
+  全字段磁盘驻留）的扩展位。
+- **eager CRC**：`OkiRunReader::open` 全文件校验后才可用（派生缓存，安全
+  优先；大 run 的惰性/分块校验属后续优化）。稀疏索引载入内存，Cursor 按块
+  `pread`——Reader 不可变，多线程可各持 Cursor 并发读。
+- 有序 key 的公共前缀差分对 `prefix:id` 形态收益显著：实测 11B key、10 万
+  条的 run ≈ 6.2 B/key（`bench/range_bench.cpp` 的 `BM_Oki_MemProbe`）。
+
+### 15.2 manifest 布局（`kv.oki.manifest`，"BCOM" v1）
+
+```
+[0..3]    Magic  u32 LE = kManifestMagic (ASCII "BCOM")
+[4..7]    Ver    u32 LE = kManifestVersion = 1
+[8..11]   Count  u32 LE                     run 条数
+Count × { gen u64 LE | cover_ord u64 LE }   每 run 的代号与覆盖上界（排他）
+          wm u64 LE                         联合覆盖水位（排他上界）
+[-8..-5]  CRC32  u32 LE                     覆盖 [0, size-8)
+[-4..-1]  Magic  u32 LE                     尾 magic
+```
+
+- 写端 `atomic_write_bytes(fsync_dir = true)`——与 `index.manifest` 同款
+  纪律；manifest 落盘即整批 run 生效，是 OKI 的**唯一 commit point**。
+- 读端任何校验不过（含文件不存在）→ 整体弃用 OKI → 重建兜底。
+- **`wm` 是排他上界**（= 尚未被 runs 覆盖的最小 ord）：`alloc_ord` 的首个
+  合法 LSN 是 **0**，含上界语义表达不了「已覆盖 ord 0」与「什么都没覆盖」
+  的区别，故全链路统一排他。恢复期 tail 重放据此只收 `ord ≥ wm` 的行。
+
+### 15.3 生命周期与重建
+
+- **写挂钩**收敛在 `KeyDir::put` / `remove` 的咽喉点（Cask 各写路径零改
+  动）→ memdelta（内存有序增量）。
+- **flush**：memdelta 换出 → 按 key 排序 + 同 key 取 max-ord 去重（墓碑保
+  留为 tomb 行）→ 写新 run → 写 manifest → 推进 wm。恒在
+  `write_keydir_snapshot` 之后同站点搭车（close / merge 收尾 / checkpoint）。
+- **重建**：open 收尾若 `wm < 快照 next_ord` 或 manifest 缺失/损坏 → 遍历
+  keydir 活 key 排序写单 run（只在读写句柄做，best-effort 不阻断 open）。
+  迁移产物（`hintord` 的 dst）首开即走这条路。
+- 旧 run 文件在 rebuild 时 unlink；在途 ReadView 持 `shared_ptr<Reader>`，
+  POSIX 语义下已开 fd 仍可读完——无需显式引用计数。
 
 ## 附录 A：常量速查
 
@@ -1158,6 +1211,8 @@ field.schema；ckpt / seg / wal 等可重建文件由新库首开走 fold 重建
 | `search.vec` / `search.qc8` | HNSW payload 容器（mmap） |
 | `kv.keydir.ckpt` | keydir 快照（BCKS v3：tstamp 定宽 8B） |
 | `index.manifest` | 三组件 ckpt 的统一提交点 |
+| `kv.oki.seg-<gen>` | §十五（OKI run，BCOK v1）|
+| `kv.oki.manifest` | §十五（OKI 提交点，BCOM v1）|
 
 ### DocValue 嵌入字段
 

@@ -14,7 +14,8 @@
 
 bitcask 做过一次字节序 **flag-day**：盘上所有多字节整数从大端切到小端（LE-only 主机原生零转换 + mmap 零拷贝友好；详见 [`format-zh.md`](format-zh.md) 字节序说明）。切换后：
 
-- `bitcask.meta` 的 version 从 `1`（大端纪元）迁到 `3`（小端 + CRC32）。
+- `bitcask.meta` 的 version 从 `1`（大端纪元）迁到当前纪元 **v5**（小端 +
+  CRC32；v5 = hint BCH5 内嵌 ord 的 S33 flag-day 门禁）。
 - 新代码打开旧大端目录时**当场拒绝**（不会静默把大端读成小端而损坏）。
 
 要把旧目录用起来，二选一：**① 从源头重灌数据（rebuild）**，或 **② 用本工具离线迁移**（无源头数据 / 想保留现有库时）。
@@ -91,12 +92,13 @@ migrated /home/me/db/wiki -> /home/me/db/wiki.le
 | 文件 | 处理 | 字段级规则 |
 |---|---|---|
 | `<id>.bitcask.data` | **逐 record 迁移**：用 BE 解码头 → 用 LE codec 重编码 → CRC 重新计算。 | `KeySz`/`ValueSz`/`Tstamp`/`Ord` 大端 → 小端；`Type` 单字节照搬；key/value 字节流原样保留（UTF-8 文本/二进制 meta blob 均为字节安全）。CRC 覆盖 `[Type..Value]`（即 `[4..end]`），由 `codec::crc32` 重算。 |
-| `<id>.bitcask.hint` | **重生成**：从迁移后的 dst data 用新的小端 `fileops::HintFile::open(kCreate)` 写；不读源 hint。 | trailer CRC 一致（v3 magic + 8B trailer + running_crc 由 HintFile 自己维护）。 |
-| `bitcask.meta` | **迁移**：version 1 → 3（LE + CRC），VecDim `u16` 大端→小端，其余字段照搬。 | 布局：`"BCME"(4)` + version=`3`(1) + mode(1) + vec_metric(1) + VecDim(2 LE) + VecQuant(1) + VecInmemInt8(1) + reserved(3) + CRC32(4, 覆盖前 14 字节)。 |
+| `<id>.bitcask.hint` | **重生成**：从迁移后的 dst data 用新的小端 `fileops::HintFile::open(kCreate)` 写；不读源 hint。 | 产物是当前纪元的 **BCH5**（含 ord 差分，见 [`format-zh.md`](format-zh.md) §六）；trailer CRC 由 HintFile 维护。 |
+| `bitcask.meta` | **迁移**：version 1 → **5**（LE + CRC；目标纪元随 flag-day 同步 bump），VecDim `u16` 大端→小端，其余字段照搬。 | 布局见 [`format-zh.md`](format-zh.md) §三（18B header：`"BCME"` + version + mode + vec_metric + VecDim + VecQuant + VecInmemInt8 + VecEngine + reserved + CRC32）。 |
 | `field.schema` | **迁移**：写入新格式（8B 文件头 `[magic:"FSCH" u32 LE][version:1 u32 LE]` + 每条 `[NameLen:u16 LE][name][CRC32:u32 LE]`）。 | 旧文件如果是新格式就 round-trip；如果是 legacy 无头格式（flag-day 后的小端无头格式）就升级到带头格式；存在则迁移，不存在则跳过。 |
 | 墓碑 v2 shadow file_id | **字段级翻转**：当 record 是墓碑且 value_sz == 4 时，把 4 字节大端值重排为 4 字节小端值。 | 这是墓碑 v2 引入的 shadow file_id 字段（v0/v1 墓碑 value 为空）。 |
 | `kv.keydir.ckpt` / `search.ckpt`（旧）/ `docmap.ckpt` / `bm25.ckpt` / `vec.ckpt`（新） | **不迁移** —— 由 fold / 重建恢复。新库首开时各 ckpt 缺失 → 自动从迁移后的 data 文件 fold 重建。 | 这些是派生缓存，正确性不依赖它们；迁移器一律跳过，节省成本并避免对内部格式产生耦合。 |
 | `<dir>.vec` / `<dir>.qc8` / `index.manifest` | **不迁移** —— 同上。 | HNSW payload 与 manifest commit point 都是 HNSW 派生结构，新库 open 时从 data 文件 fold 重放即可。 |
+| `kv.oki.seg-<gen>` / `kv.oki.manifest`（OKI 有序 key 索引）| **不迁移** —— 同上。 | 派生缓存；dst 首次以 `read_write=true` open 时由 keydir 全量重建（见 [`format-zh.md`](format-zh.md) §十五）。 |
 | `bitcask.write.lock` / `bitcask.merge.lock` | **不迁移** —— 运行时锁文件，不应跨目录迁移。 | 调用方需保证迁移时源目录无活跃 writer/merger；新库 dst 目录由首次 `open(read_write=true)` 创建新的 write.lock。 |
 
 > 可重建的 checkpoint / 索引文件**故意不迁移**：它们是派生缓存，新库第一次 open 时从迁移后的 data 文件 fold 重建即可（见 [`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)）。
@@ -144,5 +146,5 @@ bitcask_close(cask);
 
 - **仅支持小端主机**（x86-64 / ARM64），与引擎本体一致。LE 主机上的 `le_store_u32` / `le_load_u32` 经 `byte_order.hpp` 的位移实现，与主机字节序无关；BE 主机无原生 LE 指令，需额外的字节交换层，本工具不提供。
 - `migrate_le` 是引擎内**唯一仍读大端**的地方：它自带大端解码器（`be_u16` / `be_u32` / `be_u64` 在 `src/fileops/migrate.cpp` 的匿名 namespace），写侧复用小端 `fileops::DataFile` / `fileops::HintFile`，保证产物与新写入字节结构一致。
-- 已是 v2 或 v3（小端）的目录再迁移会**干净报错**（`src meta already v2 (little-endian); nothing to migrate`），不会重复迁移或破坏已有数据。
+- 已是小端纪元（meta v2 及以上）的目录再跑 `be2le` 会**干净报错**（`src meta already v2 (little-endian); nothing to migrate`），不会重复迁移或破坏已有数据；这类目录该跑的是 `tstamp64`（v2/v3）或 `hintord`（v4），用 `bitcask_migrate detect <dir>` 确认。
 - 实现：[`include/bitcask/migrate.hpp`](../include/bitcask/migrate.hpp) (`bitcask::migrate::migrate_be_to_le`) + [`src/fileops/migrate.cpp`](../src/fileops/migrate.cpp) + CLI [`tools/migrate_le.cpp`](../tools/migrate_le.cpp)。
