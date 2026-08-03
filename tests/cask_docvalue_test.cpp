@@ -2883,11 +2883,21 @@ TEST(ReadHandleCap, ResolveSemantics) {
     // 显式上限 → 原样。
     EXPECT_EQ(Cask::resolve_read_handle_cap(7u, 1024u), 7u);
     EXPECT_EQ(Cask::resolve_read_handle_cap(4096u, 1024u), 4096u);
-    // 自动（0）→ 约一半，下限 64。
+    // 自动（0）→ 约一半，夹在 [64, 1024]。
     EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 1024u), 512u);
     EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 2048u), 1024u);
     EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 100u), 64u);   // 50 < 64 → 抬到下限
     EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 0u), 64u);     // 极端：仍给下限
+    // S33-6 绝对上限：rlimit 一大（容器/systemd 常见 5×10^5+）时「取一半」
+    // 等于没有上限——实测 89 个 data 文件的库把 89 个 fd + 88 个 mmap 全留着。
+    EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 4096u), 1024u);      // 2048 → 封顶
+    EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 524288u), 1024u);    // 本机实际 ulimit
+    EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 1u << 20), 1024u);
+    EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 2047u), 1023u);      // 上限边界内侧
+    EXPECT_EQ(Cask::resolve_read_handle_cap(0u, 2049u), 1024u);      // 边界外侧
+    // 显式值不受夹取影响（caller 自负 fd 预算）。
+    EXPECT_EQ(Cask::resolve_read_handle_cap(9999u, 524288u), 9999u);
+    EXPECT_EQ(Cask::resolve_read_handle_cap(1u, 524288u), 1u);
 }
 
 // S12-2：auto-compact 开启下，并发读者 + churn 写者经异步管线（reducer 线程内触发
