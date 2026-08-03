@@ -1023,9 +1023,16 @@ std::size_t Cask::resolve_read_handle_cap(std::size_t opt,
     if (opt == CaskOptions::kUnlimitedReadHandles) return 0;  // 显式不限
     if (opt != 0) return opt;                                 // 显式上限
     // 自动（opt==0）：留约一半 fd 给 active writer / WAL / hint / meta / lock 等
-    // 非缓存 fd，其余给 read 句柄缓存。下限 64，避免极低 ulimit 下 cap 过小。
+    // 非缓存 fd，其余给 read 句柄缓存。
+    //   下限 64      ——避免极低 ulimit 下 cap 过小；
+    //   绝对上限 1024——S33-6：rlimit 一大（容器/systemd 常见 5×10^5 甚至
+    //     10^6），"一半"就等于**没有上限**，实测 89 个 data 文件的库把 89 个
+    //     fd + 88 个 mmap 全留着；封顶后 fd/mmap 与库规模脱钩。1024 个句柄在
+    //     默认 max_file_size=2GiB 下对应约 2TB 数据，正常库根本碰不到；真需要
+    //     更多的显式给 N 或 kUnlimitedReadHandles。
     const std::size_t derived = nofile_soft / 2;
-    return derived < 64 ? 64 : derived;
+    if (derived < kAutoReadHandleFloor) return kAutoReadHandleFloor;
+    return derived > kAutoReadHandleCeiling ? kAutoReadHandleCeiling : derived;
 }
 
 // P9:read_files_ 超 max_read_handles 时,淘汰 atime 最旧的**空闲**句柄

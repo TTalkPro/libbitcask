@@ -74,8 +74,10 @@ struct CaskOptions {
     // P9/S12-1：read 句柄缓存上限（每句柄 = 1 fd + 1 sealed mmap，故此值同时界定
     // fd 数与 mmap 映射数）。取值：
     //   0（默认）              → **自动**：由 RLIMIT_NOFILE 软上限推导安全上限
-    //                            （约一半，下限 64），开箱即防大库无界累积 fd/mmap
-    //                            撞 `ulimit -n` / `vm.max_map_count`；
+    //                            （约一半，**夹在 [64, 1024]**——S33-6 加的绝对
+    //                            上限：rlimit 一大时"一半"等于没有上限），开箱即
+    //                            防大库无界累积 fd/mmap 撞 `ulimit -n` /
+    //                            `vm.max_map_count`；
     //   kUnlimitedReadHandles → 不限（旧默认行为：最大吞吐、无淘汰 churn，caller 自负 fd 预算）；
     //   其它 N                → 显式上限。
     // 超额时近似 LRU 淘汰**空闲**句柄（在途读者持 shared_ptr 续命，随最后引用析构才释放）。
@@ -514,11 +516,16 @@ public:
     /// 预算上限生效）。线程安全：共享锁读。
     [[nodiscard]] std::size_t read_handle_count() const;
 
+    /// 自动档（`max_read_handles == 0`）的上下界。S33-6 加绝对上限：rlimit
+    /// 一大（容器/systemd 常见 5×10^5+），"取一半"等于没有上限。
+    static constexpr std::size_t kAutoReadHandleFloor   = 64;
+    static constexpr std::size_t kAutoReadHandleCeiling = 1024;
+
     /// S12-1：把 `CaskOptions::max_read_handles` 解析为 evict 使用的有效上限。
     ///   kUnlimitedReadHandles → 0（evict 语义下的「不限」）；
     ///   0                     → 由 `nofile_soft`（RLIMIT_NOFILE 软上限）推导的
-    ///                           安全默认（约一半，下限 64）；
-    ///   其它 N                → N（原样）。
+    ///                           安全默认（约一半，**夹在 [64, 1024]**）；
+    ///   其它 N                → N（原样，不夹）。
     /// 纯函数（不查询系统），便于确定性单测。
     [[nodiscard]] static std::size_t
     resolve_read_handle_cap(std::size_t opt, std::size_t nofile_soft) noexcept;
