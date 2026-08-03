@@ -1,9 +1,44 @@
 #include "bitcask/oki_state.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <filesystem>
 
 namespace bitcask::oki {
+
+namespace {
+
+// `kv.oki.seg-<gen>` → gen；非该形态 / 数字非法 → nullopt。
+std::optional<std::uint64_t> parse_run_gen(std::string_view filename) {
+    constexpr std::string_view kPrefix = "kv.oki.seg-";
+    if (!filename.starts_with(kPrefix)) return std::nullopt;
+    const auto digits = filename.substr(kPrefix.size());
+    if (digits.empty()) return std::nullopt;
+    std::uint64_t g = 0;
+    const auto* end = digits.data() + digits.size();
+    auto [p, ec] = std::from_chars(digits.data(), end, g);
+    if (ec != std::errc{} || p != end) return std::nullopt;
+    return g;
+}
+
+// 删除目录内 gen 不在 keep 集里的全部 run 文件。
+// **不能只删旧 manifest 列出的那些**：触发重建的典型场景恰恰是 manifest
+// 缺失/损坏（此时内存 manifest_ 为空），那批 run 文件就成了无人回收的
+// 孤儿，每重建一次多一批。在途 ReadView 经 shared_ptr 持旧 Reader，
+// unlink 后 fd 仍可读到 close——安全。
+void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep) {
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const auto name = e.path().filename().string();
+        const auto g = parse_run_gen(name);
+        if (!g) continue;
+        if (std::find(keep.begin(), keep.end(), *g) != keep.end()) continue;
+        std::error_code rm_ec;
+        std::filesystem::remove(e.path(), rm_ec);
+    }
+}
+
+}  // namespace
 
 void OkiState::append(std::string_view key, std::uint64_t ord, bool tomb) {
     // 水位门（wm = 排他上界 = 尚未覆盖的最小 ord；首个合法 LSN 是 0，
@@ -126,45 +161,55 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
         return a.ord < b.ord;
     });
 
+    // S33-6：零活 key（空库 / 全删）**不落空 run**——空 run 归并不出任何行，
+    // 却占一个文件 + 一个常驻 Reader fd，且要等下次 rebuild 才被清理。
+    // 「0 个 run + wm = cover_ord」已完整表达语义：[0, cover_ord) 里没有任何
+    // 需要被覆盖的活 key，其后的行照常走 memdelta。
     const std::uint64_t gen = next_gen_locked();
-    auto w = OkiRunWriter::create(mk_run_filename(dir, gen));
-    if (!w) return false;
-    for (std::size_t i = 0; i < rows.size(); ++i) {
-        if (i + 1 < rows.size() && rows[i + 1].key == rows[i].key) continue;
-        const auto& r = rows[i];
-        auto a = w->add(std::span<const std::byte>(
-                            reinterpret_cast<const std::byte*>(r.key.data()),
-                            r.key.size()),
-                        r.ord, r.tomb);
-        if (!a) return false;
-    }
-    if (!w->finish(/*fsync_dir=*/true)) return false;
+    std::shared_ptr<OkiRunReader> new_reader;
+    if (!rows.empty()) {
+        auto w = OkiRunWriter::create(mk_run_filename(dir, gen));
+        if (!w) return false;
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            if (i + 1 < rows.size() && rows[i + 1].key == rows[i].key) continue;
+            const auto& r = rows[i];
+            auto a = w->add(std::span<const std::byte>(
+                                reinterpret_cast<const std::byte*>(r.key.data()),
+                                r.key.size()),
+                            r.ord, r.tomb);
+            if (!a) return false;
+        }
+        if (!w->finish(/*fsync_dir=*/true)) return false;
 
-    auto rd = OkiRunReader::open(mk_run_filename(dir, gen));  // S33-5
-    if (!rd) {
-        std::error_code ec;
-        std::filesystem::remove(mk_run_filename(dir, gen), ec);
-        return false;
+        auto rd = OkiRunReader::open(mk_run_filename(dir, gen));  // S33-5
+        if (!rd) {
+            std::error_code ec;
+            std::filesystem::remove(mk_run_filename(dir, gen), ec);
+            return false;
+        }
+        new_reader = std::make_shared<OkiRunReader>(*std::move(rd));
     }
 
     OkiManifest next;
-    next.runs.push_back({gen, cover_ord});
+    if (new_reader) next.runs.push_back({gen, cover_ord});
     next.wm = cover_ord;
     if (!write_manifest(dir, next)) {
         std::error_code ec;
-        std::filesystem::remove(mk_run_filename(dir, gen), ec);
+        if (new_reader) std::filesystem::remove(mk_run_filename(dir, gen), ec);
         return false;
     }
 
-    // 提交后清理：旧 run 文件 + memdelta（内容已被全量快照覆盖）。在途
-    // ReadView 经 shared_ptr 持旧 Reader，unlink 后 fd 仍可读——安全。
-    for (const auto& r : manifest_.runs) {
-        std::error_code ec;
-        std::filesystem::remove(mk_run_filename(dir, r.gen), ec);
+    // 提交后清理：目录内一切非本次 run 的 seg 文件 + memdelta（其内容已被
+    // 全量快照覆盖）。用目录扫描而非「遍历旧 manifest」——见 sweep_runs 注释
+    // （manifest 丢失正是重建的触发场景，那批 run 不在内存里）。
+    {
+        std::vector<std::uint64_t> keep;
+        if (new_reader) keep.push_back(gen);
+        sweep_runs(dir, keep);
     }
     manifest_ = std::move(next);
     readers_.clear();
-    readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
+    if (new_reader) readers_.emplace_back(gen, std::move(new_reader));
     wm_.store(manifest_.wm, std::memory_order_release);
     loaded_.store(true, std::memory_order_release);
     {

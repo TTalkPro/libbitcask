@@ -80,6 +80,8 @@ public:
     // ——单一全量 run 的缺席即语义）。排序写单 run、manifest 只含它、
     // wm=cover_ord，删除全部旧 run 文件，清空 memdelta（其内容已被快照
     // 覆盖）。与 flush 互斥。
+    // S33-6：rows 为空（空库 / 全删）时**不落空 run**——manifest 记 0 个
+    // run + wm=cover_ord，语义等价且不留空文件与常驻 fd。
     [[nodiscard]] bool rebuild(std::string_view dir,
                                std::vector<DeltaRow>&& rows,
                                std::uint64_t cover_ord);
