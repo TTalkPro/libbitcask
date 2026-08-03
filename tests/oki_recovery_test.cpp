@@ -7,8 +7,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -186,6 +188,145 @@ TEST_F(OkiRecoveryTest, RebuildWithNoLiveKeysWritesNoEmptyRun) {
                   "z1");
         (*c)->close();
     }
+}
+
+// S33-6：run 归并（设计 §5.2「极简两层」）。不归并时 run 数 = flush 次数
+// 线性增长——每 run 一个常驻 fd + open 期全文件 CRC + range 多一路归并，
+// 且墓碑行永远回收不掉。阈值 kCompactRunLimit=8：第 9 次 flush 后塌成 1 个。
+TEST_F(OkiRecoveryTest, RunCompactionCollapsesRunsAtThreshold) {
+    CaskOptions o;
+    o.read_write = true;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    auto& cask = **c;
+
+    auto seg_count = [&] {
+        std::size_t n = 0;
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(dir_, ec)) {
+            if (e.path().filename().string().starts_with("kv.oki.seg-")) ++n;
+        }
+        return n;
+    };
+
+    const auto limit = bitcask::oki::OkiState::kCompactRunLimit;
+    // 前 limit 轮：每轮一次 flush（checkpoint 搭车）→ run 数逐一递增。
+    for (std::size_t round = 0; round < limit; ++round) {
+        ASSERT_TRUE(cask.put(bytes("c" + std::to_string(round)), bytes("v"),
+                             1000));
+        ASSERT_TRUE(cask.checkpoint());
+        EXPECT_EQ(cask.keydir().oki().run_count(), round + 1)
+            << "阈值内不该归并（round " << round << "）";
+    }
+    // 第 limit+1 次 flush：run 数越过阈值 → 全归并成 1 个。
+    ASSERT_TRUE(cask.put(bytes("c" + std::to_string(limit)), bytes("v"), 1000));
+    ASSERT_TRUE(cask.checkpoint());
+    EXPECT_EQ(cask.keydir().oki().run_count(), 1u) << "越阈值须塌成单 run";
+    EXPECT_EQ(seg_count(), 1u) << "旧 run 文件须被清理（fd 与磁盘同时回收）";
+
+    auto m = bitcask::oki::read_manifest(dir_.string());
+    ASSERT_TRUE(m.has_value());
+    EXPECT_EQ(m->runs.size(), 1u);
+    EXPECT_EQ(m->wm, cask.keydir().peek_next_ord())
+        << "归并不推进也不倒退水位";
+
+    // 数据完整：归并前写的 key 一条不少，且 range 仍按序出货。
+    auto it = cask.make_range_iter(bitcask::RangeOptions{});
+    ASSERT_TRUE(it.has_value());
+    std::vector<std::string> got;
+    while (true) {
+        auto e = (*it)->next();
+        ASSERT_TRUE(e.has_value());
+        if (!e->has_value()) break;
+        got.emplace_back(reinterpret_cast<const char*>((*e)->key.data()),
+                         (*e)->key.size());
+    }
+    ASSERT_EQ(got.size(), limit + 1);
+    EXPECT_TRUE(std::is_sorted(got.begin(), got.end()));
+    cask.close();
+}
+
+// S33-6：全归并**真正丢弃墓碑**（不是留一条 tomb 行）。前置约束：只有全归并
+// 才能丢——同 key 的 put 行与 tomb 行必定同在本次归并里。
+TEST_F(OkiRecoveryTest, FullCompactionDropsTombstoneRows) {
+    CaskOptions o;
+    o.read_write = true;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    auto& cask = **c;
+
+    // 每轮一次 flush，把 put 与后续的 remove 刻意分散到不同 run 里。
+    // 总 flush 次数须**留在阈值内**，否则归并提前触发，验不到「归并前」态。
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(cask.put(bytes("t" + std::to_string(i)), bytes("v"), 1000));
+        ASSERT_TRUE(cask.checkpoint());
+    }
+    for (int i = 0; i < 2; ++i) {  // 删前 2 个（put 行在更早的 run 里）
+        ASSERT_TRUE(cask.remove(bytes("t" + std::to_string(i)), 2000));
+        ASSERT_TRUE(cask.checkpoint());
+    }
+    ASSERT_LE(cask.keydir().oki().run_count(),
+              bitcask::oki::OkiState::kCompactRunLimit)
+        << "本段须停在阈值内";
+    // 归并前：墓碑以 tomb 行的形态存在于 run 里。
+    {
+        auto view = read_all_runs(dir_.string());
+        ASSERT_TRUE(view.count("t0"));
+        EXPECT_TRUE(view.at("t0").second) << "归并前 t0 应是 tomb 行";
+    }
+
+    // 再 flush 若干次越过阈值 → 全归并。
+    for (int i = 100; cask.keydir().oki().run_count() > 1 && i < 120; ++i) {
+        ASSERT_TRUE(cask.put(bytes("z" + std::to_string(i)), bytes("v"), 1000));
+        ASSERT_TRUE(cask.checkpoint());
+    }
+    ASSERT_EQ(cask.keydir().oki().run_count(), 1u);
+
+    // 归并后：被删的 key **整条不在 run 里**（连 tomb 行都没有），活 key 齐全。
+    auto view = read_all_runs(dir_.string());
+    for (int i = 0; i < 2; ++i) {
+        EXPECT_EQ(view.count("t" + std::to_string(i)), 0u)
+            << "t" << i << " 的墓碑行应被全归并丢弃";
+    }
+    for (int i = 2; i < 4; ++i) {
+        ASSERT_EQ(view.count("t" + std::to_string(i)), 1u);
+        EXPECT_FALSE(view.at("t" + std::to_string(i)).second);
+    }
+
+    // 语义不变：range 输出 == 活 key 集合，且删掉的 key 不出现。
+    auto it = cask.make_range_iter(bitcask::RangeOptions{});
+    ASSERT_TRUE(it.has_value());
+    std::set<std::string> got;
+    while (true) {
+        auto e = (*it)->next();
+        ASSERT_TRUE(e.has_value());
+        if (!e->has_value()) break;
+        got.emplace(reinterpret_cast<const char*>((*e)->key.data()),
+                    (*e)->key.size());
+    }
+    EXPECT_EQ(got.count("t0"), 0u);
+    EXPECT_EQ(got.count("t2"), 1u);
+
+    // 归并后删除的 key 重新写回：新行走 memdelta，必须重新可见（丢墓碑
+    // 不能让"再 put"丢失）。
+    ASSERT_TRUE(cask.put(bytes("t0"), bytes("again"), 3000));
+    auto it2 = cask.make_range_iter(bitcask::RangeOptions{});
+    ASSERT_TRUE(it2.has_value());
+    bool found_t0 = false;
+    while (true) {
+        auto e = (*it2)->next();
+        ASSERT_TRUE(e.has_value());
+        if (!e->has_value()) break;
+        if (std::string(reinterpret_cast<const char*>((*e)->key.data()),
+                        (*e)->key.size()) == "t0") {
+            found_t0 = true;
+            EXPECT_EQ(std::string(reinterpret_cast<const char*>(
+                          (*e)->value.data()), (*e)->value.size()),
+                      "again");
+        }
+    }
+    EXPECT_TRUE(found_t0) << "归并丢墓碑后重新 put 的 key 必须可见";
+    cask.close();
 }
 
 TEST_F(OkiRecoveryTest, ReopenAfterCleanCloseDoesNotRebuild) {
