@@ -10,6 +10,85 @@
 
 ---
 
+## [未发布] 6.0.0（S33：有序 key 索引 OKI + hint ord flag-day）
+
+> 版本号尚未 bump（`project(libbitcask VERSION ...)` 仍是 5.0.0）——发布时
+> 一并把库 `VERSION` / `SOVERSION` 提到 6，本节即发布说明草稿。
+> 盘上格式版本：`bitcask.meta` = **v5**（已落地），hint = **BCH5**，
+> OKI run = **BCOK v1** / manifest = **BCOM v1**。
+
+### ⚠️ 盘上格式破坏（major bump 的原因）
+
+**hint 内嵌 ord flag-day**——hint 记录新增 `ord` 字段（vbyte 差分），
+magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁。
+v4 纪元目录 open 时**干净拒开**并提示迁移命令，**不必重建**：
+`bitcask_migrate hintord <src> <dst>` 是**非破坏性 + data 字节零改动**的
+迁移路径（data 硬链接，只重生成 hint + meta；meta 最后写 = commit point，
+幂等可重跑）。C ABI 与 C++ API **无破坏性变更**（本轮只有新增）。
+
+动机：v4 时代 hint 不存 ord，hint 快路径恢复的条目 ord 恒 0，与 fold(data)
+不等价；v5 之后两条恢复路径逐 key 等价，这也是 OKI tail 重放的前提。
+
+### Added（OKI：有序 key 索引 / range 查询）
+
+- **`Cask::make_range_iter(RangeOptions{lo, hi, ...})` + `CaskRangeIter`**：
+  按 key 字典序遍历 `[lo, hi)`，**O(range)** 取代 O(全表) 过滤。实测
+  （10 万 key，选择性 1/256）：`CaskIter::start(key_prefix)` 8.0 ms →
+  **0.53 ms（15×）**，且耗时随选择性线性下降。一致性为 per-key 弱一致
+  （与 `parallel_scan` 同档，非 fold 快照）。
+- **`RangeOptions::prefetch` / `prefetch_threads`**：批量并发预取值——只
+  改取值时机，输出序与内容不变。大窗口 + 冷值形态收益明显
+  （1 KiB 值 / 6250 命中：10.8 ms → 7.6 ms）。
+- **OKI 盘上结构**（派生缓存，校验不过即整体弃用重建）：
+  `kv.oki.seg-<gen>`（BCOK v1：~4 KiB 块 + 块内 key 前缀差分 + 稀疏块索引
+  + trailer CRC）与 `kv.oki.manifest`（BCOM v1：run 集合 + 覆盖水位，
+  `atomic_write_bytes(fsync_dir=true)` 唯一 commit point）。
+- **写挂钩与恢复**：挂钩收敛在 `KeyDir::put/remove` 咽喉点（Cask 各写路径零
+  改动）；flush 恒在 keydir 快照之后搭车；open 时 `wm < 快照 next_ord` 或
+  manifest 缺失/损坏 → 全量重建兜底。put 路径实测回归 ≈1.2%（预算 ≤3%）。
+- **C API（新增导出，ABI 纯增量）**：
+  `bitcask_range_iter_start` / `_next` / `_next_batch` / `_release` /
+  `bitcask_range_entry_free` / `bitcask_range_options_init` +
+  `bitcask_range_options_t` / `bitcask_range_entry_t`；
+  另补齐既有能力的 C 侧入口：`bitcask_iter_start_prefix`、
+  `bitcask_parallel_scan_prefix`（空切片时与无前缀版完全等价）。
+- **迁移工具**：`bitcask_migrate hintord`（v4 → v5）+ `detect` 识别 v4/v5。
+
+### Fixed
+
+- **并行恢复下的墓碑复活**（S33-B1，既有 bug）：纯 KV 并行恢复（按文件并发
+  fold）中「墓碑文件先完成」或「remove 先到 + put 后到」会让已删 key 复活
+  ——到达序依赖。修复引入 ord 全序判据：`KeyDir::remove` 支持记录缺席墓碑
+  sentinel（带 ord 高水位），`put_insert` 复活须 `put.ord > 墓碑 ord`。
+  运行期路径语义零变化。复现率 8/30 → 修后 40/40 稳过。
+- **mmap 窗口外读竞态**（S33-B2，S30 × S13 既有 bug）：merge 输出在分批 CAS
+  期间仍在增长，读者以打开时刻尺寸 mmap 后，后续批次 CAS 的条目落在映射窗口
+  外 → `get` 误报 `kIo`。修复：mmap 分支的 `kShortRead` 跌落 pread
+  （kBadCrc 等仍报错）。并发 stress 修前 3/3 读者中招 → 修后 0/20。
+- **meta 错误信息被吞**：`Cask::open` 两处把 `MetaError.message` 吞成笼统
+  "read meta failed"，导致纪元迁移提示传不到用户——已透传。
+- **文件尾墓碑不推进 ord 水位**：`fold(data)` 墓碑分支原本不 `advance_ord`
+  （重启后 ord 复用的潜在隐患），已与 hint 路径对齐。
+
+### Changed
+
+- hint 读端**只认 BCH5**；BCH4 及更早在 `validate_trailer` / `fold_validated`
+  处按「缓存不可用」返回 false → 退 `fold(data)` 重建（纪元硬门禁由 meta v5
+  承担）。v2 定宽常量与 v2/v4 编解码整体删除。
+- `be2le` / `tstamp64` 的目标纪元同步 bump 到 meta v5。
+- 三处手抄的 hint/data refill 循环归并为 `detail::ChunkedReader`（T23），
+  顺带修正 data_file 版丢失的 `len_ +` 项（巨型 record 的 need 公式）。
+
+### Docs
+
+- `doc/format-zh.md`：§六 重写为 hint v5（BCH5），新增 §十五 OKI
+  （BCOK/BCOM 字节级布局 + 生命周期）；§14.2 迁移子命令补 `hintord`。
+- `doc/api-cpp.md` / `doc/api-c.md`：range 迭代器与预取契约、所有权配对表、
+  线程安全表同步；`doc/migrate-le.md` / `README.md` 同步纪元与新能力。
+- 新设计文档 `doc/ordered-key-index-design-zh.md`。
+
+---
+
 ## [5.0.0] - 2026-07-17
 
 ### ⚠️ ABI / 盘上格式破坏（major bump 的原因）

@@ -30,11 +30,12 @@
 | 混合检索 | `search_hybrid` | BM25 + 向量 RRF(60) 融合 | [`hybrid_searcher.hpp`](include/bitcask/hybrid_searcher.hpp) |
 | 同义词 | `CaskOptions::synonym_map`（open-time） | 查询时自动展开，不可变、并发安全 | [`synonym_map.hpp`](include/bitcask/synonym_map.hpp) |
 | 迭代 | `make_iter` | MVCC 快照（兄弟链 + pending 哈希） | [`keydir-sharding-design-zh.md`](doc/keydir-sharding-design-zh.md) |
-| 并行扫描 | `parallel_scan` | 多线程全表扫描（快照 key → 分段并发 get） | [`api-cpp.md`](doc/api-cpp.md) |
+| **有序 range 扫描** | `make_range_iter`（`RangeOptions{lo,hi,prefetch}`） | OKI 有序 key 索引：`[lo,hi)` 字典序遍历，**O(range)** 而非 O(全表)（实测 1/256 选择性 8.0 ms → 0.53 ms）；可选值预取 | [`ordered-key-index-design-zh.md`](doc/ordered-key-index-design-zh.md) |
+| 并行扫描 | `parallel_scan` | 多线程全表扫描（快照 key → 分段并发 get；支持 key 前缀过滤） | [`api-cpp.md`](doc/api-cpp.md) |
 | 合并 | `merge` / `needs_merge` | 与读写并发的独立 `merge.lock` 模型 | [`merge-policy-zh.md`](doc/merge-policy-zh.md) |
 | 备份 | 文件级拷贝 + `flush_index` | WAL 一致点落盘 | [`wal-batch-design-zh.md`](doc/wal-batch-design-zh.md) |
 | 升级 | `Cask::upgrade` | 离线把 KV 目录升为索引模式 | [`api-cpp.md`](doc/api-cpp.md) |
-| 迁移 | `bitcask_migrate`（CLI） | 统一纪元迁移：`detect` / `be2le`（v1 大端）/ `tstamp64`（u32 → u64，5.0 flag-day）；非破坏性 | [`migrate-le.md`](doc/migrate-le.md) |
+| 迁移 | `bitcask_migrate`（CLI） | 统一纪元迁移：`detect` / `be2le`（v1 大端）/ `tstamp64`（u32 → u64，5.0 flag-day）/ `hintord`（hint 补 ord，6.0 flag-day，data 零改动）；非破坏性 | [`migrate-le.md`](doc/migrate-le.md) |
 | 状态 | `status` / `read_handle_count` | 内省 key 数 / fd 预算 / 索引错误计数 | [`api-cpp.md`](doc/api-cpp.md) |
 | C ABI | `libbitcask.so` | `extern "C"` 不透明句柄 + slice + fault，跨 ABI 稳定 | [`api-c.md`](doc/api-c.md) |
 
@@ -278,14 +279,15 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 │                                                                     │
 │  ├─ KeyDir（256 分片 shared_mutex + MVCC 迭代器）                   │
 │  ├─ DataFile 缓存（pread 句柄 + 近似 LRU 淘汰）                    │
-│  ├─ HintFile（活跃写入器 + v4 trailer CRC + sealed-mmap hint）      │
+│  ├─ HintFile（活跃写入器 + BCH5 trailer CRC + sealed-mmap hint）   │
+│  ├─ OkiState（有序 key 索引：memdelta + BCOK run + BCOM manifest）  │
 │  ├─ DocMap（Index：ord↔ext/live/meta 宿主服务；查询面 DocTable）   │
 │  ├─ TextPlugin "bm25"（倒排/Analyzer/缓存/高亮/bm25.ckpt 文件族）  │
 │  ├─ VectorPlugin "hnsw"（VectorEnginePlugin 契约：HNSW/IVF-RaBitQ/DiskANN │
 │  │   三引擎按 meta.vector_engine 选定；归一化/vec.ckpt 族 + .vec/.qc8 侧车）│
 │  ├─ HybridSearcher（RRF 融合器；持两插件引用）                     │
 │  ├─ CaskPluginHost（read_at / run_serialized / log 窄反向接口）    │
-│  ├─ MetaConfig（bitcask.meta v4：magic + version + CRC32 + u64 纪元门禁）│
+│  ├─ MetaConfig（bitcask.meta v5：magic + version + CRC32 + 纪元门禁）│
 │  └─ IndexPool（异步索引 MapReduce，借自 KeyDirRegistry）           │
 └────────────────────────────┬────────────────────────────────────────┘
                                │

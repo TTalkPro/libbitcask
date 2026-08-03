@@ -254,14 +254,55 @@ memdelta 排序去重快照）+ `tests/oki_range_test.cpp`（3 测试）+
   零拷贝路径对窗口内读不变。
 - **验收**：并发 stress 修前 3/3 读者报错 → 修后 0/20 全过。
 
-### S33-6 — C API + 值预取 + bench + 文档 🟡 MED
+### ✅ S33-6 — C API + 值预取 + bench + 文档 🟡 MED
 
-- C API：`bitcask_range_iter_*`（顺手补现缺的 `key_prefix` 能力）
-- 值预取：`RangeOptions::prefetch`（parallel_scan 线程池基建复用）
-- `range_bench` 对比 S33-1 基线；RSS 探针启用扩展（memdelta/重建峰值）
-- 文档同步：`api-cpp.md` / `api-c.md` / `format-zh.md` / `migrate-le.md` / README
-- **工作量**：1 天
-- **验收**：build-rel 双树 + bench 入基线
+- [x] C API：`bitcask_range_iter_*`（顺手补现缺的 `key_prefix` 能力——
+      `bitcask_iter_start_prefix` + `bitcask_parallel_scan_prefix`）
+- [x] 值预取：`RangeOptions::prefetch`（parallel_scan 同款分段并发 get）
+- [x] `range_bench` 对比 S33-1 基线；RSS 探针扩展（memdelta/run/重建峰值）
+- [x] 文档同步：`api-cpp.md` / `api-c.md` / `format-zh.md` / `migrate-le.md` / README
+- **工作量**：1 天（实际 1 天内）
+- **验收**：✅ build-rel 双树 + bench 入基线（数字见下方落地记录）
+
+#### ✅ S33-6 落地记录（2026-08-03）
+
+C API `bitcask_range_iter_*`（6 个新导出 + 2 个新结构体）、
+`RangeOptions::prefetch`、bench 扩展、文档同步四块全部落地。要点：
+
+- **值预取**：`prefetch`（批大小）+ `prefetch_threads`（0 = min(hw, 4)）。
+  实现分层——归并层 `next_merged_key()`（串行、廉价）+ 取值层（分段并发
+  `get_owned`，与 `parallel_scan` 同款 JoiningPool）。**语义不变量：只改
+  取值时机，输出序与内容和惰性路径逐 key 逐 value 相同**（测试断言）。
+  死 key 在批内丢弃 ⟹ 缓冲可能空而迭代未结束（续跑路径专门测了「删掉
+  一整段 ≥ 最大批」）。
+- **计划外的一处调优**：线程是**每批**创建的（无常驻池），实测批 64 ×
+  4 线程比惰性还慢 50%（16.1 vs 10.8ms——98 批 × 4 次线程创建）。加
+  「每线程至少 64 key」的收窄后，小批自动退化为串行。最终数字（tmpfs、
+  1KiB 值、6250 命中）：惰性 10.8ms / 批 64 = 11.6ms（打平）/ 批 256 ×
+  4 线程 = **7.6ms（1.4×）**。收益形态是「大窗口 + 冷值」，故默认关闭，
+  头文件与 api-cpp 都写明了这条取舍。
+- **C API 补齐**：`bitcask_iter_start_prefix` / `bitcask_parallel_scan_prefix`
+  ——既有 C++ 形参在 C 侧一直缺口；实现上把**带前缀版做成主体**、无前缀版
+  以空切片调用它（零重复逻辑）。range 侧 entry 另立
+  `bitcask_range_entry_t`（无 file_id/offset/tomb——range 只产活 key）。
+- **bench**：`BM_Cask_RangeScan_OKI_Prefetch`（5 组参数，含同二进制内的惰性
+  对照）+ `BM_Oki_MemProbe`（memdelta 行/字节 + RSS 增量、run 字节/每 key、
+  **重建峰值 RSS**——后台采样线程取 max，计时段只含重建）。10 万 key 锚点：
+  memdelta 5.7MB（RSS +25.3MB 含 keydir）、run **6.2 B/key**（11B key 的前缀
+  差分效果）、重建峰值 +8.9MB / 49.5ms。
+- **文档**：`format-zh.md` §六 **重写**（原文还停在 v2/v4——S33-2 只改了常量
+  表，正文是漏网的陈旧描述）+ 新增 **§十五 OKI**（BCOK/BCOM 字节级布局 +
+  生命周期 + wm 排他语义）+ §14.2 补 `hintord`；`api-cpp.md`（§5.8 +
+  §6 CaskRangeIter + 线程表 + 示例）、`api-c.md`（§11.7 全套 + 所有权配对表
+  + 线程表 + §4.1/§7.5b 类型）、`migrate-le.md`（纪元 v3→v5 陈旧修正 +
+  OKI 不迁移行）、`README.md`（能力表 + 架构图）。
+- **CHANGELOG**：新增 `[未发布] 6.0.0` 段（S33 全景：flag-day + OKI + C API
+  + 两个 B 级修复）。**版本号未 bump**——`project(VERSION)` 仍 5.0.0，
+  发布时连同 SOVERSION 一起提到 6（本轮不擅自动发布边界）。
+- **验收**：Debug 全量 **672/672**（+1 新测试；1 预存 Disabled）|
+  **ASan 全量 672/672** | **TSan 相关套件 147/147**（CI 豁免口径，未新增
+  豁免；C API 新路径含 prefetch 也在 TSan 下跑过）| build-rel 全树零错误
+  （含 bench，公共结构体 `RangeOptions` 双树验证）。
 
 ### S33-7 — Level B 门禁评审 🟢 LOW（依 S33-1 数据）
 
@@ -308,5 +349,14 @@ S33-7 (评审)  ───── 依 S33-1 数据
 | S33-4 memdelta + 写挂钩 | ✅ done（Debug 668/668；put 挂钩 ≈1.2% 达标）|
 | S33-5 Range 查询路径 | ✅ done（三方对拍 + 并发 stress；**1/256 选择性 8.01→0.53ms = 15×，耗时随选择性线性**；Debug 671/671）|
 | S33-B2 mmap 窗口外读修复 | ✅ done（S30×S13 既有竞态；kShortRead 跌落 pread；修前 3/3 中招 → 0/20）|
-| S33-6 C API + 文档收尾 | 🟡 下一步（--prebuild-oki 已确认不需要，从计划移除）|
-| S33-7 Level B 门禁评审 | ⬜ 未开始 |
+| S33-6 C API + 值预取 + bench + 文档 | ✅ done（range C API 6 导出；预取批 256×4 线程 1.4×；format-zh §六重写 + §十五 OKI；Debug/ASan 672/672）|
+| S33-7 Level B 门禁评审 | 🟡 下一步（数据已齐：keydir ~122 B/key，见下）|
+
+### S33-7 输入数据（S33-1 + S33-6 探针汇总）
+
+门禁口径：**keydir RSS 占进程 RSS > ~40% 才立项** keydir 磁盘驻留。
+现有锚点（10 万 key、11B key、64B 值、tmpfs）：keydir 估算 11.6MB
+（~122 B/key）、OKI memdelta 5.7MB、OKI run 0.59MB（6.2 B/key）、
+重建峰值 +8.9MB。**该锚点规模太小、且 value 不在进程内**，占比不代表生产
+形态——立项与否须在生产规模负载（≥1000 万 key + 真实 value 分布）上重取
+`BM_KeyDir_MemProbe` / `BM_Oki_MemProbe` 两项后评审。
