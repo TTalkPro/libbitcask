@@ -108,7 +108,27 @@ public:
     static constexpr std::size_t kFlushRowLimit  = 1u << 20;       // 1M 行
     static constexpr std::size_t kFlushByteLimit = 64u << 20;      // 64 MiB
 
+    // S33-6：run 归并阈值（设计 §5.2「极简两层」）。flush 提交后 run 数超此
+    // 值即把**全部** run 归并成一个。不做 leveled compaction——OKI 条目不含
+    // value，全归并 1 亿 key 也就 ~1-2GB 顺序 IO。
+    // 不归并的后果（实测）：run 数 = flush 次数（close/merge 收尾/checkpoint
+    // 各一次）线性增长 ⟹ 每 run 一个常驻 fd + open 期全文件 CRC + range 多
+    // 一路归并，且墓碑行永远回收不掉。
+    static constexpr std::size_t kCompactRunLimit = 8;
+
 private:
+    // S33-6：把**全部** run 归并成单个新 run（持 flush_mu_ 调用）。
+    // run 数 ≤1 时 no-op。best-effort：失败原状不变（下次 flush 再试）。
+    //
+    // **墓碑真正丢弃**——仅在「全归并」下成立：同 key 的 put 行与 tomb 行必
+    // 定同在本次归并里，max-ord 胜出者若是 tomb 则两行一起丢，绝不会留下被
+    // 抵消掉的陈旧 put 行。若将来改成部分归并，这条**必须**收回（否则旧 run
+    // 里的 put 行会因抵消它的 tomb 消失而"复活"）。
+    // 完整性不变量（OKI key 集 ⊇ keydir 活 key 集）不受影响：被丢弃的 key
+    // 若之后重新 put，新行 ord > wm 走 memdelta（读视图含之），崩溃时也由
+    // tail 重放补回——归并不动 wm。
+    [[nodiscard]] bool compact_all_locked(std::string_view dir);
+
     void update_flush_hint_locked() noexcept {
         flush_hint_.store(
             delta_.size() >= kFlushRowLimit || delta_bytes_ >= kFlushByteLimit,

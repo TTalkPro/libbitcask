@@ -149,6 +149,107 @@ bool OkiState::flush(std::string_view dir) {
     manifest_ = std::move(next);
     readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
     wm_.store(manifest_.wm, std::memory_order_release);
+
+    // S33-6：run 数超阈值 → 全归并（设计 §5.2）。best-effort——失败不影响
+    // 本次 flush 的成功语义（run 集合原状保留，下次 flush 再试）。
+    if (manifest_.runs.size() > kCompactRunLimit) {
+        (void)compact_all_locked(dir);
+    }
+    return true;
+}
+
+// 全归并：k 路归并全部 run → 单个新 run。语义与 CaskRangeIter 的归并同款
+// （同 key 取 max-ord、tomb 抵消），差别是**结果落盘**且 tomb 行直接丢弃。
+bool OkiState::compact_all_locked(std::string_view dir) {
+    if (readers_.size() < 2) return true;
+
+    // 覆盖上界取并集（= 归并前的联合水位，归并不改变覆盖范围）。
+    std::uint64_t cover = 0;
+    for (const auto& r : manifest_.runs) cover = std::max(cover, r.cover_ord);
+    const std::uint64_t keep_wm = manifest_.wm;
+
+    const std::uint64_t gen = next_gen_locked();
+    auto w = OkiRunWriter::create(mk_run_filename(dir, gen));
+    if (!w) return false;
+    auto abort = [&] {
+        std::error_code ec;
+        std::filesystem::remove(mk_run_filename(dir, gen), ec);
+        return false;
+    };
+
+    // 各 run 一个游标 + 预取头元素。
+    std::vector<OkiRunReader::Cursor> cs;
+    std::vector<std::optional<OkiRunReader::Entry>> heads;
+    cs.reserve(readers_.size());
+    heads.reserve(readers_.size());
+    for (const auto& [g, rd] : readers_) {
+        auto c = rd->begin();
+        OkiRunReader::Entry e;
+        auto n = c.next(e);
+        if (!n) return abort();
+        cs.push_back(std::move(c));
+        heads.push_back(*n ? std::optional<OkiRunReader::Entry>(std::move(e))
+                           : std::nullopt);
+    }
+
+    while (true) {
+        std::string_view min_key;
+        bool any = false;
+        for (const auto& h : heads) {
+            if (h && (!any || std::string_view(h->key) < min_key)) {
+                min_key = h->key;
+                any = true;
+            }
+        }
+        if (!any) break;
+
+        const std::string key(min_key);  // 推进游标会失效 view，先物化
+        std::uint64_t win_ord = 0;
+        bool win_tomb = false;
+        bool first = true;
+        for (std::size_t i = 0; i < heads.size(); ++i) {
+            auto& h = heads[i];
+            if (!h || h->key != key) continue;
+            if (first || h->ord > win_ord) {
+                win_ord = h->ord;
+                win_tomb = h->tomb;
+                first = false;
+            }
+            OkiRunReader::Entry e;
+            auto n = cs[i].next(e);
+            if (!n) return abort();
+            if (*n) {
+                h = std::move(e);
+            } else {
+                h.reset();
+            }
+        }
+        if (win_tomb) continue;  // 全归并 ⟹ 墓碑真正丢弃（见头文件约束）
+        auto a = w->add(std::span<const std::byte>(
+                            reinterpret_cast<const std::byte*>(key.data()),
+                            key.size()),
+                        win_ord, /*tomb=*/false);
+        if (!a) return abort();
+    }
+    if (!w->finish(/*fsync_dir=*/true)) return abort();
+
+    auto rd = OkiRunReader::open(mk_run_filename(dir, gen));
+    if (!rd) return abort();
+
+    OkiManifest next;
+    next.runs.push_back({gen, cover});
+    next.wm = keep_wm;  // 归并不推进水位
+    if (!write_manifest(dir, next)) return abort();
+
+    manifest_ = std::move(next);
+    readers_.clear();
+    readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
+    // 旧 run + 此前崩溃残留的孤儿一并清（在途 ReadView 持 shared_ptr，
+    // unlink 后 fd 仍可读——安全）。
+    {
+        const std::uint64_t keep_gen[] = {gen};
+        sweep_runs(dir, keep_gen);
+    }
     return true;
 }
 
