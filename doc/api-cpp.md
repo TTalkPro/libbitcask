@@ -61,7 +61,7 @@ libbitcask 有两种工作模式，由 `CaskOptions` 决定：
 |------|------|------|------|--------|
 | `read_write` | `bool` | `false` | `false`=只读；`true`=可写（持 `bitcask.write.lock`） | `cask.hpp` |
 | `max_file_size` | `std::uint64_t` | `2 GiB` | 单个 data 文件上限，超过则 roll 到新文件 | `cask.hpp` |
-| `max_read_handles` | `std::size_t` | `0` | read 句柄缓存上限；`0`=由 RLIMIT_NOFILE 推导的安全默认；`kUnlimitedReadHandles`=不设上限；其它 N=显式上限；超额近似 LRU 淘汰空闲句柄 | `cask.hpp` |
+| `max_read_handles` | `std::size_t` | `0` | read 句柄缓存上限（**一个句柄 = 1 fd + 1 sealed mmap**，故同时界定 fd 数与映射数）；`0`=自动（RLIMIT_NOFILE 一半，**夹在 [64, 1024]**）；`kUnlimitedReadHandles`=不设上限；其它 N=显式上限；超额近似 LRU 淘汰**空闲**句柄（在途读者持 shared_ptr 续命）。调优见 [§11.1 fd / mmap 预算](#111-fd--mmap-预算怎么降打开文件数) | `cask.hpp` |
 | `o_sync` | `bool` | `false` | 每条写 durable（`O_SYNC`）；为真时 `sync_every_n` 无意义 | `cask.hpp` |
 | `sync_every_n` | `std::uint32_t` | `0` | 单写者组提交：每 N 次写 fsync 一次；`0`=关闭 | `cask.hpp` |
 | `auto_checkpoint_min_docs` | `std::uint32_t` | `65536` | 自动 checkpoint 阈值：自上次 ckpt 起 ord 增量 ≥ 本值则异步落快照；`0`=关闭；仅索引模式生效 | `cask.hpp` |
@@ -433,7 +433,9 @@ get_owned(std::span<const std::byte> key);
 resolve_read_handle_cap(std::size_t opt, std::size_t nofile_soft) noexcept;
 ```
 
-把 `CaskOptions::max_read_handles` 解析为 evict 使用的有效上限（纯函数，不查询系统，便于确定性单测）。`kUnlimitedReadHandles` → 0（evict 语义下的「不限」）；`0` → 由 `nofile_soft` 推导的安全默认（约一半，下限 64）；其它 N → N（原样）。
+把 `CaskOptions::max_read_handles` 解析为 evict 使用的有效上限（纯函数，不查询系统，便于确定性单测）。`kUnlimitedReadHandles` → 0（evict 语义下的「不限」）；`0` → 由 `nofile_soft` 推导的安全默认（约一半，**夹在 `[kAutoReadHandleFloor, kAutoReadHandleCeiling]` = [64, 1024]**）；其它 N → N（原样，不夹）。
+
+> **S33-6 加的绝对上限**：容器 / systemd 环境下 `RLIMIT_NOFILE` 常见 5×10⁵ 甚至 10⁶，"取一半"得出的 26 万形同虚设——实测 89 个 data 文件的库把 89 个 fd + 88 个 mmap 全留着不淘汰。封顶 1024 后 fd/mmap 与库规模脱钩；1024 个句柄在默认 `max_file_size = 2 GiB` 下对应约 2 TB 数据，正常库碰不到。需要更多请显式给 N 或 `kUnlimitedReadHandles`（caller 自负 fd 预算）。
 
 #### `Cask::parallel_scan`（并行全表扫描）
 
@@ -2204,7 +2206,43 @@ auto c = bitcask::Cask::open(dir, opts, &registry);
 
 ---
 
-## 11. 线程模型汇总
+## 11. 运维调优
+
+### 11.1 fd / mmap 预算：怎么降"打开文件数"
+
+一个 Cask 实例常驻的 fd 由四部分构成（实测形态，`bench` 同款负载下用 `/proc/self/fd` 数出来的）：
+
+| 来源 | 数量 | 是否有界 |
+|---|---|---|
+| 封口 data 文件的 read 句柄 | **大头**（每句柄 1 fd + 1 sealed mmap）| ✅ 受 `max_read_handles` 封顶 |
+| active data 写句柄 + active hint | 2 | ✅ 常数（封口 hint 不常驻）|
+| OKI run（`kv.oki.seg-*`）| ≤ `kCompactRunLimit + 1` = 9 | ✅ 由 run 归并保证（S33-6）|
+| `bitcask.write.lock` + `field.schema` | 2 | ✅ 常数 |
+
+**实测（1500 key、`max_file_size` 压到 4 KiB 逼出 89 个 data 文件）**：
+
+| 配置 | 盘上 data 文件 | 本库 fd | mmap |
+|---|---|---|---|
+| 默认 | 89 | 96 | 88 |
+| `max_read_handles = 16` | 89 | **24** | 16 |
+| `max_file_size = 1 MiB` | **1** | **8** | 0 |
+
+按这个顺序调：
+
+1. **先量**：`ulimit -n` 与目录里的 data 文件数。自动档取 `RLIMIT_NOFILE` 的一半——rlimit 很大时该值形同虚设（S33-6 起夹到 1024 封顶，但仍建议按业务显式给值）。
+2. **`max_read_handles = N`**：立即生效、不需要任何后台动作。超额时近似 LRU 淘汰**空闲**句柄；在途读者持 `shared_ptr` 续命，不会被抽走。代价是淘汰后再读该文件要重新 open + 重建 mmap，热点集中的负载几乎无感，全表随机扫会有 churn。
+3. **`max_file_size`**（默认 2 GiB）：从源头决定文件个数。100 GB 的库在默认值下约 50 个 data 文件；若线上被调小过，那才是文件数暴涨的根因。
+4. **别指望 merge 降 fd**：merge 的触发判据是**碎片率 / 死字节**（`frag_merge_trigger = 60%`、`dead_bytes_merge_trigger = 512 MiB`），不是文件个数。纯追加、无覆盖写与删除的库 `needs_merge()` 恒为 `false`（实测：89 个文件跑完 merge 仍是 89 个）。merge 解决的是**空间放大**，不是 fd 预算。
+
+> `vm.max_map_count`（默认 65530）是 mmap 侧的系统上限；`max_read_handles` 同时封顶映射数，故一并受控。
+
+### 11.2 merge 调度
+
+库内**不做周期策略**——`merge()` 由 caller 按业务低峰/写入量自行调度（`Cask::checkpoint` 同理）。用 `needs_merge()` 拿判据与候选文件列表；同一目录同时只能有一次 merge 在跑（caller 保证）。策略阈值见 [`merge-policy-zh.md`](merge-policy-zh.md)。
+
+---
+
+## 12. 线程模型汇总
 
 > **定位**：libbitcask 是**通用 C++ 库**——同一 Cask handle 可被多线程安全共享。详见 [`design/thread-safety.md`](../docs/design/thread-safety.md)。
 

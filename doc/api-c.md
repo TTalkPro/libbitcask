@@ -243,8 +243,8 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts);
 | 字段 | 类型 | 默认 | 含义 |
 |------|------|------|------|
 | `read_write`        | `int`      | `0`      | `0`=只读，`1`=读写 |
-| `max_file_size`     | `uint64_t` | `2 GiB`  | 单 data 文件上限 |
-| `max_read_handles`  | `size_t`   | `0`      | read 句柄缓存上限（`0`=不限）|
+| `max_file_size`     | `uint64_t` | `2 GiB`  | 单 data 文件上限（决定 data 文件个数，见 §6.5.1）|
+| `max_read_handles`  | `size_t`   | `0`      | read 句柄缓存上限（**一个句柄 = 1 fd + 1 sealed mmap**）；`0`=自动（`RLIMIT_NOFILE` 一半，夹在 **[64, 1024]**）；`SIZE_MAX`=不限；其它 N=显式上限。见 §6.5.1 |
 | `o_sync`            | `int`      | `0`      | 每条写 durable（O_SYNC）|
 | `sync_every_n`      | `uint32_t` | `0`      | 每 N 次写 group-commit 一次（`0`=关闭）|
 | `expiry_secs`       | `uint32_t` | `0`      | TTL 秒数（`0`=禁用）|
@@ -300,6 +300,25 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts);
 |------|------|------|
 | `log_fn` | `void (*)(int level, const char* msg, void* ctx)` | open-time 不可变回调。库内 best-effort 静默失败点（checkpoint 保存失败、索引 worker 异常、merge 收尾异常等）经此上报。`level`：`0`=warn，`1`=error。`msg` 为 NUL 结尾单行文本，仅回调期间有效。可能从任意内部线程调用——**回调须线程安全、不得回调进本 cask**。`NULL`=不上报（默认零开销）。|
 | `log_ctx` | `void*` | 透传给 `log_fn` |
+
+### 6.5.1 fd / mmap 预算：怎么降"打开文件数"
+
+一个句柄实例常驻的 fd 分四块：封口 data 文件的 read 句柄（**大头**，每句柄 1 fd + 1 sealed mmap）、active data + active hint（2）、OKI run（≤9，由 run 归并保证）、`write.lock` + `field.schema`（2）。
+
+实测（1500 key、`max_file_size` 压到 4096 逼出 89 个 data 文件）：
+
+| 配置 | 盘上 data 文件 | 本库 fd | mmap |
+|---|---|---|---|
+| 默认 | 89 | 96 | 88 |
+| `max_read_handles = 16` | 89 | **24** | 16 |
+| `max_file_size = 1 MiB` | **1** | **8** | 0 |
+
+调优顺序：
+
+1. **先量** `ulimit -n` 和目录里的 data 文件数。自动档取 `RLIMIT_NOFILE` 的一半——容器/systemd 下 rlimit 常见 5×10⁵，该值形同虚设（已夹到 1024 封顶，但仍建议按业务显式给值）。
+2. **`opts.max_read_handles = N`**：立即生效，超额近似 LRU 淘汰**空闲**句柄（在途读者不受影响）。代价是淘汰后再读要重开 fd + 重建 mmap。
+3. **`opts.max_file_size`**（默认 2 GiB）：从源头决定文件个数；线上若被调小过，那是文件数暴涨的根因。
+4. **`bitcask_merge` 不是降 fd 的手段**：它按碎片率/死字节触发，纯追加负载下 `bitcask_needs_merge` 恒为 `needs=0`（实测 merge 前后都是 89 个文件）。merge 解决空间放大。
 
 ### 6.6 同义词词典
 
