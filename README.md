@@ -35,7 +35,7 @@
 | 合并 | `merge` / `needs_merge` | 与读写并发的独立 `merge.lock` 模型 | [`merge-policy-zh.md`](doc/merge-policy-zh.md) |
 | 备份 | 文件级拷贝 + `flush_index` | WAL 一致点落盘 | [`wal-batch-design-zh.md`](doc/wal-batch-design-zh.md) |
 | 升级 | `Cask::upgrade` | 离线把 KV 目录升为索引模式 | [`api-cpp.md`](doc/api-cpp.md) |
-| 迁移 | `bitcask_migrate`（CLI） | 统一纪元迁移：`detect` / `be2le`（v1 大端）/ `tstamp64`（u32 → u64，5.0 flag-day）/ `hintord`（hint 补 ord，6.0 flag-day，data 零改动）；非破坏性 | [`migrate-le.md`](doc/migrate-le.md) |
+| 迁移 | `bitcask_migrate`（CLI） | 统一纪元迁移：`detect` / `be2le`（v1 大端）/ `tstamp64`（u32 → u64，5.0 flag-day）/ `hintord`（hint 补 ord，5.1 flag-day，data 零改动）；非破坏性 | [`migrate-le.md`](doc/migrate-le.md) |
 | 状态 | `status` / `read_handle_count` | 内省 key 数 / fd 预算 / 索引错误计数 | [`api-cpp.md`](doc/api-cpp.md) |
 | C ABI | `libbitcask.so` | `extern "C"` 不透明句柄 + slice + fault，跨 ABI 稳定 | [`api-c.md`](doc/api-c.md) |
 

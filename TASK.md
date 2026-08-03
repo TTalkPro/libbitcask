@@ -3,7 +3,8 @@
 > 来源：[`doc/ordered-key-index-design-zh.md`](doc/ordered-key-index-design-zh.md)（设计草案已定稿）
 > 决策基线：否决整体换 LevelDB；WiscKey 式旁挂有序 key 索引；**flag-day 停机迁移**
 > （hint BCH4→BCH5 加 ord、meta v4→v5、`bitcask_migrate hintord`，与 5.0.0 tstamp64 同模式）
-> 版本目标：**6.0.0**（盘上 `bitcask.meta` = v5）
+> 版本目标：**5.1.0**（盘上 `bitcask.meta` = v5；`SOVERSION` 保持 `5`——
+> C API 纯增量，**盘上格式破坏不驱动 major**，同 3.1.0 先例）
 > 基线测试：ctest 全绿（Phase 6 T22 后 644 项，1 个 S30RssProbe 预存 Disabled）
 > 验收标准：每项改动后 ctest 全绿 + 编译无新告警；公共结构体改动须 build-rel 双树验证；
 > 格式改动须对拍 + crash 注入
@@ -296,9 +297,17 @@ C API `bitcask_range_iter_*`（6 个新导出 + 2 个新结构体）、
   §6 CaskRangeIter + 线程表 + 示例）、`api-c.md`（§11.7 全套 + 所有权配对表
   + 线程表 + §4.1/§7.5b 类型）、`migrate-le.md`（纪元 v3→v5 陈旧修正 +
   OKI 不迁移行）、`README.md`（能力表 + 架构图）。
-- **CHANGELOG**：新增 `[未发布] 6.0.0` 段（S33 全景：flag-day + OKI + C API
-  + 两个 B 级修复）。**版本号未 bump**——`project(VERSION)` 仍 5.0.0，
-  发布时连同 SOVERSION 一起提到 6（本轮不擅自动发布边界）。
+- **CHANGELOG**：新增 `[5.1.0] - 未发布` 段（S33 全景：flag-day + OKI +
+  C API + 两个 B 级修复）；`project(VERSION)` 已 bump 到 **5.1.0**，
+  `SOVERSION` 随之保持 **5**（= major，CMakeLists 机械派生）。
+  **版本号定为 5.1.0 而非原计划的 6.0.0**（2026-08-03 复核后改）：本轮 C API
+  纯增量（新导出 6 个 range 函数 + 2 个前缀入口，既有签名/结构体布局零改动；
+  `.so` 导出表核实——改了签名的 `KeyDir::remove` / `HintFile::write` 均**未
+  导出**，只有 24 个头内联弱符号），ABI 未破坏。仓库先例即此规则：3.1.0 同样
+  是「盘上前向不兼容 + C API 增量」→ MINOR，SOVERSION 不动；4.0.0（结构体
+  布局）与 5.0.0（签名/字段宽度）才是真 ABI 破坏 → major。soname 换号挡的是
+  「二进制 × 二进制」，而这里的不兼容是「二进制 × 数据」，由 meta v5 门禁
+  承担，换号零收益却逼下游重链。
 - **验收**：Debug 全量 **672/672**（+1 新测试；1 预存 Disabled）|
   **ASan 全量 672/672** | **TSan 相关套件 147/147**（CI 豁免口径，未新增
   豁免；C API 新路径含 prefetch 也在 TSan 下跑过）| build-rel 全树零错误
@@ -315,7 +324,7 @@ keydir RSS 占进程 RSS > ~40% 才立项 keydir 磁盘驻留；立项则另立�
 ```
 S33-1 (半天)  ───── 先行，独立可交付（探针 + 基线数字）
 T23   (半天)  ───── S33-2 前置（hint_file refill 归并，避免格式分叉叠在漂移代码上）
-S33-2 (2天)   ───── flag-day 基建 = 6.0.0 发布边界
+S33-2 (2天)   ───── flag-day 基建 = 5.1.0 发布边界（盘上纪元，非 ABI）
 S33-3 (1.5天) ───── OKI 格式，纯新增，与 S33-2 后半可并行
 S33-4 (2天)   ───── 依赖 S33-2 + S33-3
 S33-5 (2天)   ───── 依赖 S33-4

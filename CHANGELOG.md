@@ -5,26 +5,38 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`5.0.0`**；库 `SOVERSION` = **`5`**（= major）；
-盘上格式版本独立于库版本：`bitcask.meta` = **`v4`**（含 CRC32 + u64 纪元门禁），`field.schema` = **FSCH v1**。
+`bitcask_version_*` = **`5.1.0`**；库 `SOVERSION` = **`5`**（= major）；
+盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（含 CRC32 + hint BCH5 纪元门禁），
+hint = **BCH5**，OKI = **BCOK v1 / BCOM v1**，`field.schema` = **FSCH v1**。
+**盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump。
 
 ---
 
-## [未发布] 6.0.0（S33：有序 key 索引 OKI + hint ord flag-day）
+## [5.1.0] - 未发布（S33：有序 key 索引 OKI + hint ord flag-day）
 
-> 版本号尚未 bump（`project(libbitcask VERSION ...)` 仍是 5.0.0）——发布时
-> 一并把库 `VERSION` / `SOVERSION` 提到 6，本节即发布说明草稿。
-> 盘上格式版本：`bitcask.meta` = **v5**（已落地），hint = **BCH5**，
+> **版本语义**：C API 为**纯增量**（新导出 6 个 range 函数 + 2 个前缀入口；
+> 既有函数签名与结构体布局零改动），故 MINOR +1 → `5.1.0`，
+> **`SOVERSION` 保持 `5`**（`.so.5` 不换号，下游无需重新链接）——与
+> [3.1.0] 同款处置：**盘上格式破坏不驱动 major/SOVERSION，ABI 破坏才驱动**
+> （4.0.0 = 结构体布局变更、5.0.0 = 签名与字段宽度变更，那两次才必须 bump）。
+>
+> 盘上格式版本：`bitcask.meta` = **v5**，hint = **BCH5**，
 > OKI run = **BCOK v1** / manifest = **BCOM v1**。
 
-### ⚠️ 盘上格式破坏（major bump 的原因）
+### ⚠️ 前向不兼容（盘上格式 flag-day；ABI 未破坏）
 
 **hint 内嵌 ord flag-day**——hint 记录新增 `ord` 字段（vbyte 差分），
 magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁。
-v4 纪元目录 open 时**干净拒开**并提示迁移命令，**不必重建**：
-`bitcask_migrate hintord <src> <dst>` 是**非破坏性 + data 字节零改动**的
-迁移路径（data 硬链接，只重生成 hint + meta；meta 最后写 = commit point，
-幂等可重跑）。C ABI 与 C++ API **无破坏性变更**（本轮只有新增）。
+
+- **本版写出的库不能被 5.0.0 打开**（5.0.0 读端只认 meta v4）。
+- **本版也不直接打开 v4 纪元目录**：open 时**干净拒开**并提示迁移命令，
+  绝不按新语义把旧字节静默读坏。
+- **但不必重建**：`bitcask_migrate hintord <src> <dst>` 是**非破坏性 +
+  data 字节零改动**的迁移路径（data 硬链接，只重生成 hint + meta；
+  meta 最后写 = commit point，幂等可重跑）。
+- **二进制层面无隔离需求**：不兼容发生在「二进制 × 数据」而非
+  「二进制 × 二进制」——旧调用方链接 `.so.5` 打开 v5 目录会拿到带迁移提示
+  的干净错误，故不换 soname。
 
 动机：v4 时代 hint 不存 ord，hint 快路径恢复的条目 ord 恒 0，与 fold(data)
 不等价；v5 之后两条恢复路径逐 key 等价，这也是 OKI tail 重放的前提。
