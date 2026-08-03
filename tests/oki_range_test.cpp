@@ -59,6 +59,27 @@ KvVec range_scan(Cask& c, std::string_view lo, std::string_view hi) {
     return out;
 }
 
+// S33-6：同上，但走值预取路径（prefetch/prefetch_threads）。
+KvVec range_scan_prefetch(Cask& c, std::string_view lo, std::string_view hi,
+                          std::size_t prefetch, std::size_t threads) {
+    RangeOptions o;
+    if (!lo.empty()) o.lo = bytes(lo);
+    if (!hi.empty()) o.hi = bytes(hi);
+    o.prefetch = prefetch;
+    o.prefetch_threads = threads;
+    auto it = c.make_range_iter(o);
+    EXPECT_TRUE(it.has_value()) << (it ? "" : it.error().detail);
+    KvVec out;
+    if (!it) return out;
+    while (true) {
+        auto e = (*it)->next();
+        EXPECT_TRUE(e.has_value());
+        if (!e || !e->has_value()) break;
+        out.emplace_back(to_str((*e)->key), to_str((*e)->value));
+    }
+    return out;
+}
+
 // 方式二：CaskIter 全表 + 过滤 + 排序（O(全表) 参照实现）。
 KvVec full_scan_filter(Cask& c, std::string_view lo, std::string_view hi) {
     KvVec out;
@@ -230,6 +251,67 @@ TEST_F(OkiRangeTest, PropertyThreeWayWithMergeAndReopen) {
         }
     }
     c->close();
+}
+
+// S33-6：值预取只改变取值时机，输出必须与惰性路径逐 key 逐 value 相同。
+// 覆盖批界（prefetch 小于/大于/整除窗口大小）、单线程与多线程、run 与
+// memdelta 混合，以及「预取批内全是死 key」（删掉一整段后仍须继续推进
+// 而不是提前 EOI）。
+TEST_F(OkiRangeTest, PrefetchMatchesLazyAcrossBatchBoundaries) {
+    CaskOptions o;
+    o.read_write = true;
+    o.max_file_size = 4096;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    auto& cask = **c;
+    std::map<std::string, std::string> shadow;
+
+    auto put = [&](const std::string& k, const std::string& v) {
+        ASSERT_TRUE(cask.put(bytes(k), bytes(v), 1000));
+        shadow[k] = v;
+    };
+
+    for (int i = 0; i < 200; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "k%04d", i);
+        put(buf, "v" + std::to_string(i) +
+                     std::string(static_cast<std::size_t>(i % 7), 'x'));
+    }
+    ASSERT_TRUE(cask.checkpoint());  // 一半进 run
+    for (int i = 200; i < 260; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "k%04d", i);
+        put(buf, "late" + std::to_string(i));
+    }
+    // 连续删一整段（≥ 最大预取批），逼出「整批死 key」的续跑路径：OKI 行
+    // 仍在（陈旧），回查 keydir 全 kNotFound。
+    for (int i = 100; i < 140; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "k%04d", i);
+        ASSERT_TRUE(cask.remove(bytes(buf), 2000));
+        shadow.erase(buf);
+    }
+
+    struct Window { const char* lo; const char* hi; };
+    const Window windows[] = {{"", ""}, {"k0090", "k0150"}, {"k0250", ""},
+                              {"", "k0005"}, {"k0300", "k0400"}};
+    for (const auto& w : windows) {
+        const auto lazy = range_scan(cask, w.lo, w.hi);
+        const auto ref  = shadow_range(shadow, w.lo, w.hi);
+        EXPECT_EQ(lazy, ref) << "lazy vs shadow lo=" << w.lo;
+        for (std::size_t p : {std::size_t{2}, std::size_t{8}, std::size_t{64},
+                              std::size_t{1000}}) {
+            for (std::size_t t : {std::size_t{0}, std::size_t{1},
+                                  std::size_t{3}}) {
+                EXPECT_EQ(range_scan_prefetch(cask, w.lo, w.hi, p, t), lazy)
+                    << "prefetch=" << p << " threads=" << t
+                    << " lo=" << w.lo << " hi=" << w.hi;
+            }
+        }
+    }
+    // prefetch=1 是「关闭」的边界值，必须与 0 等价。
+    EXPECT_EQ(range_scan_prefetch(cask, "", "", 1, 4), range_scan(cask, "", ""));
+    cask.close();
 }
 
 // 并发：单写者持续写/删 + N 个 range 读者全域扫 + 一次 merge。

@@ -135,6 +135,150 @@ static int test_iteration(void) {
     return 0;
 }
 
+/* S33-6：有序 range 迭代（OKI）+ 前缀迭代/前缀并行扫描的 C 侧覆盖。
+ * 数据形态 "gNNN:kMMM" —— 前缀组即天然的 range 窗口。 */
+static int test_range_iter(void) {
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    bitcask_error_t err =
+        bitcask_open("/tmp/bitcask_c_test_range", &opts, &cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_range_iter: open: %s\n", fault.detail);
+        return 1;
+    }
+
+    for (int g = 0; g < 4; g++) {
+        for (int i = 0; i < 25; i++) {
+            char kbuf[24], vbuf[32];
+            int klen = snprintf(kbuf, sizeof(kbuf), "g%03d:k%03d", g, i);
+            int vlen = snprintf(vbuf, sizeof(vbuf), "v%d-%d", g, i);
+            bitcask_slice_t k = {kbuf, (size_t)klen};
+            bitcask_slice_t v = {vbuf, (size_t)vlen};
+            assert(bitcask_put(cask, k, v, 0, &fault) == BITCASK_OK);
+        }
+    }
+    /* 删两条：range 只产出活 key。 */
+    bitcask_slice_t dead1 = {"g001:k000", 9};
+    bitcask_slice_t dead2 = {"g001:k024", 9};
+    assert(bitcask_delete(cask, dead1, 0, &fault) == BITCASK_OK);
+    assert(bitcask_delete(cask, dead2, 0, &fault) == BITCASK_OK);
+
+    /* 窗口 [g001:, g002:) —— 组 1 剩 23 条，升序。 */
+    bitcask_range_options_t ro;
+    bitcask_range_options_init(&ro);
+    ro.lo.data = "g001:";
+    ro.lo.size = 5;
+    ro.hi.data = "g002:";
+    ro.hi.size = 5;
+
+    bitcask_range_iter_t* rit = NULL;
+    err = bitcask_range_iter_start(cask, &ro, &rit, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_range_iter: range_iter_start: %s\n",
+                fault.detail);
+        bitcask_close(cask);
+        return 1;
+    }
+    int count = 0;
+    char prev[32];
+    size_t prev_len = 0;
+    bitcask_range_entry_t rentry;
+    while (bitcask_range_iter_next(rit, &rentry, &fault) == 1) {
+        assert(rentry.key.size == 9);
+        assert(memcmp(rentry.key.data, "g001:", 5) == 0);
+        if (prev_len > 0) {  /* 严格升序 */
+            assert(memcmp(prev, rentry.key.data, 9) < 0);
+        }
+        memcpy(prev, rentry.key.data, rentry.key.size);
+        prev_len = rentry.key.size;
+        assert(rentry.value.size > 0);
+        count++;
+        bitcask_range_entry_free(&rentry);
+    }
+    bitcask_range_iter_release(rit);
+    assert(count == 23);
+
+    /* 同窗口 + 值预取：条数必须一致（预取只改取值时机）。 */
+    ro.prefetch = 8;
+    ro.prefetch_threads = 3;
+    rit = NULL;
+    assert(bitcask_range_iter_start(cask, &ro, &rit, &fault) == BITCASK_OK);
+    int pcount = 0;
+    while (bitcask_range_iter_next(rit, &rentry, &fault) == 1) {
+        pcount++;
+        bitcask_range_entry_free(&rentry);
+    }
+    bitcask_range_iter_release(rit);
+    assert(pcount == count);
+
+    /* 批量取：一次要 100 条，先得 23 条再得 0（EOI）。 */
+    bitcask_range_entry_t batch[100];
+    rit = NULL;
+    assert(bitcask_range_iter_start(cask, &ro, &rit, &fault) == BITCASK_OK);
+    int n = bitcask_range_iter_next_batch(rit, batch, 100, &fault);
+    assert(n == 23);
+    for (int i = 0; i < n; i++) bitcask_range_entry_free(&batch[i]);
+    assert(bitcask_range_iter_next_batch(rit, batch, 100, &fault) == 0);
+    bitcask_range_iter_release(rit);
+
+    /* opts == NULL → 全域（100 - 2 删除 = 98）。 */
+    rit = NULL;
+    assert(bitcask_range_iter_start(cask, NULL, &rit, &fault) == BITCASK_OK);
+    int total = 0;
+    while (bitcask_range_iter_next(rit, &rentry, &fault) == 1) {
+        total++;
+        bitcask_range_entry_free(&rentry);
+    }
+    bitcask_range_iter_release(rit);
+    assert(total == 98);
+
+    /* 参数校验：NULL 句柄/out。 */
+    assert(bitcask_range_iter_start(NULL, &ro, &rit, &fault) ==
+           BITCASK_ERR_INVALID_OPTION);
+    assert(bitcask_range_iter_start(cask, &ro, NULL, &fault) ==
+           BITCASK_ERR_INVALID_OPTION);
+    assert(bitcask_range_iter_next(NULL, &rentry, &fault) == -1);
+    bitcask_range_iter_release(NULL);  /* no-op */
+    bitcask_range_entry_free(NULL);    /* no-op */
+
+    /* S33-6：前缀迭代（O(全表) 过滤，语义对照 range）。 */
+    bitcask_slice_t prefix = {"g001:", 5};
+    bitcask_iter_t* it = NULL;
+    assert(bitcask_iter_start_prefix(cask, -1, -1, 0, prefix, &it, &fault) ==
+           BITCASK_OK);
+    int pref_count = 0;
+    bitcask_iter_entry_t entry;
+    while (bitcask_iter_next(it, &entry, &fault) == 1) {
+        assert(entry.key.size == 9);
+        assert(memcmp(entry.key.data, "g001:", 5) == 0);
+        pref_count++;
+        bitcask_iter_entry_free(&entry);
+    }
+    bitcask_iter_release(it);
+    assert(pref_count == 23);
+
+    /* 空前缀 = 全表（等价 bitcask_iter_start）。 */
+    bitcask_slice_t empty_prefix = {NULL, 0};
+    it = NULL;
+    assert(bitcask_iter_start_prefix(cask, -1, -1, 0, empty_prefix, &it,
+                                     &fault) == BITCASK_OK);
+    int all_count = 0;
+    while (bitcask_iter_next(it, &entry, &fault) == 1) {
+        all_count++;
+        bitcask_iter_entry_free(&entry);
+    }
+    bitcask_iter_release(it);
+    assert(all_count == 98);
+
+    bitcask_close(cask);
+    printf("PASS test_range_iter\n");
+    return 0;
+}
+
 static int test_version(void) {
     assert(bitcask_version_major() > 0);
     assert(bitcask_version_string() != NULL);
@@ -404,6 +548,25 @@ static int test_parallel_scan(void) {
     err = bitcask_parallel_scan(cask, 4, NULL, &sc, &visited, &fault);
     assert(err == BITCASK_ERR_INVALID_OPTION);
 
+    // S33-6：前缀版——"pk_1" 前缀命中 pk_1 / pk_1x / pk_1xx
+    // （1, 10-19, 100-199 = 111 条）。
+    bitcask_slice_t prefix = {"pk_1", 4};
+    atomic_init(&sc.count, 0);
+    visited = 0;
+    err = bitcask_parallel_scan_prefix(cask, 4, prefix, scan_cb, &sc, &visited,
+                                       &fault);
+    assert(err == BITCASK_OK);
+    assert(visited == 111 && atomic_load(&sc.count) == 111);
+
+    // 空前缀 = 全表（等价 bitcask_parallel_scan）。
+    bitcask_slice_t empty_prefix = {NULL, 0};
+    atomic_init(&sc.count, 0);
+    visited = 0;
+    err = bitcask_parallel_scan_prefix(cask, 4, empty_prefix, scan_cb, &sc,
+                                       &visited, &fault);
+    assert(err == BITCASK_OK && visited == (size_t)N &&
+           atomic_load(&sc.count) == N);
+
     bitcask_close(cask);
     printf("PASS test_parallel_scan\n");
     return 0;
@@ -616,6 +779,7 @@ int main(void) {
     failures += test_kv_basic();
     failures += test_status_and_merge();
     failures += test_iteration();
+    failures += test_range_iter();
     failures += test_search_text_batch();
     failures += test_search_vector_hybrid_batch();
     failures += test_vector_engine_ivfrq();
