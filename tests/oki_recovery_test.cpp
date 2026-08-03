@@ -113,6 +113,81 @@ TEST_F(OkiRecoveryTest, CleanCloseFlushesRunsAndCoversAllKeys) {
     EXPECT_FALSE(view.at("ok0").second);
 }
 
+// S33-6：零活 key 的重建不落空 run。空 run 归并不出任何行，却占一个文件 +
+// 一个常驻 Reader fd，且要等下次 rebuild 才被清——manifest 记 0 个 run +
+// wm=cover_ord 语义等价。两种触发形态：空库首开、全删后重建。
+TEST_F(OkiRecoveryTest, RebuildWithNoLiveKeysWritesNoEmptyRun) {
+    auto seg_files = [&] {
+        std::vector<std::string> v;
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(dir_, ec)) {
+            const auto n = e.path().filename().string();
+            if (n.starts_with("kv.oki.seg-")) v.push_back(n);
+        }
+        return v;
+    };
+
+    // ① 空库首开：走全量重建（无 manifest），活 key 数 = 0。
+    {
+        CaskOptions o;
+        o.read_write = true;
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        ASSERT_TRUE(c);
+        auto m = bitcask::oki::read_manifest(dir_.string());
+        ASSERT_TRUE(m.has_value()) << "重建必须提交 manifest（哪怕 0 run）";
+        EXPECT_TRUE(m->runs.empty()) << "空库不该留空 run";
+        EXPECT_TRUE(seg_files().empty()) << "不该有 seg 文件";
+        EXPECT_EQ((*c)->keydir().oki().run_count(), 0u);
+        // OKI 仍是「已加载」态——range 查询可用，只是没有行可归并。
+        auto it = (*c)->make_range_iter(bitcask::RangeOptions{});
+        ASSERT_TRUE(it.has_value());
+        auto e = (*it)->next();
+        ASSERT_TRUE(e.has_value());
+        EXPECT_FALSE(e->has_value());
+        (*c)->close();
+    }
+
+    // ② 写入 → 全删 → 删 manifest 逼一次重建：同样不该落空 run。
+    {
+        CaskOptions o;
+        o.read_write = true;
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 5; ++i) {
+            ASSERT_TRUE((*c)->put(bytes("g" + std::to_string(i)),
+                                  bytes("v"), 1000));
+        }
+        for (int i = 0; i < 5; ++i) {
+            ASSERT_TRUE((*c)->remove(bytes("g" + std::to_string(i)), 2000));
+        }
+        (*c)->close();
+    }
+    {
+        std::error_code ec;
+        fs::remove(fs::path(dir_) / "kv.oki.manifest", ec);
+        CaskOptions o;
+        o.read_write = true;
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        ASSERT_TRUE(c);
+        auto m = bitcask::oki::read_manifest(dir_.string());
+        ASSERT_TRUE(m.has_value());
+        EXPECT_TRUE(m->runs.empty()) << "全删后重建不该留空 run";
+        EXPECT_TRUE(seg_files().empty()) << "旧 run 应被清理且不写新空 run";
+        EXPECT_EQ(m->wm, (*c)->keydir().peek_next_ord())
+            << "wm 仍须追平（0 run 不影响水位语义）";
+        // 重建后继续写：新行走 memdelta，range 照常出货。
+        ASSERT_TRUE((*c)->put(bytes("z1"), bytes("v1"), 1000));
+        auto it = (*c)->make_range_iter(bitcask::RangeOptions{});
+        ASSERT_TRUE(it.has_value());
+        auto e = (*it)->next();
+        ASSERT_TRUE(e.has_value() && e->has_value());
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>((*e)->key.data()),
+                              (*e)->key.size()),
+                  "z1");
+        (*c)->close();
+    }
+}
+
 TEST_F(OkiRecoveryTest, ReopenAfterCleanCloseDoesNotRebuild) {
     {
         CaskOptions o;
