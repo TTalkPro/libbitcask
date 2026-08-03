@@ -90,6 +90,12 @@ magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁�
 - hint 读端**只认 BCH5**；BCH4 及更早在 `validate_trailer` / `fold_validated`
   处按「缓存不可用」返回 false → 退 `fold(data)` 重建（纪元硬门禁由 meta v5
   承担）。v2 定宽常量与 v2/v4 编解码整体删除。
+- **`max_read_handles` 自动档加绝对上限 1024**（原来只有下限 64）：自动档取
+  `RLIMIT_NOFILE` 的一半，而容器 / systemd 环境下 rlimit 常见 5×10⁵ 甚至
+  10⁶——"一半"等于没有上限，实测 89 个 data 文件的库把 89 个 fd + 88 个 mmap
+  全留着不淘汰。**这是默认行为变更**：data 文件数 > 1024 的库会开始淘汰空闲
+  读句柄（淘汰后再读需重开 fd + 重建 mmap）。显式给 N 或
+  `kUnlimitedReadHandles` 者不受影响（不夹取）。调优见 `api-cpp.md` §11.1。
 - `be2le` / `tstamp64` 的目标纪元同步 bump 到 meta v5。
 - 三处手抄的 hint/data refill 循环归并为 `detail::ChunkedReader`（T23），
   顺带修正 data_file 版丢失的 `len_ +` 项（巨型 record 的 need 公式）。

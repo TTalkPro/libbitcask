@@ -325,6 +325,17 @@ C API `bitcask_range_iter_*`（6 个新导出 + 2 个新结构体）、
   （`RunCompactionCollapsesRunsAtThreshold` 阈值内不归并/越阈值塌成 1 个 +
   文件清理 + 水位不变 + 数据完整；`FullCompactionDropsTombstoneRows` 归并前
   tomb 行在、归并后整条消失、活 key 齐全、**丢墓碑后重新 put 仍可见**）。
+- **fd 预算收口（承上条探针）**：`max_read_handles` 自动档加绝对上限 **1024**
+  （`kAutoReadHandleCeiling`，原来只有下限 64）——自动档是「RLIMIT_NOFILE 的
+  一半」，本机 rlimit 524288 ⟹ 26 万，等于没有上限。1024 个句柄在默认
+  `max_file_size=2GiB` 下对应约 2TB 数据，正常库碰不到；显式值不夹取。
+  **默认行为变更**，已进 CHANGELOG 的 Changed 段。`ReadHandleCap.ResolveSemantics`
+  加 7 条断言（封顶/边界内外/显式值不受影响）。
+  文档：`api-cpp.md` 新增 **§11 运维调优**（§11.1 fd/mmap 预算三段实测表 +
+  四步调优顺序；§11.2 merge 调度），`api-c.md` 新增 §6.5.1 同款；两处
+  `max_read_handles` 字段说明改写。**关键结论写进文档**：merge 按碎片率/死字节
+  触发，纯追加负载 `needs_merge` 恒 false（实测 89 文件 merge 前后不变）——
+  **merge 解决空间放大，不是 fd 预算手段**。
 - **CHANGELOG**：新增 `[5.1.0] - 未发布` 段（S33 全景：flag-day + OKI +
   C API + 两个 B 级修复）；`project(VERSION)` 已 bump 到 **5.1.0**，
   `SOVERSION` 随之保持 **5**（= major，CMakeLists 机械派生）。
