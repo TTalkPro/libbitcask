@@ -775,6 +775,17 @@ merge(std::vector<std::string> files = {}, std::uint32_t now_sec = 0);
 
 线程安全：是（产生对象）；返回的 `CaskIter` 本身非线程安全。
 
+#### `Cask::make_range_iter`（S33-5/S33-6）
+
+```cpp
+[[nodiscard]] std::expected<std::unique_ptr<CaskRangeIter>, CaskFault>
+make_range_iter(const RangeOptions& opts);
+```
+
+按 key 字典序遍历 `[lo, hi)`，走 OKI（有序 key 索引）——**O(range)** 而非 `CaskIter::start(key_prefix)` 的 O(全表)。OKI 不可用（只读打开且目录没建过 OKI / 重建失败）返回 `kNoIndex`；读写打开会在 open 时自动重建。
+
+线程安全：是（可多线程各自 make 并发迭代）；返回的迭代器自身非线程安全。
+
 #### `Cask::dirname` / `keydir` / `options`
 
 ```cpp
@@ -849,6 +860,47 @@ public:
 
 - `release` 幂等。线程安全：否；与 start/next 串行调用。
 - `is_iterating`：当前是否处于迭代中（`iter_ != nullptr`）。
+
+### `bitcask::RangeOptions` / `bitcask::CaskRangeIter`（有序 range 迭代器，S33-5/S33-6）
+
+按 key 字典序遍历 `[lo, hi)`。实现：manifest 快照 pin 住 OKI run 的共享 Reader → k 路归并（runs + memdelta，同 key 取 max-ord、墓碑抵消）→ **逐 key 回查哈希 keydir**（活性与位置的权威）→ 现有 `get` 路径取值。OKI 行允许陈旧（死 key 被回查过滤），因此 merge 搬迁与本迭代器零交互。格式见 [`format-zh.md`](format-zh.md) §OKI，设计见 [`ordered-key-index-design-zh.md`](ordered-key-index-design-zh.md)。
+
+```cpp
+struct RangeOptions {
+    std::span<const std::byte> lo{};   // inclusive；空 = 从头
+    std::span<const std::byte> hi{};   // exclusive；空 = 到尾
+    std::size_t prefetch = 0;          // 0/1 = 关闭；>1 = 批量并发预取值
+    std::size_t prefetch_threads = 0;  // 0 = min(hardware_concurrency, 4)
+};
+
+class CaskRangeIter {
+public:
+    struct Entry {
+        std::vector<std::byte> key;
+        std::vector<std::byte> value;   // DocValue text 段（纯 KV 即 value）
+        std::uint64_t tstamp = 0;
+        std::uint64_t ord    = 0;       // keydir 权威 ord（非 OKI 行 ord）
+    };
+    [[nodiscard]] std::expected<std::optional<Entry>, CaskFault> next();
+};
+```
+
+- **一致性：per-key 弱一致**（与 `parallel_scan` 同档）——迭代期间的并发写可能部分可见，**不是** `CaskIter` 的 fold 快照语义。需要快照请先用 `CaskIter` 冻结。
+- **生命周期**：不可跨线程共享；须在 `Cask::close()` 之前用完（内部 pin KeyDir，但取值经 Cask 读路径）。无 `release()`——析构即释放。
+- **`prefetch`（S33-6）**：>1 时一次归并出 `prefetch` 个 key，再用 `prefetch_threads` 个线程并发取值填缓冲，`next()` 从缓冲出货。**只改变取值时机，输出序与内容和惰性路径完全一致**。线程按批创建（无常驻池），故内部按「每线程至少 64 个 key」收窄线程数——小批自动退化为串行。实测（tmpfs、1 KiB 值、6250 条命中窗口）：惰性 10.8 ms、`prefetch=64` 11.6 ms（无收益）、`prefetch=256/4 线程` 7.6 ms（**1.4×**）。收益形态是「大窗口 + 值不在页缓存」；小窗口或值已缓存时线程成本可能反超，故默认关闭。
+- 错误：run 损坏 → `kBadCrc`（该 run 整体不可信，重开会重建）；取值路径的 IO 错误原样上抛。并发删除导致的 `kNotFound` 静默跳过（同 `parallel_scan`）。
+
+```cpp
+bitcask::RangeOptions ro;
+ro.lo = as_bytes("user:1000"); ro.hi = as_bytes("user:2000");
+ro.prefetch = 256;                     // 可选：值预取
+auto it = (*c)->make_range_iter(ro);
+if (!it) { /* kNoIndex：只读打开且无 OKI */ }
+while (auto e = (*it)->next()) {
+    if (!e->has_value()) break;        // EOI
+    auto& entry = **e;                 // entry.key / value / tstamp / ord
+}
+```
 
 ---
 
@@ -2107,6 +2159,20 @@ if (auto st = it->start(/*maxage=*/-1, /*maxputs=*/-1, /*now_sec=*/0,
 it->release();
 ```
 
+### 10.4b 有序 range 迭代（OKI）
+
+```cpp
+bitcask::RangeOptions ro;
+ro.lo = as_bytes("user:");
+ro.hi = as_bytes("user;");        // ':' + 1 = 前缀窗口的开区间上界
+ro.prefetch = 256;                 // 可选：并发预取值（大窗口 + 冷值才划算）
+auto it = (*c)->make_range_iter(ro);
+while (auto e = (*it)->next()) {
+    if (!e->has_value()) break;
+    auto& entry = **e;             // key 升序
+}
+```
+
 ### 10.5 元过滤器
 
 ```cpp
@@ -2159,6 +2225,8 @@ auto c = bitcask::Cask::open(dir, opts, &registry);
 | `merge` | ✅ | 写自有输出文件 + keydir shared_mutex 协调（不取 `write_mu_`，与读写并发）；跨进程经 `merge.lock` |
 | `backup` | ✅ | 与 put/get 并发（put 被 `write_mu_` 挡在备份期间外，get 不受影响）；须与 merge 串行 |
 | `CaskIter::start` / `next` / `next_batch` / `release` | ⚠️ 每线程一个 | 有状态游标，同一对象不可并发；不同 CaskIter 可并发；并行遍历用 `parallel_scan` |
+| `make_range_iter` | ✅ | 取 OKI 只读视图（runs 的 shared_ptr + memdelta 快照拷贝）|
+| `CaskRangeIter::next` | ⚠️ 每线程一个 | 有状态游标，同一对象不可并发；不同 range 迭代器可与写/merge 并发（per-key 弱一致）|
 
 > **读写并发**：搜索可见性遵循 near-real-time 契约（`drain_plugins()` flush 覆盖调用前的写）。
 > **更高写并发**：写在文件层本就串行（单 append WAL），`write_mu_` 不损吞吐；需要更高写并发请**按目录分片多个 Cask 实例**（横向扩展）。

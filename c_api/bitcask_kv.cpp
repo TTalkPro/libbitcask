@@ -368,19 +368,20 @@ BITCASK_API void bitcask_search_result_free(bitcask_search_result_t* result) {
     std::free(result);
 }
 
-BITCASK_API bitcask_error_t bitcask_iter_start(bitcask_t* cask,
-                                                  int maxage,
-                                                  int maxputs,
-                                                  int see_tombstones,
-                                                  bitcask_iter_t** out,
-                                                  bitcask_fault_t* fault) {
+// S33-6：带前缀版是实现主体，无前缀版 = 空切片特例（见头文件契约）。
+BITCASK_API bitcask_error_t bitcask_iter_start_prefix(
+    bitcask_t* cask, int maxage, int maxputs, int see_tombstones,
+    bitcask_slice_t key_prefix, bitcask_iter_t** out,
+    bitcask_fault_t* fault) {
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
+    if (!slice_valid(key_prefix)) return BITCASK_ERR_INVALID_OPTION;  // S25-M2
     *out = nullptr;
 
     auto iter = as_cpp_cask(cask)->make_iter();
-    auto start_result = iter->start(maxage, maxputs, 0, see_tombstones != 0);
+    auto start_result = iter->start(maxage, maxputs, 0, see_tombstones != 0,
+                                    to_span(key_prefix));
     if (!start_result) {
         if (start_result.error().kind == bitcask::CaskError::kInvalidOption) {
             return BITCASK_ERR_INVALID_OPTION;
@@ -398,6 +399,17 @@ BITCASK_API bitcask_error_t bitcask_iter_start(bitcask_t* cask,
     *out = reinterpret_cast<bitcask_iter_t*>(wrapper.release());
     return BITCASK_OK;
     });
+}
+
+BITCASK_API bitcask_error_t bitcask_iter_start(bitcask_t* cask,
+                                                  int maxage,
+                                                  int maxputs,
+                                                  int see_tombstones,
+                                                  bitcask_iter_t** out,
+                                                  bitcask_fault_t* fault) {
+    bitcask_slice_t none = {NULL, 0};
+    return bitcask_iter_start_prefix(cask, maxage, maxputs, see_tombstones,
+                                     none, out, fault);
 }
 
 BITCASK_API int bitcask_iter_next(bitcask_iter_t* iter,
@@ -488,15 +500,143 @@ BITCASK_API void bitcask_iter_entry_free(bitcask_iter_entry_t* entry) {
     entry->value.size = 0;
 }
 
-BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
-                                                  size_t n_threads,
-                                                  bitcask_scan_fn fn,
-                                                  void* ctx,
-                                                  size_t* out_count,
-                                                  bitcask_fault_t* fault) {
+/* ---------------------------------------------------------------------------
+ *  S33-6：有序 range 迭代（OKI）
+ * ------------------------------------------------------------------------- */
+
+BITCASK_API void bitcask_range_options_init(bitcask_range_options_t* opts) {
+    if (!opts) return;
+    opts->lo.data = NULL;
+    opts->lo.size = 0;
+    opts->hi.data = NULL;
+    opts->hi.size = 0;
+    opts->prefetch = 0;
+    opts->prefetch_threads = 0;
+}
+
+BITCASK_API bitcask_error_t bitcask_range_iter_start(
+    bitcask_t* cask, const bitcask_range_options_t* opts,
+    bitcask_range_iter_t** out, bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+
+    bitcask::RangeOptions ro;
+    if (opts) {
+        if (!slice_valid(opts->lo) || !slice_valid(opts->hi)) {  // S25-M2
+            return BITCASK_ERR_INVALID_OPTION;
+        }
+        ro.lo = to_span(opts->lo);
+        ro.hi = to_span(opts->hi);
+        ro.prefetch = opts->prefetch;
+        ro.prefetch_threads = opts->prefetch_threads;
+    }
+    auto iter = as_cpp_cask(cask)->make_range_iter(ro);
+    if (!iter) {
+        to_c_error(iter.error(), fault);
+        return to_c_error_kind(iter.error().kind);
+    }
+
+    // 同 iter_start：构造期 unique_ptr 持有，release 转交裸句柄给调用方。
+    auto wrapper = std::make_unique<bitcask_range_iter_impl_t>();
+    wrapper->iter = std::move(*iter);
+    *out = reinterpret_cast<bitcask_range_iter_t*>(wrapper.release());
+    return BITCASK_OK;
+    });
+}
+
+BITCASK_API int bitcask_range_iter_next(bitcask_range_iter_t* iter,
+                                        bitcask_range_entry_t* entry,
+                                        bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    try {
+    if (!iter || !entry) return -1;
+
+    auto result = as_cpp_range_iter(iter)->next();
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return -1;
+    }
+    if (!*result) return 0;
+
+    if (!fill_range_entry(*std::move(*result), entry)) {  // S13-M2：OOM
+        set_oom_fault(fault);
+        return -1;
+    }
+    return 1;
+    } catch (...) {
+        (void)fault_from_exception(fault);
+        return -1;
+    }
+}
+
+BITCASK_API int bitcask_range_iter_next_batch(bitcask_range_iter_t* iter,
+                                              bitcask_range_entry_t* entries,
+                                              size_t max_n,
+                                              bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    try {
+    if (!iter || !entries || max_n == 0) return -1;
+
+    std::size_t count = 0;
+    while (count < max_n) {
+        auto result = as_cpp_range_iter(iter)->next();
+        if (!result) {
+            // S13-M1：中途失败必须释放已填充条目——契约只返回 -1，
+            // caller 无从得知已填多少条。
+            for (std::size_t i = 0; i < count; ++i) {
+                bitcask_range_entry_free(&entries[i]);
+            }
+            to_c_error(result.error(), fault);
+            return -1;
+        }
+        if (!*result) break;
+        if (!fill_range_entry(*std::move(*result), &entries[count])) {
+            for (std::size_t i = 0; i < count; ++i) {
+                bitcask_range_entry_free(&entries[i]);
+            }
+            set_oom_fault(fault);
+            return -1;
+        }
+        ++count;
+    }
+    return static_cast<int>(count);
+    } catch (...) {
+        (void)fault_from_exception(fault);
+        return -1;
+    }
+}
+
+BITCASK_API void bitcask_range_iter_release(bitcask_range_iter_t* iter) {
+    // S13-M2：extern "C" 异常隔离（无可报告通道，吞掉）
+    try {
+    if (!iter) return;
+    // adopt 回 unique_ptr：作用域结束自动 delete（与创建处 release 对称）。
+    std::unique_ptr<bitcask_range_iter_impl_t> owned(
+        reinterpret_cast<bitcask_range_iter_impl_t*>(iter));
+    } catch (...) {
+    }
+}
+
+BITCASK_API void bitcask_range_entry_free(bitcask_range_entry_t* entry) {
+    if (!entry) return;
+    if (entry->key.data) std::free(const_cast<void*>(entry->key.data));
+    if (entry->value.data) std::free(const_cast<void*>(entry->value.data));
+    entry->key.data = nullptr;
+    entry->key.size = 0;
+    entry->value.data = nullptr;
+    entry->value.size = 0;
+}
+
+BITCASK_API bitcask_error_t bitcask_parallel_scan_prefix(
+    bitcask_t* cask, size_t n_threads, bitcask_slice_t key_prefix,
+    bitcask_scan_fn fn, void* ctx, size_t* out_count,
+    bitcask_fault_t* fault) {
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !fn) return BITCASK_ERR_INVALID_OPTION;
+    if (!slice_valid(key_prefix)) return BITCASK_ERR_INVALID_OPTION;  // S25-M2
     if (out_count) *out_count = 0;
 
     // fn+ctx 按值捕获（函数指针 + void*，平凡可拷、多线程读安全）；wrapper 无共享
@@ -509,7 +649,8 @@ BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
             bitcask_slice_t k{key.data(), key.size()};
             bitcask_slice_t v{view.value.data(), view.value.size()};
             fn(ctx, k, v);
-        });
+        },
+        to_span(key_prefix));
     if (!result) {
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);
@@ -517,6 +658,17 @@ BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
     if (out_count) *out_count = *result;
     return BITCASK_OK;
     });
+}
+
+BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
+                                                  size_t n_threads,
+                                                  bitcask_scan_fn fn,
+                                                  void* ctx,
+                                                  size_t* out_count,
+                                                  bitcask_fault_t* fault) {
+    bitcask_slice_t none = {NULL, 0};
+    return bitcask_parallel_scan_prefix(cask, n_threads, none, fn, ctx,
+                                        out_count, fault);
 }
 
 BITCASK_API bitcask_error_t bitcask_status(bitcask_t* cask,

@@ -61,6 +61,12 @@ struct bitcask_iter_impl_t {
     std::unique_ptr<bitcask::CaskIter> iter;
 };
 
+// S33-6：range 迭代器句柄（CaskRangeIter 无 release()——析构即释放，
+// 见 cask.hpp 类注释；包装层与 iter 对称，便于将来加内部状态）。
+struct bitcask_range_iter_impl_t {
+    std::unique_ptr<bitcask::CaskRangeIter> iter;
+};
+
 inline bitcask_error_t to_c_error_kind(bitcask::CaskError e) {
     switch (e) {
         case bitcask::CaskError::kIo:               return BITCASK_ERR_IO;
@@ -270,6 +276,38 @@ inline bool fill_iter_entry(const bitcask::CaskIter::Entry& e,
     return true;
 }
 
+// S33-6：range entry 填充（range_iter_next / _next_batch 共用）。malloc
+// 检查——OOM 时释放半成品并返回 false（同 fill_iter_entry 的纪律）。
+inline bool fill_range_entry(bitcask::CaskRangeIter::Entry&& e,
+                             bitcask_range_entry_t* entry) {
+    entry->key.data = nullptr;
+    entry->key.size = 0;
+    entry->value.data = nullptr;
+    entry->value.size = 0;
+    if (!e.key.empty()) {
+        auto* p = std::malloc(e.key.size());
+        if (!p) return false;
+        std::memcpy(p, e.key.data(), e.key.size());
+        entry->key.data = p;
+        entry->key.size = e.key.size();
+    }
+    if (!e.value.empty()) {
+        auto* p = std::malloc(e.value.size());
+        if (!p) {
+            std::free(const_cast<void*>(entry->key.data));
+            entry->key.data = nullptr;
+            entry->key.size = 0;
+            return false;
+        }
+        std::memcpy(p, e.value.data(), e.value.size());
+        entry->value.data = p;
+        entry->value.size = e.value.size();
+    }
+    entry->tstamp = e.tstamp;
+    entry->ord = e.ord;
+    return true;
+}
+
 // S13-D2：C 过滤树 → C++ MetaFilter。返回 false = 输入非法（key 为 NULL、
 // STRING 缺 str、op/type 越界、嵌套深度超限）。
 constexpr int kMetaFilterMaxDepth = 32;
@@ -408,6 +446,15 @@ inline bitcask::Cask* as_cpp_cask(bitcask_t* h) {
 
 inline bitcask::CaskIter* as_cpp_iter(bitcask_iter_t* h) {
     return reinterpret_cast<bitcask_iter_impl_t*>(h)->iter.get();
+}
+
+inline bitcask::CaskRangeIter* as_cpp_range_iter(bitcask_range_iter_t* h) {
+    return reinterpret_cast<bitcask_range_iter_impl_t*>(h)->iter.get();
+}
+
+// C slice → C++ span（空切片 → 空 span；调用方须先过 slice_valid）。
+inline std::span<const std::byte> to_span(const bitcask_slice_t& s) {
+    return {static_cast<const std::byte*>(s.data), s.size};
 }
 
 

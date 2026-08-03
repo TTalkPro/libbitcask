@@ -93,11 +93,12 @@ BITCASK_API const char*  bitcask_version_string(void);   // "major.minor.patch"�
 ### 4.1 不透明句柄
 
 ```c
-typedef struct bitcask_t      bitcask_t;       // 包装 bitcask::Cask
-typedef struct bitcask_iter_t bitcask_iter_t;  // 包装 bitcask::CaskIter
+typedef struct bitcask_t            bitcask_t;             // 包装 bitcask::Cask
+typedef struct bitcask_iter_t       bitcask_iter_t;        // 包装 bitcask::CaskIter
+typedef struct bitcask_range_iter_t bitcask_range_iter_t;  // 包装 bitcask::CaskRangeIter（S33-6）
 ```
 
-句柄由 `bitcask_open` / `bitcask_iter_start` 分配并返回，**调用方负责在生命周期结束时调用配对的 `*_free` 释放**。已释放的句柄不可再使用（后置调用返回 `BITCASK_ERR_CLOSED`，不会崩溃）。
+句柄由 `bitcask_open` / `bitcask_iter_start` / `bitcask_range_iter_start` 分配并返回，**调用方负责在生命周期结束时调用配对的 `*_free` 释放**。已释放的句柄不可再使用（后置调用返回 `BITCASK_ERR_CLOSED`，不会崩溃）。
 
 ### 4.2 `bitcask_slice_t`：二进制安全切片
 
@@ -383,6 +384,19 @@ typedef struct {
 
 **所有权**：`key.data` / `value.data` 是 malloc 缓冲（来自 `fill_iter_entry`，见 `c_api/internal.h`）。`bitcask_iter_entry_free` 释放二者并清零——**逐条释放**（每条 entry 一次调用）。
 
+### 7.5b `bitcask_range_entry_t`（S33-6）
+
+```c
+typedef struct {
+    bitcask_slice_t key;    // 指向内部 malloc 缓冲
+    bitcask_slice_t value;  // 指向内部 malloc 缓冲
+    uint64_t        tstamp;
+    uint64_t        ord;
+} bitcask_range_entry_t;
+```
+
+比 `bitcask_iter_entry_t` 少了 `file_id` / `offset` / `total_sz` / `is_tombstone`——range 迭代只产出活 key，位置信息在内部回查 keydir 时已消化。**所有权**同上：`bitcask_range_entry_free` 逐条释放 key/value 并清零。
+
 ### 7.6 批量搜索结果数组所有权
 
 `bitcask_search_*_batch` 返回 `bitcask_search_result_t**`（指针的指针）：
@@ -637,6 +651,24 @@ BITCASK_API bitcask_error_t bitcask_iter_start(bitcask_t* cask,
 
 **内存配对**：`bitcask_iter_start` ↔ `bitcask_iter_release`。
 
+#### `bitcask_iter_start_prefix`（S33-6）
+
+```c
+BITCASK_API bitcask_error_t bitcask_iter_start_prefix(bitcask_t* cask,
+                                                      int maxage,
+                                                      int maxputs,
+                                                      int see_tombstones,
+                                                      bitcask_slice_t key_prefix,
+                                                      bitcask_iter_t** out,
+                                                      bitcask_fault_t* fault);
+```
+
+带 key 前缀过滤的迭代器快照（C++ `CaskIter::start(..., key_prefix)` 在 C 侧的补齐）。`key_prefix` 为空切片（`{NULL, 0}`）时与 `bitcask_iter_start` 完全等价——后者就是以空切片调用本函数。
+
+- 过滤发生在 keydir proxy 层（不读 value），但 **keydir 是哈希表 ⟹ 仍是 O(全表) 扫描**，省的是 value 读取与跨界拷贝。
+- 有序范围扫描（O(range)）请用本章 §11.7 `bitcask_range_iter_*`。
+- 其余参数、返回码、内存配对同 `bitcask_iter_start`。
+
 ### 11.2 `bitcask_iter_next`
 
 ```c
@@ -714,6 +746,85 @@ BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
 - `cask` 已 close → `BITCASK_ERR_CLOSED`。
 
 **所有权**：回调参数 `key` / `value` 是非拥有视图，无需 free。
+
+#### `bitcask_parallel_scan_prefix`（S33-6）
+
+```c
+BITCASK_API bitcask_error_t bitcask_parallel_scan_prefix(bitcask_t* cask,
+                                                         size_t n_threads,
+                                                         bitcask_slice_t key_prefix,
+                                                         bitcask_scan_fn fn,
+                                                         void* ctx,
+                                                         size_t* out_count,
+                                                         bitcask_fault_t* fault);
+```
+
+带 key 前缀过滤的并行扫描。过滤在快照阶段（keydir proxy 层）完成——只有匹配的 key 会进入并发 `get`。空切片等价 `bitcask_parallel_scan`（后者即以空切片调用本函数）。其余语义完全相同。
+
+### 11.7 `bitcask_range_iter_*`：有序 range 迭代（S33-6）
+
+按 key **字典序**遍历 `[lo, hi)`，走 OKI（有序 key 索引）——**O(range)**，与 `bitcask_iter_start_prefix` 的 O(全表) 相对。对应 C++ 的 `Cask::make_range_iter` / `CaskRangeIter`（语义细节见 [`api-cpp.md`](api-cpp.md) §6）。
+
+```c
+typedef struct bitcask_range_iter_t bitcask_range_iter_t;
+
+typedef struct {
+    bitcask_slice_t lo;               /* inclusive；空 = 从头 */
+    bitcask_slice_t hi;               /* exclusive；空 = 到尾 */
+    size_t          prefetch;         /* 0/1 = 关闭；>1 = 批量并发预取值 */
+    size_t          prefetch_threads; /* 0 = min(hardware_concurrency, 4) */
+} bitcask_range_options_t;
+
+typedef struct {
+    bitcask_slice_t key;    /* malloc 缓冲 */
+    bitcask_slice_t value;  /* malloc 缓冲 */
+    uint64_t        tstamp;
+    uint64_t        ord;
+} bitcask_range_entry_t;
+
+BITCASK_API void bitcask_range_options_init(bitcask_range_options_t* opts);
+
+BITCASK_API bitcask_error_t bitcask_range_iter_start(
+    bitcask_t* cask, const bitcask_range_options_t* opts,
+    bitcask_range_iter_t** out, bitcask_fault_t* fault);
+
+BITCASK_API int  bitcask_range_iter_next(bitcask_range_iter_t* iter,
+                                         bitcask_range_entry_t* entry,
+                                         bitcask_fault_t* fault);
+BITCASK_API int  bitcask_range_iter_next_batch(bitcask_range_iter_t* iter,
+                                               bitcask_range_entry_t* entries,
+                                               size_t max_n,
+                                               bitcask_fault_t* fault);
+BITCASK_API void bitcask_range_iter_release(bitcask_range_iter_t* iter);
+BITCASK_API void bitcask_range_entry_free(bitcask_range_entry_t* entry);
+```
+
+- **一致性：per-key 弱一致**（与 `bitcask_parallel_scan` 同档）——迭代期间的并发写可能部分可见，**不是** `bitcask_iter_*` 的快照语义。
+- `opts == NULL` 等价「全域 + 无预取」；`opts` 指向的切片仅在 `bitcask_range_iter_start` 调用期间被引用（内部已拷贝边界），返回后调用方可释放。
+- `prefetch > 1`：一次归并出 `prefetch` 个 key 后并发取值。**只改变取值时机，输出序与内容不变**。收益形态是「大窗口 + 值不在页缓存」；小窗口/值已缓存时线程成本可能反超（实测数字见 `api-cpp.md` §6 的 `prefetch` 条）。
+- 错误：`BITCASK_ERR_NO_INDEX` = 该目录无可用 OKI（只读打开且从未建过；读写方式打开会自动重建）；`BITCASK_ERR_BAD_CRC` = run 损坏；其余同 `bitcask_get`。
+- `next` 返回值 / `next_batch` 的错误路径所有权规则与 `bitcask_iter_next` / `_next_batch` **完全一致**（错误时实现已释放中途填充的条目）。
+- 生命周期：迭代器须在 `bitcask_close` 之前 release。
+
+**内存配对**：`bitcask_range_iter_start` ↔ `bitcask_range_iter_release`；每条 entry ↔ `bitcask_range_entry_free`。
+
+```c
+bitcask_range_options_t ro;
+bitcask_range_options_init(&ro);
+ro.lo.data = "user:";  ro.lo.size = 5;
+ro.hi.data = "user;";  ro.hi.size = 5;   /* ':' + 1 */
+ro.prefetch = 256;                        /* 可选 */
+
+bitcask_range_iter_t* it = NULL;
+if (bitcask_range_iter_start(cask, &ro, &it, &fault) == BITCASK_OK) {
+    bitcask_range_entry_t e;
+    while (bitcask_range_iter_next(it, &e, &fault) == 1) {
+        /* e.key / e.value 升序；用完即 free */
+        bitcask_range_entry_free(&e);
+    }
+    bitcask_range_iter_release(it);
+}
+```
 
 ---
 
@@ -1035,6 +1146,8 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 | `bitcask_needs_merge` → `bitcask_needs_merge_t.files` | `bitcask_needs_merge_free` | 依次 `free(files[i])`，再 `free(files)`，最后置 `files = NULL`、`files_count = 0` | 即使 `needs == 0` 也调用以保证幂等（`files` 可能为 NULL → no-op）|
 | `bitcask_iter_start` → `bitcask_iter_t*` | `bitcask_iter_release` | `delete` 句柄包装 | 可早于迭代结束调用 |
 | `bitcask_iter_next` / `_next_batch` → 每条 `bitcask_iter_entry_t` 内的 key/value | `bitcask_iter_entry_free` | `free(key.data)` / `free(value.data)` 并清零 | **逐条调用**；`bitcask_iter_next_batch` 错误路径已自行释放，调用方不可再 free |
+| `bitcask_range_iter_start` → `bitcask_range_iter_t*` | `bitcask_range_iter_release` | `delete` 句柄包装 | 可早于迭代结束调用；须在 `bitcask_close` 之前 |
+| `bitcask_range_iter_next` / `_next_batch` → 每条 `bitcask_range_entry_t` 内的 key/value | `bitcask_range_entry_free` | `free(key.data)` / `free(value.data)` 并清零 | **逐条调用**；错误路径同 `bitcask_iter_next_batch`（实现已释放，不可再 free）|
 
 **无需 free** 的"看起来返回指针"的函数：
 
@@ -1044,6 +1157,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 | `bitcask_options_init()` | 写入调用方栈/堆上的 `bitcask_options_t`，不分配 |
 | `bitcask_status()` / `bitcask_status_ex()` | 写入调用方栈/堆上的结构，无堆分配 |
 | `bitcask_iter_next()` / `_next_batch()` 的 `entry` | 由调用方提供，库写入字段；`key/value` 数据才是堆 |
+| `bitcask_range_options_init()` / `bitcask_range_iter_next()` 的 `entry` | 同上：结构由调用方提供，只有 `key/value` 数据在堆上 |
 | `bitcask_fault_t::detail` | 结构内嵌 512B 数组，随实例生命周期 |
 | 所有 `*_slice_t` / `*_scan_fn` 回调的 key/value | 非拥有视图 |
 | `bitcask_meta_filter_t` / `bitcask_meta_value_t` / `bitcask_doc_input_t` / `bitcask_hybrid_query_t` / `bitcask_kv_pair_t` | 调用方栈/静态构造即可 |
@@ -1073,7 +1187,9 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 | `bitcask_search_vector` / `_hybrid` 及对应 `_filtered` / `_batch` | ✅（向量引擎读路径；批量接口走共享 `search_arena` inter-query 并行）|
 | 同义词词典（`options.synonym_file_path`，open-time） | ✅（不可变 → 并发查询安全；无运行期 setter）|
 | `bitcask_iter_*` | ⚠️（同一 iter 不可并发；每线程一个迭代器；不同 iter 之间并发安全）|
-| `bitcask_parallel_scan` | ✅（内部多线程并发 `get`；**回调可能多线程并发触发**——回调须线程安全）|
+| `bitcask_range_iter_start` | ✅（取 OKI 只读视图）|
+| `bitcask_range_iter_next` / `_next_batch` / `_release` | ⚠️（同一 iter 不可并发；每线程一个；与并发写/merge 安全——per-key 弱一致）|
+| `bitcask_parallel_scan` / `_prefix` | ✅（内部多线程并发 `get`；**回调可能多线程并发触发**——回调须线程安全）|
 | `bitcask_status` / `bitcask_status_ex` / `bitcask_needs_merge` / `bitcask_merge` / `bitcask_is_empty` / `bitcask_is_frozen` / `bitcask_flush_index` | ✅ |
 | 读 / 写并发 | ✅（搜索可见性 near-real-time）|
 | `bitcask_merge` 与读写并发 | ✅（keydir `shared_mutex` 协调 + 独立 `merge.lock`，不阻塞 writer）|
