@@ -353,6 +353,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 | [`doc/cpp-arch.md`](doc/cpp-arch.md) | C++ 代码库架构与 CMake target 表 |
 | [`doc/format-zh.md`](doc/format-zh.md) | 字节级磁盘格式真源（record / hint / DocValue / ckpt / meta） |
 | [`doc/concurrency-zh.md`](doc/concurrency-zh.md) | 并发契约用户向说明（锁层、不变量、可见性） |
+| [`doc/multikey-txn-zh.md`](doc/multikey-txn-zh.md) | **应用层多键事务模式**（意图日志 + 前滚重放，补齐 A/D；不提供 I 与 CAS） |
 | [`doc/migrate-le.md`](doc/migrate-le.md) | 大端 → 小端目录离线迁移工具（`migrate_le`） |
 
 ### 设计文档
