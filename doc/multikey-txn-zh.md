@@ -7,7 +7,8 @@
 > 相关：[`put-flow-zh.md`](put-flow-zh.md)（`put_batch` 语义）、
 > [`format-zh.md`](format-zh.md)（record CRC）、
 > [`recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md)（torn-write 恢复）、
-> [`ordered-key-index-design-zh.md`](ordered-key-index-design-zh.md)（OKI range 扫描）
+> [`ordered-key-index-design-zh.md`](ordered-key-index-design-zh.md)（OKI range 扫描）、
+> [`pg-xid-mvcc-zh.md`](pg-xid-mvcc-zh.md)（参考：为何无需 PostgreSQL 式 XID 回收）
 
 ---
 
