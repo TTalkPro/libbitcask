@@ -410,6 +410,69 @@ v1 布局由测试侧**独立手写编码器**对拍钉死，改任何一边必�
 
 ---
 
+## ✅ S35：引擎原生原子批（方案 C——kBatchHeader）
+
+> 来源：用户拍板方案 C 取代方案 B 的提交路径。设计定稿：
+> [`doc/atomic-batch-design-zh.md`](doc/atomic-batch-design-zh.md)。
+> 核心：批头声明区间、区间完整即提交（无批尾 marker）；成员为普通
+> kDoc/kTombstone ⇒ 读路径零改动；meta v6 **懒升级**（首批前重写，
+> 未用批的目录停留 v5 与 5.1.0 读端互通）；TxnCask 接口保留、commit
+> 重接、recover 保留意图重放（兼容方案 B 遗留 pending）。
+
+### ✅ S35-1 — 格式 + fold 区间语义 🔴 HIGH
+
+- [x] `format.hpp`：`kBatchHeader = 2` + 批头 value 布局（`[u8 ver][u32 count][u64 span_bytes]`，13B 定长）
+- [x] `codec`：`encode/decode_batch_header_value`（拒收错长/错版/count=0/span=0）
+- [x] `data_file.cpp` fold：批区间内不推进 lve、区间收口一次推到位、
+      不完整（越 EOF/批头畸形/嵌套批头/记录跨界）→ break，lve 停批头起点；
+      区间内单条 CRC 腐蚀走 tolerate 跳过（位腐蚀逐条降级，原子性只承诺崩溃）
+- [x] codec 金测（枚举值 + 批头 value 黄金字节 + 拒收）
+
+### ✅ S35-2 — meta v6 懒升级 🔴 HIGH
+
+- [x] `kMetaVersionBatch = 6`，读端收 v5/v6，`MetaConfig::version` 回填/写出；
+      **顺手修**：`write_meta` 原为裸 ofstream（非原子、无 fsync）——改
+      `atomic_write_bytes(fsync_dir=true)`；`Cask::upgrade` 补纪元保留
+      （原会把 v6 目录降回 v5）
+- [x] 懒升级入口（put_batch_atomic 内、write_mu_ 下、首个批字节进写缓冲之前）
+- [x] `bitcask_migrate detect` 认 v6 + usage 表补行
+
+### ✅ S35-3 — 写路径 + 恢复 + merge 🔴 HIGH
+
+- [x] `Cask::put_batch_atomic(std::span<const BatchOp>)`（镜像 put_batch：
+      校验+值预编码 arena→懒升 v6→roll→批头+成员 write_buffered→flush→
+      hint（仅成员）→keydir put/remove→索引 Add/Delete + BatchOrdGuard
+      含批头 ord；merge-race 重试落区间外，独立完整记录）
+- [x] `cask_recovery.cpp` data fold 回调批 staging（apply_rec 提取共用、
+      拷贝暂存、区间收口依序放行、fold break 即弃）
+- [x] `merger.cpp`：批头 skip（成员为普通类型走既有路径，keydir 即活性权威）
+- [x] `tests/atomic_batch_test.cpp` 7 用例：可见性/hint-data 双路对拍、
+      meta 懒升级、掐尾批不可见+截断回批头起点、掐进批头、merge 交互、
+      TxnCask 重接掐尾、批后追加恢复。崩溃模拟 = 删派生缓存
+      （hint/kv.keydir.ckpt/kv.oki.*）+ resize_file，确定性无 fork
+
+### ✅ S35-4 — TxnCask 重接 + 文档 🟡 MED
+
+- [x] `txn.cpp` commit → 一次 `put_batch_atomic`（意图日志退役热路径，
+      写放大 2-3× → 1×）；recover/pending_txns 保留 legacy 意图重放
+- [x] S34 九用例零改动回归全绿；C API 增 `bitcask_put_batch_atomic` 直通
+- [x] format-zh §3/§4.2/§4.5、multikey-txn 系三文档、api-cpp/api-c、
+      README、CHANGELOG（并入 5.1.0 条目，标注 v6 懒升级语义）
+- **验收**：✅ Debug 全量 **692/692**（684 + 8 新增）+ build-rel 双树零错误
+
+#### ✅ S35 落地记录（2026-08-05）
+
+关键设计落点与探查结论：**批头 header-first + 「区间完整 ⟺ 已提交」**
+（头+成员同一次 flush pwrite，无批尾 marker）；**成员用普通
+kDoc/kTombstone 类型** ⇒ get/iter/merge/hint 读路径零特判（探查确认
+keydir 是全部读路径的唯一入口，批头永不进 keydir）；「封口 ⟹ 已提交」
+不变量使 hint 快路径零改动；meta v6 懒升级使不用原子批的目录与 5.1.0
+读端完全互通。测试期发现：掐尾模拟必须同时删 keydir 快照/OKI 派生缓存
+（否则批成员经快照复活——真实掉电下这些缓存同样不会覆盖撕裂批）。
+未提交（含 S34 全部改动）。
+
+---
+
 ## 执行序
 
 ```

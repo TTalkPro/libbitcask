@@ -1,4 +1,9 @@
-# S34：TxnCask 多键事务 helper 实现设计
+# S34：TxnCask 多键事务 helper 实现设计（方案 B，提交路径已被 S35 取代）
+
+> **状态（S35）**：`TxnCask::commit` 已改走引擎原生原子批
+> （[`atomic-batch-design-zh.md`](atomic-batch-design-zh.md)），本文的
+> 意图日志提交路径（§2.2/§3/§4）不再是热路径；`recover()` 仍按本文
+> §5 重放旧目录遗留的 `_txn:` 意图（blob v1 解码保留）。
 
 > 模式原理见 [`multikey-txn-zh.md`](multikey-txn-zh.md)(意图日志 + 前滚重放)。
 > 本文是**库内参考实现**(方案 B)的设计定稿:建在 `Cask` 公共 API

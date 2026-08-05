@@ -1883,6 +1883,249 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
     return {};
 }
 
+// S35：跨崩溃原子批（doc/atomic-batch-design-zh.md）。流程 = put_batch 的
+// 超集：全批校验 → **meta 懒升 v6**（首个批字节落盘前）→ roll → 批头
+// （kBatchHeader，声明成员区间）+ 成员逐条 write_buffered → 一次 flush
+// （批头+成员同一 pwrite 序列 = 提交点）→ hint（仅成员）→ keydir
+// put/remove + 索引 Add/Delete。恢复时区间不完整 ⟹ lve 停批头起点 ⟹
+// 整批截断——崩溃后 all-or-nothing。
+std::expected<void, CaskFault>
+Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
+    WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
+    std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
+    if (!opts_.read_write || opts_.merge_only) {
+        return std::unexpected(err(CaskError::kReadOnly));
+    }
+    if (ops.empty()) return {};
+    if (ops.size() > 0xFFFF'FFFFull) {
+        return std::unexpected(err(CaskError::kInvalidOption, "batch too large"));
+    }
+
+    // ① 全批前置校验 + 成员 value 预编码（span_bytes 需要精确的编码后
+    //    长度；arena 一次分配，(off,len) 索引）。校验失败零副作用。
+    thread_local std::vector<std::byte> arena;
+    arena.clear();
+    struct EncodedVal {
+        std::size_t off;
+        std::size_t len;
+    };
+    std::vector<EncodedVal> vals;
+    vals.reserve(ops.size());
+    std::uint64_t span_bytes = 0;
+    for (const auto& op : ops) {
+        if (op.key.size() > format::kMaxKeySize) {
+            return std::unexpected(err(CaskError::kKeyTooLarge));
+        }
+        if (op.type == BatchOp::Type::kPut) {
+            if (op.value.size() > format::kMaxValueSize) {
+                return std::unexpected(err(CaskError::kValueTooLarge));
+            }
+            const std::size_t off = arena.size();
+            codec::DocValueParts parts;
+            parts.text = op.value;
+            codec::encode_doc_value(arena, parts);
+            vals.push_back({off, arena.size() - off});
+        } else {
+            vals.push_back({0, 0});  // 墓碑成员 v0：空 value
+        }
+        span_bytes += format::kHeaderSize + op.key.size() + vals.back().len;
+    }
+    if (tstamp == 0) tstamp = now_sec_default();
+
+    // ② meta 懒升 v6——必须先于任何批字节进入写缓冲（write_buffered 满
+    //    1MiB 会自动 pwrite，字节可能早于 flush 落盘）。原子重写（tmp+
+    //    rename+fsync 目录），中途崩溃 meta 要么旧要么新；v6 无批字节合法。
+    if (meta_config_.version < 6) {
+        meta::MetaConfig mc = meta_config_;
+        mc.version = 6;
+        if (auto wr = meta::write_meta(dirname_, mc); !wr) {
+            return std::unexpected(err(CaskError::kIo,
+                "meta v6 upgrade failed: " + wr.error().message));
+        }
+        meta_config_ = mc;
+    }
+
+    // ③ roll：批头 + 整批进同一 active 文件（巨批软上限，同 put_batch）。
+    thread_local std::vector<std::byte> header_val;
+    header_val.clear();
+    codec::encode_batch_header_value(
+        header_val, {.count = static_cast<std::uint32_t>(ops.size()),
+                     .span_bytes = span_bytes});
+    const std::size_t about =
+        format::kHeaderSize + header_val.size() +
+        static_cast<std::size_t>(span_bytes);
+    if (auto r = roll_active_if_needed(about); !r) return std::unexpected(r.error());
+    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
+        if (auto r = roll_active(); !r) return std::unexpected(r.error());
+    }
+    const std::uint32_t batch_file =
+        active_file_id_.load(std::memory_order_relaxed);
+
+    // S13-F2 批量版守卫（同 put_batch）：未被真任务覆盖的 ord 补 Skip——
+    // 含批头 ord（永不进 keydir/索引，恒 Skip）。
+    struct BatchOrdGuard {
+        Cask* cask;
+        std::vector<std::uint64_t> ords;
+        std::vector<char> done;
+        ~BatchOrdGuard() {
+            for (std::size_t i = 0; i < ords.size(); ++i) {
+                if (!done[i]) {
+                    cask->submit_index_task(IndexTask::make(
+                        IndexOp::Skip, {}, ords[i], {}, 0, 0, 0, 0, 0));
+                }
+            }
+        }
+    } og{this, {}, {}};
+    og.ords.reserve(ops.size() + 1);
+    og.done.reserve(ops.size() + 1);
+
+    // ④ 批头 + 成员 write_buffered。文件序 == ord 序（批头 ord 先分配）。
+    const std::uint64_t header_ord = keydir_->alloc_ord();
+    og.ords.push_back(header_ord);
+    og.done.push_back(0);
+    {
+        auto w = active_data_->write_buffered(format::RecordType::kBatchHeader,
+                                              tstamp, header_ord, {}, header_val);
+        if (!w) {
+            return std::unexpected(io_fault(w.error().errnum,
+                                            std::string(active_data_->path())));
+        }
+    }
+    struct PendingWrite {
+        std::uint64_t ord;
+        std::uint64_t offset;
+        std::uint32_t total_size;
+    };
+    std::vector<PendingWrite> pw;
+    pw.reserve(ops.size());
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        const std::uint64_t ord = keydir_->alloc_ord();
+        og.ords.push_back(ord);
+        og.done.push_back(0);
+        const bool is_put = ops[i].type == BatchOp::Type::kPut;
+        const std::span<const std::byte> val =
+            is_put ? std::span<const std::byte>(arena.data() + vals[i].off,
+                                                vals[i].len)
+                   : std::span<const std::byte>{};
+        auto w = active_data_->write_buffered(
+            is_put ? format::RecordType::kDoc : format::RecordType::kTombstone,
+            tstamp, ord, ops[i].key, val);
+        if (!w) {
+            return std::unexpected(io_fault(w.error().errnum,
+                                            std::string(active_data_->path())));
+        }
+        pw.push_back({ord, w->offset, w->total_size});
+    }
+
+    // ⑤ 提交点：flush（批头+成员）。durability 策略同 put_batch。
+    if (auto f = active_data_->flush_batch(); !f) {
+        return std::unexpected(io_fault(f.error().errnum,
+                                        std::string(active_data_->path())));
+    }
+    if (!opts_.o_sync && opts_.sync_every_n > 0) {
+        if (auto s = active_data_->sync(); !s) {
+            return std::unexpected(io_fault(s.error().errnum,
+                                            std::string(active_data_->path())));
+        }
+        writes_since_sync_ = 0;
+    }
+
+    // ⑥ hint（仅成员；批头无 hint 条目——hint 快路径只在干净封口后启用，
+    //    封口 ⟹ 批已提交 ⟹ 成员条目直接 apply 正确）。
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        auto h = active_hint_->write(tstamp, pw[i].total_size, pw[i].offset,
+                                     /*tomb*/ ops[i].type == BatchOp::Type::kRemove,
+                                     ops[i].key, pw[i].ord);
+        if (!h) {
+            return std::unexpected(io_fault(h.error().errnum,
+                                            std::string(active_hint_->path())));
+        }
+    }
+
+    // ⑦ keydir apply + 索引提交（H1：锁外提交，同 put_batch）。
+    struct PendingTask {
+        std::size_t op;     // ops 下标
+        std::size_t slot;   // og 槽位
+        PersistedRecord rec;
+        bool is_remove;
+    };
+    std::vector<PendingTask> tasks;
+    tasks.reserve(ops.size());
+    auto flush_tasks = [&]() {
+        for (const auto& t : tasks) {
+            if (t.is_remove) {
+                submit_index_task(IndexTask::make(
+                    IndexOp::Delete, bytes_to_view(ops[t.op].key), t.rec.ord,
+                    {}, 0, 0, 0, tstamp, 0));
+            } else {
+                submit_index_task(IndexTask::make(
+                    IndexOp::Add, bytes_to_view(ops[t.op].key), t.rec.ord,
+                    std::string_view(
+                        reinterpret_cast<const char*>(ops[t.op].value.data()),
+                        ops[t.op].value.size()),
+                    t.rec.file_id, t.rec.offset, t.rec.total_size, tstamp, 0));
+            }
+            og.done[t.slot] = 1;
+        }
+        tasks.clear();
+    };
+    thread_local std::vector<std::byte> encoded_retry;
+    bool retried = false;
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        const std::size_t slot0 = i + 1;  // og 槽位（0 是批头）
+        if (ops[i].type == BatchOp::Type::kRemove) {
+            keydir_->remove(bytes_to_view(ops[i].key), tstamp, pw[i].ord);
+            tasks.push_back({i, slot0,
+                             PersistedRecord{pw[i].ord, pw[i].offset,
+                                             pw[i].total_size, batch_file},
+                             /*is_remove*/ true});
+            continue;
+        }
+        auto pr = keydir_->put(bytes_to_view(ops[i].key), batch_file,
+                               pw[i].total_size, pw[i].offset, tstamp,
+                               /*now*/ 0, /*newest*/ true, 0, 0, pw[i].ord);
+        PersistedRecord rec{pw[i].ord, pw[i].offset, pw[i].total_size,
+                            batch_file};
+        std::size_t slot = slot0;
+        if (pr == keydir::PutResult::kAlreadyExists) {
+            // merge race：单条重写（区间之外的独立完整记录，正确）。
+            encoded_retry.clear();
+            encoded_retry.reserve(ops[i].value.size() + 16);
+            codec::DocValueParts parts;
+            parts.text = ops[i].value;
+            codec::encode_doc_value(encoded_retry, parts);
+            std::vector<std::byte> record;
+            codec::encode_data_record(record, format::RecordType::kDoc, tstamp,
+                                      /*ord 占位*/ 0, ops[i].key, encoded_retry);
+            const std::uint64_t ord2 = keydir_->alloc_ord();
+            OrdSkipGuard g2(this, ord2);
+            auto p2 = write_and_keydir(ops[i].key, record, tstamp, ord2);
+            if (!p2) {
+                flush_tasks();  // 已收录条目补交（同 put_batch）
+                return std::unexpected(p2.error());
+            }
+            og.done.push_back(0);
+            og.ords.push_back(p2->ord);
+            g2.disarm();
+            slot = og.ords.size() - 1;
+            rec = *p2;
+            retried = true;
+        }
+        tasks.push_back({i, slot, rec, /*is_remove*/ false});
+    }
+    std::expected<void, CaskFault> gc;
+    if (retried) {
+        ++writes_since_sync_;
+        gc = maybe_group_commit(/*force*/ true);
+    }
+    wlk.unlock();
+    flush_tasks();
+    maybe_submit_auto_checkpoint();  // S14-1（锁外）
+    if (!gc) return std::unexpected(gc.error());
+    return {};
+}
+
 // 软删除 = 写一条墓碑 record。
 //
 // 墓碑 encoding (v2 backward compat):

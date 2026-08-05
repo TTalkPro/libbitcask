@@ -1,9 +1,11 @@
-// txn.hpp — S34：应用层多键事务 helper（意图日志 + 前滚重放）。
+// txn.hpp — S34/S35：多键事务 helper。
 //
-// 模式原理：doc/multikey-txn-zh.md；实现设计：doc/multikey-txn-impl-design-zh.md。
-// 建在 Cask 公共 API（put/put_batch/remove/sync/make_range_iter）之上，
-// 零盘上格式改动。提供崩溃原子性（A）与持久性（D）；**不提供**隔离性（I）
-// 与 CAS——事务中间态对并发读者可见（模式文档 §4）。
+// S35 起提交路径 = 引擎原子批（Cask::put_batch_atomic，方案 C，设计
+// doc/atomic-batch-design-zh.md）——跨崩溃 all-or-nothing 由引擎批头保证，
+// 无意图日志写放大。recover() 保留方案 B 的意图重放，兼容旧目录遗留的
+// "_txn:" pending（模式原理 doc/multikey-txn-zh.md）。
+// 提供崩溃原子性（A）与持久性（D）；**不提供**隔离性（I）与 CAS——
+// 事务中间态对并发读者可见（模式文档 §4）。
 #pragma once
 
 #include <cstdint>
@@ -52,26 +54,29 @@ public:
                      TxnSyncPolicy sync = TxnSyncPolicy::kSyncOnCommit)
         : cask_(cask), sync_(sync) {}
 
-    // 启动恢复：按提交序前滚重放全部 pending 事务并清理意图，返回重放条数。
-    // 契约：open 后、任何业务写之前调用；不得与 commit 并发。正常关闭的库
-    // 扫描开销 O(0)。意图 blob 解码失败（record CRC 已过仍解不开 = 逻辑
-    // 损坏）→ kBadCrc 停止，不静默跳过。
+    // 启动恢复（legacy，方案 B 兼容）：按提交序前滚重放旧目录遗留的
+    // "_txn:" 意图并清理，返回重放条数。S35 起 commit 不再产生意图——
+    // 从未用过方案 B 版本的目录恒返回 0（扫描 O(0)）。
+    // 契约：open 后、任何业务写之前调用；不得与 commit 并发。意图 blob
+    // 解码失败（record CRC 已过仍解不开 = 逻辑损坏）→ kBadCrc 停止。
     [[nodiscard]] std::expected<std::size_t, CaskFault> recover();
 
-    // 原子提交一批操作：① put 意图 → ②[sync] → ③ apply → ④ remove 意图。
+    // 原子提交一批操作：一次 Cask::put_batch_atomic（S35 引擎原子批）——
+    // 崩溃/掉电后整批要么全生效要么全不生效，无恢复重放依赖。
     // 校验（违反 → kInvalidOption，零副作用）：ops 非空；key 非空且互不
-    // 重复（PUT/REMOVE 拆分重放后重复 key 次序不可定义）；key 不以
-    // "_txn:" 开头。③/④ 失败 → 意图保留，下次 recover() 前滚重试。
+    // 重复；key 不以 "_txn:" 开头（保留给 legacy 意图命名空间）。
+    // 注意：首次 commit 把目录 meta 懒升级为 v6（此后 5.1.0 及更老读端
+    // 拒开该目录，契约见 Cask::put_batch_atomic）。
     // 并发：键集不相交的并发 commit 安全；键集重叠无隔离/定序保证，
     // 需应用层串行化。
     [[nodiscard]] std::expected<void, CaskFault> commit(std::span<const TxnOp> ops);
 
-    // 运维巡检：枚举当前 pending 事务（不重放、不清理）。
+    // 运维巡检：枚举 legacy pending 事务（不重放、不清理）。S35 后正常
+    // 恒空——仅方案 B 时期目录的崩溃遗留会非空。
     [[nodiscard]] std::expected<std::vector<PendingTxn>, CaskFault> pending_txns();
 
 private:
-    // ③ 与 recover 共用的重放路径：PUT 集一次 put_batch + REMOVE 逐条
-    // remove（BatchItem 无墓碑形态）。两条路径必须同一实现（模式文档 §6）。
+    // commit 与 recover（意图重放）共用：一次 put_batch_atomic。
     [[nodiscard]] std::expected<void, CaskFault> apply(std::span<const TxnOp> ops);
 
     Cask* cask_;

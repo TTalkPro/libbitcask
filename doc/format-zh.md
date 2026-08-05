@@ -186,7 +186,7 @@ Hint CRC32 与 data CRC32 用同一多项式（zlib/IEEE 802.3），由 `bitcask
 查表实现——两者输出 bit-identical，保证现有 data file / hint file 的 on-disk
 CRC 与历史数据兼容。
 
-## 三、`bitcask.meta` v5
+## 三、`bitcask.meta` v5/v6
 
 目录级配置文件，定位库运行模式与向量配置。本节对应头 `bitcask/meta_file.hpp`
 与 `src/cask/meta_file.cpp` 的 `kMetaFileSize = 18`。
@@ -196,7 +196,7 @@ CRC 与历史数据兼容。
 ```
 偏移 字节  字段           编码         含义
  0   4    magic           ASCII       4 字节 "BCME"（无 null 终止符）
- 4   1    Version         u8          = 5（kMetaVersion）
+ 4   1    Version         u8          = 5（kMetaVersion）或 6（S35 原子批纪元，懒升级）
  5   1    Mode            u8          0 = kKV / 1 = kIndex
  6   1    VecMetric       u8          见下表
  7   2    VecDim          u16 LE      向量维度，0 = 无向量
@@ -216,7 +216,8 @@ CRC 与历史数据兼容。
 - `kMetaVecMetricOffset = 6` / `kMetaVecDimOffset = 7` / `kMetaVecQuantOffset = 9`
   / `kMetaVecInmemInt8Offset = 10`
 - `kMetaReservedSize = 12` / `kMetaCrcOffset = 14` / `kMetaCrcCoverLen = 14`
-- `kMetaVersion = 5`（写端恒写 5）
+- `kMetaVersion = 5` / `kMetaVersionBatch = 6`（写端按 `MetaConfig::version`
+  写 5 或 6；目录创建恒 5，首次 `put_batch_atomic` 前懒升 6——见 §4.5）
 
 `VecMetric` 枚举（`namespace bitcask::meta::VectorMetric`）：
 
@@ -240,12 +241,12 @@ config"}`。
 | 1 | 大端 legacy 格式 → 干净拒绝（错误码 `0`, message 提示重建） |
 | 2/3 | u32-tstamp 纪元（record 布局不兼容）→ 干净拒绝，message 提示重建 |
 | 4 | ord-less-hint 纪元（data 布局相同，仅 hint 无 ord）→ 干净拒绝，message 提示 `bitcask_migrate hintord`（离线迁移即可，无需重建） |
-| 5 | 校验 CRC32（前 14 字节覆盖）→ 不匹配返回「CRC mismatch (corrupt)」 |
+| 5/6 | 校验 CRC32（前 14 字节覆盖）→ 不匹配返回「CRC mismatch (corrupt)」；v6 = v5 + 目录可能含 `kBatchHeader` 记录（S35） |
 
 字段校验顺序：
 
 1. magic（4 字节 `BCME`）
-2. Ver == 5，拒绝 1/2/3（u32 纪元）/4（ord-less-hint 纪元）与未知版本
+2. Ver ∈ {5, 6}，拒绝 1/2/3（u32 纪元）/4（ord-less-hint 纪元）与未知版本
 3. CRC32 必须匹配 `kMetaCrcCoverLen = 14`
 4. Mode ∈ {0, 1}，未知返回 `unknown mode`
 5. VecMetric ∈ {0, 1, 2, 3}，未知返回 `unknown vector metric`
@@ -255,8 +256,9 @@ config"}`。
 
 - 字段全部填好（其它字段置 0）后算 CRC32（LE 主机原生零转换，memcpy host
   序即可）。
-- 写入 18 字节单文件，无 trailing 数据。
-- `bitcask.meta` 不是高写入频率文件，单 write + close 即足够。
+- S35 起**原子写**（tmp + rename + fsync 目录，`detail::atomic_write_bytes`）
+  ——meta 是唯一纪元门禁，懒升级重写中途崩溃必须要么旧要么新，绝不能留
+  半截 meta（整目录拒开）。
 
 ### 3.3 与 LE-only flag-day 的关系
 
@@ -322,9 +324,37 @@ total = kHeaderSize + KeySz + ValueSz
 |------|---------|------|
 | `kDoc` | 0 | 文档：Value 段是 §五 的 DocValue v4 打包 |
 | `kTombstone` | 1 | 删除标记：Value 段通常为空（tombstone_version=2 时为 4B shadow file_id） |
+| `kBatchHeader` | 2 | S35 原子批批头（meta ≥ v6 纪元；见 §4.5） |
 
 墓碑识别走「一等 record 类型」，不再依赖 value 段的 magic 字符串。读端走
 `RecordType == kTombstone` 直接进入 tombstone 分支（见 §七）。
+
+### 4.5 原子批批头（S35，`kBatchHeader`，meta v6 纪元）
+
+设计：`doc/atomic-batch-design-zh.md`。`put_batch_atomic` 写出：
+
+```
+[kBatchHeader record]  [成员1]  [成员2] ... [成员N]
+                       └──── 声明区间，SpanBytes 字节 ────┘
+```
+
+- 批头是标准 27B header record：Key 为空（KeySz=0），Value 段固定 13 字节：
+
+```
+[0]      Ver         u8  = 1（kBatchHeaderVersion）
+[1..4]   Count       u32 小端（成员条数，≥1）
+[5..12]  SpanBytes   u64 小端（成员区间总字节，≥1）
+```
+
+- **成员是普通 `kDoc` / `kTombstone` 记录**（与单条 put/remove 写出的字节
+  同构）——读路径（get/iter/merge/hint）零特判；批头永不进 keydir/hint。
+- 提交判定：**声明区间完整存在且逐条 CRC 有效 ⟺ 批已提交**。批头与成员
+  经同一次 `flush_batch` pwrite 落盘，无需批尾 marker。恢复 fold 中区间
+  不完整（越 EOF / 批头 value 畸形 / 嵌套批头 / 记录跨区间边界）→
+  `last_valid_end` 停在批头起点 → 整批截断，等价于「从未写过」。
+- 纪元门禁：含 `kBatchHeader` 的目录 meta ≥ **v6**（首次 `put_batch_atomic`
+  前懒升级——旧读端对未知 type 盲转会把批头误读成活 doc，必须拒开）。
+  从不使用原子批的目录停留 v5，与 5.1.0 读端完全互通。
 
 ### 4.3 CRC 覆盖范围
 

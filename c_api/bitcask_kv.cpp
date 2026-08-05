@@ -358,6 +358,43 @@ BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
     });
 }
 
+// --- S35：引擎原子批直通 ---------------------------------------------------
+
+BITCASK_API bitcask_error_t bitcask_put_batch_atomic(bitcask_t* cask,
+                                                     const bitcask_txn_op_t* ops,
+                                                     size_t n_ops,
+                                                     bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    if (n_ops == 0) return BITCASK_OK;
+    if (!ops) return BITCASK_ERR_INVALID_OPTION;
+
+    std::vector<bitcask::Cask::BatchOp> cpp_ops;
+    cpp_ops.reserve(n_ops);
+    for (size_t i = 0; i < n_ops; ++i) {
+        if (ops[i].op > 1 || !slice_valid(ops[i].key))
+            return BITCASK_ERR_INVALID_OPTION;
+        bitcask::Cask::BatchOp op;
+        op.type = static_cast<bitcask::Cask::BatchOp::Type>(ops[i].op);
+        op.key = {static_cast<const std::byte*>(ops[i].key.data),
+                  ops[i].key.size};
+        if (op.type == bitcask::Cask::BatchOp::Type::kPut) {
+            if (!slice_valid(ops[i].value)) return BITCASK_ERR_INVALID_OPTION;
+            op.value = {static_cast<const std::byte*>(ops[i].value.data),
+                        ops[i].value.size};
+        }
+        cpp_ops.push_back(op);
+    }
+    auto result = as_cpp_cask(cask)->put_batch_atomic(cpp_ops);
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    return BITCASK_OK;
+    });
+}
+
 // --- S34：多键事务（TxnCask 无状态，每调用栈上构造）-----------------------
 
 BITCASK_API bitcask_error_t bitcask_txn_commit(bitcask_t* cask,

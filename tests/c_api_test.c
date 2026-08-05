@@ -672,6 +672,18 @@ static int test_txn(void) {
     assert(bitcask_txn_commit(cask, reserved, 1, 1, &fault) ==
            BITCASK_ERR_INVALID_OPTION);
 
+    // S35：引擎原子批直通（同 key 批内 LWW 合法）。
+    bitcask_txn_op_t raw[2] = {
+        {0, {"raw", 3}, {"first", 5}},
+        {0, {"raw", 3}, {"second", 6}},
+    };
+    assert(bitcask_put_batch_atomic(cask, raw, 2, &fault) == BITCASK_OK);
+    r = NULL;
+    assert(bitcask_get(cask, raw[0].key, &r, &fault) == BITCASK_OK);
+    assert(r->value.size == 6 && memcmp(r->value.data, "second", 6) == 0);
+    bitcask_get_result_free(r);
+    assert(bitcask_put_batch_atomic(cask, NULL, 0, &fault) == BITCASK_OK);
+
     bitcask_close(cask);
     printf("PASS test_txn\n");
     return 0;

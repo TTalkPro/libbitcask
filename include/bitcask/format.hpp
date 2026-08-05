@@ -49,7 +49,25 @@ inline constexpr std::uint32_t kMaxValueSize = 0xFFFF'FFFFu;  // 32-bit 字段�
 enum class RecordType : std::uint8_t {
     kDoc       = 0,  // 一条文档：value 是 §2.4 打包的 {vector,text,meta}
     kTombstone = 1,  // 删除标记：value 通常为空，target 由 Key=ext_id + Ord 确定
+    // S35：原子批批头（doc/atomic-batch-design-zh.md）。key 为空，value =
+    // 批头布局（见下方 kBatchHeader* 常量）声明「其后 count 条、共
+    // span_bytes 字节」为一个原子批；成员是普通 kDoc/kTombstone 记录。
+    // 声明区间完整且逐条 CRC 有效 ⟺ 批已提交；否则 fold 的
+    // last_valid_end 停在批头起点（整批不可见，恢复截断）。
+    // 批头永不进入 keydir/hint。含此类型的目录 meta ≥ v6（懒升级门禁，
+    // 5.1.0 及更老读端对未知 type 盲转会误读，必须拒开）。
+    kBatchHeader = 2,
 };
+
+// ---------------------------------------------------------------------------
+// S35 批头 value 布局（写在 kBatchHeader record 的 VALUE 段，全小端）：
+//   [0]      Ver         u8   (= kBatchHeaderVersion)
+//   [1..4]   Count       u32  (成员条数，≥1)
+//   [5..12]  SpanBytes   u64  (成员区间总字节：批头 record 之后紧邻的
+//                              count 条完整 record 的 total_size 之和)
+// ---------------------------------------------------------------------------
+inline constexpr std::uint8_t kBatchHeaderVersion   = 1;
+inline constexpr std::size_t  kBatchHeaderValueSize = 13;  // 1 + 4 + 8
 
 // ---------------------------------------------------------------------------
 // hint 文件 v5 布局（S33 flag-day：v4 变长格式 + 记录内嵌 ord）：

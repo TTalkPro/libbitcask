@@ -6,7 +6,7 @@
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
 `bitcask_version_*` = **`5.1.0`**；库 `SOVERSION` = **`5`**（= major）；
-盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（含 CRC32 + hint BCH5 纪元门禁），
+盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1 / BCOM v1**，`field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump。
 
@@ -20,7 +20,8 @@ hint = **BCH5**，OKI = **BCOK v1 / BCOM v1**，`field.schema` = **FSCH v1**。
 > [3.1.0] 同款处置：**盘上格式破坏不驱动 major/SOVERSION，ABI 破坏才驱动**
 > （4.0.0 = 结构体布局变更、5.0.0 = 签名与字段宽度变更，那两次才必须 bump）。
 >
-> 盘上格式版本：`bitcask.meta` = **v5**，hint = **BCH5**，
+> 盘上格式版本：`bitcask.meta` = **v5**（基线；首次 `put_batch_atomic`
+> 懒升 **v6**，见 S35 条目），hint = **BCH5**，
 > OKI run = **BCOK v1** / manifest = **BCOM v1**。
 
 ### ⚠️ 前向不兼容（盘上格式 flag-day；ABI 未破坏）
@@ -69,20 +70,30 @@ magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁�
   `bitcask_parallel_scan_prefix`（空切片时与无前缀版完全等价）。
 - **迁移工具**：`bitcask_migrate hintord`（v4 → v5）+ `detect` 识别 v4/v5。
 
-### Added（S34：多键事务 helper `TxnCask`）
+### Added（S34/S35：多键事务 + 引擎原子批）
 
-- **`bitcask::TxnCask`**（`include/bitcask/txn.hpp`）：意图日志 + 前滚重放
-  的多键事务——`commit`（①意图 → ②sync → ③apply → ④清理）、`recover`
-  （启动前滚，正常关闭 O(0)）、`pending_txns`（悬挂事务巡检）。提供崩溃
-  原子性（A）+ 持久性（D）；**不提供**隔离性（I）与 CAS。建在公共 API 上，
-  **零盘上格式改动**；`_txn:` key 命名空间保留。txn key 用进程级单调 seq
-  （定宽 hex）⇒ 重放序 = 提交序。依赖 OKI range 扫描（本版新增）枚举
-  pending。设计：`doc/multikey-txn-impl-design-zh.md`。
-- **C API（纯增量）**：`bitcask_txn_commit` / `bitcask_txn_recover` /
-  `bitcask_txn_pending_count` + `bitcask_txn_op_t`。
-- 模式文档 `doc/multikey-txn-zh.md` 勘误：`RangeOptions::prefetch` 是批大小
-  （`true` 隐转 1 = 关闭）、迭代器真实接口、`put_batch` 无墓碑形态、
-  txn key 必须单调（uuid 重放序 ≠ 提交序）。
+- **S35 `Cask::put_batch_atomic`（引擎原生跨崩溃原子批）**：盘上
+  `kBatchHeader`（RecordType=2）声明成员区间，批头+成员一次 flush 落盘；
+  恢复时**区间完整且逐条 CRC 有效 ⟺ 已提交**，否则 `last_valid_end` 停在
+  批头起点、整批截断——崩溃/掉电后 all-or-nothing。成员是普通
+  kDoc/kTombstone 记录 ⇒ get/iter/merge/hint 读路径零特判；支持批内
+  REMOVE；批内 op 依序 apply（同 key = 批内 LWW）。设计：
+  `doc/atomic-batch-design-zh.md`。
+- **meta v6 纪元（懒升级）**：首次 `put_batch_atomic` 前把 `bitcask.meta`
+  重写为 v6（原子写：tmp+rename+fsync，顺手修复 `write_meta` 裸 ofstream
+  非原子的问题）。**从不使用原子批的目录停留 v5**，与 5.1.0 读端完全互通；
+  v6 目录被 5.1.0 及更老读端干净拒开（unsupported meta version）。
+  `bitcask_migrate detect` 认识 v6。
+- **`bitcask::TxnCask`**（`include/bitcask/txn.hpp`，S34 立项、S35 重接）：
+  多键事务门面——`commit` = 一次引擎原子批（+ 按 `TxnSyncPolicy` fsync），
+  无意图日志写放大；`recover`/`pending_txns` 保留为 legacy（重放方案 B
+  意图日志时代目录遗留的 `_txn:` pending，新目录恒 0/空）。提供崩溃
+  原子性（A）+ 持久性（D）；**不提供**隔离性（I）与 CAS。
+- **C API（纯增量）**：`bitcask_put_batch_atomic` + `bitcask_txn_commit` /
+  `bitcask_txn_recover` / `bitcask_txn_pending_count` + `bitcask_txn_op_t`。
+- 模式文档 `doc/multikey-txn-zh.md` 勘误（S34-1）：`RangeOptions::prefetch`
+  是批大小（`true` 隐转 1 = 关闭）、迭代器真实接口、`put_batch` 无墓碑
+  形态、txn key 必须单调（uuid 重放序 ≠ 提交序）。
 
 ### Fixed
 

@@ -290,6 +290,13 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
 
     std::uint64_t offset = start_offset;
     int crc_errors = 0;
+    // S35 原子批（doc/atomic-batch-design-zh.md §1.3）：非 0 = 正处于批头
+    // 声明的成员区间 [.., batch_until) 内。区间内不推进 out_last_valid_end
+    // ——推进到区间末端才一次性推到位；区间不完整（越 EOF / 批头畸形 /
+    // 嵌套批头 / 记录跨区间边界）→ break，lve 停在批头起点 ⟹ 整批不可见，
+    // 写打开恢复按既有语义截断。区间内单条 CRC 腐蚀走 tolerate 跳过（位
+    // 腐蚀逐条降级，与全引擎一致——原子性只承诺崩溃故障）。
+    std::uint64_t batch_until = 0;
 
     // S13-P6：流式 chunked pread——原实现每条 record 2 次 pread（header 23B
     // + 整条 body），百万条即两百万次 syscall；现 256 KiB 一块 + 跨 record
@@ -343,6 +350,12 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
                 }
                 offset += rec_total;
                 rd.consume(rec_total);
+                // S35：跳过的坏记录也参与区间收口（区间是纯字节账）。
+                if (batch_until != 0 && offset >= batch_until) {
+                    if (offset > batch_until) break;  // 跨界 = 区间账坏
+                    batch_until = 0;
+                    if (out_last_valid_end) *out_last_valid_end = offset;
+                }
                 continue;
             }
             switch (rec.error()) {
@@ -352,10 +365,27 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
                     return std::unexpected(DataFileFault{DataFileError::kShortRead});
             }
         }
+        if (rec->type == format::RecordType::kBatchHeader) {
+            if (batch_until != 0) break;  // 嵌套批头 = 损坏，整批不可见
+            auto bh = codec::decode_batch_header_value(rec->value);
+            if (!bh) break;  // 批头 value 畸形：torn 语义
+            const std::uint64_t until = offset + rec_total + bh->span_bytes;
+            if (until > total) break;  // 区间越 EOF：未提交，整批不可见
+            batch_until = until;
+        }
         fn(*rec, offset, rec_total);
         offset += rec_total;
         rd.consume(rec_total);
-        if (out_last_valid_end) *out_last_valid_end = offset;
+        if (batch_until != 0) {
+            if (offset >= batch_until) {
+                if (offset > batch_until) break;  // 记录跨区间边界 = 账坏
+                batch_until = 0;
+                if (out_last_valid_end) *out_last_valid_end = offset;
+            }
+            // 区间未收口：不推进 lve
+        } else if (out_last_valid_end) {
+            *out_last_valid_end = offset;
+        }
     }
     // 防线程内存膨胀：一次巨型 record 不应让 buffer 永久占住线程堆。
     rd.shrink();

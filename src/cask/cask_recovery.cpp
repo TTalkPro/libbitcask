@@ -55,6 +55,7 @@ Cask::upgrade(std::string_view dirname,
 
     meta::MetaConfig new_mc;
     new_mc.mode = meta::Mode::kIndex;
+    new_mc.version = mc->version;  // S35：保留纪元（v6 目录不得降回 v5）
     auto wr = meta::write_meta(std::string(dirname), new_mc);
     if (!wr) {
         return std::unexpected(err(CaskError::kIo, "write meta failed"));
@@ -371,9 +372,24 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
             return std::unexpected(io_fault(df.error().errnum, e.data_path));
         }
         std::uint64_t last_valid_end = 0;
-        auto fr = df->fold(
-            [&](const codec::DataRecordView& view, std::uint64_t offset,
-                std::uint32_t total_size) {
+        // S35 原子批 staging（doc/atomic-batch-design-zh.md §1.3）：批头
+        // 声明区间内的成员**拷贝暂存**（fold 缓冲跨记录复用，view 不可
+        // 留存），推进到区间末端才依序 apply——fold 层保证区间不完整时
+        // break（lve 停批头起点，随后截断），故暂存残留 = 未提交批，
+        // 随作用域丢弃即可。
+        struct StagedRec {
+            format::RecordType type;
+            std::uint64_t tstamp;
+            std::uint64_t ord;
+            std::vector<std::byte> key;
+            std::vector<std::byte> value;
+            std::uint64_t offset;
+            std::uint32_t total_size;
+        };
+        std::vector<StagedRec> staged;
+        std::uint64_t batch_end = 0;  // 0 = 未处于批区间
+        auto apply_rec = [&](const codec::DataRecordView& view,
+                             std::uint64_t offset, std::uint32_t total_size) {
                 if (view.type == format::RecordType::kTombstone) {
                     // S33：携带 ord + 缺席即插 sentinel（并行恢复到达序无关，
                     // 同 hint 路径）。
@@ -450,6 +466,51 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                         if (recover_batch.size() >= kRecoverBatch) flush_recover();
                     }
                 }
+        };
+        auto fr = df->fold(
+            [&](const codec::DataRecordView& view, std::uint64_t offset,
+                std::uint32_t total_size) {
+                if (view.type == format::RecordType::kBatchHeader) {
+                    // 批头：开启 staging（fold 层已验证区间在 EOF 内；
+                    // value 畸形时 fold 直接 break，此处防御性忽略）。
+                    auto bh = codec::decode_batch_header_value(view.value);
+                    if (!bh) return;
+                    batch_end = offset + total_size + bh->span_bytes;
+                    staged.clear();
+                    // 批头 ord 推进水位（区间即使被弃，跳号无害、复用有害）。
+                    keydir_->advance_ord(view.ord);
+                    return;
+                }
+                if (batch_end != 0) {
+                    StagedRec sr;
+                    sr.type = view.type;
+                    sr.tstamp = view.tstamp;
+                    sr.ord = view.ord;
+                    sr.key.assign(view.key.begin(), view.key.end());
+                    sr.value.assign(view.value.begin(), view.value.end());
+                    sr.offset = offset;
+                    sr.total_size = total_size;
+                    staged.push_back(std::move(sr));
+                    if (offset + total_size >= batch_end) {
+                        // 区间收口 = 批已提交：依序放行。
+                        for (const auto& s : staged) {
+                            codec::DataRecordView v{
+                                .crc = 0,
+                                .type = s.type,
+                                .tstamp = s.tstamp,
+                                .ord = s.ord,
+                                .key = s.key,
+                                .value = s.value,
+                                .total_size = s.total_size,
+                            };
+                            apply_rec(v, s.offset, s.total_size);
+                        }
+                        staged.clear();
+                        batch_end = 0;
+                    }
+                    return;
+                }
+                apply_rec(view, offset, total_size);
             }, /*tolerate_crc_errors*/ true,
             /*out_last_valid_end*/ &last_valid_end,
             /*start_offset*/ fold_start);

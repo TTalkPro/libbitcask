@@ -48,6 +48,7 @@ constexpr const char* kUsage =
     "  v2/v3 little-endian, u32 tstamp    -> run: tstamp64\n"
     "  v4    u64 tstamp, ord-less hints   -> run: hintord\n"
     "  v5    current (BCH5 hints)         -> nothing to do\n"
+    "  v6    v5 + atomic-batch records    -> nothing to do\n"
     "\n"
     "all migrations are non-destructive: src is opened read-only, output\n"
     "is written to dst (created if missing). derived caches (keydir/search\n"
@@ -123,6 +124,10 @@ int cmd_detect(const char* dir) {
         case 5:
             std::printf("%s: meta v5 — current era (BCH5 hints), "
                         "nothing to migrate\n", dir);
+            return 0;
+        case 6:
+            std::printf("%s: meta v6 — atomic-batch era (v5 + kBatchHeader "
+                        "records), nothing to migrate\n", dir);
             return 0;
         default:
             std::fprintf(stderr,

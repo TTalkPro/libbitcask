@@ -16,6 +16,7 @@
 | 能力 | 接口（`bitcask::Cask`） | 说明 | 文档 |
 |------|------------------------|------|------|
 | KV 读写 | `put` / `get` / `remove` / `put_batch` | DocValue v4 编码（u64 tstamp），纯 KV 的 binary 走 text 段 | [`api-cpp.md`](doc/api-cpp.md) |
+| **原子批 / 多键事务** | `put_batch_atomic` / `TxnCask` | S35 引擎原子批：崩溃/掉电后整批 all-or-nothing（批头声明区间，meta v6 懒升级）；支持批内 REMOVE | [`atomic-batch-design-zh.md`](doc/atomic-batch-design-zh.md) |
 | 零拷贝读 | `get`（`GetResultView`）/ `get_owned` | view 借 `pread` 缓冲或 sealed mmap，无堆分配 | [`getresult-view-design-zh.md`](doc/getresult-view-design-zh.md) |
 | 结构化文档 | `put_doc`（`DocInput`） | text + 可选 meta + 可选 vector + 多字段 | [`api-cpp.md`](doc/api-cpp.md) |
 | 词袋检索 | `search_text` | BM25 + meta 过滤，支持 `offset` 分页 | [`api-cpp.md`](doc/api-cpp.md) |
@@ -48,7 +49,7 @@
 | 操作 | 并发语义 |
 |------|----------|
 | **读**（`get` / `search_*` / 批量检索） | 真并发（无锁 / `shared_lock`） |
-| **写**（`put` / `remove` / `put_doc` / `sync` / `put_batch`） | 多线程安全。内部 `write_mu_` 串行化——单 append WAL 在文件层本就串行，锁不损吞吐；多写**安全但不提速** |
+| **写**（`put` / `remove` / `put_doc` / `sync` / `put_batch` / `put_batch_atomic`） | 多线程安全。内部 `write_mu_` 串行化——单 append WAL 在文件层本就串行，锁不损吞吐；多写**安全但不提速** |
 | **读写并发** | 安全；搜索可见性 near-real-time |
 | **`merge`** | 与读写并发：`write.lock` 与 `merge.lock` 两把独立文件锁，merger 通过 `read()` write.lock 内容排除 live writer 的活动文件 |
 | **`parallel_scan`** | 内部多线程并发 `get`；调用方提供的 `ScanFn` 必须线程安全 |
@@ -353,8 +354,9 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 | [`doc/cpp-arch.md`](doc/cpp-arch.md) | C++ 代码库架构与 CMake target 表 |
 | [`doc/format-zh.md`](doc/format-zh.md) | 字节级磁盘格式真源（record / hint / DocValue / ckpt / meta） |
 | [`doc/concurrency-zh.md`](doc/concurrency-zh.md) | 并发契约用户向说明（锁层、不变量、可见性） |
-| [`doc/multikey-txn-zh.md`](doc/multikey-txn-zh.md) | **多键事务模式**（意图日志 + 前滚重放，补齐 A/D；不提供 I 与 CAS）——S34 起库内 `TxnCask` / `bitcask_txn_*` 落地 |
-| [`doc/multikey-txn-impl-design-zh.md`](doc/multikey-txn-impl-design-zh.md) | S34 `TxnCask` 实现设计定稿（意图 blob 编码、单调 txn key、恢复流程、并发契约） |
+| [`doc/multikey-txn-zh.md`](doc/multikey-txn-zh.md) | **多键事务模式原理**（意图日志 + 前滚重放，补齐 A/D；不提供 I 与 CAS）——库内 `TxnCask` / `bitcask_txn_*` 落地 |
+| [`doc/atomic-batch-design-zh.md`](doc/atomic-batch-design-zh.md) | **S35 引擎原子批设计定稿**（kBatchHeader 区间提交判定、meta v6 懒升级、`put_batch_atomic`）——TxnCask 现行提交路径 |
+| [`doc/multikey-txn-impl-design-zh.md`](doc/multikey-txn-impl-design-zh.md) | S34 方案 B 设计存档（意图 blob 编码、单调 txn key——提交路径已被 S35 取代，recover 兼容仍在用） |
 | [`doc/pg-xid-mvcc-zh.md`](doc/pg-xid-mvcc-zh.md) | 参考笔记：PostgreSQL xmin/xmax 与 XID 回收——论证本库事务方案无需 XID 式回收 |
 | [`doc/migrate-le.md`](doc/migrate-le.md) | 大端 → 小端目录离线迁移工具（`migrate_le`） |
 

@@ -502,6 +502,43 @@ TEST(Layout, ConstantsLocked) {
     EXPECT_EQ(format::kMaxValueSize, 0xFFFFFFFFu);
     EXPECT_EQ(static_cast<std::uint8_t>(format::RecordType::kDoc), 0u);
     EXPECT_EQ(static_cast<std::uint8_t>(format::RecordType::kTombstone), 1u);
+    // S35：原子批批头。
+    EXPECT_EQ(static_cast<std::uint8_t>(format::RecordType::kBatchHeader), 2u);
+    EXPECT_EQ(format::kBatchHeaderVersion, 1u);
+    EXPECT_EQ(format::kBatchHeaderValueSize, 13u);  // 1+4+8
+}
+
+// S35：批头 value 黄金字节（锁定磁盘布局）。
+// [Ver=1][Count u32 LE][SpanBytes u64 LE]
+TEST(BatchHeader, GoldenBytesAndRoundtrip) {
+    std::vector<std::byte> out;
+    codec::encode_batch_header_value(out, {.count = 3, .span_bytes = 0x0102030405ull});
+    ASSERT_EQ(out.size(), format::kBatchHeaderValueSize);
+    const std::uint8_t golden[13] = {
+        0x01,                          // ver
+        0x03, 0x00, 0x00, 0x00,        // count = 3 LE
+        0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0x00, 0x00,  // span LE
+    };
+    for (std::size_t i = 0; i < sizeof(golden); ++i) {
+        EXPECT_EQ(static_cast<std::uint8_t>(out[i]), golden[i]) << "byte " << i;
+    }
+    auto back = codec::decode_batch_header_value(out);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->count, 3u);
+    EXPECT_EQ(back->span_bytes, 0x0102030405ull);
+
+    // 拒收：错长度 / 错版本 / count==0 / span==0。
+    EXPECT_FALSE(codec::decode_batch_header_value(
+        std::span<const std::byte>(out.data(), 12)));
+    std::vector<std::byte> bad = out;
+    bad[0] = std::byte{9};
+    EXPECT_FALSE(codec::decode_batch_header_value(bad));
+    std::vector<std::byte> zero_count;
+    codec::encode_batch_header_value(zero_count, {.count = 0, .span_bytes = 5});
+    EXPECT_FALSE(codec::decode_batch_header_value(zero_count));
+    std::vector<std::byte> zero_span;
+    codec::encode_batch_header_value(zero_span, {.count = 1, .span_bytes = 0});
+    EXPECT_FALSE(codec::decode_batch_header_value(zero_span));
 }
 
 // V3.1:vector 段黄金字节(锁定磁盘布局)。

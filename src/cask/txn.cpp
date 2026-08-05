@@ -3,11 +3,7 @@
 
 #include "bitcask/txn.hpp"
 
-#include <atomic>
-#include <chrono>
-#include <cstdio>
 #include <cstring>
-#include <random>
 #include <unordered_set>
 
 #include "cask_internal.hpp"  // err / bytes_to_view
@@ -21,16 +17,6 @@ constexpr std::uint8_t kBlobVersion = 1;
 constexpr std::size_t kBlobHeaderSize = 1 + 8 + 4;
 // [u8 type][u32 klen][u32 vlen]
 constexpr std::size_t kOpHeaderSize = 1 + 4 + 4;
-
-void put_u32le(std::vector<std::byte>& out, std::uint32_t v) {
-    for (int i = 0; i < 4; ++i)
-        out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
-}
-
-void put_u64le(std::vector<std::byte>& out, std::uint64_t v) {
-    for (int i = 0; i < 8; ++i)
-        out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
-}
 
 std::uint32_t get_u32le(const std::byte* p) {
     std::uint32_t v = 0;
@@ -46,73 +32,13 @@ std::uint64_t get_u64le(const std::byte* p) {
     return v;
 }
 
-std::uint64_t now_us() {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
-}
-
-// 进程级单调 seq：max(now_us, last+1)。进程内严格单调 ⇒ 定宽 hex 的
-// 字典序 = 提交序（重放定序，设计 §4）；跨进程由 write.lock 排他 +
-// 墙钟保证实用单调。
-std::uint64_t alloc_seq() {
-    static std::atomic<std::uint64_t> last{0};
-    std::uint64_t prev = last.load(std::memory_order_relaxed);
-    for (;;) {
-        const std::uint64_t next = std::max(now_us(), prev + 1);
-        if (last.compare_exchange_weak(prev, next, std::memory_order_relaxed))
-            return next;
-    }
-}
-
-// 进程随机 session id：防墙钟异常下跨进程 seq 碰撞。
-std::uint32_t session_rand() {
-    static const std::uint32_t r = [] {
-        std::random_device rd;
-        return static_cast<std::uint32_t>(rd());
-    }();
-    return r;
-}
-
-std::string make_txn_key() {
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "%.*s%016llx-%08x",
-                  static_cast<int>(TxnCask::kTxnPrefix.size()),
-                  TxnCask::kTxnPrefix.data(),
-                  static_cast<unsigned long long>(alloc_seq()),
-                  session_rand());
-    return buf;
-}
-
 std::span<const std::byte> bytes(std::string_view s) {
     return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
 }
 
-// 意图 blob v1 编码（设计 §3；布局为稳定格式，txn_test 手写编码器对拍）。
-std::vector<std::byte> encode_ops(std::span<const TxnOp> ops,
-                                  std::uint64_t created_at_us) {
-    std::size_t total = kBlobHeaderSize;
-    for (const auto& op : ops) {
-        total += kOpHeaderSize + op.key.size();
-        if (op.type == TxnOp::Type::kPut) total += op.value.size();
-    }
-    std::vector<std::byte> out;
-    out.reserve(total);
-    out.push_back(static_cast<std::byte>(kBlobVersion));
-    put_u64le(out, created_at_us);
-    put_u32le(out, static_cast<std::uint32_t>(ops.size()));
-    for (const auto& op : ops) {
-        out.push_back(static_cast<std::byte>(op.type));
-        put_u32le(out, static_cast<std::uint32_t>(op.key.size()));
-        const bool is_put = op.type == TxnOp::Type::kPut;
-        put_u32le(out, is_put ? static_cast<std::uint32_t>(op.value.size()) : 0);
-        out.insert(out.end(), op.key.begin(), op.key.end());
-        if (is_put) out.insert(out.end(), op.value.begin(), op.value.end());
-    }
-    return out;
-}
-
+// 意图 blob v1（方案 B 遗留格式）：S35 起 commit 不再写意图——本解码仅
+// 服务 recover() 对旧目录遗留 pending 的前滚重放（设计
+// doc/atomic-batch-design-zh.md §4）。布局见 multikey-txn-impl-design-zh §3。
 struct DecodedIntent {
     std::uint64_t created_at_us = 0;
     std::vector<TxnOp> ops;  // span 借 blob 存储——blob 必须比本结构活得久
@@ -161,19 +87,20 @@ decode_ops(std::span<const std::byte> blob) {
 }  // namespace
 
 std::expected<void, CaskFault> TxnCask::apply(std::span<const TxnOp> ops) {
-    // PUT 集一次 put_batch（本进程内 all-or-nothing 可见）+ REMOVE 逐条。
-    // key 互不重复（commit 校验/decode 后仍由 commit 侧保证）⇒ 拆分次序无关。
-    std::vector<Cask::BatchItem> puts;
-    puts.reserve(ops.size());
-    for (const auto& op : ops)
-        if (op.type == TxnOp::Type::kPut)
-            puts.push_back({.key = op.key, .value = op.value});
-    if (!puts.empty())
-        if (auto r = cask_->put_batch(puts); !r) return r;
-    for (const auto& op : ops)
-        if (op.type == TxnOp::Type::kRemove)
-            if (auto r = cask_->remove(op.key); !r) return r;
-    return {};
+    // S35：一次引擎原子批（doc/atomic-batch-design-zh.md）——跨崩溃
+    // all-or-nothing 由引擎批头保证，PUT/REMOVE 同批依序 apply。
+    // commit 与 recover（意图重放）共用本路径。
+    std::vector<Cask::BatchOp> batch;
+    batch.reserve(ops.size());
+    for (const auto& op : ops) {
+        Cask::BatchOp b;
+        b.type = op.type == TxnOp::Type::kPut ? Cask::BatchOp::Type::kPut
+                                              : Cask::BatchOp::Type::kRemove;
+        b.key = op.key;
+        b.value = op.value;
+        batch.push_back(b);
+    }
+    return cask_->put_batch_atomic(batch);
 }
 
 std::expected<void, CaskFault> TxnCask::commit(std::span<const TxnOp> ops) {
@@ -193,14 +120,13 @@ std::expected<void, CaskFault> TxnCask::commit(std::span<const TxnOp> ops) {
                                        "txn: duplicate key in ops"));
     }
 
-    const std::string txn_key = make_txn_key();
-    const std::vector<std::byte> blob = encode_ops(ops, now_us());
-
-    if (auto r = cask_->put(bytes(txn_key), blob); !r) return r;   // ① 意图
-    if (sync_ == TxnSyncPolicy::kSyncOnCommit)                     // ② 落盘
+    // S35：原子性下沉引擎——一次 put_batch_atomic 即崩溃后 all-or-nothing，
+    // 意图日志(方案 B 的 ①②④)从热路径退役,写放大 2-3× → 1×。
+    // TxnSyncPolicy 只管持久性(原子性与其正交)。
+    if (auto r = apply(ops); !r) return r;
+    if (sync_ == TxnSyncPolicy::kSyncOnCommit)
         if (auto r = cask_->sync(); !r) return r;
-    if (auto r = apply(ops); !r) return r;                         // ③ 数据
-    return cask_->remove(bytes(txn_key));                          // ④ 完成
+    return {};
 }
 
 std::expected<std::size_t, CaskFault> TxnCask::recover() {

@@ -483,6 +483,27 @@ S13-D1 批量写（语义同 `put` 的 KV 路径）。整批一次提交：记�
 - 校验（key / value 大小）在任何写发生前全批完成——校验失败零副作用。
 - 整批写入同一 active 文件；巨批允许该文件超出 `max_file_size`（软上限）。
 
+#### `Cask::put_batch_atomic`（S35：跨崩溃原子批）
+
+```cpp
+struct BatchOp {
+    enum class Type : std::uint8_t { kPut = 0, kRemove = 1 };
+    Type type;
+    std::span<const std::byte> key;
+    std::span<const std::byte> value{};   // kRemove 忽略
+};
+[[nodiscard]] std::expected<void, CaskFault>
+put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp = 0);
+```
+
+语义 = `put_batch` 的超集（设计 [`atomic-batch-design-zh.md`](atomic-batch-design-zh.md)）：
+
+- **崩溃/掉电后整批要么全可见要么全不可见**——盘上 `kBatchHeader` 声明成员区间，恢复时区间不完整 ⟹ 整批截断（等价于从未写过）。
+- 支持批内 REMOVE；批内 op 依序 apply（同 key 多次 = 批内 LWW）。
+- **首次调用把目录 meta 懒升级为 v6**：此后 5.1.0 及更老读端拒开该目录（`unsupported meta version`）。从不调用本方法的目录停留 v5。
+- durability 与 `put_batch` 相同（`o_sync` / `sync_every_n` / caller `sync()`）——原子性与持久性正交：未 fsync 掉电可能整批丢失，但绝不半批。
+- 线程安全：是（同 `put_batch`，内部 `write_mu_`）。
+
 #### `Cask::remove`
 
 ```cpp
@@ -523,12 +544,12 @@ public:
 };
 ```
 
-意图日志 + 前滚重放的多键事务 helper（原理 [`multikey-txn-zh.md`](multikey-txn-zh.md)，设计 [`multikey-txn-impl-design-zh.md`](multikey-txn-impl-design-zh.md)）。提供崩溃原子性（A）与持久性（D）；**不提供**隔离性（I）与 CAS——事务中间态对并发读者可见。要点：
+多键事务 helper（原理 [`multikey-txn-zh.md`](multikey-txn-zh.md)；S35 起提交路径 = 引擎原子批，设计 [`atomic-batch-design-zh.md`](atomic-batch-design-zh.md)）。提供崩溃原子性（A）与持久性（D）；**不提供**隔离性（I）与 CAS——事务中间态对并发读者可见。要点：
 
-- `commit`：① 写意图（`_txn:` key）→ ②[sync] → ③ apply → ④ 清理。校验失败（空批 / 空 key / 重复 key / `_txn:` 前缀）→ `kInvalidOption` 零副作用；③/④ 失败 → 意图保留，下次 `recover()` 前滚重试。
-- `recover`：open 后、任何业务写之前调用；按提交序（txn key 单调 seq 的字典序）前滚全部 pending 并清理，返回重放条数。正常关闭的库开销 O(0)。意图 blob 解码失败 → `kBadCrc` 停止。
-- 并发：键集不相交的并发 `commit` 安全；键集重叠无隔离/定序保证（应用层串行化）；`recover` 不得与 `commit` 并发。
-- `_txn:` 命名空间保留；空间回收走 merge（意图 + 墓碑 = 普通死记录）。
+- `commit`：一次 `put_batch_atomic`——崩溃/掉电后全生效或全不生效，无恢复重放依赖。校验失败（空批 / 空 key / 重复 key / `_txn:` 前缀）→ `kInvalidOption` 零副作用。首次 commit 懒升级目录 meta 至 v6（见 `put_batch_atomic` 契约）。`TxnSyncPolicy::kSyncOnCommit`（默认）在提交后显式 `sync()`（防掉电丢批——原子性与持久性正交）。
+- `recover`（legacy）：前滚重放方案 B（意图日志）时代目录遗留的 `_txn:` pending 并清理。S35 起 commit 不再产生意图——新目录恒返回 0。open 后、任何业务写之前调用；不得与 `commit` 并发。
+- 并发：键集不相交的并发 `commit` 安全；键集重叠无隔离/定序保证（应用层串行化）。
+- `_txn:` 命名空间保留（legacy）；空间回收走 merge。
 
 ### 5.4 检索（索引模式）
 

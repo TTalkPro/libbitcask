@@ -152,6 +152,13 @@ void MergeRunner::fold_record(const codec::DataRecordView& view,
         stats_.records_tombs += 1;
         return;
     }
+    // S35 原子批批头：仅在原始文件内有意义（成员活性由 keydir 判定，
+    // merge 不需要批语义）。不搬运——merge 输出是纯 kDoc 记录流，
+    // 永不含批头。
+    if (view.type == format::RecordType::kBatchHeader) {
+        stats_.records_stale += 1;  // 计作不搬运（无独立计数，避免公共结构体膨胀）
+        return;
+    }
 
     // 活性检查：keydir 当前最新指向必须正好是 (in_file_id, offset)
     // 才算这条 record 是活的。否则它已经被新写入覆盖了，merge

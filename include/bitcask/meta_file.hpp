@@ -60,6 +60,11 @@ struct MetaConfig {
     bool vector_inmem_int8 = false; // P5b：HNSW int8-only 内存模式（仅 vector_dim>0 + kDot）
     // S32-M0：向量引擎（仅 vector_dim>0 有意义；无向量恒 kHnsw/0）。
     VectorEngine vector_engine = VectorEngine::kHnsw;
+    // S35：盘上纪元。5 = 无原子批（与 5.1.0 读端互通）；6 = 目录可能含
+    // kBatchHeader 记录（首次 put_batch_atomic 前懒升级，见
+    // doc/atomic-batch-design-zh.md §2）。read_meta 回填实际值；write_meta
+    // 按此值写出（仅接受 5/6）。目录创建默认 5。
+    std::uint8_t version = 5;
 };
 
 // meta 文件操作错误

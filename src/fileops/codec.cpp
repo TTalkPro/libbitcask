@@ -117,6 +117,37 @@ decode_data_record(std::span<const std::byte> buf) {
 }
 
 // ---------------------------------------------------------------------------
+// S35 批头 value 编解码（format.hpp kBatchHeader* 布局）
+// ---------------------------------------------------------------------------
+
+void encode_batch_header_value(std::vector<std::byte>& out,
+                               const BatchHeaderInfo& info) {
+    const std::size_t base = out.size();
+    out.resize(base + format::kBatchHeaderValueSize);
+    std::byte* p = out.data() + base;
+    p[0] = static_cast<std::byte>(format::kBatchHeaderVersion);
+    le_store_u32(p + 1, info.count);
+    le_store_u64(p + 5, info.span_bytes);
+}
+
+std::expected<BatchHeaderInfo, DecodeError>
+decode_batch_header_value(std::span<const std::byte> buf) {
+    if (buf.size() != format::kBatchHeaderValueSize) {
+        return std::unexpected(DecodeError::kBufferTooShort);
+    }
+    if (static_cast<std::uint8_t>(buf[0]) != format::kBatchHeaderVersion) {
+        return std::unexpected(DecodeError::kUnsupportedVersion);
+    }
+    BatchHeaderInfo info;
+    info.count = le_load_u32(buf.data() + 1);
+    info.span_bytes = le_load_u64(buf.data() + 5);
+    if (info.count == 0 || info.span_bytes == 0) {
+        return std::unexpected(DecodeError::kKeySizeOverflow);
+    }
+    return info;
+}
+
+// ---------------------------------------------------------------------------
 // kDoc value 打包/解包（§2.4）
 // ---------------------------------------------------------------------------
 

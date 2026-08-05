@@ -6,6 +6,7 @@
 #include <span>
 
 #include "bitcask/codec.hpp"
+#include "bitcask/detail/file_util.hpp"  // S35：atomic_write_bytes
 
 namespace bitcask::meta {
 
@@ -32,12 +33,16 @@ inline constexpr std::size_t kMetaFileSize = kMetaMagicSize + 1 + 1 + kMetaReser
 // v4 = record 时间戳 u64 flag-day（data header 27B / hint BCH4 / doc value v4）;
 // v5 = hint BCH5 flag-day（S33：hint 记录内嵌 ord;data/DocValue 布局与 v4
 // 完全相同,仅 hint 与本门禁变更,离线迁移 `bitcask_migrate hintord` 只重写
-// hint + meta——data 一字节不动）。
+// hint + meta——data 一字节不动）;
+// v6 = S35 原子批纪元（**懒升级**：目录可能含 kBatchHeader 记录;与 v5 的
+// 差异仅此一点,首次 put_batch_atomic 前由引擎重写 meta——从不用批的目录
+// 永远停留 v5,与 5.1.0 读端互通。设计 doc/atomic-batch-design-zh.md §2）。
 // 读端：v1 干净拒绝(大端,提示重建);v2/v3 干净拒绝(u32-tstamp 纪元,record
 // 布局不兼容,提示重建——绝不按新偏移把旧字节静默读坏);v4 干净拒绝(提示
-// 跑 hintord 迁移);v5 校验 CRC。
-// 写端恒写 v5(带 CRC)。见 doc/format-zh.md 字节序说明。
+// 跑 hintord 迁移);v5/v6 校验 CRC 后接受。
+// 写端按 MetaConfig::version 写 5 或 6(目录创建默认 5)。
 inline constexpr std::uint8_t kMetaVersion = 5;
+inline constexpr std::uint8_t kMetaVersionBatch = 6;  // S35 原子批纪元
 inline constexpr char kMetaMagic[kMetaMagicSize + 1] = "BCME";
 
 // header 前 kMetaCrcCoverLen 字节的 CRC32（与 data/hint/field.schema 同多项式）。
@@ -93,10 +98,10 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
             "run `bitcask_migrate hintord <src> <dst>` to migrate "
             "(data files are copied unchanged; only hints + meta rewritten)"});
     }
-    if (ver != 5) {
+    if (ver != kMetaVersion && ver != kMetaVersionBatch) {
         return std::unexpected(MetaError{0, "unsupported meta version"});
     }
-    // v5：校验 CRC32（检出位翻转/损坏 → fail-fast）。
+    // v5/v6：校验 CRC32（检出位翻转/损坏 → fail-fast）。
     {
         std::uint32_t stored = 0;
         std::memcpy(&stored, header + kMetaCrcOffset, 4);
@@ -107,6 +112,7 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
 
     const std::uint8_t mode_val = static_cast<std::uint8_t>(header[kMetaModeOffset]);
     MetaConfig cfg;
+    cfg.version = ver;  // S35：回填实际纪元（5 或 6）
     if (mode_val == 0) {
         cfg.mode = Mode::kKV;
     } else if (mode_val == 1) {
@@ -141,9 +147,8 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
 
 std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaConfig& config) {
     const auto path = std::filesystem::path(dirname) / "bitcask.meta";
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f) {
-        return std::unexpected(MetaError{errno, "cannot create bitcask.meta"});
+    if (config.version != kMetaVersion && config.version != kMetaVersionBatch) {
+        return std::unexpected(MetaError{0, "invalid meta version to write"});
     }
 
     char header[kMetaFileSize] = {0};
@@ -156,7 +161,7 @@ std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaCo
         static_cast<char>(config.vector_inmem_int8 ? 1 : 0);
     header[kMetaVecEngineOffset] =
         static_cast<char>(config.vector_engine);  // S32-M0（CRC 覆盖区内）
-    header[kMetaVersionOffset] = static_cast<char>(kMetaVersion);
+    header[kMetaVersionOffset] = static_cast<char>(config.version);  // S35：5/6
     header[kMetaModeOffset] = static_cast<char>(
         config.mode == Mode::kKV ? 0 : 1);
 
@@ -164,8 +169,14 @@ std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaCo
     const std::uint32_t crc = meta_crc(header);
     std::memcpy(header + kMetaCrcOffset, &crc, 4);
 
-    f.write(header, static_cast<std::streamsize>(kMetaFileSize));
-    if (!f) {
+    // S35：原子写（tmp + rename + fsync 目录）。原实现裸 ofstream 截断重写，
+    // 懒升级重写 meta 时若中途崩溃会留下半截 meta（整目录拒开）——meta 是
+    // 唯一纪元门禁，必须要么旧要么新。
+    if (!detail::atomic_write_bytes(
+            path.string(),
+            std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(header), kMetaFileSize),
+            /*fsync_dir=*/true)) {
         return std::unexpected(MetaError{errno, "write meta file failed"});
     }
     return {};

@@ -88,6 +88,27 @@ void patch_data_record_ord(std::span<std::byte> record, std::uint64_t ord);
 decode_data_record(std::span<const std::byte> buf);
 
 // ---------------------------------------------------------------------------
+// S35 批头 value（kBatchHeader record 的 VALUE 段，format.hpp 布局）。
+// ---------------------------------------------------------------------------
+
+struct BatchHeaderInfo {
+    std::uint32_t count = 0;       // 成员条数（≥1）
+    std::uint64_t span_bytes = 0;  // 成员区间总字节（批头之后紧邻）
+};
+
+// 编码批头 value（append 到 out，恒 kBatchHeaderValueSize 字节）。
+// 线程安全: 是（纯函数）；不需任何锁。
+void encode_batch_header_value(std::vector<std::byte>& out,
+                               const BatchHeaderInfo& info);
+
+// 解码批头 value。长度不符 → kBufferTooShort；Ver 不识别 →
+// kUnsupportedVersion；count==0 或 span_bytes==0 → kKeySizeOverflow
+// （字段矛盾归为越界类）。
+// 线程安全: 是（纯函数，只读 buf）；不需任何锁。
+[[nodiscard]] std::expected<BatchHeaderInfo, DecodeError>
+decode_batch_header_value(std::span<const std::byte> buf);
+
+// ---------------------------------------------------------------------------
 // kDoc value 打包/解包（§2.4）。仅用于 type==kDoc 的 record 的 VALUE 段。
 // ---------------------------------------------------------------------------
 

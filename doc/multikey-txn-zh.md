@@ -4,10 +4,13 @@
 > 基于「意图日志 + 前滚重放」的模式，用库已有的三项保证补齐
 > **原子性（A）与持久性（D）**。
 >
-> **S34 起库内已提供该模式的参考实现 `bitcask::TxnCask`**
-> （`include/bitcask/txn.hpp`；C API `bitcask_txn_*`），实现设计见
+> **S34 起库内提供 `bitcask::TxnCask`**（`include/bitcask/txn.hpp`；C API
+> `bitcask_txn_*`）。**S35 起其提交路径已升级为引擎原生原子批**
+> （`Cask::put_batch_atomic`，设计 [`atomic-batch-design-zh.md`](atomic-batch-design-zh.md)）
+> ——本文的「意图日志 + 前滚重放」模式仍是正确的应用层方案（也是
+> `recover()` 兼容旧目录的机制），但新代码直接用 TxnCask/原子批即可，
+> 无意图日志的 2-3× 写放大。方案 B 实现设计存档：
 > [`multikey-txn-impl-design-zh.md`](multikey-txn-impl-design-zh.md)。
-> 直接使用即可，无需按本文手工实现。
 >
 > 相关：[`put-flow-zh.md`](put-flow-zh.md)（`put_batch` 语义）、
 > [`format-zh.md`](format-zh.md)（record CRC）、
@@ -254,9 +257,9 @@ const std::vector<bitcask::TxnOp> ops = {
     {.type = bitcask::TxnOp::Type::kPut,    .key = k1, .value = v1},
     {.type = bitcask::TxnOp::Type::kRemove, .key = k2},
 };
-auto r = txn.commit(ops);               // ①意图 → ②sync → ③apply → ④清理
+auto r = txn.commit(ops);               // S35：一次引擎原子批（+ 按策略 sync）
 
-auto pending = txn.pending_txns();      // 运维巡检（§5.4）
+auto pending = txn.pending_txns();      // legacy 巡检（§5.4；S35 后正常恒空）
 ```
 
 C API：`bitcask_txn_commit` / `bitcask_txn_recover` /
