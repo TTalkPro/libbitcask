@@ -500,14 +500,18 @@ S33-7 (评审)  ───── 依 S33-1 数据
 
 ---
 
-## ⏸ 遗留（自 Phase 6 带入，原文见 git 历史）
+## ⏸ 遗留（2026-08-05 S35 收尾时复核）
 
 | 项 | 内容 | 状态 |
 |---|---|---|
-| T23 | ChunkedReader 归并 refill ×3（`hint_file.cpp` ×2 + `data_file.cpp`）| 🟡 **升级为 S33-2 前置** |
-| T24 | decode_rec 共享解包段模板归并（须 bench 基准 + build-rel 双树）| 🟢 择机 |
-| T8 | 搜索读屏障无界等待 | ⏸ 4 项前置未满足（见 git 历史 Phase 6 版）|
-| T12 | HNSW ckpt 去重 | ⏸ 默认不做（注释同步已替代）|
+| T23 | ChunkedReader 归并 refill ×3 | ✅ done（随 S33-2，见落地记录）|
+| T24 | decode_rec 共享解包段模板归并（须 bench 基准 + build-rel 双树）| 🟢 择机——**前提复核仍成立**：两份解码现位于 `src/bm25/segment_v2.cpp:604`（`decode_rec`→FlatPostings）与 `:970`（`decode_rec_list`→PostingList），原文见 git 历史 62789cd |
+| T8 | 搜索读屏障无界等待（`prepare_search` 饥饿）| ⏸ 4 项前置未满足（饥饿注入测试 / applied_ord 可见性调查 / flush 超时基建✅ / flush_upto+notify 成对恢复；原文 62789cd）|
+| T12 | HNSW ckpt 去重（~115 行）| ⏸ 默认不做（注释同步已替代）|
+| **B1** | **checkpoint 可能跑赢未 fsync 的数据**（S35 测试期发现的**预存**暴露面）：keydir 快照/OKI 经 `atomic_write_bytes` fsync 落盘，而被引用的数据记录可能还在 page cache——掉电后快照存活、数据撕裂 ⟹ 恢复拿到悬空条目（get 报 IO/CRC）。单条 put 与批同样暴露，非 S35 引入。候选方向：ckpt 写前记录各文件已 fsync 水位、快照只覆盖水位内条目；或 ckpt 前强制 sync。**须先写失败注入测试证实再立项** | 🟡 待评估 |
+| **B2** | **legacy 意图重放退役时间表**：`TxnCask::recover`/`pending_txns` + blob v1 解码现在只服务方案 B 时期（dc81bbc..S35 之间）目录的崩溃遗留。建议 5.3+ 删除（CHANGELOG 预告一版）| 🟢 择机 |
+
+Phase 6 复核仍成立的低价值项（RED-3/5/6/10，随重构自然消化）见 git 历史 62789cd。
 
 ---
 
