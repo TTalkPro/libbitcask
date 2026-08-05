@@ -499,13 +499,30 @@ S34 已由用户提交（dc81bbc）；S35 改动未提交。
 > **零 flag-day**（run 是派生缓存，版本升级自愈）。目标：100M key
 > 11GB → ~1.2GB（-90%），热 get 零回归、冷 get ≤2 次 pread。
 
-### S36-1 — BCOK v2 格式 + 外排 rebuild 🔴 HIGH
+### ✅ S36-1 — BCOK v2 格式 + 外排 rebuild 🔴 HIGH
 
-- [ ] v2 行（全字段 vbyte + tomb 免位置）+ bloom 内嵌 + 32B 尾部；
-      BCOM v2（条目带 format_ver）；(ord, gen) 归并胜出
-- [ ] rebuild 换外排（64MiB 分段 + k 路归并——现全内存 sort 在 100M 档
-      即 11GB 峰值，必须先修）
-- **验收**：roundtrip/seek/bloom FP/损坏拒收/v1 拒载自愈单测；重建峰值探针
+- [x] v2 行（全字段 vbyte + tomb 免位置 + tstamp 块内回绕差分）+ bloom
+      内嵌（FNV-1a64+splitmix64 双哈希，10 bits/key k=7，格式常量钉死）
+      + 32B 尾部；读端 v1/v2 双版本、未来版本拒收；`may_contain` v1 恒 true
+- [x] BCOM v2（条目带 format_ver，**惰性版本选择**：全 v1 → 写 v1 字节
+      老读端可读；含 v2 → v2，老读端拒收自愈）
+- [x] `SpillingRunBuilder` 外排（64MiB 分段 spill `kv.oki.spill-*` +
+      k 路归并；同 key 胜出 = max (ord, 来源序)——与 (ord, run gen) 格
+      同构；drop_tombstones 档位供全归并；sweep 顺带清崩溃残件）；
+      `OkiState::rebuild` 切外排（原全内存 sort 退役）
+- **验收**：✅ `oki_run_v2_test` 11 用例（roundtrip/bloom 无假阴性 +
+  FP<5%/seek/未知 flags/未来版本/坏 bloom/v1 兼容/外排 3 万行对拍/墓碑
+  丢弃/manifest v2）；v1 回归 10/10 + oki_recovery 8/8；**重建峰值探针：
+  500 万行 spill=64MiB → 峰值 RSS 83MB**（旧全内存 sort 同规模 ~400MB，
+  100M 档 GB 级）；v2 行实测 **33 B/行**（优于设计预估 45B）；
+  Debug 全量 **703/703** + build-rel 双树零错误
+
+#### ✅ S36-1 落地记录（2026-08-05）
+
+一处实现期修正：Cursor 持 Reader 裸指针，归并源 vector 必须先 reserve
+锁容量、Source 落位后再建游标（先建再 move 会悬垂——已修并注释）。
+spill 文件不 fsync（临时件，崩溃 = 整次构建重来，派生缓存语义；最终
+run 的 finish 才带 fsync_dir）。未提交。
 
 ### S36-2 — 全字段 delta + locate() 影子对拍 🔴 HIGH（安全网）
 
