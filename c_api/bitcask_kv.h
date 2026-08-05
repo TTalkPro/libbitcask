@@ -402,7 +402,7 @@ typedef struct {
 
 /* S35：引擎原子批直通。整批崩溃/掉电后要么全可见要么全不可见；批内 op
  * 依序 apply（同 key 多次 = 批内 LWW，不校验重复）。**首次调用把目录
- * meta 懒升级为 v6**——此后 5.1.0 及更老读端拒开该目录（unsupported
+ * meta 懒升级为 v6**——旧于 5.1.0 的读端拒开该目录（unsupported
  * meta version）。durability 同 bitcask_put_batch。ops 借调用方存储。 */
 BITCASK_API bitcask_error_t bitcask_put_batch_atomic(bitcask_t* cask,
                                                      const bitcask_txn_op_t* ops,

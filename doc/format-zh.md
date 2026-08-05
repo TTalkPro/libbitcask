@@ -354,7 +354,8 @@ total = kHeaderSize + KeySz + ValueSz
   `last_valid_end` 停在批头起点 → 整批截断，等价于「从未写过」。
 - 纪元门禁：含 `kBatchHeader` 的目录 meta ≥ **v6**（首次 `put_batch_atomic`
   前懒升级——旧读端对未知 type 盲转会把批头误读成活 doc，必须拒开）。
-  从不使用原子批的目录停留 v5，与 5.1.0 读端完全互通。
+  从不使用原子批的目录停留 v5（保守纪元标记；旧于 5.1.0 的读端对
+  v5/v6 都拒开——v5 纪元本身即 5.1.0 引入）。
 
 ### 4.3 CRC 覆盖范围
 

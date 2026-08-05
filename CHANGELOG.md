@@ -12,7 +12,7 @@ hint = **BCH5**，OKI = **BCOK v1 / BCOM v1**，`field.schema` = **FSCH v1**。
 
 ---
 
-## [5.1.0] - 未发布（S33：有序 key 索引 OKI + hint ord flag-day）
+## [5.1.0] - 2026-08-05（S33：有序 key 索引 OKI + hint ord flag-day；S34/S35：多键事务与引擎原子批）
 
 > **版本语义**：C API 为**纯增量**（新导出 6 个 range 函数 + 2 个前缀入口；
 > 既有函数签名与结构体布局零改动），故 MINOR +1 → `5.1.0`，
@@ -81,8 +81,9 @@ magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁�
   `doc/atomic-batch-design-zh.md`。
 - **meta v6 纪元（懒升级）**：首次 `put_batch_atomic` 前把 `bitcask.meta`
   重写为 v6（原子写：tmp+rename+fsync，顺手修复 `write_meta` 裸 ofstream
-  非原子的问题）。**从不使用原子批的目录停留 v5**，与 5.1.0 读端完全互通；
-  v6 目录被 5.1.0 及更老读端干净拒开（unsupported meta version）。
+  非原子的问题）。**从不使用原子批的目录停留 v5**（保守纪元标记——v5/v6 均为本版
+  5.1.0 引入并可读；旧于本版的读端对两者都干净拒开，unsupported meta
+  version）。
   `bitcask_migrate detect` 认识 v6。
 - **`bitcask::TxnCask`**（`include/bitcask/txn.hpp`，S34 立项、S35 重接）：
   多键事务门面——`commit` = 一次引擎原子批（+ 按 `TxnSyncPolicy` fsync），

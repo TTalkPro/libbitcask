@@ -591,8 +591,8 @@ public:
     // 全不可见**（盘上批头声明区间，恢复时区间不完整 ⟹ 整批截断）。
     // - 支持批内 REMOVE（kRemove 忽略 value；墓碑成员 v0 编码）。
     // - 批内 op 依序 apply（同 key 多次 = 批内 LWW）。
-    // - **首次调用把目录 meta 懒升级为 v6**——此后 5.1.0 及更老读端拒开
-    //   该目录（unsupported meta version）。从不调用本方法的目录停留 v5。
+    // - **首次调用把目录 meta 懒升级为 v6**——旧于 5.1.0 的读端拒开该
+    //   目录（unsupported meta version）。从不调用本方法的目录停留 v5。
     // - durability 与 put_batch 相同（o_sync / sync_every_n / caller sync()）；
     //   原子性与持久性正交——未 fsync 掉电可能整批丢失，但绝不半批。
     // 线程安全: **是**（同 put_batch，内部 write_mu_）。

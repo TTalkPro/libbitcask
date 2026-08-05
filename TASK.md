@@ -3,8 +3,8 @@
 > 来源：[`doc/ordered-key-index-design-zh.md`](doc/ordered-key-index-design-zh.md)（设计草案已定稿）
 > 决策基线：否决整体换 LevelDB；WiscKey 式旁挂有序 key 索引；**flag-day 停机迁移**
 > （hint BCH4→BCH5 加 ord、meta v4→v5、`bitcask_migrate hintord`，与 5.0.0 tstamp64 同模式）
-> 版本目标：**5.1.0**（盘上 `bitcask.meta` = v5；`SOVERSION` 保持 `5`——
-> C API 纯增量，**盘上格式破坏不驱动 major**，同 3.1.0 先例）
+> 版本目标：**5.1.0**（盘上 `bitcask.meta` = v5，S35 起用原子批的目录懒升 v6；
+> `SOVERSION` 保持 `5`——C API 纯增量，**盘上格式破坏不驱动 major**，同 3.1.0 先例）
 > 基线测试：ctest 全绿（Phase 6 T22 后 644 项，1 个 S30RssProbe 预存 Disabled）
 > 验收标准：每项改动后 ctest 全绿 + 编译无新告警；公共结构体改动须 build-rel 双树验证；
 > 格式改动须对拍 + crash 注入
@@ -416,7 +416,7 @@ v1 布局由测试侧**独立手写编码器**对拍钉死，改任何一边必�
 > [`doc/atomic-batch-design-zh.md`](doc/atomic-batch-design-zh.md)。
 > 核心：批头声明区间、区间完整即提交（无批尾 marker）；成员为普通
 > kDoc/kTombstone ⇒ 读路径零改动；meta v6 **懒升级**（首批前重写，
-> 未用批的目录停留 v5 与 5.1.0 读端互通）；TxnCask 接口保留、commit
+> 未用批的目录停留 v5——保守纪元标记）；TxnCask 接口保留、commit
 > 重接、recover 保留意图重放（兼容方案 B 遗留 pending）。
 
 ### ✅ S35-1 — 格式 + fold 区间语义 🔴 HIGH

@@ -36,7 +36,7 @@ inline constexpr std::size_t kMetaFileSize = kMetaMagicSize + 1 + 1 + kMetaReser
 // hint + meta——data 一字节不动）;
 // v6 = S35 原子批纪元（**懒升级**：目录可能含 kBatchHeader 记录;与 v5 的
 // 差异仅此一点,首次 put_batch_atomic 前由引擎重写 meta——从不用批的目录
-// 永远停留 v5,与 5.1.0 读端互通。设计 doc/atomic-batch-design-zh.md §2）。
+// 永远停留 v5,保守纪元标记。设计 doc/atomic-batch-design-zh.md §2）。
 // 读端：v1 干净拒绝(大端,提示重建);v2/v3 干净拒绝(u32-tstamp 纪元,record
 // 布局不兼容,提示重建——绝不按新偏移把旧字节静默读坏);v4 干净拒绝(提示
 // 跑 hintord 迁移);v5/v6 校验 CRC 后接受。

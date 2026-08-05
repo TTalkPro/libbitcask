@@ -55,7 +55,7 @@ enum class RecordType : std::uint8_t {
     // 声明区间完整且逐条 CRC 有效 ⟺ 批已提交；否则 fold 的
     // last_valid_end 停在批头起点（整批不可见，恢复截断）。
     // 批头永不进入 keydir/hint。含此类型的目录 meta ≥ v6（懒升级门禁，
-    // 5.1.0 及更老读端对未知 type 盲转会误读，必须拒开）。
+    // 旧读端对未知 type 盲转会误读，必须拒开）。
     kBatchHeader = 2,
 };
 

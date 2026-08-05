@@ -63,7 +63,8 @@
 - **懒升级**:目录创建仍写 v5;**首次写入批头之前**(同一 `write_mu_`
   临界区内、任何批字节落盘之前)把 meta 重写为 v6。
   语义:**目录含批记录 ⟺ meta ≥ v6**。从不用引擎原子批的目录永远停在
-  v5,与 5.1.0 读端完全互通。
+  v5(保守纪元标记;注意 v5 纪元本身即 5.1.0 引入——旧于 5.1.0 的读端
+  对 v5/v6 都拒开,懒升级的收益是 v6 戳只在真正用到批时落下)。
 - 本库读端:v5 与 v6 都接受(v6 仅表示「可能含批头」)。
 - **顺手修**:`write_meta` 现为裸 ofstream(非原子、无 fsync)——升级
   改用 `detail::atomic_write_bytes(fsync_dir=true)`,防 meta 重写中途
@@ -81,7 +82,7 @@ struct BatchOp {
 };
 
 // 跨崩溃原子批:整批在崩溃后要么全可见要么全不可见。
-// 首次调用把目录 meta 懒升级为 v6(此后 5.1.0 及更老读端拒开,提示见 §2)。
+// 首次调用把目录 meta 懒升级为 v6(旧于 5.1.0 的读端拒开,见 §2)。
 // 批内 op 依序 apply(同 key 多次 = 批内 LWW);durability 同 put_batch
 // (o_sync / sync_every_n / caller sync())。
 [[nodiscard]] std::expected<void, CaskFault>
