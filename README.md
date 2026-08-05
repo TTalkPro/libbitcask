@@ -358,6 +358,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 | [`doc/atomic-batch-design-zh.md`](doc/atomic-batch-design-zh.md) | **S35 引擎原子批设计定稿**（kBatchHeader 区间提交判定、meta v6 懒升级、`put_batch_atomic`）——TxnCask 现行提交路径 |
 | [`doc/multikey-txn-impl-design-zh.md`](doc/multikey-txn-impl-design-zh.md) | S34 方案 B 设计存档（意图 blob 编码、单调 txn key——提交路径已被 S35 取代，recover 兼容仍在用） |
 | [`doc/pg-xid-mvcc-zh.md`](doc/pg-xid-mvcc-zh.md) | 参考笔记：PostgreSQL xmin/xmax 与 XID 回收——论证本库事务方案无需 XID 式回收 |
+| [`doc/keydir-disk-resident-design-zh.md`](doc/keydir-disk-resident-design-zh.md) | **S36 keydir 磁盘驻留设计稿**（OKI Level B：热点缓存 + BCOK v2 全字段 run + bloom；100M key 11GB → ~1.2GB） |
 | [`doc/migrate-le.md`](doc/migrate-le.md) | 大端 → 小端目录离线迁移工具（`migrate_le`） |
 
 ### 设计文档

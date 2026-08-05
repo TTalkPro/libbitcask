@@ -30,6 +30,12 @@ void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep) {
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
         const auto name = e.path().filename().string();
+        // S36-1：外排 spill 残件（kv.oki.spill-*，仅崩溃遗留）一律清理。
+        if (name.rfind("kv.oki.spill-", 0) == 0) {
+            std::error_code rm_ec;
+            std::filesystem::remove(e.path(), rm_ec);
+            continue;
+        }
         const auto g = parse_run_gen(name);
         if (!g) continue;
         if (std::find(keep.begin(), keep.end(), *g) != keep.end()) continue;
@@ -257,11 +263,6 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
                        std::uint64_t cover_ord) {
     std::lock_guard<std::mutex> flk(flush_mu_);
 
-    std::sort(rows.begin(), rows.end(), [](const DeltaRow& a, const DeltaRow& b) {
-        if (a.key != b.key) return a.key < b.key;
-        return a.ord < b.ord;
-    });
-
     // S33-6：零活 key（空库 / 全删）**不落空 run**——空 run 归并不出任何行，
     // 却占一个文件 + 一个常驻 Reader fd，且要等下次 rebuild 才被清理。
     // 「0 个 run + wm = cover_ord」已完整表达语义：[0, cover_ord) 里没有任何
@@ -269,18 +270,19 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
     const std::uint64_t gen = next_gen_locked();
     std::shared_ptr<OkiRunReader> new_reader;
     if (!rows.empty()) {
-        auto w = OkiRunWriter::create(mk_run_filename(dir, gen));
-        if (!w) return false;
-        for (std::size_t i = 0; i < rows.size(); ++i) {
-            if (i + 1 < rows.size() && rows[i + 1].key == rows[i].key) continue;
-            const auto& r = rows[i];
-            auto a = w->add(std::span<const std::byte>(
+        // S36-1：外排构建（64MiB 分段 spill + k 路归并）取代全内存 sort——
+        // 排序工作集从 O(全部行) 降到 O(spill_bytes)；同 key 去重规则不变
+        //（max ord 胜，builder 内 (ord, 到达序) 等价于原 (key, ord) 排序取末）。
+        auto b = SpillingRunBuilder::create(std::string(dir), gen);
+        if (!b) return false;
+        for (const auto& r : rows) {
+            auto a = b->add(std::span<const std::byte>(
                                 reinterpret_cast<const std::byte*>(r.key.data()),
                                 r.key.size()),
                             r.ord, r.tomb);
             if (!a) return false;
         }
-        if (!w->finish(/*fsync_dir=*/true)) return false;
+        if (!b->finish(/*fsync_dir=*/true)) return false;
 
         auto rd = OkiRunReader::open(mk_run_filename(dir, gen));  // S33-5
         if (!rd) {

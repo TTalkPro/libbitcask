@@ -352,9 +352,13 @@ C API `bitcask_range_iter_*`（6 个新导出 + 2 个新结构体）、
   豁免；C API 新路径含 prefetch 也在 TSan 下跑过）| build-rel 全树零错误
   （含 bench，公共结构体 `RangeOptions` 双树验证）。
 
-### S33-7 — Level B 门禁评审 🟢 LOW（依 S33-1 数据）
+### ✅ S33-7 — Level B 门禁评审（2026-08-05 收口：**通过，立项 S36**）
 
-keydir RSS 占进程 RSS > ~40% 才立项 keydir 磁盘驻留；立项则另立设计文档。
+门禁数据（`doc:<n>` 真实形态直灌 keydir，`key_length_histogram` 口径）：
+1M → 96MB（100.7 B/key）；10M → 1.4GB（147.6，扩容相位最差点）；
+**100M → 11GB（118.1 B/key，大头是槽位 107.4 而非 key 本体）**。
+纯 KV 模式下 11GB 远超 40% 线 → **立项**。设计文档：
+[`doc/keydir-disk-resident-design-zh.md`](doc/keydir-disk-resident-design-zh.md)（S36）。
 
 ---
 
@@ -482,6 +486,59 @@ keydir 是全部读路径的唯一入口，批头永不进 keydir）；「封口
   对比方案 B 意图日志的 2-3×。数字入设计文档 §8。
 
 S34 已由用户提交（dc81bbc）；S35 改动未提交。
+
+---
+
+## 🔵 S36：keydir 磁盘驻留（OKI Level B）
+
+> 来源：S33-7 门禁通过（100M `doc:` key 实测 keydir 11GB）。设计定稿：
+> [`doc/keydir-disk-resident-design-zh.md`](doc/keydir-disk-resident-design-zh.md)。
+> 核心：哈希 keydir 降级热点缓存，点查权威 = cache → memdelta →
+> **BCOK v2 全字段 run**（+内嵌 bloom + 块 LRU）；(ord, run_gen) 胜出格
+> 取代 epoch；merge 活性/搬迁改走统一 `locate()`（Level A「零交互」反转）；
+> **零 flag-day**（run 是派生缓存，版本升级自愈）。目标：100M key
+> 11GB → ~1.2GB（-90%），热 get 零回归、冷 get ≤2 次 pread。
+
+### S36-1 — BCOK v2 格式 + 外排 rebuild 🔴 HIGH
+
+- [ ] v2 行（全字段 vbyte + tomb 免位置）+ bloom 内嵌 + 32B 尾部；
+      BCOM v2（条目带 format_ver）；(ord, gen) 归并胜出
+- [ ] rebuild 换外排（64MiB 分段 + k 路归并——现全内存 sort 在 100M 档
+      即 11GB 峰值，必须先修）
+- **验收**：roundtrip/seek/bloom FP/损坏拒收/v1 拒载自愈单测；重建峰值探针
+
+### S36-2 — 全字段 delta + locate() 影子对拍 🔴 HIGH（安全网）
+
+- [ ] DeltaRow 加宽（+SingleEntry）；搬迁/TTL 挂钩（keydir 咽喉点反转
+      old_file_id!=0 跳过规则）；统一 `locate()` 原语
+- [ ] **影子模式**：缓存不逐出，get 双查对拍（debug 断言组合视图 == 哈希
+      权威）——零漂移是 S36-4 开逐出的前置门
+- **验收**：全量 ctest + 对拍零漂移；put/merge 回归 bench（put ≤3%）
+
+### S36-3 — get 冷路径 + 块 LRU 🔴 HIGH
+
+- [ ] get 接 locate；块 LRU（独立小锁，不进 keydir 锁序）；读升温回填
+      （二次命中门）
+- **验收**：冷/热 get bench 锚点（热 ≤3%、冷 P99 ≤300µs tmpfs 另锚）
+
+### S36-4 — 逐出 + 快照三元组 + BCKS v4 🔴 HIGH
+
+- [ ] CLOCK 逐出 + `CaskOptions::keydir_cache_entries`（0=不限=现状，
+      默认 0 opt-in）；MultiEntry 不可逐；逻辑计数与 fstats 校准
+- [ ] CaskIter/parallel_scan 快照 = 缓存屏障 + delta 拷贝 + manifest pin
+- [ ] kv.keydir.ckpt v4（缓存子集语义；Level B 关闭时仍写 v3）
+- **验收**：100M 档 RSS ≤1.5GB 实测；快照一致性 stress
+
+### S36-5 — merge 组合视图 + 崩溃注入 + B1 收口 🔴 HIGH
+
+- [ ] merge 活性/搬迁切 locate；unlink 前搬迁行入 delta 顺序不变量；
+      遗留 B1（ckpt fsync 水位）失败注入证实 + 修复
+- **验收**：逐出态 merge 千轮无丢 key stress；崩溃注入全套；ASan/TSan
+
+### S36-6 — C API + 文档 + 门禁复测 🟡 MED
+
+- [ ] 选项透出 C API；文档/CHANGELOG；100M 门禁复测入档
+- **验收**：全矩阵 + build-rel 双树
 
 ---
 

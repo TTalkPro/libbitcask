@@ -1,20 +1,28 @@
 // OKI（有序 Key 索引）run 与 manifest——S33-3。
 // 设计：doc/ordered-key-index-design-zh.md §3。
 //
-// run（`kv.oki.seg-<gen>`，"BCOK" v1）是按 key 升序排列的不可变文件，条目
-// 只存 (key, ord, tomb)——**不存位置信息**：range 查询逐 key 回查哈希
-// keydir 取权威位置，因此 merge 搬迁与 OKI 零交互、run 允许陈旧（§2.2）。
+// run（`kv.oki.seg-<gen>`，"BCOK"）是按 key 升序排列的不可变文件。
+// v1 条目只存 (key, ord, tomb)——range 查询逐 key 回查哈希 keydir 取权威
+// 位置。**v2（S36 Level B，doc/keydir-disk-resident-design-zh.md §4）条目
+// 可携全字段位置**（file_id/total_sz/offset/tstamp），并内嵌 bloom——
+// 组合视图点查的权威载体。v1/v2 读端都支持；写端按 create 的 version 定。
 //
 // 磁盘布局（全小端）：
-//   header  8B: magic "BCOK" u32 | version u32 = 1
+//   header  8B: magic "BCOK" u32 | version u32 = 1 或 2
 //   数据块区（块目标 ~4KiB，块界由稀疏索引给出；**每块解码状态复位**
-//   prev_key="" / prev_ord=0，块首条自然退化为全量 key + 绝对 ord）：
+//   prev_key="" / prev_ord=0 / prev_tstamp=0，块首条自然退化为全量值）：
 //     每条: [vbyte shared_len][vbyte suffix_len][suffix]
 //           [vbyte ord_delta(u64 二补数回绕相对 prev_ord)][flags u8]
-//     flags: bit0 = tomb；其余位保留（Level B 全字段扩展位），读端遇未知位
-//     fail-fast（kCorrupt → 整个 run 弃用重建，绝不静默跳）。
+//     v2 且 flags.bit1(has_loc) 时追加:
+//           [vbyte file_id][vbyte total_sz][vbyte offset]
+//           [vbyte tstamp_delta(回绕相对 prev_tstamp)]
+//     flags: bit0 = tomb；bit1 = has_loc（仅 v2；墓碑行免位置字段）；
+//     其余位保留，读端遇未知位 fail-fast（kCorrupt → 整个 run 弃用重建）。
 //   稀疏索引区: [count u32] + count × { [vbyte klen][块首 key][block_off u64] }
-//   trailer 24B: [entry_count u64][index_off u64][crc u32][magic "BCOE" u32]
+//   bloom 区（仅 v2）: [n_bits u64][k u8][位数组 ceil(n_bits/8) 字节]
+//     稳定哈希（FNV-1a64 + splitmix64 双哈希），持久化格式的一部分。
+//   trailer: v1 24B [entry_count u64][index_off u64][crc u32][magic "BCOE"]
+//            v2 32B [entry_count u64][index_off u64][bloom_off u64][crc][magic]
 //     CRC 覆盖 [0, size-8)（即除 crc 与尾 magic 外全部字节）。
 //
 // 有序 key 的公共前缀差分对 `prefix:id` 形态收益显著；ord 差分同 hint v5
@@ -48,18 +56,36 @@ namespace bitcask::oki {
 inline constexpr std::uint32_t kRunMagic        = 0x4B4F4342;  // "BCOK" LE
 inline constexpr std::uint32_t kRunTrailerMagic = 0x454F4342;  // "BCOE" LE
 inline constexpr std::uint32_t kRunVersion      = 1;
+inline constexpr std::uint32_t kRunVersion2     = 2;   // S36-1：全字段 + bloom
 inline constexpr std::size_t   kRunHeaderSize   = 8;
-inline constexpr std::size_t   kRunTrailerSize  = 24;
+inline constexpr std::size_t   kRunTrailerSize  = 24;   // v1
+inline constexpr std::size_t   kRunTrailerSizeV2 = 32;  // v2（+bloom_off u64）
 inline constexpr std::size_t   kDefaultBlockBytes = 4096;
 
 inline constexpr std::uint32_t kManifestMagic   = 0x4D4F4342;  // "BCOM" LE
 inline constexpr std::uint32_t kManifestVersion = 1;
+inline constexpr std::uint32_t kManifestVersion2 = 2;  // S36-1：条目带 format_ver
 inline constexpr char kManifestName[] = "kv.oki.manifest";
 
-// flags 位。v1 只认 bit0；其余位保留给 Level B（全字段扩展），读端遇
-// 未知位 fail-fast。
+// flags 位。v1 只认 bit0；v2 认 bit0|bit1；其余位保留，读端遇未知位
+// fail-fast。
 inline constexpr std::uint8_t kFlagTomb       = 0x01;
-inline constexpr std::uint8_t kKnownFlagsMask = 0x01;
+inline constexpr std::uint8_t kFlagHasLoc     = 0x02;  // 仅 v2
+inline constexpr std::uint8_t kKnownFlagsMask   = 0x01;
+inline constexpr std::uint8_t kKnownFlagsMaskV2 = 0x03;
+
+// S36-1 bloom 参数（持久化格式的一部分——改动即 run 版本演进）。
+inline constexpr std::size_t kBloomBitsPerEntry = 10;  // FP ≈ 1%
+inline constexpr std::uint8_t kBloomHashes      = 7;
+
+// v2 行的位置字段（= keydir SingleEntry 的盘上子集；epoch 刻意不落盘，
+// 同 ord 冲突用 (ord, run gen) 胜出——设计 §D2）。
+struct RowLoc {
+    std::uint32_t file_id  = 0;
+    std::uint32_t total_sz = 0;
+    std::uint64_t offset   = 0;
+    std::uint64_t tstamp   = 0;
+};
 
 enum class OkiError {
     kIo,          // 底层 I/O 失败
@@ -81,8 +107,13 @@ enum class OkiError {
 class OkiRunWriter {
 public:
     // block_target：数据块目标字节数（超过即封块）。测试用小值逼出多块。
+    // version：kRunVersion（v1，行不带位置）或 kRunVersion2（全字段+bloom）。
+    // expected_entries：v2 bloom 预估容量（bloom 需先定尺寸再流式置位；
+    // 实际条数超出仅推高误判率，不影响正确性——0 = 最小 bloom）。
     [[nodiscard]] static std::expected<OkiRunWriter, OkiError>
-    create(std::string path, std::size_t block_target = kDefaultBlockBytes);
+    create(std::string path, std::size_t block_target = kDefaultBlockBytes,
+           std::uint32_t version = kRunVersion,
+           std::uint64_t expected_entries = 0);
 
     OkiRunWriter(OkiRunWriter&&) noexcept = default;
     OkiRunWriter& operator=(OkiRunWriter&&) noexcept = default;
@@ -91,8 +122,10 @@ public:
     ~OkiRunWriter() = default;
 
     // key 必须严格大于上一条（升序、去重由上游负责）；违反返回 kOutOfOrder。
+    // loc：v2 位置字段（v1 传非空 → kBadState；v2 传空 = 免位置行，如墓碑）。
     [[nodiscard]] std::expected<void, OkiError>
-    add(std::span<const std::byte> key, std::uint64_t ord, bool tomb);
+    add(std::span<const std::byte> key, std::uint64_t ord, bool tomb,
+        const RowLoc* loc = nullptr);
 
     struct Stats {
         std::uint64_t entries = 0;
@@ -103,8 +136,14 @@ public:
     [[nodiscard]] std::expected<Stats, OkiError> finish(bool fsync_dir = false);
 
 private:
-    OkiRunWriter(detail::AtomicFileWriter&& w, std::size_t block_target)
-        : w_(std::move(w)), block_target_(block_target) {}
+    OkiRunWriter(detail::AtomicFileWriter&& w, std::size_t block_target,
+                 std::uint32_t version, std::uint64_t expected_entries)
+        : w_(std::move(w)), block_target_(block_target), version_(version) {
+        if (version_ == kRunVersion2) init_bloom(expected_entries);
+    }
+
+    void init_bloom(std::uint64_t expected_entries);
+    void bloom_insert(std::string_view key);
 
     [[nodiscard]] bool flush_block();  // 空块 no-op；fwrite + CRC + 记账
 
@@ -115,10 +154,14 @@ private:
 
     detail::AtomicFileWriter w_;
     std::size_t   block_target_;
+    std::uint32_t version_ = kRunVersion;
     std::vector<std::byte> blk_;        // 攒块缓冲
     std::string   blk_first_key_;       // 当前块首 key（索引条目）
     std::string   prev_key_;            // 块内前缀差分状态
     std::uint64_t prev_ord_ = 0;        // 块内 ord 差分状态
+    std::uint64_t prev_tstamp_ = 0;     // 块内 tstamp 差分状态（v2）
+    std::vector<std::uint64_t> bloom_bits_;  // v2；64-bit word 数组
+    std::uint64_t bloom_nbits_ = 0;
     std::string   last_key_;            // 全局升序校验
     bool          has_last_ = false;
     std::vector<IndexEntry> index_;
@@ -148,6 +191,9 @@ public:
         std::string   key;   // cursor 拥有的重建缓冲（跨 next 复用）
         std::uint64_t ord = 0;
         bool          tomb = false;
+        // S36-1：v2 全字段（has_loc=false 时 loc 无意义；v1 行恒 false）。
+        bool          has_loc = false;
+        RowLoc        loc{};
     };
 
     // 顺序游标。next：成功且有条目 → true（out 填充）；到尾 → false；
@@ -168,6 +214,7 @@ public:
         bool          block_loaded_ = false;
         std::string   prev_key_;     // 块内差分状态
         std::uint64_t prev_ord_ = 0;
+        std::uint64_t prev_tstamp_ = 0;  // v2 块内差分状态
         std::optional<Entry> pending_;  // seek 越位暂存
     };
 
@@ -182,6 +229,9 @@ public:
     [[nodiscard]] std::size_t block_count() const noexcept {
         return blocks_.size();
     }
+    [[nodiscard]] std::uint32_t version() const noexcept { return version_; }
+    // v2：bloom 试探（false = 必不存在；true = 可能存在）。v1 恒 true。
+    [[nodiscard]] bool may_contain(std::span<const std::byte> key) const noexcept;
 
 private:
     OkiRunReader() = default;
@@ -195,6 +245,73 @@ private:
     mutable io::PosixFile file_;  // pread 线程安全、无共享游标
     std::vector<BlockRef> blocks_;
     std::uint64_t entry_count_ = 0;
+    std::uint32_t version_ = kRunVersion;
+    std::vector<std::uint64_t> bloom_bits_;  // v2；open 时整载
+    std::uint64_t bloom_nbits_ = 0;
+    std::uint8_t  bloom_k_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// S36-1 外排构建器：无序流式喂行 → 每 spill_bytes 排序落临时 spill run
+// （`kv.oki.spill-<gen>-<n>`，sweep 顺带清理崩溃残留）→ finish 时 k 路归并
+// 成单个正式 run。同 key 胜出 = max (ord, 来源序)——来源序 = spill 序号
+// （内存尾批最高），与 Level B 的 (ord, run gen) 格同构（设计 §D2）。
+// 取代 rebuild 的全内存 sort（100M 档 GB 级峰值 → 有界 spill_bytes）。
+// ---------------------------------------------------------------------------
+class SpillingRunBuilder {
+public:
+    static constexpr std::size_t kDefaultSpillBytes = 64u << 20;  // 64 MiB
+
+    // 产出 `<dir>/kv.oki.seg-<gen>`。drop_tombstones 仅在「本 run 将是全量
+    // 唯一 run」时可开（全归并前提，同 compact_all 的约束）。
+    [[nodiscard]] static std::expected<SpillingRunBuilder, OkiError>
+    create(std::string dir, std::uint64_t gen,
+           std::uint32_t version = kRunVersion,
+           std::size_t spill_bytes = kDefaultSpillBytes,
+           bool drop_tombstones = false,
+           std::size_t block_target = kDefaultBlockBytes);
+
+    SpillingRunBuilder(SpillingRunBuilder&&) noexcept = default;
+    SpillingRunBuilder& operator=(SpillingRunBuilder&&) noexcept = default;
+    SpillingRunBuilder(const SpillingRunBuilder&) = delete;
+    SpillingRunBuilder& operator=(const SpillingRunBuilder&) = delete;
+    ~SpillingRunBuilder();  // 未 finish → best-effort 清 spill 文件
+
+    // 无序、可重 key（胜出规则见类注释）。
+    [[nodiscard]] std::expected<void, OkiError>
+    add(std::span<const std::byte> key, std::uint64_t ord, bool tomb,
+        const RowLoc* loc = nullptr);
+
+    [[nodiscard]] std::expected<OkiRunWriter::Stats, OkiError>
+    finish(bool fsync_dir = false);
+
+private:
+    SpillingRunBuilder() = default;
+
+    struct Row {
+        std::string key;
+        std::uint64_t ord = 0;
+        RowLoc loc{};
+        bool tomb = false;
+        bool has_loc = false;
+        std::uint64_t seq = 0;  // 到达序（同 key 同 ord 后到者胜）
+    };
+    [[nodiscard]] std::expected<void, OkiError> spill();
+    [[nodiscard]] std::string spill_path(std::size_t n) const;
+    static void sort_dedup(std::vector<Row>& rows);
+
+    std::string dir_;
+    std::uint64_t gen_ = 0;
+    std::uint32_t version_ = kRunVersion;
+    std::size_t spill_bytes_ = kDefaultSpillBytes;
+    bool drop_tombstones_ = false;
+    std::size_t block_target_ = kDefaultBlockBytes;
+    std::vector<Row> buf_;
+    std::size_t buf_bytes_ = 0;
+    std::uint64_t seq_ = 0;
+    std::uint64_t total_rows_ = 0;
+    std::vector<std::string> spill_paths_;
+    bool finished_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -203,6 +320,9 @@ private:
 struct OkiManifestEntry {
     std::uint64_t gen = 0;        // run 文件代号（kv.oki.seg-<gen>）
     std::uint64_t cover_ord = 0;  // 该 run 的覆盖上界（**排他**：run 内最大 ord + 1）
+    // S36-1：run 格式版本（1/2）。写端惰性选 manifest 版本：全 v1 → BCOM v1
+    //（老读端可读）；含 v2 → BCOM v2（老读端拒收 → 弃用重建，自愈）。
+    std::uint8_t  format_ver = 1;
 };
 
 struct OkiManifest {
