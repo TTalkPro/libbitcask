@@ -646,6 +646,34 @@ BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
 - durability 与单条 `put` 的 sync 策略一致（`o_sync` 即时；`sync_every_n > 0` 整批一次组提交；否则由 `bitcask_sync` 控制）。
 - 失败返回时整批不可见（磁盘可能残留前缀，重启后可见——与连续单条 `put` 的崩溃语义一致）。
 
+### 10.3 多键事务（S34：`bitcask_txn_*`）
+
+```c
+typedef struct {
+    uint8_t         op;     /* 0 = put, 1 = remove（remove 忽略 value） */
+    bitcask_slice_t key;
+    bitcask_slice_t value;
+} bitcask_txn_op_t;
+
+BITCASK_API bitcask_error_t bitcask_txn_commit(bitcask_t* cask,
+                                               const bitcask_txn_op_t* ops,
+                                               size_t n_ops,
+                                               int sync_on_commit,
+                                               bitcask_fault_t* fault);
+BITCASK_API bitcask_error_t bitcask_txn_recover(bitcask_t* cask,
+                                                size_t* out_replayed,
+                                                bitcask_fault_t* fault);
+BITCASK_API bitcask_error_t bitcask_txn_pending_count(bitcask_t* cask,
+                                                      size_t* out_count,
+                                                      bitcask_fault_t* fault);
+```
+
+意图日志 + 前滚重放的多键事务（原理 `doc/multikey-txn-zh.md`，设计 `doc/multikey-txn-impl-design-zh.md`）。崩溃原子性（A）+ 持久性（D）；**不提供**隔离性（I）与 CAS。key 命名空间 `_txn:` 保留。
+
+- `bitcask_txn_commit`：原子提交。`sync_on_commit` 非零 = 意图写入后显式 fsync（防掉电）；0 = 依赖 `o_sync` / `sync_every_n`，或只防进程崩溃。校验失败（空批 / 空 key / 重复 key / `_txn:` 前缀）→ `BITCASK_ERR_INVALID_OPTION` 零副作用；apply/清理失败 → 意图保留，下次 recover 前滚重试。`ops` 借调用方存储。
+- `bitcask_txn_recover`：open 后、任何业务写之前调用；按提交序前滚全部 pending 并清理。正常关闭的库开销 O(0)。`out_replayed` 可为 `NULL`。
+- `bitcask_txn_pending_count`：运维巡检（不重放）；持续非零 = 有进程崩溃后未重启恢复。
+
 ---
 
 ## 11. 迭代与并行扫描

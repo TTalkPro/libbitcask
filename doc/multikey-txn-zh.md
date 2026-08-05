@@ -1,8 +1,13 @@
 # 在 libbitcask 上实现多键事务（应用层模式）
 
-> 本文是**应用层指南**，不描述库内实现。libbitcask 本身不提供跨 key 事务；
-> 本文给出一个基于「意图日志 + 前滚重放」的模式，用库已有的三项保证补齐
+> 本文讲**模式原理**。libbitcask 引擎本身不提供跨 key 事务；本文给出一个
+> 基于「意图日志 + 前滚重放」的模式，用库已有的三项保证补齐
 > **原子性（A）与持久性（D）**。
+>
+> **S34 起库内已提供该模式的参考实现 `bitcask::TxnCask`**
+> （`include/bitcask/txn.hpp`；C API `bitcask_txn_*`），实现设计见
+> [`multikey-txn-impl-design-zh.md`](multikey-txn-impl-design-zh.md)。
+> 直接使用即可，无需按本文手工实现。
 >
 > 相关：[`put-flow-zh.md`](put-flow-zh.md)（`put_batch` 语义）、
 > [`format-zh.md`](format-zh.md)（record CRC）、
@@ -83,18 +88,25 @@ libbitcask 是 append-only 引擎，data file 本身就是 WAL。一个常见的
 
 ```cpp
 // 用 OKI range 扫描枚举未完成事务 —— O(pending) 而非 O(全表)
-bitcask::RangeOptions ro{
-    .lo = as_bytes("_txn:"),
-    .hi = as_bytes("_txn;"),   // ';' == ':' + 1，半开区间上界
-    .prefetch = true,
-};
-auto it = c->make_range_iter(ro);
-for (; it->valid(); it->next()) {
-    auto ops = decode(it->value());
-    c->put_batch(ops);              // 幂等重放
-    c->remove(it->key());           // 标记完成
+bitcask::RangeOptions ro;
+ro.lo = as_bytes("_txn:");
+ro.hi = as_bytes("_txn;");   // ';' == ':' + 1，半开区间上界
+auto it = c->make_range_iter(ro);   // expected<unique_ptr<CaskRangeIter>,…>
+for (;;) {
+    auto e = (*it)->next();          // expected<optional<Entry>,…>
+    if (!e || !e->has_value()) break;
+    auto ops = decode((*e)->value);
+    apply(ops);                      // 幂等重放（PUT 批 + REMOVE 逐条，见 §5.2）
+    c->remove((*e)->key);            // 标记完成
 }
 ```
+
+> 注意两点（早期版本示例的错误）：`RangeOptions::prefetch` 是 `size_t`
+> 批大小而非开关，`0/1` 都是关闭——写 `true` 隐转成 1 恰好没开预取；
+> pending 本来就少，恢复扫描无需预取。迭代器接口是
+> `next() → expected<optional<Entry>>`，没有 `valid()/key()/value()`。
+> 更稳的做法（TxnCask 实现采用）：先全量收集 pending 再统一 apply，
+> 不在弱一致迭代器活跃期间写库。
 
 正常关闭的库里 `_txn:` 前缀为空，**恢复扫描的开销为零**。
 
@@ -173,14 +185,20 @@ fsync 代价可忽略。高吞吐场景用方式二，只在提交点付出 fsyn
 
 ## 5. 实现要点
 
-### 5.1 key 命名空间
+### 5.1 key 命名空间与重放定序
 
 用一个不会与业务 key 冲突的前缀，且前缀的字典序后继要便于构造：
 
 ```
-_txn:{uuid}          业务约定：所有业务 key 不以 '_' 开头
+_txn:{seq:016x}-{rand:08x}     业务约定：所有业务 key 不以 '_' 开头
 range = ["_txn:", "_txn;")
 ```
+
+**txn id 必须单调（不要用无序 uuid）**：恢复按 key 字典序重放,若多个
+pending 事务触碰同一 key,无序 id 的重放终值可能与崩溃前不一致。定宽
+hex 单调 seq（进程内 `max(now_us, last+1)`,跨进程由 write.lock 排他 +
+墙钟保证）使**字典序 = 提交序**,重放收敛到「最后提交者胜」,与 keydir
+last-write-wins 一致。rand 后缀防墙钟异常下的跨进程碰撞。
 
 ### 5.2 意图日志的编码
 
@@ -191,6 +209,12 @@ op_type ∈ { PUT, REMOVE }
 
 `REMOVE` 也必须记进意图日志，否则重放会漏掉删除动作。
 建议带上 `created_at` 便于排查悬挂事务。
+
+**实现约束**：`Cask::BatchItem` 只有 `{key, value}`——**`put_batch` 不支持
+墓碑**。含 REMOVE 的 ops 无法用一次 `put_batch` 重放，apply 必须拆成
+「PUT 集一次 `put_batch` + REMOVE 逐条 `remove`」。拆分引入的次序问题用
+「事务内 key 互不重复」的校验规则消除（TxnCask 即如此，违反返回
+`kInvalidOption`）。
 
 ### 5.3 幂等性的隐含要求
 
@@ -214,43 +238,33 @@ op_type ∈ { PUT, REMOVE }
 
 ---
 
-## 6. 最小实现骨架
+## 6. 库内参考实现：`bitcask::TxnCask`
+
+S34 起本模式由库内 `TxnCask` 落地（`include/bitcask/txn.hpp` /
+`src/cask/txn.cpp`，设计定稿
+[`multikey-txn-impl-design-zh.md`](multikey-txn-impl-design-zh.md)）：
 
 ```cpp
-class TxnCask {
-public:
-    // 启动时必须先调用，否则可能读到半截状态
-    [[nodiscard]] std::expected<void, CaskFault> recover() {
-        bitcask::RangeOptions ro{.lo = k_txn_lo, .hi = k_txn_hi, .prefetch = true};
-        auto it = cask_->make_range_iter(ro);
-        for (; it->valid(); it->next()) {
-            auto ops = decode_ops(it->value());
-            if (auto r = apply(ops); !r) return r;
-            if (auto r = cask_->remove(it->key()); !r) return r;
-        }
-        return {};
-    }
+#include <bitcask/txn.hpp>
 
-    [[nodiscard]] std::expected<void, CaskFault> commit(std::span<const Op> ops) {
-        const auto txn_key = make_txn_key();          // "_txn:{uuid}"
-        std::vector<std::byte> blob = encode_ops(ops);
+bitcask::TxnCask txn(cask.get());       // 默认 TxnSyncPolicy::kSyncOnCommit
+auto n = txn.recover();                 // open 后、业务写之前：前滚 pending
 
-        if (auto r = cask_->put(txn_key, blob); !r) return r;   // ① 意图
-        if (auto r = cask_->sync(); !r) return r;               // ② 落盘（见 §2.4）
-        if (auto r = apply(ops); !r) return r;                  // ③ 数据
-        return cask_->remove(txn_key);                          // ④ 提交
-    }
-
-private:
-    // ③ 与 recover() 共用：保证重放路径与正常路径完全一致
-    [[nodiscard]] std::expected<void, CaskFault> apply(std::span<const Op> ops);
-
-    bitcask::Cask* cask_;
+const std::vector<bitcask::TxnOp> ops = {
+    {.type = bitcask::TxnOp::Type::kPut,    .key = k1, .value = v1},
+    {.type = bitcask::TxnOp::Type::kRemove, .key = k2},
 };
+auto r = txn.commit(ops);               // ①意图 → ②sync → ③apply → ④清理
+
+auto pending = txn.pending_txns();      // 运维巡检（§5.4）
 ```
 
-> **关键**：`apply()` 必须被正常提交路径和恢复路径**共用**。
-> 两条路径若各写一份，迟早会出现「正常写了 4 个 key，重放只写 3 个」这类偏差。
+C API：`bitcask_txn_commit` / `bitcask_txn_recover` /
+`bitcask_txn_pending_count`（`bitcask_kv.h`）。
+
+> **关键**（自行实现时也一样）：`apply()` 必须被正常提交路径和恢复路径
+> **共用**。两条路径若各写一份，迟早会出现「正常写了 4 个 key，重放只写
+> 3 个」这类偏差。TxnCask 的 commit ③ 与 recover 前滚即同一 `apply()`。
 
 ---
 

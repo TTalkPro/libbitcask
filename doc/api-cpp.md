@@ -502,6 +502,34 @@ put_doc(std::span<const std::byte> key, const DocInput& doc,
 
 写入结构化文档（text + 选填 meta / vector / fields），用于索引模式。线程安全：是（同 `put`）。
 
+#### 多键事务：`bitcask::TxnCask`（S34，`txn.hpp`）
+
+```cpp
+struct TxnOp {
+    enum class Type : std::uint8_t { kPut = 0, kRemove = 1 };
+    Type type;
+    std::span<const std::byte> key;
+    std::span<const std::byte> value{};   // kRemove 忽略
+};
+enum class TxnSyncPolicy : std::uint8_t { kSyncOnCommit = 0, kNone = 1 };
+
+class TxnCask {  // 非拥有包装 Cask*；自身无状态，可随建随用
+public:
+    explicit TxnCask(Cask* cask,
+                     TxnSyncPolicy sync = TxnSyncPolicy::kSyncOnCommit);
+    [[nodiscard]] std::expected<std::size_t, CaskFault> recover();
+    [[nodiscard]] std::expected<void, CaskFault> commit(std::span<const TxnOp> ops);
+    [[nodiscard]] std::expected<std::vector<PendingTxn>, CaskFault> pending_txns();
+};
+```
+
+意图日志 + 前滚重放的多键事务 helper（原理 [`multikey-txn-zh.md`](multikey-txn-zh.md)，设计 [`multikey-txn-impl-design-zh.md`](multikey-txn-impl-design-zh.md)）。提供崩溃原子性（A）与持久性（D）；**不提供**隔离性（I）与 CAS——事务中间态对并发读者可见。要点：
+
+- `commit`：① 写意图（`_txn:` key）→ ②[sync] → ③ apply → ④ 清理。校验失败（空批 / 空 key / 重复 key / `_txn:` 前缀）→ `kInvalidOption` 零副作用；③/④ 失败 → 意图保留，下次 `recover()` 前滚重试。
+- `recover`：open 后、任何业务写之前调用；按提交序（txn key 单调 seq 的字典序）前滚全部 pending 并清理，返回重放条数。正常关闭的库开销 O(0)。意图 blob 解码失败 → `kBadCrc` 停止。
+- 并发：键集不相交的并发 `commit` 安全；键集重叠无隔离/定序保证（应用层串行化）；`recover` 不得与 `commit` 并发。
+- `_txn:` 命名空间保留；空间回收走 merge（意图 + 墓碑 = 普通死记录）。
+
 ### 5.4 检索（索引模式）
 
 无 search 层 → `kNoIndex`；无向量配置 → `kInvalidOption`。所有检索方法线程安全：是（并发读：cache_/doc_texts_ shared_mutex、倒排/HNSW shared_lock、analyzer const；与写并发遵循 near-real-time 可见性）。`filter` 非空时 meta 后过滤（overfetch 后截断到 `k`）。

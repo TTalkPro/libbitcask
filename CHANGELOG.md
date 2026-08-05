@@ -69,6 +69,21 @@ magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁�
   `bitcask_parallel_scan_prefix`（空切片时与无前缀版完全等价）。
 - **迁移工具**：`bitcask_migrate hintord`（v4 → v5）+ `detect` 识别 v4/v5。
 
+### Added（S34：多键事务 helper `TxnCask`）
+
+- **`bitcask::TxnCask`**（`include/bitcask/txn.hpp`）：意图日志 + 前滚重放
+  的多键事务——`commit`（①意图 → ②sync → ③apply → ④清理）、`recover`
+  （启动前滚，正常关闭 O(0)）、`pending_txns`（悬挂事务巡检）。提供崩溃
+  原子性（A）+ 持久性（D）；**不提供**隔离性（I）与 CAS。建在公共 API 上，
+  **零盘上格式改动**；`_txn:` key 命名空间保留。txn key 用进程级单调 seq
+  （定宽 hex）⇒ 重放序 = 提交序。依赖 OKI range 扫描（本版新增）枚举
+  pending。设计：`doc/multikey-txn-impl-design-zh.md`。
+- **C API（纯增量）**：`bitcask_txn_commit` / `bitcask_txn_recover` /
+  `bitcask_txn_pending_count` + `bitcask_txn_op_t`。
+- 模式文档 `doc/multikey-txn-zh.md` 勘误：`RangeOptions::prefetch` 是批大小
+  （`true` 隐转 1 = 关闭）、迭代器真实接口、`put_batch` 无墓碑形态、
+  txn key 必须单调（uuid 重放序 ≠ 提交序）。
+
 ### Fixed
 
 - **并行恢复下的墓碑复活**（S33-B1，既有 bug）：纯 KV 并行恢复（按文件并发

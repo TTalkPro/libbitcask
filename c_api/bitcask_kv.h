@@ -386,6 +386,47 @@ BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
                                               bitcask_fault_t* fault);
 
 /* ===========================================================================
+ *  多键事务（S34）——意图日志 + 前滚重放
+ *
+ *  提供崩溃原子性(A)与持久性(D)；**不提供**隔离性(I)与 CAS——事务中间态
+ *  对并发读者可见。原理 doc/multikey-txn-zh.md；实现设计
+ *  doc/multikey-txn-impl-design-zh.md。key 命名空间 "_txn:" 保留给意图日志，
+ *  业务 key 不得使用。
+ * ========================================================================= */
+
+typedef struct {
+    uint8_t         op;     /* 0 = put, 1 = remove（remove 忽略 value） */
+    bitcask_slice_t key;
+    bitcask_slice_t value;
+} bitcask_txn_op_t;
+
+/* 原子提交一批操作：① 写意图日志 → ②[sync] → ③ 写数据 → ④ 清理意图。
+ * 任意点崩溃后 bitcask_txn_recover 收敛到全生效或全不生效。
+ * sync_on_commit 非零 = 意图写入后显式 fsync（防掉电）；0 = 依赖
+ * o_sync / sync_every_n 配置，或只防进程崩溃。
+ * 校验失败（空批 / 空 key / 重复 key / "_txn:" 前缀）→
+ * BITCASK_ERR_INVALID_OPTION，零副作用。③/④ 失败 → 意图保留，
+ * 下次 recover 前滚重试。ops 借调用方存储。 */
+BITCASK_API bitcask_error_t bitcask_txn_commit(bitcask_t* cask,
+                                               const bitcask_txn_op_t* ops,
+                                               size_t n_ops,
+                                               int sync_on_commit,
+                                               bitcask_fault_t* fault);
+
+/* 启动恢复：按提交序前滚重放全部 pending 事务并清理意图。
+ * 契约：open 后、任何业务写之前调用；不得与 commit 并发。
+ * 正常关闭的库扫描 O(0)。out_replayed 可为 NULL。 */
+BITCASK_API bitcask_error_t bitcask_txn_recover(bitcask_t* cask,
+                                                size_t* out_replayed,
+                                                bitcask_fault_t* fault);
+
+/* 运维巡检：当前 pending 事务条数（不重放）。正常应为 0；
+ * 持续非零 = 有进程异常退出且未重启恢复。 */
+BITCASK_API bitcask_error_t bitcask_txn_pending_count(bitcask_t* cask,
+                                                      size_t* out_count,
+                                                      bitcask_fault_t* fault);
+
+/* ===========================================================================
  *  Meta 过滤（S13-D2）——V5 结构化 meta 过滤的 C 表示
  *
  *  一棵过滤树 = 叶子条件数组 + 子树数组，logic 决定 AND/OR 合流。全部指针

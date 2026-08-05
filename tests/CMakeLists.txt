@@ -159,6 +159,14 @@ target_link_libraries(bitcask_oki_recovery_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_txn_test txn_test.cpp)
+target_link_libraries(bitcask_txn_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 add_executable(bitcask_crash_recovery_test crash_recovery_test.cpp)
 target_link_libraries(bitcask_crash_recovery_test PRIVATE
     GTest::gtest_main
@@ -310,6 +318,7 @@ gtest_discover_tests(bitcask_segment_v2_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_jieba_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_keydir_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_cask_docvalue_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_txn_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_crash_recovery_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_merge_concurrent_writer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_checkpoint_recovery_test ${_bitcask_test_props})

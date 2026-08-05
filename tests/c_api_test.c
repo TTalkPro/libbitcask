@@ -614,6 +614,69 @@ static int test_put_batch(void) {
     return 0;
 }
 
+// S34：多键事务。提交语义 + 校验拒绝 + recover/pending 冒烟。
+static int test_txn(void) {
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    bitcask_error_t err =
+        bitcask_open("/tmp/bitcask_c_test_txn", &opts, &cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_txn: open failed: %s\n", fault.detail);
+        return 1;
+    }
+
+    // 启动恢复：干净目录 0 条。
+    size_t replayed = 99;
+    assert(bitcask_txn_recover(cask, &replayed, &fault) == BITCASK_OK);
+    assert(replayed == 0);
+
+    // 预置一个 key 供事务内 remove。
+    bitcask_slice_t vk = {"txn_victim", 10};
+    assert(bitcask_put(cask, vk, (bitcask_slice_t){"old", 3}, 0, &fault) ==
+           BITCASK_OK);
+
+    bitcask_txn_op_t ops[3] = {
+        {0, {"txn_a", 5}, {"va", 2}},
+        {0, {"txn_b", 5}, {"vb", 2}},
+        {1, {"txn_victim", 10}, {NULL, 0}},
+    };
+    assert(bitcask_txn_commit(cask, ops, 3, /*sync_on_commit=*/1, &fault) ==
+           BITCASK_OK);
+
+    bitcask_get_result_t* r = NULL;
+    assert(bitcask_get(cask, ops[0].key, &r, &fault) == BITCASK_OK);
+    assert(r->value.size == 2 && memcmp(r->value.data, "va", 2) == 0);
+    bitcask_get_result_free(r);
+    r = NULL;
+    assert(bitcask_get(cask, vk, &r, &fault) == BITCASK_ERR_NOT_FOUND);
+
+    // 提交完成 → 无 pending。
+    size_t n_pending = 99;
+    assert(bitcask_txn_pending_count(cask, &n_pending, &fault) == BITCASK_OK);
+    assert(n_pending == 0);
+
+    // 校验拒绝：空批 / 重复 key / "_txn:" 前缀。
+    assert(bitcask_txn_commit(cask, NULL, 0, 1, &fault) ==
+           BITCASK_ERR_INVALID_OPTION);
+    bitcask_txn_op_t dup[2] = {
+        {0, {"same", 4}, {"1", 1}},
+        {1, {"same", 4}, {NULL, 0}},
+    };
+    assert(bitcask_txn_commit(cask, dup, 2, 1, &fault) ==
+           BITCASK_ERR_INVALID_OPTION);
+    bitcask_txn_op_t reserved[1] = {{0, {"_txn:x", 6}, {"v", 1}}};
+    assert(bitcask_txn_commit(cask, reserved, 1, 1, &fault) ==
+           BITCASK_ERR_INVALID_OPTION);
+
+    bitcask_close(cask);
+    printf("PASS test_txn\n");
+    return 0;
+}
+
 // S13-D7/D8/D11：options 新字段默认值 + status_ex + log 回调冒烟。
 static void test_log_cb(int level, const char* msg, void* ctx) {
     (void)level; (void)msg;
@@ -785,6 +848,7 @@ int main(void) {
     failures += test_vector_engine_ivfrq();
     failures += test_parallel_scan();
     failures += test_put_batch();
+    failures += test_txn();
     failures += test_status_ex_and_log();
     failures += test_search_filtered();
 

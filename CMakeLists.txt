@@ -310,6 +310,7 @@ add_library(bitcask_cask STATIC
     src/cask/cask_range_iter.cpp  # S33-5：OKI 有序 Range 迭代器
     src/cask/cask_search.cpp   # S21-3 B1：搜索门面拆分 TU
     src/cask/cask_recovery.cpp # S21-3 B1：恢复域拆分 TU
+    src/cask/txn.cpp           # S34：TxnCask 多键事务 helper
     src/cask/meta_file.cpp
     src/cask/legacy_ckpt.cpp   # S19-2：pre-S17 统一 ckpt 迁移读取器
 )

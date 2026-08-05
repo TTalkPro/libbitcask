@@ -358,6 +358,58 @@ keydir RSS 占进程 RSS > ~40% 才立项 keydir 磁盘驻留；立项则另立�
 
 ---
 
+## 🔵 S34：多键事务 helper（TxnCask）
+
+> 来源：[`doc/multikey-txn-zh.md`](doc/multikey-txn-zh.md)（模式设想）→
+> [`doc/multikey-txn-impl-design-zh.md`](doc/multikey-txn-impl-design-zh.md)（实现设计定稿）
+> 决策基线：**方案 B**——库内应用层 helper，建在公共 API 之上，
+> 零盘上格式改动（否决引擎原生 commit marker——需 record 格式 flag-day，另行评估）。
+> 版本目标：随 **5.1.0**（未发布）出货（C API 纯增量，`SOVERSION` 保持 5，
+> 无盘上格式改动；若 5.1.0 已先行发布则为 5.2.0）。
+
+### S34-1 — 设计稿 + 前提核实 🟢
+
+- [x] 三前提核对（put_batch 契约 / sync / OKI range / remove 幂等）；
+      发现模式文档 4 处问题：§2.3 `.prefetch = true` 实为关闭（prefetch 是
+      size_t 批大小，0/1=关闭）、骨架 API 不存在（`valid()` 等）、
+      put_batch 不支持墓碑未提及、uuid txn key 的重放序 ≠ 提交序缺口
+- [x] `doc/multikey-txn-impl-design-zh.md` 定稿
+- [x] 参考笔记 `doc/pg-xid-mvcc-zh.md`（论证无需 XID 式回收）
+
+### ✅ S34-2 — TxnCask 核心 🔴 HIGH
+
+- [x] `include/bitcask/txn.hpp`：`TxnOp` / `TxnSyncPolicy` / `PendingTxn` / `TxnCask`
+- [x] `src/cask/txn.cpp`：commit（校验→意图→sync→apply→清理）、
+      recover（收集后前滚）、pending_txns、意图 blob v1 编解码、
+      进程级单调 seq txn key（设计 §3/§4/§5）
+- [x] CMake：挂 `bitcask_cask` target
+- **验收**：✅ ctest 全绿；txn TU 零新告警
+
+### ✅ S34-3 — 测试 🔴 HIGH
+
+- [x] `tests/txn_test.cpp`：设计 §9 全部用例落地为 9 个（含手写编码器
+      格式对拍 + fork 崩溃注入 CrashMidApplyRecovers + 乱序写入验证
+      重放序 = key 字典序）
+- **验收**：✅ Debug 全量 **684/684**（675 基线 + 9 新增）；崩溃注入稳过
+
+### ✅ S34-4 — C API + 文档修正 🟡 MED
+
+- [x] `bitcask_txn_commit` / `bitcask_txn_recover` / `bitcask_txn_pending_count`
+      （每调用栈上构造 TxnCask；`c_api_test.c` 增 `test_txn` 冒烟全过）
+- [x] 模式文档 4 处修正（见 S34-1）；README / api-cpp §5.3 / api-c §10.3 /
+      CHANGELOG（并入 5.1.0 未发布条目）增量
+- **验收**：✅ ctest 全绿；build-rel 双树零错误（新公共头 txn.hpp）
+
+#### ✅ S34 落地记录（2026-08-05）
+
+一次成型，无计划偏离。要点：apply() 为 commit ③ 与 recover 前滚的**同一
+实现**（PUT 集一次 put_batch + REMOVE 逐条——BatchItem 无墓碑形态）；
+recover 先全量收集再前滚，不在弱一致 range 迭代器活跃期间写库；意图 blob
+v1 布局由测试侧**独立手写编码器**对拍钉死，改任何一边必红。
+未提交（含前置的 pg-xid-mvcc 参考笔记与索引更新）。
+
+---
+
 ## 执行序
 
 ```

@@ -1,6 +1,8 @@
 // C API — KV/生命周期/迭代/管理（S19-5 自 bitcask_c.cpp 拆分，符号与实现不变）。
 #include "internal.h"
 
+#include "bitcask/txn.hpp"  // S34：多键事务
+
 using namespace bitcask::capi;
 
 namespace meta = bitcask::meta;
@@ -352,6 +354,77 @@ BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);
     }
+    return BITCASK_OK;
+    });
+}
+
+// --- S34：多键事务（TxnCask 无状态，每调用栈上构造）-----------------------
+
+BITCASK_API bitcask_error_t bitcask_txn_commit(bitcask_t* cask,
+                                               const bitcask_txn_op_t* ops,
+                                               size_t n_ops,
+                                               int sync_on_commit,
+                                               bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !ops || n_ops == 0) return BITCASK_ERR_INVALID_OPTION;
+
+    std::vector<bitcask::TxnOp> cpp_ops;
+    cpp_ops.reserve(n_ops);
+    for (size_t i = 0; i < n_ops; ++i) {
+        if (ops[i].op > 1 || !slice_valid(ops[i].key))
+            return BITCASK_ERR_INVALID_OPTION;
+        bitcask::TxnOp op;
+        op.type = static_cast<bitcask::TxnOp::Type>(ops[i].op);
+        op.key = {static_cast<const std::byte*>(ops[i].key.data),
+                  ops[i].key.size};
+        if (op.type == bitcask::TxnOp::Type::kPut) {
+            if (!slice_valid(ops[i].value)) return BITCASK_ERR_INVALID_OPTION;
+            op.value = {static_cast<const std::byte*>(ops[i].value.data),
+                        ops[i].value.size};
+        }
+        cpp_ops.push_back(op);
+    }
+    bitcask::TxnCask txn(as_cpp_cask(cask),
+                         sync_on_commit ? bitcask::TxnSyncPolicy::kSyncOnCommit
+                                        : bitcask::TxnSyncPolicy::kNone);
+    auto result = txn.commit(cpp_ops);
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    return BITCASK_OK;
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_txn_recover(bitcask_t* cask,
+                                                size_t* out_replayed,
+                                                bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    bitcask::TxnCask txn(as_cpp_cask(cask));
+    auto result = txn.recover();
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    if (out_replayed) *out_replayed = *result;
+    return BITCASK_OK;
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_txn_pending_count(bitcask_t* cask,
+                                                      size_t* out_count,
+                                                      bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !out_count) return BITCASK_ERR_INVALID_OPTION;
+    bitcask::TxnCask txn(as_cpp_cask(cask));
+    auto result = txn.pending_txns();
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    *out_count = result->size();
     return BITCASK_OK;
     });
 }
