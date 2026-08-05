@@ -417,6 +417,62 @@ BENCHMARK(BM_Cask_SearchHybrid)->Unit(benchmark::kMicrosecond);
 // BM_Put_WalBatch 已删除（S19-4）：wal_batch_size 是 dead config，两档
 // 测的是同一路径（S18 侦查坐实），基准前提不成立。
 
+// -----------------------------------------------------------------------------
+// S35：put_batch vs put_batch_atomic 开销对比。原子批多付：一条批头记录
+// （27+13B）+ 成员 value 的 arena 预编码（span_bytes 需要精确编码长度）+
+// 首次调用的 meta v6 重写（一次性，预热吸收）。arg = 批大小；每迭代提交
+// 一整批（覆盖写同一 keyspace），Time/items = 单条摊销成本。
+// -----------------------------------------------------------------------------
+template <bool kAtomic>
+static void BM_Cask_PutBatchImpl(benchmark::State& state) {
+    const auto n = static_cast<std::size_t>(state.range(0));
+    TempDir td;
+    auto c = Cask::open(td.path(), rw_opts(), &test_registry());
+    if (!c) { state.SkipWithError("Cask::open failed"); return; }
+    auto& cask = **c;
+
+    std::vector<std::string> keys;
+    keys.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) keys.push_back("bk" + std::to_string(i));
+    const std::string value(128, 'v');
+
+    std::vector<Cask::BatchItem> items;
+    std::vector<Cask::BatchOp> ops;
+    for (std::size_t i = 0; i < n; ++i) {
+        if constexpr (kAtomic) {
+            ops.push_back({.type = Cask::BatchOp::Type::kPut,
+                           .key = as_bytes(keys[i]), .value = as_bytes(value)});
+        } else {
+            items.push_back({.key = as_bytes(keys[i]), .value = as_bytes(value)});
+        }
+    }
+    // 预热：吸收 meta v6 懒升级与 active 文件创建的一次性成本。
+    if constexpr (kAtomic) { (void)cask.put_batch_atomic(ops); }
+    else { (void)cask.put_batch(items); }
+
+    for (auto _ : state) {
+        if constexpr (kAtomic) {
+            auto r = cask.put_batch_atomic(ops);
+            benchmark::DoNotOptimize(r);
+        } else {
+            auto r = cask.put_batch(items);
+            benchmark::DoNotOptimize(r);
+        }
+    }
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(n));
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(n * value.size()));
+    (*c)->close();
+}
+static void BM_Cask_PutBatch(benchmark::State& state) {
+    BM_Cask_PutBatchImpl<false>(state);
+}
+static void BM_Cask_PutBatchAtomic(benchmark::State& state) {
+    BM_Cask_PutBatchImpl<true>(state);
+}
+BENCHMARK(BM_Cask_PutBatch)->Arg(8)->Arg(64)->Arg(512);
+BENCHMARK(BM_Cask_PutBatchAtomic)->Arg(8)->Arg(64)->Arg(512);
+
 
 // -----------------------------------------------------------------------------
 // S27-4 P3:DWPT builder 索引吞吐——单文本 put_doc 活写路径的分析+建段在

@@ -469,7 +469,19 @@ keydir 是全部读路径的唯一入口，批头永不进 keydir）；「封口
 不变量使 hint 快路径零改动；meta v6 懒升级使不用原子批的目录与 5.1.0
 读端完全互通。测试期发现：掐尾模拟必须同时删 keydir 快照/OKI 派生缓存
 （否则批成员经快照复活——真实掉电下这些缓存同样不会覆盖撕裂批）。
-未提交（含 S34 全部改动）。
+
+**收尾验证（2026-08-05）**：
+- **ASan 全量 692/692**（无豁免）；
+- **TSan 相关套件**（KeyDir/Concurrent/Oki/Txn/AtomicBatch/CaskDocValue）
+  按 CI 门控口径全绿——唯一失败为 ci.yml:159 明文豁免的既知 S29-6
+  seqlock 误报（`KeyDirOptimisticRead.ConcurrentGetPutRemoveGrowStress`），
+  非 S35 回归；
+- **bench 锚点**（`BM_Cask_PutBatch(Atomic)`，bench/cask_bench.cpp 新增）：
+  原子批 vs put_batch **零可测回归**（8/64 档噪声内；512 档 -15%——arena
+  预编码比逐条 thread_local 编码缓存友好）。写放大 1×（批头 40B/批），
+  对比方案 B 意图日志的 2-3×。数字入设计文档 §8。
+
+S34 已由用户提交（dc81bbc）；S35 改动未提交。
 
 ---
 

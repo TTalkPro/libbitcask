@@ -151,3 +151,21 @@ put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp = 0);
 执行序:S35-1 格式+fold → S35-2 meta v6 → S35-3 写路径+恢复+merge →
 S35-4 TxnCask 重接+文档。版本:并入 5.1.0(未发布)条目,标注 v6 懒升级
 语义;`SOVERSION` 保持 5。
+
+## 8. 实测开销(收尾验证,2026-08-05)
+
+`BM_Cask_PutBatch` vs `BM_Cask_PutBatchAtomic`(bench/cask_bench.cpp,
+tmpfs,build-rel,128B value,CPU 口径):
+
+| 批大小 | put_batch | put_batch_atomic | 差异 |
+|---|---|---|---|
+| 8 | 6.1 µs/批 | 5.8 µs/批 | 噪声内(重复 3 次 CV 6-19%) |
+| 64 | 33.2 µs | 32.4 µs | 噪声内 |
+| 512 | 265 µs | 226 µs | **-15%**(arena 预编码比逐条 thread_local 编码缓存友好) |
+
+**原子批相对 put_batch 零可测回归**——批头 40B + arena 编码的代价被
+编码路径优化抵消。对比方案 B(意图日志)的 2-3× 写放大,方案 C 的
+写放大为 1×(仅批头 40B/批)。
+
+Sanitizer 验收:ASan 全量、TSan 相关套件(CI 门控口径,豁免既知
+S29-6 seqlock 误报)——见 TASK.md S35 落地记录。
