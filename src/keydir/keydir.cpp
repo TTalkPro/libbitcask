@@ -517,6 +517,8 @@ void KeyDir::cache_fill(std::string_view key, const SingleEntry& row,
     s.epoch = epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
     sh.entries.insert_or_assign(std::string(key), Entry{s});
     // D4：回填是缓存填充——key_count/key_bytes/fstats 一律不动。
+    // S36-4：回填可能顶破预算——就地收敛（fold/pending 已在上方排除）。
+    maybe_evict_locked(sh, /*fold_active=*/false);
 }
 
 bool KeyDir::evict(std::string_view key) {
@@ -550,6 +552,66 @@ bool KeyDir::evict(std::string_view key) {
     sh.writes.fetch_add(1, std::memory_order_release);  // 挡并发 fill 回填
     evictions_.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+// ---- S36-4：缓存预算与采样逐出 ----
+
+void KeyDir::set_cache_budget(std::size_t entries) {
+    cache_budget_.store(entries, std::memory_order_relaxed);
+    shard_budget_.store(
+        entries == 0 ? 0 : std::max<std::size_t>(entries / kShards, 8),
+        std::memory_order_relaxed);
+    if (entries == 0) return;
+    // Level A→B 转换（或预算调小）的一次性出清：各分片独立短锁逐一收敛。
+    // 屏障活跃则整体放弃（写者退避纪律）；fold 活跃跳过（key 集只增不减）
+    // ——未清部分由后续写路径继续收敛，预算是软目标不是硬保证。
+    for (auto& sh : shards_) {
+        std::unique_lock slock(sh.mu);
+        if (barrier_active_.load(std::memory_order_acquire)) return;
+        maybe_evict_locked(sh,
+                           keyfolders_.load(std::memory_order_relaxed) > 0);
+    }
+}
+
+// 采样逐出：clock 游标起最多看 kSampleWindow 个可逐条目，逐 epoch 最旧者
+// （近似 LRU-by-write/fill；读路径不打热度标记——乐观读者兼容，无读位可
+// 用——读热 key 被误逐由 S36-3 二次命中回填自愈。设计原文的 CLOCK
+// ref-bit 需要读侧写痕迹，与 seqlock 冲突，首版以采样近似，偏离已入
+// TASK 记录）。前置：持 sh.mu；Level B 不变量「哈希可见 ⟹ 已入组合视图」
+// 由 put/remove 的入锁挂钩保证（S36-4），任意驻留条目此刻可安全逐出。
+void KeyDir::maybe_evict_locked(Shard& sh, bool fold_active) {
+    const std::size_t budget = shard_budget_.load(std::memory_order_relaxed);
+    if (budget == 0 || fold_active) return;
+    if (has_pending_.load(std::memory_order_relaxed)) return;  // release 收尾窗口
+    constexpr std::size_t kSampleWindow = 8;
+    while (sh.entries.size() > budget) {
+        auto* base = sh.entries.begin();
+        const std::size_t n = sh.entries.size();
+        std::size_t best = n;
+        std::uint64_t best_epoch = std::numeric_limits<std::uint64_t>::max();
+        std::size_t scanned = 0;
+        std::size_t considered = 0;
+        for (; scanned < n && considered < kSampleWindow; ++scanned) {
+            const std::size_t idx = (sh.clock_hand + scanned) % n;
+            const auto* s = std::get_if<SingleEntry>(&base[idx].second);
+            if (s == nullptr) continue;  // MultiEntry（fold 竞态链）不可逐
+            ++considered;
+            if (s->epoch < best_epoch) {
+                best_epoch = s->epoch;
+                best = idx;
+            }
+        }
+        sh.clock_hand = n == 0 ? 0 : (sh.clock_hand + scanned) % n;
+        if (best == n) break;  // 窗口内无可逐条目（防御）
+        auto* victim = base + best;
+        if (const auto* s = std::get_if<SingleEntry>(&victim->second);
+            s != nullptr && is_sibling_tombstone(*s) && sh.tombstones > 0) {
+            --sh.tombstones;  // 墓碑 sentinel 亦可逐（本就等 sweep 清）
+        }
+        sh.entries.erase(victim);  // swap-delete + limbo（S29-6 读者安全）
+        sh.writes.fetch_add(1, std::memory_order_release);
+        evictions_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // 影子对拍：哈希权威 vs 组合视图冷侧，稳定失配才判漂移。
@@ -587,9 +649,13 @@ void KeyDir::shadow_verify(std::string_view key,
         } else {
             match = cold.status == LocateStatus::kMiss ||
                     (cold.status == LocateStatus::kHit && cold.tomb);
-            // S36-3：发生过逐出后，「哈希 miss vs 组合视图活行」正是被逐
-            // key 的合法形态——该方向降级为 skip（首次逐出前保持全严格）。
-            if (!match && evictions_.load(std::memory_order_relaxed) != 0) {
+            // S36-3/4：本会话发生过逐出，或预算开启（S36-4——含「v4 子集
+            // 快照重开」：上个会话的逐出使哈希天生是子集）时，「哈希 miss
+            // vs 组合视图活行」正是被逐 key 的合法形态——该方向降级为
+            // skip（两者皆无时保持全严格）。
+            if (!match &&
+                (evictions_.load(std::memory_order_relaxed) != 0 ||
+                 cache_budget_.load(std::memory_order_relaxed) != 0)) {
                 shadow_skips_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -697,33 +763,39 @@ PutResult KeyDir::put(std::string_view key,
                               newest_put, old_file_id, old_offset, ord);
         }
     }
+    // S33-4/S36-2/S36-4 OKI 写挂钩（单一咽喉点，设计 §8 难点 1 对策）：
+    // 成功的真实写才记，行携全字段（组合视图点查的权威载体）：
+    //   - 普通写：append（ord<wm 的 tail 重放旧行由水位门过滤）；
+    //   - merge 搬迁 CAS（old_file_id≠0）：Level A 明文跳过（range 回查
+    //     keydir 权威，白付 merge bench +18%），点查开启时反转（设计 §D1
+    //     ——逐出后搬迁行是组合视图知道新位置的唯一途径），append_update
+    //     绕水位门，胜出由 (ord, 来源序) 格保证。
+    // S36-4：点查开启时挂钩**入锁**（持分片锁执行；oki 内部锁是叶子，
+    // 锁序无环）——「哈希可见 ⟹ 已入组合视图」在锁边界成立，采样逐出
+    // 因此对任意驻留条目恒安全（S36-3 抓获的在途窗口静默回滚从根上消
+    // 失）。Level A 维持锁外挂钩（热路径锁持有时间不变）。
+    const bool in_lock_hook = oki_->point_query_enabled();
+    if (r == PutResult::kOk && in_lock_hook) {
+        const oki::RowLoc loc{file_id, total_sz, offset, tstamp};
+        if (old_file_id == 0) {
+            oki_->append(key, ord, /*tomb=*/false, &loc);
+        } else {
+            oki_->append_update(key, ord, /*tomb=*/false, &loc);
+        }
+        // S36-4：插入可能使分片超预算——就地采样逐出（挂钩已完成，本分
+        // 片全部条目此刻均可安全逐出）。
+        maybe_evict_locked(*ctx.shard, ctx.fold_active);
+    }
     // S29-6 P1:写者顺手增量清扫墓碑(ctx.slock 仍持有;fold 期间禁扫——
     // entries key 集只增不减是迭代器不变量)。
     if (!ctx.fold_active) sweep_tombstones_locked(*ctx.shard);
     maybe_reclaim_locked(*ctx.shard);  // S29-6 P2:攒批回收 limbo
-    // S33-4：OKI 挂钩在锁外（锁序：分片/meta 锁绝不嵌 oki mu）。
     ctx.slock.unlock();
     if (ctx.mlock.owns_lock()) ctx.mlock.unlock();
 
-    // S33-4 OKI 写挂钩（单一咽喉点，设计 §8 难点 1 对策）：成功的真实写
-    // 才记。S36-2 起行携全字段（组合视图点查的权威载体）：
-    //   - 普通写：append（ord<wm 的 tail 重放旧行由水位门过滤）；
-    //   - merge 搬迁 CAS（old_file_id≠0）：Level A 明文跳过，S36-2 反转
-    //     （设计 §D1——缓存逐出后搬迁行是组合视图知道新位置的唯一途径）。
-    //     走 append_update 绕水位门（ord 是旧写序）；胜出由 (ord, 来源序)
-    //     格保证：搬迁行必然落在更高 gen 的 run / delta 后到位。
-    //     **门在点查开启上**（影子对拍 / Level B）：Level A 不消费搬迁行
-    //     （range 回查 keydir 权威），白付每条搬迁一次 append + flush 排序
-    //     的份量（实测 merge bench +18%）；且历史 run 本就可能陈旧（S36-2
-    //     之前 / 关门期间的 merge），Level B 开启必须以重建起步（S36-4），
-    //     开启后挂钩持续在线，run 才保持新鲜——半途的行没有独立价值。
-    if (r == PutResult::kOk) {
+    if (r == PutResult::kOk && !in_lock_hook && old_file_id == 0) {
         const oki::RowLoc loc{file_id, total_sz, offset, tstamp};
-        if (old_file_id == 0) {
-            oki_->append(key, ord, /*tomb=*/false, &loc);
-        } else if (oki_->point_query_enabled()) {
-            oki_->append_update(key, ord, /*tomb=*/false, &loc);
-        }
+        oki_->append(key, ord, /*tomb=*/false, &loc);
     }
     return r;
 }
@@ -873,13 +945,53 @@ PutResult KeyDir::put_insert(PutCtx& ctx, std::string_view key,
         sh.entries.insert_or_assign(std::string(key), Entry{s});
     }
 
-    key_count_.fetch_add(1, std::memory_order_relaxed);
-    key_bytes_.fetch_add(key.size(), std::memory_order_relaxed);
+    // S36-4 D4：Level B 下「哈希 miss ≠ 新 key」——被逐出的活 key 被覆盖写
+    // 走本分支（probe 全 miss）。冷视图裁决计数走向：命中活行 = 逻辑覆盖
+    // （老位置 fstats 退账、key_count/key_bytes 不加——否则每次覆盖被逐 key
+    // 都虚增计数且死字节漏记、merge 触发失真）；miss/墓碑 = 真新 key。
+    // kUnavailable 退化为 +1（与 Level A 同口径的偏差）。冷查在分片锁内
+    // （oki mu/块缓存锁均为独立叶子；被逐 key 的块大概率缓存热）。命中
+    // 缓存墓碑（ctx.found && tombstone）= 已知死亡，不查冷侧。
+    bool logical_new = true;
+    oki::RowLoc prior{};
+    if (!ctx.found && oki_->point_query_enabled()) {
+        const auto cold = oki_->locate(key);
+        if (cold.status == oki::OkiState::LocateStatus::kHit) {
+            // Level B 版 LWW/复活门：组合视图比本行**新**（ord 全序）——
+            // 恢复期重放旧行（无水位文件/迟到 merge 输出）落在被逐 key 上
+            // 会以「全新 key」直插缓存，把已覆盖/已删的旧版本复活为权威。
+            // 冷侧更新即拒收（kAlreadyExists——recovery/merge 调用方的既有
+            // stale 语义）；运行期写 ord 恒新，不触发。S33-B1 复活门的
+            // Level B 延伸。
+            if (cold.ord > ord) return PutResult::kAlreadyExists;
+            if (!cold.tomb && cold.has_loc) {
+                logical_new = false;
+                prior = cold.loc;
+            }
+        }
+    }
+    if (logical_new) {
+        key_count_.fetch_add(1, std::memory_order_relaxed);
+        key_bytes_.fetch_add(key.size(), std::memory_order_relaxed);
+    }
     if (ctx.fold_active) iter_mutation_.store(true, std::memory_order_relaxed);
 
     const auto sz_i32 = static_cast<std::int32_t>(total_sz);
-    update_fstats(file_id, tstamp, kMaxEpoch,
-                  1, 1, sz_i32, sz_i32, /*should_create*/ true);
+    if (logical_new) {
+        update_fstats(file_id, tstamp, kMaxEpoch,
+                      1, 1, sz_i32, sz_i32, /*should_create*/ true);
+    } else if (prior.file_id != file_id) {
+        // 逻辑覆盖（镜像 put_overwrite 的两分支记账）。
+        update_fstats(prior.file_id, /*tstamp*/ 0, kMaxEpoch,
+                      -1, 0, -static_cast<std::int32_t>(prior.total_sz), 0,
+                      /*should_create*/ false);
+        update_fstats(file_id, tstamp, kMaxEpoch,
+                      1, 1, sz_i32, sz_i32, /*should_create*/ true);
+    } else {
+        update_fstats(file_id, tstamp, kMaxEpoch,
+                      0, 1, sz_i32 - static_cast<std::int32_t>(prior.total_sz),
+                      sz_i32, /*should_create*/ true);
+    }
     // CAS-max:并发 put 跨分片推进 biggest_file_id_。
     std::uint32_t big = biggest_file_id_.load(std::memory_order_relaxed);
     while (file_id > big &&
@@ -998,10 +1110,14 @@ bool KeyDir::remove(std::string_view key, std::uint64_t remove_time,
             ? &oki_hooks_in_flight_ : nullptr);
     const bool had = remove_impl(key, remove_time, ord,
                                  insert_tombstone_if_absent);
-    // S33-4 OKI 写挂钩（锁外；单一咽喉点）：墓碑行无论命中与否都记——
-    // 旧 run 里的同 key 需 tomb 抵消 / 回查过滤。wm 之下的重放旧行由
-    // append 内部水位门过滤（链重放 remove 的 ord=0 恒 < wm，天然不收）。
-    oki_->append(key, ord, /*tomb=*/true);
+    // S33-4 OKI 写挂钩（单一咽喉点）：墓碑行无论命中与否都记——旧 run 里
+    // 的同 key 需 tomb 抵消 / 回查过滤。wm 之下的重放旧行由 append 内部
+    // 水位门过滤（链重放 remove 的 ord=0 恒 < wm，天然不收）。
+    // S36-4：点查开启时挂钩已由 remove_impl **入锁**执行（HookAtExit），
+    // 此处只兜 Level A（锁外，与 S33-4 一致）。
+    if (!oki_->point_query_enabled()) {
+        oki_->append(key, ord, /*tomb=*/true);
+    }
     return had;
 }
 
@@ -1033,6 +1149,37 @@ bool KeyDir::remove_impl(std::string_view key, std::uint64_t remove_time,
     // 缺席 key 仍会写 delta 墓碑，回填若不知情会把旧行塞回缓存。
     sh.writes.fetch_add(1, std::memory_order_release);
 
+    // S36-4：点查开启时 OKI 挂钩**入锁**（作用域析构先于 slock 释放——
+    // 每个 return 出口都在持锁状态下完成 append；与 put 的入锁挂钩同一
+    // 不变量：「哈希可见 ⟹ 已入组合视图」）。普通 remove（expected==
+    // nullptr）恒记墓碑行（命中与否——语义同 S33-4 锁外版）；精确 CAS
+    // （conditional_remove）仅在真删除时以受害者 ord 记 append_update。
+    struct HookAtExit {
+        oki::OkiState* oki = nullptr;
+        std::string_view key;
+        std::uint64_t ord = 0;
+        bool plain_tomb = false;
+        bool update_tomb = false;
+        std::uint64_t victim = 0;
+        ~HookAtExit() {
+            if (oki == nullptr) return;
+            if (update_tomb) {
+                oki->append_update(key, victim, /*tomb=*/true, nullptr);
+            } else if (plain_tomb) {
+                oki->append(key, ord, /*tomb=*/true);
+            }
+        }
+        HookAtExit() = default;
+        HookAtExit(const HookAtExit&) = delete;
+        HookAtExit& operator=(const HookAtExit&) = delete;
+    } hook;
+    if (oki_->point_query_enabled()) {
+        hook.oki = oki_.get();
+        hook.key = key;
+        hook.ord = ord;
+        hook.plain_tomb = (expected == nullptr);
+    }
+
     auto it = sh.entries.find(key);
     if (it != sh.entries.end()) {
         auto at = entry_at_epoch(it->second, kMaxEpoch);
@@ -1062,6 +1209,10 @@ bool KeyDir::remove_impl(std::string_view key, std::uint64_t remove_time,
             return false;
         }
         if (victim_ord != nullptr) *victim_ord = cur.ord;
+        if (hook.oki != nullptr && expected != nullptr) {
+            hook.update_tomb = true;  // S36-4：真删除 → 受害者 ord 墓碑
+            hook.victim = cur.ord;
+        }
 
         update_fstats(cur.file_id, cur.tstamp, kMaxEpoch,
                       -1, 0, -static_cast<std::int32_t>(cur.total_sz), 0,
@@ -1123,6 +1274,10 @@ bool KeyDir::remove_impl(std::string_view key, std::uint64_t remove_time,
                     return false;
                 }
                 if (victim_ord != nullptr) *victim_ord = cur.ord;
+                if (hook.oki != nullptr && expected != nullptr) {
+                    hook.update_tomb = true;  // S36-4
+                    hook.victim = cur.ord;
+                }
                 update_fstats(cur.file_id, cur.tstamp, kMaxEpoch,
                               -1, 0, -static_cast<std::int32_t>(cur.total_sz), 0,
                               /*should_create*/ false);
@@ -1142,6 +1297,33 @@ bool KeyDir::remove_impl(std::string_view key, std::uint64_t remove_time,
             }
         }
     }
+    // S36-4 D4：Level B 下哈希 miss ≠ 不存在——被逐出的活 key 被 remove
+    // 时逻辑上确实删掉了一个 key：冷视图命中活行 → 计数/fstats 退账并
+    // 返回 true（组合视图的墓碑行由上方 HookAtExit 在锁内记，抵消 run
+    // 活行）。仅普通 remove 参与（精确 CAS 的 miss = 已被并发处理，语义
+    // 是放行）；kUnavailable/miss/墓碑 → 维持旧行为（false）。
+    if (expected == nullptr && ord != 0 && oki_->point_query_enabled()) {
+        const auto cold = oki_->locate(key);
+        // 仅当墓碑确实比冷侧活行新才是真删除（ord 全序）；更旧 = 重放的
+        // 陈旧墓碑（其 append 也被水位门丢弃），不动账。ord==0（链重放
+        // 入口）不参与——其调用方 remove_if_older 已在哈希侧做过 ord 门。
+        if (cold.status == oki::OkiState::LocateStatus::kHit && !cold.tomb &&
+            cold.has_loc && cold.ord < ord) {
+            update_fstats(cold.loc.file_id, cold.loc.tstamp, kMaxEpoch,
+                          -1, 0,
+                          -static_cast<std::int32_t>(cold.loc.total_sz), 0,
+                          /*should_create*/ false);
+            assert(key_count_.load(std::memory_order_relaxed) > 0 &&
+                   "cold remove found a live row but key_count_ is 0");
+            key_count_.fetch_sub(1, std::memory_order_relaxed);
+            key_bytes_.fetch_sub(key.size(), std::memory_order_relaxed);
+            if (fold_active) {
+                iter_mutation_.store(true, std::memory_order_relaxed);
+            }
+            return true;
+        }
+    }
+
     // S33：key 不存在。恢复模式下插入墓碑 sentinel——并行恢复中「墓碑先于
     // 其 put 到达」时，晚到的旧 put 靠复活门（比对 sentinel ord）拦截。
     // 仅非 fold 态生效（冷启动恢复即此形态）；sentinel 走 S29-6 P1 既有的
@@ -1208,20 +1390,17 @@ PutResult KeyDir::conditional_remove(std::string_view key,
             ? &oki_hooks_in_flight_ : nullptr);
     const ExpectedLoc expected{tstamp, file_id, offset};
     std::uint64_t victim_ord = 0;
-    const bool removed = remove_impl(key, remove_time, /*ord=*/0,
-                                     /*insert_tombstone_if_absent=*/false,
-                                     &expected, &victim_ord);
-    // S36-2 OKI 挂钩：TTL 删除没有数据记录背书（keydir-only），组合视图
-    // 必须靠这行墓碑抵消 run 里的陈旧活行。ord 用**受害者的 ord**（被删
-    // entry 自己的写序——有数据记录背书，恢复期 next_ord 恒覆盖它）+
-    // append_update 绕水位门；等 ord 平局由「delta/更高 gen 胜」消解，
-    // 而并发的更新写 ord 更大恒胜——与哈希侧「CAS 失配即放行」严格同构。
-    // 哈希侧墓碑 sentinel 维持 ord=0（运行期无复活门，S33-B1 契约不动）。
-    // 门在点查开启上——理由同 put 的搬迁挂钩（Level A 由 get/range 的
-    // 读时 TTL 过滤兜底，与 S36-2 之前行为一致）。
-    if (removed && oki_->point_query_enabled()) {
-        oki_->append_update(key, victim_ord, /*tomb=*/true, nullptr);
-    }
+    // S36-2/S36-4 OKI 挂钩：TTL 删除没有数据记录背书（keydir-only），组合
+    // 视图必须靠墓碑行抵消 run 里的陈旧活行——ord 用**受害者的 ord**（被删
+    // entry 自己的写序，有数据记录背书，恢复期 next_ord 恒覆盖）+
+    // append_update 绕水位门；等 ord 平局由「delta/更高 gen 胜」消解，并发
+    // 更新写 ord 更大恒胜——与「CAS 失配即放行」严格同构。哈希侧墓碑
+    // sentinel 维持 ord=0（运行期无复活门，S33-B1 契约不动）。S36-4 起该
+    // 挂钩由 remove_impl **入锁**执行（HookAtExit；仅点查开启时激活——
+    // Level A 本就不记，与 S36-2 之前行为一致）。
+    (void)remove_impl(key, remove_time, /*ord=*/0,
+                      /*insert_tombstone_if_absent=*/false,
+                      &expected, &victim_ord);
     return PutResult::kOk;
 }
 
@@ -1232,6 +1411,20 @@ PutResult KeyDir::conditional_remove(std::string_view key,
 // 读者照常并发。start 屏障内纯读 + meta unique；release 的合并是唯一
 // 屏障内写路径,按三阶段执行（见 release 注释;设计 §4 屏障 v2）。
 // =============================================================================
+
+// S36-4：Level B 冷枚举状态——OKI 三元组的 fold 侧（设计 §5.2）：
+// runs 共享 Reader（pin：shared_ptr 跨越 rebuild/compact 的 unlink）+
+// memdelta 排序去重拷贝。捕获点在 start() 的写者闸门屏障内：写者出清 +
+// Level B 挂钩入锁 ⟹ 视图 ⊇ 哈希活 key 且两者同刻（精确覆盖快照点）。
+struct IterHandle::ColdIter {
+    oki::OkiState::ReadView view;
+    std::vector<oki::OkiRunReader::Cursor> cursors;
+    std::vector<std::optional<oki::OkiRunReader::Entry>> heads;
+    std::size_t delta_pos = 0;
+    std::string cur_key;  // 当前归并 key（返回的 proxy.key 指向它）
+};
+
+IterHandle::IterHandle(KeyDir* parent) noexcept : parent_(parent) {}
 
 IterHandle::~IterHandle() noexcept {
     if (iterating_) {
@@ -1280,26 +1473,63 @@ StartIterResult IterHandle::start(std::uint64_t now_sec,
     // keyfolders_ 只在屏障内修改（此处与 release 阶段一）。
     parent_->keyfolders_.fetch_add(1, std::memory_order_relaxed);
 
+    // S36-4：Level B（预算开启或发生过逐出）——哈希是缓存子集，key 枚举改
+    // 走 OKI 组合视图（覆盖不变量：OKI key 集 ⊇ keydir 活 key 集；屏障内
+    // 捕获 + 挂钩入锁 ⟹ 与 iter_epoch_ 同刻精确）。哈希 keys 快照不再拍
+    // ——枚举与首层裁决都以视图为纲、哈希在 next() 里按 key 锁内复核。
+    // 视图捕获失败（RO 无 OKI 等——彼时也不可能有逐出）→ 经典路径。
+    cold_.reset();
+    cold_error_ = false;
+    if (parent_->cache_budget_.load(std::memory_order_relaxed) > 0 ||
+        parent_->evictions_.load(std::memory_order_relaxed) > 0) {
+        if (auto v = parent_->oki_->make_read_view()) {
+            auto ci = std::make_unique<ColdIter>();
+            ci->view = *std::move(v);
+            ci->cursors.reserve(ci->view.runs.size());
+            ci->heads.reserve(ci->view.runs.size());
+            bool ok = true;
+            for (const auto& r : ci->view.runs) {
+                auto c = r->begin();
+                oki::OkiRunReader::Entry e;
+                auto n = c.next(e);
+                if (!n) { ok = false; break; }
+                ci->cursors.push_back(std::move(c));
+                ci->heads.push_back(
+                    *n ? std::optional<oki::OkiRunReader::Entry>(std::move(e))
+                       : std::nullopt);
+            }
+            if (ok) {
+                cold_ = std::move(ci);
+            } else {
+                cold_error_ = true;  // run 损坏/IO——caller 经 cold_error 感知
+            }
+        } else {
+            cold_error_ = true;  // 逐出已发生而视图不可得：无法完整枚举
+        }
+    }
+
     // 拍 key snapshot——O(n) 一次性开销，跨分片归并（按分片下标序拼接），
     // 之后对 entries 的 rehash 免疫。屏障内写者已出清,遍历各分片
     // entries **不需要分片锁**（并发的 get/next 只读,unordered_map
     // 并发只读安全;写者出清的 HB 由排干循环的 mutex 配对保证）。
     // S24-M7：扁平缓冲——先一遍求 (条数, 字节和) 精确 reserve，再一遍
-    // 拼接；每 fold 分配 N+1 → 2。
+    // 拼接；每 fold 分配 N+1 → 2。（Level B 冷枚举路径不需要。）
     keys_buf_.clear();
     key_offs_.clear();
-    std::size_t total = 0, total_bytes = 0;
-    for (const auto& sh : parent_->shards_) {
-        total += sh.entries.size();
-        for (const auto& [k, _] : sh.entries) total_bytes += k.size();
-    }
-    keys_buf_.reserve(total_bytes);
-    key_offs_.reserve(total + 1);
-    key_offs_.push_back(0);
-    for (const auto& sh : parent_->shards_) {
-        for (const auto& [k, _] : sh.entries) {
-            keys_buf_.append(k);
-            key_offs_.push_back(keys_buf_.size());
+    if (cold_ == nullptr && !cold_error_) {
+        std::size_t total = 0, total_bytes = 0;
+        for (const auto& sh : parent_->shards_) {
+            total += sh.entries.size();
+            for (const auto& [k, _] : sh.entries) total_bytes += k.size();
+        }
+        keys_buf_.reserve(total_bytes);
+        key_offs_.reserve(total + 1);
+        key_offs_.push_back(0);
+        for (const auto& sh : parent_->shards_) {
+            for (const auto& [k, _] : sh.entries) {
+                keys_buf_.append(k);
+                key_offs_.push_back(keys_buf_.size());
+            }
         }
     }
     cursor_ = 0;
@@ -1313,6 +1543,7 @@ StartIterResult IterHandle::start(std::uint64_t now_sec,
 // snapshot 期间被折叠 erase 的 key（不可能在 fold 中,防御）直接跳过。
 std::optional<EntryProxy> IterHandle::next(bool include_tombstones) {
     if (!iterating_) return std::nullopt;
+    if (cold_ != nullptr) return next_cold(include_tombstones);  // S36-4
 
     while (cursor_ + 1 < key_offs_.size()) {
         const std::string_view k(keys_buf_.data() + key_offs_[cursor_],
@@ -1329,6 +1560,112 @@ std::optional<EntryProxy> IterHandle::next(bool include_tombstones) {
         return to_proxy(it->first, at.rev, /*tombstone*/ at.is_tombstone);
     }
     return std::nullopt;
+}
+
+// S36-4：Level B 冷枚举——OKI 视图 k 路归并（runs gen 升序 + delta；同 key
+// 取 (ord, 来源序) 最大者，与 range/compact 同一规则），每 key 在分片锁内
+// 以哈希裁决（缓存有 = 权威且带 epoch 快照语义；缓存无 = 视图行即快照点
+// 状态——挂钩入锁 + 屏障捕获保证行不老于快照点的最后一次写）。
+// 输出序 = key 升序（fold 从未承诺顺序，语义兼容）。
+std::optional<EntryProxy> IterHandle::next_cold(bool include_tombstones) {
+    auto& ci = *cold_;
+    while (true) {
+        // 1) 跨源找最小 key。
+        std::string_view min_key;
+        bool any = false;
+        for (const auto& h : ci.heads) {
+            if (h && (!any || std::string_view(h->key) < min_key)) {
+                min_key = h->key;
+                any = true;
+            }
+        }
+        if (ci.delta_pos < ci.view.delta.size()) {
+            const auto& d = ci.view.delta[ci.delta_pos];
+            if (!any || std::string_view(d.key) < min_key) {
+                min_key = d.key;
+                any = true;
+            }
+        }
+        if (!any) return std::nullopt;  // 到尾
+
+        // 2) 物化当前 key（推进源会失效 view），归并同 key 各源。
+        ci.cur_key.assign(min_key);
+        std::uint64_t win_ord = 0;
+        std::uint64_t win_tstamp = 0;
+        bool win_tomb = false;
+        bool win_has_loc = false;
+        oki::RowLoc win_loc{};
+        bool first = true;
+        for (std::size_t i = 0; i < ci.heads.size(); ++i) {
+            auto& h = ci.heads[i];
+            if (!h || h->key != ci.cur_key) continue;
+            // >=：等 ord 高 gen 胜（heads 按 gen 升序——搬迁行判据）。
+            if (first || h->ord >= win_ord) {
+                win_ord = h->ord;
+                win_tomb = h->tomb;
+                win_has_loc = h->has_loc;
+                win_loc = h->loc;
+                win_tstamp = h->loc.tstamp;
+                first = false;
+            }
+            oki::OkiRunReader::Entry e;
+            auto n = ci.cursors[i].next(e);
+            if (!n) {
+                cold_error_ = true;  // run 读损坏——caller 经 cold_error 感知
+                return std::nullopt;
+            }
+            if (*n) {
+                h = std::move(e);
+            } else {
+                h.reset();
+            }
+        }
+        if (ci.delta_pos < ci.view.delta.size() &&
+            ci.view.delta[ci.delta_pos].key == ci.cur_key) {
+            const auto& d = ci.view.delta[ci.delta_pos];
+            if (first || d.ord >= win_ord) {  // delta 视作 gen=∞
+                win_ord = d.ord;
+                win_tomb = d.tomb;
+                win_has_loc = d.has_loc;
+                win_loc = d.loc;
+                win_tstamp = d.loc.tstamp;
+                first = false;
+            }
+            ++ci.delta_pos;
+        }
+
+        // 3) 哈希裁决（分片锁内；缓存命中 = 权威 + epoch 快照语义）。
+        {
+            const KeyDir::Shard& sh =
+                parent_->shards_[KeyDir::shard_for(ci.cur_key)];
+            std::unique_lock lock(sh.mu);
+            auto it = sh.entries.find(ci.cur_key);
+            if (it != sh.entries.end()) {
+                auto at = entry_at_epoch(it->second, iter_epoch_);
+                if (at.found) {
+                    if (at.is_tombstone && !include_tombstones) continue;
+                    return to_proxy(ci.cur_key, at.rev, at.is_tombstone);
+                }
+                // !at.found（全部 revision 晚于快照点且无旧链——正常路径
+                // 不可达：fold 期覆盖恒留旧 revision、回填被禁）→ 落视图行。
+            }
+        }
+        if (win_tomb) {
+            if (!include_tombstones) continue;
+            // 与 sibling 墓碑同形态的合成 proxy（墓碑行免位置字段）。
+            return to_proxy(ci.cur_key,
+                            make_sibling_tombstone(/*epoch=*/0,
+                                                   /*tstamp=*/win_tstamp,
+                                                   win_ord),
+                            /*tombstone=*/true);
+        }
+        if (!win_has_loc) continue;  // v1 行无位置（Level B 不该有；防御）
+        return to_proxy(ci.cur_key,
+                        SingleEntry{win_loc.file_id, win_loc.total_sz,
+                                    win_loc.offset, /*epoch=*/0,
+                                    win_loc.tstamp, win_ord},
+                        /*tombstone=*/false);
+    }
 }
 
 // 结束迭代。最后一个 folder release 时触发 pending → entries 合并 +
@@ -1355,6 +1692,8 @@ void IterHandle::release() {
     key_offs_.clear();
     key_offs_.shrink_to_fit();
     cursor_ = 0;
+    cold_.reset();   // S36-4：释放 runs pin + delta 拷贝
+    cold_error_ = false;
 
     // 阶段一[meta unique]:keyfolders_--。
     {
@@ -1632,6 +1971,10 @@ constexpr std::uint32_t kSnapMagic   = 0x42434B53;  // "BCKS"
 // v3:tstamp 域定宽 8B（64 位时间戳 flag-day）。读端仅收 v3——v1/v2 属
 // u32-tstamp 纪元,version 不符拒收 → 退全量 fold 重建（降级安全）。
 constexpr std::uint32_t kSnapVersion   = 3;
+// S36-4 v4：payload 与 v3 逐字节同构，语义 = **缓存子集 + 逻辑计数**
+// （Level B——entries 只含未被逐出的条目）。老读端（≤5.1.0 / Level A）
+// version 不符拒收 → 全量 fold，自愈；接受条件见 load_snapshot。
+constexpr std::uint32_t kSnapVersionSubset = 4;
 
 void snap_put32(std::vector<std::uint8_t>& b, std::uint32_t v) {
     const auto sz = b.size();
@@ -1872,7 +2215,10 @@ bool KeyDir::save_snapshot(
     std::vector<std::uint8_t> buf;
     buf.reserve(est_size);
     snap_put32(buf, kSnapMagic);
-    snap_put32(buf, kSnapVersion);
+    // S36-4：Level B（预算开启 = 可能有逐出）→ v4（子集语义）；否则 v3。
+    snap_put32(buf, cache_budget_.load(std::memory_order_relaxed) > 0
+                        ? kSnapVersionSubset
+                        : kSnapVersion);
     const std::size_t payload_begin = buf.size();
 
     snap_put64(buf, next_ord_.load(std::memory_order_relaxed));
@@ -1932,7 +2278,8 @@ bool KeyDir::save_snapshot(
         std::string(path), std::as_bytes(std::span(buf)));
 }
 
-auto KeyDir::load_snapshot(std::string_view path)
+auto KeyDir::load_snapshot(std::string_view path, bool accept_subset,
+                           std::uint64_t subset_wm_limit)
     -> std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> {
     auto buf_opt =
         bitcask::detail::read_file_bytes<std::uint8_t>(std::string(path));
@@ -1943,7 +2290,11 @@ auto KeyDir::load_snapshot(std::string_view path)
     SnapCursor c{buf.data(), buf.data() + buf.size()};
     if (c.u32() != kSnapMagic) return std::nullopt;
     const std::uint32_t ver = c.u32();
-    if (ver != kSnapVersion) return std::nullopt;
+    // S36-4：v4 = 缓存子集快照——只有 Level B（accept_subset）且 OKI runs
+    // 覆盖快照点（next_ord ≤ wm，缺席条目可由组合视图兜底）才可用；
+    // 其余情形拒收 → 全量 fold（把子集当全量载入 + 跳字节水位 = 丢 key）。
+    if (ver != kSnapVersion && ver != kSnapVersionSubset) return std::nullopt;
+    if (ver == kSnapVersionSubset && !accept_subset) return std::nullopt;
     // CRC 覆盖 [8, size-4)。
     std::uint32_t stored_crc = 0;
     std::memcpy(&stored_crc, buf.data() + buf.size() - 4, 4);  // 未对齐安全
@@ -1980,7 +2331,12 @@ auto KeyDir::load_snapshot(std::string_view path)
         biggest_file_id_.store(0, std::memory_order_relaxed);
     };
 
-    next_ord_.store(c.u64(), std::memory_order_relaxed);
+    const std::uint64_t snap_next_ord = c.u64();
+    // S36-4：v4 覆盖前提（先验后填——失败时零状态写入）。
+    if (ver == kSnapVersionSubset && snap_next_ord > subset_wm_limit) {
+        return std::nullopt;
+    }
+    next_ord_.store(snap_next_ord, std::memory_order_relaxed);
     epoch_.store(c.u64(), std::memory_order_relaxed);
     biggest_file_id_.store(c.u32(), std::memory_order_relaxed);
     key_count_.store(c.u64(), std::memory_order_relaxed);

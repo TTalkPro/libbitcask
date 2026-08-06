@@ -116,6 +116,20 @@ struct CaskOptions {
     // （要写新文件），但不在该 Cask handle 上提供 put/delete API。
     bool          merge_only       = false;
 
+    // S36-4 Level B（keydir 磁盘驻留，doc/keydir-disk-resident-design-zh.md）：
+    // keydir 热点缓存条目预算。0 = 不限 = 现状全内存（默认）。>0 = opt-in：
+    //   - keydir 降级为热点缓存（超预算分片内采样逐出），点查权威 =
+    //     缓存 → memdelta → BCOK v2 run（bloom + 块 LRU，冷 get ≤2 次
+    //     pread）；fold/scan 枚举走组合视图；快照写 BCKS v4（缓存子集）；
+    //   - 首次在未带 Level B 戳（BCOM v3）的目录上开启会**全量重建 OKI**
+    //     （既有 run 的位置字段不可信）；此后 manifest 带戳，重开快速；
+    //   - Level A 写者重开该目录会自动清戳（其 merge 不维护 run 位置），
+    //     再回 Level B 时重建自愈；**merge_only 旁车与 Level B 目录互斥**
+    //     （open 拒绝——旁车的无挂钩搬迁会静默腐蚀组合视图）；
+    //   - 预算是软目标（fold 活跃期暂停逐出）；只读句柄不受预算影响，
+    //     但同样以组合视图服务点查（带戳目录的 RO 打开内存有界）。
+    std::size_t keydir_cache_entries = 0;
+
     // remove() 写入哪种墓碑格式。读时三种 (v0/v1/v2) 都接受。
     //   0 → "bitcask_tombstone"            (17 B)  默认，最简单
     //   2 → "bitcask_tombstone2" + FileId  (22 B)  支持「shadow file_id 仍存在

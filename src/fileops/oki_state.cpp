@@ -116,8 +116,25 @@ void OkiState::load(std::string_view dir) {
     manifest_ = *std::move(m);
     readers_ = std::move(rds);
     publish_runs_locked();
+    manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
     wm_.store(manifest_.wm, std::memory_order_release);
     loaded_.store(true, std::memory_order_release);
+}
+
+// S36-4：降级戳（level_b 关而盘上戳开 → 改写 manifest 清戳）。升级不走
+// 此路——必须经全量 rebuild（见头文件注释）。best-effort：写失败保持原
+// 状（戳仍在，Level B 下次 open 会做一次多余重建，方向安全）。
+void OkiState::stamp_mode(std::string_view dir) {
+    std::lock_guard<std::mutex> flk(flush_mu_);
+    if (!loaded_.load(std::memory_order_relaxed)) return;
+    const bool want = level_b_.load(std::memory_order_acquire);
+    if (manifest_.level_b == want) return;
+    if (want) return;  // 升级只经 rebuild
+    OkiManifest next = manifest_;
+    next.level_b = false;
+    if (!write_manifest(dir, next)) return;
+    manifest_ = std::move(next);
+    manifest_level_b_.store(false, std::memory_order_release);
 }
 
 std::uint64_t OkiState::next_gen_locked() const noexcept {
@@ -191,6 +208,7 @@ bool OkiState::flush(std::string_view dir) {
     OkiManifest next = manifest_;
     next.runs.push_back({gen, cover, /*format_ver=*/2});
     next.wm = std::max(next.wm, cover);
+    next.level_b = level_b_.load(std::memory_order_acquire);  // S36-4 模式戳
     if (!write_manifest(dir, next)) {
         std::error_code ec;
         std::filesystem::remove(mk_run_filename(dir, gen), ec);
@@ -199,6 +217,7 @@ bool OkiState::flush(std::string_view dir) {
     manifest_ = std::move(next);
     readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
     publish_runs_locked();
+    manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
     wm_.store(manifest_.wm, std::memory_order_release);
 
     // 提交完成，删已固化的前缀（先发布 run 快照再删——中间态两边可见，
@@ -328,12 +347,14 @@ bool OkiState::compact_all_locked(std::string_view dir) {
                          static_cast<std::uint8_t>(
                              out_ver == kRunVersion2 ? 2 : 1)});
     next.wm = keep_wm;  // 归并不推进水位
+    next.level_b = level_b_.load(std::memory_order_acquire);  // S36-4
     if (!write_manifest(dir, next)) return abort();
 
     manifest_ = std::move(next);
     readers_.clear();
     readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
     publish_runs_locked();
+    manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
     // 旧 run + 此前崩溃残留的孤儿一并清（在途 ReadView 持 shared_ptr，
     // unlink 后 fd 仍可读——安全）。
     {
@@ -384,6 +405,7 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
     OkiManifest next;
     if (new_reader) next.runs.push_back({gen, cover_ord, /*format_ver=*/2});
     next.wm = cover_ord;
+    next.level_b = level_b_.load(std::memory_order_acquire);  // S36-4 模式戳
     if (!write_manifest(dir, next)) {
         std::error_code ec;
         if (new_reader) std::filesystem::remove(mk_run_filename(dir, gen), ec);
@@ -403,6 +425,7 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
     readers_.clear();
     if (new_reader) readers_.emplace_back(gen, std::move(new_reader));
     publish_runs_locked();
+    manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
     wm_.store(manifest_.wm, std::memory_order_release);
     loaded_.store(true, std::memory_order_release);
     {

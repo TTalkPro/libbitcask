@@ -40,12 +40,19 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <expected>
+#include <functional>
+#include <list>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "bitcask/io.hpp"
@@ -65,6 +72,10 @@ inline constexpr std::size_t   kDefaultBlockBytes = 4096;
 inline constexpr std::uint32_t kManifestMagic   = 0x4D4F4342;  // "BCOM" LE
 inline constexpr std::uint32_t kManifestVersion = 1;
 inline constexpr std::uint32_t kManifestVersion2 = 2;  // S36-1：条目带 format_ver
+// S36-4：v2 布局 + 头部 flags 字节（bit0 = level_b——「由挂钩在线的
+// Level B 写者维护，run 内位置字段可信」的模式戳；Level B 开启对未带戳
+// 的目录必须全量重建起步，Level A 写者 open 时清戳）。
+inline constexpr std::uint32_t kManifestVersion3 = 3;
 inline constexpr char kManifestName[] = "kv.oki.manifest";
 
 // flags 位。v1 只认 bit0；v2 认 bit0|bit1；其余位保留，读端遇未知位
@@ -99,6 +110,83 @@ enum class OkiError {
                                           std::uint64_t gen);
 // `<dir>/kv.oki.manifest`
 [[nodiscard]] std::string mk_manifest_filename(std::string_view dir);
+
+// ---------------------------------------------------------------------------
+// S36-3：块 LRU 缓存（设计 §2/§5.1——冷点查的热块驻留）。
+//
+// key = (run gen, 块下标)。gen 由 manifest 单调分配、永不重用 ⟹ 缓存条目
+// 跨 run 删除/重开天然无别名（旧 gen 条目只是等 LRU 淘汰或 purge 的死重）。
+// 分片小锁（**独立锁域，不进 keydir 锁序链**——设计 §9）；块 shared_ptr
+// 共享所有权，读者拿到后锁外解码，淘汰不影响在途读者。
+// 线程模型：全方法线程安全；loader 在锁外执行（IO 不占锁），并发同块
+// double-load 允许（后到者复用先到者已插入的块）。
+// ---------------------------------------------------------------------------
+class OkiBlockCache {
+public:
+    using Block = std::shared_ptr<const std::vector<std::byte>>;
+
+    explicit OkiBlockCache(std::size_t capacity_bytes) noexcept
+        : shard_cap_(capacity_bytes / kShards) {}
+
+    // 命中返回块并升温；miss 调 loader 装载 + 插入（loader 返回 nullopt =
+    // IO 失败，不入缓存，本调用返回 nullopt）。
+    [[nodiscard]] std::optional<Block> get_or_load(
+        std::uint64_t gen, std::uint64_t block_idx,
+        const std::function<std::optional<std::vector<std::byte>>()>& loader);
+
+    // 丢弃 gen 不在 keep 集里的全部条目（compact/rebuild 删旧 run 后调，
+    // 免死重占位）。
+    void purge_except(std::span<const std::uint64_t> keep_gens);
+
+    // 测试/bench：重设容量（0 = 关缓存）；顺带清空。
+    void reset_capacity(std::size_t capacity_bytes);
+
+    struct Stats {
+        std::uint64_t hits = 0;
+        std::uint64_t misses = 0;
+        std::uint64_t bytes = 0;   // 当前驻留字节
+        std::uint64_t blocks = 0;  // 当前驻留块数
+    };
+    [[nodiscard]] Stats stats() const;
+
+private:
+    static constexpr std::size_t kShards = 16;
+    struct Key {
+        std::uint64_t gen = 0;
+        std::uint64_t idx = 0;
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& k) const noexcept {
+            // splitmix 风格混合（gen/idx 都是小整数，直接异或会碰撞成灾）。
+            std::uint64_t x = k.gen * 0x9E3779B97F4A7C15ull ^ k.idx;
+            x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 27;
+            return static_cast<std::size_t>(x);
+        }
+    };
+    struct Node {
+        Key key;
+        Block block;
+    };
+    struct Shard {
+        std::mutex mu;
+        std::list<Node> lru;  // front = 最新
+        std::unordered_map<Key, std::list<Node>::iterator, KeyHash> map;
+        std::size_t bytes = 0;
+    };
+    [[nodiscard]] Shard& shard_for(const Key& k) noexcept {
+        return shards_[KeyHash{}(k) % kShards];
+    }
+    void evict_over_cap_locked(Shard& sh) noexcept;
+
+    mutable std::array<Shard, kShards> shards_;
+    std::atomic<std::size_t> shard_cap_;  // reset_capacity 并发安全
+    std::atomic<std::uint64_t> hits_{0};
+    std::atomic<std::uint64_t> misses_{0};
+};
+
+// S36-3：块缓存默认容量（设计 §2 预算表；S36-4/6 时经 CaskOptions 透出）。
+inline constexpr std::size_t kDefaultBlockCacheBytes = 256u << 20;
 
 // ---------------------------------------------------------------------------
 // Writer：key 严格升序 add，finish 时写索引 + trailer 并原子 rename 就位
@@ -206,10 +294,19 @@ public:
         friend class OkiRunReader;
         explicit Cursor(const OkiRunReader* r) : r_(r) {}
         [[nodiscard]] std::expected<bool, OkiError> load_block(std::size_t bi);
+        // 当前块字节（缓存块或自有缓冲）。
+        [[nodiscard]] std::span<const std::byte> block_span() const noexcept {
+            return blk_hold_ ? std::span<const std::byte>(*blk_hold_)
+                             : std::span<const std::byte>(blk_);
+        }
 
         const OkiRunReader* r_ = nullptr;
         std::size_t   bi_ = 0;       // 下一个待载入的块下标（已载则为当前+1）
-        std::vector<std::byte> blk_; // 当前块数据
+        std::vector<std::byte> blk_; // 当前块数据（无缓存路径）
+        // S36-3：块缓存路径——持共享块所有权，blk_ 不用。
+        OkiBlockCache* cache_ = nullptr;
+        std::uint64_t  cache_gen_ = 0;
+        OkiBlockCache::Block blk_hold_;
         std::size_t   pos_ = 0;      // 块内游标
         bool          block_loaded_ = false;
         std::string   prev_key_;     // 块内差分状态
@@ -223,6 +320,14 @@ public:
     [[nodiscard]] std::expected<Cursor, OkiError>
     seek(std::span<const std::byte> lo) const;
 
+    // S36-3：点查——稀疏索引二分定位块 → 块经 cache 取（nullptr = 直接
+    // pread）→ 块内线性扫。命中返回行；不存在返回空 optional（caller 先过
+    // bloom，此处的空 = bloom 假阳性或真缺席）。cache_gen = 本 run 的
+    // manifest gen（缓存 key 的一半；gen 永不重用 ⟹ 无别名）。
+    [[nodiscard]] std::expected<std::optional<Entry>, OkiError>
+    find(std::span<const std::byte> key, OkiBlockCache* cache = nullptr,
+         std::uint64_t cache_gen = 0) const;
+
     [[nodiscard]] std::uint64_t entry_count() const noexcept {
         return entry_count_;
     }
@@ -235,6 +340,11 @@ public:
 
 private:
     OkiRunReader() = default;
+
+    // seek 本体（S36-3：带可选块缓存——seek()/find() 共用一份定位逻辑）。
+    [[nodiscard]] std::expected<Cursor, OkiError>
+    seek_impl(std::span<const std::byte> lo, OkiBlockCache* cache,
+              std::uint64_t cache_gen) const;
 
     struct BlockRef {
         std::string   first_key;
@@ -331,6 +441,8 @@ struct OkiManifest {
     // 收 ord ≥ wm 的行）。排他语义是刻意的：alloc_ord 首个 LSN 为 0，
     // 含上界表示不了「已覆盖 ord 0」与「什么都没覆盖」的区别。
     std::uint64_t wm = 0;
+    // S36-4：Level B 模式戳（BCOM v3；见 kManifestVersion3 注释）。
+    bool level_b = false;
 };
 
 // 唯一 commit point：atomic_write_bytes(fsync_dir=true)。

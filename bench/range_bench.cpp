@@ -13,11 +13,13 @@
 #include <benchmark/benchmark.h>
 
 #include <unistd.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -378,3 +380,85 @@ static void BM_KeyDir_MemProbe(benchmark::State& state) {
     cask.close();
 }
 BENCHMARK(BM_KeyDir_MemProbe)->Arg(100000)->Unit(benchmark::kMillisecond);
+
+// ============================================================================
+// S36-3：冷/热 get 锚点（设计 §2 预算门：热 ≤3%、冷 P99 ≤300µs SSD；
+// 本机 /tmp = tmpfs，另立 tmpfs 锚点）。
+// ============================================================================
+
+namespace {
+
+// 共享装配：100k key（"g%06d"，11B 内）× 64B 值 → checkpoint 固化 v2 run。
+// 返回打开的 Cask；caller 决定是否逐出。
+std::unique_ptr<Cask> setup_get_bench_cask(const TempDir& td, int nkeys) {
+    CaskOptions o;
+    o.read_write = true;
+    auto c = Cask::open(td.path(), o, &test_registry());
+    if (!c) return nullptr;
+    const std::string value(64, 'v');
+    for (int i = 0; i < nkeys; ++i) {
+        char kb[16];
+        std::snprintf(kb, sizeof(kb), "g%06d", i);
+        if (!(*c)->put(as_bytes(std::string(kb)), as_bytes(value), 1000)) {
+            return nullptr;
+        }
+    }
+    if (!(*c)->checkpoint()) return nullptr;  // OKI flush → v2 run
+    return std::move(*c);
+}
+
+}  // namespace
+
+// （热 get 锚点复用 cask_bench.cpp 既有 BM_Cask_Get_Hot(_View)——S36-3
+// 回归门 ≤3% 以它 A/B。）
+
+// 冷 get：全部 key 逐出，get 走组合视图（memdelta miss → run bloom/稀疏
+// 索引二分 → 块读 → 值 pread）。轮转 100k key ⟹ 4096 槽频度门指纹恒被
+// 冲刷 → 几乎零回填，哈希持续冷（这正是门的设计行为：扫描型负载不污染
+// 缓存）。arg1: 0 = 块缓存关（真·每次 2 pread），1 = 默认 256MB 块缓存
+// （100k×64B 库的 run 块全驻留 → 稳态块零 IO，只剩值 pread）。
+// counters: p50/p99（µs，样本 = 每次 get 的墙钟）。
+static void BM_Cask_Get_ColdOki(benchmark::State& state) {
+    const int nkeys = static_cast<int>(state.range(0));
+    const bool block_cache = state.range(1) != 0;
+    TempDir td;
+    auto c = setup_get_bench_cask(td, nkeys);
+    if (!c) { state.SkipWithError("setup failed"); return; }
+    auto& kd = c->keydir();
+    kd.oki().enable_point_query();  // Level B 点查（不开影子——bench 纯净）
+    kd.oki().reset_block_cache_capacity(block_cache ? (256u << 20) : 0);
+    for (int i = 0; i < nkeys; ++i) {
+        char kb[16];
+        std::snprintf(kb, sizeof(kb), "g%06d", i);
+        if (!kd.evict(std::string_view(kb))) {
+            state.SkipWithError("evict failed");
+            return;
+        }
+    }
+
+    std::vector<double> samples_us;
+    samples_us.reserve(1u << 20);
+    std::size_t i = 0;
+    for (auto _ : state) {
+        char kb[16];
+        std::snprintf(kb, sizeof(kb), "g%06zu",
+                      i++ % static_cast<std::size_t>(nkeys));
+        const auto t0 = std::chrono::steady_clock::now();
+        auto g = c->get(as_bytes(std::string(kb)));
+        const auto t1 = std::chrono::steady_clock::now();
+        if (!g) { state.SkipWithError("cold get failed"); break; }
+        benchmark::DoNotOptimize(g->value.data());
+        samples_us.push_back(
+            std::chrono::duration<double, std::micro>(t1 - t0).count());
+    }
+    if (!samples_us.empty()) {
+        std::sort(samples_us.begin(), samples_us.end());
+        state.counters["p50_us"] = samples_us[samples_us.size() / 2];
+        state.counters["p99_us"] = samples_us[samples_us.size() * 99 / 100];
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()));
+    c->close();
+}
+BENCHMARK(BM_Cask_Get_ColdOki)
+    ->Args({100000, 0})
+    ->Args({100000, 1});

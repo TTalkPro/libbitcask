@@ -799,6 +799,7 @@ void Cask::write_keydir_snapshot() noexcept {
 // 已持有），代价有界且罕见；与 checkpoint 侧 flush 由 OkiState 内部
 // flush_mu_ 互斥。
 void Cask::maybe_flush_oki() noexcept {
+    if (!keydir_) return;  // S36-4：close 竞态（组提交尾/锁外站点可达）
     auto& oki = keydir_->oki();
     if (oki.loaded() && oki.should_flush()) {
         if (!oki.flush(dirname_)) {
@@ -1181,8 +1182,18 @@ void Cask::process_gc_batch_locked() {
     // 积累 ~N-1 条 → 每 pwrite 合并 ~N 条。
     for (;;) {
         process_one_gc_round_locked();
-        std::lock_guard<std::mutex> g(gc_mu_);
-        if (gc_queue_.empty()) return;
+        {
+            std::lock_guard<std::mutex> g(gc_mu_);
+            if (!gc_queue_.empty()) continue;
+        }
+        // S36-4 修（S29-7 组提交引入时的漏接，S36-4 100M 探针抓获）：
+        // memdelta 阈值 flush 原来只挂在 persist_record 旧路径上——组提交
+        // 成为 put 主路径后阈值检查全程失联，纯 KV 长写负载（无
+        // checkpoint 搭车点）memdelta 无界增长（实测 10M put 时 790MB、
+        // runs=0）。leader 批间检查一次（write_mu_ 已持有，与
+        // persist_record 站点同款纪律）。
+        maybe_flush_oki();
+        return;
     }
 }
 
@@ -1388,7 +1399,12 @@ Cask::get(std::span<const std::byte> key) {
     // 读者），read_file lazy open 得 ENOENT。此时 keydir 已指向新文件——
     // 重查 keydir 重试一次必命中；重试仍失败才是真 I/O 错误。
     for (int attempt = 0; ; ++attempt) {
-    auto entry = keydir_->get(bytes_to_view(key));
+    // S36-3：点查改走统一 locate 原语（设计 §5.1/§5.2）——缓存命中即现状
+    // 路径；缓存 miss（Level B 逐出态）落组合视图（memdelta → run bloom/
+    // seek + 块 LRU），命中经二次命中门回填升温。点查关（Level A 现状）
+    // 时 locate ≡ 哈希 get，行为逐字节相同。S13-F5 重试对冷路径同样成立：
+    // 重查 locate 会拿到 merge 搬迁行的新位置。
+    auto entry = keydir_->locate(bytes_to_view(key), /*warm_fill=*/true);
     if (!entry) return std::unexpected(err(CaskError::kNotFound));
 
     if (opts_.expiry_secs > 0) {
@@ -1879,6 +1895,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
     wlk.unlock();  // H1：常规路径的 Add 全部在锁外提交
     flush_adds();
     maybe_submit_auto_checkpoint();  // S14-1（锁外）
+    maybe_flush_oki();  // S36-4：memdelta 阈值（无锁 hint 探询）
     if (!gc) return std::unexpected(gc.error());
     return {};
 }
@@ -2122,6 +2139,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
     wlk.unlock();
     flush_tasks();
     maybe_submit_auto_checkpoint();  // S14-1（锁外）
+    maybe_flush_oki();  // S36-4：memdelta 阈值（无锁 hint 探询）
     if (!gc) return std::unexpected(gc.error());
     return {};
 }
@@ -2145,7 +2163,8 @@ Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
     std::span<const std::byte> tomb_value;
     std::uint8_t shadow_le[4] = {0};
     if (opts_.tombstone_version == 2) {
-        if (auto entry = keydir_->get(bytes_to_view(key))) {
+        // S36-3：走 locate——逐出态下 shadow file_id 仍能从组合视图取到。
+        if (auto entry = keydir_->locate(bytes_to_view(key))) {
             if (entry->file_id != 0) {
                 shadow_le[0] = static_cast<std::uint8_t>( entry->file_id        & 0xFF);
                 shadow_le[1] = static_cast<std::uint8_t>((entry->file_id >>  8) & 0xFF);
@@ -2189,6 +2208,7 @@ Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
             IndexOp::Delete, bytes_to_view(key), ord, {}, 0, 0, 0, tstamp, 0));
     }
     maybe_submit_auto_checkpoint();  // S14-1（锁外）
+    maybe_flush_oki();  // S36-4：memdelta 阈值（无锁 hint 探询）
     if (!gc) return std::unexpected(gc.error());
     return {};
 }
@@ -2307,6 +2327,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     task.meta.assign(doc.meta.begin(), doc.meta.end());
     submit_index_task(std::move(task));
     maybe_submit_auto_checkpoint();  // S14-1（锁外）
+    maybe_flush_oki();  // S36-4：memdelta 阈值（无锁 hint 探询）
     if (req.post_err) return std::unexpected(*req.post_err);  // 旧组提交语义
     return {};
 }

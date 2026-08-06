@@ -154,6 +154,23 @@ public:
         return point_query_.load(std::memory_order_acquire);
     }
 
+    // ---- S36-4：Level B 模式戳（BCOM v3）----
+    // set_level_b：声明本写者的模式（Cask::open 在 load 之前调）。此后
+    // flush/compact/rebuild 提交的 manifest 都带（或不带）level_b 戳。
+    // manifest_level_b：**盘上** manifest 的戳（load/commit 时更新）——
+    // Level B 开启对未带戳的目录必须全量重建起步（关门期间的 merge 会让
+    // run loc 陈旧）；Level A 写者 open 时经 stamp_mode 清戳。
+    void set_level_b(bool on) noexcept {
+        level_b_.store(on, std::memory_order_release);
+    }
+    [[nodiscard]] bool manifest_level_b() const noexcept {
+        return manifest_level_b_.load(std::memory_order_acquire);
+    }
+    // 降级戳：level_b 关而盘上戳开 → 立刻改写 manifest 清戳（Level A 写者
+    // 将做无挂钩 merge，戳必须先失效——open 早期、任何 merge 之前调用）。
+    // 升级（关→开）不走此路（必须经 rebuild，戳随重建的 manifest 落盘）。
+    void stamp_mode(std::string_view dir);
+
     // S36-3：块 LRU 诊断/调参（测试与 bench；生产选项透出排 S36-6）。
     [[nodiscard]] OkiBlockCache::Stats block_cache_stats() const {
         return block_cache_.stats();
@@ -231,6 +248,10 @@ private:
     std::atomic<bool> loaded_{false};
     std::atomic<std::uint64_t> wm_{0};
     std::atomic<bool> flush_hint_{false};
+
+    // S36-4：本写者模式 / 盘上 manifest 戳（见 set_level_b 注释）。
+    std::atomic<bool> level_b_{false};
+    std::atomic<bool> manifest_level_b_{false};
 
     // S36-3：块 LRU（(gen, 块下标) → 块字节；独立锁域，不进任何既有锁序）。
     // mutable：locate 是 const 语义的读，缓存升温/装载是它的内部副作用。

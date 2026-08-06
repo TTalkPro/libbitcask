@@ -632,20 +632,85 @@ run 的 finish 才带 fsync_dir）。未提交。
   oki_range_test 惯例在 TSan 下关乐观读快路径，未新增豁免）|
   build-rel 全树零新告警。未提交。
 
-### S36-4 — 逐出 + 快照三元组 + BCKS v4 🔴 HIGH
+### ✅ S36-4 — 逐出 + 快照三元组 + BCKS v4 🔴 HIGH
 
-- [ ] CLOCK 逐出 + `CaskOptions::keydir_cache_entries`（0=不限=现状，
-      默认 0 opt-in）；MultiEntry 不可逐；逻辑计数与 fstats 校准
-- [ ] **（S36-2 立的硬要求）Level B 开启必须以全量重建起步**：搬迁/TTL
-      挂钩门在点查开启上，关门期间（含 S36-2 之前）的 run loc 可能陈旧，
-      不可直接采信既有 manifest
-- [ ] **（S36-3 立的硬要求）CLOCK 逐出必须继承 `KeyDir::evict` 的挂钩
-      静止前置**（oki_hooks_in_flight_==0；违反 = 冷读者回填旧行的静默
-      回滚，S36-3 并发实证）；全局计数在持续写压下会饿死逐出——届时评估
-      改 per-shard 计数
-- [ ] CaskIter/parallel_scan 快照 = 缓存屏障 + delta 拷贝 + manifest pin
-- [ ] kv.keydir.ckpt v4（缓存子集语义；Level B 关闭时仍写 v3）
-- **验收**：100M 档 RSS ≤1.5GB 实测；快照一致性 stress
+- [x] 采样逐出（计划的 CLOCK 有据偏离，见落地记录）+
+      `CaskOptions::keydir_cache_entries`（0=不限=现状，默认 0 opt-in）；
+      MultiEntry 不可逐；逻辑计数与 fstats 校准（冷视图记账）
+- [x] **（S36-2 立的硬要求）Level B 开启必须以全量重建起步**：BCOM v3
+      level_b 模式戳落地——未带戳不采信，重建后带戳；Level A 写者 open
+      清戳；merge_only 旁车 × Level B 目录 open 拒绝
+- [x] **（S36-3 立的硬要求）逐出安全前置**：挂钩静止前置升级为**挂钩
+      入锁**（点查开启时 put/remove 的 OKI append 在分片锁内完成——
+      「哈希可见 ⟺ 已入组合视图」在锁边界成立，插入路径的采样逐出对任意
+      驻留条目恒安全，饿死问题一并消失）
+- [x] CaskIter/parallel_scan 快照 = 缓存屏障 + delta 拷贝 + manifest pin
+      （IterHandle 冷枚举三元组）
+- [x] kv.keydir.ckpt v4（缓存子集语义；Level B 关闭时仍写 v3）
+- **验收**：✅ 100M 档 RSS ≤1.5GB 实测（数字见落地记录）；快照一致性
+  stress（并发 fold × 写者 × 自动逐出）
+
+#### ✅ S36-4 落地记录（2026-08-06）
+
+落点：keydir（预算/采样逐出/冷记账/挂钩入锁/IterHandle 冷枚举/BCKS v4）、
+oki_run+oki_state（BCOM v3 模式戳）、cask（选项 + open 协议 + 组提交
+阈值 flush 修复）+ `tests/oki_levelb_test.cpp` 7 用例。要点：
+
+- **挂钩入锁（本期的结构性决定）**：点查开启时 put/remove 的 OKI append
+  改在分片锁内执行（remove 经 HookAtExit 作用域守卫覆盖全部出口；oki
+  内部锁是叶子，锁序无环）。S36-3 的「在途窗口」从根上消失 ⟹ 插入路径
+  的采样逐出无需任何静止检查；Level A 维持锁外挂钩（热路径零变化）。
+- **逐出 = 分片内采样**（对设计 CLOCK 的**有据偏离**）：CLOCK ref-bit 要
+  读侧写痕迹，与 seqlock 乐观读冲突（读者不能碰缓存行）——改为 clock
+  游标起采 ≤8 个可逐条目、逐 epoch 最旧者（近似 LRU-by-write/fill）；
+  读热 key 被误逐由 S36-3 二次命中回填自愈。fold 活跃暂停逐出（key 集
+  不变量）；预算是软目标。
+- **D4 计数校准（冷视图记账）**：Level B 下哈希 miss ≠ 新 key/不存在——
+  put_insert 纯 miss 与 remove miss 都问冷视图：命中活行 → 覆盖/真删除
+  记账（fstats 老位置退账、key_count 精确）；并顺手立起 **Level B 版
+  LWW/复活门**（冷侧 ord 更新即拒收——恢复期重放旧行落在被逐 key 上不
+  复活，S33-B1 的组合视图延伸）。测试断言逐出态下 key_count/fstats
+  live 总和全程精确。
+- **fold 三元组**：IterHandle 在预算开启/发生过逐出时改走冷枚举——屏障
+  内捕获 OKI 读视图（runs pin + delta 拷贝；挂钩入锁 + 写者出清 ⟹ 视图
+  ⊇ 哈希活 key 且与 iter_epoch 同刻），k 路归并出 key、逐 key 分片锁内
+  哈希裁决（缓存命中 = 权威 + epoch 快照语义）。CaskIter/parallel_scan/
+  drain_live_keys 全自动继承；run 读错经 `cold_error()` 上浮（next 无错误
+  通道的补口）。输出序变为 key 升序（fold 从未承诺顺序）。
+- **BCOM v3**：v2 布局 + 头部 flags 字节（bit0 = level_b 模式戳；未知位
+  fail-fast）。戳语义 = 「run loc 由挂钩在线的写者维护，可信」：Level B
+  开启对未带戳目录**全量重建起步**；Level A 写者 open 即清戳（stamp_mode，
+  仅降级）；merge_only 旁车对带戳目录 open 拒绝（其无挂钩搬迁会静默腐蚀
+  组合视图）。字节级测试含 CRC 修补后的未知位单独验证。
+- **BCKS v4**：payload 与 v3 逐字节同构，语义 = 缓存子集 + 逻辑计数。
+  接受条件（load_snapshot 内 gating）：Level B 意图 + 带戳 manifest +
+  快照 next_ord ≤ oki wm（缺席条目可由组合视图兜底）；其余拒收 → 全量
+  fold（把子集当全量 = 静默丢 key）。Level B 关闭恒写 v3。信任链就位后
+  恢复期即启点查（tail 重放的冷记账/挂钩入锁生效）。
+- **顺手修（S29-7 遗留，100M 探针抓获）**：memdelta 阈值 flush 只挂在
+  persist_record 旧路径——组提交成为 put 主路径后阈值检查失联，纯 KV 长
+  写负载（无 ckpt 搭车点）memdelta 无界（实测 10M put 时 790MB、0 run）。
+  组提交 leader 批间 + put_batch/put_batch_atomic/remove/put_doc 尾部
+  补探询（无锁 hint）；顺带修 close 竞态空判。**Level A 也受益**。
+- **TSan 新增豁免一条**（锁序型，窄匹配）：`deadlock:KeyDir::
+  apply_pending_to_entries_barrier`——屏障 v2 文档化例外②（release 阶段
+  二 meta_shared→shard）与热路径 shard→meta 在 TSan 锁序图成环；实际无
+  环论证在 keydir.hpp 文件头（该方向仅屏障内存在，写者已出清）。路径自
+  S2 既有，S36-4 的 Level B 并发 fold 测试首次稳定踩到。race 检测不受
+  此条影响。
+- **100M 档 RSS 实测**（tmpfs，`doc:<n>` 11-12B key × 16B 值，预算 5M）：
+  加载 1 亿 key 全程 RSS 平稳，**峰值 1141MB**（13.3 分钟，key_count
+  精确 = 1 亿）；close 后重开（BCOM v3 戳 + BCKS v4 子集快照）**~1 秒**
+  完成、RSS **800MB**、计数保真、抽查冷 get 全过——**≤1.5GB 门达成**
+  （对照 S33-7 全内存实测 11GB，**-90%**，设计 §2 预算表命中）。10M 档：
+  加载 1026MB / malloc_trim 后 737MB / 重开 716MB。探针
+  scratchpad `levelb_rss_probe.cpp`。
+- **Level A 回归**：Cask put 1228-1247ns（基线 1244，噪声内）、hot get
+  848ns（基线 977-1063）、merge 19.3ms（基线 20.4-21.4）——全部零回归；
+  KeyDir put 微基准 70.6ns（S36 累计 +5%，预算口径为 Cask 全路径，达标）。
+- **验收**：Debug 全量 **722/722**（715 + 7 新增）| **ASan 全量
+  722/722** | **TSan 并发套件 193/193**（含新增锁序豁免一条，见上）|
+  build-rel 双树零错误（CaskOptions 公共结构体变更）。未提交。
 
 ### S36-5 — merge 组合视图 + 崩溃注入 + B1 收口 🔴 HIGH
 

@@ -13,3 +13,12 @@ race:*tbb*
 # （真并发），写者走 CoW 克隆、不触碰共享对象，不产生本报告形状。
 # 以 phrase/near 读者帧兜底（add_doc 写-写等其它 race 不受影响）。
 race:bitcask::bm25::InvertedIndex::search_phrase_impl
+
+# S36-4：屏障 v2 的文档化锁序例外②（keydir.hpp 文件头无环论证）——iter
+# release 阶段二在 meta shared 持有期间嵌套分片锁（meta→shard），与热路径
+# 的 shard→meta shared 构成 TSan 视角的锁序环。实际无环：该方向仅存在于
+# 写者闸门屏障内（写者已出清；读者对 meta 只拿 shared，shared-shared 相容
+# 且无 unique 排队者，meta 获取不可能阻塞）。TSan 的锁序图不建模屏障协议。
+# 触发面：fold 活跃 + 新 key 写入（pending 非空）+ release 与并发读者交错
+# ——S36-4 的 Level B 并发 fold 测试首次稳定踩到（路径自 S2 起既有）。
+deadlock:bitcask::keydir::KeyDir::apply_pending_to_entries_barrier

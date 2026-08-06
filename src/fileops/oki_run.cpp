@@ -410,14 +410,118 @@ bool OkiRunReader::may_contain(std::span<const std::byte> key) const noexcept {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// S36-3：块 LRU 缓存
+// ---------------------------------------------------------------------------
+
+std::optional<OkiBlockCache::Block> OkiBlockCache::get_or_load(
+    std::uint64_t gen, std::uint64_t block_idx,
+    const std::function<std::optional<std::vector<std::byte>>()>& loader) {
+    const Key k{gen, block_idx};
+    Shard& sh = shard_for(k);
+    {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        auto it = sh.map.find(k);
+        if (it != sh.map.end()) {
+            sh.lru.splice(sh.lru.begin(), sh.lru, it->second);  // 升温
+            hits_.fetch_add(1, std::memory_order_relaxed);
+            return it->second->block;
+        }
+    }
+    misses_.fetch_add(1, std::memory_order_relaxed);
+    auto bytes = loader();  // IO 在锁外
+    if (!bytes) return std::nullopt;
+    auto block = std::make_shared<const std::vector<std::byte>>(
+        *std::move(bytes));
+    if (shard_cap_.load(std::memory_order_relaxed) == 0) return block;  // 缓存关
+    {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        auto it = sh.map.find(k);
+        if (it != sh.map.end()) return it->second->block;  // 并发 double-load
+        sh.lru.push_front(Node{k, block});
+        sh.map.emplace(k, sh.lru.begin());
+        sh.bytes += block->size();
+        evict_over_cap_locked(sh);
+    }
+    return block;
+}
+
+void OkiBlockCache::evict_over_cap_locked(Shard& sh) noexcept {
+    const std::size_t cap = shard_cap_.load(std::memory_order_relaxed);
+    while (sh.bytes > cap && !sh.lru.empty()) {
+        const Node& victim = sh.lru.back();
+        sh.bytes -= victim.block->size();
+        sh.map.erase(victim.key);
+        sh.lru.pop_back();
+    }
+}
+
+void OkiBlockCache::purge_except(std::span<const std::uint64_t> keep_gens) {
+    for (auto& sh : shards_) {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        for (auto it = sh.lru.begin(); it != sh.lru.end();) {
+            const bool keep = std::find(keep_gens.begin(), keep_gens.end(),
+                                        it->key.gen) != keep_gens.end();
+            if (keep) {
+                ++it;
+                continue;
+            }
+            sh.bytes -= it->block->size();
+            sh.map.erase(it->key);
+            it = sh.lru.erase(it);
+        }
+    }
+}
+
+void OkiBlockCache::reset_capacity(std::size_t capacity_bytes) {
+    shard_cap_.store(capacity_bytes / kShards, std::memory_order_relaxed);
+    for (auto& sh : shards_) {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        sh.lru.clear();
+        sh.map.clear();
+        sh.bytes = 0;
+    }
+}
+
+OkiBlockCache::Stats OkiBlockCache::stats() const {
+    Stats s;
+    s.hits = hits_.load(std::memory_order_relaxed);
+    s.misses = misses_.load(std::memory_order_relaxed);
+    for (auto& sh : shards_) {
+        std::lock_guard<std::mutex> lk(sh.mu);
+        s.bytes += sh.bytes;
+        s.blocks += sh.lru.size();
+    }
+    return s;
+}
+
 std::expected<bool, OkiError>
 OkiRunReader::Cursor::load_block(std::size_t bi) {
     const auto& b = r_->blocks_[bi];
     const std::size_t len = static_cast<std::size_t>(b.end - b.off);
-    blk_.resize(len);
-    auto got = r_->file_.pread_into(b.off, std::span(blk_.data(), len));
-    if (!got) return std::unexpected(OkiError::kIo);
-    if (*got != len) return std::unexpected(OkiError::kCorrupt);
+    if (cache_ != nullptr) {
+        // S36-3：块缓存路径——命中零 IO，miss 时 loader pread（锁外）。
+        auto blk = cache_->get_or_load(
+            cache_gen_, bi,
+            [&]() -> std::optional<std::vector<std::byte>> {
+                std::vector<std::byte> buf(len);
+                auto got = r_->file_.pread_into(b.off,
+                                                std::span(buf.data(), len));
+                if (!got || *got != len) return std::nullopt;
+                return buf;
+            });
+        if (!blk) return std::unexpected(OkiError::kIo);
+        if ((*blk)->size() != len) {
+            return std::unexpected(OkiError::kCorrupt);  // 防御（gen 不重用）
+        }
+        blk_hold_ = *std::move(blk);
+    } else {
+        blk_hold_.reset();
+        blk_.resize(len);
+        auto got = r_->file_.pread_into(b.off, std::span(blk_.data(), len));
+        if (!got) return std::unexpected(OkiError::kIo);
+        if (*got != len) return std::unexpected(OkiError::kCorrupt);
+    }
     pos_ = 0;
     prev_key_.clear();
     prev_ord_ = 0;
@@ -433,13 +537,13 @@ std::expected<bool, OkiError> OkiRunReader::Cursor::next(Entry& out) {
         return true;
     }
     while (true) {
-        if (!block_loaded_ || pos_ >= blk_.size()) {
+        if (!block_loaded_ || pos_ >= block_span().size()) {
             if (bi_ >= r_->blocks_.size()) return false;  // run 末尾
             auto l = load_block(bi_++);
             if (!l) return std::unexpected(l.error());
         }
         // 解一条（CRC 已过——结构错误仍防御性 fail-fast）。
-        std::span<const std::byte> b(blk_);
+        const std::span<const std::byte> b = block_span();
         auto shared = codec::vbyte_read_checked(b, pos_);
         if (!shared) return std::unexpected(OkiError::kCorrupt);
         auto sfx = codec::vbyte_read_checked(b, shared->second);
@@ -503,7 +607,15 @@ std::expected<bool, OkiError> OkiRunReader::Cursor::next(Entry& out) {
 
 std::expected<OkiRunReader::Cursor, OkiError>
 OkiRunReader::seek(std::span<const std::byte> lo) const {
+    return seek_impl(lo, /*cache=*/nullptr, /*cache_gen=*/0);
+}
+
+std::expected<OkiRunReader::Cursor, OkiError>
+OkiRunReader::seek_impl(std::span<const std::byte> lo, OkiBlockCache* cache,
+                        std::uint64_t cache_gen) const {
     Cursor c(this);
+    c.cache_ = cache;
+    c.cache_gen_ = cache_gen;
     if (lo.empty() || blocks_.empty()) return c;
     const std::string_view lov = sv(lo);
     // 最后一个 first_key ≤ lo 的块（全部 > lo 则从块 0 起）。
@@ -526,6 +638,22 @@ OkiRunReader::seek(std::span<const std::byte> lo) const {
             return c;
         }
     }
+}
+
+std::expected<std::optional<OkiRunReader::Entry>, OkiError>
+OkiRunReader::find(std::span<const std::byte> key, OkiBlockCache* cache,
+                   std::uint64_t cache_gen) const {
+    // seek 定位（首个 ≥ key）→ 首行等值比对。run 内同 key 至多一行
+    //（flush/compact/外排都做同 key 去重），单行不跨块——命中必在首行。
+    auto c = seek_impl(key, cache, cache_gen);
+    if (!c) return std::unexpected(c.error());
+    Entry e;
+    auto n = c->next(e);
+    if (!n) return std::unexpected(n.error());
+    if (*n && std::string_view(e.key) == sv(key)) {
+        return std::optional<Entry>(std::move(e));
+    }
+    return std::optional<Entry>{};  // 缺席（或 bloom 假阳性）
 }
 
 // ---------------------------------------------------------------------------
@@ -749,12 +877,14 @@ SpillingRunBuilder::finish(bool fsync_dir) {
 bool write_manifest(std::string_view dir, const OkiManifest& m) {
     // S36-1 惰性版本：全 v1 run → BCOM v1（字节不变，老读端可读）；
     // 含 v2 run → BCOM v2（条目多 1 字节 format_ver；老读端拒收 → 重建自愈）。
-    bool any_v2 = false;
+    // S36-4：level_b（Level B 写者维护中——run loc 可信）→ BCOM v3
+    //（v2 布局 + 头部 1 字节 flags；老读端拒收自愈）。
+    bool any_v2 = m.level_b;  // v3 恒带 format_ver 字节
     for (const auto& r : m.runs) {
         if (r.format_ver != 1) any_v2 = true;
     }
     std::vector<std::byte> buf;
-    buf.reserve(24 + m.runs.size() * 17 + 16);
+    buf.reserve(25 + m.runs.size() * 17 + 16);
     auto put_u32 = [&](std::uint32_t v) {
         std::byte b[4];
         le_store_u32(b, v);
@@ -766,7 +896,9 @@ bool write_manifest(std::string_view dir, const OkiManifest& m) {
         buf.insert(buf.end(), b, b + 8);
     };
     put_u32(kManifestMagic);
-    put_u32(any_v2 ? kManifestVersion2 : kManifestVersion);
+    put_u32(m.level_b ? kManifestVersion3
+                      : (any_v2 ? kManifestVersion2 : kManifestVersion));
+    if (m.level_b) buf.push_back(std::byte{0x01});  // flags: bit0 = level_b
     put_u32(static_cast<std::uint32_t>(m.runs.size()));
     for (const auto& r : m.runs) {
         put_u64(r.gen);
@@ -792,28 +924,38 @@ std::optional<OkiManifest> read_manifest(std::string_view dir) {
         return std::nullopt;
     }
     const std::uint32_t ver = le_load_u32(b.data() + 4);
-    if (ver != kManifestVersion && ver != kManifestVersion2) {
+    if (ver != kManifestVersion && ver != kManifestVersion2 &&
+        ver != kManifestVersion3) {
         return std::nullopt;
     }
-    const std::size_t entry_len = ver == kManifestVersion2 ? 17 : 16;
+    const bool has_entry_ver = ver >= kManifestVersion2;
+    const std::size_t entry_len = has_entry_ver ? 17 : 16;
     const std::uint32_t stored_crc = le_load_u32(b.data() + b.size() - 8);
     if (stored_crc !=
         codec::crc32(std::span<const std::byte>(b.data(), b.size() - 8))) {
         return std::nullopt;
     }
-    const std::uint32_t count = le_load_u32(b.data() + 8);
-    if (b.size() != 12 + static_cast<std::size_t>(count) * entry_len + 8 + 8) {
+    OkiManifest m;
+    std::size_t pos = 8;
+    if (ver == kManifestVersion3) {  // S36-4：flags 字节
+        if (b.size() < 29) return std::nullopt;
+        const auto flags = static_cast<std::uint8_t>(b[pos]);
+        if ((flags & ~0x01u) != 0) return std::nullopt;  // 未知位 fail-fast
+        m.level_b = (flags & 0x01u) != 0;
+        pos += 1;
+    }
+    const std::uint32_t count = le_load_u32(b.data() + pos);
+    pos += 4;
+    if (b.size() != pos + static_cast<std::size_t>(count) * entry_len + 8 + 8) {
         return std::nullopt;
     }
-    OkiManifest m;
     m.runs.reserve(count);
-    std::size_t pos = 12;
     for (std::uint32_t i = 0; i < count; ++i) {
         OkiManifestEntry e;
         e.gen = le_load_u64(b.data() + pos);
         e.cover_ord = le_load_u64(b.data() + pos + 8);
         pos += 16;
-        if (ver == kManifestVersion2) {
+        if (has_entry_ver) {
             e.format_ver = static_cast<std::uint8_t>(b[pos]);
             pos += 1;
             if (e.format_ver != 1 && e.format_ver != 2) return std::nullopt;

@@ -211,7 +211,31 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
     // S33-4：OKI manifest 先载——wm 就位后，后续 fold/链重放经 keydir
     // put/remove 咽喉点的挂钩自动只收 ord ≥ wm 的 tail 行（零逐点改动）。
     // 缺失/损坏 → 未加载态，收尾 finish_oki_recovery 整体重建。
+    // S36-4 Level B open 协议（设计 §D3/§8 + S36-2/3 立的硬要求）：
+    //   1. 写者先声明模式（此后所有 manifest 提交携带/清除 level_b 戳）；
+    //   2. merge_only 旁车 × Level B 目录互斥（旁车 merge 无挂钩，会静默
+    //      腐蚀组合视图的位置权威）；
+    //   3. Level A 写者立刻清戳（其 merge 同样无挂钩——戳必须先失效）；
+    //   4. 带戳目录 + Level B 意图 → 恢复期即启点查（挂钩入锁 + 冷视图
+    //      计数裁决在 tail 重放期间就位；v4 子集快照亦以此为前提）。
+    const bool level_b_intent = opts_.keydir_cache_entries > 0;
+    keydir_->oki().set_level_b(level_b_intent && opts_.read_write &&
+                               !opts_.merge_only);
     keydir_->oki().load(dirname_);
+    if (opts_.merge_only && keydir_->oki().loaded() &&
+        keydir_->oki().manifest_level_b()) {
+        return std::unexpected(err(
+            CaskError::kIo,
+            "merge_only sidecar cannot open a Level B "
+            "(keydir_cache_entries) maintained directory"));
+    }
+    if (opts_.read_write && !opts_.merge_only) {
+        keydir_->oki().stamp_mode(dirname_);  // 仅降级清戳（升级走重建）
+    }
+    const bool level_b_trusted = level_b_intent &&
+                                 keydir_->oki().loaded() &&
+                                 keydir_->oki().manifest_level_b();
+    if (level_b_trusted) keydir_->oki().enable_point_query();
 
     // P14e:search.ckpt 分段快照快路径。search.ckpt 健康且全段 CRC 通过
     // 时，fold 从 keydir 水位起跳过已覆盖字节；否则全量 fold（各索引自门）。
@@ -631,8 +655,13 @@ void Cask::finish_oki_recovery(bool snap_loaded,
                                std::uint64_t snap_next_ord) noexcept {
     if (!opts_.read_write || opts_.merge_only) return;
     auto& oki = keydir_->oki();
+    const bool level_b = opts_.keydir_cache_entries > 0;
     const bool gap = snap_loaded && oki.wm() < snap_next_ord;
-    if (!oki.loaded() || gap) {
+    // S36-4：Level B 对未带戳的 manifest 必须全量重建起步（S36-2 硬要求：
+    // 关门期间的 merge 会让 run loc 陈旧，不可采信）。此路径下哈希必然
+    // 完整（v4 子集快照的接受前提就是带戳 manifest——未带戳 ⟹ 快照被拒
+    // ⟹ 全量 fold），迭代重建合法。
+    if (!oki.loaded() || gap || (level_b && !oki.manifest_level_b())) {
         std::vector<oki::OkiState::DeltaRow> rows;
         rows.reserve(static_cast<std::size_t>(keydir_->info().key_count));
         auto it = keydir_->make_iter();
@@ -661,6 +690,16 @@ void Cask::finish_oki_recovery(bool snap_loaded,
     // Release（含 build-rel/bench）不开：locate 冷侧有真实 IO 成本。
     if (oki.loaded()) keydir_->set_oki_shadow_check(true);
 #endif
+    // S36-4：Level B 收尾——点查/预算在恢复全部收官后就位。前提 = manifest
+    // 已带戳（重建成功即带；重建失败则戳缺失 → 保持 Level A 形态：全量
+    // 缓存、零逐出——组合视图不可信/不可用时逐出无兜底）。
+    if (level_b && oki.loaded() && oki.manifest_level_b()) {
+        oki.enable_point_query();
+        keydir_->set_cache_budget(opts_.keydir_cache_entries);
+    } else if (level_b) {
+        log_warn("level_b requested but oki not trusted/loaded; "
+                 "running without eviction until next open");
+    }
 }
 
 // P14e/P14b:加载 keydir 快照 + search.ckpt 分段快照。用 watermark 单趟
@@ -675,7 +714,14 @@ Cask::load_recovery_snapshots() {
     RecoverySnapshots recovery;
 
     // S14-7：keydir base 快照**先**载（链的行/删除要应用在 base 之上）。
-    if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName)) {
+    // S36-4：v4（缓存子集）只在 Level B 意图 + 带戳 manifest + wm 覆盖快照
+    // 点时接受（gating 在 load_snapshot 内）；其余情形拒收 → 全量 fold。
+    const bool accept_subset = opts_.keydir_cache_entries > 0 &&
+                               keydir_->oki().loaded() &&
+                               keydir_->oki().manifest_level_b();
+    if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName,
+                                        accept_subset,
+                                        keydir_->oki().wm())) {
         recovery.snap_wms = std::move(*w);
         recovery.snap_loaded = true;
         // S33-4：链重放前捕获快照自身的 next_ord（OKI 缺口检查基准）。

@@ -176,7 +176,8 @@ class KeyDir;
 //   - 析构调 release()——若上层有别的线程仍在 next()，会出现数据竞争。
 class IterHandle {
 public:
-    explicit IterHandle(KeyDir* parent) noexcept : parent_(parent) {}
+    // 定义在 .cpp（S36-4：cold_ 的 unique_ptr 需要 ColdIter 完整类型）。
+    explicit IterHandle(KeyDir* parent) noexcept;
     ~IterHandle() noexcept;
 
     IterHandle(const IterHandle&) = delete;
@@ -210,11 +211,23 @@ public:
     [[nodiscard]] bool is_iterating() const noexcept { return iterating_; }
     [[nodiscard]] std::uint64_t epoch() const noexcept { return iter_epoch_; }
 
+    // S36-4：Level B 冷枚举中途 run 读失败（IterHandle 的 next 无错误
+    // 通道——nullopt 后由 caller 查此位区分「到尾」与「截断」）。
+    [[nodiscard]] bool cold_error() const noexcept { return cold_error_; }
+
 private:
     friend class KeyDir;
+
+    // S36-4：Level B 冷枚举状态（OKI 三元组：runs 游标 + delta 拷贝；
+    // 定义在 keydir.cpp——本头不引入 oki_state.hpp）。
+    struct ColdIter;
+    std::optional<EntryProxy> next_cold(bool include_tombstones);
+
     KeyDir* parent_;
     bool iterating_           = false;
+    bool cold_error_          = false;
     std::uint64_t iter_epoch_ = kMaxEpoch;
+    std::unique_ptr<ColdIter> cold_;  // 非空 = Level B 枚举路径
 
     // 迭代位置用 key copy 来表示，比 legacy 的 bucket index 多一点拷贝
     // 开销，但对 rehash 完全免疫。pin unordered_map 迭代器要求严格控
@@ -319,7 +332,23 @@ public:
     [[nodiscard]] std::optional<EntryProxy> locate(std::string_view key,
                                                    bool warm_fill = false);
 
-    // S36-3：单 key 物理逐出（测试/bench 用；S36-4 的 CLOCK 策略建立其上）。
+    // ---- S36-4：缓存预算与逐出（Level B）----
+    // 条目预算（0 = 不限 = 现状全内存）。>0 时派生 per-shard 预算
+    // （budget/kShards，下限 8），写路径插入超限即分片内**采样逐出**：
+    // 从 clock 游标起取 ≤8 个可逐条目（SingleEntry；MultiEntry 不可逐），
+    // 逐 epoch 最旧者——读路径不触碰缓存行（乐观读兼容，无读热度位），
+    // 读热 key 被误逐后由读升温二次命中门回填自愈（S36-3）。设计原文的
+    // CLOCK ref-bit 需要读侧写痕迹，与 seqlock 乐观读冲突，首版以采样
+    // 近似（偏离已记录）。设置 >0 时同步做一次全分片出清（Level A→B
+    // 转换的即时收敛）；fold 活跃期间跳过逐出（key 集只增不减不变量）。
+    // 前置：OKI 点查已开启且组合视图可用（Cask::open 的 Level B 协议
+    // 保证——未加载态下设置预算属误用，逐出后冷 get 无兜底）。
+    void set_cache_budget(std::size_t entries);
+    [[nodiscard]] std::size_t cache_budget() const noexcept {
+        return cache_budget_.load(std::memory_order_relaxed);
+    }
+
+    // S36-3：单 key 物理逐出（测试/bench 用；S36-4 的采样逐出建立其上）。
     // 语义 = D4 的「逐出是缓存腾位，不是删除」：物理 erase（swap-delete +
     // limbo，乐观读者安全同 S29-6 清扫），key_count/fstats **不动**。
     // 前置：OKI 点查开启（组合视图能兜住冷 get）；fold/屏障期间拒绝
@@ -423,14 +452,22 @@ public:
     // tomb_ord，无论先后应用都不误杀）。返回是否实际删除。
     bool remove_if_older(std::string_view key, std::uint64_t tomb_ord);
 
+    // S36-4：Level B（cache_budget>0）时写 **BCKS v4**——payload 与 v3 逐字节
+    // 同构，但语义是「缓存子集 + 逻辑计数」（entries 只含未被逐出的条目；
+    // key_count/key_bytes/fstats 标量是逻辑值）。Level A 照写 v3（全量）。
     [[nodiscard]] bool save_snapshot(
         std::string_view path,
         const std::vector<std::pair<std::uint32_t, std::uint64_t>>& watermarks) const;
     // 校验 magic/ver/CRC 并整体重建内存态,返回水位表;任何不一致返回
     // nullopt 且清空状态(调用方走全量 fold)。仅限全新 KeyDir(open 路径)。
+    // S36-4：v4（子集快照）仅当 accept_subset 且快照 next_ord ≤
+    // subset_wm_limit（= OKI 联合水位——runs 覆盖快照点之前的全部行，缺席
+    // 条目可由组合视图兜底）时接受；否则拒收 → 全量 fold（v4 当不了全量
+    // 快照用——按子集载入再跳字节水位 = 静默丢 key）。v3 恒接受。
     [[nodiscard]] std::optional<
         std::vector<std::pair<std::uint32_t, std::uint64_t>>>
-    load_snapshot(std::string_view path);
+    load_snapshot(std::string_view path, bool accept_subset = false,
+                  std::uint64_t subset_wm_limit = 0);
 
     // ---- 文件统计 ----
     // (注:fstats 的增量更新只发生在 put/remove 内,经私有 update_fstats;
@@ -543,6 +580,9 @@ private:
         // （挡并发 fill 立即塞回）。仅回填/逐出路径消费，热路径只多一次
         // 无争用 RMW。
         std::atomic<std::uint64_t> writes{0};
+        // S36-4：采样逐出的游标（近似轮转；swap-delete 使下标漂移无碍——
+        // 逐出是启发式）。持本分片 mu 下读写。
+        std::size_t clock_hand = 0;
         // 表头独占缓存行:find 路径读表头,别让它与锁字(每次加解锁 RMW)同行。
         alignas(64) detail::SeqShardTable<Entry> entries;
         // S29-6 P1:remove 无 fold 分支不再物理 erase,改留墓碑 SingleEntry
@@ -711,6 +751,13 @@ private:
     // S36-3：累计逐出数。>0 后「哈希 miss」不再是权威 miss——影子对拍的
     // 「miss vs 组合视图活行」方向据此降级为 skip（逐出前保持全严格）。
     std::atomic<std::uint64_t> evictions_{0};
+
+    // S36-4：缓存预算（Level B）。cache_budget_ = 总条目数（0=不限）；
+    // shard_budget_ = 派生的分片预算（写路径插入后比对 entries.size()）。
+    std::atomic<std::size_t> cache_budget_{0};
+    std::atomic<std::size_t> shard_budget_{0};
+    // 采样逐出（前置：持 sh.mu；fold 活跃/无预算时 no-op）。
+    void maybe_evict_locked(Shard& sh, bool fold_active);
 
     //   读热行——get/put 热路径每次 relaxed 读、写入罕见。与上面的写热
     //   行隔离,否则每个 put 的 epoch_ RMW 都会把读者需要的行打飞

@@ -167,6 +167,14 @@ target_link_libraries(bitcask_oki_recovery_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_oki_levelb_test oki_levelb_test.cpp)
+target_link_libraries(bitcask_oki_levelb_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 add_executable(bitcask_oki_locate_test oki_locate_test.cpp)
 target_link_libraries(bitcask_oki_locate_test PRIVATE
     GTest::gtest_main
@@ -334,6 +342,7 @@ gtest_discover_tests(bitcask_oki_run_v2_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_recovery_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_locate_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_oki_levelb_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_range_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_scanner_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_analyzer_test ${_bitcask_test_props})
