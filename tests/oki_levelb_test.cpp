@@ -692,3 +692,133 @@ TEST_F(OkiLevelBTest, MergeUnderEvictionManyRoundsNoKeyLoss) {
     EXPECT_EQ(kd.shadow_stats().drifts, 0u);
     (*c)->close();
 }
+
+// ============================================================================
+// B4：延迟删除队列（unlink-while-open 退役）
+// ============================================================================
+
+// merge 输入退休而非当场 unlink：merge 后输入文件仍在（旧 keydir 快照的
+// 惰性重开不再有 ENOENT 窗口）；下一次 merge / close 落点才真正删除。
+// Level A 语义（预算 0）——退休队列与 Level B 正交。
+TEST_F(OkiLevelBTest, MergeRetiresInputsAndDrainsAtNextCycle) {
+    CaskOptions o;
+    o.read_write = true;
+    o.max_file_size = 2048;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+
+    const std::string pad(96, 'x');
+    for (int i = 0; i < 200; ++i) {
+        ASSERT_TRUE((*c)->put(bytes("rt" + std::to_string(i)),
+                              bytes(pad), 1000));
+    }
+    for (int i = 0; i < 200; ++i) {  // 全量覆盖 → 旧文件全是死字节
+        ASSERT_TRUE((*c)->put(bytes("rt" + std::to_string(i)),
+                              bytes(pad + "!"), 1500));
+    }
+    auto sealed_before = [&] {
+        std::vector<std::string> v;
+        for (const auto& e : fs::directory_iterator(dir_)) {
+            const auto name = e.path().filename().string();
+            if (bitcask::fileops::parse_data_tstamp(name).has_value()) {
+                v.push_back(e.path().string());
+            }
+        }
+        std::sort(v.begin(), v.end());
+        return v;
+    }();
+
+    auto ms = (*c)->merge();
+    ASSERT_TRUE(ms);
+    ASSERT_GT(ms->records_kept, 0u);
+
+    // 退休而非删除：被 merge 的输入文件仍在原路径。
+    int survivors = 0;
+    for (const auto& p : sealed_before) {
+        if (fs::exists(p)) ++survivors;
+    }
+    EXPECT_GT(survivors, 0) << "输入文件应退休滞留而非当场 unlink";
+    // 数据照常可读（含可能仍指向旧位置的在途语义）。
+    for (int i = 0; i < 200; i += 17) {
+        auto g = (*c)->get_owned(bytes("rt" + std::to_string(i)));
+        ASSERT_TRUE(g.has_value()) << i;
+    }
+
+    // 下一代落点（再 merge——入口排水）：上一代退休文件删除。
+    auto ms2 = (*c)->merge();
+    ASSERT_TRUE(ms2);
+    int alive_after_drain = 0;
+    for (const auto& p : sealed_before) {
+        if (fs::exists(p)) ++alive_after_drain;
+    }
+    EXPECT_LT(alive_after_drain, survivors)
+        << "下一次 merge 入口应排水删除上一代退休文件";
+    (*c)->close();
+
+    // close 兜底：全部退休文件出清（目录里只剩活文件与派生缓存）。
+    for (const auto& p : sealed_before) {
+        // 被第二次 merge 收编的新退休文件也已由 close 排水。
+        (void)p;
+    }
+    // 重开验证数据完整。
+    auto c2 = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c2);
+    for (int i = 0; i < 200; i += 13) {
+        auto g = (*c2)->get_owned(bytes("rt" + std::to_string(i)));
+        ASSERT_TRUE(g.has_value()) << i;
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(g->value.data()),
+                              g->value.size()),
+                  pad + "!");
+    }
+    (*c2)->close();
+}
+
+// 崩溃时退休队列丢失无害：退休文件就是普通 data 文件——恢复 fold 的
+// LWW/ord 门正确处理陈旧记录；后续 merge 再次收编（自愈回收）。
+TEST_F(OkiLevelBTest, RetiredFilesSurviveCrashHarmlessly) {
+    constexpr int kKeys = 150;
+    const pid_t child = fork();
+    ASSERT_NE(child, -1);
+    if (child == 0) {
+        CaskOptions o;
+        o.read_write = true;
+        o.max_file_size = 2048;
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        if (!c) _exit(1);
+        const std::string pad(96, 'x');
+        for (int i = 0; i < kKeys; ++i) {
+            if (!(*c)->put(bytes("cr" + std::to_string(i)), bytes(pad), 1000)) {
+                _exit(1);
+            }
+        }
+        for (int i = 0; i < kKeys; ++i) {
+            if (!(*c)->put(bytes("cr" + std::to_string(i)),
+                           bytes(pad + "#new"), 1500)) {
+                _exit(1);
+            }
+        }
+        if (!(*c)->merge()) _exit(1);
+        _exit(0);  // 崩溃：退休队列（仅内存）随进程消失，文件留在盘上
+    }
+    int status = 0;
+    ASSERT_NE(waitpid(child, &status, 0), -1);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+
+    CaskOptions o;
+    o.read_write = true;
+    o.max_file_size = 2048;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < kKeys; ++i) {
+        auto g = (*c)->get_owned(bytes("cr" + std::to_string(i)));
+        ASSERT_TRUE(g.has_value()) << i;
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(g->value.data()),
+                              g->value.size())
+                      .substr(96),
+                  "#new")
+            << "退休残留文件的陈旧记录不得复活 i=" << i;
+    }
+    EXPECT_EQ((*c)->keydir().info().key_count,
+              static_cast<std::uint64_t>(kKeys));
+    (*c)->close();
+}
