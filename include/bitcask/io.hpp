@@ -132,4 +132,56 @@ private:
     int fd_ = -1;
 };
 
+// ---------------------------------------------------------------------------
+// S36 后续（backlog B3）：只读整文件 mmap 的 RAII 归并。
+//
+// 此前 data_file / segment_v2 / hnsw / diskann / ivf_rq 共 7 处各写各的
+// map/unmap/madvise/移动语义——本身就是维护面（S33-B2「mmap 窗口外读」
+// 那类 bug 的温床）。本类统一承载：
+//   - 语义：PROT_READ + MAP_SHARED 整文件映射，[0, size)。
+//   - **不接管 fd**：映射建立后 fd 可关可留（内核对映射页持引用，close
+//     后映射仍有效）——各站点自行决定 fd 去留（data_file 留 fd 供 pread；
+//     向量 payload 关 fd 省预算）。
+//   - 析构 munmap；move-only（源置空，杜绝双 munmap）。
+//   - POSIX unlink-while-mapped 语义下映射持续有效（B4 的延迟删除队列
+//     落地前，各站点的 pin 语义不变）。
+//
+// 线程模型：映射建立后只读、无内部状态变更——多线程并发读 data() 安全；
+// 构造/析构/移动由所有者单线程控制（同 PosixFile 约定）。
+// ---------------------------------------------------------------------------
+class MappedFile {
+public:
+    MappedFile() = default;
+    ~MappedFile();  // munmap（定义在 .cpp——头文件不引 <sys/mman.h>）
+
+    MappedFile(const MappedFile&) = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+    MappedFile(MappedFile&& o) noexcept : base_(o.base_), len_(o.len_) {
+        o.base_ = nullptr;
+        o.len_ = 0;
+    }
+    MappedFile& operator=(MappedFile&& o) noexcept;
+
+    // 映射 fd 的 [0, len) 只读区间。len == 0 或 mmap 失败 → 无效对象
+    // （valid() == false，caller 走 pread 回退——与各站点既有降级一致）。
+    // advise_random：建立后 madvise(MADV_RANDOM)（随机点查负载防内核
+    // 预读浪费——data_file get 热路径 / 向量 payload 的既有纪律）。
+    [[nodiscard]] static MappedFile map_readonly(int fd, std::size_t len,
+                                                 bool advise_random) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept { return base_ != nullptr; }
+    [[nodiscard]] const std::byte* data() const noexcept { return base_; }
+    [[nodiscard]] std::size_t size() const noexcept { return len_; }
+    [[nodiscard]] std::span<const std::byte> view() const noexcept {
+        return {base_, len_};
+    }
+
+    // 主动解除映射（幂等）。析构自动调用。
+    void reset() noexcept;
+
+private:
+    const std::byte* base_ = nullptr;
+    std::size_t len_ = 0;
+};
+
 }  // namespace bitcask::io

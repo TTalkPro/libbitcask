@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -156,6 +157,47 @@ std::expected<void, IoError> PosixFile::truncate_here() noexcept {
     if (cur == static_cast<off_t>(-1)) return std::unexpected(IoError{errno});
     if (::ftruncate(fd_, cur) == -1) return std::unexpected(IoError{errno});
     return {};
+}
+
+
+// ---------------------------------------------------------------------------
+// S36 后续（backlog B3）：MappedFile——只读整文件 mmap 的 RAII（语义与
+// 线程模型见 io.hpp 类注释）。
+// ---------------------------------------------------------------------------
+
+MappedFile::~MappedFile() { reset(); }
+
+MappedFile& MappedFile::operator=(MappedFile&& o) noexcept {
+    if (this != &o) {
+        reset();
+        base_ = o.base_;
+        len_ = o.len_;
+        o.base_ = nullptr;
+        o.len_ = 0;
+    }
+    return *this;
+}
+
+MappedFile MappedFile::map_readonly(int fd, std::size_t len,
+                                    bool advise_random) noexcept {
+    MappedFile m;
+    if (fd < 0 || len == 0) return m;
+    void* base = ::mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) return m;  // 无效对象——caller 走 pread 回退
+    if (advise_random) {
+        ::madvise(base, len, MADV_RANDOM);  // best-effort
+    }
+    m.base_ = static_cast<const std::byte*>(base);
+    m.len_ = len;
+    return m;
+}
+
+void MappedFile::reset() noexcept {
+    if (base_ != nullptr) {
+        ::munmap(const_cast<std::byte*>(base_), len_);
+        base_ = nullptr;
+        len_ = 0;
+    }
 }
 
 }  // namespace bitcask::io
