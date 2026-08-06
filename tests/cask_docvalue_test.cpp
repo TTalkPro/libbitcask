@@ -1735,11 +1735,18 @@ TEST_F(CaskDocValueTest, FoldSurvivesConcurrentMergeUnlink) {
     ASSERT_TRUE(first);
     ASSERT_TRUE(first->has_value());
 
-    // fold 进行中触发 merge：relocate live record 到新文件并 unlink 掉 to_merge。
+    // fold 进行中触发 merge。B4：输入文件**退休滞留**而非当场 unlink
+    //（延迟删除队列——旧 keydir 快照的惰性重开不再有 ENOENT 窗口）；
+    // checkpoint 落点排水后才真正 unlink——此时 fold 仍持 pin 的 fd，
+    // 「已开句柄跨 unlink 存活」的原始验证意图保留。
     auto mr = cask.merge(to_merge);
     ASSERT_TRUE(mr);
     for (const auto& p : to_merge) {
-        EXPECT_FALSE(fs::exists(p)) << "merge 后旧文件应被 unlink：" << p;
+        EXPECT_TRUE(fs::exists(p)) << "B4：merge 后输入应退休滞留：" << p;
+    }
+    ASSERT_TRUE(cask.checkpoint());  // B4：排水点 → 真正 unlink
+    for (const auto& p : to_merge) {
+        EXPECT_FALSE(fs::exists(p)) << "checkpoint 排水后应已删除：" << p;
     }
 
     // 继续 fold 到结束：收集所有 entry。没有 pin 的话这里会 read_file 失败报错。
@@ -1878,8 +1885,14 @@ TEST_F(CaskDocValueTest, P6MmapViewSurvivesMergeUnlink) {
     for (const auto& f : files) to_merge.push_back(f.second);
     auto mr = cask.merge(to_merge);
     ASSERT_TRUE(mr);
+    // B4：输入退休滞留（延迟删除）；checkpoint 排水后才真正 unlink——
+    // 此刻 view 仍持映射，「映射跨 unlink 存活」的原始验证意图保留。
     for (const auto& p : to_merge) {
-        EXPECT_FALSE(fs::exists(p)) << "merge 后旧文件应被 unlink:" << p;
+        EXPECT_TRUE(fs::exists(p)) << "B4：merge 后输入应退休滞留:" << p;
+    }
+    ASSERT_TRUE(cask.checkpoint());
+    for (const auto& p : to_merge) {
+        EXPECT_FALSE(fs::exists(p)) << "checkpoint 排水后应已删除:" << p;
     }
 
     // 关键:持有的 view 仍可读(映射经 shared_ptr 续命,无 UAF/SIGBUS)。
