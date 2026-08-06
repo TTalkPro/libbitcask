@@ -6,7 +6,7 @@ C API 是 C++ `bitcask::Cask` 的薄 `extern "C"` 包装，编译产物：
 
 | 产物 | 说明 |
 |------|------|
-| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=4`，`VERSION=4.1.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 4.1.0)` 单一真源派生）|
+| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=6`，`VERSION=6.1.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 6.1.0)` 单一真源派生）|
 | `libbitcask.a` | 合并全部静态归档的单一 `.a`（定义 `BITCASK_STATIC_LIB` 去掉导出修饰）|
 
 符号导出由 `BITCASK_API` 宏控制（`bitcask_kv.h` §符号导出宏），Windows 下退化为 `__declspec(dllimport/dllexport)`，其它平台默认 `__attribute__((visibility("default")))`。
@@ -74,7 +74,7 @@ gcc -DBITCASK_STATIC_LIB app.c -I<c_api 头目录> libbitcask.a -o app
 
 ## 3. 版本信息
 
-版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 4.1.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
+版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 6.1.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
 
 ```c
 BITCASK_API int          bitcask_version_major(void);
@@ -84,7 +84,7 @@ BITCASK_API const char*  bitcask_version_string(void);   // "major.minor.patch"�
 ```
 
 - `bitcask_version_string()` 返回的是库内静态字符串（指向 `BITCASK_VERSION_STRING` 宏展开的字符串字面量），**不需要 free**。
-- 运行时返回值与 `libbitcask.so.4.1.0` 文件名完全对应；SOVERSION 是 `4`（大版本号），反映 ABI 兼容性。
+- 运行时返回值与 `libbitcask.so.6.1.0` 文件名完全对应；SOVERSION 是 `6`（大版本号），反映 ABI 兼容性。
 
 ---
 
@@ -135,10 +135,11 @@ C API 是进程级 host：所有经 `bitcask_open` 打开的句柄**共享同一
 | `7`  | `BITCASK_ERR_READ_ONLY`       | 对只读 cask 写 |
 | `8`  | `BITCASK_ERR_WRITE_LOCKED`    | 锁被占 |
 | `9`  | `BITCASK_ERR_INVALID_OPTION`  | 选项非法 / 迭代器快照过期（见下注）|
-| `10` | `BITCASK_ERR_NO_INDEX`        | KV 模式调用搜索 |
+| `10` | `BITCASK_ERR_NO_INDEX`        | 索引在本句柄上本就不存在：KV 模式调搜索；RO/merge-only 打开无 OKI 的目录调 range（重开读写可建）|
 | `11` | `BITCASK_ERR_MODE_MISMATCH`   | 模式不匹配 |
 | `12` | `BITCASK_ERR_ANALYZER_MISMATCH` | 分析器类型不匹配 |
 | `13` | `BITCASK_ERR_CLOSED`          | 对已 `bitcask_close` 的 handle 发起调用 |
+| `14` | `BITCASK_ERR_INDEX_REBUILD_FAILED` | OKI 试建而败——可写打开时重建失败（IO/环境问题，见日志）；修复后重开可重试 |
 
 > **快照过期**：迭代器快照过期时 `bitcask_iter_start` 返回 `BITCASK_ERR_INVALID_OPTION`（头文件中无独立的 `BITCASK_ERR_OUT_OF_DATE`），调用方应捕获并重试。
 
@@ -855,7 +856,7 @@ BITCASK_API void bitcask_range_entry_free(bitcask_range_entry_t* entry);
 - **一致性：per-key 弱一致**（与 `bitcask_parallel_scan` 同档）——迭代期间的并发写可能部分可见，**不是** `bitcask_iter_*` 的快照语义。
 - `opts == NULL` 等价「全域 + 无预取」；`opts` 指向的切片仅在 `bitcask_range_iter_start` 调用期间被引用（内部已拷贝边界），返回后调用方可释放。
 - `prefetch > 1`：一次归并出 `prefetch` 个 key 后并发取值。**只改变取值时机，输出序与内容不变**。收益形态是「大窗口 + 值不在页缓存」；小窗口/值已缓存时线程成本可能反超（实测数字见 `api-cpp.md` §6 的 `prefetch` 条）。
-- 错误：`BITCASK_ERR_NO_INDEX` = 该目录无可用 OKI（只读打开且从未建过；读写方式打开会自动重建）；`BITCASK_ERR_BAD_CRC` = run 损坏；其余同 `bitcask_get`。
+- 错误：`BITCASK_ERR_NO_INDEX` = 只读/merge-only 打开且目录未建过 OKI（本句柄本就不建；读写方式打开会自动重建）；`BITCASK_ERR_INDEX_REBUILD_FAILED` = 读写打开时 OKI 重建失败（IO/环境问题，见日志；修复后重开可重试）；`BITCASK_ERR_BAD_CRC` = run 损坏；其余同 `bitcask_get`。
 - `next` 返回值 / `next_batch` 的错误路径所有权规则与 `bitcask_iter_next` / `_next_batch` **完全一致**（错误时实现已释放中途填充的条目）。
 - 生命周期：迭代器须在 `bitcask_close` 之前 release。
 

@@ -101,10 +101,11 @@ libbitcask 有两种工作模式，由 `CaskOptions` 决定：
 | `kReadOnly` | 对只读 cask 调用写操作 |
 | `kWriteLocked` | 别人已持有 `write.lock` / `merge.lock` |
 | `kInvalidOption` | 选项非法 |
-| `kNoIndex` | KV 模式下调用了 search 接口 |
+| `kNoIndex` | 索引在本句柄上本就不存在：KV 模式调 search 接口；RO/merge_only 打开无 OKI 的目录调 range（重开读写可建）|
 | `kModeMismatch` | 文件模式与打开选项不匹配 |
 | `kAnalyzerMismatch` | 分析器类型不匹配 |
 | `kClosed` | 对已 close 的 handle 发起调用 |
+| `kIndexRebuildFailed` | OKI 试建而败——可写 open 重建失败（IO/环境问题，见日志）；修复后重开可重试 |
 
 ### 3.3 `bitcask::CaskFault`（错误详情，`cask.hpp`）
 
@@ -834,7 +835,7 @@ merge(std::vector<std::string> files = {}, std::uint32_t now_sec = 0);
 make_range_iter(const RangeOptions& opts);
 ```
 
-按 key 字典序遍历 `[lo, hi)`，走 OKI（有序 key 索引）——**O(range)** 而非 `CaskIter::start(key_prefix)` 的 O(全表)。OKI 不可用（只读打开且目录没建过 OKI / 重建失败）返回 `kNoIndex`；读写打开会在 open 时自动重建。
+按 key 字典序遍历 `[lo, hi)`，走 OKI（有序 key 索引）——**O(range)** 而非 `CaskIter::start(key_prefix)` 的 O(全表)。OKI 不可用按成因拆码：只读/merge_only 打开且目录没建过 OKI（本就不建，重开读写即自动重建）→ `kNoIndex`；读写打开但 open 时重建失败（IO/环境问题）→ `kIndexRebuildFailed`。
 
 线程安全：是（可多线程各自 make 并发迭代）；返回的迭代器自身非线程安全。
 
@@ -947,7 +948,7 @@ bitcask::RangeOptions ro;
 ro.lo = as_bytes("user:1000"); ro.hi = as_bytes("user:2000");
 ro.prefetch = 256;                     // 可选：值预取
 auto it = (*c)->make_range_iter(ro);
-if (!it) { /* kNoIndex：只读打开且无 OKI */ }
+if (!it) { /* kNoIndex：只读打开且无 OKI；kIndexRebuildFailed：重建失败 */ }
 while (auto e = (*it)->next()) {
     if (!e->has_value()) break;        // EOI
     auto& entry = **e;                 // entry.key / value / tstamp / ord
