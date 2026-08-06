@@ -1,9 +1,10 @@
 // txn.hpp — S34/S35：多键事务 helper。
 //
-// S35 起提交路径 = 引擎原子批（Cask::put_batch_atomic，方案 C，设计
+// 提交路径 = 引擎原子批（Cask::put_batch_atomic，方案 C，设计
 // doc/atomic-batch-design-zh.md）——跨崩溃 all-or-nothing 由引擎批头保证，
-// 无意图日志写放大。recover() 保留方案 B 的意图重放，兼容旧目录遗留的
-// "_txn:" pending（模式原理 doc/multikey-txn-zh.md）。
+// 无意图日志写放大。B2（2026-08-06）：方案 B 的意图重放整体删除——意图
+// 日志从未随任何发布版本存在（细节见 txn.cpp 文件头）；recover()/
+// pending_txns() 保留签名恒返空。
 // 提供崩溃原子性（A）与持久性（D）；**不提供**隔离性（I）与 CAS——
 // 事务中间态对并发读者可见（模式文档 §4）。
 #pragma once
@@ -36,10 +37,10 @@ enum class TxnSyncPolicy : std::uint8_t {
     kNone = 1,
 };
 
-// 悬挂事务巡检条目（pending_txns）。
+// 悬挂事务巡检条目（pending_txns）。B2 起恒空——类型保留为 API 稳定面。
 struct PendingTxn {
     std::string txn_key;           // "_txn:{seq:016x}-{rand:08x}"
-    std::uint64_t created_at_us;   // 意图 blob 内的创建时刻（unix µs）
+    std::uint64_t created_at_us;   // （历史）意图创建时刻（unix µs）
     std::size_t op_count;
 };
 
@@ -54,11 +55,9 @@ public:
                      TxnSyncPolicy sync = TxnSyncPolicy::kSyncOnCommit)
         : cask_(cask), sync_(sync) {}
 
-    // 启动恢复（legacy，方案 B 兼容）：按提交序前滚重放旧目录遗留的
-    // "_txn:" 意图并清理，返回重放条数。S35 起 commit 不再产生意图——
-    // 从未用过方案 B 版本的目录恒返回 0（扫描 O(0)）。
-    // 契约：open 后、任何业务写之前调用；不得与 commit 并发。意图 blob
-    // 解码失败（record CRC 已过仍解不开 = 逻辑损坏）→ kBadCrc 停止。
+    // B2：恒返回 0（意图重放已删除——方案 B 意图日志从未随发布版本存
+    // 在；签名保留 = C API 稳定面）。开发期残留的 "_txn:" 前缀 key 可经
+    // 普通 KV API 手工清理。
     [[nodiscard]] std::expected<std::size_t, CaskFault> recover();
 
     // 原子提交一批操作：一次 Cask::put_batch_atomic（S35 引擎原子批）——
@@ -71,8 +70,7 @@ public:
     // 需应用层串行化。
     [[nodiscard]] std::expected<void, CaskFault> commit(std::span<const TxnOp> ops);
 
-    // 运维巡检：枚举 legacy pending 事务（不重放、不清理）。S35 后正常
-    // 恒空——仅方案 B 时期目录的崩溃遗留会非空。
+    // B2：恒返回空（同 recover）。
     [[nodiscard]] std::expected<std::vector<PendingTxn>, CaskFault> pending_txns();
 
 private:
