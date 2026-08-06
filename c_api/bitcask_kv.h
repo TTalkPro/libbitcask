@@ -185,6 +185,17 @@ typedef struct {
        NULL = 不上报（默认，零开销）。 */
     void (*log_fn)(int level, const char* msg, void* ctx);
     void* log_ctx;
+
+    /* S36：keydir 磁盘驻留（Level B）。0 = 关（默认，keydir 全内存 =
+       现状）。>0 = keydir 热点缓存条目预算：超预算逐出，点查落组合视图
+       （memdelta + 磁盘 run，bloom + 块缓存，冷 get ≤2 次 pread）——
+       1 亿 key 常驻从 ~11GB 降到 ~1.1GB。首次对旧目录开启会全量重建
+       OKI（一次性开销）；Level A（=0）写者重开会清模式戳、再开启时重建
+       自愈；merge_only 旁车对 Level B 目录 open 返回 BITCASK_ERR_IO。
+       详见 api-c.md「keydir 磁盘驻留」。
+       ⚠ 本字段为 5.0.0 后新增（结构体布局变更）——发布版本号须按
+       ABI 规则评审（见 CHANGELOG 5.1.0 段的说明）。 */
+    size_t    keydir_cache_entries;
 } bitcask_options_t;
 
 // 初始化为默认值

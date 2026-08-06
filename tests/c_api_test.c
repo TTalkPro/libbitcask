@@ -843,6 +843,62 @@ static int test_search_filtered(void) {
 // kClosed 的实际受益方是 C++ 消费方（Cask::close 保留对象 + fail-fast），其覆盖见
 // C++ 测试 CrashRecoveryTest.OperationsAfterCloseReturnErrorNotUb。
 
+
+/* S36：Level B（keydir 磁盘驻留）冒烟——预算开启下写入远超预算、全部可
+   读（冷路径）、重开（v4 子集快照 + BCOM v3 戳）数据无损。 */
+static int test_levelb(void) {
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.keydir_cache_entries = 512; /* 2000 键 ≫ 512 预算 → 深度逐出 */
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    if (bitcask_open("/tmp/bitcask_c_test_levelb", &opts, &cask, &fault) !=
+        BITCASK_OK) {
+        fprintf(stderr, "FAIL test_levelb: open failed: %s\n", fault.detail);
+        return 1;
+    }
+    char kb[32], vb[32];
+    for (int i = 0; i < 2000; i++) {
+        int kl = snprintf(kb, sizeof kb, "lb%d", i);
+        int vl = snprintf(vb, sizeof vb, "val-%d", i);
+        bitcask_slice_t k = {kb, (size_t)kl}, v = {vb, (size_t)vl};
+        assert(bitcask_put(cask, k, v, 0, &fault) == BITCASK_OK);
+    }
+    for (int i = 0; i < 2000; i += 111) { /* 抽查（多数走冷路径） */
+        int kl = snprintf(kb, sizeof kb, "lb%d", i);
+        int vl = snprintf(vb, sizeof vb, "val-%d", i);
+        bitcask_slice_t k = {kb, (size_t)kl};
+        bitcask_get_result_t* res = NULL;
+        assert(bitcask_get(cask, k, &res, &fault) == BITCASK_OK);
+        assert(res->value.size == (size_t)vl &&
+               memcmp(res->value.data, vb, (size_t)vl) == 0);
+        bitcask_get_result_free(res);
+    }
+    bitcask_close(cask);
+
+    /* 重开：子集快照 + 模式戳快路径；数据无损。 */
+    if (bitcask_open("/tmp/bitcask_c_test_levelb", &opts, &cask, &fault) !=
+        BITCASK_OK) {
+        fprintf(stderr, "FAIL test_levelb: reopen failed: %s\n", fault.detail);
+        return 1;
+    }
+    for (int i = 1; i < 2000; i += 97) {
+        int kl = snprintf(kb, sizeof kb, "lb%d", i);
+        int vl = snprintf(vb, sizeof vb, "val-%d", i);
+        bitcask_slice_t k = {kb, (size_t)kl};
+        bitcask_get_result_t* res = NULL;
+        assert(bitcask_get(cask, k, &res, &fault) == BITCASK_OK);
+        assert(res->value.size == (size_t)vl &&
+               memcmp(res->value.data, vb, (size_t)vl) == 0);
+        bitcask_get_result_free(res);
+    }
+    bitcask_close(cask);
+    printf("PASS test_levelb\n");
+    return 0;
+}
+
 int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
@@ -861,6 +917,7 @@ int main(void) {
     failures += test_parallel_scan();
     failures += test_put_batch();
     failures += test_txn();
+    failures += test_levelb();
     failures += test_status_ex_and_log();
     failures += test_search_filtered();
 

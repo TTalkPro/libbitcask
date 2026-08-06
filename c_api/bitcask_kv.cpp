@@ -51,6 +51,7 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts) {
     opts->vector_diskann_l_build = 0;
     opts->log_fn = NULL;              // S13-D7：默认不上报
     opts->log_ctx = NULL;
+    opts->keydir_cache_entries = 0;   // S36：Level B 关（现状全内存）
 }
 
 BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
@@ -72,6 +73,7 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
         cpp_opts.expiry_secs = opts->expiry_secs;
         cpp_opts.merge_only = opts->merge_only != 0;
         cpp_opts.tombstone_version = opts->tombstone_version;
+        cpp_opts.keydir_cache_entries = opts->keydir_cache_entries;  // S36
         cpp_opts.vector_dim = opts->vector_dim;
         cpp_opts.vector_metric = to_cpp_vector_metric(opts->vector_metric);
         cpp_opts.vector_quantized = opts->vector_quantized != 0;
