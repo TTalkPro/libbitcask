@@ -1,6 +1,10 @@
-// S34：TxnCask 多键事务测试（doc/multikey-txn-impl-design-zh.md §9）。
-// 覆盖：正常提交、校验拒绝零副作用、意图前滚重放（手写编码器对拍钉死
-// blob v1 格式）、REMOVE 重放、seq 序重放定序、fork 崩溃注入、巡检枚举。
+// S34/S35：TxnCask 多键事务测试（doc/multikey-txn-impl-design-zh.md §9 +
+// doc/atomic-batch-design-zh.md）。覆盖：正常提交、校验拒绝零副作用、
+// recover/pending_txns 的 B2 后语义（恒空 + 遗留 "_txn:" key 不受触碰）、
+// fork 崩溃下 commit 的引擎原子批 all-or-nothing。
+// B2（2026-08-06）：意图重放已删除（从未随发布版本存在）——原六个意图
+// 构造/重放用例（手写编码器对拍等）随实现一并退役，崩溃原子性由
+// atomic_batch_test 的批语义用例承接。
 
 #include <gtest/gtest.h>
 
@@ -42,37 +46,6 @@ TxnOp put_op(std::string_view k, std::string_view v) {
 
 TxnOp remove_op(std::string_view k) {
     return {.type = TxnOp::Type::kRemove, .key = bytes(k)};
-}
-
-// --- 手写意图 blob 编码器：与 txn.cpp encode_ops 相互独立的第二实现，
-// --- 对拍钉死 v1 盘上布局（设计 §3）。改任何一边布局本测试必红。
-void le32(std::string& out, std::uint32_t v) {
-    for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
-}
-void le64(std::string& out, std::uint64_t v) {
-    for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
-}
-
-struct HandOp {
-    std::uint8_t type;  // 0 = put, 1 = remove
-    std::string key;
-    std::string value;
-};
-
-std::string hand_encode(std::uint64_t created_at_us,
-                        const std::vector<HandOp>& ops) {
-    std::string out;
-    out.push_back(static_cast<char>(1));  // ver
-    le64(out, created_at_us);
-    le32(out, static_cast<std::uint32_t>(ops.size()));
-    for (const auto& op : ops) {
-        out.push_back(static_cast<char>(op.type));
-        le32(out, static_cast<std::uint32_t>(op.key.size()));
-        le32(out, op.type == 0 ? static_cast<std::uint32_t>(op.value.size()) : 0);
-        out += op.key;
-        if (op.type == 0) out += op.value;
-    }
-    return out;
 }
 
 class TxnTest : public ::testing::Test {
@@ -169,116 +142,36 @@ TEST_F(TxnTest, RecoverOnCleanDirIsZero) {
     c->close();
 }
 
-// 模拟「崩在 ③ 之前」：只写意图记录（手写编码器构造）→ reopen →
-// recover 前滚补齐数据 + 清理意图。
-TEST_F(TxnTest, RecoverReplaysPendingIntent) {
+// B2：遗留意图残留（开发期构建可能写过的 "_txn:" 前缀 key）——recover
+// 恒 0、pending 恒空、残留不被触碰（手工清理路径仍是普通 KV API）。
+TEST_F(TxnTest, RecoverIgnoresLegacyIntentLeftovers) {
     {
         auto c = open_rw();
         ASSERT_TRUE(c);
-        const std::string blob = hand_encode(
-            123456789, {{0, "x", "vx"}, {0, "y", "vy"}});
         ASSERT_TRUE(c->put(bytes("_txn:0000000000000001-deadbeef"),
-                           bytes(blob)));
-        c->close();  // 意图在,数据不在——等价于崩溃留下的状态
+                           bytes("opaque-legacy-bytes")));
+        c->close();
     }
     auto c = open_rw();
     ASSERT_TRUE(c);
     TxnCask txn(c.get());
     auto n = txn.recover();
     ASSERT_TRUE(n) << n.error().detail;
-    EXPECT_EQ(*n, 1u);
-    EXPECT_EQ(get_str(*c, "x"), "vx");
-    EXPECT_EQ(get_str(*c, "y"), "vy");
+    EXPECT_EQ(*n, 0u) << "B2：意图重放已删除，恒 0";
     auto pending = txn.pending_txns();
     ASSERT_TRUE(pending);
     EXPECT_TRUE(pending->empty());
+    // 残留原样可读（手工清理走普通 KV API）。
+    EXPECT_EQ(get_str(*c, "_txn:0000000000000001-deadbeef"),
+              "opaque-legacy-bytes");
+    ASSERT_TRUE(c->remove(bytes("_txn:0000000000000001-deadbeef")));
     c->close();
 }
 
-TEST_F(TxnTest, RecoverAppliesRemoveOps) {
-    {
-        auto c = open_rw();
-        ASSERT_TRUE(c);
-        ASSERT_TRUE(c->put(bytes("victim"), bytes("alive")));
-        const std::string blob =
-            hand_encode(1, {{0, "kept", "v"}, {1, "victim", ""}});
-        ASSERT_TRUE(c->put(bytes("_txn:0000000000000001-deadbeef"),
-                           bytes(blob)));
-        c->close();
-    }
-    auto c = open_rw();
-    ASSERT_TRUE(c);
-    TxnCask txn(c.get());
-    auto n = txn.recover();
-    ASSERT_TRUE(n) << n.error().detail;
-    EXPECT_EQ(*n, 1u);
-    EXPECT_EQ(get_str(*c, "kept"), "v");
-    EXPECT_TRUE(missing(*c, "victim"));
-    c->close();
-}
-
-// 两条 pending 触碰同一 key：txn key 定宽 hex 字典序 = seq 序 = 提交序,
-// seq 大者(后提交)终值胜(设计 §4)。
-TEST_F(TxnTest, ReplayOrderIsSeqOrder) {
-    {
-        auto c = open_rw();
-        ASSERT_TRUE(c);
-        const std::string first = hand_encode(1, {{0, "k", "old"}});
-        const std::string second = hand_encode(2, {{0, "k", "new"}});
-        // 故意乱序写入——重放序由 key 字典序决定,与写入序无关。
-        ASSERT_TRUE(c->put(bytes("_txn:0000000000000002-cafecafe"),
-                           bytes(second)));
-        ASSERT_TRUE(c->put(bytes("_txn:0000000000000001-deadbeef"),
-                           bytes(first)));
-        c->close();
-    }
-    auto c = open_rw();
-    ASSERT_TRUE(c);
-    TxnCask txn(c.get());
-    auto n = txn.recover();
-    ASSERT_TRUE(n) << n.error().detail;
-    EXPECT_EQ(*n, 2u);
-    EXPECT_EQ(get_str(*c, "k"), "new");
-    c->close();
-}
-
-TEST_F(TxnTest, MalformedIntentStopsRecover) {
-    {
-        auto c = open_rw();
-        ASSERT_TRUE(c);
-        ASSERT_TRUE(c->put(bytes("_txn:0000000000000001-deadbeef"),
-                           bytes("garbage")));
-        c->close();
-    }
-    auto c = open_rw();
-    ASSERT_TRUE(c);
-    TxnCask txn(c.get());
-    auto n = txn.recover();
-    ASSERT_FALSE(n);
-    EXPECT_EQ(n.error().kind, CaskError::kBadCrc);
-    c->close();
-}
-
-TEST_F(TxnTest, PendingTxnsInspection) {
-    auto c = open_rw();
-    ASSERT_TRUE(c);
-    const std::string blob = hand_encode(42, {{0, "p", "v"}, {1, "q", ""}});
-    ASSERT_TRUE(c->put(bytes("_txn:00000000000000ff-01020304"), bytes(blob)));
-
-    TxnCask txn(c.get());
-    auto pending = txn.pending_txns();
-    ASSERT_TRUE(pending) << pending.error().detail;
-    ASSERT_EQ(pending->size(), 1u);
-    EXPECT_EQ((*pending)[0].txn_key, "_txn:00000000000000ff-01020304");
-    EXPECT_EQ((*pending)[0].created_at_us, 42u);
-    EXPECT_EQ((*pending)[0].op_count, 2u);
-    c->close();
-}
-
-// fork 崩溃注入:子进程完成 ①意图 + ②sync + 一半的 ③(两 key 只写一个),
-// 然后 _exit 模拟崩溃——即设计 §2.2「崩在 3 的中间」。父进程 reopen 后
-// recover 必须把两个 key 全部补齐并清理意图。
-TEST_F(TxnTest, CrashMidApplyRecovers) {
+// fork 崩溃注入：commit 的原子性由引擎原子批承载（方案 C）——崩溃点在
+// commit 返回之后，重开必须整批可见；kSyncOnCommit 保证 durable。
+// （掐尾批不可见的另一半由 atomic_batch_test 的截断注入覆盖。）
+TEST_F(TxnTest, CrashAfterCommitIsAtomicallyVisible) {
     const pid_t child = fork();
     ASSERT_NE(child, -1) << "fork failed";
 
@@ -287,14 +180,10 @@ TEST_F(TxnTest, CrashMidApplyRecovers) {
         opts.read_write = true;
         auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         if (!c) _exit(1);
-        const std::string blob =
-            hand_encode(7, {{0, "t1", "v1"}, {0, "t2", "v2"}});
-        if (!(*c)->put(bytes("_txn:0000000000000007-deadbeef"), bytes(blob)))
-            _exit(2);
-        if (!(*c)->sync()) _exit(3);
-        // ③ 的一半:只写 t1,t2 没写——然后"崩溃"。
-        if (!(*c)->put(bytes("t1"), bytes("v1"))) _exit(4);
-        _exit(0);  // 不 close:句柄、write lock 全部随进程消失
+        TxnCask txn(c->get());
+        const std::vector<TxnOp> ops{put_op("t1", "v1"), put_op("t2", "v2")};
+        if (!txn.commit(ops)) _exit(2);
+        _exit(0);  // 不 close：句柄、write lock 全部随进程消失
     }
 
     int status = 0;
@@ -307,12 +196,9 @@ TEST_F(TxnTest, CrashMidApplyRecovers) {
     TxnCask txn(c.get());
     auto n = txn.recover();
     ASSERT_TRUE(n) << n.error().detail;
-    EXPECT_EQ(*n, 1u);
+    EXPECT_EQ(*n, 0u);
     EXPECT_EQ(get_str(*c, "t1"), "v1");
     EXPECT_EQ(get_str(*c, "t2"), "v2");
-    auto pending = txn.pending_txns();
-    ASSERT_TRUE(pending);
-    EXPECT_TRUE(pending->empty());
     c->close();
 }
 
