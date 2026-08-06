@@ -5,7 +5,11 @@
 >   - [`keydir-sharding-design-zh.md`](keydir-sharding-design-zh.md)（分片/屏障/MVCC 现状）
 >   - [`merge-policy-zh.md`](merge-policy-zh.md)（CAS 搬迁模型——本文要动它的活性权威）
 >
-> 状态：**设计草案（未实现）**。对应 S36 梯队。
+> 状态：**已落地（S36-1..6，2026-08-05/06）**。目标命中：100M `doc:` key
+> 实测常驻 11GB → 加载峰值 **1.14GB** / 重开 **0.80GB**（-90%，重开走
+> v4 子集快照 ~1 秒）；热 get/put/merge 零回归；冷 get tmpfs 锚点
+> p50 ~4-5µs / p99 ~14µs。**实现偏差与增补见文末「落地记录」**——
+> 正文保持设计原貌，读代码以落地记录为准。
 >
 > 一句话：哈希 keydir 从「全量权威」退化为「热点缓存」，点查权威变成
 > **cache → memdelta → BCOK v2 全字段 runs** 的组合视图；bloom 挡负查询、
@@ -285,3 +289,42 @@ memdelta 行 `DeltaRow{key, SingleEntry, tomb}`（+40B/行）;flush 阈值
    **MultiEntry 不可逐出**（fold 活跃期本就短暂,collapse 后恢复可逐）;
 4. 双写模式（Level B 开启但缓存不设限）作为长期「影子验证」运维档位
    是否保留。
+
+## 12. 落地记录（S36-1..6，2026-08-06 收口）
+
+实测与验收数字见 `TASK.md` 各期落地记录；此处只记**与正文的偏差**与
+设计期未预见的增补（读代码以本节为准）：
+
+1. **逐出：CLOCK → 分片内采样**（§3 D4 / §10 的偏离）。CLOCK ref-bit 需
+   要读侧写痕迹，与 seqlock 乐观读根本冲突（读者不能碰缓存行）——改为
+   clock 游标起采 ≤8 个可逐条目、逐 **epoch 最旧**者（近似
+   LRU-by-write/fill）；读热 key 被误逐由 §11-1 的二次命中回填自愈
+   （该「频度门」已实现：4096 槽指纹表）。
+2. **挂钩入锁取代「逐出安全恒成立」**（§3 D4 的修正）。「写路径在 keydir
+   更新后同步追加 delta」存在在途窗口——逐出恰落在窗口内会让冷读者拿旧行
+   并回填 = 静默回滚（S36-3 并发实证）。定案：点查开启时 put/remove 的
+   OKI append 在**分片锁内**完成（oki 锁为叶子），「哈希可见 ⟺ 已入组合
+   视图」在锁边界成立，逐出无需任何静止检查。
+3. **挂钩门在点查开启上**（§6 的收窄）。Level A 不消费搬迁/TTL 行（range
+   回查 keydir），无门实测 merge bench +18%；且关门期间的 merge 本就使
+   run loc 陈旧。配套引入 **BCOM v3 level_b 模式戳**（§3 D3 的增补）：
+   未带戳开启即全量重建起步、Level A 写者 open 清戳、merge_only 旁车对
+   带戳目录拒开——「run loc 可信」成为有明确托管者的不变量。
+4. **同 ord 平局细化为 max (ord, 到达序)**（§3 D2 的全链路统一）：flush/
+   读视图 stable 排序取末、locate 辅助哈希 ord≥ 顶替、run 间 (ord, gen)、
+   外排 (ord, spill 序)。恢复期并行乱序由 ord 主键消解。
+5. **D4 计数从「首版从简」升级为冷视图记账**（§3 D4）：put/remove 的哈希
+   miss 分支问冷视图裁决（覆盖被逐 key 不虚增、remove 被逐 key 真退账、
+   fstats 老位置退账），并顺带落地 **Level B 版 LWW/复活门**（冷侧 ord
+   更新即拒收——恢复重放旧行不复活，S33-B1 的组合视图延伸）。
+6. **B1 的实现形态**（§8 预告的收口）：持久水位挂 **DataFile 自维护**
+   （sync/o_sync 写路径推进 + roll/close「封口即持久」不变量），
+   checkpoint 采集点做线程安全 fd 级 fdatasync；快照过滤水位外条目
+   （计数标量同步扣减）、OKI flush 对水位外行**持留**；OKI 缺口检查基准
+   改「快照实载条目 ord 覆盖界」（load 时重算，零格式变更）。
+7. **merge 收尾序增补**（§7 的崩溃收口）：搬迁行 flush 固化**先于**输入
+   unlink；flush 失败跳过 unlink。缓存外搬迁/TTL 删除按 §7 预告以冷视图
+   精确匹配免 CAS 落地。
+8. **§11 开放问题现状**：①读升温频度门已做（见 1）；②bloom 整载维持
+   （100M ≈ 125MB，未见压力）；③MultiEntry 不可逐已做；④双写运维档位
+   未做（影子对拍以 debug 构建自动开启的形式存在）。

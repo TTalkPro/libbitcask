@@ -90,11 +90,12 @@ stale 检测（写入者 PID）+ PID 行 + 持锁文件 fd 三要素。路径字
 | `docmap.ckpt` / `.prev` / `.d<seq>` | 文档身份表组件（kDocmapDeltaV3 段） |
 | `search.ckpt` / `.prev` / `.d<seq>` | legacy 单文件 ckpt（S17-5 起迁移路径） |
 | `index.manifest` | 三组件 ckpt 的提交点 + 链长 |
-| `kv.keydir.ckpt` | keydir 快照（BCKS v3：tstamp 定宽 8B） |
+| `kv.keydir.ckpt` | keydir 快照（BCKS v3 全量；**v4 = Level B 缓存子集**，S36） |
 | `search.vec` | HNSW f32 payload（BCVP） |
 | `search.qc8` | HNSW int8 量化码字 payload（BCQ8） |
-| `kv.oki.seg-<gen>` | OKI run：有序 key 索引段（BCOK v1，见 §十五） |
-| `kv.oki.manifest` | OKI 提交点：run 集合 + 覆盖水位（BCOM v1，见 §十五） |
+| `kv.oki.seg-<gen>` | OKI run：有序 key 索引段（BCOK v1/**v2**，见 §十五） |
+| `kv.oki.spill-<gen>-<n>` | OKI 外排重建的临时分段（崩溃残件由 sweep 清理） |
+| `kv.oki.manifest` | OKI 提交点：run 集合 + 覆盖水位 + 模式戳（BCOM v1-v3，见 §十五） |
 
 `*.ckpt` 走 `SearchCheckpoint` 容器（见 §九）；`*.d<seq>` 是组件 delta 文件，
 链校验三元组（base_gen / prev_wm / seq）由 `CkptSectionType::kDeltaInfo` 段承
@@ -167,7 +168,7 @@ Hint CRC32 与 data CRC32 用同一多项式（zlib/IEEE 802.3），由 `bitcask
 | `bitcask.meta` | 用自己的 `kMetaMagicSize` 等（见 §三） |
 | `field.schema` | 用自己的 `kMagic` / `kVersion` / `kHeaderSize`（见 §八） |
 | `*.ckpt` / `index.manifest` | 用 `search_checkpoint.hpp` 的 `kCkptMagic` / `kCkptVersion` |
-| `kv.oki.seg-<gen>` / `kv.oki.manifest` | 用 `oki_run.hpp` 的 `kRunMagic` / `kRunTrailerMagic` / `kRunVersion` / `kManifestMagic` / `kManifestVersion` / `kFlagTomb`（见 §十五）|
+| `kv.oki.seg-<gen>` / `kv.oki.manifest` | 用 `oki_run.hpp` 的 `kRunMagic` / `kRunTrailerMagic` / `kRunVersion(2)` / `kManifestMagic` / `kManifestVersion(2/3)` / `kFlagTomb` / `kFlagHasLoc` / `kBloom*`（见 §十五）|
 
 ### 2.3 端序与 CRC 多项式
 
@@ -1129,58 +1130,86 @@ O(全表) 降到 O(range)。两类文件皆为**派生缓存**——任何校验
 | 文件 | 角色 |
 |------|------|
 | `kv.oki.seg-<gen>` | run：按 key 升序的不可变条目流（"BCOK" v1）|
-| `kv.oki.manifest`  | run 集合 + 覆盖水位，**唯一 commit point**（"BCOM" v1）|
+| `kv.oki.manifest`  | run 集合 + 覆盖水位 + Level B 模式戳，**唯一 commit point**（"BCOM" v1/v2/**v3**）|
 
-**条目只存 `(key, ord, tomb)`，不存位置信息**——range 查询逐 key 回查哈希
-keydir 取权威位置与活性。因此 merge 搬迁与 OKI 零交互，run 允许陈旧。
+**v1 条目只存 `(key, ord, tomb)`，不存位置信息**——range 查询逐 key 回查
+哈希 keydir 取权威位置与活性，merge 搬迁与 OKI 零交互，run 允许陈旧
+（Level A 语义）。**v2（S36，Level B）条目携全字段位置 + run 内嵌
+bloom**——组合视图（缓存 → memdelta → runs）自身即点查权威，keydir 降级
+为热点缓存（`CaskOptions::keydir_cache_entries` opt-in）。读端 v1/v2 双
+支持；写端：点查开启（影子对拍 / Level B）时 flush/rebuild 恒写 v2。
 
-### 15.1 run 布局（`kv.oki.seg-<gen>`，"BCOK" v1）
+### 15.1 run 布局（`kv.oki.seg-<gen>`，"BCOK" v1 / v2）
 
 ```
 头部 8 字节（kRunHeaderSize）：
   0..3   Magic    u32 LE = kRunMagic  (ASCII "BCOK")
-  4..7   Version  u32 LE = kRunVersion = 1
+  4..7   Version  u32 LE = 1（kRunVersion）或 2（kRunVersion2，S36）
 
 数据块区（块目标 ~4 KiB = kDefaultBlockBytes，块界由稀疏索引给出）：
-  **每块解码状态复位**（prev_key = "" / prev_ord = 0）——块首条自然退化为
-  全量 key + 绝对 ord，读写两端同一条码路径，无需块首特例。
+  **每块解码状态复位**（prev_key = "" / prev_ord = 0 / prev_tstamp = 0）
+  ——块首条自然退化为全量 key + 绝对值，读写两端同一条码路径。
   每条：
     shared_len : VByte  与 prev_key 的公共前缀长度
     suffix_len : VByte  后缀字节数
     suffix     : [suffix_len]
     ord_delta  : VByte  ord − prev_ord（u64 二补数回绕，同 hint v5 语义）
-    flags      : u8     bit0 = tomb（kFlagTomb）；其余位保留
+    flags      : u8     bit0 = tomb（kFlagTomb）
+                        bit1 = has_loc（kFlagHasLoc，仅 v2）；其余位保留
+  v2 且 has_loc 时追加（墓碑行免位置字段，省 ~20B/行）：
+    file_id      : VByte
+    total_sz     : VByte
+    offset       : VByte
+    tstamp_delta : VByte  对块内 prev_tstamp 的回绕差分
 
 稀疏索引区：
   count u32 LE + count × { [VByte klen][块首 key 字节][block_off u64 LE] }
 
-trailer 24 字节（kRunTrailerSize）：
-  [-24..-17] entry_count u64 LE
-  [-16..-9]  index_off   u64 LE   稀疏索引区起始偏移
-  [-8..-5]   CRC32       u32 LE   覆盖 [0, size-8)
-  [-4..-1]   Magic       u32 LE = kRunTrailerMagic (ASCII "BCOE")
+bloom 区（仅 v2；内嵌而非 sidecar——同一次原子落盘、同一 CRC 覆盖）：
+  [n_bits u64 LE][k u8][位数组 ceil(n_bits/8) 字节]
+  参数钉进格式：10 bits/key（kBloomBitsPerEntry）、k = 7（kBloomHashes）、
+  双哈希 = FNV-1a64 + splitmix64。open 时随稀疏索引一并载入内存。
+
+trailer：v1 24 字节（kRunTrailerSize）/ v2 32 字节（kRunTrailerSizeV2）：
+  [entry_count u64][index_off u64][bloom_off u64（仅 v2）]
+  [CRC32 u32 覆盖 [0, size-8)][Magic u32 = kRunTrailerMagic ("BCOE")]
 ```
 
-- **未知 flags 位 fail-fast**：读端遇 `flags & ~kKnownFlagsMask` 立刻
-  `kCorrupt`（整个 run 弃用重建），绝不静默跳过。保留位是 Level B（keydir
-  全字段磁盘驻留）的扩展位。
+- **未知 flags 位 fail-fast**：读端遇 `flags & ~kKnownFlagsMask(V2)` 立刻
+  `kCorrupt`（整个 run 弃用重建），绝不静默跳过（行无长度前缀不可跳行，
+  扩展只能 bump 版本）。
+- **v2 实测 33 B/行**（`doc:<n>` 形态；设计预估 45B）；v1 前缀差分锚点
+  6.2 B/key 见下。同 ord 冲突用 **(ord, run gen)** 字典序胜出——搬迁行
+  恒落更高 gen；epoch 刻意不落盘（会话内计数器，快照丢失重计后会永久
+  压住新行）。
 - **eager CRC**：`OkiRunReader::open` 全文件校验后才可用（派生缓存，安全
   优先；大 run 的惰性/分块校验属后续优化）。稀疏索引载入内存，Cursor 按块
   `pread`——Reader 不可变，多线程可各持 Cursor 并发读。
 - 有序 key 的公共前缀差分对 `prefix:id` 形态收益显著：实测 11B key、10 万
   条的 run ≈ 6.2 B/key（`bench/range_bench.cpp` 的 `BM_Oki_MemProbe`）。
 
-### 15.2 manifest 布局（`kv.oki.manifest`，"BCOM" v1）
+### 15.2 manifest 布局（`kv.oki.manifest`，"BCOM" v1 / v2 / v3）
 
 ```
 [0..3]    Magic  u32 LE = kManifestMagic (ASCII "BCOM")
-[4..7]    Ver    u32 LE = kManifestVersion = 1
-[8..11]   Count  u32 LE                     run 条数
-Count × { gen u64 LE | cover_ord u64 LE }   每 run 的代号与覆盖上界（排他）
+[4..7]    Ver    u32 LE = 1 / 2（S36-1）/ 3（S36-4）
+（仅 v3）flags u8：bit0 = level_b 模式戳；未知位整体拒收
+          Count  u32 LE                     run 条数
+Count × { gen u64 LE | cover_ord u64 LE
+          | format_ver u8（仅 v2/v3：run 格式版本 1/2） }
           wm u64 LE                         联合覆盖水位（排他上界）
 [-8..-5]  CRC32  u32 LE                     覆盖 [0, size-8)
 [-4..-1]  Magic  u32 LE                     尾 magic
 ```
+
+- **版本惰性选择**（写端）：level_b 戳需要 → v3；否则含 v2 run → v2；
+  全 v1 → v1（字节与老纪元相同，老读端可读）。老读端遇 v2/v3 拒收 →
+  整体弃用 → 重建，自愈（run 是派生缓存，meta 纪元不动——设计 §D3）。
+- **level_b 模式戳语义**（S36-4）：「本 manifest 由挂钩在线的 Level B
+  写者维护，run 内位置字段可信」。Level B 开启对**未带戳**目录必须全量
+  重建起步（关门期间的 merge 不维护 run 位置）；Level A 写者 open 即清
+  戳（`stamp_mode`，仅降级——升级恒经重建）；merge_only 旁车对带戳目录
+  open 拒绝（其无挂钩搬迁会静默腐蚀组合视图）。
 
 - 写端 `atomic_write_bytes(fsync_dir = true)`——与 `index.manifest` 同款
   纪律；manifest 落盘即整批 run 生效，是 OKI 的**唯一 commit point**。
@@ -1192,13 +1221,28 @@ Count × { gen u64 LE | cover_ord u64 LE }   每 run 的代号与覆盖上界（
 ### 15.3 生命周期与重建
 
 - **写挂钩**收敛在 `KeyDir::put` / `remove` 的咽喉点（Cask 各写路径零改
-  动）→ memdelta（内存有序增量）。
-- **flush**：memdelta 换出 → 按 key 排序 + 同 key 取 max-ord 去重（墓碑保
-  留为 tomb 行）→ 写新 run → 写 manifest → 推进 wm。恒在
-  `write_keydir_snapshot` 之后同站点搭车（close / merge 收尾 / checkpoint）。
-- **重建**：open 收尾若 `wm < 快照 next_ord` 或 manifest 缺失/损坏 → 遍历
-  keydir 活 key 排序写单 run（只在读写句柄做，best-effort 不阻断 open）。
-  迁移产物（`hintord` 的 dst）首开即走这条路。
+  动）→ memdelta（内存有序增量；S36-2 起行携全字段位置）。点查开启时挂
+  钩**入锁**（分片锁内完成 append——「哈希可见 ⟺ 已入组合视图」，逐出
+  安全性的根基，S36-4）；merge 搬迁 / TTL 删除以 `append_update` 绕水位
+  门入 delta（仅点查开启时收——Level A 维持零交互）。
+- **同 key 胜出全链路 = max (ord, 到达序)**：flush/读视图 stable 排序取
+  末、run 间 (ord, gen) 字典序、外排 (ord, spill 序)——同构一条规则。
+- **flush**：memdelta 前缀拷贝 → 排序去重（墓碑保留为 tomb 行）→ 写新
+  run（点查开启时恒 v2）→ 写 manifest → 推进 wm → 删已固化前缀（IO 期间
+  行仍在 delta，点查无不可见窗口）。恒在 `write_keydir_snapshot` 之后同
+  站点搭车（close / merge 收尾 / checkpoint）；写路径另有 1M 行 / 64MiB
+  阈值同步 flush。**B1 持久性过滤**（S36-5）：loc 越过其文件已 fsync 水位
+  的行持留在 delta（run 自身 fsync 落盘，不得引用可能随掉电蒸发的字节），
+  待持久水位推进后再固化；封口（roll/close）即 fsync 的「sealed ⟹
+  durable」不变量使持留只发生在 active 尾巴。
+- **merge 收尾序**（S36-5）：Level B 下搬迁行 flush **先于**输入 unlink
+  ——任意崩溃点：行在 run（新位置）或输入仍在（旧位置可读，内容相同）；
+  flush 失败则跳过 unlink，空间下轮回收。
+- **重建**：open 收尾若 `wm < 快照实载条目 ord 覆盖界`、manifest 缺失/
+  损坏、或 Level B 开启而 manifest 未带戳 → 遍历 keydir 活 key 经
+  **SpillingRunBuilder 外排**（64MiB 分段 spill `kv.oki.spill-*` + k 路
+  归并，500 万行峰值 RSS 83MB）写单 run（只在读写句柄做，best-effort 不
+  阻断 open）。迁移产物（`hintord` 的 dst）首开即走这条路。
 - **run 归并**（「极简两层」）：flush 提交后 run 数 > 8（`kCompactRunLimit`）
   → 把**全部** run k 路归并成单个新 run（同 key 取 max-ord），manifest 一次
   提交。不做 leveled compaction——OKI 条目不含 value，全归并 1 亿 key 也就
@@ -1214,6 +1258,29 @@ Count × { gen u64 LE | cover_ord u64 LE }   每 run 的代号与覆盖上界（
   删旧 manifest 列出的那些——manifest 缺失/损坏正是重建的触发场景，那批 run
   不在内存里，只删列表会留下永不回收的孤儿）。在途 ReadView 持
   `shared_ptr<Reader>`，POSIX 语义下已开 fd 仍可读完——无需显式引用计数。
+
+### 15.4 Level B：组合视图点查与 BCKS v4（S36）
+
+`CaskOptions::keydir_cache_entries > 0` 时 keydir 降级为热点缓存（超预算
+分片内采样逐出），点查权威 = **缓存 → memdelta（辅助哈希）→ v2 runs
+（gen 降序：bloom 试探 → 稀疏索引二分 → 块 LRU/pread → 块内扫，首命中
+即权威）**，冷 get ≤2 次 pread。1 亿 `doc:<n>` key 实测：常驻 11GB →
+加载峰值 1.14GB / 重开 0.80GB（-90%，2026-08-06 入档；重开走子集快照
+~1 秒）。fold/parallel_scan 的 key 枚举同样改走组合视图（屏障内捕获
+runs pin + delta 拷贝，逐 key 分片锁内以缓存裁决 epoch 快照语义）。
+
+**BCKS v4**（`kv.keydir.ckpt`）：payload 与 v3 逐字节同构，语义 = **缓存
+子集 + 逻辑计数**（entries 只含未被逐出的条目；key_count/key_bytes 标量
+是逻辑值）。接受条件（不满足即拒收 → 全量 fold，把子集当全量载入 = 静默
+丢 key）：Level B 意图 + manifest 带 level_b 戳 + 快照 next_ord ≤ oki
+wm（缺席条目可由组合视图兜底）。Level B 关闭恒写 v3（全量）。老读端
+（≤5.1.0 / Level A）遇 v4 拒收自愈。
+
+**B1 持久水位**（S36-5，全模式生效）：快照/ckpt 链水位/OKI run 一律只
+引用「已知 fsync 落盘」的字节——active 文件的水位在 checkpoint 采集点
+经 fd 级 fdatasync 推进，sealed 文件由封口 fsync 保证全量持久；未持久
+尾巴由恢复期 fold 重放补回。掉电后快照存活而数据蒸发的悬空条目
+（backlog B1）就此消除。
 
 ## 附录 A：常量速查
 
@@ -1253,10 +1320,10 @@ Count × { gen u64 LE | cover_ord u64 LE }   每 run 的代号与覆盖上界（
 | `docmap.ckpt` / `.prev` / `.d<seq>` | §九 + §十 |
 | `search.ckpt` / `.prev` | §九（legacy） |
 | `search.vec` / `search.qc8` | HNSW payload 容器（mmap） |
-| `kv.keydir.ckpt` | keydir 快照（BCKS v3：tstamp 定宽 8B） |
+| `kv.keydir.ckpt` | keydir 快照（BCKS v3 全量；**v4 = Level B 缓存子集**，S36） |
 | `index.manifest` | 三组件 ckpt 的统一提交点 |
-| `kv.oki.seg-<gen>` | §十五（OKI run，BCOK v1）|
-| `kv.oki.manifest` | §十五（OKI 提交点，BCOM v1）|
+| `kv.oki.seg-<gen>` | §十五（OKI run，BCOK v1/v2）|
+| `kv.oki.manifest` | §十五（OKI 提交点，BCOM v1-v3）|
 
 ### DocValue 嵌入字段
 
