@@ -12,7 +12,6 @@
 #include "bm25_search_impl.hpp"
 
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -408,11 +407,8 @@ bool write_segment_v2(
 // MmapSegment
 // ===========================================================================
 
-MmapSegment::~MmapSegment() {
-    if (base_ != nullptr) {
-        ::munmap(const_cast<std::byte*>(base_), len_);
-    }
-}
+// B3：映射归 io::MappedFile RAII（成员析构 munmap），不再手写。
+MmapSegment::~MmapSegment() = default;
 
 namespace {
 template <class T>
@@ -440,13 +436,12 @@ std::unique_ptr<MmapSegment> MmapSegment::open(const std::string& path,
         return nullptr;
     }
     const auto fsize = static_cast<std::size_t>(st.st_size);
-    void* map = ::mmap(nullptr, fsize, PROT_READ, MAP_SHARED, fd, 0);
+    seg->map_ = io::MappedFile::map_readonly(fd, fsize,
+                                             /*advise_random=*/false);
     ::close(fd);  // mmap 后 fd 可关(纯映射读,无 pread 路径)
-    if (map == MAP_FAILED) return nullptr;
+    if (!seg->map_.valid()) return nullptr;
 
-    seg->base_ = static_cast<const std::byte*>(map);
-    seg->len_ = fsize;
-    const std::byte* b = seg->base_;
+    const std::byte* b = seg->map_.data();
 
     // ---- Tail → Footer ----
     const std::byte* tail = b + fsize - 16;
@@ -601,14 +596,16 @@ bool MmapSegment::find_term(const Field& f, std::string_view term,
     return false;
 }
 
-bool MmapSegment::decode_rec(const Field& f, const segv2::TermRec& rec,
-                             FlatPostings& out) const {
-    out.ords.clear();
-    out.tfs.clear();
-    out.blocks.clear();
-    out.max_tf = rec.max_tf;
-    out.ords.reserve(rec.df);
-    out.tfs.reserve(rec.df);
+namespace {
+// T24：decode_rec / decode_rec_list 的共享解包段归并（原两份手抄块循环，
+// 62789cd 备案）。逐块：BlockMeta 载入 → 尾块条数 → 头/界检查 →
+// docid/tf 列解包；OutT 带 dls 成员（PostingList）时 dl 列一并解包，否则
+// 跳过（FlatPostings——评分 dl 走 LiveChecker）。FieldT/OutT 泛型化以免
+// 触碰 MmapSegment 私有嵌套类型；编译期分支零运行时开销。
+template <class FieldT, class OutT>
+bool decode_rec_columns(const FieldT& f, const segv2::TermRec& rec,
+                        OutT& out) {
+    constexpr bool kWantDl = requires(OutT& o) { o.dls; };
 
     const std::uint64_t metas_end =
         rec.blocks_off +
@@ -647,8 +644,28 @@ bool MmapSegment::decode_rec(const Field& f, const segv2::TermRec& rec,
                 out.tfs.push_back(br.get(bh.tf_bits));
             }
         }
-        // dl 列本解码不消费(FlatPostings 无 dls;评分 dl 走 LiveChecker)。
+        if constexpr (kWantDl) {
+            p += packed_bytes(cnt, bh.tf_bits);
+            BitReader br{p};
+            for (std::size_t i = 0; i < cnt; ++i) {
+                out.dls.push_back(br.get(bh.dl_bits));
+            }
+        }
     }
+    return true;
+}
+}  // namespace
+
+bool MmapSegment::decode_rec(const Field& f, const segv2::TermRec& rec,
+                             FlatPostings& out) const {
+    out.ords.clear();
+    out.tfs.clear();
+    out.blocks.clear();
+    out.max_tf = rec.max_tf;
+    out.ords.reserve(rec.df);
+    out.tfs.reserve(rec.df);
+
+    if (!decode_rec_columns(f, rec, out)) return false;
 
     // 块元数据重建:与 PostingList::finalize() 同语义——仅 df ≥ kBlockSize
     // 时物化(含部分尾块)。块布局差异不影响结果(块跳跃是 admissible 剪枝,
@@ -980,51 +997,7 @@ bool MmapSegment::decode_rec_list(const Field& f, const segv2::TermRec& rec,
     out.tfs.reserve(rec.df);
     out.dls.reserve(rec.df);
 
-    const std::uint64_t metas_end =
-        rec.blocks_off +
-        static_cast<std::uint64_t>(rec.block_count) * sizeof(segv2::BlockMeta);
-    if (metas_end > f.blocks_len) return false;
-
-    for (std::uint32_t bi = 0; bi < rec.block_count; ++bi) {
-        const auto bm = load_pod<segv2::BlockMeta>(
-            f.blocks + rec.blocks_off + bi * sizeof(segv2::BlockMeta));
-        const std::size_t cnt =
-            (bi + 1 < rec.block_count)
-                ? segv2::kBlockSize
-                : rec.df - static_cast<std::size_t>(rec.block_count - 1) *
-                               segv2::kBlockSize;
-        const std::uint64_t data = rec.postings_off + bm.data_off;
-        if (data + sizeof(BlockHeader) > f.postings_len) return false;
-        const auto bh = load_pod<BlockHeader>(f.postings + data);
-        const std::size_t need = sizeof(BlockHeader) +
-                                 packed_bytes(cnt, bh.docid_bits) +
-                                 packed_bytes(cnt, bh.tf_bits) +
-                                 packed_bytes(cnt, bh.dl_bits);
-        if (data + need > f.postings_len) return false;
-
-        const auto* p = reinterpret_cast<const std::uint8_t*>(
-            f.postings + data + sizeof(BlockHeader));
-        {
-            BitReader br{p};
-            for (std::size_t i = 0; i < cnt; ++i) {
-                out.ords.push_back(bm.first_docid + br.get(bh.docid_bits));
-            }
-        }
-        p += packed_bytes(cnt, bh.docid_bits);
-        {
-            BitReader br{p};
-            for (std::size_t i = 0; i < cnt; ++i) {
-                out.tfs.push_back(br.get(bh.tf_bits));
-            }
-        }
-        p += packed_bytes(cnt, bh.tf_bits);
-        {
-            BitReader br{p};
-            for (std::size_t i = 0; i < cnt; ++i) {
-                out.dls.push_back(br.get(bh.dl_bits));
-            }
-        }
-    }
+    if (!decode_rec_columns(f, rec, out)) return false;  // T24：共享解包段
 
     // positions(gap-varint 还原为绝对位置;pos_off 语义与内存版一致——
     // 无 positions 的 term 保持 empty ⇒ positions(i) 返回空 span)。

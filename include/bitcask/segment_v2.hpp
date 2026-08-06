@@ -25,6 +25,7 @@
 #pragma once
 
 #include "bitcask/index.hpp"      // DocSlot
+#include "bitcask/io.hpp"         // B3：MappedFile（sealed 段只读映射）
 #include "bitcask/inverted.hpp"   // FlatPostings / SearchResult / ExtStats / LiveChecker
 
 #include <atomic>
@@ -293,9 +294,8 @@ private:
         const bm25::LiveChecker& live_checker,
         const bm25::Bm25Params* params_override) const;
 
-    // mmap 区
-    const std::byte* base_ = nullptr;
-    std::size_t      len_ = 0;
+    // mmap 区（B3：RAII 归并进 io::MappedFile——析构 munmap/移动置空）
+    io::MappedFile map_;
     // header
     std::uint64_t seg_id_ = 0;
     std::uint32_t doc_count_ = 0;
