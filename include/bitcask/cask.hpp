@@ -867,6 +867,12 @@ public:
 
     [[nodiscard]] std::string_view dirname() const noexcept { return dirname_; }
     [[nodiscard]] keydir::KeyDir&  keydir()  noexcept { return *keydir_; }
+
+    // S36-5 B1 诊断：active data file 已知持久（fsync 过）的字节上界
+    // （水位由 DataFile 自维护，见 data_file.hpp durable_bytes）。
+    // 不变量（B1 收口）：checkpoint()/OKI flush 返回后，快照与 run 引用的
+    // active 字节 ≤ 此值（引用不跑赢持久）。测试观测点。
+    [[nodiscard]] std::uint64_t active_durable_bytes() const noexcept;
     [[nodiscard]] const CaskOptions& options() const noexcept { return opts_; }
 
 private:
@@ -899,6 +905,7 @@ private:
     // P4 组提交计数：自上次 fsync 以来的写次数。写路径单线程（caller 串行），
     // 无需原子。sync_every_n>0 时由 maybe_group_commit() 维护。
     std::uint32_t writes_since_sync_ = 0;
+
 
     // S11-W1：写路径互斥——把「调用方串行化所有写」的外部契约**内化**为内部锁，
     // 使同一 Cask 可被多线程并发写而不损坏数据（通用 C++ 库定位，
@@ -1178,7 +1185,8 @@ private:
     // 与写路径阈值 flush（memdelta 达阈值时同步落 run，罕见且有界）。
     void finish_oki_recovery(bool snap_loaded,
                              std::uint64_t snap_next_ord) noexcept;
-    void maybe_flush_oki() noexcept;
+    void maybe_flush_oki() noexcept;            // 前置：write_mu_ 已持有
+    void maybe_flush_oki_unlocked() noexcept;   // 锁外站点包装（自取锁）
     // S14-1：水位捕获与快照写入拆分。RunFn 路径（checkpoint()/自动 ckpt）
     // 必须在**提交时刻**（writer 侧）捕获字节水位、reducer 执行时刻写快照
     // 本体——执行时取水位会被并发写者推进，反转「keydir_covered ≤

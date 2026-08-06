@@ -743,7 +743,38 @@ PutResult KeyDir::put(std::string_view key,
             ? &oki_hooks_in_flight_ : nullptr);
 
     PutCtx ctx;
-    if (auto r = put_probe(ctx, key, old_file_id); r != PutResult::kOk) return r;
+    if (auto r = put_probe(ctx, key, old_file_id); r != PutResult::kOk) {
+        // S36-5：**缓存外搬迁**（设计 §7/D2——merge CAS 对被逐 key 的
+        // Level B 通路）。哈希 miss + 条件 put 在 probe 快速失败——冷视图
+        // 核对旧位置：精确匹配 ⟹ 该 key 自搬迁决策以来无更新写（有则冷
+        // 侧已是新行），免 CAS 收下搬迁行（新 loc、原 ord，delta/更高 gen
+        // 胜出）；不匹配 ⟹ 已被并发覆盖，与「CAS 失败 = 跳过」同构。
+        // 行只进组合视图不进缓存（腾位语义——搬迁不该把冷 key 变热）。
+        // ctx.slock 仍持有（append 入锁纪律）；ctx.found 为真（含缓存墓碑
+        // 命中）时缓存即权威，不问冷侧。
+        if (r == PutResult::kAlreadyExists && old_file_id != 0 &&
+            !ctx.found && oki_->point_query_enabled()) {
+            const auto cold = oki_->locate(key);
+            if (cold.status == oki::OkiState::LocateStatus::kHit &&
+                !cold.tomb && cold.has_loc &&
+                cold.loc.file_id == old_file_id &&
+                cold.loc.offset == old_offset) {
+                const oki::RowLoc loc{file_id, total_sz, offset, tstamp};
+                oki_->append_update(key, cold.ord, /*tomb=*/false, &loc);
+                // fstats 搬家（镜像 put_overwrite 跨文件分支；同文件搬迁
+                // 在 merge 语义下不存在——输出恒是新文件）。
+                update_fstats(cold.loc.file_id, /*tstamp*/ 0, kMaxEpoch,
+                              -1, 0,
+                              -static_cast<std::int32_t>(cold.loc.total_sz),
+                              0, /*should_create*/ false);
+                const auto sz = static_cast<std::int32_t>(total_sz);
+                update_fstats(file_id, tstamp, kMaxEpoch,
+                              1, 1, sz, sz, /*should_create*/ true);
+                return PutResult::kOk;
+            }
+        }
+        return r;
+    }
 
     // 全局 epoch 计数器递增，作为本次写入的时间戳。分片锁内完成。
     ctx.this_epoch = epoch_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1376,7 +1407,36 @@ PutResult KeyDir::conditional_remove(std::string_view key,
                 }
             }
         }
-        if (!found) return PutResult::kOk;  // legacy: not-found is success
+        if (!found) {
+            // S36-5：Level B——被逐 key 的 TTL 删除。冷视图精确匹配
+            // (tstamp, file_id, offset) 才删（与哈希侧精确 CAS 同构）：
+            // 记受害者 ord 的墓碑行（抵消 run 活行，slock 持有 = 入锁
+            // 纪律）+ 逻辑退账。不匹配/未命中 → 维持「not-found is
+            // success」旧语义（已被并发处理/真不存在）。否则过期记录随
+            // merge 不搬运 + 输入 unlink，组合视图留下悬空 loc——冷 get
+            // 会报 kIo 而非 kNotFound。
+            if (oki_->point_query_enabled()) {
+                const auto cold = oki_->locate(key);
+                if (cold.status == oki::OkiState::LocateStatus::kHit &&
+                    !cold.tomb && cold.has_loc &&
+                    cold.loc.tstamp == tstamp &&
+                    cold.loc.file_id == file_id &&
+                    cold.loc.offset == offset) {
+                    oki_->append_update(key, cold.ord, /*tomb=*/true,
+                                        nullptr);
+                    update_fstats(file_id, tstamp, kMaxEpoch,
+                                  -1, 0,
+                                  -static_cast<std::int32_t>(
+                                      cold.loc.total_sz),
+                                  0, /*should_create*/ false);
+                    assert(key_count_.load(std::memory_order_relaxed) > 0);
+                    key_count_.fetch_sub(1, std::memory_order_relaxed);
+                    key_bytes_.fetch_sub(key.size(),
+                                         std::memory_order_relaxed);
+                }
+            }
+            return PutResult::kOk;  // legacy: not-found is success
+        }
         if (cur.tstamp != tstamp || cur.file_id != file_id || cur.offset != offset) {
             return PutResult::kAlreadyExists;
         }
@@ -2247,13 +2307,35 @@ bool KeyDir::save_snapshot(
         snap_put64(buf, off);
     }
 
-    snap_put64(buf, entries_total);
+    // S36-5 B1：持久性过滤——entry 落在其文件水位之外（active 的水位已被
+    // collect_snapshot_watermarks 钳到已 fsync 字节）不入快照：快照自身
+    // fsync 落盘，引用可能随掉电蒸发的字节 = 悬空条目。被滤 entry 由恢复
+    // 期「从水位 fold 重放」补回（数据活着就回来，方向安全），故
+    // key_count/key_bytes 标量同步扣除（否则重放 +1 双记）。无水位的文件
+    // （测试直调空表等）不过滤——与恢复端「快照不认识的文件全量 fold」的
+    // 既有语义一致。entry 数写占位、回填。
+    std::unordered_map<std::uint32_t, std::uint64_t> wm_of;
+    wm_of.reserve(watermarks.size());
+    for (const auto& [fid, off] : watermarks) wm_of.emplace(fid, off);
+
+    const std::size_t count_pos = buf.size();
+    snap_put64(buf, 0);  // 占位
+    std::uint64_t written = 0;
+    std::uint64_t skipped_keys = 0;
+    std::uint64_t skipped_key_bytes = 0;
     for (const auto& shard : shards_) {
         for (auto& [key, entry] : shard.entries) {
             const auto* se = std::get_if<SingleEntry>(&entry);
             if (se == nullptr) return false;  // 防御:不应出现(keyfolders_==0)
             if (is_sibling_tombstone(*se)) continue;  // S29-6 P1:墓碑不入快照
             if (key.size() > 0xFFFF) return false;
+            if (auto wit = wm_of.find(se->file_id);
+                wit != wm_of.end() &&
+                se->offset + se->total_sz > wit->second) {
+                ++skipped_keys;
+                skipped_key_bytes += key.size();
+                continue;  // B1：未持久字节，不入快照
+            }
             snap_put_vb(buf, key.size());
             const auto* kd = reinterpret_cast<const std::uint8_t*>(key.data());
             buf.insert(buf.end(), kd, kd + key.size());
@@ -2263,7 +2345,23 @@ bool KeyDir::save_snapshot(
             snap_put_vb(buf, se->epoch);
             snap_put64(buf, se->tstamp);   // 定宽 8B:u64 unix 秒（v3）
             snap_put_vb(buf, se->ord);
+            ++written;
         }
+    }
+    bitcask::le_store_u64(
+        reinterpret_cast<std::byte*>(buf.data() + count_pos), written);
+    if (skipped_keys != 0) {
+        // 标量布局：magic(4)+ver(4) | next_ord@8 epoch@16 biggest@24(4B)
+        // key_count@28 key_bytes@36（写端上方顺序即此）。
+        const std::uint64_t kc =
+            key_count_.load(std::memory_order_relaxed);
+        const std::uint64_t kb =
+            key_bytes_.load(std::memory_order_relaxed);
+        bitcask::le_store_u64(reinterpret_cast<std::byte*>(buf.data() + 28),
+                              kc >= skipped_keys ? kc - skipped_keys : 0);
+        bitcask::le_store_u64(reinterpret_cast<std::byte*>(buf.data() + 36),
+                              kb >= skipped_key_bytes ? kb - skipped_key_bytes
+                                                      : 0);
     }
 
     const std::uint32_t crc = codec::crc32(std::span<const std::byte>(
@@ -2382,6 +2480,7 @@ auto KeyDir::load_snapshot(std::string_view path, bool accept_subset,
 
     const std::uint64_t entry_n = c.u64();
     if (c.fail || entry_n > (1ull << 40)) { reset_all(); return std::nullopt; }
+    snap_covered_ord_ = 0;  // S36-5：随载入条目重算（见 accessor 注释）
     for (auto& sh : shards_) {
         sh.entries.reserve(static_cast<std::size_t>(entry_n) / kShards + 1);
     }
@@ -2403,6 +2502,8 @@ auto KeyDir::load_snapshot(std::string_view path, bool accept_subset,
         se.file_id  = static_cast<std::uint32_t>(fid);
         se.total_sz = static_cast<std::uint32_t>(tsz);
         if (c.fail) { reset_all(); return std::nullopt; }
+        // S36-5：覆盖界 = 实际载入条目的最大 ord + 1（排他）。
+        snap_covered_ord_ = std::max(snap_covered_ord_, se.ord + 1);
         // entries 按 shard_for 分发（磁盘格式无分片概念）。
         Shard& sh = shards_[shard_for(key)];
         sh.entries.emplace(std::move(key), se);

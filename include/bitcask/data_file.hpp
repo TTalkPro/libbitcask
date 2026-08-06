@@ -25,10 +25,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -133,6 +135,26 @@ public:
     // 写路径同步使用 → 实际由 caller 单线程触发。
     [[nodiscard]] std::expected<void, DataFileFault> sync();
 
+    // S36-5 B1：当前逻辑大小（追加游标，含未 flush 的批缓冲）。
+    // 线程安全: 否（与写操作同线程使用；写者串行契约同 write()）。
+    [[nodiscard]] std::uint64_t logical_size() const noexcept {
+        return current_offset_;
+    }
+
+    // ---- S36-5 B1：持久水位（本文件已知 fsync 落盘的字节上界）----
+    // 文件自维护：sync() 成功推进到当前逻辑大小；o_sync 打开的文件每次
+    // pwrite 即持久（写路径顺手推进）；kAppend/kRead 打开初始化为现有
+    // 大小（已在盘上的字节）。快照/OKI flush 的「引用 ≤ 持久」过滤依据。
+    // 线程安全: 是（atomic；shared_ptr 保对象移动语义）。
+    [[nodiscard]] std::uint64_t durable_bytes() const noexcept {
+        return durable_->load(std::memory_order_acquire);
+    }
+    // 仅 fd 级 fdatasync（**不** flush 批缓冲——批缓冲归写者线程），把持久
+    // 水位 CAS-max 推进到 floor（调用方先 stat 文件大小作 floor：fd fsync
+    // 后内核态字节必然全部持久）。线程安全: 是——checkpoint 采集等跨线程
+    // 站点专用；与写者的 pwrite/sync 并发安全。
+    [[nodiscard]] bool sync_fd_only(std::uint64_t durable_floor) noexcept;
+
     // ---- 读取 ----
 
     // 在 offset 处读一条 record，size 必须等于当时写入时记录的 total_size
@@ -188,14 +210,22 @@ public:
     void close() noexcept { file_.close_quiet(); }
 
 private:
-    DataFile(io::PosixFile&& f, std::string p, std::uint64_t off, Mode m) noexcept
+    DataFile(io::PosixFile&& f, std::string p, std::uint64_t off, Mode m,
+             bool durable_writes) noexcept
         : file_(std::move(f)), path_(std::move(p)),
-          current_offset_(off), mode_(m) {}
+          current_offset_(off), mode_(m),
+          durable_writes_(durable_writes),
+          durable_(std::make_shared<std::atomic<std::uint64_t>>(off)) {}
 
     io::PosixFile  file_;
     std::string    path_;
     std::uint64_t  current_offset_ = 0;
     Mode           mode_           = Mode::kRead;
+    // S36-5 B1：持久水位（见 durable_bytes 注释）。o_sync 打开 = 逐条持久
+    //（写路径顺手推进）；shared_ptr 使 DataFile 保持可移动。
+    bool           durable_writes_ = false;
+    std::shared_ptr<std::atomic<std::uint64_t>> durable_ =
+        std::make_shared<std::atomic<std::uint64_t>>(0);  // 默认构造亦可用
     std::vector<std::byte> write_buf_;  // write() 复用的编码缓冲;容量跨调用保留
     // S2:write_buffered() 累积缓冲。对应文件区间 [current_offset_-size, current_offset_)；
     // flush_batch() 一次 pwrite 后清空（容量保留复用）。

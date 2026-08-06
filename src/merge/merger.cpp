@@ -125,7 +125,9 @@ std::expected<void, MergeFault> MergeRunner::apply_pending() {
             for (auto* p : plugins_) p->on_relocate(ev);
             continue;
         }
-        auto cur = keydir_.get(u.key);
+        // S36-5：stuck 复查同样走 locate（逐出态下哈希 miss 会漏报 stuck；
+        // 组合视图仍指旧位置才是真 stuck）。
+        auto cur = keydir_.locate(u.key);
         if (cur && cur->file_id == u.old_file_id &&
             cur->offset == u.old_offset) {
             stats_.relocations_stuck += 1;
@@ -160,13 +162,17 @@ void MergeRunner::fold_record(const codec::DataRecordView& view,
         return;
     }
 
-    // 活性检查：keydir 当前最新指向必须正好是 (in_file_id, offset)
-    // 才算这条 record 是活的。否则它已经被新写入覆盖了，merge
-    // 不要再保留——直接 records_stale +1 跳过。
+    // 活性检查：当前最新指向必须正好是 (in_file_id, offset) 才算这条
+    // record 是活的。否则它已经被新写入覆盖了，merge 不要再保留——直接
+    // records_stale +1 跳过。
+    // S36-5：`get` 切 `locate`（设计 §7——Level B 最深的一刀）：逐出态下
+    // 哈希 miss ≠ 死亡，被逐的活 key 必须经组合视图判活，否则整批被判
+    // stale 跳过、随输入 unlink 数据丢失。Level A（点查关）locate ≡ get，
+    // 行为逐字节相同。
     std::string_view key_sv(
         reinterpret_cast<const char*>(view.key.data()),
         view.key.size());
-    auto current = keydir_.get(key_sv);
+    auto current = keydir_.locate(key_sv);
     if (!current ||
         current->file_id != in_file_id ||
         current->offset  != offset) {

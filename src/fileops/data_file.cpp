@@ -43,7 +43,10 @@ DataFile::open(std::string_view path, Mode mode, bool sync, bool mmap_enabled) {
         if (!end) return std::unexpected(io_fault(end.error()));
         initial_off = *end;
     }
-    DataFile df(std::move(*f), std::string(path), initial_off, mode);
+    // S36-5 B1：o_sync（durable_writes）= 逐条持久；持久水位初值 =
+    // 现有大小（盘上字节；kCreate 为 0）。
+    DataFile df(std::move(*f), std::string(path), initial_off, mode,
+                sync && mode != Mode::kRead);
 
     // P6:sealed 只读文件整文件 mmap(PROT_READ, MAP_SHARED)。只对 kRead
     // (sealed 不可变,无 torn-tail/SIGBUS)、64 位(地址空间)、非空文件。
@@ -75,6 +78,7 @@ DataFile::~DataFile() {
 DataFile::DataFile(DataFile&& o) noexcept
     : file_(std::move(o.file_)), path_(std::move(o.path_)),
       current_offset_(o.current_offset_), mode_(o.mode_),
+      durable_writes_(o.durable_writes_), durable_(std::move(o.durable_)),
       write_buf_(std::move(o.write_buf_)),
       map_base_(o.map_base_), map_size_(o.map_size_) {
     o.map_base_ = nullptr;
@@ -90,6 +94,8 @@ DataFile& DataFile::operator=(DataFile&& o) noexcept {
         path_           = std::move(o.path_);
         current_offset_ = o.current_offset_;
         mode_           = o.mode_;
+        durable_writes_ = o.durable_writes_;
+        durable_        = std::move(o.durable_);
         write_buf_      = std::move(o.write_buf_);
         map_base_       = o.map_base_;
         map_size_       = o.map_size_;
@@ -152,6 +158,9 @@ DataFile::write(format::RecordType type,
     auto w = file_.pwrite(off, write_buf_);
     if (!w) return std::unexpected(io_fault(w.error()));
     current_offset_ += total;
+    if (durable_writes_) {  // S36-5 B1：O_SYNC pwrite 即持久
+        durable_->store(current_offset_, std::memory_order_release);
+    }
     return WriteResult{off, static_cast<std::uint32_t>(total)};
 }
 
@@ -166,6 +175,9 @@ DataFile::write_encoded(std::span<const std::byte> record) {
     auto w = file_.pwrite(off, record);
     if (!w) return std::unexpected(io_fault(w.error()));
     current_offset_ += record.size();
+    if (durable_writes_) {  // S36-5 B1：O_SYNC pwrite 即持久
+        durable_->store(current_offset_, std::memory_order_release);
+    }
     return WriteResult{off, static_cast<std::uint32_t>(record.size())};
 }
 
@@ -202,6 +214,9 @@ std::expected<void, DataFileFault> DataFile::flush_batch() {
     auto w = file_.pwrite(flush_off, batch_buf_);
     if (!w) return std::unexpected(io_fault(w.error()));
     batch_buf_.clear();  // 复用容量
+    if (durable_writes_) {  // S36-5 B1：O_SYNC pwrite 即持久
+        durable_->store(current_offset_, std::memory_order_release);
+    }
     return {};
 }
 
@@ -224,7 +239,20 @@ std::expected<void, DataFileFault> DataFile::sync() {
     if (auto f = flush_batch(); !f) return std::unexpected(f.error());
     auto s = file_.sync();
     if (!s) return std::unexpected(io_fault(s.error()));
+    // S36-5 B1：全部逻辑字节已持久。
+    durable_->store(current_offset_, std::memory_order_release);
     return {};
+}
+
+// S36-5 B1：跨线程 fd 级持久化（语义见头文件）。
+bool DataFile::sync_fd_only(std::uint64_t durable_floor) noexcept {
+    if (!file_.sync()) return false;
+    std::uint64_t cur = durable_->load(std::memory_order_relaxed);
+    while (cur < durable_floor &&
+           !durable_->compare_exchange_weak(cur, durable_floor,
+                                            std::memory_order_release)) {
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

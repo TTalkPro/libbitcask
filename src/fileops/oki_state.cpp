@@ -143,7 +143,9 @@ std::uint64_t OkiState::next_gen_locked() const noexcept {
     return g + 1;
 }
 
-bool OkiState::flush(std::string_view dir) {
+bool OkiState::flush(
+    std::string_view dir,
+    std::span<const std::pair<std::uint32_t, std::uint64_t>> durable_wms) {
     std::lock_guard<std::mutex> flk(flush_mu_);
     if (!loaded_.load(std::memory_order_relaxed)) return false;
 
@@ -151,13 +153,40 @@ bool OkiState::flush(std::string_view dir) {
     // 组合视图无「在写盘路上不可见」的窗口），提交后才删前缀。失败路径
     // 因此零恢复动作（原 swap+restore 退役）。代价是一次前缀拷贝——flush
     // 本就伴随全量排序 + 文件 IO，量级淹没。
-    std::vector<DeltaRow> rows;
+    std::vector<DeltaRow> all;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        rows.assign(delta_.begin(), delta_.end());
+        all.assign(delta_.begin(), delta_.end());
     }
-    if (rows.empty()) return true;
-    const std::size_t prefix_n = rows.size();
+    if (all.empty()) return true;
+    const std::size_t prefix_n = all.size();
+
+    // S36-5 B1：持久性分拣——loc 越过其文件持久水位的行持留（语义见头
+    // 文件）。held 与前缀下标对齐，提交后据此选择性删除。
+    std::vector<char> held(prefix_n, 0);
+    std::vector<DeltaRow> rows;
+    rows.reserve(prefix_n);
+    std::size_t flushed_bytes = 0;
+    for (std::size_t i = 0; i < prefix_n; ++i) {
+        const DeltaRow& r = all[i];
+        bool hold = false;
+        if (r.has_loc && !durable_wms.empty()) {
+            for (const auto& [fid, wm] : durable_wms) {
+                if (fid == r.loc.file_id) {
+                    hold = r.loc.offset + r.loc.total_sz > wm;
+                    break;
+                }
+            }
+        }
+        if (hold) {
+            held[i] = 1;
+        } else {
+            flushed_bytes += r.key.size() + sizeof(DeltaRow);
+            rows.push_back(all[i]);
+        }
+    }
+    all.clear();
+    if (rows.empty()) return true;  // 全持留：本轮无事（持久水位推进后再来）
 
     // 排序 + 同 key 去重。**stable**：同 key 同 ord 的多行按到达序取末
     //（merge 搬迁行与被搬迁行同 ord，后到的新位置必须胜——(ord, 到达序)
@@ -221,16 +250,20 @@ bool OkiState::flush(std::string_view dir) {
     wm_.store(manifest_.wm, std::memory_order_release);
 
     // 提交完成，删已固化的前缀（先发布 run 快照再删——中间态两边可见，
-    // delta 优先，语义不变）。IO 期间新 append 的行在前缀之后，保留。
+    // delta 优先，语义不变）。IO 期间新 append 的行在前缀之后，保留；
+    // S36-5：持留行（held）留在队头，相对序不变（(ord, 到达序) 格保持）。
     {
         std::lock_guard<std::mutex> lk(mu_);
-        std::size_t freed = 0;
+        std::vector<DeltaRow> next;
+        next.reserve(prefix_n + delta_.size() - prefix_n);
         for (std::size_t i = 0; i < prefix_n; ++i) {
-            freed += delta_[i].key.size() + sizeof(DeltaRow);
+            if (held[i] != 0) next.push_back(std::move(delta_[i]));
         }
-        delta_.erase(delta_.begin(),
-                     delta_.begin() + static_cast<std::ptrdiff_t>(prefix_n));
-        delta_bytes_ -= std::min(delta_bytes_, freed);
+        for (std::size_t j = prefix_n; j < delta_.size(); ++j) {
+            next.push_back(std::move(delta_[j]));
+        }
+        delta_ = std::move(next);
+        delta_bytes_ -= std::min(delta_bytes_, flushed_bytes);
         rebuild_index_locked();
         update_flush_hint_locked();
     }

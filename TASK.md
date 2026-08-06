@@ -712,15 +712,64 @@ oki_run+oki_state（BCOM v3 模式戳）、cask（选项 + open 协议 + 组提�
   722/722** | **TSan 并发套件 193/193**（含新增锁序豁免一条，见上）|
   build-rel 双树零错误（CaskOptions 公共结构体变更）。未提交。
 
-### S36-5 — merge 组合视图 + 崩溃注入 + B1 收口 🔴 HIGH
+### ✅ S36-5 — merge 组合视图 + 崩溃注入 + B1 收口 🔴 HIGH
 
-- [ ] merge 活性/搬迁切 locate；unlink 前搬迁行入 delta 顺序不变量；
-      遗留 B1（ckpt fsync 水位）失败注入证实 + 修复
-- [ ] **（S36-2 发现）搬迁行崩溃缺口**：memdelta 中未 flush 的搬迁行随
-      崩溃丢失 → run 内 loc 陈旧且 wm 无缺口不触发重建（Level A 无害，
-      Level B 是权威错位）。候选：merge 收尾 flush 先于输入 unlink，或
-      unclean shutdown + merge 痕迹 → 重建
-- **验收**：逐出态 merge 千轮无丢 key stress；崩溃注入全套；ASan/TSan
+- [x] merge 活性/搬迁/stuck 复查切 locate；缓存外搬迁 = 冷视图精确匹配
+      免 CAS 收下（(ord, gen) 格）；TTL 对被逐 key 冷删除（精确匹配 +
+      墓碑 + 退账）
+- [x] **（S36-2 缺口）搬迁行崩溃收口**：merge 收尾「搬迁行固化（OKI
+      flush）先于输入 unlink」——flush 失败即跳过 unlink 保输入
+- [x] **B1 收口**：持久水位挂 DataFile 自维护（sync/o_sync 写路径/封口
+      推进）+ checkpoint 采集点 fd 级 fdatasync + 快照/OKI flush 一律
+      「引用 ≤ 持久」过滤；注入测试证实 + 回归钉死
+- **验收**：✅ 逐出态 merge 千轮无丢 key stress；崩溃注入（merge 后崩溃 /
+  B1 掉电模拟）；Debug/ASan 全量 + TSan 门控口径全绿
+
+#### ✅ S36-5 落地记录（2026-08-06）
+
+落点：merger（locate 切换）、keydir（冷搬迁/冷 TTL 删除）、data_file
+（持久水位）、cask（B1 采集/封口/merge 收尾序）、oki_state（flush 持留）
++ `oki_levelb_test` 4 新用例。要点：
+
+- **merge 活性权威 = locate**（设计 §7「最深的一刀」）：fold_record 活性
+  判定与 apply 后的 stuck 复查都切 locate——逐出态下哈希 miss ≠ 死亡，
+  否则被逐活 key 整批判 stale、随输入 unlink 丢失。Level A（点查关）
+  locate ≡ get，逐字节等价。
+- **缓存外搬迁免 CAS**（§D2 落地）：条件 put 在 probe 快速失败后问冷视
+  图——旧位置精确匹配 ⟹ 无并发更新写（有则冷侧已是新行），收下搬迁行
+  （新 loc + 原 ord，delta/高 gen 胜出）+ fstats 搬家；不匹配 ⟹ 与
+  「CAS 失败 = 跳过」同构。行只进组合视图不进缓存（搬迁不加热冷 key）。
+  TTL 的 conditional_remove 同款：冷视图 (tstamp,fid,off) 精确匹配才删
+  （受害者 ord 墓碑 + 计数退账），否则被逐过期键在输入 unlink 后悬空
+  （冷 get 报 kIo 而非 kNotFound）。
+- **搬迁行崩溃收口**：merge 收尾在 unlink 之前把 OKI flush 落盘（Level B
+  gate）——任意崩溃点安全：搬迁行在 run（新 loc）或输入仍在（旧 loc 可
+  读、内容相同）；flush 失败跳过全部 unlink/trim（空间下轮回收）。
+- **B1（checkpoint 跑赢未 fsync 数据）收口**——注入测试先证实（默认策略
+  下写后持久水位为 0，快照却全量引用），修复三件套：
+  ① **持久水位挂 DataFile**（`durable_bytes`，shared_ptr<atomic> 保移动
+  语义）：sync() 推进、o_sync 写路径逐条推进、roll/close/close_write_file
+  **封口即持久**（sealed ⟹ durable 不变量，每文件一次 fsync；顺手发现并
+  修复 close() 不经 close_write_file、sync_every_n=0 下全程零 fsync 的
+  既有暴露）；
+  ② **checkpoint 采集点 fd 级 fdatasync**（`sync_fd_only`——线程安全，不
+  碰写者批缓冲；stat 大小做 floor CAS-max）——采集水位恒 = 已持久字节；
+  ③ **「引用 ≤ 持久」过滤**：keydir 快照跳过水位外 entry（计数标量同步
+  扣减，恢复期水位 fold 重放补回）；OKI flush 对水位外行**持留**在
+  delta（下轮再固化）；OKI 缺口检查基准从「快照 next_ord 标量」改为
+  「快照**实载条目**的 ord 覆盖界」（load 时重算，零格式变更——否则持留
+  行为会被误判成缺口而每次崩溃恢复都全量重建）。
+  写路径阈值 flush 前先 sync active（写者线程持 write_mu_）；锁外尾站点
+  改经 `maybe_flush_oki_unlocked` 包装（hint 快查命中才取锁）。
+- **测试**：B1 注入（fork 崩溃 + 按持久水位截尾模拟掉电：checkpoint 覆
+  盖键全存活、掉电丢失键干净 kNotFound、无悬空 kIo）；merge 后立即崩溃
+  （逐出态搬迁行固化验证，600 键值全对）；TTL×逐出×merge（kNotFound +
+  计数精确）；**千轮 merge stress**（400 键 ≫ 128 预算深度逐出，1000 轮
+  覆盖+merge，周期全量对拍零丢 key、计数恒精确，2.3s）。
+- **验收**：Debug 全量 **726/726**（722 + 4 新增）| **ASan 全量
+  726/726** | **TSan 并发套件 197/197**（门控口径）| build-rel 零错误 |
+  bench：put 1268±23ns（基线 1244，+1.9% ≤3%）、merge 20.7-21.0ms
+  （基线 20.4-21.4，零回归）、hot get 840ns（零回归）。未提交。
 
 ### S36-6 — C API + 文档 + 门禁复测 🟡 MED
 
@@ -752,7 +801,7 @@ S33-7 (评审)  ───── 依 S33-1 数据
 | T24 | decode_rec 共享解包段模板归并（须 bench 基准 + build-rel 双树）| 🟢 择机——**前提复核仍成立**：两份解码现位于 `src/bm25/segment_v2.cpp:604`（`decode_rec`→FlatPostings）与 `:970`（`decode_rec_list`→PostingList），原文见 git 历史 62789cd |
 | T8 | 搜索读屏障无界等待（`prepare_search` 饥饿）| ⏸ 4 项前置未满足（饥饿注入测试 / applied_ord 可见性调查 / flush 超时基建✅ / flush_upto+notify 成对恢复；原文 62789cd）|
 | T12 | HNSW ckpt 去重（~115 行）| ⏸ 默认不做（注释同步已替代）|
-| **B1** | **checkpoint 可能跑赢未 fsync 的数据**（S35 测试期发现的**预存**暴露面）：keydir 快照/OKI 经 `atomic_write_bytes` fsync 落盘，而被引用的数据记录可能还在 page cache——掉电后快照存活、数据撕裂 ⟹ 恢复拿到悬空条目（get 报 IO/CRC）。单条 put 与批同样暴露，非 S35 引入。候选方向：ckpt 写前记录各文件已 fsync 水位、快照只覆盖水位内条目；或 ckpt 前强制 sync。**须先写失败注入测试证实再立项** | 🟡 待评估 |
+| **B1** | **checkpoint 可能跑赢未 fsync 的数据** | ✅ done（S36-5 收口：DataFile 持久水位 + ckpt 采集点 fd-fsync + 快照/OKI「引用 ≤ 持久」过滤 + 封口即持久；注入测试 `B1CheckpointNeverOutrunsDataFsync` 证实并钉死，见 S36-5 落地记录）|
 | **B2** | **legacy 意图重放退役时间表**：`TxnCask::recover`/`pending_txns` + blob v1 解码现在只服务方案 B 时期（dc81bbc..S35 之间）目录的崩溃遗留。建议 5.3+ 删除（CHANGELOG 预告一版）| 🟢 择机 |
 | **B3** | **mmap 收进 io.hpp（造 `MappedFile` RAII）**：`::mmap/munmap` 手写生命周期现散布 7 处（`data_file.{hpp,cpp}` / `segment_v2.{hpp,cpp}` / `hnsw.cpp` / `diskann.cpp` / `ivf_rq.cpp`），各写各的 map/unmap/错误处理/madvise——本身就是维护面（S33-B2 那类窗口 bug 的温床）。归并为 io.hpp 单一 `MappedFile`（open/映射长度/只读 span 视图/移动语义），各站点换用。**验收**：行为零变化（纯重构）+ 全矩阵 + build-rel 双树 | 🟢 择机（2026-08-06 入列）|
 | **B4** | **unlink-while-open 从设计里拿掉，换延迟删除队列**：现设计多处依赖「POSIX unlink 后已开 fd 仍可读」（merge 收尾 unlink 输入文件、OKI `sweep_runs`/rebuild 清旧 run），并为此付了三笔补丁账：O10 的 erase+unlink 同临界区（cask.cpp merge 收尾注释）、S13-F5 的 lazy-reopen 重试、在途读者 shared_ptr 续命——但「持旧 keydir 快照的在途 get 在 unlink 后 lazy reopen 报 ENOENT 假失败」一类窗口（cask.cpp:1388/2921 两处注记）只是被缓解，未根除。改为**延迟删除队列**：文件先退休入队（改名或仅记账），等在途引用静止（epoch/引用计数）后真正删除——ENOENT 假失败窗口整类消失，O10 持锁做文件系统操作的别扭也随之解除；顺带是未来非 POSIX 语义文件系统的可移植性铺垫。**验收**：并发 get/iter × merge 收尾 stress（含 S13-F5 场景）+ 崩溃后队列残件回收 | 🟢 择机（2026-08-06 入列）|

@@ -96,11 +96,21 @@ public:
         return wm_.load(std::memory_order_acquire);
     }
 
-    // flush：memdelta 换出 → 按 key 排序 + 同 key 取 max-ord 去重（墓碑
-    // 保留为 tomb 行）→ 写新 run → manifest 提交（唯一 commit point）→
-    // 推进 wm。空 delta 且已加载 → no-op true。IO 失败 → 行放回、状态不
-    // 变、返回 false（下次重试）。未加载态拒绝（先 load/rebuild）。
-    [[nodiscard]] bool flush(std::string_view dir);
+    // flush：memdelta 前缀拷贝 → 按 key 排序 + 同 key 取 (ord,到达序) 去重
+    // （墓碑保留为 tomb 行）→ 写新 run → manifest 提交（唯一 commit
+    // point）→ 推进 wm → 删已固化前缀。空 delta 且已加载 → no-op true。
+    // IO 失败 → delta 原状（无恢复动作）、返回 false（下次重试）。未加载
+    // 态拒绝（先 load/rebuild）。
+    // S36-5 B1：durable_wms 非空 = 各文件的**已持久字节水位**——loc 越界
+    // 的行**持留**在 delta（run 自身 fsync 落盘，引用可能随掉电蒸发的字节
+    // = 冷点查的悬空 loc），待下次 flush（持久水位推进后）再固化。持留行
+    // 恒是 active 尾巴（sealed 由封口 fsync 全量持久），ord 全局最高——
+    // cover/wm 不含它们，tail 重放的水位门语义自洽。空 span = 不过滤
+    // （调用方已保证全部持久，如写路径阈值 flush 的先 sync 后 flush）。
+    [[nodiscard]] bool flush(
+        std::string_view dir,
+        std::span<const std::pair<std::uint32_t, std::uint64_t>> durable_wms =
+            {});
 
     // 全量重建：rows 由 caller 从 keydir 收集（活 key + ord；墓碑不需要
     // ——单一全量 run 的缺席即语义）。排序写单 run、manifest 只含它、

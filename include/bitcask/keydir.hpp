@@ -469,6 +469,16 @@ public:
     load_snapshot(std::string_view path, bool accept_subset = false,
                   std::uint64_t subset_wm_limit = 0);
 
+    // S36-5 B1：最近一次 load_snapshot **实际载入**条目的 ord 覆盖上界
+    // （排他；0 = 无快照/空）。OKI 缺口检查（finish_oki_recovery）改用
+    // 此值而非快照 next_ord 标量：B1 起快照可能过滤未持久尾巴的条目——
+    // 被滤条目由水位 fold 重放补回，不需要 runs 覆盖；只有**已载入**的
+    // 条目（fold 会跳过其字节）才要求 wm 覆盖，否则才是真缺口。
+    // 线程安全: open 期单线程使用。
+    [[nodiscard]] std::uint64_t snapshot_covered_ord() const noexcept {
+        return snap_covered_ord_;
+    }
+
     // ---- 文件统计 ----
     // (注:fstats 的增量更新只发生在 put/remove 内,经私有 update_fstats;
     //  S1 起内部无锁,曾有的带锁公开版零调用方,O13 核实后删除。)
@@ -751,6 +761,9 @@ private:
     // S36-3：累计逐出数。>0 后「哈希 miss」不再是权威 miss——影子对拍的
     // 「miss vs 组合视图活行」方向据此降级为 skip（逐出前保持全严格）。
     std::atomic<std::uint64_t> evictions_{0};
+
+    // S36-5 B1：load_snapshot 实载条目的 ord 覆盖上界（见 accessor）。
+    std::uint64_t snap_covered_ord_ = 0;
 
     // S36-4：缓存预算（Level B）。cache_budget_ = 总条目数（0=不限）；
     // shard_budget_ = 派生的分片预算（写路径插入后比对 entries.size()）。

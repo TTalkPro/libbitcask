@@ -10,7 +10,11 @@
 //     Level B 强制重建（陈旧 loc 不采信）；merge_only 旁车被拒；
 //   - 并发：写者 + 读者 + 自动逐出交错零漂移（影子对拍全程在线）。
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -27,6 +31,7 @@
 
 #include <bitcask/cask.hpp>
 #include <bitcask/codec.hpp>
+#include <bitcask/data_file.hpp>
 #include <bitcask/keydir_registry.hpp>
 #include <bitcask/oki_run.hpp>
 #include <bitcask/oki_state.hpp>
@@ -449,4 +454,241 @@ TEST_F(OkiLevelBTest, ManifestV3RoundTripAndUnknownFlagRejected) {
     auto r2 = ok::read_manifest(dir_.string());
     ASSERT_TRUE(r2.has_value());
     EXPECT_FALSE(r2->level_b);
+}
+
+// ============================================================================
+// S36-5：merge 组合视图 + 崩溃注入 + B1 收口
+// ============================================================================
+
+// B1 不变量注入：sync 策略全关（默认）下，checkpoint 后快照/OKI 引用的
+// active 字节必须已 fsync（active_durable_bytes ≥ checkpoint 时刻的文件
+// 大小）；据此截掉「未持久尾巴」模拟掉电——重放后旧键全在、掉电后写入
+// 的键干净缺席（kNotFound 而非悬空 kIo/kBadCrc）。
+TEST_F(OkiLevelBTest, B1CheckpointNeverOutrunsDataFsync) {
+    constexpr int kBefore = 300;
+    constexpr int kAfter = 200;
+    const std::string status_path = (dir_ / "..status").string();
+
+    const pid_t child = fork();
+    ASSERT_NE(child, -1);
+    if (child == 0) {
+        auto c = Cask::open(dir_.string(), levelb_opts(128), &test_registry());
+        if (!c) _exit(1);
+        for (int i = 0; i < kBefore; ++i) {
+            if (!(*c)->put(bytes("b1-" + std::to_string(i)),
+                           bytes(val_of(i)), 1000)) {
+                _exit(1);
+            }
+        }
+        // 暴露面前提：默认策略下写后无任何 fsync。
+        if ((*c)->active_durable_bytes() != 0) _exit(2);
+        if (!(*c)->checkpoint()) _exit(1);
+        // B1 不变量：checkpoint 采集点已把持久水位推进到覆盖全部已写字节。
+        std::error_code ec;
+        std::uintmax_t data_sz = 0;
+        for (const auto& e : fs::directory_iterator(dir_, ec)) {
+            if (e.path().string().ends_with(".bitcask.data")) {
+                data_sz += fs::file_size(e.path(), ec);
+            }
+        }
+        const std::uint64_t durable = (*c)->active_durable_bytes();
+        {
+            std::ofstream f(status_path, std::ios::trunc);
+            f << durable << ' ' << data_sz << '\n';
+        }
+        if (durable < data_sz) _exit(3);  // 不变量破坏（修复前的形态）
+        for (int i = 0; i < kAfter; ++i) {
+            if (!(*c)->put(bytes("b1x-" + std::to_string(i)),
+                           bytes("late"), 2000)) {
+                _exit(1);
+            }
+        }
+        _exit(0);  // 崩溃：不 close
+    }
+    int status = 0;
+    ASSERT_NE(waitpid(child, &status, 0), -1);
+    ASSERT_TRUE(WIFEXITED(status)) << status;
+    ASSERT_EQ(WEXITSTATUS(status), 0)
+        << "exit=2: 前提失效（写后已有 fsync）；exit=3: B1 不变量破坏";
+
+    // 模拟掉电：截掉 checkpoint 后未持久的尾巴（合法掉电态——持久水位之
+    // 内的字节 fsync 过，必然幸存）。
+    std::uint64_t durable = 0, data_sz = 0;
+    {
+        std::ifstream f(status_path);
+        ASSERT_TRUE(f >> durable >> data_sz);
+    }
+    ASSERT_GE(durable, data_sz);
+    // 找 active data 文件（本测试单文件负载：最大 file id 即 active）。
+    fs::path active;
+    std::uint64_t max_id = 0;
+    for (const auto& e : fs::directory_iterator(dir_)) {
+        const auto name = e.path().filename().string();
+        if (name.ends_with(".bitcask.data")) {
+            const auto id = std::strtoull(name.c_str(), nullptr, 10);
+            if (id >= max_id) { max_id = id; active = e.path(); }
+        }
+    }
+    ASSERT_FALSE(active.empty());
+    fs::resize_file(active, durable);
+
+    auto c = Cask::open(dir_.string(), levelb_opts(128), &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < kBefore; ++i) {
+        auto g = (*c)->get_owned(bytes("b1-" + std::to_string(i)));
+        ASSERT_TRUE(g.has_value()) << "checkpoint 覆盖的键必须幸存 i=" << i
+                                   << " err=" << (int)g.error().kind;
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(g->value.data()),
+                              g->value.size()),
+                  val_of(i));
+    }
+    for (int i = 0; i < kAfter; ++i) {
+        auto g = (*c)->get_owned(bytes("b1x-" + std::to_string(i)));
+        ASSERT_FALSE(g.has_value()) << i;
+        EXPECT_EQ(g.error().kind, bitcask::CaskError::kNotFound)
+            << "掉电丢失的键必须干净缺席（悬空引用会报 kIo/kBadCrc）";
+    }
+    EXPECT_EQ((*c)->keydir().shadow_stats().drifts, 0u);
+    (*c)->close();
+}
+
+// 崩溃注入：merge（含被逐 key 的冷搬迁）后立即崩溃——S36-5 的「搬迁行
+// 先于输入 unlink 固化」不变量保证任意崩溃点数据可读。
+TEST_F(OkiLevelBTest, CrashRightAfterMergeKeepsEvictedKeysReadable) {
+    constexpr int kKeys = 600;
+    const pid_t child = fork();
+    ASSERT_NE(child, -1);
+    if (child == 0) {
+        CaskOptions o = levelb_opts(128);
+        o.max_file_size = 4096;
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        if (!c) _exit(1);
+        for (int i = 0; i < kKeys; ++i) {
+            if (!(*c)->put(bytes("cm" + std::to_string(i)),
+                           bytes(val_of(i)), 1000)) {
+                _exit(1);
+            }
+        }
+        if (!(*c)->checkpoint()) _exit(1);
+        for (int i = 0; i < kKeys / 2; ++i) {  // 死字节，给 merge 干活
+            if (!(*c)->put(bytes("cm" + std::to_string(i)),
+                           bytes(val_of(i) + "!"), 1500)) {
+                _exit(1);
+            }
+        }
+        if (!(*c)->merge()) _exit(1);
+        _exit(0);  // 崩溃：不 close、不 checkpoint——搬迁行只靠 merge 收尾固化
+    }
+    int status = 0;
+    ASSERT_NE(waitpid(child, &status, 0), -1);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+
+    auto c = Cask::open(dir_.string(), levelb_opts(128), &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < kKeys; ++i) {
+        auto g = (*c)->get_owned(bytes("cm" + std::to_string(i)));
+        ASSERT_TRUE(g.has_value())
+            << "i=" << i << " err=" << (int)g.error().kind
+            << "（搬迁行未固化即 unlink 会在此悬空）";
+        const std::string want =
+            (i < kKeys / 2) ? val_of(i) + "!" : val_of(i);
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(g->value.data()),
+                              g->value.size()),
+                  want);
+    }
+    EXPECT_EQ((*c)->keydir().info().key_count,
+              static_cast<std::uint64_t>(kKeys));
+    (*c)->close();
+}
+
+// TTL × 逐出 × merge：过期记录的 key 已被逐出——冷视图精确删除必须生效
+//（组合视图记墓碑 + 退账），否则输入 unlink 后冷 get 报 kIo 悬空。
+TEST_F(OkiLevelBTest, TtlMergeRemovesEvictedKeysCleanly) {
+    CaskOptions o = levelb_opts(256);
+    o.max_file_size = 512;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    auto& kd = (*c)->keydir();
+
+    ASSERT_TRUE((*c)->put(bytes("ttl-ev"), bytes("doomed"), 50,
+                          /*expiry_at=*/100));
+    const std::string pad(64, 'f');
+    for (int i = 0; i < 600; ++i) {  // 挤出 active + 制造逐出压力
+        ASSERT_TRUE((*c)->put(bytes("fill" + std::to_string(i)),
+                              bytes(pad), 50));
+    }
+    ASSERT_TRUE((*c)->checkpoint());
+    ASSERT_TRUE(kd.evict("ttl-ev"));  // 确保过期键处于逐出态
+
+    // 收集 sealed 文件显式 merge（全 live 不触发策略；同 docvalue TTL 惯例）。
+    std::vector<std::string> files;
+    for (const auto& de : fs::directory_iterator(dir_)) {
+        const auto name = de.path().filename().string();
+        if (bitcask::fileops::parse_data_tstamp(name).has_value()) {
+            files.push_back(de.path().string());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    ASSERT_GT(files.size(), 1u);
+    files.pop_back();  // active
+    auto ms = (*c)->merge(files, /*now_sec=*/200);
+    ASSERT_TRUE(ms);
+    ASSERT_GT(ms->records_expired, 0u);
+
+    auto g = (*c)->get_owned(bytes("ttl-ev"));
+    ASSERT_FALSE(g.has_value());
+    EXPECT_EQ(g.error().kind, bitcask::CaskError::kNotFound)
+        << "冷视图未记墓碑的话这里是悬空 kIo";
+    // 计数退账精确。
+    EXPECT_EQ(kd.info().key_count, 600u);
+    EXPECT_EQ(kd.shadow_stats().drifts, 0u);
+    (*c)->close();
+}
+
+// 千轮 stress：逐出态下反复 覆盖→merge，全程零丢 key、值恒正确、计数
+// 恒精确（S36-5 验收行）。
+TEST_F(OkiLevelBTest, MergeUnderEvictionManyRoundsNoKeyLoss) {
+    constexpr int kKeys = 400;
+    constexpr int kRounds = 1000;
+    CaskOptions o = levelb_opts(128);  // 深度逐出（400 key ≫ 128 预算）
+    o.max_file_size = 8192;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    auto& kd = (*c)->keydir();
+
+    std::vector<int> ver(kKeys, 0);
+    for (int i = 0; i < kKeys; ++i) {
+        ASSERT_TRUE((*c)->put(bytes("mr" + std::to_string(i)),
+                              bytes(val_of(i) + "#0"), 1000));
+    }
+    std::mt19937_64 rng(0x536365);
+    for (int round = 1; round <= kRounds; ++round) {
+        // 覆盖随机 1/8（制造死字节 + 逐出扰动）。
+        for (int j = 0; j < kKeys / 8; ++j) {
+            const int i = static_cast<int>(rng() % kKeys);
+            ver[i] = round;
+            ASSERT_TRUE((*c)->put(
+                bytes("mr" + std::to_string(i)),
+                bytes(val_of(i) + "#" + std::to_string(round)), 1000))
+                << "round " << round;
+        }
+        if (round % 50 == 0) ASSERT_TRUE((*c)->checkpoint());
+        auto ms = (*c)->merge();
+        ASSERT_TRUE(ms) << "round " << round;
+        if (round % 100 == 0) {  // 周期全量对拍
+            for (int i = 0; i < kKeys; ++i) {
+                auto g = (*c)->get_owned(bytes("mr" + std::to_string(i)));
+                ASSERT_TRUE(g.has_value()) << "round " << round << " i=" << i;
+                EXPECT_EQ(
+                    std::string(
+                        reinterpret_cast<const char*>(g->value.data()),
+                        g->value.size()),
+                    val_of(i) + "#" + std::to_string(ver[i]));
+            }
+            ASSERT_EQ(kd.info().key_count, static_cast<std::uint64_t>(kKeys))
+                << "round " << round;
+        }
+    }
+    EXPECT_EQ(kd.shadow_stats().drifts, 0u);
+    (*c)->close();
 }

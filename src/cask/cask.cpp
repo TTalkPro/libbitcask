@@ -669,6 +669,13 @@ void Cask::close() noexcept {
     // 计数 + 未来可观测性梯队，不在 close 加日志。
     try {
         (void)maybe_group_commit(/*force*/ true);  // P4:落最后一批未 fsync 的写
+        // S36-5 B1：封口即持久——close 路径不经 roll/close_write_file，补
+        // 同款 seal fsync（sync_every_n==0 时上面是 no-op，这里才是唯一
+        // 落盘点）。best-effort：失败则持久水位不推进，随后的快照/OKI
+        // flush 据实过滤（宁可少收录，不引用未持久字节）。
+        if (!opts_.o_sync && active_data_) {
+            (void)active_data_->sync();
+        }
         if (active_hint_) {
             (void)active_hint_->finalize();
             active_hint_.reset();
@@ -763,13 +770,39 @@ Cask::collect_snapshot_watermarks() const noexcept {
     if (!entries) return std::nullopt;
     std::vector<std::pair<std::uint32_t, std::uint64_t>> wms;
     wms.reserve(entries->size());
+    // S36-5 B1：active 句柄快照（S13-F3 同款纪律——shared_ptr 对象本体的
+    // 并发读写须在 read_cache_mu_ 下）。
+    std::shared_ptr<fileops::DataFile> adf;
+    {
+        std::shared_lock lk(read_cache_mu_);
+        adf = active_data_;
+    }
     for (const auto& e : *entries) {
         std::error_code ec;
         const auto sz = std::filesystem::file_size(e.data_path, ec);
         if (ec) return std::nullopt;  // 文件态不稳定,放弃本次快照
-        wms.emplace_back(static_cast<std::uint32_t>(e.tstamp), sz);
+        // S36-5 B1：active 文件的水位 = **已知持久**字节（sealed 文件由
+        // roll/close 的封口 fsync 保证全量持久，不需钳）。采集点顺手做一次
+        // fd 级 fdatasync（线程安全，不碰写者的批缓冲）把持久水位推进到
+        // 当前 stat 大小——checkpoint 因此恒能覆盖到采集时刻。由此所有
+        // 消费方（keydir 快照过滤、OKI flush 持留、search delta 字节水位）
+        // 统一拿到「引用 ≤ 持久」的水位——快照/ckpt/run 永不引用可能随
+        // 掉电蒸发的字节；未持久尾巴留给恢复期 fold 重放（数据活着就补
+        // 回，方向安全）。
+        std::uint64_t wm = sz;
+        if (adf && e.data_path == adf->path()) {
+            (void)adf->sync_fd_only(sz);  // best-effort；失败退持久旧值
+            wm = std::min<std::uint64_t>(sz, adf->durable_bytes());
+        }
+        wms.emplace_back(static_cast<std::uint32_t>(e.tstamp), wm);
     }
     return wms;
+}
+
+// S36-5 B1 诊断（声明见 cask.hpp）。
+std::uint64_t Cask::active_durable_bytes() const noexcept {
+    std::shared_lock lk(read_cache_mu_);
+    return active_data_ ? active_data_->durable_bytes() : 0;
 }
 
 void Cask::write_keydir_snapshot(
@@ -781,9 +814,11 @@ void Cask::write_keydir_snapshot(
     }
     // S33-4：OKI flush 恒在 keydir 快照**之后**（同站点搭车：close/merge
     // 收尾/成对 ckpt base）——快照跳过的字节区间必须已进 runs（wm ≥ 快照
-    // next_ord），否则崩溃后是数据洞；崩溃丢本次 flush 由 open 端缺口检查
-    // （finish_oki_recovery）整体重建兜底。best-effort：失败仅降级 OKI。
-    if (keydir_->oki().loaded() && !keydir_->oki().flush(dirname_)) {
+    // 实载覆盖界），否则崩溃后是数据洞；崩溃丢本次 flush 由 open 端缺口
+    // 检查（finish_oki_recovery）整体重建兜底。best-effort：失败仅降级。
+    // S36-5 B1：flush 带同一份持久水位（wms 的 active 项已被 collect 钳到
+    // 已 fsync 字节）——run 与快照一样不得引用可能随掉电蒸发的字节。
+    if (keydir_->oki().loaded() && !keydir_->oki().flush(dirname_, wms)) {
         log_warn("oki flush after keydir snapshot failed (rebuild on open)");
     }
 }
@@ -795,17 +830,37 @@ void Cask::write_keydir_snapshot() noexcept {
 }
 
 // S33-4：写路径阈值 flush——memdelta 超限（1M 行 / 64MiB）时同步落 run，
-// 防长时间不 ckpt 的写负载把 memdelta 撑爆。写者线程内联执行（write_mu_
-// 已持有），代价有界且罕见；与 checkpoint 侧 flush 由 OkiState 内部
-// flush_mu_ 互斥。
+// 防长时间不 ckpt 的写负载把 memdelta 撑爆。**前置：write_mu_ 已持有**
+// （写者线程内联执行，代价有界且罕见）；与 checkpoint 侧 flush 由
+// OkiState 内部 flush_mu_ 互斥。
+// S36-5 B1：flush 前先把 active fsync（写者线程，安全）——固化的 run 不
+// 得引用未持久字节；sync 后全部行持久，flush 免过滤。sync 失败放弃本轮
+// （delta 原状，下次重试）。
 void Cask::maybe_flush_oki() noexcept {
-    if (!keydir_) return;  // S36-4：close 竞态（组提交尾/锁外站点可达）
+    if (!keydir_) return;  // S36-4：close 竞态（组提交尾可达）
     auto& oki = keydir_->oki();
-    if (oki.loaded() && oki.should_flush()) {
-        if (!oki.flush(dirname_)) {
-            log_warn("oki threshold flush failed (will retry)");
+    if (!oki.loaded() || !oki.should_flush()) return;
+    if (!opts_.o_sync && active_data_) {
+        if (auto s = active_data_->sync(); !s) {
+            log_warn("oki threshold flush: active sync failed (will retry)");
+            return;
         }
     }
+    if (!oki.flush(dirname_)) {
+        log_warn("oki threshold flush failed (will retry)");
+    }
+}
+
+// S36-5：锁外站点（put_batch/put_batch_atomic/remove/put_doc 尾部）的
+// 阈值探询包装——先无锁 hint 快查，命中才取 write_mu_ 做同步 flush
+// （罕见；与并发写者短暂互斥可接受）。
+void Cask::maybe_flush_oki_unlocked() noexcept {
+    if (!keydir_) return;
+    auto& oki = keydir_->oki();
+    if (!oki.loaded() || !oki.should_flush()) return;
+    std::lock_guard<std::mutex> wlk(write_mu_);
+    if (is_closed()) return;
+    maybe_flush_oki();
 }
 
 // T3: 提交索引任务到 IndexPool。背压由有界队列提供：队列满（10240）时
@@ -911,6 +966,16 @@ Cask::roll_active_if_needed(std::size_t about_to_write) {
 // put 在 keydir.biggest_file_id 被并发 merger 顶过去时也走这条路径。
 std::expected<void, CaskFault> Cask::roll_active() {
     if (auto r = maybe_group_commit(/*force*/ true); !r) return r;  // P4:落旧文件尾批
+    // S36-5 B1：**封口即持久**——sealed 文件全量 fsync（o_sync 已逐条持久；
+    // sync_every_n>0 时上面 force 组提交已同步，此处为快速 no-op fsync）。
+    // 每文件生命周期一次。由此「sealed ⟹ durable」成为可依赖的不变量：
+    // 快照/OKI flush 的持久性过滤只需盯 active 尾巴。
+    if (!opts_.o_sync && active_data_) {
+        if (auto s = active_data_->sync(); !s) {
+            return std::unexpected(io_fault(s.error().errnum,
+                                            std::string(active_data_->path())));
+        }
+    }
     if (active_hint_) {
         if (auto r = active_hint_->finalize(); !r) {
             return std::unexpected(io_fault(r.error().errnum,
@@ -938,6 +1003,14 @@ std::expected<void, CaskFault> Cask::close_write_file() {
     if (opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly,
                                      "close_write_file: merge_only handle"));
+    }
+    // S36-5 B1：封口即持久（同 roll_active——sealed ⟹ durable 不变量；
+    // 持久水位由 DataFile::sync 自行推进）。
+    if (!opts_.o_sync && active_data_) {
+        if (auto s = active_data_->sync(); !s) {
+            return std::unexpected(io_fault(s.error().errnum,
+                                            std::string(active_data_->path())));
+        }
     }
     // 先 finalize hint trailer 再丢句柄——否则下次 open 这个目录时
     // hint 校验失败，会被迫 fold 整个 data 文件重建 keydir，
@@ -1895,7 +1968,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
     wlk.unlock();  // H1：常规路径的 Add 全部在锁外提交
     flush_adds();
     maybe_submit_auto_checkpoint();  // S14-1（锁外）
-    maybe_flush_oki();  // S36-4：memdelta 阈值（无锁 hint 探询）
+    maybe_flush_oki_unlocked();  // S36-4/5：memdelta 阈值（锁外站点包装）
     if (!gc) return std::unexpected(gc.error());
     return {};
 }
@@ -2139,7 +2212,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
     wlk.unlock();
     flush_tasks();
     maybe_submit_auto_checkpoint();  // S14-1（锁外）
-    maybe_flush_oki();  // S36-4：memdelta 阈值（无锁 hint 探询）
+    maybe_flush_oki_unlocked();  // S36-4/5：memdelta 阈值（锁外站点包装）
     if (!gc) return std::unexpected(gc.error());
     return {};
 }
@@ -2208,7 +2281,7 @@ Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
             IndexOp::Delete, bytes_to_view(key), ord, {}, 0, 0, 0, tstamp, 0));
     }
     maybe_submit_auto_checkpoint();  // S14-1（锁外）
-    maybe_flush_oki();  // S36-4：memdelta 阈值（无锁 hint 探询）
+    maybe_flush_oki_unlocked();  // S36-4/5：memdelta 阈值（锁外站点包装）
     if (!gc) return std::unexpected(gc.error());
     return {};
 }
@@ -2327,7 +2400,7 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     task.meta.assign(doc.meta.begin(), doc.meta.end());
     submit_index_task(std::move(task));
     maybe_submit_auto_checkpoint();  // S14-1（锁外）
-    maybe_flush_oki();  // S36-4：memdelta 阈值（无锁 hint 探询）
+    maybe_flush_oki_unlocked();  // S36-4/5：memdelta 阈值（锁外站点包装）
     if (req.post_err) return std::unexpected(*req.post_err);  // 旧组提交语义
     return {};
 }
@@ -2948,6 +3021,24 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
     if (r->relocations_stuck > 0) {  // S13-D7：防御路径触发即上报（不应发生）
         log_error("merge: " + std::to_string(r->relocations_stuck) +
                   " stuck relocation(s); input file(s) kept for retry");
+    }
+    // S36-5：Level B——**搬迁行先于输入 unlink 固化**（设计 §D1 顺序不变量
+    // 的崩溃收口，S36-2 立的缺口）：memdelta 中的搬迁行若随崩溃丢失，run
+    // 内旧 loc 指向已 unlink 的输入 = 组合视图悬空且 wm 无缺口不触发重建。
+    // 固化后任何崩溃点都安全：行在 run（新 loc 可用）或输入仍在（旧 loc
+    // 可读，内容相同）。flush 带持久水位（搬迁 loc 指向 merge 输出——
+    // run_merge 已 fsync；水位过滤只持留并发用户写的 active 尾巴）。
+    // flush 失败 → 跳过全部 unlink/trim（空间暂不回收，下轮 merge 重试）。
+    if (keydir_->oki().point_query_enabled()) {
+        auto wms = collect_snapshot_watermarks();
+        const bool flushed =
+            wms.has_value() && keydir_->oki().flush(dirname_, *wms);
+        if (!flushed) {
+            log_error("merge: oki flush before unlink failed; "
+                      "keeping input files for retry");
+            write_keydir_snapshot();
+            return *r;
+        }
     }
     std::vector<std::uint32_t> trimmed_ids;
     trimmed_ids.reserve(files.size());

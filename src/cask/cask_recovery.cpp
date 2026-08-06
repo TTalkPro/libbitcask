@@ -724,8 +724,11 @@ Cask::load_recovery_snapshots() {
                                         keydir_->oki().wm())) {
         recovery.snap_wms = std::move(*w);
         recovery.snap_loaded = true;
-        // S33-4：链重放前捕获快照自身的 next_ord（OKI 缺口检查基准）。
-        recovery.snap_next_ord = keydir_->peek_next_ord();
+        // S33-4/S36-5：OKI 缺口检查基准 = 快照**实载条目**的 ord 覆盖界
+        // （原 next_ord 标量——B1 起快照过滤未持久尾巴，被滤条目由水位
+        // fold 重放补回、不需 runs 覆盖，用 next_ord 会把持留行为误判成
+        // 缺口而每次崩溃恢复都全量重建）。
+        recovery.snap_next_ord = keydir_->snapshot_covered_ord();
     }
 
     bool search_ok = false;
