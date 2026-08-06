@@ -296,8 +296,67 @@ public:
     // 注意: 返回的 EntryProxy.key 是 zero-copy view，仅在持锁期间有效——
     // 本接口返回时锁已释放，所以 key 已不可信赖；
     // caller 拿到值字段足够（key 字段当前调用方都已自带）。
+    // S36-2：oki_shadow_check 开启且 epoch==kMaxEpoch 时，返回前对拍组合
+    // 视图（见 set_oki_shadow_check）。
     std::optional<EntryProxy> get(std::string_view key,
                                    std::uint64_t epoch = kMaxEpoch) const;
+
+    // ---- S36-2/3：统一点查原语（设计 doc/keydir-disk-resident-design-zh.md §5.1）----
+    // 哈希缓存 → OKI 组合视图（memdelta 辅助哈希 → runs gen 降序 bloom/
+    // seek + 块 LRU）。S36-3 起 Cask::get 走本原语（点查关 = 纯哈希，行为
+    // 与现状逐字节相同）；S36-5 起 merge 活性/搬迁与 TTL 检查也统一到此
+    // ——一份实现，杜绝三处各查一遍的漂移。组合视图来源的命中 epoch=0
+    // （epoch 不落盘）。影子开启时顺带对拍（Cask::get 不再经 get()）。
+    //
+    // warm_fill（S36-3 读升温回填，设计 §5.1 步骤 3 + §11 问题 1）：冷侧
+    // 命中时经**二次命中频度门**（4096 槽指纹表——同 key 连续两次冷命中才
+    // 回填，扫描型负载天然被门挡住）把行插回哈希缓存。回填是缓存填充而非
+    // 逻辑插入：不动 key_count/fstats（D4）；安全性靠分片写计数（fill 捕获
+    // 的 writes 快照与插入时不一致即放弃——挡「remove 缺席 key 只写 delta
+    // 墓碑」与回填旧行的竞态）+ 屏障/fold 期间直接放弃。
+    // 线程安全: 是。锁: 同 get；冷侧嵌套 oki 内部 mu / 块缓存分片小锁
+    // （独立锁域）；回填取分片锁（与写路径同款闸门检查，但退避即放弃）。
+    [[nodiscard]] std::optional<EntryProxy> locate(std::string_view key,
+                                                   bool warm_fill = false);
+
+    // S36-3：单 key 物理逐出（测试/bench 用；S36-4 的 CLOCK 策略建立其上）。
+    // 语义 = D4 的「逐出是缓存腾位，不是删除」：物理 erase（swap-delete +
+    // limbo，乐观读者安全同 S29-6 清扫），key_count/fstats **不动**。
+    // 前置：OKI 点查开启（组合视图能兜住冷 get）；fold/屏障期间拒绝
+    // （MultiEntry 不可逐——设计 §11 问题 3）；**写挂钩在途时拒绝**
+    // （oki_hooks_in_flight_≠0——否则逐掉「哈希已有、append 在途」的行 =
+    // 冷读者回填旧行的静默回滚，实现注释有并发实证）。返回是否真的逐出。
+    // ⚠ S36-5 之前 merge 活性判定仍走哈希 get——逐出态并发 merge 会把被逐
+    // key 判死丢弃，测试勿组合两者。
+    bool evict(std::string_view key);
+
+    // S36-2 影子对拍（Level B 风险闸——零漂移是 S36-4 开逐出的前置门）：
+    // 开启后每次 get(kMaxEpoch) 都以组合视图（OkiState::locate 冷侧）对拍
+    // 哈希权威，稳定失配即 assert（NDEBUG 下计入 drifts 计数）。开启同时
+    // 启用 OkiState 点查索引。前置：所有写路径携真实 ord（Cask 恒满足；
+    // 直接驱动 KeyDir 且 ord 缺省 0 的旧式测试不可开）。
+    // 并发协议：写路径以 oki_hooks_in_flight_ 括住「哈希更新可见 →
+    // OKI append 完成」窗口；对拍失配时若计数非 0 → 跳过（无法判定），
+    // 计数为 0 → 重读重试，稳定失配才判漂移。
+    // 开启时机：**open 后、任何 merge 之前**（搬迁/TTL 挂钩门在点查开启
+    // 上——关门期间的 merge 会把陈旧 loc 留在 run 里，之后开门即稳定
+    // 失配）。debug 构建下 Cask::open 自动满足（finish_oki_recovery 末尾
+    // 开启）；混用「未开门写者」的目录不可对拍（Level B 对这类目录以
+    // 重建起步，S36-4）。
+    void set_oki_shadow_check(bool on);
+    [[nodiscard]] bool oki_shadow_check() const noexcept {
+        return oki_shadow_.load(std::memory_order_relaxed);
+    }
+    struct ShadowStats {
+        std::uint64_t checks = 0;  // 组合视图可用且完成比对的次数
+        std::uint64_t skips  = 0;  // 写在途/不可用而跳过的次数
+        std::uint64_t drifts = 0;  // 稳定失配（debug 下已 assert）
+    };
+    [[nodiscard]] ShadowStats shadow_stats() const noexcept {
+        return {shadow_checks_.load(std::memory_order_relaxed),
+                shadow_skips_.load(std::memory_order_relaxed),
+                shadow_drifts_.load(std::memory_order_relaxed)};
+    }
 
     // 线程安全: 是。无锁（atomic 读）。
     [[nodiscard]] std::uint64_t get_epoch() const;
@@ -426,9 +485,38 @@ public:
 private:
     friend class IterHandle;
 
+    // S36-2：conditional_remove 的锁内精确匹配参数（消灭原探测/删除两段
+    // 之间的 TOCTOU——「删掉并发新写」从文档容忍变为不可能）。
+    struct ExpectedLoc {
+        std::uint64_t tstamp;
+        std::uint32_t file_id;
+        std::uint64_t offset;
+    };
+
     // remove 本体（remove() 是「本体 + OKI 挂钩」的薄包装）。
+    // expected 非空 = 锁内 CAS：live entry 的 (tstamp,file_id,offset) 不
+    // 匹配则不删返回 false；victim_ord 非空时回传被删 entry 的 ord。
     bool remove_impl(std::string_view key, std::uint64_t remove_time,
-                     std::uint64_t ord, bool insert_tombstone_if_absent);
+                     std::uint64_t ord, bool insert_tombstone_if_absent,
+                     const ExpectedLoc* expected = nullptr,
+                     std::uint64_t* victim_ord = nullptr);
+
+    // get 本体（get() 是「本体 + S36-2 影子对拍」的薄包装）。
+    std::optional<EntryProxy> get_impl(std::string_view key,
+                                        std::uint64_t epoch) const;
+    // S36-2：影子对拍（见 set_oki_shadow_check 注释；proxy 为 get_impl
+    // 已算出的哈希侧结果，失配时内部重读重试）。
+    void shadow_verify(std::string_view key,
+                       std::optional<EntryProxy> proxy) const;
+
+    // S36-3：读升温回填本体（locate(warm_fill=true) 的冷命中路径调用）。
+    // row = 组合视图行（epoch 由本函数分配）；w0 = locate 在哈希探测**之前**
+    // 捕获的分片写计数快照——插入时不一致即放弃（协议见 locate 注释）。
+    void cache_fill(std::string_view key, const SingleEntry& row,
+                    std::uint64_t w0);
+    // 二次命中频度门：同 key 连续两次冷命中才放行（4096 槽 32 位指纹，
+    // 槽冲突 = 假阴性延迟回填，无正确性影响）。
+    [[nodiscard]] bool warm_gate_second_hit(std::string_view key) const;
 
     // === M6-S2:分片 ===
     // 锁全序（屏障 v2,严格遵守,详见文件头）:
@@ -449,6 +537,12 @@ private:
         // 指针仅在分片锁内、获取与使用之间无 insert/erase(已审计),安全。
         // 就地改写值(经 find 指针)必须包 entries.write_section()(seqlock
         // 写窗口),否则乐观读者读撕裂数据却校验通过。
+        // S36-3：分片写计数——put/remove（含 miss 分支：remove 缺席 key 只
+        // 写 delta 墓碑也算「动过」）在持本分片锁后 ++。读升温回填以
+        // 「探测前后计数一致」为插入前提，挡住回填旧行的竞态；逐出同样 ++
+        // （挡并发 fill 立即塞回）。仅回填/逐出路径消费，热路径只多一次
+        // 无争用 RMW。
+        std::atomic<std::uint64_t> writes{0};
         // 表头独占缓存行:find 路径读表头,别让它与锁字(每次加解锁 RMW)同行。
         alignas(64) detail::SeqShardTable<Entry> entries;
         // S29-6 P1:remove 无 fold 分支不再物理 erase,改留墓碑 SingleEntry
@@ -597,6 +691,26 @@ private:
 
     // S33-4：OKI 运行态（随 KeyDir 在 registry 内共享；ctor 构造，恒非空）。
     std::shared_ptr<oki::OkiState> oki_;
+
+    // S36-2/3：影子对拍 + 逐出安全状态。oki_hooks_in_flight_ = 写路径
+    // [哈希更新可见 → OKI append 完成] 的在途括号，**点查开启即计数**
+    // （S36-3 起不只服务影子）：影子对拍靠它跳过无法判定的窗口，evict
+    // 靠它拒逐「哈希已有、append 在途」的行（否则冷读者会拿到旧行并回填
+    // = 静默回滚，见 evict 实现注释）。点查关（Level A 默认）时写路径只
+    // 多一次 acquire 读。
+    std::atomic<bool> oki_shadow_{false};
+    mutable std::atomic<std::uint32_t> oki_hooks_in_flight_{0};
+    mutable std::atomic<std::uint64_t> shadow_checks_{0};
+    mutable std::atomic<std::uint64_t> shadow_skips_{0};
+    mutable std::atomic<std::uint64_t> shadow_drifts_{0};
+
+    // S36-3：读升温频度门（4096 槽 × 32 位指纹 = 16KB；无锁 exchange）。
+    static constexpr std::size_t kWarmGateSlots = 4096;
+    mutable std::array<std::atomic<std::uint32_t>, kWarmGateSlots>
+        warm_gate_{};
+    // S36-3：累计逐出数。>0 后「哈希 miss」不再是权威 miss——影子对拍的
+    // 「miss vs 组合视图活行」方向据此降级为 skip（逐出前保持全严格）。
+    std::atomic<std::uint64_t> evictions_{0};
 
     //   读热行——get/put 热路径每次 relaxed 读、写入罕见。与上面的写热
     //   行隔离,否则每个 put 的 epoch_ RMW 都会把读者需要的行打飞

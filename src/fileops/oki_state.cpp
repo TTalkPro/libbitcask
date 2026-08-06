@@ -46,14 +46,57 @@ void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep) {
 
 }  // namespace
 
-void OkiState::append(std::string_view key, std::uint64_t ord, bool tomb) {
+void OkiState::append(std::string_view key, std::uint64_t ord, bool tomb,
+                      const RowLoc* loc) {
     // 水位门（wm = 排他上界 = 尚未覆盖的最小 ord；首个合法 LSN 是 0，
     // 故不能有 ord==0 特判）：tail 重放只收 wm 起的行。
     if (ord < wm_.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lk(mu_);
     delta_bytes_ += key.size() + sizeof(DeltaRow);
-    delta_.push_back(DeltaRow{std::string(key), ord, tomb});
+    delta_.push_back(DeltaRow{std::string(key), ord, tomb,
+                              /*has_loc=*/loc != nullptr,
+                              loc != nullptr ? *loc : RowLoc{}});
+    index_row_locked(delta_.size() - 1);
     update_flush_hint_locked();
+}
+
+void OkiState::append_update(std::string_view key, std::uint64_t ord,
+                             bool tomb, const RowLoc* loc) {
+    // 免水位门（旧 ord、新信息——merge 搬迁 / TTL 墓碑，见头文件）。
+    std::lock_guard<std::mutex> lk(mu_);
+    delta_bytes_ += key.size() + sizeof(DeltaRow);
+    delta_.push_back(DeltaRow{std::string(key), ord, tomb,
+                              /*has_loc=*/loc != nullptr,
+                              loc != nullptr ? *loc : RowLoc{}});
+    index_row_locked(delta_.size() - 1);
+    update_flush_hint_locked();
+}
+
+void OkiState::index_row_locked(std::size_t idx) {
+    if (!point_query_.load(std::memory_order_relaxed)) return;
+    const DeltaRow& row = delta_[idx];
+    auto [it, inserted] = delta_idx_.try_emplace(row.key, idx);
+    // (ord, 到达序) 胜出：等 ord 后到者顶替（搬迁行），更小 ord 不顶替
+    // （恢复期并行 fold 的乱序到达）。
+    if (!inserted && delta_[it->second].ord <= row.ord) it->second = idx;
+}
+
+void OkiState::rebuild_index_locked() {
+    delta_idx_.clear();
+    if (!point_query_.load(std::memory_order_relaxed)) return;
+    for (std::size_t i = 0; i < delta_.size(); ++i) index_row_locked(i);
+}
+
+void OkiState::enable_point_query() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (point_query_.load(std::memory_order_relaxed)) return;
+    point_query_.store(true, std::memory_order_release);
+    rebuild_index_locked();
+}
+
+void OkiState::publish_runs_locked() {
+    runs_snap_.store(std::make_shared<const RunsVec>(readers_),
+                     std::memory_order_release);
 }
 
 void OkiState::load(std::string_view dir) {
@@ -62,7 +105,7 @@ void OkiState::load(std::string_view dir) {
     if (!m) return;  // 缺失/损坏 → 未加载态（caller 决定重建）
     // S33-5：随 load 打开全部 run Reader（全量 CRC eager 校验——S33-3 既定
     // 取舍：派生缓存安全优先）。任一 run 坏 → 整体弃用（未加载态 → 重建）。
-    std::vector<std::pair<std::uint64_t, std::shared_ptr<OkiRunReader>>> rds;
+    RunsVec rds;
     rds.reserve(m->runs.size());
     for (const auto& r : m->runs) {
         auto rd = OkiRunReader::open(mk_run_filename(dir, r.gen));
@@ -72,6 +115,7 @@ void OkiState::load(std::string_view dir) {
     }
     manifest_ = *std::move(m);
     readers_ = std::move(rds);
+    publish_runs_locked();
     wm_.store(manifest_.wm, std::memory_order_release);
     loaded_.store(true, std::memory_order_release);
 }
@@ -86,51 +130,53 @@ bool OkiState::flush(std::string_view dir) {
     std::lock_guard<std::mutex> flk(flush_mu_);
     if (!loaded_.load(std::memory_order_relaxed)) return false;
 
-    // 换出 memdelta：IO 期间 append 不被阻塞（新行 ord 恒更高）。
+    // S36-2：**拷贝前缀**而非换出——IO 期间行仍留在 delta_（locate 可见，
+    // 组合视图无「在写盘路上不可见」的窗口），提交后才删前缀。失败路径
+    // 因此零恢复动作（原 swap+restore 退役）。代价是一次前缀拷贝——flush
+    // 本就伴随全量排序 + 文件 IO，量级淹没。
     std::vector<DeltaRow> rows;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        rows.swap(delta_);
-        delta_bytes_ = 0;
-        update_flush_hint_locked();
+        rows.assign(delta_.begin(), delta_.end());
     }
     if (rows.empty()) return true;
+    const std::size_t prefix_n = rows.size();
 
-    // 失败时把换出的行放回队头（保持 ord 升序不变量——放回的行恒早于
-    // IO 期间新 append 的行）。
-    auto restore = [&] {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (auto& r : rows) delta_bytes_ += r.key.size() + sizeof(DeltaRow);
-        rows.insert(rows.end(), std::make_move_iterator(delta_.begin()),
-                    std::make_move_iterator(delta_.end()));
-        delta_ = std::move(rows);
-        update_flush_hint_locked();
-    };
-
-    // 排序 + 同 key 取 max-ord（stable 不必要：显式 (key, ord) 双键）。
-    std::sort(rows.begin(), rows.end(), [](const DeltaRow& a, const DeltaRow& b) {
-        if (a.key != b.key) return a.key < b.key;
-        return a.ord < b.ord;
-    });
+    // 排序 + 同 key 去重。**stable**：同 key 同 ord 的多行按到达序取末
+    //（merge 搬迁行与被搬迁行同 ord，后到的新位置必须胜——(ord, 到达序)
+    // 胜出格的 delta 段，与 SpillingRunBuilder/locate 同一规则）。
+    std::stable_sort(rows.begin(), rows.end(),
+                     [](const DeltaRow& a, const DeltaRow& b) {
+                         if (a.key != b.key) return a.key < b.key;
+                         return a.ord < b.ord;
+                     });
     std::uint64_t cover = 0;  // 排他上界 = 本批最大 ord + 1
-    for (const auto& r : rows) cover = std::max(cover, r.ord + 1);
+    std::uint64_t uniq = 0;
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        cover = std::max(cover, rows[i].ord + 1);
+        if (i + 1 == rows.size() || rows[i + 1].key != rows[i].key) ++uniq;
+    }
 
+    // S36-2：run 落 v2（全字段 + bloom）——组合视图点查的能力前提；
+    // manifest 版本由 write_manifest 惰性选择（含 v2 条目 → BCOM v2）。
     const std::uint64_t gen = next_gen_locked();
-    auto w = OkiRunWriter::create(mk_run_filename(dir, gen));
-    if (!w) { restore(); return false; }
+    auto w = OkiRunWriter::create(mk_run_filename(dir, gen),
+                                  kDefaultBlockBytes, kRunVersion2,
+                                  /*expected_entries=*/uniq);
+    if (!w) return false;
     bool io_ok = true;
     for (std::size_t i = 0; i < rows.size(); ++i) {
-        // 同 key 连续段取最后一条（max ord）。
+        // 同 key 连续段取最后一条（(ord, 到达序) 最大者）。
         if (i + 1 < rows.size() && rows[i + 1].key == rows[i].key) continue;
         const auto& r = rows[i];
         auto a = w->add(std::span<const std::byte>(
                             reinterpret_cast<const std::byte*>(r.key.data()),
                             r.key.size()),
-                        r.ord, r.tomb);
+                        r.ord, r.tomb, r.has_loc ? &r.loc : nullptr);
         if (!a) { io_ok = false; break; }
     }
     if (io_ok && !w->finish(/*fsync_dir=*/true)) io_ok = false;
-    if (!io_ok) { restore(); return false; }
+    if (!io_ok) return false;
 
     // S33-5：manifest 提交前先开 Reader（刚写完页缓存热，CRC 校验便宜；
     // 开失败按 IO 失败处理，不留半态）。
@@ -138,23 +184,37 @@ bool OkiState::flush(std::string_view dir) {
     if (!rd) {
         std::error_code ec;
         std::filesystem::remove(mk_run_filename(dir, gen), ec);
-        restore();
         return false;
     }
 
-    // manifest 提交（唯一 commit point）。失败则删刚写的 run 并放回。
+    // manifest 提交（唯一 commit point）。失败则删刚写的 run（delta_ 未动）。
     OkiManifest next = manifest_;
-    next.runs.push_back({gen, cover});
+    next.runs.push_back({gen, cover, /*format_ver=*/2});
     next.wm = std::max(next.wm, cover);
     if (!write_manifest(dir, next)) {
         std::error_code ec;
         std::filesystem::remove(mk_run_filename(dir, gen), ec);
-        restore();
         return false;
     }
     manifest_ = std::move(next);
     readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
+    publish_runs_locked();
     wm_.store(manifest_.wm, std::memory_order_release);
+
+    // 提交完成，删已固化的前缀（先发布 run 快照再删——中间态两边可见，
+    // delta 优先，语义不变）。IO 期间新 append 的行在前缀之后，保留。
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::size_t freed = 0;
+        for (std::size_t i = 0; i < prefix_n; ++i) {
+            freed += delta_[i].key.size() + sizeof(DeltaRow);
+        }
+        delta_.erase(delta_.begin(),
+                     delta_.begin() + static_cast<std::ptrdiff_t>(prefix_n));
+        delta_bytes_ -= std::min(delta_bytes_, freed);
+        rebuild_index_locked();
+        update_flush_hint_locked();
+    }
 
     // S33-6：run 数超阈值 → 全归并（设计 §5.2）。best-effort——失败不影响
     // 本次 flush 的成功语义（run 集合原状保留，下次 flush 再试）。
@@ -174,8 +234,20 @@ bool OkiState::compact_all_locked(std::string_view dir) {
     for (const auto& r : manifest_.runs) cover = std::max(cover, r.cover_ord);
     const std::uint64_t keep_wm = manifest_.wm;
 
+    // S36-2：输出版本——全 v2 输入才出 v2（v1 行无位置字段，混入会产出
+    // 「无位置的活行」毒化点查能力）；含 v1 则整体降 v1（Level A 语义保
+    // 留，点查能力等旧 run 被 rebuild 淘汰后自愈）。
+    std::uint32_t out_ver = kRunVersion2;
+    std::uint64_t est_entries = 0;
+    for (const auto& [g, rd] : readers_) {
+        if (rd->version() != kRunVersion2) out_ver = kRunVersion;
+        est_entries += rd->entry_count();
+    }
+
     const std::uint64_t gen = next_gen_locked();
-    auto w = OkiRunWriter::create(mk_run_filename(dir, gen));
+    auto w = OkiRunWriter::create(mk_run_filename(dir, gen),
+                                  kDefaultBlockBytes, out_ver,
+                                  /*expected_entries=*/est_entries);
     if (!w) return false;
     auto abort = [&] {
         std::error_code ec;
@@ -212,13 +284,20 @@ bool OkiState::compact_all_locked(std::string_view dir) {
         const std::string key(min_key);  // 推进游标会失效 view，先物化
         std::uint64_t win_ord = 0;
         bool win_tomb = false;
+        bool win_has_loc = false;
+        RowLoc win_loc{};
         bool first = true;
         for (std::size_t i = 0; i < heads.size(); ++i) {
             auto& h = heads[i];
             if (!h || h->key != key) continue;
-            if (first || h->ord > win_ord) {
+            // S36-2：>= 使等 ord 时**更高 gen 胜**（heads 按 readers_ 的
+            // gen 升序排列）——merge 搬迁行与被搬迁行同 ord，新位置在更高
+            // gen run，(ord, gen) 胜出格（设计 §D2）。
+            if (first || h->ord >= win_ord) {
                 win_ord = h->ord;
                 win_tomb = h->tomb;
+                win_has_loc = h->has_loc;
+                win_loc = h->loc;
                 first = false;
             }
             OkiRunReader::Entry e;
@@ -234,7 +313,9 @@ bool OkiState::compact_all_locked(std::string_view dir) {
         auto a = w->add(std::span<const std::byte>(
                             reinterpret_cast<const std::byte*>(key.data()),
                             key.size()),
-                        win_ord, /*tomb=*/false);
+                        win_ord, /*tomb=*/false,
+                        (out_ver == kRunVersion2 && win_has_loc) ? &win_loc
+                                                                 : nullptr);
         if (!a) return abort();
     }
     if (!w->finish(/*fsync_dir=*/true)) return abort();
@@ -243,18 +324,22 @@ bool OkiState::compact_all_locked(std::string_view dir) {
     if (!rd) return abort();
 
     OkiManifest next;
-    next.runs.push_back({gen, cover});
+    next.runs.push_back({gen, cover,
+                         static_cast<std::uint8_t>(
+                             out_ver == kRunVersion2 ? 2 : 1)});
     next.wm = keep_wm;  // 归并不推进水位
     if (!write_manifest(dir, next)) return abort();
 
     manifest_ = std::move(next);
     readers_.clear();
     readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
+    publish_runs_locked();
     // 旧 run + 此前崩溃残留的孤儿一并清（在途 ReadView 持 shared_ptr，
     // unlink 后 fd 仍可读——安全）。
     {
         const std::uint64_t keep_gen[] = {gen};
         sweep_runs(dir, keep_gen);
+        block_cache_.purge_except(keep_gen);  // S36-3：死 gen 块不占缓存
     }
     return true;
 }
@@ -273,13 +358,16 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
         // S36-1：外排构建（64MiB 分段 spill + k 路归并）取代全内存 sort——
         // 排序工作集从 O(全部行) 降到 O(spill_bytes)；同 key 去重规则不变
         //（max ord 胜，builder 内 (ord, 到达序) 等价于原 (key, ord) 排序取末）。
-        auto b = SpillingRunBuilder::create(std::string(dir), gen);
+        // S36-2：出 v2（全字段 + bloom）——rows 由 caller 从 keydir 收集，
+        // 位置字段齐备。
+        auto b = SpillingRunBuilder::create(std::string(dir), gen,
+                                            kRunVersion2);
         if (!b) return false;
         for (const auto& r : rows) {
             auto a = b->add(std::span<const std::byte>(
                                 reinterpret_cast<const std::byte*>(r.key.data()),
                                 r.key.size()),
-                            r.ord, r.tomb);
+                            r.ord, r.tomb, r.has_loc ? &r.loc : nullptr);
             if (!a) return false;
         }
         if (!b->finish(/*fsync_dir=*/true)) return false;
@@ -294,7 +382,7 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
     }
 
     OkiManifest next;
-    if (new_reader) next.runs.push_back({gen, cover_ord});
+    if (new_reader) next.runs.push_back({gen, cover_ord, /*format_ver=*/2});
     next.wm = cover_ord;
     if (!write_manifest(dir, next)) {
         std::error_code ec;
@@ -309,19 +397,76 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
         std::vector<std::uint64_t> keep;
         if (new_reader) keep.push_back(gen);
         sweep_runs(dir, keep);
+        block_cache_.purge_except(keep);  // S36-3：死 gen 块不占缓存
     }
     manifest_ = std::move(next);
     readers_.clear();
     if (new_reader) readers_.emplace_back(gen, std::move(new_reader));
+    publish_runs_locked();
     wm_.store(manifest_.wm, std::memory_order_release);
     loaded_.store(true, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(mu_);
         delta_.clear();
         delta_bytes_ = 0;
+        rebuild_index_locked();
         update_flush_hint_locked();
     }
     return true;
+}
+
+// S36-2：组合视图点查（冷侧——不含哈希 keydir；设计 §5.1 步骤 2-4）。
+OkiState::LocateResult OkiState::locate(std::string_view key) const {
+    LocateResult out;
+    if (!point_query_.load(std::memory_order_acquire)) return out;
+    if (!loaded_.load(std::memory_order_acquire)) return out;
+
+    // 1) memdelta：辅助哈希直查（存的即 (ord, 到达序) 胜出行）。delta 命中
+    //    短路——同 key 的 delta 行恒不旧于任何 run 行（行只随时间进入更高
+    //    gen；delta 视作 gen=∞，等 ord 时 delta 胜）。
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = delta_idx_.find(key);
+        if (it != delta_idx_.end()) {
+            const DeltaRow& r = delta_[it->second];
+            out.status = LocateStatus::kHit;
+            out.ord = r.ord;
+            out.tomb = r.tomb;
+            out.has_loc = r.has_loc;
+            out.loc = r.loc;
+            return out;
+        }
+    }
+
+    // 2) 逐 run gen 降序（readers_ 恒按 gen 升序维护）：bloom 试探 →
+    //    seek 二分 → 首行比对。首命中即权威（不变量见头文件）。
+    const auto runs = runs_snap_.load(std::memory_order_acquire);
+    if (!runs) return out;  // kUnavailable（loaded 但快照未发布——不可达兜底）
+    const std::span<const std::byte> kspan(
+        reinterpret_cast<const std::byte*>(key.data()), key.size());
+    for (auto it = runs->rbegin(); it != runs->rend(); ++it) {
+        const OkiRunReader& rd = *it->second;
+        if (rd.version() != kRunVersion2) {
+            // v1 run：无位置字段也无 bloom——排除不了 key 也定位不了。
+            // 组合视图对该 key 无点查能力（kUnavailable，待重建自愈）。
+            return LocateResult{};
+        }
+        if (!rd.may_contain(kspan)) continue;
+        // S36-3：块经 LRU 缓存（命中零 IO；miss 1 次 4KiB pread）。
+        auto e = rd.find(kspan, &block_cache_, it->first);
+        if (!e) return LocateResult{};  // IO/损坏 → kUnavailable
+        if (e->has_value()) {
+            out.status = LocateStatus::kHit;
+            out.ord = (*e)->ord;
+            out.tomb = (*e)->tomb;
+            out.has_loc = (*e)->has_loc;
+            out.loc = (*e)->loc;
+            return out;
+        }
+        // 缺席（bloom 假阳性）→ 更旧 run。
+    }
+    out.status = LocateStatus::kMiss;
+    return out;
 }
 
 std::optional<OkiState::ReadView> OkiState::make_read_view() const {
@@ -335,12 +480,14 @@ std::optional<OkiState::ReadView> OkiState::make_read_view() const {
         std::lock_guard<std::mutex> lk(mu_);
         v.delta = delta_;  // 拷贝快照（排序去重在锁外做）
     }
-    std::sort(v.delta.begin(), v.delta.end(),
-              [](const DeltaRow& a, const DeltaRow& b) {
-                  if (a.key != b.key) return a.key < b.key;
-                  return a.ord < b.ord;
-              });
-    // 同 key 保留 max-ord（尾元素）。
+    // S36-2：stable——同 key 同 ord 按到达序取末（(ord, 到达序) 胜出格，
+    // 与 flush/locate 同一规则；merge 搬迁行与被搬迁行同 ord）。
+    std::stable_sort(v.delta.begin(), v.delta.end(),
+                     [](const DeltaRow& a, const DeltaRow& b) {
+                         if (a.key != b.key) return a.key < b.key;
+                         return a.ord < b.ord;
+                     });
+    // 同 key 保留 (ord, 到达序) 最大者（尾元素）。
     std::vector<DeltaRow> dedup;
     dedup.reserve(v.delta.size());
     for (std::size_t i = 0; i < v.delta.size(); ++i) {

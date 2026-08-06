@@ -623,12 +623,15 @@ add(f.live_keys, live_inc);
 - 关键修复（S13-F8）：直接 `fstats_[idx]` 会与 `emplace_back` 的 deque
   内部块表重分配构成 UAF（TSan 实证抓出）；RCU 指针表闭合。
 
-### 7.7 conditional_remove TOCTOU
+### 7.7 conditional_remove（S36-2：TOCTOU 已消灭）
 
-实现分两阶段（peek + remove），peek 瞬间持分片锁 + 嵌套 meta shared，
-释放；remove 重新取分片 unique lock 检查命中——remove 内部 re-check 当
-前状态，幂等安全。详见 `src/keydir/keydir.cpp` 的
-`KeyDir::conditional_remove`（两阶段协议 + 锁全序均在该函数附近注释）。
+实现仍分两阶段（peek 快速放行 + 写阶段），但 S36-2 起写阶段改为
+**锁内精确 CAS**（`remove_impl` 的 `expected` 参数）：重新取分片 unique
+lock 后比对 `(tstamp, file_id, offset)` 全部匹配才删，不匹配即放行
+（视作已被并发处理）。旧实现「peek 后无条件 remove、可能误删并发新写」
+的 TOCTOU 容忍从此不存在——Level B 组合视图权威化（OKI 墓碑行以受害者
+ord 记账）要求删除必须精确命中特定版本。详见 `src/keydir/keydir.cpp`
+的 `KeyDir::conditional_remove`。
 
 ---
 

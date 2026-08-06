@@ -524,24 +524,125 @@ S34 已由用户提交（dc81bbc）；S35 改动未提交。
 spill 文件不 fsync（临时件，崩溃 = 整次构建重来，派生缓存语义；最终
 run 的 finish 才带 fsync_dir）。未提交。
 
-### S36-2 — 全字段 delta + locate() 影子对拍 🔴 HIGH（安全网）
+### ✅ S36-2 — 全字段 delta + locate() 影子对拍 🔴 HIGH（安全网）
 
-- [ ] DeltaRow 加宽（+SingleEntry）；搬迁/TTL 挂钩（keydir 咽喉点反转
+- [x] DeltaRow 加宽（+SingleEntry）；搬迁/TTL 挂钩（keydir 咽喉点反转
       old_file_id!=0 跳过规则）；统一 `locate()` 原语
-- [ ] **影子模式**：缓存不逐出，get 双查对拍（debug 断言组合视图 == 哈希
+- [x] **影子模式**：缓存不逐出，get 双查对拍（debug 断言组合视图 == 哈希
       权威）——零漂移是 S36-4 开逐出的前置门
-- **验收**：全量 ctest + 对拍零漂移；put/merge 回归 bench（put ≤3%）
+- **验收**：✅ 全量 ctest + 对拍零漂移；put/merge 回归 bench（put ≤3%）
 
-### S36-3 — get 冷路径 + 块 LRU 🔴 HIGH
+#### ✅ S36-2 落地记录（2026-08-06）
 
-- [ ] get 接 locate；块 LRU（独立小锁，不进 keydir 锁序）；读升温回填
+核心落点（`oki_state.{hpp,cpp}` / `keydir.{hpp,cpp}` / `cask_recovery.cpp`
++ 新 `tests/oki_locate_test.cpp` 6 用例）：
+
+- **DeltaRow 全字段**（`has_loc` + `RowLoc`，墓碑免位置）；写挂钩把
+  (file_id,total_sz,offset,tstamp) 一并送入。新 `append_update` 入口 =
+  「旧 ord、新信息」行（merge 搬迁 / TTL 墓碑），**绕过 wm 水位门**。
+- **同 key 胜出全链路统一 max (ord, 到达序)**：flush/read_view 换
+  stable_sort 取末、locate 辅助哈希 ord≥ 顶替、compact 归并 `>=`（等
+  ord **高 gen 胜**——搬迁行与被搬迁行同 ord 的判据，设计 §D2）、
+  SpillingRunBuilder 既有 (ord,seq)——同构一条规则。
+- **flush 改「拷前缀 → 提交 → 删前缀」**（原 swap+restore 退役）：IO
+  期间行仍在 delta_，locate 无「在写盘路上不可见」窗口（影子对拍在
+  checkpoint 并发下的必要条件）；失败路径零恢复动作。flush/rebuild 出
+  **v2 run**（manifest 惰性版本既有）；compact 全 v2 输入才出 v2（v1
+  混入则降 v1 保语义，点查能力待重建自愈）。
+- **`OkiState::locate`**（冷侧）：memdelta 辅助哈希（`enable_point_query`
+  开启时维护，key→最新行下标）→ runs gen 降序 bloom/seek 首命中即权威；
+  **v1 run → kUnavailable 降级**（绝不误答 kMiss）。runs 快照走
+  `atomic<shared_ptr>`——locate 不抢横跨长 IO 的 flush_mu_。
+  `KeyDir::locate` 统一原语 = 缓存 → 冷侧（get/merge/TTL 在 S36-3/5 接）。
+- **影子对拍**：get 拆薄包装 + `shadow_verify`；并发协议 = 写路径
+  `shadow_hooks_in_flight_` 括住「哈希更新可见→append 完成」窗口 +
+  失配时重读重试，稳定失配才 assert（`ShadowStats` 三计数，NDEBUG 下
+  计入 drifts）。**debug 构建 Cask::open 自动开启** ⟹ 全量套件每一次
+  get 都在对拍。容忍面两条（TTL 恢复走廊 / kUnavailable）注释里有论证。
+- **计划微调：搬迁/TTL 挂钩门在点查开启上**。Level A 不消费这些行
+  （range 回查 keydir 权威），无门实测 merge bench +18%（每条搬迁一次
+  append + flush 排序份量 21.4→25.2ms）超 ≤10% 预算；且关门期间的
+  merge 本就会让历史 run loc 陈旧——**Level B 开启必须以全量重建起步**
+  （S36-4 硬要求，已写进挂钩注释），开启后挂钩持续在线保 run 新鲜。
+  门后 merge 19.5ms（基线 20.4-21.4，零回归）。
+- **顺手修：conditional_remove TOCTOU 消灭**——写阶段改锁内精确 CAS
+  （`remove_impl` expected 参数），「误删并发新写」从文档容忍变为不可能
+  （doc/concurrency-zh.md §7.7 已更新）；成功后以**受害者 ord** 记 OKI
+  墓碑（有数据记录背书，无 ord 复用风险；哈希侧 sentinel 维持 ord=0，
+  S33-B1 契约不动）。
+- **给 S36-5 的记录**：崩溃丢 memdelta 中的搬迁行 → run 内 loc 陈旧而
+  wm 无缺口、不触发重建——Level B 模式的恢复缺口（Level A 无害），须与
+  「unlink 顺序不变量 + 崩溃注入」一并收口（如 merge 收尾 flush 先于
+  unlink，或 unclean shutdown + merge 痕迹 → 重建）。
+- **验收**：Debug 全量 **709/709**（703 基线 + 6 新增；影子对拍全程
+  开启零漂移）| **ASan 全量 709/709** | **TSan 并发套件 180/180**（CI
+  豁免口径，未新增豁免）| build-rel 全树零新告警 | bench（8 reps）：
+  KeyDir put 67.1→68.6ns（+2.2%）、Cask put 1244→1255ns（+0.9%），
+  均 ≤3% 达标；merge 门关零回归（门开 +18% 为 Level B 模式已知成本，
+  S36-3 冷 get 锚点时一并复测）。未提交。
+
+### ✅ S36-3 — get 冷路径 + 块 LRU 🔴 HIGH
+
+- [x] get 接 locate；块 LRU（独立小锁，不进 keydir 锁序）；读升温回填
       （二次命中门）
-- **验收**：冷/热 get bench 锚点（热 ≤3%、冷 P99 ≤300µs tmpfs 另锚）
+- **验收**：✅ 冷/热 get bench 锚点（热 ≤3%、冷 P99 ≤300µs tmpfs 另锚）
+
+#### ✅ S36-3 落地记录（2026-08-06）
+
+落点：`oki_run.{hpp,cpp}`（OkiBlockCache + `find()`）、`oki_state`（locate
+接缓存 + purge）、`keydir`（locate warm 回填 + `evict` + 分片写计数）、
+`cask.cpp`（get 切 locate）+ `oki_locate_test` 6 新用例 + `range_bench`
+冷 get 锚点。要点：
+
+- **Cask::get 切 `locate(key, warm_fill=true)`**：点查关（Level A 生产
+  默认）时 locate 一行早退 ≡ 哈希 get，行为逐字节相同；点查开（影子/
+  Level B）时缓存 miss 落组合视图。S13-F5 重试对冷路径同样成立（重查
+  locate 拿到搬迁行新位置）；mmap/pread/TTL/墓碑过滤零改动。remove 的
+  tombstone_version=2 shadow 查询同步切 locate。
+- **块 LRU（OkiBlockCache）**：key=(gen, 块下标)——gen 永不重用 ⟹ 无别名，
+  跨 close/reopen 缓存天然有效；16 分片小锁独立锁域，loader（pread）在
+  锁外，块 shared_ptr 淘汰不影响在途读者；compact/rebuild 后 purge 死
+  gen。默认 256MB（选项透出排 S36-6）。`OkiRunReader::find` = seek 同款
+  定位 + 缓存块（`seek_impl` 共用一份逻辑）。
+- **读升温回填（二次命中门）**：4096 槽 32 位指纹表——同 key 连续两次冷
+  命中才回填（扫描型负载指纹恒被冲刷 → 天然不污染缓存，bench 实测轮转
+  100k key 零回填）；回填是缓存填充非逻辑插入（key_count/fstats 不动，
+  D4），安全性 = 分片写计数快照（探测前捕获，插入时变了即弃）+ 屏障/
+  fold 期直接弃。
+- **`KeyDir::evict`（测试/bench 用，S36-4 CLOCK 的底座）**：物理 erase
+  （swap-delete + limbo，乐观读者安全同 S29-6），计数不动；fold/屏障/
+  MultiEntry 拒逐。
+- **并发实证抓获一个真 bug（40 连跑 1 复现 → 修后 40/40 + 三矩阵全绿）**：
+  evictor 在「哈希已更新、OKI append 在途」的窗口把新行逐出 → 冷读者从
+  组合视图拿到旧行（hash ord=1138 stale vs cold ord=1198）→ 读升温把旧
+  行回填 = **静默回滚**。修复：写挂钩在途括号（原影子专用计数）泛化为
+  「点查开启即计数」，**evict 以挂钩静止（计数=0）为前置**——静止 ⟹ 已
+  完成写全部进 delta/runs，其后新写由分片写计数挡回填，闭环。这是 S36-4
+  CLOCK 逐出策略必须继承的前置条件（已写进 evict 注释）。
+- **影子对拍适配逐出**：发生过逐出后「哈希 miss vs 组合视图活行」是被逐
+  key 的合法形态，该方向降级 skip（首次逐出前保持全严格）；漂移 assert
+  前把两侧状态吐 stderr（本次抓 bug 即靠它）。
+- **bench 锚点（tmpfs，build-rel，8/5 reps）**：热 get 834ns（基线
+  977-1063，View 807 vs 806-808——零回归 ≤3% ✓）；put 68.8ns/1254ns
+  （+2.5%/+0.8% ≤3% ✓）；**冷 get（10 万 key 全逐出轮转）：块缓存关
+  p50 4.9µs / p99 13.7µs，开 p50 3.9µs / p99 9.4µs**（设计 SSD 门
+  300µs；冷耗时大头是块内线性扫 ~百行解码，块内重启点属后续优化）。
+- **验收**：Debug 全量 **715/715**（709 + 6 新增）| **ASan 全量
+  715/715** | **TSan 并发套件 186/186**（CI 豁免口径；新并发用例同
+  oki_range_test 惯例在 TSan 下关乐观读快路径，未新增豁免）|
+  build-rel 全树零新告警。未提交。
 
 ### S36-4 — 逐出 + 快照三元组 + BCKS v4 🔴 HIGH
 
 - [ ] CLOCK 逐出 + `CaskOptions::keydir_cache_entries`（0=不限=现状，
       默认 0 opt-in）；MultiEntry 不可逐；逻辑计数与 fstats 校准
+- [ ] **（S36-2 立的硬要求）Level B 开启必须以全量重建起步**：搬迁/TTL
+      挂钩门在点查开启上，关门期间（含 S36-2 之前）的 run loc 可能陈旧，
+      不可直接采信既有 manifest
+- [ ] **（S36-3 立的硬要求）CLOCK 逐出必须继承 `KeyDir::evict` 的挂钩
+      静止前置**（oki_hooks_in_flight_==0；违反 = 冷读者回填旧行的静默
+      回滚，S36-3 并发实证）；全局计数在持续写压下会饿死逐出——届时评估
+      改 per-shard 计数
 - [ ] CaskIter/parallel_scan 快照 = 缓存屏障 + delta 拷贝 + manifest pin
 - [ ] kv.keydir.ckpt v4（缓存子集语义；Level B 关闭时仍写 v3）
 - **验收**：100M 档 RSS ≤1.5GB 实测；快照一致性 stress
@@ -550,6 +651,10 @@ run 的 finish 才带 fsync_dir）。未提交。
 
 - [ ] merge 活性/搬迁切 locate；unlink 前搬迁行入 delta 顺序不变量；
       遗留 B1（ckpt fsync 水位）失败注入证实 + 修复
+- [ ] **（S36-2 发现）搬迁行崩溃缺口**：memdelta 中未 flush 的搬迁行随
+      崩溃丢失 → run 内 loc 陈旧且 wm 无缺口不触发重建（Level A 无害，
+      Level B 是权威错位）。候选：merge 收尾 flush 先于输入 unlink，或
+      unclean shutdown + merge 痕迹 → 重建
 - **验收**：逐出态 merge 千轮无丢 key stress；崩溃注入全套；ASan/TSan
 
 ### S36-6 — C API + 文档 + 门禁复测 🟡 MED
@@ -584,6 +689,8 @@ S33-7 (评审)  ───── 依 S33-1 数据
 | T12 | HNSW ckpt 去重（~115 行）| ⏸ 默认不做（注释同步已替代）|
 | **B1** | **checkpoint 可能跑赢未 fsync 的数据**（S35 测试期发现的**预存**暴露面）：keydir 快照/OKI 经 `atomic_write_bytes` fsync 落盘，而被引用的数据记录可能还在 page cache——掉电后快照存活、数据撕裂 ⟹ 恢复拿到悬空条目（get 报 IO/CRC）。单条 put 与批同样暴露，非 S35 引入。候选方向：ckpt 写前记录各文件已 fsync 水位、快照只覆盖水位内条目；或 ckpt 前强制 sync。**须先写失败注入测试证实再立项** | 🟡 待评估 |
 | **B2** | **legacy 意图重放退役时间表**：`TxnCask::recover`/`pending_txns` + blob v1 解码现在只服务方案 B 时期（dc81bbc..S35 之间）目录的崩溃遗留。建议 5.3+ 删除（CHANGELOG 预告一版）| 🟢 择机 |
+| **B3** | **mmap 收进 io.hpp（造 `MappedFile` RAII）**：`::mmap/munmap` 手写生命周期现散布 7 处（`data_file.{hpp,cpp}` / `segment_v2.{hpp,cpp}` / `hnsw.cpp` / `diskann.cpp` / `ivf_rq.cpp`），各写各的 map/unmap/错误处理/madvise——本身就是维护面（S33-B2 那类窗口 bug 的温床）。归并为 io.hpp 单一 `MappedFile`（open/映射长度/只读 span 视图/移动语义），各站点换用。**验收**：行为零变化（纯重构）+ 全矩阵 + build-rel 双树 | 🟢 择机（2026-08-06 入列）|
+| **B4** | **unlink-while-open 从设计里拿掉，换延迟删除队列**：现设计多处依赖「POSIX unlink 后已开 fd 仍可读」（merge 收尾 unlink 输入文件、OKI `sweep_runs`/rebuild 清旧 run），并为此付了三笔补丁账：O10 的 erase+unlink 同临界区（cask.cpp merge 收尾注释）、S13-F5 的 lazy-reopen 重试、在途读者 shared_ptr 续命——但「持旧 keydir 快照的在途 get 在 unlink 后 lazy reopen 报 ENOENT 假失败」一类窗口（cask.cpp:1388/2921 两处注记）只是被缓解，未根除。改为**延迟删除队列**：文件先退休入队（改名或仅记账），等在途引用静止（epoch/引用计数）后真正删除——ENOENT 假失败窗口整类消失，O10 持锁做文件系统操作的别扭也随之解除；顺带是未来非 POSIX 语义文件系统的可移植性铺垫。**验收**：并发 get/iter × merge 收尾 stress（含 S13-F5 场景）+ 崩溃后队列残件回收 | 🟢 择机（2026-08-06 入列）|
 
 Phase 6 复核仍成立的低价值项（RED-3/5/6/10，随重构自然消化）见 git 历史 62789cd。
 

@@ -632,26 +632,35 @@ void Cask::finish_oki_recovery(bool snap_loaded,
     if (!opts_.read_write || opts_.merge_only) return;
     auto& oki = keydir_->oki();
     const bool gap = snap_loaded && oki.wm() < snap_next_ord;
-    if (oki.loaded() && !gap) return;
-
-    std::vector<oki::OkiState::DeltaRow> rows;
-    rows.reserve(static_cast<std::size_t>(keydir_->info().key_count));
-    auto it = keydir_->make_iter();
-    if (it->start(/*now_sec*/ 0, /*maxage*/ -1, /*maxputs*/ -1) !=
-        keydir::StartIterResult::kOk) {
-        log_warn("oki rebuild: keydir iteration unavailable "
-                 "(oki disabled until next open)");
-        return;
+    if (!oki.loaded() || gap) {
+        std::vector<oki::OkiState::DeltaRow> rows;
+        rows.reserve(static_cast<std::size_t>(keydir_->info().key_count));
+        auto it = keydir_->make_iter();
+        if (it->start(/*now_sec*/ 0, /*maxage*/ -1, /*maxputs*/ -1) !=
+            keydir::StartIterResult::kOk) {
+            log_warn("oki rebuild: keydir iteration unavailable "
+                     "(oki disabled until next open)");
+            return;
+        }
+        while (auto p = it->next()) {
+            // S36-2：全字段行（BCOK v2）——组合视图点查的权威载体。
+            rows.push_back(oki::OkiState::DeltaRow{
+                std::string(p->key), p->ord, /*tomb=*/false,
+                /*has_loc=*/true,
+                oki::RowLoc{p->file_id, p->total_sz, p->offset, p->tstamp}});
+        }
+        it->release();
+        if (!oki.rebuild(dirname_, std::move(rows),
+                         keydir_->peek_next_ord())) {
+            log_warn("oki rebuild failed (oki disabled until next open)");
+        }
     }
-    while (auto p = it->next()) {
-        rows.push_back(oki::OkiState::DeltaRow{
-            std::string(p->key), p->ord, /*tomb=*/false});
-    }
-    it->release();
-    if (!keydir_->oki().rebuild(dirname_, std::move(rows),
-                                keydir_->peek_next_ord())) {
-        log_warn("oki rebuild failed (oki disabled until next open)");
-    }
+#ifndef NDEBUG
+    // S36-2 影子对拍（风险闸）：debug 构建下 OKI 就绪即自动开启——全量
+    // 测试套件的每一次 get 都在对拍组合视图 vs 哈希权威，漂移即 assert。
+    // Release（含 build-rel/bench）不开：locate 冷侧有真实 IO 成本。
+    if (oki.loaded()) keydir_->set_oki_shadow_check(true);
+#endif
 }
 
 // P14e/P14b:加载 keydir 快照 + search.ckpt 分段快照。用 watermark 单趟
