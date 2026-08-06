@@ -1185,6 +1185,17 @@ private:
     // 与写路径阈值 flush（memdelta 达阈值时同步落 run，罕见且有界）。
     void finish_oki_recovery(bool snap_loaded,
                              std::uint64_t snap_next_ord) noexcept;
+    // B4：延迟删除队列——merge 输入退休而非当场 unlink（文件留在原路径，
+    // 惰性重开的 ENOENT 假失败窗口从源头消失；O10 的临界区文件系统操作
+    // 一并退役）。排水点 = 下次 merge 开始 / checkpoint 入口 / close——
+    // 上一代在途读者（单次 get 是 µs 级）届时早已完成。崩溃丢队列无害
+    // （退休文件即普通 data 文件，恢复 LWW/ord 门正确处理，后续 merge
+    // 自愈收编）。空间回收因此**延后一拍**（下一个落点），CHANGELOG 已注。
+    std::mutex retired_mu_;
+    std::vector<std::string> retired_files_;  // data 路径（hint 同名派生）
+    void retire_files(std::vector<std::string> paths) noexcept;
+    void drain_retired_files() noexcept;
+
     void maybe_flush_oki() noexcept;            // 前置：write_mu_ 已持有
     void maybe_flush_oki_unlocked() noexcept;   // 锁外站点包装（自取锁）
     // S14-1：水位捕获与快照写入拆分。RunFn 路径（checkpoint()/自动 ckpt）

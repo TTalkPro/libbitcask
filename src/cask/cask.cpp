@@ -668,6 +668,7 @@ void Cask::close() noexcept {
     // 异常让后续资源释放仍能执行，优于进程硬死。错误可见性靠 index_errors_
     // 计数 + 未来可观测性梯队，不在 close 加日志。
     try {
+        drain_retired_files();  // B4：close 兜底排水（退休文件不过夜）
         (void)maybe_group_commit(/*force*/ true);  // P4:落最后一批未 fsync 的写
         // S36-5 B1：封口即持久——close 路径不经 roll/close_write_file，补
         // 同款 seal fsync（sync_every_n==0 时上面是 no-op，这里才是唯一
@@ -827,6 +828,33 @@ void Cask::write_keydir_snapshot() noexcept {
     auto wms = collect_snapshot_watermarks();
     if (!wms) return;
     write_keydir_snapshot(*wms);
+}
+
+// B4：延迟删除队列（语义见 merge 收尾注释与 cask.hpp 成员注释）。
+void Cask::retire_files(std::vector<std::string> paths) noexcept {
+    if (paths.empty()) return;
+    std::lock_guard<std::mutex> lk(retired_mu_);
+    retired_files_.insert(retired_files_.end(),
+                          std::make_move_iterator(paths.begin()),
+                          std::make_move_iterator(paths.end()));
+}
+
+void Cask::drain_retired_files() noexcept {
+    std::vector<std::string> batch;
+    {
+        std::lock_guard<std::mutex> lk(retired_mu_);
+        batch.swap(retired_files_);
+    }
+    for (const auto& path : batch) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        std::filesystem::remove(fileops::mk_hint_filename(path), ec);
+        // 删除失败（非 POSIX 语义下仍被打开等）→ 放回队列下代再试。
+        if (ec && std::filesystem::exists(path)) {
+            std::lock_guard<std::mutex> lk(retired_mu_);
+            retired_files_.push_back(path);
+        }
+    }
 }
 
 // S33-4：写路径阈值 flush——memdelta 超限（1M 行 / 64MiB）时同步落 run，
@@ -2584,6 +2612,7 @@ Cask::NeedsMerge Cask::needs_merge(std::uint64_t now_sec) {
 std::expected<void, CaskFault> Cask::checkpoint() {
     WriteOpGate gate(this);  // H1：close() 等本调用（含 RunFn 等待）完成
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
+    drain_retired_files();  // B4：周期落点排水（上一代退休文件删除）
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly,
                                      "checkpoint: read-only cask"));
@@ -2914,6 +2943,7 @@ void Cask::maybe_submit_auto_checkpoint() {
 std::expected<merge::MergeStats, CaskFault>
 Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
+    drain_retired_files();  // B4：上一代退休文件此刻删除（在途读者早已完成）
     if (files.empty()) {
         auto n = needs_merge(now_sec);
         if (!n.needs) {
@@ -3011,10 +3041,10 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
     // （stuck，正常流程不可达）绝不能 unlink——否则这些 key 指向已删文件，
     // 重启后永久丢失。跳过其 unlink/erase/trim，留给下轮 merge 重试。
     //
-    // erase + unlink 收在同一临界区(O10):放锁后再 unlink 会留一个窗口,
-    // 持旧 keydir 快照的在途 get 在 unlink 后 lazy reopen 报 ENOENT 假失败。
-    // 持锁做文件系统操作可接受——merge 收尾是冷路径。被 erase 的句柄若仍
-    // 被在途读者持有,由 shared_ptr 引用计数续命(UAF 修复)。
+    // B4（O10 退役）：临界区只做 erase + fstats 收集,不再有任何文件系统
+    // 操作——unlink 改为退休队列延迟删除(见下),ENOENT 假失败窗口从源头
+    // 消失。被 erase 的句柄若仍被在途读者持有,由 shared_ptr 引用计数续命
+    // (UAF 修复不变)。
     //
     // Failures here are best-effort: the keydir is already consistent. A
     // residual file just wastes disk until the next process tries the same.
@@ -3040,12 +3070,21 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
             return *r;
         }
     }
+    // B4：输入文件**退休**而非当场 unlink（延迟删除队列）——文件留在原
+    // 路径：持旧 keydir 快照的在途读者 lazy reopen 仍能成功（旧位置内容与
+    // 新副本逐字节相同），O10 时代「erase+unlink 同临界区堵 ENOENT 窗口」
+    // 的补丁账（连同 S13-F5 重试兜的那类假失败）从源头消失；临界区也不再
+    // 做文件系统操作。真正删除在下一代落点（下次 merge 开始 / close /
+    // checkpoint 入口）——届时上一代在途读者（单次 get 是 µs 级）早已完成。
+    // 崩溃丢队列无害：退休文件就是普通 data 文件，恢复 fold 的 LWW/ord 门
+    // 正确处理陈旧记录，后续 merge 会再次收编（自愈回收）。
     std::vector<std::uint32_t> trimmed_ids;
+    std::vector<std::string> to_retire;
     trimmed_ids.reserve(files.size());
+    to_retire.reserve(files.size());
     {
         std::scoped_lock lk(read_cache_mu_);
         for (const auto& path : files) {
-            std::error_code ec;
             if (auto t = fileops::parse_data_tstamp(path)) {
                 const auto fid = static_cast<std::uint32_t>(*t);
                 if (std::binary_search(r->stuck_file_ids.begin(),
@@ -3055,10 +3094,10 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
                 read_files_.erase(fid);
                 trimmed_ids.push_back(fid);
             }
-            std::filesystem::remove(path, ec);
-            std::filesystem::remove(fileops::mk_hint_filename(path), ec);
+            to_retire.push_back(path);
         }
     }
+    retire_files(std::move(to_retire));
     if (!trimmed_ids.empty()) {
         (void)keydir_->trim_fstats(trimmed_ids);
     }
