@@ -68,6 +68,7 @@ libbitcask 有两种工作模式，由 `CaskOptions` 决定：
 | `require_hint_crc` | `bool` | `false` | 是否要求 hint trailer CRC 通过 | `cask.hpp` |
 | `expiry_secs` | `std::uint32_t` | `0` | TTL：tstamp < now − expiry_secs 的 record 在 get / fold 中被过滤，并触发 merge；`0`=禁用 | `cask.hpp` |
 | `merge_only` | `bool` | `false` | merge-only 模式：拿 `bitcask.merge.lock`，不创建 active writer；可与 live writer 并行 merge | `cask.hpp` |
+| `keydir_cache_entries` | `std::size_t` | `0` | **S36 Level B（keydir 磁盘驻留）**：`0`=不限（全内存，现状）；`>0`=热点缓存条目预算——超预算分片内采样逐出，点查落组合视图（memdelta + BCOK v2 run：bloom + 块 LRU，冷 get ≤2 次 pread）。1 亿 key 常驻 11GB → ~1.1GB。语义/约束见 [§11.3](#113-keydir-磁盘驻留level-b) | `cask.hpp` |
 | `tombstone_version` | `std::uint8_t` | `0` | 墓碑格式：`0`=17B 前缀；`2`=22B 含 FileId。读时三种 (v0/v1/v2) 都接受 | `cask.hpp` |
 | `policy` | `merge::PolicyOptions` | `{}` | merge 触发策略（碎片率 / 死字节 / 过期阈值） | `merge_policy.hpp` |
 | `enable_search` | `bool` | `false` | 启用索引模式 | `cask.hpp` |
@@ -2288,6 +2289,20 @@ auto c = bitcask::Cask::open(dir, opts, &registry);
 ### 11.2 merge 调度
 
 库内**不做周期策略**——`merge()` 由 caller 按业务低峰/写入量自行调度（`Cask::checkpoint` 同理）。用 `needs_merge()` 拿判据与候选文件列表；同一目录同时只能有一次 merge 在跑（caller 保证）。策略阈值见 [`merge-policy-zh.md`](merge-policy-zh.md)。
+
+### 11.3 keydir 磁盘驻留（Level B）
+
+`keydir_cache_entries > 0` 把 keydir 从「全量内存权威」降级为「热点缓存」，点查权威变成 **缓存 → memdelta → 磁盘 run（BCOK v2：内嵌 bloom + 稀疏索引 + 块 LRU）** 的组合视图。设计与格式见 [`keydir-disk-resident-design-zh.md`](keydir-disk-resident-design-zh.md) 与 [`format-zh.md` §15.4](format-zh.md)。
+
+**收益锚点**（tmpfs，`doc:<n>` 形态 1 亿 key，预算 500 万，2026-08-06 实测）：常驻 11GB → 加载峰值 **1.14GB** / 重开 **0.80GB**（-90%）；重开走 BCKS v4 子集快照 ~1 秒；热 get 零回归（缓存命中即现状路径）；冷 get tmpfs 锚点 p50 ~4-5µs / p99 ~14µs（块缓存命中 ~4µs/9µs；SSD 预算门 ≤300µs）。
+
+使用要点：
+
+1. **opt-in 且可回退**：默认 0 = 现状。首次对旧目录开启会**全量重建 OKI**（既有 run 无位置字段/不可信，一次 fold + 外排；重建后 manifest 带 Level B 模式戳，此后重开走快路径）。回到 `0`（Level A）随时可以——open 自动清戳、快照回落 v3，再开启时重建自愈。
+2. **merge_only 旁车互斥**：旁车 merge 不维护 run 位置，对带戳目录 `open` 直接拒绝（`kIo`，报文说明）。同理，Level A 写者动过的目录回 Level B 会自动重建。
+3. **预算是软目标**：fold/scan 活跃期间暂停逐出；预算按 256 分片均摊（每分片下限 8 条）。读热但被逐的 key 由「二次命中读升温」自动回填。
+4. **计数语义不变**：`key_count`/fstats 是逻辑值（逐出不减、覆盖被逐 key 不虚增——写路径经组合视图裁决），merge 触发判据不受逐出影响。
+5. **只读句柄**同样受益：带戳目录 + `keydir_cache_entries>0` 的 RO 打开走子集快照，内存有界。
 
 ---
 

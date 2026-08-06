@@ -250,6 +250,7 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts);
 | `expiry_secs`       | `uint32_t` | `0`      | TTL 秒数（`0`=禁用）|
 | `merge_only`        | `int`      | `0`      | merge-only 模式 |
 | `tombstone_version` | `uint8_t`  | `0`      | 墓碑格式版本（`0` 或 `2`）|
+| `keydir_cache_entries` | `size_t` | `0` | **S36 Level B（keydir 磁盘驻留）**：`0`=不限（全内存，现状）；`>0`=热点缓存条目预算，点查落组合视图（冷 get ≤2 次 pread），1 亿 key 常驻 11GB → ~1.1GB。首次对旧目录开启会全量重建 OKI（一次性）；merge_only 旁车对 Level B 目录 open 返回 `BITCASK_ERR_IO`。语义详见 api-cpp.md §11.3。⚠ 结构体 5.0.0 后新增字段（布局变更，见 CHANGELOG） |
 
 **搜索 / 索引**
 
