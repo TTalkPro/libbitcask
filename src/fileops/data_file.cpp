@@ -1,6 +1,5 @@
 #include "bitcask/data_file.hpp"
 
-#include <sys/mman.h>
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -56,23 +55,13 @@ DataFile::open(std::string_view path, Mode mode, bool sync, bool mmap_enabled) {
     // mmap_enabled=false(纯 fold 的恢复/merge/迭代器 pin)跳过,避免无谓映射。
     if (mode == Mode::kRead && mmap_enabled && sizeof(void*) >= 8 &&
         initial_off > 0) {
-        void* base = ::mmap(nullptr, static_cast<std::size_t>(initial_off),
-                            PROT_READ, MAP_SHARED, df.file_.fd(), 0);
-        if (base != MAP_FAILED) {
-            df.map_base_ = static_cast<const std::byte*>(base);
-            df.map_size_ = static_cast<std::size_t>(initial_off);
-            // D3:get() 热路径按 offset 随机读，禁 readahead 避免内核预读浪费。
-            ::madvise(base, static_cast<std::size_t>(initial_off), MADV_RANDOM);
-        }
+        // D3:get() 热路径按 offset 随机读 → advise_random 禁内核预读。
+        // 失败 → 无效映射,纯 pread 回退（MappedFile 内部语义）。
+        df.map_ = io::MappedFile::map_readonly(
+            df.file_.fd(), static_cast<std::size_t>(initial_off),
+            /*advise_random=*/true);
     }
     return df;
-}
-
-DataFile::~DataFile() {
-    if (map_base_ != nullptr) {
-        ::munmap(const_cast<std::byte*>(map_base_), map_size_);
-        map_base_ = nullptr;
-    }
 }
 
 DataFile::DataFile(DataFile&& o) noexcept
@@ -80,16 +69,10 @@ DataFile::DataFile(DataFile&& o) noexcept
       current_offset_(o.current_offset_), mode_(o.mode_),
       durable_writes_(o.durable_writes_), durable_(std::move(o.durable_)),
       write_buf_(std::move(o.write_buf_)),
-      map_base_(o.map_base_), map_size_(o.map_size_) {
-    o.map_base_ = nullptr;
-    o.map_size_ = 0;
-}
+      map_(std::move(o.map_)) {}
 
 DataFile& DataFile::operator=(DataFile&& o) noexcept {
     if (this != &o) {
-        if (map_base_ != nullptr) {
-            ::munmap(const_cast<std::byte*>(map_base_), map_size_);
-        }
         file_           = std::move(o.file_);
         path_           = std::move(o.path_);
         current_offset_ = o.current_offset_;
@@ -97,24 +80,21 @@ DataFile& DataFile::operator=(DataFile&& o) noexcept {
         durable_writes_ = o.durable_writes_;
         durable_        = std::move(o.durable_);
         write_buf_      = std::move(o.write_buf_);
-        map_base_       = o.map_base_;
-        map_size_       = o.map_size_;
-        o.map_base_     = nullptr;
-        o.map_size_     = 0;
+        map_            = std::move(o.map_);  // B3:双 munmap 防护在 MappedFile
     }
     return *this;
 }
 
 std::expected<codec::DataRecordView, DataFileFault>
 DataFile::read_mmap(std::uint64_t offset, std::uint32_t total_size) const {
-    if (map_base_ == nullptr) {
+    if (!map_.valid()) {
         return std::unexpected(DataFileFault{DataFileError::kIo});
     }
-    if (offset > map_size_ || total_size > map_size_ - offset) {
+    if (offset > map_.size() || total_size > map_.size() - offset) {
         return std::unexpected(DataFileFault{DataFileError::kShortRead});
     }
     auto rec = codec::decode_data_record(
-        std::span<const std::byte>(map_base_ + offset, total_size));
+        std::span<const std::byte>(map_.data() + offset, total_size));
     if (!rec) {
         switch (rec.error()) {
             case codec::DecodeError::kBadCrc:

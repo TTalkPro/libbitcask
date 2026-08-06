@@ -66,9 +66,7 @@ public:
     enum class Mode { kRead, kAppend, kCreate };
 
     DataFile() = default;
-    // P6:析构 munmap(若已映射);移动转移映射所有权并把源置空,避免
-    // 默认 move 拷贝裸指针 → 双 munmap。定义在 .cpp。
-    ~DataFile();
+    ~DataFile() = default;  // B3:映射归 io::MappedFile RAII,不再手写 munmap
 
     DataFile(const DataFile&) = delete;
     DataFile& operator=(const DataFile&) = delete;
@@ -171,7 +169,7 @@ public:
     // 有效;CRC 不通过 → kBadCrc,越界 → kShortRead。
     // 线程安全: 是(只读映射 + 纯解码,不碰 fd/offset)。
     [[nodiscard]] bool mmapped() const noexcept {
-        return map_base_ != nullptr;
+        return map_.valid();
     }
     [[nodiscard]] std::expected<codec::DataRecordView, DataFileFault>
     read_mmap(std::uint64_t offset, std::uint32_t total_size) const;
@@ -231,11 +229,11 @@ private:
     // flush_batch() 一次 pwrite 后清空（容量保留复用）。
     std::vector<std::byte> batch_buf_;
     static constexpr std::size_t kBatchFlushBytes = 1u << 20;  // 1 MiB
-    // P6:sealed mmap。map_base_ != nullptr 表示整文件已 mmap(PROT_READ,
-    // MAP_SHARED);read_mmap 直读映射。fd 仍保留打开(read()/fold() 的 pread 需要,
-    // 见 data_file.cpp::open 注释;fd 回收归 P9)。~DataFile munmap。
-    const std::byte* map_base_ = nullptr;
-    std::size_t      map_size_ = 0;
+    // P6:sealed mmap。valid() 表示整文件已 mmap(PROT_READ, MAP_SHARED);
+    // read_mmap 直读映射。fd 仍保留打开(read()/fold() 的 pread 需要,见
+    // data_file.cpp::open 注释;fd 回收归 P9)。B3:RAII 归并进
+    // io::MappedFile(析构 munmap/移动置空,不再手写)。
+    io::MappedFile map_;
 };
 
 // ---------------------------------------------------------------------------
