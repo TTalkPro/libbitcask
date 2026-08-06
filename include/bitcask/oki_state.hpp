@@ -248,6 +248,8 @@ private:
     std::atomic<bool> point_query_{false};
 
     mutable std::mutex flush_mu_;  // flush/load/rebuild 串行；manifest_/readers_ 归其保护
+    // B4：sweep 删除失败的滞留路径（flush_mu_ 下访问；下次 sweep 重试）。
+    std::vector<std::string> sweep_backlog_;
     OkiManifest manifest_;
     // manifest_.runs 一一对应的常驻 Reader（load 全量 CRC 校验后开；
     // flush/rebuild 产出新 run 时随 manifest 提交同步维护）。

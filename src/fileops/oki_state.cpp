@@ -24,9 +24,20 @@ std::optional<std::uint64_t> parse_run_gen(std::string_view filename) {
 // 删除目录内 gen 不在 keep 集里的全部 run 文件。
 // **不能只删旧 manifest 列出的那些**：触发重建的典型场景恰恰是 manifest
 // 缺失/损坏（此时内存 manifest_ 为空），那批 run 文件就成了无人回收的
-// 孤儿，每重建一次多一批。在途 ReadView 经 shared_ptr 持旧 Reader，
-// unlink 后 fd 仍可读到 close——安全。
-void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep) {
+// 孤儿，每重建一次多一批。在途 ReadView 经 shared_ptr 持旧 Reader——
+// POSIX 下 unlink 后 fd 仍可读到 close；B4：删除失败（非 POSIX 语义下
+// 文件仍被打开等）的路径回填 backlog，下次 sweep 重试（延迟删除队列的
+// OKI 侧形态——正确性不依赖 unlink-while-open）。
+void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep,
+                std::vector<std::string>& backlog) {
+    // 先重试上一轮滞留（可能已无读者）。
+    std::vector<std::string> still;
+    for (const auto& p : backlog) {
+        std::error_code rm_ec;
+        std::filesystem::remove(p, rm_ec);
+        if (rm_ec && std::filesystem::exists(p)) still.push_back(p);
+    }
+    backlog = std::move(still);
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
         const auto name = e.path().filename().string();
@@ -41,6 +52,9 @@ void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep) {
         if (std::find(keep.begin(), keep.end(), *g) != keep.end()) continue;
         std::error_code rm_ec;
         std::filesystem::remove(e.path(), rm_ec);
+        if (rm_ec && std::filesystem::exists(e.path())) {
+            backlog.push_back(e.path().string());  // B4：滞留重试
+        }
     }
 }
 
@@ -392,7 +406,7 @@ bool OkiState::compact_all_locked(std::string_view dir) {
     // unlink 后 fd 仍可读——安全）。
     {
         const std::uint64_t keep_gen[] = {gen};
-        sweep_runs(dir, keep_gen);
+        sweep_runs(dir, keep_gen, sweep_backlog_);
         block_cache_.purge_except(keep_gen);  // S36-3：死 gen 块不占缓存
     }
     return true;
@@ -451,7 +465,7 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
     {
         std::vector<std::uint64_t> keep;
         if (new_reader) keep.push_back(gen);
-        sweep_runs(dir, keep);
+        sweep_runs(dir, keep, sweep_backlog_);
         block_cache_.purge_except(keep);  // S36-3：死 gen 块不占缓存
     }
     manifest_ = std::move(next);
