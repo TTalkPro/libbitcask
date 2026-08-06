@@ -548,7 +548,7 @@ public:
 多键事务 helper（原理 [`multikey-txn-zh.md`](multikey-txn-zh.md)；S35 起提交路径 = 引擎原子批，设计 [`atomic-batch-design-zh.md`](atomic-batch-design-zh.md)）。提供崩溃原子性（A）与持久性（D）；**不提供**隔离性（I）与 CAS——事务中间态对并发读者可见。要点：
 
 - `commit`：一次 `put_batch_atomic`——崩溃/掉电后全生效或全不生效，无恢复重放依赖。校验失败（空批 / 空 key / 重复 key / `_txn:` 前缀）→ `kInvalidOption` 零副作用。首次 commit 懒升级目录 meta 至 v6（见 `put_batch_atomic` 契约）。`TxnSyncPolicy::kSyncOnCommit`（默认）在提交后显式 `sync()`（防掉电丢批——原子性与持久性正交）。
-- `recover`（legacy）：前滚重放方案 B（意图日志）时代目录遗留的 `_txn:` pending 并清理。S35 起 commit 不再产生意图——新目录恒返回 0。open 后、任何业务写之前调用；不得与 `commit` 并发。
+- `recover` / `pending_txns`（B2 起恒空）：方案 B 的意图重放已删除——意图日志从未随任何发布版本存在（TxnCask 与引擎原子批同版首发）。签名保留为 API 稳定面；开发期残留的 `_txn:` 前缀 key 可经普通 KV API 手工清理。
 - 并发：键集不相交的并发 `commit` 安全；键集重叠无隔离/定序保证（应用层串行化）。
 - `_txn:` 命名空间保留（legacy）；空间回收走 merge。
 

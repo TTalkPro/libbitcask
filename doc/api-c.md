@@ -673,11 +673,11 @@ BITCASK_API bitcask_error_t bitcask_txn_pending_count(bitcask_t* cask,
                                                       bitcask_fault_t* fault);
 ```
 
-S35 引擎原子批（设计 `doc/atomic-batch-design-zh.md`；模式原理 `doc/multikey-txn-zh.md`）。崩溃原子性（A）+ 持久性（D）；**不提供**隔离性（I）与 CAS。key 命名空间 `_txn:` 保留（legacy 意图日志）。
+S35 引擎原子批（设计 `doc/atomic-batch-design-zh.md`；模式原理 `doc/multikey-txn-zh.md`）。崩溃原子性（A）+ 持久性（D）；**不提供**隔离性（I）与 CAS。key 命名空间 `_txn:` 保留。
 
 - `bitcask_put_batch_atomic`：引擎原子批直通——崩溃/掉电后整批要么全可见要么全不可见；批内 op 依序 apply（同 key 多次 = 批内 LWW，不校验重复）。**首次调用把目录 meta 懒升级为 v6**（旧于 5.1.0 的读端拒开该目录；从不调用则停留 v5）。durability 同 `bitcask_put_batch`。
 - `bitcask_txn_commit`：= 原子批 + 事务级校验（空批 / 空 key / 重复 key / `_txn:` 前缀 → `BITCASK_ERR_INVALID_OPTION` 零副作用）。`sync_on_commit` 非零 = 提交后显式 fsync（防掉电丢批——原子性与持久性正交）。
-- `bitcask_txn_recover`（legacy）：重放方案 B 时代目录遗留的 pending；S35 起 commit 不再产生意图，新目录恒返回 0。open 后、任何业务写之前调用。`out_replayed` 可为 `NULL`。
+- `bitcask_txn_recover` / `bitcask_txn_pending_count`（B2 起恒返回 0）：方案 B 意图重放已删除（意图日志从未随发布版本存在）；签名保留。`out_replayed` 可为 `NULL`。
 - `bitcask_txn_pending_count`：legacy 巡检；S35 后正常恒 0。
 
 ---

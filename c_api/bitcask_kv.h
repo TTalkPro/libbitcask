@@ -432,16 +432,14 @@ BITCASK_API bitcask_error_t bitcask_txn_commit(bitcask_t* cask,
                                                int sync_on_commit,
                                                bitcask_fault_t* fault);
 
-/* 启动恢复（legacy）：前滚重放方案 B（意图日志）时代目录遗留的 pending
- * 事务并清理。S35 起 commit 不再产生意图——新目录恒返回 0。
- * 契约：open 后、任何业务写之前调用；不得与 commit 并发。
- * out_replayed 可为 NULL。 */
+/* B2（2026-08-06）：恒返回 0——方案 B 的意图重放已删除（意图日志从未
+ * 随任何发布版本存在；签名保留为 API 稳定面）。开发期残留的 "_txn:"
+ * 前缀 key 可经普通 KV API 手工清理。out_replayed 可为 NULL。 */
 BITCASK_API bitcask_error_t bitcask_txn_recover(bitcask_t* cask,
                                                 size_t* out_replayed,
                                                 bitcask_fault_t* fault);
 
-/* 运维巡检：legacy pending 事务条数（不重放）。S35 后正常恒 0——仅
- * 方案 B 时期目录的崩溃遗留会非零。 */
+/* B2：恒返回 0（同 bitcask_txn_recover——意图重放已删除，签名保留）。 */
 BITCASK_API bitcask_error_t bitcask_txn_pending_count(bitcask_t* cask,
                                                       size_t* out_count,
                                                       bitcask_fault_t* fault);

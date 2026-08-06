@@ -839,7 +839,7 @@ S33-7 (评审)  ───── 依 S33-1 数据
 | T8 | 搜索读屏障无界等待（`prepare_search` 饥饿）| ⏸ 4 项前置未满足（饥饿注入测试 / applied_ord 可见性调查 / flush 超时基建✅ / flush_upto+notify 成对恢复；原文 62789cd）|
 | T12 | HNSW ckpt 去重（~115 行）| ⏸ 默认不做（注释同步已替代）|
 | **B1** | **checkpoint 可能跑赢未 fsync 的数据** | ✅ done（S36-5 收口：DataFile 持久水位 + ckpt 采集点 fd-fsync + 快照/OKI「引用 ≤ 持久」过滤 + 封口即持久；注入测试 `B1CheckpointNeverOutrunsDataFsync` 证实并钉死，见 S36-5 落地记录）|
-| **B2** | **legacy 意图重放退役时间表** | ✅ 预告已发（2026-08-06：CHANGELOG Deprecated 段——计划 5.3+（或 major 后下一 minor）删除意图重放与 blob v1 解码，接口保留恒返 0；届时执行删除即收口）|
+| **B2** | **legacy 意图重放退役** | ✅ done（2026-08-06 **提前收口**：复核发现意图日志只存在于 dc81bbc..S35 之间的未发布构建——TxnCask 与原子批同版首发，无已发布兼容对象，「预告一版再删」的仪式对象不存在，首发前删净。blob v1 解码/收集/前滚全删（txn.cpp 186→80 行）；`recover`/`pending_txns` 含 C API 签名保留恒返空；原六个意图用例退役，新用例钉死「遗留残留不受触碰 + fork 崩溃后 commit 原子可见」；CHANGELOG Removed 段 + 三处文档同步）|
 | **B3** | **mmap 收进 io.hpp（`MappedFile` RAII）** | ✅ done（2026-08-06：`io::MappedFile`（PROT_READ+MAP_SHARED 整文件、不接管 fd、move-only、可选 MADV_RANDOM）落地；7 处手抄归并——`DataFile` sealed 映射（连同手写析构/移动语义退役）、`MmapSegment`、HNSW `.vec`/`.qc8` payload、IVF/DiskANN 段；`bitcask_bm25`/`bitcask_vector` 补 `bitcask_io` 链接；零行为变化，hot get/View bench 与全矩阵零回归）|
 | **B4** | **unlink-while-open 换延迟删除队列** | ✅ done（2026-08-06：merge 输入退休（留原路径）→ 下次 merge 开始/checkpoint 入口/close 排水删除——惰性重开 ENOENT 假失败窗口从源头消失，O10「临界区 erase+unlink」退役（临界区不再做文件系统操作）；删除失败（非 POSIX 语义）回队重试；OKI sweep 同步改「尝试删除+滞留重试」；崩溃丢队列无害（退休文件即普通 data 文件，恢复 LWW/ord 门正确处理 + 后续 merge 自愈收编，fork 测试钉死）。**可见变化：空间回收延后一拍**（CHANGELOG Changed 已注）。两处断言旧行为的测试（FoldSurvives/P6MmapView）改为「退休滞留 + checkpoint 排水后删除」，原「已开句柄跨 unlink 存活」意图保留。Debug/ASan 728/728、TSan 199/199、merge/put bench 零回归 |
 

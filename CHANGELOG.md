@@ -83,15 +83,16 @@ magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁�
   （data 文件 sealed 映射 / BM25 段 / HNSW-IVF-DiskANN payload）——
   行为零变化，纯维护面收敛。
 
-### Deprecated
+### Removed（backlog B2：legacy 意图重放）
 
-- **TxnCask legacy 意图重放**（`TxnCask::recover` / `pending_txns` 的
-  意图 blob v1 解码与前滚）：S35 起 `commit` 已改走引擎原子批
-  （`put_batch_atomic`），意图日志仅服务「方案 B 时期（dc81bbc..S35
-  之间的未发布构建）目录」的崩溃遗留。**计划 5.3+（或本版按 ABI 评审
-  升 major 后的下一个 minor）删除**该重放路径与 blob v1 解码；接口
-  `recover`/`pending_txns` 保留但恒返回 0。届时旧意图残留（`__txn__:`
-  前缀 key）仍可经普通 KV API 手工清理。（backlog B2 预告）
+- **TxnCask 方案 B 意图重放删除**（意图 blob v1 解码 + `recover` 前滚 +
+  `pending_txns` 枚举的实现体）：意图日志只存在于 dc81bbc..S35 之间的
+  **未发布**开发构建（TxnCask 本身即本版新增），没有任何已发布版本写过
+  意图 blob——无兼容对象，首发前删净优于「预告一版再删」。接口
+  `recover`/`pending_txns`（含 C API `bitcask_txn_recover`/
+  `bitcask_txn_pending_count`）**签名保留**，恒返回 0/空；开发期残留的
+  `_txn:` 前缀 key 不被触碰，可经普通 KV API 手工清理。崩溃原子性全部
+  由引擎原子批承载（S35，`put_batch_atomic`）。
 
 ### Fixed（S36 期间）
 
