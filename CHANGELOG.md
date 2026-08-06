@@ -70,6 +70,29 @@ magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁�
 - **merge_only 旁车对 Level B 目录 open 拒绝**（旁车无挂钩搬迁会腐蚀
   组合视图位置权威）。
 
+### Changed（backlog B3/B4：mmap 归并 + 延迟删除队列）
+
+- **B4：merge 的输入文件改「退休 + 延迟删除」**，不再当场 unlink——文件
+  留在原路径直到下一个落点（下次 merge 开始 / `checkpoint()` 入口 /
+  `close()`）才删除。持旧 keydir 快照的在途读者惰性重开不再有 ENOENT
+  假失败窗口（S13-F5 重试兜的那类）；merge 收尾临界区不再做文件系统
+  操作。**可见变化：merge 释放的磁盘空间延后一拍**（到下一个落点）；
+  崩溃残留的退休文件是普通 data 文件，恢复与后续 merge 自愈收编。
+  OKI run 清扫同步改「尝试删除 + 失败滞留重试」。
+- **B3（内部）**：7 处手写 mmap 生命周期归并为 `io::MappedFile` RAII
+  （data 文件 sealed 映射 / BM25 段 / HNSW-IVF-DiskANN payload）——
+  行为零变化，纯维护面收敛。
+
+### Deprecated
+
+- **TxnCask legacy 意图重放**（`TxnCask::recover` / `pending_txns` 的
+  意图 blob v1 解码与前滚）：S35 起 `commit` 已改走引擎原子批
+  （`put_batch_atomic`），意图日志仅服务「方案 B 时期（dc81bbc..S35
+  之间的未发布构建）目录」的崩溃遗留。**计划 5.3+（或本版按 ABI 评审
+  升 major 后的下一个 minor）删除**该重放路径与 blob v1 解码；接口
+  `recover`/`pending_txns` 保留但恒返回 0。届时旧意图残留（`__txn__:`
+  前缀 key）仍可经普通 KV API 手工清理。（backlog B2 预告）
+
 ### Fixed（S36 期间）
 
 - **B1（checkpoint 跑赢未 fsync 数据，S35 备案的预存暴露面）收口**：

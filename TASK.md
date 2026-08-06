@@ -835,13 +835,13 @@ S33-7 (评审)  ───── 依 S33-1 数据
 | 项 | 内容 | 状态 |
 |---|---|---|
 | T23 | ChunkedReader 归并 refill ×3 | ✅ done（随 S33-2，见落地记录）|
-| T24 | decode_rec 共享解包段模板归并（须 bench 基准 + build-rel 双树）| 🟢 择机——**前提复核仍成立**：两份解码现位于 `src/bm25/segment_v2.cpp:604`（`decode_rec`→FlatPostings）与 `:970`（`decode_rec_list`→PostingList），原文见 git 历史 62789cd |
+| T24 | decode_rec 共享解包段模板归并 | ✅ done（2026-08-06：`decode_rec_columns` 泛型模板归并两份手抄块循环，dl 列以 `requires` 编译期分支；bench `BM_MmapSeg_BOWQuery` 8.25→8.22µs 零回归；全矩阵 + 双树）|
 | T8 | 搜索读屏障无界等待（`prepare_search` 饥饿）| ⏸ 4 项前置未满足（饥饿注入测试 / applied_ord 可见性调查 / flush 超时基建✅ / flush_upto+notify 成对恢复；原文 62789cd）|
 | T12 | HNSW ckpt 去重（~115 行）| ⏸ 默认不做（注释同步已替代）|
 | **B1** | **checkpoint 可能跑赢未 fsync 的数据** | ✅ done（S36-5 收口：DataFile 持久水位 + ckpt 采集点 fd-fsync + 快照/OKI「引用 ≤ 持久」过滤 + 封口即持久；注入测试 `B1CheckpointNeverOutrunsDataFsync` 证实并钉死，见 S36-5 落地记录）|
-| **B2** | **legacy 意图重放退役时间表**：`TxnCask::recover`/`pending_txns` + blob v1 解码现在只服务方案 B 时期（dc81bbc..S35 之间）目录的崩溃遗留。建议 5.3+ 删除（CHANGELOG 预告一版）| 🟢 择机 |
-| **B3** | **mmap 收进 io.hpp（造 `MappedFile` RAII）**：`::mmap/munmap` 手写生命周期现散布 7 处（`data_file.{hpp,cpp}` / `segment_v2.{hpp,cpp}` / `hnsw.cpp` / `diskann.cpp` / `ivf_rq.cpp`），各写各的 map/unmap/错误处理/madvise——本身就是维护面（S33-B2 那类窗口 bug 的温床）。归并为 io.hpp 单一 `MappedFile`（open/映射长度/只读 span 视图/移动语义），各站点换用。**验收**：行为零变化（纯重构）+ 全矩阵 + build-rel 双树 | 🟢 择机（2026-08-06 入列）|
-| **B4** | **unlink-while-open 从设计里拿掉，换延迟删除队列**：现设计多处依赖「POSIX unlink 后已开 fd 仍可读」（merge 收尾 unlink 输入文件、OKI `sweep_runs`/rebuild 清旧 run），并为此付了三笔补丁账：O10 的 erase+unlink 同临界区（cask.cpp merge 收尾注释）、S13-F5 的 lazy-reopen 重试、在途读者 shared_ptr 续命——但「持旧 keydir 快照的在途 get 在 unlink 后 lazy reopen 报 ENOENT 假失败」一类窗口（cask.cpp:1388/2921 两处注记）只是被缓解，未根除。改为**延迟删除队列**：文件先退休入队（改名或仅记账），等在途引用静止（epoch/引用计数）后真正删除——ENOENT 假失败窗口整类消失，O10 持锁做文件系统操作的别扭也随之解除；顺带是未来非 POSIX 语义文件系统的可移植性铺垫。**验收**：并发 get/iter × merge 收尾 stress（含 S13-F5 场景）+ 崩溃后队列残件回收 | 🟢 择机（2026-08-06 入列）|
+| **B2** | **legacy 意图重放退役时间表** | ✅ 预告已发（2026-08-06：CHANGELOG Deprecated 段——计划 5.3+（或 major 后下一 minor）删除意图重放与 blob v1 解码，接口保留恒返 0；届时执行删除即收口）|
+| **B3** | **mmap 收进 io.hpp（`MappedFile` RAII）** | ✅ done（2026-08-06：`io::MappedFile`（PROT_READ+MAP_SHARED 整文件、不接管 fd、move-only、可选 MADV_RANDOM）落地；7 处手抄归并——`DataFile` sealed 映射（连同手写析构/移动语义退役）、`MmapSegment`、HNSW `.vec`/`.qc8` payload、IVF/DiskANN 段；`bitcask_bm25`/`bitcask_vector` 补 `bitcask_io` 链接；零行为变化，hot get/View bench 与全矩阵零回归）|
+| **B4** | **unlink-while-open 换延迟删除队列** | ✅ done（2026-08-06：merge 输入退休（留原路径）→ 下次 merge 开始/checkpoint 入口/close 排水删除——惰性重开 ENOENT 假失败窗口从源头消失，O10「临界区 erase+unlink」退役（临界区不再做文件系统操作）；删除失败（非 POSIX 语义）回队重试；OKI sweep 同步改「尝试删除+滞留重试」；崩溃丢队列无害（退休文件即普通 data 文件，恢复 LWW/ord 门正确处理 + 后续 merge 自愈收编，fork 测试钉死）。**可见变化：空间回收延后一拍**（CHANGELOG Changed 已注）。两处断言旧行为的测试（FoldSurvives/P6MmapView）改为「退休滞留 + checkpoint 排水后删除」，原「已开句柄跨 unlink 存活」意图保留。Debug/ASan 728/728、TSan 199/199、merge/put bench 零回归 |
 
 Phase 6 复核仍成立的低价值项（RED-3/5/6/10，随重构自然消化）见 git 历史 62789cd。
 

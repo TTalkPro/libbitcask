@@ -225,7 +225,7 @@ add_library(bitcask_bm25 STATIC
 )
 target_include_directories(bitcask_bm25 PUBLIC include)
 target_link_libraries(bitcask_bm25
-    PUBLIC bitcask_format
+    PUBLIC bitcask_format bitcask_io   # B3：MmapSegment 用 io::MappedFile
     PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb)
 
 # ---------------------------------------------------------------------------
@@ -241,7 +241,7 @@ target_include_directories(bitcask_vector
     PRIVATE src/vector
 )
 target_link_libraries(bitcask_vector
-    PUBLIC  bitcask_format
+    PUBLIC  bitcask_format bitcask_io  # B3：payload mmap 用 io::MappedFile
     PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb
 )
 

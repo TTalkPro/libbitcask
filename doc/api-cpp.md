@@ -2290,6 +2290,8 @@ auto c = bitcask::Cask::open(dir, opts, &registry);
 
 库内**不做周期策略**——`merge()` 由 caller 按业务低峰/写入量自行调度（`Cask::checkpoint` 同理）。用 `needs_merge()` 拿判据与候选文件列表；同一目录同时只能有一次 merge 在跑（caller 保证）。策略阈值见 [`merge-policy-zh.md`](merge-policy-zh.md)。
 
+> **空间回收时序（B4）**：merge 的输入文件先**退休**（留在原路径，消除在途读者的 ENOENT 窗口），到下一个落点（下次 `merge()` 开始 / `checkpoint()` 入口 / `close()`）才真正删除——merge 返回后磁盘占用**延后一拍**下降。崩溃残留的退休文件无害且会被后续 merge 自愈收编。
+
 ### 11.3 keydir 磁盘驻留（Level B）
 
 `keydir_cache_entries > 0` 把 keydir 从「全量内存权威」降级为「热点缓存」，点查权威变成 **缓存 → memdelta → 磁盘 run（BCOK v2：内嵌 bloom + 稀疏索引 + 块 LRU）** 的组合视图。设计与格式见 [`keydir-disk-resident-design-zh.md`](keydir-disk-resident-design-zh.md) 与 [`format-zh.md` §15.4](format-zh.md)。
