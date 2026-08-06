@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.0.0`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.1.0`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
@@ -14,7 +14,24 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ---
 
-## [6.0.0] - 未发布（S36：keydir 磁盘驻留 Level B；backlog 收口 T24 / B1-B4）
+## [6.1.0] - 未发布
+
+> **版本语义**：C API 纯增量——`bitcask_error_t` 尾部追加一个枚举值，
+> 既有值与函数签名、结构体布局零改动 → MINOR +1，**`SOVERSION` 保持
+> `6`**（`.so.6` 不换号，下游无需重新链接）。盘上格式全部不动。
+
+### Added
+
+- **错误码 `CaskError::kIndexRebuildFailed`** / C
+  `BITCASK_ERR_INDEX_REBUILD_FAILED`（枚举尾部追加，既有值不动）：
+  `make_range_iter` / `bitcask_range_iter_start` 的「OKI 不可用」按成因
+  拆码——RO/merge_only 打开无 OKI 的目录（本就不建，重开读写即建）仍报
+  `kNoIndex`；可写 open 重建失败（IO/环境问题）改报新码。旧行为两者压成
+  `kNoIndex`，调用方无从区分「重开读写即好」与「环境有问题」。
+
+---
+
+## [6.0.0] - 2026-08-06（S36：keydir 磁盘驻留 Level B；backlog 收口 T24 / B1-B4）
 
 > **版本语义（2026-08-06 定版）**：`CaskOptions`（C++）与
 > `bitcask_options_t`（C）各新增 `keydir_cache_entries` 字段——**结构体
