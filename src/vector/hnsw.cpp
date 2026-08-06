@@ -380,23 +380,15 @@ std::span<const float> HnswIndex::node_vec(std::uint32_t id) const {
 HnswIndex::~HnswIndex() {
     // V7:mmap payload 先于 chunk 释放——mmap 区域只读、生命周期与 fd 绑定,
     // close fd 前 munmap 防止其他进程拿同一文件 mmap 时 kernel 行为未定义。
-    if (vecs_mmap_raw_ != nullptr) {
-        ::munmap(vecs_mmap_raw_, vecs_mmap_len_);
-        vecs_mmap_raw_  = nullptr;
-        vecs_mmap_base_ = nullptr;
-        vecs_mmap_len_  = 0;
-    }
+    vecs_map_.reset();  // B3：RAII munmap
+    vecs_mmap_base_ = nullptr;
     if (vecs_payload_fd_ >= 0) {
         ::close(vecs_payload_fd_);
         vecs_payload_fd_ = -1;
     }
     // S32-M2:qc8 mmap 同序释放。
-    if (qc_mmap_raw_ != nullptr) {
-        ::munmap(qc_mmap_raw_, qc_mmap_len_);
-        qc_mmap_raw_  = nullptr;
-        qc_mmap_recs_ = nullptr;
-        qc_mmap_len_  = 0;
-    }
+    qc_map_.reset();
+    qc_mmap_recs_ = nullptr;
     if (qc_payload_fd_ >= 0) {
         ::close(qc_payload_fd_);
         qc_payload_fd_ = -1;
@@ -1643,13 +1635,9 @@ bool HnswIndex::load_qc_payload(std::string_view path) {
     const std::string fp(path);
 
     // 已持有 mmap 时先拆(load 由 open 期单线程串入,契约同 load_vec_payload)。
-    if (qc_mmap_raw_ != nullptr) {
-        ::munmap(qc_mmap_raw_, qc_mmap_len_);
-        qc_mmap_raw_  = nullptr;
-        qc_mmap_recs_ = nullptr;
-        qc_mmap_len_  = 0;
-        qc_checkpoint_count_ = 0;
-    }
+    qc_map_.reset();  // B3：RAII munmap
+    qc_mmap_recs_ = nullptr;
+    qc_checkpoint_count_ = 0;
     if (qc_payload_fd_ >= 0) {
         ::close(qc_payload_fd_);
         qc_payload_fd_ = -1;
@@ -1706,18 +1694,18 @@ bool HnswIndex::load_qc_payload(std::string_view path) {
         ::close(fd);
         return false;
     }
-    void* raw = ::mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (raw == MAP_FAILED) {
+    // B3：MappedFile（advise_random = MADV_RANDOM——图导航随机 touch
+    // 码字,预读收益小,与 .vec 同款）。
+    qc_map_ = io::MappedFile::map_readonly(fd, file_size,
+                                           /*advise_random=*/true);
+    if (!qc_map_.valid()) {
         ::close(fd);
         return false;
     }
-    qc_mmap_raw_   = raw;
-    qc_mmap_recs_  = static_cast<const std::uint8_t*>(raw) + rec_off;
-    qc_mmap_len_   = file_size;
+    qc_mmap_recs_ =
+        reinterpret_cast<const std::uint8_t*>(qc_map_.data()) + rec_off;
     qc_payload_fd_ = fd;  // fd 持有至 mmap 生命周期末(destructor close)
     qc_checkpoint_count_ = n;
-    // 图导航随机 touch 码字,预读收益小 → MADV_RANDOM(与 .vec 同款)。
-    ::madvise(raw, file_size, MADV_RANDOM);
     qc_file_ = VecFileState{true, st.st_dev, st.st_ino, rec_off, n};
     qc_pending_ = false;
     return true;
@@ -1823,12 +1811,8 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
     if (fd < 0) return false;
 
     // 已持有 mmap 时先拆——契约要求 load 前为空(load 由 open 期单线程串入)。
-    if (vecs_mmap_raw_ != nullptr) {
-        ::munmap(vecs_mmap_raw_, vecs_mmap_len_);
-        vecs_mmap_raw_  = nullptr;
-        vecs_mmap_base_ = nullptr;
-        vecs_mmap_len_  = 0;
-    }
+    vecs_map_.reset();  // B3：RAII munmap
+    vecs_mmap_base_ = nullptr;
     if (vecs_payload_fd_ >= 0) {
         ::close(vecs_payload_fd_);
         vecs_payload_fd_ = -1;
@@ -1907,23 +1891,22 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
         return false;
     }
     // count=0 时文件可能仅 header(无 vecs 段),mmap 整个文件即可。
-    void* raw = ::mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (raw == MAP_FAILED) {
+    // B3：MappedFile（advise_random = MADV_RANDOM——随机访问模式,稀疏读,
+    // 预取收益小）。
+    vecs_map_ = io::MappedFile::map_readonly(fd, file_size,
+                                             /*advise_random=*/true);
+    if (!vecs_map_.valid()) {
         ::close(fd);
         return false;
     }
 
-    vecs_mmap_raw_   = raw;
     vecs_mmap_base_  = reinterpret_cast<const float*>(
-        static_cast<std::byte*>(raw) + vecs_off_u64);
-    vecs_mmap_len_   = file_size;
+        vecs_map_.data() + vecs_off_u64);
     vecs_payload_fd_ = fd;  // fd 持有至 mmap 生命周期末(destructor close)
     checkpoint_count_ = n;
     // S14-2:记录追加目标。count 取 n（ckpt 有效前缀）而非 header.count——
     // 文件尾部可能是被 .prev 回退否掉的新代数据，下次追加从 n 起覆盖。
     vec_file_ = VecFileState{true, st.st_dev, st.st_ino, vecs_off_u64, n};
-    // 随机访问模式:稀疏读,预取收益小,直接 MADV_RANDOM。
-    ::madvise(raw, file_size, MADV_RANDOM);
     return true;
 }
 

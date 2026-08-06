@@ -57,6 +57,8 @@
 
 #include "bitcask/ivf_rq.hpp"  // IvfBuildSource（两段引擎共用数据源契约）
 
+#include "bitcask/io.hpp"  // B3：MappedFile（sealed 段只读映射）
+
 namespace bitcask::vec {
 
 class DiskannSegment {
@@ -117,9 +119,8 @@ private:
         return static_cast<std::size_t>(dim_) + 8;
     }
 
-    const std::uint8_t* base_ = nullptr;  // mmap 基址
-    void*               raw_  = nullptr;
-    std::size_t         len_  = 0;
+    const std::uint8_t* base_ = nullptr;  // mmap 基址（= map_.data()）
+    io::MappedFile      map_;             // B3：RAII 归并（析构 munmap）
     int                 fd_   = -1;
 
     std::uint16_t dim_ = 0;

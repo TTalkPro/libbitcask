@@ -3,7 +3,6 @@
 #include "bitcask/ivf_rq.hpp"
 
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -70,12 +69,8 @@ std::uint32_t auto_nlist(std::uint32_t n) {
 IvfSegment::~IvfSegment() { close(); }
 
 void IvfSegment::close() {
-    if (raw_ != nullptr) {
-        ::munmap(raw_, len_);
-        raw_  = nullptr;
-        base_ = nullptr;
-        len_  = 0;
-    }
+    map_.reset();  // B3：RAII munmap
+    base_ = nullptr;
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
@@ -551,15 +546,13 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
         ::close(fd);
         return false;
     }
-    void* raw = ::mmap(nullptr, static_cast<std::size_t>(st.st_size),
-                       PROT_READ, MAP_SHARED, fd, 0);
-    if (raw == MAP_FAILED) {
+    map_ = io::MappedFile::map_readonly(
+        fd, static_cast<std::size_t>(st.st_size), /*advise_random=*/false);
+    if (!map_.valid()) {
         ::close(fd);
         return false;
     }
-    base_  = static_cast<const std::uint8_t*>(raw);
-    raw_   = raw;
-    len_   = static_cast<std::size_t>(st.st_size);
+    base_  = reinterpret_cast<const std::uint8_t*>(map_.data());
     fd_    = fd;
     dim_   = dim;
     nlist_ = nlist;

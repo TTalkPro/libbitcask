@@ -52,6 +52,8 @@
 #include <memory>
 #include <random>
 #include <span>
+
+#include "bitcask/io.hpp"  // B3：MappedFile（payload 只读映射）
 #include <string_view>
 #include <vector>
 
@@ -448,10 +450,9 @@ private:
     // chunk 分配)覆盖。vec_of() 按 id 分支: < checkpoint_count_ 走 mmap,
     // ≥ 走 chunk->vecs。下次 checkpoint 时 save_vec_payload() 合并两者写新
     // payload。inmem_int8 模式下 mmap 不建立(chunk 容量 0)。
-    const float*       vecs_mmap_base_  = nullptr;
-    void*              vecs_mmap_raw_   = nullptr;
+    const float*       vecs_mmap_base_  = nullptr;  // = vecs_map_.data()+off
+    io::MappedFile     vecs_map_;         // B3：RAII 归并（析构 munmap）
     int                vecs_payload_fd_ = -1;
-    std::size_t        vecs_mmap_len_   = 0;
     std::uint32_t      checkpoint_count_ = 0;
 
     // S32-M2:.qc8 mmap 化（设计 doc/vector-dual-engine-selection-zh.md
@@ -463,9 +464,8 @@ private:
     // 首次热插入懒分配（与 vecs 懒分配同协议——boundary chunk 内已发布
     // 节点全部 < qc_checkpoint_count_ 走 mmap，assign 无并发读者）。
     const std::uint8_t* qc_mmap_recs_ = nullptr;  // 记录区基址（含 stride）
-    void*               qc_mmap_raw_  = nullptr;
+    io::MappedFile      qc_map_;          // B3：RAII 归并（析构 munmap）
     int                 qc_payload_fd_ = -1;
-    std::size_t         qc_mmap_len_  = 0;
     std::uint32_t       qc_checkpoint_count_ = 0;
 
     // S14-2:.vec 追加状态——与 mmap 解耦（追加读内存 vec_of、写文件，不需要
