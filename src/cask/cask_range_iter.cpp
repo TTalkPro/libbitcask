@@ -26,10 +26,17 @@ Cask::make_range_iter(const RangeOptions& opts) {
     if (!keydir_) return std::unexpected(err(CaskError::kClosed));
     auto view = keydir_->oki().make_read_view();
     if (!view) {
+        // 按成因拆码（见 cask.hpp 枚举注释）：试建而败 vs 本就不建。
+        if (oki_rebuild_failed_) {
+            return std::unexpected(err(
+                CaskError::kIndexRebuildFailed,
+                "oki rebuild failed at open (io/env problem, see log; "
+                "fix and reopen to retry)"));
+        }
         return std::unexpected(err(
             CaskError::kNoIndex,
-            "oki unavailable (read-only open of a dir without oki, or "
-            "rebuild failed; reopen read-write to rebuild)"));
+            "oki unavailable on this handle (read-only or merge-only open "
+            "of a dir without oki; reopen read-write to build)"));
     }
 
     // unique_ptr + 私有构造：make_unique 不可用，直接 new。

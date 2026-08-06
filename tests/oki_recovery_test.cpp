@@ -495,3 +495,53 @@ TEST_F(OkiRecoveryTest, SnapshotGapTriggersRebuild) {
     auto view = read_all_runs(dir_.string());
     EXPECT_EQ(view.size(), 8u);
 }
+
+// OKI 不可用的错误码按成因拆分：RO 打开无 OKI 的目录（本就不建）→
+// kNoIndex；可写打开重建失败（试建而败）→ kIndexRebuildFailed。
+// 压成同一码的旧行为让调用方无从区分「重开读写即好」和「环境有问题」。
+TEST_F(OkiRecoveryTest, RangeErrorSplitsNeverBuiltFromRebuildFailed) {
+    {
+        CaskOptions o;
+        o.read_write = true;
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        ASSERT_TRUE(c);
+        ASSERT_TRUE((*c)->put(bytes("re1"), bytes("v"), 1000));
+        (*c)->close();
+    }
+    // OKI 全丢（派生缓存语义），RO 打开——不持 write.lock 不产文件，
+    // OKI 保持未加载态 → kNoIndex。
+    {
+        auto m = bitcask::oki::read_manifest(dir_.string());
+        ASSERT_TRUE(m.has_value());
+        for (const auto& r : m->runs) {
+            fs::remove(bitcask::oki::mk_run_filename(dir_.string(), r.gen));
+        }
+        fs::remove(bitcask::oki::mk_manifest_filename(dir_.string()));
+    }
+    {
+        CaskOptions o;
+        o.read_write = false;
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        ASSERT_TRUE(c);
+        auto it = (*c)->make_range_iter(bitcask::RangeOptions{});
+        ASSERT_FALSE(it.has_value());
+        EXPECT_EQ(it.error().kind, bitcask::CaskError::kNoIndex);
+        (*c)->close();
+    }
+    // 可写重开会触发全量重建（gen 从 1 起）——在 run 目标路径上放一个
+    // **目录**使落盘失败 → 重建失败 → open 仍成功（best-effort 降级），
+    // range 报 kIndexRebuildFailed。
+    fs::create_directories(bitcask::oki::mk_run_filename(dir_.string(), 1));
+    {
+        CaskOptions o;
+        o.read_write = true;
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        ASSERT_TRUE(c);
+        EXPECT_FALSE((*c)->keydir().oki().loaded());
+        auto it = (*c)->make_range_iter(bitcask::RangeOptions{});
+        ASSERT_FALSE(it.has_value());
+        EXPECT_EQ(it.error().kind,
+                  bitcask::CaskError::kIndexRebuildFailed);
+        (*c)->close();
+    }
+}

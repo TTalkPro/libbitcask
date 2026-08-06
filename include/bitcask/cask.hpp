@@ -183,10 +183,14 @@ enum class CaskError {
     kReadOnly,            // 写操作给到只读 cask
     kWriteLocked,         // 别人已经持有 write.lock / merge.lock
     kInvalidOption,
-    kNoIndex,           // KV 模式下调用了 search 接口
+    kNoIndex,           // 索引在本句柄上本就不存在：KV 模式调 search 接口；
+                        // RO/merge_only 打开无 OKI 的目录调 range（重开读写可建）
     kModeMismatch,      // 文件模式与打开选项不匹配
     kAnalyzerMismatch,  // 分析器类型不匹配
     kClosed,            // 对已 close 的 handle 发起调用（S12-5：与 kInvalidOption 区分）
+    kIndexRebuildFailed,  // OKI 试建而败（可写 open 重建失败——IO/环境问题，
+                          // 见 log；与 kNoIndex 的「本就不建」区分。追加在尾：
+                          // 既有枚举值不动，C API 映射 +1 偏移不破）
 };
 
 struct CaskFault {
@@ -860,7 +864,9 @@ public:
     }
 
     // S33-5：有序 Range 迭代器（语义/契约见 CaskRangeIter 类注释）。
-    // OKI 不可用（RO 打开无 OKI 的目录 / 重建失败）→ kNoIndex。
+    // OKI 不可用按成因拆码：RO/merge_only 打开无 OKI 的目录（本就不建，
+    // 重开读写即建）→ kNoIndex；可写 open 重建失败（试建而败，IO/环境
+    // 问题）→ kIndexRebuildFailed。
     // 线程安全: 是（可多线程各自 make 并发迭代）；返回的迭代器自身非线程安全。
     [[nodiscard]] std::expected<std::unique_ptr<CaskRangeIter>, CaskFault>
     make_range_iter(const RangeOptions& opts);
@@ -1185,6 +1191,11 @@ private:
     // 与写路径阈值 flush（memdelta 达阈值时同步落 run，罕见且有界）。
     void finish_oki_recovery(bool snap_loaded,
                              std::uint64_t snap_next_ord) noexcept;
+    // OKI 试建而败的记账——make_range_iter 据此把「不可用」拆成
+    // kIndexRebuildFailed（可写 open 重建失败）vs kNoIndex（RO/merge_only
+    // 本就不建）。open 期单线程置位，此后只读；loaded_ 置真后不会再翻回，
+    // 故不可用性（连同本标志）在 open 期定型。
+    bool oki_rebuild_failed_ = false;
     // B4：延迟删除队列——merge 输入退休而非当场 unlink（文件留在原路径，
     // 惰性重开的 ENOENT 假失败窗口从源头消失；O10 的临界区文件系统操作
     // 一并退役）。排水点 = 下次 merge 开始 / checkpoint 入口 / close——

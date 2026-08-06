@@ -669,6 +669,7 @@ void Cask::finish_oki_recovery(bool snap_loaded,
             keydir::StartIterResult::kOk) {
             log_warn("oki rebuild: keydir iteration unavailable "
                      "(oki disabled until next open)");
+            oki_rebuild_failed_ = true;
             return;
         }
         while (auto p = it->next()) {
@@ -682,6 +683,7 @@ void Cask::finish_oki_recovery(bool snap_loaded,
         if (!oki.rebuild(dirname_, std::move(rows),
                          keydir_->peek_next_ord())) {
             log_warn("oki rebuild failed (oki disabled until next open)");
+            oki_rebuild_failed_ = true;
         }
     }
 #ifndef NDEBUG
