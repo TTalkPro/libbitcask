@@ -12,7 +12,7 @@ hint = **BCH5**，OKI = **BCOK v1 / BCOM v1**，`field.schema` = **FSCH v1**。
 
 ---
 
-## [5.1.0] - 2026-08-05（S33：有序 key 索引 OKI + hint ord flag-day；S34/S35：多键事务与引擎原子批）
+## [5.1.0] - 2026-08-05（S33：有序 key 索引 OKI + hint ord flag-day；S34/S35：多键事务与引擎原子批；S36：keydir 磁盘驻留 Level B）
 
 > **版本语义**：C API 为**纯增量**（新导出 6 个 range 函数 + 2 个前缀入口；
 > 既有函数签名与结构体布局零改动），故 MINOR +1 → `5.1.0`，
@@ -22,7 +22,16 @@ hint = **BCH5**，OKI = **BCOK v1 / BCOM v1**，`field.schema` = **FSCH v1**。
 >
 > 盘上格式版本：`bitcask.meta` = **v5**（基线；首次 `put_batch_atomic`
 > 懒升 **v6**，见 S35 条目），hint = **BCH5**，
-> OKI run = **BCOK v1** / manifest = **BCOM v1**。
+> OKI run = **BCOK v1/v2** / manifest = **BCOM v1-v3**，
+> keydir 快照 = **BCKS v3/v4**（v2/v3/v4 皆派生缓存演进：老读端拒收 →
+> 重建自愈，meta 纪元不动）。
+>
+> ⚠️ **版本号待发布评审复核（S36 之后）**：S36 给 `CaskOptions`（C++）与
+> `bitcask_options_t`（C）各新增 `keydir_cache_entries` 字段——**结构体
+> 布局较 5.0.0 变更**。按仓库 ABI 规则（4.0.0 先例 = 结构体布局变更驱动
+> major），本版发布时应升 **6.0.0（SOVERSION 6）**，除非评审决定将该
+> 选项改为独立 API 以保住 5.1.0 的「纯增量」前提。上方「ABI 未破坏」的
+> 表述仅覆盖 S33-S35 时点。
 
 ### ⚠️ 前向不兼容（盘上格式 flag-day；ABI 未破坏）
 
@@ -41,6 +50,41 @@ magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁�
 
 动机：v4 时代 hint 不存 ord，hint 快路径恢复的条目 ord 恒 0，与 fold(data)
 不等价；v5 之后两条恢复路径逐 key 等价，这也是 OKI tail 重放的前提。
+
+### Added（S36：keydir 磁盘驻留——Level B，opt-in）
+
+- `CaskOptions::keydir_cache_entries` / C `bitcask_options_t.keydir_cache_entries`
+  （`0`=不限=现状，默认）：keydir 降级热点缓存（超预算分片内采样逐出），
+  点查权威 = 缓存 → memdelta → **BCOK v2 run**（全字段行 + 内嵌 bloom +
+  块 LRU），冷 get ≤2 次 pread。**1 亿 `doc:` key 实测：常驻 11GB →
+  加载峰值 1.14GB / 重开 0.80GB（-90%）**；热 get/put/merge 零回归。
+- 盘上（全部派生缓存演进，零 flag-day）：**BCOK v2**（全字段 vbyte 行 +
+  墓碑免位置 + 10bits/key 内嵌 bloom + 32B trailer）；**BCOM v2**
+  （run 条目带 format_ver，惰性版本选择）与 **BCOM v3**（Level B 模式戳
+  ——未带戳开启即全量重建，Level A 写者 open 清戳）；**BCKS v4**
+  （缓存子集快照 + 逻辑计数，信任链 = 模式戳 + wm 覆盖）；OKI 重建改
+  **外排**（`kv.oki.spill-*` 分段 + k 路归并，500 万行峰值 RSS 83MB）。
+- fold/`parallel_scan`/range 在逐出态经组合视图完整枚举；merge 活性/搬迁/
+  TTL 对被逐 key 经组合视图裁决（免 CAS 的 (ord, gen) 胜出格）；merge
+  收尾「搬迁行固化先于输入 unlink」（崩溃任意点数据可读）。
+- **merge_only 旁车对 Level B 目录 open 拒绝**（旁车无挂钩搬迁会腐蚀
+  组合视图位置权威）。
+
+### Fixed（S36 期间）
+
+- **B1（checkpoint 跑赢未 fsync 数据，S35 备案的预存暴露面）收口**：
+  持久水位由 DataFile 自维护（sync/o_sync 写路径/封口推进——roll/close
+  起「封口即持久」不变量），checkpoint 采集点做线程安全的 fd 级
+  fdatasync，keydir 快照 / ckpt 链字节水位 / OKI run 一律「引用 ≤ 持久」
+  过滤。掉电后快照存活而数据蒸发的悬空条目（get 报 IO/CRC）就此消除。
+  注入测试证实并回归钉死。
+- 顺手修（S29-7 遗留）：组提交成为 put 主路径后 memdelta **阈值 flush
+  失联**——纯 KV 长写负载（无 checkpoint 搭车点）memdelta 无界增长
+  （实测 1000 万 put 时 790MB、0 run）。组提交 leader 批间与各批量写路径
+  尾部补探询；顺带修 `close()` 在 `sync_every_n=0` 下全程零 fsync 的
+  既有暴露。
+- 顺手修（S36-2）：`KeyDir::conditional_remove`（TTL 路径）的文档化
+  TOCTOU（「可能误删并发新写」）改锁内精确 CAS，从容忍变为不可能。
 
 ### Added（OKI：有序 key 索引 / range 查询）
 

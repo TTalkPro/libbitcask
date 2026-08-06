@@ -771,10 +771,47 @@ oki_run+oki_state（BCOM v3 模式戳）、cask（选项 + open 协议 + 组提�
   bench：put 1268±23ns（基线 1244，+1.9% ≤3%）、merge 20.7-21.0ms
   （基线 20.4-21.4，零回归）、hot get 840ns（零回归）。未提交。
 
-### S36-6 — C API + 文档 + 门禁复测 🟡 MED
+### ✅ S36-6 — C API + 文档 + 门禁复测 🟡 MED
 
-- [ ] 选项透出 C API；文档/CHANGELOG；100M 门禁复测入档
-- **验收**：全矩阵 + build-rel 双树
+- [x] 选项透出 C API（`bitcask_options_t.keydir_cache_entries` + 冒烟）
+- [x] 文档：format-zh §15（BCOK v2 / BCOM v2/v3 / BCKS v4 / §15.4
+      Level B + B1）、api-cpp §3.1+§11.3、api-c §6.5、README 能力表、
+      CHANGELOG、设计文档头部状态 + §12 落地记录（8 条实现偏差/增补）
+- [x] 100M 门禁复测入档（终版代码，含 S36-5 B1）
+- **验收**：✅ 全矩阵 + build-rel 双树
+
+#### ✅ S36-6 落地记录（2026-08-06）
+
+- **C API**：`bitcask_options_t` 尾部追加 `keydir_cache_entries`（init
+  默认 0；映射到 CaskOptions）；`c_api_test.c` 增 `test_levelb` 冒烟
+  （2000 键 ≫ 512 预算 → 深度逐出 + 重开子集快照，全过）。
+  **⚠ 版本号问题上报**：该字段（连同 C++ CaskOptions 的同名字段）使
+  options 结构体布局较 5.0.0 变更——按仓库 ABI 规则（4.0.0 先例 =
+  结构体布局变更驱动 major），发布时应升 **6.0.0（SOVERSION 6）**，
+  除非评审决定改为独立 API 保住 5.1.0 的「纯增量」前提。已在
+  CHANGELOG 5.1.0 段落顶部醒目标注，**留发布评审拍板**。
+- **文档**：format-zh §15 全面改写至 v2/v3 现状（run v2 行布局/bloom/
+  32B trailer、manifest v3 flags/level_b 戳语义、生命周期含 B1 持留与
+  merge 收尾序）+ 新增 §15.4（Level B 组合视图 + BCKS v4 + B1 持久
+  水位）；api-cpp 新增 §11.3（收益锚点 + 5 条使用要点）；设计文档头部
+  改「已落地」+ 文末 §12 落地记录（CLOCK→采样、挂钩入锁、挂钩门+模式
+  戳、(ord,到达序)、冷记账、B1 形态、merge 收尾序、开放问题现状——
+  正文保持设计原貌，读代码以 §12 为准）。
+- **100M 门禁复测（终版代码，tmpfs，`doc:<n>` × 16B 值，预算 5M）**：
+  加载 1 亿 key 峰值 RSS **1087MB**（14.2 分钟全程平稳）、key_count
+  精确 1 亿；重开（BCOM v3 戳 + BCKS v4）**~2 秒 / 802MB**、抽查冷
+  get 全过。对照 S33-7 门禁数据 11GB：**-90%，设计 §2 预算表命中**。
+- **验收**：Debug 全量 **726/726** | **ASan 全量 726/726** | **TSan
+  并发套件 197/197**（门控口径）| C API 冒烟含 Level B | build-rel
+  双树零错误。未提交。
+
+---
+
+**S36 全期收官（2026-08-06）**：S36-1 格式与外排 → S36-2 影子安全网 →
+S36-3 冷路径 → S36-4 逐出与快照 → S36-5 merge 权威与崩溃/B1 → S36-6
+收尾。零 flag-day（全部派生缓存演进）；期间顺手收口 backlog B1、修复
+S29-7 组提交漏接阈值 flush、消灭 conditional_remove TOCTOU。遗留给发布
+评审：版本号（6.0.0 vs 5.1.0+独立 API）。
 
 ---
 

@@ -32,6 +32,7 @@
 | 同义词 | `CaskOptions::synonym_map`（open-time） | 查询时自动展开，不可变、并发安全 | [`synonym_map.hpp`](include/bitcask/synonym_map.hpp) |
 | 迭代 | `make_iter` | MVCC 快照（兄弟链 + pending 哈希） | [`keydir-sharding-design-zh.md`](doc/keydir-sharding-design-zh.md) |
 | **有序 range 扫描** | `make_range_iter`（`RangeOptions{lo,hi,prefetch}`） | OKI 有序 key 索引：`[lo,hi)` 字典序遍历，**O(range)** 而非 O(全表)（实测 1/256 选择性 8.0 ms → 0.53 ms）；可选值预取 | [`ordered-key-index-design-zh.md`](doc/ordered-key-index-design-zh.md) |
+| **keydir 磁盘驻留（Level B）** | `CaskOptions::keydir_cache_entries`（opt-in） | keydir 降级热点缓存，点查落组合视图（memdelta + BCOK v2 run：bloom + 块 LRU，冷 get ≤2 次 pread）——**1 亿 key 常驻 11GB → ~1.1GB（-90%）**，热路径零回归 | [`keydir-disk-resident-design-zh.md`](doc/keydir-disk-resident-design-zh.md) |
 | 并行扫描 | `parallel_scan` | 多线程全表扫描（快照 key → 分段并发 get；支持 key 前缀过滤） | [`api-cpp.md`](doc/api-cpp.md) |
 | 合并 | `merge` / `needs_merge` | 与读写并发的独立 `merge.lock` 模型 | [`merge-policy-zh.md`](doc/merge-policy-zh.md) |
 | 备份 | 文件级拷贝 + `flush_index` | WAL 一致点落盘 | [`wal-batch-design-zh.md`](doc/wal-batch-design-zh.md) |
