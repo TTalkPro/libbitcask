@@ -77,6 +77,8 @@ typedef enum {
     BITCASK_ERR_MODE_MISMATCH  = 11,
     BITCASK_ERR_ANALYZER_MISMATCH = 12,
     BITCASK_ERR_CLOSED         = 13,  // 对已 bitcask_close 的 handle 发起调用（S12-5）
+    BITCASK_ERR_INDEX_REBUILD_FAILED = 14,  // OKI 试建而败（可写 open 重建失败；
+                                            // 与 NO_INDEX 的「本就不建」区分）
 } bitcask_error_t;
 
 // 错误详情（对应 bitcask::CaskFault）
@@ -567,8 +569,10 @@ BITCASK_API void bitcask_range_options_init(bitcask_range_options_t* opts);
 // 一致性：**per-key 弱一致**（与 bitcask_parallel_scan 同档）——迭代期间的
 // 并发写可能部分可见，不是 bitcask_iter_* 的快照语义。
 // 返回 BITCASK_OK，或：
-//   BITCASK_ERR_NO_INDEX  — 该目录没有可用的 OKI（只读打开且未建过索引 /
-//                           重建失败）；读写方式打开会自动重建。
+//   BITCASK_ERR_NO_INDEX  — 只读/merge-only 打开且目录未建过 OKI（本句柄
+//                           本就不建索引）；读写方式打开会自动重建。
+//   BITCASK_ERR_INDEX_REBUILD_FAILED — 读写打开时 OKI 重建失败（IO/环境
+//                           问题，见日志）；修复后重新打开可重试。
 //   BITCASK_ERR_CLOSED / BITCASK_ERR_BAD_CRC 等 — 见 fault 详情。
 // 生命周期：迭代器须在 bitcask_close 之前 release。
 BITCASK_API bitcask_error_t bitcask_range_iter_start(
