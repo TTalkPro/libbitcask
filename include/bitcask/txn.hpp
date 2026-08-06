@@ -2,8 +2,8 @@
 //
 // 提交路径 = 引擎原子批（Cask::put_batch_atomic，方案 C，设计
 // doc/atomic-batch-design-zh.md）——跨崩溃 all-or-nothing 由引擎批头保证，
-// 无意图日志写放大。B2（2026-08-06）：方案 B 的意图重放整体删除——意图
-// 日志从未随任何发布版本存在（细节见 txn.cpp 文件头）；recover()/
+// 无意图日志写放大。B2（2026-08-06，6.0.0）：方案 B 的意图重放整体删除
+// ——发布版从未写过意图 blob（细节见 txn.cpp 文件头）；recover()/
 // pending_txns() 保留签名恒返空。
 // 提供崩溃原子性（A）与持久性（D）；**不提供**隔离性（I）与 CAS——
 // 事务中间态对并发读者可见（模式文档 §4）。
@@ -55,9 +55,9 @@ public:
                      TxnSyncPolicy sync = TxnSyncPolicy::kSyncOnCommit)
         : cask_(cask), sync_(sync) {}
 
-    // B2：恒返回 0（意图重放已删除——方案 B 意图日志从未随发布版本存
-    // 在；签名保留 = C API 稳定面）。开发期残留的 "_txn:" 前缀 key 可经
-    // 普通 KV API 手工清理。
+    // B2（6.0.0）：恒返回 0（意图重放已删除——发布版从未写过意图 blob；
+    // 签名保留 = C API 稳定面）。开发期残留的 "_txn:" 前缀 key 可经普通
+    // KV API 手工清理。
     [[nodiscard]] std::expected<std::size_t, CaskFault> recover();
 
     // 原子提交一批操作：一次 Cask::put_batch_atomic（S35 引擎原子批）——

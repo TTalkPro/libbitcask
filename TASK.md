@@ -785,11 +785,11 @@ oki_run+oki_state（BCOM v3 模式戳）、cask（选项 + open 协议 + 组提�
 - **C API**：`bitcask_options_t` 尾部追加 `keydir_cache_entries`（init
   默认 0；映射到 CaskOptions）；`c_api_test.c` 增 `test_levelb` 冒烟
   （2000 键 ≫ 512 预算 → 深度逐出 + 重开子集快照，全过）。
-  **⚠ 版本号问题上报**：该字段（连同 C++ CaskOptions 的同名字段）使
-  options 结构体布局较 5.0.0 变更——按仓库 ABI 规则（4.0.0 先例 =
-  结构体布局变更驱动 major），发布时应升 **6.0.0（SOVERSION 6）**，
-  除非评审决定改为独立 API 保住 5.1.0 的「纯增量」前提。已在
-  CHANGELOG 5.1.0 段落顶部醒目标注，**留发布评审拍板**。
+  **版本号（2026-08-06 用户拍板：6.0.0）**：该字段（连同 C++
+  CaskOptions 的同名字段）使 options 结构体布局较 5.1.0 变更——按仓库
+  ABI 规则（4.0.0 先例）bump major → **6.0.0（SOVERSION 6）**。
+  `project(VERSION 6.0.0)` 已落；CHANGELOG 拆出独立 [6.0.0] 段
+  （[5.1.0] 复原为 Release fcc1c6a 定稿形态），README 版本行同步。
 - **文档**：format-zh §15 全面改写至 v2/v3 现状（run v2 行布局/bloom/
   32B trailer、manifest v3 flags/level_b 戳语义、生命周期含 B1 持留与
   merge 收尾序）+ 新增 §15.4（Level B 组合视图 + BCKS v4 + B1 持久
@@ -810,8 +810,9 @@ oki_run+oki_state（BCOM v3 模式戳）、cask（选项 + open 协议 + 组提�
 **S36 全期收官（2026-08-06）**：S36-1 格式与外排 → S36-2 影子安全网 →
 S36-3 冷路径 → S36-4 逐出与快照 → S36-5 merge 权威与崩溃/B1 → S36-6
 收尾。零 flag-day（全部派生缓存演进）；期间顺手收口 backlog B1、修复
-S29-7 组提交漏接阈值 flush、消灭 conditional_remove TOCTOU。遗留给发布
-评审：版本号（6.0.0 vs 5.1.0+独立 API）。
+S29-7 组提交漏接阈值 flush、消灭 conditional_remove TOCTOU。版本号已
+拍板（2026-08-06）：**6.0.0 / SOVERSION 6**（options 结构体布局变更，
+4.0.0 先例）——S36 与 backlog T24/B1-B4 全部进 [6.0.0] 段。
 
 ---
 

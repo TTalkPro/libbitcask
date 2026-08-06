@@ -1,8 +1,9 @@
 // txn.cpp — S34/S35：TxnCask 多键事务 helper 实现。
 // 设计：doc/multikey-txn-impl-design-zh.md + doc/atomic-batch-design-zh.md。
-// B2（2026-08-06）：方案 B 的意图重放整体删除——意图日志只存在于
-// dc81bbc..S35 之间的**未发布**构建（TxnCask 本身即未发布版本的新增），
-// 没有任何已发布版本写过意图 blob，无兼容对象。recover()/pending_txns()
+// B2（2026-08-06，6.0.0）：方案 B 的意图重放整体删除——5.1.0 发布版的
+// commit 已是引擎原子批（S35 在发布前替换方案 B），意图 blob 只可能出自
+// dc81bbc..S35 之间的未发布开发构建，发布用户的目录不存在重放对象。
+// recover()/pending_txns()
 // 保留签名（C API 稳定面）恒返空；罕见的开发期残留（"_txn:" 前缀 key）
 // 可经普通 KV API 手工清理。
 

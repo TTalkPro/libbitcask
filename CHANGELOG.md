@@ -5,51 +5,28 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`5.1.0`**；库 `SOVERSION` = **`5`**（= major）；
+`bitcask_version_*` = **`6.0.0`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
-hint = **BCH5**，OKI = **BCOK v1 / BCOM v1**，`field.schema` = **FSCH v1**。
-**盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump。
+hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
+`field.schema` = **FSCH v1**。
+**盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
+（4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
 
 ---
 
-## [5.1.0] - 2026-08-05（S33：有序 key 索引 OKI + hint ord flag-day；S34/S35：多键事务与引擎原子批；S36：keydir 磁盘驻留 Level B）
+## [6.0.0] - 未发布（S36：keydir 磁盘驻留 Level B；backlog 收口 T24 / B1-B4）
 
-> **版本语义**：C API 为**纯增量**（新导出 6 个 range 函数 + 2 个前缀入口；
-> 既有函数签名与结构体布局零改动），故 MINOR +1 → `5.1.0`，
-> **`SOVERSION` 保持 `5`**（`.so.5` 不换号，下游无需重新链接）——与
-> [3.1.0] 同款处置：**盘上格式破坏不驱动 major/SOVERSION，ABI 破坏才驱动**
-> （4.0.0 = 结构体布局变更、5.0.0 = 签名与字段宽度变更，那两次才必须 bump）。
->
-> 盘上格式版本：`bitcask.meta` = **v5**（基线；首次 `put_batch_atomic`
-> 懒升 **v6**，见 S35 条目），hint = **BCH5**，
-> OKI run = **BCOK v1/v2** / manifest = **BCOM v1-v3**，
-> keydir 快照 = **BCKS v3/v4**（v2/v3/v4 皆派生缓存演进：老读端拒收 →
-> 重建自愈，meta 纪元不动）。
->
-> ⚠️ **版本号待发布评审复核（S36 之后）**：S36 给 `CaskOptions`（C++）与
+> **版本语义（2026-08-06 定版）**：`CaskOptions`（C++）与
 > `bitcask_options_t`（C）各新增 `keydir_cache_entries` 字段——**结构体
-> 布局较 5.0.0 变更**。按仓库 ABI 规则（4.0.0 先例 = 结构体布局变更驱动
-> major），本版发布时应升 **6.0.0（SOVERSION 6）**，除非评审决定将该
-> 选项改为独立 API 以保住 5.1.0 的「纯增量」前提。上方「ABI 未破坏」的
-> 表述仅覆盖 S33-S35 时点。
-
-### ⚠️ 前向不兼容（盘上格式 flag-day；ABI 未破坏）
-
-**hint 内嵌 ord flag-day**——hint 记录新增 `ord` 字段（vbyte 差分），
-magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁。
-
-- **本版写出的库不能被 5.0.0 打开**（5.0.0 读端只认 meta v4）。
-- **本版也不直接打开 v4 纪元目录**：open 时**干净拒开**并提示迁移命令，
-  绝不按新语义把旧字节静默读坏。
-- **但不必重建**：`bitcask_migrate hintord <src> <dst>` 是**非破坏性 +
-  data 字节零改动**的迁移路径（data 硬链接，只重生成 hint + meta；
-  meta 最后写 = commit point，幂等可重跑）。
-- **二进制层面无隔离需求**：不兼容发生在「二进制 × 数据」而非
-  「二进制 × 二进制」——旧调用方链接 `.so.5` 打开 v5 目录会拿到带迁移提示
-  的干净错误，故不换 soname。
-
-动机：v4 时代 hint 不存 ord，hint 快路径恢复的条目 ord 恒 0，与 fold(data)
-不等价；v5 之后两条恢复路径逐 key 等价，这也是 OKI tail 重放的前提。
+> 布局较 5.1.0 变更**，按 [4.0.0] 先例（布局变更 = ABI 破坏）bump major
+> → `6.0.0`，**`SOVERSION` → `6`**（`.so.6`，下游需重新链接）。C API
+> **函数签名零增删改**；除 TxnCask `recover`/`pending_txns` 语义收敛
+>（见 Removed）与 merge 空间回收时序（见 Changed）外行为向后兼容。
+>
+> 盘上格式：**meta 纪元不动**（v5/v6 同 5.1.0，无 flag-day、无迁移）。
+> 新增格式皆**派生缓存演进**：OKI run **BCOK v2**、manifest
+> **BCOM v2/v3**、keydir 快照 **BCKS v4**——5.1.0 读端遇之拒收 → 全量
+> 重建自愈；5.1.0 写出的目录本版直接打开。双向互开、零停机。
 
 ### Added（S36：keydir 磁盘驻留——Level B，opt-in）
 
@@ -86,9 +63,10 @@ magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁�
 ### Removed（backlog B2：legacy 意图重放）
 
 - **TxnCask 方案 B 意图重放删除**（意图 blob v1 解码 + `recover` 前滚 +
-  `pending_txns` 枚举的实现体）：意图日志只存在于 dc81bbc..S35 之间的
-  **未发布**开发构建（TxnCask 本身即本版新增），没有任何已发布版本写过
-  意图 blob——无兼容对象，首发前删净优于「预告一版再删」。接口
+  `pending_txns` 枚举的实现体）：5.1.0 发布版的 `commit` 已是引擎原子批
+  （S35 在发布前替换了方案 B），意图 blob 只可能出自 dc81bbc..S35 之间的
+  **未发布开发构建**——发布用户的目录不存在重放对象，兼容代码没有服务
+  对象。接口
   `recover`/`pending_txns`（含 C API `bitcask_txn_recover`/
   `bitcask_txn_pending_count`）**签名保留**，恒返回 0/空；开发期残留的
   `_txn:` 前缀 key 不被触碰，可经普通 KV API 手工清理。崩溃原子性全部
@@ -109,6 +87,38 @@ magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁�
   既有暴露。
 - 顺手修（S36-2）：`KeyDir::conditional_remove`（TTL 路径）的文档化
   TOCTOU（「可能误删并发新写」）改锁内精确 CAS，从容忍变为不可能。
+
+---
+
+## [5.1.0] - 2026-08-05（S33：有序 key 索引 OKI + hint ord flag-day；S34/S35：多键事务与引擎原子批）
+
+> **版本语义**：C API 为**纯增量**（新导出 6 个 range 函数 + 2 个前缀入口；
+> 既有函数签名与结构体布局零改动），故 MINOR +1 → `5.1.0`，
+> **`SOVERSION` 保持 `5`**（`.so.5` 不换号，下游无需重新链接）——与
+> [3.1.0] 同款处置：**盘上格式破坏不驱动 major/SOVERSION，ABI 破坏才驱动**
+> （4.0.0 = 结构体布局变更、5.0.0 = 签名与字段宽度变更，那两次才必须 bump）。
+>
+> 盘上格式版本：`bitcask.meta` = **v5**（基线；首次 `put_batch_atomic`
+> 懒升 **v6**，见 S35 条目），hint = **BCH5**，
+> OKI run = **BCOK v1** / manifest = **BCOM v1**。
+
+### ⚠️ 前向不兼容（盘上格式 flag-day；ABI 未破坏）
+
+**hint 内嵌 ord flag-day**——hint 记录新增 `ord` 字段（vbyte 差分），
+magic `BCH4` → `BCH5`；`bitcask.meta` v4 → **v5** 作为唯一纪元门禁。
+
+- **本版写出的库不能被 5.0.0 打开**（5.0.0 读端只认 meta v4）。
+- **本版也不直接打开 v4 纪元目录**：open 时**干净拒开**并提示迁移命令，
+  绝不按新语义把旧字节静默读坏。
+- **但不必重建**：`bitcask_migrate hintord <src> <dst>` 是**非破坏性 +
+  data 字节零改动**的迁移路径（data 硬链接，只重生成 hint + meta；
+  meta 最后写 = commit point，幂等可重跑）。
+- **二进制层面无隔离需求**：不兼容发生在「二进制 × 数据」而非
+  「二进制 × 二进制」——旧调用方链接 `.so.5` 打开 v5 目录会拿到带迁移提示
+  的干净错误，故不换 soname。
+
+动机：v4 时代 hint 不存 ord，hint 快路径恢复的条目 ord 恒 0，与 fold(data)
+不等价；v5 之后两条恢复路径逐 key 等价，这也是 OKI tail 重放的前提。
 
 ### Added（OKI：有序 key 索引 / range 查询）
 

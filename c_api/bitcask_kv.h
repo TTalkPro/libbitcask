@@ -193,8 +193,8 @@ typedef struct {
        OKI（一次性开销）；Level A（=0）写者重开会清模式戳、再开启时重建
        自愈；merge_only 旁车对 Level B 目录 open 返回 BITCASK_ERR_IO。
        详见 api-c.md「keydir 磁盘驻留」。
-       ⚠ 本字段为 5.0.0 后新增（结构体布局变更）——发布版本号须按
-       ABI 规则评审（见 CHANGELOG 5.1.0 段的说明）。 */
+       本字段为 6.0.0 新增——结构体布局较 5.1.0 变更即本版 bump major
+       （SOVERSION 6）的原因，见 CHANGELOG [6.0.0] 段。 */
     size_t    keydir_cache_entries;
 } bitcask_options_t;
 
@@ -432,9 +432,9 @@ BITCASK_API bitcask_error_t bitcask_txn_commit(bitcask_t* cask,
                                                int sync_on_commit,
                                                bitcask_fault_t* fault);
 
-/* B2（2026-08-06）：恒返回 0——方案 B 的意图重放已删除（意图日志从未
- * 随任何发布版本存在；签名保留为 API 稳定面）。开发期残留的 "_txn:"
- * 前缀 key 可经普通 KV API 手工清理。out_replayed 可为 NULL。 */
+/* B2（6.0.0）：恒返回 0——方案 B 的意图重放已删除（发布版从未写过
+ * 意图 blob；签名保留为 API 稳定面）。开发期残留的 "_txn:" 前缀 key
+ * 可经普通 KV API 手工清理。out_replayed 可为 NULL。 */
 BITCASK_API bitcask_error_t bitcask_txn_recover(bitcask_t* cask,
                                                 size_t* out_replayed,
                                                 bitcask_fault_t* fault);
