@@ -44,6 +44,55 @@ Lucene / Tantivy / Vespa 的共同答案（`ord-recycling-design-zh.md` §4.2 �
 **段模型让这件事免费发生**：docid 天生段内本地，段 drop 即回收，无需在全局索引里做 seq/ord
 双轨；LSN 就是现有的 `ord`，一字不改。
 
+#### 2.1.1 位宽：LSN 必须 u64，docid 必须 u32
+
+这**不是**「把 64 位砍成 32 位省空间」，而是上表两个不同概念各自取合适的宽度。定这条的
+依据是上表最后一列的性质差异，不是内存开销：
+
+| | LSN(`ord`) | docid |
+|---|---|---|
+| 增长来源 | 全库历史写入总量 | 单段文档数 |
+| 回收 | **永不回收** | 段 drop 即整体回收 |
+| 取值 | 无界单调 | `[0, N_s)`，dense 无洞 |
+| 宽度 | **u64**（长跑必然越过 2^32） | **u32** |
+
+段化之前 `docid == ord == lsn` 三者数值相等（见 §9 的类型区分说明），故全局
+`DocId = std::uint64_t` 一直够用；docid 下沉为段内本地量之后，u64 就成了纯浪费。
+
+**u32 是三处机制的前提，不只是"够用"：**
+
+1. **posting 位打包依赖小整数。** 段文件 posting 按 128 文档一块做 delta + 位打包
+   （`segment_v2.hpp` 头注释）。段内 docid dense 且 0-based，块内 delta 通常只要 4~8 bit。
+   若改存全局 LSN——它随全库写入无界增长，且**在段内不连续**（中间夹着其他段、其他 key
+   的写入）——delta 立刻变大变稀疏，位打包基本失效。这是段模型相对 delta 链的白拿收益，
+   与 Lucene / Tantivy 同源。
+2. **R4 打分热路径的 SIMD gather**（见 §3.3 表）。`doc_lens[N_s]` 是 u32 SoA，AVX2 一条
+   gather 取 8 个 u32 vs 4 个 u64，吞吐差一倍；段内无洞还省掉稀疏跳转。
+3. **段是盘上格式**（S30 mmap 段化）。doc_store 定长行、BlockMeta、posting 全平坦，
+   宽度翻倍会直接抵消掉那一届 RSS −49~55% 的收益。
+
+**上限有硬门禁，不是赌**：单段容量受封口阈值封顶
+（`text_plugin.hpp` `kBuildingFlushDocThreshold = 65536`，另有 `seal_ram_budget_bytes`
+会更早触发），离 2^32 差 4 个数量级；写入侧 `write_segment_v2*` 对 docid ≥ 2^32
+**返回 false**，merge 产出的段走同一入口。
+
+> **⚠️ 遗留：类型没跟上设计（S30 遗留，非 S37 引入）**
+> 设计已把 docid 定义为段内本地量，但 `SealedSegment` 的对外签名仍用全局
+> `DocId`(u64)，转发给 `MmapSegment::key_of/lsn_of/slot_of/mark_dead`(u32) 时隐式收窄：
+> ```cpp
+> std::string_view key_at(DocId d) const {
+>     if (mmap_) return mmap_->key_of(d);   // ← 跨越两套编号体系，类型上不可见
+>     return keys_[d];
+> }
+> ```
+> 于是这层转换只剩编译器的 `-Wshorten-64-to-32` / `-Wconversion` 在提醒
+> （`segment.hpp` 现有 4 处，GCC 与 clang 均报）。其中 `mark_dead` 前有
+> `docid >= mmap_->doc_count()` 守卫（比较提升到 u64，守卫有效）；
+> `key_at`/`lsn_at`/`slot_at` **无边界检查**，直接截断——因写入侧门禁在，目前不构成
+> 实际敞口，但失败形态是**静默读错行**。
+> **修法是引入 `using LocalDocId = std::uint32_t` 让这层转换在类型上显形；
+> 加 `static_cast` 只是消音、反而更糟**——它删掉了唯一的提示而不改变任何语义。
+
 ### 2.2 段（Segment）的定义
 
 一个**不可变、自包含**的索引单元，覆盖任意一批文档：
