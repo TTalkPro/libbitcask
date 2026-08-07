@@ -457,7 +457,7 @@ C4244 ×32、C4100 ×1、C4456 ×1。**设计稿点名会刷屏的 C4267 实际�
 | 13 个第一方静态库 + 合并 `bitcask_static.lib` | ✅ 产出（121 MB，Debug） |
 | `bitcask.dll` | ⛔ 缺 34 个 `bitcask::io` 符号（S37-5） |
 | ctest | ⛔ 同上，40 个测试 exe 均卡在链接 |
-| Linux 侧 | ⬜ **本届改动尚未在 Linux 上复验**（见下） |
+| Linux 侧 | 🟡 Debug/Release 双树 + 干净树复验通过；ASan/TSan 未跑（见下） |
 
 > ⚠️ **本届记录未覆盖的一项**：所有改动都只在 Windows 上验证过。虽然每处都按
 > 「GCC 分支逐字不变」的原则做（`__atomic_load_n`、visibility pragma、
@@ -465,6 +465,24 @@ C4244 ×32、C4100 ×1、C4456 ×1。**设计稿点名会刷屏的 C4267 实际�
 > 4 处 `target_link_libraries` 的 PRIVATE→PUBLIC 仍须在 Linux 上过一遍
 > **Debug 全量 + ASan + TSan**（TSan 尤其——`BITCASK_TSAN_ENABLED` 若因漏包含
 > 头而恒 0，TSan 注解会**静默失效**，表现为 TSan 误报而非编译错误）。
+
+#### 🟡 Linux 复验记录（2026-08-07，df83b4b 时点）
+
+构建系统改动最怕的是「MSVC 分支加进来时误伤 GNU 分支」，且这类错误在增量树上
+可能被既有缓存掩盖，故**另起干净树**验证 configure 逻辑本身：
+
+| 验证 | 结果 |
+|---|---|
+| `build-clang`（Debug + BUILD_TESTING=ON, clang++） | ✅ 编译 0 错误；ctest **732/732**（1 项 Disabled：`CheckpointRecoveryTest.S30RssProbe`）|
+| `build-rel`（Release -O3+LTO + bench, g++ 14.2） | ✅ 编译 0 错误，`bitcask_bench` 链接通过 |
+| **干净树** `cmake -S . -B <新目录>` Release | ✅ configure 0 警告，全部 target 建成（含 `bitcask_simd` / `bitcask_io`）|
+
+告警面无新增，仍是既有的 `segment.hpp` 七条（`DocId`→`uint32_t` 收窄 ×4、
+`pin` 字段缺失初始化 ×3），GCC 与 clang 两侧一致。
+
+**仍未结清**：ASan / TSan 两棵树本次**没跑**。上面那条 TSan 顾虑
+（`BITCASK_TSAN_ENABLED` 恒 0 → 注解静默失效）**编译和 Debug 全绿都测不出来**，
+必须实跑 `build-tsan` 才能排除，此项保持未决。
 
 **S37-5 的完整工作面（34 个未解析符号，链接器实测）**：
 
@@ -615,6 +633,17 @@ Windows 上剥不掉 → base 成了 `C:\dir\42` → 数字校验失败 → 返�
 **非 ASCII 路径会被判为非法 UTF-8 而报 EINVAL**。彻底修复要把那些站点换成
 `u8string()`，见下方遗留 W4。
 
+**🟡 Linux 复验（2026-08-07，fe4d545 时点）：无回归。**
+`build-clang` Debug 与 `build-rel` Release+LTO+bench 均 0 错误；
+ctest **735/735 通过**（736 项注册，1 项 Disabled 同上），耗时 86 秒。
+用例数较 S37-4 时点的 733 增加 3 项——即本届新增的 `ProcessToken` 三个用例，
+它们在 Linux 上同样参与（令牌恒 0 时退化为纯 pid 判活，见上）。
+本届主体 `src/io/win32_file.cpp` 在 Linux 下不参与编译，**真正需要 Linux 复验的
+是那 7 处「把 `FileHandle` 当 `int`」的连带修改**——它们在跨平台代码里，全绿即无回归。
+告警面与 S37-4 时点逐条一致，无新增。
+⚠️ 落地记录开头的「724/733」是 **Windows 上**的数，Linux 侧覆盖不到那 9 个失败；
+ASan / TSan 仍未跑（同 S37-4 复验记录）。
+
 ### S37-6 — 删除/映射生命周期 🔴 HIGH（**唯一架构改动**）
 
 Windows 下：① 所有 `CreateFile` 须带 `FILE_SHARE_DELETE`，否则删除报
@@ -732,8 +761,8 @@ S37-7 (1.5周) ───── CI + 收尾
 | S37-2 fork → exec-self | ✅ done（6 个 fork 点全转；`tests/` POSIX 头归零；Debug/ASan 725/725，见落地记录）|
 | S37-3.a cpu_features + 降档开关 | ✅ done（`__builtin_cpu_supports` 归零；四档 732/732 跨档对拍，见落地记录）|
 | S37-3.b 内核分 ISA TU | ✅ done（24 个 target 函数搬完；ISA 泄漏 0；四档 732/732；bench ±2%，见落地记录）|
-| S37-4 MSVC 构建适配 | ✅ done（188 个 TU 编译零错误；13 库 + 合并静态库产出；剩余全部为 io 后端符号。⚠️ Linux 侧未复验，见落地记录）|
-| S37-5 Windows I/O 后端 | ✅ done（bitcask.dll 产出；ctest 733 → 724 通过 99%；余 9 个全部落在 S37-6，见落地记录）|
+| S37-4 MSVC 构建适配 | ✅ done（188 个 TU 编译零错误；13 库 + 合并静态库产出；剩余全部为 io 后端符号。Linux 复验：双树 + 干净树编译通过、Debug 732/732，ASan/TSan 未跑，见落地记录）|
+| S37-5 Windows I/O 后端 | ✅ done（bitcask.dll 产出；Windows ctest 733 → 724 通过 99%，余 9 个全部落在 S37-6；Linux 复验 735/735 无回归，见落地记录）|
 | S37-6 删除/映射生命周期 | ⬜ 未开始（工作面已由 S37-5 的 ctest 量准：9 个失败用例逐个归因，见 S37-6 段）|
 | S37-7 CI + 收尾 | ⬜ 未开始 |
 
