@@ -465,7 +465,7 @@ reducer 串行，读可与之并发。
 | `bitcask_text` | STATIC | `src/text/{analyzer,jieba_analyzer}.cpp` | utf8proc, cppjieba, `generate_inert_table` | Analyzer 抽象基类 + Ngram + Jieba + 工厂 + 停用词 |
 | `bitcask_cask` | STATIC | `src/cask/{cask,cask_iter,cask_search,cask_recovery,meta_file,legacy_ckpt}.cpp` | `bitcask_keydir`, `bitcask_fileops`, `bitcask_io`, `bitcask_format`, `bitcask_merge`, `bitcask_hybrid`, TBB | Cask 高层门面（KV + 搜索 + 生命周期 + 元数据） |
 | `bitcask_shared` | SHARED | `c_api/{bitcask_kv,bitcask_text,bitcask_vec}.cpp` | `bitcask_cask` | `libbitcask.so`（C ABI，SOVERSION 3） |
-| `bitcask_static` | CUSTOM | 合并上述所有 STATIC 为单一 `libbitcask.a` | — | 静态归档 |
+| `bitcask_static` | STATIC | 合并上述所有 STATIC 为单一 `libbitcask.a`（Windows：`bitcask_static.lib`）| — | 静态归档 |
 | `migrate_le` | EXECUTABLE | `tools/migrate_le.cpp` | `bitcask_fileops`, `bitcask_format`, `bitcask_io` | 大端 → 小端离线迁移工具（详见 `migrate-le.md`） |
 | `gen_inert_table` | EXECUTABLE | `tools/gen_inert_table.cpp` | utf8proc | 构建期 NFKC 惰性区间表生成器 |
 

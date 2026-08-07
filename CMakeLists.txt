@@ -154,7 +154,11 @@ endif()
 # Release 性能选项（-falign-functions=64 + LTO/IPO）。
 # 需在所有 add_library 之前设置（目录属性在 target 创建时固化）。
 # ---------------------------------------------------------------------------
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+# S37-4 补 `AND NOT MSVC`：clang-cl 下 CMAKE_CXX_COMPILER_ID 是 "Clang" 而
+# CMake 的 MSVC 变量**同时为真**，两个分支会一起生效 —— 下面 GNU 语法的
+# -f/-Wl 选项就会跟着 /W4 一起发出去（-Wl,-z,relro 到 lld-link 直接报错）。
+# Linux 上 MSVC 恒假，此条件不改变任何既有行为。
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
     add_compile_options($<$<CONFIG:Release>:-falign-functions=64>)
 endif()
 
@@ -163,7 +167,7 @@ endif()
 # 任何 add_library/add_executable 之前设置（目录级编译/链接选项在 target 创建
 # 时固化）。sanitizer 构建按需排除 FORTIFY（与运行时 interceptor 冲突）。
 # ---------------------------------------------------------------------------
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)   # NOT MSVC：见上（clang-cl）
     # H1:栈溢出探测——strong 覆盖含数组/大局部对象/取址局部变量的函数
     # （比默认 -fstack-protector 覆盖面大，开销可忽略）。全配置启用。
     add_compile_options(-fstack-protector-strong)
@@ -192,17 +196,19 @@ endif()
 # 依赖精确可复现浮点（int8 kernel self-test 校验 ULP）。
 option(BITCASK_NATIVE "为本机现编启用 -march=native（默认 OFF，破坏二进制可移植性）" OFF)
 if(BITCASK_NATIVE)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)   # NOT MSVC：见上（clang-cl）
         add_compile_options(-march=native)
         message(STATUS "libbitcask: BITCASK_NATIVE -> -march=native（二进制仅限本机 ISA）")
     else()
-        # S37-4：MSVC 无 -march=native 等价物（/arch: 只有固定档位，且不探测本机）。
-        # **报错退出而非静默忽略**——本开关的语义是「我明确要为本机榨性能」，
-        # 静默忽略会让人以为拿到了本机码而实际没有，且无从察觉。
+        # S37-4：MSVC 驱动器无 -march=native 等价物（/arch: 只有固定档位，
+        # 且不探测本机）。**报错退出而非静默忽略**——本开关的语义是「我明确
+        # 要为本机榨性能」，静默忽略会让人以为拿到了本机码而实际没有，
+        # 且无从察觉。
         message(FATAL_ERROR
-            "BITCASK_NATIVE 在 ${CMAKE_CXX_COMPILER_ID} 下无等价物（MSVC 的 /arch: "
-            "是固定档位，不按本机 CPU 探测）。请关闭该选项；SIMD 内核本就运行时按 "
-            "CPUID 派发，通用构建不受影响。")
+            "BITCASK_NATIVE 在当前编译器驱动下无等价物"
+            "（ID=${CMAKE_CXX_COMPILER_ID}，MSVC 兼容驱动器）：/arch: 是固定档位，"
+            "不按本机 CPU 探测。请关闭该选项；SIMD 内核本就运行时按 CPUID 派发，"
+            "通用构建不受影响。")
     endif()
 endif()
 
