@@ -569,7 +569,16 @@ static int count_os_threads() {
     // **全系统**线程快照，得自己按 owner pid 过滤。调用不便宜，但本用例只调
     // 三次。
     const DWORD me = ::GetCurrentProcessId();
-    const HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    // ⚠️ **必须重试**：TH32CS_SNAPTHREAD 拍的是全系统线程表，系统繁忙时
+    // 会以 ERROR_BAD_LENGTH 失败（微软文档明确要求重试）。首版没重试、
+    // 失败即返回 0，于是本用例在 `ctest -j 8` 下偶发失败而单跑 5/5 全过
+    // ——典型的「并发负载才复现」的 flaky，比直接不实现更糟。
+    HANDLE snap = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap != INVALID_HANDLE_VALUE) break;
+        if (::GetLastError() != ERROR_BAD_LENGTH) break;  // 别的错就别空转
+    }
     if (snap == INVALID_HANDLE_VALUE) return 0;
     THREADENTRY32 te{};
     te.dwSize = sizeof(te);
@@ -612,27 +621,52 @@ TEST(IndexPoolMultiLib, ThreadCountIndependentOfLibCount) {
 #if BITCASK_TSAN_ENABLED   // S37-4：见 detail/cpu_features.hpp
     GTEST_SKIP() << "TSan 运行时线程计入,OS 线程计数断言失真(S29-T)";
 #endif
-    IndexPool pool(1, 10240);
     auto noop_map   = no_preps;
     auto noop_red   = [](ReorderEntry&) {};
     auto noop_err   = []() {};
 
-    const int before = count_os_threads();
-    IndexLane* l0 = pool.register_lib(noop_map, noop_red, noop_err, 0);
-    const int after_first = count_os_threads();
-    // 首个 register 起 dispatcher + reducer 两条线程。
-    EXPECT_EQ(after_first - before, 2);
+    // S37-6：整轮测量**重试**，而不是一次定生死。
+    //
+    // 计数手段是「进程线程总数」，它同时受被测对象之外的因素影响：Windows
+    // 上 ntdll 的加载器工作线程、DLL 延迟加载、系统线程池都会在任意时刻
+    // 增减本进程的线程；`ctest -j 8` 的并发负载下尤其明显。首版一次测量定
+    // 结论，于是单跑 5/5 全过、并发下偶发失败——**flaky 测试比没有测试更糟**，
+    // 它会让人习惯性忽略这个用例。
+    //
+    // 重试不削弱断言强度：真回归（注册一个 lib 就多起一条线程）是确定性的，
+    // 每一轮都会违反；只有外部噪声才会时中时不中。
+    constexpr int kAttempts = 5;
+    int last_delta_first = -1;
+    int last_after_first = -1;
+    int last_after_many  = -1;
+    bool ok = false;
+    for (int attempt = 0; attempt < kAttempts && !ok; ++attempt) {
+        IndexPool pool(1, 10240);
+        const int before = count_os_threads();
+        IndexLane* l0 = pool.register_lib(noop_map, noop_red, noop_err, 0);
+        const int after_first = count_os_threads();
 
-    std::vector<IndexLane*> lanes{l0};
-    for (int i = 0; i < 49; ++i) {
-        lanes.push_back(pool.register_lib(noop_map, noop_red, noop_err, 0));
+        std::vector<IndexLane*> lanes{l0};
+        for (int i = 0; i < 49; ++i) {
+            lanes.push_back(pool.register_lib(noop_map, noop_red, noop_err, 0));
+        }
+        const int after_many = count_os_threads();
+
+        last_delta_first = after_first - before;
+        last_after_first = after_first;
+        last_after_many  = after_many;
+        // 首个 register 起 dispatcher + reducer 两条线程；
+        // 之后 49 个 lib 零新增（无 per-库线程）。
+        ok = (last_delta_first == 2) && (after_many == after_first);
+
+        for (IndexLane* l : lanes) pool.unregister_lib(l);
+        pool.stop();
     }
-    const int after_many = count_os_threads();
-    // 多注册 49 个 lib：零新增线程（无 per-库线程）。
-    EXPECT_EQ(after_many, after_first);
-
-    for (IndexLane* l : lanes) pool.unregister_lib(l);
-    pool.stop();
+    EXPECT_TRUE(ok)
+        << "线程数与库数解耦不成立（" << kAttempts << " 轮均未观察到）："
+        << "首个 register 的线程增量=" << last_delta_first << "（应为 2），"
+        << "注册 50 个 lib 后=" << last_after_many
+        << "（应等于首个之后的 " << last_after_first << "）";
 }
 
 // AT5-b：库间独立 + 库内 ord 序。一个共享池，N 条 lane，每 lane 各自交错

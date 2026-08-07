@@ -635,7 +635,82 @@ Windows 下：① 所有 `CreateFile` 须带 `FILE_SHARE_DELETE`，否则删除�
 - **工作量**：1-1.5 周
 - **验收**：Windows 上 merge 后退休队列能排空（长跑测试）；Linux 侧行为零变化 + TSan 全绿
 
-#### 🎯 S37-6 的工作面已由 S37-5 的 ctest 量准（9 个失败，2026-08-07）
+#### ✅ S37-6 落地记录（2026-08-07）—— **结论：不是架构改动**
+
+**ctest 733/733 全绿。**
+
+**开工第一件事是实测本项赖以立项的前提，结果推翻了它。**
+设计稿 C2 断言「即使带 `FILE_SHARE_DELETE`，被 section 映射持有的文件仍删不掉」，
+并据此规划「退休前先 `evict_mappings` 并与 `epoch_reclaim` 协调」这一架构改动。
+写了个复刻本库 `MappedFile` 建法的探针逐条量（Windows 10.0.26200）：
+
+| 设计稿断言 | 实测 |
+|---|---|
+| 被映射的文件删不掉 | **假**——删除成功，名字**立刻**从目录消失（Win10 1709+ 的 POSIX 语义删除），同名可立即重建 |
+| 被映射的文件不能被 rename 覆盖 | **假**（前提是目标没有打开的文件句柄）|
+| 覆盖/删除后旧视图读到什么 | **旧内容**，含之后才首次触碰的页——与 POSIX unlink-while-mapped **逐条等价** |
+
+于是重试队列在 Windows 上本就能正常排空，`evict_mappings` 与 epoch 协调**都不必做**。
+**风险排序第一位的那项，实际不存在。**
+
+**真正的限制是另外两条，设计稿都没提到**：
+
+1. **`MoveFileEx(REPLACE_EXISTING)` 覆盖一个尚有文件句柄打开的目标必然
+   `ERROR_ACCESS_DENIED`**——与共享模式、与映射都无关，任何访问模式（连
+   `GENERIC_READ`）都拦。命中点：`IvfSegment`/`DiskannSegment::open` 建好映射后
+   仍把 `fd_` 留着，而**那个 fd 从头到尾没被读过**（段全部经 `base_` 访问，
+   `fd_` 只在析构里被关）。段 rebase 正是「写 tmp → rename 覆盖旧段」的形态，
+   于是 4 个 rebase 用例全挂。
+   修法就是建好映射后立刻 `close_handle`——`io.hpp` 早写着「向量 payload 关 fd
+   省预算」，这两个站点一直没照做。两平台同时受益（每个 sealed 段少一个 fd）。
+   `fd_` 成员随之从两个公开头删除：改完之后它恒为 `kInvalidHandle`，
+   `close()` 里那个分支成了死代码，而留一个永远无效的成员会让后来者以为
+   「这儿有个 fd 可以用」。
+2. **CRT stdio 是第二类阻塞源**。MSVC 的 `std::fopen` / `std::ifstream` 用
+   `_SH_DENYNO`，共享位不含 `FILE_SHARE_DELETE`，**且 CRT 不提供任何开关**。
+   任何被它们长期持有的文件都删不掉（`ERROR_SHARING_VIOLATION`）。
+   新增 `io::open_stream(path, mode)`：POSIX 就是 `std::fopen`；Windows 走
+   `CreateFileW`(带 SHARE_DELETE) → `_open_osfhandle` → `_fdopen`。
+   全库长期持有的 `std::FILE*` **只有一处**（`field_schema.hpp:105` 的追加句柄），
+   已切换；用完即关的 `FilePtr`/`AtomicFileWriter` 保持 `std::fopen` 不动。
+
+**9 个失败的最终归因与修法**：
+
+| 失败 | 真因 | 修法 |
+|---|---|---|
+| Diskann/Ivf Rebase ×4 | 段留着没用的 `fd_` 挡住 rename 覆盖 | 建映射后立刻关句柄 |
+| FieldSchema | CRT `fopen` 无 SHARE_DELETE | `io::open_stream` |
+| BackupHotCopy / MigrateHintOrd / SearcherFacade | 同上（目录里那个 `field.schema` 一个句柄卡住整个 `remove_all`）| 同上 |
+| InvertedIndex.V5BlockMinDl | **测试**里 `std::ifstream` 未出作用域就 `remove` | 加一层作用域 |
+
+> 注意最后一列：5 个「目录/文件删不掉」的失败里，**4 个的根因是同一个
+> `field.schema` 句柄**。Windows 上一个漏网的 CRT 句柄就能让整个库目录删不掉，
+> 排查时很容易误以为是 mmap。
+
+**顺带修掉一个我自己引入的 flaky**：S37-5 给 W3 补的 `count_os_threads`
+Windows 实现，单跑 5/5 全过、`ctest -j 8` 下偶发失败。两处原因叠加：
+① `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` 拍的是全系统线程表，繁忙时会以
+`ERROR_BAD_LENGTH` 失败（微软文档明载需重试），首版失败即返回 0；
+② 进程线程总数本就受被测对象之外的因素影响（ntdll 加载器工作线程、延迟加载 DLL）。
+①加重试，②把整轮测量改为最多 5 次重试、任一轮满足不变量即通过。
+**重试不削弱断言**：真回归是确定性的，每轮都会违反。
+> flaky 测试比没有测试更糟——它会让人养成忽略这个用例的习惯。
+
+**新增 3 个不变量测试**（`tests/posix_file_test.cpp` 的 `FileLifecycle`）：
+把本届赖以成立的三条语义从「一次性探针验过」变成常驻守护——
+`DeleteWhileMappedKeepsViewContent` / `AtomicRenameOverMappedFileKeepsViewContent`
+（含「rename 前必须先关句柄」那条纪律）/ `OpenStreamAllowsDeleteWhileHeld`。
+三条在 POSIX 上是常识、在 Windows 上是实测结论，任一条不成立的表现都是
+「merge 后文件删不掉、退休队列增长」或「rebase 静默失败」，不会在别处炸出来。
+
+**文档同步**：`io.hpp` 的 `MappedFile` 头注释、`doc/read-handle-lru-design-zh.md`、
+`doc/sealed-mmap-read-design-zh.md` 均补「Windows 上同一条 pin 语义成立（实测）」；
+`doc/windows-port-design-zh.md` 的 C2 加了醒目更正块并保留原文作对照——
+留一个已知为假的前提在定稿设计里，下一个读它的人会照着做无谓的架构改动。
+
+---
+
+#### 🎯（历史）S37-6 开工前的工作面（S37-5 的 ctest 量出，2026-08-07）
 
 | 失败用例 | 卡在哪 |
 |---|---|
@@ -734,7 +809,7 @@ S37-7 (1.5周) ───── CI + 收尾
 | S37-3.b 内核分 ISA TU | ✅ done（24 个 target 函数搬完；ISA 泄漏 0；四档 732/732；bench ±2%，见落地记录）|
 | S37-4 MSVC 构建适配 | ✅ done（188 个 TU 编译零错误；13 库 + 合并静态库产出；剩余全部为 io 后端符号。⚠️ Linux 侧未复验，见落地记录）|
 | S37-5 Windows I/O 后端 | ✅ done（bitcask.dll 产出；ctest 733 → 724 通过 99%；余 9 个全部落在 S37-6，见落地记录）|
-| S37-6 删除/映射生命周期 | ⬜ 未开始（工作面已由 S37-5 的 ctest 量准：9 个失败用例逐个归因，见 S37-6 段）|
+| S37-6 删除/映射生命周期 | ✅ done（**实测推翻立项前提，非架构改动**；ctest 733/733 全绿，见落地记录）|
 | S37-7 CI + 收尾 | ⬜ 未开始 |
 
 ### 待确认项

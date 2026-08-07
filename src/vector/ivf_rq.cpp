@@ -71,10 +71,6 @@ IvfSegment::~IvfSegment() { close(); }
 void IvfSegment::close() {
     map_.reset();  // B3：RAII munmap
     base_ = nullptr;
-    if (io::handle_valid(fd_)) {  // S37-5：原 `>= 0` 把 FileHandle 当 int
-        io::close_handle(fd_);
-        fd_ = io::kInvalidHandle;
-    }
     centroids_ = nullptr;
     cidx_      = nullptr;
     post_off_  = 0;
@@ -560,8 +556,20 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
         io::close_handle(fd);
         return false;
     }
+    // S37-6：**映射建成后立刻关句柄**。段的全部读取都走 base_（映射）；
+    // 原先这里把 fd 存进成员 fd_、只在析构里关，而那个成员**从未被读过**
+    // ——即 io.hpp 说的「向量 payload 关 fd 省预算」那一档，本站点一直没
+    // 照做。fd_ 成员随之删除（留一个恒为无效值的成员会误导后来者）。
+    //
+    // 之所以现在必须做：Windows 上 `MoveFileEx(tmp, seg, REPLACE_EXISTING)`
+    // 覆盖一个**仍开着文件句柄**的目标会 ERROR_ACCESS_DENIED（实测：任何
+    // 访问模式都拦，连 GENERIC_READ 也不例外），而 rebase 正是这个形态
+    // （save_component_base → build_sealed → atomic_rename 覆盖旧段）。
+    // **只剩映射**则覆盖成功，且旧视图完整保持旧内容——与 POSIX
+    // unlink-while-mapped 语义等价（已实测，含覆盖后才首次触碰的页）。
+    // 故这一行同时是 Windows 的正确性修复与两平台的 fd 预算改善。
+    io::close_handle(fd);
     base_  = reinterpret_cast<const std::uint8_t*>(map_.data());
-    fd_    = fd;
     dim_   = dim;
     nlist_ = nlist;
     count_ = count;

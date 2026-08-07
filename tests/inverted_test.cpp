@@ -1511,11 +1511,19 @@ TEST(InvertedIndex, V5BlockMinDlTrackedAndPersisted) {
     std::filesystem::remove(tmp2);
     ASSERT_TRUE(idx2.save(tmp2.string()));
 
-    std::ifstream f1(tmp, std::ios::binary), f2(tmp2, std::ios::binary);
-    std::vector<char> b1((std::istreambuf_iterator<char>(f1)),
-                         std::istreambuf_iterator<char>());
-    std::vector<char> b2((std::istreambuf_iterator<char>(f2)),
-                         std::istreambuf_iterator<char>());
+    // S37-6：两个 ifstream 必须在 remove 之前析构。POSIX 下 unlink 一个仍
+    // 打开的文件合法，故原来把它们留到函数末尾也无妨；**MSVC 的 ifstream
+    // 走 CRT 的 _SH_DENYNO，共享位不含 FILE_SHARE_DELETE**，于是下面的
+    // remove 抛 ERROR_SHARING_VIOLATION。加一层作用域即可，顺带也是更好的
+    // 测试卫生（读完就关）。
+    std::vector<char> b1, b2;
+    {
+        std::ifstream f1(tmp, std::ios::binary), f2(tmp2, std::ios::binary);
+        b1.assign((std::istreambuf_iterator<char>(f1)),
+                  std::istreambuf_iterator<char>());
+        b2.assign((std::istreambuf_iterator<char>(f2)),
+                  std::istreambuf_iterator<char>());
+    }
     EXPECT_EQ(b1, b2);  // load→save 幂等 ⇒ min_dl 等块字段全数保留
 
     std::filesystem::remove(tmp);

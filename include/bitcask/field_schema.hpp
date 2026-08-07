@@ -39,6 +39,7 @@
 #include "bitcask/byte_order.hpp"
 #include "bitcask/codec.hpp"
 #include "bitcask/detail/file_util.hpp"  // detail::FileCloser / FilePtr（RED-2 归并）
+#include "bitcask/io.hpp"                // S37-6：io::open_stream（带 share-delete）
 
 namespace bitcask {
 
@@ -102,7 +103,12 @@ public:
         }
 
         if (fp_) fp_.reset();
-        fp_.reset(std::fopen(path.c_str(), "ab"));  // best-effort 追加句柄
+        // S37-6：**这是全库唯一长期持有的 std::FILE***（生命周期 = FieldSchema
+        // 对象）。必须走 io::open_stream 而非 std::fopen——MSVC 的 CRT 不带
+        // FILE_SHARE_DELETE 且无开关，于是只要 FieldSchema 活着，
+        // field.schema 就删不掉（ERROR_SHARING_VIOLATION），连带整个库目录
+        // 都删不掉。POSIX 侧 open_stream 就是 std::fopen，零差别。
+        fp_.reset(io::open_stream(path, "ab"));  // best-effort 追加句柄
 
         // 全新文件：先写 8 字节文件头，后续 intern 的 entry 才是自洽的新格式。
         if (fresh && fp_) {

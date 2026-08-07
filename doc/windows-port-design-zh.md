@@ -262,7 +262,37 @@ hnsw ×3 / docmap ckpt / search ckpt / oki run）都走这两条路径
 > `MoveFileEx`），但 `file_util.hpp` 用的是 `<cstdio>` 的 `std::rename`。
 > 两者极易混淆，改动时须逐处确认。
 
-#### C2 — 删除/重命名正在打开的文件 · **唯一需要改架构处**
+#### C2 — 删除/重命名正在打开的文件 · ~~**唯一需要改架构处**~~
+
+> ## ⚠️ 本节的前提②已被实测推翻（S37-6，2026-08-07）
+>
+> 在 **Windows 10.0.26200** 上逐条实测（探针复刻本库 `MappedFile` 的建法：
+> `CreateFileMappingW` → `MapViewOfFile` → 立刻关 section 句柄）：
+>
+> | 断言 | 实测 |
+> |---|---|
+> | 带 `FILE_SHARE_DELETE` 也删不掉被 section 映射的文件 | **假**。删除成功，且名字**立刻**从目录消失（Win10 1709+ 的 POSIX 语义删除），同名可立即重建 |
+> | 被映射的文件不能被 `MoveFileEx(REPLACE_EXISTING)` 覆盖 | **假**（前提是目标没有打开的文件句柄）|
+> | 覆盖/删除后旧视图是否仍读旧内容 | **是**，含之后才首次触碰的页 —— 与 POSIX unlink-while-mapped **逐条等价** |
+>
+> 因此：`retire_files`/`drain_retired_files` 的重试队列在 Windows 上**会正常
+> 排空**，本节要求的 `evict_mappings(file_id)` 新不变量、以及与
+> `epoch_reclaim` 的协调，**都不需要做**。本项不是架构改动。
+>
+> **真正的限制在别处，且本节没提到**：
+> `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)` 覆盖一个**尚有文件句柄打开**的
+> 目标必然 `ERROR_ACCESS_DENIED` —— 与共享模式、与映射都无关，任何访问模式
+> （连 `GENERIC_READ`）都拦。故凡「写 tmp → rename 覆盖自己正在读的文件」的
+> 站点必须先关句柄（映射不用动）。实际命中：`IvfSegment`/`DiskannSegment::open`
+> 建好映射后仍留着 `fd_`（而该 fd 从未被读过），导致 4 个 rebase 用例失败。
+>
+> **另一类本节完全没预见的阻塞源：CRT stdio**。MSVC 的 `std::fopen` /
+> `std::ifstream` 用 `_SH_DENYNO`，共享位不含 `FILE_SHARE_DELETE`，**且 CRT
+> 不提供任何开关**。任何被它们长期持有的文件都删不掉。处置见
+> `io::open_stream`（S37-6 新增）。
+>
+> 落地细节见 `TASK.md` 的 S37-6 记录与 `io.hpp` 的 `MappedFile` 头注释。
+> 以下原文保留，作为「设计期假设 vs 实测」的对照。
 
 站点：merge 收尾删旧 data file（`cask.cpp:849-851`）、`oki_state.cpp` 7 处删旧
 run、`cask_recovery.cpp` 删旧 ckpt、`oki_run.cpp` 2 处。

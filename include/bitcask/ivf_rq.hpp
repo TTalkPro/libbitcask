@@ -148,7 +148,6 @@ private:
 
     const std::uint8_t* base_ = nullptr;  // mmap 基址（= map_.data()）
     io::MappedFile      map_;             // B3：RAII 归并（析构 munmap）
-    io::FileHandle      fd_   = io::kInvalidHandle;  // S37-5：Windows 上 HANDLE 装不进 int
 
     std::uint16_t dim_   = 0;
     std::uint32_t nlist_ = 0;

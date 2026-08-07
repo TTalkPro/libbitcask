@@ -265,6 +265,27 @@ using PosixFile = File;
 //   - POSIX unlink-while-mapped 语义下映射持续有效（B4 的延迟删除队列
 //     落地前，各站点的 pin 语义不变）。
 //
+// === S37-6：Windows 上这条 pin 语义同样成立（实测，非推断）===
+// 移植设计稿曾假设「被 section 映射持有的文件在 Windows 上删不掉」，
+// 据此规划了一项「退休前先逐出映射、并与 epoch 回收协调」的架构改动。
+// **实测（Windows 10.0.26200）推翻了该前提**——只要所有句柄都带
+// FILE_SHARE_DELETE（本库的 CreateFileW 全部如此）：
+//   - DeleteFile 一个正被映射的文件**成功**，且名字**立刻**从目录消失
+//     （Win10 1709+ 的 POSIX 语义删除），同名可立即重建；
+//   - MoveFileEx(..., REPLACE_EXISTING) 覆盖一个正被映射的文件**成功**；
+//   - 上述两种情况下，**已建立的视图完整保持旧内容**（含覆盖后才首次
+//     触碰的页）——与 POSIX unlink-while-mapped 逐条等价。
+// 于是 merge 的「unlink 旧文件，在途读者继续读旧映射」在两平台同样成立，
+// 那项架构改动不必做。
+//
+// ⚠️ **真正的 Windows 限制是另一件事：仍开着的文件句柄**。
+// MoveFileEx(REPLACE_EXISTING) 覆盖一个**尚有文件句柄打开**的目标必然
+// ERROR_ACCESS_DENIED（实测：任何访问模式都拦，连 GENERIC_READ 也不例外），
+// 与共享模式和映射都无关。故凡是「写 tmp → rename 覆盖自己正在读的文件」
+// 的站点，**必须先关掉那个句柄**——映射不用动。这正是
+// IvfSegment/DiskannSegment::open 在建好映射后立刻 close_handle 的理由
+// （它们本就只经映射读，fd 从未被用过）。
+//
 // 线程模型：映射建立后只读、无内部状态变更——多线程并发读 data() 安全；
 // 构造/析构/移动由所有者单线程控制（同 PosixFile 约定）。
 // ---------------------------------------------------------------------------
@@ -377,6 +398,22 @@ void sync_directory(const std::string& path) noexcept;
 // 已打开的 FILE* 流：fflush + fdatasync。两个返回值都检查——disk-full 下
 // fflush 失败而 fdatasync 对已落盘部分成功，就会 rename 出半截文件。
 [[nodiscard]] bool flush_and_sync_stream(std::FILE* f) noexcept;
+
+// ---------------------------------------------------------------------------
+// 打开一个 std::FILE* 流（S37-6）。语义同 std::fopen，**唯一差别是持有期间
+// 该文件仍可被删除**。失败返回 nullptr。mode 支持 "r"/"w"/"a" + 可选 "+"/"b"。
+//
+// 为什么需要它：**MSVC 的 CRT 用 `_SH_DENYNO` 开文件，共享位只有
+// FILE_SHARE_READ|FILE_SHARE_WRITE，没有 FILE_SHARE_DELETE，且 CRT 不提供
+// 任何开关能加上它**。于是任何被 std::fopen 长期持有的文件在 Windows 上都
+// 删不掉（实测 DeleteFileW 报 ERROR_SHARING_VIOLATION），连带整个目录都删不掉。
+// POSIX 侧本函数就是 std::fopen，零差别。
+//
+// 只有**长期持有**的流需要用它。用完即关的读写（file_util 的 FilePtr、
+// AtomicFileWriter 的 tmp）继续用 std::fopen 即可——它们的持有窗口内不会
+// 有人来删该文件。
+[[nodiscard]] std::FILE* open_stream(const std::string& path,
+                                     const char* mode) noexcept;
 
 // 建议宿主预取 [addr, addr+len) 的页（POSIX: madvise(MADV_WILLNEED)；
 // Windows: PrefetchVirtualMemory）。尽力而为，失败无碍（页仍会按需缺页装入）。

@@ -222,3 +222,90 @@ TEST(ProcessToken, DeadPidIsNotAlive) {
     EXPECT_FALSE(bitcask::io::process_alive(-1, 0));
     EXPECT_EQ(bitcask::io::process_start_token(-1), 0u);
 }
+
+// ---------------------------------------------------------------------------
+// S37-6：文件生命周期语义——merge 退休 / 段 rebase 全都建立在这三条上。
+//
+// 这些性质在 POSIX 上是常识（unlink-while-mapped），在 Windows 上则是**实测
+// 结论而非文档承诺**（见 io.hpp MappedFile 头注释）。做成测试是因为：一旦
+// 哪条不成立，表现是「merge 后文件删不掉、退休队列无限增长」或「rebase 静默
+// 失败」，两者都不会在别处炸出来。
+// ---------------------------------------------------------------------------
+
+TEST(FileLifecycle, DeleteWhileMappedKeepsViewContent) {
+    TempDir td;
+    const auto path = td.file("mapped.dat");
+    {
+        auto w = PosixFile::open(path, OpenFlag::kCreate);
+        ASSERT_TRUE(w);
+        ASSERT_TRUE(w->pwrite(0, as_bytes("OLDDATA")));
+    }
+    auto r = PosixFile::open(path, OpenFlag::kReadOnly);
+    ASSERT_TRUE(r);
+    auto m = bitcask::io::MappedFile::map_readonly(r->fd(), 7,
+                                                   /*advise_random=*/false);
+    ASSERT_TRUE(m.valid());
+    r->close_quiet();  // 只留映射（Windows 上「仍开着的句柄」才是限制项）
+
+    // 删除一个正被映射的文件必须成功。
+    ASSERT_TRUE(bitcask::io::remove_file(path))
+        << "被映射的文件删不掉 ⇒ merge 退休队列会无限增长";
+    EXPECT_FALSE(fs::exists(path)) << "删除后名字应立刻从目录消失";
+
+    // 旧视图仍读到旧内容——在途读者的正确性基础。
+    EXPECT_EQ(0, std::memcmp(m.data(), "OLDDATA", 7));
+
+    // 同名可立即重建，且不影响旧视图。
+    {
+        auto n = PosixFile::open(path, OpenFlag::kCreate);
+        ASSERT_TRUE(n) << "删除后同名新建应立刻成功";
+        ASSERT_TRUE(n->pwrite(0, as_bytes("NEWDATA")));
+    }
+    EXPECT_EQ(0, std::memcmp(m.data(), "OLDDATA", 7))
+        << "旧视图串到了新文件内容 ⇒ 在途读者会读到撕裂数据";
+}
+
+TEST(FileLifecycle, AtomicRenameOverMappedFileKeepsViewContent) {
+    // 段 rebase 的形态：写 tmp → atomic_rename 覆盖自己正在映射的旧段。
+    TempDir td;
+    const auto target = td.file("seg.dat");
+    const auto tmp    = td.file("seg.dat.tmp");
+    {
+        auto w = PosixFile::open(target, OpenFlag::kCreate);
+        ASSERT_TRUE(w);
+        ASSERT_TRUE(w->pwrite(0, as_bytes("OLDSEG")));
+    }
+    auto r = PosixFile::open(target, OpenFlag::kReadOnly);
+    ASSERT_TRUE(r);
+    auto m = bitcask::io::MappedFile::map_readonly(r->fd(), 6, false);
+    ASSERT_TRUE(m.valid());
+    // ⚠️ 必须先关句柄：Windows 上 rename 覆盖一个仍开着句柄的目标必然失败
+    // （任何访问模式都拦）。IvfSegment/DiskannSegment::open 因此在建好映射
+    // 后立刻 close_handle——本行就是那条纪律的测试面。
+    r->close_quiet();
+    {
+        auto w = PosixFile::open(tmp, OpenFlag::kCreate);
+        ASSERT_TRUE(w);
+        ASSERT_TRUE(w->pwrite(0, as_bytes("NEWSEG")));
+    }
+    ASSERT_TRUE(bitcask::io::atomic_rename(tmp, target))
+        << "rename 覆盖被映射的目标失败 ⇒ 段 rebase 无法落地";
+    EXPECT_EQ(0, std::memcmp(m.data(), "OLDSEG", 6))
+        << "旧视图必须保持旧内容（等价 POSIX unlink-while-mapped）";
+}
+
+TEST(FileLifecycle, OpenStreamAllowsDeleteWhileHeld) {
+    // field_schema 长期持有一个追加流。若退回 std::fopen，Windows 上
+    // 整个库目录都会因这一个句柄而删不掉。
+    TempDir td;
+    const auto path = td.file("held.dat");
+    std::FILE* f = bitcask::io::open_stream(path, "ab");
+    ASSERT_NE(f, nullptr);
+    ASSERT_EQ(std::fwrite("x", 1, 1, f), 1u);
+    ASSERT_EQ(std::fflush(f), 0);
+
+    EXPECT_TRUE(bitcask::io::remove_file(path))
+        << "io::open_stream 持有期间文件必须仍可删除"
+           "（Windows 上 std::fopen 不带 FILE_SHARE_DELETE）";
+    std::fclose(f);
+}

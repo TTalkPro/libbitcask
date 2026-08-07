@@ -236,6 +236,11 @@ void Cask::evict_read_handles_locked() {
   不进 `read_files_`——淘汰不影响在跑的 fold。
 - merge unlink 的 erase 与 LRU 淘汰并存：都仅去 map 引用，依赖
   `shared_ptr<DataFile>` refcount 续命 fd + mmap。
+  - **Windows 上无需另加不变量**（S37-6 实测）：带 `FILE_SHARE_DELETE` 的
+    句柄不阻止删除，被 section 映射持有的文件也照样能删且视图保持旧内容。
+    故 `retire_files` / `drain_retired_files` 的重试队列在 Windows 上会正常
+    排空，不会像移植设计稿 C2 担心的那样无限增长。细节与实测结论见
+    `io.hpp` 的 `MappedFile` 头注释。
 - `CaskOptions::kUnlimitedReadHandles`（`opt = (size_t)-1`）在
   `resolve_read_handle_cap` 内映射为 `cap = 0`；`evict_read_handles_locked`
   早退——行为与现状（旧默认）一致。

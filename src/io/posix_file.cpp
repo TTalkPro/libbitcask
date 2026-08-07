@@ -361,6 +361,12 @@ bool flush_and_sync_stream(std::FILE* f) noexcept {
     return std::fflush(f) == 0 && ::fdatasync(::fileno(f)) == 0;
 }
 
+// S37-6：POSIX 下就是 std::fopen——unlink 一个已打开的文件本就合法，
+// 无须任何额外共享位。差异全在 Windows 侧（见 io.hpp）。
+std::FILE* open_stream(const std::string& path, const char* mode) noexcept {
+    return std::fopen(path.c_str(), mode);
+}
+
 std::size_t page_size() noexcept {
     const long ps = ::sysconf(_SC_PAGESIZE);
     return ps > 0 ? static_cast<std::size_t>(ps) : 4096u;

@@ -190,6 +190,17 @@ GetResultView(GetResultView&& other) noexcept;
   `GetResultView::map_holder_`）→ DataFile 存活 → 映射存活。
 - Linux 上 **unlinked-but-mapped 文件仍可读**（inode 由映射续命，
   类似 open fd 续命）。
+- **Windows 上同样成立**（S37-6 实测，Windows 10.0.26200，非推断）：只要
+  所有句柄都带 `FILE_SHARE_DELETE`（`win32_file.cpp` 的 `CreateFileW` 全部
+  如此），`DeleteFile` 一个正被映射的文件成功、名字立刻从目录消失、同名
+  可立即重建，而**已建立的视图完整保持旧内容**（含删除后才首次触碰的页）。
+  即本节的延迟 munmap 模式无需为 Windows 做任何改动。
+  > 移植设计稿（`windows-port-design-zh.md` C2）曾假设「被 section 映射
+  > 持有的文件删不掉」，并据此规划了一项「退休前先逐出映射、且与
+  > `epoch_reclaim` 协调」的架构改动。该前提已被实测推翻，那项改动不做。
+  > Windows 侧真正的限制在别处：`MoveFileEx(REPLACE_EXISTING)` 覆盖一个
+  > **尚有文件句柄打开**的目标必然 `ERROR_ACCESS_DENIED`（与映射无关，
+  > 任何访问模式都拦）——处置见 `io.hpp` 的 `MappedFile` 头注释。
 - 最后引用析构（`~DataFile`）时才 `munmap`——同 `O10` UAF 修复
   / `read-handle-lru-design-zh.md` §5.3 共享 `shared_ptr` 续命模式。
 

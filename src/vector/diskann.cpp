@@ -175,10 +175,6 @@ DiskannSegment::~DiskannSegment() { close(); }
 void DiskannSegment::close() {
     map_.reset();  // B3：RAII munmap
     base_ = nullptr;
-    if (io::handle_valid(fd_)) {  // S37-5：原 `>= 0` 把 FileHandle 当 int
-        io::close_handle(fd_);
-        fd_ = io::kInvalidHandle;
-    }
     nav_.clear();
     nav_.shrink_to_fit();
     count_ = 0;
@@ -536,8 +532,10 @@ bool DiskannSegment::open(std::string_view path, std::uint16_t dim,
         io::close_handle(fd);
         return false;
     }
+    // S37-6：映射建成后立刻关句柄——理由与 IvfSegment::open 同一处注释
+    // （段只经 base_ 读；Windows 上 rename 覆盖仍开着句柄的目标会 err=5）。
+    io::close_handle(fd);
     base_ = reinterpret_cast<const std::uint8_t*>(map_.data());
-    fd_ = fd;
     dim_ = dim;
     r_ = r;
     medoid_ = medoid;
