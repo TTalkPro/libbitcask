@@ -17,6 +17,7 @@ C API 是 C++ `bitcask::Cask` 的薄 `extern "C"` 包装，编译产物：
 
 1. [设计原则](#1-设计原则)
 2. [头文件与链接](#2-头文件与链接)
+   - [2.1 为什么跨模块只能用 C API（Windows）](#21-为什么跨模块只能用-c-api-windows)
 3. [版本信息](#3-版本信息)
 4. [基础类型](#4-基础类型)
 5. [错误处理](#5-错误处理)
@@ -69,6 +70,53 @@ gcc app.c -I<c_api 头目录> -L<lib 目录> -lbitcask -o app
 # 静态链接（libbitcask.a）需先定义 BITCASK_STATIC_LIB
 gcc -DBITCASK_STATIC_LIB app.c -I<c_api 头目录> libbitcask.a -o app
 ```
+
+Windows（MSVC）：
+
+```bat
+cl app.c /I<c_api 头目录> bitcask.lib          :: 动态：链导入库，运行时需 bitcask.dll 同目录
+cl /DBITCASK_STATIC_LIB app.c /I<c_api 头目录> bitcask_static.lib   :: 静态
+```
+
+### 2.1 为什么跨模块只能用 C API（Windows）
+
+**C API 是本库唯一的模块边界。C++ 头（`include/bitcask/*.hpp`）不是** ——
+它要求调用方与库**在同一模块内、或至少共用同一份 CRT**。
+
+原因是 Windows 的 CRT 模型：`/MT`（静态 CRT）下**每个模块各带一份自己的 CRT，
+各有一份自己的堆和自己的 fd 表**。而 C++ 头有若干处让 CRT 拥有的对象跨过
+调用方与库的边界：
+
+| 出处 | 谁分配 | 谁释放 / 使用 |
+|---|---|---|
+| `io::File::pread` 返回 `ReadOk{std::vector<std::byte>}` | 库 | 调用方析构 → 跨堆 free |
+| `io::open_stream()` 返回 `std::FILE*` | 库 | 调用方的 `fclose`（`field_schema.hpp` 是 header-only）|
+| `io::flush_and_sync_stream(std::FILE*)` | 调用方 | 库内的 `_fileno` / `_get_osfhandle` |
+
+在 `/MD`（动态 CRT，**CMake 与 vcpkg `x64-windows` 三元组的默认，也是本项目的
+构建方式**）下，全进程只有一份 CRT，上述三处都成立。只有当有人把它改成 `/MT`
+并跨模块使用 C++ 头时才会出事。
+
+> ⚠️ **失败形态是静默的，值得单独记住。** CRT 的 invalid-parameter handler 直接
+> `__fastfail`：进程当场消失，退出码 `0xC0000409`，**`terminate` 与 `abort` 两个
+> 钩子都不触发**，现场只剩一个退出码。该状态码名为 `STACK_BUFFER_OVERRUN`，
+> **与栈毫无关系** —— 它只是 CRT 致命退出的统一出口，照字面查会往完全错的方向走。
+>
+> 这不是推演：姊妹项目 coxswain 在 `/MT` + 多 DLL 下踩过同一形态（一个 `FILE*`
+> 在两个 DLL 之间穿过），表现为「所有模型文件都加载不了、进程无声消失」，
+> 最后靠 `cdb` 取栈才定位。**上游不会碰到，因为默认动态 CRT；`/MT` 才是没人
+> 测过的那个组合。**
+
+因此：
+
+- **同一模块内**（直接把本库编进你的可执行文件）——C++ 头随便用，不受此限；
+- **跨模块**（用 `bitcask.dll`，或把本库放进另一个 DLL）——**只用 C API**。
+  C API 的边界上只有不透明句柄、POD 结构和 `bitcask_*_free()` 配对的所有权，
+  没有任何 CRT 对象穿过。
+
+`CMakeLists.txt` 在配置期检查 CRT 选择：选了静态 CRT 会给出指名道姓的告警。
+给告警而非硬错，是因为「单模块静态链接」与「跨模块但只用 C API」两种 `/MT`
+用法本身成立。
 
 ---
 

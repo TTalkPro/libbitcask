@@ -170,12 +170,30 @@ C API 设计要点：不透明句柄、显式 `*_free` 配对、错误码 + `bit
 
 | 依赖 | 版本 | 说明 | Debian/Ubuntu 包 |
 |------|------|------|------------------|
-| C++ 编译器 | GCC 13+ / Clang 17+ | 需要 C++23 支持 | `gcc` `g++` |
-| CMake | ≥ 3.20 | 构建系统 | `cmake` |
+| C++ 编译器 | GCC 13+ / Clang 17+ / **MSVC 19.4x+（VS 2022 17.6+）** | 需要 C++23 支持 | `gcc` `g++` |
+| CMake | **≥ 3.21** | 构建系统（合并静态库用 `$<TARGET_OBJECTS:>` 取 STATIC 目标对象，该用法自 3.21 起可用）| `cmake` |
 | ZLIB | — | CRC32 / 数据压缩 | `zlib1g-dev` |
 | oneTBB | — | 并发容器；普通构建用系统包 | `libtbb-dev` |
 
 > 普通构建用系统的 `libtbb`（`find_package(TBB)`）；仅 TSan 构建会改用 `third_party/oneTBB` 源码编译插桩版——系统 libtbb 未插桩，TSan 下会漏报/误报。
+
+### Windows（MSVC）
+
+平台支持范围：**Windows x64 / MSVC 原生 ABI**。不支持 MinGW，不支持 ARM64 Windows 与 32 位 x86。
+
+- **依赖**：zlib 走 vcpkg（`vcpkg.json` 只列它一个）；**oneTBB 从 `third_party/oneTBB` 子模块现编**——vcpkg 的 `tbb` 端口经 `hwloc` 会拖进一整套 msys2（m4/perl/autotools）工具链，与「纯 MSVC」构建冲突。需设环境变量 `VCPKG_ROOT`。
+- **配置**：用 `CMakePresets.json`，不必手填 toolchain 与 triplet：
+
+```bat
+cmake --preset msvc-debug
+cmake --build --preset msvc-debug
+ctest --preset msvc-debug
+```
+
+- **产物**：`bitcask.dll` + `bitcask.lib`（导入库）+ `bitcask_static.lib`（合并静态库；Windows 下不叫 `bitcask.lib` 是为了不与导入库撞名）。所有 exe 与 DLL 统一落到 `<build>/bin/`——Windows 没有 RPATH，DLL 必须与 exe 同目录。
+- **Sanitizer**：只有 ASan（`BITCASK_SANITIZE=address`）。TSan / UBSan 在 MSVC 下不存在，指定它们会在**配置期报错退出**而不是静默降级——「以为在跑 TSan 而实际没插桩」比构建失败危险得多。并发正确性仍以 Linux TSan 为准。
+
+> ⚠️ **跨模块使用请只用 C API。** C++ 头（`include/bitcask/*.hpp`）要求调用方与库共用同一份 CRT；`/MT`（静态 CRT）下每个模块各有一份堆与 fd 表，而 C++ 头有几处让 `std::vector` / `std::FILE*` 跨过边界。默认的 `/MD` 下没有这个问题。失败形态是**进程无声消失、退出码 `0xC0000409`、`terminate`/`abort` 都不触发**，极难定位——详见 [`doc/api-c.md` §2.1](doc/api-c.md)。`CMakeLists.txt` 在配置期检查 CRT 选择并告警。
 
 ### Vendored 依赖（git submodule）
 
@@ -249,8 +267,8 @@ cmake --build build -j --target bitcask_static bitcask_shared
 
 ### 产物
 
-- `libbitcask.so` — 共享库，导出 C API（`extern "C"`，`SOVERSION=6`）
-- `libbitcask.a` — 把全部静态归档合并为单一 `.a`
+- `libbitcask.so` — 共享库，导出 C API（`extern "C"`，`SOVERSION=6`）；Windows 为 `bitcask.dll` + `bitcask.lib`（导入库）
+- `libbitcask.a` — 把全部静态归档合并为单一 `.a`；Windows 为 `bitcask_static.lib`（换名避免与导入库撞名）
 - `bitcask_migrate` — 统一纪元迁移入口：`detect` / `be2le`（v1 大端 → 当前）/ `tstamp64`（u32 → u64，5.0 flag-day）/ `hintord`（hint 补 ord，5.1 flag-day）
 - `migrate_le` — v1 大端 → 当前纪元（旧入口，等价于 `bitcask_migrate be2le`）
 - `vec_engine_migrate` — HNSW / IVF-RaBitQ / DiskANN 离线引擎切换（S32-M4）
