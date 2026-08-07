@@ -2,6 +2,7 @@
 // Cask::prepare_vector 平移——行为与文件格式逐字节不变，只换持有方。
 
 #include "bitcask/vector_plugin.hpp"
+#include "bitcask/detail/cpu_features.hpp"
 #include "bitcask/ckpt_chain.hpp"       // S20-2：walk_chain / remove_chain_files
 #include "bitcask/search_checkpoint.hpp"
 
@@ -97,10 +98,10 @@ inline void scale_avx512(float* dst, const float* src, float inv, std::size_t n)
 // 缩放 v *= inv 用 float 乘。运行时 AVX-512F > AVX2/FMA > 标量三档兜底。
 inline double sum_sq(const float* v, std::size_t n) noexcept {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-    if (n >= 16 && __builtin_cpu_supports("avx512f")) {
+    if (n >= 16 && simd::have_avx512()) {  // S37-3：整集门
         return sum_sq_avx512(v, n);
     }
-    if (n >= 8 && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+    if (n >= 8 && simd::have_avx2_fma()) {  // S37-3
         return sum_sq_avx2(v, n);
     }
 #endif
@@ -111,11 +112,11 @@ inline double sum_sq(const float* v, std::size_t n) noexcept {
 
 inline void scale_query(float* dst, const float* src, float inv, std::size_t n) noexcept {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-    if (n >= 16 && __builtin_cpu_supports("avx512f")) {
+    if (n >= 16 && simd::have_avx512()) {  // S37-3：整集门
         scale_avx512(dst, src, inv, n);
         return;
     }
-    if (n >= 8 && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+    if (n >= 8 && simd::have_avx2_fma()) {  // S37-3
         scale_avx2(dst, src, inv, n);
         return;
     }

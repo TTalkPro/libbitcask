@@ -6,7 +6,7 @@
 //               (float(tfs[i]) + k1*(1 - b) + k1*b * float(dls[i]) / float(avgdl))
 //   contrib_i = idf * (tf_norm_i + delta)
 //
-// Three tiers, picked at runtime via __builtin_cpu_supports() in the
+// Three tiers, picked at runtime via bitcask::simd::cpu_features (S37-3) in the
 // dispatcher (bm25_score_dispatch):
 //   1. AVX-512F: 16 uint32→float pairs per iteration (Skylake-X / Ice Lake /
 //      Zen4+). _mm512_cvtepi32_ps + FMA chain + single _mm512_div_ps.
@@ -28,7 +28,7 @@
 // / CompactRemovesDeadPostingsPreservesScores family) continue to pass
 // because both sides of the comparison use the same kernel.
 //
-// The dispatcher caches its decision on first call: __builtin_cpu_supports()
+// The dispatcher caches its decision on first call: simd::have_*()
 // touches CPUID, but the per-call branch on a static bool is essentially
 // free (predicted perfectly after warmup).
 //
@@ -39,6 +39,7 @@
 #pragma once
 
 #include <cstddef>
+#include "bitcask/detail/cpu_features.hpp"
 #include <cstdint>
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
@@ -246,23 +247,17 @@ inline void bm25_score_dispatch(
     float* contrib,
     std::size_t n) noexcept {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-    // Cached runtime probe: __builtin_cpu_init() is required before
-    // __builtin_cpu_supports() in some toolchains; cheap to call multiple
-    // times (idempotent), but a single static init is even cheaper.
-    static const bool kAvx512 = [] {
-        __builtin_cpu_init();
-        return __builtin_cpu_supports("avx512f");
-    }();
+    // S37-3：探测下沉到 simd::cpu_features（自实现 CPUID + XCR0 门，MSVC
+    // 通用）。注意 AVX-512 档现在要求 F+CD+BW+DQ+VL 整集齐备而非仅 F——
+    // 见 cpu_features.hpp（MSVC /arch:AVX512 隐含整集）。
+    static const bool kAvx512 = simd::have_avx512();
     if (kAvx512) {
         bm25_score_avx512(tfs, dls,
                           k1_plus_1, k1_times_1_minus_b, k1_times_b,
                           delta, idf, inv_avgdl, contrib, n);
         return;
     }
-    static const bool kAvx2Fma = [] {
-        return __builtin_cpu_supports("avx2") &&
-               __builtin_cpu_supports("fma");
-    }();
+    static const bool kAvx2Fma = simd::have_avx2_fma();
     if (kAvx2Fma) {
         bm25_score_avx2(tfs, dls,
                         k1_plus_1, k1_times_1_minus_b, k1_times_b,

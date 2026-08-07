@@ -31,7 +31,7 @@
 //                 = sq_a + sq_b - 2 * Σ codes_a[i] * codes_b[i]
 // (precomputed sq_a, sq_b in QVector; dot from above).
 //
-// === Kernel tiers (runtime dispatch via __builtin_cpu_supports) ===
+// === Kernel tiers (runtime dispatch via bitcask::simd::cpu_features) ===
 //   1. AVX-512 VNNI (avx512vnni):  64 int8 per iteration, __m512i accum
 //   2. AVX-VNNI    (avxvnni):      32 int8 per iteration, __m256i accum
 //   3. Scalar fallback (non-x86 or CPU without VNNI)
@@ -50,6 +50,7 @@
 #pragma once
 
 #include <algorithm>
+#include "bitcask/detail/cpu_features.hpp"
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -457,10 +458,10 @@ using Int8DotFn = float (*)(const std::int8_t*, const std::int8_t*,
 inline Int8DotFn pick_int8_dot_kernel() noexcept {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
     static const Int8DotFn kFn = []() -> Int8DotFn {
-        __builtin_cpu_init();
-        if (__builtin_cpu_supports("avx512vnni")) return &dot_vnni512;
-        if (__builtin_cpu_supports("avxvnni"))     return &dot_vnni;
-        if (__builtin_cpu_supports("avx2"))        return &dot_avx2;  // S29-11-②
+        // S37-3：探测经 simd::cpu_features（见 cpu_features.hpp）。
+        if (simd::have_avx512_vnni()) return &dot_vnni512;
+        if (simd::have_avx_vnni())    return &dot_vnni;
+        if (simd::have_avx2())        return &dot_avx2;  // S29-11-②
         return nullptr;
     }();
     return kFn;

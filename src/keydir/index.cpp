@@ -1,4 +1,5 @@
 #include "bitcask/index.hpp"
+#include "bitcask/detail/cpu_features.hpp"
 
 #include "bitcask/codec.hpp"  // S18-2：sidecar CRC
 #include "bitcask/vbyte.hpp"   // S21-2 A2：sidecar v2 行 gap+vbyte
@@ -237,7 +238,7 @@ void Index::fill_is_live(std::span<const std::uint64_t> ords,
         const std::size_t n = ords.size();
         std::size_t i = 0;
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-        if (__builtin_cpu_supports("avx2")) {
+        if (simd::have_avx2()) {  // S37-3
             fill_is_live_inbounds_avx2(live_arr, ords_arr, out_arr, n);
             return;
         }
@@ -270,7 +271,7 @@ void Index::fill_doc_lens(std::span<const std::uint64_t> ords,
         // AVX2 vpgatherqd(_mm256_i64gather_epi32) 一次取 8 个 64-bit 索引
         // 但仅消费低 4 个、返 4 个 32-bit 值(__m128i)。每轮 4 ords 一次
         // gather;高 4 索引通过 lane shift 喂下一轮。
-        if (__builtin_cpu_supports("avx2")) {
+        if (simd::have_avx2()) {  // S37-3
             for (; i + 4 <= n; i += 4) {
                 __m256i idx = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i*>(ords_arr + i));

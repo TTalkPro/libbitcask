@@ -1,7 +1,8 @@
 // bitcask/hw_crc32.hpp — CRC32 IEEE 802.3 (polynomial 0xEDB88320) with
 // PCLMULQDQ hardware acceleration.
 //
-// Three tiers, picked at runtime via __builtin_cpu_supports():
+// Three tiers, picked at runtime via bitcask::simd::cpu_features (S37-3;
+// 自实现 CPUID + XCR0 门，MSVC 通用，受 BITCASK_SIMD_MAX 钳制):
 //   1. SSE4.2 + PCLMULQDQ: 16-byte-at-a-time carryless folding. ~10 GB/s on
 //      modern x86. Used for inputs >= 16 bytes (after head-alignment).
 //   2. Slice-by-1 bytewise table: head-alignment bytes + tail < 16 bytes.
@@ -28,6 +29,7 @@
 #pragma once
 
 #include <algorithm>
+#include "bitcask/detail/cpu_features.hpp"
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -375,8 +377,9 @@ inline std::uint32_t crc32_pclmul_small(std::uint32_t crc_internal,
 // True iff CPU supports both sse4.2 and pclmul. Cached after first call.
 inline bool has_pclmul_crc32() noexcept {
 #if defined(__GNUC__) || defined(__clang__)
-    static const bool k = __builtin_cpu_supports("sse4.2") &&
-                          __builtin_cpu_supports("pclmul");
+    // S37-3：改经 simd::cpu_features（自实现 CPUID，MSVC 通用；且受
+    // BITCASK_SIMD_MAX 钳制，可强制降档做跨档对拍）。
+    static const bool k = simd::have_sse42_pclmul();
     return k;
 #else
     return false;

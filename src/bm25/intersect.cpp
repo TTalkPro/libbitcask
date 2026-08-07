@@ -6,6 +6,7 @@
 // 一次 resize 截断到实际长度。见 doc/intersect-kernel-internals-zh.md §2。
 
 #include "bitcask/intersect.hpp"
+#include "bitcask/detail/cpu_features.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -210,14 +211,14 @@ void intersect_u64(std::span<const std::uint64_t> a,
     }
 
 #ifdef BITCASK_INTERSECT_SIMD
-    static const bool kHasAvx512f = __builtin_cpu_supports("avx512f");
+    static const bool kHasAvx512f = simd::have_avx512();  // S37-3：整集门
     if (kHasAvx512f) {
         cur = intersect_inoue_avx512(a.data(), a.size(), b.data(), b.size(),
                                      cur);
         out.resize(static_cast<std::size_t>(cur - base));
         return;
     }
-    static const bool kHasAvx2 = __builtin_cpu_supports("avx2");
+    static const bool kHasAvx2 = simd::have_avx2();  // S37-3
     if (kHasAvx2) {
         cur = intersect_inoue_avx2(a.data(), a.size(), b.data(), b.size(),
                                    cur);

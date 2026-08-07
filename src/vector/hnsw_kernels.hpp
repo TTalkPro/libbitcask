@@ -14,7 +14,7 @@ float dot_scalar(const float* a, const float* b, std::size_t n);
 float l2_scalar(const float* a, const float* b, std::size_t n);
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-// AVX2+FMA 内核。仅在支持的目标上调用;bench 用 __builtin_cpu_supports
+// AVX2+FMA 内核。仅在支持的目标上调用;bench 用 simd::have_* (S37-3)
 // 运行时探测,见 distance_bench.cpp。target 属性让函数体只在该 ISA 上
 // 发射,跨 ISA 调用由 ifunc / target_clones 解析。
 __attribute__((target("avx2,fma"))) float dot_avx2(const float* a,

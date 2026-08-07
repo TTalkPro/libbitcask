@@ -2,6 +2,7 @@
 // 工程选择见 doc/hnsw-design-zh.md §2,并发协议见 §3 与 hnsw.hpp 文件头。
 
 #include "bitcask/hnsw.hpp"
+#include "bitcask/detail/cpu_features.hpp"
 #include "bitcask/codec.hpp"
 #include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
 #include "hnsw_kernels.hpp"
@@ -261,13 +262,12 @@ DistFn pick_kernel(HnswMetric metric) {
 #ifdef BITCASK_HNSW_SIMD
     // V3.9:AVX-512F 优先(超集)。要求仅基础 AVX-512 Foundation,无 BW/VL,
     // 覆盖 Skylake-SP / Ice Lake / Zen4。运行时一次探测,零查询开销。
-    static const bool kAvx512f = __builtin_cpu_supports("avx512f");
+    static const bool kAvx512f = simd::have_avx512();  // S37-3：整集门
     if (kAvx512f) {
         return metric == HnswMetric::kDot ? detail::dot_avx512
                                           : detail::l2_avx512;
     }
-    static const bool kAvx2 = __builtin_cpu_supports("avx2") &&
-                              __builtin_cpu_supports("fma");
+    static const bool kAvx2 = simd::have_avx2_fma();  // S37-3
     if (kAvx2) {
         return metric == HnswMetric::kDot ? detail::dot_avx2
                                           : detail::l2_avx2;

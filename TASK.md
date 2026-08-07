@@ -229,6 +229,51 @@ crash_after_merge / retired_files_crash)。事前担心的「依赖 fork 时刻�
 - **验收**：全 ISA 档位对拍（`int8_kernels` 既有 `self_test` + BM25/intersect/crc32
   scalar-vs-SIMD）；bench 零回归；**仓库既有纪律「改评分算法必须过三方穷举对拍」在此适用**
 
+> **执行拆分（2026-08-07）**：本项拆两步做。搬内核之前**必须先有对拍手段**——
+> 否则搬完无从验证（见下方 3.a 的发现）。
+> - **3.a** `cpu_features` + `BITCASK_SIMD_MAX` + 单测 + 派发点切换（纯增量，
+>   派发逻辑不变，只换探测来源）✅ done
+> - **3.b** 内核出头文件 → 分 ISA TU + `/arch:` 施加 + 机械替换 ⬜ 未开始
+
+#### ✅ S37-3.a 落地记录（2026-08-07）
+
+**开工即发现的盲区**：本机 CPU 为 `avx2 avx_vnni fma pclmulqdq sse4_2`，
+**无 AVX-512**；`ci.yml` 也无任何 ISA 相关配置。即：仓库里的 **AVX-512 内核
+从未在本地或 CI 上被执行过**——改错了不会红。这比设计稿预估的更严重，
+也正是「先建对拍手段再搬内核」的直接理由。
+
+**新增**：`include/bitcask/detail/cpu_features.hpp` + `src/simd/cpu_features.cpp`
+（新 `bitcask_simd` 库，由 `bitcask_format` PUBLIC 传播——`codec.cpp` 同时包含
+`hw_crc32.hpp` 与 `int8_kernels.hpp`）。三重过滤后的能力位：
+CPUID 报告 ∧ XCR0 表明 OS 已启用相应寄存器状态 ∧ 未被 `BITCASK_SIMD_MAX` 钳掉。
+
+**验证策略——与 `__builtin_cpu_supports` 逐位对拍**：`cpu_features_test` 的
+`MatchesCompilerBuiltin` 把手写 CPUID 的 11 个位与编译器内建对拍。这是关键的
+一步：GCC/Clang 的内建是**替我们做过 XCR0 检查**的权威实现，MSVC 上没有——
+只有在 GCC/Clang 上对拍通过，才有底气到 MSVC 上只留手写版。本机通过，
+含最易抄错的 **AVX-VNNI（leaf 7 subleaf **1** 的 EAX bit 4，与 AVX512-VNNI 的
+leaf 7.0 ECX bit 11 位置迥异）**。
+
+**AVX-512 门已收紧**为 `F && CD && BW && DQ && VL`（原仅查 `avx512f`），
+理由见设计稿 §2.5。`have_avx512()` 单一出口，5 个派发点全部随之收紧。
+
+**`BITCASK_SIMD_MAX` 行为**（实测）：`scalar/sse42/avx2/avxvnni` 下调生效；
+`avx512/avx512vnni` 在无该硬件的机器上正确保持 `avxvnni`（**只降不升**）；
+拼错档位 **SIGABRT**（不做「警告后忽略」——CI 矩阵里一个拼错的档位若被静默
+忽略，那个 job 会在满档下跑却显示为在测低档，即「测了个寂寞还报绿」）。
+
+**派发点切换**：`src/` + `include/` 的 18 处 `__builtin_cpu_supports` 与
+3 处 `__builtin_cpu_init` **归零**（`hw_crc32` / `bm25_kernels` / `int8_kernels` /
+`hnsw.cpp` / `vector_plugin.cpp` / `intersect.cpp` / `index.cpp`）。
+`bench/avx512_verify_bench.cpp` 等诊断 bench 暂留（默认不构建，S37-3.b 一并处理）。
+
+**验收——本届第一次真正的跨档对拍**：全套 **732/732** 在
+`scalar` / `sse42` / `avx2` / `avxvnni` 四档下**逐档全绿**（此前只有 avxvnni
+一条码路被执行过）。build-rel 双树零错误（三个公开头改动）；ASan 732/732。
+
+**仍未覆盖**：AVX-512 / AVX512-VNNI 两档——降档开关只能往下钳，覆盖它们必须
+有带 AVX-512 的机器（S37-7 的 CI 矩阵）。这是 3.b 搬内核时的**已知风险敞口**。
+
 ### S37-4 — MSVC 构建适配 🟡 MED（首个需要 Windows 环境的任务）
 
 1. **编译第一天必炸三项**：`/utf-8`（187 源文件中 **181 个含中文注释**，不给此项 MSVC
@@ -367,7 +412,8 @@ S37-7 (1.5周) ───── CI + 收尾
 | 面积实测 | ✅ 裸 POSIX 调用面已重新量准（`::open` 13 处而非 51，见本届总纲）|
 | S37-1 抽象层收编 | ✅ done（裸宿主原语归零；Debug/ASan 725/725 + 双树，见落地记录）|
 | S37-2 fork → exec-self | ✅ done（6 个 fork 点全转；`tests/` POSIX 头归零；Debug/ASan 725/725，见落地记录）|
-| S37-3 SIMD 分 ISA TU | ⬜ 未开始 |
+| S37-3.a cpu_features + 降档开关 | ✅ done（`__builtin_cpu_supports` 归零；四档 732/732 跨档对拍，见落地记录）|
+| S37-3.b 内核分 ISA TU | ⬜ 未开始 |
 | S37-4 MSVC 构建适配 | ⬜ 未开始（需 Windows 环境）|
 | S37-5 Windows I/O 后端 | ⬜ 未开始 |
 | S37-6 删除/映射生命周期 | ⬜ 未开始 |

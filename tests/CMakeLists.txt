@@ -38,6 +38,13 @@ target_link_libraries(bitcask_smoke_test PRIVATE
     bitcask_sanitizers
 )
 
+add_executable(bitcask_cpu_features_test cpu_features_test.cpp)
+target_link_libraries(bitcask_cpu_features_test PRIVATE
+    GTest::gtest_main
+    bitcask_simd
+    bitcask_warnings
+    bitcask_sanitizers
+)
 add_executable(bitcask_codec_test codec_test.cpp)
 target_link_libraries(bitcask_codec_test PRIVATE
     GTest::gtest_main
@@ -360,6 +367,7 @@ if(BITCASK_SANITIZE MATCHES "thread")
         "TSAN_OPTIONS=suppressions=${PROJECT_SOURCE_DIR}/cmake/tsan.supp:detect_deadlocks=1")
 endif()
 gtest_discover_tests(bitcask_smoke_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_cpu_features_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_codec_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_posix_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_file_lock_test ${_bitcask_test_props})

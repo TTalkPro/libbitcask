@@ -130,6 +130,18 @@ if(NOT TARGET bitcask_sanitizers)
 endif()
 
 # ---------------------------------------------------------------------------
+# bitcask_simd — 运行时 ISA 探测（CPUID/XGETBV）+ BITCASK_SIMD_MAX 档位钳制。
+#
+# S37-3：替代 __builtin_cpu_supports（MSVC 不支持）。刻意**不带任何 -m/-arch
+# 开关**——本 TU 只做探测，绝不能让编译器有权在此生成宽指令。
+# ---------------------------------------------------------------------------
+add_library(bitcask_simd STATIC
+    src/simd/cpu_features.cpp
+)
+target_include_directories(bitcask_simd PUBLIC include)
+target_link_libraries(bitcask_simd PRIVATE bitcask_warnings bitcask_sanitizers)
+
+# ---------------------------------------------------------------------------
 # bitcask_format — codec for data file / hint file records.
 # ---------------------------------------------------------------------------
 add_library(bitcask_format STATIC
@@ -141,8 +153,10 @@ target_include_directories(bitcask_format PUBLIC include)
 # 符号——而它经 index_manifest.hpp / field_schema.hpp / oki_run.hpp /
 # search_checkpoint.hpp 等公共头传播到几乎所有下游。由最低公共层 PUBLIC
 # 传递，避免逐个 target 补链接的打地鼠。无环：bitcask_io 不依赖 format。
+# S37-3：codec.cpp 同时包含 hw_crc32.hpp 与 int8_kernels.hpp，两者的派发都要
+# 用 bitcask_simd；与 bitcask_io 同理由 PUBLIC 向下游传播。
 target_link_libraries(bitcask_format
-    PUBLIC ZLIB::ZLIB bitcask_io
+    PUBLIC ZLIB::ZLIB bitcask_io bitcask_simd
     PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
