@@ -387,6 +387,18 @@ pwrite_once(FileHandle h, const void* buf, std::size_t len,
 // 若各站点继续直接调 std::rename，Windows 上第二次写入即全线失败。
 // Windows 实现须用 MoveFileExW(MOVEFILE_REPLACE_EXISTING |
 // MOVEFILE_WRITE_THROUGH)。
+//
+// ⚠️ **调用约束（S37-6 实测）：Windows 上目标只要还有任何打开的文件句柄，
+// 本函数必然失败（ERROR_ACCESS_DENIED）。** 逐项拆开量过：
+//   - 与共享模式无关——目标带 `FILE_SHARE_DELETE` 打开照样拦；
+//   - 与访问模式无关——只读（GENERIC_READ）也拦；
+//   - 与 MOVEFILE_WRITE_THROUGH 无关——只给 REPLACE_EXISTING 同样失败；
+//   - 与**映射**无关——只有映射、没有文件句柄时反而成功（见 MappedFile 注释）。
+// 即：**「写 tmp → rename 覆盖自己正在读的文件」的站点，必须先关掉自己对
+// 目标的句柄**（映射不用动）。POSIX 下这条限制不存在，故该错误只会在
+// Windows 上冒出来，且表现为原子写「返回 false」而非崩溃——很安静。
+// 现有站点均已核对：向量段 rebase 已改为建映射后立即关句柄；
+// field_schema 的 legacy 升级发生在长期句柄 `fp_` 打开**之前**。
 [[nodiscard]] bool atomic_rename(const std::string& from,
                                  const std::string& to) noexcept;
 
@@ -412,6 +424,24 @@ void sync_directory(const std::string& path) noexcept;
 // 只有**长期持有**的流需要用它。用完即关的读写（file_util 的 FilePtr、
 // AtomicFileWriter 的 tmp）继续用 std::fopen 即可——它们的持有窗口内不会
 // 有人来删该文件。
+//
+// ⚠️ **Windows CRT 边界约束：要求进程内所有模块共用同一份 CRT
+// （即全部 /MD，本项目的默认）。**
+//
+// 这不是本函数独有的——**本库的 C++ API 本就不是模块边界，只有 C API 是**。
+// `/MT` 下每个模块各带一份静态 CRT、各有一份自己的**堆与 fd 表**，于是：
+//   - `File::pread` 返回 `std::vector`：库这侧分配、调用方析构 → 跨堆 free；
+//   - 本函数在库这侧建 FILE*，而调用方（`field_schema.hpp` 是 header-only）
+//     用自己那份 CRT 的 fclose 去关；
+//   - `flush_and_sync_stream` 反过来——FILE* 由调用方的 CRT 建，传进来给
+//     本库的 `_fileno`/`_get_osfhandle` 用。
+// 后两者会拿到「别人 fd 表里的号」，触发 CRT 的 invalid-parameter handler →
+// `__fastfail`：**进程当场无声消失，退出码 0xC0000409，terminate/abort 钩子
+// 都不触发**，现场只剩一个退出码。
+// （该状态码名为 STACK_BUFFER_OVERRUN，与栈无关，只是 CRT 致命退出的统一出口。）
+//
+// 跨模块使用本库请走 C API（`c_api/bitcask_c.h`）。CMakeLists 在配置期检查
+// CRT 选择并给出告警。
 [[nodiscard]] std::FILE* open_stream(const std::string& path,
                                      const char* mode) noexcept;
 
