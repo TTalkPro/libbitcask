@@ -161,7 +161,8 @@ TEST(PosixFile, MoveCloses) {
     TempDir td;
     auto f = PosixFile::open(td.file("m.dat"), OpenFlag::kCreate);
     ASSERT_TRUE(f);
-    int fd = f->fd();
+    // S37-5：不能写死 int——Windows 上 FileHandle 是 HANDLE(void*)。
+    bitcask::io::FileHandle fd = f->fd();
     PosixFile g = std::move(*f);
     EXPECT_FALSE(f->is_open());
     EXPECT_EQ(g.fd(), fd);
@@ -172,4 +173,52 @@ TEST(PosixFile, SyncOnRegularFileIsOk) {
     auto f = PosixFile::open(td.file("y.dat"), OpenFlag::kCreate);
     ASSERT_TRUE(f);
     EXPECT_TRUE(f->sync());
+}
+
+// ---------------------------------------------------------------------------
+// S37-5：进程实例令牌（stale-lock 判定，设计稿 C4 / 风险 #2）
+//
+// 这组用例守的是「PID 复用误判」这一整个移植里最容易造成生产事故的单点：
+// 判错的后果是**拒绝回收有效的 stale lock → 库彻底打不开**，且只在
+// 「新进程恰好复用了崩溃进程的 PID」这一时序下复现——没有单测就只能等线上。
+//
+// 关键是**否定用例**：令牌不符时必须判死。若 process_alive(pid, token) 忽略
+// 了令牌参数（比如实现退化成只查 pid），全套 ctest 照样全绿，而守卫已然失效。
+// ---------------------------------------------------------------------------
+TEST(ProcessToken, SelfIsAliveWithMatchingToken) {
+    const int me = bitcask::io::current_process_id();
+    EXPECT_GT(me, 0);
+    const std::uint64_t tok = bitcask::io::process_start_token(me);
+
+    EXPECT_TRUE(bitcask::io::process_alive(me));
+    EXPECT_TRUE(bitcask::io::process_alive(me, tok));
+    // 令牌 0 = 「取不到 / 老锁文件」，须退化为纯 pid 判断（向后兼容）。
+    EXPECT_TRUE(bitcask::io::process_alive(me, 0));
+}
+
+TEST(ProcessToken, MismatchedTokenMeansDifferentProcessInstance) {
+    const int me = bitcask::io::current_process_id();
+    const std::uint64_t tok = bitcask::io::process_start_token(me);
+
+#if defined(_WIN32)
+    // Windows 必须给出令牌——它是这里唯一的判别手段。
+    ASSERT_NE(tok, 0u) << "Windows 上 process_start_token 必须可用，"
+                          "否则 PID 复用防护完全失效";
+    // 令牌不符 ⇒ 「同一 pid 的另一个进程实例」⇒ 原主人已死。
+    EXPECT_FALSE(bitcask::io::process_alive(me, tok ^ 1u))
+        << "令牌不符仍判活 ⇒ stale lock 永远回收不掉 ⇒ 库打不开";
+#else
+    // POSIX 侧刻意不提供令牌（见 io.hpp）：恒 0，且带令牌版与不带版等价，
+    // 保证本届对 Linux 行为零改动。
+    EXPECT_EQ(tok, 0u);
+    EXPECT_TRUE(bitcask::io::process_alive(me, 12345u));
+#endif
+}
+
+TEST(ProcessToken, DeadPidIsNotAlive) {
+    // pid <= 0 是「解析不出 pid」的哨兵，两平台都必须判死。
+    EXPECT_FALSE(bitcask::io::process_alive(0));
+    EXPECT_FALSE(bitcask::io::process_alive(-1));
+    EXPECT_FALSE(bitcask::io::process_alive(-1, 0));
+    EXPECT_EQ(bitcask::io::process_start_token(-1), 0u);
 }

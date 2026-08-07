@@ -24,7 +24,9 @@ FileLock::acquire(std::string_view filename, bool is_write_lock) noexcept {
 }
 
 void FileLock::release_quiet() noexcept {
-    if (fd_ >= 0) {
+    // S37-5：原为 `fd_ >= 0`——把 FileHandle 当成 int 的硬编码。Windows 下
+    // 该别名是 void*，此式不再可编译。统一走 io::handle_valid。
+    if (io::handle_valid(fd_)) {
         // 必须先 unlink 后 close：让仍持有 fd 的 reader 还能从老 inode 读到
         // 一致的内容；如果反过来先 close 后 unlink，新建同名锁文件的进程
         // 可能会被旧 reader 读出 garbage。这是 legacy lock_release 里的

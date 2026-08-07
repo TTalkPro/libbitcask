@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <limits>   // S37-5：parse_start_token 的溢出保护
 #include <thread>
 
 #include "bitcask/format.hpp"
@@ -78,6 +79,53 @@ parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
     return any_digit ? pid : -1;
 }
 
+// ---------------------------------------------------------------------------
+// S37-5（风险 #2）：锁文件的**第二行** = 进程实例令牌。
+//
+// 格式演进为：
+//     "<pid> <activefile>\n<start_token>\n"
+//                          ^^^^^^^^^^^^^ 本届新增
+//
+// **刻意加成第二行而不是扩到第一行**：现有两个解析器都只看首行——
+// parse_leading_pid 只读开头的连续数字，parse_active_file_id_from_lock
+// 把第一个空格到第一个 '\n' 之间整段当作路径。往第一行追加任何东西都会被
+// 当成路径的一部分（file_id 解析随之失效）；加第二行则对两者完全不可见，
+// 于是新旧锁文件双向兼容：旧库被新代码读到 → 令牌缺失（0）→ 退化为按 pid 判，
+// 与升级前行为一致；新库被旧代码读到 → 第二行被忽略。
+[[nodiscard]] std::uint64_t
+parse_start_token(std::span<const std::byte> bytes) noexcept {
+    std::size_t i = 0;
+    while (i < bytes.size() && static_cast<char>(bytes[i]) != '\n') ++i;
+    if (i == bytes.size()) return 0;  // 只有一行 → 无令牌
+    ++i;                              // 跳过换行
+    std::uint64_t tok = 0;
+    bool any_digit = false;
+    for (; i < bytes.size(); ++i) {
+        const char c = static_cast<char>(bytes[i]);
+        if (c < '0' || c > '9') break;
+        if (tok > (std::numeric_limits<std::uint64_t>::max() - 9) / 10) return 0;
+        tok = tok * 10 + static_cast<std::uint64_t>(c - '0');
+        any_digit = true;
+    }
+    return any_digit ? tok : 0;
+}
+
+// 组装锁文件内容。active_path 为空则只写 pid 行（active data file 还没建）。
+[[nodiscard]] std::string make_lock_payload(const std::string& active_path) {
+    const int pid = io::current_process_id();
+    std::string s = std::to_string(pid);
+    if (!active_path.empty()) {
+        s += ' ';
+        s += active_path;
+    }
+    s += '\n';
+    // 令牌行。POSIX 后端恒给 0，此时仍写出来（"0\n"）——让格式在两平台一致，
+    // 解析端把 0 当作「无令牌」处理。
+    s += std::to_string(io::process_start_token(pid));
+    s += '\n';
+    return s;
+}
+
 // 如果锁文件里记录的 pid 已死，尝试删掉它，让 caller 重试 O_EXCL acquire。
 //
 // 竞态窗口：从读 pid 到 unlink 之间，另一 writer 可能写了新 lock 而被误删；
@@ -89,11 +137,17 @@ parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
     auto data = rl->read_data();
     bool dead = false;
     if (data) {
-        const int pid = parse_leading_pid(
-            std::span<const std::byte>(data->data(), data->size()));
+        const std::span<const std::byte> payload(data->data(), data->size());
+        const int pid = parse_leading_pid(payload);
         // pid == -1 means "no parseable PID" (e.g. legacy hadn't written
         // it yet, or the writer crashed mid-write). Treat as stale.
-        if (pid == -1 || !io::process_alive(pid)) {
+        //
+        // S37-5：带令牌比对。令牌为 0（老锁文件 / POSIX）时 process_alive
+        // 退化为纯 pid 判断，与本届之前逐字一致。Windows 上它是唯一能挡住
+        // 「新进程复用了崩溃进程 PID → 有效 stale lock 永远回收不掉 →
+        // 库彻底打不开」的东西。
+        const std::uint64_t token = parse_start_token(payload);
+        if (pid == -1 || !io::process_alive(pid, token)) {
             dead = true;
         }
     } else {
@@ -122,7 +176,8 @@ acquire_writer_lock(const std::string& dirname) {
         }
         return std::unexpected(io_fault(fl.error().errnum, lock_path));
     }
-    const std::string pid_line = std::to_string(io::current_process_id()) + "\n";
+    // S37-5：pid 行 + 进程实例令牌行（见 make_lock_payload / parse_start_token）。
+    const std::string pid_line = make_lock_payload(/*active_path=*/"");
     auto pid_bytes = std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(pid_line.data()),
         pid_line.size());
@@ -312,7 +367,8 @@ std::expected<void, CaskFault> Cask::acquire_open_locks() {
         }
         return std::unexpected(io_fault(fl.error().errnum, lock_path));
     }
-    const std::string pid_line = std::to_string(io::current_process_id()) + "\n";
+    // S37-5：pid 行 + 进程实例令牌行（见 make_lock_payload / parse_start_token）。
+    const std::string pid_line = make_lock_payload(/*active_path=*/"");
     auto pid_bytes = std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(pid_line.data()),
         pid_line.size());
@@ -941,8 +997,8 @@ std::expected<void, CaskFault> Cask::ensure_active_writer() {
     // 通过读 write.lock 知道我们正在写哪个 file_id，从 needs_merge 候选里
     // 排除它。格式跟 legacy 一致："<pid> <active_data_path>\n"。
     if (write_lock_) {
-        const std::string line = std::to_string(io::current_process_id()) + " " +
-                                  data_path + "\n";
+        // S37-5：同上，第二行补进程实例令牌。
+        const std::string line = make_lock_payload(data_path);
         auto bytes = std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(line.data()), line.size());
         if (!write_lock_->write_data(bytes)) {  // best-effort：失败不阻断

@@ -120,12 +120,84 @@ int spawn_crash_child(std::string_view scenario, const std::string& dir) {
     const std::string arg_dir = std::string(kDirFlag) + dir;
 
 #if defined(_WIN32)
-    // S37-5 补齐：CreateProcessW + WaitForSingleObject + GetExitCodeProcess。
-    // 路径与参数须转 UTF-16；命令行需按 Windows 规则加引号转义。
-    (void)arg_scenario;
-    (void)arg_dir;
-    std::fprintf(stderr, "crash_child: Windows 后端待实现（S37-5）\n");
-    return -1;
+    // S37-5：CreateProcessW + WaitForSingleObject + GetExitCodeProcess。
+    //
+    // 与 POSIX 侧的关键差别：Windows 没有 argv 数组，只有**一整条命令行**，
+    // 由子进程自己按 CRT 规则再切分。所以三个参数必须逐个按那套规则加引号
+    // 转义（见 quote_arg）——目录路径含空格是常态（用户名带空格的
+    // %TEMP% 就是），不转义会被切成两个参数，子进程收到半截路径后
+    // 「打不开目录」而以别的退出码结束，测试报的将是一个与真因无关的断言。
+    auto wide = [](const std::string& s) -> std::wstring {
+        if (s.empty()) return std::wstring();
+        const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.data(),
+                                            static_cast<int>(s.size()),
+                                            nullptr, 0);
+        if (n <= 0) return std::wstring();
+        std::wstring w(static_cast<std::size_t>(n), L'\0');
+        ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                              w.data(), n);
+        return w;
+    };
+
+    // CRT 命令行切分规则的逆运算：包一层双引号；内部的 `"` 前加 `\`；
+    // 紧邻结尾引号的反斜杠串需要翻倍（否则会转义掉那个结尾引号）。
+    auto quote_arg = [](const std::wstring& a) -> std::wstring {
+        std::wstring out;
+        out.push_back(L'"');
+        std::size_t backslashes = 0;
+        for (wchar_t c : a) {
+            if (c == L'\\') {
+                ++backslashes;
+                continue;
+            }
+            if (c == L'"') {
+                out.append(backslashes * 2 + 1, L'\\');  // 翻倍 + 转义这个引号
+                backslashes = 0;
+            } else {
+                out.append(backslashes, L'\\');
+                backslashes = 0;
+            }
+            out.push_back(c);
+        }
+        out.append(backslashes * 2, L'\\');  // 结尾引号前的反斜杠须翻倍
+        out.push_back(L'"');
+        return out;
+    };
+
+    const std::wstring wexe = wide(executable_path());
+    if (wexe.empty()) {
+        std::fprintf(stderr, "crash_child: 可执行文件路径转 UTF-16 失败\n");
+        return -1;
+    }
+    std::wstring cmdline = quote_arg(wexe) + L' ' +
+                           quote_arg(wide(arg_scenario)) + L' ' +
+                           quote_arg(wide(arg_dir));
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    // lpCommandLine 必须可写（CreateProcessW 会就地改它），故传 data()。
+    if (!::CreateProcessW(wexe.c_str(), cmdline.data(), nullptr, nullptr,
+                          /*bInheritHandles=*/FALSE, 0, nullptr, nullptr,
+                          &si, &pi)) {
+        std::fprintf(stderr, "crash_child: CreateProcessW 失败（GetLastError=%lu）\n",
+                     static_cast<unsigned long>(::GetLastError()));
+        return -1;
+    }
+    ::CloseHandle(pi.hThread);
+    if (::WaitForSingleObject(pi.hProcess, INFINITE) != WAIT_OBJECT_0) {
+        ::CloseHandle(pi.hProcess);
+        return -1;
+    }
+    DWORD code = 0;
+    const BOOL got = ::GetExitCodeProcess(pi.hProcess, &code);
+    ::CloseHandle(pi.hProcess);
+    if (!got) return -1;
+    // 场景函数经 crash_exit(_Exit) 退出，退出码是我们自己给的小整数；
+    // 若子进程是被异常终止（如 0xC0000005），这里会拿到那个大值，
+    // 调用方的等值断言会失败——与 POSIX 侧 !WIFEXITED 返回 -2 的效果一致：
+    // 都表现为「不等于期望的退出码」，不会被误判成成功。
+    return static_cast<int>(code);
 #else
     // posix_spawn 而非 fork+exec：本改造的目的就是去掉 fork，用 fork 实现
     // 会把要消除的东西又请回来（且 fork 在多线程进程里本就危险——gtest

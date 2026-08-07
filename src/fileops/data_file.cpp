@@ -447,8 +447,23 @@ std::string mk_hint_filename(std::string_view data_path) {
 
 std::optional<std::uint64_t>
 parse_data_tstamp(std::string_view filename) noexcept {
-    // 去掉目录前缀；没斜杠就当 basename 用。
-    auto slash = filename.find_last_of('/');
+    // 去掉目录前缀；没分隔符就当 basename 用。
+    //
+    // S37-5：分隔符集合按平台取，等价于 std::filesystem::path::filename()
+    // 的判定（此处不用它是因为本函数 noexcept，而构造 path 会分配、可能抛）。
+    // **原先只认 '/'**：Windows 上 scanner 交出的是 `C:\dir\42.bitcask.data`，
+    // 剥不掉目录 → base 变成 `C:\dir\42` → 数字校验失败 → 返回 nullopt。
+    // 后果是 merger.cpp:292 把**每一个**输入文件都判为「不是 data 文件」而跳过，
+    // merge 于是「成功」但 records_kept 恒为 0——不报错、不崩，只是从来没干活。
+    // 首轮 ctest 里 12 个 merge 相关用例全挂在这一处。
+    // Linux 侧分隔符集合仍只有 '/'（'\' 在 POSIX 是合法文件名字符，
+    // 不能一并当分隔符），行为逐字不变。
+#if defined(_WIN32)
+    constexpr std::string_view kSeps = "/\\";
+#else
+    constexpr std::string_view kSeps = "/";
+#endif
+    auto slash = filename.find_last_of(kSeps);
     std::string_view base =
         (slash == std::string_view::npos) ? filename : filename.substr(slash + 1);
 

@@ -48,11 +48,26 @@ namespace bitcask::io {
 // 路径把句柄穿过多层 helper，包成 RAII 对象的收益不抵改动风险，故本层
 // 同时提供句柄级自由函数（见下）。
 // ---------------------------------------------------------------------------
-using FileHandle = int;
+// S37-5：Windows 后端落地，typedef 按平台分叉。
+//
+// **哨兵值刻意选 nullptr 而非 INVALID_HANDLE_VALUE**：后者是
+// `(HANDLE)(LONG_PTR)-1`，需要 reinterpret_cast，无法出现在 constexpr 里
+// （本常量与 handle_valid 都是 constexpr，65 处调用站点依赖之）。
+// win32_file.cpp 在边界处把 CreateFileW 的 INVALID_HANDLE_VALUE 归一成
+// nullptr——「无效句柄只有一种表示」在库内是硬约定，比多一种哨兵更不易错。
+#if defined(_WIN32)
+using FileHandle = void*;  // Win32 HANDLE
+inline constexpr FileHandle kInvalidHandle = nullptr;
+[[nodiscard]] constexpr bool handle_valid(FileHandle h) noexcept {
+    return h != nullptr;
+}
+#else
+using FileHandle = int;  // POSIX fd
 inline constexpr FileHandle kInvalidHandle = -1;
 [[nodiscard]] constexpr bool handle_valid(FileHandle h) noexcept {
     return h >= 0;
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // 文件身份——「这个路径还是不是我上次写的那个文件」。
@@ -270,7 +285,9 @@ public:
     // （valid() == false，caller 走 pread 回退——与各站点既有降级一致）。
     // advise_random：建立后 madvise(MADV_RANDOM)（随机点查负载防内核
     // 预读浪费——data_file get 热路径 / 向量 payload 的既有纪律）。
-    [[nodiscard]] static MappedFile map_readonly(int fd, std::size_t len,
+    // S37-5：形参由裸 int 改 FileHandle（Windows 上 int 装不下 HANDLE）。
+    // Linux 上 FileHandle 就是 int，签名逐字不变。
+    [[nodiscard]] static MappedFile map_readonly(FileHandle fd, std::size_t len,
                                                  bool advise_random) noexcept;
 
     [[nodiscard]] bool valid() const noexcept { return base_ != nullptr; }
@@ -394,13 +411,32 @@ void prefetch_range(const void* addr, std::size_t len) noexcept;
 
 // 探测 pid 对应的进程是否还活着。**保守偏向「活着」**——无权查询等不确定
 // 情形一律返回 true，避免误删他人持有的有效锁。
-//
-// ⚠️ Windows 移植的风险点 #2（设计稿 C4）：**Windows 的 PID 复用远快于
-// Linux**（内核主动复用小号 PID）。仅凭 pid 存活判断会把「新进程恰好复用了
-// 崩溃进程的 PID」误判为锁仍有效 → 拒绝回收 stale lock → **库彻底打不开**。
-// Windows 后端须在锁文件里同时记录进程创建时间（GetProcessTimes 的
-// ftCreationTime）双重比对；本函数签名届时需相应扩展。
 [[nodiscard]] bool process_alive(int pid) noexcept;
+
+// ---------------------------------------------------------------------------
+// 进程实例令牌（S37-5，设计稿 C4 / 风险 #2）
+//
+// **问题**：仅凭 pid 判存活，在 PID 被复用后会把「另一个进程」误认成「锁的
+// 原主人还活着」，于是拒绝回收 stale lock —— 库彻底打不开，且只在特定时序
+// 复现。Windows 上这不是理论风险：内核主动复用小号 PID，一个崩溃后立刻重启
+// 的服务极易撞上自己上一次的 PID。
+//
+// **解法**：锁文件除 pid 外再记一个「进程实例令牌」，回收前双重比对。
+// 令牌只需满足「同一 pid 的不同进程实例，取值几乎必然不同」。
+//   Windows：GetProcessTimes 的 ftCreationTime（100ns 精度的创建时刻）。
+//   POSIX  ：返回 0（无令牌）——见下。
+//
+// 令牌为 0 表示「取不到」，此时 process_alive(pid, 0) 退化为 process_alive(pid)，
+// 与本函数引入前的行为逐字一致。POSIX 后端恒返回 0 是**刻意**的：Linux 的
+// pid 是顺序分配、绕 pid_max 才回卷，复用间隔以万计，仅按 pid 判断是本库
+// 长期以来的既有行为；改成读 /proc/<pid>/stat 的 starttime 会把一条
+// 「本届不涉及、且无法在 Windows 上验证」的行为变更塞进移植里。
+// ---------------------------------------------------------------------------
+[[nodiscard]] std::uint64_t process_start_token(int pid) noexcept;
+
+// 带令牌的存活探测：pid 存活 **且** 令牌吻合才算「原主人还活着」。
+// expect_token == 0（老锁文件 / 取不到令牌）→ 退化为 process_alive(pid)。
+[[nodiscard]] bool process_alive(int pid, std::uint64_t expect_token) noexcept;
 
 // 进程可同时打开的文件数上限（POSIX: RLIMIT_NOFILE 软上限）。
 // 取不到（含 RLIM_INFINITY）时返回 nullopt，由调用方给保守兜底。

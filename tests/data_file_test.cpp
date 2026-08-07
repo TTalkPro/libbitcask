@@ -106,7 +106,11 @@ TEST(Filename, MkAndParse) {
     using bitcask::fileops::mk_hint_filename;
     using bitcask::fileops::parse_data_tstamp;
 
-    EXPECT_EQ(mk_data_filename("/tmp/foo", 12345), "/tmp/foo/12345.bitcask.data");
+    // S37-5：mk_data_filename 走 fs::path 拼接，分隔符是**平台原生**的
+    // （Windows 上是 '\'）。期望值按同样方式构造——本用例要守的是
+    // 「<tstamp>.bitcask.data 这个文件名怎么拼」，不是分隔符长什么样。
+    EXPECT_EQ(mk_data_filename("/tmp/foo", 12345),
+              (std::filesystem::path("/tmp/foo") / "12345.bitcask.data").string());
     EXPECT_EQ(mk_hint_filename("/tmp/foo/12345.bitcask.data"),
               "/tmp/foo/12345.bitcask.hint");
 

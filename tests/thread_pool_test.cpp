@@ -11,6 +11,14 @@
 #include <variant>
 #include <vector>
 
+#if defined(_WIN32)
+// S37-5：count_os_threads 的 Windows 实现需要 Toolhelp 快照。
+// 本文件是测试，不受「windows.h 只准进移植层 TU」那条约束的约束——
+// 那条针对的是产品代码的公开/内部头，测试 TU 自成一体。
+#  include <windows.h>
+#  include <tlhelp32.h>
+#endif
+
 
 #include <gtest/gtest.h>
 
@@ -550,10 +558,38 @@ TEST(IndexPool, RunFnCarriesOrdAndExecutesInReducer) {
 // ===== S6-P3: 多 lib 共享池（AT5）=====
 
 // 统计当前进程 OS 线程数。**Linux 专用**——读 /proc/self/task 的目录项。
-// S37-2：改用 std::filesystem 枚举（去掉 <dirent.h>），但 /proc 本身没有
-// Windows 对应物：S37-5 时需换 CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)
-// 按 owner pid 过滤，或把依赖它的 AT5 用例整体标记为 Linux-only。
-// 目录不存在（非 Linux）时返回 0，调用方据此跳过。
+// S37-2：改用 std::filesystem 枚举（去掉 <dirent.h>）。
+// S37-5（遗留项 W3 结清）：/proc 无 Windows 对应物——原实现在非 Linux 上恒
+// 返回 0，而调用方断言的是**差值**（after_first - before == 2），0-0=0 直接
+// 失败。这里补 Windows 实现而不是把用例标成 Linux-only：AT5 守的是「线程数
+// 与库数解耦」这条结构性保证，它与平台无关，在 Windows 上同样值得守。
+#if defined(_WIN32)
+static int count_os_threads() {
+    // Windows 没有「本进程的线程列表」这种轻量接口：TH32CS_SNAPTHREAD 拍的是
+    // **全系统**线程快照，得自己按 owner pid 过滤。调用不便宜，但本用例只调
+    // 三次。
+    const DWORD me = ::GetCurrentProcessId();
+    const HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    int n = 0;
+    if (::Thread32First(snap, &te)) {
+        do {
+            // dwSize 是这套老 API 的兼容字段：只有当它大到覆盖了
+            // th32OwnerProcessID 时该字段才有效（文档明载的坑）。
+            if (te.dwSize >= FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) +
+                                 sizeof(te.th32OwnerProcessID) &&
+                te.th32OwnerProcessID == me) {
+                ++n;
+            }
+            te.dwSize = sizeof(te);  // Thread32Next 每次都要重置
+        } while (::Thread32Next(snap, &te));
+    }
+    ::CloseHandle(snap);
+    return n;
+}
+#else
 static int count_os_threads() {
     std::error_code ec;
     const std::filesystem::path task_dir{"/proc/self/task"};
@@ -564,6 +600,7 @@ static int count_os_threads() {
     }
     return ec ? 0 : n;
 }
+#endif
 
 // AT5-a：线程数与库数解耦（G2）。注册第 1 个 lib 惰性启动 dispatcher+reducer
 // 两个线程；之后注册任意多 lib 都不再起新线程。不提交任务（避免 TBB 懒起

@@ -71,9 +71,9 @@ IvfSegment::~IvfSegment() { close(); }
 void IvfSegment::close() {
     map_.reset();  // B3：RAII munmap
     base_ = nullptr;
-    if (fd_ >= 0) {
+    if (io::handle_valid(fd_)) {  // S37-5：原 `>= 0` 把 FileHandle 当 int
         io::close_handle(fd_);
-        fd_ = -1;
+        fd_ = io::kInvalidHandle;
     }
     centroids_ = nullptr;
     cidx_      = nullptr;

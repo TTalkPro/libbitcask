@@ -220,16 +220,16 @@ HnswIndex::~HnswIndex() {
     // close fd 前 munmap 防止其他进程拿同一文件 mmap 时 kernel 行为未定义。
     vecs_map_.reset();  // B3：RAII munmap
     vecs_mmap_base_ = nullptr;
-    if (vecs_payload_fd_ >= 0) {
+    if (io::handle_valid(vecs_payload_fd_)) {  // S37-5：原 `>= 0` 把 FileHandle 当 int
         io::close_handle(vecs_payload_fd_);
-        vecs_payload_fd_ = -1;
+        vecs_payload_fd_ = io::kInvalidHandle;
     }
     // S32-M2:qc8 mmap 同序释放。
     qc_map_.reset();
     qc_mmap_recs_ = nullptr;
-    if (qc_payload_fd_ >= 0) {
+    if (io::handle_valid(qc_payload_fd_)) {  // S37-5：原 `>= 0` 把 FileHandle 当 int
         io::close_handle(qc_payload_fd_);
-        qc_payload_fd_ = -1;
+        qc_payload_fd_ = io::kInvalidHandle;
     }
     for (auto& slot : chunks_) {
         delete slot.load(std::memory_order_relaxed);
@@ -1479,9 +1479,9 @@ bool HnswIndex::load_qc_payload(std::string_view path) {
     qc_map_.reset();  // B3：RAII munmap
     qc_mmap_recs_ = nullptr;
     qc_checkpoint_count_ = 0;
-    if (qc_payload_fd_ >= 0) {
+    if (io::handle_valid(qc_payload_fd_)) {  // S37-5：原 `>= 0` 把 FileHandle 当 int
         io::close_handle(qc_payload_fd_);
-        qc_payload_fd_ = -1;
+        qc_payload_fd_ = io::kInvalidHandle;
     }
 
     const auto fh = io::open_handle(
@@ -1671,9 +1671,9 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
     // 已持有 mmap 时先拆——契约要求 load 前为空(load 由 open 期单线程串入)。
     vecs_map_.reset();  // B3：RAII munmap
     vecs_mmap_base_ = nullptr;
-    if (vecs_payload_fd_ >= 0) {
+    if (io::handle_valid(vecs_payload_fd_)) {  // S37-5：原 `>= 0` 把 FileHandle 当 int
         io::close_handle(vecs_payload_fd_);
-        vecs_payload_fd_ = -1;
+        vecs_payload_fd_ = io::kInvalidHandle;
     }
 
     std::uint8_t hdr[kBcvpHeaderSize];

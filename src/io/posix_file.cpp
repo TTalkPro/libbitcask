@@ -243,10 +243,10 @@ MappedFile& MappedFile::operator=(MappedFile&& o) noexcept {
     return *this;
 }
 
-MappedFile MappedFile::map_readonly(int fd, std::size_t len,
+MappedFile MappedFile::map_readonly(FileHandle fd, std::size_t len,
                                     bool advise_random) noexcept {
     MappedFile m;
-    if (fd < 0 || len == 0) return m;
+    if (!handle_valid(fd) || len == 0) return m;
     void* base = ::mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) return m;  // 无效对象——caller 走 pread 回退
     if (advise_random) {
@@ -391,6 +391,17 @@ bool process_alive(int pid) noexcept {
     if (pid <= 0) return false;
     if (::kill(pid, 0) == 0) return true;
     return errno != ESRCH;
+}
+
+// S37-5：POSIX 侧不提供进程实例令牌，恒返回 0 ——理由见 io.hpp 的长注释
+// （Linux pid 顺序分配、绕 pid_max 才回卷，仅按 pid 判断是本库长期既有行为；
+// 引入 /proc/<pid>/stat 的 starttime 属本届不涉及的行为变更）。
+// 于是 process_alive(pid, token) 在 POSIX 上恒等于 process_alive(pid)，
+// Linux 行为逐字不变。
+std::uint64_t process_start_token(int /*pid*/) noexcept { return 0; }
+
+bool process_alive(int pid, std::uint64_t /*expect_token*/) noexcept {
+    return process_alive(pid);
 }
 
 std::optional<std::uint64_t> max_open_files() noexcept {

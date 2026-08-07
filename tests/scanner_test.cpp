@@ -134,6 +134,8 @@ TEST(Scanner, FullPathInDataFileEntry) {
     auto r = scan_dir(td.path());
     ASSERT_TRUE(r);
     ASSERT_EQ(r->size(), 1u);
-    EXPECT_EQ((*r)[0].data_path, td.path() + "/42.bitcask.data");
-    EXPECT_EQ((*r)[0].hint_path, td.path() + "/42.bitcask.hint");
+    // S37-5：scanner 交出的是 fs::directory_entry::path().string()，
+    // 分隔符为平台原生（Windows 上是 '\'）。期望值按同样方式构造。
+    EXPECT_EQ((*r)[0].data_path, (fs::path(td.path()) / "42.bitcask.data").string());
+    EXPECT_EQ((*r)[0].hint_path, (fs::path(td.path()) / "42.bitcask.hint").string());
 }

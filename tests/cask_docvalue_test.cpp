@@ -362,6 +362,17 @@ TEST_F(CaskDocValueTest, StatusExFieldsAndHnswParamPassthrough) {
 
 // S13-D7：日志回调——用「keydir 快照保存失败」（目录只读）确定性触发 warn。
 TEST_F(CaskDocValueTest, LogHookFiresOnSnapshotFailure) {
+#if defined(_WIN32)
+    // S37-5：跳过的是**故障注入手段**，不是被测行为。
+    // std::filesystem::permissions 在 Windows 上只能翻转 FILE_ATTRIBUTE_READONLY，
+    // 而该属性对**目录**只影响 shell 的自定义图标等，完全不阻止在其中创建文件
+    // ——于是快照照常保存成功、没有 warn，断言失败。真要在 Windows 上确定性
+    // 地制造「建不出临时文件」，得改用 ACL（DENY FILE_ADD_FILE）或换一种注入
+    // 点；那是独立于本用例意图的工作，不在 S37-5 范围。
+    // 日志回调本身的行为由 Linux 侧同一用例守护。
+    GTEST_SKIP() << "只读目录这一故障注入手段在 Windows 上不成立（目录的 "
+                    "READONLY 属性不阻止建文件）——见用例内注释";
+#endif
     std::vector<std::string> logs;
     std::mutex logs_mu;
 

@@ -145,6 +145,23 @@ if(BITCASK_BUNDLED_TBB)
     endif()
     add_subdirectory(third_party/oneTBB EXCLUDE_FROM_ALL)
     set(CMAKE_CXX_FLAGS "${_bitcask_saved_cxx_flags}")
+    # S37-5：oneTBB 把自己的产物放进 <build>/msvc_<ver>_cxx23_64_md_<cfg>/，
+    # 覆盖了上面给 WIN32 设的 CMAKE_RUNTIME_OUTPUT_DIRECTORY。Windows 没有
+    # RPATH，tbb12.dll 不与 exe 同目录就加载不到——**而且失败点在构建期**：
+    # gtest_discover_tests 会运行每个测试 exe 去枚举用例，exe 起不来直接
+    # 让构建失败（报「Error running test executable」，与 DLL 缺失毫无字面关联）。
+    # 逐目标把运行时产物拉回 bin/；per-config 变体一并设，多配置生成器下
+    # 只有它们生效。
+    foreach(_tbb_t tbb tbbmalloc tbbmalloc_proxy)
+        if(TARGET ${_tbb_t})
+            set_target_properties(${_tbb_t} PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY                "${CMAKE_BINARY_DIR}/bin"
+                RUNTIME_OUTPUT_DIRECTORY_DEBUG          "${CMAKE_BINARY_DIR}/bin"
+                RUNTIME_OUTPUT_DIRECTORY_RELEASE        "${CMAKE_BINARY_DIR}/bin"
+                RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/bin"
+                RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL     "${CMAKE_BINARY_DIR}/bin")
+        endif()
+    endforeach()
     message(STATUS "libbitcask: bundled oneTBB from third_party/oneTBB (${_bitcask_bundled_tbb_why})")
 else()
     find_package(TBB REQUIRED)

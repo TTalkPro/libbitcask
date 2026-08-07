@@ -512,6 +512,109 @@ C4244 ×32、C4100 ×1、C4456 ×1。**设计稿点名会刷屏的 C4267 实际�
 - **工作量**：2.5-3 周
 - **验收**：ctest 全绿（除已知 Windows 语义差异项）；crash 注入用例通过
 
+#### ✅ S37-5 落地记录（2026-08-07）
+
+**结果：`bitcask.dll` 产出，49 个 exe 全部链接通过，ctest 733 个用例 724 通过
+（99%）。剩余 9 个失败全部落在 S37-6 的映射/删除生命周期，无一例外。**
+崩溃注入 6 个场景在 Windows 上全绿。
+
+**`FileHandle` 在 Windows 上改 `void*`（HANDLE）**——S37-1 头注释写明的设计意图。
+备选是用 CRT 的 `_open_osfhandle` 把 HANDLE 包成 `int` fd（调用站点零改动），
+否决理由：CRT fd 表有 8192 硬上限、全局锁、且「CRT fd + HANDLE 双重所有权」
+是经典 double-close 温床，而本库要把大量 sealed 段句柄挂在 read-handle LRU 上。
+**哨兵值选 `nullptr` 而非 `INVALID_HANDLE_VALUE`**：后者需 `reinterpret_cast`，
+进不了 constexpr（`kInvalidHandle` 与 `handle_valid` 都是 constexpr，65 处依赖）；
+归一在 `win32_file.cpp` 边界完成，出了那个文件只有一种无效表示。
+连带修掉 7 处把 `FileHandle` 当 `int` 的硬编码（`fd_ >= 0` / `int fd_ = -1`），
+其中 `file_lock.cpp` 那处在 Linux 上一直是对的、只是不该那么写。
+
+**两处会静默出错、必须逐站点核对才能发现的语义**：
+
+1. **`File::write()` 恒为「原子追加到 EOF」，不走文件指针。**
+   Windows 同步句柄上带 `OVERLAPPED` 的定位读**会移动文件指针**（POSIX 的
+   pread 不会）。而 `HintFile` 恰恰把顺序 `write()`（hint_file.cpp:50）与定位
+   `pread`（112/129/179/189/206/230）**交错**用在同一个 `File` 上——直译成普通
+   `WriteFile` 的话，一次 pread 就让随后的追加变成**从上次读到的位置覆盖**。
+   编译通过、写入「成功」，只有 hint 内容被悄悄写坏。改用
+   `OVERLAPPED.Offset/OffsetHigh` 全 1 的原子追加惯用法，与 O_APPEND 逐条对应
+   且完全不受指针状态影响。（核查过：`File::write()` 全库仅此一个调用点，
+   `File::read()` 零调用点。）
+2. **`truncate(len)` 用 `SetFileInformationByHandle(FileEndOfFileInfo)`**
+   而非 `SetFilePointerEx + SetEndOfFile`——后者以文件指针为截断点，会把
+   io.hpp 明写「不依赖 fd 当前 offset，故线程安全」的 `truncate` 变成有状态操作。
+   `truncate_here()` 则**刻意**用 SetEndOfFile（语义就是「截到指针处」）。
+
+**首轮 ctest 35 个失败 → 9 个，三处修复**（按贡献排序）：
+
+| 修复 | 修好 | 性质 |
+|---|---|---|
+| `parse_data_tstamp` 的分隔符 | ~12 | **产品 bug** |
+| crash_child 的 `CreateProcessW` | 6 | S37-2 留位补齐 |
+| 测试里的 POSIX 假设 | ~5 | 测试可移植性 |
+
+**最值得记住的：`parse_data_tstamp` 只认 `/`，导致 merge「成功但从不干活」**
+它用 `find_last_of('/')` 剥目录前缀，而 `merger.cpp:292` 传的是**完整路径**。
+Windows 上剥不掉 → base 成了 `C:\dir\42` → 数字校验失败 → 返回 nullopt →
+**每一个输入文件都被判为「不是 data 文件」而跳过**。merge 于是返回成功、
+不报错、不崩，只是 `records_kept` 恒为 0。12 个 merge 相关用例全挂在这一处。
+修法是按平台取分隔符集合（Linux 仍只有 `/`——`\` 在 POSIX 是合法文件名字符，
+不能一并当分隔符），等价于 `fs::path::filename()` 但保持 noexcept 且不分配。
+
+**⚠️ PID 复用加固（风险 #2）——新增的单测当场揪出一个会静默损坏数据的 bug**
+
+锁文件格式扩为**两行**：
+```
+<pid> <activefile>\n
+<start_token>\n        ← 本届新增：进程实例令牌
+```
+加第二行而非扩第一行是**刻意**的：现有两个 parser（`parse_leading_pid` 只读
+开头连续数字、`parse_active_file_id_from_lock` 取首个空格到首个 `\n`）对第二行
+完全不可见，于是新旧锁文件双向兼容。Windows 令牌 = `GetProcessTimes` 的
+`ftCreationTime`；**POSIX 恒返回 0**（令牌为 0 时 `process_alive(pid, 0)` 退化为
+`process_alive(pid)`），因此 **Linux 行为逐字不变**——不引入 `/proc/<pid>/stat`
+的 starttime，那是本届不涉及、也无法在 Windows 上验证的行为变更。
+
+写完实现后加的 `ProcessToken` 三个用例立刻炸出：**`process_alive()` 对当前
+存活进程返回 `false`**。根因是 `WaitForSingleObject` 需要 `SYNCHRONIZE` 权限，
+而 `PROCESS_QUERY_LIMITED_INFORMATION` **不含**它 → 返回 `WAIT_FAILED` 而非
+`WAIT_TIMEOUT`。后果是**每一把写锁都被判为 stale 并删掉 → 两个 writer 能同时
+持锁写同一个库**。同时把「只有明确 signaled 才判死」定成不变量，让
+`WAIT_FAILED` 一类意外落到保守判活那侧。
+
+> **`grep kWriteLocked tests/` 全库零命中**——写锁竞争路径此前完全没有测试覆盖。
+> 这个 bug 走完全套 733 个用例照样全绿。`ProcessToken` 那组用例的价值全在
+> **否定断言**（令牌不符必须判死）：若实现退化成只查 pid，肯定断言依然通过。
+> 建议 S37-7 补一个真正的「两进程争锁」用例。
+
+**Windows 后端与 POSIX 的语义差异总表**（均在 `win32_file.cpp` 对应函数处展开）：
+| # | 差异 | 处置 |
+|---|---|---|
+| 1 | `File::write()` 恒追加 | 见上；全部调用点本就以追加模式开档 |
+| 2 | 定位读写会移动文件指针 | 见上；已逐站点核对 |
+| 3 | `sync_directory` 是 no-op | 持久性改由 `MOVEFILE_WRITE_THROUGH` 承担 |
+| 4 | `FileMode`(0600/0644) 被忽略 | Windows 靠 ACL 继承 |
+| 5 | `kCloseOnExec` 是 no-op | Windows 句柄默认不被继承（W1 在此平台不成立）|
+| 6 | `max_open_files` 返回 nullopt | 句柄不受 fd 表约束；调用方兜底 1024 |
+| 7 | `advise_random` 被忽略 | 见下「刻意没做」 |
+| 8 | `kOSync`/`kSyncAll` 合并 | 都是 `FILE_FLAG_WRITE_THROUGH`；S13-P2 的 dsync 优化在此平台不存在 |
+
+**刻意没做的两项（附理由，避免被当成遗漏）**：
+- **`FILE_FLAG_RANDOM_ACCESS`**：设计稿 C7 建议把 `MADV_RANDOM` 的时机前移到
+  开文件时。实测 6 个 `map_readonly` 调用点里 **3 个传 `false`**（segment_v2 /
+  diskann / ivf_rq 是顺序访问），在 `kReadOnly` 上一刀切会关掉顺序路径的预读。
+  该提示只影响预读启发、不涉正确性。若 bench 显示有收益，应做成 `OpenFlag`
+  位由调用方指定。
+- **每线程句柄池（C3 / 风险 #3）**：同步句柄上的 I/O 被内核在文件对象上串行化，
+  即多线程并发 pread 同一句柄不会真正并行。**这正是「测试全绿、只有 bench 掉」
+  的那一项**，本次未做——它要与 read-handle LRU 预算合并考虑，属独立工作。
+
+**已知缺口**：窄路径一律按 **UTF-8** 解读（`MB_ERR_INVALID_CHARS` 严格拒非法
+序列，不退回 ANSI 猜测——「同一个 char* 可能是两种编码」会让「打开了错误的
+文件」无法定位）。但库内多处经 `fs::path::string()` 产出窄路径，它在 Windows 上
+走**系统 ANSI 代码页**。纯 ASCII 路径两者一致（现有全部测试与典型部署），
+**非 ASCII 路径会被判为非法 UTF-8 而报 EINVAL**。彻底修复要把那些站点换成
+`u8string()`，见下方遗留 W4。
+
 ### S37-6 — 删除/映射生命周期 🔴 HIGH（**唯一架构改动**）
 
 Windows 下：① 所有 `CreateFile` 须带 `FILE_SHARE_DELETE`，否则删除报
@@ -531,6 +634,34 @@ Windows 下：① 所有 `CreateFile` 须带 `FILE_SHARE_DELETE`，否则删除�
 
 - **工作量**：1-1.5 周
 - **验收**：Windows 上 merge 后退休队列能排空（长跑测试）；Linux 侧行为零变化 + TSan 全绿
+
+#### 🎯 S37-6 的工作面已由 S37-5 的 ctest 量准（9 个失败，2026-08-07）
+
+| 失败用例 | 卡在哪 |
+|---|---|
+| `DiskannPlugin.RebaseDropsDeadPhysically` / `RebaseMinDocsWindow` | `IvfSegment/DiskannSegment::build` 写 tmp 后 `atomic_rename` 覆盖旧段文件，而**旧段文件正被 `MappedFile` 持有**——被 section 映射的文件在 Windows 上既删不掉也覆盖不了 |
+| `IvfPlugin.RebaseDropsDeadPhysically` / `RebaseMinDocsWindow` | 同上 |
+| `CaskDocValueTest.BackupHotCopyAndReopen` | `(*b)->close()` 后 `remove_all(dir)` 仍失败。已核实 `Cask::close()` **确实**清了 `read_files_` 与 `active_data_`，残留的是**搜索/向量插件持有的 mmap**（Cask 对象尚未析构）|
+| `CaskDocValueTest.MigrateHintOrdV4EraDirOpensAndReads` | 同上 |
+| `SearcherFacade.MatchesCaskFacade` | 同上 |
+| `InvertedIndex.V5BlockMinDlTrackedAndPersisted` | `remove(*.snap)` 被占用 |
+| `FieldSchema.InternDeterministicAndReverseLookup` | **第二类占用源**：`field_schema.hpp:105` 长期持有一个 CRT `std::fopen(path,"ab")` 句柄，而 **MSVC 的 fopen 不带 `FILE_SHARE_DELETE`**（CRT 用 `_SH_DENYNO` = SHARE_READ\|SHARE_WRITE），文件因此删不掉 |
+
+**两条结论直接影响 S37-6 的设计**：
+
+1. **占用源有两类，不只是 mmap。** 设计稿 C2 只点了 section 映射；实测还有
+   **CRT stdio 句柄**——任何走 `std::fopen`/`ofstream` 且长期持有的文件都删不掉，
+   因为 CRT 不给 `FILE_SHARE_DELETE`（也没有开关能要）。第一方长期持有的目前
+   只有 `field_schema`，但 `AtomicFileWriter` / `segment.hpp:525` /
+   `search_checkpoint.hpp:233` / `index_manifest.hpp:169` 同属该形态，需逐个确认
+   生命周期。**建议给 io seam 补一个 `open_stream(path, mode)`**：POSIX 直接
+   `std::fopen`，Windows 走 `CreateFileW`(带 SHARE_DELETE) + `_open_osfhandle` +
+   `_fdopen`，把 `std::FILE*` 这条通路也纳入统一的共享策略。
+2. **`remove_all(目录)` 与 POSIX 语义有本质差别。** 即使所有句柄都带
+   `FILE_SHARE_DELETE`，被删的文件在最后一个句柄关闭前只是 *delete-pending*、
+   **仍留在目录里**，于是父目录删不掉。POSIX 的 `rm -rf` 没有这个问题。
+   即：Windows 上「关掉 Cask 才能删目录」是硬要求，`close()` 必须真正放掉
+   **全部**映射与句柄（含插件侧），而不只是 KV 侧的 `read_files_`。
 
 ### S37-7 — CI + 收尾 🟡 MED
 
@@ -585,8 +716,9 @@ S37-7 (1.5周) ───── CI + 收尾
 | T8 | 搜索读屏障无界等待（`prepare_search` 饥饿）| ⏸ 4 项前置未满足（原文 62789cd）|
 | T12 | HNSW ckpt 去重（~115 行）| ⏸ 默认不做（注释同步已替代）|
 | **W1** | `File::open` 默认**不设 `O_CLOEXEC`** | 🔍 S37-1 期间发现：11 处裸 `::open` 全部显式带 `O_CLOEXEC`（收编后由 `kCloseOnExec` 原样保留），而走 `io::File` 的核心 KV 路径（data/hint/oki run/write.lock）**没有** —— fork+exec 场景下 data file fd 泄漏进子进程。现有 fork 测试只 fork 不 exec 故未暴露，**S37-2 改 exec-self 后会变成真实暴露面**。收编时未擅自统一（那是行为变化，超出「零行为变化」约束）。**待评估**：给核心路径补 `kCloseOnExec`。Windows 侧句柄默认不继承，无对应问题 |
+| **W4** | 窄路径的编码约定 | 🔍 S37-5 引入：Windows 后端把窄路径**一律按 UTF-8** 解读（严格拒非法序列，不退回 ANSI 猜测）。但库内多处经 `fs::path::string()` 产出窄路径，它在 Windows 上走**系统 ANSI 代码页**。纯 ASCII 两者一致（现有全部测试与典型部署），**非 ASCII 路径会报 EINVAL**。修法是把这些站点换成 `u8string()` 并统一「窄路径 = UTF-8」这条库级约定；面积需先量（S37-4 期间已新增 8 处 `.string()`）。Linux 侧 `string()`/`u8string()` 等价，无影响 |
 | **W2** | `bitcask_format` → `bitcask_io` 的 PUBLIC 依赖 | 🔍 S37-1 引入（见落地记录）。当前无环且必要，但「记录 codec 层依赖 I/O 层」是轻微的分层异味。若 S37-4 把 13 个 STATIC 改 OBJECT 库，可顺带复核是否有更干净的归置 |
-| **W3** | `count_os_threads()` 读 `/proc/self/task` | 🔍 S37-2 期间确认：`thread_pool_test` 的 AT5 用例（「线程数与库数解耦」）靠它计数，**`/proc` 无 Windows 对应物**。已改用 `std::filesystem` 去掉 `<dirent.h>`，且目录不存在时返回 0。S37-5 需二选一：换 `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` 按 owner pid 过滤，或把依赖它的用例整体标 Linux-only |
+| ~~W3~~ | `count_os_threads()` 读 `/proc/self/task` | ✅ S37-5 结清：补 `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` 实现（按 owner pid 过滤），**没有**把用例标 Linux-only——AT5 守的「线程数与库数解耦」是平台无关的结构性保证，在 Windows 上同样值得守。原实现在非 Linux 上恒返回 0，而断言的是差值，0-0=0 直接失败 |
 
 ---
 
@@ -601,8 +733,8 @@ S37-7 (1.5周) ───── CI + 收尾
 | S37-3.a cpu_features + 降档开关 | ✅ done（`__builtin_cpu_supports` 归零；四档 732/732 跨档对拍，见落地记录）|
 | S37-3.b 内核分 ISA TU | ✅ done（24 个 target 函数搬完；ISA 泄漏 0；四档 732/732；bench ±2%，见落地记录）|
 | S37-4 MSVC 构建适配 | ✅ done（188 个 TU 编译零错误；13 库 + 合并静态库产出；剩余全部为 io 后端符号。⚠️ Linux 侧未复验，见落地记录）|
-| S37-5 Windows I/O 后端 | ⬜ 未开始（工作面已由链接器量准：34 个符号，见 S37-4 落地记录末）|
-| S37-6 删除/映射生命周期 | ⬜ 未开始 |
+| S37-5 Windows I/O 后端 | ✅ done（bitcask.dll 产出；ctest 733 → 724 通过 99%；余 9 个全部落在 S37-6，见落地记录）|
+| S37-6 删除/映射生命周期 | ⬜ 未开始（工作面已由 S37-5 的 ctest 量准：9 个失败用例逐个归因，见 S37-6 段）|
 | S37-7 CI + 收尾 | ⬜ 未开始 |
 
 ### 待确认项

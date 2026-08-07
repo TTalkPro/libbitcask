@@ -5,6 +5,55 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* S37-5：原先用固定 "/tmp/..." 路径 + system("rm -rf ...") 清理，两者在
+ * Windows 上都不成立（无 /tmp，也没有 rm 命令——实测报「'rm' 不是内部或
+ * 外部命令」，随后陈旧目录污染 reopen，用例断在一个与真因无关的地方）。
+ *
+ * 本文件是 C，用不了 <filesystem>：改成平台条件的目录前缀 + rmrf() 外壳调用。
+ * Windows 侧用相对当前工作目录的名字——ctest 给每个测试设了工作目录，
+ * 天然隔离，不必去解析 %TEMP%。 */
+#if defined(_WIN32)
+#  define BITCASK_TEST_DIR_PREFIX "bitcask_c_test_"
+#else
+#  define BITCASK_TEST_DIR_PREFIX "/tmp/bitcask_c_test_"
+#endif
+#define TDIR(name) (BITCASK_TEST_DIR_PREFIX name)
+
+static void rmrf(const char* dir) {
+    char cmd[512];
+#if defined(_WIN32)
+    snprintf(cmd, sizeof(cmd), "rd /s /q \"%s\" >nul 2>&1", dir);
+#else
+    snprintf(cmd, sizeof(cmd), "rm -rf \"%s\" >/dev/null 2>&1", dir);
+#endif
+    (void)system(cmd);
+}
+
+/* 运行前统一清空：跨运行/跨二进制版本累积的 checkpoint 残留会污染 reopen
+ * （尤以向量批量用例敏感，陈旧 vec.ckpt → 搜索命中 0）。
+ * 通配符交给 shell 在 POSIX 上可行，Windows 的 rd 不认通配符，故逐个列举。 */
+static const char* const kAllTestDirs[] = {
+    TDIR("batch"),
+    TDIR("filter"),
+    TDIR("iter"),
+    TDIR("kv"),
+    TDIR("levelb"),
+    TDIR("pscan"),
+    TDIR("putbatch"),
+    TDIR("range"),
+    TDIR("status"),
+    TDIR("statusex"),
+    TDIR("txn"),
+    TDIR("veng"),
+    TDIR("vhbatch"),
+};
+
+static void cleanup_all_test_dirs(void) {
+    for (size_t i = 0; i < sizeof(kAllTestDirs) / sizeof(kAllTestDirs[0]); ++i) {
+        rmrf(kAllTestDirs[i]);
+    }
+}
+
 static int test_kv_basic(void) {
     bitcask_options_t opts;
     bitcask_options_init(&opts);
@@ -12,7 +61,7 @@ static int test_kv_basic(void) {
 
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
-    bitcask_error_t err = bitcask_open("/tmp/bitcask_c_test_kv", &opts, &cask, &fault);
+    bitcask_error_t err = bitcask_open(TDIR("kv"), &opts, &cask, &fault);
     if (err != BITCASK_OK) {
         fprintf(stderr, "FAIL test_kv_basic: open failed: %s\n", fault.detail);
         return 1;
@@ -60,7 +109,7 @@ static int test_status_and_merge(void) {
 
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
-    bitcask_error_t err = bitcask_open("/tmp/bitcask_c_test_status", &opts, &cask, &fault);
+    bitcask_error_t err = bitcask_open(TDIR("status"), &opts, &cask, &fault);
     assert(err == BITCASK_OK);
 
     for (int i = 0; i < 100; i++) {
@@ -101,7 +150,7 @@ static int test_iteration(void) {
 
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
-    bitcask_error_t err = bitcask_open("/tmp/bitcask_c_test_iter", &opts, &cask, &fault);
+    bitcask_error_t err = bitcask_open(TDIR("iter"), &opts, &cask, &fault);
     assert(err == BITCASK_OK);
 
     for (int i = 0; i < 10; i++) {
@@ -145,7 +194,7 @@ static int test_range_iter(void) {
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
     bitcask_error_t err =
-        bitcask_open("/tmp/bitcask_c_test_range", &opts, &cask, &fault);
+        bitcask_open(TDIR("range"), &opts, &cask, &fault);
     if (err != BITCASK_OK) {
         fprintf(stderr, "FAIL test_range_iter: open: %s\n", fault.detail);
         return 1;
@@ -296,7 +345,7 @@ static int test_search_text_batch(void) {
 
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
-    bitcask_error_t err = bitcask_open("/tmp/bitcask_c_test_batch", &opts, &cask, &fault);
+    bitcask_error_t err = bitcask_open(TDIR("batch"), &opts, &cask, &fault);
     if (err != BITCASK_OK) {
         fprintf(stderr, "FAIL test_search_text_batch: open failed: %s\n", fault.detail);
         return 1;
@@ -343,10 +392,8 @@ static int test_search_text_batch(void) {
 
 /* S32：C API 向量引擎选择——IVFRQ 建库/写查/重开一致性/引擎不符拒开。 */
 static int test_vector_engine_ivfrq(void) {
-    const char* dir = "/tmp/bitcask_c_test_veng";
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
-    (void)system(cmd);
+    const char* dir = TDIR("veng");
+    rmrf(dir);
 
     bitcask_options_t opts;
     bitcask_options_init(&opts);
@@ -429,7 +476,7 @@ static int test_search_vector_hybrid_batch(void) {
 
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
-    bitcask_error_t err = bitcask_open("/tmp/bitcask_c_test_vhbatch", &opts, &cask, &fault);
+    bitcask_error_t err = bitcask_open(TDIR("vhbatch"), &opts, &cask, &fault);
     if (err != BITCASK_OK) {
         fprintf(stderr, "FAIL test_search_vector_hybrid_batch: open: %s\n", fault.detail);
         return 1;
@@ -509,7 +556,7 @@ static int test_parallel_scan(void) {
 
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
-    bitcask_error_t err = bitcask_open("/tmp/bitcask_c_test_pscan", &opts, &cask, &fault);
+    bitcask_error_t err = bitcask_open(TDIR("pscan"), &opts, &cask, &fault);
     if (err != BITCASK_OK) {
         fprintf(stderr, "FAIL test_parallel_scan: open: %s\n", fault.detail);
         return 1;
@@ -581,7 +628,7 @@ static int test_put_batch(void) {
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
     bitcask_error_t err =
-        bitcask_open("/tmp/bitcask_c_test_putbatch", &opts, &cask, &fault);
+        bitcask_open(TDIR("putbatch"), &opts, &cask, &fault);
     if (err != BITCASK_OK) {
         fprintf(stderr, "FAIL test_put_batch: open failed: %s\n", fault.detail);
         return 1;
@@ -623,7 +670,7 @@ static int test_txn(void) {
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
     bitcask_error_t err =
-        bitcask_open("/tmp/bitcask_c_test_txn", &opts, &cask, &fault);
+        bitcask_open(TDIR("txn"), &opts, &cask, &fault);
     if (err != BITCASK_OK) {
         fprintf(stderr, "FAIL test_txn: open failed: %s\n", fault.detail);
         return 1;
@@ -709,7 +756,7 @@ static int test_status_ex_and_log(void) {
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
     bitcask_error_t err =
-        bitcask_open("/tmp/bitcask_c_test_statusex", &opts, &cask, &fault);
+        bitcask_open(TDIR("statusex"), &opts, &cask, &fault);
     assert(err == BITCASK_OK);
     bitcask_slice_t k = {"sk", 2}, v = {"sv", 2};
     assert(bitcask_put(cask, k, v, 0, &fault) == BITCASK_OK);
@@ -741,7 +788,7 @@ static int test_search_filtered(void) {
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
     bitcask_error_t err =
-        bitcask_open("/tmp/bitcask_c_test_filter", &opts, &cask, &fault);
+        bitcask_open(TDIR("filter"), &opts, &cask, &fault);
     if (err != BITCASK_OK) {
         fprintf(stderr, "FAIL test_search_filtered: open failed: %s\n", fault.detail);
         return 1;
@@ -854,7 +901,7 @@ static int test_levelb(void) {
 
     bitcask_t* cask = NULL;
     bitcask_fault_t fault;
-    if (bitcask_open("/tmp/bitcask_c_test_levelb", &opts, &cask, &fault) !=
+    if (bitcask_open(TDIR("levelb"), &opts, &cask, &fault) !=
         BITCASK_OK) {
         fprintf(stderr, "FAIL test_levelb: open failed: %s\n", fault.detail);
         return 1;
@@ -879,7 +926,7 @@ static int test_levelb(void) {
     bitcask_close(cask);
 
     /* 重开：子集快照 + 模式戳快路径；数据无损。 */
-    if (bitcask_open("/tmp/bitcask_c_test_levelb", &opts, &cask, &fault) !=
+    if (bitcask_open(TDIR("levelb"), &opts, &cask, &fault) !=
         BITCASK_OK) {
         fprintf(stderr, "FAIL test_levelb: reopen failed: %s\n", fault.detail);
         return 1;
@@ -903,7 +950,7 @@ int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
     // 搜索命中 0）。运行前统一清空，保证 hermetic。
-    (void)system("rm -rf /tmp/bitcask_c_test_* 2>/dev/null");
+    cleanup_all_test_dirs();
 
     int failures = 0;
     failures += test_version();
