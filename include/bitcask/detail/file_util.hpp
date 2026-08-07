@@ -26,8 +26,7 @@
 #include <string>
 #include <vector>
 
-#include <fcntl.h>   // T21: fsync_parent_dir 的 O_DIRECTORY
-#include <unistd.h>  // T21: fdatasync / fsync
+#include "bitcask/io.hpp"  // S37-1：宿主原语一律经 io seam（原 <fcntl.h>/<unistd.h>）
 
 namespace bitcask::detail {
 
@@ -90,19 +89,20 @@ read_file_bytes(const std::string& path) {
 // 关，保持 T21 为纯重构。是否全面铺开属 Phase 7「目录 fsync 专项」。
 
 // fsync 路径所在目录，使其中的 rename 持久化。尽力而为（打不开即跳过）。
+//
+// S37-1：目录打开与 fsync 下沉到 io::sync_directory（Windows 无对应物，
+// 后端将降为 no-op，持久性改由 MOVEFILE_WRITE_THROUGH 承担）。
+// 注意 parent 须转成 std::string 再传——std::filesystem::path::c_str() 在
+// Windows 上返回 const wchar_t*，直接喂给窄字符 API 会编译失败。
 inline void fsync_parent_dir(const std::string& path) noexcept {
     std::filesystem::path parent = std::filesystem::path(path).parent_path();
     if (parent.empty()) parent = ".";
-    const int dfd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
-    if (dfd >= 0) {
-        ::fsync(dfd);
-        ::close(dfd);
-    }
+    io::sync_directory(parent.string());
 }
 
 // 已开的 tmp 文件：flush + fdatasync。两个返回值都检查（见上）。
 inline bool flush_and_sync(std::FILE* f) noexcept {
-    return std::fflush(f) == 0 && ::fdatasync(::fileno(f)) == 0;
+    return io::flush_and_sync_stream(f);
 }
 
 // 缓冲区一次性原子落盘。失败即 remove(tmp) 并返回 false——最终路径始终
@@ -125,7 +125,9 @@ inline bool flush_and_sync(std::FILE* f) noexcept {
             return false;
         }
     }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    // S37-1：经 io::atomic_rename 而非 std::rename——后者在 Windows 上
+    // 目标已存在即失败，本站点是 9 个原子写站点的公共出口（见 io.hpp）。
+    if (!io::atomic_rename(tmp, path)) {
         std::remove(tmp.c_str());
         return false;
     }
@@ -197,7 +199,7 @@ public:
             std::remove(tmp_path_.c_str());
             return false;
         }
-        if (std::rename(tmp_path_.c_str(), final_path_.c_str()) != 0) {
+        if (!io::atomic_rename(tmp_path_, final_path_)) {  // S37-1，见上
             std::remove(tmp_path_.c_str());
             return false;
         }

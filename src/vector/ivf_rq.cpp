@@ -2,9 +2,9 @@
 
 #include "bitcask/ivf_rq.hpp"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
+
+
+
 
 #include <algorithm>
 #include <atomic>
@@ -72,7 +72,7 @@ void IvfSegment::close() {
     map_.reset();  // B3：RAII munmap
     base_ = nullptr;
     if (fd_ >= 0) {
-        ::close(fd_);
+        io::close_handle(fd_);
         fd_ = -1;
     }
     centroids_ = nullptr;
@@ -333,10 +333,15 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
     const std::string fp(path);
     diskint::TmpFile tf;
     tf.path = fp + ".tmp";
-    tf.fd = ::open(tf.path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC,
-                   0644);
-    if (tf.fd < 0) return false;
-    const int fd = tf.fd;
+    {
+        auto h = io::open_handle(tf.path,
+                                 io::OpenFlag::kTruncate |
+                                     io::OpenFlag::kCloseOnExec,
+                                 io::FileMode::kWorldReadable);
+        if (!h) return false;
+        tf.fd = *h;
+    }
+    const io::FileHandle fd = tf.fd;
     bool ok = true;
     std::uint64_t max_ord = 0;
     // 质心区。
@@ -458,7 +463,7 @@ bool IvfSegment::build(std::string_view path, std::uint16_t dim,
         ok = pwrite_all(fd, hdr, kIvfHeaderSize, 0);
     }
     if (ok) ok = tf.sync_close();
-    if (!ok || std::rename(tf.path.c_str(), fp.c_str()) != 0) {
+    if (!ok || !io::atomic_rename(tf.path, fp)) {  // S37-1：见 io.hpp C1 注释
         return false;  // TmpFile 析构清 tmp
     }
     tf.committed = true;
@@ -471,16 +476,20 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
                       std::uint64_t expected_gen, bool verify_crc) {
     close();
     const std::string fp(path);
-    const int fd = ::open(fp.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
+    const auto fh = io::open_handle(
+        fp, io::OpenFlag::kReadOnly | io::OpenFlag::kCloseOnExec);
+    if (!fh) return false;
+    const io::FileHandle fd = *fh;
     std::uint8_t hdr[kIvfHeaderSize];
-    if (::read(fd, hdr, kIvfHeaderSize) !=
-        static_cast<ssize_t>(kIvfHeaderSize)) {
-        ::close(fd);
+    // S37-1：定位读而非 ::read——不依赖 fd 内部偏移（Windows 后端下同一
+    // 句柄的顺序读会被内核串行化，见设计稿 C3）。短读在此仍判失败，
+    // 但 pread_all 会先重试补齐（较原 ::read 更严，非放松）。
+    if (!io::pread_all(fd, hdr, kIvfHeaderSize, 0)) {
+        io::close_handle(fd);
         return false;
     }
     if (std::memcmp(hdr, kIvfMagic, 4) != 0) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     std::uint32_t ver = 0, flags = 0, nlist = 0;
@@ -510,18 +519,17 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
         (ver == kIvfVersion && flags == 0) ||
         (ver == kIvfVersion2 && (flags & ~kFlagBits) == 0);
     if (!ver_ok || fdim != dim || stored != calc) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     const bool has_bits = (flags & kFlagBits) != 0;
     if (expected_gen != 0 && gen != 0 && gen != expected_gen) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
-    struct stat st;
-    if (::fstat(fd, &st) != 0 ||
-        static_cast<std::uint64_t>(st.st_size) < file_len) {
-        ::close(fd);
+    const auto fsize = io::handle_size(fd);
+    if (!fsize || *fsize < file_len) {
+        io::close_handle(fd);
         return false;
     }
     // 布局自洽性（防越界寻址——mmap 后所有区指针由这些偏移导出）。
@@ -543,13 +551,13 @@ bool IvfSegment::open(std::string_view path, std::uint16_t dim,
         (!v2 && (bits_off != 0 || has_bits)) ||
         post_off != gidx_end + bits_len ||
         file_len != post_off + count * stride) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     map_ = io::MappedFile::map_readonly(
-        fd, static_cast<std::size_t>(st.st_size), /*advise_random=*/false);
+        fd, static_cast<std::size_t>(*fsize), /*advise_random=*/false);
     if (!map_.valid()) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     base_  = reinterpret_cast<const std::uint8_t*>(map_.data());

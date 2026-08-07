@@ -41,7 +41,6 @@
 
 #pragma once
 
-#include <sys/types.h>  // S14-2: dev_t/ino_t（.vec 追加目标身份）
 
 #include <array>
 #include <atomic>
@@ -476,9 +475,11 @@ private:
     // 并发：只在 save/load 上下文访问（reducer RunFn / close / open 均已
     // 串行化），无并发读者——mutable 仅为让 const 的 save 路径更新状态。
     struct VecFileState {
-        bool          valid = false;
-        dev_t         dev   = 0;
-        ino_t         ino   = 0;
+        bool             valid = false;
+        // S37-1：原 dev_t/ino_t 两个字段——POSIX 专有类型，且为此在**公开头**
+        // 里 #include <sys/types.h>，污染所有下游用户。改用 io::FileIdentity
+        // （Windows 后端下由 VolumeSerialNumber + FileIndex 承载）。
+        io::FileIdentity id{};
         std::uint64_t data_off = 0;   // 数据区起始偏移（header.vecs_off）
         std::uint32_t count    = 0;   // 已在文件中的向量数
     };

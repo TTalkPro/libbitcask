@@ -2,9 +2,8 @@
 // 红线(hnsw-design §6 V3.2):recall@10 ≥ 0.95(ef=64)/ 0.99(ef=256)。
 
 #include <gtest/gtest.h>
+#include "support/test_paths.hpp"
 
-#include <sys/stat.h>   // S14-2 vec append 测试:stat/truncate
-#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -591,8 +590,11 @@ TEST(HnswVecAppend, AppendRoundTripPrefixContract) {
     const std::string vec_path = base + ".vec";
     ASSERT_TRUE(idx.save(base));  // 全量重写世代（v1）
 
-    struct stat st1;
-    ASSERT_EQ(::stat(vec_path.c_str(), &st1), 0);
+    // S37-2：身份 + 大小改用可移植 helper（原 struct stat / st_ino / st_size）。
+    const auto id1 = bitcask::test::identity_of(vec_path);
+    const auto sz1 = bitcask::test::file_size_of(vec_path);
+    ASSERT_TRUE(id1.has_value());
+    ASSERT_TRUE(sz1.has_value());
     // 留存旧代 ckpt（模拟 .prev）供前缀契约验证。
     const std::string old_ckpt = base + ".gen1";
     fs::copy_file(base, old_ckpt, fs::copy_options::overwrite_existing);
@@ -603,10 +605,12 @@ TEST(HnswVecAppend, AppendRoundTripPrefixContract) {
     }
     ASSERT_TRUE(idx.save(base));  // 应走追加
 
-    struct stat st2;
-    ASSERT_EQ(::stat(vec_path.c_str(), &st2), 0);
-    EXPECT_EQ(st1.st_ino, st2.st_ino) << "二次 save 应追加（无 tmp+rename）";
-    EXPECT_EQ(static_cast<std::size_t>(st2.st_size - st1.st_size),
+    const auto id2 = bitcask::test::identity_of(vec_path);
+    const auto sz2 = bitcask::test::file_size_of(vec_path);
+    ASSERT_TRUE(id2.has_value());
+    ASSERT_TRUE(sz2.has_value());
+    EXPECT_EQ(*id1, *id2) << "二次 save 应追加（无 tmp+rename）";
+    EXPECT_EQ(static_cast<std::size_t>(*sz2 - *sz1),
               50 * dim * sizeof(float))
         << "尺寸应精确增长 50 个向量";
     {
@@ -651,11 +655,13 @@ TEST(HnswVecAppend, AppendRoundTripPrefixContract) {
         // 恢复新代 ckpt：base 现在是旧代——用 idx 重存一次新代
         // （.vec 身份未变，追加路径 no-op）。
         ASSERT_TRUE(idx.save(base));
-        struct stat stv;
-        ASSERT_EQ(::stat(vec_path.c_str(), &stv), 0);
-        const off_t cut =
-            stv.st_size - static_cast<off_t>(30 * dim * sizeof(float));
-        ASSERT_EQ(::truncate(vec_path.c_str(), cut), 0);
+        const auto szv = bitcask::test::file_size_of(vec_path);
+        ASSERT_TRUE(szv.has_value());
+        const auto cut =
+            *szv - static_cast<std::uintmax_t>(30 * dim * sizeof(float));
+        std::error_code trunc_ec;
+        fs::resize_file(vec_path, cut, trunc_ec);  // S37-2：原 ::truncate
+        ASSERT_FALSE(trunc_ec);
         HnswIndex r(cfg);
         EXPECT_FALSE(r.load(base)) << "前缀不足必须拒载";
     }
@@ -703,18 +709,22 @@ TEST(HnswQc8Append, AppendGenGuardRoundTrip) {
     // 留存旧代 ckpt 字节（gen A）。
     const std::string old_ckpt = base + ".genA";
     fs::copy_file(base, old_ckpt, fs::copy_options::overwrite_existing);
-    struct stat st1;
-    ASSERT_EQ(::stat(qc_path.c_str(), &st1), 0);
+    const auto qid1 = bitcask::test::identity_of(qc_path);
+    const auto qsz1 = bitcask::test::file_size_of(qc_path);
+    ASSERT_TRUE(qid1.has_value());
+    ASSERT_TRUE(qsz1.has_value());
 
     for (std::size_t i = 100; i < 150; ++i) {
         auto v = vec_i(i, 7);
         idx.insert(i, std::span<const float>(v.data(), dim));
     }
     ASSERT_TRUE(idx.save(base));  // 二存：qc8 应追加
-    struct stat st2;
-    ASSERT_EQ(::stat(qc_path.c_str(), &st2), 0);
-    EXPECT_EQ(st1.st_ino, st2.st_ino) << "二次 save 应追加 qc8 而非重写";
-    EXPECT_EQ(static_cast<std::size_t>(st2.st_size - st1.st_size),
+    const auto qid2 = bitcask::test::identity_of(qc_path);
+    const auto qsz2 = bitcask::test::file_size_of(qc_path);
+    ASSERT_TRUE(qid2.has_value());
+    ASSERT_TRUE(qsz2.has_value());
+    EXPECT_EQ(*qid1, *qid2) << "二次 save 应追加 qc8 而非重写";
+    EXPECT_EQ(static_cast<std::size_t>(*qsz2 - *qsz1),
               50 * (dim + 8)) << "尺寸应精确增长 50 条码字记录";
 
     // 轮回：v3 段 + qc8 载入，int8 检索语义完好。
@@ -931,12 +941,13 @@ TEST(HnswCloneSpill, SpillAttachAdoptAndReload) {
         }
 
         // save:身份已收养 → 追加路径(inode 不变)。
-        struct stat st1{}, st2{};
         const std::string adopt_path = int8_only ? qc_path : vec_path;
-        ASSERT_EQ(::stat(adopt_path.c_str(), &st1), 0);
+        const auto aid1 = bitcask::test::identity_of(adopt_path);
+        ASSERT_TRUE(aid1.has_value());
         ASSERT_TRUE(fresh->save(base));
-        ASSERT_EQ(::stat(adopt_path.c_str(), &st2), 0);
-        EXPECT_EQ(st1.st_ino, st2.st_ino)
+        const auto aid2 = bitcask::test::identity_of(adopt_path);
+        ASSERT_TRUE(aid2.has_value());
+        EXPECT_EQ(*aid1, *aid2)
             << "外溢文件身份未被收养(save 走了全量重写)";
 
         // 重载等价。

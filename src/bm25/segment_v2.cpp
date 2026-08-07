@@ -11,9 +11,6 @@
 #include "bitcask/wildcard_matcher.hpp"
 #include "bm25_search_impl.hpp"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <bit>
@@ -428,17 +425,19 @@ std::unique_ptr<MmapSegment> MmapSegment::open(const std::string& path,
     // 虚拟地址空间）。建后所有早返回均由 ~MmapSegment 的 munmap 兜住。
     auto seg = std::unique_ptr<MmapSegment>(new MmapSegment());
 
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return nullptr;
-    struct stat st{};
-    if (::fstat(fd, &st) != 0 || st.st_size < 64 + 16) {
-        ::close(fd);
+    const auto fh = io::open_handle(
+        path, io::OpenFlag::kReadOnly | io::OpenFlag::kCloseOnExec);
+    if (!fh) return nullptr;
+    const io::FileHandle fd = *fh;
+    const auto sz = io::handle_size(fd);
+    if (!sz || *sz < 64 + 16) {
+        io::close_handle(fd);
         return nullptr;
     }
-    const auto fsize = static_cast<std::size_t>(st.st_size);
+    const auto fsize = static_cast<std::size_t>(*sz);
     seg->map_ = io::MappedFile::map_readonly(fd, fsize,
                                              /*advise_random=*/false);
-    ::close(fd);  // mmap 后 fd 可关(纯映射读,无 pread 路径)
+    io::close_handle(fd);  // mmap 后 fd 可关(纯映射读,无 pread 路径)
     if (!seg->map_.valid()) return nullptr;
 
     const std::byte* b = seg->map_.data();

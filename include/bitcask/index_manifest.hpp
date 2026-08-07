@@ -27,8 +27,6 @@
 #include <string_view>
 #include <vector>
 
-#include <fcntl.h>
-#include <unistd.h>
 
 #include "bitcask/codec.hpp"  // crc32
 #include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）

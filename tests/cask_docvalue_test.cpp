@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
+#include "support/test_paths.hpp"
 
-#include <sys/stat.h>  // S14-2 .vec 追加测试:stat inode 断言
 
 #include <bitcask/cask.hpp>
 #include <bitcask/keydir_registry.hpp>
@@ -1483,7 +1483,7 @@ class CaskUpgradeTest : public ::testing::Test {
 protected:
     void SetUp() override {
         tmpdir_ = std::filesystem::temp_directory_path() /
-                  ("cask_upgrade_test_" + std::to_string(::getpid()));
+                  ("cask_upgrade_test_" + std::to_string(bitcask::test::test_pid()));
         std::error_code ec;
         std::filesystem::remove_all(tmpdir_, ec);
         std::filesystem::create_directories(tmpdir_, ec);
@@ -4114,27 +4114,34 @@ TEST_F(CaskDocValueTest, CheckpointVecPayloadAppends) {
     ASSERT_TRUE((*c)->checkpoint());  // 首存：全量 base（.vec 收养 inode）
     // S17-2:per-component sidecar is sibling to vec.ckpt（vec.vec / vec.qc8）。
     const std::string vec_path = (tmpdir_ / "vec.vec").string();
-    struct stat st1;
-    ASSERT_EQ(::stat(vec_path.c_str(), &st1), 0);
+    // S37-2：身份 + 大小改用可移植 helper（原 struct stat / st_ino / st_size）。
+    const auto vid1 = bitcask::test::identity_of(vec_path);
+    const auto vsz1 = bitcask::test::file_size_of(vec_path);
+    ASSERT_TRUE(vid1.has_value());
+    ASSERT_TRUE(vsz1.has_value());
 
     put_range(120, 160);
     ASSERT_TRUE((*c)->checkpoint());  // 二存：delta——base 与 .vec 均不动
     // S17-2:per-component delta——vec 组件写 .d1。
     EXPECT_TRUE(fs::exists(tmpdir_ / "vec.ckpt.d1"));
     EXPECT_TRUE(fs::exists(tmpdir_ / "docmap.ckpt.d1"));
-    struct stat st2;
-    ASSERT_EQ(::stat(vec_path.c_str(), &st2), 0);
-    EXPECT_EQ(st1.st_ino, st2.st_ino);
-    EXPECT_EQ(st1.st_size, st2.st_size) << "delta 保存不应触碰 .vec";
+    const auto vid2 = bitcask::test::identity_of(vec_path);
+    const auto vsz2 = bitcask::test::file_size_of(vec_path);
+    ASSERT_TRUE(vid2.has_value());
+    ASSERT_TRUE(vsz2.has_value());
+    EXPECT_EQ(*vid1, *vid2);
+    EXPECT_EQ(*vsz1, *vsz2) << "delta 保存不应触碰 .vec";
 
     auto img = crash_image(tmpdir_, "vecapp");
 
     // close 强制全量 base → 此时 .vec 走 S14-2 追加（inode 不变、精确增长）。
     (*c)->close();
-    struct stat st3;
-    ASSERT_EQ(::stat(vec_path.c_str(), &st3), 0);
-    EXPECT_EQ(st1.st_ino, st3.st_ino) << "close 的 base 保存应追加 .vec 而非重写";
-    EXPECT_EQ(static_cast<std::size_t>(st3.st_size - st1.st_size),
+    const auto vid3 = bitcask::test::identity_of(vec_path);
+    const auto vsz3 = bitcask::test::file_size_of(vec_path);
+    ASSERT_TRUE(vid3.has_value());
+    ASSERT_TRUE(vsz3.has_value());
+    EXPECT_EQ(*vid1, *vid3) << "close 的 base 保存应追加 .vec 而非重写";
+    EXPECT_EQ(static_cast<std::size_t>(*vsz3 - *vsz1),
               40u * kDim * sizeof(float));
     EXPECT_FALSE(fs::exists(tmpdir_ / "vec.ckpt.d1"))
         << "base 落成后 delta 链应被清扫";
@@ -4279,7 +4286,7 @@ TEST_F(CaskDocValueTest, OpenAfterCrashResavesCheckpoint) {
 TEST_F(CaskDocValueTest, S17ManifestCorruptionFallsBackToFullFold) {
     namespace fs = std::filesystem;
     const auto dir = fs::temp_directory_path() /
-        ("s17_manifest_" + std::to_string(::getpid()));
+        ("s17_manifest_" + std::to_string(bitcask::test::test_pid()));
     fs::remove_all(dir);
     auto opts = v31_opts(0);
 

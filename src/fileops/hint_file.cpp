@@ -1,6 +1,5 @@
 #include "bitcask/hint_file.hpp"
 
-#include <sys/stat.h>
 
 #include <algorithm>
 #include <cstring>

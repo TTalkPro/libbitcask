@@ -4,8 +4,9 @@
 // 重建；快照缺口（快照写后 flush 前崩溃窗口）→ 重建；墓碑行进 run 与
 // 同 key 去重语义。
 
-#include <sys/wait.h>
-#include <unistd.h>
+#include "support/crash_child.hpp"
+
+using bitcask::test::crash_exit;
 
 #include <algorithm>
 #include <filesystem>
@@ -362,32 +363,33 @@ TEST_F(OkiRecoveryTest, ReopenAfterCleanCloseDoesNotRebuild) {
     }
 }
 
-TEST_F(OkiRecoveryTest, CrashTailReplayWithoutRebuild) {
-    constexpr int kFirst = 15, kSecond = 10;
-    const pid_t child = fork();
-    ASSERT_NE(child, -1);
-    if (child == 0) {
-        CaskOptions o;
-        o.read_write = true;
-        auto c = Cask::open(dir_.string(), o, &test_registry());
-        if (!c) _exit(1);
-        for (int i = 0; i < kFirst; ++i) {
-            if (!(*c)->put(bytes("ct" + std::to_string(i)), bytes("v"), 1000)) {
-                _exit(1);
-            }
+constexpr int kCrashTailFirst = 15, kCrashTailSecond = 10;
+
+BITCASK_CRASH_SCENARIO(oki_crash_tail) {
+    CaskOptions o;
+    o.read_write = true;
+    auto c = Cask::open(dir, o, &test_registry());
+    if (!c) crash_exit(1);
+    for (int i = 0; i < kCrashTailFirst; ++i) {
+        if (!(*c)->put(bytes("ct" + std::to_string(i)), bytes("v"), 1000)) {
+            crash_exit(1);
         }
-        if (!(*c)->checkpoint()) _exit(1);  // keydir 快照 + OKI flush 搭车
-        for (int i = kFirst; i < kFirst + kSecond; ++i) {
-            if (!(*c)->put(bytes("ct" + std::to_string(i)), bytes("v"), 1000)) {
-                _exit(1);
-            }
-            if (!(*c)->sync()) _exit(1);
-        }
-        _exit(0);  // 崩溃：不 close（第二段行只在 data file 里）
     }
-    int status = 0;
-    ASSERT_NE(waitpid(child, &status, 0), -1);
-    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    if (!(*c)->checkpoint()) crash_exit(1);  // keydir 快照 + OKI flush 搭车
+    for (int i = kCrashTailFirst; i < kCrashTailFirst + kCrashTailSecond; ++i) {
+        if (!(*c)->put(bytes("ct" + std::to_string(i)), bytes("v"), 1000)) {
+            crash_exit(1);
+        }
+        if (!(*c)->sync()) crash_exit(1);
+    }
+    crash_exit(0);  // 崩溃：不 close（第二段行只在 data file 里）
+}
+
+TEST_F(OkiRecoveryTest, CrashTailReplayWithoutRebuild) {
+    constexpr int kFirst = kCrashTailFirst, kSecond = kCrashTailSecond;
+    ASSERT_EQ(bitcask::test::spawn_crash_child("oki_crash_tail",
+                                               dir_.string()),
+              0);
 
     auto m_before = bitcask::oki::read_manifest(dir_.string());
     ASSERT_TRUE(m_before.has_value());

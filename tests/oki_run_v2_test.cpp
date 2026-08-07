@@ -5,9 +5,9 @@
 // bloom 结构）、外排对拍参考实现（(ord, 到达序) 胜出）、墓碑丢弃档、
 // manifest v2 与惰性版本选择。
 
-#include <unistd.h>
 
 #include <algorithm>
+#include "support/test_paths.hpp"
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -39,7 +39,7 @@ class TempDir {
 public:
     TempDir() {
         path_ = fs::temp_directory_path() /
-                ("bitcask_okiv2_" + std::to_string(::getpid()) + "_" +
+                ("bitcask_okiv2_" + std::to_string(bitcask::test::test_pid()) + "_" +
                  std::to_string(reinterpret_cast<std::uintptr_t>(this)));
         fs::create_directories(path_);
     }

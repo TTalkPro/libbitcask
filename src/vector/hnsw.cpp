@@ -20,10 +20,6 @@
 #include <string>
 
 // V7:BCVS v2 payload 文件 mmap(只读 MAP_SHARED + madvise RANDOM)。
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
@@ -383,14 +379,14 @@ HnswIndex::~HnswIndex() {
     vecs_map_.reset();  // B3：RAII munmap
     vecs_mmap_base_ = nullptr;
     if (vecs_payload_fd_ >= 0) {
-        ::close(vecs_payload_fd_);
+        io::close_handle(vecs_payload_fd_);
         vecs_payload_fd_ = -1;
     }
     // S32-M2:qc8 mmap 同序释放。
     qc_map_.reset();
     qc_mmap_recs_ = nullptr;
     if (qc_payload_fd_ >= 0) {
-        ::close(qc_payload_fd_);
+        io::close_handle(qc_payload_fd_);
         qc_payload_fd_ = -1;
     }
     for (auto& slot : chunks_) {
@@ -1376,8 +1372,8 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
                 // 下纯开销。合并后典型降到个位数 syscall。
                 const std::size_t vec_bytes =
                     static_cast<std::size_t>(cfg_.dim) * sizeof(float);
-                const auto page = static_cast<std::uintptr_t>(
-                    ::sysconf(_SC_PAGESIZE));
+                const auto page =
+                    static_cast<std::uintptr_t>(io::page_size());
                 const std::uintptr_t pmask = ~(page - 1);
                 thread_local std::vector<std::uintptr_t> addrs;
                 addrs.clear();
@@ -1402,8 +1398,8 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
                         if (e2 > end) end = e2;
                         ++j;
                     }
-                    ::madvise(reinterpret_cast<void*>(start), end - start,
-                              MADV_WILLNEED);
+                    io::prefetch_range(reinterpret_cast<const void*>(start),
+                                       end - start);
                     i = j;
                 }
             }
@@ -1497,9 +1493,8 @@ bool HnswIndex::save_vec_payload(std::string_view path) const {
         return false;
     }
     // S14-2:收养新文件身份（rename 保 inode 不变）——后续 save 走追加。
-    struct stat st;
-    if (::stat(fp.c_str(), &st) == 0) {
-        vec_file_ = VecFileState{true, st.st_dev, st.st_ino, vecs_off, n};
+    if (const auto ident = io::path_identity(fp)) {
+        vec_file_ = VecFileState{true, *ident, vecs_off, n};
     } else {
         vec_file_.valid = false;
     }
@@ -1541,9 +1536,8 @@ bool HnswIndex::save_qc_payload(std::string_view path) const {
         qc_file_.valid = false;
         return false;
     }
-    struct stat st;
-    if (::stat(fp.c_str(), &st) == 0) {
-        qc_file_ = VecFileState{true, st.st_dev, st.st_ino, kBcq8HeaderSize, n};
+    if (const auto ident = io::path_identity(fp)) {
+        qc_file_ = VecFileState{true, *ident, kBcq8HeaderSize, n};
     } else {
         qc_file_.valid = false;
     }
@@ -1557,19 +1551,25 @@ bool HnswIndex::try_append_qc_payload(std::string_view path,
         static_cast<std::size_t>(cfg_.dim) + sizeof(float) +
         sizeof(std::int32_t);
     const std::string fp(path);
-    const int fd = ::open(fp.c_str(), O_WRONLY | O_CLOEXEC);
-    if (fd < 0) return false;
-    struct stat st;
-    if (::fstat(fd, &st) != 0 ||
-        st.st_dev != qc_file_.dev || st.st_ino != qc_file_.ino) {
-        ::close(fd);
+    const auto fh = io::open_handle(
+        fp, io::OpenFlag::kWriteOnly | io::OpenFlag::kCloseOnExec);
+    if (!fh) return false;
+    const io::FileHandle fd = *fh;
+    const auto ident = io::handle_identity(fd);
+    if (!ident || *ident != qc_file_.id) {
+        io::close_handle(fd);
+        return false;
+    }
+    const auto fsize = io::handle_size(fd);
+    if (!fsize) {
+        io::close_handle(fd);
         return false;
     }
     const std::uint64_t old_end =
         qc_file_.data_off +
         static_cast<std::uint64_t>(qc_file_.count) * stride;
-    if (static_cast<std::uint64_t>(st.st_size) < old_end) {
-        ::close(fd);
+    if (*fsize < old_end) {
+        io::close_handle(fd);
         return false;
     }
     bool ok = true;
@@ -1595,13 +1595,13 @@ bool HnswIndex::try_append_qc_payload(std::string_view path,
                 batch.clear();
             }
         }
-        if (ok) ok = ::fdatasync(fd) == 0;
+        if (ok) ok = io::sync_data(fd);
         if (ok) {
-            (void)::ftruncate(fd, static_cast<off_t>(
+            (void)io::truncate_handle(fd, (
                 qc_file_.data_off + static_cast<std::uint64_t>(n) * stride));
         }
     } else if (n == qc_file_.count) {
-        ::close(fd);
+        io::close_handle(fd);
         return true;  // 无新节点，无事可做
     }
     if (ok) {
@@ -1618,9 +1618,9 @@ bool HnswIndex::try_append_qc_payload(std::string_view path,
             bitcask::codec::crc32(std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(hdr), kBcq8HeaderCrcOff));
         std::memcpy(hdr + kBcq8HeaderCrcOff, &hcrc, 4);
-        ok = diskint::pwrite_all(fd, hdr, kBcq8HeaderSize, 0) && ::fdatasync(fd) == 0;
+        ok = diskint::pwrite_all(fd, hdr, kBcq8HeaderSize, 0) && io::sync_data(fd);
     }
-    ::close(fd);
+    io::close_handle(fd);
     if (ok) qc_file_.count = n;
     return ok;
 }
@@ -1639,20 +1639,22 @@ bool HnswIndex::load_qc_payload(std::string_view path) {
     qc_mmap_recs_ = nullptr;
     qc_checkpoint_count_ = 0;
     if (qc_payload_fd_ >= 0) {
-        ::close(qc_payload_fd_);
+        io::close_handle(qc_payload_fd_);
         qc_payload_fd_ = -1;
     }
 
-    const int fd = ::open(fp.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
+    const auto fh = io::open_handle(
+        fp, io::OpenFlag::kReadOnly | io::OpenFlag::kCloseOnExec);
+    if (!fh) return false;
+    const io::FileHandle fd = *fh;
     std::uint8_t hdr[kBcq8HeaderSize];
-    if (::read(fd, hdr, kBcq8HeaderSize) !=
-        static_cast<ssize_t>(kBcq8HeaderSize)) {
-        ::close(fd);
+    // S37-1：定位读，不依赖 fd 内部偏移（见 ivf_rq 同处注释）。
+    if (!io::pread_all(fd, hdr, kBcq8HeaderSize, 0)) {
+        io::close_handle(fd);
         return false;
     }
     if (std::memcmp(hdr, kBcq8Magic, 4) != 0) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     std::uint32_t ver = 0, count = 0;
@@ -1668,30 +1670,30 @@ bool HnswIndex::load_qc_payload(std::string_view path) {
     const std::uint32_t calc = bitcask::codec::crc32(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(hdr), kBcq8HeaderCrcOff));
     if (ver != kBcq8Version || dim != cfg_.dim || stored != calc) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     const std::uint32_t n = count_.load(std::memory_order_relaxed);
     if (count < n) {  // 前缀不足
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     // gen 配对：双方非零才校验（legacy 0 跳过）。
     if (gen != 0 && payload_gen_ != 0 && gen != payload_gen_) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
 
     // 前缀契约:文件须物理持有 [0, n) 记录字节(header.count 声称更多但
     // 尾部缺失 = torn append,不影响前缀装载)。
-    struct stat st;
-    if (::fstat(fd, &st) != 0) {
-        ::close(fd);
+    const auto fsize = io::handle_size(fd);
+    if (!fsize) {
+        io::close_handle(fd);
         return false;
     }
-    const auto file_size = static_cast<std::size_t>(st.st_size);
+    const auto file_size = static_cast<std::size_t>(*fsize);
     if (file_size < rec_off + static_cast<std::uint64_t>(n) * stride) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     // B3：MappedFile（advise_random = MADV_RANDOM——图导航随机 touch
@@ -1699,14 +1701,21 @@ bool HnswIndex::load_qc_payload(std::string_view path) {
     qc_map_ = io::MappedFile::map_readonly(fd, file_size,
                                            /*advise_random=*/true);
     if (!qc_map_.valid()) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     qc_mmap_recs_ =
         reinterpret_cast<const std::uint8_t*>(qc_map_.data()) + rec_off;
     qc_payload_fd_ = fd;  // fd 持有至 mmap 生命周期末(destructor close)
     qc_checkpoint_count_ = n;
-    qc_file_ = VecFileState{true, st.st_dev, st.st_ino, rec_off, n};
+    // S37-1：由已持有的句柄取身份（原按 fstat 的 st）——比按路径 stat 更准，
+    // 排除「校验与收养之间路径被替换」的窗口。取不到则不收养（valid=false
+    // ⇒ 下次 save 走全量重写，与原 fstat 失败路径同向）。
+    if (const auto self = io::handle_identity(fd)) {
+        qc_file_ = VecFileState{true, *self, rec_off, n};
+    } else {
+        qc_file_.valid = false;
+    }
     qc_pending_ = false;
     return true;
 }
@@ -1722,24 +1731,30 @@ bool HnswIndex::try_append_vec_payload(std::string_view path,
     const std::size_t vec_bytes =
         static_cast<std::size_t>(cfg_.dim) * sizeof(float);
     const std::string fp(path);
-    const int fd = ::open(fp.c_str(), O_WRONLY | O_CLOEXEC);
-    if (fd < 0) return false;
-    struct stat st;
-    if (::fstat(fd, &st) != 0 ||
-        st.st_dev != vec_file_.dev || st.st_ino != vec_file_.ino) {
-        ::close(fd);  // 路径已指向别的文件（外部替换）→ 全量重写
+    const auto fh = io::open_handle(
+        fp, io::OpenFlag::kWriteOnly | io::OpenFlag::kCloseOnExec);
+    if (!fh) return false;
+    const io::FileHandle fd = *fh;
+    const auto ident = io::handle_identity(fd);
+    if (!ident || *ident != vec_file_.id) {
+        io::close_handle(fd);  // 路径已指向别的文件（外部替换）→ 全量重写
+        return false;
+    }
+    const auto fsize = io::handle_size(fd);
+    if (!fsize) {
+        io::close_handle(fd);
         return false;
     }
     // 前缀完整性：文件必须仍持有 [0, vec_file_.count) 的数据字节。
     const std::uint64_t old_end =
         vec_file_.data_off +
         static_cast<std::uint64_t>(vec_file_.count) * vec_bytes;
-    if (static_cast<std::uint64_t>(st.st_size) < old_end) {
-        ::close(fd);
+    if (*fsize < old_end) {
+        io::close_handle(fd);
         return false;
     }
     if (n == vec_file_.count) {
-        ::close(fd);  // 无新向量 ⇒ watermark 也未变（仅 insert 推进），无事可做
+        io::close_handle(fd);  // 无新向量 ⇒ watermark 也未变，无事可做
         return true;
     }
 
@@ -1760,11 +1775,11 @@ bool HnswIndex::try_append_vec_payload(std::string_view path,
             off += len;
             id = run_end;
         }
-        if (ok) ok = ::fdatasync(fd) == 0;
+        if (ok) ok = io::sync_data(fd);
         // 裁到精确末端：覆盖掉可能更长的旧代垃圾尾（.prev 回退场景）。
         // best-effort——mmap 前缀 [0, checkpoint_count_) 远在截断点之前。
         if (ok) {
-            (void)::ftruncate(fd, static_cast<off_t>(
+            (void)io::truncate_handle(fd, (
                 vec_file_.data_off +
                 static_cast<std::uint64_t>(n) * vec_bytes));
         }
@@ -1794,9 +1809,9 @@ bool HnswIndex::try_append_vec_payload(std::string_view path,
             std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(hdr), kBcvpHeaderCrcOff));
         std::memcpy(hdr + kBcvpHeaderCrcOff, &hcrc, 4);
-        ok = diskint::pwrite_all(fd, hdr, kBcvpHeaderSize, 0) && ::fdatasync(fd) == 0;
+        ok = diskint::pwrite_all(fd, hdr, kBcvpHeaderSize, 0) && io::sync_data(fd);
     }
-    ::close(fd);
+    io::close_handle(fd);
     if (ok) vec_file_.count = n;
     return ok;
 }
@@ -1807,26 +1822,28 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
     if (cfg_.inmem_int8) return true;  // 无 payload,语义上 no-op
 
     const std::string fp(path);
-    int fd = ::open(fp.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
+    const auto fh = io::open_handle(
+        fp, io::OpenFlag::kReadOnly | io::OpenFlag::kCloseOnExec);
+    if (!fh) return false;
+    io::FileHandle fd = *fh;
 
     // 已持有 mmap 时先拆——契约要求 load 前为空(load 由 open 期单线程串入)。
     vecs_map_.reset();  // B3：RAII munmap
     vecs_mmap_base_ = nullptr;
     if (vecs_payload_fd_ >= 0) {
-        ::close(vecs_payload_fd_);
+        io::close_handle(vecs_payload_fd_);
         vecs_payload_fd_ = -1;
     }
 
     std::uint8_t hdr[kBcvpHeaderSize];
-    if (::read(fd, hdr, kBcvpHeaderSize) !=
-        static_cast<ssize_t>(kBcvpHeaderSize)) {
-        ::close(fd);
+    // S37-1：定位读，不依赖 fd 内部偏移（见 ivf_rq 同处注释）。
+    if (!io::pread_all(fd, hdr, kBcvpHeaderSize, 0)) {
+        io::close_handle(fd);
         return false;
     }
     if (hdr[0] != kBcvpMagic[0] || hdr[1] != kBcvpMagic[1] ||
         hdr[2] != kBcvpMagic[2] || hdr[3] != kBcvpMagic[3]) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     std::uint32_t version;
@@ -1834,7 +1851,7 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
     // S14-2:v1 = 全量重写世代（有页 CRC 表，从未校验）；v2 = 被追加过的
     // 世代（不再维护页表）。两者数据区语义相同，均按前缀契约装载。
     if (version != 1 && version != 2) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     std::uint16_t dim;
@@ -1850,7 +1867,7 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
     std::uint64_t file_gen = 0;
     std::memcpy(&file_gen, hdr + kBcvpGenOff, 8);
     if (file_gen != 0 && payload_gen_ != 0 && file_gen != payload_gen_) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
 
@@ -1862,7 +1879,7 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
         static_cast<std::uint64_t>(n) *
         static_cast<std::uint64_t>(cfg_.dim) * 4u;
     if (dim != cfg_.dim || count < n || vecs_len_u64 < need_bytes) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
 
@@ -1873,21 +1890,21 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
         std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(hdr), kBcvpHeaderCrcOff));
     if (stored_hdr_crc != calc_hdr_crc) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
 
     // 文件大小校验(vecs_off + vecs_len 不能超出文件)。
-    struct stat st;
-    if (::fstat(fd, &st) != 0) {
-        ::close(fd);
+    const auto fsize = io::handle_size(fd);
+    if (!fsize) {
+        io::close_handle(fd);
         return false;
     }
-    const std::size_t file_size = static_cast<std::size_t>(st.st_size);
+    const std::size_t file_size = static_cast<std::size_t>(*fsize);
     // S14-2:只要求有效前缀 [0, n) 的字节在文件内（header.count 声称的
     // 更长区域允许缺失——torn append 的尾巴不影响前缀装载）。
     if (file_size < vecs_off_u64 + need_bytes) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     // count=0 时文件可能仅 header(无 vecs 段),mmap 整个文件即可。
@@ -1896,7 +1913,7 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
     vecs_map_ = io::MappedFile::map_readonly(fd, file_size,
                                              /*advise_random=*/true);
     if (!vecs_map_.valid()) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
 
@@ -1906,7 +1923,11 @@ bool HnswIndex::load_vec_payload(std::string_view path) {
     checkpoint_count_ = n;
     // S14-2:记录追加目标。count 取 n（ckpt 有效前缀）而非 header.count——
     // 文件尾部可能是被 .prev 回退否掉的新代数据，下次追加从 n 起覆盖。
-    vec_file_ = VecFileState{true, st.st_dev, st.st_ino, vecs_off_u64, n};
+    if (const auto self = io::handle_identity(fd)) {  // S37-1，见 qc 同处注释
+        vec_file_ = VecFileState{true, *self, vecs_off_u64, n};
+    } else {
+        vec_file_.valid = false;
+    }
     return true;
 }
 

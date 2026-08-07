@@ -3,9 +3,9 @@
 #include <bitcask/cask.hpp>
 #include <bitcask/keydir_registry.hpp>
 
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include "support/crash_child.hpp"
+
+using bitcask::test::crash_exit;
 
 #include <atomic>
 #include <cstdint>
@@ -31,6 +31,25 @@ inline bitcask::keydir::KeyDirRegistry& test_registry() {
 using bitcask::Cask;
 using bitcask::CaskOptions;
 
+// S37-2：原为 CrashRecoveryTest 的 protected static——崩溃场景函数在命名空间
+// 作用域（非 fixture 成员），够不着。三者都是无状态纯函数，外提无副作用。
+std::string key_for(int i) {
+    char buf[16]{};
+    std::snprintf(buf, sizeof(buf), "key%04d", i);
+    return std::string(buf);
+}
+
+std::string value_for(int i) {
+    char buf[32]{};
+    std::snprintf(buf, sizeof(buf), "val%04d_fixed", i);
+    return std::string(buf);
+}
+
+std::vector<std::byte> bytes(std::string_view s) {
+    const auto* p = reinterpret_cast<const std::byte*>(s.data());
+    return std::vector<std::byte>(p, p + s.size());
+}
+
 class CrashRecoveryTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -46,23 +65,6 @@ protected:
     void TearDown() override {
         std::error_code ec;
         std::filesystem::remove_all(tmpdir_, ec);
-    }
-
-    static std::string key_for(int i) {
-        char buf[16]{};
-        std::snprintf(buf, sizeof(buf), "key%04d", i);
-        return std::string(buf);
-    }
-
-    static std::string value_for(int i) {
-        char buf[32]{};
-        std::snprintf(buf, sizeof(buf), "val%04d_fixed", i);
-        return std::string(buf);
-    }
-
-    static std::vector<std::byte> bytes(std::string_view s) {
-        const auto* p = reinterpret_cast<const std::byte*>(s.data());
-        return std::vector<std::byte>(p, p + s.size());
     }
 
     std::filesystem::path max_data_file() const {
@@ -93,43 +95,42 @@ protected:
     std::filesystem::path tmpdir_;
 };
 
-TEST_F(CrashRecoveryTest, MidPutRestartFoldsCorrectly) {
-    constexpr int kN = 50;
+constexpr int kMidPutN = 50;
 
-    const pid_t child = fork();
-    ASSERT_NE(child, -1) << "fork failed";
-
-    if (child == 0) {
-        CaskOptions opts;
-        opts.read_write = true;
-        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
-        if (!c) {
-            std::fprintf(stderr, "child open failed: %s\n",
-                         c.error().detail.c_str());
-            _exit(1);
-        }
-        for (int i = 0; i < kN; ++i) {
-            auto pr = (*c)->put(bytes(key_for(i)), bytes(value_for(i)),
-                                static_cast<std::uint32_t>(1000 + i));
-            if (!pr) {
-                std::fprintf(stderr, "child put failed: %s\n",
-                             pr.error().detail.c_str());
-                _exit(1);
-            }
-            auto sr = (*c)->sync();
-            if (!sr) {
-                std::fprintf(stderr, "child sync failed: %s\n",
-                             sr.error().detail.c_str());
-                _exit(1);
-            }
-        }
-        _exit(0);
+BITCASK_CRASH_SCENARIO(mid_put) {
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(dir, opts, &test_registry());
+    if (!c) {
+        std::fprintf(stderr, "child open failed: %s\n",
+                     c.error().detail.c_str());
+        crash_exit(1);
     }
+    for (int i = 0; i < kMidPutN; ++i) {
+        auto pr = (*c)->put(bytes(key_for(i)), bytes(value_for(i)),
+                            static_cast<std::uint32_t>(1000 + i));
+        if (!pr) {
+            std::fprintf(stderr, "child put failed: %s\n",
+                         pr.error().detail.c_str());
+            crash_exit(1);
+        }
+        auto sr = (*c)->sync();
+        if (!sr) {
+            std::fprintf(stderr, "child sync failed: %s\n",
+                         sr.error().detail.c_str());
+            crash_exit(1);
+        }
+    }
+    crash_exit(0);  // 不 close：写锁/句柄随进程消失（模拟崩溃）
+}
 
-    int status = 0;
-    const pid_t waited = waitpid(child, &status, 0);
-    ASSERT_NE(waited, -1);
-    ASSERT_TRUE(WIFEXITED(status) || WIFSIGNALED(status));
+TEST_F(CrashRecoveryTest, MidPutRestartFoldsCorrectly) {
+    constexpr int kN = kMidPutN;
+
+    // 原 fork 版接受 WIFEXITED || WIFSIGNALED（子进程被信号杀死也算「崩溃
+    // 发生了」）。exec-self 下场景走完必然正常退出 0，异常终止由
+    // spawn_crash_child 归一为 -2——两种都不该出现，故直接断言 0。
+    ASSERT_EQ(bitcask::test::spawn_crash_child("mid_put", tmpdir_.string()), 0);
 
     CaskOptions opts;
     opts.read_write = true;

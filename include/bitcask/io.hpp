@@ -1,6 +1,17 @@
-// POSIX 文件 I/O 包装。纯 C++，不依赖 Erlang/OTP——这样可以直接喂给
+// 文件 I/O 平台抽象层。纯 C++，不依赖 Erlang/OTP——这样可以直接喂给
 // gtest，跟 NIF 层解耦。语义上跟 legacy bitcask_nifs.c 的 file_* 系列原语
 // 一一对应，方便从 C 翻译过来不出现行为漂移。
+//
+// === S37-1：本头是「平台 seam」===
+// 全库**唯一**允许直接调用宿主文件系统原语的地方是本头的实现文件
+// （POSIX: src/io/posix_file.cpp；Windows: src/io/win32_file.cpp）。
+// 其余第一方代码一律经由本头，使 Windows 移植 = 新增一个实现文件，
+// 而不是改 20 个调用站点。
+//
+// 收编前的形态（2026-08-07 实测）：12 处裸 ::open、53 处 ::close、
+// 8 处 ::fstat、8 处 ::fdatasync、4 处 ::ftruncate、4 处 std::rename
+// 散在 20 个文件里——其中 std::rename **在 Windows 上目标存在即失败**
+// （POSIX 下是原子覆盖），9 个原子写站点会全线挂。见 io::atomic_rename。
 //
 // === 线程模型 ===
 // PosixFile 对象本身只持有一个 int fd_，没有内部互斥量。
@@ -17,7 +28,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -26,6 +39,38 @@
 
 namespace bitcask::io {
 
+// ---------------------------------------------------------------------------
+// 平台原生文件句柄。
+//
+// POSIX 下是 int fd；Windows 下将是 void*（HANDLE）。第一方代码以本别名
+// 为通货（而非裸 int），使 Windows 后端只换 typedef 而不改调用站点形态。
+// 向量插件（hnsw / ivf_rq / diskann）仍以裸句柄为通货——它们的 build/append
+// 路径把句柄穿过多层 helper，包成 RAII 对象的收益不抵改动风险，故本层
+// 同时提供句柄级自由函数（见下）。
+// ---------------------------------------------------------------------------
+using FileHandle = int;
+inline constexpr FileHandle kInvalidHandle = -1;
+[[nodiscard]] constexpr bool handle_valid(FileHandle h) noexcept {
+    return h >= 0;
+}
+
+// ---------------------------------------------------------------------------
+// 文件身份——「这个路径还是不是我上次写的那个文件」。
+//
+// POSIX 用 (st_dev, st_ino)；Windows 用 (dwVolumeSerialNumber,
+// nFileIndexHigh/Low)。本结构替代 hnsw.hpp 此前直接暴露的 dev_t/ino_t，
+// 顺带把 <sys/types.h> 逐出公开头（原先污染所有下游用户）。
+//
+// 用途（S14-2）：.vec / .qc8 payload 追加前校验目标路径未被外部替换——
+// 若身份不符则放弃追加、退回全量重写。
+// ---------------------------------------------------------------------------
+struct FileIdentity {
+    std::uint64_t device  = 0;
+    std::uint64_t file_id = 0;
+    friend bool operator==(const FileIdentity&,
+                           const FileIdentity&) noexcept = default;
+};
+
 // open() 接受的 flag 位掩码。bitcask 自己的语义层，不直接对应 POSIX flag。
 enum class OpenFlag : unsigned {
     kNone     = 0,
@@ -33,7 +78,25 @@ enum class OpenFlag : unsigned {
     // kCreate：           O_CREAT | O_EXCL | O_RDWR | O_APPEND（强制新建）
     kCreate   = 1u << 0,
     kReadOnly = 1u << 1,  // 改用 O_RDONLY，跟 kCreate 互斥（caller 自己保证）
-    kOSync    = 1u << 2,  // 在原 flag 上 OR 一个 O_SYNC
+    kOSync    = 1u << 2,  // 在原 flag 上 OR 一个 O_DSYNC（见 translate 注释）
+
+    // --- S37-1 新增：收编裸 ::open 站点所需的形态 ---------------------------
+    // 这四位的存在理由是「原先绕过本抽象的站点用了本抽象表达不了的 flag」，
+    // 逐个补齐后裸调用才能归零。语义严格对齐各站点收编前的原样。
+    kWriteOnly   = 1u << 3,  // O_WRONLY（hnsw payload 追加：只写不读）
+    // O_RDWR | O_CREAT | O_TRUNC —— **不带 O_APPEND**（与 kCreate 的关键差别：
+    // 向量段 build 走 pwrite 定位写，O_APPEND 会让每次写强制落到文件尾）
+    kTruncate    = 1u << 4,
+    kCloseOnExec = 1u << 5,  // OR 一个 O_CLOEXEC（Windows 句柄默认不继承）
+    // OR 一个 O_SYNC（**非** O_DSYNC）。仅 bitcask.write.lock 用：stale-lock
+    // 检查要求写进去的 pid 立刻对其它进程的读锁可见，元数据也需同步。
+    kSyncAll     = 1u << 6,
+    // 从基模式里**去掉** O_APPEND。仅 bitcask.write.lock 用。
+    // 理由是 POSIX 的一条暗礁：**O_APPEND 下 pwrite 会忽略 offset 改为追加**。
+    // 锁文件走 ftruncate(0) + pwrite(0, …) 覆盖写，若带上 O_APPEND，写入位置
+    // 就不再由 offset 决定。当前 truncate 到 0 使二者结果碰巧一致，但语义已
+    // 漂移——收编时原样保留「无 O_APPEND」，不依赖这个巧合。
+    kNoAppend    = 1u << 7,
 };
 constexpr OpenFlag operator|(OpenFlag a, OpenFlag b) noexcept {
     return static_cast<OpenFlag>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
@@ -41,6 +104,13 @@ constexpr OpenFlag operator|(OpenFlag a, OpenFlag b) noexcept {
 constexpr bool has_flag(OpenFlag set, OpenFlag bit) noexcept {
     return (static_cast<unsigned>(set) & static_cast<unsigned>(bit)) != 0u;
 }
+
+// 新建文件的权限位。POSIX 语义；Windows 后端忽略（由 ACL 继承决定）。
+// 两档取值来自收编前各站点的原样：核心 KV 路径 0600、向量段 tmp 0644。
+enum class FileMode : unsigned {
+    kOwnerOnly     = 0,  // 0600
+    kWorldReadable = 1,  // 0644
+};
 
 // IoError 只带 errno；NIF 层用 erl_errno_id() 翻成 atom，跟 legacy 行为
 // 完全对齐（业务上拿到的 {error, enoent}/{error, eio} 等都不变）。
@@ -57,30 +127,46 @@ struct ReadOk {
 struct ReadEof {};
 using ReadResult = std::expected<std::variant<ReadOk, ReadEof>, IoError>;
 
-// fd 持有者：移动语义、析构 close、不可拷贝。
-// 跟 std::unique_ptr 一样的所有权模型，但定制了 fd_=-1 sentinel。
-class PosixFile {
+// 句柄持有者：移动语义、析构 close、不可拷贝。
+// 跟 std::unique_ptr 一样的所有权模型，但定制了 kInvalidHandle sentinel。
+//
+// S37-1：类名由 PosixFile 改为 File（Windows 后端下 "Posix" 是误称）；
+// PosixFile 保留为别名，既有 65 处引用零改动。
+class File {
 public:
-    PosixFile() noexcept = default;
-    explicit PosixFile(int fd) noexcept : fd_(fd) {}
-    ~PosixFile() noexcept { close_quiet(); }
+    File() noexcept = default;
+    explicit File(FileHandle fd) noexcept : fd_(fd) {}
+    ~File() noexcept { close_quiet(); }
 
-    PosixFile(const PosixFile&) = delete;
-    PosixFile& operator=(const PosixFile&) = delete;
-    PosixFile(PosixFile&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
-    PosixFile& operator=(PosixFile&& other) noexcept {
-        if (this != &other) { close_quiet(); fd_ = other.fd_; other.fd_ = -1; }
+    File(const File&) = delete;
+    File& operator=(const File&) = delete;
+    File(File&& other) noexcept : fd_(other.fd_) { other.fd_ = kInvalidHandle; }
+    File& operator=(File&& other) noexcept {
+        if (this != &other) {
+            close_quiet();
+            fd_ = other.fd_;
+            other.fd_ = kInvalidHandle;
+        }
         return *this;
     }
 
-    [[nodiscard]] bool is_open() const noexcept { return fd_ >= 0; }
-    [[nodiscard]] int  fd()      const noexcept { return fd_; }
+    [[nodiscard]] bool is_open() const noexcept { return handle_valid(fd_); }
+    [[nodiscard]] FileHandle fd() const noexcept { return fd_; }
+
+    // 放弃所有权并交出裸句柄（析构不再 close）。给「先经 File 打开拿到
+    // 正确 flag 翻译，再把句柄交给以裸句柄为通货的既有路径」的站点用。
+    [[nodiscard]] FileHandle release() noexcept {
+        const FileHandle h = fd_;
+        fd_ = kInvalidHandle;
+        return h;
+    }
 
     // 按 bitcask 风格的 flag 打开文件。flag 推导规则跟 legacy
-    // get_file_open_flags() 1:1 对齐（见 OpenFlag 注释）。mode = 0600。
+    // get_file_open_flags() 1:1 对齐（见 OpenFlag 注释）。
     // 线程安全: 是（每次调用产出一个新对象，不触碰任何共享状态）。
-    [[nodiscard]] static std::expected<PosixFile, IoError>
-    open(std::string_view path, OpenFlag flags) noexcept;
+    [[nodiscard]] static std::expected<File, IoError>
+    open(std::string_view path, OpenFlag flags,
+         FileMode mode = FileMode::kOwnerOnly) noexcept;
 
     // 关 fd；幂等。错误吞掉——legacy 也是这个行为，反正 close 失败没救。
     // 线程安全: 否（修改 fd_）；caller 必须保证此刻无其它线程在用该对象。
@@ -128,9 +214,27 @@ public:
     // 线程安全: 否（依赖 fd 当前 offset）；同一对象 caller 串行化。
     [[nodiscard]] std::expected<void, IoError> truncate_here() noexcept;
 
+    // --- S37-1 新增 ---------------------------------------------------------
+
+    // 截断到显式长度（不依赖 fd 当前 offset，故线程安全）。
+    [[nodiscard]] std::expected<void, IoError>
+    truncate(std::uint64_t length) noexcept;
+
+    // 当前文件大小。收编 8 处 ::fstat（其中 7 处只为取 st_size）。
+    // 线程安全: 是（不触碰 fd offset）。
+    [[nodiscard]] std::expected<std::uint64_t, IoError> size() const noexcept;
+
+    // 文件身份（见 FileIdentity 注释）。线程安全: 是。
+    [[nodiscard]] std::expected<FileIdentity, IoError>
+    identity() const noexcept;
+
 private:
-    int fd_ = -1;
+    FileHandle fd_ = kInvalidHandle;
 };
+
+// S37-1 之前的类名。既有站点（data_file / hint_file / oki_run / segment /
+// chunked_reader 等 65 处）继续可用。
+using PosixFile = File;
 
 // ---------------------------------------------------------------------------
 // S36 后续（backlog B3）：只读整文件 mmap 的 RAII 归并。
@@ -183,5 +287,125 @@ private:
     const std::byte* base_ = nullptr;
     std::size_t len_ = 0;
 };
+
+// ---------------------------------------------------------------------------
+// 句柄级自由函数（S37-1）
+//
+// 供仍以裸句柄为通货的路径使用——主要是向量插件的 build / payload 追加，
+// 它们把句柄穿过多层 helper（TmpFile、pwrite_all…），改成 RAII 对象的
+// 收益不抵改动风险。这些函数是 File 之外**唯一**的宿主原语出口。
+// ---------------------------------------------------------------------------
+
+// 打开并交出裸句柄（flag 翻译与 File::open 完全同一条路径）。
+[[nodiscard]] std::expected<FileHandle, IoError>
+open_handle(std::string_view path, OpenFlag flags,
+            FileMode mode = FileMode::kOwnerOnly) noexcept;
+
+// 关句柄；对 kInvalidHandle 为 no-op。错误吞掉（close 失败无恢复路径）。
+void close_handle(FileHandle h) noexcept;
+
+// fdatasync（Windows: FlushFileBuffers——无 data/metadata 之分）。
+[[nodiscard]] bool sync_data(FileHandle h) noexcept;
+
+// ftruncate 到显式长度。
+[[nodiscard]] bool truncate_handle(FileHandle h, std::uint64_t length) noexcept;
+
+// 文件大小 / 身份；失败返回 nullopt。
+[[nodiscard]] std::optional<std::uint64_t> handle_size(FileHandle h) noexcept;
+[[nodiscard]] std::optional<FileIdentity> handle_identity(FileHandle h) noexcept;
+
+// 按路径取身份（不需要已打开的句柄）。收编 hnsw 的 2 处 ::stat。
+[[nodiscard]] std::optional<FileIdentity>
+path_identity(const std::string& path) noexcept;
+
+// 定位读写循环，含 EINTR 重试。短读/短写视作失败（调用方读写已知长度）。
+// 原 vec::diskint::pwrite_all / pread_all，S37-1 收编至此。
+[[nodiscard]] bool pwrite_all(FileHandle h, const void* buf, std::size_t len,
+                              std::uint64_t off) noexcept;
+[[nodiscard]] bool pread_all(FileHandle h, void* buf, std::size_t len,
+                             std::uint64_t off) noexcept;
+
+// 单次定位读/写——**不循环、不重试**，返回实际传输字节数（nullopt = 错误）。
+// 与上面的 *_all 是刻意并存的两套语义：file_lock 的 legacy 契约是「部分写
+// 也算成功，不重试」（见 file_lock.cpp write_data 注释），套 *_all 会把该
+// 契约悄悄改掉。锁文件 < 一页，短读写实际不会发生，但语义须原样保留。
+[[nodiscard]] std::optional<std::size_t>
+pread_once(FileHandle h, void* buf, std::size_t len,
+           std::uint64_t off) noexcept;
+[[nodiscard]] std::optional<std::size_t>
+pwrite_once(FileHandle h, const void* buf, std::size_t len,
+            std::uint64_t off) noexcept;
+
+// ---------------------------------------------------------------------------
+// 路径级自由函数（S37-1）
+// ---------------------------------------------------------------------------
+
+// 原子改名，**目标已存在则覆盖**。
+//
+// ⚠️ 本函数是 Windows 移植的头号风险点（设计稿 C1）。POSIX 的 rename(2)
+// 在目标存在时原子覆盖，而 **Windows CRT 的 std::rename 目标存在即失败**。
+// 全库 9 个原子写站点（keydir snapshot / index manifest / field.schema /
+// hnsw ×3 / docmap ckpt / search ckpt / oki run）都经由本函数落地——
+// 若各站点继续直接调 std::rename，Windows 上第二次写入即全线失败。
+// Windows 实现须用 MoveFileExW(MOVEFILE_REPLACE_EXISTING |
+// MOVEFILE_WRITE_THROUGH)。
+[[nodiscard]] bool atomic_rename(const std::string& from,
+                                 const std::string& to) noexcept;
+
+// fsync 路径所在目录，使其中的 rename 持久化。尽力而为（打不开即跳过）。
+// Windows 无对应物 → 后端将降为 no-op，rename 的目录项持久性改由
+// MOVEFILE_WRITE_THROUGH 承担（持久性契约不变，机制不同）。
+void sync_directory(const std::string& path) noexcept;
+
+// 已打开的 FILE* 流：fflush + fdatasync。两个返回值都检查——disk-full 下
+// fflush 失败而 fdatasync 对已落盘部分成功，就会 rename 出半截文件。
+[[nodiscard]] bool flush_and_sync_stream(std::FILE* f) noexcept;
+
+// 建议宿主预取 [addr, addr+len) 的页（POSIX: madvise(MADV_WILLNEED)；
+// Windows: PrefetchVirtualMemory）。尽力而为，失败无碍（页仍会按需缺页装入）。
+//
+// 取地址区间而非「映射 + 偏移」：唯一调用方（HNSW 精排前的候选页预取）
+// 自己按页掩码合并了候选地址区间，地址式接口免去一层偏移换算；
+// Windows 的 PrefetchVirtualMemory 同样以地址区间为单位，语义直接对应。
+void prefetch_range(const void* addr, std::size_t len) noexcept;
+
+// 系统页大小。
+// ⚠️ Windows 下页大小（dwPageSize，4 KiB）与**映射分配粒度**
+// （dwAllocationGranularity，64 KiB）不同；本函数返回前者（用于预取区间
+// 对齐）。映射视图偏移的对齐须用后者——当前全部是整文件映射（offset=0），
+// 尚无站点需要，故暂不暴露。
+[[nodiscard]] std::size_t page_size() noexcept;
+
+// 删除一个文件。成功返回 true；目标不存在或被占用返回 false。
+//
+// ⚠️ POSIX 下删除仍被打开的文件是合法的（inode 延迟回收）；**Windows 下
+// 除非所有句柄都以 FILE_SHARE_DELETE 打开，否则报 ERROR_SHARING_VIOLATION，
+// 且被 section 映射持有的文件即便如此也删不掉**（设计稿 C2）。调用方须
+// 容忍失败——Cask::drain_retired_files 的重试队列即为此存在。
+[[nodiscard]] bool remove_file(const std::string& path) noexcept;
+
+// ---------------------------------------------------------------------------
+// 进程原语（S37-1 一并收编——它们与写锁的 stale 回收强耦合，留在外面会让
+// S37-5 的「Windows 后端 = 新增一个实现文件」不成立）
+// ---------------------------------------------------------------------------
+
+// 当前进程 id。写进 bitcask.write.lock 供 stale-lock 检查。
+[[nodiscard]] int current_process_id() noexcept;
+
+// 探测 pid 对应的进程是否还活着。**保守偏向「活着」**——无权查询等不确定
+// 情形一律返回 true，避免误删他人持有的有效锁。
+//
+// ⚠️ Windows 移植的风险点 #2（设计稿 C4）：**Windows 的 PID 复用远快于
+// Linux**（内核主动复用小号 PID）。仅凭 pid 存活判断会把「新进程恰好复用了
+// 崩溃进程的 PID」误判为锁仍有效 → 拒绝回收 stale lock → **库彻底打不开**。
+// Windows 后端须在锁文件里同时记录进程创建时间（GetProcessTimes 的
+// ftCreationTime）双重比对；本函数签名届时需相应扩展。
+[[nodiscard]] bool process_alive(int pid) noexcept;
+
+// 进程可同时打开的文件数上限（POSIX: RLIMIT_NOFILE 软上限）。
+// 取不到（含 RLIM_INFINITY）时返回 nullopt，由调用方给保守兜底。
+// Windows 下句柄不受 fd 表约束，后端将返回 nullopt——read-handle LRU 预算
+// 须另行标定（设计稿 C9）。
+[[nodiscard]] std::optional<std::uint64_t> max_open_files() noexcept;
 
 }  // namespace bitcask::io

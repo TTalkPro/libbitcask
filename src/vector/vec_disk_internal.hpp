@@ -16,57 +16,34 @@
 #include <thread>
 #include <vector>
 
-#include <unistd.h>
+#include "bitcask/io.hpp"  // S37-1：宿主原语一律经 io seam（原 <unistd.h>）
 
 namespace bitcask::vec::diskint {
 
-// 审计修复 2026-07-13:EINTR 重试（此前 w<0 一律判失败——极端信号压力下
-// build 假失败）。w==0 仍判失败（磁盘满等无进展场景防死循环）。
-inline bool pwrite_all(int fd, const void* buf, std::size_t len,
-                       std::uint64_t off) {
-    const auto* p = static_cast<const std::uint8_t*>(buf);
-    while (len > 0) {
-        const ssize_t w = ::pwrite(fd, p, len, static_cast<off_t>(off));
-        if (w < 0 && errno == EINTR) continue;
-        if (w <= 0) return false;
-        p   += w;
-        off += static_cast<std::uint64_t>(w);
-        len -= static_cast<std::size_t>(w);
-    }
-    return true;
-}
-
-inline bool pread_all(int fd, void* buf, std::size_t len, std::uint64_t off) {
-    auto* p = static_cast<std::uint8_t*>(buf);
-    while (len > 0) {
-        const ssize_t r = ::pread(fd, p, len, static_cast<off_t>(off));
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) return false;  // EOF 短读 = 失败（调用方读已知长度）
-        p   += r;
-        off += static_cast<std::uint64_t>(r);
-        len -= static_cast<std::size_t>(r);
-    }
-    return true;
-}
+// S37-1：pwrite_all / pread_all 的实现（含 2026-07-13 的 EINTR 重试审计修复）
+// 已下沉到 io seam。此处保留同名转发，使 ivf_rq / diskann / hnsw 的数十处
+// 调用站点零改动。
+using io::pread_all;
+using io::pwrite_all;
 
 // build 用 tmp 文件 RAII:异常/早退时 close(fd) + 删 tmp（审计修复——
 // 此前 build 中途 bad_alloc 会泄 fd 并残留 tmp）。成功路径 commit() 后
 // 调用方自行 rename。
 struct TmpFile {
-    int fd = -1;
+    io::FileHandle fd = io::kInvalidHandle;
     std::string path;
     bool committed = false;
     ~TmpFile() {
-        if (fd >= 0) ::close(fd);
+        if (io::handle_valid(fd)) io::close_handle(fd);
         if (!committed && !path.empty()) std::remove(path.c_str());
     }
     // fdatasync + close;成功返回 true 并转入 committed（rename 由调用方做,
     // rename 失败调用方应手动 remove——见各 build 尾部）。
     [[nodiscard]] bool sync_close() {
-        if (fd < 0) return false;
-        const bool ok = ::fdatasync(fd) == 0;
-        ::close(fd);
-        fd = -1;
+        if (!io::handle_valid(fd)) return false;
+        const bool ok = io::sync_data(fd);
+        io::close_handle(fd);
+        fd = io::kInvalidHandle;
         return ok;
     }
 };

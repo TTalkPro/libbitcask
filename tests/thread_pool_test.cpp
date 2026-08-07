@@ -2,6 +2,7 @@
 // S6-P2: 测试更新到新 start(MapFn, ReduceFn, ErrorFn) API。
 
 #include <atomic>
+#include <filesystem>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -10,7 +11,6 @@
 #include <variant>
 #include <vector>
 
-#include <dirent.h>
 
 #include <gtest/gtest.h>
 
@@ -548,16 +548,20 @@ TEST(IndexPool, RunFnCarriesOrdAndExecutesInReducer) {
 
 // ===== S6-P3: 多 lib 共享池（AT5）=====
 
-// 统计当前进程 OS 线程数（/proc/self/task 目录项）。Linux 专用。
+// 统计当前进程 OS 线程数。**Linux 专用**——读 /proc/self/task 的目录项。
+// S37-2：改用 std::filesystem 枚举（去掉 <dirent.h>），但 /proc 本身没有
+// Windows 对应物：S37-5 时需换 CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)
+// 按 owner pid 过滤，或把依赖它的 AT5 用例整体标记为 Linux-only。
+// 目录不存在（非 Linux）时返回 0，调用方据此跳过。
 static int count_os_threads() {
+    std::error_code ec;
+    const std::filesystem::path task_dir{"/proc/self/task"};
+    if (!std::filesystem::is_directory(task_dir, ec)) return 0;
     int n = 0;
-    if (DIR* d = ::opendir("/proc/self/task")) {
-        while (dirent* e = ::readdir(d)) {
-            if (e->d_name[0] != '.') ++n;
-        }
-        ::closedir(d);
+    for (const auto& e : std::filesystem::directory_iterator(task_dir, ec)) {
+        if (!e.path().filename().string().starts_with(".")) ++n;
     }
-    return n;
+    return ec ? 0 : n;
 }
 
 // AT5-a：线程数与库数解耦（G2）。注册第 1 个 lib 惰性启动 dispatcher+reducer

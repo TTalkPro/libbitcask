@@ -1,850 +1,361 @@
-# S33：有序 Key 索引（OKI）开发任务清单
+# S37：Windows 移植（MSVC 原生 · x64 · 保 SIMD）开发任务清单
 
-> 来源：[`doc/ordered-key-index-design-zh.md`](doc/ordered-key-index-design-zh.md)（设计草案已定稿）
-> 决策基线：否决整体换 LevelDB；WiscKey 式旁挂有序 key 索引；**flag-day 停机迁移**
-> （hint BCH4→BCH5 加 ord、meta v4→v5、`bitcask_migrate hintord`，与 5.0.0 tstamp64 同模式）
-> 版本目标：**5.1.0**（盘上 `bitcask.meta` = v5，S35 起用原子批的目录懒升 v6；
-> `SOVERSION` 保持 `5`——C API 纯增量，**盘上格式破坏不驱动 major**，同 3.1.0 先例）
-> 基线测试：ctest 全绿（Phase 6 T22 后 644 项，1 个 S30RssProbe 预存 Disabled）
+> 来源：[`doc/windows-port-design-zh.md`](doc/windows-port-design-zh.md)（设计稿已定稿）
+> 决策基线（2026-08-07 拍板）：**MSVC 原生 ABI**（不考虑 MinGW）、**Windows 上保留 SIMD**
+> （不接受 scalar 退化）、**不做 ARM64 Windows / 32 位 x86**
+> 目标平台：Windows x64 / VS2022 17.6+；Linux 侧行为与性能**零回归**是全程硬约束
+> 基线测试：ctest 全绿（v6.1.0 基线，Debug 全量）
 > 验收标准：每项改动后 ctest 全绿 + 编译无新告警；公共结构体改动须 build-rel 双树验证；
-> 格式改动须对拍 + crash 注入
+> I/O 语义改动须过 crash 注入用例
 
 ---
 
 ## 📁 上一清单归档
 
-Google C++ Style 规范化清单（Phase 1-6，T1-T26）已收官，详见 git 历史
-（本文件在 v5.0.0 之后、S33 换届之前的版本）与 `RISK_REPORT.md`。
-**未完项带入本清单遗留区**：T23（ChunkedReader）、T24（decode_rec 模板）、
-T8（搜索读屏障，⏸ 前置未满足）、T12（HNSW ckpt 去重，⏸ 默认不做）。
-其中 **T23 与 S33-2 撞车**（同在 `hint_file.cpp` 的 refill 三胞胎）——见 S33-2 备注。
+S33（有序 Key 索引 OKI）、S34（TxnCask）、S35（引擎原生原子批）、S36（keydir 磁盘驻留
+Level B）四届清单已全部收官，随 **v6.1.0** 发布，详见 git 历史（本文件在 056127b
+之前的版本）与 `CHANGELOG.md`。
+
+**未完项带入本清单遗留区**：T8（搜索读屏障，⏸ 4 项前置未满足）、
+T12（HNSW ckpt 去重，⏸ 默认不做）。两项均与本届无耦合。
 
 ---
 
-## 🔴 S33 主线
+## 🧭 本届总纲
 
-### S33-1 — 量化探针 + 基线 bench 🟡 MED（先行，产出 Level B 门禁数据）
+设计稿把移植拆成 A（构建）/ B（SIMD 派发）/ C（系统调用）/ D（测试）四段，
+落到执行序上是 7 个任务。**关键排期事实：S37-1 / S37-2 / S37-3 三项共约 5 周
+可完全在 Linux 上完成并验证**，且每项对现有代码库都是净收益 —— 应先行吃掉，
+把风险最高的 S37-4 / S37-5 攻击面压到最小。
 
-1. `KeyDir::key_length_histogram()`（`keydir.hpp:389-396`，现仅测试在用）接出诊断口：
-   `Cask` 新增只读访问器（不进 `StatusInfo`，避免无谓的公共结构体膨胀）。
-2. keydir RSS 估算口径落地：`key_count × (40 + avg_key + 槽位开销)`，
-   在访问器返回里直接给出估算字节数。
-3. 新增 `bench/range_bench.cpp`：现状 O(全表) prefix 扫描基线
-   （`CaskIter::start(key_prefix)` 路径），OKI 落地后同 bench 对比。
-- **工作量**：半天
-- **验收**：ctest 全绿；bench 可跑出基线数字；build-rel 双树（新公共访问器）
+### 面积实测（2026-08-07，开工前重新量过）
 
-#### ✅ S33-1 落地记录（2026-07-31）
+初版设计稿的 `::open` 计数把 `HintFile::open` / `MmapSegment::open` /
+`OkiRunReader::open` 一类**成员函数**误算在内。剔除后的真实裸 POSIX 调用面：
 
-**一处与原计划的偏离**：`Cask::keydir()` 公共访问器**已存在**（`cask.hpp:751`），
-无需新增——直方图本就可达。实际改动收窄为：
-- `SeqShardTable` 加 `values_capacity()` / `bucket_count()` 诊断访问器；
-- `KeyLenHistogram` 扩展 5 个内存估算字段（`key_bytes` / `entry_slot_bytes`
-  （capacity 口径——vector 空闲槽照样占 RSS）/ `bucket_bytes` / `heap_key_bytes`
-  / `estimated_bytes`），`keydir_test` 断言口径；
-- `bench/range_bench.cpp`：`BM_Cask_PrefixScan_Baseline`（100k key，选择性
-  1/16 vs 1/256）+ `BM_KeyDir_MemProbe`。
+| 调用 | 处数 | 主要分布 |
+|---|---|---|
+| `::close` | 53 | 向量插件错误路径（一个 open 对应 6-8 个 close）|
+| `::open` | **13** | hnsw ×4、ivf_rq ×2、diskann ×2、segment_v2 ×1、file_lock ×1、file_util ×1、sealed_segment_vector_plugin ×1、posix_file ×1 |
+| `::fstat` | 8 | 同上，全部用于取文件大小（1 处取 dev/ino）|
+| `::fdatasync` | 8 | file_util `flush_and_sync` 为主 |
+| `::ftruncate` | 4 | file_lock、vec 追加回滚 |
+| `::pread`/`::pwrite` | 4 / 3 | posix_file + file_lock |
+| `::lseek` | 3 | posix_file |
+| `::stat`/`::unlink`/`::madvise` | 2 / 2 / 2 | — |
+| `::mmap`/`::munmap`/`::fsync`/`::fileno` | 各 1 | 已收敛（S36-B3）|
 
-**基线数字（tmpfs，build-rel，负载下量的粗锚点）**：选择性收窄 16×（6250→391
-条命中）耗时仅降 1.8×（15.1→8.3ms）——**O(全表) 实锤**（降幅来自省掉的
-value 读取，非扫描本身）。内存探针：11B 短 key 负载 ~122 B/key（含 capacity
-slack），100k key ≈ 11.6MB。
-
-### ✅ T23 落地记录（2026-07-31，随 S33-2 一并做）
-
-`detail/chunked_reader.hpp` 新建：三份手抄 refill 归并为 `ChunkedReader`
-（`avail/cursor/consume/refill/shrink`），`need` 公式统一为 hint 版（正确
-覆盖巨型 record 的 `len_ + need_hint`；data_file 版此前丢了 `len_ +`）。
-落点：`data_file.cpp::fold` + 新 `hint_file.cpp::fold_v5` 两站点——原 v2
-fold / fold_v4 两份手抄随 flag-day 整体删除，三胞胎实际收敛为 2 站点 1 实现。
-
-### S33-2 — flag-day 基建：hint BCH5 + meta v5 + 迁移工具 🔴 HIGH（发布边界）
-
-设计依据：设计文档 §3.4 / §7。**同步清单逐项勾销，缺一即数据错读**：
-
-- [x] `format.hpp`：BCH5 常量（`kHintMagicV5`）+ 布局注释；`kHintMagicV4` 保留
-      （识别/拒收用）；v2 定宽常量（`kHintRecordSize`/`kMaxOffsetV2`/`kTombMaskV2`）删除
-- [x] `codec.hpp::HintRecord`：加 `ord` 字段；`encode/decode_hint_record_v5`
-      （prev_end/prev_ord 双差分 in/out 引用）；v2 与 v4 编解码整体删除
-- [x] `hint_file.cpp/.hpp`：写端 BCH5（`write(..., ord)`，`prev_ord_` 串联）；
-      读端仅 `fold_v5`（ChunkedReader）；v2 fold / fold_v4 删除
-- [x] `merger.cpp`：merge 写 hint 传 `view.ord`
-- [x] `cask_recovery.cpp` hint 快路径：`put(..., rec.ord)` + `advance_ord`
-      （含墓碑）；**顺手修**：fold(data) 墓碑分支原本不 `advance_ord`
-      （文件尾墓碑 → 重启 ord 复用的潜在隐患），已对齐
-- [x] `meta_file.cpp`：`kMetaVersion = 5`；v4 拒绝分支（提示 hintord）；
-      `meta_file.hpp` 头注释修正（原写 v2）；**顺手修**：`Cask::open` 两处把
-      `MetaError.message` 吞成笼统 "read meta failed"——门禁迁移提示传不到
-      用户，已透传
-- [x] `migrate.{hpp,cpp}` + `tools/bitcask_migrate.cpp`：`migrate_hint_ord`
-      （前置校验 src=v4 → data 硬链接（跨设备退化拷贝）→ DataFile::fold 重扫
-      生成 BCH5 hint → meta 最后写 = commit point，幂等）；be2le/tstamp64 目标
-      纪元同步 bump 到 v5；`detect` 识别 v4/v5。`--prebuild-oki` 未留桩（S33-4 实装时加）
-- [x] 测试：HintRecordV5 golden/回绕/流式/短读（codec_test）；HintFileGolden
-      双向 v5 golden；Bch4LegacyFileRejected 三入口全拒；MetaV4CleanlyRejectedWithHintordHint；
-      MigrateHintOrdV4EraDirOpensAndReads（含 data 字节零改动断言 + 幂等 + 已 v5 拒迁）；
-      **HintAndDataFoldRecoveryOrdEquivalent**（含 merge 后，逐 key ord + next_ord 水位双等价）
-- [x] 文档：`doc/format-zh.md`（hint v5 / meta v5 表与版本策略，顺手修正 §3
-      的 v3 陈旧描述与缺失的 VecEngine 字段）/ `doc/migrate-le.md`（统一入口
-      提示）/ 设计文档 §7（派生缓存不迁移，对齐工具惯例）；CHANGELOG 发布时补
-
-- **工作量**：1.5~2 天（实际 1 天内，与 T23 一并）
-- **验收**：✅ Debug 全量 **650/650**（648 基线 + 新测试；1 预存 Disabled）
-  | ✅ build-rel 全量零错误（含 bench，公共 API 双树验证）| ASan 全量见状态快照
-- **备注（偏离记录）**：
-  1. 计划说"BCH4 读端干净报错提示迁移"——实现为 `validate_trailer`/
-     `fold_validated` 对非 BCH5 magic 返回 **false（退 fold(data) 重建）**、
-     仅 `fold()` 报错：hint 是派生缓存，陈旧格式当"缓存不可用"处理比硬报错
-     更符合语义；纪元硬门禁由 meta v5 承担（v5 目录里本不该有 BCH4 hint，
-     出现即用户手工拷文件，fold(data) 回退仍保正确性）。
-  2. "迁移幂等 + 中途 kill 注入"以"meta 最后写 + 删 dst 重跑"的幂等测试覆盖；
-     显式 kill 注入留给 S33-4 的 crash 套件统一做（迁移的 commit point 语义
-     已由"无 meta 的 dst 不可开"保证）。
-
-### S33-3 — OKI run 格式（BCOK v1）+ manifest（BCOM v1）🔴 HIGH
-
-- run：块式布局（~4KiB 块、块内 key 前缀差分、稀疏块索引、trailer CRC），
-  writer（流式 + 外排入口）/ reader（`seek(lo)` 二分 + 顺序游标）
-- manifest：run 集合 + `cover_ord` + 联合水位，`atomic_write_bytes(fsync_dir=true)`
-  唯一 commit point；未知 magic/ver 整体拒收 → 重建
-- 格式预留 Level B 全字段扩展位（flags + 可选字段区）
-- **工作量**：1.5 天
-- **验收**：round-trip / seek 边界 / 损坏拒收单元测试
-
-#### ✅ S33-3 落地记录（2026-07-31）
-
-新增 `include/bitcask/oki_run.hpp` + `src/fileops/oki_run.cpp`（挂
-`bitcask_fileops`）+ `tests/oki_run_test.cpp`（10 测试）。要点：
-
-- **格式简化**：块首条不设独立编码——每块解码状态复位（prev_key="" /
-  prev_ord=0），块首条自然退化为全量 key + 绝对 ord，读写两端同一条码路径。
-- trailer 扩为 24B（+entry_count u64）；ord 差分与 hint v5 同款回绕语义。
-- **flags 未知位 fail-fast**（Level B 扩展位预留），专项测试绕过 CRC
-  重算后单独验证该门。
-- reader open 时**全文件 eager CRC**（派生缓存，安全优先；惰性/分块校验
-  留作后续优化），稀疏索引载入内存，Cursor 按块 pread。
-- 顺手：`detail::AtomicFileWriter` 补移动语义（T21 基建缺口，OkiRunWriter
-  按值持有需要；源移出标记 committed_ 防双清理）。
-- 测试含：多块 round-trip（乱序 ord/墓碑/`prefix:id` 形态）、100 长公共
-  前缀 + 二进制 key、块界全覆盖 seek（每个存在 key 精确 seek + seek 后
-  顺序推进）、writer 乱序/重复/finish 后拒写、弃写不留残件、四区域翻
-  bit + 截尾拒收、manifest 逐字节翻 bit 全扫。
-- **验收**：OKI 10/10；Debug 全量 663/663；**ASan 全量 663/663**；
-  TSan 相关套件（KeyDir/Concurrent/Parallel/CaskDocValue/Oki）137/137
-  （按 CI 门控豁免 1 项既知 seqlock 误报，见 ci.yml TSan 豁免注释）。
-
-### 🔴 S33-B1 —（S33-3 期间发现）纯 KV 并行恢复墓碑复活 bug 修复
-
-**Phase 7 头号盲区（Tombstone 语义 / basho #82 删除复活类）的现行实例**，
-由 S33-2 新增的 `MigrateHintOrdV4EraDirOpensAndReads` 首次暴露（8/30 flaky）：
-
-- **根因**（两个缺口叠加，均为既有代码，非 flag-day 引入）：
-  ① `put_insert` 命中墓碑**无条件复活**（不比对任何新旧）；
-  ② key 尚未插入时 `remove` **不留任何标记**直接返回。
-  R3 的纯 KV 并行恢复（按文件并发 fold）下，「墓碑文件先于 put 文件完成」
-  或「remove 先到 + put 后到」皆复活——到达序依赖。串行恢复（按 tstamp
-  升序）从未触发，故一直潜伏。
-- **修复**（ord 全序判据——恢复两路 BCH5/data fold 皆有 ord，无平局）：
-  `KeyDir::remove` 增 `ord` + `insert_tombstone_if_absent` 参数（默认值
-  保持旧语义）；墓碑 sentinel 记 ord，重复 remove 推进 ord 高水位；
-  `put_insert` 复活门：`!newest_put` 且墓碑 ord≠0 时须 `put.ord > 墓碑 ord`。
-  运行期路径（newest_put、ord=0 墓碑、链重放）语义零变化。缺席 sentinel
-  走 S29-6 P1 既有墓碑清扫回收。
-- **验收**：flaky 复现 8/30 → 修后 40/40 稳过；keydir 新增 3 测试
-  （复活门 / 双 remove 高水位 / 运行期旧语义留存）；Debug 全量 663/663 +
-  ASan 全量 663/663 + TSan 相关套件 137/137（CI 门控口径）。
-
-### S33-4 — memdelta + 写挂钩 + flush/恢复 🔴 HIGH
-
-- memdelta 单写者结构（锁独立于 keydir 分片锁全序）；put/remove 成功后单一挂钩点
-- flush 触发（条数/字节阈值 + close 收尾）；open 恢复：manifest 校验 → tail 重放
-  （`ord > oki_wm` 喂 memdelta，hint/fold 两路皆可，靠 S33-2 的 BCH5）
-- 全量重建路径（复用 save_snapshot 遍历 + 外排）；`bitcask_migrate --prebuild-oki` 实装
-- put 路径回归预算 **≤3%**（`keydir_bench` 挂钩前后对比），超预算换 append+惰性排序
-- **工作量**：2 天
-- **验收**：crash 注入套件（flush/manifest 各阶段 kill）；put 回归达标
-
-#### ✅ S33-4 落地记录（2026-07-31）
-
-新增 `oki_state.hpp` + `src/fileops/oki_state.cpp`（OkiState：memdelta/
-flush/rebuild/水位）+ `tests/oki_recovery_test.cpp`（5 集成测试）。要点：
-
-- **挂钩收敛到 KeyDir::put/remove 咽喉点**（比原计划的"Cask 各写路径挂钩"
-  更深一层）——Cask 侧零逐点改动，未来新增写路径自动覆盖（设计 §8 难点 1
-  的结构性对策）。锁外执行（分片/meta 锁释放后），锁序不交叉。过滤规则：
-  merge 搬迁（old_file_id≠0）不收；`ord < wm` 的 tail 重放旧行由水位门
-  自动丢弃——**恢复路径因此零逐点改动**（fold/hint/链重放全自动生效）。
-- **wm 语义定为排他上界**（= 尚未覆盖的最小 ord）。发现并绕开一个 ±1 深坑：
-  `alloc_ord` 首个 LSN 是 **0**，含上界语义表示不了「已覆盖 ord 0」vs
-  「未覆盖任何」——排他语义下 ord 0 自然纳入，全部特判消失。
-- **快照崩溃窗口的闭环**：flush 恒在 write_keydir_snapshot 之后同站点搭车
-  （close/merge 收尾/成对 ckpt base）；快照自身 next_ord 在链重放前捕获
-  （RecoverySnapshots.snap_next_ord）；open 收尾 `wm < snap_next_ord` 或
-  manifest 缺失/损坏 → 全量重建（迭代 keydir 活 key 排序写单 run）。
-  重建只在 rw 句柄做，best-effort 不阻断 open。
-- 阈值 flush：写路径探询 `should_flush()`（1M 行/64MiB，无锁 hint），超限
-  同步落 run；flush 换出 memdelta，IO 期间 append 不被阻塞，失败放回队头。
-- **put 回归实测**：KeyDir 微基准 52→67ns（+29.6%——无 IO 口径放大，且
-  bench 中 memdelta 无界增长）；**Cask put 全路径 1246ns，挂钩 ≈15ns ≈
-  1.2% ≤ 3% 预算达标**（预算口径即 put 路径）。
-- **计划偏离**：`--prebuild-oki` 未实装（推 S33-5/6——迁移后首开的自动
-  重建已覆盖语义，prebuild 只是省一次重建耗时的锦上添花）。
-- 测试矩阵：干净关闭（run 内容/墓碑去重/wm 追平）；重开零重建（gen 集
-  不变 + memdelta 空）；**fork crash 后 tail 重放**（checkpoint 已 flush
-  一半 + 崩溃丢另一半 → 旧 run 保留 + 新行进 memdelta，不触发重建）；
-  manifest/runs 全删 → 全量重建（活 key 覆盖、删除键缺席）；快照缺口
-  （manifest 回滚 wm=0）→ 重建追平。
-- **验收**：Debug 全量 **668/668** | **ASan 全量 668/668** |
-  **TSan 并发套件 142/142**（CI 门控口径）| build-rel bench 零错误。
-
-### S33-5 — Range 查询路径 🔴 HIGH
-
-- `Cask::make_range_iter(RangeOptions{lo,hi,...})`：manifest 快照 pin runs →
-  k 路归并（runs + memdelta，同 key max-ord 胜、tomb 抵消）→ 逐 key 回查 keydir →
-  现有 `get` 取值（零拷贝）
-- 一致性：per-key 弱一致，API 注释言明（非 fold 快照语义）
-- **三方对拍**：`range(lo,hi)` vs 全表 `CaskIter`+过滤+排序 vs 影子 `std::map`，
-  随机写/删/merge/crash 交错属性测试；每轮校验完整性不变量
-  （OKI key 集 ⊇ keydir 活 key 集）
-- **工作量**：2 天
-- **验收**：对拍 + 完整性测试全过；TSan 树（writer + N range iter + merge 并发）
-
-#### ✅ S33-5 落地记录（2026-07-31）
-
-新增 `src/cask/cask_range_iter.cpp`（`CaskRangeIter` + `RangeOptions`，
-cask.hpp 公共 API）、OkiState `make_read_view()`（runs 共享 Reader +
-memdelta 排序去重快照）+ `tests/oki_range_test.cpp`（3 测试）+
-`range_bench` OKI 对比项。要点：
-
-- **run Reader 常驻缓存**：load 时全量 CRC 校验并打开（任一坏 → 整体未
-  加载态 → 重建，S33-3 eager 取舍的落点）；flush/rebuild 随 manifest 提交
-  同步维护；shared_ptr 使在途 ReadView 安全跨越 rebuild 的旧 run 删除
-  （POSIX unlink 后已开 fd 仍可读）——"pin" 即持句柄，无需显式引用计数。
-- 归并：各 run `seek(lo)` + memdelta `lower_bound(lo)`，逐 key 取 max-ord
-  （不依赖"memdelta 恒新"假设）、tomb 抵消、`get_owned` 回查（kNotFound
-  跳过 = 陈旧行无害）；Entry 的 tstamp/ord 取 keydir 权威值。
-- **三方对拍**：12 轮 × 120 随机操作（put/覆盖/删/merge/close-reopen/
-  checkpoint 交错）× 每轮全域 + 3 随机窗口，range vs 全表过滤 vs 影子
-  map 逐 key 逐 value 相等；完整性不变量由「全域 range == 影子 map」蕴含。
-- 并发 stress：writer(4000 ops) + 3 range 读者 + 中途 merge——严格升序 +
-  零错误断言，20 连跑稳过；TSan 树重点目标。TSan 下经 S29-6 回退开关关闭
-  乐观读快路径（与 CI 既知豁免同根因的 seqlock 误报；OKI 层并发仍全程
-  受检，**未新增豁免条目**）。
-- **`--prebuild-oki`（S33-4 遗留）确认不再需要**：hintord 迁移产物首开
-  自动重建已覆盖（MigrateHintOrdV4EraDirOpensAndReads 即证），从计划移除。
-- **bench（vs S33-1 基线，同参数）**：选择性 1/256 时 8.01ms → **0.534ms
-  （15×）**，1/16 大窗口 14.3ms → 7.80ms（1.8×，value 读取主导）；OKI 耗时
-  随选择性线性下降（基线持平）——**O(range) 实锤**，S33-1 立的靶命中。
-- **验收**：Debug 全量 **671/671**（20 连跑稳定）| **ASan 全量 671/671**
-  （首轮 1 个无关既有测试 IndexPoolUnregister.Timeout* 在同机双 sanitizer
-  高负载下时序 flaky，单独 12 连跑 0 失败，非 OKI 回归）| **TSan 并发套件
-  157/157**（CI 门控口径，未新增豁免）。
-
-### 🔴 S33-B2 —（S33-5 并发测试发现）mmap 窗口外读竞态修复
-
-**S30 mmap × S13 分批 CAS 的既有竞态**，并发 range 读者首次稳定复现
-（3/3 读者中招），普通 get 在多批次 merge 期间同样可踩：
-
-- **根因**：S30 的前提是「只映射 sealed 文件」，但 `read_file` 无从判定
-  封口——merge 输出在分批 CAS（`kApplyBatch`/逐输入文件 apply）期间仍在
-  增长，读者以打开时刻的尺寸 mmap 后，**后续批次 CAS 的条目落在映射窗口
-  之外** → `read_mmap` kShortRead → get 报 kIo。S13-F5 的重试只覆盖
-  open-ENOENT 窗口，不覆盖此分支。
-- **修复**：`Cask::get` mmap 分支收窄错误处理——kShortRead（= 窗口外）
-  **跌落 pread**（fd 本就保留未关，条目本身有效），kBadCrc/其余仍报错。
-  零拷贝路径对窗口内读不变。
-- **验收**：并发 stress 修前 3/3 读者报错 → 修后 0/20 全过。
-
-### ✅ S33-6 — C API + 值预取 + bench + 文档 🟡 MED
-
-- [x] C API：`bitcask_range_iter_*`（顺手补现缺的 `key_prefix` 能力——
-      `bitcask_iter_start_prefix` + `bitcask_parallel_scan_prefix`）
-- [x] 值预取：`RangeOptions::prefetch`（parallel_scan 同款分段并发 get）
-- [x] `range_bench` 对比 S33-1 基线；RSS 探针扩展（memdelta/run/重建峰值）
-- [x] 文档同步：`api-cpp.md` / `api-c.md` / `format-zh.md` / `migrate-le.md` / README
-- **工作量**：1 天（实际 1 天内）
-- **验收**：✅ build-rel 双树 + bench 入基线（数字见下方落地记录）
-
-#### ✅ S33-6 落地记录（2026-08-03）
-
-C API `bitcask_range_iter_*`（6 个新导出 + 2 个新结构体）、
-`RangeOptions::prefetch`、bench 扩展、文档同步四块全部落地。要点：
-
-- **值预取**：`prefetch`（批大小）+ `prefetch_threads`（0 = min(hw, 4)）。
-  实现分层——归并层 `next_merged_key()`（串行、廉价）+ 取值层（分段并发
-  `get_owned`，与 `parallel_scan` 同款 JoiningPool）。**语义不变量：只改
-  取值时机，输出序与内容和惰性路径逐 key 逐 value 相同**（测试断言）。
-  死 key 在批内丢弃 ⟹ 缓冲可能空而迭代未结束（续跑路径专门测了「删掉
-  一整段 ≥ 最大批」）。
-- **计划外的一处调优**：线程是**每批**创建的（无常驻池），实测批 64 ×
-  4 线程比惰性还慢 50%（16.1 vs 10.8ms——98 批 × 4 次线程创建）。加
-  「每线程至少 64 key」的收窄后，小批自动退化为串行。最终数字（tmpfs、
-  1KiB 值、6250 命中）：惰性 10.8ms / 批 64 = 11.6ms（打平）/ 批 256 ×
-  4 线程 = **7.6ms（1.4×）**。收益形态是「大窗口 + 冷值」，故默认关闭，
-  头文件与 api-cpp 都写明了这条取舍。
-- **C API 补齐**：`bitcask_iter_start_prefix` / `bitcask_parallel_scan_prefix`
-  ——既有 C++ 形参在 C 侧一直缺口；实现上把**带前缀版做成主体**、无前缀版
-  以空切片调用它（零重复逻辑）。range 侧 entry 另立
-  `bitcask_range_entry_t`（无 file_id/offset/tomb——range 只产活 key）。
-- **bench**：`BM_Cask_RangeScan_OKI_Prefetch`（5 组参数，含同二进制内的惰性
-  对照）+ `BM_Oki_MemProbe`（memdelta 行/字节 + RSS 增量、run 字节/每 key、
-  **重建峰值 RSS**——后台采样线程取 max，计时段只含重建）。10 万 key 锚点：
-  memdelta 5.7MB（RSS +25.3MB 含 keydir）、run **6.2 B/key**（11B key 的前缀
-  差分效果）、重建峰值 +8.9MB / 49.5ms。
-- **文档**：`format-zh.md` §六 **重写**（原文还停在 v2/v4——S33-2 只改了常量
-  表，正文是漏网的陈旧描述）+ 新增 **§十五 OKI**（BCOK/BCOM 字节级布局 +
-  生命周期 + wm 排他语义）+ §14.2 补 `hintord`；`api-cpp.md`（§5.8 +
-  §6 CaskRangeIter + 线程表 + 示例）、`api-c.md`（§11.7 全套 + 所有权配对表
-  + 线程表 + §4.1/§7.5b 类型）、`migrate-le.md`（纪元 v3→v5 陈旧修正 +
-  OKI 不迁移行）、`README.md`（能力表 + 架构图）。
-- **顺手修（两处 OKI 重建的既有小疵，均为 S33-4 代码、未发布）**：
-  ① 零活 key（空库首开 / 全删后重建）仍落一个 entry_count=0 的空 run——
-  36B 文件 + 一个常驻 Reader fd，归并不出任何行，且要等下次 rebuild 才被
-  清；改为 manifest 记 0 run + `wm=cover_ord`（语义等价）。
-  ② 由 ① 的新测试逮出更实的一个：rebuild 的旧文件清理原本只遍历**内存
-  manifest 列出的 run**，而触发重建的典型场景恰恰是 **manifest 缺失/损坏**
-  （此时内存 manifest 为空）——那批 run 文件成了永不回收的孤儿，每重建一次
-  多一批。改为提交后按目录扫描删除一切非本次 run 的 `kv.oki.seg-*`。
-  新增测试 `RebuildWithNoLiveKeysWritesNoEmptyRun`（空库首开 + 全删后
-  删 manifest 重建，双形态各验 manifest 0 run + 目录零 seg 文件 + 水位追平
-  + 重建后 range 照常出货）。
-- **补实装 run 归并（设计 §5.2 的漏项，fd 探针实测发现）**：起因是复盘
-  「一个库同时开多少文件」——探针（scratchpad `fd_probe.cpp`）显示 1500 key /
-  37 个 data 文件的库共 45 个 fd（data read handle 37 个是大头且**有界**：
-  `max_read_handles=0` → RLIMIT_NOFILE 一半、下限 64），但 **OKI run 数 =
-  flush 次数线性增长且 merge 不回收**（5 次 checkpoint → 5 个 run），每 run
-  一个常驻 fd + open 期全文件 CRC + range 多一路归并，墓碑行还永远回收不掉。
-  设计文档 §5.2 本就写明「run 数 > N（默认 8）→ 归并成一个；全归并时墓碑真正
-  丢弃」，S33-4 首版只做了 flush 与 rebuild，这层漏了。现补
-  `OkiState::compact_all_locked`（k 路归并全部 run → 单 run，复用 range 同款
-  max-ord 归并；manifest 一次提交；旧 run 走 sweep_runs）+ 阈值常量
-  `kCompactRunLimit=8`。best-effort：归并失败不影响 flush 的成功语义。
-  **墓碑丢弃的正确性只在「全归并」下成立**（同 key 的 put 行与 tomb 行必定同在
-  本次归并里），已在头文件写明——将来若改部分归并必须收回此条。
-  探针复测：run 数呈锯齿 1→8→1，fd 有界。新增 2 测试
-  （`RunCompactionCollapsesRunsAtThreshold` 阈值内不归并/越阈值塌成 1 个 +
-  文件清理 + 水位不变 + 数据完整；`FullCompactionDropsTombstoneRows` 归并前
-  tomb 行在、归并后整条消失、活 key 齐全、**丢墓碑后重新 put 仍可见**）。
-- **fd 预算收口（承上条探针）**：`max_read_handles` 自动档加绝对上限 **1024**
-  （`kAutoReadHandleCeiling`，原来只有下限 64）——自动档是「RLIMIT_NOFILE 的
-  一半」，本机 rlimit 524288 ⟹ 26 万，等于没有上限。1024 个句柄在默认
-  `max_file_size=2GiB` 下对应约 2TB 数据，正常库碰不到；显式值不夹取。
-  **默认行为变更**，已进 CHANGELOG 的 Changed 段。`ReadHandleCap.ResolveSemantics`
-  加 7 条断言（封顶/边界内外/显式值不受影响）。
-  文档：`api-cpp.md` 新增 **§11 运维调优**（§11.1 fd/mmap 预算三段实测表 +
-  四步调优顺序；§11.2 merge 调度），`api-c.md` 新增 §6.5.1 同款；两处
-  `max_read_handles` 字段说明改写。**关键结论写进文档**：merge 按碎片率/死字节
-  触发，纯追加负载 `needs_merge` 恒 false（实测 89 文件 merge 前后不变）——
-  **merge 解决空间放大，不是 fd 预算手段**。
-- **CHANGELOG**：新增 `[5.1.0] - 未发布` 段（S33 全景：flag-day + OKI +
-  C API + 两个 B 级修复）；`project(VERSION)` 已 bump 到 **5.1.0**，
-  `SOVERSION` 随之保持 **5**（= major，CMakeLists 机械派生）。
-  **版本号定为 5.1.0 而非原计划的 6.0.0**（2026-08-03 复核后改）：本轮 C API
-  纯增量（新导出 6 个 range 函数 + 2 个前缀入口，既有签名/结构体布局零改动；
-  `.so` 导出表核实——改了签名的 `KeyDir::remove` / `HintFile::write` 均**未
-  导出**，只有 24 个头内联弱符号），ABI 未破坏。仓库先例即此规则：3.1.0 同样
-  是「盘上前向不兼容 + C API 增量」→ MINOR，SOVERSION 不动；4.0.0（结构体
-  布局）与 5.0.0（签名/字段宽度）才是真 ABI 破坏 → major。soname 换号挡的是
-  「二进制 × 二进制」，而这里的不兼容是「二进制 × 数据」，由 meta v5 门禁
-  承担，换号零收益却逼下游重链。
-- **验收**：Debug 全量 **675/675**（+4 新测试；1 预存 Disabled）|
-  **ASan 全量 675/675** | **TSan 相关套件 150/150**（CI 豁免口径，未新增
-  豁免；C API 新路径含 prefetch 也在 TSan 下跑过）| build-rel 全树零错误
-  （含 bench，公共结构体 `RangeOptions` 双树验证）。
-
-### ✅ S33-7 — Level B 门禁评审（2026-08-05 收口：**通过，立项 S36**）
-
-门禁数据（`doc:<n>` 真实形态直灌 keydir，`key_length_histogram` 口径）：
-1M → 96MB（100.7 B/key）；10M → 1.4GB（147.6，扩容相位最差点）；
-**100M → 11GB（118.1 B/key，大头是槽位 107.4 而非 key 本体）**。
-纯 KV 模式下 11GB 远超 40% 线 → **立项**。设计文档：
-[`doc/keydir-disk-resident-design-zh.md`](doc/keydir-disk-resident-design-zh.md)（S36）。
+**结论：核心 KV 路径（data_file / hint_file / oki_run / segment）早已走
+`io::PosixFile`，裸调用高度集中在向量插件（13 个 open 里占 8 个）。**
+S37-1 的实际工作量因此低于设计稿估计。
 
 ---
 
-## 🔵 S34：多键事务 helper（TxnCask）
+## 🔴 S37 主线
 
-> 来源：[`doc/multikey-txn-zh.md`](doc/multikey-txn-zh.md)（模式设想）→
-> [`doc/multikey-txn-impl-design-zh.md`](doc/multikey-txn-impl-design-zh.md)（实现设计定稿）
-> 决策基线：**方案 B**——库内应用层 helper，建在公共 API 之上，
-> 零盘上格式改动（否决引擎原生 commit marker——需 record 格式 flag-day，另行评估）。
-> 版本目标：随 **5.1.0**（未发布）出货（C API 纯增量，`SOVERSION` 保持 5，
-> 无盘上格式改动；若 5.1.0 已先行发布则为 5.2.0）。
+### 🟡 S37-1 — 平台抽象层收编 🔴 HIGH（先行，纯 Linux 可交付）
 
-### S34-1 — 设计稿 + 前提核实 🟢
+把散落的裸 POSIX 调用全部收进 `bitcask::io`，使「Windows 后端」= 新增一个
+`src/io/win32_file.cpp`，而不是改 20 个文件。**Linux 行为零变化**。
 
-- [x] 三前提核对（put_batch 契约 / sync / OKI range / remove 幂等）；
-      发现模式文档 4 处问题：§2.3 `.prefetch = true` 实为关闭（prefetch 是
-      size_t 批大小，0/1=关闭）、骨架 API 不存在（`valid()` 等）、
-      put_batch 不支持墓碑未提及、uuid txn key 的重放序 ≠ 提交序缺口
-- [x] `doc/multikey-txn-impl-design-zh.md` 定稿
-- [x] 参考笔记 `doc/pg-xid-mvcc-zh.md`（论证无需 XID 式回收）
+`io.hpp` 需补齐的 API（当前缺口）：
 
-### ✅ S34-2 — TxnCask 核心 🔴 HIGH
+1. `OpenFlag` 补 `kTruncate`(O_TRUNC) / `kWriteOnly`(O_WRONLY) —— 向量插件的
+   `O_RDWR|O_CREAT|O_TRUNC` 与 `O_WRONLY` 形态现无法表达，是这些站点绕过抽象的直接原因。
+2. `PosixFile::size()` —— 收编 8 处 `::fstat`（其中 7 处只为取大小）。
+3. `PosixFile::identity()` → `io::FileIdentity{dev, ino}` —— 收编 hnsw `.vec`
+   追加目标身份校验，同时把 `<sys/types.h>` 逐出**公开头** `hnsw.hpp:44`。
+4. `PosixFile::truncate(len)` —— 显式长度版（现仅有 `truncate_here()`），
+   收编 `file_lock` 的 `ftruncate(fd,0)` 与 vec 追加回滚。
+5. `io::sync_data(int fd)` —— 收编 8 处 `::fdatasync`。
+6. `io::sync_directory(path)` —— 收编 `file_util.hpp:96` 的 `O_DIRECTORY` 开目录 fsync
+   （Windows 下将降为 no-op，见设计稿 C5）。
+7. **`io::atomic_rename(from, to)`** —— 收编 `file_util.hpp:128/200` 的 `std::rename`。
+   **这是 C1（最高危项）的落点**：Windows 上 `std::rename` 目标存在即失败，
+   9 个原子写站点会全线挂。提前把它放到 seam 后面，Windows 侧只需改这一个函数。
+8. `MappedFile::prefetch(off, len)` —— 收编 `hnsw.cpp:1406` 的 `MADV_WILLNEED`。
+9. `io::page_size()` —— 收编 `hnsw.cpp:1380` 的 `::sysconf(_SC_PAGESIZE)`
+   （Windows 侧需区分 `dwPageSize` 与 `dwAllocationGranularity`，见设计稿 C7）。
 
-- [x] `include/bitcask/txn.hpp`：`TxnOp` / `TxnSyncPolicy` / `PendingTxn` / `TxnCask`
-- [x] `src/cask/txn.cpp`：commit（校验→意图→sync→apply→清理）、
-      recover（收集后前滚）、pending_txns、意图 blob v1 编解码、
-      进程级单调 seq txn key（设计 §3/§4/§5）
-- [x] CMake：挂 `bitcask_cask` target
-- **验收**：✅ ctest 全绿；txn TU 零新告警
+- **工作量**：2 周（面积实测后下修，原估 2 周含 51 个 open 的误算，实际净工作量约 1 周 + 验证）
+- **验收**：ctest 全绿（Debug 全量 + ASan）；bench 零回归（hot get / BOW / hnsw）；
+  build-rel 双树（`hnsw.hpp` 公开头改动）；`grep` 确认第一方裸 POSIX 调用归零
 
-### ✅ S34-3 — 测试 🔴 HIGH
+#### ✅ S37-1 落地记录（2026-08-07）
 
-- [x] `tests/txn_test.cpp`：设计 §9 全部用例落地为 9 个（含手写编码器
-      格式对拍 + fork 崩溃注入 CrashMidApplyRecovers + 乱序写入验证
-      重放序 = key 字典序）
-- **验收**：✅ Debug 全量 **684/684**（675 基线 + 9 新增）；崩溃注入稳过
+**seam 建立**：`io.hpp` 从「POSIX 文件 I/O 包装」升格为平台 seam——全库唯一允许
+直接调用宿主原语的地方是其实现文件（POSIX `src/io/posix_file.cpp`；Windows 将是
+`src/io/win32_file.cpp`）。核验：第一方 `src/` `include/` `c_api/` `tools/` 的裸宿主
+原语与 POSIX 头**双双归零**（唯一 grep 命中是成员函数 `SealedSegmentVectorPlugin::open`
+的误报）。
 
-### ✅ S34-4 — C API + 文档修正 🟡 MED
+**新增 API**：
+- 类型：`FileHandle`（+ `kInvalidHandle` / `handle_valid`）、`FileIdentity`、`FileMode`
+- `PosixFile` → `File`（`PosixFile` 留别名，既有 65 处引用零改动）+ `release()` /
+  `truncate(len)` / `size()` / `identity()`
+- `OpenFlag` 补 4 位：`kWriteOnly` / `kTruncate` / `kCloseOnExec` / `kSyncAll` / `kNoAppend`
+- 句柄级：`open_handle` / `close_handle` / `sync_data` / `truncate_handle` /
+  `handle_size` / `handle_identity` / `path_identity` / `pread_all` / `pwrite_all` /
+  `pread_once` / `pwrite_once`
+- 路径级：**`atomic_rename`（C1 落点）** / `sync_directory` / `flush_and_sync_stream` /
+  `remove_file` / `prefetch_range` / `page_size`
+- 进程级：`current_process_id` / **`process_alive`（C4/风险#2 落点）** / `max_open_files`
 
-- [x] `bitcask_txn_commit` / `bitcask_txn_recover` / `bitcask_txn_pending_count`
-      （每调用栈上构造 TxnCask；`c_api_test.c` 增 `test_txn` 冒烟全过）
-- [x] 模式文档 4 处修正（见 S34-1）；README / api-cpp §5.3 / api-c §10.3 /
-      CHANGELOG（并入 5.1.0 未发布条目）增量
-- **验收**：✅ ctest 全绿；build-rel 双树零错误（新公共头 txn.hpp）
+**收编站点**：`file_util.hpp`（原子写 ×2 + 目录 fsync + fdatasync）、`vec_disk_internal.hpp`
+（`pread_all`/`pwrite_all` 下沉，`TmpFile` 换句柄类型；数十处调用站点零改动）、
+`ivf_rq.cpp`、`diskann.cpp`、`hnsw.cpp`（站点最多）、`segment_v2.cpp`、`file_lock.cpp`、
+`cask.cpp`（进程原语）。`hnsw.hpp` 的 `dev_t`/`ino_t` 换 `io::FileIdentity`，
+**`<sys/types.h>` 逐出公开头**（原污染所有下游用户）。
 
-#### ✅ S34 落地记录（2026-08-05）
+**三处「像机械替换、实则会漂」的语义，已原样保留**（收编的主要风险都在这里，
+非 API 翻译）：
+1. **`O_APPEND` × `pwrite`**：`file_lock` 原用 `O_CREAT|O_EXCL|O_RDWR|O_SYNC`
+   （**无** `O_APPEND`），而 `OpenFlag::kCreate` 带 `O_APPEND`。POSIX 下
+   **`O_APPEND` 会让 `pwrite` 忽略 offset 改为追加**——锁文件的 `ftruncate(0)` +
+   `pwrite(0,…)` 覆盖写语义会被悄悄改掉（当前因先截断到 0 而结果碰巧一致，
+   但已不由 offset 决定）。为此新增 `kNoAppend`。
+2. **`O_SYNC` ≠ `O_DSYNC`**：库内其余写路径的 `kOSync` 映射到 `O_DSYNC`（S13-P2），
+   而写锁需要元数据也同步。为此新增 `kSyncAll`，未合并两者。
+3. **单次 pwrite ≠ 循环 pwrite**：`file_lock::write_data` 的 legacy 契约明写
+   「不循环，部分写也算成功」，套 `pwrite_all`（重试补齐）或 `File::pwrite`（循环）
+   都会改掉它。为此新增 `pread_once`/`pwrite_once` 与 `*_all` 并存。
 
-一次成型，无计划偏离。要点：apply() 为 commit ③ 与 recover 前滚的**同一
-实现**（PUT 集一次 put_batch + REMOVE 逐条——BatchItem 无墓碑形态）；
-recover 先全量收集再前滚，不在弱一致 range 迭代器活跃期间写库；意图 blob
-v1 布局由测试侧**独立手写编码器**对拍钉死，改任何一边必红。
-未提交（含前置的 pg-xid-mvcc 参考笔记与索引更新）。
+**两处刻意的收紧**（非纯搬运，已在代码注释标注）：
+- 4 处「开文件后 `::read` 读头部」改为 `pread_all` 定位读：消除对 fd 内部偏移的
+  依赖（正是 C3 要解决的形态），且短读由失败改为先重试补齐（更严，非放松）。
+- hnsw 两处 payload load 的身份收养由「按路径 `::stat`」改为「按已持有句柄
+  `handle_identity`」：排除「校验与收养之间路径被外部替换」的窗口。
 
----
+**构建**：`bitcask_format` 补 `PUBLIC bitcask_io`——`file_util.hpp` 经 `index_manifest.hpp` /
+`field_schema.hpp` / `oki_run.hpp` / `search_checkpoint.hpp` 传播到几乎所有下游，
+逐 target 补链接会变成打地鼠。无环（`bitcask_io` 不依赖 format）。
 
-## ✅ S35：引擎原生原子批（方案 C——kBatchHeader）
+**验收**：Debug 全量 **725/725**、**ASan 全量 725/725**、build-rel 双树零错误
+（1 项 S30RssProbe 预存 Disabled）。
 
-> 来源：用户拍板方案 C 取代方案 B 的提交路径。设计定稿：
-> [`doc/atomic-batch-design-zh.md`](doc/atomic-batch-design-zh.md)。
-> 核心：批头声明区间、区间完整即提交（无批尾 marker）；成员为普通
-> kDoc/kTombstone ⇒ 读路径零改动；meta v6 **懒升级**（首批前重写，
-> 未用批的目录停留 v5——保守纪元标记）；TxnCask 接口保留、commit
-> 重接、recover 保留意图重放（兼容方案 B 遗留 pending）。
+### S37-2 — 测试解耦：fork → exec-self 🔴 HIGH（纯 Linux 可交付）
 
-### ✅ S35-1 — 格式 + fold 区间语义 🔴 HIGH
+4 个测试文件用 `fork()` + `_exit()` 模拟崩溃恢复，是全套中最有价值的一批
+（WAL / torn tail / 墓碑复活门 / 原子批区间提交）：
+`crash_recovery_test.cpp`、`oki_levelb_test.cpp`（`:476` `:565` `:787`）、
+`oki_recovery_test.cpp`、`txn_test.cpp`（`:182`）。
 
-- [x] `format.hpp`：`kBatchHeader = 2` + 批头 value 布局（`[u8 ver][u32 count][u64 span_bytes]`，13B 定长）
-- [x] `codec`：`encode/decode_batch_header_value`（拒收错长/错版/count=0/span=0）
-- [x] `data_file.cpp` fold：批区间内不推进 lve、区间收口一次推到位、
-      不完整（越 EOF/批头畸形/嵌套批头/记录跨界）→ break，lve 停批头起点；
-      区间内单条 CRC 腐蚀走 tolerate 跳过（位腐蚀逐条降级，原子性只承诺崩溃）
-- [x] codec 金测（枚举值 + 批头 value 黄金字节 + 拒收）
+改为「子进程 = 重新 exec 测试二进制自身 + `--bitcask-child-scenario=<name>` argv 分发」，
+父进程 `posix_spawn` + `waitpid`（Windows 侧换 `CreateProcess` + `WaitForSingleObject`）。
 
-### ✅ S35-2 — meta v6 懒升级 🔴 HIGH
+> ⚠️ **实质工作量在语义差异**：exec-self 下子进程不再继承 fork 时刻的内存状态
+> （已建好的 keydir、已打开的句柄）。每个 case 需逐个确认能否改为「子进程自己重建」，
+> 不能的要重新设计断言。这不是机械改写。
 
-- [x] `kMetaVersionBatch = 6`，读端收 v5/v6，`MetaConfig::version` 回填/写出；
-      **顺手修**：`write_meta` 原为裸 ofstream（非原子、无 fsync）——改
-      `atomic_write_bytes(fsync_dir=true)`；`Cask::upgrade` 补纪元保留
-      （原会把 v6 目录降回 v5）
-- [x] 懒升级入口（put_batch_atomic 内、write_mu_ 下、首个批字节进写缓冲之前）
-- [x] `bitcask_migrate detect` 认 v6 + usage 表补行
+顺带清理：`::getpid()` 造临时目录（4 处）、硬编码 `/tmp`（`scanner_test.cpp:53`）、
+`<dirent.h>`（`thread_pool_test.cpp`）、直接 `stat` 断言 inode
+（`cask_docvalue_test.cpp:38`、`hnsw_test.cpp:38`，改用 S37-1 的 `FileIdentity`）。
 
-### ✅ S35-3 — 写路径 + 恢复 + merge 🔴 HIGH
+- **工作量**：1 周
+- **验收**：ctest 全绿；4 个崩溃场景的原有断言意图全部保留（逐条对照 review）
 
-- [x] `Cask::put_batch_atomic(std::span<const BatchOp>)`（镜像 put_batch：
-      校验+值预编码 arena→懒升 v6→roll→批头+成员 write_buffered→flush→
-      hint（仅成员）→keydir put/remove→索引 Add/Delete + BatchOrdGuard
-      含批头 ord；merge-race 重试落区间外，独立完整记录）
-- [x] `cask_recovery.cpp` data fold 回调批 staging（apply_rec 提取共用、
-      拷贝暂存、区间收口依序放行、fold break 即弃）
-- [x] `merger.cpp`：批头 skip（成员为普通类型走既有路径，keydir 即活性权威）
-- [x] `tests/atomic_batch_test.cpp` 7 用例：可见性/hint-data 双路对拍、
-      meta 懒升级、掐尾批不可见+截断回批头起点、掐进批头、merge 交互、
-      TxnCask 重接掐尾、批后追加恢复。崩溃模拟 = 删派生缓存
-      （hint/kv.keydir.ckpt/kv.oki.*）+ resize_file，确定性无 fork
+#### ✅ S37-2 落地记录（2026-08-07）
 
-### ✅ S35-4 — TxnCask 重接 + 文档 🟡 MED
+**骨架**：`tests/support/crash_child.{hpp,cpp}` + `crash_main.cpp`，聚成
+`bitcask_test_crash_child` 静态库（用它的目标链 `GTest::gtest` 而非 `gtest_main`
+——需在 `InitGoogleTest` 之前拦截参数分发）。子进程 = `posix_spawn` 本测试二进制
+自身 + `--bitcask-crash-child=<场景> --bitcask-crash-dir=<路径>`。
+Windows 分支（`CreateProcessW`）已留位并标注 S37-5。
 
-- [x] `txn.cpp` commit → 一次 `put_batch_atomic`（意图日志退役热路径，
-      写放大 2-3× → 1×）；recover/pending_txns 保留 legacy 意图重放
-- [x] S34 九用例零改动回归全绿；C API 增 `bitcask_put_batch_atomic` 直通
-- [x] format-zh §3/§4.2/§4.5、multikey-txn 系三文档、api-cpp/api-c、
-      README、CHANGELOG（并入 5.1.0 条目，标注 v6 懒升级语义）
-- **验收**：✅ Debug 全量 **692/692**（684 + 8 新增）+ build-rel 双树零错误
+**6 个 fork 点全部转换**：`crash_recovery`(mid_put)、`txn`(txn_crash_after_commit)、
+`oki_recovery`(oki_crash_tail)、`oki_levelb`(b1_checkpoint_fsync /
+crash_after_merge / retired_files_crash)。事前担心的「依赖 fork 时刻内存快照」
+**未发生**——6 个场景全部形如「`Cask::open(dir)` → 干活 → `_exit(N)`」，唯一
+输入是目录路径。
 
-#### ✅ S35 落地记录（2026-08-05）
+**⚠️ 本届最值得记住的一条：`return N` ≠ `_exit(N)`，且失败形态是静默的**
 
-关键设计落点与探查结论：**批头 header-first + 「区间完整 ⟺ 已提交」**
-（头+成员同一次 flush pwrite，无批尾 marker）；**成员用普通
-kDoc/kTombstone 类型** ⇒ get/iter/merge/hint 读路径零特判（探查确认
-keydir 是全部读路径的唯一入口，批头永不进 keydir）；「封口 ⟹ 已提交」
-不变量使 hint 快路径零改动；meta v6 懒升级使不用原子批的目录与 5.1.0
-读端完全互通。测试期发现：掐尾模拟必须同时删 keydir 快照/OKI 派生缓存
-（否则批成员经快照复活——真实掉电下这些缓存同样不会覆盖撕裂批）。
+改造初版让场景函数 `return` 退出码。**编译通过、6 个里 4 个照样 PASS。**
+但 `return` 会正常展开栈 → 局部 `Cask` 析构 → `close()` → **OKI flush +
+写锁释放**，注入的崩溃态当场消失：那 4 个测试的断言在「干净关闭」下同样成立，
+于是**不声不响地不再检验崩溃路径**。只有 2 个（OKI tail 重放 / B1 不变量）
+因为断言了「必须存在未固化的尾巴」才炸出来。
 
-**收尾验证（2026-08-05）**：
-- **ASan 全量 692/692**（无豁免）；
-- **TSan 相关套件**（KeyDir/Concurrent/Oki/Txn/AtomicBatch/CaskDocValue）
-  按 CI 门控口径全绿——唯一失败为 ci.yml:159 明文豁免的既知 S29-6
-  seqlock 误报（`KeyDirOptimisticRead.ConcurrentGetPutRemoveGrowStress`），
-  非 S35 回归；
-- **bench 锚点**（`BM_Cask_PutBatch(Atomic)`，bench/cask_bench.cpp 新增）：
-  原子批 vs put_batch **零可测回归**（8/64 档噪声内；512 档 -15%——arena
-  预编码比逐条 thread_local 编码缓存友好）。写放大 1×（批头 40B/批），
-  对比方案 B 意图日志的 2-3×。数字入设计文档 §8。
+排查证据：子进程跑完后目录里**没有 `bitcask.write.lock`**、且已出现 `seg-2`
+（第二段被 flush 成 run）——正常关闭的指纹。
 
-S34 已由用户提交（dc81bbc）；S35 改动未提交。
+**修法是把契约做成强制的**，而非写进注释靠自觉：
+- 场景函数返回类型改 `void`，退出一律经 `crash_exit(code)`（`_Exit`，不展开栈）；
+- 场景函数若正常走到结尾（忘了调），骨架带诊断以 122 退出，**不当作成功**。
 
----
+修后复验：子进程目录里写锁残留、只有 `seg-1`，与原 fork 版指纹一致。
 
-## 🔵 S36：keydir 磁盘驻留（OKI Level B）
+**顺带清理的 POSIX 依赖**（新增 `tests/support/test_paths.hpp`）：
+- `::getpid()` ×9 文件 → `test_pid()`（走库的 io seam，Windows 已覆盖）
+- 硬编码 `/tmp` 负面路径（`scanner_test`）→ `nonexistent_path()`
+- `<dirent.h>` 枚举 `/proc/self/task`（`thread_pool_test`）→ `std::filesystem`；
+  **`/proc` 本身无 Windows 对应物**，已标注 S37-5 需换
+  `CreateToolhelp32Snapshot` 或把该用例整体标 Linux-only
+- `::stat` 断言 inode/size（`hnsw_test` ×4、`cask_docvalue_test` ×3）→
+  `identity_of()` / `file_size_of()`；`::truncate` → `fs::resize_file`
+- `tests/` 下 POSIX 头（`<unistd.h>`/`<sys/wait.h>`/`<sys/stat.h>`/`<dirent.h>`）
+  **归零**
 
-> 来源：S33-7 门禁通过（100M `doc:` key 实测 keydir 11GB）。设计定稿：
-> [`doc/keydir-disk-resident-design-zh.md`](doc/keydir-disk-resident-design-zh.md)。
-> 核心：哈希 keydir 降级热点缓存，点查权威 = cache → memdelta →
-> **BCOK v2 全字段 run**（+内嵌 bloom + 块 LRU）；(ord, run_gen) 胜出格
-> 取代 epoch；merge 活性/搬迁改走统一 `locate()`（Level A「零交互」反转）；
-> **零 flag-day**（run 是派生缓存，版本升级自愈）。目标：100M key
-> 11GB → ~1.2GB（-90%），热 get 零回归、冷 get ≤2 次 pread。
+**W1 现状复核**：exec-self 已让 fd 继承成为真实语义面，但**当前 6 个场景不触发**
+——父进程都是「先 spawn 后重开」，spawn 时手里没有打开的 Cask。W1 仍待评估。
 
-### ✅ S36-1 — BCOK v2 格式 + 外排 rebuild 🔴 HIGH
+**验收**：Debug 全量 **725/725**（含 6 个崩溃场景）；ASan 全量 725/725。
 
-- [x] v2 行（全字段 vbyte + tomb 免位置 + tstamp 块内回绕差分）+ bloom
-      内嵌（FNV-1a64+splitmix64 双哈希，10 bits/key k=7，格式常量钉死）
-      + 32B 尾部；读端 v1/v2 双版本、未来版本拒收；`may_contain` v1 恒 true
-- [x] BCOM v2（条目带 format_ver，**惰性版本选择**：全 v1 → 写 v1 字节
-      老读端可读；含 v2 → v2，老读端拒收自愈）
-- [x] `SpillingRunBuilder` 外排（64MiB 分段 spill `kv.oki.spill-*` +
-      k 路归并；同 key 胜出 = max (ord, 来源序)——与 (ord, run gen) 格
-      同构；drop_tombstones 档位供全归并；sweep 顺带清崩溃残件）；
-      `OkiState::rebuild` 切外排（原全内存 sort 退役）
-- **验收**：✅ `oki_run_v2_test` 11 用例（roundtrip/bloom 无假阴性 +
-  FP<5%/seek/未知 flags/未来版本/坏 bloom/v1 兼容/外排 3 万行对拍/墓碑
-  丢弃/manifest v2）；v1 回归 10/10 + oki_recovery 8/8；**重建峰值探针：
-  500 万行 spill=64MiB → 峰值 RSS 83MB**（旧全内存 sort 同规模 ~400MB，
-  100M 档 GB 级）；v2 行实测 **33 B/行**（优于设计预估 45B）；
-  Debug 全量 **703/703** + build-rel 双树零错误
+### S37-3 — SIMD 派发层分 ISA TU 🔴 HIGH（大部分纯 Linux 可交付）
 
-#### ✅ S36-1 落地记录（2026-08-05）
+**当前状态：MSVC 下所有 SIMD 内核被 25 处 `#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))`
+守卫整体编译掉，静默退化为 scalar 且不报错。** 即「能编过」与「有 SIMD」差一整个阶段。
 
-一处实现期修正：Cursor 持 Reader 裸指针，归并源 vector 必须先 reserve
-锁容量、Source 落位后再建游标（先建再 move 会悬垂——已修并注释）。
-spill 文件不 fsync（临时件，崩溃 = 整次构建重来，派生缓存语义；最终
-run 的 finish 才带 fsync_dir）。未提交。
+1. 新建 `src/simd/`：`cpu_features`（CPUID 探测）+ `kernels_{sse42,avx2,avx512,vnni}.cpp`
+   + `dispatch.cpp`（函数指针表）。CMake 按 TU 施加 `/arch:`（MSVC）或 `-m*`/target 属性（GCC/Clang）。
+2. **3 个公开头 + 1 个内部头交出内联内核**：`bm25_kernels.hpp`、`detail/int8_kernels.hpp`、
+   `hw_crc32.hpp`、`src/vector/hnsw_kernels.hpp` —— 跨 TU 边界迁移，内联被切断处须实测无回退
+   （`bm25_kernels` 在 BOW 热路径上最需盯）。
+3. `__builtin_cpu_supports`（18 处）→ 自实现 CPUID。
+   **必须同时检查 `XCR0`**（AVX 需 OSXSAVE + XCR0[2:1]，AVX-512 还需 XCR0[7:5]）——
+   `__builtin_cpu_supports` 替我们做了这步，手写漏掉会在「CPU 支持但 OS/hypervisor
+   未启用 YMM/ZMM 保存」的机器上直接 `#UD`，且只在特定虚拟化环境复现。**须写单测**。
+4. **收紧 AVX-512 运行时门为 `F && CD && BW && DQ && VL`**：MSVC 的 `/arch:AVX512`
+   隐含此集合，比代码当前 `target("avx512f")` 的窄集更宽，编译器可能在胶水代码里
+   生成 BW/DQ/VL 指令而门只查了 F → 在仅 F+CD 的 CPU 上 `#UD`。
+5. 机械替换：`__builtin_ia32_pause`→`_mm_pause`、`__builtin_popcount*`→`std::popcount`、
+   `__builtin_memcpy`→`std::memcpy`、`__attribute__((noinline))`→宏、
+   `#pragma GCC visibility`（`c_api/internal.h`）删除（靠已有 `BITCASK_API`）、
+   25 处 `__x86_64__` 守卫 → `BITCASK_X86_64` 宏（注意 `cask.cpp:1253` 未带编译器条件）。
+6. **新增 `BITCASK_SIMD_MAX=scalar|sse42|avx2|avx512` 强制降档开关**：让 CI 在同一台机器上
+   把所有 ISA 档位都跑一遍对拍，而不是听天由命看 runner 的 CPU 型号。Linux 侧同样受益。
 
-### ✅ S36-2 — 全字段 delta + locate() 影子对拍 🔴 HIGH（安全网）
+- **工作量**：2-2.5 天设计 + 2 周实现
+- **验收**：全 ISA 档位对拍（`int8_kernels` 既有 `self_test` + BM25/intersect/crc32
+  scalar-vs-SIMD）；bench 零回归；**仓库既有纪律「改评分算法必须过三方穷举对拍」在此适用**
 
-- [x] DeltaRow 加宽（+SingleEntry）；搬迁/TTL 挂钩（keydir 咽喉点反转
-      old_file_id!=0 跳过规则）；统一 `locate()` 原语
-- [x] **影子模式**：缓存不逐出，get 双查对拍（debug 断言组合视图 == 哈希
-      权威）——零漂移是 S36-4 开逐出的前置门
-- **验收**：✅ 全量 ctest + 对拍零漂移；put/merge 回归 bench（put ≤3%）
+### S37-4 — MSVC 构建适配 🟡 MED（首个需要 Windows 环境的任务）
 
-#### ✅ S36-2 落地记录（2026-08-06）
+1. **编译第一天必炸三项**：`/utf-8`（187 源文件中 **181 个含中文注释**，不给此项 MSVC
+   按系统 ANSI 代码页解析，中文字节吃掉后续代码报无从溯源的 C2001/C4819）；
+   `NOMINMAX` + `WIN32_LEAN_AND_MEAN`（`windows.h` 的 `min`/`max` 宏 vs 全库 94 处
+   `std::min/max`，且 `windows.h` **只准进移植层 TU**）；`/bigobj`。
+2. `CMakeLists.txt:30-113` 全部 GCC/Clang 选项加 `if(MSVC)` 分流（映射表见设计稿 §1.2）。
+   `/W4` 首轮**不开 `/WX`**（MSVC 独有告警 C4267/C4244/C4100 会刷屏并阻塞进度），
+   逐条清理后再开。
+3. **静态库合并重写**：`CMakeLists.txt:458-471` 在配置期生成 bash 脚本跑 `ar x`，
+   Windows 无 bash/ar。改 `OBJECT` 库 + `$<TARGET_OBJECTS:>`。
+   **顺带修既有隐患**：`ar x` 把 13 个归档解到同一临时目录，不同库中的**同名 `.o`
+   会静默相互覆盖** —— 当前是否已发生取决于文件名巧合，属定时炸弹。
+4. install 规则补 Windows 布局（`RUNTIME`→`bin/`、`ARCHIVE`(.lib)→`lib/`；
+   现二者都指向 `LIBDIR`）。
+5. vcpkg manifest 承载 zlib + TBB；cppjieba/limonp 在 MSVC 下的可编译性实测。
 
-核心落点（`oki_state.{hpp,cpp}` / `keydir.{hpp,cpp}` / `cask_recovery.cpp`
-+ 新 `tests/oki_locate_test.cpp` 6 用例）：
+- **工作量**：4-6 天
+- **验收**：MSVC 能编出 `bitcask.dll` + `bitcask.lib`；ctest 能跑起来（不要求全绿）
 
-- **DeltaRow 全字段**（`has_loc` + `RowLoc`，墓碑免位置）；写挂钩把
-  (file_id,total_sz,offset,tstamp) 一并送入。新 `append_update` 入口 =
-  「旧 ord、新信息」行（merge 搬迁 / TTL 墓碑），**绕过 wm 水位门**。
-- **同 key 胜出全链路统一 max (ord, 到达序)**：flush/read_view 换
-  stable_sort 取末、locate 辅助哈希 ord≥ 顶替、compact 归并 `>=`（等
-  ord **高 gen 胜**——搬迁行与被搬迁行同 ord 的判据，设计 §D2）、
-  SpillingRunBuilder 既有 (ord,seq)——同构一条规则。
-- **flush 改「拷前缀 → 提交 → 删前缀」**（原 swap+restore 退役）：IO
-  期间行仍在 delta_，locate 无「在写盘路上不可见」窗口（影子对拍在
-  checkpoint 并发下的必要条件）；失败路径零恢复动作。flush/rebuild 出
-  **v2 run**（manifest 惰性版本既有）；compact 全 v2 输入才出 v2（v1
-  混入则降 v1 保语义，点查能力待重建自愈）。
-- **`OkiState::locate`**（冷侧）：memdelta 辅助哈希（`enable_point_query`
-  开启时维护，key→最新行下标）→ runs gen 降序 bloom/seek 首命中即权威；
-  **v1 run → kUnavailable 降级**（绝不误答 kMiss）。runs 快照走
-  `atomic<shared_ptr>`——locate 不抢横跨长 IO 的 flush_mu_。
-  `KeyDir::locate` 统一原语 = 缓存 → 冷侧（get/merge/TTL 在 S36-3/5 接）。
-- **影子对拍**：get 拆薄包装 + `shadow_verify`；并发协议 = 写路径
-  `shadow_hooks_in_flight_` 括住「哈希更新可见→append 完成」窗口 +
-  失配时重读重试，稳定失配才 assert（`ShadowStats` 三计数，NDEBUG 下
-  计入 drifts）。**debug 构建 Cask::open 自动开启** ⟹ 全量套件每一次
-  get 都在对拍。容忍面两条（TTL 恢复走廊 / kUnavailable）注释里有论证。
-- **计划微调：搬迁/TTL 挂钩门在点查开启上**。Level A 不消费这些行
-  （range 回查 keydir 权威），无门实测 merge bench +18%（每条搬迁一次
-  append + flush 排序份量 21.4→25.2ms）超 ≤10% 预算；且关门期间的
-  merge 本就会让历史 run loc 陈旧——**Level B 开启必须以全量重建起步**
-  （S36-4 硬要求，已写进挂钩注释），开启后挂钩持续在线保 run 新鲜。
-  门后 merge 19.5ms（基线 20.4-21.4，零回归）。
-- **顺手修：conditional_remove TOCTOU 消灭**——写阶段改锁内精确 CAS
-  （`remove_impl` expected 参数），「误删并发新写」从文档容忍变为不可能
-  （doc/concurrency-zh.md §7.7 已更新）；成功后以**受害者 ord** 记 OKI
-  墓碑（有数据记录背书，无 ord 复用风险；哈希侧 sentinel 维持 ord=0，
-  S33-B1 契约不动）。
-- **给 S36-5 的记录**：崩溃丢 memdelta 中的搬迁行 → run 内 loc 陈旧而
-  wm 无缺口、不触发重建——Level B 模式的恢复缺口（Level A 无害），须与
-  「unlink 顺序不变量 + 崩溃注入」一并收口（如 merge 收尾 flush 先于
-  unlink，或 unclean shutdown + merge 痕迹 → 重建）。
-- **验收**：Debug 全量 **709/709**（703 基线 + 6 新增；影子对拍全程
-  开启零漂移）| **ASan 全量 709/709** | **TSan 并发套件 180/180**（CI
-  豁免口径，未新增豁免）| build-rel 全树零新告警 | bench（8 reps）：
-  KeyDir put 67.1→68.6ns（+2.2%）、Cask put 1244→1255ns（+0.9%），
-  均 ≤3% 达标；merge 门关零回归（门开 +18% 为 Level B 模式已知成本，
-  S36-3 冷 get 锚点时一并复测）。未提交。
+### S37-5 — Windows I/O 后端 🔴 HIGH
 
-### ✅ S36-3 — get 冷路径 + 块 LRU 🔴 HIGH
+实现 `src/io/win32_file.cpp`，填 S37-1 留下的 seam：
 
-- [x] get 接 locate；块 LRU（独立小锁，不进 keydir 锁序）；读升温回填
-      （二次命中门）
-- **验收**：✅ 冷/热 get bench 锚点（热 ≤3%、冷 P99 ≤300µs tmpfs 另锚）
+1. `CreateFileW` + UTF-8→UTF-16 路径转换（**非 ASCII 目录名在 ANSI 代码页下直接打不开**）。
+   编译期地雷：`std::filesystem::path::c_str()` 在 Windows 返回 `const wchar_t*`，
+   任何直接喂给 `::open`/`std::fopen` 处编译失败（`file_util.hpp:96` 即一例）；
+   `data_file.cpp:452` 的 `find_last_of('/')` 改 `fs::path::filename()`。
+2. **`atomic_rename` → `MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)`**（C1）。
+3. **定位读写（C3）**：Windows 无原生 pread；同步句柄上带 `OVERLAPPED.Offset` 的 `ReadFile`
+   会更新文件指针且并发被内核串行化 —— 直接翻译会把并发点查悄悄变成串行，
+   **测试全绿、只有 bench 掉**。定为**每线程句柄池**方案，并与 read-handle LRU 预算合并考虑。
+   `io.hpp:6-12` 的线程模型注释需按平台重新表述。
+4. **文件锁（C4）**：`CREATE_NEW` 对应 `O_CREAT|O_EXCL`；`release_quiet` 的
+   「先 unlink 后 close」需带 `FILE_SHARE_DELETE`。
+   ⚠️ **stale-lock 检测必须加进程创建时间**（`GetProcessTimes` 的 `ftCreationTime`）：
+   Windows PID 复用远快于 Linux，仅凭 `OpenProcess` 判存活会误判「新进程复用了崩溃
+   进程的 PID」→ 拒绝回收有效 stale lock → **库彻底打不开**。本移植中最易造成生产事故的单点。
+5. `sync_data` → `FlushFileBuffers`（无 data/metadata 区分，checkpoint 路径需重新 bench）；
+   `sync_directory` → no-op（并在 `doc/format-zh.md` 补：Windows 下 rename 的目录项
+   持久性改由 `MOVEFILE_WRITE_THROUGH` 承担）。
+6. `MappedFile` → `CreateFileMappingW` + `MapViewOfFile`；**析构要收两个句柄**
+   （`UnmapViewOfFile` + `CloseHandle(section)`，`MappedFile` 需多存一个成员）；
+   `MADV_RANDOM` → `FILE_FLAG_RANDOM_ACCESS`（**时机从 mmap 后前移到开文件时**）；
+   `prefetch` → `PrefetchVirtualMemory`。
+7. `getrlimit(RLIMIT_NOFILE)`（`cask.cpp:184`）→ Windows 句柄不受 fd 表约束，
+   需重新标定 read-handle LRU 预算（原逻辑是 `nofile` 的比例）。
+8. MAX_PATH 260 评估：`longPathAware` manifest 或 `\\?\` 前缀。
 
-#### ✅ S36-3 落地记录（2026-08-06）
+- **工作量**：2.5-3 周
+- **验收**：ctest 全绿（除已知 Windows 语义差异项）；crash 注入用例通过
 
-落点：`oki_run.{hpp,cpp}`（OkiBlockCache + `find()`）、`oki_state`（locate
-接缓存 + purge）、`keydir`（locate warm 回填 + `evict` + 分片写计数）、
-`cask.cpp`（get 切 locate）+ `oki_locate_test` 6 新用例 + `range_bench`
-冷 get 锚点。要点：
+### S37-6 — 删除/映射生命周期 🔴 HIGH（**唯一架构改动**）
 
-- **Cask::get 切 `locate(key, warm_fill=true)`**：点查关（Level A 生产
-  默认）时 locate 一行早退 ≡ 哈希 get，行为逐字节相同；点查开（影子/
-  Level B）时缓存 miss 落组合视图。S13-F5 重试对冷路径同样成立（重查
-  locate 拿到搬迁行新位置）；mmap/pread/TTL/墓碑过滤零改动。remove 的
-  tombstone_version=2 shadow 查询同步切 locate。
-- **块 LRU（OkiBlockCache）**：key=(gen, 块下标)——gen 永不重用 ⟹ 无别名，
-  跨 close/reopen 缓存天然有效；16 分片小锁独立锁域，loader（pread）在
-  锁外，块 shared_ptr 淘汰不影响在途读者；compact/rebuild 后 purge 死
-  gen。默认 256MB（选项透出排 S36-6）。`OkiRunReader::find` = seek 同款
-  定位 + 缓存块（`seek_impl` 共用一份逻辑）。
-- **读升温回填（二次命中门）**：4096 槽 32 位指纹表——同 key 连续两次冷
-  命中才回填（扫描型负载指纹恒被冲刷 → 天然不污染缓存，bench 实测轮转
-  100k key 零回填）；回填是缓存填充非逻辑插入（key_count/fstats 不动，
-  D4），安全性 = 分片写计数快照（探测前捕获，插入时变了即弃）+ 屏障/
-  fold 期直接弃。
-- **`KeyDir::evict`（测试/bench 用，S36-4 CLOCK 的底座）**：物理 erase
-  （swap-delete + limbo，乐观读者安全同 S29-6），计数不动；fold/屏障/
-  MultiEntry 拒逐。
-- **并发实证抓获一个真 bug（40 连跑 1 复现 → 修后 40/40 + 三矩阵全绿）**：
-  evictor 在「哈希已更新、OKI append 在途」的窗口把新行逐出 → 冷读者从
-  组合视图拿到旧行（hash ord=1138 stale vs cold ord=1198）→ 读升温把旧
-  行回填 = **静默回滚**。修复：写挂钩在途括号（原影子专用计数）泛化为
-  「点查开启即计数」，**evict 以挂钩静止（计数=0）为前置**——静止 ⟹ 已
-  完成写全部进 delta/runs，其后新写由分片写计数挡回填，闭环。这是 S36-4
-  CLOCK 逐出策略必须继承的前置条件（已写进 evict 注释）。
-- **影子对拍适配逐出**：发生过逐出后「哈希 miss vs 组合视图活行」是被逐
-  key 的合法形态，该方向降级 skip（首次逐出前保持全严格）；漂移 assert
-  前把两侧状态吐 stderr（本次抓 bug 即靠它）。
-- **bench 锚点（tmpfs，build-rel，8/5 reps）**：热 get 834ns（基线
-  977-1063，View 807 vs 806-808——零回归 ≤3% ✓）；put 68.8ns/1254ns
-  （+2.5%/+0.8% ≤3% ✓）；**冷 get（10 万 key 全逐出轮转）：块缓存关
-  p50 4.9µs / p99 13.7µs，开 p50 3.9µs / p99 9.4µs**（设计 SSD 门
-  300µs；冷耗时大头是块内线性扫 ~百行解码，块内重启点属后续优化）。
-- **验收**：Debug 全量 **715/715**（709 + 6 新增）| **ASan 全量
-  715/715** | **TSan 并发套件 186/186**（CI 豁免口径；新并发用例同
-  oki_range_test 惯例在 TSan 下关乐观读快路径，未新增豁免）|
-  build-rel 全树零新告警。未提交。
+Windows 下：① 所有 `CreateFile` 须带 `FILE_SHARE_DELETE`，否则删除报
+`ERROR_SHARING_VIOLATION`；② **即使带了，被 section 映射持有的文件仍删不掉**
+（映射对象持独立引用，与句柄共享模式无关）。
 
-### ✅ S36-4 — 逐出 + 快照三元组 + BCKS v4 🔴 HIGH
+现有 `retire_files`/`drain_retired_files`（`cask.cpp:833-858`）重试队列是**必要但不充分**的
+兜底：只要 sealed 段的 mmap 还在 read-handle LRU 里，重试永远失败，**队列无限增长**。
 
-- [x] 采样逐出（计划的 CLOCK 有据偏离，见落地记录）+
-      `CaskOptions::keydir_cache_entries`（0=不限=现状，默认 0 opt-in）；
-      MultiEntry 不可逐；逻辑计数与 fstats 校准（冷视图记账）
-- [x] **（S36-2 立的硬要求）Level B 开启必须以全量重建起步**：BCOM v3
-      level_b 模式戳落地——未带戳不采信，重建后带戳；Level A 写者 open
-      清戳；merge_only 旁车 × Level B 目录 open 拒绝
-- [x] **（S36-3 立的硬要求）逐出安全前置**：挂钩静止前置升级为**挂钩
-      入锁**（点查开启时 put/remove 的 OKI append 在分片锁内完成——
-      「哈希可见 ⟺ 已入组合视图」在锁边界成立，插入路径的采样逐出对任意
-      驻留条目恒安全，饿死问题一并消失）
-- [x] CaskIter/parallel_scan 快照 = 缓存屏障 + delta 拷贝 + manifest pin
-      （IterHandle 冷枚举三元组）
-- [x] kv.keydir.ckpt v4（缓存子集语义；Level B 关闭时仍写 v3）
-- **验收**：✅ 100M 档 RSS ≤1.5GB 实测（数字见落地记录）；快照一致性
-  stress（并发 fold × 写者 × 自动逐出）
+**新增不变量**：退休一个文件前，先把它从 read-handle LRU 逐出并 `reset()` 其 `MappedFile`。
+流程改为 `evict_mappings(file_id) → close handles → delete`，且 evict 须与
+`epoch_reclaim.hpp` 的并发回收协调 —— 不能在读者仍持 `span` 时 unmap。
 
-#### ✅ S36-4 落地记录（2026-08-06）
+需同步修订：`doc/read-handle-lru-design-zh.md`、`doc/sealed-mmap-read-design-zh.md`、
+`io.hpp:135-151`（`MappedFile` 头注释明写依赖「POSIX unlink-while-mapped 语义」，
+该注释在 Windows 上失效）。
 
-落点：keydir（预算/采样逐出/冷记账/挂钩入锁/IterHandle 冷枚举/BCKS v4）、
-oki_run+oki_state（BCOM v3 模式戳）、cask（选项 + open 协议 + 组提交
-阈值 flush 修复）+ `tests/oki_levelb_test.cpp` 7 用例。要点：
+- **工作量**：1-1.5 周
+- **验收**：Windows 上 merge 后退休队列能排空（长跑测试）；Linux 侧行为零变化 + TSan 全绿
 
-- **挂钩入锁（本期的结构性决定）**：点查开启时 put/remove 的 OKI append
-  改在分片锁内执行（remove 经 HookAtExit 作用域守卫覆盖全部出口；oki
-  内部锁是叶子，锁序无环）。S36-3 的「在途窗口」从根上消失 ⟹ 插入路径
-  的采样逐出无需任何静止检查；Level A 维持锁外挂钩（热路径零变化）。
-- **逐出 = 分片内采样**（对设计 CLOCK 的**有据偏离**）：CLOCK ref-bit 要
-  读侧写痕迹，与 seqlock 乐观读冲突（读者不能碰缓存行）——改为 clock
-  游标起采 ≤8 个可逐条目、逐 epoch 最旧者（近似 LRU-by-write/fill）；
-  读热 key 被误逐由 S36-3 二次命中回填自愈。fold 活跃暂停逐出（key 集
-  不变量）；预算是软目标。
-- **D4 计数校准（冷视图记账）**：Level B 下哈希 miss ≠ 新 key/不存在——
-  put_insert 纯 miss 与 remove miss 都问冷视图：命中活行 → 覆盖/真删除
-  记账（fstats 老位置退账、key_count 精确）；并顺手立起 **Level B 版
-  LWW/复活门**（冷侧 ord 更新即拒收——恢复期重放旧行落在被逐 key 上不
-  复活，S33-B1 的组合视图延伸）。测试断言逐出态下 key_count/fstats
-  live 总和全程精确。
-- **fold 三元组**：IterHandle 在预算开启/发生过逐出时改走冷枚举——屏障
-  内捕获 OKI 读视图（runs pin + delta 拷贝；挂钩入锁 + 写者出清 ⟹ 视图
-  ⊇ 哈希活 key 且与 iter_epoch 同刻），k 路归并出 key、逐 key 分片锁内
-  哈希裁决（缓存命中 = 权威 + epoch 快照语义）。CaskIter/parallel_scan/
-  drain_live_keys 全自动继承；run 读错经 `cold_error()` 上浮（next 无错误
-  通道的补口）。输出序变为 key 升序（fold 从未承诺顺序）。
-- **BCOM v3**：v2 布局 + 头部 flags 字节（bit0 = level_b 模式戳；未知位
-  fail-fast）。戳语义 = 「run loc 由挂钩在线的写者维护，可信」：Level B
-  开启对未带戳目录**全量重建起步**；Level A 写者 open 即清戳（stamp_mode，
-  仅降级）；merge_only 旁车对带戳目录 open 拒绝（其无挂钩搬迁会静默腐蚀
-  组合视图）。字节级测试含 CRC 修补后的未知位单独验证。
-- **BCKS v4**：payload 与 v3 逐字节同构，语义 = 缓存子集 + 逻辑计数。
-  接受条件（load_snapshot 内 gating）：Level B 意图 + 带戳 manifest +
-  快照 next_ord ≤ oki wm（缺席条目可由组合视图兜底）；其余拒收 → 全量
-  fold（把子集当全量 = 静默丢 key）。Level B 关闭恒写 v3。信任链就位后
-  恢复期即启点查（tail 重放的冷记账/挂钩入锁生效）。
-- **顺手修（S29-7 遗留，100M 探针抓获）**：memdelta 阈值 flush 只挂在
-  persist_record 旧路径——组提交成为 put 主路径后阈值检查失联，纯 KV 长
-  写负载（无 ckpt 搭车点）memdelta 无界（实测 10M put 时 790MB、0 run）。
-  组提交 leader 批间 + put_batch/put_batch_atomic/remove/put_doc 尾部
-  补探询（无锁 hint）；顺带修 close 竞态空判。**Level A 也受益**。
-- **TSan 新增豁免一条**（锁序型，窄匹配）：`deadlock:KeyDir::
-  apply_pending_to_entries_barrier`——屏障 v2 文档化例外②（release 阶段
-  二 meta_shared→shard）与热路径 shard→meta 在 TSan 锁序图成环；实际无
-  环论证在 keydir.hpp 文件头（该方向仅屏障内存在，写者已出清）。路径自
-  S2 既有，S36-4 的 Level B 并发 fold 测试首次稳定踩到。race 检测不受
-  此条影响。
-- **100M 档 RSS 实测**（tmpfs，`doc:<n>` 11-12B key × 16B 值，预算 5M）：
-  加载 1 亿 key 全程 RSS 平稳，**峰值 1141MB**（13.3 分钟，key_count
-  精确 = 1 亿）；close 后重开（BCOM v3 戳 + BCKS v4 子集快照）**~1 秒**
-  完成、RSS **800MB**、计数保真、抽查冷 get 全过——**≤1.5GB 门达成**
-  （对照 S33-7 全内存实测 11GB，**-90%**，设计 §2 预算表命中）。10M 档：
-  加载 1026MB / malloc_trim 后 737MB / 重开 716MB。探针
-  scratchpad `levelb_rss_probe.cpp`。
-- **Level A 回归**：Cask put 1228-1247ns（基线 1244，噪声内）、hot get
-  848ns（基线 977-1063）、merge 19.3ms（基线 20.4-21.4）——全部零回归；
-  KeyDir put 微基准 70.6ns（S36 累计 +5%，预算口径为 Cask 全路径，达标）。
-- **验收**：Debug 全量 **722/722**（715 + 7 新增）| **ASan 全量
-  722/722** | **TSan 并发套件 193/193**（含新增锁序豁免一条，见上）|
-  build-rel 双树零错误（CaskOptions 公共结构体变更）。未提交。
+### S37-7 — CI + 收尾 🟡 MED
 
-### ✅ S36-5 — merge 组合视图 + 崩溃注入 + B1 收口 🔴 HIGH
+1. `.github/workflows/ci.yml` 加 `windows-2022` job（MSVC Release + 全量 ctest）。
+2. 加 `BITCASK_SIMD_MAX` 矩阵（scalar/avx2/avx512），覆盖所有 ISA 档位对拍。
+3. `/WX` 清理收口；bench 对拍（Linux vs Windows 同档）。
+4. 文档：README 加 Windows 构建段、`doc/format-zh.md` 补持久性机制差异、CHANGELOG。
 
-- [x] merge 活性/搬迁/stuck 复查切 locate；缓存外搬迁 = 冷视图精确匹配
-      免 CAS 收下（(ord, gen) 格）；TTL 对被逐 key 冷删除（精确匹配 +
-      墓碑 + 退账）
-- [x] **（S36-2 缺口）搬迁行崩溃收口**：merge 收尾「搬迁行固化（OKI
-      flush）先于输入 unlink」——flush 失败即跳过 unlink 保输入
-- [x] **B1 收口**：持久水位挂 DataFile 自维护（sync/o_sync 写路径/封口
-      推进）+ checkpoint 采集点 fd 级 fdatasync + 快照/OKI flush 一律
-      「引用 ≤ 持久」过滤；注入测试证实 + 回归钉死
-- **验收**：✅ 逐出态 merge 千轮无丢 key stress；崩溃注入（merge 后崩溃 /
-  B1 掉电模拟）；Debug/ASan 全量 + TSan 门控口径全绿
+> ⚠️ **需明确承认的护栏损失**：Windows/MSVC **无 TSan**（ASan 有，UBSan 无）。
+> 对一个重并发的库（epoch 回收、无锁 keydir 读、组提交、后台 merge）这是实打实的损失。
+> 缓解：并发正确性继续以 Linux TSan 为准（并发逻辑本身平台无关）；但 S37-5.3
+> （每线程句柄池）与 S37-6（映射逐出 × epoch 协调）是 **Windows 独有的新并发代码，
+> TSan 覆盖不到** —— 这两处必须补压力测试，并考虑 Application Verifier / `/analyze` 补位。
 
-#### ✅ S36-5 落地记录（2026-08-06）
-
-落点：merger（locate 切换）、keydir（冷搬迁/冷 TTL 删除）、data_file
-（持久水位）、cask（B1 采集/封口/merge 收尾序）、oki_state（flush 持留）
-+ `oki_levelb_test` 4 新用例。要点：
-
-- **merge 活性权威 = locate**（设计 §7「最深的一刀」）：fold_record 活性
-  判定与 apply 后的 stuck 复查都切 locate——逐出态下哈希 miss ≠ 死亡，
-  否则被逐活 key 整批判 stale、随输入 unlink 丢失。Level A（点查关）
-  locate ≡ get，逐字节等价。
-- **缓存外搬迁免 CAS**（§D2 落地）：条件 put 在 probe 快速失败后问冷视
-  图——旧位置精确匹配 ⟹ 无并发更新写（有则冷侧已是新行），收下搬迁行
-  （新 loc + 原 ord，delta/高 gen 胜出）+ fstats 搬家；不匹配 ⟹ 与
-  「CAS 失败 = 跳过」同构。行只进组合视图不进缓存（搬迁不加热冷 key）。
-  TTL 的 conditional_remove 同款：冷视图 (tstamp,fid,off) 精确匹配才删
-  （受害者 ord 墓碑 + 计数退账），否则被逐过期键在输入 unlink 后悬空
-  （冷 get 报 kIo 而非 kNotFound）。
-- **搬迁行崩溃收口**：merge 收尾在 unlink 之前把 OKI flush 落盘（Level B
-  gate）——任意崩溃点安全：搬迁行在 run（新 loc）或输入仍在（旧 loc 可
-  读、内容相同）；flush 失败跳过全部 unlink/trim（空间下轮回收）。
-- **B1（checkpoint 跑赢未 fsync 数据）收口**——注入测试先证实（默认策略
-  下写后持久水位为 0，快照却全量引用），修复三件套：
-  ① **持久水位挂 DataFile**（`durable_bytes`，shared_ptr<atomic> 保移动
-  语义）：sync() 推进、o_sync 写路径逐条推进、roll/close/close_write_file
-  **封口即持久**（sealed ⟹ durable 不变量，每文件一次 fsync；顺手发现并
-  修复 close() 不经 close_write_file、sync_every_n=0 下全程零 fsync 的
-  既有暴露）；
-  ② **checkpoint 采集点 fd 级 fdatasync**（`sync_fd_only`——线程安全，不
-  碰写者批缓冲；stat 大小做 floor CAS-max）——采集水位恒 = 已持久字节；
-  ③ **「引用 ≤ 持久」过滤**：keydir 快照跳过水位外 entry（计数标量同步
-  扣减，恢复期水位 fold 重放补回）；OKI flush 对水位外行**持留**在
-  delta（下轮再固化）；OKI 缺口检查基准从「快照 next_ord 标量」改为
-  「快照**实载条目**的 ord 覆盖界」（load 时重算，零格式变更——否则持留
-  行为会被误判成缺口而每次崩溃恢复都全量重建）。
-  写路径阈值 flush 前先 sync active（写者线程持 write_mu_）；锁外尾站点
-  改经 `maybe_flush_oki_unlocked` 包装（hint 快查命中才取锁）。
-- **测试**：B1 注入（fork 崩溃 + 按持久水位截尾模拟掉电：checkpoint 覆
-  盖键全存活、掉电丢失键干净 kNotFound、无悬空 kIo）；merge 后立即崩溃
-  （逐出态搬迁行固化验证，600 键值全对）；TTL×逐出×merge（kNotFound +
-  计数精确）；**千轮 merge stress**（400 键 ≫ 128 预算深度逐出，1000 轮
-  覆盖+merge，周期全量对拍零丢 key、计数恒精确，2.3s）。
-- **验收**：Debug 全量 **726/726**（722 + 4 新增）| **ASan 全量
-  726/726** | **TSan 并发套件 197/197**（门控口径）| build-rel 零错误 |
-  bench：put 1268±23ns（基线 1244，+1.9% ≤3%）、merge 20.7-21.0ms
-  （基线 20.4-21.4，零回归）、hot get 840ns（零回归）。未提交。
-
-### ✅ S36-6 — C API + 文档 + 门禁复测 🟡 MED
-
-- [x] 选项透出 C API（`bitcask_options_t.keydir_cache_entries` + 冒烟）
-- [x] 文档：format-zh §15（BCOK v2 / BCOM v2/v3 / BCKS v4 / §15.4
-      Level B + B1）、api-cpp §3.1+§11.3、api-c §6.5、README 能力表、
-      CHANGELOG、设计文档头部状态 + §12 落地记录（8 条实现偏差/增补）
-- [x] 100M 门禁复测入档（终版代码，含 S36-5 B1）
-- **验收**：✅ 全矩阵 + build-rel 双树
-
-#### ✅ S36-6 落地记录（2026-08-06）
-
-- **C API**：`bitcask_options_t` 尾部追加 `keydir_cache_entries`（init
-  默认 0；映射到 CaskOptions）；`c_api_test.c` 增 `test_levelb` 冒烟
-  （2000 键 ≫ 512 预算 → 深度逐出 + 重开子集快照，全过）。
-  **版本号（2026-08-06 用户拍板：6.0.0）**：该字段（连同 C++
-  CaskOptions 的同名字段）使 options 结构体布局较 5.1.0 变更——按仓库
-  ABI 规则（4.0.0 先例）bump major → **6.0.0（SOVERSION 6）**。
-  `project(VERSION 6.0.0)` 已落；CHANGELOG 拆出独立 [6.0.0] 段
-  （[5.1.0] 复原为 Release fcc1c6a 定稿形态），README 版本行同步。
-- **文档**：format-zh §15 全面改写至 v2/v3 现状（run v2 行布局/bloom/
-  32B trailer、manifest v3 flags/level_b 戳语义、生命周期含 B1 持留与
-  merge 收尾序）+ 新增 §15.4（Level B 组合视图 + BCKS v4 + B1 持久
-  水位）；api-cpp 新增 §11.3（收益锚点 + 5 条使用要点）；设计文档头部
-  改「已落地」+ 文末 §12 落地记录（CLOCK→采样、挂钩入锁、挂钩门+模式
-  戳、(ord,到达序)、冷记账、B1 形态、merge 收尾序、开放问题现状——
-  正文保持设计原貌，读代码以 §12 为准）。
-- **100M 门禁复测（终版代码，tmpfs，`doc:<n>` × 16B 值，预算 5M）**：
-  加载 1 亿 key 峰值 RSS **1087MB**（14.2 分钟全程平稳）、key_count
-  精确 1 亿；重开（BCOM v3 戳 + BCKS v4）**~2 秒 / 802MB**、抽查冷
-  get 全过。对照 S33-7 门禁数据 11GB：**-90%，设计 §2 预算表命中**。
-- **验收**：Debug 全量 **726/726** | **ASan 全量 726/726** | **TSan
-  并发套件 197/197**（门控口径）| C API 冒烟含 Level B | build-rel
-  双树零错误。未提交。
-
----
-
-**S36 全期收官（2026-08-06）**：S36-1 格式与外排 → S36-2 影子安全网 →
-S36-3 冷路径 → S36-4 逐出与快照 → S36-5 merge 权威与崩溃/B1 → S36-6
-收尾。零 flag-day（全部派生缓存演进）；期间顺手收口 backlog B1、修复
-S29-7 组提交漏接阈值 flush、消灭 conditional_remove TOCTOU。版本号已
-拍板（2026-08-06）：**6.0.0 / SOVERSION 6**（options 结构体布局变更，
-4.0.0 先例）——S36 与 backlog T24/B1-B4 全部进 [6.0.0] 段。
+- **工作量**：1-1.5 周
 
 ---
 
 ## 执行序
 
 ```
-S33-1 (半天)  ───── 先行，独立可交付（探针 + 基线数字）
-T23   (半天)  ───── S33-2 前置（hint_file refill 归并，避免格式分叉叠在漂移代码上）
-S33-2 (2天)   ───── flag-day 基建 = 5.1.0 发布边界（盘上纪元，非 ABI）
-S33-3 (1.5天) ───── OKI 格式，纯新增，与 S33-2 后半可并行
-S33-4 (2天)   ───── 依赖 S33-2 + S33-3
-S33-5 (2天)   ───── 依赖 S33-4
-S33-6 (1天)   ───── 收尾
-S33-7 (评审)  ───── 依 S33-1 数据
+S37-1 (2周)   ───── 平台抽象层收编      ┐
+S37-2 (1周)   ───── fork → exec-self    ├─ 纯 Linux，无需 Windows 环境，可并行
+S37-3 (2周)   ───── SIMD 分 ISA TU      ┘   （合计约 5 周 ≈ 一半工作量）
+                        ↓
+S37-4 (5天)   ───── MSVC 构建适配（首次需要 Windows 环境）
+S37-5 (3周)   ───── Windows I/O 后端    ← 依赖 S37-1 的 seam
+S37-6 (1.5周) ───── 删除/映射生命周期   ← 依赖 S37-5
+S37-7 (1.5周) ───── CI + 收尾
 ```
+
+**合计约 10-12 周**至「Windows x64 MSVC 全套 ctest 通过 + SIMD 同档性能」。
 
 ---
 
-## ⏸ 遗留（2026-08-05 S35 收尾时复核）
+## ⚠️ 风险排序（按「有多容易静默错」）
+
+| # | 项 | 任务 | 为何危险 |
+|---|---|---|---|
+| 1 | 映射生命周期 | S37-6 | 架构改动 + 与并发回收耦合 + TSan 覆盖不到；失败形态是退休队列无限增长（磁盘不回收），不报错 |
+| 2 | PID 复用误判 | S37-5.4 | 导致库彻底打不开；只在特定时序复现 |
+| 3 | pread 并发退化 | S37-5.3 | **测试全绿、只有 bench 掉**，最易漏 |
+| 4 | CPUID 漏检 XCR0 | S37-3.3 | 只在特定虚拟化环境 `#UD`；本地全绿、线上偶发 |
+| 5 | `std::rename` 覆盖语义 | S37-1.7 / S37-5.2 | 危害大（9 个原子写站点全线挂）但**必然立刻暴露**，反而最安全 |
+
+---
+
+## ⏸ 遗留
 
 | 项 | 内容 | 状态 |
 |---|---|---|
-| T23 | ChunkedReader 归并 refill ×3 | ✅ done（随 S33-2，见落地记录）|
-| T24 | decode_rec 共享解包段模板归并 | ✅ done（2026-08-06：`decode_rec_columns` 泛型模板归并两份手抄块循环，dl 列以 `requires` 编译期分支；bench `BM_MmapSeg_BOWQuery` 8.25→8.22µs 零回归；全矩阵 + 双树）|
-| T8 | 搜索读屏障无界等待（`prepare_search` 饥饿）| ⏸ 4 项前置未满足（饥饿注入测试 / applied_ord 可见性调查 / flush 超时基建✅ / flush_upto+notify 成对恢复；原文 62789cd）|
+| T8 | 搜索读屏障无界等待（`prepare_search` 饥饿）| ⏸ 4 项前置未满足（原文 62789cd）|
 | T12 | HNSW ckpt 去重（~115 行）| ⏸ 默认不做（注释同步已替代）|
-| **B1** | **checkpoint 可能跑赢未 fsync 的数据** | ✅ done（S36-5 收口：DataFile 持久水位 + ckpt 采集点 fd-fsync + 快照/OKI「引用 ≤ 持久」过滤 + 封口即持久；注入测试 `B1CheckpointNeverOutrunsDataFsync` 证实并钉死，见 S36-5 落地记录）|
-| **B2** | **legacy 意图重放退役** | ✅ done（2026-08-06 **提前收口**：复核发现意图日志只存在于 dc81bbc..S35 之间的未发布构建——TxnCask 与原子批同版首发，无已发布兼容对象，「预告一版再删」的仪式对象不存在，首发前删净。blob v1 解码/收集/前滚全删（txn.cpp 186→80 行）；`recover`/`pending_txns` 含 C API 签名保留恒返空；原六个意图用例退役，新用例钉死「遗留残留不受触碰 + fork 崩溃后 commit 原子可见」；CHANGELOG Removed 段 + 三处文档同步）|
-| **B3** | **mmap 收进 io.hpp（`MappedFile` RAII）** | ✅ done（2026-08-06：`io::MappedFile`（PROT_READ+MAP_SHARED 整文件、不接管 fd、move-only、可选 MADV_RANDOM）落地；7 处手抄归并——`DataFile` sealed 映射（连同手写析构/移动语义退役）、`MmapSegment`、HNSW `.vec`/`.qc8` payload、IVF/DiskANN 段；`bitcask_bm25`/`bitcask_vector` 补 `bitcask_io` 链接；零行为变化，hot get/View bench 与全矩阵零回归）|
-| **B4** | **unlink-while-open 换延迟删除队列** | ✅ done（2026-08-06：merge 输入退休（留原路径）→ 下次 merge 开始/checkpoint 入口/close 排水删除——惰性重开 ENOENT 假失败窗口从源头消失，O10「临界区 erase+unlink」退役（临界区不再做文件系统操作）；删除失败（非 POSIX 语义）回队重试；OKI sweep 同步改「尝试删除+滞留重试」；崩溃丢队列无害（退休文件即普通 data 文件，恢复 LWW/ord 门正确处理 + 后续 merge 自愈收编，fork 测试钉死）。**可见变化：空间回收延后一拍**（CHANGELOG Changed 已注）。两处断言旧行为的测试（FoldSurvives/P6MmapView）改为「退休滞留 + checkpoint 排水后删除」，原「已开句柄跨 unlink 存活」意图保留。Debug/ASan 728/728、TSan 199/199、merge/put bench 零回归 |
-
-Phase 6 复核仍成立的低价值项（RED-3/5/6/10，随重构自然消化）见 git 历史 62789cd。
+| **W1** | `File::open` 默认**不设 `O_CLOEXEC`** | 🔍 S37-1 期间发现：11 处裸 `::open` 全部显式带 `O_CLOEXEC`（收编后由 `kCloseOnExec` 原样保留），而走 `io::File` 的核心 KV 路径（data/hint/oki run/write.lock）**没有** —— fork+exec 场景下 data file fd 泄漏进子进程。现有 fork 测试只 fork 不 exec 故未暴露，**S37-2 改 exec-self 后会变成真实暴露面**。收编时未擅自统一（那是行为变化，超出「零行为变化」约束）。**待评估**：给核心路径补 `kCloseOnExec`。Windows 侧句柄默认不继承，无对应问题 |
+| **W2** | `bitcask_format` → `bitcask_io` 的 PUBLIC 依赖 | 🔍 S37-1 引入（见落地记录）。当前无环且必要，但「记录 codec 层依赖 I/O 层」是轻微的分层异味。若 S37-4 把 13 个 STATIC 改 OBJECT 库，可顺带复核是否有更干净的归置 |
+| **W3** | `count_os_threads()` 读 `/proc/self/task` | 🔍 S37-2 期间确认：`thread_pool_test` 的 AT5 用例（「线程数与库数解耦」）靠它计数，**`/proc` 无 Windows 对应物**。已改用 `std::filesystem` 去掉 `<dirent.h>`，且目录不存在时返回 0。S37-5 需二选一：换 `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` 按 owner pid 过滤，或把依赖它的用例整体标 Linux-only |
 
 ---
 
@@ -852,23 +363,20 @@ Phase 6 复核仍成立的低价值项（RED-3/5/6/10，随重构自然消化）
 
 | 项 | 状态 |
 |---|---|
-| 设计文档 | ✅ `doc/ordered-key-index-design-zh.md`（含 flag-day 决策）|
-| S33-1 探针 + 基线 | ✅ done（O(全表) 实锤 + ~122B/key 锚点，见落地记录）|
-| T23（前置）| ✅ done（ChunkedReader；v2/v4 读端删除后收敛为 2 站点 1 实现）|
-| S33-2 flag-day | ✅ done（Debug 650/650 + **ASan 全量 650/650** + build-rel 零错误）|
-| S33-3 OKI 格式 | ✅ done（10 测试；Debug 全量 663/663；ASan/TSan 见落地记录）|
-| S33-B1 墓碑复活修复 | ✅ done（并行恢复到达序无关；flaky 8/30 → 40/40 稳过）|
-| S33-4 memdelta + 写挂钩 | ✅ done（Debug 668/668；put 挂钩 ≈1.2% 达标）|
-| S33-5 Range 查询路径 | ✅ done（三方对拍 + 并发 stress；**1/256 选择性 8.01→0.53ms = 15×，耗时随选择性线性**；Debug 671/671）|
-| S33-B2 mmap 窗口外读修复 | ✅ done（S30×S13 既有竞态；kShortRead 跌落 pread；修前 3/3 中招 → 0/20）|
-| S33-6 C API + 值预取 + bench + 文档 | ✅ done（range C API 6 导出；预取批 256×4 线程 1.4×；format-zh §六重写 + §十五 OKI；顺带补实装 run 归并 + 两处重建疵；Debug/ASan **675/675**）|
-| S33-7 Level B 门禁评审 | 🟡 下一步（数据已齐：keydir ~122 B/key，见下）|
+| 设计文档 | ✅ `doc/windows-port-design-zh.md`（含三项决策基线与风险排序）|
+| 面积实测 | ✅ 裸 POSIX 调用面已重新量准（`::open` 13 处而非 51，见本届总纲）|
+| S37-1 抽象层收编 | ✅ done（裸宿主原语归零；Debug/ASan 725/725 + 双树，见落地记录）|
+| S37-2 fork → exec-self | ✅ done（6 个 fork 点全转；`tests/` POSIX 头归零；Debug/ASan 725/725，见落地记录）|
+| S37-3 SIMD 分 ISA TU | ⬜ 未开始 |
+| S37-4 MSVC 构建适配 | ⬜ 未开始（需 Windows 环境）|
+| S37-5 Windows I/O 后端 | ⬜ 未开始 |
+| S37-6 删除/映射生命周期 | ⬜ 未开始 |
+| S37-7 CI + 收尾 | ⬜ 未开始 |
 
-### S33-7 输入数据（S33-1 + S33-6 探针汇总）
+### 待确认项（不阻塞 S37-1/2/3）
 
-门禁口径：**keydir RSS 占进程 RSS > ~40% 才立项** keydir 磁盘驻留。
-现有锚点（10 万 key、11B key、64B 值、tmpfs）：keydir 估算 11.6MB
-（~122 B/key）、OKI memdelta 5.7MB、OKI run 0.59MB（6.2 B/key）、
-重建峰值 +8.9MB。**该锚点规模太小、且 value 不在进程内**，占比不代表生产
-形态——立项与否须在生产规模负载（≥1000 万 key + 真实 value 分布）上重取
-`BM_KeyDir_MemProbe` / `BM_Oki_MemProbe` 两项后评审。
+- 设计稿 §2.2「MSVC intrinsic 无需 `/arch` 开关」前提须在目标 VS 版本实测。
+  结论决定 S37-3 的分 TU 是**性能需要**还是**正确性需要** —— 若为后者，改动面更硬。
+- cppjieba / limonp 在 MSVC 下的实际可编译性（header-only，但含类 POSIX 习惯）。
+- 目标最低 Windows 版本（决定 `PrefetchVirtualMemory` / `FILE_ID_INFO` / 长路径 opt-in 可用性）。
+- `std::expected` 等 C++23 库设施在目标 VS 版本的覆盖度（21 个 TU 依赖）。

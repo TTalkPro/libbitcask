@@ -1,7 +1,7 @@
 // S34/S35：TxnCask 多键事务测试（doc/multikey-txn-impl-design-zh.md §9 +
 // doc/atomic-batch-design-zh.md）。覆盖：正常提交、校验拒绝零副作用、
 // recover/pending_txns 的 B2 后语义（恒空 + 遗留 "_txn:" key 不受触碰）、
-// fork 崩溃下 commit 的引擎原子批 all-or-nothing。
+// 崩溃下 commit 的引擎原子批 all-or-nothing（S37-2：fork → exec-self）。
 // B2（2026-08-06）：意图重放已删除（从未随发布版本存在）——原六个意图
 // 构造/重放用例（手写编码器对拍等）随实现一并退役，崩溃原子性由
 // atomic_batch_test 的批语义用例承接。
@@ -12,9 +12,9 @@
 #include <bitcask/keydir_registry.hpp>
 #include <bitcask/txn.hpp>
 
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include "support/crash_child.hpp"
+
+using bitcask::test::crash_exit;
 
 #include <cstdint>
 #include <cstdio>
@@ -168,28 +168,24 @@ TEST_F(TxnTest, RecoverIgnoresLegacyIntentLeftovers) {
     c->close();
 }
 
-// fork 崩溃注入：commit 的原子性由引擎原子批承载（方案 C）——崩溃点在
+// 崩溃注入：commit 的原子性由引擎原子批承载（方案 C）——崩溃点在
 // commit 返回之后，重开必须整批可见；kSyncOnCommit 保证 durable。
 // （掐尾批不可见的另一半由 atomic_batch_test 的截断注入覆盖。）
+BITCASK_CRASH_SCENARIO(txn_crash_after_commit) {
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(dir, opts, &test_registry());
+    if (!c) crash_exit(1);
+    TxnCask txn(c->get());
+    const std::vector<TxnOp> ops{put_op("t1", "v1"), put_op("t2", "v2")};
+    if (!txn.commit(ops)) crash_exit(2);
+    crash_exit(0);  // 不 close：句柄、write lock 全部随进程消失
+}
+
 TEST_F(TxnTest, CrashAfterCommitIsAtomicallyVisible) {
-    const pid_t child = fork();
-    ASSERT_NE(child, -1) << "fork failed";
-
-    if (child == 0) {
-        CaskOptions opts;
-        opts.read_write = true;
-        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
-        if (!c) _exit(1);
-        TxnCask txn(c->get());
-        const std::vector<TxnOp> ops{put_op("t1", "v1"), put_op("t2", "v2")};
-        if (!txn.commit(ops)) _exit(2);
-        _exit(0);  // 不 close：句柄、write lock 全部随进程消失
-    }
-
-    int status = 0;
-    ASSERT_NE(waitpid(child, &status, 0), -1);
-    ASSERT_TRUE(WIFEXITED(status));
-    ASSERT_EQ(WEXITSTATUS(status), 0);
+    ASSERT_EQ(bitcask::test::spawn_crash_child("txn_crash_after_commit",
+                                               tmpdir_.string()),
+              0);
 
     auto c = open_rw();
     ASSERT_TRUE(c);

@@ -10,8 +10,9 @@
 //     Level B 强制重建（陈旧 loc 不采信）；merge_only 旁车被拒；
 //   - 并发：写者 + 读者 + 自动逐出交错零漂移（影子对拍全程在线）。
 
-#include <sys/wait.h>
-#include <unistd.h>
+#include "support/crash_child.hpp"
+
+using bitcask::test::crash_exit;
 
 #include <atomic>
 #include <cstdlib>
@@ -53,6 +54,15 @@ std::span<const std::byte> bytes(std::string_view s) {
 
 std::string val_of(int i) { return "value-" + std::to_string(i); }
 
+// S37-2：原为 OkiLevelBTest 的成员——崩溃场景函数在命名空间作用域，够不着。
+// 纯函数（只由 budget 决定），外提无副作用。
+CaskOptions levelb_opts(std::size_t budget) {
+    CaskOptions o;
+    o.read_write = true;
+    o.keydir_cache_entries = budget;
+    return o;
+}
+
 // 物理驻留条目数（含墓碑 sentinel——直方图口径）。
 std::uint64_t physical_entries(bitcask::keydir::KeyDir& kd) {
     return kd.key_length_histogram().total;
@@ -79,12 +89,6 @@ protected:
     void TearDown() override {
         std::error_code ec;
         fs::remove_all(dir_, ec);
-    }
-    CaskOptions levelb_opts(std::size_t budget) {
-        CaskOptions o;
-        o.read_write = true;
-        o.keydir_cache_entries = budget;
-        return o;
     }
     fs::path dir_;
 };
@@ -464,51 +468,57 @@ TEST_F(OkiLevelBTest, ManifestV3RoundTripAndUnknownFlagRejected) {
 // active 字节必须已 fsync（active_durable_bytes ≥ checkpoint 时刻的文件
 // 大小）；据此截掉「未持久尾巴」模拟掉电——重放后旧键全在、掉电后写入
 // 的键干净缺席（kNotFound 而非悬空 kIo/kBadCrc）。
-TEST_F(OkiLevelBTest, B1CheckpointNeverOutrunsDataFsync) {
-    constexpr int kBefore = 300;
-    constexpr int kAfter = 200;
-    const std::string status_path = (dir_ / "..status").string();
+constexpr int kB1Before = 300;
+constexpr int kB1After = 200;
 
-    const pid_t child = fork();
-    ASSERT_NE(child, -1);
-    if (child == 0) {
-        auto c = Cask::open(dir_.string(), levelb_opts(128), &test_registry());
-        if (!c) _exit(1);
-        for (int i = 0; i < kBefore; ++i) {
-            if (!(*c)->put(bytes("b1-" + std::to_string(i)),
-                           bytes(val_of(i)), 1000)) {
-                _exit(1);
-            }
+// 状态文件路径：原实现由父进程闭包捕获；exec-self 下父子各自从 dir 推导。
+std::string b1_status_path(const std::string& dir) {
+    return (fs::path(dir) / "..status").string();
+}
+
+BITCASK_CRASH_SCENARIO(b1_checkpoint_fsync) {
+    auto c = Cask::open(dir, levelb_opts(128), &test_registry());
+    if (!c) crash_exit(1);
+    for (int i = 0; i < kB1Before; ++i) {
+        if (!(*c)->put(bytes("b1-" + std::to_string(i)),
+                       bytes(val_of(i)), 1000)) {
+            crash_exit(1);
         }
-        // 暴露面前提：默认策略下写后无任何 fsync。
-        if ((*c)->active_durable_bytes() != 0) _exit(2);
-        if (!(*c)->checkpoint()) _exit(1);
-        // B1 不变量：checkpoint 采集点已把持久水位推进到覆盖全部已写字节。
-        std::error_code ec;
-        std::uintmax_t data_sz = 0;
-        for (const auto& e : fs::directory_iterator(dir_, ec)) {
-            if (e.path().string().ends_with(".bitcask.data")) {
-                data_sz += fs::file_size(e.path(), ec);
-            }
-        }
-        const std::uint64_t durable = (*c)->active_durable_bytes();
-        {
-            std::ofstream f(status_path, std::ios::trunc);
-            f << durable << ' ' << data_sz << '\n';
-        }
-        if (durable < data_sz) _exit(3);  // 不变量破坏（修复前的形态）
-        for (int i = 0; i < kAfter; ++i) {
-            if (!(*c)->put(bytes("b1x-" + std::to_string(i)),
-                           bytes("late"), 2000)) {
-                _exit(1);
-            }
-        }
-        _exit(0);  // 崩溃：不 close
     }
-    int status = 0;
-    ASSERT_NE(waitpid(child, &status, 0), -1);
-    ASSERT_TRUE(WIFEXITED(status)) << status;
-    ASSERT_EQ(WEXITSTATUS(status), 0)
+    // 暴露面前提：默认策略下写后无任何 fsync。
+    if ((*c)->active_durable_bytes() != 0) crash_exit(2);
+    if (!(*c)->checkpoint()) crash_exit(1);
+    // B1 不变量：checkpoint 采集点已把持久水位推进到覆盖全部已写字节。
+    std::error_code ec;
+    std::uintmax_t data_sz = 0;
+    for (const auto& e : fs::directory_iterator(fs::path(dir), ec)) {
+        if (e.path().string().ends_with(".bitcask.data")) {
+            data_sz += fs::file_size(e.path(), ec);
+        }
+    }
+    const std::uint64_t durable = (*c)->active_durable_bytes();
+    {
+        std::ofstream f(b1_status_path(dir), std::ios::trunc);
+        f << durable << ' ' << data_sz << '\n';
+    }
+    if (durable < data_sz) crash_exit(3);  // 不变量破坏（修复前的形态）
+    for (int i = 0; i < kB1After; ++i) {
+        if (!(*c)->put(bytes("b1x-" + std::to_string(i)),
+                       bytes("late"), 2000)) {
+            crash_exit(1);
+        }
+    }
+    crash_exit(0);  // 崩溃：不 close
+}
+
+TEST_F(OkiLevelBTest, B1CheckpointNeverOutrunsDataFsync) {
+    constexpr int kBefore = kB1Before;
+    constexpr int kAfter = kB1After;
+    const std::string status_path = b1_status_path(dir_.string());
+
+    ASSERT_EQ(bitcask::test::spawn_crash_child("b1_checkpoint_fsync",
+                                               dir_.string()),
+              0)
         << "exit=2: 前提失效（写后已有 fsync）；exit=3: B1 不变量破坏";
 
     // 模拟掉电：截掉 checkpoint 后未持久的尾巴（合法掉电态——持久水位之
@@ -554,34 +564,35 @@ TEST_F(OkiLevelBTest, B1CheckpointNeverOutrunsDataFsync) {
 
 // 崩溃注入：merge（含被逐 key 的冷搬迁）后立即崩溃——S36-5 的「搬迁行
 // 先于输入 unlink 固化」不变量保证任意崩溃点数据可读。
-TEST_F(OkiLevelBTest, CrashRightAfterMergeKeepsEvictedKeysReadable) {
-    constexpr int kKeys = 600;
-    const pid_t child = fork();
-    ASSERT_NE(child, -1);
-    if (child == 0) {
-        CaskOptions o = levelb_opts(128);
-        o.max_file_size = 4096;
-        auto c = Cask::open(dir_.string(), o, &test_registry());
-        if (!c) _exit(1);
-        for (int i = 0; i < kKeys; ++i) {
-            if (!(*c)->put(bytes("cm" + std::to_string(i)),
-                           bytes(val_of(i)), 1000)) {
-                _exit(1);
-            }
+constexpr int kCrashMergeKeys = 600;
+
+BITCASK_CRASH_SCENARIO(crash_after_merge) {
+    CaskOptions o = levelb_opts(128);
+    o.max_file_size = 4096;
+    auto c = Cask::open(dir, o, &test_registry());
+    if (!c) crash_exit(1);
+    for (int i = 0; i < kCrashMergeKeys; ++i) {
+        if (!(*c)->put(bytes("cm" + std::to_string(i)),
+                       bytes(val_of(i)), 1000)) {
+            crash_exit(1);
         }
-        if (!(*c)->checkpoint()) _exit(1);
-        for (int i = 0; i < kKeys / 2; ++i) {  // 死字节，给 merge 干活
-            if (!(*c)->put(bytes("cm" + std::to_string(i)),
-                           bytes(val_of(i) + "!"), 1500)) {
-                _exit(1);
-            }
-        }
-        if (!(*c)->merge()) _exit(1);
-        _exit(0);  // 崩溃：不 close、不 checkpoint——搬迁行只靠 merge 收尾固化
     }
-    int status = 0;
-    ASSERT_NE(waitpid(child, &status, 0), -1);
-    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+    if (!(*c)->checkpoint()) crash_exit(1);
+    for (int i = 0; i < kCrashMergeKeys / 2; ++i) {  // 死字节，给 merge 干活
+        if (!(*c)->put(bytes("cm" + std::to_string(i)),
+                       bytes(val_of(i) + "!"), 1500)) {
+            crash_exit(1);
+        }
+    }
+    if (!(*c)->merge()) crash_exit(1);
+    crash_exit(0);  // 崩溃：不 close、不 checkpoint——搬迁行只靠 merge 收尾固化
+}
+
+TEST_F(OkiLevelBTest, CrashRightAfterMergeKeepsEvictedKeysReadable) {
+    constexpr int kKeys = kCrashMergeKeys;
+    ASSERT_EQ(bitcask::test::spawn_crash_child("crash_after_merge",
+                                               dir_.string()),
+              0);
 
     auto c = Cask::open(dir_.string(), levelb_opts(128), &test_registry());
     ASSERT_TRUE(c);
@@ -775,34 +786,35 @@ TEST_F(OkiLevelBTest, MergeRetiresInputsAndDrainsAtNextCycle) {
 
 // 崩溃时退休队列丢失无害：退休文件就是普通 data 文件——恢复 fold 的
 // LWW/ord 门正确处理陈旧记录；后续 merge 再次收编（自愈回收）。
-TEST_F(OkiLevelBTest, RetiredFilesSurviveCrashHarmlessly) {
-    constexpr int kKeys = 150;
-    const pid_t child = fork();
-    ASSERT_NE(child, -1);
-    if (child == 0) {
-        CaskOptions o;
-        o.read_write = true;
-        o.max_file_size = 2048;
-        auto c = Cask::open(dir_.string(), o, &test_registry());
-        if (!c) _exit(1);
-        const std::string pad(96, 'x');
-        for (int i = 0; i < kKeys; ++i) {
-            if (!(*c)->put(bytes("cr" + std::to_string(i)), bytes(pad), 1000)) {
-                _exit(1);
-            }
+constexpr int kRetiredKeys = 150;
+
+BITCASK_CRASH_SCENARIO(retired_files_crash) {
+    CaskOptions o;
+    o.read_write = true;
+    o.max_file_size = 2048;
+    auto c = Cask::open(dir, o, &test_registry());
+    if (!c) crash_exit(1);
+    const std::string pad(96, 'x');
+    for (int i = 0; i < kRetiredKeys; ++i) {
+        if (!(*c)->put(bytes("cr" + std::to_string(i)), bytes(pad), 1000)) {
+            crash_exit(1);
         }
-        for (int i = 0; i < kKeys; ++i) {
-            if (!(*c)->put(bytes("cr" + std::to_string(i)),
-                           bytes(pad + "#new"), 1500)) {
-                _exit(1);
-            }
-        }
-        if (!(*c)->merge()) _exit(1);
-        _exit(0);  // 崩溃：退休队列（仅内存）随进程消失，文件留在盘上
     }
-    int status = 0;
-    ASSERT_NE(waitpid(child, &status, 0), -1);
-    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+    for (int i = 0; i < kRetiredKeys; ++i) {
+        if (!(*c)->put(bytes("cr" + std::to_string(i)),
+                       bytes(pad + "#new"), 1500)) {
+            crash_exit(1);
+        }
+    }
+    if (!(*c)->merge()) crash_exit(1);
+    crash_exit(0);  // 崩溃：退休队列（仅内存）随进程消失，文件留在盘上
+}
+
+TEST_F(OkiLevelBTest, RetiredFilesSurviveCrashHarmlessly) {
+    constexpr int kKeys = kRetiredKeys;
+    ASSERT_EQ(bitcask::test::spawn_crash_child("retired_files_crash",
+                                               dir_.string()),
+              0);
 
     CaskOptions o;
     o.read_write = true;

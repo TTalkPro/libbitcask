@@ -1,10 +1,6 @@
 #include "bitcask/file_lock.hpp"
 
 #include <cerrno>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #include <utility>
 
@@ -12,16 +8,19 @@ namespace bitcask::lock {
 
 std::expected<FileLock, io::IoError>
 FileLock::acquire(std::string_view filename, bool is_write_lock) noexcept {
-    int flags = O_RDONLY;
+    io::OpenFlag flags = io::OpenFlag::kReadOnly;
     if (is_write_lock) {
-        // O_SYNC：保证 write_data 写进去的内容（pid / active file 路径等）
-        // 立刻被其它进程的读锁看到——bitcask 用这个机制做 stale-lock 检查。
-        flags = O_CREAT | O_EXCL | O_RDWR | O_SYNC;
+        // kSyncAll（O_SYNC，**非** O_DSYNC）：保证 write_data 写进去的内容
+        // （pid / active file 路径等）立刻被其它进程的读锁看到——bitcask 用
+        // 这个机制做 stale-lock 检查。S37-1 收编时原样保留该区别：库内其余
+        // 写路径用的 kOSync 是 O_DSYNC，只有本处需要元数据也同步。
+        flags = io::OpenFlag::kCreate | io::OpenFlag::kSyncAll |
+                io::OpenFlag::kNoAppend;  // 见 kNoAppend 注释
     }
     std::string path(filename);
-    const int fd = ::open(path.c_str(), flags, 0600);
-    if (fd < 0) return std::unexpected(io::IoError{errno});
-    return FileLock(fd, is_write_lock, std::move(path));
+    auto fh = io::open_handle(path, flags);  // mode 0600 = kOwnerOnly（默认）
+    if (!fh) return std::unexpected(io::IoError{fh.error()});
+    return FileLock(*fh, is_write_lock, std::move(path));
 }
 
 void FileLock::release_quiet() noexcept {
@@ -31,10 +30,10 @@ void FileLock::release_quiet() noexcept {
         // 可能会被旧 reader 读出 garbage。这是 legacy lock_release 里的
         // 既定顺序，照搬。
         if (is_write_lock_ && !filename_.empty()) {
-            ::unlink(filename_.c_str());
+            std::remove(filename_.c_str());
         }
-        ::close(fd_);
-        fd_ = -1;
+        io::close_handle(fd_);
+        fd_ = io::kInvalidHandle;
     }
 }
 
@@ -43,26 +42,26 @@ void FileLock::release_quiet() noexcept {
 // 是 OOM；pread 失败是真正的 I/O 错误）。
 std::expected<std::vector<std::byte>, FileLock::ReadError>
 FileLock::read_data() noexcept {
-    struct stat st{};
-    if (::fstat(fd_, &st) != 0) {
+    const auto sz = io::handle_size(fd_);
+    if (!sz) {
         return std::unexpected(ReadError{ReadErrorKind::kFstat, errno});
     }
     std::vector<std::byte> buf;
     try {
-        buf.resize(static_cast<std::size_t>(st.st_size));
+        buf.resize(static_cast<std::size_t>(*sz));
     } catch (...) {
         return std::unexpected(ReadError{ReadErrorKind::kAlloc, 0});
     }
-    if (st.st_size > 0) {
-        const ssize_t n = ::pread(fd_, buf.data(), buf.size(), 0);
-        if (n == -1) {
+    if (*sz > 0) {
+        // S37-1：单次定位读。不套 io::pread_all——后者把短读判为失败，
+        // 会改变下面注释所述的 legacy 行为。
+        const auto n = io::pread_once(fd_, buf.data(), buf.size(), 0);
+        if (!n) {
             return std::unexpected(ReadError{ReadErrorKind::kPread, errno});
         }
         // legacy 这里不检测短读——锁文件本来就 < 一页，pread 不太可能短读，
         // 出现的话就当合法的「内容比 fstat 看到的小」处理（resize 截断）。
-        if (n >= 0 && static_cast<std::size_t>(n) < buf.size()) {
-            buf.resize(static_cast<std::size_t>(n));
-        }
+        if (*n < buf.size()) buf.resize(*n);
     }
     return buf;
 }
@@ -75,14 +74,16 @@ FileLock::write_data(std::span<const std::byte> data) noexcept {
     if (!is_write_lock_) {
         return std::unexpected(WriteError{WriteErrorKind::kNotWritable, 0});
     }
-    if (::ftruncate(fd_, 0) == -1) {
+    if (!io::truncate_handle(fd_, 0)) {
         return std::unexpected(WriteError{WriteErrorKind::kTruncate, errno});
     }
     // legacy 是单次 pwrite——不循环。这里照搬，以便错误语义完全一致：
     // 部分写在 legacy 里也算成功，不重试。锁文件容量极小，这种简化没
     // 实际风险。
     if (!data.empty()) {
-        if (::pwrite(fd_, data.data(), data.size(), 0) == -1) {
+        // legacy 是单次 pwrite——不循环，故不用 io::pwrite_all（那会重试补齐，
+        // 改变「部分写也算成功」的既有语义）。
+        if (!io::pwrite_once(fd_, data.data(), data.size(), 0)) {
             return std::unexpected(WriteError{WriteErrorKind::kPwrite, errno});
         }
     }

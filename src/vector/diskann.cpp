@@ -6,9 +6,6 @@
 
 #include "bitcask/diskann.hpp"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
@@ -179,7 +176,7 @@ void DiskannSegment::close() {
     map_.reset();  // B3：RAII munmap
     base_ = nullptr;
     if (fd_ >= 0) {
-        ::close(fd_);
+        io::close_handle(fd_);
         fd_ = -1;
     }
     nav_.clear();
@@ -395,10 +392,15 @@ bool DiskannSegment::build(std::string_view path, std::uint16_t dim,
     const std::string fp(path);
     diskint::TmpFile tf;
     tf.path = fp + ".tmp";
-    tf.fd = ::open(tf.path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC,
-                   0644);
-    if (tf.fd < 0) return false;
-    const int fd = tf.fd;
+    {
+        auto h = io::open_handle(tf.path,
+                                 io::OpenFlag::kTruncate |
+                                     io::OpenFlag::kCloseOnExec,
+                                 io::FileMode::kWorldReadable);
+        if (!h) return false;
+        tf.fd = *h;
+    }
+    const io::FileHandle fd = tf.fd;
     bool ok = true;
     const std::uint32_t nav_crc =
         n > 0 ? bitcask::codec::crc32(std::span<const std::byte>(
@@ -454,7 +456,7 @@ bool DiskannSegment::build(std::string_view path, std::uint16_t dim,
         ok = pwrite_all(fd, hdr, kBdaHeaderSize, 0);
     }
     if (ok) ok = tf.sync_close();
-    if (!ok || std::rename(tf.path.c_str(), fp.c_str()) != 0) {
+    if (!ok || !io::atomic_rename(tf.path, fp)) {  // S37-1：见 io.hpp C1 注释
         return false;  // TmpFile 析构清 tmp
     }
     tf.committed = true;
@@ -468,16 +470,18 @@ bool DiskannSegment::open(std::string_view path, std::uint16_t dim,
                           std::uint64_t expected_gen, bool verify_crc) {
     close();
     const std::string fp(path);
-    const int fd = ::open(fp.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
+    const auto fh = io::open_handle(
+        fp, io::OpenFlag::kReadOnly | io::OpenFlag::kCloseOnExec);
+    if (!fh) return false;
+    const io::FileHandle fd = *fh;
     std::uint8_t hdr[kBdaHeaderSize];
-    if (::read(fd, hdr, kBdaHeaderSize) !=
-        static_cast<ssize_t>(kBdaHeaderSize)) {
-        ::close(fd);
+    // S37-1：定位读，不依赖 fd 内部偏移（见 ivf_rq 同处注释）。
+    if (!io::pread_all(fd, hdr, kBdaHeaderSize, 0)) {
+        io::close_handle(fd);
         return false;
     }
     if (std::memcmp(hdr, kBdaMagic, 4) != 0) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     std::uint32_t ver = 0, r = 0, medoid = 0, nav_crc = 0, blocks_crc = 0;
@@ -501,15 +505,15 @@ bool DiskannSegment::open(std::string_view path, std::uint16_t dim,
     const std::uint32_t calc = bitcask::codec::crc32(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(hdr), kBdaHeaderCrcOff));
     if (ver != kBdaVersion || fdim != dim || stored != calc || r == 0) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     if (expected_gen != 0 && gen != 0 && gen != expected_gen) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     if (count > 0 && medoid >= count) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     const std::size_t snav = static_cast<std::size_t>(dim) + 8;
@@ -518,19 +522,18 @@ bool DiskannSegment::open(std::string_view path, std::uint16_t dim,
     if (nav_off != kBdaHeaderSize ||
         blocks_off != nav_off + count * snav ||
         file_len != blocks_off + count * bstride) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
-    struct stat st;
-    if (::fstat(fd, &st) != 0 ||
-        static_cast<std::uint64_t>(st.st_size) < file_len) {
-        ::close(fd);
+    const auto fsize = io::handle_size(fd);
+    if (!fsize || *fsize < file_len) {
+        io::close_handle(fd);
         return false;
     }
     map_ = io::MappedFile::map_readonly(
-        fd, static_cast<std::size_t>(st.st_size), /*advise_random=*/false);
+        fd, static_cast<std::size_t>(*fsize), /*advise_random=*/false);
     if (!map_.valid()) {
-        ::close(fd);
+        io::close_handle(fd);
         return false;
     }
     base_ = reinterpret_cast<const std::uint8_t*>(map_.data());

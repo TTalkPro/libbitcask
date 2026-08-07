@@ -1,8 +1,8 @@
 // Unit tests for bitcask::lock::FileLock.
 
-#include <unistd.h>
 
 #include <cerrno>
+#include "support/test_paths.hpp"
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -21,7 +21,7 @@ class TempDir {
 public:
     TempDir() {
         path_ = fs::temp_directory_path() /
-                ("bitcask_lock_" + std::to_string(::getpid()) + "_" +
+                ("bitcask_lock_" + std::to_string(bitcask::test::test_pid()) + "_" +
                  std::to_string(reinterpret_cast<std::uintptr_t>(this)));
         fs::create_directories(path_);
     }

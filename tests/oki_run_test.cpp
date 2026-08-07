@@ -3,9 +3,9 @@
 // 区间之间、首尾越界）/ 损坏与结构错误拒收（fail-fast → 弃用重建）/
 // 空 run / manifest round-trip 与拒收。
 
-#include <unistd.h>
 
 #include <algorithm>
+#include "support/test_paths.hpp"
 #include <cstdio>
 #include <filesystem>
 #include <map>
@@ -30,7 +30,7 @@ class TempDir {
 public:
     TempDir() {
         path_ = fs::temp_directory_path() /
-                ("bitcask_oki_" + std::to_string(::getpid()) + "_" +
+                ("bitcask_oki_" + std::to_string(bitcask::test::test_pid()) + "_" +
                  std::to_string(reinterpret_cast<std::uintptr_t>(this)));
         fs::create_directories(path_);
     }

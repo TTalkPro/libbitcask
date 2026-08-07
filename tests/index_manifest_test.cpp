@@ -1,4 +1,5 @@
 #include "bitcask/index_manifest.hpp"
+#include "support/test_paths.hpp"
 
 #include <gtest/gtest.h>
 
@@ -14,7 +15,7 @@ namespace {
 
 class IndexManifestTest : public ::testing::Test {
 protected:
-    fs::path tmp = fs::temp_directory_path() / ("manifest_test_" + std::to_string(::getpid()));
+    fs::path tmp = fs::temp_directory_path() / ("manifest_test_" + std::to_string(bitcask::test::test_pid()));
     std::string path = (tmp / "index.manifest").string();
 
     void SetUp() override { fs::create_directories(tmp); }

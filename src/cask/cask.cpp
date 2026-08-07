@@ -2,9 +2,6 @@
 #include "bitcask/diskann_plugin.hpp"  // S32-M5：DiskANN 引擎工厂
 #include "bitcask/ivf_plugin.hpp"  // S32-M3：IVF 引擎工厂
 
-#include <signal.h>     // ::kill for stale-lock detection
-#include <sys/resource.h>  // ::getrlimit, RLIMIT_NOFILE（S12-1 read 句柄默认上限）
-#include <unistd.h>     // ::getpid, ::unlink
 
 #include <algorithm>
 #include <atomic>
@@ -28,17 +25,8 @@ namespace bitcask {
 namespace {
 namespace fs = std::filesystem;
 
-// 探测 OS 进程 pid 是否还活着。对应 legacy bitcask_lockops:os_pid_exists/1
-// 用 `kill -0 <pid>` 的做法。kill(pid, 0)：
-//   返回 0   — 信号能投递，进程在
-//   -1 + ESRCH — 进程已死
-//   -1 + EPERM — 进程在但我们无权 signal（保守地视为「活着」，
-//                避免误删别人的 lock）
-[[nodiscard]] bool process_alive(int pid) noexcept {
-    if (pid <= 0) return false;
-    if (::kill(pid, 0) == 0) return true;
-    return errno != ESRCH;
-}
+// S37-1：进程存活探测下沉到 io seam（原 kill(pid,0)）。**Windows 下 PID
+// 复用快，仅凭 pid 判断会误判——见 io::process_alive 的告警注释。**
 
 // 锁文件内容格式（legacy 和我们都遵守）：
 //   "<pid> <active_data_file_path>\n"
@@ -101,7 +89,7 @@ parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
             std::span<const std::byte>(data->data(), data->size()));
         // pid == -1 means "no parseable PID" (e.g. legacy hadn't written
         // it yet, or the writer crashed mid-write). Treat as stale.
-        if (pid == -1 || !process_alive(pid)) {
+        if (pid == -1 || !io::process_alive(pid)) {
             dead = true;
         }
     } else {
@@ -109,7 +97,7 @@ parse_active_file_id_from_lock(std::span<const std::byte> bytes) noexcept {
     }
     rl->release_quiet();  // closes fd; read locks don't unlink
     if (!dead) return false;
-    return ::unlink(path.c_str()) == 0;
+    return io::remove_file(path);
 }
 
 // 拿 bitcask.write.lock，自带 stale-lock 回收。先只写一行 pid；active
@@ -130,7 +118,7 @@ acquire_writer_lock(const std::string& dirname) {
         }
         return std::unexpected(io_fault(fl.error().errnum, lock_path));
     }
-    const std::string pid_line = std::to_string(::getpid()) + "\n";
+    const std::string pid_line = std::to_string(io::current_process_id()) + "\n";
     auto pid_bytes = std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(pid_line.data()),
         pid_line.size());
@@ -179,10 +167,9 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     // 避免大库无界累积 fd/mmap 撞 `ulimit -n` / `vm.max_map_count`。显式值/不限
     // 哨兵原样透传（见 resolve_read_handle_cap）。
     {
-        std::size_t nofile = 1024;  // getrlimit 失败/INFINITY 时的保守兜底
-        struct ::rlimit rl{};
-        if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
-            nofile = static_cast<std::size_t>(rl.rlim_cur);
+        std::size_t nofile = 1024;  // 取不到/INFINITY 时的保守兜底
+        if (const auto lim = io::max_open_files()) {
+            nofile = static_cast<std::size_t>(*lim);
         }
         cask->opts_.max_read_handles =
             resolve_read_handle_cap(opts.max_read_handles, nofile);
@@ -321,7 +308,7 @@ std::expected<void, CaskFault> Cask::acquire_open_locks() {
         }
         return std::unexpected(io_fault(fl.error().errnum, lock_path));
     }
-    const std::string pid_line = std::to_string(::getpid()) + "\n";
+    const std::string pid_line = std::to_string(io::current_process_id()) + "\n";
     auto pid_bytes = std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(pid_line.data()),
         pid_line.size());
@@ -950,7 +937,7 @@ std::expected<void, CaskFault> Cask::ensure_active_writer() {
     // 通过读 write.lock 知道我们正在写哪个 file_id，从 needs_merge 候选里
     // 排除它。格式跟 legacy 一致："<pid> <active_data_path>\n"。
     if (write_lock_) {
-        const std::string line = std::to_string(::getpid()) + " " +
+        const std::string line = std::to_string(io::current_process_id()) + " " +
                                   data_path + "\n";
         auto bytes = std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(line.data()), line.size());

@@ -1,8 +1,8 @@
 // M3.2 unit tests for the bitcask directory scanner.
 
-#include <unistd.h>
 
 #include <cstdio>
+#include "support/test_paths.hpp"
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -23,7 +23,7 @@ class TempDir {
 public:
     TempDir() {
         path_ = fs::temp_directory_path() /
-                ("bitcask_scan_" + std::to_string(::getpid()) + "_" +
+                ("bitcask_scan_" + std::to_string(bitcask::test::test_pid()) + "_" +
                  std::to_string(reinterpret_cast<std::uintptr_t>(this)));
         fs::create_directories(path_);
     }
@@ -50,7 +50,7 @@ TEST(Scanner, EmptyDirectory) {
 }
 
 TEST(Scanner, MissingDirectoryReturnsError) {
-    auto r = scan_dir("/tmp/this/path/should/not/exist/" + std::to_string(::getpid()));
+    auto r = scan_dir(bitcask::test::nonexistent_path().string());
     ASSERT_FALSE(r);
     EXPECT_EQ(r.error().kind, ScanError::kCannotOpenDir);
     EXPECT_NE(r.error().errnum, 0);

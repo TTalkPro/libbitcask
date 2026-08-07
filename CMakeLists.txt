@@ -136,8 +136,13 @@ add_library(bitcask_format STATIC
     src/fileops/codec.cpp
 )
 target_include_directories(bitcask_format PUBLIC include)
+# S37-1：detail/file_util.hpp 的宿主原语（atomic_rename / sync_directory /
+# flush_and_sync_stream）下沉到 io seam 后，任何包含该头的 target 都需要 io
+# 符号——而它经 index_manifest.hpp / field_schema.hpp / oki_run.hpp /
+# search_checkpoint.hpp 等公共头传播到几乎所有下游。由最低公共层 PUBLIC
+# 传递，避免逐个 target 补链接的打地鼠。无环：bitcask_io 不依赖 format。
 target_link_libraries(bitcask_format
-    PUBLIC ZLIB::ZLIB
+    PUBLIC ZLIB::ZLIB bitcask_io
     PRIVATE bitcask_warnings bitcask_sanitizers
 )
 

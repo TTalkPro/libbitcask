@@ -37,7 +37,8 @@ namespace bitcask::lock {
 class FileLock {
 public:
     FileLock() noexcept = default;
-    FileLock(int fd, bool is_write_lock, std::string filename) noexcept
+    FileLock(io::FileHandle fd, bool is_write_lock,
+             std::string filename) noexcept
         : fd_(fd), is_write_lock_(is_write_lock),
           filename_(std::move(filename)) {}
     ~FileLock() noexcept { release_quiet(); }
@@ -46,19 +47,19 @@ public:
     FileLock& operator=(const FileLock&) = delete;
     FileLock(FileLock&& o) noexcept
         : fd_(o.fd_), is_write_lock_(o.is_write_lock_),
-          filename_(std::move(o.filename_)) { o.fd_ = -1; }
+          filename_(std::move(o.filename_)) { o.fd_ = io::kInvalidHandle; }
     FileLock& operator=(FileLock&& o) noexcept {
         if (this != &o) {
             release_quiet();
             fd_ = o.fd_; is_write_lock_ = o.is_write_lock_;
-            filename_ = std::move(o.filename_); o.fd_ = -1;
+            filename_ = std::move(o.filename_); o.fd_ = io::kInvalidHandle;
         }
         return *this;
     }
 
-    [[nodiscard]] bool is_open()       const noexcept { return fd_ >= 0; }
+    [[nodiscard]] bool is_open()       const noexcept { return io::handle_valid(fd_); }
     [[nodiscard]] bool is_write_lock() const noexcept { return is_write_lock_; }
-    [[nodiscard]] int  fd()            const noexcept { return fd_; }
+    [[nodiscard]] io::FileHandle fd()  const noexcept { return fd_; }
     [[nodiscard]] const std::string& filename() const noexcept { return filename_; }
 
     // 读锁：O_RDONLY 打开已存在的锁文件——只是为了能读到当前持有者
@@ -91,7 +92,7 @@ public:
     write_data(std::span<const std::byte> data) noexcept;
 
 private:
-    int  fd_ = -1;
+    io::FileHandle fd_ = io::kInvalidHandle;
     bool is_write_lock_ = false;
     std::string filename_;
 };

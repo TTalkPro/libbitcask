@@ -8,6 +8,29 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/googletest"
                  "${CMAKE_BINARY_DIR}/_deps/googletest-build" EXCLUDE_FROM_ALL)
 
+# S37-2：测试公共 helper（support/test_paths.hpp、support/crash_child.hpp）
+# 以 "support/..." 形式引用，把 tests/ 自身放进包含路径。目录级——所有测试
+# 目标一致可见，免得每加一个用到 helper 的测试就补一次 include 目录。
+include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
+
+# ---------------------------------------------------------------------------
+# bitcask_test_crash_child — 崩溃注入测试的 exec-self 骨架 + main（S37-2）。
+#
+# 用它的测试目标链 GTest::gtest（**不是** gtest_main）——本库自带 main，
+# 需在 InitGoogleTest 之前拦截 --bitcask-crash-child 分发。契约见
+# support/crash_child.hpp。
+# ---------------------------------------------------------------------------
+add_library(bitcask_test_crash_child STATIC
+    support/crash_child.cpp
+    support/crash_main.cpp
+)
+target_include_directories(bitcask_test_crash_child PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(bitcask_test_crash_child
+    PUBLIC  GTest::gtest
+    PRIVATE bitcask_warnings bitcask_sanitizers
+)
+
 add_executable(bitcask_smoke_test smoke_test.cpp)
 target_link_libraries(bitcask_smoke_test PRIVATE
     GTest::gtest_main
@@ -161,7 +184,8 @@ target_link_libraries(bitcask_oki_range_test PRIVATE
 
 add_executable(bitcask_oki_recovery_test oki_recovery_test.cpp)
 target_link_libraries(bitcask_oki_recovery_test PRIVATE
-    GTest::gtest_main
+    GTest::gtest
+    bitcask_test_crash_child
     bitcask_cask
     bitcask_warnings
     bitcask_sanitizers
@@ -169,7 +193,8 @@ target_link_libraries(bitcask_oki_recovery_test PRIVATE
 
 add_executable(bitcask_oki_levelb_test oki_levelb_test.cpp)
 target_link_libraries(bitcask_oki_levelb_test PRIVATE
-    GTest::gtest_main
+    GTest::gtest
+    bitcask_test_crash_child
     bitcask_cask
     bitcask_warnings
     bitcask_sanitizers
@@ -193,7 +218,8 @@ target_link_libraries(bitcask_atomic_batch_test PRIVATE
 
 add_executable(bitcask_txn_test txn_test.cpp)
 target_link_libraries(bitcask_txn_test PRIVATE
-    GTest::gtest_main
+    GTest::gtest
+    bitcask_test_crash_child
     bitcask_cask
     bitcask_warnings
     bitcask_sanitizers
@@ -201,7 +227,8 @@ target_link_libraries(bitcask_txn_test PRIVATE
 
 add_executable(bitcask_crash_recovery_test crash_recovery_test.cpp)
 target_link_libraries(bitcask_crash_recovery_test PRIVATE
-    GTest::gtest_main
+    GTest::gtest
+    bitcask_test_crash_child
     bitcask_cask
     bitcask_warnings
     bitcask_sanitizers
