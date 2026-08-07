@@ -48,6 +48,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <intrin.h>   // S37-4：__iso_volatile_load64（见 opt_copy_bytes）
+#endif
+
 namespace bitcask::detail {
 
 template <class T>
@@ -389,7 +393,23 @@ private:
         auto* d = static_cast<std::uint64_t*>(dst);
         const auto* s = static_cast<const std::uint64_t*>(src);
         for (std::size_t i = 0; i < bytes / 8; ++i) {
+#if defined(_MSC_VER) && !defined(__clang__)
+            // S37-4：`__iso_volatile_load64` 是 MSVC 侧与
+            // `__atomic_load_n(..., __ATOMIC_RELAXED)` 逐条对应的等价物：
+            // 单条 mov、无 libcall、**且不参与 loop-idiom 识别**（后者会把
+            // 本循环聚合回 memcpy，正是上面注释要避免的）。
+            // 用它而非普通 `volatile`：x64 默认 /volatile:ms 会给 volatile
+            // 读加上 acquire 语义，比这里需要的 relaxed 更强；`__iso_` 前缀
+            // 的这一族恰恰是「ISO volatile 语义、不附加序」。
+            // TBAA 在此不是问题——MSVC 不做基于类型的别名分析（GCC 侧的
+            // 严格别名违规才是 __atomic_load_n 的首要理由，见上）。
+            // TSan 一项不适用：MSVC 无 TSan（设计稿 §5.3）。
+            static_assert(sizeof(long long) == sizeof(std::uint64_t));
+            d[i] = static_cast<std::uint64_t>(__iso_volatile_load64(
+                reinterpret_cast<const volatile long long*>(s + i)));
+#else
             d[i] = __atomic_load_n(s + i, __ATOMIC_RELAXED);
+#endif
         }
     }
     [[nodiscard]]

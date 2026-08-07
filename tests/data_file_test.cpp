@@ -576,7 +576,7 @@ TEST(MigrateBEtoLE, RoundTrip) {
     // dst meta：version 4（LE + CRC + u64 tstamp 纪元）、dim 小端 = 4、
     // CRC 覆盖 [0,14) 正确。
     {
-        std::FILE* f = std::fopen((fs::path(dst) / "bitcask.meta").c_str(), "rb");
+        std::FILE* f = std::fopen((fs::path(dst) / "bitcask.meta").string().c_str(), "rb");
         ASSERT_NE(f, nullptr);
         unsigned char m[18];
         ASSERT_EQ(std::fread(m, 1, 18, f), 18u);
@@ -764,7 +764,7 @@ TEST(MigrateU32toU64, RoundTrip) {
     // dst meta：version 4,其余配置字节保留,CRC 重算正确（v4 门禁字节级
     // 校验;与 MigrateBEtoLE.RoundTrip 同法,避免测试链接 cask 库）。
     {
-        std::FILE* f = std::fopen((fs::path(dst) / "bitcask.meta").c_str(),
+        std::FILE* f = std::fopen((fs::path(dst) / "bitcask.meta").string().c_str(),
                                   "rb");
         ASSERT_NE(f, nullptr);
         unsigned char m[18];
@@ -786,7 +786,7 @@ TEST(MigrateU32toU64, RoundTrip) {
     }
     // field.schema 原样拷贝。
     {
-        std::FILE* f = std::fopen((fs::path(dst) / "field.schema").c_str(),
+        std::FILE* f = std::fopen((fs::path(dst) / "field.schema").string().c_str(),
                                   "rb");
         ASSERT_NE(f, nullptr);
         unsigned char buf[4] = {0};

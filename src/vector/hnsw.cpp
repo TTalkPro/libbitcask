@@ -616,8 +616,7 @@ std::uint32_t HnswIndex::copy_neighbors(std::uint32_t id, std::uint32_t layer,
         if (s1 & 1u) { cpu_pause(); continue; }  // 写者更新中
         const std::uint32_t n = adj_load(a);
         if (n > cap) { cpu_pause(); continue; }  // torn count，防 out 越界
-#if defined(__SANITIZE_THREAD__) || \
-    (defined(__has_feature) && __has_feature(thread_sanitizer))
+#if BITCASK_TSAN_ENABLED   // S37-4：见 detail/cpu_features.hpp
         for (std::uint32_t i = 0; i < n; ++i) out[i] = adj_load(a + 1 + i);
 #else
         std::memcpy(out, a + 1,

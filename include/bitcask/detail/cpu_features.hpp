@@ -63,6 +63,35 @@
 #  define BITCASK_NO_SANITIZE(what) __attribute__((no_sanitize(what)))
 #endif
 
+// ---------------------------------------------------------------------------
+// BITCASK_TSAN_ENABLED —— 是否在 TSan 插桩构建下（1/0）。
+//
+// S37-4：替代原先散在 8 个文件里的
+//   #if defined(__SANITIZE_THREAD__) || \
+//       (defined(__has_feature) && __has_feature(thread_sanitizer))
+//
+// **那个写法在符合标准的预处理器下是语法错误**，不只是「MSVC 方言问题」：
+// `__has_feature` 未定义时，标准要求先把整个 #if 表达式做宏替换、把剩余
+// 标识符换成 0，于是右半边变成 `0(thread_sanitizer)` —— 一个不合法的表达式。
+// GCC/Clang 对 `&&` 右侧宽容（不求值即不报错），MSVC 的 /Zc:preprocessor
+// 严格按标准来，报 C1012「unmatched parenthesis」，且错误位置指向 #if 行，
+// 与真实原因（探测宏不存在）毫无关联，极难追。
+//
+// 正确写法是**嵌套** #if：外层先确认 `__has_feature` 存在，内层才调用它。
+// TSan 只在 GCC/Clang 上存在（设计稿 §5.3：MSVC 无 TSan），故 MSVC 恒 0。
+// ---------------------------------------------------------------------------
+#if defined(__SANITIZE_THREAD__)
+#  define BITCASK_TSAN_ENABLED 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define BITCASK_TSAN_ENABLED 1
+#  else
+#    define BITCASK_TSAN_ENABLED 0
+#  endif
+#else
+#  define BITCASK_TSAN_ENABLED 0
+#endif
+
 namespace bitcask::simd {
 
 // ISA 档位。单调递增——BITCASK_SIMD_MAX 按序钳制。

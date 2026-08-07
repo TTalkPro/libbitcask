@@ -349,6 +349,137 @@ leaf 7.0 ECX bit 11 位置迥异）**。
 - **工作量**：4-6 天
 - **验收**：MSVC 能编出 `bitcask.dll` + `bitcask.lib`；ctest 能跑起来（不要求全绿）
 
+#### ✅ S37-4 落地记录（2026-08-07）
+
+环境：VS 18 / **MSVC 14.51（cl 19.51）** / Windows SDK 10.0.28000 / CMake 4.3 / Ninja 1.13。
+`scripts/Enter-MsvcEnv.ps1` 把 VsDevCmd 的环境导进当前会话（本届新增的开发脚本）。
+
+**结论先行：全部 188 个 TU（第一方 + 61 个源 + 40 个测试 + tools + 第三方）
+在 MSVC 下编译零错误；剩余 1851 条链接错误 100% 是 `bitcask::io` 的 34 个符号
+——即 S37-5 的完整工作面，无一例外。** 编译面比设计稿预估小得多。
+
+**依赖策略（决策变更）**：设计稿 §1.4 建议 vcpkg 承载 zlib + TBB。**TBB 改从
+`third_party/oneTBB` 子模块现编**——vcpkg 的 `tbb` 端口经 `hwloc` 依赖会拖进
+msys2（m4/perl/autotools/ncurses…）整套工具链，与「纯 MSVC」构建约束冲突。
+oneTBB 自身用 MSVC + CMake 直接可编（无 hwloc 时只跳过 `tbbbind` 的 NUMA 绑定）。
+新增 `BITCASK_BUNDLED_TBB` 开关，Windows 与 TSan 构建默认 ON，Linux 默认 OFF
+（`find_package` 行为逐字不变）。`vcpkg.json` 最终只剩 zlib，14 秒装完。
+
+**构建系统改动**：
+- 全局 MSVC 分流：`/utf-8 /bigobj /permissive- /Zc:preprocessor /Zc:__cplusplus`
+  + `NOMINMAX` / `WIN32_LEAN_AND_MEAN` / `_CRT_SECURE_NO_WARNINGS` /
+  `_CRT_NONSTDC_NO_WARNINGS`（目录作用域，置于所有 `add_library`/`add_subdirectory` 之前）
+- `bitcask_warnings` 分流 `/W4`（**首轮不开 `/WX`**）；`BITCASK_WERROR`→`/WX`；
+  `BITCASK_NATIVE` 在 MSVC 下 **FATAL_ERROR 而非静默忽略**；
+  `BitcaskSanitizers.cmake` 加 MSVC 分支（ASan → `/fsanitize=address` + 清 `/RTC1`
+  + `/INCREMENTAL:NO`；**TSan/UBSan/LSan 报错退出**——「以为在跑 TSan、实际没插桩」
+  比构建失败危险得多）
+- `WIN32` 下 `CMAKE_RUNTIME_OUTPUT_DIRECTORY` 收进 `bin/`（Windows 无 RPATH，
+  exe 与 bitcask.dll/tbb12.dll/zlib1.dll 须同目录）
+- `bitcask_io` 改为**按平台选后端**（`posix_file.cpp` / `win32_file.cpp`）；
+  后端文件不存在时告警并留空——库目标仍全部可编译，这正是本届量编译面的形态
+- `cmake_minimum_required` 3.20 → 3.21（见下）
+
+**静态库合并重写（设计稿 §1.3）——未按原方案改 OBJECT 库**：
+原实现在**配置期生成 bash 脚本**跑 `ar x` 解包 13 个归档再重打包，Windows 无
+bash/ar。设计稿建议改 OBJECT 库，但那会**改动整个链接图**（每个测试 exe 从
+「按需抽取」变成「全量吞入」），而「Linux 侧零回归」是硬约束且本机无法验证。
+改用 `add_library(bitcask_static STATIC $<TARGET_OBJECTS:...>)`——`$<TARGET_OBJECTS:>`
+自 CMake 3.21 起对 STATIC 目标同样可用（已实测确认：符号进归档且不重复编译），
+于是**链接图逐字不变**，只有「怎么产出这一个归档」变了。同样杜绝了同名 `.o`
+互相覆盖的隐患（对象按目标各自成路径喂入，不再解包到同一临时目录）。
+
+顺带修掉两个**现行缺陷**：
+1. **`bitcask_simd` 原本不在合并列表里**（S37-3 新增该库时漏补）——即 v6.1.0
+   发布的 `libbitcask.a` 缺 `cpu_features` / `crc32_sse42` 两个 TU，静态链接的
+   下游会撞未定义符号。已补入并 `dumpbin /ARCHIVEMEMBERS` 核验（58 个成员，
+   `bitcask::simd::*` 符号确为定义态）。
+2. install 规则的合并静态库那条原是 `install(FILES <硬编码 .a 路径>)`，Windows
+   上指向不存在的文件；改 `install(TARGETS)`。Windows 下产物改名
+   `bitcask_static.lib`——`bitcask_shared` 的**导入库**已占用 `bitcask.lib`。
+
+**三处被 `/usr/include` 长期掩盖的依赖缺失**（Windows 无全局头目录，一编即炸）：
+| 目标 | 缺 | 经由 |
+|---|---|---|
+| `bitcask_simd` | `ZLIB::ZLIB` | 公开头 `hw_crc32.hpp` 直接 `#include <zlib.h>` |
+| `bitcask_bm25` | TBB 需 PRIVATE→**PUBLIC** | 公开头 `inverted.hpp` 含 TBB 头，经 segment/text_plugin/search_cache 传播 |
+| `bitcask_cask` | TBB 需 PRIVATE→**PUBLIC** | **公开头** `cask.hpp` 含 `thread_pool.hpp` → TBB |
+| `bitcask_keydir` | TBB（PRIVATE 即可）| `keydir_registry.cpp` 含 `thread_pool.hpp` |
+
+**⚠️ 本届最值得记住的一条：`#if defined(__has_feature) && __has_feature(...)`
+在符合标准的预处理器下是语法错误，不是「MSVC 方言问题」**
+
+全库 6 处 TSan 探测写成
+`#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))`。
+标准要求先对整个 `#if` 表达式做宏替换、把剩余标识符换成 `0`，于是右半边成为
+`0(thread_sanitizer)`——不合法。GCC/Clang 对 `&&` 右侧宽容，`/Zc:preprocessor`
+严格按标准来，报 **C1012「unmatched parenthesis」**，且错误位置指向 `#if` 行，
+与真实原因（探测宏不存在）毫无关联，极难追。一处在 `thread_pool.hpp` 里，
+波及 `bitcask_keydir`/`bitcask_cask`/`bitcask_hybrid` 等一大片。
+
+修法：`detail/cpu_features.hpp` 新增 **`BITCASK_TSAN_ENABLED`** 单一出口，
+用**嵌套** `#if`（外层先确认 `__has_feature` 存在，内层才调用）。仓库里
+`oki_levelb/oki_locate/oki_range_test` 三处本来就写的是正确的嵌套形式——
+即正确写法一直在库里，只是没被推广。6 处已全部切换。
+
+**其余源码改动（全部是「Linux 上碰巧能过」的真问题）**：
+- `seq_shard_table.hpp` 的 `__atomic_load_n(..., __ATOMIC_RELAXED)` → MSVC 侧
+  `__iso_volatile_load64`。**GCC 分支逐字保留**：原注释里三条理由（TBAA 豁免、
+  无 libcall、TSan 原生理解）中前两条在 GCC 上是正确性依赖，换 `std::atomic_ref`
+  有重新引入陈旧读的风险且无法在本机验证。MSVC 侧选 `__iso_` 前缀那一族而非
+  普通 `volatile`：x64 默认 `/volatile:ms` 会给 volatile 读加 acquire 语义，
+  强于此处需要的 relaxed。
+- `intersect_kernels_avx2.cpp` 的 `__m256i_u`（GCC 私有类型）→ `__m256i`；
+  `_mm256_loadu_si256` 的非对齐语义由 intrinsic 自身保证，不靠指针类型。
+- `intersect_kernels_avx512.cpp` 补 `<bit>`（`std::popcount`）、
+  `keydir_test.cpp` 补 `<algorithm>`（`std::sort`）——MSVC STL 不做传递包含。
+- **`fs::path::c_str()` 在 Windows 返回 `const wchar_t*`**（设计稿 C8）：
+  `migrate.cpp` ×1 + 测试 ×7 处直接喂给窄 `std::fopen`，编译失败。改 `.string()`，
+  与全库「路径以 `std::string` 流转」约定一致。⚠️ 这只解决可编译性——`.string()`
+  走系统 ANSI 代码页，**非 ASCII 路径仍打不开**，属 S37-5 的 UTF-8→UTF-16 范畴。
+- `c_api/internal.h` 的 `#pragma GCC visibility push/pop` **加编译器守卫而非
+  按 S37-3.5 原计划删除**：`bitcask_shared` 是唯一不链 `bitcask_warnings` 的目标，
+  拿不到 `-fvisibility=hidden`，这条 pragma 是那些助手符号在 Linux 上唯一的
+  隐藏来源，删掉即改行为。
+- `c_api_test.c` 用 `<stdatomic.h>`（parallel_scan 并发回调计数，非装饰）：
+  MSVC 的 `.c` 默认 C89 且 C11 atomics 仍在开关后。该目标单独加
+  `C_STANDARD 11` + `/experimental:c11atomics`，不动全局 `CMAKE_C_STANDARD`
+  （那会把 utf8proc/zlib 的 C 方言从 gnu17 降到 gnu11，属无谓波及）。
+
+**告警面（S37-7 开 `/WX` 前的账）——远好于设计稿预估**：
+库目标全量 `/W4` 共 **94 条**：C4324 ×60（cacheline `alignas` 的填充提示，无害）、
+C4244 ×32、C4100 ×1、C4456 ×1。**设计稿点名会刷屏的 C4267 实际为 0。**
+
+**验收状态**：
+| 项 | 状态 |
+|---|---|
+| 全部 188 个 TU 编译 | ✅ 0 错误 |
+| 13 个第一方静态库 + 合并 `bitcask_static.lib` | ✅ 产出（121 MB，Debug） |
+| `bitcask.dll` | ⛔ 缺 34 个 `bitcask::io` 符号（S37-5） |
+| ctest | ⛔ 同上，40 个测试 exe 均卡在链接 |
+| Linux 侧 | ⬜ **本届改动尚未在 Linux 上复验**（见下） |
+
+> ⚠️ **本届记录未覆盖的一项**：所有改动都只在 Windows 上验证过。虽然每处都按
+> 「GCC 分支逐字不变」的原则做（`__atomic_load_n`、visibility pragma、
+> `find_package(TBB)` 路径均保持原样），`BITCASK_TSAN_ENABLED` 的替换与
+> 4 处 `target_link_libraries` 的 PRIVATE→PUBLIC 仍须在 Linux 上过一遍
+> **Debug 全量 + ASan + TSan**（TSan 尤其——`BITCASK_TSAN_ENABLED` 若因漏包含
+> 头而恒 0，TSan 注解会**静默失效**，表现为 TSan 误报而非编译错误）。
+
+**S37-5 的完整工作面（34 个未解析符号，链接器实测）**：
+
+`File` 成员 ×9：`open` / `close_quiet` / `pread` / `pread_into` / `pwrite` /
+`write` / `seek` / `seek_bof` / `sync` / `truncate_here`
+（另 `truncate(len)` / `size()` / `identity()` / `release()` 在未解析表外——
+未被 c_api 路径引用，实现时同样要补）
+`MappedFile` ×4：`map_readonly` / `~MappedFile` / `operator=(&&)` / `reset`
+句柄级 ×11：`open_handle` / `close_handle` / `sync_data` / `truncate_handle` /
+`handle_size` / `handle_identity` / `path_identity` / `pread_all` / `pwrite_all` /
+`pread_once` / `pwrite_once`
+路径级 ×5：**`atomic_rename`** / `sync_directory` / `flush_and_sync_stream` /
+`remove_file` / `prefetch_range`
+进程/系统 ×4：`current_process_id` / **`process_alive`** / `max_open_files` / `page_size`
+
 ### S37-5 — Windows I/O 后端 🔴 HIGH
 
 实现 `src/io/win32_file.cpp`，填 S37-1 留下的 seam：
@@ -469,15 +600,26 @@ S37-7 (1.5周) ───── CI + 收尾
 | S37-2 fork → exec-self | ✅ done（6 个 fork 点全转；`tests/` POSIX 头归零；Debug/ASan 725/725，见落地记录）|
 | S37-3.a cpu_features + 降档开关 | ✅ done（`__builtin_cpu_supports` 归零；四档 732/732 跨档对拍，见落地记录）|
 | S37-3.b 内核分 ISA TU | ✅ done（24 个 target 函数搬完；ISA 泄漏 0；四档 732/732；bench ±2%，见落地记录）|
-| S37-4 MSVC 构建适配 | ⬜ 未开始（需 Windows 环境）|
-| S37-5 Windows I/O 后端 | ⬜ 未开始 |
+| S37-4 MSVC 构建适配 | ✅ done（188 个 TU 编译零错误；13 库 + 合并静态库产出；剩余全部为 io 后端符号。⚠️ Linux 侧未复验，见落地记录）|
+| S37-5 Windows I/O 后端 | ⬜ 未开始（工作面已由链接器量准：34 个符号，见 S37-4 落地记录末）|
 | S37-6 删除/映射生命周期 | ⬜ 未开始 |
 | S37-7 CI + 收尾 | ⬜ 未开始 |
 
-### 待确认项（不阻塞 S37-1/2/3）
+### 待确认项
 
-- 设计稿 §2.2「MSVC intrinsic 无需 `/arch` 开关」前提须在目标 VS 版本实测。
-  结论决定 S37-3 的分 TU 是**性能需要**还是**正确性需要** —— 若为后者，改动面更硬。
-- cppjieba / limonp 在 MSVC 下的实际可编译性（header-only，但含类 POSIX 习惯）。
-- 目标最低 Windows 版本（决定 `PrefetchVirtualMemory` / `FILE_ID_INFO` / 长路径 opt-in 可用性）。
-- `std::expected` 等 C++23 库设施在目标 VS 版本的覆盖度（21 个 TU 依赖）。
+已由 S37-4 实测结清（VS 18 / MSVC 14.51 / SDK 10.0.28000）：
+
+- ~~cppjieba / limonp 在 MSVC 下的可编译性~~ → ✅ **零修改编过**（含 utf8proc /
+  googletest / benchmark / unordered_dense / oneTBB，第三方一处没改）。
+- ~~`std::expected` 等 C++23 设施的覆盖度~~ → ✅ 21 个依赖 TU 全部编过，
+  `/std:c++latest` 下 `<expected>` / `<span>` / `<bit>` 齐备。
+- ~~MSVC 侧的 `/arch:` 施加~~ → ✅ `bitcask_simd_tu` 的 MSVC 分支实测可用，
+  12 个分 ISA TU 全部编过（含 `/arch:AVX512` 的 5 个）。
+
+仍未结清：
+
+- 设计稿 §2.2「MSVC intrinsic 无需 `/arch` 开关」——**只验证了能编，没验证
+  生成的指令**。分 TU 是性能需要还是正确性需要，须等 S37-7 的反汇编泄漏检查
+  （Linux 侧 S37-3.b 已做过：42 个非 SIMD TU 宽指令泄漏 0）。
+- 目标最低 Windows 版本（决定 `PrefetchVirtualMemory` / `FILE_ID_INFO` /
+  长路径 opt-in 可用性）—— S37-5 落地前须拍板。

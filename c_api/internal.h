@@ -37,7 +37,15 @@
 // 助手仅供三个 C API TU 内部使用——显式 hidden，杜绝 mangled 符号泄进
 // 动态表（原匿名 namespace 的内链接语义等效替代；具名 namespace 保证
 // c_api_registry() 的静态局部跨 TU 单实例）。
-#pragma GCC visibility push(hidden)
+//
+// S37-4：加编译器守卫而非按 S37-3.5 原计划直接删除。删除会**改 Linux 行为**：
+// bitcask_shared 是唯一不链 bitcask_warnings 的目标（见 CMakeLists），故它拿
+// 不到 -fvisibility=hidden，这条 pragma 是这些助手符号唯一的隐藏来源。
+// MSVC 侧无需对应物——Windows 默认不导出，只有 BITCASK_API 的 dllexport 进
+// 导出表；不加守卫则每个 C API TU 刷一条 C4068「无法识别的 pragma」。
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC visibility push(hidden)
+#endif
 namespace bitcask::capi {
 
 
@@ -461,4 +469,6 @@ inline std::span<const std::byte> to_span(const bitcask_slice_t& s) {
 
 
 }  // namespace bitcask::capi
-#pragma GCC visibility pop
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC visibility pop
+#endif

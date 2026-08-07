@@ -15,9 +15,12 @@
 #else
 #  include <spawn.h>
 #  include <sys/wait.h>
-#endif
 
+// posix_spawn 的环境块。只有 POSIX 分支引用它——MSVC 下这个名字不存在
+// （CRT 提供的是 _environ），放在守卫外虽然只是声明能编过，但会误导读者
+// 以为两平台通用。
 extern char** environ;
+#endif
 
 namespace bitcask::test {
 

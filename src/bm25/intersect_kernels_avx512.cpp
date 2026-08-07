@@ -8,6 +8,9 @@
 
 #include "intersect_kernels.hpp"
 
+#include <bit>   // S37-4：std::popcount。原靠 libstdc++ 的传递包含拿到，
+                 // MSVC STL 不传递，须显式包含。
+
 #if BITCASK_X86_64
 #include <immintrin.h>
 

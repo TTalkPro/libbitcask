@@ -497,4 +497,17 @@ target_link_libraries(bitcask_c_api_test PRIVATE bitcask_shared bitcask_sanitize
 # 失败；clang++ 驱动链 ubsan_standalone_cxx 补齐。对 gcc/非 sanitizer
 # 构建无影响（C 程序用 C++ 链接器无害）。
 set_target_properties(bitcask_c_api_test PROPERTIES LINKER_LANGUAGE CXX)
+# S37-4：c_api_test.c 用 <stdatomic.h>，要求 C11。GCC 默认 gnu17 故一直没事；
+# MSVC 的 .c 默认走 C89/C90，其 <stdatomic.h> 首行就 #error「C atomics require
+# C11 or later」。只钉这一个目标，不动全局 CMAKE_C_STANDARD——那会连带改掉
+# utf8proc / zlib 的 C 方言档位（GCC 侧从 gnu17 降到 gnu11），属无谓的波及。
+set_target_properties(bitcask_c_api_test PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED ON)
+if(MSVC)
+    # 光有 /std:c11 还不够：MSVC 的 C11 atomics 至今在开关后面，不给此项
+    # <stdatomic.h> 第 12 行就 #error「C atomic support is not enabled」。
+    # 不改测试去用 Interlocked* —— 那会把一个平台无关的并发断言拆成两份实现；
+    # 这些 atomic 是 parallel_scan 多工作线程回调的计数/校验和，属实质用途。
+    target_compile_options(bitcask_c_api_test PRIVATE /experimental:c11atomics)
+endif()
 add_test(NAME CApi.SmokeTest COMMAND bitcask_c_api_test)

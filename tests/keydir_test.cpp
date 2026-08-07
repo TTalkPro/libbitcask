@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>   // S37-4：std::sort（MSVC STL 不经 <string>/<vector> 传递）
 #include <string>
 #include <vector>
 

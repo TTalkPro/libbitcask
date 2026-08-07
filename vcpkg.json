@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "libbitcask",
+  "version": "6.1.0",
+  "description": "S37-4: Windows/MSVC dependency manifest. Carries only zlib -- the single dependency that is neither a git submodule nor buildable from the tree. Everything else (oneTBB, googletest, benchmark, utf8proc, cppjieba, limonp, unordered_dense) is a pinned submodule, so those revisions stay the single source of truth. NOTE: oneTBB is deliberately NOT taken from vcpkg -- the vcpkg tbb port pulls in hwloc, which drags an msys2 (m4/perl/autotools) toolchain into the build. This project builds pure-MSVC; oneTBB compiles fine from third_party/oneTBB with MSVC + CMake alone.",
+  "homepage": "https://github.com/libbitcask/libbitcask",
+  "dependencies": [
+    "zlib"
+  ],
+  "builtin-baseline": "9e593bb18ea69cc5095e012465dcd675a822ed0d",
+  "overrides": []
+}

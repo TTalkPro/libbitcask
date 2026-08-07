@@ -60,8 +60,15 @@ read_all(const fs::path& path) {
 
 std::expected<void, std::string>
 write_all(const fs::path& path, std::span<const std::byte> bytes) {
+    // S37-4：原为 path.c_str()。`std::filesystem::path::c_str()` 在 Windows 上
+    // 返回 const wchar_t*，喂给窄字符的 std::fopen 直接编译失败（设计稿 C8）。
+    // 改用 .string()，与紧邻的 read_all 及全库「路径以 std::string 流转」的
+    // 约定一致（同 file_util.hpp 的 fsync_parent_dir）。
+    // ⚠️ 这只解决可编译性：Windows 上 .string() 走的是系统 ANSI 代码页，
+    // 非 ASCII 路径仍打不开。窄路径统一按 UTF-8 解释、在 io 后端转 UTF-16
+    // 是 S37-5 的事，属库级问题，不在本站点单独修。
     std::unique_ptr<std::FILE, detail::FileCloser> f(
-        std::fopen(path.c_str(), "wb"));
+        std::fopen(path.string().c_str(), "wb"));
     if (!f) return std::unexpected("cannot create " + path.string());
     const bool ok =
         bytes.empty() ||

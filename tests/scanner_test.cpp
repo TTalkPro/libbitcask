@@ -30,7 +30,7 @@ public:
     ~TempDir() { std::error_code ec; fs::remove_all(path_, ec); }
     std::string path() const { return path_.string(); }
     void touch(const std::string& name) {
-        std::FILE* fp = std::fopen((path_ / name).c_str(), "wb");
+        std::FILE* fp = std::fopen((path_ / name).string().c_str(), "wb");
         if (fp) std::fclose(fp);
     }
     void mkdir(const std::string& name) {

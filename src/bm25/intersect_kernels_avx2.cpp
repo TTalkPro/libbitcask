@@ -17,10 +17,15 @@ namespace {
 std::uint64_t* exact_match_u64_avx2(const std::uint64_t* a,
                                     const std::uint64_t* b,
                                     std::uint64_t* cur) {
+    // S37-4：原为 `const __m256i_u*`。`__m256i_u` 是 GCC/Clang 私有的
+    // 「对齐要求为 1 的 __m256i」别名，MSVC 无此类型。改用标准形参类型
+    // `const __m256i*`——_mm256_loadu_si256 的**语义本就是非对齐装载**
+    // （Intel intrinsics guide 的原型即为此），对齐豁免由 intrinsic 自身
+    // 保证，不靠指针类型。GCC/Clang 侧生成的指令不变（同为 vmovdqu）。
     const __m256i va =
-        _mm256_loadu_si256(reinterpret_cast<const __m256i_u*>(a));
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a));
     const __m256i vb =
-        _mm256_loadu_si256(reinterpret_cast<const __m256i_u*>(b));
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b));
 
     const __m256i cmp01 = _mm256_or_si256(
         _mm256_cmpeq_epi64(va, vb),

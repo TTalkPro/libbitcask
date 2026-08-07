@@ -1,4 +1,6 @@
-cmake_minimum_required(VERSION 3.20)
+# S37-4：3.20 → 3.21。合并静态库改用 `$<TARGET_OBJECTS:>` 取 STATIC 目标的对象
+# 文件（替代原 bash+ar 脚本），该用法自 3.21 起才不限于 OBJECT 库。
+cmake_minimum_required(VERSION 3.21)
 # 版本单一真源（S12-7）：project(VERSION ...) 是唯一手写版本处。
 # 库 SOVERSION 与 C API bitcask_version_* 均从此派生，杜绝三处手工同步漂移。
 project(libbitcask VERSION 6.1.0 LANGUAGES CXX)
@@ -24,45 +26,126 @@ include(BitcaskSanitizers)
 enable_testing()
 
 # ---------------------------------------------------------------------------
+# S37-4：MSVC 全局必需项。**目录作用域，且必须在任何 add_library /
+# add_subdirectory 之前**——目录级编译选项在 target 创建时固化，放晚了
+# third_party（utf8proc / googletest / benchmark）拿不到。
+#
+# 这三项是设计稿 §1.1「编译第一天必炸」的全部：
+#
+# ① /utf-8 —— 187 个源文件中 181 个含中文注释/字符串。不给此项，MSVC 按系统
+#    ANSI 代码页（本机 936/GBK）解析源码：中文注释末字节若落在 0x5C（'\'），
+#    会把下一行**续接进注释**吃掉真实代码，报出 C2001/C4819 且行号指向别处。
+#    等价于 /source-charset:utf-8 /execution-charset:utf-8。
+# ② NOMINMAX + WIN32_LEAN_AND_MEAN —— windows.h 的 min/max 函数式宏 vs 全库
+#    94 处 std::min/std::max。**全局定义而非只在移植层给**：windows.h 只准进
+#    移植层 TU，但第三方头（TBB / googletest）也可能间接引入，全局定义才封死。
+# ③ /bigobj —— C++23 重模板 + segment.hpp 一类大 TU 会超过 COFF 的 65279 段上限。
+#
+# 附带的一致性开关（设计稿 §1.2 末行）：
+# - /permissive- —— 关闭 MSVC 的宽松模式，两阶段名字查找与 GCC/Clang 对齐，
+#   否则模板里的错误要到 Windows 实例化时才暴露。
+# - /Zc:preprocessor —— 传统 MSVC 预处理器对 __VA_ARGS__ 的展开与标准不符
+#   （整包当一个参数），库内可变参宏在其下行为会漂。
+# - /Zc:__cplusplus —— 不给此项 MSVC 恒报 __cplusplus == 199711L，任何按该宏
+#   分支的代码（含标准库探测）会走错分支。
+# ---------------------------------------------------------------------------
+if(MSVC)
+    add_compile_options(/utf-8 /bigobj /permissive- /Zc:preprocessor /Zc:__cplusplus)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+    # MSVC 对 std::fopen / strdup 报 C4996「不安全，请改用 fopen_s」。这两个
+    # 都是**标准/POSIX 明文规定**的函数，弃用是微软单方面的；改用 _s 变体会
+    # 让代码只能在 MSVC 上编。故按其自己的文档关掉这两类噪音，而不是改代码。
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+endif()
+
+if(WIN32)
+    # Windows 没有 RPATH：DLL 只按「exe 所在目录 → PATH」搜索。把所有可执行
+    # 文件与 DLL（bitcask.dll / tbb12.dll / zlib1.dll）收进同一个 bin/，
+    # ctest 直接跑 exe 全路径即可加载到依赖，不必给每个测试改 PATH。
+    # 变量会被子目录继承，故 third_party 的 DLL 也落在这里。
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
+
+# ---------------------------------------------------------------------------
 # Common warning flags for all bitcask C++ targets.
 # ---------------------------------------------------------------------------
 add_library(bitcask_warnings INTERFACE)
-target_compile_options(bitcask_warnings INTERFACE
-    -Wall -Wextra -Wpedantic
-    -Wshadow -Wconversion -Wsign-conversion
-    -Wnon-virtual-dtor -Wold-style-cast
-    -Wcast-align -Woverloaded-virtual
-    -fvisibility=hidden -fvisibility-inlines-hidden
-)
+if(MSVC)
+    # S37-4：设计稿 §1.2 映射表。/Wall 不可用——它把整套 STL 头的告警也算进来，
+    # 噪音量级远超可清理范围；/W4 是 MSVC 侧实际能收敛的最高档。
+    # -fvisibility=hidden 无等价物：Windows 默认就不导出，靠 BITCASK_API 显式
+    # dllexport（已就位），故映射表此行为空。
+    target_compile_options(bitcask_warnings INTERFACE /W4)
+else()
+    target_compile_options(bitcask_warnings INTERFACE
+        -Wall -Wextra -Wpedantic
+        -Wshadow -Wconversion -Wsign-conversion
+        -Wnon-virtual-dtor -Wold-style-cast
+        -Wcast-align -Woverloaded-virtual
+        -fvisibility=hidden -fvisibility-inlines-hidden
+    )
+endif()
 # S12-7：把告警升为错误。**默认关**——避免新编译器版本的新告警破坏下游/本地构建；
 # CI 的库构建（BUILD_TESTING=OFF，只建 first-party）开启作回归护栏。third_party
 # 头已标 SYSTEM，-Werror 不作用于它们。
+#
+# S37-4：MSVC 侧首轮**刻意不开** /WX。C4267（size_t→窄整型）/ C4244 / C4100
+# （未引用形参）是 MSVC 独有告警，首轮必然刷屏；开 /WX 会让整个移植卡在
+# 清告警上。收口挪到 S37-7。
 option(BITCASK_WERROR "Treat first-party warnings as errors（CI 库构建开启）" OFF)
 if(BITCASK_WERROR)
-    target_compile_options(bitcask_warnings INTERFACE -Werror)
+    if(MSVC)
+        target_compile_options(bitcask_warnings INTERFACE /WX)
+    else()
+        target_compile_options(bitcask_warnings INTERFACE -Werror)
+    endif()
 endif()
 
 find_package(ZLIB REQUIRED)
 
 # ---------------------------------------------------------------------------
-# TSan 构建改用源码编译的**插桩版** oneTBB（系统 libtbb 未插桩）。
-# 源码以 submodule 形式置于 third_party/oneTBB（v2022.0.0）。
+# oneTBB。两种来源：
+#
+# ① 系统/包管理器安装的 TBB（find_package）—— Linux 默认，行为与既往一致。
+# ② third_party/oneTBB 子模块现编（v2022.0.0）—— 两种情况下必须走这条：
+#    - **TSan 构建**：系统 libtbb 未插桩，必须自己带 -fsanitize=thread 编。
+#    - **Windows/MSVC**（S37-4）：Windows 上没有「系统 TBB」这一说；而 vcpkg
+#      的 tbb 端口经 hwloc 依赖拖进 msys2（m4/perl/autotools）工具链，与本项目
+#      「纯 MSVC」的构建约束冲突。oneTBB 自身用 MSVC + CMake 直接可编，
+#      故从子模块现编，vcpkg 只留 zlib。
 # ---------------------------------------------------------------------------
 if(BITCASK_SANITIZE MATCHES "thread")
+    set(_bitcask_bundled_tbb_default ON)
+    set(_bitcask_bundled_tbb_why "TSan 需要插桩版")
+elseif(WIN32)
+    set(_bitcask_bundled_tbb_default ON)
+    set(_bitcask_bundled_tbb_why "Windows 无系统 TBB，且不引 vcpkg tbb→hwloc→msys2")
+else()
+    set(_bitcask_bundled_tbb_default OFF)
+    set(_bitcask_bundled_tbb_why "")
+endif()
+option(BITCASK_BUNDLED_TBB
+    "从 third_party/oneTBB 子模块现编 TBB，而非 find_package"
+    ${_bitcask_bundled_tbb_default})
+
+if(BITCASK_BUNDLED_TBB)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/oneTBB/CMakeLists.txt")
         message(FATAL_ERROR
-            "third_party/oneTBB 未初始化（TSan 构建需要插桩版 oneTBB）。请运行:\n"
+            "third_party/oneTBB 未初始化（本构建需要现编 TBB：${_bitcask_bundled_tbb_why}）。请运行:\n"
             "  git submodule update --init third_party/oneTBB")
     endif()
     set(TBB_TEST OFF CACHE BOOL "" FORCE)
     set(TBB_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(TBB_STRICT OFF CACHE BOOL "" FORCE)
     set(_bitcask_saved_cxx_flags "${CMAKE_CXX_FLAGS}")
-    set(CMAKE_CXX_FLAGS
-        "${CMAKE_CXX_FLAGS} -fsanitize=thread -fno-omit-frame-pointer")
+    if(BITCASK_SANITIZE MATCHES "thread")
+        # 只有 TSan 这条需要给 TBB 自身加插桩开关；Windows 那条不加任何东西。
+        set(CMAKE_CXX_FLAGS
+            "${CMAKE_CXX_FLAGS} -fsanitize=thread -fno-omit-frame-pointer")
+    endif()
     add_subdirectory(third_party/oneTBB EXCLUDE_FROM_ALL)
     set(CMAKE_CXX_FLAGS "${_bitcask_saved_cxx_flags}")
-    message(STATUS "libbitcask: TSan build -> instrumented oneTBB from third_party/oneTBB")
+    message(STATUS "libbitcask: bundled oneTBB from third_party/oneTBB (${_bitcask_bundled_tbb_why})")
 else()
     find_package(TBB REQUIRED)
 endif()
@@ -108,9 +191,19 @@ endif()
 # 的 ~3-8%（让非 SIMD 代码也用本机 ISA）。勿与 -ffast-math 混用：HNSW/int8
 # 依赖精确可复现浮点（int8 kernel self-test 校验 ULP）。
 option(BITCASK_NATIVE "为本机现编启用 -march=native（默认 OFF，破坏二进制可移植性）" OFF)
-if(BITCASK_NATIVE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-march=native)
-    message(STATUS "libbitcask: BITCASK_NATIVE -> -march=native（二进制仅限本机 ISA）")
+if(BITCASK_NATIVE)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        add_compile_options(-march=native)
+        message(STATUS "libbitcask: BITCASK_NATIVE -> -march=native（二进制仅限本机 ISA）")
+    else()
+        # S37-4：MSVC 无 -march=native 等价物（/arch: 只有固定档位，且不探测本机）。
+        # **报错退出而非静默忽略**——本开关的语义是「我明确要为本机榨性能」，
+        # 静默忽略会让人以为拿到了本机码而实际没有，且无从察觉。
+        message(FATAL_ERROR
+            "BITCASK_NATIVE 在 ${CMAKE_CXX_COMPILER_ID} 下无等价物（MSVC 的 /arch: "
+            "是固定档位，不按本机 CPU 探测）。请关闭该选项；SIMD 内核本就运行时按 "
+            "CPUID 派发，通用构建不受影响。")
+    endif()
 endif()
 
 option(BITCASK_LTO "Release 构建启用 LTO/IPO（sanitizer 构建自动关闭）" ON)
@@ -140,7 +233,14 @@ add_library(bitcask_simd STATIC
     src/simd/crc32_sse42.cpp     # S37-3.b：分 ISA TU（见下 bitcask_simd_tu）
 )
 target_include_directories(bitcask_simd PUBLIC include)
-target_link_libraries(bitcask_simd PRIVATE bitcask_warnings bitcask_sanitizers)
+# S37-4：ZLIB PUBLIC —— 公开头 hw_crc32.hpp 里 `#include <zlib.h>`（scalar CRC32
+# 与 zlib::crc32 逐位一致，需要它的原型），crc32_sse42.cpp 就是包含者之一。
+# 此前无人显式声明该依赖：Linux 上 zlib.h 躺在 /usr/include，编译器**无需任何
+# -I 就能找到**，缺失的依赖声明因此永远不报错。Windows 上没有这种全局头目录，
+# 一编即炸——本届暴露的第一类「被系统路径掩盖的依赖缺失」。
+target_link_libraries(bitcask_simd
+    PUBLIC  ZLIB::ZLIB
+    PRIVATE bitcask_warnings bitcask_sanitizers)
 
 # ---------------------------------------------------------------------------
 # bitcask_simd_tu(<源文件> <档位>) — 给单个 TU 施加该 ISA 档的编译选项。
@@ -222,10 +322,28 @@ target_link_libraries(bitcask_format
 )
 
 # ---------------------------------------------------------------------------
-# bitcask_io — POSIX file + advisory lock primitives.
+# bitcask_io — 平台 seam 的实现侧。S37-1 起，**全库唯一允许直接调用宿主原语的
+# 地方就是这里的后端 TU**（第一方 src/ include/ c_api/ tools/ 的裸 POSIX 头已
+# 归零，唯一命中是本目录）。换平台 = 换一个后端文件，而不是改 20 个文件。
 # ---------------------------------------------------------------------------
+if(WIN32)
+    set(_bitcask_io_backend src/io/win32_file.cpp)
+else()
+    set(_bitcask_io_backend src/io/posix_file.cpp)
+endif()
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_bitcask_io_backend}")
+    # S37-4 阶段性状态：Windows 后端（S37-5）尚未落地。
+    # 静态库目标不做符号解析，故去掉后端后**其余全部第一方 TU 照样编译**——
+    # 这正是 S37-4 用来量清 MSVC 编译面的形态。链接期目标
+    # （bitcask_shared / 各测试 exe）会缺 io 符号，属预期，不是回归。
+    message(WARNING
+        "libbitcask: 平台 I/O 后端 '${_bitcask_io_backend}' 不存在——本次构建"
+        "不含 io seam 实现。库目标可编译，链接期目标会缺符号（S37-5 待落地）。")
+    set(_bitcask_io_backend "")
+endif()
+
 add_library(bitcask_io STATIC
-    src/io/posix_file.cpp
+    ${_bitcask_io_backend}
     src/lock/file_lock.cpp
 )
 target_include_directories(bitcask_io PUBLIC include)
@@ -268,7 +386,9 @@ add_library(bitcask_keydir STATIC
 target_include_directories(bitcask_keydir PUBLIC include)
 target_link_libraries(bitcask_keydir
     PUBLIC  bitcask_fileops bitcask_io unordered_dense::unordered_dense
-    PRIVATE bitcask_warnings bitcask_sanitizers
+    # S37-4：keydir_registry.cpp 包含 thread_pool.hpp（→ oneapi/tbb/*）。
+    # PRIVATE 即可——keydir 自身的公开头不暴露 TBB。同为「被 /usr/include 掩盖」类。
+    PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb
 )
 
 # ---------------------------------------------------------------------------
@@ -314,9 +434,15 @@ bitcask_simd_tu(src/bm25/bm25_kernels_avx512.cpp      avx512)
 bitcask_simd_tu(src/bm25/intersect_kernels_avx2.cpp   avx2)
 bitcask_simd_tu(src/bm25/intersect_kernels_avx512.cpp avx512)
 target_include_directories(bitcask_bm25 PUBLIC include)
+# S37-4：TBB 由 PRIVATE 改 PUBLIC —— 公开头 inverted.hpp 直接
+# `#include <oneapi/tbb/concurrent_hash_map.h>`，而它经 segment.hpp /
+# text_plugin.hpp / search_cache.hpp / segment_query.hpp 传播到大量下游。
+# 同 zlib 那条：Linux 上系统 TBB 头在 /usr/include，缺声明也能编，
+# Windows 上 bitcask_hybrid 首先炸出来。
 target_link_libraries(bitcask_bm25
     PUBLIC bitcask_format bitcask_io   # B3：MmapSegment 用 io::MappedFile
-    PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb)
+           TBB::tbb
+    PRIVATE bitcask_warnings bitcask_sanitizers)
 
 # ---------------------------------------------------------------------------
 # bitcask_vector — 向量索引（HNSW + IVF 段，S32-M3）。
@@ -419,9 +545,13 @@ add_library(bitcask_cask STATIC
     src/cask/legacy_ckpt.cpp   # S19-2：pre-S17 统一 ckpt 迁移读取器
 )
 target_include_directories(bitcask_cask PUBLIC include)
+# S37-4：TBB 由 PRIVATE 改 PUBLIC —— **公开头** cask.hpp 包含 thread_pool.hpp，
+# 后者直接 `#include <oneapi/tbb/concurrent_queue.h>`。任何 include 了 cask.hpp
+# 的下游（近乎全部测试与 c_api）都需要 TBB 的头路径。
 target_link_libraries(bitcask_cask
     PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_merge bitcask_hybrid  # S19-2：去 shim 依赖
-    PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb
+            TBB::tbb
+    PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
 # ---------------------------------------------------------------------------
@@ -558,54 +688,73 @@ set_target_properties(bitcask_shared PROPERTIES
 )
 add_library(Bitcask::shared ALIAS bitcask_shared)
 
-# libbitcask.a — 合并全部静态归档为单一 .a
-set(BITCASK_STATIC_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/libbitcask.a")
-set(BITCASK_MERGE_SH "${CMAKE_CURRENT_BINARY_DIR}/merge_static.sh")
-file(WRITE "${BITCASK_MERGE_SH}"
-    "#!/bin/bash\n"
-    "set -e\n"
-    "OUTPUT=\"$1\"\n"
-    "shift\n"
-    "TMPD=$(mktemp -d)\n"
-    "for lib in \"$@\"; do\n"
-    "    (cd \"$TMPD\" && ${CMAKE_AR} x \"$lib\")\n"
-    "done\n"
-    "${CMAKE_AR} rcs \"$OUTPUT\" \"$TMPD\"/*.o\n"
-    "${CMAKE_RANLIB} \"$OUTPUT\"\n"
-    "rm -rf \"$TMPD\"\n"
+# ---------------------------------------------------------------------------
+# libbitcask.a / bitcask_static.lib — 合并全部第一方归档为单一静态库。
+#
+# S37-4：原实现**在配置期生成 bash 脚本**跑 `ar x` 解包 13 个归档到同一临时
+# 目录再 `ar rcs` 重打包。Windows 既无 bash 也无 ar，必须重写。
+#
+# 现改为 CMake 原生：把各库的**对象文件**直接喂给一个真正的 STATIC target。
+# `$<TARGET_OBJECTS:>` 自 CMake 3.21 起对 STATIC/SHARED 目标同样可用（不再限于
+# OBJECT 库），故**无需把 13 个库改成 OBJECT 库**——链接图与 Linux 侧现有行为
+# 逐字不变，只有「怎么产出这一个归档」变了。
+#
+# 顺带修掉的既有隐患：`ar x` 把 13 个归档解到**同一个**临时目录，不同库中的
+# **同名 .o 会静默相互覆盖**（后解包的赢），产物里少一份实现且不报错。当前 43
+# 个源文件基名恰好互不相同，故尚未发生——属于「加一个重名文件就中招」的定时
+# 炸弹。对象文件按目标各自成路径喂进来后，结构上不再可能。
+#
+# 顺带修掉的一个现行缺失：**bitcask_simd 原本不在合并列表里**（S37-3 新增该库
+# 时漏补）。即当前发布的 libbitcask.a 缺 cpu_features / crc32_sse42 两个 TU，
+# 静态链接的下游会撞未定义符号。已补入。
+# ---------------------------------------------------------------------------
+add_library(bitcask_static STATIC
+    $<TARGET_OBJECTS:bitcask_simd>          # S37-4 补：原漏
+    $<TARGET_OBJECTS:bitcask_format>
+    $<TARGET_OBJECTS:bitcask_io>
+    $<TARGET_OBJECTS:bitcask_fileops>
+    $<TARGET_OBJECTS:bitcask_keydir>
+    $<TARGET_OBJECTS:bitcask_docmap>
+    $<TARGET_OBJECTS:bitcask_bm25>
+    $<TARGET_OBJECTS:bitcask_vector>
+    $<TARGET_OBJECTS:bitcask_text>
+    $<TARGET_OBJECTS:bitcask_text_plugin>
+    $<TARGET_OBJECTS:bitcask_vector_plugin>
+    $<TARGET_OBJECTS:bitcask_hybrid>
+    $<TARGET_OBJECTS:bitcask_merge>
+    $<TARGET_OBJECTS:bitcask_cask>
 )
-add_custom_target(bitcask_static ALL
-    COMMAND bash "${BITCASK_MERGE_SH}" "${BITCASK_STATIC_OUTPUT}"
-            $<TARGET_FILE:bitcask_format>
-            $<TARGET_FILE:bitcask_io>
-            $<TARGET_FILE:bitcask_fileops>
-            $<TARGET_FILE:bitcask_keydir>
-            $<TARGET_FILE:bitcask_docmap>
-            $<TARGET_FILE:bitcask_bm25>
-            $<TARGET_FILE:bitcask_vector>
-            $<TARGET_FILE:bitcask_text>
-            $<TARGET_FILE:bitcask_text_plugin>
-            $<TARGET_FILE:bitcask_vector_plugin>
-            $<TARGET_FILE:bitcask_hybrid>
-            $<TARGET_FILE:bitcask_merge>
-            $<TARGET_FILE:bitcask_cask>
-    DEPENDS bitcask_cask bitcask_text
-    BYPRODUCTS "${BITCASK_STATIC_OUTPUT}"
-    COMMENT "Merging libbitcask.a from all static archives"
-)
+# Windows：bitcask_shared 的**导入库**已叫 bitcask.lib，同目录不能再有同名的
+# 合并静态库。Unix 侧 libbitcask.so 与 libbitcask.a 后缀不同，可沿用原名。
+if(WIN32)
+    set_target_properties(bitcask_static PROPERTIES OUTPUT_NAME "bitcask_static")
+else()
+    set_target_properties(bitcask_static PROPERTIES OUTPUT_NAME "bitcask")
+endif()
+# 归档不含第三方对象（utf8proc / zlib / TBB 各自成库），故静态链接的下游必须
+# 一并链上它们。原 custom-target 版没有任何 usage requirement，下游只能手工
+# 猜；这里补成 INTERFACE 依赖（纯增量，不改任何既有目标的链接）。
+target_include_directories(bitcask_static INTERFACE include)
+target_link_libraries(bitcask_static INTERFACE
+    ZLIB::ZLIB TBB::tbb ${UTF8PROC_TARGET} unordered_dense::unordered_dense)
 
 # ---------------------------------------------------------------------------
 # Install 规则
 # ---------------------------------------------------------------------------
 include(GNUInstallDirs)
+# S37-4：Windows 的 DLL 走 RUNTIME（→ bin/，须与 exe 同目录才能被加载器找到），
+# 而**导入库** bitcask.lib 走 ARCHIVE（→ lib/）。Unix 侧 .so 走 LIBRARY，
+# ARCHIVE/RUNTIME 两条对它无效——故三条并存即可两平台通吃。
+# 原规则已有这三条且方向正确；真正缺的是合并静态库那条（下方），
+# 它此前是 install(FILES <硬编码 .a 路径>)，在 Windows 上指向不存在的文件。
 install(TARGETS bitcask_shared
     EXPORT BitcaskTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
-install(FILES "${BITCASK_STATIC_OUTPUT}"
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}
+install(TARGETS bitcask_static
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(DIRECTORY include/bitcask
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}

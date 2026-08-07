@@ -6,6 +6,7 @@
 #include "bitcask/wildcard_matcher.hpp"
 #include "bitcask/bm25_kernels.hpp"
 #include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
+#include "bitcask/detail/cpu_features.hpp"  // S37-4：BITCASK_TSAN_ENABLED
 
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/parallel_for.h>       // S7-5：短语候选评分并行
@@ -78,8 +79,7 @@ std::vector<std::string> collect_term_keys(
 // fence,与读者 shared_ptr 析构的 release 递减配对)语义正确,但 TSan 不建模
 // atomic_thread_fence → 持引用出锁的读者(S29-1 BOW 快照 / phrase 零拷贝读)
 // 与写者原地追加被误报 race。注解把协议边显式告知 TSan,零行为变化。
-#if defined(__SANITIZE_THREAD__) || \
-    (defined(__has_feature) && __has_feature(thread_sanitizer))
+#if BITCASK_TSAN_ENABLED   // S37-4：见 detail/cpu_features.hpp
 extern "C" void __tsan_acquire(void*);
 extern "C" void __tsan_release(void*);
 #define BITCASK_PL_TSAN_ACQUIRE(p) \

@@ -50,9 +50,9 @@
 #include <oneapi/tbb/task_arena.h>       // S6-P2: this_task_arena::isolate for TSan compatibility
 
 #include "bitcask/plugin_api.hpp"  // S15-2: PreparedPtr 用于 PutEntry（本头不再依赖 search）
+#include "bitcask/detail/cpu_features.hpp"  // S37-4：BITCASK_TSAN_ENABLED
 
-#if defined(__SANITIZE_THREAD__) || \
-    (defined(__has_feature) && __has_feature(thread_sanitizer))
+#if BITCASK_TSAN_ENABLED   // S37-4：见 detail/cpu_features.hpp
 extern "C" {
 void __tsan_acquire(void* addr);
 void __tsan_release(void* addr);
@@ -206,8 +206,7 @@ public:
     std::size_t size() const { return static_cast<std::size_t>(queue_.size()); }
 
 private:
-#if defined(__SANITIZE_THREAD__) || \
-    (defined(__has_feature) && __has_feature(thread_sanitizer))
+#if BITCASK_TSAN_ENABLED   // S37-4：见 detail/cpu_features.hpp
     void annotate_release() { __tsan_release(&queue_); }
     void annotate_acquire() { __tsan_acquire(&queue_); }
 #else

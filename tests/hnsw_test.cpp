@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "bitcask/detail/int8_kernels.hpp"  // P3c：落盘 int8 量化召回测量
+#include "bitcask/detail/cpu_features.hpp"  // S37-4：BITCASK_TSAN_ENABLED
 #include "bitcask/hnsw.hpp"
 
 using bitcask::vec::HnswConfig;
@@ -434,8 +435,7 @@ TEST(Hnsw, EmptyAndZeroK) {
 TEST(Hnsw, ConcurrentReadersWithSingleWriter) {
     // TSan 下缩规模不缩协议:happens-before 验证与节点数无关,
     // 但自旋锁 × TSan 插桩是乘法减速(实测 20k 档 ~110s)。
-#if defined(__SANITIZE_THREAD__) || \
-    (defined(__has_feature) && __has_feature(thread_sanitizer))
+#if BITCASK_TSAN_ENABLED   // S37-4：见 detail/cpu_features.hpp
     const std::size_t n = 5000;
 #else
     const std::size_t n = 20000;

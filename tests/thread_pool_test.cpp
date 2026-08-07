@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "bitcask/thread_pool.hpp"
+#include "bitcask/detail/cpu_features.hpp"  // S37-4：BITCASK_TSAN_ENABLED
 
 namespace {
 
@@ -571,8 +572,7 @@ TEST(IndexPoolMultiLib, ThreadCountIndependentOfLibCount) {
     // S29-T:TSan 运行时自带后台线程计入 /proc/self/task,精确计数断言在
     // build-tsan 恒失真(git stash 验证过非业务回归)——按 TASK.md 既定修法
     // 跳过;结构性保证由 build-clang/build-rel 继续守护。
-#if defined(__SANITIZE_THREAD__) || \
-    (defined(__has_feature) && __has_feature(thread_sanitizer))
+#if BITCASK_TSAN_ENABLED   // S37-4：见 detail/cpu_features.hpp
     GTEST_SKIP() << "TSan 运行时线程计入,OS 线程计数断言失真(S29-T)";
 #endif
     IndexPool pool(1, 10240);

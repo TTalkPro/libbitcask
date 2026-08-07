@@ -650,7 +650,7 @@ TEST_F(CaskDocValueTest, MigrateU32EraDirOpensAndReads) {
     fs::create_directories(src);
 
     auto wfile = [](const fs::path& p, const std::vector<unsigned char>& b) {
-        std::FILE* f = std::fopen(p.c_str(), "wb");
+        std::FILE* f = std::fopen(p.string().c_str(), "wb");
         ASSERT_NE(f, nullptr);
         ASSERT_EQ(std::fwrite(b.data(), 1, b.size(), f), b.size());
         std::fclose(f);
@@ -739,7 +739,7 @@ TEST_F(CaskDocValueTest, MetaV4CleanlyRejectedWithHintordHint) {
     }
     {
         const auto mp = tmpdir_ / "bitcask.meta";
-        std::FILE* f = std::fopen(mp.c_str(), "rb+");
+        std::FILE* f = std::fopen(mp.string().c_str(), "rb+");
         ASSERT_NE(f, nullptr);
         unsigned char hdr[18];
         ASSERT_EQ(std::fread(hdr, 1, 18, f), 18u);
@@ -789,7 +789,7 @@ TEST_F(CaskDocValueTest, MigrateHintOrdV4EraDirOpensAndReads) {
     // 从不读 src hint，删除即等价）。
     {
         const auto mp = src / "bitcask.meta";
-        std::FILE* f = std::fopen(mp.c_str(), "rb+");
+        std::FILE* f = std::fopen(mp.string().c_str(), "rb+");
         ASSERT_NE(f, nullptr);
         unsigned char hdr[18];
         ASSERT_EQ(std::fread(hdr, 1, 18, f), 18u);
