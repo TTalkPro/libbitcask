@@ -61,6 +61,10 @@ compile_commands.json
 # vcpkg
 vcpkg_installed/
 
+# CMake presets：CMakePresets.json 入库（团队共享），
+# CMakeUserPresets.json 是本机私有覆盖（编译器路径、VCPKG_ROOT 等），不入库
+CMakeUserPresets.json
+
 # debug information files
 *.dwo
 

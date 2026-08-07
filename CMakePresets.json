@@ -1,0 +1,168 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON"
+      }
+    },
+
+    {
+      "name": "windows-base",
+      "hidden": true,
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
+      },
+      "architecture": { "value": "x64", "strategy": "external" },
+      "toolset":      { "value": "host=x64", "strategy": "external" },
+      "vendor": {
+        "note": [
+          "需要环境变量 VCPKG_ROOT（vcpkg 只承载 zlib；oneTBB 走 third_party 子模块",
+          "现编，见 CMakeLists 的 BITCASK_BUNDLED_TBB）。CLion 里在",
+          "Settings > Build > Toolchains 选 Visual Studio 工具链、Architecture=amd64。"
+        ]
+      }
+    },
+    {
+      "name": "msvc-debug",
+      "displayName": "Windows MSVC Debug",
+      "inherits": "windows-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "msvc-release",
+      "displayName": "Windows MSVC Release",
+      "inherits": "windows-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "msvc-asan",
+      "displayName": "Windows MSVC Debug + ASan",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BITCASK_SANITIZE": "address"
+      },
+      "vendor": {
+        "note": "MSVC 只有 ASan；thread/undefined/leak 会在配置期 FATAL_ERROR（见 cmake/BitcaskSanitizers.cmake）。"
+      }
+    },
+
+    {
+      "name": "linux-base",
+      "hidden": true,
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    },
+    {
+      "name": "gcc-release",
+      "displayName": "Linux g++ Release（对应 CI 的 build-and-test）",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "clang-debug",
+      "displayName": "Linux clang++ Debug（对应 CI 的 clang job）",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "Linux clang++ Debug + ASan/UBSan（对应 CI 的 sanitizer 矩阵）",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "BITCASK_SANITIZE": "address,undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "Linux clang++ Debug + TSan（对应 CI 的 sanitizer 矩阵）",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "BITCASK_SANITIZE": "thread"
+      },
+      "vendor": {
+        "note": [
+          "TSan 构建强制从 third_party/oneTBB 现编插桩版（系统 libtbb 未插桩）。",
+          "先 git submodule update --init third_party/oneTBB。"
+        ]
+      }
+    },
+    {
+      "name": "werror",
+      "displayName": "Linux 库构建 + -Werror（对应 CI 的 warnings-as-errors）",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTING": "OFF",
+        "BITCASK_WERROR": "ON",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "bench",
+      "displayName": "Linux Release + benchmarks（对应 CI 的 bench job）",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTING": "OFF",
+        "BITCASK_BUILD_BENCHMARKS": "ON",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    }
+  ],
+
+  "buildPresets": [
+    { "name": "msvc-debug",   "configurePreset": "msvc-debug" },
+    { "name": "msvc-release", "configurePreset": "msvc-release" },
+    { "name": "msvc-asan",    "configurePreset": "msvc-asan" },
+    { "name": "gcc-release",  "configurePreset": "gcc-release" },
+    { "name": "clang-debug",  "configurePreset": "clang-debug" },
+    { "name": "asan",         "configurePreset": "asan" },
+    { "name": "tsan",         "configurePreset": "tsan" },
+    { "name": "werror",       "configurePreset": "werror" },
+    { "name": "bench",        "configurePreset": "bench" }
+  ],
+
+  "testPresets": [
+    {
+      "name": "test-base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "timeout": 300 }
+    },
+    { "name": "msvc-debug",   "inherits": "test-base", "configurePreset": "msvc-debug" },
+    { "name": "msvc-release", "inherits": "test-base", "configurePreset": "msvc-release" },
+    { "name": "msvc-asan",    "inherits": "test-base", "configurePreset": "msvc-asan" },
+    { "name": "gcc-release",  "inherits": "test-base", "configurePreset": "gcc-release" },
+    { "name": "clang-debug",  "inherits": "test-base", "configurePreset": "clang-debug" },
+    { "name": "asan",         "inherits": "test-base", "configurePreset": "asan" },
+    {
+      "name": "tsan",
+      "inherits": "test-base",
+      "configurePreset": "tsan",
+      "execution": { "timeout": 900 }
+    }
+  ]
+}
