@@ -1,4 +1,8 @@
 #include "bitcask/cask.hpp"
+#include "bitcask/detail/cpu_features.hpp"
+#if BITCASK_X86_64
+#include <immintrin.h>  // _mm_pause
+#endif
 #include "bitcask/diskann_plugin.hpp"  // S32-M5：DiskANN 引擎工厂
 #include "bitcask/ivf_plugin.hpp"  // S32-M3：IVF 引擎工厂
 
@@ -1237,8 +1241,8 @@ Cask::submit_group_commit(GcRequest& req) {
         // 的收益全部吃掉(首版实测 4/8 线程反而 3× 恶化)。
         bool spun_done = false;
         for (int i = 0; i < 4096; ++i) {
-#if defined(__x86_64__)
-            __builtin_ia32_pause();
+#if BITCASK_X86_64
+            _mm_pause();  // S37-3.b：原 __builtin_ia32_pause（GCC 专有）
 #endif
             if (req.done.load(std::memory_order_acquire)) {
                 spun_done = true;

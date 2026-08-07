@@ -42,9 +42,7 @@
 #include "bitcask/detail/cpu_features.hpp"
 #include <cstdint>
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-#include <immintrin.h>
-#endif
+#include "bitcask/detail/cpu_features.hpp"
 
 namespace bitcask::bm25::detail {
 
@@ -76,159 +74,29 @@ inline void bm25_score_scalar(
     }
 }
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-
-// ---------------------------------------------------------------------------
-// AVX2+FMA kernel — 8 uint32→float pairs per iteration.
+#if BITCASK_X86_64
+// S37-3.b：SIMD 内核的**定义**已移出本头，进按 ISA 分的 TU
+// （src/bm25/bm25_kernels_avx2.cpp / _avx512.cpp）。
 //
-// Strategy: convert both input arrays to __m256 (8 lanes) with
-// _mm256_cvtepi32_ps, then evaluate the BM25 formula elementwise using
-// FMA. The single division (one __m256 per 8 lanes) is on the critical
-// path, but FMA hides the multiplies/memory loads.
+// 为什么必须移出：内核原带 __attribute__((target(...)))，MSVC 不支持；而
+// MSVC 唯一的等价手段 /arch: 是**每 TU** 生效的——内核只要还内联在头里，
+// 就会被编进每一个包含者（本头经 bm25_search_impl.hpp / inverted.cpp 传播），
+// 无法对它们单独施加 ISA 开关。
 //
-// _mm256_cvtepi32_ps is the unsigned-friendly path: GCC/Clang emit vcvtdq2ps
-// which converts signed int32 — for unsigned values that fit in 31 bits
-// (our tfs and dls are well under 2^31, since kBlockSize=128 and per-term
-// tf rarely exceeds hundreds), the result is bit-identical to a true
-// uint32→float conversion. The alternative (_mm256_cvtepu32_ps) requires
-// AVX-512F + AVX-512VL, which is outside our target matrix.
-// ---------------------------------------------------------------------------
-__attribute__((target("avx2,fma")))
-inline void bm25_score_avx2(
-    const std::uint32_t* tfs,
-    const std::uint32_t* dls,
-    float k1_plus_1,
-    float k1_times_1_minus_b,
-    float k1_times_b,
-    float delta,
-    float idf,
-    float inv_avgdl,
-    float* contrib,
-    std::size_t n) noexcept {
-    const __m256 v_k1p1     = _mm256_set1_ps(k1_plus_1);
-    const __m256 v_k1_1mb   = _mm256_set1_ps(k1_times_1_minus_b);
-    const __m256 v_k1b      = _mm256_set1_ps(k1_times_b);
-    const __m256 v_inv_avg  = _mm256_set1_ps(inv_avgdl);
-    const __m256 v_delta    = _mm256_set1_ps(delta);
-    const __m256 v_idf      = _mm256_set1_ps(idf);
-
-    std::size_t i = 0;
-    constexpr std::size_t kStride = 8;  // __m256 = 8 floats
-
-    for (; i + kStride <= n; i += kStride) {
-        // uint32→float: tfs[i..i+7], dls[i..i+7]. Safe for tf < 2^31 and
-        // dl < 2^31, which holds in practice (tf ≤ ~thousands, dl ≤ ~10k).
-        const __m256i tfs_i = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(tfs + i));
-        const __m256i dls_i = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(dls + i));
-        const __m256 tf_f = _mm256_cvtepi32_ps(tfs_i);
-        const __m256 dl_f = _mm256_cvtepi32_ps(dls_i);
-
-        // Denominator = tf + k1*(1-b) + k1*b * dl * (1/avgdl).
-        // Two FMAs: temp = k1*b * dl * (1/avgdl); denom = tf + k1*(1-b) + temp.
-        // The k1*b * dl is FMA-fused with * (1/avgdl) via the second fma.
-        const __m256 temp = _mm256_mul_ps(
-            _mm256_mul_ps(v_k1b, dl_f), v_inv_avg);
-        const __m256 denom = _mm256_add_ps(
-            _mm256_add_ps(tf_f, v_k1_1mb), temp);
-
-        // Numerator = tf * (k1+1). Single mul, no FMA needed.
-        const __m256 numer = _mm256_mul_ps(tf_f, v_k1p1);
-
-        // Single 8-wide division.
-        const __m256 tf_norm = _mm256_div_ps(numer, denom);
-
-        // contrib = idf * (tf_norm + delta).
-        const __m256 out = _mm256_mul_ps(
-            v_idf, _mm256_add_ps(tf_norm, v_delta));
-
-        _mm256_storeu_ps(contrib + i, out);
-    }
-
-    // Tail: scalar fallback (n - i) < 8.
-    for (; i < n; ++i) {
-        const auto tf_f = static_cast<float>(tfs[i]);
-        const auto dl_f = static_cast<float>(dls[i]);
-        const float denom = tf_f + k1_times_1_minus_b +
-                            k1_times_b * dl_f * inv_avgdl;
-        const float tf_norm = tf_f * k1_plus_1 / denom;
-        contrib[i] = idf * (tf_norm + delta);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AVX-512F kernel — 16 uint32→float pairs per iteration.
+// 副作用：跨 TU 调用切断了内联。本档内核按块（kBlockSize=128）调用，
+// 单次调用摊薄了调用开销——需 bench 复核（见 TASK.md 落地记录）。
 //
-// _mm512_cvtepi32_ps (AVX-512F) is the same signed-int32 conversion as the
-// AVX2 path, but the unsigned→signed trick (values < 2^31 produce identical
-// bit pattern) gives us the full 16-lane throughput without requiring
-// AVX-512BW or AVX-512VL. The single _mm512_div_ps on 16 lanes has the
-// same throughput as the AVX2 8-lane version on most cores (Skylake-X
-// shipped 1 div/cycle for 256-bit and 2 div/cycle for 512-bit, so we
-// double the work per division).
-// ---------------------------------------------------------------------------
-__attribute__((target("avx512f")))
-inline void bm25_score_avx512(
-    const std::uint32_t* tfs,
-    const std::uint32_t* dls,
-    float k1_plus_1,
-    float k1_times_1_minus_b,
-    float k1_times_b,
-    float delta,
-    float idf,
-    float inv_avgdl,
-    float* contrib,
-    std::size_t n) noexcept {
-    const __m512 v_k1p1     = _mm512_set1_ps(k1_plus_1);
-    const __m512 v_k1_1mb   = _mm512_set1_ps(k1_times_1_minus_b);
-    const __m512 v_k1b      = _mm512_set1_ps(k1_times_b);
-    const __m512 v_inv_avg  = _mm512_set1_ps(inv_avgdl);
-    const __m512 v_delta    = _mm512_set1_ps(delta);
-    const __m512 v_idf      = _mm512_set1_ps(idf);
+// 调用方必须先过 simd::have_avx2_fma() / have_avx512() 门。
+void bm25_score_avx2(const std::uint32_t* tfs, const std::uint32_t* dls,
+                     float k1_plus_1, float k1_times_1_minus_b,
+                     float k1_times_b, float delta, float idf,
+                     float inv_avgdl, float* contrib, std::size_t n) noexcept;
 
-    std::size_t i = 0;
-    constexpr std::size_t kStride = 16;  // __m512 = 16 floats
-
-    for (; i + kStride <= n; i += kStride) {
-        // 16-lane uint32→float. Both arrays share stride-16 of u32s = 64B
-        // (one cache line each) per iteration — friendly to the load pipe.
-        const __m512i tfs_i = _mm512_loadu_si512(
-            reinterpret_cast<const __m512i*>(tfs + i));
-        const __m512i dls_i = _mm512_loadu_si512(
-            reinterpret_cast<const __m512i*>(dls + i));
-        const __m512 tf_f = _mm512_cvtepi32_ps(tfs_i);
-        const __m512 dl_f = _mm512_cvtepi32_ps(dls_i);
-
-        // Same FMA chain as AVX2, widened to 16 lanes.
-        const __m512 temp = _mm512_mul_ps(
-            _mm512_mul_ps(v_k1b, dl_f), v_inv_avg);
-        const __m512 denom = _mm512_add_ps(
-            _mm512_add_ps(tf_f, v_k1_1mb), temp);
-
-        const __m512 numer = _mm512_mul_ps(tf_f, v_k1p1);
-        const __m512 tf_norm = _mm512_div_ps(numer, denom);
-
-        const __m512 out = _mm512_mul_ps(
-            v_idf, _mm512_add_ps(tf_norm, v_delta));
-
-        _mm512_storeu_ps(contrib + i, out);
-    }
-
-    // Tail: scalar fallback (n - i) < 16.
-    // We don't partial-issue AVX2 here — the tail is small and the AVX2
-    // setup cost would exceed the savings.
-    for (; i < n; ++i) {
-        const auto tf_f = static_cast<float>(tfs[i]);
-        const auto dl_f = static_cast<float>(dls[i]);
-        const float denom = tf_f + k1_times_1_minus_b +
-                            k1_times_b * dl_f * inv_avgdl;
-        const float tf_norm = tf_f * k1_plus_1 / denom;
-        contrib[i] = idf * (tf_norm + delta);
-    }
-}
-
-#endif  // __x86_64__ && (GCC || Clang)
+void bm25_score_avx512(const std::uint32_t* tfs, const std::uint32_t* dls,
+                       float k1_plus_1, float k1_times_1_minus_b,
+                       float k1_times_b, float delta, float idf,
+                       float inv_avgdl, float* contrib, std::size_t n) noexcept;
+#endif  // BITCASK_X86_64
 
 // ---------------------------------------------------------------------------
 // Runtime dispatcher — pick the best available kernel for the current CPU.
@@ -246,7 +114,7 @@ inline void bm25_score_dispatch(
     float inv_avgdl,
     float* contrib,
     std::size_t n) noexcept {
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#if BITCASK_X86_64
     // S37-3：探测下沉到 simd::cpu_features（自实现 CPUID + XCR0 门，MSVC
     // 通用）。注意 AVX-512 档现在要求 F+CD+BW+DQ+VL 整集齐备而非仅 F——
     // 见 cpu_features.hpp（MSVC /arch:AVX512 隐含整集）。

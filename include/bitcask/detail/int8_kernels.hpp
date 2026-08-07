@@ -57,9 +57,7 @@
 #include <random>
 #include <vector>
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-#include <immintrin.h>
-#endif
+#include "bitcask/detail/cpu_features.hpp"
 
 namespace bitcask::vec::int8 {
 
@@ -220,232 +218,29 @@ inline float dot_scalar_raw(const std::int8_t* a, const std::int8_t* b,
     return static_cast<float>(raw) * (scale_a * scale_b) / (127.0f * 127.0f);
 }
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-
-// ---------------------------------------------------------------------------
-// dot_vnni512 — AVX-512 VNNI dot product kernel.
+#if BITCASK_X86_64
+// S37-3.b：SIMD 内核的**定义**已移出本头，进按 ISA 分的 TU
+// （src/vector/int8_kernels_{avx2,vnni,vnni512}.cpp）。移出原因同 bm25_kernels：
+// 原带 __attribute__((target(...)))，MSVC 不支持，而本头被 format.hpp /
+// hnsw.hpp / codec.cpp 等大量 TU 包含，内联在头里就无法分别施加 ISA 开关。
 //
-// 64 int8 elements per iteration (__m512i). The intrinsic signature is
-// unsigned × signed (u8 × s8 → i32 accumulate):
-//   query_u8 = query_codes XOR 0x80      (s8 in [-127,127] → u8 in [1,255])
-//   db_s8    = db_codes                  (kept as signed — the second arg
-//                                          of dpbusd is the signed operand)
-// Compensation (folded into the return value):
-//   raw  = Σ (query_u8[i] * db_s8[i])
-//         = Σ query[i] * db[i] + 128 * Σ db[i]
-//   dot  = raw - 128 * sum_db
-//   res  = (scale_q * scale_db / (127*127)) * dot
-//
-// Tail (< 64 elements) is handled by a scalar loop.
-// ---------------------------------------------------------------------------
-__attribute__((target("avx512vnni")))
-inline float dot_vnni512(const std::int8_t* query_codes,
-                         const std::int8_t* db_codes,
-                         std::int32_t sum_db,
-                         float scale_q, float scale_db,
-                         std::size_t dim) noexcept {
-    const __m512i sign_flip = _mm512_set1_epi8(
-        static_cast<std::int8_t>(-128));   // 0x80
-    __m512i acc = _mm512_setzero_si512();
-
-    std::size_t i = 0;
-    constexpr std::size_t kStride = 64;    // __m512i = 64 bytes
-    for (; i + kStride <= dim; i += kStride) {
-        const __m512i va = _mm512_loadu_si512(query_codes + i);
-        const __m512i vb = _mm512_loadu_si512(db_codes     + i);
-        // XOR 0x80 flips the sign bit: s8 [-127,127] → u8 [1,255] safely
-        // (codes never equal -128 because quantize() clamps to [-127,127]).
-        const __m512i va_u8 = _mm512_xor_si512(va, sign_flip);
-        // vpdpbusd: acc[i32] += Σ va_u8[u8] * vb[s8], per 4-byte lane
-        acc = _mm512_dpbusd_epi32(acc, va_u8, vb);
-    }
-
-    // Horizontal reduce of 16 × i32 lanes to a single i32 scalar.
-    const std::int32_t raw = _mm512_reduce_add_epi32(acc);
-
-    // Scalar tail. The SIMD loop contributed the biased form
-    // Σ (q[i]+128) * b[i] for the head; the tail must match so that the
-    // -128*sum_db compensation is applied uniformly. Concretely:
-    //   biased_tail = Σ q[i]*b[i] + 128 * Σ b[i]   (i in tail)
-    std::int32_t tail_dot = 0;
-    std::int32_t tail_sum_b = 0;
-    for (; i < dim; ++i) {
-        tail_dot  += static_cast<std::int32_t>(query_codes[i]) *
-                     static_cast<std::int32_t>(db_codes[i]);
-        tail_sum_b += static_cast<std::int32_t>(db_codes[i]);
-    }
-    const std::int32_t raw_total = raw + tail_dot + 128 * tail_sum_b;
-    const std::int32_t dot_codes = raw_total - 128 * sum_db;
-    const float k = (scale_q * scale_db) / (127.0f * 127.0f);
-    return static_cast<float>(dot_codes) * k;
-}
-
-// ---------------------------------------------------------------------------
-// dot_vnni — AVX-VNNI (256-bit, VEX-encoded) dot product kernel.
-//
-// 32 int8 elements per iteration (__m256i). Uses _mm256_dpbusd_avx_epi32
-// (the VEX-encoded variant — NOT the EVEX _mm256_dpbusd_epi32, which would
-// require AVX-512-VNNI even for a 256-bit operation on this toolchain).
-//
-// _mm256_reduce_add_epi32 does not exist on AVX/AVX2 — we do the 8-lane
-// horizontal sum by hand: extract low/high 128, each -> 4 × i32 pair,
-// add, then accumulate the four pairs.
-// ---------------------------------------------------------------------------
-__attribute__((target("avxvnni")))
-inline float dot_vnni(const std::int8_t* query_codes,
-                      const std::int8_t* db_codes,
-                      std::int32_t sum_db,
-                      float scale_q, float scale_db,
-                      std::size_t dim) noexcept {
-    const __m256i sign_flip = _mm256_set1_epi8(
-        static_cast<std::int8_t>(-128));   // 0x80
-    __m256i acc = _mm256_setzero_si256();
-
-    std::size_t i = 0;
-    constexpr std::size_t kStride = 32;    // __m256i = 32 bytes
-    for (; i + kStride <= dim; i += kStride) {
-        const __m256i va = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(query_codes + i));
-        const __m256i vb = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(db_codes + i));
-        const __m256i va_u8 = _mm256_xor_si256(va, sign_flip);
-        acc = _mm256_dpbusd_avx_epi32(acc, va_u8, vb);
-    }
-
-    // Manual horizontal sum of 8 × i32 lanes (no _mm256_reduce_add_epi32).
-    // Split into two 128-bit halves, each has 4 × i32, then pairwise add.
-    const __m128i lo = _mm256_castsi256_si128(acc);
-    const __m128i hi = _mm256_extracti128_si256(acc, 1);
-    const __m128i sum4 = _mm_add_epi32(lo, hi);  // 4 × i32 (each = pair sum)
-    const __m128i sum2 = _mm_add_epi32(sum4, _mm_srli_si128(sum4, 8));  // 2 × i32
-    const __m128i sum1 = _mm_add_epi32(sum2, _mm_srli_si128(sum2, 4));  // 1 × i32 (low lane)
-    const std::int32_t raw = _mm_cvtsi128_si32(sum1);
-
-    // Scalar tail (same biased-tail invariant as the 512-bit kernel —
-    // see dot_vnni512 above; the tail must contribute q[i]*b[i] +
-    // 128*Σ b[i] so that the -128*sum_db compensation cancels uniformly).
-    std::int32_t tail_dot = 0;
-    std::int32_t tail_sum_b = 0;
-    for (; i < dim; ++i) {
-        tail_dot  += static_cast<std::int32_t>(query_codes[i]) *
-                     static_cast<std::int32_t>(db_codes[i]);
-        tail_sum_b += static_cast<std::int32_t>(db_codes[i]);
-    }
-    const std::int32_t raw_total = raw + tail_dot + 128 * tail_sum_b;
-    const std::int32_t dot_codes = raw_total - 128 * sum_db;
-    const float k = (scale_q * scale_db) / (127.0f * 127.0f);
-    return static_cast<float>(dot_codes) * k;
-}
-
-// ---------------------------------------------------------------------------
-// l2_vnni512 — AVX-512 VNNI squared L2 distance kernel.
-//
-// ||a-b||² = ||a||² + ||b||² - 2·dot(a,b)
-// In codes space:
-//   sq_diff = sq_a + sq_b - 2 * Σ codes_a[i]*codes_b[i]
-// Reconstructed scale: ((scale_a + scale_b) / 2 / 127)² * sq_diff.
-//
-// Implementation: do the dot kernel (above) to get the integer codes-space
-// dot, then assemble the L2 formula on the outside. The query vector's
-// sq_norm and scale are passed in; the db vector's are pre-stored in
-// QVector. Total work: 1 VNNI pass + O(1) outside-the-loop arithmetic.
-//
-// The 64-byte blocks of the VNNI pass overlap with dot_vnni512 exactly,
-// so a compiler that inlines both will fuse them — but we keep them as
-// separate functions for clarity and so callers can choose.
-// ---------------------------------------------------------------------------
-__attribute__((target("avx512vnni")))
-inline float l2_vnni512(const std::int8_t* query_codes,
-                        const std::int8_t* db_codes,
-                        std::int32_t sum_db,
-                        std::int32_t sq_norm_db,
-                        float scale_q, float scale_db,
-                        std::size_t dim) noexcept {
-    const __m512i sign_flip = _mm512_set1_epi8(
-        static_cast<std::int8_t>(-128));
-    __m512i acc = _mm512_setzero_si512();
-
-    std::size_t i = 0;
-    constexpr std::size_t kStride = 64;
-    for (; i + kStride <= dim; i += kStride) {
-        const __m512i va = _mm512_loadu_si512(query_codes + i);
-        const __m512i vb = _mm512_loadu_si512(db_codes     + i);
-        const __m512i va_u8 = _mm512_xor_si512(va, sign_flip);
-        acc = _mm512_dpbusd_epi32(acc, va_u8, vb);
-    }
-
-    const std::int32_t raw = _mm512_reduce_add_epi32(acc);
-
-    // Scalar tail for dot part (biased, same invariant as dot_vnni512).
-    std::int32_t tail_dot = 0;
-    std::int32_t tail_sum_b = 0;
-    for (; i < dim; ++i) {
-        tail_dot  += static_cast<std::int32_t>(query_codes[i]) *
-                     static_cast<std::int32_t>(db_codes[i]);
-        tail_sum_b += static_cast<std::int32_t>(db_codes[i]);
-    }
-    const std::int32_t dot_codes =
-        (raw + tail_dot + 128 * tail_sum_b) - 128 * sum_db;
-
-    // L2 assembly. sq_norm_query is computed by the caller and passed in
-    // implicitly via the .sq_norm_codes of the QVector (we don't take it
-    // as a kernel arg to keep the API symmetric with dot_vnni512 — the
-    // caller does sq_a + sq_b outside the call). Here we just expose the
-    // dot_codes and the caller plugs in the precomputed sq_norms.
-    (void)sq_norm_db;  // documented arg for the L2 API; unused in this
-                       // implementation (we compute the L2 outside the
-                       // kernel after the dot pass).
-    (void)scale_q;
-    (void)scale_db;
-    (void)dim;
-    return static_cast<float>(dot_codes);
-}
-
-// ---------------------------------------------------------------------------
-// dot_avx2 — S29-11-②:无 VNNI 机器的缺口补齐（AVX2 自 2013 Haswell 起
-// 普及）。经典两步 vpmaddubsw(u8×s8→s16 对和) + vpmaddwd(s16→s32 横加)。
-//
-// **sign 技巧防饱和**（与 VNNI 的 XOR-0x80 偏置法不同）:vpmaddubsw 的
-// s16 对和会饱和——若走偏置法,u8∈[1,255] × s8∈[-127,127] 的对和上界
-// 2·255·127 = 64770 > 32767,静默饱和 = 静默错分。改用恒等式
-// q·d = |d| ⊙ sign(q, d):|d| ≤ 127 作 u8 操作数、sign(q,d) ∈ [-127,127]
-// 作 s8 操作数 → 对和上界 2·127·127 = 32258 < 32767,**永不饱和**。
-// 整数部分与 dot_scalar_raw 精确一致(kernel 对拍契约;sum_db 无用——
-// 无偏置需补偿)。s32 lane 累计上界 (dim/32)·64516,dim ≤ 65535 时
-// ≈1.3e8 ≪ 2^31,安全。
-// ---------------------------------------------------------------------------
-__attribute__((target("avx2")))
-inline float dot_avx2(const std::int8_t* query_codes,
-                      const std::int8_t* db_codes,
-                      std::int32_t /*sum_db*/, float scale_q, float scale_db,
-                      std::size_t dim) noexcept {
-    __m256i acc = _mm256_setzero_si256();
-    const __m256i ones16 = _mm256_set1_epi16(1);
-    std::size_t i = 0;
-    constexpr std::size_t kStride = 32;
-    for (; i + kStride <= dim; i += kStride) {
-        const __m256i q = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(query_codes + i));
-        const __m256i d = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(db_codes + i));
-        const __m256i ad = _mm256_abs_epi8(d);       // u8 ∈ [0,127]
-        const __m256i sq = _mm256_sign_epi8(q, d);   // d==0 → 0(乘积本为 0)
-        const __m256i p16 = _mm256_maddubs_epi16(ad, sq);
-        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p16, ones16));
-    }
-    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc),
-                              _mm256_extracti128_si256(acc, 1));
-    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
-    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
-    std::int64_t raw = _mm_cvtsi128_si32(s);
-    for (; i < dim; ++i) {  // 尾部标量（dim 非 32 倍数）
-        raw += static_cast<std::int32_t>(query_codes[i]) *
-               static_cast<std::int32_t>(db_codes[i]);
-    }
-    return static_cast<float>(raw) * (scale_q * scale_db) / (127.0f * 127.0f);
-}
-
-#endif  // __x86_64__ && (GCC || Clang)
+// 调用方一律经 pick_int8_dot_kernel() 取函数指针（内部已过运行时门），
+// 不要直接调这些符号。
+// 三者签名一致，可直接赋给 Int8DotFn（见下）。
+float dot_vnni512(const std::int8_t* query_codes, const std::int8_t* db_codes,
+                  std::int32_t sum_db, float scale_q, float scale_db,
+                  std::size_t dim) noexcept;
+float dot_vnni(const std::int8_t* query_codes, const std::int8_t* db_codes,
+               std::int32_t sum_db, float scale_q, float scale_db,
+               std::size_t dim) noexcept;
+float dot_avx2(const std::int8_t* query_codes, const std::int8_t* db_codes,
+               std::int32_t sum_db, float scale_q, float scale_db,
+               std::size_t dim) noexcept;
+// L2 多一个 sq_norm_db 参数，故不属于 Int8DotFn 族。
+float l2_vnni512(const std::int8_t* query_codes, const std::int8_t* db_codes,
+                 std::int32_t sum_db, std::int32_t sq_norm_db, float scale_q,
+                 float scale_db, std::size_t dim) noexcept;
+#endif  // BITCASK_X86_64
 
 // ---------------------------------------------------------------------------
 // Runtime dispatcher. Returns the best int8 dot kernel for this CPU.
@@ -456,7 +251,7 @@ using Int8DotFn = float (*)(const std::int8_t*, const std::int8_t*,
                             std::int32_t, float, float, std::size_t);
 
 inline Int8DotFn pick_int8_dot_kernel() noexcept {
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#if BITCASK_X86_64
     static const Int8DotFn kFn = []() -> Int8DotFn {
         // S37-3：探测经 simd::cpu_features（见 cpu_features.hpp）。
         if (simd::have_avx512_vnni()) return &dot_vnni512;

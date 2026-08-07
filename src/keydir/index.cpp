@@ -7,41 +7,12 @@
 #include <algorithm>
 #include <cstring>
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-#include <immintrin.h>
-#endif
+#include "index_kernels.hpp"  // S37-3.b：AVX2 gather 内核（分 ISA TU）
 
 namespace bitcask::index {
 
 namespace {
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-// Tier-2 SIMD:fill_is_live 快路径 4 ords 一组,AVX2 vpgatherdq
-// (_mm256_i64gather_epi64) 一次取 __m256i 索引(8 × 64-bit)但仅消费
-// 低 4 个索引、返 4 × 64-bit 值(__m256i 高 128 bit 是无定义垃圾,绝不读)。
-// 每轮 4 ords = 1 gather;低 lane 提取低字节写入 out。
-// 注:LTO 模式下 _mm256_extract_epi64 会被拆成对 _mm256_extractf128_si256
-// 的非立即数调用失败,故走 store + 数组索引(编译为 vmovq)。
-__attribute__((target("avx2")))
-__attribute__((noinline))
-inline void fill_is_live_inbounds_avx2(const std::uint8_t* live_arr,
-                                       const std::uint64_t* ords,
-                                       char* out, std::size_t n) noexcept {
-    std::size_t i = 0;
-    alignas(32) std::uint64_t lanes[4];
-    for (; i + 4 <= n; i += 4) {
-        __m256i idx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ords + i));
-        __m256i b = _mm256_i64gather_epi64(
-            reinterpret_cast<const long long*>(live_arr), idx, 1);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), b);
-        out[i + 0] = static_cast<char>(lanes[0] & 0xFF);
-        out[i + 1] = static_cast<char>(lanes[1] & 0xFF);
-        out[i + 2] = static_cast<char>(lanes[2] & 0xFF);
-        out[i + 3] = static_cast<char>(lanes[3] & 0xFF);
-    }
-    for (; i < n; ++i) out[i] = static_cast<char>(live_arr[ords[i]]);
-}
-#endif
 
 }
 
@@ -222,9 +193,9 @@ void Index::set_meta(std::uint64_t ord, std::span<const std::byte> blob) {
     dirty_.store(true, std::memory_order_relaxed);  // S18-2：自记账
 }
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-__attribute__((target("avx2")))
-#endif
+// S37-3.b：原带 __attribute__((target("avx2")))——但本函数被**无条件调用**，
+// 该属性允许编译器在 scalar 回退路径也生成 AVX2 ⇒ 无 AVX2 的 CPU 上 SIGILL。
+// 内核拆到独立 TU 后，本函数是普通 TU 代码，编译器无权在此生成 AVX2。
 void Index::fill_is_live(std::span<const std::uint64_t> ords,
                          std::span<char> out) const {
     std::shared_lock lk(mutex_);
@@ -236,14 +207,15 @@ void Index::fill_is_live(std::span<const std::uint64_t> ords,
         const auto* ords_arr = ords.data();
         char* out_arr = out.data();
         const std::size_t n = ords.size();
-        std::size_t i = 0;
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-        if (simd::have_avx2()) {  // S37-3
-            fill_is_live_inbounds_avx2(live_arr, ords_arr, out_arr, n);
+#if BITCASK_X86_64
+        if (simd::have_avx2()) {  // S37-3：门后才可调 AVX2 内核
+            kernels::fill_is_live_avx2(live_arr, ords_arr, out_arr, n);
             return;
         }
 #endif
-        for (; i < n; ++i) out_arr[i] = static_cast<char>(live_arr[ords_arr[i]]);
+        for (std::size_t i = 0; i < n; ++i) {
+            out_arr[i] = static_cast<char>(live_arr[ords_arr[i]]);
+        }
         return;
     }
     // 慢路径:含越界或ds → per-element 越界检查。
@@ -252,9 +224,7 @@ void Index::fill_is_live(std::span<const std::uint64_t> ords,
     }
 }
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-__attribute__((target("avx2")))
-#endif
+// S37-3.b：同 fill_is_live——原函数级 target 属性已移除，见其注释。
 void Index::fill_doc_lens(std::span<const std::uint64_t> ords,
                           std::span<std::uint32_t> out) const {
     std::shared_lock lk(mutex_);
@@ -266,23 +236,13 @@ void Index::fill_doc_lens(std::span<const std::uint64_t> ords,
         const auto* ords_arr = ords.data();
         auto* out_arr = out.data();
         const std::size_t n = ords.size();
-        std::size_t i = 0;
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-        // AVX2 vpgatherqd(_mm256_i64gather_epi32) 一次取 8 个 64-bit 索引
-        // 但仅消费低 4 个、返 4 个 32-bit 值(__m128i)。每轮 4 ords 一次
-        // gather;高 4 索引通过 lane shift 喂下一轮。
-        if (simd::have_avx2()) {  // S37-3
-            for (; i + 4 <= n; i += 4) {
-                __m256i idx = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i*>(ords_arr + i));
-                __m128i v = _mm256_i64gather_epi32(
-                    reinterpret_cast<const int*>(dls_arr), idx, 4);
-                _mm_storeu_si128(
-                    reinterpret_cast<__m128i*>(out_arr + i), v);
-            }
+#if BITCASK_X86_64
+        if (simd::have_avx2()) {  // S37-3：门后才可调 AVX2 内核
+            kernels::fill_doc_lens_avx2(dls_arr, ords_arr, out_arr, n);
+            return;
         }
 #endif
-        for (; i < n; ++i) out_arr[i] = dls_arr[ords_arr[i]];
+        for (std::size_t i = 0; i < n; ++i) out_arr[i] = dls_arr[ords_arr[i]];
         return;
     }
     for (std::size_t i = 0; i < ords.size(); ++i) {

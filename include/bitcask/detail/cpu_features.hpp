@@ -37,6 +37,32 @@
 #include <cstdint>
 #include <string_view>
 
+// ---------------------------------------------------------------------------
+// 可移植宏（S37-3.b）。原先散在 25 处的
+//   #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+// 有两个问题：① MSVC 用 `_M_X64` 而非 `__x86_64__`，② 把「是不是 x86-64」
+// 和「是不是 GCC/Clang」搅在一起——后者的存在只是因为内核用了 GCC 扩展，
+// 扩展消除后这个条件就不该再有。
+// ---------------------------------------------------------------------------
+#if defined(__x86_64__) || defined(_M_X64)
+#  define BITCASK_X86_64 1
+#else
+#  define BITCASK_X86_64 0
+#endif
+
+#if defined(_MSC_VER)
+#  define BITCASK_NOINLINE __declspec(noinline)
+#else
+#  define BITCASK_NOINLINE __attribute__((noinline))
+#endif
+
+// 关闭指定 sanitizer 检查。MSVC 无对应物，展开为空。
+#if defined(_MSC_VER)
+#  define BITCASK_NO_SANITIZE(what)
+#else
+#  define BITCASK_NO_SANITIZE(what) __attribute__((no_sanitize(what)))
+#endif
+
 namespace bitcask::simd {
 
 // ISA 档位。单调递增——BITCASK_SIMD_MAX 按序钳制。

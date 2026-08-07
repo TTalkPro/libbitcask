@@ -33,6 +33,7 @@
 #pragma once
 
 #include "bitcask/epoch_reclaim.hpp"
+#include "bitcask/detail/cpu_features.hpp"  // S37-3.b：BITCASK_NO_SANITIZE
 #include "bitcask/string_hash.hpp"
 
 #include <atomic>
@@ -209,7 +210,7 @@ public:
     // 拷入 out(caller 负责按可乐观消费的判别解释——KeyDir 只认 Single
     // POD,其余回退加锁);kMiss 为权威不存在;kRetry = 撕裂/写者活跃。
 #if defined(__clang__) || defined(__GNUC__)
-    __attribute__((no_sanitize("thread")))
+    BITCASK_NO_SANITIZE("thread")
 #endif
     OptResult try_get_optimistic(std::string_view key,
                                  std::byte* out) const noexcept {
@@ -374,7 +375,7 @@ private:
     // 插桩,压不住拦截器(TSan 树实测报 race)。volatile 逐字装载同时阻止
     // 编译器把循环聚合回 memcpy libcall(loop-idiom 识别)。
 #if defined(__clang__) || defined(__GNUC__)
-    __attribute__((no_sanitize("thread")))  // 独立函数,须自带豁免(非内联时
+    BITCASK_NO_SANITIZE("thread")  // 独立函数,须自带豁免(非内联时
                                             // 不继承 caller 的豁免——TSan 实测)
 #endif
     // 逐 8 字节 __atomic_load_n(relaxed):① TBAA 豁免——曾用 uint64_t*
@@ -393,7 +394,7 @@ private:
     }
     [[nodiscard]]
 #if defined(__clang__) || defined(__GNUC__)
-    __attribute__((no_sanitize("thread")))
+    BITCASK_NO_SANITIZE("thread")
 #endif
     static inline bool opt_bytes_equal(const void* shared,
                                        const void* own,
@@ -409,8 +410,8 @@ private:
         for (; i + 8 <= n; i += 8) {
             std::uint64_t a;
             std::uint64_t b;
-            __builtin_memcpy(&a, x + i, 8);
-            __builtin_memcpy(&b, y + i, 8);
+            std::memcpy(&a, x + i, 8);
+            std::memcpy(&b, y + i, 8);
             acc |= a ^ b;
         }
         for (; i < n; ++i) {

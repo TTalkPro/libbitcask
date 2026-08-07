@@ -6,12 +6,6 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#  define BITCASK_X86_64 1
-#else
-#  define BITCASK_X86_64 0
-#endif
-
 #if BITCASK_X86_64
 #  if defined(_MSC_VER)
 #    include <intrin.h>     // __cpuidex / _xgetbv

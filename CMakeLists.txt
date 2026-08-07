@@ -137,9 +137,70 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(bitcask_simd STATIC
     src/simd/cpu_features.cpp
+    src/simd/crc32_sse42.cpp     # S37-3.b：分 ISA TU（见下 bitcask_simd_tu）
 )
 target_include_directories(bitcask_simd PUBLIC include)
 target_link_libraries(bitcask_simd PRIVATE bitcask_warnings bitcask_sanitizers)
+
+# ---------------------------------------------------------------------------
+# bitcask_simd_tu(<源文件> <档位>) — 给单个 TU 施加该 ISA 档的编译选项。
+# 档位取值：avx2 | avx512 | vnni | vnni512 | sse42
+#
+# S37-3.b：SIMD 内核按 ISA 分 TU 的落点。
+#
+# **为什么必须分 TU 而不是继续用 __attribute__((target))**：
+#   MSVC 既无该属性也无 __builtin_cpu_supports，`/arch:` 是**每 TU** 生效的
+#   唯一手段。GCC/Clang 侧同样改用 -m 开关，两边一套结构，免得维护两份。
+#
+# ⚠️ **被施加了 -m/-arch 的 TU 里，编译器有权在任何函数中生成该 ISA 的指令**
+# （不止 intrinsic，还包括自动向量化的胶水代码）。因此这类 TU 必须满足：
+#   ① 只放运行时门后才会被调用的内核；
+#   ② **不得有静态初始化器 / 全局构造** —— 它们在 main 之前无条件执行，
+#      在不支持该 ISA 的 CPU 上直接 SIGILL，且崩在库加载期极难定位；
+#   ③ 不得放 scalar 回退实现（那是要在任何 CPU 上都能跑的）。
+#
+# MSVC 无 /arch:SSE4.2——x64 基线已含 SSE2，SSE4.2/PCLMUL intrinsic 在 MSVC 下
+# 无需开关即可用，故 sse42 档在 MSVC 侧不加任何选项。
+# ---------------------------------------------------------------------------
+function(bitcask_simd_tu src tier)
+    if(MSVC)
+        if(tier STREQUAL "avx2" OR tier STREQUAL "vnni")
+            set(_opts "/arch:AVX2")
+        elseif(tier STREQUAL "avx512" OR tier STREQUAL "vnni512")
+            set(_opts "/arch:AVX512")
+        else()
+            set(_opts "")          # sse42：见上
+        endif()
+    else()
+        if(tier STREQUAL "avx2")
+            set(_opts -mavx2 -mfma)
+        elseif(tier STREQUAL "vnni")
+            set(_opts -mavx2 -mfma -mavxvnni)
+        elseif(tier STREQUAL "avx512")
+            # 与 MSVC /arch:AVX512 的隐含集合对齐（F+CD+BW+DQ+VL）——运行时门
+            # 也按此整集放行（见 detail/cpu_features.hpp）。两边一致才不会出现
+            # 「一侧编出了另一侧门不放行的指令」。
+            set(_opts -mavx512f -mavx512cd -mavx512bw -mavx512dq -mavx512vl)
+        elseif(tier STREQUAL "vnni512")
+            set(_opts -mavx512f -mavx512cd -mavx512bw -mavx512dq -mavx512vl
+                      -mavx512vnni)
+        elseif(tier STREQUAL "sse42")
+            set(_opts -msse4.2 -mpclmul)
+        else()
+            message(FATAL_ERROR "bitcask_simd_tu: 未知档位 '${tier}'")
+        endif()
+    endif()
+    # SKIP_PRECOMPILE_HEADERS 必开：PCH 在**目标级**用统一选项预编译，而本函数
+    # 给单个 TU 追加 -m/-arch。GCC 会报
+    #   "cmake_pch.hxx.gch: created and used with differing settings of '-mavx'"
+    # 并退化/失效；更糟的是这类不一致属于「警告而非错误」，极易被忽略后
+    # 演变成难以定位的行为差异。分 ISA TU 本就很小，不用 PCH 无性能顾虑。
+    set_source_files_properties("${src}" PROPERTIES
+        COMPILE_OPTIONS "${_opts}"
+        SKIP_PRECOMPILE_HEADERS ON)
+endfunction()
+
+bitcask_simd_tu(src/simd/crc32_sse42.cpp sse42)
 
 # ---------------------------------------------------------------------------
 # bitcask_format — codec for data file / hint file records.
@@ -217,8 +278,10 @@ target_link_libraries(bitcask_keydir
 # ---------------------------------------------------------------------------
 add_library(bitcask_docmap STATIC
     src/keydir/index.cpp
+    src/keydir/index_kernels_avx2.cpp   # S37-3.b：分 ISA TU
     src/keydir/docmap_ckpt.cpp   # S18-2：docmap 组件 ckpt（宿主侧持久化）
 )
+bitcask_simd_tu(src/keydir/index_kernels_avx2.cpp avx2)
 target_include_directories(bitcask_docmap PUBLIC include)
 target_link_libraries(bitcask_docmap
     PUBLIC  bitcask_text bitcask_format   # format：sidecar/组件容器 CRC（S18-2）
@@ -238,10 +301,18 @@ target_include_directories(bitcask_plugin_api INTERFACE include)
 # ---------------------------------------------------------------------------
 add_library(bitcask_bm25 STATIC
     src/bm25/intersect.cpp
+    src/bm25/bm25_kernels_avx2.cpp        # S37-3.b：分 ISA TU
+    src/bm25/bm25_kernels_avx512.cpp
+    src/bm25/intersect_kernels_avx2.cpp
+    src/bm25/intersect_kernels_avx512.cpp
     src/bm25/inverted.cpp
     src/bm25/query_parser.cpp
     src/bm25/segment_v2.cpp
 )
+bitcask_simd_tu(src/bm25/bm25_kernels_avx2.cpp        avx2)
+bitcask_simd_tu(src/bm25/bm25_kernels_avx512.cpp      avx512)
+bitcask_simd_tu(src/bm25/intersect_kernels_avx2.cpp   avx2)
+bitcask_simd_tu(src/bm25/intersect_kernels_avx512.cpp avx512)
 target_include_directories(bitcask_bm25 PUBLIC include)
 target_link_libraries(bitcask_bm25
     PUBLIC bitcask_format bitcask_io   # B3：MmapSegment 用 io::MappedFile
@@ -252,9 +323,19 @@ target_link_libraries(bitcask_bm25
 # ---------------------------------------------------------------------------
 add_library(bitcask_vector STATIC
     src/vector/hnsw.cpp
+    src/vector/hnsw_kernels_avx2.cpp     # S37-3.b：分 ISA TU（见下 bitcask_simd_tu）
+    src/vector/hnsw_kernels_avx512.cpp
+    src/vector/int8_kernels_avx2.cpp
+    src/vector/int8_kernels_vnni.cpp
+    src/vector/int8_kernels_vnni512.cpp
     src/vector/ivf_rq.cpp
     src/vector/diskann.cpp
 )
+bitcask_simd_tu(src/vector/hnsw_kernels_avx2.cpp   avx2)
+bitcask_simd_tu(src/vector/hnsw_kernels_avx512.cpp avx512)
+bitcask_simd_tu(src/vector/int8_kernels_avx2.cpp    avx2)
+bitcask_simd_tu(src/vector/int8_kernels_vnni.cpp    vnni)
+bitcask_simd_tu(src/vector/int8_kernels_vnni512.cpp vnni512)
 target_include_directories(bitcask_vector
     PUBLIC  include
     PRIVATE src/vector
@@ -286,9 +367,13 @@ target_link_libraries(bitcask_text_plugin
 
 add_library(bitcask_vector_plugin STATIC
     src/search/vector_plugin.cpp
+    src/search/vector_plugin_kernels_avx2.cpp    # S37-3.b：分 ISA TU
+    src/search/vector_plugin_kernels_avx512.cpp
     src/search/ivf_plugin.cpp
     src/search/diskann_plugin.cpp
 )
+bitcask_simd_tu(src/search/vector_plugin_kernels_avx2.cpp   avx2)
+bitcask_simd_tu(src/search/vector_plugin_kernels_avx512.cpp avx512)
 target_include_directories(bitcask_vector_plugin PUBLIC include)
 target_link_libraries(bitcask_vector_plugin
     PUBLIC  bitcask_vector bitcask_format bitcask_plugin_api

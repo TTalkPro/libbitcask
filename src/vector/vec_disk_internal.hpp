@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <bit>  // S37-3.b：std::popcount 替代 __builtin_popcount*
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -128,11 +129,11 @@ inline std::uint32_t hamming_bytes(const std::uint8_t* a,
         std::uint64_t x, y;
         std::memcpy(&x, a + i, 8);
         std::memcpy(&y, b + i, 8);
-        h += static_cast<std::uint32_t>(__builtin_popcountll(x ^ y));
+        h += static_cast<std::uint32_t>(std::popcount(x ^ y));
     }
     for (; i < nbytes; ++i) {
         h += static_cast<std::uint32_t>(
-            __builtin_popcount(static_cast<unsigned>(a[i] ^ b[i])));
+            std::popcount(static_cast<unsigned>(a[i] ^ b[i])));
     }
     return h;
 }

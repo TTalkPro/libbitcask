@@ -274,6 +274,61 @@ leaf 7.0 ECX bit 11 位置迥异）**。
 **仍未覆盖**：AVX-512 / AVX512-VNNI 两档——降档开关只能往下钳，覆盖它们必须
 有带 AVX-512 的机器（S37-7 的 CI 矩阵）。这是 3.b 搬内核时的**已知风险敞口**。
 
+#### ✅ S37-3.b 落地记录（2026-08-07）
+
+**24 个 `__attribute__((target))` 函数全部搬进分 ISA TU**，第一方 GCC 扩展归零。
+
+新增 CMake 函数 `bitcask_simd_tu(<源文件> <档位>)`（`avx2|avx512|vnni|vnni512|sse42`）
+统一施加 `-m*`（GCC/Clang）或 `/arch:`（MSVC）。**GCC/Clang 侧也改用 `-m` 开关而
+非保留 target 属性**——两边一套结构，免得维护两份。
+
+新增 12 个分 ISA TU：
+
+| 模块 | 新 TU | 档 |
+|---|---|---|
+| hnsw 距离 | `hnsw_kernels_avx2/_avx512.cpp` | avx2 / avx512 |
+| int8 点积 | `int8_kernels_avx2/_vnni/_vnni512.cpp` | avx2 / vnni / vnni512 |
+| BM25 打分 | `bm25_kernels_avx2/_avx512.cpp` | avx2 / avx512 |
+| 求交 | `intersect_kernels_avx2/_avx512.cpp` | avx2 / avx512 |
+| 向量归一化 | `vector_plugin_kernels_avx2/_avx512.cpp` | avx2 / avx512 |
+| CRC32 折叠 | `simd/crc32_sse42.cpp` | sse42 |
+| Index gather | `index_kernels_avx2.cpp` | avx2 |
+
+**3 个公开头 + 1 个内部头交出内联内核**（`bm25_kernels.hpp` / `detail/int8_kernels.hpp` /
+`hw_crc32.hpp` / `hnsw_kernels.hpp`）——它们经 `format.hpp`/`hnsw.hpp`/`codec.cpp`
+传播到大量 TU，内核留在头里就无法对包含者分别施加 ISA 开关。
+
+**顺带修掉的一个潜在 SIGILL**：`Index::fill_is_live` / `fill_doc_lens` 原**整个成员
+函数**带 `target("avx2")` 却被**无条件调用**——该属性允许编译器在函数任何位置
+（含运行时门之后才该走的 scalar 回退）生成 AVX2，在无 AVX2 的 CPU 上即 SIGILL。
+反汇编确认当前 GCC -O3 未真的越界生成（**潜在风险而非现行 bug**），但结构上不
+该依赖编译器的克制；内核拆出后调用方是普通 TU，编译器无权在其中生成 AVX2。
+
+**机械替换**：`__builtin_ia32_pause`→`_mm_pause`（2 处）、`__builtin_popcount*`→
+`std::popcount`、`__builtin_memcpy`→`std::memcpy`、`__attribute__((no_sanitize))`→
+`BITCASK_NO_SANITIZE` 宏、25 处 `#if defined(__x86_64__) && (GNUC||clang)` →
+`BITCASK_X86_64`（后半个条件本就只因内核用了 GCC 扩展而存在）。
+
+**踩到的一个构建坑**：分 ISA TU 与**预编译头冲突**——PCH 在目标级用统一选项
+预编译，而本函数给单个 TU 追加 `-m`，GCC 报
+`cmake_pch.hxx.gch: created and used with differing settings of '-mavx'`。
+这属**警告而非错误**，极易被忽略后演变成难定位的行为差异。已在
+`bitcask_simd_tu` 内固定 `SKIP_PRECOMPILE_HEADERS ON`。
+
+**验收**：
+- **ISA 泄漏检查**：反汇编本次构建的 **42 个非 SIMD TU，宽指令（zmm/vfmadd/
+  vpgather/vpclmul/ymm）泄漏 0**；5 个 avx512/vnni512 TU 确实含 zmm。隔离
+  从「靠编译器自觉」变成结构性成立。
+  （首轮检查曾报 2 处泄漏，追查为 7 月 4 日的**陈旧 .o**——`bitcask_index.dir` /
+  `bitcask_search.dir` 是已不存在的旧目标遗留目录。）
+- **四档跨档回归**：`scalar`/`sse42`/`avx2`/`avxvnni` 逐档 **732/732**。
+- **CRC32 内核体与原版逐字 diff 一致**（唯一差异是删掉的守卫行）——搬运忠实。
+- **bench 零回归**：同机交替 A/B + `taskset` 绑核 + 3 轮取最小值，
+  crc32(4 档尺寸)/BOW/intersect 全部落在 **±2%** 内。
+  ⚠️ **首轮非绑核测量曾报 crc32 +27%、intersect +40%**，但**未改动的 scalar 路径
+  也「回退」13%**——据此判定为负载噪声（load avg >10 / 8 核），改用绑核交替
+  后全部消失。**这类噪声足以让人误判并去「优化」一个并不存在的回退。**
+
 ### S37-4 — MSVC 构建适配 🟡 MED（首个需要 Windows 环境的任务）
 
 1. **编译第一天必炸三项**：`/utf-8`（187 源文件中 **181 个含中文注释**，不给此项 MSVC
@@ -413,7 +468,7 @@ S37-7 (1.5周) ───── CI + 收尾
 | S37-1 抽象层收编 | ✅ done（裸宿主原语归零；Debug/ASan 725/725 + 双树，见落地记录）|
 | S37-2 fork → exec-self | ✅ done（6 个 fork 点全转；`tests/` POSIX 头归零；Debug/ASan 725/725，见落地记录）|
 | S37-3.a cpu_features + 降档开关 | ✅ done（`__builtin_cpu_supports` 归零；四档 732/732 跨档对拍，见落地记录）|
-| S37-3.b 内核分 ISA TU | ⬜ 未开始 |
+| S37-3.b 内核分 ISA TU | ✅ done（24 个 target 函数搬完；ISA 泄漏 0；四档 732/732；bench ±2%，见落地记录）|
 | S37-4 MSVC 构建适配 | ⬜ 未开始（需 Windows 环境）|
 | S37-5 Windows I/O 后端 | ⬜ 未开始 |
 | S37-6 删除/映射生命周期 | ⬜ 未开始 |
