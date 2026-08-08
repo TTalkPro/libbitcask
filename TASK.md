@@ -1061,6 +1061,48 @@ field id N 解析成另一个字段名。这是静默的数据错位，比丢一
 
 **验证**：msvc-debug 746 全绿。
 
+#### 🟢 P3 Linux 复验（2026-08-08，e2c875d 时点）——无回归
+
+| 树 | 结果 |
+|---|---|
+| 干净树 `-Werror` 全树（库+测试+bench） | ✅ 0 错误 0 告警；ctest **749/749** |
+| gcc Debug / clang Debug | ✅ 各 **749/749** |
+| ASan（P3 动了句柄生命周期，重点） | ✅ **749/749** |
+| TSan（写路径持锁，按 CI `-E` 豁免） | ✅ **747/747** |
+| Release -O3+LTO+bench 双树（`field_schema.hpp`/`io.hpp` 是公开头） | ✅ 编译 0 错误 |
+| `check-path-encoding.sh` | ✅ 无违规 |
+
+**偏移追踪在 POSIX 上确实正确**：探针写三条后文件 43 字节 =
+8(头) + (2+5+4) + (2+5+4) + (2+7+4)，逐条对得上——即 `kNoAppend` + 自记 `woff_`
+没有覆盖写，也没有因为丢了 `O_APPEND` 而错位。
+
+**顺带查实一个隐患，结论是「预存、非 P3 引入」**：
+
+`woff_` 取的是 `handle_size`（**整个文件大小**），而 `load_new_format_` 对
+torn tail 是「短读即 `return true`」——**容忍并停止解析**。两者拼在一起是：
+崩在半条 entry 上 → 重开时内存里少了尾部那条，但下一条 entry 被追加到
+**那半条之后**，文件变成 `[完整条…][半条][新条]`。
+
+写探针实测（`/tmp` 上真跑一遍：写 3 条 → 砍尾 3 字节 → 重开 → `intern` 一条 →
+再重开）：
+
+```
+reopen#2: id0=charlie id1=bravo id2=<none>     ← 半条被容忍，少一条
+reopen#2: intern(delta) = 2                    ← 追加到半条之后
+reopen#3: open() = FALSE (硬失败)              ← 下次打开直接硬失败
+```
+
+`open()` 返回 false 按本类契约是「真损坏 → caller 应中止 open」，即**整个库打不开**。
+
+**但这不是 P3 引入的**：把同一个探针对着 `e2c875d~1`（P3 之前，`fopen(path,"ab")`
++ `O_APPEND`）编译运行，**输出逐字相同**——`O_APPEND` 同样从文件末尾（含半条）
+开始写。P3 的前缀不变式覆盖的是「**写失败**后停止持久化」，那条它做到了；
+覆盖不到「上一次进程崩在半条上」这种既有状态。
+
+> 修法（若要做）应是 open 时把 `woff_` 定在**最后一条完整 entry 的末尾**而非
+> 文件大小，即让下一次追加覆盖掉那半条。这是行为变更且与 legacy 分支耦合，
+> 不在本次复验范围内，记在这里备查。
+
 ### P4 · 错误模型：**收窄，不做统一** [todo]
 
 13 个文件用 `std::error_code`，但绝大多数是 `fs::remove(p, ec)` 这种**尽力而为、
@@ -1256,7 +1298,7 @@ clang 侧告警数 **0**（CI 另有 clang job，确认没引入 clang 独有告
 | P 段 P2 读路径改走定位读 | [done]（原计划是写路径缓冲层，实测把靶心改到 2 GiB 天花板。**Linux 已复验**，2.54 GiB 用例走稀疏文件 3 ms 实跑未跳过）|
 | **Linux 全面复验（P 段 + S37-4/5 遗留）** | ✅ done（2026-08-08）：Debug g++/clang 各 **749/749**、Release+LTO 编译、**ASan 749/749**、**TSan 747/747**、干净树 configure、守门脚本。查出 1 条真回归（`-Wcomment` 打断 `werror-lib`，已修）+ 1 个过窄断言（已修）；TSan 那条失败是预存 CI 豁免项，已用 v6.1.0 基线对拍证否 |
 | **`werror-lib` 修复（S37-7.3 的 Linux 半边）** | ✅ done（2026-08-08）：该 job 自 v6.1.0 起从未绿过。库 14 条 + tests/bench 118 条，**共 132 条全部修根因**（无一个 `-Wno-*`）。现在 `BITCASK_WERROR=ON`+`BUILD_TESTING=ON`+benchmarks 的干净树整树 0 错误 0 告警，clang 侧亦 0。改动含 seqlock 头与公开头、且把多处「忽略返回值」改为断言，已全矩阵复跑：Release+`-Werror` 749/749、gcc/clang Debug 各 749/749、ASan 749/749、TSan 747/747 |
-| P 段 P3 field_schema 退掉长期 FILE* | [done]（顺带修掉未检查的写导致的 id 错位；adopt_stream 删除）|
+| P 段 P3 field_schema 退掉长期 FILE* | [done]（顺带修掉未检查的写导致的 id 错位；adopt_stream 删除）。**Linux 已复验**：`-Werror` 全树 0 告警 + gcc/clang/ASan 各 749/749 + TSan 747/747 + 双树；偏移追踪实测正确。另查实一个 torn-tail 隐患为**预存**（P3 前后输出逐字相同），见 P3 复验记录 |
 | P 段 P4 错误模型 | [todo] 未开始（结论仍是「收窄，不做统一」）|
 
 ### 待确认项
