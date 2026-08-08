@@ -26,7 +26,10 @@ static void rmrf(const char* dir) {
 #else
     snprintf(cmd, sizeof(cmd), "rm -rf \"%s\" >/dev/null 2>&1", dir);
 #endif
-    (void)system(cmd);
+    /* C 下 `(void)` 压不住 warn_unused_result（与 C++ 的 [[nodiscard]] 不同），
+       须真的接住返回值。清理是尽力而为，失败不影响用例。 */
+    const int rc = system(cmd);
+    (void)rc;
 }
 
 /* 运行前统一清空：跨运行/跨二进制版本累积的 checkpoint 残留会污染 reopen

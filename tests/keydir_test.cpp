@@ -24,8 +24,8 @@ TEST(KeyDir, AllocOrdMonotonic) {
 
 TEST(KeyDir, AdvanceOrd) {
     KeyDir kd;
-    kd.alloc_ord();
-    kd.alloc_ord();
+    (void)kd.alloc_ord();  // 只为推进计数器,取值由下一行断言
+    (void)kd.alloc_ord();
     EXPECT_EQ(kd.alloc_ord(), 2u);
 
     kd.advance_ord(5);
@@ -249,7 +249,7 @@ TEST(KeyDir, AllocOrdThreadSafety) {
     for (auto& t : threads) t.join();
 
     std::sort(ords.begin(), ords.end());
-    for (int i = 0; i < N; ++i) {
+    for (std::size_t i = 0; i < static_cast<std::size_t>(N); ++i) {
         EXPECT_EQ(ords[i], static_cast<std::uint64_t>(i));
     }
 }
@@ -458,7 +458,8 @@ TEST(KeyDirOptimisticRead, ConcurrentGetPutRemoveGrowStress) {
     std::vector<std::thread> readers;
     for (int t = 0; t < 4; ++t) {
         readers.emplace_back([&, t] {
-            std::uint64_t seed = 0x9E3779B97F4A7C15ull * (t + 1);
+            std::uint64_t seed =
+                0x9E3779B97F4A7C15ull * (static_cast<std::uint64_t>(t) + 1);
             while (!stop.load(std::memory_order_relaxed)) {
                 seed = seed * 6364136223846793005ull + 1442695040888963407ull;
                 const int s = static_cast<int>((seed >> 33) % kStable);

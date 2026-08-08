@@ -440,22 +440,22 @@ TEST_F(CrashRecoveryTest, MultiIteratorInterleavedReleaseAfterClose) {
 // 残留字节。重开逐值校验 + TSan 守护。
 TEST_F(CrashRecoveryTest, ThreadLocalEncodedBufferNoCrossThreadInterference) {
     namespace fs = std::filesystem;
-    constexpr int kThreads = 8;
+    constexpr std::size_t kThreads = 8;  // 用作 vector 尺寸/下标
     constexpr int kPuts = 200;
 
     // value 长度随 i 大幅变化（~10..310），强制缓冲反复 clear/扩缩。
-    auto value_for_tp = [](int tid, int i) {
+    auto value_for_tp = [](std::size_t tid, int i) {
         std::string v = "T" + std::to_string(tid) + "_V" + std::to_string(i) + "_";
         v.append(static_cast<std::size_t>(10 + (i * 7) % 300),
-                 static_cast<char>('a' + (tid % 26)));
+                 static_cast<char>('a' + static_cast<int>(tid % 26)));
         return v;
     };
-    auto key_for_tp = [](int tid, int i) {
+    auto key_for_tp = [](std::size_t tid, int i) {
         return "t" + std::to_string(tid) + "_k" + std::to_string(i);
     };
 
     std::vector<fs::path> dirs(kThreads);
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         dirs[t] = tmpdir_ / ("thread_" + std::to_string(t));
         std::error_code ec;
         fs::create_directories(dirs[t], ec);
@@ -464,7 +464,7 @@ TEST_F(CrashRecoveryTest, ThreadLocalEncodedBufferNoCrossThreadInterference) {
     std::atomic<bool> ok{true};
     std::vector<std::thread> workers;
     workers.reserve(kThreads);
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         workers.emplace_back([&, t] {
             CaskOptions opts;
             opts.read_write = true;
@@ -484,7 +484,7 @@ TEST_F(CrashRecoveryTest, ThreadLocalEncodedBufferNoCrossThreadInterference) {
     ASSERT_TRUE(ok.load()) << "并发 put 失败";
 
     // 逐 Cask 重开，校验每个 value 完整无串台。
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         CaskOptions opts;
         opts.read_write = true;
         auto c = Cask::open(dirs[t].string(), opts, &test_registry());

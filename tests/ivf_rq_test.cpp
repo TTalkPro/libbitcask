@@ -47,25 +47,6 @@ std::vector<float> make_clustered(std::size_t n, std::size_t dim,
     return out;
 }
 
-std::vector<std::uint64_t> brute_topk(const std::vector<float>& base,
-                                      std::size_t n, std::size_t dim,
-                                      const float* q, std::size_t k,
-                                      std::uint64_t ord_stride) {
-    std::vector<std::pair<float, std::uint64_t>> all;
-    all.reserve(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        const float* v = base.data() + i * dim;
-        float dot = 0.0f;
-        for (std::size_t d = 0; d < dim; ++d) dot += v[d] * q[d];
-        all.push_back({dot, static_cast<std::uint64_t>(i) * ord_stride});
-    }
-    std::partial_sort(all.begin(), all.begin() + static_cast<long>(k),
-                      all.end(), std::greater<>());
-    std::vector<std::uint64_t> ids(k);
-    for (std::size_t i = 0; i < k; ++i) ids[i] = all[i].second;
-    return ids;
-}
-
 IvfBuildSource src_of(const std::vector<float>& base, std::size_t dim,
                       std::uint64_t ord_stride = 1) {
     IvfBuildSource s;

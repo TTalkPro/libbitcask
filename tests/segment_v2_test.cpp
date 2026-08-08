@@ -1026,7 +1026,7 @@ TEST(SegmentV2P3, KWayMergeGoldenEquivalence) {
 TEST(SegmentV2P3, MergePhraseOnNamedField) {
     const auto tmp = std::filesystem::temp_directory_path();
     std::vector<std::shared_ptr<const SealedSegment>> cins;
-    for (int i = 0; i < 2; ++i) {
+    for (std::uint32_t i = 0; i < 2; ++i) {
         auto seg = std::make_shared<SealedSegment>();
         for (std::uint32_t g = 0; g < 40; ++g) add_merge_doc(*seg, g + i * 40);
         cins.push_back(std::move(seg));

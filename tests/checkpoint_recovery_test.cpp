@@ -583,7 +583,7 @@ TEST_F(CheckpointRecoveryTest, S30BudgetSealBuilderConcurrent) {
 // S30-P4:RSS 探针(手动实验,CI 恒跳过)。协议:BITCASK_RSS_PROBE=v1|v2
 // 各跑一次——两模式同预算封口节奏(段数一致),仅 seal_v2_segments 不同,
 // VmHWM 差值即「封口段 mmap 出内存」的净收益。
-// 用法:BITCASK_RSS_PROBE=v2 ./bitcask_checkpoint_recovery_test \
+// 用法:BITCASK_RSS_PROBE=v2 ./bitcask_checkpoint_recovery_test
 //        --gtest_filter='*S30RssProbe*' --gtest_also_run_disabled_tests
 namespace {
 long read_status_kb(const char* key) {

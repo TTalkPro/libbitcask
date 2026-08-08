@@ -1713,10 +1713,10 @@ TEST(InvertedIndex, SortedVocabSidecarWildcardPrefixRebuild) {
 TEST(InvertedIndex, V6SnapshotRoundtripWithPositions) {
     InvertedIndex idx;
     constexpr std::uint64_t kDocs = 500;
-    constexpr int kTermsPerDoc = 5;
+    constexpr std::uint64_t kTermsPerDoc = 5;  // 与 d 同类型,免去 d + t 的符号转换
     for (std::uint64_t d = 0; d < kDocs; ++d) {
         TermPositions tp;
-        for (int t = 0; t < kTermsPerDoc; ++t) {
+        for (std::uint64_t t = 0; t < kTermsPerDoc; ++t) {
             std::string term = "term" + std::to_string(t);
             std::uint32_t tf = static_cast<std::uint32_t>((d + t) % 3) + 1;
             tp.emplace(term, std::make_pair(tf, std::vector<std::uint32_t>{0}));

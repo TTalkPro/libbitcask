@@ -92,7 +92,7 @@ std::vector<std::byte> be_data_record(bitcask::format::RecordType type,
 void write_file_bytes(const std::string& path, std::span<const std::byte> b) {
     std::FILE* f = std::fopen(path.c_str(), "wb");
     ASSERT_NE(f, nullptr);
-    if (!b.empty()) ASSERT_EQ(std::fwrite(b.data(), 1, b.size(), f), b.size());
+    if (!b.empty()) { ASSERT_EQ(std::fwrite(b.data(), 1, b.size(), f), b.size()); }
     std::fclose(f);
 }
 
@@ -211,7 +211,7 @@ TEST(DataFile, BadCrcReturnsKBadCrc) {
         ASSERT_NE(fp, nullptr);
         std::fseek(fp, -1, SEEK_END);
         char c;
-        std::fread(&c, 1, 1, fp);
+        ASSERT_EQ(std::fread(&c, 1, 1, fp), 1u);
         c ^= 0x01;
         std::fseek(fp, -1, SEEK_END);
         std::fwrite(&c, 1, 1, fp);
@@ -300,7 +300,7 @@ TEST(HintFile, ValidateTrailerCorrupted) {
         ASSERT_NE(fp, nullptr);
         std::fseek(fp, 5, SEEK_SET);
         char c;
-        std::fread(&c, 1, 1, fp);
+        ASSERT_EQ(std::fread(&c, 1, 1, fp), 1u);
         c ^= 0x01;
         std::fseek(fp, 5, SEEK_SET);
         std::fwrite(&c, 1, 1, fp);
