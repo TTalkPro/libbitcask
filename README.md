@@ -172,7 +172,7 @@ C API 设计要点：不透明句柄、显式 `*_free` 配对、错误码 + `bit
 |------|------|------|------------------|
 | C++ 编译器 | GCC 13+ / Clang 17+ / **MSVC 19.4x+（VS 2022 17.6+）** | 需要 C++23 支持 | `gcc` `g++` |
 | CMake | **≥ 3.21** | 构建系统（合并静态库用 `$<TARGET_OBJECTS:>` 取 STATIC 目标对象，该用法自 3.21 起可用）| `cmake` |
-| ZLIB | — | CRC32 / 数据压缩 | `zlib1g-dev` |
+| ZLIB | v1.3.1（Windows 走子模块）| CRC32 / 数据压缩 | Linux/BSD `zlib1g-dev`；Windows 由 `third_party/zlib` 现编 |
 | oneTBB | — | 并发容器；普通构建用系统包 | `libtbb-dev` |
 
 > 普通构建用系统的 `libtbb`（`find_package(TBB)`）；仅 TSan 构建会改用 `third_party/oneTBB` 源码编译插桩版——系统 libtbb 未插桩，TSan 下会漏报/误报。
@@ -181,7 +181,12 @@ C API 设计要点：不透明句柄、显式 `*_free` 配对、错误码 + `bit
 
 平台支持范围：**Windows x64 / MSVC 原生 ABI**。不支持 MinGW，不支持 ARM64 Windows 与 32 位 x86。
 
-- **依赖**：zlib 走 vcpkg（`vcpkg.json` 只列它一个）；**oneTBB 从 `third_party/oneTBB` 子模块现编**——vcpkg 的 `tbb` 端口经 `hwloc` 会拖进一整套 msys2（m4/perl/autotools）工具链，与「纯 MSVC」构建冲突。需设环境变量 `VCPKG_ROOT`。
+- **依赖**：**无外部包管理器**。zlib 与 oneTBB 都从 `third_party/` 子模块现编——Windows 上这两者都没有「系统版」可用。此前 zlib 走 vcpkg（`vcpkg.json` 只列它一个），为一个库就要求装 vcpkg、设 `VCPKG_ROOT`、拉 `x64-windows` 三元组；现已改为子模块，`VCPKG_ROOT` 不再需要。（oneTBB 一直没走 vcpkg：其 `tbb` 端口经 `hwloc` 会拖进一整套 msys2（m4/perl/autotools）工具链，与「纯 MSVC」构建冲突。）配置前先：
+
+```bat
+git submodule update --init --recursive
+```
+
 - **配置**：用 `CMakePresets.json`，不必手填 toolchain 与 triplet：
 
 ```bat

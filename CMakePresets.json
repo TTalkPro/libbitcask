@@ -18,17 +18,15 @@
       "hidden": true,
       "inherits": "base",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
-      "cacheVariables": {
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "VCPKG_TARGET_TRIPLET": "x64-windows"
-      },
       "architecture": { "value": "x64", "strategy": "external" },
       "toolset":      { "value": "host=x64", "strategy": "external" },
       "vendor": {
         "note": [
-          "需要环境变量 VCPKG_ROOT（vcpkg 只承载 zlib；oneTBB 走 third_party 子模块",
-          "现编，见 CMakeLists 的 BITCASK_BUNDLED_TBB）。CLion 里在",
-          "Settings > Build > Toolchains 选 Visual Studio 工具链、Architecture=amd64。"
+          "无外部包管理器：全部依赖走 third_party 子模块（zlib 与 oneTBB 现编，",
+          "见 CMakeLists 的 BITCASK_BUNDLED_ZLIB / BITCASK_BUNDLED_TBB）。",
+          "配置前先 git submodule update --init --recursive。",
+          "CLion 里在 Settings > Build > Toolchains 选 Visual Studio 工具链、",
+          "Architecture=amd64。"
         ]
       }
     },

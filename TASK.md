@@ -1348,6 +1348,42 @@ clang 侧告警数 **0**（CI 另有 clang job，确认没引入 clang 独有告
 
 ---
 
+## 依赖来源统一：vcpkg 退场
+
+`vcpkg.json` 已删除。它只列了 zlib 一个依赖，却让 Windows 构建为这一个库就要
+装 vcpkg、设 `VCPKG_ROOT`、拉 `x64-windows` 三元组——而其余七个依赖
+（oneTBB / googletest / benchmark / utf8proc / cppjieba / limonp /
+unordered_dense）早就是子模块。现在 zlib 也是：`third_party/zlib`，钉在 v1.3.1。
+
+**分流不是一刀切**：`BITCASK_BUNDLED_ZLIB` 在 **Windows 默认 ON**，
+**Linux/BSD/macOS 默认 OFF**（仍 `find_package(ZLIB)` 用系统包，行为与既往一字
+不差）。理由是那些平台上 zlib 是基础系统库，且发行版打包明确反对 vendored
+副本——钉死一个版本等于把自己排除在发行版的安全补丁之外。Windows 才是「根本
+没有系统 zlib」的那个平台，也正是 vcpkg 当初存在的唯一理由。规则与既有的
+`BITCASK_BUNDLED_TBB` 完全同构。
+
+**没有用 `add_subdirectory(third_party/zlib)`**（那是本仓库其余子模块的做法）：
+zlib 自带的 CMakeLists 在 out-of-source 构建时会**无条件把源码树里的 `zconf.h`
+改名成 `zconf.h.included`**（其 CMakeLists 第 67-77 行），子模块工作区从此永远
+dirty，`git status` 与 `git submodule update` 都受影响；顺带还建共享库、
+examples、install/pkg-config 规则，一个都不需要。改为自建 15 个 `.c` 的静态
+目标 + `ZLIB::ZLIB` 别名，并对每个源文件做存在性检查——版本升级导致清单对不上
+是**配置期报错**而非静默漏编。实测子模块工作区保持干净。
+
+`enable_language(C)` 只在 bundled 这一支调用：顶层 `project()` 只启用了 CXX，
+而其余 C 依赖（utf8proc）走 `add_subdirectory`、由它自己的 `project()` 启用，
+顶层无感。
+
+Windows 侧还需一并安装 `bitcask_zlib`（合并静态库不含第三方对象），否则静态
+链接的下游装出来的包缺 `crc32` 等符号。
+
+**验证**：删掉整个 build 目录重新配置（原缓存里钉着 vcpkg 工具链），
+msvc-debug 747 全绿。**Linux 侧未复验**——该分支走的是 `find_package`，与改动前
+同一条路径，但仍应跑一次 `gcc-release` 确认 `enable_language(C)` 的条件分支没有
+在非 Windows 上引入意外。
+
+---
+
 ## 当前状态快照
 
 | 项 | 状态 |

@@ -94,6 +94,17 @@ MSVC 等价映射：
 建议 vcpkg manifest（`vcpkg.json`）承载 zlib + TBB，其余保持 submodule。
 cppjieba / limonp 为 header-only，但用了若干类 POSIX 习惯（需实测；预计小修）。
 
+> **本节已被取代，勿照此实施。** 落地时两条都改了：
+> - **TBB** 未走 vcpkg——其端口经 `hwloc` 拖进 msys2 工具链，与「纯 MSVC」冲突，
+>   改为 `third_party/oneTBB` 子模块现编（S37-4）。
+> - **zlib** 后来也退出 vcpkg——它一度是全项目唯一非子模块依赖，却让 Windows
+>   构建为一个库就要装 vcpkg、设 `VCPKG_ROOT`。现改为 `third_party/zlib` 子模块
+>   （v1.3.1），`vcpkg.json` 已删除。
+>
+> 分流规则：**Windows 走子模块现编，Linux/BSD/macOS 仍 `find_package` 用系统
+> zlib**（`BITCASK_BUNDLED_ZLIB`，默认按平台取值）。那些平台上 zlib 是基础系统
+> 库，且发行版打包反对 vendored 副本——安全补丁应由发行版统一推。
+
 ### 1.5 install 规则
 
 `CMakeLists.txt:497-511` 缺 Windows 的 import library 布局：

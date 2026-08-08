@@ -131,7 +131,82 @@ if(BITCASK_WERROR)
     endif()
 endif()
 
-find_package(ZLIB REQUIRED)
+# ---------------------------------------------------------------------------
+# zlib。两种来源，分流规则与上面的 oneTBB 一致：
+#
+# ① 系统/包管理器安装的 zlib（find_package）—— **Linux / BSD / macOS 默认**。
+#    这些平台上 zlib 是基础系统库，`find_package(ZLIB)` 一直就能用；而且发行版
+#    打包明确反对 vendored 副本——安全补丁由发行版统一推，钉死一个子模块版本
+#    反而会把自己排除在补丁之外。此前的行为就是这条，保持不变。
+# ② third_party/zlib 子模块现编（v1.3.1）—— **Windows 默认**，因为那里根本没有
+#    「系统 zlib」这一说。这正是 vcpkg 此前存在的唯一理由：vcpkg.json 只列了
+#    zlib 一个依赖，却要求装 vcpkg、设 VCPKG_ROOT、拉 x64-windows 三元组。
+#    改走子模块后 Windows 的依赖来源与其余平台的其余依赖统一：
+#    `git submodule update --init`，版本钉在本仓库的提交里。
+#
+# 为什么不 add_subdirectory(third_party/zlib) —— 那才是本仓库其余子模块的做法：
+# zlib 自带的 CMakeLists 在 out-of-source 构建时会**把源码树里的 zconf.h 改名成
+# zconf.h.included**（无条件，见其 CMakeLists 第 67-77 行），子模块的工作区从此
+# 永远是 dirty，`git status` 与 `git submodule update` 都要跟着受影响。顺带还会
+# 建共享库、examples、install/pkg-config 规则，我们一个都不要。
+# 自建目标是十几行的事，换掉这些副作用划算。
+#
+# 代价：源文件清单得自己维护。zlib 的文件集多年未变，且下面对每个文件都做了
+# 存在性检查——版本一升导致清单对不上，是**配置期报错**而不是静默漏编。
+# zconf.h 直接用 zlib 仓库自带的那份（无 ./configure 的消费方本来就用它）。
+# ---------------------------------------------------------------------------
+if(WIN32)
+    set(_bitcask_bundled_zlib_default ON)
+else()
+    set(_bitcask_bundled_zlib_default OFF)
+endif()
+option(BITCASK_BUNDLED_ZLIB
+    "从 third_party/zlib 子模块编 zlib，而非 find_package（Windows 默认 ON）"
+    ${_bitcask_bundled_zlib_default})
+
+if(BITCASK_BUNDLED_ZLIB)
+    # 顶层 project() 只启用了 CXX，而 zlib 是 C。其余 C 依赖（utf8proc）走
+    # add_subdirectory，由它自己的 project() 启用 C，顶层无感；这里是顶层直接
+    # add_library(.c)，必须显式启用，否则配置期就报「未知源文件扩展名」。
+    # 只在这一支启用：Linux/BSD 走系统 zlib 时不必平白多探测一个编译器。
+    enable_language(C)
+    set(_bitcask_zlib_dir "${CMAKE_SOURCE_DIR}/third_party/zlib")
+    if(NOT EXISTS "${_bitcask_zlib_dir}/zlib.h")
+        message(FATAL_ERROR
+            "third_party/zlib 未初始化。请运行:\n"
+            "  git submodule update --init third_party/zlib")
+    endif()
+    set(_bitcask_zlib_srcs
+        adler32.c compress.c crc32.c deflate.c gzclose.c gzlib.c gzread.c
+        gzwrite.c infback.c inffast.c inflate.c inftrees.c trees.c uncompr.c
+        zutil.c)
+    set(_bitcask_zlib_abs "")
+    foreach(_f IN LISTS _bitcask_zlib_srcs)
+        if(NOT EXISTS "${_bitcask_zlib_dir}/${_f}")
+            message(FATAL_ERROR
+                "third_party/zlib 里没有 ${_f}——子模块版本与本清单不符。"
+                "核对 zlib 的文件集后更新 CMakeLists 里的 _bitcask_zlib_srcs。")
+        endif()
+        list(APPEND _bitcask_zlib_abs "${_bitcask_zlib_dir}/${_f}")
+    endforeach()
+
+    add_library(bitcask_zlib STATIC ${_bitcask_zlib_abs})
+    add_library(ZLIB::ZLIB ALIAS bitcask_zlib)
+    target_include_directories(bitcask_zlib PUBLIC "${_bitcask_zlib_dir}")
+    # bitcask_shared（bitcask.dll / libbitcask.so）要链它，故必须 PIC。
+    set_target_properties(bitcask_zlib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    # 第三方代码不受本项目的告警纪律约束（同 utf8proc/googletest 的处置）：
+    # 它按自己的标准写就行，不该因为我们开了 /W4 -Werror 而编不过。
+    if(MSVC)
+        target_compile_definitions(bitcask_zlib
+            PRIVATE _CRT_SECURE_NO_DEPRECATE _CRT_NONSTDC_NO_DEPRECATE)
+        target_compile_options(bitcask_zlib PRIVATE /W0)
+    else()
+        target_compile_options(bitcask_zlib PRIVATE -w)
+    endif()
+else()
+    find_package(ZLIB REQUIRED)
+endif()
 
 # ---------------------------------------------------------------------------
 # oneTBB。两种来源：
@@ -809,6 +884,15 @@ install(TARGETS bitcask_shared
 install(TARGETS bitcask_static
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
+# Windows 上 zlib 由子模块现编，于是它成了**我们的产物**。合并静态库不含第三方
+# 对象（见 bitcask_static 上方注释），所以静态链接的下游还得拿到这一份，否则装出来
+# 的包缺 crc32 等符号。Linux/BSD 走系统 zlib（BITCASK_BUNDLED_ZLIB=OFF），
+# ZLIB::ZLIB 是外部 imported target，不该也无法由我们安装。
+if(BITCASK_BUNDLED_ZLIB)
+    install(TARGETS bitcask_zlib
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+endif()
 install(DIRECTORY include/bitcask
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.hpp"

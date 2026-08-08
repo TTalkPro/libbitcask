@@ -101,7 +101,7 @@ cl /DBITCASK_STATIC_LIB app.c /I<c_api 头目录> bitcask_static.lib   :: 静态
 > 剩下的 `std::vector` 那条是常规 C++ ABI 约束（任何按值返回 STL 容器的 C++ 库
 > 都有），不值得为它改 API——按下面的规则用即可。
 
-在 `/MD`（动态 CRT，**CMake 与 vcpkg `x64-windows` 三元组的默认，也是本项目的
+在 `/MD`（动态 CRT，**CMake 的默认，也是本项目的
 构建方式**）下，全进程只有一份 CRT，上述三处都成立。只有当有人把它改成 `/MT`
 并跨模块使用 C++ 头时才会出事。
 
