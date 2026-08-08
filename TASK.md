@@ -772,10 +772,11 @@ Windows 实现，单跑 5/5 全过、`ctest -j 8` 下偶发失败。两处原因
 1. `.github/workflows/ci.yml` 加 `windows-2022` job（MSVC Release + 全量 ctest）。
 2. 加 `BITCASK_SIMD_MAX` 矩阵（scalar/avx2/avx512），覆盖所有 ISA 档位对拍。
 3. `/WX` 清理收口；bench 对拍（Linux vs Windows 同档）。
-   > **Linux 侧的 `-Werror` 已于 2026-08-08 提前结清**（见 P 段复验记录 ④）：
-   > `werror-lib` 此前从 v6.1.0 起就没绿过，14 条已全部修根因，`src/`+`include/`+
-   > `c_api/` 告警面归零。本项在 Linux 侧只剩 `tests/`+`bench/` 的告警（18 个文件，
-   > 该 job 不构建）。MSVC 的 `/WX` 仍未开，账见 S37-4 落地记录的 94 条。
+   > **Linux 侧的 `-Werror` 已于 2026-08-08 全部结清**（见 P 段复验记录 ④⑤）：
+   > `werror-lib` 此前从 v6.1.0 起就没绿过。库 14 条 + tests/bench 118 条共
+   > **132 条全部修根因**（无一个 `-Wno-*`），现在 `BITCASK_WERROR=ON` +
+   > `BUILD_TESTING=ON` + benchmarks 的整树零错误零告警，clang 侧同样 0。
+   > **本项在 Linux 侧已无剩余工作**；MSVC 的 `/WX` 仍未开，账见 S37-4 的 94 条。
 4. 文档：README 加 Windows 构建段、`doc/format-zh.md` 补持久性机制差异、CHANGELOG。
 
 > ⚠️ **需明确承认的护栏损失**：Windows/MSVC **无 TSan**（ASan 有，UBSan 无）。
@@ -1140,18 +1141,50 @@ v6.1.0 基线（另起 worktree 实测）同样红，且比 HEAD 多两条
 | `seq_shard_table.hpp` | 2 | `-Wclass-memaccess` | `memset` 清桶数组。`Bucket` 只因带**默认成员初始化器**而「非平凡默认构造」，但它**平凡可复制**，全零字节就是合法空桶。收进 `zero_buckets()`：`static_assert(is_trivially_copyable_v<Bucket>)` 把真正依赖的性质钉死 + 转 `void*` 消告警，生成代码不变 |
 
 **结果：`src/` + `include/` + `c_api/` 的告警面归零**（干净树 `-Werror` 库构建
-0 错误 0 告警，13 个静态库 + `libbitcask.so.6.1.0` 全部产出）。Debug 树里剩余的
-告警**全部落在 `tests/` 与 `bench/`**（18 个文件），而 `werror-lib` 不构建它们
-—— 要不要一并清，是独立取舍。
-
-> ⚠️ 本地只有 g++ 14.2，CI 用 **g++-13**。修的都是 `-Wshadow`/`-Wunused-parameter`/
-> `-Wconversion`/`-Wmissing-field-initializers`/`-Wclass-memaccess`/`-Wcomment`
-> 这类两个版本都有的老告警，且是修根因不是压制，g++-13 上应同样成立；
-> 但「g++-13 有而 g++-14 没有的告警」这一可能性本地照不到，以 CI 首跑为准。
+0 错误 0 告警，13 个静态库 + `libbitcask.so.6.1.0` 全部产出）。
 
 **改动落在 seqlock 头与公开头上，故全矩阵复跑**：gcc/clang Debug 各 **749/749**、
 Release+LTO+bench 编译、ASan **749/749**、TSan **747/747**（按 CI 豁免）、
 干净树 `-Werror` 构建 —— 全绿。
+
+**⑤ `tests/` + `bench/` 的告警一并清完（2026-08-08，CI 编译器确认为 g++ 14.2）**
+
+上一步只清了库；测试与 bench 还有 **118 条**（26 个文件）。全部清完，现在
+`BITCASK_WERROR=ON` + `BUILD_TESTING=ON` + `BITCASK_BUILD_BENCHMARKS=ON`
+的干净树**整树零错误零告警**，Debug 与 Release 两棵普通树也各自 **0 告警**。
+
+分布与修法（同样是修根因，**全程没有加一个 `-Wno-*`**）：
+
+| 类别 | 条数 | 修法 |
+|---|---|---|
+| `-Wmissing-field-initializers` | 39 | **不在 39 个调用点改，而在 4 个声明处改。** GCC 只对**没有默认成员初始化器**的成员报此警，而被点名的恰好就是那几个：`AnalyzerConfig::{stop_words,dict_path}`、`SearchLayerConfig::synonym_map`、`SegmentView::pin`、`MultiFieldSegmentView::pin`。补 `{}` 后语义分毫不变（本来就默认构造成空），却一次消掉全部，且以后新增指派初始化点不会再犯 |
+| `-Wsign-conversion` | 43 | 清一色「`int` 循环变量去索引容器」。**逐点判断**：只当下标的改 `std::size_t`（`kLibs`/`kPerLib`/`kN`/`kThreads` 等常量随之）；同时要喂给收 `int` 的函数的，保持 `int` 而在下标处显式转换；`mt19937_64` 的种子、`Cask::put` 的 tstamp 这类收 `uint64` 的，循环变量直接用 `uint64_t` |
+| `-Wunused-result` | 22 | **按站点性质分三类**：① 测试 setup 的 `put`/`remove`/`load_from_file` —— 失败则后续断言全无意义，改 **`ASSERT_TRUE`**（不是 `(void)`）；② bench setup 的 `put`/`put_doc` —— 走既有的 `state.SkipWithError` 形态；③ teardown 的 `unregister_lib` —— 显式 `(void)`。`thread_pool_test` 那处 `unregister_lib(a)` 注释本就写着「a 排空并注销」，返回值就是「是否排空」，改成 `EXPECT_TRUE` 断言它 |
+| `-Wold-style-cast` | 4 | `(double)` / `(int)` → `static_cast` |
+| `-Wdangling-else` | 4 | `if (c) ASSERT_XX(...)` 裸挂——gtest 宏内部展开出 `if/else`，加花括号 |
+| `-Wcomment` | 2 | 同 ① 的形态：注释里引用 shell 命令时行尾留了 `\`（bench/inverted_bench、checkpoint_recovery_test）。改成不靠续行符 |
+| `-Wunused-function` / `-Wunused-but-set-variable` | 2 | **删死代码**：`ivf_rq_test` 的 float 版 `brute_topk`（召回门用的是 `brute_topk_int8`，其注释写明必须与段内核同一算式穷举对拍——留一个 float 版正是"拿错真值"的入口，仓库已记过这个坑）；`tests/support/search_layer.cpp` 里从未被调用的 `add_byte_sec` 与其缓冲 |
+| `-Wformat-truncation` | 1 | `range_bench` 的 `char kb[16]` 装不下 `"g" + %06zu`（最坏 20 位）→ 32 |
+| `-Wconversion` | 1 | `gate_bench` 的 `(rss_after-rss_before)*1024` 隐式转 double |
+
+**两个值得记下的坑**：
+1. **C 里 `(void)` 压不住 `warn_unused_result`。** `c_api_test.c` 已经写着
+   `(void)system(cmd);` 却照样告警——GCC 的 `warn_unused_result` 属性与 C++ 的
+   `[[nodiscard]]` 不同，`(void)` 转换对它无效，必须真的接住返回值。
+   `fread` 同理（glibc 也用该属性）。
+2. **把「忽略返回值」改成「断言返回值」是有风险的改动**，因为原先可能一直在
+   静默失败。故本轮不是只看能不能编——全矩阵实跑确认这些新断言都成立。
+
+**顺带对齐 `ci.yml`**：`release` / `werror-lib` / `benchmark` 三个 job 原本显式
+`apt install g++-13` 并 `-DCMAKE_CXX_COMPILER=g++-13`，与实际使用的 **g++ 14.2**
+不符（ubuntu-24.04 默认也是 13，所以这三个 job 一直在按 13 编）。已统一改为
+`g++-14`，ccache key 同步换名（`*-gcc13` → `*-gcc14`，避免命中旧编译器的缓存）。
+本轮全部验证都是在 g++ 14.2 上做的，改完之后 CI 看到的就是同一个编译器。
+
+**验收**：`-Werror` 全树（库 + 40 个测试 exe + bench）**0 错误 0 告警**；
+Release+tests+bench+`-Werror` 树 ctest **749/749**；gcc Debug **749/749**、
+clang Debug **749/749**、ASan **749/749**、TSan **747/747**（按 CI 豁免）；
+clang 侧告警数 **0**（CI 另有 clang job，确认没引入 clang 独有告警）。
 
 ### 明确不做
 
@@ -1185,7 +1218,7 @@ Release+LTO+bench 编译、ASan **749/749**、TSan **747/747**（按 CI 豁免�
 | P 段 P1 `.prev` 轮转收进 seam | [done]（4 处；立项理由被实测推翻，改按纪律做。**Linux 已复验**）|
 | P 段 P2 读路径改走定位读 | [done]（原计划是写路径缓冲层，实测把靶心改到 2 GiB 天花板。**Linux 已复验**，2.54 GiB 用例走稀疏文件 3 ms 实跑未跳过）|
 | **Linux 全面复验（P 段 + S37-4/5 遗留）** | ✅ done（2026-08-08）：Debug g++/clang 各 **749/749**、Release+LTO 编译、**ASan 749/749**、**TSan 747/747**、干净树 configure、守门脚本。查出 1 条真回归（`-Wcomment` 打断 `werror-lib`，已修）+ 1 个过窄断言（已修）；TSan 那条失败是预存 CI 豁免项，已用 v6.1.0 基线对拍证否 |
-| **`werror-lib` 修复（S37-7.3 的 Linux 半边）** | ✅ done（2026-08-08）：该 job 自 v6.1.0 起从未绿过。14 条分四轮全部修根因（无 `-Wno-*`），`src/`+`include/`+`c_api/` 告警面归零；干净树 `-Werror` 构建 0 错误 0 告警。改动含 seqlock 头与公开头，已全矩阵复跑全绿 |
+| **`werror-lib` 修复（S37-7.3 的 Linux 半边）** | ✅ done（2026-08-08）：该 job 自 v6.1.0 起从未绿过。库 14 条 + tests/bench 118 条，**共 132 条全部修根因**（无一个 `-Wno-*`）。现在 `BITCASK_WERROR=ON`+`BUILD_TESTING=ON`+benchmarks 的干净树整树 0 错误 0 告警，clang 侧亦 0。改动含 seqlock 头与公开头、且把多处「忽略返回值」改为断言，已全矩阵复跑：Release+`-Werror` 749/749、gcc/clang Debug 各 749/749、ASan 749/749、TSan 747/747 |
 | P 段 P3–P4 | [todo] 未开始（W5 已于 6ad5b4b 结清）|
 
 ### 待确认项
