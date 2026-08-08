@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.1.0`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.2.0`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
@@ -14,7 +14,61 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ---
 
-## [6.1.0] - 未发布
+## [6.2.0] - 2026-08-08（S37：Windows 移植——MSVC 原生 · x64；P3/P4 I/O 稳健性收口）
+
+> **版本语义**：C API 零变化——函数签名、枚举值、结构体布局全部零改动 →
+> MINOR +1，**`SOVERSION` 保持 `6`**（`.so.6` 不换号，下游无需重新链接）。
+> 盘上格式零变化（无 flag-day、无迁移）。
+
+### Added
+
+- **Windows 平台支持（S37，MSVC 原生 ABI · x64）**，子任务全数交付：
+  - **S37-1 io seam**——全库裸 POSIX 调用（`::open` / `::fstat` /
+    `::fdatasync` / `::rename` / `::mmap` / `::sysconf` …）收进 `bitcask::io`，
+    Linux 行为零变化；换平台 = 换一个后端文件。seam 补齐
+    `io::atomic_rename`（Windows 上 `std::rename` 目标存在即失败，9 个
+    原子写站点全员改道）、`PosixFile::size() / truncate() / identity()`、
+    `io::sync_data / sync_directory()`、`MappedFile::prefetch`、`io::page_size`。
+  - **S37-3 `bitcask_simd`**——运行时 CPUID/XGETBV 探测 + `BITCASK_SIMD_MAX`
+    档位钳制（替代 MSVC 不支持的 `__builtin_cpu_supports`）；SIMD 内核按
+    ISA 分 TU（S37-3.b），`-m` / `/arch:` 一一对应，规避 PCH 选项不一致。
+  - **S37-4 构建适配 MSVC 工具链**——`/utf-8`、`/bigobj`、`/permissive-`、
+    `/Zc:preprocessor`、`/Zc:__cplusplus`、`NOMINMAX` / `WIN32_LEAN_AND_MEAN`
+    全局开关；CRT 模型检查（/MT 跨模块跨堆释放告警）；合并静态库改原生
+    `$<TARGET_OBJECTS:>`（顺带补回此前漏掉的 bitcask_simd 对象），Windows
+    下改名 `bitcask_static.lib` 避免与导入库撞名；`CMakePresets.json` 覆盖
+    Windows（debug/release/asan）与 Linux 全部常用配置。
+  - **S37-5 Windows I/O 后端**——`src/io/win32_file.cpp` 落地，io seam 在
+    Windows 侧有实现，链接期目标不再缺符号。
+  - **S37-6 文件删除/替换**——Windows 上打开中的文件不再阻塞重命名/删除
+    （file_lock、`.prev` 轮转、merge 迁移全部改经 seam）。
+  - **zlib 子模块化（v1.3.1）+ 移除 vcpkg**——Windows 构建不再需要
+    vcpkg / `VCPKG_ROOT` / `x64-windows` 三元组，依赖来源与其余平台统一、
+    版本钉在提交里；Linux / BSD / macOS 维持系统 `find_package(ZLIB)`。
+- **解除 Windows 单文件 2 GiB 上限（P2）**：写路径偏移全 64 位，与 Linux 对齐。
+
+### Changed
+
+- 库边界不再跨模块传递 `FILE*`（W5）：C I/O 两路只交换内核句柄，`FILE*`
+  的生成与拆解在调用方模块内完成——最后一处长驻 `FILE*` 退役。
+- `.prev` 轮转与 vec 追加目标身份（dev/ino）校验改走 io seam（P1）。
+- CI 工具链 GCC 13 → **14**（Release 全量），配套清掉 GCC 14 新增告警
+  （`-Wmissing-field-initializers` 聚合默认初始化、数据面/OKI/搜索/插件/
+  bench 各套件）；`BITCASK_WERROR` 库构建在 GCC 14 下保持全绿。
+
+### Fixed
+
+- **撕裂尾部（torn tail）覆盖（P3）**：写入偏移锚定到最后一个完整 record，
+  崩溃 / 掉电后尾部半条 record 不再被当作有效数据；「丢写导致字段 id
+  漂移」一并修复。
+- **Win32 错误码泄漏（P4）**：`GetLastError` 不再污染 C API 的 `errno`
+  字段，调用方拿到的始终是 POSIX 语义错误码。
+- **窄路径 UTF-8 双端对齐（P0，关 W4）**：`std::filesystem` 窄字符路径在
+  输入 / 输出两侧统一按 UTF-8 处理（Windows 内部 UTF-16），并扩充测试覆盖。
+
+---
+
+## [6.1.0] - 2026-08-06（OKI 不可用拆码：kNoIndex / kIndexRebuildFailed）
 
 > **版本语义**：C API 纯增量——`bitcask_error_t` 尾部追加一个枚举值，
 > 既有值与函数签名、结构体布局零改动 → MINOR +1，**`SOVERSION` 保持
