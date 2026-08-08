@@ -364,6 +364,9 @@ void sync_directory(const std::string& path) noexcept {
     }
 }
 
+// P4：POSIX 下 std::filesystem 的 error_code 本就装 errno，恒等即可。
+int errno_of_native(int native_error) noexcept { return native_error; }
+
 std::size_t page_size() noexcept {
     const long ps = ::sysconf(_SC_PAGESIZE);
     return ps > 0 ? static_cast<std::size_t>(ps) : 4096u;

@@ -658,6 +658,12 @@ void sync_directory(const std::string& path) noexcept {
     (void)path;
 }
 
+// P4：把 std::filesystem 的 Win32 error_code 翻成 errno。见 io.hpp 的声明注释。
+int errno_of_native(int native_error) noexcept {
+    if (native_error == 0) return 0;
+    return errno_of(static_cast<DWORD>(native_error));
+}
+
 std::size_t page_size() noexcept {
     SYSTEM_INFO si{};
     ::GetSystemInfo(&si);

@@ -1,6 +1,7 @@
 // M3.2 unit tests for the bitcask directory scanner.
 
 
+#include <cerrno>
 #include <cstdio>
 #include "support/test_paths.hpp"
 #include <filesystem>
@@ -9,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include "bitcask/detail/path_utf8.hpp"
 #include "bitcask/detail/scanner.hpp"
 
 using bitcask::fileops::scan_dir;
@@ -50,10 +52,23 @@ TEST(Scanner, EmptyDirectory) {
 }
 
 TEST(Scanner, MissingDirectoryReturnsError) {
-    auto r = scan_dir(bitcask::test::nonexistent_path().string());
+    auto r = scan_dir(bitcask::detail::to_utf8(bitcask::test::nonexistent_path()));
     ASSERT_FALSE(r);
     EXPECT_EQ(r.error().kind, ScanError::kCannotOpenDir);
-    EXPECT_NE(r.error().errnum, 0);
+
+    // P4：断言**具体的 errno**，不是「非零」。
+    //
+    // 原先只断 errnum != 0，而 Windows 上这里装的是 Win32 码，非零同样成立——
+    // 于是这条链一路错到 C API 都没人发现：ScanFault.errnum → cask_recovery 的
+    // io_fault → CaskFault → c_api 的 errnum，而那个字段的公开契约写的是
+    // 「errno 值」（c_api/bitcask_kv.h）。MSVC 下 std::filesystem 的 error_code
+    // 是 system_category，目录不存在给 3 = ERROR_PATH_NOT_FOUND，按 errno 读
+    // 就是 ESRCH「没有这个进程」。Linux 上同样场景给 ENOENT(2)。
+    //
+    // 这条断言在两个平台上都必须是 ENOENT——那正是 io::errno_of_native 的职责。
+    EXPECT_EQ(r.error().errnum, ENOENT)
+        << "errnum 契约是 errno；拿到 " << r.error().errnum
+        << " 多半是 Win32 码直接漏了出来";
 }
 
 TEST(Scanner, FindsDataFilesAndSortsByTstamp) {

@@ -58,6 +58,22 @@ scan 'std::remove\s*\(\s*[a-z_]' \
 scan 'std::(fseek|ftell)\s*\(' \
      'std::fseek/ftell 的 long 偏移在 Windows 上是 2 GiB 天花板。定位读用 io::pread_all（收 uint64），写路径用 bitcask::detail::fseek64()。' || rc=1
 
+# P4：全库所有 errnum 字段都是 errno（C API 的公开契约），但 MSVC 下
+# std::filesystem 的 error_code 是 system_category，装 Win32 码。目录不存在
+# 给 3（ERROR_PATH_NOT_FOUND），按 errno 读成 ESRCH。必须过 io::errno_of_native。
+ecval=$(grep -rnE '\b(ec|rm_ec|sec|[a-z_]+_ec)\.value\(\)' \
+          --include='*.cpp' --include='*.hpp' --include='*.h' src include c_api 2>/dev/null \
+        | grep -vE "^($ALLOW):" \
+        | grep -vE ':[0-9]+: *//' \
+        | grep -v 'errno_of_native')
+if [[ -n "$ecval" ]]; then
+    echo "FAIL: error_code::value() 在 Windows 上是 Win32 码，不是 errno。"
+    echo "   要进 errnum 类字段须先过 io::errno_of_native()。"
+    echo "$ecval" | sed 's/^/   /'
+    echo
+    rc=1
+fi
+
 # ---------------------------------------------------------------------------
 # 隐式转换 —— P1 期间发现，上面四条都抓不到它。
 #

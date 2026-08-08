@@ -138,6 +138,25 @@ struct IoError {
     int errnum = 0;
 };
 
+// ---------------------------------------------------------------------------
+// 原生错误码 → errno（P4）。
+//
+// **全库约定：所有叫 `errnum` 的字段一律是 errno**，`c_api/bitcask_kv.h` 把这
+// 条写进了公开契约（"errnum = errno 值"）。seam 自身一直守着它——Windows 后端
+// 的每条错误路径都经 `errno_of(GetLastError())` 翻译。
+//
+// 但 `std::filesystem` 的 `std::error_code` **不守**：MSVC 下它是
+// `system_category`，装的是 **Win32 码**。实测（P4.0）：
+//   目录不存在      → ec.value() == 3   （ERROR_PATH_NOT_FOUND）
+//                     按 errno 读就是 ESRCH「没有这个进程」，本该是 ENOENT(2)
+//   把文件当目录开  → ec.value() == 267 （ERROR_DIRECTORY），errno 里根本没有
+// Linux 上同样场景给的是 ENOENT，于是同一个字段在两个平台上含义不同。
+//
+// 所以凡是 `std::error_code` 的值要流进 `errnum` 类字段的，必须先过这里。
+// POSIX 后端是恒等（那边 ec.value() 本就是 errno）。
+// ---------------------------------------------------------------------------
+[[nodiscard]] int errno_of_native(int native_error) noexcept;
+
 // pread / read 的结果：要么读到了字节（可能短读），要么 EOF，要么报错。
 // EOF 单独走 ReadEof 是因为 NIF 那边返回的是 atom 'eof'（不是 {ok, <<>>}），
 // 必须在类型层面就把这两种情况区分开，避免下游误把 0 字节当成「合法空读」。

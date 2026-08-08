@@ -19,7 +19,14 @@ scan_dir(std::string_view dirname) {
     if (ec) {
         // 目录无法打开就报错——open 阶段就需要这个信息。后面的迭代错误
         // 都视作「能扫多少算多少」。
-        return std::unexpected(ScanFault{ScanError::kCannotOpenDir, ec.value()});
+        //
+        // P4：**必须翻译**，不能塞 ec.value()。ScanFault.errnum 一路流到
+        // cask_recovery 的 io_fault → CaskFault → C API 的 errnum，而那个字段
+        // 的公开契约是 errno。MSVC 下 fs 的 error_code 是 system_category，
+        // 装的是 Win32 码：目录不存在给 3（ERROR_PATH_NOT_FOUND），按 errno
+        // 读成 ESRCH「没有这个进程」。见 io::errno_of_native。
+        return std::unexpected(
+            ScanFault{ScanError::kCannotOpenDir, io::errno_of_native(ec.value())});
     }
 
     std::vector<DataFileEntry> out;

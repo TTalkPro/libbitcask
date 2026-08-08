@@ -1127,7 +1127,52 @@ reopen#3: open() = FALSE (硬失败)              ← 下次打开直接硬失�
 **复验**：干净树 `-Werror` 全树 0 告警、ctest **750/750**；gcc/clang Debug 各
 **750/750**；ASan **750/750**；TSan **748/748**（按 CI 豁免）；Release+LTO+bench 编译。
 
-### P4 · 错误模型：**收窄，不做统一** [todo]
+### P4 · 错误模型 [done]（「收窄」的结论保留，但收窄后剩下的那一处是个真 bug）
+
+**「不做大统一」的结论成立，可查证据时发现留下的缝里漏着一个违反公开契约的
+错误码。**
+
+立项时估「真正消费 `ec` 的只有 4 处」，重新扫是 15 处以上，且**大多已经在做
+正确的事**——`scanner.cpp` 翻成 `ScanFault`、`cask.cpp` 翻成 `CaskError::kIo`、
+`migrate.cpp` 翻成 `std::unexpected(ec.message())`。`std::error_code` 在这些
+站点是 fs:: 调用旁的**局部机制**，当场翻成本模块的错误类型，并没有「两套模型
+跨 API 并存」的问题。所以维持原结论：**不把 37 处 `error_code` 统一成
+`IoError`**，尽力清理的 `fs::remove(p, ec)` 保持原样——统一成 `IoError` 再原样
+忽略，只是把噪音换个写法。
+
+**但翻译里有一处是错的。** `scanner.cpp` 把 `ec.value()` **原样**塞进
+`ScanFault.errnum`，而那个值一路流到公开 API：
+
+```
+scan_dir -> ScanFault.errnum -> cask_recovery.cpp io_fault() -> CaskFault
+         -> c_api/internal.h -> c_api/bitcask_kv.h 的 int errnum
+```
+
+而 `bitcask_kv.h:91` 写的是 `// errno 值（IO 错误时有效，否则 0）`。实测
+（P4.0，MSVC，`ec.category()` 是 `system`）：
+
+| 场景 | `ec.value()` | 按 errno 解读 | 应当是 |
+|---|---|---|---|
+| 目录不存在（最常见的 open 失败）| 3 = `ERROR_PATH_NOT_FOUND` | **`ESRCH`「没有这个进程」** | `ENOENT`(2) |
+| 把普通文件当目录 | 267 = `ERROR_DIRECTORY` | errno 里没有对应值 | `ENOTDIR`(20) |
+
+Linux 上同样场景给 `ENOENT`，所以这是**同一字段在两个平台上含义不同**。seam
+自身一直守着契约（Windows 后端每条错误路径都过 `errno_of(GetLastError())`），
+漏的是 `std::filesystem` 这条旁路。
+
+**落地**：
+
+- 新增 `io::errno_of_native(int)`：Windows 后端委托既有的 `errno_of(DWORD)`，
+  POSIX 后端恒等（那边 `ec.value()` 本就是 errno）。放在 seam 里，因为 seam
+  本来就是 Win32→errno 翻译的归属地。取 `int` 而非 `std::error_code`，是为了
+  不把 `<system_error>` 拖进 `io.hpp`（那个头只包 8 个标准头，很克制）。
+- `scanner.cpp` 的唯一一处 `ec.value()` 过翻译。全库再无第二处。
+- 守门加一条：`error_code::value()` 未经 `errno_of_native` 不得出现。
+- `Scanner.MissingDirectoryReturnsError` 从 `EXPECT_NE(errnum, 0)` 收紧为
+  `EXPECT_EQ(errnum, ENOENT)`。**原断言正是这个 bug 活下来的原因**——Win32 码
+  同样满足「非零」。
+
+**验证**：msvc-debug 747 全绿。
 
 13 个文件用 `std::error_code`，但绝大多数是 `fs::remove(p, ec)` 这种**尽力而为、
 `ec` 根本不看**的清理。把它们统一成 `IoError` 再原样忽略，是把噪音换个写法，
@@ -1323,7 +1368,7 @@ clang 侧告警数 **0**（CI 另有 clang job，确认没引入 clang 独有告
 | **Linux 全面复验（P 段 + S37-4/5 遗留）** | ✅ done（2026-08-08）：Debug g++/clang 各 **749/749**、Release+LTO 编译、**ASan 749/749**、**TSan 747/747**、干净树 configure、守门脚本。查出 1 条真回归（`-Wcomment` 打断 `werror-lib`，已修）+ 1 个过窄断言（已修）；TSan 那条失败是预存 CI 豁免项，已用 v6.1.0 基线对拍证否 |
 | **`werror-lib` 修复（S37-7.3 的 Linux 半边）** | ✅ done（2026-08-08）：该 job 自 v6.1.0 起从未绿过。库 14 条 + tests/bench 118 条，**共 132 条全部修根因**（无一个 `-Wno-*`）。现在 `BITCASK_WERROR=ON`+`BUILD_TESTING=ON`+benchmarks 的干净树整树 0 错误 0 告警，clang 侧亦 0。改动含 seqlock 头与公开头、且把多处「忽略返回值」改为断言，已全矩阵复跑：Release+`-Werror` 749/749、gcc/clang Debug 各 749/749、ASan 749/749、TSan 747/747 |
 | P 段 P3 field_schema 退掉长期 FILE* | [done]（顺带修掉未检查的写导致的 id 错位；adopt_stream 删除）。**Linux 已复验**：`-Werror` 全树 0 告警 + gcc/clang/ASan 各 749/749 + TSan 747/747 + 双树；偏移追踪实测正确。另查实一个 torn-tail 隐患为**预存**（P3 前后输出逐字相同），见 P3 复验记录 |
-| P 段 P4 错误模型 | [todo] 未开始（结论仍是「收窄，不做统一」）|
+| P 段 P4 错误模型 | [done]（不做大统一的结论保留；修掉 ScanFault.errnum 漏 Win32 码到 C API）|
 
 ### 待确认项
 
