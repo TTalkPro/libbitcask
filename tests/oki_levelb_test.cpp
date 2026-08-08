@@ -372,7 +372,7 @@ TEST_F(OkiLevelBTest, ConcurrentWorkloadUnderEvictionZeroDrift) {
     std::vector<std::thread> ts;
     for (int w = 0; w < 2; ++w) {
         ts.emplace_back([&, w] {
-            std::mt19937_64 rng(w + 1);
+            std::mt19937_64 rng(static_cast<std::uint64_t>(w) + 1);
             for (int i = 0; i < 1500; ++i) {
                 const std::string k = "c" + std::to_string(rng() % 800);
                 if (rng() % 5 == 0) {
@@ -386,7 +386,7 @@ TEST_F(OkiLevelBTest, ConcurrentWorkloadUnderEvictionZeroDrift) {
     }
     for (int r = 0; r < 2; ++r) {
         ts.emplace_back([&, r] {
-            std::mt19937_64 rng(100 + r);
+            std::mt19937_64 rng(100 + static_cast<std::uint64_t>(r));
             while (!stop.load()) {
                 auto g = (*c)->get_owned(
                     bytes("c" + std::to_string(rng() % 800)));
@@ -547,7 +547,7 @@ TEST_F(OkiLevelBTest, B1CheckpointNeverOutrunsDataFsync) {
     for (int i = 0; i < kBefore; ++i) {
         auto g = (*c)->get_owned(bytes("b1-" + std::to_string(i)));
         ASSERT_TRUE(g.has_value()) << "checkpoint 覆盖的键必须幸存 i=" << i
-                                   << " err=" << (int)g.error().kind;
+                                   << " err=" << static_cast<int>(g.error().kind);
         EXPECT_EQ(std::string(reinterpret_cast<const char*>(g->value.data()),
                               g->value.size()),
                   val_of(i));
@@ -599,7 +599,7 @@ TEST_F(OkiLevelBTest, CrashRightAfterMergeKeepsEvictedKeysReadable) {
     for (int i = 0; i < kKeys; ++i) {
         auto g = (*c)->get_owned(bytes("cm" + std::to_string(i)));
         ASSERT_TRUE(g.has_value())
-            << "i=" << i << " err=" << (int)g.error().kind
+            << "i=" << i << " err=" << static_cast<int>(g.error().kind)
             << "（搬迁行未固化即 unlink 会在此悬空）";
         const std::string want =
             (i < kKeys / 2) ? val_of(i) + "!" : val_of(i);
@@ -677,13 +677,13 @@ TEST_F(OkiLevelBTest, MergeUnderEvictionManyRoundsNoKeyLoss) {
         // 覆盖随机 1/8（制造死字节 + 逐出扰动）。
         for (int j = 0; j < kKeys / 8; ++j) {
             const int i = static_cast<int>(rng() % kKeys);
-            ver[i] = round;
+            ver[static_cast<std::size_t>(i)] = round;
             ASSERT_TRUE((*c)->put(
                 bytes("mr" + std::to_string(i)),
                 bytes(val_of(i) + "#" + std::to_string(round)), 1000))
                 << "round " << round;
         }
-        if (round % 50 == 0) ASSERT_TRUE((*c)->checkpoint());
+        if (round % 50 == 0) { ASSERT_TRUE((*c)->checkpoint()); }
         auto ms = (*c)->merge();
         ASSERT_TRUE(ms) << "round " << round;
         if (round % 100 == 0) {  // 周期全量对拍
@@ -694,7 +694,7 @@ TEST_F(OkiLevelBTest, MergeUnderEvictionManyRoundsNoKeyLoss) {
                     std::string(
                         reinterpret_cast<const char*>(g->value.data()),
                         g->value.size()),
-                    val_of(i) + "#" + std::to_string(ver[i]));
+                    val_of(i) + "#" + std::to_string(ver[static_cast<std::size_t>(i)]));
             }
             ASSERT_EQ(kd.info().key_count, static_cast<std::uint64_t>(kKeys))
                 << "round " << round;

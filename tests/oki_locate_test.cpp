@@ -678,7 +678,7 @@ TEST_F(OkiLocateTest, ConcurrentColdReadsWithWriterAndEvictor) {
     std::vector<std::thread> readers;
     for (int t = 0; t < 2; ++t) {
         readers.emplace_back([&, t] {
-            std::mt19937_64 rng(100 + t);
+            std::mt19937_64 rng(100 + static_cast<std::uint64_t>(t));
             while (!stop.load()) {
                 const std::string k = "s" + std::to_string(rng() % 100);
                 auto g = (*c)->get_owned(bytes(k));

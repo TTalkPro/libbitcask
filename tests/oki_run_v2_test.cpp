@@ -105,7 +105,8 @@ std::vector<Row> make_rows(int n) {
             r.loc.total_sz = static_cast<std::uint32_t>(64 + i % 512);
             r.loc.offset = static_cast<std::uint64_t>(i) * 128;
             // 有意非单调：偶数行时间倒退，钉死回绕差分。
-            r.loc.tstamp = (i % 2 == 0) ? 2'000'000ull - i : 1'000'000ull + i;
+            const auto iu = static_cast<std::uint64_t>(i);
+            r.loc.tstamp = (i % 2 == 0) ? 2'000'000ull - iu : 1'000'000ull + iu;
         }
         rows.push_back(std::move(r));
     }
@@ -196,7 +197,7 @@ TEST(OkiRunV2, SeekCarriesLoc) {
         ASSERT_TRUE(n.has_value() && *n);
         EXPECT_EQ(e.key, rows[i].key);
         EXPECT_EQ(e.has_loc, rows[i].has_loc);
-        if (rows[i].has_loc) EXPECT_EQ(e.loc.offset, rows[i].loc.offset);
+        if (rows[i].has_loc) { EXPECT_EQ(e.loc.offset, rows[i].loc.offset); }
     }
 }
 
