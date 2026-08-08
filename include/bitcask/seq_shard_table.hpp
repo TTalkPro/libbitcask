@@ -419,10 +419,19 @@ private:
     static inline bool opt_bytes_equal(const void* shared,
                                        const void* own,
                                        std::size_t n) noexcept {
-        // 8 字块比较:__builtin_memcpy 定长 8 → 单条(非对齐)mov,别名豁免、
-        // 无 libcall(std::memcmp 是真实 libc 调用,会被 TSan 拦截器记录,
-        // 函数级 no_sanitize 压不住——实测报 race)。shared 侧可能是脏数据,
+        // 8 字块比较:定长 8 的 memcpy → 单条(非对齐)mov,别名豁免、无 libcall
+        // (std::mem**cmp** 是真实 libc 调用,会被 TSan 拦截器记录,函数级
+        // no_sanitize 压不住——实测报 race)。shared 侧可能是脏数据,
         // 结果由 caller 的 seq 校验背书。
+        //
+        // S37-3.b 把这里的 `__builtin_memcpy` 换成了 `std::memcpy`(MSVC 无
+        // `__builtin_memcpy`)。看着像是违反了上一段的禁令,**实测不是**:
+        // 禁的是 `memcmp`/变长 `memcpy` 那种真会落成 libcall 的形态,而
+        // **定长 8** 的 `std::memcpy` 两个编译器都直接内联。实测(2026-08-08)
+        // g++ 14.2 / clang 均在 -O0 与 -O2 下 libcall 数为 0,且与
+        // `__builtin_memcpy` 版的指令序列逐条一致(仅标签名与一处调度差异)。
+        // 换言之此处**不是** TSan 拦截器的暴露点——别改回去,也别顺手把下面
+        // 的循环"简化"成 `std::memcmp`,那才会真的触发上一段说的问题。
         const auto* x = static_cast<const unsigned char*>(shared);
         const auto* y = static_cast<const unsigned char*>(own);
         std::uint64_t acc = 0;

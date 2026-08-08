@@ -67,8 +67,13 @@
 // BITCASK_TSAN_ENABLED —— 是否在 TSan 插桩构建下（1/0）。
 //
 // S37-4：替代原先散在 8 个文件里的
-//   #if defined(__SANITIZE_THREAD__) || \
-//       (defined(__has_feature) && __has_feature(thread_sanitizer))
+//   #if defined(__SANITIZE_THREAD__)
+//       || (defined(__has_feature) && __has_feature(thread_sanitizer))
+//
+// （引文刻意**去掉了原来的行尾续行反斜杠**：`\` 出现在 `//` 行末会把下一行
+//  拼进本注释——即 `-Wcomment`，而 CI 的 werror-lib job 带 `-Werror`，于是这
+//  条注释本身会让 Linux 库构建失败。本头经 bitcask_format PUBLIC 传播，一处
+//  中招就是几十个 TU 中招。写成两行、`||` 前置，语义不变且不再需要反斜杠。）
 //
 // **那个写法在符合标准的预处理器下是语法错误**，不只是「MSVC 方言问题」：
 // `__has_feature` 未定义时，标准要求先把整个 #if 表达式做宏替换、把剩余
