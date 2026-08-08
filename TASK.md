@@ -820,14 +820,14 @@ S37-7 (1.5周) ───── CI + 收尾
 | T8 | 搜索读屏障无界等待（`prepare_search` 饥饿）| ⏸ 4 项前置未满足（原文 62789cd）|
 | T12 | HNSW ckpt 去重（~115 行）| ⏸ 默认不做（注释同步已替代）|
 | **W1** | `File::open` 默认**不设 `O_CLOEXEC`** | 🔍 S37-1 期间发现：11 处裸 `::open` 全部显式带 `O_CLOEXEC`（收编后由 `kCloseOnExec` 原样保留），而走 `io::File` 的核心 KV 路径（data/hint/oki run/write.lock）**没有** —— fork+exec 场景下 data file fd 泄漏进子进程。现有 fork 测试只 fork 不 exec 故未暴露，**S37-2 改 exec-self 后会变成真实暴露面**。收编时未擅自统一（那是行为变化，超出「零行为变化」约束）。**待评估**：给核心路径补 `kCloseOnExec`。Windows 侧句柄默认不继承，无对应问题 |
-| ~~W5~~ | Windows CRT/堆 边界（/MT 下每模块各一份）| ✅ 结清。**准确范围：本库的 C++ API 本就不是模块边界，只有 C API 是。** 原有三处跨界：`io::File::pread` 返回 `std::vector`（库这侧分配、调用方析构）、`io::open_stream` 返回 `FILE*`、`io::flush_and_sync_stream` 反向收 `FILE*`。`/MD`（本项目默认，已核实 `-MDd`）下全部成立；`/MT` + 多模块下是跨堆 free 与跨 fd 表查号，失败形态为 **invalid-parameter handler → `__fastfail`，进程无声消失、退出码 0xC0000409、terminate/abort 都不触发**（参考 `../coxswain` W9.9，当时靠 cdb 取栈才定位；该状态码名为 STACK_BUFFER_OVERRUN，与栈无关）。✅ 已做：配置期告警 + `io.hpp` 注释 + `doc/api-c.md` §2.1 与 README 的 Windows 段（36655bd）+ **两处 `FILE*` 跨界消除：seam 只交换内核句柄，`FILE*` 的生成与拆解由 `detail/file_util.hpp` 的 inline `adopt_stream` / `stream_handle` 在调用方模块内完成**（6ad5b4b）。余下 `pread` 返回 `std::vector` 属常规 C++ ABI 约束（任何按值返回 STL 容器的 C++ 库都有），靠「跨模块只用 C API」这条规则解决，不为它动 API |
-| ~~W4~~ | 窄路径的编码约定 | ✅ P0 结清。立项时以为只是「45 处 `.string()` 产出 ANSI → seam 报 EINVAL」，实测（CP936 简中 Windows）比这严重两级：`fs::path(窄串)` 这个**构造方向**同样走 ANSI，两头的错误互相抵消，才让纯 ASCII 与「碰巧是合法 GBK」的数据看着正常；一旦字节不是合法 GBK，**构造直接抛 `std::system_error`**，而 `detail::fsync_parent_dir` 是 `noexcept` 且是全库 9 个原子写站点的公共收尾 ⇒ **`std::terminate`**。修法见 P 段 P0 |
+| ~~W5~~ | Windows CRT/堆 边界（/MT 下每模块各一份）| [结清]。**准确范围：本库的 C++ API 本就不是模块边界，只有 C API 是。** 原有三处跨界：`io::File::pread` 返回 `std::vector`（库这侧分配、调用方析构）、`io::open_stream` 返回 `FILE*`、`io::flush_and_sync_stream` 反向收 `FILE*`。`/MD`（本项目默认，已核实 `-MDd`）下全部成立；`/MT` + 多模块下是跨堆 free 与跨 fd 表查号，失败形态为 **invalid-parameter handler → `__fastfail`，进程无声消失、退出码 0xC0000409、terminate/abort 都不触发**（参考 `../coxswain` W9.9，当时靠 cdb 取栈才定位；该状态码名为 STACK_BUFFER_OVERRUN，与栈无关）。已做：配置期告警 + `io.hpp` 注释 + `doc/api-c.md` §2.1 与 README 的 Windows 段（36655bd）+ **两处 `FILE*` 跨界消除：seam 只交换内核句柄，`FILE*` 的生成与拆解由 `detail/file_util.hpp` 的 inline `adopt_stream` / `stream_handle` 在调用方模块内完成**（6ad5b4b）。余下 `pread` 返回 `std::vector` 属常规 C++ ABI 约束（任何按值返回 STL 容器的 C++ 库都有），靠「跨模块只用 C API」这条规则解决，不为它动 API |
+| ~~W4~~ | 窄路径的编码约定 | [结清] 由 P0 结清。立项时以为只是「45 处 `.string()` 产出 ANSI → seam 报 EINVAL」，实测（CP936 简中 Windows）比这严重两级：`fs::path(窄串)` 这个**构造方向**同样走 ANSI，两头的错误互相抵消，才让纯 ASCII 与「碰巧是合法 GBK」的数据看着正常；一旦字节不是合法 GBK，**构造直接抛 `std::system_error`**，而 `detail::fsync_parent_dir` 是 `noexcept` 且是全库 9 个原子写站点的公共收尾 ⇒ **`std::terminate`**。修法见 P 段 P0 |
 | **W2** | `bitcask_format` → `bitcask_io` 的 PUBLIC 依赖 | 🔍 S37-1 引入（见落地记录）。当前无环且必要，但「记录 codec 层依赖 I/O 层」是轻微的分层异味。若 S37-4 把 13 个 STATIC 改 OBJECT 库，可顺带复核是否有更干净的归置 |
 | ~~W3~~ | `count_os_threads()` 读 `/proc/self/task` | ✅ S37-5 结清：补 `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` 实现（按 owner pid 过滤），**没有**把用例标 Linux-only——AT5 守的「线程数与库数解耦」是平台无关的结构性保证，在 Windows 上同样值得守。原实现在非 Linux 上恒返回 0，而断言的是差值，0-0=0 直接失败 |
 
 ---
 
-## 🔵 P 段 · 路径编码与 stdio 收编（W4 后续）
+## P 段 · 路径编码与 stdio 收编（W4 后续）
 
 来源：S37 收尾后复盘「Windows 侧是否全用原生 API」。结论是**核心 I/O / 内存 /
 进程层已是纯原生 Win32**——`src/io/win32_file.cpp`（770 行）用的是 `CreateFileW`、
@@ -855,7 +855,7 @@ S37-7 (1.5周) ───── CI + 收尾
 换成一个不能用的路径。** 这条推翻了直觉上的排序（「先做小的 rename 收编」），
 P1 必须排在 P0 之后。
 
-### P0 · 路径编码统一 ✅ done
+### P0 · 路径编码统一 [done]
 
 **立项时的判断错了两处，实测（2026-08-08，VS 18 / MSVC 14.51 / `GetACP()==936`）
 纠正如下**——这也是「动 45 处之前先花二十分钟写探针」换回来的：
@@ -932,7 +932,7 @@ bug。所以第一步是一个非 ASCII（中文）路径的用例，Windows + L
 
 </details>
 
-### P1 · `.prev` 轮转的 `fs::rename` 收进 seam ✅ done
+### P1 · `.prev` 轮转的 `fs::rename` 收进 seam [done]
 
 **立项理由没能通过实测，改用另一条理由做的。** 原以为这两处绕过
 `io::atomic_rename` 会丢掉 `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`。
@@ -969,7 +969,7 @@ bug。所以第一步是一个非 ASCII（中文）路径的用例，Windows + L
 
 **验证**：msvc-debug 745 全绿，无回归。Linux 仍未复验。
 
-### P2 · `AtomicFileWriter` 换缓冲层 ⬜
+### P2 · `AtomicFileWriter` 换缓冲层 [todo]
 
 在 seam 之上加 `detail::BufferedWriter`（`FileHandle` + 一块 buffer + 偏移，
 约 200 行 + 边界测试：短读、EOF、flush 失败、超大写）。**注意不要重写 native
@@ -979,12 +979,12 @@ bug。所以第一步是一个非 ASCII（中文）路径的用例，Windows + L
 `AtomicFileWriter`（`detail/file_util.hpp:242`）先换：全库 9 个原子写站点共用它，
 一处改动覆盖面最大，且改完 tmp 的 fsync 直接用句柄，不必绕 `stream_handle`。
 
-### P3 · `field_schema` 换 `BufferedWriter` ⬜
+### P3 · `field_schema` 换 `BufferedWriter` [todo]
 
 stdio 调用最密的一处（14 次）。换完就彻底不碰 `FILE*`，6ad5b4b 引入的
 `adopt_stream` 降级为纯过渡设施。
 
-### P4 · 错误模型：**收窄，不做统一** ⬜
+### P4 · 错误模型：**收窄，不做统一** [todo]
 
 13 个文件用 `std::error_code`，但绝大多数是 `fs::remove(p, ec)` 这种**尽力而为、
 `ec` 根本不看**的清理。把它们统一成 `IoError` 再原样忽略，是把噪音换个写法，
@@ -1022,9 +1022,9 @@ CONTRIBUTING：**错误要被消费 → 走 seam 的 `IoError`；纯尽力清理
 | S37-5 Windows I/O 后端 | ✅ done（bitcask.dll 产出；Windows ctest 733 → 724 通过 99%，余 9 个全部落在 S37-6；Linux 复验 735/735 无回归，见落地记录）|
 | S37-6 删除/映射生命周期 | ✅ done（**实测推翻立项前提，非架构改动**；Windows ctest 733/733 全绿，见落地记录）|
 | S37-7 CI + 收尾 | ⬜ 未开始 |
-| P 段 P0 路径编码统一 | ✅ done（59 处成对收编 + 守门 + 9 个用例；P1 期间又补 26 处隐式转换。**Linux 未复验**）|
-| P 段 P1 `.prev` 轮转收进 seam | ✅ done（4 处；立项理由被实测推翻，改按纪律做）|
-| P 段 P2–P4 | ⬜ 未开始（W5 已于 6ad5b4b 结清）|
+| P 段 P0 路径编码统一 | [done]（59 处成对收编 + 守门 + 9 个用例；P1 期间又补 26 处隐式转换。**Linux 未复验**）|
+| P 段 P1 `.prev` 轮转收进 seam | [done]（4 处；立项理由被实测推翻，改按纪律做）|
+| P 段 P2–P4 | [todo] 未开始（W5 已于 6ad5b4b 结清）|
 
 ### 待确认项
 

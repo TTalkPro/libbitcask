@@ -434,7 +434,7 @@ void sync_directory(const std::string& path) noexcept;
 // Windows 上删不掉（实测 ERROR_SHARING_VIOLATION），连带整个目录都删不掉。
 // 只有**长期持有**的流需要这么做；用完即关的读写继续用 std::fopen。
 //
-// ⚠️ 剩余的一处 CRT/堆 跨界：`File::pread` 返回 `std::vector`（库这侧分配、
+// 剩余的一处 CRT/堆 跨界：`File::pread` 返回 `std::vector`（库这侧分配、
 // 调用方析构）。那是常规 C++ ABI 约束，靠「跨模块只用 C API」这条规则解决，
 // 不值得为它改 API。整套约束见 doc/api-c.md §2.1。
 // ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ scan() {  # scan <正则> <说明>
            | grep -vE '^\s*//' \
            | grep -vE ':[0-9]+:\s*//')
     if [[ -n "$hits" ]]; then
-        echo "❌ $msg"
+        echo "FAIL: $msg"
         echo "$hits" | sed 's/^/   /'
         echo
         return 1
@@ -86,7 +86,7 @@ implicit=$(echo "$joined" \
            | grep -vE ':[0-9]+: *//' \
            | grep -vE 'from_utf8|\.path\(\)|_path\b|_dir\b')
 if [[ -n "$implicit" ]]; then
-    echo "❌ fs:: 调用点的路径入参可能是窄串（隐式构造 fs::path，按 ANSI 解码）。"
+    echo "FAIL: fs:: 调用点的路径入参可能是窄串（隐式构造 fs::path，按 ANSI 解码）。"
     echo "   包成 bitcask::detail::from_utf8(...)；若入参本就是 fs::path，"
     echo "   把变量改名为 *_path / *_dir 或拆行以示明确。"
     echo "$implicit" | sed 's/^/   /'
@@ -95,7 +95,7 @@ if [[ -n "$implicit" ]]; then
 fi
 
 if [[ $rc -eq 0 ]]; then
-    echo "✅ 窄路径编码约定：无违规"
+    echo "OK: 窄路径编码约定：无违规"
 else
     echo "详见 include/bitcask/detail/path_utf8.hpp 的文件头注释。"
 fi
