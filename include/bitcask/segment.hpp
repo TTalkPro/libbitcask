@@ -30,8 +30,10 @@
 #include "bitcask/string_hash.hpp"     // StringHash（透明 hash）
 
 #include <atomic>
+#include <cassert>      // local_docid 的越界断言
 #include <cstring>
 #include <filesystem>
+#include <limits>       // local_docid 的 u32 上界
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -202,7 +204,7 @@ public:
         // dead_dirty 语义变为「待落 live sidecar」(v1 段仍是整段重存)。
         if (mmap_) {
             if (docid >= mmap_->doc_count()) return false;
-            mmap_->mark_dead(docid);
+            mmap_->mark_dead(local_docid(docid));  // 上一行已保证 < doc_count(u32)
             dead_dirty_.store(true, std::memory_order_relaxed);
             return true;
         }
@@ -273,11 +275,11 @@ public:
     // S30-P2:key_at 改 string_view——mmap 背衬的 key 直指映射区(零拷贝),
     // 内存态指 keys_ 行(RowChunks 元素稳定)。持有期 ≤ 段 pin 生命周期。
     [[nodiscard]] std::string_view key_at(DocId d) const {
-        if (mmap_) return mmap_->key_of(d);
+        if (mmap_) return mmap_->key_of(local_docid(d));
         return keys_[d];
     }
     [[nodiscard]] Lsn lsn_at(DocId d) const {
-        if (mmap_) return mmap_->lsn_of(d);
+        if (mmap_) return mmap_->lsn_of(local_docid(d));
         return lsns_[d];
     }
 
@@ -288,7 +290,11 @@ public:
                   : static_cast<const bm25::TermIndex*>(&inv_),
             this,
             [this](DocId d) { return std::string(key_at(d)); },
-            [this](DocId d) { return lsn_at(d); }};
+            [this](DocId d) { return lsn_at(d); },
+            // pin 显式留空：钉段是**调用方**的事（text_plugin.cpp 拿到 view 后
+            // 按需 v.pin = ...）。这里写出来是为了让「没钉」是个决定而不是遗漏
+            // ——省略会触发 -Wmissing-field-initializers（werror-lib 带 -Werror）。
+            {}};
     }
 
     // 多字段视图（multi_field_segment_search 用）：把本段所有字段（含默认）汇总。
@@ -306,7 +312,8 @@ public:
             for (const auto& fi : mmap_fields_) {
                 fvs.push_back(FieldSegmentView{fi->field(), fi.get()});
             }
-            return MultiFieldSegmentView{this, std::move(fvs)};
+            // pin 显式留空,理由同 view()。
+            return MultiFieldSegmentView{this, std::move(fvs), {}};
         }
         std::shared_lock lk(fields_mu_);  // S27-4 P2:size() 读也须在锁内
         fvs.reserve(1 + fields_.size());
@@ -314,7 +321,7 @@ public:
         for (const auto& [name, inv] : fields_) {
             fvs.push_back(FieldSegmentView{name, inv.get()});
         }
-        return MultiFieldSegmentView{this, std::move(fvs)};
+        return MultiFieldSegmentView{this, std::move(fvs), {}};  // pin 同上
     }
 
     // 命名字段访问（测试 / 内省用）。返回的指针活到下次 map 结构变更（emplace/
@@ -457,7 +464,7 @@ public:
     // ---- S30-P3:merge 导出面(双形态;调用契约 = 静止段/封口段) ----
 
     [[nodiscard]] index::DocSlot slot_at(DocId d) const {
-        if (mmap_) return mmap_->slot_of(d);
+        if (mmap_) return mmap_->slot_of(local_docid(d));
         return slots_[d];
     }
 
@@ -535,6 +542,21 @@ public:
     }
 
 private:
+    // DocId(u64) → mmap 段 doc_store 的 u32 本地 docid。
+    //
+    // 为什么必须显式收窄：`DocId` 是全局 u64（index_ids.hpp——现阶段 docid==lsn），
+    // 而 `MmapSegment` 的 doc_store 面（key_of/lsn_of/slot_of/mark_dead）收 u32
+    // ——段内 docid 是**段本地、稠密、0..doc_count-1**，而 `doc_count()` 本身
+    // 就是 u32。所以这个收窄由段模型保证安全，不是碰运气。
+    // 隐式转换会触发 `-Wconversion`（CI 的 werror-lib 带 -Werror），且隐式收窄
+    // 正是「哪天 DocId 真的超过 u32 也不会有人发现」的形态；显式一次并配 assert，
+    // 让越界在 Debug 下当场炸，而不是悄悄截断成另一篇文档。
+    [[nodiscard]] static std::uint32_t local_docid(DocId d) noexcept {
+        assert(d <= std::numeric_limits<std::uint32_t>::max() &&
+               "mmap 段的本地 docid 必须落在 u32 内(段内稠密 0..doc_count-1)");
+        return static_cast<std::uint32_t>(d);
+    }
+
     static constexpr std::uint32_t kDocStoreMagic = 0x54534453;  // 'SDST'
     // v2:行内 tstamp 定宽 4B→8B（64 位时间戳 flag-day）。读端仅收 v2,
     // 旧段 version 不符 → load 返回 nullptr → 退全量重建（降级安全）。

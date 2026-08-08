@@ -45,6 +45,7 @@
 #include <new>
 #include <string>
 #include <string_view>
+#include <type_traits>  // zero_buckets 的 is_trivially_copyable_v 断言
 #include <utility>
 #include <vector>
 
@@ -105,7 +106,7 @@ public:
         }
         values_.clear();
         if (BucketBlock* bb = buckets_.load(std::memory_order_relaxed)) {
-            std::memset(bb->b, 0, bb->count() * sizeof(Bucket));
+            zero_buckets(bb->b, bb->count());
         }
     }
 
@@ -316,6 +317,22 @@ private:
         std::uint32_t frag = 0;  // hash 低 32 位(home = frag & mask)
         std::uint32_t idx1 = 0;  // values 下标 + 1;0 = 空
     };
+
+    // 批量清零桶数组。桶块是手工 ::operator new 的变长块,从不逐个默认构造,
+    // 所以清零走 memset(热路径:grow 每次都要清整块)。
+    //
+    // 直接 `std::memset(b, 0, n * sizeof(Bucket))` 会触发 GCC 的
+    // `-Wclass-memaccess`(CI 的 werror-lib 带 -Werror):Bucket 因为带**默认成员
+    // 初始化器**(`= 0`)而不是「trivially default constructible」,编译器据此提醒
+    // 「别拿 memset 清非平凡类型」。但这里真正需要的性质是**平凡可复制**——
+    // 下面的 static_assert 把它钉死,不成立时编译期就炸,而不是靠这段注释。
+    // 满足该性质时全零字节就是合法的 Bucket 表示(frag=0/idx1=0 = 空桶),
+    // memset 正确。转 void* 是消除该告警的标准写法,不改任何生成代码。
+    static void zero_buckets(Bucket* b, std::size_t n) noexcept {
+        static_assert(std::is_trivially_copyable_v<Bucket>,
+                      "zero_buckets 依赖 Bucket 平凡可复制(全零字节 = 空桶)");
+        std::memset(static_cast<void*>(b), 0, n * sizeof(Bucket));
+    }
     // self-describing 桶块:mask 内嵌于块——乐观读者拿到块指针即拿到与之
     // 恒一致的界,探测 deref 无混代可能。
     struct BucketBlock {
@@ -471,7 +488,7 @@ private:
             sizeof(BucketBlock) + (cap - 1) * sizeof(Bucket);
         auto* nb = static_cast<BucketBlock*>(::operator new(bytes));
         nb->mask = cap - 1;
-        std::memset(nb->b, 0, cap * sizeof(Bucket));
+        zero_buckets(nb->b, cap);
         for (std::size_t v = 0; v < values_.size(); ++v) {
             place_bucket(nb, StringHash{}(values_[v].first),
                          static_cast<std::uint32_t>(v + 1));
