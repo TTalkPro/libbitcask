@@ -32,12 +32,12 @@
 #include "bitcask/detail/path_utf8.hpp"  // P0：窄路径 = UTF-8，不走 ANSI 代码页
 
 // W5：**唯一**需要在头里出现平台头的地方——`stream_handle` 必须 inline
-// （理由见该函数）。两边都只是 CRT 的小头，不引 windows.h、不带 min/max 宏：
+// （理由见该函数）。只是 CRT 的小头，不引 windows.h、不带 min/max 宏：
 //   Windows：<io.h> 给 _get_osfhandle（_fileno 在 <cstdio> 里）
 //   POSIX  ：fileno 由 <cstdio> 提供，无需额外头
+// （P3 起 <fcntl.h> 不再需要——它是给已退役的 adopt_stream 用的。）
 #if defined(_WIN32)
-#  include <fcntl.h>   // _O_BINARY / _O_RDONLY / _O_APPEND（adopt_stream）
-#  include <io.h>      // _get_osfhandle / _open_osfhandle / _close
+#  include <io.h>      // _get_osfhandle（stream_handle）
 #endif
 
 namespace bitcask::detail {
@@ -62,7 +62,7 @@ using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
 // 交给 from_utf8 而不是代码页。POSIX 下就是 std::fopen，零差别。
 //
 // 注意本函数只解决**编码**。共享位（Windows CRT 不带 FILE_SHARE_DELETE）与
-// CRT 边界是另一条线，见 io.hpp 的 open_handle / adopt_stream。
+// CRT 边界是另一条线，见 io.hpp 的 open_handle。
 // ---------------------------------------------------------------------------
 [[nodiscard]] inline std::FILE* fopen_utf8(const std::string& path,
                                            const char* mode) noexcept {
@@ -215,50 +215,6 @@ inline io::FileHandle stream_handle(std::FILE* f) noexcept {
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// 内核句柄 → std::FILE*（W5），`stream_handle` 的反向。
-//
-// **同样必须 inline**：包出来的 FILE* 属于**执行这行代码的那份 CRT**，只有让
-// 它在调用方模块内展开，FILE* 的分配与随后的 fclose 才在同一份 CRT 里。
-// 于是跨库边界的只有 `io::open_handle` 交出来的**内核句柄**。
-//
-// 成功后句柄所有权转移给返回的 FILE*——fclose 会一路关到底，调用方按
-// std::fopen 的习惯用即可。**失败返回 nullptr 且句柄已被关闭**（与 fopen
-// 一致：拿到 nullptr 就没有任何东西需要清理）。
-//
-// mode 直接透传给 fdopen/_fdopen，须与打开句柄时的 flag 相容
-// （典型：`io::OpenFlag::kNone` 配 "ab"）。
-// ---------------------------------------------------------------------------
-inline std::FILE* adopt_stream(io::FileHandle h, const char* mode) noexcept {
-    if (!io::handle_valid(h) || mode == nullptr || mode[0] == '\0') {
-        if (io::handle_valid(h)) io::close_handle(h);
-        return nullptr;
-    }
-#if defined(_WIN32)
-    int flags = _O_BINARY;
-    if (mode[0] == 'a') flags |= _O_APPEND;
-    bool plus = false;
-    for (const char* p = mode + 1; *p != '\0'; ++p) {
-        if (*p == '+') plus = true;
-    }
-    if (mode[0] == 'r' && !plus) flags |= _O_RDONLY;
-    const int fd = ::_open_osfhandle(reinterpret_cast<std::intptr_t>(h), flags);
-    if (fd == -1) {
-        io::close_handle(h);   // 尚未被 CRT 接管，得自己收
-        return nullptr;
-    }
-    std::FILE* f = ::_fdopen(fd, mode);
-    if (f == nullptr) {
-        ::_close(fd);          // 已被接管：关 fd 即连带关掉那个句柄
-        return nullptr;
-    }
-    return f;
-#else
-    std::FILE* f = ::fdopen(h, mode);
-    if (f == nullptr) io::close_handle(h);
-    return f;
-#endif
-}
 
 // 已开的 tmp 文件：flush + fdatasync。两个返回值都检查（见上）。
 inline bool flush_and_sync(std::FILE* f) noexcept {

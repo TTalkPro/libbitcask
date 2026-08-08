@@ -1019,10 +1019,47 @@ bug。所以第一步是一个非 ASCII（中文）路径的用例，Windows + L
 
 **验证**：msvc-debug 746 全绿（新增 1 个用例，实跑 856 ms 未跳过）。Linux 仍未复验。
 
-### P3 · `field_schema` 换 `BufferedWriter` [todo]
+### P3 · `field_schema` 退掉长期持有的 `FILE*` [done]（原「换 `BufferedWriter`」）
 
-stdio 调用最密的一处（14 次）。换完就彻底不碰 `FILE*`，6ad5b4b 引入的
-`adopt_stream` 降级为纯过渡设施。
+**缓冲层的前提在这里也不成立，但查代码时发现了一个更值钱的东西。**
+
+不需要缓冲：`intern` 每写一条 entry 就 `fflush` 一次（语义要求如此——新 id 必须
+立刻对其它进程可见）。所以 CRT 缓冲实际从不攒批，一条 entry = 一次系统调用；
+改成「组好整条 + 一次定位写」是等价的，legacy 分支还因此从两次 fwrite 减到一次。
+
+**真问题：`intern` 里的写一个返回值都没检查，而 id 是位置性的。** 写侧和读侧
+（`load_new_format_`）都用 `id_to_name_.size()` 定序，entry 里**不存 id**。于是
+「中间丢一条、后面继续写」会让重启后所有后续 id **前移一位**——老数据里记的
+field id N 解析成另一个字段名。这是静默的数据错位，比丢一条字段名严重得多。
+佐证这是遗漏而非取舍：同文件的 `upgrade_legacy_to_new_` 是**检查**了 `fwrite`
+返回值的。生产侧调用 `intern` 的只有一处（`cask.cpp:2391`），其余全是测试。
+
+**落地**：
+
+- `fp_`（`std::unique_ptr<FILE>`）换成 `io::File wf_` + `std::uint64_t woff_`。
+  这是全库最后一个长期持有的 `FILE*`，退役后本类不再碰 CRT 的流层。
+- **`kNoAppend` + 自记偏移**，不是 `kNone` 的 `O_APPEND`：POSIX 下 `O_APPEND`
+  会让 `pwrite` **忽略 offset**（`io.hpp` 的 `kNoAppend` 注释早记了这条暗礁），
+  而 Windows 根本没有 `O_APPEND` 的等价物，seam 的定位写走 `OVERLAPPED` 偏移。
+  靠 `O_APPEND` 两边行为就会分叉，只能开时量一次大小、之后自己推进。
+- 写失败 → `stop_persisting_()`：关句柄 + 置 `persist_failed_`。这样盘上序列
+  **始终是内存序列的前缀**，已持久化的 id 全部保持正确。这正是本类原本就接受
+  的降级形态（句柄压根开不出来时即如此），现在把「开着但写挂了」也纳进来。
+  新增 `persist_failed()` 供调用方查询。**没有改 `intern` 的签名**——那会波及
+  一处生产调用点和约 15 处测试断言，而前缀不变式已经消掉了错位。
+- `detail::adopt_stream` 随之**删除**（44 行）：field_schema 是它唯一的生产
+  调用方，W5 引入它就是为了这一处。`<fcntl.h>` 也一并从 `file_util.hpp` 退掉。
+  `stream_handle` 保留——`flush_and_sync` 仍在用（`AtomicFileWriter` 走它）。
+- 测试 `AdoptedStreamAllowsDeleteWhileHeld` 改名并重定向为
+  `LongHeldWriteHandleAllowsDeleteAndTracksOffset`：它守的两条性质（句柄带
+  `SHARE_DELETE` 故文件仍可删；追加靠自记偏移而非 `O_APPEND`）依然要守，
+  只是形态变了。
+
+**未做**：读路径（`open` / `load_new_format_` / `load_legacy_`）仍用短命
+`FILE*`，`upgrade_legacy_to_new_` 仍走 `AtomicFileWriter`。两者都是用完即关，
+不在「退掉长期持有」的目标内，也没有 P2 那样的实测缺陷支撑。
+
+**验证**：msvc-debug 746 全绿。
 
 ### P4 · 错误模型：**收窄，不做统一** [todo]
 
@@ -1219,7 +1256,8 @@ clang 侧告警数 **0**（CI 另有 clang job，确认没引入 clang 独有告
 | P 段 P2 读路径改走定位读 | [done]（原计划是写路径缓冲层，实测把靶心改到 2 GiB 天花板。**Linux 已复验**，2.54 GiB 用例走稀疏文件 3 ms 实跑未跳过）|
 | **Linux 全面复验（P 段 + S37-4/5 遗留）** | ✅ done（2026-08-08）：Debug g++/clang 各 **749/749**、Release+LTO 编译、**ASan 749/749**、**TSan 747/747**、干净树 configure、守门脚本。查出 1 条真回归（`-Wcomment` 打断 `werror-lib`，已修）+ 1 个过窄断言（已修）；TSan 那条失败是预存 CI 豁免项，已用 v6.1.0 基线对拍证否 |
 | **`werror-lib` 修复（S37-7.3 的 Linux 半边）** | ✅ done（2026-08-08）：该 job 自 v6.1.0 起从未绿过。库 14 条 + tests/bench 118 条，**共 132 条全部修根因**（无一个 `-Wno-*`）。现在 `BITCASK_WERROR=ON`+`BUILD_TESTING=ON`+benchmarks 的干净树整树 0 错误 0 告警，clang 侧亦 0。改动含 seqlock 头与公开头、且把多处「忽略返回值」改为断言，已全矩阵复跑：Release+`-Werror` 749/749、gcc/clang Debug 各 749/749、ASan 749/749、TSan 747/747 |
-| P 段 P3–P4 | [todo] 未开始（W5 已于 6ad5b4b 结清）|
+| P 段 P3 field_schema 退掉长期 FILE* | [done]（顺带修掉未检查的写导致的 id 错位；adopt_stream 删除）|
+| P 段 P4 错误模型 | [todo] 未开始（结论仍是「收窄，不做统一」）|
 
 ### 待确认项
 

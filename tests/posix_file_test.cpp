@@ -336,26 +336,42 @@ TEST(LargeFile, SizeAndPositionedIoBeyond2GiB) {
     EXPECT_EQ(0, std::memcmp(back, mark, sizeof mark));
 }
 
-TEST(FileLifecycle, AdoptedStreamAllowsDeleteWhileHeld) {
-    // field_schema 长期持有一个追加流（field.schema）。它必须由
-    // io::open_handle 打开（恒带 FILE_SHARE_DELETE）再由 inline 的
-    // detail::adopt_stream 在**调用方模块**内包成 FILE*：
-    //   - 退回 std::fopen → Windows 上整个库目录都会因这一个句柄删不掉；
-    //   - 让库那侧建 FILE* → /MT 下跨 CRT 分配/释放（W5）。
+TEST(FileLifecycle, LongHeldWriteHandleAllowsDeleteAndTracksOffset) {
+    // field_schema 是全库唯一长期持有写句柄的地方（field.schema，生命周期 =
+    // FieldSchema 对象）。本用例守它依赖的两条性质：
+    //
+    // 1) 句柄必须由 io::open_handle 打开——它恒带 FILE_SHARE_DELETE。退回
+    //    std::fopen 的话，Windows 上整个库目录都会因这一个句柄删不掉
+    //    （ERROR_SHARING_VIOLATION，S37-6）。
+    // 2) 追加必须**自己记偏移**（kNoAppend + pwrite），不能靠 O_APPEND：
+    //    POSIX 下 O_APPEND 会让 pwrite 忽略 offset，而 Windows 根本没有
+    //    O_APPEND 的等价物，seam 的定位写走 OVERLAPPED 偏移。靠 O_APPEND
+    //    两边行为就会分叉（P3）。
+    //
+    // W5 时这里包了一层 detail::adopt_stream 把句柄变成 FILE*；P3 后
+    // field_schema 直接用句柄，adopt_stream 已删除。
     TempDir td;
     const auto path = td.file("held.dat");
-    auto h = bitcask::io::open_handle(path, bitcask::io::OpenFlag::kNone,
+    auto h = bitcask::io::open_handle(path, OpenFlag::kNoAppend,
                                       bitcask::io::FileMode::kUmaskDefault);
     ASSERT_TRUE(h);
-    std::FILE* f = bitcask::detail::adopt_stream(*h, "ab");
-    ASSERT_NE(f, nullptr);
-    ASSERT_EQ(std::fwrite("x", 1, 1, f), 1u);
-    ASSERT_EQ(std::fflush(f), 0);
+    bitcask::io::File wf{*h};
 
+    // 自记偏移的追加：连写两段，第二段必须落在第一段之后。
+    std::uint64_t off = 0;
+    ASSERT_TRUE(bitcask::io::pwrite_all(wf.fd(), "AB", 2, off));
+    off += 2;
+    ASSERT_TRUE(bitcask::io::pwrite_all(wf.fd(), "CD", 2, off));
+    off += 2;
+    const auto sz = bitcask::io::handle_size(wf.fd());
+    ASSERT_TRUE(sz);
+    EXPECT_EQ(*sz, off) << "偏移推进与文件大小不符（O_APPEND 语义分叉的征兆）";
+    char back[4] = {};
+    ASSERT_TRUE(bitcask::io::pread_all(wf.fd(), back, 4, 0));
+    EXPECT_EQ(0, std::memcmp(back, "ABCD", 4));
+
+    // 句柄仍开着，文件必须仍可删除。
     EXPECT_TRUE(bitcask::io::remove_file(path))
-        << "长期持有的追加流不得阻止删除"
+        << "长期持有的写句柄不得阻止删除"
            "（Windows 上 std::fopen 不带 FILE_SHARE_DELETE）";
-    // 顺带守 W5 的另一半：flush_and_sync 只把内核句柄递进库里。
-    EXPECT_TRUE(bitcask::detail::flush_and_sync(f));
-    std::fclose(f);
 }

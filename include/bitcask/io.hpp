@@ -127,8 +127,8 @@ enum class FileMode : unsigned {
     kWorldReadable = 1,  // 0644
     // W5：0666（实际权限由 umask 削）。存在的唯一理由是**逐字复刻
     // `std::fopen` 的建档权限**——C 标准库建新文件用的就是 0666&~umask。
-    // 供「原先用 fopen、现改为 open_handle + detail::adopt_stream」的站点用，
-    // 保证 POSIX 侧权限位一字不差。新代码不该选它（库内文件应是 0600）。
+    // 供「原先用 fopen、现改为 open_handle」的站点用，保证 POSIX 侧权限位
+    // 一字不差（当前只剩 field_schema）。新代码不该选它（库内文件应是 0600）。
     kUmaskDefault  = 2,  // 0666
 };
 
@@ -422,13 +422,17 @@ void sync_directory(const std::string& path) noexcept;
 //
 // 它在**库这侧的 CRT** 里建出 FILE*，而调用方用**自己那份 CRT** 的 fclose 去
 // 关——`/MT` 下每个模块各带一份 CRT、各有一份堆与 fd 表，这一来一回就是跨 CRT
-// 的分配/释放。取而代之的形状是「库只交内核句柄，FILE* 由调用方自己包」：
+// 的分配/释放。
 //
-//     auto h = io::open_handle(path, io::OpenFlag::kNone,
+// W5 当时的替代形状是「库只交内核句柄，调用方用 inline 的 detail::adopt_stream
+// 自己包成 FILE*」。**P3 之后连这一步也不需要了**：唯一的长期持有者
+// field_schema 改成直接持句柄 + pwrite 定位写，adopt_stream 随之删除。
+// 现在的形状就是：
+//
+//     auto h = io::open_handle(path, io::OpenFlag::kNoAppend,
 //                              io::FileMode::kUmaskDefault);   // 带 SHARE_DELETE
-//     std::FILE* f = detail::adopt_stream(*h, "ab");           // inline，在调用方模块内
+//     io::pwrite_all(*h, buf, len, off);                       // 自己记偏移
 //
-// `detail::adopt_stream` 见 detail/file_util.hpp；跨库边界的只剩内核句柄。
 // 「为什么非要绕开 std::fopen」那半边理由不变：**MSVC 的 CRT 用 `_SH_DENYNO`
 // 开文件，共享位不含 FILE_SHARE_DELETE 且无开关**，被它长期持有的文件在
 // Windows 上删不掉（实测 ERROR_SHARING_VIOLATION），连带整个目录都删不掉。

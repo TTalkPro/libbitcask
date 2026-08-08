@@ -18,10 +18,12 @@
 // 目录下**原子升级**为新格式（temp + fsync + rename，权威数据零丢失窗口）。升级失败
 // （如只读目录）则退回按 legacy 格式继续追加，保持该文件自洽。
 //
-// 并发：写路径持 unique_lock + fflush。
+// 并发：写路径持 unique_lock。P3 后写是 pwrite 定位写（无用户态缓冲，
+// 故不再需要 fflush）；偏移 woff_ 由该锁保护。
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -39,7 +41,7 @@
 #include "bitcask/byte_order.hpp"
 #include "bitcask/codec.hpp"
 #include "bitcask/detail/file_util.hpp"  // detail::FileCloser / FilePtr（RED-2 归并）
-#include "bitcask/io.hpp"                // S37-6：io::open_stream（带 share-delete）
+#include "bitcask/io.hpp"                // S37-6：open_handle 恒带 share-delete
 
 namespace bitcask {
 
@@ -102,31 +104,47 @@ public:
             legacy_ = false;  // 升级成功：文件现已是带头新格式
         }
 
-        if (fp_) fp_.reset();
-        // **这是全库唯一长期持有的 std::FILE***（生命周期 = FieldSchema 对象），
-        // 所以它同时踩中两条 Windows 约束，都不能用裸 std::fopen：
+        wf_.close_quiet();
+        woff_ = 0;
+        persist_failed_ = false;
+        // 这里曾是**全库唯一长期持有的 std::FILE***。P3 把它退成内核句柄，
+        // 于是本类不再碰 CRT 的流层，`detail::adopt_stream` 也随之退役。
         //
-        // S37-6：MSVC 的 CRT 用 `_SH_DENYNO` 开文件，共享位不含
-        //   FILE_SHARE_DELETE 且无开关 —— 只要 FieldSchema 活着，field.schema
-        //   就删不掉（ERROR_SHARING_VIOLATION），连带整个库目录都删不掉。
-        //   故句柄必须由 io::open_handle 打开（它恒带 SHARE_DELETE）。
-        // W5：FILE* 必须在**调用方模块的 CRT** 里生成——detail::adopt_stream
-        //   是 inline 的，于是跨库边界的只有内核句柄。
+        // 句柄仍必须由 io::open_handle 打开，理由不变（S37-6）：MSVC 的 CRT 用
+        // `_SH_DENYNO` 开文件，共享位不含 FILE_SHARE_DELETE 且无开关——只要
+        // FieldSchema 活着，field.schema 就删不掉（ERROR_SHARING_VIOLATION），
+        // 连带整个库目录都删不掉。open_handle 恒带 SHARE_DELETE。
         //
-        // kNone + kUmaskDefault 逐字复刻 fopen(path, "ab")：O_APPEND|O_CREAT
-        // 与 0666&~umask 的建档权限。（唯一差别是基模式为 O_RDWR 而非
-        // O_WRONLY，本类只写，无影响。）
-        if (auto h = io::open_handle(path, io::OpenFlag::kNone,
+        // **kNoAppend + 自己记偏移**，而不是 kNone 的 O_APPEND：
+        //   - POSIX 下 O_APPEND 会让 pwrite **忽略 offset** 改为追加
+        //     （io.hpp 的 kNoAppend 注释记的那条暗礁）；
+        //   - Windows 没有 O_APPEND 的等价物，seam 的定位写走 OVERLAPPED 偏移。
+        // 两边要行为一致，就只能开时量一次大小、之后自己推进。
+        // kUmaskDefault 仍是为了逐字复刻 fopen 的 0666&~umask 建档权限。
+        if (auto h = io::open_handle(path, io::OpenFlag::kNoAppend,
                                      io::FileMode::kUmaskDefault)) {
-            fp_.reset(detail::adopt_stream(*h, "ab"));  // best-effort 追加句柄
+            io::File wf{*h};
+            if (const auto sz = io::handle_size(wf.fd())) {
+                woff_ = *sz;
+                wf_ = std::move(wf);   // best-effort：量不到大小就不持有
+            }
         }
 
         // 全新文件：先写 8 字节文件头，后续 intern 的 entry 才是自洽的新格式。
-        if (fresh && fp_) {
-            write_header_(fp_.get());
-            std::fflush(fp_.get());
+        if (fresh && wf_.is_open()) {
+            const auto hdr = header_bytes_();
+            if (!append_(std::span<const std::byte>(hdr.data(), hdr.size()))) {
+                stop_persisting_();
+            }
         }
         return true;
+    }
+
+    // 追加写是否已因 I/O 错误停摆（见 intern 里的说明）。停摆后本类仍可用，
+    // 但只在内存中生效——盘上是内存序列的一个前缀。
+    [[nodiscard]] bool persist_failed() const {
+        std::shared_lock lk(mu_);
+        return persist_failed_;
     }
 
     // 返回字段名的 id；新名字分配下一个 id 并 append 持久化。线程安全。
@@ -143,18 +161,27 @@ public:
             return it->second;
         }
         const auto id = static_cast<std::uint32_t>(id_to_name_.size());
-        if (fp_) {
-            if (legacy_) {
-                // 升级失败（只读目录等）→ 按旧无头格式追加，保持该文件自洽。
-                std::byte lb[2];
-                le_store_u16(lb, static_cast<std::uint16_t>(name.size()));
-                std::fwrite(lb, 1, 2, fp_.get());
-                if (!name.empty()) std::fwrite(name.data(), 1, name.size(), fp_.get());
-            } else {
-                const auto buf = encode_entry_(name);
-                std::fwrite(buf.data(), 1, buf.size(), fp_.get());
+        if (wf_.is_open()) {
+            // legacy（升级失败，如只读目录）→ 按旧无头格式 [len][name] 追加，
+            // 保持该文件自洽；新格式则是 encode_entry_ 的 [len][name][crc]。
+            // 两者都先组好整条再一次写出——原先 legacy 分支是两次 fwrite 靠
+            // CRT 缓冲合并，现在直接就是一次定位写。
+            const std::vector<std::byte> buf =
+                legacy_ ? encode_legacy_entry_(name) : encode_entry_(name);
+            if (!append_(std::span<const std::byte>(buf.data(), buf.size()))) {
+                // P3：**写失败必须停止后续持久化，不能接着写下一条。**
+                //
+                // id 是位置性的——写侧和读侧（load_new_format_）都用
+                // `id_to_name_.size()` 定序，entry 里不存 id。所以「丢掉中间
+                // 一条、后面继续写」会让重启后所有后续 id 前移一位：老数据里
+                // 记的 field id N 会解析成另一个字段名。这是静默的数据错位，
+                // 比丢一条字段名严重得多。
+                //
+                // 关掉句柄后，盘上序列始终是内存序列的**前缀**，重启后已持久
+                // 的那些 id 全部保持正确。这正是本类原本就接受的降级形态
+                // （句柄压根开不出来时即如此），只是现在也覆盖「开着但写挂了」。
+                stop_persisting_();
             }
-            std::fflush(fp_.get());
         }
         std::string key(name);
         name_to_id_.emplace(key, id);
@@ -187,11 +214,42 @@ private:
         return buf;
     }
 
+    static std::array<std::byte, kHeaderSize> header_bytes_() {
+        std::array<std::byte, kHeaderSize> hdr{};
+        le_store_u32(hdr.data(), kMagic);
+        le_store_u32(hdr.data() + 4, kVersion);
+        return hdr;
+    }
+
+    // upgrade_legacy_to_new_ 仍走 AtomicFileWriter（短命 FILE*，原子写路径
+    // 不在 P3 范围内），故保留这个 FILE* 版。
     static bool write_header_(std::FILE* f) {
-        std::byte hdr[kHeaderSize];
-        le_store_u32(hdr, kMagic);
-        le_store_u32(hdr + 4, kVersion);
-        return std::fwrite(hdr, 1, kHeaderSize, f) == kHeaderSize;
+        const auto hdr = header_bytes_();
+        return std::fwrite(hdr.data(), 1, kHeaderSize, f) == kHeaderSize;
+    }
+
+    // legacy 无头格式的一条 entry：[NameLen:u16][name]，无 CRC。
+    static std::vector<std::byte> encode_legacy_entry_(std::string_view name) {
+        std::vector<std::byte> buf(2 + name.size());
+        le_store_u16(buf.data(), static_cast<std::uint16_t>(name.size()));
+        if (!name.empty()) std::memcpy(buf.data() + 2, name.data(), name.size());
+        return buf;
+    }
+
+    // 定位追加。**返回值必须检查**——调用方见 intern 里的说明。
+    // 调用者须持 unique_lock（woff_ 非原子）。
+    [[nodiscard]] bool append_(std::span<const std::byte> b) {
+        if (!wf_.is_open()) return false;
+        if (b.empty()) return true;
+        if (!io::pwrite_all(wf_.fd(), b.data(), b.size(), woff_)) return false;
+        woff_ += b.size();
+        return true;
+    }
+
+    // 写挂了：停止持久化，盘上序列就此定格为内存序列的前缀。
+    void stop_persisting_() {
+        wf_.close_quiet();
+        persist_failed_ = true;
     }
 
     // 新格式解析：rf 已越过 8 字节文件头。返回 false 仅当「完整 entry 但 CRC 不符」
@@ -262,7 +320,10 @@ private:
     std::unordered_map<std::string, std::uint32_t> name_to_id_;
     std::vector<std::string> id_to_name_;  // id == 下标
     std::string path_;
-    std::unique_ptr<std::FILE, detail::FileCloser> fp_;  // append-only 写句柄
+    // P3：内核句柄 + 自记偏移，取代原先长期持有的 std::FILE*。
+    io::File      wf_;                  // append-only 写句柄（best-effort）
+    std::uint64_t woff_ = 0;            // 下一次追加的偏移（持 unique_lock 推进）
+    bool persist_failed_ = false;       // 写挂过 → 已停止持久化，见 intern
     bool legacy_ = false;  // true = 该文件为无头 legacy 且升级失败 → intern 按旧格式追加
 };
 
