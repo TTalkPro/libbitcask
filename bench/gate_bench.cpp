@@ -222,7 +222,10 @@ static void BM_P7_DocTextLruHit(benchmark::State& state) {
     for (std::size_t i = 0; i < n_docs; ++i) {
         std::string key = "k" + std::to_string(i);
         std::string text = make_latin_text(256);
-        cask.put(as_bytes(key), as_bytes(text));
+        if (!cask.put(as_bytes(key), as_bytes(text))) {
+            state.SkipWithError("put failed during setup");
+            return;
+        }
     }
     cask.flush_index();
 
@@ -320,7 +323,10 @@ static void BM_P7_CaskGet_DocValueText(benchmark::State& state) {
     for (int i = 0; i < kDocs; ++i) {
         std::string key = "k" + std::to_string(i);
         std::string val(256, 'v');
-        cask.put(as_bytes(key), as_bytes(val));
+        if (!cask.put(as_bytes(key), as_bytes(val))) {
+            state.SkipWithError("put failed during setup");
+            return;
+        }
     }
     cask.close();
 
@@ -370,15 +376,21 @@ static void BM_P7_CaskGet_QuantizedVec(benchmark::State& state) {
     for (int i = 0; i < kDocs; ++i) {
         std::string key = "k" + std::to_string(i);
         double sq = 0.0;
-        for (int d = 0; d < dim; ++d) { v[d] = nd(rng); sq += (double)v[d] * v[d]; }
-        float inv = 1.0f / std::sqrt((float)sq);
+        for (std::size_t d = 0; d < static_cast<std::size_t>(dim); ++d) {
+            v[d] = nd(rng);
+            sq += static_cast<double>(v[d]) * static_cast<double>(v[d]);
+        }
+        float inv = 1.0f / std::sqrt(static_cast<float>(sq));
         for (auto& x : v) x *= inv;
 
         bitcask::DocInput doc;
         std::string text = "doc " + std::to_string(i);
         doc.text = as_bytes(text);
         doc.vector = std::span<const float>(v.data(), dim);
-        cask.put_doc(as_bytes(key), doc);
+        if (!cask.put_doc(as_bytes(key), doc)) {
+            state.SkipWithError("put_doc failed during setup");
+            return;
+        }
     }
     cask.flush_index();
     cask.close();
@@ -462,9 +474,10 @@ static void BM_P12_MetaBlobFootprint(benchmark::State& state) {
             benchmark::Counter::kDefaults,
             benchmark::Counter::kIs1024);
         state.counters["per_ord_bytes"] = benchmark::Counter(
-            static_cast<double>(rss_after > rss_before
-                ? (rss_after - rss_before) * 1024 / static_cast<double>(n)
-                : static_cast<double>(blob_sz)),
+            (rss_after > rss_before
+                 ? static_cast<double>((rss_after - rss_before) * 1024) /
+                       static_cast<double>(n)
+                 : static_cast<double>(blob_sz)),
             benchmark::Counter::kDefaults);
     }
     state.counters["n_docs"] = benchmark::Counter(static_cast<double>(n));

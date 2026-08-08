@@ -440,7 +440,7 @@ static void BM_Cask_Get_ColdOki(benchmark::State& state) {
     samples_us.reserve(1u << 20);
     std::size_t i = 0;
     for (auto _ : state) {
-        char kb[16];
+        char kb[32];  // %06zu 最坏 20 位 + 'g' + NUL，16 装不下（-Wformat-truncation）
         std::snprintf(kb, sizeof(kb), "g%06zu",
                       i++ % static_cast<std::size_t>(nkeys));
         const auto t0 = std::chrono::steady_clock::now();

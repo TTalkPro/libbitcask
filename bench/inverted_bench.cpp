@@ -12,8 +12,8 @@
 //                            cache、TBB），不是同桶锁竞争。
 //
 // Run:  ./bitcask_bench --benchmark_filter=Inverted
-//       ./bitcask_bench --benchmark_filter=Inverted --benchmark_format=json \
-//                       --benchmark_out=inverted_baseline.json
+//       ./bitcask_bench --benchmark_filter=Inverted
+//           --benchmark_format=json --benchmark_out=inverted_baseline.json
 
 #include <benchmark/benchmark.h>
 

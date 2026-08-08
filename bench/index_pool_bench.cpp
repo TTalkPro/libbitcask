@@ -167,7 +167,7 @@ static void BM_IndexPool_MultiLibThroughput(benchmark::State& state) {
         for (auto* lane : lanes) pool.flush(lane);
 
         state.PauseTiming();
-        for (auto* lane : lanes) pool.unregister_lib(lane);
+        for (auto* lane : lanes) (void)pool.unregister_lib(lane);
         pool.stop();
         state.ResumeTiming();
     }
