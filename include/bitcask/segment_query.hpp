@@ -36,7 +36,10 @@ struct SegmentView {
     std::function<Lsn(DocId)>         lsn_of;  // 本地 docid → 全局 LSN
     // S27-3 步骤 5:段生命周期钉住——查询期间段可能被并发 drop(段压实)/
     // 封口替换,view 持 shared_ptr 保段存活(见 SegmentSet 快照 API)。
-    std::shared_ptr<const void>       pin;
+    // `{}`:钉段是**调用方**的事(text_plugin.cpp 拿到 view 后按需 v.pin = ...),
+    // 绝大多数构造点本就该留空。给默认成员初始化器,免得每个聚合初始化点都要
+    // 补一个 `{}` 才能过 -Wmissing-field-initializers。
+    std::shared_ptr<const void>       pin{};
 };
 
 // §3.5 多段查询：① 跨段聚合全局 N/sum_dl/df（G-on-the-fly）② 串行逐段用**同一

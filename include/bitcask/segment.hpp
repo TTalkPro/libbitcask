@@ -66,7 +66,8 @@ struct FieldSegmentView {
 struct MultiFieldSegmentView {
     const SealedSegment*         seg;        // 段（LiveChecker + docid→key/lsn）
     std::vector<FieldSegmentView> fields;    // 该段所有字段倒排
-    std::shared_ptr<const void>  pin;        // S27-3 步骤 5:段生命周期钉住
+    // `{}` 理由同 SegmentView::pin。
+    std::shared_ptr<const void>  pin{};       // S27-3 步骤 5:段生命周期钉住
 };
 
 class SealedSegment : public bm25::LiveChecker {
@@ -290,11 +291,7 @@ public:
                   : static_cast<const bm25::TermIndex*>(&inv_),
             this,
             [this](DocId d) { return std::string(key_at(d)); },
-            [this](DocId d) { return lsn_at(d); },
-            // pin 显式留空：钉段是**调用方**的事（text_plugin.cpp 拿到 view 后
-            // 按需 v.pin = ...）。这里写出来是为了让「没钉」是个决定而不是遗漏
-            // ——省略会触发 -Wmissing-field-initializers（werror-lib 带 -Werror）。
-            {}};
+            [this](DocId d) { return lsn_at(d); }};  // pin 留空,见其声明处
     }
 
     // 多字段视图（multi_field_segment_search 用）：把本段所有字段（含默认）汇总。
@@ -312,8 +309,7 @@ public:
             for (const auto& fi : mmap_fields_) {
                 fvs.push_back(FieldSegmentView{fi->field(), fi.get()});
             }
-            // pin 显式留空,理由同 view()。
-            return MultiFieldSegmentView{this, std::move(fvs), {}};
+            return MultiFieldSegmentView{this, std::move(fvs)};
         }
         std::shared_lock lk(fields_mu_);  // S27-4 P2:size() 读也须在锁内
         fvs.reserve(1 + fields_.size());
@@ -321,7 +317,7 @@ public:
         for (const auto& [name, inv] : fields_) {
             fvs.push_back(FieldSegmentView{name, inv.get()});
         }
-        return MultiFieldSegmentView{this, std::move(fvs), {}};  // pin 同上
+        return MultiFieldSegmentView{this, std::move(fvs)};
     }
 
     // 命名字段访问（测试 / 内省用）。返回的指针活到下次 map 结构变更（emplace/

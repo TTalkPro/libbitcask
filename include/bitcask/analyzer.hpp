@@ -62,8 +62,12 @@ struct AnalyzerConfig {
     std::uint32_t min_n = 2;
     std::uint32_t max_n = 3;
     bool enable_stop_words = false;                  // 启用停用词过滤
-    std::vector<std::string> stop_words;             // 自定义停用词表（空则用内置默认）
-    std::string dict_path;                           // jieba 词典目录；必须有效，由调用方（Erlang facade 默认填 priv/dict）保证
+    // `{}` 不是装饰：本结构体绝大多数使用点是指派初始化（`AnalyzerConfig{.type=...}`），
+    // 而 GCC 的 -Wmissing-field-initializers **只对没有默认成员初始化器的成员**报警。
+    // 这两个成员本来就默认构造成空，补上 `{}` 后语义分毫不变，却把 ~20 个测试站点的
+    // 告警一次消掉（否则每加一个新的指派初始化点就要补一次）。
+    std::vector<std::string> stop_words{};           // 自定义停用词表（空则用内置默认）
+    std::string dict_path{};                         // jieba 词典目录；必须有效，由调用方（Erlang facade 默认填 priv/dict）保证
     // 拉丁整词的最小 codepoint 长度（S9.8）：短于此的拉丁 token 被丢弃。
     // 仅作用于拉丁/空白切分的整词路径，CJK 的 n-gram 不受影响。
     // 默认 1 = 不过滤（向后兼容）。索引与查询两侧一致生效。

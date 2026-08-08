@@ -64,7 +64,8 @@ struct SearchLayerConfig {
     // 同义词词典（open-time，不可变）。由 Cask::open 从 CaskOptions::synonym_map
     // 透传进来（同 vector_dim 的注入方式）。构造后只读 → 并发查询安全，无需锁。
     // 空 = 不展开同义词。
-    std::shared_ptr<const text::SynonymMap> synonym_map;
+    // `{}` 同 AnalyzerConfig：让指派初始化的调用点不必逐个补这一项。
+    std::shared_ptr<const text::SynonymMap> synonym_map{};
     // S14-5：delta 链长上限。链达此长度后下次 save 强制全量 base（坍缩链、回收
     // delta 文件）——否则纯追加负载（无删除 ⇒ 不触发 merge）会随写入线性堆积、
     // 永不回收（向量库尤甚：每 delta 内联 f32 向量）。权衡：小 → base 重序列化更
