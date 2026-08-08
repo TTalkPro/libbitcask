@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -27,6 +28,15 @@
 #include <vector>
 
 #include "bitcask/io.hpp"  // S37-1：宿主原语一律经 io seam（原 <fcntl.h>/<unistd.h>）
+
+// W5：**唯一**需要在头里出现平台头的地方——`stream_handle` 必须 inline
+// （理由见该函数）。两边都只是 CRT 的小头，不引 windows.h、不带 min/max 宏：
+//   Windows：<io.h> 给 _get_osfhandle（_fileno 在 <cstdio> 里）
+//   POSIX  ：fileno 由 <cstdio> 提供，无需额外头
+#if defined(_WIN32)
+#  include <fcntl.h>   // _O_BINARY / _O_RDONLY / _O_APPEND（adopt_stream）
+#  include <io.h>      // _get_osfhandle / _open_osfhandle / _close
+#endif
 
 namespace bitcask::detail {
 
@@ -100,9 +110,86 @@ inline void fsync_parent_dir(const std::string& path) noexcept {
     io::sync_directory(parent.string());
 }
 
+// ---------------------------------------------------------------------------
+// std::FILE* → 内核句柄（W5）
+//
+// **必须 inline，这是本函数存在的全部理由。** `fflush` 与「取出 fd / 句柄」
+// 只在**创建该 FILE\* 的那份 CRT** 里有意义：`FILE` 的布局和 fd 表都是 CRT
+// 私有的。放在头里 ⇒ 在调用方模块内展开 ⇒ 跨库边界的只剩一个**内核句柄**
+// （内核对象，与 CRT 无关）。
+//
+// 此前这段逻辑在 `io::flush_and_sync_stream`（编进 bitcask_io），于是调用方
+// 建的 `FILE*` 要穿过模块边界进到库里的 `_fileno`。`/MD`（本项目默认）下只有
+// 一份 CRT 故无事；`/MT` 下每模块各一张 fd 表，拿到的是别人的号，触发
+// invalid-parameter handler → `__fastfail`：**进程无声消失、退出码 0xC0000409、
+// terminate/abort 都不触发**。见 `doc/api-c.md` §2.1。
+// ---------------------------------------------------------------------------
+inline io::FileHandle stream_handle(std::FILE* f) noexcept {
+    if (f == nullptr) return io::kInvalidHandle;
+#if defined(_WIN32)
+    const int fd = ::_fileno(f);
+    if (fd < 0) return io::kInvalidHandle;
+    const std::intptr_t h = ::_get_osfhandle(fd);
+    // -1 = fd 非法；-2 = 该 fd 未关联到打开的文件（两者都是文档明载的返回值）。
+    if (h == -1 || h == -2) return io::kInvalidHandle;
+    return reinterpret_cast<io::FileHandle>(h);
+#else
+    const int fd = ::fileno(f);          // POSIX：fd 本身就是 io::FileHandle
+    return fd < 0 ? io::kInvalidHandle : fd;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 内核句柄 → std::FILE*（W5），`stream_handle` 的反向。
+//
+// **同样必须 inline**：包出来的 FILE* 属于**执行这行代码的那份 CRT**，只有让
+// 它在调用方模块内展开，FILE* 的分配与随后的 fclose 才在同一份 CRT 里。
+// 于是跨库边界的只有 `io::open_handle` 交出来的**内核句柄**。
+//
+// 成功后句柄所有权转移给返回的 FILE*——fclose 会一路关到底，调用方按
+// std::fopen 的习惯用即可。**失败返回 nullptr 且句柄已被关闭**（与 fopen
+// 一致：拿到 nullptr 就没有任何东西需要清理）。
+//
+// mode 直接透传给 fdopen/_fdopen，须与打开句柄时的 flag 相容
+// （典型：`io::OpenFlag::kNone` 配 "ab"）。
+// ---------------------------------------------------------------------------
+inline std::FILE* adopt_stream(io::FileHandle h, const char* mode) noexcept {
+    if (!io::handle_valid(h) || mode == nullptr || mode[0] == '\0') {
+        if (io::handle_valid(h)) io::close_handle(h);
+        return nullptr;
+    }
+#if defined(_WIN32)
+    int flags = _O_BINARY;
+    if (mode[0] == 'a') flags |= _O_APPEND;
+    bool plus = false;
+    for (const char* p = mode + 1; *p != '\0'; ++p) {
+        if (*p == '+') plus = true;
+    }
+    if (mode[0] == 'r' && !plus) flags |= _O_RDONLY;
+    const int fd = ::_open_osfhandle(reinterpret_cast<std::intptr_t>(h), flags);
+    if (fd == -1) {
+        io::close_handle(h);   // 尚未被 CRT 接管，得自己收
+        return nullptr;
+    }
+    std::FILE* f = ::_fdopen(fd, mode);
+    if (f == nullptr) {
+        ::_close(fd);          // 已被接管：关 fd 即连带关掉那个句柄
+        return nullptr;
+    }
+    return f;
+#else
+    std::FILE* f = ::fdopen(h, mode);
+    if (f == nullptr) io::close_handle(h);
+    return f;
+#endif
+}
+
 // 已开的 tmp 文件：flush + fdatasync。两个返回值都检查（见上）。
 inline bool flush_and_sync(std::FILE* f) noexcept {
-    return io::flush_and_sync_stream(f);
+    if (std::fflush(f) != 0) return false;
+    const io::FileHandle h = stream_handle(f);
+    if (!io::handle_valid(h)) return false;
+    return io::sync_data(h);  // 只有内核句柄跨进库里
 }
 
 // 缓冲区一次性原子落盘。失败即 remove(tmp) 并返回 false——最终路径始终

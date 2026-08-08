@@ -103,12 +103,23 @@ public:
         }
 
         if (fp_) fp_.reset();
-        // S37-6：**这是全库唯一长期持有的 std::FILE***（生命周期 = FieldSchema
-        // 对象）。必须走 io::open_stream 而非 std::fopen——MSVC 的 CRT 不带
-        // FILE_SHARE_DELETE 且无开关，于是只要 FieldSchema 活着，
-        // field.schema 就删不掉（ERROR_SHARING_VIOLATION），连带整个库目录
-        // 都删不掉。POSIX 侧 open_stream 就是 std::fopen，零差别。
-        fp_.reset(io::open_stream(path, "ab"));  // best-effort 追加句柄
+        // **这是全库唯一长期持有的 std::FILE***（生命周期 = FieldSchema 对象），
+        // 所以它同时踩中两条 Windows 约束，都不能用裸 std::fopen：
+        //
+        // S37-6：MSVC 的 CRT 用 `_SH_DENYNO` 开文件，共享位不含
+        //   FILE_SHARE_DELETE 且无开关 —— 只要 FieldSchema 活着，field.schema
+        //   就删不掉（ERROR_SHARING_VIOLATION），连带整个库目录都删不掉。
+        //   故句柄必须由 io::open_handle 打开（它恒带 SHARE_DELETE）。
+        // W5：FILE* 必须在**调用方模块的 CRT** 里生成——detail::adopt_stream
+        //   是 inline 的，于是跨库边界的只有内核句柄。
+        //
+        // kNone + kUmaskDefault 逐字复刻 fopen(path, "ab")：O_APPEND|O_CREAT
+        // 与 0666&~umask 的建档权限。（唯一差别是基模式为 O_RDWR 而非
+        // O_WRONLY，本类只写，无影响。）
+        if (auto h = io::open_handle(path, io::OpenFlag::kNone,
+                                     io::FileMode::kUmaskDefault)) {
+            fp_.reset(detail::adopt_stream(*h, "ab"));  // best-effort 追加句柄
+        }
 
         // 全新文件：先写 8 字节文件头，后续 intern 的 entry 才是自洽的新格式。
         if (fresh && fp_) {

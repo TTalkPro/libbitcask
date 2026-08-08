@@ -193,7 +193,7 @@ ctest --preset msvc-debug
 - **产物**：`bitcask.dll` + `bitcask.lib`（导入库）+ `bitcask_static.lib`（合并静态库；Windows 下不叫 `bitcask.lib` 是为了不与导入库撞名）。所有 exe 与 DLL 统一落到 `<build>/bin/`——Windows 没有 RPATH，DLL 必须与 exe 同目录。
 - **Sanitizer**：只有 ASan（`BITCASK_SANITIZE=address`）。TSan / UBSan 在 MSVC 下不存在，指定它们会在**配置期报错退出**而不是静默降级——「以为在跑 TSan 而实际没插桩」比构建失败危险得多。并发正确性仍以 Linux TSan 为准。
 
-> ⚠️ **跨模块使用请只用 C API。** C++ 头（`include/bitcask/*.hpp`）要求调用方与库共用同一份 CRT；`/MT`（静态 CRT）下每个模块各有一份堆与 fd 表，而 C++ 头有几处让 `std::vector` / `std::FILE*` 跨过边界。默认的 `/MD` 下没有这个问题。失败形态是**进程无声消失、退出码 `0xC0000409`、`terminate`/`abort` 都不触发**，极难定位——详见 [`doc/api-c.md` §2.1](doc/api-c.md)。`CMakeLists.txt` 在配置期检查 CRT 选择并告警。
+> ⚠️ **跨模块使用请只用 C API。** C++ 头（`include/bitcask/*.hpp`）要求调用方与库共用同一份 CRT；`/MT`（静态 CRT）下每个模块各有一份自己的堆，而 `io::File::pread` 一类按值返回 `std::vector` 的接口会让「库这侧分配、调用方析构」跨堆发生。默认的 `/MD` 下没有这个问题。失败形态是**进程无声消失、退出码 `0xC0000409`、`terminate`/`abort` 都不触发**，极难定位——详见 [`doc/api-c.md` §2.1](doc/api-c.md)。`CMakeLists.txt` 在配置期检查 CRT 选择并告警。
 
 ### Vendored 依赖（git submodule）
 

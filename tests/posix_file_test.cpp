@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "bitcask/io.hpp"
+#include "bitcask/detail/file_util.hpp"  // W5：adopt_stream / flush_and_sync
 
 using bitcask::io::IoError;
 using bitcask::io::OpenFlag;
@@ -294,18 +295,26 @@ TEST(FileLifecycle, AtomicRenameOverMappedFileKeepsViewContent) {
         << "旧视图必须保持旧内容（等价 POSIX unlink-while-mapped）";
 }
 
-TEST(FileLifecycle, OpenStreamAllowsDeleteWhileHeld) {
-    // field_schema 长期持有一个追加流。若退回 std::fopen，Windows 上
-    // 整个库目录都会因这一个句柄而删不掉。
+TEST(FileLifecycle, AdoptedStreamAllowsDeleteWhileHeld) {
+    // field_schema 长期持有一个追加流（field.schema）。它必须由
+    // io::open_handle 打开（恒带 FILE_SHARE_DELETE）再由 inline 的
+    // detail::adopt_stream 在**调用方模块**内包成 FILE*：
+    //   - 退回 std::fopen → Windows 上整个库目录都会因这一个句柄删不掉；
+    //   - 让库那侧建 FILE* → /MT 下跨 CRT 分配/释放（W5）。
     TempDir td;
     const auto path = td.file("held.dat");
-    std::FILE* f = bitcask::io::open_stream(path, "ab");
+    auto h = bitcask::io::open_handle(path, bitcask::io::OpenFlag::kNone,
+                                      bitcask::io::FileMode::kUmaskDefault);
+    ASSERT_TRUE(h);
+    std::FILE* f = bitcask::detail::adopt_stream(*h, "ab");
     ASSERT_NE(f, nullptr);
     ASSERT_EQ(std::fwrite("x", 1, 1, f), 1u);
     ASSERT_EQ(std::fflush(f), 0);
 
     EXPECT_TRUE(bitcask::io::remove_file(path))
-        << "io::open_stream 持有期间文件必须仍可删除"
+        << "长期持有的追加流不得阻止删除"
            "（Windows 上 std::fopen 不带 FILE_SHARE_DELETE）";
+    // 顺带守 W5 的另一半：flush_and_sync 只把内核句柄递进库里。
+    EXPECT_TRUE(bitcask::detail::flush_and_sync(f));
     std::fclose(f);
 }

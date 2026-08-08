@@ -90,8 +90,16 @@ cl /DBITCASK_STATIC_LIB app.c /I<c_api 头目录> bitcask_static.lib   :: 静态
 | 出处 | 谁分配 | 谁释放 / 使用 |
 |---|---|---|
 | `io::File::pread` 返回 `ReadOk{std::vector<std::byte>}` | 库 | 调用方析构 → 跨堆 free |
-| `io::open_stream()` 返回 `std::FILE*` | 库 | 调用方的 `fclose`（`field_schema.hpp` 是 header-only）|
-| `io::flush_and_sync_stream(std::FILE*)` | 调用方 | 库内的 `_fileno` / `_get_osfhandle` |
+
+> 曾经还有两处 `std::FILE*` 跨界（`io::open_stream` 返回、`io::flush_and_sync_stream` 收），
+> **已在 W5 消除**：`io.hpp` 现在只交换**内核句柄**，`FILE*` 的生成与拆解一律由
+> `detail/file_util.hpp` 里的 `adopt_stream` / `stream_handle` 完成——两者都是
+> `inline`，在调用方模块内展开，于是 `FILE*` 从头到尾只属于一份 CRT。
+> 代价是 Windows 上 `detail/file_util.hpp` 会引入 `<io.h>` / `<fcntl.h>`
+> 两个 CRT 小头（不引 `windows.h`，不带 `min`/`max` 宏）。
+>
+> 剩下的 `std::vector` 那条是常规 C++ ABI 约束（任何按值返回 STL 容器的 C++ 库
+> 都有），不值得为它改 API——按下面的规则用即可。
 
 在 `/MD`（动态 CRT，**CMake 与 vcpkg `x64-windows` 三元组的默认，也是本项目的
 构建方式**）下，全进程只有一份 CRT，上述三处都成立。只有当有人把它改成 `/MT`

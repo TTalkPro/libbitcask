@@ -65,9 +65,16 @@ int translate_open_flags(OpenFlag in) noexcept {
 }
 
 constexpr mode_t translate_mode(FileMode m) noexcept {
-    return m == FileMode::kWorldReadable
-               ? static_cast<mode_t>(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
-               : static_cast<mode_t>(S_IRUSR | S_IWUSR);
+    switch (m) {
+        case FileMode::kWorldReadable:  // 0644
+            return static_cast<mode_t>(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        case FileMode::kUmaskDefault:   // 0666——与 std::fopen 建档权限一致
+            return static_cast<mode_t>(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
+                                       S_IROTH | S_IWOTH);
+        case FileMode::kOwnerOnly:
+        default:                        // 0600
+            return static_cast<mode_t>(S_IRUSR | S_IWUSR);
+    }
 }
 
 }  // namespace
@@ -355,16 +362,6 @@ void sync_directory(const std::string& path) noexcept {
         ::fsync(dfd);
         ::close(dfd);
     }
-}
-
-bool flush_and_sync_stream(std::FILE* f) noexcept {
-    return std::fflush(f) == 0 && ::fdatasync(::fileno(f)) == 0;
-}
-
-// S37-6：POSIX 下就是 std::fopen——unlink 一个已打开的文件本就合法，
-// 无须任何额外共享位。差异全在 Windows 侧（见 io.hpp）。
-std::FILE* open_stream(const std::string& path, const char* mode) noexcept {
-    return std::fopen(path.c_str(), mode);
 }
 
 std::size_t page_size() noexcept {

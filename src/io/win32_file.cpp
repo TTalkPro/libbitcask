@@ -31,9 +31,6 @@
 
 #include <windows.h>
 
-#include <fcntl.h>    // _O_BINARY / _O_RDONLY / _O_APPEND
-#include <io.h>       // _get_osfhandle / _open_osfhandle / _close
-#include <stdio.h>    // _fileno / _fdopen
 
 #include <cerrno>
 #include <cstring>
@@ -659,76 +656,6 @@ bool atomic_rename(const std::string& from, const std::string& to) noexcept {
 // MOVEFILE_WRITE_THROUGH 承担——见上。
 void sync_directory(const std::string& path) noexcept {
     (void)path;
-}
-
-bool flush_and_sync_stream(std::FILE* f) noexcept {
-    if (std::fflush(f) != 0) return false;
-    const intptr_t osf = ::_get_osfhandle(::_fileno(f));
-    if (osf == -1) return false;
-    return ::FlushFileBuffers(reinterpret_cast<HANDLE>(osf)) != FALSE;
-}
-
-// S37-6：带 FILE_SHARE_DELETE 的 std::FILE*。
-//
-// 三步桥接：CreateFileW（我们自己定共享位）→ _open_osfhandle（把 HANDLE
-// 交给 CRT 的 fd 表，所有权随之转移）→ _fdopen（在 fd 上挂 FILE*）。
-// 此后 fclose 会一路关到底，调用方与 std::fopen 的用法完全一致。
-//
-// 之所以不能直接用 _fsopen/_wfsopen：它们的 _SH_* 只有 DENYNO/DENYRD/
-// DENYWR/DENYRW 四档，**没有一档包含 FILE_SHARE_DELETE**——CRT 根本不暴露
-// 这个位。
-std::FILE* open_stream(const std::string& path, const char* mode) noexcept {
-    if (mode == nullptr || mode[0] == '\0') return nullptr;
-
-    // 解析 mode：首字符 r/w/a 定基模式，其后 '+' 表示读写，'b' 在 Win32 层
-    // 无意义（文本/二进制之分在 CRT 层，由传给 _fdopen 的 mode 决定）。
-    bool plus = false;
-    for (const char* p = mode + 1; *p; ++p) {
-        if (*p == '+') plus = true;
-    }
-    DWORD access = 0, disposition = 0;
-    int   crt_flags = _O_BINARY;
-    switch (mode[0]) {
-        case 'r':
-            access      = plus ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;
-            disposition = OPEN_EXISTING;
-            if (!plus) crt_flags |= _O_RDONLY;
-            break;
-        case 'w':
-            access      = plus ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_WRITE;
-            disposition = CREATE_ALWAYS;
-            break;
-        case 'a':
-            access      = plus ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_WRITE;
-            disposition = OPEN_ALWAYS;
-            crt_flags  |= _O_APPEND;   // CRT 每次写前自行 seek 到尾
-            break;
-        default:
-            return nullptr;
-    }
-
-    auto wp = native_path(path);
-    if (!wp) return nullptr;
-    const HANDLE h = ::CreateFileW(
-        wp->c_str(), access,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, disposition, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return nullptr;
-
-    const int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(h), crt_flags);
-    if (fd == -1) {
-        ::CloseHandle(h);   // 所有权尚未转移，得自己收
-        return nullptr;
-    }
-    std::FILE* f = ::_fdopen(fd, mode);
-    if (f == nullptr) {
-        ::_close(fd);       // 所有权已在 CRT 手里，关 fd 即连带关 HANDLE
-        return nullptr;
-    }
-    // 'a' 模式下把指针摆到尾：_O_APPEND 保证每次**写**都落到尾，但
-    // std::fopen("ab") 后立刻 ftell 应得文件大小，这里对齐该观感。
-    if (mode[0] == 'a') (void)std::fseek(f, 0, SEEK_END);
-    return f;
 }
 
 std::size_t page_size() noexcept {

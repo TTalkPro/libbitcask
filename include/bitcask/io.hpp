@@ -125,6 +125,11 @@ constexpr bool has_flag(OpenFlag set, OpenFlag bit) noexcept {
 enum class FileMode : unsigned {
     kOwnerOnly     = 0,  // 0600
     kWorldReadable = 1,  // 0644
+    // W5：0666（实际权限由 umask 削）。存在的唯一理由是**逐字复刻
+    // `std::fopen` 的建档权限**——C 标准库建新文件用的就是 0666&~umask。
+    // 供「原先用 fopen、现改为 open_handle + detail::adopt_stream」的站点用，
+    // 保证 POSIX 侧权限位一字不差。新代码不该选它（库内文件应是 0600）。
+    kUmaskDefault  = 2,  // 0666
 };
 
 // IoError 只带 errno；NIF 层用 erl_errno_id() 翻成 atom，跟 legacy 行为
@@ -407,43 +412,33 @@ pwrite_once(FileHandle h, const void* buf, std::size_t len,
 // MOVEFILE_WRITE_THROUGH 承担（持久性契约不变，机制不同）。
 void sync_directory(const std::string& path) noexcept;
 
-// 已打开的 FILE* 流：fflush + fdatasync。两个返回值都检查——disk-full 下
-// fflush 失败而 fdatasync 对已落盘部分成功，就会 rename 出半截文件。
-[[nodiscard]] bool flush_and_sync_stream(std::FILE* f) noexcept;
+// W5：`flush_and_sync_stream(std::FILE*)` 已删除。它收调用方 CRT 建的 FILE*
+// 再在库里做 `_fileno`/`fileno`，是一处跨 CRT 边界；改为
+// `detail::flush_and_sync`（inline，在调用方模块内取出内核句柄后只把句柄传进
+// 本层的 sync_data）。见 detail/file_util.hpp 与 doc/api-c.md §2.1。
 
 // ---------------------------------------------------------------------------
-// 打开一个 std::FILE* 流（S37-6）。语义同 std::fopen，**唯一差别是持有期间
-// 该文件仍可被删除**。失败返回 nullptr。mode 支持 "r"/"w"/"a" + 可选 "+"/"b"。
+// W5：`open_stream(path, mode) -> std::FILE*` 已删除。
 //
-// 为什么需要它：**MSVC 的 CRT 用 `_SH_DENYNO` 开文件，共享位只有
-// FILE_SHARE_READ|FILE_SHARE_WRITE，没有 FILE_SHARE_DELETE，且 CRT 不提供
-// 任何开关能加上它**。于是任何被 std::fopen 长期持有的文件在 Windows 上都
-// 删不掉（实测 DeleteFileW 报 ERROR_SHARING_VIOLATION），连带整个目录都删不掉。
-// POSIX 侧本函数就是 std::fopen，零差别。
+// 它在**库这侧的 CRT** 里建出 FILE*，而调用方用**自己那份 CRT** 的 fclose 去
+// 关——`/MT` 下每个模块各带一份 CRT、各有一份堆与 fd 表，这一来一回就是跨 CRT
+// 的分配/释放。取而代之的形状是「库只交内核句柄，FILE* 由调用方自己包」：
 //
-// 只有**长期持有**的流需要用它。用完即关的读写（file_util 的 FilePtr、
-// AtomicFileWriter 的 tmp）继续用 std::fopen 即可——它们的持有窗口内不会
-// 有人来删该文件。
+//     auto h = io::open_handle(path, io::OpenFlag::kNone,
+//                              io::FileMode::kUmaskDefault);   // 带 SHARE_DELETE
+//     std::FILE* f = detail::adopt_stream(*h, "ab");           // inline，在调用方模块内
 //
-// ⚠️ **Windows CRT 边界约束：要求进程内所有模块共用同一份 CRT
-// （即全部 /MD，本项目的默认）。**
+// `detail::adopt_stream` 见 detail/file_util.hpp；跨库边界的只剩内核句柄。
+// 「为什么非要绕开 std::fopen」那半边理由不变：**MSVC 的 CRT 用 `_SH_DENYNO`
+// 开文件，共享位不含 FILE_SHARE_DELETE 且无开关**，被它长期持有的文件在
+// Windows 上删不掉（实测 ERROR_SHARING_VIOLATION），连带整个目录都删不掉。
+// 只有**长期持有**的流需要这么做；用完即关的读写继续用 std::fopen。
 //
-// 这不是本函数独有的——**本库的 C++ API 本就不是模块边界，只有 C API 是**。
-// `/MT` 下每个模块各带一份静态 CRT、各有一份自己的**堆与 fd 表**，于是：
-//   - `File::pread` 返回 `std::vector`：库这侧分配、调用方析构 → 跨堆 free；
-//   - 本函数在库这侧建 FILE*，而调用方（`field_schema.hpp` 是 header-only）
-//     用自己那份 CRT 的 fclose 去关；
-//   - `flush_and_sync_stream` 反过来——FILE* 由调用方的 CRT 建，传进来给
-//     本库的 `_fileno`/`_get_osfhandle` 用。
-// 后两者会拿到「别人 fd 表里的号」，触发 CRT 的 invalid-parameter handler →
-// `__fastfail`：**进程当场无声消失，退出码 0xC0000409，terminate/abort 钩子
-// 都不触发**，现场只剩一个退出码。
-// （该状态码名为 STACK_BUFFER_OVERRUN，与栈无关，只是 CRT 致命退出的统一出口。）
-//
-// 跨模块使用本库请走 C API（`c_api/bitcask_c.h`）。CMakeLists 在配置期检查
-// CRT 选择并给出告警。
-[[nodiscard]] std::FILE* open_stream(const std::string& path,
-                                     const char* mode) noexcept;
+// ⚠️ 剩余的一处 CRT/堆 跨界：`File::pread` 返回 `std::vector`（库这侧分配、
+// 调用方析构）。那是常规 C++ ABI 约束，靠「跨模块只用 C API」这条规则解决，
+// 不值得为它改 API。整套约束见 doc/api-c.md §2.1。
+// ---------------------------------------------------------------------------
+
 
 // 建议宿主预取 [addr, addr+len) 的页（POSIX: madvise(MADV_WILLNEED)；
 // Windows: PrefetchVirtualMemory）。尽力而为，失败无碍（页仍会按需缺页装入）。

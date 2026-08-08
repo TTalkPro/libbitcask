@@ -63,13 +63,13 @@ if(MSVC)
     # S37-6：CRT 模型检查。**要求全进程共用一份 CRT（/MD），这是默认值。**
     #
     # `/MT` 下每个模块各带一份静态 CRT、**各有一份自己的堆与 fd 表**。而本库的
-    # **C++ API 本就不是模块边界**——只有 C API 是。跨界的 CRT/STL 对象至少三处：
-    #   - io::File::pread 返回 std::vector（库这侧分配、调用方析构）→ 跨堆 free；
-    #   - io::open_stream 在库这侧建 FILE*，header-only 的 field_schema 用调用方
-    #     那份 CRT 的 fclose 去关；
-    #   - io::flush_and_sync_stream 反向：收调用方建的 FILE*，喂给库这侧的 _fileno。
-    # 在 /MT + 多模块（尤其是 bitcask.dll）下，这些会跨堆释放、或拿到「别人 fd 表
-    # 里的号」，触发 invalid-parameter handler → __fastfail：**进程无声消失、
+    # **C++ API 本就不是模块边界**——只有 C API 是。W5 之后仍跨界的是：
+    #   - io::File::pread 返回 std::vector（库这侧分配、调用方析构）→ 跨堆 free。
+    # （两处 FILE* 跨界已在 W5 消除：io.hpp 现在只交换内核句柄，FILE* 的生成与
+    #  拆解由 detail/file_util.hpp 的 inline adopt_stream / stream_handle 在调用方
+    #  模块内完成。）
+    # 在 /MT + 多模块（尤其是 bitcask.dll）下，跨堆释放会触发 CRT 的
+    # invalid-parameter handler → __fastfail：**进程无声消失、
     # 退出码 0xC0000409、terminate/abort 钩子都不触发**，现场只剩一个退出码。
     # （该状态码名为 STACK_BUFFER_OVERRUN，与栈无关，只是 CRT 致命退出的统一出口。）
     #
@@ -80,10 +80,11 @@ if(MSVC)
        NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
         message(WARNING
             "libbitcask: CMAKE_MSVC_RUNTIME_LIBRARY=${CMAKE_MSVC_RUNTIME_LIBRARY} "
-            "选的是静态 CRT(/MT)。本库的 C++ 头有 FILE* 跨模块（见 io.hpp 的 "
-            "open_stream 注释）；若同时使用 bitcask.dll 或把本库与宿主分在不同模块，"
-            "会在 CRT 的 fd 表上撞车并以 __fastfail(0xC0000409) 无声退出。"
-            "仅当整个进程是单模块静态链接、或只经 C API 使用时才安全。")
+            "选的是静态 CRT(/MT)。本库的 C++ API 会按值返回 STL 容器"
+            "（io::File::pread 等），库这侧分配、调用方析构；若同时使用 "
+            "bitcask.dll 或把本库与宿主分在不同模块，就是跨堆释放，"
+            "会以 __fastfail(0xC0000409) 无声退出。仅当整个进程是单模块静态链接、"
+            "或只经 C API 使用时才安全。详见 doc/api-c.md §2.1。")
     endif()
 endif()
 
