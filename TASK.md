@@ -772,6 +772,10 @@ Windows 实现，单跑 5/5 全过、`ctest -j 8` 下偶发失败。两处原因
 1. `.github/workflows/ci.yml` 加 `windows-2022` job（MSVC Release + 全量 ctest）。
 2. 加 `BITCASK_SIMD_MAX` 矩阵（scalar/avx2/avx512），覆盖所有 ISA 档位对拍。
 3. `/WX` 清理收口；bench 对拍（Linux vs Windows 同档）。
+   > **Linux 侧的 `-Werror` 已于 2026-08-08 提前结清**（见 P 段复验记录 ④）：
+   > `werror-lib` 此前从 v6.1.0 起就没绿过，14 条已全部修根因，`src/`+`include/`+
+   > `c_api/` 告警面归零。本项在 Linux 侧只剩 `tests/`+`bench/` 的告警（18 个文件，
+   > 该 job 不构建）。MSVC 的 `/WX` 仍未开，账见 S37-4 落地记录的 94 条。
 4. 文档：README 加 Windows 构建段、`doc/format-zh.md` 补持久性机制差异、CHANGELOG。
 
 > ⚠️ **需明确承认的护栏损失**：Windows/MSVC **无 TSan**（ASan 有，UBSan 无）。
@@ -1115,13 +1119,39 @@ S37-4 记录担心「若因漏包含头而恒 0，TSan 注解会静默失效，�
 **TSan 树里引用 `__tsan_acquire`/`__tsan_release`，普通树里不引用**。宏在两种
 构建下各自取到了正确的值。
 
-**仍然红的两条 `-Werror`，与本届无关（v6.1.0 基线同样红）**：
-`src/bm25/inverted.cpp:291`（`term_freqs` 未使用形参）与
-`src/fileops/oki_state.cpp:273`（`next` shadow）。基线上还多两条
-`hnsw.cpp` 的 `ftruncate` 返回值未查 —— **那两条恰是本届收编裸 POSIX 调用时
-顺带修掉的**。即本届在 `werror-lib` 上净修 2 条、新增 1 条（已修）。
-（本地只有 g++ 14.2，CI 用 g++-13；但基线与 HEAD 是同一编译器对拍，结论不受影响。）
-清掉剩下两条属 S37-7 的 `/WX` 收口范围。
+**④ `werror-lib` job 早在 v6.1.0 就是红的，本次一并修完（S37-7 的 `-Werror` 收口提前结清）**
+
+去掉 `-Wcomment` 那条之后，`werror-lib` 仍然编不过 —— 而且**不是本届引入**：
+v6.1.0 基线（另起 worktree 实测）同样红，且比 HEAD 多两条
+（`hnsw.cpp` 的 `ftruncate` 返回值未查，**恰是本届收编裸 POSIX 调用时顺带修掉的**）。
+即这个 job 长期处于「配置了但从没绿过」的状态，`-Werror` 护栏事实上不存在。
+
+由于 `-Werror` 遇错即停，每修一批才露出下一批，共四轮 **14 条**，全部按「修根因、
+不降告警级别」处理（没有加任何 `-Wno-*`）：
+
+| 文件 | 条数 | 类别 | 修法 |
+|---|---|---|---|
+| `bm25/inverted.cpp` | 1 | `-Wunused-parameter` | `remove_doc` 的 `term_freqs`：V2 删除不动 posting 行，只调统计。标 `[[maybe_unused]]` **保留参数名**并说明为何空着 |
+| `search/text_plugin.cpp` | 1 | `-Wunused-parameter` | `load_component` 的 `chain_seq`：S27-3 停用 text 的 delta 链后无用，但三插件签名同形态、vector 侧仍在用。同上处理 |
+| `fileops/oki_state.cpp` | 1 | `-Wshadow` | 内层 `std::vector<DeltaRow> next` 遮蔽外层 `OkiManifest next` → 改名 `kept`（本来就更贴切：前缀里持留的 + 前缀之后新追加的）|
+| `cask/cask.cpp` | 3 | `-Wshadow` | 三个 `lk(*done_mu)` 遮蔽外层 `lk(ckpt_mu_)` → 改名 `done_lk` |
+| `segment.hpp` | 4 | `-Wconversion` | `DocId`(u64) → mmap doc_store 面(u32) 的隐式收窄。新增私有 `local_docid()`：显式转换 + `assert` 上界。**这不是纯消音**——段内 docid 本就是 u32 稠密（`doc_count()` 即 u32），隐式收窄恰恰是「哪天真溢出也没人发现」的形态 |
+| `segment.hpp` | 3 | `-Wmissing-field-initializers` | `SegmentView`/`MultiFieldSegmentView` 的 `pin` 聚合初始化时省略。**钉段确实是调用方的事**（`text_plugin.cpp` 拿到 view 后自己设），显式写 `{}` 让「没钉」是决定而非遗漏 |
+| `seq_shard_table.hpp` | 2 | `-Wclass-memaccess` | `memset` 清桶数组。`Bucket` 只因带**默认成员初始化器**而「非平凡默认构造」，但它**平凡可复制**，全零字节就是合法空桶。收进 `zero_buckets()`：`static_assert(is_trivially_copyable_v<Bucket>)` 把真正依赖的性质钉死 + 转 `void*` 消告警，生成代码不变 |
+
+**结果：`src/` + `include/` + `c_api/` 的告警面归零**（干净树 `-Werror` 库构建
+0 错误 0 告警，13 个静态库 + `libbitcask.so.6.1.0` 全部产出）。Debug 树里剩余的
+告警**全部落在 `tests/` 与 `bench/`**（18 个文件），而 `werror-lib` 不构建它们
+—— 要不要一并清，是独立取舍。
+
+> ⚠️ 本地只有 g++ 14.2，CI 用 **g++-13**。修的都是 `-Wshadow`/`-Wunused-parameter`/
+> `-Wconversion`/`-Wmissing-field-initializers`/`-Wclass-memaccess`/`-Wcomment`
+> 这类两个版本都有的老告警，且是修根因不是压制，g++-13 上应同样成立；
+> 但「g++-13 有而 g++-14 没有的告警」这一可能性本地照不到，以 CI 首跑为准。
+
+**改动落在 seqlock 头与公开头上，故全矩阵复跑**：gcc/clang Debug 各 **749/749**、
+Release+LTO+bench 编译、ASan **749/749**、TSan **747/747**（按 CI 豁免）、
+干净树 `-Werror` 构建 —— 全绿。
 
 ### 明确不做
 
@@ -1155,6 +1185,7 @@ S37-4 记录担心「若因漏包含头而恒 0，TSan 注解会静默失效，�
 | P 段 P1 `.prev` 轮转收进 seam | [done]（4 处；立项理由被实测推翻，改按纪律做。**Linux 已复验**）|
 | P 段 P2 读路径改走定位读 | [done]（原计划是写路径缓冲层，实测把靶心改到 2 GiB 天花板。**Linux 已复验**，2.54 GiB 用例走稀疏文件 3 ms 实跑未跳过）|
 | **Linux 全面复验（P 段 + S37-4/5 遗留）** | ✅ done（2026-08-08）：Debug g++/clang 各 **749/749**、Release+LTO 编译、**ASan 749/749**、**TSan 747/747**、干净树 configure、守门脚本。查出 1 条真回归（`-Wcomment` 打断 `werror-lib`，已修）+ 1 个过窄断言（已修）；TSan 那条失败是预存 CI 豁免项，已用 v6.1.0 基线对拍证否 |
+| **`werror-lib` 修复（S37-7.3 的 Linux 半边）** | ✅ done（2026-08-08）：该 job 自 v6.1.0 起从未绿过。14 条分四轮全部修根因（无 `-Wno-*`），`src/`+`include/`+`c_api/` 告警面归零；干净树 `-Werror` 构建 0 错误 0 告警。改动含 seqlock 头与公开头，已全矩阵复跑全绿 |
 | P 段 P3–P4 | [todo] 未开始（W5 已于 6ad5b4b 结清）|
 
 ### 待确认项
