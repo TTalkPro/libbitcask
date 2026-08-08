@@ -2726,7 +2726,9 @@ std::expected<void, CaskFault> Cask::checkpoint() {
                         last_ckpt_ord_.store(wm, std::memory_order_relaxed);
                     }
                     {
-                        std::lock_guard<std::mutex> lk(*done_mu);
+                        // done_lk 而非 lk：本函数上方已有一个 lk(ckpt_mu_),
+                        // 同名会 shadow 它(-Wshadow,werror-lib 带 -Werror)。
+                        std::lock_guard<std::mutex> done_lk(*done_mu);
                         *done_val = result;
                     }
                     done_cv->notify_all();
@@ -2748,7 +2750,7 @@ std::expected<void, CaskFault> Cask::checkpoint() {
                     last_ckpt_ord_.store(wm, std::memory_order_relaxed);
                 }
                 {
-                    std::lock_guard<std::mutex> lk(*done_mu);
+                    std::lock_guard<std::mutex> done_lk(*done_mu);  // 同上,避免 shadow lk(ckpt_mu_)
                     *done_val = result;
                 }
                 done_cv->notify_all();
@@ -2761,8 +2763,8 @@ std::expected<void, CaskFault> Cask::checkpoint() {
             // 已拦截，但双保险）；或 reducer 线程异常卡死。
             int wait_result = 0;
             {
-                std::unique_lock<std::mutex> lk(*done_mu);
-                done_cv->wait_for(lk, std::chrono::seconds(30),
+                std::unique_lock<std::mutex> done_lk(*done_mu);  // 同上
+                done_cv->wait_for(done_lk, std::chrono::seconds(30),
                                   [&] { return *done_val != 0; });
                 wait_result = *done_val;
             }
