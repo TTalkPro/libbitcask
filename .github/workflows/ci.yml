@@ -13,6 +13,22 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # 窄路径编码约定（P0 / W4）。纯 grep，秒级，放最前面当快速失败。
+  #
+  # 这条约定在类型上看不见：std::string 既能装 UTF-8 也能装 GBK，而
+  # fs::path(窄) / path.string() / std::fopen 在 Windows 上都按系统 ANSI
+  # 代码页编解码，编译期毫无提示，且**只在非 ASCII 路径上暴露**——全部现有
+  # 测试都是 ASCII 路径，绿得毫无意义。故用 grep 补上强制力。
+  # ---------------------------------------------------------------------------
+  path-encoding:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check narrow-path encoding convention
+        run: bash scripts/check-path-encoding.sh
+
+  # ---------------------------------------------------------------------------
   # Release 构建 + 全量 ctest。
   # ---------------------------------------------------------------------------
   build-test:

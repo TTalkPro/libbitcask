@@ -3,6 +3,7 @@
 #include <cerrno>
 
 #include <utility>
+#include "bitcask/detail/file_util.hpp"
 
 namespace bitcask::lock {
 
@@ -32,7 +33,7 @@ void FileLock::release_quiet() noexcept {
         // 可能会被旧 reader 读出 garbage。这是 legacy lock_release 里的
         // 既定顺序，照搬。
         if (is_write_lock_ && !filename_.empty()) {
-            std::remove(filename_.c_str());
+            bitcask::detail::remove_utf8(filename_);
         }
         io::close_handle(fd_);
         fd_ = io::kInvalidHandle;

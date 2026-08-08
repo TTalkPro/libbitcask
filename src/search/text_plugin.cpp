@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <map>
 #include <system_error>
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::text {
 
@@ -32,7 +33,7 @@ namespace {
 constexpr const char* kBm25CkptName = "bm25.ckpt";
 
 std::string comp_path(std::string_view dir) {
-    return (std::filesystem::path(dir) / kBm25CkptName).string();
+    return bitcask::detail::to_utf8(bitcask::detail::from_utf8(dir) / kBm25CkptName);
 }
 
 // S12-2：自动压实的节流下限（与原 SearchLayer 常量一致）。
@@ -1100,8 +1101,8 @@ bool TextPlugin::save_component_base(std::string_view dir,
     const std::string fp = comp_path(dir);
     const std::string prev = fp + ".prev";
     std::error_code ec;
-    if (std::filesystem::exists(fp, ec)) {
-        std::filesystem::rename(fp, prev, ec);
+    if (std::filesystem::exists(bitcask::detail::from_utf8(fp), ec)) {
+        std::filesystem::rename(bitcask::detail::from_utf8(fp), bitcask::detail::from_utf8(prev), ec);
     }
     sc::SectionWriter sw;  // S20-1 R4
     // S27-3 步骤 3:kBm25Default/kBm25Fields 退役——倒排数据在各段文件内
@@ -1275,7 +1276,7 @@ void TextPlugin::maybe_merge_segments() {
 
     const auto [new_id, fname] = segment_set_->reserve_seg_file();
     const std::string path =
-        (std::filesystem::path(segment_set_->dir()) / fname).string();
+        bitcask::detail::to_utf8(bitcask::detail::from_utf8(segment_set_->dir()) / bitcask::detail::from_utf8(fname));
     search::MergeResult mr;
     if (!search::merge_segments_v2(path, new_id, inputs, mr)) {
         return;  // 合并失败:输入原样保留(输出残留 tmp 已由 writer 清理)

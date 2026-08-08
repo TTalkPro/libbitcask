@@ -61,6 +61,16 @@ target_link_libraries(bitcask_posix_file_test PRIVATE
     bitcask_sanitizers
 )
 
+# P0：窄路径 = UTF-8 的库级约定。链 fileops 是为了用 scan_dir 覆盖
+# 「directory_iterator 产出的真·宽路径转窄」这条形态（见文件头）。
+add_executable(bitcask_path_utf8_test path_utf8_test.cpp)
+target_link_libraries(bitcask_path_utf8_test PRIVATE
+    GTest::gtest_main
+    bitcask_fileops
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 add_executable(bitcask_file_lock_test file_lock_test.cpp)
 target_link_libraries(bitcask_file_lock_test PRIVATE
     GTest::gtest_main
@@ -370,6 +380,7 @@ gtest_discover_tests(bitcask_smoke_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_cpu_features_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_codec_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_posix_file_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_path_utf8_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_file_lock_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_index_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})

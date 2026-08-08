@@ -1258,7 +1258,7 @@ void InvertedIndex::serialize(std::vector<std::byte>& out) const {
 auto InvertedIndex::save(std::string_view path) const -> bool {
     std::vector<std::byte> buf;
     serialize(buf);
-    auto* f = std::fopen(std::string(path).c_str(), "wb");
+    auto* f = bitcask::detail::fopen_utf8(std::string(path), "wb");
     if (!f) return false;
     const bool wrote =
         buf.empty() || std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();

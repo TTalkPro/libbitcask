@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <filesystem>
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::oki {
 
@@ -34,13 +35,14 @@ void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep,
     std::vector<std::string> still;
     for (const auto& p : backlog) {
         std::error_code rm_ec;
-        std::filesystem::remove(p, rm_ec);
-        if (rm_ec && std::filesystem::exists(p)) still.push_back(p);
+        const auto pp = bitcask::detail::from_utf8(p);
+        std::filesystem::remove(pp, rm_ec);
+        if (rm_ec && std::filesystem::exists(pp)) still.push_back(p);
     }
     backlog = std::move(still);
     std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
-        const auto name = e.path().filename().string();
+    for (const auto& e : std::filesystem::directory_iterator(bitcask::detail::from_utf8(dir), ec)) {
+        const auto name = bitcask::detail::to_utf8(e.path().filename());
         // S36-1：外排 spill 残件（kv.oki.spill-*，仅崩溃遗留）一律清理。
         if (name.rfind("kv.oki.spill-", 0) == 0) {
             std::error_code rm_ec;
@@ -53,7 +55,7 @@ void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep,
         std::error_code rm_ec;
         std::filesystem::remove(e.path(), rm_ec);
         if (rm_ec && std::filesystem::exists(e.path())) {
-            backlog.push_back(e.path().string());  // B4：滞留重试
+            backlog.push_back(bitcask::detail::to_utf8(e.path()));  // B4：滞留重试
         }
     }
 }

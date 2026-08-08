@@ -820,10 +820,166 @@ S37-7 (1.5周) ───── CI + 收尾
 | T8 | 搜索读屏障无界等待（`prepare_search` 饥饿）| ⏸ 4 项前置未满足（原文 62789cd）|
 | T12 | HNSW ckpt 去重（~115 行）| ⏸ 默认不做（注释同步已替代）|
 | **W1** | `File::open` 默认**不设 `O_CLOEXEC`** | 🔍 S37-1 期间发现：11 处裸 `::open` 全部显式带 `O_CLOEXEC`（收编后由 `kCloseOnExec` 原样保留），而走 `io::File` 的核心 KV 路径（data/hint/oki run/write.lock）**没有** —— fork+exec 场景下 data file fd 泄漏进子进程。现有 fork 测试只 fork 不 exec 故未暴露，**S37-2 改 exec-self 后会变成真实暴露面**。收编时未擅自统一（那是行为变化，超出「零行为变化」约束）。**待评估**：给核心路径补 `kCloseOnExec`。Windows 侧句柄默认不继承，无对应问题 |
-| **W5** | Windows CRT/堆 边界（/MT 下每模块各一份）| 🟡 部分收口。**准确范围：本库的 C++ API 本就不是模块边界，只有 C API 是** —— `io::File::pread` 返回 `std::vector`（库这侧分配、调用方析构）、`io::open_stream` 返回 `FILE*`（同理）、`io::flush_and_sync_stream` 反向收 `FILE*`。`/MD`（本项目默认，已核实 `-MDd`）下全部成立；`/MT` + 多模块下是跨堆 free 与跨 fd 表查号，失败形态为 **invalid-parameter handler → `__fastfail`，进程无声消失、退出码 0xC0000409、terminate/abort 都不触发**（参考 `../coxswain` W9.9，当时靠 cdb 取栈才定位；该状态码名为 STACK_BUFFER_OVERRUN，与栈无关）。✅ 已做：配置期告警（选静态 CRT 时指名道姓）+ `io.hpp` 注释 + **`doc/api-c.md` §2.1 与 README 的 Windows 段写明「跨模块只用 C API」**。⬜ 待办：考虑把 `flush_and_sync_stream` 改成收句柄而非 `FILE*`（三处里最刺眼的一处——句柄是内核对象，不受 CRT 分裂影响；`pread` 返回 `std::vector` 属常规 C++ ABI 约束，改动面大得多，不值得为它动 API）|
-| **W4** | 窄路径的编码约定 | 🔍 S37-5 引入：Windows 后端把窄路径**一律按 UTF-8** 解读（严格拒非法序列，不退回 ANSI 猜测）。但库内多处经 `fs::path::string()` 产出窄路径，它在 Windows 上走**系统 ANSI 代码页**。纯 ASCII 两者一致（现有全部测试与典型部署），**非 ASCII 路径会报 EINVAL**。修法是把这些站点换成 `u8string()` 并统一「窄路径 = UTF-8」这条库级约定；面积需先量（S37-4 期间已新增 8 处 `.string()`）。Linux 侧 `string()`/`u8string()` 等价，无影响 |
+| ~~W5~~ | Windows CRT/堆 边界（/MT 下每模块各一份）| ✅ 结清。**准确范围：本库的 C++ API 本就不是模块边界，只有 C API 是。** 原有三处跨界：`io::File::pread` 返回 `std::vector`（库这侧分配、调用方析构）、`io::open_stream` 返回 `FILE*`、`io::flush_and_sync_stream` 反向收 `FILE*`。`/MD`（本项目默认，已核实 `-MDd`）下全部成立；`/MT` + 多模块下是跨堆 free 与跨 fd 表查号，失败形态为 **invalid-parameter handler → `__fastfail`，进程无声消失、退出码 0xC0000409、terminate/abort 都不触发**（参考 `../coxswain` W9.9，当时靠 cdb 取栈才定位；该状态码名为 STACK_BUFFER_OVERRUN，与栈无关）。✅ 已做：配置期告警 + `io.hpp` 注释 + `doc/api-c.md` §2.1 与 README 的 Windows 段（36655bd）+ **两处 `FILE*` 跨界消除：seam 只交换内核句柄，`FILE*` 的生成与拆解由 `detail/file_util.hpp` 的 inline `adopt_stream` / `stream_handle` 在调用方模块内完成**（6ad5b4b）。余下 `pread` 返回 `std::vector` 属常规 C++ ABI 约束（任何按值返回 STL 容器的 C++ 库都有），靠「跨模块只用 C API」这条规则解决，不为它动 API |
+| ~~W4~~ | 窄路径的编码约定 | ✅ P0 结清。立项时以为只是「45 处 `.string()` 产出 ANSI → seam 报 EINVAL」，实测（CP936 简中 Windows）比这严重两级：`fs::path(窄串)` 这个**构造方向**同样走 ANSI，两头的错误互相抵消，才让纯 ASCII 与「碰巧是合法 GBK」的数据看着正常；一旦字节不是合法 GBK，**构造直接抛 `std::system_error`**，而 `detail::fsync_parent_dir` 是 `noexcept` 且是全库 9 个原子写站点的公共收尾 ⇒ **`std::terminate`**。修法见 P 段 P0 |
 | **W2** | `bitcask_format` → `bitcask_io` 的 PUBLIC 依赖 | 🔍 S37-1 引入（见落地记录）。当前无环且必要，但「记录 codec 层依赖 I/O 层」是轻微的分层异味。若 S37-4 把 13 个 STATIC 改 OBJECT 库，可顺带复核是否有更干净的归置 |
 | ~~W3~~ | `count_os_threads()` 读 `/proc/self/task` | ✅ S37-5 结清：补 `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` 实现（按 owner pid 过滤），**没有**把用例标 Linux-only——AT5 守的「线程数与库数解耦」是平台无关的结构性保证，在 Windows 上同样值得守。原实现在非 Linux 上恒返回 0，而断言的是差值，0-0=0 直接失败 |
+
+---
+
+## 🔵 P 段 · 路径编码与 stdio 收编（W4 后续）
+
+来源：S37 收尾后复盘「Windows 侧是否全用原生 API」。结论是**核心 I/O / 内存 /
+进程层已是纯原生 Win32**——`src/io/win32_file.cpp`（770 行）用的是 `CreateFileW`、
+`ReadFile`/`WriteFile`+`OVERLAPPED`、`SetFileInformationByHandle(FileEndOfFileInfo)`、
+`CreateFileMappingW`/`MapViewOfFile`、`MoveFileExW`、`DeleteFileW`、
+`GetFileInformationByHandle`、`PrefetchVirtualMemory`、`OpenProcess`+`GetProcessTimes`，
+**没有一处走 CRT 的 POSIX 兼容层**（`_open`/`_read`/`_lseek` 零使用）；SIMD 派发用
+`__cpuidex`/`_xgetbv`，测试替代 `fork` 的是 `CreateProcessW`。
+
+未原生的只剩两类，各有各的性质：
+
+| 类 | 面积 | 性质 |
+|---|---|---|
+| CRT stdio（`std::FILE*`）| 10 个文件 51 处调用 | **真问题**：不带 `FILE_SHARE_DELETE`；且是库内第二种文件通货（另一种是 `io::FileHandle`，69 处）|
+| `std::filesystem` | 13 个文件 78 处调用 | **基本不是问题**：MSVC 的实现底下已经是 `DeleteFileW` 那一套，无 CRT 堆/fd 表问题 |
+
+### 顺序约束 —— P0 必须最先，否则 P1 是倒退
+
+`fs::remove(p)` 的 `p` 在 Windows 上**本来就是宽字符**（`fs::path` 内部是 `wstring`），
+根本不经过窄字符这一道，**对非 ASCII 路径是能工作的**；而
+`io::remove_file(p.string())` 会先被 `.string()` 转成 ANSI、再被 `widen()` 的
+`MB_ERR_INVALID_CHARS` 判为非法 UTF-8 → `EINVAL`。
+
+**所以在编码修好之前，任何「把 `fs::` 站点收进 seam」的动作都是把一个能用的路径
+换成一个不能用的路径。** 这条推翻了直觉上的排序（「先做小的 rename 收编」），
+P1 必须排在 P0 之后。
+
+### P0 · 路径编码统一 ✅ done
+
+**立项时的判断错了两处，实测（2026-08-08，VS 18 / MSVC 14.51 / `GetACP()==936`）
+纠正如下**——这也是「动 45 处之前先花二十分钟写探针」换回来的：
+
+1. **不只是 `.string()` 一个方向。** `fs::path(窄串)` 的**构造**同样走 ANSI 代码页。
+   两头各错一次、方向相反，于是往返无损——纯 ASCII 与「UTF-8 字节碰巧也是合法
+   GBK」的数据（如「测试」）全都看着正常。这解释了为什么 733 个用例一直全绿。
+2. **失败形态不止 `EINVAL`，最坏是 `std::terminate`。** 字节不是合法 GBK 时
+   （如「测试库」），`fs::path` 构造**直接抛 `std::system_error`**
+   （`ERROR_NO_UNICODE_TRANSLATION`）。而 `detail::fsync_parent_dir` 是
+   `noexcept`，且是 `atomic_write_bytes` / `AtomicFileWriter::commit` 的收尾，
+   即**全库 9 个原子写站点的公共出口**：库目录名带中文 → 写任何东西 → 进程挂。
+
+三种形态实测汇总：
+
+| 数据 | `fs::path(UTF-8)` | 结果 |
+|---|---|---|
+| 碰巧也是合法 GBK | 静默解错成别的宽字符 | 往返抵消，seam 能用；但该 path 交给 `fs::exists`/`ifstream` 时指向**另一个名字** |
+| 不是合法 GBK | **抛 `std::system_error`** | 穿过 `noexcept` ⇒ `std::terminate` |
+| 真·宽来源（`directory_iterator`）| `.string()` 编出 GBK | seam `EINVAL`；`remove_file` 返 false 而文件仍在 |
+
+**落地**：新增 `include/bitcask/detail/path_utf8.hpp`，一对 `from_utf8` /
+`to_utf8` 把两个方向都钉死在 UTF-8 上（走 `char8_t` 重载，由标准保证语义，
+不碰代码页、不需要 `windows.h`）。**两者都是 `noexcept`**：标准转换在非法
+UTF-8（孤立续字节、截断序列、超长编码、代理区）下会抛，而调用方多为
+`noexcept` 或返 `bool`/`expected` 的风格——失败收敛成空值，下游照常返错。
+配套 `fopen_utf8`（Windows 落 `_wfopen`）与 `remove_utf8`（走
+`io::remove_file`），因为 CRT 的 `fopen`/`remove` 同样按 ANSI 解释窄路径。
+
+**面积**：59 处（52 + 守门脚本揪出的 7 处），覆盖 15 个文件的窄↔`fs::path`
+两个方向，以及 `std::fopen` ×5 / `std::remove` ×2。**成对改动**是硬要求——
+只改一头会把「两次错误抵消」拆散，反而把形态 1 从「能用」变成「不能用」。
+
+**守门**：`scripts/check-path-encoding.sh` + CI 的 `path-encoding` job。这条
+约定在类型上看不见（`std::string` 既能装 UTF-8 也能装 GBK），且只在非 ASCII
+路径上暴露，靠评审守不住。对照 RocksDB：它把每个路径 API 塞进 `RX_*` 宏
+（`RX_CreateFile`/`RX_FN`），绕过转换层在结构上就写不出来；我们选普通函数 +
+typedef 换可读性，代价就是没那层强制力，用 grep 补回来。
+
+**测试**：`tests/path_utf8_test.cpp` 9 个用例，三种形态各有对应，含
+`AtomicWriteInNonAsciiDirDoesNotTerminate`（守 `noexcept` 那条）与
+`ScannerYieldsSeamUsablePaths`（守 `directory_iterator` 那条）。
+
+**验证**：msvc-debug 745 用例，新增 9 个全绿，其余无回归
+（`Hnsw.ConcurrentReadersWithSingleWriter` 在 `-j 8` 下超 300s 预算，单独跑
+184s 通过，是 CPU 争用不是回归）。**Linux 侧未编未跑**——`from_utf8`/`to_utf8`
+在 POSIX 下退化成拷贝，但仍需一次 `gcc-release` 复验。
+
+<details><summary>立项时的原始判断（已被实测推翻，留档）</summary>
+
+### P0 · 路径编码统一（前置，45 处）
+
+`.string()` 在 `src/` + `include/` 出现 **45 次**，集中在 `fileops/migrate.cpp`(16)、
+`search/vector_plugin.cpp`(7)、`cask/cask.cpp`(5)；全库**没有一处**用 `u8string()`。
+
+**P0.0 前置验证（必须先做，可能使 P0 归零）**：整段建立在「MSVC 的
+`path::string()` 是 ANSI」上。MSVC STL 的 narrow 转换走 `__std_fs_code_page()`，
+默认 `CP_ACP`，但**进程清单声明 ACP=UTF-8 时它返回 `CP_UTF8`**，那样现状就没有
+bug。所以第一步是一个非 ASCII（中文）路径的用例，Windows + Linux 各跑一遍，
+确认失败形态真的是 `EINVAL`。**不确认就动 45 处，是拿假设换工作量。**
+
+**P0.1 修法选型**：
+
+| | A. 统一到 UTF-8 窄串 | B. seam 直接收 `fs::path` |
+|---|---|---|
+| 做法 | 加 `detail::to_utf8(const fs::path&)`，45 处 `.string()` 换掉 | `open_handle(const fs::path&, …)`，Win32 后端直接 `c_str()` 拿宽串 |
+| 编码转换 | 仍有一次（UTF-8 → UTF-16）| **零次**，最彻底 |
+| 代价 | 45 处机械改动 | seam 签名变（69 处调用点）+ `<filesystem>` 进公开头 |
+
+**选 A。** 决定性理由是 B 要把 `<filesystem>` 拖进 `io.hpp`——那个头现在只包 8 个
+标准头，克制得很刻意；且 c_api 边界本来就是 UTF-8 `char*`，B 到了那里还是要转，
+彻底性打折。A 另有一个 B 没有的好处：改完可加 CI grep 禁止裸 `.string()`，
+把「窄路径 = UTF-8」这条库级约定固化成可执行的守门规则。
+
+</details>
+
+### P1 · 语义：两处 `fs::rename` 收进 seam（依赖 P0）⬜
+
+`src/keydir/docmap_ckpt.cpp:223` 与 `src/search/text_plugin.cpp:1104`，形态相同
+（base → `.prev` 轮转），绕过了 `io::atomic_rename`，因而拿不到
+`MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`。
+
+先答语义问题再动手：这两处**真需要 write-through 吗**？它们是写新 base 之前的
+备份轮转，后面紧跟 `SearchCheckpoint::write` 的真正原子发布——若 `.prev` 只是
+崩溃后的兜底副本，write-through 是多余开销。**覆盖语义**（目标已存在时是否替换）
+则是必须确认的。查完可能的结论有两个，「保留 `fs::rename` 并加注释说明为何不需要」
+同样是正当结论。
+
+### P2 · `AtomicFileWriter` 换缓冲层 ⬜
+
+在 seam 之上加 `detail::BufferedWriter`（`FileHandle` + 一块 buffer + 偏移，
+约 200 行 + 边界测试：短读、EOF、flush 失败、超大写）。**注意不要重写 native
+读写**——`pread_once`/`pwrite_once` 在两个平台上都已是原生实现，stdio 现在唯一
+还提供的东西是缓冲。
+
+`AtomicFileWriter`（`detail/file_util.hpp:242`）先换：全库 9 个原子写站点共用它，
+一处改动覆盖面最大，且改完 tmp 的 fsync 直接用句柄，不必绕 `stream_handle`。
+
+### P3 · `field_schema` 换 `BufferedWriter` ⬜
+
+stdio 调用最密的一处（14 次）。换完就彻底不碰 `FILE*`，6ad5b4b 引入的
+`adopt_stream` 降级为纯过渡设施。
+
+### P4 · 错误模型：**收窄，不做统一** ⬜
+
+13 个文件用 `std::error_code`，但绝大多数是 `fs::remove(p, ec)` 这种**尽力而为、
+`ec` 根本不看**的清理。把它们统一成 `IoError` 再原样忽略，是把噪音换个写法，
+读起来反而更糟（`(void)io::remove_file(p)` 并不比 `fs::remove(p, ec)` 清楚）。
+
+真正**消费**了 `ec` 的只有 `cask/cask.cpp:900`、`fileops/oki_state.cpp:38`、`:55`、
+`cask/cask_recovery.cpp:188`。只收这几处，其余保留，并把规则写进 `io.hpp` 或
+CONTRIBUTING：**错误要被消费 → 走 seam 的 `IoError`；纯尽力清理 → `fs::` + 忽略 `ec`**。
+
+### 明确不做
+
+| 项 | 理由 |
+|---|---|
+| 78 处 `fs::` 调用大规模原生化 | MSVC 的 `std::filesystem` 底下已是 `DeleteFileW` 那一套，无 CRT 堆/fd 表问题；重写只增加 `#ifdef` 密度，而本移植的价值恰恰是「一个 seam、两个后端、各一个文件」|
+| `FileHandle` 改 strong type | 69 处改动换一个至今没踩过的错误类别；`io.hpp:47-49` 已写明向量插件要裸句柄通货 |
+| `FileHandle` 改宏（如 `FILE_HANDLE`）| 宏无命名空间，且 `FILE_HANDLE` 正落在 `windows.h` 的 `FILE_*` 宏命名空间里（`FILE_SHARE_DELETE`/`FILE_ATTRIBUTE_NORMAL`…），会污染每个下游 TU；typedef 还能进 `std::expected<FileHandle, IoError>`、能被模板推导。**现状已是 typedef 分叉 + `kInvalidHandle` + `constexpr handle_valid`，无需改动** |
+| 只读一次的 stdio 站点 | `index_manifest.hpp:169`、`segment.hpp:525`、`fileops/migrate.cpp:71` —— 持有窗口短，收益低 |
+
+**执行序**：P0.0 → P0.1 → P1 → P2 → P3 → P4。P0 是硬前置；P2/P3 与 P0/P1 无依赖，
+可并行。
 
 ---
 
@@ -841,6 +997,8 @@ S37-7 (1.5周) ───── CI + 收尾
 | S37-5 Windows I/O 后端 | ✅ done（bitcask.dll 产出；Windows ctest 733 → 724 通过 99%，余 9 个全部落在 S37-6；Linux 复验 735/735 无回归，见落地记录）|
 | S37-6 删除/映射生命周期 | ✅ done（**实测推翻立项前提，非架构改动**；Windows ctest 733/733 全绿，见落地记录）|
 | S37-7 CI + 收尾 | ⬜ 未开始 |
+| P 段 P0 路径编码统一 | ✅ done（59 处成对收编 + 守门 + 9 个用例；msvc-debug 745 无回归。**Linux 未复验**）|
+| P 段 P1–P4 | ⬜ 未开始（W5 已于 6ad5b4b 结清）|
 
 ### 待确认项
 

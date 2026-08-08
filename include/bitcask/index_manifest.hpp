@@ -166,7 +166,7 @@ deserialize_manifest(const std::byte* raw, std::size_t len) {
 
 [[nodiscard]] inline std::optional<Manifest>
 read_manifest(const std::string& path) {
-    detail::FilePtr f(std::fopen(path.c_str(), "rb"));
+    detail::FilePtr f(detail::fopen_utf8(path, "rb"));
     if (!f) return std::nullopt;
     std::array<std::byte, kManifestSize> buf{};
     const bool read_ok =

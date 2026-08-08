@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <optional>
 #include <system_error>
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::index {
 
@@ -20,7 +21,7 @@ namespace {
 constexpr const char* kDocmapCkptName = "docmap.ckpt";
 
 std::string comp_path(std::string_view dir) {
-    return (std::filesystem::path(dir) / kDocmapCkptName).string();
+    return bitcask::detail::to_utf8(bitcask::detail::from_utf8(dir) / kDocmapCkptName);
 }
 
 }  // namespace
@@ -219,8 +220,8 @@ bool save_docmap_base(Index& docmap, std::string_view dir,
     const std::string fp = comp_path(dir);
     const std::string prev = fp + ".prev";
     std::error_code ec;
-    if (std::filesystem::exists(fp, ec)) {
-        std::filesystem::rename(fp, prev, ec);
+    if (std::filesystem::exists(bitcask::detail::from_utf8(fp), ec)) {
+        std::filesystem::rename(bitcask::detail::from_utf8(fp), bitcask::detail::from_utf8(prev), ec);
     }
     std::vector<std::uint8_t> buf;
     if (!docmap.serialize_docmap(buf, watermark)) return false;

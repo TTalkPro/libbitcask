@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "bitcask/io.hpp"  // S37-1：宿主原语一律经 io seam（原 <fcntl.h>/<unistd.h>）
+#include "bitcask/detail/path_utf8.hpp"  // P0：窄路径 = UTF-8，不走 ANSI 代码页
 
 // W5：**唯一**需要在头里出现平台头的地方——`stream_handle` 必须 inline
 // （理由见该函数）。两边都只是 CRT 的小头，不引 windows.h、不带 min/max 宏：
@@ -51,6 +52,39 @@ struct FileCloser {
 //   // 作用域结束自动 fclose；抛出路径也覆盖
 using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
 
+// ---------------------------------------------------------------------------
+// std::fopen 的 UTF-8 版（P0）。
+//
+// **Windows 上 `std::fopen` 按 CRT 的 ANSI 代码页解释窄路径**，而库内窄路径
+// 一律是 UTF-8（见 path_utf8.hpp）。简中 Windows 实测 `GetACP()==936`，于是
+// 非 ASCII 路径要么开错文件、要么开不出来。`_wfopen` 收宽串，把编码这一层
+// 交给 from_utf8 而不是代码页。POSIX 下就是 std::fopen，零差别。
+//
+// 注意本函数只解决**编码**。共享位（Windows CRT 不带 FILE_SHARE_DELETE）与
+// CRT 边界是另一条线，见 io.hpp 的 open_handle / adopt_stream。
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline std::FILE* fopen_utf8(const std::string& path,
+                                           const char* mode) noexcept {
+#if defined(_WIN32)
+    const std::filesystem::path wp = from_utf8(path);
+    // mode 全库只有 "rb"/"wb"/"ab" 这类纯 ASCII 短串，逐字符加宽即可。
+    wchar_t wmode[8] = {};
+    std::size_t i = 0;
+    for (; mode[i] != '\0' && i + 1 < std::size(wmode); ++i) {
+        wmode[i] = static_cast<wchar_t>(mode[i]);
+    }
+    return ::_wfopen(wp.c_str(), wmode);
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
+// std::remove 的 UTF-8 版（P0）。同上：CRT 的 remove 也按 ANSI 解释窄路径。
+// 走 io::remove_file（Windows 后端是 DeleteFileW + widen，POSIX 是 ::remove）。
+inline void remove_utf8(const std::string& path) noexcept {
+    (void)io::remove_file(path);
+}
+
 // ---- 整文件读 -------------------------------------------------------------
 
 // 整文件读入内存。空文件 → 空向量（成功）；fopen/seek/ftell 失败或短读
@@ -67,7 +101,7 @@ template <class Byte = std::byte>
 [[nodiscard]] std::optional<std::vector<Byte>>
 read_file_bytes(const std::string& path) {
     static_assert(sizeof(Byte) == 1, "read_file_bytes: Byte 须为单字节类型");
-    FilePtr f(std::fopen(path.c_str(), "rb"));
+    FilePtr f(fopen_utf8(path, "rb"));
     if (!f) return std::nullopt;
     if (std::fseek(f.get(), 0, SEEK_END) != 0) return std::nullopt;
     const long sz = std::ftell(f.get());
@@ -104,10 +138,17 @@ read_file_bytes(const std::string& path) {
 // 后端将降为 no-op，持久性改由 MOVEFILE_WRITE_THROUGH 承担）。
 // 注意 parent 须转成 std::string 再传——std::filesystem::path::c_str() 在
 // Windows 上返回 const wchar_t*，直接喂给窄字符 API 会编译失败。
+//
+// P0：这里原先是 `fs::path(path)` + `parent.string()`，两头都走 ANSI 代码页。
+// **本函数是 noexcept，而 `fs::path(窄串)` 在 CP936 下遇到非 GBK 字节会抛
+// `std::system_error`** —— 穿过 noexcept 就是 `std::terminate`。而本函数正是
+// atomic_write_bytes 与 AtomicFileWriter::commit 的收尾步骤，即全库 9 个原子
+// 写站点的公共出口：库目录名带中文 → 写任何东西 → 进程直接挂。实测见
+// path_utf8.hpp 的形态 2。
 inline void fsync_parent_dir(const std::string& path) noexcept {
-    std::filesystem::path parent = std::filesystem::path(path).parent_path();
+    std::filesystem::path parent = from_utf8(path).parent_path();
     if (parent.empty()) parent = ".";
-    io::sync_directory(parent.string());
+    io::sync_directory(to_utf8(parent));
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +240,7 @@ inline bool flush_and_sync(std::FILE* f) noexcept {
                                              bool fsync_dir = false) {
     const std::string tmp = path + ".tmp";
     {
-        FilePtr f(std::fopen(tmp.c_str(), "wb"));
+        FilePtr f(fopen_utf8(tmp, "wb"));
         if (!f) return false;
         const bool ok =
             (bytes.empty() ||
@@ -208,14 +249,14 @@ inline bool flush_and_sync(std::FILE* f) noexcept {
             flush_and_sync(f.get());
         f.reset();  // 必须先 close 再 rename
         if (!ok) {
-            std::remove(tmp.c_str());
+            remove_utf8(tmp);
             return false;
         }
     }
     // S37-1：经 io::atomic_rename 而非 std::rename——后者在 Windows 上
     // 目标已存在即失败，本站点是 9 个原子写站点的公共出口（见 io.hpp）。
     if (!io::atomic_rename(tmp, path)) {
-        std::remove(tmp.c_str());
+        remove_utf8(tmp);
         return false;
     }
     if (fsync_dir) fsync_parent_dir(path);
@@ -239,12 +280,12 @@ public:
                               const char* tmp_suffix = ".tmp")
         : final_path_(std::move(final_path)),
           tmp_path_(final_path_ + tmp_suffix),
-          f_(std::fopen(tmp_path_.c_str(), "wb")) {}
+          f_(fopen_utf8(tmp_path_, "wb")) {}
 
     ~AtomicFileWriter() {
         if (committed_) return;
         f_.reset();  // 先 close 再 remove
-        if (!tmp_path_.empty()) std::remove(tmp_path_.c_str());
+        if (!tmp_path_.empty()) remove_utf8(tmp_path_);
     }
 
     AtomicFileWriter(const AtomicFileWriter&) = delete;
@@ -263,7 +304,7 @@ public:
         if (this != &o) {
             if (!committed_) {
                 f_.reset();
-                if (!tmp_path_.empty()) std::remove(tmp_path_.c_str());
+                if (!tmp_path_.empty()) remove_utf8(tmp_path_);
             }
             final_path_ = std::move(o.final_path_);
             tmp_path_   = std::move(o.tmp_path_);
@@ -283,11 +324,11 @@ public:
         const bool synced = flush_and_sync(f_.get());
         f_.reset();  // 必须先 close 再 rename
         if (!synced) {
-            std::remove(tmp_path_.c_str());
+            remove_utf8(tmp_path_);
             return false;
         }
         if (!io::atomic_rename(tmp_path_, final_path_)) {  // S37-1，见上
-            std::remove(tmp_path_.c_str());
+            remove_utf8(tmp_path_);
             return false;
         }
         committed_ = true;  // 析构不再清理

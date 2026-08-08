@@ -21,6 +21,7 @@
 #include <span>
 #include <string>
 #include <vector>
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::search {
 
@@ -302,7 +303,7 @@ private:
     static constexpr std::uint32_t kManifestVersion = 1;
 
     static std::string join(const std::string& dir, const std::string& f) {
-        return (std::filesystem::path(dir) / f).string();
+        return bitcask::detail::to_utf8(bitcask::detail::from_utf8(dir) / bitcask::detail::from_utf8(f));
     }
     static std::string manifest_path(const std::string& dir) {
         return join(dir, "segments.manifest");

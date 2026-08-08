@@ -17,6 +17,7 @@
 #include "bitcask/detail/scanner.hpp"  // scan_dir（fold 数据文件枚举）
 
 #include "cask_internal.hpp"  // err / io_fault / bytes_to_view / ckpt 常量 / component_of_plugin
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask {
 
@@ -64,7 +65,7 @@ Cask::upgrade(std::string_view dirname,
     auto cask = std::make_unique<Cask>();
     cask->dirname_ = std::string(dirname);
     cask->meta_config_ = new_mc;
-    if (!cask->field_schema_.open((fs::path(dirname) / "field.schema").string())) {  // #1
+    if (!cask->field_schema_.open(bitcask::detail::to_utf8(bitcask::detail::from_utf8(dirname) / "field.schema"))) {  // #1
         return std::unexpected(err(CaskError::kIo,
             "field.schema corrupt or incompatible version"));
     }
@@ -192,9 +193,9 @@ bool Cask::migrate_legacy_search_ckpt() {
         }
     }
     std::filesystem::remove(
-        std::filesystem::path(old_ckpt).replace_extension(".vec"), ec);
+        bitcask::detail::from_utf8(old_ckpt).replace_extension(".vec"), ec);
     std::filesystem::remove(
-        std::filesystem::path(old_ckpt).replace_extension(".qc8"), ec);
+        bitcask::detail::from_utf8(old_ckpt).replace_extension(".qc8"), ec);
     return true;
 }
 

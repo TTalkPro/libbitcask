@@ -6,6 +6,7 @@
 #include <system_error>
 
 #include "bitcask/data_file.hpp"
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::fileops {
 
@@ -14,7 +15,7 @@ namespace fs = std::filesystem;
 std::expected<std::vector<DataFileEntry>, ScanFault>
 scan_dir(std::string_view dirname) {
     std::error_code ec;
-    fs::directory_iterator it(fs::path(dirname), ec);
+    fs::directory_iterator it(bitcask::detail::from_utf8(dirname), ec);
     if (ec) {
         // 目录无法打开就报错——open 阶段就需要这个信息。后面的迭代错误
         // 都视作「能扫多少算多少」。
@@ -27,8 +28,8 @@ scan_dir(std::string_view dirname) {
         // 跳过：不是普通文件（symlink、目录、socket、device 节点）
         if (!it->is_regular_file(ec) || ec) continue;
 
-        const auto path_str = it->path().string();
-        const auto filename = it->path().filename().string();
+        const auto path_str = bitcask::detail::to_utf8(it->path());
+        const auto filename = bitcask::detail::to_utf8(it->path().filename());
         // 只接受 "<tstamp>.bitcask.data" 模式；锁文件、merge.txt 等返回 nullopt
         auto tstamp = parse_data_tstamp(filename);
         if (!tstamp) continue;

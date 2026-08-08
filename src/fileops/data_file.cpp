@@ -10,6 +10,7 @@
 #include "bitcask/format.hpp"
 #include "bitcask/detail/chunked_reader.hpp"       // T23
 #include "bitcask/detail/thread_local_buffer.hpp"  // S9-P1-d
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::fileops {
 
@@ -425,9 +426,9 @@ DataFile::truncate_to(std::uint64_t new_size) {
 // ---------------------------------------------------------------------------
 
 std::string mk_data_filename(std::string_view dirname, std::uint64_t tstamp) {
-    std::filesystem::path p(dirname);
+    std::filesystem::path p = bitcask::detail::from_utf8(dirname);
     p /= (std::to_string(tstamp) + ".bitcask.data");
-    return p.string();
+    return bitcask::detail::to_utf8(p);
 }
 
 std::string mk_hint_filename(std::string_view data_path) {

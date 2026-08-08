@@ -64,6 +64,7 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::vec::detail {
 
@@ -209,7 +210,7 @@ protected:
 
     // ckpt 段族路径助手（双方共享）。
     [[nodiscard]] std::string comp_path(std::string_view dir) const {
-        return (std::filesystem::path(dir) / ckpt_name()).string();
+        return bitcask::detail::to_utf8(bitcask::detail::from_utf8(dir) / ckpt_name());
     }
 
     // kHnswDelta 通用插入日志（count u64 | dim u16 | 每条 ord u64 + f32[dim]）。

@@ -7,6 +7,7 @@
 
 #include "bitcask/codec.hpp"
 #include "bitcask/detail/file_util.hpp"  // S35：atomic_write_bytes
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::meta {
 
@@ -54,12 +55,12 @@ inline std::uint32_t meta_crc(const char* header) {
 }  // namespace
 
 bool meta_exists(std::string_view dirname) {
-    const auto path = std::filesystem::path(dirname) / "bitcask.meta";
+    const auto path = bitcask::detail::from_utf8(dirname) / "bitcask.meta";
     return std::filesystem::exists(path);
 }
 
 std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
-    const auto path = std::filesystem::path(dirname) / "bitcask.meta";
+    const auto path = bitcask::detail::from_utf8(dirname) / "bitcask.meta";
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         return std::unexpected(MetaError{errno, "cannot open bitcask.meta"});
@@ -146,7 +147,7 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
 }
 
 std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaConfig& config) {
-    const auto path = std::filesystem::path(dirname) / "bitcask.meta";
+    const auto path = bitcask::detail::from_utf8(dirname) / "bitcask.meta";
     if (config.version != kMetaVersion && config.version != kMetaVersionBatch) {
         return std::unexpected(MetaError{0, "invalid meta version to write"});
     }
@@ -173,7 +174,7 @@ std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaCo
     // 懒升级重写 meta 时若中途崩溃会留下半截 meta（整目录拒开）——meta 是
     // 唯一纪元门禁，必须要么旧要么新。
     if (!detail::atomic_write_bytes(
-            path.string(),
+            bitcask::detail::to_utf8(path),
             std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(header), kMetaFileSize),
             /*fsync_dir=*/true)) {

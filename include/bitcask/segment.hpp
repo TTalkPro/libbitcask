@@ -41,6 +41,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include "bitcask/detail/file_util.hpp"
 
 namespace bitcask::search {
 
@@ -522,7 +523,7 @@ public:
         const std::string& path, bool verify_crc = true) {
         std::uint32_t magic = 0;
         {
-            std::FILE* f = std::fopen(path.c_str(), "rb");
+            std::FILE* f = bitcask::detail::fopen_utf8(path, "rb");
             if (f == nullptr) return nullptr;
             const bool ok = std::fread(&magic, 1, 4, f) == 4;
             std::fclose(f);

@@ -12,6 +12,7 @@
 #include "bitcask/field_schema.hpp"
 #include "bitcask/format.hpp"
 #include "bitcask/hint_file.hpp"
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::migrate {
 
@@ -53,8 +54,8 @@ std::uint64_t be_u64(const std::byte* p) {
 // 合并诊断（migrate 是离线工具路径，诊断粒度够用）。
 std::expected<std::vector<std::byte>, std::string>
 read_all(const fs::path& path) {
-    auto buf = detail::read_file_bytes<>(path.string());
-    if (!buf) return std::unexpected("cannot read " + path.string());
+    auto buf = detail::read_file_bytes<>(bitcask::detail::to_utf8(path));
+    if (!buf) return std::unexpected("cannot read " + bitcask::detail::to_utf8(path));
     return *std::move(buf);
 }
 
@@ -62,19 +63,17 @@ std::expected<void, std::string>
 write_all(const fs::path& path, std::span<const std::byte> bytes) {
     // S37-4：原为 path.c_str()。`std::filesystem::path::c_str()` 在 Windows 上
     // 返回 const wchar_t*，喂给窄字符的 std::fopen 直接编译失败（设计稿 C8）。
-    // 改用 .string()，与紧邻的 read_all 及全库「路径以 std::string 流转」的
-    // 约定一致（同 file_util.hpp 的 fsync_parent_dir）。
-    // ⚠️ 这只解决可编译性：Windows 上 .string() 走的是系统 ANSI 代码页，
-    // 非 ASCII 路径仍打不开。窄路径统一按 UTF-8 解释、在 io 后端转 UTF-16
-    // 是 S37-5 的事，属库级问题，不在本站点单独修。
+    // 当时留下的「.string() 走系统 ANSI 代码页、非 ASCII 路径仍打不开」已由
+    // P0 结清：窄路径统一按 UTF-8（bitcask::detail::to_utf8），fopen 走
+    // bitcask::detail::fopen_utf8（Windows 下落到 _wfopen）。
     std::unique_ptr<std::FILE, detail::FileCloser> f(
-        std::fopen(path.string().c_str(), "wb"));
-    if (!f) return std::unexpected("cannot create " + path.string());
+        bitcask::detail::fopen_utf8(bitcask::detail::to_utf8(path), "wb"));
+    if (!f) return std::unexpected("cannot create " + bitcask::detail::to_utf8(path));
     const bool ok =
         bytes.empty() ||
         std::fwrite(bytes.data(), 1, bytes.size(), f.get()) == bytes.size();
     f.reset();
-    if (!ok) return std::unexpected("write failed " + path.string());
+    if (!ok) return std::unexpected("write failed " + bitcask::detail::to_utf8(path));
     return {};
 }
 
@@ -85,8 +84,8 @@ migrate_data_file(const fs::path& src_data, const fs::path& dst_dir,
     auto bytes = read_all(src_data);
     if (!bytes) return std::unexpected(bytes.error());
 
-    const auto name = src_data.filename().string();
-    const auto dst_data_path = (dst_dir / name).string();
+    const auto name = bitcask::detail::to_utf8(src_data.filename());
+    const auto dst_data_path = bitcask::detail::to_utf8(dst_dir / src_data.filename());
     const auto dst_hint_path =
         fileops::mk_hint_filename(dst_data_path);
 
@@ -280,8 +279,8 @@ migrate_u32_data_file(const fs::path& src_data, const fs::path& dst_dir,
     auto bytes = read_all(src_data);
     if (!bytes) return std::unexpected(bytes.error());
 
-    const auto name = src_data.filename().string();
-    const auto dst_data_path = (dst_dir / name).string();
+    const auto name = bitcask::detail::to_utf8(src_data.filename());
+    const auto dst_data_path = bitcask::detail::to_utf8(dst_dir / src_data.filename());
     const auto dst_hint_path = fileops::mk_hint_filename(dst_data_path);
 
     auto dst_data = fileops::DataFile::open(
@@ -412,8 +411,8 @@ migrate_u32_meta(const fs::path& src_dir, const fs::path& dst_dir,
 std::expected<void, std::string>
 hintord_link_and_rehint(const fs::path& src_data, const fs::path& dst_dir,
                         MigrateStats& st) {
-    const auto name = src_data.filename().string();
-    const auto dst_data_path = (dst_dir / name).string();
+    const auto name = bitcask::detail::to_utf8(src_data.filename());
+    const auto dst_data_path = bitcask::detail::to_utf8(dst_dir / src_data.filename());
     const auto dst_hint_path = fileops::mk_hint_filename(dst_data_path);
 
     std::error_code ec;
@@ -514,7 +513,7 @@ migrate_be_to_le(std::string_view src_dir, std::string_view dst_dir) {
     }
     // 逐 data 文件（hint 由其重生成）。ckpt/seg/wal/旧 hint/锁不迁移。
     for (const auto& de : fs::directory_iterator(src)) {
-        const auto fname = de.path().filename().string();
+        const auto fname = bitcask::detail::to_utf8(de.path().filename());
         if (fileops::parse_data_tstamp(fname).has_value()) {
             if (auto r = migrate_data_file(de.path(), dst, st); !r) {
                 return std::unexpected(r.error());
@@ -550,7 +549,7 @@ migrate_u32_to_u64(std::string_view src_dir, std::string_view dst_dir) {
     }
     // 逐 data 文件（hint 由其重生成）。ckpt/seg/wal/旧 hint/锁不迁移。
     for (const auto& de : fs::directory_iterator(src)) {
-        const auto fname = de.path().filename().string();
+        const auto fname = bitcask::detail::to_utf8(de.path().filename());
         if (fileops::parse_data_tstamp(fname).has_value()) {
             if (auto r = migrate_u32_data_file(de.path(), dst, st); !r) {
                 return std::unexpected(r.error());
@@ -587,7 +586,7 @@ migrate_hint_ord(std::string_view src_dir, std::string_view dst_dir) {
     // 逐 data 文件：硬链接 + 从 data 重扫生成 BCH5 hint。
     // ckpt/seg/wal/旧 hint/锁不迁移（新库首开 fold 重建,与既有迁移器同策略）。
     for (const auto& de : fs::directory_iterator(src)) {
-        const auto fname = de.path().filename().string();
+        const auto fname = bitcask::detail::to_utf8(de.path().filename());
         if (fileops::parse_data_tstamp(fname).has_value()) {
             if (auto r = hintord_link_and_rehint(de.path(), dst, st); !r) {
                 return std::unexpected(r.error());

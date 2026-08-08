@@ -230,7 +230,7 @@ public:
                   const std::function<bool(std::uint16_t)>& want) {
         using namespace detail;
         std::unique_ptr<std::FILE, ::bitcask::detail::FileCloser> f(
-            std::fopen(std::string(path).c_str(), "rb"));
+            bitcask::detail::fopen_utf8(std::string(path), "rb"));
         if (!f) return std::nullopt;
         std::fseek(f.get(), 0, SEEK_END);
         const long fsz = std::ftell(f.get());

@@ -12,6 +12,7 @@
 #include <string>
 #include <system_error>
 #include <vector>
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::legacy_ckpt {
 
@@ -62,7 +63,7 @@ LoadResult load(std::string_view path, index::Index& docmap,
     const std::string prev = fp + ".prev";
     // V7:BCVS v2 vecs_ payload 路径(与 ckpt 同目录,.vec 扩展名)。
     const std::string vec_path =
-        std::filesystem::path(fp).replace_extension(".vec").string();
+        bitcask::detail::to_utf8(bitcask::detail::from_utf8(fp).replace_extension(".vec"));
 
     auto lc = sc::SearchCheckpoint::read(fp);
     bool from_prev = false;
@@ -110,9 +111,8 @@ LoadResult load(std::string_view path, index::Index& docmap,
         case sc::CkptSectionType::kHnsw:
             if (vec.enabled()) {
                 const std::string qc_path =
-                    std::filesystem::path(vec_path)
-                        .replace_extension(".qc8")
-                        .string();
+                    bitcask::detail::to_utf8(bitcask::detail::from_utf8(vec_path)
+                                        .replace_extension(".qc8"));
                 if (vec.load_graph_section(pl, vec_path, qc_path)) {
                     hnsw_loaded = true;
                 } else {

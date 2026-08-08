@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "bitcask/io.hpp"  // S37-1：宿主原语一律经 io seam（原 <unistd.h>）
+#include "bitcask/detail/file_util.hpp"
 
 namespace bitcask::vec::diskint {
 
@@ -36,7 +37,7 @@ struct TmpFile {
     bool committed = false;
     ~TmpFile() {
         if (io::handle_valid(fd)) io::close_handle(fd);
-        if (!committed && !path.empty()) std::remove(path.c_str());
+        if (!committed && !path.empty()) bitcask::detail::remove_utf8(path);
     }
     // fdatasync + close;成功返回 true 并转入 committed（rename 由调用方做,
     // rename 失败调用方应手动 remove——见各 build 尾部）。

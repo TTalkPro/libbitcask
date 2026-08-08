@@ -13,6 +13,7 @@
 #include <system_error>
 
 #include "vector_plugin_kernels.hpp"  // S37-3.b：分 ISA TU
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::vec {
 
@@ -23,7 +24,7 @@ namespace {
 constexpr const char* kVecCkptName = "vec.ckpt";
 
 std::string comp_path(std::string_view dir) {
-    return (std::filesystem::path(dir) / kVecCkptName).string();
+    return bitcask::detail::to_utf8(bitcask::detail::from_utf8(dir) / kVecCkptName);
 }
 
 
@@ -190,9 +191,9 @@ void VectorPlugin::rebuild() {
     if (!dir_.empty()) {
         const std::string fp = comp_path(dir_);
         vec_path =
-            std::filesystem::path(fp).replace_extension(".vec").string();
+            bitcask::detail::to_utf8(bitcask::detail::from_utf8(fp).replace_extension(".vec"));
         qc_path =
-            std::filesystem::path(fp).replace_extension(".qc8").string();
+            bitcask::detail::to_utf8(bitcask::detail::from_utf8(fp).replace_extension(".qc8"));
     }
     auto fresh = old->clone_live(
         [this](std::uint64_t ord) { return docs_.is_live(ord); },
@@ -253,9 +254,9 @@ bool VectorPlugin::save_component_base(std::string_view dir,
         std::filesystem::remove(fp, ec);
         std::filesystem::remove(fp + ".prev", ec);
         std::filesystem::remove(
-            std::filesystem::path(fp).replace_extension(".vec"), ec);
+            bitcask::detail::from_utf8(fp).replace_extension(".vec"), ec);
         std::filesystem::remove(
-            std::filesystem::path(fp).replace_extension(".qc8"), ec);
+            bitcask::detail::from_utf8(fp).replace_extension(".qc8"), ec);
         dirty_.store(false, std::memory_order_relaxed);
         return false;
     }
@@ -269,9 +270,9 @@ bool VectorPlugin::save_component_base(std::string_view dir,
     auto hnsw = hnsw_.load(std::memory_order_acquire);
     if (hnsw) {
         const std::string vec_path =
-            std::filesystem::path(fp).replace_extension(".vec").string();
+            bitcask::detail::to_utf8(bitcask::detail::from_utf8(fp).replace_extension(".vec"));
         const std::string qc_path =
-            std::filesystem::path(fp).replace_extension(".qc8").string();
+            bitcask::detail::to_utf8(bitcask::detail::from_utf8(fp).replace_extension(".qc8"));
         if (hnsw->save_vec_payload(vec_path) &&
             hnsw->save_qc_payload(qc_path)) {
             if (hnsw->serialize(buf)) {
@@ -368,9 +369,9 @@ VectorPlugin::load_component(std::string_view dir,
         if (ls.type ==
             static_cast<std::uint16_t>(sc::CkptSectionType::kHnsw)) {
             const std::string vec_path =
-                std::filesystem::path(fp).replace_extension(".vec").string();
+                bitcask::detail::to_utf8(bitcask::detail::from_utf8(fp).replace_extension(".vec"));
             const std::string qc_path =
-                std::filesystem::path(fp).replace_extension(".qc8").string();
+                bitcask::detail::to_utf8(bitcask::detail::from_utf8(fp).replace_extension(".qc8"));
             if (load_graph_section(
                     std::span<const std::byte>(ls.payload.data(),
                                                ls.payload.size()),

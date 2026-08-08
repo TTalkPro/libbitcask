@@ -70,7 +70,7 @@ public:
         // MEM-LOW-1 修复：用 FilePtr RAII 包裹读句柄——load_new_format_ /
         // load_legacy_ 内的 vector/string/map 分配可能抛 bad_alloc，
         // 裸 FILE* 跳过 fclose → fd 泄漏。detail::FilePtr 见 file_util.hpp。
-        if (detail::FilePtr rf{std::fopen(path.c_str(), "rb")}) {
+        if (detail::FilePtr rf{detail::fopen_utf8(path, "rb")}) {
             std::FILE* raw = rf.get();
             std::byte magic_buf[4];
             const std::size_t got = std::fread(magic_buf, 1, 4, raw);

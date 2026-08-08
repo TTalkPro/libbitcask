@@ -11,6 +11,7 @@
 
 #include "bitcask/detail/sealed_segment_vector_plugin.hpp"
 #include "bitcask/ivf_rq.hpp"
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::vec {
 
@@ -33,7 +34,7 @@ protected:
     }
     [[nodiscard]] std::string
     segment_path_ext(std::string_view base) const override {
-        return std::filesystem::path(base).replace_extension(".biv").string();
+        return bitcask::detail::to_utf8(bitcask::detail::from_utf8(base).replace_extension(".biv"));
     }
     [[nodiscard]] search::CkptSectionType
     section_type() const noexcept override {

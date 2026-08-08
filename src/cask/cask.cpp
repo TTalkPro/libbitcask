@@ -24,6 +24,7 @@
 #include "bitcask/codec.hpp"   // V6.1: GetResultView::ctor 解码 DocValue
 
 #include "cask_internal.hpp"  // S21-3 B1：拆分 TU 共用助手/常量
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask {
 
@@ -163,7 +164,7 @@ parse_start_token(std::span<const std::byte> bytes) noexcept {
 // Cask::open 跟 close_write_file → 下一次 put 重新拿锁时都走这条路径。
 [[nodiscard]] std::expected<lock::FileLock, CaskFault>
 acquire_writer_lock(const std::string& dirname) {
-    const auto lock_path = (fs::path(dirname) / "bitcask.write.lock").string();
+    const auto lock_path = bitcask::detail::to_utf8(bitcask::detail::from_utf8(dirname) / "bitcask.write.lock");
     auto fl = lock::FileLock::acquire(lock_path, /*write*/ true);
     if (!fl && fl.error().errnum == EEXIST) {
         if (try_remove_stale_lock(lock_path)) {
@@ -239,7 +240,7 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     fs::create_directories(cask->dirname_, ec);
 
     // 字段名 ↔ id 注册表（#1）：加载已有 + 打开追加句柄。
-    if (!cask->field_schema_.open((fs::path(cask->dirname_) / "field.schema").string())) {
+    if (!cask->field_schema_.open(bitcask::detail::to_utf8(bitcask::detail::from_utf8(cask->dirname_) / "field.schema"))) {
         return std::unexpected(err(CaskError::kIo,
             "field.schema corrupt or incompatible version"));
     }
@@ -354,7 +355,7 @@ std::expected<void, CaskFault> Cask::acquire_open_locks() {
     }
     // merge_only 路径。
     const auto lock_path =
-        (fs::path(dirname_) / "bitcask.merge.lock").string();
+        bitcask::detail::to_utf8(bitcask::detail::from_utf8(dirname_) / "bitcask.merge.lock");
     auto fl = lock::FileLock::acquire(lock_path, /*write*/ true);
     if (!fl && fl.error().errnum == EEXIST) {
         if (try_remove_stale_lock(lock_path)) {
@@ -381,7 +382,7 @@ std::expected<void, CaskFault> Cask::acquire_open_locks() {
     // bitcask_lockops:read_activefile），后果最多是少并掉一个刚 roll 的
     // 文件，下一轮 merge 自然会处理。
     const auto wlock_path =
-        (fs::path(dirname_) / "bitcask.write.lock").string();
+        bitcask::detail::to_utf8(bitcask::detail::from_utf8(dirname_) / "bitcask.write.lock");
     auto wl = lock::FileLock::acquire(wlock_path, /*write*/ false);
     if (wl) {
         if (auto data = wl->read_data()) {
@@ -2509,7 +2510,7 @@ std::expected<void, CaskFault> Cask::backup(std::string_view dst_dir) {
     const fs::path dst(dst_dir);
     fs::create_directories(dst, ec);
     if (ec) return std::unexpected(err(CaskError::kIo,
-        "backup: cannot create dst dir: " + dst.string()));
+        "backup: cannot create dst dir: " + bitcask::detail::to_utf8(dst)));
 
     // 关闭 active writer：finalize hint trailer 后该文件成为 sealed（不可变），
     // 可安全 hardlink。read_write 且有 active 时才需要；下一次 put 经
