@@ -183,11 +183,11 @@ bool Cask::migrate_legacy_search_ckpt() {
     current_manifest_ = m;
     // 5) 删旧 search.ckpt + .prev + .d<seq> + .vec + .qc8。
     std::error_code ec;
-    std::filesystem::remove(old_ckpt, ec);
-    std::filesystem::remove(old_ckpt + ".prev", ec);
+    std::filesystem::remove(bitcask::detail::from_utf8(old_ckpt), ec);
+    std::filesystem::remove(bitcask::detail::from_utf8(old_ckpt + ".prev"), ec);
     for (std::uint32_t i = 1; i < 1024; ++i) {
         if (!std::filesystem::remove(
-                old_ckpt + ".d" + std::to_string(i), ec)) {
+                bitcask::detail::from_utf8(old_ckpt + ".d" + std::to_string(i)), ec)) {
             // 链中段缺失即停（链是连续 1..N）。
             if (ec) break;
         }
@@ -760,8 +760,8 @@ Cask::load_recovery_snapshots() {
             std::string(bitcask::kManifestName);
         const std::string old_ckpt = dirname_ + "/" + kSearchCkptName;
         std::error_code ec;
-        const bool has_manifest = std::filesystem::exists(mpath, ec);
-        const bool has_old_ckpt = std::filesystem::exists(old_ckpt, ec);
+        const bool has_manifest = std::filesystem::exists(bitcask::detail::from_utf8(mpath), ec);
+        const bool has_old_ckpt = std::filesystem::exists(bitcask::detail::from_utf8(old_ckpt), ec);
         if (!has_manifest && has_old_ckpt) {
             // 触发迁移：把旧 search.ckpt 用旧路径 load 回来，再分
             // 写到新组件文件 + 写 manifest + 删旧文件。失败 → 全量 fold。

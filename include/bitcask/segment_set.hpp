@@ -156,7 +156,7 @@ public:
         if (!commit_manifest()) return false;
         for (const auto& f : pending_unlink_) {
             std::error_code ec;
-            std::filesystem::remove(join(dir_, f), ec);
+            std::filesystem::remove(bitcask::detail::from_utf8(join(dir_, f)), ec);
         }
         pending_unlink_.clear();
         return true;

@@ -53,6 +53,47 @@ scan 'std::fopen\s*\(' \
 scan 'std::remove\s*\(\s*[a-z_]' \
      'std::remove 同上。改用 bitcask::detail::remove_utf8() 或 io::remove_file()。' || rc=1
 
+# ---------------------------------------------------------------------------
+# 隐式转换 —— P1 期间发现，上面四条都抓不到它。
+#
+# `fs::remove(narrow_string, ec)` 里没有字面量 `fs::path(`，路径是**隐式**
+# 构造的，所以前面的正则视而不见。而它照样按 ANSI 解码；`ec` 重载也挡不住，
+# 因为构造发生在调用**之前**，抛出来的 std::system_error 不经过 ec。
+# 首轮扫出 26 处，横跨 11 个文件。
+#
+# 规则：fs:: 的路径入参必须是 fs::path 本身。允许三种写法——
+#   bitcask::detail::from_utf8(...)  显式转换
+#   e.path() / it->path()            迭代器产出的 path
+#   以 _path / _dir 结尾的变量        约定其类型已是 fs::path
+# 其余一律要求显式化。判不准的地方宁可报出来让人写清楚，也好过悄悄错。
+# ---------------------------------------------------------------------------
+FS_FNS='remove|remove_all|exists|rename|copy_file|file_size|create_directories|create_directory|is_directory|is_regular_file|status'
+
+# 调用常跨行（`fs::remove(` 后换行才是入参），逐行扫会把它们全判成违规。
+# 先把以 ( 或 , 结尾的行与下一行拼起来再扫。
+joined=$(find src include c_api -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) 2>/dev/null \
+         | xargs awk '{
+             buf = $0
+             n = 0
+             while (buf ~ /[(,][ \t]*$/ && n < 3 && (getline nxt) > 0) { buf = buf " " nxt; n++ }
+             gsub(/[ \t]+/, " ", buf)
+             print FILENAME ":" FNR ":" buf
+           }')
+
+implicit=$(echo "$joined" \
+           | grep -E "(std::)?filesystem::($FS_FNS) ?\(" \
+           | grep -vE "^($ALLOW):" \
+           | grep -vE ':[0-9]+: *//' \
+           | grep -vE 'from_utf8|\.path\(\)|_path\b|_dir\b')
+if [[ -n "$implicit" ]]; then
+    echo "❌ fs:: 调用点的路径入参可能是窄串（隐式构造 fs::path，按 ANSI 解码）。"
+    echo "   包成 bitcask::detail::from_utf8(...)；若入参本就是 fs::path，"
+    echo "   把变量改名为 *_path / *_dir 或拆行以示明确。"
+    echo "$implicit" | sed 's/^/   /'
+    echo
+    rc=1
+fi
+
 if [[ $rc -eq 0 ]]; then
     echo "✅ 窄路径编码约定：无违规"
 else

@@ -55,8 +55,8 @@ inline std::uint32_t meta_crc(const char* header) {
 }  // namespace
 
 bool meta_exists(std::string_view dirname) {
-    const auto path = bitcask::detail::from_utf8(dirname) / "bitcask.meta";
-    return std::filesystem::exists(path);
+    const auto meta_path = bitcask::detail::from_utf8(dirname) / "bitcask.meta";
+    return std::filesystem::exists(meta_path);
 }
 
 std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {

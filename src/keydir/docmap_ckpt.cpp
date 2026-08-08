@@ -219,9 +219,25 @@ bool save_docmap_base(Index& docmap, std::string_view dir,
                       std::uint64_t watermark) {
     const std::string fp = comp_path(dir);
     const std::string prev = fp + ".prev";
+    // 旧 base 轮转成 .prev —— 它不是普通备份，是**崩溃恢复的回退源**
+    // （主 ckpt 结构损坏时读它，见 legacy_ckpt.hpp）。
+    //
+    // P1：经 io::atomic_rename 而非 fs::rename。理由是**纪律不是语义**——
+    // 两者在 Windows 上实测行为逐条一致：覆盖已存在的目标都成功；目标仍开着
+    // 句柄都以 ERROR_ACCESS_DENIED 失败，且带不带 FILE_SHARE_DELETE 都拦
+    // （与 posix_file_test 的 AtomicRenameOverMappedFileKeepsViewContent 所守的
+    // 是同一条规则）。收进 seam 是为了让「Windows 的 rename 语义」全库只有
+    // 一个地方需要解释，不是为了修什么。
+    //
+    // **尽力而为，失败不算错**：轮转没成只意味着 .prev 停在更旧的一份，新
+    // base 照常写。恢复端仅在主 ckpt 损坏时才回退到 .prev，且一旦回退就不吃
+    // delta 链（legacy_ckpt.cpp:133），本就是退到更旧的水位再全量 fold。
+    // 两种崩溃结局（改名了 / 没改名）也都落在可恢复状态上，故此处不需要
+    // atomic_rename 顺带提供的 MOVEFILE_WRITE_THROUGH（实测 0.229 vs
+    // 0.124 ms/次，代价可忽略，但也不构成收编理由）。
     std::error_code ec;
     if (std::filesystem::exists(bitcask::detail::from_utf8(fp), ec)) {
-        std::filesystem::rename(bitcask::detail::from_utf8(fp), bitcask::detail::from_utf8(prev), ec);
+        (void)io::atomic_rename(fp, prev);
     }
     std::vector<std::uint8_t> buf;
     if (!docmap.serialize_docmap(buf, watermark)) return false;

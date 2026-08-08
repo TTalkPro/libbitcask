@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <string>
 #include <system_error>
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::search {
 
@@ -49,7 +50,7 @@ ChainWalk walk_chain(const std::string& base_path, std::uint64_t base_gen,
     for (std::uint32_t s = 1; unbounded || s <= chain_seq; ++s) {
         const std::string dpath = base_path + ".d" + std::to_string(s);
         std::error_code ec;
-        if (!std::filesystem::exists(dpath, ec)) {
+        if (!std::filesystem::exists(bitcask::detail::from_utf8(dpath), ec)) {
             if (!unbounded) w.ok = false;  // 有界：缺文件=链断；无界：正常链尾
             break;
         }
@@ -88,7 +89,7 @@ inline void remove_chain_files(const std::string& base_path) {
     std::uint32_t misses = 0;
     for (std::uint32_t i = 1; misses < 8; ++i) {
         std::error_code ec;
-        if (std::filesystem::remove(base_path + ".d" + std::to_string(i), ec)) {
+        if (std::filesystem::remove(bitcask::detail::from_utf8(base_path + ".d" + std::to_string(i)), ec)) {
             misses = 0;
         } else {
             ++misses;

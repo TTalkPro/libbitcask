@@ -828,7 +828,7 @@ Cask::collect_snapshot_watermarks() const noexcept {
     }
     for (const auto& e : *entries) {
         std::error_code ec;
-        const auto sz = std::filesystem::file_size(e.data_path, ec);
+        const auto sz = std::filesystem::file_size(bitcask::detail::from_utf8(e.data_path), ec);
         if (ec) return std::nullopt;  // 文件态不稳定,放弃本次快照
         // S36-5 B1：active 文件的水位 = **已知持久**字节（sealed 文件由
         // roll/close 的封口 fsync 保证全量持久，不需钳）。采集点顺手做一次
@@ -895,10 +895,10 @@ void Cask::drain_retired_files() noexcept {
     }
     for (const auto& path : batch) {
         std::error_code ec;
-        std::filesystem::remove(path, ec);
-        std::filesystem::remove(fileops::mk_hint_filename(path), ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(path), ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(fileops::mk_hint_filename(path)), ec);
         // 删除失败（非 POSIX 语义下仍被打开等）→ 放回队列下代再试。
-        if (ec && std::filesystem::exists(path)) {
+        if (ec && std::filesystem::exists(bitcask::detail::from_utf8(path))) {
             std::lock_guard<std::mutex> lk(retired_mu_);
             retired_files_.push_back(path);
         }

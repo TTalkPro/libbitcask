@@ -432,9 +432,9 @@ bool SealedSegmentVectorPlugin<SealedT>::save_component_base(
     const std::string fp = comp_path(dir);
     if (config_.dim == 0) {
         std::error_code ec;
-        std::filesystem::remove(fp, ec);
-        std::filesystem::remove(fp + ".prev", ec);
-        std::filesystem::remove(segment_path_ext(fp), ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(fp), ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(fp + ".prev"), ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(segment_path_ext(fp)), ec);
         dirty_.store(false, std::memory_order_relaxed);
         return false;
     }
@@ -494,8 +494,10 @@ bool SealedSegmentVectorPlugin<SealedT>::save_component_base(
     // ckpt：rename → .prev + 引擎段（gen 守卫同 kHnsw payload 语义）。
     const std::string prev = fp + ".prev";
     std::error_code ec;
-    if (std::filesystem::exists(fp, ec)) {
-        std::filesystem::rename(fp, prev, ec);
+    // .prev 轮转：同 docmap_ckpt.cpp 的 save_docmap_base（P1），经 seam、
+    // 尽力而为。完整理由见那处。
+    if (std::filesystem::exists(bitcask::detail::from_utf8(fp), ec)) {
+        (void)io::atomic_rename(fp, prev);
     }
     sc::SectionWriter sw;
     {

@@ -42,6 +42,7 @@
 #include <unordered_map>
 #include <vector>
 #include "bitcask/detail/file_util.hpp"
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::search {
 
@@ -432,7 +433,7 @@ public:
         auto m = MmapSegment::open(path, bm25::Bm25Params{}, verify_crc);
         if (!m) return nullptr;
         const std::string side = path + ".live";
-        if (std::filesystem::exists(side)) {
+        if (std::filesystem::exists(bitcask::detail::from_utf8(side))) {
             if (!m->load_live_sidecar(side)) return nullptr;  // 坏 sidecar:拒载
         }
         auto seg = std::make_unique<SealedSegment>();

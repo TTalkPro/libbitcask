@@ -932,17 +932,42 @@ bug。所以第一步是一个非 ASCII（中文）路径的用例，Windows + L
 
 </details>
 
-### P1 · 语义：两处 `fs::rename` 收进 seam（依赖 P0）⬜
+### P1 · `.prev` 轮转的 `fs::rename` 收进 seam ✅ done
 
-`src/keydir/docmap_ckpt.cpp:223` 与 `src/search/text_plugin.cpp:1104`，形态相同
-（base → `.prev` 轮转），绕过了 `io::atomic_rename`，因而拿不到
-`MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`。
+**立项理由没能通过实测，改用另一条理由做的。** 原以为这两处绕过
+`io::atomic_rename` 会丢掉 `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`。
+对拍结果（同一台机器，同一场景）：
 
-先答语义问题再动手：这两处**真需要 write-through 吗**？它们是写新 base 之前的
-备份轮转，后面紧跟 `SearchCheckpoint::write` 的真正原子发布——若 `.prev` 只是
-崩溃后的兜底副本，write-through 是多余开销。**覆盖语义**（目标已存在时是否替换）
-则是必须确认的。查完可能的结论有两个，「保留 `fs::rename` 并加注释说明为何不需要」
-同样是正当结论。
+| 场景 | `fs::rename` | `MoveFileExW(REPL)` |
+|---|---|---|
+| 目标无人打开 | 成功 | 成功 |
+| 目标被打开（无 `SHARE_DELETE`）| `ACCESS_DENIED` | `ACCESS_DENIED` (5) |
+| 目标被打开（**带 `SHARE_DELETE`**）| `ACCESS_DENIED` | `ACCESS_DENIED` (5) |
+
+**两者行为逐条一致**，覆盖语义 `fs::rename` 本来就有（仓库里那条「`std::rename`
+目标已存在即失败」说的是 C stdio 的 `std::rename`，不是 `fs::rename`）。第三行
+顺带独立复现了 S37-6 已确立、`AtomicRenameOverMappedFileKeepsViewContent` 已在守
+的规则：**Windows 上改名覆盖一个仍开着句柄的目标必然失败，任何 share 位都拦**。
+
+`WRITE_THROUGH` 实测 0.229 vs 0.124 ms/次。而 `.prev` 也不需要它：轮转的两种
+崩溃结局（改名了 / 没改名）都落在可恢复状态上——`.prev` 是主 ckpt 结构损坏时
+的回退源，一旦回退就不吃 delta 链（`legacy_ckpt.cpp:133`），本就退到更旧的水位
+再全量 fold。
+
+所以**收编的理由只剩纪律**：让「Windows 的 rename 语义」全库只有一个地方需要
+解释。按这条理由做了，并把原先被丢弃的 `ec` 显式化为 `(void)` + 注释说明为何
+失败可容忍。站点比立项时数的多两处——`src/search/vector_plugin.cpp:266` 与
+`include/bitcask/detail/sealed_segment_vector_plugin.hpp:498` 是同一形态，
+共 4 处。
+
+**P0 的漏网（P1 期间发现，一并结清）**：`fs::remove(窄串, ec)` 这类**隐式**
+构造 `fs::path` 的调用点，P0 的守门抓不到（没有字面量 `fs::path(`），而它照样
+按 ANSI 解码——且 `ec` 重载**挡不住**，因为路径构造发生在调用之前，抛出的
+`std::system_error` 不经过 `ec`。扫出 **26 处，横跨 11 个文件**。守门脚本已补
+这条规则（并支持跨行调用；判不准时宁可报出来）：fs:: 的路径入参必须是
+`from_utf8(...)`、`e.path()`，或以 `_path`/`_dir` 结尾的变量。
+
+**验证**：msvc-debug 745 全绿，无回归。Linux 仍未复验。
 
 ### P2 · `AtomicFileWriter` 换缓冲层 ⬜
 
@@ -997,8 +1022,9 @@ CONTRIBUTING：**错误要被消费 → 走 seam 的 `IoError`；纯尽力清理
 | S37-5 Windows I/O 后端 | ✅ done（bitcask.dll 产出；Windows ctest 733 → 724 通过 99%，余 9 个全部落在 S37-6；Linux 复验 735/735 无回归，见落地记录）|
 | S37-6 删除/映射生命周期 | ✅ done（**实测推翻立项前提，非架构改动**；Windows ctest 733/733 全绿，见落地记录）|
 | S37-7 CI + 收尾 | ⬜ 未开始 |
-| P 段 P0 路径编码统一 | ✅ done（59 处成对收编 + 守门 + 9 个用例；msvc-debug 745 无回归。**Linux 未复验**）|
-| P 段 P1–P4 | ⬜ 未开始（W5 已于 6ad5b4b 结清）|
+| P 段 P0 路径编码统一 | ✅ done（59 处成对收编 + 守门 + 9 个用例；P1 期间又补 26 处隐式转换。**Linux 未复验**）|
+| P 段 P1 `.prev` 轮转收进 seam | ✅ done（4 处；立项理由被实测推翻，改按纪律做）|
+| P 段 P2–P4 | ⬜ 未开始（W5 已于 6ad5b4b 结清）|
 
 ### 待确认项
 

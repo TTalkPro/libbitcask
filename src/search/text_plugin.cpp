@@ -1100,9 +1100,12 @@ bool TextPlugin::save_component_base(std::string_view dir,
                                      std::uint64_t watermark) {
     const std::string fp = comp_path(dir);
     const std::string prev = fp + ".prev";
+    // 同 docmap_ckpt.cpp 的 save_docmap_base：.prev 是崩溃恢复的回退源，
+    // 轮转经 io::atomic_rename 收进 seam（纪律，非语义——fs::rename 与
+    // MoveFileExW 在 Windows 上实测行为一致），失败尽力而为。完整理由见那处。
     std::error_code ec;
     if (std::filesystem::exists(bitcask::detail::from_utf8(fp), ec)) {
-        std::filesystem::rename(bitcask::detail::from_utf8(fp), bitcask::detail::from_utf8(prev), ec);
+        (void)io::atomic_rename(fp, prev);
     }
     sc::SectionWriter sw;  // S20-1 R4
     // S27-3 步骤 3:kBm25Default/kBm25Fields 退役——倒排数据在各段文件内
@@ -1199,7 +1202,7 @@ TextPlugin::load_component(std::string_view dir,
 bool TextPlugin::init_segment_set(std::string_view dir, bool loaded) {
     const std::string segs_dir = std::string(dir) + "/bm25_segments/";
     std::error_code ec;
-    std::filesystem::create_directories(segs_dir, ec);
+    std::filesystem::create_directories(bitcask::detail::from_utf8(segs_dir), ec);
     // S31:是否「清单声明了段」——非空 payload 意味着必须载出段,失败要上抛
     // (原实现静默落空集,配合高水位 = 永久静默空索引,下游 zhwiki 实测踩中)。
     const bool expect_segments = loaded && !pending_seg_manifest_.empty();
@@ -1285,7 +1288,7 @@ void TextPlugin::maybe_merge_segments() {
         search::SealedSegment::open_v2(path);
     if (!merged) {
         std::error_code ec;
-        std::filesystem::remove(path, ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(path), ec);
         return;
     }
 

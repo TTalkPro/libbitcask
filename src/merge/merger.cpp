@@ -10,6 +10,7 @@
 #include "bitcask/format.hpp"
 #include "bitcask/hint_file.hpp"
 #include "bitcask/plugin_api.hpp"  // S18-7：merge 参与协议（设计 §3.9）
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::merge {
 
@@ -69,8 +70,8 @@ private:
 
     void cleanup_partial_outputs() {
         std::error_code ec;
-        std::filesystem::remove(stats_.output_data_path, ec);
-        std::filesystem::remove(stats_.output_hint_path, ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(stats_.output_data_path), ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(stats_.output_hint_path), ec);
     }
 
     // 失败清理（分批版）：任何批 apply 过之后，输出已被 keydir 引用——
@@ -254,7 +255,7 @@ MergeRunner::run(std::span<const std::string> input_data_paths,
         std::uint64_t est_records = 0;
         for (const auto& path : input_data_paths) {
             std::error_code ec;
-            const auto sz = std::filesystem::file_size(path, ec);
+            const auto sz = std::filesystem::file_size(bitcask::detail::from_utf8(path), ec);
             if (!ec) est_records += sz / 64;
         }
         if (est_records > 0) {

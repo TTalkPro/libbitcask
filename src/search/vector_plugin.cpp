@@ -251,8 +251,8 @@ bool VectorPlugin::save_component_base(std::string_view dir,
         // 恒脏使 any_dirty 永真，静止后的收尾 ckpt 永远走不到 base 路径
         // （旧 save_components_base 尾部即无条件清）。
         std::error_code ec;
-        std::filesystem::remove(fp, ec);
-        std::filesystem::remove(fp + ".prev", ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(fp), ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(fp + ".prev"), ec);
         std::filesystem::remove(
             bitcask::detail::from_utf8(fp).replace_extension(".vec"), ec);
         std::filesystem::remove(
@@ -262,8 +262,10 @@ bool VectorPlugin::save_component_base(std::string_view dir,
     }
     const std::string prev = fp + ".prev";
     std::error_code ec;
-    if (std::filesystem::exists(fp, ec)) {
-        std::filesystem::rename(fp, prev, ec);
+    // .prev 轮转：同 docmap_ckpt.cpp 的 save_docmap_base（P1），经 seam、
+    // 尽力而为。完整理由见那处。
+    if (std::filesystem::exists(bitcask::detail::from_utf8(fp), ec)) {
+        (void)io::atomic_rename(fp, prev);
     }
     std::vector<sc::CkptSection> secs;
     std::vector<std::uint8_t> buf;

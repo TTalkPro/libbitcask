@@ -35,9 +35,9 @@ void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep,
     std::vector<std::string> still;
     for (const auto& p : backlog) {
         std::error_code rm_ec;
-        const auto pp = bitcask::detail::from_utf8(p);
-        std::filesystem::remove(pp, rm_ec);
-        if (rm_ec && std::filesystem::exists(pp)) still.push_back(p);
+        const auto stale_path = bitcask::detail::from_utf8(p);
+        std::filesystem::remove(stale_path, rm_ec);
+        if (rm_ec && std::filesystem::exists(stale_path)) still.push_back(p);
     }
     backlog = std::move(still);
     std::error_code ec;
@@ -245,7 +245,7 @@ bool OkiState::flush(
     auto rd = OkiRunReader::open(mk_run_filename(dir, gen));
     if (!rd) {
         std::error_code ec;
-        std::filesystem::remove(mk_run_filename(dir, gen), ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
         return false;
     }
 
@@ -256,7 +256,7 @@ bool OkiState::flush(
     next.level_b = level_b_.load(std::memory_order_acquire);  // S36-4 模式戳
     if (!write_manifest(dir, next)) {
         std::error_code ec;
-        std::filesystem::remove(mk_run_filename(dir, gen), ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
         return false;
     }
     manifest_ = std::move(next);
@@ -319,7 +319,7 @@ bool OkiState::compact_all_locked(std::string_view dir) {
     if (!w) return false;
     auto abort = [&] {
         std::error_code ec;
-        std::filesystem::remove(mk_run_filename(dir, gen), ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
         return false;
     };
 
@@ -445,7 +445,7 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
         auto rd = OkiRunReader::open(mk_run_filename(dir, gen));  // S33-5
         if (!rd) {
             std::error_code ec;
-            std::filesystem::remove(mk_run_filename(dir, gen), ec);
+            std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
             return false;
         }
         new_reader = std::make_shared<OkiRunReader>(*std::move(rd));
@@ -457,7 +457,7 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
     next.level_b = level_b_.load(std::memory_order_acquire);  // S36-4 模式戳
     if (!write_manifest(dir, next)) {
         std::error_code ec;
-        if (new_reader) std::filesystem::remove(mk_run_filename(dir, gen), ec);
+        if (new_reader) std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
         return false;
     }
 

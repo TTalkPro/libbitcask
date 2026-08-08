@@ -7,6 +7,7 @@
 #include "bitcask/byte_order.hpp"
 #include "bitcask/codec.hpp"   // crc32 / crc32_update
 #include "bitcask/vbyte.hpp"   // vbyte_encode / vbyte_read_checked
+#include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::oki {
 
@@ -681,7 +682,7 @@ SpillingRunBuilder::~SpillingRunBuilder() {
     // 未 finish（错误路径/析构弃用）：best-effort 清 spill 残件。
     for (const auto& p : spill_paths_) {
         std::error_code ec;
-        std::filesystem::remove(p, ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(p), ec);
     }
 }
 
@@ -862,7 +863,7 @@ SpillingRunBuilder::finish(bool fsync_dir) {
 
     for (const auto& p : spill_paths_) {
         std::error_code ec;
-        std::filesystem::remove(p, ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(p), ec);
     }
     spill_paths_.clear();
     buf_.clear();
