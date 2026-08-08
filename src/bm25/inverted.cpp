@@ -286,9 +286,15 @@ void InvertedIndex::add_doc(
 
 }
 
+// term_freqs 刻意不使用：V2 的删除**不动 posting 行**（查询期靠 live 过滤，
+// df 漂移在 merge 时重算，见 inverted.hpp 文件头「df 漂移」一节），本函数只负责
+// 把全局统计调准。参数仍留在签名里——它是「删哪篇文档的哪些 term」这一语义的
+// 一部分，V3/merge 期实现会用到，且 4 个调用点本就手里有这份 map。
+// 标 [[maybe_unused]] 而非删名：删了名字，读者就看不出这里本该收到什么。
 void InvertedIndex::remove_doc(
     std::uint32_t doc_len,
-    const std::unordered_map<std::string, std::uint32_t>& term_freqs) {
+    [[maybe_unused]] const std::unordered_map<std::string, std::uint32_t>&
+        term_freqs) {
     // 写路径 V2 串行，guard 用 load + fetch_sub（reader 侧裸 load 已无 race）。
     if (live_doc_count_.load(std::memory_order_relaxed) > 0) {
         live_doc_count_.fetch_sub(1, std::memory_order_relaxed);
