@@ -1109,6 +1109,55 @@ TEST(FieldSchema, ToleratesTornTailNewFormat) {
     EXPECT_EQ(fs2.name_of(0).value(), "title");
 }
 
+// torn tail **之后再 intern 一条**——上一个用例只验到「打开时容忍」，
+// 而真正的危险在下一步：若续写起点取文件大小，新条就落到残条**之后**，
+// 文件变成 [完整条…][残条][新条]，再下次打开时 open() 直接返回 false
+// （= 真损坏 → caller 中止 open → 整个库打不开）。
+// 起点必须取「最后一条完整 entry 的末尾」并截掉残条。
+// 注：该隐患早于 P3（fopen "ab" 的 O_APPEND 同样从含残条的末尾写），
+// 与写句柄换成 io::File 无关。
+TEST(FieldSchema, TornTailIsOverwrittenByNextIntern) {
+    TempDir td;
+    const std::string path = td / "field.schema";
+    {
+        bitcask::FieldSchema fs;
+        ASSERT_TRUE(fs.open(path));
+        fs.intern("title");
+        fs.intern("body");
+    }
+    const auto clean_size = std::filesystem::file_size(path);
+
+    // 崩在半条上：声称 len=5，只落了 2 字节 name，CRC 全缺。
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::app);
+        const char lb[2] = {static_cast<char>(5), static_cast<char>(0)};
+        out.write(lb, 2);
+        out.write("ab", 2);
+    }
+    ASSERT_GT(std::filesystem::file_size(path), clean_size);
+
+    std::uint32_t id_third = 0;
+    {
+        bitcask::FieldSchema fs2;
+        ASSERT_TRUE(fs2.open(path));
+        EXPECT_EQ(fs2.size(), 2u);
+        // 打开即应把残条截掉，文件回到最后一条完整 entry 的末尾。
+        EXPECT_EQ(std::filesystem::file_size(path), clean_size)
+            << "残条未被截掉 → 下一条会写在它后面";
+        id_third = fs2.intern("author");
+        EXPECT_EQ(id_third, 2u);
+    }
+
+    // 关键断言：再打开一次必须成功，且三条都在、id 不漂移。
+    bitcask::FieldSchema fs3;
+    ASSERT_TRUE(fs3.open(path)) << "残条夹在中间会让这里返回 false";
+    EXPECT_EQ(fs3.size(), 3u);
+    EXPECT_EQ(fs3.name_of(0).value(), "title");
+    EXPECT_EQ(fs3.name_of(1).value(), "body");
+    EXPECT_EQ(fs3.name_of(2).value(), "author");
+    EXPECT_EQ(fs3.intern("author"), id_third) << "id 必须与写入时一致";
+}
+
 // ---------------------------------------------------------------------------
 // HintFile v3（S23-A1）+ v2 兼容读
 // ---------------------------------------------------------------------------

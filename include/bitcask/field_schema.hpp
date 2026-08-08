@@ -66,6 +66,10 @@ public:
         name_to_id_.clear();
         id_to_name_.clear();
         legacy_ = false;
+        // 必须重置：文件不存在/为空时下面两个 load_ 都不会跑，若留着上一次
+        // open 的值，woff_ 会被定到一个凭空的偏移上（同一对象重复 open 才会
+        // 暴露，测试里就有这种用法）。
+        valid_end_ = 0;
         bool fresh = true;         // 无既有内容（新文件/空文件）→ 需写文件头
         bool need_upgrade = false; // 读到 legacy 无头内容 → 尝试升级为新格式
 
@@ -102,6 +106,11 @@ public:
 
         if (need_upgrade && upgrade_legacy_to_new_()) {
             legacy_ = false;  // 升级成功：文件现已是带头新格式
+            // 文件被整体重写了，load_legacy_ 记下的 valid_end_ 是**旧格式**的
+            // 偏移，对新文件无意义（照它截断会把刚升级好的文件切掉一截）。
+            // 升级产物 = 文件头 + 全部 entry 的新格式编码，按此重算。
+            valid_end_ = kHeaderSize;
+            for (const auto& n : id_to_name_) valid_end_ += 2u + n.size() + 4u;
         }
 
         wf_.close_quiet();
@@ -119,14 +128,37 @@ public:
         //   - POSIX 下 O_APPEND 会让 pwrite **忽略 offset** 改为追加
         //     （io.hpp 的 kNoAppend 注释记的那条暗礁）；
         //   - Windows 没有 O_APPEND 的等价物，seam 的定位写走 OVERLAPPED 偏移。
-        // 两边要行为一致，就只能开时量一次大小、之后自己推进。
+        // 两边要行为一致，就只能开时定一次起点、之后自己推进。
         // kUmaskDefault 仍是为了逐字复刻 fopen 的 0666&~umask 建档权限。
         if (auto h = io::open_handle(path, io::OpenFlag::kNoAppend,
                                      io::FileMode::kUmaskDefault)) {
             io::File wf{*h};
             if (const auto sz = io::handle_size(wf.fd())) {
-                woff_ = *sz;
-                wf_ = std::move(wf);   // best-effort：量不到大小就不持有
+                // **起点是「最后一条完整 entry 的末尾」，不是文件大小。**
+                //
+                // 上一次进程若崩在半条 entry 上，文件尾部会留着那半条：
+                // load_* 对它是「短读即停止解析」（容忍，见 load_new_format_），
+                // 于是它**不在**内存序列里。若仍按文件大小续写，下一条就落到
+                // 半条**之后**，文件变成 [完整条…][半条][新条]——再下次打开时
+                // 解析会在半条处停住或把后面的字节读成名字，实测直接 open()
+                // 返回 false（= 真损坏，caller 须中止 open，整个库打不开）。
+                //
+                // 这个隐患在 P3 之前（fopen "ab" + O_APPEND）就存在，形态一模
+                // 一样——O_APPEND 同样从文件末尾（含半条）开始写。P3 的前缀
+                // 不变式只覆盖「写失败后停止持久化」，覆盖不到这个既有状态。
+                //
+                // 修法：起点取 valid_end_，并把尾部多余字节截掉。截掉的一定是
+                // **解析不出来的残条**（valid_end_ 由刚才那趟解析产出），不是
+                // 有效数据；不截则残条会夹在新条之前，更糟。目录只读时
+                // open_handle 就失败了，走不到这里，行为与既往一致。
+                woff_ = valid_end_;
+                if (*sz > woff_ && !io::truncate_handle(wf.fd(), woff_)) {
+                    // 截不掉：宁可不持有句柄（= 本类既有的「只在内存生效」降级），
+                    // 也不要在残条之后追加。
+                    wf.close_quiet();
+                } else {
+                    wf_ = std::move(wf);  // best-effort：量不到大小就不持有
+                }
             }
         }
 
@@ -255,6 +287,7 @@ private:
     // 新格式解析：rf 已越过 8 字节文件头。返回 false 仅当「完整 entry 但 CRC 不符」
     // （真损坏）；torn tail（尾部读不满一条）容忍，返回 true。
     bool load_new_format_(std::FILE* rf) {
+        valid_end_ = kHeaderSize;  // rf 已越过文件头
         while (true) {
             std::byte lb[2];
             const std::size_t g = std::fread(lb, 1, 2, rf);
@@ -277,11 +310,13 @@ private:
             const auto id = static_cast<std::uint32_t>(id_to_name_.size());
             name_to_id_.emplace(name, id);
             id_to_name_.push_back(std::move(name));
+            valid_end_ += 2u + nlen + 4u;  // [len][name][crc]，见 encode_entry_
         }
     }
 
     // legacy 无头格式解析：[NameLen:u16][name] 循环（flag-day 后小端）。
     void load_legacy_(std::FILE* rf) {
+        valid_end_ = 0;  // legacy 无文件头
         while (true) {
             std::byte lb[2];
             if (std::fread(lb, 1, 2, rf) != 2) break;
@@ -291,6 +326,7 @@ private:
             const auto id = static_cast<std::uint32_t>(id_to_name_.size());
             name_to_id_.emplace(name, id);
             id_to_name_.push_back(std::move(name));
+            valid_end_ += 2u + nlen;  // legacy 一条是 [len][name]，无 CRC
         }
     }
 
@@ -323,6 +359,9 @@ private:
     // P3：内核句柄 + 自记偏移，取代原先长期持有的 std::FILE*。
     io::File      wf_;                  // append-only 写句柄（best-effort）
     std::uint64_t woff_ = 0;            // 下一次追加的偏移（持 unique_lock 推进）
+    // 解析出的「最后一条完整 entry 的末尾」。与文件大小的差 = 上次崩溃留下的
+    // 残条；open 据此定 woff_ 并截掉尾巴（理由见 open 里的长注释）。
+    std::uint64_t valid_end_ = 0;
     bool persist_failed_ = false;       // 写挂过 → 已停止持久化，见 intern
     bool legacy_ = false;  // true = 该文件为无头 legacy 且升级失败 → intern 按旧格式追加
 };
