@@ -969,15 +969,50 @@ bug。所以第一步是一个非 ASCII（中文）路径的用例，Windows + L
 
 **验证**：msvc-debug 745 全绿，无回归。Linux 仍未复验。
 
-### P2 · `AtomicFileWriter` 换缓冲层 [todo]
+### P2 · 读路径改走 seam 的定位读 [done]（原「`AtomicFileWriter` 换缓冲层」，靶心已改）
 
-在 seam 之上加 `detail::BufferedWriter`（`FileHandle` + 一块 buffer + 偏移，
-约 200 行 + 边界测试：短读、EOF、flush 失败、超大写）。**注意不要重写 native
-读写**——`pread_once`/`pwrite_once` 在两个平台上都已是原生实现，stdio 现在唯一
-还提供的东西是缓冲。
+**动手前查调用方，把靶心从写路径挪到了读路径。** 原计划要写一个 ~200 行的
+`BufferedWriter` 去替换 `AtomicFileWriter`，理由是「stdio 唯一还提供的是缓冲」。
+查下来两件事推翻了它：
 
-`AtomicFileWriter`（`detail/file_util.hpp:242`）先换：全库 9 个原子写站点共用它，
-一处改动覆盖面最大，且改完 tmp 的 fsync 直接用句柄，不必绕 `stream_handle`。
+1. **写路径没有缺陷可修。** `AtomicFileWriter` 的调用方是顺序 `fwrite`，不经过
+   `long` 偏移；而它原有的另外三条理由已被前面两期消化掉了——CRT 跨界 W5
+   已消除（`flush_and_sync` 现在 inline），路径编码 P0 已消除
+   （`fopen_utf8`），`FILE_SHARE_DELETE` 对短命 tmp 文件无意义。剩下的只有
+   「通货统一」这种整洁性收益，而代价是改 5 个用 `fseek`/`fwrite` 图案的调用点
+   外加一个必须自己写对的缓冲层（短写、disk-full、超大写）。**不划算，不做。**
+2. **读路径有真缺陷。** `std::fseek`/`std::ftell` 的偏移类型是 `long`，
+   **MSVC x64 上只有 4 字节**（Linux 上 8 字节，所以 CI 与全部现有测试都照不到）。
+   实测：
+
+   | | 结果 |
+   |---|---|
+   | `sizeof(long)` | 4 |
+   | `static_cast<long>(3 GiB + 4 KiB)` | **-1073737728**（静默截断成负数）|
+   | 2.54 GiB 文件上的 `ftell()` | **-1** |
+   | `_ftelli64()` / `ReadFile`+`OVERLAPPED` | 正常 |
+
+   即**库有一个 Windows 独有的 2 GiB 单文件天花板**，Linux 上不存在。失败形态
+   分两类：`read_file_bytes` 把好文件当成读不出来（返 nullopt）；
+   `search_checkpoint::read_selected` 把好 ckpt 判成结构损坏（调用方据此退
+   `.prev` 或全量重建）。受影响的调用方包括 **keydir 快照、HNSW payload、
+   BM25 段、migrate 的数据文件**——都是大部署下能过 2 GiB 的东西。
+
+**落地**：
+
+- `detail::read_file_bytes` 与 `search::SearchCheckpoint::read_selected` 整体
+  改走 seam 的 `io::File::open` + `handle_size` + `pread_all`（全程
+  `std::uint64_t`）。后者本就是「按目录跳着读」，定位读比 `seek`+`fread` 更贴合，
+  改完还少了「seek 到尾、量、再 seek 回来」三步。**没有用到缓冲**——整读是一次
+  大 `pread`，跳读是按目录定位，缓冲层从头到尾没有必要。
+- `hnsw.cpp` 的两处顺序写保留 `FILE*`，只把 `static_cast<long>` 换成新增的
+  `detail::fseek64`（Windows 落 `_fseeki64`，POSIX 落 `fseeko`）。那两处偏移
+  实际远小于 2 GiB（头部 + 页 CRC 数组），但那个 cast 是颗定时炸弹。
+- 守门加一条：禁止 `std::fseek`/`std::ftell`。
+- `tests/posix_file_test.cpp` 新增 `LargeFile.SizeAndPositionedIoBeyond2GiB`
+  （2.54 GiB，跨过 2^31），空间不足时 `GTEST_SKIP` 而不是把 CI runner 的盘写满。
+
+**验证**：msvc-debug 746 全绿（新增 1 个用例，实跑 856 ms 未跳过）。Linux 仍未复验。
 
 ### P3 · `field_schema` 换 `BufferedWriter` [todo]
 
@@ -1024,7 +1059,8 @@ CONTRIBUTING：**错误要被消费 → 走 seam 的 `IoError`；纯尽力清理
 | S37-7 CI + 收尾 | ⬜ 未开始 |
 | P 段 P0 路径编码统一 | [done]（59 处成对收编 + 守门 + 9 个用例；P1 期间又补 26 处隐式转换。**Linux 未复验**）|
 | P 段 P1 `.prev` 轮转收进 seam | [done]（4 处；立项理由被实测推翻，改按纪律做）|
-| P 段 P2–P4 | [todo] 未开始（W5 已于 6ad5b4b 结清）|
+| P 段 P2 读路径改走定位读 | [done]（原计划是写路径缓冲层，实测把靶心改到 2 GiB 天花板）|
+| P 段 P3–P4 | [todo] 未开始（W5 已于 6ad5b4b 结清）|
 
 ### 待确认项
 

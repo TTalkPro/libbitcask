@@ -295,6 +295,47 @@ TEST(FileLifecycle, AtomicRenameOverMappedFileKeepsViewContent) {
         << "旧视图必须保持旧内容（等价 POSIX unlink-while-mapped）";
 }
 
+// P2：2 GiB 以上的文件。守的是「大小与定位偏移全程 64 位」。
+//
+// 原实现用 std::fseek(SEEK_END)+std::ftell 量大小，而它们的偏移类型是 long——
+// **MSVC x64 上只有 4 字节**。实测 2.54 GiB 的文件 ftell() 返 -1，于是
+// read_file_bytes 把好文件当成读不出来、search_checkpoint 把好 ckpt 判成结构
+// 损坏；而 static_cast<long>(off) 那几处更会静默截断成负数。Linux 上 long 是
+// 8 字节，所以这条分歧只在 Windows 出现，CI 与其余用例全都照不到——正因为
+// 照不到，才需要这一条显式守着。
+TEST(LargeFile, SizeAndPositionedIoBeyond2GiB) {
+    constexpr std::uint64_t kSize = 2600ull << 20;  // 2.54 GiB，跨过 2^31
+    TempDir td;
+
+    // 稀疏与否取决于文件系统；空间不够就跳过，不要在 CI runner 上把盘写满。
+    std::error_code sec;
+    const auto sp = fs::space(fs::temp_directory_path(), sec);
+    if (sec || sp.available < kSize + (4ull << 30)) {
+        GTEST_SKIP() << "可用空间不足，跳过大文件用例";
+    }
+
+    const auto path = td.file("big.bin");
+    // kTruncate 而非 kCreate：后者带 O_APPEND，POSIX 下会让 pwrite 忽略 offset。
+    auto f = bitcask::io::File::open(path, OpenFlag::kTruncate);
+    ASSERT_TRUE(f);
+    if (!bitcask::io::truncate_handle(f->fd(), kSize)) {
+        GTEST_SKIP() << "文件系统不支持撑到该大小";
+    }
+
+    const char mark[8] = {'M', 'A', 'R', 'K', 'E', 'R', '!', '!'};
+    ASSERT_TRUE(bitcask::io::pwrite_all(f->fd(), mark, sizeof mark, kSize - 8))
+        << "2 GiB 以上的定位写失败";
+
+    const auto sz = bitcask::io::handle_size(f->fd());
+    ASSERT_TRUE(sz);
+    EXPECT_EQ(*sz, kSize) << "大小被截断（std::ftell 在这里会给 -1）";
+
+    char back[8] = {};
+    ASSERT_TRUE(bitcask::io::pread_all(f->fd(), back, sizeof back, kSize - 8))
+        << "2 GiB 以上的定位读失败";
+    EXPECT_EQ(0, std::memcmp(back, mark, sizeof mark));
+}
+
 TEST(FileLifecycle, AdoptedStreamAllowsDeleteWhileHeld) {
     // field_schema 长期持有一个追加流（field.schema）。它必须由
     // io::open_handle 打开（恒带 FILE_SHARE_DELETE）再由 inline 的

@@ -53,6 +53,11 @@ scan 'std::fopen\s*\(' \
 scan 'std::remove\s*\(\s*[a-z_]' \
      'std::remove 同上。改用 bitcask::detail::remove_utf8() 或 io::remove_file()。' || rc=1
 
+# P2：fseek/ftell 的偏移类型是 long —— MSVC x64 上只有 4 字节，超过 2 GiB
+# 静默截断成负数（Linux 上 long 是 8 字节，CI 照不到）。
+scan 'std::(fseek|ftell)\s*\(' \
+     'std::fseek/ftell 的 long 偏移在 Windows 上是 2 GiB 天花板。定位读用 io::pread_all（收 uint64），写路径用 bitcask::detail::fseek64()。' || rc=1
+
 # ---------------------------------------------------------------------------
 # 隐式转换 —— P1 期间发现，上面四条都抓不到它。
 #

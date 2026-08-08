@@ -325,7 +325,8 @@ bool write_bcvp_file(const std::string& fp, std::uint16_t dim, std::uint32_t n,
     bool ok = true;
     if (total_vecs > 0) {
         // 数据区：逐页组装（页与向量边界不对齐——页跨向量/向量跨页均有）。
-        ok = std::fseek(f.get(), static_cast<long>(vecs_off), SEEK_SET) == 0;
+        ok = bitcask::detail::fseek64(f.get(), static_cast<std::int64_t>(vecs_off),
+                                     SEEK_SET);
         std::vector<std::uint8_t> page(kBcvpPageSize);
         std::size_t fill = 0;
         std::uint32_t pidx = 0;
@@ -359,7 +360,7 @@ bool write_bcvp_file(const std::string& fp, std::uint16_t dim, std::uint32_t n,
         if (ok && fill > 0) ok = flush_page(fill);  // 尾页（< 4KB）
     }
     // 回头补写 header + CRC 表。
-    if (ok) ok = std::fseek(f.get(), 0, SEEK_SET) == 0;
+    if (ok) ok = bitcask::detail::fseek64(f.get(), 0, SEEK_SET);
     if (ok) ok = std::fwrite(head.data(), 1, head.size(), f.get()) ==
                  head.size();
     if (!ok || !w.commit()) return false;  // commit 内含 P6-DUR-1 的 fdatasync

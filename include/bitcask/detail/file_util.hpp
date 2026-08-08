@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -85,6 +86,27 @@ inline void remove_utf8(const std::string& path) noexcept {
     (void)io::remove_file(path);
 }
 
+// ---------------------------------------------------------------------------
+// 64 位偏移的 fseek（P2）。
+//
+// `std::fseek` 的偏移类型是 `long`，**MSVC x64 上只有 4 字节**（Linux 上 8 字节，
+// 所以这条分歧只在 Windows 出现，CI 与全部现有测试都照不到）。实测：
+//   static_cast<long>(3 GiB + 4 KiB) == -1073737728   —— 静默截断成负数
+//   2.54 GiB 文件上 ftell() == -1
+// 于是「offset 超过 2 GiB」不会报错，而是 seek 到一个负数位置。
+//
+// 只读流用不上它——那条路已整体改走 seam 的定位读（pread_all 收 uint64）。
+// 本函数留给仍以 FILE* 顺序写、只在小偏移上回头补头的写路径（hnsw 的分页
+// CRC + 回头补头），把那个 static_cast 去掉，免得日后格式一变就静默截断。
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline bool fseek64(std::FILE* f, std::int64_t off, int origin) noexcept {
+#if defined(_WIN32)
+    return ::_fseeki64(f, off, origin) == 0;
+#else
+    return ::fseeko(f, static_cast<off_t>(off), origin) == 0;
+#endif
+}
+
 // ---- 整文件读 -------------------------------------------------------------
 
 // 整文件读入内存。空文件 → 空向量（成功）；fopen/seek/ftell 失败或短读
@@ -97,21 +119,34 @@ inline void remove_utf8(const std::string& path) noexcept {
 // Byte 模板化而非统一为 std::byte：调用方两种元素类型并存
 // （keydir/hnsw 的 deserialize 吃 uint8_t，其余吃 byte），而仓库策略禁
 // reinterpret_cast 逃逸，统一类型会逼出更多 cast。
+// P2：由 stdio 改走 io seam。**动机是 32 位的 long，不是通货统一。**
+//
+// 原实现用 `fseek(SEEK_END)` + `ftell` 量大小，而这两者的偏移类型是 `long`，
+// 在 **MSVC x64 上是 4 字节**（Linux 上是 8 字节，所以 CI 与全部现有测试都照
+// 不到）。实测 2.54 GiB 的文件：`ftell()` 返回 **-1**，于是本函数把一个完全
+// 正常的文件当成读不出来，返回 nullopt。调用方包括 keydir 快照、HNSW payload、
+// BM25 段、migrate 的数据文件——都是大部署下能过 2 GiB 的东西。
+//
+// seam 的 `handle_size` / `pread_all` 收 `std::uint64_t`，没有这个上限；
+// 顺带也不再需要「seek 到尾、量、再 seek 回来」这三步。
+//
+// 注意本函数把整个文件读进内存，所以 2 GiB 级的文件本就应当走 mmap 而非这里；
+// 但「Linux 能读、Windows 读不了」是移植引入的行为分歧，与设计上限是两回事。
 template <class Byte = std::byte>
 [[nodiscard]] std::optional<std::vector<Byte>>
 read_file_bytes(const std::string& path) {
     static_assert(sizeof(Byte) == 1, "read_file_bytes: Byte 须为单字节类型");
-    FilePtr f(fopen_utf8(path, "rb"));
+    auto f = io::File::open(path, io::OpenFlag::kReadOnly);
     if (!f) return std::nullopt;
-    if (std::fseek(f.get(), 0, SEEK_END) != 0) return std::nullopt;
-    const long sz = std::ftell(f.get());
-    if (sz < 0) return std::nullopt;
-    if (std::fseek(f.get(), 0, SEEK_SET) != 0) return std::nullopt;
-    // sz 来自可能损坏的文件（可为巨值）：vector 分配可抛 bad_alloc，
-    // FilePtr 保证 fd 不泄漏（MEM-LOW-1 同源）。
-    std::vector<Byte> buf(static_cast<std::size_t>(sz));
-    if (!buf.empty() &&
-        std::fread(buf.data(), 1, buf.size(), f.get()) != buf.size()) {
+    const auto sz = io::handle_size(f->fd());
+    if (!sz) return std::nullopt;
+    if (*sz > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)())) {
+        return std::nullopt;  // 32 位宿主上装不下
+    }
+    // 大小来自可能损坏的文件（可为巨值）：vector 分配可抛 bad_alloc，
+    // io::File 的析构保证句柄不泄漏（MEM-LOW-1 同源）。
+    std::vector<Byte> buf(static_cast<std::size_t>(*sz));
+    if (!buf.empty() && !io::pread_all(f->fd(), buf.data(), buf.size(), 0)) {
         return std::nullopt;
     }
     return buf;

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>  // S14-3: read_selected 的段选择谓词
+#include <limits>      // P2：size_t 上限校验（seam 的大小是 uint64）
 #include <memory>      // S21-3：unique_ptr（曾靠传递包含，B3 新包含点暴露）
 #include <optional>
 #include <span>
@@ -229,19 +230,24 @@ public:
     read_selected(std::string_view path,
                   const std::function<bool(std::uint16_t)>& want) {
         using namespace detail;
-        std::unique_ptr<std::FILE, ::bitcask::detail::FileCloser> f(
-            bitcask::detail::fopen_utf8(std::string(path), "rb"));
+        // P2：由 stdio 改走 io seam。`fseek`/`ftell` 的偏移类型是 `long`，
+        // **MSVC x64 上只有 4 字节**——实测 2.54 GiB 的文件 `ftell()` 返 -1，
+        // 于是下面那个长度门槛把整份 ckpt 判成结构损坏（调用方据此退 .prev
+        // 或全量重建）。而 `static_cast<long>(off)` 这类还会**静默截断成负数**。
+        // seam 的 `pread_all` 收 `std::uint64_t`，且本函数的读法本就是「按目录
+        // 跳着读」，定位读比 seek+fread 更贴合。Linux 上 long 是 8 字节，
+        // 所以这条分歧只在 Windows 出现，CI 照不到。
+        auto f = io::File::open(path, io::OpenFlag::kReadOnly);
         if (!f) return std::nullopt;
-        std::fseek(f.get(), 0, SEEK_END);
-        const long fsz = std::ftell(f.get());
-        if (fsz < static_cast<long>(kHeaderLen + kTrailerLen)) {
+        const auto fsz = io::handle_size(f->fd());
+        if (!fsz || *fsz < kHeaderLen + kTrailerLen) return std::nullopt;
+        if (*fsz > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)())) {
             return std::nullopt;
         }
-        const std::size_t n = static_cast<std::size_t>(fsz);
+        const std::size_t n = static_cast<std::size_t>(*fsz);
 
         std::byte head[kHeaderLen];
-        std::fseek(f.get(), 0, SEEK_SET);
-        if (std::fread(head, 1, kHeaderLen, f.get()) != kHeaderLen) {
+        if (!io::pread_all(f->fd(), head, kHeaderLen, 0)) {
             return std::nullopt;
         }
         if (std::memcmp(head, kCkptMagic, 4) != 0) return std::nullopt;
@@ -250,8 +256,8 @@ public:
                 ver != kCkptVersion3) return std::nullopt;
 
         std::byte tail[kTrailerLen];
-        std::fseek(f.get(), static_cast<long>(n - kTrailerLen), SEEK_SET);
-        if (std::fread(tail, 1, kTrailerLen, f.get()) != kTrailerLen) {
+        if (!io::pread_all(f->fd(), tail, kTrailerLen,
+                           static_cast<std::uint64_t>(n) - kTrailerLen)) {
             return std::nullopt;
         }
         if (std::memcmp(tail + 8, kCkptMagic, 4) != 0) return std::nullopt;
@@ -263,8 +269,9 @@ public:
         const std::size_t dir_begin = n - kTrailerLen - dir_len;
         if (dir_begin < kHeaderLen) return std::nullopt;
         std::vector<std::byte> dir(dir_len);
-        std::fseek(f.get(), static_cast<long>(dir_begin), SEEK_SET);
-        if (std::fread(dir.data(), 1, dir_len, f.get()) != dir_len) {
+        if (dir_len != 0 &&
+            !io::pread_all(f->fd(), dir.data(), dir_len,
+                           static_cast<std::uint64_t>(dir_begin))) {
             return std::nullopt;
         }
         if (bitcask::codec::crc32(
@@ -296,9 +303,9 @@ public:
             ls.type = type;
             ls.flags = flags;
             ls.payload.resize(static_cast<std::size_t>(len));
-            std::fseek(f.get(), static_cast<long>(off), SEEK_SET);
-            if (std::fread(ls.payload.data(), 1, ls.payload.size(), f.get()) !=
-                ls.payload.size()) {
+            if (!ls.payload.empty() &&
+                !io::pread_all(f->fd(), ls.payload.data(), ls.payload.size(),
+                               off)) {
                 return std::nullopt;
             }
             ls.crc_ok = bitcask::codec::crc32(std::span<const std::byte>(
