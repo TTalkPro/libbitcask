@@ -1029,6 +1029,100 @@ stdio 调用最密的一处（14 次）。换完就彻底不碰 `FILE*`，6ad5b4
 `cask/cask_recovery.cpp:188`。只收这几处，其余保留，并把规则写进 `io.hpp` 或
 CONTRIBUTING：**错误要被消费 → 走 seam 的 `IoError`；纯尽力清理 → `fs::` + 忽略 `ec`**。
 
+### 🟡 P 段 Linux 复验记录（2026-08-08，1e23e1e 时点）
+
+P0/P1/P2 三期全部只在 msvc-debug 上验过（三条落地记录均写着「Linux 未复验」），
+S37-4/S37-5 的复验也都留了「ASan / TSan 未跑」的尾巴。本次一并结清。
+
+| 树 | 配置 | 结果 |
+|---|---|---|
+| `build` | g++ 14.2 Debug + bench | ✅ 编译 0 错误；ctest **749/749** |
+| `build-clang` | clang++ Debug | ✅ 编译 0 错误；ctest **749/749** |
+| `build-rel` | Release -O3 + LTO + bench | ✅ 编译 0 错误 |
+| `build-asan` | clang address,undefined | ✅ **749/749**（S37-4 起首次跑）|
+| `build-tsan` | clang thread + 插桩 oneTBB | ✅ **747/747**（按 CI 的 `-E` 豁免）|
+| 干净树 | Release configure | ✅ 0 警告 0 错误，全部 target 建成 |
+| `check-path-encoding.sh` | 守门 | ✅ 无违规 |
+
+（1 项 `CheckpointRecoveryTest.S30RssProbe` 预存 Disabled，同既往。）
+
+**查出三件事，其中一件是真回归。**
+
+**① `-Wcomment` 打断了 CI 的 `werror-lib` job（真回归，已修）**
+
+S37-4 给 `detail/cpu_features.hpp` 写的 `BITCASK_TSAN_ENABLED` 说明块里，引用原
+写法时保留了行尾的续行反斜杠：
+
+```
+//   #if defined(__SANITIZE_THREAD__) || \
+```
+
+`\` 出现在 `//` 行末会把下一行拼进本注释 —— GCC 的 `-Wcomment`（含在 `-Wall`
+里），而 `werror-lib` job 带 `-Werror`，于是**这条注释本身让 Linux 库构建失败**。
+本头经 `bitcask_format` PUBLIC 传播，一处中招就是几十个 TU 中招（本次 Release
+树里 23 条）。修法是把引文写成两行、`||` 前置，不再需要反斜斜杠。
+
+> 这类「注释导致编译失败」最难联想：报错位置是注释行，而改动看着纯属文档。
+> 全库另有 2 处同形态（`bench/inverted_bench.cpp` / `checkpoint_recovery_test.cpp`
+> 引用 shell 命令），**均早于本届**（6-19 / 7-11）且不在 `werror-lib` 构建的目标里，未动。
+
+**② `path_utf8_test` 把 Windows 的结果写成了通用断言（测试缺陷，已修）**
+
+`InvalidUtf8YieldsEmptyInsteadOfThrowing` 断言「非法 UTF-8 → 空 path」，在 Linux
+上 gcc/clang 双双失败。**实现是对的，断言过窄**：
+
+| | Windows | POSIX |
+|---|---|---|
+| `fs::path` 内部 | UTF-16，构造要真解码 | 就是字节串，`char8_t`↔`char` 无解码 |
+| 非法 UTF-8 | 转换失败 → 收敛成空 path | **逐字节透传，libstdc++ 不校验** |
+
+POSIX 那侧的行为**正是要的**：非 UTF-8 文件名在 Linux 上完全合法（Latin-1 名字、
+从别的 locale 拷来的目录），P0 之前的 `fs::path(窄串)` 能打开它们，P0 之后必须
+照旧。把「非法 → 空」强加到 POSIX 上，等于让库突然打不开一批本来能打开的文件
+—— **那才是真回归**。已改成两边各断言各自的不变量（共同的「不抛/不 terminate」
+由「函数返回了」本身证明），并补 `PosixNonUtf8FilenameStillUsable`：在磁盘上真建
+一个 Latin-1 名字的文件，走 seam 建/开/删一遍。
+
+先写探针逐字节量过 7 类非法输入（孤立续字节 / 截断 / 超长 C0 80 / 代理区
+ED A0 80 / Latin-1 / 混合），`from_utf8`→`to_utf8` 往返与旧写法 `fs::path(s)`
+→`.string()` **逐字节一致**，`catch` 从不触发 —— 即 P0 在 Linux 上确是零行为变化。
+`path_utf8.hpp` 里「非法 → 空值」那段已标注**只在 Windows 上发生**。
+
+**③ TSan 的 `KeyDirOptimisticRead.ConcurrentGetPutRemoveGrowStress` 是预存豁免项（非回归）**
+
+首轮 TSan 全量报此项失败（约 54 条 race，集中在 `seq_shard_table.hpp` 的
+seqlock）。**不是本届引入**，两条独立证据：
+
+- `ci.yml` 的 sanitizer job 对 TSan 档**本就带 `-E` 豁免**这一项与
+  `IndexPoolMultiLib.ThreadCountIndependentOfLibCount`，注释里记着 S29-6 的定性
+  （seqlock 的 `atomic_thread_fence` + 非原子数据，TSan 无法推理）。我首轮没加
+  `-E`，是复验脚本的疏漏。
+- 另起 worktree 在 **v6.1.0 基线（056127b）** 上编 TSan 跑同一用例：**57 条 race，
+  站点集合与 HEAD 逐条对应**（行号整体位移 +20/+21，正是 S37-4 插入的 MSVC 注释块
+  长度）。
+
+顺带核实了两处「看着像本届踩了自己写的雷」的地方，**实测都不是**：
+- `opt_bytes_equal` 的 `__builtin_memcpy` → `std::memcpy`（S37-3.b 机械替换），
+  而该函数上方注释明写「不得用 std::memcpy/memcmp，会被 TSan 拦截器记录」。
+  实测 g++ 14.2 与 clang 在 `-O0`/`-O2` 下**定长 8 的 `std::memcpy` libcall 数均为 0**，
+  指令序列与 `__builtin_memcpy` 版逐条一致（仅标签名与一处调度差异）。禁令针对的
+  是 `memcmp` 与变长形态。已在该处补注说明，免得后来者改回去或"顺手简化"成 `memcmp`。
+- `BITCASK_NO_SANITIZE` / `BITCASK_TSAN_ENABLED` 两个宏都确实生效，见下。
+
+**`BITCASK_TSAN_ENABLED` 恒 0 的顾虑已结构性排除。**
+S37-4 记录担心「若因漏包含头而恒 0，TSan 注解会静默失效，全绿也测不出来」。
+用符号表直接对拍，不靠测试结果：`nm -u` 查 `inverted.cpp.o` ——
+**TSan 树里引用 `__tsan_acquire`/`__tsan_release`，普通树里不引用**。宏在两种
+构建下各自取到了正确的值。
+
+**仍然红的两条 `-Werror`，与本届无关（v6.1.0 基线同样红）**：
+`src/bm25/inverted.cpp:291`（`term_freqs` 未使用形参）与
+`src/fileops/oki_state.cpp:273`（`next` shadow）。基线上还多两条
+`hnsw.cpp` 的 `ftruncate` 返回值未查 —— **那两条恰是本届收编裸 POSIX 调用时
+顺带修掉的**。即本届在 `werror-lib` 上净修 2 条、新增 1 条（已修）。
+（本地只有 g++ 14.2，CI 用 g++-13；但基线与 HEAD 是同一编译器对拍，结论不受影响。）
+清掉剩下两条属 S37-7 的 `/WX` 收口范围。
+
 ### 明确不做
 
 | 项 | 理由 |
@@ -1057,9 +1151,10 @@ CONTRIBUTING：**错误要被消费 → 走 seam 的 `IoError`；纯尽力清理
 | S37-5 Windows I/O 后端 | ✅ done（bitcask.dll 产出；Windows ctest 733 → 724 通过 99%，余 9 个全部落在 S37-6；Linux 复验 735/735 无回归，见落地记录）|
 | S37-6 删除/映射生命周期 | ✅ done（**实测推翻立项前提，非架构改动**；Windows ctest 733/733 全绿，见落地记录）|
 | S37-7 CI + 收尾 | ⬜ 未开始 |
-| P 段 P0 路径编码统一 | [done]（59 处成对收编 + 守门 + 9 个用例；P1 期间又补 26 处隐式转换。**Linux 未复验**）|
-| P 段 P1 `.prev` 轮转收进 seam | [done]（4 处；立项理由被实测推翻，改按纪律做）|
-| P 段 P2 读路径改走定位读 | [done]（原计划是写路径缓冲层，实测把靶心改到 2 GiB 天花板）|
+| P 段 P0 路径编码统一 | [done]（59 处成对收编 + 守门 + 9 个用例；P1 期间又补 26 处隐式转换。**Linux 已复验**，见 P 段复验记录：1 个用例把 Windows 结果写成了通用断言，已改）|
+| P 段 P1 `.prev` 轮转收进 seam | [done]（4 处；立项理由被实测推翻，改按纪律做。**Linux 已复验**）|
+| P 段 P2 读路径改走定位读 | [done]（原计划是写路径缓冲层，实测把靶心改到 2 GiB 天花板。**Linux 已复验**，2.54 GiB 用例走稀疏文件 3 ms 实跑未跳过）|
+| **Linux 全面复验（P 段 + S37-4/5 遗留）** | ✅ done（2026-08-08）：Debug g++/clang 各 **749/749**、Release+LTO 编译、**ASan 749/749**、**TSan 747/747**、干净树 configure、守门脚本。查出 1 条真回归（`-Wcomment` 打断 `werror-lib`，已修）+ 1 个过窄断言（已修）；TSan 那条失败是预存 CI 豁免项，已用 v6.1.0 基线对拍证否 |
 | P 段 P3–P4 | [todo] 未开始（W5 已于 6ad5b4b 结清）|
 
 ### 待确认项
