@@ -47,6 +47,15 @@
 //   from_utf8(非法) -> 空 path    -> 下游 open/remove 拿空路径，照常失败返错
 //   to_utf8(非法)   -> 空 string  -> 同上
 //
+// ⚠️ **上面这两行只在 Windows 上发生。** POSIX 下路径就是字节串，`char8_t`
+// 与 `char` 之间没有解码这一步，libstdc++ 逐字节透传、**不校验**，于是非法
+// UTF-8 原样穿过去、`catch` 永不触发。这不是缺陷而是要的行为：**非 UTF-8 的
+// 文件名在 Linux 上完全合法**（Latin-1 名字、从别的 locale 拷来的目录），
+// P0 之前的 `fs::path(窄串)` 能打开它们，收编之后必须逐字照旧。把「非法 →
+// 空」强加到 POSIX 上会让库突然打不开一批本来能打开的文件。
+// 两平台各自的不变量由 `tests/path_utf8_test.cpp` 的
+// `InvalidUtf8ConvergesWithoutThrowing` / `PosixNonUtf8FilenameStillUsable` 守。
+//
 // 代价是「空输入」与「非法输入」不可区分。对本库无妨——两者下游都是同一
 // 条失败路径。若将来某处（如 c_api 的入参校验）需要分辨，再加一个返
 // `std::optional` 的 `try_*` 变体，不要把 throw 放回来。

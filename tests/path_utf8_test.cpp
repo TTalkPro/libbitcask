@@ -18,6 +18,11 @@
 // Linux 侧 string()/u8string() 等价，这些用例在两个平台上都该绿——它们守的
 // 是约定本身，不是某个平台的怪癖。
 //
+// **唯一一条两平台结果不同、也不该相同的**是「非法 UTF-8 输入」：Windows 上
+// 转换真会失败（收敛成空 path），POSIX 上路径就是字节串、逐字节透传，因为
+// 非 UTF-8 文件名在 Linux 上完全合法、P0 之前能打开、之后也必须能打开。
+// 见 InvalidUtf8ConvergesWithoutThrowing 与 PosixNonUtf8FilenameStillUsable。
+//
 // 注：本文件的中文字面量依赖 CMakeLists.txt:53 的 `/utf-8`
 // （含 /execution-charset:utf-8），故运行期字节就是 UTF-8。
 
@@ -98,9 +103,25 @@ TEST(PathUtf8, EmptyStaysEmpty) {
     EXPECT_TRUE(to_utf8(fs::path{}).empty());
 }
 
-// 两个函数都是 noexcept，而标准转换在非法输入下会抛。若这条守不住，
-// fsync_parent_dir（noexcept）就会 std::terminate——见文件头形态 2。
-TEST(PathUtf8, InvalidUtf8YieldsEmptyInsteadOfThrowing) {
+// 两个函数都是 noexcept，而标准转换**在 Windows 上**对非法输入会抛。若这条守
+// 不住，fsync_parent_dir（noexcept）就会 std::terminate——见文件头形态 2。
+//
+// 「不抛」是两平台共同的不变量，但**「非法输入」的结果两平台并不相同**，
+// 而且不该相同（本用例初版把 Windows 的结果写成了通用断言，Linux 首次复验
+// 即炸；实现是对的，断言过窄）：
+//
+//   Windows：`fs::path` 内部是 UTF-16，构造要真做一次 UTF-8 解码，非法序列
+//            无处安放 → 转换失败 → 收敛成空 path（下游 open/remove 照常返错）。
+//   POSIX  ：路径就是字节串，`char8_t` 与 `char` 之间没有解码这一步，
+//            libstdc++ **逐字节透传、不校验**。而这正是要的：**非 UTF-8 的
+//            文件名在 Linux 上完全合法**（Latin-1 名字、从别的 locale 拷来的
+//            目录），P0 之前的 `fs::path(窄串)` 能打开它们，P0 之后必须照旧。
+//            把「非法 UTF-8 → 空 path」强加到 POSIX 上，等于让库突然打不开
+//            一批本来能打开的文件——那才是真回归。
+//
+// 所以两边各断言各自的不变量，共同的那条（不抛、不 terminate）由「函数返回了」
+// 这件事本身证明。
+TEST(PathUtf8, InvalidUtf8ConvergesWithoutThrowing) {
     const std::string cases[] = {
         std::string("\x80"),                  // 孤立续字节
         std::string("\xFF\xFE"),              // 非法首字节
@@ -110,9 +131,43 @@ TEST(PathUtf8, InvalidUtf8YieldsEmptyInsteadOfThrowing) {
         std::string("ok\xFF.dat"),            // 合法 + 非法混合
     };
     for (const auto& bad : cases) {
-        EXPECT_TRUE(from_utf8(bad).empty()) << "输入字节数 " << bad.size();
+        const fs::path p = from_utf8(bad);  // 走到这行就说明没抛（noexcept 下抛 = terminate）
+#if defined(_WIN32)
+        EXPECT_TRUE(p.empty()) << "输入字节数 " << bad.size();
+#else
+        // POSIX：与 P0 之前的写法逐字等价，一个字节都不能变。
+        EXPECT_EQ(p, fs::path(bad)) << "输入字节数 " << bad.size();
+        EXPECT_EQ(to_utf8(p), bad) << "输入字节数 " << bad.size();
+#endif
     }
 }
+
+#if !defined(_WIN32)
+// POSIX 专用：非 UTF-8 的文件名在磁盘上是合法的，收编后必须还能建/开/删。
+// 上一个用例守的是转换的字节等价，这个守的是「等价之后真的还能用」——
+// 前者过了后者仍可能挂（比如 seam 哪天在窄路径上加了 UTF-8 校验）。
+TEST(PathUtf8, PosixNonUtf8FilenameStillUsable) {
+    const fs::path dir = fs::temp_directory_path() /
+                         ("bitcask_nonutf8_" + std::to_string(bitcask::test::test_pid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    ASSERT_TRUE(fs::create_directories(dir, ec));
+
+    // Latin-1 的「café.dat」——合法 POSIX 文件名，非法 UTF-8。
+    const std::string p = to_utf8(dir) + "/caf\xE9.dat";
+
+    auto h = bitcask::io::open_handle(p, bitcask::io::OpenFlag::kCreate,
+                                      bitcask::io::FileMode::kOwnerOnly);
+    ASSERT_TRUE(h) << "非 UTF-8 文件名 open_handle 失败 errno=" << (h ? 0 : h.error().errnum);
+    bitcask::io::close_handle(*h);
+
+    EXPECT_TRUE(fs::exists(from_utf8(p)));
+    EXPECT_TRUE(bitcask::io::remove_file(p));
+    EXPECT_FALSE(fs::exists(from_utf8(p)));
+
+    fs::remove_all(dir, ec);
+}
+#endif
 
 // --- seam ------------------------------------------------------------------
 
