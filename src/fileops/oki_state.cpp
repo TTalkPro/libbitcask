@@ -270,15 +270,18 @@ bool OkiState::flush(
     // S36-5：持留行（held）留在队头，相对序不变（(ord, 到达序) 格保持）。
     {
         std::lock_guard<std::mutex> lk(mu_);
-        std::vector<DeltaRow> next;
-        next.reserve(prefix_n + delta_.size() - prefix_n);
+        // 命名为 kept 而非 next：本函数上方已有一个 OkiManifest next（下一份
+        // manifest），同名会 shadow 它（-Wshadow，CI 的 werror-lib 带 -Werror）。
+        // 且这里装的确实是「留下来的行」——前缀里被持留的 + 前缀之后新追加的。
+        std::vector<DeltaRow> kept;
+        kept.reserve(prefix_n + delta_.size() - prefix_n);
         for (std::size_t i = 0; i < prefix_n; ++i) {
-            if (held[i] != 0) next.push_back(std::move(delta_[i]));
+            if (held[i] != 0) kept.push_back(std::move(delta_[i]));
         }
         for (std::size_t j = prefix_n; j < delta_.size(); ++j) {
-            next.push_back(std::move(delta_[j]));
+            kept.push_back(std::move(delta_[j]));
         }
-        delta_ = std::move(next);
+        delta_ = std::move(kept);
         delta_bytes_ -= std::min(delta_bytes_, flushed_bytes);
         rebuild_index_locked();
         update_flush_hint_locked();

@@ -1134,10 +1134,14 @@ bool TextPlugin::save_component_base(std::string_view dir,
 // S27-3 步骤 3:save_component_delta 退役(Slice C 已停用 delta 链,
 // fields_ 删除后 delta 序列化源不复存在)。
 
+// chain_seq 刻意不使用：S27-3 步骤 3 停用了 text 的 delta 链（fields_ 删除后
+// delta 序列化源不复存在），本插件只读 base ckpt，没有「续到第几号 delta」可言。
+// 参数保留是因为 text/vector/docmap 三个插件的 load_component 是**同一形态的
+// 签名**（ckpt_chain 按统一形状驱动），vector 侧仍在用它。
 TextPlugin::LoadResult
 TextPlugin::load_component(std::string_view dir,
                            std::uint64_t expected_base_wm,
-                           std::uint32_t chain_seq) {
+                           [[maybe_unused]] std::uint32_t chain_seq) {
     LoadResult result;
     const std::string fp = comp_path(dir);
     const std::string prev_path = fp + ".prev";
