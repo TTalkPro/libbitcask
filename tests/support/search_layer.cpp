@@ -586,16 +586,8 @@ bool SearchLayer::save_search_ckpt(std::string_view path,
 
     std::vector<sc::CkptSection> secs;
     // 段 payload 缓冲区须活到 write() 完成——span 是非 owning 视图。
-    std::vector<std::vector<std::byte>> byte_bufs;
+    // 只剩 u8 一种形态在用；原先的 add_byte_sec/byte_bufs 从未被调用，已删。
     std::vector<std::vector<std::uint8_t>> u8_bufs;
-    auto add_byte_sec = [&](std::uint16_t type,
-                            std::vector<std::byte> buf) {
-        byte_bufs.push_back(std::move(buf));
-        secs.push_back(sc::CkptSection{
-            type, 0,
-            std::span<const std::byte>(byte_bufs.back().data(),
-                                        byte_bufs.back().size())});
-    };
     auto add_u8_sec = [&](std::uint16_t type,
                           std::vector<std::uint8_t> buf) {
         u8_bufs.push_back(std::move(buf));

@@ -683,7 +683,9 @@ TEST_F(CaskDocValueTest, MigrateU32EraDirOpensAndReads) {
         m[0] = 'B'; m[1] = 'C'; m[2] = 'M'; m[3] = 'E';
         m[4] = 3; m[5] = 0;  // v3, mode=KV
         const std::uint32_t crc = crc_of(m.data(), 14);
-        for (int i = 0; i < 4; ++i) m[14 + i] = (crc >> (8 * i)) & 0xFF;
+        for (std::size_t i = 0; i < 4; ++i) {
+            m[14 + i] = static_cast<unsigned char>((crc >> (8 * i)) & 0xFF);
+        }
         wfile(src / "bitcask.meta", m);
     }
     // 一条 kDoc record（23B 小端头）：key="mykey",DocValue v3 text="hi",
@@ -1000,23 +1002,23 @@ TEST_F(CaskDocValueTest, PutBatchBasicAndPersistence) {
             reinterpret_cast<const std::byte*>(s.data()), s.size());
     };
 
-    constexpr int kN = 200;
+    constexpr std::size_t kN = 200;  // 只用于 reserve/下标
     std::vector<std::string> keys, vals;
     keys.reserve(kN);
     vals.reserve(kN);
-    for (int i = 0; i < kN; ++i) {
+    for (std::size_t i = 0; i < kN; ++i) {
         keys.push_back("bk" + std::to_string(i));
         vals.push_back("value_" + std::to_string(i));
     }
     std::vector<Cask::BatchItem> batch;
     batch.reserve(kN);
-    for (int i = 0; i < kN; ++i) {
+    for (std::size_t i = 0; i < kN; ++i) {
         batch.push_back({bytes(keys[i]), bytes(vals[i])});
     }
     ASSERT_TRUE((*c)->put_batch(batch, 1000));
 
     // 全部可读且值正确。
-    for (int i = 0; i < kN; ++i) {
+    for (std::size_t i = 0; i < kN; ++i) {
         auto r = (*c)->get_owned(bytes(keys[i]));
         ASSERT_TRUE(r) << "batch key missing: " << keys[i];
         EXPECT_EQ(std::string(reinterpret_cast<const char*>(r->value.data()),
@@ -1051,7 +1053,7 @@ TEST_F(CaskDocValueTest, PutBatchBasicAndPersistence) {
     // 重启后全部仍在（含覆盖后的值）。
     auto c2 = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c2);
-    for (int i = 1; i < kN; ++i) {
+    for (std::size_t i = 1; i < kN; ++i) {
         auto r = (*c2)->get_owned(bytes(keys[i]));
         ASSERT_TRUE(r) << "batch key lost after reopen: " << keys[i];
     }
@@ -1589,7 +1591,7 @@ TEST_F(CaskUpgradeTest, UpgradeFailsOnAlreadyIndexMode) {
     opts.search_config = search_cfg;
     auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
-    (*c)->put(bytes("k"), bytes("v"));
+    ASSERT_TRUE((*c)->put(bytes("k"), bytes("v")));
     (*c)->close();
 
     auto upg = Cask::upgrade(tmpdir_.string(), search_cfg);
@@ -1609,9 +1611,9 @@ TEST_F(CaskUpgradeTest, UpgradePreservesDeletes) {
         auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
 
-        (*c)->put(bytes("keep"), bytes("kept value"));
-        (*c)->put(bytes("remove"), bytes("removed value"));
-        (*c)->remove(bytes("remove"));
+        ASSERT_TRUE((*c)->put(bytes("keep"), bytes("kept value")));
+        ASSERT_TRUE((*c)->put(bytes("remove"), bytes("removed value")));
+        ASSERT_TRUE((*c)->remove(bytes("remove")));
         (*c)->close();
     }
 
@@ -2273,7 +2275,7 @@ TEST_F(CaskDocValueTest, P4GroupCommitWritesSurviveReopen) {
     {
         auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
-        for (int i = 0; i < 10; ++i) {  // 10 % 3 = 1 条留给 close force-flush
+        for (std::uint64_t i = 0; i < 10; ++i) {  // 10 % 3 = 1 条留给 close force-flush
             std::vector<std::byte> k{std::byte{'k'}, static_cast<std::byte>('0' + i)};
             std::vector<std::byte> v{std::byte{'v'}, static_cast<std::byte>('0' + i)};
             ASSERT_TRUE((*c)->put(k, v, 1000 + i));
@@ -3683,7 +3685,9 @@ void v36_put_corpus(Cask& c) {
     }
 }
 
-constexpr double v36_rrf(int rank) { return 1.0 / (60.0 + rank); }
+constexpr double v36_rrf(std::size_t rank) {
+    return 1.0 / (60.0 + static_cast<double>(rank));
+}
 
 }  // namespace
 
@@ -3736,7 +3740,7 @@ TEST_F(CaskDocValueTest, V36HybridSingleLeg) {
     ASSERT_TRUE(rv);
     ASSERT_EQ(rv->hits.size(), 4u);
     const char* vexp[] = {"d3", "d2", "d1", "d4"};
-    for (int i = 0; i < 4; ++i) {
+    for (std::size_t i = 0; i < 4; ++i) {
         EXPECT_EQ(rv->hits[i].key, vexp[i]);
         EXPECT_DOUBLE_EQ(rv->hits[i].score, v36_rrf(i + 1));
     }
@@ -3746,7 +3750,7 @@ TEST_F(CaskDocValueTest, V36HybridSingleLeg) {
     ASSERT_TRUE(rt);
     ASSERT_EQ(rt->hits.size(), 3u);
     const char* texp[] = {"d1", "d2", "d3"};
-    for (int i = 0; i < 3; ++i) {
+    for (std::size_t i = 0; i < 3; ++i) {
         EXPECT_EQ(rt->hits[i].key, texp[i]);
         EXPECT_DOUBLE_EQ(rt->hits[i].score, v36_rrf(i + 1));
     }

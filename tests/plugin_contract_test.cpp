@@ -315,8 +315,8 @@ TEST(PluginContract, TwoLanesConcurrentNoRace) {
     EXPECT_TRUE(a1.paired_ok_);
     EXPECT_EQ(b0.prepare_calls_.load(), 0u);
 
-    pool.unregister_lib(l0);
-    pool.unregister_lib(l1);
+    (void)pool.unregister_lib(l0);
+    (void)pool.unregister_lib(l1);
     pool.stop();
 }
 

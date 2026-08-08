@@ -659,7 +659,7 @@ TEST(IndexPoolMultiLib, ThreadCountIndependentOfLibCount) {
         // 之后 49 个 lib 零新增（无 per-库线程）。
         ok = (last_delta_first == 2) && (after_many == after_first);
 
-        for (IndexLane* l : lanes) pool.unregister_lib(l);
+        for (IndexLane* l : lanes) (void)pool.unregister_lib(l);
         pool.stop();
     }
     EXPECT_TRUE(ok)
@@ -674,14 +674,14 @@ TEST(IndexPoolMultiLib, ThreadCountIndependentOfLibCount) {
 // I2）；各 lane 结果互不串扰。
 TEST(IndexPoolMultiLib, LanesApplyIndependentlyInOrdOrder) {
     IndexPool pool(1, 10240);
-    constexpr int kLibs  = 4;
-    constexpr int kPerLib = 200;
+    constexpr std::size_t kLibs   = 4;    // 用作 vector 尺寸/下标,故 size_t
+    constexpr std::size_t kPerLib = 200;
 
     // 每 lane 记录 reducer 看到的 ord 序列（reducer 单线程串行，无需锁）。
     std::vector<std::vector<std::uint64_t>> seen(kLibs);
     std::vector<IndexLane*> lanes(kLibs);
 
-    for (int lib = 0; lib < kLibs; ++lib) {
+    for (std::size_t lib = 0; lib < kLibs; ++lib) {
         lanes[lib] = pool.register_lib(
             // S15-2：ord 直接随 PutEntry.task 到达 reducer，map 无需透传。
             no_preps,
@@ -696,9 +696,9 @@ TEST(IndexPoolMultiLib, LanesApplyIndependentlyInOrdOrder) {
 
     // N 个生产者线程，各喂自己的 lane（单写者契约：每 lane 一个 producer）。
     std::vector<std::thread> producers;
-    for (int lib = 0; lib < kLibs; ++lib) {
+    for (std::size_t lib = 0; lib < kLibs; ++lib) {
         producers.emplace_back([&pool, lane = lanes[lib]] {
-            for (int i = 0; i < kPerLib; ++i) {
+            for (std::size_t i = 0; i < kPerLib; ++i) {
                 // Add-with-fields → 走 TBB 并行 map → 该 lane 的 reorder buffer。
                 pool.submit(lane, mk_fields_task(
                     IndexOp::Add, "k" + std::to_string(i),
@@ -710,13 +710,13 @@ TEST(IndexPoolMultiLib, LanesApplyIndependentlyInOrdOrder) {
     }
     for (auto& t : producers) t.join();
 
-    for (int lib = 0; lib < kLibs; ++lib) pool.flush(lanes[lib]);
+    for (std::size_t lib = 0; lib < kLibs; ++lib) pool.flush(lanes[lib]);
 
     // 每 lane 恰好看到自己的 kPerLib 条，且严格 0,1,...,kPerLib-1 升序。
-    for (int lib = 0; lib < kLibs; ++lib) {
+    for (std::size_t lib = 0; lib < kLibs; ++lib) {
         ASSERT_EQ(seen[lib].size(), static_cast<std::size_t>(kPerLib))
             << "lib " << lib;
-        for (int i = 0; i < kPerLib; ++i) {
+        for (std::size_t i = 0; i < kPerLib; ++i) {
             EXPECT_EQ(seen[lib][i], static_cast<std::uint64_t>(i))
                 << "lib " << lib << " pos " << i;
         }
@@ -724,7 +724,7 @@ TEST(IndexPoolMultiLib, LanesApplyIndependentlyInOrdOrder) {
                   static_cast<std::uint64_t>(kPerLib - 1));
     }
 
-    for (int lib = 0; lib < kLibs; ++lib) pool.unregister_lib(lanes[lib]);
+    for (std::size_t lib = 0; lib < kLibs; ++lib) (void)pool.unregister_lib(lanes[lib]);
     pool.stop();
 }
 
@@ -739,19 +739,21 @@ TEST(IndexPoolMultiLib, UnregisterOneLibKeepsOthersRunning) {
         no_preps,
         [&](ReorderEntry&) { ++cntB; }, []() {}, 0);
 
-    for (int i = 0; i < 50; ++i)
+    for (std::uint64_t i = 0; i < 50; ++i)
         pool.submit(a, IndexTask::make(IndexOp::Add, "k", i, "t", 1, 0, 0, 0, 0));
     pool.flush(a);
-    pool.unregister_lib(a);  // a 排空并注销
+    // 返回值就是「是否排空」——注释本来就这么写的,断言它比忽略强,
+    // 且与下一行的 cntA==50 是同一件事的两面。
+    EXPECT_TRUE(pool.unregister_lib(a)) << "a 应排空后注销";
     EXPECT_EQ(cntA.load(), 50u);
 
     // b 仍正常工作。
-    for (int i = 0; i < 30; ++i)
+    for (std::uint64_t i = 0; i < 30; ++i)
         pool.submit(b, IndexTask::make(IndexOp::Add, "k", i, "t", 1, 0, 0, 0, 0));
     pool.flush(b);
     EXPECT_EQ(cntB.load(), 30u);
 
-    pool.unregister_lib(b);
+    (void)pool.unregister_lib(b);
     pool.stop();
 }
 
@@ -812,7 +814,7 @@ TEST(IndexPoolMultiLib, ReorderBackpressureBoundsMemoryThenDrains) {
     EXPECT_EQ(processed.load(), kTotal) << "释放后必须零丢失全部 apply";
     EXPECT_EQ(submitted.load(), kTotal);
 
-    pool.unregister_lib(lane);
+    (void)pool.unregister_lib(lane);
     pool.stop();
 }
 

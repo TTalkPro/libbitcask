@@ -94,7 +94,7 @@ TEST(SearcherFacade, MatchesCaskFacade) {
     ASSERT_EQ(ab.size(), bb.size());
     for (std::size_t i = 0; i < ab.size(); ++i) {
         ASSERT_EQ(ab[i].has_value(), bb[i].has_value());
-        if (ab[i]) EXPECT_EQ(ab[i]->hits.size(), bb[i]->hits.size());
+        if (ab[i]) { EXPECT_EQ(ab[i]->hits.size(), bb[i]->hits.size()); }
     }
 
     (*c)->close();

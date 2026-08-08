@@ -108,7 +108,7 @@ TEST(SynonymMap, LoadFromFile) {
     }
 
     SynonymMap map;
-    map.load_from_file(path.string());
+    ASSERT_TRUE(map.load_from_file(path.string()));
 
     auto r = map.expand("NYC");
     EXPECT_EQ(r.size(), 3u);
@@ -128,7 +128,7 @@ TEST(SynonymMap, LoadFromFileEmptyLine) {
     }
 
     SynonymMap map;
-    map.load_from_file(path.string());
+    ASSERT_TRUE(map.load_from_file(path.string()));
 
     auto r = map.expand("a");
     EXPECT_EQ(r.size(), 2u);

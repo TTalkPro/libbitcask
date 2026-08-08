@@ -432,7 +432,7 @@ TEST(TextPlugin, SegmentLifecycleVsQueryStress) {
             p.flush_building_now();
             for (int i = 0; i < 8; ++i) {
                 p.on_delete("k" + std::to_string(base + i), ord + 100,
-                            static_cast<std::uint64_t>(ord - 8 + i));
+                            ord - 8 + static_cast<std::uint64_t>(i));
             }
             ++round;
         }
