@@ -5,6 +5,29 @@ cmake_minimum_required(VERSION 3.21)
 # 库 SOVERSION 与 C API bitcask_version_* 均从此派生，杜绝三处手工同步漂移。
 project(libbitcask VERSION 6.2.0 LANGUAGES CXX)
 
+# ---------------------------------------------------------------------------
+# ⚠️ 本文件（连同 tests/ 与 bench/ 的两份）一律用 `PROJECT_SOURCE_DIR` /
+#    `PROJECT_BINARY_DIR` 定位自己的东西，**不用 `CMAKE_SOURCE_DIR` /
+#    `CMAKE_BINARY_DIR`**。
+#
+# 两者在**独立构建时完全等价**，所以这不是风格问题，是「能不能被别人
+# add_subdirectory」的问题：被嵌入时 `CMAKE_SOURCE_DIR` 指的是**下游的仓库根**，
+# 于是 `${CMAKE_SOURCE_DIR}/third_party/zlib` 找去了下游的树里，configure 期报
+#
+#     third_party/zlib 未初始化。请运行: git submodule update --init third_party/zlib
+#
+# —— 而子模块明明检出了，错的是找它的路径。这条错误消息**指向了错的原因**，
+# 是最贵的那一类。
+#
+# ⚠️ 下游**不能**在自己那边绕过去：CMake 进入子目录作用域时会重新设
+#    `CMAKE_SOURCE_DIR`，父作用域覆盖它无效；而唯一能在子目录里改它的注入点
+#    （`CMAKE_PROJECT_<name>_INCLUDE`）会连带让本项目的 `PROJECT_IS_TOP_LEVEL`
+#    判成真，进而污染下游的构建目录（实测：下游的 CMakeCache.txt 被换成了本项目
+#    的）。所以这件事**只有在这里能修**。
+#
+# 加新路径时照抄这条：`PROJECT_SOURCE_DIR`，不是 `CMAKE_SOURCE_DIR`。
+# ---------------------------------------------------------------------------
+
 # 由 project 版本生成 C API 版本头（configure 时展开 @PROJECT_VERSION*@）。
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/c_api/bitcask_version.h.in"
@@ -20,7 +43,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 include(BitcaskSanitizers)
 
 enable_testing()
@@ -93,7 +116,7 @@ if(WIN32)
     # 文件与 DLL（bitcask.dll / tbb12.dll / zlib1.dll）收进同一个 bin/，
     # ctest 直接跑 exe 全路径即可加载到依赖，不必给每个测试改 PATH。
     # 变量会被子目录继承，故 third_party 的 DLL 也落在这里。
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -170,7 +193,7 @@ if(BITCASK_BUNDLED_ZLIB)
     # add_library(.c)，必须显式启用，否则配置期就报「未知源文件扩展名」。
     # 只在这一支启用：Linux/BSD 走系统 zlib 时不必平白多探测一个编译器。
     enable_language(C)
-    set(_bitcask_zlib_dir "${CMAKE_SOURCE_DIR}/third_party/zlib")
+    set(_bitcask_zlib_dir "${PROJECT_SOURCE_DIR}/third_party/zlib")
     if(NOT EXISTS "${_bitcask_zlib_dir}/zlib.h")
         message(FATAL_ERROR
             "third_party/zlib 未初始化。请运行:\n"
@@ -234,7 +257,7 @@ option(BITCASK_BUNDLED_TBB
     ${_bitcask_bundled_tbb_default})
 
 if(BITCASK_BUNDLED_TBB)
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/oneTBB/CMakeLists.txt")
+    if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/oneTBB/CMakeLists.txt")
         message(FATAL_ERROR
             "third_party/oneTBB 未初始化（本构建需要现编 TBB：${_bitcask_bundled_tbb_why}）。请运行:\n"
             "  git submodule update --init third_party/oneTBB")
@@ -260,11 +283,11 @@ if(BITCASK_BUNDLED_TBB)
     foreach(_tbb_t tbb tbbmalloc tbbmalloc_proxy)
         if(TARGET ${_tbb_t})
             set_target_properties(${_tbb_t} PROPERTIES
-                RUNTIME_OUTPUT_DIRECTORY                "${CMAKE_BINARY_DIR}/bin"
-                RUNTIME_OUTPUT_DIRECTORY_DEBUG          "${CMAKE_BINARY_DIR}/bin"
-                RUNTIME_OUTPUT_DIRECTORY_RELEASE        "${CMAKE_BINARY_DIR}/bin"
-                RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/bin"
-                RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL     "${CMAKE_BINARY_DIR}/bin")
+                RUNTIME_OUTPUT_DIRECTORY                "${PROJECT_BINARY_DIR}/bin"
+                RUNTIME_OUTPUT_DIRECTORY_DEBUG          "${PROJECT_BINARY_DIR}/bin"
+                RUNTIME_OUTPUT_DIRECTORY_RELEASE        "${PROJECT_BINARY_DIR}/bin"
+                RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${PROJECT_BINARY_DIR}/bin"
+                RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL     "${PROJECT_BINARY_DIR}/bin")
         endif()
     endforeach()
     message(STATUS "libbitcask: bundled oneTBB from third_party/oneTBB (${_bitcask_bundled_tbb_why})")
@@ -500,7 +523,7 @@ target_link_libraries(bitcask_fileops
 # ankerl::unordered_dense（单头 INTERFACE 库）：KeyDir 分片表用它替代
 # std::unordered_map（开放寻址 + 稠密存储，消除每键节点 malloc + 指针追逐）。
 # header-only，EXCLUDE_FROM_ALL 不会引入测试/benchmark 目标。
-if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/unordered_dense/include/ankerl/unordered_dense.h")
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/unordered_dense/include/ankerl/unordered_dense.h")
     message(FATAL_ERROR
         "third_party/unordered_dense 未初始化。请运行:\n"
         "  git submodule update --init third_party/unordered_dense")
@@ -685,7 +708,7 @@ target_link_libraries(bitcask_cask
 # ---------------------------------------------------------------------------
 # utf8proc — Unicode NFKC 归一化 + case fold（submodule: third_party/utf8proc）。
 # ---------------------------------------------------------------------------
-if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/utf8proc/CMakeLists.txt")
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/utf8proc/CMakeLists.txt")
     message(FATAL_ERROR
         "third_party/utf8proc 未初始化。请运行:\n"
         "  git submodule update --init")
@@ -743,8 +766,8 @@ add_custom_target(generate_inert_table DEPENDS "${INERT_TABLE_HPP}")
 # cppjieba — jieba 中文分词（header-only，依赖 limonp）。
 # 两者均以 submodule 形式置于 third_party/。
 # ---------------------------------------------------------------------------
-if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/cppjieba/include/cppjieba/Jieba.hpp" OR
-   NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/limonp/include/limonp/StringUtil.hpp")
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/cppjieba/include/cppjieba/Jieba.hpp" OR
+   NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/limonp/include/limonp/StringUtil.hpp")
     message(FATAL_ERROR
         "third_party/cppjieba 或 third_party/limonp 未初始化。请运行:\n"
         "  git submodule update --init third_party/cppjieba third_party/limonp")
@@ -756,12 +779,12 @@ if(NOT TARGET cppjieba)
     # -Wsign-conversion 等告警；标 SYSTEM 让编译器视为系统头、不对其告警，
     # 使 BITCASK_WERROR（-Werror）只作用于 first-party 代码。
     target_include_directories(cppjieba SYSTEM INTERFACE
-        "${CMAKE_SOURCE_DIR}/third_party/cppjieba/include"
-        "${CMAKE_SOURCE_DIR}/third_party/limonp/include"
+        "${PROJECT_SOURCE_DIR}/third_party/cppjieba/include"
+        "${PROJECT_SOURCE_DIR}/third_party/limonp/include"
     )
 endif()
 
-set(BITCASK_JIEBA_DICT_DIR "${CMAKE_SOURCE_DIR}/third_party/cppjieba/dict"
+set(BITCASK_JIEBA_DICT_DIR "${PROJECT_SOURCE_DIR}/third_party/cppjieba/dict"
     CACHE INTERNAL "cppjieba 词典目录")
 
 # ---------------------------------------------------------------------------
