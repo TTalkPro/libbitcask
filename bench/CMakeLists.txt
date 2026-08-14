@@ -1,5 +1,5 @@
 # Google Benchmark via submodule (third_party/benchmark)
-if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/benchmark/CMakeLists.txt")
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/benchmark/CMakeLists.txt")
     message(FATAL_ERROR
         "third_party/benchmark 未初始化。请运行:\n"
         "  git submodule update --init third_party/benchmark")
@@ -12,8 +12,8 @@ set(BENCHMARK_ENABLE_GTEST_TESTS   OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_USE_BUNDLED_GTEST    OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_DOWNLOAD_DEPENDENCIES OFF CACHE BOOL "" FORCE)
 
-add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/benchmark"
-                 "${CMAKE_BINARY_DIR}/_deps/benchmark-build" EXCLUDE_FROM_ALL)
+add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/benchmark"
+                 "${PROJECT_BINARY_DIR}/_deps/benchmark-build" EXCLUDE_FROM_ALL)
 
 # Bench binary: keydir + cask micro-benchmarks.
 # Sanitizers are deliberately NOT linked here — perf numbers under sanitizers
@@ -35,7 +35,7 @@ add_executable(bitcask_bench
     avx512_verify_bench.cpp  # AVX-512 启用验证（scalar vs SIMD 对拍）
     bench_main.cpp
 )
-target_include_directories(bitcask_bench PRIVATE "${CMAKE_SOURCE_DIR}/src/vector")
+target_include_directories(bitcask_bench PRIVATE "${PROJECT_SOURCE_DIR}/src/vector")
 target_link_libraries(bitcask_bench
     PRIVATE
         benchmark::benchmark

@@ -1,12 +1,12 @@
 # GoogleTest via submodule (third_party/googletest)
-if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/googletest/CMakeLists.txt")
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/googletest/CMakeLists.txt")
     message(FATAL_ERROR
         "third_party/googletest 未初始化。请运行:\n"
         "  git submodule update --init third_party/googletest")
 endif()
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/googletest"
-                 "${CMAKE_BINARY_DIR}/_deps/googletest-build" EXCLUDE_FROM_ALL)
+add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/googletest"
+                 "${PROJECT_BINARY_DIR}/_deps/googletest-build" EXCLUDE_FROM_ALL)
 
 # S37-2：测试公共 helper（support/test_paths.hpp、support/crash_child.hpp）
 # 以 "support/..." 形式引用，把 tests/ 自身放进包含路径。目录级——所有测试
