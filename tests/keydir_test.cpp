@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>   // S37-4：std::sort（MSVC STL 不经 <string>/<vector> 传递）
+#include <cstdint>
+#include <mutex>       // libc++ 同理：std::mutex / lock_guard 不经他头传递
 #include <string>
+#include <thread>      // 同上；libstdc++ 恰好传递到，libc++ 不传，故显式列出
 #include <vector>
 
 #include "bitcask/keydir.hpp"
