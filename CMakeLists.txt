@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.21)
 # 版本单一真源（S12-7）：project(VERSION ...) 是唯一手写版本处。
 # 库 SOVERSION 与 C API bitcask_version_* 均从此派生，杜绝三处手工同步漂移。
-project(libbitcask VERSION 6.2.0 LANGUAGES CXX)
+project(libbitcask VERSION 6.2.2 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
 # ⚠️ 本文件（连同 tests/ 与 bench/ 的两份）一律用 `PROJECT_SOURCE_DIR` /
