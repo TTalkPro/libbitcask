@@ -139,9 +139,17 @@ inline void seq_write_begin(std::atomic<std::uint32_t>& seq) {
 inline void seq_write_end(std::atomic<std::uint32_t>& seq) {
     seq.fetch_add(1, std::memory_order_release);  // → 偶，发布本轮更新
 }
+// ⚠️ const_cast 是**移植要求**，不是偷懒：libstdc++ 接受
+// `std::atomic_ref<const T>`，libc++ 不接受——它的 __atomic_ref_base::load
+// 把成员指针原样喂给 __atomic_load 的非 const 形参，于是在 FreeBSD/macOS
+// 上报 "cannot initialize a parameter of type 'unsigned int *' with an
+// lvalue of type 'const unsigned int *'"，错误行在 <atomic> 内部。
+// 这里被引用的对象本身从不是 const（adj 数组是 NodeChunk 堆分配的可变
+// 内存，写端 adj_store 就在改它），const 只出现在本函数的只读形参上，
+// 故去掉它不引入任何新的 UB，语义与 libstdc++ 下逐字相同。
 inline std::uint32_t adj_load(const std::uint32_t* p) {
-    return std::atomic_ref<const std::uint32_t>(*p).load(
-        std::memory_order_relaxed);
+    return std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(p))
+        .load(std::memory_order_relaxed);
 }
 inline void adj_store(std::uint32_t* p, std::uint32_t v) {
     std::atomic_ref<std::uint32_t>(*p).store(v, std::memory_order_relaxed);
