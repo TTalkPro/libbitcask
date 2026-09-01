@@ -2,6 +2,7 @@
 // S6-P2: 测试更新到新 start(MapFn, ReduceFn, ErrorFn) API。
 
 #include <atomic>
+#include <cstddef>
 #include <filesystem>
 #include <chrono>
 #include <condition_variable>
@@ -17,6 +18,12 @@
 // 那条针对的是产品代码的公开/内部头，测试 TU 自成一体。
 #  include <windows.h>
 #  include <tlhelp32.h>
+#elif defined(__FreeBSD__)
+// count_os_threads 的 FreeBSD 实现走 sysctl(KERN_PROC_PID)，见下。
+#  include <sys/types.h>
+#  include <sys/sysctl.h>
+#  include <sys/user.h>
+#  include <unistd.h>
 #endif
 
 
@@ -598,6 +605,24 @@ static int count_os_threads() {
     ::CloseHandle(snap);
     return n;
 }
+#elif defined(__FreeBSD__)
+// FreeBSD 的 /proc 是 procfs，**不是** linprocfs：/proc/<pid> 下根本没有
+// task/ 这个目录（哪怕 procfs 已挂载）。于是下面那份 Linux 实现在这里
+// 恒返回 0，而调用方断言的是**差值**（after_first - before == 2），
+// 0-0=0 直接失败——与 S37-5 在 Windows 上遇到的是同一件事，故按同样的
+// 口径补实现，而不是把用例标成 Linux-only：AT5 守的是「线程数与库数
+// 解耦」这条结构性保证，它与平台无关。
+// KERN_PROC_PID 一次 sysctl 取回本进程的 kinfo_proc，ki_numthreads 即
+// 当前线程数（内核直接维护，比枚举目录项还准）。
+static int count_os_threads() {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, ::getpid()};
+    struct kinfo_proc kp{};
+    std::size_t len = sizeof(kp);
+    if (::sysctl(mib, 4, &kp, &len, nullptr, 0) != 0 || len != sizeof(kp)) {
+        return 0;
+    }
+    return static_cast<int>(kp.ki_numthreads);
+}
 #else
 static int count_os_threads() {
     std::error_code ec;
@@ -857,9 +882,23 @@ struct ReducerGate {
 TEST(IndexPoolUnregister, TimeoutReturnsFalseAndDoesNotHang) {
     // 超时注入 100ms：reducer 被卡死 → flush 必然超时。
     IndexPool pool(1, 64, 16, std::chrono::milliseconds(100));
-    ReducerGate gate;
+    // gate 用 shared_ptr 按值捕获，理由与姊妹用例
+    // TimeoutDoesNotLeakGlobalReorderBudget 完全一致，而这条当初漏了：
+    // 栈上的 `ReducerGate gate` 声明在 `pool` **之后** ⇒ 作用域退出时
+    // **gate 先析构**，reducer 却要到随后的 ~IndexPool()→stop()→join()
+    // 才停。中间那段窗口里 reducer 仍可能停在 gate.wait() 内 —— 对已析构
+    // 的 mutex/condition_variable 动手，是确定的 use-after-scope。
+    // reduce_fn 由 reducer 在 reorder_mu_ 下拷走的 lane shared_ptr 续命
+    // （见 reducer_loop 的「锁下拷活 lane」），故按值捕获足以让 gate 活过
+    // reducer 对它的最后一次访问。
+    //
+    // 为什么 Linux 上一直是绿的：libstdc++ 对「解锁一把并不持有的 mutex」
+    // 静默放过，UB 不表现；libc++（FreeBSD 15 / macOS）检查
+    // pthread_mutex_unlock 的返回值，非 0 直接 ud2 → SIGILL，100% 复现。
+    // 同一段 UB，一边静默一边必炸。
+    auto gate = std::make_shared<ReducerGate>();
     auto* lane = pool.register_lib(
-        no_preps, [&](ReorderEntry&) { gate.wait(); }, [] {});
+        no_preps, [gate](ReorderEntry&) { gate->wait(); }, [] {});
     ASSERT_NE(lane, nullptr);
 
     for (std::size_t i = 0; i < 4; ++i) {
@@ -875,7 +914,7 @@ TEST(IndexPoolUnregister, TimeoutReturnsFalseAndDoesNotHang) {
     // 有界性本身：不得退化回无界等待。
     EXPECT_LT(elapsed, std::chrono::seconds(5)) << "超时未生效——退化为无界等待";
 
-    gate.release();  // 放行 reducer，让 stop() 能 join
+    gate->release();  // 放行 reducer，让 stop() 能 join
 }
 
 TEST(IndexPoolUnregister, TimeoutDoesNotLeakGlobalReorderBudget) {
