@@ -19,6 +19,7 @@
 #pragma once
 
 #include "bitcask/component_ckpt.hpp"       // S20-1 R6：共用链状态/载入结果类型
+#include "bitcask/detail/atomic_shared_ptr.hpp"
 #include "bitcask/doc_table.hpp"
 #include "bitcask/hnsw.hpp"
 #include "bitcask/vector_plugin_config.hpp"  // S20-4：VectorPluginConfig（轻量头）
@@ -177,7 +178,7 @@ private:
     const bm25::DocTable& docs_;
     // V3.5：atomic<shared_ptr>——rebuild「旁路建新图 + 原子换指针」，读者
     // 每次操作开头 load 快照，旧图引用计数续命。
-    std::atomic<std::shared_ptr<HnswIndex>> hnsw_;
+    ::bitcask::detail::AtomicSharedPtr<HnswIndex> hnsw_;
     std::atomic<bool> dirty_{true};
     // S14-4/S18-1：delta 插入日志 + 入账窗口（单写者上下文访问）。
     // S32-M0b：抽为 vec::DeltaLog（与 IvfPlugin 共用单一真源）。

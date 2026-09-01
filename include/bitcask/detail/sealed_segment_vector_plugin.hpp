@@ -64,6 +64,7 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+#include "bitcask/detail/atomic_shared_ptr.hpp"
 #include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::vec::detail {
@@ -226,8 +227,8 @@ protected:
 
     VectorPluginConfig    config_;
     const bm25::DocTable& docs_;
-    std::atomic<std::shared_ptr<const SealedT>> sealed_;
-    std::atomic<std::shared_ptr<HnswIndex>>     window_;
+    ::bitcask::detail::AtomicSharedPtr<const SealedT> sealed_;
+    ::bitcask::detail::AtomicSharedPtr<HnswIndex>     window_;
 
     std::atomic<bool> dirty_{true};
     std::atomic<bool> rebase_needed_{true};

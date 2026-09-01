@@ -20,6 +20,7 @@
 
 #include "bitcask/analyzer.hpp"
 #include "bitcask/component_ckpt.hpp"     // S20-1 R6：共用链状态/载入结果类型
+#include "bitcask/detail/atomic_shared_ptr.hpp"
 #include "bitcask/doc_table.hpp"
 #include "bitcask/highlighter.hpp"
 #include "bitcask/text_plugin_config.hpp"  // S20-4：TextPluginConfig（轻量头）
@@ -473,7 +474,7 @@ private:
         bool waiting = false;  // builder 睡在 cv_idle(生产者据此免 notify)
         // S27-4 P3:每 builder 一个 building 段(设计 §1——不共享可变态,
         // 段内单写者;查询与 building_ 同款 load+pin)。
-        std::atomic<std::shared_ptr<search::SealedSegment>> building;
+        ::bitcask::detail::AtomicSharedPtr<search::SealedSegment> building;
     };
     static constexpr std::size_t kBuilderQueueCap = 1024;
     std::vector<std::unique_ptr<Builder>> builders_;
@@ -486,7 +487,7 @@ private:
     // S27-4 P3:apply/封口按「目标 building 槽」参数化——inline 路径用
     // building_,builder 线程用自己的槽。公开 apply_* 保持旧签名(恒指
     // building_,既有测试/standalone 语义不变)。
-    using BuildingSlot = std::atomic<std::shared_ptr<search::SealedSegment>>;
+    using BuildingSlot = ::bitcask::detail::AtomicSharedPtr<search::SealedSegment>;
     void apply_text_in(BuildingSlot& slot, std::string_view key,
                        std::uint64_t ord, std::string_view text);
     void apply_job_in(BuildingSlot& slot, search::ReduceJob& job);
@@ -503,7 +504,7 @@ private:
 
     // S27-3 步骤 5:building_ 原子 shared_ptr——封口切换(reducer store)与
     // 查询读(load)并发;查询经 pin 钉住段对象跨越切换/drop。
-    std::atomic<std::shared_ptr<search::SealedSegment>> building_;
+    ::bitcask::detail::AtomicSharedPtr<search::SealedSegment> building_;
     std::unique_ptr<search::SegmentSet>      segment_set_;  // 已封口活跃段集
     // S27-3 步骤 5:key_loc_mu_ 保护 map 结构——写者全在 reducer(unique,
     // 无竞争零代价),explain 在查询线程 find(shared)。search 路径不读此表。

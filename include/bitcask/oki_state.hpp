@@ -48,6 +48,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "bitcask/detail/atomic_shared_ptr.hpp"
 #include "bitcask/oki_run.hpp"
 #include "bitcask/string_hash.hpp"
 
@@ -255,7 +256,7 @@ private:
     // flush/rebuild 产出新 run 时随 manifest 提交同步维护）。
     RunsVec readers_;
     // readers_ 的不可变快照（atomic shared_ptr；locate 无锁取用）。
-    std::atomic<std::shared_ptr<const RunsVec>> runs_snap_{nullptr};
+    ::bitcask::detail::AtomicSharedPtr<const RunsVec> runs_snap_{nullptr};
 
     std::atomic<bool> loaded_{false};
     std::atomic<std::uint64_t> wm_{0};
