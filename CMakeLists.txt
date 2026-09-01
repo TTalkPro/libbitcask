@@ -280,6 +280,25 @@ if(BITCASK_BUNDLED_TBB)
     # 让构建失败（报「Error running test executable」，与 DLL 缺失毫无字面关联）。
     # 逐目标把运行时产物拉回 bin/；per-config 变体一并设，多配置生成器下
     # 只有它们生效。
+    #
+    # 另一件必须在这里补的事：把 oneTBB 的公开头改标 SYSTEM。
+    # 上面 BITCASK_WERROR 处写着「third_party 头已标 SYSTEM，-Werror 不作用于
+    # 它们」——对 find_package(TBB) 这条为真（导入目标带 SYSTEM 语义），对
+    # add_subdirectory 这条**为假**：源码构建的 tbb 目标只有普通
+    # INTERFACE_INCLUDE_DIRECTORIES，于是 oneapi/tbb/*.h 里的 old-style cast 与
+    # 隐式符号转换全算进我们的 -Wold-style-cast / -Wsign-conversion。
+    # 平时只是刷屏，开 BITCASK_WERROR 就直接编不过——而 **FreeBSD / macOS 上
+    # 没有「系统 TBB」这一说，bundled 是唯一可选项**，等于在这些平台上
+    # -Werror 恒定不可用。Windows 与 TSan 构建同理。
+    foreach(_tbb_t tbb tbbmalloc tbbmalloc_proxy)
+        if(TARGET ${_tbb_t})
+            get_target_property(_tbb_inc ${_tbb_t} INTERFACE_INCLUDE_DIRECTORIES)
+            if(_tbb_inc)
+                set_target_properties(${_tbb_t} PROPERTIES
+                    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_tbb_inc}")
+            endif()
+        endif()
+    endforeach()
     foreach(_tbb_t tbb tbbmalloc tbbmalloc_proxy)
         if(TARGET ${_tbb_t})
             set_target_properties(${_tbb_t} PROPERTIES
