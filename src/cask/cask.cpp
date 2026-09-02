@@ -1,5 +1,6 @@
 #include "bitcask/cask.hpp"
 #include "bitcask/detail/cpu_features.hpp"
+#include "bitcask/detail/icu_util.hpp"  // S38：Unicode 数据版本比对
 #if BITCASK_X86_64
 #include <immintrin.h>  // _mm_pause
 #endif
@@ -468,6 +469,31 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
                 "vector config mismatch (meta dim/metric/quantized/inmem_int8/engine vs options)"));
         }
         meta_config_ = *mc;
+        // S38：Unicode 数据版本比对。分词结果 = NFKC_Casefold 表 = Unicode
+        // 版本 = ICU 版本；换个 ICU 版本打开旧索引，新写入的文档会被切成与
+        // 老文档不同的 term，两边互相搜不到。这个失败**没有任何显式症状**，
+        // 只是召回悄悄少一块，所以必须主动报。
+        //
+        // 只告警、不拒开：跨版本的索引仍然可读可写，绝大多数码点的切分也没
+        // 变——把它做成硬门禁会让「升级发行版的 libicu」变成「所有库打不开」，
+        // 代价远大于风险。是否重建由用户按自己的语料决定。
+        // icu_major == 0 = S38 之前建的目录或 KV 模式，无从比对，跳过。
+        if (mc->mode == meta::Mode::kIndex && mc->icu_major != 0 &&
+            mc->icu_major != text::detail::icu_major_version()) {
+            log_warn(
+                "Unicode data version differs from when this index was built: "
+                "index built with ICU " + std::to_string(mc->icu_major) +
+                " (Unicode " + std::to_string(mc->unicode_major) +
+                "), current runtime is ICU " +
+                std::to_string(text::detail::icu_major_version()) +
+                " (Unicode " +
+                std::to_string(text::detail::unicode_major_version()) +
+                "). NFKC_Casefold tables change between Unicode versions, so "
+                "newly indexed documents may be tokenized differently from "
+                "existing ones and the two may not match each other. "
+                "Rebuild the index, or use the original ICU version, if recall "
+                "consistency matters for your corpus.");
+        }
         return {};
     }
     // 首次创建:无 meta 时写一份。vector_dim > 0 隐含 enable_search。
@@ -477,6 +503,12 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
     }
     meta::MetaConfig mc;
     mc.mode = opts_.enable_search ? meta::Mode::kIndex : meta::Mode::kKV;
+    // S38：索引模式才记 Unicode 数据版本——KV 模式没有文本分析，记了也无从
+    // 比对，留 0（未记录）语义更干净。
+    if (mc.mode == meta::Mode::kIndex) {
+        mc.icu_major = text::detail::icu_major_version();
+        mc.unicode_major = text::detail::unicode_major_version();
+    }
     if (opts_.vector_dim > 0) {
         mc.vector_dim = opts_.vector_dim;
         mc.vector_metric = opts_.vector_metric;

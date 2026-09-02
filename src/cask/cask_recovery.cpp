@@ -3,6 +3,7 @@
 // legacy search.ckpt 一次性迁移与 delta 链重放。S21-3 B1：从 cask.cpp 纯
 // 物理平移拆出（函数体不变），先例同 meta_file.cpp / legacy_ckpt.cpp。
 #include "bitcask/cask.hpp"
+#include "bitcask/detail/icu_util.hpp"  // S38：Unicode 数据版本记录
 
 #include "legacy_ckpt.hpp"  // S19-2：pre-S17 统一 ckpt 迁移读取器
 
@@ -57,6 +58,10 @@ Cask::upgrade(std::string_view dirname,
     meta::MetaConfig new_mc;
     new_mc.mode = meta::Mode::kIndex;
     new_mc.version = mc->version;  // S35：保留纪元（v6 目录不得降回 v5）
+    // S38：此刻才开始有文本分析（KV → 索引模式），故此刻记 Unicode 数据版本。
+    // 原 KV 目录的该字段恒为 0（未记录），这里是它第一次被真正写入。
+    new_mc.icu_major = text::detail::icu_major_version();
+    new_mc.unicode_major = text::detail::unicode_major_version();
     auto wr = meta::write_meta(std::string(dirname), new_mc);
     if (!wr) {
         return std::unexpected(err(CaskError::kIo, "write meta failed"));
