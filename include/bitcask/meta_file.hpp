@@ -10,7 +10,9 @@
 //   [9]      VecQuant     uint8 = 0/1（P3b：向量落盘 int8 量化；旧文件全零=否）
 //   [10]     VecInmemInt8 uint8 = 0/1（P5b：HNSW int8-only 内存；旧文件全零=否）
 //   [11]     VecEngine    uint8（S32-M0：向量引擎；0=HNSW，旧文件全零=HNSW）
-//   [12..17] Reserved     6 bytes zeros（future use；[14..17] 为 v3 CRC32）
+//   [12]     IcuMajor     uint8（S38：建索引时的 ICU 主版本；0=未记录）
+//   [13]     UnicodeMajor uint8（S38：同上的 Unicode 主版本；0=未记录）
+//   [14..17] CRC32        uint32 LE（v3 起，覆盖 [0,14)）
 //
 // === 线程模型 ===
 // 所有函数均为纯函数：线程安全、可重入、无锁。
@@ -60,6 +62,27 @@ struct MetaConfig {
     bool vector_inmem_int8 = false; // P5b：HNSW int8-only 内存模式（仅 vector_dim>0 + kDot）
     // S32-M0：向量引擎（仅 vector_dim>0 有意义；无向量恒 kHnsw/0）。
     VectorEngine vector_engine = VectorEngine::kHnsw;
+    // === S38：建索引时的 Unicode 数据版本 ===
+    // 分词结果 = NFKC_Casefold 表 = Unicode 版本 = ICU 版本。同一份语料在
+    // 不同 ICU 版本下会被切成**不同的 term**，于是「用 ICU 76 建的索引，
+    // 换 ICU 74 的机器打开后新写入的文档」与老文档互相搜不到——而这没有
+    // 任何显式症状，只是召回悄悄少了一块。故建索引时记下版本，重开时比对。
+    //
+    // **0 = 未记录**，不是「版本 0」：S38 之前建的目录、以及 KV 模式的目录
+    // （无文本分析，无所谓）都是 0，比对时跳过。这让本字段无需 bump meta
+    // 版本即可加入——沿用 VectorMetric::kNone / VectorEngine::kHnsw 那套
+    // 「保留字节全零即默认」的零升级模式。
+    //
+    // 只记主版本：meta 是固定 18 字节、只剩 [12..13] 两个空闲字节的格式，
+    // 而 ICU 主版本与 Unicode 版本一一对应（ICU 74=Unicode 15.1，
+    // 76=16.0），主版本一致即数据表一致，够做判别。
+    //
+    // 这两个字段**默认 0 且只在建索引时显式填写**：write_meta 会被懒升级
+    // （v5→v6）等路径调用，若默认取「当前运行时版本」，那些路径就会把原始
+    // 记录悄悄覆盖成当次运行的版本——比对从此永远相等，告警永不触发。
+    std::uint8_t icu_major = 0;
+    std::uint8_t unicode_major = 0;
+
     // S35：盘上纪元。5 = 无原子批（保守纪元标记）；6 = 目录可能含
     // kBatchHeader 记录（首次 put_batch_atomic 前懒升级，见
     // doc/atomic-batch-design-zh.md §2）。read_meta 回填实际值；write_meta

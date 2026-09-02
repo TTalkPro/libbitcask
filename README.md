@@ -254,6 +254,41 @@ U+FFFD（ICU 转换器的出厂回调是 SUBSTITUTE，本层显式改成了 STOP
 注意 `key` / `value`（`get`/`put` 那条路）**不受**此约束：它们是不透明字节，
 库不做任何编码解释，GB18030 存进去原样取出来。
 
+#### 索引与 Unicode 版本的绑定
+
+分词结果 = NFKC_Casefold 表 = Unicode 版本 = **ICU 版本**。换一个 ICU 版本打开
+既有索引，新写入的文档可能被切成与老文档不同的 term，两边互相搜不到——而这
+**没有任何显式症状**，只是召回悄悄少一块。
+
+所以建索引时会把当时的 ICU / Unicode 主版本记进 `bitcask.meta`（`[12]`/`[13]`
+两字节，在 CRC 覆盖区内），重开时比对，不一致就经 `CaskOptions::log_fn` 报一条
+`kWarn`：
+
+```
+Unicode data version differs from when this index was built: index built with
+ICU 76 (Unicode 16), current runtime is ICU 74 (Unicode 15). NFKC_Casefold
+tables change between Unicode versions, so newly indexed documents may be
+tokenized differently from existing ones and the two may not match each other.
+Rebuild the index, or use the original ICU version, if recall consistency
+matters for your corpus.
+```
+
+**只告警，不拒开。** 跨版本索引仍然可读可写，绝大多数码点的切分也没变；做成
+硬门禁会让「升级发行版的 libicu」变成「所有库打不开」，代价远大于风险。是否
+重建由你按自己的语料决定。
+
+几点语义：
+
+- **0 = 未记录**，不是「版本 0」。S38 之前建的目录、以及 KV 模式的目录（无
+  文本分析）都是 0，比对时跳过——不会把「没记录」误报成「不匹配」。
+- 记录只在**建索引时**写入（新建索引目录，或 `open_as_index` 把 KV 目录转成
+  索引模式）。`v5→v6` 懒升级一类的 meta 重写**不会**覆盖它，否则记录会被刷成
+  当次运行的版本、告警永不触发。
+- 只记主版本：ICU 主版本与 Unicode 版本一一对应（ICU 74 = Unicode 15.1，
+  76 = 16.0），主版本一致即数据表一致。
+- 需要跨机器可复现的索引，用 `BITCASK_ICU_PROVIDER=vendored` 把版本钉死——
+  这正是 vendored 模式最实际的用途。
+
 #### ICU 的来源（`BITCASK_ICU_PROVIDER`）
 
 ICU 提供 NFKC_Casefold 归一化、Unicode 字符属性与编码转换（GB18030 等 → UTF-8）。
