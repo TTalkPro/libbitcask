@@ -51,7 +51,7 @@ enable_testing()
 # ---------------------------------------------------------------------------
 # S37-4：MSVC 全局必需项。**目录作用域，且必须在任何 add_library /
 # add_subdirectory 之前**——目录级编译选项在 target 创建时固化，放晚了
-# third_party（utf8proc / googletest / benchmark）拿不到。
+# third_party（ICU / googletest / benchmark）拿不到。
 #
 # 这三项是设计稿 §1.1「编译第一天必炸」的全部：
 #
@@ -188,8 +188,9 @@ option(BITCASK_BUNDLED_ZLIB
     ${_bitcask_bundled_zlib_default})
 
 if(BITCASK_BUNDLED_ZLIB)
-    # 顶层 project() 只启用了 CXX，而 zlib 是 C。其余 C 依赖（utf8proc）走
-    # add_subdirectory，由它自己的 project() 启用 C，顶层无感；这里是顶层直接
+    # 顶层 project() 只启用了 CXX，而 zlib 是 C。别的 C 依赖要么走
+    # add_subdirectory（由它自己的 project() 启用 C，顶层无感），要么像 ICU
+    # 那样自带构建系统由 ExternalProject 驱动；只有这里是顶层直接
     # add_library(.c)，必须显式启用，否则配置期就报「未知源文件扩展名」。
     # 只在这一支启用：Linux/BSD 走系统 zlib 时不必平白多探测一个编译器。
     enable_language(C)
@@ -218,7 +219,7 @@ if(BITCASK_BUNDLED_ZLIB)
     target_include_directories(bitcask_zlib PUBLIC "${_bitcask_zlib_dir}")
     # bitcask_shared（bitcask.dll / libbitcask.so）要链它，故必须 PIC。
     set_target_properties(bitcask_zlib PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    # 第三方代码不受本项目的告警纪律约束（同 utf8proc/googletest 的处置）：
+    # 第三方代码不受本项目的告警纪律约束（同 ICU/googletest 的处置）：
     # 它按自己的标准写就行，不该因为我们开了 /W4 -Werror 而编不过。
     if(MSVC)
         target_compile_definitions(bitcask_zlib
@@ -648,7 +649,7 @@ target_link_libraries(bitcask_vector
 # VectorPlugin（HNSW）、HybridSearcher（可选融合器）；bitcask_search 退化
 # 为 SearchLayer shim 过渡目标（P5 随 shim 删除）。解锁独立装配：
 # KV+BM25（链 text_plugin，无向量依赖）/ KV+HNSW（链 vector_plugin，
-# 无 jieba/utf8proc——经 bm25 的 DocTable 头只读消费，不链 bitcask_text）。
+# 无 jieba/ICU——经 bm25 的 DocTable 头只读消费，不链 bitcask_text）。
 add_library(bitcask_text_plugin STATIC
     src/search/text_plugin.cpp
     src/search/search_arena.cpp    # S19-1：inter-query Search 池（生产件）
@@ -725,26 +726,18 @@ target_link_libraries(bitcask_cask
 )
 
 # ---------------------------------------------------------------------------
-# utf8proc — Unicode NFKC 归一化 + case fold（submodule: third_party/utf8proc）。
+# ICU — Unicode NFKC_Casefold + 字符属性 + 编码转换（S38：取代 utf8proc）。
+# 系统装了就用系统的，没有则用 third_party/icu 子模块现编。详见
+# cmake/BitcaskICU.cmake。
 # ---------------------------------------------------------------------------
-if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/utf8proc/CMakeLists.txt")
-    message(FATAL_ERROR
-        "third_party/utf8proc 未初始化。请运行:\n"
-        "  git submodule update --init")
-endif()
-add_subdirectory(third_party/utf8proc EXCLUDE_FROM_ALL)
-
-if(TARGET utf8proc::utf8proc)
-    set(UTF8PROC_TARGET utf8proc::utf8proc)
-else()
-    set(UTF8PROC_TARGET utf8proc)
-endif()
+include(BitcaskICU)
 
 # ---------------------------------------------------------------------------
 # gen_inert_table — build-time code generator for the NFKC inert range table.
 # ---------------------------------------------------------------------------
 add_executable(gen_inert_table tools/gen_inert_table.cpp)
-target_link_libraries(gen_inert_table PRIVATE ${UTF8PROC_TARGET})
+target_include_directories(gen_inert_table PRIVATE include)  # detail/icu_util.hpp
+target_link_libraries(gen_inert_table PRIVATE ${BITCASK_ICU_TARGETS})
 
 # ---------------------------------------------------------------------------
 # migrate_le — v1 大端 → 当前纪元离线迁移工具（旧入口,保留兼容;新增迁移
@@ -812,10 +805,11 @@ set(BITCASK_JIEBA_DICT_DIR "${PROJECT_SOURCE_DIR}/third_party/cppjieba/dict"
 add_library(bitcask_text STATIC
     src/text/analyzer.cpp
     src/text/jieba_analyzer.cpp
+    src/text/text_encoding.cpp   # S38：ICU ucnv 编码转换（GB18030 等 → UTF-8）
 )
 target_include_directories(bitcask_text PUBLIC include)
 target_link_libraries(bitcask_text
-    PUBLIC  ${UTF8PROC_TARGET}
+    PUBLIC  ${BITCASK_ICU_TARGETS}
     PRIVATE bitcask_warnings bitcask_sanitizers cppjieba
 )
 add_dependencies(bitcask_text generate_inert_table)
@@ -901,12 +895,12 @@ if(WIN32)
 else()
     set_target_properties(bitcask_static PROPERTIES OUTPUT_NAME "bitcask")
 endif()
-# 归档不含第三方对象（utf8proc / zlib / TBB 各自成库），故静态链接的下游必须
+# 归档不含第三方对象（ICU / zlib / TBB 各自成库），故静态链接的下游必须
 # 一并链上它们。原 custom-target 版没有任何 usage requirement，下游只能手工
 # 猜；这里补成 INTERFACE 依赖（纯增量，不改任何既有目标的链接）。
 target_include_directories(bitcask_static INTERFACE include)
 target_link_libraries(bitcask_static INTERFACE
-    ZLIB::ZLIB TBB::tbb ${UTF8PROC_TARGET} unordered_dense::unordered_dense)
+    ZLIB::ZLIB TBB::tbb ${BITCASK_ICU_TARGETS} unordered_dense::unordered_dense)
 
 # ---------------------------------------------------------------------------
 # Install 规则
@@ -933,6 +927,21 @@ install(TARGETS bitcask_static
 if(BITCASK_BUNDLED_ZLIB)
     install(TARGETS bitcask_zlib
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+endif()
+
+# 同理，vendored ICU 也是**我们的产物**，装出来的包必须带上它，否则静态链接的
+# 下游缺 ICU 符号（合并归档不含第三方对象，见 bitcask_static 上方注释）。
+# 走 install(FILES) 而非 install(TARGETS)：bitcask_icu_uc/_data 是 IMPORTED
+# 目标，install(TARGETS) 不接受。BITCASK_ICU_VENDORED=OFF（系统 ICU）时什么
+# 也不装——那是外部依赖，不该由我们分发。
+if(BITCASK_ICU_VENDORED)
+    install(FILES ${BITCASK_ICU_VENDORED_LIBS}
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+    install(DIRECTORY "${BITCASK_ICU_VENDORED_INCLUDE}/unicode"
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h"
     )
 endif()
 install(DIRECTORY include/bitcask

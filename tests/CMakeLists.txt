@@ -129,6 +129,15 @@ target_link_libraries(bitcask_analyzer_test PRIVATE
     bitcask_sanitizers
 )
 
+# S38：ICU 编码转换层（GB18030 等 → UTF-8）。
+add_executable(bitcask_text_encoding_test text_encoding_test.cpp)
+target_link_libraries(bitcask_text_encoding_test PRIVATE
+    GTest::gtest_main
+    bitcask_text
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 add_executable(bitcask_porter_stemmer_test porter_stemmer_test.cpp)
 target_link_libraries(bitcask_porter_stemmer_test PRIVATE
     GTest::gtest_main
@@ -392,6 +401,7 @@ gtest_discover_tests(bitcask_oki_levelb_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_range_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_scanner_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_analyzer_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_text_encoding_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_porter_stemmer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_stemming_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_inverted_test ${_bitcask_test_props})
@@ -511,7 +521,7 @@ set_target_properties(bitcask_c_api_test PROPERTIES LINKER_LANGUAGE CXX)
 # S37-4：c_api_test.c 用 <stdatomic.h>，要求 C11。GCC 默认 gnu17 故一直没事；
 # MSVC 的 .c 默认走 C89/C90，其 <stdatomic.h> 首行就 #error「C atomics require
 # C11 or later」。只钉这一个目标，不动全局 CMAKE_C_STANDARD——那会连带改掉
-# utf8proc / zlib 的 C 方言档位（GCC 侧从 gnu17 降到 gnu11），属无谓的波及。
+# zlib 的 C 方言档位（GCC 侧从 gnu17 降到 gnu11），属无谓的波及。
 set_target_properties(bitcask_c_api_test PROPERTIES
     C_STANDARD 11 C_STANDARD_REQUIRED ON)
 if(MSVC)
