@@ -242,6 +242,15 @@ target_link_libraries(bitcask_atomic_batch_test PRIVATE
     bitcask_sanitizers
 )
 
+# S38：meta 里的 Unicode 数据版本记录与重开比对告警。
+add_executable(bitcask_meta_unicode_version_test meta_unicode_version_test.cpp)
+target_link_libraries(bitcask_meta_unicode_version_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 add_executable(bitcask_txn_test txn_test.cpp)
 target_link_libraries(bitcask_txn_test PRIVATE
     GTest::gtest
@@ -402,6 +411,7 @@ gtest_discover_tests(bitcask_oki_range_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_scanner_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_text_encoding_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_meta_unicode_version_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_porter_stemmer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_stemming_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_inverted_test ${_bitcask_test_props})
