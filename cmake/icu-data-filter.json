@@ -1,0 +1,45 @@
+{
+  "_comment": [
+    "vendored ICU 的数据裁剪清单（S38）。",
+    "",
+    "ICU 的完整数据表约 31 MB，静态打包会整块进 libbitcask.so（实测 .so 从",
+    "1.7 MB 涨到 34 MB）。但本库只用 ICU 的三样东西：",
+    "  1. NFKC_Casefold 归一化   -> normalization",
+    "  2. 字符属性 u_charType    -> 编在代码里，不需要数据",
+    "  3. 编码转换 ucnv          -> conversion_mappings + cnvalias（别名表）",
+    "collation / 时区 / 区域数据 / 音译 / 断词 / 货币 / 字符名全都用不上。",
+    "",
+    "conversion_mappings 不做白名单：转换器表本身不大（全留约 1 MB），而收窄它",
+    "会把 transcode_to_utf8 能接受的编码名钉死在这份清单上——那是把一个运行期",
+    "可发现的能力变成构建期的隐式约束，调用方只会看到 kUnknownEncoding，却不知",
+    "道是被裁掉了。宁可多留 1 MB。",
+    "",
+    "改这份清单必须重跑 tests/text_encoding_test.cpp 与 analyzer_test.cpp——",
+    "裁掉 normalization 之类的东西不会让构建失败，只会让归一化在运行期静默失效。"
+  ],
+
+  "featureFilters": {
+    "normalization": "include",
+    "conversion_mappings": "include",
+    "cnvalias": "include",
+
+    "brkitr_rules": "exclude",
+    "brkitr_dictionaries": "exclude",
+    "brkitr_treedict": "exclude",
+    "coll_tree": "exclude",
+    "coll_ucadata": "exclude",
+    "confusables": "exclude",
+    "curr_tree": "exclude",
+    "lang_tree": "exclude",
+    "locales_tree": "exclude",
+    "misc": "exclude",
+    "rbnf_tree": "exclude",
+    "region_tree": "exclude",
+    "stringprep": "exclude",
+    "translit": "exclude",
+    "ulayout": "exclude",
+    "unames": "exclude",
+    "unit_tree": "exclude",
+    "zone_tree": "exclude"
+  }
+}
