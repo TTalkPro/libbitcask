@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #include <unicode/normalizer2.h>
@@ -83,9 +84,17 @@ int main(int argc, char** argv) {
     }
     flush();
 
-    FILE* fp = std::fopen(out_path, "wb");
+    // 先写到 .tmp，最后只在内容真的不同时才替换目标——**这是让「每次构建都
+    // 跑一遍本工具」可行的前提**。表的内容取决于本工具链接的那个 ICU 的版本，
+    // 而 inert_table.hpp 在源码树里、被所有构建树共享；system ICU 与 vendored
+    // ICU 的版本可以不同，于是两棵树会互相覆盖它。对策是让每次构建都重新生成
+    // （见 CMakeLists.txt 的 generate_inert_table），但那样若无条件重写文件，
+    // mtime 每次都变，全部下游 TU 每次构建都要重编。内容不变就不落盘即可两全。
+    const std::string tmp_path = std::string(out_path) + ".tmp";
+    FILE* fp = std::fopen(tmp_path.c_str(), "wb");
     if (fp == nullptr) {
-        std::fprintf(stderr, "gen_inert_table: cannot open %s\n", out_path);
+        std::fprintf(stderr, "gen_inert_table: cannot open %s\n",
+                     tmp_path.c_str());
         return 1;
     }
 
@@ -147,10 +156,37 @@ int main(int argc, char** argv) {
                      "}  // namespace bitcask::text::detail\n");
 
     if (std::fclose(fp) != 0) {
-        std::fprintf(stderr, "gen_inert_table: write failed for %s\n", out_path);
+        std::fprintf(stderr, "gen_inert_table: write failed for %s\n",
+                     tmp_path.c_str());
+        std::remove(tmp_path.c_str());
         return 1;
     }
 
+    const auto slurp = [](const char* path) -> std::string {
+        FILE* f = std::fopen(path, "rb");
+        if (f == nullptr) return {};
+        std::string out;
+        char buf[8192];
+        std::size_t n = 0;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+        std::fclose(f);
+        return out;
+    };
+
+    if (slurp(tmp_path.c_str()) == slurp(out_path)) {
+        std::remove(tmp_path.c_str());
+        std::printf("gen_inert_table: %zu range(s), %s already up to date\n",
+                    ranges.size(), out_path);
+        return 0;
+    }
+
+    std::remove(out_path);  // Windows 的 rename 不覆盖已存在的目标
+    if (std::rename(tmp_path.c_str(), out_path) != 0) {
+        std::fprintf(stderr, "gen_inert_table: rename %s -> %s failed\n",
+                     tmp_path.c_str(), out_path);
+        std::remove(tmp_path.c_str());
+        return 1;
+    }
     std::printf("gen_inert_table: wrote %zu range(s) to %s\n",
                 ranges.size(), out_path);
     return 0;

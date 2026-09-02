@@ -6,6 +6,7 @@
 #include <unicode/ustring.h>
 
 #include "bitcask/analyzer.hpp"
+#include "bitcask/detail/icu_util.hpp"
 #include "bitcask/text_utils.hpp"
 #include "bitcask/cjk_detect.hpp"
 #include "bitcask/ngram_analyzer.hpp"
@@ -395,15 +396,43 @@ std::string nfkc_oracle(std::string_view input) {
 // 表成员穷举验证：nfkc_casefold_inert 标记的每个码点，经 ICU
 // NFKC_Casefold 后必须逐字节不变。表与 Unicode 数据不符即此测试红。
 TEST(NfkcInert, TableOracleExhaustive) {
+    using bitcask::text::detail::icu_is_nfkc_cf_inert;
     using bitcask::text::detail::nfkc_casefold_inert;
-    std::size_t checked = 0;
+
+    // 表必须与**当前链接的这个 ICU** 的 isInert 逐码点相等——双向、全 BMP。
+    //
+    // 这里曾经只检查「表内码点经 NFKC_Casefold 后逐字节不变」，那有两个洞：
+    //   ① 只验单码点恒等，不验 isInert 的第三条「不与邻居组合」。当初的韩文
+    //      bug（U+1100 U+1161 没合成 U+AC00）正是漏在这一条上，而旧断言对
+    //      那张错表是绿的。
+    //   ② 单向——只看表内成员，从不检查该被排除的码点是否真被排除。
+    // 于是一张**别的 ICU 版本生成的表**能安然通过。这不是假想：inert_table.hpp
+    // 是源码树内的共享生成物，system ICU 与 vendored ICU 版本可以不同，两棵
+    // 构建树会互相覆盖这份表（见 CMakeLists.txt 里 generate_inert_table 的注释）。
+    // 改成双向比对后，任何版本错配都在这里立刻变红。
+    std::size_t inert_count = 0;
+    for (char32_t cp = 0x80; cp <= 0xFFFF; ++cp) {
+        // 代理半区不是合法标量值，生成器刻意排除（gen_inert_table 的
+        // is_inert 第一条）。ICU 的 isInert 对它们返回 true——这是双方有意
+        // 的差异，不是版本错配，故不参与比对。
+        if (cp >= 0xD800 && cp <= 0xDFFF) continue;
+        const bool in_table = nfkc_casefold_inert(cp);
+        const bool icu_says = icu_is_nfkc_cf_inert(cp);
+        ASSERT_EQ(in_table, icu_says)
+            << "cp=U+" << std::hex << static_cast<int>(cp) << std::dec
+            << "：表与当前 ICU 不一致——多半是 inert_table.hpp 由另一个 ICU "
+               "版本生成（源码树内共享），重新构建本树即可复现/修复";
+        if (in_table) ++inert_count;
+    }
+    EXPECT_GT(inert_count, 27000u);  // CJK 基本区+扩展 A+标点
+
+    // 表成员必须真的是 NFKC_Casefold 恒等（isInert 的第一条）——独立于上面的
+    // 相等性再验一遍，免得 ICU 的 isInert 与 normalizeUTF8 两条路径自己打架。
     for (char32_t cp = 0x80; cp <= 0xFFFF; ++cp) {
         if (!nfkc_casefold_inert(cp)) continue;
-        auto u = encode_utf8(cp);
+        const auto u = encode_utf8(cp);
         ASSERT_EQ(nfkc_oracle(u), u) << "cp=U+" << std::hex << static_cast<int>(cp);
-        ++checked;
     }
-    EXPECT_GT(checked, 27000u);  // CJK 基本区+扩展 A+标点
 }
 
 // 黑盒对拍：从「表成员 ∪ 回退字符」混合字母表生成随机串，

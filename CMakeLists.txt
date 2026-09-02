@@ -765,14 +765,28 @@ target_link_libraries(vec_engine_migrate
 
 set(INERT_TABLE_HPP
     "${CMAKE_CURRENT_SOURCE_DIR}/include/bitcask/detail/inert_table.hpp")
-add_custom_command(
-    OUTPUT "${INERT_TABLE_HPP}"
+# **每次构建都重新生成**，而不是 add_custom_command(OUTPUT ...) 那种按时间戳
+# 判定的增量规则。
+#
+# 为什么：表的内容取决于 gen_inert_table 链接的那个 ICU 的版本，而
+# inert_table.hpp 在**源码树**里、被所有构建树共享。ICU 现在有 system 与
+# vendored 两个来源，版本可以不同（实测 system 76.1 / vendored 78.3）。
+# 旧的 OUTPUT 规则只 DEPENDS 可执行文件：另一棵树刚写过这份表之后，本树的
+# exe 比表旧 → 命令被判为最新、直接跳过 → **本树拿着别人 ICU 版本的表编译
+# 自己的 TU**。实测复现过：vendored 78.3 生成表后，system 76.1 的树重建
+# bitcask_text 时沿用了 Unicode 17 的表。
+#
+# 无条件重跑的代价由生成器自己消掉：它内容不变就不落盘（写 .tmp 后比对），
+# 所以 mtime 不动，下游 TU 不会每次构建都重编。
+# 兜底在 tests/analyzer_test.cpp 的 NfkcInert.TableOracleExhaustive——它把表
+# 与**当前链接的 ICU** 双向逐码点比对，版本错配即红。
+add_custom_target(generate_inert_table ALL
     COMMAND gen_inert_table "${INERT_TABLE_HPP}"
     DEPENDS gen_inert_table
+    BYPRODUCTS "${INERT_TABLE_HPP}"
     COMMENT "Generating NFKC inert range table"
     VERBATIM
 )
-add_custom_target(generate_inert_table DEPENDS "${INERT_TABLE_HPP}")
 
 # ---------------------------------------------------------------------------
 # cppjieba — jieba 中文分词（header-only，依赖 limonp）。

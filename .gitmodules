@@ -28,6 +28,6 @@
 [submodule "third_party/icu"]
 	path = third_party/icu
 	url = https://github.com/unicode-org/icu
-	branch = maint/maint-76
+	branch = maint/maint-78
 	shallow = true
 	update = none
