@@ -128,6 +128,17 @@ target_link_libraries(bitcask_analyzer_test PRIVATE
     bitcask_warnings
     bitcask_sanitizers
 )
+# analyzer_test.cpp 直接 include 了**生成的** detail/inert_table.hpp（
+# NfkcInert.TableOracleExhaustive 拿它跟 ICU 对拍）。generate_inert_table 现在是
+# add_custom_target(ALL)，不再是 add_custom_command(OUTPUT ...)——后者会让每个
+# 消费该文件的目标经**文件**拿到隐式依赖，前者只剩 add_dependencies 这一条显式
+# 边。链接 bitcask_text 不够：那只保证 bitcask_text 自己排在生成之后，管不到本
+# 目标自己的 TU 何时编译。少了这条边，ninja 可以在同一次构建里先编完
+# analyzer_test.cpp、最后才重新生成表 —— 于是本次构建产出的二进制是拿**旧表**
+# 编的，要再构建一次才对。实测复现过：表从 0 条目恢复成 1219 条目那次构建，
+# 表的重新生成排在 [4/4]，而测试早已编完，TableOracleExhaustive 于是红在
+# cp=U+80。
+add_dependencies(bitcask_analyzer_test generate_inert_table)
 
 # S38：ICU 编码转换层（GB18030 等 → UTF-8）。
 add_executable(bitcask_text_encoding_test text_encoding_test.cpp)
