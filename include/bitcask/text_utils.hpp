@@ -1,67 +1,159 @@
 #pragma once
 
-#include <cstdlib>
-#include <cstring>
-#include <memory>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include <utf8proc.h>
-
+#include "bitcask/detail/icu_util.hpp"
 #include "bitcask/detail/inert_table.hpp"
 
 namespace bitcask::text::detail {
 
-struct Utf8ProcDeleter {
-    void operator()(void* p) const noexcept { std::free(p); }
-};
-using Utf8ProcBuf = std::unique_ptr<uint8_t[], Utf8ProcDeleter>;
-
+// ===========================================================================
+// UTF-8 解码
+// ===========================================================================
+//
+// S38：自带严格解码器，不用 ICU 的 U8_NEXT。理由有两条，都不是风格问题：
+//   1. U8_NEXT 是**宏**，在我们的 TU 里展开。ICU 的头虽被当 SYSTEM（告警免疫），
+//      但宏展开出来的 C 风格转换算在**调用方**头上，会被 -Wold-style-cast /
+//      -Wconversion 逐个打中，只能靠 pragma 包起来——那比自己写还脏。
+//   2. 这是分词热路径上每码点都要过的函数。手写内联版没有库调用，比原先的
+//      utf8proc_iterate（一次真函数调用）还快。
+//
+// 严格性契约（与 ICU / utf8proc 一致，tests/analyzer_test.cpp 对拍全码点）：
+// 拒绝过长编码（overlong）、代理区 U+D800..DFFF、> U+10FFFF、非法前导/续字节。
+//
+// 返回 {码点, 消耗字节数}；**consumed == 0 表示输入非法或为空**。
+// 注意这与 S38 之前的行为不同：旧版对非法序列返回 {U+FFFD, 1}，于是所有
+// `consumed == 0` 的判空守卫都形同虚设，GB18030 之类的非 UTF-8 字节能一路
+// 混过快路径。现在非法即 0，守卫真正生效。
 [[nodiscard]] inline std::pair<char32_t, std::size_t> decode_one(
     std::string_view sv) noexcept {
     if (sv.empty()) return {0, 0};
 
-    auto* ptr = reinterpret_cast<const utf8proc_uint8_t*>(sv.data());
-    auto len = static_cast<utf8proc_ssize_t>(sv.size());
+    const auto b0 = static_cast<unsigned char>(sv[0]);
+    if (b0 < 0x80) return {static_cast<char32_t>(b0), 1};
 
-    utf8proc_int32_t cp = 0;
-    auto consumed = utf8proc_iterate(ptr, len, &cp);
-    if (consumed < 0 || cp < 0) return {0xFFFD, 1};
-    return {static_cast<char32_t>(cp), static_cast<std::size_t>(consumed)};
+    const auto cont = [&sv](std::size_t i) noexcept -> unsigned {
+        return static_cast<unsigned char>(sv[i]) & 0xC0u;
+    };
+
+    if (b0 >= 0xC2 && b0 <= 0xDF) {  // 2 字节；< 0xC2 即 overlong
+        if (sv.size() < 2 || cont(1) != 0x80) return {0, 0};
+        const auto cp = (static_cast<char32_t>(b0 & 0x1Fu) << 6) |
+                        static_cast<char32_t>(static_cast<unsigned char>(sv[1]) & 0x3Fu);
+        return {cp, 2};
+    }
+
+    if (b0 >= 0xE0 && b0 <= 0xEF) {  // 3 字节
+        if (sv.size() < 3 || cont(1) != 0x80 || cont(2) != 0x80) return {0, 0};
+        const auto cp = (static_cast<char32_t>(b0 & 0x0Fu) << 12) |
+                        (static_cast<char32_t>(static_cast<unsigned char>(sv[1]) & 0x3Fu) << 6) |
+                        static_cast<char32_t>(static_cast<unsigned char>(sv[2]) & 0x3Fu);
+        if (cp < 0x800) return {0, 0};                      // overlong
+        if (cp >= 0xD800 && cp <= 0xDFFF) return {0, 0};    // 代理半区
+        return {cp, 3};
+    }
+
+    if (b0 >= 0xF0 && b0 <= 0xF4) {  // 4 字节
+        if (sv.size() < 4 || cont(1) != 0x80 || cont(2) != 0x80 || cont(3) != 0x80) {
+            return {0, 0};
+        }
+        const auto cp = (static_cast<char32_t>(b0 & 0x07u) << 18) |
+                        (static_cast<char32_t>(static_cast<unsigned char>(sv[1]) & 0x3Fu) << 12) |
+                        (static_cast<char32_t>(static_cast<unsigned char>(sv[2]) & 0x3Fu) << 6) |
+                        static_cast<char32_t>(static_cast<unsigned char>(sv[3]) & 0x3Fu);
+        if (cp < 0x10000 || cp > 0x10FFFF) return {0, 0};   // overlong / 越界
+        return {cp, 4};
+    }
+
+    return {0, 0};  // 0x80..0xC1（孤立续字节 / overlong 前导）、0xF5..0xFF
 }
 
-// 慢路径：utf8proc_map 全量 NFKC_Casefold（快路径未命中时的回退）。
-// utf8proc_map 接受显式长度（utf8proc_NFKC_Casefold 即它加 NULLTERM 的
-// 包装）——免去此前「输入拷贝求 null 终止」与「输出 strlen」两次全串遍历。
-// 行为差异仅在含内嵌 \0 的输入：旧版在 \0 截断，本版处理全长（更正确）。
-inline void nfkc_map_slow(std::string_view input, std::string& out) {
-    utf8proc_uint8_t* mapped = nullptr;
-    auto n = utf8proc_map(
-        reinterpret_cast<const utf8proc_uint8_t*>(input.data()),
-        static_cast<utf8proc_ssize_t>(input.size()), &mapped,
-        static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE |
-                                       UTF8PROC_COMPAT | UTF8PROC_CASEFOLD |
-                                       UTF8PROC_IGNORE));
-    if (n < 0 || mapped == nullptr) return;  // out 已 clear
-    Utf8ProcBuf guard(mapped);
-    out.assign(reinterpret_cast<const char*>(mapped),
-               static_cast<std::size_t>(n));
+// 整串是否合法 UTF-8。入口校验用——**索引入口必须先过这一关**，否则非 UTF-8
+// 数据会以"能存进去但搜不出来"的形态静默失败（见 nfkc_fold 的注释）。
+[[nodiscard]] inline bool validate_utf8(std::string_view sv) noexcept {
+    std::size_t off = 0;
+    while (off < sv.size()) {
+        // ASCII 快扫：绝大多数语料的多数字节走这里。
+        if (static_cast<unsigned char>(sv[off]) < 0x80) {
+            ++off;
+            continue;
+        }
+        const auto [cp, n] = decode_one(sv.substr(off));
+        (void)cp;
+        if (n == 0) return false;
+        off += n;
+    }
+    return true;
 }
 
-// P6:出参版——写入 caller 缓冲（clear 保留容量），热路径稳态零分配。
-// caller 用 thread_local 复用（如 jieba 逐词归一化）。语义与返回值版完全一致。
-inline void nfkc_fold(std::string_view input, std::string& out) {
+// 把非法字节逐个替换为 U+FFFD，产出保证合法的 UTF-8。
+// 只在 nfkc_fold 的非法输入分支上跑，不在热路径。
+inline void sanitize_utf8(std::string_view in, std::string& out) {
     out.clear();
-    if (input.empty()) return;
+    out.reserve(in.size());
+    std::size_t off = 0;
+    while (off < in.size()) {
+        const auto [cp, n] = decode_one(in.substr(off));
+        (void)cp;
+        if (n == 0) {
+            out.append("\xEF\xBF\xBD", 3);  // U+FFFD
+            ++off;                          // 逐字节推进，不吞掉后面可能合法的序列
+        } else {
+            out.append(in.substr(off, n));
+            off += n;
+        }
+    }
+}
+
+// ===========================================================================
+// NFKC_Casefold
+// ===========================================================================
+
+enum class FoldStatus : std::uint8_t {
+    kOk,           // 输入是合法 UTF-8，out 为其 NFKC_Casefold
+    kInvalidUtf8,  // 输入含非法 UTF-8 字节；out 是把非法字节换成 U+FFFD 后的结果
+    kIcuError,     // ICU 侧失败（数据缺失/OOM）；out 为空
+};
+
+// 慢路径：ICU NFKC_Casefold（快路径未命中时的回退）。
+//
+// S38 的行为变更，两处都是修 bug：
+//   1. 旧版调 utf8proc_map，遇非法 UTF-8 返回负值，而调用点写的是
+//      `if (n < 0) return;` —— out 已 clear，于是**整段文本静默变空**，该文档
+//      零 term、永远搜不到，且不产生任何错误信号。
+//   2. 换成 ICU 也不能直接信它：实测 icu::Normalizer2::normalizeUTF8 对非法
+//      UTF-8 **不报错也不替换**，原样透传字节。那会让失败形态从"整段消失"
+//      变成"整段黏成一个乱码 term"，一样是静默错。
+// 所以非法输入在这里显式转成 U+FFFD 再归一化，并把状态回报给调用方。
+[[nodiscard]] inline FoldStatus nfkc_map_slow(std::string_view input,
+                                              std::string& out) {
+    if (validate_utf8(input)) {
+        return icu_nfkc_casefold(input, out) ? FoldStatus::kOk
+                                             : FoldStatus::kIcuError;
+    }
+    std::string cleaned;
+    sanitize_utf8(input, cleaned);
+    if (!icu_nfkc_casefold(cleaned, out)) return FoldStatus::kIcuError;
+    return FoldStatus::kInvalidUtf8;
+}
+
+// 出参版——写入 caller 缓冲（clear 保留容量），热路径稳态零分配。
+// caller 用 thread_local 复用（如 jieba 逐词归一化）。
+[[nodiscard]] inline FoldStatus nfkc_fold_checked(std::string_view input,
+                                                  std::string& out) {
+    out.clear();
+    if (input.empty()) return FoldStatus::kOk;
 
     // P2.5/P2.5b 统一快路径：全部码点 ∈（NFKC_Casefold 恒等区段 ∪ ASCII）
     // 时，整个变换等价于「原串 + ASCII 字节 tolower」——纯 ASCII 文本与
-    // 「中文 + 半角英文/标点」文本都命中，跳过整条 utf8proc 流水线。
+    // 「中文 + 半角英文/标点」文本都命中，跳过整条 ICU 流水线。
     // ASCII 的 tolower 可安全按字节做：UTF-8 多字节序列的所有字节 ≥ 0x80，
     // 不会误伤。含全角标点（，：！？等会被 NFKC 折叠）即整串回退。
-    // 语义对拍见 analyzer_test（穷举表成员 + 随机串黑盒 vs utf8proc）。
+    // 语义对拍见 analyzer_test（穷举表成员 + 随机串黑盒 vs ICU）。
     bool fast = true;
     {
         std::size_t off = 0;
@@ -78,7 +170,9 @@ inline void nfkc_fold(std::string_view input, std::string& out) {
                 ++off;
                 continue;
             }
-            auto [cp, consumed] = decode_one(input.substr(off));
+            const auto [cp, consumed] = decode_one(input.substr(off));
+            // consumed == 0 现在真的表示"非法 UTF-8"（S38 前它只表示空输入），
+            // 于是非 UTF-8 字节会正确地掉进慢路径去做校验与替换。
             if (consumed == 0 || !nfkc_casefold_inert(cp)) {
                 fast = false;
                 break;
@@ -91,15 +185,21 @@ inline void nfkc_fold(std::string_view input, std::string& out) {
         for (auto& c : out) {
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
         }
-        return;
+        return FoldStatus::kOk;
     }
 
-    nfkc_map_slow(input, out);
+    return nfkc_map_slow(input, out);
+}
+
+// 宽容形态：丢弃状态。调用点若不关心输入合法性可用它——但**索引入口不该用**，
+// 那里要的是 nfkc_fold_checked 的状态（否则又回到静默失败）。
+inline void nfkc_fold(std::string_view input, std::string& out) {
+    (void)nfkc_fold_checked(input, out);
 }
 
 [[nodiscard]] inline std::string nfkc_fold(std::string_view input) {
     std::string out;
-    nfkc_fold(input, out);
+    (void)nfkc_fold_checked(input, out);
     return out;
 }
 
@@ -116,15 +216,15 @@ inline void to_codepoints(std::string_view text, std::vector<CpInfo>& cps) {
     cps.reserve(text.size() / 2);
     std::size_t off = 0;
     while (off < text.size()) {
-        // P2.5：ASCII 免 utf8proc_iterate 库调用（每码点一次函数调用 +
-        // 分支判定，对拉丁/混合文本是纯开销）。
+        // P2.5：ASCII 免解码函数调用（每码点一次调用 + 分支判定，对拉丁/
+        // 混合文本是纯开销）。
         const auto b = static_cast<unsigned char>(text[off]);
         if (b < 0x80) {
             cps.push_back({static_cast<char32_t>(b), off, 1});
             ++off;
             continue;
         }
-        auto [cp, consumed] = decode_one(text.substr(off));
+        const auto [cp, consumed] = decode_one(text.substr(off));
         if (consumed == 0) break;
         cps.push_back({cp, off, consumed});
         off += consumed;
@@ -143,15 +243,15 @@ inline void to_codepoints(std::string_view text, std::vector<CpInfo>& cps) {
 // decode_one 只为判 nfkc_casefold_inert、产出字节与输入相同（纯拷贝），
 // to_codepoints 又对同样的字节全量重解。本函数在校验的同一趟里直接产出
 // CpInfo（ASCII 记 tolower 后的码点——与「解码 out」逐位一致；inert 非
-// ASCII 原样），快路径命中即省整趟解码。回退慢路径时（utf8proc_map 产出
-// 与输入不同的字节）行为同旧两段式：map 后对映射串全量解码。
+// ASCII 原样），快路径命中即省整趟解码。回退慢路径时（ICU 产出与输入不同
+// 的字节）行为同旧两段式：归一化后对映射串全量解码。
 // 语义契约：(out, cps) 与 `nfkc_fold(input,out); to_codepoints(out,cps)`
 // 逐位一致（analyzer_test 黑盒对拍覆盖）。
-inline void nfkc_fold_codepoints(std::string_view input, std::string& out,
-                                 std::vector<CpInfo>& cps) {
+[[nodiscard]] inline FoldStatus nfkc_fold_codepoints_checked(
+    std::string_view input, std::string& out, std::vector<CpInfo>& cps) {
     out.clear();
     cps.clear();
-    if (input.empty()) return;
+    if (input.empty()) return FoldStatus::kOk;
     cps.reserve(input.size() / 2);
 
     bool fast = true;
@@ -172,7 +272,7 @@ inline void nfkc_fold_codepoints(std::string_view input, std::string& out,
             ++off;
             continue;
         }
-        auto [cp, consumed] = decode_one(input.substr(off));
+        const auto [cp, consumed] = decode_one(input.substr(off));
         if (consumed == 0 || !nfkc_casefold_inert(cp)) {
             fast = false;
             break;
@@ -185,13 +285,19 @@ inline void nfkc_fold_codepoints(std::string_view input, std::string& out,
         for (auto& c : out) {
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
         }
-        return;
+        return FoldStatus::kOk;
     }
 
-    // 慢路径：半程 cps 作废，map 后全量重解（同旧两段式）。
+    // 慢路径：半程 cps 作废，归一化后全量重解（同旧两段式）。
     cps.clear();
-    nfkc_map_slow(input, out);
+    const auto st = nfkc_map_slow(input, out);
     to_codepoints(out, cps);
+    return st;
+}
+
+inline void nfkc_fold_codepoints(std::string_view input, std::string& out,
+                                 std::vector<CpInfo>& cps) {
+    (void)nfkc_fold_codepoints_checked(input, out, cps);
 }
 
 // S29-8：融合版的 thread_local 复用形态（对齐 to_codepoints_reuse——含同款

@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include <utf8proc.h>
+#include <unicode/uchar.h>
 
 #include <cppjieba/Jieba.hpp>
 
@@ -38,19 +38,20 @@ namespace {
 // 判断一个 codepoint 是否「无检索意义」：空白（Zs / 控制空白）或标点（P*）。
 // 用于过滤 jieba CutForSearch 偶尔输出的纯空白/标点词（S9.26）。
 [[nodiscard]] bool is_noise_cp(char32_t cp) noexcept {
-    auto cat = utf8proc_category(static_cast<utf8proc_int32_t>(cp));
-    switch (cat) {
-        case UTF8PROC_CATEGORY_ZS:  // 空格分隔符
-        case UTF8PROC_CATEGORY_ZL:  // 行分隔符
-        case UTF8PROC_CATEGORY_ZP:  // 段分隔符
-        case UTF8PROC_CATEGORY_CC:  // 控制字符
-        case UTF8PROC_CATEGORY_PC:  // 标点（连接）
-        case UTF8PROC_CATEGORY_PD:  // 标点（破折）
-        case UTF8PROC_CATEGORY_PS:  // 标点（开）
-        case UTF8PROC_CATEGORY_PE:  // 标点（闭）
-        case UTF8PROC_CATEGORY_PI:  // 标点（首引号）
-        case UTF8PROC_CATEGORY_PF:  // 标点（尾引号）
-        case UTF8PROC_CATEGORY_PO:  // 标点（其它）
+    // S38：utf8proc_category → ICU u_charType。两套枚举都是 Unicode 通用类别，
+    // 下面 11 项一一对应（Zs/Zl/Zp/Cc + P* 全族），逐码点等价。
+    switch (u_charType(static_cast<UChar32>(cp))) {
+        case U_SPACE_SEPARATOR:          // Zs 空格分隔符
+        case U_LINE_SEPARATOR:           // Zl 行分隔符
+        case U_PARAGRAPH_SEPARATOR:      // Zp 段分隔符
+        case U_CONTROL_CHAR:             // Cc 控制字符
+        case U_CONNECTOR_PUNCTUATION:    // Pc 标点（连接）
+        case U_DASH_PUNCTUATION:         // Pd 标点（破折）
+        case U_START_PUNCTUATION:        // Ps 标点（开）
+        case U_END_PUNCTUATION:          // Pe 标点（闭）
+        case U_INITIAL_PUNCTUATION:      // Pi 标点（首引号）
+        case U_FINAL_PUNCTUATION:        // Pf 标点（尾引号）
+        case U_OTHER_PUNCTUATION:        // Po 标点（其它）
             return true;
         default:
             return false;

@@ -1,5 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <unicode/bytestream.h>
+#include <unicode/normalizer2.h>
+#include <unicode/stringpiece.h>
+#include <unicode/ustring.h>
+
 #include "bitcask/analyzer.hpp"
 #include "bitcask/text_utils.hpp"
 #include "bitcask/cjk_detect.hpp"
@@ -321,11 +326,11 @@ TEST(NfkcFold, AsciiFastPathEqualsLowercase) {
 
 TEST(NfkcFold, NonAsciiPathUnchanged) {
     using bitcask::text::detail::nfkc_fold;
-    // 全角 → 半角 + casefold（NFKC_Casefold 经典行为，走 utf8proc 路径）。
+    // 全角 → 半角 + casefold（NFKC_Casefold 经典行为，走 ICU 慢路径）。
     EXPECT_EQ(nfkc_fold("ＨＥＬＬＯ"), "hello");
     EXPECT_EQ(nfkc_fold("Ｃａｆé"), "café");
     EXPECT_EQ(nfkc_fold("北京"), "北京");
-    // 混合（含非 ASCII → 整串走 utf8proc，ASCII 部分行为一致）。
+    // 混合（含非 ASCII → 整串走 ICU，ASCII 部分行为一致）。
     EXPECT_EQ(nfkc_fold("Hello北京World"), "hello北京world");
 }
 
@@ -370,21 +375,24 @@ std::string encode_utf8(char32_t cp) {
     return s;
 }
 
-// 旧实现等价的 utf8proc oracle（绕过快路径）。
+// ICU oracle（绕过我们的快路径，直接问库）。S38 前这里是 utf8proc。
 std::string nfkc_oracle(std::string_view input) {
     if (input.empty()) return {};
-    std::string owned(input);
-    auto* out = utf8proc_NFKC_Casefold(
-        reinterpret_cast<const utf8proc_uint8_t*>(owned.c_str()));
-    if (out == nullptr) return {};
-    std::string r(reinterpret_cast<const char*>(out),
-                  std::strlen(reinterpret_cast<const char*>(out)));
-    std::free(out);
-    return r;
+    UErrorCode ec = U_ZERO_ERROR;
+    const auto* n2 = icu::Normalizer2::getNFKCCasefoldInstance(ec);
+    if (U_FAILURE(ec) || n2 == nullptr) return {};
+    std::string out;
+    icu::StringByteSink<std::string> sink(&out);
+    n2->normalizeUTF8(0,
+                      icu::StringPiece(input.data(),
+                                       static_cast<std::int32_t>(input.size())),
+                      sink, nullptr, ec);
+    if (U_FAILURE(ec)) return {};
+    return out;
 }
 }  // namespace
 
-// 表成员穷举验证：nfkc_casefold_inert 标记的每个码点，经 utf8proc
+// 表成员穷举验证：nfkc_casefold_inert 标记的每个码点，经 ICU
 // NFKC_Casefold 后必须逐字节不变。表与 Unicode 数据不符即此测试红。
 TEST(NfkcInert, TableOracleExhaustive) {
     using bitcask::text::detail::nfkc_casefold_inert;
@@ -399,7 +407,7 @@ TEST(NfkcInert, TableOracleExhaustive) {
 }
 
 // 黑盒对拍：从「表成员 ∪ 回退字符」混合字母表生成随机串，
-// nfkc_fold（含快路径）必须与 utf8proc oracle 逐串一致。
+// nfkc_fold（含快路径）必须与 ICU oracle 逐串一致。
 TEST(NfkcInert, RandomizedAgainstOracle) {
     using bitcask::text::detail::nfkc_fold;
     const std::string alphabet[] = {
@@ -407,6 +415,12 @@ TEST(NfkcInert, RandomizedAgainstOracle) {
         "a", "B", "z", "9", " ", ",", ".",           // ASCII（含大写）
         "、", "。", "《", "》", "—",                  // 恒等标点
         "，", "！", "Ａ", "…", "é", "　",             // 回退触发（全角/分解/附标）
+        // S38：**会与邻居组合**的起始字符。旧表（identity + ccc==0）把它们
+        // 判成 inert，快路径原样透传，于是 U+1100 U+1161 没有合成 U+AC00。
+        // 字母表里加上它们，随机串就能撞出那条路径。
+        "\u1100", "\u1161", "\u11A8",               // 谚文 jamo（可合成 가/각）
+        "\u09C7", "\u09BE",                         // 孟加拉元音符（可合成 U+09CB）
+        "\u0061", "\u0301",                         // a + 组合锐音符 → á
     };
     std::uint64_t seed = 23;
     auto next = [&seed] {
@@ -432,6 +446,137 @@ TEST(NfkcInert, TargetedCases) {
     EXPECT_EQ(nfkc_fold("《标题》、正文。"), "《标题》、正文。");
     EXPECT_EQ(nfkc_fold("全角，逗号"), "全角,逗号");      // 回退路径折叠
     EXPECT_EQ(nfkc_fold("ＧＰＵ测试"), "gpu测试");        // 全角字母回退折叠
+}
+
+// S38 回归：**会与邻居组合的起始字符不得进 inert 表**。
+//
+// 旧表的判据只有「NFKC_Casefold 恒等 + ccc == 0」，漏了第三条「不与邻居组合」。
+// 于是 U+1100/U+1161 这类 ccc 均为 0 的谚文 jamo 双双被判 inert，上下文无关的
+// 快路径把它们原样透传——同一个韩文词，预组合写法与分解写法产出不同 term，
+// 互相搜不到。换成 ICU 的 Normalizer2::isInert（含第三条）后此测试才成立。
+TEST(NfkcInert, ComposableStartersAreNotInert) {
+    using bitcask::text::detail::nfkc_casefold_inert;
+    using bitcask::text::detail::nfkc_fold;
+
+    // 表层面：这些码点必须被排除在快路径之外。
+    EXPECT_FALSE(nfkc_casefold_inert(0x1100));  // 谚文 CHOSEONG KIYEOK
+    EXPECT_FALSE(nfkc_casefold_inert(0x1161));  // 谚文 JUNGSEONG A
+    EXPECT_FALSE(nfkc_casefold_inert(0x09C7));  // 孟加拉 VOWEL SIGN E
+    EXPECT_FALSE(nfkc_casefold_inert(0x09BE));  // 孟加拉 VOWEL SIGN AA
+    EXPECT_FALSE(nfkc_casefold_inert(0x00E9));  // é（可再与组合符组合）
+
+    // 行为层面：必须真的合成。
+    EXPECT_EQ(nfkc_fold("\u1100\u1161"), "\uAC00");           // 가
+    EXPECT_EQ(nfkc_fold("\u1100\u1161\u11A8"), "\uAC01");     // 각
+    EXPECT_EQ(nfkc_fold("\u09C7\u09BE"), "\u09CB");
+    EXPECT_EQ(nfkc_fold("\u0061\u0301"), "\u00E1");           // a + ́ → á
+
+    // 预组合写法与分解写法必须归一到同一串（否则索引互相搜不到）。
+    EXPECT_EQ(nfkc_fold("\u1100\u1161"), nfkc_fold("\uAC00"));
+}
+
+// S38：非法 UTF-8 必须**有信号**。
+//
+// 改造前有两种静默失败：utf8proc 路径下整段文本变空（该文档零 term），
+// 而直接信任 ICU 的话它对非法字节原样透传（整段黏成一个乱码 term）。
+// 两者都不产生任何错误信息。现在统一为：状态回报 + U+FFFD 替换。
+TEST(NfkcFold, InvalidUtf8IsReported) {
+    using bitcask::text::detail::FoldStatus;
+    using bitcask::text::detail::nfkc_fold_checked;
+
+    std::string out;
+
+    // GB18030 的「测试」——合法 GBK，非法 UTF-8。
+    EXPECT_EQ(nfkc_fold_checked(std::string("\xB2\xE2\xCA\xD4"), out),
+              FoldStatus::kInvalidUtf8);
+    EXPECT_EQ(out, "\uFFFD\uFFFD\uFFFD\uFFFD");  // 逐字节替换，不吞后续
+
+    // 截断的多字节序列。
+    EXPECT_EQ(nfkc_fold_checked(std::string("\xE6\xB5"), out),
+              FoldStatus::kInvalidUtf8);
+
+    // 孤立续字节。
+    EXPECT_EQ(nfkc_fold_checked(std::string("a\x80" "b"), out),
+              FoldStatus::kInvalidUtf8);
+    EXPECT_EQ(out, "a\uFFFDb");
+
+    // 合法输入不得被误判。
+    EXPECT_EQ(nfkc_fold_checked("北京GPU测试", out), FoldStatus::kOk);
+    EXPECT_EQ(out, "北京gpu测试");
+    EXPECT_EQ(nfkc_fold_checked("", out), FoldStatus::kOk);
+    EXPECT_TRUE(out.empty());
+}
+
+// S38：手写严格解码器 vs ICU。decode_one 是分词热路径上每码点都要过的函数，
+// 且是本次自己实现的（不再用 utf8proc_iterate），必须逐码点 + 逐非法序列对拍。
+TEST(Utf8Decode, StrictAgainstIcuOracle) {
+    using bitcask::text::detail::decode_one;
+    using bitcask::text::detail::validate_utf8;
+
+    // ICU 的合法性判据：u_strFromUTF8 对病态输入置 U_INVALID_CHAR_FOUND。
+    auto icu_valid = [](std::string_view sv) {
+        UErrorCode ec = U_ZERO_ERROR;
+        std::int32_t need = 0;
+        u_strFromUTF8(nullptr, 0, &need, sv.data(),
+                      static_cast<std::int32_t>(sv.size()), &ec);
+        return ec == U_BUFFER_OVERFLOW_ERROR || U_SUCCESS(ec);
+    };
+
+    // (a) 全部标量值往返：编码后解回来必须是原码点，且吃掉全部字节。
+    for (char32_t cp = 0; cp <= 0x10FFFF; ++cp) {
+        if (cp >= 0xD800 && cp <= 0xDFFF) continue;
+        const auto u = encode_utf8(cp);
+        ASSERT_FALSE(u.empty()) << "cp=" << static_cast<std::uint32_t>(cp);
+        const auto [got, n] = decode_one(u);
+        ASSERT_EQ(n, u.size()) << "cp=" << static_cast<std::uint32_t>(cp);
+        ASSERT_EQ(got, cp);
+    }
+
+    // (b) 全部 1 字节与 2 字节序列穷举对拍合法性。
+    for (unsigned b0 = 0; b0 < 0x100; ++b0) {
+        const std::string s(1, static_cast<char>(b0));
+        EXPECT_EQ(validate_utf8(s), icu_valid(s)) << "b0=" << b0;
+    }
+    for (unsigned b0 = 0x80; b0 < 0x100; ++b0) {
+        for (unsigned b1 = 0; b1 < 0x100; ++b1) {
+            std::string s;
+            s.push_back(static_cast<char>(b0));
+            s.push_back(static_cast<char>(b1));
+            ASSERT_EQ(validate_utf8(s), icu_valid(s))
+                << "b0=" << b0 << " b1=" << b1;
+        }
+    }
+
+    // (c) 3 字节序列抽样（覆盖 overlong 与代理区两个经典陷阱）。
+    for (unsigned b0 = 0xE0; b0 <= 0xEF; ++b0) {
+        for (unsigned b1 = 0; b1 < 0x100; ++b1) {
+            for (unsigned b2 = 0x80; b2 <= 0xBF; b2 += 0x0D) {
+                std::string s;
+                s.push_back(static_cast<char>(b0));
+                s.push_back(static_cast<char>(b1));
+                s.push_back(static_cast<char>(b2));
+                ASSERT_EQ(validate_utf8(s), icu_valid(s))
+                    << "b0=" << b0 << " b1=" << b1 << " b2=" << b2;
+            }
+        }
+    }
+
+    // (d) 定向：经典病态序列一律非法。
+    const char* bad[] = {
+        "\xC0\x80",          // overlong NUL
+        "\xC1\xBF",          // overlong
+        "\xE0\x80\x80",      // overlong
+        "\xED\xA0\x80",      // 代理半区 U+D800
+        "\xF0\x80\x80\x80",  // overlong
+        "\xF5\x80\x80\x80",  // > U+10FFFF
+        "\xF8\x88\x80\x80\x80",  // 5 字节形式（已废止）
+        "\x80",              // 孤立续字节
+        "\xBF",
+        "\xFE", "\xFF",
+    };
+    for (const auto* p : bad) {
+        EXPECT_FALSE(validate_utf8(p)) << "seq=" << p;
+    }
 }
 
 // S31(下游反馈):max_token_bytes——超长 token(长 URL/模板块噪声)源头

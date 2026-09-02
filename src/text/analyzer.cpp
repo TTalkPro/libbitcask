@@ -19,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-#include <utf8proc.h>
+#include <unicode/uchar.h>
 
 namespace bitcask::text {
 
@@ -128,8 +128,10 @@ auto Analyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap
 namespace detail {
 
 [[nodiscard]] bool is_unicode_space(char32_t cp) noexcept {
-    auto cat = utf8proc_category(static_cast<utf8proc_int32_t>(cp));
-    if (cat == UTF8PROC_CATEGORY_ZS) return true;
+    // S38：utf8proc_category → ICU u_charType。两者都返回 Unicode 通用类别，
+    // UTF8PROC_CATEGORY_ZS 与 U_SPACE_SEPARATOR 同为 Zs，逐码点等价。
+    const auto cat = u_charType(static_cast<UChar32>(cp));
+    if (cat == U_SPACE_SEPARATOR) return true;
     if (cp == 0x09 || cp == 0x0A || cp == 0x0D || cp == 0x0B || cp == 0x0C) {
         return true;
     }
