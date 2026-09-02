@@ -130,7 +130,7 @@ plugin::PluginHost
 部署裁剪：
 
 - **纯 KV**：`bitcask_cask` 直接连 `bitcask_keydir + bitcask_fileops + bitcask_io + bitcask_format + bitcask_merge`，无任何搜索目标。
-- **KV + BM25**：`bitcask_cask` 链 `bitcask_hybrid`（hybrid 即时降级为仅 text 路径），下游只拉 `bitcask_text_plugin`，不链 `bitcask_vector / utf8proc / cppjieba` 之外的 HNSW 相关物。
+- **KV + BM25**：`bitcask_cask` 链 `bitcask_hybrid`（hybrid 即时降级为仅 text 路径），下游只拉 `bitcask_text_plugin`，不链 `bitcask_vector / ICU / cppjieba` 之外的 HNSW 相关物。
 - **KV + HNSW**：通过 `CaskOptions` 关 text 入口后，hnsw 仍可独立启用；消费者可主动卸载 `bitcask_text_plugin` 子依赖。
 - **完整搜索域**：`bitcask_text_plugin + bitcask_vector_plugin + bitcask_hybrid` 全部链入。
 

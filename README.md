@@ -206,7 +206,7 @@ ctest --preset msvc-debug
 
 | submodule | 来源 | 用途 |
 |-----------|------|------|
-| `third_party/utf8proc` | https://github.com/JuliaStrings/utf8proc | Unicode NFKC 归一化 + case fold |
+| `third_party/icu` | https://github.com/unicode-org/icu | Unicode NFKC_Casefold + 字符属性 + 编码转换。**可选**：标了 `update = none`，`--recursive` 会跳过它（380 MB）；只有 `BITCASK_ICU_PROVIDER=vendored` 或系统无 ICU 时才需要，见下 |
 | `third_party/cppjieba` | https://github.com/yanyiwu/cppjieba | 中文分词 |
 | `third_party/limonp` | https://github.com/yanyiwu/limonp | cppjieba 的 header-only 依赖 |
 | `third_party/googletest` | https://github.com/google/googletest | 测试（`BUILD_TESTING=ON` 时编） |
@@ -222,6 +222,78 @@ git clone --recurse-submodules <repo-url>
 # 已 clone 的仓库补拉 submodule
 git submodule update --init --recursive
 ```
+
+#### 文本编码：内部只吃 UTF-8
+
+库内部全程只认 UTF-8——分词、NFKC_Casefold 归一化、highlight 的 byte offset
+都以 UTF-8 码点边界为准。`put_doc` 的 `text` / `fields` 必须是 UTF-8。
+
+**要不要转码是调用方的决定**，库只提供机制（`bitcask/text_encoding.hpp`），
+不猜编码、不自动转换：
+
+```cpp
+#include "bitcask/text_encoding.hpp"
+using namespace bitcask::text;
+
+std::string utf8;
+if (transcode_to_utf8(gb18030_bytes, "GB18030", utf8) != TranscodeStatus::kOk) {
+    // 编码名不认识 / 输入是畸形序列 —— 由你决定是拒绝还是走 lenient
+}
+```
+
+编码名走 ICU 的转换器名与别名（`GB18030`、`GBK`、`Big5`、`Shift_JIS`、
+`EUC-KR`、`windows-1252` …），大小写与连字符不敏感；`encoding_supported()`
+可先探测。默认**严格**：遇畸形字节返回 `kMalformedInput` 而非静默替换成
+U+FFFD（ICU 转换器的出厂回调是 SUBSTITUTE，本层显式改成了 STOP）。
+`transcode_from_utf8()` 是反向。
+
+不转码直接喂非 UTF-8 字节不会崩，但那段文本的索引结果没有意义：非法序列被
+替换成 U+FFFD，整段退化成一个不可检索的 token——**存得进去、搜不出来**。
+拿不准就先过 `bitcask::text::detail::validate_utf8()`。
+
+注意 `key` / `value`（`get`/`put` 那条路）**不受**此约束：它们是不透明字节，
+库不做任何编码解释，GB18030 存进去原样取出来。
+
+#### ICU 的来源（`BITCASK_ICU_PROVIDER`）
+
+ICU 提供 NFKC_Casefold 归一化、Unicode 字符属性与编码转换（GB18030 等 → UTF-8）。
+它是**唯一默认走系统安装**的依赖——ICU 带约 30 MB 数据表，vendored 一份会让
+部署形态和发行版的安全补丁流都变样。三态显式可控：
+
+| 取值 | 行为 |
+|------|------|
+| `auto`（默认） | 先 `find_package(ICU)`；系统没有（或 < 60）才回落 `third_party/icu` |
+| `system` | 只用系统 ICU；找不到就**配置期报错**，绝不静默回落。发行版打包用 |
+| `vendored` | 只用 `third_party/icu`，跳过系统探测——即使系统装了也不用 |
+
+```bash
+cmake -S . -B build -DBITCASK_ICU_PROVIDER=vendored   # 强制用子模块里的 ICU
+cmake -S . -B build -DBITCASK_ICU_PROVIDER=system     # 只认系统 ICU
+```
+
+`vendored` 的典型场景：需要把 ICU 版本钉死以保证索引可复现（ICU 版本 = Unicode
+版本 = NFKC_Casefold 表 = 分词结果）、交叉编译、目标机无开发包、或系统 ICU 过老。
+这个子模块标了 `update = none`，所以 `git submodule update --init --recursive` **不会**
+拉它（380 MB，其余依赖加起来也没这么大）。要用 vendored 就显式拉：
+
+```bash
+git submodule update --init third_party/icu
+```
+
+ICU 自带 autoconf（Unix）/ MSBuild（Windows）构建，官方不提供 CMake，故由
+`ExternalProject_Add` 驱动它自己的构建系统——首次构建要额外花十几分钟编 ICU，
+且顶层的 warning / sanitizer / IPO flag 不传播进去（同 zlib/googletest 的处置）。
+
+**数据裁剪（`BITCASK_ICU_TRIM_DATA`，默认 ON）**：ICU 的完整数据表约 31 MB，
+静态打包会整块进 `libbitcask.so`（实测 1.7 MB → 34 MB）。本库只用归一化与编码
+转换，故默认按 `cmake/icu-data-filter.json` 裁掉 collation / 时区 / 区域数据 /
+音译 / 断词 / 货币 / 字符名。裁剪由 ICU 自己的 buildtool 完成，**需要 Python 3**；
+找不到 Python 3 会告警并回落全量数据。改那份清单后必须重跑
+`bitcask_text_encoding_test` 与 `bitcask_analyzer_test`——裁错了不会让构建失败，
+只会让归一化/转码在**运行期**静默失效。
+
+需要 ICU **≥ 60**（`Normalizer2::normalizeUTF8` 的引入版本）。只用 `uc` + `data`
+两个组件，不链 `i18n`。
 
 ```bash
 # Release 构建（含 LTO / -falign-functions=64 / _FORTIFY_SOURCE=2 / Full RELRO）

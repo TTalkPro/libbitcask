@@ -106,7 +106,7 @@
 └── doc/                     # 架构 / 格式 / 设计文档
 ```
 
-整个代码树使用 C++23，不依赖 Boost / abseil。第三方库（utf8proc / cppjieba / limonp / googletest / google-benchmark / oneTBB / unordered_dense）均以 **git submodule** 形式 vendored 在 `third_party/`，clone 后无需手动安装，构建无需联网。GoogleTest 与 Google Benchmark 仅在 `BUILD_TESTING=ON` / `BITCASK_BUILD_BENCHMARKS=ON` 开启时编译。
+整个代码树使用 C++23，不依赖 Boost / abseil。第三方库（cppjieba / limonp / googletest / google-benchmark / oneTBB / unordered_dense）均以 **git submodule** 形式 vendored 在 `third_party/`，clone 后无需手动安装，构建无需联网。**ICU 是例外**：默认走系统安装（`find_package(ICU)`），仅在系统缺失或显式指定 `BITCASK_ICU_PROVIDER=vendored` 时才用 `third_party/icu` 子模块现编（见 `cmake/BitcaskICU.cmake`）。GoogleTest 与 Google Benchmark 仅在 `BUILD_TESTING=ON` / `BITCASK_BUILD_BENCHMARKS=ON` 开启时编译。
 
 ## 分层结构与依赖
 
@@ -462,12 +462,12 @@ reducer 串行，读可与之并发。
 | `bitcask_vector_plugin` | STATIC | `src/search/vector_plugin.cpp` | `bitcask_vector`, `bitcask_format`, `bitcask_plugin_api` | VectorPlugin（HNSW 域） |
 | `bitcask_hybrid` | STATIC | `src/search/hybrid_searcher.cpp` | `bitcask_text_plugin`, `bitcask_vector_plugin` | HybridSearcher（RRF 融合器） |
 | `bitcask_merge` | STATIC | `src/merge/{merger,merge_policy}.cpp` | `bitcask_keydir`, `bitcask_fileops`, `bitcask_io`, `bitcask_format`, `bitcask_plugin_api` | 合并执行 + 纯函数策略 |
-| `bitcask_text` | STATIC | `src/text/{analyzer,jieba_analyzer}.cpp` | utf8proc, cppjieba, `generate_inert_table` | Analyzer 抽象基类 + Ngram + Jieba + 工厂 + 停用词 |
+| `bitcask_text` | STATIC | `src/text/{analyzer,jieba_analyzer,text_encoding}.cpp` | ICU(uc+data), cppjieba, `generate_inert_table` | Analyzer 抽象基类 + Ngram + Jieba + 工厂 + 停用词 + 编码转换 |
 | `bitcask_cask` | STATIC | `src/cask/{cask,cask_iter,cask_search,cask_recovery,meta_file,legacy_ckpt}.cpp` | `bitcask_keydir`, `bitcask_fileops`, `bitcask_io`, `bitcask_format`, `bitcask_merge`, `bitcask_hybrid`, TBB | Cask 高层门面（KV + 搜索 + 生命周期 + 元数据） |
 | `bitcask_shared` | SHARED | `c_api/{bitcask_kv,bitcask_text,bitcask_vec}.cpp` | `bitcask_cask` | `libbitcask.so`（C ABI，SOVERSION 3） |
 | `bitcask_static` | STATIC | 合并上述所有 STATIC 为单一 `libbitcask.a`（Windows：`bitcask_static.lib`）| — | 静态归档 |
 | `migrate_le` | EXECUTABLE | `tools/migrate_le.cpp` | `bitcask_fileops`, `bitcask_format`, `bitcask_io` | 大端 → 小端离线迁移工具（详见 `migrate-le.md`） |
-| `gen_inert_table` | EXECUTABLE | `tools/gen_inert_table.cpp` | utf8proc | 构建期 NFKC 惰性区间表生成器 |
+| `gen_inert_table` | EXECUTABLE | `tools/gen_inert_table.cpp` | ICU(uc+data) | 构建期 NFKC 惰性区间表生成器 |
 
 附加构建选项与目标：
 

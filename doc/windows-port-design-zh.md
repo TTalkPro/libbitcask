@@ -20,7 +20,7 @@
 | C API 导出宏 | `c_api/bitcask_kv.h:20-31` | 已有 `_WIN32` / `__declspec(dllexport|dllimport)` 分支 |
 | 延迟删除已有骨架 | `src/cask/cask.cpp:833-858` | `retire_files`/`drain_retired_files` 注释已写明「非 POSIX 删除语义下失败 → 放回队列重试」 |
 | 原子写已收敛 | `include/bitcask/detail/file_util.hpp` | T21 把 9 个站点归并到 `atomic_write_bytes` / `AtomicFileWriter` 两条路径 |
-| 依赖链干净 | — | zlib / oneTBB / googletest / benchmark / utf8proc / unordered_dense 均官方支持 Windows |
+| 依赖链干净 | — | zlib / oneTBB / googletest / benchmark / ICU / unordered_dense 均官方支持 Windows |
 
 **归并的历史投资在这里直接兑现**：mmap 从 7 处收到 1 处、原子写从 9 处收到 2 处，
 使 C 段（系统调用移植）的攻击面比未归并前小一个数量级。
