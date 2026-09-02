@@ -939,6 +939,15 @@ if(BITCASK_ICU_VENDORED)
     install(FILES ${BITCASK_ICU_VENDORED_LIBS}
         DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )
+    # Windows 上 ICU 只有 DLL 一种形态（allinone.sln 全是 DynamicLibrary，
+    # 见 cmake/BitcaskICU.cmake §2a）。上面装进 lib/ 的是**导入库**，真正的
+    # icuuc<major>.dll / icudt<major>.dll 必须与 exe 同目录才加载得到，故走
+    # BINDIR。Unix 的 vendored ICU 是静态库，这个变量为空，整条不生成。
+    if(BITCASK_ICU_VENDORED_DLLS)
+        install(FILES ${BITCASK_ICU_VENDORED_DLLS}
+            DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+    endif()
     install(DIRECTORY "${BITCASK_ICU_VENDORED_INCLUDE}/unicode"
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
         FILES_MATCHING PATTERN "*.h"

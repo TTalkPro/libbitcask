@@ -274,15 +274,42 @@ cmake -S . -B build -DBITCASK_ICU_PROVIDER=system     # 只认系统 ICU
 `vendored` 的典型场景：需要把 ICU 版本钉死以保证索引可复现（ICU 版本 = Unicode
 版本 = NFKC_Casefold 表 = 分词结果）、交叉编译、目标机无开发包、或系统 ICU 过老。
 这个子模块标了 `update = none`，所以 `git submodule update --init --recursive` **不会**
-拉它（380 MB，其余依赖加起来也没这么大）。要用 vendored 就显式拉：
+拉它（380 MB，其余依赖加起来也没这么大）。要用 vendored 就显式拉——注意
+`update = none` 会让**普通的 `--init` 也静默跳过**（只打印 `Skipping submodule`，
+退出码 0），必须用 `-c` 就地覆盖：
 
 ```bash
-git submodule update --init third_party/icu
+git -c submodule.third_party/icu.update=checkout \
+    submodule update --init --depth 1 third_party/icu
 ```
 
 ICU 自带 autoconf（Unix）/ MSBuild（Windows）构建，官方不提供 CMake，故由
 `ExternalProject_Add` 驱动它自己的构建系统——首次构建要额外花十几分钟编 ICU，
 且顶层的 warning / sanitizer / IPO flag 不传播进去（同 zlib/googletest 的处置）。
+用 CPM.cmake / FetchContent 换掉这段也不行：上游 ICU 树里没有任何
+`CMakeLists.txt`，而社区仅有的两个 CMake 移植都不覆盖本项目要的组合
+（[LibCMaker/ICU_CMake_Files](https://github.com/LibCMaker/ICU_CMake_Files) 停在
+ICU 63 且仓库已归档；[viaduck/icu-cmake](https://github.com/viaduck/icu-cmake)
+的 Windows 预编译产物是 MinGW-w64 的、与 MSVC ABI 不兼容，源码构建走的还是
+autoconf）。
+
+**Windows / MSVC 上的 vendored ICU**：ICU 的 `allinone.sln` 里所有工程都是
+`DynamicLibrary`，官方**没有静态配置**，所以这条路产出的是
+`icuuc<major>.dll` + `icudt<major>.dll` 与两个导入库（Unix 侧则是静态
+`libicuuc.a` + `libicudata.a`）。两个 DLL 会被自动复制到 `<build>/bin/`，
+`install` 时进 `bin/`。除 MSBuild 外还**必须有 Python 3**——ICU 的
+`source/data/makedata.mak` 把整个数据构建交给了 `py -3 -m icutools.databuilder`，
+与 `BITCASK_ICU_TRIM_DATA` 开关无关；机器上没有可用的 `py` launcher 时，构建系统
+会自动生成一个转发到 CMake 找到的 Python 的垫片。相关旋钮（都可留空自动探测）：
+
+| 变量 | 作用 |
+|------|------|
+| `BITCASK_ICU_MSBUILD` | `MSBuild.exe` 路径。默认按 `CMAKE_VS_MSBUILD_COMMAND` → `PATH` → `vswhere` 顺序找 |
+| `BITCASK_ICU_MSVC_TOOLSET` | 编 ICU 用的 `PlatformToolset`。默认跟随本次构建的工具集。ICU 76 自带的 props 只认到 `v143`（VS 2022），更新的 VS 必须显式喂，否则 MSBuild 报 `Platform Toolset = ''` |
+| `BITCASK_ICU_MSVC_CONFIG` | `Debug` / `Release`。默认跟随 `CMAKE_BUILD_TYPE`——ICU 的 Debug 用 `/MDd`、Release 用 `/MD`，务必与本次构建的 CRT 一致 |
+
+MSBuild 只能在 ICU 源码树里就地构建（vcxproj 把产物路径写死成 `..\..\bin64` 等），
+故 vendored 构建会弄脏 `third_party/icu` 工作区，属预期。
 
 **数据裁剪（`BITCASK_ICU_TRIM_DATA`，默认 ON）**：ICU 的完整数据表约 31 MB，
 静态打包会整块进 `libbitcask.so`（实测 1.7 MB → 34 MB）。本库只用归一化与编码
