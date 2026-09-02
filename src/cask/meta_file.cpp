@@ -24,8 +24,13 @@ inline constexpr std::size_t kMetaVecDimOffset    = 7;  // u16 LE
 inline constexpr std::size_t kMetaVecQuantOffset  = 9;  // P3b：u8 0/1（旧文件全零=否）
 inline constexpr std::size_t kMetaVecInmemInt8Offset = 10;  // P5b：u8 0/1（旧文件全零=否）
 inline constexpr std::size_t kMetaVecEngineOffset = 11;  // S32-M0：u8（旧文件全零=kHnsw）
+// S38：建索引时的 Unicode 数据版本（旧文件全零 = 未记录 → 重开时跳过比对）。
+// 落在 CRC 覆盖区 [0,14) 内，故与其余字段同受校验保护。用掉保留区最后两个
+// 空闲字节——再加字段就必须扩文件长度并 bump 版本了。
+inline constexpr std::size_t kMetaIcuMajorOffset     = 12;
+inline constexpr std::size_t kMetaUnicodeMajorOffset = 13;
 // v3(S12)：保留区偏移 14 起放 CRC32(u32 LE)，覆盖前 14 字节(magic+version+mode+
-// 向量配置+保留 11-13)。CRC 字段自身不被覆盖。
+// 向量配置+S38 的 Unicode 版本记录 12-13)。CRC 字段自身不被覆盖。
 inline constexpr std::size_t kMetaCrcOffset   = 14;
 inline constexpr std::size_t kMetaCrcCoverLen = 14;  // CRC 覆盖 [0, 14)
 inline constexpr std::size_t kMetaFileSize = kMetaMagicSize + 1 + 1 + kMetaReservedSize;  // 18 bytes
@@ -143,6 +148,13 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
         return std::unexpected(MetaError{0, "unknown vector engine"});
     }
     cfg.vector_engine = static_cast<VectorEngine>(engine_val);
+    // S38：Unicode 数据版本。任何值都合法（含 0 = 未记录）——这是**诊断信息，
+    // 不是纪元门禁**，不做 fail-fast：未知的新版本号只该让人看到告警，不该
+    // 让目录打不开。比对与告警在 Cask::open（见 cask.cpp）。
+    cfg.icu_major =
+        static_cast<std::uint8_t>(header[kMetaIcuMajorOffset]);
+    cfg.unicode_major =
+        static_cast<std::uint8_t>(header[kMetaUnicodeMajorOffset]);
     return cfg;
 }
 
@@ -162,6 +174,11 @@ std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaCo
         static_cast<char>(config.vector_inmem_int8 ? 1 : 0);
     header[kMetaVecEngineOffset] =
         static_cast<char>(config.vector_engine);  // S32-M0（CRC 覆盖区内）
+    // S38：原样写出 config 给的值（0 = 未记录）。**不在这里取当前运行时
+    // 版本**——write_meta 也被懒升级（v5→v6）等路径调用，那样会把建索引时
+    // 的原始记录覆盖成当次运行的版本，比对从此恒相等、告警永不触发。
+    header[kMetaIcuMajorOffset] = static_cast<char>(config.icu_major);
+    header[kMetaUnicodeMajorOffset] = static_cast<char>(config.unicode_major);
     header[kMetaVersionOffset] = static_cast<char>(config.version);  // S35：5/6
     header[kMetaModeOffset] = static_cast<char>(
         config.mode == Mode::kKV ? 0 : 1);

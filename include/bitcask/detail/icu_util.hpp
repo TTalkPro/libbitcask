@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -83,6 +84,29 @@ namespace bitcask::text::detail {
 [[nodiscard]] inline const char* icu_version() noexcept { return U_ICU_VERSION; }
 [[nodiscard]] inline const char* icu_unicode_version() noexcept {
     return U_UNICODE_VERSION;
+}
+
+// "16.0" / "76.1" 一类版本串的前导整数。constexpr——下面两个访问器要在编译期
+// 求值，落进 meta 时不该有运行期开销。
+[[nodiscard]] constexpr std::uint8_t leading_uint(const char* s) noexcept {
+    unsigned v = 0;
+    for (; *s >= '0' && *s <= '9'; ++s) {
+        v = v * 10 + static_cast<unsigned>(*s - '0');
+        if (v > 255) return 255;  // 饱和：u8 装不下就钉在 255（远期才可能）
+    }
+    return static_cast<std::uint8_t>(v);
+}
+
+// 主版本号，供 bitcask.meta 记录（见 meta_file.hpp 的 icu_major /
+// unicode_major）。存主版本而非完整串的理由：meta 是固定 18 字节、只剩
+// 2 个空闲字节的格式，而**主版本已经足够做判别**——ICU 主版本与 Unicode
+// 版本是一一对应的（ICU 74 = Unicode 15.1，ICU 76 = Unicode 16.0），所以
+// ICU 主版本一致就意味着 NFKC_Casefold 表一致。
+[[nodiscard]] constexpr std::uint8_t icu_major_version() noexcept {
+    return static_cast<std::uint8_t>(U_ICU_VERSION_MAJOR_NUM);
+}
+[[nodiscard]] constexpr std::uint8_t unicode_major_version() noexcept {
+    return leading_uint(U_UNICODE_VERSION);
 }
 
 }  // namespace bitcask::text::detail
