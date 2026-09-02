@@ -5,12 +5,78 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.2.0`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.3.0`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
+
+---
+
+## [6.3.0] - 2026-09-02（S38：Unicode 层由 utf8proc 迁至 ICU；新增编码转换）
+
+> **版本语义**：C API 零变化——自 6.2.2 起 `c_api/` 下**一个字节都没动**
+> （`git diff 6.2.2..HEAD -- c_api/` 为空）→ MINOR +1，**`SOVERSION` 保持 `6`**
+> （`.so.6` 不换号，下游无需重新链接）。
+> 盘上格式**不 bump**：`bitcask.meta` 仍是 `v5`（用原子批的目录懒升 `v6`），
+> S38 的 Unicode 版本记录占用的是保留区里两个**原本就空闲**的字节（偏移
+> 12-13，落在既有 CRC 覆盖区 `[0,14)` 内）。旧目录读出来是 `0` = 未记录，
+> 新旧双向兼容，**无 flag-day、无迁移**。
+
+### Added
+
+- **ICU 取代 utf8proc 作为 Unicode 层（S38）**。`third_party/utf8proc` 换成
+  `third_party/icu`（submodule，钉 `release-78.3`；标了 `update = none`，
+  `--recursive` 不拉它）。
+  - NFKC_Casefold 归一化改走 `icu::Normalizer2::normalizeUTF8`——直接吃 UTF-8，
+    省掉 utf8proc 路径上的 UTF-16 往返。接入层集中在
+    `include/bitcask/detail/icu_util.hpp`，全库唯一直接摸 ICU C++ API 的地方。
+  - 字符属性 `utf8proc_category` → `u_charType`（两者同为 Unicode 通用类别，
+    逐码点等价）。
+- **文本编码转换（`src/text/text_encoding.cpp`）**：走 ICU 的 `ucnv_*`，把
+  GB18030 / GBK / Big5 / Shift_JIS 等转成 UTF-8 再入索引。编码名走 ICU 的
+  转换器名与别名；转换器出厂回调是 SUBSTITUTE，本层显式改成 STOP——非法输入
+  报错而不是静默变 U+FFFD。
+- **Unicode / ICU 版本记入索引元数据**：建索引时把两个 major 写进
+  `bitcask.meta` 的保留字节，重开时不一致则**告警**。刻意不做 fail-fast——
+  这是诊断信息、不是纪元门禁，未知版本号不该让目录打不开。
+- **`cmake/BitcaskICU.cmake`**：ICU 来源三态可控 `BITCASK_ICU_PROVIDER`
+  = `auto`（默认，系统优先、回落 vendored）/ `system`（找不到就配置期报错）/
+  `vendored`（只用子模块）。只用 `uc` + `data` 两个组件，不链 `i18n`。
+- **Windows/MSVC 的 vendored ICU 支持**（ICU 官方在 Windows 只提供 MSBuild
+  解决方案，无 CMake）：MSBuild 经 `CMAKE_VS_MSBUILD_COMMAND` → `PATH` →
+  `vswhere` 三级探测；显式指定 `PlatformToolset`（ICU 自带的 props 只认到
+  `v143`，更新的 VS 会落空报 `Platform Toolset = ''`）；ICU 配置跟随
+  `CMAKE_BUILD_TYPE` 以对齐 CRT；两个 ICU DLL 自动进 `<build>/bin/` 与
+  `install` 的 `bin/`。新增旋钮 `BITCASK_ICU_MSBUILD` /
+  `BITCASK_ICU_MSVC_TOOLSET` / `BITCASK_ICU_MSVC_CONFIG`。
+
+### Changed
+
+- **`BITCASK_ICU_TRIM_DATA` 默认由 `ON` 改为 `OFF`**，即默认用全量 ICU 数据
+  （约 31 MB，裁剪版约 5.5 MB）。理由是风险不对等：裁多了**不会让构建失败**，
+  只会让归一化或某个编码在**运行期**静默失效；而
+  `cmake/icu-data-filter.json` 里写的是 ICU 的**内部 category 名**，跨大版本
+  会改（ICU 78 已对其中的 `brkitr_treedict` / `coll_tree` 报“category 不存在”，
+  且只是 warning、不中断）。为省 25 MB 背这个不划算。需要时显式
+  `-DBITCASK_ICU_TRIM_DATA=ON`。
+
+### Fixed
+
+- **`inert_table.hpp` 跨 ICU 版本的构建安全**。这份 NFKC inert 区间表是**生成
+  物却放在源码树里**，被所有构建树共享，而它的内容取决于生成器链接的那个 ICU
+  的版本（system 与 vendored 可以不同版本）。原先的
+  `add_custom_command(OUTPUT ...)` 只按“生成器是否比产物新”判定，另一棵树刚写
+  过表之后本树就会跳过重新生成，**拿着别人 ICU 版本的表编译自己的 TU**。改为
+  `add_custom_target(... ALL)` 每次构建都跑，由生成器自己“内容不变就不落盘”
+  来避免无谓的下游重编。
+  - `tests/analyzer_test.cpp` 直接 include 这份生成的头，补上对
+    `generate_inert_table` 的显式依赖——换成 custom target 后，消费者不再能经
+    **文件**拿到隐式依赖，缺这条边时 ninja 可以在同一次构建里先编测试、后生成表。
+  - `NfkcInert.TableOracleExhaustive` 改为**双向**校验（表说 inert 的码点确实
+    inert，且表中每个成员确实 NFKC-casefold 不变），版本错配当场变红而不是靠
+    一张陈旧的表静默通过。
 
 ---
 
