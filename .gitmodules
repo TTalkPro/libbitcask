@@ -14,10 +14,6 @@
 	path = third_party/benchmark
 	url = https://github.com/google/benchmark.git
 	shallow = true
-[submodule "third_party/utf8proc"]
-	path = third_party/utf8proc
-	url = https://github.com/JuliaStrings/utf8proc.git
-	shallow = true
 [submodule "third_party/oneTBB"]
 	path = third_party/oneTBB
 	url = https://github.com/uxlfoundation/oneTBB.git
@@ -29,3 +25,9 @@
 	path = third_party/zlib
 	url = https://github.com/madler/zlib.git
 	shallow = true
+[submodule "third_party/icu"]
+	path = third_party/icu
+	url = https://github.com/unicode-org/icu
+	branch = maint/maint-76
+	shallow = true
+	update = none
