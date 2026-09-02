@@ -259,6 +259,26 @@ struct TextSearchResult {
 
 // put_doc 的输入结构：text 是必须的，meta 可选。
 // S8.6：fields 非空时走多字段路径（编码进 DocValue v2 fields 段 + 多字段索引）。
+//
+// === 编码契约（S38）===
+// **text / fields 的值必须是 UTF-8。** 库内部全程只认 UTF-8——分词、
+// NFKC_Casefold 归一化、highlight 的 byte offset 都以 UTF-8 码点边界为准。
+//
+// 要不要转码是**调用方的决定**，库只提供机制，不猜编码、不自动转换：
+//
+//     #include "bitcask/text_encoding.hpp"
+//     std::string utf8;
+//     if (bitcask::text::transcode_to_utf8(raw, "GB18030", utf8)
+//             != bitcask::text::TranscodeStatus::kOk) { /* 拒绝这条文档 */ }
+//     doc.text = as_bytes(utf8);
+//
+// 不转码直接喂非 UTF-8 字节（GB18030、Big5、windows-1252 …）不会崩，但那段
+// 文本的索引结果没有意义：非法序列会被替换成 U+FFFD，整段退化成一个不可检索
+// 的 token。这是**静默**的——存得进去、搜不出来，没有任何错误信号会浮到这一层。
+// 拿不准输入是否合法时，先过 bitcask::text::detail::validate_utf8()。
+//
+// 注：key / value（get/put 那条路）**不受**此约束——它们全程是不透明字节，
+// 库不做任何编码解释。约束只在进索引的文本上。
 struct DocInput {
     std::span<const std::byte> text;    // required（多字段时可空，作默认字段）
     std::span<const std::byte> meta;    // optional

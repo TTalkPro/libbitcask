@@ -5,7 +5,7 @@
 //      稳态 alloc/doc 应显著低于冷启动——A4 前「每文档 × 每字段一次 owning string」
 //      变为 A4 后「首次 N 字段 intern，之后零字段名分配」。
 //
-// 编译：见配套 run 脚本。链接：libbitcask.a + libtbb + utf8proc + zlib。
+// 编译：见配套 run 脚本。链接：libbitcask.a + libtbb + ICU(icuuc+icudata) + zlib。
 
 #include <atomic>
 #include <chrono>

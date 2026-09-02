@@ -1,7 +1,7 @@
 // S10-A1 ad-hoc micro-bench（不依赖 google benchmark）。
 // 直接量化缓存命中 / 未命中路径的 per-query 耗时，对比 CJK vs Latin。
 //
-// 编译：见配套 run 脚本。链接：libbitcask.a + libtbb + utf8proc + zlib。
+// 编译：见配套 run 脚本。链接：libbitcask.a + libtbb + ICU(icuuc+icudata) + zlib。
 
 #include <chrono>
 #include <cstdint>
