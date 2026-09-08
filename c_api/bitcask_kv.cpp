@@ -290,27 +290,50 @@ BITCASK_API void bitcask_get_result_free(bitcask_get_result_t* result) {
     std::free(result);
 }
 
-BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
-                                              bitcask_slice_t key,
-                                              const bitcask_doc_input_t* doc,
-                                              uint64_t tstamp,
-                                              bitcask_fault_t* fault) {
-    // S13-M2：extern "C" 异常隔离
-    return guarded(fault, [&]() -> bitcask_error_t {
-    if (!cask || !doc) return BITCASK_ERR_INVALID_OPTION;
-    if (!slice_valid(key) || !slice_valid(doc->text) ||
-        !slice_valid(doc->meta)) return BITCASK_ERR_INVALID_OPTION;  // S25-M2
+// S39：put_doc / put_doc_ex 的公共实现——两个入口只在「有没有 fields」上
+// 分叉，其余（校验、span 转换、错误映射）逐字相同，故收编成一份。
+namespace {
+
+bitcask_error_t put_doc_common(bitcask_t* cask,
+                               bitcask_slice_t key,
+                               bitcask_slice_t text,
+                               bitcask_slice_t meta_slice,
+                               const float* vector,
+                               size_t vector_len,
+                               uint64_t expiry_at,
+                               const bitcask_doc_field_t* fields,
+                               size_t fields_count,
+                               uint64_t tstamp,
+                               bitcask_fault_t* fault) {
+    if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    if (!slice_valid(key) || !slice_valid(text) ||
+        !slice_valid(meta_slice)) return BITCASK_ERR_INVALID_OPTION;  // S25-M2
+    if (fields_count > 0 && !fields) return BITCASK_ERR_INVALID_OPTION;
 
     std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
     bitcask::DocInput doc_input;
-    doc_input.text = {static_cast<const std::byte*>(doc->text.data), doc->text.size};
-    if (doc->meta.data && doc->meta.size > 0) {
-        doc_input.meta = {static_cast<const std::byte*>(doc->meta.data), doc->meta.size};
+    doc_input.text = {static_cast<const std::byte*>(text.data), text.size};
+    if (meta_slice.data && meta_slice.size > 0) {
+        doc_input.meta = {static_cast<const std::byte*>(meta_slice.data), meta_slice.size};
     }
-    if (doc->vector && doc->vector_len > 0) {
-        doc_input.vector = {doc->vector, doc->vector_len};
+    if (vector && vector_len > 0) {
+        doc_input.vector = {vector, vector_len};
     }
-    doc_input.expiry_at = doc->expiry_at;  // S13-D5
+    doc_input.expiry_at = expiry_at;  // S13-D5
+
+    // S39：字段名要按值拷进 DocInput（C++ 侧是 std::string，intern 时才用），
+    // 字段值保持零拷贝 span——借调用方存储，put_doc 返回前用完。
+    doc_input.fields.reserve(fields_count);
+    for (size_t i = 0; i < fields_count; ++i) {
+        const auto& f = fields[i];
+        if (!slice_valid(f.name) || !slice_valid(f.value)) {
+            return BITCASK_ERR_INVALID_OPTION;
+        }
+        doc_input.fields.emplace_back(
+            std::string(static_cast<const char*>(f.name.data), f.name.size),
+            std::span<const std::byte>{static_cast<const std::byte*>(f.value.data),
+                                       f.value.size});
+    }
 
     auto result = as_cpp_cask(cask)->put_doc(key_span, doc_input, tstamp);
     if (!result) {
@@ -318,6 +341,35 @@ BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
         return to_c_error_kind(result.error().kind);
     }
     return BITCASK_OK;
+}
+
+}  // namespace
+
+BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
+                                              bitcask_slice_t key,
+                                              const bitcask_doc_input_t* doc,
+                                              uint64_t tstamp,
+                                              bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!doc) return BITCASK_ERR_INVALID_OPTION;
+    return put_doc_common(cask, key, doc->text, doc->meta, doc->vector,
+                          doc->vector_len, doc->expiry_at,
+                          /*fields*/ nullptr, /*fields_count*/ 0, tstamp, fault);
+    });
+}
+
+// S39：多字段写入。fields_count==0 时与 bitcask_put_doc 完全同义。
+BITCASK_API bitcask_error_t bitcask_put_doc_ex(bitcask_t* cask,
+                                              bitcask_slice_t key,
+                                              const bitcask_doc_input_ex_t* doc,
+                                              uint64_t tstamp,
+                                              bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!doc) return BITCASK_ERR_INVALID_OPTION;
+    return put_doc_common(cask, key, doc->text, doc->meta, doc->vector,
+                          doc->vector_len, doc->expiry_at,
+                          doc->fields, doc->fields_count, tstamp, fault);
     });
 }
 
@@ -476,6 +528,15 @@ BITCASK_API void bitcask_search_result_free(bitcask_search_result_t* result) {
     for (std::size_t i = 0; i < result->count; ++i) {
         std::free(result->hits[i].key);
     }
+    std::free(result->hits);
+    std::free(result);
+}
+
+// S39：高亮结果释放。逐 hit 放 key + 片段文本 + 片段数组（物化侧
+// internal.h::to_search_result_ex 的镜像；OOM 回滚也走同一个 free_hit_ex_range）。
+BITCASK_API void bitcask_search_result_ex_free(bitcask_search_result_ex_t* result) {
+    if (!result) return;
+    free_hit_ex_range(result->hits, result->count);
     std::free(result->hits);
     std::free(result);
 }
@@ -907,6 +968,168 @@ BITCASK_API void bitcask_flush_index(bitcask_t* cask) {
     if (!cask) return;
     as_cpp_cask(cask)->flush_index();
     } catch (...) {
+    }
+}
+
+
+/* ===========================================================================
+ *  Meta 编解码（S39）——纯函数，不碰 cask 句柄
+ * ========================================================================= */
+
+namespace {
+
+void set_invalid(bitcask_fault_t* fault, const char* msg) {
+    if (!fault) return;
+    fault->code = BITCASK_ERR_INVALID_OPTION;
+    fault->errnum = 0;
+    snprintf(fault->detail, BITCASK_DETAIL_MAX, "%s", msg);
+}
+
+}  // namespace
+
+BITCASK_API bitcask_error_t bitcask_meta_encode(const bitcask_meta_entry_t* entries,
+                                              size_t n,
+                                              bitcask_slice_t* out_blob,
+                                              bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!out_blob) return BITCASK_ERR_INVALID_OPTION;
+    out_blob->data = nullptr;
+    out_blob->size = 0;
+    if (n == 0) return BITCASK_OK;  // 空 blob = 「不带 meta」，无需 free
+    if (!entries) return BITCASK_ERR_INVALID_OPTION;
+
+    std::vector<meta::MetaEntry> es;
+    es.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (!entries[i].key) {
+            set_invalid(fault, "bitcask_meta_encode: entry key is NULL");
+            return BITCASK_ERR_INVALID_OPTION;
+        }
+        meta::MetaEntry e;
+        e.key = entries[i].key;
+        if (!to_cpp_meta_value(entries[i].value, e.value)) {
+            set_invalid(fault, "bitcask_meta_encode: bad value type or NULL string");
+            return BITCASK_ERR_INVALID_OPTION;
+        }
+        es.push_back(std::move(e));
+    }
+
+    // 格式不变式：key 字典序升序 + 无重复（meta_lookup 靠它提前退出）。
+    // 排序由本层做——不外泄给调用方；重复 key 则是真错误：encode_meta 只有
+    // assert 兜底，Release（NDEBUG）下放过去就是运行期**静默**的过滤失配。
+    std::sort(es.begin(), es.end(),
+              [](const meta::MetaEntry& a, const meta::MetaEntry& b) {
+                  return a.key < b.key;
+              });
+    for (size_t i = 1; i < es.size(); ++i) {
+        if (es[i - 1].key == es[i].key) {
+            char msg[BITCASK_DETAIL_MAX];
+            snprintf(msg, sizeof(msg),
+                     "bitcask_meta_encode: duplicate meta key: %s",
+                     es[i].key.c_str());
+            set_invalid(fault, msg);
+            return BITCASK_ERR_INVALID_OPTION;
+        }
+    }
+
+    std::vector<std::byte> blob;
+    meta::encode_meta(blob, es);
+    if (blob.empty()) return BITCASK_OK;
+
+    void* buf = std::malloc(blob.size());
+    if (!buf) {
+        if (fault) {
+            fault->code = BITCASK_ERR_IO;
+            fault->errnum = ENOMEM;
+            snprintf(fault->detail, BITCASK_DETAIL_MAX, "out of memory");
+        }
+        return BITCASK_ERR_IO;
+    }
+    std::memcpy(buf, blob.data(), blob.size());
+    out_blob->data = buf;
+    out_blob->size = blob.size();
+    return BITCASK_OK;
+    });
+}
+
+BITCASK_API void bitcask_meta_blob_free(bitcask_slice_t* blob) {
+    if (!blob) return;
+    if (blob->data) std::free(const_cast<void*>(blob->data));
+    blob->data = nullptr;
+    blob->size = 0;
+}
+
+BITCASK_API int bitcask_meta_iter_begin(bitcask_slice_t blob,
+                                        bitcask_meta_iter_t* it) {
+    try {
+    if (!it) return 0;
+    it->offset = 0;
+    it->remaining = 0;
+    if (!slice_valid(blob) || blob.size < 2) return 0;
+    const auto span = to_span(blob);
+    if (static_cast<std::uint8_t>(span[0]) != meta::kMetaFormatVersion) return 0;
+    auto n_vr = bitcask::codec::vbyte_read_checked(span, 1);
+    if (!n_vr) return 0;
+    it->remaining = n_vr->first;
+    it->offset = n_vr->second;
+    return it->remaining > 0 ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+BITCASK_API int bitcask_meta_iter_next(bitcask_slice_t blob,
+                                       bitcask_meta_iter_t* it,
+                                       bitcask_slice_t* out_key,
+                                       bitcask_meta_value_view_t* out_value) {
+    try {
+    if (!it || it->remaining == 0) return 0;
+    if (!slice_valid(blob)) return 0;
+    const auto span = to_span(blob);
+    MetaEntryRaw raw;
+    if (!meta_parse_entry(span, it->offset, raw)) {
+        it->remaining = 0;  // 损坏：就地收尾（与 meta_lookup 的容错一致）
+        return 0;
+    }
+    if (out_key) {
+        out_key->data = raw.key.data();
+        out_key->size = raw.key.size();
+    }
+    if (out_value) *out_value = raw.value;
+    it->offset = raw.next;
+    --it->remaining;
+    return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+BITCASK_API int bitcask_meta_lookup(bitcask_slice_t blob,
+                                    const char* key,
+                                    bitcask_meta_value_view_t* out_value) {
+    try {
+    if (out_value) *out_value = bitcask_meta_value_view_t{};
+    if (!key) return 0;
+
+    // 走与 iter 同一个解析器；差别只在「key 升序 ⟹ 遇到更大的即可提前退出」，
+    // 与 C++ meta_lookup 的剪枝同构。
+    const std::string_view want(key);
+    bitcask_meta_iter_t it;
+    if (!bitcask_meta_iter_begin(blob, &it)) return 0;
+    bitcask_slice_t k;
+    bitcask_meta_value_view_t v;
+    while (bitcask_meta_iter_next(blob, &it, &k, &v)) {
+        const std::string_view ek(static_cast<const char*>(k.data), k.size);
+        const int cmp = ek.compare(want);
+        if (cmp > 0) return 0;  // 升序：后面只会更大
+        if (cmp == 0) {
+            if (out_value) *out_value = v;
+            return 1;
+        }
+    }
+    return 0;
+    } catch (...) {
+        return 0;
     }
 }
 

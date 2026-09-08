@@ -100,6 +100,49 @@ BITCASK_API bitcask_error_t bitcask_search_text_filtered(
     const bitcask_meta_filter_t* filter,
     bitcask_search_result_t** out, bitcask_fault_t* fault);
 
+/* ===========================================================================
+ *  分页（S39）——C++ 侧 search_text / search_phrase / bool_search 一直有
+ *  offset 参数（S13-D10），C 侧此前三个函数全无，纯 C 调用方做不了分页。
+ *
+ *  additive 新符号，既有四个函数签名零改动。
+ *
+ *  offset = 跳过排名前 offset 条。实现是 overfetch k+offset 后截断——**深分页
+ *  成本线性增长**，offset 很大时应改用别的方案（如按 score/ord 游标）。
+ *  另：本 API **不提供总命中数**——WAND/BMW 剪枝下 total 只能给下界，误导大于
+ *  价值（C++ 侧同样不给，见 cask.hpp S13-D10 注）。
+ * ========================================================================= */
+
+/* search_text 的全参版：filter 与 offset 都能给。filter == NULL 等价无过滤，
+ * offset == 0 等价 bitcask_search_text——即本函数是既有两个 text 入口的超集。
+ * 注意 filter 非空时**没有 meta 段的文档一律不通过**（同 *_filtered）。 */
+BITCASK_API bitcask_error_t bitcask_search_text_ex(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+/* 短语/布尔搜索的分页版（C++ 侧这两个没有 filter 形参，故只加 offset）。 */
+BITCASK_API bitcask_error_t bitcask_search_phrase_ex(
+    bitcask_t* cask, const char* query, size_t k, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_bool_search_ex(
+    bitcask_t* cask, const char* query, size_t k, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+/* ===========================================================================
+ *  高亮检索（S39）——补上 C++ Cask::search_text_highlight（S13-D3）的 C 表示
+ * ========================================================================= */
+
+/* BM25 词袋搜索 + 高亮片段。语义同 bitcask_search_text，额外为每条命中生成
+ * 片段（结果类型/所有权/LRU 降级语义见 bitcask_kv.h 的 bitcask_search_result_ex_t）。
+ *   opts : NULL = 全默认（<em>/</em>、fragment_size=120、max_fragments=3）
+ *   out  : 成功时 *out 指向新建结果，调用方须调 bitcask_search_result_ex_free
+ * 线程安全：是（并发读安全，同 bitcask_search_text）。 */
+BITCASK_API bitcask_error_t bitcask_search_text_highlight(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_highlight_options_t* opts,
+    bitcask_search_result_ex_t** out, bitcask_fault_t* fault);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

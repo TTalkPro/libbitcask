@@ -14,15 +14,16 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ---
 
-## [6.3.0] - 2026-09-02（S38：Unicode 层由 utf8proc 迁至 ICU；新增编码转换）
+## [6.3.0] - 2026-09-08（S38：Unicode 层由 utf8proc 迁至 ICU · 新增编码转换；S39：C API 补齐——多字段写入 · meta 编解码 · 检索分页 · 高亮）
 
-> **版本语义**：C API 零变化——自 6.2.2 起 `c_api/` 下**一个字节都没动**
-> （`git diff 6.2.2..HEAD -- c_api/` 为空）→ MINOR +1，**`SOVERSION` 保持 `6`**
-> （`.so.6` 不换号，下游无需重新链接）。
-> 盘上格式**不 bump**：`bitcask.meta` 仍是 `v5`（用原子批的目录懒升 `v6`），
-> S38 的 Unicode 版本记录占用的是保留区里两个**原本就空闲**的字节（偏移
-> 12-13，落在既有 CRC 覆盖区 `[0,14)` 内）。旧目录读出来是 `0` = 未记录，
-> 新旧双向兼容，**无 flag-day、无迁移**。
+> **版本语义**：C API 纯增量——S38 自 6.2.2 起 `c_api/` 下一个字节都没动
+> （`git diff 6.2.2..HEAD -- c_api/` 为空），S39 再新增 11 个函数 + 9 个类型；
+> 既有函数签名、枚举值、结构体布局零改动 → MINOR +1，**`SOVERSION` 保持
+> `6`**（`.so.6` 不换号，下游无需重新链接）。盘上格式**不 bump**、零变化
+> （无 flag-day、无迁移）：`bitcask.meta` 仍是 `v5`（基线；使用原子批的目录
+> 懒升 `v6`）；S38 的 Unicode 版本记录占用的是保留区里两个**原本就空闲**的
+> 字节（偏移 12-13，落在既有 CRC 覆盖区 `[0,14)` 内）——旧目录读出来是
+> `0` = 未记录，新旧双向兼容。
 
 ### Added
 
@@ -51,6 +52,35 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
   `CMAKE_BUILD_TYPE` 以对齐 CRT；两个 ICU DLL 自动进 `<build>/bin/` 与
   `install` 的 `bin/`。新增旋钮 `BITCASK_ICU_MSBUILD` /
   `BITCASK_ICU_MSVC_TOOLSET` / `BITCASK_ICU_MSVC_CONFIG`。
+
+- **多字段文档写入**：`bitcask_doc_field_t` / `bitcask_doc_input_ex_t` /
+  `bitcask_put_doc_ex`。此前 C 侧只能写 text/meta/vector，命名字段（fields）
+  无从表达，`bitcask_search_fields` 的 `field:term` 在纯 C 建的库上永远搜不到
+  东西——本组补齐该缺口。`fields_count==0` 时与 `bitcask_put_doc` 逐字节同义
+  （实现收敛于 `put_doc_common`）。fields 与 meta 正交：fields 是**进倒排索引
+  的命名文本**（分词、参与 BM25），meta 是**不分词的结构化属性**（仅布尔过滤）。
+- **Meta 编解码（纯函数，不碰句柄，线程安全可重入）**：
+  - `bitcask_meta_encode` / `bitcask_meta_blob_free`——编码
+    `bitcask_doc_input_t.meta` 那块 V5 结构化 KV blob。entries **无需预排序**
+    （内部按 key 升序排），重复 key 直接判非法——把「升序无重复」的格式
+    不变式封在库内，不外泄给绑定作者。
+  - `bitcask_meta_lookup`（单 key 零拷贝查询，零分配，引擎过滤热路径同款
+    剪枝）与 `bitcask_meta_iter_begin` / `bitcask_meta_iter_next`（零拷贝
+    游标遍历）+ `bitcask_meta_value_view_t` 零拷贝值视图（STRING 借 blob
+    内存，不保证 NUL 结尾）。损坏 blob 一律按「未命中 / 遍历结束」处理，
+    不报错——与 C++ 侧容错一致。
+- **检索分页**：`bitcask_search_text_ex` / `bitcask_search_phrase_ex` /
+  `bitcask_bool_search_ex`。C++ 侧三个入口一直有 `offset` 参数（S13-D10），
+  C 侧此前全无分页能力。offset 经 overfetch `k+offset` 后截断——深分页成本
+  线性增长；不提供总命中数（WAND/BMW 剪枝下 total 只能给下界，与 C++ 侧
+  同样不给）。
+- **高亮检索**：`bitcask_search_text_highlight` + `bitcask_highlight_options_t`
+  （全零取 C++ 默认：`<em>`/`</em>`、片段 120B、每命中 3 段）+ 结果族
+  `bitcask_search_result_ex_t` / `bitcask_search_hit_ex_t` / `bitcask_snippet_t` /
+  `bitcask_search_result_ex_free`。补齐 C++ `Cask::search_text_highlight`
+  （S13-D3）的 C 表示；原文 LRU 未命中的冷文档降级为 `highlights_count==0`
+  的 hit，不整条丢弃。
+- 测试：`tests/c_api_test.c` +620 行覆盖四组新 API；`doc/api-c.md` 符号表同步。
 
 ### Changed
 

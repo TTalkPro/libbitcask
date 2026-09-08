@@ -156,4 +156,71 @@ BITCASK_API bitcask_error_t bitcask_search_text_filtered(
     });
 }
 
+
+/* ===========================================================================
+ *  S39：分页（offset）与高亮
+ * ========================================================================= */
+
+// search_text 的全参版：filter == NULL 且 offset == 0 时与 bitcask_search_text
+// 逐字节同义；是既有 text / text_filtered 两个入口的超集。
+BITCASK_API bitcask_error_t bitcask_search_text_ex(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
+    return finish_single(
+        as_cpp_cask(cask)->search_text(query, k, pf.get(), offset), out, fault);
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_search_phrase_ex(
+    bitcask_t* cask, const char* query, size_t k, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+    return finish_single(as_cpp_cask(cask)->search_phrase(query, k, offset),
+                         out, fault);
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_bool_search_ex(
+    bitcask_t* cask, const char* query, size_t k, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+    return finish_single(as_cpp_cask(cask)->bool_search(query, k, offset),
+                         out, fault);
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_search_text_highlight(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_highlight_options_t* opts,
+    bitcask_search_result_ex_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+
+    // opts == NULL 或某字段为 0/NULL → 保留 C++ 侧默认值（不覆盖）。
+    // 这样 C 调用方 memset(&opts, 0, ...) 后只填想改的那项即可。
+    search::HighlightOptions hopts;
+    if (opts) {
+        if (opts->pre_tag)  hopts.pre_tag  = opts->pre_tag;
+        if (opts->post_tag) hopts.post_tag = opts->post_tag;
+        if (opts->fragment_size > 0) hopts.fragment_size = opts->fragment_size;
+        if (opts->max_fragments > 0) hopts.max_fragments = opts->max_fragments;
+    }
+    return finish_single_ex(
+        as_cpp_cask(cask)->search_text_highlight(query, k, hopts), out, fault);
+    });
+}
+
 }  // extern "C"
