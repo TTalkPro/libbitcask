@@ -38,6 +38,8 @@ static void rmrf(const char* dir) {
 static const char* const kAllTestDirs[] = {
     TDIR("batch"),
     TDIR("filter"),
+    TDIR("fields"),
+    TDIR("paging"),
     TDIR("iter"),
     TDIR("kv"),
     TDIR("levelb"),
@@ -888,6 +890,622 @@ static int test_search_filtered(void) {
     return 0;
 }
 
+/* S39：C 侧多字段写入 + meta 编解码。
+ *
+ * 本用例同时是 test_search_filtered 的补课——那个用例的每条断言都是
+ * count==0，因为 C 侧此前造不出 meta blob，过滤树从来没在「真有 meta」的
+ * 文档上跑过。这里先 bitcask_meta_encode 出真 blob，再验过滤真的命中。 */
+static int test_doc_fields_and_meta(void) {
+    const char* dir = TDIR("fields");
+    rmrf(dir);
+
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.enable_search = 1;
+    opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    bitcask_error_t err = bitcask_open(dir, &opts, &cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_doc_fields_and_meta: open: %s\n", fault.detail);
+        return 1;
+    }
+
+    /* ---- meta 编码：**故意乱序**传入，验证内部自己排 ---- */
+    bitcask_meta_entry_t entries[3];
+    memset(entries, 0, sizeof(entries));
+    entries[0].key = "price";
+    entries[0].value.type = BITCASK_META_VALUE_INT64;
+    entries[0].value.i64 = 42;
+    entries[1].key = "author";
+    entries[1].value.type = BITCASK_META_VALUE_STRING;
+    entries[1].value.str = "david";
+    entries[2].key = "draft";
+    entries[2].value.type = BITCASK_META_VALUE_BOOL;
+    entries[2].value.i64 = 0;
+
+    bitcask_slice_t meta_blob;
+    memset(&meta_blob, 0, sizeof(meta_blob));
+    err = bitcask_meta_encode(entries, 3, &meta_blob, &fault);
+    assert(err == BITCASK_OK);
+    assert(meta_blob.data != NULL && meta_blob.size > 0);
+
+    /* ---- 写：d0 带 text + 两个命名字段 + meta；d1 只有命名字段 ---- */
+    bitcask_doc_field_t f0[2];
+    memset(f0, 0, sizeof(f0));
+    f0[0].name.data = "title";  f0[0].name.size = 5;
+    f0[0].value.data = "alpha";  f0[0].value.size = 5;
+    f0[1].name.data = "body";   f0[1].name.size = 4;
+    f0[1].value.data = "gamma"; f0[1].value.size = 5;
+
+    bitcask_doc_input_ex_t d0;
+    memset(&d0, 0, sizeof(d0));
+    d0.text.data = "hello world";  d0.text.size = 11;
+    d0.meta = meta_blob;
+    d0.fields = f0;
+    d0.fields_count = 2;
+    bitcask_slice_t k0 = {"d0", 2};
+    err = bitcask_put_doc_ex(cask, k0, &d0, 0, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_doc_fields_and_meta: put_doc_ex: %s\n", fault.detail);
+        bitcask_close(cask);
+        return 1;
+    }
+
+    bitcask_doc_field_t f1[1];
+    memset(f1, 0, sizeof(f1));
+    f1[0].name.data = "title"; f1[0].name.size = 5;
+    f1[0].value.data = "beta"; f1[0].value.size = 4;
+
+    bitcask_doc_input_ex_t d1;
+    memset(&d1, 0, sizeof(d1));  /* text 留空 */
+    d1.fields = f1;
+    d1.fields_count = 1;
+    bitcask_slice_t k1 = {"d1", 2};
+    err = bitcask_put_doc_ex(cask, k1, &d1, 0, &fault);
+    assert(err == BITCASK_OK);
+
+    bitcask_flush_index(cask);
+
+    /* ---- 命名字段可检索（这条在 S39 之前的纯 C 库上恒为 0 命中）---- */
+    {
+        bitcask_search_result_t* r = NULL;
+        err = bitcask_search_fields(cask, "title:alpha", 10, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL);
+        if (r->count != 1 || strcmp(r->hits[0].key, "d0") != 0) {
+            fprintf(stderr, "FAIL: title:alpha count=%zu\n", r->count);
+            bitcask_search_result_free(r);
+            bitcask_close(cask);
+            return 1;
+        }
+        bitcask_search_result_free(r);
+
+        r = NULL;
+        err = bitcask_search_fields(cask, "title:beta", 10, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL && r->count == 1);
+        assert(strcmp(r->hits[0].key, "d1") == 0);
+        bitcask_search_result_free(r);
+
+        /* body 字段独立于 title：title:gamma 不命中 */
+        r = NULL;
+        err = bitcask_search_fields(cask, "title:gamma", 10, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL && r->count == 0);
+        bitcask_search_result_free(r);
+    }
+
+    /* ---- text 走默认字段，fields 不进默认字段 ---- */
+    {
+        bitcask_search_result_t* r = NULL;
+        err = bitcask_search_text(cask, "hello", 10, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL && r->count == 1);
+        assert(strcmp(r->hits[0].key, "d0") == 0);
+        bitcask_search_result_free(r);
+
+        /* "beta" 只存在于 d1 的 title 字段，d1 连 text 都没有——但 catch-all
+           （index_catch_all 默认 true）把命名字段词项并进了默认字段，所以词袋
+           搜索照样命中。这条钉住该语义：fields 不是「只能靠 search_fields 找
+           到」，两条路都通；search_fields 的 field: 限定才是「只查该字段」。 */
+        r = NULL;
+        err = bitcask_search_text(cask, "beta", 10, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL && r->count == 1);
+        assert(strcmp(r->hits[0].key, "d1") == 0);
+        bitcask_search_result_free(r);
+    }
+
+    /* ---- meta 过滤：现在有真 blob 了，能验命中而不只是 0 ---- */
+    {
+        bitcask_meta_condition_t cond;
+        memset(&cond, 0, sizeof(cond));
+        cond.key = "author";
+        cond.op = BITCASK_META_OP_EQ;
+        cond.value.type = BITCASK_META_VALUE_STRING;
+        cond.value.str = "david";
+        bitcask_meta_filter_t filter;
+        memset(&filter, 0, sizeof(filter));
+        filter.conditions = &cond;
+        filter.conditions_count = 1;
+
+        bitcask_search_result_t* r = NULL;
+        err = bitcask_search_text_filtered(cask, "hello", 10, &filter, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL);
+        if (r->count != 1) {
+            fprintf(stderr, "FAIL: meta filter Eq(author,david) count=%zu\n", r->count);
+            bitcask_search_result_free(r);
+            bitcask_close(cask);
+            return 1;
+        }
+        bitcask_search_result_free(r);
+
+        /* Gt(price, 100) → 不通过 */
+        cond.key = "price";
+        cond.op = BITCASK_META_OP_GT;
+        cond.value.type = BITCASK_META_VALUE_INT64;
+        cond.value.i64 = 100;
+        cond.value.str = NULL;
+        r = NULL;
+        err = bitcask_search_text_filtered(cask, "hello", 10, &filter, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL && r->count == 0);
+        bitcask_search_result_free(r);
+    }
+
+    /* ---- 读回：get 的 meta 段能被 lookup / 遍历 ---- */
+    {
+        bitcask_get_result_t* g = NULL;
+        err = bitcask_get(cask, k0, &g, &fault);
+        assert(err == BITCASK_OK && g != NULL);
+        assert(g->meta.size == meta_blob.size);
+        assert(memcmp(g->meta.data, meta_blob.data, meta_blob.size) == 0);
+
+        bitcask_meta_value_view_t v;
+        assert(bitcask_meta_lookup(g->meta, "price", &v) == 1);
+        assert(v.type == BITCASK_META_VALUE_INT64 && v.i64 == 42);
+
+        assert(bitcask_meta_lookup(g->meta, "author", &v) == 1);
+        assert(v.type == BITCASK_META_VALUE_STRING);
+        assert(v.str.size == 5 && memcmp(v.str.data, "david", 5) == 0);
+
+        assert(bitcask_meta_lookup(g->meta, "draft", &v) == 1);
+        assert(v.type == BITCASK_META_VALUE_BOOL && v.i64 == 0);
+
+        /* 未命中 / NULL key / 空 blob 一律 0，且 out 置 NULL 类型 */
+        assert(bitcask_meta_lookup(g->meta, "nope", &v) == 0);
+        assert(v.type == BITCASK_META_VALUE_NULL);
+        assert(bitcask_meta_lookup(g->meta, NULL, &v) == 0);
+        {
+            bitcask_slice_t empty = {NULL, 0};
+            assert(bitcask_meta_lookup(empty, "price", &v) == 0);
+        }
+
+        /* 遍历：3 条，key 升序（author < draft < price） */
+        bitcask_meta_iter_t it;
+        assert(bitcask_meta_iter_begin(g->meta, &it) == 1);
+        const char* expect[3] = {"author", "draft", "price"};
+        int n = 0;
+        bitcask_slice_t key;
+        while (bitcask_meta_iter_next(g->meta, &it, &key, &v)) {
+            assert(n < 3);
+            assert(key.size == strlen(expect[n]));
+            assert(memcmp(key.data, expect[n], key.size) == 0);
+            n++;
+        }
+        assert(n == 3);
+
+        /* out 参数可为 NULL（只数条数） */
+        assert(bitcask_meta_iter_begin(g->meta, &it) == 1);
+        n = 0;
+        while (bitcask_meta_iter_next(g->meta, &it, NULL, NULL)) n++;
+        assert(n == 3);
+
+        bitcask_get_result_free(g);
+    }
+
+    /* ---- 编码器的错误面 ---- */
+    {
+        bitcask_slice_t blob;
+        memset(&blob, 0, sizeof(blob));
+
+        /* 重复 key → INVALID_OPTION（release 下 C++ assert 不设防，故必须由 C 层拦） */
+        bitcask_meta_entry_t dup[2];
+        memset(dup, 0, sizeof(dup));
+        dup[0].key = "k";
+        dup[0].value.type = BITCASK_META_VALUE_INT64;
+        dup[0].value.i64 = 1;
+        dup[1].key = "k";
+        dup[1].value.type = BITCASK_META_VALUE_INT64;
+        dup[1].value.i64 = 2;
+        err = bitcask_meta_encode(dup, 2, &blob, &fault);
+        assert(err == BITCASK_ERR_INVALID_OPTION);
+        assert(blob.data == NULL && blob.size == 0);
+
+        /* key == NULL → INVALID_OPTION */
+        bitcask_meta_entry_t bad;
+        memset(&bad, 0, sizeof(bad));
+        bad.value.type = BITCASK_META_VALUE_INT64;
+        err = bitcask_meta_encode(&bad, 1, &blob, &fault);
+        assert(err == BITCASK_ERR_INVALID_OPTION);
+
+        /* STRING 缺 str → INVALID_OPTION */
+        memset(&bad, 0, sizeof(bad));
+        bad.key = "s";
+        bad.value.type = BITCASK_META_VALUE_STRING;
+        bad.value.str = NULL;
+        err = bitcask_meta_encode(&bad, 1, &blob, &fault);
+        assert(err == BITCASK_ERR_INVALID_OPTION);
+
+        /* n==0 → OK + 空 blob（等价「不带 meta」，无需 free） */
+        err = bitcask_meta_encode(NULL, 0, &blob, &fault);
+        assert(err == BITCASK_OK && blob.data == NULL && blob.size == 0);
+
+        /* out_blob == NULL → INVALID_OPTION */
+        err = bitcask_meta_encode(entries, 3, NULL, &fault);
+        assert(err == BITCASK_ERR_INVALID_OPTION);
+    }
+
+    /* ---- put_doc_ex 的参数面 ---- */
+    {
+        bitcask_doc_input_ex_t bad;
+        memset(&bad, 0, sizeof(bad));
+        bad.text.data = "x"; bad.text.size = 1;
+        bad.fields_count = 1;  /* fields==NULL 但 count>0 */
+        err = bitcask_put_doc_ex(cask, k0, &bad, 0, &fault);
+        assert(err == BITCASK_ERR_INVALID_OPTION);
+
+        err = bitcask_put_doc_ex(cask, k0, NULL, 0, &fault);
+        assert(err == BITCASK_ERR_INVALID_OPTION);
+
+        /* fields_count==0 时与 bitcask_put_doc 同义 */
+        bitcask_doc_input_ex_t plain;
+        memset(&plain, 0, sizeof(plain));
+        plain.text.data = "plain text"; plain.text.size = 10;
+        bitcask_slice_t k2 = {"d2", 2};
+        err = bitcask_put_doc_ex(cask, k2, &plain, 0, &fault);
+        assert(err == BITCASK_OK);
+    }
+
+    /* blob_free 幂等 */
+    bitcask_meta_blob_free(&meta_blob);
+    assert(meta_blob.data == NULL && meta_blob.size == 0);
+    bitcask_meta_blob_free(&meta_blob);
+    bitcask_meta_blob_free(NULL);
+
+    bitcask_close(cask);
+
+    /* ---- 重开：字段名经 field.schema 还原，命名字段仍可检索 ---- */
+    {
+        bitcask_t* c2 = NULL;
+        err = bitcask_open(dir, &opts, &c2, &fault);
+        assert(err == BITCASK_OK);
+        bitcask_search_result_t* r = NULL;
+        err = bitcask_search_fields(c2, "title:alpha", 10, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL);
+        if (r->count != 1) {
+            fprintf(stderr, "FAIL: reopen title:alpha count=%zu\n", r->count);
+            bitcask_search_result_free(r);
+            bitcask_close(c2);
+            return 1;
+        }
+        bitcask_search_result_free(r);
+        bitcask_close(c2);
+    }
+
+    printf("PASS test_doc_fields_and_meta\n");
+    return 0;
+}
+
+/* S39：分页（offset）与高亮检索。两者在 C 侧此前都无从表达——
+   offset 是 C++ search_text/search_phrase/bool_search 一直有、C 侧三个函数
+   全无的参数；search_text_highlight 则是 C 侧完全缺失的符号。 */
+static int test_paging_and_highlight(void) {
+    const char* dir = TDIR("paging");
+    rmrf(dir);
+
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.enable_search = 1;
+    opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    bitcask_error_t err = bitcask_open(dir, &opts, &cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_paging_and_highlight: open: %s\n", fault.detail);
+        return 1;
+    }
+
+    /* 5 篇都含 "alpha"，词频递减 → BM25 排名可预期地不同。 */
+    const char* texts[5] = {
+        "alpha alpha alpha alpha beta",
+        "alpha alpha alpha beta",
+        "alpha alpha beta",
+        "alpha beta gamma",
+        "alpha beta gamma delta epsilon"
+    };
+    const char* keys[5] = {"p0", "p1", "p2", "p3", "p4"};
+    for (int i = 0; i < 5; i++) {
+        bitcask_doc_input_t doc;
+        memset(&doc, 0, sizeof(doc));
+        doc.text.data = texts[i];
+        doc.text.size = strlen(texts[i]);
+        bitcask_slice_t key = {keys[i], strlen(keys[i])};
+        err = bitcask_put_doc(cask, key, &doc, 0, &fault);
+        assert(err == BITCASK_OK);
+    }
+    bitcask_flush_index(cask);
+
+    /* ---- 分页：整页 vs 逐页，同一排名序 ---- */
+    char page_all[5][32];
+    size_t total = 0;
+    {
+        bitcask_search_result_t* r = NULL;
+        err = bitcask_search_text_ex(cask, "alpha", 10, NULL, 0, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL);
+        if (r->count != 5) {
+            fprintf(stderr, "FAIL: baseline count=%zu\n", r->count);
+            bitcask_search_result_free(r);
+            bitcask_close(cask);
+            return 1;
+        }
+        total = r->count;
+        for (size_t i = 0; i < total; i++) {
+            snprintf(page_all[i], sizeof(page_all[i]), "%s", r->hits[i].key);
+        }
+        bitcask_search_result_free(r);
+    }
+
+    /* k=2 逐页取，拼起来必须与整页前 4 条逐条相等 */
+    for (size_t off = 0; off + 2 <= 4; off += 2) {
+        bitcask_search_result_t* r = NULL;
+        err = bitcask_search_text_ex(cask, "alpha", 2, NULL, off, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL);
+        if (r->count != 2) {
+            fprintf(stderr, "FAIL: page off=%zu count=%zu\n", off, r->count);
+            bitcask_search_result_free(r);
+            bitcask_close(cask);
+            return 1;
+        }
+        for (size_t i = 0; i < 2; i++) {
+            if (strcmp(r->hits[i].key, page_all[off + i]) != 0) {
+                fprintf(stderr, "FAIL: page off=%zu i=%zu got %s want %s\n",
+                        off, i, r->hits[i].key, page_all[off + i]);
+                bitcask_search_result_free(r);
+                bitcask_close(cask);
+                return 1;
+            }
+        }
+        bitcask_search_result_free(r);
+    }
+
+    /* offset 越过总数 → 空结果而非错误 */
+    {
+        bitcask_search_result_t* r = NULL;
+        err = bitcask_search_text_ex(cask, "alpha", 10, NULL, 99, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL && r->count == 0);
+        bitcask_search_result_free(r);
+    }
+
+    /* filter 非空——哪怕是空树——时，没有 meta 段的文档一律不通过（引擎
+       「空 blob 不通过」约定）。上面 5 篇都没带 meta，故这里恒 0；这不是
+       offset 的锅，是过滤语义。 */
+    {
+        bitcask_meta_filter_t empty;
+        memset(&empty, 0, sizeof(empty));
+        bitcask_search_result_t* r = NULL;
+        err = bitcask_search_text_ex(cask, "alpha", 10, &empty, 1, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL && r->count == 0);
+        bitcask_search_result_free(r);
+    }
+
+    /* filter + offset 真正一起生效：另写 3 篇带 meta 的文档（词 "omega"，与
+       上面的 alpha 排名互不干扰），grp=1 的两篇里跳过第一篇。 */
+    {
+        const char* qtexts[3] = {"omega omega omega", "omega omega", "omega"};
+        const char* qkeys[3] = {"q0", "q1", "q2"};
+        const int64_t grps[3] = {1, 1, 2};
+        for (int i = 0; i < 3; i++) {
+            bitcask_meta_entry_t e;
+            memset(&e, 0, sizeof(e));
+            e.key = "grp";
+            e.value.type = BITCASK_META_VALUE_INT64;
+            e.value.i64 = grps[i];
+            bitcask_slice_t blob;
+            memset(&blob, 0, sizeof(blob));
+            err = bitcask_meta_encode(&e, 1, &blob, &fault);
+            assert(err == BITCASK_OK);
+
+            bitcask_doc_input_t doc;
+            memset(&doc, 0, sizeof(doc));
+            doc.text.data = qtexts[i];
+            doc.text.size = strlen(qtexts[i]);
+            doc.meta = blob;
+            bitcask_slice_t key = {qkeys[i], strlen(qkeys[i])};
+            err = bitcask_put_doc(cask, key, &doc, 0, &fault);
+            assert(err == BITCASK_OK);
+            bitcask_meta_blob_free(&blob);
+        }
+        bitcask_flush_index(cask);
+
+        bitcask_meta_condition_t cond;
+        memset(&cond, 0, sizeof(cond));
+        cond.key = "grp";
+        cond.op = BITCASK_META_OP_EQ;
+        cond.value.type = BITCASK_META_VALUE_INT64;
+        cond.value.i64 = 1;
+        bitcask_meta_filter_t f;
+        memset(&f, 0, sizeof(f));
+        f.conditions = &cond;
+        f.conditions_count = 1;
+
+        bitcask_search_result_t* r = NULL;
+        err = bitcask_search_text_ex(cask, "omega", 10, &f, 0, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL);
+        if (r->count != 2) {
+            fprintf(stderr, "FAIL: filter grp=1 count=%zu\n", r->count);
+            bitcask_search_result_free(r);
+            bitcask_close(cask);
+            return 1;
+        }
+        char first[32];
+        snprintf(first, sizeof(first), "%s", r->hits[0].key);
+        char second[32];
+        snprintf(second, sizeof(second), "%s", r->hits[1].key);
+        bitcask_search_result_free(r);
+
+        r = NULL;
+        err = bitcask_search_text_ex(cask, "omega", 10, &f, 1, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL);
+        if (r->count != 1 || strcmp(r->hits[0].key, second) != 0) {
+            fprintf(stderr, "FAIL: filter+offset got count=%zu key=%s want %s\n",
+                    r->count, r->count ? r->hits[0].key : "(none)", second);
+            bitcask_search_result_free(r);
+            bitcask_close(cask);
+            return 1;
+        }
+        (void)first;
+        bitcask_search_result_free(r);
+    }
+
+    /* 非法 filter 仍走 INVALID_OPTION（与 *_filtered 一致） */
+    {
+        bitcask_meta_condition_t bad;
+        memset(&bad, 0, sizeof(bad));  /* key == NULL */
+        bitcask_meta_filter_t bf;
+        memset(&bf, 0, sizeof(bf));
+        bf.conditions = &bad;
+        bf.conditions_count = 1;
+        bitcask_search_result_t* r = NULL;
+        err = bitcask_search_text_ex(cask, "alpha", 10, &bf, 0, &r, &fault);
+        assert(err == BITCASK_ERR_INVALID_OPTION && r == NULL);
+    }
+
+    /* phrase / bool 的分页版：offset=0 与既有无 offset 版同结果 */
+    {
+        bitcask_search_result_t* a = NULL;
+        bitcask_search_result_t* b = NULL;
+        err = bitcask_search_phrase(cask, "alpha beta", 10, &a, &fault);
+        assert(err == BITCASK_OK && a != NULL);
+        err = bitcask_search_phrase_ex(cask, "alpha beta", 10, 0, &b, &fault);
+        assert(err == BITCASK_OK && b != NULL && b->count == a->count);
+        if (a->count > 1) {
+            bitcask_search_result_t* c = NULL;
+            err = bitcask_search_phrase_ex(cask, "alpha beta", 10, 1, &c, &fault);
+            assert(err == BITCASK_OK && c != NULL && c->count == a->count - 1);
+            assert(strcmp(c->hits[0].key, a->hits[1].key) == 0);
+            bitcask_search_result_free(c);
+        }
+        bitcask_search_result_free(a);
+        bitcask_search_result_free(b);
+
+        a = NULL; b = NULL;
+        err = bitcask_bool_search(cask, "alpha AND beta", 10, &a, &fault);
+        assert(err == BITCASK_OK && a != NULL);
+        err = bitcask_bool_search_ex(cask, "alpha AND beta", 10, 0, &b, &fault);
+        assert(err == BITCASK_OK && b != NULL && b->count == a->count);
+        bitcask_search_result_free(a);
+        bitcask_search_result_free(b);
+    }
+
+    /* 参数面 */
+    {
+        bitcask_search_result_t* r = NULL;
+        assert(bitcask_search_text_ex(NULL, "alpha", 10, NULL, 0, &r, &fault)
+               == BITCASK_ERR_INVALID_OPTION);
+        assert(bitcask_search_text_ex(cask, NULL, 10, NULL, 0, &r, &fault)
+               == BITCASK_ERR_INVALID_OPTION);
+        assert(bitcask_search_text_ex(cask, "alpha", 10, NULL, 0, NULL, &fault)
+               == BITCASK_ERR_INVALID_OPTION);
+        assert(bitcask_search_phrase_ex(cask, NULL, 10, 0, &r, &fault)
+               == BITCASK_ERR_INVALID_OPTION);
+        assert(bitcask_bool_search_ex(cask, NULL, 10, 0, &r, &fault)
+               == BITCASK_ERR_INVALID_OPTION);
+    }
+
+    /* ---- 高亮 ---- */
+    {
+        /* 默认配置：<em>alpha</em> */
+        bitcask_search_result_ex_t* r = NULL;
+        err = bitcask_search_text_highlight(cask, "alpha", 3, NULL, &r, &fault);
+        if (err != BITCASK_OK || r == NULL) {
+            fprintf(stderr, "FAIL: highlight err=%d\n", err);
+            bitcask_close(cask);
+            return 1;
+        }
+        if (r->count != 3) {
+            fprintf(stderr, "FAIL: highlight count=%zu\n", r->count);
+            bitcask_search_result_ex_free(r);
+            bitcask_close(cask);
+            return 1;
+        }
+        /* 排名与普通 search_text 一致 */
+        assert(strcmp(r->hits[0].key, page_all[0]) == 0);
+
+        int saw_tag = 0;
+        for (size_t i = 0; i < r->count; i++) {
+            assert(r->hits[i].key != NULL);
+            /* 片段可能为空（原文 LRU 未命中时降级），但不该是野指针 */
+            if (r->hits[i].highlights_count == 0) {
+                assert(r->hits[i].highlights == NULL);
+                continue;
+            }
+            for (size_t j = 0; j < r->hits[i].highlights_count; j++) {
+                assert(r->hits[i].highlights[j].text != NULL);
+                if (strstr(r->hits[i].highlights[j].text, "<em>alpha</em>")) {
+                    saw_tag = 1;
+                }
+            }
+        }
+        if (!saw_tag) {
+            fprintf(stderr, "FAIL: highlight produced no <em> fragment\n");
+            bitcask_search_result_ex_free(r);
+            bitcask_close(cask);
+            return 1;
+        }
+        bitcask_search_result_ex_free(r);
+    }
+    {
+        /* 自定义标签；只填想改的字段，其余保持 C++ 默认 */
+        bitcask_highlight_options_t hopts;
+        memset(&hopts, 0, sizeof(hopts));
+        hopts.pre_tag = "[[";
+        hopts.post_tag = "]]";
+        hopts.max_fragments = 1;
+
+        bitcask_search_result_ex_t* r = NULL;
+        err = bitcask_search_text_highlight(cask, "alpha", 2, &hopts, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL && r->count == 2);
+        int saw = 0;
+        for (size_t i = 0; i < r->count; i++) {
+            assert(r->hits[i].highlights_count <= 1);  /* max_fragments 生效 */
+            for (size_t j = 0; j < r->hits[i].highlights_count; j++) {
+                if (strstr(r->hits[i].highlights[j].text, "[[alpha]]")) saw = 1;
+            }
+        }
+        assert(saw);
+        bitcask_search_result_ex_free(r);
+    }
+    {
+        /* 零命中 → 非 NULL 结果、count==0；free 与 NULL free 均安全 */
+        bitcask_search_result_ex_t* r = NULL;
+        err = bitcask_search_text_highlight(cask, "zzz", 10, NULL, &r, &fault);
+        assert(err == BITCASK_OK && r != NULL && r->count == 0);
+        bitcask_search_result_ex_free(r);
+        bitcask_search_result_ex_free(NULL);
+
+        assert(bitcask_search_text_highlight(NULL, "alpha", 10, NULL, &r, &fault)
+               == BITCASK_ERR_INVALID_OPTION);
+        assert(bitcask_search_text_highlight(cask, NULL, 10, NULL, &r, &fault)
+               == BITCASK_ERR_INVALID_OPTION);
+        assert(bitcask_search_text_highlight(cask, "alpha", 10, NULL, NULL, &fault)
+               == BITCASK_ERR_INVALID_OPTION);
+    }
+
+    bitcask_close(cask);
+    printf("PASS test_paging_and_highlight\n");
+    return 0;
+}
+
 // 注：C API 的 bitcask_close **销毁句柄**（adopt+delete），故纯 C 无「已关闭但存活」
 // 状态——close 后再用是 use-after-free（caller bug），非 BITCASK_ERR_CLOSED 场景。
 // kClosed 的实际受益方是 C++ 消费方（Cask::close 保留对象 + fail-fast），其覆盖见
@@ -970,6 +1588,8 @@ int main(void) {
     failures += test_levelb();
     failures += test_status_ex_and_log();
     failures += test_search_filtered();
+    failures += test_doc_fields_and_meta();
+    failures += test_paging_and_highlight();
 
     if (failures == 0) {
         printf("\n=== All C API tests passed ===\n");

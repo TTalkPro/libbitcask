@@ -17,6 +17,7 @@
 #  define BITCASK_VERSION_STRING "0.0.0-unknown"
 #endif
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,7 @@
 
 #include "bitcask/cask.hpp"
 #include "bitcask/keydir_registry.hpp"
+#include "bitcask/meta_codec.hpp"   // S39：meta blob 编解码（C 侧 lookup/iter）
 #include "bitcask/search_config.hpp"  // S19-3：shim 已离开产品库
 #include "bitcask/synonym_map.hpp"
 
@@ -214,6 +216,90 @@ inline bitcask_error_t finish_single(
         return to_c_error_kind(result.error().kind);
     }
     if (!to_search_result(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
+    return BITCASK_OK;
+}
+
+// S39：高亮结果物化。形状同 to_search_result，多一层片段数组——每个 hit 的
+// key 与每个片段的 text 都是独立 strdup，故 OOM 回滚要逐层放。失败时 *out
+// 保持 NULL 且不泄漏任何半成品。
+inline void free_hit_ex_range(bitcask_search_hit_ex_t* hits, std::size_t n) noexcept {
+    for (std::size_t i = 0; i < n; ++i) {
+        std::free(hits[i].key);
+        for (std::size_t j = 0; j < hits[i].highlights_count; ++j) {
+            std::free(hits[i].highlights[j].text);
+        }
+        std::free(hits[i].highlights);
+    }
+}
+
+inline bool to_search_result_ex(bitcask::Cask::HighlightSearchResult&& src,
+                                bitcask_search_result_ex_t** out) {
+    auto* r = static_cast<bitcask_search_result_ex_t*>(
+        std::malloc(sizeof(bitcask_search_result_ex_t)));
+    if (!r) return false;
+    r->count = src.hits.size();
+    r->hits = static_cast<bitcask_search_hit_ex_t*>(
+        std::malloc(sizeof(bitcask_search_hit_ex_t) * (r->count ? r->count : 1)));
+    if (!r->hits) {
+        std::free(r);
+        return false;
+    }
+    for (std::size_t i = 0; i < r->count; ++i) {
+        auto& dst = r->hits[i];
+        auto& hit = src.hits[i];
+        // 先清零：任何一步失败时 free_hit_ex_range 只会看到已初始化的字段。
+        dst.key = nullptr;
+        dst.ord = hit.ord;
+        dst.score = hit.score;
+        dst.highlights = nullptr;
+        dst.highlights_count = 0;
+
+        dst.key = strdup(hit.key.c_str());
+        if (!dst.key) {
+            free_hit_ex_range(r->hits, i);
+            std::free(r->hits);
+            std::free(r);
+            return false;
+        }
+        const std::size_t ns = hit.highlights.size();
+        if (ns > 0) {
+            dst.highlights = static_cast<bitcask_snippet_t*>(
+                std::malloc(sizeof(bitcask_snippet_t) * ns));
+            if (!dst.highlights) {
+                free_hit_ex_range(r->hits, i + 1);  // 含本条已 strdup 的 key
+                std::free(r->hits);
+                std::free(r);
+                return false;
+            }
+            for (std::size_t j = 0; j < ns; ++j) {
+                dst.highlights[j].text = strdup(hit.highlights[j].text.c_str());
+                dst.highlights[j].score = hit.highlights[j].score;
+                if (!dst.highlights[j].text) {
+                    dst.highlights_count = j;  // 只回滚已成功的 j 个
+                    free_hit_ex_range(r->hits, i + 1);
+                    std::free(r->hits);
+                    std::free(r);
+                    return false;
+                }
+            }
+            dst.highlights_count = ns;
+        }
+    }
+    *out = r;
+    return true;
+}
+
+inline bitcask_error_t finish_single_ex(
+    std::expected<bitcask::Cask::HighlightSearchResult, bitcask::CaskFault>&& result,
+    bitcask_search_result_ex_t** out, bitcask_fault_t* fault) {
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    if (!to_search_result_ex(std::move(*result), out)) {
         set_oom_fault(fault);
         return BITCASK_ERR_IO;
     }
@@ -441,6 +527,102 @@ inline bool fill_get_result_view(const bitcask::GetResultView& src,
     }
     out->tstamp = src.tstamp;
     out->ord = src.ord;
+    return true;
+}
+
+// S39：meta blob 的就地单条解析——C 侧 bitcask_meta_lookup / bitcask_meta_iter_*
+// 共用的**唯一**解析器（两个入口一份代码，不各写一遍）。
+//
+// 格式权威定义在 include/bitcask/meta_codec.hpp 顶部：
+//   [Ver:u8=1][NumEntries:varint] × { [KeyLen:varint][key][Type:u8][ValueData] }
+// C++ 侧的 meta_lookup 出于热路径考虑把「解析 + 比较 + 提前退出」揉在一个循环
+// 里并直接产出 owning 的 MetaValue；C 侧要的是零拷贝视图 + 可暂停的游标，故这里
+// 单独实现「解析一条 + 前进」。**格式若变，两处须同步**。
+//
+// off 指向一条 entry 的起始（KeyLen 的第一个字节）。返回 false = blob 到此为止
+// 或损坏——调用方一律按「遍历结束」处理（与 meta_lookup 的「非法即未命中」
+// 一致，不向 C 侧报错）。
+struct MetaEntryRaw {
+    std::string_view          key;
+    bitcask_meta_value_view_t value;
+    std::size_t               next = 0;
+};
+
+// 小端读 8 字节（int64 / float64 共用；镜像 meta_lookup 的手写循环，
+// 不假设主机字节序）。
+inline std::uint64_t meta_read_u64_le(std::span<const std::byte> blob,
+                                      std::size_t at) noexcept {
+    std::uint64_t bits = 0;
+    for (std::size_t j = 0; j < 8; ++j) {
+        bits |= static_cast<std::uint64_t>(
+                    static_cast<std::uint8_t>(blob[at + j]))
+                << (8 * j);
+    }
+    return bits;
+}
+
+inline bool meta_parse_entry(std::span<const std::byte> blob, std::size_t off,
+                             MetaEntryRaw& out) noexcept {
+    if (off >= blob.size()) return false;
+
+    auto kl_vr = codec::vbyte_read_checked(blob, off);
+    if (!kl_vr) return false;
+    const auto kl = kl_vr->first;
+    const std::size_t kp = kl_vr->second;
+    if (kl > blob.size() - kp) return false;
+    out.key = std::string_view(reinterpret_cast<const char*>(blob.data() + kp),
+                               static_cast<std::size_t>(kl));
+
+    std::size_t cur = kp + static_cast<std::size_t>(kl);
+    if (cur >= blob.size()) return false;
+    const auto tag = static_cast<meta::MetaType>(
+        static_cast<std::uint8_t>(blob[cur]));
+    ++cur;
+
+    out.value = bitcask_meta_value_view_t{};
+    switch (tag) {
+        case meta::MetaType::Null:
+            out.value.type = BITCASK_META_VALUE_NULL;
+            break;
+        case meta::MetaType::Bool:
+            if (cur >= blob.size()) return false;
+            out.value.type = BITCASK_META_VALUE_BOOL;
+            out.value.i64 = static_cast<std::uint8_t>(blob[cur]) != 0 ? 1 : 0;
+            cur += 1;
+            break;
+        case meta::MetaType::Int64: {
+            if (blob.size() - cur < 8) return false;
+            const std::uint64_t bits = meta_read_u64_le(blob, cur);
+            std::int64_t v = 0;
+            std::memcpy(&v, &bits, sizeof(v));
+            out.value.type = BITCASK_META_VALUE_INT64;
+            out.value.i64 = v;
+            cur += 8;
+            break;
+        }
+        case meta::MetaType::Float64: {
+            if (blob.size() - cur < 8) return false;
+            const std::uint64_t bits = meta_read_u64_le(blob, cur);
+            double v = 0.0;
+            std::memcpy(&v, &bits, sizeof(v));
+            out.value.type = BITCASK_META_VALUE_FLOAT64;
+            out.value.f64 = v;
+            cur += 8;
+            break;
+        }
+        case meta::MetaType::String: {
+            auto sl_vr = codec::vbyte_read_checked(blob, cur);
+            if (!sl_vr || sl_vr->first > blob.size() - sl_vr->second) return false;
+            out.value.type = BITCASK_META_VALUE_STRING;
+            out.value.str.data = blob.data() + sl_vr->second;
+            out.value.str.size = static_cast<std::size_t>(sl_vr->first);
+            cur = sl_vr->second + static_cast<std::size_t>(sl_vr->first);
+            break;
+        }
+        default:
+            return false;  // 未知 type tag：整块按损坏处理
+    }
+    out.next = cur;
     return true;
 }
 

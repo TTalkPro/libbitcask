@@ -399,7 +399,7 @@ typedef struct {
     bitcask_slice_t meta;        // meta 段（可为空：data=NULL, size=0）
     const float*    vector;      // 向量段（可为 NULL）
     size_t          vector_len;  // 向量元素数（vector_dim 或 0）
-    uint32_t        tstamp;      // 时间戳
+    uint64_t        tstamp;      // 时间戳
     uint64_t        ord;         // 写入序号
 } bitcask_get_result_t;
 ```
@@ -423,7 +423,52 @@ typedef struct {
 
 **所有权**：每个 `hit.key` 是 strdup 的；整个 `hits[]` 数组与 `result` 结构本身是 malloc 的。`bitcask_search_result_free()` 逐条 free key，再 free hits 数组，最后 free result。批量变体见 [§7.6](#76-批量搜索结果数组所有权)。
 
-### 7.3 `bitcask_doc_input_t`
+### 7.2b 高亮结果类型（S39）
+
+`bitcask_search_text_highlight` 的结果——普通 hit 加一层片段数组：
+
+```c
+typedef struct {
+    char*  text;   // NUL 结尾，malloc；已含 pre_tag/post_tag 包裹的高亮标记
+    double score;  // 片段相关性（挑最优片段用，非 BM25 文档分）
+} bitcask_snippet_t;
+
+typedef struct {
+    char*              key;
+    uint64_t           ord;
+    double             score;             // BM25 文档分
+    bitcask_snippet_t* highlights;        // 可能为 NULL/空，见下
+    size_t             highlights_count;
+} bitcask_search_hit_ex_t;
+
+typedef struct {
+    bitcask_search_hit_ex_t* hits;
+    size_t                   count;
+} bitcask_search_result_ex_t;
+
+typedef struct {
+    const char* pre_tag;        // NULL = "<em>"
+    const char* post_tag;       // NULL = "</em>"
+    size_t      fragment_size;  // 0 = 120
+    size_t      max_fragments;  // 0 = 3
+} bitcask_highlight_options_t;
+```
+
+**片段可能为空。** 高亮需要文档原文，原文来自「原文 LRU」
+（C++ 侧 `SearchLayerConfig::doc_text_cache_max`，默认 1024 条，C 侧暂不可配）。
+**LRU 未命中的冷文档降级为 `highlights_count == 0` 的 hit，而不是整条丢弃**——
+结果集不会因缓存容量而缩水，但也不保证每条命中都有片段。`highlights_count == 0`
+时 `highlights` 为 `NULL`。
+
+**配置的 0/NULL 即默认**：`bitcask_highlight_options_t` 各字段留 0/NULL 就取 C++ 侧
+默认值，所以 `memset(&opts, 0, sizeof opts)` 后只填想改的那项即可；`opts` 整个传
+`NULL` 则全默认。
+
+**所有权**：`bitcask_search_result_ex_free` ↔ `bitcask_search_text_highlight`，逐 hit
+free `key` 与每个片段的 `text`，再 free 片段数组、hits 数组、result。
+**不能**用 `bitcask_search_result_free` 释放（结构不同，会漏掉片段并越界读）。
+
+### 7.3 `bitcask_doc_input_t` / `bitcask_doc_input_ex_t`
 
 ```c
 typedef struct {
@@ -431,9 +476,53 @@ typedef struct {
     bitcask_slice_t meta;        // 可选（data=NULL 跳过）
     const float*    vector;      // 可选（NULL=无向量）
     size_t          vector_len;  // 向量元素数
-    uint32_t        expiry_at;   // S13-D5：per-key 过期时刻（绝对 unix 秒；0=永不）
+    uint64_t        expiry_at;   // S13-D5：per-key 过期时刻（绝对 unix 秒；0=永不）
 } bitcask_doc_input_t;
 ```
+
+S39 起补上命名字段（`fields`）。既有结构与 `bitcask_put_doc` **布局语义零改动**，
+新能力走 additive 新结构 + 新函数（同 `bitcask_status_ex_t` 的先例），`SOVERSION`
+不变，既有调用方无需重新编译：
+
+```c
+typedef struct {
+    bitcask_slice_t name;   // 字段名（UTF-8；空切片 = 默认字段）
+    bitcask_slice_t value;  // 字段值（UTF-8 文本，会被分词）
+} bitcask_doc_field_t;
+
+typedef struct {
+    bitcask_slice_t            text;
+    bitcask_slice_t            meta;
+    const float*               vector;
+    size_t                     vector_len;
+    uint64_t                   expiry_at;
+    const bitcask_doc_field_t* fields;        // 可选（NULL = 无命名字段）
+    size_t                     fields_count;
+} bitcask_doc_input_ex_t;
+```
+
+`fields` 与 `meta` 正交，别混：
+
+| | `fields` | `meta` |
+|---|---|---|
+| 用途 | 进倒排索引的**命名文本** | **结构化属性**，只用于过滤 |
+| 是否分词 | 是 | 否 |
+| 查询入口 | `bitcask_search_fields` 的 `field:term^boost`，参与 BM25 打分 | `bitcask_meta_filter_t` 传给 `*_filtered` 搜索，纯布尔过滤 |
+| 能否读回 | 否（只作索引输入；盘上存的是 field id） | 能，`bitcask_get_result_t.meta` |
+| 盘上 | 名字经 `<dir>/field.schema` intern 成整数 id | 一整块 key 升序 KV blob |
+
+`text` 与 `fields` 的关系——**不冲突，但会重复计数**：
+
+- `text` 进「默认字段」；命名字段各自进各自的倒排；
+- 命名字段的词项**默认还会被并进默认字段**（catch-all，对应 C++ 的
+  `SearchLayerConfig::index_catch_all`，默认 `true`，C 侧暂不可配）。所以
+  `bitcask_search_text` 同样能命中只写了 `fields`、`text` 留空的文档；要「只查某个
+  字段」得用 `bitcask_search_fields` 的 `field:` 限定。
+- 同一段正文既放 `text` 又放某个 field ⟹ DocValue 存两份值，且该词在默认字段里的
+  tf 被累加两次，抬高本文档的 BM25 得分。正文要么走 `text`、要么走 field，别两头下注。
+
+**编码**：`name` / `value` 都必须是 UTF-8。非法序列被替换成 U+FFFD、整段退化成一个
+检索不到的 token，且**静默**——存得进、搜不出，没有任何错误码。
 
 ### 7.4 `bitcask_kv_pair_t`（批量写）
 
@@ -450,7 +539,7 @@ typedef struct {
 typedef struct {
     bitcask_slice_t key;         // 指向内部 malloc 缓冲
     bitcask_slice_t value;       // 指向内部 malloc 缓冲
-    uint32_t        tstamp;
+    uint64_t        tstamp;
     uint32_t        file_id;
     uint64_t        offset;
     uint32_t        total_sz;
@@ -550,6 +639,10 @@ typedef struct bitcask_meta_filter {
 
 非法条件：`key == NULL`、`STRING` 值缺 `str`、`op`/`type` 越界、嵌套深度 > 32 → `BITCASK_ERR_INVALID_OPTION`。
 
+> 过滤树只是**读端**。要让它有东西可过滤，写入时得给文档带上 meta blob——生产/读取
+> 该 blob 的函数见 [§10.4](#104-meta-blob-编解码s39)。注意 `filter` 非空时**没有 meta 段的
+> 文档一律不通过**（含 `Neq` / `Exists` 等否定式条件）。
+
 ---
 
 ## 8. 生命周期：打开与关闭
@@ -613,7 +706,7 @@ BITCASK_API bitcask_error_t bitcask_get(bitcask_t* cask,
 BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
                                         bitcask_slice_t key,
                                         bitcask_slice_t value,
-                                        uint32_t tstamp,
+                                        uint64_t tstamp,
                                         bitcask_fault_t* fault);
 ```
 
@@ -625,8 +718,8 @@ BITCASK_API bitcask_error_t bitcask_put(bitcask_t* cask,
 BITCASK_API bitcask_error_t bitcask_put_ex(bitcask_t* cask,
                                            bitcask_slice_t key,
                                            bitcask_slice_t value,
-                                           uint32_t tstamp,
-                                           uint32_t expiry_at,
+                                           uint64_t tstamp,
+                                           uint64_t expiry_at,
                                            bitcask_fault_t* fault);
 ```
 
@@ -637,7 +730,7 @@ BITCASK_API bitcask_error_t bitcask_put_ex(bitcask_t* cask,
 ```c
 BITCASK_API bitcask_error_t bitcask_delete(bitcask_t* cask,
                                            bitcask_slice_t key,
-                                           uint32_t tstamp,
+                                           uint64_t tstamp,
                                            bitcask_fault_t* fault);
 ```
 
@@ -681,11 +774,30 @@ BITCASK_API void bitcask_get_result_free(bitcask_get_result_t* result);
 BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
                                             bitcask_slice_t key,
                                             const bitcask_doc_input_t* doc,
-                                            uint32_t tstamp,
+                                            uint64_t tstamp,
                                             bitcask_fault_t* fault);
 ```
 
 写入结构化文档（索引模式）。`doc == NULL` 返回 `BITCASK_ERR_INVALID_OPTION`。
+
+### 10.1b `bitcask_put_doc_ex`（S39：带命名字段）
+
+```c
+BITCASK_API bitcask_error_t bitcask_put_doc_ex(bitcask_t* cask,
+                                               bitcask_slice_t key,
+                                               const bitcask_doc_input_ex_t* doc,
+                                               uint64_t tstamp,
+                                               bitcask_fault_t* fault);
+```
+
+`fields_count == 0` 时与 `bitcask_put_doc` 完全同义。字段结构与语义见 [§7.3](#73-bitcask_doc_input_t--bitcask_doc_input_ex_t)。
+
+- `doc == NULL`、`fields == NULL && fields_count > 0`、任一 `name`/`value` 切片非法
+  （`data == NULL && size != 0`）→ `BITCASK_ERR_INVALID_OPTION`，零副作用。
+- `fields` 数组借调用方存储，仅在调用期间读取；字段名在库内按值拷贝并 intern。
+
+**这条补的是一个死 API**：S39 之前，纯 C 建的库无从写入命名字段，`bitcask_search_fields`
+的 `field:term` 在这类库上永远 0 命中。
 
 ### 10.2 `bitcask_put_batch`（批量写）
 
@@ -693,7 +805,7 @@ BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
 BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
                                               const bitcask_kv_pair_t* items,
                                               size_t n,
-                                              uint32_t tstamp,
+                                              uint64_t tstamp,
                                               bitcask_fault_t* fault);
 ```
 
@@ -736,6 +848,93 @@ S35 引擎原子批（设计 `doc/atomic-batch-design-zh.md`；模式原理 `doc
 - `bitcask_txn_commit`：= 原子批 + 事务级校验（空批 / 空 key / 重复 key / `_txn:` 前缀 → `BITCASK_ERR_INVALID_OPTION` 零副作用）。`sync_on_commit` 非零 = 提交后显式 fsync（防掉电丢批——原子性与持久性正交）。
 - `bitcask_txn_recover` / `bitcask_txn_pending_count`（B2 起恒返回 0）：方案 B 意图重放已删除（意图日志从未随发布版本存在）；签名保留。`out_replayed` 可为 `NULL`。
 - `bitcask_txn_pending_count`：legacy 巡检；S35 后正常恒 0。
+
+### 10.4 Meta blob 编解码（S39）
+
+`bitcask_doc_input_t.meta` 收的是「V5 结构化 KV」二进制 blob。S39 之前 C 侧既没有
+编码器也没有解码器：要用 [§7.9](#79-meta-过滤结构) 那棵过滤树，调用方得照着
+`include/bitcask/meta_codec.hpp` 的格式自己拼 varint；`bitcask_get_result_t.meta`
+拿回来也只能当裸字节看。本组补齐两端，全部是纯函数（不碰 `bitcask_t*`），线程安全、
+可重入、无 I/O。
+
+```c
+typedef struct {
+    const char*          key;    // 必填，NUL 结尾 UTF-8
+    bitcask_meta_value_t value;  // 复用 §7.9 的值表示
+} bitcask_meta_entry_t;
+
+BITCASK_API bitcask_error_t bitcask_meta_encode(const bitcask_meta_entry_t* entries,
+                                                size_t n,
+                                                bitcask_slice_t* out_blob,
+                                                bitcask_fault_t* fault);
+BITCASK_API void bitcask_meta_blob_free(bitcask_slice_t* blob);
+```
+
+**排序由库内做。** 格式有一条不变式：entry 必须按 key 字典序升序且不重复——
+`meta_lookup` 靠它「遇到更大的 key 即提前退出」。C++ 侧只有 `assert` 兜底，Release
+（`NDEBUG`）下顺序错了不报错，而是过滤**静默**失配。故本编码器不要求调用方预排序，
+内部自己排；重复 key 判为调用方错误：
+
+- 重复 key、`key == NULL`、`STRING` 缺 `str`、`type` 越界 → `BITCASK_ERR_INVALID_OPTION`，
+  `*out_blob` 保持空（`fault.detail` 给出具体 key）。
+- `n == 0` → `BITCASK_OK` + 空 blob（`data = NULL, size = 0`，**无需 free**），语义等价「不带 meta」。
+- 成功时 `*out_blob` 指向 `malloc` 缓冲，用完调 `bitcask_meta_blob_free`（幂等，接受 `NULL`）。
+
+读回一侧是零拷贝视图，不需要任何释放：
+
+```c
+typedef struct {
+    bitcask_meta_value_type_t type;
+    int64_t         i64;  // BOOL（0/1）与 INT64
+    double          f64;  // FLOAT64
+    bitcask_slice_t str;  // STRING：借 blob 内存，不保证 NUL 结尾，用 str.size
+} bitcask_meta_value_view_t;
+
+BITCASK_API int bitcask_meta_lookup(bitcask_slice_t blob, const char* key,
+                                    bitcask_meta_value_view_t* out_value);
+
+typedef struct { size_t offset; uint64_t remaining; } bitcask_meta_iter_t;
+BITCASK_API int bitcask_meta_iter_begin(bitcask_slice_t blob, bitcask_meta_iter_t* it);
+BITCASK_API int bitcask_meta_iter_next(bitcask_slice_t blob, bitcask_meta_iter_t* it,
+                                       bitcask_slice_t* out_key,
+                                       bitcask_meta_value_view_t* out_value);
+```
+
+- `bitcask_meta_lookup`：单 key 查询，不全量解码（引擎过滤热路径走的就是这条）。
+  命中返回 1，未命中 / blob 为空 / 格式非法返回 0 并把 `*out_value` 置 NULL 类型。
+- 遍历游标零分配、无需释放，key 按升序给出；`out_key` / `out_value` 允许为 `NULL`。
+  blob 必须在整个遍历期间保持有效（视图借的是它的内存）。
+- 损坏的 blob 不报错，`iter_next` 提前返回 0 收尾——与 `meta_lookup` 的「非法即未命中」一致。
+
+`bitcask_meta_value_view_t` 与 `bitcask_meta_value_t` 的唯一区别是字符串表示：后者的
+`str` 是调用方提供的 NUL 结尾串（用于构造过滤/编码输入），前者是借 blob 的
+`{ptr, len}` 切片（用于读出）。
+
+用法：
+
+```c
+bitcask_meta_entry_t es[2] = {0};
+es[0].key = "price"; es[0].value.type = BITCASK_META_VALUE_INT64;  es[0].value.i64 = 42;
+es[1].key = "author"; es[1].value.type = BITCASK_META_VALUE_STRING; es[1].value.str = "david";
+
+bitcask_slice_t meta = {0};
+bitcask_meta_encode(es, 2, &meta, &fault);   /* 无需预排序 */
+
+bitcask_doc_input_ex_t doc = {0};
+doc.text.data = "hello world"; doc.text.size = 11;
+doc.meta = meta;
+bitcask_put_doc_ex(cask, key, &doc, 0, &fault);
+bitcask_meta_blob_free(&meta);
+
+/* 读回 */
+bitcask_get_result_t* g = NULL;
+bitcask_get(cask, key, &g, &fault);
+bitcask_meta_value_view_t v;
+if (bitcask_meta_lookup(g->meta, "price", &v) && v.type == BITCASK_META_VALUE_INT64) {
+    printf("price=%lld\n", (long long)v.i64);
+}
+bitcask_get_result_free(g);
+```
 
 ---
 
@@ -1143,6 +1342,63 @@ BITCASK_API void bitcask_search_result_batch_free(bitcask_search_result_t** resu
 
 **内存配对**：`bitcask_search_text_batch` ↔ `bitcask_search_result_batch_free`；同理 `bitcask_search_vector_batch`、`bitcask_search_hybrid_batch`。
 
+### 13.12 分页：`bitcask_search_text_ex` / `_phrase_ex` / `bool_search_ex`（S39）
+
+C++ 侧 `search_text` / `search_phrase` / `bool_search` 一直有 `offset` 形参（S13-D10），
+C 侧三个函数此前全无——纯 C 调用方做不了分页。S39 补上，既有四个函数签名零改动：
+
+```c
+BITCASK_API bitcask_error_t bitcask_search_text_ex(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_search_phrase_ex(
+    bitcask_t* cask, const char* query, size_t k, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_bool_search_ex(
+    bitcask_t* cask, const char* query, size_t k, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+```
+
+- `bitcask_search_text_ex` 是既有 `bitcask_search_text` 与 `bitcask_search_text_filtered`
+  的**超集**：`filter == NULL && offset == 0` 时三者同义。短语/布尔在 C++ 侧没有
+  `filter` 形参，故只加 `offset`。
+- `offset` = 跳过排名前 `offset` 条。实现是 overfetch `k + offset` 后截断——
+  **深分页成本线性增长**；`offset` 很大时应改用游标式方案。
+- `offset` 超过总命中数 → `BITCASK_OK` + `count == 0`，不是错误。
+- **不提供总命中数**：WAND/BMW 剪枝下 total 只能给下界，误导大于价值（C++ 侧同样不给）。
+- 结果所有权同 §13.10：`bitcask_search_result_free`。
+- ⚠️ `filter` 非空时——**哪怕是一棵空树**——没有 meta 段的文档一律不通过（引擎
+  「空 blob 不通过」约定）。要分页又要过滤，文档必须带 meta（见 [§10.4](#104-meta-blob-编解码s39)）。
+
+### 13.13 `bitcask_search_text_highlight`（词袋 + 高亮片段，S39）
+
+```c
+BITCASK_API bitcask_error_t bitcask_search_text_highlight(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_highlight_options_t* opts,
+    bitcask_search_result_ex_t** out, bitcask_fault_t* fault);
+```
+
+补上 C++ `Cask::search_text_highlight`（S13-D3）的 C 表示。语义同 `bitcask_search_text`，
+额外为每条命中生成片段。结果类型、片段可能为空的原因、配置默认值与所有权见
+[§7.2b](#72b-高亮结果类型s39)。
+
+```c
+bitcask_search_result_ex_t* r = NULL;
+if (bitcask_search_text_highlight(cask, "alpha", 10, NULL, &r, &fault) == BITCASK_OK) {
+    for (size_t i = 0; i < r->count; i++) {
+        printf("%s (%.3f)\n", r->hits[i].key, r->hits[i].score);
+        for (size_t j = 0; j < r->hits[i].highlights_count; j++) {
+            printf("  %s\n", r->hits[i].highlights[j].text);  /* ...<em>alpha</em>... */
+        }
+    }
+    bitcask_search_result_ex_free(r);
+}
+```
+
 ---
 
 ## 14. 向量检索（HNSW / IVF-RaBitQ / DiskANN）与 RRF 混合检索
@@ -1251,7 +1507,9 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 |--------------------------|--------|------|------|
 | `bitcask_open` → `bitcask_t*` | `bitcask_close` | `delete` 句柄包装（内部先调 `Cask::close()`）| 同一 handle 必须恰好 1 次 `close`；句柄指针之后失效 |
 | `bitcask_get` → `bitcask_get_result_t*` | `bitcask_get_result_free` | 依次 `free(value.data)` / `free(meta.data)` / `free(vector)`，最后 `free(result)` | 仅在 `BITCASK_OK` 时有效；`BITCASK_ERR_NOT_FOUND` 时 `*out = NULL` 不需 free |
-| `bitcask_search_*`（单查询）→ `bitcask_search_result_t*` | `bitcask_search_result_free` | 对每个 `hits[i].key` 调 `free`，再 `free(hits)`，最后 `free(result)` | 包含 `search_text / _phrase / _bool / _fields / _near / _fuzzy / _wildcard / _vector / _hybrid` 及对应 `_filtered` 共 12 个单查询入口 |
+| `bitcask_search_*`（单查询）→ `bitcask_search_result_t*` | `bitcask_search_result_free` | 对每个 `hits[i].key` 调 `free`，再 `free(hits)`，最后 `free(result)` | 包含 `search_text / _phrase / _bool / _fields / _near / _fuzzy / _wildcard / _vector / _hybrid`、对应 `_filtered`，以及 S39 新增的 `_text_ex / _phrase_ex / bool_search_ex` 共 15 个单查询入口（高亮版另有自己的 free，见上一行） |
+| `bitcask_search_text_highlight` → `bitcask_search_result_ex_t*` | `bitcask_search_result_ex_free` | 逐 hit `free(key)` + 逐片段 `free(text)` + `free(highlights)`，再 `free(hits)`、`free(result)` | **不可**用 `bitcask_search_result_free` 释放（结构不同）|
+| `bitcask_meta_encode` → `bitcask_slice_t.data` | `bitcask_meta_blob_free` | `free(blob->data)` 并清零（幂等，接受 `NULL`）| `n == 0` 时返回空 blob，无需 free |
 | `bitcask_search_*_batch` → `bitcask_search_result_t**` | `bitcask_search_result_batch_free` | 逐元素调 `bitcask_search_result_free`（`NULL` no-op），最后 `free(results)` | 适用于 `search_text_batch / _vector_batch / _hybrid_batch` |
 | `bitcask_needs_merge` → `bitcask_needs_merge_t.files` | `bitcask_needs_merge_free` | 依次 `free(files[i])`，再 `free(files)`，最后置 `files = NULL`、`files_count = 0` | 即使 `needs == 0` 也调用以保证幂等（`files` 可能为 NULL → no-op）|
 | `bitcask_iter_start` → `bitcask_iter_t*` | `bitcask_iter_release` | `delete` 句柄包装 | 可早于迭代结束调用 |
