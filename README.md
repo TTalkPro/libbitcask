@@ -346,13 +346,20 @@ autoconf）。
 MSBuild 只能在 ICU 源码树里就地构建（vcxproj 把产物路径写死成 `..\..\bin64` 等），
 故 vendored 构建会弄脏 `third_party/icu` 工作区，属预期。
 
-**数据裁剪（`BITCASK_ICU_TRIM_DATA`，默认 ON）**：ICU 的完整数据表约 31 MB，
-静态打包会整块进 `libbitcask.so`（实测 1.7 MB → 34 MB）。本库只用归一化与编码
-转换，故默认按 `cmake/icu-data-filter.json` 裁掉 collation / 时区 / 区域数据 /
-音译 / 断词 / 货币 / 字符名。裁剪由 ICU 自己的 buildtool 完成，**需要 Python 3**；
-找不到 Python 3 会告警并回落全量数据。改那份清单后必须重跑
-`bitcask_text_encoding_test` 与 `bitcask_analyzer_test`——裁错了不会让构建失败，
-只会让归一化/转码在**运行期**静默失效。
+**数据裁剪（`BITCASK_ICU_TRIM_DATA`，默认 OFF）**：ICU 的完整数据表约 31 MB，
+只留归一化与编码转换的话约 5.5 MB。**默认不裁，直接用全量数据。**
+
+不裁的理由是风险不对等：裁多了**不会让构建失败**，只会让归一化或某个编码在
+**运行期**静默失效（返回空串 / `kUnknownEncoding`）。而 `cmake/icu-data-filter.json`
+里写的是 ICU 的**内部 category 名**，属实现细节、跨大版本会改——ICU 78 就已经
+对其中的 `brkitr_treedict` / `coll_tree` 报“category 不存在”，且只是 warning、
+不中断构建。等于这份清单会随 ICU 升级悄悄失效，而失效点在运行期。为省 25 MB
+背这个，不划算。
+
+需要那 25 MB 时再显式打开（`-DBITCASK_ICU_TRIM_DATA=ON`）：裁剪由 ICU 自己的
+buildtool 完成，**需要 Python 3**，找不到会告警并回落全量数据。开启或改动清单后
+必须重跑 `bitcask_text_encoding_test` 与 `bitcask_analyzer_test`——它们是这份清单
+唯一的守门人。
 
 需要 ICU **≥ 60**（`Normalizer2::normalizeUTF8` 的引入版本）。只用 `uc` + `data`
 两个组件，不链 `i18n`。
