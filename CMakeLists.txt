@@ -116,7 +116,20 @@ if(WIN32)
     # 文件与 DLL（bitcask.dll / tbb12.dll / zlib1.dll）收进同一个 bin/，
     # ctest 直接跑 exe 全路径即可加载到依赖，不必给每个测试改 PATH。
     # 变量会被子目录继承，故 third_party 的 DLL 也落在这里。
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin")
+    #
+    # ⚠️ per-config 的四个变体必须**一并设**：多配置生成器（Visual Studio /
+    # Xcode）只认它们，光设无后缀的那个，exe 会落进 bin/<Config>/ 而 DLL 仍在
+    # bin/ —— 「收进同一个 bin/」这条就地失效。失败点在**构建期**：
+    # gen_inert_table 是链 ICU 的代码生成器，构建中途要被执行，icuuc*.dll 不在
+    # 它旁边就是 0xC0000135（MSB8066，退出代码 -1073741515），而那条报错里
+    # 一个字都不提 DLL。实测：VS 生成器 + vendored ICU 的发行构建必炸。
+    # 代价是 Debug 与 Release 在同一棵树里会互相覆盖 bin/ —— 与下面 oneTBB 那
+    # 段逐目标拉回 bin/ 的既成取舍一致（那里同样把四个 per-config 都指向 bin/）。
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY                "${PROJECT_BINARY_DIR}/bin")
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG          "${PROJECT_BINARY_DIR}/bin")
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE        "${PROJECT_BINARY_DIR}/bin")
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${PROJECT_BINARY_DIR}/bin")
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL     "${PROJECT_BINARY_DIR}/bin")
 endif()
 
 # ---------------------------------------------------------------------------
