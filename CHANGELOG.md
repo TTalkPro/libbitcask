@@ -5,12 +5,33 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.3.0`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.3.1`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
+
+---
+
+## [6.3.1] - 2026-09-08（构建修复：多配置生成器下的 exe 输出目录）
+
+> **版本语义**：只动构建脚本——C API 的函数、枚举、结构体布局零改动，
+> 库代码一行未变，盘上格式零变化 → PATCH +1，**`SOVERSION` 保持 `6`**。
+
+### Fixed
+
+- **多配置生成器（Visual Studio / Xcode）下 exe 与 DLL 被拆到两个目录**。
+  `CMAKE_RUNTIME_OUTPUT_DIRECTORY` 那条只设了无后缀的变量，而多配置生成器只认
+  per-config 的四个变体，于是 exe 落进 `bin/<Config>/`、DLL 仍在 `bin/`——
+  「全部收进同一个 `bin/`」这条就地失效。现在 `_DEBUG` / `_RELEASE` /
+  `_RELWITHDEBINFO` / `_MINSIZEREL` 一并指向 `bin/`，与下面 oneTBB 那段逐目标
+  拉回 `bin/` 的既有做法一致。
+  - 失败点在**构建期**而非运行期：`gen_inert_table` 是链 ICU 的代码生成器，
+    构建中途要被执行，`icuuc*.dll` 不在它旁边就是 `0xC0000135`（MSB8066，
+    退出码 -1073741515），而那条报错里一个字都不提 DLL。VS 生成器 + vendored
+    ICU 的发行构建必现。
+  - 代价：Debug 与 Release 在同一棵构建树里会互相覆盖 `bin/`——与既有取舍一致。
 
 ---
 
