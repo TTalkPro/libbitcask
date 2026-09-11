@@ -5,12 +5,44 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.3.1`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.3.2`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
+
+---
+
+## [6.3.2] - 2026-09-11（修复：V5 结构化 meta 重开即丢——带 meta filter 的检索恒空）
+
+> **版本语义**：C API 零改动；盘上格式**仅追加段型、文件版本不动**——docmap
+> ckpt 新增 `kDocmapMeta`（20）/ `kDocmapMetaDelta`（21）两个段，旧读端静默
+> 忽略 → 行/水位完整，只丢 meta，与此前「meta 从不落盘」等价，不构成数据洞。
+> 纯缺陷修复 → PATCH +1，**`SOVERSION` 保持 `6`**。无 meta 部署不写段，零字节
+> 开销。
+
+### Fixed
+
+- **V5 结构化 meta 只活在内存，重开即丢**：docmap ckpt（base 全量与 delta 窗口）
+  与 fold 重放都不带 meta，重开后 `eval_meta` 对所有文档恒 false——带 filter
+  的检索一律空集，无 filter 检索正常。三条恢复路径本次全部补齐：
+  - **docmap base ckpt**：新增 `kDocmapMeta` 段（全部 live 且 meta 非空的 ord，
+    ord-gap + 长度 + blob 原样），读端在 `kDocmap` 行段应用完后逐条
+    `Index::set_meta`。
+  - **docmap delta 链**：新增 `kDocmapMetaDelta` 段（窗口 `[from, watermark)`
+    内同上），**必须排在行段之后**——读端按文件序应用，行先 `put_doc`、meta
+    后补，与活写路径 `put_doc→set_meta` 同序。
+  - **fold 尾部重放**：恢复重放（`load_keydir_from_disk`）的 `ReplayDoc` 补带
+    meta，与 ckpt 同序回填；仅带 meta 的文档（text/向量/命名字段全空）此前
+    连 docmap 都不登记，被 live 过滤当死文档——现在与纯命名字段文档同理恢复。
+  - 段畸形（长度不足/尾部残留）→ 整组件退 fold 重建，fold 重放同样回填 meta，
+    不丢数据。`Index` 新增 `for_each_meta_in(from, to, fn)` 遍历原语（语义/
+    锁与 `for_each_live_in` 一致）。
+  - 回归测试 `V5MetaFilterSurvivesReopen` 三路覆盖：close 全量 base、崩溃镜像
+    （base + delta 链）、崩溃镜像（ckpt + fold 尾部），并验证恢复后再
+    checkpoint 的增量 meta 落盘。格式规约同步见 [`format-zh.md`](doc/format-zh.md)
+    §10.1.1。
 
 ---
 
