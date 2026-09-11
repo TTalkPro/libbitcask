@@ -4654,6 +4654,92 @@ TEST_F(CaskDocValueTest, V5SearchTextWithMetaFilter) {
     (*c)->close();
 }
 
+// V5 回归：meta 此前只活在内存（docmap ckpt 与 fold 重放都不带），重开后
+// eval_meta 对所有文档恒 false → 带 filter 的检索一律空集（无 filter 正常）。
+// 三条恢复路径全覆盖：base ckpt（close 全量）、delta 链（checkpoint 增量）、
+// fold 尾部重放（ckpt 之后未落盘的记录，经崩溃镜像）。
+TEST_F(CaskDocValueTest, V5MetaFilterSurvivesReopen) {
+    namespace fs = std::filesystem;
+    auto opts = p3_search_opts();
+    auto m_tech = make_meta_blob({{"category", std::string("tech")}});
+    auto m_sport = make_meta_blob({{"category", std::string("sport")}});
+
+    // 每段各写一 tech 一 sport，文本都含 "learning"：无 filter 命中 2n，
+    // tech/sport filter 各命中 n 且 key 前缀对应；filter 值不存在 → 0。
+    auto expect_n = [&](Cask& c, std::size_t n, const char* tag) {
+        auto all = c.search_text("learning", 10);
+        ASSERT_TRUE(all) << tag;
+        EXPECT_EQ(all->hits.size(), 2 * n) << tag;
+        for (const char* cat : {"tech", "sport"}) {
+            auto filter = make_eq_filter({{"category", std::string(cat)}});
+            auto r = c.search_text("learning", 10, filter.get());
+            ASSERT_TRUE(r) << tag;
+            EXPECT_EQ(r->hits.size(), n) << tag << " " << cat;
+            for (auto& h : r->hits) {
+                EXPECT_EQ(h.key[0], cat[0]) << tag << " " << h.key;
+            }
+        }
+        auto none = make_eq_filter({{"category", std::string("music")}});
+        auto r = c.search_text("learning", 10, none.get());
+        ASSERT_TRUE(r) << tag;
+        EXPECT_EQ(r->hits.size(), 0u) << tag;
+    };
+
+    fs::path img_fold, img_delta;
+    {
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        // 段①：进 ckpt base/delta（第一次 checkpoint）。
+        v5_put(**c, "t1", "machine learning algorithms", {}, m_tech);
+        v5_put(**c, "s1", "learning to swim", {}, m_sport);
+        (*c)->flush_index();
+        ASSERT_TRUE((*c)->checkpoint());
+        // 段②：进 delta 链（第二次 checkpoint，docmap 脏 → delta）。
+        v5_put(**c, "t2", "deep learning networks", {}, m_tech);
+        v5_put(**c, "s2", "learning football", {}, m_sport);
+        (*c)->flush_index();
+        ASSERT_TRUE((*c)->checkpoint());
+        img_delta = crash_image(tmpdir_, "meta_delta");
+        // 段③：ckpt 之后的尾部，只在 data 文件里 → fold 重放。
+        v5_put(**c, "t3", "reinforcement learning agents", {}, m_tech);
+        v5_put(**c, "s3", "learning tennis", {}, m_sport);
+        (*c)->flush_index();
+        expect_n(**c, 3, "live");
+        img_fold = crash_image(tmpdir_, "meta_fold");
+        (*c)->close();  // 全量 base 落盘
+    }
+    {
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        expect_n(**c, 3, "reopen after close (base ckpt)");
+        (*c)->close();
+    }
+    {
+        auto c = Cask::open(img_delta.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        expect_n(**c, 2, "crash image (base + delta chain)");
+        (*c)->close();
+    }
+    {
+        auto c = Cask::open(img_fold.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        expect_n(**c, 3, "crash image (ckpt + fold tail)");
+        // 重开后再写、再 checkpoint、再重开：增量 meta 也要跟着落。
+        v5_put(**c, "t4", "learning rate schedules", {}, m_tech);
+        v5_put(**c, "s4", "learning golf", {}, m_sport);
+        (*c)->flush_index();
+        ASSERT_TRUE((*c)->checkpoint());
+        (*c)->close();
+        auto c2 = Cask::open(img_fold.string(), opts, &test_registry());
+        ASSERT_TRUE(c2);
+        expect_n(**c2, 4, "reopen after post-recovery checkpoint");
+        (*c2)->close();
+    }
+    std::error_code ec;
+    fs::remove_all(img_delta, ec);
+    fs::remove_all(img_fold, ec);
+}
+
 // V5.2:向量搜索 + metadata filter
 TEST_F(CaskDocValueTest, V5SearchVectorWithMetaFilter) {
     constexpr std::size_t kDim = 8, kN = 6;

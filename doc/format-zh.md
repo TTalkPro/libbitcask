@@ -904,6 +904,23 @@ rows × 行编码（gap+vbyte；v3 起 tstamp 定宽 8B）：
 固定 `kSidecarMagic` / `kSidecarVersion = 3` 是 namespace 内的匿名空间常量。
 v1/v2 属 u32-tstamp 纪元，读端拒收（退 fold 重建）。
 
+#### 10.1.1 docmap meta（kDocmapMeta 段，可选）
+
+base 文件里紧随 kDocmap 段之后，落全部 live 且 meta 非空的 ord 的 V5
+结构化 meta blob（`Index::meta_blobs_`）。无 meta 部署不写此段。
+
+```
+  rn        : VByte   条数
+  rn × ：
+    ord_gap : VByte   ord - prev_ord
+    len     : VByte   blob 字节数（> 0）
+    blob    : [len]   meta_codec 编码的 KV blob（原样）
+```
+
+读端在 kDocmap 段应用完后逐条 `Index::set_meta`；段畸形 → 整组件退 fold
+（fold 重放同样回填 meta）。仅追加段型、文件版本不变：旧读端静默忽略，
+行/水位完整，只丢 meta——与此段引入前「meta 从不落盘」等价，不构成数据洞。
+
 ### 10.2 docmap delta（kDocmapDeltaV3 段）
 
 `save_docmap_delta` 把窗口 `[from, watermark)` 内的 live 行 + 删除日志作为
@@ -932,6 +949,10 @@ v1/v2 属 u32-tstamp 纪元，读端拒收（退 fold 重建）。
     tomb_gap  : VByte   tomb - prev_tomb
     klen      : VByte   ≤ 0xFFFF
     key       : [klen]
+
+[kDocmapMetaDelta 段]（可选，必在行段之后）
+  窗口 [from, watermark) 内 live 且 meta 非空的 ord 的 meta blob；布局同
+  §10.1.1 的 kDocmapMeta。读端按文件序应用（行先 put_doc、再 set_meta）。
 
 [kKeydirDelta 段]（可选）
   keydir 半边元数据；由宿主透传（see `DocmapReplayHook`）。

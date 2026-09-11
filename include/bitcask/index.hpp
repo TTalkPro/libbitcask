@@ -249,6 +249,23 @@ public:
         }
     }
 
+    // V5 meta 持久化：遍历 ord ∈ [from, to) 且 live 且 meta 非空的文档，
+    // 对每个调用 fn(ord, blob)。docmap ckpt（base 全量 / delta 窗口）用——
+    // 此前 meta 只活在内存，ckpt 与 fold 都不带它，重开后 eval_meta 对所有
+    // 文档恒 false（带 filter 的检索一律空集）。语义/锁与 for_each_live_in
+    // 一致；meta 未启用（列为空）时零次回调。
+    template <typename Fn>
+    void for_each_meta_in(std::uint64_t from, std::uint64_t to, Fn&& fn) const {
+        std::shared_lock lk(mutex_);
+        const std::uint64_t hi = std::min<std::uint64_t>(
+            {to, live_.size(), meta_blobs_.size()});
+        for (std::uint64_t ord = from; ord < hi; ++ord) {
+            if (live_[ord] && !meta_blobs_[ord].empty()) {
+                fn(ord, std::span<const std::byte>(meta_blobs_[ord]));
+            }
+        }
+    }
+
     // ---- S18-2：docmap sidecar（"BCIS"）序列化（自 SearchLayer 平移）----
     // 把 ord → (ext_id, DocSlot) 活映射落进 checkpoint，避免冷启动全量 fold
     // 重建。covers_next_ord 记录快照覆盖的 ord 水位（与后续 WAL/data 的衔接

@@ -274,6 +274,7 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
         std::uint64_t tstamp = 0;
         std::vector<float> vector;
         std::vector<std::pair<std::string, std::string>> fields;
+        std::vector<std::byte> meta;  // V5 结构化 meta（空 = 无）
     };
     std::vector<ReplayDoc> recover_batch;
     // ①（s13-review §P1 后续）：统计本次恢复重分析的文档数——它度量的是
@@ -333,6 +334,10 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                                                .file_id  = d.file_id,
                                                .total_sz = d.total_sz},
                                  d.tstamp, /*doc_len=*/0});
+            // V5 meta 与活写路径（reduce_index_entry）同序回填：此前 fold
+            // 重放整段丢弃 meta → 重开后 eval_meta 恒 false，带 filter 的
+            // 检索一律空集。
+            if (!d.meta.empty()) docmap_->set_meta(d.ord, d.meta);
             for (std::size_t pi = 0; pi < np; ++pi) {
                 plugins_[pi]->on_put(views[i].ev, std::move(preps[i][pi]));
             }
@@ -455,8 +460,9 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                     // S14-6：纯命名字段文档（text 空、无向量）也必须恢复——
                     // 否则连 docmap 都缺该 ord，live 过滤把它当死文档，
                     // bm25.fields 重建无从谈起。
+                    // V5：仅带 meta 的文档同理（活写路径无条件登记 docmap）。
                     if (dv && (!dv->text.empty() || dv_has_vec ||
-                               dv->has_fields)) {
+                               dv->has_fields || dv->has_meta)) {
                         // S3:攒进批，满 kRecoverBatch 即并行处理。ReplayDoc 持
                         // owning 拷贝（fold 缓冲会复用，view 不可跨记录留存）。
                         ReplayDoc rd;
@@ -491,6 +497,9 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                                             f.value.data()),
                                         f.value.size()));
                             }
+                        }
+                        if (dv->has_meta) {
+                            rd.meta.assign(dv->meta.begin(), dv->meta.end());
                         }
                         recover_batch.push_back(std::move(rd));
                         if (recover_batch.size() >= kRecoverBatch) flush_recover();

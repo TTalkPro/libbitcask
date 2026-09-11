@@ -185,6 +185,66 @@ bool apply_docmap_delta_section_v2(Index& docmap,
     return true;
 }
 
+// V5 meta 段（kDocmapMeta / kDocmapMetaDelta 同一布局）：
+//   count vbyte; 每条 ord-gap vbyte | len vbyte | bytes
+// 只收 [from, to) 内 live 且 meta 非空的 ord。返回是否有条目（无则 caller
+// 不写段——无 meta 部署零字节开销）。
+bool encode_docmap_meta_section(const Index& docmap, std::uint64_t from,
+                                std::uint64_t to, std::vector<std::byte>& out) {
+    std::vector<std::byte> rows_buf;
+    std::uint64_t rows = 0;
+    std::uint64_t prev_ord = 0;
+    docmap.for_each_meta_in(from, to,
+        [&](std::uint64_t ord, std::span<const std::byte> blob) {
+            codec::vbyte_encode(ord - prev_ord, rows_buf);
+            prev_ord = ord;
+            codec::vbyte_encode(blob.size(), rows_buf);
+            rows_buf.insert(rows_buf.end(), blob.begin(), blob.end());
+            ++rows;
+        });
+    if (rows == 0) return false;
+    out.clear();
+    out.reserve(rows_buf.size() + 16);
+    codec::vbyte_encode(rows, out);
+    out.insert(out.end(), rows_buf.begin(), rows_buf.end());
+    return true;
+}
+
+// 解析 + 应用 meta 段：逐条 set_meta（ord 已由同文件更早的 kDocmap /
+// kDocmapDelta* 段 put_doc 登记；set_meta 对未登记 ord 也只是扩容，不会
+// 误亮 live）。载荷结构错误（长度不足/尾部残留）返回 false。
+bool apply_docmap_meta_section(Index& docmap,
+                               std::span<const std::byte> payload) {
+    const auto* p = payload.data();
+    const auto* end = p + payload.size();
+    bool fail = false;
+    auto vb = [&]() -> std::uint64_t {  // 边界安全 vbyte
+        std::uint64_t v = 0, shift = 0;
+        while (true) {
+            if (p >= end || shift > 63) { fail = true; return 0; }
+            const auto byte = static_cast<std::uint8_t>(*p++);
+            v |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
+            if (byte & 0x80) return v;
+            shift += 7;
+        }
+    };
+    const std::uint64_t rn = vb();
+    if (fail || rn > (1ull << 40)) return false;
+    std::uint64_t prev_ord = 0;
+    for (std::uint64_t i = 0; i < rn; ++i) {
+        const std::uint64_t ord = prev_ord + vb();
+        prev_ord = ord;
+        const std::uint64_t len = vb();
+        if (fail || len == 0 ||
+            static_cast<std::uint64_t>(end - p) < len) {
+            return false;
+        }
+        docmap.set_meta(ord, std::span<const std::byte>(p, len));
+        p += len;
+    }
+    return !fail && p == end;
+}
+
 namespace {
 
 // 单个 delta 文件的段集应用（原 apply_delta_file 的 docmap 版）。
@@ -207,6 +267,10 @@ bool apply_delta_file(Index& docmap,
             case sc::CkptSectionType::kDocmapDeltaV3:
                 return apply_docmap_delta_section_v2(docmap, pl, rows, rems,
                                                      /*tstamp64=*/true);
+            case sc::CkptSectionType::kDocmapMetaDelta:
+                // 段序：save_docmap_delta 先写行段再写 meta 段，此处按文件序
+                // 应用 → 行先落、meta 后补，与活写路径 put_doc→set_meta 同序。
+                return apply_docmap_meta_section(docmap, pl);
             default:
                 return true;  // kDeltaInfo 由链校验消费；其余段型忽略。
             }
@@ -241,11 +305,22 @@ bool save_docmap_base(Index& docmap, std::string_view dir,
     }
     std::vector<std::uint8_t> buf;
     if (!docmap.serialize_docmap(buf, watermark)) return false;
-    sc::CkptSection sec{
-        static_cast<std::uint16_t>(sc::CkptSectionType::kDocmap), 0,
-        std::span<const std::byte>(
-            reinterpret_cast<const std::byte*>(buf.data()), buf.size())};
-    if (!sc::SearchCheckpoint::write(fp, watermark, {&sec, 1})) return false;
+    sc::SectionWriter sw;
+    sw.add(sc::CkptSectionType::kDocmap,
+           std::vector<std::byte>(
+               reinterpret_cast<const std::byte*>(buf.data()),
+               reinterpret_cast<const std::byte*>(buf.data()) + buf.size()));
+    // V5 meta：全部 live ord 的 meta 随 base 落盘（此前只活在内存，重开即丢
+    // → 带 filter 的检索恒空）。无 meta 部署不写段。
+    {
+        std::vector<std::byte> mb;
+        if (encode_docmap_meta_section(docmap, 0, watermark, mb)) {
+            sw.add(sc::CkptSectionType::kDocmapMeta, std::move(mb));
+        }
+    }
+    if (!sc::SearchCheckpoint::write(fp, watermark, sw.sections())) {
+        return false;
+    }
     sc::remove_chain_files(fp);  // S20-2 R8
     // 记账收尾：base 落成 = 链坍缩（静止点所有已入账 ord < watermark）。
     docmap.begin_delta_window(watermark);
@@ -316,6 +391,14 @@ bool save_docmap_delta(Index& docmap, std::string_view dir,
         }
         sw.add(sc::CkptSectionType::kDocmapDeltaV3, std::move(b));
     }
+    // V5 meta：窗口内 live 行的 meta（必须排在行段之后——读端按文件序应用，
+    // 行先落再 set_meta）。窗口内无 meta 则不写段。
+    {
+        std::vector<std::byte> mb;
+        if (encode_docmap_meta_section(docmap, from, watermark, mb)) {
+            sw.add(sc::CkptSectionType::kDocmapMetaDelta, std::move(mb));
+        }
+    }
     // keydir meta 仅在 docmap 组件落（S14-7 成对不变量）。
     if (!keydir_delta.empty()) {
         std::vector<std::byte> kb(keydir_delta.begin(), keydir_delta.end());
@@ -363,6 +446,7 @@ DocmapLoadResult load_docmap(Index& docmap, std::string_view dir,
     // kDocmap 段应用。
     bool segments_ok = true;
     bool any = false;
+    std::optional<std::span<const std::byte>> meta_pl;
     for (const auto& ls : lc->sections) {
         if (!ls.crc_ok) { segments_ok = false; continue; }
         if (ls.type ==
@@ -373,10 +457,19 @@ DocmapLoadResult load_docmap(Index& docmap, std::string_view dir,
                     ls.payload.size()));
             if (!covers) segments_ok = false;
             else any = true;
+        } else if (ls.type == static_cast<std::uint16_t>(
+                                  sc::CkptSectionType::kDocmapMeta)) {
+            // 延后到行段之后应用（不依赖段在文件里的先后）。
+            meta_pl = std::span<const std::byte>(ls.payload.data(),
+                                                 ls.payload.size());
         }
         // 旧文件可能含 meta/terms 等扩展段——忽略。
     }
     if (!any) segments_ok = false;
+    if (segments_ok && meta_pl &&
+        !apply_docmap_meta_section(docmap, *meta_pl)) {
+        segments_ok = false;  // meta 段畸形 → 整组件退 fold（fold 可重建 meta）
+    }
     // 链重放（.prev 回退 = 链不可信，与 SearchLayer 版语义一致）。S20-2 R2：
     // 走读收敛至 sc::walk_chain（有界，apply = apply_delta_file 含 CRC 预检）。
     std::uint64_t coverage = lc->watermark;

@@ -75,6 +75,12 @@ enum class CkptSectionType : std::uint16_t {
     // 含本段的文件以 file version 3 写出（同 V2 引入时的降级安全论证：
     // 旧读端整文件拒收 → 链断 → 退 fold，绝不静默跳段丢行）。
     kDocmapDeltaV3    = 19,
+    // V5 meta 持久化：docmap 的 per-ord meta blob（base 全量 / delta 窗口
+    // 增量）。布局：count vbyte; 每条 ord-gap vbyte | len vbyte | bytes。
+    // 仅追加段型、文件版本不动：旧读端静默忽略 → 行/水位完整，只丢 meta
+    // ——与其此前「从不落盘」的行为等价，不构成数据洞。
+    kDocmapMeta       = 20,  // docmap.ckpt base：全部 live 且 meta 非空的 ord
+    kDocmapMetaDelta  = 21,  // docmap.ckpt.d<seq>：窗口 [from, wm) 内同上
 };
 
 // 写入用:caller 持有 payload 字节。
