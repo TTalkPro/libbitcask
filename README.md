@@ -343,6 +343,16 @@ autoconf）。
 | `BITCASK_ICU_MSVC_TOOLSET` | 编 ICU 用的 `PlatformToolset`。默认跟随本次构建的工具集。ICU 76 自带的 props 只认到 `v143`（VS 2022），更新的 VS 必须显式喂，否则 MSBuild 报 `Platform Toolset = ''` |
 | `BITCASK_ICU_MSVC_CONFIG` | `Debug` / `Release`。默认跟随 `CMAKE_BUILD_TYPE`——ICU 的 Debug 用 `/MDd`、Release 用 `/MD`，务必与本次构建的 CRT 一致 |
 
+`VCToolsVersion` 无旋钮、自动钉：构建系统从当前编译器路径切出
+`…/VC/Tools/MSVC/<ver>/bin/` 里的版本（`VCToolsVersion` 环境变量只作兜底；
+都拿不到不钉），经 `/p:` 全局属性喂给 MSBuild。不钉的话 VS 18 的 MSBuild 会
+自选最新的 14.5x，与 `/p:PlatformToolset=v143` 撞 `MSB8052`——而报文指的
+「改工具集 / 修 VS 安装」两条都不通。configure 输出第四格显示钉的是哪版：
+
+```
+ICU: vendored ICU 78 via MSBuild [Release | x64 | v143 | VCToolsVersion 14.44.35207]
+```
+
 MSBuild 只能在 ICU 源码树里就地构建（vcxproj 把产物路径写死成 `..\..\bin64` 等），
 故 vendored 构建会弄脏 `third_party/icu` 工作区，属预期。
 

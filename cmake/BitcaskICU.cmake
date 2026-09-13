@@ -310,6 +310,37 @@ if(MSVC)
         set(_icu_toolset "v143")
     endif()
 
+    # ---- VCToolsVersion ----
+    # 上面 PlatformToolset 那款手法的另一半。VS 18（2026）上 MSBuild 会把
+    # VCToolsVersion 自己找回来，而且找到的是**最新的** 14.5x，链路三步、每步
+    # 都是 Microsoft 的设计：
+    #   1. Microsoft.Cpp.Default.props 开头的清空表里明写 <VCToolsVersion />——
+    #      vcvars 注进来的环境变量从这里起就不算数（所以在 build-icu.bat 里
+    #      `set VCToolsVersion=…` 也没用：环境变量进 MSBuild 只是普通属性，
+    #      工程里一句 <VCToolsVersion /> 就压掉；**命令行 /p: 是全局属性，
+    #      压不掉**，这正是上面 PlatformToolset 在用的那手）；
+    #   2. Microsoft.Cpp.VCTools.props 按 PlatformToolset 找
+    #      Auxiliary\Build\Microsoft.VCToolsVersion.v143.default.props，
+    #      找不到就退回版本无关的 Microsoft.VCToolsVersion.default.props；
+    #   3. VS 18 不发 …v143.default.props（本机同名 .txt 在、.props 不在），
+    #      第 2 步退回的那份按 v145→v143→… 取最新 ⇒ 14.5x ⇒ 与
+    #      /p:PlatformToolset=v143 撞 MSB8052，而报文指的「改 PlatformToolset /
+    #      修 VS 安装」两条都不通（14.5x 的 bin 里没有 cl.exe；安装没坏）。
+    # 解法：/p:VCToolsVersion 显式钉。版本号优先从编译器路径切
+    # （…/VC/Tools/MSVC/14.44.35207/bin/…）——_icu_toolset 推自
+    # MSVC_TOOLSET_VERSION / CMAKE_VS_PLATFORM_TOOLSET，都出自这一个编译器，
+    # 两者同源、不可能互相打架，且不依赖调用方进没进 vcvars。
+    # $ENV{VCToolsVersion} 是 configure 时读、build 时才用，两次不在同一个
+    # shell 里（下游每条命令一个新进程），今天相等是约定不是保证——只配当兜底。
+    # 都拿不到就不钉（保持旧行为）：钉一个猜出来的版本号，错法与不钉同款，
+    # 只是换个方向。
+    set(_icu_vctools_version "")
+    if(CMAKE_CXX_COMPILER MATCHES "[/\\]MSVC[/\\]([0-9][0-9.]*)[/\\]bin[/\\]")
+        set(_icu_vctools_version "${CMAKE_MATCH_1}")
+    elseif(DEFINED ENV{VCToolsVersion} AND NOT "$ENV{VCToolsVersion}" STREQUAL "")
+        set(_icu_vctools_version "$ENV{VCToolsVersion}")
+    endif()
+
     # ---- Configuration ----
     # ICU 的 Debug 配置用 /MDd，Release 用 /MD。跟本次构建的 CRT 对齐，别让一个
     # 进程里同时出现两份 CRT——ICU 的 ByteSink 会往我们的 std::string 里写，
@@ -520,6 +551,11 @@ if(MSVC)
         " /p:SkipUWP=true"
         " /p:PlatformToolset=${_icu_toolset}"
         " /p:DefaultPlatformToolset=${_icu_toolset}")
+    if(_icu_vctools_version)
+        # /p: 是全局属性，工程内的 <VCToolsVersion /> 清不掉它——
+        # PlatformToolset 同款手法，理由见上面 VCToolsVersion 一段的推导。
+        string(APPEND _icu_bat_body " /p:VCToolsVersion=${_icu_vctools_version}")
+    endif()
     if(NOT _icu_toolset MATCHES "^v14[0123]$")
         # props 只给 v141/v142/v143 兜底设 WindowsTargetPlatformVersion；更新的
         # 工具集上它是空的，得自己给。"10.0" = 用装着的最新 Windows 10/11 SDK。
@@ -610,9 +646,16 @@ if(MSVC)
     set(BITCASK_ICU_VENDORED_LIBS "${_icu_uc_implib}" "${_icu_dt_implib}")
     set(BITCASK_ICU_VENDORED_DLLS "${_icu_uc_dll}" "${_icu_dt_dll}")
 
+    # STATUS 第四格：这一格错了会编不动（MSB8052），而 MSB8052 的报文指的是
+    # 别的方向——当场说出钉的是哪版，省掉从报文反查三层 props 的那一趟。
+    if(_icu_vctools_version)
+        set(_icu_vctools_note " | VCToolsVersion ${_icu_vctools_version}")
+    else()
+        set(_icu_vctools_note " | VCToolsVersion 未钉（MSBuild 自选）")
+    endif()
     message(STATUS
         "ICU: vendored ICU ${BITCASK_ICU_MAJOR} via MSBuild"
-        " [${_icu_cfg} | ${_icu_msvc_platform} | ${_icu_toolset}]")
+        " [${_icu_cfg} | ${_icu_msvc_platform} | ${_icu_toolset}${_icu_vctools_note}]")
 else()
     # -----------------------------------------------------------------------
     # 2b. Unix（含 MinGW/MSYS）—— autoconf，静态
