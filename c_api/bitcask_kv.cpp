@@ -54,16 +54,68 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts) {
     opts->keydir_cache_entries = 0;   // S36：Level B 关（现状全内存）
 }
 
+// 6.4.0：缺省**从 C++ 结构体抄**，不手写数字——上游哪天改缺省这里自动跟。
+BITCASK_API void bitcask_merge_policy_init(bitcask_merge_policy_t* policy) {
+    if (!policy) return;
+    const bitcask::merge::PolicyOptions d{};
+    policy->frag_merge_trigger       = d.frag_merge_trigger;
+    policy->dead_bytes_merge_trigger = d.dead_bytes_merge_trigger;
+    policy->deletion_rate_trigger    = d.deletion_rate_trigger;
+    policy->frag_threshold           = d.frag_threshold;
+    policy->dead_bytes_threshold     = d.dead_bytes_threshold;
+    policy->small_file_threshold     = d.small_file_threshold;
+    policy->expiry_secs              = d.expiry_secs;
+    policy->expiry_grace_time        = d.expiry_grace_time;
+    policy->max_merge_size           = d.max_merge_size;
+}
+
 BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
                                           const bitcask_options_t* opts,
                                           bitcask_t** out,
                                           bitcask_fault_t* fault) {
+    // 6.4.0：bitcask_open 只是 policy = NULL 的 bitcask_open_ex，行为逐字节不变。
+    return bitcask_open_ex(dirname, opts, nullptr, out, fault);
+}
+
+BITCASK_API bitcask_error_t bitcask_open_ex(const char* dirname,
+                                             const bitcask_options_t* opts,
+                                             const bitcask_merge_policy_t* policy,
+                                             bitcask_t** out,
+                                             bitcask_fault_t* fault) {
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
 
     bitcask::CaskOptions cpp_opts;
+    // 6.4.0：merge 策略。百分比三格先验，越界不碰盘就拒绝（merge::decide 拿
+    // 它们与 0..100 的碎片率比，101 = 永不触发、-1 = 恒触发，两种都是静默的）。
+    if (policy) {
+        const int pcts[3] = {policy->frag_merge_trigger, policy->frag_threshold,
+                             policy->deletion_rate_trigger};
+        const char* const names[3] = {"frag_merge_trigger", "frag_threshold",
+                                      "deletion_rate_trigger"};
+        for (int i = 0; i < 3; ++i) {
+            if (pcts[i] < 0 || pcts[i] > 100) {
+                if (fault) {
+                    fault->code = BITCASK_ERR_INVALID_OPTION;
+                    fault->errnum = 0;
+                    snprintf(fault->detail, BITCASK_DETAIL_MAX,
+                             "merge policy: %s = %d out of [0, 100]", names[i], pcts[i]);
+                }
+                return BITCASK_ERR_INVALID_OPTION;
+            }
+        }
+        cpp_opts.policy.frag_merge_trigger       = policy->frag_merge_trigger;
+        cpp_opts.policy.dead_bytes_merge_trigger = policy->dead_bytes_merge_trigger;
+        cpp_opts.policy.deletion_rate_trigger    = policy->deletion_rate_trigger;
+        cpp_opts.policy.frag_threshold           = policy->frag_threshold;
+        cpp_opts.policy.dead_bytes_threshold     = policy->dead_bytes_threshold;
+        cpp_opts.policy.small_file_threshold     = policy->small_file_threshold;
+        cpp_opts.policy.expiry_secs              = policy->expiry_secs;
+        cpp_opts.policy.expiry_grace_time        = policy->expiry_grace_time;
+        cpp_opts.policy.max_merge_size           = policy->max_merge_size;
+    }
     if (opts) {
         cpp_opts.read_write = opts->read_write != 0;
         cpp_opts.max_file_size = opts->max_file_size;
@@ -934,6 +986,55 @@ BITCASK_API bitcask_error_t bitcask_merge(bitcask_t* cask,
     if (!cask) return BITCASK_ERR_INVALID_OPTION;
 
     auto result = as_cpp_cask(cask)->merge();
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    return BITCASK_OK;
+    });
+}
+
+// 6.4.0：显式文件表。名字与 active 文件的两道闸在 Cask::merge 里（active_file_id_
+// 只有它看得见），这里只做 C 边界的形状检查与拷贝。
+BITCASK_API bitcask_error_t bitcask_merge_files(bitcask_t* cask,
+                                                  const char* const* files,
+                                                  size_t files_count,
+                                                  bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    std::vector<std::string> paths;
+    if (files && files_count > 0) {
+        paths.reserve(files_count);
+        for (size_t i = 0; i < files_count; ++i) {
+            if (!files[i] || files[i][0] == '\0') {
+                if (fault) {
+                    fault->code = BITCASK_ERR_INVALID_OPTION;
+                    fault->errnum = 0;
+                    snprintf(fault->detail, BITCASK_DETAIL_MAX,
+                             "merge_files: files[%zu] is NULL or empty", i);
+                }
+                return BITCASK_ERR_INVALID_OPTION;
+            }
+            paths.emplace_back(files[i]);
+        }
+    }
+    auto result = as_cpp_cask(cask)->merge(std::move(paths));
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    return BITCASK_OK;
+    });
+}
+
+// 6.4.0：手动 checkpoint。
+BITCASK_API bitcask_error_t bitcask_checkpoint(bitcask_t* cask,
+                                                 bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    auto result = as_cpp_cask(cask)->checkpoint();
     if (!result) {
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);

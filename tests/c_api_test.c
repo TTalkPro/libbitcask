@@ -43,6 +43,7 @@ static const char* const kAllTestDirs[] = {
     TDIR("iter"),
     TDIR("kv"),
     TDIR("levelb"),
+    TDIR("mergepol"),
     TDIR("pscan"),
     TDIR("putbatch"),
     TDIR("range"),
@@ -1567,6 +1568,144 @@ static int test_levelb(void) {
     return 0;
 }
 
+
+/* ⚠️ Release 构建下 NDEBUG 把 assert 整个抹掉（本文件其它用例在 Release 上
+ * 其实什么都没判）。这一节用自己的宏：判失败就报行号、返回 1，与构建类型无关。 */
+#define MP_CHECK(cond) do { if (!(cond)) { \
+    fprintf(stderr, "FAIL test_merge_policy_files_checkpoint: line %d: %s\n", __LINE__, #cond); \
+    return 1; } } while (0)
+
+/* 6.4.0：merge 策略 / 显式文件表 / 手动 checkpoint（keel 2026-09-13 锦书那条账）。
+ * 路线：max_file_size 压到 8 KiB 逼出多个 sealed 文件，写两轮同键（第一轮全死）
+ * ⇒ 老文件碎片率 100%；策略缺省（60%）与收紧（frag_merge_trigger=0）都该报
+ * needs=1，这里用**逐字节等价**（policy=NULL vs 缺省结构体）与**闸**（越界拒绝、
+ * 名字不对拒绝、active 文件拒绝）两类判据钉住新面，而不是钉具体阈值的数学。 */
+static int test_merge_policy_files_checkpoint(void) {
+    bitcask_fault_t fault;
+    bitcask_t* cask = NULL;
+
+    /* ① 缺省结构体与 C++ 缺省逐字相同（数字抄自 include/bitcask/merge_policy.hpp）。 */
+    bitcask_merge_policy_t pol;
+    bitcask_merge_policy_init(&pol);
+    MP_CHECK(pol.frag_merge_trigger == 60);
+    MP_CHECK(pol.dead_bytes_merge_trigger == 512ULL * 1024ULL * 1024ULL);
+    MP_CHECK(pol.deletion_rate_trigger == 0);
+    MP_CHECK(pol.frag_threshold == 40);
+    MP_CHECK(pol.dead_bytes_threshold == 128ULL * 1024ULL * 1024ULL);
+    MP_CHECK(pol.small_file_threshold == 10ULL * 1024ULL * 1024ULL);
+    MP_CHECK(pol.expiry_secs == 0 && pol.expiry_grace_time == 0 && pol.max_merge_size == 0);
+
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.max_file_size = 8 * 1024;  /* 逼文件滚动 */
+
+    /* ② 百分比越界：三格各拒一次，不碰盘（目录此刻还不存在，之后也不该存在）。 */
+    {
+        int bad[3][2] = {{0, 101}, {1, -1}, {2, 101}};
+        for (int i = 0; i < 3; ++i) {
+            bitcask_merge_policy_t p2 = pol;
+            if (bad[i][0] == 0) p2.frag_merge_trigger = bad[i][1];
+            if (bad[i][0] == 1) p2.frag_threshold = bad[i][1];
+            if (bad[i][0] == 2) p2.deletion_rate_trigger = bad[i][1];
+            cask = (bitcask_t*)0x1;
+            bitcask_error_t e = bitcask_open_ex(TDIR("mergepol"), &opts, &p2, &cask, &fault);
+            MP_CHECK(e == BITCASK_ERR_INVALID_OPTION);
+            MP_CHECK(cask == NULL);
+            MP_CHECK(strstr(fault.detail, "out of [0, 100]") != NULL);
+        }
+    }
+
+    /* ③ 收紧的策略开库、写两轮同键。 */
+    pol.frag_merge_trigger = 30;
+    pol.frag_threshold = 20;
+    bitcask_error_t err = bitcask_open_ex(TDIR("mergepol"), &opts, &pol, &cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_merge_policy: open_ex: %s\n", fault.detail);
+        return 1;
+    }
+    char kbuf[32], vbuf[256];
+    memset(vbuf, 'x', sizeof vbuf);
+    for (int round = 0; round < 2; ++round) {
+        for (int i = 0; i < 200; i++) {
+            int klen = snprintf(kbuf, sizeof(kbuf), "mp_%d", i);
+            bitcask_slice_t k = {kbuf, (size_t)klen};
+            bitcask_slice_t v = {vbuf, sizeof vbuf};
+            MP_CHECK(bitcask_put(cask, k, v, 0, &fault) == BITCASK_OK);
+        }
+    }
+
+    /* ④ 显式表的闸：名字不对 / active 文件，都是 INVALID_OPTION、不碰盘。 */
+    {
+        char bogus_path[512];
+        snprintf(bogus_path, sizeof bogus_path, "%s/not-a-data-file.txt", TDIR("mergepol"));
+        const char* bogus[1] = {bogus_path};
+        err = bitcask_merge_files(cask, bogus, 1, &fault);
+        MP_CHECK(err == BITCASK_ERR_INVALID_OPTION);
+        MP_CHECK(strstr(fault.detail, "not a data file") != NULL);
+
+        const char* nul[1] = {NULL};
+        err = bitcask_merge_files(cask, nul, 1, &fault);
+        MP_CHECK(err == BITCASK_ERR_INVALID_OPTION);
+    }
+
+    /* ⑤ needs_merge：老文件已 100% 死 ⇒ needs=1 且有候选（active 文件被排除）。 */
+    bitcask_needs_merge_t nm;
+    err = bitcask_needs_merge(cask, &nm, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_merge_policy: needs_merge: %s\n", fault.detail);
+        bitcask_close(cask);
+        return 1;
+    }
+    MP_CHECK(nm.needs == 1);
+    MP_CHECK(nm.files_count >= 1);
+    printf("  needs_merge: %zu candidate file(s)\n", nm.files_count);
+
+    /* ⑥ 显式表并**第一个**候选 —— 与 needs_merge 的候选是同一种路径形状。 */
+    {
+        const char* one[1] = {nm.files[0]};
+        err = bitcask_merge_files(cask, one, 1, &fault);
+        if (err != BITCASK_OK) {
+            fprintf(stderr, "FAIL test_merge_policy: merge_files: %s\n", fault.detail);
+            bitcask_needs_merge_free(&nm);
+            bitcask_close(cask);
+            return 1;
+        }
+    }
+    bitcask_needs_merge_free(&nm);
+
+    /* ⑦ 键都还在（并掉的是死记录）。 */
+    for (int i = 0; i < 200; i += 37) {
+        int klen = snprintf(kbuf, sizeof(kbuf), "mp_%d", i);
+        bitcask_slice_t k = {kbuf, (size_t)klen};
+        bitcask_get_result_t* res = NULL;
+        MP_CHECK(bitcask_get(cask, k, &res, &fault) == BITCASK_OK);
+        MP_CHECK(res->value.size == sizeof vbuf);
+        bitcask_get_result_free(res);
+    }
+
+    /* ⑧ 手动 checkpoint：读写句柄 OK（顺带排掉退休文件）。 */
+    err = bitcask_checkpoint(cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_merge_policy: checkpoint: %s\n", fault.detail);
+        bitcask_close(cask);
+        return 1;
+    }
+
+    /* ⑨ 空表 = 自动（与 bitcask_merge 等价），不是「并零个」：调得通。 */
+    MP_CHECK(bitcask_merge_files(cask, NULL, 0, &fault) == BITCASK_OK);
+    bitcask_close(cask);
+
+    /* ⑩ 只读句柄：checkpoint → READ_ONLY；policy=NULL 的 open_ex 与 open 同路。 */
+    opts.read_write = 0;
+    MP_CHECK(bitcask_open_ex(TDIR("mergepol"), &opts, NULL, &cask, &fault) == BITCASK_OK);
+    MP_CHECK(bitcask_checkpoint(cask, &fault) == BITCASK_ERR_READ_ONLY);
+    bitcask_close(cask);
+
+    printf("PASS test_merge_policy_files_checkpoint\n");
+    return 0;
+}
+
 int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
@@ -1590,6 +1729,7 @@ int main(void) {
     failures += test_search_filtered();
     failures += test_doc_fields_and_meta();
     failures += test_paging_and_highlight();
+    failures += test_merge_policy_files_checkpoint();
 
     if (failures == 0) {
         printf("\n=== All C API tests passed ===\n");

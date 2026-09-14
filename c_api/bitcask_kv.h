@@ -203,6 +203,35 @@ typedef struct {
 // 初始化为默认值
 BITCASK_API void bitcask_options_init(bitcask_options_t* opts);
 
+/* 6.4.0：merge 策略（对应 bitcask::merge::PolicyOptions，逐字段一一映射）。
+   此前 C API 只能拿上游缺省（碎片 ≥ 60% 才触发 ⇒ 盘上占用上界 ≈ 2.5 × 活数据），
+   下游 keel（锦书 2026-09-13）要把它收到 30–40%。
+   用 bitcask_merge_policy_init() 初始化为**与 C++ 缺省逐字相同**的值，再按需改。
+   ⚠️ 不放进 bitcask_options_t：那会改结构体布局 ⇒ ABI 破坏 ⇒ major bump
+   （6.0.0 的 keydir_cache_entries 先例）。走独立结构体 + bitcask_open_ex，
+   bitcask_open 的形状与行为一个字节不变。
+   百分比三格取值 [0, 100]，越界 → bitcask_open_ex 返回 BITCASK_ERR_INVALID_OPTION。 */
+typedef struct {
+    // --- 触发（任一满足整体就要 merge）---
+    int       frag_merge_trigger;        // 某文件碎片率 ≥ 此百分比（默认 60）
+    uint64_t  dead_bytes_merge_trigger;  // 某文件死字节 ≥ 此值（默认 512 MiB）
+    int       deletion_rate_trigger;     // 索引删除率 ≥ 此百分比（默认 0 = 禁用；仅索引模式）
+    // --- per-file 阈值（任一满足该文件入选）---
+    int       frag_threshold;            // 碎片率 ≥（默认 40）
+    uint64_t  dead_bytes_threshold;      // 死字节 ≥（默认 128 MiB）
+    uint64_t  small_file_threshold;      // 文件小于此值即入选（默认 10 MiB；0 = 禁用）
+    // --- 过期 ---
+    uint32_t  expiry_secs;               // 0 = 禁用（⚠️ 与 bitcask_options_t.expiry_secs
+                                         //   是两格：那格管 get/iter 的可见性，这格管
+                                         //   「整个文件都过期 ⇒ 可并」；上游 C++ 也是两格）
+    uint32_t  expiry_grace_time;         // 默认 0
+    // --- 输出体积上限 ---
+    uint64_t  max_merge_size;            // 默认 0 = 无上限
+} bitcask_merge_policy_t;
+
+// 初始化为上游缺省（与 bitcask::merge::PolicyOptions{} 逐字相同）
+BITCASK_API void bitcask_merge_policy_init(bitcask_merge_policy_t* policy);
+
 /* ===========================================================================
  *  结果类型
  * ========================================================================= */
@@ -308,6 +337,16 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
                                           const bitcask_options_t* opts,
                                           bitcask_t** out,
                                           bitcask_fault_t* fault);
+
+// 6.4.0：同 bitcask_open，多收一份 merge 策略。
+// policy: NULL = 上游缺省（此时与 bitcask_open 逐字节等价）。
+// 百分比三格越界 [0, 100] → BITCASK_ERR_INVALID_OPTION，*out = NULL，不碰盘。
+// ⚠️ 策略是 open-time 一次性读进去的（与 opts 同一条纪律），运行期改要重开。
+BITCASK_API bitcask_error_t bitcask_open_ex(const char* dirname,
+                                             const bitcask_options_t* opts,
+                                             const bitcask_merge_policy_t* policy,
+                                             bitcask_t** out,
+                                             bitcask_fault_t* fault);
 
 // 关闭并释放 Cask 实例。cask 句柄此后不可使用。
 // 内部调用 Cask::close() 后 delete 句柄包装。
@@ -826,9 +865,34 @@ BITCASK_API bitcask_error_t bitcask_needs_merge(bitcask_t* cask,
 // 释放 needs_merge 结果
 BITCASK_API void bitcask_needs_merge_free(bitcask_needs_merge_t* nm);
 
-// 执行 merge（files 为 NULL 时自动调 needs_merge 决定）。
+// 执行 merge：自动调 needs_merge 决定并哪些文件（needs=0 时什么都不做，返回 OK）。
 BITCASK_API bitcask_error_t bitcask_merge(bitcask_t* cask,
                                             bitcask_fault_t* fault);
+
+// 6.4.0：在**调用方指定**的文件上跑 merge（对应 C++ Cask::merge(files)）。
+// files: data 文件路径数组（bitcask_needs_merge 给的那种；NUL 结尾串），
+//        files_count 个。⚠️ files == NULL 或 files_count == 0 时**等价于
+//        bitcask_merge**（上游语义：空表 = 自动决定），不是「并零个文件」。
+// 有了它宿主可以自己算碎片率、自己挑文件——needs_merge 说「不需要」时
+// 照样能并。两条拒绝（BITCASK_ERR_INVALID_OPTION，不碰盘）：
+//   · 名字不是 data 文件的形状（此前 C++ 层对这种是**静默跳过**，打错字
+//     什么都不报）；
+//   · 是当前 active 写文件——并它等于把 writer 正在追加的文件 unlink 掉，
+//     先 bitcask_close_write_file 再说。
+// 线程安全与锁要求同 bitcask_merge（同一目录同时只许一次 merge）。
+BITCASK_API bitcask_error_t bitcask_merge_files(bitcask_t* cask,
+                                                  const char* const* files,
+                                                  size_t files_count,
+                                                  bitcask_fault_t* fault);
+
+// 6.4.0：手动 checkpoint（对应 C++ Cask::checkpoint()）：keydir 快照 +
+// search.ckpt 主动落盘，把崩溃恢复的重放窗口收到「自本次调用以来」；
+// ⭐ 顺带把上一轮 merge 退休的输入文件**此刻删掉**——此前 C API 只能靠
+// bitcask_close / 下一次 merge 才回收那些盘。
+// 只读 / merge_only 句柄 → BITCASK_ERR_READ_ONLY。阻塞：大库序列化可达秒级。
+// 线程安全：是（内部串行；与 put/get 并发安全）。
+BITCASK_API bitcask_error_t bitcask_checkpoint(bitcask_t* cask,
+                                                 bitcask_fault_t* fault);
 
 // 是否空（写过 key 后即使删光也返回 0）。
 BITCASK_API int bitcask_is_empty(bitcask_t* cask);

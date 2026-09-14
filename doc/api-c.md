@@ -6,7 +6,7 @@ C API 是 C++ `bitcask::Cask` 的薄 `extern "C"` 包装，编译产物：
 
 | 产物 | 说明 |
 |------|------|
-| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=6`，`VERSION=6.3.3`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 6.3.3)` 单一真源派生）|
+| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=6`，`VERSION=6.4.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 6.4.0)` 单一真源派生）|
 | `libbitcask.a` | 合并全部静态归档的单一 `.a`（定义 `BITCASK_STATIC_LIB` 去掉导出修饰）|
 
 符号导出由 `BITCASK_API` 宏控制（`bitcask_kv.h` §符号导出宏），Windows 下退化为 `__declspec(dllimport/dllexport)`，其它平台默认 `__attribute__((visibility("default")))`。
@@ -130,7 +130,7 @@ cl /DBITCASK_STATIC_LIB app.c /I<c_api 头目录> bitcask_static.lib   :: 静态
 
 ## 3. 版本信息
 
-版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 6.3.3)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
+版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 6.4.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
 
 ```c
 BITCASK_API int          bitcask_version_major(void);
@@ -140,7 +140,7 @@ BITCASK_API const char*  bitcask_version_string(void);   // "major.minor.patch"�
 ```
 
 - `bitcask_version_string()` 返回的是库内静态字符串（指向 `BITCASK_VERSION_STRING` 宏展开的字符串字面量），**不需要 free**。
-- 运行时返回值与 `libbitcask.so.6.3.3` 文件名完全对应；SOVERSION 是 `6`（大版本号），反映 ABI 兼容性。
+- 运行时返回值与 `libbitcask.so.6.4.0` 文件名完全对应；SOVERSION 是 `6`（大版本号），反映 ABI 兼容性。
 
 ---
 
@@ -675,6 +675,45 @@ BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
 
 可能错误：`BITCASK_ERR_IO`、`BITCASK_ERR_WRITE_LOCKED`、`BITCASK_ERR_INVALID_OPTION`（含同义词文件无法打开）、`BITCASK_ERR_MODE_MISMATCH`、`BITCASK_ERR_ANALYZER_MISMATCH`。
 
+### 8.1b `bitcask_open_ex` + `bitcask_merge_policy_t`（6.4.0：merge 策略）
+
+```c
+typedef struct {
+    int       frag_merge_trigger;        // 60（%）
+    uint64_t  dead_bytes_merge_trigger;  // 512 MiB
+    int       deletion_rate_trigger;     // 0 = 禁用（%；仅索引模式）
+    int       frag_threshold;            // 40（%）
+    uint64_t  dead_bytes_threshold;      // 128 MiB
+    uint64_t  small_file_threshold;      // 10 MiB；0 = 禁用
+    uint32_t  expiry_secs;               // 0 = 禁用
+    uint32_t  expiry_grace_time;         // 0
+    uint64_t  max_merge_size;            // 0 = 无上限
+} bitcask_merge_policy_t;
+
+BITCASK_API void bitcask_merge_policy_init(bitcask_merge_policy_t* policy);
+BITCASK_API bitcask_error_t bitcask_open_ex(const char* dirname,
+                                            const bitcask_options_t* opts,
+                                            const bitcask_merge_policy_t* policy,
+                                            bitcask_t** out,
+                                            bitcask_fault_t* fault);
+```
+
+`bitcask::merge::PolicyOptions` 逐字段一一映射（此前 C API 拿不到它，只能吃缺省：
+碎片 ≥ 60% 才触发 ⇒ 盘上占用上界 ≈ 2.5 × 活数据；桌面型宿主想收到 30–40%）。
+`bitcask_merge_policy_init` 填的缺省**从 C++ 结构体抄**，与 `PolicyOptions{}` 逐字相同。
+
+- `policy == NULL` ⇒ 与 `bitcask_open` **逐字节等价**；`bitcask_open` 本身就是
+  `bitcask_open_ex(…, NULL, …)`，形状与行为一个字节没变。
+- 百分比三格（`frag_merge_trigger` / `frag_threshold` / `deletion_rate_trigger`）
+  取值 `[0, 100]`，越界 → `BITCASK_ERR_INVALID_OPTION`，`fault->detail` 点名哪格，
+  `*out = NULL`，**不碰盘**（101 = 永不触发、-1 = 恒触发，两种都是静默的，所以拒）。
+- ⚠️ `expiry_secs` 与 `bitcask_options_t.expiry_secs` 是**两格**：那格管 get/iter
+  的可见性，这格管「整个文件都过期 ⇒ 可并」——上游 C++ 本来就是两格，这里不替
+  调用方合并。
+- 策略是 open-time 一次性读进去的（与 `opts` 同一条纪律），运行期改要重开。
+- ⚠️ 为什么不放进 `bitcask_options_t`：那会改结构体布局 ⇒ ABI 破坏 ⇒ major bump
+  （6.0.0 `keydir_cache_entries` 的先例）。独立结构体 + 新入口是纯加法，SOVERSION 6 不动。
+
 ### 8.2 `bitcask_close`
 
 ```c
@@ -1186,7 +1225,47 @@ BITCASK_API bitcask_error_t bitcask_merge(bitcask_t* cask,
                                           bitcask_fault_t* fault);
 ```
 
-执行 merge（内部自动调 `needs_merge` 决定）。与读写并发，不阻塞 writer。
+执行 merge（内部自动调 `needs_merge` 决定；`needs=0` 时什么都不做、返回 `BITCASK_OK`）。与读写并发，不阻塞 writer。
+
+### 12.5b `bitcask_merge_files`（6.4.0：调用方指定文件）
+
+```c
+BITCASK_API bitcask_error_t bitcask_merge_files(bitcask_t* cask,
+                                                const char* const* files,
+                                                size_t files_count,
+                                                bitcask_fault_t* fault);
+```
+
+在**调用方指定**的 data 文件上跑 merge（对应 C++ `Cask::merge(files)`；此前 C API 只有
+「空表」那一支）。有了它宿主可以自己算碎片率、自己挑文件——`bitcask_needs_merge` 说
+`needs=0` 时照样能并。`files[i]` 是 `bitcask_needs_merge` 给的那种路径（NUL 结尾）。
+
+- ⚠️ `files == NULL` 或 `files_count == 0` ⇒ **等价于 `bitcask_merge`**（上游语义：
+  空表 = 自动决定），**不是**「并零个文件」。要「什么都不并」就别调。
+- 两道闸，都是 `BITCASK_ERR_INVALID_OPTION`、**不碰盘**：
+  - 名字 parse 不出 data 文件 tstamp（`<tstamp>.bitcask.data`）——此前 C++ 层对这种
+    是**静默跳过**（`MergeRunner` 里一句 `continue`），打错字什么都不报；
+  - 是当前 **active 写文件**——并它 = 收尾时把 writer 正在追加的文件 unlink 掉
+    （POSIX 上此后写的全丢，Windows 上 unlink 直接失败）。`needs_merge` 自动挑的
+    从来排除它，显式表同一条纪律。先 `bitcask_close_write_file` 再并。
+  - `files[i] == NULL` 或空串 → 同码，`detail` 点名下标。
+- 线程安全与锁要求同 `bitcask_merge`（同一目录同时只许一次 merge）。
+
+### 12.5c `bitcask_checkpoint`（6.4.0：手动 checkpoint）
+
+```c
+BITCASK_API bitcask_error_t bitcask_checkpoint(bitcask_t* cask,
+                                               bitcask_fault_t* fault);
+```
+
+对应 C++ `Cask::checkpoint()`：keydir 快照 + `search.ckpt` 主动落盘，把崩溃恢复的重放
+窗口收到「自本次调用以来」。⭐ 顺带把上一轮 merge **退休的输入文件此刻删掉**——此前
+C API 只能靠 `bitcask_close`（多一次重开）或下一次 merge 才回收那些盘。
+
+- 只读 / merge-only 句柄 → `BITCASK_ERR_READ_ONLY`。
+- 阻塞：大库序列化可达秒级；期间 reducer 停摆、写者可能被背压。
+- 线程安全：是（内部 `ckpt_mu_` 串行；与 put/get 并发安全；与 merge 收尾并发时最后写者赢，
+  建议与 merge 同一运维线程串行调度）。
 
 ### 12.6 `bitcask_is_empty` / `bitcask_is_frozen`
 

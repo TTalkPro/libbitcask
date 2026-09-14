@@ -14,6 +14,56 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ---
 
+## [6.4.0] - 2026-09-14（C API：merge 策略 / 显式文件表 / 手动 checkpoint 三个口子）
+
+> **版本语义**：C API **纯加法**（4 个新符号 + 1 个新结构体，既有函数一个签名都
+> 没动，`bitcask_options_t` 布局不动）；盘上格式零改动；C++ 层 `Cask::merge(files)`
+> 对**显式**文件表多两道拒绝（此前静默跳过 / 静默并 active 文件，见下）。
+> 纯加法 → MINOR +1，**`SOVERSION` 保持 `6`**。
+>
+> 来源：下游 keel 转来的锦书账（keel `feedbacks/2026-09-13-jinshu-bitcask-merge-policy.md`）：
+> 「不是 bug，是调不到的旋钮」——一本书一个 bitcask、索引几 MB 到几十 MB，
+> 缺省 2 GiB `max_file_size` 下一辈子住在一个 active 文件里，每次压缩都得先
+> `close_write_file`；缺省 60% 碎片才触发 ⇒ 盘上占用上界 ≈ 2.5 × 活数据，
+> 桌面写作软件想收到 30–40%；`needs_merge` 说不需要就什么都劝不动。
+> （`max_file_size` C API 本来就有，是 keel 那一侧没接；其余三格是这里补的。）
+
+### Added
+
+- **`bitcask_merge_policy_t` + `bitcask_merge_policy_init` + `bitcask_open_ex`**：
+  `bitcask::merge::PolicyOptions` 逐字段映射进 C API（9 格），`init` 填的缺省
+  **从 C++ 结构体抄**、不手写数字。`policy == NULL` 与 `bitcask_open` 逐字节等价
+  ——`bitcask_open` 本身改成了 `bitcask_open_ex(…, NULL, …)`。百分比三格越界
+  `[0, 100]` → `BITCASK_ERR_INVALID_OPTION`，`detail` 点名哪格，不碰盘。
+  ⚠️ 为什么不追加进 `bitcask_options_t`：改布局 = ABI 破坏 = major bump
+  （6.0.0 `keydir_cache_entries` 先例）；独立结构体是纯加法。
+- **`bitcask_merge_files(cask, files, count, fault)`**：在调用方指定的 data 文件上
+  跑 merge（C++ `Cask::merge(files)` 那一支，此前 C API 只有空表）。
+  ⚠️ `files == NULL` / `count == 0` **等价于 `bitcask_merge`**（上游语义：空表 =
+  自动），不是「并零个」。`files[i]` 为 NULL / 空串 → `INVALID_OPTION`。
+- **`bitcask_checkpoint(cask, fault)`**：C++ `Cask::checkpoint()` 接出来——keydir
+  快照 + `search.ckpt` 主动落盘，⭐ 顺带把上一轮 merge 退休的输入文件此刻删掉
+  （此前 C API 只能靠 `bitcask_close` 或下一次 merge 回收）。只读 / merge-only →
+  `BITCASK_ERR_READ_ONLY`。
+- `tests/c_api_test.c` 新用例 `test_merge_policy_files_checkpoint`（10 步）。
+  ⚠️ 顺带发现：本文件既有用例把**有副作用的调用写在 `assert(...)` 里**
+  （`assert(bitcask_put(...) == BITCASK_OK)`），Release 构建 `NDEBUG` 下那些 put
+  **根本没执行**——新用例自带 `MP_CHECK` 宏与构建类型无关；旧用例没动，记在这儿。
+
+### Changed
+
+- **`Cask::merge(files)` 对非空 `files` 多两道闸**（`kInvalidOption`，不碰盘）：
+  ① 名字 parse 不出 data 文件 tstamp——此前 `MergeRunner` 对这种是 `continue`
+  **静默跳过**，打错字什么都不报；② 是当前 active 写文件——并它 = 收尾时把 writer
+  正在追加的文件 unlink 掉（POSIX 上此后写的全丢，Windows 上 unlink 直接失败）；
+  `needs_merge` 自动挑的从来排除它，显式表同一条纪律（merge_only 旁车排除的是
+  open 时从 write.lock 抠出的 live writer id，与 `needs_merge` 同源）。
+  ⚠️ 这是 C++ 层唯一的行为变化，只影响**自己传文件表**的调用方；空表那一支不动。
+  ⭐ 这道闸当场抓到两条自家判据：`oki_levelb_test` / `oki_locate_test` 里
+  「收集 sealed 文件 → 字典序 sort → `pop_back()` 当 active」——`9.bitcask.data`
+  在字典序里排在 `10.bitcask.data` 之后，超过 9 个文件时弹掉的不是 active，
+  **active 一直在被并**，此前静默通过。改成按 `parse_data_tstamp` 数值排。
+
 ## [6.3.3] - 2026-09-14（修复：Windows vendored ICU 在 VS 18 上撞 MSB8052）
 
 > **版本语义**：C API 零改动，盘上格式零改动，只动 Windows 构建脚本

@@ -834,6 +834,10 @@ public:
 
     // 在指定文件上跑 merge。files 为空时先调 needs_merge。caller 自己负责
     // 外部调度 / 锁——这个方法只是把 run_merge 包了一层。
+    // 6.4.0：files 非空时先过两道闸（kInvalidOption，不碰盘）：每个名字都得
+    // parse 得出 data 文件 tstamp（此前不合形状的是静默跳过），且不得是当前
+    // active 写文件（并它 = 收尾 unlink 掉 writer 正在追加的文件；先
+    // close_write_file()）。C API bitcask_merge_files 走的就是这条。
     // 线程安全（S13-F7 统一措辞，对齐 thread-safety.md §7.6）: **是**。
     //   - KV 路径：merge 与并发 put/remove/get 安全——keydir 重定位是条件
     //     CAS（newest_put=false，S13-F1），收尾对 stuck 文件跳过 unlink 兜底；

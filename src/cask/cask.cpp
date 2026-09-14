@@ -3033,6 +3033,31 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
             return merge::MergeStats{};
         }
         files = std::move(n.files);
+    } else {
+        // 6.4.0：显式文件表的两道闸（C API bitcask_merge_files 打开了这条路，
+        // 宿主自己算碎片率、自己挑文件，从此拼错名字 / 挑中 active 文件都可能）：
+        //   · 不是 data 文件的形状 → kInvalidOption。此前 MergeRunner 对
+        //     parse 不出 tstamp 的路径是 `continue`（静默跳过）——打错字什么都不报。
+        //   · 是当前 active 写文件 → kInvalidOption。并它 = 收尾时把 writer
+        //     正在追加的文件 unlink 掉（POSIX 上此后写的全丢，Windows 上 unlink
+        //     直接失败）；needs_merge 自动挑的从来排除它，显式表也得同一条纪律。
+        //     merge_only 旁车没有自己的 active 文件，排除的是 open 时从
+        //     write.lock 抠出来的 live writer id（与 needs_merge 同源）。
+        const std::uint32_t exclude_id =
+            opts_.merge_only ? merger_writer_active_id_
+                             : active_file_id_.load(std::memory_order_relaxed);
+        for (const auto& path : files) {
+            const auto ts = fileops::parse_data_tstamp(path);
+            if (!ts) {
+                return std::unexpected(err(CaskError::kInvalidOption,
+                    "merge: not a data file name: " + path));
+            }
+            if (exclude_id != 0 && static_cast<std::uint32_t>(*ts) == exclude_id) {
+                return std::unexpected(err(CaskError::kInvalidOption,
+                    "merge: " + path + " is the active write file "
+                    "(close_write_file() first)"));
+            }
+        }
     }
     // S18-7：merge 参与插件 span——首位 DocmapRelocator（宿主 docmap 搬迁），
     // 其余按注册序。纯 KV 库空 span。生命周期：栈上，覆盖 run_merge 全程

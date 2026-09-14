@@ -239,9 +239,14 @@ TEST_F(OkiLocateTest, TtlConditionalRemoveTombstonesColdView) {
             files.push_back(de.path().string());
         }
     }
-    std::sort(files.begin(), files.end());
+    // 6.4.0：按 **file_id 数值**排，不按字典序——"9.bitcask.data" 在字典序里排在
+    // "10.bitcask.data" 之后，超过 9 个文件时 pop_back 弹掉的不是 active，而
+    // active 留在表里被并掉（此前静默通过，正是 Cask::merge 新加的那道闸要拒的）。
+    std::sort(files.begin(), files.end(), [](const std::string& a, const std::string& b) {
+        return *bitcask::fileops::parse_data_tstamp(a) < *bitcask::fileops::parse_data_tstamp(b);
+    });
     ASSERT_GT(files.size(), 1u);
-    files.pop_back();  // active
+    files.pop_back();  // active（数值最大的那个）
     auto ms = (*c)->merge(files, /*now_sec=*/200);
     ASSERT_TRUE(ms);
     ASSERT_GT(ms->records_expired, 0u) << "本测试前提：TTL 过期确被触发";

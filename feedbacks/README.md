@@ -17,4 +17,5 @@
 
 | # | 标题 | 报的人 | 严重度 | 回没回 |
 |---|---|---|---|---|
+| [2026-09-14](2026-09-14-c-api-merge-policy-files-checkpoint-not-reachable.md) | C API 够不到 merge 策略 / 显式文件表 / checkpoint：宿主只能吃 60% 缺省、只能等 `needs_merge` 点头、退休文件只能靠 close 重开回收 | keel（转锦书 2026-09-13） | 🟡 调不到的旋钮，不报错 | ✅ 已修（**6.4.0**：`bitcask_merge_policy_t` + `bitcask_open_ex` / `bitcask_merge_files` / `bitcask_checkpoint`；策略走独立结构体而非 `bitcask_options_t`，ABI 不破） |
 | [2026-09-13](2026-09-13-icu-msbuild-v143-needs-vctoolsversion-pinned.md) | vendored ICU 在 VS 18 上编不动：`/p:PlatformToolset=v143` 少了配套的 `VCToolsVersion` ⇒ MSB8052，报文指的两条改法都不通 | keel（porthole 报 · coxswain 复现 + A/B） | 🔴 构建当场停，报文指向与病因无关的方向 | ✅ 已修（`/p:VCToolsVersion` 自动钉 + STATUS 第四格；VS 18 真机待复验） |
