@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.3.2`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.3.3`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
@@ -13,6 +13,27 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
 
 ---
+
+## [6.3.3] - 2026-09-14（修复：Windows vendored ICU 在 VS 18 上撞 MSB8052）
+
+> **版本语义**：C API 零改动，盘上格式零改动，只动 Windows 构建脚本
+> `cmake/BitcaskICU.cmake`。纯构建修复 → PATCH +1，**`SOVERSION` 保持 `6`**。
+
+### Fixed
+
+- **vendored ICU 在 VS 2026（VS 18）上无法构建**：MSBuild 会把 `VCToolsVersion`
+  自选成最新的 14.5x，与 `/p:PlatformToolset=v143` 冲突报 `MSB8052`，而报文指的
+  「改工具集 / 修 VS 安装」两条都不通（14.5x 的 bin 里没有 cl.exe；安装没坏）。
+  现在从 `CMAKE_CXX_COMPILER` 路径切出 `…/VC/Tools/MSVC/<ver>/bin/` 的版本号，经
+  `/p:VCToolsVersion=<ver>` 全局属性钉给 MSBuild（`VCToolsVersion` 环境变量只作
+  兜底；都拿不到不钉，保持旧行为）。configure 输出 STATUS 第四格显示钉的是哪版：
+  `[Release | x64 | v143 | VCToolsVersion 14.44.35207]`。VS 18 真机 A/B：不钉复现
+  MSB8052，钉上后 vendored ICU 与整库构建、链接通过。
+
+### Added
+
+- `feedbacks/`：下游反馈账（一条一文件，只记 libbitcask 这一侧该改的）；首条即本次
+  ICU 条目。
 
 ## [6.3.2] - 2026-09-11（修复：V5 结构化 meta 重开即丢——带 meta filter 的检索恒空）
 
