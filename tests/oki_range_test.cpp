@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <random>
@@ -413,4 +414,91 @@ TEST_F(OkiRangeTest, ConcurrentWriterRangeReadersAndMerge) {
     EXPECT_EQ(reader_errors.load(), 0) << "first: " << first_err;
     EXPECT_GT(scans.load(), 0);
     c.close();
+}
+
+// 反馈 2026-09-18（oki-unflushed-memdelta-range-query）回归：memdelta 排序
+// 视图缓存。钉两件事——
+//   1) 任何写（put/覆盖/remove）都必须正确失效缓存：视图 × 影子三方对拍
+//      在「缓存已建立 → 再写 → 再读」的序列下不得缺 key、不得给旧值；
+//   2) 未 flush 的 memdelta（5 万行，远低于 1M 行 flush 阈值）上连续 range
+//      查询不得按查询次数线性变贵：修订前每次 make_range_iter 全量拷贝 +
+//      stable_sort memdelta（下游实测 5 万行 ~120ms/次），1000 次窄窗口
+//      会拖到数十秒；修订后首查排序一次、后续命中缓存，秒级以内。
+//      10s 上限是悬崖探针（数量级护栏），不是性能断言——性能标定归
+//      bench/range_bench.cpp。
+TEST_F(OkiRangeTest, SortedViewCacheInvalidatesOnWriteAndStaysFast) {
+    CaskOptions o;
+    o.read_write = true;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    std::map<std::string, std::string> shadow;
+
+    auto put = [&](const std::string& k, const std::string& v) {
+        ASSERT_TRUE((*c)->put(bytes(k), bytes(v), 1000));
+        shadow[k] = v;
+    };
+    auto del = [&](const std::string& k) {
+        ASSERT_TRUE((*c)->remove(bytes(k), 2000));
+        shadow.erase(k);
+    };
+
+    // 建缓存：首批写 + 全域对拍（首次 make_range_iter 走 miss 路径建缓存）。
+    for (int i = 0; i < 50; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "c%03d", i);
+        put(buf, "v" + std::to_string(i));
+    }
+    expect_three_way_equal(**c, shadow, "", "", "cache-build");
+
+    // 命中路径 + 写后失效，交替验证：同 key 覆盖、新 key、删除、删除后重写。
+    expect_three_way_equal(**c, shadow, "", "", "cache-hit-1");
+    put("c010", "overwritten");
+    put("c999", "late");
+    del("c020");
+    expect_three_way_equal(**c, shadow, "", "", "after-write-1");
+    expect_three_way_equal(**c, shadow, "c015", "c030", "after-write-window");
+    del("c999");
+    put("c020", "resurrected");
+    expect_three_way_equal(**c, shadow, "", "", "after-write-2");
+    expect_three_way_equal(**c, shadow, "", "", "cache-hit-2");
+    (*c)->close();
+}
+
+TEST_F(OkiRangeTest, UnflushedMemdeltaRepeatedRangeNotLinearPerQuery) {
+    constexpr int kKeys = 50000;
+    constexpr int kQueries = 1000;
+
+    CaskOptions o;
+    o.read_write = true;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < kKeys; ++i) {
+        char k[16], v[16];
+        std::snprintf(k, sizeof(k), "m%06d", i);
+        std::snprintf(v, sizeof(v), "v%06d", i);
+        ASSERT_TRUE((*c)->put(bytes(std::string_view(k)),
+                              bytes(std::string_view(v)), 1000));
+    }
+    ASSERT_EQ((*c)->status().oki_delta_rows,
+              static_cast<std::uint64_t>(kKeys))
+        << "前置失效：memdelta 应未 flush（阈值 1M 行）";
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int q = 0; q < kQueries; ++q) {
+        // 窄窗口：每次只取 1 个 key——把「视图构建」成本与归并/取值成本
+        // 分开，钉的正是视图构建不再逐查询重排 memdelta。
+        char lo[16], hi[16];
+        std::snprintf(lo, sizeof(lo), "m%06d", (q * 37) % kKeys);
+        std::snprintf(hi, sizeof(hi), "m%06d", (q * 37) % kKeys + 1);
+        auto out = range_scan(**c, lo, hi);
+        ASSERT_EQ(out.size(), 1u);
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
+              10)
+        << "1000 次窄窗口 range 耗时 "
+        << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
+               .count()
+        << "ms——memdelta 视图疑似逐查询重排（悬崖回归）";
+    (*c)->close();
 }

@@ -1474,7 +1474,7 @@ PutResult KeyDir::conditional_remove(std::string_view key,
 
 // S36-4：Level B 冷枚举状态——OKI 三元组的 fold 侧（设计 §5.2）：
 // runs 共享 Reader（pin：shared_ptr 跨越 rebuild/compact 的 unlink）+
-// memdelta 排序去重拷贝。捕获点在 start() 的写者闸门屏障内：写者出清 +
+// memdelta 排序去重快照（排序视图缓存命中时零拷贝共享，见 OkiState）。捕获点在 start() 的写者闸门屏障内：写者出清 +
 // Level B 挂钩入锁 ⟹ 视图 ⊇ 哈希活 key 且两者同刻（精确覆盖快照点）。
 struct IterHandle::ColdIter {
     oki::OkiState::ReadView view;
@@ -1639,8 +1639,8 @@ std::optional<EntryProxy> IterHandle::next_cold(bool include_tombstones) {
                 any = true;
             }
         }
-        if (ci.delta_pos < ci.view.delta.size()) {
-            const auto& d = ci.view.delta[ci.delta_pos];
+        if (ci.delta_pos < ci.view.delta->size()) {
+            const auto& d = (*ci.view.delta)[ci.delta_pos];
             if (!any || std::string_view(d.key) < min_key) {
                 min_key = d.key;
                 any = true;
@@ -1680,9 +1680,9 @@ std::optional<EntryProxy> IterHandle::next_cold(bool include_tombstones) {
                 h.reset();
             }
         }
-        if (ci.delta_pos < ci.view.delta.size() &&
-            ci.view.delta[ci.delta_pos].key == ci.cur_key) {
-            const auto& d = ci.view.delta[ci.delta_pos];
+        if (ci.delta_pos < ci.view.delta->size() &&
+            (*ci.view.delta)[ci.delta_pos].key == ci.cur_key) {
+            const auto& d = (*ci.view.delta)[ci.delta_pos];
             if (first || d.ord >= win_ord) {  // delta 视作 gen=∞
                 win_ord = d.ord;
                 win_tomb = d.tomb;

@@ -129,9 +129,13 @@ public:
     // 快照）。OKI 未加载 → nullopt（RO 打开无 OKI 的目录等）。
     // shared_ptr 使在途视图安全跨越 rebuild 的旧 run 删除（POSIX unlink
     // 后已开 fd 仍可读到 close）。
+    // delta 走 shared_ptr<const>：排序视图缓存（见 sorted_view_）命中时
+    // 与缓存**零拷贝共享**——memdelta 未 flush 的服务型负载里连续 range
+    // 查询不再各自支付全量拷贝 + 排序（下游实测 5 万行 ~120ms/次 → 近零）。
+    // 行内容不可变；在途视图不受后续写影响（写 bump 版本，缓存自动失效）。
     struct ReadView {
         std::vector<std::shared_ptr<OkiRunReader>> runs;
-        std::vector<DeltaRow> delta;
+        std::shared_ptr<const std::vector<DeltaRow>> delta;
     };
     [[nodiscard]] std::optional<ReadView> make_read_view() const;
 
@@ -240,9 +244,21 @@ private:
         std::vector<std::pair<std::uint64_t, std::shared_ptr<OkiRunReader>>>;
     void publish_runs_locked();  // 前置：持 flush_mu_
 
-    mutable std::mutex mu_;        // delta_ / delta_bytes_ / delta_idx_
+    mutable std::mutex mu_;        // delta_ / delta_bytes_ / delta_idx_ / delta_version_
     std::vector<DeltaRow> delta_;
     std::size_t delta_bytes_ = 0;
+    // 排序视图缓存（make_read_view 的复用层）。memdelta 本是「append + 惰性
+    // 排序」——惰性排序的成本原落在每一次 range 的视图构建上，与查询次数
+    // 相乘（下游实测：5 万行未 flush 时 ~120ms/次，flush 后 ~0.03ms，4200×；
+    // 见 feedbacks/2026-09-18-oki-unflushed-memdelta-range-query-4000x-slower.md）。
+    // 缓存 = 排序去重后的快照；失效判据 = delta_version_ 失配（任何 append /
+    // flush 前缀裁剪 / rebuild 清空都 bump 版本）——「写后首查重建一次」语义
+    // 不变，无写时的连续查询降为 shared_ptr 拷贝。
+    // 锁序恒为 flush_mu_ → mu_ → view_mu_（构建在锁外，持锁段只碰指针）。
+    mutable std::mutex view_mu_;
+    mutable std::shared_ptr<const std::vector<DeltaRow>> sorted_view_;
+    mutable std::uint64_t sorted_view_version_ = 0;  // 与 delta_version_ 相等即有效
+    std::uint64_t delta_version_ = 0;
     // S36-2：key → delta_ 内最新行下标（透明哈希，点查开启时维护）。
     std::unordered_map<std::string, std::size_t, StringHash, std::equal_to<>>
         delta_idx_;

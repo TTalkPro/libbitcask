@@ -74,10 +74,10 @@ Cask::make_range_iter(const RangeOptions& opts) {
     }
     const std::string_view lo = sv(opts.lo);
     it->delta_pos_ = static_cast<std::size_t>(
-        std::lower_bound(it->view_.delta.begin(), it->view_.delta.end(), lo,
+        std::lower_bound(it->view_.delta->begin(), it->view_.delta->end(), lo,
                          [](const oki::OkiState::DeltaRow& r,
                             std::string_view v) { return r.key < v; }) -
-        it->view_.delta.begin());
+        it->view_.delta->begin());
     return it;
 }
 
@@ -95,8 +95,8 @@ CaskRangeIter::next_merged_key() {
                 any = true;
             }
         }
-        if (delta_pos_ < view_.delta.size()) {
-            const auto& d = view_.delta[delta_pos_];
+        if (delta_pos_ < view_.delta->size()) {
+            const auto& d = (*view_.delta)[delta_pos_];
             if (!any || std::string_view(d.key) < min_key) {
                 min_key = d.key;
                 any = true;
@@ -134,9 +134,9 @@ CaskRangeIter::next_merged_key() {
                 h.reset();
             }
         }
-        if (delta_pos_ < view_.delta.size() &&
-            view_.delta[delta_pos_].key == key) {
-            const auto& d = view_.delta[delta_pos_];
+        if (delta_pos_ < view_.delta->size() &&
+            (*view_.delta)[delta_pos_].key == key) {
+            const auto& d = (*view_.delta)[delta_pos_];
             if (first || d.ord > win_ord) {
                 win_ord = d.ord;
                 win_tomb = d.tomb;

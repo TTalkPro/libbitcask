@@ -72,6 +72,7 @@ void OkiState::append(std::string_view key, std::uint64_t ord, bool tomb,
     delta_.push_back(DeltaRow{std::string(key), ord, tomb,
                               /*has_loc=*/loc != nullptr,
                               loc != nullptr ? *loc : RowLoc{}});
+    ++delta_version_;  // 排序视图缓存失效
     index_row_locked(delta_.size() - 1);
     update_flush_hint_locked();
 }
@@ -84,6 +85,7 @@ void OkiState::append_update(std::string_view key, std::uint64_t ord,
     delta_.push_back(DeltaRow{std::string(key), ord, tomb,
                               /*has_loc=*/loc != nullptr,
                               loc != nullptr ? *loc : RowLoc{}});
+    ++delta_version_;  // 排序视图缓存失效
     index_row_locked(delta_.size() - 1);
     update_flush_hint_locked();
 }
@@ -283,8 +285,13 @@ bool OkiState::flush(
         }
         delta_ = std::move(kept);
         delta_bytes_ -= std::min(delta_bytes_, flushed_bytes);
+        ++delta_version_;  // 前缀已固化——缓存里的行已在 run 中，立即释放
         rebuild_index_locked();
         update_flush_hint_locked();
+    }
+    {
+        std::lock_guard<std::mutex> vlk(view_mu_);
+        sorted_view_.reset();
     }
 
     // S33-6：run 数超阈值 → 全归并（设计 §5.2）。best-effort——失败不影响
@@ -484,8 +491,13 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
         std::lock_guard<std::mutex> lk(mu_);
         delta_.clear();
         delta_bytes_ = 0;
+        ++delta_version_;
         rebuild_index_locked();
         update_flush_hint_locked();
+    }
+    {
+        std::lock_guard<std::mutex> vlk(view_mu_);
+        sorted_view_.reset();
     }
     return true;
 }
@@ -547,31 +559,62 @@ OkiState::LocateResult OkiState::locate(std::string_view key) const {
 std::optional<OkiState::ReadView> OkiState::make_read_view() const {
     if (!loaded_.load(std::memory_order_acquire)) return std::nullopt;
     ReadView v;
+    // 缓存命中路径只做 shared_ptr 拷贝（无深拷贝、无排序）；失配路径沿用
+    // 「锁内拷贝、锁外排序」的原流程，构建完尝试发布缓存（期间有写则弃存
+    // ——持旧快照照常返回，弱一致语义同前）。
+    std::shared_ptr<const std::vector<DeltaRow>> snap;
+    std::shared_ptr<std::vector<DeltaRow>> fresh;
+    std::uint64_t want = 0;
     {
-        // 锁序与 flush 一致：flush_mu_ → mu_。
+        // 锁序与 flush 一致：flush_mu_ → mu_（→ view_mu_）。
         std::lock_guard<std::mutex> flk(flush_mu_);
         v.runs.reserve(readers_.size());
         for (const auto& [gen, rd] : readers_) v.runs.push_back(rd);
         std::lock_guard<std::mutex> lk(mu_);
-        v.delta = delta_;  // 拷贝快照（排序去重在锁外做）
+        {
+            std::lock_guard<std::mutex> vlk(view_mu_);
+            if (sorted_view_ && sorted_view_version_ == delta_version_) {
+                snap = sorted_view_;
+            }
+        }
+        if (!snap) {
+            fresh = std::make_shared<std::vector<DeltaRow>>(delta_);
+            want = delta_version_;
+        }
     }
+    if (!fresh) {
+        v.delta = std::move(snap);
+        return v;
+    }
+
     // S36-2：stable——同 key 同 ord 按到达序取末（(ord, 到达序) 胜出格，
     // 与 flush/locate 同一规则；merge 搬迁行与被搬迁行同 ord）。
-    std::stable_sort(v.delta.begin(), v.delta.end(),
+    std::stable_sort(fresh->begin(), fresh->end(),
                      [](const DeltaRow& a, const DeltaRow& b) {
                          if (a.key != b.key) return a.key < b.key;
                          return a.ord < b.ord;
                      });
-    // 同 key 保留 (ord, 到达序) 最大者（尾元素）。
-    std::vector<DeltaRow> dedup;
-    dedup.reserve(v.delta.size());
-    for (std::size_t i = 0; i < v.delta.size(); ++i) {
-        if (i + 1 < v.delta.size() && v.delta[i + 1].key == v.delta[i].key) {
+    // 同 key 保留 (ord, 到达序) 最大者（尾元素）——原地压实。
+    // out != i 时才 move：out == i 的自移动赋值对 std::string 是
+    // valid-but-unspecified（libstdc++ 下实测清空 key），必须跳过。
+    std::size_t out = 0;
+    for (std::size_t i = 0; i < fresh->size(); ++i) {
+        if (i + 1 < fresh->size() && (*fresh)[i + 1].key == (*fresh)[i].key) {
             continue;
         }
-        dedup.push_back(std::move(v.delta[i]));
+        if (out != i) (*fresh)[out] = std::move((*fresh)[i]);
+        ++out;
     }
-    v.delta = std::move(dedup);
+    fresh->resize(out);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::lock_guard<std::mutex> vlk(view_mu_);
+        if (delta_version_ == want) {
+            sorted_view_ = fresh;
+            sorted_view_version_ = want;
+        }
+    }
+    v.delta = std::move(fresh);
     return v;
 }
 

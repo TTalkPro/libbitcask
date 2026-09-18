@@ -2625,6 +2625,10 @@ StatusInfo Cask::status() {
         s.search_cache_entries = text_->cache_entries();
     }
     s.read_handles = read_handle_count();
+    // OKI memdelta 体量（反馈 2026-09-18：让「range 为什么慢」可观测——
+    // 未 flush 行数即下次 range 视图构建的最坏成本上界）。OKI 不可用时为 0。
+    s.oki_delta_rows = keydir_->oki().delta_rows();
+    s.oki_delta_bytes = keydir_->oki().delta_bytes();
     return s;
 }
 

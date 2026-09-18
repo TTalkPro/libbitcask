@@ -300,6 +300,11 @@ struct StatusInfo {
     std::uint64_t hnsw_nodes = 0;            // HNSW 图节点数（含软删死节点）
     std::uint64_t search_cache_entries = 0;  // 查询缓存当前条目数
     std::uint64_t read_handles = 0;          // read 句柄缓存当前大小（fd+mmap 数）
+    // OKI memdelta 体量（未 flush 的行数/字节；OKI 不可用时为 0）。这是
+    // range 首查视图构建的最坏成本上界——下游反馈 2026-09-18：装载后
+    // range 变慢时，先看这里是不是胀起来了。
+    std::uint64_t oki_delta_rows = 0;
+    std::uint64_t oki_delta_bytes = 0;
     // 注：倒排 posting 总量（total_postings）未纳入——其统计需遍历
     // concurrent_hash_map，与 reducer 插入并发不安全（S13-F6 同类）；待
     // InvertedIndex 维护原子计数器后再暴露。
