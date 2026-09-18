@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.3.3`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.5.0`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
@@ -13,6 +13,42 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
 
 ---
+
+## [6.5.0] - 2026-09-18（OKI：memdelta 排序视图缓存——拔掉「装载后 range 静默变慢 4200×」的性能悬崖）
+
+> **版本语义**：C API **一个字节都没动**；盘上格式零改动；C++ 层
+> `StatusInfo` 尾部追加两个字段（`oki_delta_rows` / `oki_delta_bytes`，
+> 纯加法）。MINOR +1，**`SOVERSION` 保持 `6`**。
+>
+> 来源：下游 bitcask 的反馈账（`feedbacks/2026-09-18-oki-unflushed-memdelta-range-query-4000x-slower.md`）：
+> 批量装载后开始服务的负载，每次
+> `make_range_iter` 固定付出与未 flush 写入量成正比的时间——5 万行实测
+> ~120ms/次（flush 后 ~0.03ms，4200×），不报任何错。
+
+### Fixed
+
+- **OKI range 视图构建不再逐查询重排 memdelta**。`OkiState::make_read_view`
+  原先每次调用都对 memdelta 全量深拷贝（每行一次 string 堆分配，持 `mu_`
+  阻塞 append）+ `stable_sort` + 同 key 去重，成本与查询次数相乘；现排序
+  去重快照缓存在 `OkiState` 内，以 memdelta 变更代数（`delta_version_`）
+  失效——**写后首查重建一次，无写时的连续查询降为一次 `shared_ptr` 拷贝**。
+  发布时若期间有写则弃存（持旧快照照常返回），per-key 弱一致语义不变。
+  锁序恒为 `flush_mu_ → mu_ → view_mu_`；`ReadView.delta` 随之改为
+  `shared_ptr<const>`（命中路径零深拷贝）。
+- 文档勘误（`feedbacks/2026-09-18-ord-recycling-doc-exhaustion-years-off-by-10-7.md`）：
+  `ord-recycling-design-zh.md` §1.1/§12.1 的 ord 耗尽年数 `5.8 × 10¹³ 年`
+  实为 `5.8 × 10⁶ 年（约 585 万年）`（秒数误作年）；同段 32-bit「约 12 天」
+  实为约 11.9 小时（@10⁵ ord/s）。两处已改并补换算。
+
+### Added
+
+- `StatusInfo.oki_delta_rows` / `StatusInfo.oki_delta_bytes`（`Cask::status()`）：
+  OKI memdelta 未 flush 的行数/字节。range 首查视图构建的最坏成本上界——
+  装载后 range 变慢时先看这里（`doc/api-cpp.md` §4.6 已补用法说明）。
+- 回归测试：`OkiRangeTest.SortedViewCacheInvalidatesOnWriteAndStaysFast`
+  （写后失效 × 影子三方对拍）与
+  `OkiRangeTest.UnflushedMemdeltaRepeatedRangeNotLinearPerQuery`
+  （5 万行未 flush × 1000 次窄窗口 range，悬崖探针）。
 
 ## [6.4.0] - 2026-09-14（C API：merge 策略 / 显式文件表 / 手动 checkpoint 三个口子）
 
