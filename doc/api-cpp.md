@@ -253,8 +253,15 @@ struct StatusInfo {
     std::uint64_t hnsw_nodes          = 0;  // HNSW 图节点数（含软删死节点）
     std::uint64_t search_cache_entries= 0;  // 查询缓存当前条目数
     std::uint64_t read_handles        = 0;  // read 句柄缓存当前大小（fd+mmap 数）
+    std::uint64_t oki_delta_rows      = 0;  // OKI memdelta 未 flush 行数（OKI 不可用为 0）
+    std::uint64_t oki_delta_bytes     = 0;  // OKI memdelta 字节体量（含行开销）
 };
 ```
+
+`oki_delta_*` 何时有用：range 扫描（`make_range_iter`）首查需把 memdelta 排序去重
+成视图——排序结果有缓存（写后失效、重建一次），故该成本只在「写后首查」出现；
+若这个数字长期高企（批量装载后未触发 flush），`checkpoint()`/`close→reopen`
+可立即把 memdelta 固化进 run。
 
 ### 4.7 `bitcask::Cask::NeedsMerge`（`cask.hpp`）
 

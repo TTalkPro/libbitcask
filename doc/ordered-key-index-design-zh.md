@@ -184,6 +184,15 @@ key 序枚举 → 值读取是随机 pread。`prefetch > 0` 时用 `parallel_sca
 
 merge 的 `apply_pending` **不挂钩**（§2.2 性质 1）。TTL 过期的 `conditional_remove` 同样不挂钩——过期 key 留在 run 里由回查过滤，语义正确。
 
+> **读侧修订（2026-09-18，排序视图缓存）**：memdelta 采用「append + 惰性排序」后，
+> range 视图构建（`make_read_view`）的拷贝 + 排序成本原落在**每一次**查询上，
+> 与查询次数相乘——下游实测 5 万行未 flush 时 ~120ms/次（flush 后 ~0.03ms，
+> 4200×），「批量装载 → 开始服务」的负载必撞且不报任何错。现改为：排序去重
+> 快照缓存在 `OkiState` 内，以 memdelta 变更代数失效——**写后首查重建一次，
+> 无写时的连续查询降为一次 `shared_ptr` 拷贝**；`ReadView.delta` 随之改为
+> `shared_ptr<const>`。`status().oki_delta_rows/oki_delta_bytes` 可观测 memdelta
+> 体量。
+
 ### 5.2 flush 与归并
 
 - **flush 触发**：memdelta 条数/字节阈值，或搭 auto-ckpt 节流的车（`last_ckpt_ord_` 模式）。flush = 排序写 `kv.oki.seg-<gen>`，`cover_ord` = 当时 `peek_next_ord()`，然后 manifest 提交、清 memdelta。
