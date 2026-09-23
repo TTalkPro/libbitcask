@@ -97,16 +97,15 @@ bool Index::remove(std::string_view ext_id, std::uint64_t tomb_ord) {
     next_ord_ = std::max(next_ord_, tomb_ord + 1);
     dirty_.store(true, std::memory_order_relaxed);  // S18-2：自记账
     // S18-2：delta 窗口删除日志自记账（S14-4 门限：链覆盖区内的旧墓碑不入，
-    // 防跨文件 stale removal 重放误杀复活文档）。在 found-check **之前**入账
+    // 防跨文件 stale removal 重放误杀复活文档）。**命中与否都入账**
     // ——与旧 recover_tomb 语义一致（keydir 半边的 remove_if_older 重放可能
     // 仍需要该条目，即使 docmap 已无此 key）。ckpt 载入重放产生的污染由
     // 载入方收尾 clear_removals()。
-    if (tomb_ord >= delta_window_wm_) {
-        removals_.emplace_back(std::string(ext_id), tomb_ord);
-    }
+    const bool log_removal = tomb_ord >= delta_window_wm_;
 
     auto it = ext2ord_.find(ext_id);
     if (it == ext2ord_.end()) {
+        if (log_removal) removals_.emplace_back(std::string(ext_id), tomb_ord);
         return false;
     }
     const std::uint64_t cur_ord = it->second;
@@ -116,8 +115,11 @@ bool Index::remove(std::string_view ext_id, std::uint64_t tomb_ord) {
         if (chunks_[ci]) --chunks_[ci]->live_count;
         ++retired_since_compact_;  // S12-2：删除退休当前版本
     }
-    clear_ord2ext_locked(cur_ord);  // S40 D2:erase 前置空,否则槽 view 悬垂
-    ext2ord_.erase(it);
+    clear_ord2ext_locked(cur_ord);  // S40 D2:摘节点前置空,否则槽 view 悬垂
+    // 命中路径:key 从节点 move 进删除日志,省一次拷贝(ext_id 此后不再使用,
+    // 即使它恰是本节点键的 view 也无碍)。
+    auto nh = ext2ord_.extract(it);
+    if (log_removal) removals_.emplace_back(std::move(nh.key()), tomb_ord);
     --live_docs_;
     return true;
 }

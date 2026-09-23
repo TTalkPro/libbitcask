@@ -140,6 +140,28 @@ TEST(Index, OrdToExtDeadOrdReturnsNullopt) {
     EXPECT_EQ(live, 1u);
 }
 
+// D3:remove 命中时 key 从 ext2ord_ 节点 move 进删除日志(省一次拷贝);
+// 未命中照旧拷贝入账;低于窗口水位的旧墓碑两条路径都不入。
+TEST(Index, RemoveLogsKeyOnHitAndMiss) {
+    Index idx;
+    const std::string k(40, 'r');  // 堆串:move 后源节点摘除,ASan 可见误用
+    idx.put_doc(k, 5, slot(1, 0, 10));
+    idx.begin_delta_window(3);
+    ASSERT_TRUE(idx.remove(k, 6));            // 命中
+    ASSERT_FALSE(idx.remove("absent", 7));    // 未命中仍入账
+    ASSERT_FALSE(idx.remove("stale", 2));     // 低于水位:不入
+    idx.put_doc(k, 8, slot(1, 10, 10));       // 删后再写:新节点可用
+    ASSERT_TRUE(idx.ord_to_ext(8).has_value());
+    EXPECT_EQ(*idx.ord_to_ext(8), k);
+
+    const auto log = idx.removals_snapshot();
+    ASSERT_EQ(log.size(), 2u);
+    EXPECT_EQ(log[0].first, k);
+    EXPECT_EQ(log[0].second, 6u);
+    EXPECT_EQ(log[1].first, "absent");
+    EXPECT_EQ(log[1].second, 7u);
+}
+
 // 恢复路径：按 ord 序回放磁盘 record（显式 ord，不经 alloc_ord）。
 // put_doc/remove 内部推进 next_ord，后写自动覆盖旧版本。
 TEST(Index, ReplayWithExplicitOrds) {
