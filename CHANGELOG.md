@@ -17,7 +17,8 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 ## [6.6.0] - 2026-09-23（search 库开库内存 + 进程级线程数上限）
 
 > **版本语义**：C API **纯加法**（4 个新符号 + 1 个新结构体，既有函数签名与
-> `bitcask_options_t` 布局都没动）；盘上格式零改动。C++ 层 `index::Index::for_each_live*`
+> `bitcask_options_t` 布局都没动）；盘上格式只有一处**向后兼容的追加**：`bitcask.meta`
+> 可选尾段（analyzer 指纹，旧二进制透明，见下）。C++ 层 `index::Index::for_each_live*`
 > 回调的 ext 参数改为 `std::string_view`（见下）。MINOR +1，**`SOVERSION` 保持 `6`**。
 >
 > 来源：下游 keel 转来 coxswain 的两条账（2026-09-22）：
@@ -50,11 +51,24 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
   `key_to_location_`。现后两份改为 `string_view`——`ord2ext` 指向 `ext2ord_`
   的节点键，`key_to_location_` 指向段内 key 存储（mmap 段直指映射区、内存段指
   `keys_`，由条目持有的段 shared_ptr 钉住），墓碑键单独存一份并在键重新写入时回收。
-  1M 个 20 字节 key 约省 96 MB（≤15 字节的短 key 约省 32 MB）。开库重建
-  `key_to_location_` 与写 / 删热路径不再构造 key 字符串。
+  实测（1M 文档开库，堆 + mmap 大块）：20 字节 key 开库堆 565.8 → 455.3 MB
+  （**−110.5 MB / −19.5%**），12 字节 key 418.8 → 384.6 MB（**−34.2 MB / −8.2%**），
+  RSS 同步下降。开库重建 `key_to_location_` 与写 / 删热路径不再构造 key 字符串。
+  写入 / 开库 / 检索 bench 中位数与改前差异在 ±1% 内（多线程 builder 写入项受
+  机器噪声影响约 ±15%，两轮方向相反，未见可检测回退）。
 - **`Index::ord_to_ext` 对已删 / 被覆盖的 ord 返回 `nullopt`**，兑现 `DocTable`
   契约（此前返回残留的旧 key）。可见影响仅在「检索判活 → 物化 key」之间被并发
   删除 / 覆盖的命中（高亮检索、向量检索）：此前返回过期 key，现丢弃该命中。
+- **核心路径文件句柄一律 `O_CLOEXEC`（行为变化）**：data / hint / `write.lock` /
+  OKI run / keydir 快照 / `field.schema` 追加句柄，以及经 `fopen_utf8` 打开的
+  ckpt、原子写临时文件、目录 fsync 句柄。此前宿主 fork+exec 子进程时，子进程会
+  继承这些 fd：拖住已删除数据文件的磁盘空间、能读到库内容、延长锁文件句柄的
+  生命期。bm25 段与向量插件此前已带。若宿主有意让子进程继承库 fd（不应如此），
+  现在继承不到了。Windows 句柄本就默认不继承，无变化。
+- **`Index::remove` 删除日志不再拷贝 key**：命中时从 `ext2ord_` 节点直接 move 出来。
+- **HNSW `search_layer` / `greedy_closest` 的 f32 与 int8 两份手写实现合并为一个
+  模板主循环**（距离函数与预取目标作参数，内联后同码）。`BM_Hnsw_RecallQps` 4 档新旧
+  交替：召回逐位相同，查询延迟中位数 −5.0%～0%，建图吞吐 +1～2%。
 - **C++：`index::Index::for_each_live` / `for_each_live_in` 回调第二参数由
   `const std::string&` 改为 `std::string_view`**（仅在回调内有效）。写成
   `const std::string&` 的回调改为 `std::string_view` 或 `const auto&` 即可。
@@ -62,6 +76,13 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ### Added
 
+- **analyzer 配置指纹告警**：建索引时把影响切词的 analyzer 配置（分词器类型、
+  n-gram 范围、停用词、token 长度上下限、词干化）的指纹写进 `bitcask.meta`
+  可选尾段；之后以不同配置重开时 `kWarn` 告警（仍然开库）。失败形态与 ICU 版本
+  告警相同：换了分词配置，新写入的文档和查询就与老文档切出不同的 term，
+  互相搜不到，且没有任何报错。尾段自带 CRC，旧二进制读写都不受影响（旧二进制
+  重写 meta 会丢掉尾段，退化为「未记录」，不再告警）；C1 之前建的目录未记录，
+  不告警，也不补记。布局见 `doc/format-zh.md` §3.1b。
 - **`bitcask_set_thread_limits(index_workers, search_slots, fault)`**：进程级线程数
   上限（两处线程池本来就是进程共享的）。`index_workers` = 索引池 map worker 数；
   `search_slots` = 批量查询 `task_arena` 槽数，非 0 时顺带用 `tbb::global_control`
@@ -78,7 +99,16 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
   （独占可执行文件：冻结是进程级不可逆的；含开库线程增量断言）；
   `c_api_test.c` 新用例 `test_thread_limits_and_tuning`（排在所有 search 用例之前，
   其后全部 C API 用例都在 (2, 2) 的小池下跑）；S40：`Index.OrdToExtDeadOrdReturnsNullopt`、
-  `TextPlugin.S40TombKeyLifecycle`、`TextPlugin.S40RekeyAcrossSealMergeNoDangling`。
+  `TextPlugin.S40TombKeyLifecycle`、`TextPlugin.S40RekeyAcrossSealMergeNoDangling`；
+  `MetaAnalyzerFpTest.*`（8 项：记录 / 不记录保持 18 字节 / 同配置静默 / 异配置告警
+  且仍开库 / 无关字段不改指纹 / 尾段截断与损坏降级 / 重写 meta 保留指纹）；
+  `ProcessIsolationTest.*`（exec-self 真实子进程：cloexec 探针自检、开库状态下子进程
+  继承不到任何库 fd、第二个进程争写锁得 `kWriteLocked`、持锁进程崩溃后 stale 锁被
+  接管）；`Index.RemoveLogsKeyOnHitAndMiss`；手动探针
+  `CheckpointRecoveryTest.DISABLED_S40KeyRssProbe`（两进程协议测开库常驻）。
+- CI：`build-test` 追加 `BITCASK_SIMD_MAX=scalar/sse42/avx2` 强制降档全量；新增
+  `avx512-sde`（Intel SDE 仿真 Sapphire Rapids，首次执行 AVX-512 / AVX512-VNNI 内核）
+  与 `windows-msvc`（MSVC Release 全量），后两者首次跑绿前为非门控。
 
 ## [6.5.0] - 2026-09-18（OKI：memdelta 排序视图缓存——拔掉「装载后 range 静默变慢 4200×」的性能悬崖）
 
