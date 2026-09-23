@@ -14,16 +14,17 @@
 #include "support/crash_child.hpp"
 #include "support/test_paths.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#if defined(__linux__)
-#  include <fcntl.h>
-#  include <unistd.h>
-#endif
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using bitcask::test::crash_exit;
 
@@ -53,27 +54,33 @@ constexpr int kOtherError = 12;
 }  // namespace
 
 // 子进程：列出本进程继承到的、指向库目录内的 fd。exec 之后仍存在的 fd
-// 只可能是父进程没带 cloexec 的那些。
+// 只可能是父进程没带 cloexec 的那些。按 (st_dev, st_ino) 比对而非读
+// /proc/self/fd 符号链接——后者仅 Linux 有（FreeBSD 的 procfs 没有 fd 目录，
+// /dev/fd 不挂 fdescfs 时只有 0-2），这样探针在所有 POSIX 平台都真跑。
 BITCASK_CRASH_SCENARIO(cloexec_probe) {
-#if defined(__linux__)
-    const fs::path want = fs::weakly_canonical(dir);
-    bool leaked = false;
+    std::set<std::pair<dev_t, ino_t>> inside;
+    const auto add = [&](const fs::path& p) {
+        struct stat st{};
+        if (::stat(p.c_str(), &st) == 0) inside.emplace(st.st_dev, st.st_ino);
+    };
+    add(dir);
     std::error_code ec;
-    for (const auto& e : fs::directory_iterator("/proc/self/fd", ec)) {
-        std::error_code lec;
-        const auto target = fs::read_symlink(e.path(), lec);
-        if (lec) continue;
-        const auto t = target.string();
-        if (t.rfind(want.string() + "/", 0) == 0 || t == want.string()) {
-            std::fprintf(stderr, "[cloexec_probe] inherited fd %s -> %s\n",
-                         e.path().filename().string().c_str(), t.c_str());
+    for (const auto& e : fs::recursive_directory_iterator(dir, ec)) add(e.path());
+
+    const long open_max = ::sysconf(_SC_OPEN_MAX);
+    const int fd_end =
+        static_cast<int>(std::clamp<long>(open_max > 0 ? open_max : 1024, 64, 65536));
+    bool leaked = false;
+    for (int fd = 3; fd < fd_end; ++fd) {
+        struct stat st{};
+        if (::fstat(fd, &st) != 0) continue;
+        if (inside.contains({st.st_dev, st.st_ino})) {
+            std::fprintf(stderr, "[cloexec_probe] inherited fd %d (ino %llu)\n", fd,
+                         static_cast<unsigned long long>(st.st_ino));
             leaked = true;
         }
     }
     crash_exit(leaked ? kLeakFound : kNoLeak);
-#else
-    crash_exit(kNoLeak);
-#endif
 }
 
 // 子进程：以读写方式开同一目录（第二个写者）。成功后**不 close** 直接退出
@@ -109,24 +116,17 @@ protected:
 // 探针自检：父进程故意开一个**不带** cloexec 的 fd，子进程必须报告泄漏
 // ——否则下一个用例的「零泄漏」可能只是探针失效。
 TEST_F(ProcessIsolationTest, CloexecProbeDetectsDeliberateLeak) {
-#if !defined(__linux__)
-    GTEST_SKIP() << "/proc/self/fd 探针仅 Linux";
-#else
     const auto sentinel = (dir_ / "sentinel").string();
     const int fd = ::open(sentinel.c_str(), O_RDWR | O_CREAT, 0600);  // 无 O_CLOEXEC
     ASSERT_GE(fd, 0);
     const int rc = bitcask::test::spawn_crash_child("cloexec_probe", dir_.string());
     ::close(fd);
     EXPECT_EQ(rc, kLeakFound);
-#endif
 }
 
 // W1：开着一个带检索的读写库（data / hint / write.lock / ckpt / 段文件都
 // 已存在并持有句柄）时 spawn 子进程，子进程不得继承其中任何一个。
 TEST_F(ProcessIsolationTest, LibraryFdsAreNotInheritedAcrossExec) {
-#if !defined(__linux__)
-    GTEST_SKIP() << "/proc/self/fd 探针仅 Linux";
-#else
     CaskOptions opts;
     opts.read_write = true;
     opts.enable_search = true;
@@ -148,7 +148,6 @@ TEST_F(ProcessIsolationTest, LibraryFdsAreNotInheritedAcrossExec) {
     EXPECT_EQ(bitcask::test::spawn_crash_child("cloexec_probe", dir_.string()),
               kNoLeak);
     (*c)->close();
-#endif
 }
 
 // B3：父进程持写锁 → 第二个进程开读写必须得到 kWriteLocked（而非静默成功
