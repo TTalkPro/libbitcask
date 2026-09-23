@@ -35,6 +35,18 @@ inline constexpr std::size_t kMetaCrcOffset   = 14;
 inline constexpr std::size_t kMetaCrcCoverLen = 14;  // CRC 覆盖 [0, 14)
 inline constexpr std::size_t kMetaFileSize = kMetaMagicSize + 1 + 1 + kMetaReservedSize;  // 18 bytes
 
+// C1:可选尾段(定长头之后)。定长头已无空闲字节;旧读端只读前 18 字节、
+// 不查文件长度,故追加尾段对旧二进制透明(它懒升级重写 meta 时会丢掉尾段,
+// 退化为「未记录」——只少一次告警,不致错)。尾段自带 CRC,损坏同样按未记录
+// 处理(诊断信息,不做 fail-fast,与 S38 同策略)。
+//   [18]      TailVersion u8 = 1
+//   [19..22]  AnalyzerFp  u32 LE(0 = 未记录,此时不写尾段)
+//   [23..26]  CRC32       u32 LE,覆盖 [18, 23)
+inline constexpr std::size_t kMetaTailOffset = kMetaFileSize;
+inline constexpr std::size_t kMetaTailCoverLen = 5;
+inline constexpr std::size_t kMetaTailSize = kMetaTailCoverLen + 4;  // 9 bytes
+inline constexpr std::uint8_t kMetaTailVersion = 1;
+
 // v1 = 大端纪元(legacy);v2 = 小端 flag-day 起;v3(S12) = 加 CRC32 校验和;
 // v4 = record 时间戳 u64 flag-day（data header 27B / hint BCH4 / doc value v4）;
 // v5 = hint BCH5 flag-day（S33：hint 记录内嵌 ord;data/DocValue 布局与 v4
@@ -76,6 +88,11 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
     if (!f || f.gcount() != static_cast<std::streamsize>(kMetaFileSize)) {
         return std::unexpected(MetaError{EIO, "read meta file truncated"});
     }
+    // C1:可选尾段。缺失/截断/版本未知/CRC 不符 → analyzer_fp 保持 0(未记录)。
+    char tail[kMetaTailSize] = {0};
+    f.read(tail, static_cast<std::streamsize>(kMetaTailSize));
+    const bool have_tail =
+        f.gcount() == static_cast<std::streamsize>(kMetaTailSize);
 
     if (std::memcmp(header, kMetaMagic, kMetaMagicSize) != 0) {
         return std::unexpected(MetaError{0, "bad magic"});
@@ -155,6 +172,13 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
         static_cast<std::uint8_t>(header[kMetaIcuMajorOffset]);
     cfg.unicode_major =
         static_cast<std::uint8_t>(header[kMetaUnicodeMajorOffset]);
+    if (have_tail && static_cast<std::uint8_t>(tail[0]) == kMetaTailVersion) {
+        std::uint32_t stored = 0;
+        std::memcpy(&stored, tail + kMetaTailCoverLen, 4);
+        const std::uint32_t crc = codec::crc32(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(tail), kMetaTailCoverLen));
+        if (stored == crc) std::memcpy(&cfg.analyzer_fp, tail + 1, 4);
+    }
     return cfg;
 }
 
@@ -187,13 +211,27 @@ std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaCo
     const std::uint32_t crc = meta_crc(header);
     std::memcpy(header + kMetaCrcOffset, &crc, 4);
 
+    // C1:有指纹才写尾段(未记录的目录保持 18 字节,与旧版逐字节相同)。
+    char buf[kMetaFileSize + kMetaTailSize] = {0};
+    std::memcpy(buf, header, kMetaFileSize);
+    std::size_t len = kMetaFileSize;
+    if (config.analyzer_fp != 0) {
+        char* tail = buf + kMetaTailOffset;
+        tail[0] = static_cast<char>(kMetaTailVersion);
+        std::memcpy(tail + 1, &config.analyzer_fp, 4);
+        const std::uint32_t tcrc = codec::crc32(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(tail), kMetaTailCoverLen));
+        std::memcpy(tail + kMetaTailCoverLen, &tcrc, 4);
+        len += kMetaTailSize;
+    }
+
     // S35：原子写（tmp + rename + fsync 目录）。原实现裸 ofstream 截断重写，
     // 懒升级重写 meta 时若中途崩溃会留下半截 meta（整目录拒开）——meta 是
     // 唯一纪元门禁，必须要么旧要么新。
     if (!detail::atomic_write_bytes(
             bitcask::detail::to_utf8(path),
             std::span<const std::byte>(
-                reinterpret_cast<const std::byte*>(header), kMetaFileSize),
+                reinterpret_cast<const std::byte*>(buf), len),
             /*fsync_dir=*/true)) {
         return std::unexpected(MetaError{errno, "write meta file failed"});
     }

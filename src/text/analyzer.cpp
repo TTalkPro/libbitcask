@@ -91,6 +91,42 @@ static const bool s_reg_jieba = [] {
     return true;
 }();
 
+// C1:analyzer 配置指纹(FNV-1a 32,纯函数、跨平台稳定——值会落盘,不能用
+// std::hash)。字段按类型归一,见 analyzer.hpp 声明处。
+std::uint32_t analyzer_fingerprint(const AnalyzerConfig& c) {
+    std::uint32_t h = 2166136261u;
+    auto mix_byte = [&h](std::uint8_t b) {
+        h ^= b;
+        h *= 16777619u;
+    };
+    auto mix_u32 = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) mix_byte(static_cast<std::uint8_t>(v >> (8 * i)));
+    };
+    auto mix_str = [&](std::string_view s) {
+        mix_u32(static_cast<std::uint32_t>(s.size()));
+        for (char ch : s) mix_byte(static_cast<std::uint8_t>(ch));
+    };
+    mix_byte(1);  // 指纹方案版本:改动归一规则时递增,旧记录自然不等
+    mix_u32(static_cast<std::uint32_t>(c.type));
+    mix_u32(c.min_token_length);
+    mix_u32(c.max_token_bytes);
+    mix_byte(c.enable_stemming ? 1 : 0);
+    if (c.type == AnalyzerType::Ngram || c.type == AnalyzerType::Jieba) {
+        mix_u32(c.min_n);
+        mix_u32(c.max_n);
+        mix_byte(c.enable_stop_words ? 1 : 0);
+        if (c.enable_stop_words) {
+            std::vector<std::string_view> words(c.stop_words.begin(),
+                                                c.stop_words.end());
+            std::sort(words.begin(), words.end());
+            words.erase(std::unique(words.begin(), words.end()), words.end());
+            mix_u32(static_cast<std::uint32_t>(words.size()));
+            for (auto w : words) mix_str(w);
+        }
+    }
+    return h == 0 ? 1u : h;
+}
+
 // ===========================================================================
 // Analyzer 基类默认实现（Template Method）
 // ===========================================================================

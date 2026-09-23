@@ -494,6 +494,25 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
                 "Rebuild the index, or use the original ICU version, if recall "
                 "consistency matters for your corpus.");
         }
+        // C1：analyzer 配置指纹比对——与上面同一失败形态（新旧文档 term 集
+        // 静默分叉），同样只告警不拒开。0 = 未记录；本次无 search_config
+        // （不建文本插件、不分词）无从比对，跳过。
+        if (mc->mode == meta::Mode::kIndex && mc->analyzer_fp != 0 &&
+            opts_.search_config.has_value()) {
+            const auto fp =
+                text::analyzer_fingerprint(opts_.search_config->analyzer_config);
+            if (fp != mc->analyzer_fp) {
+                log_warn(
+                    "analyzer configuration differs from when this index was "
+                    "built (fingerprint " + std::to_string(mc->analyzer_fp) +
+                    " recorded, " + std::to_string(fp) + " now): analyzer type, "
+                    "n-gram range, stop words, token length limits or stemming "
+                    "changed. Newly indexed documents and queries are tokenized "
+                    "differently from existing documents and may not match "
+                    "them. Reopen with the original analyzer settings, or "
+                    "rebuild the index.");
+            }
+        }
         return {};
     }
     // 首次创建:无 meta 时写一份。vector_dim > 0 隐含 enable_search。
@@ -508,6 +527,11 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
     if (mc.mode == meta::Mode::kIndex) {
         mc.icu_major = text::detail::icu_major_version();
         mc.unicode_major = text::detail::unicode_major_version();
+        // C1：有 search_config 才有分词，才记指纹（否则留 0 = 未记录）。
+        if (opts_.search_config.has_value()) {
+            mc.analyzer_fp =
+                text::analyzer_fingerprint(opts_.search_config->analyzer_config);
+        }
     }
     if (opts_.vector_dim > 0) {
         mc.vector_dim = opts_.vector_dim;

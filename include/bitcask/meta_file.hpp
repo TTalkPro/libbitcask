@@ -13,6 +13,8 @@
 //   [12]     IcuMajor     uint8（S38：建索引时的 ICU 主版本；0=未记录）
 //   [13]     UnicodeMajor uint8（S38：同上的 Unicode 主版本；0=未记录）
 //   [14..17] CRC32        uint32 LE（v3 起，覆盖 [0,14)）
+//   [18..26] 可选尾段（C1）：TailVersion u8=1 + AnalyzerFp u32 + CRC32(覆盖尾段前 5B)；
+//            旧读端只读前 18 字节，对其透明（布局详见 meta_file.cpp）
 //
 // === 线程模型 ===
 // 所有函数均为纯函数：线程安全、可重入、无锁。
@@ -82,6 +84,13 @@ struct MetaConfig {
     // 记录悄悄覆盖成当次运行的版本——比对从此永远相等，告警永不触发。
     std::uint8_t icu_major = 0;
     std::uint8_t unicode_major = 0;
+
+    // === C1：建索引时的 analyzer 配置指纹（text::analyzer_fingerprint）===
+    // 同 S38 的失败形态：换分词配置重开，新旧文档 term 集静默分叉。**0 = 未
+    // 记录**（C1 之前建的目录 / KV 模式 / 建库时无 search_config / 被旧二进制
+    // 重写 meta 丢了尾段），比对时跳过。与 icu_major 同纪律：只在建索引时
+    // 显式填写，其余 write_meta 路径原样透传读回的值。
+    std::uint32_t analyzer_fp = 0;
 
     // S35：盘上纪元。5 = 无原子批（保守纪元标记）；6 = 目录可能含
     // kBatchHeader 记录（首次 put_batch_atomic 前懒升级，见

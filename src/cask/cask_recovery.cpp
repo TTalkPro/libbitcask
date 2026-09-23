@@ -62,6 +62,8 @@ Cask::upgrade(std::string_view dirname,
     // 原 KV 目录的该字段恒为 0（未记录），这里是它第一次被真正写入。
     new_mc.icu_major = text::detail::icu_major_version();
     new_mc.unicode_major = text::detail::unicode_major_version();
+    new_mc.analyzer_fp =  // C1：同上，此刻起按该配置分词
+        text::analyzer_fingerprint(search_config.analyzer_config);
     auto wr = meta::write_meta(std::string(dirname), new_mc);
     if (!wr) {
         return std::unexpected(err(CaskError::kIo, "write meta failed"));

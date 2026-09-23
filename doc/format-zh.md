@@ -204,10 +204,11 @@ CRC 与历史数据兼容。
  9   1    VecQuant        u8          0/1，向量落盘 int8 量化
 10   1    VecInmemInt8    u8          0/1，HNSW int8-only 内存
 11   1    VecEngine       u8          0=HNSW / 1=IvfRq / 2=Diskann（S32-M0）
-12   2    Reserved        全 0        保留位
+12   1    IcuMajor        u8          建索引时的 ICU 主版本，0 = 未记录（S38）
+13   1    UnicodeMajor    u8          建索引时的 Unicode 主版本，0 = 未记录（S38）
 14   4    CRC32           u32 LE      覆盖前 14 字节（不含 CRC 自身）
 ─────────────────────────────────────────
-     18 字节合计（kMetaFileSize）
+     18 字节合计（kMetaFileSize）；定长头已无空闲字节
 ```
 
 各字段对应源 `src/cask/meta_file.cpp` 的常量：
@@ -219,6 +220,31 @@ CRC 与历史数据兼容。
 - `kMetaReservedSize = 12` / `kMetaCrcOffset = 14` / `kMetaCrcCoverLen = 14`
 - `kMetaVersion = 5` / `kMetaVersionBatch = 6`（写端按 `MetaConfig::version`
   写 5 或 6；目录创建恒 5，首次 `put_batch_atomic` 前懒升 6——见 §4.5）
+
+### 3.1b 可选尾段（6.6.0，C1：analyzer 配置指纹）
+
+定长头之后可选追加 9 字节尾段，只在 `MetaConfig::analyzer_fp != 0`（建索引时
+带 `search_config`）时写出；未记录的目录保持 18 字节，与旧版逐字节相同。
+
+```
+偏移 字节  字段           编码         含义
+18   1    TailVersion     u8          = 1（kMetaTailVersion）
+19   4    AnalyzerFp      u32 LE      text::analyzer_fingerprint(建索引时的 AnalyzerConfig)
+23   4    TailCrc32       u32 LE      覆盖 [18, 23)
+─────────────────────────────────────────
+     27 字节合计
+```
+
+- **兼容性**：`read_meta` 只读前 18 字节、不查文件长度，所以旧二进制对尾段
+  透明。旧二进制懒升级（v5→v6）重写 meta 时只写 18 字节，尾段丢失，退化为
+  「未记录」，只少一次告警，不会出错。
+- **损坏处理**：尾段缺失、截断、版本未知或 CRC 不符时，一律视为未记录
+  （`analyzer_fp = 0`）。与 S38 的版本字段一样，这是**诊断信息，不是纪元门禁**，
+  不 fail-fast。
+- **比对**：`Cask::open` 在索引模式、记录非 0 且本次带 `search_config` 时
+  重算指纹，不一致则 `kWarn` 告警，仍然开库。指纹只覆盖影响切词的字段，并按
+  分词器类型归一：Whitespace 不计 n 与停用词；停用词按集合语义计；`dict_path`
+  不计。
 
 `VecMetric` 枚举（`namespace bitcask::meta::VectorMetric`）：
 

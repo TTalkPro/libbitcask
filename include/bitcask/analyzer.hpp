@@ -129,4 +129,10 @@ public:
         -> std::unique_ptr<Analyzer>;
 };
 
+// C1:analyzer 配置指纹(记入 bitcask.meta 尾段,重开比对告警)。只覆盖
+// **影响切词结果**的字段,按类型归一——Whitespace 不读 n / 停用词,改它们
+// 不该告警;dict_path 是机器相关的路径(词典内容变化无法廉价探测),不计入。
+// 停用词表按集合语义排序后参与。恒非零(0 在 meta 里表示「未记录」)。
+[[nodiscard]] std::uint32_t analyzer_fingerprint(const AnalyzerConfig& c);
+
 }  // namespace bitcask::text

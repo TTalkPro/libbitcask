@@ -265,4 +265,179 @@ TEST_F(MetaUnicodeVersionTest, RoundTripAlongsideOtherFields) {
     EXPECT_EQ(got.mode, bitcask::meta::Mode::kIndex);
 }
 
+
+// ===========================================================================
+// C1：analyzer 配置指纹（meta 尾段）。与 S38 同一失败形态：换分词配置重开，
+// 新旧文档 term 集静默分叉。定长头已无空闲字节，故落在可选尾段（自带 CRC，
+// 旧读端透明）。
+// ===========================================================================
+
+namespace {
+bitcask::text::AnalyzerConfig ngram(std::uint32_t lo, std::uint32_t hi) {
+    bitcask::text::AnalyzerConfig a;
+    a.type = bitcask::text::AnalyzerType::Ngram;
+    a.min_n = lo;
+    a.max_n = hi;
+    return a;
+}
+
+std::uintmax_t meta_size(const fs::path& dir) {
+    return fs::file_size(dir / "bitcask.meta");
+}
+}  // namespace
+
+class MetaAnalyzerFpTest : public MetaUnicodeVersionTest {
+protected:
+    // 以给定 analyzer 配置开库（带 search_config），收集告警。
+    std::vector<std::string> open_with(const bitcask::text::AnalyzerConfig& a,
+                                       bool* opened = nullptr) const {
+        std::vector<std::string> logs;
+        std::mutex mu;
+        CaskOptions opts;
+        opts.read_write = true;
+        opts.enable_search = true;
+        bitcask::search::SearchLayerConfig cfg;
+        cfg.analyzer_config = a;
+        opts.search_config = cfg;
+        opts.log_fn = [&](CaskOptions::LogLevel lvl, std::string_view msg) {
+            if (lvl != CaskOptions::LogLevel::kWarn) return;
+            std::lock_guard<std::mutex> g(mu);
+            logs.emplace_back(msg);
+        };
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        if (opened) *opened = c.has_value();
+        EXPECT_TRUE(c.has_value());
+        if (c) (*c)->close();
+        std::lock_guard<std::mutex> g(mu);
+        return logs;
+    }
+    static bool mentions_analyzer(const std::vector<std::string>& logs) {
+        for (const auto& m : logs) {
+            if (m.find("analyzer configuration differs") != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+// 带 search_config 建库 → 记下指纹（非零），meta 为 18B 头 + 9B 尾段。
+TEST_F(MetaAnalyzerFpTest, RecordsFingerprintOnCreate) {
+    (void)open_with(ngram(2, 3));
+    const auto mc = read();
+    EXPECT_NE(mc.analyzer_fp, 0u);
+    EXPECT_EQ(mc.analyzer_fp, bitcask::text::analyzer_fingerprint(ngram(2, 3)));
+    EXPECT_EQ(meta_size(tmpdir_), 27u);
+}
+
+// 无 search_config（不分词）/ KV 模式：不记，meta 保持 18 字节——与旧版
+// 逐字节同形，旧二进制零感知。
+TEST_F(MetaAnalyzerFpTest, NoAnalyzerLeavesMetaAt18Bytes) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;  // 无 search_config
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c.has_value());
+    (*c)->close();
+    EXPECT_EQ(read().analyzer_fp, 0u);
+    EXPECT_EQ(meta_size(tmpdir_), 18u);
+}
+
+TEST_F(MetaAnalyzerFpTest, SameConfigReopenIsSilent) {
+    (void)open_with(ngram(2, 3));
+    EXPECT_FALSE(mentions_analyzer(open_with(ngram(2, 3))));
+}
+
+// 换 n 范围 / 换分词器类型 → 告警，且仍能打开（与 S38 同策略：只告警不拒开）。
+TEST_F(MetaAnalyzerFpTest, DifferentConfigWarnsButStillOpens) {
+    (void)open_with(ngram(2, 3));
+    bool opened = false;
+    EXPECT_TRUE(mentions_analyzer(open_with(ngram(1, 2), &opened)));
+    EXPECT_TRUE(opened);
+
+    bitcask::text::AnalyzerConfig ws;
+    ws.type = bitcask::text::AnalyzerType::Whitespace;
+    EXPECT_TRUE(mentions_analyzer(open_with(ws)));
+}
+
+// 不影响切词的差异不得告警（否则告警很快被无视）：Whitespace 不读 n；
+// 停用词表是集合语义；dict_path 是机器相关路径。
+TEST_F(MetaAnalyzerFpTest, IrrelevantDifferencesDoNotChangeFingerprint) {
+    using bitcask::text::analyzer_fingerprint;
+    bitcask::text::AnalyzerConfig a;
+    a.type = bitcask::text::AnalyzerType::Whitespace;
+    auto b = a;
+    b.min_n = 5;
+    b.max_n = 9;
+    b.enable_stop_words = true;
+    EXPECT_EQ(analyzer_fingerprint(a), analyzer_fingerprint(b));
+
+    auto s1 = ngram(2, 3);
+    s1.enable_stop_words = true;
+    s1.stop_words = {"the", "a", "of"};
+    auto s2 = s1;
+    s2.stop_words = {"of", "the", "a", "the"};
+    s2.dict_path = "/elsewhere/dict";
+    EXPECT_EQ(analyzer_fingerprint(s1), analyzer_fingerprint(s2));
+
+    // 停用词只在启用时计入。
+    auto s3 = ngram(2, 3);
+    s3.stop_words = {"x"};
+    EXPECT_EQ(analyzer_fingerprint(s3), analyzer_fingerprint(ngram(2, 3)));
+
+    // 真正影响切词的字段各自改变指纹。
+    const auto base = analyzer_fingerprint(ngram(2, 3));
+    auto m1 = ngram(2, 3); m1.min_token_length = 2;
+    auto m2 = ngram(2, 3); m2.max_token_bytes = 64;
+    auto m3 = ngram(2, 3); m3.enable_stemming = true;
+    auto m4 = s1;          m4.stop_words.push_back("and");
+    EXPECT_NE(analyzer_fingerprint(m1), base);
+    EXPECT_NE(analyzer_fingerprint(m2), base);
+    EXPECT_NE(analyzer_fingerprint(m3), base);
+    EXPECT_NE(analyzer_fingerprint(m4), analyzer_fingerprint(s1));
+}
+
+// 旧二进制懒升级重写 meta 会截掉尾段（它只写 18 字节）→ 退化为未记录：
+// 必须仍能读、且静默（不能把「没记录」误报成「配置不同」）。
+TEST_F(MetaAnalyzerFpTest, TruncatedTailDegradesToUnrecorded) {
+    (void)open_with(ngram(2, 3));
+    fs::resize_file(tmpdir_ / "bitcask.meta", 18);
+    EXPECT_EQ(read().analyzer_fp, 0u);
+    EXPECT_FALSE(mentions_analyzer(open_with(ngram(1, 2))));
+}
+
+// 尾段损坏（CRC 不符）→ 同样按未记录处理，**不拒开**（诊断信息，非纪元门禁）。
+TEST_F(MetaAnalyzerFpTest, CorruptTailIsIgnoredNotFatal) {
+    (void)open_with(ngram(2, 3));
+    const auto path = tmpdir_ / "bitcask.meta";
+    std::vector<char> buf(27);
+    {
+        std::FILE* f = std::fopen(path.string().c_str(), "rb");
+        ASSERT_NE(f, nullptr);
+        ASSERT_EQ(std::fread(buf.data(), 1, buf.size(), f), buf.size());
+        std::fclose(f);
+    }
+    buf[20] = static_cast<char>(buf[20] ^ 0x10);  // 翻指纹一位，不动尾段 CRC
+    {
+        std::FILE* f = std::fopen(path.string().c_str(), "wb");
+        ASSERT_NE(f, nullptr);
+        ASSERT_EQ(std::fwrite(buf.data(), 1, buf.size(), f), buf.size());
+        std::fclose(f);
+    }
+    auto mc = bitcask::meta::read_meta(tmpdir_.string());
+    ASSERT_TRUE(mc.has_value()) << "尾段损坏不应让目录打不开";
+    EXPECT_EQ(mc->analyzer_fp, 0u);
+}
+
+// 与 S38 同一关键不变式：重写 meta（懒升级 v5→v6 等）不得丢失/覆盖原始指纹。
+TEST_F(MetaAnalyzerFpTest, RewritingMetaPreservesFingerprint) {
+    (void)open_with(ngram(2, 3));
+    auto mc = read();
+    const auto fp = mc.analyzer_fp;
+    mc.version = 6;
+    ASSERT_TRUE(bitcask::meta::write_meta(tmpdir_.string(), mc).has_value());
+    EXPECT_EQ(read().analyzer_fp, fp);
+    EXPECT_TRUE(mentions_analyzer(open_with(ngram(1, 2))));
+}
+
 }  // namespace
