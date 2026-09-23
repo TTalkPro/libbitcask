@@ -17,7 +17,8 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 ## [6.6.0] - 2026-09-23（search 库开库内存 + 进程级线程数上限）
 
 > **版本语义**：C API **纯加法**（4 个新符号 + 1 个新结构体，既有函数签名与
-> `bitcask_options_t` 布局都没动）；盘上格式零改动。MINOR +1，**`SOVERSION` 保持 `6`**。
+> `bitcask_options_t` 布局都没动）；盘上格式零改动。C++ 层 `index::Index::for_each_live*`
+> 回调的 ext 参数改为 `std::string_view`（见下）。MINOR +1，**`SOVERSION` 保持 `6`**。
 >
 > 来源：下游 keel 转来 coxswain 的两条账（2026-09-22）：
 > `feedbacks/2026-09-23-search-open-resident-memory-no-c-api-knob.md`（`enable_search`
@@ -43,6 +44,22 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
   keydir 的 `SnapCursor` 换成同形接口的 `detail::StreamCursor`。
   docmap ckpt 里不被消费的扩展段，其 CRC 仍照旧校验（坏了照旧退 fold）。
 
+- **检索 key 常驻由四份降为两份（S40，`docs/design/s40-key-single-instance.md`）**。
+  enable_search 库里同一批 key 原本住四份（报账记三份，漏了 docmap 的 ord→ext
+  反查表）：keydir、docmap `ext2ord_`、docmap `ord2ext`、TextPlugin
+  `key_to_location_`。现后两份改为 `string_view`——`ord2ext` 指向 `ext2ord_`
+  的节点键，`key_to_location_` 指向段内 key 存储（mmap 段直指映射区、内存段指
+  `keys_`，由条目持有的段 shared_ptr 钉住），墓碑键单独存一份并在键重新写入时回收。
+  1M 个 20 字节 key 约省 96 MB（≤15 字节的短 key 约省 32 MB）。开库重建
+  `key_to_location_` 与写 / 删热路径不再构造 key 字符串。
+- **`Index::ord_to_ext` 对已删 / 被覆盖的 ord 返回 `nullopt`**，兑现 `DocTable`
+  契约（此前返回残留的旧 key）。可见影响仅在「检索判活 → 物化 key」之间被并发
+  删除 / 覆盖的命中（高亮检索、向量检索）：此前返回过期 key，现丢弃该命中。
+- **C++：`index::Index::for_each_live` / `for_each_live_in` 回调第二参数由
+  `const std::string&` 改为 `std::string_view`**（仅在回调内有效）。写成
+  `const std::string&` 的回调改为 `std::string_view` 或 `const auto&` 即可。
+  C API 不受影响。
+
 ### Added
 
 - **`bitcask_set_thread_limits(index_workers, search_slots, fault)`**：进程级线程数
@@ -60,12 +77,8 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 - 测试：`ThreadLimitsTest.SetBeforeFirstSearchOpenCapsIndexPoolThenFreezes`
   （独占可执行文件：冻结是进程级不可逆的；含开库线程增量断言）；
   `c_api_test.c` 新用例 `test_thread_limits_and_tuning`（排在所有 search 用例之前，
-  其后全部 C API 用例都在 (2, 2) 的小池下跑）。
-
-### Not done
-
-- 报账第 3 条「同一批 key 住三份」（keydir / docmap `ext2ord_` / TextPlugin
-  `key_to_location_`）是结构性改动，报账本身也排在最后；本版不动，记在 feedback 里。
+  其后全部 C API 用例都在 (2, 2) 的小池下跑）；S40：`Index.OrdToExtDeadOrdReturnsNullopt`、
+  `TextPlugin.S40TombKeyLifecycle`、`TextPlugin.S40RekeyAcrossSealMergeNoDangling`。
 
 ## [6.5.0] - 2026-09-18（OKI：memdelta 排序视图缓存——拔掉「装载后 range 静默变慢 4200×」的性能悬崖）
 

@@ -28,6 +28,9 @@ Windows 11 / MSVC 14.44，`enable_search = 1`，BM25 only（`vector_dim = 0`）�
 | **BM25 的 `key_to_location_`** | 堆，开库时对每条活文档重建一遍 `std::string` 键 | `src/search/text_plugin.cpp:1350-1366` |
 
 ⇒ 同一批 key 在内存里住**三份**：keydir 哈希、docmap 的 `ext2ord_`、TextPlugin 的 `key_to_location_`。
+> **libbitcask 勘误（S40）**：实为**四份**——还漏了 docmap 的 `ord2ext`（每 ord 一个 `std::string`，
+> `include/bitcask/index.hpp` `Chunk`）。6.6.0 起 `ord2ext` / `key_to_location_` 改为 view，常驻降为两份，
+> 见 `docs/design/s40-key-single-instance.md`。
 Level B（`keydir_cache_entries`）只拆得掉第一份。
 ⇒ 峰值里另有两块整份读缓冲（这个库 ≈ 67 MB）。
 （hint 在 `search_on` 时不读，`cask_recovery.cpp:367`；data 文件惰性 mmap —— 这两份不是账。）
