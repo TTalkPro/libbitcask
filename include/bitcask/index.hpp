@@ -83,7 +83,10 @@ static constexpr std::size_t kChunkOrds = 65536;   // 每 chunk 64K 个 ord
 
 struct Chunk {
     std::array<DocSlot,     kChunkOrds> slots;      // 24B × 64K = 1.5 MB
-    std::array<std::string, kChunkOrds> ord2ext;    // ~32B × 64K = 2 MB (SSO)
+    // S40 D2:view 指向 Index::ext2ord_ 的节点键(node-based,地址稳定)。
+    // 不变量 O:ord2ext[i] 非空 ⟺ 该 ord live;覆盖写/删除时先置空旧槽
+    // 再动节点(docs/design/s40-key-single-instance.md §6)。
+    std::array<std::string_view, kChunkOrds> ord2ext;  // 16B × 64K = 1 MB
     std::uint32_t live_count = 0;                    // chunk 内存活 ord 数；== 0 可释放
 };
 
@@ -155,7 +158,8 @@ public:
     // 线程安全：shared_lock。
     [[nodiscard]] std::optional<DocHit> get(std::string_view ext_id) const;
 
-    // ord → ext_id（检索结果翻译用；V1 主要给调试/恢复）。越界返回 nullopt。
+    // ord → ext_id（检索结果翻译用；V1 主要给调试/恢复）。越界 / 已死返回
+    // nullopt（S40：补 live 门禁，兑现 DocTable 契约——此前死 ord 返回残留拷贝）。
     // S16-3：override DocTable::ord_to_ext。S27-1：按 DocId 定位。
     [[nodiscard]] std::optional<std::string> ord_to_ext(DocId docid) const override;
 
@@ -221,7 +225,8 @@ public:
     }
 
     // 遍历所有 live 文档，对每个调用 fn(ord, ext_id, slot)。
-    // 线程安全：持 shared_lock。
+    // 线程安全：持 shared_lock。S40：ext_id 以 std::string_view 传入（零拷贝，
+    // 仅在回调内有效——指向 ext2ord_ 节点键，出锁即可能被删除）。
     template <typename Fn>
     void for_each_live(Fn&& fn) const {
         std::shared_lock lk(mutex_);
@@ -286,6 +291,9 @@ public:
                        std::uint64_t len);
 
 private:
+    // S40 D2:置空 ord 的 ord2ext 槽(chunk 未分配/已释放则 no-op)。持 unique_lock。
+    void clear_ord2ext_locked(std::uint64_t ord) noexcept;
+
     mutable std::shared_mutex mutex_;
 
     std::unordered_map<std::string, std::uint64_t,

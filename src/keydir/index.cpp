@@ -41,6 +41,13 @@ void Index::ensure_capacity_locked(std::uint64_t ord) {
     }
 }
 
+void Index::clear_ord2ext_locked(std::uint64_t ord) noexcept {
+    const auto ci = ord / kChunkOrds;
+    if (ci < chunks_.size() && chunks_[ci]) {
+        chunks_[ci]->ord2ext[ord % kChunkOrds] = std::string_view{};
+    }
+}
+
 std::uint64_t Index::alloc_ord() {
     std::unique_lock lk(mutex_);
     return next_ord_++;
@@ -57,6 +64,8 @@ void Index::put_doc(std::string_view ext_id, std::uint64_t ord,
     const auto si = ord % kChunkOrds;
     auto* chunk = chunks_[ci].get();
 
+    // S40 D2:ord2ext 槽是指向 ext2ord_ 节点键的 view(不变量 O:非空 ⟺ live)。
+    std::string_view key_view;
     if (auto it = ext2ord_.find(ext_id); it != ext2ord_.end()) {
         const std::uint64_t old_ord = it->second;
         if (old_ord < live_.size() && live_[old_ord]) {
@@ -65,14 +74,17 @@ void Index::put_doc(std::string_view ext_id, std::uint64_t ord,
             if (chunks_[oc]) --chunks_[oc]->live_count;
             ++retired_since_compact_;  // S12-2：覆盖写退休旧版本
         }
+        clear_ord2ext_locked(old_ord);  // 退休槽置空,不留指向节点的旧 view
         it->second = ord;
+        key_view = it->first;
     } else {
-        ext2ord_.emplace(std::string(ext_id), ord);
+        auto [ins, _] = ext2ord_.emplace(std::string(ext_id), ord);
+        key_view = ins->first;
         ++live_docs_;
     }
 
     chunk->slots[si]    = slot;
-    chunk->ord2ext[si].assign(ext_id);
+    chunk->ord2ext[si]  = key_view;
     ++chunk->live_count;
     live_[ord]      = true;
     doc_lens_[ord]  = slot.doc_len;
@@ -104,6 +116,7 @@ bool Index::remove(std::string_view ext_id, std::uint64_t tomb_ord) {
         if (chunks_[ci]) --chunks_[ci]->live_count;
         ++retired_since_compact_;  // S12-2：删除退休当前版本
     }
+    clear_ord2ext_locked(cur_ord);  // S40 D2:erase 前置空,否则槽 view 悬垂
     ext2ord_.erase(it);
     --live_docs_;
     return true;
@@ -138,7 +151,8 @@ std::optional<std::string> Index::ord_to_ext(std::uint64_t ord) const {
     if (ci >= chunks_.size() || !chunks_[ci]) {
         return std::nullopt;
     }
-    return chunks_[ci]->ord2ext[si];
+    if (!live_[ord]) return std::nullopt;  // S40:契约「已删返回 nullopt」
+    return std::string(chunks_[ci]->ord2ext[si]);
 }
 
 bool Index::is_live(std::uint64_t ord) const {
@@ -328,7 +342,7 @@ bool Index::serialize_docmap(std::vector<std::uint8_t>& buf,
     std::uint64_t rows = 0;
     bool ok = true;
     std::uint64_t prev_ord = 0;
-    for_each_live([&](std::uint64_t ord, const std::string& ext,
+    for_each_live([&](std::uint64_t ord, std::string_view ext,
                       const DocSlot& slot) {
         if (ext.size() > 0xFFFF) { ok = false; return; }
         codec::vbyte_encode(ord - prev_ord, buf);  // gap：live 按 ord 升序遍历

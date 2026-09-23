@@ -111,6 +111,35 @@ TEST(Index, OrdToExt) {
     EXPECT_FALSE(idx.ord_to_ext(9999).has_value());
 }
 
+// S40 D2:ord_to_ext 兑现 DocTable 契约「已删返回 nullopt」——覆盖写退休的
+// 旧 ord、remove 的当前 ord 都不再返回残留 ext(ord2ext 改 view 后不变量 O:
+// 槽非空 ⟺ live)。长 key(>15B,走堆)让 ASan 能抓到悬垂 view。
+TEST(Index, OrdToExtDeadOrdReturnsNullopt) {
+    Index idx;
+    const std::string k(40, 'x');
+    idx.put_doc(k, 0, slot(1, 0, 10));
+    idx.put_doc(k, 1, slot(1, 10, 10));  // 覆盖写:ord 0 退休
+    EXPECT_FALSE(idx.ord_to_ext(0).has_value());
+    ASSERT_TRUE(idx.ord_to_ext(1).has_value());
+    EXPECT_EQ(*idx.ord_to_ext(1), k);
+
+    ASSERT_TRUE(idx.remove(k, 2));  // 节点 erase:所有槽都不得再指向它
+    EXPECT_FALSE(idx.ord_to_ext(0).has_value());
+    EXPECT_FALSE(idx.ord_to_ext(1).has_value());
+
+    idx.put_doc(k, 3, slot(1, 20, 10));  // 删后再写:新节点
+    ASSERT_TRUE(idx.ord_to_ext(3).has_value());
+    EXPECT_EQ(*idx.ord_to_ext(3), k);
+    std::size_t live = 0;
+    idx.for_each_live([&](std::uint64_t ord, std::string_view ext,
+                          const DocSlot&) {
+        EXPECT_EQ(ord, 3u);
+        EXPECT_EQ(ext, k);
+        ++live;
+    });
+    EXPECT_EQ(live, 1u);
+}
+
 // 恢复路径：按 ord 序回放磁盘 record（显式 ord，不经 alloc_ord）。
 // put_doc/remove 内部推进 next_ord，后写自动覆盖旧版本。
 TEST(Index, ReplayWithExplicitOrds) {
@@ -225,7 +254,7 @@ TEST(Index, ForEachLiveAcrossChunks) {
     idx.put_doc("c", N + 1, slot(1, 20, 10));
 
     std::vector<std::pair<std::uint64_t, std::string>> seen;
-    idx.for_each_live([&](std::uint64_t ord, const std::string& ext,
+    idx.for_each_live([&](std::uint64_t ord, std::string_view ext,
                           const DocSlot&) {
         seen.emplace_back(ord, ext);
     });

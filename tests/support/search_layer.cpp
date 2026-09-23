@@ -324,7 +324,7 @@ void SearchLayer::rebuild_index(DocReader doc_reader) {
     text_.rebuild_index([&](const std::function<void(
                                 std::uint64_t, const std::string&)>& emit) {
         index_.for_each_live([&](std::uint64_t ord,
-                                 const std::string& /*ext_id*/,
+                                 std::string_view /*ext_id*/,
                                  const index::DocSlot& slot) {
             auto text = doc_reader(slot.loc.file_id, slot.loc.offset,
                                    slot.loc.total_sz);
@@ -390,7 +390,7 @@ bool SearchLayer::save_delta_ckpt(const std::string& base_path,
         bool ok = true;
         index_.for_each_live_in(
             from, watermark,
-            [&](std::uint64_t ord, const std::string& ext,
+            [&](std::uint64_t ord, std::string_view ext,
                 const index::DocSlot& slot) {
                 if (ext.size() > 0xFFFF) { ok = false; return; }
                 detail::put_u64(b, ord);

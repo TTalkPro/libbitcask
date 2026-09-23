@@ -355,7 +355,7 @@ bool save_docmap_delta(Index& docmap, std::string_view dir,
         bool ok = true;
         docmap.for_each_live_in(
             from, watermark,
-            [&](std::uint64_t ord, const std::string& ext,
+            [&](std::uint64_t ord, std::string_view ext,
                 const DocSlot& slot) {
                 if (ext.size() > 0xFFFF) { ok = false; return; }
                 codec::vbyte_encode(ord - prev_ord, rows_buf);
