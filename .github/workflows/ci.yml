@@ -58,6 +58,93 @@ jobs:
         run: cmake --build build -j$(nproc)
       - name: Test
         run: ctest --test-dir build --output-on-failure -j$(nproc)
+      # B1：ISA 档位矩阵。上一步按 runner 的最高档跑；这里用 BITCASK_SIMD_MAX
+      # 强制降档再跑全量，使 scalar / sse42 / avx2 回退内核在每次 CI 都被执行
+      # （复用同一构建，不另起 job）。runner 本身的档位打印在日志里备查。
+      - name: Test (forced ISA tiers)
+        run: |
+          if grep -qm1 avx512f /proc/cpuinfo; then echo "runner: AVX-512 present"; else echo "runner: no AVX-512"; fi
+          for tier in scalar sse42 avx2; do
+            echo "::group::BITCASK_SIMD_MAX=$tier"
+            BITCASK_SIMD_MAX=$tier ctest --test-dir build --output-on-failure -j$(nproc)
+            echo "::endgroup::"
+          done
+
+  # ---------------------------------------------------------------------------
+  # B1：AVX-512 / AVX512-VNNI 内核首次真执行（Intel SDE 仿真 Sapphire Rapids）。
+  # 本机与 GitHub runner 都不保证有 AVX-512，这批内核此前从未被执行过。SDE 比
+  # 原生慢 10-40×，故只跑覆盖 SIMD 内核的测试组（bm25 / intersect / hnsw /
+  # 向量插件 / IVF-RaBitQ / CPU 探测），不跑全量。
+  # **非门控**（continue-on-error）直到首次跑绿——SDE 下载与仿真环境未经实跑验证。
+  # ---------------------------------------------------------------------------
+  avx512-sde:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install GCC 14
+        run: |
+          sudo add-apt-repository ppa:ubuntu-toolchain-r/test -y
+          sudo apt-get update
+          sudo apt-get install -y g++-14
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: sde-gcc14
+      - name: Setup Intel SDE
+        uses: petarpetrovt/setup-sde@v2
+        with:
+          environmentVariableName: SDE_PATH
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build kernel test groups
+        run: |
+          cmake --build build -j$(nproc) --target \
+            bitcask_cpu_features_test bitcask_codec_test bitcask_inverted_test \
+            bitcask_hnsw_test bitcask_vector_plugin_test bitcask_ivf_rq_test
+      - name: Run under SDE (-spr = AVX-512 + AVX512-VNNI + AVX-VNNI)
+        run: |
+          set -e
+          for t in cpu_features codec inverted hnsw vector_plugin ivf_rq; do
+            echo "::group::$t"
+            "$SDE_PATH/sde64" -spr -- ./build/tests/bitcask_${t}_test --gtest_brief=1
+            echo "::endgroup::"
+          done
+
+  # ---------------------------------------------------------------------------
+  # B1：Windows MSVC Release + 全量 ctest。Windows 移植此前零 CI。
+  # 依赖全走 third_party 子模块（zlib / oneTBB / ICU 现编，见 CMakePresets 的
+  # windows-base 注）；ICU 的 MSBuild 工具集钉法见 feedbacks/2026-09-13。
+  # **非门控**（continue-on-error）直到首次跑绿。
+  # ---------------------------------------------------------------------------
+  windows-msvc:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install Ninja
+        run: choco install ninja -y
+      - name: Configure
+        run: cmake --preset msvc-release -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build-msvc-release -j 4
+      - name: Test
+        run: ctest --test-dir build-msvc-release --output-on-failure -j 4
 
   # ---------------------------------------------------------------------------
   # Clang 构建 + 全量 ctest（S12-6）。GCC 是主编译器；clang 作可移植性护栏——
