@@ -97,6 +97,23 @@ inline void prefetch_vec(const float* p, std::size_t dim) {
 #endif
 }
 
+// V4.2 int8 粗筛路径的码字预取:与 prefetch_vec 同一套按长度守卫的 6 条
+// prefetch,码字 1 字节/维(bytes = dim)。
+inline void prefetch_qcodes(const std::int8_t* p, std::size_t dim) {
+#if BITCASK_X86_64
+    const char* c = reinterpret_cast<const char*>(p);
+    _mm_prefetch(c, _MM_HINT_T0);
+    if (dim > 64)  _mm_prefetch(c + 64, _MM_HINT_T0);
+    if (dim > 128) _mm_prefetch(c + 128, _MM_HINT_T0);
+    if (dim > 192) _mm_prefetch(c + 192, _MM_HINT_T0);
+    if (dim > 256) _mm_prefetch(c + 256, _MM_HINT_T0);
+    if (dim > 320) _mm_prefetch(c + 320, _MM_HINT_T0);
+#else
+    (void)p;
+    (void)dim;
+#endif
+}
+
 using DistFn = float (*)(const float*, const float*, std::size_t);
 
 DistFn pick_kernel(HnswMetric metric) {
@@ -637,22 +654,28 @@ std::uint32_t HnswIndex::copy_neighbors(std::uint32_t id, std::uint32_t layer,
     }
 }
 
-std::uint32_t HnswIndex::greedy_closest(const float* q, std::uint32_t start,
-                                        std::uint32_t layer, std::uint32_t n,
-                                        std::uint32_t* scratch) const {
+// D7:greedy_closest / greedy_closest_int8 共用主循环——两者只差距离函数与
+// 预取目标(f32 向量 / int8 码字)。lambda 内联后与原手写两份同码。
+template <class Dist, class Prefetch>
+std::uint32_t HnswIndex::greedy_closest_impl(std::uint32_t start,
+                                             std::uint32_t layer,
+                                             std::uint32_t n,
+                                             std::uint32_t* scratch,
+                                             Dist&& dist,
+                                             Prefetch&& prefetch) const {
     std::uint32_t cur = start;
-    float cur_d = dist_id(q, cur);
+    float cur_d = dist(cur);
     bool improved = true;
     while (improved) {
         improved = false;
         const std::uint32_t cnt = copy_neighbors(cur, layer, scratch);
         for (std::uint32_t i = 0; i < cnt; ++i) {
-            if (scratch[i] < n) prefetch_vec(vec_of(scratch[i]), cfg_.dim);
+            if (scratch[i] < n) prefetch(scratch[i]);
         }
         for (std::uint32_t i = 0; i < cnt; ++i) {
             const std::uint32_t nid = scratch[i];
             if (nid >= n) continue;  // 本地 count 快照之外:尚未对我发布
-            const float d = dist_id(q, nid);
+            const float d = dist(nid);
             if (d < cur_d) {
                 cur_d = d;
                 cur = nid;
@@ -661,6 +684,15 @@ std::uint32_t HnswIndex::greedy_closest(const float* q, std::uint32_t start,
         }
     }
     return cur;
+}
+
+std::uint32_t HnswIndex::greedy_closest(const float* q, std::uint32_t start,
+                                        std::uint32_t layer, std::uint32_t n,
+                                        std::uint32_t* scratch) const {
+    return greedy_closest_impl(
+        start, layer, n, scratch,
+        [&](std::uint32_t id) { return dist_id(q, id); },
+        [&](std::uint32_t id) { prefetch_vec(vec_of(id), cfg_.dim); });
 }
 
 using Cand = std::pair<float, std::uint32_t>;
@@ -675,10 +707,12 @@ struct ReusablePQ : std::priority_queue<Cand, std::vector<Cand>, Compare> {
 thread_local std::vector<Cand> tl_cands_buf;
 thread_local std::vector<Cand> tl_top_buf;
 
-void HnswIndex::search_layer(
-    const float* q, std::uint32_t entry, std::size_t ef, std::uint32_t layer,
-    std::uint32_t n, std::uint32_t* scratch,
-    std::vector<std::pair<float, std::uint32_t>>& out) const {
+// D7:search_layer / search_layer_int8 共用主循环(同上,只差距离与预取)。
+template <class Dist, class Prefetch>
+void HnswIndex::search_layer_impl(
+    std::uint32_t entry, std::size_t ef, std::uint32_t layer, std::uint32_t n,
+    std::uint32_t* scratch, std::vector<std::pair<float, std::uint32_t>>& out,
+    Dist&& dist, Prefetch&& prefetch) const {
     out.reserve(ef);  // D1:保容量 ≥ ef，后续 clear+resize 不 realloc。
     // visited:thread_local 版本化数组(方案见文件顶部注释)。
     auto& vt = t_visited;
@@ -702,7 +736,7 @@ void HnswIndex::search_layer(
     ReusablePQ<std::greater<>> cands(std::greater<>{}, std::move(tl_cands_buf));
     ReusablePQ<std::less<Cand>> top(std::less<Cand>{}, std::move(tl_top_buf));
 
-    const float d0 = dist_id(q, entry);
+    const float d0 = dist(entry);
     cands.push({d0, entry});
     top.push({d0, entry});
     visited[entry] = ep;
@@ -715,14 +749,14 @@ void HnswIndex::search_layer(
         // 预取与计算分两遍:未访问的在界邻居先把向量段拉过来。
         for (std::uint32_t i = 0; i < cnt; ++i) {
             const std::uint32_t nid = scratch[i];
-            if (nid < n && visited[nid] != ep) prefetch_vec(vec_of(nid), cfg_.dim);
+            if (nid < n && visited[nid] != ep) prefetch(nid);
         }
         for (std::uint32_t i = 0; i < cnt; ++i) {
             const std::uint32_t nid = scratch[i];
             if (nid >= n) continue;  // 本地 count 快照之外(见 hpp 协议)
             if (visited[nid] == ep) continue;
             visited[nid] = ep;
-            const float nd = dist_id(q, nid);
+            const float nd = dist(nid);
             if (top.size() < ef || nd < top.top().first) {
                 cands.push({nd, nid});
                 top.push({nd, nid});
@@ -741,117 +775,43 @@ void HnswIndex::search_layer(
     tl_top_buf = std::move(top).extract();
 }
 
-// V4.2:int8 粗筛版 greedy_closest,与 f32 版同结构,只换 dist_id →
-// dist_id_int8。粗筛阶段不要求数值精度,目的是把图遍历导到正确区域。
+void HnswIndex::search_layer(
+    const float* q, std::uint32_t entry, std::size_t ef, std::uint32_t layer,
+    std::uint32_t n, std::uint32_t* scratch,
+    std::vector<std::pair<float, std::uint32_t>>& out) const {
+    search_layer_impl(
+        entry, ef, layer, n, scratch, out,
+        [&](std::uint32_t id) { return dist_id(q, id); },
+        [&](std::uint32_t id) { prefetch_vec(vec_of(id), cfg_.dim); });
+}
+
+// V4.2:int8 粗筛版 greedy_closest(D7 起与 f32 版共用 greedy_closest_impl)。
+// 粗筛阶段不要求数值精度,目的是把图遍历导到正确区域。
 std::uint32_t HnswIndex::greedy_closest_int8(
     const std::int8_t* query_codes, float query_scale,
     std::int32_t query_sum, std::uint32_t start, std::uint32_t layer,
     std::uint32_t n, std::uint32_t* scratch) const {
-    std::uint32_t cur = start;
-    float cur_d = dist_id_int8(query_codes, query_scale, query_sum, cur);
-    bool improved = true;
-    while (improved) {
-        improved = false;
-        const std::uint32_t cnt = copy_neighbors(cur, layer, scratch);
-        for (std::uint32_t i = 0; i < cnt; ++i) {
-            if (scratch[i] < n) {
-                const char* pc = reinterpret_cast<const char*>(qcodes_of(scratch[i]));
-                _mm_prefetch(pc, _MM_HINT_T0);
-                if (cfg_.dim > 64)  _mm_prefetch(pc + 64, _MM_HINT_T0);
-                if (cfg_.dim > 128) _mm_prefetch(pc + 128, _MM_HINT_T0);
-                if (cfg_.dim > 192) _mm_prefetch(pc + 192, _MM_HINT_T0);
-                if (cfg_.dim > 256) _mm_prefetch(pc + 256, _MM_HINT_T0);
-                if (cfg_.dim > 320) _mm_prefetch(pc + 320, _MM_HINT_T0);
-            }
-        }
-        for (std::uint32_t i = 0; i < cnt; ++i) {
-            const std::uint32_t nid = scratch[i];
-            if (nid >= n) continue;
-            const float d = dist_id_int8(query_codes, query_scale, query_sum,
-                                         nid);
-            if (d < cur_d) {
-                cur_d = d;
-                cur = nid;
-                improved = true;
-            }
-        }
-    }
-    return cur;
+    return greedy_closest_impl(
+        start, layer, n, scratch,
+        [&](std::uint32_t id) {
+            return dist_id_int8(query_codes, query_scale, query_sum, id);
+        },
+        [&](std::uint32_t id) { prefetch_qcodes(qcodes_of(id), cfg_.dim); });
 }
 
-// V4.2:int8 粗筛版 search_layer,与 f32 版同结构。预取仍对 f32 向量
-// 段发(冷拉后段距离不需要重读——int8 阶段之后才是 f32 重排)。
+// V4.2:int8 粗筛版 search_layer(D7 起与 f32 版共用 search_layer_impl)。
+// 预取对象是 int8 码字(距离就在码字上算;f32 重排在其后另行进行)。
 void HnswIndex::search_layer_int8(
     const std::int8_t* query_codes, float query_scale, std::int32_t query_sum,
     std::uint32_t entry, std::size_t ef, std::uint32_t layer, std::uint32_t n,
     std::uint32_t* scratch,
     std::vector<std::pair<float, std::uint32_t>>& out) const {
-    out.reserve(ef);
-    auto& vt = t_visited;
-    if (vt.owner != instance_id_) {
-        vt.owner = instance_id_;
-        vt.epoch = 0;
-        std::fill(vt.marks.begin(), vt.marks.end(), 0);
-    }
-    if (vt.marks.size() < n) vt.marks.resize(n, 0);
-    if (++vt.epoch == 0) {
-        std::fill(vt.marks.begin(), vt.marks.end(), 0);
-        vt.epoch = 1;
-    }
-    const std::uint32_t ep = vt.epoch;
-    std::uint32_t* visited = vt.marks.data();
-
-    // Cand 用文件级全局别名（std::pair<float, std::uint32_t>）。
-    tl_cands_buf.clear();
-    tl_top_buf.clear();
-    ReusablePQ<std::greater<>> cands(std::greater<>{}, std::move(tl_cands_buf));
-    ReusablePQ<std::less<Cand>> top(std::less<Cand>{}, std::move(tl_top_buf));
-
-    const float d0 = dist_id_int8(query_codes, query_scale, query_sum, entry);
-    cands.push({d0, entry});
-    top.push({d0, entry});
-    visited[entry] = ep;
-
-    while (!cands.empty()) {
-        const auto [d, id] = cands.top();
-        if (d > top.top().first && top.size() >= ef) break;
-        cands.pop();
-        const std::uint32_t cnt = copy_neighbors(id, layer, scratch);
-        for (std::uint32_t i = 0; i < cnt; ++i) {
-            const std::uint32_t nid = scratch[i];
-            if (nid < n && visited[nid] != ep) {
-                const char* pc = reinterpret_cast<const char*>(qcodes_of(nid));
-                _mm_prefetch(pc, _MM_HINT_T0);
-                if (cfg_.dim > 64)  _mm_prefetch(pc + 64, _MM_HINT_T0);
-                if (cfg_.dim > 128) _mm_prefetch(pc + 128, _MM_HINT_T0);
-                if (cfg_.dim > 192) _mm_prefetch(pc + 192, _MM_HINT_T0);
-                if (cfg_.dim > 256) _mm_prefetch(pc + 256, _MM_HINT_T0);
-                if (cfg_.dim > 320) _mm_prefetch(pc + 320, _MM_HINT_T0);
-            }
-        }
-        for (std::uint32_t i = 0; i < cnt; ++i) {
-            const std::uint32_t nid = scratch[i];
-            if (nid >= n) continue;
-            if (visited[nid] == ep) continue;
-            visited[nid] = ep;
-            const float nd = dist_id_int8(query_codes, query_scale, query_sum,
-                                          nid);
-            if (top.size() < ef || nd < top.top().first) {
-                cands.push({nd, nid});
-                top.push({nd, nid});
-                if (top.size() > ef) top.pop();
-            }
-        }
-    }
-
-    out.clear();
-    out.resize(top.size());
-    for (std::size_t i = top.size(); i-- > 0;) {
-        out[i] = top.top();
-        top.pop();
-    }
-    tl_cands_buf = std::move(cands).extract();
-    tl_top_buf = std::move(top).extract();
+    search_layer_impl(
+        entry, ef, layer, n, scratch, out,
+        [&](std::uint32_t id) {
+            return dist_id_int8(query_codes, query_scale, query_sum, id);
+        },
+        [&](std::uint32_t id) { prefetch_qcodes(qcodes_of(id), cfg_.dim); });
 }
 
 void HnswIndex::select_neighbors(

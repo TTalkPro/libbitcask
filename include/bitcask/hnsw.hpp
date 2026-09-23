@@ -405,6 +405,19 @@ private:
                            std::uint32_t* scratch,
                            std::vector<std::pair<float, std::uint32_t>>& out) const;
 
+    // D7:上面 f32 / int8 两对的共用主循环(定义与实例化都在 hnsw.cpp)。
+    // dist(id) → float;prefetch(id) 预取该节点参与距离计算的数据。
+    template <class Dist, class Prefetch>
+    [[nodiscard]] std::uint32_t greedy_closest_impl(
+        std::uint32_t start, std::uint32_t layer, std::uint32_t n,
+        std::uint32_t* scratch, Dist&& dist, Prefetch&& prefetch) const;
+    template <class Dist, class Prefetch>
+    void search_layer_impl(std::uint32_t entry, std::size_t ef,
+                           std::uint32_t layer, std::uint32_t n,
+                           std::uint32_t* scratch,
+                           std::vector<std::pair<float, std::uint32_t>>& out,
+                           Dist&& dist, Prefetch&& prefetch) const;
+
     // 邻居选择启发式(HNSW 论文 Algorithm 4):候选若离 query 比离任一
     // 已选邻居更近才保留——避免聚簇数据上邻居全挤在同一方向。
     void select_neighbors(
