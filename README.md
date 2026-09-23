@@ -40,6 +40,8 @@
 | 迁移 | `bitcask_migrate`（CLI） | 统一纪元迁移：`detect` / `be2le`（v1 大端）/ `tstamp64`（u32 → u64，5.0 flag-day）/ `hintord`（hint 补 ord，5.1 flag-day，data 零改动）；非破坏性 | [`migrate-le.md`](doc/migrate-le.md) |
 | 状态 | `status` / `read_handle_count` | 内省 key 数 / fd 预算 / 索引错误计数 | [`api-cpp.md`](doc/api-cpp.md) |
 | C ABI | `libbitcask.so` | `extern "C"` 不透明句柄 + slice + fault，跨 ABI 稳定 | [`api-c.md`](doc/api-c.md) |
+| **进程级线程数上限** | `bitcask_set_thread_limits`（C）/ `include/bitcask/thread_limits.hpp`（C++） | 封顶索引池 map worker 数与批量查询 arena 槽数（0 = 缺省 `hardware_concurrency`）；进程级共享两池，须在首个 search 库 open 前设置 | [`api-c.md`](doc/api-c.md) |
+| **开库调优** | `bitcask_open_ex2`（`bitcask_open_tuning_t`） | 首旋钮 `segment_verify_crc`（缺省 1；0 = BM25 段只验页脚 / 目录，省开库整读段目录的 I/O）；`struct_size` 前向兼容，以后尾部追加字段不开新入口 | [`api-c.md`](doc/api-c.md) |
 
 ---
 
@@ -289,6 +291,13 @@ matters for your corpus.
 - 需要跨机器可复现的索引，用 `BITCASK_ICU_PROVIDER=vendored` 把版本钉死——
   这正是 vendored 模式最实际的用途。
 
+**6.6.0 起同一思路覆盖 analyzer 配置本身**：建索引时把影响切词的 analyzer
+配置（分词器类型、n-gram 范围、停用词、token 长度上下限、词干化）的指纹写进
+`bitcask.meta` **可选尾段**（自带 CRC，旧二进制读写透明），之后以不同配置重开
+同样只经 `CaskOptions::log_fn` 报一条 `kWarn`、不拒开。6.6.0 之前建的目录
+未记录指纹：不告警，也不补记。尾段布局见
+[`doc/format-zh.md`](doc/format-zh.md) §3.1b。
+
 #### ICU 的来源（`BITCASK_ICU_PROVIDER`）
 
 ICU 提供 NFKC_Casefold 归一化、Unicode 字符属性与编码转换（GB18030 等 → UTF-8）。
@@ -490,7 +499,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 
 - **双持久化**：数据文件（append-only，KV 权威）+ per-component base + delta ckpt + manifest commit（BM25/HNSW 的派生缓存，校验失败回退全量 fold）。详见 [`recovery-unified-checkpoint-design-zh.md`](doc/recovery-unified-checkpoint-design-zh.md)。
 - **双锁模型**：`bitcask.write.lock`（writer）与 `bitcask.merge.lock`（merger）独立，周期 merge 与 live writer 并行不互斥。merger 通过读取 `write.lock` 内容排除 live writer 的活动文件。
-- **异步索引 MapReduce**：`put_doc` 入队有界 `IndexPool`（满则 push 阻塞做背压）→ N 个 map worker 并行分词（`hardware_concurrency` 真数据并行）→ per-lane reorder buffer（按 ord 排序）→ 单 reducer 串行 apply（库内单写者）。池由 `KeyDirRegistry` 共享，线程数 = N+1 与库数无关。详见 [`docs/design/async-index-pipeline.md`](docs/design/async-index-pipeline.md)。
+- **异步索引 MapReduce**：`put_doc` 入队有界 `IndexPool`（满则 push 阻塞做背压）→ N 个 map worker 并行分词（`hardware_concurrency` 真数据并行）→ per-lane reorder buffer（按 ord 排序）→ 单 reducer 串行 apply（库内单写者）。池由 `KeyDirRegistry` 共享，线程数 = N+1 与库数无关；6.6.0 起可经 `bitcask_set_thread_limits`（进程级，须在首个 search 库 open 前）同时封顶索引 worker 数与批量查询 arena 槽数。详见 [`docs/design/async-index-pipeline.md`](docs/design/async-index-pipeline.md)。
 - **查询并发**：批量查询接口（`search_*_batch`）在进程级共享 `search_arena`（TBB `task_arena`）上 inter-query 并行；单查询内部仍串行（WAND 顺序依赖、HNSW 图遍历）。
 - **向量双引擎**（S32）：`vector_engine` 建库时一次性选定并持久化进 `bitcask.meta`——`hnsw`（内存图，≤数 M 向量）/ `ivfrq`（IVF-RaBitQ 磁盘段，10M-100M 推荐）/ `diskann`（Vamana 图，实验性）。引擎不符重开 → `kModeMismatch`；离线切换用 `vec_engine_migrate`（只改 meta，首次 open 全量 fold 重建，可回滚）。详见 [`vector-dual-engine-selection-zh.md`](doc/vector-dual-engine-selection-zh.md)。
 - **小端 only**：所有多字节整数小端（LE 主机原生零转换）；不再与 legacy 大端 Erlang 字节互通，迁移用 `bitcask_migrate be2le`（旧名 `migrate_le`，见 [`migrate-le.md`](doc/migrate-le.md)）。
@@ -507,7 +516,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 ├── c_api/             # libbitcask.so 的 C ABI（bitcask_kv / text / vec + 聚合 bitcask_c.h）
 ├── src/               # 实现：fileops / io / lock / keydir / merge /
 │                      #       cask / search / bm25 / text / vector
-├── tests/             # GoogleTest 单元 + 集成测试（35 个测试二进制）
+├── tests/             # GoogleTest 单元 + 集成测试（50 个测试二进制，含 C API smoke）
 ├── bench/             # Google Benchmark（keydir / cask / inverted / hnsw …）
 ├── tools/             # bitcask_migrate（统一）、migrate_le（旧）、vec_engine_migrate、gen_inert_table
 ├── cmake/             # BitcaskSanitizers 模块 + tsan.supp
