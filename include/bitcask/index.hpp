@@ -16,6 +16,7 @@
 
 #include "bitcask/live_checker.hpp"
 #include "bitcask/doc_table.hpp"  // S16-3：Index 实现 DocTable（查询面只读身份表）
+#include "bitcask/io.hpp"  // 6.6.0：deserialize_docmap 流式重载的 FileHandle
 #include "bitcask/index_ids.hpp"  // S27-1：Lsn/DocId 角色别名
 #include "bitcask/meta_filter.hpp"  // S13-P8：eval_meta 锁内求值
 #include "bitcask/string_hash.hpp"
@@ -277,6 +278,12 @@ public:
                                         std::uint64_t covers_next_ord) const;
     [[nodiscard]] std::optional<std::uint64_t>
     deserialize_docmap(std::span<const std::uint8_t> bytes);
+    // 6.6.0：同上，但直接从文件区间 [off, off+len) 流式载入（分块 CRC +
+    // 分块解析，不把整段读进堆）。开库路径用它——docmap 行段与文件同量级
+    // （feedback 2026-09-23：60 MB），整段缓冲是开库峰值的大头之一。
+    [[nodiscard]] std::optional<std::uint64_t>
+    deserialize_docmap(io::FileHandle fd, std::uint64_t off,
+                       std::uint64_t len);
 
 private:
     mutable std::shared_mutex mutex_;

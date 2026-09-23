@@ -1,8 +1,8 @@
 #include "bitcask/keydir_registry.hpp"
 
 #include <algorithm>
-#include <thread>
 
+#include "bitcask/thread_limits.hpp"  // 6.6.0：进程级线程数上限
 #include "bitcask/thread_pool.hpp"  // S6-P3: IndexPool 完整定义（out-of-line dtor + 懒创建）
 
 namespace bitcask::keydir {
@@ -19,8 +19,10 @@ bitcask::IndexPool* KeyDirRegistry::index_pool() {
         // S6-P4: map worker 数 = 硬件并发（真数据并行跑 analyze → G1）。
         // 至少 2（hardware_concurrency 可能返回 0/1）。queue / reorder 在途上限
         // 取 IndexPool 具名默认（kDefaultIndexQueueCapacity / kDefaultReorderInflightCap）。
-        unsigned hc = std::thread::hardware_concurrency();
-        int map_workers = static_cast<int>(hc > 1 ? hc : 2);
+        // 6.6.0：宿主可经 set_thread_limits 压低（进程级；建池即冻结）。
+        const auto lim = bitcask::freeze_thread_limits();
+        const int map_workers = static_cast<int>(
+            bitcask::resolve_thread_count(lim.index_workers));
         index_pool_ = std::make_unique<bitcask::IndexPool>(map_workers);
     }
     return index_pool_.get();

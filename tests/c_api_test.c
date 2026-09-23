@@ -49,6 +49,7 @@ static const char* const kAllTestDirs[] = {
     TDIR("range"),
     TDIR("status"),
     TDIR("statusex"),
+    TDIR("tuning"),
     TDIR("txn"),
     TDIR("veng"),
     TDIR("vhbatch"),
@@ -1706,6 +1707,84 @@ static int test_merge_policy_files_checkpoint(void) {
     return 0;
 }
 
+#define TL_CHECK(cond) do { if (!(cond)) { \
+    fprintf(stderr, "FAIL test_thread_limits_and_tuning: line %d: %s\n", __LINE__, #cond); \
+    return 1; } } while (0)
+
+/* 6.6.0：进程级线程上限 + 开库调优（keel 转 coxswain 2026-09-22 两条账）。
+ * 注意：必须是 main 里**第一个**开 search 库的用例：线程上限在首个 search 库
+ * 建池时冻结，之后的用例全在 (2, 2) 的小池下跑——顺带验证功能不受上限影响。 */
+static int test_thread_limits_and_tuning(void) {
+    bitcask_fault_t fault;
+    bitcask_t* cask = NULL;
+
+    /* ① 冻结前可反复设置。 */
+    TL_CHECK(bitcask_set_thread_limits(3, 3, &fault) == BITCASK_OK);
+    TL_CHECK(bitcask_set_thread_limits(2, 2, &fault) == BITCASK_OK);
+
+    /* ② tuning 缺省与 C++ 缺省一致；未经 init（struct_size 太小）→ 拒绝、不碰盘。 */
+    bitcask_open_tuning_t tuning;
+    bitcask_open_tuning_init(&tuning);
+    TL_CHECK(tuning.struct_size == sizeof(bitcask_open_tuning_t));
+    TL_CHECK(tuning.segment_verify_crc == 1);
+
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.enable_search = 1;
+    opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+    {
+        bitcask_open_tuning_t bad = tuning;
+        bad.struct_size = 0;
+        cask = (bitcask_t*)0x1;
+        TL_CHECK(bitcask_open_ex2(TDIR("tuning"), &opts, NULL, &bad, &cask, &fault) ==
+                 BITCASK_ERR_INVALID_OPTION);
+        TL_CHECK(cask == NULL);
+        TL_CHECK(strstr(fault.detail, "bitcask_open_tuning_init") != NULL);
+    }
+
+    /* ③ 建库（首个 search 库 ⇒ 冻结 (2, 2)），写 + close 封口出 BM25 段。 */
+    TL_CHECK(bitcask_open_ex2(TDIR("tuning"), &opts, NULL, &tuning, &cask, &fault) == BITCASK_OK);
+    char kbuf[32];
+    for (int i = 0; i < 100; i++) {
+        int klen = snprintf(kbuf, sizeof(kbuf), "t_%d", i);
+        const char* text = (i % 2) ? "alpha beta" : "alpha gamma";
+        bitcask_doc_input_t doc;
+        memset(&doc, 0, sizeof(doc));
+        doc.text.data = text;
+        doc.text.size = strlen(text);
+        bitcask_slice_t key = {kbuf, (size_t)klen};
+        TL_CHECK(bitcask_put_doc(cask, key, &doc, 0, &fault) == BITCASK_OK);
+    }
+    bitcask_flush_index(cask);
+    bitcask_close(cask);
+
+    /* ④ 已冻结：同值幂等 OK；异值拒绝，fault 点名生效值。 */
+    TL_CHECK(bitcask_set_thread_limits(2, 2, &fault) == BITCASK_OK);
+    TL_CHECK(bitcask_set_thread_limits(4, 2, &fault) == BITCASK_ERR_INVALID_OPTION);
+    TL_CHECK(strstr(fault.detail, "already in effect") != NULL);
+    TL_CHECK(strstr(fault.detail, "index_workers=2") != NULL);
+
+    /* ⑤ 重开：校验开 / 关两种都能开、查得对（段走 mmap，校验走定位读）。 */
+    for (int verify = 1; verify >= 0; --verify) {
+        tuning.segment_verify_crc = verify;
+        TL_CHECK(bitcask_open_ex2(TDIR("tuning"), &opts, NULL, &tuning, &cask, &fault) ==
+                 BITCASK_OK);
+        bitcask_search_result_t* r = NULL;
+        TL_CHECK(bitcask_search_text(cask, "gamma", 1000, &r, &fault) == BITCASK_OK);
+        TL_CHECK(r != NULL && r->count == 50);
+        bitcask_search_result_free(r);
+        bitcask_close(cask);
+    }
+
+    /* ⑥ tuning = NULL 的 open_ex2 与 open_ex 同路。 */
+    TL_CHECK(bitcask_open_ex2(TDIR("tuning"), &opts, NULL, NULL, &cask, &fault) == BITCASK_OK);
+    bitcask_close(cask);
+
+    printf("PASS test_thread_limits_and_tuning\n");
+    return 0;
+}
+
 int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
@@ -1714,6 +1793,7 @@ int main(void) {
 
     int failures = 0;
     failures += test_version();
+    failures += test_thread_limits_and_tuning();  /* 须先于其它 search 用例（见用例注释） */
     failures += test_kv_basic();
     failures += test_status_and_merge();
     failures += test_iteration();

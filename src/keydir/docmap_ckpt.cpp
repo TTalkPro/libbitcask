@@ -424,11 +424,13 @@ DocmapLoadResult load_docmap(Index& docmap, std::string_view dir,
     DocmapLoadResult result;
     const std::string fp = comp_path(dir);
     const std::string prev_path = fp + ".prev";
-    auto lc = sc::SearchCheckpoint::read(fp);
+    // 6.6.0：open（只解析页脚目录）而非 read（整份 payload 进堆）——行段
+    // 走 deserialize_docmap 的流式重载，开库不再为它付一份文件大小的缓冲。
+    auto lc = sc::SearchCheckpoint::open(fp);
     bool from_prev = false;
     if (lc && lc->watermark != expected_base_wm) lc.reset();
     if (!lc) {
-        lc = sc::SearchCheckpoint::read(prev_path);
+        lc = sc::SearchCheckpoint::open(prev_path);
         if (lc && lc->watermark != expected_base_wm) lc.reset();
         if (lc) from_prev = true;
     }
@@ -446,24 +448,33 @@ DocmapLoadResult load_docmap(Index& docmap, std::string_view dir,
     // kDocmap 段应用。
     bool segments_ok = true;
     bool any = false;
-    std::optional<std::span<const std::byte>> meta_pl;
-    for (const auto& ls : lc->sections) {
-        if (!ls.crc_ok) { segments_ok = false; continue; }
-        if (ls.type ==
+    std::optional<sc::LoadedSection> meta_ls;
+    for (const auto& r : lc->sections) {
+        if (r.type ==
             static_cast<std::uint16_t>(sc::CkptSectionType::kDocmap)) {
-            auto covers = docmap.deserialize_docmap(
-                std::span<const std::uint8_t>(
-                    reinterpret_cast<const std::uint8_t*>(ls.payload.data()),
-                    ls.payload.size()));
+            // 段 CRC 分块先验（坏段不碰 docmap），再流式解析。
+            if (!lc->section_crc_ok(r)) { segments_ok = false; continue; }
+            auto covers = docmap.deserialize_docmap(lc->file.fd(), r.off,
+                                                    r.len);
             if (!covers) segments_ok = false;
             else any = true;
-        } else if (ls.type == static_cast<std::uint16_t>(
-                                  sc::CkptSectionType::kDocmapMeta)) {
-            // 延后到行段之后应用（不依赖段在文件里的先后）。
-            meta_pl = std::span<const std::byte>(ls.payload.data(),
-                                                 ls.payload.size());
+        } else if (r.type == static_cast<std::uint16_t>(
+                                 sc::CkptSectionType::kDocmapMeta)) {
+            // 延后到行段之后应用（不依赖段在文件里的先后）。meta 本就要
+            // 常驻进 meta_blobs_，整段读进来不额外抬峰值的量级。
+            auto ls = lc->load(r);
+            if (!ls || !ls->crc_ok) { segments_ok = false; continue; }
+            meta_ls = std::move(ls);
+        } else if (!lc->section_crc_ok(r)) {
+            // 旧文件可能含 meta/terms 等扩展段——内容忽略，但坏 CRC 照旧记
+            // segments_ok=false（与 read 时代「逐段带 crc_ok」的判据一致）。
+            segments_ok = false;
         }
-        // 旧文件可能含 meta/terms 等扩展段——忽略。
+    }
+    std::optional<std::span<const std::byte>> meta_pl;
+    if (meta_ls) {
+        meta_pl = std::span<const std::byte>(meta_ls->payload.data(),
+                                             meta_ls->payload.size());
     }
     if (!any) segments_ok = false;
     if (segments_ok && meta_pl &&

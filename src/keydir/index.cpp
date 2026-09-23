@@ -3,6 +3,7 @@
 
 #include "bitcask/codec.hpp"  // S18-2：sidecar CRC
 #include "bitcask/vbyte.hpp"   // S21-2 A2：sidecar v2 行 gap+vbyte
+#include "bitcask/detail/stream_cursor.hpp"  // 6.6.0：docmap 行段流式载入
 
 #include <algorithm>
 #include <cstring>
@@ -350,6 +351,72 @@ bool Index::serialize_docmap(std::vector<std::uint8_t>& buf,
     return true;
 }
 
+namespace {
+// 6.6.0：行段解析对游标类型模板化——span 版（legacy_ckpt 等整段在手的调用
+// 方）与流式版（docmap_ckpt 开库载入）共用这一份解析。Cur 须提供
+// SnapCursor 同形接口：u64 / vb / bytes / fail / at_end。
+struct SidecarSpanCursor {
+    const std::uint8_t* p;
+    const std::uint8_t* end;
+    bool fail = false;
+    [[nodiscard]] bool at_end() const noexcept { return p == end; }
+    bool bytes(void* dst, std::size_t n) {
+        if (fail || static_cast<std::size_t>(end - p) < n) {
+            fail = true;
+            return false;
+        }
+        std::memcpy(dst, p, n);
+        p += n;
+        return true;
+    }
+    std::uint64_t u64() { std::uint64_t v = 0; bytes(&v, 8); return v; }
+    std::uint64_t vb() {  // 边界安全 vbyte
+        std::uint64_t v = 0, shift = 0;
+        while (true) {
+            std::uint8_t byte = 0;
+            if (!bytes(&byte, 1)) return 0;
+            v |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
+            if (byte & 0x80) return v;
+            shift += 7;
+            if (shift > 63) { fail = true; return 0; }
+        }
+    }
+};
+
+// 游标起点 = magic/version 之后（covers 字段），终点 = 尾部 CRC 之前。
+template <class Cur>
+std::optional<std::uint64_t> parse_sidecar_rows(Index& idx, Cur& c) {
+    const std::uint64_t covers = c.u64();
+    const std::uint64_t rows = c.u64();
+    if (c.fail || rows > (1ull << 40)) return std::nullopt;
+    std::uint64_t prev_ord = 0;
+    std::string ext;
+    for (std::uint64_t i = 0; i < rows; ++i) {
+        const std::uint64_t ord = prev_ord + c.vb();  // gap（二补数回绕，正确性不依赖升序）
+        prev_ord = ord;
+        const std::uint64_t klen = c.vb();
+        if (c.fail || klen > 0xFFFF) return std::nullopt;
+        ext.resize(static_cast<std::size_t>(klen));
+        if (!c.bytes(ext.data(), ext.size())) return std::nullopt;
+        DocSlot slot;
+        const std::uint64_t fid = c.vb(), off = c.vb(), tsz = c.vb();
+        slot.tstamp = c.u64();
+        const std::uint64_t dl = c.vb();
+        if (c.fail || fid > 0xFFFFFFFFull || tsz > 0xFFFFFFFFull ||
+            dl > 0xFFFFFFFFull) {
+            return std::nullopt;
+        }
+        slot.loc.offset   = off;
+        slot.loc.file_id  = static_cast<std::uint32_t>(fid);
+        slot.loc.total_sz = static_cast<std::uint32_t>(tsz);
+        slot.doc_len      = static_cast<std::uint32_t>(dl);
+        idx.put_doc(ext, ord, slot);  // 重建 ext2ord/live/doc_lens/水位
+    }
+    if (!c.at_end()) return std::nullopt;
+    return covers;
+}
+}  // namespace
+
 std::optional<std::uint64_t>
 Index::deserialize_docmap(std::span<const std::uint8_t> buf) {
     if (buf.size() < 28) return std::nullopt;
@@ -365,51 +432,28 @@ Index::deserialize_docmap(std::span<const std::uint8_t> buf) {
         reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 12));
     if (crc != stored_crc) return std::nullopt;
 
-    const std::uint8_t* p = buf.data() + 8;
-    const std::uint8_t* end = buf.data() + buf.size() - 4;
-    auto need = [&](std::size_t n) {
-        return static_cast<std::size_t>(end - p) >= n;
-    };
-    std::uint64_t covers = 0, rows = 0;
-    std::memcpy(&covers, p, 8); p += 8;
-    std::memcpy(&rows, p, 8); p += 8;
-    if (rows > (1ull << 40)) return std::nullopt;
-    bool vfail = false;
-    auto vb = [&]() -> std::uint64_t {  // 边界安全 vbyte
-        std::uint64_t v = 0, shift = 0;
-        while (true) {
-            if (p >= end || shift > 63) { vfail = true; return 0; }
-            const std::uint8_t byte = *p++;
-            v |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
-            if (byte & 0x80) return v;
-            shift += 7;
-        }
-    };
-    std::uint64_t prev_ord = 0;
-    for (std::uint64_t i = 0; i < rows; ++i) {
-        const std::uint64_t ord = prev_ord + vb();  // gap（二补数回绕，正确性不依赖升序）
-        prev_ord = ord;
-        const std::uint64_t klen = vb();
-        if (vfail || klen > 0xFFFF) return std::nullopt;
-        if (!need(static_cast<std::size_t>(klen))) return std::nullopt;
-        std::string ext(reinterpret_cast<const char*>(p), klen); p += klen;
-        DocSlot slot;
-        const std::uint64_t fid = vb(), off = vb(), tsz = vb();
-        if (vfail || !need(8)) return std::nullopt;
-        std::memcpy(&slot.tstamp, p, 8); p += 8;
-        const std::uint64_t dl = vb();
-        if (vfail || fid > 0xFFFFFFFFull || tsz > 0xFFFFFFFFull ||
-            dl > 0xFFFFFFFFull) {
-            return std::nullopt;
-        }
-        slot.loc.offset   = off;
-        slot.loc.file_id  = static_cast<std::uint32_t>(fid);
-        slot.loc.total_sz = static_cast<std::uint32_t>(tsz);
-        slot.doc_len      = static_cast<std::uint32_t>(dl);
-        put_doc(ext, ord, slot);  // 重建 ext2ord/live/doc_lens/水位
+    SidecarSpanCursor c{buf.data() + 8, buf.data() + buf.size() - 4};
+    return parse_sidecar_rows(*this, c);
+}
+
+std::optional<std::uint64_t>
+Index::deserialize_docmap(io::FileHandle fd, std::uint64_t off,
+                          std::uint64_t len) {
+    // 与 span 版逐步对应：头 8B（magic/version）→ 尾 4B CRC → 分块校验
+    // [8, len-4) → 流式解析。全程只有 StreamCursor 的一块缓冲在堆上。
+    if (len < 28) return std::nullopt;
+    std::uint32_t hdr[2] = {};
+    if (!io::pread_all(fd, hdr, 8, off)) return std::nullopt;
+    if (hdr[0] != kSidecarMagic || hdr[1] != kSidecarVersion) {
+        return std::nullopt;
     }
-    if (p != end) return std::nullopt;
-    return covers;
+    std::uint32_t stored_crc = 0;
+    if (!io::pread_all(fd, &stored_crc, 4, off + len - 4)) return std::nullopt;
+    const auto crc = bitcask::detail::crc32_file_range(fd, off + 8, len - 12);
+    if (!crc || *crc != stored_crc) return std::nullopt;
+
+    bitcask::detail::StreamCursor c(fd, off + 8, len - 12);
+    return parse_sidecar_rows(*this, c);
 }
 
 }  // namespace bitcask::index

@@ -29,6 +29,7 @@
 
 #include "bitcask/codec.hpp"  // crc32
 #include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
+#include "bitcask/detail/stream_cursor.hpp"  // 6.6.0：分块 CRC / 流式载入
 
 namespace bitcask::search {
 
@@ -129,6 +130,47 @@ struct LoadedCheckpoint {
     std::vector<LoadedSection> sections;  // 结构内定位到的段(逐段带 crc_ok)
 };
 
+// 6.6.0：页脚目录的一条（只定位，payload 未载入）。
+struct CkptSectionRef {
+    std::uint16_t type = 0;
+    std::uint16_t flags = 0;
+    std::uint64_t off = 0;
+    std::uint64_t len = 0;
+    std::uint32_t crc = 0;
+};
+
+// 6.6.0：SearchCheckpoint::open 的产物——结构已校验、句柄留着，payload 按需
+// 定位读。大段可不落堆：section_crc_ok 分块校验 + StreamCursor 顺序解析。
+struct OpenedCheckpoint {
+    io::File file;
+    std::uint64_t watermark = 0;
+    std::vector<CkptSectionRef> sections;
+
+    // 整段读进 owned payload 并算 CRC（crc_ok 如实标记）。IO 失败 → nullopt。
+    [[nodiscard]] std::optional<LoadedSection>
+    load(const CkptSectionRef& r) const {
+        LoadedSection ls;
+        ls.type = r.type;
+        ls.flags = r.flags;
+        ls.payload.resize(static_cast<std::size_t>(r.len));
+        if (!ls.payload.empty() &&
+            !io::pread_all(file.fd(), ls.payload.data(), ls.payload.size(),
+                           r.off)) {
+            return std::nullopt;
+        }
+        ls.crc_ok = bitcask::codec::crc32(std::span<const std::byte>(
+                        ls.payload.data(), ls.payload.size())) == r.crc;
+        return ls;
+    }
+
+    // 分块校验该段 CRC，不留整段缓冲（IO 失败按不通过算）。
+    [[nodiscard]] bool section_crc_ok(const CkptSectionRef& r) const {
+        const auto c = ::bitcask::detail::crc32_file_range(file.fd(), r.off,
+                                                           r.len);
+        return c && *c == r.crc;
+    }
+};
+
 namespace detail {
 
 constexpr char kCkptMagic[4] = {'B', 'C', 'S', 'C'};
@@ -227,22 +269,21 @@ public:
         return ::bitcask::detail::atomic_write_bytes(std::string(path), buf);
     }
 
-    // S14-3:只载入 want(type) 选中的段——段级 dirty-bit 前移用（干净段原
-    // 字节搬运进新 ckpt，免重序列化；脏段由调用方重建，不为其付读 I/O）。
-    // 结构损坏（页脚缺失/footerCrc 失败/越界）→ nullopt；选中段逐段校验
-    // CRC，失败的段不返回（调用方视作脏段重新序列化，安全收敛）。
-    // 页脚解析逻辑与 read() 相同，但按目录 fseek 只读选中 payload。
-    [[nodiscard]] static std::optional<std::vector<LoadedSection>>
-    read_selected(std::string_view path,
-                  const std::function<bool(std::uint16_t)>& want) {
+    // 6.6.0：打开 + 结构校验（头部 magic/version、页脚 footerCrc、目录越界），
+    // 不读任何 payload。结构损坏 → nullopt。read / read_selected / 流式载入
+    // （docmap_ckpt）三处共用这一份页脚解析。
+    //
+    // 此前 read() 是「整文件读进 buf，再把每段 assign 出一份 owned payload」
+    // ——开库瞬时峰值 = 2 × 文件大小（feedback 2026-09-23：60 MB 的
+    // docmap.ckpt ⇒ 120 MB 瞬时堆）。现改为按目录逐段定位读，峰值 = 1 ×；
+    // 大段（docmap 行段）还可经 section_crc_ok + StreamCursor 完全流式消费。
+    //
+    // P2（原 read_selected 注释）：走 io seam 的定位读而非 stdio——`fseek`/
+    // `ftell` 的偏移类型是 `long`，**MSVC x64 上只有 4 字节**，2.54 GiB 的
+    // 文件 `ftell()` 返 -1 会把整份 ckpt 判成结构损坏。
+    [[nodiscard]] static std::optional<OpenedCheckpoint>
+    open(std::string_view path) {
         using namespace detail;
-        // P2：由 stdio 改走 io seam。`fseek`/`ftell` 的偏移类型是 `long`，
-        // **MSVC x64 上只有 4 字节**——实测 2.54 GiB 的文件 `ftell()` 返 -1，
-        // 于是下面那个长度门槛把整份 ckpt 判成结构损坏（调用方据此退 .prev
-        // 或全量重建）。而 `static_cast<long>(off)` 这类还会**静默截断成负数**。
-        // seam 的 `pread_all` 收 `std::uint64_t`，且本函数的读法本就是「按目录
-        // 跳着读」，定位读比 seek+fread 更贴合。Linux 上 long 是 8 字节，
-        // 所以这条分歧只在 Windows 出现，CI 照不到。
         auto f = io::File::open(path, io::OpenFlag::kReadOnly);
         if (!f) return std::nullopt;
         const auto fsz = io::handle_size(f->fd());
@@ -269,6 +310,8 @@ public:
         if (std::memcmp(tail + 8, kCkptMagic, 4) != 0) return std::nullopt;
         const std::uint32_t dir_len = get_u32(tail + 4);
         const std::uint32_t footer_crc = get_u32(tail);
+        // directory 区间 [dir_begin, dir_begin+dir_len) 必须落在 header 与
+        // trailer 之间。
         if (static_cast<std::size_t>(dir_len) + kHeaderLen + kTrailerLen > n) {
             return std::nullopt;
         }
@@ -283,41 +326,52 @@ public:
         if (bitcask::codec::crc32(
                 std::span<const std::byte>(dir.data(), dir_len)) !=
             footer_crc) {
-            return std::nullopt;
+            return std::nullopt;  // 结构损坏。
         }
 
+        OpenedCheckpoint out;
+        out.watermark = get_u64(head + 8);
         if (dir_len < 4) return std::nullopt;
         const std::uint32_t cnt = get_u32(dir.data());
         std::size_t p = 4;
         constexpr std::size_t kEntLen = 2 + 2 + 8 + 8 + 4;  // 24
-        std::vector<LoadedSection> out;
         for (std::uint32_t i = 0; i < cnt; ++i) {
             if (p + kEntLen > dir_len) return std::nullopt;
             const std::byte* e = dir.data() + p;
             p += kEntLen;
-            const std::uint16_t type = get_u16(e);
-            if (!want(type)) continue;
-            const std::uint16_t flags = get_u16(e + 2);
-            const std::uint64_t off = get_u64(e + 4);
-            const std::uint64_t len = get_u64(e + 12);
-            const std::uint32_t crc = get_u32(e + 20);
-            if (off < kHeaderLen || off > dir_begin ||
-                len > dir_begin - off) {
+            CkptSectionRef r;
+            r.type = get_u16(e);
+            r.flags = get_u16(e + 2);
+            r.off = get_u64(e + 4);
+            r.len = get_u64(e + 12);
+            r.crc = get_u32(e + 20);
+            // payload 区间必须落在 header 与 directory 之间。
+            if (r.off < kHeaderLen || r.off > dir_begin ||
+                r.len > dir_begin - r.off) {
                 return std::nullopt;  // 目录越界 = 结构损坏。
             }
-            LoadedSection ls;
-            ls.type = type;
-            ls.flags = flags;
-            ls.payload.resize(static_cast<std::size_t>(len));
-            if (!ls.payload.empty() &&
-                !io::pread_all(f->fd(), ls.payload.data(), ls.payload.size(),
-                               off)) {
-                return std::nullopt;
-            }
-            ls.crc_ok = bitcask::codec::crc32(std::span<const std::byte>(
-                            ls.payload.data(), ls.payload.size())) == crc;
-            if (!ls.crc_ok) continue;  // 坏段不搬——调用方重序列化
-            out.push_back(std::move(ls));
+            out.sections.push_back(r);
+        }
+        out.file = std::move(*f);
+        return out;
+    }
+
+    // S14-3:只载入 want(type) 选中的段——段级 dirty-bit 前移用（干净段原
+    // 字节搬运进新 ckpt，免重序列化；脏段由调用方重建，不为其付读 I/O）。
+    // 结构损坏（页脚缺失/footerCrc 失败/越界）→ nullopt；选中段逐段校验
+    // CRC，失败的段不返回（调用方视作脏段重新序列化，安全收敛）。
+    [[nodiscard]] static std::optional<std::vector<LoadedSection>>
+    read_selected(std::string_view path,
+                  const std::function<bool(std::uint16_t)>& want) {
+        auto oc = open(path);
+        if (!oc) return std::nullopt;
+        std::vector<LoadedSection> out;
+        for (const auto& r : oc->sections) {
+            if (!want(r.type)) continue;
+            auto ls = oc->load(r);
+            if (!ls) return std::nullopt;
+            if (!ls->crc_ok) continue;  // 坏段不搬——调用方重序列化
+            out.push_back(std::move(*ls));
         }
         return out;
     }
@@ -326,63 +380,15 @@ public:
     // .prev 或全量重建)。结构完整 → 返回 watermark + 各段(逐段带 crc_ok)。
     [[nodiscard]] static std::optional<LoadedCheckpoint>
     read(std::string_view path) {
-        using namespace detail;
-        auto buf_opt = ::bitcask::detail::read_file_bytes<>(std::string(path));
-        if (!buf_opt) return std::nullopt;
-        const auto& buf = *buf_opt;
-        if (buf.size() < kHeaderLen + kTrailerLen) return std::nullopt;
-
-        const std::byte* base = buf.data();
-        const std::size_t n = buf.size();
-        // 头部 magic/version。
-        if (std::memcmp(base, kCkptMagic, 4) != 0) return std::nullopt;
-        {
-            const std::uint32_t ver = get_u32(base + 4);
-            if (ver != kCkptVersion && ver != kCkptVersion2 &&
-                ver != kCkptVersion3) return std::nullopt;
-        }
-        // 页脚(从尾倒走)。
-        if (std::memcmp(base + n - 4, kCkptMagic, 4) != 0) return std::nullopt;
-        const std::uint32_t dir_len = get_u32(base + n - 8);
-        const std::uint32_t footer_crc = get_u32(base + n - 12);
-        // directory 区间 [dir_begin, dir_begin+dir_len) 必须落在 header 与
-        // trailer 之间。
-        if (static_cast<std::size_t>(dir_len) + kHeaderLen + kTrailerLen > n) {
-            return std::nullopt;
-        }
-        const std::size_t dir_begin = n - kTrailerLen - dir_len;
-        if (dir_begin < kHeaderLen) return std::nullopt;
-        const std::byte* d = base + dir_begin;
-        if (bitcask::codec::crc32(std::span<const std::byte>(d, dir_len)) !=
-            footer_crc) {
-            return std::nullopt;  // 结构损坏。
-        }
-
+        auto oc = open(path);
+        if (!oc) return std::nullopt;
         LoadedCheckpoint out;
-        out.watermark = get_u64(base + 8);
-        if (dir_len < 4) return std::nullopt;
-        const std::uint32_t cnt = get_u32(d);
-        std::size_t p = 4;
-        constexpr std::size_t kEntLen = 2 + 2 + 8 + 8 + 4;  // 24
-        for (std::uint32_t i = 0; i < cnt; ++i) {
-            if (p + kEntLen > dir_len) return std::nullopt;
-            const std::byte* e = d + p;
-            LoadedSection ls;
-            ls.type = get_u16(e);
-            ls.flags = get_u16(e + 2);
-            const std::uint64_t off = get_u64(e + 4);
-            const std::uint64_t len = get_u64(e + 12);
-            const std::uint32_t crc = get_u32(e + 20);
-            p += kEntLen;
-            // payload 区间必须落在 header 与 directory 之间。
-            if (off < kHeaderLen || off > dir_begin ||
-                len > dir_begin - off) {
-                return std::nullopt;  // 目录越界 = 结构损坏。
-            }
-            ls.payload.assign(base + off, base + off + len);
-            ls.crc_ok = bitcask::codec::crc32(
-                std::span<const std::byte>(base + off, len)) == crc;
-            out.sections.push_back(std::move(ls));
+        out.watermark = oc->watermark;
+        out.sections.reserve(oc->sections.size());
+        for (const auto& r : oc->sections) {
+            auto ls = oc->load(r);
+            if (!ls) return std::nullopt;
+            out.sections.push_back(std::move(*ls));
         }
         return out;
     }

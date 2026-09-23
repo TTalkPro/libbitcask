@@ -5,6 +5,7 @@
 
 #include "bitcask/codec.hpp"
 #include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
+#include "bitcask/detail/stream_cursor.hpp"  // 6.6.0：节 CRC 走定位读
 #include "bitcask/term_snapshot_cache.hpp"  // S30-P5:查询快照缓存
 #include "bitcask/myers.hpp"
 #include "bitcask/vbyte.hpp"
@@ -437,8 +438,16 @@ std::unique_ptr<MmapSegment> MmapSegment::open(const std::string& path,
     const auto fsize = static_cast<std::size_t>(*sz);
     seg->map_ = io::MappedFile::map_readonly(fd, fsize,
                                              /*advise_random=*/false);
-    io::close_handle(fd);  // mmap 后 fd 可关(纯映射读,无 pread 路径)
-    if (!seg->map_.valid()) return nullptr;
+    if (!seg->map_.valid()) {
+        io::close_handle(fd);
+        return nullptr;
+    }
+    // 6.6.0：fd 留到节表校验完再关——节 CRC 走定位读（见下），映射只给
+    // 查询路径用。任何早返回都经此 guard 关句柄。
+    struct FdGuard {
+        io::FileHandle h;
+        ~FdGuard() { io::close_handle(h); }
+    } fd_guard{fd};
 
     const std::byte* b = seg->map_.data();
 
@@ -482,10 +491,13 @@ std::unique_ptr<MmapSegment> MmapSegment::open(const std::string& path,
         const auto len = load_pod<std::uint64_t>(e + 16);
         const auto crc = load_pod<std::uint32_t>(e + 24);
         if (off + len > footer_off) return nullptr;  // 节必在 footer 之前
-        if (verify_crc &&
-            codec::crc32_update(0, std::span<const std::byte>(b + off, len)) !=
-                crc) {
-            return nullptr;
+        // 6.6.0：节 CRC 不再扫映射——映射页一经触碰就进本进程工作集，逐节
+        // 校验 = 整段常驻（feedback 2026-09-23：104 MB 段目录开库即 104 MB
+        // 工作集）。改走分块定位读：数据经 OS 文件缓存进 1 MiB 缓冲，校验
+        // 强度不变，进程侧只多这一块。
+        if (verify_crc) {
+            const auto c = bitcask::detail::crc32_file_range(fd, off, len);
+            if (!c || *c != crc) return nullptr;
         }
         if (kind == 0) continue;  // header 伪节(CRC 已验)
         if (field_idx != segv2::kGlobalField) {

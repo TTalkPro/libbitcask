@@ -6,7 +6,7 @@ C API 是 C++ `bitcask::Cask` 的薄 `extern "C"` 包装，编译产物：
 
 | 产物 | 说明 |
 |------|------|
-| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=6`，`VERSION=6.4.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 6.4.0)` 单一真源派生）|
+| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=6`，`VERSION=6.6.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 6.6.0)` 单一真源派生）|
 | `libbitcask.a` | 合并全部静态归档的单一 `.a`（定义 `BITCASK_STATIC_LIB` 去掉导出修饰）|
 
 符号导出由 `BITCASK_API` 宏控制（`bitcask_kv.h` §符号导出宏），Windows 下退化为 `__declspec(dllimport/dllexport)`，其它平台默认 `__attribute__((visibility("default")))`。
@@ -130,7 +130,7 @@ cl /DBITCASK_STATIC_LIB app.c /I<c_api 头目录> bitcask_static.lib   :: 静态
 
 ## 3. 版本信息
 
-版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 6.4.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
+版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 6.6.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
 
 ```c
 BITCASK_API int          bitcask_version_major(void);
@@ -140,7 +140,7 @@ BITCASK_API const char*  bitcask_version_string(void);   // "major.minor.patch"�
 ```
 
 - `bitcask_version_string()` 返回的是库内静态字符串（指向 `BITCASK_VERSION_STRING` 宏展开的字符串字面量），**不需要 free**。
-- 运行时返回值与 `libbitcask.so.6.4.0` 文件名完全对应；SOVERSION 是 `6`（大版本号），反映 ABI 兼容性。
+- 运行时返回值与 `libbitcask.so.6.6.0` 文件名完全对应；SOVERSION 是 `6`（大版本号），反映 ABI 兼容性。
 
 ---
 
@@ -713,6 +713,70 @@ BITCASK_API bitcask_error_t bitcask_open_ex(const char* dirname,
 - 策略是 open-time 一次性读进去的（与 `opts` 同一条纪律），运行期改要重开。
 - ⚠️ 为什么不放进 `bitcask_options_t`：那会改结构体布局 ⇒ ABI 破坏 ⇒ major bump
   （6.0.0 `keydir_cache_entries` 的先例）。独立结构体 + 新入口是纯加法，SOVERSION 6 不动。
+
+### 8.1c `bitcask_open_ex2` + `bitcask_open_tuning_t`（6.6.0：开库调优）
+
+```c
+typedef struct {
+    size_t    struct_size;         // bitcask_open_tuning_init 填 sizeof(本结构)
+    int       segment_verify_crc;  // 1（缺省）= 开库逐节校验 BM25 段 CRC；0 = 只验页脚/目录
+} bitcask_open_tuning_t;
+
+BITCASK_API void bitcask_open_tuning_init(bitcask_open_tuning_t* tuning);
+BITCASK_API bitcask_error_t bitcask_open_ex2(const char* dirname,
+                                             const bitcask_options_t* opts,
+                                             const bitcask_merge_policy_t* policy,
+                                             const bitcask_open_tuning_t* tuning,
+                                             bitcask_t** out,
+                                             bitcask_fault_t* fault);
+```
+
+来源：下游 keel 转 coxswain 的账（`feedbacks/2026-09-23-search-open-resident-memory-no-c-api-knob.md`）
+——`enable_search` 的库一打开，常驻内存约为盘上大小的 1.8 倍。
+
+- `tuning == NULL` ⇒ 与 `bitcask_open_ex` **逐字节等价**（`bitcask_open_ex` 本身就是
+  `bitcask_open_ex2(…, NULL, …)`）。
+- **`struct_size` 是向后兼容的口子**：以后在尾部追加字段不再开新入口，库只读调用方
+  `struct_size` 覆盖到的前缀，其余取缺省。**务必先 `init` 再改字段**；`struct_size`
+  连首个字段都没覆盖（如 0）→ `BITCASK_ERR_INVALID_OPTION`，`*out = NULL`，不碰盘。
+- `segment_verify_crc`：BM25 v2 段开库时是否逐节校验 CRC。
+  - `1`（缺省）：校验。6.6.0 起走**分块定位读**，不再扫 mmap 映射——此前逐节校验
+    会把整个 `bm25_segments/` 映射页扫进工作集（104 MB 段目录 ⇒ 开库即 104 MB 工作集），
+    现在数据经 OS 文件缓存进一块 1 MiB 缓冲，校验强度不变。但开库仍要把段目录整读一遍
+    I/O（冷缓存上百 MB 级是秒级）。
+  - `0`：只校验页脚 / 目录 CRC 与节边界，节内容信任盘——可信盘上的冷启动加速。
+    注意：盘上损坏会读出错误数据而不是报错，风险自担。
+  - 只影响 BM25 段；向量磁盘段（IVF / DiskANN）不受此格控制。
+- 与 `bitcask_merge_policy_t` 同一条纪律：不追加进 `bitcask_options_t`（改布局 ⇒ ABI 破坏）。
+
+### 8.1d `bitcask_set_thread_limits`（6.6.0：进程级线程数上限）
+
+```c
+BITCASK_API bitcask_error_t bitcask_set_thread_limits(size_t index_workers,
+                                                      size_t search_slots,
+                                                      bitcask_fault_t* fault);
+```
+
+来源：`feedbacks/2026-09-23-c-api-no-search-thread-count-knob.md`——`enable_search` 首次
+开库起约 `hardware_concurrency` 条线程，宿主没有口子压低。
+
+**进程级而非每库**：这两处线程本来就是进程共享的（C API 的 registry 是进程级单例，见 §4.3）。
+
+| 参数 | 管什么 | 0 = |
+|---|---|---|
+| `index_workers` | 索引池 map worker 数（首个 search 库 open 时建池，外加 1 条 reducer） | `hardware_concurrency`（至少 2） |
+| `search_slots` | 批量查询并发池（`task_arena`）槽数；**非 0 时顺带**用 `tbb::global_control` 把本库经 TBB 跑的并行段（恢复期批内 prepare、查询内短语 / 通配 / 模糊 / HNSW 重排）的 worker 总数封到 `search_slots - 1` | `hardware_concurrency`（至少 2），且不装 `global_control` |
+
+两格都是 0 即 6.5.0 及以前的行为。
+
+- **「第一个开 search 库的人定终身」**：须在首个 `enable_search = 1` 的 `bitcask_open*`
+  之前调。之后池已按生效值建好：再调且值不同 → `BITCASK_ERR_INVALID_OPTION`，
+  `fault->detail` 注明生效值，**不静默忽略**；值相同 → `BITCASK_OK`（幂等）。
+  纯 KV 库的 open 不冻结，可在其后设置。
+- 注意：`tbb::global_control` 管的是 TBB 运行时（进程级）：宿主若与本库共用同一份 TBB
+  动态库，宿主自己的 TBB 并行也会被 `search_slots` 约束。
+- 不管的：纯 KV 恢复的临时线程、`prefetch_threads` / 并行扫描的 `n_threads` 这类
+  **单次调用级**的线程（调用返回即回收，本来就由调用方给数）。
 
 ### 8.2 `bitcask_close`
 

@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.5.0`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.6.0`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
@@ -13,6 +13,59 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
 
 ---
+
+## [6.6.0] - 2026-09-23（search 库开库内存 + 进程级线程数上限）
+
+> **版本语义**：C API **纯加法**（4 个新符号 + 1 个新结构体，既有函数签名与
+> `bitcask_options_t` 布局都没动）；盘上格式零改动。MINOR +1，**`SOVERSION` 保持 `6`**。
+>
+> 来源：下游 keel 转来 coxswain 的两条账（2026-09-22）：
+> `feedbacks/2026-09-23-search-open-resident-memory-no-c-api-knob.md`（`enable_search`
+> 库一打开就常驻 ≈ 盘上 1.8 倍，336 MB ⇒ 峰值 610 MB）与
+> `feedbacks/2026-09-23-c-api-no-search-thread-count-knob.md`（C API 收不了线程数）。
+
+### Changed
+
+- **BM25 v2 段开库校验不再把整个段扫进工作集**。`MmapSegment::open` 的逐节 CRC
+  原先直接扫 mmap 映射——映射页一经触碰就算进本进程工作集，校验一遍 = 整个
+  `bm25_segments/` 常驻（报账的库 104 MB）。现改为分块定位读（1 MiB 缓冲，
+  数据走 OS 文件缓存），校验强度不变；映射只留给查询路径按需触页。
+- **checkpoint 读取不再整份读进缓冲**。`SearchCheckpoint::read` 原先「整文件读进
+  一个 buffer，再把每段 assign 出一份 owned payload」——瞬时峰值其实是
+  **2 ×** 文件大小（报账估的是 1 ×）。现拆出 `SearchCheckpoint::open`（只解析页脚
+  目录、句柄留着），`read` / `read_selected` 改为按目录逐段定位读，峰值降为 1 ×，
+  惠及全部组件 ckpt（text / vector / docmap / 段清单）。
+- **docmap 行段与 keydir 快照改为流式载入**。`load_docmap` 走 `open` + 新重载
+  `Index::deserialize_docmap(fd, off, len)`（分块校验段 CRC 与内层 CRC，再分块
+  解析）；`KeyDir::load_snapshot` 同样分块校验 + 分块解析。两处开库时堆上只剩
+  一块 1 MiB 缓冲（报账的库此前瞬时 ≈ 60 MB + 7 MB，按上条实为约两倍）。
+  解析逻辑不变：docmap 行解析对游标模板化，span 版（legacy ckpt）与流式版共用；
+  keydir 的 `SnapCursor` 换成同形接口的 `detail::StreamCursor`。
+  docmap ckpt 里不被消费的扩展段，其 CRC 仍照旧校验（坏了照旧退 fold）。
+
+### Added
+
+- **`bitcask_set_thread_limits(index_workers, search_slots, fault)`**：进程级线程数
+  上限（两处线程池本来就是进程共享的）。`index_workers` = 索引池 map worker 数；
+  `search_slots` = 批量查询 `task_arena` 槽数，非 0 时顺带用 `tbb::global_control`
+  把本库经 TBB 跑的并行段（恢复期批内 prepare、查询内 parallel_for）封到
+  `search_slots - 1` 条 worker。0 = 缺省（`hardware_concurrency`，即旧行为）。
+  须在首个 search 库 open 之前调；之后值不同 → `BITCASK_ERR_INVALID_OPTION`
+  （detail 注明生效值），值相同 → OK。C++ 侧为 `bitcask/thread_limits.hpp`。
+- **`bitcask_open_tuning_t` + `bitcask_open_tuning_init` + `bitcask_open_ex2`**：
+  开库调优，首格 `segment_verify_crc`（缺省 1；0 = BM25 段只验页脚 / 目录，信任盘上
+  节内容——省掉开库整读段目录的 I/O）。结构体带 `struct_size`，以后尾部追加字段
+  不再开新入口；未经 init（`struct_size` 不够）→ `INVALID_OPTION`，不碰盘。
+  `bitcask_open_ex` 改为 `bitcask_open_ex2(…, NULL, …)`，行为逐字节不变。
+- 测试：`ThreadLimitsTest.SetBeforeFirstSearchOpenCapsIndexPoolThenFreezes`
+  （独占可执行文件：冻结是进程级不可逆的；含开库线程增量断言）；
+  `c_api_test.c` 新用例 `test_thread_limits_and_tuning`（排在所有 search 用例之前，
+  其后全部 C API 用例都在 (2, 2) 的小池下跑）。
+
+### Not done
+
+- 报账第 3 条「同一批 key 住三份」（keydir / docmap `ext2ord_` / TextPlugin
+  `key_to_location_`）是结构性改动，报账本身也排在最后；本版不动，记在 feedback 里。
 
 ## [6.5.0] - 2026-09-18（OKI：memdelta 排序视图缓存——拔掉「装载后 range 静默变慢 4200×」的性能悬崖）
 

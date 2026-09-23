@@ -5,6 +5,7 @@
 #include "bitcask/epoch_reclaim.hpp"  // S29-6 P2: epoch 读者注册表
 #include "bitcask/vbyte.hpp"  // S21-2 A3: 快照 v2 entries 变长编码
 #include "bitcask/detail/file_util.hpp"  // detail::FilePtr（RED-2 归并）
+#include "bitcask/detail/stream_cursor.hpp"  // 6.6.0：快照流式载入
 
 #include <cstdio>
 #include <cstring>
@@ -2051,36 +2052,7 @@ void snap_put_vb(std::vector<std::uint8_t>& b, std::uint64_t v) {
     bitcask::codec::vbyte_encode(v, b);
 }
 
-struct SnapCursor {
-    const std::uint8_t* p;
-    const std::uint8_t* end;
-    bool fail = false;
-    bool need(std::size_t n) {
-        if (static_cast<std::size_t>(end - p) < n) { fail = true; return false; }
-        return true;
-    }
-    std::uint16_t u16() { std::uint16_t v = 0; if (need(2)) { std::memcpy(&v, p, 2); p += 2; } return v; }
-    std::uint32_t u32() { std::uint32_t v = 0; if (need(4)) { std::memcpy(&v, p, 4); p += 4; } return v; }
-    std::uint64_t u64() { std::uint64_t v = 0; if (need(8)) { std::memcpy(&v, p, 8); p += 8; } return v; }
-    // S21-2 A3:边界安全 vbyte(vbyte_decode 不查界,损坏文件不能越读)。
-    std::uint64_t vb() {
-        std::uint64_t v = 0, shift = 0;
-        while (true) {
-            if (!need(1)) return 0;
-            const std::uint8_t byte = *p++;
-            v |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
-            if (byte & 0x80) return v;
-            shift += 7;
-            if (shift > 63) { fail = true; return 0; }  // 超长=损坏
-        }
-    }
-    bool bytes(void* dst, std::size_t n) {
-        if (!need(n)) return false;
-        std::memcpy(dst, p, n);
-        p += n;
-        return true;
-    }
-};
+// 读端游标：6.6.0 起换成 detail::StreamCursor（同形接口，流式底座）。
 
 }  // namespace
 
@@ -2379,15 +2351,20 @@ bool KeyDir::save_snapshot(
 auto KeyDir::load_snapshot(std::string_view path, bool accept_subset,
                            std::uint64_t subset_wm_limit)
     -> std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> {
-    auto buf_opt =
-        bitcask::detail::read_file_bytes<std::uint8_t>(std::string(path));
-    if (!buf_opt) return std::nullopt;
-    const auto& buf = *buf_opt;
-    if (buf.size() < 16) return std::nullopt;  // 头部最小尺寸（本站点谓词）
+    // 6.6.0：流式载入——此前 read_file_bytes 整份进堆（开库瞬时峰值 ≈ 快照
+    // 大小，feedback 2026-09-23）。现分块校验 CRC、分块解析，堆上只有
+    // StreamCursor 的一块缓冲。
+    auto f = io::File::open(path, io::OpenFlag::kReadOnly);
+    if (!f) return std::nullopt;
+    const auto fsz = io::handle_size(f->fd());
+    if (!fsz) return std::nullopt;
+    const std::uint64_t size = *fsz;
+    if (size < 16) return std::nullopt;  // 头部最小尺寸（本站点谓词）
 
-    SnapCursor c{buf.data(), buf.data() + buf.size()};
-    if (c.u32() != kSnapMagic) return std::nullopt;
-    const std::uint32_t ver = c.u32();
+    std::uint32_t hdr[2] = {};
+    if (!io::pread_all(f->fd(), hdr, 8, 0)) return std::nullopt;
+    if (hdr[0] != kSnapMagic) return std::nullopt;
+    const std::uint32_t ver = hdr[1];
     // S36-4：v4 = 缓存子集快照——只有 Level B（accept_subset）且 OKI runs
     // 覆盖快照点（next_ord ≤ wm，缺席条目可由组合视图兜底）才可用；
     // 其余情形拒收 → 全量 fold（把子集当全量载入 + 跳字节水位 = 丢 key）。
@@ -2395,11 +2372,11 @@ auto KeyDir::load_snapshot(std::string_view path, bool accept_subset,
     if (ver == kSnapVersionSubset && !accept_subset) return std::nullopt;
     // CRC 覆盖 [8, size-4)。
     std::uint32_t stored_crc = 0;
-    std::memcpy(&stored_crc, buf.data() + buf.size() - 4, 4);  // 未对齐安全
-    const std::uint32_t crc = codec::crc32(std::span<const std::byte>(
-        reinterpret_cast<const std::byte*>(buf.data() + 8), buf.size() - 12));
-    if (crc != stored_crc) return std::nullopt;
-    c.end -= 4;  // payload 不含尾部 CRC
+    if (!io::pread_all(f->fd(), &stored_crc, 4, size - 4)) return std::nullopt;
+    const auto crc = bitcask::detail::crc32_file_range(f->fd(), 8, size - 12);
+    if (!crc || *crc != stored_crc) return std::nullopt;
+    // payload 区间 [8, size-4)（不含尾部 CRC）。
+    bitcask::detail::StreamCursor c(f->fd(), 8, size - 12);
 
     // open 期单线程,但仍走写者闸门屏障统一（防御 + TSan 友好）。
     // 内部逻辑不变:直填各分片 entries——写者已出清且 open 期无并发
@@ -2508,7 +2485,7 @@ auto KeyDir::load_snapshot(std::string_view path, bool accept_subset,
         Shard& sh = shards_[shard_for(key)];
         sh.entries.emplace(std::move(key), se);
     }
-    if (c.fail || c.p != c.end) { reset_all(); return std::nullopt; }
+    if (c.fail || !c.at_end()) { reset_all(); return std::nullopt; }
     return wms;
 }
 

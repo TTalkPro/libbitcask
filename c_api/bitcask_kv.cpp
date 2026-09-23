@@ -1,7 +1,10 @@
 // C API — KV/生命周期/迭代/管理（S19-5 自 bitcask_c.cpp 拆分，符号与实现不变）。
 #include "internal.h"
 
+#include "bitcask/thread_limits.hpp"  // 6.6.0：bitcask_set_thread_limits
 #include "bitcask/txn.hpp"  // S34：多键事务
+
+#include <cstddef>  // offsetof
 
 using namespace bitcask::capi;
 
@@ -69,6 +72,36 @@ BITCASK_API void bitcask_merge_policy_init(bitcask_merge_policy_t* policy) {
     policy->max_merge_size           = d.max_merge_size;
 }
 
+// 6.6.0：同上，缺省从 C++ 抄（SearchLayerConfig::mmap_verify_crc）。
+BITCASK_API void bitcask_open_tuning_init(bitcask_open_tuning_t* tuning) {
+    if (!tuning) return;
+    const search::SearchLayerConfig d{};
+    tuning->struct_size        = sizeof(bitcask_open_tuning_t);
+    tuning->segment_verify_crc = d.mmap_verify_crc ? 1 : 0;
+}
+
+BITCASK_API bitcask_error_t bitcask_set_thread_limits(size_t index_workers,
+                                                       size_t search_slots,
+                                                       bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (bitcask::set_thread_limits({index_workers, search_slots})) {
+        return BITCASK_OK;
+    }
+    // 已冻结且值不同：池已按生效值建好，改不动了——明说，不静默忽略。
+    const auto cur = bitcask::thread_limits();
+    if (fault) {
+        fault->code = BITCASK_ERR_INVALID_OPTION;
+        fault->errnum = 0;
+        snprintf(fault->detail, BITCASK_DETAIL_MAX,
+                 "thread limits already in effect (index_workers=%zu, "
+                 "search_slots=%zu; 0 = hardware_concurrency): call "
+                 "bitcask_set_thread_limits before the first search-enabled open",
+                 cur.index_workers, cur.search_slots);
+    }
+    return BITCASK_ERR_INVALID_OPTION;
+    });
+}
+
 BITCASK_API bitcask_error_t bitcask_open(const char* dirname,
                                           const bitcask_options_t* opts,
                                           bitcask_t** out,
@@ -82,10 +115,41 @@ BITCASK_API bitcask_error_t bitcask_open_ex(const char* dirname,
                                              const bitcask_merge_policy_t* policy,
                                              bitcask_t** out,
                                              bitcask_fault_t* fault) {
+    // 6.6.0：bitcask_open_ex 只是 tuning = NULL 的 bitcask_open_ex2。
+    return bitcask_open_ex2(dirname, opts, policy, nullptr, out, fault);
+}
+
+BITCASK_API bitcask_error_t bitcask_open_ex2(const char* dirname,
+                                              const bitcask_options_t* opts,
+                                              const bitcask_merge_policy_t* policy,
+                                              const bitcask_open_tuning_t* tuning,
+                                              bitcask_t** out,
+                                              bitcask_fault_t* fault) {
     // S13-M2：extern "C" 异常隔离
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
+
+    // 6.6.0：tuning 按 struct_size 读前缀（尾部追加字段不破 ABI）。连首个
+    // 字段都没覆盖到 = 没经 init，拒绝而不是按缺省静默吞掉。
+    bool segment_verify_crc = search::SearchLayerConfig{}.mmap_verify_crc;
+    if (tuning) {
+        constexpr std::size_t kNeed =
+            offsetof(bitcask_open_tuning_t, segment_verify_crc) +
+            sizeof(tuning->segment_verify_crc);
+        if (tuning->struct_size < kNeed) {
+            if (fault) {
+                fault->code = BITCASK_ERR_INVALID_OPTION;
+                fault->errnum = 0;
+                snprintf(fault->detail, BITCASK_DETAIL_MAX,
+                         "open tuning: struct_size = %zu (call "
+                         "bitcask_open_tuning_init first)",
+                         tuning->struct_size);
+            }
+            return BITCASK_ERR_INVALID_OPTION;
+        }
+        segment_verify_crc = tuning->segment_verify_crc != 0;
+    }
 
     bitcask::CaskOptions cpp_opts;
     // 6.4.0：merge 策略。百分比三格先验，越界不碰盘就拒绝（merge::decide 拿
@@ -167,6 +231,7 @@ BITCASK_API bitcask_error_t bitcask_open_ex(const char* dirname,
                     search_cfg.analyzer_config.stop_words.emplace_back(*p);
                 }
             }
+            search_cfg.mmap_verify_crc = segment_verify_crc;  // 6.6.0
             cpp_opts.search_config = search_cfg;
             cpp_opts.enable_search = true;
             // 同义词词典：open 时一次性加载（不可变、并发安全）。文件无法打开 →

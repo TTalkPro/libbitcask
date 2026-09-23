@@ -515,6 +515,16 @@ target_link_libraries(bitcask_thread_pool_test PRIVATE
 )
 gtest_discover_tests(bitcask_thread_pool_test ${_bitcask_test_props})
 
+# 6.6.0：进程级线程数上限。冻结状态进程级不可逆 → 独占可执行文件。
+add_executable(bitcask_thread_limits_test thread_limits_test.cpp)
+target_link_libraries(bitcask_thread_limits_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_thread_limits_test ${_bitcask_test_props})
+
 # S17-1：index.manifest 格式测试——header-only（只需 gtest + zlib via codec）。
 add_executable(bitcask_index_manifest_test index_manifest_test.cpp)
 target_link_libraries(bitcask_index_manifest_test PRIVATE

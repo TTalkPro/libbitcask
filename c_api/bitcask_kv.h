@@ -232,6 +232,27 @@ typedef struct {
 // 初始化为上游缺省（与 bitcask::merge::PolicyOptions{} 逐字相同）
 BITCASK_API void bitcask_merge_policy_init(bitcask_merge_policy_t* policy);
 
+/* 6.6.0：开库调优（bitcask_open_ex2 的第四份参数）。下游 keel（转 coxswain
+   2026-09-22）报 search 库开库常驻 ≈ 盘上 1.8 倍，其中 BM25 段目录的逐节
+   CRC 校验是可调的一块。与 bitcask_merge_policy_t 同一条纪律：不进
+   bitcask_options_t（改布局 = ABI 破坏 = major bump）。
+   struct_size 由 bitcask_open_tuning_init 填为 sizeof(本结构)——以后在尾部
+   追加字段不必再开新入口：库按 struct_size 只读调用方认得的前缀，其余取
+   缺省。**务必先 init 再改字段**，不要手填 struct_size。 */
+typedef struct {
+    size_t    struct_size;
+    /* BM25 v2 段开库时是否逐节校验 CRC（默认 1）。
+       1 = 校验（6.6.0 起走分块定位读，不再把整段映射扫进工作集；开库仍要
+           把段目录整读一遍 I/O——百 MB 级段目录在冷缓存上是秒级）；
+       0 = 只校验页脚 / 目录 CRC 与节边界，节内容信任盘（可信盘上的冷启动
+           加速；盘上损坏会读出错误数据而不是报错，风险自担）。
+       只影响 BM25 段；向量磁盘段（IVF / DiskANN）不受此格控制。 */
+    int       segment_verify_crc;
+} bitcask_open_tuning_t;
+
+// 初始化为缺省（struct_size = sizeof(bitcask_open_tuning_t)，segment_verify_crc = 1）
+BITCASK_API void bitcask_open_tuning_init(bitcask_open_tuning_t* tuning);
+
 /* ===========================================================================
  *  结果类型
  * ========================================================================= */
@@ -347,6 +368,38 @@ BITCASK_API bitcask_error_t bitcask_open_ex(const char* dirname,
                                              const bitcask_merge_policy_t* policy,
                                              bitcask_t** out,
                                              bitcask_fault_t* fault);
+
+// 6.6.0：同 bitcask_open_ex，多收一份开库调优。
+// tuning: NULL = 缺省（此时与 bitcask_open_ex 逐字节等价）。
+// tuning->struct_size 小于首个字段的末尾（未经 init）→ BITCASK_ERR_INVALID_OPTION，
+// *out = NULL，不碰盘。
+BITCASK_API bitcask_error_t bitcask_open_ex2(const char* dirname,
+                                              const bitcask_options_t* opts,
+                                              const bitcask_merge_policy_t* policy,
+                                              const bitcask_open_tuning_t* tuning,
+                                              bitcask_t** out,
+                                              bitcask_fault_t* fault);
+
+// 6.6.0：进程级线程数上限（下游 keel 转 coxswain 2026-09-22：C API 收不了
+// 线程数，enable_search 首次开库起 hardware_concurrency 条线程）。
+//
+// 进程级而非每库——两处线程本来就是进程共享的：
+//   index_workers: 索引池 map worker 数（首个 search 库 open 时建池，外加
+//                  1 条 reducer）。
+//   search_slots:  批量查询并发池（task_arena）槽数；非 0 时顺带封顶本库经
+//                  TBB 跑的并行段（恢复期批内 prepare、查询内 parallel_for）的
+//                  worker 总数为 search_slots - 1（tbb::global_control）。
+//   0 = 缺省（hardware_concurrency，至少 2），即 6.5.0 及以前的行为。
+//
+// 「第一个开 search 库的人定终身」：须在首个 enable_search 的 bitcask_open*
+// 之前调。之后再调且值与生效值不同 → BITCASK_ERR_INVALID_OPTION（fault 注明
+// 生效值），不静默忽略；与生效值相同 → BITCASK_OK（幂等）。纯 KV 库的
+// open 不冻结，可在其后设置。
+// 注意：tbb::global_control 是 TBB 运行时进程级的：宿主若与本库共用同一份
+// TBB 动态库，它自己的 TBB 并行也会被 search_slots 约束。
+BITCASK_API bitcask_error_t bitcask_set_thread_limits(size_t index_workers,
+                                                       size_t search_slots,
+                                                       bitcask_fault_t* fault);
 
 // 关闭并释放 Cask 实例。cask 句柄此后不可使用。
 // 内部调用 Cask::close() 后 delete 句柄包装。

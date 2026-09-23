@@ -1,10 +1,10 @@
 // Search 池实现（S19-1 自 search_layer.cpp 平移，行为不变）。
 
 #include "bitcask/search_arena.hpp"
+#include "bitcask/thread_limits.hpp"  // 6.6.0
 
 #include <oneapi/tbb/parallel_for.h>
 #include <oneapi/tbb/task_arena.h>
-#include <thread>
 
 namespace bitcask::search {
 
@@ -16,9 +16,11 @@ namespace {
 // 故意泄漏（never-destroyed）：规避静态析构与 TbbLifetime::finalize 的顺序坑；
 // task_arena 仅是调度上下文、不持有线程（线程来自全局 market），泄漏成本可忽略。
 tbb::task_arena& search_arena() {
+    // 6.6.0：槽数取进程级上限（set_thread_limits；首次使用即冻结）。
     static tbb::task_arena* arena = [] {
-        unsigned hc = std::thread::hardware_concurrency();
-        int slots = static_cast<int>(hc > 1 ? hc : 2);
+        const auto lim = bitcask::freeze_thread_limits();
+        const int slots = static_cast<int>(
+            bitcask::resolve_thread_count(lim.search_slots));
         return new tbb::task_arena(slots);
     }();
     return *arena;

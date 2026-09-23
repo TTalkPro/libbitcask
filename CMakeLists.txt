@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.21)
 # 版本单一真源（S12-7）：project(VERSION ...) 是唯一手写版本处。
 # 库 SOVERSION 与 C API bitcask_version_* 均从此派生，杜绝三处手工同步漂移。
-project(libbitcask VERSION 6.5.0 LANGUAGES CXX)
+project(libbitcask VERSION 6.6.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
 # ⚠️ 本文件（连同 tests/ 与 bench/ 的两份）一律用 `PROJECT_SOURCE_DIR` /
@@ -566,6 +566,7 @@ add_subdirectory(third_party/unordered_dense EXCLUDE_FROM_ALL)
 add_library(bitcask_keydir STATIC
     src/keydir/keydir.cpp
     src/keydir/keydir_registry.cpp
+    src/keydir/thread_limits.cpp   # 6.6.0：进程级线程数上限（registry 与 search_arena 共用）
 )
 target_include_directories(bitcask_keydir PUBLIC include)
 target_link_libraries(bitcask_keydir
@@ -673,6 +674,7 @@ target_include_directories(bitcask_text_plugin PUBLIC include)
 target_link_libraries(bitcask_text_plugin
     PUBLIC  bitcask_docmap bitcask_bm25 bitcask_text bitcask_plugin_api
     PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb  # TBB：search_arena
+            bitcask_keydir  # 6.6.0：search_arena 读 thread_limits（在 keydir 库里）
 )
 
 add_library(bitcask_vector_plugin STATIC
