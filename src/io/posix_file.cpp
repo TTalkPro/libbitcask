@@ -357,7 +357,7 @@ bool atomic_rename(const std::string& from, const std::string& to) noexcept {
 }
 
 void sync_directory(const std::string& path) noexcept {
-    const int dfd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+    const int dfd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dfd >= 0) {
         ::fsync(dfd);
         ::close(dfd);

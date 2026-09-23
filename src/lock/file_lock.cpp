@@ -18,6 +18,10 @@ FileLock::acquire(std::string_view filename, bool is_write_lock) noexcept {
         flags = io::OpenFlag::kCreate | io::OpenFlag::kSyncAll |
                 io::OpenFlag::kNoAppend;  // 见 kNoAppend 注释
     }
+    // W1:锁 fd 不随 exec 传给子进程。**这对锁语义是必需的**:若锁基于 fd
+    // (flock/OFD),子进程继承 fd 会在父进程关库后仍持锁;且子进程可经该
+    // fd 改写锁文件内容(pid 等 stale 检查依据)。
+    flags = flags | io::OpenFlag::kCloseOnExec;
     std::string path(filename);
     auto fh = io::open_handle(path, flags);  // mode 0600 = kOwnerOnly（默认）
     if (!fh) return std::unexpected(io::IoError{fh.error()});

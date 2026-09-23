@@ -2354,7 +2354,8 @@ auto KeyDir::load_snapshot(std::string_view path, bool accept_subset,
     // 6.6.0：流式载入——此前 read_file_bytes 整份进堆（开库瞬时峰值 ≈ 快照
     // 大小，feedback 2026-09-23）。现分块校验 CRC、分块解析，堆上只有
     // StreamCursor 的一块缓冲。
-    auto f = io::File::open(path, io::OpenFlag::kReadOnly);
+    auto f = io::File::open(  // W1:cloexec
+        path, io::OpenFlag::kReadOnly | io::OpenFlag::kCloseOnExec);
     if (!f) return std::nullopt;
     const auto fsz = io::handle_size(f->fd());
     if (!fsz) return std::nullopt;

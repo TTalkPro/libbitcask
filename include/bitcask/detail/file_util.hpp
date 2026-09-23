@@ -76,7 +76,14 @@ using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
     }
     return ::_wfopen(wp.c_str(), wmode);
 #else
-    return std::fopen(path.c_str(), mode);
+    // W1:追加 glibc/musl/BSD libc 通行的 'e' 标志 = O_CLOEXEC——经本函数
+    // 打开的 ckpt / 原子写临时文件 / field.schema 等 fd 不随 exec 泄漏。
+    // mode 全库只有 "rb"/"wb"/"ab" 这类短串,定长缓冲足够。
+    char emode[8] = {};
+    std::size_t i = 0;
+    for (; mode[i] != '\0' && i + 2 < sizeof(emode); ++i) emode[i] = mode[i];
+    emode[i] = 'e';
+    return std::fopen(path.c_str(), emode);
 #endif
 }
 

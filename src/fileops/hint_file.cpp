@@ -22,6 +22,7 @@ HintFile::open(std::string_view path, Mode mode, bool sync) {
         case Mode::kCreate: flags = OpenFlag::kCreate; break;
     }
     if (sync && mode != Mode::kRead) flags = flags | OpenFlag::kOSync;
+    flags = flags | OpenFlag::kCloseOnExec;  // W1:同 data_file
 
     auto f = io::PosixFile::open(path, flags);
     if (!f) return std::unexpected(io_fault(f.error()));

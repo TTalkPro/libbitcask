@@ -242,7 +242,8 @@ OkiRunWriter::finish(bool fsync_dir) {
 // ---------------------------------------------------------------------------
 
 std::expected<OkiRunReader, OkiError> OkiRunReader::open(std::string path) {
-    auto f = io::PosixFile::open(path, io::OpenFlag::kReadOnly);
+    auto f = io::PosixFile::open(  // W1:cloexec
+        path, io::OpenFlag::kReadOnly | io::OpenFlag::kCloseOnExec);
     if (!f) return std::unexpected(OkiError::kIo);
     OkiRunReader r;
     r.file_ = std::move(*f);

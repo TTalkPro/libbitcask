@@ -30,6 +30,9 @@ DataFile::open(std::string_view path, Mode mode, bool sync, bool mmap_enabled) {
         case Mode::kCreate: flags = OpenFlag::kCreate; break;     // O_EXCL
     }
     if (sync && mode != Mode::kRead) flags = flags | OpenFlag::kOSync;
+    // W1:fd 不随 exec 泄漏给子进程(宿主 fork+exec 时,子进程持有 data/hint
+    // fd 会拖住已删除文件的空间、并能读到库内容)。Windows 句柄默认不继承。
+    flags = flags | OpenFlag::kCloseOnExec;
 
     auto f = io::PosixFile::open(path, flags);
     if (!f) return std::unexpected(io_fault(f.error()));

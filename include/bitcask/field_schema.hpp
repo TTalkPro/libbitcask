@@ -130,8 +130,10 @@ public:
         //   - Windows 没有 O_APPEND 的等价物，seam 的定位写走 OVERLAPPED 偏移。
         // 两边要行为一致，就只能开时定一次起点、之后自己推进。
         // kUmaskDefault 仍是为了逐字复刻 fopen 的 0666&~umask 建档权限。
-        if (auto h = io::open_handle(path, io::OpenFlag::kNoAppend,
-                                     io::FileMode::kUmaskDefault)) {
+        // W1:kCloseOnExec——追加句柄常驻整个库生命期,不得随 exec 泄漏。
+        if (auto h = io::open_handle(
+                path, io::OpenFlag::kNoAppend | io::OpenFlag::kCloseOnExec,
+                io::FileMode::kUmaskDefault)) {
             io::File wf{*h};
             if (const auto sz = io::handle_size(wf.fd())) {
                 // **起点是「最后一条完整 entry 的末尾」，不是文件大小。**
