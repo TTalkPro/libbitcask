@@ -350,8 +350,22 @@ std::array<std::string_view, kChunkOrds> ord2ext;   // 2MB → 1MB/chunk
   `KeyDirOptimisticRead.ConcurrentGetPutRemoveGrowStress`(TASK.md 预存);
 - **变异验证**:把 `k2l_assign_locked` 改为只改 value 不换键,ASan 下两条 S40 用例
   分别报断言失败与 heap-use-after-free——证明用例确实守住不变量 K;
-- 未做:§10 的 RSS probe 实测与 bench ±2% 对比(`BITCASK_BUILD_BENCHMARKS=OFF`),
-  收益目前只有 §1.1 的估算。
+- **RSS 实测(TODO A1,2026-09-23)**:手动探针 `CheckpointRecoveryTest.DISABLED_S40KeyRssProbe`
+  (两进程:先建库 checkpoint,新进程开库量 `mallinfo2` uordblks+hblkhd 与 VmRSS),
+  S40 前(8649f0d)/后二进制对同一目录交替开库,结果逐次一致:
+
+  | 1M 文档 | 改前开库堆 | 改后 | 节省 | RSS |
+  |---|---|---|---|---|
+  | key 20B | 565.8 MB | 455.3 MB | −110.5 MB(−19.5%,115.9 B/doc) | −111 MB |
+  | key 12B | 418.8 MB | 384.6 MB | −34.2 MB(−8.2%,35.9 B/doc) | −35 MB |
+
+  均略优于 §1.1 估算(96 / 32 MB):多出的部分来自 map 节点缩小后 malloc 块降档
+  (88B→72B 请求跨过 96/80 分档)。注意只看 `uordblks` 会漏掉 `ord2ext` chunk
+  (1MB 大块走 mmap,计在 `hblkhd`)。
+- **bench(TODO A2)**:7 轮新旧交替、绑核 2-5,中位数:PutDocTextIndex(内联)+0.5%、
+  Open_Snapshot +0.1%、Open_FullFold −0.7%、SearchHybrid +0.6%、BOW 对照 +0.4%。
+  builder 模式(B=2)首轮 +4.7%,追加 11 轮复测 −2.9%——该项在本机负载下单二进制
+  轮间波动 122–160ms(约 ±15%),两轮方向相反,判定无可检测回退。
 
 ---
 

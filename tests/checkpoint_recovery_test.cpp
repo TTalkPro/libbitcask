@@ -14,6 +14,8 @@
 #include <string_view>
 #include <vector>
 
+#include <malloc.h>
+
 namespace {
 
 // S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
@@ -634,5 +636,63 @@ TEST_F(CheckpointRecoveryTest, DISABLED_S30RssProbe) {
     std::fprintf(stderr,
                  "[rss-probe] mode=%s docs=%d VmHWM=%ld MB VmRSS=%ld MB\n",
                  mode, kN, hwm / 1024, rss / 1024);
+    (*c)->close();
+}
+
+// S40:开库常驻 key 材料探针(手动实验,CI 恒跳过)。两进程协议——先
+// BITCASK_RSS_PHASE=build 建库(checkpoint 后关),再 BITCASK_RSS_PHASE=open
+// 在新进程开库,报开库前后堆占用(mallinfo2 uordblks+hblkhd,精确到字节)与 VmRSS。
+// 同一目录/同一参数下新旧二进制各跑一次 open,堆差值即 key 材料净变化。
+// 参数:BITCASK_RSS_DIR(必填)、BITCASK_RSS_DOCS(缺省 200000)、
+//       BITCASK_RSS_KEYLEN(缺省 20)。
+TEST_F(CheckpointRecoveryTest, DISABLED_S40KeyRssProbe) {
+    const char* phase = std::getenv("BITCASK_RSS_PHASE");
+    const char* dir = std::getenv("BITCASK_RSS_DIR");
+    ASSERT_NE(phase, nullptr) << "设 BITCASK_RSS_PHASE=build|open";
+    ASSERT_NE(dir, nullptr) << "设 BITCASK_RSS_DIR";
+    const int kN = std::getenv("BITCASK_RSS_DOCS")
+                       ? std::atoi(std::getenv("BITCASK_RSS_DOCS"))
+                       : 200000;
+    const int kLen = std::getenv("BITCASK_RSS_KEYLEN")
+                         ? std::atoi(std::getenv("BITCASK_RSS_KEYLEN"))
+                         : 20;
+    auto opts = make_search_options(8);
+    if (std::string_view(phase) == "build") {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        auto c = Cask::open(dir, opts, &test_registry());
+        ASSERT_TRUE(c);
+        std::string text;
+        char kb[64];
+        for (int i = 0; i < kN; ++i) {
+            std::snprintf(kb, sizeof(kb), "k%0*d", kLen - 1, i);
+            text = "w" + std::to_string(i % 997) + " common tail";
+            bitcask::DocInput doc;
+            doc.text = sv_bytes(text);
+            ASSERT_TRUE((*c)->put_doc(sv_bytes(std::string_view(kb, static_cast<std::size_t>(kLen))), doc,
+                                      static_cast<std::uint32_t>(i)));
+        }
+        ASSERT_TRUE((*c)->checkpoint());
+        (*c)->close();
+        return;
+    }
+    ::malloc_trim(0);
+    const auto mi0 = ::mallinfo2();  // 大块(chunk 数组)走 mmap,计 hblkhd
+    const auto heap0 = mi0.uordblks + mi0.hblkhd;
+    const long rss0 = read_status_kb("VmRSS:");
+    auto c = Cask::open(dir, opts, &test_registry());
+    ASSERT_TRUE(c);
+    auto r = (*c)->search_text("common", 10);
+    ASSERT_TRUE(r);
+    const auto mi1 = ::mallinfo2();
+    const auto heap1 = mi1.uordblks + mi1.hblkhd;
+    const long rss1 = read_status_kb("VmRSS:");
+    // 有符号差值:开库后释放多于分配时不回绕。
+    const double delta = static_cast<double>(heap1) - static_cast<double>(heap0);
+    std::fprintf(stderr,
+                 "[s40-probe] docs=%d keylen=%d heap_delta=%.2f MB "
+                 "rss_delta=%ld MB (%.1f B/doc heap)\n",
+                 kN, kLen, delta / 1048576.0, (rss1 - rss0) / 1024,
+                 delta / kN);
     (*c)->close();
 }
