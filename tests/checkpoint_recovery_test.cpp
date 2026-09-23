@@ -14,7 +14,9 @@
 #include <string_view>
 #include <vector>
 
-#include <malloc.h>
+#if defined(__GLIBC__)
+#include <malloc.h>  // malloc_trim / mallinfo2,仅 glibc
+#endif
 
 namespace {
 
@@ -676,6 +678,9 @@ TEST_F(CheckpointRecoveryTest, DISABLED_S40KeyRssProbe) {
         (*c)->close();
         return;
     }
+#if !defined(__GLIBC__)
+    GTEST_SKIP() << "mallinfo2 / malloc_trim 仅 glibc 可用";
+#else
     ::malloc_trim(0);
     const auto mi0 = ::mallinfo2();  // 大块(chunk 数组)走 mmap,计 hblkhd
     const auto heap0 = mi0.uordblks + mi0.hblkhd;
@@ -695,4 +700,5 @@ TEST_F(CheckpointRecoveryTest, DISABLED_S40KeyRssProbe) {
                  kN, kLen, delta / 1048576.0, (rss1 - rss0) / 1024,
                  delta / kN);
     (*c)->close();
+#endif
 }
