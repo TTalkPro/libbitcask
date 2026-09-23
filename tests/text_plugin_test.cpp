@@ -1329,3 +1329,159 @@ TEST(TextPlugin, S31SegmentLoadFailureDegradesLoudly) {
     EXPECT_EQ(b.watermark(), 0u);
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// S40(docs/design/s40-key-single-instance.md):key_to_location_ 键改 view。
+// 长 key(>15B)确保键字节在堆/段存储上,ASan 下任何悬垂 view 都会被抓到。
+// ===========================================================================
+
+namespace {
+std::string s40_key(std::uint64_t i) {
+    return "s40-key-with-a-long-prefix-to-defeat-sso-" + std::to_string(i);
+}
+}  // namespace
+
+// 墓碑键背衬:删 → 旧 put 被拒、新 put 生效;tomb_keys_ 占用恒等于存活墓碑数
+// (删后再写回收,反复删写不增长)。
+TEST(TextPlugin, S40TombKeyLifecycle) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_s40_tomb";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();  // OpenContext::dir 是 view
+
+    index::Index idx;
+    text::TextPlugin p(make_cfg(), idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);
+
+    const std::string k = s40_key(0);
+    host_put_row(idx, k, 1);
+    p.apply_text(k, 1, "alpha original");
+
+    p.on_delete(k, /*tomb_ord=*/2, /*prior_ord=*/1);
+    auto st = p.key_location_stats();
+    EXPECT_EQ(st.entries, 1u);
+    EXPECT_EQ(st.tombs, 1u);
+    EXPECT_EQ(st.tomb_keys, 1u);
+
+    // 重复/过期删除不重复入墓碑背衬。
+    p.on_delete(k, /*tomb_ord=*/2, /*prior_ord=*/1);
+    p.on_delete(k, /*tomb_ord=*/1, /*prior_ord=*/1);
+    EXPECT_EQ(p.key_location_stats().tomb_keys, 1u);
+
+    // 墓碑前的旧版本乱序到达:被 LSN 守卫拒绝(不入段)。
+    const auto before = p.building_segment()->doc_count();
+    p.apply_text(k, 0, "stale ghost");
+    EXPECT_EQ(p.building_segment()->doc_count(), before);
+
+    // 新版本生效,墓碑背衬随之回收。
+    host_put_row(idx, k, 3);
+    p.apply_text(k, 3, "gamma fresh");
+    st = p.key_location_stats();
+    EXPECT_EQ(st.entries, 1u);
+    EXPECT_EQ(st.tombs, 0u);
+    EXPECT_EQ(st.tomb_keys, 0u);
+    {
+        auto r = p.search_text("gamma", 10);
+        ASSERT_TRUE(r.has_value());
+        ASSERT_EQ(r->size(), 1u);
+        EXPECT_EQ((*r)[0].key, k);
+    }
+
+    // 反复删写:墓碑背衬有界(≤ 1)。
+    std::uint64_t ord = 4;
+    for (int i = 0; i < 50; ++i) {
+        p.on_delete(k, ord, ord - 1);
+        ++ord;
+        st = p.key_location_stats();
+        EXPECT_EQ(st.tomb_keys, st.tombs);
+        EXPECT_LE(st.tomb_keys, 1u);
+        host_put_row(idx, k, ord);
+        p.apply_text(k, ord, "delta cycle");
+        ++ord;
+        EXPECT_EQ(p.key_location_stats().tomb_keys, 0u);
+    }
+    fs::remove_all(dir);
+}
+
+// 换键闭环:多轮覆盖写 × 预算封口(v1→v2 换对象)× merge(输入段 drop)。
+// 若任一写点只改 value 不换键,键会指向已 drop 段的存储——后续 find/explain/
+// on_delete 的键比较即读已释放内存(ASan 报错),或定位错乱(断言失败)。
+TEST(TextPlugin, S40RekeyAcrossSealMergeNoDangling) {
+    const fs::path dir = fs::temp_directory_path() / "bitcask_tp_s40_rekey";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    index::Index idx;
+    auto cfg = make_cfg();
+    cfg.seal_ram_budget_bytes = 2048;  // 碎段:频繁 v2 封口换对象
+    cfg.merge_fan_in = 4;
+    text::TextPlugin a(cfg, idx, idx, idx);
+    plugin::OpenContext ctx;
+    ctx.dir = dir_s;
+    ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+
+    constexpr std::uint64_t kKeys = 40;
+    const char* rounds[] = {"roundzero", "roundone", "roundtwo"};
+    std::uint64_t ord = 0;
+    for (const char* word : rounds) {
+        for (std::uint64_t i = 0; i < kKeys; ++i) {
+            const auto k = s40_key(i);
+            host_put_row(idx, k, ord);
+            a.apply_text(k, ord, std::string(word) + " payload filler text");
+            ++ord;
+        }
+        plugin::FlushRequest req;
+        req.watermark = ord;
+        ASSERT_EQ(a.flush(req).status, plugin::PluginStatus::kOk);  // 封口 + merge
+    }
+    EXPECT_EQ(a.key_location_stats().entries, kKeys);
+
+    auto count = [](const text::TextPlugin& p, std::string_view q) {
+        auto r = p.search_text(q, 1000);
+        return r.has_value() ? r->size() : std::size_t{9999};
+    };
+    EXPECT_EQ(count(a, "roundtwo"), kKeys);
+    EXPECT_EQ(count(a, "roundzero"), 0u);
+    for (std::uint64_t i = 0; i < kKeys; ++i) {
+        EXPECT_TRUE(a.explain("roundtwo", s40_key(i)).has_value()) << i;
+    }
+
+    // 删一半(命中经封口/merge 换入的定位)。
+    for (std::uint64_t i = 0; i < kKeys; i += 2) {
+        a.on_delete(s40_key(i), ord, /*prior_ord=*/0);
+        ++ord;
+    }
+    EXPECT_EQ(count(a, "roundtwo"), kKeys / 2);
+
+    // 再 flush(merge 回收死行、drop 输入段)后,所有定位仍可用。
+    plugin::FlushRequest req;
+    req.watermark = ord;
+    ASSERT_EQ(a.flush(req).status, plugin::PluginStatus::kOk);
+    for (std::uint64_t i = 1; i < kKeys; i += 2) {
+        EXPECT_TRUE(a.explain("roundtwo", s40_key(i)).has_value()) << i;
+    }
+    const auto st = a.chain_state();
+
+    // 重开:rebuild_key_locations 以段存储为键(不构造 string),墓碑消失。
+    index::Index idx2;
+    for (std::uint64_t i = 1; i < kKeys; i += 2) {
+        host_put_row(idx2, s40_key(i), 2 * kKeys + i);
+    }
+    text::TextPlugin b(cfg, idx2, idx2, idx2);
+    plugin::OpenContext c2;
+    c2.dir = dir_s;
+    c2.committed_base_watermark = st.base_gen;
+    c2.committed_chain_watermark = st.chain_wm;
+    c2.committed_chain_seq = st.next_seq - 1;
+    ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+    const auto bst = b.key_location_stats();
+    EXPECT_EQ(bst.entries, kKeys / 2);
+    EXPECT_EQ(bst.tomb_keys, 0u);
+    EXPECT_EQ(count(b, "roundtwo"), kKeys / 2);
+    b.on_delete(s40_key(1), ord + 1, 2 * kKeys + 1);
+    EXPECT_EQ(count(b, "roundtwo"), kKeys / 2 - 1);
+    fs::remove_all(dir);
+}

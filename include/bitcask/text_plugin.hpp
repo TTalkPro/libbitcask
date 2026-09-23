@@ -284,6 +284,20 @@ public:
     [[nodiscard]] const search::SegmentSet* segment_set() const {
         return segment_set_.get();
     }
+    // S40 内省:key 定位条目数 / 墓碑背衬串数(后者应恒等于存活墓碑数)。
+    struct KeyLocationStats {
+        std::size_t entries = 0;
+        std::size_t tombs = 0;       // tomb 态条目
+        std::size_t tomb_keys = 0;   // tomb_keys_ 背衬串
+    };
+    [[nodiscard]] KeyLocationStats key_location_stats() const {
+        std::shared_lock lk(key_loc_mu_);
+        KeyLocationStats st;
+        st.entries = key_to_location_.size();
+        for (const auto& [k, loc] : key_to_location_) st.tombs += loc.tomb;
+        st.tomb_keys = tomb_keys_.size();
+        return st;
+    }
 
     // ---- 记账（S27-3 步骤 3:fields_ 退役,单一段侧脏位）----
     // seg_dirty_:building_ 有新文档 / 段有新 mark_dead / 段集成员变动。
@@ -508,9 +522,26 @@ private:
     std::unique_ptr<search::SegmentSet>      segment_set_;  // 已封口活跃段集
     // S27-3 步骤 5:key_loc_mu_ 保护 map 结构——写者全在 reducer(unique,
     // 无竞争零代价),explain 在查询线程 find(shared)。search 路径不读此表。
+    // S40 读侧纪律:键是 view,只在持 key_loc_mu_ 期间比较/读取,不得带出锁外。
     mutable std::shared_mutex key_loc_mu_;
-    std::unordered_map<std::string, KeyLocation,
-                       StringHash, std::equal_to<>> key_to_location_;
+    // S40 D1(docs/design/s40-key-single-instance.md §5):键为 string_view,
+    // 不再 owned。不变量 K——seg 非空 ⇒ 键字节 ∈ *seg(= seg->key_at(docid));
+    // tomb ⇒ 键字节 ∈ tomb_keys_。seg 的 pin 因此恒覆盖键的背衬。
+    // **改 seg/tomb 的写入只许经 k2l_assign_locked**(只改 value 不换键 =
+    // 键指向不再被 pin 的旧段,段 drop 后同桶 find 读已释放内存)。
+    using K2LMap = std::unordered_map<std::string_view, KeyLocation,
+                                      StringHash, std::equal_to<>>;
+    K2LMap key_to_location_;
+    // 墓碑键的 owned 背衬(node-based:元素地址稳定)。占用 = 存活墓碑数——
+    // 条目离开墓碑态时由 k2l_assign_locked 回收。与 key_to_location_ 同锁同清。
+    std::unordered_set<std::string, StringHash, std::equal_to<>> tomb_keys_;
+    // 登记/改写 key 定位(持 key_loc_mu_ unique)。it == end → 新插;否则经
+    // node handle 换键(零分配、不 rehash)。backing 必须来自
+    // loc.seg->key_at(loc.docid) 或 tomb_keys_ 元素,绝不能是调用方临时串。
+    void k2l_assign_locked(K2LMap::iterator it, std::string_view backing,
+                           const KeyLocation& loc);
+    // 清空 key 定位与墓碑背衬(持 key_loc_mu_ unique)。
+    void k2l_clear_locked() noexcept;
 };
 
 }  // namespace bitcask::text

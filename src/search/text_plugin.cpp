@@ -119,7 +119,7 @@ void TextPlugin::apply_text_in(BuildingSlot& slot, std::string_view key,
         // 跳过**优化**(已见更高版本则免 add);正确性全由下方终检承担。
         {
             std::shared_lock lk(key_loc_mu_);
-            if (auto it = key_to_location_.find(std::string(key));
+            if (auto it = key_to_location_.find(key);
                 it != key_to_location_.end() && it->second.ord > ord) {
                 lk.unlock();
                 cache_.invalidate_terms(changed_terms);
@@ -141,10 +141,12 @@ void TextPlugin::apply_text_in(BuildingSlot& slot, std::string_view key,
         bool lost = false;
         {
             std::unique_lock lk(key_loc_mu_);
-            auto& e = key_to_location_[std::string(key)];
-            if (e.ord <= ord) {
-                displaced = e;
-                e = KeyLocation{bld, docid, ord, false};
+            auto it = key_to_location_.find(key);
+            if (it == key_to_location_.end() || it->second.ord <= ord) {
+                if (it != key_to_location_.end()) displaced = it->second;
+                // S40:换键到本段存储(不变量 K)——不可只改 value。
+                k2l_assign_locked(it, bld->key_at(docid),
+                                  KeyLocation{bld, docid, ord, false});
             } else {
                 lost = true;
             }
@@ -300,7 +302,7 @@ void TextPlugin::apply_job_impl_in(BuildingSlot& slot, const ReduceJob& job,
         // 终检 = 唯一 mark_dead 责任点,论证见彼处)。
         {
             std::shared_lock lk(key_loc_mu_);
-            if (auto it = key_to_location_.find(std::string(job.key));
+            if (auto it = key_to_location_.find(job.key);
                 it != key_to_location_.end() && it->second.ord > job.ord) {
                 lk.unlock();
                 cache_.invalidate_terms(changed_terms);
@@ -324,10 +326,12 @@ void TextPlugin::apply_job_impl_in(BuildingSlot& slot, const ReduceJob& job,
             bool lost = false;
             {
                 std::unique_lock lk(key_loc_mu_);
-                auto& e = key_to_location_[std::string(job.key)];
-                if (e.ord <= job.ord) {
-                    displaced = e;
-                    e = KeyLocation{bld, docid, job.ord, false};
+                auto it = key_to_location_.find(job.key);
+                if (it == key_to_location_.end() || it->second.ord <= job.ord) {
+                    if (it != key_to_location_.end()) displaced = it->second;
+                    // S40:换键到本段存储(不变量 K)。
+                    k2l_assign_locked(it, bld->key_at(docid),
+                                      KeyLocation{bld, docid, job.ord, false});
                 } else {
                     lost = true;
                 }
@@ -395,11 +399,20 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
     bool have_prior = false;
     {
         std::unique_lock lk(key_loc_mu_);
-        auto& e = key_to_location_[std::string(key)];
-        if (e.ord > tomb_ord) return;  // 已有更新版本(put/墓碑),本删除过期
-        prior = e;
-        have_prior = (e.seg != nullptr || e.tomb);
-        e = KeyLocation{nullptr, 0, tomb_ord, true};
+        auto it = key_to_location_.find(key);
+        if (it != key_to_location_.end()) {
+            if (it->second.ord > tomb_ord) return;  // 已有更新版本(put/墓碑),本删除过期
+            prior = it->second;
+            have_prior = (prior.seg != nullptr || prior.tomb);
+        }
+        const KeyLocation tomb{nullptr, 0, tomb_ord, true};
+        if (it != key_to_location_.end() && it->second.tomb) {
+            it->second = tomb;  // 键已在 tomb_keys_(不变量 K),只改 value
+        } else {
+            // S40 §5.3:墓碑无段背衬 → 键字节落 tomb_keys_(node-based,地址稳定)。
+            const auto& owned = *tomb_keys_.emplace(key).first;
+            k2l_assign_locked(it, owned, tomb);
+        }
     }
     if (have_prior && !prior.tomb && prior.seg) {
         (void)prior.seg->mark_dead(prior.docid);
@@ -427,7 +440,7 @@ void TextPlugin::rebuild_index(
     doc_texts_.clear();
     {
         std::unique_lock lk(key_loc_mu_);
-        key_to_location_.clear();
+        k2l_clear_locked();
     }
     if (segment_set_) {
         std::vector<std::uint64_t> ids;
@@ -455,7 +468,9 @@ void TextPlugin::rebuild_index(
             doc_len);
         {
             std::unique_lock lk(key_loc_mu_);
-            key_to_location_[*key] = KeyLocation{bld, docid, ord, false};
+            // S40:键取段存储(*key 是 ord_to_ext 的临时串,不可作 view 背衬)。
+            k2l_assign_locked(key_to_location_.find(*key), bld->key_at(docid),
+                              KeyLocation{bld, docid, ord, false});
         }
         doc_texts_.put(ord, text);
         if (bld->doc_count() >= kBuildingFlushDocThreshold) {
@@ -904,7 +919,7 @@ TextPlugin::explain(std::string_view query, std::string_view key,
     bool have_loc = false;
     {
         std::shared_lock lk(key_loc_mu_);
-        if (auto it = key_to_location_.find(std::string(key));
+        if (auto it = key_to_location_.find(key);
             it != key_to_location_.end()) {
             loc = it->second;
             have_loc = true;
@@ -1305,11 +1320,13 @@ void TextPlugin::maybe_merge_segments() {
             for (std::uint32_t od = 0; od < map.size(); ++od) {
                 const auto nd = map[od];
                 if (nd == search::MergeResult::kDead) continue;
-                auto it = key_to_location_.find(merged->key_at(nd));
+                const auto k = merged->key_at(nd);
+                auto it = key_to_location_.find(k);
                 if (it != key_to_location_.end() &&
                     it->second.seg == inputs[si] && it->second.docid == od) {
-                    it->second.seg = merged;
-                    it->second.docid = nd;
+                    // S40:换键到输出段(输入段随后 drop,旧键字节不再被 pin)。
+                    k2l_assign_locked(it, k,
+                                      KeyLocation{merged, nd, it->second.ord, false});
                 }
             }
         }
@@ -1344,14 +1361,49 @@ plugin::PluginStatus TextPlugin::open(const plugin::OpenContext& ctx) {
     return plugin::PluginStatus::kOk;
 }
 
+// S40 D1:key 定位的唯一写入口(不变量 K,见头文件声明处)。
+void TextPlugin::k2l_assign_locked(K2LMap::iterator it, std::string_view backing,
+                                   const KeyLocation& loc) {
+    if (it == key_to_location_.end()) {
+        key_to_location_.emplace(backing, loc);
+        return;
+    }
+    const bool was_tomb = it->second.tomb;
+    const std::string_view old_key = it->first;
+    if (old_key.data() != backing.data()) {
+        // node handle 换键:同一节点复用,字节相等 ⇒ hash 相同,不 rehash。
+        auto nh = key_to_location_.extract(it);
+        nh.key() = backing;
+        nh.mapped() = loc;
+        key_to_location_.insert(std::move(nh));
+    } else {
+        it->second = loc;
+    }
+    // 离开墓碑态 → 回收墓碑背衬(此时已无键指向它)。
+    if (was_tomb && !loc.tomb && old_key.data() != backing.data()) {
+        if (auto t = tomb_keys_.find(old_key); t != tomb_keys_.end() &&
+                                               t->data() == old_key.data()) {
+            tomb_keys_.erase(t);
+        }
+    }
+}
+
+void TextPlugin::k2l_clear_locked() noexcept {
+    key_to_location_.clear();  // 先清 view,再清背衬
+    tomb_keys_.clear();
+}
+
 // S27-3 B2b 步骤 4:从段集重建 key_to_location_(open 尾部调,单线程)。
 // 按段集序(seg_id 升序 == 清单序)遍历,段内 docid 升序 == LSN 升序 →
 // 同 key 后写天然覆盖前写;只登记 live 文档(dead 槽位无删除/覆盖价值)。
 void TextPlugin::rebuild_key_locations() {
     std::unique_lock lk(key_loc_mu_);
-    key_to_location_.clear();
+    k2l_clear_locked();
     if (!segment_set_) return;
     const auto segs = segment_set_->segments_view();  // open 单线程上下文
+    std::size_t total = 0;
+    for (const auto& sp : segs) total += sp->doc_count();
+    key_to_location_.reserve(total);  // S40:上界预留,免重建期 rehash
     for (const auto& sp : segs) {
         const auto& seg = *sp;
         const auto n = seg.doc_count();
@@ -1360,8 +1412,11 @@ void TextPlugin::rebuild_key_locations() {
             if (!seg.is_live(docid)) continue;
             // 段序=seg_id 升序、段内 docid 升序=LSN 升序 → 直接覆盖即
             // 后写胜;S27-4 P1 起条目带 ord(LSN 守卫)与段对象指针。
-            key_to_location_[std::string(seg.key_at(docid))] =
-                KeyLocation{sp, docid, seg.lsn_at(docid), false};
+            // S40:键直接 view 段存储(不构造 string);同 key 后段覆盖前段
+            // 时必须换键(operator[] 会保留前段的键,value 却指后段)。
+            const auto k = seg.key_at(docid);
+            k2l_assign_locked(key_to_location_.find(k), k,
+                              KeyLocation{sp, docid, seg.lsn_at(docid), false});
         }
     }
 }
@@ -1447,10 +1502,13 @@ void TextPlugin::flush_building_slot(BuildingSlot& slot) {
             if (!sealed->is_live(d) && pending->is_live(d)) {
                 (void)pending->mark_dead(d);
             }
-            auto it = key_to_location_.find(pending->key_at(d));
+            const auto k = pending->key_at(d);
+            auto it = key_to_location_.find(k);
             if (it != key_to_location_.end() && it->second.seg == sealed &&
                 it->second.docid == d) {
-                it->second.seg = pending;
+                // S40:换键到 mmap 背衬(sealed 的 keys_ 随局部引用释放)。
+                k2l_assign_locked(it, k,
+                                  KeyLocation{pending, d, it->second.ord, false});
             }
         }
     }
