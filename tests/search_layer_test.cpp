@@ -91,8 +91,10 @@ TEST(SearchLayer, MultipleDocsRanking) {
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 2u);
 
-    EXPECT_EQ(result->at(0).key, "doc2");
-    EXPECT_EQ(result->at(1).key, "doc1");
+    // doc1 / doc2 同分：全序 (分数降序, 段内 docid 升序) → 先写入者在前
+    // （下游反馈 2026-10-06 第 5 条；此前并列按 ord 降序）。
+    EXPECT_EQ(result->at(0).key, "doc1");
+    EXPECT_EQ(result->at(1).key, "doc2");
 }
 
 TEST(SearchLayer, OnRelocate) {

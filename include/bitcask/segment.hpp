@@ -29,6 +29,7 @@
 #include "bitcask/segment_v2.hpp"      // S30-P2:mmap 背衬(MmapSegment/MmapFieldIndex)
 #include "bitcask/string_hash.hpp"     // StringHash（透明 hash）
 
+#include <algorithm>    // stable_sort（阶段 3 全序）
 #include <atomic>
 #include <cassert>      // local_docid 的越界断言
 #include <cstring>
@@ -843,9 +844,13 @@ private:
                 acc_local[docid] += static_cast<double>(h.score);
             }
         }
-        // 段内累加完 → 物化 SearchHit（key/lsn 由段 doc_store 提供）。
-        merged.reserve(merged.size() + acc_local.size());
-        for (const auto& [docid, score] : acc_local) {
+        // 段内累加完 → 按 docid 升序物化 SearchHit（key/lsn 由段 doc_store
+        // 提供）——段内次序须确定，阶段 3 稳定排序据此给出全序。
+        std::vector<std::pair<DocId, double>> local(acc_local.begin(),
+                                                    acc_local.end());
+        std::sort(local.begin(), local.end());
+        merged.reserve(merged.size() + local.size());
+        for (const auto& [docid, score] : local) {
             merged.push_back(SearchHit{
                 std::string(seg->key_at(docid)),
                 seg->lsn_at(docid),
@@ -853,20 +858,13 @@ private:
         }
     }
 
-    // 阶段 3：全局 top-k（分数降序，并列 key 升序稳定——与 multi_segment_search
-    // 一致，便于跨调用比较）。
-    const auto cmp = [](const SearchHit& a, const SearchHit& b) {
-        if (a.score != b.score) return a.score > b.score;
-        return a.key < b.key;
-    };
-    if (merged.size() > k) {
-        std::partial_sort(merged.begin(),
-                          merged.begin() + static_cast<std::ptrdiff_t>(k),
-                          merged.end(), cmp);
-        merged.resize(k);
-    } else {
-        std::sort(merged.begin(), merged.end(), cmp);
-    }
+    // 阶段 3：全局 top-k——全序 (分数降序, 段次序, 段内 docid 升序)，与
+    // multi_segment_search 一致（按分数稳定排序，见其注释）。
+    std::stable_sort(merged.begin(), merged.end(),
+                     [](const SearchHit& a, const SearchHit& b) {
+                         return a.score > b.score;
+                     });
+    if (merged.size() > k) merged.resize(k);
     return merged;
 }
 

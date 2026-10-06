@@ -44,7 +44,7 @@ struct SegmentView {
 
 // §3.5 多段查询：① 跨段聚合全局 N/sum_dl/df（G-on-the-fly）② 串行逐段用**同一
 // idf/avgdl** 打分 ③ 大小 k 的并集归并（一个 doc 只在一个段，故并集不求和）。
-// 返回按分数降序（并列以 key 升序稳定）的 top-k。
+// 返回全序 (分数降序, 段次序, 段内 docid 升序) 下的 top-k。
 [[nodiscard]] inline std::vector<SearchHit> multi_segment_search(
     std::span<const SegmentView> segs,
     const std::vector<std::string>& terms,
@@ -83,19 +83,16 @@ struct SegmentView {
         }
     }
 
-    // ---- 全局 top-k：分数降序，并列以 key 升序稳定 ----
-    const auto cmp = [](const SearchHit& a, const SearchHit& b) {
-        if (a.score != b.score) return a.score > b.score;
-        return a.key < b.key;
-    };
-    if (merged.size() > k) {
-        std::partial_sort(merged.begin(),
-                          merged.begin() + static_cast<std::ptrdiff_t>(k),
-                          merged.end(), cmp);
-        merged.resize(k);
-    } else {
-        std::sort(merged.begin(), merged.end(), cmp);
-    }
+    // ---- 全局 top-k：全序 (分数降序, 段在 segs 中的次序, 段内 docid 升序) ----
+    // 段内列表已按内核全序 (分数降序, docid 升序) 给出、逐段按 segs 次序拼接，
+    // 故按分数**稳定**排序即得该全序（下游反馈 2026-10-06 第 5 条：此前并列
+    // 按 key 升序截取，与内核的段内取舍不一致，小 k 结果不是大 k 的前缀）。
+    // 同分序在两次封口 / 段合并之间稳定（docid 与段集随之重排，同 Lucene）。
+    std::stable_sort(merged.begin(), merged.end(),
+                     [](const SearchHit& a, const SearchHit& b) {
+                         return a.score > b.score;
+                     });
+    if (merged.size() > k) merged.resize(k);
     return merged;
 }
 

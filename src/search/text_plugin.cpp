@@ -65,8 +65,8 @@ FetchOut make_out(const std::vector<bm25::SearchResult>& results,
 // 穷尽判据「候选数 < k_req」对各检索路径都成立：候选集是逐段（或全局）
 // top-k_req 的并集再截到 k_req——任一路取满 k_req，并集必满。
 // 无 filter 时首轮通常即满足，成本不变。缓存键含 k_req，各轮各占一条。
-// 注：同分并列的取舍由内核扫描 / 剪枝次序决定，补取不改变这一点
-// （反馈第 5 条，另案处理）。
+// 同分并列由内核全序 (分数降序, 段内 docid 升序) + 跨段稳定排序决定
+// （反馈第 5 条，见 sort_truncate），补取各轮的候选都是同一全序的前缀。
 template <class Fetch>
 std::vector<SearchHit> refetch_until_k(std::size_t k, std::size_t k_req,
                                        Fetch&& fetch) {
@@ -80,13 +80,15 @@ std::vector<SearchHit> refetch_until_k(std::size_t k, std::size_t k_req,
     }
 }
 
-// 逐段并集的公共收尾：分数降序、并列 ord 降序，截到 k_req。
+// 逐段并集的公共收尾：按分数**稳定**排序，截到 k_req。各段结果已是内核
+// 全序 (分数降序, 段内 docid 升序)、按视图次序拼接，稳定排序即得全序
+// (分数降序, 段次序, 段内 docid 升序)——小 k 结果恒为大 k 的前缀（下游
+// 反馈 2026-10-06 第 5 条；此前并列按 ord 降序重排，与内核取舍不一致）。
 void sort_truncate(std::vector<bm25::SearchResult>& results, std::size_t k_req) {
-    std::sort(results.begin(), results.end(),
-              [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
-                  if (a.score != b.score) return a.score > b.score;
-                  return a.ord > b.ord;
-              });
+    std::stable_sort(results.begin(), results.end(),
+                     [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
+                         return a.score > b.score;
+                     });
     if (results.size() > k_req) results.resize(k_req);
 }
 
@@ -761,10 +763,8 @@ TextPlugin::search_text(std::string_view query, std::size_t k,
                 for (const auto& h : hits) {
                     results.push_back({h.ord, static_cast<float>(h.score)});
                 }
-                // S29-5 评估后保留：非冗余排序——multi_segment_search 返回并列
-                // 以 key 升序，此处重排为 ord 降序，对齐单索引路径（score_bow_topk
-                // 堆序 → 并列 ord 降序）与缓存语义；≤k_req 个元素，成本可忽略。
-                sort_truncate(results, k_req);
+                // multi_segment_search 已按全序给出（见 sort_truncate 注释），
+                // 不再重排（S29-5 的「并列 ord 降序」重排已撤，反馈第 5 条）。
             }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
             if (!params_override) cache_.put(cache_key, results, *terms);
         }
@@ -1035,9 +1035,13 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
 
     auto fetch = [&](std::size_t k_req) -> FetchOut {
         // S27-3 Slice B2a：逐段逐字段 + boost 累加（同 fields_ 逻辑，换段集源）。
-        std::unordered_map<std::uint64_t, double> acc;
+        // 按 LSN 累加（一个文档只在一个段）；记其 (段次序, 段内 docid) 作全序的
+        // 平局键——与 sort_truncate 同序（反馈第 5 条）。
+        struct Acc { double score = 0.0; std::size_t seg = 0; std::uint64_t docid = 0; };
+        std::unordered_map<std::uint64_t, Acc> acc;
         auto seg_views = collect_multi_field_segment_views();
-        for (const auto& sv : seg_views) {
+        for (std::size_t si = 0; si < seg_views.size(); ++si) {
+            const auto& sv = seg_views[si];
             for (const auto& fv : sv.fields) {
                 auto fbi = by_field.find(std::string(fv.field_name));
                 if (fbi == by_field.end()) continue;
@@ -1052,27 +1056,36 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
                 for (auto& [boost, gterms] : boost_groups) {
                     auto res = fv.inv->search(gterms, k_req, *sv.seg, params_override);
                     for (auto& r : res) {
-                        acc[sv.seg->lsn_at(r.ord)] += static_cast<double>(r.score) * boost;
+                        auto& a = acc[sv.seg->lsn_at(r.ord)];
+                        a.score += static_cast<double>(r.score) * boost;
+                        a.seg = si;
+                        a.docid = r.ord;
                     }
                 }
             }
         }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
 
-        std::vector<std::pair<std::uint64_t,double>> ranked(acc.begin(), acc.end());
+        std::vector<std::pair<std::uint64_t, Acc>> ranked(acc.begin(), acc.end());
         std::partial_sort(ranked.begin(),
                           ranked.begin() +
                               static_cast<std::ptrdiff_t>(std::min(k_req, ranked.size())),
                           ranked.end(),
                           [](const auto& a, const auto& b) {
-                              // 全序：分数降序、并列 ord 降序（同 sort_truncate）。
-                              if (a.second != b.second) return a.second > b.second;
-                              return a.first > b.first;
+                              // 全序：分数降序, 段次序, 段内 docid 升序。
+                              if (a.second.score != b.second.score) {
+                                  return a.second.score > b.second.score;
+                              }
+                              if (a.second.seg != b.second.seg) {
+                                  return a.second.seg < b.second.seg;
+                              }
+                              return a.second.docid < b.second.docid;
                           });
         if (ranked.size() > k_req) ranked.resize(k_req);
 
         std::vector<SearchHit> hits;
         hits.reserve(std::min(k, ranked.size()));
-        for (auto& [ord, score] : ranked) {
+        for (auto& [ord, a] : ranked) {
+            const double score = a.score;
             if (hits.size() >= k) break;
             if (!docs_.is_live(ord)) continue;  // B2a：全局兜底（S18-8 段级盲区）
             if (filter && !docs_.eval_meta(ord, *filter)) continue;
@@ -1112,11 +1125,7 @@ TextPlugin::search_text_highlight(std::string_view query, std::size_t k,
             for (const auto& h : hh) {
                 results.push_back({h.ord, static_cast<float>(h.score)});
             }
-            std::sort(results.begin(), results.end(),
-                      [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
-                          if (a.score != b.score) return a.score > b.score;
-                          return a.ord > b.ord;
-                      });
+            // 已按全序给出，不重排（同 search_text）。
         }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
         cache_.put(cache_key, results, terms);
     }
