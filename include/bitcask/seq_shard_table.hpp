@@ -196,6 +196,10 @@ public:
         }
         ~WriteSection() {
             if (--t_.write_depth_ == 0) {
+                // values_ 的结构变更（扩容 / 增删）全在 section 内——收尾时
+                // 把 (data, size) 发布给乐观读者（见 pub_vdata_ 注释）。
+                t_.pub_vdata_.store(t_.values_.data(), std::memory_order_relaxed);
+                t_.pub_vsize_.store(t_.values_.size(), std::memory_order_relaxed);
                 std::atomic_thread_fence(std::memory_order_release);
                 t_.seq_.fetch_add(1, std::memory_order_relaxed);  // → even
             }
@@ -223,10 +227,13 @@ public:
         if ((s1 & 1u) != 0u) return OptResult::kRetry;
 
         // 跳 1:桶块 + values 快照。bb->mask 与块自洽(self-describing);
-        // (vdata, vsize) 经 seq 验证后与 bb 同世代。
+        // (vdata, vsize) 经 seq 验证后与 bb 同世代。读发布的原子副本而非
+        // values_.data()/size()——后者是对 vector 内部指针的非原子并发读
+        // (UB),且 libstdc++ 成员函数非内联时被 TSan 插桩、不继承本函数
+        // 的豁免(TSan 实测:ConcurrentGetPutRemoveGrowStress 报 race)。
         const BucketBlock* bb = buckets_.load(std::memory_order_acquire);
-        const Pair* vdata = values_.data();
-        const std::size_t vsize = values_.size();
+        const Pair* vdata = pub_vdata_.load(std::memory_order_relaxed);
+        const std::size_t vsize = pub_vsize_.load(std::memory_order_relaxed);
         if (seq_changed(s1)) return OptResult::kRetry;
         if (bb == nullptr) return OptResult::kMiss;  // 空表(见上验证)
         const std::uint64_t mask = bb->mask;
@@ -402,7 +409,8 @@ private:
     // 逐 8 字节 __atomic_load_n(relaxed):① TBAA 豁免——曾用 uint64_t*
     // 直读,严格别名违规,GCC -O2 判定与 Bucket/string 的写不别名读到陈旧
     // 零值(单线程 100% 伪 miss,clang 恰好宽容);② 编译为普通 mov,无
-    // libcall/无拦截器;③ TSan 原生理解原子。前置:两侧 8 对齐、bytes%8==0
+    // libcall/无拦截器;③ (已证不成立,TSan 构建另走普通读,见循环内注释)。
+    // 前置:两侧 8 对齐、bytes%8==0
     // (调用点 static_assert)。relaxed 足够——序由 seq_changed 的 fence 背书。
     // (曾用 volatile 逐字节:正确但 Get 热路径 +30ns、长 key 比较 3×。)
     static inline void opt_copy_bytes(void* dst, const void* src,
@@ -424,6 +432,17 @@ private:
             static_assert(sizeof(long long) == sizeof(std::uint64_t));
             d[i] = static_cast<std::uint64_t>(__iso_volatile_load64(
                 reinterpret_cast<const volatile long long*>(s + i)));
+#elif BITCASK_TSAN_ENABLED
+            // TSan 树：原子读**不受**函数级 no_sanitize 豁免——原子操作恒经
+            // TSan 运行时记录，与写者对同一地址的普通写（桶 memcpy、string /
+            // variant 的移动赋值）配成「原子读 × 非原子写」必报 race（上面 ③
+            // 的判断不成立，ConcurrentGetPutRemoveGrowStress 实测）。写侧是
+            // 标准库类型的整体移动，无法改为逐字原子写；故 TSan 构建下改用
+            // 普通读：豁免函数内不插桩，回到评审决议 ① 的「读者整体豁免」。
+            // may_alias 规避严格别名（同 ①）；volatile 阻止循环被聚合为
+            // memcpy libcall（拦截器不吃函数级豁免）。仅 TSan 构建，性能无关。
+            typedef std::uint64_t u64_alias __attribute__((may_alias));
+            d[i] = *reinterpret_cast<const volatile u64_alias*>(s + i);
 #else
             d[i] = __atomic_load_n(s + i, __ATOMIC_RELAXED);
 #endif
@@ -562,6 +581,12 @@ private:
     std::atomic<BucketBlock*> buckets_{nullptr};
     std::atomic<std::uint64_t> seq_{0};
     std::size_t write_depth_ = 0;  // WriteSection 嵌套深度(写者串行,普通成员)
+    // 乐观读者专用的 values_ (data, size) 发布副本:最外层 WriteSection 收尾
+    // 时(even-bump 的 release fence 之前)写入,读者 relaxed 载入、由 seq
+    // 校验背书同世代——与桶块指针同一套 seqlock 论证,但全程原子,不再
+    // 并发读 std::vector 的内部字段。加锁路径照旧直接用 values_。
+    std::atomic<const Pair*> pub_vdata_{nullptr};
+    std::atomic<std::size_t> pub_vsize_{0};
 };
 
 }  // namespace bitcask::detail
