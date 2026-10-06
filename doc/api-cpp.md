@@ -496,10 +496,11 @@ S13-D1 批量写（语义同 `put` 的 KV 路径）。整批一次提交：记�
 
 ```cpp
 struct BatchOp {
-    enum class Type : std::uint8_t { kPut = 0, kRemove = 1 };
+    enum class Type : std::uint8_t { kPut = 0, kRemove = 1, kPutDoc = 2 };
     Type type;
     std::span<const std::byte> key;
-    std::span<const std::byte> value{};   // kRemove 忽略
+    std::span<const std::byte> value{};   // kRemove / kPutDoc 忽略
+    const DocInput* doc = nullptr;        // kPutDoc 必填，其余忽略
 };
 [[nodiscard]] std::expected<void, CaskFault>
 put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp = 0);
@@ -509,6 +510,7 @@ put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp = 0);
 
 - **崩溃/掉电后整批要么全可见要么全不可见**——盘上 `kBatchHeader` 声明成员区间，恢复时区间不完整 ⟹ 整批截断（等价于从未写过）。
 - 支持批内 REMOVE；批内 op 依序 apply（同 key 多次 = 批内 LWW）。
+- 支持批内结构化文档（`kPutDoc`，下游反馈 2026-10-06）：编码、向量归一化、字段 intern、索引登记（text / fields / vector / meta）与 `put_doc` 逐项相同，`expiry_at` 同样生效——文档与它的二级索引项可同批落盘。`doc == nullptr` / 向量维度错 / 未知 op → `kInvalidOption`，零副作用（字段名 intern 推迟到全批校验通过之后）。
 - **首次调用把目录 meta 懒升级为 v6**：旧于 5.1.0 的读端拒开该目录（`unsupported meta version`）。从不调用本方法的目录停留 v5（保守纪元标记）。
 - durability 与 `put_batch` 相同（`o_sync` / `sync_every_n` / caller `sync()`）——原子性与持久性正交：未 fsync 掉电可能整批丢失，但绝不半批。
 - 线程安全：是（同 `put_batch`，内部 `write_mu_`）。
@@ -536,10 +538,11 @@ put_doc(std::span<const std::byte> key, const DocInput& doc,
 
 ```cpp
 struct TxnOp {
-    enum class Type : std::uint8_t { kPut = 0, kRemove = 1 };
+    enum class Type : std::uint8_t { kPut = 0, kRemove = 1, kPutDoc = 2 };
     Type type;
     std::span<const std::byte> key;
-    std::span<const std::byte> value{};   // kRemove 忽略
+    std::span<const std::byte> value{};   // kRemove / kPutDoc 忽略
+    const DocInput* doc = nullptr;        // kPutDoc 必填（语义同 BatchOp::kPutDoc）
 };
 enum class TxnSyncPolicy : std::uint8_t { kSyncOnCommit = 0, kNone = 1 };
 
