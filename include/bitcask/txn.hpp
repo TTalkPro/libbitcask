@@ -20,12 +20,14 @@
 
 namespace bitcask {
 
-// 事务操作。kRemove 忽略 value。
+// 事务操作。kRemove 忽略 value。kPutDoc 写结构化文档（语义同
+// Cask::BatchOp::kPutDoc / put_doc），忽略 value，doc 必填。
 struct TxnOp {
-    enum class Type : std::uint8_t { kPut = 0, kRemove = 1 };
+    enum class Type : std::uint8_t { kPut = 0, kRemove = 1, kPutDoc = 2 };
     Type type = Type::kPut;
     std::span<const std::byte> key;
     std::span<const std::byte> value{};
+    const DocInput* doc = nullptr;  // kPutDoc 必填，其余类型忽略
 };
 
 // 提交点 fsync 策略（模式文档 §2.4）。

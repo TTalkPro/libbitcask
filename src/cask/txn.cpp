@@ -15,6 +15,13 @@
 
 namespace bitcask {
 
+static_assert(static_cast<int>(TxnOp::Type::kPut) ==
+              static_cast<int>(Cask::BatchOp::Type::kPut));
+static_assert(static_cast<int>(TxnOp::Type::kRemove) ==
+              static_cast<int>(Cask::BatchOp::Type::kRemove));
+static_assert(static_cast<int>(TxnOp::Type::kPutDoc) ==
+              static_cast<int>(Cask::BatchOp::Type::kPutDoc));
+
 std::expected<void, CaskFault> TxnCask::apply(std::span<const TxnOp> ops) {
     // S35：一次引擎原子批（doc/atomic-batch-design-zh.md）——跨崩溃
     // all-or-nothing 由引擎批头保证，PUT/REMOVE 同批依序 apply。
@@ -22,10 +29,11 @@ std::expected<void, CaskFault> TxnCask::apply(std::span<const TxnOp> ops) {
     batch.reserve(ops.size());
     for (const auto& op : ops) {
         Cask::BatchOp b;
-        b.type = op.type == TxnOp::Type::kPut ? Cask::BatchOp::Type::kPut
-                                              : Cask::BatchOp::Type::kRemove;
+        // 两枚举数值逐一对齐（见下方 static_assert）；越界值由引擎校验拒绝。
+        b.type = static_cast<Cask::BatchOp::Type>(op.type);
         b.key = op.key;
         b.value = op.value;
+        b.doc = op.doc;
         batch.push_back(b);
     }
     return cask_->put_batch_atomic(batch);

@@ -670,12 +670,18 @@ public:
     //   目录（unsupported meta version）。从不调用本方法的目录停留 v5。
     // - durability 与 put_batch 相同（o_sync / sync_every_n / caller sync()）；
     //   原子性与持久性正交——未 fsync 掉电可能整批丢失，但绝不半批。
+    // - kPutDoc（下游反馈 2026-10-06）：批内写结构化文档——编码、向量归一化、
+    //   字段 intern、索引登记（text / fields / vector / meta）与 put_doc 逐项
+    //   相同，expiry_at 同样生效；value 被忽略，doc 必填（nullptr →
+    //   kInvalidOption，零副作用）。用途：文档与它的二级索引项同批落盘。
     // 线程安全: **是**（同 put_batch，内部 write_mu_）。
     struct BatchOp {
-        enum class Type : std::uint8_t { kPut = 0, kRemove = 1 };
+        enum class Type : std::uint8_t { kPut = 0, kRemove = 1, kPutDoc = 2 };
         Type type = Type::kPut;
         std::span<const std::byte> key;
-        std::span<const std::byte> value{};   // kRemove 忽略
+        std::span<const std::byte> value{};   // kRemove / kPutDoc 忽略
+        // kPutDoc 必填，其余类型忽略。借调用方存储，调用期间有效即可。
+        const DocInput* doc = nullptr;
     };
     [[nodiscard]] std::expected<void, CaskFault>
     put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp = 0);

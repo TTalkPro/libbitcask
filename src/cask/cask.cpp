@@ -2105,6 +2105,58 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
     return {};
 }
 
+namespace {
+// put_doc 与 put_batch_atomic(kPutDoc) 共用：由 DocInput 组装索引 Add 任务
+// （text / fields / vector / meta）。vec_out 是 prepare_vector 的结果——
+// 指向 vec_norm（cosine 归一化）时直接移交缓冲，否则拷贝。
+IndexTask make_doc_add_task(std::span<const std::byte> key, const DocInput& doc,
+                            std::uint64_t ord, std::uint32_t file_id,
+                            std::uint64_t offset, std::uint32_t total_size,
+                            std::uint64_t tstamp,
+                            std::span<const float> vec_out,
+                            std::vector<float>& vec_norm) {
+    auto task = IndexTask::make(
+        IndexOp::Add, bytes_to_view(key), ord,
+        std::string_view(reinterpret_cast<const char*>(doc.text.data()),
+                         doc.text.size()),
+        file_id, offset, total_size, tstamp, 0);
+    // S10-A5:多字段名+值打包进单个 fields_store（一次分配替代 2×num_fields
+    // 次 string 分配）。fields 持 string_view 借自 fields_store；vector<char>
+    // move = 指针转移 → view 跨 IndexTask 移动仍有效。
+    if (!doc.fields.empty()) {
+        std::size_t total = 0;
+        for (const auto& [name, val] : doc.fields) total += name.size() + val.size();
+        std::vector<char> store;
+        store.reserve(total);
+        std::vector<std::pair<std::string_view, std::string_view>> views;
+        views.reserve(doc.fields.size());
+        for (const auto& [name, val] : doc.fields) {
+            auto name_off = store.size();
+            store.insert(store.end(), name.begin(), name.end());
+            auto val_off = store.size();
+            store.insert(store.end(),
+                         reinterpret_cast<const char*>(val.data()),
+                         reinterpret_cast<const char*>(val.data()) + val.size());
+            views.emplace_back(
+                std::string_view(store.data() + name_off, name.size()),
+                std::string_view(store.data() + val_off, val.size()));
+        }
+        task.fields_store = std::move(store);
+        task.fields = std::move(views);
+    }
+    // W2:cosine 路径 vec_out 是 vec_norm 的 span，encode 已用完，可直接移交，
+    // 省一次 512B（128-dim）拷贝 + 分配。其余情形（passthrough / L2）
+    // vec_out 指向 doc.vector，仍需拷贝。
+    if (!vec_out.empty() && vec_out.data() == vec_norm.data()) {
+        task.vec = std::move(vec_norm);
+    } else if (!vec_out.empty()) {
+        task.vec.assign(vec_out.begin(), vec_out.end());
+    }
+    task.meta.assign(doc.meta.begin(), doc.meta.end());
+    return task;
+}
+}  // namespace
+
 // S35：跨崩溃原子批（doc/atomic-batch-design-zh.md）。流程 = put_batch 的
 // 超集：全批校验 → **meta 懒升 v6**（首个批字节落盘前）→ roll → 批头
 // （kBatchHeader，声明成员区间）+ 成员逐条 write_buffered → 一次 flush
@@ -2124,8 +2176,51 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
         return std::unexpected(err(CaskError::kInvalidOption, "batch too large"));
     }
 
-    // ① 全批前置校验 + 成员 value 预编码（span_bytes 需要精确的编码后
-    //    长度；arena 一次分配，(off,len) 索引）。校验失败零副作用。
+    // ①a 全批前置校验（含 kPutDoc 的向量校验/归一化——纯计算）。校验失败
+    //     零副作用：字段 intern（会追加 field.schema）推迟到 ①b，全批校验
+    //     通过之后。
+    // kPutDoc 向量归一化缓冲：prepare_vector 的输出可能指向其中，须活到
+    // ⑦ 索引任务提交。仅批内含文档时分配。
+    std::vector<std::vector<float>> vec_norms;
+    std::vector<std::span<const float>> vec_outs;
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        const auto& op = ops[i];
+        if (op.key.size() > format::kMaxKeySize) {
+            return std::unexpected(err(CaskError::kKeyTooLarge));
+        }
+        switch (op.type) {
+            case BatchOp::Type::kPut:
+                if (op.value.size() > format::kMaxValueSize) {
+                    return std::unexpected(err(CaskError::kValueTooLarge));
+                }
+                break;
+            case BatchOp::Type::kRemove:
+                break;
+            case BatchOp::Type::kPutDoc: {
+                if (!op.doc) {
+                    return std::unexpected(err(CaskError::kInvalidOption,
+                                               "batch kPutDoc op without doc"));
+                }
+                if (op.doc->text.size() > format::kMaxValueSize) {
+                    return std::unexpected(err(CaskError::kValueTooLarge));
+                }
+                if (vec_norms.empty()) {
+                    vec_norms.resize(ops.size());
+                    vec_outs.resize(ops.size());
+                }
+                auto v = prepare_vector(op.doc->vector, vec_norms[i]);
+                if (!v) return std::unexpected(v.error());
+                vec_outs[i] = *v;
+                break;
+            }
+            default:
+                return std::unexpected(err(CaskError::kInvalidOption,
+                                           "unknown batch op type"));
+        }
+    }
+
+    // ①b 成员 value 预编码（span_bytes 需要精确的编码后长度；arena 一次
+    //     分配，(off,len) 索引）。kPutDoc 编码同 put_doc。
     thread_local std::vector<std::byte> arena;
     arena.clear();
     struct EncodedVal {
@@ -2135,21 +2230,30 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
     std::vector<EncodedVal> vals;
     vals.reserve(ops.size());
     std::uint64_t span_bytes = 0;
-    for (const auto& op : ops) {
-        if (op.key.size() > format::kMaxKeySize) {
-            return std::unexpected(err(CaskError::kKeyTooLarge));
-        }
-        if (op.type == BatchOp::Type::kPut) {
-            if (op.value.size() > format::kMaxValueSize) {
-                return std::unexpected(err(CaskError::kValueTooLarge));
-            }
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        const auto& op = ops[i];
+        if (op.type == BatchOp::Type::kRemove) {
+            vals.push_back({0, 0});  // 墓碑成员 v0：空 value
+        } else {
             const std::size_t off = arena.size();
             codec::DocValueParts parts;
-            parts.text = op.value;
+            if (op.type == BatchOp::Type::kPut) {
+                parts.text = op.value;
+            } else {
+                const DocInput& doc = *op.doc;
+                parts.text = doc.text;
+                parts.expiry_at = doc.expiry_at;
+                if (!doc.meta.empty()) parts.meta = doc.meta;
+                if (!vec_outs[i].empty()) {
+                    parts.vector = vec_outs[i];
+                    parts.vec_quantized = meta_config_.vector_quantized;
+                }
+                for (const auto& [name, val] : doc.fields) {
+                    parts.fields.push_back({field_schema_.intern(name), val});
+                }
+            }
             codec::encode_doc_value(arena, parts);
             vals.push_back({off, arena.size() - off});
-        } else {
-            vals.push_back({0, 0});  // 墓碑成员 v0：空 value
         }
         span_bytes += format::kHeaderSize + op.key.size() + vals.back().len;
     }
@@ -2225,7 +2329,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
         const std::uint64_t ord = keydir_->alloc_ord();
         og.ords.push_back(ord);
         og.done.push_back(0);
-        const bool is_put = ops[i].type == BatchOp::Type::kPut;
+        const bool is_put = ops[i].type != BatchOp::Type::kRemove;
         const std::span<const std::byte> val =
             is_put ? std::span<const std::byte>(arena.data() + vals[i].off,
                                                 vals[i].len)
@@ -2280,6 +2384,11 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
                 submit_index_task(IndexTask::make(
                     IndexOp::Delete, bytes_to_view(ops[t.op].key), t.rec.ord,
                     {}, 0, 0, 0, tstamp, 0));
+            } else if (ops[t.op].type == BatchOp::Type::kPutDoc) {
+                submit_index_task(make_doc_add_task(
+                    ops[t.op].key, *ops[t.op].doc, t.rec.ord, t.rec.file_id,
+                    t.rec.offset, t.rec.total_size, tstamp, vec_outs[t.op],
+                    vec_norms[t.op]));
             } else {
                 submit_index_task(IndexTask::make(
                     IndexOp::Add, bytes_to_view(ops[t.op].key), t.rec.ord,
@@ -2292,7 +2401,6 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
         }
         tasks.clear();
     };
-    thread_local std::vector<std::byte> encoded_retry;
     bool retried = false;
     for (std::size_t i = 0; i < ops.size(); ++i) {
         const std::size_t slot0 = i + 1;  // og 槽位（0 是批头）
@@ -2311,15 +2419,13 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
                             batch_file};
         std::size_t slot = slot0;
         if (pr == keydir::PutResult::kAlreadyExists) {
-            // merge race：单条重写（区间之外的独立完整记录，正确）。
-            encoded_retry.clear();
-            encoded_retry.reserve(ops[i].value.size() + 16);
-            codec::DocValueParts parts;
-            parts.text = ops[i].value;
-            codec::encode_doc_value(encoded_retry, parts);
+            // merge race：单条重写（区间之外的独立完整记录，正确）。复用
+            // ①b 的预编码 value（kPutDoc 的 meta/vector/fields 一并保留）。
+            const std::span<const std::byte> val(arena.data() + vals[i].off,
+                                                 vals[i].len);
             std::vector<std::byte> record;
             codec::encode_data_record(record, format::RecordType::kDoc, tstamp,
-                                      /*ord 占位*/ 0, ops[i].key, encoded_retry);
+                                      /*ord 占位*/ 0, ops[i].key, val);
             const std::uint64_t ord2 = keydir_->alloc_ord();
             OrdSkipGuard g2(this, ord2);
             auto p2 = write_and_keydir(ops[i].key, record, tstamp, ord2);
@@ -2447,29 +2553,6 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
             p.fields.push_back({field_schema_.intern(name), val});
         }
     };
-    // S10-A5:多字段名+值打包进单个 fields_store（一次分配替代 2×num_fields 次 string 分配）。
-    // fields 持 string_view 借自 fields_store；vector<char> move = 指针转移 → view 跨 IndexTask 移动仍有效。
-    auto pack_fields = [&doc]() {
-        std::size_t total = 0;
-        for (const auto& [name, val] : doc.fields) total += name.size() + val.size();
-        std::vector<char> store;
-        store.reserve(total);
-        std::vector<std::pair<std::string_view, std::string_view>> views;
-        views.reserve(doc.fields.size());
-        for (const auto& [name, val] : doc.fields) {
-            auto name_off = store.size();
-            store.insert(store.end(), name.begin(), name.end());
-            auto val_off = store.size();
-            store.insert(store.end(),
-                         reinterpret_cast<const char*>(val.data()),
-                         reinterpret_cast<const char*>(val.data()) + val.size());
-            views.emplace_back(
-                std::string_view(store.data() + name_off, name.size()),
-                std::string_view(store.data() + val_off, val.size()));
-        }
-        return std::pair{std::move(store), std::move(views)};
-    };
-
     // V3.1:向量校验 + cosine 写入归一化(存储即归一化值,merge/恢复
     // 不再重算;hnsw-design §1)。归一化缓冲在双编码点(roll 重试)间复用。
     std::vector<float> vec_norm;
@@ -2510,27 +2593,9 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
 
     // H1(不变):任务构造(fields 打包、vec 移交、meta 拷贝)与提交在锁外。
     const PersistedRecord rec = *persisted;
-    auto task = IndexTask::make(
-        IndexOp::Add, bytes_to_view(key), rec.ord,
-        std::string_view(reinterpret_cast<const char*>(doc.text.data()),
-                         doc.text.size()),
-        rec.file_id, rec.offset, rec.total_size, tstamp, 0);
-    // S10-A5:多字段打包进 fields_store（一次分配），替代旧 task_fields() 的 N×2 string 拷贝。
-    {
-        auto [store, views] = pack_fields();
-        task.fields_store = std::move(store);
-        task.fields = std::move(views);
-    }
-    // W2:cosine 路径 vec_out 是 vec_norm 的 span，encode（上方 parts.vector）
-    // 已用完，可直接移交，省一次 512B（128-dim）拷贝 + 分配。其余情形
-    // （passthrough / L2）vec_out 指向 doc.vector，仍需拷贝。
-    if (!vec_out.empty() && vec_out.data() == vec_norm.data()) {
-        task.vec = std::move(vec_norm);
-    } else if (!vec_out.empty()) {
-        task.vec.assign(vec_out.begin(), vec_out.end());
-    }
-    task.meta.assign(doc.meta.begin(), doc.meta.end());
-    submit_index_task(std::move(task));
+    submit_index_task(make_doc_add_task(key, doc, rec.ord, rec.file_id,
+                                        rec.offset, rec.total_size, tstamp,
+                                        vec_out, vec_norm));
     maybe_submit_auto_checkpoint();  // S14-1（锁外）
     maybe_flush_oki_unlocked();  // S36-4/5：memdelta 阈值（锁外站点包装）
     if (req.post_err) return std::unexpected(*req.post_err);  // 旧组提交语义
