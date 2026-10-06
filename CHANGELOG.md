@@ -14,6 +14,61 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ---
 
+## [Unreleased]（meta filter：补取到 k · 全部文本检索收 filter · 迭代器交出 meta / 按 meta 筛选）
+
+> 来源：下游 bitcask（Erlang 封装）`feedbacks/2026-10-06-meta-filter-query-gaps.md`。
+> C++ 层只加带默认值的末位形参 / 新成员；C API **纯加法**（14 个新符号 + 2 个新结构体，
+> 既有函数签名与结构体布局都没动）；盘上格式未动。
+
+### Fixed
+
+- **带 meta filter 的检索不再静默少返回**（反馈第 1 条，🔴）。原先 filter 非空时
+  只多取一轮固定 `max(k×4, 64)` 个候选再后过滤，候选不够就直接少返回：1000 篇里
+  100 篇满足 filter，`search_text(K=10)` 只回 6 条，K=50 回 20 条。现改为循环补取——
+  命中不足 k 时把候选数翻倍重取，直到凑满 k 或候选穷尽（候选数 < 请求数）。
+  返回少于 k 条即「满足条件的就这么多」。查询缓存键本就含候选数，各轮各占一条
+  缓存，不互相污染。同一循环也兜住了无 filter 时段级判活漏掉宿主墓碑导致的缺额
+  （正常情况首轮即满足，不多付成本）。
+  影响面：`search_text` / `search_text_batch` / `search_hybrid` 的文本路
+  （`HybridSearcher` 经 `search_text` 拿 K' 条通过 filter 的命中）、带 `offset` 的分页。
+- **未修：同分命中的 top-K 不前缀稳定**（反馈第 5 条）。进入 top-K 的同分文档由段内
+  内核的扫描 / 剪枝次序与 `multi_segment_search` 的 key 升序决定，输出却重排为「同分
+  ord 降序」——小 K 结果不是大 K 结果的前缀，offset 分页在同分处会翻出重复页。只改
+  截取或输出一处的平局键不够（内核堆本身「先到先留、最小 ord 先逐出」，取舍不一致）。
+  评估过「边界同分即补取到整组同分取全」的修法：结果精确、不动内核，但无 filter
+  查询实测慢 1.8×（自然语料 843→1503 µs）~4.9×（短标题 159→770 µs），未采纳；
+  改为另案统一内核平局规则（分数降序、段内 docid 升序）。本批 `search_fields` 的排序
+  补上同分 ord 降序（此前 partial_sort 无平局键，同分序不确定）。
+
+### Added
+
+- **`search_phrase` / `bool_search` / `search_fields` / `search_near` /
+  `search_fuzzy` / `search_wildcard` 收 `const meta::MetaFilter* filter = nullptr`**
+  （反馈第 3 条）：`Cask`、`text::Searcher`、`TextPlugin` 三层都加在末位，语义与补取
+  策略同 `search_text`。`search_fields` 原先先截到 k 再判活，判活丢掉的也会缺额，
+  一并纳入补取。
+- **迭代器可交出 meta**（反馈第 2 条）：`CaskIter::Entry` / `CaskRangeIter::Entry`
+  新增 `meta`（原样 blob，不解码）。`CaskIter::set_want_meta(true)` /
+  `RangeOptions::want_meta = true` 时才填，默认不付拷贝。meta 与 value 出自同一次
+  读——下游不必再逐行补 `get`，也不会拿到 A 版本 text 配 B 版本 meta。
+- **迭代器按 meta 筛选**（反馈第 4 条）：`CaskIter::set_filter(&f)` /
+  `RangeOptions::filter = &f`，C++ 侧逐条 `MetaFilter::evaluate`，不通过的连 value
+  都不拷。无 meta 的不通过（与检索侧同语义）；`see_tombstones=true` 时墓碑照常交出。
+  合用即「只按 meta 筛选的有序扫描」：`make_range_iter({.lo, .hi, .want_meta = true,
+  .filter = &f})`；无 OKI 的句柄用 `CaskIter` 全表版。
+  `CaskRangeIter` 取值改走零拷贝 `get` 视图（原 `get_owned` 先整份拷出），filter 在
+  视图上求值。
+- **C API 跟进 filter 与 want_meta**（纯加法）：
+  - 检索：`bitcask_search_phrase_filtered` / `bitcask_bool_search_filtered`（兼收 `offset`）、
+    `bitcask_search_fields_filtered` / `_near_filtered` / `_fuzzy_filtered` / `_wildcard_filtered`。
+  - 迭代：`bitcask_iter_start_ex` / `bitcask_range_iter_start_ex` 收 `want_meta` + `filter`
+    （过滤树由迭代器句柄持有）；新结构体 `bitcask_iter_entry_ex_t` / `bitcask_range_entry_ex_t`
+    （`base` 内嵌既有条目 + `meta` 切片）配 `*_next_ex` / `*_next_batch_ex` / `*_entry_ex_free`。
+    既有条目结构由调用方分配、布局不能改，故走新类型。
+  - 既有 `bitcask_iter_start_prefix` / `bitcask_range_iter_start` 改为转调 `_ex`（行为不变）。
+
+---
+
 ## [6.6.0] - 2026-09-23（search 库开库内存 + 进程级线程数上限）
 
 > **版本语义**：C API **纯加法**（4 个新符号 + 1 个新结构体，既有函数签名与

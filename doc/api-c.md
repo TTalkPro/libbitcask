@@ -1238,6 +1238,37 @@ if (bitcask_range_iter_start(cask, &ro, &it, &fault) == BITCASK_OK) {
 }
 ```
 
+### 11.8 迭代时交出 meta / 按 meta 筛选（下游反馈 2026-10-06）
+
+```c
+typedef struct { bitcask_iter_entry_t  base; bitcask_slice_t meta; } bitcask_iter_entry_ex_t;
+typedef struct { bitcask_range_entry_t base; bitcask_slice_t meta; } bitcask_range_entry_ex_t;
+
+BITCASK_API bitcask_error_t bitcask_iter_start_ex(
+    bitcask_t* cask, int maxage, int maxputs, int see_tombstones,
+    bitcask_slice_t key_prefix, int want_meta,
+    const bitcask_meta_filter_t* filter,
+    bitcask_iter_t** out, bitcask_fault_t* fault);
+BITCASK_API int  bitcask_iter_next_ex(bitcask_iter_t*, bitcask_iter_entry_ex_t*, bitcask_fault_t*);
+BITCASK_API int  bitcask_iter_next_batch_ex(bitcask_iter_t*, bitcask_iter_entry_ex_t*, size_t max_n, bitcask_fault_t*);
+BITCASK_API void bitcask_iter_entry_ex_free(bitcask_iter_entry_ex_t*);
+
+BITCASK_API bitcask_error_t bitcask_range_iter_start_ex(
+    bitcask_t* cask, const bitcask_range_options_t* opts, int want_meta,
+    const bitcask_meta_filter_t* filter,
+    bitcask_range_iter_t** out, bitcask_fault_t* fault);
+BITCASK_API int  bitcask_range_iter_next_ex(bitcask_range_iter_t*, bitcask_range_entry_ex_t*, bitcask_fault_t*);
+BITCASK_API int  bitcask_range_iter_next_batch_ex(bitcask_range_iter_t*, bitcask_range_entry_ex_t*, size_t max_n, bitcask_fault_t*);
+BITCASK_API void bitcask_range_entry_ex_free(bitcask_range_entry_ex_t*);
+```
+
+- 既有条目 / 选项结构由调用方分配、布局不能改，故以「`base` 内嵌 + 追加 `meta`」的新类型承载，全部为 additive 新符号。
+- `want_meta` 非 0：`meta` 填 DocValue 的 meta 段原样 blob（不解码；可用 §10.4 的 `bitcask_meta_lookup` / `bitcask_meta_iter_*` 读），与 `value` 出自**同一条记录**——不必逐条补 `bitcask_get`，也没有 text 与 meta 版本错配。无 meta / 纯 KV / 墓碑 / 未开 `want_meta` 时为 `{NULL, 0}`。
+- `filter` 非 NULL：只交出 meta 满足条件的条目（引擎侧逐条求值，不通过的不读出 value）；无 meta 的不通过（同检索侧）；非法 → `BITCASK_ERR_INVALID_OPTION`。过滤树在调用期间转换并由迭代器句柄持有，返回后 C 侧存储即可释放。只作用于活条目：`see_tombstones` 时墓碑照常交出。
+- 合用即「只按 meta 筛选的扫描」：有序 `[lo, hi)` 用 `bitcask_range_iter_start_ex`（需 OKI）；无 OKI 的句柄用 `bitcask_iter_start_ex` 全表版。
+- `*_next_ex` / `*_next_batch_ex` 返回码与错误释放契约同非 ex 版；同一迭代器混调旧 `*_next` 合法（meta 被丢弃）。ex 条目用 `*_entry_ex_free` 释放（连同 `base` 的 key/value）。
+- 释放迭代器仍用 `bitcask_iter_release` / `bitcask_range_iter_release`。`want_meta = 0` 且 `filter = NULL` 时与非 ex 版完全等价。
+
 ---
 
 ## 12. 状态与合并管理
@@ -1378,6 +1409,7 @@ BITCASK_API bitcask_error_t bitcask_search_text_filtered(
 - `filter == NULL` → 退化为 `bitcask_search_text`。
 - `filter` 非法（`key == NULL`、`STRING` 值缺 `str`、嵌套深度 > 32、`op`/`type` 越界）→ `BITCASK_ERR_INVALID_OPTION`。
 - **注意**：`filter` 非空时**没有 meta 段的文档一律不通过**（引擎"空 blob 不通过"约定，与 C++ `MetaFilter` 行为一致）——含 `Neq`/`Exists` 等否定式条件。
+- **补取**（下游反馈 2026-10-06）：后过滤后命中不足 `k` 时引擎自动加大候选数重取，直到凑满 `k` 或候选穷尽——**返回少于 `k` 条即满足条件的就这么多**（此前只多取一轮 `max(k×4, 64)`，严 filter 下静默少返回）。全部带 filter 的文本检索与 hybrid 文本路同此语义。
 
 ### 13.3 `bitcask_search_text_batch`（批量词袋）
 
@@ -1516,6 +1548,39 @@ BITCASK_API bitcask_error_t bitcask_bool_search_ex(
 - ⚠️ `filter` 非空时——**哪怕是一棵空树**——没有 meta 段的文档一律不通过（引擎
   「空 blob 不通过」约定）。要分页又要过滤，文档必须带 meta（见 [§10.4](#104-meta-blob-编解码s39)）。
 
+### 13.12b 其余文本检索的 meta 过滤版（下游反馈 2026-10-06）
+
+```c
+BITCASK_API bitcask_error_t bitcask_search_phrase_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+BITCASK_API bitcask_error_t bitcask_bool_search_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+BITCASK_API bitcask_error_t bitcask_search_fields_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+BITCASK_API bitcask_error_t bitcask_search_near_filtered(
+    bitcask_t* cask, const char* query, uint32_t slop, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+BITCASK_API bitcask_error_t bitcask_search_fuzzy_filtered(
+    bitcask_t* cask, const char* query, size_t k, uint32_t max_edit_distance,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+BITCASK_API bitcask_error_t bitcask_search_wildcard_filtered(
+    bitcask_t* cask, const char* pattern, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+```
+
+- additive 新符号，既有签名零改动。`filter` 语义、非法判据、补取行为同 [§13.2](#132-bitcask_search_text_filtered词袋--meta-过滤)；`filter == NULL` 等价无过滤版。
+- phrase / bool 的过滤版同时收 `offset`（是同名 `_ex` 的超集）；其余四个 C++ 侧本无 `offset`，故不收。
+- 结果所有权同 §13.10：`bitcask_search_result_free`。
+
 ### 13.13 `bitcask_search_text_highlight`（词袋 + 高亮片段，S39）
 
 ```c
@@ -1650,7 +1715,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 |--------------------------|--------|------|------|
 | `bitcask_open` → `bitcask_t*` | `bitcask_close` | `delete` 句柄包装（内部先调 `Cask::close()`）| 同一 handle 必须恰好 1 次 `close`；句柄指针之后失效 |
 | `bitcask_get` → `bitcask_get_result_t*` | `bitcask_get_result_free` | 依次 `free(value.data)` / `free(meta.data)` / `free(vector)`，最后 `free(result)` | 仅在 `BITCASK_OK` 时有效；`BITCASK_ERR_NOT_FOUND` 时 `*out = NULL` 不需 free |
-| `bitcask_search_*`（单查询）→ `bitcask_search_result_t*` | `bitcask_search_result_free` | 对每个 `hits[i].key` 调 `free`，再 `free(hits)`，最后 `free(result)` | 包含 `search_text / _phrase / _bool / _fields / _near / _fuzzy / _wildcard / _vector / _hybrid`、对应 `_filtered`，以及 S39 新增的 `_text_ex / _phrase_ex / bool_search_ex` 共 15 个单查询入口（高亮版另有自己的 free，见上一行） |
+| `bitcask_search_*`（单查询）→ `bitcask_search_result_t*` | `bitcask_search_result_free` | 对每个 `hits[i].key` 调 `free`，再 `free(hits)`，最后 `free(result)` | 包含 `search_text / _phrase / _bool / _fields / _near / _fuzzy / _wildcard / _vector / _hybrid`、对应 `_filtered`，以及 S39 新增的 `_text_ex / _phrase_ex / bool_search_ex`、反馈 2026-10-06 新增的 `_phrase / bool_search / _fields / _near / _fuzzy / _wildcard` 六个 `_filtered`，共 21 个单查询入口（高亮版另有自己的 free，见上一行） |
 | `bitcask_search_text_highlight` → `bitcask_search_result_ex_t*` | `bitcask_search_result_ex_free` | 逐 hit `free(key)` + 逐片段 `free(text)` + `free(highlights)`，再 `free(hits)`、`free(result)` | **不可**用 `bitcask_search_result_free` 释放（结构不同）|
 | `bitcask_meta_encode` → `bitcask_slice_t.data` | `bitcask_meta_blob_free` | `free(blob->data)` 并清零（幂等，接受 `NULL`）| `n == 0` 时返回空 blob，无需 free |
 | `bitcask_search_*_batch` → `bitcask_search_result_t**` | `bitcask_search_result_batch_free` | 逐元素调 `bitcask_search_result_free`（`NULL` no-op），最后 `free(results)` | 适用于 `search_text_batch / _vector_batch / _hybrid_batch` |

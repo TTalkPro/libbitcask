@@ -67,13 +67,17 @@ struct bitcask_impl_t {
     std::unique_ptr<bitcask::Cask> cask;
 };
 
+// 反馈 2026-10-06：filter 为 *_start_ex 转换出的 C++ 过滤树，迭代器借用其
+// 指针——声明在 iter 之前，析构序保证它比迭代器活得久。
 struct bitcask_iter_impl_t {
+    std::unique_ptr<bitcask::meta::MetaFilter> filter;
     std::unique_ptr<bitcask::CaskIter> iter;
 };
 
 // S33-6：range 迭代器句柄（CaskRangeIter 无 release()——析构即释放，
 // 见 cask.hpp 类注释；包装层与 iter 对称，便于将来加内部状态）。
 struct bitcask_range_iter_impl_t {
+    std::unique_ptr<bitcask::meta::MetaFilter> filter;
     std::unique_ptr<bitcask::CaskRangeIter> iter;
 };
 
@@ -369,6 +373,20 @@ inline bool fill_iter_entry(const bitcask::CaskIter::Entry& e,
     entry->total_sz = e.total_sz;
     entry->is_tombstone = e.is_tombstone ? 1 : 0;
     entry->ord = e.ord;
+    return true;
+}
+
+// 反馈 2026-10-06：ex 条目的 meta 段填充（malloc；空 meta → {NULL,0}）。
+inline bool fill_meta_slice(const std::vector<std::byte>& meta,
+                            bitcask_slice_t* out) {
+    out->data = nullptr;
+    out->size = 0;
+    if (meta.empty()) return true;
+    auto* p = std::malloc(meta.size());
+    if (!p) return false;
+    std::memcpy(p, meta.data(), meta.size());
+    out->data = p;
+    out->size = meta.size();
     return true;
 }
 

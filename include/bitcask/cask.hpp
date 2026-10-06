@@ -363,6 +363,18 @@ public:
           bool see_tombstones = false,
           std::span<const std::byte> key_prefix = {});
 
+    // 下游反馈 2026-10-06 第 2、4 条：迭代时顺带交出 / 按 meta 筛选。
+    // 两者都在 start() 前后任意时刻可设，对其后的 next() 生效。
+    //   want_meta — true 时 Entry::meta 填 DocValue 的 meta 段原样 blob（不解码；
+    //     无 meta / 纯 KV 为空）。与 value 出自**同一条记录**，不存在下游补 get
+    //     时 text 与 meta 版本错配的问题。默认 false（不付拷贝）。
+    //   filter    — 非空时只交出 meta 满足条件的条目（MetaFilter::evaluate，
+    //     无 meta 的不通过，与检索侧同语义）；不通过的条目连 value 都不拷。
+    //     借用指针：迭代期间调用方须保其存活。只作用于活条目——
+    //     see_tombstones=true 时墓碑照常交出（墓碑没有 meta 可判）。
+    void set_want_meta(bool on) noexcept { want_meta_ = on; }
+    void set_filter(const meta::MetaFilter* filter) noexcept { filter_ = filter; }
+
     // 取下一项；end-of-iteration 返回 nullopt。Entry 内部的 vector 拥有
     // 自己的存储，调用方持有期间可任意使用。
     struct Entry {
@@ -374,6 +386,7 @@ public:
         std::uint32_t total_sz = 0;
         bool is_tombstone = false;
         std::uint64_t ord = 0;
+        std::vector<std::byte> meta;  // set_want_meta(true) 时填，否则恒空
     };
     // 线程安全: 否（推进 iter_ + 内部 pread）；同一对象不可并发使用。
     [[nodiscard]] std::expected<std::optional<Entry>, CaskFault> next();
@@ -427,6 +440,8 @@ private:
     std::shared_ptr<keydir::KeyDir> keydir_pin_;
     std::unique_ptr<keydir::IterHandle> iter_;
     bool see_tombstones_ = false;
+    bool want_meta_ = false;                    // 反馈 2026-10-06
+    const meta::MetaFilter* filter_ = nullptr;  // 借用；空 = 不过滤
     std::string key_prefix_;  // S13-D4：空 = 不过滤
     std::unordered_map<std::uint32_t,
                        std::unique_ptr<fileops::DataFile>> pinned_files_;
@@ -458,6 +473,15 @@ struct RangeOptions {
     // 预取线程数；0 = min(hardware_concurrency, 4)。批内 key 数不足时按
     // key 数收窄（不会为 1 个 key 起一堆线程）。
     std::size_t prefetch_threads = 0;
+
+    // 下游反馈 2026-10-06 第 2、4 条（语义同 CaskIter::set_want_meta /
+    // set_filter）：want_meta → Entry::meta 填原样 meta blob，与 value 出自
+    // 同一次读；filter 非空 → 只交出 meta 满足条件的 key（C++ 侧逐条求值，
+    // 不通过的不拷值）。filter 为借用指针，迭代器存活期间调用方须保其存活。
+    // 二者合用即「只按 meta 筛选的有序扫描」：make_range_iter({lo, hi, ...,
+    // .want_meta = true, .filter = &f})。
+    bool want_meta = false;
+    const meta::MetaFilter* filter = nullptr;
 };
 
 class CaskRangeIter {
@@ -467,6 +491,7 @@ public:
         std::vector<std::byte> value;   // DocValue text 段（纯 KV 即 value）
         std::uint64_t tstamp = 0;
         std::uint64_t ord = 0;          // keydir 权威 ord（非 OKI 行 ord）
+        std::vector<std::byte> meta;    // RangeOptions::want_meta 时填，否则恒空
     };
 
     // 下一条：有 → Entry；到尾（或越过 hi）→ nullopt；错误 → unexpected。
@@ -485,6 +510,11 @@ private:
     // 死 key（kNotFound）在批内被丢弃，故 buf_ 可能为空而迭代未结束。
     [[nodiscard]] std::expected<void, CaskFault> fill_prefetch();
 
+    // 回查 keydir 取值 + filter + 物化（惰性与预取共用；只读成员，可并发调）。
+    // 死 key（kNotFound）或 filter 不通过 → nullopt。
+    [[nodiscard]] std::expected<std::optional<Entry>, CaskFault>
+    fetch_entry(const std::string& key) const;
+
     Cask* cask_ = nullptr;
     std::shared_ptr<keydir::KeyDir> keydir_pin_;
     oki::OkiState::ReadView view_;
@@ -499,6 +529,8 @@ private:
     // S33-6：预取缓冲（prefetch_ ≤ 1 时恒空，走惰性路径）。
     std::size_t prefetch_ = 0;
     std::size_t prefetch_threads_ = 0;
+    bool want_meta_ = false;
+    const meta::MetaFilter* filter_ = nullptr;
     std::vector<Entry> buf_;
     std::size_t buf_pos_ = 0;
 };
@@ -663,7 +695,10 @@ public:
     // 线程安全: **是**（并发读安全：cache_/doc_texts_ 各 shared_mutex、倒排/HNSW
     // shared_lock、analyzer const;S6/S7 TSan 已证）。与并发写安全,可见性遵循
     // near-real-time 契约（prepare_search flush 覆盖调用前的写)。
-    // V5:filter 非空时 meta 过滤(后过滤 overfetch k×4 再截断到 k)。
+    // V5:filter 非空时 meta 过滤（后过滤：首轮 overfetch max(k×4, 64)，命中
+    // 仍不足 k 则翻倍补取，直到凑满 k 或候选穷尽——返回少于 k 条即满足条件
+    // 的就这么多；无 meta 的文档不通过）。phrase / bool / fields / near /
+    // fuzzy / wildcard 的末位 filter 形参同此语义（下游反馈 2026-10-06）。
     // S13-D10：offset = 跳过排名前 offset 条（分页）。实现为 overfetch
     // k+offset 后截断——深分页成本线性增长（offset 大时考虑游标式方案）。
     // 不提供总命中数：WAND/BMW 剪枝下 total 只能给下界，误导大于价值（详见
@@ -689,12 +724,14 @@ public:
     // 线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     search_phrase(std::string_view query, std::size_t k = 10,
-                  std::size_t offset = 0);  // S13-D10
+                  std::size_t offset = 0,  // S13-D10
+                  const meta::MetaFilter* filter = nullptr);
 
     // BM25 布尔搜索（AND/OR/NOT）。线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
     bool_search(std::string_view query, std::size_t k = 10,
-                std::size_t offset = 0);  // S13-D10
+                std::size_t offset = 0,  // S13-D10
+                const meta::MetaFilter* filter = nullptr);
 
     // V3.3:HNSW 向量检索。query 长度必须 == meta 配置的 vector_dim;
     // cosine 配置时内部归一化查询向量(零向量返回空命中)。ef=0 →
@@ -744,22 +781,26 @@ public:
     // BM25 多字段搜索（S8.6）：支持 `field:term^boost` 语法，跨字段加权合并。
     // 无字段限定的词等价于默认字段词袋搜索。线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    search_fields(std::string_view query, std::size_t k = 10);
+    search_fields(std::string_view query, std::size_t k = 10,
+                  const meta::MetaFilter* filter = nullptr);
 
     // BM25 近邻搜索（S8.7）：term 按序出现且相邻间隙 ≤ slop。slop=0 即短语。
     // 线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    search_near(std::string_view query, std::uint32_t slop, std::size_t k = 10);
+    search_near(std::string_view query, std::uint32_t slop, std::size_t k = 10,
+                const meta::MetaFilter* filter = nullptr);
 
     // S8.3：BM25 模糊搜索（Levenshtein 编辑距离匹配）。
     // 线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance);
+    search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance,
+                 const meta::MetaFilter* filter = nullptr);
 
     // S8.4：BM25 通配符搜索（* / ? 模式匹配）。
     // 线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    search_wildcard(std::string_view pattern, std::size_t k);
+    search_wildcard(std::string_view pattern, std::size_t k,
+                    const meta::MetaFilter* filter = nullptr);
 
     // S13-D3：带高亮的 BM25 文本搜索。README 功能表早已宣称本方法，此前却
     // 只在 SearchLayer 上——绕过门面调用会丢失 closed_ fail-fast 与

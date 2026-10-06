@@ -48,6 +48,8 @@ Cask::make_range_iter(const RangeOptions& opts) {
     it->has_hi_ = !opts.hi.empty();
     it->prefetch_ = opts.prefetch;
     it->prefetch_threads_ = opts.prefetch_threads;
+    it->want_meta_ = opts.want_meta;
+    it->filter_ = opts.filter;
 
     // 各 run seek(lo)；memdelta lower_bound(lo)。
     it->cursors_.reserve(it->view_.runs.size());
@@ -170,28 +172,42 @@ CaskRangeIter::next() {
         auto k = next_merged_key();
         if (!k) return std::unexpected(k.error());
         if (!*k) return std::optional<Entry>{};
-        const std::string& key = **k;
-
-        auto g = cask_->get_owned(std::span<const std::byte>(
-            reinterpret_cast<const std::byte*>(key.data()), key.size()));
-        if (!g) {
-            if (g.error().kind == CaskError::kNotFound) continue;
-            return std::unexpected(g.error());
-        }
-        Entry out;
-        const auto* kp = reinterpret_cast<const std::byte*>(key.data());
-        out.key.assign(kp, kp + key.size());
-        out.value = std::move(g->value);
-        out.tstamp = g->tstamp;
-        out.ord = g->ord;
-        return std::optional<Entry>(std::move(out));
+        auto e = fetch_entry(**k);
+        if (!e) return std::unexpected(e.error());
+        if (!*e) continue;  // 死 key / filter 不通过
+        return e;
     }
+}
+
+// 反馈 2026-10-06：走零拷贝 get 视图——filter 在视图的 meta 段上求值，
+// 不通过的连 value 都不拷；value 与 meta 出自同一次读（同一版本）。
+std::expected<std::optional<CaskRangeIter::Entry>, CaskFault>
+CaskRangeIter::fetch_entry(const std::string& key) const {
+    const auto* kp = reinterpret_cast<const std::byte*>(key.data());
+    auto g = cask_->get(std::span<const std::byte>(kp, key.size()));
+    if (!g) {
+        if (g.error().kind == CaskError::kNotFound) {
+            return std::optional<Entry>{};
+        }
+        return std::unexpected(g.error());
+    }
+    if (filter_ && (g->meta.empty() || !filter_->evaluate(g->meta))) {
+        return std::optional<Entry>{};  // 无 meta 不通过（同检索侧）
+    }
+    Entry out;
+    out.key.assign(kp, kp + key.size());
+    out.value.assign(g->value.begin(), g->value.end());
+    if (want_meta_) out.meta.assign(g->meta.begin(), g->meta.end());
+    out.tstamp = g->tstamp;
+    out.ord = g->ord;
+    return std::optional<Entry>(std::move(out));
 }
 
 // S33-6：预取一批。归并 ≤prefetch_ 个 key（串行、廉价，只碰 run 块与
 // memdelta）→ 分段并发 get 取值（被并行化的是 value 的 pread+decode，
 // 与 parallel_scan 同款 JoiningPool）→ 按 key 序压实进 buf_。
-// 死 key（并发删除 / OKI 行陈旧）与 parallel_scan 同样静默跳过。
+// 死 key（并发删除 / OKI 行陈旧）与 parallel_scan 同样静默跳过；filter 不
+// 通过的同样不进 buf_。
 std::expected<void, CaskFault> CaskRangeIter::fill_prefetch() {
     buf_.clear();
     buf_pos_ = 0;
@@ -228,23 +244,13 @@ std::expected<void, CaskFault> CaskRangeIter::fill_prefetch() {
     auto worker = [&](std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end; ++i) {
             if (!ok.load(std::memory_order_relaxed)) return;
-            auto g = cask_->get_owned(std::span<const std::byte>(
-                reinterpret_cast<const std::byte*>(keys[i].data()),
-                keys[i].size()));
-            if (!g) {
-                if (g.error().kind == CaskError::kNotFound) continue;
+            auto e = fetch_entry(keys[i]);
+            if (!e) {
                 std::lock_guard<std::mutex> lk(err_mu);
-                if (ok.exchange(false)) first_err = g.error();
+                if (ok.exchange(false)) first_err = e.error();
                 return;
             }
-            Entry e;
-            const auto* kp =
-                reinterpret_cast<const std::byte*>(keys[i].data());
-            e.key.assign(kp, kp + keys[i].size());
-            e.value = std::move(g->value);
-            e.tstamp = g->tstamp;
-            e.ord = g->ord;
-            slots[i] = std::move(e);
+            slots[i] = *std::move(e);  // nullopt = 死 key / filter 不通过
         }
     };
 

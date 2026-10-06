@@ -481,6 +481,16 @@ target_link_libraries(bitcask_searcher_test PRIVATE
 )
 gtest_discover_tests(bitcask_searcher_test ${_bitcask_test_props})
 
+# 下游反馈 2026-10-06：meta filter 补取 / 迭代器 want_meta + filter。
+add_executable(bitcask_meta_filter_query_test meta_filter_query_test.cpp)
+target_link_libraries(bitcask_meta_filter_query_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_meta_filter_query_test ${_bitcask_test_props})
+
 # S18-11：插件级测试（flush/open 自治、replay 路由、归一化契约）。
 add_executable(bitcask_text_plugin_test text_plugin_test.cpp)
 target_link_libraries(bitcask_text_plugin_test PRIVATE

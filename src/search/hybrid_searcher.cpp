@@ -21,6 +21,8 @@ HybridSearcher::search(std::string_view text_query,
 
     // V5:filter 独立走两条路(text 后过滤 + vec 折 live callback)——只有
     // 同时通过两路 filter 的文档才进 RRF 融合,符合「filter 收紧 live」语义。
+    // text 路由 search_text 自己补取到 kp 条通过 filter 的命中（下游反馈
+    // 2026-10-06：此前只多取一轮固定候选，严 filter 下本路静默缩水）。
     // S7：单查询两路串行（见头文件注释）。
     std::vector<SearchHit> text_hits;
     if (!text_query.empty()) {

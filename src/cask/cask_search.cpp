@@ -184,10 +184,10 @@ Cask::search_hybrid_batch(std::span<const HybridQuery> queries,
 // search_phrase：BM25 短语模式搜索。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_phrase(std::string_view query, std::size_t k,
-                    std::size_t offset) {
+                    std::size_t offset, const meta::MetaFilter* filter) {
     return run_search_one(/*require_vector=*/false,
         [&] {
-            auto hits = text_->search_phrase(query, k + offset);
+            auto hits = text_->search_phrase(query, k + offset, nullptr, filter);
             if (hits && offset > 0) {  // S13-D10
                 if (hits->size() > offset) {
                     hits->erase(hits->begin(),
@@ -202,25 +202,27 @@ Cask::search_phrase(std::string_view query, std::size_t k,
 
 // search_fields：BM25 多字段搜索（S8.6），支持 field:term^boost。
 std::expected<TextSearchResult, CaskFault>
-Cask::search_fields(std::string_view query, std::size_t k) {
+Cask::search_fields(std::string_view query, std::size_t k,
+                    const meta::MetaFilter* filter) {
     return run_search_one(/*require_vector=*/false,
-        [&] { return text_->search_fields(query, k); });
+        [&] { return text_->search_fields(query, k, nullptr, filter); });
 }
 
 // search_near：BM25 近邻搜索（S8.7）。
 std::expected<TextSearchResult, CaskFault>
-Cask::search_near(std::string_view query, std::uint32_t slop, std::size_t k) {
+Cask::search_near(std::string_view query, std::uint32_t slop, std::size_t k,
+                  const meta::MetaFilter* filter) {
     return run_search_one(/*require_vector=*/false,
-        [&] { return text_->search_near(query, slop, k); });
+        [&] { return text_->search_near(query, slop, k, nullptr, filter); });
 }
 
 // bool_search：BM25 布尔搜索（AND/OR/NOT）。
 std::expected<TextSearchResult, CaskFault>
 Cask::bool_search(std::string_view query, std::size_t k,
-                  std::size_t offset) {
+                  std::size_t offset, const meta::MetaFilter* filter) {
     return run_search_one(/*require_vector=*/false,
         [&] {
-            auto hits = text_->bool_search(query, k + offset);
+            auto hits = text_->bool_search(query, k + offset, nullptr, filter);
             if (hits && offset > 0) {  // S13-D10
                 if (hits->size() > offset) {
                     hits->erase(hits->begin(),
@@ -235,16 +237,18 @@ Cask::bool_search(std::string_view query, std::size_t k,
 
 // S8.3：模糊搜索（Levenshtein 编辑距离匹配）。
 std::expected<TextSearchResult, CaskFault>
-Cask::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance) {
+Cask::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance,
+                   const meta::MetaFilter* filter) {
     return run_search_one(/*require_vector=*/false,
-        [&] { return text_->search_fuzzy(query, k, max_edit_distance); });
+        [&] { return text_->search_fuzzy(query, k, max_edit_distance, nullptr, filter); });
 }
 
 // S8.4：通配符搜索（* / ? 模式匹配）。
 std::expected<TextSearchResult, CaskFault>
-Cask::search_wildcard(std::string_view pattern, std::size_t k) {
+Cask::search_wildcard(std::string_view pattern, std::size_t k,
+                      const meta::MetaFilter* filter) {
     return run_search_one(/*require_vector=*/false,
-        [&] { return text_->search_wildcard(pattern, k); });
+        [&] { return text_->search_wildcard(pattern, k, nullptr, filter); });
 }
 
 }  // namespace bitcask

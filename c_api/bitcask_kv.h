@@ -315,6 +315,22 @@ typedef struct {
     uint64_t        ord;
 } bitcask_range_entry_t;
 
+// 下游反馈 2026-10-06：带 meta 的迭代条目（bitcask_iter_next_ex / _batch_ex 填）。
+// 既有 bitcask_iter_entry_t 由调用方分配、布局不能改，故以 base 内嵌 + 追加
+// meta 的新类型承载。meta 指向内部 malloc 缓冲（DocValue 的 meta 段原样 blob，
+// 不解码；无 meta / 纯 KV / 墓碑 / 迭代器未开 want_meta 时为 {NULL,0}），
+// 由 bitcask_iter_entry_ex_free 连同 base 一并释放。
+typedef struct {
+    bitcask_iter_entry_t base;
+    bitcask_slice_t      meta;
+} bitcask_iter_entry_ex_t;
+
+// 同上，range 版（bitcask_range_iter_next_ex / _batch_ex 填）。
+typedef struct {
+    bitcask_range_entry_t base;
+    bitcask_slice_t       meta;
+} bitcask_range_entry_ex_t;
+
 // 状态信息（对应 bitcask::StatusInfo，简化版——不含文件列表）
 typedef struct {
     uint64_t key_count;
@@ -860,6 +876,71 @@ BITCASK_API void bitcask_range_iter_release(bitcask_range_iter_t* iter);
 
 // 释放 range 条目内部缓冲（key/value 的 malloc 缓冲）。
 BITCASK_API void bitcask_range_entry_free(bitcask_range_entry_t* entry);
+
+/* ---------------------------------------------------------------------------
+ *  迭代时交出 meta / 按 meta 筛选（下游反馈 2026-10-06，additive 新符号）
+ *
+ *  want_meta — 非 0 时条目的 meta 填 DocValue 的 meta 段原样 blob，与 value
+ *    出自**同一条记录**（不必逐条补 bitcask_get，也没有 text 与 meta 版本
+ *    错配）。只有 *_next_ex / *_next_batch_ex 能取到 meta；对同一迭代器调
+ *    旧的 *_next / *_next_batch 也合法，meta 被丢弃。
+ *  filter    — 非 NULL 时只交出 meta 满足条件的条目（引擎侧逐条求值，不通过
+ *    的不读出 value）；无 meta 的不通过（同检索侧）。过滤树在本调用期间
+ *    转换并由迭代器句柄持有，返回后 C 侧存储即可释放。filter 非法 →
+ *    BITCASK_ERR_INVALID_OPTION（判据同 bitcask_search_text_filtered）。
+ *    只作用于活条目：see_tombstones 时墓碑照常交出（墓碑没有 meta 可判）。
+ *  want_meta=0 + filter=NULL 时与无 _ex 的同名函数完全等价。
+ *  合用即「只按 meta 筛选的扫描」：有序 [lo, hi) 用 bitcask_range_iter_start_ex
+ *  （需 OKI）；无 OKI 的句柄用 bitcask_iter_start_ex 全表版。
+ * ------------------------------------------------------------------------- */
+
+// bitcask_iter_start_prefix 的全参版；key_prefix 为空切片 = 不限前缀。
+// 其余参数与返回码同 bitcask_iter_start_prefix。
+BITCASK_API bitcask_error_t bitcask_iter_start_ex(bitcask_t* cask,
+                                                  int maxage,
+                                                  int maxputs,
+                                                  int see_tombstones,
+                                                  bitcask_slice_t key_prefix,
+                                                  int want_meta,
+                                                  const bitcask_meta_filter_t* filter,
+                                                  bitcask_iter_t** out,
+                                                  bitcask_fault_t* fault);
+
+// 同 bitcask_iter_next，条目带 meta。返回 1 = 有数据，0 = 结束，<0 = 错误。
+// 调用方须对返回 1 的条目调 bitcask_iter_entry_ex_free。
+BITCASK_API int bitcask_iter_next_ex(bitcask_iter_t* iter,
+                                     bitcask_iter_entry_ex_t* entry,
+                                     bitcask_fault_t* fault);
+
+// 同 bitcask_iter_next_batch，条目带 meta；错误时已填条目由本函数释放。
+BITCASK_API int bitcask_iter_next_batch_ex(bitcask_iter_t* iter,
+                                           bitcask_iter_entry_ex_t* entries,
+                                           size_t max_n,
+                                           bitcask_fault_t* fault);
+
+// 释放 ex 条目的全部内部缓冲（key / value / meta）。entry 为 NULL 时 no-op。
+BITCASK_API void bitcask_iter_entry_ex_free(bitcask_iter_entry_ex_t* entry);
+
+// bitcask_range_iter_start 的全参版（opts 语义同原函数，NULL = 全域无预取）。
+// 返回码同 bitcask_range_iter_start，另加 filter 非法 → INVALID_OPTION。
+BITCASK_API bitcask_error_t bitcask_range_iter_start_ex(
+    bitcask_t* cask,
+    const bitcask_range_options_t* opts,
+    int want_meta,
+    const bitcask_meta_filter_t* filter,
+    bitcask_range_iter_t** out,
+    bitcask_fault_t* fault);
+
+BITCASK_API int bitcask_range_iter_next_ex(bitcask_range_iter_t* iter,
+                                           bitcask_range_entry_ex_t* entry,
+                                           bitcask_fault_t* fault);
+
+BITCASK_API int bitcask_range_iter_next_batch_ex(bitcask_range_iter_t* iter,
+                                                 bitcask_range_entry_ex_t* entries,
+                                                 size_t max_n,
+                                                 bitcask_fault_t* fault);
+
+BITCASK_API void bitcask_range_entry_ex_free(bitcask_range_entry_ex_t* entry);
 
 // 并行全表扫描回调（S12-5）。对每个 live 文档调用一次；**可能来自多个工作线程并发调用**。
 //   ctx  : bitcask_parallel_scan 透传的用户指针（C 无闭包，用它带状态）

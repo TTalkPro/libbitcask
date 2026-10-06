@@ -201,6 +201,92 @@ BITCASK_API bitcask_error_t bitcask_bool_search_ex(
     });
 }
 
+// 下游反馈 2026-10-06：其余文本检索的 meta 过滤版（契约见 bitcask_text.h）。
+BITCASK_API bitcask_error_t bitcask_search_phrase_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
+    return finish_single(
+        as_cpp_cask(cask)->search_phrase(query, k, offset, pf.get()), out, fault);
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_bool_search_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
+    return finish_single(
+        as_cpp_cask(cask)->bool_search(query, k, offset, pf.get()), out, fault);
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_search_fields_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
+    return finish_single(as_cpp_cask(cask)->search_fields(query, k, pf.get()),
+                         out, fault);
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_search_near_filtered(
+    bitcask_t* cask, const char* query, uint32_t slop, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
+    return finish_single(
+        as_cpp_cask(cask)->search_near(query, slop, k, pf.get()), out, fault);
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_search_fuzzy_filtered(
+    bitcask_t* cask, const char* query, size_t k, uint32_t max_edit_distance,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
+    return finish_single(
+        as_cpp_cask(cask)->search_fuzzy(query, k, max_edit_distance, pf.get()),
+        out, fault);
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_search_wildcard_filtered(
+    bitcask_t* cask, const char* pattern, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !pattern || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
+    return finish_single(
+        as_cpp_cask(cask)->search_wildcard(pattern, k, pf.get()), out, fault);
+    });
+}
+
 BITCASK_API bitcask_error_t bitcask_search_text_highlight(
     bitcask_t* cask, const char* query, size_t k,
     const bitcask_highlight_options_t* opts,

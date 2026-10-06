@@ -562,7 +562,7 @@ public:
 
 ### 5.4 检索（索引模式）
 
-无 search 层 → `kNoIndex`；无向量配置 → `kInvalidOption`。所有检索方法线程安全：是（并发读：cache_/doc_texts_ shared_mutex、倒排/HNSW shared_lock、analyzer const；与写并发遵循 near-real-time 可见性）。`filter` 非空时 meta 后过滤（overfetch 后截断到 `k`）。
+无 search 层 → `kNoIndex`；无向量配置 → `kInvalidOption`。所有检索方法线程安全：是（并发读：cache_/doc_texts_ shared_mutex、倒排/HNSW shared_lock、analyzer const；与写并发遵循 near-real-time 可见性）。`filter` 非空时 meta 后过滤（无 meta 的文档不通过）：首轮多取 `max(k×4, 64)` 个候选，过滤后不足 `k` 则把候选数翻倍补取，直到凑满 `k` 或候选穷尽——**返回少于 `k` 条即满足条件的就这么多**（下游反馈 2026-10-06；此前只取一轮，严 filter 下静默少返回）。全部文本检索（text / phrase / bool / fields / near / fuzzy / wildcard）与 hybrid 文本路同此语义。⚠️ 同分并列：进入前 `k` 名的同分文档由内核扫描 / 剪枝次序决定，**小 K 结果不保证是大 K 结果的前缀**，`offset` 分页在同分处可能重复 / 遗漏（反馈 2026-10-06 第 5 条，待内核统一平局规则后修复）。
 
 #### `Cask::search_text`（词袋 BM25）
 
@@ -591,7 +591,8 @@ S7-4：K 条**独立**查询并发跑在进程级共享「有界 Search 池」�
 ```cpp
 [[nodiscard]] std::expected<TextSearchResult, CaskFault>
 search_phrase(std::string_view query, std::size_t k = 10,
-              std::size_t offset = 0);
+              std::size_t offset = 0,
+              const meta::MetaFilter* filter = nullptr);
 ```
 
 term 连续出现。需 `index_positions=true`。
@@ -601,7 +602,8 @@ term 连续出现。需 `index_positions=true`。
 ```cpp
 [[nodiscard]] std::expected<TextSearchResult, CaskFault>
 bool_search(std::string_view query, std::size_t k = 10,
-            std::size_t offset = 0);
+            std::size_t offset = 0,
+            const meta::MetaFilter* filter = nullptr);
 ```
 
 AND / OR / NOT 查询语法（`+term` MUST / `-term` MUST_NOT / 裸 SHOULD；含括号嵌套与引号短语时走 `parse_query_tree`）。
@@ -610,7 +612,8 @@ AND / OR / NOT 查询语法（`+term` MUST / `-term` MUST_NOT / 裸 SHOULD；含
 
 ```cpp
 [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-search_fields(std::string_view query, std::size_t k = 10);
+search_fields(std::string_view query, std::size_t k = 10,
+              const meta::MetaFilter* filter = nullptr);
 ```
 
 S8.6：解析 `field:term^boost` 语法：有字段限定的词查对应字段，无限定的查默认字段；各词得分 × boost，跨字段累加。不含字段语法时等价默认字段词袋。
@@ -619,7 +622,8 @@ S8.6：解析 `field:term^boost` 语法：有字段限定的词查对应字段�
 
 ```cpp
 [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-search_near(std::string_view query, std::uint32_t slop, std::size_t k = 10);
+search_near(std::string_view query, std::uint32_t slop, std::size_t k = 10,
+            const meta::MetaFilter* filter = nullptr);
 ```
 
 term 按序出现且相邻间隙 ≤ `slop`；`slop = 0` 即短语。
@@ -628,7 +632,8 @@ term 按序出现且相邻间隙 ≤ `slop`；`slop = 0` 即短语。
 
 ```cpp
 [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance);
+search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance,
+             const meta::MetaFilter* filter = nullptr);
 ```
 
 S8.3：Levenshtein 编辑距离匹配。
@@ -637,7 +642,8 @@ S8.3：Levenshtein 编辑距离匹配。
 
 ```cpp
 [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-search_wildcard(std::string_view pattern, std::size_t k);
+search_wildcard(std::string_view pattern, std::size_t k,
+                const meta::MetaFilter* filter = nullptr);
 ```
 
 S8.4：`*` / `?` 模式匹配。
@@ -880,7 +886,11 @@ public:
         std::uint32_t total_sz    = 0;
         bool          is_tombstone = false;
         std::uint64_t ord         = 0;
+        std::vector<std::byte> meta;   // set_want_meta(true) 时填，否则恒空
     };
+
+    void set_want_meta(bool on) noexcept;                  // 反馈 2026-10-06
+    void set_filter(const meta::MetaFilter* filter) noexcept;
 
     [[nodiscard]] std::expected<keydir::StartIterResult, CaskFault>
     start(int maxage          = -1,
@@ -905,6 +915,12 @@ public:
 - `key_prefix` 非空时只产出以该前缀开头的 key——过滤发生在 keydir proxy 层（不 pread value）。
 - 返回底层 keydir 的 `StartIterResult`：`kOk`（开始迭代）/ `kAlreadyIterating`（已经在迭代）/ `kOutOfDate`（pending 表 freshness 未过，caller 稍后重试）。`CaskFault` 留给真正的失败。
 - 线程安全：否（修改自身字段）；同一 CaskIter 不可并发使用。
+
+### `CaskIter::set_want_meta` / `set_filter`
+
+- `set_want_meta(true)`：`Entry::meta` 填 DocValue 的 meta 段原样 blob（不解码；无 meta / 纯 KV 为空），与 `value` 出自**同一条记录**——不必逐行补 `get`，也没有 text 与 meta 版本错配。默认关（不付拷贝）。
+- `set_filter(&f)`：只交出 meta 满足 `f` 的条目（`MetaFilter::evaluate`；无 meta 不通过，与检索侧同语义），不通过的不拷 value。借用指针，迭代期间调用方保活。只作用于活条目——`see_tombstones = true` 时墓碑照常交出。
+- 两者在 `start()` 前后任意时刻可设，对其后的 `next()` 生效。
 
 ### `CaskIter::next`
 
@@ -931,6 +947,8 @@ struct RangeOptions {
     std::span<const std::byte> hi{};   // exclusive；空 = 到尾
     std::size_t prefetch = 0;          // 0/1 = 关闭；>1 = 批量并发预取值
     std::size_t prefetch_threads = 0;  // 0 = min(hardware_concurrency, 4)
+    bool want_meta = false;                    // Entry::meta 填原样 meta blob
+    const meta::MetaFilter* filter = nullptr;  // 只交出 meta 满足条件的 key（借用）
 };
 
 class CaskRangeIter {
@@ -940,10 +958,13 @@ public:
         std::vector<std::byte> value;   // DocValue text 段（纯 KV 即 value）
         std::uint64_t tstamp = 0;
         std::uint64_t ord    = 0;       // keydir 权威 ord（非 OKI 行 ord）
+        std::vector<std::byte> meta;    // want_meta 时填，否则恒空
     };
     [[nodiscard]] std::expected<std::optional<Entry>, CaskFault> next();
 };
 ```
+
+- **`want_meta` / `filter`（下游反馈 2026-10-06）**：语义同 `CaskIter::set_want_meta` / `set_filter`。合用即「只按 meta 筛选的有序扫描」——filter 在 C++ 侧逐条求值（取值走零拷贝 `get` 视图，不通过的不拷 value），惰性与预取路径一致。
 
 - **一致性：per-key 弱一致**（与 `parallel_scan` 同档）——迭代期间的并发写可能部分可见，**不是** `CaskIter` 的 fold 快照语义。需要快照请先用 `CaskIter` 冻结。
 - **生命周期**：不可跨线程共享；须在 `Cask::close()` 之前用完（内部 pin KeyDir，但取值经 Cask 读路径）。无 `release()`——析构即释放。
@@ -1377,23 +1398,30 @@ public:
                 const bm25::Bm25Params* params_override = nullptr,
                 const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>, search::SearchError>
+    // 以下六个末位均有 const meta::MetaFilter* filter = nullptr（语义同 search_text）
     search_phrase(std::string_view query, std::size_t k,
-                  const bm25::Bm25Params* params_override = nullptr) const;
+                  const bm25::Bm25Params* params_override = nullptr,
+                  const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>, search::SearchError>
     search_near(std::string_view query, std::uint32_t slop, std::size_t k,
-                const bm25::Bm25Params* params_override = nullptr) const;
+                const bm25::Bm25Params* params_override = nullptr,
+                const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>, search::SearchError>
     bool_search(std::string_view query, std::size_t k,
-                const bm25::Bm25Params* params_override = nullptr) const;
+                const bm25::Bm25Params* params_override = nullptr,
+                const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>, search::SearchError>
     search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance,
-                 const bm25::Bm25Params* params_override = nullptr) const;
+                 const bm25::Bm25Params* params_override = nullptr,
+                 const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>, search::SearchError>
     search_fields(std::string_view query, std::size_t k,
-                  const bm25::Bm25Params* params_override = nullptr) const;
+                  const bm25::Bm25Params* params_override = nullptr,
+                  const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>, search::SearchError>
     search_wildcard(std::string_view pattern, std::size_t k,
-                    const bm25::Bm25Params* params_override = nullptr) const;
+                    const bm25::Bm25Params* params_override = nullptr,
+                    const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::optional<bm25::ScoreExplanation>
     explain(std::string_view query, std::string_view key,
             const bm25::Bm25Params* params_override = nullptr) const;

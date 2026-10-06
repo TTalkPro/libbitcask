@@ -43,6 +43,7 @@ static const char* const kAllTestDirs[] = {
     TDIR("iter"),
     TDIR("kv"),
     TDIR("levelb"),
+    TDIR("metaq"),
     TDIR("mergepol"),
     TDIR("pscan"),
     TDIR("putbatch"),
@@ -1785,6 +1786,261 @@ static int test_thread_limits_and_tuning(void) {
     return 0;
 }
 
+/* 下游反馈 2026-10-06：其余文本检索的 *_filtered（补取到 k）+ 迭代器
+ * *_start_ex / *_next_ex（want_meta + filter）。200 篇全含 "apple pie"，
+ * key 末位为 '0' 的 20 篇 tag=keep。改前严 filter 只多取 64 个候选，K=10
+ * 只回约 6 条。 */
+#define MQ_DOCS 200
+static int mq_is_keep(const char* key, size_t len) {
+    return len > 0 && key[len - 1] == '0';
+}
+
+static int mq_check_result(const char* what, bitcask_error_t err,
+                           bitcask_search_result_t* r, size_t want) {
+    if (err != BITCASK_OK || r == NULL || r->count != want) {
+        fprintf(stderr, "FAIL test_meta_filter_query %s: err=%d count=%zu want=%zu\n",
+                what, (int)err, r ? r->count : 0, want);
+        bitcask_search_result_free(r);
+        return 1;
+    }
+    for (size_t i = 0; i < r->count; ++i) {
+        if (!mq_is_keep(r->hits[i].key, strlen(r->hits[i].key))) {
+            fprintf(stderr, "FAIL test_meta_filter_query %s: non-keep hit %s\n",
+                    what, r->hits[i].key);
+            bitcask_search_result_free(r);
+            return 1;
+        }
+    }
+    bitcask_search_result_free(r);
+    return 0;
+}
+
+static int test_meta_filter_query(void) {
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.enable_search = 1;
+    opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    bitcask_error_t err = bitcask_open(TDIR("metaq"), &opts, &cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_meta_filter_query: open failed: %s\n", fault.detail);
+        return 1;
+    }
+
+    bitcask_slice_t keep_blob, drop_blob;
+    memset(&keep_blob, 0, sizeof(keep_blob));
+    memset(&drop_blob, 0, sizeof(drop_blob));
+    {
+        bitcask_meta_entry_t e;
+        memset(&e, 0, sizeof(e));
+        e.key = "tag";
+        e.value.type = BITCASK_META_VALUE_STRING;
+        e.value.str = "keep";
+        err = bitcask_meta_encode(&e, 1, &keep_blob, &fault);
+        assert(err == BITCASK_OK);
+        e.value.str = "drop";
+        err = bitcask_meta_encode(&e, 1, &drop_blob, &fault);
+        assert(err == BITCASK_OK);
+    }
+    for (int i = 0; i < MQ_DOCS; ++i) {
+        char key[16];
+        snprintf(key, sizeof(key), "d%03d", i);
+        const char* text = "apple pie";
+        bitcask_doc_input_t doc;
+        memset(&doc, 0, sizeof(doc));
+        doc.text.data = text;
+        doc.text.size = strlen(text);
+        doc.meta = (i % 10 == 0) ? keep_blob : drop_blob;
+        bitcask_slice_t k = {key, strlen(key)};
+        err = bitcask_put_doc(cask, k, &doc, 0, &fault);
+        assert(err == BITCASK_OK);
+    }
+    bitcask_flush_index(cask);
+
+    bitcask_meta_condition_t cond;
+    memset(&cond, 0, sizeof(cond));
+    cond.key = "tag";
+    cond.op = BITCASK_META_OP_EQ;
+    cond.value.type = BITCASK_META_VALUE_STRING;
+    cond.value.str = "keep";
+    bitcask_meta_filter_t f;
+    memset(&f, 0, sizeof(f));
+    f.conditions = &cond;
+    f.conditions_count = 1;
+
+    int fails = 0;
+    bitcask_search_result_t* r = NULL;
+
+    /* 检索：K=10 取满（keep 共 20 篇）；K=50 回全部 20。 */
+    r = NULL; err = bitcask_search_text_filtered(cask, "apple", 10, &f, &r, &fault);
+    fails += mq_check_result("text k=10", err, r, 10);
+    r = NULL; err = bitcask_search_text_filtered(cask, "apple", 50, &f, &r, &fault);
+    fails += mq_check_result("text k=50", err, r, 20);
+    r = NULL; err = bitcask_search_phrase_filtered(cask, "apple pie", 10, &f, 0, &r, &fault);
+    fails += mq_check_result("phrase", err, r, 10);
+    r = NULL; err = bitcask_search_phrase_filtered(cask, "apple pie", 10, &f, 15, &r, &fault);
+    fails += mq_check_result("phrase offset=15", err, r, 5);
+    r = NULL; err = bitcask_bool_search_filtered(cask, "apple AND pie", 10, &f, 10, &r, &fault);
+    fails += mq_check_result("bool offset=10", err, r, 10);
+    r = NULL; err = bitcask_search_fields_filtered(cask, "apple", 10, &f, &r, &fault);
+    fails += mq_check_result("fields", err, r, 10);
+    r = NULL; err = bitcask_search_near_filtered(cask, "apple pie", 0, 10, &f, &r, &fault);
+    fails += mq_check_result("near", err, r, 10);
+    r = NULL; err = bitcask_search_fuzzy_filtered(cask, "aple", 10, 1, &f, &r, &fault);
+    fails += mq_check_result("fuzzy", err, r, 10);
+    r = NULL; err = bitcask_search_wildcard_filtered(cask, "app*", 10, &f, &r, &fault);
+    fails += mq_check_result("wildcard", err, r, 10);
+    /* filter == NULL 等价无过滤 */
+    r = NULL; err = bitcask_search_wildcard_filtered(cask, "app*", 10, NULL, &r, &fault);
+    if (err != BITCASK_OK || r == NULL || r->count != 10) {
+        fprintf(stderr, "FAIL test_meta_filter_query: wildcard NULL filter\n");
+        ++fails;
+    }
+    bitcask_search_result_free(r);
+    /* 非法 filter → INVALID_OPTION */
+    {
+        bitcask_meta_condition_t bad;
+        memset(&bad, 0, sizeof(bad));  /* key == NULL */
+        bitcask_meta_filter_t bf;
+        memset(&bf, 0, sizeof(bf));
+        bf.conditions = &bad;
+        bf.conditions_count = 1;
+        r = NULL;
+        err = bitcask_search_near_filtered(cask, "apple pie", 0, 10, &bf, &r, &fault);
+        if (err != BITCASK_ERR_INVALID_OPTION || r != NULL) {
+            fprintf(stderr, "FAIL test_meta_filter_query: bad filter err=%d\n", (int)err);
+            ++fails;
+        }
+        bitcask_iter_t* bit = NULL;
+        bitcask_slice_t none = {NULL, 0};
+        err = bitcask_iter_start_ex(cask, -1, -1, 0, none, 1, &bf, &bit, &fault);
+        if (err != BITCASK_ERR_INVALID_OPTION || bit != NULL) {
+            fprintf(stderr, "FAIL test_meta_filter_query: iter bad filter err=%d\n", (int)err);
+            ++fails;
+        }
+    }
+
+    /* fold 迭代器：want_meta + filter → 只交 20 篇 keep，meta == keep blob。
+       单条 + 批量混用。 */
+    {
+        bitcask_iter_t* it = NULL;
+        bitcask_slice_t none = {NULL, 0};
+        err = bitcask_iter_start_ex(cask, -1, -1, 0, none, 1, &f, &it, &fault);
+        assert(err == BITCASK_OK && it != NULL);
+        int n = 0;
+        bitcask_iter_entry_ex_t e;
+        memset(&e, 0, sizeof(e));
+        if (bitcask_iter_next_ex(it, &e, &fault) == 1) {
+            ++n;
+            if (!mq_is_keep((const char*)e.base.key.data, e.base.key.size) ||
+                e.meta.size != keep_blob.size ||
+                memcmp(e.meta.data, keep_blob.data, keep_blob.size) != 0) {
+                fprintf(stderr, "FAIL test_meta_filter_query: iter_next_ex entry\n");
+                ++fails;
+            }
+            bitcask_iter_entry_ex_free(&e);
+        }
+        bitcask_iter_entry_ex_t batch[8];
+        int got;
+        while ((got = bitcask_iter_next_batch_ex(it, batch, 8, &fault)) > 0) {
+            for (int i = 0; i < got; ++i) {
+                ++n;
+                if (!mq_is_keep((const char*)batch[i].base.key.data,
+                                batch[i].base.key.size) ||
+                    batch[i].meta.size != keep_blob.size ||
+                    batch[i].base.value.size != strlen("apple pie")) {
+                    fprintf(stderr, "FAIL test_meta_filter_query: iter batch entry\n");
+                    ++fails;
+                }
+                bitcask_iter_entry_ex_free(&batch[i]);
+            }
+        }
+        if (got < 0 || n != MQ_DOCS / 10) {
+            fprintf(stderr, "FAIL test_meta_filter_query: iter got=%d n=%d\n", got, n);
+            ++fails;
+        }
+        bitcask_iter_release(it);
+    }
+    /* 无 want_meta / filter 的 ex 迭代：全量、meta 恒空；旧 next 可混用。 */
+    {
+        bitcask_iter_t* it = NULL;
+        bitcask_slice_t none = {NULL, 0};
+        err = bitcask_iter_start_ex(cask, -1, -1, 0, none, 0, NULL, &it, &fault);
+        assert(err == BITCASK_OK);
+        int n = 0;
+        bitcask_iter_entry_t old;
+        if (bitcask_iter_next(it, &old, &fault) == 1) {
+            ++n;
+            bitcask_iter_entry_free(&old);
+        }
+        bitcask_iter_entry_ex_t e;
+        while (bitcask_iter_next_ex(it, &e, &fault) == 1) {
+            ++n;
+            if (e.meta.data != NULL || e.meta.size != 0) {
+                fprintf(stderr, "FAIL test_meta_filter_query: unexpected meta\n");
+                ++fails;
+            }
+            bitcask_iter_entry_ex_free(&e);
+        }
+        if (n != MQ_DOCS) {
+            fprintf(stderr, "FAIL test_meta_filter_query: plain ex iter n=%d\n", n);
+            ++fails;
+        }
+        bitcask_iter_release(it);
+    }
+
+    /* 有序 range：[d050, d150) 里 keep 共 10 篇，按 key 升序（含预取路径）。 */
+    for (int pass = 0; pass < 2; ++pass) {
+        bitcask_range_options_t ro;
+        bitcask_range_options_init(&ro);
+        ro.lo.data = "d050"; ro.lo.size = 4;
+        ro.hi.data = "d150"; ro.hi.size = 4;
+        ro.prefetch = pass ? 64 : 0;
+        bitcask_range_iter_t* rit = NULL;
+        err = bitcask_range_iter_start_ex(cask, &ro, 1, &f, &rit, &fault);
+        if (err != BITCASK_OK) {
+            fprintf(stderr, "FAIL test_meta_filter_query: range start err=%d\n", (int)err);
+            ++fails;
+            continue;
+        }
+        int n = 0;
+        int next_i = 50;
+        bitcask_range_entry_ex_t batch[4];
+        int got;
+        while ((got = bitcask_range_iter_next_batch_ex(rit, batch, 4, &fault)) > 0) {
+            for (int i = 0; i < got; ++i) {
+                char want[16];
+                snprintf(want, sizeof(want), "d%03d", next_i);
+                if (batch[i].base.key.size != 4 ||
+                    memcmp(batch[i].base.key.data, want, 4) != 0 ||
+                    batch[i].meta.size != keep_blob.size ||
+                    memcmp(batch[i].meta.data, keep_blob.data, keep_blob.size) != 0) {
+                    fprintf(stderr, "FAIL test_meta_filter_query: range entry %d\n", n);
+                    ++fails;
+                }
+                next_i += 10;
+                ++n;
+                bitcask_range_entry_ex_free(&batch[i]);
+            }
+        }
+        bitcask_range_entry_ex_t one;
+        if (got < 0 || n != 10 || bitcask_range_iter_next_ex(rit, &one, &fault) != 0) {
+            fprintf(stderr, "FAIL test_meta_filter_query: range got=%d n=%d\n", got, n);
+            ++fails;
+        }
+        bitcask_range_iter_release(rit);
+    }
+
+    bitcask_meta_blob_free(&keep_blob);
+    bitcask_meta_blob_free(&drop_blob);
+    bitcask_close(cask);
+    if (fails == 0) printf("PASS test_meta_filter_query\n");
+    return fails ? 1 : 0;
+}
+
 int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
@@ -1809,6 +2065,7 @@ int main(void) {
     failures += test_search_filtered();
     failures += test_doc_fields_and_meta();
     failures += test_paging_and_highlight();
+    failures += test_meta_filter_query();
     failures += test_merge_policy_files_checkpoint();
 
     if (failures == 0) {

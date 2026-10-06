@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <system_error>
 #include "bitcask/detail/path_utf8.hpp"
@@ -38,6 +39,56 @@ std::string comp_path(std::string_view dir) {
 
 // S12-2：自动压实的节流下限（与原 SearchLayer 常量一致）。
 constexpr std::uint64_t kAutoCompactMinDeaths = 1024;
+
+// 下游反馈 2026-10-06 第 1 条：后过滤补取。首轮候选数：filter 非空多取
+// K'=max(k×4, 64)（V5 原值），无 filter 按 k。
+std::size_t initial_k_req(std::size_t k, const meta::MetaFilter* filter) {
+    if (!filter) return k;
+    constexpr auto kMax = std::numeric_limits<std::size_t>::max();
+    const std::size_t kx4 = k > kMax / 4 ? kMax : k * 4;
+    return std::max<std::size_t>(kx4, 64);
+}
+
+// 一轮取数的结果：候选数、物化后命中（≤k）。
+struct FetchOut {
+    std::size_t n_cand = 0;
+    std::vector<SearchHit> hits;
+};
+
+FetchOut make_out(const std::vector<bm25::SearchResult>& results,
+                  std::vector<SearchHit> hits) {
+    return {results.size(), std::move(hits)};
+}
+
+// fetch(k_req) 取一轮。物化丢掉候选（filter 不过 / 全局判活不过）致命中
+// < k 时把 k_req 翻倍重取，直到凑满 k 或候选穷尽。
+// 穷尽判据「候选数 < k_req」对各检索路径都成立：候选集是逐段（或全局）
+// top-k_req 的并集再截到 k_req——任一路取满 k_req，并集必满。
+// 无 filter 时首轮通常即满足，成本不变。缓存键含 k_req，各轮各占一条。
+// 注：同分并列的取舍由内核扫描 / 剪枝次序决定，补取不改变这一点
+// （反馈第 5 条，另案处理）。
+template <class Fetch>
+std::vector<SearchHit> refetch_until_k(std::size_t k, std::size_t k_req,
+                                       Fetch&& fetch) {
+    for (;;) {
+        auto out = fetch(k_req);
+        if (out.hits.size() >= k || out.n_cand < k_req ||
+            k_req > std::numeric_limits<std::size_t>::max() / 2) {
+            return std::move(out.hits);
+        }
+        k_req *= 2;
+    }
+}
+
+// 逐段并集的公共收尾：分数降序、并列 ord 降序，截到 k_req。
+void sort_truncate(std::vector<bm25::SearchResult>& results, std::size_t k_req) {
+    std::sort(results.begin(), results.end(),
+              [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.ord > b.ord;
+              });
+    if (results.size() > k_req) results.resize(k_req);
+}
 
 }  // namespace
 
@@ -567,7 +618,7 @@ std::vector<SearchHit> TextPlugin::materialize_hits(
     const bm25::DocTable& doc_table,
     const meta::MetaFilter* filter, std::size_t k) const {
     std::vector<SearchHit> hits;
-    hits.reserve(results.size());
+    hits.reserve(k > 0 ? std::min(k, results.size()) : results.size());
     for (auto& r : results) {
         if (!doc_table.is_live(r.ord)) continue;  // B2a：全局兜底（S18-8 段级盲区）
         if (filter) {
@@ -576,8 +627,8 @@ std::vector<SearchHit> TextPlugin::materialize_hits(
         auto ext_id = doc_table.ord_to_ext(r.ord);
         if (!ext_id) continue;
         hits.push_back(SearchHit{std::move(*ext_id), r.ord, r.score});
+        if (k > 0 && hits.size() == k) break;  // 补取轮候选多，够 k 即停
     }
-    if (k > 0 && hits.size() > k) hits.resize(k);
     return hits;
 }
 
@@ -676,130 +727,126 @@ TextPlugin::search_text(std::string_view query, std::size_t k,
     // 安全前提:CacheKey 仅依赖 (query_type, query, k_req),不依赖 analyze 结果。
     if (query.empty()) return std::vector<SearchHit>{};
 
-    // V5:filter 非空时 overfetch K'=max(k×4, 64)——BM25 评分排序在
-    // filter 之前,过严 filter 命中数 < k 时需更多候选弥补损耗。无 filter
-    // 仍按 k 请求(避免无谓放大,保持兼容)。
-    const std::size_t k_req = filter ? std::max<std::size_t>(k * 4, 64) : k;
+    // 分词惰性且只做一次：首轮缓存命中不付 analyze，补取轮复用。
+    std::optional<std::vector<std::string>> terms;
+    auto fetch = [&](std::size_t k_req) -> FetchOut {
+        auto cache_key = CacheKey::make("text", query, k_req);
+        auto cached = params_override
+                          ? std::optional<std::vector<bm25::SearchResult>>{}
+                          : cache_.get(cache_key);
 
-    auto cache_key = CacheKey::make("text", query, k_req);
-    auto cached = params_override
-                      ? std::optional<std::vector<bm25::SearchResult>>{}
-                      : cache_.get(cache_key);
-
-    std::vector<bm25::SearchResult> results;
-    if (cached) {
-        results = std::move(*cached);
-    } else {
-        auto term_freqs = analyzer_->analyze(query);
-        if (term_freqs.empty()) return std::vector<SearchHit>{};
-
-        std::vector<std::string> terms;
-        terms.reserve(term_freqs.size());
-        for (auto& [term, _] : term_freqs) {
-            terms.push_back(term);
-        }
-        if (synonym_map_) {
-            terms = synonym_map_->expand_terms(terms);
-        }
-
-        // S27-3 Slice B2a：走 [SegmentSet + Building] 多段 G-on-the-fly 归并。
-        auto views = collect_default_segment_views();
-        if (!views.empty()) {
-            const auto hits = search::multi_segment_search(
-                views, terms, k_req, params_override);
-            results.reserve(hits.size());
-            for (const auto& h : hits) {
-                results.push_back({h.ord, static_cast<float>(h.score)});
+        std::vector<bm25::SearchResult> results;
+        if (cached) {
+            results = std::move(*cached);
+        } else {
+            if (!terms) {
+                auto term_freqs = analyzer_->analyze(query);
+                terms.emplace();
+                terms->reserve(term_freqs.size());
+                for (auto& [term, _] : term_freqs) {
+                    terms->push_back(term);
+                }
+                if (synonym_map_ && !terms->empty()) {
+                    *terms = synonym_map_->expand_terms(*terms);
+                }
             }
-            // S29-5 评估后保留：非冗余排序——multi_segment_search 返回并列
-            // 以 key 升序，此处重排为 ord 降序，对齐单索引路径（score_bow_topk
-            // 堆序 → 并列 ord 降序）与缓存语义；≤k_req 个元素，成本可忽略。
-            std::sort(results.begin(), results.end(),
-                      [](const bm25::SearchResult& a,
-                         const bm25::SearchResult& b) {
-                          if (a.score != b.score) return a.score > b.score;
-                          return a.ord > b.ord;
-                      });
-        }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
-        if (!params_override) cache_.put(cache_key, results, terms);
-    }
+            if (terms->empty()) return FetchOut{};
 
-    // D2：filter 后过滤（空 meta 不通过）+ overfetch 后截断到 k。
-    return materialize_hits(results, docs_, filter, k);
+            // S27-3 Slice B2a：走 [SegmentSet + Building] 多段 G-on-the-fly 归并。
+            auto views = collect_default_segment_views();
+            if (!views.empty()) {
+                const auto hits = search::multi_segment_search(
+                    views, *terms, k_req, params_override);
+                results.reserve(hits.size());
+                for (const auto& h : hits) {
+                    results.push_back({h.ord, static_cast<float>(h.score)});
+                }
+                // S29-5 评估后保留：非冗余排序——multi_segment_search 返回并列
+                // 以 key 升序，此处重排为 ord 降序，对齐单索引路径（score_bow_topk
+                // 堆序 → 并列 ord 降序）与缓存语义；≤k_req 个元素，成本可忽略。
+                sort_truncate(results, k_req);
+            }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
+            if (!params_override) cache_.put(cache_key, results, *terms);
+        }
+        // D2：filter 后过滤（空 meta 不通过）+ 截断到 k。
+        return make_out(results, materialize_hits(results, docs_, filter, k));
+    };
+    // V5:filter 非空时首轮 overfetch K'=max(k×4, 64)；仍不够则翻倍补取。
+    return refetch_until_k(k, initial_k_req(k, filter), fetch);
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
 TextPlugin::search_phrase(std::string_view query, std::size_t k,
-                           const bm25::Bm25Params* params_override) const {
+                           const bm25::Bm25Params* params_override,
+                           const meta::MetaFilter* filter) const {
     // S10-A1:缓存检查前置（同 search_text）。
     if (query.empty()) return std::vector<SearchHit>{};
 
-    auto cache_key = CacheKey::make("phrase", query, k);
-    auto cached = params_override
-                      ? std::optional<std::vector<bm25::SearchResult>>{}
-                      : cache_.get(cache_key);
+    std::optional<std::vector<std::string>> terms;
+    auto fetch = [&](std::size_t k_req) -> FetchOut {
+        auto cache_key = CacheKey::make("phrase", query, k_req);
+        auto cached = params_override
+                          ? std::optional<std::vector<bm25::SearchResult>>{}
+                          : cache_.get(cache_key);
 
-    std::vector<bm25::SearchResult> results;
-    if (cached) {
-        results = std::move(*cached);
-    } else {
-        // S9.28：短语匹配依赖查询词序——用 analyze_with_positions 还原（D2 helper）。
-        auto terms = ordered_query_terms(query);
-        if (terms.empty()) return std::vector<SearchHit>{};
+        std::vector<bm25::SearchResult> results;
+        if (cached) {
+            results = std::move(*cached);
+        } else {
+            // S9.28：短语匹配依赖查询词序——用 analyze_with_positions 还原（D2 helper）。
+            if (!terms) terms = ordered_query_terms(query);
+            if (terms->empty()) return FetchOut{};
 
-        // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
-        auto views = collect_default_segment_views();
-        if (!views.empty()) {
-            for (const auto& s : views) {
-                auto seg_hits = s.inv->search_phrase(terms, k, *s.live, params_override);
-                for (auto& h : seg_hits) {
-                    results.push_back({s.lsn_of(h.ord), h.score});
+            // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
+            auto views = collect_default_segment_views();
+            if (!views.empty()) {
+                for (const auto& s : views) {
+                    auto seg_hits = s.inv->search_phrase(*terms, k_req, *s.live,
+                                                         params_override);
+                    for (auto& h : seg_hits) {
+                        results.push_back({s.lsn_of(h.ord), h.score});
+                    }
                 }
-            }
-            std::sort(results.begin(), results.end(),
-                      [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
-                          if (a.score != b.score) return a.score > b.score;
-                          return a.ord > b.ord;
-                      });
-            if (results.size() > k) results.resize(k);
-        }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
-        if (!params_override) cache_.put(cache_key, results, terms);
-    }
-
-    return materialize_hits(results, docs_);
+                sort_truncate(results, k_req);
+            }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
+            if (!params_override) cache_.put(cache_key, results, *terms);
+        }
+        return make_out(results, materialize_hits(results, docs_, filter, k));
+    };
+    return refetch_until_k(k, initial_k_req(k, filter), fetch);
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
 TextPlugin::search_near(std::string_view query, std::uint32_t slop, std::size_t k,
-                         const bm25::Bm25Params* params_override) const {
+                         const bm25::Bm25Params* params_override,
+                         const meta::MetaFilter* filter) const {
     // 近邻依赖查询词序——用 analyze_with_positions 还原（D2 helper，同 phrase）。
-    auto terms = ordered_query_terms(query);
+    const auto terms = ordered_query_terms(query);
     if (terms.empty()) return std::vector<SearchHit>{};
 
-    std::vector<bm25::SearchResult> results;
-    // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
-    auto views = collect_default_segment_views();
-    if (!views.empty()) {
-        for (const auto& s : views) {
-            auto seg_hits = s.inv->search_near(terms, k, slop, *s.live, params_override);
-            for (auto& h : seg_hits) {
-                results.push_back({s.lsn_of(h.ord), h.score});
+    auto fetch = [&](std::size_t k_req) -> FetchOut {
+        std::vector<bm25::SearchResult> results;
+        // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
+        auto views = collect_default_segment_views();
+        if (!views.empty()) {
+            for (const auto& s : views) {
+                auto seg_hits = s.inv->search_near(terms, k_req, slop, *s.live,
+                                                   params_override);
+                for (auto& h : seg_hits) {
+                    results.push_back({s.lsn_of(h.ord), h.score});
+                }
             }
-        }
-        std::sort(results.begin(), results.end(),
-                  [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
-                      if (a.score != b.score) return a.score > b.score;
-                      return a.ord > b.ord;
-                  });
-        if (results.size() > k) results.resize(k);
-    }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
-
-    return materialize_hits(results, docs_);
+            sort_truncate(results, k_req);
+        }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
+        return make_out(results, materialize_hits(results, docs_, filter, k));
+    };
+    return refetch_until_k(k, initial_k_req(k, filter), fetch);
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
 TextPlugin::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t max_edit_distance,
-                          const bm25::Bm25Params* params_override) const {
+                          const bm25::Bm25Params* params_override,
+                          const meta::MetaFilter* filter) const {
     auto term_freqs = analyzer_->analyze(query);
     if (term_freqs.empty()) return std::vector<SearchHit>{};
 
@@ -809,95 +856,98 @@ TextPlugin::search_fuzzy(std::string_view query, std::size_t k, std::uint32_t ma
         terms.push_back(term);
     }
 
-    std::vector<bm25::SearchResult> results;
-    // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
-    auto views = collect_default_segment_views();
-    if (!views.empty()) {
-        for (const auto& s : views) {
-            auto seg_hits = s.inv->search_fuzzy(terms, k, max_edit_distance, *s.live, params_override);
-            for (auto& h : seg_hits) {
-                results.push_back({s.lsn_of(h.ord), h.score});
-            }
-        }
-        std::sort(results.begin(), results.end(),
-                  [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
-                      if (a.score != b.score) return a.score > b.score;
-                      return a.ord > b.ord;
-                  });
-        if (results.size() > k) results.resize(k);
-    }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
-
-    return materialize_hits(results, docs_);
-}
-
-std::expected<std::vector<SearchHit>, SearchError>
-TextPlugin::bool_search(std::string_view query, std::size_t k,
-                         const bm25::Bm25Params* params_override) const {
-    // S10-A1:缓存检查前置（同 search_text）。
-    if (query.empty()) return std::vector<SearchHit>{};
-
-    auto cache_key = CacheKey::make("bool", query, k);
-    auto cached = params_override
-                      ? std::optional<std::vector<bm25::SearchResult>>{}
-                      : cache_.get(cache_key);
-
-    std::vector<bm25::SearchResult> results;
-    if (cached) {
-        results = std::move(*cached);
-    } else {
-        // S13-D9：含 '(' 或 '"' 的查询走树路径（递归下降 + 集合求值）；
-        // 其余仍走扁平路径——既有查询行为位级不变。
-        const bool tree_syntax =
-            query.find('(') != std::string_view::npos ||
-            query.find('"') != std::string_view::npos;
-        auto query_node = tree_syntax ? bitcask::bm25::parse_query_tree(query)
-                                      : bitcask::bm25::parse_query(query);
-        if (query_node.term.empty() && query_node.children.empty()) {
-            return std::vector<SearchHit>{};
-        }
-        if (tree_syntax) {
-            // 短语叶子：analyzer 切词填 phrase_terms（有序）。
-            std::function<void(bm25::QueryNode&)> fill =
-                [&](bm25::QueryNode& node) {
-                if (node.is_phrase) {
-                    node.phrase_terms = ordered_query_terms(node.term);
-                    return;
-                }
-                for (auto& c : node.children) fill(c);
-            };
-            fill(query_node);
-        }
-
+    auto fetch = [&](std::size_t k_req) -> FetchOut {
+        std::vector<bm25::SearchResult> results;
         // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
         auto views = collect_default_segment_views();
         if (!views.empty()) {
             for (const auto& s : views) {
-                auto seg_hits = tree_syntax
-                                    ? s.inv->bool_search_tree(query_node, k, *s.live, params_override)
-                                    : s.inv->bool_search(query_node, k, *s.live, params_override);
+                auto seg_hits = s.inv->search_fuzzy(terms, k_req, max_edit_distance,
+                                                    *s.live, params_override);
                 for (auto& h : seg_hits) {
                     results.push_back({s.lsn_of(h.ord), h.score});
                 }
             }
-            std::sort(results.begin(), results.end(),
-                      [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
-                          if (a.score != b.score) return a.score > b.score;
-                          return a.ord > b.ord;
-                      });
-            if (results.size() > k) results.resize(k);
+            sort_truncate(results, k_req);
         }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
-        if (!params_override && !results.empty()) {
-            // 收集 MUST/SHOULD/MUST_NOT 全部叶子词，作为该缓存条目的词集。
-            std::vector<std::string> must, should, must_not;
-            bm25::collect_terms(query_node, must, should, must_not);
-            std::vector<std::string> terms = std::move(must);
-            terms.insert(terms.end(), should.begin(), should.end());
-            terms.insert(terms.end(), must_not.begin(), must_not.end());
-            cache_.put(cache_key, results, std::move(terms));
-        }
-    }
+        return make_out(results, materialize_hits(results, docs_, filter, k));
+    };
+    return refetch_until_k(k, initial_k_req(k, filter), fetch);
+}
 
-    return materialize_hits(results, docs_);
+std::expected<std::vector<SearchHit>, SearchError>
+TextPlugin::bool_search(std::string_view query, std::size_t k,
+                         const bm25::Bm25Params* params_override,
+                         const meta::MetaFilter* filter) const {
+    // S10-A1:缓存检查前置（同 search_text）。
+    if (query.empty()) return std::vector<SearchHit>{};
+
+    // S13-D9：含 '(' 或 '"' 的查询走树路径（递归下降 + 集合求值）；
+    // 其余仍走扁平路径——既有查询行为位级不变。
+    const bool tree_syntax =
+        query.find('(') != std::string_view::npos ||
+        query.find('"') != std::string_view::npos;
+    // 解析惰性且只做一次（同 search_text 的 terms）。
+    std::optional<bm25::QueryNode> query_node;
+    auto fetch = [&](std::size_t k_req) -> FetchOut {
+        auto cache_key = CacheKey::make("bool", query, k_req);
+        auto cached = params_override
+                          ? std::optional<std::vector<bm25::SearchResult>>{}
+                          : cache_.get(cache_key);
+
+        std::vector<bm25::SearchResult> results;
+        if (cached) {
+            results = std::move(*cached);
+        } else {
+            if (!query_node) {
+                query_node = tree_syntax ? bitcask::bm25::parse_query_tree(query)
+                                         : bitcask::bm25::parse_query(query);
+                if (tree_syntax) {
+                    // 短语叶子：analyzer 切词填 phrase_terms（有序）。
+                    std::function<void(bm25::QueryNode&)> fill =
+                        [&](bm25::QueryNode& node) {
+                        if (node.is_phrase) {
+                            node.phrase_terms = ordered_query_terms(node.term);
+                            return;
+                        }
+                        for (auto& c : node.children) fill(c);
+                    };
+                    fill(*query_node);
+                }
+            }
+            if (query_node->term.empty() && query_node->children.empty()) {
+                return FetchOut{};
+            }
+
+            // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
+            auto views = collect_default_segment_views();
+            if (!views.empty()) {
+                for (const auto& s : views) {
+                    auto seg_hits =
+                        tree_syntax
+                            ? s.inv->bool_search_tree(*query_node, k_req, *s.live,
+                                                      params_override)
+                            : s.inv->bool_search(*query_node, k_req, *s.live,
+                                                 params_override);
+                    for (auto& h : seg_hits) {
+                        results.push_back({s.lsn_of(h.ord), h.score});
+                    }
+                }
+                sort_truncate(results, k_req);
+            }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
+            if (!params_override && !results.empty()) {
+                // 收集 MUST/SHOULD/MUST_NOT 全部叶子词，作为该缓存条目的词集。
+                std::vector<std::string> must, should, must_not;
+                bm25::collect_terms(*query_node, must, should, must_not);
+                std::vector<std::string> cterms = std::move(must);
+                cterms.insert(cterms.end(), should.begin(), should.end());
+                cterms.insert(cterms.end(), must_not.begin(), must_not.end());
+                cache_.put(cache_key, results, std::move(cterms));
+            }
+        }
+        return make_out(results, materialize_hits(results, docs_, filter, k));
+    };
+    return refetch_until_k(k, initial_k_req(k, filter), fetch);
 }
 
 std::optional<bm25::ScoreExplanation>
@@ -938,32 +988,32 @@ TextPlugin::explain(std::string_view query, std::string_view key,
 
 std::expected<std::vector<SearchHit>, SearchError>
 TextPlugin::search_wildcard(std::string_view pattern, std::size_t k,
-                             const bm25::Bm25Params* params_override) const {
-    std::vector<bm25::SearchResult> results;
-    // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
-    auto views = collect_default_segment_views();
-    if (!views.empty()) {
-        const std::string pat(pattern);
-        for (const auto& s : views) {
-            auto seg_hits = s.inv->search_wildcard(pat, k, *s.live, params_override);
-            for (auto& h : seg_hits) {
-                results.push_back({s.lsn_of(h.ord), h.score});
+                             const bm25::Bm25Params* params_override,
+                             const meta::MetaFilter* filter) const {
+    const std::string pat(pattern);
+    auto fetch = [&](std::size_t k_req) -> FetchOut {
+        std::vector<bm25::SearchResult> results;
+        // S27-3 Slice B2a：走 [SegmentSet + Building] 逐段并集。
+        auto views = collect_default_segment_views();
+        if (!views.empty()) {
+            for (const auto& s : views) {
+                auto seg_hits = s.inv->search_wildcard(pat, k_req, *s.live,
+                                                       params_override);
+                for (auto& h : seg_hits) {
+                    results.push_back({s.lsn_of(h.ord), h.score});
+                }
             }
-        }
-        std::sort(results.begin(), results.end(),
-                  [](const bm25::SearchResult& a, const bm25::SearchResult& b) {
-                      if (a.score != b.score) return a.score > b.score;
-                      return a.ord > b.ord;
-                  });
-        if (results.size() > k) results.resize(k);
-    }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
-
-    return materialize_hits(results, docs_);
+            sort_truncate(results, k_req);
+        }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
+        return make_out(results, materialize_hits(results, docs_, filter, k));
+    };
+    return refetch_until_k(k, initial_k_req(k, filter), fetch);
 }
 
 std::expected<std::vector<SearchHit>, SearchError>
 TextPlugin::search_fields(std::string_view query, std::size_t k,
-                           const bm25::Bm25Params* params_override) const {
+                           const bm25::Bm25Params* params_override,
+                           const meta::MetaFilter* filter) const {
     auto qnode = bitcask::bm25::parse_query(query);
 
     std::vector<const bm25::QueryNode*> leaves;
@@ -974,7 +1024,6 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
     walk(qnode);
     if (leaves.empty()) return std::vector<SearchHit>{};
 
-    struct FieldQuery { std::vector<std::string> terms; float boost; };
     std::unordered_map<std::string, std::vector<std::pair<std::string,float>>> by_field;
     for (auto* leaf : leaves) {
         std::string field = leaf->field.empty() ? std::string(kDefaultField) : leaf->field;
@@ -984,10 +1033,10 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
         }
     }
 
-    // S27-3 Slice B2a：逐段逐字段 + boost 累加（同 fields_ 逻辑，换段集源）。
-    std::unordered_map<std::uint64_t, double> acc;
-    auto seg_views = collect_multi_field_segment_views();
-    if (!seg_views.empty()) {
+    auto fetch = [&](std::size_t k_req) -> FetchOut {
+        // S27-3 Slice B2a：逐段逐字段 + boost 累加（同 fields_ 逻辑，换段集源）。
+        std::unordered_map<std::uint64_t, double> acc;
+        auto seg_views = collect_multi_field_segment_views();
         for (const auto& sv : seg_views) {
             for (const auto& fv : sv.fields) {
                 auto fbi = by_field.find(std::string(fv.field_name));
@@ -1001,32 +1050,39 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
                     g.insert(g.end(), expanded.begin(), expanded.end());
                 }
                 for (auto& [boost, gterms] : boost_groups) {
-                    auto res = fv.inv->search(gterms, k, *sv.seg, params_override);
+                    auto res = fv.inv->search(gterms, k_req, *sv.seg, params_override);
                     for (auto& r : res) {
                         acc[sv.seg->lsn_at(r.ord)] += static_cast<double>(r.score) * boost;
                     }
                 }
             }
+        }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
+
+        std::vector<std::pair<std::uint64_t,double>> ranked(acc.begin(), acc.end());
+        std::partial_sort(ranked.begin(),
+                          ranked.begin() +
+                              static_cast<std::ptrdiff_t>(std::min(k_req, ranked.size())),
+                          ranked.end(),
+                          [](const auto& a, const auto& b) {
+                              // 全序：分数降序、并列 ord 降序（同 sort_truncate）。
+                              if (a.second != b.second) return a.second > b.second;
+                              return a.first > b.first;
+                          });
+        if (ranked.size() > k_req) ranked.resize(k_req);
+
+        std::vector<SearchHit> hits;
+        hits.reserve(std::min(k, ranked.size()));
+        for (auto& [ord, score] : ranked) {
+            if (hits.size() >= k) break;
+            if (!docs_.is_live(ord)) continue;  // B2a：全局兜底（S18-8 段级盲区）
+            if (filter && !docs_.eval_meta(ord, *filter)) continue;
+            auto ext_id = docs_.ord_to_ext(ord);
+            if (!ext_id) continue;
+            hits.push_back(SearchHit{std::move(*ext_id), ord, score});
         }
-    }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
-
-    std::vector<std::pair<std::uint64_t,double>> ranked(acc.begin(), acc.end());
-    std::partial_sort(ranked.begin(),
-                      ranked.begin() +
-                          static_cast<std::ptrdiff_t>(std::min(k, ranked.size())),
-                      ranked.end(),
-                      [](const auto& a, const auto& b) { return a.second > b.second; });
-    if (ranked.size() > k) ranked.resize(k);
-
-    std::vector<SearchHit> hits;
-    hits.reserve(ranked.size());
-    for (auto& [ord, score] : ranked) {
-        if (!docs_.is_live(ord)) continue;  // B2a：全局兜底（S18-8 段级盲区）
-        auto ext_id = docs_.ord_to_ext(ord);
-        if (!ext_id) continue;
-        hits.push_back(SearchHit{std::move(*ext_id), ord, score});
-    }
-    return hits;
+        return {ranked.size(), std::move(hits)};
+    };
+    return refetch_until_k(k, initial_k_req(k, filter), fetch);
 }
 
 std::expected<std::vector<SearchHitEx>, SearchError>

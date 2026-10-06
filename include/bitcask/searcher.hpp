@@ -89,37 +89,48 @@ public:
         });
     }
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    search_phrase(std::string_view query, std::size_t k) const {
-        return search::detail::run_query(
-            cask_, [&] { return plugin_.search_phrase(query, k); });
-    }
-    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    search_near(std::string_view query, std::uint32_t slop,
-                std::size_t k) const {
-        return search::detail::run_query(
-            cask_, [&] { return plugin_.search_near(query, slop, k); });
-    }
-    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    bool_search(std::string_view query, std::size_t k) const {
-        return search::detail::run_query(
-            cask_, [&] { return plugin_.bool_search(query, k); });
-    }
-    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    search_fields(std::string_view query, std::size_t k) const {
-        return search::detail::run_query(
-            cask_, [&] { return plugin_.search_fields(query, k); });
-    }
-    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    search_fuzzy(std::string_view query, std::size_t k,
-                 std::uint32_t max_edit_distance) const {
+    search_phrase(std::string_view query, std::size_t k,
+                  const meta::MetaFilter* filter = nullptr) const {
         return search::detail::run_query(cask_, [&] {
-            return plugin_.search_fuzzy(query, k, max_edit_distance);
+            return plugin_.search_phrase(query, k, nullptr, filter);
         });
     }
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>
-    search_wildcard(std::string_view pattern, std::size_t k) const {
-        return search::detail::run_query(
-            cask_, [&] { return plugin_.search_wildcard(pattern, k); });
+    search_near(std::string_view query, std::uint32_t slop, std::size_t k,
+                const meta::MetaFilter* filter = nullptr) const {
+        return search::detail::run_query(cask_, [&] {
+            return plugin_.search_near(query, slop, k, nullptr, filter);
+        });
+    }
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    bool_search(std::string_view query, std::size_t k,
+                const meta::MetaFilter* filter = nullptr) const {
+        return search::detail::run_query(cask_, [&] {
+            return plugin_.bool_search(query, k, nullptr, filter);
+        });
+    }
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    search_fields(std::string_view query, std::size_t k,
+                  const meta::MetaFilter* filter = nullptr) const {
+        return search::detail::run_query(cask_, [&] {
+            return plugin_.search_fields(query, k, nullptr, filter);
+        });
+    }
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    search_fuzzy(std::string_view query, std::size_t k,
+                 std::uint32_t max_edit_distance,
+                 const meta::MetaFilter* filter = nullptr) const {
+        return search::detail::run_query(cask_, [&] {
+            return plugin_.search_fuzzy(query, k, max_edit_distance, nullptr,
+                                        filter);
+        });
+    }
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    search_wildcard(std::string_view pattern, std::size_t k,
+                    const meta::MetaFilter* filter = nullptr) const {
+        return search::detail::run_query(cask_, [&] {
+            return plugin_.search_wildcard(pattern, k, nullptr, filter);
+        });
     }
     // 高亮：返回类型为 SearchHitEx 向量（非 TextSearchResult），不套用共用
     // 骨架——单独物化。

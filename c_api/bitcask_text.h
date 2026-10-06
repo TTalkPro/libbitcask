@@ -120,13 +120,61 @@ BITCASK_API bitcask_error_t bitcask_search_text_ex(
     const bitcask_meta_filter_t* filter, size_t offset,
     bitcask_search_result_t** out, bitcask_fault_t* fault);
 
-/* 短语/布尔搜索的分页版（C++ 侧这两个没有 filter 形参，故只加 offset）。 */
+/* 短语/布尔搜索的分页版（只加 offset；filter + offset 全参版见下方
+ * bitcask_search_phrase_filtered / bitcask_bool_search_filtered）。 */
 BITCASK_API bitcask_error_t bitcask_search_phrase_ex(
     bitcask_t* cask, const char* query, size_t k, size_t offset,
     bitcask_search_result_t** out, bitcask_fault_t* fault);
 
 BITCASK_API bitcask_error_t bitcask_bool_search_ex(
     bitcask_t* cask, const char* query, size_t k, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+/* ===========================================================================
+ *  其余文本检索的 meta 过滤版（下游反馈 2026-10-06）——C++ 侧 phrase / bool /
+ *  fields / near / fuzzy / wildcard 补上 filter 形参，C 侧以 additive 新符号
+ *  跟进，既有函数签名零改动。
+ *
+ *  filter == NULL 等价无过滤；filter 非法 → BITCASK_ERR_INVALID_OPTION（判据同
+ *  bitcask_search_text_filtered）。filter 非空时**没有 meta 段的文档一律不通过**。
+ *  过滤树在调用期间转换，返回后 C 侧存储即可释放。
+ *
+ *  补取语义（全部文本检索通用，含既有 *_filtered / *_ex）：后过滤后命中不足
+ *  k 时引擎自动加大候选数重取，直到凑满 k 或候选穷尽——**返回少于 k 条即满足
+ *  条件的就这么多**。注意同分并列的取舍尚不随 k 稳定：小 k 结果不保证是
+ *  大 k 结果的前缀，offset 分页在同分处可能重复 / 遗漏（待修）。
+ *
+ *  phrase / bool 的过滤版同时收 offset（与 bitcask_search_text_ex 对齐，是
+ *  同名 _ex 的超集）；其余四个 C++ 侧本无 offset，故不收。
+ * ========================================================================= */
+BITCASK_API bitcask_error_t bitcask_search_phrase_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_bool_search_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter, size_t offset,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_search_fields_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_search_near_filtered(
+    bitcask_t* cask, const char* query, uint32_t slop, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_search_fuzzy_filtered(
+    bitcask_t* cask, const char* query, size_t k, uint32_t max_edit_distance,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_search_wildcard_filtered(
+    bitcask_t* cask, const char* pattern, size_t k,
+    const bitcask_meta_filter_t* filter,
     bitcask_search_result_t** out, bitcask_fault_t* fault);
 
 /* ===========================================================================

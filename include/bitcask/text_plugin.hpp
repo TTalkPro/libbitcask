@@ -219,6 +219,9 @@ public:
                    std::uint64_t prior_ord);
 
     // ---- 查询面（线程安全，语义与原 SearchLayer 相同）----
+    // filter 非空时 meta 后过滤（无 meta 的文档不通过）。后过滤 / 全局判活
+    // 丢掉候选致命中不足 k 时**翻倍补取**，直到凑满 k 或候选穷尽——返回
+    // 少于 k 条即「满足条件的就这么多」（下游反馈 2026-10-06 第 1 条）。
     [[nodiscard]] std::expected<std::vector<search::SearchHit>,
                                 search::SearchError>
     search_text(std::string_view query, std::size_t k,
@@ -227,28 +230,34 @@ public:
     [[nodiscard]] std::expected<std::vector<search::SearchHit>,
                                 search::SearchError>
     search_phrase(std::string_view query, std::size_t k,
-                  const bm25::Bm25Params* params_override = nullptr) const;
+                  const bm25::Bm25Params* params_override = nullptr,
+                  const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>,
                                 search::SearchError>
     search_near(std::string_view query, std::uint32_t slop, std::size_t k,
-                const bm25::Bm25Params* params_override = nullptr) const;
+                const bm25::Bm25Params* params_override = nullptr,
+                const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>,
                                 search::SearchError>
     bool_search(std::string_view query, std::size_t k,
-                const bm25::Bm25Params* params_override = nullptr) const;
+                const bm25::Bm25Params* params_override = nullptr,
+                const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>,
                                 search::SearchError>
     search_fuzzy(std::string_view query, std::size_t k,
                  std::uint32_t max_edit_distance,
-                 const bm25::Bm25Params* params_override = nullptr) const;
+                 const bm25::Bm25Params* params_override = nullptr,
+                 const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>,
                                 search::SearchError>
     search_fields(std::string_view query, std::size_t k,
-                  const bm25::Bm25Params* params_override = nullptr) const;
+                  const bm25::Bm25Params* params_override = nullptr,
+                  const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>,
                                 search::SearchError>
     search_wildcard(std::string_view pattern, std::size_t k,
-                    const bm25::Bm25Params* params_override = nullptr) const;
+                    const bm25::Bm25Params* params_override = nullptr,
+                    const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::optional<bm25::ScoreExplanation>
     explain(std::string_view query, std::string_view key,
             const bm25::Bm25Params* params_override = nullptr) const;

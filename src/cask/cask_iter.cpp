@@ -181,7 +181,12 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
             if (dv->expiry_at != 0 && dv->expiry_at <= now_sec_default()) {
                 continue;
             }
+            // 反馈 2026-10-06：meta 筛选先于拷值；无 meta 不通过（同检索侧）。
+            if (filter_ && (dv->meta.empty() || !filter_->evaluate(dv->meta))) {
+                continue;
+            }
             e.value.assign(dv->text.begin(), dv->text.end());
+            if (want_meta_) e.meta.assign(dv->meta.begin(), dv->meta.end());
         }
         e.tstamp       = rec->tstamp;
         e.file_id      = proxy->file_id;
