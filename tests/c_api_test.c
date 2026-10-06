@@ -739,6 +739,56 @@ static int test_txn(void) {
     bitcask_get_result_free(r);
     assert(bitcask_put_batch_atomic(cask, NULL, 0, &fault) == BITCASK_OK);
 
+    // 下游反馈 2026-10-06：带文档的原子批 / 事务（op = 2 → put_doc）。
+    bitcask_doc_input_ex_t d = {0};
+    d.text = (bitcask_slice_t){"apple", 5};
+    d.meta = (bitcask_slice_t){"M-blue", 6};
+    bitcask_txn_op_ex_t ex[3] = {
+        {2, {"pk", 2}, {NULL, 0}, &d},
+        {0, {"ix/blue/pk", 10}, {"", 0}, NULL},
+        {1, {"ix/red/pk", 9}, {NULL, 0}, NULL},
+    };
+    assert(bitcask_put(cask, ex[2].key, (bitcask_slice_t){"", 0}, 0, &fault) ==
+           BITCASK_OK);
+    assert(bitcask_put_batch_atomic_ex(cask, ex, 3, &fault) == BITCASK_OK);
+    r = NULL;
+    assert(bitcask_get(cask, ex[0].key, &r, &fault) == BITCASK_OK);
+    assert(r->value.size == 5 && memcmp(r->value.data, "apple", 5) == 0);
+    assert(r->meta.size == 6 && memcmp(r->meta.data, "M-blue", 6) == 0);
+    bitcask_get_result_free(r);
+    r = NULL;
+    assert(bitcask_get(cask, ex[1].key, &r, &fault) == BITCASK_OK);
+    bitcask_get_result_free(r);
+    r = NULL;
+    assert(bitcask_get(cask, ex[2].key, &r, &fault) == BITCASK_ERR_NOT_FOUND);
+
+    d.meta = (bitcask_slice_t){"M-red", 5};
+    bitcask_txn_op_ex_t ex2[1] = {{2, {"pk2", 3}, {NULL, 0}, &d}};
+    assert(bitcask_txn_commit_ex(cask, ex2, 1, 1, &fault) == BITCASK_OK);
+    r = NULL;
+    assert(bitcask_get(cask, ex2[0].key, &r, &fault) == BITCASK_OK);
+    assert(r->meta.size == 5 && memcmp(r->meta.data, "M-red", 5) == 0);
+    bitcask_get_result_free(r);
+
+    // 校验拒绝：op = 2 缺 doc / 未知 op / 事务级重复 key。
+    bitcask_txn_op_ex_t no_doc[1] = {{2, {"z", 1}, {NULL, 0}, NULL}};
+    assert(bitcask_put_batch_atomic_ex(cask, no_doc, 1, &fault) ==
+           BITCASK_ERR_INVALID_OPTION);
+    assert(bitcask_txn_commit_ex(cask, no_doc, 1, 1, &fault) ==
+           BITCASK_ERR_INVALID_OPTION);
+    bitcask_txn_op_ex_t bad_op[1] = {{3, {"z", 1}, {"v", 1}, NULL}};
+    assert(bitcask_put_batch_atomic_ex(cask, bad_op, 1, &fault) ==
+           BITCASK_ERR_INVALID_OPTION);
+    bitcask_txn_op_ex_t dup_ex[2] = {
+        {2, {"z", 1}, {NULL, 0}, &d},
+        {0, {"z", 1}, {"v", 1}, NULL},
+    };
+    assert(bitcask_txn_commit_ex(cask, dup_ex, 2, 1, &fault) ==
+           BITCASK_ERR_INVALID_OPTION);
+    r = NULL;
+    assert(bitcask_get(cask, (bitcask_slice_t){"z", 1}, &r, &fault) ==
+           BITCASK_ERR_NOT_FOUND);
+
     bitcask_close(cask);
     printf("PASS test_txn\n");
     return 0;
