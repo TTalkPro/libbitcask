@@ -14,6 +14,41 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ---
 
+## [Unreleased]
+
+> **版本语义**：C API **纯加法**（2 个新符号 + 1 个新结构体，`bitcask_txn_op_t` 与
+> 既有函数零改动）；C++ 层 `Cask::BatchOp` / `TxnOp` 枚举末尾加值 + 末位加带默认值
+> 的成员（同 6.6.1 `Entry::meta` 口径）；盘上格式未动（批成员本就是普通 `kDoc`
+> 记录，恢复 / merge / hint 零特判）；`SOVERSION` 保持 `6`。
+>
+> 来源：下游 bitcask（Erlang 封装）`feedbacks/2026-10-06-atomic-batch-doc-meta.md`。
+
+### Added
+
+- **原子批 / 事务收结构化文档**（🟡 能力缺口）。原先 `BatchOp` 只有 key + value，
+  value 一律按 text 编码，带 meta / vector / fields / expiry_at 的文档进不了原子批——
+  维护 meta 二级索引的下游无法让「文档 + 新索引项 + 删旧索引项」同批落盘，只能拆三步
+  写、加 key 锁、读时回表校验兜底。
+  - C++：`Cask::BatchOp::Type::kPutDoc` + `const DocInput* doc`；`TxnOp` 同步加
+    `kPutDoc` / `doc`（`TxnCask::commit` 照常做事务级校验）。批内文档的编码、向量
+    归一化（cosine 存储即归一化值）、字段 intern、索引登记（text / fields / vector /
+    meta）与 `put_doc` 逐项相同，`expiry_at` 同样生效。二者共用新抽出的
+    `make_doc_add_task`，不会各自漂移。
+  - C：`bitcask_txn_op_ex_t`（多 `const bitcask_doc_input_ex_t* doc`，`op = 2` =
+    put_doc）+ `bitcask_put_batch_atomic_ex` / `bitcask_txn_commit_ex`。
+  - 校验：`doc == nullptr` / 向量维度错 / 未知 op 类型 → `kInvalidOption`，**零副作用**
+    ——向量校验在前，字段 intern（会追加 `field.schema`）推迟到全批校验通过之后，被拒
+    批的新字段名不入注册表；meta 不懒升 v6。原先 C++ 直调传入越界 op 值（C 侧已挡）会按墓碑
+    落盘、却按 put 进 keydir，前后不一致；现一并拒绝。
+  - 顺带修正：merge race 单条重写路径改为复用预编码 value，不再按 text 重新编码
+    （否则 kPutDoc 在该罕见路径上会丢 meta / vector / fields）。
+  - 回归 `AtomicBatchDocTest.*`（与 put_doc 存储逐字段相同 + 全量 fold 后索引仍在；
+    meta 改色同批完成；撕裂批下文档与索引项在 keydir 与检索两侧一起不可见——崩溃盘面
+    取自库未关闭时的目录拷贝，变异验证：不掐尾则四项断言全反转；校验零副作用；
+    批内 expiry_at 与 `TxnCask` 路径）/ C 侧 `test_txn` 扩展。
+
+---
+
 ## [6.6.1] - 2026-10-06（meta filter：补取到 k · 同分 top-K 前缀稳定 · 全部文本检索收 filter · 迭代器交出 meta / 按 meta 筛选 · keydir 乐观读 TSan data race）
 
 > **版本语义**：C API **纯加法**（14 个新符号 + 2 个新结构体，既有函数签名与
