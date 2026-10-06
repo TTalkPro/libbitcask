@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.6.1`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.6.2`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
@@ -16,10 +16,17 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ## [Unreleased]
 
+---
+
+## [6.6.2] - 2026-10-06（原子批 / `txn_commit` 收结构化文档 · 越界 op 值拒收 · merge race 重写路径复用预编码 value）
+
 > **版本语义**：C API **纯加法**（2 个新符号 + 1 个新结构体，`bitcask_txn_op_t` 与
 > 既有函数零改动）；C++ 层 `Cask::BatchOp` / `TxnOp` 枚举末尾加值 + 末位加带默认值
 > 的成员（同 6.6.1 `Entry::meta` 口径）；盘上格式未动（批成员本就是普通 `kDoc`
-> 记录，恢复 / merge / hint 零特判）；`SOVERSION` 保持 `6`。
+> 记录，恢复 / merge / hint 零特判）；`SOVERSION` 保持 `6`。**按维护者决定取
+> PATCH +1（6.6.2），而非按 semver 的 MINOR（6.7.0）**——同 6.6.1 的口径，延续
+> 同一批下游的 pin 序列；新符号只被下游新代码引用，对既有二进制零风险。此处显式
+> 记下这处偏离，不静默改口径。
 >
 > 来源：下游 bitcask（Erlang 封装）`feedbacks/2026-10-06-atomic-batch-doc-meta.md`。
 
