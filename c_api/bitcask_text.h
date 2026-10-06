@@ -141,8 +141,8 @@ BITCASK_API bitcask_error_t bitcask_bool_search_ex(
  *
  *  补取语义（全部文本检索通用，含既有 *_filtered / *_ex）：后过滤后命中不足
  *  k 时引擎自动加大候选数重取，直到凑满 k 或候选穷尽——**返回少于 k 条即满足
- *  条件的就这么多**。注意同分并列的取舍尚不随 k 稳定：小 k 结果不保证是
- *  大 k 结果的前缀，offset 分页在同分处可能重复 / 遗漏（待修）。
+ *  条件的就这么多**。结果是全序（分数降序、段次序、段内 docid 升序）下的
+ *  前 k 名：小 k 结果恒为大 k 结果的前缀，offset 分页不重不漏。
  *
  *  phrase / bool 的过滤版同时收 offset（与 bitcask_search_text_ex 对齐，是
  *  同名 _ex 的超集）；其余四个 C++ 侧本无 offset，故不收。

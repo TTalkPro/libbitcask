@@ -1410,6 +1410,7 @@ BITCASK_API bitcask_error_t bitcask_search_text_filtered(
 - `filter` 非法（`key == NULL`、`STRING` 值缺 `str`、嵌套深度 > 32、`op`/`type` 越界）→ `BITCASK_ERR_INVALID_OPTION`。
 - **注意**：`filter` 非空时**没有 meta 段的文档一律不通过**（引擎"空 blob 不通过"约定，与 C++ `MetaFilter` 行为一致）——含 `Neq`/`Exists` 等否定式条件。
 - **补取**（下游反馈 2026-10-06）：后过滤后命中不足 `k` 时引擎自动加大候选数重取，直到凑满 `k` 或候选穷尽——**返回少于 `k` 条即满足条件的就这么多**（此前只多取一轮 `max(k×4, 64)`，严 filter 下静默少返回）。全部带 filter 的文本检索与 hybrid 文本路同此语义。
+- **同分序**（下游反馈 2026-10-06）：全部文本检索的结果是全序（分数降序、段次序、段内 docid 升序）下的前 `k` 名——小 `k` 结果恒为大 `k` 结果的前缀，`offset` 分页不重不漏；同分者大体按写入序先后。
 
 ### 13.3 `bitcask_search_text_batch`（批量词袋）
 

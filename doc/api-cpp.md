@@ -562,7 +562,7 @@ public:
 
 ### 5.4 检索（索引模式）
 
-无 search 层 → `kNoIndex`；无向量配置 → `kInvalidOption`。所有检索方法线程安全：是（并发读：cache_/doc_texts_ shared_mutex、倒排/HNSW shared_lock、analyzer const；与写并发遵循 near-real-time 可见性）。`filter` 非空时 meta 后过滤（无 meta 的文档不通过）：首轮多取 `max(k×4, 64)` 个候选，过滤后不足 `k` 则把候选数翻倍补取，直到凑满 `k` 或候选穷尽——**返回少于 `k` 条即满足条件的就这么多**（下游反馈 2026-10-06；此前只取一轮，严 filter 下静默少返回）。全部文本检索（text / phrase / bool / fields / near / fuzzy / wildcard）与 hybrid 文本路同此语义。⚠️ 同分并列：进入前 `k` 名的同分文档由内核扫描 / 剪枝次序决定，**小 K 结果不保证是大 K 结果的前缀**，`offset` 分页在同分处可能重复 / 遗漏（反馈 2026-10-06 第 5 条，待内核统一平局规则后修复）。
+无 search 层 → `kNoIndex`；无向量配置 → `kInvalidOption`。所有检索方法线程安全：是（并发读：cache_/doc_texts_ shared_mutex、倒排/HNSW shared_lock、analyzer const；与写并发遵循 near-real-time 可见性）。`filter` 非空时 meta 后过滤（无 meta 的文档不通过）：首轮多取 `max(k×4, 64)` 个候选，过滤后不足 `k` 则把候选数翻倍补取，直到凑满 `k` 或候选穷尽——**返回少于 `k` 条即满足条件的就这么多**（下游反馈 2026-10-06；此前只取一轮，严 filter 下静默少返回）。全部文本检索（text / phrase / bool / fields / near / fuzzy / wildcard）与 hybrid 文本路同此语义。结果是全序 **(分数降序, 段次序, 段内 docid 升序)** 下的前 `k` 名——**小 K 结果恒为大 K 结果的前缀**，`offset` 分页不重不漏（反馈 2026-10-06 第 5 条）。同分者大体按写入序先后；同分序在两次段封口 / 合并之间稳定。多字段 `search_fields` 为逐字段 top-k 求和的近似，前缀性不作保证。
 
 #### `Cask::search_text`（词袋 BM25）
 
