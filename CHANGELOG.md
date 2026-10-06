@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.6.0`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.6.1`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
@@ -14,11 +14,17 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ---
 
-## [Unreleased]（meta filter：补取到 k · 同分 top-K 前缀稳定 · 全部文本检索收 filter · 迭代器交出 meta / 按 meta 筛选）
+## [6.6.1] - 2026-10-06（meta filter：补取到 k · 同分 top-K 前缀稳定 · 全部文本检索收 filter · 迭代器交出 meta / 按 meta 筛选 · keydir 乐观读 TSan data race）
 
-> 来源：下游 bitcask（Erlang 封装）`feedbacks/2026-10-06-meta-filter-query-gaps.md`。
-> C++ 层只加带默认值的末位形参 / 新成员；C API **纯加法**（14 个新符号 + 2 个新结构体，
-> 既有函数签名与结构体布局都没动）；盘上格式未动。
+> **版本语义**：C API **纯加法**（14 个新符号 + 2 个新结构体，既有函数签名与
+> 结构体布局都没动，ABI 向后兼容）；C++ 层只加带默认值的末位形参 / 新成员；盘上
+> 格式未动；`SOVERSION` 保持 `6`。**按维护者决定取 PATCH +1（6.6.1），而非按
+> semver 的 MINOR（6.7.0）**——本批主体是结果错的修复，Added 里的新 API 只被
+> 下游新代码引用，对既有二进制零风险。此处显式记下这处偏离，不静默改口径。
+>
+> 来源：下游 bitcask（Erlang 封装）`feedbacks/2026-10-06-meta-filter-query-gaps.md`
+> 五条账；另销 `TASK.md` S37-4 复验里挂着的 TSan 预存豁免项
+> （`KeyDirOptimisticRead.ConcurrentGetPutRemoveGrowStress`）。
 
 ### Fixed
 
