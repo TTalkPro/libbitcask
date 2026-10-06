@@ -593,6 +593,34 @@ BITCASK_API bitcask_error_t bitcask_txn_commit(bitcask_t* cask,
                                                int sync_on_commit,
                                                bitcask_fault_t* fault);
 
+/* 下游反馈 2026-10-06：带文档的原子批 / 事务。bitcask_txn_op_t 的 value
+ * 一律按 text 写，带 meta / vector / fields / expiry_at 的文档进不了批，
+ * 于是「文档 + 它的二级索引项」无法同批落盘。本组按纯加法补齐：
+ * bitcask_txn_op_t 与两个既有函数**零改动**，新结构 + 新函数（SOVERSION 不变）。
+ *
+ * op = 2（put_doc）：写结构化文档，编码与索引登记与 bitcask_put_doc_ex
+ * 逐项相同；value 被忽略，doc 必填（NULL → BITCASK_ERR_INVALID_OPTION，
+ * 零副作用）。op = 0 / 1 与 bitcask_txn_op_t 同义（doc 被忽略）。
+ * 其余语义（原子性、meta v6 懒升级、durability、事务级校验）分别同
+ * bitcask_put_batch_atomic / bitcask_txn_commit。ops 与 doc 借调用方存储。 */
+typedef struct {
+    uint8_t                       op;     /* 0 = put, 1 = remove, 2 = put_doc */
+    bitcask_slice_t               key;
+    bitcask_slice_t               value;  /* op = 0 时用；1 / 2 忽略 */
+    const bitcask_doc_input_ex_t* doc;    /* op = 2 必填；0 / 1 忽略 */
+} bitcask_txn_op_ex_t;
+
+BITCASK_API bitcask_error_t bitcask_put_batch_atomic_ex(bitcask_t* cask,
+                                                        const bitcask_txn_op_ex_t* ops,
+                                                        size_t n_ops,
+                                                        bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_txn_commit_ex(bitcask_t* cask,
+                                                  const bitcask_txn_op_ex_t* ops,
+                                                  size_t n_ops,
+                                                  int sync_on_commit,
+                                                  bitcask_fault_t* fault);
+
 /* B2（6.0.0）：恒返回 0——方案 B 的意图重放已删除（发布版从未写过
  * 意图 blob；签名保留为 API 稳定面）。开发期残留的 "_txn:" 前缀 key
  * 可经普通 KV API 手工清理。out_replayed 可为 NULL。 */

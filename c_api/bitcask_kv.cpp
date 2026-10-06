@@ -411,24 +411,19 @@ BITCASK_API void bitcask_get_result_free(bitcask_get_result_t* result) {
 // 分叉，其余（校验、span 转换、错误映射）逐字相同，故收编成一份。
 namespace {
 
-bitcask_error_t put_doc_common(bitcask_t* cask,
-                               bitcask_slice_t key,
-                               bitcask_slice_t text,
-                               bitcask_slice_t meta_slice,
-                               const float* vector,
-                               size_t vector_len,
-                               uint64_t expiry_at,
-                               const bitcask_doc_field_t* fields,
-                               size_t fields_count,
-                               uint64_t tstamp,
-                               bitcask_fault_t* fault) {
-    if (!cask) return BITCASK_ERR_INVALID_OPTION;
-    if (!slice_valid(key) || !slice_valid(text) ||
-        !slice_valid(meta_slice)) return BITCASK_ERR_INVALID_OPTION;  // S25-M2
-    if (fields_count > 0 && !fields) return BITCASK_ERR_INVALID_OPTION;
+// put_doc_common 与原子批 put_doc op 共用：C 文档 → DocInput。校验失败返回
+// false（调用方映射 BITCASK_ERR_INVALID_OPTION）。
+bool to_cpp_doc(bitcask_slice_t text,
+                bitcask_slice_t meta_slice,
+                const float* vector,
+                size_t vector_len,
+                uint64_t expiry_at,
+                const bitcask_doc_field_t* fields,
+                size_t fields_count,
+                bitcask::DocInput& doc_input) {
+    if (!slice_valid(text) || !slice_valid(meta_slice)) return false;  // S25-M2
+    if (fields_count > 0 && !fields) return false;
 
-    std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
-    bitcask::DocInput doc_input;
     doc_input.text = {static_cast<const std::byte*>(text.data), text.size};
     if (meta_slice.data && meta_slice.size > 0) {
         doc_input.meta = {static_cast<const std::byte*>(meta_slice.data), meta_slice.size};
@@ -443,14 +438,34 @@ bitcask_error_t put_doc_common(bitcask_t* cask,
     doc_input.fields.reserve(fields_count);
     for (size_t i = 0; i < fields_count; ++i) {
         const auto& f = fields[i];
-        if (!slice_valid(f.name) || !slice_valid(f.value)) {
-            return BITCASK_ERR_INVALID_OPTION;
-        }
+        if (!slice_valid(f.name) || !slice_valid(f.value)) return false;
         doc_input.fields.emplace_back(
             std::string(static_cast<const char*>(f.name.data), f.name.size),
             std::span<const std::byte>{static_cast<const std::byte*>(f.value.data),
                                        f.value.size});
     }
+    return true;
+}
+
+bitcask_error_t put_doc_common(bitcask_t* cask,
+                               bitcask_slice_t key,
+                               bitcask_slice_t text,
+                               bitcask_slice_t meta_slice,
+                               const float* vector,
+                               size_t vector_len,
+                               uint64_t expiry_at,
+                               const bitcask_doc_field_t* fields,
+                               size_t fields_count,
+                               uint64_t tstamp,
+                               bitcask_fault_t* fault) {
+    if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    if (!slice_valid(key)) return BITCASK_ERR_INVALID_OPTION;  // S25-M2
+
+    std::span<const std::byte> key_span{static_cast<const std::byte*>(key.data), key.size};
+    bitcask::DocInput doc_input;
+    if (!to_cpp_doc(text, meta_slice, vector, vector_len, expiry_at, fields,
+                    fields_count, doc_input))
+        return BITCASK_ERR_INVALID_OPTION;
 
     auto result = as_cpp_cask(cask)->put_doc(key_span, doc_input, tstamp);
     if (!result) {
@@ -458,6 +473,37 @@ bitcask_error_t put_doc_common(bitcask_t* cask,
         return to_c_error_kind(result.error().kind);
     }
     return BITCASK_OK;
+}
+
+// bitcask_txn_op_ex_t[] → BatchOp[]（docs 承载 put_doc op 的 DocInput，
+// 须预留 n_ops 容量——BatchOp::doc 指向其元素，扩容会悬空）。
+bool to_cpp_batch_ops(const bitcask_txn_op_ex_t* ops, size_t n_ops,
+                      std::vector<bitcask::Cask::BatchOp>& out,
+                      std::vector<bitcask::DocInput>& docs) {
+    out.reserve(n_ops);
+    docs.reserve(n_ops);
+    for (size_t i = 0; i < n_ops; ++i) {
+        if (ops[i].op > 2 || !slice_valid(ops[i].key)) return false;
+        bitcask::Cask::BatchOp op;
+        op.type = static_cast<bitcask::Cask::BatchOp::Type>(ops[i].op);
+        op.key = {static_cast<const std::byte*>(ops[i].key.data),
+                  ops[i].key.size};
+        if (op.type == bitcask::Cask::BatchOp::Type::kPut) {
+            if (!slice_valid(ops[i].value)) return false;
+            op.value = {static_cast<const std::byte*>(ops[i].value.data),
+                        ops[i].value.size};
+        } else if (op.type == bitcask::Cask::BatchOp::Type::kPutDoc) {
+            const bitcask_doc_input_ex_t* d = ops[i].doc;
+            if (!d) return false;
+            auto& doc = docs.emplace_back();
+            if (!to_cpp_doc(d->text, d->meta, d->vector, d->vector_len,
+                            d->expiry_at, d->fields, d->fields_count, doc))
+                return false;
+            op.doc = &doc;
+        }
+        out.push_back(op);
+    }
+    return true;
 }
 
 }  // namespace
@@ -566,6 +612,29 @@ BITCASK_API bitcask_error_t bitcask_put_batch_atomic(bitcask_t* cask,
     });
 }
 
+// 下游反馈 2026-10-06：带文档的原子批（op = 2 → BatchOp::kPutDoc）。
+BITCASK_API bitcask_error_t bitcask_put_batch_atomic_ex(bitcask_t* cask,
+                                                        const bitcask_txn_op_ex_t* ops,
+                                                        size_t n_ops,
+                                                        bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    if (n_ops == 0) return BITCASK_OK;
+    if (!ops) return BITCASK_ERR_INVALID_OPTION;
+
+    std::vector<bitcask::Cask::BatchOp> cpp_ops;
+    std::vector<bitcask::DocInput> docs;
+    if (!to_cpp_batch_ops(ops, n_ops, cpp_ops, docs))
+        return BITCASK_ERR_INVALID_OPTION;
+    auto result = as_cpp_cask(cask)->put_batch_atomic(cpp_ops);
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    return BITCASK_OK;
+    });
+}
+
 // --- S34：多键事务（TxnCask 无状态，每调用栈上构造）-----------------------
 
 BITCASK_API bitcask_error_t bitcask_txn_commit(bitcask_t* cask,
@@ -591,6 +660,40 @@ BITCASK_API bitcask_error_t bitcask_txn_commit(bitcask_t* cask,
             op.value = {static_cast<const std::byte*>(ops[i].value.data),
                         ops[i].value.size};
         }
+        cpp_ops.push_back(op);
+    }
+    bitcask::TxnCask txn(as_cpp_cask(cask),
+                         sync_on_commit ? bitcask::TxnSyncPolicy::kSyncOnCommit
+                                        : bitcask::TxnSyncPolicy::kNone);
+    auto result = txn.commit(cpp_ops);
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    return BITCASK_OK;
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_txn_commit_ex(bitcask_t* cask,
+                                                  const bitcask_txn_op_ex_t* ops,
+                                                  size_t n_ops,
+                                                  int sync_on_commit,
+                                                  bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !ops || n_ops == 0) return BITCASK_ERR_INVALID_OPTION;
+
+    std::vector<bitcask::Cask::BatchOp> batch;
+    std::vector<bitcask::DocInput> docs;
+    if (!to_cpp_batch_ops(ops, n_ops, batch, docs))
+        return BITCASK_ERR_INVALID_OPTION;
+    std::vector<bitcask::TxnOp> cpp_ops;
+    cpp_ops.reserve(n_ops);
+    for (const auto& b : batch) {
+        bitcask::TxnOp op;
+        op.type = static_cast<bitcask::TxnOp::Type>(b.type);
+        op.key = b.key;
+        op.value = b.value;
+        op.doc = b.doc;
         cpp_ops.push_back(op);
     }
     bitcask::TxnCask txn(as_cpp_cask(cask),
