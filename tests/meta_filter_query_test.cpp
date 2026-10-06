@@ -4,7 +4,7 @@
 //   2. CaskIter / CaskRangeIter 可交出 meta（want_meta），与 value 同一次读。
 //   3. phrase / bool / fields / near / fuzzy / wildcard 收 filter。
 //   4. 迭代器收 filter：只按 meta 筛选的扫描（含有序 [lo, hi) 版）。
-// 第 5 条（同分并列的 top-K 前缀稳定）另案处理，本文件不覆盖。
+//   5. 同分并列：小 K 结果 = 大 K 结果的前缀，offset 分页不重不漏。
 // 迭代器 filter 不吞墓碑（see_tombstones 时照常交出）由构造保证：求值只在
 // 解码活记录的分支里，墓碑分支不经过（cask_iter.cpp）。
 // 对拍基准：无 filter 全量检索（k ≥ 文档数）→ 按 meta 过滤 → 取前 K。
@@ -111,34 +111,39 @@ protected:
         fs::remove_all(dir_);
     }
 
-    // 对拍：无 filter 全量结果（k ≥ 文档数，候选穷尽）按 keep 过滤后的前 k 个。
-    // 同分并列的取舍由内核扫描 / 剪枝次序决定、不随 k 稳定（反馈第 5 条，另案），
-    // 故按分数多重集比，不比 key 序列。
+    // 对拍：无 filter 全量结果（k ≥ 文档数，候选穷尽）按 keep 过滤后的前 k 个
+    // key，逐位相等；无 filter 时小 k 结果 = 全量结果的前缀——结果是全序
+    // (分数降序, 段次序, 段内 docid 升序) 的前缀（反馈第 5 条）。
     template <class Run>
     void expect_matches_oracle(const char* what, Run run) {
         auto full = run(static_cast<std::size_t>(kDocs) * 2, nullptr);
         ASSERT_TRUE(full) << what;
-        std::vector<double> oracle;
+        std::vector<std::string> all_keys, oracle;
         for (auto& h : full->hits) {
-            if (is_keep(std::stoi(h.key.substr(1)))) oracle.push_back(h.score);
+            all_keys.push_back(h.key);
+            if (is_keep(std::stoi(h.key.substr(1)))) oracle.push_back(h.key);
         }
+        ASSERT_EQ(all_keys.size(), static_cast<std::size_t>(kDocs)) << what;
         ASSERT_EQ(oracle.size(), static_cast<std::size_t>(kDocs / kKeepEvery))
             << what << ": 全量检索应命中全部 keep 文档";
         const auto keep = tag_filter("keep");
-        for (std::size_t k : {1u, 10u, 50u, 100u, 1000u}) {
+        for (std::size_t k : {1u, 5u, 10u, 50u, 100u, 1000u}) {
             auto r = run(k, &keep);
             ASSERT_TRUE(r) << what << " k=" << k;
-            const std::size_t want = std::min(k, oracle.size());
-            ASSERT_EQ(r->hits.size(), want) << what << " k=" << k;
-            std::multiset<double> got_scores;
-            for (auto& h : r->hits) {
-                EXPECT_TRUE(is_keep(std::stoi(h.key.substr(1))))
-                    << what << " k=" << k << " key=" << h.key;
-                got_scores.insert(h.score);
-            }
-            const std::multiset<double> want_scores(
-                oracle.begin(), oracle.begin() + static_cast<std::ptrdiff_t>(want));
-            EXPECT_EQ(got_scores, want_scores) << what << " k=" << k;
+            std::vector<std::string> got;
+            for (auto& h : r->hits) got.push_back(h.key);
+            const std::vector<std::string> want(
+                oracle.begin(),
+                oracle.begin() + static_cast<std::ptrdiff_t>(std::min(k, oracle.size())));
+            EXPECT_EQ(got, want) << what << " filtered k=" << k;
+            auto u = run(k, nullptr);
+            ASSERT_TRUE(u) << what << " k=" << k;
+            std::vector<std::string> ugot;
+            for (auto& h : u->hits) ugot.push_back(h.key);
+            const std::vector<std::string> uwant(
+                all_keys.begin(),
+                all_keys.begin() + static_cast<std::ptrdiff_t>(std::min(k, all_keys.size())));
+            EXPECT_EQ(ugot, uwant) << what << " unfiltered k=" << k;
         }
     }
 
@@ -162,29 +167,69 @@ TEST_P(MetaFilterQueryTest, SearchTextFillsKUnderSelectiveFilter) {
     });
 }
 
-// 分页：每页都取满，十页合起来正好是全部 keep 文档的分数分布。
-// 同分并列跨页可能重复 / 遗漏（反馈第 5 条，既有问题、另案），故按分数
-// 多重集对拍，不比 key 集合。
+// 分页：每页都取满，十页首尾相接正好是 top-100（同分并列也不重不漏）。
 TEST_P(MetaFilterQueryTest, SearchTextOffsetPagesThroughFilteredSet) {
     const auto f = tag_filter("keep");
-    std::multiset<double> paged, want;
+    auto all = cask_->search_text("apple", 100, &f);
+    ASSERT_TRUE(all);
+    ASSERT_EQ(all->hits.size(), 100u);
     for (std::size_t off = 0; off < 100; off += 10) {
         auto r = cask_->search_text("apple", 10, &f, off);
         ASSERT_TRUE(r);
         ASSERT_EQ(r->hits.size(), 10u) << "offset=" << off;
-        for (auto& h : r->hits) {
-            EXPECT_TRUE(is_keep(std::stoi(h.key.substr(1))));
-            paged.insert(h.score);
+        for (std::size_t i = 0; i < 10; ++i) {
+            EXPECT_EQ(r->hits[i].key, all->hits[off + i].key) << "offset=" << off;
         }
     }
-    auto all = cask_->search_text("apple", 100, &f);
-    ASSERT_TRUE(all);
-    ASSERT_EQ(all->hits.size(), 100u);
-    for (auto& h : all->hits) want.insert(h.score);
-    EXPECT_EQ(paged, want);
     auto tail = cask_->search_text("apple", 10, &f, 100);
     ASSERT_TRUE(tail);
     EXPECT_TRUE(tail->hits.empty());
+}
+
+// 反馈第 5 条原场景：文本全同 → 分数全同。小 K = 大 K 的前缀，offset 分页
+// 不出重复页（改前：K=5 选 key 最小的 5 篇再按 ord 降序出，每页都一样）。
+TEST_P(MetaFilterQueryTest, TiedScoresPrefixStableAndPageable) {
+    constexpr int kTied = 300;
+    for (int i = 0; i < kTied; ++i) {
+        char key[16];
+        std::snprintf(key, sizeof key, "t%04d", i);
+        DocInput doc;
+        const std::string text = "durian";
+        doc.text = sv_bytes(text);
+        ASSERT_TRUE(cask_->put_doc(sv_bytes(key), doc, 1000));
+    }
+    cask_->flush_index();
+    for (const char* which : {"text", "phrase", "bool"}) {
+        auto run = [&](std::size_t k, std::size_t off) {
+            const std::string w = which;
+            if (w == "text") return cask_->search_text("durian", k, nullptr, off);
+            if (w == "phrase") return cask_->search_phrase("durian", k, off);
+            return cask_->bool_search("durian", k, off);
+        };
+        auto all = run(1000, 0);
+        ASSERT_TRUE(all);
+        ASSERT_EQ(all->hits.size(), static_cast<std::size_t>(kTied)) << which;
+        for (std::size_t k : {1u, 5u, 10u, 64u, 299u}) {
+            auto r = run(k, 0);
+            ASSERT_TRUE(r);
+            ASSERT_EQ(r->hits.size(), k) << which;
+            for (std::size_t i = 0; i < k; ++i) {
+                EXPECT_EQ(r->hits[i].key, all->hits[i].key)
+                    << which << " k=" << k << " i=" << i;
+            }
+        }
+        std::set<std::string> seen;
+        for (std::size_t off = 0; off < kTied; off += 7) {
+            auto r = run(7, off);
+            ASSERT_TRUE(r);
+            for (std::size_t i = 0; i < r->hits.size(); ++i) {
+                EXPECT_EQ(r->hits[i].key, all->hits[off + i].key)
+                    << which << " offset=" << off;
+                seen.insert(r->hits[i].key);
+            }
+        }
+        EXPECT_EQ(seen.size(), static_cast<std::size_t>(kTied)) << which;
+    }
 }
 
 TEST_P(MetaFilterQueryTest, BatchAndHybridTextLegFillK) {
