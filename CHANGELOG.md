@@ -62,6 +62,18 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
   （反馈原场景，单段 / 多段）；三方穷举对拍的参照实现改为「全量打分 + 全序排序取前 k」
   的规范定义（不再模拟堆语义），WAND / MaxScore 与之逐位一致。
 
+- **keydir 乐观读在 TSan 下报 data race**（`KeyDirOptimisticRead.ConcurrentGetPutRemoveGrowStress`
+  稳定复现，每轮三四十条）。两处成因，均在 `SeqShardTable::try_get_optimistic`：
+  - 读 `values_.data()` / `values_.size()`——对 `std::vector` 内部指针的非原子并发读
+    （严格说是 UB），且 libstdc++ 成员函数非内联时被插桩、不继承读函数的
+    `no_sanitize`。改为写者在最外层 `WriteSection` 收尾时把 (data, size) 发布到两个
+    原子（`pub_vdata_` / `pub_vsize_`），乐观读者只读原子副本，由 seq 校验背书。
+  - `opt_copy_bytes` 的 `__atomic_load_n(relaxed)`：原子操作恒经 TSan 运行时、不受函数级
+    豁免，与写者的普通写（桶 memcpy、string / variant 移动赋值）配成「原子读 × 非原子写」
+    必报。写侧是标准库类型整体移动，无法逐字原子化；故仅 TSan 构建下改用
+    `may_alias` + `volatile` 普通读（豁免函数内不插桩），普通构建照旧原子读。
+  修后 TSan 全量 810/810、该用例连跑零告警；keydir 读 / 写 / 混合 bench 同机 A/B 在 ±1.5% 内。
+
 ### Added
 
 - **`search_phrase` / `bool_search` / `search_fields` / `search_near` /
