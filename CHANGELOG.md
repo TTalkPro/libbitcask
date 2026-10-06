@@ -14,7 +14,7 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ---
 
-## [Unreleased]（meta filter：补取到 k · 全部文本检索收 filter · 迭代器交出 meta / 按 meta 筛选）
+## [Unreleased]（meta filter：补取到 k · 同分 top-K 前缀稳定 · 全部文本检索收 filter · 迭代器交出 meta / 按 meta 筛选）
 
 > 来源：下游 bitcask（Erlang 封装）`feedbacks/2026-10-06-meta-filter-query-gaps.md`。
 > C++ 层只加带默认值的末位形参 / 新成员；C API **纯加法**（14 个新符号 + 2 个新结构体，
@@ -31,14 +31,36 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
   （正常情况首轮即满足，不多付成本）。
   影响面：`search_text` / `search_text_batch` / `search_hybrid` 的文本路
   （`HybridSearcher` 经 `search_text` 拿 K' 条通过 filter 的命中）、带 `offset` 的分页。
-- **未修：同分命中的 top-K 不前缀稳定**（反馈第 5 条）。进入 top-K 的同分文档由段内
-  内核的扫描 / 剪枝次序与 `multi_segment_search` 的 key 升序决定，输出却重排为「同分
-  ord 降序」——小 K 结果不是大 K 结果的前缀，offset 分页在同分处会翻出重复页。只改
-  截取或输出一处的平局键不够（内核堆本身「先到先留、最小 ord 先逐出」，取舍不一致）。
-  评估过「边界同分即补取到整组同分取全」的修法：结果精确、不动内核，但无 filter
-  查询实测慢 1.8×（自然语料 843→1503 µs）~4.9×（短标题 159→770 µs），未采纳；
-  改为另案统一内核平局规则（分数降序、段内 docid 升序）。本批 `search_fields` 的排序
-  补上同分 ord 降序（此前 partial_sort 无平局键，同分序不确定）。
+- **同分命中：小 K 结果不再与大 K 结果矛盾，offset 分页不再翻出重复页**（反馈第 5 条，🔴）。
+  原先三处平局规则互不一致：段内内核的 top-k 堆是 `std::greater` 小顶堆——同分时
+  「收」按先到先留（严格 `>` 才换），「逐」却按最小 ord 先出；跨段归并按 key 升序截取；
+  `TextPlugin` 输出又重排为同分 ord 降序。1000 篇全同文本：K=5 回 d5..d1，K=1000 时 d1
+  排最后；offset 分页每页都是同一组。
+  现统一为全序 **(分数降序, 段次序, 段内 docid 升序)**（同 Lucene 的 docid 平局）：
+  - 内核：堆比较器改为「更优」序，堆顶 = 最差者（最低分、同分 docid 最大）
+    （`detail::TopKHeap` / `topk_offer`，7 处堆统一）。全部调用点按 ord 严格升序
+    递入候选（DAAT / 升序候选集），同分后到者在此全序下必败，故**准入仍是「严格
+    高分才换」、只有逐出侧换比较器**；剪枝 `上界 <= θ` 跳过的也只会是 docid 更大、
+    同分必败的文档——**剪枝条件不变**。准入若改用全序比较，大量同分的穷举路径
+    实测 +5~15%，故不用。
+  - 跨段：`multi_segment_search` / `multi_field_segment_search` / `TextPlugin` 逐段并集
+    改为按分数**稳定**排序（段内已是全序、按视图次序拼接），不再按 key / ord 重排；
+    `search_fields` 的累加结果带 (段次序, docid) 平局键。
+  - 未选 LSN 作平局键：段内 docid 与 LSN 不单调（DWPT 多 building 段交错、段合并按
+    输入序拼接、fold 重放按 keydir 序），用它须放弃 `<= θ` 剪枝。
+  - 评估过并否决「TextPlugin 层边界同分补取到整组取全」：结果同样精确，但无 filter
+    查询实测慢 1.8×~4.9×（单词查询同分组上千篇）。
+  - 性能（同机 A/B 对 HEAD，5 次中位数）：BOW / WAND / MaxScore / 短语 / 布尔 / mmap 段 /
+    hybrid / 高亮共 19 项内核 bench 在 −6%~+1% 内；20 万文档端到端 `search_text`
+    无 filter 832→820 µs、短标题语料 148→155 µs（噪声内）。
+  **可见变化**：同分命中的先后由「ord 降序」变为「段次序、段内写入序」（大体是先写
+  入者在前）；同分序在两次封口 / 段合并之间稳定（段与 docid 随之重排）。多字段 /
+  多 boost 组的 `search_fields` 是逐字段 top-k 后求和的近似，前缀性不作保证（既有近似，
+  与平局无关）；hybrid 的 RRF 融合平局规则（ord 小者在前）未动。
+  回归：`MaxScore.TopKTiedScoresPrefixStableAllKernels`（BOW / WAND / MaxScore / 短语 /
+  扁平与树形布尔，同分前缀性）、`MetaFilterQueryTest.TiedScoresPrefixStableAndPageable`
+  （反馈原场景，单段 / 多段）；三方穷举对拍的参照实现改为「全量打分 + 全序排序取前 k」
+  的规范定义（不再模拟堆语义），WAND / MaxScore 与之逐位一致。
 
 ### Added
 
