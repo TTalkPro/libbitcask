@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <functional>
 #include <cstdint>
 #include <queue>
 #include <random>
@@ -2643,8 +2644,9 @@ TEST(InvertedIndex, S31OversizedTermSkippedOnLoad) {
 namespace {
 
 // 无剪枝穷举参照:镜像 search_wand_impl 的取数与标量公式(idf 用 live_df/
-// 全局 df、dl 每文档取一次、匹配词按原词序累加、>=θ 进堆/满后 >top 换)。
-// 这是 top-k 语义的**规范实现**——剪枝算法必须与其逐位一致。
+// 全局 df、dl 每文档取一次、匹配词按原词序累加),全量打分后按全序
+// (分数降序, ord 升序) 取前 k。这是 top-k 语义的**规范实现**——剪枝算法
+// 必须与其逐位一致。
 std::vector<SearchResult> exhaustive_topk_reference(
     const InvertedIndex& idx, const std::vector<std::string>& terms,
     std::size_t k, const LiveChecker& live,
@@ -2686,9 +2688,9 @@ std::vector<SearchResult> exhaustive_topk_reference(
     all_ords.erase(std::unique(all_ords.begin(), all_ords.end()),
                    all_ords.end());
 
-    using Entry = std::pair<float, std::uint64_t>;
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
-    float threshold = 0.0F;
+    // 规范定义（下游反馈 2026-10-06 第 5 条）：全部打分后按全序 (分数降序,
+    // ord 升序) 取前 k——不模拟任何堆语义，剪枝算法必须与之逐位一致。
+    std::vector<SearchResult> scored;
     for (auto d : all_ords) {
         if (!live.is_live(d)) continue;
         const auto dl = live.doc_len(d);
@@ -2709,24 +2711,15 @@ std::vector<SearchResult> exhaustive_topk_reference(
             score += ts[i].idf * (tf_norm + params.delta);
         }
         if (!any) continue;
-        if (score >= threshold) {
-            if (heap.size() < k) {
-                heap.push({score, d});
-            } else if (score > heap.top().first) {
-                heap.pop();
-                heap.push({score, d});
-            }
-            if (heap.size() >= k) threshold = heap.top().first;
-        }
+        scored.push_back({d, score});
     }
-    std::vector<SearchResult> out;
-    out.reserve(heap.size());
-    while (!heap.empty()) {
-        out.push_back({heap.top().second, heap.top().first});
-        heap.pop();
-    }
-    std::reverse(out.begin(), out.end());
-    return out;
+    std::sort(scored.begin(), scored.end(),
+              [](const SearchResult& x, const SearchResult& y) {
+                  if (x.score != y.score) return x.score > y.score;
+                  return x.ord < y.ord;
+              });
+    if (scored.size() > k) scored.resize(k);
+    return scored;
 }
 
 void expect_bitwise_equal(const std::vector<SearchResult>& a,
@@ -2816,5 +2809,77 @@ TEST(MaxScore, ThreeWayRandomizedBitwiseEquivalence) {
         expect_bitwise_equal(ref, wand, "ref-vs-wand t" + std::to_string(trial));
         expect_bitwise_equal(ref, ms, "ref-vs-ms t" + std::to_string(trial));
         if (::testing::Test::HasFailure()) break;
+    }
+}
+
+// 下游反馈 2026-10-06 第 5 条：同分大量并列时，各内核（BOW / WAND / MaxScore
+// / 短语 / 扁平布尔 / 树形布尔）的 top-k 都是全序 (分数降序, ord 升序) 的
+// 前缀——小 k 结果恒为大 k 结果的前缀。此前堆「先到先留」收、「最小 ord
+// 先出」逐，同分进榜者随 k 漂移。
+TEST(MaxScore, TopKTiedScoresPrefixStableAllKernels) {
+    for (const std::uint32_t docs : {300u, 3000u}) {  // 300 → BOW 档；3000 → WAND 档
+        InvertedIndex idx;
+        FakeLiveChecker live;
+        for (std::uint32_t d = 0; d < docs; ++d) {
+            TermPositions tp;
+            tp["a"] = {1, {0}};
+            if (d % 2 == 0) tp["b"] = {1, {1}};
+            if (d % 3 == 0) tp["c"] = {1, {2}};
+            idx.add_doc(d, tp);
+            std::uint32_t dl = 0;
+            for (auto& [t, pd] : tp) dl += pd.first;
+            live.doc_lens[d] = dl;
+        }
+        for (std::uint32_t d = 5; d < docs; d += 7) live.doc_lens.erase(d);
+
+        using Run = std::function<std::vector<SearchResult>(std::size_t)>;
+        const auto q_should = parse_query("a b");
+        const auto q_must = parse_query("+a +b");
+        const auto q_tree = parse_query_tree("(a b) -c");
+        const std::vector<std::pair<std::string, Run>> runs = {
+            {"wand", [&](std::size_t k) {
+                 MaxScoreToggle t(false);
+                 return idx.search({"a", "b", "c"}, k, live);
+             }},
+            {"maxscore", [&](std::size_t k) {
+                 MaxScoreToggle t(true);
+                 return idx.search({"a", "b", "c"}, k, live);
+             }},
+            {"single", [&](std::size_t k) { return idx.search({"a"}, k, live); }},
+            {"phrase", [&](std::size_t k) {
+                 return idx.search_phrase({"a", "b"}, k, live);
+             }},
+            {"bool_should", [&](std::size_t k) {
+                 return idx.bool_search(q_should, k, live);
+             }},
+            {"bool_must", [&](std::size_t k) {
+                 return idx.bool_search(q_must, k, live);
+             }},
+            {"bool_tree", [&](std::size_t k) {
+                 return idx.bool_search_tree(q_tree, k, live);
+             }},
+        };
+        for (const auto& [name, run] : runs) {
+            const auto all = run(docs);
+            ASSERT_FALSE(all.empty()) << name << " docs=" << docs;
+            for (std::size_t i = 1; i < all.size(); ++i) {
+                const bool ordered =
+                    all[i - 1].score > all[i].score ||
+                    (all[i - 1].score == all[i].score && all[i - 1].ord < all[i].ord);
+                ASSERT_TRUE(ordered) << name << " docs=" << docs << " @" << i;
+            }
+            for (std::size_t k : {1u, 2u, 5u, 10u, 37u, 100u, 250u}) {
+                const auto r = run(k);
+                const std::size_t want = std::min(k, all.size());
+                ASSERT_EQ(r.size(), want) << name << " docs=" << docs << " k=" << k;
+                for (std::size_t i = 0; i < want; ++i) {
+                    EXPECT_EQ(r[i].ord, all[i].ord)
+                        << name << " docs=" << docs << " k=" << k << " @" << i;
+                    EXPECT_EQ(r[i].score, all[i].score)
+                        << name << " docs=" << docs << " k=" << k << " @" << i;
+                }
+                if (::testing::Test::HasFailure()) return;
+            }
+        }
     }
 }

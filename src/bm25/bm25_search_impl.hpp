@@ -18,6 +18,7 @@
 #pragma once
 
 #include "bitcask/bm25_kernels.hpp"
+#include "bitcask/detail/cpu_features.hpp"  // BITCASK_FORCE_INLINE
 #include "bitcask/inverted.hpp"
 
 #include "bitcask/intersect.hpp"
@@ -58,6 +59,41 @@ inline std::atomic<int> g_topk_use_maxscore{1};
 // 甜区是大候选集（热词短语，~8.7ms）；小候选集并行 task spawn 开销 > 收益，
 // 走串行（同 S7-1 BOW 串行化的教训）。
 inline constexpr std::size_t kPhraseParallelThreshold = 2048;
+
+// 下游反馈 2026-10-06 第 5 条：top-k 全序 = (分数降序, 段内 docid 升序)。
+// 此前堆为 std::greater 小顶堆——同分时「收」按先到先留（严格 > 才换），
+// 「逐」却按最小 ord 先出，二者矛盾，同分进榜者随 k 漂移（小 k 结果不是
+// 大 k 的前缀）。改为以「更优」为比较器：堆顶 = 最差者（最低分，同分取
+// docid 最大）——修的只是逐出侧，准入仍是「严格高分才换」（见 topk_offer
+// 的升序契约）。DAAT 各路径按 docid 升序推进，剪枝 `上界 <= θ` 跳过的
+// 只会是 docid 大于堆内全部条目的文档——在此全序下同分必然落败，故剪枝
+// 无需改动、仍精确。
+using TopKEntry = std::pair<float, std::uint64_t>;  // (score, ord)
+struct TopKBetter {
+    bool operator()(const TopKEntry& a, const TopKEntry& b) const noexcept {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second < b.second;
+    }
+};
+using TopKHeap =
+    std::priority_queue<TopKEntry, std::vector<TopKEntry>, TopKBetter>;
+
+// 候选入堆：未满直接收；满则仅当严格优于堆顶（全序意义）才替换。
+// **调用契约：同一堆的 ord 严格升序递入**——全部调用点皆满足（DAAT 按 docid
+// 推进；BOW 按 ord 排序去重后累加；布尔 / 短语的候选集为升序交并集或升序
+// posting）。在此前提下同分后到者 ord 必然更大、全序下必败，故准入只需比
+// 分数（与旧堆逐字相同，热循环零额外开销——全序比较实测在大量同分的穷举
+// 路径上 +5~15%）；全序只体现在逐出（堆比较器）。
+// 强制内联：穷举路径每候选调一次，未内联时调用本身即可测。
+BITCASK_FORCE_INLINE void topk_offer(TopKHeap& heap, std::size_t k, float score,
+                                     std::uint64_t ord) {
+    if (heap.size() < k) {
+        heap.push({score, ord});
+    } else if (score > heap.top().first) {
+        heap.pop();
+        heap.push({score, ord});
+    }
+}
 
 // block_for_ord / block_upper_bound 的共享实现——PostingList 与
 // FlatPostings（P1 查询快照）语义必须一致，逻辑只写一份。
@@ -201,8 +237,7 @@ inline std::vector<SearchResult> score_bow_topk(
     std::sort(hits.begin(), hits.end(),
               [](const Hit& x, const Hit& y) { return x.first < y.first; });
 
-    using Entry = std::pair<float, std::uint64_t>;
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+    TopKHeap heap;
     for (std::size_t i = 0; i < hits.size();) {
         const std::uint64_t ord = hits[i].first;
         float score = 0.0F;
@@ -210,12 +245,7 @@ inline std::vector<SearchResult> score_bow_topk(
             score += hits[i].second;
             ++i;
         } while (i < hits.size() && hits[i].first == ord);
-        if (heap.size() < k) {
-            heap.push({score, ord});
-        } else if (score > heap.top().first) {
-            heap.pop();
-            heap.push({score, ord});
-        }
+        topk_offer(heap, k, score, ord);
     }
     std::vector<SearchResult> results;
     results.reserve(heap.size());
@@ -357,8 +387,7 @@ inline std::vector<SearchResult> search_wand_impl(
         tp.dls_filled[b] = 1;
     };
 
-    using Entry = std::pair<float, std::uint64_t>;
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+    TopKHeap heap;
     float threshold = 0.0f;
 
     // S10.5：每轮只排序索引数组，避免 std::sort 整体搬运含多个 vector 的
@@ -509,12 +538,7 @@ inline std::vector<SearchResult> search_wand_impl(
             }
 
             if (score >= threshold) {
-                if (heap.size() < k) {
-                    heap.push({score, pivot_ord});
-                } else if (score > heap.top().first) {
-                    heap.pop();
-                    heap.push({score, pivot_ord});
-                }
+                topk_offer(heap, k, score, pivot_ord);
                 if (heap.size() >= k) {
                     threshold = heap.top().first;
                 }
@@ -681,18 +705,12 @@ inline std::vector<SearchResult> phrase_search_impl(
         for (std::size_t i = 0; i < n_cand; ++i) cand_scores[i] = score_one(i);
     }
 
-    using Entry = std::pair<float, std::uint64_t>;
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+    TopKHeap heap;
     for (std::size_t i = 0; i < n_cand; ++i) {
         float score = cand_scores[i];
         if (score <= 0.0F) continue;  // 0 = 非短语（见 score_one 哨兵契约）
         std::uint64_t ord = cand_pl.ords[i];
-        if (heap.size() < k) {
-            heap.push({score, ord});
-        } else if (score > heap.top().first) {
-            heap.pop();
-            heap.push({score, ord});
-        }
+        topk_offer(heap, k, score, ord);
     }
 
     std::vector<SearchResult> results;
@@ -917,8 +935,7 @@ inline std::vector<SearchResult> bool_search_impl(
                                         : fp.ords.back();
         };
 
-        using Entry = std::pair<float, std::uint64_t>;
-        std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+        TopKHeap heap;
 
         bool exhausted = false;
         while (!exhausted && curs[0].i < curs[0].tp->fp.size()) {
@@ -977,12 +994,7 @@ inline std::vector<SearchResult> bool_search_impl(
                                   static_cast<float>(avgdl)));
                     score += c.idf * (tf_norm + params.delta);
                 }
-                if (heap.size() < k) {
-                    heap.push({score, v});
-                } else if (score > heap.top().first) {
-                    heap.pop();
-                    heap.push({score, v});
-                }
+                topk_offer(heap, k, score, v);
             }
             ++curs[0].i;
         }
@@ -1249,17 +1261,11 @@ inline std::vector<SearchResult> bool_search_impl(
         }
     }
 
-    using Entry = std::pair<float, std::uint64_t>;
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+    TopKHeap heap;
 
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         const float score = scores[i];
-        if (heap.size() < k) {
-            heap.push({score, candidates[i]});
-        } else if (score > heap.top().first) {
-            heap.pop();
-            heap.push({score, candidates[i]});
-        }
+        topk_offer(heap, k, score, candidates[i]);
     }
 
     std::vector<SearchResult> results;
@@ -1438,15 +1444,9 @@ inline std::vector<SearchResult> bool_tree_impl(
         }
     }
 
-    using Entry = std::pair<float, std::uint64_t>;
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+    TopKHeap heap;
     for (std::size_t i = 0; i < candidates.size(); ++i) {
-        if (heap.size() < k) {
-            heap.push({scores[i], candidates[i]});
-        } else if (scores[i] > heap.top().first) {
-            heap.pop();
-            heap.push({scores[i], candidates[i]});
-        }
+        topk_offer(heap, k, scores[i], candidates[i]);
     }
     std::vector<SearchResult> results;
     results.reserve(heap.size());
@@ -1585,8 +1585,7 @@ inline std::vector<SearchResult> search_maxscore_impl(
         }
     }
 
-    using Entry = std::pair<float, std::uint64_t>;
-    std::priority_queue<Entry, std::vector<Entry>, std::greater<>> heap;
+    TopKHeap heap;
     float threshold = 0.0F;
     // 边界 p:order[0..p) 为 non-essential(prefix[p-1] ≤ θ)。θ 单调升
     // ⇒ p 单调升(降级不可逆)。θ=0 时仅 ub==0 的死列表落入前缀。
@@ -1735,12 +1734,7 @@ inline std::vector<SearchResult> search_maxscore_impl(
                 score += t.idf * (tf_norm + params.delta);
             }
             if (score >= threshold) {
-                if (heap.size() < k) {
-                    heap.push({score, d});
-                } else if (score > heap.top().first) {
-                    heap.pop();
-                    heap.push({score, d});
-                }
+                topk_offer(heap, k, score, d);
                 if (heap.size() >= k) {
                     const float new_theta = heap.top().first;
                     if (new_theta > threshold) {

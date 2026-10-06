@@ -52,8 +52,10 @@
 
 #if defined(_MSC_VER)
 #  define BITCASK_NOINLINE __declspec(noinline)
+#  define BITCASK_FORCE_INLINE __forceinline
 #else
 #  define BITCASK_NOINLINE __attribute__((noinline))
+#  define BITCASK_FORCE_INLINE inline __attribute__((always_inline))
 #endif
 
 // 关闭指定 sanitizer 检查。MSVC 无对应物，展开为空。
