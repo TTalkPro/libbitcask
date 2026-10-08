@@ -79,6 +79,8 @@ typedef enum {
     BITCASK_ERR_CLOSED         = 13,  // 对已 bitcask_close 的 handle 发起调用（S12-5）
     BITCASK_ERR_INDEX_REBUILD_FAILED = 14,  // OKI 试建而败（可写 open 重建失败；
                                             // 与 NO_INDEX 的「本就不建」区分）
+    BITCASK_ERR_BUSY           = 15,  // 6.7.0：仅 C 侧（无 CaskError 对应）——
+                                      // bitcask_shutdown 时运行时仍被占用
 } bitcask_error_t;
 
 // 错误详情（对应 bitcask::CaskFault）
@@ -416,6 +418,37 @@ BITCASK_API bitcask_error_t bitcask_open_ex2(const char* dirname,
 BITCASK_API bitcask_error_t bitcask_set_thread_limits(size_t index_workers,
                                                        size_t search_slots,
                                                        bitcask_fault_t* fault);
+
+// 6.7.0：拆除本库的进程级后台线程，使宿主可以安全卸载动态库（dlclose /
+// FreeLibrary / JVM FFM Arena 关闭 / .NET NativeLibrary.Free）。
+// 不调本函数就卸载：TBB worker 与索引池线程仍在跑已卸载的代码 → 进程崩溃。
+//
+// 依次：
+//   1. 停索引池（index_workers 条 map worker + 1 条 reducer，join）；
+//   2. 释放 Search 池对 TBB 的引用；
+//   3. tbb::finalize：阻塞等 TBB worker 线程全部退出。
+//
+// 前置条件（宿主负责）：
+//   - 所有 bitcask_t 已 bitcask_close（迭代器已 release）；否则返回
+//     BITCASK_ERR_BUSY，什么都不动。
+//   - 不与本库的任何其它调用并发；不得在 log_fn / scan 回调里调。
+//   - 除调用线程外，**曾进入过本库 TBB 并行段的其它线程须已退出**——TBB
+//     在这些线程上留有线程局部状态（被调线程自身的会被本函数清掉）。会进入
+//     并行段的调用：带 search 的 open（恢复）、搜索（尤其批量）、merge 等。
+//     .NET 线程池 / JVM 线程池里的常驻线程是典型违例：要么让这些调用走
+//     专用线程并在 shutdown 前结束它，要么接受 BUSY 并放弃卸载。
+//
+// 返回：
+//   BITCASK_OK   — 后台线程全部退出，可卸载。
+//   BITCASK_ERR_BUSY — 仍有打开的库（步骤 1 前就返回），或步骤 3 未能等到
+//                  TBB 收尾（其它线程仍持 TBB 状态 / 宿主自己也在用同一份
+//                  TBB）。fault 注明哪种。**不可卸载**，但库仍完全可用。
+//
+// shutdown 之后（无论成败）库仍可继续使用：再 open 时各池按冻结的
+// bitcask_set_thread_limits 值懒重建。可重复调用。
+// 注意：TBB 运行时是进程级的。宿主若与本库共用同一份 TBB 动态库且自己也
+// 在用，步骤 3 会返回 BUSY（不会强拆宿主的 TBB）。
+BITCASK_API bitcask_error_t bitcask_shutdown(bitcask_fault_t* fault);
 
 // 关闭并释放 Cask 实例。cask 句柄此后不可使用。
 // 内部调用 Cask::close() 后 delete 句柄包装。

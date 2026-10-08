@@ -1,10 +1,15 @@
 // C API — KV/生命周期/迭代/管理（S19-5 自 bitcask_c.cpp 拆分，符号与实现不变）。
 #include "internal.h"
 
+#include "bitcask/search_arena.hpp"   // 6.7.0：bitcask_shutdown
 #include "bitcask/thread_limits.hpp"  // 6.6.0：bitcask_set_thread_limits
 #include "bitcask/txn.hpp"  // S34：多键事务
 
 #include <cstddef>  // offsetof
+#include <mutex>
+#include <new>      // std::nothrow
+
+#include <oneapi/tbb/global_control.h>  // 6.7.0：task_scheduler_handle / finalize
 
 using namespace bitcask::capi;
 
@@ -264,6 +269,46 @@ BITCASK_API bitcask_error_t bitcask_open_ex2(const char* dirname,
     auto wrapper = std::make_unique<bitcask_impl_t>();
     wrapper->cask = std::move(*result);
     *out = reinterpret_cast<bitcask_t*>(wrapper.release());
+    return BITCASK_OK;
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_shutdown(bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    // 串行化并发 shutdown。故意泄漏：卸载前的静态析构序与本函数无关。
+    static std::mutex* mu = new std::mutex();
+    std::lock_guard lk(*mu);
+
+    const std::size_t open = c_api_registry().stop_index_pool_if_idle();
+    if (open != 0) {
+        if (fault) {
+            fault->code = BITCASK_ERR_BUSY;
+            fault->errnum = 0;
+            snprintf(fault->detail, BITCASK_DETAIL_MAX,
+                     "bitcask_shutdown: %zu database(s) still open; "
+                     "bitcask_close every handle first", open);
+        }
+        return BITCASK_ERR_BUSY;
+    }
+
+    bitcask::search::release_search_arena();
+
+    // attach：TBB 尚未初始化时不为此去建运行时（finalize 直接成功）。
+    // nothrow 版：仍有其它 public 引用（别的线程的 TBB 线程局部状态 / 别的
+    // task_arena / 宿主的 handle）时返回 false 而非抛 unsafe_wait。
+    oneapi::tbb::task_scheduler_handle handle{oneapi::tbb::attach{}};
+    if (!oneapi::tbb::finalize(handle, std::nothrow)) {
+        if (fault) {
+            fault->code = BITCASK_ERR_BUSY;
+            fault->errnum = 0;
+            snprintf(fault->detail, BITCASK_DETAIL_MAX,
+                     "bitcask_shutdown: TBB runtime still referenced (another "
+                     "live thread entered a TBB parallel region, or the host "
+                     "uses the same TBB); worker threads not joined, do not "
+                     "unload the library");
+        }
+        return BITCASK_ERR_BUSY;
+    }
     return BITCASK_OK;
     });
 }
