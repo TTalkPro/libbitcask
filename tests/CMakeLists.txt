@@ -556,6 +556,19 @@ target_link_libraries(bitcask_thread_limits_test PRIVATE
 )
 gtest_discover_tests(bitcask_thread_limits_test ${_bitcask_test_props})
 
+# 6.7.0：bitcask_shutdown。tbb::finalize 是进程级状态变化 → 独占可执行文件。
+# 只走 C API（链 bitcask_shared）；TBB::tbb 仅供用例自己进一次并行段，模拟
+# 宿主线程池里持 TBB 线程局部状态的常驻线程。
+add_executable(bitcask_c_api_shutdown_test c_api_shutdown_test.cpp)
+target_link_libraries(bitcask_c_api_shutdown_test PRIVATE
+    GTest::gtest_main
+    bitcask_shared
+    TBB::tbb
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_c_api_shutdown_test ${_bitcask_test_props})
+
 # S17-1：index.manifest 格式测试——header-only（只需 gtest + zlib via codec）。
 add_executable(bitcask_index_manifest_test index_manifest_test.cpp)
 target_link_libraries(bitcask_index_manifest_test PRIVATE
