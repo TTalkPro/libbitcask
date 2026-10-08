@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.6.2`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.7.0`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
@@ -15,6 +15,45 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 ---
 
 ## [Unreleased]
+
+---
+
+## [6.7.0] - 2026-10-08（`bitcask_shutdown`：拆除进程级后台线程供卸载动态库 · C API 内部助手不再泄进动态符号表）
+
+> **版本语义**：C API **纯加法**（1 个新符号 `bitcask_shutdown` + `bitcask_error_t`
+> 末尾加值 `BITCASK_ERR_BUSY = 15`，既有函数签名与结构体布局零改动）；C++ 层只加
+> 内部成员函数；盘上格式未动；`SOVERSION` 保持 `6`。按维护者决定取 MINOR +1（6.7.0）。
+
+### Added
+
+- **`bitcask_shutdown`：拆除进程级后台线程，供宿主卸载动态库**。动机：经 FFM / P/Invoke /
+  `dlopen` 嵌入的宿主要在进程存活期间卸载本库，而索引池线程、Search 池（`task_arena`）
+  与 TBB worker 常驻、C API 原本没有拆除口子（`TbbLifetime` 只给 NIF 的
+  `on_load` / `on_unload` 用）。实测 Linux/glibc 上不拆直接 `dlclose`，库驻留不卸
+  （其它平台有崩溃风险）；调用后 `dlclose` 真正卸载。
+  - 行为：仍有库打开 → `BUSY`、零副作用；否则依次停索引池（join）、`task_arena::terminate`、
+    `tbb::finalize`（nothrow；仍有其它 public 引用时 → `BUSY`）。无论成败库仍可用，
+    各池按冻结的线程数上限懒重建。
+  - 限制：除调用线程外，曾进入过本库 TBB 并行段的线程须已退出（TBB 线程局部状态只在
+    线程退出时释放）——宿主线程池里跑过查询的常驻线程会令其返回 `BUSY`；宿主自己也在用
+    同一份 TBB 时同样返回 `BUSY`。详见 `doc/api-c.md` §8.3。
+  - 内部：`KeyDirRegistry::stop_index_pool_if_idle()`（检查与停池同锁，不与 acquire
+    竞态）、`search::release_search_arena()`（池从未建过则不建，免得冻结线程数上限）。
+  - `BITCASK_ERR_BUSY` 是首个**仅 C 侧**的错误码（无 `CaskError` 对应）；绑定层的错误码
+    枚举需补这一项。
+  - 回归 `CApiShutdownTest.*`（独占可执行文件：未初始化即成功 / 有库打开 → BUSY 且库照常
+    可用 / 全关后成功且线程数回到基线 / shutdown 后可再开再查 / 另一存活线程持 TBB 状态
+    → BUSY、其退出后成功）。
+
+### Fixed
+
+- **4 个 C API 内部助手不再泄进 `libbitcask.so` 动态符号表**：`put_doc_common` /
+  `to_cpp_doc` / `to_cpp_batch_ops` / `set_invalid`。它们本已在匿名 namespace 里，
+  但处于 `bitcask_kv.cpp` 的 `extern "C" {}` 块内——C 链接的函数即便在匿名 namespace
+  中，GCC 仍给外部链接，于是以裸名导出（污染全局符号表，宿主或其它库同名符号可能被
+  错绑）。现包一层 `extern "C++"`（同文件 `fill_ex` 一段的既有做法）。`nm -D` 核对：
+  非 `bitcask_*` 导出 24 → 20，`bitcask_*` 导出集合不变（另加本版的 `bitcask_shutdown`）。
+  这 4 个符号不在任何头文件中，不构成 ABI 承诺，移除不影响 `SOVERSION`。
 
 ---
 
@@ -958,10 +997,6 @@ meta v4 是统一门禁，组件层不再各自维护 u32 兼容分支）：
   mmap OOB 读 UB）：IVF cidx 无条件校验、DiskANN 查询侧 use-site guard。
 - IO 循环 EINTR 重试；`parallel_for` 异常安全（捕获重抛替代
   `std::terminate`）+ build 的 fd/tmp RAII 清理。
-
----
-
-## [Unreleased]
 
 ---
 
