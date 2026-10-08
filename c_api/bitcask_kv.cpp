@@ -454,6 +454,9 @@ BITCASK_API void bitcask_get_result_free(bitcask_get_result_t* result) {
 
 // S39：put_doc / put_doc_ex 的公共实现——两个入口只在「有没有 fields」上
 // 分叉，其余（校验、span 转换、错误映射）逐字相同，故收编成一份。
+// 6.7.0：包一层 extern "C++"。本文件主体在 extern "C" 内，C 链接的函数即便
+// 放进匿名 namespace，GCC 仍给外部链接——这几个助手曾以裸名泄进 .so 动态表。
+extern "C++" {
 namespace {
 
 // put_doc_common 与原子批 put_doc op 共用：C 文档 → DocInput。校验失败返回
@@ -552,6 +555,7 @@ bool to_cpp_batch_ops(const bitcask_txn_op_ex_t* ops, size_t n_ops,
 }
 
 }  // namespace
+}  // extern "C++"
 
 BITCASK_API bitcask_error_t bitcask_put_doc(bitcask_t* cask,
                                               bitcask_slice_t key,
@@ -1451,6 +1455,8 @@ BITCASK_API void bitcask_flush_index(bitcask_t* cask) {
  *  Meta 编解码（S39）——纯函数，不碰 cask 句柄
  * ========================================================================= */
 
+// 6.7.0：extern "C++" 理由同 put_doc_common 处——否则 set_invalid 泄进动态表。
+extern "C++" {
 namespace {
 
 void set_invalid(bitcask_fault_t* fault, const char* msg) {
@@ -1461,6 +1467,7 @@ void set_invalid(bitcask_fault_t* fault, const char* msg) {
 }
 
 }  // namespace
+}  // extern "C++"
 
 BITCASK_API bitcask_error_t bitcask_meta_encode(const bitcask_meta_entry_t* entries,
                                               size_t n,
