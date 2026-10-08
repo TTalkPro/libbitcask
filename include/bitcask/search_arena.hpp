@@ -16,4 +16,11 @@ namespace bitcask::search {
 void parallel_for_queries(std::size_t n,
                           const std::function<void(std::size_t)>& body);
 
+// 6.7.0：释放 Search 池对 TBB 运行时的引用（task_arena::terminate），使
+// tbb::finalize 能等到 worker 全部退出（bitcask_shutdown 用）。池从未建过则
+// 无操作；此后再有批量查询，池按冻结的槽数懒重建。
+// 要求：调用期间无查询在跑（task_arena::terminate 与 execute 不可并发）——
+// 调用方保证所有 Cask 已关闭。
+void release_search_arena();
+
 }  // namespace bitcask::search

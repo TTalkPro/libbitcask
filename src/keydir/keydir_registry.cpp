@@ -28,6 +28,15 @@ bitcask::IndexPool* KeyDirRegistry::index_pool() {
     return index_pool_.get();
 }
 
+std::size_t KeyDirRegistry::stop_index_pool_if_idle() {
+    std::scoped_lock lock(mutex_);
+    if (!entries_.empty()) return entries_.size();
+    // ~IndexPool → stop()：推 sentinel、join map worker 与 reducer。无车道
+    // 注册（entries_ 空 ⇒ 无 search 库在用）时队列里只剩 sentinel，join 即返。
+    index_pool_.reset();
+    return 0;
+}
+
 AcquireResult KeyDirRegistry::acquire(std::string_view name) {
     std::scoped_lock lock(mutex_);
     const std::string key(name);

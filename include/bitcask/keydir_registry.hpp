@@ -69,6 +69,13 @@ public:
     // Map/Reduce 线程 → 线程数与库数解耦，G2）。线程安全（内部锁）。
     [[nodiscard]] bitcask::IndexPool* index_pool();
 
+    // 6.7.0：bitcask_shutdown 用。无活动 keydir（entries_ 空 ⇔ 本 registry
+    // 上无打开的 Cask）时停池并 join 其全部线程，返回 0；否则不动池，返回
+    // 仍占用的 keydir 数。检查与停池在同一把 mutex_ 下，不与 acquire 竞态。
+    // 停池后再有 search 库 open，index_pool() 照常懒建新池。
+    // 线程安全: 是。锁: 内部 std::scoped_lock(mutex_)（持锁 join）。
+    [[nodiscard]] std::size_t stop_index_pool_if_idle();
+
     // 获取或新建一个命名 KeyDir。语义见文件头注释的初始化协议。
     // 线程安全: 是。锁: 内部 std::lock_guard(mutex_)。
     [[nodiscard]] AcquireResult acquire(std::string_view name);
