@@ -177,7 +177,7 @@ C API 是进程级 host：所有经 `bitcask_open` 打开的句柄**共享同一
 
 ### 5.1 `bitcask_error_t`：错误码枚举
 
-数值固定不变，对应 C++ `bitcask::CaskError`，ABI 稳定：
+数值固定不变，对应 C++ `bitcask::CaskError`，ABI 稳定（`15` 例外：仅 C 侧，无 `CaskError` 对应）：
 
 | 值 | 名称 | 含义 |
 |----|------|------|
@@ -196,6 +196,7 @@ C API 是进程级 host：所有经 `bitcask_open` 打开的句柄**共享同一
 | `12` | `BITCASK_ERR_ANALYZER_MISMATCH` | 分析器类型不匹配 |
 | `13` | `BITCASK_ERR_CLOSED`          | 对已 `bitcask_close` 的 handle 发起调用 |
 | `14` | `BITCASK_ERR_INDEX_REBUILD_FAILED` | OKI 试建而败——可写打开时重建失败（IO/环境问题，见日志）；修复后重开可重试 |
+| `15` | `BITCASK_ERR_BUSY`            | `bitcask_shutdown` 时运行时仍被占用（仍有库打开 / TBB 仍被其它线程引用），**不可卸载**；见 §8.3 |
 
 > **快照过期**：迭代器快照过期时 `bitcask_iter_start` 返回 `BITCASK_ERR_INVALID_OPTION`（头文件中无独立的 `BITCASK_ERR_OUT_OF_DATE`），调用方应捕获并重试。
 
@@ -787,6 +788,51 @@ BITCASK_API void bitcask_close(bitcask_t* cask);
 关闭并释放实例。内部调 `Cask::close()` 后 delete 句柄包装。`cask` 句柄此后不可使用。`cask == NULL` 是 no-op。**注意**：`bitcask_close` 调用 `delete`，因此句柄本身被 free——之后任何使用该指针的调用返回 `BITCASK_ERR_CLOSED`，不崩溃。
 
 **内存配对**：`bitcask_open` ↔ `bitcask_close`。
+
+### 8.3 `bitcask_shutdown`（拆除后台线程，供卸载动态库）
+
+```c
+BITCASK_API bitcask_error_t bitcask_shutdown(bitcask_fault_t* fault);
+```
+
+本库在进程里留有常驻后台线程：索引池（`index_workers` 条 map worker + 1 条 reducer，
+首个 search 库 open 时建）、Search 池（`task_arena`）与 TBB worker。宿主要在进程存活
+期间卸载动态库（`dlclose` / `FreeLibrary` / JVM FFM 关闭 `Arena` / .NET
+`NativeLibrary.Free`）时，先调本函数把它们拆掉。不调就卸载：这些线程仍在跑本库的
+代码——Linux/glibc 上实测表现为库**卸不掉**（`dlclose` 后仍驻留映射），其它平台 /
+libc 上有崩溃风险。进程退出前不打算卸载的宿主**不需要**调用。
+
+依次做三件事：
+
+1. 停索引池，join 其全部线程；
+2. 释放 Search 池对 TBB 运行时的引用；
+3. `tbb::finalize`：阻塞直到 TBB worker 线程全部退出。
+
+| 返回 | 含义 |
+|---|---|
+| `BITCASK_OK` | 后台线程已全部退出，可卸载 |
+| `BITCASK_ERR_BUSY` | 仍有库打开（第 1 步前就返回，什么都不动），或第 3 步未能等到 TBB 收尾；`fault->detail` 注明哪种。**不可卸载**，但库仍完全可用 |
+
+前置条件（宿主负责）：
+
+- 所有 `bitcask_t` 已 `bitcask_close`，迭代器已 release。
+- 不与本库的任何其它调用并发；不得在 `log_fn` / `bitcask_scan_fn` 回调里调。
+- **除调用线程外，曾进入过本库 TBB 并行段的其它线程须已退出**。TBB 在这些线程上留有
+  线程局部状态，只在线程退出时释放（调用线程自己的那份由本函数清掉）。会进入并行段的
+  调用：带 search 的 open（恢复）、文本 / 向量检索（尤其 `_batch`）、merge 等。
+  JVM / .NET 线程池里执行过这些调用的常驻线程是典型违例——要么把对本库的调用收到一条
+  专用线程上、shutdown 前结束它，要么接受 `BUSY` 并放弃卸载。
+- TBB 运行时是进程级的：宿主若与本库共用同一份 TBB 动态库且自己也在用，第 3 步返回
+  `BUSY`（不会强拆宿主的 TBB）。
+
+其它语义：
+
+- shutdown 之后（无论成败）库仍可继续使用：再 open 时各池按 `bitcask_set_thread_limits`
+  冻结的值懒重建（§8.1d 的上限不随 shutdown 解冻）。可重复调用；并发调用内部串行。
+- 从未初始化过任何池时直接返回 `BITCASK_OK`（不为 finalize 去建 TBB 运行时）。
+- 边角：若 TBB 的最后一份引用是由「另一条线程退出」释放的，TBB 走非阻塞拆除，其 worker
+  异步离场——只跑 libtbb 自己的代码，不碍卸载 libbitcask；宿主若紧接着连 libtbb 一起
+  卸载，存在一个很短的窗口。
 
 ---
 
@@ -1780,6 +1826,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 | `bitcask_status` / `bitcask_status_ex` / `bitcask_needs_merge` / `bitcask_merge` / `bitcask_is_empty` / `bitcask_is_frozen` / `bitcask_flush_index` | ✅ |
 | 读 / 写并发 | ✅（搜索可见性 near-real-time）|
 | `bitcask_merge` 与读写并发 | ✅（keydir `shared_mutex` 协调 + 独立 `merge.lock`，不阻塞 writer）|
+| `bitcask_shutdown` | ⚠️（多个 shutdown 之间内部串行；但**不得与本库任何其它调用并发**，且须所有句柄已关闭，见 §8.3）|
 
 ---
 
