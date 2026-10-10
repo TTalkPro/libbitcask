@@ -772,7 +772,6 @@ void Cask::close() noexcept {
     // 异常让后续资源释放仍能执行，优于进程硬死。错误可见性靠 index_errors_
     // 计数 + 未来可观测性梯队，不在 close 加日志。
     try {
-        drain_retired_files();  // B4：close 兜底排水（退休文件不过夜）
         (void)maybe_group_commit(/*force*/ true);  // P4:落最后一批未 fsync 的写
         // S36-5 B1：封口即持久——close 路径不经 roll/close_write_file，补
         // 同款 seal fsync（sync_every_n==0 时上面是 no-op，这里才是唯一
@@ -789,6 +788,24 @@ void Cask::close() noexcept {
             std::scoped_lock lk(read_cache_mu_);
             active_data_.reset();
             read_files_.clear();
+        }
+        // B4：close 兜底排水（退休文件不过夜）。必须排在释放读句柄之后：
+        // Windows 上仍被映射的文件 DeleteFileW 必然失败（feedbacks/
+        // 2026-10-10），先排水会让本该删掉的退休文件滞留到下次 open。
+        drain_retired_files();
+        {
+            std::size_t pending = 0;
+            {
+                std::lock_guard<std::mutex> lk(retired_mu_);
+                pending = retired_files_.size();
+            }
+            if (pending > 0) {
+                // 仍有句柄/映射占着（或删除失败）：析构时队列即被丢弃，
+                // 留一条日志让下游看得见「还有 N 个退休文件没删」。
+                log_error("close: " + std::to_string(pending) +
+                          " retired data file(s) not deleted (still open or "
+                          "mapped); they will be collected by a later merge");
+            }
         }
         // A4-P2/P3 顺序要点:先排干本库车道(flush → Index 覆盖全部已分配
         // ord),再在 keydir 仍在手时做 search 双保存(bm25 + sidecar,覆盖标记

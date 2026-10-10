@@ -1921,6 +1921,55 @@ TEST_F(CaskDocValueTest, P6MmapViewSurvivesMergeUnlink) {
     cask.close();
 }
 
+// feedbacks/2026-10-10：Windows 上 merge 之后 close 不删退休文件。按报告的形态：
+// 开搜索、同一批键覆盖写 4 轮（merge 输入里有大量死记录）、中间做一次搜索
+//（经 CaskPluginHost::read_at 进句柄缓存）；close 后退休输入应从目录消失。
+TEST_F(CaskDocValueTest, MergeThenCloseAfterSearchRemovesRetiredFiles) {
+    namespace fs = std::filesystem;
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    opts.max_file_size = 256;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Ngram;
+    sl_cfg.analyzer_config.min_n = 2;
+    sl_cfg.analyzer_config.max_n = 3;
+    opts.search_config = sl_cfg;
+    constexpr int kKeys = 4;
+    constexpr int kRounds = 4;
+    {
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        for (int r = 0; r < kRounds; ++r) {
+            for (int i = 0; i < kKeys; ++i) {
+                std::vector<std::byte> key{std::byte{'k'}, static_cast<std::byte>(i)};
+                std::vector<std::byte> val(40, static_cast<std::byte>('a' + r));
+                ASSERT_TRUE((*c)->put(key, val, static_cast<std::uint32_t>(1000 + r * 10 + i)));
+            }
+        }
+        (*c)->close();
+    }
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    auto& cask = **c;
+    cask.flush_index();
+    ASSERT_TRUE(cask.search_text("aaaa", 10));  // 搜索：读路径映射 data 文件
+
+    std::vector<std::string> to_merge;
+    for (const auto& de : fs::directory_iterator(tmpdir_)) {
+        if (bitcask::fileops::parse_data_tstamp(de.path().filename().string())) {
+            to_merge.push_back(de.path().string());
+        }
+    }
+    ASSERT_GE(to_merge.size(), 2u);
+    ASSERT_TRUE(cask.merge(to_merge));
+
+    cask.close();
+    for (const auto& p : to_merge) {
+        EXPECT_FALSE(fs::exists(p)) << "close 后退休文件应已删除：" << p;
+    }
+}
+
 // --- #1: FieldSchema 注册表 ---
 
 // intern 确定性：同名同 id、新名递增；name_of 反查。
