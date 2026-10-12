@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.7.0`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.7.1`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
@@ -15,6 +15,31 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 ---
 
 ## [Unreleased]
+
+---
+
+## [6.7.1] - 2026-10-12（Windows：merge 后 `bitcask_close` 正确删除退休文件，盘上体积不再滞留）
+
+> **版本语义**：纯缺陷修复——C API 零改动（无新符号、无结构体变化）；C++ 层只动
+> `Cask::close()` 内部次序并加一条错误日志；盘上格式未动；`SOVERSION` 保持 `6`。
+> 取 PATCH +1（6.7.1）。
+
+### Fixed
+
+- **Windows 上 merge 之后 `bitcask_close` 不删退休数据文件，盘上体积不降**（🟠 结果错，
+  不报错）。根因：`close()` 的 `drain_retired_files()` 排在释放读句柄缓存
+  （`read_files_.clear()`）之前——要删的文件仍被 mmap 映射占用，Windows 上
+  `DeleteFileW` 对被映射文件必然失败，失败路径把文件放回退休队列，析构时被静默丢弃；
+  Linux/glibc 上 `unlink` 对映射文件本就成功，故本机测不出（本机同形态原代码即绿，
+  病因「句柄占用」未经实测证实）。
+  - 修复：排水挪到释放读句柄缓存之后；排水后仍滞留队列的路径记一条 `log_error`
+    （数量 + 原因），不再静默丢。`checkpoint()` 入口与 merge 开头的排水经核对前序已
+    正确（merge 已先摘掉输入句柄），未动。
+  - 回归 `CaskDocValueTest.MergeThenCloseAfterSearchRemovesRetiredFiles`（开搜索、
+    4 轮覆盖写、搜索、merge、close，断言退休输入文件消失）。
+  - 来源：下游锦书（C#，经 Keelson.Bitcask 1.0.6，Windows x64）
+    `feedbacks/2026-10-10-windows-merge-retired-files-not-deleted-on-close.md`；
+    锦书侧需在 Windows 上复验 `RagIndexTests.Compaction`。
 
 ---
 
