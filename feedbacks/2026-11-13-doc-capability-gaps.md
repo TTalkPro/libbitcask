@@ -29,7 +29,12 @@ fields 成了纯写侧投影，读侧享受不到结构化，「按节读回」�
 
 **建议**：文档读回 API——get-doc / read-record 带 fields（至少可选返回）。
 
-**回没回**：未回。
+**回没回**：**已修（6.8.0）**：C++ 侧 `Cask::get_doc_view()` /
+`Cask::get_doc_owned()`，`GetResultView` / `GetResult` 末位加 `fields`；C API 纯加法
+`bitcask_get_doc` / `bitcask_get_doc_result_free`。盘上 field id 经 `field.schema`
+翻译回原名；schema 缺名 / DocValue 解码失败按 `kIo` 显式失败。普通
+`get()` / `bitcask_get()` 不解码 fields，热路径与布局零改动。逐字段写侧 patch 更新
+未做——覆盖写仍是全量 fields 替换。
 
 ## 3. 文档无部分更新（优先级：中）
 

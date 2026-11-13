@@ -179,6 +179,16 @@ S32-M0 向量引擎枚举。建库时一次性选定、持久化进 `bitcask.met
 ### 4.1 `bitcask::GetResultView`（零拷贝读结果，`cask.hpp`）
 
 ```cpp
+struct DocFieldView {
+    std::string name;                    // field.schema 翻译后的字段名
+    std::span<const std::byte> value;    // 借用底层读缓冲 / mmap
+};
+
+struct DocField {
+    std::string name;                    // field.schema 翻译后的字段名
+    std::vector<std::byte> value;        // owning 拷贝
+};
+
 struct GetResultView {
     std::span<const std::byte> value{};   // text 段（指向底层字节内部）
     std::span<const std::byte> meta{};    // meta 段（可为空）
@@ -186,6 +196,7 @@ struct GetResultView {
     std::uint32_t              tstamp     = 0;
     std::uint64_t              ord        = 0;
     std::uint32_t              expiry_at  = 0;  // per-key 过期时刻（0=永不）
+    std::vector<DocFieldView>  fields;         // 仅 get_doc_view() 填充
 
     GetResult to_owned() const;           // 拷贝为 owned 版本
 
@@ -196,7 +207,7 @@ struct GetResultView {
 };
 ```
 
-`Cask::get()` 返回 view：`value` / `meta` / `vector` 是借用内部 pread 缓冲或 mmap 的 span，**生命周期与 `GetResultView` 绑定**。即时消费场景零拷贝；需持久化用 `Cask::get_owned()` 或本结构上的 `to_owned()`。量化文档（`kFlagVecQuantized`）无法零拷贝成 f32，引擎内部 dequant 进自有缓冲。
+`Cask::get()` 返回 view：`value` / `meta` / `vector` 是借用内部 pread 缓冲或 mmap 的 span，**生命周期与 `GetResultView` 绑定**。即时消费场景零拷贝；需持久化用 `Cask::get_owned()` 或本结构上的 `to_owned()`。量化文档（`kFlagVecQuantized`）无法零拷贝成 f32，引擎内部 dequant 进自有缓冲。`get()` 不解码命名字段，`fields` 恒空。
 
 ### 4.2 `bitcask::GetResult`（owned 读结果，`cask.hpp`）
 
@@ -207,6 +218,7 @@ struct GetResult {
     std::vector<float>     vector;    // 向量段（空=无向量）
     std::uint32_t          tstamp = 0;
     std::uint64_t          ord    = 0;
+    std::vector<DocField>  fields;    // 仅 get_doc_owned() 填充
 };
 ```
 
@@ -426,6 +438,28 @@ get_owned(std::span<const std::byte> key);
 ```
 
 拷贝语义版本——benchmark 等需 owned 数据的场景。线程安全同 `get`。
+
+#### `Cask::get_doc_view`（命名字段零拷贝）
+
+```cpp
+[[nodiscard]] std::expected<GetResultView, CaskFault>
+get_doc_view(std::span<const std::byte> key);
+```
+
+S41：读回结构化文档并把 DocValue fields 段中的 field id 翻译为字段名。
+`fields[i].value` 借用读缓冲或 mmap，生命周期与返回的 view 绑定。定位、TTL、
+CRC、merge-retry 与 `get()` 相同。field id 缺 schema 名或 DocValue 解码失败返回
+`kIo`。线程安全同 `get`。
+
+#### `Cask::get_doc_owned`（命名字段拷贝）
+
+```cpp
+[[nodiscard]] std::expected<GetResult, CaskFault>
+get_doc_owned(std::span<const std::byte> key);
+```
+
+`get_doc_view()` 的 owning 版本；text、meta、vector、每个字段名与字段值全部拷出。
+线程安全同 `get`。
 
 #### `Cask::read_handle_count`
 
@@ -2357,7 +2391,7 @@ auto c = bitcask::Cask::open(dir, opts, &registry);
 |------|---------|------|
 | `open` / `upgrade` | ✅ | 产生独立对象；registry 内部锁 |
 | `close` | ⚠️ 生命周期（幂等）| caller 须保证无在途调用；close 后新调用 fail-fast 返回 `kClosed` |
-| `get` / `get_owned` / `read_handle_count` | ✅ | keydir 分片 shared_lock + `pread`（无状态、thread-safe）；read_files_ 由 `read_cache_mu_` 护 |
+| `get` / `get_owned` / `get_doc_view` / `get_doc_owned` / `read_handle_count` | ✅ | keydir 分片 shared_lock + `pread`（无状态、thread-safe）；read_files_ 由 `read_cache_mu_` 护 |
 | `put` / `put_batch` / `remove` / `put_doc` / `sync` / `close_write_file` / `checkpoint` | ✅ | **S11-W1：内部 `write_mu_` 串行化**整个写序列；多线程并发写安全（写本就串行 → 吞吐不变） |
 | `search_text` / `_phrase` / `_bool` / `_fields` / `_near` / `_fuzzy` / `_wildcard` / `search_text_highlight` | ✅ | 并发读：`cache_`/`doc_texts_` shared_mutex、InvertedIndex 分片 shared_lock、analyzer const |
 | `search_vector` / `search_hybrid` | ✅ | HNSW `atomic<shared_ptr>` 快照（读者引用计数续命）；两路内核读路径均并发安全 |

@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "bitcask/data_file.hpp"
+#include "bitcask/codec.hpp"
 #include "bitcask/file_lock.hpp"
 #include "bitcask/hint_file.hpp"
 #include "bitcask/docmap_ckpt.hpp"    // S18-2:docmap 持久化归宿主
@@ -203,6 +204,22 @@ struct CaskFault {
 // 声明顺序决定初始化顺序：storage_ 必须在 spans 之前声明。
 // (前置声明 GetResult:to_owned() 返回类型仅在 .cpp 中需要完整定义)
 struct GetResult;
+struct DocField;
+
+// S41：get_doc_view() 返回的命名字段。name 由 field.schema 复制；value 是
+// zero-copy span，借用底层 pread 缓冲或 mmap，生命周期随 GetResultView。
+// 普通 get() 不填充 fields，保持 KV 热路径零开销。
+struct DocFieldView {
+    std::string name;
+    std::span<const std::byte> value{};
+};
+
+// S41：get_doc_owned() 返回的命名字段。name/value 均为 owning 拷贝。
+struct DocField {
+    std::string name;
+    std::vector<std::byte> value;
+};
+
 struct GetResultView {
 private:
     friend class Cask;
@@ -224,6 +241,10 @@ public:
     std::uint64_t tstamp = 0;
     std::uint64_t ord = 0;
     std::uint64_t expiry_at = 0;           // S13-D5：per-key 过期时刻（0=永不）
+    // S41：仅 get_doc_view() 填充；get() 保持空 vector，避免 KV 点查热路径
+    // 新增分配。value 借底层字节；name 由 field.schema 复制。追加在末位，
+    // 既有聚合初始化 / 成员布局不前移。
+    std::vector<DocFieldView> fields;
 
     /// 拷贝为 owned 版本
     GetResult to_owned() const;
@@ -234,15 +255,25 @@ public:
     GetResultView& operator=(const GetResultView&) = delete;
 
 private:
-    explicit GetResultView(fileops::ReadRecord&& rec);  // owned(pread)
+    explicit GetResultView(fileops::ReadRecord&& rec,
+                           bool want_fields = false);  // owned(pread)
     // P6:mmap 命中——holder 锚定映射,value_bytes 指向映射内的 DocValue 字节。
     GetResultView(std::shared_ptr<fileops::DataFile> holder,
                   std::span<const std::byte> value_bytes,
                   format::RecordType type,
-                  std::uint64_t tstamp, std::uint64_t ord);
+                  std::uint64_t tstamp, std::uint64_t ord,
+                  bool want_fields = false);
     // 从 value_bytes_ 解出 value/meta/vector span（量化则 dequant 进
-    // vector_dequant_）。三个 ctor 共用，避免漂移。
-    void derive_from_storage();
+    // vector_dequant_）。want_fields 时额外暂存 field id/value；字段名由
+    // attach_fields() 翻译。三个 ctor 共用，避免漂移。
+    void derive_from_storage(bool want_fields);
+    // S41：把 derive_from_storage() 解出的 field id 翻译成字段名。
+    // dangling id 是 field.schema 损坏 / 记录与 schema 代际不一致，不静默丢。
+    [[nodiscard]] bool attach_fields(const FieldSchema& schema);
+
+    bool fields_requested_ = false;
+    bool storage_decode_failed_ = false;
+    std::vector<codec::DocField> decoded_fields_;
 };
 
 struct GetResult {
@@ -251,6 +282,9 @@ struct GetResult {
     std::vector<float> vector;     // V3.1:向量段(空 = 该文档无向量)
     std::uint64_t tstamp = 0;
     std::uint64_t ord = 0;
+    // S41：get_doc_owned() 填充；get_owned() 恒空。追加在末位，既有聚合
+    // 初始化 / 成员布局不前移。
+    std::vector<DocField> fields;
 };
 
 struct TextSearchResult {
@@ -583,9 +617,26 @@ public:
     [[nodiscard]] std::expected<GetResultView, CaskFault>
     get(std::span<const std::byte> key);
 
+    // S41：结构化文档读取（含命名字段）。fields 的 value 借底层 pread/mmap
+    // 缓冲，生命周期与 GetResultView 绑定；字段名从 field.schema 翻译。
+    // dangling field id / DocValue 损坏 → kIo（get() 对 fields 不感知，行为不变）。
+    [[nodiscard]] std::expected<GetResultView, CaskFault>
+    get_doc_view(std::span<const std::byte> key);
+
+    // S41：get_doc_view() 的 owning 版本。text/meta/vector/fields 全部拷出，
+    // 与 GetResultView 生命周期解耦。
+    [[nodiscard]] std::expected<GetResult, CaskFault>
+    get_doc_owned(std::span<const std::byte> key);
+
     /// 拷贝语义版本——benchmark 等需要 owned 数据的场景
     [[nodiscard]] std::expected<GetResult, CaskFault>
     get_owned(std::span<const std::byte> key);
+
+    // S41：get/get_doc_view 共用定位、TTL、CRC 与 merge-retry 读路径。
+    // want_fields=true 时额外解码 fields 并翻译 field id；否则 KV 热路径
+    // 保持现状（不建 fields 容器）。
+    [[nodiscard]] std::expected<GetResultView, CaskFault>
+    read_doc(std::span<const std::byte> key, bool want_fields);
 
     /// P9:当前常驻的 read 句柄数（read_files_ 大小）。内省用（测试断言 fd
     /// 预算上限生效）。线程安全：共享锁读。

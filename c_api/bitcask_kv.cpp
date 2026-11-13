@@ -452,6 +452,115 @@ BITCASK_API void bitcask_get_result_free(bitcask_get_result_t* result) {
     std::free(result);
 }
 
+BITCASK_API bitcask_error_t bitcask_get_doc(bitcask_t* cask,
+                                            bitcask_slice_t key,
+                                            bitcask_get_doc_result_t** out,
+                                            bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+        if (!cask || !out) return BITCASK_ERR_INVALID_OPTION;
+        if (!slice_valid(key)) return BITCASK_ERR_INVALID_OPTION;
+        *out = nullptr;
+
+        std::span<const std::byte> key_span{
+            static_cast<const std::byte*>(key.data), key.size};
+        auto src = as_cpp_cask(cask)->get_doc_owned(key_span);
+        if (!src) {
+            to_c_error(src.error(), fault);
+            return to_c_error_kind(src.error().kind);
+        }
+
+        auto copy_slice = [](std::span<const std::byte> bytes,
+                             bitcask_slice_t* dst) {
+            if (bytes.empty()) return true;
+            auto* p = std::malloc(bytes.size());
+            if (!p) return false;
+            std::memcpy(p, bytes.data(), bytes.size());
+            dst->data = p;
+            dst->size = bytes.size();
+            return true;
+        };
+
+        auto* r = static_cast<bitcask_get_doc_result_t*>(
+            std::malloc(sizeof(bitcask_get_doc_result_t)));
+        if (!r) {
+            set_oom_fault(fault);
+            return BITCASK_ERR_IO;
+        }
+        std::memset(r, 0, sizeof(*r));
+        if (!copy_slice(src->value, &r->value) ||
+            !copy_slice(src->meta, &r->meta)) {
+            bitcask_get_doc_result_free(r);
+            set_oom_fault(fault);
+            return BITCASK_ERR_IO;
+        }
+        if (!src->vector.empty()) {
+            auto* p = std::malloc(sizeof(float) * src->vector.size());
+            if (!p) {
+                bitcask_get_doc_result_free(r);
+                set_oom_fault(fault);
+                return BITCASK_ERR_IO;
+            }
+            std::memcpy(p, src->vector.data(),
+                        sizeof(float) * src->vector.size());
+            r->vector = static_cast<const float*>(p);
+            r->vector_len = src->vector.size();
+        }
+        if (!src->fields.empty()) {
+            r->fields_count = src->fields.size();
+            r->fields = static_cast<bitcask_doc_field_result_t*>(
+                std::malloc(sizeof(*r->fields) * r->fields_count));
+            if (!r->fields) {
+                r->fields_count = 0;
+                bitcask_get_doc_result_free(r);
+                set_oom_fault(fault);
+                return BITCASK_ERR_IO;
+            }
+            for (std::size_t i = 0; i < r->fields_count; ++i) {
+                r->fields[i].name = nullptr;
+                std::memset(&r->fields[i].value, 0,
+                            sizeof(r->fields[i].value));
+            }
+            for (std::size_t i = 0; i < r->fields_count; ++i) {
+                const auto& f = src->fields[i];
+                r->fields[i].name = static_cast<char*>(
+                    std::malloc(f.name.size() + 1));
+                if (!r->fields[i].name) {
+                    bitcask_get_doc_result_free(r);
+                    set_oom_fault(fault);
+                    return BITCASK_ERR_IO;
+                }
+                std::memcpy(r->fields[i].name, f.name.data(), f.name.size());
+                r->fields[i].name[f.name.size()] = '\0';
+                if (!copy_slice(f.value, &r->fields[i].value)) {
+                    bitcask_get_doc_result_free(r);
+                    set_oom_fault(fault);
+                    return BITCASK_ERR_IO;
+                }
+            }
+        }
+        r->tstamp = src->tstamp;
+        r->ord = src->ord;
+        *out = r;
+        return BITCASK_OK;
+    });
+}
+
+BITCASK_API void bitcask_get_doc_result_free(bitcask_get_doc_result_t* result) {
+    if (!result) return;
+    if (result->value.data) std::free(const_cast<void*>(result->value.data));
+    if (result->meta.data) std::free(const_cast<void*>(result->meta.data));
+    if (result->vector) std::free(const_cast<float*>(result->vector));
+    for (std::size_t i = 0; i < result->fields_count; ++i) {
+        std::free(result->fields[i].name);
+        if (result->fields[i].value.data) {
+            std::free(const_cast<void*>(result->fields[i].value.data));
+        }
+    }
+    std::free(result->fields);
+    std::free(result);
+    return;
+}
+
 // S39：put_doc / put_doc_ex 的公共实现——两个入口只在「有没有 fields」上
 // 分叉，其余（校验、span 转换、错误映射）逐字相同，故收编成一份。
 // 6.7.0：包一层 extern "C++"。本文件主体在 extern "C" 内，C 链接的函数即便

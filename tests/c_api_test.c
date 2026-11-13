@@ -1022,6 +1022,35 @@ static int test_doc_fields_and_meta(void) {
 
     bitcask_flush_index(cask);
 
+    /* ---- S41：get_doc 读回命名字段；field id 已翻译为原名 ---- */
+    {
+        bitcask_get_doc_result_t* doc = NULL;
+        err = bitcask_get_doc(cask, k0, &doc, &fault);
+        assert(err == BITCASK_OK && doc != NULL);
+        assert(doc->value.size == 11);
+        assert(memcmp(doc->value.data, "hello world", 11) == 0);
+        assert(doc->meta.size == meta_blob.size);
+        assert(memcmp(doc->meta.data, meta_blob.data, meta_blob.size) == 0);
+        assert(doc->fields_count == 2);
+        assert(strcmp(doc->fields[0].name, "title") == 0);
+        assert(doc->fields[0].value.size == 5);
+        assert(memcmp(doc->fields[0].value.data, "alpha", 5) == 0);
+        assert(strcmp(doc->fields[1].name, "body") == 0);
+        assert(doc->fields[1].value.size == 5);
+        assert(memcmp(doc->fields[1].value.data, "gamma", 5) == 0);
+        bitcask_get_doc_result_free(doc);
+
+        doc = NULL;
+        err = bitcask_get_doc(cask, k1, &doc, &fault);
+        assert(err == BITCASK_OK && doc != NULL);
+        assert(doc->value.size == 0);
+        assert(doc->fields_count == 1);
+        assert(strcmp(doc->fields[0].name, "title") == 0);
+        assert(doc->fields[0].value.size == 4);
+        assert(memcmp(doc->fields[0].value.data, "beta", 4) == 0);
+        bitcask_get_doc_result_free(doc);
+    }
+
     /* ---- 命名字段可检索（这条在 S39 之前的纯 C 库上恒为 0 命中）---- */
     {
         bitcask_search_result_t* r = NULL;

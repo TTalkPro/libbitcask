@@ -407,6 +407,29 @@ typedef struct {
 
 **所有权**：由 `bitcask_get` malloc 分配；`value.data` / `meta.data` / `vector` 是 malloc 缓冲。调用方负责 `bitcask_get_result_free()`。
 
+### 7.1b `bitcask_get_doc_result_t`（S41：命名字段读回）
+
+```c
+typedef struct {
+    char*           name;    // field.schema 翻译后的字段名，NUL 结尾
+    bitcask_slice_t value;   // 字段原值（写入时的 UTF-8 载荷）
+} bitcask_doc_field_result_t;
+
+typedef struct {
+    bitcask_slice_t             value;       // text 段（DocValue 解码后）
+    bitcask_slice_t             meta;        // meta 段（可为空）
+    const float*                vector;      // 向量段（可为 NULL）
+    size_t                      vector_len;  // 0 = 无向量
+    bitcask_doc_field_result_t* fields;      // fields_count == 0 时可为 NULL
+    size_t                      fields_count;
+    uint64_t                    tstamp;
+    uint64_t                    ord;
+} bitcask_get_doc_result_t;
+```
+
+**所有权**：由 `bitcask_get_doc` malloc 分配。`value` / `meta` / `vector` 与每个
+字段的 `name` / `value` 都是独立缓冲；调用方负责 `bitcask_get_doc_result_free()`。
+
 ### 7.2 `bitcask_search_hit_t` / `bitcask_search_result_t`
 
 ```c
@@ -509,7 +532,7 @@ typedef struct {
 | 用途 | 进倒排索引的**命名文本** | **结构化属性**，只用于过滤 |
 | 是否分词 | 是 | 否 |
 | 查询入口 | `bitcask_search_fields` 的 `field:term^boost`，参与 BM25 打分 | `bitcask_meta_filter_t` 传给 `*_filtered` 搜索，纯布尔过滤 |
-| 能否读回 | 否（只作索引输入；盘上存的是 field id） | 能，`bitcask_get_result_t.meta` |
+| 能否读回 | 能，`bitcask_get_doc_result_t.fields`（S41；field id 翻译回原名） | 能，`bitcask_get_result_t.meta` |
 | 盘上 | 名字经 `<dir>/field.schema` intern 成整数 id | 一整块 key 升序 KV blob |
 
 `text` 与 `fields` 的关系——**不冲突，但会重复计数**：
@@ -912,6 +935,30 @@ BITCASK_API void bitcask_get_result_free(bitcask_get_result_t* result);
 **所有权**：`result == NULL` 是 no-op；否则依次 `free(value.data)` / `free(meta.data)` / `free(vector)`，最后 `free(result)`（实现见 `c_api/bitcask_kv.cpp::bitcask_get_result_free`）。
 
 **内存配对**：`bitcask_get` ↔ `bitcask_get_result_free`。
+
+### 9.8 `bitcask_get_doc`（S41：读回命名字段）
+
+```c
+BITCASK_API bitcask_error_t bitcask_get_doc(bitcask_t* cask,
+                                            bitcask_slice_t key,
+                                            bitcask_get_doc_result_t** out,
+                                            bitcask_fault_t* fault);
+```
+
+读取结构化文档并交出命名字段；盘上 field id 由 `field.schema` 翻译回原名。
+定位、TTL、CRC、merge-retry 语义同 `bitcask_get`。key 不存在或已过期返回
+`BITCASK_ERR_NOT_FOUND`；DocValue 解码失败或 field id 缺 schema 名返回
+`BITCASK_ERR_IO`。既有 `bitcask_get` 的布局与语义零改动。
+
+### 9.9 `bitcask_get_doc_result_free`
+
+```c
+BITCASK_API void bitcask_get_doc_result_free(bitcask_get_doc_result_t* result);
+```
+
+**所有权**：`result == NULL` 是 no-op；否则依次释放 `value.data` / `meta.data` /
+`vector` / 每个 `fields[i].name` / `fields[i].value.data` / `fields` 数组，最后
+释放 `result`。内存配对：`bitcask_get_doc` ↔ `bitcask_get_doc_result_free`。
 
 ---
 
@@ -1772,6 +1819,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 |--------------------------|--------|------|------|
 | `bitcask_open` → `bitcask_t*` | `bitcask_close` | `delete` 句柄包装（内部先调 `Cask::close()`）| 同一 handle 必须恰好 1 次 `close`；句柄指针之后失效 |
 | `bitcask_get` → `bitcask_get_result_t*` | `bitcask_get_result_free` | 依次 `free(value.data)` / `free(meta.data)` / `free(vector)`，最后 `free(result)` | 仅在 `BITCASK_OK` 时有效；`BITCASK_ERR_NOT_FOUND` 时 `*out = NULL` 不需 free |
+| `bitcask_get_doc` → `bitcask_get_doc_result_t*` | `bitcask_get_doc_result_free` | 依次 `free(value.data)` / `free(meta.data)` / `free(vector)` / 逐字段 `free(name)`、`free(value.data)`，再 `free(fields)`，最后 `free(result)` | 仅在 `BITCASK_OK` 时有效；找不到 key 时 `*out = NULL` 不需 free |
 | `bitcask_search_*`（单查询）→ `bitcask_search_result_t*` | `bitcask_search_result_free` | 对每个 `hits[i].key` 调 `free`，再 `free(hits)`，最后 `free(result)` | 包含 `search_text / _phrase / _bool / _fields / _near / _fuzzy / _wildcard / _vector / _hybrid`、对应 `_filtered`，以及 S39 新增的 `_text_ex / _phrase_ex / bool_search_ex`、反馈 2026-10-06 新增的 `_phrase / bool_search / _fields / _near / _fuzzy / _wildcard` 六个 `_filtered`，共 21 个单查询入口（高亮版另有自己的 free，见上一行） |
 | `bitcask_search_text_highlight` → `bitcask_search_result_ex_t*` | `bitcask_search_result_ex_free` | 逐 hit `free(key)` + 逐片段 `free(text)` + `free(highlights)`，再 `free(hits)`、`free(result)` | **不可**用 `bitcask_search_result_free` 释放（结构不同）|
 | `bitcask_meta_encode` → `bitcask_slice_t.data` | `bitcask_meta_blob_free` | `free(blob->data)` 并清零（幂等，接受 `NULL`）| `n == 0` 时返回空 blob，无需 free |

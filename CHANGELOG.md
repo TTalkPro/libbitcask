@@ -14,11 +14,12 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ---
 
-## [6.8.0] - 2026-11-13（字段命中归属：search_fields 回包附「命中的字段名」）
+## [6.8.0] - 2026-11-13（字段命中归属 + fields 读回：结构化文档字段不再是纯写侧投影）
 
 > **版本语义**：纯能力新增——C API 纯加法（新结构 + 新函数，既有
-> `bitcask_search_fields*` 布局与语义零改动）；C++ 层 `search_fields` 改为委托
-> `search_fields_attributed` 后剥离（排序与命中语义不变）；盘上格式未动；
+> `bitcask_search_fields*` / `bitcask_get` 布局与语义零改动）；C++ 层
+> `search_fields` 改为委托 `search_fields_attributed` 后剥离（排序与命中语义不变），
+> 读结果末位追加 `fields` 并新增显式文档读入口；盘上格式未动；
 > `SOVERSION` 保持 `6`。取 MINOR +1（6.8.0）。
 
 ### Added
@@ -34,6 +35,17 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
   `bitcask_search_fields_ex` / `bitcask_search_fields_ex_filtered` /
   `bitcask_search_fields_result_free`——既有 `bitcask_search_fields*` 布局与语义
   零改动，SOVERSION 不变。逐字段 snippet 未做（命中归属已可回答「第几节」）。
+
+- **fields 读回（反馈 2026-11-13 #2）**：`put_doc` 的命名字段此前只进 DocValue v2
+  与倒排索引，读接口没有任何 get-doc——下游要拿字段原值只能重新解析业务文档。
+  补齐：C++ 侧 `DocFieldView` / `DocField`，`GetResultView` / `GetResult` 末位追加
+  `fields`，新增 `Cask::get_doc_view()` / `Cask::get_doc_owned()`；`get()` 不解码
+  fields、结果恒空，KV 点查热路径零变化。文档读共用定位 / TTL / CRC / merge-retry
+  路径，field id 经 `field.schema` 翻译回原名；schema 缺名或 DocValue 解码失败返回
+  `kIo`，不静默丢字段。C API 纯加法：`bitcask_doc_field_result_t` /
+  `bitcask_get_doc_result_t` + `bitcask_get_doc` /
+  `bitcask_get_doc_result_free`——既有 `bitcask_get` 布局与语义零改动，
+  SOVERSION 不变。append-only 语义不变：覆盖写仍是全量 fields 替换。
 
 ---
 

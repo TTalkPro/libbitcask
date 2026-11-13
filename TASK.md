@@ -10,6 +10,23 @@
 
 ---
 
+## ✅ S41 · fields 读回（2026-11-13，随 6.8.0）
+
+> 来源：[`feedbacks/2026-11-13-doc-capability-gaps.md`](feedbacks/2026-11-13-doc-capability-gaps.md) #2。
+> 设计：[`docs/design/s41-fields-read-back-design-zh.md`](docs/design/s41-fields-read-back-design-zh.md)。
+
+| # | 任务 | 状态 | 结果 |
+|---|---|---|---|
+| S41-1 | C++ 结果类型与文档读入口 | ✅ done | `DocFieldView` / `DocField`；`GetResultView` / `GetResult` 末位追加 `fields`；`Cask::get_doc_view()` / `get_doc_owned()`；`get()` 不解码 fields，热路径行为不变 |
+| S41-2 | 共用读路径 + schema 翻译 | ✅ done | `read_doc(key, want_fields)` 复用定位、TTL、CRC、merge-retry；field id 翻译失败或文档解码失败按 `kIo` 显式失败，不静默丢字段 |
+| S41-3 | C API 纯加法 | ✅ done | `bitcask_get_doc` / `bitcask_get_doc_result_free` + 新结果结构；`bitcask_get` 布局与语义零改动，SOVERSION 保持 6 |
+| S41-4 | 回归与账目 | ✅ done | C++ 覆盖 view/owned/覆盖替换/重开读回/search；C 覆盖 `put_doc_ex → get_doc` 与所有权释放；CHANGELOG 与 feedbacks 已标随 6.8.0 |
+
+**明确不做**：field/meta 部分更新；fields 值的独立删除。append-only 下文档覆盖仍是
+全量 fields 替换，后续如做 patch 更新需另行设计读-改-写与索引重登记语义。
+
+---
+
 ## 📁 上一清单归档
 
 S33（有序 Key 索引 OKI）、S34（TxnCask）、S35（引擎原生原子批）、S36（keydir 磁盘驻留

@@ -270,6 +270,30 @@ typedef struct {
     uint64_t        ord;        // 写入序号
 } bitcask_get_result_t;
 
+/* ===========================================================================
+ *  结构化文档读取（反馈 2026-11-13 #2）
+ * ========================================================================= */
+
+/* get_doc 返回的单个命名字段。name/value 均独立 malloc，由
+ * bitcask_get_doc_result_free() 统一释放。 */
+typedef struct {
+    char*           name;   /* NUL 结尾；由 field.schema 翻译回原名 */
+    bitcask_slice_t value;  /* 原始字节（与写入时相同的 UTF-8 载荷） */
+} bitcask_doc_field_result_t;
+
+/* get_doc 返回结果（对应 bitcask::GetResult + fields）。
+ * 调用方负责调用 bitcask_get_doc_result_free() 释放。 */
+typedef struct {
+    bitcask_slice_t              value;       /* text 段（DocValue 解码后） */
+    bitcask_slice_t              meta;        /* meta 段（可为空） */
+    const float*                 vector;      /* 向量段（可为 NULL） */
+    size_t                       vector_len;  /* 向量元素数（0 = 无向量） */
+    bitcask_doc_field_result_t*  fields;      /* fields_count 可为 0，此时 NULL */
+    size_t                       fields_count;
+    uint64_t                     tstamp;
+    uint64_t                     ord;
+} bitcask_get_doc_result_t;
+
 // 单条搜索命中（对应 bitcask::search::SearchHit）
 typedef struct {
     char*     key;    // NUL 结尾，malloc 分配，由 bitcask_search_result_free 释放
@@ -500,6 +524,18 @@ BITCASK_API bitcask_error_t bitcask_close_write_file(bitcask_t* cask,
 
 // 释放 get 结果
 BITCASK_API void bitcask_get_result_free(bitcask_get_result_t* result);
+
+/* 读取 key 对应的结构化文档，并交出命名字段（field id 已翻译为字段名）。
+ * 成功返回 BITCASK_OK，*out 指向新建结果；key 不存在 / 已过期返回
+ * BITCASK_ERR_NOT_FOUND；DocValue 损坏或 field.schema 缺项返回
+ * BITCASK_ERR_IO。既有 bitcask_get 的布局与语义零改动。 */
+BITCASK_API bitcask_error_t bitcask_get_doc(bitcask_t* cask,
+                                            bitcask_slice_t key,
+                                            bitcask_get_doc_result_t** out,
+                                            bitcask_fault_t* fault);
+
+/* 释放 bitcask_get_doc 返回的结果。NULL 安全。 */
+BITCASK_API void bitcask_get_doc_result_free(bitcask_get_doc_result_t* result);
 
 /* ===========================================================================
  *  结构化文档写入

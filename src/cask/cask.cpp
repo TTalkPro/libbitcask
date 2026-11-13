@@ -1614,6 +1614,23 @@ Cask::prepare_vector(std::span<const float> input,
 //   benchmark / 测试 / 需要持久化 → get_owned()。
 std::expected<GetResultView, CaskFault>
 Cask::get(std::span<const std::byte> key) {
+    return read_doc(key, /*want_fields=*/false);
+}
+
+std::expected<GetResultView, CaskFault>
+Cask::get_doc_view(std::span<const std::byte> key) {
+    return read_doc(key, /*want_fields=*/true);
+}
+
+std::expected<GetResult, CaskFault>
+Cask::get_doc_owned(std::span<const std::byte> key) {
+    auto v = get_doc_view(key);
+    if (!v) return std::unexpected(v.error());
+    return v->to_owned();
+}
+
+std::expected<GetResultView, CaskFault>
+Cask::read_doc(std::span<const std::byte> key, bool want_fields) {
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
     // S13-F5：get 与并发 merge 收尾之间有窗口——本线程先查 keydir 拿到旧定位，
     // merge 随即把该 key CAS 到新文件并 unlink 旧文件（O10 的同临界区 erase+
@@ -1654,10 +1671,18 @@ Cask::get(std::span<const std::byte> key) {
                 return std::unexpected(err(CaskError::kNotFound));
             }
             GetResultView view(std::move(df), rv->value, rv->type,
-                               rv->tstamp, rv->ord);
+                               rv->tstamp, rv->ord, want_fields);
             // S13-D5：per-key TTL——过期视作不存在（空间留给 merge 回收）。
             if (view.expiry_at != 0 && view.expiry_at <= now_sec_default()) {
                 return std::unexpected(err(CaskError::kNotFound));
+            }
+            if (want_fields && !view.attach_fields(field_schema_)) {
+                return std::unexpected(err(CaskError::kIo,
+                                           "dangling DocValue field id"));
+            }
+            if (want_fields && view.storage_decode_failed_) {
+                return std::unexpected(err(CaskError::kIo,
+                                           "corrupt DocValue"));
             }
             return view;
         }
@@ -1690,10 +1715,18 @@ Cask::get(std::span<const std::byte> key) {
     }
 
     {
-        GetResultView view(std::move(*rec));
+        GetResultView view(std::move(*rec), want_fields);
         // S13-D5：per-key TTL——过期视作不存在。
         if (view.expiry_at != 0 && view.expiry_at <= now_sec_default()) {
             return std::unexpected(err(CaskError::kNotFound));
+        }
+        if (want_fields && !view.attach_fields(field_schema_)) {
+            return std::unexpected(err(CaskError::kIo,
+                                       "dangling DocValue field id"));
+        }
+        if (want_fields && view.storage_decode_failed_) {
+            return std::unexpected(err(CaskError::kIo,
+                                       "corrupt DocValue"));
         }
         return view;
     }
@@ -1783,14 +1816,24 @@ Cask::parallel_scan(std::size_t n_threads, const ScanFn& fn,
 
 // --- GetResultView implementation ---
 
-void GetResultView::derive_from_storage() {
+void GetResultView::derive_from_storage(bool want_fields) {
     if (rec_type_ != format::RecordType::kDoc) return;  // tombstone 等不解码
     if (value_bytes_.empty()) return;
     auto dv = codec::decode_doc_value(value_bytes_);
-    if (!dv) return;  // corrupt DocValue → empty spans
+    if (!dv) {
+        // get() 的既有契约：坏 DocValue 交出空 spans，不在 KV 点查热路径上
+        // 改错误模型。get_doc_view() 需要可靠 fields 语义，由 caller 查该位
+        // 后显式失败。
+        if (want_fields) storage_decode_failed_ = true;
+        return;
+    }
     value = dv->text;
     meta  = dv->meta;
     expiry_at = dv->expiry_at;  // S13-D5
+    if (want_fields) {
+        fields_requested_ = true;
+        decoded_fields_ = std::move(dv->fields);
+    }
     if (dv->vec_quantized) {
         // P3b:量化 → dequant 进拥有缓冲，span 指向它。
         vector_dequant_ = codec::doc_vector_f32(*dv);
@@ -1815,28 +1858,41 @@ void GetResultView::derive_from_storage() {
     }
 }
 
-GetResultView::GetResultView(fileops::ReadRecord&& rec)
+bool GetResultView::attach_fields(const FieldSchema& schema) {
+    if (!fields_requested_) return true;
+    fields.clear();
+    fields.reserve(decoded_fields_.size());
+    for (const auto& f : decoded_fields_) {
+        auto name = schema.name_of(f.id);
+        if (!name) return false;
+        fields.push_back({std::move(*name), f.value});
+    }
+    return true;
+}
+
+GetResultView::GetResultView(fileops::ReadRecord&& rec, bool want_fields)
     : storage_(std::move(rec))       // move first (declaration order)
     , rec_type_(storage_.type)
     , tstamp(storage_.tstamp)
     , ord(storage_.ord)
 {
     value_bytes_ = std::span<const std::byte>(storage_.value);
-    derive_from_storage();
+    derive_from_storage(want_fields);
 }
 
 // P6:mmap 命中——map_holder_ 锚定映射,value_bytes 指向映射内 DocValue 字节。
 GetResultView::GetResultView(std::shared_ptr<fileops::DataFile> holder,
                              std::span<const std::byte> value_bytes,
                              format::RecordType type,
-                             std::uint64_t ts, std::uint64_t o)
+                             std::uint64_t ts, std::uint64_t o,
+                             bool want_fields)
     : map_holder_(std::move(holder))
     , value_bytes_(value_bytes)
     , rec_type_(type)
     , tstamp(ts)
     , ord(o)
 {
-    derive_from_storage();
+    derive_from_storage(want_fields);
 }
 
 GetResultView::GetResultView(GetResultView&& other) noexcept
@@ -1846,21 +1902,32 @@ GetResultView::GetResultView(GetResultView&& other) noexcept
     , tstamp(other.tstamp)
     , ord(other.ord)
 {
+    fields_requested_ = other.fields_requested_;
+    storage_decode_failed_ = other.storage_decode_failed_;
+    decoded_fields_ = std::move(other.decoded_fields_);
+    fields = std::move(other.fields);
     // owned 路径:value_bytes_ 重指向自己的 storage_(other 的已悬垂);
     // mmap 路径:映射地址稳定,沿用 other 的字节区(map_holder_ 已移交本对象)。
     value_bytes_ = map_holder_ ? other.value_bytes_
                                : std::span<const std::byte>(storage_.value);
-    derive_from_storage();
+    // fields/decoded_fields 已随 move 转移；span 目标字节也随 storage_/mmap
+    // 转移。这里只需重建 value/meta/vector 基础视图，不要重放 fields。
+    derive_from_storage(false);
 }
 
 GetResult GetResultView::to_owned() const {
-    GetResult out{
-        std::vector<std::byte>(value.begin(), value.end()),
-        std::vector<std::byte>(meta.begin(), meta.end()),
-        {},
-        tstamp,
-        ord
-    };
+    GetResult out;
+    out.value.assign(value.begin(), value.end());
+    out.meta.assign(meta.begin(), meta.end());
+    out.tstamp = tstamp;
+    out.ord = ord;
+    out.fields.reserve(this->fields.size());
+    for (const auto& f : this->fields) {
+        out.fields.push_back({
+            f.name,
+            std::vector<std::byte>(f.value.begin(), f.value.end()),
+        });
+    }
     if (!vector.empty()) {
         out.vector.assign(vector.begin(), vector.end());
     }

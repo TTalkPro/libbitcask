@@ -1001,7 +1001,6 @@ TEST_F(CaskDocValueTest, PutBatchBasicAndPersistence) {
         return std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(s.data()), s.size());
     };
-
     constexpr std::size_t kN = 200;  // 只用于 reserve/下标
     std::vector<std::string> keys, vals;
     keys.reserve(kN);
@@ -1190,6 +1189,114 @@ TEST_F(CaskDocValueTest, SearchTextHighlightViaCaskFacade) {
     auto closed = (*c)->search_text_highlight("quick", 10);
     ASSERT_FALSE(closed);
     EXPECT_EQ(closed.error().kind, bitcask::CaskError::kClosed);
+}
+
+// S41：put_doc 已把命名字段写进 DocValue v2；本组回归锁定读侧契约——
+// get() 保持 KV 热路径零 fields 开销，显式 get_doc_* 才解码并翻译字段名。
+TEST_F(CaskDocValueTest, MultiFieldReadBackViewOwnedAndFullReplace) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = sl_cfg;
+
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    auto bytes = [](std::string_view s) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s.data()), s.size());
+    };
+    auto owned_bytes = [](std::string_view s) {
+        return std::vector<std::byte>(
+            reinterpret_cast<const std::byte*>(s.data()),
+            reinterpret_cast<const std::byte*>(s.data()) + s.size());
+    };
+    auto same_bytes = [](std::span<const std::byte> got,
+                         std::string_view want) {
+        return got.size() == want.size() &&
+               std::equal(got.begin(), got.end(),
+                          reinterpret_cast<const std::byte*>(want.data()));
+    };
+
+    bitcask::DocInput doc;
+    doc.text = bytes("alpha payload");
+    doc.meta = bytes(R"({"color":"blue"})");
+    doc.fields.push_back({"title", bytes("alpha title")});
+    doc.fields.push_back({"body", bytes("alpha body")});
+    ASSERT_TRUE((*c)->put_doc(bytes("doc"), doc, 1000));
+
+    // 既有 KV 点查契约：不为了 fields 新增堆分配/拷贝。
+    auto plain = (*c)->get_owned(bytes("doc"));
+    ASSERT_TRUE(plain);
+    EXPECT_TRUE(plain->fields.empty());
+    EXPECT_EQ(plain->value, owned_bytes("alpha payload"));
+
+    auto vr = (*c)->get_doc_view(bytes("doc"));
+    ASSERT_TRUE(vr);
+    ASSERT_EQ(vr->fields.size(), 2u);
+    EXPECT_EQ(vr->fields[0].name, "title");
+    EXPECT_TRUE(same_bytes(vr->fields[0].value, "alpha title"));
+    EXPECT_EQ(vr->fields[1].name, "body");
+    EXPECT_TRUE(same_bytes(vr->fields[1].value, "alpha body"));
+
+    auto owned = vr->to_owned();
+    ASSERT_EQ(owned.fields.size(), 2u);
+    EXPECT_EQ(owned.fields[0].name, "title");
+    EXPECT_EQ(owned.fields[0].value, owned_bytes("alpha title"));
+    EXPECT_EQ(owned.fields[1].name, "body");
+    EXPECT_EQ(owned.fields[1].value, owned_bytes("alpha body"));
+    EXPECT_EQ(owned.meta, plain->meta);
+
+    // append-only：文档级覆盖即全量 fields 替换；旧 body 不会残留。
+    bitcask::DocInput replacement;
+    replacement.text = bytes("replacement");
+    replacement.fields.push_back({"title", bytes("new title")});
+    ASSERT_TRUE((*c)->put_doc(bytes("doc"), replacement, 1001));
+    auto rr = (*c)->get_doc_view(bytes("doc"));
+    ASSERT_TRUE(rr);
+    ASSERT_EQ(rr->fields.size(), 1u);
+    EXPECT_EQ(rr->fields[0].name, "title");
+    EXPECT_TRUE(same_bytes(rr->fields[0].value, "new title"));
+
+    (*c)->close();
+}
+
+TEST_F(CaskDocValueTest, MultiFieldReadBackAfterReopen) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.enable_search = true;
+    SearchLayerConfig sl_cfg;
+    sl_cfg.analyzer_config.type = AnalyzerType::Whitespace;
+    opts.search_config = sl_cfg;
+    auto bytes = [](std::string_view s) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s.data()), s.size());
+    };
+    auto same_bytes = [](std::span<const std::byte> got,
+                         std::string_view want) {
+        return got.size() == want.size() &&
+               std::equal(got.begin(), got.end(),
+                          reinterpret_cast<const std::byte*>(want.data()));
+    };
+
+    {
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        bitcask::DocInput doc;
+        doc.text = bytes("persisted alpha");
+        doc.fields.push_back({"title", bytes("persisted title")});
+        ASSERT_TRUE((*c)->put_doc(bytes("doc"), doc, 1000));
+        (*c)->close();
+    }
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    auto r = (*c)->get_doc_view(bytes("doc"));
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->fields.size(), 1u);
+    EXPECT_EQ(r->fields[0].name, "title");
+    EXPECT_TRUE(same_bytes(r->fields[0].value, "persisted title"));
+    (*c)->close();
 }
 
 // S8.6：put_doc 多字段 → search_fields 字段路由，端到端经 Cask（含异步 IndexTask）。
