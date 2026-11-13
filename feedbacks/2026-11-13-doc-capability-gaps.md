@@ -15,7 +15,7 @@
 
 **建议**：字段检索的命中附命中的字段名列表，最好再带逐字段 snippet。
 
-**回没回**：**已修**（归属部分）：`SearchFieldHit{key, ord, score, fields}` +
+**回没回**：**已修（6.8.0，归属部分）**：`SearchFieldHit{key, ord, score, fields}` +
 `TextPlugin::search_fields_attributed` / `Cask::search_fields_attributed`；
 C API 纯加法 `bitcask_search_fields_ex` / `bitcask_search_fields_ex_filtered` /
 `bitcask_search_fields_result_free`。`fields` 去重、首次命中序；默认字段

@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.7.1`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.8.0`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
@@ -14,7 +14,12 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ---
 
-## [Unreleased]
+## [6.8.0] - 2026-11-13（字段命中归属：search_fields 回包附「命中的字段名」）
+
+> **版本语义**：纯能力新增——C API 纯加法（新结构 + 新函数，既有
+> `bitcask_search_fields*` 布局与语义零改动）；C++ 层 `search_fields` 改为委托
+> `search_fields_attributed` 后剥离（排序与命中语义不变）；盘上格式未动；
+> `SOVERSION` 保持 `6`。取 MINOR +1（6.8.0）。
 
 ### Added
 
