@@ -244,6 +244,43 @@ BITCASK_API bitcask_error_t bitcask_search_fields_filtered(
     });
 }
 
+/* 反馈 2026-11-13 #4：字段命中归属版。语义同 bitcask_search_fields（含
+ * _filtered），命中额外附「命中的字段名列表」（去重、首次命中序；默认字段
+ * 记空串）。 */
+BITCASK_API bitcask_error_t bitcask_search_fields_ex(
+    bitcask_t* cask, const char* query, size_t k,
+    bitcask_search_fields_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+    return finish_single_fields(
+        as_cpp_cask(cask)->search_fields_attributed(query, k), out, fault);
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_search_fields_ex_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_fields_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
+    return finish_single_fields(
+        as_cpp_cask(cask)->search_fields_attributed(query, k, pf.get()),
+        out, fault);
+    });
+}
+
+BITCASK_API void bitcask_search_fields_result_free(
+    bitcask_search_fields_result_t* result) {
+    if (!result) return;
+    free_hit_fields_range(result->hits, result->count);
+    std::free(result->hits);
+    std::free(result);
+}
+
 BITCASK_API bitcask_error_t bitcask_search_near_filtered(
     bitcask_t* cask, const char* query, uint32_t slop, size_t k,
     const bitcask_meta_filter_t* filter,

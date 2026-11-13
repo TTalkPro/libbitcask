@@ -790,6 +790,13 @@ public:
     search_fields(std::string_view query, std::size_t k = 10,
                   const meta::MetaFilter* filter = nullptr);
 
+    // 反馈 2026-11-13 #4：search_fields 的归属版——命中附「命中的字段名列表」
+    //（去重、首次命中序；默认字段记空串）。排序与语义同 search_fields。
+    // 线程安全: **是**（并发读安全，同 search_fields）。
+    [[nodiscard]] std::expected<std::vector<search::SearchFieldHit>, CaskFault>
+    search_fields_attributed(std::string_view query, std::size_t k = 10,
+                             const meta::MetaFilter* filter = nullptr);
+
     // BM25 近邻搜索（S8.7）：term 按序出现且相邻间隙 ≤ slop。slop=0 即短语。
     // 线程安全: **是**（并发读安全，同 search_text）。
     [[nodiscard]] std::expected<TextSearchResult, CaskFault>

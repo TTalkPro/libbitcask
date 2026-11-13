@@ -310,6 +310,91 @@ inline bitcask_error_t finish_single_ex(
     return BITCASK_OK;
 }
 
+// 反馈 2026-11-13 #4：字段归属结果物化。形状同 to_search_result，多一层
+// 字段名数组——每个 hit 的 key 与每个字段名都是独立 strdup，OOM 回滚逐层放。
+inline void free_hit_fields_range(bitcask_search_hit_fields_t* hits,
+                                  std::size_t n) noexcept {
+    for (std::size_t i = 0; i < n; ++i) {
+        std::free(hits[i].key);
+        for (std::size_t j = 0; j < hits[i].fields_count; ++j) {
+            std::free(hits[i].fields[j]);
+        }
+        std::free(hits[i].fields);
+    }
+}
+
+inline bool to_search_result_fields(
+    std::vector<bitcask::search::SearchFieldHit>&& src,
+    bitcask_search_fields_result_t** out) {
+    auto* r = static_cast<bitcask_search_fields_result_t*>(
+        std::malloc(sizeof(bitcask_search_fields_result_t)));
+    if (!r) return false;
+    r->count = src.size();
+    r->hits = static_cast<bitcask_search_hit_fields_t*>(
+        std::malloc(sizeof(bitcask_search_hit_fields_t) * (r->count ? r->count : 1)));
+    if (!r->hits) {
+        std::free(r);
+        return false;
+    }
+    for (std::size_t i = 0; i < r->count; ++i) {
+        auto& dst = r->hits[i];
+        auto& hit = src[i];
+        // 先清零：任何一步失败时 free_hit_fields_range 只会看到已初始化的字段。
+        dst.key = nullptr;
+        dst.ord = hit.ord;
+        dst.score = hit.score;
+        dst.fields = nullptr;
+        dst.fields_count = 0;
+
+        dst.key = strdup(hit.key.c_str());
+        if (!dst.key) {
+            free_hit_fields_range(r->hits, i);
+            std::free(r->hits);
+            std::free(r);
+            return false;
+        }
+        const std::size_t nf = hit.fields.size();
+        if (nf > 0) {
+            dst.fields = static_cast<char**>(
+                std::malloc(sizeof(char*) * nf));
+            if (!dst.fields) {
+                free_hit_fields_range(r->hits, i + 1);  // 含本条已 strdup 的 key
+                std::free(r->hits);
+                std::free(r);
+                return false;
+            }
+            for (std::size_t j = 0; j < nf; ++j) {
+                dst.fields[j] = strdup(hit.fields[j].c_str());
+                if (!dst.fields[j]) {
+                    dst.fields_count = j;  // 只回滚已成功的 j 个
+                    free_hit_fields_range(r->hits, i + 1);
+                    std::free(r->hits);
+                    std::free(r);
+                    return false;
+                }
+            }
+            dst.fields_count = nf;
+        }
+    }
+    *out = r;
+    return true;
+}
+
+inline bitcask_error_t finish_single_fields(
+    std::expected<std::vector<bitcask::search::SearchFieldHit>,
+                  bitcask::CaskFault>&& result,
+    bitcask_search_fields_result_t** out, bitcask_fault_t* fault) {
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    if (!to_search_result_fields(std::move(*result), out)) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
+    return BITCASK_OK;
+}
+
 // 把 C++ 批量搜索的 n 个 expected 物化为 malloc 的 n 元结果数组（S12-5）。三种批量
 // （text/vector/hybrid）返回类型相同，故共用。out_results[i]：成功=result 指针，
 // 失败=NULL；fault 回填首个失败查询详情。calloc 失败返回 BITCASK_ERR_IO。

@@ -29,6 +29,16 @@ struct SearchHit {
     double        score; // BM25 / 距离 / RRF 分数（按查询类型）
 };
 
+// 字段归属命中（反馈 2026-11-13 #4）：SearchHit + 本文档命中了哪些字段。
+// fields 去重、按字段首次命中序；默认字段（text / catch-all）记空串
+// （内部哨兵 kDefaultField 翻译回 ""，对外不暴露）。
+struct SearchFieldHit {
+    std::string              key;    // 同 SearchHit.key
+    Lsn                      ord;    // 同 SearchHit.ord
+    double                   score;  // 跨字段累加后的 BM25 分（同 search_fields）
+    std::vector<std::string> fields; // 命中字段名（空串 = 默认字段）
+};
+
 // S9-P2-d：搜索层错误类型。强类型枚举只表达「哪类错误」，由 Cask 边界
 // （cask.cpp `search_fault`）翻译成 CaskFault（kind + 可读 detail）。
 // 当前三种都映射到 CaskError::kInvalidOption。

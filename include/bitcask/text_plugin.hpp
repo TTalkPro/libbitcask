@@ -253,6 +253,13 @@ public:
     search_fields(std::string_view query, std::size_t k,
                   const bm25::Bm25Params* params_override = nullptr,
                   const meta::MetaFilter* filter = nullptr) const;
+    // 反馈 2026-11-13 #4：同 search_fields，命中附「命中的字段名列表」
+    //（去重、首次命中序；默认字段记空串）。排序与语义同 search_fields。
+    [[nodiscard]] std::expected<std::vector<search::SearchFieldHit>,
+                                search::SearchError>
+    search_fields_attributed(std::string_view query, std::size_t k,
+                             const bm25::Bm25Params* params_override = nullptr,
+                             const meta::MetaFilter* filter = nullptr) const;
     [[nodiscard]] std::expected<std::vector<search::SearchHit>,
                                 search::SearchError>
     search_wildcard(std::string_view pattern, std::size_t k,

@@ -208,6 +208,19 @@ Cask::search_fields(std::string_view query, std::size_t k,
         [&] { return text_->search_fields(query, k, nullptr, filter); });
 }
 
+// search_fields_attributed：归属版（反馈 2026-11-13 #4）。骨架同 run_search_one，
+// 命中类型是 SearchFieldHit、无法复用泛型骨架。
+std::expected<std::vector<search::SearchFieldHit>, CaskFault>
+Cask::search_fields_attributed(std::string_view query, std::size_t k,
+                               const meta::MetaFilter* filter) {
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
+    if (auto g = prepare_search(); !g) return std::unexpected(g.error());
+    auto hits = text_->search_fields_attributed(query, k, nullptr, filter);
+    if (!hits) return std::unexpected(search_fault(hits.error()));
+    return std::expected<std::vector<search::SearchFieldHit>, CaskFault>(
+        std::in_place, std::move(*hits));
+}
+
 // search_near：BM25 近邻搜索（S8.7）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_near(std::string_view query, std::uint32_t slop, std::size_t k,

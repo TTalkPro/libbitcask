@@ -1014,6 +1014,18 @@ std::expected<std::vector<SearchHit>, SearchError>
 TextPlugin::search_fields(std::string_view query, std::size_t k,
                            const bm25::Bm25Params* params_override,
                            const meta::MetaFilter* filter) const {
+    auto attributed = search_fields_attributed(query, k, params_override, filter);
+    if (!attributed) return std::unexpected(attributed.error());
+    std::vector<SearchHit> hits;
+    hits.reserve(attributed->size());
+    for (auto& h : *attributed) hits.push_back(SearchHit{std::move(h.key), h.ord, h.score});
+    return hits;
+}
+
+std::expected<std::vector<search::SearchFieldHit>, SearchError>
+TextPlugin::search_fields_attributed(std::string_view query, std::size_t k,
+                                     const bm25::Bm25Params* params_override,
+                                     const meta::MetaFilter* filter) const {
     auto qnode = bitcask::bm25::parse_query(query);
 
     std::vector<const bm25::QueryNode*> leaves;
@@ -1022,7 +1034,7 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
         for (auto& c : n.children) walk(c);
     };
     walk(qnode);
-    if (leaves.empty()) return std::vector<SearchHit>{};
+    if (leaves.empty()) return std::vector<search::SearchFieldHit>{};
 
     std::unordered_map<std::string, std::vector<std::pair<std::string,float>>> by_field;
     for (auto* leaf : leaves) {
@@ -1033,11 +1045,19 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
         }
     }
 
-    auto fetch = [&](std::size_t k_req) -> FetchOut {
+    // 归属版 fetch：FetchOut 是 SearchHit 形状，这里单独写一轮取数 +
+    // 补取循环（同 refetch_until_k 的判据；候选计数语义一致）。
+    struct Acc {
+        double score = 0.0;
+        std::size_t seg = 0;
+        std::uint64_t docid = 0;
+        std::vector<std::string> fields;  // 首次命中序，去重
+    };
+    auto fetch = [&](std::size_t k_req)
+        -> std::pair<std::size_t, std::vector<search::SearchFieldHit>> {
         // S27-3 Slice B2a：逐段逐字段 + boost 累加（同 fields_ 逻辑，换段集源）。
         // 按 LSN 累加（一个文档只在一个段）；记其 (段次序, 段内 docid) 作全序的
         // 平局键——与 sort_truncate 同序（反馈第 5 条）。
-        struct Acc { double score = 0.0; std::size_t seg = 0; std::uint64_t docid = 0; };
         std::unordered_map<std::uint64_t, Acc> acc;
         auto seg_views = collect_multi_field_segment_views();
         for (std::size_t si = 0; si < seg_views.size(); ++si) {
@@ -1060,6 +1080,13 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
                         a.score += static_cast<double>(r.score) * boost;
                         a.seg = si;
                         a.docid = r.ord;
+                        // 反馈 2026-11-13 #4：记录命中的字段（去重、首次命中序）。
+                        std::string fname(fv.field_name);
+                        if (fname == kDefaultField) fname.clear();  // 默认字段对外记空串
+                        if (std::find(a.fields.begin(), a.fields.end(), fname) ==
+                            a.fields.end()) {
+                            a.fields.push_back(std::move(fname));
+                        }
                     }
                 }
             }
@@ -1082,7 +1109,7 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
                           });
         if (ranked.size() > k_req) ranked.resize(k_req);
 
-        std::vector<SearchHit> hits;
+        std::vector<search::SearchFieldHit> hits;
         hits.reserve(std::min(k, ranked.size()));
         for (auto& [ord, a] : ranked) {
             const double score = a.score;
@@ -1091,11 +1118,23 @@ TextPlugin::search_fields(std::string_view query, std::size_t k,
             if (filter && !docs_.eval_meta(ord, *filter)) continue;
             auto ext_id = docs_.ord_to_ext(ord);
             if (!ext_id) continue;
-            hits.push_back(SearchHit{std::move(*ext_id), ord, score});
+            hits.push_back(search::SearchFieldHit{std::move(*ext_id), ord, score,
+                                          std::move(a.fields)});
         }
         return {ranked.size(), std::move(hits)};
     };
-    return refetch_until_k(k, initial_k_req(k, filter), fetch);
+
+    // 同 refetch_until_k：物化丢候选（filter / 判活 / ord_to_ext）致命中 < k
+    // 时翻倍重取，直到凑满 k 或候选穷尽（候选数 < k_req）。
+    std::size_t k_req = initial_k_req(k, filter);
+    for (;;) {
+        auto [n_cand, hits] = fetch(k_req);
+        if (hits.size() >= k || n_cand < k_req ||
+            k_req > std::numeric_limits<std::size_t>::max() / 2) {
+            return hits;
+        }
+        k_req *= 2;
+    }
 }
 
 std::expected<std::vector<SearchHitEx>, SearchError>

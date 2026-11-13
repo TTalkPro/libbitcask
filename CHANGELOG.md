@@ -16,6 +16,20 @@ hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/
 
 ## [Unreleased]
 
+### Added
+
+- **字段命中归属（反馈 2026-11-13 #4）**：`search_fields` 的命中此前统一
+  `{key, ord, score}`，回包不说命中的是哪个字段——下游「哪张卡的第几节」只能靠
+  派生的节级存储自己回答。补齐：C++ 侧 `SearchFieldHit{key, ord, score, fields}`
+  + `TextPlugin::search_fields_attributed` / `Cask::search_fields_attributed`
+  （复用 `search_fields` 的逐段逐字段 boost 累加与补取判据；`search_fields` 改为
+  委托后剥离，排序语义不变）；`fields` 去重、按字段首次命中序，默认字段
+  （text / catch-all，内部哨兵 `kDefaultField`）对外记空串。C API 纯加法：
+  `bitcask_search_hit_fields_t` / `bitcask_search_fields_result_t` +
+  `bitcask_search_fields_ex` / `bitcask_search_fields_ex_filtered` /
+  `bitcask_search_fields_result_free`——既有 `bitcask_search_fields*` 布局与语义
+  零改动，SOVERSION 不变。逐字段 snippet 未做（命中归属已可回答「第几节」）。
+
 ---
 
 ## [6.7.1] - 2026-10-12（Windows：merge 后 `bitcask_close` 正确删除退休文件，盘上体积不再滞留）

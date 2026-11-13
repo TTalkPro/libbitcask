@@ -178,6 +178,40 @@ BITCASK_API bitcask_error_t bitcask_search_wildcard_filtered(
     bitcask_search_result_t** out, bitcask_fault_t* fault);
 
 /* ===========================================================================
+ *  字段命中归属检索（反馈 2026-11-13 #4）——bitcask_search_fields 的归属版
+ *
+ *  语义同 bitcask_search_fields（含 _filtered），每条命中额外附「本文档命中
+ *  了哪些字段」：去重、按字段首次命中序；默认字段（text / catch-all）记
+ *  空串。既有 bitcask_search_fields* 的布局与语义零改动——additive 新结构 +
+ *  新函数，SOVERSION 不变。
+ * ========================================================================= */
+
+typedef struct {
+    char*    key;           /* NUL 结尾，malloc 分配，由 bitcask_search_fields_result_free 释放 */
+    uint64_t ord;
+    double   score;         /* 跨字段累加后的 BM25 分（同 bitcask_search_fields） */
+    char**   fields;        /* 命中字段名数组（每个 NUL 结尾，独立 malloc；空串 = 默认字段） */
+    size_t   fields_count;
+} bitcask_search_hit_fields_t;
+
+typedef struct {
+    bitcask_search_hit_fields_t* hits;
+    size_t                       count;
+} bitcask_search_fields_result_t;
+
+BITCASK_API bitcask_error_t bitcask_search_fields_ex(
+    bitcask_t* cask, const char* query, size_t k,
+    bitcask_search_fields_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_search_fields_ex_filtered(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_fields_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API void bitcask_search_fields_result_free(
+    bitcask_search_fields_result_t* result);
+
+/* ===========================================================================
  *  高亮检索（S39）——补上 C++ Cask::search_text_highlight（S13-D3）的 C 表示
  * ========================================================================= */
 
