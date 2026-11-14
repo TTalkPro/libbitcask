@@ -562,6 +562,11 @@ if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/unordered_dense/include/ankerl/
         "  git submodule update --init third_party/unordered_dense")
 endif()
 add_subdirectory(third_party/unordered_dense EXCLUDE_FROM_ALL)
+# S42：index.hpp 是公开头，其私有成员直接使用 ankerl 容器（live_/meta_/
+# delta_live_）。仅 include index.hpp 而不链 bitcask_docmap 的目标
+# （bitcask_bm25、segment_v2 测试等）也需要头路径——目录级 include 全局可见；
+# 链接语义仍由上面的 INTERFACE 目标（bitcask_docmap PUBLIC）承担。
+include_directories("${PROJECT_SOURCE_DIR}/third_party/unordered_dense/include")
 
 add_library(bitcask_keydir STATIC
     src/keydir/keydir.cpp
@@ -583,13 +588,13 @@ target_link_libraries(bitcask_keydir
 # ---------------------------------------------------------------------------
 add_library(bitcask_docmap STATIC
     src/keydir/index.cpp
-    src/keydir/index_kernels_avx2.cpp   # S37-3.b：分 ISA TU
     src/keydir/docmap_ckpt.cpp   # S18-2：docmap 组件 ckpt（宿主侧持久化）
 )
-bitcask_simd_tu(src/keydir/index_kernels_avx2.cpp avx2)
 target_include_directories(bitcask_docmap PUBLIC include)
 target_link_libraries(bitcask_docmap
-    PUBLIC  bitcask_text bitcask_format   # format：sidecar/组件容器 CRC（S18-2）
+    # S42：index.hpp 暴露 ankerl 成员（live_ / meta_ / delta_live_）→ PUBLIC。
+    PUBLIC  bitcask_text bitcask_format unordered_dense::unordered_dense
+            # format：sidecar/组件容器 CRC（S18-2）
     PRIVATE bitcask_warnings bitcask_sanitizers
 )
 add_library(bitcask_index ALIAS bitcask_docmap)  # 兼容别名（P5 撤）

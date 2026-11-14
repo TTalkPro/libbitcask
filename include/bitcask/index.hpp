@@ -1,16 +1,19 @@
 // 向量库的内存索引侧表（Index）。
 //
-// Index 是 legacy KeyDir 的演化版（doc/vector-db-design-zh.md §3.1）：主映射
-// 从「key → location」改为「ext_id → 最新 ord」+ 一组「ord 下标的数组」
-// （slots / ord2ext / live）。ord 是引擎单调分配的 per-write 序号，永不复用，
-// 所以 ord→X 用数组而非 hashmap（O(1) 下标、省内存）。
+// Index 是 legacy KeyDir 的演化版（doc/vector-db-design-zh.md §3.1）。S42 起
+// 改为 live-only 存储（docs/design/s42-docmap-live-store-design-zh.md）：
+//   ext2ord_ : ext_id → 最新 ord（node-based，key 地址稳定，S40）
+//   live_    : ord → LiveRow（仅当前存活行；ord 是 map key，不再做数组下标）
+//   meta_    : ord → meta blob（仅 live；空 blob 即删除条目）
+//   delta_live_ : 当前 checkpoint 窗口内仍 live 的 ord journal
+// ord/LSN 仍全局单调、永不复用；覆盖写/删除在写路径同步淘汰旧行，
+// 稳态内存 O(live docs) 而非 O(historical ords)。
 //
 // V1 范围：只承载身份映射 + 文档定位 + 软删，不含 BM25 倒排 / HNSW / fold MVCC。
 //
 // === 线程模型 ===
 // 所有 public 方法线程安全：读取 shared_lock、写入 unique_lock。caller 不应
-// 在外部预先持锁。组合操作（如 get 后 put）非原子。*_locked 后缀的
-// 私有方法要求 caller 已持 unique_lock。
+// 在外部预先持锁。组合操作（如 get 后 put）非原子。
 
 #pragma once
 
@@ -21,11 +24,12 @@
 #include "bitcask/meta_filter.hpp"  // S13-P8：eval_meta 锁内求值
 #include "bitcask/string_hash.hpp"
 
-#include <array>
+#include <ankerl/unordered_dense.h>  // S42：live_/meta_/delta_live_ 稠密 map
+
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -50,11 +54,9 @@ struct DocLoc {
     std::uint32_t total_sz = 0;
 };
 
-// 按 ord 存的每文档元信息（slots[ord]）。
-// S21-1：不含 ord——slots_ 本身按 ord 下标寻址，存 ord 是每槽 8B 死重
-// （原注释自证「仅 get() 返回时填充」）。get() 返回带 ord 的 DocHit。
-// S21-1 曾借 DocLoc 重排收到 24B；tstamp 随 64 位时间戳 flag-day 扩为
-// u64 后回到 32B（尾部 4B padding），每 chunk 槽数组 1.5MB→2MB。
+// 每文档元信息（S42 起挂在 LiveRow.slot，不再按 ord 下标展开）。
+// S21-1：不含 ord——ord 是 live_ 的 map key，存槽里是每行 8B 死重。
+// tstamp 随 64 位时间戳 flag-day 为 u64；sizeof 32B（含尾部 padding）。
 struct DocSlot {
     DocLoc        loc;
     std::uint64_t tstamp  = 0;
@@ -67,27 +69,27 @@ struct DocHit : DocSlot {
     std::uint64_t ord = 0;
 };
 
+// S42：live-only 行。ext 指向 ext2ord_ 节点键（node-based，地址稳定，S40）；
+// slot 为文档定位与长度。ord 是 live_ 的 map key，不重复存储。
+struct LiveRow {
+    std::string_view ext;
+    DocSlot slot;
+};
+
+// S42：升序遍历/checkpoint 快照的行引用。ext/slot 指向 Index 内部（live_ 值
+// 与 ext2ord_ 节点键），仅在遍历回调的 shared lock 作用域内有效。
+struct DocRowRef {
+    std::uint64_t ord;
+    std::string_view ext;
+    const DocSlot* slot;
+};
+
 struct IndexInfo {
     std::uint64_t live_docs  = 0;   // 当前存活文档数（= ext2ord_.size()）
     std::uint64_t total_ords = 0;   // 历史分配 ord 数（含已死）
     std::uint64_t next_ord   = 0;
-    std::uint64_t chunks_allocated = 0;   // 分配过的 chunk 总数
-    std::uint64_t chunks_freed     = 0;   // 被 compact_chunks 释放的 chunk 数
-};
-
-// ---- 分块数组（Tiered Arrays, 方案 B）----
-// slots_ 和 ord2ext_ 按 chunk 分块，live_count == 0 的 chunk 可在 merge 后释放。
-// live_ 和 doc_lens_ 保持平坦（SIMD fill_is_live / fill_doc_lens 需要）。
-// 设计详见 doc/ord-recycling-design-zh.md §5。
-static constexpr std::size_t kChunkOrds = 65536;   // 每 chunk 64K 个 ord
-
-struct Chunk {
-    std::array<DocSlot,     kChunkOrds> slots;      // 24B × 64K = 1.5 MB
-    // S40 D2:view 指向 Index::ext2ord_ 的节点键(node-based,地址稳定)。
-    // 不变量 O:ord2ext[i] 非空 ⟺ 该 ord live;覆盖写/删除时先置空旧槽
-    // 再动节点(docs/design/s40-key-single-instance.md §6)。
-    std::array<std::string_view, kChunkOrds> ord2ext;  // 16B × 64K = 1 MB
-    std::uint32_t live_count = 0;                    // chunk 内存活 ord 数；== 0 可释放
+    std::uint64_t chunks_allocated = 0;   // S42 起冻结为 0（诊断兼容，保留字段）
+    std::uint64_t chunks_freed     = 0;   // S42 起冻结为 0（诊断兼容，保留字段）
 };
 
 class Index : public bm25::DocTable,
@@ -104,37 +106,33 @@ public:
 
     // ---- 写 ----
     // 登记一条文档（append 落盘后调用）。若 ext_id 已存在 → update：旧 ord
-    // 在 live 中清 0（软删），ext2ord 改指新 ord。内部把 next_ord 推到
-    // max(next_ord, ord+1)，故恢复时按 ord 序回放亦走此方法。
-    // S27-1：`docid` 既是数组下标又推进 LSN 水位（当前 docid==lsn）；分段化后
-    // 数组下标语义归 DocId、水位推进另由 LSN 承担。线程安全：unique_lock。
+    // 的 live row/meta/journal 写路径同步淘汰（S42，不再等 compaction），
+    // ext2ord 改指新 ord。内部把 next_ord 推到 max(next_ord, ord+1)，
+    // 故恢复时按 ord 序回放亦走此方法。线程安全：unique_lock。
     void put_doc(std::string_view ext_id, DocId docid, const DocSlot& slot);
 
-    // 删除：软删 ext_id 当前文档（清 live）、erase ext2ord。tomb_ord 是墓碑
-    // record 自身的 ord（仅用于推进 next_ord）→ 纯 LSN 角色。返回原本是否存在。
-    // 线程安全：unique_lock。
+    // 删除：软删 ext_id 当前文档（淘汰 live row）、erase ext2ord。tomb_ord 是
+    // 墓碑 record 自身的 ord（仅用于推进 next_ord）→ 纯 LSN 角色。返回原本
+    // 是否存在。线程安全：unique_lock。
     bool remove(std::string_view ext_id, Lsn tomb_ord);
 
     // S16-2：单独回填 doc_len（BM25 token 数）。写路径反转后 DocSlot 由
     // 宿主先落（doc_len=0，宿主不做分析拿不到 token 数），分析产物由
-    // BM25 侧（reducer 单写者）经本方法补写。同时更新 slots_ AoS 与
-    // doc_lens_ SoA（序列化读前者，SIMD gather 读后者）。ord 未登记则
-    // no-op（防御：空 job 守卫路径）。线程安全：unique_lock。
-    // S18-1：override bm25::DocLenWriter——P4 起 TextPlugin 经窄接口回填。
-    // S27-1：按 DocId(数组下标) 定位。
+    // BM25 侧（reducer 单写者）经本方法补写。ord 未登记则 no-op（防御）。
+    // S18-1：override bm25::DocLenWriter。线程安全：unique_lock。
     void set_doc_len(DocId docid, std::uint32_t len) override;
 
     // V5:存储 ord 的 meta blob(结构化 KV 二进制,可为空)。与 put_doc
-    // 在同一 unique_lock 下调用——保证 meta 与定位/live 同写入原子点,
-    // 后续读路径不必额外同步。blob 由 Index 内部拷贝(caller 可立即
-    // 释放源缓冲)。线程安全:unique_lock。
+    // 在同一 unique_lock 下调用——保证 meta 与定位/live 同写入原子点。
+    // S42：meta 只挂 live 行——ord 未登记（或已死）时 no-op。blob 由
+    // Index 内部拷贝(caller 可立即释放源缓冲)。线程安全:unique_lock。
     void set_meta(DocId docid, std::span<const std::byte> blob);
 
     // ---- S18-2：docmap 持久化记账（自记账原则：写它的人负责记账）----
     //
-    // 脏位：put_doc/remove/set_doc_len/set_meta/compact_chunks 内部置位；
-    // docmap 保存方（宿主 Cask / legacy SearchLayer 路径）保存或载入成功后
-    // clear_dirty()。初值 true（未知状态一律重序列化）。
+    // 脏位：put_doc/remove/set_doc_len/set_meta 内部置位；docmap 保存方
+    // （宿主 Cask / legacy SearchLayer 路径）保存或载入成功后 clear_dirty()。
+    // 初值 true（未知状态一律重序列化）。
     [[nodiscard]] bool dirty() const noexcept {
         return dirty_.load(std::memory_order_relaxed);
     }
@@ -153,52 +151,74 @@ public:
     removals_snapshot() const;
     void clear_removals();
 
+    // S42-3：checkpoint 载入期抑制 delta journal（RAII；析构恢复）。
+    // 载入重放的行会在收尾 begin_delta_window 时整体清空，逐行入账只是
+    // 白付开库峰值内存——base 重放期间置位本 guard 直接跳过 journal 维护。
+    class ReplayJournalGuard {
+    public:
+        explicit ReplayJournalGuard(Index& idx) : idx_(idx) {
+            idx_.journal_suppressed_ = true;
+        }
+        ~ReplayJournalGuard() { idx_.journal_suppressed_ = false; }
+        ReplayJournalGuard(const ReplayJournalGuard&) = delete;
+        ReplayJournalGuard& operator=(const ReplayJournalGuard&) = delete;
+
+    private:
+        Index& idx_;
+    };
+
+    // S42：当前 delta 窗口 journal 的有序快照（诊断/测试用）。
+    // 不变量：快照 ⊆ live（覆盖写/删除同步淘汰旧 ord）。
+    [[nodiscard]] std::vector<std::uint64_t> delta_live_snapshot() const {
+        std::shared_lock lk(mutex_);
+        std::vector<std::uint64_t> ords;
+        ords.reserve(delta_live_.size());
+        for (auto ord : delta_live_) ords.push_back(ord);
+        std::sort(ords.begin(), ords.end());
+        return ords;
+    }
+
     // ---- 读 ----
     // 取 ext_id 当前存活文档的定位（含现填的 ord）；不存在/已删返回 nullopt。
     // 线程安全：shared_lock。
     [[nodiscard]] std::optional<DocHit> get(std::string_view ext_id) const;
 
-    // ord → ext_id（检索结果翻译用；V1 主要给调试/恢复）。越界 / 已死返回
-    // nullopt（S40：补 live 门禁，兑现 DocTable 契约——此前死 ord 返回残留拷贝）。
-    // S16-3：override DocTable::ord_to_ext。S27-1：按 DocId 定位。
+    // ord → ext_id（检索结果翻译用）。已死返回 nullopt（S40 契约）。
+    // S16-3：override DocTable::ord_to_ext。
     [[nodiscard]] std::optional<std::string> ord_to_ext(DocId docid) const override;
 
-    // 某 ord 是否存活。越界返回 false。线程安全：shared_lock。
-    // 同时实现 LiveChecker::is_live。S27-1：按 DocId 定位。
+    // 某 ord 是否存活。同时实现 LiveChecker::is_live。线程安全：shared_lock。
     [[nodiscard]] bool is_live(DocId docid) const override;
 
-    // LiveChecker::doc_len — 返回 ord 对应文档的 token 数，越界返回 0。
+    // LiveChecker::doc_len — 返回 ord 对应文档的 token 数，未登记/已死返回 0。
     [[nodiscard]] std::uint32_t doc_len(DocId docid) const override;
 
     // S16-3：DocTable::ord_of — ext_id → ord（explain 等 key→ord 反查）。
-    // get() 的窄投影，避免查询面暴露完整 DocSlot。S27-1：返回当前版本 DocId。
     [[nodiscard]] std::optional<DocId>
     ord_of(std::string_view ext_id) const override;
 
-    // V5:取 ord 的原始 meta blob(结构化 KV 二进制)。越界或空 → 空 vector,
-    // 让上层 filter 直接判 false 跳过(无 meta = 不通过过滤)。
-    // 线程安全:shared_lock。返回**拷贝**而非 span——读路径无锁并发,而
-    // set_meta(worker 线程)会重分配底层 vector;若返回内部 span 会在锁外
-    // 被并发 set_meta 释放(use-after-free)。锁内拷贝杜绝逃逸。
+    // V5:取 ord 的原始 meta blob(结构化 KV 二进制)。未登记/已死/空 → 空
+    // vector, 让上层 filter 直接判 false 跳过。线程安全:shared_lock。返回
+    // **拷贝**而非 span——读路径无锁并发,set_meta(worker 线程)会重分配
+    // 底层 vector;锁内拷贝杜绝逃逸。
     [[nodiscard]] std::vector<std::byte> meta_blob(DocId docid) const;
 
-    // S13-P8：meta filter 锁内求值——省去 meta_blob 的锁内堆拷贝（过滤查询
-    // 每候选一次，overfetch K'=4k 时最多 4k 次拷贝/查询）。evaluate 是纯读
-    // 无 IO（meta_filter.hpp），shared_lock 内直接跑安全。
-    // 语义与「meta_blob 后 evaluate」一致：无 meta（空 blob）恒 false。
+    // S13-P8：meta filter 锁内求值——省去 meta_blob 的锁内堆拷贝。
+    // 语义：死 ord / 无 meta（空 blob）恒 false。
     [[nodiscard]] bool eval_meta(DocId docid,
                                  const meta::MetaFilter& filter) const override;
 
-    // P2.1 批量版本：一次 shared_lock 完成整个数组（逐 posting 版本每条
-    // posting 一次锁 + 一次虚调用，热词查询 = 数十万次锁操作且阻断评分
-    // 循环的自动向量化）。
+    // P2.1 批量版本：一次 shared_lock 完成整个数组。S42：平坦数组退役后
+    // 退化为逐 candidate hash lookup（放弃全局 SIMD gather；BM25 主查询
+    // 已分段化，段内用 segment-local live checker，不走本接口）。
     void fill_is_live(std::span<const std::uint64_t> ords,
                       std::span<char> out) const override;
     void fill_doc_lens(std::span<const std::uint64_t> ords,
                        std::span<std::uint32_t> out) const override;
 
-    // 释放所有 live_count == 0 的 chunk（merge 后调用）。
-    // 返回释放的 chunk 数。线程安全：unique_lock。
+    // S42 起为兼容 no-op：live-only 结构在写路径同步淘汰死行，
+    // 不存在可释放的 chunk。保留 API 减少调用方（Cask merge / 测试 shim）
+    // 改动面。返回恒 0。线程安全：unique_lock。
     std::uint64_t compact_chunks();
 
     // ---- 内省 ----
@@ -212,9 +232,8 @@ public:
     }
 
     // S12-2：自上次 reset 以来退休（软删/覆盖/删除）的文档版本数——put_doc 覆盖旧版本
-    // 与 remove 各计 1。用于后台自动 compaction 的节流触发。仅 reducer 线程读写
-    // （put_doc/remove 在写路径、maybe_auto_compact 在同线程末尾），故非并发热点。
-    // 线程安全：shared_lock 读 / unique_lock 重置（与 put_doc/remove 的 unique_lock 一致）。
+    // 与 remove 各计 1。用于后台自动 compaction 的节流触发。
+    // 线程安全：shared_lock 读 / unique_lock 重置。
     [[nodiscard]] std::uint64_t retired_since_compact() const override {
         std::shared_lock lk(mutex_);
         return retired_since_compact_;
@@ -226,102 +245,109 @@ public:
 
     // 遍历所有 live 文档，对每个调用 fn(ord, ext_id, slot)。
     // 线程安全：持 shared_lock。S40：ext_id 以 std::string_view 传入（零拷贝，
-    // 仅在回调内有效——指向 ext2ord_ 节点键，出锁即可能被删除）。
+    // 仅在回调内有效）。S42：hash 迭代无序——checkpoint/测试兼容要求按
+    // ord 升序回调，锁内收集 RowRef 排序后再回调。
     template <typename Fn>
     void for_each_live(Fn&& fn) const {
         std::shared_lock lk(mutex_);
-        for (std::uint64_t ord = 0; ord < live_.size(); ++ord) {
-            if (live_[ord]) {
-                const auto ci = ord / kChunkOrds;
-                const auto si = ord % kChunkOrds;
-                fn(ord, chunks_[ci]->ord2ext[si], chunks_[ci]->slots[si]);
-            }
+        std::vector<DocRowRef> refs;
+        refs.reserve(live_.size());
+        for (const auto& [ord, row] : live_) {
+            refs.push_back(DocRowRef{ord, row.ext, &row.slot});
         }
+        std::sort(refs.begin(), refs.end(),
+                  [](const DocRowRef& a, const DocRowRef& b) {
+                      return a.ord < b.ord;
+                  });
+        for (const auto& r : refs) fn(r.ord, r.ext, *r.slot);
     }
 
     // S14-4：范围版——只遍历 ord ∈ [from, to) 的 live 文档（docmap delta
-    // 行提取用）。语义/锁与 for_each_live 一致。
+    // 行提取用）。语义/锁/升序保证与 for_each_live 一致。
     template <typename Fn>
     void for_each_live_in(std::uint64_t from, std::uint64_t to, Fn&& fn) const {
         std::shared_lock lk(mutex_);
-        const std::uint64_t hi =
-            std::min<std::uint64_t>(to, live_.size());
-        for (std::uint64_t ord = from; ord < hi; ++ord) {
-            if (live_[ord]) {
-                const auto ci = ord / kChunkOrds;
-                const auto si = ord % kChunkOrds;
-                fn(ord, chunks_[ci]->ord2ext[si], chunks_[ci]->slots[si]);
+        std::vector<DocRowRef> refs;
+        for (const auto& [ord, row] : live_) {
+            if (ord >= from && ord < to) {
+                refs.push_back(DocRowRef{ord, row.ext, &row.slot});
             }
         }
+        std::sort(refs.begin(), refs.end(),
+                  [](const DocRowRef& a, const DocRowRef& b) {
+                      return a.ord < b.ord;
+                  });
+        for (const auto& r : refs) fn(r.ord, r.ext, *r.slot);
     }
 
     // V5 meta 持久化：遍历 ord ∈ [from, to) 且 live 且 meta 非空的文档，
-    // 对每个调用 fn(ord, blob)。docmap ckpt（base 全量 / delta 窗口）用——
-    // 此前 meta 只活在内存，ckpt 与 fold 都不带它，重开后 eval_meta 对所有
-    // 文档恒 false（带 filter 的检索一律空集）。语义/锁与 for_each_live_in
-    // 一致；meta 未启用（列为空）时零次回调。
+    // 对每个调用 fn(ord, blob)。docmap ckpt（base 全量 / delta 窗口）用。
+    // 语义/锁/升序保证与 for_each_live_in 一致。
     template <typename Fn>
     void for_each_meta_in(std::uint64_t from, std::uint64_t to, Fn&& fn) const {
+        struct MetaRef {
+            std::uint64_t ord;
+            const std::vector<std::byte>* blob;
+        };
         std::shared_lock lk(mutex_);
-        const std::uint64_t hi = std::min<std::uint64_t>(
-            {to, live_.size(), meta_blobs_.size()});
-        for (std::uint64_t ord = from; ord < hi; ++ord) {
-            if (live_[ord] && !meta_blobs_[ord].empty()) {
-                fn(ord, std::span<const std::byte>(meta_blobs_[ord]));
-            }
+        std::vector<MetaRef> refs;
+        for (const auto& [ord, blob] : meta_) {
+            if (blob.empty() || ord < from || ord >= to) continue;
+            if (!live_.contains(ord)) continue;  // 不变量防御
+            refs.push_back(MetaRef{ord, &blob});
+        }
+        std::sort(refs.begin(), refs.end(),
+                  [](const MetaRef& a, const MetaRef& b) {
+                      return a.ord < b.ord;
+                  });
+        for (const auto& r : refs) {
+            fn(r.ord, std::span<const std::byte>(*r.blob));
         }
     }
 
-    // ---- S18-2：docmap sidecar（"BCIS"）序列化（自 SearchLayer 平移）----
+    // ---- S18-2：docmap sidecar（"BCIS"）序列化 ----
     // 把 ord → (ext_id, DocSlot) 活映射落进 checkpoint，避免冷启动全量 fold
-    // 重建。covers_next_ord 记录快照覆盖的 ord 水位（与后续 WAL/data 的衔接
-    // 点）。布局：header(magic+version+covers+行数) + 每活文档一行（固定
-    // 34B + 变长 ext_id）+ CRC。仅遍历 live（死文档由 keydir LWW 过滤）。
-    // serialize 返回 false 仅当某 ext 超 64KiB；deserialize 校验失败返回
-    // nullopt，成功返回 covers。
+    // 重建。covers_next_ord 记录快照覆盖的 ord 水位。S42：内存形态换
+    // live-only map，磁盘格式逐字节不变（行按 ord 升序 gap+vbyte）。
     [[nodiscard]] bool serialize_docmap(std::vector<std::uint8_t>& out,
                                         std::uint64_t covers_next_ord) const;
     [[nodiscard]] std::optional<std::uint64_t>
     deserialize_docmap(std::span<const std::uint8_t> bytes);
-    // 6.6.0：同上，但直接从文件区间 [off, off+len) 流式载入（分块 CRC +
-    // 分块解析，不把整段读进堆）。开库路径用它——docmap 行段与文件同量级
-    // （feedback 2026-09-23：60 MB），整段缓冲是开库峰值的大头之一。
+    // 6.6.0：流式载入重载（分块 CRC + 分块解析，不把整段读进堆）。
     [[nodiscard]] std::optional<std::uint64_t>
     deserialize_docmap(io::FileHandle fd, std::uint64_t off,
                        std::uint64_t len);
 
 private:
-    // S40 D2:置空 ord 的 ord2ext 槽(chunk 未分配/已释放则 no-op)。持 unique_lock。
-    void clear_ord2ext_locked(std::uint64_t ord) noexcept;
-
     mutable std::shared_mutex mutex_;
 
+    // S40：node-based，key 地址稳定——LiveRow.ext 指向节点键，覆盖写只改
+    // value 不动节点，删除时必须先淘汰 live row 再 extract 节点（防悬垂）。
     std::unordered_map<std::string, std::uint64_t,
                        StringHash, std::equal_to<>> ext2ord_;  // ext_id → 最新 ord
 
-    std::vector<std::unique_ptr<Chunk>> chunks_;               // chunk N 覆盖 [N*64K, (N+1)*64K)
-
-    std::vector<std::uint8_t>  live_;       // 下标 = ord;0/1。平坦保持以兼容 SIMD gather。
-    std::vector<std::uint32_t> doc_lens_;   // P2.4 SoA 副本;平坦保持以兼容 SIMD gather。
-    // V5 per-ord meta。S21-1 惰性化：首个非空 set_meta 前恒 empty（不随 ord
-    // 增长），无 meta 部署零常驻（改前每 ord 白付 24B 空 vector 头）。启用后
-    // 与 live_ 同步跟平。读路径经 ord >= size() 门禁天然得到「空 blob」语义。
-    std::vector<std::vector<std::byte>> meta_blobs_;
+    // S42 live-only：ord → 行（仅当前存活）。ankerl 稠密 map：值连续存储，
+    // erase 交换回收，稳态容量随 live_docs 而非历史 ord 增长。
+    ankerl::unordered_dense::map<std::uint64_t, LiveRow> live_;
+    // V5 meta：仅 live ord 有条目；空 blob 语义 = 删除条目（map 中不存在）。
+    ankerl::unordered_dense::map<std::uint64_t, std::vector<std::byte>> meta_;
+    // S42-2：当前 delta 窗口内仍 live 的 ord journal。put 插入 / 覆盖写与
+    // 删除淘汰旧 ord / begin_delta_window 清空。delta checkpoint 消费。
+    ankerl::unordered_dense::set<std::uint64_t> delta_live_;
 
     std::uint64_t next_ord_       = 0;
     std::uint64_t live_docs_      = 0;
-    std::uint64_t retired_since_compact_ = 0;  // S12-2：自上次 compact 起退休的文档版本数
-    std::uint64_t chunks_alloc_   = 0;      // 历史分配 chunk 数（内省用）
-    std::uint64_t chunks_freed_   = 0;      // 被 compact_chunks 释放的 chunk 数
+    std::uint64_t retired_since_compact_ = 0;  // S12-2：自上次 compact 起退休的版本数
+    std::uint64_t chunks_alloc_   = 0;      // S42 起冻结为 0（IndexInfo 兼容）
+    std::uint64_t chunks_freed_   = 0;      // S42 起冻结为 0（IndexInfo 兼容）
 
     // S18-2：docmap 持久化记账（见 public 段注释）。removals_ 受 mutex_
-    // 保护（remove 已持 unique_lock）；dirty_ 为 relaxed 原子（与原
-    // SearchLayer::dirty_docmap_ 语义一致：写点已被 reducer/静止点串行化）。
+    // 保护；dirty_ 为 relaxed 原子（写点已被 reducer/静止点串行化）。
     std::atomic<bool> dirty_{true};
     std::uint64_t delta_window_wm_ = 0;
     std::vector<std::pair<std::string, std::uint64_t>> removals_;
-
-    void ensure_capacity_locked(std::uint64_t ord);
+    // S42-3：载入期抑制 journal 增长（ReplayJournalGuard 置位）。
+    bool journal_suppressed_ = false;
 };
 
 }  // namespace bitcask::index

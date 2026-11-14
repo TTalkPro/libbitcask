@@ -1,5 +1,8 @@
+// S42 live-only DocMap 实现。设计：docs/design/s42-docmap-live-store-design-zh.md。
+// 内存形态：ext2ord_ + live_ + meta_ + delta_live_（见 index.hpp 顶注）；
+// sidecar（"BCIS"）序列化格式逐字节不变（S18-2 平移）。
+
 #include "bitcask/index.hpp"
-#include "bitcask/detail/cpu_features.hpp"
 
 #include "bitcask/codec.hpp"  // S18-2：sidecar CRC
 #include "bitcask/vbyte.hpp"   // S21-2 A2：sidecar v2 行 gap+vbyte
@@ -8,45 +11,12 @@
 #include <algorithm>
 #include <cstring>
 
-#include "index_kernels.hpp"  // S37-3.b：AVX2 gather 内核（分 ISA TU）
-
 namespace bitcask::index {
 
-namespace {
-
-
-}
-
-// S21-1：布局契约——DocLoc 消 padding 后 16B；DocSlot 去 ord 后曾为 24B，
-// tstamp u32→u64 flag-day 后 32B（含尾部 4B padding）。
+// S21-1：布局契约——DocLoc 消 padding 后 16B；DocSlot 32B（tstamp u64）。
 // serialize_docmap/deserialize_docmap 逐字段读写，不受内存布局影响。
 static_assert(sizeof(DocLoc) == 16, "DocLoc 应为 16B（offset 前置消 padding）");
-static_assert(sizeof(DocSlot) == 32, "DocSlot 应为 32B（ord 不常驻 slots_；tstamp u64）");
-
-void Index::ensure_capacity_locked(std::uint64_t ord) {
-    const std::size_t want = static_cast<std::size_t>(ord) + 1;
-    if (live_.size() < want) {
-        live_.resize(want, false);
-        doc_lens_.resize(want, 0);
-        // S21-1：meta 惰性——未启用（首个非空 set_meta 前）不跟平。
-        if (!meta_blobs_.empty()) meta_blobs_.resize(want);
-    }
-    const std::size_t ci = static_cast<std::size_t>(ord) / kChunkOrds;
-    if (chunks_.size() <= ci) {
-        chunks_.resize(ci + 1);
-    }
-    if (!chunks_[ci]) {
-        chunks_[ci] = std::make_unique<Chunk>();
-        ++chunks_alloc_;
-    }
-}
-
-void Index::clear_ord2ext_locked(std::uint64_t ord) noexcept {
-    const auto ci = ord / kChunkOrds;
-    if (ci < chunks_.size() && chunks_[ci]) {
-        chunks_[ci]->ord2ext[ord % kChunkOrds] = std::string_view{};
-    }
-}
+static_assert(sizeof(DocSlot) == 32, "DocSlot 应为 32B（tstamp u64）");
 
 std::uint64_t Index::alloc_ord() {
     std::unique_lock lk(mutex_);
@@ -58,36 +28,33 @@ void Index::put_doc(std::string_view ext_id, std::uint64_t ord,
     std::unique_lock lk(mutex_);
 
     next_ord_ = std::max(next_ord_, ord + 1);
-    ensure_capacity_locked(ord);
 
-    const auto ci = ord / kChunkOrds;
-    const auto si = ord % kChunkOrds;
-    auto* chunk = chunks_[ci].get();
-
-    // S40 D2:ord2ext 槽是指向 ext2ord_ 节点键的 view(不变量 O:非空 ⟺ live)。
+    // S40 D2：key_view 指向 ext2ord_ 节点键（node-based，地址稳定）。
+    // 覆盖写只更新节点 value，不移动 key——既有 LiveRow.ext 不悬垂。
     std::string_view key_view;
     if (auto it = ext2ord_.find(ext_id); it != ext2ord_.end()) {
         const std::uint64_t old_ord = it->second;
-        if (old_ord < live_.size() && live_[old_ord]) {
-            live_[old_ord] = false;
-            const auto oc = old_ord / kChunkOrds;
-            if (chunks_[oc]) --chunks_[oc]->live_count;
-            ++retired_since_compact_;  // S12-2：覆盖写退休旧版本
+        // S42：旧行写路径同步淘汰（live row / meta / delta journal 三处）。
+        if (live_.erase(old_ord) > 0) {
+            ++retired_since_compact_;  // S12-2：仅旧版本实际 live 时计退休
         }
-        clear_ord2ext_locked(old_ord);  // 退休槽置空,不留指向节点的旧 view
+        meta_.erase(old_ord);
+        delta_live_.erase(old_ord);
         it->second = ord;
         key_view = it->first;
     } else {
-        auto [ins, _] = ext2ord_.emplace(std::string(ext_id), ord);
+        auto [ins, ok] = ext2ord_.emplace(std::string(ext_id), ord);
+        (void)ok;
         key_view = ins->first;
         ++live_docs_;
     }
 
-    chunk->slots[si]    = slot;
-    chunk->ord2ext[si]  = key_view;
-    ++chunk->live_count;
-    live_[ord]      = true;
-    doc_lens_[ord]  = slot.doc_len;
+    live_.insert_or_assign(ord, LiveRow{key_view, slot});
+    // S42-2：窗口 journal 只记当前窗口写入；覆盖写淘汰旧 ord（上方）后
+    // 仅留最新——热点覆盖写不会把 journal 撑到 O(writes)。
+    if (!journal_suppressed_ && ord >= delta_window_wm_) {
+        delta_live_.insert(ord);
+    }
     dirty_.store(true, std::memory_order_relaxed);  // S18-2：自记账
 }
 
@@ -109,13 +76,13 @@ bool Index::remove(std::string_view ext_id, std::uint64_t tomb_ord) {
         return false;
     }
     const std::uint64_t cur_ord = it->second;
-    if (cur_ord < live_.size() && live_[cur_ord]) {
-        live_[cur_ord] = false;
-        const auto ci = cur_ord / kChunkOrds;
-        if (chunks_[ci]) --chunks_[ci]->live_count;
+    // S42：先淘汰 live row（拿 retire 计数），再摘 ext 节点——LiveRow.ext
+    // 指向节点键，extract 之后任何指向该节点的 view 都不得存活。
+    if (live_.erase(cur_ord) > 0) {
         ++retired_since_compact_;  // S12-2：删除退休当前版本
     }
-    clear_ord2ext_locked(cur_ord);  // S40 D2:摘节点前置空,否则槽 view 悬垂
+    meta_.erase(cur_ord);
+    delta_live_.erase(cur_ord);
     // 命中路径:key 从节点 move 进删除日志,省一次拷贝(ext_id 此后不再使用,
     // 即使它恰是本节点键的 view 也无碍)。
     auto nh = ext2ord_.extract(it);
@@ -131,9 +98,12 @@ std::optional<DocHit> Index::get(std::string_view ext_id) const {
         return std::nullopt;
     }
     const std::uint64_t ord = it->second;
-    const auto ci = ord / kChunkOrds;
-    const auto si = ord % kChunkOrds;
-    return DocHit{chunks_[ci]->slots[si], ord};
+    // 不变量：ext2ord_ 命中 ⟹ live row 存在。防御性检查兜底不变量破坏。
+    auto lit = live_.find(ord);
+    if (lit == live_.end()) {
+        return std::nullopt;
+    }
+    return DocHit{lit->second.slot, ord};
 }
 
 std::optional<std::uint64_t> Index::ord_of(std::string_view ext_id) const {
@@ -145,125 +115,83 @@ std::optional<std::uint64_t> Index::ord_of(std::string_view ext_id) const {
 
 std::optional<std::string> Index::ord_to_ext(std::uint64_t ord) const {
     std::shared_lock lk(mutex_);
-    if (ord >= live_.size()) {
-        return std::nullopt;
-    }
-    const auto ci = ord / kChunkOrds;
-    const auto si = ord % kChunkOrds;
-    if (ci >= chunks_.size() || !chunks_[ci]) {
-        return std::nullopt;
-    }
-    if (!live_[ord]) return std::nullopt;  // S40:契约「已删返回 nullopt」
-    return std::string(chunks_[ci]->ord2ext[si]);
+    // S40：契约「已删返回 nullopt」——live-only map 中死 ord 天然不存在。
+    auto it = live_.find(ord);
+    if (it == live_.end()) return std::nullopt;
+    return std::string(it->second.ext);
 }
 
 bool Index::is_live(std::uint64_t ord) const {
     std::shared_lock lk(mutex_);
-    return ord < live_.size() && live_[ord];
+    return live_.contains(ord);
 }
 
 std::uint32_t Index::doc_len(std::uint64_t ord) const {
     std::shared_lock lk(mutex_);
-    if (ord >= doc_lens_.size()) return 0;
-    return doc_lens_[ord];
+    auto it = live_.find(ord);
+    return it != live_.end() ? it->second.slot.doc_len : 0;
 }
 
 std::vector<std::byte> Index::meta_blob(std::uint64_t ord) const {
     std::shared_lock lk(mutex_);
-    if (ord >= meta_blobs_.size()) return {};
-    // 锁内拷贝返回:并发 set_meta 会重分配 meta_blobs_[ord],返回内部指针/span
-    // 会在锁外悬垂。空 vector → 空返回（无 meta 的文档,filter 直接判 false）。
-    return meta_blobs_[ord];
+    // 死 ord / 无 meta → 空返回（无 meta 的文档,filter 直接判 false）。
+    if (!live_.contains(ord)) return {};
+    auto it = meta_.find(ord);
+    if (it == meta_.end()) return {};
+    // 锁内拷贝返回:并发 set_meta 会重分配底层 buffer,返回内部指针/span
+    // 会在锁外悬垂。
+    return it->second;
 }
 
 // S13-P8：锁内求值（契约见头文件）。
 bool Index::eval_meta(std::uint64_t ord, const meta::MetaFilter& filter) const {
     std::shared_lock lk(mutex_);
-    if (ord >= meta_blobs_.size()) return false;
-    const auto& blob = meta_blobs_[ord];
-    if (blob.empty()) return false;  // 无 meta 恒不通过（与 materialize_hits 一致）
-    return filter.evaluate(std::span<const std::byte>(blob));
+    if (!live_.contains(ord)) return false;  // 死 ord 恒不通过（S42 强化）
+    auto it = meta_.find(ord);
+    if (it == meta_.end() || it->second.empty()) {
+        return false;  // 无 meta 恒不通过（与 materialize_hits 一致）
+    }
+    return filter.evaluate(std::span<const std::byte>(it->second));
 }
 
 void Index::set_doc_len(std::uint64_t ord, std::uint32_t len) {
     std::unique_lock lk(mutex_);
-    if (ord >= doc_lens_.size()) return;  // 未登记（空 job 守卫路径）：no-op
-    doc_lens_[ord] = len;
-    const auto ci = ord / kChunkOrds;
-    const auto si = ord % kChunkOrds;
-    if (ci < chunks_.size() && chunks_[ci]) chunks_[ci]->slots[si].doc_len = len;
+    auto it = live_.find(ord);
+    if (it == live_.end()) return;  // 未登记（空 job 守卫路径）：no-op
+    it->second.slot.doc_len = len;
     dirty_.store(true, std::memory_order_relaxed);  // S18-2：自记账
 }
 
 void Index::set_meta(std::uint64_t ord, std::span<const std::byte> blob) {
     std::unique_lock lk(mutex_);
-    ensure_capacity_locked(ord);
-    // 与 put_doc 共锁：调用顺序保证 ord 此前已在 slots_/live_/doc_lens_ 注册。
+    // S42：meta 只挂 live 行——死 ord 不落条目（旧实现的平坦列对死 ord
+    // 留值但序列化/求值均不可见，新实现 no-op 语义等价且更省）。
+    if (!live_.contains(ord)) return;
     if (blob.empty()) {
-        // S21-1：meta 未启用时无槽可清——ord >= size() 本就是空 blob 语义。
-        if (ord < meta_blobs_.size()) meta_blobs_[ord].clear();
+        meta_.erase(ord);
     } else {
-        // S21-1：首个非空 blob 才启用 meta 列（跟平到 live_ 现宽）。
-        if (meta_blobs_.size() < live_.size()) meta_blobs_.resize(live_.size());
-        meta_blobs_[ord].assign(blob.begin(), blob.end());
+        meta_[ord].assign(blob.begin(), blob.end());
     }
     dirty_.store(true, std::memory_order_relaxed);  // S18-2：自记账
 }
 
-// S37-3.b：原带 __attribute__((target("avx2")))——但本函数被**无条件调用**，
-// 该属性允许编译器在 scalar 回退路径也生成 AVX2 ⇒ 无 AVX2 的 CPU 上 SIGILL。
-// 内核拆到独立 TU 后，本函数是普通 TU 代码，编译器无权在此生成 AVX2。
+// S42：全局 DocMap 批量过滤放弃 SIMD gather（设计 §10）——一次 shared_lock
+// 内逐 candidate hash lookup。BM25 主评分路径走 segment-local live checker，
+// 不经本接口；本接口服务 HNSW/IVF callback 与结果物化等长尾路径。
 void Index::fill_is_live(std::span<const std::uint64_t> ords,
                          std::span<char> out) const {
     std::shared_lock lk(mutex_);
-    const std::size_t bound = live_.size();
-    // 快路径:FlatPostings ords 升序去重 → ords.back() < bound ⟺ 全在界,
-    // 单次比较省掉 per-element 分支。占绝大多数查询(recents)。
-    if (!ords.empty() && ords.back() < bound) {
-        const auto* live_arr = live_.data();
-        const auto* ords_arr = ords.data();
-        char* out_arr = out.data();
-        const std::size_t n = ords.size();
-#if BITCASK_X86_64
-        if (simd::have_avx2()) {  // S37-3：门后才可调 AVX2 内核
-            kernels::fill_is_live_avx2(live_arr, ords_arr, out_arr, n);
-            return;
-        }
-#endif
-        for (std::size_t i = 0; i < n; ++i) {
-            out_arr[i] = static_cast<char>(live_arr[ords_arr[i]]);
-        }
-        return;
-    }
-    // 慢路径:含越界或ds → per-element 越界检查。
     for (std::size_t i = 0; i < ords.size(); ++i) {
-        out[i] = static_cast<char>(ords[i] < bound && live_[ords[i]]);
+        out[i] = static_cast<char>(live_.contains(ords[i]));
     }
 }
 
-// S37-3.b：同 fill_is_live——原函数级 target 属性已移除，见其注释。
 void Index::fill_doc_lens(std::span<const std::uint64_t> ords,
                           std::span<std::uint32_t> out) const {
     std::shared_lock lk(mutex_);
-    // P2.4：读 SoA 紧凑数组（gather 的 cache 流量 ↓8x，见 index.hpp 注释）。
-    const std::size_t bound = doc_lens_.size();
-    // 同 fill_is_live:ords 升序去重 → ords.back() < bound 全在界。
-    if (!ords.empty() && ords.back() < bound) {
-        const auto* dls_arr = doc_lens_.data();
-        const auto* ords_arr = ords.data();
-        auto* out_arr = out.data();
-        const std::size_t n = ords.size();
-#if BITCASK_X86_64
-        if (simd::have_avx2()) {  // S37-3：门后才可调 AVX2 内核
-            kernels::fill_doc_lens_avx2(dls_arr, ords_arr, out_arr, n);
-            return;
-        }
-#endif
-        for (std::size_t i = 0; i < n; ++i) out_arr[i] = dls_arr[ords_arr[i]];
-        return;
-    }
     for (std::size_t i = 0; i < ords.size(); ++i) {
-        out[i] = ords[i] < bound ? doc_lens_[ords[i]] : 0;
+        auto it = live_.find(ords[i]);
+        out[i] = it != live_.end() ? it->second.slot.doc_len : 0u;
     }
 }
 
@@ -273,23 +201,15 @@ IndexInfo Index::info() const {
         .live_docs        = live_docs_,
         .total_ords       = next_ord_,
         .next_ord         = next_ord_,
-        .chunks_allocated = chunks_alloc_,
-        .chunks_freed     = chunks_freed_,
+        .chunks_allocated = chunks_alloc_,   // S42 起恒 0
+        .chunks_freed     = chunks_freed_,   // S42 起恒 0
     };
 }
 
 std::uint64_t Index::compact_chunks() {
+    // S42：live-only 结构无 chunk 可释放；保留 API 兼容（Cask merge / shim）。
     std::unique_lock lk(mutex_);
-    std::uint64_t freed = 0;
-    for (auto& chunk_ptr : chunks_) {
-        if (chunk_ptr && chunk_ptr->live_count == 0) {
-            chunk_ptr.reset();
-            ++freed;
-        }
-    }
-    chunks_freed_ += freed;
-    if (freed > 0) dirty_.store(true, std::memory_order_relaxed);  // S18-2
-    return freed;
+    return 0;
 }
 
 // ---- S18-2：docmap 持久化记账 ----
@@ -297,6 +217,9 @@ std::uint64_t Index::compact_chunks() {
 void Index::begin_delta_window(std::uint64_t wm) {
     std::unique_lock lk(mutex_);
     delta_window_wm_ = wm;
+    // S42-2：窗口推进 = 旧窗口 journal 整体作废（base/delta 落成或载入
+    // 成功后，下一窗口从空 journal 起记）。
+    delta_live_.clear();
 }
 
 std::vector<std::pair<std::string, std::uint64_t>>
@@ -344,10 +267,11 @@ bool Index::serialize_docmap(std::vector<std::uint8_t>& buf,
     std::uint64_t rows = 0;
     bool ok = true;
     std::uint64_t prev_ord = 0;
+    // S42：for_each_live 锁内按 ord 升序回调——gap 编码压缩率与旧实现一致。
     for_each_live([&](std::uint64_t ord, std::string_view ext,
                       const DocSlot& slot) {
         if (ext.size() > 0xFFFF) { ok = false; return; }
-        codec::vbyte_encode(ord - prev_ord, buf);  // gap：live 按 ord 升序遍历
+        codec::vbyte_encode(ord - prev_ord, buf);
         prev_ord = ord;
         codec::vbyte_encode(ext.size(), buf);
         const auto* kd = reinterpret_cast<const std::uint8_t*>(ext.data());
@@ -426,7 +350,7 @@ std::optional<std::uint64_t> parse_sidecar_rows(Index& idx, Cur& c) {
         slot.loc.file_id  = static_cast<std::uint32_t>(fid);
         slot.loc.total_sz = static_cast<std::uint32_t>(tsz);
         slot.doc_len      = static_cast<std::uint32_t>(dl);
-        idx.put_doc(ext, ord, slot);  // 重建 ext2ord/live/doc_lens/水位
+        idx.put_doc(ext, ord, slot);  // 重建 ext2ord/live/水位
     }
     if (!c.at_end()) return std::nullopt;
     return covers;

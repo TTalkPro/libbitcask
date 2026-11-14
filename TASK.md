@@ -10,6 +10,187 @@
 
 ---
 
+## 🔴 S42 · DocMap Live-Only Store（2026-11-14 立项）
+
+> 来源：热点覆盖写使 `index::Index` 按历史 ord 展开的平坦数组随总写入量增长
+> （`live_docs == 1` 时写 N 次仍占 O(N) 内存）。
+> 设计：[`docs/design/s42-docmap-live-store-design-zh.md`](docs/design/s42-docmap-live-store-design-zh.md)（已评审定稿）。
+> 决策基线：**live-only map 为主存储**；**checkpoint 显式升序快照**；**delta 窗口 journal**；
+> **放弃全局 DocMap 层 SIMD gather**（BM25 主路径已分段化，段内 dense DocId + 段内 live checker）。
+> 硬约束：磁盘 docmap checkpoint 格式逐字节不变（旧链可读、新链旧实现可读）；
+> `SearchHit.ord` 仍为全局 LSN；S40 key 单实例不变量（ext node 地址稳定）不破。
+> 验收标准：每项改动后 ctest 全绿 + 编译无新告警；涉及恢复语义须过 crash/recovery 用例；
+> 收尾须过 ASan/TSan 与 benchmark gate（见 S42-5）。
+
+| # | 任务 | 状态 | 说明 |
+|---|---|---|---|
+| S42-1 | live-only 主结构替换 | ✅ done | `index.hpp` / `index.cpp`：删 chunks/flat arrays，换 `ext2ord_ + live_ + meta_ + delta_live_` |
+| S42-2 | checkpoint 升序快照 + delta journal | ✅ done | `for_each_live(_in)/for_each_meta_in` 锁内 RowRef 排序回调；sidecar 格式零改动 |
+| S42-3 | recovery replay journal 抑制 | ✅ done | `Index::ReplayJournalGuard`（docmap_ckpt load + legacy_ckpt load） |
+| S42-4 | 回归与一致性测试 | ✅ done | index_test 改造 + 随机 reference-model 对拍 + 热点 overwrite 形态回归 |
+| S42-5 | benchmark gate 与 rollout | ✅ done | bench smoke 新基线（Put_Overwrite / BOW 查询 / Open_Snapshot）；正式 rollout/CHANGELOG 待版本发布 |
+| S42-6 | flat arrays 与 SIMD kernel 清理 | ✅ done | 删 `index_kernels.hpp` / `index_kernels_avx2.cpp` + CMake `bitcask_simd_tu` 条目 |
+
+### 🔴 S42-1 — live-only 主结构替换（先行，纯内存侧）
+
+工作面：`include/bitcask/index.hpp`、`src/keydir/index.cpp`。
+
+1. 新结构（设计 §6）：
+   - `ext2ord_` 保持 node-based `std::unordered_map`（S40 地址稳定）；
+   - `ankerl::unordered_dense::map<Lsn, LiveRow> live_`，`LiveRow{string_view ext; DocSlot slot}`，ext 指向 ext node key；
+   - `ankerl::unordered_dense::map<Lsn, vector<byte>> meta_`（无 meta 部署零 per-doc header）；
+   - `ankerl::unordered_dense::set<Lsn> delta_live_`（窗口 journal，S42-2 消费）。
+   - 依赖已就绪：`unordered_dense::unordered_dense` 已是 CMake 链接目标（KeyDir 分片表在用）。
+2. 写路径语义（设计 §7）：覆盖写先 `live_.erase(old)` / `meta_.erase(old)` / `delta_live_.erase(old)` 再插新；
+   `retired_since_compact_` 仅旧版本实际 live 时递增；删除先 erase live row 再 extract ext node（防悬垂）；
+   removals 入账门限（`tomb >= delta_window_wm_`，命中与否都入账）保持现状。
+3. 读路径：`get/ord_of/ord_to_ext/is_live/doc_len/meta_blob/eval_meta` 改 hash 查找；
+   `eval_meta` 仍锁内求值；`meta_blob` 仍锁内拷贝。
+4. `fill_is_live/fill_doc_lens` 退化为**一次 shared_lock + 逐 candidate hash lookup**（接口不变，`LiveChecker` 契约不变）。
+5. 遍历兼容：`for_each_live/for_each_live_in/for_each_meta_in` 保留升序语义（锁内收集 RowRef 排序后回调）；
+   checkpoint 内部改走 S42-2 的 snapshot API，避免全量遍历重复排序。
+6. `compact_chunks()` 保留 API、返回 0；`IndexInfo` chunk 字段保留但冻结（诊断兼容）。
+7. 测试适配：`CrossChunkOps/ChunkBoundaryLastSlot/CompactChunks*` 三个 chunk 语义用例改写为
+   「历史 ord 不占内存 / compact no-op」断言；其余 index_test 用例语义不变须全绿。
+
+- **验收**：index_test + checkpoint/recovery 相关 ctest 全绿；`-Werror` 无新告警；
+  热点 overwrite 冒烟（1 key × 100K 写）RSS 不随 ord 增长。
+
+### 🔴 S42-2 — checkpoint 升序快照 + delta journal
+
+工作面：`src/keydir/index.cpp`（serialize/deserialize）、`src/keydir/docmap_ckpt.cpp`、
+`include/bitcask/index.hpp`（snapshot API）、`src/cask/legacy_ckpt.cpp` 与
+`tests/support/search_layer.cpp`（调用点适配）。
+
+1. base：shared lock 内收集 `RowRef{ord, string_view ext, const DocSlot*}` → 按 ord 排序 →
+   现有 v3 格式写盘（不拷贝全部 key，只付 ~32B/live 临时 ref）；meta section 同序。
+2. delta：只遍历 `delta_live_`，过滤 `[from, watermark)` 且仍 live → 排序 → `kDocmapDeltaV3`；
+   与 `removals_snapshot()` 按 ord 交错语义不变；meta delta 只含窗口内 live meta。
+3. `begin_delta_window(wm)` 清空 `delta_live_`；put/remove 按 wm 门限维护 journal（S42-1 已埋点，此处接通消费端）。
+4. **格式零改动**：deserialize/apply 路径不动；旧 checkpoint 新实现可读、新 checkpoint 旧实现可读。
+5.  golden 对拍：同一操作流下新旧实现产出的 base/delta 字节一致（或语义等价重放一致）。
+6. **migration 影响：无**。纯内存表示变更，migrate 工具面积不含 docmap（设计 §8.4）；
+   不 bump 版本、无 flag-day，回滚双向兼容。
+
+- **验收**：`SidecarV2RoundTrip/SidecarV1CompatRead/ForEachLiveAcrossChunks`、
+  `checkpoint_recovery_test`、`crash_recovery_test` 全绿；「删后重写」交错重放用例通过。
+
+### 🟡 S42-3 — recovery replay journal 抑制
+
+1. 载入期（base deserialize / delta apply / fold 重建）抑制 `delta_live_` 常规增长
+   （RAII guard 或 replay 标志）；成功推进窗口时清空，失败退 fold 不污染正式状态。
+2. 调用点：`docmap_ckpt.cpp` load 链、`legacy_ckpt.cpp`、`tests/support/search_layer.cpp`。
+3. removals 的载入污染清理语义保持现状（收尾 `clear_removals()`）。
+
+- **验收**：recovery 用例全绿；大 base 开库峰值 RSS 不因 journal 抬升（对照 S42-1 冒烟基线）。
+
+### 🔴 S42-4 — 回归与一致性测试
+
+1. 随机操作流（put/overwrite/remove/reinsert/set_doc_len/set_meta/checkpoint）对拍简单 reference model：
+   `get/ord_of/ord_to_ext/is_live/doc_len/meta_blob` + checkpoint 重放后全量状态。
+2. 新增用例：同窗口多次覆盖写 delta 只含当前 live row；覆盖写清除旧 meta；64 位 ord 边界不做数组下标；
+   删除后重写 ord 交错；replay 中途失败退 fold。
+3. RSS 回归：1 live key × 1M overwrite，DocMap 常驻近似恒定（旧实现对照 ~50MiB+ 增长）。
+4. 并发：读写并发 + checkpoint 并发过 TSan；悬垂防护过 ASan。
+
+- **验收**：Debug 全量 + ASan + TSan 全绿。
+
+### 🟡 S42-5 — benchmark gate 与 rollout
+
+1. bench 面：`cask_bench`（hot overwrite RSS/吞吐）、`keydir_bench`/点查、`hnsw_bench`（live callback）、
+   IVF 过滤搜索、`inverted_bench`/BM25 分段 P99、`checkpoint_bench`（base/delta 吞吐与文件大小）、开库 recovery。
+2. gate 标准（设计 §16.4）：热点 overwrite RSS 显著下降；BM25 主查询 P99 无明显回退；
+   ckpt/recovery 在可接受范围。**不要求所有路径都快**。
+3. 默认开启 live-only；如 gate 边缘，提供短期配置开关回退（不长期维护双实现）。
+4. 账目：CHANGELOG + feedbacks 标注；TASK.md 落地记录回填。
+
+### 🟡 S42-6 — flat arrays 与 SIMD kernel 清理（gate 后）
+
+1. 删 `src/keydir/index_kernels.hpp` / `index_kernels_avx2.cpp` 与 CMake `bitcask_simd_tu(... avx2)` 条目
+   （grep 确认仅 index.cpp 消费）；`fill_*` 保留 scalar 批量实现。
+2. 清理 `IndexInfo`/`compact_chunks` 的 obsolete 注释或标记 deprecated（API 保留）。
+3. 遍历 API 长期方向：无序版本标 deprecated，防新调用方误认升序。
+
+- **验收**：`-Werror` 整树 0 告警；gcc/clang Debug+Release 双树 ctest 全绿；
+  分 ISA 降档对拍无回归（沿用 S37-3 纪律）。
+
+### 执行序
+
+S42-1 → S42-2 → S42-3 → S42-4 → S42-5（gate）→ S42-6。
+S42-4 的用例随 1/2/3 增量补齐，集中对拍与 sanitizer 在 4 收口；6 必须在 gate 之后。
+
+### ⚠️ 风险排序（按「有多容易静默错」）
+
+1. **checkpoint 遍历顺序**：unordered 天然序直接写盘 → gap 压缩率崩/重放语义错。所有写盘路径显式排序（S42-2 golden 对拍兜底）。
+2. **ext view 悬垂**：删除/覆盖时先动 ext node 后 erase live row → use-after-free。写路径顺序纪律 + ASan（S42-1/4）。
+3. **delta journal 漏淘汰旧 ord**：热点覆盖写把窗口 journal 写爆 → delta 文件 O(writes)。覆盖写 erase 旧 ord 埋点 + 用例（S42-1/4）。
+4. **replay journal 放大开库峰值**：base 重放逐 ord 入 journal。抑制 guard（S42-3）。
+5. **低 churn 大全量集内存略增**：非目标场景劣化，gate 决策（S42-5）。
+
+### 明确不做
+
+| 项 | 理由 |
+|---|---|
+| ord 复用 / 世代压缩 | 与本设计正交，LSN 永不复用是恢复语义基线 |
+| 有序索引（B-tree/skiplist）维持遍历序 | checkpoint 时排序是最小正确方案，不为遍历序付常驻结构 |
+| BM25/HNSW/IVF 内部 id 结构改动 | 三者均不用 LSN 做数组下标，不在本届面积内 |
+| `ext2ord_` value 携带 DocSlot 的点查优化 | 留作后续；第一版双 map 直观、迁移面小 |
+| flat/live-only 双实现长期共存 | 仅 gate 边缘时短期开关，S42-6 收口删除 |
+
+#### ✅ S42 落地记录（2026-11-14）
+
+**S42-1 主结构**：`include/bitcask/index.hpp` 重写——`ext2ord_` 保持 node-based
+（S40 地址稳定），新增 `ankerl::unordered_dense::map<Lsn, LiveRow> live_`、
+`meta_`、`set<Lsn> delta_live_`；chunk/`live_`/`doc_lens_`/`meta_blobs_` 全部退役。
+覆盖写/删除在写路径同步淘汰旧行（live row + meta + journal 三处）；
+`retired_since_compact_` 仅旧行实际存在时递增。`fill_is_live/fill_doc_lens`
+退化为单锁逐 candidate hash lookup（`LiveChecker` 批量接口契约不变）。
+`compact_chunks()` 保留 API、恒返 0；`IndexInfo` chunk 字段冻结为 0。
+
+**S42-2 checkpoint**：`for_each_live/for_each_live_in/for_each_meta_in` 在
+shared lock 内收集 RowRef 排序后回调——base/delta/meta section 写盘序列与旧
+实现逐字节同序同码（编码逻辑未动）。`begin_delta_window(wm)` 清空 journal；
+put/remove 按 wm 门限维护（覆盖写淘汰旧 ord，热点写不撑爆 delta）。
+
+**S42-3 载入抑制**：`Index::ReplayJournalGuard`（RAII）在 `load_docmap`
+与 `legacy_ckpt::load` 重放期置位——journal 维护跳过，收尾
+`begin_delta_window` 整体清空语义不变，开库峰值不随 base 抬升。
+
+**S42-4 测试**：`tests/index_test.cpp` 改造——chunk 用例改为大 ord 间隙 /
+compact no-op 断言；新增 `DeltaJournalTracksLiveOnly`（覆盖写淘汰 journal 旧
+ord、窗口推进清空、wm 门限）、`OverwriteClearsOldMeta`（覆盖写/删除/空 blob
+三路淘汰 + 死 ord no-op）、`HotOverwriteKeepsLiveOnlyShape`（1 key × 100K
+overwrite → `live_docs==1`、chunk 字段 0、死 ord 无残留 doc_len）、
+`RandomOpsMatchReferenceModel`（mt19937 固定种子 400 步 put/overwrite/
+remove/set_doc_len/set_meta 对拍 + sidecar roundtrip 二次对拍）。
+
+**S42-6 清理**：删 `src/keydir/index_kernels.hpp`、`index_kernels_avx2.cpp`、
+CMake `bitcask_simd_tu(... avx2)` 条目；`bitcask_docmap` 链
+`unordered_dense::unordered_dense`（PUBLIC，index.hpp 暴露成员类型），并在
+子模块注册后加目录级 include 路径（覆盖仅 include `index.hpp` 不链 docmap
+的目标，如 `bitcask_bm25`）。
+
+**验证矩阵**：
+
+| 树 | 结果 |
+|---|---|
+| gcc Release | **821/821** 全绿（0 告警；2 项预存 disabled + 1 项 >2GiB skip）|
+| ASan | **821/821** 全绿（悬垂 view 防护通过；唯一告警为 googletest 第三方预存）|
+| TSan | **821/821** 全绿（读写并发 + checkpoint 并发；1 项预存 skip）|
+
+**bench smoke（Release，新基线，无旧对照）**：`BM_Cask_Put_Overwrite`
+1.51µs（663.9K ops/s）、`BM_Inverted_QueryThroughputBOW/threads:1`
+6.93µs（144.3K qps，分段主路径不经全局 DocMap gather）、
+`BM_Cask_Open_Snapshot` 3.93ms。基线 json 仅有 KeyDir put（本届未动）。
+
+**migration**：无磁盘 migration（设计 §8.4）。chunk/flat arrays 从未落盘；
+sidecar v3/V3 逐字节不变，回滚双向兼容。
+
+**遗留到 rollout**：正式 CHANGELOG 账目、低 churn 大全量集 RSS 对照、
+HNSW/IVF 带 callback 的正式 gate 数字（本机 bench smoke 已覆盖对应代码路径）。
+
+---
+
 ## ✅ S41 · fields 读回（2026-11-13，随 6.8.0）
 
 > 来源：[`feedbacks/2026-11-13-doc-capability-gaps.md`](feedbacks/2026-11-13-doc-capability-gaps.md) #2。

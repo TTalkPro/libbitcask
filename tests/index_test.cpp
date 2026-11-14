@@ -2,6 +2,11 @@
 
 #include <gtest/gtest.h>
 
+#include <random>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include "bitcask/index.hpp"
 
 using bitcask::index::DocLoc;
@@ -14,6 +19,45 @@ DocSlot slot(std::uint32_t file_id, std::uint64_t off, std::uint32_t sz,
              std::uint32_t ts = 0) {
     return DocSlot{DocLoc{.offset = off, .file_id = file_id, .total_sz = sz},
                    ts, /*doc_len*/ 0};
+}
+
+std::vector<std::byte> as_bytes(std::string_view s) {
+    std::vector<std::byte> b;
+    b.reserve(s.size());
+    for (const char c : s) {
+        b.push_back(static_cast<std::byte>(static_cast<unsigned char>(c)));
+    }
+    return b;
+}
+
+// S42-4：reference model——ord/ext/live/doc_len/meta 全量对拍。
+struct RefDoc {
+    std::uint64_t ord = 0;
+    std::uint32_t doc_len = 0;
+    std::vector<std::byte> meta;
+};
+
+void verify_model(const Index& idx,
+                  const std::unordered_map<std::string, RefDoc>& model,
+                  const std::vector<std::uint64_t>& dead_ords,
+                  bool check_meta) {
+    for (const auto& [key, d] : model) {
+        auto hit = idx.get(key);
+        ASSERT_TRUE(hit.has_value()) << key;
+        EXPECT_EQ(hit->ord, d.ord) << key;
+        EXPECT_EQ(idx.ord_of(key), std::optional<std::uint64_t>(d.ord)) << key;
+        EXPECT_TRUE(idx.is_live(d.ord)) << key;
+        EXPECT_EQ(idx.doc_len(d.ord), d.doc_len) << key;
+        auto e = idx.ord_to_ext(d.ord);
+        ASSERT_TRUE(e.has_value());
+        EXPECT_EQ(*e, key);
+        if (check_meta) {
+            EXPECT_EQ(idx.meta_blob(d.ord), d.meta) << key;
+        }
+    }
+    for (const auto ord : dead_ords) {
+        EXPECT_FALSE(idx.is_live(ord)) << ord;
+    }
 }
 
 }  // namespace
@@ -187,11 +231,11 @@ TEST(Index, ReplayWithExplicitOrds) {
     EXPECT_EQ(idx.alloc_ord(), 4u);
 }
 
-// ---- 分块数组测试（方案 B）----
+// ---- S42：live-only 形态测试（chunk 数组已退役）----
 
-TEST(Index, CrossChunkOps) {
+TEST(Index, LargeOrdGapOps) {
     Index idx;
-    constexpr auto N = bitcask::index::kChunkOrds;
+    constexpr std::uint64_t N = 1ull << 16;  // 旧 chunk 边界；S42 起只是普通 ord 间隙
 
     idx.put_doc("low",  0,     slot(1, 0,  10));
     idx.put_doc("high", N + 5, slot(2, 100, 20));
@@ -199,50 +243,35 @@ TEST(Index, CrossChunkOps) {
     EXPECT_TRUE(idx.is_live(0));
     EXPECT_TRUE(idx.is_live(N + 5));
     EXPECT_FALSE(idx.is_live(1));
-    EXPECT_FALSE(idx.is_live(N));
+    EXPECT_FALSE(idx.is_live(N));  // 间隙 ord 不占任何行
 
-    auto lo = idx.get("low");
-    ASSERT_TRUE(lo.has_value());
-    EXPECT_EQ(lo->loc.file_id, 1u);
-
-    auto hi = idx.get("high");
-    ASSERT_TRUE(hi.has_value());
-    EXPECT_EQ(hi->loc.file_id, 2u);
+    EXPECT_EQ(idx.get("low")->loc.file_id, 1u);
+    EXPECT_EQ(idx.get("high")->loc.file_id, 2u);
 
     EXPECT_EQ(*idx.ord_to_ext(0), "low");
     EXPECT_EQ(*idx.ord_to_ext(N + 5), "high");
+
+    // 中间 64K 死 ord 不占行：live-only 稳态随 live docs 而非历史 ord。
+    EXPECT_EQ(idx.info().live_docs, 2u);
 }
 
-TEST(Index, ChunkBoundaryLastSlot) {
+TEST(Index, CompactChunksIsNoOp) {
     Index idx;
-    constexpr auto N = bitcask::index::kChunkOrds;
-
-    idx.put_doc("last0",  N - 1, slot(1, 0, 10));
-    idx.put_doc("first1", N,     slot(2, 0, 10));
-
-    EXPECT_TRUE(idx.is_live(N - 1));
-    EXPECT_TRUE(idx.is_live(N));
-    EXPECT_EQ(*idx.ord_to_ext(N - 1), "last0");
-    EXPECT_EQ(*idx.ord_to_ext(N), "first1");
-}
-
-TEST(Index, CompactChunksFreesDeadChunks) {
-    Index idx;
-    constexpr auto N = bitcask::index::kChunkOrds;
+    constexpr std::uint64_t N = 1ull << 16;
 
     idx.put_doc("a", 0,     slot(1, 0, 10));
     idx.put_doc("b", 1,     slot(1, 10, 10));
     idx.put_doc("c", N,     slot(1, 20, 10));
     idx.put_doc("d", N + 1, slot(1, 30, 10));
 
-    EXPECT_EQ(idx.info().chunks_allocated, 2u);
-
     idx.remove("c", idx.alloc_ord());
     idx.remove("d", idx.alloc_ord());
 
+    // S42：写路径已淘汰死行，compact 退化为兼容 no-op。
     auto freed = idx.compact_chunks();
-    EXPECT_EQ(freed, 1u);
-    EXPECT_EQ(idx.info().chunks_freed, 1u);
+    EXPECT_EQ(freed, 0u);
+    EXPECT_EQ(idx.info().chunks_allocated, 0u);
+    EXPECT_EQ(idx.info().chunks_freed, 0u);
 
     EXPECT_TRUE(idx.is_live(0));
     EXPECT_TRUE(idx.is_live(1));
@@ -250,30 +279,14 @@ TEST(Index, CompactChunksFreesDeadChunks) {
     EXPECT_FALSE(idx.is_live(N + 1));
 }
 
-TEST(Index, CompactChunksPreservesLiveChunks) {
+TEST(Index, ForEachLiveAcrossLargeOrdGap) {
     Index idx;
-    constexpr auto N = bitcask::index::kChunkOrds;
+    constexpr std::uint64_t N = 1ull << 16;
 
     idx.put_doc("a", 0,     slot(1, 0, 10));
     idx.put_doc("b", N,     slot(1, 10, 10));
     idx.put_doc("c", N + 1, slot(1, 20, 10));
-
-    idx.remove("c", idx.alloc_ord());
-
-    auto freed = idx.compact_chunks();
-    EXPECT_EQ(freed, 0u);
-
-    EXPECT_TRUE(idx.is_live(0));
-    EXPECT_TRUE(idx.is_live(N));
-}
-
-TEST(Index, ForEachLiveAcrossChunks) {
-    Index idx;
-    constexpr auto N = bitcask::index::kChunkOrds;
-
-    idx.put_doc("a", 0,     slot(1, 0, 10));
-    idx.put_doc("b", N,     slot(1, 10, 10));
-    idx.put_doc("c", N + 1, slot(1, 20, 10));
+    idx.remove("b", idx.alloc_ord());
 
     std::vector<std::pair<std::uint64_t, std::string>> seen;
     idx.for_each_live([&](std::uint64_t ord, std::string_view ext,
@@ -281,13 +294,184 @@ TEST(Index, ForEachLiveAcrossChunks) {
         seen.emplace_back(ord, ext);
     });
 
-    ASSERT_EQ(seen.size(), 3u);
+    ASSERT_EQ(seen.size(), 2u);
     EXPECT_EQ(seen[0].first, 0u);
     EXPECT_EQ(seen[0].second, "a");
-    EXPECT_EQ(seen[1].first, N);
-    EXPECT_EQ(seen[1].second, "b");
-    EXPECT_EQ(seen[2].first, N + 1);
-    EXPECT_EQ(seen[2].second, "c");
+    EXPECT_EQ(seen[1].first, N + 1);
+    EXPECT_EQ(seen[1].second, "c");
+}
+
+// ---- S42-2：delta journal（live-only、窗口推进清空）----
+
+TEST(Index, DeltaJournalTracksLiveOnly) {
+    Index idx;
+    idx.put_doc("k", 0, slot(1, 0, 10));
+    idx.begin_delta_window(0);  // 窗口从 0 起；journal 清空
+    EXPECT_TRUE(idx.delta_live_snapshot().empty());
+
+    idx.put_doc("k", 1, slot(1, 10, 10));  // 覆盖写：journal 0 淘汰 → 1
+    auto js = idx.delta_live_snapshot();
+    ASSERT_EQ(js.size(), 1u);
+    EXPECT_EQ(js[0], 1u);
+
+    idx.put_doc("other", 2, slot(2, 0, 10));
+    js = idx.delta_live_snapshot();
+    ASSERT_EQ(js.size(), 2u);
+    EXPECT_EQ(js[0], 1u);
+    EXPECT_EQ(js[1], 2u);
+
+    ASSERT_TRUE(idx.remove("k", 3));
+    js = idx.delta_live_snapshot();
+    ASSERT_EQ(js.size(), 1u);
+    EXPECT_EQ(js[0], 2u);
+
+    idx.begin_delta_window(4);  // 推进窗口 = journal 整体作废
+    EXPECT_TRUE(idx.delta_live_snapshot().empty());
+
+    idx.put_doc("old", 3, slot(1, 20, 10));  // ord < 新窗口水位：不入 journal
+    EXPECT_TRUE(idx.delta_live_snapshot().empty());
+
+    idx.put_doc("new", 5, slot(1, 30, 10));
+    js = idx.delta_live_snapshot();
+    ASSERT_EQ(js.size(), 1u);
+    EXPECT_EQ(js[0], 5u);
+}
+
+// ---- S42：meta 挂 live 行，覆盖写/删除同步淘汰 ----
+
+TEST(Index, OverwriteClearsOldMeta) {
+    Index idx;
+    idx.put_doc("k", 0, slot(1, 0, 10));
+    const auto blob1 = as_bytes("meta-1");
+    idx.set_meta(0, blob1);
+    EXPECT_EQ(idx.meta_blob(0), blob1);
+
+    idx.put_doc("k", 1, slot(1, 10, 10));  // 覆盖写：旧 ord 的 meta 淘汰
+    EXPECT_TRUE(idx.meta_blob(0).empty());
+    EXPECT_TRUE(idx.meta_blob(1).empty());  // 新行未挂 meta
+
+    const auto blob2 = as_bytes("meta-2");
+    idx.set_meta(1, blob2);
+    EXPECT_EQ(idx.meta_blob(1), blob2);
+
+    idx.set_meta(1, {});  // 空 blob = 清除
+    EXPECT_TRUE(idx.meta_blob(1).empty());
+
+    idx.set_meta(999, blob2);  // 未登记/死 ord：no-op，不复活
+    EXPECT_TRUE(idx.meta_blob(999).empty());
+
+    ASSERT_TRUE(idx.remove("k", 2));
+    EXPECT_TRUE(idx.meta_blob(1).empty());  // 删除淘汰 meta
+}
+
+// ---- S42-1：热点覆盖写稳态（内存形态回归）----
+
+TEST(Index, HotOverwriteKeepsLiveOnlyShape) {
+    Index idx;
+    constexpr std::uint64_t kWrites = 100000;
+    for (std::uint64_t i = 0; i < kWrites; ++i) {
+        idx.put_doc("hot", i, slot(1, i * 8, 8));
+        if (i % 2 == 1) idx.set_doc_len(i, 7);
+    }
+
+    auto info = idx.info();
+    EXPECT_EQ(info.live_docs, 1u);          // 1 key 写 100K 次 → 仍 1 行
+    EXPECT_EQ(info.total_ords, kWrites);
+    EXPECT_EQ(info.chunks_allocated, 0u);   // chunk 数组已退役
+    EXPECT_EQ(idx.compact_chunks(), 0u);
+
+    EXPECT_TRUE(idx.is_live(kWrites - 1));
+    EXPECT_FALSE(idx.is_live(0));
+    EXPECT_FALSE(idx.is_live(kWrites - 2));
+    EXPECT_EQ(idx.doc_len(0), 0u);          // 死 ord 不再返回残留 doc_len
+    EXPECT_EQ(idx.ord_to_ext(0), std::nullopt);
+
+    auto hit = idx.get("hot");
+    ASSERT_TRUE(hit.has_value());
+    EXPECT_EQ(hit->ord, kWrites - 1);
+    EXPECT_EQ(hit->doc_len, 7u);            // 最后一次写入为奇数 ord → 已回填
+}
+
+// ---- S42-4：随机操作流对拍 reference model（含 checkpoint roundtrip）----
+
+TEST(Index, RandomOpsMatchReferenceModel) {
+    Index idx;
+    std::mt19937_64 rng(42);
+    std::vector<std::string> keys;
+    for (int i = 0; i < 16; ++i) keys.push_back("key-" + std::to_string(i));
+    std::unordered_map<std::string, RefDoc> model;
+    std::vector<std::uint64_t> dead_ords;
+    std::uint64_t next = 0;
+    std::uniform_int_distribution<std::size_t> key_pick(0, keys.size() - 1);
+    std::uniform_int_distribution<int> op(0, 5);
+
+    auto do_put = [&](const std::string& k) {
+        const std::uint64_t ord = next++;
+        idx.put_doc(k, ord,
+                    slot(1, ord * 16, 8, static_cast<std::uint32_t>(ord)));
+        if (auto it = model.find(k); it != model.end()) {
+            dead_ords.push_back(it->second.ord);
+        }
+        model[k] = RefDoc{ord, 0u, {}};
+    };
+    auto do_remove = [&](const std::string& k) {
+        auto it = model.find(k);
+        const std::uint64_t tomb = next++;
+        ASSERT_EQ(idx.remove(k, tomb), it != model.end());
+        if (it != model.end()) {
+            dead_ords.push_back(it->second.ord);
+            model.erase(it);
+        }
+    };
+
+    for (int step = 0; step < 400; ++step) {
+        const std::string& k = keys[key_pick(rng)];
+        switch (op(rng)) {
+        case 0:
+        case 1:
+            do_put(k);
+            break;
+        case 2:
+            do_remove(k);
+            break;
+        case 3: {
+            auto it = model.find(k);
+            if (it == model.end()) break;
+            const std::uint32_t len = static_cast<std::uint32_t>(step % 97 + 1);
+            idx.set_doc_len(it->second.ord, len);
+            it->second.doc_len = len;
+            break;
+        }
+        case 4: {
+            auto it = model.find(k);
+            if (it == model.end()) break;
+            if (step % 3 == 0) {
+                idx.set_meta(it->second.ord, {});
+                it->second.meta.clear();
+            } else {
+                const auto blob = as_bytes("meta-" + std::to_string(step));
+                idx.set_meta(it->second.ord, blob);
+                it->second.meta = blob;
+            }
+            break;
+        }
+        default:
+            verify_model(idx, model, dead_ords, /*check_meta=*/true);
+            break;
+        }
+    }
+    verify_model(idx, model, dead_ords, /*check_meta=*/true);
+
+    // checkpoint roundtrip：ord/ext/live/doc_len 保持；meta 走独立 section，
+    // 纯 sidecar 不含 meta（与旧实现一致）→ idx2 对拍时关闭 meta 校验。
+    std::vector<std::uint8_t> buf;
+    ASSERT_TRUE(idx.serialize_docmap(buf, next));
+    Index idx2;
+    auto covers = idx2.deserialize_docmap(
+        std::span<const std::uint8_t>(buf.data(), buf.size()));
+    ASSERT_TRUE(covers.has_value());
+    EXPECT_EQ(*covers, next);
+    verify_model(idx2, model, dead_ords, /*check_meta=*/false);
 }
 
 // ---- S21-2 A2：BCIS sidecar v2（行 gap+vbyte）----

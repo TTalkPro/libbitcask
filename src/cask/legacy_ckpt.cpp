@@ -77,6 +77,9 @@ LoadResult load(std::string_view path, index::Index& docmap,
     result.loaded = true;
     result.watermark = lc->watermark;
     result.all_segments_ok = true;
+    // S42-3：载入重放期抑制 delta journal（与 docmap_ckpt load 同理——
+    // 收尾 begin_delta_window 会整体清空，重放期逐行入账纯属峰值浪费）。
+    index::Index::ReplayJournalGuard replay_guard(docmap);
 
     bool bm25_loaded = false;
     bool docmap_loaded = false;

@@ -445,6 +445,10 @@ DocmapLoadResult load_docmap(Index& docmap, std::string_view dir,
         return result;
     };
     if (!lc) return fail();
+    // S42-3：base 行段 + delta 链重放期间抑制 delta journal——重放行会在
+    // 收尾 begin_delta_window 时整体清空，逐行入账只是白付开库峰值内存。
+    // 抑制只影响 journal 维护，不影响 rows/removals 的重放与污染清理语义。
+    Index::ReplayJournalGuard replay_guard(docmap);
     // kDocmap 段应用。
     bool segments_ok = true;
     bool any = false;
@@ -461,7 +465,7 @@ DocmapLoadResult load_docmap(Index& docmap, std::string_view dir,
         } else if (r.type == static_cast<std::uint16_t>(
                                  sc::CkptSectionType::kDocmapMeta)) {
             // 延后到行段之后应用（不依赖段在文件里的先后）。meta 本就要
-            // 常驻进 meta_blobs_，整段读进来不额外抬峰值的量级。
+            // 常驻进 meta_（S42 live-only map），整段读进来不额外抬峰值的量级。
             auto ls = lc->load(r);
             if (!ls || !ls->crc_ok) { segments_ok = false; continue; }
             meta_ls = std::move(ls);

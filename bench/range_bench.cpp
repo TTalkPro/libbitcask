@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "bitcask/cask.hpp"
+#include "bitcask/index.hpp"  // S42：DocMap 内存探针（live-only gate 数据源）
 #include <bitcask/keydir_registry.hpp>
 
 namespace fs = std::filesystem;
@@ -462,3 +463,70 @@ static void BM_Cask_Get_ColdOki(benchmark::State& state) {
 BENCHMARK(BM_Cask_Get_ColdOki)
     ->Args({100000, 0})
     ->Args({100000, 1});
+
+// -----------------------------------------------------------------------------
+// S42：DocMap live-only 内存探针——gate 数据源（设计 §13.2/§16.3）。
+// 直接构造 index::Index（不经磁盘/KV 管线）：S42 改的就是这一层，
+// 隔离出纯 DocMap 的 RSS 增量口径。
+//   1) 热点覆盖写：1 key × Arg0 次覆盖 → rss_MB 应近似恒定
+//      （旧行为随历史 ord 展开约 53B/ord：1M 次 ≈ 50MiB+）。
+//   2) 低 churn 大 live set：Arg0 个不同 key 各写一次 → rss_B_per_live_doc
+//      即每 live doc 常驻字节（预期 100-160B 量级）。
+// -----------------------------------------------------------------------------
+namespace {
+
+bitcask::index::DocSlot docmap_probe_slot() {
+    return bitcask::index::DocSlot{
+        bitcask::index::DocLoc{.offset = 0, .file_id = 1, .total_sz = 64},
+        /*tstamp*/ 0, /*doc_len*/ 8};
+}
+
+}  // namespace
+
+static void BM_Docmap_HotOverwrite_MemProbe(benchmark::State& state) {
+    const std::uint64_t total = static_cast<std::uint64_t>(state.range(0));
+    bitcask::index::Index idx;
+    const auto slot = docmap_probe_slot();
+    const std::size_t rss0 = read_rss_kb();
+    for (std::uint64_t i = 0; i < total; ++i) {
+        idx.put_doc("hot-key", i, slot);
+    }
+    const std::size_t rss1 = read_rss_kb();
+    const double rss_mb =
+        static_cast<double>(rss1 > rss0 ? rss1 - rss0 : 0) / 1024.0;
+    state.counters["writes"] = static_cast<double>(total);
+    state.counters["live_docs"] = static_cast<double>(idx.live_docs());
+    state.counters["rss_MB"] = rss_mb;
+    state.counters["rss_B_per_write"] =
+        total > 0 ? rss_mb * 1024.0 * 1024.0 / static_cast<double>(total)
+                  : 0.0;
+    benchmark::DoNotOptimize(idx.live_docs());
+}
+BENCHMARK(BM_Docmap_HotOverwrite_MemProbe)
+    ->Arg(1000000)
+    ->Unit(benchmark::kMillisecond);
+
+static void BM_Docmap_LiveSet_MemProbe(benchmark::State& state) {
+    const std::uint64_t total = static_cast<std::uint64_t>(state.range(0));
+    bitcask::index::Index idx;
+    const auto slot = docmap_probe_slot();
+    const std::size_t rss0 = read_rss_kb();
+    std::string key;
+    for (std::uint64_t i = 0; i < total; ++i) {
+        key = "live-key-" + std::to_string(i);
+        idx.put_doc(key, i, slot);
+    }
+    const std::size_t rss1 = read_rss_kb();
+    const double rss_mb =
+        static_cast<double>(rss1 > rss0 ? rss1 - rss0 : 0) / 1024.0;
+    state.counters["live_docs"] = static_cast<double>(idx.live_docs());
+    state.counters["rss_MB"] = rss_mb;
+    state.counters["rss_B_per_live_doc"] =
+        total > 0 ? rss_mb * 1024.0 * 1024.0 / static_cast<double>(total)
+                  : 0.0;
+    benchmark::DoNotOptimize(idx.live_docs());
+}
+BENCHMARK(BM_Docmap_LiveSet_MemProbe)
+    ->Arg(100000)
+    ->Arg(1000000)
+    ->Unit(benchmark::kMillisecond);
