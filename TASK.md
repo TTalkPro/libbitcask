@@ -28,7 +28,7 @@
 | S42-2 | checkpoint 升序快照 + delta journal | ✅ done | `for_each_live(_in)/for_each_meta_in` 锁内 RowRef 排序回调；sidecar 格式零改动 |
 | S42-3 | recovery replay journal 抑制 | ✅ done | `Index::ReplayJournalGuard`（docmap_ckpt load + legacy_ckpt load） |
 | S42-4 | 回归与一致性测试 | ✅ done | index_test 改造 + 随机 reference-model 对拍 + 热点 overwrite 形态回归 |
-| S42-5 | benchmark gate 与 rollout | ✅ done | bench smoke 新基线（Put_Overwrite / BOW 查询 / Open_Snapshot）；正式 rollout/CHANGELOG 待版本发布 |
+| S42-5 | benchmark gate 与 rollout | ✅ done | 远端 9700X Release 基线 + rollout 报告（`docs/design/s42-rollout-bench-report-zh.md`）；随 6.8.1 发布 |
 | S42-6 | flat arrays 与 SIMD kernel 清理 | ✅ done | 删 `index_kernels.hpp` / `index_kernels_avx2.cpp` + CMake `bitcask_simd_tu` 条目 |
 
 ### 🔴 S42-1 — live-only 主结构替换（先行，纯内存侧）

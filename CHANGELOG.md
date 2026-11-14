@@ -5,12 +5,40 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.8.0`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.8.1`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
+
+---
+
+## [6.8.1] - 2026-11-14（S42：DocMap live-only store，内存随 live docs 而非历史写入增长）
+
+> **版本语义**：纯内部内存结构变更——公共 C++ / C API 与盘上格式零改动；
+> docmap checkpoint sidecar 格式逐字节兼容，旧数据目录无需 migration；
+> `SearchHit.ord` 仍为全局 LSN；`SOVERSION` 保持 `6`。取 PATCH +1（6.8.1）。
+
+### Changed
+
+- **DocMap Live-Only Store（S42）**：全局 DocMap 从「按历史 ord/LSN 展开的
+  chunks + 平坦 live/doc_lens/meta 数组」改为 `ext_id → 最新 ord` 主表加
+  「仅当前 live row 的稠密 map」。覆盖写与删除在写路径同步淘汰旧 `ord` 的
+  live row、meta 与 delta journal，不再等待 `compact_chunks()`。极端热点 key
+  覆盖写的 DocMap 常驻内存从 `O(total writes)` 降到 `O(live docs)`——远端
+  1M 次覆盖写、1 个 live doc 的 RSS 净增为 **0.0625 MiB**；100K/1M 低 churn
+  live set 分别约 **172.5B**、**169.5B/live doc**。
+  - 放弃全局 DocMap 层 SIMD live/doc-len gather：BM25 主评分路径早已使用段内
+    dense DocId 与段内 live checker，全局 DocMap 服务 KV 点查、ord/ext 翻译、
+    meta 过滤、结果物化与向量 callback。远端 Release 基线：KV 覆盖写
+    **578 ns/op**，单线程 BOW 查询 **3.74 µs/query**，快照开库 **2.335 ms**。
+  - checkpoint 写入时显式按 `ord` 升序提取；delta checkpoint 增加当前窗口
+    live journal，覆盖写淘汰旧 `ord`，热点 key 不会把 journal 写成
+    `O(writes)`。恢复重放期间抑制 journal 增长。`compact_chunks()` 成为兼容
+    no-op，相关 SIMD kernel 文件删除。
+  - 报告与远端基线见 `docs/design/s42-rollout-bench-report-zh.md`；
+    功能/内存语义见 `docs/design/s42-docmap-live-store-design-zh.md`。
 
 ---
 
