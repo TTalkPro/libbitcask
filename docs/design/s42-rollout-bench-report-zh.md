@@ -2,8 +2,8 @@
 
 > 日期：2026-11-14。被测提交：`2347cde`（S42 DocMap Live-Only Store）。
 > 结论：**通过 rollout gate**。热点覆盖写内存已经与历史写入量解耦；低 churn
-> live set 每文档约 162–170B，符合设计预期数量级；本次远端 Release 基线未见
-> 端到端热路径异常退化。
+> live set 每文档约 162–170B，符合设计预期数量级。发布前又补做同机 A/B：
+> 关键热路径无可观测退化，最大变化为 KV 覆盖写延迟 +0.41%。
 
 ## 1. 测试环境
 
@@ -50,23 +50,27 @@ RSS 页粒度；key 形态为 `live-key-<number>`。因此数值高于纯 `LiveR
 可接受；若后续要把低 churn 全量集再压低，方向是 key arena 与 row pool，而不是
 回退到按历史 LSN 展开的平坦数组。
 
-## 4. Release 性能基线
+## 4. Release 性能 A/B
 
-端到端基准使用 Google Benchmark `--benchmark_min_time=2s`。本次远端没有编译
-6.8.0 旧实现作同机 A/B，因此本节是 **6.8.1/S42 远端新基线**，不声明旧版本
-同机百分比收益。
+端到端基准使用 Google Benchmark `--benchmark_min_time=2s`。发布前补跑了同机
+A/B：6.8.0 基线取 `22d8a33`，S42 取 `2347cde`；两者均为
+g++ 14.2 / Release / LTO / performance governor，`--benchmark_min_time=2s`。
+每组为单进程连续采样，未做多次独立重复；下列百分比用于判断是否存在工程级
+退化，不作为精确统计结论。
 
-| 基准 | 结果 | 备注 |
-|---|---:|---|
-| `BM_Cask_Put_Overwrite` | **578 ns/op**，1.730M ops/s，211.2 MiB/s | KV 覆盖写热路径 |
-| `BM_Inverted_QueryThroughputBOW/threads:1` | **3.74 µs/query**，267.7k iter/s | 每线程每迭代口径；不是聚合 QPS |
-| `BM_Cask_Open_Snapshot` | **2.335 ms** | 20k key 快照开库 |
-| `BM_Cask_Open_FullFold` | **3.441 ms** | 快照删除后的全量 fold 对照 |
-| `BM_Checkpoint_KeydirSave/100000` | **0.141 ms**，708.9M items/s | KeyDir 快照保存 |
-| `BM_Checkpoint_KeydirLoad/100000` | **0.016 ms**，6.301G items/s | KeyDir 快照载入 |
+| 基准 | 6.8.0 | 6.8.1/S42 | 变化 |
+|---|---:|---:|---:|
+| `BM_Cask_Put_Overwrite` | 579.67 ns/op | 582.05 ns/op | **+0.41%**（吞吐 -0.41%） |
+| `BM_Inverted_QueryThroughputBOW/threads:1` | 3.748 µs/query | 3.725 µs/query | **-0.61%**（略快） |
+| `BM_Cask_Open_Snapshot` | 2344.85 µs | 2344.90 µs | **+0.00%** |
+| `BM_Cask_Open_FullFold` | 3427.79 µs | 3425.00 µs | **-0.08%**（略快） |
+| `BM_Checkpoint_KeydirSave/100000` | 0.14082 ms | 0.14194 ms | **+0.79%** |
+| `BM_Checkpoint_KeydirLoad/100000` | 0.015694 ms | 0.015809 ms | **+0.74%** |
 
-快照开库比全量 fold 快约 32%；`DocMap` live-only 化没有把 Cask 覆盖写、单线程
-BOW 查询或开库路径推入异常区间。上述数据作为后续同机对照基线。
+因此结论是：**关键热路径没有实质性能下降**。与 S42 直接相关的 KV 覆盖写最差
+只变化 +2.38 ns/op（+0.41%）；单线程 BOW 查询略快，开库两条路径基本持平。
+KeyDir checkpoint 的 +0.7%~0.8% 与本次 DocMap 改造无直接关系，且低于本
+benchmark 单次运行噪声口径。快照开库仍比全量 fold 快约 31.5%。
 
 ## 5. Gate 判断
 
@@ -75,8 +79,8 @@ BOW 查询或开库路径推入异常区间。上述数据作为后续同机对�
 | 功能正确性 | **通过** | 本地 Release/ASan/TSan 821/821；远端 Release 821/821 |
 | 热点覆盖写内存 | **通过** | 1M 写入、1 live doc，RSS 净增 0.0625MiB |
 | 低 churn live set | **通过** | 100K/1M 分别约 172.5B、169.5B/live doc |
-| 热路径性能 | **通过** | KV 覆盖写 578ns/op；单线程 BOW 查询 3.74µs/query |
-| 恢复/开库 | **通过** | Snapshot 2.335ms、FullFold 3.441ms；恢复测试全绿 |
+| 热路径性能 | **通过** | 同机 A/B：KV 覆盖写 +0.41%；单线程 BOW 查询 -0.61% |
+| 恢复/开库 | **通过** | Snapshot 基本持平、FullFold 略快；恢复测试全绿 |
 | 盘上兼容性 | **通过** | checkpoint/docmap 格式零改动；旧目录无 migration |
 
 ## 6. 运维语义
@@ -91,8 +95,12 @@ BOW 查询或开库路径推入异常区间。上述数据作为后续同机对�
 远端保留：
 
 ```text
+/mnt/storage/workspace/libbitcask/bench-results/6.8.0-baseline/perf.log
+/mnt/storage/workspace/libbitcask/bench-results/6.8.0-baseline/perf.json
 /mnt/storage/workspace/libbitcask/bench-results/6.8.1/perf.log
 /mnt/storage/workspace/libbitcask/bench-results/6.8.1/perf.json
+/mnt/storage/workspace/libbitcask/bench-results/6.8.1/perf-rerun.log
+/mnt/storage/workspace/libbitcask/bench-results/6.8.1/perf-rerun.json
 /mnt/storage/workspace/libbitcask/bench-results/6.8.1/docmap-probes.log
 /mnt/storage/workspace/libbitcask/bench-results/6.8.1/docmap-probes.json
 ```
