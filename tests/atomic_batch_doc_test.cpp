@@ -11,7 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <bitcask/cask.hpp>
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_registry.hpp>
 #include <bitcask/meta_codec.hpp>
 #include <bitcask/meta_file.hpp>
 #include <bitcask/txn.hpp>
@@ -27,8 +27,8 @@ namespace {
 namespace fs = std::filesystem;
 using namespace bitcask;
 
-keydir::KeyDirRegistry& test_registry() {
-    static keydir::KeyDirRegistry reg;
+bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 

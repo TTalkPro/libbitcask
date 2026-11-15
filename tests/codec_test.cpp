@@ -484,7 +484,6 @@ TEST(DocValue, QuantizedAcceptedAndUnknownSchemeRejected) {
 
 // ---------------------------------------------------------------------------
 // Layout constants are part of the on-disk contract.
-// （v2 定宽 hint 常量已随 S33 flag-day 删除——hint 仅 v5，见下方 HintRecordV5。）
 // ---------------------------------------------------------------------------
 TEST(Layout, ConstantsLocked) {
     EXPECT_EQ(format::kHeaderSize, 27u);  // 4+1+8+8+2+4
@@ -494,10 +493,6 @@ TEST(Layout, ConstantsLocked) {
     EXPECT_EQ(format::kOrdOffset, 13u);
     EXPECT_EQ(format::kKeySzOffset, 21u);
     EXPECT_EQ(format::kValueSzOffset, 23u);
-    EXPECT_EQ(format::kHintMagicV5, 0x35484342u);      // "BCH5" LE
-    EXPECT_EQ(format::kHintTrailerMagic, 0x45484342u); // "BCHE" LE
-    EXPECT_EQ(format::kHintHeader, 4u);
-    EXPECT_EQ(format::kHintTrailer, 8u);
     EXPECT_EQ(format::kMaxKeySize, 0xFFFFu);
     EXPECT_EQ(format::kMaxValueSize, 0xFFFFFFFFu);
     EXPECT_EQ(static_cast<std::uint8_t>(format::RecordType::kDoc), 0u);
@@ -675,122 +670,4 @@ TEST(MetaFilterCompileCheck, HeaderOnlyRoundtrip) {
     // 空 filter：恒 true。
     MetaFilter empty;
     EXPECT_TRUE(empty.evaluate(sp));
-}
-
-// ---------------------------------------------------------------------------
-// Hint record v5（S33 flag-day：vbyte + gap/ord 双差分；文件级布局见
-// format.hpp）。
-// ---------------------------------------------------------------------------
-namespace {
-std::string hint_key_str(std::span<const std::byte> k) {
-    return {reinterpret_cast<const char*>(k.data()), k.size()};
-}
-}  // namespace
-
-TEST(HintRecordV5, GoldenLayoutContiguous) {
-    std::vector<std::byte> out;
-    // 连续追加（offset == prev_end=0，ord=5 相对 prev_ord=0）：gap=0(1B) +
-    // total_sz=0x10(1B) + keysz<<1|0=4(1B) + ord_delta=5(1B) + tstamp 8B +
-    // "ab" = 14B。
-    std::uint64_t prev_end = 0, prev_ord = 0;
-    codec::encode_hint_record_v5(out, 0xDEADBEEF, 0x10, 0, false,
-                                 as_bytes("ab"), /*ord=*/5,
-                                 prev_end, prev_ord);
-    EXPECT_EQ(prev_end, 0x10u);
-    EXPECT_EQ(prev_ord, 5u);
-    auto expected = hex_to_bytes("80" "90" "84" "85"
-                                 "efbeadde00000000" "6162");
-    ASSERT_EQ(out.size(), expected.size());
-    EXPECT_EQ(bytes_to_hex(out), bytes_to_hex(expected));
-
-    std::uint64_t d_end = 0, d_ord = 0;
-    auto rec = codec::decode_hint_record_v5(out, d_end, d_ord);
-    ASSERT_TRUE(rec.has_value());
-    EXPECT_EQ(rec->tstamp, 0xDEADBEEFu);
-    EXPECT_EQ(rec->total_sz, 0x10u);
-    EXPECT_EQ(rec->offset, 0u);
-    EXPECT_EQ(rec->ord, 5u);
-    EXPECT_FALSE(rec->tombstone);
-    EXPECT_EQ(hint_key_str(rec->key), "ab");
-    EXPECT_EQ(rec->consumed, out.size());
-    EXPECT_EQ(d_end, 0x10u);
-    EXPECT_EQ(d_ord, 5u);
-}
-
-TEST(HintRecordV5, TombstoneBitAndGap) {
-    std::vector<std::byte> out;
-    // 非零 gap（offset=100, prev_end=64 → gap=36）+ tomb 位 + ord 差分。
-    std::uint64_t prev_end = 64, prev_ord = 41;
-    codec::encode_hint_record_v5(out, 7, 22, 100, true, as_bytes("k"),
-                                 /*ord=*/42, prev_end, prev_ord);
-    EXPECT_EQ(prev_end, 122u);
-    EXPECT_EQ(prev_ord, 42u);
-    std::uint64_t d_end = 64, d_ord = 41;
-    auto rec = codec::decode_hint_record_v5(out, d_end, d_ord);
-    ASSERT_TRUE(rec.has_value());
-    EXPECT_EQ(rec->offset, 100u);
-    EXPECT_EQ(rec->ord, 42u);
-    EXPECT_TRUE(rec->tombstone);
-    EXPECT_EQ(d_end, 122u);
-}
-
-TEST(HintRecordV5, WraparoundOffsetAndOrdRegression) {
-    // offset < prev_end / ord < prev_ord（merge 输出等场景不应出现，但语义
-    // 须无损）：u64 二补数回绕还原，正确性不依赖单调性。
-    std::vector<std::byte> out;
-    std::uint64_t prev_end = 100, prev_ord = 50;
-    codec::encode_hint_record_v5(out, 1, 8, /*offset=*/16, false,
-                                 as_bytes("x"), /*ord=*/3,
-                                 prev_end, prev_ord);
-    std::uint64_t d_end = 100, d_ord = 50;
-    auto rec = codec::decode_hint_record_v5(out, d_end, d_ord);
-    ASSERT_TRUE(rec.has_value());
-    EXPECT_EQ(rec->offset, 16u);
-    EXPECT_EQ(rec->ord, 3u);
-    EXPECT_EQ(d_end, 24u);
-    EXPECT_EQ(d_ord, 3u);
-}
-
-TEST(HintRecordV5, StreamRoundTripChainsDeltas) {
-    // 三条流式串联：offset 连续、ord 递增——差分状态跨条传递。
-    std::vector<std::byte> out;
-    std::uint64_t prev_end = 0, prev_ord = 0;
-    codec::encode_hint_record_v5(out, 1, 100, 0,   false, as_bytes("a"),
-                                 10, prev_end, prev_ord);
-    codec::encode_hint_record_v5(out, 2, 200, 100, true,  as_bytes("bb"),
-                                 11, prev_end, prev_ord);
-    codec::encode_hint_record_v5(out, 3, 300, 300, false, as_bytes("ccc"),
-                                 12, prev_end, prev_ord);
-
-    std::span<const std::byte> rest = out;
-    std::uint64_t d_end = 0, d_ord = 0;
-    auto r1 = codec::decode_hint_record_v5(rest, d_end, d_ord);
-    ASSERT_TRUE(r1);
-    rest = rest.subspan(r1->consumed);
-    auto r2 = codec::decode_hint_record_v5(rest, d_end, d_ord);
-    ASSERT_TRUE(r2);
-    rest = rest.subspan(r2->consumed);
-    auto r3 = codec::decode_hint_record_v5(rest, d_end, d_ord);
-    ASSERT_TRUE(r3);
-    rest = rest.subspan(r3->consumed);
-    EXPECT_TRUE(rest.empty());
-
-    EXPECT_EQ(r1->ord, 10u); EXPECT_EQ(r1->offset, 0u);
-    EXPECT_EQ(r2->ord, 11u); EXPECT_EQ(r2->offset, 100u);
-    EXPECT_TRUE(r2->tombstone);
-    EXPECT_EQ(r3->ord, 12u); EXPECT_EQ(r3->offset, 300u);
-}
-
-TEST(HintRecordV5, ShortBufferReturnsTooShort) {
-    std::vector<std::byte> out;
-    std::uint64_t prev_end = 0, prev_ord = 0;
-    codec::encode_hint_record_v5(out, 1, 30, 0, false, as_bytes("abc"),
-                                 7, prev_end, prev_ord);
-    for (std::size_t cut = 0; cut < out.size(); ++cut) {
-        std::uint64_t d_end = 0, d_ord = 0;
-        auto rec = codec::decode_hint_record_v5(
-            std::span<const std::byte>(out.data(), cut), d_end, d_ord);
-        ASSERT_FALSE(rec.has_value()) << "cut=" << cut;
-        EXPECT_EQ(rec.error(), codec::DecodeError::kBufferTooShort);
-    }
 }

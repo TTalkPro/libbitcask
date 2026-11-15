@@ -20,11 +20,11 @@
 
 namespace bitcask {
 
-// P14a:恢复 checkpoint 文件名(目录级,与 bitcask.meta 同级)。命名契约
+// P14a:搜索 checkpoint 文件名(目录级,与 bitcask.meta 同级)。命名契约
 // {kv|search}.{组件}.{ckpt|seg|wal|manifest},见
 // doc/recovery-unified-checkpoint-design-zh.md §3。后缀 .ckpt = 可 fold
 // 重建的 checkpoint(纯优化);缺失/损坏时首次 open 走全量 fold 重建。
-inline constexpr const char* kKeydirSnapName = "kv.keydir.ckpt";
+// KV 权威不再有同名旧快照：kv.oki.manifest + kv.oki.seg-* 是唯一提交集。
 // P14e:搜索索引统一分段 checkpoint（docmap/bm25/hnsw 单文件，逐段 CRC）。
 inline constexpr const char* kSearchCkptName = "search.ckpt";
 // S17-2:per-component 段文件名（docmap.ckpt / bm25.ckpt / vec.ckpt）。

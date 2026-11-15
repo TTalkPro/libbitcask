@@ -5,10 +5,12 @@
 // v1 条目只存 (key, ord, tomb)——range 查询逐 key 回查哈希 keydir 取权威
 // 位置。**v2（S36 Level B，doc/keydir-disk-resident-design-zh.md §4）条目
 // 可携全字段位置**（file_id/total_sz/offset/tstamp），并内嵌 bloom——
-// 组合视图点查的权威载体。v1/v2 读端都支持；写端按 create 的 version 定。
+// 组合视图点查的权威载体。v3（S43-1，D2 §4-C）在 v2 行格式上为每个数据
+// 块追加独立 CRC32：开库只校验 header/索引/bloom/元数据 CRC，数据块延迟
+// 到首读时校验。v1/v2/v3 读端都支持；v1/v2 保持 eager 整文件 CRC。
 //
 // 磁盘布局（全小端）：
-//   header  8B: magic "BCOK" u32 | version u32 = 1 或 2
+//   header  8B: magic "BCOK" u32 | version u32 = 1、2 或 3
 //   数据块区（块目标 ~4KiB，块界由稀疏索引给出；**每块解码状态复位**
 //   prev_key="" / prev_ord=0 / prev_tstamp=0，块首条自然退化为全量值）：
 //     每条: [vbyte shared_len][vbyte suffix_len][suffix]
@@ -16,16 +18,17 @@
 //     v2 且 flags.bit1(has_loc) 时追加:
 //           [vbyte file_id][vbyte total_sz][vbyte offset]
 //           [vbyte tstamp_delta(回绕相对 prev_tstamp)]
-//     flags: bit0 = tomb；bit1 = has_loc（仅 v2；墓碑行免位置字段）；
+//     flags: bit0 = tomb；bit1 = has_loc（v2+；墓碑行免位置字段）；
 //     其余位保留，读端遇未知位 fail-fast（kCorrupt → 整个 run 弃用重建）。
 //   稀疏索引区: [count u32] + count × { [vbyte klen][块首 key][block_off u64] }
-//   bloom 区（仅 v2）: [n_bits u64][k u8][位数组 ceil(n_bits/8) 字节]
+//     v3 每条追加 [block_crc u32]。
+//   bloom 区（v2/v3）: [n_bits u64][k u8][位数组 ceil(n_bits/8) 字节]
 //     稳定哈希（FNV-1a64 + splitmix64 双哈希），持久化格式的一部分。
-//   trailer: v1 24B [entry_count u64][index_off u64][crc u32][magic "BCOE"]
-//            v2 32B [entry_count u64][index_off u64][bloom_off u64][crc][magic]
-//     CRC 覆盖 [0, size-8)（即除 crc 与尾 magic 外全部字节）。
+//   trailer: v1/v2 24/32B
+//            [entry_count u64][index_off u64][(v2+) bloom_off u64][crc][magic]
+//     v1/v2 CRC 覆盖 [0, size-8)；v3 CRC 覆盖小区域元数据（不含数据块）。
 //
-// 有序 key 的公共前缀差分对 `prefix:id` 形态收益显著；ord 差分同 hint v5
+    // 有序 key 的公共前缀差分对 `prefix:id` 形态收益显著；ord 差分沿用
 // 的回绕语义（正确性不依赖单调性）。
 //
 // manifest（`kv.oki.manifest`，"BCOM" v1）是 OKI 的**唯一 commit point**：
@@ -64,6 +67,7 @@ inline constexpr std::uint32_t kRunMagic        = 0x4B4F4342;  // "BCOK" LE
 inline constexpr std::uint32_t kRunTrailerMagic = 0x454F4342;  // "BCOE" LE
 inline constexpr std::uint32_t kRunVersion      = 1;
 inline constexpr std::uint32_t kRunVersion2     = 2;   // S36-1：全字段 + bloom
+inline constexpr std::uint32_t kRunVersion3     = 3;   // S43-1：per-block CRC
 inline constexpr std::size_t   kRunHeaderSize   = 8;
 inline constexpr std::size_t   kRunTrailerSize  = 24;   // v1
 inline constexpr std::size_t   kRunTrailerSizeV2 = 32;  // v2（+bloom_off u64）
@@ -76,6 +80,10 @@ inline constexpr std::uint32_t kManifestVersion2 = 2;  // S36-1：条目带 form
 // Level B 写者维护，run 内位置字段可信」的模式戳；Level B 开启对未带戳
 // 的目录必须全量重建起步，Level A 写者 open 时清戳）。
 inline constexpr std::uint32_t kManifestVersion3 = 3;
+// S43-2：v3 布局 + 结构化全局/文件元数据段。v4 是索引元数据迁移到
+// OKI 提交点的第一步；旧 v3 读端拒收新 manifest 后只能重建，因此写端
+// 在元数据首次可用时才升 v4，读端则同时支持 v1/v2/v3/v4。
+inline constexpr std::uint32_t kManifestVersion4 = 4;
 inline constexpr char kManifestName[] = "kv.oki.manifest";
 
 // flags 位。v1 只认 bit0；v2 认 bit0|bit1；其余位保留，读端遇未知位
@@ -195,8 +203,8 @@ inline constexpr std::size_t kDefaultBlockCacheBytes = 256u << 20;
 class OkiRunWriter {
 public:
     // block_target：数据块目标字节数（超过即封块）。测试用小值逼出多块。
-    // version：kRunVersion（v1，行不带位置）或 kRunVersion2（全字段+bloom）。
-    // expected_entries：v2 bloom 预估容量（bloom 需先定尺寸再流式置位；
+    // version：v1（无位置）；v2（全字段+bloom）；v3（v2 + per-block CRC）。
+    // expected_entries：v2/v3 bloom 预估容量（bloom 需先定尺寸再流式置位；
     // 实际条数超出仅推高误判率，不影响正确性——0 = 最小 bloom）。
     [[nodiscard]] static std::expected<OkiRunWriter, OkiError>
     create(std::string path, std::size_t block_target = kDefaultBlockBytes,
@@ -210,7 +218,7 @@ public:
     ~OkiRunWriter() = default;
 
     // key 必须严格大于上一条（升序、去重由上游负责）；违反返回 kOutOfOrder。
-    // loc：v2 位置字段（v1 传非空 → kBadState；v2 传空 = 免位置行，如墓碑）。
+    // loc：v2+ 位置字段（v1 传非空 → kBadState；v2/v3 传空 = 免位置行）。
     [[nodiscard]] std::expected<void, OkiError>
     add(std::span<const std::byte> key, std::uint64_t ord, bool tomb,
         const RowLoc* loc = nullptr);
@@ -227,7 +235,7 @@ private:
     OkiRunWriter(detail::AtomicFileWriter&& w, std::size_t block_target,
                  std::uint32_t version, std::uint64_t expected_entries)
         : w_(std::move(w)), block_target_(block_target), version_(version) {
-        if (version_ == kRunVersion2) init_bloom(expected_entries);
+        if (version_ != kRunVersion) init_bloom(expected_entries);
     }
 
     void init_bloom(std::uint64_t expected_entries);
@@ -238,6 +246,8 @@ private:
     struct IndexEntry {
         std::string first_key;
         std::uint64_t off = 0;
+        // 仅 v3 落盘；v1/v2 恒 0。
+        std::uint32_t crc = 0;
     };
 
     detail::AtomicFileWriter w_;
@@ -261,8 +271,8 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Reader：open 时全文件 CRC 校验（run 是派生缓存，eager 校验换绝对安全；
-// 大 run 的惰性/分块校验属后续优化）+ 稀疏索引载入内存。
+// Reader：v1/v2 open 时全文件 CRC 校验；v3 open 只校验小区域元数据，
+// 数据块 CRC 由 Cursor::load_block 两条加载路径在首读时校验。
 // ---------------------------------------------------------------------------
 class OkiRunReader {
 public:
@@ -279,7 +289,7 @@ public:
         std::string   key;   // cursor 拥有的重建缓冲（跨 next 复用）
         std::uint64_t ord = 0;
         bool          tomb = false;
-        // S36-1：v2 全字段（has_loc=false 时 loc 无意义；v1 行恒 false）。
+        // S36-1：v2+ 全字段（has_loc=false 时 loc 无意义；v1 行恒 false）。
         bool          has_loc = false;
         RowLoc        loc{};
     };
@@ -335,7 +345,7 @@ public:
         return blocks_.size();
     }
     [[nodiscard]] std::uint32_t version() const noexcept { return version_; }
-    // v2：bloom 试探（false = 必不存在；true = 可能存在）。v1 恒 true。
+    // v2/v3：bloom 试探（false = 必不存在；true = 可能存在）。v1 恒 true。
     [[nodiscard]] bool may_contain(std::span<const std::byte> key) const noexcept;
 
 private:
@@ -350,6 +360,8 @@ private:
         std::string   first_key;
         std::uint64_t off = 0;
         std::uint64_t end = 0;  // 下块 off 或 index_off
+        // 仅 v3 有效；加载块后与块字节 CRC 比对。
+        std::uint32_t crc = 0;
     };
 
     mutable io::PosixFile file_;  // pread 线程安全、无共享游标
@@ -430,9 +442,50 @@ private:
 struct OkiManifestEntry {
     std::uint64_t gen = 0;        // run 文件代号（kv.oki.seg-<gen>）
     std::uint64_t cover_ord = 0;  // 该 run 的覆盖上界（**排他**：run 内最大 ord + 1）
-    // S36-1：run 格式版本（1/2）。写端惰性选 manifest 版本：全 v1 → BCOM v1
-    //（老读端可读）；含 v2 → BCOM v2（老读端拒收 → 弃用重建，自愈）。
+    // run 格式版本（1/2/3）。写端惰性选 manifest 版本：全 v1 → BCOM v1
+    //（老读端可读）；含 v2/v3 → BCOM v2+（老读端拒收 → 弃用重建，自愈）。
     std::uint8_t  format_ver = 1;
+};
+
+// S43-2：随 BCOM v4 原子提交的索引权威派生元数据快照。
+//
+// 这是提交点上的绝对值，不是运行期热路径缓存。next_ord 允许大于 wm：
+// wm 只表示 runs 已覆盖到的 LSN 下界，memdelta/tail 中的行仍属于同一
+// 提交快照。next_file_id 显式建模为 biggest_file_id 的下一个分配值。
+// oldest_tstamp=0 表示没有 live key；oldest=0 且 newest!=0 是非法快照。
+struct OkiManifestMetadata {
+    std::uint64_t next_ord = 0;
+    std::uint32_t biggest_file_id = 0;
+    std::uint32_t next_file_id = 0;
+    std::uint64_t active_keys = 0;
+    std::uint64_t live_bytes = 0;
+    std::uint64_t oldest_tstamp = 0;
+    std::uint64_t newest_tstamp = 0;
+    // 版本演进保留位：读写端都必须要求 0，避免静默复用语义。
+    std::uint64_t reserved = 0;
+    bool operator==(const OkiManifestMetadata&) const = default;
+};
+
+// 定长 64B：4B file_id + 1B pending_delete + 3B pad + 7×8B 统计。
+// expiration_epoch 沿用 BCKS 语义（kMaxEpoch = 无 pending delete）。
+struct OkiManifestFStats {
+    std::uint32_t file_id = 0;
+    bool pending_delete = false;
+    std::uint64_t live_keys = 0;
+    std::uint64_t total_keys = 0;
+    std::uint64_t live_bytes = 0;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t oldest_tstamp = 0;
+    std::uint64_t newest_tstamp = 0;
+    std::uint64_t expiration_epoch = ~std::uint64_t{0};
+    bool operator==(const OkiManifestFStats&) const = default;
+};
+
+// S43-2：caller 在写者静止点捕获的完整 v4 元数据；OkiState 只透传，
+// 不在 flush/rebuild 内部自己感知 IndexAuthority。
+struct OkiCommitSnapshot {
+    OkiManifestMetadata metadata;
+    std::vector<OkiManifestFStats> fstats;
 };
 
 struct OkiManifest {
@@ -443,6 +496,15 @@ struct OkiManifest {
     std::uint64_t wm = 0;
     // S36-4：Level B 模式戳（BCOM v3；见 kManifestVersion3 注释）。
     bool level_b = false;
+    // S43-2：v4 才落盘；v1-v3 双读时保持 nullopt，由 caller 迁移计算。
+    std::optional<OkiManifestMetadata> metadata;
+    std::vector<OkiManifestFStats> fstats;
+    // S43-3：各 data file 的已提交字节水位（file_id → 排他 EOF）。这是
+    // 「ord 水位 wm」在物理 data 文件上的落点：tail replay 直接从该字节
+    // 之后 fold，不再为找出 ord>=wm 的尾部而读全库。旧 v4 manifest 没有
+    // 本段时为空——recovery 退化为全量 data 扫描 + ord 门，方向仍安全。
+    // v1-v3 恒为空。
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> data_wms;
 };
 
 // 唯一 commit point：atomic_write_bytes(fsync_dir=true)。

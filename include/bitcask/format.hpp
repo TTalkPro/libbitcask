@@ -54,7 +54,7 @@ enum class RecordType : std::uint8_t {
     // span_bytes 字节」为一个原子批；成员是普通 kDoc/kTombstone 记录。
     // 声明区间完整且逐条 CRC 有效 ⟺ 批已提交；否则 fold 的
     // last_valid_end 停在批头起点（整批不可见，恢复截断）。
-    // 批头永不进入 keydir/hint。含此类型的目录 meta ≥ v6（懒升级门禁，
+    // 批头永不进入 keydir。含此类型的目录 meta ≥ v6（懒升级门禁，
     // 旧读端对未知 type 盲转会误读，必须拒开）。
     kBatchHeader = 2,
 };
@@ -68,29 +68,6 @@ enum class RecordType : std::uint8_t {
 // ---------------------------------------------------------------------------
 inline constexpr std::uint8_t kBatchHeaderVersion   = 1;
 inline constexpr std::size_t  kBatchHeaderValueSize = 13;  // 1 + 4 + 8
-
-// ---------------------------------------------------------------------------
-// hint 文件 v5 布局（S33 flag-day：v4 变长格式 + 记录内嵌 ord）：
-//   [0..3]           magic "BCH5"
-//   记录流（变长）    [vbyte gap][vbyte total_sz][vbyte keysz<<1|tomb]
-//                    [vbyte ord_delta][tstamp u64 小端][key]
-//   [size-8..size-1] trailer: magic "BCHE" u32 + running_crc u32
-//                    （CRC 覆盖 [0, size-8)，含文件头与全部记录字节）
-// gap = offset − prev_end（prev_end = 上条 offset+total_sz，首条为 0）；
-// ord_delta = ord − prev_ord（prev_ord = 上条 ord，首条为 0）。二者均经
-// u64 二补数回绕无损还原，正确性**不依赖**单调性/连续性假设；正常 append
-// 序 gap==0（1 字节）、ord 递增（ord_delta 1-2 字节），典型记录 ~13-15B。
-// v5 使 hint 快路径恢复与 fold(data) 完全等价（ord 不再丢失，v4 时代 hint
-// 路径 ord 恒 0 的怪癖随之消除），也是 OKI（S33）tail 重放的前提。
-// 兼容：写端恒 v5；读端仅 v5——BCH4 及更早视作校验失败退 fold(data)
-// 重建（hint 是派生缓存），纪元硬门禁在 bitcask.meta v5（meta_file.cpp）。
-// 设计见 doc/ordered-key-index-design-zh.md §3.4。
-// ---------------------------------------------------------------------------
-inline constexpr std::uint32_t kHintMagicV5     = 0x35484342;  // "BCH5" LE
-inline constexpr std::uint32_t kHintMagicV4     = 0x34484342;  // "BCH4" LE（仅旧纪元识别/拒收）
-inline constexpr std::uint32_t kHintTrailerMagic = 0x45484342;  // "BCHE" LE
-inline constexpr std::size_t   kHintHeader       = 4;
-inline constexpr std::size_t   kHintTrailer      = 8;
 
 // ---------------------------------------------------------------------------
 // kDoc value 打包布局（写在 kDoc record 的 VALUE 段）。设计见 §2.4。
@@ -140,9 +117,7 @@ inline constexpr std::uint8_t kFlagHasExpiry    = 0x20;
 inline constexpr std::uint8_t kQuantizedVersion = 1;
 
 // ---------------------------------------------------------------------------
-// hint 文件的 CRC chunk 大小（解析时做合理性边界检查）。
-// hint 末尾 EOF sentinel 的 TotalSz 字段实际放的是 running CRC，参见
-// codec.cpp::encode_hint_eof / decode_hint_record。
+// 流式文件读取的 CRC/chunk 合理性边界。
 // ---------------------------------------------------------------------------
 inline constexpr std::size_t kChunkSize = 65535;
 inline constexpr std::size_t kMinChunkSize = 1024;

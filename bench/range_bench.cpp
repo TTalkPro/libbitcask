@@ -1,14 +1,15 @@
 // S33-1：Range/prefix 扫描基线基准——OKI（有序 key 索引）落地前的现状锚点。
 //
-// 现状：keydir 是哈希表，CaskIter::start(key_prefix) 是 O(全表) 过滤
-// （cask.hpp 头注释自承：省的是 value 读取与跨界拷贝，扫描本身仍全表）。
+// 历史现状：旧哈希表的 CaskIter::start(key_prefix) 是 O(全表) 过滤
+// （省的是 value 读取与跨界拷贝，扫描本身仍全表）。S43-9 后基线保留，
+// 用于对比 OKI-only 的 seek + 有序归并。
 // 证据形态：固定总 key 数、把选择性从 1/16 收窄到 1/256，耗时应基本持平
 // （匹配数降 16 倍而时间不降 = 全表扫描）。
 // S33-5 的 make_range_iter 落地后在同参数下对比，预期改善一个数量级以上，
 // 且耗时随选择性线性下降。
 //
-// 另含 BM_KeyDir_MemProbe：S33-1 内存估算探针的数字锚点（Level B 门禁数据
-// 口径演示；真实决策数据须在生产规模负载上取）。
+// 内存探针注释保留 S33-1 的历史数字锚点口径；真实决策数据须在生产
+// 规模负载上取。
 
 #include <benchmark/benchmark.h>
 
@@ -20,13 +21,14 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <malloc.h>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "bitcask/cask.hpp"
 #include "bitcask/index.hpp"  // S42：DocMap 内存探针（live-only gate 数据源）
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_registry.hpp>
 
 namespace fs = std::filesystem;
 using bitcask::Cask;
@@ -34,8 +36,8 @@ using bitcask::CaskOptions;
 
 namespace {
 
-inline bitcask::keydir::KeyDirRegistry& test_registry() {
-    static bitcask::keydir::KeyDirRegistry reg;
+inline bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 
@@ -288,7 +290,7 @@ static void BM_Oki_MemProbe(benchmark::State& state) {
             }
         }
         // 阶段 1：memdelta 驻留（尚未 flush——阈值是 1M 行 / 64MiB）。
-        auto& oki = cask.keydir().oki();
+        auto& oki = cask.index_authority().state();
         delta_rows  = static_cast<double>(oki.delta_rows());
         delta_bytes = static_cast<double>(oki.delta_bytes());
         const std::size_t rss1 = read_rss_kb();
@@ -346,41 +348,69 @@ static void BM_Oki_MemProbe(benchmark::State& state) {
         total > 0 ? run_bytes / static_cast<double>(total) : 0.0;
     state.counters["rebuild_peak_rss_MB"] = rebuild_peak_mb;
 }
-BENCHMARK(BM_Oki_MemProbe)->Arg(100000)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_Oki_MemProbe)
+    ->Arg(100000)
+    ->Arg(1000000)
+    ->Unit(benchmark::kMillisecond);
 
-// -----------------------------------------------------------------------------
-// S33-1 内存估算探针锚点：填 Arg0 个 key 后跑一次 key_length_histogram()，
-// 把估算字节数写进 counter（本身也顺带量了探针的遍历耗时）。
-// -----------------------------------------------------------------------------
-static void BM_KeyDir_MemProbe(benchmark::State& state) {
+// S43-10：健康 manifest 开库 RSS 探针。与最坏 rebuild 分开：构造完成后
+// 释放构造态堆页，重复 open/close 只取进程 RSS 差值；不要求 allocator 把
+// 所有缓存归还 OS，因此这是“常驻上界”，不是精确索引字节。
+static void BM_Oki_OpenRssProbe(benchmark::State& state) {
     const int total = static_cast<int>(state.range(0));
     TempDir td;
-    auto c = Cask::open(td.path(), rw_opts(), &test_registry());
-    if (!c) { state.SkipWithError("Cask::open failed"); return; }
-    auto& cask = **c;
-
     const std::string value(64, 'v');
-    for (int i = 0; i < total; ++i) {
-        if (!cask.put(as_bytes(mk_key(i % 16, i)), as_bytes(value))) {
-            state.SkipWithError("populate put failed");
+    {
+        auto c = Cask::open(td.path(), rw_opts(), &test_registry());
+        if (!c) { state.SkipWithError("Cask::open failed"); return; }
+        auto& cask = **c;
+        for (int i = 0; i < total; ++i) {
+            if (!cask.put(as_bytes(mk_key(i % 16, i)), as_bytes(value))) {
+                state.SkipWithError("populate put failed");
+                return;
+            }
+        }
+        if (!cask.checkpoint()) {
+            state.SkipWithError("checkpoint failed");
             return;
         }
+        cask.close();
     }
 
-    bitcask::keydir::KeyDir::KeyLenHistogram h;
+    double rss_delta_mb = 0, open_ms = 0;
     for (auto _ : state) {
-        h = cask.keydir().key_length_histogram();
-        benchmark::DoNotOptimize(h);
+        state.PauseTiming();
+#if defined(__GLIBC__)
+        ::malloc_trim(0);  // 只为让 RSS 差值排除构造态归还延迟。
+#endif
+        const long rss_before = static_cast<long>(read_rss_kb());
+        const auto begin = std::chrono::steady_clock::now();
+        state.ResumeTiming();
+
+        auto c = Cask::open(td.path(), rw_opts(), &test_registry());
+
+        state.PauseTiming();
+        const auto end = std::chrono::steady_clock::now();
+        if (!c) { state.SkipWithError("snapshot open failed"); return; }
+        const long rss_after = static_cast<long>(read_rss_kb());
+        rss_delta_mb =
+            static_cast<double>(rss_after - rss_before) / 1024.0;
+        open_ms = std::chrono::duration<double, std::milli>(end - begin)
+                      .count();
+        state.counters["open_rss_MB"] = rss_delta_mb;
+        state.counters["open_ms"] = open_ms;
+        state.counters["open_rss_B_per_key"] =
+            total > 0 ? rss_delta_mb * 1024.0 * 1024.0 /
+                            static_cast<double>(total)
+                      : 0.0;
+        (*c)->close();
+        state.ResumeTiming();
     }
-    state.counters["est_MB"] =
-        static_cast<double>(h.estimated_bytes) / (1024.0 * 1024.0);
-    state.counters["B_per_key"] =
-        h.total > 0 ? static_cast<double>(h.estimated_bytes) /
-                          static_cast<double>(h.total)
-                    : 0.0;
-    cask.close();
 }
-BENCHMARK(BM_KeyDir_MemProbe)->Arg(100000)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_Oki_OpenRssProbe)
+    ->Arg(100000)
+    ->Arg(1000000)
+    ->Unit(benchmark::kMillisecond);
 
 // ============================================================================
 // S36-3：冷/热 get 锚点（设计 §2 预算门：热 ≤3%、冷 P99 ≤300µs SSD；
@@ -390,7 +420,7 @@ BENCHMARK(BM_KeyDir_MemProbe)->Arg(100000)->Unit(benchmark::kMillisecond);
 namespace {
 
 // 共享装配：100k key（"g%06d"，11B 内）× 64B 值 → checkpoint 固化 v2 run。
-// 返回打开的 Cask；caller 决定是否逐出。
+// 返回打开的 Cask。
 std::unique_ptr<Cask> setup_get_bench_cask(const TempDir& td, int nkeys) {
     CaskOptions o;
     o.read_write = true;
@@ -413,10 +443,8 @@ std::unique_ptr<Cask> setup_get_bench_cask(const TempDir& td, int nkeys) {
 // （热 get 锚点复用 cask_bench.cpp 既有 BM_Cask_Get_Hot(_View)——S36-3
 // 回归门 ≤3% 以它 A/B。）
 
-// 冷 get：全部 key 逐出，get 走组合视图（memdelta miss → run bloom/稀疏
-// 索引二分 → 块读 → 值 pread）。轮转 100k key ⟹ 4096 槽频度门指纹恒被
-// 冲刷 → 几乎零回填，哈希持续冷（这正是门的设计行为：扫描型负载不污染
-// 缓存）。arg1: 0 = 块缓存关（真·每次 2 pread），1 = 默认 256MB 块缓存
+// OKI 冷点查：每次都走 run bloom/稀疏索引二分 → 块读 → 值 pread。
+// arg1: 0 = 块缓存关（真·每次 2 pread），1 = 默认 256MB 块缓存
 // （100k×64B 库的 run 块全驻留 → 稳态块零 IO，只剩值 pread）。
 // counters: p50/p99（µs，样本 = 每次 get 的墙钟）。
 static void BM_Cask_Get_ColdOki(benchmark::State& state) {
@@ -425,17 +453,9 @@ static void BM_Cask_Get_ColdOki(benchmark::State& state) {
     TempDir td;
     auto c = setup_get_bench_cask(td, nkeys);
     if (!c) { state.SkipWithError("setup failed"); return; }
-    auto& kd = c->keydir();
-    kd.oki().enable_point_query();  // Level B 点查（不开影子——bench 纯净）
-    kd.oki().reset_block_cache_capacity(block_cache ? (256u << 20) : 0);
-    for (int i = 0; i < nkeys; ++i) {
-        char kb[16];
-        std::snprintf(kb, sizeof(kb), "g%06d", i);
-        if (!kd.evict(std::string_view(kb))) {
-            state.SkipWithError("evict failed");
-            return;
-        }
-    }
+    auto& oki = c->index_authority().state();
+    oki.enable_point_query();  // Level B 点查
+    oki.reset_block_cache_capacity(block_cache ? (256u << 20) : 0);
 
     std::vector<double> samples_us;
     samples_us.reserve(1u << 20);

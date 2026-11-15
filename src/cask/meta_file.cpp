@@ -49,9 +49,9 @@ inline constexpr std::uint8_t kMetaTailVersion = 1;
 
 // v1 = 大端纪元(legacy);v2 = 小端 flag-day 起;v3(S12) = 加 CRC32 校验和;
 // v4 = record 时间戳 u64 flag-day（data header 27B / hint BCH4 / doc value v4）;
-// v5 = hint BCH5 flag-day（S33：hint 记录内嵌 ord;data/DocValue 布局与 v4
-// 完全相同,仅 hint 与本门禁变更,离线迁移 `bitcask_migrate hintord` 只重写
-// hint + meta——data 一字节不动）;
+// v5 = BCH5 hint 纪元（S33：hint 记录内嵌 ord;data/DocValue 布局与 v4
+// 完全相同,仅本门禁变更,离线迁移 `bitcask_migrate hintord` 只重写
+// meta——data 一字节不动;S43-8 起 hint 停写并在可写开库清理）;
 // v6 = S35 原子批纪元（**懒升级**：目录可能含 kBatchHeader 记录;与 v5 的
 // 差异仅此一点,首次 put_batch_atomic 前由引擎重写 meta——从不用批的目录
 // 永远停留 v5,保守纪元标记。设计 doc/atomic-batch-design-zh.md §2）。
@@ -63,7 +63,7 @@ inline constexpr std::uint8_t kMetaVersion = 5;
 inline constexpr std::uint8_t kMetaVersionBatch = 6;  // S35 原子批纪元
 inline constexpr char kMetaMagic[kMetaMagicSize + 1] = "BCME";
 
-// header 前 kMetaCrcCoverLen 字节的 CRC32（与 data/hint/field.schema 同多项式）。
+// header 前 kMetaCrcCoverLen 字节的 CRC32（与 data/field.schema 同多项式）。
 inline std::uint32_t meta_crc(const char* header) {
     return codec::crc32(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(header), kMetaCrcCoverLen));
@@ -119,7 +119,7 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
         return std::unexpected(MetaError{0,
             "ord-less-hint era format (meta v4); "
             "run `bitcask_migrate hintord <src> <dst>` to migrate "
-            "(data files are copied unchanged; only hints + meta rewritten)"});
+            "(data files are copied unchanged; only meta is rewritten)"});
     }
     if (ver != kMetaVersion && ver != kMetaVersionBatch) {
         return std::unexpected(MetaError{0, "unsupported meta version"});

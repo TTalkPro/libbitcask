@@ -1,7 +1,7 @@
 // CRC32 IEEE 802.3 micro-benchmark — zlib ::crc32() vs bitcask::hw::crc32().
 //
 // Scenarios: 23, 256, 4096, 65536 bytes. Covers the on-disk hot path
-// (data records ~16..512 B, hint record payloads up to 64 KiB, scanner
+// (data records ~16..512 B, WAL frames up to 64 KiB, scanner
 // reads aggregating many KiB at a time).
 //
 // Run:  ./bitcask_bench --benchmark_filter=Crc32
@@ -160,7 +160,7 @@ BENCHMARK(BM_Crc32_Hw)
     ->Arg(4096)
     ->Arg(65536);
 
-// Streaming variant — matches the hint file trailer / WAL framing pattern
+// Streaming variant — matches file-trailer / WAL framing patterns
 // (running CRC across many small appends).
 static void BM_Crc32_Hw_Streaming(benchmark::State& state) {
     const std::size_t len = static_cast<std::size_t>(state.range(0));

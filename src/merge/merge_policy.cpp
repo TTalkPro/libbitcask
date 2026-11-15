@@ -6,7 +6,8 @@
 
 namespace bitcask::merge {
 
-FileStatus summarize(std::string_view dirname, const keydir::FStatsEntry& f) {
+template <typename FStats>
+FileStatus summarize_impl(std::string_view dirname, const FStats& f) {
     FileStatus s;
     s.file_id          = f.file_id;
     s.filename         = fileops::mk_data_filename(dirname, f.file_id);
@@ -27,6 +28,11 @@ FileStatus summarize(std::string_view dirname, const keydir::FStatsEntry& f) {
         s.fragmented = 0;
     }
     return s;
+}
+
+FileStatus summarize(std::string_view dirname,
+                     const oki::OkiManifestFStats& f) {
+    return summarize_impl(dirname, f);
 }
 
 namespace {
@@ -114,7 +120,7 @@ Decision decide(const std::vector<FileStatus>& summary,
             return any_trigger_fires(f, opts, cuts.trigger_cutoff);
         });
     // V4:索引删除率触发(全局信号)。纯函数契约不变,信号作为 int 入参
-    // 由 caller 算好后传进来——此函数仍不依赖 Index/KeyDir。
+    // 由 caller 算好后传进来——此函数仍不依赖 IndexAuthority。
     if (!any && opts.deletion_rate_trigger > 0 &&
         dead_doc_rate >= opts.deletion_rate_trigger) {
         any = true;

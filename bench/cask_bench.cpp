@@ -12,11 +12,12 @@
 #include <filesystem>
 #include <random>
 #include <string>
+#include <chrono>
 #include <vector>
 #include <utility>
 
 #include "bitcask/cask.hpp"
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_registry.hpp>
 
 namespace fs = std::filesystem;
 using bitcask::Cask;
@@ -27,8 +28,8 @@ namespace {
 // S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
 // 各用例用唯一目录名，互不冲突；同用例内 open→close→reopen 经 refcount 归零
 // 重新从盘加载，与旧 nullptr 行为等价。
-inline bitcask::keydir::KeyDirRegistry& test_registry() {
-    static bitcask::keydir::KeyDirRegistry reg;
+inline bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 
@@ -68,10 +69,12 @@ static void BM_Cask_Put_Overwrite(benchmark::State& state) {
     if (!c) state.SkipWithError("Cask::open failed");
     auto& cask = **c;
 
-    constexpr int kKeyspace = 1024;
+    // S43-5：1024 是稳态热覆盖锚点；100k 保留同一个均匀写 gate 的
+    // run 态 OKI probe 形态（每 put 一次，不是热哈希捷径）。
+    const std::size_t kKeyspace = static_cast<std::size_t>(state.range(0));
     std::vector<std::string> keys;
     keys.reserve(kKeyspace);
-    for (int i = 0; i < kKeyspace; ++i) {
+    for (std::size_t i = 0; i < kKeyspace; ++i) {
         keys.push_back("k" + std::to_string(i));
     }
 
@@ -82,7 +85,7 @@ static void BM_Cask_Put_Overwrite(benchmark::State& state) {
     }
 
     std::mt19937 rng(0xCAFE);
-    std::uniform_int_distribution<int> dist(0, kKeyspace - 1);
+    std::uniform_int_distribution<std::size_t> dist(0, kKeyspace - 1);
 
     for (auto _ : state) {
         auto& k = keys[static_cast<std::size_t>(dist(rng))];
@@ -92,7 +95,111 @@ static void BM_Cask_Put_Overwrite(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
     state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(value.size()));
 }
-BENCHMARK(BM_Cask_Put_Overwrite);
+BENCHMARK(BM_Cask_Put_Overwrite)->Arg(1024)->Arg(100000);
+
+// S43-10：bounded Zipf(s=1) 覆盖写。均匀 probe 已单独量化；这里记录
+// 热点倾斜对端到端 put 的额外影响。CDF 用调和级数精确离散化，截断在
+// 100k key；每次采样 O(log n)，避免把 benchmark 开销做成连续近似。
+static void BM_Cask_Put_Zipfian(benchmark::State& state) {
+    const std::size_t kKeyspace =
+        static_cast<std::size_t>(state.range(0));
+    TempDir td;
+    auto c = Cask::open(td.path(), rw_opts(), &test_registry());
+    if (!c) {
+        state.SkipWithError("Cask::open failed");
+        return;
+    }
+    auto& cask = **c;
+    std::vector<std::string> keys;
+    keys.reserve(kKeyspace);
+    for (std::size_t i = 0; i < kKeyspace; ++i) {
+        keys.push_back("k" + std::to_string(i));
+    }
+    const std::string value(128, 'v');
+    for (const auto& k : keys) {
+        if (!cask.put(as_bytes(k), as_bytes(value))) {
+            state.SkipWithError("populate put failed");
+            cask.close();
+            return;
+        }
+    }
+
+    std::vector<double> cdf;
+    cdf.reserve(kKeyspace);
+    double harmonic = 0.0;
+    for (std::size_t rank = 1; rank <= kKeyspace; ++rank) {
+        harmonic += 1.0 / static_cast<double>(rank);
+        cdf.push_back(harmonic);
+    }
+    for (auto& x : cdf) x /= harmonic;
+    cdf.back() = 1.0;
+
+    std::mt19937 rng(0x21F3);
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    for (auto _ : state) {
+        const auto rank_it = std::upper_bound(
+            cdf.begin(), cdf.end(), uniform(rng));
+        const auto index = static_cast<std::size_t>(
+            rank_it - cdf.begin());
+        auto& k = keys[index < kKeyspace ? index : kKeyspace - 1];
+        auto r = cask.put(as_bytes(k), as_bytes(value));
+        benchmark::DoNotOptimize(r);
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(
+        state.iterations() * static_cast<int64_t>(value.size()));
+    cask.close();
+}
+BENCHMARK(BM_Cask_Put_Zipfian)->Arg(100000)->Unit(benchmark::kNanosecond);
+
+// S43-5 性能口径：均匀覆盖写时每次 put 都会先做一次 OKI write probe。
+// 这个基准把该 locate 从 pwrite/OKI/authority 应用中剥离出来，单独量化
+// 100k 稳态 keyspace 的 run 态探测成本；端到端吞吐仍看上面的
+// BM_Cask_Put_Overwrite。两者都不构成静默降级理由。
+static void BM_Cask_WriteProbe_Uniform(benchmark::State& state) {
+    const int nkeys = static_cast<int>(state.range(0));
+    TempDir td;
+    auto c = Cask::open(td.path(), rw_opts(), &test_registry());
+    if (!c) { state.SkipWithError("Cask::open failed"); return; }
+    auto& cask = **c;
+    const std::string value(128, 'v');
+    for (int i = 0; i < nkeys; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        if (!cask.put(as_bytes(key), as_bytes(value))) {
+            state.SkipWithError("populate put failed");
+            cask.close();
+            return;
+        }
+    }
+    if (!cask.checkpoint()) {
+        state.SkipWithError("oki checkpoint failed");
+        cask.close();
+        return;
+    }
+
+    std::size_t i = 0;
+    std::size_t hits = 0;
+    for (auto _ : state) {
+        const std::string key = "k" + std::to_string(
+            i++ % static_cast<std::size_t>(nkeys));
+        const auto probe = cask.index_authority().state().probe_for_write(
+            std::string_view(key.data(), key.size()));
+        auto status = probe.status;
+        auto offset = probe.loc.offset;
+        benchmark::DoNotOptimize(status);
+        benchmark::DoNotOptimize(offset);
+        hits += probe.status ==
+                bitcask::oki::OkiState::LocateStatus::kHit;
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.counters["probe_hits"] = static_cast<double>(hits);
+    state.counters["hit_ratio"] =
+        state.iterations() > 0
+            ? static_cast<double>(hits) / static_cast<double>(state.iterations())
+            : 0.0;
+    cask.close();
+}
+BENCHMARK(BM_Cask_WriteProbe_Uniform)->Arg(100000)->Unit(benchmark::kNanosecond);
 
 // -----------------------------------------------------------------------------
 // S11-W1：多线程并发写**同一** Cask handle 的吞吐。各线程写自己的 key 段。
@@ -292,7 +399,7 @@ static void BM_Cask_Open_FullFold(benchmark::State& state) {
     for (auto _ : state) {
         state.PauseTiming();
         std::error_code ec;
-        fs::remove(fs::path(dir) / "kv.keydir.ckpt", ec);
+        fs::remove(fs::path(dir) / "kv.oki.manifest", ec);
         state.ResumeTiming();
         auto c = Cask::open(dir, rw_opts(), &test_registry());
         if (!c) state.SkipWithError("open failed");

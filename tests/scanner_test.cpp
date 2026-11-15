@@ -84,7 +84,7 @@ TEST(Scanner, FindsDataFilesAndSortsByTstamp) {
     EXPECT_EQ((*r)[2].tstamp, 3u);
 }
 
-TEST(Scanner, ReportsHintFilePresence) {
+TEST(Scanner, IgnoresHintFiles) {
     TempDir td;
     td.touch("1.bitcask.data");
     td.touch("2.bitcask.data");
@@ -96,12 +96,7 @@ TEST(Scanner, ReportsHintFilePresence) {
     ASSERT_EQ(r->size(), 2u);
 
     EXPECT_EQ((*r)[0].tstamp, 1u);
-    EXPECT_FALSE((*r)[0].has_hint);
-    EXPECT_TRUE((*r)[0].hint_path.ends_with("1.bitcask.hint"));
-
     EXPECT_EQ((*r)[1].tstamp, 2u);
-    EXPECT_TRUE((*r)[1].has_hint);
-    EXPECT_TRUE((*r)[1].hint_path.ends_with("2.bitcask.hint"));
 }
 
 TEST(Scanner, IgnoresGarbageFilenames) {
@@ -151,6 +146,6 @@ TEST(Scanner, FullPathInDataFileEntry) {
     ASSERT_EQ(r->size(), 1u);
     // S37-5：scanner 交出的是 fs::directory_entry::path().string()，
     // 分隔符为平台原生（Windows 上是 '\'）。期望值按同样方式构造。
-    EXPECT_EQ((*r)[0].data_path, (fs::path(td.path()) / "42.bitcask.data").string());
-    EXPECT_EQ((*r)[0].hint_path, (fs::path(td.path()) / "42.bitcask.hint").string());
+    EXPECT_EQ((*r)[0].data_path,
+              (fs::path(td.path()) / "42.bitcask.data").string());
 }

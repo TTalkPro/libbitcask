@@ -1,7 +1,7 @@
 // plugin_api：KV 存储层的插件回调接口（S15 P1，设计 doc/plugin-arch-split-design-zh.md §3）。
 //
 // === 定位 ===
-// Cask（KV 核心：data/hint/keydir）对上层索引/观测能力零概念——它只认识本头
+// Cask（KV 核心：data/keydir）对上层索引/观测能力零概念——它只认识本头
 // 定义的 CaskPlugin 接口，把 KV 固有事件（写入/删除/搬迁/merge/落盘/开关）广播
 // 给注册的插件。搜索（BM25/HNSW）只是插件的一种实现；统计、TTL、变更流等
 // 非搜索插件同样凭本接口接入。

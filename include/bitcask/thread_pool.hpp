@@ -16,7 +16,7 @@
 // （进程级共享有界 arena，用于 inter-query 并发；单查询内并行实测净亏已不用，S7）。
 //
 // === 生命周期 ===
-//   1. registry 懒创建 IndexPool（KeyDirRegistry::index_pool）
+//   1. registry 懒创建 IndexPool（IndexRegistry::index_pool）
 //   2. Cask::open（search 模式）→ register_lib 注册本库 lane
 //   3. put/delete → submit(lane, IndexTask) 异步入队
 //   4. Cask::close → unregister_lib（flush 排空 + 注销 lane，不停池）

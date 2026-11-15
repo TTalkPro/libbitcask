@@ -1,4 +1,4 @@
-// bitcask data 文件 / hint 文件 record 的编解码。
+// bitcask data 文件 record 的编解码。
 //
 // 纯函数：只在 caller 提供的 byte buffer 上做事，不做 I/O，不分配除
 // caller 容器之外的内存。磁盘格式定义见 format.hpp。
@@ -44,18 +44,6 @@ struct DataRecordView {
     std::span<const std::byte> key;
     std::span<const std::byte> value;
     std::size_t total_size;  // kHeaderSize + key.size() + value.size()
-};
-
-// 解码后的 hint record。consumed 是消耗的字节数，caller 用它推进 buf
-// 指针读下一条。
-struct HintRecord {
-    std::uint64_t tstamp;   // 盘上 u64（v4 起）
-    std::uint32_t total_sz;
-    std::uint64_t offset;
-    std::uint64_t ord = 0;  // S33 v5 起盘上有（vbyte delta）；见 format.hpp
-    bool tombstone;
-    std::span<const std::byte> key;
-    std::size_t consumed;
 };
 
 // ---------------------------------------------------------------------------
@@ -169,30 +157,6 @@ decode_doc_value(std::span<const std::byte> buf);
 [[nodiscard]] std::vector<float> doc_vector_f32(const DocValueView& v);
 
 // ---------------------------------------------------------------------------
-// hint 文件 record
-// ---------------------------------------------------------------------------
-
-// ---- hint v5（S33 flag-day：v4 变长编码 + vbyte ord_delta；文件级布局见
-// format.hpp）。v2 定宽 18B 与 v4 编解码已随 flag-day 整体退役——库内不再
-// 有任何旧格式 hint 读端（BCH4 在 HintFile 层按校验失败退 fold(data)）。----
-// 编码一条 v5 记录（append 进 out）。prev_end/prev_ord 是差分串联状态，
-// 传入并在返回时更新（prev_end ← offset+total_sz，prev_ord ← ord）。
-// 线程安全: 是（纯函数，串联状态由 caller 持有）；不需任何锁。
-void encode_hint_record_v5(std::vector<std::byte>& out,
-                           std::uint64_t tstamp,
-                           std::uint32_t total_sz,
-                           std::uint64_t offset, bool tombstone,
-                           std::span<const std::byte> key,
-                           std::uint64_t ord,
-                           std::uint64_t& prev_end,
-                           std::uint64_t& prev_ord);
-// 从 buf 头部解一条 v5 记录；prev_end/prev_ord 传入并在成功时更新。字节
-// 不足返回 kBufferTooShort（流式 caller 据此 refill 重试）。
-[[nodiscard]] std::expected<HintRecord, DecodeError>
-decode_hint_record_v5(std::span<const std::byte> buf,
-                      std::uint64_t& prev_end, std::uint64_t& prev_ord);
-
-// ---------------------------------------------------------------------------
 // CRC32 (zlib / IEEE 802.3 多项式，跟 erlang:crc32/1 一致)
 // 全部为纯函数，线程安全、可重入，不需任何锁。
 // ---------------------------------------------------------------------------
@@ -200,7 +164,7 @@ decode_hint_record_v5(std::span<const std::byte> buf,
 // 一次性算一段。
 [[nodiscard]] std::uint32_t crc32(std::span<const std::byte> data) noexcept;
 
-// 流式：seed 是上一次的 CRC，data 是新增的字节。hint 文件 running CRC 用。
+// 流式：seed 是上一次的 CRC，data 是新增的字节。WAL 帧校验用。
 [[nodiscard]] std::uint32_t crc32_update(std::uint32_t seed,
                                          std::span<const std::byte> data) noexcept;
 

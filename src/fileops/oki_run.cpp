@@ -44,6 +44,11 @@ std::string_view sv(std::span<const std::byte> b) {
     return true;
 }
 
+[[nodiscard]] bool fwrite_bytes(std::FILE* f, std::span<const std::byte> b) {
+    if (b.empty()) return true;
+    return std::fwrite(b.data(), 1, b.size(), f) == b.size();
+}
+
 }  // namespace
 
 std::string mk_run_filename(std::string_view dir, std::uint64_t gen) {
@@ -61,7 +66,8 @@ std::string mk_manifest_filename(std::string_view dir) {
 std::expected<OkiRunWriter, OkiError>
 OkiRunWriter::create(std::string path, std::size_t block_target,
                      std::uint32_t version, std::uint64_t expected_entries) {
-    if (version != kRunVersion && version != kRunVersion2) {
+    if (version != kRunVersion && version != kRunVersion2 &&
+        version != kRunVersion3) {
         return std::unexpected(OkiError::kBadState);
     }
     detail::AtomicFileWriter w(std::move(path), ".oki.tmp");
@@ -100,8 +106,15 @@ bool OkiRunWriter::flush_block() {
         }
         header_written_ = true;
     }
-    index_.push_back({blk_first_key_, file_off_});
-    if (!fwrite_crc(w_.get(), blk_, crc_)) return false;
+    if (version_ == kRunVersion3) {
+        index_.push_back({blk_first_key_, file_off_,
+                          codec::crc32(std::span<const std::byte>(
+                              blk_.data(), blk_.size()))});
+        if (!fwrite_bytes(w_.get(), blk_)) return false;
+    } else {
+        index_.push_back({blk_first_key_, file_off_});
+        if (!fwrite_crc(w_.get(), blk_, crc_)) return false;
+    }
     file_off_ += blk_.size();
     blk_.clear();
     blk_first_key_.clear();
@@ -115,7 +128,7 @@ std::expected<void, OkiError>
 OkiRunWriter::add(std::span<const std::byte> key, std::uint64_t ord,
                   bool tomb, const RowLoc* loc) {
     if (finished_) return std::unexpected(OkiError::kBadState);
-    if (loc != nullptr && version_ != kRunVersion2) {
+    if (loc != nullptr && version_ == kRunVersion) {
         return std::unexpected(OkiError::kBadState);  // v1 无位置字段
     }
     const std::string_view k = sv(key);
@@ -145,7 +158,7 @@ OkiRunWriter::add(std::span<const std::byte> key, std::uint64_t ord,
         codec::vbyte_encode(loc->tstamp - prev_tstamp_, blk_);  // 回绕差分
         prev_tstamp_ = loc->tstamp;
     }
-    if (version_ == kRunVersion2) bloom_insert(k);
+    if (version_ != kRunVersion) bloom_insert(k);
 
     prev_key_.assign(k);
     prev_ord_ = ord;
@@ -191,13 +204,18 @@ OkiRunWriter::finish(bool fsync_dir) {
         std::byte off[8];
         le_store_u64(off, e.off);
         idx.insert(idx.end(), off, off + 8);
+        if (version_ == kRunVersion3) {
+            std::byte bcrc[4];
+            le_store_u32(bcrc, e.crc);
+            idx.insert(idx.end(), bcrc, bcrc + 4);
+        }
     }
     if (!fwrite_crc(w_.get(), idx, crc_)) return std::unexpected(OkiError::kIo);
     file_off_ += idx.size();
 
     // v2：bloom 区 [n_bits u64][k u8][位数组]（计入 CRC）。
     std::uint64_t bloom_off = 0;
-    if (version_ == kRunVersion2) {
+    if (version_ != kRunVersion) {
         bloom_off = file_off_;
         std::vector<std::byte> bl;
         bl.reserve(9 + bloom_bits_.size() * 8);
@@ -218,11 +236,11 @@ OkiRunWriter::finish(bool fsync_dir) {
 
     // trailer：定宽字段计入 CRC，随后 [crc][magic]。
     // v1: [entry_count][index_off]；v2: [entry_count][index_off][bloom_off]。
-    const std::size_t t1_len = version_ == kRunVersion2 ? 24 : 16;
+    const std::size_t t1_len = version_ != kRunVersion ? 24 : 16;
     std::byte t1[24];
     le_store_u64(t1, entries_);
     le_store_u64(t1 + 8, index_off);
-    if (version_ == kRunVersion2) le_store_u64(t1 + 16, bloom_off);
+    if (version_ != kRunVersion) le_store_u64(t1 + 16, bloom_off);
     if (!fwrite_crc(w_.get(), std::span<const std::byte>(t1, t1_len), crc_)) {
         return std::unexpected(OkiError::kIo);
     }
@@ -255,7 +273,7 @@ std::expected<OkiRunReader, OkiError> OkiRunReader::open(std::string path) {
         return std::unexpected(OkiError::kCorrupt);
     }
 
-    // header：magic + version（1/2 都收——S36-1 起读端双版本）。
+    // header：magic + version（1/2/3 都收——S43-1 起读端三版本）。
     std::byte hdr[kRunHeaderSize];
     {
         auto n = r.file_.pread_into(0, std::span(hdr, sizeof hdr));
@@ -266,10 +284,11 @@ std::expected<OkiRunReader, OkiError> OkiRunReader::open(std::string path) {
         return std::unexpected(OkiError::kCorrupt);
     }
     r.version_ = le_load_u32(hdr + 4);
-    if (r.version_ != kRunVersion && r.version_ != kRunVersion2) {
+    if (r.version_ != kRunVersion && r.version_ != kRunVersion2 &&
+        r.version_ != kRunVersion3) {
         return std::unexpected(OkiError::kCorrupt);  // 未来版本：拒收重建
     }
-    const bool v2 = r.version_ == kRunVersion2;
+    const bool v2 = r.version_ != kRunVersion;
     const std::size_t trailer_size = v2 ? kRunTrailerSizeV2 : kRunTrailerSize;
     // 最小合法文件 = header + 空索引(4) + (v2: 最小 bloom 17B) + trailer。
     if (total < kRunHeaderSize + 4 + (v2 ? 17 : 0) + trailer_size) {
@@ -301,8 +320,9 @@ std::expected<OkiRunReader, OkiError> OkiRunReader::open(std::string path) {
         return std::unexpected(OkiError::kCorrupt);
     }
 
-    // 全文件 CRC（覆盖 [0, size-8)）。run 是派生缓存：eager 校验换绝对安全。
-    {
+    // v1/v2 全文件 CRC（覆盖 [0, size-8)）。run 是派生缓存：eager 校验换
+    // 绝对安全。v3 数据块由 per-block CRC 延迟到首读校验，这里不整读。
+    if (r.version_ != kRunVersion3) {
         std::uint64_t remaining = total - 8;
         std::uint64_t off = 0;
         std::uint32_t crc = 0;
@@ -323,11 +343,14 @@ std::expected<OkiRunReader, OkiError> OkiRunReader::open(std::string path) {
         if (crc != expected_crc) return std::unexpected(OkiError::kCorrupt);
     }
 
-    // 稀疏索引区 [index_off, index_end)。
+    // 稀疏索引区 [index_off, index_end)。v3 的元数据 CRC 需要在解析和
+    // bloom 校验完成后统一计算，因此保存原始两段字节。
+    std::vector<std::byte> idx;
+    std::vector<std::byte> bl;
     {
         const std::size_t idx_len =
             static_cast<std::size_t>(index_end - index_off);
-        std::vector<std::byte> idx(idx_len);
+        idx.resize(idx_len);
         auto got = r.file_.pread_into(index_off,
                                       std::span(idx.data(), idx.size()));
         if (!got || *got != idx_len) {
@@ -344,7 +367,8 @@ std::expected<OkiRunReader, OkiError> OkiRunReader::open(std::string path) {
             if (!klen) return std::unexpected(OkiError::kCorrupt);
             pos = klen->second;
             const std::uint64_t kl = klen->first;
-            if (pos + kl + 8 > ib.size()) {
+            const std::size_t fixed_len = r.version_ == kRunVersion3 ? 12 : 8;
+            if (pos + kl + fixed_len > ib.size()) {
                 return std::unexpected(OkiError::kCorrupt);
             }
             BlockRef b;
@@ -353,6 +377,10 @@ std::expected<OkiRunReader, OkiError> OkiRunReader::open(std::string path) {
             pos += static_cast<std::size_t>(kl);
             b.off = le_load_u64(ib.data() + pos);
             pos += 8;
+            if (r.version_ == kRunVersion3) {
+                b.crc = le_load_u32(ib.data() + pos);
+                pos += 4;
+            }
             // 块偏移必须严格递增且落在数据块区内。
             if (b.off < kRunHeaderSize || b.off >= index_off ||
                 (i > 0 && b.off <= prev_off) ||
@@ -373,11 +401,11 @@ std::expected<OkiRunReader, OkiError> OkiRunReader::open(std::string path) {
         }
     }
 
-    // v2：bloom 区 [bloom_off, total - trailer) 整载内存。
+    // v2+：bloom 区 [bloom_off, total - trailer) 整载内存。
     if (v2) {
         const std::size_t bl_len =
             static_cast<std::size_t>(total - trailer_size - bloom_off);
-        std::vector<std::byte> bl(bl_len);
+        bl.resize(bl_len);
         auto got = r.file_.pread_into(bloom_off,
                                       std::span(bl.data(), bl.size()));
         if (!got || *got != bl_len) return std::unexpected(OkiError::kCorrupt);
@@ -394,11 +422,25 @@ std::expected<OkiRunReader, OkiError> OkiRunReader::open(std::string path) {
             r.bloom_bits_[i] = le_load_u64(bl.data() + 9 + i * 8);
         }
     }
+    if (r.version_ == kRunVersion3) {
+        // v3 元数据 CRC = header + 稀疏索引 + bloom + trailer 定宽字段。
+        // 数据块不在其中；块完整性由 BlockRef::crc 在首读时校验。
+        std::uint32_t meta_crc = 0;
+        meta_crc = codec::crc32_update(
+            meta_crc, std::span<const std::byte>(hdr, sizeof hdr));
+        meta_crc = codec::crc32_update(meta_crc, idx);
+        meta_crc = codec::crc32_update(meta_crc, bl);
+        meta_crc = codec::crc32_update(meta_crc, std::span<const std::byte>(
+                                                     tr, trailer_size - 8));
+        if (meta_crc != expected_crc) {
+            return std::unexpected(OkiError::kCorrupt);
+        }
+    }
     return r;
 }
 
 bool OkiRunReader::may_contain(std::span<const std::byte> key) const noexcept {
-    if (version_ != kRunVersion2 || bloom_nbits_ == 0) return true;
+    if (version_ == kRunVersion || bloom_nbits_ == 0) return true;
     const std::string_view k = sv(key);
     const std::uint64_t h1 = fnv1a64(k);
     const std::uint64_t h2 = splitmix64(h1) | 1;
@@ -501,6 +543,12 @@ std::expected<bool, OkiError>
 OkiRunReader::Cursor::load_block(std::size_t bi) {
     const auto& b = r_->blocks_[bi];
     const std::size_t len = static_cast<std::size_t>(b.end - b.off);
+    const auto verify_crc = [&](const std::vector<std::byte>& blk) {
+        if (r_->version_ != kRunVersion3) return true;
+        const std::uint32_t got = codec::crc32(
+            std::span<const std::byte>(blk.data(), blk.size()));
+        return got == b.crc;
+    };
     if (cache_ != nullptr) {
         // S36-3：块缓存路径——命中零 IO，miss 时 loader pread（锁外）。
         auto blk = cache_->get_or_load(
@@ -516,6 +564,7 @@ OkiRunReader::Cursor::load_block(std::size_t bi) {
         if ((*blk)->size() != len) {
             return std::unexpected(OkiError::kCorrupt);  // 防御（gen 不重用）
         }
+        if (!verify_crc(**blk)) return std::unexpected(OkiError::kCorrupt);
         blk_hold_ = *std::move(blk);
     } else {
         blk_hold_.reset();
@@ -523,6 +572,7 @@ OkiRunReader::Cursor::load_block(std::size_t bi) {
         auto got = r_->file_.pread_into(b.off, std::span(blk_.data(), len));
         if (!got) return std::unexpected(OkiError::kIo);
         if (*got != len) return std::unexpected(OkiError::kCorrupt);
+        if (!verify_crc(blk_)) return std::unexpected(OkiError::kCorrupt);
     }
     pos_ = 0;
     prev_key_.clear();
@@ -568,8 +618,9 @@ std::expected<bool, OkiError> OkiRunReader::Cursor::next(Entry& out) {
         if (pos + 1 > b.size()) return std::unexpected(OkiError::kCorrupt);
         const auto flags = static_cast<std::uint8_t>(b[pos]);
         pos += 1;
-        const bool v2 = r_->version_ == kRunVersion2;
-        const std::uint8_t known = v2 ? kKnownFlagsMaskV2 : kKnownFlagsMask;
+        const bool has_fields = r_->version_ != kRunVersion;
+        const std::uint8_t known = has_fields ? kKnownFlagsMaskV2
+                                              : kKnownFlagsMask;
         if ((flags & ~known) != 0) {
             // 未知扩展位 fail-fast，绝不静默跳（行无长度前缀，跳不动）。
             return std::unexpected(OkiError::kCorrupt);
@@ -666,7 +717,8 @@ std::expected<SpillingRunBuilder, OkiError>
 SpillingRunBuilder::create(std::string dir, std::uint64_t gen,
                            std::uint32_t version, std::size_t spill_bytes,
                            bool drop_tombstones, std::size_t block_target) {
-    if (version != kRunVersion && version != kRunVersion2) {
+    if (version != kRunVersion && version != kRunVersion2 &&
+        version != kRunVersion3) {
         return std::unexpected(OkiError::kBadState);
     }
     SpillingRunBuilder b;
@@ -736,7 +788,7 @@ std::expected<void, OkiError>
 SpillingRunBuilder::add(std::span<const std::byte> key, std::uint64_t ord,
                         bool tomb, const RowLoc* loc) {
     if (finished_) return std::unexpected(OkiError::kBadState);
-    if (loc != nullptr && version_ != kRunVersion2) {
+    if (loc != nullptr && version_ == kRunVersion) {
         return std::unexpected(OkiError::kBadState);
     }
     Row r;
@@ -879,14 +931,25 @@ SpillingRunBuilder::finish(bool fsync_dir) {
 bool write_manifest(std::string_view dir, const OkiManifest& m) {
     // S36-1 惰性版本：全 v1 run → BCOM v1（字节不变，老读端可读）；
     // 含 v2 run → BCOM v2（条目多 1 字节 format_ver；老读端拒收 → 重建自愈）。
-    // S36-4：level_b（Level B 写者维护中——run loc 可信）→ BCOM v3
-    //（v2 布局 + 头部 1 字节 flags；老读端拒收自愈）。
-    bool any_v2 = m.level_b;  // v3 恒带 format_ver 字节
+    // S36-4：level_b（Level B 写者维护中——run loc 可信）→ BCOM v3。
+    // S43-2：健康元数据快照存在时升 BCOM v4；元数据和 runs/wm 一起过
+    // CRC 并由 atomic_write_bytes 一次性发布。没有快照时保留 v1-v3，
+    // 让旧目录继续走原有 data fold 迁移，而不是提交空/假元数据。
+    bool has_entry_ver = m.level_b;  // level_b 恒带 format_ver 字节
     for (const auto& r : m.runs) {
-        if (r.format_ver != 1) any_v2 = true;
+        if (r.format_ver != 1) has_entry_ver = true;
     }
+    const bool is_v4 = m.metadata.has_value();
     std::vector<std::byte> buf;
-    buf.reserve(25 + m.runs.size() * 17 + 16);
+    std::size_t reserve = 25 + m.runs.size() * 17 + 16;
+    if (is_v4) {
+        reserve += 8 + sizeof(OkiManifestMetadata) +
+                   m.fstats.size() * sizeof(OkiManifestFStats);
+    }
+    buf.reserve(reserve);
+    auto put_u8 = [&](std::uint8_t v) {
+        buf.push_back(static_cast<std::byte>(v));
+    };
     auto put_u32 = [&](std::uint32_t v) {
         std::byte b[4];
         le_store_u32(b, v);
@@ -897,15 +960,51 @@ bool write_manifest(std::string_view dir, const OkiManifest& m) {
         le_store_u64(b, v);
         buf.insert(buf.end(), b, b + 8);
     };
+    auto put_pad = [&](std::size_t n) {
+        buf.insert(buf.end(), n, std::byte{0});
+    };
     put_u32(kManifestMagic);
-    put_u32(m.level_b ? kManifestVersion3
-                      : (any_v2 ? kManifestVersion2 : kManifestVersion));
-    if (m.level_b) buf.push_back(std::byte{0x01});  // flags: bit0 = level_b
+    put_u32(is_v4 ? kManifestVersion4
+                  : (m.level_b ? kManifestVersion3
+                               : (has_entry_ver ? kManifestVersion2
+                                                : kManifestVersion)));
+    if (is_v4 || m.level_b) put_u8(m.level_b ? 0x01 : 0x00);
     put_u32(static_cast<std::uint32_t>(m.runs.size()));
+    if (is_v4) {
+        put_u32(static_cast<std::uint32_t>(m.fstats.size()));
+        put_u32(static_cast<std::uint32_t>(m.data_wms.size()));
+        const auto& g = *m.metadata;
+        put_u64(g.next_ord);
+        put_u32(g.biggest_file_id);
+        put_u32(g.next_file_id);
+        put_u64(g.active_keys);
+        put_u64(g.live_bytes);
+        put_u64(g.oldest_tstamp);
+        put_u64(g.newest_tstamp);
+        put_u64(g.reserved);
+        for (const auto& f : m.fstats) {
+            put_u32(f.file_id);
+            put_u8(f.pending_delete ? 1 : 0);
+            put_pad(3);
+            put_u64(f.live_keys);
+            put_u64(f.total_keys);
+            put_u64(f.live_bytes);
+            put_u64(f.total_bytes);
+            put_u64(f.oldest_tstamp);
+            put_u64(f.newest_tstamp);
+            put_u64(f.expiration_epoch);
+        }
+        // S43-3：data 字节水位是 v4 提交段的一部分。file_id 升序写入，
+        // 读端检查重复/乱序，让 CRC 之外再挡住 caller 侧结构错误。
+        for (const auto& [file_id, byte_wm] : m.data_wms) {
+            put_u32(file_id);
+            put_u64(byte_wm);
+        }
+    }
     for (const auto& r : m.runs) {
         put_u64(r.gen);
         put_u64(r.cover_ord);
-        if (any_v2) buf.push_back(static_cast<std::byte>(r.format_ver));
+        if (has_entry_ver) buf.push_back(static_cast<std::byte>(r.format_ver));
     }
     put_u64(m.wm);
     const std::uint32_t crc = codec::crc32(buf);
@@ -927,7 +1026,7 @@ std::optional<OkiManifest> read_manifest(std::string_view dir) {
     }
     const std::uint32_t ver = le_load_u32(b.data() + 4);
     if (ver != kManifestVersion && ver != kManifestVersion2 &&
-        ver != kManifestVersion3) {
+        ver != kManifestVersion3 && ver != kManifestVersion4) {
         return std::nullopt;
     }
     const bool has_entry_ver = ver >= kManifestVersion2;
@@ -939,7 +1038,7 @@ std::optional<OkiManifest> read_manifest(std::string_view dir) {
     }
     OkiManifest m;
     std::size_t pos = 8;
-    if (ver == kManifestVersion3) {  // S36-4：flags 字节
+    if (ver == kManifestVersion3 || ver == kManifestVersion4) {
         if (b.size() < 29) return std::nullopt;
         const auto flags = static_cast<std::uint8_t>(b[pos]);
         if ((flags & ~0x01u) != 0) return std::nullopt;  // 未知位 fail-fast
@@ -948,11 +1047,86 @@ std::optional<OkiManifest> read_manifest(std::string_view dir) {
     }
     const std::uint32_t count = le_load_u32(b.data() + pos);
     pos += 4;
+    if (ver == kManifestVersion4) {
+        constexpr std::size_t kGlobalBytes = sizeof(OkiManifestMetadata);
+        constexpr std::size_t kFStatsBytes = sizeof(OkiManifestFStats);
+        static_assert(kGlobalBytes == 56);
+        static_assert(kFStatsBytes == 64);
+        if (b.size() < pos + 4 + kGlobalBytes) return std::nullopt;
+        const std::uint32_t fstats_count = le_load_u32(b.data() + pos);
+        pos += 4;
+        if (b.size() < pos + 4) return std::nullopt;
+        const std::uint32_t data_wm_count = le_load_u32(b.data() + pos);
+        pos += 4;
+        if (fstats_count > (1u << 24) ||
+            b.size() < pos + kGlobalBytes +
+                       static_cast<std::size_t>(fstats_count) * kFStatsBytes) {
+            return std::nullopt;
+        }
+        OkiManifestMetadata g;
+        g.next_ord = le_load_u64(b.data() + pos);
+        g.biggest_file_id = le_load_u32(b.data() + pos + 8);
+        g.next_file_id = le_load_u32(b.data() + pos + 12);
+        g.active_keys = le_load_u64(b.data() + pos + 16);
+        g.live_bytes = le_load_u64(b.data() + pos + 24);
+        g.oldest_tstamp = le_load_u64(b.data() + pos + 32);
+        g.newest_tstamp = le_load_u64(b.data() + pos + 40);
+        g.reserved = le_load_u64(b.data() + pos + 48);
+        pos += kGlobalBytes;
+        if (g.reserved != 0 ||
+            g.next_file_id <= g.biggest_file_id ||
+            (g.oldest_tstamp == 0 && g.newest_tstamp != 0) ||
+            (g.oldest_tstamp != 0 && g.newest_tstamp != 0 &&
+             g.oldest_tstamp > g.newest_tstamp)) {
+            return std::nullopt;
+        }
+        m.metadata = g;
+        m.fstats.reserve(fstats_count);
+        for (std::uint32_t i = 0; i < fstats_count; ++i) {
+            OkiManifestFStats f;
+            f.file_id = le_load_u32(b.data() + pos);
+            f.pending_delete = std::to_integer<std::uint8_t>(b[pos + 4]) != 0;
+            if (std::to_integer<std::uint8_t>(b[pos + 1]) != 0 ||
+                std::to_integer<std::uint8_t>(b[pos + 2]) != 0 ||
+                std::to_integer<std::uint8_t>(b[pos + 3]) != 0) {
+                return std::nullopt;
+            }
+            f.live_keys = le_load_u64(b.data() + pos + 8);
+            f.total_keys = le_load_u64(b.data() + pos + 16);
+            f.live_bytes = le_load_u64(b.data() + pos + 24);
+            f.total_bytes = le_load_u64(b.data() + pos + 32);
+            f.oldest_tstamp = le_load_u64(b.data() + pos + 40);
+            f.newest_tstamp = le_load_u64(b.data() + pos + 48);
+            f.expiration_epoch = le_load_u64(b.data() + pos + 56);
+            pos += kFStatsBytes;
+            m.fstats.push_back(f);
+        }
+        if (data_wm_count > (1u << 24) ||
+            b.size() <
+                pos + static_cast<std::size_t>(data_wm_count) * 12) {
+            return std::nullopt;
+        }
+        m.data_wms.reserve(data_wm_count);
+        std::uint32_t prior_file_id = 0;
+        for (std::uint32_t i = 0; i < data_wm_count; ++i) {
+            const std::uint32_t file_id = le_load_u32(b.data() + pos);
+            const std::uint64_t byte_wm = le_load_u64(b.data() + pos + 4);
+            pos += 12;
+            // 升序 + 去重是写端契约；不合规当作损坏处理，不猜语义。
+            if (i != 0 && file_id <= prior_file_id) return std::nullopt;
+            m.data_wms.emplace_back(file_id, byte_wm);
+            prior_file_id = file_id;
+        }
+    } else {
+        // v3 迁移语义：只承诺 runs/wm 可读；不伪造“当前内存状态”。
+        m.metadata.reset();
+        m.fstats.clear();
+    }
     if (b.size() != pos + static_cast<std::size_t>(count) * entry_len + 8 + 8) {
         return std::nullopt;
     }
     m.runs.reserve(count);
-    for (std::uint32_t i = 0; i < count; ++i) {
+    for (std::uint32_t i = 0; i < count; i++) {
         OkiManifestEntry e;
         e.gen = le_load_u64(b.data() + pos);
         e.cover_ord = le_load_u64(b.data() + pos + 8);
@@ -960,7 +1134,10 @@ std::optional<OkiManifest> read_manifest(std::string_view dir) {
         if (has_entry_ver) {
             e.format_ver = static_cast<std::uint8_t>(b[pos]);
             pos += 1;
-            if (e.format_ver != 1 && e.format_ver != 2) return std::nullopt;
+            if (e.format_ver != 1 && e.format_ver != 2 &&
+                e.format_ver != 3) {
+                return std::nullopt;
+            }
         }
         m.runs.push_back(e);
     }

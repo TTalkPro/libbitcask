@@ -1,20 +1,20 @@
-// bitcask 高层门面：把 keydir、data file、hint file、scanner、merger 串起来，
+// bitcask 高层门面：把索引权威、data file、scanner、merger 串起来，
 // 整合成一个进程级 handle。专为 M3.4 的「粗粒度 NIF 暴露」设计——
 // 一次 open / close / get / put / delete 就够，替代 legacy 那 30+ 个细粒度
-// keydir_*_int / file_*_int 调用。
+// legacy 索引内部调用。
 //
 // === 线程模型（S11：通用 C++ 库,handle 内部线程安全；docs/design/thread-safety.md）===
 //
 // 同一个 Cask handle 可被多线程安全共享：
 //   - **读**（get / search* / search_vector / 批量搜索）：并发安全,无锁/共享锁。
-//     keydir get + DataFile pread thread-safe;read_files_ cache 受 read_cache_mu_ 护;
+//     authority get + DataFile pread thread-safe;read_files_ cache 受 read_cache_mu_ 护;
 //     搜索读 cache_/doc_texts_ shared_mutex、倒排/HNSW shared_lock、analyzer const。
 //   - **写**（put / remove / put_doc / sync / close_write_file）：并发安全,由内部
 //     `write_mu_` 串行化（S11-W1）。写在文件层本就串行 → 锁不损吞吐;需要更高写
 //     并发 → 按目录分片多个 Cask 实例（横向扩展）。
 //   - **读写并发**：安全;搜索可见性遵循 near-real-time 契约（prepare_search flush
 //     覆盖调用前的写）。
-//   - **merge**：与读写并发,经 keydir shared_mutex 协调（不取 write_mu_,写自有
+//   - **merge**：与读写并发,经 authority shared_mutex 协调（不取 write_mu_,写自有
 //     输出文件）。
 //
 // 例外（非 handle 级线程安全,见各方法注释）：
@@ -23,7 +23,7 @@
 // （同义词词典已改为 open-time 不可变配置 `CaskOptions::synonym_map`，不再是运行期
 //  可变项 → 无并发竞态。）
 //
-// 底层 KeyDir 可在同目录多个 Cask 间共享（KeyDirRegistry 管 refcount）。
+// 底层索引权威可在同目录多个 Cask 间共享（IndexRegistry 管 refcount）。
 
 #pragma once
 
@@ -46,10 +46,10 @@
 #include "bitcask/data_file.hpp"
 #include "bitcask/codec.hpp"
 #include "bitcask/file_lock.hpp"
-#include "bitcask/hint_file.hpp"
 #include "bitcask/docmap_ckpt.hpp"    // S18-2:docmap 持久化归宿主
 #include "bitcask/index_manifest.hpp"  // S17-2:per-component commit
-#include "bitcask/keydir.hpp"
+#include "bitcask/index_authority.hpp"
+#include "bitcask/index_registry.hpp"
 #include "bitcask/oki_state.hpp"  // S33-5：CaskRangeIter 的 ReadView/Cursor
 #include "bitcask/merge_policy.hpp"
 #include "bitcask/merger.hpp"
@@ -66,7 +66,8 @@
 namespace bitcask {
 
 // 前置声明：registry_ 仅用作裸指针，完整定义在 cask.cpp 内 include。
-namespace keydir { class KeyDirRegistry; }
+namespace oki { class IndexAuthority; class IndexRegistry; }
+namespace fileops { struct DataFileEntry; }
 
 // --- 配置 --------------------------------------------------------------------
 struct CaskOptions {
@@ -95,7 +96,7 @@ struct CaskOptions {
     // 下游 zhwiki 实测反馈)。S31.5 起锚点为 ord 增量本身(原需数据文件
     // roll 配合——字节锚点与分词算力脱钩,大文档语料下窗口失控)。
     // 默认 65536 与 building 段封口阈值对齐(封口后一个阈值内清单必提交);
-    // 0 = 关闭。仅索引模式生效(纯 KV 恢复本就走 hint 快路径);
+    // 0 = 关闭。仅索引模式生效(纯 KV 恢复走 data-only 主路径);
     // 精细节奏控制用 checkpoint() API。
     std::uint32_t auto_checkpoint_min_docs = 65536;
     bool          require_hint_crc = false;  // legacy 默认 false；M5 之后可能改 true
@@ -192,6 +193,8 @@ enum class CaskError {
     kIndexRebuildFailed,  // OKI 试建而败（可写 open 重建失败——IO/环境问题，
                           // 见 log；与 kNoIndex 的「本就不建」区分。追加在尾：
                           // 既有枚举值不动，C API 映射 +1 偏移不破）
+    kIndexCorrupt,        // S43-1：定位记录存在，但读回 record 的 key 不同。
+                          // 这是索引损坏/陈旧错误的硬证据，绝不能返回 value。
 };
 
 struct CaskFault {
@@ -347,29 +350,27 @@ struct StatusInfo {
 class Cask;
 
 // --- fold 迭代器 -------------------------------------------------------------
-// 遍历 make_iter() 时刻的全部活跃 (key, value)。snapshot 语义靠
-// KeyDir::IterHandle 提供；每条 entry 的 value 在 next() 时按需 pread。
-// 设计上是「per-step 一次 NIF 调用」，方便上层在 BEAM scheduler 之间让出。
+// 遍历 OKI 组合视图在创建时刻的全部活跃 (key, value)。视图由 runs 共享
+// Reader + memdelta 排序快照组成；每条 entry 的 value 在 next() 时按需
+// pread 并核对 key/ord。设计上是「per-step 一次 NIF 调用」，方便上层在
+// BEAM scheduler 之间让出。
 //
 // === 线程模型 ===
 // CaskIter 自身不持锁，方法非线程安全——同一对象只能由一个线程使用。
 // 但不同 CaskIter 对象之间可在多线程并发使用同一个 parent Cask
-// （读路径并行 + KeyDir::IterHandle 支持多 fold）。
+// （OKI Reader 与 data pread 都支持并发读者）。
 //
 // === 生命周期契约（T9 / 见 X1）===
-// 1. CaskIter **可以** 跨越 `Cask::close()` 存活：close() reset 自己的 KeyDir
-//    shared_ptr，但 CaskIter 经 `keydir_pin_` 持一份引用让 KeyDir 续命；start()
-//    时 pin_files() 已 pin 住 sealed fd，故 close() 后 `start/next/release` 仍
-//    可用（next() 对未 pin 文件退回 parent_->read_file lazy-open，文件仍在盘上）。
-//    多 iterator 交错 release 时，最后一个（keyfolders_→0）才触发 KeyDir 的
-//    pending 应用 + MultiEntry 折叠——全在 pinned KeyDir 上安全完成。
+// 1. CaskIter **可以** 跨越 `Cask::close()` 存活：OKI ReadView 持有 runs
+//    共享所有权，start() 后 pin_files() 再持有 sealed data fd；close() 后
+//    `next/release` 仍可用（未 pin 文件退回 parent_->read_file lazy-open，
+//    文件仍在盘上）。多 iterator 不共享 pending/epoch 状态，release 只释放
+//    自身视图和文件句柄。
 // 2. CaskIter **必须先于 Cask 对象本身析构**。`parent_` 是裸 `Cask*`（非
 //    weak/shared）：若 Cask 对象被销毁（持有它的 unique_ptr 析构）而 iterator
 //    仍存活，则 `next()` 访问 `parent_->opts_/dirname_/read_file` 即悬空 UAF。
-//    这与 close() 正交——close() 不销毁 Cask 对象。X1 的 pin 兜 KeyDir 生命周期，
-//    但不兜 Cask 对象本身（裸 parent_ 的结构性问题，留待 zero-copy 重构时
-//    用 weak_ptr/owning 句柄解决；在 next() 加 keydir_ 空检查无用——既会误杀
-//    上述「合法的 close 后 next()」，又无法防住真正的 parent_ 悬空）。
+//    这与 close() 正交——close() 不销毁 Cask 对象。裸 parent_ 的结构性约束
+//    不变：OKI ReadView 兜索引/文件生命周期，但不兜 Cask 对象本身。
 class CaskIter {
 public:
     explicit CaskIter(Cask* parent) noexcept : parent_(parent) {}
@@ -382,17 +383,15 @@ public:
     // （对应 legacy fold/6 + fold_keys/6 的 SeeTombstones=true 行为）。
     // false（默认）下墓碑被静默跳过。
     //
-    // 返回底层 keydir 的 StartIterResult：
-    //   kOk         — 真的开始迭代了
-    //   kOutOfDate  — pending 表 freshness 检查没过；caller 应稍后重试
+    // 返回历史 StartIterResult 以维持 ABI：OKI 视图创建成功恒 kOk。
+    // 非 -1 的 pending freshness 参数在 OKI-only 视图下不再触发 authority
+    // pending freeze；视图自身就是创建时的不可变来源。
     // CaskFault 留给真正的失败（比如 handle 已经在迭代）。
     // 线程安全: 否（修改自身字段）；同一 CaskIter 不可并发使用。
     //
-    // S13-D4：key_prefix 非空时只产出以该前缀开头的 key——过滤发生在
-    // keydir proxy 层（不 pread value），遍历命名空间（如 "user:"）无需
-    // caller 全表扫 + 自行过滤。keydir 是哈希表，过滤版仍是 O(全表) 扫描
-    // （省的是 value 读取与跨界拷贝）；有序范围扫描需有序索引，见 TASK.md。
-    [[nodiscard]] std::expected<keydir::StartIterResult, CaskFault>
+    // S13-D4 / S43-6：key_prefix 非空时先在 OKI 有序结构上 seek，并从越过
+    // 前缀处截断；不依赖 shard 表，也不做全表值读取。
+    [[nodiscard]] std::expected<void, CaskFault>
     start(int maxage = -1, int maxputs = -1, std::uint64_t now_sec = 0,
           bool see_tombstones = false,
           std::span<const std::byte> key_prefix = {});
@@ -435,13 +434,13 @@ public:
 
     // 线程安全: 否；幂等。同一对象的 start/next/release 串行调用。
     void release() noexcept;
-    [[nodiscard]] bool is_iterating() const noexcept { return iter_ != nullptr; }
+    [[nodiscard]] bool is_iterating() const noexcept { return iterating_; }
 
 private:
     friend class Cask;  // S11-W4：Cask::parallel_scan 调用 drain_live_keys()
 
-    // S11-W4：排干所有 live key（仅 key 拷贝，**不读 value**——走 keydir proxy）。
-    // 供 Cask::parallel_scan 取快照后分区并行 get。start() 之后调用,消费迭代器。
+    // S11-W4：排干所有 live key（仅 key 拷贝，**不读 value**——走 OKI
+    // 归并游标）。供 Cask::parallel_scan 取快照后分区并行 get。
     // S24-M7：扁平承载（单缓冲 + N+1 偏移哨兵）——原 vector<vector<byte>>
     // 每 key 一个堆 vector（24B 头 + malloc），百万 key 快照 N 次分配 →
     // 恒 2 次，峰值内存约减半。切片经 operator[] 以 span 消费。
@@ -457,6 +456,10 @@ private:
         }
     };
     [[nodiscard]] FlatKeys drain_live_keys();
+    // OKI 组合视图的公共归并层：产出下一个胜出且非墓碑 key 及其视图行。
+    // CaskIter 与 drain_live_keys 共用；错误必须显式上抛，不得折叠成 EOI。
+    [[nodiscard]] std::expected<std::optional<oki::OkiState::DeltaRow>, CaskFault>
+    next_merged_key();
 
     // S13：fold 启动时 pin 一份「目录下全部 data file」的只读句柄快照。
     // 并发 merge 在 fold 期间 unlink 旧文件时，已 open 的 fd 让 inode 在
@@ -464,15 +467,17 @@ private:
     // 不含 active write file（merge 从不合并它，交给 parent_->read_file）。
     void pin_files();
 
-    Cask* parent_;
-    // X1:pin 一份 KeyDir 的 shared_ptr，保证迭代器存活期间 KeyDir 不被
-    // 释放。Cask::close() 会 reset 自己的 keydir_（并经 registry release
-    // 递减引用计数），但 IterHandle 内部持 KeyDir* 裸指针——若迭代器在
-    // close() 后才析构（release()→BarrierGuard 锁 KeyDir mutex），裸指针
-    // 会悬空 UAF。pin 让 KeyDir 至少活到本迭代器析构。声明在 iter_ 之前
-    // → 隐式析构序中后于 iter_ 释放（release() 也显式保证此序）。
-    std::shared_ptr<keydir::KeyDir> keydir_pin_;
-    std::unique_ptr<keydir::IterHandle> iter_;
+    Cask* parent_ = nullptr;
+    // S43-6：CaskIter 直接持有 OKI 组合视图。runs Reader 是共享所有权，
+    // memdelta 是不可变快照；close/rebuild 只会让后续新迭代器看到新视图，
+    // 在途迭代器不依赖 authority shard 表或 pending/epoch 协调。
+    oki::OkiState::ReadView view_;
+    std::vector<oki::OkiRunReader::Cursor> cursors_;
+    std::vector<std::optional<oki::OkiRunReader::Entry>> heads_;
+    std::size_t delta_pos_ = 0;
+    std::string cur_key_;
+    bool iterating_ = false;
+    bool done_ = false;
     bool see_tombstones_ = false;
     bool want_meta_ = false;                    // 反馈 2026-10-06
     const meta::MetaFilter* filter_ = nullptr;  // 借用；空 = 不过滤
@@ -483,15 +488,13 @@ private:
 
 // --- CaskRangeIter（S33-5：OKI 有序 Range 迭代器）--------------------------
 //
-// 按 key 字典序遍历 [lo, hi)：k 路归并 OKI runs + memdelta（同 key max-ord
-// 胜、墓碑抵消）→ **逐 key 回查哈希 keydir**（权威活性）→ 现有 get 路径
-// 取值。OKI 行允许陈旧——死 key 被回查过滤，merge 搬迁与本迭代器零交互
-// （设计 doc/ordered-key-index-design-zh.md §2.2/§4）。
+// 按 key 字典序遍历 [lo, hi)：k 路归并 OKI runs + memdelta（同 key 按
+// (ord, 来源序) 胜、墓碑抵消）→ public get 相同的 key/ord 核对与 merge
+// 重试取值。OKI 行允许陈旧——死 key 被回查过滤，merge 搬迁后重定位收敛。
 //
-// 一致性：**per-key 弱一致**（与 parallel_scan 同档）——迭代期间的并发写
-// 可能部分可见，不是 CaskIter 的 fold 快照语义；需要快照请先 CaskIter
-// 冻结。生命周期契约同 CaskIter：不可跨线程共享；须在 Cask::close 前
-// 用完（内部 pin KeyDir，但取值经 Cask 读路径）。
+// 一致性：**per-key 弱一致**——迭代期间的并发写可能部分可见，不是
+// CaskIter 的 ReadView 快照语义。生命周期契约同 CaskIter：不可跨线程
+// 共享；须在 Cask 对象析构前用完（close() 仍安全）。
 struct RangeOptions {
     std::span<const std::byte> lo{};  // inclusive；空 = 从头
     std::span<const std::byte> hi{};  // exclusive；空 = 到尾
@@ -524,7 +527,7 @@ public:
         std::vector<std::byte> key;
         std::vector<std::byte> value;   // DocValue text 段（纯 KV 即 value）
         std::uint64_t tstamp = 0;
-        std::uint64_t ord = 0;          // keydir 权威 ord（非 OKI 行 ord）
+        std::uint64_t ord = 0;          // 记录内核对后的权威 ord
         std::vector<std::byte> meta;    // RangeOptions::want_meta 时填，否则恒空
     };
 
@@ -535,7 +538,7 @@ private:
     friend class Cask;
     CaskRangeIter() = default;
 
-    // 归并层：产出下一个「胜出且非墓碑」的 key（尚未回查 keydir）；
+    // 归并层：产出下一个「胜出且非墓碑」的 key（尚未回查 public get）；
     // 到尾或越过 hi → nullopt。取值与预取都建在它之上。
     [[nodiscard]] std::expected<std::optional<std::string>, CaskFault>
     next_merged_key();
@@ -544,13 +547,12 @@ private:
     // 死 key（kNotFound）在批内被丢弃，故 buf_ 可能为空而迭代未结束。
     [[nodiscard]] std::expected<void, CaskFault> fill_prefetch();
 
-    // 回查 keydir 取值 + filter + 物化（惰性与预取共用；只读成员，可并发调）。
+    // 回查 public get 取值 + filter + 物化（惰性与预取共用；只读成员，可并发调）。
     // 死 key（kNotFound）或 filter 不通过 → nullopt。
     [[nodiscard]] std::expected<std::optional<Entry>, CaskFault>
     fetch_entry(const std::string& key) const;
 
     Cask* cask_ = nullptr;
-    std::shared_ptr<keydir::KeyDir> keydir_pin_;
     oki::OkiState::ReadView view_;
     std::vector<oki::OkiRunReader::Cursor> cursors_;
     // 各 run 游标的当前头（nullopt = 该源已排空）。
@@ -582,11 +584,11 @@ public:
     // S6-P0-pre：registry **强制非空**——双池（异步索引 MapReduce）归属 registry，
     //   无 registry 则池无处可挂。传 nullptr 返回 kInvalidOption（无 nullptr fallback）。
     // 线程安全: 是（每次调用产生独立的 Cask 对象）；registry 自身的并发
-    // 由 KeyDirRegistry 内部锁保证。
+    // 由 IndexRegistry 内部锁保证。
     // 锁要求: 无。
     [[nodiscard]] static std::expected<std::unique_ptr<Cask>, CaskFault>
     open(std::string_view dirname, const CaskOptions& opts,
-         keydir::KeyDirRegistry* registry);
+         oki::IndexRegistry* registry);
 
     // 离线升级：将 KV 模式目录升级为索引模式。
     // 前提条件：目录必须存在且当前为 KV 模式；目录必须处于离线状态（无活跃 writer）。
@@ -917,7 +919,7 @@ public:
     // 线程安全: **是**（S11-W1：内部 write_mu_，与 put/remove 互斥）。
     [[nodiscard]] std::expected<void, CaskFault> sync();
 
-    // 强制关 active write file：finalize hint trailer、丢掉 active data/hint
+    // 强制关 active write file：丢掉 active data
     // 句柄、释放 bitcask.write.lock。Cask 仍可用——下次 put/delete 自动
     // 重新拿锁、新建 active file（对应 legacy bitcask:close_write_file 语义）。
     // 只读 / merge_only 句柄返回 kReadOnly。
@@ -960,8 +962,8 @@ public:
     merge(std::vector<std::string> files = {}, std::uint64_t now_sec = 0);
 
     // S13-D6：不停机备份到 dst_dir（不存在则创建）。流程：持 write_mu_ 关闭
-    // active writer（finalize hint trailer，下一次 put 自动重建）→ 快照文件
-    // 清单 → 逐文件 hardlink（跨设备回退 copy）data/hint + bitcask.meta +
+    // active writer 关闭 → 快照文件清单 → 逐文件 hardlink（跨设备回退 copy）
+    // data + bitcask.meta +
     // field.schema + keydir/search checkpoint（有则带上，加速备份目录首次
     // open）。sealed 文件不可变 ⟹ hardlink 即一致快照。
     // 备份目录可直接以只读或读写模式 open。
@@ -998,15 +1000,15 @@ public:
     }
 
     // S33-5：有序 Range 迭代器（语义/契约见 CaskRangeIter 类注释）。
-    // OKI 不可用按成因拆码：RO/merge_only 打开无 OKI 的目录（本就不建，
-    // 重开读写即建）→ kNoIndex；可写 open 重建失败（试建而败，IO/环境
-    // 问题）→ kIndexRebuildFailed。
+    // OKI 不可用按成因拆码：merge_only 不建读视图 → kNoIndex；打开恢复
+    // /运行期受控重建失败（试建而败，IO/环境问题）→ kIndexRebuildFailed。
+    // RO 打开可从 data 建内存读视图，不写 run/manifest。
     // 线程安全: 是（可多线程各自 make 并发迭代）；返回的迭代器自身非线程安全。
     [[nodiscard]] std::expected<std::unique_ptr<CaskRangeIter>, CaskFault>
     make_range_iter(const RangeOptions& opts);
 
     [[nodiscard]] std::string_view dirname() const noexcept { return dirname_; }
-    [[nodiscard]] keydir::KeyDir&  keydir()  noexcept { return *keydir_; }
+    [[nodiscard]] oki::IndexAuthority& index_authority() noexcept { return *authority_; }
 
     // S36-5 B1 诊断：active data file 已知持久（fsync 过）的字节上界
     // （水位由 DataFile 自维护，见 data_file.hpp durable_bytes）。
@@ -1026,17 +1028,16 @@ private:
     FieldSchema field_schema_;
 
     // keydir（多个 Cask 可能通过 registry 共享同一个）
-    std::shared_ptr<keydir::KeyDir> keydir_;
-    // 非拥有指针：KeyDirRegistry 由 Erlang/NIF 层创建和销毁，Cask 仅借
+    std::shared_ptr<oki::IndexAuthority> authority_;
+    // 非拥有指针：IndexRegistry 由 Erlang/NIF 层创建和销毁，Cask 仅借
     // 用以调 acquire/release。close() 时 release 后置 nullptr，不 delete。
-    keydir::KeyDirRegistry* registry_ = nullptr;
-    std::string keydir_name_;
+    oki::IndexRegistry* registry_ = nullptr;
+    std::string authority_name_;
 
     // 当前 active write file。只读 / merge_only 时为 nullptr。
     // shared_ptr:读路径(read_file)可能在锁外持有 active 句柄,roll/close
     // 时旧对象由在途读者的引用计数续命,不会析构正在被 pread 的对象。
     std::shared_ptr<fileops::DataFile> active_data_;
-    std::unique_ptr<fileops::HintFile> active_hint_;
     // S13-F4：atomic——写者仅持 write_mu_、读者（read_file/needs_merge/
     // CaskIter::pin_files）持 read_cache_mu_ 或无锁，双方无公共锁、无
     // happens-before。值仅作提示（读到陈旧值最多多开一次文件句柄，良性），
@@ -1052,7 +1053,7 @@ private:
     // docs/design/thread-safety.md）。覆盖 put/remove/put_doc/sync/close_write_file
     // 的整个写序列（含内部 ensure_active_writer/roll_active/maybe_group_commit/
     // write_and_keydir）。保护对象：active_data_ 的 current_offset_/write_buf_/
-    // batch_buf_、writes_since_sync_、active_file_id_、active_hint_ 等写态。
+    // batch_buf_、writes_since_sync_、active_file_id_ 等写态。
     // 锁序：write_mu_ 最外层 → 内部再取 read_cache_mu_/keydir 锁；**读路径不取
     // write_mu_**（get/搜索保持无锁/共享锁，吞吐不变）。merge 不取本锁（写自有
     // 输出文件，经 keydir shared_mutex 协调，与写并发）；flush_index 不取本锁
@@ -1060,7 +1061,7 @@ private:
     std::mutex write_mu_;
 
     // S11-W3：生命周期 fail-fast 标志。close() 置位后,公共方法入口检查 → 返回
-    // 错误码而非解引用已释放的 keydir_/search_/active_data_（UB）。这是**尽力
+    // 错误码而非解引用已释放的 authority_/search_/active_data_（UB）。这是**尽力
     // 而为的 fail-fast**,非完整 rundown：已在途的操作与 close() 并发仍是 caller
     // 责任（契约：close 时刻无在途调用）。close() 用 exchange 兼作幂等门。
     std::atomic<bool> closed_{false};
@@ -1104,7 +1105,7 @@ private:
     // S14-7：成对保存——search.ckpt（delta 或 base）+ keydir 推进的统一
     // 入口。delta 路径把 keydir 元数据（水位/标量/fstats，caller 于提交
     // 时刻构建）内联进 delta 文件（**同文件原子成对**，无写序窗口，且
-    // 不再每次全量写 kv.keydir.ckpt——它曾是 delta 时代 per-save I/O 的
+    // 不再另写旧 KV 快照——它曾是 delta 时代 per-save I/O 的
     // 大头）；base 路径照旧全量快照（先 ckpt 后快照）。
     // S17-3 改造为 P3：先写 per-component 段（docmap/bm25/vec），再写
     // manifest（commit point），最后才写 keydir 快照（仅 base 路径）。
@@ -1112,7 +1113,7 @@ private:
         const std::string& path, std::uint64_t wm,
         const std::optional<std::vector<
             std::pair<std::uint32_t, std::uint64_t>>>& wms,
-        const std::vector<std::byte>& keydir_delta);
+        const std::vector<std::byte>& authority_delta);
 
     // S17-3 显式 commit 入口：先 per-component base（或 delta），再写
     // manifest 作为 commit point，最后 base 路径下写 keydir 快照。
@@ -1122,7 +1123,7 @@ private:
         const std::string& dir, std::uint64_t wm,
         const std::optional<std::vector<
             std::pair<std::uint32_t, std::uint64_t>>>& wms,
-        const std::vector<std::byte>& keydir_delta);
+        const std::vector<std::byte>& authority_delta);
 
     // S17-2:当前 manifest。save 时按组件结果更新；load 时初始化。每组件
     // 链状态也镜像一份（各插件内部维护，Cask 在 commit 时同步）。
@@ -1318,18 +1319,41 @@ private:
         const std::function<
             std::expected<std::vector<search::SearchHit>, search::SearchError>()>& run);
 
-    // A4:落 keydir 段快照(best-effort;close/merge 末尾调)。
-    void write_keydir_snapshot() noexcept;
+    // S43-9：OKI manifest 本身就是提交点；关闭/merge 收尾不再另写
+    // BCKS。保留空操作以收敛历史调用点。
+    void write_authority_snapshot() noexcept;
+    void write_authority_snapshot(
+        const std::vector<std::pair<std::uint32_t, std::uint64_t>>& wms) noexcept;
 
     // S33-4：OKI 恢复收尾（缺口检查 + 全量重建；实现见 cask_recovery.cpp）
     // 与写路径阈值 flush（memdelta 达阈值时同步落 run，罕见且有界）。
     void finish_oki_recovery(bool snap_loaded,
                              std::uint64_t snap_next_ord) noexcept;
+    // S43-3：健康 BCOM v4 + 有效 run 的 data-only streaming recovery。
+    // 成功返回 true 并直接结束 load_authority_from_disk；false 表示该目录
+    // 交回传统全量 fold / rebuild 兜底（search 模式与旧 manifest 等）。
+    [[nodiscard]] bool try_data_only_recovery(
+        const std::vector<fileops::DataFileEntry>& entries);
+    // S43-1：运行期 OKI 冷路径不可用时的受控降级重建。持 authority 写者
+    // 屏障扫 data（唯一持久真相），产出 v3 单 run；期间 rebuilding 标志
+    // 让其他读者显式失败，而不是误判 NotFound 或继续走坏索引。
+    [[nodiscard]] bool rebuild_oki_from_data() noexcept;
+    // S43-5：写路径使用 OKI 前的可信视图门。旧 Level A / 未加载态先做
+    // 一次 data 受控重建；失败必须显式报 kIndexCorrupt，不能退回哈希
+    // 语义或把 unavailable 当 miss。
+    [[nodiscard]] bool ensure_oki_for_write() noexcept;
+    // 运行期重建一次只允许一个执行者；读者看到 true 时必须返回显式
+    // 索引不可用/损坏错误，禁止当 miss。
+    std::atomic<bool> oki_rebuilding_{false};
+    // S43-5：写入口共享同一受控重建窗口。后续写者等待重建完成后重读
+    // 状态，而不是把“正在自愈”误报成索引损坏。
+    std::mutex oki_rebuild_mu_;
+    std::condition_variable oki_rebuild_cv_;
     // OKI 试建而败的记账——make_range_iter 据此把「不可用」拆成
     // kIndexRebuildFailed（可写 open 重建失败）vs kNoIndex（RO/merge_only
     // 本就不建）。open 期单线程置位，此后只读；loaded_ 置真后不会再翻回，
     // 故不可用性（连同本标志）在 open 期定型。
-    bool oki_rebuild_failed_ = false;
+    std::atomic<bool> oki_rebuild_failed_{false};
     // B4：延迟删除队列——merge 输入退休而非当场 unlink（文件留在原路径，
     // 惰性重开的 ENOENT 假失败窗口从源头消失；O10 的临界区文件系统操作
     // 一并退役）。排水点 = 下次 merge 开始 / checkpoint 入口 / close——
@@ -1337,7 +1361,7 @@ private:
     // （退休文件即普通 data 文件，恢复 LWW/ord 门正确处理，后续 merge
     // 自愈收编）。空间回收因此**延后一拍**（下一个落点），CHANGELOG 已注。
     std::mutex retired_mu_;
-    std::vector<std::string> retired_files_;  // data 路径（hint 同名派生）
+    std::vector<std::string> retired_files_;  // data 路径（S43-8 起 data-only）
     void retire_files(std::vector<std::string> paths) noexcept;
     void drain_retired_files() noexcept;
 
@@ -1345,20 +1369,18 @@ private:
     void maybe_flush_oki_unlocked() noexcept;   // 锁外站点包装（自取锁）
     // S14-1：水位捕获与快照写入拆分。RunFn 路径（checkpoint()/自动 ckpt）
     // 必须在**提交时刻**（writer 侧）捕获字节水位、reducer 执行时刻写快照
-    // 本体——执行时取水位会被并发写者推进，反转「keydir_covered ≤
+    // 本体——执行时取水位会被并发写者推进，反转「authority_covered ≤
     // search_covered」保存序不变量（路线 A §4），fold 跳过 search 未覆盖区。
     [[nodiscard]] std::optional<
         std::vector<std::pair<std::uint32_t, std::uint64_t>>>
     collect_snapshot_watermarks() const noexcept;
-    void write_keydir_snapshot(
-        const std::vector<std::pair<std::uint32_t, std::uint64_t>>& wms) noexcept;
 
 public:
     // 访问共享 IndexPool（借用自 registry）
     [[nodiscard]] IndexPool* index_pool() { return index_pool_; }
 
     // 内部辅助
-    [[nodiscard]] std::expected<void, CaskFault> load_keydir_from_disk();
+    [[nodiscard]] std::expected<void, CaskFault> load_authority_from_disk();
     [[nodiscard]] std::expected<void, CaskFault> ensure_active_writer();
 
     // P4：组提交。每次写后调用；sync_every_n>0 且累计写数达阈值时 fsync 一次
@@ -1404,13 +1426,13 @@ public:
     [[nodiscard]] std::expected<RecoverySnapshots, CaskFault>
     load_recovery_snapshots();
 
-    // checkpoint delta 链重放钩子——把 delta 行/删除/keydir 元数据应用到
-    // keydir，推进恢复水位。S18-2：类型换 index::（docmap 持久化归宿主，
+    // checkpoint delta 链重放钩子——把 delta 行/删除/authority 元数据应用到
+    // authority，推进恢复水位。S18-2：类型换 index::（docmap 持久化归宿主，
     // 钩子只被 index::load_docmap 消费）。
-    void replay_delta_to_keydir(
+    void replay_delta_to_authority(
         const std::vector<index::DocmapDeltaRow>& rows,
         const std::vector<index::DocmapDeltaRemoval>& rems,
-        std::span<const std::byte> keydir_meta,
+        std::span<const std::byte> authority_meta,
         RecoverySnapshots& recovery);
 
     // S17-5:legacy search.ckpt → 3 个组件文件 + manifest 的一次性迁移。
@@ -1428,12 +1450,12 @@ public:
 
     // ---- 写入共用基础设施 ----
 
-    // write_and_keydir：写 data record + hint record + keydir put，
+    // write_and_keydir：写 data record + keydir put，
     // 若 keydir put 返回 kAlreadyExists 则 roll_active 后重试一次。
     // 返回最终使用的 ord / offset / total_size（供 caller 构造 IndexTask）。
     // S29-7 铺垫：record 是 caller **锁外预编码**的完整 data record（可变
     // ——本函数用 patch_data_record_ord 补真实 ord/重试 ord2 后 pwrite），
-    // 锁内不再做 O(V) 编码。key 仅用于 hint/keydir。
+    // 锁内不再做 O(V) 编码。key 仅用于 OKI/keydir。
     struct PersistedRecord {
         std::uint64_t ord;
         std::uint64_t offset;
@@ -1452,7 +1474,7 @@ public:
     // 入队;拿到 write_mu_ 者为 leader,按**队列序**整批处理——逐条
     // alloc_ord + patch + 累积,一次 pwrite 落盘整批(合并 syscall,字节仍
     // 在各 caller 返回前持久 → [WAL data file = immediate durable] 语义
-    // 不变),再逐条 hint/keydir/收尾;follower 只在自己的结果槽上等
+    // 不变),再逐条 OKI/keydir/收尾;follower 只在自己的结果槽上等
     // (gc_cv_,100µs 超时兜底自转 leader——避免给所有 write_mu_ 释放点
     // 加通知)。**队列序 == ord 序 == 文件序**(恢复硬不变量)由「leader
     // 独占 write_mu_ + 按队列序 alloc_ord + 顺序追加」保证。

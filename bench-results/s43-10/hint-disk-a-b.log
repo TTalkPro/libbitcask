@@ -1,0 +1,37 @@
+# S43-10 hint disk A/B
+date_utc=2026-11-15T23:26:26+08:00
+docs=100000 keylen=20 binary_before=cce59d4 binary_after=working-tree-6.9.0
+
+[before-build]
+Running main() from /tmp/libbitcask-s43-base/third_party/googletest/googletest/src/gtest_main.cc
+Note: Google Test filter = CheckpointRecoveryTest.DISABLED_S40KeyRssProbe
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from CheckpointRecoveryTest
+[ RUN      ] CheckpointRecoveryTest.DISABLED_S40KeyRssProbe
+[       OK ] CheckpointRecoveryTest.DISABLED_S40KeyRssProbe (796 ms)
+[----------] 1 test from CheckpointRecoveryTest (796 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (796 ms total)
+[  PASSED  ] 1 test.
+before_hint_files=1
+before_hint_bytes=3200012
+
+[after-open]
+Running main() from /home/david/workspace/libbitcask/third_party/googletest/googletest/src/gtest_main.cc
+Note: Google Test filter = CheckpointRecoveryTest.DISABLED_S40KeyRssProbe
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from CheckpointRecoveryTest
+[ RUN      ] CheckpointRecoveryTest.DISABLED_S40KeyRssProbe
+[s40-probe] docs=100000 keylen=20 heap_delta=29.23 MB rss_delta=53 MB (306.5 B/doc heap)
+[       OK ] CheckpointRecoveryTest.DISABLED_S40KeyRssProbe (355 ms)
+[----------] 1 test from CheckpointRecoveryTest (356 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (356 ms total)
+[  PASSED  ] 1 test.
+after_hint_files=0
+after_hint_bytes=0
+after_oki_run_bytes=1319099

@@ -5,12 +5,89 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.8.1`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.9.0`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
-hint = **BCH5**，OKI = **BCOK v1/v2 / BCOM v1-v3**，keydir 快照 = **BCKS v3/v4**，
+hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
+keydir 快照 = 历史 BCKS v3/v4（不再生成），
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
+
+---
+
+## [6.9.0] - 2026-11-15（S43：OKI-only 权威、data-only recovery 与 KeyDir/hint 退役）
+
+> **版本语义**：内部架构能力收敛与盘上辅助布局变化；公共 C++ / C API
+> 既有签名与 ABI 零破坏（`SOVERSION` 保持 `6`）。`data` 仍唯一持久真相，
+> OKI 成为查找/提交权威。取 MINOR +1（6.9.0）。
+
+### Added
+
+- **C API 新错误码（纯追加，S43-1）**：`BITCASK_ERR_INDEX_CORRUPT = 16`
+  （枚举尾部追加，既有取值不变），对应 C++ `CaskError::kIndexCorrupt`：
+  索引定位成功但读回 record 的 key / ord 与请求不一致时显式报错，
+  绝不返回别的 key 的 value，也不折叠成 NotFound。
+- **Rollout gate 与恢复语义守门（S43-0/10）**：新增
+  `S43RolloutGateTest`（随机 reference model、迁移/损坏矩阵、K1-K15
+  崩溃窗口）与 `OkiOnlyContractTest`（点查生命周期、data-only reopen、
+  atomic batch 语义）。
+- **磁盘与内存量化基准（S43-10）**：新增 `BM_Merge_DiskAccounting`
+  （data/OKI/hint 物理字节与增量写放大）与 `BM_Oki_OpenRssProbe`
+  （健康 manifest 开库 RSS 上界）；`BM_Oki_MemProbe` 增加 1M 档。
+  原始 JSON/日志归档在 `bench-results/s43-10/`。
+
+### Changed
+
+- **OKI-only 查找权威（S43）**：`get`、写路径、range/iterator、merge
+  relocation、ord/file-id/fstats 都直接走 `OkiState`/`IndexAuthority`；
+  内存 KeyDir 与 `KeyDirRegistry` 实现退役，多 Cask 同目录共享、
+  write lock 与 multi-lib 线程限制语义保持。坏索引返回显式
+  `kIndexCorrupt`，可写读者触发 data-only 受控重建，绝不静默返回
+  其他 key 的 value 或折叠成 NotFound。
+
+- **Data-only recovery 与提交点（S43）**：BCOK v3 用 sparse block CRC
+  把 100M 元数据冷开从约 2.5 s 降到约 0.414 s；BCOM v4 保存全局
+  next_ord/file-id/key 数/fstats 元数据。健康 Level B v4 按 data 字节
+  水位 streaming replay；manifest/run 损坏、水位越界或旧 Level A 显式
+  fallback/rebuild。K1-K15 写、checkpoint、merge 崩溃窗口由集中
+  rollout gate 与专项 recovery/merge 测试守门。
+
+- **迁移与磁盘布局（S43-8/9）**：新库不再写 `.hint` 和
+  `kv.keydir.ckpt`；可写打开惰性清理历史 hint。旧库带 hint、v3
+  manifest/BCKS 可打开并迁移；目标目录 data-only，旧二进制缺少辅助
+  缓存时退慢速 data fold。备份只复制 `.data` + 当前 OKI 提交集。
+  回退依赖 data 唯一真相与 v1-v3 manifest reader，而不是重建已退役
+  的运行时缓存。
+
+- **Rollout 基线**：本地 i9-13900H Release/LTO 下热点查约
+  806 ns/op，冷块 p50/p99 4.57/7.41 µs；100k 均匀写 2.707 µs/op，
+  100k Zipf(s=1) 覆盖写 1.599 µs/op；
+  snapshot/full-fold 开库 7.10/11.7 ms；20k merge 约 60.7 MiB/s
+  （636k rows/s）。冷点查与均匀写退化已量化，接受换取消除
+  KeyDir 常驻结构并统一提交集。报告见
+  `docs/design/s43-okionly-rollout-report-zh.md`。
+- **内存/磁盘账**：100k KV RSS A/B 显示 memdelta 净增从 6.8.1 的
+  26.37 MiB 降到 7.60 MiB（-71.2%），rebuild 峰值从 37.14 MiB 降到
+  17.60 MiB；20k merge 的 value 增量写放大实测 0.1533，同时历史 hint
+  在可写迁移后从 3.05 MiB 清理为 0。
+
+### Removed
+
+- **`.hint` 写路径与历史 hint 辅助缓存（S43-8）**：新库不再生成
+  `*.hint`；可写打开惰性清理历史 hint 文件（旧 hint 退化为不可信缓存，
+  损坏或缺失都不改变恢复语义）。
+- **内存 KeyDir 与 `kv.keydir.ckpt`（S43-9）**：删除 `KeyDir` /
+  `KeyDirRegistry` 实现与 checkpoint 写路径；查找、写入、range、
+  merge 全部改由 OKI ReadView 裁决，多 Cask 同目录共享改由
+  `IndexAuthority` / `IndexRegistry` 承担。
+
+### Validation
+
+- GCC Release 全量 ctest **808/808**；ASan/UBSan 全量 **808/808**；
+  TSan 全量 **807 executed / 0 failed**（一项平台 skip；RSS probes
+  保持 disabled）；GCC Release `-Werror` 全树干净。
+- 新增 `S43RolloutGateTest` 7 项随机模型、迁移/损坏与崩溃窗口验收，
+  Release 和 ASan 均 7/7 通过。
 
 ---
 

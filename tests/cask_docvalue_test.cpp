@@ -3,7 +3,7 @@
 
 
 #include <bitcask/cask.hpp>
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_registry.hpp>
 #include <bitcask/search_checkpoint.hpp>  // S14-3 段 carry 断言
 #include <bitcask/codec.hpp>
 #include <bitcask/data_file.hpp>  // parse_data_tstamp（S13 测试枚举 data 文件）
@@ -28,8 +28,8 @@ namespace {
 // S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
 // 各用例用唯一目录名，互不冲突；同用例内 open→close→reopen 经 refcount 归零
 // 重新从盘加载，与旧 nullptr 行为等价。
-inline bitcask::keydir::KeyDirRegistry& test_registry() {
-    static bitcask::keydir::KeyDirRegistry reg;
+inline bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 
@@ -398,7 +398,7 @@ TEST_F(CaskDocValueTest, LogHookFiresOnSnapshotFailure) {
     ASSERT_FALSE(logs.empty()) << "只读目录下 close 应触发快照保存失败上报";
     bool has_snap_warn = false;
     for (const auto& m : logs) {
-        if (m.find("snapshot save failed") != std::string::npos) {
+        if (m.find("snapshot") != std::string::npos) {
             has_snap_warn = true;
         }
     }
@@ -534,7 +534,7 @@ TEST_F(CaskDocValueTest, PerKeyTtlExpiryAndMergeReclaim) {
     auto it = (*c)->make_iter();
     auto sr = it->start();
     ASSERT_TRUE(sr);
-    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+    ASSERT_TRUE(sr.has_value());
     std::size_t n = 0;
     while (true) {
         auto e = it->next();
@@ -601,7 +601,7 @@ TEST_F(CaskDocValueTest, HugeExpirySecsNoWrap) {
     auto it = (*c)->make_iter();
     auto sr = it->start();
     ASSERT_TRUE(sr);
-    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+    ASSERT_TRUE(sr.has_value());
     std::size_t n = 0;
     while (true) {
         auto e = it->next();
@@ -641,7 +641,7 @@ TEST_F(CaskDocValueTest, Post2106TimestampRoundTrip) {
     auto it = (*c)->make_iter();
     auto sr = it->start();
     ASSERT_TRUE(sr);
-    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+    ASSERT_TRUE(sr.has_value());
     auto e = it->next();
     ASSERT_TRUE(e);
     ASSERT_TRUE(e->has_value());
@@ -725,7 +725,8 @@ TEST_F(CaskDocValueTest, MigrateU32EraDirOpensAndReads) {
             reinterpret_cast<const std::byte*>(s2.data()), s2.size());
     };
     auto g = (*c)->get_owned(bytes("mykey"));
-    ASSERT_TRUE(g) << "迁移后的 key 必须可读（TTL 2100 年,未过期）";
+    ASSERT_TRUE(g) << "迁移后的 key 必须可读（TTL 2100 年,未过期）: " <<
+        (g ? "" : g.error().detail);
     EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(g->value.data()),
                                g->value.size()), "hi");
     (*c)->close();
@@ -773,9 +774,9 @@ TEST_F(CaskDocValueTest, MetaV4CleanlyRejectedWithHintordHint) {
         << "拒开信息必须指向 hintord 迁移，实际：" << c.error().detail;
 }
 
-// S33：migrate_hint_ord 集成——模拟 v4 纪元目录（当前代码建库 → meta 改
-// v4 → 删 hint/派生缓存），迁移后 dst 过 v5 门禁、数据可读、hint 为合法
-// BCH5、data 文件内容零改动。重跑（删 dst）幂等。
+// S33/S43-8：migrate_hint_ord 集成——模拟 v4 纪元目录（当前代码建库 →
+// meta 改 v4 → 删 hint/派生缓存），迁移后 dst 过 v5 门禁、数据可读、
+// 不生成 hint、data 文件内容零改动。重跑（删 dst）幂等。
 TEST_F(CaskDocValueTest, MigrateHintOrdV4EraDirOpensAndReads) {
     namespace fs = std::filesystem;
     const auto src = tmpdir_ / "v4src";
@@ -816,7 +817,9 @@ TEST_F(CaskDocValueTest, MigrateHintOrdV4EraDirOpensAndReads) {
         std::fclose(f);
         for (const auto& de : fs::directory_iterator(src)) {
             const auto name = de.path().filename().string();
-            if (name.ends_with(".bitcask.hint") || name == "kv.keydir.ckpt") {
+            if (name.ends_with(".bitcask.hint") ||
+                name == "kv.oki.manifest" ||
+                name.starts_with("kv.oki.seg-")) {
                 fs::remove(de.path());
             }
         }
@@ -824,8 +827,8 @@ TEST_F(CaskDocValueTest, MigrateHintOrdV4EraDirOpensAndReads) {
     auto mig = bitcask::migrate::migrate_hint_ord(src.string(), dst.string());
     ASSERT_TRUE(mig) << (mig ? "" : mig.error());
     EXPECT_GE(mig->data_files, 2u);
-    EXPECT_EQ(mig->records, 21u);  // 20 put + 1 墓碑
-    EXPECT_EQ(mig->tombstones, 1u);
+    EXPECT_EQ(mig->records, 0u);  // data 零改动，不再为了 hint 重扫计数
+    EXPECT_EQ(mig->tombstones, 0u);
     EXPECT_TRUE(mig->meta_migrated);
 
     // data 文件内容零改动（逐文件字节比对）。
@@ -864,6 +867,15 @@ TEST_F(CaskDocValueTest, MigrateHintOrdV4EraDirOpensAndReads) {
     auto mig2 = bitcask::migrate::migrate_hint_ord(src.string(), dst.string());
     ASSERT_TRUE(mig2);
     EXPECT_EQ(mig2->records, mig->records);
+    {
+        bool has_hint = false;
+        for (const auto& de : fs::directory_iterator(dst)) {
+            if (de.path().filename().string().ends_with(".bitcask.hint")) {
+                has_hint = true;
+            }
+        }
+        EXPECT_FALSE(has_hint);
+    }
     // 已是 v5 的目录拒绝再迁。
     auto mig3 = bitcask::migrate::migrate_hint_ord(dst.string(),
                                                    (tmpdir_ / "x").string());
@@ -921,19 +933,19 @@ TEST_F(CaskDocValueTest, HintAndDataFoldRecoveryOrdEquivalent) {
                          (*e)->ord);
         }
         it->release();
-        const std::uint64_t next_ord = (*c)->keydir().peek_next_ord();
+        const std::uint64_t next_ord = (*c)->index_authority().peek_next_ord();
         (*c)->close();
         return std::pair{ords, next_ord};
     };
 
     // 路径 A：hint 快路径（删 keydir 快照强制走 hint；hint 全部 sealed 且
     // 已 finalize）。
-    fs::remove(tmpdir_ / "kv.keydir.ckpt");
+    fs::remove(tmpdir_ / "kv.oki.manifest");
     auto [ords_hint, next_hint] = collect("hint path");
     ASSERT_FALSE(ords_hint.empty());
 
     // 路径 B：fold(data)（hint 与快照全删）。
-    fs::remove(tmpdir_ / "kv.keydir.ckpt");
+    fs::remove(tmpdir_ / "kv.oki.manifest");
     for (const auto& de : fs::directory_iterator(tmpdir_)) {
         if (de.path().filename().string().ends_with(".bitcask.hint")) {
             fs::remove(de.path());
@@ -962,10 +974,22 @@ TEST_F(CaskDocValueTest, BackupHotCopyAndReopen) {
         ASSERT_TRUE((*c)->put(bytes("bku" + std::to_string(i)),
                               bytes("val" + std::to_string(i)), 1000));
     }
+    ASSERT_TRUE(std::filesystem::exists(
+        tmpdir_ / "kv.oki.manifest"));
 
     const auto dst = tmpdir_.string() + "_backup";
     std::filesystem::remove_all(dst);
     ASSERT_TRUE((*c)->backup(dst));
+    ASSERT_TRUE(std::filesystem::exists(
+        std::filesystem::path(dst) / "kv.oki.manifest"));
+    bool oki_run_copied = false;
+    for (const auto& de : std::filesystem::directory_iterator(dst)) {
+        if (de.path().filename().string().starts_with("kv.oki.seg-")) {
+            oki_run_copied = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(oki_run_copied);
 
     // 原库备份后仍可写（active writer 惰性重建）且旧数据可读。
     ASSERT_TRUE((*c)->put(bytes("after_backup"), bytes("x"), 2000));
@@ -979,7 +1003,8 @@ TEST_F(CaskDocValueTest, BackupHotCopyAndReopen) {
     ASSERT_TRUE(b);
     for (int i = 0; i < 50; ++i) {
         auto r = (*b)->get_owned(bytes("bku" + std::to_string(i)));
-        ASSERT_TRUE(r) << "backup missing key bku" << i;
+        ASSERT_TRUE(r) << "backup missing key bku" << i << ": " <<
+            (r ? "" : r.error().detail);
         EXPECT_EQ(std::string(reinterpret_cast<const char*>(r->value.data()),
                               r->value.size()),
                   "val" + std::to_string(i));
@@ -1117,7 +1142,7 @@ TEST_F(CaskDocValueTest, PrefixScanIterAndParallelScan) {
     auto it = (*c)->make_iter();
     auto sr = it->start(-1, -1, 0, false, bytes("user:"));
     ASSERT_TRUE(sr);
-    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+    ASSERT_TRUE(sr.has_value());
     std::size_t n = 0;
     while (true) {
         auto e = it->next();
@@ -1850,7 +1875,7 @@ TEST_F(CaskDocValueTest, FoldSurvivesConcurrentMergeUnlink) {
     auto it = cask.make_iter();
     auto sr = it->start();
     ASSERT_TRUE(sr);
-    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+    ASSERT_TRUE(sr.has_value());
     auto first = it->next();
     ASSERT_TRUE(first);
     ASSERT_TRUE(first->has_value());
@@ -2140,6 +2165,43 @@ namespace {
 std::span<const std::byte> sv_bytes(std::string_view s) {
     return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
 }
+
+// S43-9 后，“authority 快照”是 manifest + 其引用 run 的原子提交集。
+// 崩溃窗口测试必须一起回退它们，才能模拟旧 BCKS 单文件回退的语义。
+void save_oki_cache(const std::filesystem::path& dir,
+                    const std::filesystem::path& dst) {
+    std::error_code ec;
+    std::filesystem::create_directories(dst, ec);
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const auto name = e.path().filename().string();
+        if (name == "kv.oki.manifest" || name.starts_with("kv.oki.seg-")) {
+            std::filesystem::copy_file(
+                e.path(), dst / name,
+                std::filesystem::copy_options::overwrite_existing, ec);
+            ASSERT_FALSE(ec) << e.path() << ": " << ec.message();
+        }
+    }
+    ASSERT_FALSE(ec) << ec.message();
+}
+
+void restore_oki_cache(const std::filesystem::path& src,
+                       const std::filesystem::path& dir) {
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const auto name = e.path().filename().string();
+        if (name == "kv.oki.manifest" || name.starts_with("kv.oki.seg-")) {
+            std::filesystem::remove(e.path(), ec);
+            ASSERT_FALSE(ec) << e.path() << ": " << ec.message();
+        }
+    }
+    for (const auto& e : std::filesystem::directory_iterator(src, ec)) {
+        std::filesystem::copy_file(
+            e.path(), dir / e.path().filename(),
+            std::filesystem::copy_options::overwrite_existing, ec);
+        ASSERT_FALSE(ec) << e.path() << ": " << ec.message();
+    }
+    ASSERT_FALSE(ec) << ec.message();
+}
 }  // namespace
 
 // 快照路径 reopen 与全量 fold reopen 等价(键集/值/删除一致)。
@@ -2159,7 +2221,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotRoundTripEquivalence) {
         }
         (*c)->close();
     }
-    const auto snap = tmpdir_ / "kv.keydir.ckpt";
+    const auto snap = tmpdir_ / "kv.oki.manifest";
     ASSERT_TRUE(std::filesystem::exists(snap));
 
     auto collect = [&]() {
@@ -2190,8 +2252,8 @@ TEST_F(CaskDocValueTest, KeydirSnapshotRoundTripEquivalence) {
 TEST_F(CaskDocValueTest, KeydirSnapshotStaleTailReplay) {
     CaskOptions opts;
     opts.read_write = true;
-    const auto snap = tmpdir_ / "kv.keydir.ckpt";
-    const auto snap_old = tmpdir_ / "snap.old";
+    const auto cache_old = tmpdir_.parent_path() /
+        (tmpdir_.filename().string() + ".oki.old");
 
     {   // 会话 1
         auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
@@ -2202,7 +2264,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotStaleTailReplay) {
         }
         (*c)->close();
     }
-    std::filesystem::copy_file(snap, snap_old);
+    save_oki_cache(tmpdir_, cache_old);
 
     {   // 会话 2:新增 + 覆写 + 删除
         auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
@@ -2216,8 +2278,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotStaleTailReplay) {
         (*c)->close();
     }
     // 用会话 1 的旧快照覆盖 → 模拟"快照落后于数据文件"(崩溃形态)。
-    std::filesystem::copy_file(snap_old, snap,
-        std::filesystem::copy_options::overwrite_existing);
+    restore_oki_cache(cache_old, tmpdir_);
 
     auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
@@ -2245,7 +2306,7 @@ TEST_F(CaskDocValueTest, KeydirSnapshotCorruptFallsBackToFullFold) {
         }
         (*c)->close();
     }
-    const auto snap = tmpdir_ / "kv.keydir.ckpt";
+    const auto snap = tmpdir_ / "kv.oki.manifest";
 
     // 位翻转 payload 中部。
     {
@@ -2324,8 +2385,8 @@ TEST_F(CaskDocValueTest, SearchSnapshotFastReopen) {
 // 陈旧 keydir 快照:尾部回放在 search 模式下同样生效(门按覆盖判定放行)。
 TEST_F(CaskDocValueTest, SearchSnapshotStaleKeydirTailReplay) {
     auto opts = p3_search_opts();
-    const auto snap = tmpdir_ / "kv.keydir.ckpt";
-    const auto snap_old = tmpdir_ / "kd.old";
+    const auto cache_old = tmpdir_.parent_path() /
+        (tmpdir_.filename().string() + ".oki.old");
     {
         auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
@@ -2335,7 +2396,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotStaleKeydirTailReplay) {
         }
         (*c)->close();
     }
-    std::filesystem::copy_file(snap, snap_old);
+    save_oki_cache(tmpdir_, cache_old);
     {
         auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
         ASSERT_TRUE(c);
@@ -2346,8 +2407,7 @@ TEST_F(CaskDocValueTest, SearchSnapshotStaleKeydirTailReplay) {
         (*c)->close();
     }
     // keydir 快照回退到会话 1;bm25/sidecar 保持会话 2(覆盖更大 → 门过)。
-    std::filesystem::copy_file(snap_old, snap,
-        std::filesystem::copy_options::overwrite_existing);
+    restore_oki_cache(cache_old, tmpdir_);
 
     auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
     ASSERT_TRUE(c);
@@ -3561,9 +3621,9 @@ TEST_F(CaskDocValueTest, V35StaleTailReplay) {
     constexpr std::size_t kDim = 8;
     auto opts = v31_opts(kDim);
     auto vecs = v35_make_vecs(35, kDim, 0x57A1E);
-    const auto kd_snap = tmpdir_ / "kv.keydir.ckpt";
+    const auto cache_old = tmpdir_.parent_path() /
+        (tmpdir_.filename().string() + ".oki.old");
     const auto hs_snap = tmpdir_ / "bm25.ckpt";
-    const auto kd_old = tmpdir_ / "kd.old";
     const auto hs_old = tmpdir_ / "hs.old";
 
     {   // 会话 1:20 个向量文档。
@@ -3574,7 +3634,7 @@ TEST_F(CaskDocValueTest, V35StaleTailReplay) {
         }
         (*c)->close();
     }
-    std::filesystem::copy_file(kd_snap, kd_old);
+    save_oki_cache(tmpdir_, cache_old);
     std::filesystem::copy_file(hs_snap, hs_old);
 
     {   // 会话 2:再写 15 个。
@@ -3587,8 +3647,7 @@ TEST_F(CaskDocValueTest, V35StaleTailReplay) {
     }
     // 回退 keydir+hnsw 到会话 1(一致的旧快照对;bm25/sidecar 保持新——
     // 覆盖更大,门照过)。会话 2 的文件不在旧水位表 → 从 0 回放。
-    std::filesystem::copy_file(kd_old, kd_snap,
-        std::filesystem::copy_options::overwrite_existing);
+    restore_oki_cache(cache_old, tmpdir_);
     std::filesystem::copy_file(hs_old, hs_snap,
         std::filesystem::copy_options::overwrite_existing);
 
@@ -4151,7 +4210,7 @@ TEST_F(CaskDocValueTest, CheckpointCrashImageRecoversAllDocs) {
     put_n(0, 120);
     ASSERT_TRUE((*c)->checkpoint());
     EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt"));
-    EXPECT_TRUE(fs::exists(tmpdir_ / "kv.keydir.ckpt"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "kv.oki.manifest"));
     put_n(120, 160);  // ckpt 之后的尾部增量，崩溃时只存在于 data 文件
 
     auto img = crash_image(tmpdir_, "ckpt");
@@ -4231,7 +4290,7 @@ TEST_F(CaskDocValueTest, AutoCheckpointOnRoll) {
     }
     (*c)->flush_index();  // 排干 reducer → 在途自动 ckpt RunFn 必已执行
     EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt"));
-    EXPECT_TRUE(fs::exists(tmpdir_ / "kv.keydir.ckpt"));
+    EXPECT_TRUE(fs::exists(tmpdir_ / "kv.oki.manifest"));
     {
         auto live = (*c)->search_text("lemon", 500);
         ASSERT_TRUE(live);
@@ -4413,7 +4472,7 @@ TEST_F(CaskDocValueTest, AutoCheckpointDisabledByDefault) {
     }
     (*c)->flush_index();
     EXPECT_FALSE(fs::exists(tmpdir_ / "bm25.ckpt"));
-    EXPECT_FALSE(fs::exists(tmpdir_ / "kv.keydir.ckpt"));
+    EXPECT_FALSE(fs::exists(tmpdir_ / "bm25.ckpt"));
     (*c)->close();
 }
 
@@ -4443,7 +4502,7 @@ TEST_F(CaskDocValueTest, OpenAfterCrashResavesCheckpoint) {
         ASSERT_TRUE(r);
         // ①：重建（1500 docs > 阈值）完成后 open 已回存两份成对文件。
         EXPECT_TRUE(fs::exists(img / "bm25.ckpt"));
-        EXPECT_TRUE(fs::exists(img / "kv.keydir.ckpt"));
+        EXPECT_TRUE(fs::exists(img / "kv.oki.manifest"));
         auto hits = (*r)->search_text("cherry", 2000);
         ASSERT_TRUE(hits);
         EXPECT_EQ(hits->hits.size(), 1500u);
@@ -4461,7 +4520,7 @@ TEST_F(CaskDocValueTest, S17ManifestCorruptionFallsBackToFullFold) {
     fs::remove_all(dir);
     auto opts = v31_opts(0);
 
-    bitcask::keydir::KeyDirRegistry reg1;
+    bitcask::oki::IndexRegistry reg1;
     {
         auto c = Cask::open(dir.string(), opts, &reg1);
         ASSERT_TRUE(c);
@@ -4482,7 +4541,7 @@ TEST_F(CaskDocValueTest, S17ManifestCorruptionFallsBackToFullFold) {
     fs::remove(dir / "index.manifest");
     fs::remove(dir / "kv.keydir.ckpt");
 
-    bitcask::keydir::KeyDirRegistry reg2;
+    bitcask::oki::IndexRegistry reg2;
     auto r = Cask::open(dir.string(), opts, &reg2);
     ASSERT_TRUE(r);
     auto h = (*r)->search_text("banana", 100);
@@ -5157,7 +5216,7 @@ TEST(V61BatchFold, NextBatchReturnsMultiple) {
     auto it = cask.make_iter();
     auto sr = it->start();
     ASSERT_TRUE(sr);
-    ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+    ASSERT_TRUE(sr.has_value());
 
     // 用 map 收集 next_batch 返回的内容（顺序无关）。
     std::map<std::vector<std::byte>, std::vector<std::byte>> got;

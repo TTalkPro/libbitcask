@@ -9,7 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <bitcask/cask.hpp>
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_registry.hpp>
 
 #include "support/crash_child.hpp"
 #include "support/test_paths.hpp"
@@ -35,8 +35,8 @@ using bitcask::Cask;
 using bitcask::CaskError;
 using bitcask::CaskOptions;
 
-inline bitcask::keydir::KeyDirRegistry& test_registry() {
-    static bitcask::keydir::KeyDirRegistry reg;
+inline bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 

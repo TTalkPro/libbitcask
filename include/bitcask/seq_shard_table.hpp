@@ -18,7 +18,7 @@
 //              free:key/值先 move 进 limbo,swap-with-last 只搬指针。
 //
 // === 并发契约 ===
-//   写者:外部互斥(KeyDir 分片锁),表内所有变更方法自动 bump seq。
+//   写者:外部互斥(authority 分片锁),表内所有变更方法自动 bump seq。
 //   乐观读者:try_get_optimistic()——不持锁;进入前必须已在
 //     epoch::Registry 注册槽位(存活性依据:注册后 retire 的 stamp ≥ 读者
 //     epoch ⇒ limbo 不回收 ⇒ 已 copy 的指针 deref 恒安全)。
@@ -216,7 +216,7 @@ public:
 
     // ---- 乐观读(不持锁;评审决议 ① TSan 豁免——论证见文件头/设计 §6.2) ----
     // 前置:caller 已在 epoch::Registry 注册活跃槽位。命中时把 T 的原始字节
-    // 拷入 out(caller 负责按可乐观消费的判别解释——KeyDir 只认 Single
+    // 拷入 out(caller 负责按可乐观消费的判别解释——authority 只认 Single
     // POD,其余回退加锁);kMiss 为权威不存在;kRetry = 撕裂/写者活跃。
 #if defined(__clang__) || defined(__GNUC__)
     BITCASK_NO_SANITIZE("thread")

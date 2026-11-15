@@ -30,7 +30,7 @@ DataFile::open(std::string_view path, Mode mode, bool sync, bool mmap_enabled) {
         case Mode::kCreate: flags = OpenFlag::kCreate; break;     // O_EXCL
     }
     if (sync && mode != Mode::kRead) flags = flags | OpenFlag::kOSync;
-    // W1:fd 不随 exec 泄漏给子进程(宿主 fork+exec 时,子进程持有 data/hint
+    // W1:fd 不随 exec 泄漏给子进程(宿主 fork+exec 时,子进程持有 data
     // fd 会拖住已删除文件的空间、并能读到库内容)。Windows 句柄默认不继承。
     flags = flags | OpenFlag::kCloseOnExec;
 
@@ -312,10 +312,10 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
     // S13-P6：流式 chunked pread——原实现每条 record 2 次 pread（header 23B
     // + 整条 body），百万条即两百万次 syscall；现 256 KiB 一块 + 跨 record
     // 复用，syscall 数降 3 个数量级。
-    // 影响面：merge 全部输入文件扫描、搜索模式恢复（有 search 时 hint 快路径
-    // 被跳过恒走 data fold）、纯 KV 无 hint 回退。buffer thread_local：fold
+    // 影响面：merge 全部输入文件扫描、搜索模式恢复与纯 KV data fold。
+    // buffer thread_local：fold
     // 可被多 reader 并发调同一 DataFile——pread 线程安全，buf 不能共享。
-    // T23：refill 归并进 detail::ChunkedReader（与 hint fold 共享实现）。
+    // T23：refill 归并进 detail::ChunkedReader。
     static thread_local detail::ThreadLocalBuffer buf;
     detail::ChunkedReader rd(file_, buf, total);
 
@@ -350,7 +350,7 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
             auto r = rd.refill(offset, rec_total);
             if (!r) return std::unexpected(io_fault(r.error()));
         }
-        if (rd.avail() < rec_total) break;  // 短读当 EOF（同 hint fold）
+        if (rd.avail() < rec_total) break;  // 短读当 EOF
 
         auto rec = codec::decode_data_record(
             std::span<const std::byte>(rd.cursor(), rec_total));
@@ -432,21 +432,6 @@ std::string mk_data_filename(std::string_view dirname, std::uint64_t tstamp) {
     std::filesystem::path p = bitcask::detail::from_utf8(dirname);
     p /= (std::to_string(tstamp) + ".bitcask.data");
     return bitcask::detail::to_utf8(p);
-}
-
-std::string mk_hint_filename(std::string_view data_path) {
-    // 把后缀 ".data" 换成 ".hint"，跟 legacy hintfile_name 完全一致；
-    // 没有 ".data" 后缀就直接 append（兜底，正常路径不会走到）。
-    constexpr std::string_view kData = ".data";
-    constexpr std::string_view kHint = ".hint";
-    std::string out(data_path);
-    if (out.size() >= kData.size() &&
-        out.compare(out.size() - kData.size(), kData.size(), kData) == 0) {
-        out.replace(out.size() - kData.size(), kData.size(), kHint);
-    } else {
-        out.append(kHint);
-    }
-    return out;
 }
 
 std::optional<std::uint64_t>

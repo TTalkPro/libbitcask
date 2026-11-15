@@ -204,7 +204,7 @@ std::uint32_t crc32_pclmul(std::uint32_t crc_internal,
 }
 
 // S29-10：16..63 字节小块 PCLMULQDQ 内核。大内核（crc32_pclmul）Step 1 无条件
-// 读 4×16 字节 → 有 64B 下限；流式增量场景（hint/WAL 帧,每次 16-48B）恒落
+// 读 4×16 字节 → 有 64B 下限；流式增量场景（WAL 帧,每次 16-48B）恒落
 // bytewise 表路径。本内核处理 nblocks16 个 16 字节块（loadu,**无对齐要求**
 // ——小块走头对齐反而会把整块拆碎成 bytewise）：首块 XOR seed,后续块各一次
 // (k3,k4) 折叠,收尾与大内核 Step 5-7 完全一致（128→64→32 + Barrett）。

@@ -33,7 +33,8 @@ using bitcask::test::crash_exit;
 #include <bitcask/cask.hpp>
 #include <bitcask/codec.hpp>
 #include <bitcask/data_file.hpp>
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_authority.hpp>
+#include <bitcask/index_registry.hpp>
 #include <bitcask/oki_run.hpp>
 #include <bitcask/oki_state.hpp>
 
@@ -43,8 +44,8 @@ using bitcask::CaskOptions;
 
 namespace {
 
-bitcask::keydir::KeyDirRegistry& test_registry() {
-    static bitcask::keydir::KeyDirRegistry reg;
+bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 
@@ -53,6 +54,10 @@ std::span<const std::byte> bytes(std::string_view s) {
 }
 
 std::string val_of(int i) { return "value-" + std::to_string(i); }
+
+std::string as_string(std::span<const std::byte> b) {
+    return {reinterpret_cast<const char*>(b.data()), b.size()};
+}
 
 // S37-2：原为 OkiLevelBTest 的成员——崩溃场景函数在命名空间作用域，够不着。
 // 纯函数（只由 budget 决定），外提无副作用。
@@ -63,15 +68,10 @@ CaskOptions levelb_opts(std::size_t budget) {
     return o;
 }
 
-// 物理驻留条目数（含墓碑 sentinel——直方图口径）。
-std::uint64_t physical_entries(bitcask::keydir::KeyDir& kd) {
-    return kd.key_length_histogram().total;
-}
-
-// fstats 活 key 总和（merge 触发的输入——逐出态下必须保持逻辑精确）。
-std::uint64_t fstats_live_sum(bitcask::keydir::KeyDir& kd) {
+// fstats 活 key 总和（authority ledger 是 per-file 逻辑账本的唯一来源）。
+std::uint64_t fstats_live_sum(bitcask::oki::IndexAuthority& authority) {
     std::uint64_t sum = 0;
-    for (const auto& f : kd.info().fstats) sum += f.live_keys;
+    for (const auto& f : authority.fstats()) sum += f.live_keys;
     return sum;
 }
 
@@ -95,121 +95,40 @@ protected:
 
 }  // namespace
 
-// 预算逐出：写入远超预算 → 物理驻留有界；全部 key 可读（冷路径）；
-// 逻辑 key_count 与 fstats 活计数保持精确。
-TEST_F(OkiLevelBTest, EvictionKeepsResidencyBoundedAndCountsExact) {
-    constexpr int kKeys = 8000;
-    constexpr std::size_t kBudget = 1024;  // per-shard = max(1024/256,8) = 8
-    auto c = Cask::open(dir_.string(), levelb_opts(kBudget), &test_registry());
+// Level B 首次恢复：manifest 打戳，authority 的逻辑账本在覆盖/删除后保持
+// 精确。OKI-only 架构没有 resident-key 逐出，物理驻留不再是契约。
+TEST_F(OkiLevelBTest, AuthorityKeepsLogicalCountsExact) {
+    constexpr int kKeys = 800;
+    auto c = Cask::open(dir_.string(), levelb_opts(512), &test_registry());
     ASSERT_TRUE(c);
-    auto& kd = (*c)->keydir();
-    EXPECT_TRUE(kd.oki().manifest_level_b()) << "首开重建后 manifest 应带戳";
-    EXPECT_GT(kd.cache_budget(), 0u);
+    auto& authority = (*c)->index_authority();
+    EXPECT_TRUE(authority.state().manifest_level_b())
+        << "首开重建后 manifest 应带戳";
 
     for (int i = 0; i < kKeys; ++i) {
         ASSERT_TRUE((*c)->put(bytes("k" + std::to_string(i)),
                               bytes(val_of(i)), 1000));
     }
-    // 物理驻留 ≤ 分片预算 × 分片数 + 少量余量（采样逐出是软目标）。
-    EXPECT_LE(physical_entries(kd), 3000u)
-        << "预算 1024（分片下限 8×256=2048）下物理驻留必须有界";
-    // 逻辑计数精确（无逐出干扰）。
-    EXPECT_EQ(kd.info().key_count, static_cast<std::uint64_t>(kKeys));
+    EXPECT_EQ(authority.info().key_count, static_cast<std::uint64_t>(kKeys));
 
-    // 全部 key 可读（多数走冷路径）。
-    for (int i = 0; i < kKeys; i += 97) {
-        auto g = (*c)->get_owned(bytes("k" + std::to_string(i)));
-        ASSERT_TRUE(g.has_value()) << i;
-        EXPECT_EQ(std::string(reinterpret_cast<const char*>(g->value.data()),
-                              g->value.size()),
-                  val_of(i));
-    }
-
-    // 覆盖全部 key（多数已被逐出——D4 冷记账：key_count 不得虚增）。
     for (int i = 0; i < kKeys; ++i) {
         ASSERT_TRUE((*c)->put(bytes("k" + std::to_string(i)),
                               bytes(val_of(i) + "!"), 1500));
     }
-    EXPECT_EQ(kd.info().key_count, static_cast<std::uint64_t>(kKeys))
-        << "覆盖被逐 key 不得虚增逻辑计数";
-    EXPECT_EQ(fstats_live_sum(kd), static_cast<std::uint64_t>(kKeys))
-        << "fstats 活计数在覆盖被逐 key 后必须精确（老文件已退账）";
+    EXPECT_EQ(authority.info().key_count, static_cast<std::uint64_t>(kKeys));
+    EXPECT_EQ(fstats_live_sum(authority), static_cast<std::uint64_t>(kKeys));
 
-    // 删除 1/4（多数被逐——冷记账真退账 + 组合视图墓碑）。
     for (int i = 0; i < kKeys; i += 4) {
         ASSERT_TRUE((*c)->remove(bytes("k" + std::to_string(i)), 2000));
     }
     const auto expect_live = static_cast<std::uint64_t>(kKeys - kKeys / 4);
-    EXPECT_EQ(kd.info().key_count, expect_live)
-        << "remove 被逐 key 必须退账（返回 true 语义）";
-    EXPECT_EQ(fstats_live_sum(kd), expect_live);
-    // 删除的 key 读不到、幸存的读得到。
-    auto gd = (*c)->get_owned(bytes("k4"));
-    ASSERT_FALSE(gd.has_value());
-    EXPECT_EQ(gd.error().kind, bitcask::CaskError::kNotFound);
+    EXPECT_EQ(authority.info().key_count, expect_live);
+    EXPECT_EQ(fstats_live_sum(authority), expect_live);
+
+    auto removed = (*c)->get_owned(bytes("k4"));
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(removed.error().kind, bitcask::CaskError::kNotFound);
     ASSERT_TRUE((*c)->get_owned(bytes("k5")).has_value());
-
-    EXPECT_EQ(kd.shadow_stats().drifts, 0u);
-    (*c)->close();
-}
-
-// fold（CaskIter）与 parallel_scan 在逐出态下的完整枚举：被逐 key 不消失、
-// 值正确、删除的 key 不复活。
-TEST_F(OkiLevelBTest, FoldAndParallelScanEnumerateEvictedKeys) {
-    constexpr int kKeys = 3000;
-    auto c = Cask::open(dir_.string(), levelb_opts(512), &test_registry());
-    ASSERT_TRUE(c);
-    auto& kd = (*c)->keydir();
-
-    std::map<std::string, std::string> expect;
-    for (int i = 0; i < kKeys; ++i) {
-        const std::string k = "f" + std::to_string(i);
-        const std::string v = val_of(i);
-        ASSERT_TRUE((*c)->put(bytes(k), bytes(v), 1000));
-        expect[k] = v;
-    }
-    for (int i = 0; i < kKeys; i += 3) {  // 删 1/3
-        const std::string k = "f" + std::to_string(i);
-        ASSERT_TRUE((*c)->remove(bytes(k), 2000));
-        expect.erase(k);
-    }
-    ASSERT_LE(physical_entries(kd), 3000u);  // 确认确实在逐出态
-
-    // CaskIter 全量 fold 对拍影子 map。
-    {
-        auto it = (*c)->make_iter();
-        auto st = it->start(-1, -1, 0, false);
-        ASSERT_TRUE(st.has_value());
-        ASSERT_EQ(*st, bitcask::keydir::StartIterResult::kOk);
-        std::map<std::string, std::string> got;
-        while (true) {
-            auto e = it->next();
-            ASSERT_TRUE(e.has_value());
-            if (!e->has_value()) break;
-            std::string k(reinterpret_cast<const char*>((*e)->key.data()),
-                          (*e)->key.size());
-            std::string v(reinterpret_cast<const char*>((*e)->value.data()),
-                          (*e)->value.size());
-            EXPECT_TRUE(got.emplace(std::move(k), std::move(v)).second)
-                << "fold 不得重复输出同一 key";
-        }
-        it->release();
-        EXPECT_EQ(got, expect) << "fold 输出必须与影子 map 完全一致";
-    }
-
-    // parallel_scan 计数对拍。
-    {
-        std::atomic<std::size_t> n{0};
-        auto r = (*c)->parallel_scan(
-            4, [&](std::span<const std::byte>, const bitcask::GetResultView&) {
-                n.fetch_add(1);
-            });
-        ASSERT_TRUE(r.has_value());
-        EXPECT_EQ(*r, expect.size());
-        EXPECT_EQ(n.load(), expect.size());
-    }
-
-    EXPECT_EQ(kd.shadow_stats().drifts, 0u);
     (*c)->close();
 }
 
@@ -226,7 +145,7 @@ TEST_F(OkiLevelBTest, ReopenUsesSubsetSnapshotWithoutRebuild) {
             ASSERT_TRUE((*c)->put(bytes("s" + std::to_string(i)),
                                   bytes(val_of(i)), 1000));
         }
-        logical = (*c)->keydir().info().key_count;
+        logical = (*c)->index_authority().info().key_count;
         ASSERT_EQ(logical, static_cast<std::uint64_t>(kKeys));
         (*c)->close();
         auto m = bitcask::oki::read_manifest(dir_.string());
@@ -238,10 +157,8 @@ TEST_F(OkiLevelBTest, ReopenUsesSubsetSnapshotWithoutRebuild) {
     {
         auto c = Cask::open(dir_.string(), levelb_opts(512), &test_registry());
         ASSERT_TRUE(c);
-        auto& kd = (*c)->keydir();
+        auto& kd = (*c)->index_authority();
         EXPECT_EQ(kd.info().key_count, logical) << "v4 逻辑计数保真";
-        EXPECT_LE(physical_entries(kd), 3000u)
-            << "重开走 v4 子集快照——物理驻留必须仍有界（否则是全量 fold）";
         auto m = bitcask::oki::read_manifest(dir_.string());
         ASSERT_TRUE(m.has_value());
         std::vector<std::uint64_t> gens_after;
@@ -257,7 +174,6 @@ TEST_F(OkiLevelBTest, ReopenUsesSubsetSnapshotWithoutRebuild) {
                             g->value.size()),
                 val_of(i));
         }
-        EXPECT_EQ(kd.shadow_stats().drifts, 0u);
         (*c)->close();
     }
 }
@@ -290,7 +206,7 @@ TEST_F(OkiLevelBTest, LevelTransitionsStampAndRebuild) {
             ASSERT_TRUE(m.has_value());
             EXPECT_FALSE(m->level_b) << "Level A 写者 open 即清戳";
         }
-        EXPECT_EQ((*c)->keydir().info().key_count,
+        EXPECT_EQ((*c)->index_authority().info().key_count,
                   static_cast<std::uint64_t>(kKeys))
             << "v4 被拒 → 全量 fold，数据无损";
         for (int i = 0; i < kKeys / 2; ++i) {
@@ -321,7 +237,6 @@ TEST_F(OkiLevelBTest, LevelTransitionsStampAndRebuild) {
                 want)
                 << i;
         }
-        EXPECT_EQ((*c)->keydir().shadow_stats().drifts, 0u);
         (*c)->close();
     }
 }
@@ -347,21 +262,6 @@ TEST_F(OkiLevelBTest, MergeOnlySidecarRefusedOnLevelBDir) {
 TEST_F(OkiLevelBTest, ConcurrentWorkloadUnderEvictionZeroDrift) {
     auto c = Cask::open(dir_.string(), levelb_opts(512), &test_registry());
     ASSERT_TRUE(c);
-    auto& kd = (*c)->keydir();
-    kd.set_oki_shadow_check(true);  // 不依赖 NDEBUG
-#if defined(__SANITIZE_THREAD__)          // GCC
-#  define BITCASK_TSAN_ACTIVE 1
-#elif defined(__has_feature)              // clang
-#  if __has_feature(thread_sanitizer)
-#    define BITCASK_TSAN_ACTIVE 1
-#  endif
-#endif
-#ifdef BITCASK_TSAN_ACTIVE
-    // S29-6 seqlock 既知误报同根因（oki_range_test 同款处理）；本测试
-    // 对象是逐出/冷路径/fold 并发，关闭乐观读后仍全程受检。
-    kd.set_optimistic_reads(false);
-#endif
-
     for (int i = 0; i < 800; ++i) {
         ASSERT_TRUE((*c)->put(bytes("c" + std::to_string(i)),
                               bytes("v0"), 1000));
@@ -401,7 +301,7 @@ TEST_F(OkiLevelBTest, ConcurrentWorkloadUnderEvictionZeroDrift) {
             auto it = (*c)->make_iter();
             auto st = it->start(-1, -1, 0, false);
             if (!st) { errors.fetch_add(1); break; }
-            if (*st != bitcask::keydir::StartIterResult::kOk) continue;
+            if (!st) continue;
             while (true) {
                 auto e = it->next();
                 if (!e) { errors.fetch_add(1); break; }
@@ -413,7 +313,6 @@ TEST_F(OkiLevelBTest, ConcurrentWorkloadUnderEvictionZeroDrift) {
     for (auto& t : ts) t.join();
 
     EXPECT_EQ(errors.load(), 0);
-    EXPECT_EQ(kd.shadow_stats().drifts, 0u);
     (*c)->close();
 }
 
@@ -558,7 +457,6 @@ TEST_F(OkiLevelBTest, B1CheckpointNeverOutrunsDataFsync) {
         EXPECT_EQ(g.error().kind, bitcask::CaskError::kNotFound)
             << "掉电丢失的键必须干净缺席（悬空引用会报 kIo/kBadCrc）";
     }
-    EXPECT_EQ((*c)->keydir().shadow_stats().drifts, 0u);
     (*c)->close();
 }
 
@@ -607,7 +505,7 @@ TEST_F(OkiLevelBTest, CrashRightAfterMergeKeepsEvictedKeysReadable) {
                               g->value.size()),
                   want);
     }
-    EXPECT_EQ((*c)->keydir().info().key_count,
+    EXPECT_EQ((*c)->index_authority().info().key_count,
               static_cast<std::uint64_t>(kKeys));
     (*c)->close();
 }
@@ -619,7 +517,7 @@ TEST_F(OkiLevelBTest, TtlMergeRemovesEvictedKeysCleanly) {
     o.max_file_size = 512;
     auto c = Cask::open(dir_.string(), o, &test_registry());
     ASSERT_TRUE(c);
-    auto& kd = (*c)->keydir();
+    auto& kd = (*c)->index_authority();
 
     ASSERT_TRUE((*c)->put(bytes("ttl-ev"), bytes("doomed"), 50,
                           /*expiry_at=*/100));
@@ -629,8 +527,6 @@ TEST_F(OkiLevelBTest, TtlMergeRemovesEvictedKeysCleanly) {
                               bytes(pad), 50));
     }
     ASSERT_TRUE((*c)->checkpoint());
-    ASSERT_TRUE(kd.evict("ttl-ev"));  // 确保过期键处于逐出态
-
     // 收集 sealed 文件显式 merge（全 live 不触发策略；同 docvalue TTL 惯例）。
     std::vector<std::string> files;
     for (const auto& de : fs::directory_iterator(dir_)) {
@@ -657,7 +553,6 @@ TEST_F(OkiLevelBTest, TtlMergeRemovesEvictedKeysCleanly) {
         << "冷视图未记墓碑的话这里是悬空 kIo";
     // 计数退账精确。
     EXPECT_EQ(kd.info().key_count, 600u);
-    EXPECT_EQ(kd.shadow_stats().drifts, 0u);
     (*c)->close();
 }
 
@@ -670,7 +565,7 @@ TEST_F(OkiLevelBTest, MergeUnderEvictionManyRoundsNoKeyLoss) {
     o.max_file_size = 8192;
     auto c = Cask::open(dir_.string(), o, &test_registry());
     ASSERT_TRUE(c);
-    auto& kd = (*c)->keydir();
+    auto& kd = (*c)->index_authority();
 
     std::vector<int> ver(kKeys, 0);
     for (int i = 0; i < kKeys; ++i) {
@@ -705,7 +600,6 @@ TEST_F(OkiLevelBTest, MergeUnderEvictionManyRoundsNoKeyLoss) {
                 << "round " << round;
         }
     }
-    EXPECT_EQ(kd.shadow_stats().drifts, 0u);
     (*c)->close();
 }
 
@@ -835,7 +729,120 @@ TEST_F(OkiLevelBTest, RetiredFilesSurviveCrashHarmlessly) {
                   "#new")
             << "退休残留文件的陈旧记录不得复活 i=" << i;
     }
-    EXPECT_EQ((*c)->keydir().info().key_count,
+    EXPECT_EQ((*c)->index_authority().info().key_count,
               static_cast<std::uint64_t>(kKeys));
     (*c)->close();
+}
+
+// S43-3：BCOM v4 + Level B 戳健康时，删除 BCKS/hint 后只流式重放崩溃
+// 尾条。恢复必须保留盘上 manifest/run 的权威并只重放新 data 记录；
+// 父进程随后验证点查能力、逻辑计数与键值。
+BITCASK_CRASH_SCENARIO(data_only_crash_tail_levelb) {
+    CaskOptions o;
+    o.read_write = true;
+    o.keydir_cache_entries = 16;
+    auto c = Cask::open(dir, o, &test_registry());
+    if (!c) crash_exit(1);
+    for (int i = 0; i < 3; ++i) {
+        if (!(*c)->put(bytes("dtail-" + std::to_string(i)),
+                       bytes("tail-" + std::to_string(i)), 2000)) {
+            crash_exit(1);
+        }
+    }
+    if (!(*c)->remove(bytes("seed-1"), 2100)) crash_exit(1);
+    crash_exit(0);
+}
+
+TEST_F(OkiLevelBTest, DataOnlyTailReplayWithoutBcksOrHints) {
+    constexpr int kSeeds = 3000;
+    {
+        auto c = Cask::open(dir_.string(), levelb_opts(16), &test_registry());
+        ASSERT_TRUE(c);
+        for (int i = 0; i < kSeeds; ++i) {
+            ASSERT_TRUE((*c)->put(bytes("seed-" + std::to_string(i)),
+                                  bytes("seed-" + std::to_string(i)), 1000));
+        }
+        (*c)->close();
+    }
+
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(dir_, ec)) {
+        if (entry.path().extension() == ".hint") {
+            ASSERT_TRUE(fs::remove(entry.path(), ec));
+        }
+    }
+    (void)fs::remove(dir_ / "kv.keydir.ckpt", ec);  // S43-8：可能本就不存在
+
+    ASSERT_EQ(bitcask::test::spawn_crash_child(
+                  "data_only_crash_tail_levelb", dir_.string()),
+              0);
+
+    auto c = Cask::open(dir_.string(), levelb_opts(16), &test_registry());
+    ASSERT_TRUE(c);
+    EXPECT_TRUE((*c)->index_authority().state().point_query_enabled());
+    EXPECT_EQ((*c)->index_authority().info().key_count,
+              static_cast<std::uint64_t>(kSeeds + 2));
+    for (int i = 0; i < kSeeds; ++i) {
+        const std::string key_str = "seed-" + std::to_string(i);
+        const auto key = bytes(key_str);
+        auto g = (*c)->get_owned(key);
+        if (i == 1) {
+            ASSERT_FALSE(g) << "tombstone must survive recovery";
+            EXPECT_EQ(g.error().kind, bitcask::CaskError::kNotFound);
+        } else {
+            ASSERT_TRUE(g.has_value()) << i;
+            EXPECT_EQ(as_string(g->value), "seed-" + std::to_string(i));
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        auto g = (*c)->get_owned(bytes("dtail-" + std::to_string(i)));
+        ASSERT_TRUE(g.has_value()) << i;
+        EXPECT_EQ(as_string(g->value), "tail-" + std::to_string(i));
+    }
+    (*c)->close();
+}
+
+// S43-3：data 字节水位超过物理 EOF 是显式提交损坏。这里不能继续从
+// “未来位置”起跳；必须 fallback 到无 BCKS/hint 的 data full fold rebuild。
+TEST_F(OkiLevelBTest, DataWatermarkBeyondFileSizeTriggersFullRebuild) {
+    {
+        auto c = Cask::open(dir_.string(), levelb_opts(16), &test_registry());
+        ASSERT_TRUE(c);
+        ASSERT_TRUE((*c)->put(bytes("dw-a"), bytes("va"), 1000));
+        ASSERT_TRUE((*c)->put(bytes("dw-b"), bytes("vb"), 1000));
+        (*c)->close();
+    }
+
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(dir_, ec)) {
+        if (entry.path().extension() == ".hint") {
+            ASSERT_TRUE(fs::remove(entry.path(), ec));
+        }
+    }
+    (void)fs::remove(dir_ / "kv.keydir.ckpt", ec);  // S43-8：可能本就不存在
+    auto m = bitcask::oki::read_manifest(dir_.string());
+    ASSERT_TRUE(m.has_value());
+    ASSERT_FALSE(m->data_wms.empty());
+    for (auto& [file_id, byte_wm] : m->data_wms) {
+        (void)file_id;
+        byte_wm = 1ull << 62;
+    }
+    ASSERT_TRUE(bitcask::oki::write_manifest(dir_.string(), *m));
+
+    auto c = Cask::open(dir_.string(), levelb_opts(16), &test_registry());
+    ASSERT_TRUE(c);
+    EXPECT_EQ((*c)->index_authority().info().key_count, 2u);
+    ASSERT_TRUE((*c)->get_owned(bytes("dw-a")).has_value());
+    ASSERT_TRUE((*c)->get_owned(bytes("dw-b")).has_value());
+    (*c)->close();
+
+    auto rebuilt = bitcask::oki::read_manifest(dir_.string());
+    ASSERT_TRUE(rebuilt.has_value());
+    for (const auto& [file_id, byte_wm] : rebuilt->data_wms) {
+        const auto data = dir_ / (std::to_string(file_id) +
+                                  ".bitcask.data");
+        ASSERT_TRUE(fs::exists(data));
+        EXPECT_LE(byte_wm, fs::file_size(data, ec));
+        EXPECT_FALSE(ec);
+    }
 }

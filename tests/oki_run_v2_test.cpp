@@ -26,8 +26,12 @@ namespace fs = std::filesystem;
 using bitcask::oki::kRunTrailerSizeV2;
 using bitcask::oki::kRunVersion;
 using bitcask::oki::kRunVersion2;
+using bitcask::oki::kRunVersion3;
+using bitcask::oki::OkiBlockCache;
 using bitcask::oki::OkiError;
 using bitcask::oki::OkiManifest;
+using bitcask::oki::OkiManifestFStats;
+using bitcask::oki::OkiManifestMetadata;
 using bitcask::oki::OkiRunReader;
 using bitcask::oki::OkiRunWriter;
 using bitcask::oki::RowLoc;
@@ -114,9 +118,10 @@ std::vector<Row> make_rows(int n) {
 }
 
 std::string write_v2_run(const TempDir& td, const std::vector<Row>& rows,
-                         std::size_t block_target = 96) {
+                         std::size_t block_target = 96,
+                         std::uint32_t version = kRunVersion2) {
     const std::string path = td / "kv.oki.seg-1";
-    auto w = OkiRunWriter::create(path, block_target, kRunVersion2,
+    auto w = OkiRunWriter::create(path, block_target, version,
                                   rows.size());
     EXPECT_TRUE(w.has_value());
     for (const auto& r : rows) {
@@ -127,6 +132,163 @@ std::string write_v2_run(const TempDir& td, const std::vector<Row>& rows,
     auto f = w->finish();
     EXPECT_TRUE(f.has_value());
     return path;
+}
+
+// S43-1：v3 只把数据块 CRC 延迟到首读；开库必须放行块位翻转，并在读端
+// 显式报 kCorrupt。缓存与 pread 两条加载路径都要过同一道门。
+TEST(OkiRunV3, RoundtripAndLazyBlockCrc) {
+    TempDir td;
+    const auto rows = make_rows(120);
+    const auto path = write_v2_run(td, rows, /*block_target=*/96,
+                                   kRunVersion3);
+
+    auto r = OkiRunReader::open(path);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->version(), kRunVersion3);
+    EXPECT_EQ(r->entry_count(), rows.size());
+    ASSERT_GT(r->block_count(), 1u);
+
+    auto cur = r->begin();
+    OkiRunReader::Entry e;
+    for (const auto& want : rows) {
+        auto n = cur.next(e);
+        ASSERT_TRUE(n.has_value() && *n);
+        EXPECT_EQ(e.key, want.key);
+        EXPECT_EQ(e.has_loc, want.has_loc);
+    }
+
+    // 破坏首块数据字节。v3 元数据 CRC 不含数据块，open 仍应成功。
+    auto b = read_all(path);
+    b[8] = static_cast<std::byte>(
+        std::to_integer<std::uint8_t>(b[8]) ^ 0x40);
+    write_all(path, b);
+    auto lazy = OkiRunReader::open(path);
+    ASSERT_TRUE(lazy.has_value());
+    auto direct = lazy->find(bytes(rows.front().key));
+    ASSERT_FALSE(direct.has_value());
+    EXPECT_EQ(direct.error(), OkiError::kCorrupt);
+
+    OkiBlockCache cache(4096);
+    auto cached = lazy->find(bytes(rows.front().key), &cache, 1);
+    ASSERT_FALSE(cached.has_value());
+    EXPECT_EQ(cached.error(), OkiError::kCorrupt);
+}
+
+TEST(OkiRunV3, MetadataCrcStillRejectedAtOpen) {
+    TempDir td;
+    const auto rows = make_rows(80);
+    const auto path = write_v2_run(td, rows, 96, kRunVersion3);
+    auto b = read_all(path);
+    // 破坏首个稀疏索引 key 字节；v3 metadata CRC 必须在 open 拦下。
+    const std::size_t index_off_pos = b.size() - 24;
+    std::uint64_t index_off = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        index_off |= static_cast<std::uint64_t>(
+            std::to_integer<std::uint8_t>(b[index_off_pos + i])) << (8 * i);
+    }
+    ASSERT_GT(index_off, 8u);
+    ASSERT_LT(index_off + 5, b.size());
+    b[static_cast<std::size_t>(index_off) + 4] ^=
+        static_cast<std::byte>(0x10);
+    write_all(path, b);
+    auto r = OkiRunReader::open(path);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), OkiError::kCorrupt);
+}
+
+TEST(OkiRunV3, ManifestAcceptsMixedV1V2V3) {
+    TempDir td;
+    OkiManifest m;
+    m.runs.push_back({.gen = 1, .cover_ord = 10, .format_ver = 1});
+    m.runs.push_back({.gen = 2, .cover_ord = 20, .format_ver = 2});
+    m.runs.push_back({.gen = 3, .cover_ord = 30, .format_ver = 3});
+    m.wm = 30;
+    ASSERT_TRUE(bitcask::oki::write_manifest(td.str(), m));
+    auto back = bitcask::oki::read_manifest(td.str());
+    ASSERT_TRUE(back.has_value());
+    ASSERT_EQ(back->runs.size(), 3u);
+    EXPECT_EQ(back->runs[2].format_ver, 3);
+    EXPECT_EQ(back->wm, 30u);
+}
+
+TEST(OkiManifestV4, MetadataRoundtripAndFailFast) {
+    TempDir td;
+    OkiManifest m;
+    m.runs.push_back({.gen = 1, .cover_ord = 24, .format_ver = 3});
+    m.wm = 24;
+    m.level_b = true;
+    m.metadata = OkiManifestMetadata{
+        .next_ord = 41,
+        .biggest_file_id = 7,
+        .next_file_id = 8,
+        .active_keys = 12,
+        .live_bytes = 456,
+        .oldest_tstamp = 1'000,
+        .newest_tstamp = 2'000,
+        .reserved = 0,
+    };
+    m.fstats.push_back(OkiManifestFStats{
+        .file_id = 7,
+        .pending_delete = true,
+        .live_keys = 12,
+        .total_keys = 20,
+        .live_bytes = 456,
+        .total_bytes = 1'024,
+        .oldest_tstamp = 1'000,
+        .newest_tstamp = 2'000,
+        .expiration_epoch = 99,
+    });
+    m.data_wms.push_back({7, 1'024});
+    ASSERT_TRUE(bitcask::oki::write_manifest(td.str(), m));
+    ASSERT_EQ(bitcask::le_load_u32(read_all(td / "kv.oki.manifest").data() + 4),
+              bitcask::oki::kManifestVersion4);
+
+    auto back = bitcask::oki::read_manifest(td.str());
+    ASSERT_TRUE(back.has_value());
+    ASSERT_TRUE(back->metadata.has_value());
+    EXPECT_EQ(*back->metadata, *m.metadata);
+    ASSERT_EQ(back->fstats.size(), 1u);
+    EXPECT_EQ(back->fstats[0].file_id, 7u);
+    EXPECT_TRUE(back->fstats[0].pending_delete);
+    EXPECT_EQ(back->fstats[0].live_keys, 12u);
+    EXPECT_EQ(back->fstats[0].expiration_epoch, 99u);
+    EXPECT_EQ(back->wm, 24u);
+    ASSERT_EQ(back->data_wms.size(), 1u);
+    EXPECT_EQ(back->data_wms[0].first, 7u);
+    EXPECT_EQ(back->data_wms[0].second, 1'024u);
+
+    // 未知模式位 fail-fast。
+    {
+        auto b = read_all(td / "kv.oki.manifest");
+        b[8] = static_cast<std::byte>(0x03);
+        fix_crc(b);
+        write_all(td / "kv.oki.manifest", b);
+        EXPECT_FALSE(bitcask::oki::read_manifest(td.str()).has_value());
+    }
+
+    // 保留位不是“下一个可用字段”：必须显式拒收。
+    {
+        ASSERT_TRUE(bitcask::oki::write_manifest(td.str(), m));
+        auto b = read_all(td / "kv.oki.manifest");
+        ASSERT_EQ(b.size(),
+                  8 + 1 + 4 + 4 + 4 + 56 + 64 + 12 + 17 + 8 + 8);
+        b[8 + 1 + 4 + 4 + 4 + 48] = static_cast<std::byte>(1);
+        fix_crc(b);
+        write_all(td / "kv.oki.manifest", b);
+        EXPECT_FALSE(bitcask::oki::read_manifest(td.str()).has_value());
+    }
+
+    // fstats 定长段中的保留 pad 也纳入 CRC/结构校验。
+    {
+        ASSERT_TRUE(bitcask::oki::write_manifest(td.str(), m));
+        auto b = read_all(td / "kv.oki.manifest");
+        ASSERT_EQ(b.size(),
+                  8 + 1 + 4 + 4 + 4 + 56 + 64 + 12 + 17 + 8 + 8);
+        b[8 + 1 + 4 + 4 + 4 + 56 + 1] = static_cast<std::byte>(1);
+        fix_crc(b);
+        write_all(td / "kv.oki.manifest", b);
+        EXPECT_FALSE(bitcask::oki::read_manifest(td.str()).has_value());
+    }
 }
 
 TEST(OkiRunV2, RoundtripFullFields) {

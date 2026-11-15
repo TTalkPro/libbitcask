@@ -2,7 +2,7 @@
 // 收不了线程数，`enable_search` 首次开库起 hardware_concurrency 条线程）。
 //
 // 形状是**进程级**而非每库：两处线程本来就是进程共享的——
-//   · 索引池 IndexPool：挂在 KeyDirRegistry 上（C API 是进程级单例 registry），
+//   · 索引池 IndexPool：挂在 IndexRegistry 上（C API 是进程级单例 registry），
 //     首个 search 库 open 时建池、起 index_workers 条 map worker + 1 条 reducer；
 //   · Search 池：进程级 static tbb::task_arena（search_arena.cpp）。
 // 另外本库经 TBB 全局 arena 跑的并行段（恢复期批内 prepare、查询内短语 /

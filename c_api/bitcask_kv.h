@@ -81,6 +81,8 @@ typedef enum {
                                             // 与 NO_INDEX 的「本就不建」区分）
     BITCASK_ERR_BUSY           = 15,  // 6.7.0：仅 C 侧（无 CaskError 对应）——
                                       // bitcask_shutdown 时运行时仍被占用
+    BITCASK_ERR_INDEX_CORRUPT  = 16,  // S43-1：定位成功但读回 record 的 key
+                                      // 不同；不得当作 NotFound 或返回错值。
 } bitcask_error_t;
 
 // 错误详情（对应 bitcask::CaskFault）

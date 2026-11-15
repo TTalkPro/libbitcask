@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <bitcask/cask.hpp>
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_registry.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -23,8 +23,8 @@ namespace {
 // S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
 // 各用例用唯一目录名，互不冲突；同用例内 open→close→reopen 经 refcount 归零
 // 重新从盘加载，与旧 nullptr 行为等价。
-inline bitcask::keydir::KeyDirRegistry& test_registry() {
-    static bitcask::keydir::KeyDirRegistry reg;
+inline bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 
@@ -181,11 +181,11 @@ TEST_F(CheckpointRecoveryTest, CorruptSearchCheckpointFallsBackToFullFold) {
   EXPECT_GT(fs::file_size(bm25_ckpt), 0u);
 }
 
-// P14e: kv.keydir.ckpt corruption must fall back to full fold of data files.
+// P14e: OKI manifest corruption must fall back to full fold of data files.
 TEST_F(CheckpointRecoveryTest, CorruptKeydirCheckpointFallsBackToFullFold) {
   namespace fs = std::filesystem;
   constexpr int kN = 20;
-  const auto keydir_ckpt = tmpdir_ / "kv.keydir.ckpt";
+  const auto keydir_ckpt = tmpdir_ / "kv.oki.manifest";
 
   {
     CaskOptions opts;
@@ -200,11 +200,11 @@ TEST_F(CheckpointRecoveryTest, CorruptKeydirCheckpointFallsBackToFullFold) {
     (*c)->close();
   }
 
-  ASSERT_TRUE(fs::exists(keydir_ckpt)) << "kv.keydir.ckpt was not written";
+  ASSERT_TRUE(fs::exists(keydir_ckpt)) << "kv.oki.manifest was not written";
 
   {
     const auto sz = fs::file_size(keydir_ckpt);
-    ASSERT_GT(sz, 8u) << "kv.keydir.ckpt too small to corrupt";
+    ASSERT_GT(sz, 8u) << "kv.oki.manifest too small to corrupt";
     const std::vector<std::byte> garbage{
         std::byte{0xCA}, std::byte{0xFE}, std::byte{0xBA}, std::byte{0xBE},
         std::byte{0xDE}, std::byte{0xAD}, std::byte{0xBE}, std::byte{0xEF}};
@@ -216,7 +216,7 @@ TEST_F(CheckpointRecoveryTest, CorruptKeydirCheckpointFallsBackToFullFold) {
     CaskOptions opts;
     opts.read_write = true;
     auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
-    ASSERT_TRUE(c) << "reopen with corrupt kv.keydir.ckpt failed: "
+    ASSERT_TRUE(c) << "reopen with corrupt kv.oki.manifest failed: "
                    << c.error().detail;
 
     for (int i = 0; i < kN; ++i) {
@@ -231,11 +231,11 @@ TEST_F(CheckpointRecoveryTest, CorruptKeydirCheckpointFallsBackToFullFold) {
   }
 }
 
-// P14e: missing checkpoint must behave identically to a corrupt one.
+// P14e: missing OKI manifest must behave identically to a corrupt one.
 TEST_F(CheckpointRecoveryTest, MissingCheckpointFallsBackToFullFold) {
   namespace fs = std::filesystem;
   constexpr int kN = 20;
-  const auto keydir_ckpt = tmpdir_ / "kv.keydir.ckpt";
+  const auto keydir_ckpt = tmpdir_ / "kv.oki.manifest";
 
   {
     CaskOptions opts;
@@ -250,7 +250,7 @@ TEST_F(CheckpointRecoveryTest, MissingCheckpointFallsBackToFullFold) {
     (*c)->close();
   }
 
-  ASSERT_TRUE(fs::exists(keydir_ckpt)) << "kv.keydir.ckpt was not written";
+  ASSERT_TRUE(fs::exists(keydir_ckpt)) << "kv.oki.manifest was not written";
   {
     std::error_code ec;
     ASSERT_TRUE(fs::remove(keydir_ckpt, ec));
@@ -260,7 +260,7 @@ TEST_F(CheckpointRecoveryTest, MissingCheckpointFallsBackToFullFold) {
     CaskOptions opts;
     opts.read_write = true;
     auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
-    ASSERT_TRUE(c) << "reopen with missing kv.keydir.ckpt failed: "
+    ASSERT_TRUE(c) << "reopen with missing kv.oki.manifest failed: "
                    << c.error().detail;
 
     for (int i = 0; i < kN; ++i) {

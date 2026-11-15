@@ -406,11 +406,10 @@ ReadResult File::read(std::size_t count) noexcept {
 // 顺序写 —— **本后端上恒为「原子追加到 EOF」，不使用也不依赖文件指针**。
 //
 // 为什么不能直译成普通 WriteFile：
-//   HintFile 是本函数唯一的调用方（hint_file.cpp:50），它把顺序 write() 与
-//   定位 pread/pread_into 交错用在同一个 File 上（112/129/179/189/206/230 行）。
+//   同一 File 可在顺序 write() 与定位 pread/pread_into 间交错使用。
 //   同步句柄上带 OVERLAPPED 的定位读**会移动文件指针**，于是随后的普通
 //   WriteFile 不再落在 EOF，而是从上次读到的位置**覆盖**已有内容。
-//   编译通过、单条写入也「成功」，只有 hint 文件内容被悄悄写坏——
+//   编译通过、单条写入也「成功」，只有顺序文件内容被悄悄写坏——
 //   典型的静默损坏。
 //
 // 用 OVERLAPPED 的 Offset/OffsetHigh 全 1（0xFFFFFFFF）即 Win32 文档的

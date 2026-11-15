@@ -1,6 +1,6 @@
 // 向量库的内存索引侧表（Index）。
 //
-// Index 是 legacy KeyDir 的演化版（doc/vector-db-design-zh.md §3.1）。S42 起
+// Index 是 legacy 索引权威的演化版（doc/vector-db-design-zh.md §3.1）。S42 起
 // 改为 live-only 存储（docs/design/s42-docmap-live-store-design-zh.md）：
 //   ext2ord_ : ext_id → 最新 ord（node-based，key 地址稳定，S40）
 //   live_    : ord → LiveRow（仅当前存活行；ord 是 map key，不再做数组下标）
@@ -42,7 +42,7 @@
 
 namespace bitcask::index {
 
-// 透明 hash 已提到 bitcask/string_hash.hpp 与 KeyDir 共用。
+// 透明 hash 已提到 bitcask/string_hash.hpp 与 authority 共用。
 using bitcask::StringHash;
 
 // 一条文档在磁盘上的定位（pread 整条 kDoc 用）。

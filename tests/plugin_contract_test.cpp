@@ -23,6 +23,7 @@
 
 #include "bitcask/plugin_api.hpp"
 #include "bitcask/thread_pool.hpp"
+#include "bitcask/index_authority.hpp"
 #include "bitcask/index.hpp"  // S16-2：宿主 docmap（index::Index 身份/存活/meta）
 
 namespace {
@@ -479,8 +480,8 @@ TEST(PluginContract, DeleteEventPriorOrdReflectsLatestVersion) {
 // ============================================================================
 
 #include "bitcask/data_file.hpp"
-#include "bitcask/keydir.hpp"
 #include "bitcask/merger.hpp"
+#include "bitcask/oki_state.hpp"
 
 #include <filesystem>
 
@@ -529,10 +530,10 @@ TEST(PluginMergeContract, BeginRelocateCommitOrder) {
     fs::remove_all(dir);
     fs::create_directories(dir);
 
-    // 手工构造输入 data 文件 + keydir（3 条 live record）。
+    // 手工构造输入 data 文件 + OKI authority（3 条 live record）。
     const std::string data_path =
         bitcask::fileops::mk_data_filename(dir.string(), 1);
-    bitcask::keydir::KeyDir kd;
+    bitcask::oki::IndexAuthority authority;
     {
         auto df = bitcask::fileops::DataFile::open(
             data_path, bitcask::fileops::DataFile::Mode::kCreate);
@@ -547,19 +548,19 @@ TEST(PluginMergeContract, BeginRelocateCommitOrder) {
                 std::as_bytes(std::span<const char>(key.data(), key.size())),
                 std::as_bytes(std::span<const char>(val.data(), val.size())));
             ASSERT_TRUE(w.has_value());
-            kd.put(key, /*file_id=*/1, w->total_size, w->offset,
-                   static_cast<std::uint32_t>(1000 + i), /*now*/ 0,
-                   /*newest*/ true, 0, 0, static_cast<std::uint64_t>(i));
         }
         ASSERT_TRUE(df->sync().has_value());
     }
-    kd.increment_file_id_at_least(1);
-    kd.mark_ready();
+    ASSERT_TRUE(authority.rebuild_from_data(dir.string()));
+    (void)authority.increment_file_id_at_least(1);
+    authority.state().enable_point_query();
+    authority.mark_ready();
 
     MergeEventRecorder rec;
     bitcask::plugin::CaskPlugin* plugs[] = {&rec};
     const std::string inputs[] = {data_path};
-    auto r = bitcask::merge::run_merge(inputs, dir.string(), kd,
+    auto r = bitcask::merge::run_merge(
+        std::span<const std::string>(inputs), dir.string(), authority,
                                        /*sync*/ false, plugs, /*now*/ 0);
     ASSERT_TRUE(r.has_value()) << r.error().detail;
 
@@ -573,6 +574,11 @@ TEST(PluginMergeContract, BeginRelocateCommitOrder) {
     // 搬迁定位指向 merge 输出文件（≠ 输入 file_id 1），且 commit 携带之。
     ASSERT_EQ(rec.output_ids.size(), 1u);
     EXPECT_EQ(rec.output_ids[0], r->output_file_id);
+    // S43-7：merge 输出 data-only。旧 ABI 字段保留但必须为空。
+    EXPECT_TRUE(r->output_hint_path.empty());
+    const std::string stem = r->output_data_path.substr(
+        0, r->output_data_path.size() - std::strlen(".data"));
+    EXPECT_FALSE(std::filesystem::exists(stem + ".hint"));
     for (auto fid : rec.relocated_file_ids) {
         EXPECT_EQ(fid, r->output_file_id);
         EXPECT_NE(fid, 1u);
@@ -592,7 +598,7 @@ TEST(PluginMergeContract, AbortOnFailure) {
 
     const std::string data_path =
         bitcask::fileops::mk_data_filename(dir.string(), 1);
-    bitcask::keydir::KeyDir kd;
+    bitcask::oki::IndexAuthority authority;
     {
         auto df = bitcask::fileops::DataFile::open(
             data_path, bitcask::fileops::DataFile::Mode::kCreate);
@@ -604,17 +610,19 @@ TEST(PluginMergeContract, AbortOnFailure) {
             std::as_bytes(std::span<const char>(key.data(), key.size())),
             std::as_bytes(std::span<const char>(val.data(), val.size())));
         ASSERT_TRUE(w.has_value());
-        kd.put(key, 1, w->total_size, w->offset, 1000, 0, true, 0, 0, 0);
         ASSERT_TRUE(df->sync().has_value());
     }
-    kd.increment_file_id_at_least(1);
-    kd.mark_ready();
+    ASSERT_TRUE(authority.rebuild_from_data(dir.string()));
+    (void)authority.increment_file_id_at_least(1);
+    authority.state().enable_point_query();
+    authority.mark_ready();
 
     MergeEventRecorder rec;
     bitcask::plugin::CaskPlugin* plugs[] = {&rec};
     const std::string inputs[] = {data_path};
     const std::string bad_out = (dir / "no_such_subdir" / "x").string();
-    auto r = bitcask::merge::run_merge(inputs, bad_out, kd,
+    auto r = bitcask::merge::run_merge(
+        std::span<const std::string>(inputs), bad_out, authority,
                                        /*sync*/ false, plugs, /*now*/ 0);
     EXPECT_FALSE(r.has_value());
     ASSERT_EQ(rec.events.size(), 2u);

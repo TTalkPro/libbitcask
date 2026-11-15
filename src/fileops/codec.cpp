@@ -17,12 +17,12 @@ std::uint32_t crc32(std::span<const std::byte> data) noexcept {
     return crc32_update(0, data);
 }
 
-// 流式 CRC：seed 是上一段的结果，可以多段累计。hint 文件的 trailer CRC
+// 流式 CRC：seed 是上一段的结果，可以多段累计。文件级 trailer CRC
 // 就靠这个边写边累加。CRC32 有 incremental 性质——seed 起始值是 0，append
 // 一段后的 CRC 跟「整段一次性算」结果一致。
 //
 // 实际计算交给 bitcask::hw::crc32_update（PCLMULQDQ 硬件加速 + zlib 兜底），
-// 输出与 zlib::crc32() bit-identical，确保现有 data file / hint file 的
+// 输出与 zlib::crc32() bit-identical，确保现有 data file 的
 // on-disk CRC 与历史数据兼容。
 std::uint32_t crc32_update(std::uint32_t seed,
                            std::span<const std::byte> data) noexcept {
@@ -364,83 +364,6 @@ std::vector<float> doc_vector_f32(const DocValueView& v) {
         }
     }
     return out;
-}
-
-// ---------------------------------------------------------------------------
-// hint record 编解码（v5 唯一；v2 定宽/v4 无 ord 编解码已随 S33 flag-day
-// 删除——库内无旧格式读端，纪元门禁在 bitcask.meta v5）
-// ---------------------------------------------------------------------------
-
-void encode_hint_record_v5(std::vector<std::byte>& out,
-                           std::uint64_t tstamp,
-                           std::uint32_t total_sz,
-                           std::uint64_t offset, bool tombstone,
-                           std::span<const std::byte> key,
-                           std::uint64_t ord,
-                           std::uint64_t& prev_end,
-                           std::uint64_t& prev_ord) {
-    assert(key.size() <= format::kMaxKeySize);
-    // gap/ord_delta 均经 u64 二补数回绕：decode 侧 prev + delta ≡ 真值
-    // (mod 2^64)，正确性不依赖单调性；正常 append 序 gap==0（1 字节）、
-    // ord 递增（delta 小 → 1-2 字节）。
-    vbyte_encode(offset - prev_end, out);
-    vbyte_encode(total_sz, out);
-    vbyte_encode((static_cast<std::uint64_t>(key.size()) << 1) |
-                     (tombstone ? 1u : 0u),
-                 out);
-    vbyte_encode(ord - prev_ord, out);  // v5：ord 差分
-    const std::size_t base = out.size();
-    out.resize(base + 8);
-    le_store_u64(out.data() + base, tstamp);
-    if (!key.empty()) {
-        out.insert(out.end(), key.begin(), key.end());
-    }
-    prev_end = offset + total_sz;
-    prev_ord = ord;
-}
-
-std::expected<HintRecord, DecodeError>
-decode_hint_record_v5(std::span<const std::byte> buf,
-                      std::uint64_t& prev_end, std::uint64_t& prev_ord) {
-    // 边界安全 vbyte（buf 可能只含半条记录，短读返回 kBufferTooShort）。
-    std::size_t pos = 0;
-    auto vb = [&](std::uint64_t& v) -> bool {
-        v = 0;
-        std::uint64_t shift = 0;
-        while (true) {
-            if (pos >= buf.size() || shift > 63) return false;
-            const auto byte = static_cast<std::uint8_t>(buf[pos++]);
-            v |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
-            if (byte & 0x80) return true;
-            shift += 7;
-        }
-    };
-    std::uint64_t gap = 0, tsz = 0, kt = 0, od = 0;
-    if (!vb(gap) || !vb(tsz) || !vb(kt) || !vb(od)) {
-        return std::unexpected(DecodeError::kBufferTooShort);
-    }
-    const std::uint64_t key_sz = kt >> 1;
-    if (tsz > 0xFFFFFFFFull || key_sz > format::kMaxKeySize) {
-        return std::unexpected(DecodeError::kKeySizeOverflow);
-    }
-    if (buf.size() < pos + 8 + key_sz) {
-        return std::unexpected(DecodeError::kBufferTooShort);
-    }
-    const std::uint64_t tstamp = le_load_u64(buf.data() + pos);
-    pos += 8;
-    const std::uint64_t offset = prev_end + gap;  // 回绕还原
-    HintRecord rec{
-        .tstamp = tstamp,
-        .total_sz = static_cast<std::uint32_t>(tsz),
-        .offset = offset,
-        .ord = prev_ord + od,  // 回绕还原
-        .tombstone = (kt & 1) != 0,
-        .key = buf.subspan(pos, static_cast<std::size_t>(key_sz)),
-        .consumed = pos + static_cast<std::size_t>(key_sz),
-    };
-    prev_end = offset + rec.total_sz;
-    prev_ord = rec.ord;
-    return rec;
 }
 
 }  // namespace bitcask::codec

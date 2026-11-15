@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "bitcask/cask.hpp"
-#include "bitcask/keydir_registry.hpp"
+#include "bitcask/index_registry.hpp"
 #include "bitcask/meta_codec.hpp"
 #include "bitcask/searcher.hpp"
 
@@ -28,8 +28,8 @@ namespace fs = std::filesystem;
 
 namespace {
 
-keydir::KeyDirRegistry& test_registry() {
-    static keydir::KeyDirRegistry reg;
+bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 

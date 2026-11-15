@@ -8,7 +8,7 @@
 #include "support/test_paths.hpp"
 
 #include <bitcask/cask.hpp>
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_registry.hpp>
 #include <bitcask/search_config.hpp>
 #include <bitcask/thread_limits.hpp>
 
@@ -77,7 +77,7 @@ TEST(ThreadLimitsTest, SetBeforeFirstSearchOpenCapsIndexPoolThenFreezes) {
     std::error_code ec;
     fs::remove_all(dir, ec);
 
-    bitcask::keydir::KeyDirRegistry registry;
+    bitcask::oki::IndexRegistry registry;
     bitcask::CaskOptions opts;
     opts.read_write = true;
     opts.enable_search = true;

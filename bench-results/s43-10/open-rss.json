@@ -1,0 +1,76 @@
+{
+  "context": {
+    "date": "2026-11-15T23:19:36+08:00",
+    "host_name": "Debian-VM01",
+    "executable": "./build-gcc-release/bench/bitcask_bench",
+    "num_cpus": 8,
+    "mhz_per_cpu": 2995,
+    "cpu_scaling_enabled": false,
+    "caches": [
+      {
+        "type": "Data",
+        "level": 1,
+        "size": 49152,
+        "num_sharing": 1
+      },
+      {
+        "type": "Instruction",
+        "level": 1,
+        "size": 32768,
+        "num_sharing": 1
+      },
+      {
+        "type": "Unified",
+        "level": 2,
+        "size": 1310720,
+        "num_sharing": 1
+      },
+      {
+        "type": "Unified",
+        "level": 3,
+        "size": 25165824,
+        "num_sharing": 8
+      }
+    ],
+    "load_avg": [1.23535,2.94092,6.06445],
+    "library_version": "v1.9.0",
+    "library_build_type": "release",
+    "json_schema_version": 1
+  },
+  "benchmarks": [
+    {
+      "name": "BM_Oki_OpenRssProbe/100000",
+      "family_index": 0,
+      "per_family_instance_index": 0,
+      "run_name": "BM_Oki_OpenRssProbe/100000",
+      "run_type": "iteration",
+      "repetitions": 1,
+      "repetition_index": 0,
+      "threads": 1,
+      "iterations": 72,
+      "real_time": 3.9157236805395868e+01,
+      "cpu_time": 3.9062584041666696e+01,
+      "time_unit": "ms",
+      "open_ms": 3.8520558999999999e+01,
+      "open_rss_B_per_key": 1.1272192000000000e+02,
+      "open_rss_MB": 1.0750000000000000e+01
+    },
+    {
+      "name": "BM_Oki_OpenRssProbe/1000000",
+      "family_index": 0,
+      "per_family_instance_index": 1,
+      "run_name": "BM_Oki_OpenRssProbe/1000000",
+      "run_type": "iteration",
+      "repetitions": 1,
+      "repetition_index": 0,
+      "threads": 1,
+      "iterations": 5,
+      "real_time": 5.6688271119928686e+02,
+      "cpu_time": 5.6578239940000014e+02,
+      "time_unit": "ms",
+      "open_ms": 6.0263555499999995e+02,
+      "open_rss_B_per_key": 1.1335680000000001e+02,
+      "open_rss_MB": 1.0810546875000000e+02
+    }
+  ]
+}

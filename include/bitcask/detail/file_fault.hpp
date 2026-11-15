@@ -1,6 +1,6 @@
-// 文件 I/O 错误类型——data_file 与 hint_file 共用。
+// 文件 I/O 错误类型——data_file 及其上层恢复/迁移路径共用。
 //
-// 提取为独立头是为了让 hint_file.hpp 不必 include 整个 data_file.hpp
+// 提取为独立头是为了让上层不必 include 整个 data_file.hpp
 // （DataFile 类及其全部实现细节）仅为了复用错误类型。
 
 #pragma once
@@ -23,7 +23,7 @@ struct DataFileFault {
     int errnum = 0;  // 仅当 kind == kIo 有意义
 };
 
-/// IoError → DataFileFault 适配器。data_file.cpp 与 hint_file.cpp 共用。
+/// IoError → DataFileFault 适配器。
 inline DataFileFault io_fault(const io::IoError& e) noexcept {
     return DataFileFault{DataFileError::kIo, e.errnum};
 }

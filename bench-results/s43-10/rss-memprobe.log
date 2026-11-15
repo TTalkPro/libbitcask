@@ -1,0 +1,4 @@
+---------------------------------------------------------------------------------
+Benchmark                       Time             CPU   Iterations UserCounters...
+---------------------------------------------------------------------------------
+BM_Oki_MemProbe/100000       64.3 ms         64.1 ms           44 memdelta_MB=8.01086 memdelta_rows=100k memdelta_rss_MB=8.34766 rebuild_peak_rss_MB=18.3477 run_B_per_key=14.3613 run_MB=1.3696 run_count=1

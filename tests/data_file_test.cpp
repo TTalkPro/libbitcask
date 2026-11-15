@@ -1,10 +1,9 @@
-// M3.1 unit tests: DataFile + HintFile.
+// M3.1 unit tests: DataFile。
 
 
 #include <cstring>
 #include "support/test_paths.hpp"
 #include <filesystem>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -16,13 +15,11 @@
 #include "bitcask/data_file.hpp"
 #include "bitcask/field_schema.hpp"
 #include "bitcask/format.hpp"
-#include "bitcask/hint_file.hpp"
 #include "bitcask/migrate.hpp"
 #include "bitcask/search_checkpoint.hpp"
 
 using bitcask::fileops::DataFile;
 using bitcask::fileops::DataFileError;
-using bitcask::fileops::HintFile;
 using bitcask::fileops::ReadRecord;
 using bitcask::format::RecordType;
 using bitcask::format::kHeaderSize;
@@ -103,7 +100,6 @@ void write_file_bytes(const std::string& path, std::span<const std::byte> b) {
 // ---------------------------------------------------------------------------
 TEST(Filename, MkAndParse) {
     using bitcask::fileops::mk_data_filename;
-    using bitcask::fileops::mk_hint_filename;
     using bitcask::fileops::parse_data_tstamp;
 
     // S37-5：mk_data_filename 走 fs::path 拼接，分隔符是**平台原生**的
@@ -111,9 +107,6 @@ TEST(Filename, MkAndParse) {
     // 「<tstamp>.bitcask.data 这个文件名怎么拼」，不是分隔符长什么样。
     EXPECT_EQ(mk_data_filename("/tmp/foo", 12345),
               (std::filesystem::path("/tmp/foo") / "12345.bitcask.data").string());
-    EXPECT_EQ(mk_hint_filename("/tmp/foo/12345.bitcask.data"),
-              "/tmp/foo/12345.bitcask.hint");
-
     EXPECT_EQ(parse_data_tstamp("/tmp/x/12345.bitcask.data"), 12345u);
     EXPECT_EQ(parse_data_tstamp("12345.bitcask.data"), 12345u);
     EXPECT_FALSE(parse_data_tstamp("not-a-bitcask").has_value());
@@ -242,290 +235,6 @@ TEST(DataFile, ReuseOffsetMatchesIndex) {
 }
 
 // ---------------------------------------------------------------------------
-// HintFile
-// ---------------------------------------------------------------------------
-TEST(HintFile, AppendFinalizeFold) {
-    TempDir td;
-    const auto path = td / "1.bitcask.hint";
-
-    auto h = HintFile::open(path, HintFile::Mode::kCreate);
-    ASSERT_TRUE(h);
-    ASSERT_TRUE(h->write(1, /*total_sz*/ 30, /*off*/ 0,   /*tomb*/ false, as_bytes("a"), /*ord*/ 1));
-    ASSERT_TRUE(h->write(2, /*total_sz*/ 40, /*off*/ 30,  /*tomb*/ true,  as_bytes("bb"), /*ord*/ 2));
-    ASSERT_TRUE(h->write(3, /*total_sz*/ 50, /*off*/ 70,  /*tomb*/ false, as_bytes("ccc"), /*ord*/ 3));
-    ASSERT_TRUE(h->finalize());
-
-    auto r = HintFile::open(path, HintFile::Mode::kRead);
-    ASSERT_TRUE(r);
-    std::vector<std::string> keys;
-    std::vector<bool> tombs;
-    auto fr = r->fold([&](const auto& rec) {
-        keys.push_back(view_str(rec.key));
-        tombs.push_back(rec.tombstone);
-    });
-    ASSERT_TRUE(fr);
-    EXPECT_EQ(keys, (std::vector<std::string>{"a", "bb", "ccc"}));
-    EXPECT_EQ(tombs, (std::vector<bool>{false, true, false}));
-}
-
-TEST(HintFile, ValidateTrailerHappyPath) {
-    TempDir td;
-    const auto path = td / "good.bitcask.hint";
-    auto h = HintFile::open(path, HintFile::Mode::kCreate);
-    ASSERT_TRUE(h);
-    ASSERT_TRUE(h->write(1, 30, 0, false, as_bytes("a"), /*ord*/ 4));
-    ASSERT_TRUE(h->write(2, 40, 30, false, as_bytes("bb"), /*ord*/ 5));
-    ASSERT_TRUE(h->finalize());
-
-    auto r = HintFile::open(path, HintFile::Mode::kRead);
-    ASSERT_TRUE(r);
-    auto v = r->validate_trailer();
-    ASSERT_TRUE(v);
-    EXPECT_TRUE(*v);
-}
-
-TEST(HintFile, ValidateTrailerCorrupted) {
-    TempDir td;
-    const auto path = td / "bad.bitcask.hint";
-    {
-        auto h = HintFile::open(path, HintFile::Mode::kCreate);
-        ASSERT_TRUE(h);
-        ASSERT_TRUE(h->write(1, 30, 0, false, as_bytes("a"), /*ord*/ 6));
-        ASSERT_TRUE(h->write(2, 40, 30, false, as_bytes("bb"), /*ord*/ 7));
-        ASSERT_TRUE(h->finalize());
-    }
-    // Flip a byte in the body.
-    {
-        std::FILE* fp = std::fopen(path.c_str(), "rb+");
-        ASSERT_NE(fp, nullptr);
-        std::fseek(fp, 5, SEEK_SET);
-        char c;
-        ASSERT_EQ(std::fread(&c, 1, 1, fp), 1u);
-        c ^= 0x01;
-        std::fseek(fp, 5, SEEK_SET);
-        std::fwrite(&c, 1, 1, fp);
-        std::fclose(fp);
-    }
-    auto r = HintFile::open(path, HintFile::Mode::kRead);
-    ASSERT_TRUE(r);
-    auto v = r->validate_trailer();
-    ASSERT_TRUE(v);
-    EXPECT_FALSE(*v);
-}
-
-TEST(HintFile, ValidateMissingTrailer) {
-    TempDir td;
-    const auto path = td / "trunc.bitcask.hint";
-    auto h = HintFile::open(path, HintFile::Mode::kCreate);
-    ASSERT_TRUE(h);
-    ASSERT_TRUE(h->write(1, 30, 0, false, as_bytes("a"), /*ord*/ 8));
-    // No finalize() — trailer missing.
-
-    auto r = HintFile::open(path, HintFile::Mode::kRead);
-    ASSERT_TRUE(r);
-    auto v = r->validate_trailer();
-    ASSERT_TRUE(v);
-    EXPECT_FALSE(*v);
-}
-
-TEST(HintFile, EmptyFileFoldReturnsNoRecords) {
-    TempDir td;
-    const auto path = td / "empty.bitcask.hint";
-    {
-        auto h = HintFile::open(path, HintFile::Mode::kCreate);
-        ASSERT_TRUE(h);
-        ASSERT_TRUE(h->finalize());
-    }
-    auto r = HintFile::open(path, HintFile::Mode::kRead);
-    ASSERT_TRUE(r);
-    int n = 0;
-    auto fr = r->fold([&](const auto&) { ++n; });
-    ASSERT_TRUE(fr);
-    EXPECT_EQ(n, 0);
-}
-
-// ---------------------------------------------------------------------------
-// Hint 字节 golden（自洽,非跨语言）。
-//   P:flag-day 后全盘统一小端——**不再与 legacy Erlang 大端字节互通**,故原
-//   "cross-language golden" 失效。下方 hex 是当前 LE 编码对三条 record + trailer
-//   的钉死字节(字段全小端;packed u64 的 tomb 标记落在最后一字节;trailer 的
-//   totalsz=running CRC 随 LE 字节重算)。任何编码漂移在此失败。
-//
-//     R1: key="a"    tstamp=100 totalsz=19 offset=0    tomb=false
-//     R2: key="bb"   tstamp=101 totalsz=20 offset=19   tomb=true
-//     R3: key="cccc" tstamp=102 totalsz=22 offset=39   tomb=false
-//     trailer:       tstamp=0   keysz=0   totalsz=CRC  offset=0x7FFFFFFFFFFFFFFF
-//
-// 重新生成:跑 EncodingMatchesGoldenByteForByte,取 stderr 的 CAPTURE_LE_HINT_HEX。
-// ---------------------------------------------------------------------------
-namespace {
-
-std::vector<std::byte> hex_to_bytes(std::string_view h) {
-    auto nyb = [](char c) {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-        return 0;
-    };
-    std::vector<std::byte> out;
-    out.reserve(h.size() / 2);
-    for (std::size_t i = 0; i + 1 < h.size(); i += 2) {
-        out.push_back(static_cast<std::byte>((nyb(h[i]) << 4) | nyb(h[i + 1])));
-    }
-    return out;
-}
-
-std::string write_temp_with_bytes(const TempDir& td, std::string_view name,
-                                   std::span<const std::byte> bytes) {
-    const auto path = td / std::string(name);
-    std::FILE* fp = std::fopen(path.c_str(), "wb");
-    EXPECT_NE(fp, nullptr);
-    std::fwrite(bytes.data(), 1, bytes.size(), fp);
-    std::fclose(fp);
-    return path;
-}
-
-// BCH5 golden 记录字节（S33 flag-day；trailer CRC 运行期由 codec::crc32
-// 拼接——CRC 实现自身有独立 golden 锁定）。布局见 format.hpp：
-// header "BCH5" + 每条 [vbyte gap][vbyte total_sz][vbyte keysz<<1|tomb]
-// [vbyte ord_delta][tstamp u64][key] + trailer "BCHE"+CRC。
-// 三条连续记录 gap 恒 0（1B）；ord 9/10/11 → 首条 delta 9、后续 delta 1。
-std::vector<std::byte> golden_hint_v5_bytes() {
-    auto body = hex_to_bytes(
-        "42434835"                                    // "BCH5"
-        "80" "93" "82" "89" "6400000000000000" "61"   // R1: sz19,k1,ord9,ts100,"a"
-        "80" "94" "85" "81" "6500000000000000" "6262" // R2: sz20,k2|tomb,ord10,ts101,"bb"
-        "80" "96" "88" "81" "6600000000000000" "63636363");  // R3: ord11
-    const std::uint32_t crc = bitcask::codec::crc32(
-        std::span<const std::byte>(body.data(), body.size()));
-    auto tr = hex_to_bytes("42434845");  // "BCHE"
-    body.insert(body.end(), tr.begin(), tr.end());
-    for (int i = 0; i < 4; ++i) {
-        body.push_back(static_cast<std::byte>((crc >> (8 * i)) & 0xFF));
-    }
-    return body;
-}
-
-}  // namespace
-
-TEST(HintFileGolden, ReadsGoldenEncodedFile) {
-    TempDir td;
-    auto bytes = golden_hint_v5_bytes();
-    // header(4) + 13 + 14 + 16 记录字节 + trailer(8) = 55B。
-    ASSERT_EQ(bytes.size(), 55u);
-    const auto path = write_temp_with_bytes(td, "golden.bitcask.hint", bytes);
-
-    auto h = HintFile::open(path, HintFile::Mode::kRead);
-    ASSERT_TRUE(h);
-
-    auto valid = h->validate_trailer();
-    ASSERT_TRUE(valid);
-    EXPECT_TRUE(*valid) << "trailer CRC must validate against golden LE bytes";
-
-    struct R { std::string key; std::uint64_t ts; std::uint32_t sz;
-               std::uint64_t off; std::uint64_t ord; bool tomb; };
-    std::vector<R> seen;
-    auto fr = h->fold([&](const auto& rec) {
-        seen.push_back({view_str(rec.key), rec.tstamp, rec.total_sz,
-                        rec.offset, rec.ord, rec.tombstone});
-    });
-    ASSERT_TRUE(fr);
-
-    ASSERT_EQ(seen.size(), 3u);
-    EXPECT_EQ(seen[0].key, "a");    EXPECT_EQ(seen[0].ts, 100u);
-    EXPECT_EQ(seen[0].sz,  19u);    EXPECT_EQ(seen[0].off, 0u);
-    EXPECT_EQ(seen[0].ord, 9u);
-    EXPECT_FALSE(seen[0].tomb);
-
-    EXPECT_EQ(seen[1].key, "bb");   EXPECT_EQ(seen[1].ts, 101u);
-    EXPECT_EQ(seen[1].sz,  20u);    EXPECT_EQ(seen[1].off, 19u);
-    EXPECT_EQ(seen[1].ord, 10u);
-    EXPECT_TRUE (seen[1].tomb);
-
-    EXPECT_EQ(seen[2].key, "cccc"); EXPECT_EQ(seen[2].ts, 102u);
-    EXPECT_EQ(seen[2].sz,  22u);    EXPECT_EQ(seen[2].off, 39u);
-    EXPECT_EQ(seen[2].ord, 11u);
-    EXPECT_FALSE(seen[2].tomb);
-}
-
-// Inverse direction: bytes our HintFile produces must match the pinned LE
-// golden for the same logical inputs (drift guard)。写端沿革 v2→v3/v4→v5
-// （S33 flag-day）——golden 同步换代，旧纪元读端已整体删除。
-TEST(HintFileGolden, EncodingMatchesGoldenByteForByte) {
-    TempDir td;
-    const auto path = td / "ours.bitcask.hint";
-    auto h = HintFile::open(path, HintFile::Mode::kCreate);
-    ASSERT_TRUE(h);
-    ASSERT_TRUE(h->write(100, 19, 0,   false, as_bytes("a"), /*ord*/ 9));
-    ASSERT_TRUE(h->write(101, 20, 19,  true,  as_bytes("bb"), /*ord*/ 10));
-    ASSERT_TRUE(h->write(102, 22, 39,  false, as_bytes("cccc"), /*ord*/ 11));
-    ASSERT_TRUE(h->finalize());
-
-    // Slurp back the bytes and compare.
-    std::FILE* fp = std::fopen(path.c_str(), "rb");
-    ASSERT_NE(fp, nullptr);
-    std::fseek(fp, 0, SEEK_END);
-    const auto sz = static_cast<std::size_t>(std::ftell(fp));
-    std::fseek(fp, 0, SEEK_SET);
-    std::vector<std::byte> got(sz);
-    ASSERT_EQ(std::fread(got.data(), 1, sz, fp), sz);
-    std::fclose(fp);
-
-    auto expected = golden_hint_v5_bytes();
-    ASSERT_EQ(got.size(), expected.size());
-    for (std::size_t i = 0; i < got.size(); ++i) {
-        EXPECT_EQ(got[i], expected[i])
-            << "mismatch at byte " << i << " (0x" << std::hex << i << ")";
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DataFile <-> HintFile pair (typical bitcask scenario)
-// ---------------------------------------------------------------------------
-TEST(DataAndHint, ParallelStreamsAreConsistent) {
-    TempDir td;
-    const auto data_path = td / "10.bitcask.data";
-    const auto hint_path = td / "10.bitcask.hint";
-
-    auto df = DataFile::open(data_path, DataFile::Mode::kCreate);
-    ASSERT_TRUE(df);
-    auto hf = HintFile::open(hint_path, HintFile::Mode::kCreate);
-    ASSERT_TRUE(hf);
-
-    struct Rec { std::string k, v; std::uint32_t ts; std::uint64_t ord; };
-    std::vector<Rec> input = {
-        {"alpha",   "1",   100, 1},
-        {"bravo",   "22",  101, 2},
-        {"charlie", "333", 102, 3},
-    };
-
-    for (const auto& r : input) {
-        auto w = df->write(RecordType::kDoc, r.ts, r.ord, as_bytes(r.k), as_bytes(r.v));
-        ASSERT_TRUE(w);
-        ASSERT_TRUE(hf->write(r.ts, w->total_size, w->offset,
-                              /*tomb*/ false, as_bytes(r.k), r.ord));
-    }
-    ASSERT_TRUE(hf->finalize());
-
-    // Re-open hint and use it to fetch from data.
-    auto h_read = HintFile::open(hint_path, HintFile::Mode::kRead);
-    ASSERT_TRUE(h_read);
-    EXPECT_TRUE(*h_read->validate_trailer());
-
-    auto d_read = DataFile::open(data_path, DataFile::Mode::kRead);
-    ASSERT_TRUE(d_read);
-
-    std::set<std::string> keys_seen;
-    auto fr = h_read->fold([&](const auto& hint) {
-        auto rec = d_read->read(hint.offset, hint.total_sz);
-        ASSERT_TRUE(rec);
-        EXPECT_EQ(view_str(rec->key), view_str(hint.key));
-        keys_seen.insert(view_str(rec->key));
-    });
-    ASSERT_TRUE(fr);
-    EXPECT_EQ(keys_seen.size(), input.size());
-}
-
-// ---------------------------------------------------------------------------
 // migrate_le：v1 大端目录 → v2 小端目录端到端。手工构造 v1 大端 meta /
 // field.schema / data（含墓碑 + 4 字节 shadow），迁移后用小端读路径校验。
 // ---------------------------------------------------------------------------
@@ -621,21 +330,11 @@ TEST(MigrateBEtoLE, RoundTrip) {
         EXPECT_EQ(static_cast<unsigned char>(recs[2].val[3]), 0u);
     }
 
-    // dst hint：重生成，fold 出 3 条，墓碑标志正确。
+    // S43-8：迁移目标 data-only，旧纪元 hint 不迁移也不重生成。
     {
-        auto h = HintFile::open((fs::path(dst) / "1.bitcask.hint").string(),
-                                HintFile::Mode::kRead);
-        ASSERT_TRUE(h);
-        auto v = h->validate_trailer();
-        ASSERT_TRUE(v); EXPECT_TRUE(*v);
-        std::vector<std::string> keys; std::vector<bool> tombs;
-        auto fr = h->fold([&](const auto& rec) {
-            keys.push_back(view_str(rec.key));
-            tombs.push_back(rec.tombstone);
-        });
-        ASSERT_TRUE(fr);
-        EXPECT_EQ(keys, (std::vector<std::string>{"k1", "k2", "k1"}));
-        EXPECT_EQ(tombs, (std::vector<bool>{false, false, true}));
+        std::error_code ec;
+        EXPECT_FALSE(fs::exists(fs::path(dst) / "1.bitcask.hint", ec));
+        EXPECT_FALSE(ec);
     }
 }
 
@@ -832,17 +531,11 @@ TEST(MigrateU32toU64, RoundTrip) {
         ASSERT_EQ(recs[2].val.size(), 4u) << "墓碑 shadow 原样保留";
     }
 
-    // dst hint：v4 重生成,trailer 校验通过,tstamp 不截断。
+    // S43-8：tstamp64 目标同样 data-only。
     {
-        auto h = HintFile::open((fs::path(dst) / "1.bitcask.hint").string(),
-                                HintFile::Mode::kRead);
-        ASSERT_TRUE(h);
-        auto v = h->validate_trailer();
-        ASSERT_TRUE(v); EXPECT_TRUE(*v);
-        std::vector<std::uint64_t> ts;
-        auto fr = h->fold([&](const auto& rec) { ts.push_back(rec.tstamp); });
-        ASSERT_TRUE(fr);
-        EXPECT_EQ(ts, (std::vector<std::uint64_t>{100, 101, 102}));
+        std::error_code ec;
+        EXPECT_FALSE(fs::exists(fs::path(dst) / "1.bitcask.hint", ec));
+        EXPECT_FALSE(ec);
     }
 }
 
@@ -1156,104 +849,4 @@ TEST(FieldSchema, TornTailIsOverwrittenByNextIntern) {
     EXPECT_EQ(fs3.name_of(1).value(), "body");
     EXPECT_EQ(fs3.name_of(2).value(), "author");
     EXPECT_EQ(fs3.intern("author"), id_third) << "id 必须与写入时一致";
-}
-
-// ---------------------------------------------------------------------------
-// HintFile v3（S23-A1）+ v2 兼容读
-// ---------------------------------------------------------------------------
-
-// v3 非连续 offset（gap≠0，模拟未来写端跳记录）：正确性不依赖连续性。
-TEST(HintFile, V3NonContiguousOffsets) {
-    TempDir td;
-    const auto path = td / "gap.bitcask.hint";
-    auto h = HintFile::open(path, HintFile::Mode::kCreate);
-    ASSERT_TRUE(h);
-    ASSERT_TRUE(h->write(1, 30, /*off*/ 0,   false, as_bytes("a"), /*ord*/ 12));
-    ASSERT_TRUE(h->write(2, 40, /*off*/ 100, false, as_bytes("bb"), /*ord*/ 13));  // 洞
-    ASSERT_TRUE(h->write(3, 50, /*off*/ 140, true,  as_bytes("ccc"), /*ord*/ 14));
-    ASSERT_TRUE(h->finalize());
-
-    auto r = HintFile::open(path, HintFile::Mode::kRead);
-    ASSERT_TRUE(r);
-    std::vector<std::uint64_t> offs;
-    std::vector<bool> tombs;
-    auto fr = r->fold_validated([&](const auto& rec) {
-        offs.push_back(rec.offset);
-        tombs.push_back(rec.tombstone);
-    });
-    ASSERT_TRUE(fr);
-    EXPECT_TRUE(*fr);
-    EXPECT_EQ(offs, (std::vector<std::uint64_t>{0, 100, 140}));
-    EXPECT_EQ(tombs, (std::vector<bool>{false, false, true}));
-}
-
-// S33 flag-day：BCH4 及更早纪元的 hint 无读端——validate/fold_validated
-// 返回 false（caller 退 fold(data) 重建）、fold 报错。手工构造一个带 BCH4
-// 文件头 magic 的字节流验证三入口全拒。纪元硬门禁在 bitcask.meta v5，
-// 此处只保证「陈旧 hint 绝不被静默误读」。
-TEST(HintFile, Bch4LegacyFileRejected) {
-    TempDir td;
-    const auto path = td / "legacy.bitcask.hint";
-    {
-        // BCH4 magic + 若干字节旧格式载荷 + 伪 trailer（内容无关紧要——
-        // 应在 magic 检查处即被拒）。
-        std::vector<std::byte> buf;
-        auto push_u32 = [&](std::uint32_t v) {
-            for (int i = 0; i < 4; ++i) {
-                buf.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
-            }
-        };
-        push_u32(bitcask::format::kHintMagicV4);
-        for (int i = 0; i < 16; ++i) buf.push_back(std::byte{0x42});
-        push_u32(bitcask::format::kHintTrailerMagic);
-        push_u32(0xDEADBEEF);
-        std::ofstream f(std::string(path), std::ios::binary | std::ios::trunc);
-        f.write(reinterpret_cast<const char*>(buf.data()),
-                static_cast<std::streamsize>(buf.size()));
-    }
-    auto r = HintFile::open(path, HintFile::Mode::kRead);
-    ASSERT_TRUE(r);
-    auto v = r->validate_trailer();
-    ASSERT_TRUE(v);
-    EXPECT_FALSE(*v) << "BCH4 hint 必须判不可用（退 fold(data)）";
-
-    bool called = false;
-    auto fr = r->fold_validated([&](const auto&) { called = true; });
-    ASSERT_TRUE(fr);
-    EXPECT_FALSE(*fr);
-    EXPECT_FALSE(called) << "拒收路径绝不能回调";
-
-    auto fo = r->fold([&](const auto&) { called = true; });
-    EXPECT_FALSE(fo.has_value()) << "fold 对 BCH4 必须报错";
-    EXPECT_FALSE(called);
-}
-
-// v3 未封口（崩溃丢 trailer）：validate/fold_validated 拒绝 → fold(data) 兜底。
-TEST(HintFile, V3UnfinalizedRejected) {
-    TempDir td;
-    const auto path = td / "torn.bitcask.hint";
-    {
-        auto h = HintFile::open(path, HintFile::Mode::kCreate);
-        ASSERT_TRUE(h);
-        ASSERT_TRUE(h->write(1, 30, 0, false, as_bytes("a"), /*ord*/ 15));
-        // 手动 flush 但不 finalize（模拟崩溃）——sync 触发不了 pending 落盘，
-        // 直接析构会丢缓冲；这里用 finalize 前的 write 大小不足以自动 flush，
-        // 故重开写一批超过缓冲阈值不现实——改为 finalize 后截尾 8B。
-        ASSERT_TRUE(h->finalize());
-    }
-    // 截掉 trailer 模拟未封口。
-    std::error_code ec;
-    const auto sz = std::filesystem::file_size(std::string(path), ec);
-    ASSERT_FALSE(ec);
-    std::filesystem::resize_file(std::string(path), sz - 8, ec);
-    ASSERT_FALSE(ec);
-
-    auto r = HintFile::open(path, HintFile::Mode::kRead);
-    ASSERT_TRUE(r);
-    auto v = r->validate_trailer();
-    ASSERT_TRUE(v);
-    EXPECT_FALSE(*v);
-    auto fr = r->fold_validated([&](const auto&) {});
-    ASSERT_TRUE(fr);
-    EXPECT_FALSE(*fr);
 }

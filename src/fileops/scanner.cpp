@@ -44,11 +44,6 @@ scan_dir(std::string_view dirname) {
         DataFileEntry e;
         e.tstamp    = *tstamp;
         e.data_path = path_str;
-        // hint_path 即使没文件也会算出来——caller 可能要用这个名字写新 hint
-        e.hint_path = mk_hint_filename(path_str);
-
-        std::error_code hec;
-        e.has_hint  = fs::is_regular_file(e.hint_path, hec);
         out.push_back(std::move(e));
     }
 

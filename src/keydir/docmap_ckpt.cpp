@@ -332,7 +332,7 @@ bool save_docmap_base(Index& docmap, std::string_view dir,
 bool save_docmap_delta(Index& docmap, std::string_view dir,
                        std::uint64_t watermark, std::uint64_t base_gen,
                        std::uint64_t from, std::uint32_t seq,
-                       std::span<const std::byte> keydir_delta) {
+                       std::span<const std::byte> authority_delta) {
     const std::string fp = comp_path(dir);
     const std::string dpath = fp + ".d" + std::to_string(seq);
     sc::SectionWriter sw;  // S20-1 R4
@@ -400,8 +400,8 @@ bool save_docmap_delta(Index& docmap, std::string_view dir,
         }
     }
     // keydir meta 仅在 docmap 组件落（S14-7 成对不变量）。
-    if (!keydir_delta.empty()) {
-        std::vector<std::byte> kb(keydir_delta.begin(), keydir_delta.end());
+    if (!authority_delta.empty()) {
+        std::vector<std::byte> kb(authority_delta.begin(), authority_delta.end());
         sw.add(sc::CkptSectionType::kKeydirDelta, std::move(kb));
     }
     // 文件版本 3（含 V3 段型）——旧读端整文件拒收 → 链断退 fold（降级安全，

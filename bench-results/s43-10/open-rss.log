@@ -1,0 +1,5 @@
+--------------------------------------------------------------------------------------
+Benchmark                            Time             CPU   Iterations UserCounters...
+--------------------------------------------------------------------------------------
+BM_Oki_OpenRssProbe/100000        39.2 ms         39.1 ms           72 open_ms=38.5206 open_rss_B_per_key=112.722 open_rss_MB=10.75
+BM_Oki_OpenRssProbe/1000000        567 ms          566 ms            5 open_ms=602.636 open_rss_B_per_key=113.357 open_rss_MB=108.105

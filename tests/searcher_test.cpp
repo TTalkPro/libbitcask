@@ -5,15 +5,15 @@
 #include <string>
 
 #include "bitcask/cask.hpp"
-#include "bitcask/keydir_registry.hpp"
+#include "bitcask/index_registry.hpp"
 #include "bitcask/searcher.hpp"
 
 using namespace bitcask;
 namespace fs = std::filesystem;
 
 namespace {
-keydir::KeyDirRegistry& test_registry() {
-    static keydir::KeyDirRegistry reg;
+bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 std::span<const std::byte> sv_bytes(const std::string& s) {

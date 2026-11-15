@@ -30,7 +30,7 @@
 #include <vector>
 
 #include "bitcask/cask.hpp"
-#include "bitcask/keydir_registry.hpp"
+#include "bitcask/index_registry.hpp"
 #include "bitcask/meta_codec.hpp"   // S39：meta blob 编解码（C 侧 lookup/iter）
 #include "bitcask/search_config.hpp"  // S19-3：shim 已离开产品库
 #include "bitcask/synonym_map.hpp"
@@ -58,8 +58,8 @@ namespace text = bitcask::text;
 // S6-P0-pre：open() 强制非空 registry。C API 是进程级 host——一个全局 registry
 // 共享给所有经本 FFI 打开的句柄（即「每个共享库实例一个全局 registry」生产形态）。
 // 同目录多次 open 共享同一 keydir（refcount），与既有 NIF host 语义一致。
-inline bitcask::keydir::KeyDirRegistry& c_api_registry() {
-    static bitcask::keydir::KeyDirRegistry reg;
+inline bitcask::oki::IndexRegistry& c_api_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 
@@ -98,6 +98,8 @@ inline bitcask_error_t to_c_error_kind(bitcask::CaskError e) {
         case bitcask::CaskError::kClosed:           return BITCASK_ERR_CLOSED;
         case bitcask::CaskError::kIndexRebuildFailed:
             return BITCASK_ERR_INDEX_REBUILD_FAILED;
+        case bitcask::CaskError::kIndexCorrupt:
+            return BITCASK_ERR_INDEX_CORRUPT;
     }
     return BITCASK_ERR_IO;
 }

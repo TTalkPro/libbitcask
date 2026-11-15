@@ -30,8 +30,8 @@
 
 namespace bitcask::index {
 
-// 链重放时透传给宿主的 keydir 半边（原 SearchLayer::DeltaDocRow/DeltaRemoval
-// 的宿主版）。rows/removals → keydir LWW put / remove_if_older；keydir_meta
+// 链重放时透传给宿主的索引权威半边（原 SearchLayer::DeltaDocRow/DeltaRemoval
+// 的宿主版）。rows/removals → authority LWW put / remove_if_older；authority_meta
 // 为 kKeydirDelta 段原始字节（可为空 → 字节水位不推进，方向安全）。
 struct DocmapDeltaRow {
     std::uint64_t ord = 0;
@@ -45,7 +45,7 @@ struct DocmapDeltaRemoval {
 using DocmapReplayHook = std::function<void(
     const std::vector<DocmapDeltaRow>&,
     const std::vector<DocmapDeltaRemoval>&,
-    std::span<const std::byte> keydir_meta)>;
+    std::span<const std::byte> authority_meta)>;
 
 // kDocmapDelta 段解析 + 交错重放（S20-2 R3：docmap_ckpt 与 legacy_ckpt 共用）。
 // 窗口 live 行 + 删除日志按 ord 升序交错应用到 Index（「删后重写」场景删除
@@ -58,8 +58,8 @@ using DocmapReplayHook = std::function<void(
 // S21-3 B3：单 delta 文件段集应用的共享骨架（docmap_ckpt 与 legacy_ckpt
 // 各自的 apply_delta_file 曾逐字节重复此结构，仅段分发集不同）。不变量
 // 收敛于一处：① 全段 CRC 预检——任何坏段整个 delta 拒绝，绝不部分应用；
-// ② keydir 半边（rows/rems/meta）收集后 hook **收尾一次性**透传。
-// fn(type, payload, rows, rems, keydir_meta) 处理一个段：kKeydirDelta 由
+// ② authority 半边（rows/rems/meta）收集后 hook **收尾一次性**透传。
+// fn(type, payload, rows, rems, authority_meta) 处理一个段：kKeydirDelta 由
 // 骨架代管（fn 不会收到）；kDeltaInfo 由链校验消费，fn 应忽略；返回 false
 // 断链。
 template <typename SectionFn>
@@ -71,18 +71,18 @@ template <typename SectionFn>
     }
     std::vector<DocmapDeltaRow> rows;
     std::vector<DocmapDeltaRemoval> rems;
-    std::span<const std::byte> keydir_meta;
+    std::span<const std::byte> authority_meta;
     for (const auto& ls : sections) {
         const std::span<const std::byte> pl(ls.payload.data(),
                                             ls.payload.size());
         const auto st = static_cast<search::CkptSectionType>(ls.type);
         if (st == search::CkptSectionType::kKeydirDelta) {
-            keydir_meta = pl;
+            authority_meta = pl;
             continue;
         }
         if (!fn(st, pl, rows, rems)) return false;
     }
-    if (hook) hook(rows, rems, keydir_meta);
+    if (hook) hook(rows, rems, authority_meta);
     return true;
 }
 
@@ -98,7 +98,7 @@ template <typename SectionFn>
                                      std::uint64_t watermark,
                                      std::uint64_t base_gen,
                                      std::uint64_t from, std::uint32_t seq,
-                                     std::span<const std::byte> keydir_delta);
+                                     std::span<const std::byte> authority_delta);
 
 // 组件载入结果：与 text/vector 组件同构（S20-1 R6 收敛至 ckpt::LoadResult）。
 using DocmapLoadResult = ckpt::LoadResult;

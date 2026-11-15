@@ -18,7 +18,7 @@ using bitcask::test::crash_exit;
 #include <gtest/gtest.h>
 
 #include <bitcask/cask.hpp>
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_registry.hpp>
 #include <bitcask/oki_run.hpp>
 #include <bitcask/oki_state.hpp>
 
@@ -28,8 +28,8 @@ using bitcask::CaskOptions;
 
 namespace {
 
-bitcask::keydir::KeyDirRegistry& test_registry() {
-    static bitcask::keydir::KeyDirRegistry reg;
+bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 
@@ -96,7 +96,7 @@ TEST_F(OkiRecoveryTest, CleanCloseFlushesRunsAndCoversAllKeys) {
         }
         ASSERT_TRUE((*c)->remove(bytes("ok3"), 2000));
         ASSERT_TRUE((*c)->remove(bytes("ok7"), 2000));
-        const std::uint64_t next = (*c)->keydir().peek_next_ord();
+        const std::uint64_t next = (*c)->index_authority().peek_next_ord();
         (*c)->close();
 
         auto m = bitcask::oki::read_manifest(dir_.string());
@@ -140,7 +140,7 @@ TEST_F(OkiRecoveryTest, RebuildWithNoLiveKeysWritesNoEmptyRun) {
         ASSERT_TRUE(m.has_value()) << "重建必须提交 manifest（哪怕 0 run）";
         EXPECT_TRUE(m->runs.empty()) << "空库不该留空 run";
         EXPECT_TRUE(seg_files().empty()) << "不该有 seg 文件";
-        EXPECT_EQ((*c)->keydir().oki().run_count(), 0u);
+        EXPECT_EQ((*c)->index_authority().state().run_count(), 0u);
         // OKI 仍是「已加载」态——range 查询可用，只是没有行可归并。
         auto it = (*c)->make_range_iter(bitcask::RangeOptions{});
         ASSERT_TRUE(it.has_value());
@@ -176,7 +176,7 @@ TEST_F(OkiRecoveryTest, RebuildWithNoLiveKeysWritesNoEmptyRun) {
         ASSERT_TRUE(m.has_value());
         EXPECT_TRUE(m->runs.empty()) << "全删后重建不该留空 run";
         EXPECT_TRUE(seg_files().empty()) << "旧 run 应被清理且不写新空 run";
-        EXPECT_EQ(m->wm, (*c)->keydir().peek_next_ord())
+        EXPECT_EQ(m->wm, (*c)->index_authority().peek_next_ord())
             << "wm 仍须追平（0 run 不影响水位语义）";
         // 重建后继续写：新行走 memdelta，range 照常出货。
         ASSERT_TRUE((*c)->put(bytes("z1"), bytes("v1"), 1000));
@@ -216,19 +216,19 @@ TEST_F(OkiRecoveryTest, RunCompactionCollapsesRunsAtThreshold) {
         ASSERT_TRUE(cask.put(bytes("c" + std::to_string(round)), bytes("v"),
                              1000));
         ASSERT_TRUE(cask.checkpoint());
-        EXPECT_EQ(cask.keydir().oki().run_count(), round + 1)
+        EXPECT_EQ(cask.index_authority().state().run_count(), round + 1)
             << "阈值内不该归并（round " << round << "）";
     }
     // 第 limit+1 次 flush：run 数越过阈值 → 全归并成 1 个。
     ASSERT_TRUE(cask.put(bytes("c" + std::to_string(limit)), bytes("v"), 1000));
     ASSERT_TRUE(cask.checkpoint());
-    EXPECT_EQ(cask.keydir().oki().run_count(), 1u) << "越阈值须塌成单 run";
+    EXPECT_EQ(cask.index_authority().state().run_count(), 1u) << "越阈值须塌成单 run";
     EXPECT_EQ(seg_count(), 1u) << "旧 run 文件须被清理（fd 与磁盘同时回收）";
 
     auto m = bitcask::oki::read_manifest(dir_.string());
     ASSERT_TRUE(m.has_value());
     EXPECT_EQ(m->runs.size(), 1u);
-    EXPECT_EQ(m->wm, cask.keydir().peek_next_ord())
+    EXPECT_EQ(m->wm, cask.index_authority().peek_next_ord())
         << "归并不推进也不倒退水位";
 
     // 数据完整：归并前写的 key 一条不少，且 range 仍按序出货。
@@ -266,7 +266,7 @@ TEST_F(OkiRecoveryTest, FullCompactionDropsTombstoneRows) {
         ASSERT_TRUE(cask.remove(bytes("t" + std::to_string(i)), 2000));
         ASSERT_TRUE(cask.checkpoint());
     }
-    ASSERT_LE(cask.keydir().oki().run_count(),
+    ASSERT_LE(cask.index_authority().state().run_count(),
               bitcask::oki::OkiState::kCompactRunLimit)
         << "本段须停在阈值内";
     // 归并前：墓碑以 tomb 行的形态存在于 run 里。
@@ -277,11 +277,11 @@ TEST_F(OkiRecoveryTest, FullCompactionDropsTombstoneRows) {
     }
 
     // 再 flush 若干次越过阈值 → 全归并。
-    for (int i = 100; cask.keydir().oki().run_count() > 1 && i < 120; ++i) {
+    for (int i = 100; cask.index_authority().state().run_count() > 1 && i < 120; ++i) {
         ASSERT_TRUE(cask.put(bytes("z" + std::to_string(i)), bytes("v"), 1000));
         ASSERT_TRUE(cask.checkpoint());
     }
-    ASSERT_EQ(cask.keydir().oki().run_count(), 1u);
+    ASSERT_EQ(cask.index_authority().state().run_count(), 1u);
 
     // 归并后：被删的 key **整条不在 run 里**（连 tomb 行都没有），活 key 齐全。
     auto view = read_all_runs(dir_.string());
@@ -349,9 +349,9 @@ TEST_F(OkiRecoveryTest, ReopenAfterCleanCloseDoesNotRebuild) {
         o.read_write = true;
         auto c = Cask::open(dir_.string(), o, &test_registry());
         ASSERT_TRUE(c);
-        EXPECT_TRUE((*c)->keydir().oki().loaded());
-        EXPECT_EQ((*c)->keydir().oki().wm(), m1->wm);
-        EXPECT_EQ((*c)->keydir().oki().delta_rows(), 0u)
+        EXPECT_TRUE((*c)->index_authority().state().loaded());
+        EXPECT_EQ((*c)->index_authority().state().wm(), m1->wm);
+        EXPECT_EQ((*c)->index_authority().state().delta_rows(), 0u)
             << "无缺口重开：tail 重放为空";
         (*c)->close();
     }
@@ -368,6 +368,7 @@ constexpr int kCrashTailFirst = 15, kCrashTailSecond = 10;
 BITCASK_CRASH_SCENARIO(oki_crash_tail) {
     CaskOptions o;
     o.read_write = true;
+    o.keydir_cache_entries = 64;  // S43-9：tail 重放是 Level B 提交协议
     auto c = Cask::open(dir, o, &test_registry());
     if (!c) crash_exit(1);
     for (int i = 0; i < kCrashTailFirst; ++i) {
@@ -397,9 +398,10 @@ TEST_F(OkiRecoveryTest, CrashTailReplayWithoutRebuild) {
     {
         CaskOptions o;
         o.read_write = true;
+        o.keydir_cache_entries = 64;
         auto c = Cask::open(dir_.string(), o, &test_registry());
         ASSERT_TRUE(c);
-        auto& oki = (*c)->keydir().oki();
+        auto& oki = (*c)->index_authority().state();
         EXPECT_TRUE(oki.loaded());
         // 崩溃前 checkpoint 的 flush 覆盖第一段；第二段靠 tail 重放进
         // memdelta——不触发重建（manifest run 集保持，含新 flush 前）。
@@ -452,9 +454,9 @@ TEST_F(OkiRecoveryTest, MissingManifestTriggersFullRebuild) {
         o.read_write = true;
         auto c = Cask::open(dir_.string(), o, &test_registry());
         ASSERT_TRUE(c);
-        EXPECT_TRUE((*c)->keydir().oki().loaded()) << "重建后必须就绪";
-        EXPECT_EQ((*c)->keydir().oki().wm(),
-                  (*c)->keydir().peek_next_ord());
+        EXPECT_TRUE((*c)->index_authority().state().loaded()) << "重建后必须就绪";
+        EXPECT_EQ((*c)->index_authority().state().wm(),
+                  (*c)->index_authority().peek_next_ord());
         (*c)->close();
     }
     auto view = read_all_runs(dir_.string());
@@ -478,16 +480,18 @@ TEST_F(OkiRecoveryTest, SnapshotGapTriggersRebuild) {
     }
     // 模拟「快照写后、OKI flush 前崩溃」：把 manifest 回滚成空（wm=0），
     // 快照仍在——fold 会跳过字节水位前的行，OKI 无法靠 tail 重放补齐。
-    ASSERT_TRUE(bitcask::oki::write_manifest(dir_.string(),
-                                             bitcask::oki::OkiManifest{}));
+    bitcask::oki::OkiManifest gap;
+    gap.level_b = true;
+    ASSERT_TRUE(bitcask::oki::write_manifest(dir_.string(), gap));
     {
         CaskOptions o;
         o.read_write = true;
+        o.keydir_cache_entries = 64;
         auto c = Cask::open(dir_.string(), o, &test_registry());
         ASSERT_TRUE(c);
-        EXPECT_TRUE((*c)->keydir().oki().loaded());
-        EXPECT_EQ((*c)->keydir().oki().wm(),
-                  (*c)->keydir().peek_next_ord())
+        EXPECT_TRUE((*c)->index_authority().state().loaded());
+        EXPECT_EQ((*c)->index_authority().state().wm(),
+                  (*c)->index_authority().peek_next_ord())
             << "缺口必须触发全量重建并追平水位";
         (*c)->close();
     }
@@ -510,8 +514,8 @@ TEST_F(OkiRecoveryTest, RangeErrorSplitsNeverBuiltFromRebuildFailed) {
         ASSERT_TRUE((*c)->put(bytes("re1"), bytes("v"), 1000));
         (*c)->close();
     }
-    // OKI 全丢（派生缓存语义），RO 打开——不持 write.lock 不产文件，
-    // OKI 保持未加载态 → kNoIndex。
+    // S43-9：data 是唯一持久真相。OKI 全丢（派生缓存语义）后，RO 打开
+    // 只建内存读视图、不持 write.lock 也不产文件；range 必须可用。
     {
         auto m = bitcask::oki::read_manifest(dir_.string());
         ASSERT_TRUE(m.has_value());
@@ -526,20 +530,26 @@ TEST_F(OkiRecoveryTest, RangeErrorSplitsNeverBuiltFromRebuildFailed) {
         auto c = Cask::open(dir_.string(), o, &test_registry());
         ASSERT_TRUE(c);
         auto it = (*c)->make_range_iter(bitcask::RangeOptions{});
-        ASSERT_FALSE(it.has_value());
-        EXPECT_EQ(it.error().kind, bitcask::CaskError::kNoIndex);
+        ASSERT_TRUE(it.has_value());
+        auto e = (*it)->next();
+        ASSERT_TRUE(e.has_value());
+        ASSERT_TRUE(e->has_value());
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>((*e)->key.data()),
+                              (*e)->key.size()), "re1");
         (*c)->close();
     }
     // 可写重开会触发全量重建（gen 从 1 起）——在 run 目标路径上放一个
     // **目录**使落盘失败 → 重建失败 → open 仍成功（best-effort 降级），
     // range 报 kIndexRebuildFailed。
+    std::error_code blocker_ec;
+    fs::remove(bitcask::oki::mk_run_filename(dir_.string(), 1), blocker_ec);
     fs::create_directories(bitcask::oki::mk_run_filename(dir_.string(), 1));
     {
         CaskOptions o;
         o.read_write = true;
         auto c = Cask::open(dir_.string(), o, &test_registry());
         ASSERT_TRUE(c);
-        EXPECT_FALSE((*c)->keydir().oki().loaded());
+        EXPECT_FALSE((*c)->index_authority().state().loaded());
         auto it = (*c)->make_range_iter(bitcask::RangeOptions{});
         ASSERT_FALSE(it.has_value());
         EXPECT_EQ(it.error().kind,

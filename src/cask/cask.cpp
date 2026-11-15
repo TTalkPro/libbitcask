@@ -9,16 +9,18 @@
 
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <limits>   // S37-5：parse_start_token 的溢出保护
+#include <map>
 #include <thread>
 
 #include "bitcask/format.hpp"
-#include "bitcask/keydir_registry.hpp"
+#include "bitcask/index_registry.hpp"
 #include "bitcask/merger.hpp"
 #include "bitcask/oki_state.hpp"  // S33-4：flush 搭快照车 / 阈值 flush
 #include "bitcask/detail/scanner.hpp"
@@ -192,12 +194,12 @@ acquire_writer_lock(const std::string& dirname) {
 // =============================================================================
 // Cask 主体实现
 //
-// open   ：拿锁 / 注册 keydir / 扫盘重建索引 / 准备 active writer
+// open   ：拿锁 / 注册 authority / 扫盘重建索引 / 准备 active writer
 // upgrade：离线 KV→索引升级（不拿锁，只读扫盘重建索引）
-// close  ：finalize active writer + hint trailer，释放锁，registry release
-// get    ：keydir 查 → DataFile pread → 校验 → 返回 value
-// put    ：append 到 active data file → 写 hint → 更新 keydir
-// remove ：append 一条墓碑 record → 更新 keydir 标记为墓碑
+// close  ：落 active data 尾批，释放锁，registry release
+// get    ：authority 查 → DataFile pread → 校验 → 返回 value
+// put    ：append 到 active data file → 更新 OKI/authority
+// remove ：append 一条墓碑 record → 更新 authority 标记为墓碑
 // merge  ：跑 run_merge → 合并完后从 read_files_ 缓存里淘汰旧句柄、
 //          然后 unlink 老文件
 // =============================================================================
@@ -208,17 +210,17 @@ Cask::~Cask() { close(); }
 //   1. ensure dir 存在
 //   2. 拿锁：read_write 拿 bitcask.write.lock；merge_only 拿 bitcask.merge.lock；
 //      只读模式不拿任何锁
-//   3. 拿 keydir：通过 registry 共享 / 单独 new；首次创建的需要 load_keydir_from_disk
+//   3. 拿 authority：通过 registry 共享 / 单独 new；首次创建的需要 load_authority_from_disk
 // 失败路径会回滚已分配的资源（unique_ptr 自带 RAII，锁也是 optional<FileLock> 自管）。
 // 内部按阶段拆为 acquire_open_locks() → check_or_create_meta() →
-// create_search_infra() → keydir 装配,本函数只做编排。
+// create_search_infra() → authority 装配,本函数只做编排。
 std::expected<std::unique_ptr<Cask>, CaskFault>
 Cask::open(std::string_view dirname, const CaskOptions& opts,
-            keydir::KeyDirRegistry* registry) {
+            oki::IndexRegistry* registry) {
     // S6-P0-pre：registry 强制非空（双池归属 registry，无 nullptr fallback）。
     if (registry == nullptr) {
         return std::unexpected(err(CaskError::kInvalidOption,
-            "open() requires a non-null KeyDirRegistry"));
+            "open() requires a non-null IndexRegistry"));
     }
     auto cask = std::make_unique<Cask>();
     cask->dirname_ = std::string(dirname);
@@ -268,39 +270,39 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     // 不走 registry：每个 cask 独占一个 keydir（unit test 常见）。
     if (registry != nullptr) {
         // MEM-MED-1 修复：先在局部变量上完成 acquire（含失败重试），
-        // 仅当确认 acquire 成功后才把 registry_ / keydir_name_ 提交给 cask。
+        // 仅当确认 acquire 成功后才把 registry_ / authority_name_ 提交给 cask。
         //
-        // 原 bug：先设 registry_/keydir_name_ 再 acquire。kNotReady 路径
+        // 原 bug：先设 registry_/authority_name_ 再 acquire。kNotReady 路径
         // acquire 不增 refcount，2 秒超时返回后 ~Cask→close() 仍会执行
         // registry_->release()——把初始化方的活动 slot refcount 从 1 减到 0
         // 并 erase。后果：biggest_file_id 持久化被跳过 → 老文件 ID 复用 →
         // keydir 误判旧 entry 为最新（tombstone-resurrection 等价类）。
         // 报告 MEM-MED-1；触发条件：同进程并发 open + 初始化 >2s（大库冷启动）。
-        std::string keydir_name(dirname);
-        auto a = registry->acquire(keydir_name);
-        if (a.status == keydir::AcquireStatus::kNotReady) {
+        std::string authority_name(dirname);
+        auto a = registry->acquire(authority_name);
+        if (a.status == oki::AcquireStatus::kNotReady) {
             for (int i = 0; i < 40; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                a = registry->acquire(keydir_name);
-                if (a.status != keydir::AcquireStatus::kNotReady) break;
+                a = registry->acquire(authority_name);
+                if (a.status != oki::AcquireStatus::kNotReady) break;
             }
-            if (a.status == keydir::AcquireStatus::kNotReady) {
+            if (a.status == oki::AcquireStatus::kNotReady) {
                 return std::unexpected(err(CaskError::kIo,
                     "keydir not_ready after wait"));
             }
         }
         // acquire 成功后才登记到 cask——close() 的 release 现严格配对
         cask->registry_    = registry;
-        cask->keydir_name_ = std::move(keydir_name);
-        cask->keydir_ = a.keydir;
-        if (a.status == keydir::AcquireStatus::kCreated) {
-            if (auto r = cask->load_keydir_from_disk(); !r) return std::unexpected(r.error());
-            cask->keydir_->mark_ready();
+        cask->authority_name_ = std::move(authority_name);
+        cask->authority_ = a.authority;
+        if (a.status == oki::AcquireStatus::kCreated) {
+            if (auto r = cask->load_authority_from_disk(); !r) return std::unexpected(r.error());
+            cask->authority_->mark_ready();
         }
     } else {
-        cask->keydir_ = std::make_shared<keydir::KeyDir>();
-        if (auto r = cask->load_keydir_from_disk(); !r) return std::unexpected(r.error());
-        cask->keydir_->mark_ready();
+        cask->authority_ = std::make_shared<oki::IndexAuthority>();
+        if (auto r = cask->load_authority_from_disk(); !r) return std::unexpected(r.error());
+        cask->authority_->mark_ready();
     }
     // S6-P3: 仅 search 模式注册车道（KV 模式无 search_）。索引双池由 registry
     // 共享所有——本库向其注册一条 lane（map/reduce/error 闭包 + 起始 ord），
@@ -310,7 +312,7 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     // 起始 ord 对齐 keydir 当前水位——reducer 跳过 disk 已恢复的
     // [0, peek_next_ord) 区间。merge 提交的 RunFn{ord=peek_next_ord} 等
     // 首个 entry 进该 lane 的 reorder 时 next_apply_ord 已对齐，无 stall。必须
-    // 在 keydir_/registry_ 就绪后（create_search_infra 早于此装配）。
+    // 在 authority_/registry_ 就绪后（create_search_infra 早于此装配）。
     //
     // S15-3：闭包按 CaskPlugin 接口分发（捕获 plugins_ 快照 by value；P1 恒
     // = {TextPlugin, VectorPlugin}，S18-5）。生命周期见 close()：先 unregister_lib（flush
@@ -325,12 +327,12 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
             [c](ReorderEntry& entry) { c->reduce_index_entry(entry); },
             [c]() { c->on_index_worker_error(); },
             // 起始 ord。
-            cask->keydir_->peek_next_ord()
+            cask->authority_->peek_next_ord()
         );
     }
     // S14-1：自动 ckpt 增量基线 = 当前水位（open 恢复路径①已按需回存，
     // 从零起算会导致老库首个 roll 必触发一次全量 ckpt）。
-    cask->last_ckpt_ord_.store(cask->keydir_->peek_next_ord(),
+    cask->last_ckpt_ord_.store(cask->authority_->peek_next_ord(),
                                std::memory_order_relaxed);
     return cask;
 }
@@ -610,7 +612,7 @@ void Cask::CaskPluginHost::run_serialized(std::function<void()> fn) {
     if (c->index_pool_ && c->index_lane_) {
         IndexTask t;
         t.op  = IndexOp::RunFn;
-        const std::uint64_t ord = c->keydir_->alloc_ord();
+        const std::uint64_t ord = c->authority_->alloc_ord();
         OrdSkipGuard og(c, ord);
         t.ord = ord;
         t.fn  = std::move(fn);
@@ -732,8 +734,7 @@ void Cask::on_index_worker_error() noexcept {
 }
 
 // 收尾顺序很关键：
-//   1. finalize active hint（写 trailer + running CRC，否则 hint 文件
-//      下次 open 时会被判失效，回退到全量 fold(data) 重建 keydir）；
+//   1. 落 active data 尾批；
 //   2. 关 active data；
 //   3. 清 read cache（关掉缓存的 fd，避免泄漏）；
 //   4. registry release（refcount -1，归零时 keydir 真正销毁）；
@@ -780,10 +781,6 @@ void Cask::close() noexcept {
         if (!opts_.o_sync && active_data_) {
             (void)active_data_->sync();
         }
-        if (active_hint_) {
-            (void)active_hint_->finalize();
-            active_hint_.reset();
-        }
         {
             std::scoped_lock lk(read_cache_mu_);
             active_data_.reset();
@@ -810,7 +807,7 @@ void Cask::close() noexcept {
         // A4-P2/P3 顺序要点:先排干本库车道(flush → Index 覆盖全部已分配
         // ord),再在 keydir 仍在手时做 search 双保存(bm25 + sidecar,覆盖标记
         // 取 peek_next_ord),最后落 keydir 快照并释放。顺序不可颠倒:sidecar
-        // 存点须在 keydir_.reset() 之前，否则恒被跳过。
+        // 存点须在 authority_.reset() 之前，否则恒被跳过。
         //
         // S6-P3: 池由 registry 共享，close 只注销本库车道（flush 排空 + 从
         // lanes_ 移除），不停池（其它库仍在用）。unregister_lib 内含 flush，
@@ -829,17 +826,17 @@ void Cask::close() noexcept {
             index_lane_ = nullptr;
             index_pool_ = nullptr;  // 仅清借用指针，不动共享池本体
         }
-        if (text_ && opts_.read_write && keydir_) {
+        if (text_ && opts_.read_write && authority_) {
             // P14e:统一分段 search.ckpt（docmap + bm25 + hnsw 单文件）。
             // S14-4：close 强制全量 base——干净关闭收敛为单一 base，
             // .prev 代际刷新、delta 链坍缩（链不跨干净重启累积）。
             force_ckpt_rebase();
             const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
             (void)save_search_ckpt_paired(search_ckpt,
-                                          keydir_->peek_next_ord(),
+                                          authority_->peek_next_ord(),
                                           collect_snapshot_watermarks(), {});
         }
-        if (opts_.read_write) write_keydir_snapshot();
+        if (opts_.read_write) write_authority_snapshot();
     } catch (...) {
         // 吞掉：close 是终结路径，没有合理的恢复动作。后续 keydir/lock
         // release 仍需执行，所以不 return。S13-D7：上报（log 自身 noexcept）。
@@ -851,16 +848,16 @@ void Cask::close() noexcept {
     // noexcept）不抛；唯 registry_->release 内部取 mutex + 构造 std::string，
     // 理论上可抛 system_error/bad_alloc——单独包 try 兜底，保证 close() 整体
     // 真正 noexcept（否则此处抛出仍会 std::terminate）。
-    if (registry_ && !keydir_name_.empty()) {
+    if (registry_ && !authority_name_.empty()) {
         try {
-            registry_->release(keydir_name_);
+            registry_->release(authority_name_);
         } catch (...) {
             // 极罕见（mutex 资源耗尽 / OOM）；吞掉，继续释放本地资源。
         }
         registry_ = nullptr;
-        keydir_name_.clear();
+        authority_name_.clear();
     }
-    keydir_.reset();
+    authority_.reset();
     // S18-5：plugins_ 指向 search_ 内部插件，先清分发表再重置 search_
     // （lane 已在上方 unregister（含 flush），闭包不会再触碰）。
     plugins_.clear();
@@ -881,13 +878,13 @@ void Cask::close() noexcept {
 // S14-1：水位捕获与快照写入拆分。无参版本 = 捕获+写入（调用点须在写者
 // 静止处：close / merge 末尾 / open 恢复①）；RunFn 路径（checkpoint()/
 // 自动 ckpt）在**提交时刻**捕获水位、reducer 执行时刻写快照本体——执行时
-// 取水位会被并发写者推进，反转「keydir_covered ≤ search_covered」保存序
+// 取水位会被并发写者推进，反转「authority_covered ≤ search_covered」保存序
 // 不变量（路线 A §4），fold 从超前字节水位起跳、search 丢失
 // [ckpt_wm, 快照时刻) 区间。快照 entries 比水位新无害：fold 尾部重放对
 // keydir 幂等覆盖。
 std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>>
 Cask::collect_snapshot_watermarks() const noexcept {
-    if (!keydir_) return std::nullopt;
+    if (!authority_) return std::nullopt;
     auto entries = fileops::scan_dir(dirname_);
     if (!entries) return std::nullopt;
     std::vector<std::pair<std::uint32_t, std::uint64_t>> wms;
@@ -927,28 +924,20 @@ std::uint64_t Cask::active_durable_bytes() const noexcept {
     return active_data_ ? active_data_->durable_bytes() : 0;
 }
 
-void Cask::write_keydir_snapshot(
+void Cask::write_authority_snapshot(
     const std::vector<std::pair<std::uint32_t, std::uint64_t>>& wms) noexcept {
-    if (!keydir_) return;
-    if (!keydir_->save_snapshot(dirname_ + "/" + kKeydirSnapName, wms)) {
-        // best-effort：失败下次 open 走全量 fold（仅慢一次启动）。S13-D7 上报。
-        log_warn("keydir snapshot save failed (will rebuild on next open)");
-    }
-    // S33-4：OKI flush 恒在 keydir 快照**之后**（同站点搭车：close/merge
-    // 收尾/成对 ckpt base）——快照跳过的字节区间必须已进 runs（wm ≥ 快照
-    // 实载覆盖界），否则崩溃后是数据洞；崩溃丢本次 flush 由 open 端缺口
-    // 检查（finish_oki_recovery）整体重建兜底。best-effort：失败仅降级。
-    // S36-5 B1：flush 带同一份持久水位（wms 的 active 项已被 collect 钳到
-    // 已 fsync 字节）——run 与快照一样不得引用可能随掉电蒸发的字节。
-    if (keydir_->oki().loaded() && !keydir_->oki().flush(dirname_, wms)) {
+    if (!authority_ || !authority_->state().loaded()) return;
+    // S43-9：OKI manifest 是唯一权威快照；不再写 BCKS。
+    auto commit = authority_->capture_commit_snapshot();
+    if (!authority_->state().flush(dirname_, wms, std::move(commit))) {
         log_warn("oki flush after keydir snapshot failed (rebuild on open)");
     }
 }
 
-void Cask::write_keydir_snapshot() noexcept {
+void Cask::write_authority_snapshot() noexcept {
     auto wms = collect_snapshot_watermarks();
     if (!wms) return;
-    write_keydir_snapshot(*wms);
+    write_authority_snapshot(*wms);
 }
 
 // B4：延迟删除队列（语义见 merge 收尾注释与 cask.hpp 成员注释）。
@@ -969,7 +958,7 @@ void Cask::drain_retired_files() noexcept {
     for (const auto& path : batch) {
         std::error_code ec;
         std::filesystem::remove(bitcask::detail::from_utf8(path), ec);
-        std::filesystem::remove(bitcask::detail::from_utf8(fileops::mk_hint_filename(path)), ec);
+        // S43-8：retirement 的清理面收敛为 .data；旧 hint 在 open 时惰性删除。
         // 删除失败（非 POSIX 语义下仍被打开等）→ 放回队列下代再试。
         if (ec && std::filesystem::exists(bitcask::detail::from_utf8(path))) {
             std::lock_guard<std::mutex> lk(retired_mu_);
@@ -986,8 +975,8 @@ void Cask::drain_retired_files() noexcept {
 // 得引用未持久字节；sync 后全部行持久，flush 免过滤。sync 失败放弃本轮
 // （delta 原状，下次重试）。
 void Cask::maybe_flush_oki() noexcept {
-    if (!keydir_) return;  // S36-4：close 竞态（组提交尾可达）
-    auto& oki = keydir_->oki();
+    if (!authority_) return;  // S36-4：close 竞态（组提交尾可达）
+    auto& oki = authority_->state();
     if (!oki.loaded() || !oki.should_flush()) return;
     if (!opts_.o_sync && active_data_) {
         if (auto s = active_data_->sync(); !s) {
@@ -1001,11 +990,11 @@ void Cask::maybe_flush_oki() noexcept {
 }
 
 // S36-5：锁外站点（put_batch/put_batch_atomic/remove/put_doc 尾部）的
-// 阈值探询包装——先无锁 hint 快查，命中才取 write_mu_ 做同步 flush
+// 阈值探询包装——先无锁快查，命中才取 write_mu_ 做同步 flush
 // （罕见；与并发写者短暂互斥可接受）。
 void Cask::maybe_flush_oki_unlocked() noexcept {
-    if (!keydir_) return;
-    auto& oki = keydir_->oki();
+    if (!authority_) return;
+    auto& oki = authority_->state();
     if (!oki.loaded() || !oki.should_flush()) return;
     std::lock_guard<std::mutex> wlk(write_mu_);
     if (is_closed()) return;
@@ -1024,7 +1013,7 @@ void Cask::submit_index_task(IndexTask task) {
 
 // ---- active writer 管理 ----------------------------------------------------
 // ensure_active_writer：第一次写入或 close_write_file 之后调用，
-// 创建新的 data + hint 文件、把路径补到 write.lock 内容里。
+// 创建新的 data 文件、把路径补到 write.lock 内容里。
 // roll_active_if_needed：写之前判断是否会撑爆 max_file_size，是的话切下一个。
 // roll_active：无条件切——给 put 在 keydir.biggest_file_id 被并发 merger
 // 顶过去时使用。
@@ -1047,26 +1036,19 @@ std::expected<void, CaskFault> Cask::ensure_active_writer() {
         write_lock_ = std::move(*fl);
     }
 
-    active_file_id_ = keydir_->increment_file_id();
+    active_file_id_ = authority_->increment_file_id();
     auto data_path = fileops::mk_data_filename(dirname_, active_file_id_);
-    auto hint_path = fileops::mk_hint_filename(data_path);
 
     auto df = fileops::DataFile::open(data_path,
                                        fileops::DataFile::Mode::kCreate,
                                        opts_.o_sync);
     if (!df) return std::unexpected(io_fault(df.error().errnum, data_path));
-    auto hf = fileops::HintFile::open(hint_path,
-                                       fileops::HintFile::Mode::kCreate,
-                                       opts_.o_sync);
-    if (!hf) return std::unexpected(io_fault(hf.error().errnum, hint_path));
     {
         // active_data_ 被 read_file 在 read_cache_mu_ 下读取,
         // 写点必须同锁互斥(O10:shared_ptr 拷贝与替换需要串行化)。
         std::unique_lock lk(read_cache_mu_);
         active_data_ = std::make_shared<fileops::DataFile>(std::move(*df));
     }
-    active_hint_ = std::make_unique<fileops::HintFile>(std::move(*hf));
-
     // 把新 active file 路径记到 write.lock 里：merger（merge_only=true）
     // 通过读 write.lock 知道我们正在写哪个 file_id，从 needs_merge 候选里
     // 排除它。格式跟 legacy 一致："<pid> <active_data_path>\n"。
@@ -1086,7 +1068,6 @@ std::expected<void, CaskFault> Cask::ensure_active_writer() {
 // P4 单写者组提交。put/remove/put_doc 每次写后调用。o_sync 已逐条 durable、
 // 或 sync_every_n==0、或无 active writer → no-op。累计写数达阈值（或 force）
 // 时对 active data file fsync 一次并清零计数。写路径单线程，计数无需原子。
-// hint 不在此 fsync——它可重建，崩溃回退 fold(data)。
 std::expected<void, CaskFault> Cask::maybe_group_commit(bool force) {
     if (opts_.o_sync || opts_.sync_every_n == 0 || !active_data_) return {};
     if (!force) ++writes_since_sync_;
@@ -1110,8 +1091,8 @@ Cask::roll_active_if_needed(std::size_t about_to_write) {
     return roll_active();
 }
 
-// 无条件 roll：先把 hint trailer finalize（保证下次 open 能用 hint 加速），
-// 然后丢掉 active data/hint 句柄，新建一个新 file_id 的 active writer。
+// 无条件 roll：先把 active data 尾批封口持久，然后丢句柄并新建
+// 一个新 file_id 的 active writer。
 // put 在 keydir.biggest_file_id 被并发 merger 顶过去时也走这条路径。
 std::expected<void, CaskFault> Cask::roll_active() {
     if (auto r = maybe_group_commit(/*force*/ true); !r) return r;  // P4:落旧文件尾批
@@ -1125,17 +1106,10 @@ std::expected<void, CaskFault> Cask::roll_active() {
                                             std::string(active_data_->path())));
         }
     }
-    if (active_hint_) {
-        if (auto r = active_hint_->finalize(); !r) {
-            return std::unexpected(io_fault(r.error().errnum,
-                                             std::string(active_hint_->path())));
-        }
-    }
     {
         std::unique_lock lk(read_cache_mu_);
         active_data_.reset();  // 在途读者持 shared_ptr,旧对象由引用计数续命
     }
-    active_hint_.reset();
     // S14-1 曾在此置 auto-ckpt pending(roll = 字节锚点);S31.5 改为写路径
     // 直接按 ord 增量评估(字节锚点与分词算力脱钩,见
     // maybe_submit_auto_checkpoint 注),roll 点无需再做任何事。
@@ -1161,20 +1135,10 @@ std::expected<void, CaskFault> Cask::close_write_file() {
                                             std::string(active_data_->path())));
         }
     }
-    // 先 finalize hint trailer 再丢句柄——否则下次 open 这个目录时
-    // hint 校验失败，会被迫 fold 整个 data 文件重建 keydir，
-    // 大目录上代价非常高。
-    if (active_hint_) {
-        if (auto r = active_hint_->finalize(); !r) {
-            return std::unexpected(io_fault(r.error().errnum,
-                                             std::string(active_hint_->path())));
-        }
-    }
     {
         std::unique_lock lk(read_cache_mu_);
         active_data_.reset();
     }
-    active_hint_.reset();
     active_file_id_ = 0;
     if (write_lock_) {
         write_lock_->release_quiet();
@@ -1245,7 +1209,7 @@ std::size_t Cask::resolve_read_handle_cap(std::size_t opt,
                                           std::size_t nofile_soft) noexcept {
     if (opt == CaskOptions::kUnlimitedReadHandles) return 0;  // 显式不限
     if (opt != 0) return opt;                                 // 显式上限
-    // 自动（opt==0）：留约一半 fd 给 active writer / WAL / hint / meta / lock 等
+    // 自动（opt==0）：留约一半 fd 给 active writer / WAL / meta / lock 等
     // 非缓存 fd，其余给 read 句柄缓存。
     //   下限 64      ——避免极低 ulimit 下 cap 过小；
     //   绝对上限 1024——S33-6：rlimit 一大（容器/systemd 常见 5×10^5 甚至
@@ -1282,6 +1246,38 @@ void Cask::evict_read_handles_locked() {
     for (std::size_t i = 0; i < over; ++i) read_files_.erase(idle[i].second);
 }
 
+// S43-5：OKI 成为写前存在性/CAS 裁决面之前，必须先消除旧 Level A 的
+// “hash 可信但 OKI 可能 stale/unavailable”迁移态。可写 open 首次写在此
+// 做一次受控重建；重建失败不允许静默退回 hash-first 行为。
+bool Cask::ensure_oki_for_write() noexcept {
+    auto& oki = authority_->state();
+    // 点查开关可能被影子对拍/Level B 读路径提前打开；只有 loaded 的
+    // 组合视图才是可写权威。unavailable/v1 mixed 仍走受控重建。
+    if (oki.write_probe_ready()) return true;
+    if (!opts_.read_write || opts_.merge_only) return false;
+
+    std::unique_lock<std::mutex> lk(oki_rebuild_mu_);
+    oki_rebuild_cv_.wait(lk, [&] {
+        return !oki_rebuilding_.load(std::memory_order_acquire);
+    });
+    if (oki.write_probe_ready()) return true;
+
+    oki_rebuilding_.store(true, std::memory_order_release);
+    lk.unlock();
+    const bool rebuilt = rebuild_oki_from_data();
+    lk.lock();
+    oki_rebuilding_.store(false, std::memory_order_release);
+    oki_rebuild_cv_.notify_all();
+    if (rebuilt) {
+        // IndexAuthority::rebuild_from_data 装载 OkiState，但 Level A 不
+        // 主动打开点查。写权威必须同时具备 loaded + point_query。
+        authority_->state().enable_point_query();
+        return authority_->state().write_probe_ready();
+    }
+    oki_rebuild_failed_.store(true, std::memory_order_release);
+    return false;
+}
+
 // ---- 搜索 / 写入共用辅助 ---------------------------------------------------
 
 std::expected<void, CaskFault> Cask::prepare_search() {
@@ -1303,22 +1299,22 @@ Cask::write_and_keydir(std::span<const std::byte> key,
     auto w = active_data_->write_encoded(record);
     if (!w) return std::unexpected(io_fault(w.error().errnum,
                                              std::string(active_data_->path())));
-    auto h = active_hint_->write(tstamp, w->total_size, w->offset,
-                                  /*tomb*/ false, key, ord);
-    if (!h) return std::unexpected(io_fault(h.error().errnum,
-                                             std::string(active_hint_->path())));
-
-    auto pr = keydir_->put(bytes_to_view(key), active_file_id_,
+    auto pr = authority_->apply_put(bytes_to_view(key), active_file_id_,
                             w->total_size, w->offset, tstamp,
-                            /*now*/ 0, /*newest*/ true, 0, 0, ord);
-    if (pr != keydir::PutResult::kAlreadyExists) {
+                            ord);
+    if (pr == oki::PutResult::kIndexUnavailable) {
+        return std::unexpected(err(
+            CaskError::kIndexCorrupt,
+            "oki unavailable while applying put"));
+    }
+    if (pr != oki::PutResult::kAlreadyExists) {
         maybe_flush_oki();  // S33-4：memdelta 阈值检查
         return PersistedRecord{ord, w->offset, w->total_size, active_file_id_};
     }
 
     // keydir 认为已存在更新的 entry → roll_active 切新文件后重试一次。
     if (auto r = roll_active(); !r) return std::unexpected(r.error());
-    const std::uint64_t ord2 = keydir_->alloc_ord();
+    const std::uint64_t ord2 = authority_->alloc_ord();
     // S13-F2: ord2 守卫——重试路径任何失败 return 都补 Skip，防 reorder
     // buffer 空洞（ord 本身由 caller 的守卫覆盖）。
     OrdSkipGuard g2(this, ord2);
@@ -1326,14 +1322,15 @@ Cask::write_and_keydir(std::span<const std::byte> key,
     auto w2 = active_data_->write_encoded(record);
     if (!w2) return std::unexpected(io_fault(w2.error().errnum,
                                               std::string(active_data_->path())));
-    auto h2 = active_hint_->write(tstamp, w2->total_size, w2->offset,
-                                   /*tomb*/ false, key, ord2);
-    if (!h2) return std::unexpected(io_fault(h2.error().errnum,
-                                              std::string(active_hint_->path())));
-    auto pr2 = keydir_->put(bytes_to_view(key), active_file_id_,
+    auto pr2 = authority_->apply_put(bytes_to_view(key), active_file_id_,
                              w2->total_size, w2->offset, tstamp,
-                             0, true, 0, 0, ord2);
-    if (pr2 == keydir::PutResult::kAlreadyExists) {
+                             ord2);
+    if (pr2 == oki::PutResult::kIndexUnavailable) {
+        return std::unexpected(err(
+            CaskError::kIndexCorrupt,
+            "oki unavailable while applying put retry"));
+    }
+    if (pr2 == oki::PutResult::kAlreadyExists) {
         // S13-F2: ord 与 ord2 均未被真任务覆盖——g2 析构补 ord2 的 Skip，
         // ord 由 caller 守卫补。
         return std::unexpected(err(CaskError::kAlreadyExists));
@@ -1394,7 +1391,7 @@ Cask::submit_group_commit(GcRequest& req) {
 }
 
 // 前置:持 write_mu_。按队列序整批:逐条 alloc_ord + patch + 累积 →
-// 一次 pwrite → 逐条 hint/keydir/组提交计数。队列序 == ord 序 == 文件序
+// 一次 pwrite → 逐条 OKI/keydir/组提交计数。队列序 == ord 序 == 文件序
 // (恢复硬不变量)。失败的请求补 Skip(ord 必须被 Add 或 Skip 覆盖,防
 // reorder stall——与旧 OrdSkipGuard 同义,含 in-lock 提交的既有行为)。
 void Cask::process_gc_batch_locked() {
@@ -1452,7 +1449,7 @@ void Cask::process_one_gc_round_locked() {
     }
 
     // merge race:并发 merger 顶过 active_file_id_ → 先 roll(同旧 put)。
-    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
+    if (active_data_ && active_file_id_ < authority_->biggest_file_id()) {
         if (auto r = roll_active(); !r) {
             for (auto* q : batch) fail(q, r.error());
             finish_all();
@@ -1469,7 +1466,7 @@ void Cask::process_one_gc_round_locked() {
     bool io_dead = false;
     CaskFault io_err{};
 
-    // 落当前段:一次 pwrite + 逐条 hint/keydir/组提交。返回 false = IO 故障
+    // 落当前段:一次 pwrite + 逐条 keydir/组提交。返回 false = IO 故障
     // (sub 内全部已 fail + Skip;调用方停止整批)。
     auto flush_sub = [&]() -> bool {
         if (sub.empty()) return true;
@@ -1486,31 +1483,21 @@ void Cask::process_one_gc_round_locked() {
             return false;
         }
         std::uint64_t off = w->offset;
-        bool tail_dead = false;  // hint 流故障 → 保守 fail 本段剩余
-        CaskFault tail_err{};
         for (auto* r : sub) {
             const auto sz = static_cast<std::uint32_t>(r->record.size());
-            if (tail_dead) {
-                fail(r, tail_err);
+            auto pr = authority_->apply_put(bytes_to_view(r->key),
+                                            active_file_id_, sz, off,
+                                            r->tstamp, r->rec.ord);
+            if (pr == oki::PutResult::kIndexUnavailable) {
+                const auto e = err(
+                    CaskError::kIndexCorrupt,
+                    "oki unavailable while applying group-commit put");
+                fail(r, e);
                 skip_ord(r->rec.ord);
                 off += sz;
                 continue;
             }
-            auto h = active_hint_->write(r->tstamp, sz, off, /*tomb*/ false,
-                                         r->key, r->rec.ord);
-            if (!h) {
-                tail_dead = true;
-                tail_err = io_fault(h.error().errnum,
-                                    std::string(active_hint_->path()));
-                fail(r, tail_err);
-                skip_ord(r->rec.ord);
-                off += sz;
-                continue;
-            }
-            auto pr = keydir_->put(bytes_to_view(r->key), active_file_id_, sz,
-                                   off, r->tstamp, /*now*/ 0, /*newest*/ true,
-                                   0, 0, r->rec.ord);
-            if (pr == keydir::PutResult::kAlreadyExists) {
+            if (pr == oki::PutResult::kAlreadyExists) {
                 // merge race(罕见):单条重写路径(内部 roll + ord2 +
                 // 原 ord 的 Skip 语义;见 write_and_keydir)。
                 auto p2 = write_and_keydir(r->key, r->record, r->tstamp,
@@ -1566,7 +1553,7 @@ void Cask::process_one_gc_round_locked() {
                 continue;
             }
         }
-        const std::uint64_t ord = keydir_->alloc_ord();
+        const std::uint64_t ord = authority_->alloc_ord();
         r->rec.ord = ord;
         codec::patch_data_record_ord(r->record, ord);
         combine.insert(combine.end(), r->record.begin(), r->record.end());
@@ -1632,41 +1619,100 @@ Cask::get_doc_owned(std::span<const std::byte> key) {
 std::expected<GetResultView, CaskFault>
 Cask::read_doc(std::span<const std::byte> key, bool want_fields) {
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
-    // S13-F5：get 与并发 merge 收尾之间有窗口——本线程先查 keydir 拿到旧定位，
+    // S13-F5：get 与并发 merge 收尾之间有窗口——本线程先查 authority 拿到旧定位，
     // merge 随即把该 key CAS 到新文件并 unlink 旧文件（O10 的同临界区 erase+
-    // unlink 只保护已持缓存句柄的读者，保护不了「先查 keydir、后 open」的
-    // 读者），read_file lazy open 得 ENOENT。此时 keydir 已指向新文件——
-    // 重查 keydir 重试一次必命中；重试仍失败才是真 I/O 错误。
+    // unlink 只保护已持缓存句柄的读者，保护不了「先查 authority、后 open」的
+    // 读者），read_file lazy open 得 ENOENT。此时 authority 已指向新文件——
+    // 重查 authority 重试一次必命中；重试仍失败才是真 I/O 错误。
     for (int attempt = 0; ; ++attempt) {
-    // S36-3：点查改走统一 locate 原语（设计 §5.1/§5.2）——缓存命中即现状
-    // 路径；缓存 miss（Level B 逐出态）落组合视图（memdelta → run bloom/
-    // seek + 块 LRU），命中经二次命中门回填升温。点查关（Level A 现状）
-    // 时 locate ≡ 哈希 get，行为逐字节相同。S13-F5 重试对冷路径同样成立：
-    // 重查 locate 会拿到 merge 搬迁行的新位置。
-    auto entry = keydir_->locate(bytes_to_view(key), /*warm_fill=*/true);
-    if (!entry) return std::unexpected(err(CaskError::kNotFound));
+    // S43-4：公共读取的定位入口切到 OkiState。memdelta → runs(gen 降序)
+    // 是唯一定位权威；authority 只保留写/merge/range 等尚未迁移的旧消费面，
+    // 不再作为 get 的 hash-first 缓存。S13-F5 的 merge 窗口重试天然成立：
+    // 重查 OKI 会看到 append_update 后的新 loc。
+    // S43-1：读到 data record 后仍必须核对 key/ord；定位结果不回填
+    // authority，避免错误 loc 进入热点缓存。
+    // S43-1：冷侧坏块必须和普通 miss 分开。kUnavailable 表示索引无法
+    // 判定；首次遇到时做一次 data 全量受控重建并重试，其他读者在重建
+    // 期间拿到显式 kIndexCorrupt，绝不折叠成 NotFound。
+    auto located = authority_->state().locate(bytes_to_view(key));
+    if (located.status == oki::OkiState::LocateStatus::kUnavailable) {
+        // 迁移期例外：真正的 Level A 目录（无 Level B 戳且尚未开启写权威
+        // 点查）哈希表仍是完整权威。RO 无法受控重建；并发首读也不应把
+        // “尚未迁移”折叠成损坏。一旦 Level B 戳存在，即使运行期降级，
+        // 也不得回到可能被逐出的哈希缓存。
+            {
+        const bool can_rebuild =
+            !opts_.merge_only &&
+            !oki_rebuilding_.exchange(true, std::memory_order_acq_rel);
+        if (can_rebuild) {
+            const bool rebuilt = rebuild_oki_from_data();
+            oki_rebuilding_.store(false, std::memory_order_release);
+            if (rebuilt) continue;
+            oki_rebuild_failed_ = true;
+        }
+        return std::unexpected(err(
+            CaskError::kIndexCorrupt,
+            oki_rebuilding_.load(std::memory_order_acquire)
+                ? "oki unavailable: controlled rebuild in progress"
+                : "oki unavailable: runtime rebuild failed or unavailable"));
+        }
+    }
+    if (located.status != oki::OkiState::LocateStatus::kHit ||
+        located.tomb || !located.has_loc) {
+        return std::unexpected(err(CaskError::kNotFound));
+    }
+    const auto& entry = located.loc;
+    const auto located_ord = located.ord;
+
+    // S43-1（D2 §5）：OKI 定位必须自证。record 自身 CRC 只能证明该记录
+    // 完好，不能证明它就是请求的 key；索引 loc 被损坏/错指向另一条完好
+    // 记录时，若不核对 key，get(k1) 会静默返回 k2 的 value。这是
+    // OKI-only 化的硬前置，对 mmap 与 pread 路径同一纪律。
+    const auto located_key_matches =
+        [&key](const auto& actual_key) {
+            return actual_key.size() == key.size() &&
+                   std::equal(actual_key.begin(), actual_key.end(),
+                              key.begin(), key.end());
+        };
 
     if (opts_.expiry_secs > 0) {
         const auto now = now_sec_default();
         // 64 位求和：expiry_secs 极大（> 2^32 - now）时 u32 加法会 wrap 成
         // 小值，把所有 key 误判为过期。merge_policy 的 cutoff 计算同款防御。
-        if (static_cast<std::uint64_t>(entry->tstamp) + opts_.expiry_secs <= now) {
+        if (static_cast<std::uint64_t>(entry.tstamp) + opts_.expiry_secs <= now) {
             return std::unexpected(err(CaskError::kNotFound));
         }
     }
 
-    auto df = read_file(entry->file_id);
+    auto df = read_file(entry.file_id);
     if (!df) {
         if (attempt == 0) continue;  // S13-F5: merge 窗口，重查 keydir 重试
         return std::unexpected(err(CaskError::kIo,
-            "open file_id=" + std::to_string(entry->file_id)));
+            "open file_id=" + std::to_string(entry.file_id)));
     }
 
     // P6:sealed mmap 命中 → 零拷贝(无 syscall,直读 page cache)。GetResultView
     // 持 df 的 shared_ptr 锚定映射,view 生命内映射不撤(即便并发 merge unlink)。
     if (df->mmapped()) {
-        auto rv = df->read_mmap(entry->offset, entry->total_sz);
+        auto rv = df->read_mmap(entry.offset, entry.total_sz);
         if (rv) {
+            if (!located_key_matches(rv->key)) {
+                return std::unexpected(err(
+                    CaskError::kIndexCorrupt,
+                    "located record key mismatch (file_id=" +
+                    std::to_string(entry.file_id) + ", offset=" +
+                    std::to_string(entry.offset) + ")"));
+            }
+            // 注入矩阵的 ord 门：OKI 行的 LSN 是定位语义的一部分。若 data
+            // 记录完好但 ord 与索引不一致，说明 loc/索引元数据已被语义性
+            // 改写；继续返回值会让错误 ord 进入 warm fill 与 merge 裁决。
+            if (rv->ord != located_ord) {
+                return std::unexpected(err(
+                    CaskError::kIndexCorrupt,
+                    "located record ord mismatch (file_id=" +
+                    std::to_string(entry.file_id) + ", offset=" +
+                    std::to_string(entry.offset) + ")"));
+            }
             if (rv->type == format::RecordType::kTombstone) {
                 return std::unexpected(err(CaskError::kNotFound));
             }
@@ -1699,7 +1745,7 @@ Cask::read_doc(std::span<const std::byte> key, bool want_fields) {
         // pread** 读窗口外记录——不报错、不重查（条目本身有效）。
     }
 
-    auto rec = df->read(entry->offset, entry->total_sz);
+    auto rec = df->read(entry.offset, entry.total_sz);
     if (!rec) {
         switch (rec.error().kind) {
             case fileops::DataFileError::kBadCrc:
@@ -1709,6 +1755,20 @@ Cask::read_doc(std::span<const std::byte> key, bool want_fields) {
             default:
                 return std::unexpected(err(CaskError::kIo));
         }
+    }
+    if (!located_key_matches(rec->key)) {
+        return std::unexpected(err(
+            CaskError::kIndexCorrupt,
+            "located record key mismatch (file_id=" +
+            std::to_string(entry.file_id) + ", offset=" +
+            std::to_string(entry.offset) + ")"));
+    }
+    if (rec->ord != located_ord) {
+        return std::unexpected(err(
+            CaskError::kIndexCorrupt,
+            "located record ord mismatch (file_id=" +
+            std::to_string(entry.file_id) + ", offset=" +
+            std::to_string(entry.offset) + ")"));
     }
     if (rec->type == format::RecordType::kTombstone) {
         return std::unexpected(err(CaskError::kNotFound));
@@ -1754,10 +1814,6 @@ Cask::parallel_scan(std::size_t n_threads, const ScanFn& fn,
     auto sr = it->start(/*maxage=*/-1, /*maxputs=*/-1, /*now_sec=*/0,
                         /*see_tombstones=*/false, key_prefix);
     if (!sr) return std::unexpected(sr.error());
-    if (*sr != keydir::StartIterResult::kOk) {
-        return std::unexpected(err(CaskError::kIo,
-            "parallel_scan: keydir iterator out of date"));
-    }
     auto keys = it->drain_live_keys();
     it->release();
 
@@ -1937,7 +1993,7 @@ GetResult GetResultView::to_owned() const {
 // put 流程：
 //   1. 校验权限 + key/value 大小
 //   2. 必要时 roll active 文件（写满 / 没建过 / 被 merger 抢 file_id）
-//   3. 写 data + hint
+//   3. 写 data
 //   4. 更新 keydir
 //   5. keydir 拒绝（merge race）→ 再 roll 一次重试一次；二次失败上报
     std::expected<void, CaskFault>
@@ -1949,8 +2005,14 @@ Cask::put(std::span<const std::byte> key,
     // （纯函数或 const 配置读，均不依赖 write_mu_ 保护的状态）。ord 必须锁
     // 内分配（恢复按 fold 序回放 + add_doc 水位自门 ⇒ 文件序 == ord 序是
     // 硬不变量），故 record 先用占位 ord=0 编码，锁内 patch。
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly));
+    }
+    if (!ensure_oki_for_write()) {
+        return std::unexpected(err(
+            CaskError::kIndexCorrupt,
+            "oki unavailable for put: controlled rebuild failed"));
     }
     if (key.size()   > format::kMaxKeySize)   return std::unexpected(err(CaskError::kKeyTooLarge));
     if (value.size() > format::kMaxValueSize) return std::unexpected(err(CaskError::kValueTooLarge));
@@ -1973,7 +2035,7 @@ Cask::put(std::span<const std::byte> key,
                               /*ord 占位*/ 0, key, encoded);
 
     // S29-7:组提交——入队 + leader/follower(闭锁检查/roll/merge-race/
-    // alloc_ord/pwrite/hint/keydir/组提交计数全部 leader 侧,见
+    // alloc_ord/pwrite/OKI/keydir/组提交计数全部 leader 侧,见
     // process_gc_batch_locked)。字节仍在返回前持久(仅合并 syscall)。
     GcRequest req;
     req.key = key;
@@ -1998,7 +2060,7 @@ Cask::put(std::span<const std::byte> key,
 
 // S13-D1：批量写。流程：全批校验 → roll → 逐条 alloc_ord + encode +
 // write_buffered（聚合 1MiB 块 pwrite）→ 一次 flush + fdatasync（批的持久化
-// 点）→ hint → keydir apply + 索引提交。keydir apply 在 fsync 之后 ⟹ 本进程
+// 点）→ OKI → keydir apply + 索引提交。keydir apply 在 fsync 之后 ⟹ 本进程
 // 内 all-or-nothing。merge race（merge 恰在批写入期间启动、biggest_file_id
 // 被推过批文件）时被拒条目走 write_and_keydir 单条重写路径（内部 roll+重试），
 // 与单条 put 的 race 处理一致。
@@ -2009,6 +2071,11 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly));
+    }
+    if (!ensure_oki_for_write()) {
+        return std::unexpected(err(
+            CaskError::kIndexCorrupt,
+            "oki unavailable for put_batch: controlled rebuild failed"));
     }
     if (items.empty()) return {};
 
@@ -2027,7 +2094,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
 
     // ② roll：整批进同一 active 文件（巨批允许超 max_file_size，软上限）。
     if (auto r = roll_active_if_needed(about); !r) return std::unexpected(r.error());
-    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
+    if (active_data_ && active_file_id_ < authority_->biggest_file_id()) {
         if (auto r = roll_active(); !r) return std::unexpected(r.error());
     }
     const std::uint32_t batch_file =
@@ -2061,7 +2128,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
     pw.reserve(items.size());
     thread_local std::vector<std::byte> encoded;
     for (const auto& it : items) {
-        const std::uint64_t ord = keydir_->alloc_ord();
+        const std::uint64_t ord = authority_->alloc_ord();
         og.ords.push_back(ord);
         og.done.push_back(0);
         encoded.clear();
@@ -2095,17 +2162,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
         writes_since_sync_ = 0;  // P4 组提交计数：刚 fsync 过，归零
     }
 
-    // ⑤ hint（可重建；失败语义与单条 put 一致：报错、keydir 未动）。
-    for (std::size_t i = 0; i < items.size(); ++i) {
-        auto h = active_hint_->write(tstamp, pw[i].total_size, pw[i].offset,
-                                     /*tomb*/ false, items[i].key, pw[i].ord);
-        if (!h) {
-            return std::unexpected(io_fault(h.error().errnum,
-                                            std::string(active_hint_->path())));
-        }
-    }
-
-    // ⑥ keydir apply + 索引提交。
+    // ⑤ keydir apply + 索引提交。
     // H1（s13-review §P1）：Add 的实际提交延后到 write_mu_ 释放之后——锁内
     // 只收集 {item 下标, og 槽位, 定位记录}，锁外逐条构造 + 提交（IndexTask
     // 深拷贝 key/text，队列背压兜底，峰值内存与旧的即时提交一致）。中途
@@ -2132,13 +2189,19 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
     };
     bool retried = false;
     for (std::size_t i = 0; i < items.size(); ++i) {
-        auto pr = keydir_->put(bytes_to_view(items[i].key), batch_file,
+        auto pr = authority_->apply_put(bytes_to_view(items[i].key), batch_file,
                                pw[i].total_size, pw[i].offset, tstamp,
-                               /*now*/ 0, /*newest*/ true, 0, 0, pw[i].ord);
+                               pw[i].ord);
+        if (pr == oki::PutResult::kIndexUnavailable) {
+            flush_adds();
+            return std::unexpected(err(
+                CaskError::kIndexCorrupt,
+                "oki unavailable while applying put_batch"));
+        }
         PersistedRecord rec{pw[i].ord, pw[i].offset, pw[i].total_size,
                             batch_file};
         std::size_t slot = i;
-        if (pr == keydir::PutResult::kAlreadyExists) {
+        if (pr == oki::PutResult::kAlreadyExists) {
             // merge race：单条重写（write_and_keydir 内部 roll+重试）。
             // 原始 ord 保持 !done → 函数退出时由 og 补 Skip。
             encoded.clear();
@@ -2151,7 +2214,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
             std::vector<std::byte> record;
             codec::encode_data_record(record, format::RecordType::kDoc, tstamp,
                                       /*ord 占位*/ 0, items[i].key, encoded);
-            const std::uint64_t ord2 = keydir_->alloc_ord();
+            const std::uint64_t ord2 = authority_->alloc_ord();
             OrdSkipGuard g2(this, ord2);
             auto p2 = write_and_keydir(items[i].key, record, tstamp, ord2);
             if (!p2) {
@@ -2244,7 +2307,7 @@ IndexTask make_doc_add_task(std::span<const std::byte> key, const DocInput& doc,
 // S35：跨崩溃原子批（doc/atomic-batch-design-zh.md）。流程 = put_batch 的
 // 超集：全批校验 → **meta 懒升 v6**（首个批字节落盘前）→ roll → 批头
 // （kBatchHeader，声明成员区间）+ 成员逐条 write_buffered → 一次 flush
-// （批头+成员同一 pwrite 序列 = 提交点）→ hint（仅成员）→ keydir
+// （批头+成员同一 pwrite 序列 = 提交点）→ OKI（仅成员）→ keydir
 // put/remove + 索引 Add/Delete。恢复时区间不完整 ⟹ lve 停批头起点 ⟹
 // 整批截断——崩溃后 all-or-nothing。
 std::expected<void, CaskFault>
@@ -2258,6 +2321,31 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
     if (ops.empty()) return {};
     if (ops.size() > 0xFFFF'FFFFull) {
         return std::unexpected(err(CaskError::kInvalidOption, "batch too large"));
+    }
+    if (!ensure_oki_for_write()) {
+        return std::unexpected(err(
+            CaskError::kIndexCorrupt,
+            "oki unavailable for atomic batch: controlled rebuild failed"));
+    }
+
+    // S43-5：物理 data 记录保留全部成员及其真实 ord；恢复按文件序重放时
+    // 自然收敛到同批最终态。索引/authority/OKI/fstats 只应用每 key 的最后一
+    // 个成员，避免 put→remove→put 这类重复把中间态逐次重复入账。
+    auto byte_less = [](std::span<const std::byte> a,
+                        std::span<const std::byte> b) {
+        return std::lexicographical_compare(
+            a.begin(), a.end(), b.begin(), b.end());
+    };
+    std::map<std::span<const std::byte>, std::size_t,
+             decltype(byte_less)> final_ops(byte_less);
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        final_ops.insert_or_assign(ops[i].key, i);
+    }
+    std::vector<std::size_t> apply_order;
+    apply_order.reserve(final_ops.size());
+    for (const auto& [key, idx] : final_ops) {
+        (void)key;
+        apply_order.push_back(idx);
     }
 
     // ①a 全批前置校验（含 kPutDoc 的向量校验/归一化——纯计算）。校验失败
@@ -2317,7 +2405,41 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
     for (std::size_t i = 0; i < ops.size(); ++i) {
         const auto& op = ops[i];
         if (op.type == BatchOp::Type::kRemove) {
-            vals.push_back({0, 0});  // 墓碑成员 v0：空 value
+            // 只有每 key 的最终 remove 需要 v2 shadow；中间 remove 只是
+            // 崩溃重放里的历史行，最终态裁决不消费它的 file_id。
+            std::span<const std::byte> tomb_value;
+            std::array<std::uint8_t, 4> shadow{};
+            if (final_ops.at(op.key) == i && opts_.tombstone_version == 2) {
+                const auto prior =
+                    authority_->state().probe_for_write(bytes_to_view(op.key));
+                if (prior.status == oki::OkiState::LocateStatus::kUnavailable) {
+                    return std::unexpected(err(
+                        CaskError::kIndexCorrupt,
+                        "oki unavailable while probing atomic batch remove"));
+                }
+                if (prior.status == oki::OkiState::LocateStatus::kHit &&
+                    !prior.tomb && prior.has_loc && prior.loc.file_id != 0) {
+                    const auto file_id = prior.loc.file_id;
+                    for (unsigned shift = 0; shift < 4; ++shift) {
+                        shadow[shift] = static_cast<std::uint8_t>(
+                            (file_id >> (shift * 8)) & 0xFF);
+                    }
+                    tomb_value = std::span<const std::byte>(
+                        reinterpret_cast<const std::byte*>(shadow.data()),
+                        shadow.size());
+                }
+            }
+            if (tomb_value.empty()) {
+                vals.push_back({0, 0});
+                span_bytes += format::kHeaderSize + op.key.size();
+                continue;
+            }
+            const std::size_t off = arena.size();
+            arena.insert(arena.end(), tomb_value.begin(), tomb_value.end());
+            vals.push_back({off, tomb_value.size()});
+            span_bytes += format::kHeaderSize + op.key.size() +
+                          tomb_value.size();
+            continue;
         } else {
             const std::size_t off = arena.size();
             codec::DocValueParts parts;
@@ -2366,7 +2488,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
         format::kHeaderSize + header_val.size() +
         static_cast<std::size_t>(span_bytes);
     if (auto r = roll_active_if_needed(about); !r) return std::unexpected(r.error());
-    if (active_data_ && active_file_id_ < keydir_->biggest_file_id()) {
+    if (active_data_ && active_file_id_ < authority_->biggest_file_id()) {
         if (auto r = roll_active(); !r) return std::unexpected(r.error());
     }
     const std::uint32_t batch_file =
@@ -2391,7 +2513,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
     og.done.reserve(ops.size() + 1);
 
     // ④ 批头 + 成员 write_buffered。文件序 == ord 序（批头 ord 先分配）。
-    const std::uint64_t header_ord = keydir_->alloc_ord();
+    const std::uint64_t header_ord = authority_->alloc_ord();
     og.ords.push_back(header_ord);
     og.done.push_back(0);
     {
@@ -2410,7 +2532,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
     std::vector<PendingWrite> pw;
     pw.reserve(ops.size());
     for (std::size_t i = 0; i < ops.size(); ++i) {
-        const std::uint64_t ord = keydir_->alloc_ord();
+        const std::uint64_t ord = authority_->alloc_ord();
         og.ords.push_back(ord);
         og.done.push_back(0);
         const bool is_put = ops[i].type != BatchOp::Type::kRemove;
@@ -2441,19 +2563,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
         writes_since_sync_ = 0;
     }
 
-    // ⑥ hint（仅成员；批头无 hint 条目——hint 快路径只在干净封口后启用，
-    //    封口 ⟹ 批已提交 ⟹ 成员条目直接 apply 正确）。
-    for (std::size_t i = 0; i < ops.size(); ++i) {
-        auto h = active_hint_->write(tstamp, pw[i].total_size, pw[i].offset,
-                                     /*tomb*/ ops[i].type == BatchOp::Type::kRemove,
-                                     ops[i].key, pw[i].ord);
-        if (!h) {
-            return std::unexpected(io_fault(h.error().errnum,
-                                            std::string(active_hint_->path())));
-        }
-    }
-
-    // ⑦ keydir apply + 索引提交（H1：锁外提交，同 put_batch）。
+    // ⑥ keydir apply + 索引提交（H1：锁外提交，同 put_batch）。
     struct PendingTask {
         std::size_t op;     // ops 下标
         std::size_t slot;   // og 槽位
@@ -2486,23 +2596,29 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
         tasks.clear();
     };
     bool retried = false;
-    for (std::size_t i = 0; i < ops.size(); ++i) {
+    for (const std::size_t i : apply_order) {
         const std::size_t slot0 = i + 1;  // og 槽位（0 是批头）
         if (ops[i].type == BatchOp::Type::kRemove) {
-            keydir_->remove(bytes_to_view(ops[i].key), tstamp, pw[i].ord);
+            authority_->apply_remove(bytes_to_view(ops[i].key), pw[i].ord);
             tasks.push_back({i, slot0,
                              PersistedRecord{pw[i].ord, pw[i].offset,
                                              pw[i].total_size, batch_file},
                              /*is_remove*/ true});
             continue;
         }
-        auto pr = keydir_->put(bytes_to_view(ops[i].key), batch_file,
+        auto pr = authority_->apply_put(bytes_to_view(ops[i].key), batch_file,
                                pw[i].total_size, pw[i].offset, tstamp,
-                               /*now*/ 0, /*newest*/ true, 0, 0, pw[i].ord);
+                               pw[i].ord);
+        if (pr == oki::PutResult::kIndexUnavailable) {
+            flush_tasks();
+            return std::unexpected(err(
+                CaskError::kIndexCorrupt,
+                "oki unavailable while applying atomic batch"));
+        }
         PersistedRecord rec{pw[i].ord, pw[i].offset, pw[i].total_size,
                             batch_file};
         std::size_t slot = slot0;
-        if (pr == keydir::PutResult::kAlreadyExists) {
+        if (pr == oki::PutResult::kAlreadyExists) {
             // merge race：单条重写（区间之外的独立完整记录，正确）。复用
             // ①b 的预编码 value（kPutDoc 的 meta/vector/fields 一并保留）。
             const std::span<const std::byte> val(arena.data() + vals[i].off,
@@ -2510,7 +2626,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
             std::vector<std::byte> record;
             codec::encode_data_record(record, format::RecordType::kDoc, tstamp,
                                       /*ord 占位*/ 0, ops[i].key, val);
-            const std::uint64_t ord2 = keydir_->alloc_ord();
+            const std::uint64_t ord2 = authority_->alloc_ord();
             OrdSkipGuard g2(this, ord2);
             auto p2 = write_and_keydir(ops[i].key, record, tstamp, ord2);
             if (!p2) {
@@ -2526,6 +2642,13 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
         }
         tasks.push_back({i, slot, rec, /*is_remove*/ false});
     }
+    // 最终应用按 key 排序后，成员完成序不再等于 ord 序。索引 reducer 仍按
+    // 全局 ord 门消费；这里把真任务先排回 ord 序，非最终成员继续由
+    // BatchOrdGuard 补 Skip。
+    std::sort(tasks.begin(), tasks.end(),
+              [&](const PendingTask& a, const PendingTask& b) {
+                  return a.rec.ord < b.rec.ord;
+              });
     std::expected<void, CaskFault> gc;
     if (retried) {
         ++writes_since_sync_;
@@ -2545,7 +2668,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
 //   v0: empty value (RecordType::kTombstone carries the meaning)
 //   v2: 4-byte little-endian shadow file_id (tells merger "I exist because of
 //       an entry in file_id N; if that entry is gone, I'm meaningless").
-//       If key not in keydir or file_id==0, fall back to v0.
+//       If key not in authority or file_id==0, fall back to v0.
 //       (P：盘格式统一小端。)
 std::expected<void, CaskFault>
 Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
@@ -2555,20 +2678,35 @@ Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
     if (!opts_.read_write) return std::unexpected(err(CaskError::kReadOnly));
     if (tstamp == 0) tstamp = now_sec_default();
 
+    // S43-5：tombstone shadow file_id 只能来自 OKI 权威行。旧 Level A
+    // 先做一次受控重建；不可用即显式失败，不再借旧哈希补齐元数据。
+    if (!ensure_oki_for_write()) {
+        return std::unexpected(err(
+            CaskError::kIndexCorrupt,
+            "oki unavailable for remove: controlled rebuild failed"));
+    }
+
     std::span<const std::byte> tomb_value;
     std::uint8_t shadow_le[4] = {0};
     if (opts_.tombstone_version == 2) {
-        // S36-3：走 locate——逐出态下 shadow file_id 仍能从组合视图取到。
-        if (auto entry = keydir_->locate(bytes_to_view(key))) {
-            if (entry->file_id != 0) {
-                shadow_le[0] = static_cast<std::uint8_t>( entry->file_id        & 0xFF);
-                shadow_le[1] = static_cast<std::uint8_t>((entry->file_id >>  8) & 0xFF);
-                shadow_le[2] = static_cast<std::uint8_t>((entry->file_id >> 16) & 0xFF);
-                shadow_le[3] = static_cast<std::uint8_t>((entry->file_id >> 24) & 0xFF);
-                tomb_value = std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(shadow_le),
-                    sizeof(shadow_le));
-            }
+        // 组合视图 miss/tombstone 都保持 v0 墓碑；只有权威活行携带旧
+        // file_id 时才写 v2 shadow。
+        const auto prior = authority_->state().probe_for_write(bytes_to_view(key));
+        if (prior.status == oki::OkiState::LocateStatus::kUnavailable) {
+            return std::unexpected(err(
+                CaskError::kIndexCorrupt,
+                "oki unavailable for remove: probe failed"));
+        }
+        if (prior.status == oki::OkiState::LocateStatus::kHit &&
+            !prior.tomb && prior.has_loc && prior.loc.file_id != 0) {
+            const auto file_id = prior.loc.file_id;
+            shadow_le[0] = static_cast<std::uint8_t>( file_id        & 0xFF);
+            shadow_le[1] = static_cast<std::uint8_t>((file_id >>  8) & 0xFF);
+            shadow_le[2] = static_cast<std::uint8_t>((file_id >> 16) & 0xFF);
+            shadow_le[3] = static_cast<std::uint8_t>((file_id >> 24) & 0xFF);
+            tomb_value = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(shadow_le),
+                sizeof(shadow_le));
         }
     }
     if (tomb_value.empty()) {
@@ -2579,18 +2717,14 @@ Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
         format::kHeaderSize + key.size() + tomb_value.size();
     if (auto r = roll_active_if_needed(about); !r) return std::unexpected(r.error());
 
-    const std::uint64_t ord = keydir_->alloc_ord();
+    const std::uint64_t ord = authority_->alloc_ord();
     OrdSkipGuard og(this, ord);  // S13-F2: 失败路径补 Skip 防 reorder stall
     auto w = active_data_->write(format::RecordType::kTombstone, tstamp,
                                   ord, key, tomb_value);
     if (!w) return std::unexpected(io_fault(w.error().errnum));
-    // hint 文件也要追一条墓碑——下次 open fold(hint) 重建时才能正确删 key。
-    auto h = active_hint_->write(tstamp, w->total_size, w->offset,
-                                  /*tomb*/ true, key, ord);
-    if (!h) return std::unexpected(io_fault(h.error().errnum));
     // S33：墓碑记 ord（运行期 put 走 newest_put=true 不受复活门影响；
     // 记下 ord 使崩溃前的内存态与恢复重建态一致）。
-    keydir_->remove(bytes_to_view(key), tstamp, ord);
+    authority_->apply_remove(bytes_to_view(key), ord);
     og.disarm();  // S13-F2: ord 由下面的 Delete 任务覆盖
     // H1：Delete 提交移出临界区（同 put）。S15-3：原「非池同步直调
     // on_delete」分支删除——open 强制 registry 非空（本文件 open() 首行
@@ -2618,8 +2752,14 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     // 预编码全部**锁外**完成——prepare_vector 读 const 配置、intern 自带
     // shared_mutex、编码是纯函数，均不依赖 write_mu_。ord 锁内分配（文件序
     // == ord 序不变量），record 占位 ord 编码、锁内 patch（同 put）。
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly));
+    }
+    if (!ensure_oki_for_write()) {
+        return std::unexpected(err(
+            CaskError::kIndexCorrupt,
+            "oki unavailable for put_doc: controlled rebuild failed"));
     }
     if (key.size() > format::kMaxKeySize) {
         return std::unexpected(err(CaskError::kKeyTooLarge));
@@ -2703,7 +2843,7 @@ std::expected<void, CaskFault> Cask::sync() {
 // 把它放到 dirty 调度器，所以不会卡住 BEAM 主调度。merge 完成后：
 //   1. 从 fstats 里把已合并的 file_id 删掉（trim_fstats）
 //   2. 从 read_files_ 缓存淘汰对应句柄（防止 fd 泄漏）
-//   3. unlink 旧 data + hint 文件（节省磁盘）
+//   3. unlink 旧 data 文件（节省磁盘）
 
 // S13-D6：不停机备份（契约见 cask.hpp）。
 std::expected<void, CaskFault> Cask::backup(std::string_view dst_dir) {
@@ -2717,7 +2857,7 @@ std::expected<void, CaskFault> Cask::backup(std::string_view dst_dir) {
     if (ec) return std::unexpected(err(CaskError::kIo,
         "backup: cannot create dst dir: " + bitcask::detail::to_utf8(dst)));
 
-    // 关闭 active writer：finalize hint trailer 后该文件成为 sealed（不可变），
+    // 关闭 active writer：data 封口持久后成为 sealed（不可变），
     // 可安全 hardlink。read_write 且有 active 时才需要；下一次 put 经
     // ensure_active_writer 自动重建（write_lock_ 保留不释放——与
     // close_write_file 不同，备份不让出写权）。
@@ -2725,19 +2865,16 @@ std::expected<void, CaskFault> Cask::backup(std::string_view dst_dir) {
         if (auto r = maybe_group_commit(/*force*/ true); !r) {
             return std::unexpected(r.error());
         }
-        if (active_hint_) {
-            if (auto r = active_hint_->finalize(); !r) {
-                return std::unexpected(io_fault(r.error().errnum,
-                                                std::string(active_hint_->path())));
-            }
-        }
         {
             std::unique_lock lk(read_cache_mu_);
             active_data_.reset();
         }
-        active_hint_.reset();
         active_file_id_ = 0;
     }
+    // S43-9：备份的 KV 恢复面必须与 data 点一致。封口 data 后落一次 OKI
+    // 提交集；flush 失败时仍可备份 data（缺失 manifest 只是首开重建），
+    // 但不得把旧 keydir 快照伪装成权威。
+    if (opts_.read_write) write_authority_snapshot();
 
     // hardlink（同设备零拷贝、天然一致）→ 跨设备回退字节拷贝。
     auto link_or_copy = [&](const fs::path& src) -> bool {
@@ -2761,15 +2898,23 @@ std::expected<void, CaskFault> Cask::backup(std::string_view dst_dir) {
             return std::unexpected(err(CaskError::kIo,
                 "backup: copy failed: " + e.data_path));
         }
-        (void)link_or_copy(fileops::mk_hint_filename(e.data_path));  // hint 可重建
     }
-    // 元数据必备；checkpoint 可选（缺失只是备份目录首次 open 慢一次）。
+    // 元数据必备；索引/checkpoint 可选（缺失只是备份目录首次 open 慢一次）。
     const fs::path base(dirname_);
     if (!link_or_copy(base / "bitcask.meta")) {
         return std::unexpected(err(CaskError::kIo, "backup: meta copy failed"));
     }
     (void)link_or_copy(base / "field.schema");
-    (void)link_or_copy(base / kKeydirSnapName);
+    (void)link_or_copy(base / oki::kManifestName);
+    for (const auto& entry : fs::directory_iterator(base, ec)) {
+        if (ec) break;
+        const auto name = entry.path().filename().string();
+        if (!name.starts_with("kv.oki.seg-")) continue;
+        if (!link_or_copy(entry.path())) {
+            return std::unexpected(err(CaskError::kIo,
+                "backup: copy failed: " + entry.path().string()));
+        }
+    }
     (void)link_or_copy(base / kSearchCkptName);
     // S14-8：向量 payload 一并带上（此前漏 .vec——缺失仅降级为 fold 重建，
     // 但备份目录首次 open 会付全量重建代价）。delta 链文件不带：备份点的
@@ -2781,13 +2926,14 @@ std::expected<void, CaskFault> Cask::backup(std::string_view dst_dir) {
 
 StatusInfo Cask::status() {
     StatusInfo s;
-    if (is_closed()) return s;  // S11-W3：已关闭返回零值快照（不解引用 keydir_）
-    auto info = keydir_->info();
+    if (is_closed()) return s;  // S11-W3：已关闭返回零值快照（不解引用 authority_）
+    auto info = authority_->info();
     s.key_count = info.key_count;
     s.key_bytes = info.key_bytes;
-    s.epoch     = info.epoch;
-    s.files.reserve(info.fstats.size());
-    for (const auto& f : info.fstats) {
+    s.epoch     = 0;
+    auto files = authority_->fstats();
+    s.files.reserve(files.size());
+    for (const auto& f : files) {
         s.files.push_back(merge::summarize(dirname_, f));
     }
     s.index_errors = index_errors_.load(std::memory_order_relaxed);
@@ -2800,19 +2946,20 @@ StatusInfo Cask::status() {
     s.read_handles = read_handle_count();
     // OKI memdelta 体量（反馈 2026-09-18：让「range 为什么慢」可观测——
     // 未 flush 行数即下次 range 视图构建的最坏成本上界）。OKI 不可用时为 0。
-    s.oki_delta_rows = keydir_->oki().delta_rows();
-    s.oki_delta_bytes = keydir_->oki().delta_bytes();
+    s.oki_delta_rows = authority_->state().delta_rows();
+    s.oki_delta_bytes = authority_->state().delta_bytes();
     return s;
 }
 
 bool Cask::is_empty_estimate() {
     if (is_closed()) return true;  // S11-W3
-    return keydir_->info().key_count == 0;
+    return authority_->info().key_count == 0;
 }
 
 bool Cask::is_frozen() {
     if (is_closed()) return false;  // S11-W3
-    return keydir_->info().iter_info.frozen;
+    (void)authority_;
+    return false;
 }
 
 // 包装 merge::decide。关键工作是「排除不该被合的 active file」：
@@ -2823,21 +2970,26 @@ bool Cask::is_frozen() {
 //     下一轮 merge 自然处理。
 Cask::NeedsMerge Cask::needs_merge(std::uint64_t now_sec) {
     if (is_closed()) return {};  // S11-W3：needs=false
-    auto info = keydir_->info();
+    // S43-7：merge 候选选择优先采信 BCOM v4 元数据。v4 是 OKI/authority
+    // 共同提交点的冻结对拍结果；没有 v4（旧目录/元数据尚未收敛）才退
+    // 回 authority fstats，保持兼容但不再是 OKI-only 目标路径。
+    auto oki_fstats = authority_->state().manifest_fstats();
+    if (oki_fstats.empty()) oki_fstats = authority_->fstats();
     const std::uint32_t exclude_id =
         opts_.merge_only
             ? merger_writer_active_id_
             : active_file_id_.load(std::memory_order_relaxed);
     std::vector<merge::FileStatus> summary;
-    summary.reserve(info.fstats.size());
-    for (const auto& f : info.fstats) {
+    summary.reserve(oki_fstats.size());
+    const auto push_fstats = [&](const auto& f) {
         if (opts_.merge_only) {
-            if (exclude_id != 0 && f.file_id >= exclude_id) continue;
+            if (exclude_id != 0 && f.file_id >= exclude_id) return;
         } else {
-            if (f.file_id == active_file_id_) continue;
+            if (f.file_id == active_file_id_) return;
         }
         summary.push_back(merge::summarize(dirname_, f));
-    }
+    };
+    for (const auto& f : oki_fstats) push_fstats(f);
     // V4:计算索引删除率(全局信号,用于触发 merge)。
     // dead_doc_rate = (total_ords - live_docs) * 100 / total_ords
     // total_ords==0 时跳过(无任何写入,谈不上删除率)。
@@ -2878,7 +3030,7 @@ std::expected<void, CaskFault> Cask::checkpoint() {
     if (!text_) {
         // 纯 KV 库：keydir 快照即全部（无 reducer，调用线程直写；并发调用
         // 由 ckpt_mu_ 串行，快照 tmp+rename 不与自身竞争）。
-        write_keydir_snapshot();
+        write_authority_snapshot();
         return {};
     }
     const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
@@ -2888,8 +3040,8 @@ std::expected<void, CaskFault> Cask::checkpoint() {
         if (index_pool_->is_stopped()) {
             std::vector<std::byte> kd;
             auto wms0 = collect_snapshot_watermarks();
-            if (wms0) keydir_->serialize_meta_delta(kd, *wms0);
-            const std::uint64_t wm = keydir_->peek_next_ord();
+            (void)wms0;
+            const std::uint64_t wm = authority_->peek_next_ord();
             if (!save_search_ckpt_paired(search_ckpt, wm, wms0, kd)) {
                 return std::unexpected(err(CaskError::kIo,
                     "checkpoint: search checkpoint save failed (stopped pool "
@@ -2907,7 +3059,7 @@ std::expected<void, CaskFault> Cask::checkpoint() {
             auto done_val = std::make_shared<int>(0);
             IndexTask t;
             t.op  = IndexOp::RunFn;
-            const std::uint64_t ord = keydir_->alloc_ord();
+            const std::uint64_t ord = authority_->alloc_ord();
             OrdSkipGuard og(this, ord);  // DL-MED-1: 失败路径补 Skip 防 ord 空洞
             // S14-1：keydir 快照也移进 RunFn——所有 ckpt 文件写统一到 reducer
             // 单线程，与自动 checkpoint 的 RunFn 天然串行（消除 .tmp 并发写
@@ -2919,10 +3071,10 @@ std::expected<void, CaskFault> Cask::checkpoint() {
             // 成对一致）；delta 路径内联进 delta 文件，base 路径落全量快照。
             std::vector<std::byte> kd;
             if (auto wms0 = collect_snapshot_watermarks()) {
-                keydir_->serialize_meta_delta(kd, *wms0);
+                (void)wms0;
                 t.fn = [this, search_ckpt, done_mu, done_cv, done_val,
                         wms = std::move(wms0),
-                        kd = std::move(kd), wm = keydir_->peek_next_ord()] {
+                        kd = std::move(kd), wm = authority_->peek_next_ord()] {
                     int result = 2;
                     try {
                         result = save_search_ckpt_paired(search_ckpt, wm, wms, kd)
@@ -2945,7 +3097,7 @@ std::expected<void, CaskFault> Cask::checkpoint() {
             } else
             t.fn  = [this, search_ckpt, done_mu, done_cv, done_val,
                      wms = collect_snapshot_watermarks(),
-                     wm = keydir_->peek_next_ord()] {
+                     wm = authority_->peek_next_ord()] {
                 int result = 2;
                 try {
                     // 水位捕获失败（文件态不稳定）：无 keydir payload，delta
@@ -2990,8 +3142,8 @@ std::expected<void, CaskFault> Cask::checkpoint() {
         // 无索引池（理论不可达：search_ 存在则 lane 已注册）——调用线程直跑。
         std::vector<std::byte> kd;
         auto wms0 = collect_snapshot_watermarks();
-        if (wms0) keydir_->serialize_meta_delta(kd, *wms0);
-        const std::uint64_t wm = keydir_->peek_next_ord();
+        (void)wms0;
+        const std::uint64_t wm = authority_->peek_next_ord();
         if (!save_search_ckpt_paired(search_ckpt, wm, wms0, kd)) {
             return std::unexpected(err(CaskError::kIo,
                 "checkpoint: search checkpoint save failed"));
@@ -3015,11 +3167,11 @@ bool Cask::save_search_ckpt_paired(
     const std::string& path, std::uint64_t wm,
     const std::optional<std::vector<
         std::pair<std::uint32_t, std::uint64_t>>>& wms,
-    const std::vector<std::byte>& keydir_delta) {
+    const std::vector<std::byte>& authority_delta) {
     // S17-3 P3 commit 路径：dir = dirname_。所有 ckpt 写都改走
     // save_checkpoint_paired 走 per-component + manifest 协议。
     (void)path;
-    return save_checkpoint_paired(dirname_, wm, wms, keydir_delta);
+    return save_checkpoint_paired(dirname_, wm, wms, authority_delta);
 }
 
 // S17-3 P3 commit 路径。先 per-component base（或 delta），再写
@@ -3036,7 +3188,7 @@ bool Cask::save_checkpoint_paired(
     const std::string& dir, std::uint64_t wm,
     const std::optional<std::vector<
         std::pair<std::uint32_t, std::uint64_t>>>& wms,
-    const std::vector<std::byte>& keydir_delta) {
+    const std::vector<std::byte>& authority_delta) {
     if (!text_) return true;  // 纯 KV 库无 search ckpt
     // S18-6：base/delta 决策下沉——宿主只决策 docmap（自己的组件）+ 全局
     // 收链提示（close/静止全量），插件在 flush() 内自决（自身 rebase 标志 +
@@ -3078,8 +3230,8 @@ bool Cask::save_checkpoint_paired(
         if (index::save_docmap_delta(
                 *docmap_, dir, wm, docmap_chain_.base_watermark,
                 docmap_chain_.chain_watermark, seq,
-                std::span<const std::byte>(keydir_delta.data(),
-                                            keydir_delta.size()))) {
+                std::span<const std::byte>(authority_delta.data(),
+                                            authority_delta.size()))) {
             docmap_chain_.chain_seq = seq;
             docmap_chain_.chain_watermark = wm;
             new_manifest.entries[0] = docmap_chain_;
@@ -3118,7 +3270,7 @@ bool Cask::save_checkpoint_paired(
     // keydir 快照与 docmap base 成对（delta 路径下 keydir 元数据已内联进
     // docmap delta 的 kKeydirDelta 段）。
     if (docmap_base_taken && wms) {
-        write_keydir_snapshot(*wms);
+        write_authority_snapshot(*wms);
     }
     return true;
 }
@@ -3132,7 +3284,7 @@ void Cask::maybe_submit_auto_checkpoint() {
     // 工作量,崩溃后全部重放(且 S30 后段文件在预算/阈值封口时已在盘上,
     // 只差清单提交,重放纯属浪费)。改为每写评估 ord 增量(两次 relaxed
     // load,热路径零 RMW),恢复重放窗口恒 ≤ min_docs。
-    const std::uint64_t now_ord = keydir_->peek_next_ord();
+    const std::uint64_t now_ord = authority_->peek_next_ord();
     if (now_ord - last_ckpt_ord_.load(std::memory_order_relaxed) <
         opts_.auto_checkpoint_min_docs) {
         return;
@@ -3145,13 +3297,13 @@ void Cask::maybe_submit_auto_checkpoint() {
     }
     IndexTask t;
     t.op  = IndexOp::RunFn;
-    const std::uint64_t ord = keydir_->alloc_ord();
+    const std::uint64_t ord = authority_->alloc_ord();
     OrdSkipGuard og(this, ord);  // DL-MED-1
     std::vector<std::byte> auto_kd;
     auto auto_wms = collect_snapshot_watermarks();
-    if (auto_wms) keydir_->serialize_meta_delta(auto_kd, *auto_wms);
+    (void)auto_wms;
     t.fn  = [this, wms = std::move(auto_wms), kd = std::move(auto_kd),
-             wm = keydir_->peek_next_ord()] {
+             wm = authority_->peek_next_ord()] {
         try {
             if (save_search_ckpt_paired(dirname_ + "/" + kSearchCkptName,
                                         wm, wms, kd)) {
@@ -3178,10 +3330,10 @@ void Cask::maybe_submit_auto_checkpoint() {
 // 必须严格按以下顺序执行。违反顺序会破坏快照一致性或丢失索引数据：
 //
 //  Phase 1 — Data compaction:
-//    1. run_merge()  重写活 record 到新文件, CAS 更新 KeyDir
+//    1. run_merge()  重写活 record 到新文件, CAS 更新 authority
 //
 //  Phase 2 — Index maintenance (search_ 存在时):
-//    2. write_keydir_snapshot()  捕获 ord 水位
+//    2. write_authority_snapshot()  捕获 ord 水位
 //    3. flush IndexPool          排干待处理索引任务
 //    4. compact()                P2:阈值压实死 posting(不重读、不重分词;
 //                                定位由 run_merge 的 on_relocate 已更新)
@@ -3190,9 +3342,9 @@ void Cask::maybe_submit_auto_checkpoint() {
 //    7. save hnsw snapshot       V4:持久化重建后图(下次 open 走快照路径)
 //
 //  Phase 3 — Cleanup:
-//    8. erase read_files_ cache + unlink old data/hint
+//    8. erase read_files_ cache + unlink old data
 //    9. trim_fstats
-//   10. write_keydir_snapshot()  最终状态快照
+//   10. write_authority_snapshot()  最终状态快照
 //
 // 关键约束:
 //  - Phase 2 的 flush(3)必须在 compact(4)之前,保证 Index 覆盖全部已分配 ord,
@@ -3247,11 +3399,27 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
         merge_plugins.push_back(&relocator);
         for (auto* p : plugins_) merge_plugins.push_back(p);
     }
-    auto r = merge::run_merge(files, dirname_, *keydir_, opts_.o_sync,
+    // S43-7：merge 的活性来源切换为 OKI ReadView。旧 Level A 目录在
+    // 重开后可能仍是“hash 可用、OKI 未挂写挂钩”的迁移态；进入 merge
+    // 前必须走与 put 相同的受控重建闸，绝不把不可判定视图当空集。
+    if (!ensure_oki_for_write()) {
+        return std::unexpected(err(
+            oki_rebuild_failed_ ? CaskError::kIndexRebuildFailed
+                                : CaskError::kIndexCorrupt,
+            "oki unavailable before merge: controlled rebuild failed"));
+    }
+    auto r = merge::run_merge(files, dirname_, *authority_, opts_.o_sync,
                               merge_plugins,
                               now_sec ? now_sec : now_sec_default());
     if (!r) {
         return std::unexpected(err(CaskError::kIo, r.error().detail));
+    }
+    if (r->records_stale != 0) {
+        // S43-7：foreground 隔离诊断。合并 pinned 的旧视图与并发写者
+        // 竞争同一个 key 时不会丢数据，但失败 CAS 数是限速决策的核心
+        // 信号；先以结构化日志记录，token bucket 由后续 gate 决定。
+        log_warn("merge: " + std::to_string(r->records_stale) +
+                 " relocation CAS request(s) lost to concurrent writes");
     }
 
     if (text_) {
@@ -3277,14 +3445,14 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
         if (index_pool_ && index_lane_) {
             IndexTask t;
             t.op  = IndexOp::RunFn;
-            const std::uint64_t ord = keydir_->alloc_ord();
+            const std::uint64_t ord = authority_->alloc_ord();
             OrdSkipGuard og(this, ord);  // DL-MED-1
             // S14-7：merge 恒 rebase → paired 走 base + 全量快照（用早段
             // 捕获的水位）。S18-7：rebase 标志改在此显式置位（原经 compact
             // shim 顺带置全局位；插件版 compact 只置自身位）；docmap chunk
             // 回收（原 compact_index_chunks）一并收进本 RunFn。
             t.fn  = [this, search_ckpt, wms = merge_snap_wms,
-                     wm = keydir_->peek_next_ord()] {
+                     wm = authority_->peek_next_ord()] {
                 docmap_->compact_chunks();
                 force_ckpt_rebase();
                 if (!save_search_ckpt_paired(search_ckpt, wm, wms, {})) {
@@ -3303,7 +3471,7 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
         } else {
             docmap_->compact_chunks();
             force_ckpt_rebase();
-            const std::uint64_t wm = keydir_->peek_next_ord();
+            const std::uint64_t wm = authority_->peek_next_ord();
             if (!save_search_ckpt_paired(search_ckpt, wm, merge_snap_wms, {})) {
                 log_warn("search checkpoint save failed after merge "
                          "(will rebuild on next open)");  // S13-D7
@@ -3319,7 +3487,7 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
     // After run_merge, every live record from `files` has been CAS-rewritten
     // into the new merge file, and stale records were already pointing
     // elsewhere. So nothing in the keydir references these inputs anymore —
-    // safe to unlink the .data + .hint pair and drop the fstats entry.
+    // safe to unlink the retired .data files and drop the fstats entries.
     //
     // S13-F1 纵深防御：run_merge 复查后仍有 keydir entry 指向的输入文件
     // （stuck，正常流程不可达）绝不能 unlink——否则这些 key 指向已删文件，
@@ -3343,14 +3511,16 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
     // 可读，内容相同）。flush 带持久水位（搬迁 loc 指向 merge 输出——
     // run_merge 已 fsync；水位过滤只持留并发用户写的 active 尾巴）。
     // flush 失败 → 跳过全部 unlink/trim（空间暂不回收，下轮 merge 重试）。
-    if (keydir_->oki().point_query_enabled()) {
+    if (authority_->state().point_query_enabled()) {
         auto wms = collect_snapshot_watermarks();
+        auto commit = authority_->capture_commit_snapshot();
         const bool flushed =
-            wms.has_value() && keydir_->oki().flush(dirname_, *wms);
+            wms.has_value() &&
+            authority_->state().flush(dirname_, *wms, std::move(commit));
         if (!flushed) {
             log_error("merge: oki flush before unlink failed; "
                       "keeping input files for retry");
-            write_keydir_snapshot();
+            write_authority_snapshot();
             return *r;
         }
     }
@@ -3383,9 +3553,9 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
     }
     retire_files(std::move(to_retire));
     if (!trimmed_ids.empty()) {
-        (void)keydir_->trim_fstats(trimmed_ids);
+        (void)authority_->trim_fstats(trimmed_ids);
     }
-    write_keydir_snapshot();  // A4:merge 后状态最紧凑,顺手落快照
+    write_authority_snapshot();  // A4:merge 后状态最紧凑,顺手落快照
     return *r;
 }
 

@@ -271,7 +271,7 @@ private:
     FileHandle fd_ = kInvalidHandle;
 };
 
-// S37-1 之前的类名。既有站点（data_file / hint_file / oki_run / segment /
+// S37-1 之前的类名。既有站点（data_file / oki_run / segment /
 // chunked_reader 等 65 处）继续可用。
 using PosixFile = File;
 

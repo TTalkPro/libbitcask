@@ -15,11 +15,10 @@ set(BENCHMARK_DOWNLOAD_DEPENDENCIES OFF CACHE BOOL "" FORCE)
 add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/benchmark"
                  "${PROJECT_BINARY_DIR}/_deps/benchmark-build" EXCLUDE_FROM_ALL)
 
-# Bench binary: keydir + cask micro-benchmarks.
+# Bench binary: authority + cask micro-benchmarks.
 # Sanitizers are deliberately NOT linked here — perf numbers under sanitizers
 # are misleading and have nothing to do with steady-state throughput.
 add_executable(bitcask_bench
-    keydir_bench.cpp
     cask_bench.cpp
     inverted_bench.cpp
     segment_v2_bench.cpp
@@ -30,7 +29,6 @@ add_executable(bitcask_bench
     gate_bench.cpp
     merge_bench.cpp          # B1
     index_pool_bench.cpp     # B2
-    checkpoint_bench.cpp     # B4 （B3 扩展在 keydir_bench.cpp 内）
     range_bench.cpp          # S33-1：prefix 扫描基线 + keydir 内存探针
     avx512_verify_bench.cpp  # AVX-512 启用验证（scalar vs SIMD 对拍）
     bench_main.cpp
@@ -39,7 +37,7 @@ target_include_directories(bitcask_bench PRIVATE "${PROJECT_SOURCE_DIR}/src/vect
 target_link_libraries(bitcask_bench
     PRIVATE
         benchmark::benchmark
-        bitcask_keydir
+        bitcask_index_authority
         bitcask_cask
         bitcask_bm25
         bitcask_index

@@ -193,14 +193,6 @@ target_link_libraries(bitcask_jieba_analyzer_test PRIVATE
 target_compile_definitions(bitcask_jieba_analyzer_test PRIVATE
     BITCASK_JIEBA_DICT_DIR="${BITCASK_JIEBA_DICT_DIR}")
 
-add_executable(bitcask_keydir_test keydir_test.cpp)
-target_link_libraries(bitcask_keydir_test PRIVATE
-    GTest::gtest_main
-    bitcask_keydir
-    bitcask_warnings
-    bitcask_sanitizers
-)
-
 add_executable(bitcask_cask_docvalue_test cask_docvalue_test.cpp)
 target_link_libraries(bitcask_cask_docvalue_test PRIVATE
     GTest::gtest_main
@@ -237,9 +229,22 @@ target_link_libraries(bitcask_oki_levelb_test PRIVATE
     bitcask_sanitizers
 )
 
-add_executable(bitcask_oki_locate_test oki_locate_test.cpp)
-target_link_libraries(bitcask_oki_locate_test PRIVATE
+# S43-0：OKI-only 外部语义守门（lifecycle / Level B 冷视图 / atomic batch /
+# data-only reopen）。完整并发与崩溃矩阵由 S43-10 收口。
+add_executable(bitcask_oki_only_contract_test oki_only_contract_test.cpp)
+target_link_libraries(bitcask_oki_only_contract_test PRIVATE
     GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
+# S43-10：发布前 rollout gate。集中固化随机 reference model 和 S43-0
+# K1-K15 崩溃/提交点语义；细粒度 CRC、并发与 merge 竞态仍由专项测试守门。
+add_executable(bitcask_s43_rollout_gate_test s43_rollout_gate_test.cpp)
+target_link_libraries(bitcask_s43_rollout_gate_test PRIVATE
+    GTest::gtest
+    bitcask_test_crash_child
     bitcask_cask
     bitcask_warnings
     bitcask_sanitizers
@@ -408,8 +413,8 @@ include(GoogleTest)
 # TBB 的 fence 同步对 TSan 不可见,插桩自编 oneTBB 后仍有残余假阳性)。
 # 动态 libtsan 不回调二进制内的 __tsan_default_suppressions,env 是
 # 唯一可靠通道。
-# detect_deadlocks=1 固化(屏障 v2 验收门禁):KeyDir 屏障曾因同时持
-# 257 把锁撞 TSan 死锁检测器 64 持锁硬上限崩溃,该开关保证回归可见。
+# detect_deadlocks=1 固化(屏障 v2 验收门禁):索引屏障曾因同时持
+# 大量锁撞 TSan 死锁检测器 64 持锁硬上限崩溃,该开关保证回归可见。
 set(_bitcask_test_props "")
 if(BITCASK_SANITIZE MATCHES "thread")
     set(_bitcask_test_props PROPERTIES ENVIRONMENT
@@ -426,7 +431,8 @@ gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_v2_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_recovery_test ${_bitcask_test_props})
-gtest_discover_tests(bitcask_oki_locate_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_oki_only_contract_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_s43_rollout_gate_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_levelb_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_range_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_scanner_test ${_bitcask_test_props})
@@ -438,7 +444,6 @@ gtest_discover_tests(bitcask_stemming_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_inverted_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_segment_v2_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_jieba_analyzer_test ${_bitcask_test_props})
-gtest_discover_tests(bitcask_keydir_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_cask_docvalue_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_atomic_batch_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_txn_test ${_bitcask_test_props})
@@ -528,7 +533,7 @@ target_link_libraries(bitcask_plugin_contract_test PRIVATE
     bitcask_plugin_api
     bitcask_index
     bitcask_merge     # S18-11：merge 广播契约（run_merge 直调 + mock 插件）
-    bitcask_keydir
+    bitcask_index_authority
     bitcask_fileops
     bitcask_warnings
     bitcask_sanitizers

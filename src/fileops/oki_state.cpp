@@ -60,6 +60,30 @@ void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep,
     }
 }
 
+// S43-2：caller 快照进入 manifest 前的最后一道结构/水位门。这比 CRC
+// 更严格：reader 拒收能保护 open，但提交端必须在发布前拦住本地协议错误。
+[[nodiscard]] bool valid_commit_snapshot(
+    const OkiManifest& next,
+    const OkiManifestMetadata& g,
+    const std::vector<OkiManifestFStats>& fs) {
+    const auto max_cover = [&]() {
+        std::uint64_t v = 0;
+        for (const auto& r : next.runs) v = std::max(v, r.cover_ord);
+        return v;
+    };
+    return g.reserved == 0 &&
+           g.next_file_id == g.biggest_file_id + 1 &&
+           g.next_ord >= next.wm &&
+           g.next_ord >= max_cover() &&
+           (g.active_keys == 0) == (g.live_bytes == 0) &&
+           !(g.oldest_tstamp == 0 && g.newest_tstamp != 0) &&
+           !(g.active_keys == 0 &&
+             (g.oldest_tstamp != 0 || g.newest_tstamp != 0)) &&
+           !(g.active_keys != 0 &&
+             (g.oldest_tstamp == 0 || g.newest_tstamp == 0)) &&
+           fs.size() <= (1u << 24);
+}
+
 }  // namespace
 
 void OkiState::append(std::string_view key, std::uint64_t ord, bool tomb,
@@ -110,6 +134,56 @@ void OkiState::enable_point_query() {
     if (point_query_.load(std::memory_order_relaxed)) return;
     point_query_.store(true, std::memory_order_release);
     rebuild_index_locked();
+}
+
+// S43-5：写前探测是 locate 的显式语义别名。实现暂共用同一条组合视图；
+// 后续把 memdelta 辅助哈希提升为写路径专用热缓存时，读视图的替换策略
+// 不会再反向影响写 CAS 的可用性判定。
+OkiState::WriteProbe OkiState::probe_for_write(std::string_view key) const {
+    const auto r = locate(key);
+    return WriteProbe{r.status, r.ord, r.tomb, r.has_loc, r.loc};
+}
+
+bool OkiState::write_probe_ready() const noexcept {
+    if (!point_query_.load(std::memory_order_acquire) ||
+        !loaded_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const auto runs = runs_snap_.load(std::memory_order_acquire);
+    if (!runs) return false;
+    return std::none_of(
+        runs->begin(), runs->end(),
+        [](const auto& run) {
+            return run.second->version() == kRunVersion;
+        });
+}
+
+void OkiState::apply_put(std::string_view key, std::uint64_t ord,
+                         const RowLoc& loc) {
+    append(key, ord, /*tomb=*/false, &loc);
+}
+
+void OkiState::apply_remove(std::string_view key, std::uint64_t ord) {
+    append(key, ord, /*tomb=*/true);
+}
+
+void OkiState::apply_conditional_remove(std::string_view key,
+                                        std::uint64_t victim_ord) {
+    append_update(key, victim_ord, /*tomb=*/true, nullptr);
+}
+
+void OkiState::apply_relocation(std::string_view key, std::uint64_t ord,
+                                const RowLoc& loc) {
+    append_update(key, ord, /*tomb=*/false, &loc);
+}
+
+// S43-1：坏块运行期降级。先关点查，再置 unloaded；顺序保证不会出现
+// 「点查仍开但视图已消失」的窗口。flush_mu_ 与 flush/compact/rebuild
+// 串行，避免降级动作插在半途提交之后造成状态回退。
+void OkiState::degrade_for_rebuild() noexcept {
+    std::lock_guard<std::mutex> flk(flush_mu_);
+    point_query_.store(false, std::memory_order_release);
+    loaded_.store(false, std::memory_order_release);
 }
 
 void OkiState::publish_runs_locked() {
@@ -163,9 +237,39 @@ std::uint64_t OkiState::next_gen_locked() const noexcept {
 
 bool OkiState::flush(
     std::string_view dir,
-    std::span<const std::pair<std::uint32_t, std::uint64_t>> durable_wms) {
+    std::span<const std::pair<std::uint32_t, std::uint64_t>> durable_wms,
+    std::optional<OkiCommitSnapshot> commit_snapshot) {
     std::lock_guard<std::mutex> flk(flush_mu_);
     if (!loaded_.load(std::memory_order_relaxed)) return false;
+
+    // S43-2：Level A / 空 memdelta 也是合法提交点。尤其 v3→v4 迁移目录
+    // 可能没有任何待固化 delta，但仍要把刚捕获的标量/fstats 随 manifest
+    // 原子发布；否则“空 flush”会静默放弃迁移。
+    const auto commit_metadata_only = [&]() -> bool {
+        if (!commit_snapshot.has_value()) return true;
+        const auto& g = commit_snapshot->metadata;
+        if (!valid_commit_snapshot(manifest_, g, commit_snapshot->fstats)) {
+            return false;
+        }
+        OkiManifest next = manifest_;
+        if (!durable_wms.empty()) {
+            next.data_wms.assign(durable_wms.begin(), durable_wms.end());
+        }
+        next.metadata = g;
+        next.fstats = commit_snapshot->fstats;
+        next.level_b = level_b_.load(std::memory_order_acquire);
+        if (next.metadata == manifest_.metadata &&
+            next.fstats == manifest_.fstats &&
+            next.level_b == manifest_level_b_.load(
+                std::memory_order_acquire)) {
+            return true;
+        }
+        if (!write_manifest(dir, next)) return false;
+        manifest_ = std::move(next);
+        manifest_level_b_.store(manifest_.level_b,
+                                std::memory_order_release);
+        return true;
+    };
 
     // S36-2：**拷贝前缀**而非换出——IO 期间行仍留在 delta_（locate 可见，
     // 组合视图无「在写盘路上不可见」的窗口），提交后才删前缀。失败路径
@@ -176,7 +280,7 @@ bool OkiState::flush(
         std::lock_guard<std::mutex> lk(mu_);
         all.assign(delta_.begin(), delta_.end());
     }
-    if (all.empty()) return true;
+    if (all.empty()) return commit_metadata_only();
     const std::size_t prefix_n = all.size();
 
     // S36-5 B1：持久性分拣——loc 越过其文件持久水位的行持留（语义见头
@@ -204,7 +308,8 @@ bool OkiState::flush(
         }
     }
     all.clear();
-    if (rows.empty()) return true;  // 全持留：本轮无事（持久水位推进后再来）
+    // 全持留：本轮无新 run；但 metadata 快照仍是同一提交点的最新派生值。
+    if (rows.empty()) return commit_metadata_only();
 
     // 排序 + 同 key 去重。**stable**：同 key 同 ord 的多行按到达序取末
     //（merge 搬迁行与被搬迁行同 ord，后到的新位置必须胜——(ord, 到达序)
@@ -221,11 +326,11 @@ bool OkiState::flush(
         if (i + 1 == rows.size() || rows[i + 1].key != rows[i].key) ++uniq;
     }
 
-    // S36-2：run 落 v2（全字段 + bloom）——组合视图点查的能力前提；
-    // manifest 版本由 write_manifest 惰性选择（含 v2 条目 → BCOM v2）。
+    // S43-1：新 run 落 v3（全字段 + bloom + per-block CRC）——组合视图
+    // 点查的能力前提；开库不再整读 data 索引文件。
     const std::uint64_t gen = next_gen_locked();
     auto w = OkiRunWriter::create(mk_run_filename(dir, gen),
-                                  kDefaultBlockBytes, kRunVersion2,
+                                  kDefaultBlockBytes, kRunVersion3,
                                   /*expected_entries=*/uniq);
     if (!w) return false;
     bool io_ok = true;
@@ -253,9 +358,28 @@ bool OkiState::flush(
 
     // manifest 提交（唯一 commit point）。失败则删刚写的 run（delta_ 未动）。
     OkiManifest next = manifest_;
-    next.runs.push_back({gen, cover, /*format_ver=*/2});
+    // S43-3：本次 caller 持久水位和 run/metadata 同为一个提交点。空水位
+    // 表示 caller 没有新落点（如测试直调）；此时保留上一份 data 水位。
+    if (!durable_wms.empty()) {
+        next.data_wms.assign(durable_wms.begin(), durable_wms.end());
+    }
+    next.runs.push_back({gen, cover, /*format_ver=*/3});
     next.wm = std::max(next.wm, cover);
     next.level_b = level_b_.load(std::memory_order_acquire);  // S36-4 模式戳
+    if (commit_snapshot.has_value()) {
+        // v4 是随本次 run 一起过 CRC 的提交快照。校验放在 run fsync 后、
+        // manifest 发布前：非法 caller 快照只浪费一次 run，不会发布超前
+        // 标量。无快照时保留上一份 v4 元数据（现有 v4 目录的普通 flush
+        // 可继续），v3 目录则保持 nullopt 等真实迁移点。
+        next.metadata = commit_snapshot->metadata;
+        next.fstats = std::move(commit_snapshot->fstats);
+        if (!valid_commit_snapshot(next, *next.metadata, next.fstats)) {
+            std::error_code ec;
+            std::filesystem::remove(
+                bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
+            return false;
+        }
+    }
     if (!write_manifest(dir, next)) {
         std::error_code ec;
         std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
@@ -312,15 +436,17 @@ bool OkiState::compact_all_locked(std::string_view dir) {
     for (const auto& r : manifest_.runs) cover = std::max(cover, r.cover_ord);
     const std::uint64_t keep_wm = manifest_.wm;
 
-    // S36-2：输出版本——全 v2 输入才出 v2（v1 行无位置字段，混入会产出
+    // S43-1：输出版本——全 v2/v3 输入才出 v3（v1 行无位置字段，混入会产出
     // 「无位置的活行」毒化点查能力）；含 v1 则整体降 v1（Level A 语义保
-    // 留，点查能力等旧 run 被 rebuild 淘汰后自愈）。
+    // 留，点查能力等旧 run 被 rebuild 淘汰后自愈）。v2 输入提升到 v3 的
+    // 收益是后续开库只验元数据；行内容本身完全兼容。
     std::uint32_t out_ver = kRunVersion2;
     std::uint64_t est_entries = 0;
     for (const auto& [g, rd] : readers_) {
-        if (rd->version() != kRunVersion2) out_ver = kRunVersion;
+        if (rd->version() == kRunVersion) out_ver = kRunVersion;
         est_entries += rd->entry_count();
     }
+    if (out_ver == kRunVersion2) out_ver = kRunVersion3;
 
     const std::uint64_t gen = next_gen_locked();
     auto w = OkiRunWriter::create(mk_run_filename(dir, gen),
@@ -392,7 +518,7 @@ bool OkiState::compact_all_locked(std::string_view dir) {
                             reinterpret_cast<const std::byte*>(key.data()),
                             key.size()),
                         win_ord, /*tomb=*/false,
-                        (out_ver == kRunVersion2 && win_has_loc) ? &win_loc
+                        (out_ver != kRunVersion && win_has_loc) ? &win_loc
                                                                  : nullptr);
         if (!a) return abort();
     }
@@ -402,9 +528,7 @@ bool OkiState::compact_all_locked(std::string_view dir) {
     if (!rd) return abort();
 
     OkiManifest next;
-    next.runs.push_back({gen, cover,
-                         static_cast<std::uint8_t>(
-                             out_ver == kRunVersion2 ? 2 : 1)});
+    next.runs.push_back({gen, cover, static_cast<std::uint8_t>(out_ver)});
     next.wm = keep_wm;  // 归并不推进水位
     next.level_b = level_b_.load(std::memory_order_acquire);  // S36-4
     if (!write_manifest(dir, next)) return abort();
@@ -425,7 +549,8 @@ bool OkiState::compact_all_locked(std::string_view dir) {
 }
 
 bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
-                       std::uint64_t cover_ord) {
+                       std::uint64_t cover_ord,
+                       std::optional<OkiCommitSnapshot> commit_snapshot) {
     std::lock_guard<std::mutex> flk(flush_mu_);
 
     // S33-6：零活 key（空库 / 全删）**不落空 run**——空 run 归并不出任何行，
@@ -438,10 +563,10 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
         // S36-1：外排构建（64MiB 分段 spill + k 路归并）取代全内存 sort——
         // 排序工作集从 O(全部行) 降到 O(spill_bytes)；同 key 去重规则不变
         //（max ord 胜，builder 内 (ord, 到达序) 等价于原 (key, ord) 排序取末）。
-        // S36-2：出 v2（全字段 + bloom）——rows 由 caller 从 keydir 收集，
-        // 位置字段齐备。
+        // S43-1：出 v3（全字段 + bloom + per-block CRC）——rows 由 caller
+        // 从 keydir 收集，位置字段齐备；下次打开不用整文件 CRC。
         auto b = SpillingRunBuilder::create(std::string(dir), gen,
-                                            kRunVersion2);
+                                            kRunVersion3);
         if (!b) return false;
         for (const auto& r : rows) {
             auto a = b->add(std::span<const std::byte>(
@@ -462,9 +587,21 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
     }
 
     OkiManifest next;
-    if (new_reader) next.runs.push_back({gen, cover_ord, /*format_ver=*/2});
+    if (new_reader) next.runs.push_back({gen, cover_ord, /*format_ver=*/3});
     next.wm = cover_ord;
     next.level_b = level_b_.load(std::memory_order_acquire);  // S36-4 模式戳
+    if (commit_snapshot.has_value()) {
+        next.metadata = commit_snapshot->metadata;
+        next.fstats = std::move(commit_snapshot->fstats);
+        if (!valid_commit_snapshot(next, *next.metadata, next.fstats)) {
+            std::error_code ec;
+            if (new_reader) {
+                std::filesystem::remove(bitcask::detail::from_utf8(
+                    mk_run_filename(dir, gen)), ec);
+            }
+            return false;
+        }
+    }
     if (!write_manifest(dir, next)) {
         std::error_code ec;
         if (new_reader) std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
@@ -502,6 +639,45 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
     return true;
 }
 
+void OkiState::install_memory_view(
+    std::vector<DeltaRow>&& rows,
+    std::uint64_t cover_ord,
+    std::optional<OkiCommitSnapshot> commit_snapshot) {
+    std::lock_guard<std::mutex> flk(flush_mu_);
+    OkiManifest next;
+    next.wm = cover_ord;
+    next.level_b = level_b_.load(std::memory_order_acquire);
+    if (commit_snapshot.has_value()) {
+        next.metadata = commit_snapshot->metadata;
+        next.fstats = commit_snapshot->fstats;
+        if (!valid_commit_snapshot(next, *next.metadata, next.fstats)) return;
+    }
+
+    // 只读视图仍要有明确提交边界：空 run 集 + wm 表达“内存行覆盖全序”。
+    // 旧 Reader 只经 shared_ptr 存活到在途视图结束，本进程不修改盘面。
+    manifest_ = std::move(next);
+    readers_.clear();
+    publish_runs_locked();
+    manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
+    wm_.store(manifest_.wm, std::memory_order_release);
+    loaded_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        delta_ = std::move(rows);
+        delta_bytes_ = 0;
+        for (const auto& row : delta_) {
+            delta_bytes_ += row.key.size() + sizeof(DeltaRow);
+        }
+        ++delta_version_;
+        rebuild_index_locked();
+        update_flush_hint_locked();
+    }
+    {
+        std::lock_guard<std::mutex> vlk(view_mu_);
+        sorted_view_.reset();
+    }
+}
+
 // S36-2：组合视图点查（冷侧——不含哈希 keydir；设计 §5.1 步骤 2-4）。
 OkiState::LocateResult OkiState::locate(std::string_view key) const {
     LocateResult out;
@@ -533,7 +709,7 @@ OkiState::LocateResult OkiState::locate(std::string_view key) const {
         reinterpret_cast<const std::byte*>(key.data()), key.size());
     for (auto it = runs->rbegin(); it != runs->rend(); ++it) {
         const OkiRunReader& rd = *it->second;
-        if (rd.version() != kRunVersion2) {
+        if (rd.version() == kRunVersion) {
             // v1 run：无位置字段也无 bloom——排除不了 key 也定位不了。
             // 组合视图对该 key 无点查能力（kUnavailable，待重建自愈）。
             return LocateResult{};

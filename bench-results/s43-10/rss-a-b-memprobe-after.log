@@ -1,0 +1,10 @@
+----------------------------------------------------------------------------------------
+Benchmark                              Time             CPU   Iterations UserCounters...
+----------------------------------------------------------------------------------------
+BM_Oki_MemProbe/100000              66.3 ms         66.0 ms           43 memdelta_MB=8.01086 memdelta_rows=100k memdelta_rss_MB=7.59766 rebuild_peak_rss_MB=17.5977 run_B_per_key=14.3601 run_MB=1.36948 run_count=1
+BM_Oki_MemProbe/100000              68.0 ms         67.8 ms           43 memdelta_MB=8.01086 memdelta_rows=100k memdelta_rss_MB=7.59766 rebuild_peak_rss_MB=17.5977 run_B_per_key=14.3601 run_MB=1.36948 run_count=1
+BM_Oki_MemProbe/100000              67.2 ms         66.9 ms           43 memdelta_MB=8.01086 memdelta_rows=100k memdelta_rss_MB=7.59766 rebuild_peak_rss_MB=17.5977 run_B_per_key=14.3613 run_MB=1.3696 run_count=1
+BM_Oki_MemProbe/100000_mean         67.1 ms         66.9 ms            3 memdelta_MB=8.01086 memdelta_rows=100k memdelta_rss_MB=7.59766 rebuild_peak_rss_MB=17.5977 run_B_per_key=14.3605 run_MB=1.36952 run_count=1
+BM_Oki_MemProbe/100000_median       67.2 ms         66.9 ms            3 memdelta_MB=8.01086 memdelta_rows=100k memdelta_rss_MB=7.59766 rebuild_peak_rss_MB=17.5977 run_B_per_key=14.3601 run_MB=1.36948 run_count=1
+BM_Oki_MemProbe/100000_stddev      0.860 ms        0.916 ms            3 memdelta_MB=0 memdelta_rows=0 memdelta_rss_MB=0 rebuild_peak_rss_MB=0 run_B_per_key=710.141u run_MB=67.7243u run_count=0
+BM_Oki_MemProbe/100000_cv           1.28 %          1.37 %             3 memdelta_MB=0.00% memdelta_rows=0.00% memdelta_rss_MB=0.00% rebuild_peak_rss_MB=0.00% run_B_per_key=0.00% run_MB=0.00% run_count=0.00%

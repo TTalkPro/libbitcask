@@ -1,16 +1,16 @@
 // OKI 运行态（S33-4）：memdelta + run 集合 + manifest 水位。
 // 设计：doc/ordered-key-index-design-zh.md §2/§5。
 //
-// 归属：挂 KeyDir（进程内随 KeyDirRegistry 共享，生命周期随 KeyDir——
-// CaskIter 的 keydir_pin_ 语义自动顺延）；目录路径由 Cask 注入（KeyDir
-// 不知道自己的目录，与 kv.keydir.ckpt 同模式）。
+// 归属：挂索引权威（进程内随 IndexRegistry 共享，生命周期随 authority——
+// 迭代器 pin 语义自动顺延）；目录路径由 Cask 注入（OkiState 不知道自己的
+// 目录，与 kv.oki.manifest 同模式）。
 //
 // === 挂钩与水位模型 ===
-// 写挂钩收敛在 KeyDir::put / KeyDir::remove 的单一咽喉点（本类的 append
-// 由 keydir.cpp 调用，Cask 各写路径零改动——设计文档 §8 难点 1 的对策）。
+// 写挂钩收敛在 IndexAuthority 的条件 put/remove 咽喉点（本类的 append
+// 由 Cask 写路径调用——设计文档 §8 难点 1 的对策）。
 // append 以 `ord ≥ wm` 为门：
 //   - 运行期写（ord 恒新）→ 全收；
-//   - 恢复 tail 重放（fold/hint 皆携真实 ord）→ 自动只收 wm 之后的行；
+    //   - 恢复 tail 重放（fold 携真实 ord）→ 自动只收 wm 之后的行；
 //   - merge 搬迁 put（old_file_id≠0）与 TTL conditional_remove（S36-2 起
 //     反转 Level A 的「零交互」）→ 走 append_update **绕过水位门**
 //     （旧 ord、新信息）。**仅点查开启时收**（影子对拍 / Level B）：
@@ -26,10 +26,9 @@
 // 序即写序（write_mu_ / 分片锁串行）；恢复期并行 fold 乱序到达由 ord
 // 主键消解（恢复期无同 ord 平局）。
 //
-// 快照崩溃窗口：keydir 快照使 fold 跳过字节水位前的行——这些行若未进
-// runs 即是洞。约定 flush 恒在 write_keydir_snapshot **之后**（同站点搭
-// 车），正常路径 wm ≥ 快照覆盖；崩溃丢 flush 时由 open 端检查
-// `wm < 快照 next_ord - 1` → 整体重建兜底（cask_recovery）。
+// 崩溃窗口：fold 用 data 字节水位跳过已恢复行——这些行若未进 runs 即是
+// 洞。约定 OKI flush 恒在 data 提交面稳定之后；崩溃丢 flush 时由 open
+// 端检查 run 覆盖/metadata 活键数 → 整体重建兜底（cask_recovery）。
 //
 // === 线程模型 ===
 // append/delta 统计：内部 mu_（运行期单写者无争用；恢复期并行 fold 短锁）。
@@ -111,7 +110,8 @@ public:
     [[nodiscard]] bool flush(
         std::string_view dir,
         std::span<const std::pair<std::uint32_t, std::uint64_t>> durable_wms =
-            {});
+            {},
+        std::optional<OkiCommitSnapshot> commit_snapshot = std::nullopt);
 
     // 全量重建：rows 由 caller 从 keydir 收集（活 key + ord；墓碑不需要
     // ——单一全量 run 的缺席即语义）。排序写单 run、manifest 只含它、
@@ -121,7 +121,16 @@ public:
     // run + wm=cover_ord，语义等价且不留空文件与常驻 fd。
     [[nodiscard]] bool rebuild(std::string_view dir,
                                std::vector<DeltaRow>&& rows,
-                               std::uint64_t cover_ord);
+                               std::uint64_t cover_ord,
+                               std::optional<OkiCommitSnapshot> commit_snapshot =
+                                   std::nullopt);
+
+    // 只读恢复/升级的内存视图：语义与 rebuild 相同，但不落 run、不改盘上
+    // manifest。data 仍是持久真相；可写句柄后续会做持久受控重建。
+    void install_memory_view(std::vector<DeltaRow>&& rows,
+                             std::uint64_t cover_ord,
+                             std::optional<OkiCommitSnapshot> commit_snapshot =
+                                 std::nullopt);
 
     // S33-5：range 读者视图——runs 的共享 Reader（不可变，多线程各持
     // Cursor 并发读）+ memdelta 快照（已按 key 排序、同 key max-ord 去重，
@@ -161,13 +170,46 @@ public:
     };
     [[nodiscard]] LocateResult locate(std::string_view key) const;
 
+    // ---- S43-5：写权威服务（第一批只收敛探测/应用入口）----
+    //
+    // probe_for_write 是 locate 的显式写前语义包装：kUnavailable 必须由
+    // caller 触发受控重建或显式失败，禁止折叠成“不存在”。返回的 loc/ord
+    // 只能用于 CAS 与账务裁决；数据记录仍必须先持久化，OKI 行随后才可见。
+    struct WriteProbe {
+        LocateStatus status = LocateStatus::kUnavailable;
+        std::uint64_t ord = 0;
+        bool tomb = false;
+        bool has_loc = false;
+        RowLoc loc{};
+    };
+    [[nodiscard]] WriteProbe probe_for_write(std::string_view key) const;
+
+    // 运行期行应用入口。put/remove 使用真实新 ord；relocation 与
+    // conditional_remove 使用受害者/旧 ord 的新信息（绕过 wm 门）。
+    // 这些方法不检查 CAS——CAS 判定必须先 probe_for_write，再由调用方在
+    // 同一把写序闸门内应用，避免探测/应用之间出现 TOCTOU。
+    void apply_put(std::string_view key, std::uint64_t ord,
+                   const RowLoc& loc);
+    void apply_remove(std::string_view key, std::uint64_t ord);
+    void apply_conditional_remove(std::string_view key,
+                                  std::uint64_t victim_ord);
+    void apply_relocation(std::string_view key, std::uint64_t ord,
+                          const RowLoc& loc);
+
     // 点查开关：建 memdelta 辅助哈希（key → 最新行下标，(ord, 到达序)
     // 胜出）。默认关——索引在 append 热路径上多一次哈希插入 + key 拷贝，
     // 只在影子对拍（S36-2）/ Level B（S36-3+）需要时开启。幂等。
     void enable_point_query();
+    // S43-1：运行期发现坏块/组合视图不可用时立刻关闭点查并卸载视图。
+    // 后续冷查询不得把该状态当 miss；受控 rebuild 成功后恢复 loaded/v3。
+    void degrade_for_rebuild() noexcept;
     [[nodiscard]] bool point_query_enabled() const noexcept {
         return point_query_.load(std::memory_order_acquire);
     }
+    // S43-5：点查开关只代表读端允许查，不代表组合视图具备写权威能力。
+    // v1 run 没有 loc/bloom，任何 newest put 都无法安全裁决，必须先做
+    // 受控重建；读取仍可对 v2/v3 子集工作。
+    [[nodiscard]] bool write_probe_ready() const noexcept;
 
     // ---- S36-4：Level B 模式戳（BCOM v3）----
     // set_level_b：声明本写者的模式（Cask::open 在 load 之前调）。此后
@@ -180,6 +222,25 @@ public:
     }
     [[nodiscard]] bool manifest_level_b() const noexcept {
         return manifest_level_b_.load(std::memory_order_acquire);
+    }
+    // S43-2：v4 元数据迁移入口；nullopt = 盘上仍是 v1-v3 或未加载。
+    [[nodiscard]] const std::optional<OkiManifestMetadata>&
+    manifest_metadata() const noexcept {
+        return manifest_.metadata;
+    }
+    [[nodiscard]] const std::vector<OkiManifestFStats>&
+    manifest_fstats() const noexcept {
+        return manifest_.fstats;
+    }
+    // S43-3：streaming recovery 检查 run 版本/覆盖时需要的只读 manifest 面。
+    [[nodiscard]] const std::vector<OkiManifestEntry>&
+    manifest_runs() const noexcept {
+        return manifest_.runs;
+    }
+    [[nodiscard]] const std::vector<
+        std::pair<std::uint32_t, std::uint64_t>>&
+    manifest_data_wms() const noexcept {
+        return manifest_.data_wms;
     }
     // 降级戳：level_b 关而盘上戳开 → 立刻改写 manifest 清戳（Level A 写者
     // 将做无挂钩 merge，戳必须先失效——open 早期、任何 merge 之前调用）。

@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.21)
 # 版本单一真源（S12-7）：project(VERSION ...) 是唯一手写版本处。
 # 库 SOVERSION 与 C API bitcask_version_* 均从此派生，杜绝三处手工同步漂移。
-project(libbitcask VERSION 6.8.1 LANGUAGES CXX)
+project(libbitcask VERSION 6.9.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
 # ⚠️ 本文件（连同 tests/ 与 bench/ 的两份）一律用 `PROJECT_SOURCE_DIR` /
@@ -487,7 +487,7 @@ endfunction()
 bitcask_simd_tu(src/simd/crc32_sse42.cpp sse42)
 
 # ---------------------------------------------------------------------------
-# bitcask_format — codec for data file / hint file records.
+# bitcask_format — codec for data file records.
 # ---------------------------------------------------------------------------
 add_library(bitcask_format STATIC
     src/fileops/codec.cpp
@@ -538,7 +538,6 @@ target_link_libraries(bitcask_io PRIVATE bitcask_warnings bitcask_sanitizers)
 # ---------------------------------------------------------------------------
 add_library(bitcask_fileops STATIC
     src/fileops/data_file.cpp
-    src/fileops/hint_file.cpp
     src/fileops/oki_run.cpp
     src/fileops/oki_state.cpp
     src/fileops/scanner.cpp
@@ -551,9 +550,9 @@ target_link_libraries(bitcask_fileops
 )
 
 # ---------------------------------------------------------------------------
-# bitcask_keydir — in-memory keydir (KeyDir class for bitcask).
+# bitcask_index_authority — in-memory index authority (OKI runtime).
 # ---------------------------------------------------------------------------
-# ankerl::unordered_dense（单头 INTERFACE 库）：KeyDir 分片表用它替代
+# ankerl::unordered_dense（单头 INTERFACE 库）：索引权威分片表用它替代
 # std::unordered_map（开放寻址 + 稠密存储，消除每键节点 malloc + 指针追逐）。
 # header-only，EXCLUDE_FROM_ALL 不会引入测试/benchmark 目标。
 if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/unordered_dense/include/ankerl/unordered_dense.h")
@@ -568,16 +567,16 @@ add_subdirectory(third_party/unordered_dense EXCLUDE_FROM_ALL)
 # 链接语义仍由上面的 INTERFACE 目标（bitcask_docmap PUBLIC）承担。
 include_directories("${PROJECT_SOURCE_DIR}/third_party/unordered_dense/include")
 
-add_library(bitcask_keydir STATIC
-    src/keydir/keydir.cpp
-    src/keydir/keydir_registry.cpp
+add_library(bitcask_index_authority STATIC
+    src/fileops/index_authority.cpp
+    src/fileops/index_registry.cpp
     src/keydir/thread_limits.cpp   # 6.6.0：进程级线程数上限（registry 与 search_arena 共用）
 )
-target_include_directories(bitcask_keydir PUBLIC include)
-target_link_libraries(bitcask_keydir
+target_include_directories(bitcask_index_authority PUBLIC include)
+target_link_libraries(bitcask_index_authority
     PUBLIC  bitcask_fileops bitcask_io unordered_dense::unordered_dense
-    # S37-4：keydir_registry.cpp 包含 thread_pool.hpp（→ oneapi/tbb/*）。
-    # PRIVATE 即可——keydir 自身的公开头不暴露 TBB。同为「被 /usr/include 掩盖」类。
+    # S37-4：index_registry.cpp 包含 thread_pool.hpp（→ oneapi/tbb/*）。
+    # PRIVATE 即可——索引权威自身的公开头不暴露 TBB。同为「被 /usr/include 掩盖」类。
     PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb
 )
 
@@ -679,7 +678,7 @@ target_include_directories(bitcask_text_plugin PUBLIC include)
 target_link_libraries(bitcask_text_plugin
     PUBLIC  bitcask_docmap bitcask_bm25 bitcask_text bitcask_plugin_api
     PRIVATE bitcask_warnings bitcask_sanitizers TBB::tbb  # TBB：search_arena
-            bitcask_keydir  # 6.6.0：search_arena 读 thread_limits（在 keydir 库里）
+            bitcask_index_authority  # 6.6.0：search_arena 读 thread_limits（在 keydir 库里）
 )
 
 add_library(bitcask_vector_plugin STATIC
@@ -718,7 +717,7 @@ add_library(bitcask_merge STATIC
 )
 target_include_directories(bitcask_merge PUBLIC include)
 target_link_libraries(bitcask_merge
-    PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_plugin_api   # S18-7：merge 去搜索化（设计 §8）
+    PUBLIC  bitcask_index_authority bitcask_fileops bitcask_io bitcask_format bitcask_plugin_api   # S18-7：merge 去搜索化（设计 §8）
     PRIVATE bitcask_warnings bitcask_sanitizers
 )
 
@@ -740,7 +739,7 @@ target_include_directories(bitcask_cask PUBLIC include)
 # 后者直接 `#include <oneapi/tbb/concurrent_queue.h>`。任何 include 了 cask.hpp
 # 的下游（近乎全部测试与 c_api）都需要 TBB 的头路径。
 target_link_libraries(bitcask_cask
-    PUBLIC  bitcask_keydir bitcask_fileops bitcask_io bitcask_format bitcask_merge bitcask_hybrid  # S19-2：去 shim 依赖
+    PUBLIC  bitcask_index_authority bitcask_fileops bitcask_io bitcask_format bitcask_merge bitcask_hybrid  # S19-2：去 shim 依赖
             TBB::tbb
     PRIVATE bitcask_warnings bitcask_sanitizers
 )
@@ -859,7 +858,7 @@ if(BITCASK_PCH)
     set(_bitcask_pch_headers
         <algorithm> <cstdint> <expected> <memory> <optional>
         <span> <string> <string_view> <unordered_map> <vector>)
-    foreach(_t bitcask_cask bitcask_text_plugin bitcask_keydir bitcask_bm25 bitcask_text)
+    foreach(_t bitcask_cask bitcask_text_plugin bitcask_index_authority bitcask_bm25 bitcask_text)
         target_precompile_headers(${_t} PRIVATE ${_bitcask_pch_headers})
     endforeach()
 endif()
@@ -911,7 +910,7 @@ add_library(bitcask_static STATIC
     $<TARGET_OBJECTS:bitcask_format>
     $<TARGET_OBJECTS:bitcask_io>
     $<TARGET_OBJECTS:bitcask_fileops>
-    $<TARGET_OBJECTS:bitcask_keydir>
+    $<TARGET_OBJECTS:bitcask_index_authority>
     $<TARGET_OBJECTS:bitcask_docmap>
     $<TARGET_OBJECTS:bitcask_bm25>
     $<TARGET_OBJECTS:bitcask_vector>

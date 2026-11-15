@@ -1,0 +1,63 @@
+{
+  "context": {
+    "date": "2026-11-15T23:17:23+08:00",
+    "host_name": "Debian-VM01",
+    "executable": "./build-gcc-release/bench/bitcask_bench",
+    "num_cpus": 8,
+    "mhz_per_cpu": 2995,
+    "cpu_scaling_enabled": false,
+    "caches": [
+      {
+        "type": "Data",
+        "level": 1,
+        "size": 49152,
+        "num_sharing": 1
+      },
+      {
+        "type": "Instruction",
+        "level": 1,
+        "size": 32768,
+        "num_sharing": 1
+      },
+      {
+        "type": "Unified",
+        "level": 2,
+        "size": 1310720,
+        "num_sharing": 1
+      },
+      {
+        "type": "Unified",
+        "level": 3,
+        "size": 25165824,
+        "num_sharing": 8
+      }
+    ],
+    "load_avg": [1.3125,4.1001,6.88232],
+    "library_version": "v1.9.0",
+    "library_build_type": "release",
+    "json_schema_version": 1
+  },
+  "benchmarks": [
+    {
+      "name": "BM_Oki_MemProbe/100000",
+      "family_index": 0,
+      "per_family_instance_index": 0,
+      "run_name": "BM_Oki_MemProbe/100000",
+      "run_type": "iteration",
+      "repetitions": 1,
+      "repetition_index": 0,
+      "threads": 1,
+      "iterations": 44,
+      "real_time": 6.4278654158360126e+01,
+      "cpu_time": 6.4108964318181833e+01,
+      "time_unit": "ms",
+      "memdelta_MB": 8.0108642578125000e+00,
+      "memdelta_rows": 1.0000000000000000e+05,
+      "memdelta_rss_MB": 8.3476562500000000e+00,
+      "rebuild_peak_rss_MB": 1.8347656250000000e+01,
+      "run_B_per_key": 1.4361290000000000e+01,
+      "run_MB": 1.3695993423461914e+00,
+      "run_count": 1.0000000000000000e+00
+    }
+  ]
+}

@@ -10,6 +10,856 @@
 
 ---
 
+## 🔴 S43 · OKI-only：直接点查、去 hint、退役 KeyDir（2026-11-15 立项）
+
+> 来源：[`docs/design/oki-only-keydir-analysis-zh.md`](docs/design/oki-only-keydir-analysis-zh.md)、
+> [`docs/design/oki-run-open-verify.md`](docs/design/oki-run-open-verify.md)；
+> S43-0 基线见 [`docs/design/s43-okionly-baseline-zh.md`](docs/design/s43-okionly-baseline-zh.md)。
+> 决策基线：**OKI 成为唯一查找权威；`Cask::get(key)` 直接由 OKI 定位；
+> 停写并移除 `.hint`；退役内存 KeyDir / `kv.keydir.ckpt` 路径。**
+> 持久真相不变：**data 文件仍是唯一持久真相，OKI 是可重建索引**。
+> 硬约束：任何崩溃点都不允许静默丢活跃 key；`Cask::get` 不允许因索引损坏静默
+> 返回别的 key 的 value；旧库可打开并迁移；search/docmap/vec 水位语义不回退。
+> 验收标准：每项改动后 ctest 全绿 + 编译无新告警；涉及恢复/提交点的改动必须
+> 过 kill 点注入、CRC 损坏、unlink/merge 竞态用例；收尾过 ASan/TSan 与 benchmark gate。
+
+### ⚠️ 执行纪律
+
+**不能先物理删除 hint 或 KeyDir 再补 OKI 能力。** 顺序必须是：
+
+```text
+OKI 安全点查与恢复自洽
+→ BCOM v4 收敛全局元数据/提交点
+→ data-only recovery / merge / iterator 全部去 hint、去 KeyDir
+→ 停写 hint
+→ 最后删除 KeyDir 实现与旧 checkpoint
+```
+
+设计分析已指出：废 hint 会把廉价恢复保险换成 data 全量扫描；零缓存/零 KeyDir
+会让每次 put 付 OKI 点查成本。本 S43 接受该架构取舍，但必须先用 benchmark
+量化回退幅度，不能默认性能不回归。
+
+| # | 任务 | 状态 | 说明 |
+|---|---|---|---|
+| S43-0 | 基线、语义契约与故障注入底座 | ✅ done | 语义契约、调用面、性能基线与 K1-K15 注入底座已收口 |
+| S43-1 | OKI 点查安全加固 | ✅ done | key/ord 核对、BCOK v3、四类语义注入、运行期坏块受控重建、mixed 降级、benchmark 与全量回归已收口 |
+| S43-2 | BCOM v4：OKI 元数据提交点 | ✅ done | v4 codec、捕获/恢复、失败注入、v3 迁移、fstats/held row 对拍与全量回归已收口 |
+| S43-3 | data-only streaming recovery | ✅ done | 健康可信 Level B v4 从 data 字节水位流式重放 tail；缺失/越界/Level A 等显式 fallback；hint/BCKS 不入主路径 |
+| S43-4 | OKI-only `get(key)` 直查 | ✅ done | public get 定位直连 OkiState；hash warm-fill 双路径移除；坏索引显式报错/受控重建与全量回归已收口 |
+| S43-5 | OKI-only 写路径与 fstats | ✅ done | put/put_doc/batch 已切 OKI 写闸；group-commit 顺序、fstats parity 与均匀写性能 gate 已收口 |
+| S43-6 | OKI-only iterator/range | ✅ done | CaskIter/range 统一 OKI ReadView 归并；prefix seek、view pin、close/rebuild 安全与定向 sanitizer 已收口 |
+| S43-7 | OKI-driven merge | ✅ done | merge 选择/活性/迁移统一 OKI ReadView；输出 data-only、BCOM v4 候选元数据与崩溃顺序已定向收口 |
+| S43-8 | 停写并清理 hint | ✅ done | 停写、data-only recovery/merge/migrate、惰性清理与实现退役均已收口 |
+| S43-9 | 退役 KeyDir 与 BCKS | ✅ done | IndexAuthority/IndexRegistry、只读内存重建、崩溃尾洞检测、OKI-only 备份与 grep 清理已收口 |
+| S43-10 | 全量验证、迁移与 rollout | ✅ done | rollout gate、迁移/损坏矩阵、ASan/TSan/Werror、benchmark 报告与发布账已闭合 |
+
+### 🔴 S43-0 — 基线、语义契约与故障注入底座（先行）
+
+工作面：`docs/design/*`、`TASK.md`、`tests/`、`bench/`。
+
+1. 冻结外部语义并写成守门用例：
+   - `put` / overwrite / remove / reinsert 的 `kAlreadyExists` 与 LWW 语义；
+   - atomic batch 的全成全败语义；
+   - TTL / conditional remove / merge relocation 语义；
+   - iterator/range 的快照一致性与并发写可见性边界；
+   - search/docmap/vec 的 `keydir_covered ≤ search_covered` 不变量。
+2. 生成当前实现基线：
+   - 冷/热开库时间与 RSS；
+   - 点查 p50/p99、写吞吐、range 吞吐；
+   - merge 吞吐、磁盘占用、OKI compaction 写放大；
+   - 10M/100M 规模 recovery 时间与峰值 RSS。
+3. 量化调用面：
+   - `.hint` 的写、finalize、fold、merge、迁移路径；
+   - `KeyDir` 的 put/remove/get/locate/fstats/ord/file_id/iterator/checkpoint/registry 消费点；
+   - 不可直接删除的 public/C API 面。
+4. 搭建 kill 注入底座，至少覆盖：
+   - data append 后、OKI append 前；
+   - OKI memdelta flush 中 run fsync 前/后；
+   - BCOM 提交前/后、memdelta 截断前/后；
+   - merge unlink data 前/后、relocation append 前/后；
+   - checkpoint / manifest 原子替换失败点。
+
+- **验收**：基线报告入库；注入框架能稳定复现“keydir snapshot 已写、OKI flush 未写”
+  这类当前缺口；所有新守门用例在改动前明确标注预期行为。
+
+#### ✅ S43-0 落地记录（2026-11-15，第一批）
+
+- 新增基线与契约文档：`docs/design/s43-okionly-baseline-zh.md`。
+  - 当前调用面计数：hint 相关 24 文件 / 146 行，生产路径 94 行；
+    KeyDir 相关 57 文件 / 631 行；cask 内 `keydir_` 172 行。
+  - 冻结点查 lifecycle、OKI/public get 对齐、atomic batch、record key 核对契约。
+  - 列出 K1-K15 故障注入矩阵与待回填性能基线。
+- 新增 `bitcask_oki_only_contract_test`：
+  - 点查 missing / put / overwrite / remove / reinsert / reopen；
+  - 删除 `.hint` 后重开仍由 data 恢复最终状态；
+  - Level B 下 `OkiState::locate` 与 public get 的存在性 / ord 对齐；
+  - atomic batch 批后状态在 data-only reopen 后保持。
+- `S43-0` 随 S43-10 收口完成：rollout gate 补齐随机模型、迁移/损坏
+  形态与 K1-K15 窗口；性能与 rollout 结果转记
+  `docs/design/s43-okionly-rollout-report-zh.md`。
+
+- **验证**：`build-gcc-release` 下新增目标编译通过；
+  `OkiOnlyContractTest` 3/3 通过；相关 `OkiLocateTest` 12/12 与
+  `AtomicBatchTest` 7/7 回归通过。
+
+### ✅ S43-1 — OKI 点查安全加固
+
+工作面：`src/cask/cask.cpp`、`src/fileops/oki_run.cpp`、`include/bitcask/oki_run.hpp`、`tests/oki_*_test.cpp`。
+
+1. 先落 D2 §5，作为 OKI-only 的前置条件：
+   - `Cask::get` 读回 data record 后，比较 record 内 key 与请求 key；
+   - 不匹配时返回显式索引损坏错误，禁止返回 value；
+   - Level B/OKI-only 模式下触发该 run 降级与重建流程；
+   - 确认 mmap / zero-copy 读路径同样能拿到 key 做 memcmp。
+2. 按 D2 §3 先量化开库整文件 CRC：
+   - Level B 10M / 100M，冷缓存与热缓存分别计时；
+   - 记录 run 总大小、盘类型、开库总耗时中 CRC/read 的占比。
+3. 若校验占比显著，实施 run v3：
+   - 稀疏索引 entry 追加 block CRC；
+   - 开库只校验 header / trailer / 索引 / bloom 小区域；
+   - `OkiBlockCache` loader 与直读路径首次读块时校验；
+   - 运行期坏块降级为弃用 OKI 并重建；
+   - v1/v2 读端保留，manifest 条目区分 v3。
+4. 若占比不显著，保持 eager CRC，但 key 核对仍必须落地。
+
+- **验收**：翻转 run 块中的 loc/key/tomb/ord 位后，系统不得静默错值；
+  v1/v2/v3 mixed manifest 与旧二进制降级用例通过；开库耗时报告归档。
+
+#### 🔄 S43-1 落地记录（2026-11-15，第一批）
+
+- D2 §5：`Cask::read_doc` 在 mmap 与 pread 两条路径都核对 record 内 key；
+  定位成功但 key 不同时返回新增 `CaskError::kIndexCorrupt`
+  （C API `BITCASK_ERR_INDEX_CORRUPT = 16`，只追加枚举尾部），绝不返回错值。
+- D2 §3：10M/100M BCOK v2 真实 run 开库量化已归档到
+  `docs/design/s43-okionly-baseline-zh.md`；100M run 热开约 609ms、
+  fadvise 冷开约 2.5s，判定开销显著。
+- 新增契约用例：强制 Level B hash 缓存逐出后，将 `a` 的 OKI loc 指向
+  `z` 的完好 data record；public get 必须返回 `kIndexCorrupt`。
+- BCOK v3 第一批已落地：sparse index per-block CRC、v3 metadata-only
+  open、块缓存/直读首读 CRC、`OkiState` 新写路径输出 v3、mixed
+  `format_ver=1/2/3` manifest 读端。`Cask::read_doc` 修正 warm-fill 时机，
+  record key 核对通过前不回填 KeyDir。
+
+#### 🔄 S43-1 落地记录（2026-11-15，第二批）
+
+- `KeyDir::locate_status` 将冷侧 `kUnavailable` 与普通 miss 分离；
+  `Cask::read_doc` 不再把坏块/IO/不可定位折叠成 NotFound。
+- 首次冷路径不可用时，`Cask` 在 KeyDir 写者屏障内执行 data-only
+  受控重建：重新 fold data + 原子批 staging，产出单个 BCOK v3 run；
+  成功后重试触发读，失败显式返回 `kIndexCorrupt`。重建期间其他读者
+  同样显式失败，不做静默错值/静默 miss。
+- 新增 `RuntimeBadBlockTriggersControlledOkiRebuild`：v3 块 CRC 破坏后
+  触发重建，目标 key 可读，旧 run 被清理且新 gen 生效。
+
+**S43-1 未收口项**：loc/key/tomb/ord 四类翻转注入矩阵；v1/v2/v3 mixed
+run 与旧二进制降级用例；v3 开库/首读 benchmark 回填；全库 C API 回归。
+运行期 rebuild 的 RSS/停写窗口上界交由 S43-3 streaming recovery 收敛。
+
+#### 🔄 S43-1 落地记录（2026-11-15，第三批）
+
+- `Cask::read_doc` 在 mmap 与 pread 路径同时核对 record ord：OKI loc 命中
+  完好记录但 LSN 不一致时显式返回 `kIndexCorrupt`，避免错误 ord 进入
+  warm fill 或后续 merge 裁决。
+- 新增结构合法 v3 注入用例：重写 run 并同步重算 block/metadata CRC，
+  key 改写、ord 改写均显式失败；tomb 置位不返回旧 value。
+- 新增 Cask 级 mixed `format_ver=1/2/3` 降级用例：最高 gen 的 v1 行使
+  Level B locate 明确不可用，public get 触发受控重建并收敛到单 v3 run。
+- 新增未来 BCOK version 降级用例：旧读端拒收后从 data 重建，不猜测
+  未知格式语义。
+
+BCOK v3 benchmark 已回填：100M 元数据冷开约 413.7 ms、第二次热开约
+101.9 ms；10k 均匀 distinct key 首读 89.8 ms（p99 约 23.7 µs）。见
+`docs/design/s43-okionly-baseline-zh.md` §3.1.1。
+
+最终验证：`build-gcc-release` 全量 ctest 834/834 通过；两个 RSS probe
+维持 disabled 未运行。C API 目标包含在该全量回归中。运行期 rebuild 的
+RSS/停写窗口上界交由 S43-3 streaming recovery 收敛。
+
+### 🔴 S43-2 — BCOM v4：OKI 元数据提交点
+
+工作面：`include/bitcask/oki_run.hpp`、`src/fileops/oki_run.cpp`、`src/fileops/oki_state.cpp`、
+`src/cask/cask.cpp`、`src/cask/cask_recovery.cpp`、`tests/oki_*_test.cpp`、`tests/checkpoint_recovery_test.cpp`。
+
+1. 新增 BCOM v4 元数据段，至少包含：
+   - `next_ord`；
+   - `biggest_file_id`；
+   - `next_file_id`（若与 biggest 语义分离则显式建模）；
+   - active key 数、live bytes、时间戳边界；
+   - per-file fstats：`file_id/live_keys/total_keys/live_bytes/total_bytes/oldest/newest/pending_delete`；
+   - 保留位与版本化 TLV/定长段，避免后续继续 flag-day。
+2. v4 仍是唯一 commit point：
+   - run fsync → Reader 校验 → data durable watermark 分拣 → 原子写 manifest → memdelta 截断；
+   - manifest 提交失败必须能回退到上一份状态并保留 delta/tail；
+   - 孤儿 run、半截 spill、旧 BCKS 清理策略写成显式测试。
+3. 兼容迁移：
+   - 读 v3：先加载 runs，再通过 data/hint fold 或受控 rebuild 计算 v4 元数据；
+   - 下一次成功 flush/compaction/rebuild 时写 v4；
+   - Level A / Level B 模式戳进入 v4 flags，规则不得弱化。
+4. `next_ord`、fstats 与 manifest 提交的一致性：
+   - 不允许 run 未固化但水位/统计超前；
+   - held row 不推进 cover；
+   - 同 key 同 ord 的 relocation 用现有 `(ord, gen/到达序)` 规则裁决。
+5. 收敛 checkpoint 顺序：
+   - keydir snapshot 不再作为 OKI flush 的前置提交点；
+   - search checkpoint 继续独立，但其依赖的 keydir watermark 改由 OKI 提供。
+
+- **验收**：v3/v4 双读、v4 往返、CRC/未知 flags/未知版本 fail-fast 全绿；
+  任意 manifest 提交点崩溃后重开不丢活跃 key；v4 元数据与全量重建结果对拍一致。
+
+#### 🔄 S43-2 落地记录（2026-11-15，第一批）
+
+- 新增 BCOM v4 定长元数据段：56B 全局（`next_ord`、`biggest_file_id`、
+  `next_file_id`、active key 数、live bytes、时间边界、reserved）+
+  64B per-file fstats（含 `pending_delete` 与 `expiration_epoch`）。
+  manifest 布局为 header/counts → global → fstats[] → run entries →
+  wm → CRC；写端仅在真实快照存在时升 v4，v1-v3 读端路径保留，
+  v3 不伪造空元数据。
+- `KeyDir` 新增提交快照捕获/应用。捕获位于写者屏障内；活跃 fold
+  拒绝提交 v4。应用只用于 BCKS 快照确实接受后的 open 线程，覆盖
+  逻辑标量与 fstats；无 BCKS 的全量 data fold 仍从空表重建计数，
+  避免 fold 挂钩双记。
+- `OkiState::flush/rebuild` 接受 caller 快照；run fsync/Reader 校验后、
+  manifest 发布前做水位与结构门。空 memdelta / 全持留时也支持
+  metadata-only 原子提交，保证 Level A 和 v3→v4 首迁移不被“无 run”
+  静默跳过。compaction 保留上一份 v4 元数据。
+- Cask close/checkpoint、merge unlink 前和受控/开库 rebuild 在提交前
+  捕获 KeyDir 快照并传给 OKI；v4 + BCKS open 先恢复提交点标量再重放
+  tail。
+- 新增契约测试：v4 快照跨 hint-only reopen、manifest 全损后 data/BCKS
+  rebuild 与上一提交点 metadata 对拍、旧 run 清理；BCOM v4 codec
+  未知 flags、reserved、fstats pad fail-fast。
+
+**S43-2 未收口项**：manifest 原子替换失败的注入矩阵；v3 目录强制
+迁移到 v4 的覆盖矩阵；merge/TTL fstats 精确对拍；孤儿 run 与半截
+spill 的崩溃点专项；next_ord 与 held row 的组合注入。
+
+#### ✅ S43-2 落地记录（2026-11-15，第二批 / 收口）
+
+- manifest 原子发布失败：新增 K4 可复现用例（manifest tmp 被目录阻塞）。
+  run 已 durable 但发布失败时，memdelta、上一份 v4 metadata、双 key
+  可读性都保持；移除阻塞后重试使用同一 delta 成功提交，旧状态不被回退。
+- v3→v4 迁移：显式把健康 v4 目录降写为 v3（保留 runs/wm，清空 metadata/
+  fstats）。v3 open 不伪造空元数据；下一次真实 flush 使用 KeyDir 当前
+  派生值发布 v4，重启后 metadata 稳定。
+- merge/TTL fstats：merge 成功后对拍 pre-unlink flush、trim 旧输入和
+  最终 snapshot 三个阶段，旧 input fstats 必须消失，output/active fstats
+  与 KeyDir 逐字段一致；到期 key 清理后不复活。`pending_delete` 显式
+  锁住 `expiration_epoch` 派生布尔语义，epoch 推进后提交必须发布 true。
+- `next_ord` × held row：caller 持久水位不足时，行留在 memdelta，
+  `wm/run cover` 不推进；同一提交点可发布真实 next_ord/active/fstats。
+  数据越过持久水位后，下一次 flush 才进入 run，metadata 不回退。
+- 孤儿/半截 run：manifest 全损重建继续对拍上一提交点 metadata 并清理
+  孤儿 run；新增半截 `kv.oki.spill-*` 残件断言，rebuild 后必须清光。
+
+收口回归：85 项 OKI/manifest/recovery/LevelB/KeyDir 定向测试全绿；
+`build-gcc-release` 全量 ctest 841/841 通过；ctest 总账 843 项，另两个
+RSS probe 维持 disabled 未运行。
+
+### ✅ S43-3 — data-only streaming recovery
+
+工作面：`src/cask/cask_recovery.cpp`、`src/fileops/data_file.cpp`、`src/fileops/scanner.cpp`、
+`src/fileops/oki_state.cpp`、`tests/crash_recovery_test.cpp`、`tests/oki_recovery_test.cpp`。
+
+1. 恢复主路径改为：
+   ```text
+   读 last-good BCOM v4
+   → 打开有效 runs
+   → 恢复 next_ord / fstats / file_id 元数据
+   → 从 wm 对应 data 位置起流式 fold(data)
+   → tail row 进入 OKI memdelta
+   → 超阈值时继续 flush 成 run
+   ```
+2. 禁止在主路径遍历内存 KeyDir 或依赖 hint fold。
+3. 最坏路径保留为一级公民：
+   - manifest 全损 / CRC 失败 / 模式戳不一致 / 覆盖缺口；
+   - 全量扫 data → 外排 → 单 run rebuild；
+   - 不因 hint 缺失而进入未定义状态。
+4. memdelta / recovery 内存上界：
+   - 恢复期间保持 bounded RSS；
+   - 超过 `kFlushRowLimit` / `kFlushByteLimit` 时可 flush；
+   - 恢复 flush 与普通 flush 使用同一提交协议。
+5. data tail 解析必须处理：
+   - torn tail / CRC 坏记录；
+   - 墓碑复活门；
+   - 并行 fold 到达乱序时按 ord 裁决；
+   - search 层需要 value 时的恢复路径。
+6. `fold(data)` 不读 value 的优化若短期不可行，先接受恢复成本回退，并把
+   开库耗时作为 S43-10 的明确 gate 项；不得用跳过 CRC/校验换速度。
+
+- **验收**：manifest 健康时 recovery RSS 与 tail 大小相关，而不是与全库 key 数相关；
+  hint 全部删除后 recovery 全绿；manifest 损坏 fallback 能重建与原状态等价的 OKI。
+
+#### ✅ S43-3 落地记录（2026-11-15）
+
+- BCOM v4 新增 per-file `data_wms`（`file_id → committed byte EOF`），作为
+  data tail 的物理起跳点。旧 v4 缺失水位时退化为从 0 扫描，但仍按
+  `ord >= wm` 过滤；读端要求 file_id 升序去重。
+- 新增 `Cask::try_data_only_recovery()`：先应用 v4 标量/fstats，再按
+  file_id 串行流式 fold data tail。tail 进 OKI memdelta；阈值触发时走
+  普通 flush 的 run fsync → Reader 校验 → manifest 原子发布协议。主路径
+  不读 hint、不装 BCKS、不构建全量 KeyDir shard。
+- `KeyDir::account_recovery_row()` 用 OKI 当前权威裁决新 key/覆盖/墓碑，
+  只推进全局标量与 fstats，不插入全量 hash table。
+- data-only 主路径显式要求健康 BCOM v4、可信 `level_b` 戳、非 v1 run、
+  `next_ord >= wm`、活跃 key 有 run 覆盖、`data_wm <= file_size`。任何
+  不满足都是显式 fallback，不“顺手升级”或吞掉提交尾。search 与
+  merge_only 保持旧恢复路径。Level A 必须走传统路径：其 merge
+  relocation 不在线维护 OKI，直接采信旧 run loc 会指向已退休文件。
+- 新增崩溃子进程测试：删除 BCKS/hint 后，3000 个已提交 key 只留在 OKI
+  runs，崩溃 tail 重放前后 KeyDir 物理驻留均为 0，覆盖/墓碑逻辑计数
+  正确；另锁住 `data_wm > EOF` 必须退回 data full rebuild。BCOM v4 data
+  水位 roundtrip 与保留位/pad fail-fast 已入 codec 测试。
+
+收口回归：S43/OKI/LevelB/KeyDir/CrashRecovery 定向 97/97 通过；
+`build-gcc-release` 全量 ctest 843/843 通过；`S30RssProbe` 和
+`S40KeyRssProbe` 仍为 disabled 未运行。3000 已提交 key + 小 tail 的物理
+驻留行为测试已锁住“不随全库 key 数装表”；进程 RSS 绝对值继续留待
+disabled probe / S43-10 benchmark gate 量化。
+
+### 🔴 S43-4 — OKI-only `get(key)` 直查
+
+工作面：`include/bitcask/cask.hpp`、`src/cask/cask.cpp`、`include/bitcask/oki_state.hpp`、
+`src/fileops/oki_state.cpp`、`src/cask/cask_iter.cpp`、`src/cask/cask_range_iter.cpp`。
+
+1. `Cask::get/read_doc/read_mmap` 的定位入口改为 `OkiState::locate(key)`：
+   - memdelta 命中优先；
+   - runs 按 gen 降序，首个命中为权威；
+   - tombstone 返回 NotFound；
+   - TTL 过期按现有语义返回 NotFound 或触发条件删除路径；
+   - `kUnavailable` 只能表示索引不可用，不得当 miss。
+2. 删除 KeyDir warm-fill / hash-first / OKI cold-fill 的双路径。
+3. 读到 data record 后执行 S43-1 的 key 核对、record CRC、TTL 与 merge retry。
+4. 并发语义：
+   - 获取 runs snapshot + memdelta 可见状态；
+   - flush / compaction 期间旧 run 由 shared_ptr 保活；
+   - merge relocation 后旧 loc 读失败必须用最新 OKI 视图重试；
+   - 不再依赖 KeyDir epoch/limbo 保证槽位稳定。
+5. 为 OKI-only 暴露最小内部接口：
+   - `locate(key)`；
+   - `make_read_view()` / pinned snapshot；
+   - 状态与错误分类：`kMiss/kHit/kUnavailable/kCorrupt/kRebuilding`。
+6. 影子对拍改为迁移期工具：
+   - 先双读 KeyDir 与 OKI 并统计 drift；
+   - drift 归零后才切默认路径；
+   - 切换后保留测试专用对拍，不在生产热路径执行。
+
+- **验收**：随机写删/覆盖/merge 并发下 `get(key)` 与 reference model 全等；
+  OKI 损坏时可见报错或重建，不允许错值；读路径不再引用 KeyDir hash。
+
+### ✅ S43-5 — OKI-only 写路径与 fstats
+
+#### ✅ S43-4 落地记录（2026-11-15）
+
+- `Cask::read_doc` 定位入口改为 `OkiState::locate`：memdelta 先行，runs
+  按 gen 降序裁决；miss/tombstone/无 loc 返回 NotFound，TTL 语义保持。
+  mmap 与 pread 路径继续执行 S43-1 的 key/ord 核对和 record CRC。
+- public get 不再查 KeyDir hash，也不再执行 warm-fill / OKI cold-fill；
+  读成功后不回填旧缓存。merge relocation 后的重试直接重查 OKI 最新
+  视图，不再依赖 KeyDir epoch/limbo。
+- `kUnavailable` 保持显式语义：可写 public get 首次遇到旧 Level A/坏
+  索引时触发一次受控 data rebuild；重建中其他读者收到
+  `kIndexCorrupt`。损坏 run、语义 loc 注入与未来 run 版本降级用例继续
+  保证不返回错值。
+- 迁移期 KeyDir→OKI 影子对拍仍保留为 debug/测试工具；生产 release
+  热路径已不再双读。Level B 的旧冷命中/warm-fill 用例更新为锁定“冷读
+  正常、缓存不回填”的 S43-4 契约；range 并发用例随后通过 S43-5 可用性
+  闸完成旧 Level A 目录的一次性懒迁移。
+
+收口回归：S43/OKI/LevelB/KeyDir/CrashRecovery/Range 定向 58/58 通过；
+`build-gcc-release` 全量 ctest 843/843 通过（两个 RSS probe 保持
+disabled）。读路径不再引用 KeyDir hash。
+
+#### 🔄 S43-5 落地记录（2026-11-15，第一批）
+
+- `OkiState` 增加 `probe_for_write` 与 `apply_put/apply_remove/
+  apply_conditional_remove/apply_relocation` 写权威门面。probe 只返回
+  loc/ord/CAS 裁决信息；数据仍先落盘，apply 不承担 CAS，探测与应用必须
+  在同一把写序闸门内完成。
+- `Cask::remove` 切到 `ensure_oki_for_write`；tombstone 影子 `file_id`
+  改由 OKI probe 提供，OKI 不可用时显式报 `kIndexCorrupt`，不折叠成
+  miss。
+- merge/TTL 的 `KeyDir::conditional_remove` 先做 OKI probe；OKI 命中时
+  继续用 `ExpectedLoc` 进 `remove_impl`，保证 hash/fstats/OKI 三方一致。
+  哈希条目被逐出而 OKI 明确 live/tomb 时，`remove_impl` 增加权威裁决
+  分支。
+- 迁移期 read fallback：可写 public get 首次访问旧 Level A 时受控重建；
+  RO reader 在“无 Level B 戳且点查未启用”的旧目录下保留显式 KeyDir
+  fallback。`Cask::make_range_iter` 对旧 Level A/运行期降级复用同一条
+  受控重建闸，并发读者等待新视图而非报“没有索引”。
+- 新增 `OkiOnlyContractTest.RemoveShadowFileIdComesFromOkiProbe`，锁定
+  v2 tombstone 影子文件号必须来自 OKI probe。
+
+**S43-5 未收口项**：put/put_doc/atomic batch 仍走旧 KeyDir 权威；
+batch key 去重/排序与单次 apply 未实现；new/overwrite/delete/relocation/
+TTL 的 per-file fstats 精确对拍、group-commit 顺序与均匀写 locate 开销
+尚未收口。
+
+本批回归：`build-gcc-release` 全量 ctest 844/844 通过（两个 RSS probe
+保持 disabled）。
+
+#### 🔄 S43-5 落地记录（2026-11-15，第二批）
+
+- `Cask::put`、`put_doc`、`put_batch`、`put_batch_atomic` 与 `remove`
+  统一先过 `ensure_oki_for_write()`。写闸检查 `write_probe_ready()`，
+  等待共享受控重建窗口，并保证同一批数据先提交、OKI 后可见。
+- 运行期 newest put 在 `KeyDir::put_probe` 内用 OKI 做权威裁决；
+  `kIndexUnavailable` 显式映射为 `kIndexCorrupt`，绝不折叠成 miss/new。
+  `put_insert` / `put_overwrite` 按该 probe 区分逻辑 new/overwrite，并
+  用 OKI prior loc 做 per-file fstats 退账/入账。
+- atomic batch 按 key 去重：物理 records/ords 全保留，但只把每个 key
+  的最终 op 应用到 KeyDir/OKI/index/fstats；最终 op 按字典序应用后，
+  index task 再按 ord 重排。最终 remove 的 v2 tombstone 影子 file_id
+  改由 OKI prior loc 提供，中间 remove 保持 v0。
+- 新增 `AtomicBatchDuplicateKeysApplyOnlyFinalOp` 与
+  `PutAndProbeFstatsParityAcrossFiles`，分别锁定 batch 最终态和跨文件
+  new/overwrite 的 fstats 对拍；mixed v1/v2/v3 断言移到首个 filler put
+  前，反映“可写 put 允许触发受控重建”的契约。
+- 影子对拍增加“冷侧 ord 更新”容忍走廊：旧哈希子集不得阻断公共读的
+  OKI/data key/ord 损坏裁决；同时修复 LevelB data-only 用例中临时
+  string 生命周期造成的 stack-use-after-scope。
+
+本批回归：`build-asan` 定向 192/192 通过；`build-tsan` 并发/写闸定向
+38/38 通过；`build-gcc-release` 配置 848 项、运行 846/846 通过（两个
+RSS probe 保持 disabled）。S43-5 仍不关闭：group-commit 顺序覆盖、
+merge/TTL fstats 精度确认与均匀写 locate 开销量化待做。
+
+#### ✅ S43-5 落地记录（2026-11-15，第三批 / 收口）
+
+- 新增 `GroupCommitPreservesOrdAndMemdeltaOrder`：8 线程 × 180 个互斥
+  key、`sync_every_n=1` 的 group-commit 下，锁定 queue 分派序 → ord
+  序 → data 物理追加序一致；重开后逐 key 校验 OKI live row 的 ord
+  与 public get 返回值。OKI 扫描按 key 排序输出，因此只断言同 key
+  ord 一致，不断言全局行序。
+- 均匀覆盖写 gate 落地双 keyspace：`BM_Cask_Put_Overwrite` 参数化为
+  1024 与 100000。1024 热覆盖中位延迟 1577 ns（约 635.5k puts/s）；
+  100000 稳态 run 覆盖中位延迟 2242 ns（约 447.0k puts/s）。隔离的
+  `BM_Cask_WriteProbe_Uniform/100000` 中位探测 2763 ns（约 362k
+  probes/s，hit_ratio=1）。因此每 put 一次 run 态 OKI probe 是已量化
+  的架构成本，不构成静默降级理由。
+- merge/TTL 收口用
+  `OkiOnlyContractTest.MergeAndTtlFstatsMatchManifestAfterTrim`
+  定向复验，trim 后 manifest per-file fstats 与期望状态一致。
+- 基准与测试目标 clean rebuild 无新 warning；ASan 定向复验
+  group-commit 与 merge/TTL 2/2 通过；`build-gcc-release` 全量 ctest
+  配置 849 项、运行 847/847 通过（两个 RSS probe 保持 disabled）。
+
+工作面：`include/bitcask/oki_state.hpp`、`src/fileops/oki_state.cpp`、
+`src/cask/cask.cpp`、`src/cask/cask_internal.hpp`、`tests/atomic_batch_*_test.cpp`、`tests/txn_test.cpp`。
+
+1. 建立写权威服务（可先放在 `OkiState` 或新的 `OkiIndex` 门面）：
+   - `put(key, loc, tstamp, ord, expected_loc?)`；
+   - `remove(key, tstamp, ord)`；
+   - `conditional_remove(...)`；
+   - `append_update(...)` 供 merge relocation 绕过水位门；
+   - atomic batch 的一次性 apply。
+2. 写前存在性/CAS 判定改走 OKI locate：
+   - 保持当前 `kAlreadyExists` 外部语义；
+   - 同 batch 内先做 key 去重/排序，减少重复点查；
+   - memdelta 辅助哈希作为写路径热缓存；
+   - 禁止把“不存在”误当 `kUnavailable`。
+3. 精确维护 per-file fstats：
+   - logical new / overwrite / delete 分别入账；
+   - relocation 减旧 file、加新 file；
+   - TTL tombstone 正确扣旧 file；
+   - merge 后 trim 被删除 file；
+   - manifest 提交时的 fstats 与内存状态一致。
+4. 提交顺序保持“data 是真相”：
+   - data append/commit 先于 OKI 可见性；
+   - OKI append 失败不得伪装成功；
+   - group commit / parallel batch 的 ord 顺序、写锁与 memdelta 到达序不变量重写并测试。
+5. flush 阈值与恢复窗口重新调参：
+   - 行数/字节上限按目标 recovery 时间反推；
+   - held row 不推进 wm；
+   - active data sync 失败时不提交引用未持久字节的 run。
+6. 性能记录：
+   -均匀写场景必须量化每次 locate 的开销；
+   -如 gate 不通过，只能以显式配置/后续设计提案引入延迟记账或近似语义，不得静默改变 API。
+
+- **验收**：put/remove/batch/TTL/merge 后 fstats 与逐文件扫描对拍一致；
+  group commit 并发写无 ord 丢失/错序；写路径不再引用 KeyDir 分片表。
+
+### ✅ S43-6 — OKI-only iterator/range
+
+工作面：`include/bitcask/oki_state.hpp`、`src/fileops/oki_state.cpp`、
+`src/cask/cask_iter.cpp`、`src/cask/cask_range_iter.cpp`、`tests/oki_range_test.cpp`。
+
+1. iterator 改为标准归并视图：
+   ```text
+   pinned ReadView = runs[] + memdelta sorted view
+   按 key 升序 k-way merge
+   同 key 取 max(ord, gen/到达序)
+   tombstone 终止该 key 或按 include_tombstones 语义输出
+   ```
+2. 快照一致性：
+   - iterator 创建时 pin runs 集合与 memdelta sorted view；
+   - compaction/rebuild 不得 unlink 在途 run 语义；
+   - flush 后新写入是否可见遵循现有 iterator 契约，并在测试中显式锁定。
+3. seek/range：
+   - prefix/range 直接在有序结构上 seek；
+   - bloom 只服务点查，不作为 range 剪枝依据；
+   - v1/v2/v3 mixed 时按能力显式降级或重建，不静默漏 key。
+4. 值读取：
+   - iterator 只保存定位，不缓存 value；
+   - `next()` 取值走与 `get` 相同的 key 核对与 retry；
+   - 迭代期间 relocation/merge 能收敛到最新位置。
+5. 删除依赖：
+   - 移除 `KeyDir::IterHandle`、`ColdIter`、pending hash、epoch freeze 的调用面；
+   - 多 iterator 并发与 close 竞态改由 OKI run/view 引用计数兜住。
+
+- **验收**：并发写、flush、compaction、close 下 iterator 无漏 key/重复 key/UAF；
+  range 与 brute-force scan 对拍全等；TSan/ASan 全绿。
+
+#### ✅ S43-6 落地记录（2026-11-15）
+
+- `CaskIter` 弃用 `KeyDir::IterHandle` / `ColdIter` / pending hash / epoch
+  freeze 路径：`start()` 捕获 `OkiState::ReadView`，runs 共享 Reader 与
+  memdelta 不可变快照由视图自身续命。历史 `StartIterResult` 仍对外保留
+  以维持 ABI，成功路径恒 `kOk`；pending freshness 参数不再驱动哈希冻结。
+- fold 归并统一 key 升序，同 key 取 `max(ord)` 且等 ord 时 memdelta /
+  更高 gen 胜；墓碑在归并层抵消，`see_tombstones=true` 时按视图行合成
+  tombstone entry。prefix 先在 run/delta 有序结构上 seek，再越过前缀截断，
+  不再全表过滤。
+- value 读取只保存定位，按 S43-1 契约核对 record key 与 ord；并发
+  merge relocation 造成旧 loc 缺失时重查最新 OKI 并重试一次，绝不折叠成
+  静默漏 key。视图存活跨 `close()`；release 只释放自身 runs/文件句柄。
+- `CaskRangeIter` 归并同样收敛到 `(ord, 来源序)` 胜出格，移除 KeyDir
+  pin；public get 继续承担 key/ord 核对与 merge 窗口重试。
+- 新增 `FoldIterPinsOkiViewAcrossWritesAndFlush`：迭代创建后并发覆盖、
+  删除、新增并 checkpoint，锁定在途 fold 仍输出创建时视图且无重复 key。
+
+验证：GCC release 目标 clean rebuild 无新 warning；range/CaskIter/C API/
+merge/close 相关定向 172/172 通过；ASan 同口径 172/172 通过；TSan
+range/LevelB/contract/crash/merge 151/151 通过；GCC release 全量
+850 配置、848/848 运行通过（两个 RSS probe 维持 disabled）。
+
+### ✅ S43-7 — OKI-driven merge
+
+工作面：`src/merge/merger.cpp`、`src/merge/merge_policy.cpp`、
+`src/cask/cask.cpp`、`include/bitcask/merger.hpp`、`tests/merge_*_test.cpp`。
+
+1. 第一步先完成 no-hint 正确性：
+   - 输入枚举改 `fold(data)`；
+   - 活性判断改 `OkiState::locate`；
+   - relocation 直接 append_update 到 OKI；
+   - 输出不再写/finalize/link/copy hint；
+   - unlink 只处理 `.data`。
+2. 第二步实现 sort-merge join：
+   - OKI runs + memdelta 按 key 有序；
+   - data 输入若非 key 序，用外排或按 file/offset 序 + OKI 定位筛选；
+   - 顺序游标替代逐 record 随机 locate；
+   - join 期间 pin 一致性 runs/memdelta 视图；
+   - 新写入行按 ord 裁决，不得被旧 relocation 覆盖。
+3. merge 候选选择依赖 v4 per-file fstats：
+   - dead ratio、live bytes、total bytes 不再从被删除的 KeyDir fstats 获取；
+   - manifest 元数据落后时允许保守不合并或先收敛元数据。
+4. 崩溃窗口：
+   - output data fsync → OKI relocation 提交 → 旧 data unlink 的顺序固定；
+   - 任意点崩溃后重开可用 tail/fallback 修复；
+   - 绝不允许 OKI 指向已 unlink 且无法恢复的 data。
+5. 限速与 foreground 隔离：
+   - OKI compaction / merge IO 不无限抢占前台 fsync；
+   - 至少提供诊断指标，是否做 token bucket 由 gate 决定。
+
+- **验收**：merge 后 get/range/fstats 与 pre-merge reference model 等价；
+  unlink 前后 kill 注入均可恢复；merge 吞吐与写 P99 记录到 gate 报告。
+
+#### ✅ S43-7 落地记录（2026-11-15）
+
+- `run_merge` 全程 pin 一个 `OkiState::ReadView`，由 OKI runs 与不可变
+  memdelta 快照参与候选裁决；不逐 record 扫 data，也不调用
+  `KeyDir::locate` 判断活性。归并仍按 key 升序进行，同 key 取
+  `max(ord, 来源序)`：runs 按 gen 升序，memdelta 为最高来源；墓碑在
+  裁决层抵消 live 行。只有权威 live 行且 `loc.file_id` 属于输入集时，
+  才按精确 `RowLoc` 读源记录。
+- 源记录回读强制核对 key、ord、timestamp、total size 与 `kDoc` 类型；
+  不匹配立即失败，避免把并发迁移后的旧位置误写成新位置。重定位继续
+  通过 `KeyDir::put(..., newest_put=false, old_file_id, old_offset, ord)`
+  分片锁 CAS 提交，内部落到 `OkiState::apply_relocation`；这样保留对
+  并发新写的 ord 裁决，避免 merger 裸调 OKI 造成 TOCTOU。CAS 失败计入
+  `records_stale`，并由 `Cask::merge` 输出前台 contention warning；
+  失败位置仍进入 `relocations_stuck` / `stuck_file_ids` 诊断。
+- merge 输出改为 data-only：不创建、写、finalize、sync、link 或清理
+  hint。`MergeStats::output_hint_path` 仅保留 ABI 字段，成功路径恒为
+  空。retirement 只 unlink 旧 `.data`；历史 hint 残留留给 S43-8 统一
+  停写/清理，不在本阶段扩大删除面。
+- 固定崩溃顺序保持 output data flush/fsync → KeyDir/OKI relocation
+  commit → caller 侧 OKI flush → 输入 retirement/unlink。merger 侧
+  relocation 批量 apply 仍先落盘数据，再提交索引；任何 CAS 拒绝都不会
+  掩盖新写权威。
+- `Cask::needs_merge` 优先使用健康 BCOM v4 的
+  `OkiState::manifest_fstats()` 做 dead ratio/live bytes/total bytes
+  候选统计；legacy/非 v4 状态才回退 KeyDir fstats。新增
+  `merge::summarize(string_view, oki::OkiManifestFStats)`，与旧口径共用
+  模板实现，避免统计规则漂移。
+- `Cask::merge` 前先执行 `ensure_oki_for_write()`，阻断旧 Level A
+  “hash 可用但 OKI 不可用/落后”的目录直接进入 OKI-driven merge；
+  受控重建失败显式返回 `kIndexRebuildFailed` 或 `kIndexCorrupt`，绝不
+  把 `kUnavailable` 静默当作空索引。
+- `PluginContract` 直接 `run_merge` 用例改为先 rebuild 真实 OKI 视图，
+  并断言 merge 目录无 hint、`output_hint_path` 为空；`OkiRangeTest`
+  merge 失败路径输出 `error().detail` 便于故障区分。
+
+验证：GCC release 全量 850 配置、848/848 运行通过（两个 RSS probe 维持
+disabled）；ASan Merge/Oki/Crash/Checkpoint/Plugin 定向 203/203 通过；
+TSan Merge/Oki/Crash/Plugin/Concurrent 定向 192/192 通过，日志无
+ThreadSanitizer race report。
+
+### ✅ S43-8 — 停写并清理 hint
+
+工作面：`src/cask/cask.cpp`、`src/cask/cask_recovery.cpp`、`src/fileops/hint_file.cpp`、
+`include/bitcask/hint_file.hpp`、`src/fileops/scanner.cpp`、`src/merge/merger.cpp`、
+`src/fileops/migrate.cpp`、`tools/bitcask_migrate.cpp`、`tests/`。
+
+1. 前置 gate：S43-3 / S43-7 的 data-only recovery 与 merge 全绿。
+2. 停止写 hint：
+   - `roll_active` / `close` / merge 不再创建或 finalize `.hint`；
+   - active data fsync 语义保持不变；
+   - 写路径不再因 hint 失败而失败。
+3. 扫描与打开：
+   - scanner 不再把 `.hint` 当必需伴生文件；
+   - 旧目录中的 hint 默认视为可删除的历史加速缓存；
+   - 明确策略：open 时惰性删除、merge 后删除，或提供维护命令，不得静默依赖。
+4. recovery：
+   - 删除 hint fast path 与 hint/data 双路径分支；
+   - 只保留 data fold 与 OKI manifest/tail 协议。
+5. migration：
+   - `hintord` 迁移改为 data-only 迁移或保留只面向旧目标目录的兼容工具；
+   - 新目标不生成 hint；
+   - 老 binary 打开新目录时允许走慢速 `fold(data)`，但不得报格式错误。
+6. 清理实现：
+   - hint codec/fold/trailer 代码按迁移策略退役或隔离到 legacy 工具；
+   - grep 归零生产路径引用；测试目录中旧 hint fixture 只服务兼容用例。
+
+- **验收**：新库目录树无 `.hint`；旧库带 hint 重开正常；删除/重命名/损坏 hint 不影响
+  新路径；recovery 与 merge 注入矩阵全绿。
+
+#### ✅ S43-8 落地记录（2026-11-15，收口）
+
+- 架构落点：`.data` 仍是唯一持久真相；`.hint` 一律降级为历史加速缓存。
+  可写普通开库在持有 writer exclusivity 后 best-effort 删除目录内所有
+  regular `.hint`；只读、recovery 失败、`merge_only` 都不扩大删除面。
+  删除失败只记 warning，不阻塞打开；合法或损坏 hint 都不再进入恢复。
+- 写路径停写：`roll_active`、close、checkpoint、batch/组提交与 merge 全部
+  不再创建、追加、finalize、link 或复制 hint。active data 的
+  flush/fsync → OKI commit → memdelta 截断顺序保持不变；数据 durable
+  水位分拣也不回退。
+- 恢复收敛：删除 `fold(hint)` fast path，健康 BCOM v4 走 data-only
+  streaming replay；缺失、越界、Level A、损坏等情况继续显式 fallback
+  或受控重建。scanner 只扫描 `.data`，`DataFileEntry` 不再携带 hint 元数据。
+- 实现退役：删除 `src/fileops/hint_file.cpp` 与
+  `include/bitcask/hint_file.hpp`；从 production `bitcask_fileops` 移除；
+  删除 `HintRecord`、`encode_hint_record_v5`、`decode_hint_record_v5`、
+  `mk_hint_filename` 与 BCH4/BCH5 常量。`MergeStats::output_hint_path`
+  只保留 ABI 字段并恒为空。
+- 迁移 data-only：`be2le`、`tstamp64`、`hintord` 的目标都不迁移或生成
+  hint；`hintord_link_and_rehint` 改名 `hintord_link_data`，只 link/copy
+  data 并最后原子提交 meta。迁移 CLI 与 meta v4/v5 文案同步为 data-only。
+- 测试收敛：删除 HintFile/golden/DataAndHint/BCH4/v3 与 HintRecordV5
+  专属用例；保留 scanner 忽略 hint、迁移目标无 hint、删除 hint 后
+  data-only reopen，以及可写重开清理 corrupt/orphan legacy hint 的契约
+  （`OkiOnlyContractTest.ReopenRemovesLegacyHintsAndUsesDataOnly`）。
+
+验证：干净重建无新 warning；`build-gcc-release` 全量 ctest 835 配置、
+833/833 运行通过（两个 RSS probe 维持 disabled）；ASan
+Merge/Oki/Crash/Checkpoint/Plugin/Scanner/DataFile/Migrate 定向 226 配置、
+224/224 运行通过（同两个 disabled probe）；TSan
+Merge/Oki/Crash/Plugin/Concurrent 定向 193/193 通过。生产代码 grep 无
+hint codec/fold/writer/filename 符号；剩余引用仅限 ABI 字段、legacy 清理
+策略与历史纪元说明。
+
+### 🔴 S43-9 — 退役 KeyDir 与 BCKS
+
+工作面：`include/bitcask/keydir.hpp`、`include/bitcask/keydir_registry.hpp`、
+`src/keydir/*`、`src/cask/*`、`src/merge/*`、`src/search/*`、`c_api/*`、`tests/*`。
+
+1. 替换 KeyDir 的内部职责：
+   - ord 分配 / `next_ord` → OKI manifest v4；
+   - file_id 分配 / biggest_file_id → OKI manifest v4；
+   - fstats → OKI manifest v4；
+   - point lookup → `OkiState::locate`；
+   - range/iterator → OKI ReadView；
+   - merge CAS / relocation → OKI 写权威服务。
+2. 替换进程内共享语义：
+   - `KeyDirRegistry` 的多 Cask 同目录共享改为 OKI/index registry 或等价 owner；
+   - open/close refcount、write lock、multi-lib thread limits 语义保持；
+   - 不允许多个 Cask 各自维护会漂移的 OKI 权威状态。
+3. 删除内存结构：
+   - shard table、seqlock/optimistic read、epoch limbo、pending sibling chain；
+   - `cache_budget` / eviction / shadow check；
+   - BCKS v3/v4 serialize/deserialize；
+   - `kv.keydir.ckpt` 写路径。
+4. 兼容策略拍板：
+   - 首个 rollout 允许读旧 BCKS 仅用于迁移元数据，不作为运行时索引；
+   - 稳定后删除 BCKS 解析或隔离到 legacy migration；
+   - `Cask::keydir()` 等内部/public API 的删除或 deprecated 窗口必须明确。
+5. search/plugin 面适配：
+   - live checker、ord/key 回调、checkpoint watermark 改走 OKI/只读 service interface；
+   - plugin API 尽量以窄接口替代对 `KeyDir` 具体类型的依赖。
+6. C API / bindings：
+   - 行为零变化；
+   - 只允许错误码/诊断字段新增；
+   - SOVERSION 与 ABI 兼容用 c_api test 守门。
+
+- **验收**：生产路径 grep `KeyDir/keydir_/kv.keydir.ckpt` 归零（legacy migration 除外）；
+  多 Cask 同目录、multi-lib、close/iterator 竞态全绿；公开 API 行为快照无变化。
+
+#### ✅ S43-9 落地记录（2026-11-15，收口）
+
+- 权威收编：旧 `KeyDir`/`KeyDirRegistry` 实现退役，进程内共享改为
+  `oki::IndexAuthority` + `oki::IndexRegistry`。ord、file_id、fstats、点查、
+  range/iterator 与 merge CAS/relocation 都由 OKI 权威面提供；多 Cask 同目录
+  refcount、write lock、multi-lib 线程池与既有公开行为保持不变。
+- 提交面收敛：`kv.oki.manifest` + `kv.oki.seg-*` 是 KV 唯一恢复提交集。
+  BCKS/checkpoint 语义迁移为 BCOM v4 全局/文件元数据；`kKeydirSnapName`
+  与 `kv.keydir.ckpt` 生产写入/复制路径退役。`Cask::backup()` 先封口并
+  flush OKI，再复制 manifest 和当前 run 集；bench 的 full-fold 场景改为
+  删除 OKI manifest。备份契约测试新增提交集存在性守门。
+- 只读能力：新增 `OkiState::install_memory_view()` 和
+  `IndexAuthority::rebuild_memory_from_data()`。只读目录在缺 manifest、
+  无点查视图或显式 rebuild 时只构建内存视图，不写 run/manifest；
+  RO `read_doc` 可触发受控重建，但不把失败折叠成 `kNoIndex`。
+- 崩溃尾洞：恢复收尾在「manifest loaded + run 集为空 + data 非空」时
+  先做 ledger-only 对账，metadata 活键数不一致即触发全量重建。该检测
+  覆盖 Level A 写者在 OKI flush 前崩溃的窗口；有 run 的 metadata-less
+  v3 目录仍保持“只补 ledger、不伪造视图”的迁移契约。
+- 搜索与插件：docmap delta 链的 keydir 半边改称 authority 半边，
+  `DocmapReplayHook`、保存参数与 `Cask::replay_delta_to_authority()`
+  统一术语；merge runner 直接消费 `IndexAuthority`。merge 前受控重建
+  后显式启用 point query，避免只建 ledger 导致插件 merge 失败。
+- 测试迁移：stale snapshot、crash image、auto checkpoint、search tail、
+  checkpoint corruption 等契约从旧 `kv.keydir.ckpt` 迁移到 OKI 提交集；
+  Level B/merge/plugin/range/恢复断言同步新语义。删除旧 KeyDir、
+  hint-only 和 OKI locate 专属测试面。
+- grep 边界：生产路径旧 KeyDir 术语清零。允许保留的只剩
+  `keydir_cache_entries` ABI 字段及兼容说明、迁移工具跳过的历史
+  `kv.keydir.ckpt` 文件名，以及历史 benchmark baseline JSON。
+
+验证：`build-gcc-release` 全量 ctest **803 配置、801/801 运行通过**
+（两个 RSS probe 维持 disabled，日志 `/tmp/full-gcc-s43-9-final.log`）；
+ASan Merge/Oki/Crash/Checkpoint/Plugin/Scanner/DataFile/Migrate 定向
+**213 配置、211/211 运行通过**（同两个 disabled probe，
+`/tmp/asan-s43-9-final.log`）；TSan Merge/Oki/Crash/Plugin/Concurrent
+定向 **179/179** 通过，日志无 race report
+（`/tmp/tsan-s43-9-final.log`）。
+
+### ✅ S43-10 — 全量验证、迁移与 rollout
+
+工作面：`tests/`、`bench/`、`CHANGELOG.md`、`feedbacks/`、`TASK.md`、CI。
+
+1. 正确性矩阵：
+   - 随机 put/overwrite/remove/reinsert/TTL/batch/checkpoint/reopen reference model；
+   - `get/range/iterate/fstats/next_ord/file_id` 全量对拍；
+   - v3 → v4、带 hint 旧库、无 hint 新库、manifest 损坏、run 损坏、meta 旧版本；
+   - 同目录多 Cask、multi-lib、search/docmap/bm25/vec。
+2. 崩溃矩阵：
+   - S43-0 的所有 kill 点逐点注入；
+   - data tail torn / bad CRC / short read；
+   - manifest old/new/orphan run / spill 残件；
+   - merge unlink 与 relocation 交错。
+3. 并发矩阵：
+   - reader/writer/flush/compaction/checkpoint/close/iterator；
+   - group commit 与 atomic batch；
+   - merge relocation 与前台读写竞态。
+4. benchmark gate：
+   - 点查延迟：接受冷查退化，但必须量化；
+   - 写吞吐：记录均匀写与 Zipfian 写差异；
+   - 开库：manifest 健康时目标为 O(tail)，最坏 data rebuild 允许显著变慢并明确文档；
+   - RSS：无 KeyDir 后常驻内存应显著下降；
+   - 磁盘：hint 删除收益与 OKI compaction 写放大一起核算。
+5. rollout：
+   - 默认路径切换前先跑 shadow/dry-run；
+   - 变更分阶段打开：v4 manifest → OKI get → OKI write/range/merge → no hint → remove KeyDir；
+   - 每阶段具备回退开关或明确单向迁移决策；
+   - CHANGELOG 写清 recovery 时间与磁盘布局变化。
+
+- **验收**：gcc/clang Debug/Release、ASan、TSan、`-Werror` 全绿；
+  benchmark 报告归档；旧库迁移演练通过；TASK/CHANGELOG/feedbacks 账目闭合。
+
+#### ✅ S43-10 落地记录（2026-11-15，收口）
+
+- 新增 `S43RolloutGateTest`：480 步随机 put/overwrite/remove/reinsert、
+  TTL、atomic batch、checkpoint/merge/reopen reference model；
+  legacy hint、manifest tmp、manifest 损坏、run 损坏、torn data tail
+  显式重开；K1/K2、K3/K4、K10、K12/K13、K14/K15 子进程崩溃窗口。
+  Release 与 ASan 均 7/7 通过。
+- `batch` reference model 修掉一个测试侧借用生命周期缺陷：
+  `BatchOp::value` 借用的临时字符串在 initializer 完成后过期，ASan
+  捕获 stack-use-after-scope；现与 key 一样使用命名宿主字符串。
+- K12/K13 语义澄清：merge output 完整 fsync 后即使 manifest 回退，
+  重放按 ord/LWW 收敛到该完整更代状态；门禁检查 900 key 无悬空、
+  无丢失，而不是要求孤儿输出不可见。
+- Rollout 报告归档于
+  `docs/design/s43-okionly-rollout-report-zh.md`，原始 benchmark
+  JSON/日志在 `bench-results/s43-10/`。热点查 806 ns，冷块 p50/p99
+  4.57/7.41 µs，100k 均匀写 2.707 µs/op，snapshot/full-fold 开库
+  7.10/11.7 ms，merge 636k rows/s；新增 bounded Zipf(s=1) 100k
+  覆盖写基准实测 1.599 µs/op。
+- RSS/磁盘账闭合：`BM_Oki_MemProbe/100000` 同机 `cce59d4` A/B 3 次重复，
+  memdelta RSS 净增 26.37→7.60 MiB（-71.2%），rebuild 峰值
+  37.14→17.60 MiB（-52.6%）；归档
+  `rss-a-b-memprobe-{before,after}.{json,log}`。新增
+  `BM_Merge_DiskAccounting/20000`：18,702 eligible 行、retired data
+  2.5834 MiB、OKI run +0.2734 MiB、hint 0 文件，value 增量写放大
+  0.1533；归档 `merge-disk-accounting.{json,log}`。100k/key20B 迁移
+  A/B 中 3,200,012B hint 可写打开后清理为 0；归档
+  `hint-disk-a-b.log`。
+- Release full ctest **808/808**（两个 RSS probe disabled）；ASan/UBSan
+  full **808/808**；TSan full **807 executed / 0 failed**（一个平台
+  skip，同两个 RSS probe disabled）；GCC Release `-Werror` 207 targets
+  干净构建；Clang 21 Debug/Release `-Werror` 均 808/808（Release
+  测试构建关 LTO 以规避 linker 插件加载 C object 工具链问题）。日志：
+  `/tmp/asan-s43-10-final.log`、`/tmp/tsan-s43-10-final.log`、
+  `/tmp/werror-s43-10-build.log`、`/tmp/clang-debug-s43-10-final.log`、
+  `/tmp/clang-release-s43-10-final.log`。
+- 版本真源 bump 至 **6.9.0**（`SOVERSION` 保持 6）；CHANGELOG 记录
+  恢复、迁移、磁盘布局与回退语义。`feedbacks/` 账本无需新增条目，
+  既有 2026-11-13 ③④ 与本 S43 范围无耦合。
+
+### 执行序
+
+```text
+S43-0 基线/故障注入
+→ S43-1 点查安全
+→ S43-2 BCOM v4
+→ S43-3 data-only recovery
+→ S43-4 OKI-only get
+→ S43-5 OKI-only write/fstats
+→ S43-6 OKI-only iterator/range
+→ S43-7 OKI-driven merge
+→ S43-8 remove hint
+→ S43-9 remove KeyDir/BCKS
+→ S43-10 rollout gate
+```
+
+S43-1 可与 S43-0 后半并行；S43-4 依赖 S43-1/2/3；
+S43-5/6 依赖 S43-4；S43-7 依赖 S43-5/6；
+S43-8 是硬 gate 后动作；S43-9 必须最后执行。
+
+### 风险排序（按“有多容易静默错”）
+
+| # | 风险 | 任务 | 失败形态 |
+|---|---|---|---|
+| 1 | OKI 损坏导致 `get` 静默返回别的 key | S43-1/4 | 数据正确性事故，最不可接受 |
+| 2 | manifest 水位超前 / held row 误提交 | S43-2/3/5 | 重放跳过记录，静默丢活跃 key |
+| 3 | merge unlink 早于 relocation 持久化 | S43-7 | 重开后 loc 悬空，恢复成本放大 |
+| 4 | iterator 视图漏 run / 提前释放 | S43-6 | range 少 key、UAF 或旧值 |
+| 5 | fstats 漂移导致 merge 误判死文件 | S43-5/7 | unlink 仍被引用的 data |
+| 6 | 均匀写每 put 点查导致吞吐崩 | S43-5/10 | 功能正确但性能不可用 |
+| 7 | 废 hint 后最坏恢复变成全库 data 扫描 | S43-3/8/10 | 打开时间小时级、污染 page cache |
+| 8 | search/plugin watermark 与 OKI 提交点错序 | S43-2/9 | 搜索丢区间或重复回放 |
+
+### 明确不做
+
+| 项 | 理由 |
+|---|---|
+| 把 OKI 当作唯一持久真相 | data 文件仍是真相；OKI 必须可从 data 重建 |
+| 在 recovery/merge 去 hint 前物理删除 hint 写路径 | 会先失去恢复保险且无兜底 |
+| 用关闭 CRC / key 核对换点查性能 | OKI-only 下索引损坏不能变成静默错值 |
+| 静默把 logical-new 记账改成最终一致 | 会改变 `kAlreadyExists`、CAS 与 fstats 语义；必须单独拍板 |
+| 保留 KeyDir 哈希作为隐藏权威 | 与 OKI-only 目标冲突，只允许迁移期影子对拍 |
+
+---
+
 ## 🔴 S42 · DocMap Live-Only Store（2026-11-14 立项）
 
 > 来源：热点覆盖写使 `index::Index` 按历史 ord 展开的平坦数组随总写入量增长

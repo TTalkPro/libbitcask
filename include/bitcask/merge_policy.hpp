@@ -17,7 +17,7 @@
 // 本模块所有函数均为纯函数（无内部状态，无 I/O）。
 //   - 可重入 / 线程安全：是。多线程可并发对同一/不同输入并发调用。
 //   - 锁要求：无。
-//   - 注意：输入的 fstats 列表通常来自 KeyDir::info()，由 caller 取到
+//   - 注意：输入的 fstats 列表通常来自 IndexAuthority::info()，由 caller 取到
 //     快照后传入；本模块不保证「正在被并发修改的容器」的访问安全——caller
 //     的责任是先拿快照再算策略。
 
@@ -28,7 +28,7 @@
 #include <string>
 #include <vector>
 
-#include "bitcask/keydir.hpp"  // 需要 FStatsEntry
+#include "bitcask/oki_run.hpp"    // S43-7：BCOM v4 fstats
 
 namespace bitcask::merge {
 
@@ -97,7 +97,7 @@ struct Reason {
 // total_bytes==0 && total_keys==0 的 fstats（空文件统计）legacy 隐式过滤
 // 掉了——这里也保持同样行为。
 [[nodiscard]] FileStatus
-summarize(std::string_view dirname, const keydir::FStatsEntry& f);
+summarize(std::string_view dirname, const oki::OkiManifestFStats& f);
 
 // 列出某文件命中了哪些 per-file 阈值；空列表表示该文件不参与 merge。
 // Policy::decide 内部用；测试 + log_needs_merge 也调它。

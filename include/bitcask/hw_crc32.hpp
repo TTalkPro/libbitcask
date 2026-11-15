@@ -186,7 +186,7 @@ inline std::uint32_t crc32_update(std::uint32_t seed,
 
         // S29-10：16..63 字节走小块内核——无对齐步骤（loadu 不要求对齐;
         // 原实现头对齐会把小块拆碎到全 bytewise），整 16B 块单折叠 CLMUL,
-        // 尾部 <16B bytewise。流式增量（hint/WAL 帧）的主命中路径。
+        // 尾部 <16B bytewise。流式增量（WAL 帧等）的主命中路径。
         if (len < 64) {
             const std::size_t nblk = len / 16;  // ≥1（<16 已在上面走 zlib）
             c = detail::crc32_pclmul_small(c, p, nblk);

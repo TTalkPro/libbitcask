@@ -105,7 +105,7 @@ public:
     // S2:批量 append。语义同 write()，但把编码后的 record 累积到 batch_buf_，
     // 累计 ≥ kBatchFlushBytes 才一次 pwrite——把 N 条 pwrite 降到 N/batch。
     // 返回的 offset 是逻辑偏移（current_offset_，含尚未落盘的缓冲），确定性
-    // 不依赖落盘时机，故 hint/keydir 引用照旧正确。
+    // 不依赖落盘时机，故 OKI/keydir 引用照旧正确。
     //   ⚠️ 仅用于「flush（+按策略 sync）之后才被 caller 采信」的场景：merge
     //   输出、put_batch（S13-D1，flush 后才 apply keydir）。单条 put 的 WAL
     //   语义必须每条立即 pwrite，不可用本 API（见 ⑪ 否决记录）。
@@ -237,14 +237,13 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// 文件名约定：<dir>/<tstamp>.bitcask.data 与 <dir>/<tstamp>.bitcask.hint
+// 文件名约定：<dir>/<tstamp>.bitcask.data。S43-8 起不再生成 hint。
 // tstamp 是文件创建时刻的 monotonic counter（不是 wall clock，避免
-// 跨进程冲突；keydir_registry 全局递增）。
+// 跨进程冲突；index registry 全局递增）。
 // 以下都是纯字符串处理函数：线程安全、可重入、无锁。
 // ---------------------------------------------------------------------------
 [[nodiscard]] std::string mk_data_filename(std::string_view dirname,
                                             std::uint64_t tstamp);
-[[nodiscard]] std::string mk_hint_filename(std::string_view data_path);
 
 // 从 "<tstamp>.bitcask.data" 解析出 tstamp；不匹配返回 nullopt。
 [[nodiscard]] std::optional<std::uint64_t>

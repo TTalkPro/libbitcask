@@ -1,0 +1,71 @@
+{
+  "context": {
+    "date": "2026-11-15T23:28:54+08:00",
+    "host_name": "Debian-VM01",
+    "executable": "./build-gcc-release/bench/bitcask_bench",
+    "num_cpus": 8,
+    "mhz_per_cpu": 2995,
+    "cpu_scaling_enabled": false,
+    "caches": [
+      {
+        "type": "Data",
+        "level": 1,
+        "size": 49152,
+        "num_sharing": 1
+      },
+      {
+        "type": "Instruction",
+        "level": 1,
+        "size": 32768,
+        "num_sharing": 1
+      },
+      {
+        "type": "Unified",
+        "level": 2,
+        "size": 1310720,
+        "num_sharing": 1
+      },
+      {
+        "type": "Unified",
+        "level": 3,
+        "size": 25165824,
+        "num_sharing": 8
+      }
+    ],
+    "load_avg": [0.703613,1.09619,3.67383],
+    "library_version": "v1.9.0",
+    "library_build_type": "release",
+    "json_schema_version": 1
+  },
+  "benchmarks": [
+    {
+      "name": "BM_Merge_DiskAccounting/20000/iterations:1",
+      "family_index": 0,
+      "per_family_instance_index": 0,
+      "run_name": "BM_Merge_DiskAccounting/20000/iterations:1",
+      "run_type": "iteration",
+      "repetitions": 1,
+      "repetition_index": 0,
+      "threads": 1,
+      "iterations": 0,
+      "real_time": 2.0047517110490002e+07,
+      "cpu_time": 7.9796338999999989e+01,
+      "time_unit": "ms",
+      "data_after_MB": 2.5833988189697266e+00,
+      "data_before_MB": 5.1667976379394531e+00,
+      "hint_after_files": 0.0000000000000000e+00,
+      "hint_before_files": 0.0000000000000000e+00,
+      "manifest_after_B": 5.1900000000000000e+02,
+      "manifest_before_B": 1.7060000000000000e+03,
+      "merge_output_bytes": 2.5323620000000000e+06,
+      "oki_delta_MB": 2.7338409423828125e-01,
+      "oki_run_after_MB": 5.6160926818847656e-01,
+      "oki_run_before_MB": 2.8822517395019531e-01,
+      "records_kept": 1.8702000000000000e+04,
+      "records_seen": 1.8702000000000000e+04,
+      "retired_data_MB": 2.5833988189697266e+00,
+      "write_amplification": 1.5327986311624425e-01,
+      "label": "hint_files=0 records=18702"
+    }
+  ]
+}

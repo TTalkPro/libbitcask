@@ -11,7 +11,6 @@
 #include "bitcask/data_file.hpp"
 #include "bitcask/field_schema.hpp"
 #include "bitcask/format.hpp"
-#include "bitcask/hint_file.hpp"
 #include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::migrate {
@@ -77,7 +76,8 @@ write_all(const fs::path& path, std::span<const std::byte> bytes) {
     return {};
 }
 
-// 一个 data 文件：逐 record 解大端头 → 小端重编码 + 重生成 hint。
+// 一个 data 文件：逐 record 解大端头 → 小端重编码。S43-8 后迁移目标
+// data-only，旧 hint 不迁移、不重生成。
 std::expected<void, std::string>
 migrate_data_file(const fs::path& src_data, const fs::path& dst_dir,
                   MigrateStats& st) {
@@ -86,17 +86,12 @@ migrate_data_file(const fs::path& src_data, const fs::path& dst_dir,
 
     const auto name = bitcask::detail::to_utf8(src_data.filename());
     const auto dst_data_path = bitcask::detail::to_utf8(dst_dir / src_data.filename());
-    const auto dst_hint_path =
-        fileops::mk_hint_filename(dst_data_path);
 
     // 小端写：DataFile/HintFile 内部用新（小端）codec,CRC/水位重算。
     auto dst_data = fileops::DataFile::open(
         dst_data_path, fileops::DataFile::Mode::kCreate, /*sync*/ false,
         /*mmap_enabled*/ false);
     if (!dst_data) return std::unexpected("create dst data " + dst_data_path);
-    auto dst_hint = fileops::HintFile::open(
-        dst_hint_path, fileops::HintFile::Mode::kCreate);
-    if (!dst_hint) return std::unexpected("create dst hint " + dst_hint_path);
 
     const std::byte* base = bytes->data();
     const std::uint64_t total = bytes->size();
@@ -140,16 +135,9 @@ migrate_data_file(const fs::path& src_data, const fs::path& dst_dir,
 
         auto w = dst_data->write(type, tstamp, ord, key, value);
         if (!w) return std::unexpected("write record to " + dst_data_path);
-        auto h = dst_hint->write(tstamp, w->total_size, w->offset, tomb, key,
-                                 ord);
-        if (!h) return std::unexpected("write hint to " + dst_hint_path);
-
         ++st.records;
         if (tomb) ++st.tombstones;
         off += rec_total;
-    }
-    if (auto r = dst_hint->finalize(); !r) {
-        return std::unexpected("finalize hint " + dst_hint_path);
     }
     ++st.data_files;
     return {};
@@ -174,7 +162,7 @@ migrate_meta(const fs::path& src_dir, const fs::path& dst_dir,
     }
     if (ver != 1) return std::unexpected("unknown meta version");
 
-    // v1 → v5：version 改 5（data record 已按当前 codec 重编码,hint 已是
+    // v1 → v5：version 改 5（data record 已按当前 codec 重编码，
     // BCH5）,VecDim u16 大端→小端,其余单字节照搬,偏移 14 放 CRC32
     // (覆盖前 14 字节),与 write_meta 一致。
     std::byte out[18] = {};
@@ -272,7 +260,7 @@ bool transcode_doc_value_v3_to_v4(std::span<const std::byte> in,
 }
 
 // 一个 data 文件：逐 record 解 u32 纪元小端头（23B,偏移同 kLegacy*）→
-// 当前 codec 重编码（27B 头,u64 tstamp）+ 重生成 hint。
+// 当前 codec 重编码（27B 头,u64 tstamp）。迁移目标 data-only。
 std::expected<void, std::string>
 migrate_u32_data_file(const fs::path& src_data, const fs::path& dst_dir,
                       MigrateStats& st) {
@@ -281,15 +269,10 @@ migrate_u32_data_file(const fs::path& src_data, const fs::path& dst_dir,
 
     const auto name = bitcask::detail::to_utf8(src_data.filename());
     const auto dst_data_path = bitcask::detail::to_utf8(dst_dir / src_data.filename());
-    const auto dst_hint_path = fileops::mk_hint_filename(dst_data_path);
-
     auto dst_data = fileops::DataFile::open(
         dst_data_path, fileops::DataFile::Mode::kCreate, /*sync*/ false,
         /*mmap_enabled*/ false);
     if (!dst_data) return std::unexpected("create dst data " + dst_data_path);
-    auto dst_hint = fileops::HintFile::open(
-        dst_hint_path, fileops::HintFile::Mode::kCreate);
-    if (!dst_hint) return std::unexpected("create dst hint " + dst_hint_path);
 
     const std::byte* base = bytes->data();
     const std::uint64_t total = bytes->size();
@@ -336,16 +319,9 @@ migrate_u32_data_file(const fs::path& src_data, const fs::path& dst_dir,
 
         auto w = dst_data->write(type, tstamp, ord, key, value);
         if (!w) return std::unexpected("write record to " + dst_data_path);
-        auto h = dst_hint->write(tstamp, w->total_size, w->offset, tomb, key,
-                                 ord);
-        if (!h) return std::unexpected("write hint to " + dst_hint_path);
-
         ++st.records;
         if (tomb) ++st.tombstones;
         off += rec_total;
-    }
-    if (auto r = dst_hint->finalize(); !r) {
-        return std::unexpected("finalize hint " + dst_hint_path);
     }
     ++st.data_files;
     return {};
@@ -402,19 +378,16 @@ migrate_u32_meta(const fs::path& src_dir, const fs::path& dst_dir,
 }
 
 // ---------------------------------------------------------------------------
-// u64 纪元（meta v4）→ 当前纪元（meta v5,hint BCH5）。S33 flag-day。
-// data 一字节不动：硬链接进 dst（跨设备退化为拷贝）;hint 从 data 重扫生成
-// （ord 在 record header 内现成,DataFile::fold 直接给出）;meta 最后写
+// u64 纪元（meta v4）→ 当前纪元（meta v5）。S33 flag-day + S43-8。
+// data 一字节不动：硬链接进 dst（跨设备退化为拷贝）；meta 最后写
 // = dst 的 commit point（中途 kill 的 dst 无 meta → 不会被误开;重跑幂等）。
 // ---------------------------------------------------------------------------
 
 std::expected<void, std::string>
-hintord_link_and_rehint(const fs::path& src_data, const fs::path& dst_dir,
+hintord_link_data(const fs::path& src_data, const fs::path& dst_dir,
                         MigrateStats& st) {
     const auto name = bitcask::detail::to_utf8(src_data.filename());
     const auto dst_data_path = bitcask::detail::to_utf8(dst_dir / src_data.filename());
-    const auto dst_hint_path = fileops::mk_hint_filename(dst_data_path);
-
     std::error_code ec;
     fs::create_hard_link(src_data, dst_data_path, ec);
     if (ec) {  // 跨设备等 → 退化为拷贝
@@ -427,35 +400,6 @@ hintord_link_and_rehint(const fs::path& src_data, const fs::path& dst_dir,
         }
     }
 
-    auto df = fileops::DataFile::open(dst_data_path,
-                                      fileops::DataFile::Mode::kRead,
-                                      /*sync*/ false, /*mmap_enabled*/ false);
-    if (!df) return std::unexpected("open data " + dst_data_path);
-    auto dst_hint = fileops::HintFile::open(
-        dst_hint_path, fileops::HintFile::Mode::kCreate);
-    if (!dst_hint) return std::unexpected("create dst hint " + dst_hint_path);
-
-    // tolerate_crc_errors：单条损坏跳过（与恢复同策略）——被跳过的 record
-    // hint 里也不会有,fold(data) 恢复同样读不到它,语义一致。
-    std::string werr;
-    auto fr = df->fold(
-        [&](const codec::DataRecordView& view, std::uint64_t offset,
-            std::uint32_t total_size) {
-            if (!werr.empty()) return;
-            const bool tomb =
-                view.type == format::RecordType::kTombstone;
-            auto h = dst_hint->write(view.tstamp, total_size, offset, tomb,
-                                     view.key, view.ord);
-            if (!h) { werr = "write hint to " + dst_hint_path; return; }
-            ++st.records;
-            if (tomb) ++st.tombstones;
-        },
-        /*tolerate_crc_errors*/ true);
-    if (!fr) return std::unexpected("fold data " + dst_data_path);
-    if (!werr.empty()) return std::unexpected(werr);
-    if (auto r = dst_hint->finalize(); !r) {
-        return std::unexpected("finalize hint " + dst_hint_path);
-    }
     ++st.data_files;
     return {};
 }
@@ -511,7 +455,7 @@ migrate_be_to_le(std::string_view src_dir, std::string_view dst_dir) {
     if (auto r = migrate_field_schema(src, dst, st); !r) {
         return std::unexpected(r.error());
     }
-    // 逐 data 文件（hint 由其重生成）。ckpt/seg/wal/旧 hint/锁不迁移。
+    // 逐 data 文件（data-only）。ckpt/seg/wal/旧 hint/锁不迁移。
     for (const auto& de : fs::directory_iterator(src)) {
         const auto fname = bitcask::detail::to_utf8(de.path().filename());
         if (fileops::parse_data_tstamp(fname).has_value()) {
@@ -547,7 +491,7 @@ migrate_u32_to_u64(std::string_view src_dir, std::string_view dst_dir) {
         }
         st.field_schema_migrated = true;
     }
-    // 逐 data 文件（hint 由其重生成）。ckpt/seg/wal/旧 hint/锁不迁移。
+    // 逐 data 文件（data-only）。ckpt/seg/wal/旧 hint/锁不迁移。
     for (const auto& de : fs::directory_iterator(src)) {
         const auto fname = bitcask::detail::to_utf8(de.path().filename());
         if (fileops::parse_data_tstamp(fname).has_value()) {
@@ -583,12 +527,12 @@ migrate_hint_ord(std::string_view src_dir, std::string_view dst_dir) {
         }
         st.field_schema_migrated = true;
     }
-    // 逐 data 文件：硬链接 + 从 data 重扫生成 BCH5 hint。
+    // 逐 data 文件：硬链接 + data-only 元数据迁移。
     // ckpt/seg/wal/旧 hint/锁不迁移（新库首开 fold 重建,与既有迁移器同策略）。
     for (const auto& de : fs::directory_iterator(src)) {
         const auto fname = bitcask::detail::to_utf8(de.path().filename());
         if (fileops::parse_data_tstamp(fname).has_value()) {
-            if (auto r = hintord_link_and_rehint(de.path(), dst, st); !r) {
+            if (auto r = hintord_link_data(de.path(), dst, st); !r) {
                 return std::unexpected(r.error());
             }
         }

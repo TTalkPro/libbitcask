@@ -18,7 +18,7 @@
 #include <gtest/gtest.h>
 
 #include <bitcask/cask.hpp>
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_registry.hpp>
 
 namespace fs = std::filesystem;
 using bitcask::Cask;
@@ -27,8 +27,8 @@ using bitcask::RangeOptions;
 
 namespace {
 
-bitcask::keydir::KeyDirRegistry& test_registry() {
-    static bitcask::keydir::KeyDirRegistry reg;
+bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 
@@ -186,6 +186,47 @@ TEST_F(OkiRangeTest, BasicWindowsAcrossRunsAndMemdelta) {
     (*c)->close();
 }
 
+// S43-6：CaskIter 的快照来源必须是 OKI ReadView，而不是仍在共享可变的
+// shard 表。创建视图后的覆盖/删除/新写和 flush 都不得改变在途枚举。
+TEST_F(OkiRangeTest, FoldIterPinsOkiViewAcrossWritesAndFlush) {
+    CaskOptions o;
+    o.read_write = true;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    auto& cask = **c;
+
+    ASSERT_TRUE(cask.put(bytes("a1"), bytes("old-1"), 1000));
+    ASSERT_TRUE(cask.put(bytes("a2"), bytes("old-2"), 1000));
+
+    auto it = cask.make_iter();
+    auto st = it->start();
+    ASSERT_TRUE(st.has_value());
+    ASSERT_TRUE(st.has_value());
+
+    // 覆盖、删除、新增各一条，并把 memdelta 真实推进到 run。旧视图里的
+    // run Reader 与 delta 拷贝都不可变；flush 只发布新视图。
+    ASSERT_TRUE(cask.put(bytes("a1"), bytes("new-1"), 1001));
+    ASSERT_TRUE(cask.remove(bytes("a2"), 1002));
+    ASSERT_TRUE(cask.put(bytes("a3"), bytes("new-3"), 1003));
+    ASSERT_TRUE(cask.checkpoint());
+
+    std::map<std::string, std::string> got;
+    while (true) {
+        auto e = it->next();
+        ASSERT_TRUE(e.has_value()) << (e ? "" : e.error().detail);
+        if (!e || !e->has_value()) break;
+        got.emplace(to_str((*e)->key), to_str((*e)->value));
+    }
+    it->release();
+
+    const std::map<std::string, std::string> expected{
+        {"a1", "old-1"},
+        {"a2", "old-2"},
+    };
+    EXPECT_EQ(got, expected);
+    cask.close();
+}
+
 TEST_F(OkiRangeTest, PropertyThreeWayWithMergeAndReopen) {
     std::mt19937_64 rng(0x0C1);
     std::map<std::string, std::string> shadow;
@@ -228,7 +269,8 @@ TEST_F(OkiRangeTest, PropertyThreeWayWithMergeAndReopen) {
                 }
                 case 3: {  // 偶发结构事件
                     if (rng() % 6 == 0) {
-                        ASSERT_TRUE(c->merge());
+                        auto merged = c->merge();
+                        ASSERT_TRUE(merged) << merged.error().detail;
                     } else if (rng() % 6 == 1) {
                         c->close();
                         c = open_cask();
@@ -332,19 +374,17 @@ TEST_F(OkiRangeTest, ConcurrentWriterRangeReadersAndMerge) {
 #    define BITCASK_TSAN_ACTIVE 1
 #  endif
 #endif
-#ifdef BITCASK_TSAN_ACTIVE
-    // TSan 下关闭 keydir 乐观读快路径（S29-6 回退开关）：seqlock 的
-    // volatile 载入 × 写者搬移是 CI 既知豁免的误报同根因
-    // （ci.yml TSan 豁免注释；专属 stress 为
-    // KeyDirOptimisticRead.ConcurrentGetPutRemoveGrowStress）。本测试的
-    // 对象是 OKI 层并发（归并/回查/merge 交互），不是乐观读——关闭后
-    // 其余全部路径仍在 TSan 下受检，不新增豁免条目。
-    c.keydir().set_optimistic_reads(false);
-#endif
     for (int i = 0; i < 200; ++i) {
         ASSERT_TRUE(c.put(bytes("c" + std::to_string(i)), bytes("v"), 1000));
     }
     ASSERT_TRUE(c.checkpoint());  // 让读者有 run 可归并
+    // S43-4：public get 直连 OKI；旧 Level A 下 RO 语义的显式 fallback
+    // 只证明读可用。Range 的可用性闸随后负责首次受控迁移，并发扫描不
+    // 会把迁移窗口折叠成“没有索引”。
+    {
+        const auto warmup = c.get_owned(bytes("c0"));
+        ASSERT_TRUE(warmup.has_value()) << warmup.error().detail;
+    }
 
     std::atomic<bool> stop{false};
     std::atomic<int> scans{0};

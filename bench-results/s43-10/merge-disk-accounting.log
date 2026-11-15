@@ -1,0 +1,4 @@
+-----------------------------------------------------------------------------------------------------
+Benchmark                                           Time             CPU   Iterations UserCounters...
+-----------------------------------------------------------------------------------------------------
+BM_Merge_DiskAccounting/20000/iterations:1   20047517 ms         79.8 ms            0 data_after_MB=2.5834 data_before_MB=5.1668 hint_after_files=0 hint_before_files=0 manifest_after_B=519 manifest_before_B=1.706k merge_output_bytes=2.53236M oki_delta_MB=0.273384 oki_run_after_MB=0.561609 oki_run_before_MB=0.288225 records_kept=18.702k records_seen=18.702k retired_data_MB=2.5834 write_amplification=0.15328 hint_files=0 records=18702

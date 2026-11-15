@@ -23,8 +23,27 @@ std::string_view sv(std::span<const std::byte> b) {
 
 std::expected<std::unique_ptr<CaskRangeIter>, CaskFault>
 Cask::make_range_iter(const RangeOptions& opts) {
-    if (!keydir_) return std::unexpected(err(CaskError::kClosed));
-    auto view = keydir_->oki().make_read_view();
+    if (!authority_) return std::unexpected(err(CaskError::kClosed));
+    auto view = authority_->state().make_read_view();
+    if (!view && opts_.read_write && !opts_.merge_only) {
+        // S43-5：Range 也进入写前/读前可用性闸。旧 Level A 首次 Range
+        // 或运行期降级时触发同一条受控重建；并发读者短暂等待新视图，
+        // 而不是把迁移/重建窗口折叠成“没有索引”。
+        for (;;) {
+            if (oki_rebuild_failed_) break;
+            view = authority_->state().make_read_view();
+            if (view) break;
+            if (oki_rebuilding_.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+                continue;
+            }
+            if (!ensure_oki_for_write()) break;
+            view = authority_->state().make_read_view();
+            if (view) break;
+            // ensure 认为可用但视图尚未发布（理论竞态）；下一次重读。
+            std::this_thread::yield();
+        }
+    }
     if (!view) {
         // 按成因拆码（见 cask.hpp 枚举注释）：试建而败 vs 本就不建。
         if (oki_rebuild_failed_) {
@@ -42,7 +61,6 @@ Cask::make_range_iter(const RangeOptions& opts) {
     // unique_ptr + 私有构造：make_unique 不可用，直接 new。
     std::unique_ptr<CaskRangeIter> it(new CaskRangeIter());
     it->cask_ = this;
-    it->keydir_pin_ = keydir_;
     it->view_ = *std::move(view);
     it->hi_.assign(sv(opts.hi));
     it->has_hi_ = !opts.hi.empty();
@@ -109,8 +127,8 @@ CaskRangeIter::next_merged_key() {
             return std::optional<std::string>{};
         }
 
-        // 2) 归并同 key 各源：max-ord 胜（memdelta 行恒新于 runs 的同 key
-        //    行——但不依赖此性质，统一 max-ord）；并推进这些源。
+        // 2) 归并同 key 各源：max-ord 胜；等 ord 时 delta / 更高 gen
+        //    到达序胜（merge relocation 的权威裁决格）。
         std::uint64_t win_ord = 0;
         bool win_tomb = false;
         bool first = true;
@@ -118,7 +136,7 @@ CaskRangeIter::next_merged_key() {
         for (std::size_t i = 0; i < heads_.size(); ++i) {
             auto& h = heads_[i];
             if (!h || h->key != key) continue;
-            if (first || h->ord > win_ord) {
+            if (first || h->ord >= win_ord) {
                 win_ord = h->ord;
                 win_tomb = h->tomb;
                 first = false;
@@ -139,7 +157,7 @@ CaskRangeIter::next_merged_key() {
         if (delta_pos_ < view_.delta->size() &&
             (*view_.delta)[delta_pos_].key == key) {
             const auto& d = (*view_.delta)[delta_pos_];
-            if (first || d.ord > win_ord) {
+            if (first || d.ord >= win_ord) {
                 win_ord = d.ord;
                 win_tomb = d.tomb;
                 first = false;

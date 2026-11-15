@@ -59,7 +59,7 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts) {
     opts->vector_diskann_l_build = 0;
     opts->log_fn = NULL;              // S13-D7：默认不上报
     opts->log_ctx = NULL;
-    opts->keydir_cache_entries = 0;   // S36：Level B 关（现状全内存）
+    opts->keydir_cache_entries = 0;      // ABI 名保留；语义 = OKI Level B
 }
 
 // 6.4.0：缺省**从 C++ 结构体抄**，不手写数字——上游哪天改缺省这里自动跟。
@@ -952,10 +952,6 @@ BITCASK_API bitcask_error_t bitcask_iter_start_ex(
         to_c_error(start_result.error(), fault);
         return to_c_error_kind(start_result.error().kind);
     }
-    if (*start_result == bitcask::keydir::StartIterResult::kOutOfDate) {
-        return BITCASK_ERR_INVALID_OPTION;
-    }
-
     wrapper->iter = std::move(iter);
     *out = reinterpret_cast<bitcask_iter_t*>(wrapper.release());
     return BITCASK_OK;

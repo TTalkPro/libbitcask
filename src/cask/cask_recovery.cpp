@@ -1,5 +1,5 @@
-// cask_recovery.cpp — Cask 恢复域：离线升级（upgrade）、open 时 keydir
-// 重建（load_keydir_from_disk）、恢复快照装载（load_recovery_snapshots）、
+// cask_recovery.cpp — Cask 恢复域：离线升级（upgrade）、open 时索引权威
+// 重建（load_authority_from_disk）、恢复快照装载（load_recovery_snapshots）、
 // legacy search.ckpt 一次性迁移与 delta 链重放。S21-3 B1：从 cask.cpp 纯
 // 物理平移拆出（函数体不变），先例同 meta_file.cpp / legacy_ckpt.cpp。
 #include "bitcask/cask.hpp"
@@ -11,6 +11,7 @@
 #include <atomic>
 #include <filesystem>
 #include <thread>
+#include <unordered_map>
 
 #include "bitcask/codec.hpp"           // decode_doc_value / doc_vector_f32
 #include "bitcask/format.hpp"          // RecordType（fold 墓碑判定）
@@ -29,7 +30,7 @@ namespace fs = std::filesystem;
 // 离线升级：将 KV 模式目录转为索引模式。
 // 不获取任何锁——要求目录处于离线状态（无活跃 writer/merger）。
 // 步骤：验证 meta 是 KV → 覆写 meta 为 kIndex → 创建搜索插件（Text/Vector）→
-//       新建 KeyDir + load_keydir_from_disk → mark_ready
+//       新建 authority + load_authority_from_disk → mark_ready
 // 返回的 Cask 是只读的（无 active writer），调用方可以 close 后
 // 再用 open(dirname, {enable_search=true, read_write=true}) 正常使用。
 std::expected<std::unique_ptr<Cask>, CaskFault>
@@ -87,40 +88,26 @@ Cask::upgrade(std::string_view dirname,
     // S18-8：恢复重放经 plugins_ 广播——upgrade 手工装配路径同样要注册。
     cask->plugins_ = {cask->text_.get(), cask->vec_plugin_.get()};
 
-    cask->keydir_ = std::make_shared<keydir::KeyDir>();
-    if (auto r = cask->load_keydir_from_disk(); !r) {
+    cask->authority_ = std::make_shared<oki::IndexAuthority>();
+    if (auto r = cask->load_authority_from_disk(); !r) {
         return std::unexpected(r.error());
     }
-    cask->keydir_->mark_ready();
+    cask->authority_->mark_ready();
 
     return cask;
 }
 
-void Cask::replay_delta_to_keydir(
+void Cask::replay_delta_to_authority(
     const std::vector<index::DocmapDeltaRow>& rows,
     const std::vector<index::DocmapDeltaRemoval>& rems,
-    std::span<const std::byte> keydir_meta,
+    std::span<const std::byte> authority_meta,
     RecoverySnapshots& recovery) {
-    // 链重放：行 → LWW put；删除 → remove_if_older，ord 守卫顺序无关；
-    // kKeydirDelta 段推进标量/fstats/字节水位。行/删除先于 meta 应用
-    // （meta 的水位声明覆盖 ≤ 行集）。
-    for (const auto& r : rows) {
-        keydir_->put(r.ext, r.slot.loc.file_id,
-                     r.slot.loc.total_sz, r.slot.loc.offset,
-                     r.slot.tstamp, /*now*/ 0,
-                     /*newest*/ false, 0, 0, r.ord);
-        keydir_->advance_ord(r.ord);
-    }
-    for (const auto& m : rems) {
-        (void)keydir_->remove_if_older(m.key, m.tomb);
-        keydir_->advance_ord(m.tomb);
-    }
-    if (!keydir_meta.empty()) {
-        if (auto wms = keydir_->apply_meta_delta(keydir_meta)) {
-            // 链尾水位驱动 fold_start（快照对里最新的一份）。
-            recovery.snap_wms = std::move(*wms);
-        }
-    }
+    // S43-9：data 文件是唯一物理权威；docmap checkpoint 只恢复搜索侧。
+    // 不再把搜索链 delta 回写 OKI，否则会与 data rebuild 双记。
+    (void)rows;
+    (void)rems;
+    (void)authority_meta;
+    (void)recovery;
 }
 
 // S17-5:legacy search.ckpt → per-component 一次性迁移。流程：
@@ -206,17 +193,233 @@ bool Cask::migrate_legacy_search_ckpt() {
     return true;
 }
 
-// ---- open 时重建 keydir ----------------------------------------------------
-// 优先 fold(hint_file)，hint 缺失或 trailer CRC 校验不过时回退到 fold(data_file)
-// 重建。fold 顺序按 tstamp 升序——保证后写入的 entry 覆盖前面的。
+// ---- open 时重建索引权威 ---------------------------------------------------
+// data-only fold 重建。fold 顺序按 tstamp 升序——保证后写入的 entry 覆盖前面的。
 // search_layer 为空时跳过 SearchLayer 的恢复。
-std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
+// S43-3：健康 BCOM v4 + 有效 run 时优先走 data-only streaming recovery。
+// 返回 false 不代表 open 失败，caller 继续走传统全量 fold / rebuild。
+bool Cask::try_data_only_recovery(
+    const std::vector<fileops::DataFileEntry>& entries) {
+    auto& oki = authority_->state();
+    const bool search_on = text_ != nullptr;
+    if (search_on || opts_.merge_only) return false;  // value 恢复仍走旧路径
+    if (!oki.loaded() || !oki.manifest_metadata().has_value()) return false;
+
+    // S43-3：mode-stamp mismatch 是一级公民 fallback，不做“顺手升级”。
+    // 只有 level_b 戳可信时，run 内 loc 才是 merge/写路径在线维护的
+    // 权威。Level A 目录的 merge relocation 不入 OKI；若这里启用冷侧，
+    // 重开后会把 stale loc 当权威，可能指向已退休文件。
+    const bool intended_level_b =
+        opts_.read_write && opts_.keydir_cache_entries > 0;
+    if (!oki.manifest_level_b() || !intended_level_b) return false;
+    const auto& commit = *oki.manifest_metadata();
+
+    // v1 行没有位置和 bloom；混入即组合视图不可点查。这是显式覆盖缺口，
+    // 不能靠空 authority 上的普通 get 兜底。v2/v3 load 时已完成结构校验。
+    for (const auto& r : oki.manifest_runs()) {
+        if (r.format_ver == oki::kRunVersion) return false;
+    }
+
+    // v4 全局段和 run 覆盖必须自洽。active key >0 但 0 run 是明显缺口；
+    // next_ord >= wm 允许 delta/tail 超前，但反过来会吞掉已提交 tail。
+    if (commit.next_ord < oki.wm() ||
+        (commit.active_keys != 0 && oki.manifest_runs().empty())) {
+        return false;
+    }
+
+    // data 字节水位是 ord 水位的物理落点。缺失（旧 v4）时从 0 全扫但仍
+    // 只收 ord>=wm；水位超前文件大小是不可修复的落点错误，交全量 rebuild。
+    std::unordered_map<std::uint32_t, std::uint64_t> committed_ends;
+    committed_ends.reserve(oki.manifest_data_wms().size());
+    for (const auto& [file_id, end] : oki.manifest_data_wms()) {
+        committed_ends.emplace(file_id, end);
+    }
+
+    oki::OkiManifest manifest;
+    manifest.metadata = commit;
+    manifest.fstats = oki.manifest_fstats();
+    if (!authority_->adopt_manifest(manifest)) {
+        return false;
+    }
+
+    oki.enable_point_query();
+
+    std::unordered_map<std::uint32_t, std::uint64_t> progress;
+    progress.reserve(entries.size());
+    auto durable_now = [&](std::uint32_t current_id,
+                           std::uint64_t current_end) {
+        std::vector<std::pair<std::uint32_t, std::uint64_t>> wms;
+        wms.reserve(entries.size());
+        for (const auto& e : entries) {
+            const std::uint32_t fid =
+                static_cast<std::uint32_t>(e.tstamp);
+            if (fid == current_id) {
+                wms.emplace_back(fid, current_end);
+            } else if (auto it = progress.find(fid); it != progress.end()) {
+                wms.emplace_back(fid, it->second);
+            }
+        }
+        return wms;
+    };
+
+    // 串行按 file_id 升序 fold：恢复期不需要并发抢 CPU，也保证同一
+    // data file 内的 append/墓碑序不被打乱；跨文件乱序由 ord 裁决。
+    for (const auto& e : entries) {
+        const std::uint32_t fid = static_cast<std::uint32_t>(e.tstamp);
+        (void)authority_->increment_file_id_at_least(fid);
+
+        std::error_code size_ec;
+        const std::uint64_t file_size = std::filesystem::file_size(
+            bitcask::detail::from_utf8(e.data_path), size_ec);
+        if (size_ec) return false;
+
+        std::uint64_t start = 0;
+        if (auto it = committed_ends.find(fid); it != committed_ends.end()) {
+            if (it->second > file_size) return false;
+            start = it->second;
+        }
+        if (start >= file_size) {
+            progress[fid] = start;
+            continue;
+        }
+
+        auto df = fileops::DataFile::open(
+            e.data_path, fileops::DataFile::Mode::kRead,
+            /*sync=*/false, /*mmap_enabled=*/false);
+        if (!df) return false;
+
+        std::uint64_t current_end = start;
+        std::uint64_t last_valid_end = start;
+        struct StagedRec {
+            format::RecordType type;
+            std::uint64_t tstamp;
+            std::uint64_t ord;
+            std::vector<std::byte> key;
+            std::vector<std::byte> value;
+            std::uint64_t offset;
+            std::uint32_t total_size;
+        };
+        std::vector<StagedRec> staged;
+        std::uint64_t batch_end = 0;
+        bool flush_failed = false;
+        auto apply_rec = [&](const codec::DataRecordView& view,
+                             std::uint64_t offset,
+                             std::uint32_t total_size) {
+            if (view.type == format::RecordType::kTombstone) {
+                authority_->account_recovery_row(
+                    bytes_to_view(view.key), fid, total_size,
+                    view.tstamp, view.ord, /*tomb=*/true);
+                oki.append(bytes_to_view(view.key), view.ord,
+                           /*tomb=*/true);
+            } else {
+                const oki::RowLoc loc{fid, total_size, offset, view.tstamp};
+                authority_->account_recovery_row(
+                    bytes_to_view(view.key), fid, total_size,
+                    view.tstamp, view.ord, /*tomb=*/false);
+                oki.append(bytes_to_view(view.key), view.ord,
+                           /*tomb=*/false, &loc);
+            }
+            current_end = offset + total_size;
+        };
+
+        auto fr = df->fold(
+            [&](const codec::DataRecordView& view,
+                std::uint64_t offset, std::uint32_t total_size) {
+                if (view.type == format::RecordType::kBatchHeader) {
+                    auto bh = codec::decode_batch_header_value(view.value);
+                    if (!bh) return;
+                    batch_end = offset + total_size + bh->span_bytes;
+                    staged.clear();
+                    // 批成员收口后才可引用；水位停在批头之前。
+                    authority_->advance_ord(view.ord);
+                    return;
+                }
+                if (batch_end != 0) {
+                    StagedRec sr;
+                    sr.type = view.type;
+                    sr.tstamp = view.tstamp;
+                    sr.ord = view.ord;
+                    sr.key.assign(view.key.begin(), view.key.end());
+                    sr.value.assign(view.value.begin(), view.value.end());
+                    sr.offset = offset;
+                    sr.total_size = total_size;
+                    staged.push_back(std::move(sr));
+                    if (offset + total_size >= batch_end) {
+                        for (const auto& s : staged) {
+                            codec::DataRecordView v{
+                                .crc = 0,
+                                .type = s.type,
+                                .tstamp = s.tstamp,
+                                .ord = s.ord,
+                                .key = s.key,
+                                .value = s.value,
+                                .total_size = s.total_size,
+                            };
+                            apply_rec(v, s.offset, s.total_size);
+                        }
+                        staged.clear();
+                        batch_end = 0;
+                    }
+                    return;
+                }
+                apply_rec(view, offset, total_size);
+
+                // S43-3：恢复 flush 和普通写路径同一条协议（run fsync →
+                // Reader 校验 → manifest 原子发布 → delta 截断）。当前文件
+                // 已扫描到的记录先 fsync，才允许 run 引用该位置。
+                if (oki.should_flush()) {
+                    if (!df->sync_fd_only(current_end) ||
+                        !oki.flush(dirname_,
+                                   durable_now(fid, current_end))) {
+                        // 失败时交全量兜底；已提交前缀仍有效，delta 保留。
+                        flush_failed = true;
+                        return;
+                    }
+                }
+            },
+            /*tolerate_crc_errors=*/true,
+            /*out_last_valid_end=*/&last_valid_end,
+            /*start_offset=*/start);
+        if (!fr || flush_failed) return false;
+
+        // tail 的 torn write 语义与传统恢复一致：写打开且持锁时截掉尾部。
+        // 这里一定不是 merge_only；RO 不截断，留给下一次可写 open。
+        if (opts_.read_write && last_valid_end < file_size) {
+            auto wdf = fileops::DataFile::open(
+                e.data_path, fileops::DataFile::Mode::kAppend);
+            if (wdf) (void)wdf->truncate_to(last_valid_end);
+            progress[fid] = last_valid_end;
+        } else {
+            progress[fid] = last_valid_end;
+        }
+        df->close();
+    }
+    return true;
+}
+
+std::expected<void, CaskFault> Cask::load_authority_from_disk() {
     // S19-2：搜索模式判定改成员（text_ 非空 = 索引模式）。
     const bool search_on = text_ != nullptr;
     auto entries = fileops::scan_dir(dirname_);
     if (!entries) return std::unexpected(io_fault(entries.error().errnum, dirname_));
 
-    // S33-4：OKI manifest 先载——wm 就位后，后续 fold/链重放经 keydir
+    // S43-8：hint 从本版起只是历史加速缓存。可写普通句柄已持有
+    // write.lock，这里惰性清掉所有旧产物（含无 data 配对的孤儿）；
+    // 只读句柄不改变目录，merge_only 不代表独占写权。清理失败不阻断
+    // data-only recovery / fold(data)。
+    if (opts_.read_write && !opts_.merge_only) {
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(dirname_, ec)) {
+            if (ec) break;
+            std::error_code hint_ec;
+            if (!entry.is_regular_file(hint_ec) || hint_ec) continue;
+            if (entry.path().extension() != ".hint") continue;
+            std::error_code remove_ec;
+            (void)std::filesystem::remove(entry.path(), remove_ec);
+        }
+    }
+
+    // S33-4：OKI manifest 先载——wm 就位后，后续 fold/链重放经权威
     // put/remove 咽喉点的挂钩自动只收 ord ≥ wm 的 tail 行（零逐点改动）。
     // 缺失/损坏 → 未加载态，收尾 finish_oki_recovery 整体重建。
     // S36-4 Level B open 协议（设计 §D3/§8 + S36-2/3 立的硬要求）：
@@ -227,29 +430,36 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
     //   4. 带戳目录 + Level B 意图 → 恢复期即启点查（挂钩入锁 + 冷视图
     //      计数裁决在 tail 重放期间就位；v4 子集快照亦以此为前提）。
     const bool level_b_intent = opts_.keydir_cache_entries > 0;
-    keydir_->oki().set_level_b(level_b_intent && opts_.read_write &&
+    authority_->state().set_level_b(level_b_intent && opts_.read_write &&
                                !opts_.merge_only);
-    keydir_->oki().load(dirname_);
-    if (opts_.merge_only && keydir_->oki().loaded() &&
-        keydir_->oki().manifest_level_b()) {
+    authority_->state().load(dirname_);
+    if (opts_.merge_only && authority_->state().loaded() &&
+        authority_->state().manifest_level_b()) {
         return std::unexpected(err(
             CaskError::kIo,
             "merge_only sidecar cannot open a Level B "
             "(keydir_cache_entries) maintained directory"));
     }
     if (opts_.read_write && !opts_.merge_only) {
-        keydir_->oki().stamp_mode(dirname_);  // 仅降级清戳（升级走重建）
+        authority_->state().stamp_mode(dirname_);  // 仅降级清戳（升级走重建）
     }
     const bool level_b_trusted = level_b_intent &&
-                                 keydir_->oki().loaded() &&
-                                 keydir_->oki().manifest_level_b();
-    if (level_b_trusted) keydir_->oki().enable_point_query();
+                                 authority_->state().loaded() &&
+                                 authority_->state().manifest_level_b();
+    if (level_b_trusted) authority_->state().enable_point_query();
+
+    // S43-3：data-only 主路径。成功时返回，完全不装 BCKS、不扫 hint、
+    // 也不构建全量内存索引；失败自然落入下方传统兜底路径。
+    if (try_data_only_recovery(*entries)) {
+        return {};
+    }
 
     // P14e:search.ckpt 分段快照快路径。search.ckpt 健康且全段 CRC 通过
     // 时，fold 从 keydir 水位起跳过已覆盖字节；否则全量 fold（各索引自门）。
     auto recovery = load_recovery_snapshots();
     if (!recovery) return std::unexpected(recovery.error());
     bool snap_loaded = recovery->snap_loaded;
+    (void)snap_loaded;
     const auto& snap_wms = recovery->snap_wms;
     auto wm_of = [&](std::uint32_t fid) -> std::uint64_t {
         for (auto& [id, off] : snap_wms) {
@@ -357,48 +567,12 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
         [&](const fileops::DataFileEntry& e) -> std::expected<void, CaskFault> {
         // 把 keydir 的 biggest_file_id 推到至少这个文件的 id——保证后续
         // 分配新 file_id 时不会跟磁盘上已有的文件冲突。
-        keydir_->increment_file_id_at_least(static_cast<std::uint32_t>(e.tstamp));
+        (void)authority_->increment_file_id_at_least(
+            static_cast<std::uint32_t>(e.tstamp));
 
-        // 优先走 hint 文件加速路径（不读 value，省掉绝大部分 I/O）。
-        // hint 缺失或 trailer CRC 不通过则 fallback 到 fold(data) 全量重建。
-        // SearchLayer 恢复需要读 value（text 段），有 search_layer 时跳过 hint。
         const std::uint64_t fold_start =
             snap_loaded ? wm_of(static_cast<std::uint32_t>(e.tstamp)) : 0;
-
-        bool used_hint = false;
-        if (e.has_hint && !search_on && !snap_loaded) {
-            auto hf = fileops::HintFile::open(e.hint_path,
-                                                fileops::HintFile::Mode::kRead);
-            if (hf) {
-                // S13-P8：单遍校验+fold（原 validate_trailer 全文件读一遍、
-                // fold 再读一遍）。CRC 不过时回调零次，keydir 零污染。
-                // S33（hint v5）：记录带 ord——put 用真实 ord 并 advance，
-                // 与 fold(data) 路径恢复结果完全等价（v4 时代 ord 恒 0 的
-                // 怪癖随 flag-day 消除）。
-                auto fr = hf->fold_validated([&](const auto& rec) {
-                        if (rec.tombstone) {
-                            // 墓碑 hint 必须执行——否则前一个 file 里的同 key
-                            // 活 entry 会被错误保留。S33：携带 ord + 缺席即
-                            // 插 sentinel——并行恢复下 remove/put 到达序无关
-                            // （复活门见 keydir put_insert）。
-                            keydir_->remove(bytes_to_view(rec.key), rec.tstamp,
-                                            rec.ord,
-                                            /*insert_tombstone_if_absent=*/true);
-                            keydir_->advance_ord(rec.ord);
-                            return;
-                        }
-                        keydir_->put(bytes_to_view(rec.key),
-                                     static_cast<std::uint32_t>(e.tstamp), rec.total_sz, rec.offset,
-                                     rec.tstamp, /*now*/ 0,
-                                     /*newest*/ false, 0, 0, rec.ord);
-                        keydir_->advance_ord(rec.ord);
-                });
-                if (fr && *fr) used_hint = true;
-            }
-        }
-        if (used_hint) return {};
-
-        // Fallback：fold 整个 data file。tolerate_crc_errors=true 让单条
+        // S43-8：恢复恒 fold(data)。tolerate_crc_errors=true 让单条
         // 损坏的 record 跳过而不是中断整个文件加载——legacy 也是这语义。
         // out_last_valid_end 用于后续 torn-write 修复。
         // P6:恢复纯 fold,不 mmap(避免对大库逐文件全映射)。
@@ -429,14 +603,9 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                              std::uint64_t offset, std::uint32_t total_size) {
                 if (view.type == format::RecordType::kTombstone) {
                     // S33：携带 ord + 缺席即插 sentinel（并行恢复到达序无关，
-                    // 同 hint 路径）。
-                    keydir_->remove(bytes_to_view(view.key), view.tstamp,
-                                    view.ord,
-                                    /*insert_tombstone_if_absent=*/true);
-                    // S33：墓碑 ord 也推进水位——否则文件末尾是墓碑时
-                    // next_ord 落后于盘上已用 ord，重启后 alloc_ord 复用
-                    // （与 hint v5 路径对齐；OKI max-ord-wins 依赖 ord 不重）。
-                    keydir_->advance_ord(view.ord);
+                    // 与恢复裁决一致）。
+                    // S43-9：search 全量 fold 只恢复索引侧；权威账本随后
+                    // 用 rebuild_from_data 从同一份 data 精确重建。
                     if (search_on) {
                         // S3:墓碑前 flush 攒批，保「文档↔墓碑」相对序（否则墓碑
                         // 可能先于其要删的 batch 内文档插入而被无效化）。
@@ -449,10 +618,8 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                     }
                     return;
                 }
-                keydir_->put(bytes_to_view(view.key), static_cast<std::uint32_t>(e.tstamp),
-                             total_size, offset, view.tstamp, /*now*/ 0,
-                             /*newest*/ false, 0, 0, view.ord);
-                keydir_->advance_ord(view.ord);
+                (void)total_size;
+                (void)offset;
                 if (search_on) {
                     auto dv = codec::decode_doc_value(std::span<const std::byte>(view.value));
                     // V3.3:带向量的文档即使 text 为空也要恢复(否则
@@ -519,7 +686,6 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
                     batch_end = offset + total_size + bh->span_bytes;
                     staged.clear();
                     // 批头 ord 推进水位（区间即使被弃，跳号无害、复用有害）。
-                    keydir_->advance_ord(view.ord);
                     return;
                 }
                 if (batch_end != 0) {
@@ -612,11 +778,10 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
         if (search_on && recovered_docs >= kPostRecoveryCkptMinDocs &&
             opts_.read_write && !opts_.merge_only) {
             // S14-7：经成对入口（fold 后链可能有效 → delta 回存更省）。
-            std::vector<std::byte> kd;
             auto wms0 = collect_snapshot_watermarks();
-            if (wms0) keydir_->serialize_meta_delta(kd, *wms0);
+            std::vector<std::byte> kd;
             if (!save_search_ckpt_paired(dirname_ + "/" + kSearchCkptName,
-                                         keydir_->peek_next_ord(), wms0,
+                                         authority_->peek_next_ord(), wms0,
                                          kd)) {
                 log_warn("post-recovery search checkpoint save failed "
                          "(next open will re-fold)");
@@ -657,68 +822,85 @@ std::expected<void, CaskFault> Cask::load_keydir_from_disk() {
     return {};
 }
 
-// S33-4：恢复收尾——OKI 缺口检查与全量重建。
-//
-// 缺口来源：keydir 快照使 fold 跳过字节水位前的行，这些行 ord 全部 <
-// snap_next_ord（快照自身的 next_ord，链重放前捕获）。manifest 缺失/损坏，
-// 或 wm < snap_next_ord（快照写后、OKI flush 前崩溃的窗口）→ 无法靠 tail
-// 重放补齐 → 整体重建：迭代 keydir 活 key（快照语义）排序写单一 run，
-// cover = 当前 peek_next_ord()（open 单线程，无并发写者）。
-//
-// 只在可写句柄做（RO/merge_only 不持 write.lock，不产文件；OKI 保持未
-// 加载态，S33-5 的 range 查询届时按不可用降级）。best-effort：失败仅降级
-// OKI 可用性（下次 open 再试），不阻断 open。
+// S43-9：恢复收尾只做可信门检查；权威缺失/缺口由 data 重建兜底。
 void Cask::finish_oki_recovery(bool snap_loaded,
                                std::uint64_t snap_next_ord) noexcept {
-    if (!opts_.read_write || opts_.merge_only) return;
-    auto& oki = keydir_->oki();
+    // data-only 恢复在成功时提前返回且已经 adopt manifest + ledger。
+    // 走到这里的一定是全量/tail fold 路径；S43-9 下该路径只恢复搜索侧，
+    // 但 ledger-only 重建不等于重发索引视图：已加载 OKI 是读端故障检测
+    // 的对象，尤其语义坏行必须在 locate/get 时按受控重建暴露；v3 目录
+    // 也不得在 open 期伪造 v4 元数据。只有未加载态才整体重建并换 run。
+    if (opts_.merge_only) return;
+
     const bool level_b = opts_.keydir_cache_entries > 0;
-    const bool gap = snap_loaded && oki.wm() < snap_next_ord;
-    // S36-4：Level B 对未带戳的 manifest 必须全量重建起步（S36-2 硬要求：
-    // 关门期间的 merge 会让 run loc 陈旧，不可采信）。此路径下哈希必然
-    // 完整（v4 子集快照的接受前提就是带戳 manifest——未带戳 ⟹ 快照被拒
-    // ⟹ 全量 fold），迭代重建合法。
-    if (!oki.loaded() || gap || (level_b && !oki.manifest_level_b())) {
-        std::vector<oki::OkiState::DeltaRow> rows;
-        rows.reserve(static_cast<std::size_t>(keydir_->info().key_count));
-        auto it = keydir_->make_iter();
-        if (it->start(/*now_sec*/ 0, /*maxage*/ -1, /*maxputs*/ -1) !=
-            keydir::StartIterResult::kOk) {
-            log_warn("oki rebuild: keydir iteration unavailable "
-                     "(oki disabled until next open)");
-            oki_rebuild_failed_ = true;
-            return;
-        }
-        while (auto p = it->next()) {
-            // S36-2：全字段行（BCOK v2）——组合视图点查的权威载体。
-            rows.push_back(oki::OkiState::DeltaRow{
-                std::string(p->key), p->ord, /*tomb=*/false,
-                /*has_loc=*/true,
-                oki::RowLoc{p->file_id, p->total_sz, p->offset, p->tstamp}});
-        }
-        it->release();
-        if (!oki.rebuild(dirname_, std::move(rows),
-                         keydir_->peek_next_ord())) {
-            log_warn("oki rebuild failed (oki disabled until next open)");
-            oki_rebuild_failed_ = true;
+    const bool read_only = !opts_.read_write;
+    const bool state_loaded = authority_->state().loaded();
+    bool rebuild_state = !state_loaded ||
+        (level_b && !authority_->state().manifest_level_b()) ||
+        (read_only && !authority_->state().point_query_enabled());
+    // 已载 Level B 的两道持久门：run 集为空但 data 有活 key 说明 wm/盖
+    // 且回滚；字节水位越过 EOF 说明引用了不存在的提交点。二者都不可
+    // 保留视图。健康 v3 迁移（有 run、无 v4 元数据）仍只补 ledger。
+    bool data_wms_valid = true;
+    if (level_b) {
+        for (const auto& [file_id, byte_wm] :
+             authority_->state().manifest_data_wms()) {
+            std::error_code ec;
+            const auto path = fs::path(dirname_) /
+                (std::to_string(file_id) + ".bitcask.data");
+            if (!fs::exists(path, ec) || ec ||
+                byte_wm > fs::file_size(path, ec)) {
+                data_wms_valid = false;
+                break;
+            }
         }
     }
-#ifndef NDEBUG
-    // S36-2 影子对拍（风险闸）：debug 构建下 OKI 就绪即自动开启——全量
-    // 测试套件的每一次 get 都在对拍组合视图 vs 哈希权威，漂移即 assert。
-    // Release（含 build-rel/bench）不开：locate 冷侧有真实 IO 成本。
-    if (oki.loaded()) keydir_->set_oki_shadow_check(true);
-#endif
-    // S36-4：Level B 收尾——点查/预算在恢复全部收官后就位。前提 = manifest
-    // 已带戳（重建成功即带；重建失败则戳缺失 → 保持 Level A 形态：全量
-    // 缓存、零逐出——组合视图不可信/不可用时逐出无兜底）。
-    if (level_b && oki.loaded() && oki.manifest_level_b()) {
-        oki.enable_point_query();
-        keydir_->set_cache_budget(opts_.keydir_cache_entries);
-    } else if (level_b) {
-        log_warn("level_b requested but oki not trusted/loaded; "
-                 "running without eviction until next open");
+    // 空 run 集但 data 有活 key，是崩溃前的 memdelta 尾部丢失（典型：
+    // 可写进程未 close 就退出）。data 是唯一真相，必须全量重建视图；
+    // 有 run 的健康 v3 目录仍只补账本，不得在 open 期伪造/替换视图。
+    if (state_loaded && authority_->state().manifest_runs().empty() &&
+        !rebuild_state) {
+        if (!authority_->rebuild_ledger_from_data(dirname_) ||
+            authority_->info().key_count !=
+                authority_->state().manifest_metadata()
+                    .value_or(bitcask::oki::OkiManifestMetadata{})
+                    .active_keys) {
+            rebuild_state = true;
+        }
     }
+    rebuild_state = rebuild_state || (level_b && !data_wms_valid);
+
+    bool ok = rebuild_state
+                  ? authority_->rebuild_from_data(dirname_)
+                  : authority_->rebuild_ledger_from_data(dirname_);
+    if (rebuild_state && read_only) {
+        ok = authority_->rebuild_memory_from_data(dirname_);
+    }
+    if (!ok) {
+        log_warn("oki authority recovery failed (oki disabled until "
+                 "next open)");
+        authority_->state().degrade_for_rebuild();
+        oki_rebuild_failed_ = true;
+    } else {
+        // 未加载重建成功后才有可点查视图；已加载视图沿用 open 早期
+        // 的模式门（Level B 才开）。ledger-only 不改变该决策。
+        if (read_only || (!authority_->state().loaded() && level_b)) {
+            authority_->state().enable_point_query();
+        }
+    }
+    (void)snap_loaded;
+    (void)snap_next_ord;
+}
+
+// S43-1：运行期受控重建。写序闸门内重扫 data（唯一持久真相），账本与
+// OKI run 一起由 IndexAuthority 原子重建。
+bool Cask::rebuild_oki_from_data() noexcept {
+    bool ok = opts_.read_write
+                  ? authority_->rebuild_from_data(dirname_)
+                  : authority_->rebuild_memory_from_data(dirname_);
+    if (!ok) log_warn("oki runtime rebuild failed");
+    if (ok) authority_->state().enable_point_query();
+    return ok;
 }
 
 // P14e/P14b:加载 keydir 快照 + search.ckpt 分段快照。用 watermark 单趟
@@ -731,24 +913,6 @@ void Cask::finish_oki_recovery(bool snap_loaded,
 std::expected<Cask::RecoverySnapshots, CaskFault>
 Cask::load_recovery_snapshots() {
     RecoverySnapshots recovery;
-
-    // S14-7：keydir base 快照**先**载（链的行/删除要应用在 base 之上）。
-    // S36-4：v4（缓存子集）只在 Level B 意图 + 带戳 manifest + wm 覆盖快照
-    // 点时接受（gating 在 load_snapshot 内）；其余情形拒收 → 全量 fold。
-    const bool accept_subset = opts_.keydir_cache_entries > 0 &&
-                               keydir_->oki().loaded() &&
-                               keydir_->oki().manifest_level_b();
-    if (auto w = keydir_->load_snapshot(dirname_ + "/" + kKeydirSnapName,
-                                        accept_subset,
-                                        keydir_->oki().wm())) {
-        recovery.snap_wms = std::move(*w);
-        recovery.snap_loaded = true;
-        // S33-4/S36-5：OKI 缺口检查基准 = 快照**实载条目**的 ord 覆盖界
-        // （原 next_ord 标量——B1 起快照过滤未持久尾巴，被滤条目由水位
-        // fold 重放补回、不需 runs 覆盖，用 next_ord 会把持留行为误判成
-        // 缺口而每次崩溃恢复都全量重建）。
-        recovery.snap_next_ord = keydir_->snapshot_covered_ord();
-    }
 
     bool search_ok = false;
     if (text_) {
@@ -800,8 +964,8 @@ Cask::load_recovery_snapshots() {
             [this, &recovery](
                 const std::vector<index::DocmapDeltaRow>& rows,
                 const std::vector<index::DocmapDeltaRemoval>& rems,
-                std::span<const std::byte> keydir_meta) {
-                replay_delta_to_keydir(rows, rems, keydir_meta, recovery);
+                std::span<const std::byte> authority_meta) {
+                replay_delta_to_authority(rows, rems, authority_meta, recovery);
             };
         const auto hook_arg = recovery.snap_loaded ? hook :
             index::DocmapReplayHook{};

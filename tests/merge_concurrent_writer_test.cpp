@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <bitcask/cask.hpp>
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_registry.hpp>
 #include <bitcask/data_file.hpp>
 
 #include <atomic>
@@ -22,8 +22,8 @@ namespace {
 // S6-P0-pre：open() 现强制非空 registry。测试/bench 共享一个进程内 registry——
 // 各用例用唯一目录名，互不冲突；同用例内 open→close→reopen 经 refcount 归零
 // 重新从盘加载，与旧 nullptr 行为等价。
-inline bitcask::keydir::KeyDirRegistry& test_registry() {
-    static bitcask::keydir::KeyDirRegistry reg;
+inline bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 
@@ -228,7 +228,7 @@ TEST_F(MergeConcurrentWriterTest, ConcurrentMergePreservesActiveFile) {
   auto it = cask.make_iter();
   auto sr = it->start();
   ASSERT_TRUE(sr);
-  ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+  ASSERT_TRUE(sr.has_value());
 
   std::uint32_t new_key_file_id = 0;
   while (true) {
@@ -355,7 +355,7 @@ TEST_F(MergeConcurrentWriterTest, MergeFailureLeavesKeydirConsistent) {
   auto it = cask.make_iter();
   auto sr = it->start();
   ASSERT_TRUE(sr);
-  ASSERT_EQ(*sr, bitcask::keydir::StartIterResult::kOk);
+  ASSERT_TRUE(sr.has_value());
   auto first = it->next();
   ASSERT_TRUE(first);
   ASSERT_TRUE(first->has_value());

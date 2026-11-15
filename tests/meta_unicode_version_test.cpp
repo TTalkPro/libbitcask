@@ -9,7 +9,7 @@
 
 #include <bitcask/cask.hpp>
 #include <bitcask/detail/icu_util.hpp>
-#include <bitcask/keydir_registry.hpp>
+#include <bitcask/index_registry.hpp>
 #include <bitcask/meta_file.hpp>
 
 #include <cstdint>
@@ -25,8 +25,8 @@ namespace fs = std::filesystem;
 using bitcask::Cask;
 using bitcask::CaskOptions;
 
-inline bitcask::keydir::KeyDirRegistry& test_registry() {
-    static bitcask::keydir::KeyDirRegistry reg;
+inline bitcask::oki::IndexRegistry& test_registry() {
+    static bitcask::oki::IndexRegistry reg;
     return reg;
 }
 

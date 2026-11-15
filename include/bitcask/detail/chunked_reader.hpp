@@ -1,10 +1,9 @@
 // T23：流式 chunked pread 的共享 refill 基建。
 //
-// 归并前有三份手抄的 refill（hint_file.cpp v2 fold / fold_v4、
-// data_file.cpp fold），`need` 公式已出现漂移（data_file 版丢了
-// `buf_len +`，当时无害但证明分别维护不可靠）。本类收敛为唯一实现，
-// hint v5 fold 与 data fold 共用；唯一参数化点是文件读取上界 end_bound
-// （data fold 用文件总长快照，hint fold 用 body_end = total − trailer）。
+// 归并前 data_file.cpp fold 有多份手抄 refill，`need` 公式曾出现漂移
+// （data_file 版丢了 `buf_len +`，当时无害但证明分别维护不可靠）。
+// 本类收敛为唯一实现；end_bound 是文件读取上界（data fold 用文件总长
+// 快照，不读 caller 语义之外的字节）。
 //
 // 语义：buf 内有效数据区间 [pos, len)，对应文件 [file_off, file_off+avail)。
 // refill 把残留字节 memmove 到 buf 头部，再续读一整块 kChunkBytes（或按
@@ -43,10 +42,10 @@ public:
     void consume(std::size_t n) noexcept { pos_ += n; }
 
     // refill：残留搬到头部 + 续读一块。file_off = cursor() 当前对应的文件
-    // 偏移（caller 的消费游标）。need_hint：本轮至少需要的可用字节数
+    // 偏移（caller 的消费游标）。need_bytes：本轮至少需要的可用字节数
     // （超过 kChunkBytes 时触发缓冲扩容）。返回新读字节数（0 = 到界/EOF）。
     [[nodiscard]] std::expected<std::size_t, io::IoError>
-    refill(std::uint64_t file_off, std::size_t need_hint) {
+    refill(std::uint64_t file_off, std::size_t need_bytes) {
         const std::size_t leftover = len_ - pos_;
         if (leftover > 0 && pos_ > 0) {
             std::memmove(buf_.data(), buf_.data() + pos_, leftover);
@@ -54,10 +53,9 @@ public:
         pos_ = 0;
         len_ = leftover;
 
-        // 统一后的公式：残留 + max(一块, 本轮所需)——T23 前 data_file 版
-        // 丢了 `len_ +`，此处以 hint 版（正确覆盖巨型 record）为准。
+        // 统一后的公式：残留 + max(一块, 本轮所需)，正确覆盖巨型 record。
         const std::size_t need =
-            std::max(len_ + kChunkBytes, len_ + need_hint);
+            std::max(len_ + kChunkBytes, len_ + need_bytes);
         buf_.ensure(need);
 
         const std::uint64_t file_remaining =

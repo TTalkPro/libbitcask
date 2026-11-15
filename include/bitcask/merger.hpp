@@ -1,5 +1,5 @@
-// Bitcask merger：把若干 fragmented data file 合并成一个新 data file
-// （+ hint），然后 CAS 更新 keydir 指向新位置。
+// Bitcask merger：把若干 fragmented data file 合并成一个新 data file，
+// 然后 CAS 把索引权威指向新位置。
 //
 // M3.3 的精简范围（M3.4+ 在 cask.cpp 里包了完整功能）：
 //   - 输出单个 data file，不超过 max_file_size 也不切分
@@ -10,11 +10,11 @@
 //   - 源文件里的墓碑 record 直接 SKIP（简化模型）
 //
 // 即使简化掉这些，run_merge 依然提供：
-//   1. 去重：只有 keydir 仍然指向 (file_id, offset) 的 key 才被复制——
-//      被覆盖 / 删除过的死 record 自然丢弃；
-//   2. 同步生成 hint 文件，加速下次 open 的 keydir 重建；
-//   3. 用 keydir->put(..., old_file_id, old_offset) 做 CAS 更新——
-//      避免跟其它 writer 抢同一个 key。
+//   1. S43-7：钉住 OKI ReadView，按 key 归并 runs + memdelta；只有权威
+//      loc 仍落在候选 data file 的 key 才被复制；
+//   2. S43-7：输出不写/finalize/link/copy hint；
+//   3. 输出 fsync 后用条件 CAS 提交 relocation；CAS 内部在分片锁内
+//      应用 OKI relocation，避免旧视图覆盖并发新写入。
 //
 // === 线程模型 ===
 //   - run_merge 自身不取任何锁；caller 必须在外部串行（典型做法：通过
@@ -32,7 +32,7 @@
 #include <string_view>
 #include <vector>
 
-#include "bitcask/keydir.hpp"
+#include "bitcask/index_authority.hpp"
 
 namespace bitcask::plugin { class CaskPlugin; }  // S18-7：merge 插件广播
 
@@ -54,11 +54,11 @@ struct MergeFault {
 
 struct MergeStats {
     std::string   output_data_path;
-    std::string   output_hint_path;
+    std::string   output_hint_path;  // ABI 兼容保留；S43-7 起恒为空。
     std::uint32_t output_file_id = 0;
     std::uint64_t records_seen   = 0;   // 输入文件总扫过的 record 数
     std::uint64_t records_kept   = 0;   // 实际复制到输出的
-    std::uint64_t records_stale  = 0;   // 跳过：keydir 已指向别处
+    std::uint64_t records_stale  = 0;   // S43-7： relocation CAS 被并发写者抢先
     std::uint64_t records_tombs  = 0;   // 跳过：源 record 是墓碑
     std::uint64_t records_expired = 0;  // S13-D5：per-key TTL 过期，丢弃 + 清 keydir
     std::uint64_t bytes_written  = 0;
@@ -70,8 +70,8 @@ struct MergeStats {
 };
 
 // 把 input_data_paths（必须都是 data file，不是 hint）合并到 output_dir
-// 下一个新 data file + 新 hint。新文件的 file_id 通过
-// keydir.increment_file_id() 分配，写在 MergeStats 里返回。
+// 下一个新 data file。新文件的 file_id 通过
+// authority.increment_file_id() 分配，写在 MergeStats 里返回。
 //
 // sync_output=true 让输出文件以 O_SYNC 打开——cask 的 sync_strategy=o_sync
 // 时使用，保证 merge 输出立刻落盘。
@@ -89,7 +89,7 @@ struct MergeStats {
 [[nodiscard]] std::expected<MergeStats, MergeFault>
 run_merge(std::span<const std::string> input_data_paths,
           std::string_view output_dir,
-          keydir::KeyDir& keydir,
+          oki::IndexAuthority& keydir,
           bool sync_output = false,
           std::span<plugin::CaskPlugin* const> plugins = {},
           std::uint64_t now_sec = 0);  // S13-D5：TTL 判定时刻（0 = 不判 TTL）

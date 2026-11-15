@@ -1,9 +1,8 @@
 // ThreadLocalBuffer — thread_local 字节复用缓冲的统一管理（S9-P1-d）。
 //
-// 多个 reader 可并发调同一 DataFile::read / HintFile::fold；pread 线程安全，
+// 多个 reader 可并发调同一 DataFile::read / fold；pread 线程安全，
 // 但读缓冲不能共享 → 各路径用 `static thread_local` 缓冲做稳态零分配复用。
-// 该模式在 data_file.cpp（get 热路径）与 hint_file.cpp（chunked fold）重复出现，
-// 共有三段逻辑：
+// 该模式在 data_file.cpp 的 get 热路径与 chunked fold 中重复出现，共有三段逻辑：
 //   ① ensure(n)      —— 按需扩容（只增不缩），返回数据指针；
 //   ② data()/size()  —— 直接访问底层缓冲（fold 的 cursor/memmove 需要）；
 //   ③ maybe_shrink() —— 用完后若超过 retain 阈值则释放，防一次超大读长期
