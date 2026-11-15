@@ -1254,7 +1254,7 @@ bool Cask::ensure_oki_for_write() noexcept {
     // 点查开关可能被影子对拍/Level B 读路径提前打开；只有 loaded 的
     // 组合视图才是可写权威。unavailable/v1 mixed 仍走受控重建。
     if (oki.write_probe_ready()) return true;
-    if (!opts_.read_write || opts_.merge_only) return false;
+    if (!opts_.read_write && !opts_.merge_only) return false;
 
     std::unique_lock<std::mutex> lk(oki_rebuild_mu_);
     oki_rebuild_cv_.wait(lk, [&] {
@@ -1264,7 +1264,9 @@ bool Cask::ensure_oki_for_write() noexcept {
 
     oki_rebuilding_.store(true, std::memory_order_release);
     lk.unlock();
-    const bool rebuilt = rebuild_oki_from_data();
+    const bool rebuilt = opts_.merge_only
+        ? authority_->rebuild_memory_from_data(dirname_)
+        : rebuild_oki_from_data();
     lk.lock();
     oki_rebuilding_.store(false, std::memory_order_release);
     oki_rebuild_cv_.notify_all();
