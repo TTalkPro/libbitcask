@@ -5,13 +5,29 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.9.0`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`6.9.1`**；库 `SOVERSION` = **`6`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
+
+---
+
+## [6.9.1] - 2026-11-16（S43 后续修复：merge-only 可完成 OKI readiness 重建）
+
+> **版本语义**：纯缺陷修复——公共 C++ / C API、盘上格式与 ABI 零改动；
+> `SOVERSION` 保持 `6`。取 PATCH +1（6.9.1）。
+
+### Fixed
+
+- **merge-only OKI readiness rebuild**：`ensure_oki_for_write()` 此前把
+  `opts_.merge_only` 与「不可写」一并拒绝，导致 merge-only 打开的库在
+  OKI 尚未达到写探针 ready 时无法从 data 完成受控重建。现在 merge-only
+  也允许重建，并走 `IndexAuthority::rebuild_memory_from_data()` 的轻量
+  路径；重建成功后显式启用 point query。健康 data 仍唯一真相，失败时
+  继续显式报错，不静默退回旧查找语义。
 
 ---
 
