@@ -467,4 +467,50 @@ TEST_F(OkiRegressionTest, NoWastedWriteAfterMerge) {
     c->close();
 }
 
+// 读视图里 (delta, runs) 必须属于同一提交点之间的状态：若读者拿着旧 delta
+// （只有原始行）却配上了新 runs（已含同 ord 的搬迁行），等 ord「delta 胜」
+// 会让旧位置压过新位置。检查：视图胜出行若指向旧文件(1)，则该视图的任何
+// run 里都不得已有同 ord 的新位置(2)。
+TEST_F(OkiRegressionTest, ReadViewEqualOrdNotInvertedAcrossFlush) {
+    using bitcask::oki::OkiState;
+    using bitcask::oki::RowLoc;
+    OkiState st;
+    ASSERT_TRUE(st.rebuild(dir_.string(), {}, 0));
+    std::atomic<bool> stop{false};
+    std::atomic<std::size_t> inverted{0};
+    std::thread reader([&] {
+        while (!stop.load()) {
+            auto v = st.make_read_view();
+            if (!v) continue;
+            auto mc = bitcask::oki::OkiMergeCursor::open(*v);
+            if (!mc) continue;
+            OkiState::DeltaRow row;
+            while (true) {
+                auto n = mc->next(row);
+                if (!n || !*n) break;
+                if (row.loc.file_id != 1) continue;
+                for (const auto& run : v->runs) {
+                    auto e = run->find(bytes(row.key));
+                    if (e && e->has_value() && (*e)->ord == row.ord &&
+                        (*e)->loc.file_id == 2) {
+                        ++inverted;
+                    }
+                }
+            }
+        }
+    });
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        const std::string key = "e" + std::to_string(i);
+        const RowLoc a{1, 10, i * 10, 1000};
+        const RowLoc b{2, 10, i * 10, 1000};
+        st.append(key, i, false, &a);
+        std::this_thread::yield();  // 放大「旧 delta 快照」窗口
+        st.append_update(key, i, false, &b);  // 同 ord 搬迁
+        ASSERT_TRUE(st.flush(dir_.string()));
+    }
+    stop.store(true);
+    reader.join();
+    EXPECT_EQ(inverted.load(), 0u) << "等 ord 的搬迁行被旧 delta 行压过";
+}
+
 }  // namespace

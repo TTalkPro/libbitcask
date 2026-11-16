@@ -231,6 +231,15 @@ target_link_libraries(bitcask_oki_levelb_test PRIVATE
 
 # S43-0：OKI-only 外部语义守门（lifecycle / Level B 冷视图 / atomic batch /
 # data-only reopen）。完整并发与崩溃矩阵由 S43-10 收口。
+# 一写多读基础件（SnapshotCell / SeqGate，header-only）。
+add_executable(bitcask_sync_primitives_test sync_primitives_test.cpp)
+target_link_libraries(bitcask_sync_primitives_test PRIVATE
+    GTest::gtest_main
+    bitcask_fileops
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 # OKI 审查修复回归：崩溃 tail 补回、归并保元数据、merge 墓碑/TTL 不复活、
 # 等 ord 选 merge 副本、Level A 干净重开不重建。
 add_executable(bitcask_oki_regression_test oki_regression_test.cpp)
@@ -443,6 +452,7 @@ gtest_discover_tests(bitcask_oki_run_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_recovery_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_only_contract_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_regression_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_sync_primitives_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_s43_rollout_gate_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_levelb_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_range_test ${_bitcask_test_props})

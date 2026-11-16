@@ -49,7 +49,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "bitcask/detail/atomic_shared_ptr.hpp"
+#include "bitcask/detail/seq_gate.hpp"
+#include "bitcask/detail/snapshot_cell.hpp"
 #include "bitcask/oki_run.hpp"
 #include "bitcask/string_hash.hpp"
 
@@ -352,9 +353,11 @@ private:
     [[nodiscard]] std::uint64_t next_gen_locked(std::string_view dir);
     std::uint64_t gen_floor_ = 0;  // 曾发布过的最大 gen（flush_mu_ 保护）
     std::vector<std::uint64_t> inflight_gens_;  // 在途构建的 gen（flush_mu_）
-    // runs 与 delta 同时替换（rebuild / install_memory_view）时奇数；
-    // make_read_view 不持 flush_mu_，靠它检出替换窗口重试。
-    std::atomic<std::uint64_t> view_epoch_{0};
+    // 读视图的成对一致闸：凡同时改动 runs 与 delta 的提交（flush 的「发布
+    // run + 裁前缀」、rebuild、install_memory_view）都在其写窗口内进行；
+    // make_read_view 不持 flush_mu_，经它取到成对的 (delta, runs)。写者由
+    // flush_mu_ 串行。只换 runs 的归并不进窗口（新旧内容等价）。
+    ::bitcask::detail::SeqGate view_gate_;
     std::mutex compact_mu_;         // compact_runs 串行
     std::mutex compact_thread_mu_;  // compact_thread_ 的启动/join
     std::thread compact_thread_;
@@ -401,7 +404,7 @@ private:
     // flush/rebuild 产出新 run 时随 manifest 提交同步维护）。
     RunsVec readers_;
     // readers_ 的不可变快照（atomic shared_ptr；locate 无锁取用）。
-    ::bitcask::detail::AtomicSharedPtr<const RunsVec> runs_snap_{nullptr};
+    ::bitcask::detail::SnapshotCell<RunsVec> runs_snap_;
 
     std::atomic<bool> loaded_{false};
     std::atomic<std::uint64_t> wm_{0};

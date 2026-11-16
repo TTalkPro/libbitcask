@@ -184,7 +184,7 @@ bool OkiState::write_probe_ready() const noexcept {
         !loaded_.load(std::memory_order_acquire)) {
         return false;
     }
-    const auto runs = runs_snap_.load(std::memory_order_acquire);
+    const auto runs = runs_snap_.load();
     if (!runs) return false;
     return std::none_of(
         runs->begin(), runs->end(),
@@ -228,8 +228,7 @@ void OkiState::degrade_for_rebuild() noexcept {
 }
 
 void OkiState::publish_runs_locked() {
-    runs_snap_.store(std::make_shared<const RunsVec>(readers_),
-                     std::memory_order_release);
+    runs_snap_.emplace(readers_);
 }
 
 void OkiState::load(std::string_view dir) {
@@ -486,6 +485,13 @@ bool OkiState::flush_locked_impl(
         std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
         return false;
     }
+    // 「发布新 run + 裁 delta 前缀」对读视图必须成对可见（view_gate_ 写
+    // 窗口）。只靠「先取 delta、后取 runs」的顺序能保证不缺行，但会把等 ord
+    // 的两行判反：读者手里的旧 delta 含原始行，新 run 含同 ord 的搬迁行 /
+    // 条件墓碑，归并时 delta 胜 ⟹ 旧位置压过新位置（输入文件删除后 fold
+    // 报 location disappeared）或已删除的 key 被当成活的。
+    {
+    const auto view_window = view_gate_.write();
     manifest_ = std::move(next);
     readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
     publish_runs_locked();
@@ -493,8 +499,7 @@ bool OkiState::flush_locked_impl(
     manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
     wm_.store(manifest_.wm, std::memory_order_release);
 
-    // 提交完成，删已固化的前缀（先发布 run 快照再删——中间态两边可见，
-    // delta 优先，语义不变）。IO 期间新 append 的行在前缀之后，保留；
+    // 提交完成，删已固化的前缀。IO 期间新 append 的行在前缀之后，保留；
     // S36-5：持留行（held）留在队头，相对序不变（(ord, 到达序) 格保持）。
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -515,6 +520,7 @@ bool OkiState::flush_locked_impl(
         rebuild_index_locked();
         update_flush_hint_locked();
     }
+    }  // view_window
     {
         std::lock_guard<std::mutex> vlk(view_mu_);
         sorted_view_.reset();
@@ -773,8 +779,9 @@ bool OkiState::install_built_run(
         sweep_runs(dir, keep, sweep_backlog_, inflight_gens_);
         block_cache_.purge_except(keep);  // S36-3：死 gen 块不占缓存
     }
-    // runs 与 delta 一起替换：读视图经 view_epoch_ 检出这一窗口并重试。
-    view_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    // runs 与 delta 一起替换：读视图经 view_gate_ 检出这一窗口并重试。
+    {
+    const auto view_window = view_gate_.write();
     manifest_ = std::move(next);
     readers_.clear();
     if (new_reader) readers_.emplace_back(gen, std::move(new_reader));
@@ -791,7 +798,7 @@ bool OkiState::install_built_run(
         rebuild_index_locked();
         update_flush_hint_locked();
     }
-    view_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }  // view_window
     {
         std::lock_guard<std::mutex> vlk(view_mu_);
         sorted_view_.reset();
@@ -815,7 +822,8 @@ void OkiState::install_memory_view(
 
     // 只读视图仍要有明确提交边界：空 run 集 + wm 表达“内存行覆盖全序”。
     // 旧 Reader 只经 shared_ptr 存活到在途视图结束，本进程不修改盘面。
-    view_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    {
+    const auto view_window = view_gate_.write();
     manifest_ = std::move(next);
     readers_.clear();
     publish_runs_locked();
@@ -834,7 +842,7 @@ void OkiState::install_memory_view(
         rebuild_index_locked();
         update_flush_hint_locked();
     }
-    view_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }  // view_window
     {
         std::lock_guard<std::mutex> vlk(view_mu_);
         sorted_view_.reset();
@@ -866,7 +874,7 @@ OkiState::LocateResult OkiState::locate(std::string_view key) const {
 
     // 2) 逐 run gen 降序（readers_ 恒按 gen 升序维护）：bloom 试探 →
     //    seek 二分 → 首行比对。首命中即权威（不变量见头文件）。
-    const auto runs = runs_snap_.load(std::memory_order_acquire);
+    const auto runs = runs_snap_.load();
     if (!runs) return out;  // kUnavailable（loaded 但快照未发布——不可达兜底）
     const std::span<const std::byte> kspan(
         reinterpret_cast<const std::byte*>(key.data()), key.size());
@@ -898,37 +906,47 @@ OkiState::LocateResult OkiState::locate(std::string_view key) const {
 std::optional<OkiState::ReadView> OkiState::make_read_view() const {
     // 不再取 flush_mu_：flush/归并/重建持该锁横跨长 IO，原实现让每次
     // range/迭代/merge 视图构建都陪等。一致性论证：
-    //   - flush 先发布新 run 快照、后裁 delta 前缀；归并只换 run 不动
-    //     delta。故**先取 delta、后取 runs**：若看到已裁的 delta，则新 run
-    //     必已发布（重复行由 (ord, 来源序) 消解，不会缺行）；
-    //   - rebuild / install_memory_view 同时替换 runs 与 delta，用
-    //     view_epoch_（奇数 = 替换中）检出并重试。
+    //   - 凡是同时改动 runs 与 delta 的提交（flush 的「发布 run + 裁前缀」、
+    //     rebuild、install_memory_view）都在 view_gate_ 的写窗口里；这里经
+    //     view_gate_.read 取 (delta, runs)，跨了窗口自动重取——二者恒属同一
+    //     提交点之间的状态，等 ord 裁决（delta 胜）才成立；
+    //   - 归并只换 runs、不动 delta，且新旧 run 集合内容等价（墓碑丢弃只
+    //     发生在含最老 run 的归并里），与任一时刻的 delta 组合都自洽，
+    //     不需要进窗口。
     // 排序视图缓存（sorted_view_）复用逻辑不变：命中只做 shared_ptr 拷贝。
-    for (;;) {
-        const auto e1 = view_epoch_.load(std::memory_order_acquire);
-        if ((e1 & 1u) != 0) {
-            std::this_thread::yield();
-            continue;
-        }
-        if (!loaded_.load(std::memory_order_acquire)) return std::nullopt;
-        std::shared_ptr<const std::vector<DeltaRow>> snap;
-        std::shared_ptr<std::vector<DeltaRow>> fresh;
+    struct Pair {
+        bool loaded = false;
+        std::shared_ptr<const std::vector<DeltaRow>> snap;   // 缓存命中
+        std::shared_ptr<std::vector<DeltaRow>> fresh;        // 待排序的新拷贝
         std::uint64_t want = 0;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
+        decltype(runs_snap_.load()) runs;
+    };
+    {
+        Pair p = view_gate_.read([&] {
+            Pair out;
+            out.loaded = loaded_.load(std::memory_order_acquire);
+            if (!out.loaded) return out;
             {
-                std::lock_guard<std::mutex> vlk(view_mu_);
-                if (sorted_view_ && sorted_view_version_ == delta_version_) {
-                    snap = sorted_view_;
+                std::lock_guard<std::mutex> lk(mu_);
+                {
+                    std::lock_guard<std::mutex> vlk(view_mu_);
+                    if (sorted_view_ && sorted_view_version_ == delta_version_) {
+                        out.snap = sorted_view_;
+                    }
+                }
+                if (!out.snap) {
+                    out.fresh = std::make_shared<std::vector<DeltaRow>>(delta_);
+                    out.want = delta_version_;
                 }
             }
-            if (!snap) {
-                fresh = std::make_shared<std::vector<DeltaRow>>(delta_);
-                want = delta_version_;
-            }
-        }
-        const auto runs = runs_snap_.load(std::memory_order_acquire);
-        if (view_epoch_.load(std::memory_order_acquire) != e1) continue;
+            out.runs = runs_snap_.load();
+            return out;
+        });
+        if (!p.loaded) return std::nullopt;
+        auto& snap = p.snap;
+        auto& fresh = p.fresh;
+        const std::uint64_t want = p.want;
+        const auto& runs = p.runs;
 
         ReadView v;
         if (runs) {
