@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`6.9.1`**；库 `SOVERSION` = **`6`**（= major）；
+`bitcask_version_*` = **`7.0.0`**；库 `SOVERSION` = **`7`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -15,12 +15,16 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
-## [Unreleased]（S44：OKI 分级归并 + 读视图不可变发布）
+## [7.0.0] - 2026-11-16（S44：OKI 分级归并 + 读视图不可变发布）
 
-> **版本语义（待发版时定）**：盘上格式零改动（manifest v4 / run v3），新旧版本可互开同一目录。
-> C++ 侧有 ABI 变化：`StatusInfo` 追加字段、`OkiState` / `OkiState::ReadView` / `OkiMergeCursor`
-> 接口与布局变化；C API 不变。按本仓库惯例（major 只在 ABI 破坏时 bump），需在发版时评估
-> C++ ABI 变化是否触发 major。
+> **版本语义（2026-11-16 定版）**：**C++ ABI 破坏 → bump major → `7.0.0`**，
+> **`SOVERSION` → `7`**（`.so.7`，下游需重新链接）。
+> 破坏点：`StatusInfo` **布局变更**（追加统计字段）、`OkiState` / `OkiState::ReadView` /
+> `OkiMergeCursor` **接口与布局变更**、`OkiState::flush()` 去掉 `async_compaction` 参数——
+> 均在已安装的公共头 `include/bitcask/*.hpp` 内，按 [6.0.0] 先例
+> （结构体布局变更 = ABI 破坏 = bump major）处理。
+> C API **函数签名零增删改**，`bitcask_version_*` 随产品版本同步为 7.0.0。
+> 盘上格式**零改动**（manifest v4 / run v3），新旧版本可互开同一目录，无 flag-day、无迁移。
 
 ### Changed
 
