@@ -231,6 +231,23 @@ target_link_libraries(bitcask_oki_levelb_test PRIVATE
 
 # S43-0：OKI-only 外部语义守门（lifecycle / Level B 冷视图 / atomic batch /
 # data-only reopen）。完整并发与崩溃矩阵由 S43-10 收口。
+# S44：OKI 归并选段策略（纯函数）与分级归并 / 读视图不可变发布的模型对拍、
+# 并发守门（两道归并、取消、背压、跨进程 load）。
+add_executable(bitcask_oki_compaction_policy_test oki_compaction_policy_test.cpp)
+target_link_libraries(bitcask_oki_compaction_policy_test PRIVATE
+    GTest::gtest_main
+    bitcask_fileops
+    bitcask_warnings
+    bitcask_sanitizers
+)
+add_executable(bitcask_oki_compaction_model_test oki_compaction_model_test.cpp)
+target_link_libraries(bitcask_oki_compaction_model_test PRIVATE
+    GTest::gtest_main
+    bitcask_fileops
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 # 一写多读基础件（SnapshotCell / SeqGate，header-only）。
 add_executable(bitcask_sync_primitives_test sync_primitives_test.cpp)
 target_link_libraries(bitcask_sync_primitives_test PRIVATE
@@ -453,6 +470,8 @@ gtest_discover_tests(bitcask_oki_recovery_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_only_contract_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_regression_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_sync_primitives_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_oki_compaction_policy_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_oki_compaction_model_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_s43_rollout_gate_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_levelb_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_range_test ${_bitcask_test_props})

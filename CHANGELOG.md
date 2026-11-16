@@ -15,6 +15,57 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
+## [Unreleased]（S44：OKI 分级归并 + 读视图不可变发布）
+
+> **版本语义（待发版时定）**：盘上格式零改动（manifest v4 / run v3），新旧版本可互开同一目录。
+> C++ 侧有 ABI 变化：`StatusInfo` 追加字段、`OkiState` / `OkiState::ReadView` / `OkiMergeCursor`
+> 接口与布局变化；C API 不变。按本仓库惯例（major 只在 ABI 破坏时 bump），需在发版时评估
+> C++ ABI 变化是否触发 major。
+
+### Changed
+
+- **OKI run 归并改为分级后缀归并**（设计稿 `designs/oki-size-tiered-compaction-design-zh.md`）：
+  不再「run 数 > 8 就把全部 run 重写」，改为只归并最新的一段连续后缀（几何选段，扇入 K = 1）；
+  后缀含最老 run 时才是全归并、才回收墓碑；非全归并保留墓碑，墓碑占比 > 25% 时触发一次全归并。
+  底座 < 1M 行的小库仍按旧规则。旧策略保留为 `CompactionMode::kFull`。写放大与耗时对比见
+  `docs/design/s44-compaction-baseline-zh.md`。
+- **归并全部后台执行**：所有提交点（checkpoint / close / merge 收尾 / 备份 / 阈值 flush）只调度归并；
+  两条归并道（大归并在途时，年轻道收拾期间新产生的小 run）；run 数硬上限 24，超限时 flush 背压等待；
+  close 给在途归并 500ms 宽限后取消，耗时有上界。`OkiState::flush()` 去掉 `async_compaction` 参数。
+- **OKI 读视图整体不可变发布**：run 集合与「已冻结、待落盘」的内存段放进同一个不可变视图整体发布，
+  附「到达序号 ≤ frozen_through 的行已全部归入视图」水位；读者先取 active、后取视图并按序号过滤，
+  成对一致由构造保证（取代上一版的 `SeqGate` 写窗口）。flush 改为「冻结 → 落盘 → 单次发布」。
+- **OKI run 的 bloom 加大**：新写出的 run 由 10 bits / 7 哈希（FP ≈ 0.8%）改为 16 bits / 11 哈希
+  （FP ≈ 0.05%）。分级归并下常驻 run 增多，旧参数会让 3%～6% 的点查多读一个块（p99 约 2.3 倍）；改后
+  10⁸ 行点查 p99 与全归并持平。参数写在 run 文件里，旧 run / 旧版本 reader 不受影响；bloom 常驻内存 +60%。
+- **归并策略细化**：`max_runs` 默认 6（背压阈值另设，默认 2 × max_runs）；硬上限只驱动主道；主道修复
+  「新而大」倒挂、被上限扩大后缀后继续几何吸收（修复前两道并发下实测写放大可达 28）。
+- **读路径**：归并游标改为堆 + 下沉提前退出 + 前 8 字节整数比较；区间起点定位块走块缓存
+  （`OkiRunReader::seek_cached`）；多 run 点查的 bloom 哈希只算一次。读视图携带共享块缓存
+  （`ReadView::gens` / `ReadView::cache`）。
+- **已知取舍**：10⁸ 行、64K/run 的大库上，分级布局（约 6 个 run）相对单 run（索引驻留页缓存时）：点查 p99
+  约 1.3 倍、p50 约 1.4 倍、全量迭代约 0.46 倍、短区间扫描 p99 约 3.7 倍；索引放不进内存时点查尾延迟差距更大
+  （未预热实测 p99 约 1.6 倍）。减少 run 数会让写放大急剧上升。见基准报告 §3d–§3f。
+- **无快照的 `OkiState::flush(dir, durable_wms)`** 不再「整组持留」引用未持久字节的行，改为与带快照
+  路径一致地放弃本轮（生产调用点均带快照；仅影响直调）。
+
+### Added
+
+- `OkiState::compaction_stats()`、`set_compaction_policy()` / `compaction_policy()`、`wait_compaction()`；
+  `StatusInfo::oki_runs` / `oki_flushed_rows` / `oki_compactions` / `oki_full_compactions` /
+  `oki_young_compactions` / `oki_compaction_rows` / `oki_compaction_tomb_rows` / `oki_compaction_aborts` /
+  `oki_compaction_ns` / `oki_backpressure_waits` / `oki_backpressure_ns`。
+- `include/bitcask/detail/oki_compaction_policy.hpp`（`choose_compaction` 纯函数）。
+- 基准 `bitcask_oki_compaction_bench`；测试 `bitcask_oki_compaction_policy_test`、
+  `bitcask_oki_compaction_model_test`（模型对拍、读视图成对对照组、两道归并、取消、背压、并发 load）。
+
+### Fixed
+
+- `OkiState::load()` 读完 manifest 后若 run 文件已被另一进程的归并清掉，重读 manifest 有界重试，
+  不再直接退回未加载态（只读句柄 / merge_only 旁车因此不必全量重建内存视图）。
+
+---
+
 ## [6.9.1] - 2026-11-16（S43 后续修复：merge-only 可完成 OKI readiness 重建）
 
 > **版本语义**：纯缺陷修复——公共 C++ / C API、盘上格式与 ABI 零改动；

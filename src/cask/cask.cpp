@@ -928,13 +928,13 @@ std::uint64_t Cask::active_durable_bytes() const noexcept {
 // → flush。所有提交点（close/checkpoint/merge/阈值/备份）都走这里——run 与
 // v4 元数据、data 水位必须同属一个切面；任何「只推进 run 不带元数据」的提交
 // 都会让崩溃重放漏记账或重复记账。
-bool Cask::commit_oki_cut(bool async_compaction) noexcept {
+bool Cask::commit_oki_cut() noexcept {
     if (!authority_ || !authority_->state().loaded()) return false;
     auto cut = authority_->capture_commit_cut(
         [this] { return collect_snapshot_watermarks(); });
     if (!cut) return false;
     return authority_->state().flush(dirname_, cut->second,
-                                     std::move(cut->first), async_compaction);
+                                     std::move(cut->first));
 }
 
 void Cask::write_authority_snapshot(
@@ -994,8 +994,9 @@ void Cask::maybe_flush_oki() noexcept {
     // 与其它提交点同一协议（切面内 fsync active）。原实现裸 flush 不带
     // 元数据与水位：run/wm 前进而 metadata 停在旧点，崩溃后 tail 行被当作
     //「已在 run」跳过记账，active_keys/fstats 永久少计。
-    // 写线程上（持 write_mu_）：越阈值的 run 全归并交后台线程。
-    if (!commit_oki_cut(/*async_compaction=*/true)) {
+    // 归并一律由 OkiState 交后台线程（S44-4）；run 数超硬上限时 flush 内部
+    // 等待归并追上（背压）。
+    if (!commit_oki_cut()) {
         log_warn("oki threshold flush failed (will retry)");
     }
 }
@@ -2990,6 +2991,21 @@ StatusInfo Cask::status() {
     // 未 flush 行数即下次 range 视图构建的最坏成本上界）。OKI 不可用时为 0。
     s.oki_delta_rows = authority_->state().delta_rows();
     s.oki_delta_bytes = authority_->state().delta_bytes();
+    {
+        const auto& oki = authority_->state();
+        const auto cs = oki.compaction_stats();
+        s.oki_runs = oki.run_count();
+        s.oki_flushed_rows = cs.flushed_rows;
+        s.oki_compactions = cs.compactions;
+        s.oki_full_compactions = cs.full_compactions;
+        s.oki_young_compactions = cs.young_compactions;
+        s.oki_compaction_rows = cs.rows_written;
+        s.oki_compaction_tomb_rows = cs.tomb_rows_written;
+        s.oki_compaction_aborts = cs.aborted;
+        s.oki_compaction_ns = cs.compaction_ns;
+        s.oki_backpressure_waits = cs.backpressure_waits;
+        s.oki_backpressure_ns = cs.backpressure_ns;
+    }
     return s;
 }
 

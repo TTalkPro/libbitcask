@@ -366,6 +366,7 @@ MergeRunner::run(std::span<const std::string> input_data_paths,
             est_rows += run->entry_count();
         }
         est_rows += oki_view_.delta->size();
+        for (const auto& seg : oki_view_.frozen) est_rows += seg->size();
         if (est_rows > 0) {
             pending_.reserve(static_cast<std::size_t>(
                 std::min<std::uint64_t>(est_rows, kApplyBatch)));

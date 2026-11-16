@@ -445,6 +445,59 @@ debug assert 明文——多写者不支持；引擎范围内 insert 只在
 - `max_indexed_ord_`（崩溃恢复幂等保护）原子——replay 重放已在快
   照里的 `(ord, term)` 时丢弃。
 
+### 5.5 OKI 读视图、flush 与后台归并（S44，2026-11-16）
+
+设计稿：`designs/oki-size-tiered-compaction-design-zh.md` §4.7–§4.9。
+
+**状态与保护**
+
+| 状态 | 保护 | 读者如何取 |
+|---|---|---|
+| active memdelta（只追加；行带到达序号 `seq`）+ 点查哈希 `delta_idx_` | `OkiState::mu_` | 锁内拷贝 / 哈希命中 |
+| 已发布视图 `OkiView { runs, frozen 段, frozen_through }` | 写者在 `flush_mu_` 下构造新对象，经 `SnapshotCell` 整体发布 | `view_.load()`，无锁 |
+| manifest / `readers_` / `frozen_` / 在途 gen | `flush_mu_` | 只经视图读 |
+| 归并调度（两条归并道的线程与标志） | `lane_mu_` + `lane_cv_` | — |
+| 写序闸门（probe + 应用 + 一致切面） | `IndexAuthority::writer_mu_` | — |
+
+**读者协议（点查 `locate` 与读视图 `make_read_view` 共用）**：先取 active、
+后取视图，丢弃 `seq ≤ frozen_through` 的 active 行；来源序 active > frozen
+（新→旧）> runs（gen 降序）。顺序不可反——反了会漏掉恰在两步之间被冻结
+的行。读者不重试、不进任何闸。
+
+**写者的发布点**（均在 `flush_mu_` 下「读当前状态 → 构造新视图 → 发布」）：
+
+1. flush 冻结：active 中切面之内的行排序去重成不可变段，`frozen += 段`、
+   `frozen_through` 抬到段内最大 seq，发布；随后从 active 物理删除这些行。
+2. flush 落盘：全部待落盘段归并写成一个 run；manifest 提交后 `runs += run`、
+   `frozen` 清空，**一次发布**。写盘失败时段留在视图里，下次 flush 一并写出。
+3. 归并提交：输入后缀换成输出，`frozen` / `frozen_through` 原样带过。
+4. rebuild / 只读内存视图：`frozen_through` 抬到当前最大 seq，整体作废旧
+   active 行。
+
+**归并**：主道可取任意后缀（含全归并）；主道在途（预留输出 gen = G）时可起
+年轻道，只取 gen > G 的 run，永不含最老 run。两道各自三段式提交：锁内选段 +
+预留 gen → 锁外归并写 run（不持任何锁）→ 锁内校验「输入仍连续、其后 run 的
+gen 全部大于输出 gen」后替换。主道在年轻道运行期间不开始新一轮。所有提交点
+只调度归并；run 数超硬上限时 flush 在锁外等待归并追上（背压）。
+
+**锁序**
+
+```text
+IndexAuthority::writer_mu_ → OkiState::flush_mu_ → OkiState::mu_ → OkiState::view_mu_
+OkiState::lane_mu_ → OkiState::flush_mu_      （flush_mu_ 下绝不取 lane_mu_）
+OkiState::stats_mu_                           （叶子锁，任何锁下均可取）
+```
+
+`flush()` 在释放 `flush_mu_` 后才调度归并 / 等背压；归并线程只在
+`compact_once` 内取 `flush_mu_`，在调度循环里取 `lane_mu_`，两者不嵌套。
+
+**析构 / close**：给在途归并 500ms 宽限期（小归并跑完），随后置取消标志；
+归并每 4096 行检查一次，取消即删除半成品输出、输入不动。close 耗时有上界。
+
+**跨进程**：只读句柄 / merge_only 旁车在自己进程里 `load`。读完 manifest、
+打开 run 时若文件已被另一进程的归并 sweep 掉，重读 manifest 重试（有界次数）；
+CRC / 结构损坏仍整体弃用。
+
 ---
 
 ## 6. IndexPool 与 CaskPluginHost

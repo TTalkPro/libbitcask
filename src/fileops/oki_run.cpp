@@ -440,12 +440,19 @@ std::expected<OkiRunReader, OkiError> OkiRunReader::open(std::string path) {
 }
 
 bool OkiRunReader::may_contain(std::span<const std::byte> key) const noexcept {
+    return may_contain_hashed(bloom_hash(key));
+}
+
+OkiRunReader::BloomHash OkiRunReader::bloom_hash(
+    std::span<const std::byte> key) noexcept {
+    const std::uint64_t h1 = fnv1a64(sv(key));
+    return BloomHash{h1, splitmix64(h1) | 1};
+}
+
+bool OkiRunReader::may_contain_hashed(const BloomHash& h) const noexcept {
     if (version_ == kRunVersion || bloom_nbits_ == 0) return true;
-    const std::string_view k = sv(key);
-    const std::uint64_t h1 = fnv1a64(k);
-    const std::uint64_t h2 = splitmix64(h1) | 1;
     for (std::uint8_t i = 0; i < bloom_k_; ++i) {
-        const std::uint64_t bit = (h1 + i * h2) % bloom_nbits_;
+        const std::uint64_t bit = (h.h1 + i * h.h2) % bloom_nbits_;
         if ((bloom_bits_[static_cast<std::size_t>(bit / 64)] &
              (1ull << (bit % 64))) == 0) {
             return false;
@@ -661,6 +668,14 @@ std::expected<bool, OkiError> OkiRunReader::Cursor::next(Entry& out) {
 std::expected<OkiRunReader::Cursor, OkiError>
 OkiRunReader::seek(std::span<const std::byte> lo) const {
     return seek_impl(lo, /*cache=*/nullptr, /*cache_gen=*/0);
+}
+
+std::expected<OkiRunReader::Cursor, OkiError>
+OkiRunReader::seek_cached(std::span<const std::byte> lo, OkiBlockCache* cache,
+                          std::uint64_t cache_gen) const {
+    auto c = seek_impl(lo, cache, cache_gen);
+    if (c) c->cache_ = nullptr;  // 后续块直读（定位块已由 blk_hold_ 持有）
+    return c;
 }
 
 std::expected<OkiRunReader::Cursor, OkiError>

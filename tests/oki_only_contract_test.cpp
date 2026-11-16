@@ -1314,7 +1314,8 @@ TEST_F(OkiOnlyContractTest, ForcedV3ManifestMigratesOnNextFlush) {
 // 账本含该行而 run 不含、data 水位又在它之前——崩溃后 tail 重放会把它
 // 再记一次账（active_keys 重复计数）。因此带快照的 flush 必须整体放弃
 // （delta 原状，下次提交重试）；持久水位越过 loc 后同一行收敛进唯一 run。
-// 无快照的直调 flush 维持旧语义：持留该行、不推进覆盖水位。
+// S44-0：无快照的直调 flush 同样放弃（不再「整组持留」——持留会让切面之内
+// 的行滞留 active，破坏读视图的 frozen_through 水位语义）。
 TEST_F(OkiOnlyContractTest, HeldRowAdvancesMetadataButNotRunWatermark) {
     auto c = open_rw(/*level_b_entries=*/128);
     ASSERT_TRUE(c);
@@ -1345,8 +1346,8 @@ TEST_F(OkiOnlyContractTest, HeldRowAdvancesMetadataButNotRunWatermark) {
     }
     expect_value(*c, "held", "tail");
 
-    // 无快照直调：持留、不推进覆盖水位。
-    ASSERT_TRUE((*c).index_authority().state().flush(
+    // 无快照直调：同样放弃，状态不变。
+    EXPECT_FALSE((*c).index_authority().state().flush(
         dir_.string(),
         std::span<const std::pair<std::uint32_t, std::uint64_t>>(
             {{file_id, 0}})));

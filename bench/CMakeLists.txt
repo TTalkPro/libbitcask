@@ -47,3 +47,11 @@ target_link_libraries(bitcask_bench
         bitcask_warnings
         TBB::tbb
 )
+
+# S44：OKI 归并写放大 / 读放大基准（OkiState 直驱，独立 main）。
+add_executable(bitcask_oki_compaction_bench oki_compaction_bench.cpp)
+target_link_libraries(bitcask_oki_compaction_bench
+    PRIVATE
+        bitcask_fileops
+        bitcask_warnings
+)

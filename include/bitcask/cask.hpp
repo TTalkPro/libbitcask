@@ -343,6 +343,18 @@ struct StatusInfo {
     // range 变慢时，先看这里是不是胀起来了。
     std::uint64_t oki_delta_rows = 0;
     std::uint64_t oki_delta_bytes = 0;
+    // S44：OKI run 与归并（诊断；计数自本进程打开该目录起单调累计）。
+    std::uint64_t oki_runs = 0;
+    std::uint64_t oki_flushed_rows = 0;          // flush 写入 run 的行数
+    std::uint64_t oki_compactions = 0;           // 已提交归并次数（含全归并）
+    std::uint64_t oki_full_compactions = 0;      // 其中含最老 run 的全归并
+    std::uint64_t oki_young_compactions = 0;     // 其中年轻道完成的
+    std::uint64_t oki_compaction_rows = 0;       // 归并输出行数（写放大 = 它 / flushed_rows）
+    std::uint64_t oki_compaction_tomb_rows = 0;  // 其中墓碑行
+    std::uint64_t oki_compaction_aborts = 0;     // 校验失败 / IO 失败放弃
+    std::uint64_t oki_compaction_ns = 0;         // 归并累计耗时
+    std::uint64_t oki_backpressure_waits = 0;    // flush 因 run 数超限而等待的次数
+    std::uint64_t oki_backpressure_ns = 0;
     // 注：倒排 posting 总量（total_postings）未纳入——其统计需遍历
     // concurrent_hash_map，与 reducer 插入并发不安全（S13-F6 同类）；待
     // InvertedIndex 维护原子计数器后再暴露。
@@ -1318,7 +1330,7 @@ private:
     // S43-9：OKI manifest 本身就是提交点；关闭/merge 收尾不再另写
     // BCKS。保留空操作以收敛历史调用点。
     void write_authority_snapshot() noexcept;
-    [[nodiscard]] bool commit_oki_cut(bool async_compaction = false) noexcept;
+    [[nodiscard]] bool commit_oki_cut() noexcept;
     void write_authority_snapshot(
         const std::vector<std::pair<std::uint32_t, std::uint64_t>>& wms) noexcept;
 

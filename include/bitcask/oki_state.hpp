@@ -38,6 +38,8 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <optional>
 #include <thread>
 #include <cstdint>
@@ -49,7 +51,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "bitcask/detail/seq_gate.hpp"
+#include "bitcask/detail/oki_compaction_policy.hpp"
 #include "bitcask/detail/snapshot_cell.hpp"
 #include "bitcask/oki_run.hpp"
 #include "bitcask/string_hash.hpp"
@@ -81,6 +83,12 @@ public:
         // OkiCommitSnapshot::cut_seq 配合界定「快照已计入」的行。
         std::uint64_t seq = 0;
     };
+
+    // 冻结段：已按 key 升序、每 key 一行（(ord, 到达序) 胜出者，墓碑保留）
+    // 的不可变内存段。flush 先把 active 的一段前缀冻结成段并发布，落盘成
+    // run 后再把段从视图移除（S44-1，设计 §4.9）。
+    using Segment = std::vector<DeltaRow>;
+    using SegmentPtr = std::shared_ptr<const Segment>;
 
     // 写挂钩（keydir.cpp 的 put/remove 咽喉点调用）。ord < wm 的行直接
     // 丢弃（见文件头水位模型）。loc：活行的位置字段（S36-2；墓碑传空）。
@@ -131,14 +139,19 @@ public:
     // 恒是 active 尾巴（sealed 由封口 fsync 全量持久），ord 全局最高——
     // cover/wm 不含它们，tail 重放的水位门语义自洽。空 span = 不过滤
     // （调用方已保证全部持久，如写路径阈值 flush 的先 sync 后 flush）。
-    // async_compaction：提交后若 run 数越阈值，归并交后台线程（写线程上的
-    // 阈值 flush 用，免写者陪等全量归并）；否则在释放 flush_mu_ 后同步归并。
+    // S44：flush 分三步——冻结（active 中切面之内的行 → 不可变段，发布）→
+    // 落盘（全部待落盘段归并写成一个 run）→ 单次发布（run 入视图、段出视图）。
+    // 落盘失败时段留在视图里（读者照常可见），下次 flush 一并写出。
+    // 切面之内任何胜出行引用了未持久字节（durable_wms）→ 放弃本轮、状态不变
+    // （S44-0：不再「整组持留」——持留会让切面之内的行滞留 active，破坏
+    // frozen_through 水位语义）。
+    // 提交后按归并策略调度后台归并（所有提交点都只调度，不同步归并）；run 数
+    // 超过硬上限时同步等待归并追上（背压）。
     [[nodiscard]] bool flush(
         std::string_view dir,
         std::span<const std::pair<std::uint32_t, std::uint64_t>> durable_wms =
             {},
-        std::optional<OkiCommitSnapshot> commit_snapshot = std::nullopt,
-        bool async_compaction = false);
+        std::optional<OkiCommitSnapshot> commit_snapshot = std::nullopt);
 
     // 全量重建：rows 由 caller 从 keydir 收集（活 key + ord；墓碑不需要
     // ——单一全量 run 的缺席即语义）。排序写单 run、manifest 只含它、
@@ -163,8 +176,39 @@ public:
         std::optional<OkiCommitSnapshot> commit_snapshot = std::nullopt);
     void abandon_gen(std::string_view dir, std::uint64_t gen);
 
-    // 等待在途后台归并完成（测试 / 需要确定性 run 集合的调用方）。
+    // 等待后台归并全部收尾（测试 / 基准 / 需要确定性 run 集合的调用方）。
     void wait_compaction();
+
+    // S44：归并策略（默认几何后缀；kFull 为旧策略，用于 A/B 与回退）。
+    void set_compaction_policy(const CompactionPolicyOptions& opts);
+    [[nodiscard]] CompactionPolicyOptions compaction_policy() const;
+
+    // S44：归并与 flush 统计（诊断 / 基准；单调计数）。
+    struct CompactionStats {
+        std::uint64_t flushes = 0;              // 成功落盘的 flush 次数
+        std::uint64_t flushed_rows = 0;         // flush 写入 run 的行数
+        std::uint64_t compactions = 0;          // 成功提交的归并次数（含全归并）
+        std::uint64_t full_compactions = 0;     // 其中含最老 run 的全归并
+        std::uint64_t young_compactions = 0;    // 其中年轻道完成的
+        std::uint64_t rows_written = 0;         // 归并输出的行数（写放大分子）
+        std::uint64_t tomb_rows_written = 0;    // 其中墓碑行
+        std::uint64_t aborted = 0;              // 提交校验失败 / IO 失败而放弃
+        std::uint64_t cancelled = 0;            // 被取消（析构）
+        std::uint64_t compaction_ns = 0;        // 归并累计耗时
+        std::uint64_t backpressure_waits = 0;   // flush 因 run 数超限而等待的次数
+        std::uint64_t backpressure_ns = 0;      // 累计等待时长
+    };
+    [[nodiscard]] CompactionStats compaction_stats() const;
+
+    // 仅供测试：归并每写出 kHookEveryRows 行（以及开始时）回调一次，参数为
+    // (是否年轻道, 已写行数)。用于确定性地制造「大归并在途」窗口。回调里可
+    // 轮询 cancel_requested() 以配合取消测试。生产代码不得设置。
+    using CompactionRowHook = std::function<void(bool young, std::uint64_t rows)>;
+    void set_compaction_row_hook_for_test(CompactionRowHook hook);
+    [[nodiscard]] bool cancel_requested() const noexcept {
+        return cancel_.load(std::memory_order_acquire);
+    }
+    static constexpr std::uint64_t kHookEveryRows = 256;
 
     // 只读恢复/升级的内存视图：语义与 rebuild 相同，但不落 run、不改盘上
     // manifest。data 仍是持久真相；可写句柄后续会做持久受控重建。
@@ -183,9 +227,17 @@ public:
     // 与缓存**零拷贝共享**——memdelta 未 flush 的服务型负载里连续 range
     // 查询不再各自支付全量拷贝 + 排序（下游实测 5 万行 ~120ms/次 → 近零）。
     // 行内容不可变；在途视图不受后续写影响（写 bump 版本，缓存自动失效）。
+    // S44-1：runs 与 frozen 恒来自同一个已发布的不可变视图；delta 是 active
+    // 中「到达序号 > 该视图 frozen_through」的行（已排序去重）。三者来源序
+    // runs（gen 升序）< frozen（旧→新）< delta，与 OkiMergeCursor 一致。
     struct ReadView {
         std::vector<std::shared_ptr<OkiRunReader>> runs;
+        std::vector<SegmentPtr> frozen;
         std::shared_ptr<const std::vector<DeltaRow>> delta;
+        // 与 runs 一一对应的 gen + 共享块缓存（区间起点定位用；视图可能活得比
+        // OkiState 久——CaskIter 可跨 close 存活——故缓存以 shared_ptr 持有）。
+        std::vector<std::uint64_t> gens;
+        std::shared_ptr<OkiBlockCache> cache;
     };
     [[nodiscard]] std::optional<ReadView> make_read_view() const;
 
@@ -298,10 +350,10 @@ public:
 
     // S36-3：块 LRU 诊断/调参（测试与 bench；生产选项透出排 S36-6）。
     [[nodiscard]] OkiBlockCache::Stats block_cache_stats() const {
-        return block_cache_.stats();
+        return block_cache_->stats();
     }
     void reset_block_cache_capacity(std::size_t bytes) {
-        block_cache_.reset_capacity(bytes);
+        block_cache_->reset_capacity(bytes);
     }
 
     // 诊断。
@@ -314,28 +366,27 @@ public:
     static constexpr std::size_t kFlushRowLimit  = 1u << 20;       // 1M 行
     static constexpr std::size_t kFlushByteLimit = 64u << 20;      // 64 MiB
 
-    // S33-6：run 归并阈值（设计 §5.2「极简两层」）。flush 提交后 run 数超此
-    // 值即把**全部** run 归并成一个。不做 leveled compaction——OKI 条目不含
-    // value，全归并 1 亿 key 也就 ~1-2GB 顺序 IO。
-    // 不归并的后果（实测）：run 数 = flush 次数（close/merge 收尾/checkpoint
-    // 各一次）线性增长 ⟹ 每 run 一个常驻 fd + open 期全文件 CRC + range 多
-    // 一路归并，且墓碑行永远回收不掉。
+    // S33-6：旧策略（kFull / 小库）的全归并阈值：run 数超此值即全归并。
     static constexpr std::size_t kCompactRunLimit = 8;
+    // S44：常驻 run 数目标上限（默认策略值；超过时强制扩大后缀）。flush 背压
+    // 阈值默认取其 2 倍（见 CompactionPolicyOptions::stall_runs）。
+    static constexpr std::size_t kMaxRuns = 6;
 
 private:
-    // S33-6：把**全部** run 归并成单个新 run（持 flush_mu_ 调用）。
-    // run 数 ≤1 时 no-op。best-effort：失败原状不变（下次 flush 再试）。
+    // ---- S44：归并（设计 §4.1–§4.5、§4.8）----
     //
-    // **墓碑真正丢弃**——仅在「全归并」下成立：同 key 的 put 行与 tomb 行必
-    // 定同在本次归并里，max-ord 胜出者若是 tomb 则两行一起丢，绝不会留下被
-    // 抵消掉的陈旧 put 行。若将来改成部分归并，这条**必须**收回（否则旧 run
-    // 里的 put 行会因抵消它的 tomb 消失而"复活"）。
-    // 完整性不变量（OKI key 集 ⊇ keydir 活 key 集）不受影响：被丢弃的 key
-    // 若之后重新 put，新行 ord > wm 走 memdelta（读视图含之），崩溃时也由
-    // tail 重放补回——归并不动 wm。
-    // 全归并（三段式，IO 不持 flush_mu_；见实现注释）。
-    [[nodiscard]] bool compact_runs(std::string_view dir);
+    // 两条归并道：主道可取任意后缀（含全归并）；主道在途（预留输出 gen = G）
+    // 时可起年轻道，只取 gen > G 的 run（主道开始之后 flush 出来的），永不
+    // 含最老 run。主道在年轻道运行期间不开始新一轮。两道各自三段式提交
+    // （锁内选段 + 预留 gen → 锁外归并写 run → 锁内校验连续性并替换）。
+    enum class Lane { kMain, kYoung };
+    enum class CompactResult { kNone, kDone, kFailed, kCancelled };
+    [[nodiscard]] CompactResult compact_once(std::string_view dir, Lane lane);
     void schedule_compaction(std::string_view dir);
+    void main_lane_loop();
+    void young_lane_loop();
+    void wait_backpressure();
+    [[nodiscard]] bool needs_compaction_locked() const;
     [[nodiscard]] bool flush_locked_impl(
         std::string_view dir,
         std::span<const std::pair<std::uint32_t, std::uint64_t>> durable_wms,
@@ -353,15 +404,26 @@ private:
     [[nodiscard]] std::uint64_t next_gen_locked(std::string_view dir);
     std::uint64_t gen_floor_ = 0;  // 曾发布过的最大 gen（flush_mu_ 保护）
     std::vector<std::uint64_t> inflight_gens_;  // 在途构建的 gen（flush_mu_）
-    // 读视图的成对一致闸：凡同时改动 runs 与 delta 的提交（flush 的「发布
-    // run + 裁前缀」、rebuild、install_memory_view）都在其写窗口内进行；
-    // make_read_view 不持 flush_mu_，经它取到成对的 (delta, runs)。写者由
-    // flush_mu_ 串行。只换 runs 的归并不进窗口（新旧内容等价）。
-    ::bitcask::detail::SeqGate view_gate_;
-    std::mutex compact_mu_;         // compact_runs 串行
-    std::mutex compact_thread_mu_;  // compact_thread_ 的启动/join
-    std::thread compact_thread_;
-    std::atomic<bool> compacting_{false};
+    // 归并调度状态（lane_mu_ 保护；锁序 lane_mu_ → flush_mu_，flush_mu_ 下
+    // 绝不取 lane_mu_）。
+    mutable std::mutex lane_mu_;
+    std::condition_variable lane_cv_;
+    std::string compact_dir_;
+    std::thread main_thread_;
+    std::thread young_thread_;
+    bool main_running_ = false;   // 主道线程存活
+    bool main_busy_ = false;      // 主道正在一次 compact_once 内
+    bool young_running_ = false;  // 年轻道线程存活
+    bool pending_ = false;        // 主道运行期间又有调度请求
+    std::atomic<bool> cancel_{false};
+    // 主道在途归并的输出 gen（flush_mu_ 保护；年轻道据此划定 floor）。
+    std::optional<std::uint64_t> main_out_gen_;
+    std::atomic<bool> force_full_next_{false};  // 墓碑占比触发的全归并
+    CompactionPolicyOptions policy_;            // flush_mu_ 保护
+    CompactionRowHook row_hook_;                // flush_mu_ 保护（测试用）
+
+    mutable std::mutex stats_mu_;
+    CompactionStats stats_;
 
     // S36-2：memdelta 辅助哈希的维护（前置：持 mu_ 且 point_query_ 开）。
     // 胜出规则 = max (ord, 到达序)：新行 ord ≥ 旧行才顶替（等 ord 后到者
@@ -369,11 +431,22 @@ private:
     void index_row_locked(std::size_t idx);
     void rebuild_index_locked();
 
-    // S36-2：locate 的 runs 快照（免抢 flush_mu_——flush/compact/rebuild
-    // 持锁横跨长 IO，点查不能陪等）。发布点 = readers_ 每次变更后。
     using RunsVec =
         std::vector<std::pair<std::uint64_t, std::shared_ptr<OkiRunReader>>>;
-    void publish_runs_locked();  // 前置：持 flush_mu_
+
+    // ---- S44-1：读视图整体不可变发布（设计 §4.9）----
+    // runs 与冻结段放进同一个不可变对象整体发布；frozen_through = 「到达
+    // 序号 ≤ 它的行已全部归入本视图（frozen 或 runs）」。读者先取 active、
+    // 后取视图，丢弃 seq ≤ frozen_through 的 active 行——无论 active 快照多
+    // 旧，已归入视图的行都不会再以内存行身份压过视图里同 ord 的更新行。
+    struct OkiView {
+        RunsVec runs;                    // gen 升序
+        std::vector<SegmentPtr> frozen;  // 冻结先后（旧→新）
+        std::uint64_t frozen_through = 0;
+    };
+    void publish_view_locked();  // 前置：持 flush_mu_；由 readers_/frozen_ 构造
+    // 从 active 物理删除 seq ≤ through 的行（前置：持 flush_mu_；内部取 mu_）。
+    void drop_active_through(std::uint64_t through);
 
     mutable std::mutex mu_;        // delta_ / delta_bytes_ / delta_idx_ / delta_version_
     std::vector<DeltaRow> delta_;
@@ -389,6 +462,7 @@ private:
     mutable std::mutex view_mu_;
     mutable std::shared_ptr<const std::vector<DeltaRow>> sorted_view_;
     mutable std::uint64_t sorted_view_version_ = 0;  // 与 delta_version_ 相等即有效
+    mutable std::uint64_t sorted_view_min_seq_ = 0;  // 缓存内最小到达序号
     std::uint64_t delta_version_ = 0;
     std::uint64_t append_seq_ = 0;  // DeltaRow::seq 分配器（mu_ 保护）
     // S36-2：key → delta_ 内最新行下标（透明哈希，点查开启时维护）。
@@ -403,8 +477,10 @@ private:
     // manifest_.runs 一一对应的常驻 Reader（load 全量 CRC 校验后开；
     // flush/rebuild 产出新 run 时随 manifest 提交同步维护）。
     RunsVec readers_;
-    // readers_ 的不可变快照（atomic shared_ptr；locate 无锁取用）。
-    ::bitcask::detail::SnapshotCell<RunsVec> runs_snap_;
+    std::vector<SegmentPtr> frozen_;   // 待落盘的冻结段（flush_mu_）
+    std::uint64_t frozen_through_ = 0; // flush_mu_
+    // 已发布视图（locate / make_read_view 无锁取用）。
+    ::bitcask::detail::SnapshotCell<OkiView> view_;
 
     std::atomic<bool> loaded_{false};
     std::atomic<std::uint64_t> wm_{0};
@@ -417,7 +493,9 @@ private:
     // S36-3：块 LRU（(gen, 块下标) → 块字节；独立锁域，不进任何既有锁序）。
     // mutable：locate 是 const 语义的读，缓存升温/装载是它的内部副作用。
     // 跨 close/reopen 复用安全：gen 永不重用，run 文件按 gen 不可变。
-    mutable OkiBlockCache block_cache_{kDefaultBlockCacheBytes};
+    // S44：shared_ptr——读视图（区间扫描）共享同一缓存且可能活得比 OkiState 久。
+    std::shared_ptr<OkiBlockCache> block_cache_ =
+        std::make_shared<OkiBlockCache>(kDefaultBlockCacheBytes);
 };
 
 }  // namespace bitcask::oki

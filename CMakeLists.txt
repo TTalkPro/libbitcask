@@ -541,6 +541,7 @@ add_library(bitcask_fileops STATIC
     src/fileops/oki_run.cpp
     src/fileops/oki_state.cpp
     src/fileops/oki_merge_cursor.cpp
+    src/fileops/oki_compaction_policy.cpp
     src/fileops/committed_fold.cpp
     src/fileops/scanner.cpp
     src/fileops/migrate.cpp

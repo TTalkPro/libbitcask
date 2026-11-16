@@ -93,9 +93,15 @@ inline constexpr std::uint8_t kFlagHasLoc     = 0x02;  // 仅 v2
 inline constexpr std::uint8_t kKnownFlagsMask   = 0x01;
 inline constexpr std::uint8_t kKnownFlagsMaskV2 = 0x03;
 
-// S36-1 bloom 参数（持久化格式的一部分——改动即 run 版本演进）。
-inline constexpr std::size_t kBloomBitsPerEntry = 10;  // FP ≈ 1%
-inline constexpr std::uint8_t kBloomHashes      = 7;
+// S36-1 bloom 参数（写入端缺省值）。位数与哈希数随 run 文件持久化、reader 按
+// 文件读取并校验，因此调整只影响新写出的 run，不需要 run 版本演进。
+// S44：10 bits / 7 哈希（FP ≈ 0.8%）→ 16 bits / 11 哈希（FP ≈ 0.05%）。
+// 分级归并下常驻 run 数为 4～8 个，未命中的 run 各自按 FP 概率多读一个块，
+// 10 bits 时约 3%～6% 的点查多一次块读，正好把 p99 推到「两次块读」。
+// 位数与哈希数写在 run 文件里（reader 按文件读取），旧 run / 旧 reader 不受
+// 影响；代价是 bloom 常驻内存 +60%（1 亿行约 125MB → 200MB）。
+inline constexpr std::size_t kBloomBitsPerEntry = 16;
+inline constexpr std::uint8_t kBloomHashes      = 11;
 
 // v2 行的位置字段（= keydir SingleEntry 的盘上子集；epoch 刻意不落盘，
 // 同 ord 冲突用 (ord, run gen) 胜出——设计 §D2）。
@@ -329,6 +335,12 @@ public:
     // 首个 key ≥ lo 的位置；lo 为空 span 等价 begin()。
     [[nodiscard]] std::expected<Cursor, OkiError>
     seek(std::span<const std::byte> lo) const;
+    // S44：同 seek，但**只有定位那一块**经块缓存取（多 run 的短区间扫描每个
+    // run 都要定位一次，原先每次一个 pread）；之后的块照常直读，长区间扫描
+    // 不会冲刷点查共用的缓存。
+    [[nodiscard]] std::expected<Cursor, OkiError>
+    seek_cached(std::span<const std::byte> lo, OkiBlockCache* cache,
+                std::uint64_t cache_gen) const;
 
     // S36-3：点查——稀疏索引二分定位块 → 块经 cache 取（nullptr = 直接
     // pread）→ 块内线性扫。命中返回行；不存在返回空 optional（caller 先过
@@ -347,6 +359,15 @@ public:
     [[nodiscard]] std::uint32_t version() const noexcept { return version_; }
     // v2/v3：bloom 试探（false = 必不存在；true = 可能存在）。v1 恒 true。
     [[nodiscard]] bool may_contain(std::span<const std::byte> key) const noexcept;
+
+    // S44：多 run 点查的哈希只算一次——同一 key 在每个 run 的 bloom 用同一对
+    // (h1, h2)。bloom_hash 计算它；may_contain_hashed 检查。
+    struct BloomHash {
+        std::uint64_t h1 = 0;
+        std::uint64_t h2 = 0;
+    };
+    [[nodiscard]] static BloomHash bloom_hash(std::span<const std::byte> key) noexcept;
+    [[nodiscard]] bool may_contain_hashed(const BloomHash& h) const noexcept;
 
 private:
     OkiRunReader() = default;

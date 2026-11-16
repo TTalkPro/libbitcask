@@ -216,12 +216,14 @@ TEST_F(OkiRecoveryTest, RunCompactionCollapsesRunsAtThreshold) {
         ASSERT_TRUE(cask.put(bytes("c" + std::to_string(round)), bytes("v"),
                              1000));
         ASSERT_TRUE(cask.checkpoint());
+        cask.index_authority().state().wait_compaction();  // S44-4：归并后台化
         EXPECT_EQ(cask.index_authority().state().run_count(), round + 1)
             << "阈值内不该归并（round " << round << "）";
     }
     // 第 limit+1 次 flush：run 数越过阈值 → 全归并成 1 个。
     ASSERT_TRUE(cask.put(bytes("c" + std::to_string(limit)), bytes("v"), 1000));
     ASSERT_TRUE(cask.checkpoint());
+    cask.index_authority().state().wait_compaction();  // S44-4：归并后台化
     EXPECT_EQ(cask.index_authority().state().run_count(), 1u) << "越阈值须塌成单 run";
     EXPECT_EQ(seg_count(), 1u) << "旧 run 文件须被清理（fd 与磁盘同时回收）";
 
@@ -261,10 +263,12 @@ TEST_F(OkiRecoveryTest, FullCompactionDropsTombstoneRows) {
     for (int i = 0; i < 4; ++i) {
         ASSERT_TRUE(cask.put(bytes("t" + std::to_string(i)), bytes("v"), 1000));
         ASSERT_TRUE(cask.checkpoint());
+        cask.index_authority().state().wait_compaction();  // S44-4：归并后台化
     }
     for (int i = 0; i < 2; ++i) {  // 删前 2 个（put 行在更早的 run 里）
         ASSERT_TRUE(cask.remove(bytes("t" + std::to_string(i)), 2000));
         ASSERT_TRUE(cask.checkpoint());
+        cask.index_authority().state().wait_compaction();  // S44-4：归并后台化
     }
     ASSERT_LE(cask.index_authority().state().run_count(),
               bitcask::oki::OkiState::kCompactRunLimit)
@@ -280,6 +284,7 @@ TEST_F(OkiRecoveryTest, FullCompactionDropsTombstoneRows) {
     for (int i = 100; cask.index_authority().state().run_count() > 1 && i < 120; ++i) {
         ASSERT_TRUE(cask.put(bytes("z" + std::to_string(i)), bytes("v"), 1000));
         ASSERT_TRUE(cask.checkpoint());
+        cask.index_authority().state().wait_compaction();  // S44-4：归并后台化
     }
     ASSERT_EQ(cask.index_authority().state().run_count(), 1u);
 

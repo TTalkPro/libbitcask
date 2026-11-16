@@ -198,6 +198,7 @@ merge 的 `apply_pending` **不挂钩**（§2.2 性质 1）。TTL 过期的 `con
 - **flush 触发**：memdelta 条数/字节阈值，或搭 auto-ckpt 节流的车（`last_ckpt_ord_` 模式）。flush = 排序写 `kv.oki.seg-<gen>`，`cover_ord` = 当时 `peek_next_ord()`，然后 manifest 提交、清 memdelta。
 - **初建 / 全量重建**：`save_snapshot` 已全量遍历 entries（`keydir.cpp:1538-1553`，哈希序）——重建路径复用该遍历 + 外部排序，产出单个全量 run。触发点与 keydir 快照相同（close/merge 收尾/成对 ckpt），但**不阻塞**这些路径：重建放后台，失败只影响 OKI 可用性。
 - **归并策略**：极简两层。小 run 数量 > N（默认 8）→ 归并成一个；全归并时墓碑真正丢弃。不做 leveled compaction——OKI 条目小（无值），全归并 1 亿 key 也就 ~1-2GB 顺序 IO。
+  > **S44 改述（2026-11-16）**：已改为**分级后缀归并**（设计稿 `designs/oki-size-tiered-compaction-design-zh.md`）。每次只归并最新的一段连续后缀（几何选段，扇入 K 默认 1），后缀含最老 run 时才是全归并、才丢墓碑；底座 < 1M 行的小库仍按「run 数 > 8 即全归并」处理。归并后台执行（两条归并道、可取消、run 数硬上限 24 + flush 背压）；读视图改为 runs 与冻结段整体不可变发布。盘上格式不变。旧策略保留为 `CompactionMode::kFull`（A/B 与回退）。
   > **落地状态（S33-6，2026-08-03）**：已实装（`OkiState::compact_all_locked`，阈值 `kCompactRunLimit=8`）。S33-4 首版只做了 flush（追加 run）与 rebuild（全量重来），本条漏实现——run 数随 flush 次数无界增长、墓碑永不回收，由 fd 探针实测发现后补上。墓碑丢弃的正确性**依赖「全归并」**这一前提，已在 `oki_state.hpp` 内注明约束。
 
 ### 5.3 恢复

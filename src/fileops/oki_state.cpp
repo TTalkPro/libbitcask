@@ -1,5 +1,6 @@
 #include "bitcask/oki_state.hpp"
 
+#include <chrono>
 #include <thread>
 
 #include "bitcask/oki_merge_cursor.hpp"
@@ -116,26 +117,54 @@ void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep,
 
 }  // namespace
 
+namespace {
+
+// 按 (key, ord) 稳定排序后每 key 取末行（(ord, 到达序) 胜出者）。
+std::vector<OkiState::DeltaRow> sort_dedup(std::vector<OkiState::DeltaRow> rows) {
+    std::stable_sort(rows.begin(), rows.end(),
+                     [](const OkiState::DeltaRow& a, const OkiState::DeltaRow& b) {
+                         if (a.key != b.key) return a.key < b.key;
+                         return a.ord < b.ord;
+                     });
+    // out == i 的自移动赋值对 std::string 是 valid-but-unspecified，必须跳过。
+    std::size_t out = 0;
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        if (i + 1 < rows.size() && rows[i + 1].key == rows[i].key) continue;
+        if (out != i) rows[out] = std::move(rows[i]);
+        ++out;
+    }
+    rows.resize(out);
+    return rows;
+}
+
+const OkiState::DeltaRow* segment_find(const OkiState::Segment& seg,
+                                       std::string_view key) {
+    auto it = std::lower_bound(
+        seg.begin(), seg.end(), key,
+        [](const OkiState::DeltaRow& r, std::string_view k) { return r.key < k; });
+    if (it == seg.end() || it->key != key) return nullptr;
+    return &*it;
+}
+
+constexpr std::size_t kCancelCheckRows = 4096;
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// active memdelta（只追加；mu_）
+// ---------------------------------------------------------------------------
+
 void OkiState::append(std::string_view key, std::uint64_t ord, bool tomb,
                       const RowLoc* loc) {
     // 水位门（wm = 排他上界 = 尚未覆盖的最小 ord；首个合法 LSN 是 0，
     // 故不能有 ord==0 特判）：tail 重放只收 wm 起的行。
     if (ord < wm_.load(std::memory_order_acquire)) return;
-    std::lock_guard<std::mutex> lk(mu_);
-    delta_bytes_ += key.size() + sizeof(DeltaRow);
-    delta_.push_back(DeltaRow{std::string(key), ord, tomb,
-                              /*has_loc=*/loc != nullptr,
-                              loc != nullptr ? *loc : RowLoc{}});
-    delta_.back().seq = ++append_seq_;
-    ++delta_version_;  // 排序视图缓存失效
-    index_row_locked(delta_.size() - 1);
-    update_flush_hint_locked();
+    append_update(key, ord, tomb, loc);
 }
 
 void OkiState::append_update(std::string_view key, std::uint64_t ord,
                              bool tomb, const RowLoc* loc,
                              std::uint32_t dur_file, std::uint64_t dur_end) {
-    // 免水位门（旧 ord、新信息——merge 搬迁 / TTL 墓碑，见头文件）。
     std::lock_guard<std::mutex> lk(mu_);
     delta_bytes_ += key.size() + sizeof(DeltaRow);
     delta_.push_back(DeltaRow{std::string(key), ord, tomb,
@@ -153,8 +182,7 @@ void OkiState::index_row_locked(std::size_t idx) {
     if (!point_query_.load(std::memory_order_relaxed)) return;
     const DeltaRow& row = delta_[idx];
     auto [it, inserted] = delta_idx_.try_emplace(row.key, idx);
-    // (ord, 到达序) 胜出：等 ord 后到者顶替（搬迁行），更小 ord 不顶替
-    // （恢复期并行 fold 的乱序到达）。
+    // (ord, 到达序) 胜出：等 ord 后到者顶替（搬迁行），更小 ord 不顶替。
     if (!inserted && delta_[it->second].ord <= row.ord) it->second = idx;
 }
 
@@ -171,9 +199,25 @@ void OkiState::enable_point_query() {
     rebuild_index_locked();
 }
 
-// S43-5：写前探测是 locate 的显式语义别名。实现暂共用同一条组合视图；
-// 后续把 memdelta 辅助哈希提升为写路径专用热缓存时，读视图的替换策略
-// 不会再反向影响写 CAS 的可用性判定。
+void OkiState::drop_active_through(std::uint64_t through) {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<DeltaRow> kept;
+    kept.reserve(delta_.size());
+    std::size_t bytes = 0;
+    for (auto& r : delta_) {
+        if (r.seq > through) {
+            bytes += r.key.size() + sizeof(DeltaRow);
+            kept.push_back(std::move(r));
+        }
+    }
+    delta_ = std::move(kept);
+    delta_bytes_ = bytes;
+    ++delta_version_;
+    rebuild_index_locked();
+    update_flush_hint_locked();
+}
+
+// S43-5：写前探测是 locate 的显式语义别名。
 OkiState::WriteProbe OkiState::probe_for_write(std::string_view key) const {
     const auto r = locate(key);
     return WriteProbe{r.status, r.ord, r.tomb, r.has_loc, r.loc};
@@ -184,20 +228,17 @@ bool OkiState::write_probe_ready() const noexcept {
         !loaded_.load(std::memory_order_acquire)) {
         return false;
     }
-    const auto runs = runs_snap_.load();
-    if (!runs) return false;
+    const auto view = view_.load();
+    if (!view) return false;
     return std::none_of(
-        runs->begin(), runs->end(),
-        [](const auto& run) {
-            return run.second->version() == kRunVersion;
-        });
+        view->runs.begin(), view->runs.end(),
+        [](const auto& run) { return run.second->version() == kRunVersion; });
 }
 
 // 运行期应用一律绕过 wm 门：调用方（IndexAuthority）已在写序闸门内做过
 // probe + CAS 裁决，行必然是该 key 的最新态。wm 门只服务恢复期的 tail
-// 重放；用在运行期会误丢在途写——例如运行期重建把 wm 设为 next_ord（含已
-// 分配、尚未应用的 ord），重建发布后这条写被 `ord < wm` 静默丢弃，账本却
-// 已计入（data 在、索引无）。
+// 重放；用在运行期会误丢在途写（运行期重建把 wm 设为 next_ord，含已分配、
+// 尚未应用的 ord）。
 void OkiState::apply_put(std::string_view key, std::uint64_t ord,
                          const RowLoc& loc) {
     append_update(key, ord, /*tomb=*/false, &loc);
@@ -218,45 +259,70 @@ void OkiState::apply_relocation(std::string_view key, std::uint64_t ord,
     append_update(key, ord, /*tomb=*/false, &loc);
 }
 
-// S43-1：坏块运行期降级。先关点查，再置 unloaded；顺序保证不会出现
-// 「点查仍开但视图已消失」的窗口。flush_mu_ 与 flush/compact/rebuild
-// 串行，避免降级动作插在半途提交之后造成状态回退。
+// S43-1：坏块运行期降级。先关点查，再置 unloaded。
 void OkiState::degrade_for_rebuild() noexcept {
     std::lock_guard<std::mutex> flk(flush_mu_);
     point_query_.store(false, std::memory_order_release);
     loaded_.store(false, std::memory_order_release);
 }
 
-void OkiState::publish_runs_locked() {
-    runs_snap_.emplace(readers_);
+void OkiState::publish_view_locked() {
+    auto v = std::make_shared<OkiView>();
+    v->runs = readers_;
+    v->frozen = frozen_;
+    v->frozen_through = frozen_through_;
+    for (const auto& r : manifest_.runs) gen_floor_ = std::max(gen_floor_, r.gen);
+    view_.publish(std::move(v));
 }
+
+// ---------------------------------------------------------------------------
+// load（S44-5：run 缺失时重读 manifest 重试）
+// ---------------------------------------------------------------------------
 
 void OkiState::load(std::string_view dir) {
     std::lock_guard<std::mutex> flk(flush_mu_);
-    auto m = read_manifest(dir);
-    if (!m) return;  // 缺失/损坏 → 未加载态（caller 决定重建）
-    // S33-5：随 load 打开全部 run Reader（全量 CRC eager 校验——S33-3 既定
-    // 取舍：派生缓存安全优先）。任一 run 坏 → 整体弃用（未加载态 → 重建）。
-    RunsVec rds;
-    rds.reserve(m->runs.size());
-    for (const auto& r : m->runs) {
-        auto rd = OkiRunReader::open(mk_run_filename(dir, r.gen));
-        if (!rd) return;  // 未加载态
-        rds.emplace_back(r.gen,
-                         std::make_shared<OkiRunReader>(*std::move(rd)));
+    // 另一个进程（可写句柄）的归并 / flush 可能恰在我们读完 manifest、打开
+    // run 之前把旧 run 提交掉并 sweep。run 文件「不存在」时重读 manifest 重
+    // 试（有界次数）；CRC / 结构损坏仍整体弃用（未加载态 → caller 重建）。
+    constexpr int kMaxAttempts = 8;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        auto m = read_manifest(dir);
+        if (!m) return;  // 缺失/损坏 → 未加载态（caller 决定重建）
+        RunsVec rds;
+        rds.reserve(m->runs.size());
+        bool missing = false;
+        bool broken = false;
+        for (const auto& r : m->runs) {
+            const auto path = mk_run_filename(dir, r.gen);
+            auto rd = OkiRunReader::open(path);
+            if (!rd) {
+                std::error_code ec;
+                if (!std::filesystem::exists(bitcask::detail::from_utf8(path), ec)) {
+                    missing = true;
+                } else {
+                    broken = true;
+                }
+                break;
+            }
+            rds.emplace_back(r.gen,
+                             std::make_shared<OkiRunReader>(*std::move(rd)));
+        }
+        if (broken) return;
+        if (missing) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1 << attempt));
+            continue;
+        }
+        manifest_ = *std::move(m);
+        readers_ = std::move(rds);
+        publish_view_locked();
+        manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
+        wm_.store(manifest_.wm, std::memory_order_release);
+        loaded_.store(true, std::memory_order_release);
+        return;
     }
-    manifest_ = *std::move(m);
-    readers_ = std::move(rds);
-    publish_runs_locked();
-    for (const auto& r : manifest_.runs) gen_floor_ = std::max(gen_floor_, r.gen);
-    manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
-    wm_.store(manifest_.wm, std::memory_order_release);
-    loaded_.store(true, std::memory_order_release);
 }
 
-// S36-4：降级戳（level_b 关而盘上戳开 → 改写 manifest 清戳）。升级不走
-// 此路——必须经全量 rebuild（见头文件注释）。best-effort：写失败保持原
-// 状（戳仍在，Level B 下次 open 会做一次多余重建，方向安全）。
+// S36-4：降级戳（level_b 关而盘上戳开 → 改写 manifest 清戳）。
 void OkiState::stamp_mode(std::string_view dir) {
     std::lock_guard<std::mutex> flk(flush_mu_);
     if (!loaded_.load(std::memory_order_relaxed)) return;
@@ -278,25 +344,24 @@ std::uint64_t OkiState::next_gen_locked(std::string_view dir) {
     return g + 1;
 }
 
+void OkiState::release_gen_locked(std::uint64_t gen) {
+    std::erase(inflight_gens_, gen);
+}
+
+// ---------------------------------------------------------------------------
+// flush：冻结 → 落盘 → 单次发布
+// ---------------------------------------------------------------------------
+
 bool OkiState::flush(
     std::string_view dir,
     std::span<const std::pair<std::uint32_t, std::uint64_t>> durable_wms,
-    std::optional<OkiCommitSnapshot> commit_snapshot,
-    bool async_compaction) {
+    std::optional<OkiCommitSnapshot> commit_snapshot) {
     bool need_compact = false;
     const bool ok = flush_locked_impl(dir, durable_wms,
-                                      std::move(commit_snapshot),
-                                      need_compact);
-    // S33-6：run 数超阈值 → 全归并（设计 §5.2）。归并的 IO 不再持
-    // flush_mu_（原实现在 flush 锁内同步全归并：写线程阈值 flush 持着
-    // write_mu_ 陪等整个索引的顺序重写，range/merge 视图构建也被挡住）。
-    // best-effort——失败不影响本次 flush 的成功语义。
+                                      std::move(commit_snapshot), need_compact);
     if (ok && need_compact) {
-        if (async_compaction) {
-            schedule_compaction(dir);
-        } else {
-            (void)compact_runs(dir);
-        }
+        schedule_compaction(dir);
+        wait_backpressure();
     }
     return ok;
 }
@@ -308,9 +373,8 @@ bool OkiState::flush_locked_impl(
     std::lock_guard<std::mutex> flk(flush_mu_);
     if (!loaded_.load(std::memory_order_relaxed)) return false;
 
-    // S43-2：Level A / 空 memdelta 也是合法提交点。尤其 v3→v4 迁移目录
-    // 可能没有任何待固化 delta，但仍要把刚捕获的标量/fstats 随 manifest
-    // 原子发布；否则“空 flush”会静默放弃迁移。
+    // S43-2：空 memdelta 也是合法提交点（v3→v4 迁移目录可能没有待固化行，
+    // 但仍要把刚捕获的标量/fstats 随 manifest 原子发布）。
     const auto commit_metadata_only = [&]() -> bool {
         if (!commit_snapshot.has_value()) return true;
         const auto& g = commit_snapshot->metadata;
@@ -326,387 +390,539 @@ bool OkiState::flush_locked_impl(
         next.level_b = level_b_.load(std::memory_order_acquire);
         if (next.metadata == manifest_.metadata &&
             next.fstats == manifest_.fstats &&
-            next.level_b == manifest_level_b_.load(
-                std::memory_order_acquire)) {
+            next.level_b == manifest_level_b_.load(std::memory_order_acquire) &&
+            next.data_wms == manifest_.data_wms) {
             return true;
         }
         if (!write_manifest(dir, next)) return false;
         manifest_ = std::move(next);
-        manifest_level_b_.store(manifest_.level_b,
-                                std::memory_order_release);
+        manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
         return true;
     };
 
-    // S36-2：**拷贝前缀**而非换出——IO 期间行仍留在 delta_（locate 可见，
-    // 组合视图无「在写盘路上不可见」的窗口），提交后才删前缀。失败路径
-    // 因此零恢复动作（原 swap+restore 退役）。代价是一次前缀拷贝——flush
-    // 本就伴随全量排序 + 文件 IO，量级淹没。
-    std::vector<DeltaRow> all;
+    // ---- 1) 切面之内的 active 行 → 胜出行 ----
+    // 带快照：切面 = cut_seq（seq ≤ cut 的行恰是账本已计入的行）；无快照：
+    // 当前全部行。
+    const std::uint64_t cut_seq =
+        commit_snapshot.has_value() ? commit_snapshot->cut_seq
+                                    : std::numeric_limits<std::uint64_t>::max();
+    std::vector<DeltaRow> eligible;
+    std::uint64_t max_eligible_seq = 0;
+    std::uint64_t min_remaining_ord = std::numeric_limits<std::uint64_t>::max();
     {
         std::lock_guard<std::mutex> lk(mu_);
-        all.assign(delta_.begin(), delta_.end());
-    }
-    if (all.empty()) return commit_metadata_only();
-    const std::size_t prefix_n = all.size();
-
-    // S36-5 B1：持久性分拣——引用了未持久字节的行持留在 delta（语义见头
-    // 文件）。修订：
-    //   1) 按 key 分组后只对胜出行判定（被同 key 新行覆盖的旧行随组走），
-    //      避免指向已退役文件的陈旧行永久滞留；
-    //   2) 墓碑也参与判定（dur_file/dur_end）——否则未持久的墓碑会先进 run；
-    //   3) 带快照时以一致切面（cut_seq）划界：切面之后到达的行一律持留，
-    //      切面之内的行必须全部可固化——metadata 与 run 覆盖必须一致，否则
-    //      崩溃重放会把行当「已在 run」跳过记账，或重复记账；
-    //   4) wm 不越过任何持留行的 ord（纵深防御；恢复重放已改为与组合视图
-    //      比对而非单靠 wm 门，见 IndexAuthority::recover_row）。
-    std::uint32_t max_snap_fid = 0;
-    for (const auto& [fid, wm] : durable_wms) max_snap_fid = std::max(max_snap_fid, fid);
-    const auto beyond_durable = [&](std::uint32_t fid, std::uint64_t end) {
-        if (durable_wms.empty() || fid == 0) return false;
-        for (const auto& [f, wm] : durable_wms) {
-            if (f == fid) return end > wm;
-        }
-        // 快照之后新建的文件（id 更大）尚无持久保证；更小 id 的缺席文件
-        // 是已退役/删除的旧文件，其行必然已被覆盖，不持留。
-        return fid > max_snap_fid;
-    };
-    const auto row_beyond = [&](const DeltaRow& r) {
-        if (r.has_loc) return beyond_durable(r.loc.file_id, r.loc.offset + r.loc.total_sz);
-        if (r.tomb) return beyond_durable(r.dur_file, r.dur_end);
-        return false;
-    };
-    const bool with_snapshot = commit_snapshot.has_value();
-    const std::uint64_t cut_seq =
-        with_snapshot ? commit_snapshot->cut_seq
-                      : std::numeric_limits<std::uint64_t>::max();
-
-    // (key, ord, 到达序) 排序的下标序；只有 seq ≤ cut 的行参与本次固化。
-    std::vector<std::size_t> order;
-    order.reserve(prefix_n);
-    std::vector<char> held(prefix_n, 0);
-    std::uint64_t min_held_ord = std::numeric_limits<std::uint64_t>::max();
-    for (std::size_t i = 0; i < prefix_n; ++i) {
-        if (all[i].seq > cut_seq) {  // 快照之后到达：不在账本里
-            held[i] = 1;
-            min_held_ord = std::min(min_held_ord, all[i].ord);
-        } else {
-            order.push_back(i);
-        }
-    }
-    std::stable_sort(order.begin(), order.end(),
-                     [&](std::size_t a, std::size_t b) {
-                         if (all[a].key != all[b].key) return all[a].key < all[b].key;
-                         return all[a].ord < all[b].ord;
-                     });
-    std::vector<DeltaRow> rows;  // key 升序、每 key 一行（胜出者）
-    rows.reserve(order.size());
-    std::size_t flushed_bytes = 0;
-    for (std::size_t gb = 0; gb < order.size();) {
-        std::size_t ge = gb + 1;
-        while (ge < order.size() && all[order[ge]].key == all[order[gb]].key) ++ge;
-        const DeltaRow& win = all[order[ge - 1]];  // (ord, 到达序) 最大
-        if (row_beyond(win)) {
-            // 已计入快照账本的行却引用未持久字节：metadata 与 run 无法同时
-            // 自洽（崩溃重放会重复记账）。带快照时放弃本轮（delta 原状，下
-            // 次提交重试）；无快照的旧路径维持「整组持留」。
-            if (with_snapshot) return false;
-            for (std::size_t j = gb; j < ge; ++j) held[order[j]] = 1;
-            min_held_ord = std::min(min_held_ord, win.ord);
-        } else {
-            for (std::size_t j = gb; j < ge; ++j) {
-                flushed_bytes += all[order[j]].key.size() + sizeof(DeltaRow);
+        eligible.reserve(delta_.size());
+        for (const auto& r : delta_) {
+            if (r.seq <= cut_seq) {
+                eligible.push_back(r);
+                max_eligible_seq = std::max(max_eligible_seq, r.seq);
+            } else {
+                min_remaining_ord = std::min(min_remaining_ord, r.ord);
             }
-            rows.push_back(win);
         }
-        gb = ge;
     }
-    all.clear();
-    // 全持留：本轮无新 run；metadata 快照仍是一致切面（持留行都在切面后）。
-    if (rows.empty()) return commit_metadata_only();
+    auto winners = sort_dedup(std::move(eligible));
 
-    std::uint64_t cover = 0;  // 排他上界 = 本批最大 ord + 1
-    for (const auto& r : rows) cover = std::max(cover, r.ord + 1);
-    const std::uint64_t uniq = rows.size();
+    // 持久性：胜出行引用了未持久字节 → 放弃本轮（状态不变）。带快照时这些行
+    // 已计入账本，run 不含而 data 水位又在其前，崩溃重放会重复记账；无快照
+    // 时同样不得发布引用可能随掉电蒸发的字节的 run。
+    if (!durable_wms.empty()) {
+        std::uint32_t max_snap_fid = 0;
+        for (const auto& [fid, wm] : durable_wms) {
+            max_snap_fid = std::max(max_snap_fid, fid);
+        }
+        const auto beyond = [&](std::uint32_t fid, std::uint64_t end) {
+            if (fid == 0) return false;
+            for (const auto& [f, wm] : durable_wms) {
+                if (f == fid) return end > wm;
+            }
+            // 快照之后新建的文件（id 更大）尚无持久保证；更小 id 的缺席文件
+            // 是已退役的旧文件，其行必然已被覆盖。
+            return fid > max_snap_fid;
+        };
+        for (const auto& r : winners) {
+            const bool b = r.has_loc ? beyond(r.loc.file_id,
+                                              r.loc.offset + r.loc.total_sz)
+                                     : (r.tomb && beyond(r.dur_file, r.dur_end));
+            if (b) return false;
+        }
+    }
 
-    // S43-1：新 run 落 v3（全字段 + bloom + per-block CRC）——组合视图
-    // 点查的能力前提；开库不再整读 data 索引文件。
+    if (winners.empty() && frozen_.empty()) return commit_metadata_only();
+
+    // ---- 2) 冻结：发布后从 active 物理删除 ----
+    if (!winners.empty()) {
+        frozen_.push_back(std::make_shared<const Segment>(std::move(winners)));
+        frozen_through_ = std::max(frozen_through_, max_eligible_seq);
+        publish_view_locked();
+        drop_active_through(frozen_through_);
+    }
+
+    // ---- 3) 落盘：全部待落盘段归并成一个 run（墓碑保留）----
+    std::vector<OkiMergeCursor::MemSource> segs(frozen_.begin(), frozen_.end());
+    std::uint64_t est = 0;
+    for (const auto& sp : frozen_) est += sp->size();
     const std::uint64_t gen = next_gen_locked(dir);
-    auto w = OkiRunWriter::create(mk_run_filename(dir, gen),
-                                  kDefaultBlockBytes, kRunVersion3,
-                                  /*expected_entries=*/uniq);
-    if (!w) return false;
-    bool io_ok = true;
-    for (std::size_t i = 0; i < rows.size(); ++i) {
-        const auto& r = rows[i];
-        auto a = w->add(std::span<const std::byte>(
-                            reinterpret_cast<const std::byte*>(r.key.data()),
-                            r.key.size()),
-                        r.ord, r.tomb, r.has_loc ? &r.loc : nullptr);
-        if (!a) { io_ok = false; break; }
-    }
-    if (io_ok && !w->finish(/*fsync_dir=*/true)) io_ok = false;
-    if (!io_ok) return false;
-
-    // S33-5：manifest 提交前先开 Reader（刚写完页缓存热，CRC 校验便宜；
-    // 开失败按 IO 失败处理，不留半态）。
-    auto rd = OkiRunReader::open(mk_run_filename(dir, gen));
-    if (!rd) {
+    const auto run_path = mk_run_filename(dir, gen);
+    const auto drop_run = [&] {
         std::error_code ec;
-        std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
+        std::filesystem::remove(bitcask::detail::from_utf8(run_path), ec);
+    };
+    auto w = OkiRunWriter::create(run_path, kDefaultBlockBytes, kRunVersion3,
+                                  /*expected_entries=*/est);
+    if (!w) return false;
+    std::uint64_t cover = 0;
+    std::uint64_t written = 0;
+    {
+        auto mc = OkiMergeCursor::open({}, std::move(segs));
+        if (!mc) return false;
+        DeltaRow r;
+        while (true) {
+            auto n = mc->next(r, /*include_tombs=*/true);
+            if (!n) return false;
+            if (!*n) break;
+            auto a = w->add(std::span<const std::byte>(
+                                reinterpret_cast<const std::byte*>(r.key.data()),
+                                r.key.size()),
+                            r.ord, r.tomb, r.has_loc ? &r.loc : nullptr);
+            if (!a) {
+                drop_run();
+                return false;
+            }
+            cover = std::max(cover, r.ord + 1);
+            ++written;
+        }
+    }
+    if (!w->finish(/*fsync_dir=*/true)) {
+        drop_run();
+        return false;
+    }
+    auto rd = OkiRunReader::open(run_path);
+    if (!rd) {
+        drop_run();
         return false;
     }
 
-    // manifest 提交（唯一 commit point）。失败则删刚写的 run（delta_ 未动）。
+    // ---- 4) manifest 提交（唯一 commit point）----
     OkiManifest next = manifest_;
-    // S43-3：本次 caller 持久水位和 run/metadata 同为一个提交点。空水位
-    // 表示 caller 没有新落点（如测试直调）；此时保留上一份 data 水位。
     if (!durable_wms.empty()) {
         next.data_wms.assign(durable_wms.begin(), durable_wms.end());
     }
     next.runs.push_back({gen, cover, /*format_ver=*/3});
-    next.wm = std::max(next.wm, std::min(cover, min_held_ord));
+    next.wm = std::max(next.wm, std::min(cover, min_remaining_ord));
     next.level_b = level_b_.load(std::memory_order_acquire);  // S36-4 模式戳
     if (commit_snapshot.has_value()) {
-        // v4 是随本次 run 一起过 CRC 的提交快照。校验放在 run fsync 后、
-        // manifest 发布前：非法 caller 快照只浪费一次 run，不会发布超前
-        // 标量。无快照时保留上一份 v4 元数据（现有 v4 目录的普通 flush
-        // 可继续），v3 目录则保持 nullopt 等真实迁移点。
         next.metadata = commit_snapshot->metadata;
         next.fstats = std::move(commit_snapshot->fstats);
         if (!valid_commit_snapshot(next, *next.metadata, next.fstats)) {
-            std::error_code ec;
-            std::filesystem::remove(
-                bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
+            drop_run();
             return false;
         }
     }
     if (!write_manifest(dir, next)) {
-        std::error_code ec;
-        std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
+        drop_run();
         return false;
     }
-    // 「发布新 run + 裁 delta 前缀」对读视图必须成对可见（view_gate_ 写
-    // 窗口）。只靠「先取 delta、后取 runs」的顺序能保证不缺行，但会把等 ord
-    // 的两行判反：读者手里的旧 delta 含原始行，新 run 含同 ord 的搬迁行 /
-    // 条件墓碑，归并时 delta 胜 ⟹ 旧位置压过新位置（输入文件删除后 fold
-    // 报 location disappeared）或已删除的 key 被当成活的。
-    {
-    const auto view_window = view_gate_.write();
+
+    // ---- 5) 单次发布：run 入视图、段出视图 ----
     manifest_ = std::move(next);
     readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
-    publish_runs_locked();
-    for (const auto& r : manifest_.runs) gen_floor_ = std::max(gen_floor_, r.gen);
+    frozen_.clear();
+    publish_view_locked();
     manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
     wm_.store(manifest_.wm, std::memory_order_release);
-
-    // 提交完成，删已固化的前缀。IO 期间新 append 的行在前缀之后，保留；
-    // S36-5：持留行（held）留在队头，相对序不变（(ord, 到达序) 格保持）。
     {
-        std::lock_guard<std::mutex> lk(mu_);
-        // 命名为 kept 而非 next：本函数上方已有一个 OkiManifest next（下一份
-        // manifest），同名会 shadow 它（-Wshadow，CI 的 werror-lib 带 -Werror）。
-        // 且这里装的确实是「留下来的行」——前缀里被持留的 + 前缀之后新追加的。
-        std::vector<DeltaRow> kept;
-        kept.reserve(prefix_n + delta_.size() - prefix_n);
-        for (std::size_t i = 0; i < prefix_n; ++i) {
-            if (held[i] != 0) kept.push_back(std::move(delta_[i]));
-        }
-        for (std::size_t j = prefix_n; j < delta_.size(); ++j) {
-            kept.push_back(std::move(delta_[j]));
-        }
-        delta_ = std::move(kept);
-        delta_bytes_ -= std::min(delta_bytes_, flushed_bytes);
-        ++delta_version_;  // 前缀已固化——缓存里的行已在 run 中，立即释放
-        rebuild_index_locked();
-        update_flush_hint_locked();
+        std::lock_guard<std::mutex> sl(stats_mu_);
+        ++stats_.flushes;
+        stats_.flushed_rows += written;
     }
-    }  // view_window
-    {
-        std::lock_guard<std::mutex> vlk(view_mu_);
-        sorted_view_.reset();
-    }
-
-    need_compact = manifest_.runs.size() > kCompactRunLimit;
+    need_compact = needs_compaction_locked();
     return true;
 }
 
-// 全归并：把**开始时刻**的全部 run 归并成单个新 run（结果落盘、墓碑丢弃）。
-// 三段式，IO 段不持 flush_mu_：
-//   1) 锁内快照输入 run 集合、预留输出 gen（gen_floor_ 抬高，之后的 flush
-//      必取更大 gen——「行只随时间进入更高 gen」不变量保持）；
-//   2) 锁外用 OkiMergeCursor 归并写新 run；
-//   3) 锁内校验输入仍全部在册（期间若有 rebuild 替换了 run 集合则放弃），
-//      用「新 run + 期间新增的更高 gen run」替换，元数据/水位原样沿用。
-// 墓碑丢弃仍成立：输入是开始时刻的**全部** run，同 key 的旧 put 必在其中；
-// 期间新增的 run 只含更新的行，gen 更高，裁决不受影响。
-bool OkiState::compact_runs(std::string_view dir) {
-    std::lock_guard<std::mutex> one(compact_mu_);  // 同一时刻至多一个归并
+// ---------------------------------------------------------------------------
+// 归并（S44-3 / S44-4）
+// ---------------------------------------------------------------------------
+
+void OkiState::set_compaction_policy(const CompactionPolicyOptions& opts) {
+    std::lock_guard<std::mutex> flk(flush_mu_);
+    policy_ = opts;
+}
+
+CompactionPolicyOptions OkiState::compaction_policy() const {
+    std::lock_guard<std::mutex> flk(flush_mu_);
+    return policy_;
+}
+
+void OkiState::set_compaction_row_hook_for_test(CompactionRowHook hook) {
+    std::lock_guard<std::mutex> flk(flush_mu_);
+    row_hook_ = std::move(hook);
+}
+
+OkiState::CompactionStats OkiState::compaction_stats() const {
+    std::lock_guard<std::mutex> sl(stats_mu_);
+    return stats_;
+}
+
+bool OkiState::needs_compaction_locked() const {
+    std::vector<std::uint64_t> sizes;
+    sizes.reserve(readers_.size());
+    for (const auto& [g, rd] : readers_) sizes.push_back(rd->entry_count());
+    return choose_compaction(sizes, 0, policy_,
+                             force_full_next_.load(std::memory_order_relaxed))
+        .merge;
+}
+
+// 一次归并（三段式；设计 §4.5）：
+//   1) 锁内按策略选后缀 Rj..Rn，快照输入，预留输出 gen（在途登记）；
+//   2) 锁外 OkiMergeCursor 归并：不含最老 run 时**保留墓碑**（更老的 run
+//      里可能还有该 key 的 put，丢墓碑会让它复活）；含最老 run 时丢弃；
+//   3) 锁内校验：输入仍在册且连续，其后的 run gen 全部大于输出 gen；替换并
+//      单次发布视图（冻结段与 frozen_through 原样沿用——归并只换 runs，新旧
+//      内容等价）。
+OkiState::CompactResult OkiState::compact_once(std::string_view dir,
+                                               Lane lane) {
+    if (cancel_.load(std::memory_order_acquire)) return CompactResult::kCancelled;
+    const auto t0 = std::chrono::steady_clock::now();
+
     RunsVec inputs;
-    std::uint64_t cover = 0;
     std::uint64_t gen = 0;
+    std::uint64_t cover = 0;
     std::uint32_t out_ver = kRunVersion3;
-    std::uint64_t est_entries = 0;
+    std::uint64_t est = 0;
+    bool full = false;
+    CompactionRowHook hook;
     {
         std::lock_guard<std::mutex> flk(flush_mu_);
-        if (!loaded_.load(std::memory_order_acquire) || readers_.size() < 2) {
-            return true;
+        if (!loaded_.load(std::memory_order_acquire)) return CompactResult::kNone;
+        hook = row_hook_;
+        std::size_t floor = 0;
+        if (lane == Lane::kYoung) {
+            if (!main_out_gen_) return CompactResult::kNone;
+            floor = readers_.size();
+            for (std::size_t i = 0; i < readers_.size(); ++i) {
+                if (readers_[i].first > *main_out_gen_) {
+                    floor = i;
+                    break;
+                }
+            }
         }
-        inputs = readers_;
-        for (const auto& r : manifest_.runs) cover = std::max(cover, r.cover_ord);
-        // S43-1：全 v2/v3 输入才出 v3（v1 行无位置字段，混入会产出无位置
-        // 活行毒化点查）；含 v1 则整体降 v1，待 rebuild 淘汰后自愈。
+        std::vector<std::uint64_t> sizes;
+        sizes.reserve(readers_.size());
+        for (const auto& [g, rd] : readers_) sizes.push_back(rd->entry_count());
+        const bool want_full =
+            lane == Lane::kMain && force_full_next_.load(std::memory_order_relaxed);
+        const auto choice = choose_compaction(sizes, floor, policy_, want_full);
+        if (!choice.merge) return CompactResult::kNone;
+        full = choice.full;
+        inputs.assign(readers_.begin() + static_cast<std::ptrdiff_t>(choice.begin),
+                      readers_.end());
+        for (std::size_t i = choice.begin; i < manifest_.runs.size(); ++i) {
+            cover = std::max(cover, manifest_.runs[i].cover_ord);
+        }
+        // S43-1：全 v2/v3 输入才出 v3；含 v1 则整体降 v1（待 rebuild 淘汰后自愈）。
         for (const auto& [g, rd] : inputs) {
             if (rd->version() == kRunVersion) out_ver = kRunVersion;
-            est_entries += rd->entry_count();
+            est += rd->entry_count();
         }
         gen = next_gen_locked(dir);
-        inflight_gens_.push_back(gen);  // 预留：期间的 flush 必取更大 gen
+        inflight_gens_.push_back(gen);  // 期间的 flush 必取更大 gen
+        if (lane == Lane::kMain) main_out_gen_ = gen;
     }
-    // 任何退出路径都撤销在途登记（提交路径在锁内先撤销）。
-    struct Release {
-        OkiState* self;
-        std::uint64_t g;
-        bool armed = true;
-        ~Release() {
-            if (!armed) return;
-            std::lock_guard<std::mutex> flk(self->flush_mu_);
-            self->release_gen_locked(g);
-        }
-    } release{this, gen};
 
     const auto out_path = mk_run_filename(dir, gen);
-    auto abort = [&] {
-        std::error_code ec;
-        std::filesystem::remove(bitcask::detail::from_utf8(out_path), ec);
-        return false;
+    // 任何退出路径都撤销在途登记 / 主道标记，并删除未提交的输出。
+    bool committed = false;
+    const auto finish = [&](CompactResult r) {
+        {
+            std::lock_guard<std::mutex> flk(flush_mu_);
+            release_gen_locked(gen);
+            if (lane == Lane::kMain) main_out_gen_.reset();
+        }
+        if (!committed) {
+            std::error_code ec;
+            std::filesystem::remove(bitcask::detail::from_utf8(out_path), ec);
+        }
+        const auto ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+        std::lock_guard<std::mutex> sl(stats_mu_);
+        stats_.compaction_ns += ns;
+        if (r == CompactResult::kFailed) ++stats_.aborted;
+        if (r == CompactResult::kCancelled) ++stats_.cancelled;
+        return r;
     };
-    auto w = OkiRunWriter::create(out_path, kDefaultBlockBytes, out_ver,
-                                  /*expected_entries=*/est_entries);
-    if (!w) return false;
+
+    std::uint64_t rows = 0;
+    std::uint64_t tombs = 0;
     {
+        auto w = OkiRunWriter::create(out_path, kDefaultBlockBytes, out_ver, est);
+        if (!w) return finish(CompactResult::kFailed);
         std::vector<std::shared_ptr<OkiRunReader>> rs;
         rs.reserve(inputs.size());
         for (const auto& [g, rd] : inputs) rs.push_back(rd);
-        auto mc = OkiMergeCursor::open(std::move(rs), nullptr);
-        if (!mc) return abort();
+        auto mc = OkiMergeCursor::open(std::move(rs),
+                                       std::vector<OkiMergeCursor::MemSource>{});
+        if (!mc) return finish(CompactResult::kFailed);
         DeltaRow row;
         while (true) {
-            auto n = mc->next(row);  // 墓碑在归并层抵消 ⟹ 真正丢弃
-            if (!n) return abort();
+            if (hook && (rows % kHookEveryRows) == 0) {
+                hook(lane == Lane::kYoung, rows);
+            }
+            if ((rows % kCancelCheckRows) == 0 &&
+                cancel_.load(std::memory_order_acquire)) {
+                return finish(CompactResult::kCancelled);
+            }
+            auto n = mc->next(row, /*include_tombs=*/!full);
+            if (!n) return finish(CompactResult::kFailed);
             if (!*n) break;
+            const bool loc = out_ver != kRunVersion && row.has_loc && !row.tomb;
             auto a = w->add(std::span<const std::byte>(
                                 reinterpret_cast<const std::byte*>(row.key.data()),
                                 row.key.size()),
-                            row.ord, /*tomb=*/false,
-                            (out_ver != kRunVersion && row.has_loc) ? &row.loc
-                                                                     : nullptr);
-            if (!a) return abort();
+                            row.ord, row.tomb, loc ? &row.loc : nullptr);
+            if (!a) return finish(CompactResult::kFailed);
+            ++rows;
+            if (row.tomb) ++tombs;
         }
+        if (!w->finish(/*fsync_dir=*/true)) return finish(CompactResult::kFailed);
     }
-    if (!w->finish(/*fsync_dir=*/true)) return abort();
     auto rd = OkiRunReader::open(out_path);
-    if (!rd) return abort();
+    if (!rd) return finish(CompactResult::kFailed);
 
-    std::lock_guard<std::mutex> flk(flush_mu_);
-    release.armed = false;
-    release_gen_locked(gen);
-    if (!loaded_.load(std::memory_order_acquire)) return abort();
-    // 输入必须仍全部在册，且其余 run 的 gen 都高于输出（期间 flush 产出）。
-    RunsVec kept_newer;
-    std::size_t matched = 0;
-    for (const auto& [g, r] : readers_) {
-        const bool is_input = std::any_of(
-            inputs.begin(), inputs.end(),
-            [&](const auto& in) { return in.first == g; });
-        if (is_input) {
-            ++matched;
-        } else if (g > gen) {
-            kept_newer.emplace_back(g, r);
+    {
+        std::lock_guard<std::mutex> flk(flush_mu_);
+        if (!loaded_.load(std::memory_order_acquire)) {
+            // 期间被 rebuild / 降级：放弃（finish 会再取 flush_mu_，先放锁）。
         } else {
-            return abort();
+            // 输入必须仍在册且连续；其后每个 run 的 gen 必须大于输出 gen。
+            std::size_t pos = readers_.size();
+            for (std::size_t i = 0; i < readers_.size(); ++i) {
+                if (readers_[i].first == inputs.front().first) {
+                    pos = i;
+                    break;
+                }
+            }
+            bool ok = pos + inputs.size() <= readers_.size() &&
+                      manifest_.runs.size() == readers_.size();
+            for (std::size_t k = 0; ok && k < inputs.size(); ++k) {
+                ok = readers_[pos + k].first == inputs[k].first &&
+                     manifest_.runs[pos + k].gen == inputs[k].first;
+            }
+            for (std::size_t i = pos + inputs.size(); ok && i < readers_.size();
+                 ++i) {
+                ok = readers_[i].first > gen;
+            }
+            // 全归并必须仍从最老 run 开始（否则丢墓碑不安全）。
+            if (ok && full) ok = pos == 0;
+            if (ok) {
+                OkiManifest next = manifest_;
+                next.runs.clear();
+                next.runs.insert(next.runs.end(), manifest_.runs.begin(),
+                                 manifest_.runs.begin() +
+                                     static_cast<std::ptrdiff_t>(pos));
+                next.runs.push_back(
+                    {gen, cover, static_cast<std::uint8_t>(out_ver)});
+                next.runs.insert(next.runs.end(),
+                                 manifest_.runs.begin() +
+                                     static_cast<std::ptrdiff_t>(pos + inputs.size()),
+                                 manifest_.runs.end());
+                next.level_b = level_b_.load(std::memory_order_acquire);
+                if (write_manifest(dir, next)) {
+                    RunsVec nr;
+                    nr.reserve(next.runs.size());
+                    nr.insert(nr.end(), readers_.begin(),
+                              readers_.begin() + static_cast<std::ptrdiff_t>(pos));
+                    nr.emplace_back(gen, std::make_shared<OkiRunReader>(
+                                             *std::move(rd)));
+                    nr.insert(nr.end(),
+                              readers_.begin() +
+                                  static_cast<std::ptrdiff_t>(pos + inputs.size()),
+                              readers_.end());
+                    manifest_ = std::move(next);
+                    readers_ = std::move(nr);
+                    publish_view_locked();
+                    manifest_level_b_.store(manifest_.level_b,
+                                            std::memory_order_release);
+                    committed = true;
+                    std::vector<std::uint64_t> keep;
+                    for (const auto& r : manifest_.runs) keep.push_back(r.gen);
+                    sweep_runs(dir, keep, sweep_backlog_, inflight_gens_);
+                    std::vector<std::uint64_t> cache_keep = keep;
+                    cache_keep.insert(cache_keep.end(), inflight_gens_.begin(),
+                                      inflight_gens_.end());
+                    block_cache_->purge_except(cache_keep);
+                    // 墓碑只在全归并时回收；非全归并输出里墓碑占比过高 →
+                    // 下一次主道归并强制全归并。
+                    if (full) {
+                        force_full_next_.store(false, std::memory_order_relaxed);
+                    } else if (rows > 0 && tombs * 4 > rows) {
+                        force_full_next_.store(true, std::memory_order_relaxed);
+                    }
+                }
+            }
         }
     }
-    if (matched != inputs.size()) return abort();
-
-    // 从当前 manifest 派生：元数据 / fstats / data 水位 / wm 原样保留，
-    // 只替换 run 集合（原实现用空 manifest 提交，三者被清零）。
-    OkiManifest next = manifest_;
-    next.runs.clear();
-    next.runs.push_back({gen, cover, static_cast<std::uint8_t>(out_ver)});
-    for (const auto& e : manifest_.runs) {
-        if (e.gen > gen) next.runs.push_back(e);
+    if (!committed) return finish(CompactResult::kFailed);
+    {
+        std::lock_guard<std::mutex> sl(stats_mu_);
+        ++stats_.compactions;
+        if (full) ++stats_.full_compactions;
+        if (lane == Lane::kYoung) ++stats_.young_compactions;
+        stats_.rows_written += rows;
+        stats_.tomb_rows_written += tombs;
     }
-    next.level_b = level_b_.load(std::memory_order_acquire);  // S36-4
-    if (!write_manifest(dir, next)) return abort();
-
-    manifest_ = std::move(next);
-    readers_.clear();
-    readers_.emplace_back(gen, std::make_shared<OkiRunReader>(*std::move(rd)));
-    for (auto& e : kept_newer) readers_.push_back(std::move(e));
-    publish_runs_locked();
-    for (const auto& r : manifest_.runs) gen_floor_ = std::max(gen_floor_, r.gen);
-    manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
-    // 旧 run + 崩溃残留孤儿一并清（在途 ReadView 持 shared_ptr，unlink 后
-    // fd 仍可读——安全）。
-    std::vector<std::uint64_t> keep_gen;
-    for (const auto& r : manifest_.runs) keep_gen.push_back(r.gen);
-    sweep_runs(dir, keep_gen, sweep_backlog_, inflight_gens_);
-    block_cache_.purge_except(keep_gen);  // S36-3：死 gen 块不占缓存
-    return true;
+    return finish(CompactResult::kDone);
 }
 
 void OkiState::schedule_compaction(std::string_view dir) {
-    std::lock_guard<std::mutex> lk(compact_thread_mu_);
-    if (compacting_.exchange(true, std::memory_order_acq_rel)) return;
-    // 上一个后台线程已跑完（compacting_ 在其最后一步才清），join 立即返回。
-    if (compact_thread_.joinable()) compact_thread_.join();
-    compact_thread_ = std::thread([this, d = std::string(dir)] {
-        // 归并期间到达的 flush 不会另起归并（compacting_ 为真），因此收尾时
-        // 复查 run 数并续跑；清标志后再复查一次，堵住「flush 恰在清标志前
-        // 判定并放弃调度」的窗口。归并失败（IO）则停，等下次 flush 再触发。
-        for (;;) {
-            const bool ok = compact_runs(d);
-            if (ok && run_count() > kCompactRunLimit) continue;
-            compacting_.store(false, std::memory_order_release);
-            if (ok && run_count() > kCompactRunLimit &&
-                !compacting_.exchange(true, std::memory_order_acq_rel)) {
-                continue;
+    std::lock_guard<std::mutex> lk(lane_mu_);
+    if (cancel_.load(std::memory_order_acquire)) return;
+    compact_dir_ = std::string(dir);
+    if (!main_running_) {
+        if (main_thread_.joinable()) main_thread_.join();  // 已退出，立即返回
+        main_running_ = true;
+        pending_ = false;
+        main_thread_ = std::thread([this] { main_lane_loop(); });
+        return;
+    }
+    pending_ = true;
+    // 主道正在一次（可能很大的）归并里：起年轻道收拾期间新 flush 的小 run。
+    if (main_busy_ && !young_running_) {
+        if (young_thread_.joinable()) young_thread_.join();
+        young_running_ = true;
+        young_thread_ = std::thread([this] { young_lane_loop(); });
+    }
+}
+
+void OkiState::main_lane_loop() {
+    for (;;) {
+        std::string dir;
+        {
+            std::unique_lock<std::mutex> lk(lane_mu_);
+            // 年轻道运行期间主道不开始新一轮（两道输入不得交叠）。
+            lane_cv_.wait(lk, [&] {
+                return !young_running_ || cancel_.load(std::memory_order_acquire);
+            });
+            if (cancel_.load(std::memory_order_acquire)) {
+                main_running_ = false;
+                lane_cv_.notify_all();
+                return;
             }
-            break;
+            main_busy_ = true;
+            pending_ = false;
+            dir = compact_dir_;
         }
-    });
+        const auto r = compact_once(dir, Lane::kMain);
+        std::lock_guard<std::mutex> lk(lane_mu_);
+        main_busy_ = false;
+        lane_cv_.notify_all();
+        if (r == CompactResult::kDone) continue;
+        if (r == CompactResult::kNone && pending_) continue;
+        main_running_ = false;
+        pending_ = false;
+        lane_cv_.notify_all();
+        return;
+    }
+}
+
+void OkiState::young_lane_loop() {
+    for (;;) {
+        std::string dir;
+        {
+            std::lock_guard<std::mutex> lk(lane_mu_);
+            dir = compact_dir_;
+        }
+        const auto r = compact_once(dir, Lane::kYoung);
+        if (r == CompactResult::kDone) continue;
+        std::lock_guard<std::mutex> lk(lane_mu_);
+        young_running_ = false;
+        lane_cv_.notify_all();
+        return;
+    }
+}
+
+// 背压：run 数超过硬上限时等待归并追上；归并已全部停下（无法再推进）即返回。
+void OkiState::wait_backpressure() {
+    const auto pol = compaction_policy();
+    const std::size_t cap = pol.stall_runs != 0 ? pol.stall_runs : 2 * pol.max_runs;
+    if (run_count() <= cap) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+        std::unique_lock<std::mutex> lk(lane_mu_);
+        while (!cancel_.load(std::memory_order_acquire) &&
+               (main_running_ || young_running_)) {
+            lane_cv_.wait_for(lk, std::chrono::milliseconds(20));
+            lk.unlock();
+            const bool done = run_count() <= cap;
+            lk.lock();
+            if (done) break;
+        }
+    }
+    const auto ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count());
+    std::lock_guard<std::mutex> sl(stats_mu_);
+    ++stats_.backpressure_waits;
+    stats_.backpressure_ns += ns;
 }
 
 void OkiState::wait_compaction() {
-    std::lock_guard<std::mutex> lk(compact_thread_mu_);
-    if (compact_thread_.joinable()) compact_thread_.join();
+    std::unique_lock<std::mutex> lk(lane_mu_);
+    lane_cv_.wait(lk, [&] { return !main_running_ && !young_running_; });
+    // 线程最后一步是在 lane_mu_ 下清标志后返回，此时 join 立即完成。
+    if (main_thread_.joinable()) main_thread_.join();
+    if (young_thread_.joinable()) young_thread_.join();
 }
 
-OkiState::~OkiState() { wait_compaction(); }
+OkiState::~OkiState() {
+    // close 的最后一步。小归并（常见：close 那次 flush 刚调度的）给一个短
+    // 宽限期跑完——否则只在 close 时 flush 的短会话永远完不成归并；大归并
+    // 超过宽限即取消（每 kCancelCheckRows 行检查一次，半成品输出删除、输入
+    // 未动），close 耗时有上界（S44-4）。
+    {
+        std::unique_lock<std::mutex> lk(lane_mu_);
+        lane_cv_.wait_for(lk, std::chrono::milliseconds(500), [&] {
+            return !main_running_ && !young_running_;
+        });
+    }
+    cancel_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(lane_mu_);
+        lane_cv_.notify_all();
+    }
+    wait_compaction();
+}
+
+// ---------------------------------------------------------------------------
+// 重建 / 只读内存视图
+// ---------------------------------------------------------------------------
 
 std::uint64_t OkiState::reserve_gen(std::string_view dir) {
     std::lock_guard<std::mutex> flk(flush_mu_);
-    // 只登记在途、不抬 gen_floor_：放弃的 gen 从未发布 Reader（块缓存里
-    // 没有它的块），可以复用；在途期间 next_gen_locked 会越过它。
+    // 只登记在途、不抬 gen_floor_：放弃的 gen 从未发布 Reader，可以复用。
     const auto g = next_gen_locked(dir);
     inflight_gens_.push_back(g);
     return g;
 }
 
-void OkiState::release_gen_locked(std::uint64_t gen) {
-    std::erase(inflight_gens_, gen);
+void OkiState::abandon_gen(std::string_view dir, std::uint64_t gen) {
+    std::lock_guard<std::mutex> flk(flush_mu_);
+    release_gen_locked(gen);
+    std::error_code ec;
+    std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
 }
 
 bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
                        std::uint64_t cover_ord,
                        std::optional<OkiCommitSnapshot> commit_snapshot) {
-    // S33-6：零活 key（空库 / 全删）**不落空 run**——「0 个 run + wm =
-    // cover_ord」已完整表达语义，且不留空文件与常驻 fd。
+    // S33-6：零活 key（空库 / 全删）不落空 run。
     if (rows.empty()) {
         return install_built_run(dir, 0, cover_ord, std::move(commit_snapshot));
     }
-    // S36-1：外排构建（64MiB 分段 spill + k 路归并）——排序工作集
-    // O(spill_bytes)。S43-1：出 v3（全字段 + bloom + per-block CRC）。
+    // S36-1：外排构建（64MiB 分段 spill + k 路归并）。S43-1：出 v3。
     const std::uint64_t gen = reserve_gen(dir);
     const auto fail = [&] {
         abandon_gen(dir, gen);
@@ -725,13 +941,6 @@ bool OkiState::rebuild(std::string_view dir, std::vector<DeltaRow>&& rows,
     return install_built_run(dir, gen, cover_ord, std::move(commit_snapshot));
 }
 
-void OkiState::abandon_gen(std::string_view dir, std::uint64_t gen) {
-    std::lock_guard<std::mutex> flk(flush_mu_);
-    release_gen_locked(gen);
-    std::error_code ec;
-    std::filesystem::remove(bitcask::detail::from_utf8(mk_run_filename(dir, gen)), ec);
-}
-
 bool OkiState::install_built_run(
     std::string_view dir, std::uint64_t gen, std::uint64_t cover_ord,
     std::optional<OkiCommitSnapshot> commit_snapshot) {
@@ -745,7 +954,7 @@ bool OkiState::install_built_run(
     };
     std::shared_ptr<OkiRunReader> new_reader;
     if (gen != 0) {
-        auto rd = OkiRunReader::open(run_path);  // S33-5
+        auto rd = OkiRunReader::open(run_path);
         if (!rd) {
             drop_run();
             return false;
@@ -756,7 +965,7 @@ bool OkiState::install_built_run(
     OkiManifest next;
     if (new_reader) next.runs.push_back({gen, cover_ord, /*format_ver=*/3});
     next.wm = cover_ord;
-    next.level_b = level_b_.load(std::memory_order_acquire);  // S36-4 模式戳
+    next.level_b = level_b_.load(std::memory_order_acquire);
     if (commit_snapshot.has_value()) {
         next.metadata = commit_snapshot->metadata;
         next.fstats = std::move(commit_snapshot->fstats);
@@ -769,36 +978,32 @@ bool OkiState::install_built_run(
         drop_run();
         return false;
     }
-
-    // 提交后清理：目录内一切非本次 run 的 seg 文件 + memdelta（其内容已被
-    // 全量快照覆盖）。用目录扫描而非「遍历旧 manifest」——见 sweep_runs 注释
-    // （manifest 丢失正是重建的触发场景，那批 run 不在内存里）。
     {
         std::vector<std::uint64_t> keep;
         if (new_reader) keep.push_back(gen);
         sweep_runs(dir, keep, sweep_backlog_, inflight_gens_);
-        block_cache_.purge_except(keep);  // S36-3：死 gen 块不占缓存
+        std::vector<std::uint64_t> cache_keep = keep;
+        cache_keep.insert(cache_keep.end(), inflight_gens_.begin(),
+                          inflight_gens_.end());
+        block_cache_->purge_except(cache_keep);
     }
-    // runs 与 delta 一起替换：读视图经 view_gate_ 检出这一窗口并重试。
+    // 新视图覆盖到此刻的全部 active 行：frozen_through 抬到当前最大到达序号，
+    // 旧 active 行随即被水位整体作废（读者按 seq 过滤），再物理删除。
+    std::uint64_t through = 0;
     {
-    const auto view_window = view_gate_.write();
+        std::lock_guard<std::mutex> lk(mu_);
+        through = append_seq_;
+    }
     manifest_ = std::move(next);
     readers_.clear();
     if (new_reader) readers_.emplace_back(gen, std::move(new_reader));
-    publish_runs_locked();
-    for (const auto& r : manifest_.runs) gen_floor_ = std::max(gen_floor_, r.gen);
+    frozen_.clear();
+    frozen_through_ = std::max(frozen_through_, through);
+    publish_view_locked();
     manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
     wm_.store(manifest_.wm, std::memory_order_release);
     loaded_.store(true, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        delta_.clear();
-        delta_bytes_ = 0;
-        ++delta_version_;
-        rebuild_index_locked();
-        update_flush_hint_locked();
-    }
-    }  // view_window
+    drop_active_through(frozen_through_);
     {
         std::lock_guard<std::mutex> vlk(view_mu_);
         sorted_view_.reset();
@@ -819,179 +1024,176 @@ void OkiState::install_memory_view(
         next.fstats = commit_snapshot->fstats;
         if (!valid_commit_snapshot(next, *next.metadata, next.fstats)) return;
     }
-
-    // 只读视图仍要有明确提交边界：空 run 集 + wm 表达“内存行覆盖全序”。
-    // 旧 Reader 只经 shared_ptr 存活到在途视图结束，本进程不修改盘面。
+    // 只读视图：空 run 集 + 一个冻结段（内存行覆盖全序）。不修改盘面。
+    for (auto& r : rows) r.seq = 0;
+    auto seg = std::make_shared<const Segment>(sort_dedup(std::move(rows)));
+    std::uint64_t through = 0;
     {
-    const auto view_window = view_gate_.write();
+        std::lock_guard<std::mutex> lk(mu_);
+        through = append_seq_;
+    }
     manifest_ = std::move(next);
     readers_.clear();
-    publish_runs_locked();
-    for (const auto& r : manifest_.runs) gen_floor_ = std::max(gen_floor_, r.gen);
+    frozen_.clear();
+    if (!seg->empty()) frozen_.push_back(std::move(seg));
+    frozen_through_ = std::max(frozen_through_, through);
+    publish_view_locked();
     manifest_level_b_.store(manifest_.level_b, std::memory_order_release);
     wm_.store(manifest_.wm, std::memory_order_release);
     loaded_.store(true, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        delta_ = std::move(rows);
-        delta_bytes_ = 0;
-        for (const auto& row : delta_) {
-            delta_bytes_ += row.key.size() + sizeof(DeltaRow);
-        }
-        ++delta_version_;
-        rebuild_index_locked();
-        update_flush_hint_locked();
-    }
-    }  // view_window
+    drop_active_through(frozen_through_);
     {
         std::lock_guard<std::mutex> vlk(view_mu_);
         sorted_view_.reset();
     }
 }
 
-// S36-2：组合视图点查（冷侧——不含哈希 keydir；设计 §5.1 步骤 2-4）。
+// ---------------------------------------------------------------------------
+// 读：点查与读视图（S44-1：先 active、后视图、按 seq 过滤）
+// ---------------------------------------------------------------------------
+
+// S36-2：组合视图点查。查询序：active（seq > frozen_through 才算数）→ 冻结
+// 段（新→旧）→ run（gen 降序）。首命中即权威——依赖不变量「行只随时间进入
+// 更新的来源」（flush 按时序冻结、run 按 gen、归并输出取最大 gen）。
 OkiState::LocateResult OkiState::locate(std::string_view key) const {
     LocateResult out;
     if (!point_query_.load(std::memory_order_acquire)) return out;
     if (!loaded_.load(std::memory_order_acquire)) return out;
 
-    // 1) memdelta：辅助哈希直查（存的即 (ord, 到达序) 胜出行）。delta 命中
-    //    短路——同 key 的 delta 行恒不旧于任何 run 行（行只随时间进入更高
-    //    gen；delta 视作 gen=∞，等 ord 时 delta 胜）。
+    const auto hit = [&](const auto& r) {
+        out.status = LocateStatus::kHit;
+        out.ord = r.ord;
+        out.tomb = r.tomb;
+        out.has_loc = r.has_loc;
+        out.loc = r.loc;
+        return out;
+    };
+
+    // 1) active：必须先于视图读取（反过来会漏掉恰在两步之间被冻结的行）。
+    bool have_active = false;
+    DeltaRow active;
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = delta_idx_.find(key);
         if (it != delta_idx_.end()) {
             const DeltaRow& r = delta_[it->second];
-            out.status = LocateStatus::kHit;
-            out.ord = r.ord;
-            out.tomb = r.tomb;
-            out.has_loc = r.has_loc;
-            out.loc = r.loc;
-            return out;
+            active.ord = r.ord;
+            active.tomb = r.tomb;
+            active.has_loc = r.has_loc;
+            active.loc = r.loc;
+            active.seq = r.seq;
+            have_active = true;
         }
     }
+    const auto view = view_.load();
+    if (!view) return out;  // kUnavailable（loaded 但视图未发布——不可达兜底）
+    if (have_active && active.seq > view->frozen_through) return hit(active);
 
-    // 2) 逐 run gen 降序（readers_ 恒按 gen 升序维护）：bloom 试探 →
-    //    seek 二分 → 首行比对。首命中即权威（不变量见头文件）。
-    const auto runs = runs_snap_.load();
-    if (!runs) return out;  // kUnavailable（loaded 但快照未发布——不可达兜底）
+    // 2) 冻结段（新→旧）。
+    for (auto it = view->frozen.rbegin(); it != view->frozen.rend(); ++it) {
+        if (const DeltaRow* r = segment_find(**it, key)) return hit(*r);
+    }
+
+    // 3) run（gen 降序）：bloom 试探 → seek 二分 → 首行比对。哈希只算一次。
     const std::span<const std::byte> kspan(
         reinterpret_cast<const std::byte*>(key.data()), key.size());
-    for (auto it = runs->rbegin(); it != runs->rend(); ++it) {
+    const auto bh = OkiRunReader::bloom_hash(kspan);
+    for (auto it = view->runs.rbegin(); it != view->runs.rend(); ++it) {
         const OkiRunReader& rd = *it->second;
         if (rd.version() == kRunVersion) {
-            // v1 run：无位置字段也无 bloom——排除不了 key 也定位不了。
-            // 组合视图对该 key 无点查能力（kUnavailable，待重建自愈）。
+            // v1 run：无位置字段也无 bloom——组合视图对该 key 无点查能力。
             return LocateResult{};
         }
-        if (!rd.may_contain(kspan)) continue;
-        // S36-3：块经 LRU 缓存（命中零 IO；miss 1 次 4KiB pread）。
-        auto e = rd.find(kspan, &block_cache_, it->first);
+        if (!rd.may_contain_hashed(bh)) continue;
+        auto e = rd.find(kspan, block_cache_.get(), it->first);
         if (!e) return LocateResult{};  // IO/损坏 → kUnavailable
-        if (e->has_value()) {
-            out.status = LocateStatus::kHit;
-            out.ord = (*e)->ord;
-            out.tomb = (*e)->tomb;
-            out.has_loc = (*e)->has_loc;
-            out.loc = (*e)->loc;
-            return out;
-        }
-        // 缺席（bloom 假阳性）→ 更旧 run。
+        if (e->has_value()) return hit(**e);
     }
     out.status = LocateStatus::kMiss;
     return out;
 }
 
 std::optional<OkiState::ReadView> OkiState::make_read_view() const {
-    // 不再取 flush_mu_：flush/归并/重建持该锁横跨长 IO，原实现让每次
-    // range/迭代/merge 视图构建都陪等。一致性论证：
-    //   - 凡是同时改动 runs 与 delta 的提交（flush 的「发布 run + 裁前缀」、
-    //     rebuild、install_memory_view）都在 view_gate_ 的写窗口里；这里经
-    //     view_gate_.read 取 (delta, runs)，跨了窗口自动重取——二者恒属同一
-    //     提交点之间的状态，等 ord 裁决（delta 胜）才成立；
-    //   - 归并只换 runs、不动 delta，且新旧 run 集合内容等价（墓碑丢弃只
-    //     发生在含最老 run 的归并里），与任一时刻的 delta 组合都自洽，
-    //     不需要进窗口。
-    // 排序视图缓存（sorted_view_）复用逻辑不变：命中只做 shared_ptr 拷贝。
-    struct Pair {
-        bool loaded = false;
-        std::shared_ptr<const std::vector<DeltaRow>> snap;   // 缓存命中
-        std::shared_ptr<std::vector<DeltaRow>> fresh;        // 待排序的新拷贝
-        std::uint64_t want = 0;
-        decltype(runs_snap_.load()) runs;
-    };
-    {
-        Pair p = view_gate_.read([&] {
-            Pair out;
-            out.loaded = loaded_.load(std::memory_order_acquire);
-            if (!out.loaded) return out;
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                {
-                    std::lock_guard<std::mutex> vlk(view_mu_);
-                    if (sorted_view_ && sorted_view_version_ == delta_version_) {
-                        out.snap = sorted_view_;
-                    }
-                }
-                if (!out.snap) {
-                    out.fresh = std::make_shared<std::vector<DeltaRow>>(delta_);
-                    out.want = delta_version_;
-                }
-            }
-            out.runs = runs_snap_.load();
-            return out;
-        });
-        if (!p.loaded) return std::nullopt;
-        auto& snap = p.snap;
-        auto& fresh = p.fresh;
-        const std::uint64_t want = p.want;
-        const auto& runs = p.runs;
+    // 不持 flush_mu_（flush/归并/重建持该锁横跨长 IO）。成对一致由构造保证：
+    // runs 与冻结段来自同一个已发布视图；active 先取、视图后取，丢弃
+    // seq ≤ frozen_through 的 active 行（已归入视图）。
+    if (!loaded_.load(std::memory_order_acquire)) return std::nullopt;
 
-        ReadView v;
-        if (runs) {
-            v.runs.reserve(runs->size());
-            for (const auto& [gen, rd] : *runs) v.runs.push_back(rd);
-        }
-        if (!fresh) {
-            v.delta = std::move(snap);
-            return v;
-        }
-        // S36-2：stable——同 key 同 ord 按到达序取末（与 flush/locate 同一
-        // 规则；merge 搬迁行与被搬迁行同 ord）。
-        std::stable_sort(fresh->begin(), fresh->end(),
-                         [](const DeltaRow& a, const DeltaRow& b) {
-                             if (a.key != b.key) return a.key < b.key;
-                             return a.ord < b.ord;
-                         });
-        // 同 key 保留尾元素——原地压实。out == i 的自移动赋值对
-        // std::string 是 valid-but-unspecified，必须跳过。
-        std::size_t out = 0;
-        for (std::size_t i = 0; i < fresh->size(); ++i) {
-            if (i + 1 < fresh->size() &&
-                (*fresh)[i + 1].key == (*fresh)[i].key) {
-                continue;
+    // 1) active 排序视图（缓存命中零拷贝；失配则锁内拷贝、锁外排序）。
+    std::shared_ptr<const std::vector<DeltaRow>> sorted;
+    std::uint64_t sorted_min_seq = 0;
+    std::shared_ptr<std::vector<DeltaRow>> fresh;
+    std::uint64_t want = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        {
+            std::lock_guard<std::mutex> vlk(view_mu_);
+            if (sorted_view_ && sorted_view_version_ == delta_version_) {
+                sorted = sorted_view_;
+                sorted_min_seq = sorted_view_min_seq_;
             }
-            if (out != i) (*fresh)[out] = std::move((*fresh)[i]);
-            ++out;
         }
-        fresh->resize(out);
+        if (!sorted) {
+            fresh = std::make_shared<std::vector<DeltaRow>>(delta_);
+            want = delta_version_;
+        }
+    }
+    // 2) 视图。
+    const auto view = view_.load();
+    if (!view) return std::nullopt;
+
+    if (fresh) {
+        std::uint64_t min_seq = std::numeric_limits<std::uint64_t>::max();
+        for (const auto& r : *fresh) min_seq = std::min(min_seq, r.seq);
+        *fresh = sort_dedup(std::move(*fresh));
         {
             std::lock_guard<std::mutex> lk(mu_);
             std::lock_guard<std::mutex> vlk(view_mu_);
             if (delta_version_ == want) {
                 sorted_view_ = fresh;
                 sorted_view_version_ = want;
+                sorted_view_min_seq_ = min_seq;
             }
         }
-        v.delta = std::move(fresh);
-        return v;
+        sorted = fresh;
+        sorted_min_seq = min_seq;
     }
+
+    ReadView v;
+    v.runs.reserve(view->runs.size());
+    v.gens.reserve(view->runs.size());
+    for (const auto& [gen, rd] : view->runs) {
+        v.runs.push_back(rd);
+        v.gens.push_back(gen);
+    }
+    v.cache = block_cache_;
+    v.frozen = view->frozen;
+    // 3) seq 过滤。胜出行 seq ≤ frozen_through ⟹ 该 key 的权威在视图里
+    //    （冻结段恰持有它），整行剔除。常见情形缓存内全部行都新于水位，零拷贝。
+    if (sorted->empty() || sorted_min_seq > view->frozen_through) {
+        v.delta = std::move(sorted);
+    } else {
+        auto filtered = std::make_shared<std::vector<DeltaRow>>();
+        filtered->reserve(sorted->size());
+        for (const auto& r : *sorted) {
+            if (r.seq > view->frozen_through) filtered->push_back(r);
+        }
+        v.delta = std::move(filtered);
+    }
+    return v;
 }
 
 std::size_t OkiState::delta_rows() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return delta_.size();
+    // 尚未落盘的行：active + 待落盘冻结段。
+    std::size_t n = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        n = delta_.size();
+    }
+    if (const auto view = view_.load()) {
+        for (const auto& seg : view->frozen) n += seg->size();
+    }
+    return n;
 }
 
 std::size_t OkiState::delta_bytes() const {

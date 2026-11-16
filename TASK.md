@@ -10,6 +10,394 @@
 
 ---
 
+## 🔴 S44 · OKI 分级归并 + 读视图不可变发布（2026-11-16 立项）
+
+> 来源：[`designs/oki-size-tiered-compaction-design-zh.md`](designs/oki-size-tiered-compaction-design-zh.md)
+> （含第 10 节自审修订；下文「设计 §x」均指该文档）。
+> 决策基线：**run 归并从「超过 8 个就全量重写」改为「只归并最新的连续后缀」
+> （几何选段，K 默认 1）；读视图改为整体不可变发布（`OkiView` + `frozen_through`）。**
+> 硬约束：**盘上格式零改动**（manifest v4 / run v3 不变，新旧版本可互开同一目录）；
+> 任何并发读都不得读到已删除的旧值、旧位置或缺行；data 仍是唯一持久真相。
+> 验收标准：每项改动后 ctest 全绿 + 编译无新告警；涉及读视图 / 归并提交的改动
+> 必须过模型对拍与 TSan 循环；并发测试必须带**对照组**（去掉保护后能观察到违例），
+> 否则不算有效测试；收尾过 ASan/TSan 与写放大基准。
+
+### ⚠️ 执行纪律
+
+**先让「成对一致」由构造保证，再让归并变频繁。** 顺序必须是：
+
+```text
+基线与守门用例
+→ 读视图整体不可变发布（T-0），删掉 OkiState 里的 SeqGate
+→ 选段策略（纯函数）
+→ 后缀归并 + 墓碑保留 + 提交校验
+→ 调度（全部后台 / 可取消 / 年轻道 / 背压）
+→ 跨进程 load 重试
+→ 基准调参与收口
+```
+
+不得跳过 S44-1 直接做 S44-3：分级后提交点更多更频繁，继续靠「每个提交点都记得
+进 `SeqGate` 窗口」维持成对一致，漏一处就是并发读读错（设计 §4.7 陷阱 3 已经在
+现有代码里出现过一次）。
+
+已具备的前置（不在本清单内）：`SnapshotCell` / `SeqGate` 基础件、`OkiMergeCursor`
+统一归并游标、三段式 `compact_runs`（IO 不持 `flush_mu_`）、在途 gen 登记
+（`inflight_gens_`）、提交一致切面（`cut_seq`）。
+
+| # | 任务 | 状态 | 说明 |
+|---|---|---|---|
+| S44-0 | 基线、不变量守门与对拍底座 | ✅ done | 写放大基线（`bitcask_oki_compaction_bench`）；`locate_matches_cursor` 守门；模型对拍；旧持留路径改为放弃 |
+| S44-1 | 读视图整体不可变发布（设计 T-0） | ✅ done | `OkiView` + `frozen_through`；flush「冻结 → 落盘 → 单次发布」；`OkiState` 内 `SeqGate` 已移除 |
+| S44-2 | 选段策略纯函数（设计 T-1） | ✅ done | `choose_compaction`；几何后缀、硬上限、小库全归并、`force_full`；`CompactionMode::kFull` 回退 |
+| S44-3 | 后缀归并 + 墓碑保留 + 提交校验（设计 T-2） | ✅ done | `compact_once` 后缀归并；不含最老 run 时保留墓碑；连续性校验；墓碑占比触发全归并 |
+| S44-4 | 归并调度：后台化、可取消、年轻道、背压（设计 T-3） | ✅ done | 所有提交点只调度；两条归并道；析构宽限 + 取消；`kMaxRuns` 背压；`StatusInfo` 统计 |
+| S44-5 | 跨进程 `load` 重试（设计 T-3b） | ✅ done | run 缺失时重读 manifest 有界重试；Windows 滞留文件仅代码路径复核，未实测 |
+| S44-6 | 基准、调参、文档与 rollout（设计 T-4） | ✅ done | 用户 2026-11-16 确认接受预热口径：F=64K 点查 p99 1.31×（未预热 1.61×）；写放大 ≈12～13×；F=1M 点查达标；全矩阵 5 套全绿；kFull 可用。自设附加门限 G2–G4 未达标（已知取舍） |
+
+### ✅ S44-0 — 基线、不变量守门与对拍底座（先行）
+
+工作面：`bench/`、`tests/oki_regression_test.cpp`（或新 `tests/oki_compaction_model_test.cpp`）、
+`src/fileops/oki_state.cpp`、`docs/design/`。
+
+1. 写放大基线（现状 = 全归并）：
+   - `OkiState` 直驱基准：N = 10⁷ / 10⁸，单 run 行数 F = 64K / 1M；
+   - 记录「归并重写行数 ÷ flush 行数」、归并总耗时、常驻 run 数、点查 p50/p99、range 吞吐；
+   - 为此给 `OkiState` 加只读统计 `compaction_stats()`（归并次数、重写行数、墓碑行数）——
+     本任务只加计数，不改行为。
+2. 不变量守门（设计 §4.7 的 I1 / I2）：
+   - 调试构建断言 / 测试助手：同一视图上 `locate(key)` 的结果必须与 `OkiMergeCursor`
+     的裁决一致（两者是 I1 的两种消费方式，I1 被破坏时会分叉）；
+   - 把该助手接进现有 OKI 测试的收尾检查。
+3. 模型对拍骨架：
+   - 随机操作序列（put / remove / 同 ord 搬迁 / 条件墓碑 / flush / 归并 / rebuild），
+     与内存 map 模型逐 key 对比 `locate` 与迭代结果；
+   - 固定种子可复现；先在现状（全归并）下跑绿，作为后续任务的回归底座。
+4. 旧持留路径处置（设计 §4.9「需要一并处理的点」）：
+   - 不带提交切面的 `flush(dir, durable_wms)` 按持久水位**整组持留**，会让
+     「seq ≤ S 的行仍留在 active」，与 `frozen_through` 水位语义冲突；
+   - 盘点调用点（预期只有测试直调），改为与带切面路径一致：引用未持久字节 → 放弃本轮；
+   - 同步调整 `OkiOnlyContractTest.HeldRowAdvancesMetadataButNotRunWatermark`。
+
+- **验收**：基线报告入库（`docs/design/s44-compaction-baseline-zh.md`）；模型对拍在现状下
+  ≥ 10⁴ 步 × 多种子全绿；`locate` / 游标一致性助手在全量 OKI 测试中启用且全绿；
+  旧持留路径无生产调用点残留。
+
+#### ✅ S44-0 落地记录（2026-11-16）
+
+- 基准：新增 `bench/oki_compaction_bench.cpp`（`bitcask_oki_compaction_bench <dir> <N> <F> <full|tiered> [K]`，
+  `OkiState` 直驱，均匀随机 key 含覆盖写）；`OkiState::compaction_stats()` 计 flush / 归并次数、
+  重写行数、墓碑行数、耗时、背压。基线与对比合并记录在
+  `docs/design/s44-compaction-baseline-zh.md`（「现状」= `CompactionMode::kFull`，与旧全归并的选段
+  规则逐字等价；旧实现是同步归并，计时口径见报告说明）。
+- 不变量守门：`tests/support/oki_invariants.hpp` 的 `locate_matches_cursor()`——同一视图上点查与
+  `OkiMergeCursor` 裁决逐 key 比对（墓碑与缺席视为等价：后台全归并会回收墓碑）。已接入
+  `oki_regression_test` 的崩溃 tail、运行期重建、后台归并用例收尾，以及全部 S44 用例。
+- 模型对拍：`tests/oki_compaction_model_test.cpp` 的 `Model*`——随机 put / remove / 同 ord 搬迁 /
+  条件墓碑 / flush / rebuild / reopen，与内存 map 逐 key 对比点查与迭代；三套策略
+  （分级小上限、分级 K=4、kFull）× 多种子 × 3000 步，后台归并并发运行。
+- 旧持留路径：无快照的 `flush(dir, durable_wms)` 不再「整组持留」，与带快照路径一致（引用未持久字节
+  → 放弃本轮）。生产调用点均带快照，无残留；`HeldRowAdvancesMetadataButNotRunWatermark` 已同步。
+
+### ✅ S44-1 — 读视图整体不可变发布（设计 §4.9，T-0）
+
+工作面：`include/bitcask/oki_state.hpp`、`src/fileops/oki_state.cpp`、
+`include/bitcask/oki_merge_cursor.hpp`、`src/fileops/oki_merge_cursor.cpp`、
+`src/cask/cask_iter.cpp`、`src/cask/cask_range_iter.cpp`、`src/merge/merger.cpp`。
+
+1. 数据模型：
+   - `OkiView { runs, frozen[], frozen_through }`，整体经 `SnapshotCell<OkiView>` 发布；
+   - `DeltaSegment`：已排序去重的不可变内存段（带 key 二分查找，供点查）；
+   - active memdelta 仍在 `mu_` 下只追加，行带 `seq`（已有）。
+2. 唯一取数入口（点查与读视图共用，禁止各写一份）：
+   - 先取 active（快照或哈希命中）→ 再 `view = cell.load()` → 丢弃 `seq ≤ view.frozen_through`
+     的 active 行 → 来源序 active > frozen（新→旧）> runs（gen 降序）；
+   - 顺序不可反（反了会漏掉恰在两步之间被冻结的行）。
+3. 写者三个发布点（均在 `flush_mu_` 下「读当前视图 → 构造新视图 → 发布」）：
+   - 冻结：`frozen += seg`、`frozen_through = cut_seq`，发布后再从 active 物理删除；
+   - 落盘完成：`runs += run`、`frozen −= seg`，**一次发布**取代「发布 run + 裁 delta」；
+   - rebuild / `install_memory_view`：`frozen_through = 当前最大 seq` 整体作废旧 active 行；
+     内存视图的行直接成为一个 frozen 段。
+4. `OkiMergeCursor` 增加 frozen 段这一类来源（位于 runs 之后、active 之前）；
+   `ReadView` 改为持 `OkiView` + 过滤后的 active 快照；CaskIter / CaskRangeIter / MergeRunner
+   只跟着改构造处。
+5. 移除 `OkiState::view_gate_` 及三处写窗口、`make_read_view` 的重试路径；
+   `sorted_view_` 缓存收窄为只缓存 active 剩余部分（或评估后删除）。
+
+- **验收**：
+  - 专项压力测试：写者循环「追加原始行 → 追加同 ord 搬迁行 → flush」，读者断言视图里
+    任何 key 的胜出位置不旧于同视图 run / frozen 段里的同 ord 行；**对照组**（去掉 seq
+    过滤，或把取数顺序写反）必须能观察到违例；
+  - S44-0 的模型对拍与 `locate` / 游标一致性助手全绿；
+  - `OkiState` 内不再出现 `SeqGate`；TSan 循环 ≥ 25 次无告警；
+  - flush IO 期间的 range 不再重排被冻结的行（基准对比 S44-0 基线，记录即可）。
+
+#### ✅ S44-1 落地记录（2026-11-16）
+
+- `OkiState::OkiView { runs, frozen, frozen_through }` 经 `SnapshotCell` 整体发布；`ReadView` 增加
+  `frozen`。点查与读视图同一协议：先取 active、后取视图、丢弃 `seq ≤ frozen_through` 的 active 行。
+- flush 三步：冻结（排序去重成不可变段并发布，随后物理删除 active 行）→ 全部待落盘段归并写成 run
+  （墓碑保留）→ manifest 提交后**单次发布**（run 入、段出）。写盘失败时段留在视图里，下次 flush 一并写出。
+- rebuild / `install_memory_view`：`frozen_through` 抬到当前最大 seq 整体作废旧 active 行；内存视图
+  的行直接成为一个冻结段。
+- `OkiMergeCursor` 支持多个内存来源（冻结段旧→新，最后 active）；CaskIter / CaskRangeIter / merge
+  只改构造处。`OkiState` 内不再使用 `SeqGate`（基础件保留，供其它站点）。
+- 验收：`ReadViewPairingControlGroup`（确定性对照组：旧 active + 新 runs 必然判反，真实视图不判反）、
+  `ReadViewNeverInvertedUnderConcurrentFlush`（读视图 + 点查「位置不倒退」并发压力）、
+  `FrozenSegmentVisibleDuringFlushIo`（冻结窗口不缺行）。
+- 偏差：「flush IO 期间 range 不再重排被冻结的行」由构造保证（冻结段已排序），未单独做 range 计时对比。
+
+### ✅ S44-2 — 选段策略纯函数（设计 §4.2 / §4.3，T-1）
+
+工作面：新 `include/bitcask/detail/oki_compaction_policy.hpp` +
+`src/fileops/oki_compaction_policy.cpp`、`tests/`。
+
+1. `choose_compaction(sizes, floor_index, opts) → {begin, full}`：
+   - 几何后缀：从最新 run 往前累加，`s[j-1] ≤ K·acc` 就并入；后缀长度 ≥ 2 才归并；
+   - `floor_index`：只能取下标 ≥ 它的 run（供 S44-4 的年轻道使用；老道传 0）；
+   - `kMaxRuns` 硬上限：超过时强制把后缀扩到满足上限；
+   - 小库直接全归并（底座 < 16·F 一类阈值，避免千万级小库写放大略升）；
+   - `force_full` 输入位：由墓碑占比触发（S44-3 回填）。
+2. `CompactionPolicy::kFull` 内部开关：策略函数恒返回全归并，用于 A/B 与回退。
+3. 纯函数，不碰 IO、不持锁。
+
+- **验收**：单元测试覆盖边界（空 / 单 run / 全等大小 / 严格递减 / 极小 run 夹杂）、
+  K→∞ 退化为全归并、`floor_index` 约束、硬上限；模拟 10⁴ 次随机大小 flush，断言 run 数
+  始终 ≤ `kMaxRuns`、每行累计重写次数 ≤ ⌈log₂(N/F_min)⌉ + 常数。
+
+#### ✅ S44-2 落地记录（2026-11-16）
+
+- `include/bitcask/detail/oki_compaction_policy.hpp` + `src/fileops/oki_compaction_policy.cpp`：
+  `choose_compaction(sizes, floor, opts, force_full)`。几何后缀（K 默认 1）；`floor` 供年轻道；
+  `max_runs`（默认 6，S44-6 由 24 下调）硬上限**只驱动主道**，被上限扩大后缀后继续按几何规则吸收；主道发现
+  明显倒挂（老 run × 2 < 某更新 run）时从倒挂点起修复性归并；`stall_runs`（默认 2 × max_runs）为 flush
+  背压阈值；底座 < `small_base_rows`（默认 1M 行）按 kFull 规则（run 数 > 8 全归并）；
+  `force_full` 仅主道生效，对单 run 也生效（回收墓碑）。
+- `tests/oki_compaction_policy_test.cpp` 11 例（S44-6 补「上限不驱动年轻道」「倒挂修复」「上限后继续吸收」3 例）：边界、几何选段、严格递减不并、K→∞ 退化全归并、
+  floor、硬上限、kFull / 小库；10⁴ 次随机大小 flush 模拟——run 数恒 ≤ 24，写放大 ≤ log₂(N/F_min)+3，
+  且旧策略在同一序列上的重写量 > 分级的 10 倍。
+
+### ✅ S44-3 — 后缀归并 + 墓碑保留 + 提交校验（设计 §4.1 / §4.4 / §4.5，T-2）
+
+工作面：`src/fileops/oki_state.cpp`、`include/bitcask/oki_state.hpp`、`tests/`。
+依赖：S44-1、S44-2。
+
+1. `compact_runs` 泛化为归并后缀 `Rj..Rn`：
+   - 锁内：调用 S44-2 选段，快照输入 Reader，预留输出 gen（在途登记）；
+   - 锁外：`OkiMergeCursor` 归并；**不含最老 run 时 `include_tombs = true`**，墓碑行原样
+     写入输出（与 flush 产出的墓碑行同形）；含最老 run 时丢弃墓碑（同现状）；
+   - 归并过程顺带统计输出墓碑行数，超过阈值（默认 25%）则置下一次 `force_full`。
+2. 锁内提交校验：
+   - 输入 gen 仍全部在册，且仍是「所有新于输出 gen 的 run 之前」的一段连续区间；
+   - 期间发生 rebuild 或输入被改动 → 放弃并删除输出；
+   - 新视图 = `Rj` 之前的 run + 输出 + 期间新增的更高 gen run；frozen / `frozen_through` /
+     元数据 / fstats / data 水位 / wm 原样沿用；经 S44-1 的单次发布提交。
+3. v1 输入时输出降 v1（同现状）。
+4. 调整锁定旧行为的测试：
+   - `OkiRecoveryTest.RunCompactionCollapsesRunsAtThreshold`；
+   - `OkiRecoveryTest.FullCompactionDropsTombstoneRows`（改为断言「全归并后」）；
+   - `OkiRegressionTest.CompactionKeepsManifestMetadata`、`AsyncCompactionKeepsReadViewsComplete`
+     （run 数上限改为 `kMaxRuns`）。
+
+- **验收**（设计 §4.7 的陷阱 1、2 必须各有专项用例）：
+  - put 在最老 run、墓碑在小 run，后缀归并不含最老 run → key 仍不可见；重开后亦然；
+  - 搬迁行与原行分处后缀内外 → 新位置胜出；
+  - 归并期间并发 flush / rebuild → 提交放弃或正确拼接；
+  - 「输出 run 已写、manifest 未提交」处中断 → 重开后输出作为孤儿被清理，数据完整；
+  - 旧版本二进制（6.9.x）能打开分级归并后的目录并读对（降级兼容）；
+  - S44-0 模型对拍（加入后缀归并操作）全绿。
+
+#### ✅ S44-3 落地记录（2026-11-16）
+
+- `OkiState::compact_once(dir, lane)`：锁内按策略选后缀、快照输入、预留输出 gen（在途登记）；锁外
+  `OkiMergeCursor` 归并（不含最老 run 时 `include_tombs=true`，墓碑原样写入）；锁内校验输入仍在册且连续、
+  其后 run 的 gen 全部大于输出 gen、全归并仍从下标 0 开始，通过才替换并单次发布视图。
+  非全归并输出墓碑占比 > 25% → 下一次主道归并强制全归并。
+- 锁定旧行为的测试已调整：`RunCompactionCollapsesRunsAtThreshold` / `FullCompactionDropsTombstoneRows`
+  在 checkpoint 后 `wait_compaction()`；`AsyncCompactionKeepsReadViewsComplete` 上限改为 `kMaxRuns`。
+  小库仍按旧规则（第 9 个 run 触发全归并），这两条用例的断言本身未改。
+- 验收：`SuffixMergeKeepsTombstoneAndRelocation`（陷阱 1、2；重开后亦然；全归并后墓碑才消失）、
+  `OrphanRunSweptOnNextCompaction`、模型对拍（含 rebuild 与后台归并并发）。
+- 旧版本兼容：见 S44-6 落地记录（6.9.0 二进制以 Level B 读写打开分级归并后的目录逐 key 核对）。
+
+### ✅ S44-4 — 归并调度：后台化、可取消、年轻道、背压（设计 §4.5 / §4.8，T-3）
+
+工作面：`src/fileops/oki_state.cpp`、`include/bitcask/oki_state.hpp`、`src/cask/cask.cpp`、
+`include/bitcask/cask.hpp`（`StatusInfo`）。依赖：S44-3。
+
+1. 所有提交点（checkpoint / close / merge 收尾 / 备份 / 阈值 flush）只**调度**归并，
+   不再同步执行；`flush` 的 `async_compaction` 参数随之移除。
+   需要确定性 run 集合的调用方（测试、基准）用 `wait_compaction()`。
+2. 可取消：归并循环每写 N 行检查取消标志；取消即删除半成品输出（输入未动，无副作用）。
+   `OkiState` 析构 / close 先置取消再 join，不再陪等大归并。
+3. 两条归并道：
+   - 老道在途（预留输出 gen = G）时，允许年轻道只取 gen > G 的 run（S44-2 的 `floor_index`）；
+   - 年轻道永不含最老 run，必然保留墓碑；两道各自提交、互不依赖；
+   - 提交仍由 `flush_mu_` 串行，各自做 S44-3 的连续性校验。
+4. 背压：run 数超过 `kMaxRuns` 时，flush 提交后同步等待年轻道归并完成。
+5. `compaction_stats()` 补全（两道分别计数、取消次数、背压等待次数与时长），
+   接入 `StatusInfo`。
+
+- **验收**：
+  - 自动 checkpoint（reducer 线程）与 close 的耗时不再随归并规模增长（基准对比）；
+  - 大归并进行中持续 flush：run 数始终 ≤ `kMaxRuns`，读视图不缺行、不判反；
+  - close 在大归并中途返回时间有上界，重开后数据完整；
+  - 两道并发的模型对拍 + TSan 循环 ≥ 25 次无告警。
+
+#### ✅ S44-4 落地记录（2026-11-16）
+
+- 所有提交点只调度归并：`flush()` 去掉 `async_compaction` 参数，提交后 `schedule_compaction()`；
+  `Cask::commit_oki_cut()` 随之简化。需要确定性 run 集合时用 `wait_compaction()`。
+- 两条归并道（`lane_mu_` + `lane_cv_`）：主道在途（`main_out_gen_`）时 flush 调度会起年轻道，只取
+  gen > G 的 run；主道在年轻道运行期间不开始新一轮。
+- 取消：析构先给 500ms 宽限（小归并跑完——否则只在 close 时 flush 的短会话永远完不成归并），
+  再置取消标志；归并每 4096 行检查一次，半成品输出删除、输入不动。
+- 背压：flush 提交后 run 数 > `stall_runs`（默认 2 × `max_runs`）时在锁外等待归并追上（归并全部停下即返回）。
+  阈值不直接用 `max_runs`：主道重写大 run 期间其输入仍在册，run 数短暂越过上限很正常，否则写入会被卡到大归并结束。
+- `StatusInfo` 新增 `oki_runs` / `oki_flushed_rows` / `oki_compactions` / `oki_full_compactions` /
+  `oki_young_compactions` / `oki_compaction_rows` / `oki_compaction_tomb_rows` / `oki_compaction_aborts` /
+  `oki_compaction_ns` / `oki_backpressure_waits` / `oki_backpressure_ns`（C++ 结构体追加字段；C API 未同步）。
+- 仅测试用的 `set_compaction_row_hook_for_test()`：确定性制造「大归并在途」窗口。
+- 验收：`YoungLaneRunsWhileMainCompactionInFlight`、`DestructorCancelsLongCompactionBounded`（< 3s，
+  取消后输入完整）、`BackpressureBoundsRunCount`；模型对拍覆盖两道并发。
+- 偏差：「自动 checkpoint / close 耗时不再随归并规模增长」未单独计时；由构造保证（提交点不再同步
+  归并，close 有宽限 + 取消上界）。
+
+### ✅ S44-5 — 跨进程 `load` 重试（设计 §4.8，T-3b）
+
+工作面：`src/fileops/oki_state.cpp`、`tests/`。可与 S44-4 并行。
+
+1. `OkiState::load`：读完 manifest 后打开 run 文件遇到「文件不存在」时，重读 manifest 重试
+   （有界次数），而不是直接退回未加载态（只读句柄 / merge_only 旁车会因此全量重建内存视图）。
+   只对「缺失」重试；CRC / 结构损坏仍按现状弃用。
+2. Windows：打开中的 run unlink 失败进 `sweep_backlog_`；确认每次归并提交都会重试，
+   并补覆盖用例。
+
+- **验收**：一个进程持续归并、另一个进程循环只读打开同一目录 ≥ 10³ 次，无一次退回
+  全量重建；Windows ctest 全绿且长跑后无滞留 run 文件堆积。
+
+#### ✅ S44-5 落地记录（2026-11-16）
+
+- `OkiState::load`：打开 run 失败且文件不存在 → 指数退避（1ms 起）重读 manifest，最多 8 次；
+  CRC / 结构损坏仍立即弃用。
+- 验收：`ConcurrentLoaderNeverFallsBackToUnloaded`——写者持续 flush + 分级归并（上限 4），同进程另一个
+  `OkiState` 循环 `load` 同一目录，0 次退回未加载态（同一文件系统竞态，未跨进程 fork）。
+- Windows：每次归并 / 重建提交的 `sweep_runs` 都会先重试 `sweep_backlog_`，重试点与归并频率同步。
+  **未在 Windows 上实测**（本机无 Windows 环境）。
+
+### ✅ S44-6 — 基准、调参、文档与 rollout（设计 §5 / §9，T-4）
+
+工作面：`bench/`、`docs/design/`、`doc/ordered-key-index-design-zh.md`、`CHANGELOG.md`。
+依赖：S44-4、S44-5。
+
+1. 与 S44-0 基线同口径复测（N = 10⁷ / 10⁸，F = 64K / 1M），对比 `CompactionPolicy::kFull`：
+   写放大、归并总耗时、常驻 run 数、点查 p50/p99、range 吞吐、空间占用（含墓碑滞留）。
+2. 结清设计 §9 的待定问题并写回设计文档：
+   - K 默认值（1 或 2）；
+   - `K` / `kMaxRuns` 是否暴露为 `CaskOptions`（倾向不暴露）；
+   - 墓碑占比阈值是否按规模自适应；
+   - 两条归并道是否需要 IO 限速（年轻道优先）。
+3. 更新 `doc/ordered-key-index-design-zh.md` §5.2（「极简两层」改述）与
+   `docs/design/thread-safety.md`（读视图模型、锁序）。
+4. 全矩阵收口：gcc/clang Debug、Release+`-Werror`、ASan、TSan；rollout 报告入库。
+
+- **验收**：1 亿 key、F = 64K 时写放大较基线下降一个数量级以上；点查 p99 回退 ≤ 既定门限
+  （门限在 S44-0 基线报告中先行写明）；全矩阵全绿；`CompactionPolicy::kFull` 回退路径验证可用。
+
+
+#### ✅ S44-6 落地记录（2026-11-16）
+
+- 基准报告：`docs/design/s44-compaction-baseline-zh.md`。写放大（归并输出行 ÷ flush 行）：
+  10⁷ / 64K 5.22 → 2.83；10⁸ / 1M 3.79 → 2.24；10⁸ / 64K ≈62（估算，模型用两组实测回算误差 ≤ 15%）→ 4.18。
+  归并累计耗时下降 41%～54%。点查 p99 在 10⁸ 上约 8µs → 18～19µs（run 数 1 → 5～8）。
+- 设计 §9 结清：K = 1；不暴露 `CaskOptions`；墓碑阈值固定 25%；两道 IO 限速暂不做。
+- 文档：`doc/ordered-key-index-design-zh.md` §5.2 改述；`docs/design/thread-safety.md` 新增 §5.5
+  （读视图协议、发布点、归并道、锁序、析构、跨进程）；设计稿状态改为已实现；CHANGELOG `[Unreleased]`。
+- 旧版本兼容（S44-3 验收项）：用新库生成「底座 run + 含 30 条墓碑的后缀归并输出」的目录，6.9.0 的
+  `libbitcask.so` 以 Level B 读写打开两次，270 个活 key 值正确、30 个已删 key 均 NOT_FOUND。
+- 全矩阵：见下方「验证」。
+- **偏差**：
+  - 点查 p99 门限没有在首轮测量前写明（S44-0 应先行写明），首轮实测约 2.3 倍回退。已补救：在修复与复测
+    **之前**把门限写入报告 §3a（10⁸ / F=1M，分级 / 全归并：p99 ≤ 1.5×、p50 ≤ 1.3×，各 3 次取中位数）；
+    定位主因为 bloom 假阳性叠加（多 run 时 3%～6% 点查多一次块读），新 run 改为 16 bits / 11 哈希
+    （FP ≈ 0.05%，格式兼容，bloom 内存 +60%）；复测中位数 p99 **1.00×**、p50 **1.11×**，达标（报告 §3b）。
+    10⁸ / F=64K 的 p99 约 2.1×（6 个 run，块读数相同，推测为逐 run bloom 探测的缓存未命中，未单独验证），
+    按事先约定只记录；
+  - 10⁸ / 64K 全归并侧未实测（估算）；
+  - **第二批门限（报告 §3c，写于补测之前）**：10⁸ / 64K 同数据对比（分级 6 run vs 全归并 1 run，3 次中位数）——
+    G1 点查 p99 1.61×（门限 1.5×）、G2 p50 1.33×（1.3×）、G3 全量迭代 0.40×（≥0.7×）、G4 短区间 p99 4.5×（1.5×）
+    **均未达标**；G5（10⁸ / 1M、20% 删除）空间放大 1.469 ≤ 1.5、G6（10⁷ / 64K）1.000，达标。
+    补测中发现并修复了选段策略在两道并发下的两个缺陷（硬上限驱动年轻道、「新而大」倒挂；修复前实测写放大 28），
+    `max_runs` 24 → 6（另设背压阈值），游标堆优化（迭代 +15%），区间起点走块缓存；bloom 预取实测无效已撤回。
+    定位实验与模拟表明：本场景下减少 run 数会让写放大急剧上升（上限 5 → 约 10.5，即只比全归并好约 6 倍）；
+  - **结案（2026-11-16）**：用户确认接受预热口径作为 S44-6 点查 p99 门限的判定依据，S44-6 标为完成。
+  - **方法修正与重测（报告 §3e / §3f）**：点查分解测量显示 §3d 的 p99 尾部几乎全是 find 段读盘（100～250µs）——
+    老 run 文件在写入压力和共享机器外部负载下被挤出页缓存，与 run 结构无关。在门限写定之后、重测之前改为
+    「测量前预热 run 文件进页缓存」（两阶段同样处理），按原协议重测：G1 点查 p99 **1.31×（达标）**；
+    G2 p50 1.38×、G3 迭代 0.46×、G4 短区间 p99 3.65× 仍未达标。G1 是 S44-6 验收原文里的门限；G2–G4 为补测时
+    自设的附加门限（验收原文只要求测量 range 与空间），其差距是多 run 结构固有读放大、与写放大目标冲突，
+    记为已知取舍。**索引放不进内存时分级布局的点查尾延迟会明显差于单 run**（未预热 1.61×）；
+  - Windows 未测（本机无 Windows 环境）。
+
+- **最终验证**（第二批补测与选段 / 游标 / 读路径修改之后，同一份最终代码）：`build-gcc-release`
+  （Release + LTO + `-Werror`）全量构建 0 告警、ctest **853/853**；`build-asan`（ASan + UBSan）**853/853**；
+  `build-tsan` **853/853**；`build-clang-debug` **853/853**、构建 0 告警；gcc Debug（树外 `/tmp` 临时配置，
+  `BUILD_TESTING=ON` + `BITCASK_WERROR=ON`，验后删除）全量构建 0 告警、ctest **853/853**——验收原文要求的
+  gcc / clang Debug、Release + `-Werror`、ASan、TSan 五套齐全。
+- **验证**（2026-11-16 首轮，全部在 192.168.3.13；以下为第二批修改之前的记录）：
+  - `build-gcc-release`（Release + LTO + `-Werror`）：全量构建 0 告警，ctest **850/850**；
+  - `build-asan`（clang Debug，ASan + UBSan）：ctest **850/850**；
+  - `build-tsan`（clang Debug，TSan）：ctest **850/850**；
+  - `build-clang-debug`：首轮 4 个 S44 并发用例失败——排查为测试临时目录只按用例名命名，与同时在跑的
+    TSan 循环写进同一目录；改为目录名带进程级唯一后缀后，S44 相关 42 例并行 ctest 连跑 3 遍全过，
+    随后**全量 ctest 重跑 850/850**；Release / ASan 下同批用例复跑亦全过；
+  - bloom 参数调整之后：Release 全量重建 0 告警、全量 ctest **850/850**；ASan、TSan 重建后 OKI / merge / 崩溃恢复
+    相关 160 例各 160/160；
+  - TSan 下 `oki_compaction_model` + `oki_regression` 循环：与 clang Debug ctest 时间重叠的那一轮出现 3 次失败、
+    0 条竞争告警（同一目录冲突）；修正目录命名后**单独**重跑 10 轮，两组各 10/10 通过、0 告警。
+    `oki_regression_test` 的目录仍只按用例名命名（沿用仓库既有惯例），并行跑多套构建树时同样可能冲突。
+
+### 执行序
+
+```text
+S44-0 基线 / 守门 / 对拍底座
+→ S44-1 读视图不可变发布
+→ S44-2 选段策略            （纯函数，可与 S44-1 并行）
+→ S44-3 后缀归并            （依赖 S44-1 + S44-2）
+→ S44-4 调度                （依赖 S44-3）
+   S44-5 load 重试          （可与 S44-4 并行）
+→ S44-6 基准 / 调参 / rollout
+```
+
+S44-1 是独立可交付的：即使后续任务暂缓，它也消除了一类并发读隐患并简化了 flush 提交。
+S44-3 合入后、S44-4 合入前，归并仍按现状调度（阈值 flush 走后台、其余同步），功能正确
+但大库的 checkpoint 可能变慢——两者不宜隔版本发布。
+
+### 风险排序（按“有多容易静默错”）
+
+| # | 风险 | 任务 | 失败形态 |
+|---|---|---|---|
+| 1 | 不含最老 run 的归并丢了墓碑 | S44-3 | 已删除的 key 读到旧值，最不可接受 |
+| 2 | 归并了不连续 / 非后缀的 run | S44-3/4 | 旧位置压过新位置，读已退役的 data 文件 |
+| 3 | 读者漏做 seq 过滤或取数顺序写反 | S44-1 | 等 ord 判反：旧位置或已删除的 key 被当成活的 |
+| 4 | 年轻道越界取了老道输入 / 提交拼接错位 | S44-4 | run 重复或丢失，读视图缺行 |
+| 5 | 冻结段与 run 双重计入或都没计入 | S44-1 | 缺行，或 flush 期间读到重复的陈旧行 |
+| 6 | 取消 / 背压路径留下半成品或死等 | S44-4 | close 挂起、孤儿文件、写入停顿 |
+| 7 | 跨进程读者撞上 sweep | S44-5 | 只读句柄退化为全量重建（慢，不错） |
+| 8 | 小库写放大略升、墓碑滞留占空间 | S44-2/6 | 功能正确，资源回退 |
+
+### 明确不做
+
+| 项 | 理由 |
+|---|---|
+| leveled（分层、key 区间不重叠）归并 | 需要 manifest 记录层级与区间、点查逐层查；十亿级以上再议 |
+| 按 key 区间的分区归并 | 需维护分区边界与热点分裂，本届不做 |
+| 改 manifest / run 盘上格式 | 硬约束；回退与新旧互开依赖格式不变 |
+| 把 active memdelta 改成分块存储以消除冻结拷贝 | 冻结拷贝与现状的前缀拷贝同量级，单独立项 |
+| 把其它 `AtomicSharedPtr` 站点（向量 / 文本插件）迁到 `SnapshotCell` | 那些对象不一定是不可变快照，需逐个确认，另行处理 |
+| 解决 merge_only 旁车删文件后写者视图失真 | 属跨进程一致性问题，S44-5 只覆盖 `load` 窗口；写者运行期感知另议 |
+
+---
+
 ## 🔴 S43 · OKI-only：直接点查、去 hint、退役 KeyDir（2026-11-15 立项）
 
 > 来源：[`docs/design/oki-only-keydir-analysis-zh.md`](docs/design/oki-only-keydir-analysis-zh.md)、

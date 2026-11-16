@@ -27,6 +27,8 @@
 
 #include <thread>
 
+#include "support/oki_invariants.hpp"
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -137,6 +139,8 @@ protected:
                 << "b" << i << "：data 在、索引缺失";
         }
         EXPECT_EQ(r->status().key_count, total);
+        EXPECT_TRUE(bitcask_test::locate_matches_cursor(
+            r->index_authority().state()));  // S44-0 不变量守门
         r->close();
     }
 
@@ -358,8 +362,7 @@ TEST_F(OkiRegressionTest, AsyncCompactionKeepsReadViewsComplete) {
                       false, &loc);
         }
         published.store(static_cast<std::size_t>((r + 1) * kPer));
-        ASSERT_TRUE(st.flush(dir_.string(), {}, std::nullopt,
-                             /*async_compaction=*/true));
+        ASSERT_TRUE(st.flush(dir_.string(), {}, std::nullopt));
     }
     st.wait_compaction();
     stop.store(true);
@@ -368,7 +371,10 @@ TEST_F(OkiRegressionTest, AsyncCompactionKeepsReadViewsComplete) {
     auto v = st.make_read_view();
     ASSERT_TRUE(v.has_value());
     EXPECT_EQ(live_count(*v), static_cast<std::size_t>(kRounds * kPer));
-    EXPECT_LE(st.run_count(), OkiState::kCompactRunLimit + 1);
+    // 小库走旧规则（> kCompactRunLimit 才全归并），大库走分级上限 kMaxRuns。
+    EXPECT_LE(st.run_count(), std::max(OkiState::kMaxRuns, OkiState::kCompactRunLimit));
+    st.enable_point_query();
+    EXPECT_TRUE(bitcask_test::locate_matches_cursor(st));
     // 归并产物落盘：重新 load 后内容一致。
     OkiState again;
     again.load(dir_.string());
@@ -437,6 +443,7 @@ TEST_F(OkiRegressionTest, RuntimeRebuildDoesNotLoseConcurrentWrites) {
     EXPECT_EQ(missing, 0);
     EXPECT_EQ(c->status().key_count, static_cast<std::uint64_t>(kKeys));
     EXPECT_EQ(scan_count(*c), static_cast<std::size_t>(kKeys));
+    EXPECT_TRUE(bitcask_test::locate_matches_cursor(c->index_authority().state()));
     c->close();
     auto r = open(dir_, o);
     ASSERT_TRUE(r);
