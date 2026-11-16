@@ -1729,23 +1729,30 @@ TEST_F(OkiOnlyContractTest, UnrecognizedRunVersionDegradesToDataRebuild) {
     }
     const fs::path run = sole_run(dir_);
     ASSERT_FALSE(run.empty());
-    std::ifstream in(run, std::ios::binary);
-    ASSERT_TRUE(in.good());
-    const std::vector<char> raw((std::istreambuf_iterator<char>(in)),
-                                std::istreambuf_iterator<char>());
+    std::vector<char> raw;
+    std::byte version[4];
+    bitcask::le_store_u32(version, 99);
+    {
+        std::ifstream in(run, std::ios::binary);
+        ASSERT_TRUE(in.good());
+        raw.assign((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+    }
+    ASSERT_GE(raw.size(), 8u);
     ASSERT_EQ(raw[0], 'B');
     ASSERT_EQ(raw[1], 'C');
     ASSERT_EQ(raw[2], 'O');
     ASSERT_EQ(raw[3], 'K');
-    std::byte version[4];
-    bitcask::le_store_u32(version, 99);
-    std::fstream out(run, std::ios::binary | std::ios::in |
-                              std::ios::out);
-    ASSERT_TRUE(out.good());
-    out.seekp(4, std::ios::beg);
-    out.write(reinterpret_cast<const char*>(version), 4);
-    out.flush();
-    ASSERT_TRUE(out.good());
+    {
+        std::fstream out(run, std::ios::binary | std::ios::in |
+                                  std::ios::out);
+        ASSERT_TRUE(out.good());
+        out.seekp(4, std::ios::beg);
+        out.write(reinterpret_cast<const char*>(version), 4);
+        out.flush();
+        ASSERT_TRUE(out.good());
+        out.close();
+    }
 
     // 旧读端遇到未来 run 版本会拒收 OKI，而不是猜语义。当前实现等价
     // 降级：索引不可信时回到 data 重建，恢复后重写 v3。

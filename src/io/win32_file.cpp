@@ -644,9 +644,27 @@ bool atomic_rename(const std::string& from, const std::string& to) noexcept {
     auto wf = native_path(from);
     auto wt = native_path(to);
     if (!wf || !wt) return false;
-    return ::MoveFileExW(wf->c_str(), wt->c_str(),
-                         MOVEFILE_REPLACE_EXISTING |
-                         MOVEFILE_WRITE_THROUGH) != FALSE;
+    // POSIX 的 rename(2) 没有共享冲突的概念；Windows 上 REPLACE_EXISTING 只要
+    // 目标还被任何句柄打开就报 ERROR_ACCESS_DENIED（见 io.hpp 的调用约束）。
+    // 本库自己的读端句柄虽带 FILE_SHARE_DELETE，但 Windows 内核对
+    // 「替换仍打开的目标」一律拒绝；瞬时冲突的窗口极短（读者都是整读后
+    // 立刻关闭），因此这里做有界退避重试，把 POSIX 语义补齐为
+    // 「除了持久性错误外，rename 最终成功」。
+    for (unsigned attempt = 0;; ++attempt) {
+        if (::MoveFileExW(wf->c_str(), wt->c_str(),
+                          MOVEFILE_REPLACE_EXISTING |
+                              MOVEFILE_WRITE_THROUGH) != FALSE) {
+            return true;
+        }
+        const DWORD gle = ::GetLastError();
+        // ERROR_ACCESS_DENIED = 目标仍被打开；ERROR_SHARING_VIOLATION =
+        // 目标正在被删除（前一轮 rename 刚把目标标成 delete-pending）。
+        if (gle != ERROR_ACCESS_DENIED && gle != ERROR_SHARING_VIOLATION) {
+            return false;
+        }
+        if (attempt >= 50) return false;  // ~0.5 s 上限，防读者死循环挂死写端
+        ::Sleep(10);
+    }
 }
 
 // no-op：Windows 打不开目录做 fsync（CreateFileW 即便带

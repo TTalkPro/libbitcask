@@ -1,6 +1,7 @@
 #include "bitcask/oki_merge_cursor.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <string_view>
 
@@ -72,7 +73,7 @@ namespace {
 inline std::uint64_t load_be8(const char* p) noexcept {
     std::uint64_t v;
     std::memcpy(&v, p, 8);
-    return __builtin_bswap64(v);
+    return std::byteswap(v);
 }
 
 inline int key_cmp(std::string_view a, std::string_view b) noexcept {

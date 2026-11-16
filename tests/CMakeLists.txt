@@ -313,14 +313,16 @@ target_link_libraries(bitcask_txn_test PRIVATE
 )
 
 # W1 cloexec + B3 两进程写锁争用（exec-self 骨架）。
-add_executable(bitcask_process_isolation_test process_isolation_test.cpp)
-target_link_libraries(bitcask_process_isolation_test PRIVATE
-    GTest::gtest
-    bitcask_test_crash_child
-    bitcask_cask
-    bitcask_warnings
-    bitcask_sanitizers
-)
+if(NOT WIN32)
+    add_executable(bitcask_process_isolation_test process_isolation_test.cpp)
+    target_link_libraries(bitcask_process_isolation_test PRIVATE
+        GTest::gtest
+        bitcask_test_crash_child
+        bitcask_cask
+        bitcask_warnings
+        bitcask_sanitizers
+    )
+endif()
 
 add_executable(bitcask_crash_recovery_test crash_recovery_test.cpp)
 target_link_libraries(bitcask_crash_recovery_test PRIVATE
@@ -488,7 +490,9 @@ gtest_discover_tests(bitcask_cask_docvalue_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_atomic_batch_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_txn_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_crash_recovery_test ${_bitcask_test_props})
-gtest_discover_tests(bitcask_process_isolation_test ${_bitcask_test_props})
+if(NOT WIN32)
+    gtest_discover_tests(bitcask_process_isolation_test ${_bitcask_test_props})
+endif()
 gtest_discover_tests(bitcask_merge_concurrent_writer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_checkpoint_recovery_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_search_layer_test ${_bitcask_test_props})

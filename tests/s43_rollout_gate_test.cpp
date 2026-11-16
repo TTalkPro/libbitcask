@@ -435,7 +435,7 @@ TEST_F(S43RolloutGateTest, MigrationAndCorruptionFormsRecoverExplicitly) {
     ASSERT_GT(raw.size(), 64u);
     raw[4] = '\x63';  // BCOK version 99：直接复现旧读端拒收的 run 损坏。
     write_bytes(run, raw);
-    EXPECT_FALSE(bitcask::oki::OkiRunReader::open(run).has_value());
+    EXPECT_FALSE(bitcask::oki::OkiRunReader::open(run.string()).has_value());
     {
         auto c = open_rw();
         ASSERT_TRUE(c);
