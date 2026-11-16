@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`7.0.2`**；库 `SOVERSION` = **`7`**（= major）；
+`bitcask_version_*` = **`7.0.3`**；库 `SOVERSION` = **`7`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -15,10 +15,10 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
-## [7.0.2] - 2026-11-16（Windows 平台兼容性与旧索引分数修复）
+## [7.0.3] - 2026-11-16（旧索引 BM25 分数漂移修复）
 
-> **版本语义**：纯缺陷修复与构建适配——C API 签名、ABI、盘上格式零改动；
-> `SOVERSION` 保持 `7`。取 PATCH +1（7.0.2）。
+> **版本语义**：纯缺陷修复——C API 签名、ABI、盘上格式零改动；
+> `SOVERSION` 保持 `7`。取 PATCH +1（7.0.3）。
 
 ### Fixed
 
@@ -32,6 +32,16 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
   `live_doc_count() == 0` 的段；building 段也改按 live 文档数判断是否参与
   聚合。键、正文、向量与盘上格式不受影响，C API 零改动。回归
   `TextPlugin.RecoveryReplayFullyDeadSegmentKeepsScoresStable`。
+
+---
+
+## [7.0.2] - 2026-11-16（Windows 平台兼容性修复）
+
+> **版本语义**：纯缺陷修复与构建适配——C API 签名、ABI、盘上格式零改动；
+> `SOVERSION` 保持 `7`。取 PATCH +1（7.0.2）。
+
+### Fixed
+
 - **Windows `atomic_rename` 共享冲突**：`MoveFileExW(REPLACE_EXISTING)` 在目标
   文件仍被本库读句柄短暂打开，或目标处于 delete-pending 时返回
   `ERROR_ACCESS_DENIED` / `ERROR_SHARING_VIOLATION`，而 POSIX `rename(2)`
