@@ -2,7 +2,7 @@
 
 高性能嵌入式存储引擎，以 C++23 实现 Bitcask 追加日志 KV，并在其之上叠加 **BM25 全文检索**、**HNSW 向量检索** 与 **RRF 混合检索**。同一套核心既暴露为 C++23 库，也以 `extern "C"` ABI 编译为 `libbitcask.so`，供 Python / Rust / Go / Node 等跨语言 FFI 绑定使用。
 
-- **KV 模式**：append-only 数据文件 + 内存 keydir，`get` 走 O(1) keydir + 单次 `pread` 读值
+- **KV 模式**：append-only data 文件是唯一持久真相；OKI（有序 key 索引）是运行期查找/提交权威，`get` 定位后单次 `pread` 读值。索引损坏时显式报错并从 data 受控重建
 - **索引模式**：在 KV 之上叠加 BM25 倒排、HNSW 图、字段索引，支持文本 / 向量 / 混合检索
 - **C++23**，无 Boost / abseil 依赖；第三方以 git submodule 形式 vendored 在 `third_party/`，构建无需联网
 - **Apache 2.0** 协议
@@ -30,15 +30,16 @@
 | 向量引擎迁移 | `vec_engine_migrate`（CLI） | 离线切换向量引擎（只改 meta，首次 open 全量 fold 重建，可回滚） | [`vector-dual-engine-selection-zh.md`](doc/vector-dual-engine-selection-zh.md) |
 | 混合检索 | `search_hybrid` | BM25 + 向量 RRF(60) 融合 | [`hybrid_searcher.hpp`](include/bitcask/hybrid_searcher.hpp) |
 | 同义词 | `CaskOptions::synonym_map`（open-time） | 查询时自动展开，不可变、并发安全 | [`synonym_map.hpp`](include/bitcask/synonym_map.hpp) |
-| 迭代 | `make_iter` | MVCC 快照（兄弟链 + pending 哈希） | [`keydir-sharding-design-zh.md`](doc/keydir-sharding-design-zh.md) |
+| 迭代 | `make_iter` | 创建时刻的 OKI 组合视图快照（runs + frozen + memdelta） | [`ordered-key-index-design-zh.md`](doc/ordered-key-index-design-zh.md) |
 | **有序 range 扫描** | `make_range_iter`（`RangeOptions{lo,hi,prefetch}`） | OKI 有序 key 索引：`[lo,hi)` 字典序遍历，**O(range)** 而非 O(全表)（实测 1/256 选择性 8.0 ms → 0.53 ms）；可选值预取 | [`ordered-key-index-design-zh.md`](doc/ordered-key-index-design-zh.md) |
-| **keydir 磁盘驻留（Level B）** | `CaskOptions::keydir_cache_entries`（opt-in） | keydir 降级热点缓存，点查落组合视图（memdelta + BCOK v2 run：bloom + 块 LRU，冷 get ≤2 次 pread）——**1 亿 key 常驻 11GB → ~1.1GB（-90%）**，热路径零回归 | [`keydir-disk-resident-design-zh.md`](doc/keydir-disk-resident-design-zh.md) |
+| **OKI 磁盘驻留 / Level B** | `CaskOptions::keydir_cache_entries`（ABI 字段名保留；`>0` 即声明） | 点查走 active memdelta + frozen 段 + BCOK v3 run 的组合视图（bloom + 块缓存），避免重建全量内存哈希索引 | [`keydir-disk-resident-design-zh.md`](doc/keydir-disk-resident-design-zh.md) |
+| **OKI 分级归并** | 默认后台策略（`CompactionMode::kTiered`） | 只归并最新连续后缀，降低写放大并解除索引重写量与总规模近似线性绑定；`kFull` 保留为 A/B / 回退策略 | [`../designs/oki-size-tiered-compaction-design-zh.md`](designs/oki-size-tiered-compaction-design-zh.md) |
 | 并行扫描 | `parallel_scan` | 多线程全表扫描（快照 key → 分段并发 get；支持 key 前缀过滤） | [`api-cpp.md`](doc/api-cpp.md) |
 | 合并 | `merge` / `needs_merge` | 与读写并发的独立 `merge.lock` 模型 | [`merge-policy-zh.md`](doc/merge-policy-zh.md) |
-| 备份 | 文件级拷贝 + `flush_index` | WAL 一致点落盘 | [`wal-batch-design-zh.md`](doc/wal-batch-design-zh.md) |
+| 备份 | `backup` / 文件级拷贝 + `flush_index` | 一致切面复制 data 提交集与当前 OKI commit set；搜索/向量辅助缓存可按目录带快照 | [`wal-batch-design-zh.md`](doc/wal-batch-design-zh.md) |
 | 升级 | `Cask::upgrade` | 离线把 KV 目录升为索引模式 | [`api-cpp.md`](doc/api-cpp.md) |
 | 迁移 | `bitcask_migrate`（CLI） | 统一纪元迁移：`detect` / `be2le`（v1 大端）/ `tstamp64`（u32 → u64，5.0 flag-day）/ `hintord`（hint 补 ord，5.1 flag-day，data 零改动）；非破坏性 | [`migrate-le.md`](doc/migrate-le.md) |
-| 状态 | `status` / `read_handle_count` | 内省 key 数 / fd 预算 / 索引错误计数 | [`api-cpp.md`](doc/api-cpp.md) |
+| 状态 | `status` / `read_handle_count` | 内省 key 数 / fd 预算 / 索引错误 / OKI run、归并与背压计数（7.0.0 C++ 布局扩展） | [`api-cpp.md`](doc/api-cpp.md) |
 | C ABI | `libbitcask.so` | `extern "C"` 不透明句柄 + slice + fault，跨 ABI 稳定 | [`api-c.md`](doc/api-c.md) |
 | **进程级线程数上限** | `bitcask_set_thread_limits`（C）/ `include/bitcask/thread_limits.hpp`（C++） | 封顶索引池 map worker 数与批量查询 arena 槽数（0 = 缺省 `hardware_concurrency`）；进程级共享两池，须在首个 search 库 open 前设置 | [`api-c.md`](doc/api-c.md) |
 | **开库调优** | `bitcask_open_ex2`（`bitcask_open_tuning_t`） | 首旋钮 `segment_verify_crc`（缺省 1；0 = BM25 段只验页脚 / 目录，省开库整读段目录的 I/O）；`struct_size` 前向兼容，以后尾部追加字段不开新入口 | [`api-c.md`](doc/api-c.md) |
@@ -73,10 +74,10 @@
 #include <bitcask/cask.hpp>
 
 using bitcask::Cask, bitcask::CaskOptions;
-using bitcask::keydir::KeyDirRegistry;
+using bitcask::oki::IndexRegistry;
 
-// registry 强制非空：管理同目录 Cask 间的共享 keydir（典型：每进程一个）。
-KeyDirRegistry registry;
+// registry 强制非空：管理同目录 Cask 间的共享索引权威与索引池（典型：每进程一个）。
+IndexRegistry registry;
 auto c = Cask::open("/tmp/db", CaskOptions{.read_write = true}, &registry);
 if (!c) {
     fprintf(stderr, "open failed: %s\n", c.error().detail.c_str());
@@ -112,7 +113,7 @@ opts.search_config = SearchLayerConfig{
 opts.vector_dim    = 128;                                       // 启用向量
 opts.vector_metric = meta::VectorMetric::kCosineNormalized;     // 写入端归一化
 
-KeyDirRegistry registry;
+IndexRegistry registry;
 auto c = Cask::open("/tmp/db", opts, &registry);
 if (!c || !(*c)->has_search()) { return 1; }
 
@@ -214,7 +215,7 @@ ctest --preset msvc-debug
 | `third_party/googletest` | https://github.com/google/googletest | 测试（`BUILD_TESTING=ON` 时编） |
 | `third_party/benchmark` | https://github.com/google/benchmark | 微基准（`BITCASK_BUILD_BENCHMARKS=ON` 时编） |
 | `third_party/oneTBB` | https://github.com/uxlfoundation/oneTBB | TSan 插桩版（`BITCASK_SANITIZE=thread` 时编） |
-| `third_party/unordered_dense` | https://github.com/martinus/unordered_dense | KeyDir 分片表的稠密哈希表（header-only INTERFACE 库） |
+| `third_party/unordered_dense` | https://github.com/martinus/unordered_dense | DocMap live/meta/delta 表使用的稠密哈希容器（header-only INTERFACE 库） |
 
 ### 获取代码与构建
 
@@ -462,9 +463,8 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 │  CaskIter / GetResult[View] / DocInput / StatusInfo / …）           │
 │  src/cask/{cask,cask_iter,cask_search,cask_recovery}.cpp + meta_file│
 │                                                                     │
-│  ├─ KeyDir（256 分片 shared_mutex + MVCC 迭代器）                   │
+│  ├─ IndexAuthority（ord/file-id/fstats 账本 + 写序闸门）            │
 │  ├─ DataFile 缓存（pread 句柄 + 近似 LRU 淘汰）                    │
-│  ├─ HintFile（活跃写入器 + BCH5 trailer CRC + sealed-mmap hint）   │
 │  ├─ OkiState（有序 key 索引：memdelta + BCOK run + BCOM manifest）  │
 │  ├─ DocMap（Index：ord↔ext/live/meta 宿主服务；查询面 DocTable）   │
 │  ├─ TextPlugin "bm25"（倒排/Analyzer/缓存/高亮/bm25.ckpt 文件族）  │
@@ -473,7 +473,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 │  ├─ HybridSearcher（RRF 融合器；持两插件引用）                     │
 │  ├─ CaskPluginHost（read_at / run_serialized / log 窄反向接口）    │
 │  ├─ MetaConfig（bitcask.meta v5：magic + version + CRC32 + 纪元门禁）│
-│  └─ IndexPool（异步索引 MapReduce，借自 KeyDirRegistry）           │
+│  └─ IndexPool（异步索引 MapReduce，借自 IndexRegistry）             │
 └────────────────────────────┬────────────────────────────────────────┘
                                │
 ┌────────────────────────────▼────────────────────────────────────────┐
@@ -485,7 +485,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
                                │
 ┌────────────────────────────▼────────────────────────────────────────┐
 │  基础实现层                                                         │
-│  fileops        codec / data_file / hint_file / scanner / migrate  │
+│  fileops        codec / data_file / scanner / migrate               │
 │  io / lock      PosixFile / FileLock（O_EXCL 仲裁）                 │
 │  merge          纯函数策略 + Merger（CAS 重定位 + 插件广播）       │
 │  bm25           InvertedIndex + WAND + k-way 交集 + 查询 AST        │
@@ -497,9 +497,9 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 
 关键设计要点：
 
-- **双持久化**：数据文件（append-only，KV 权威）+ per-component base + delta ckpt + manifest commit（BM25/HNSW 的派生缓存，校验失败回退全量 fold）。详见 [`recovery-unified-checkpoint-design-zh.md`](doc/recovery-unified-checkpoint-design-zh.md)。
+- **持久真相与派生权威**：data 文件是唯一持久真相；健康目录下 OKI 是查找/提交权威。BM25/HNSW 仍为 per-component base + delta ckpt + manifest 的派生缓存，校验失败回退全量 fold。详见 [`recovery-unified-checkpoint-design-zh.md`](doc/recovery-unified-checkpoint-design-zh.md)。
 - **双锁模型**：`bitcask.write.lock`（writer）与 `bitcask.merge.lock`（merger）独立，周期 merge 与 live writer 并行不互斥。merger 通过读取 `write.lock` 内容排除 live writer 的活动文件。
-- **异步索引 MapReduce**：`put_doc` 入队有界 `IndexPool`（满则 push 阻塞做背压）→ N 个 map worker 并行分词（`hardware_concurrency` 真数据并行）→ per-lane reorder buffer（按 ord 排序）→ 单 reducer 串行 apply（库内单写者）。池由 `KeyDirRegistry` 共享，线程数 = N+1 与库数无关；6.6.0 起可经 `bitcask_set_thread_limits`（进程级，须在首个 search 库 open 前）同时封顶索引 worker 数与批量查询 arena 槽数。详见 [`docs/design/async-index-pipeline.md`](docs/design/async-index-pipeline.md)。
+- **异步索引 MapReduce**：`put_doc` 入队有界 `IndexPool`（满则 push 阻塞做背压）→ N 个 map worker 并行分词（`hardware_concurrency` 真数据并行）→ per-lane reorder buffer（按 ord 排序）→ 单 reducer 串行 apply（库内单写者）。池由 `IndexRegistry` 共享，线程数 = N+1 与库数无关；6.6.0 起可经 `bitcask_set_thread_limits`（进程级，须在首个 search 库 open 前）同时封顶索引 worker 数与批量查询 arena 槽数。详见 [`docs/design/async-index-pipeline.md`](docs/design/async-index-pipeline.md)。
 - **查询并发**：批量查询接口（`search_*_batch`）在进程级共享 `search_arena`（TBB `task_arena`）上 inter-query 并行；单查询内部仍串行（WAND 顺序依赖、HNSW 图遍历）。
 - **向量双引擎**（S32）：`vector_engine` 建库时一次性选定并持久化进 `bitcask.meta`——`hnsw`（内存图，≤数 M 向量）/ `ivfrq`（IVF-RaBitQ 磁盘段，10M-100M 推荐）/ `diskann`（Vamana 图，实验性）。引擎不符重开 → `kModeMismatch`；离线切换用 `vec_engine_migrate`（只改 meta，首次 open 全量 fold 重建，可回滚）。详见 [`vector-dual-engine-selection-zh.md`](doc/vector-dual-engine-selection-zh.md)。
 - **小端 only**：所有多字节整数小端（LE 主机原生零转换）；不再与 legacy 大端 Erlang 字节互通，迁移用 `bitcask_migrate be2le`（旧名 `migrate_le`，见 [`migrate-le.md`](doc/migrate-le.md)）。
@@ -514,7 +514,7 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 .
 ├── include/bitcask/   # 公共头文件（API 接口）
 ├── c_api/             # libbitcask.so 的 C ABI（bitcask_kv / text / vec + 聚合 bitcask_c.h）
-├── src/               # 实现：fileops / io / lock / keydir / merge /
+├── src/               # 实现：fileops / io / lock / cask / index / merge /
 │                      #       cask / search / bm25 / text / vector
 ├── tests/             # GoogleTest 单元 + 集成测试（50 个测试二进制，含 C API smoke）
 ├── bench/             # Google Benchmark（keydir / cask / inverted / hnsw …）
@@ -542,7 +542,9 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 | [`doc/atomic-batch-design-zh.md`](doc/atomic-batch-design-zh.md) | **S35 引擎原子批设计定稿**（kBatchHeader 区间提交判定、meta v6 懒升级、`put_batch_atomic`）——TxnCask 现行提交路径 |
 | [`doc/multikey-txn-impl-design-zh.md`](doc/multikey-txn-impl-design-zh.md) | S34 方案 B 设计存档（意图 blob 编码、单调 txn key——提交路径已被 S35 取代，recover 兼容仍在用） |
 | [`doc/pg-xid-mvcc-zh.md`](doc/pg-xid-mvcc-zh.md) | 参考笔记：PostgreSQL xmin/xmax 与 XID 回收——论证本库事务方案无需 XID 式回收 |
-| [`doc/keydir-disk-resident-design-zh.md`](doc/keydir-disk-resident-design-zh.md) | **S36 keydir 磁盘驻留设计稿**（OKI Level B：热点缓存 + BCOK v2 全字段 run + bloom；100M key 11GB → ~1.2GB） |
+| [`doc/keydir-disk-resident-design-zh.md`](doc/keydir-disk-resident-design-zh.md) | **OKI Level B 磁盘驻留设计稿**（S36 起点用 BCOK v2 表述；当前格式已演进到 BCOK v3 / BCOM v4） |
+| [`designs/oki-size-tiered-compaction-design-zh.md`](designs/oki-size-tiered-compaction-design-zh.md) | **S44 OKI 分级后缀归并设计**（后台归并、读视图不可变发布、盘上格式零改动） |
+| [`docs/design/s44-compaction-baseline-zh.md`](docs/design/s44-compaction-baseline-zh.md) | S44 写放大 / 读路径基准与验收报告 |
 | [`doc/migrate-le.md`](doc/migrate-le.md) | 大端 → 小端目录离线迁移工具（`migrate_le`） |
 
 ### 设计文档
@@ -590,11 +592,11 @@ cmake --install build   # 头文件、libbitcask.{so,a}、bitcask_c.h
 | [`doc/segment-index-design-zh.md`](doc/segment-index-design-zh.md) | 封口段格式设计（v2 mmap 零驻留 / v1 全量回退） |
 | [`doc/roaring-meta-bitmap-design-zh.md`](doc/roaring-meta-bitmap-design-zh.md) | Roaring bitmap 加速 meta 过滤设计 |
 
-### KeyDir / 恢复 / Merge / 插件
+### Index / 恢复 / Merge / 插件
 
 | 文档 | 说明 |
 |------|------|
-| [`doc/keydir-sharding-design-zh.md`](doc/keydir-sharding-design-zh.md) | KeyDir 分片与 MVCC fold 设计 |
+| [`doc/keydir-sharding-design-zh.md`](doc/keydir-sharding-design-zh.md) | 6.x KeyDir 分片与 MVCC fold 设计存档（S43 已由 OKI-only 权威取代） |
 | [`doc/getresult-view-design-zh.md`](doc/getresult-view-design-zh.md) | `GetResultView` 零拷贝设计 |
 | [`doc/recovery-unified-checkpoint-design-zh.md`](doc/recovery-unified-checkpoint-design-zh.md) | 恢复持久化：分段 ckpt + manifest commit |
 | [`doc/merge-policy-zh.md`](doc/merge-policy-zh.md) | Merge 触发策略（碎片率 / 死字节 / 过期阈值） |

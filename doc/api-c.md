@@ -141,6 +141,9 @@ BITCASK_API const char*  bitcask_version_string(void);   // "major.minor.patch"�
 
 - `bitcask_version_string()` 返回的是库内静态字符串（指向 `BITCASK_VERSION_STRING` 宏展开的字符串字面量），**不需要 free**。
 - 运行时返回值与 `libbitcask.so.7.0.0` 文件名完全对应；SOVERSION 是 `7`（大版本号），反映 ABI 兼容性。
+- 7.0.0 的 major bump 由 **C++ 公共头 ABI 变化**驱动（`StatusInfo` / `OkiState` /
+  `OkiMergeCursor` 布局变化）。C API 函数签名与既有 C POD 布局保持零增删改；
+  跨语言绑定仍需针对 `.so.7` 重新链接加载。
 
 ---
 
@@ -169,7 +172,10 @@ typedef struct {
 
 ### 4.3 句柄与全局 registry
 
-C API 是进程级 host：所有经 `bitcask_open` 打开的句柄**共享同一个进程级 `KeyDirRegistry`**（`c_api/internal.h::c_api_registry()`）。同目录多次 open 共享同一 keydir（refcount），与既有 NIF host 语义一致。
+C API 是进程级 host：所有经 `bitcask_open` 打开的句柄**共享同一个进程级
+`oki::IndexRegistry`**（`c_api/internal.h::c_api_registry()`）。同目录多次 open
+共享同一 `IndexAuthority`（引用计数），但不再共享全量内存 key 哈希索引；与既有
+NIF host 语义一致。
 
 ---
 
@@ -308,7 +314,7 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts);
 | `expiry_secs`       | `uint32_t` | `0`      | TTL 秒数（`0`=禁用）|
 | `merge_only`        | `int`      | `0`      | merge-only 模式 |
 | `tombstone_version` | `uint8_t`  | `0`      | 墓碑格式版本（`0` 或 `2`）|
-| `keydir_cache_entries` | `size_t` | `0` | **S36 Level B（keydir 磁盘驻留）**：`0`=不限（全内存，现状）；`>0`=热点缓存条目预算，点查落组合视图（冷 get ≤2 次 pread），1 亿 key 常驻 11GB → ~1.1GB。首次对旧目录开启会全量重建 OKI（一次性）；merge_only 旁车对 Level B 目录 open 返回 `BITCASK_ERR_IO`。语义详见 api-cpp.md §11.3。⚠ 结构体 5.0.0 后新增字段（布局变更，见 CHANGELOG） |
+| `keydir_cache_entries` | `size_t` | `0` | **OKI Level B 意图**（字段名为 ABI 兼容保留）：`>0` 开启组合视图运行形态，点查走 active memdelta + frozen 段 + BCOK v3 磁盘 run；首次对旧目录开启可能全量重建 OKI。merge_only 旁车对 Level B 目录 open 返回 `BITCASK_ERR_IO`。语义详见 api-cpp.md §11.3。⚠ 结构体 5.0.0 后新增字段（布局变更，见 CHANGELOG） |
 
 **搜索 / 索引**
 
@@ -362,7 +368,10 @@ BITCASK_API void bitcask_options_init(bitcask_options_t* opts);
 
 ### 6.5.1 fd / mmap 预算：怎么降"打开文件数"
 
-一个句柄实例常驻的 fd 分四块：封口 data 文件的 read 句柄（**大头**，每句柄 1 fd + 1 sealed mmap）、active data + active hint（2）、OKI run（≤9，由 run 归并保证）、`write.lock` + `field.schema`（2）。
+一个句柄实例常驻 fd 的主要构成：封口 data 文件的 read 句柄（**大头**，每句柄 1 fd +
+1 sealed mmap）、active data 写句柄（1）、OKI run reader（通常约 6；默认背压阈值 12，
+短时可更高）、`write.lock` + `field.schema`（2）。S43 新库不再写 hint；旧目录中的历史 hint
+会在可写打开时惰性清理。
 
 实测（1500 key、`max_file_size` 压到 4096 逼出 89 个 data 文件）：
 
@@ -585,7 +594,7 @@ typedef struct {
 } bitcask_range_entry_t;
 ```
 
-比 `bitcask_iter_entry_t` 少了 `file_id` / `offset` / `total_sz` / `is_tombstone`——range 迭代只产出活 key，位置信息在内部回查 keydir 时已消化。**所有权**同上：`bitcask_range_entry_free` 逐条释放 key/value 并清零。
+比 `bitcask_iter_entry_t` 少了 `file_id` / `offset` / `total_sz` / `is_tombstone`——range 迭代只产出活 key，位置信息在内部经 OKI / IndexAuthority 回查时已消化。**所有权**同上：`bitcask_range_entry_free` 逐条释放 key/value 并清零。
 
 ### 7.6 批量搜索结果数组所有权
 
@@ -1005,7 +1014,7 @@ BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
                                               bitcask_fault_t* fault);
 ```
 
-语义同逐条 `bitcask_put`，但整批一次提交：记录聚合写入、单次 flush 后才更新 keydir 并返回——**本进程内 all-or-nothing 可见**。`items` 借调用方存储；校验（key/value 大小）在任何写之前全批完成。
+语义同逐条 `bitcask_put`，但整批一次提交：记录聚合写入、单次 flush 后才应用到 IndexAuthority / OKI 并返回——**本进程内 all-or-nothing 可见**。`items` 借调用方存储；校验（key/value 大小）在任何写之前全批完成。
 
 - `n == 0`：no-op，返回 `BITCASK_OK`。
 - `items == NULL && n > 0`：`BITCASK_ERR_INVALID_OPTION`。
@@ -1180,7 +1189,8 @@ BITCASK_API bitcask_error_t bitcask_iter_start_prefix(bitcask_t* cask,
 
 带 key 前缀过滤的迭代器快照（C++ `CaskIter::start(..., key_prefix)` 在 C 侧的补齐）。`key_prefix` 为空切片（`{NULL, 0}`）时与 `bitcask_iter_start` 完全等价——后者就是以空切片调用本函数。
 
-- 过滤发生在 keydir proxy 层（不读 value），但 **keydir 是哈希表 ⟹ 仍是 O(全表) 扫描**，省的是 value 读取与跨界拷贝。
+- 过滤发生在索引权威快照层（不读 value）；扫描仍是 O(全表) 遍历，省的是不匹配 key
+  的 value 读取与跨界拷贝。
 - 有序范围扫描（O(range)）请用本章 §11.7 `bitcask_range_iter_*`。
 - 其余参数、返回码、内存配对同 `bitcask_iter_start`。
 
@@ -1274,7 +1284,7 @@ BITCASK_API bitcask_error_t bitcask_parallel_scan_prefix(bitcask_t* cask,
                                                          bitcask_fault_t* fault);
 ```
 
-带 key 前缀过滤的并行扫描。过滤在快照阶段（keydir proxy 层）完成——只有匹配的 key 会进入并发 `get`。空切片等价 `bitcask_parallel_scan`（后者即以空切片调用本函数）。其余语义完全相同。
+带 key 前缀过滤的并行扫描。过滤在快照阶段（IndexAuthority / OKI 快照层）完成——只有匹配的 key 会进入并发 `get`。空切片等价 `bitcask_parallel_scan`（后者即以空切片调用本函数）。其余语义完全相同。
 
 ### 11.7 `bitcask_range_iter_*`：有序 range 迭代（S33-6）
 
@@ -1396,6 +1406,10 @@ BITCASK_API bitcask_error_t bitcask_status_ex(bitcask_t* cask,
 
 填充 `bitcask_status_ex_t`（栈/调用方持有）。无堆分配。在 `bitcask_status_t` 基础上追加 `hnsw_nodes`、`search_cache_entries`、`read_handles`。
 
+> 7.0.0 的 OKI run / 归并 / 背压统计只加入 **C++ `StatusInfo`**（C++ ABI 破坏）；
+> C ABI 签名与既有 `bitcask_status(_ex)_t` 布局保持零变化，因此这些诊断不经过 C API
+> 暴露。C 端仍可通过目录 run 文件数与库日志观测归并状态。
+
 ### 12.3 `bitcask_needs_merge`
 
 ```c
@@ -1456,7 +1470,7 @@ BITCASK_API bitcask_error_t bitcask_checkpoint(bitcask_t* cask,
                                                bitcask_fault_t* fault);
 ```
 
-对应 C++ `Cask::checkpoint()`：keydir 快照 + `search.ckpt` 主动落盘，把崩溃恢复的重放
+对应 C++ `Cask::checkpoint()`：OKI / IndexAuthority 提交集与 `search.ckpt` 主动落盘，把崩溃恢复的重放
 窗口收到「自本次调用以来」。⭐ 顺带把上一轮 merge **退休的输入文件此刻删掉**——此前
 C API 只能靠 `bitcask_close`（多一次重开）或下一次 merge 才回收那些盘。
 
@@ -1469,7 +1483,7 @@ C API 只能靠 `bitcask_close`（多一次重开）或下一次 merge 才回收
 
 ```c
 BITCASK_API int bitcask_is_empty(bitcask_t* cask);   // 写过 key 后即使删光也返回 0
-BITCASK_API int bitcask_is_frozen(bitcask_t* cask);  // keydir 是否被 fold/iter pin 住
+BITCASK_API int bitcask_is_frozen(bitcask_t* cask);  // IndexAuthority 是否被 fold/iter pin 住
 ```
 
 返回 `0` / `1`。`cask == NULL` 时分别返回 `1` / `0`。
@@ -1873,7 +1887,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 | `bitcask_parallel_scan` / `_prefix` | ✅（内部多线程并发 `get`；**回调可能多线程并发触发**——回调须线程安全）|
 | `bitcask_status` / `bitcask_status_ex` / `bitcask_needs_merge` / `bitcask_merge` / `bitcask_is_empty` / `bitcask_is_frozen` / `bitcask_flush_index` | ✅ |
 | 读 / 写并发 | ✅（搜索可见性 near-real-time）|
-| `bitcask_merge` 与读写并发 | ✅（keydir `shared_mutex` 协调 + 独立 `merge.lock`，不阻塞 writer）|
+| `bitcask_merge` 与读写并发 | ✅（IndexAuthority 写序闸门 / 共享读 + 独立 `merge.lock`，不阻塞 writer）|
 | `bitcask_shutdown` | ⚠️（多个 shutdown 之间内部串行；但**不得与本库任何其它调用并发**，且须所有句柄已关闭，见 §8.3）|
 
 ---
