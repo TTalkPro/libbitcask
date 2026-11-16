@@ -69,106 +69,29 @@ Cask::make_range_iter(const RangeOptions& opts) {
     it->want_meta_ = opts.want_meta;
     it->filter_ = opts.filter;
 
-    // 各 run seek(lo)；memdelta lower_bound(lo)。
-    it->cursors_.reserve(it->view_.runs.size());
-    it->heads_.reserve(it->view_.runs.size());
-    for (const auto& r : it->view_.runs) {
-        auto c = r->seek(opts.lo);
-        if (!c) {
-            return std::unexpected(err(CaskError::kBadCrc,
-                                       "oki run seek failed (corrupt run)"));
-        }
-        // 预取头元素。
-        oki::OkiRunReader::Entry e;
-        auto n = c->next(e);
-        if (!n) {
-            return std::unexpected(err(CaskError::kBadCrc,
-                                       "oki run read failed (corrupt run)"));
-        }
-        it->cursors_.push_back(*std::move(c));
-        if (*n) {
-            it->heads_.push_back(std::move(e));
-        } else {
-            it->heads_.push_back(std::nullopt);
-        }
+    auto mc = oki::OkiMergeCursor::open(it->view_, opts.lo);
+    if (!mc) {
+        return std::unexpected(err(CaskError::kBadCrc,
+                                   "oki run seek failed (corrupt run)"));
     }
-    const std::string_view lo = sv(opts.lo);
-    it->delta_pos_ = static_cast<std::size_t>(
-        std::lower_bound(it->view_.delta->begin(), it->view_.delta->end(), lo,
-                         [](const oki::OkiState::DeltaRow& r,
-                            std::string_view v) { return r.key < v; }) -
-        it->view_.delta->begin());
+    it->merged_.emplace(std::move(*mc));
     return it;
 }
 
 std::expected<std::optional<std::string>, CaskFault>
 CaskRangeIter::next_merged_key() {
-    if (done_) return std::optional<std::string>{};
-
-    while (true) {
-        // 1) 找当前最小 key（跨全部 run 头 + memdelta 头）。
-        std::string_view min_key;
-        bool any = false;
-        for (const auto& h : heads_) {
-            if (h && (!any || std::string_view(h->key) < min_key)) {
-                min_key = h->key;
-                any = true;
-            }
-        }
-        if (delta_pos_ < view_.delta->size()) {
-            const auto& d = (*view_.delta)[delta_pos_];
-            if (!any || std::string_view(d.key) < min_key) {
-                min_key = d.key;
-                any = true;
-            }
-        }
-        if (!any || (has_hi_ && min_key >= std::string_view(hi_))) {
-            done_ = true;
-            return std::optional<std::string>{};
-        }
-
-        // 2) 归并同 key 各源：max-ord 胜；等 ord 时 delta / 更高 gen
-        //    到达序胜（merge relocation 的权威裁决格）。
-        std::uint64_t win_ord = 0;
-        bool win_tomb = false;
-        bool first = true;
-        const std::string key(min_key);  // 推进源会失效 view，先物化
-        for (std::size_t i = 0; i < heads_.size(); ++i) {
-            auto& h = heads_[i];
-            if (!h || h->key != key) continue;
-            if (first || h->ord >= win_ord) {
-                win_ord = h->ord;
-                win_tomb = h->tomb;
-                first = false;
-            }
-            // 推进该 run 游标。
-            oki::OkiRunReader::Entry e;
-            auto n = cursors_[i].next(e);
-            if (!n) {
-                return std::unexpected(err(CaskError::kBadCrc,
-                                           "oki run read failed mid-scan"));
-            }
-            if (*n) {
-                h = std::move(e);
-            } else {
-                h.reset();
-            }
-        }
-        if (delta_pos_ < view_.delta->size() &&
-            (*view_.delta)[delta_pos_].key == key) {
-            const auto& d = (*view_.delta)[delta_pos_];
-            if (first || d.ord >= win_ord) {
-                win_ord = d.ord;
-                win_tomb = d.tomb;
-                first = false;
-            }
-            ++delta_pos_;
-        }
-
-        // 3) 墓碑抵消 → 下一个 key。
-        if (win_tomb) continue;
-        return std::optional<std::string>(key);
+    if (done_ || !merged_) return std::optional<std::string>{};
+    oki::OkiState::DeltaRow row;
+    auto n = merged_->next(row);  // 规则见 OkiMergeCursor；墓碑已抵消
+    if (!n) {
+        return std::unexpected(err(CaskError::kBadCrc,
+                                   "oki run read failed mid-scan"));
     }
+    if (!*n || (has_hi_ && std::string_view(row.key) >= std::string_view(hi_))) {
+        done_ = true;
+        return std::optional<std::string>{};
+    }
+    return std::optional<std::string>(std::move(row.key));
 }
 
 // 惰性单条：归并出 key → 立刻回查 keydir 取权威值（key 可能已死 / 已被

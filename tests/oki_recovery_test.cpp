@@ -538,12 +538,13 @@ TEST_F(OkiRecoveryTest, RangeErrorSplitsNeverBuiltFromRebuildFailed) {
                               (*e)->key.size()), "re1");
         (*c)->close();
     }
-    // 可写重开会触发全量重建（gen 从 1 起）——在 run 目标路径上放一个
-    // **目录**使落盘失败 → 重建失败 → open 仍成功（best-effort 降级），
-    // range 报 kIndexRebuildFailed。
+    // 可写重开会触发全量重建——在 manifest 目标路径上放一个**目录**使提交
+    // 失败 → 重建失败 → open 仍成功（best-effort 降级），range 报
+    // kIndexRebuildFailed。（run gen 现取 manifest/目录内最大 gen + 1，
+    // 不再固定从 1 起，故不能在 run 路径上设阻挡。）
     std::error_code blocker_ec;
-    fs::remove(bitcask::oki::mk_run_filename(dir_.string(), 1), blocker_ec);
-    fs::create_directories(bitcask::oki::mk_run_filename(dir_.string(), 1));
+    fs::remove(bitcask::oki::mk_manifest_filename(dir_.string()), blocker_ec);
+    fs::create_directories(bitcask::oki::mk_manifest_filename(dir_.string()));
     {
         CaskOptions o;
         o.read_write = true;

@@ -50,6 +50,7 @@
 #include "bitcask/index_manifest.hpp"  // S17-2:per-component commit
 #include "bitcask/index_authority.hpp"
 #include "bitcask/index_registry.hpp"
+#include "bitcask/oki_merge_cursor.hpp"  // 统一归并游标（CaskIter/CaskRangeIter）
 #include "bitcask/oki_state.hpp"  // S33-5：CaskRangeIter 的 ReadView/Cursor
 #include "bitcask/merge_policy.hpp"
 #include "bitcask/merger.hpp"
@@ -472,9 +473,7 @@ private:
     // memdelta 是不可变快照；close/rebuild 只会让后续新迭代器看到新视图，
     // 在途迭代器不依赖 authority shard 表或 pending/epoch 协调。
     oki::OkiState::ReadView view_;
-    std::vector<oki::OkiRunReader::Cursor> cursors_;
-    std::vector<std::optional<oki::OkiRunReader::Entry>> heads_;
-    std::size_t delta_pos_ = 0;
+    std::optional<oki::OkiMergeCursor> merged_;  // 统一归并规则（见 oki_merge_cursor.hpp）
     std::string cur_key_;
     bool iterating_ = false;
     bool done_ = false;
@@ -554,10 +553,7 @@ private:
 
     Cask* cask_ = nullptr;
     oki::OkiState::ReadView view_;
-    std::vector<oki::OkiRunReader::Cursor> cursors_;
-    // 各 run 游标的当前头（nullopt = 该源已排空）。
-    std::vector<std::optional<oki::OkiRunReader::Entry>> heads_;
-    std::size_t delta_pos_ = 0;
+    std::optional<oki::OkiMergeCursor> merged_;  // 统一归并规则
     std::string hi_;
     bool has_hi_ = false;
     bool done_ = false;
@@ -1322,6 +1318,7 @@ private:
     // S43-9：OKI manifest 本身就是提交点；关闭/merge 收尾不再另写
     // BCKS。保留空操作以收敛历史调用点。
     void write_authority_snapshot() noexcept;
+    [[nodiscard]] bool commit_oki_cut(bool async_compaction = false) noexcept;
     void write_authority_snapshot(
         const std::vector<std::pair<std::uint32_t, std::uint64_t>>& wms) noexcept;
 
@@ -1338,10 +1335,14 @@ private:
     // 屏障扫 data（唯一持久真相），产出 v3 单 run；期间 rebuilding 标志
     // 让其他读者显式失败，而不是误判 NotFound 或继续走坏索引。
     [[nodiscard]] bool rebuild_oki_from_data() noexcept;
+    [[nodiscard]] bool oki_manifest_consistent() const;
     // S43-5：写路径使用 OKI 前的可信视图门。旧 Level A / 未加载态先做
     // 一次 data 受控重建；失败必须显式报 kIndexCorrupt，不能退回哈希
     // 语义或把 unavailable 当 miss。
     [[nodiscard]] bool ensure_oki_for_write() noexcept;
+    enum class RebuildOutcome { kRebuilt, kBusy, kFailed };
+    [[nodiscard]] RebuildOutcome run_controlled_rebuild(bool wait,
+                                                        bool force) noexcept;
     // 运行期重建一次只允许一个执行者；读者看到 true 时必须返回显式
     // 索引不可用/损坏错误，禁止当 miss。
     std::atomic<bool> oki_rebuilding_{false};

@@ -1310,9 +1310,11 @@ TEST_F(OkiOnlyContractTest, ForcedV3ManifestMigratesOnNextFlush) {
     EXPECT_EQ(*reopened->metadata, *migrated->metadata);
 }
 
-// held row 不允许推进 runs 覆盖水位；但它所在那次提交的 v4 全局快照
-// 可以包含 next_ord/active key/fstats。恢复语义是：wm 不含未持久 loc，
-// 行继续留在 memdelta；持久水位越过 loc 后，下一次 flush 才进入 run。
+// 已计入快照账本的行若引用未持久字节，metadata 与 run 无法同时自洽：
+// 账本含该行而 run 不含、data 水位又在它之前——崩溃后 tail 重放会把它
+// 再记一次账（active_keys 重复计数）。因此带快照的 flush 必须整体放弃
+// （delta 原状，下次提交重试）；持久水位越过 loc 后同一行收敛进唯一 run。
+// 无快照的直调 flush 维持旧语义：持留该行、不推进覆盖水位。
 TEST_F(OkiOnlyContractTest, HeldRowAdvancesMetadataButNotRunWatermark) {
     auto c = open_rw(/*level_b_entries=*/128);
     ASSERT_TRUE(c);
@@ -1322,26 +1324,34 @@ TEST_F(OkiOnlyContractTest, HeldRowAdvancesMetadataButNotRunWatermark) {
     ASSERT_EQ(located.status, OkiState::LocateStatus::kHit);
     ASSERT_TRUE(located.has_loc);
     const auto file_id = located.loc.file_id;
+    const auto before = read_manifest(dir_.string());
 
-    // 人为把 active data 的持久水位钳在 0，复现“row 已有 loc 但 caller
-    // 尚不可引用”的提交输入；OkiState 必须把它持留。
+    // 人为把 active data 的持久水位钳在 0。
     auto commit = (*c).index_authority().capture_commit_snapshot();
     ASSERT_TRUE(commit.has_value());
-    ASSERT_TRUE((*c).index_authority().state().flush(
+    EXPECT_FALSE((*c).index_authority().state().flush(
         dir_.string(),
         std::span<const std::pair<std::uint32_t, std::uint64_t>>(
             {{file_id, 0}}),
         std::move(commit)));
     EXPECT_EQ((*c).index_authority().state().delta_rows(), 1u);
     EXPECT_EQ((*c).index_authority().state().run_count(), 0u);
-    const auto held_manifest = read_manifest(dir_.string());
-    ASSERT_TRUE(held_manifest.has_value());
-    ASSERT_TRUE(held_manifest->metadata.has_value());
-    EXPECT_EQ(held_manifest->wm, 0u);
-    EXPECT_EQ(held_manifest->metadata->next_ord,
-              (*c).index_authority().peek_next_ord());
-    EXPECT_EQ(held_manifest->metadata->active_keys, 1u);
+    const auto after_abort = read_manifest(dir_.string());
+    ASSERT_EQ(before.has_value(), after_abort.has_value());
+    if (before) {
+        EXPECT_EQ(after_abort->wm, before->wm);
+        EXPECT_EQ(after_abort->metadata, before->metadata)
+            << "放弃的提交不得发布超前元数据";
+    }
     expect_value(*c, "held", "tail");
+
+    // 无快照直调：持留、不推进覆盖水位。
+    ASSERT_TRUE((*c).index_authority().state().flush(
+        dir_.string(),
+        std::span<const std::pair<std::uint32_t, std::uint64_t>>(
+            {{file_id, 0}})));
+    EXPECT_EQ((*c).index_authority().state().delta_rows(), 1u);
+    EXPECT_EQ((*c).index_authority().state().run_count(), 0u);
 
     // 数据已 sync；用真实文件尺寸做水位后，同一行收敛进唯一 run。
     const auto data_path =

@@ -924,20 +924,33 @@ std::uint64_t Cask::active_durable_bytes() const noexcept {
     return active_data_ ? active_data_->durable_bytes() : 0;
 }
 
+// OKI 唯一提交入口：一致切面（写序闸门内采集 data 水位 + 账本 + cut_seq）
+// → flush。所有提交点（close/checkpoint/merge/阈值/备份）都走这里——run 与
+// v4 元数据、data 水位必须同属一个切面；任何「只推进 run 不带元数据」的提交
+// 都会让崩溃重放漏记账或重复记账。
+bool Cask::commit_oki_cut(bool async_compaction) noexcept {
+    if (!authority_ || !authority_->state().loaded()) return false;
+    auto cut = authority_->capture_commit_cut(
+        [this] { return collect_snapshot_watermarks(); });
+    if (!cut) return false;
+    return authority_->state().flush(dirname_, cut->second,
+                                     std::move(cut->first), async_compaction);
+}
+
 void Cask::write_authority_snapshot(
     const std::vector<std::pair<std::uint32_t, std::uint64_t>>& wms) noexcept {
-    if (!authority_ || !authority_->state().loaded()) return;
-    // S43-9：OKI manifest 是唯一权威快照；不再写 BCKS。
-    auto commit = authority_->capture_commit_snapshot();
-    if (!authority_->state().flush(dirname_, wms, std::move(commit))) {
-        log_warn("oki flush after keydir snapshot failed (rebuild on open)");
-    }
+    // 调用方的水位可能早于当下（paired 入口在 search ckpt 前捕获），不能与
+    // 现在的账本拼成一个提交点；OKI 侧总是重新取一致切面。
+    (void)wms;
+    write_authority_snapshot();
 }
 
 void Cask::write_authority_snapshot() noexcept {
-    auto wms = collect_snapshot_watermarks();
-    if (!wms) return;
-    write_authority_snapshot(*wms);
+    if (!authority_ || !authority_->state().loaded()) return;
+    // S43-9：OKI manifest 是唯一权威快照；不再写 BCKS。
+    if (!commit_oki_cut()) {
+        log_warn("oki snapshot commit failed (will retry at next commit point)");
+    }
 }
 
 // B4：延迟删除队列（语义见 merge 收尾注释与 cask.hpp 成员注释）。
@@ -978,13 +991,11 @@ void Cask::maybe_flush_oki() noexcept {
     if (!authority_) return;  // S36-4：close 竞态（组提交尾可达）
     auto& oki = authority_->state();
     if (!oki.loaded() || !oki.should_flush()) return;
-    if (!opts_.o_sync && active_data_) {
-        if (auto s = active_data_->sync(); !s) {
-            log_warn("oki threshold flush: active sync failed (will retry)");
-            return;
-        }
-    }
-    if (!oki.flush(dirname_)) {
+    // 与其它提交点同一协议（切面内 fsync active）。原实现裸 flush 不带
+    // 元数据与水位：run/wm 前进而 metadata 停在旧点，崩溃后 tail 行被当作
+    //「已在 run」跳过记账，active_keys/fstats 永久少计。
+    // 写线程上（持 write_mu_）：越阈值的 run 全归并交后台线程。
+    if (!commit_oki_cut(/*async_compaction=*/true)) {
         log_warn("oki threshold flush failed (will retry)");
     }
 }
@@ -1087,6 +1098,14 @@ std::expected<void, CaskFault> Cask::maybe_group_commit(bool force) {
 std::expected<void, CaskFault>
 Cask::roll_active_if_needed(std::size_t about_to_write) {
     if (!active_data_) return ensure_active_writer();
+    // merge 输出分配的 file_id 已越过 active：权威会以 kAlreadyExists 拒收
+    // 落在更小 id 文件里的新行。原流程是先写进旧 active、被拒、再 roll 重写
+    // ——每次 merge 后首个写白写一条记录（留下垃圾 + 补 Skip 任务）。这里
+    // 写前先换文件；write_and_keydir 的拒收重试保留为并发兜底。
+    if (active_file_id_.load(std::memory_order_relaxed) <
+        authority_->biggest_file_id()) {
+        return roll_active();
+    }
     if (active_data_->size() + about_to_write <= opts_.max_file_size) return {};
     return roll_active();
 }
@@ -1254,30 +1273,56 @@ bool Cask::ensure_oki_for_write() noexcept {
     // 点查开关可能被影子对拍/Level B 读路径提前打开；只有 loaded 的
     // 组合视图才是可写权威。unavailable/v1 mixed 仍走受控重建。
     if (oki.write_probe_ready()) return true;
+    // 无锁读到「未就绪」可能只是撞上了别处（同目录共享 authority 的另一个
+    // Cask、或直调 rebuild_from_data）正在进行的重建：其「降级 → 发布」全程
+    // 持写序闸门，故在闸门内复核得到的是稳定态。复核之后即便又有新重建
+    // 开始，本写者的 apply_put 也会排在它之后、且重建在释放闸门前已开点查。
+    const auto ready_under_gate = [&] {
+        bool ready = false;
+        authority_->with_writer_lock(
+            [&] { ready = authority_->state().write_probe_ready(); });
+        return ready;
+    };
+    if (ready_under_gate()) return true;
     if (!opts_.read_write && !opts_.merge_only) return false;
+    (void)run_controlled_rebuild(/*wait=*/true, /*force=*/false);
+    return ready_under_gate();
+}
 
+// 运行期受控重建的唯一闸（读路径 / 写前 / range / fold 共用）。同一时刻
+// 至多一个重建；wait=true 时排队等在途重建结束并复核（新视图可能已可用），
+// wait=false 时遇在途重建立即返回 kBusy。force=false 时视图已具备写权威
+// 即视为无需重建；force=true（读路径：某 key 不可判定，如单个坏块）总是
+// 重建。重建本身在 IndexAuthority 内全程持写序闸门，与并发写/merge 搬迁互斥。
+Cask::RebuildOutcome Cask::run_controlled_rebuild(bool wait,
+                                                  bool force) noexcept {
+    auto& oki = authority_->state();
     std::unique_lock<std::mutex> lk(oki_rebuild_mu_);
-    oki_rebuild_cv_.wait(lk, [&] {
-        return !oki_rebuilding_.load(std::memory_order_acquire);
-    });
-    if (oki.write_probe_ready()) return true;
-
+    if (oki_rebuilding_.load(std::memory_order_acquire)) {
+        if (!wait) return RebuildOutcome::kBusy;
+        oki_rebuild_cv_.wait(lk, [&] {
+            return !oki_rebuilding_.load(std::memory_order_acquire);
+        });
+        // 刚有一次重建完成：交调用方复核，不连环重建。
+        return oki_rebuild_failed_.load(std::memory_order_acquire)
+                   ? RebuildOutcome::kFailed
+                   : RebuildOutcome::kRebuilt;
+    }
+    if (!force && oki.write_probe_ready()) return RebuildOutcome::kRebuilt;
     oki_rebuilding_.store(true, std::memory_order_release);
     lk.unlock();
     const bool rebuilt = opts_.merge_only
         ? authority_->rebuild_memory_from_data(dirname_)
         : rebuild_oki_from_data();
+    if (rebuilt) authority_->state().enable_point_query();
     lk.lock();
     oki_rebuilding_.store(false, std::memory_order_release);
     oki_rebuild_cv_.notify_all();
-    if (rebuilt) {
-        // IndexAuthority::rebuild_from_data 装载 OkiState，但 Level A 不
-        // 主动打开点查。写权威必须同时具备 loaded + point_query。
-        authority_->state().enable_point_query();
-        return authority_->state().write_probe_ready();
+    if (!rebuilt) {
+        oki_rebuild_failed_.store(true, std::memory_order_release);
+        return RebuildOutcome::kFailed;
     }
-    oki_rebuild_failed_.store(true, std::memory_order_release);
-    return false;
+    return RebuildOutcome::kRebuilt;
 }
 
 // ---- 搜索 / 写入共用辅助 ---------------------------------------------------
@@ -1638,26 +1683,18 @@ Cask::read_doc(std::span<const std::byte> key, bool want_fields) {
     // 期间拿到显式 kIndexCorrupt，绝不折叠成 NotFound。
     auto located = authority_->state().locate(bytes_to_view(key));
     if (located.status == oki::OkiState::LocateStatus::kUnavailable) {
-        // 迁移期例外：真正的 Level A 目录（无 Level B 戳且尚未开启写权威
-        // 点查）哈希表仍是完整权威。RO 无法受控重建；并发首读也不应把
-        // “尚未迁移”折叠成损坏。一旦 Level B 戳存在，即使运行期降级，
-        // 也不得回到可能被逐出的哈希缓存。
-            {
-        const bool can_rebuild =
-            !opts_.merge_only &&
-            !oki_rebuilding_.exchange(true, std::memory_order_acq_rel);
-        if (can_rebuild) {
-            const bool rebuilt = rebuild_oki_from_data();
-            oki_rebuilding_.store(false, std::memory_order_release);
-            if (rebuilt) continue;
-            oki_rebuild_failed_ = true;
+        // 与写路径同一个受控重建闸（不等待：并发读者在重建期间拿到显式
+        // kIndexCorrupt，绝不折叠成 NotFound）。
+        if (!opts_.merge_only &&
+            run_controlled_rebuild(/*wait=*/false, /*force=*/true) ==
+                RebuildOutcome::kRebuilt) {
+            continue;
         }
         return std::unexpected(err(
             CaskError::kIndexCorrupt,
             oki_rebuilding_.load(std::memory_order_acquire)
                 ? "oki unavailable: controlled rebuild in progress"
                 : "oki unavailable: runtime rebuild failed or unavailable"));
-        }
     }
     if (located.status != oki::OkiState::LocateStatus::kHit ||
         located.tomb || !located.has_loc) {
@@ -2601,7 +2638,9 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
     for (const std::size_t i : apply_order) {
         const std::size_t slot0 = i + 1;  // og 槽位（0 是批头）
         if (ops[i].type == BatchOp::Type::kRemove) {
-            authority_->apply_remove(bytes_to_view(ops[i].key), pw[i].ord);
+            authority_->apply_remove(bytes_to_view(ops[i].key), pw[i].ord,
+                                     batch_file,
+                                     pw[i].offset + pw[i].total_size);
             tasks.push_back({i, slot0,
                              PersistedRecord{pw[i].ord, pw[i].offset,
                                              pw[i].total_size, batch_file},
@@ -2726,7 +2765,8 @@ Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
     if (!w) return std::unexpected(io_fault(w.error().errnum));
     // S33：墓碑记 ord（运行期 put 走 newest_put=true 不受复活门影响；
     // 记下 ord 使崩溃前的内存态与恢复重建态一致）。
-    authority_->apply_remove(bytes_to_view(key), ord);
+    authority_->apply_remove(bytes_to_view(key), ord, active_file_id_,
+                             w->offset + w->total_size);
     og.disarm();  // S13-F2: ord 由下面的 Delete 任务覆盖
     // H1：Delete 提交移出临界区（同 put）。S15-3：原「非池同步直调
     // on_delete」分支删除——open 强制 registry 非空（本文件 open() 首行
@@ -3514,11 +3554,7 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
     // run_merge 已 fsync；水位过滤只持留并发用户写的 active 尾巴）。
     // flush 失败 → 跳过全部 unlink/trim（空间暂不回收，下轮 merge 重试）。
     if (authority_->state().point_query_enabled()) {
-        auto wms = collect_snapshot_watermarks();
-        auto commit = authority_->capture_commit_snapshot();
-        const bool flushed =
-            wms.has_value() &&
-            authority_->state().flush(dirname_, *wms, std::move(commit));
+        const bool flushed = commit_oki_cut();
         if (!flushed) {
             log_error("merge: oki flush before unlink failed; "
                       "keeping input files for retry");

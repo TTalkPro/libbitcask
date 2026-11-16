@@ -17,6 +17,7 @@
 #include "bitcask/format.hpp"          // RecordType（fold 墓碑判定）
 #include "bitcask/oki_state.hpp"       // S33-4：OKI load/缺口检查/重建
 #include "bitcask/detail/scanner.hpp"  // scan_dir（fold 数据文件枚举）
+#include "bitcask/detail/committed_fold.hpp"  // 原子批语义的统一 fold
 
 #include "cask_internal.hpp"  // err / io_fault / bytes_to_view / ckpt 常量 / component_of_plugin
 #include "bitcask/detail/path_utf8.hpp"
@@ -197,13 +198,42 @@ bool Cask::migrate_legacy_search_ckpt() {
 // data-only fold 重建。fold 顺序按 tstamp 升序——保证后写入的 entry 覆盖前面的。
 // search_layer 为空时跳过 SearchLayer 的恢复。
 // S43-3：健康 BCOM v4 + 有效 run 时优先走 data-only streaming recovery。
+// 已载 manifest 与目录实况是否自洽（Level A / Level B 共用的唯一判据）。
+// OKI-only（S43-7）后 merge 搬迁恒经 IndexAuthority::relocate 进 OKI，与
+// Level A/B 无关；能让 run 位置失真的只剩「别的进程删掉了 run 仍引用的
+// 文件」（merge_only 旁车）或提交点回滚。可检出的迹象：
+//   - manifest 的 data 水位引用了不存在 / 变短的文件（提交点越过 EOF）；
+//   - v4 fstats 里仍有活键的文件已不存在（写者不知情的删除）。
+// 目录里多出的新文件（崩溃 tail）不影响自洽：恢复会从 0 重放它们。
+// v1 run 不在此判：它是「点查不可用」而非「位置失真」，由访问时的受控
+// 重建处理。
+bool Cask::oki_manifest_consistent() const {
+    const auto& oki = authority_->state();
+    if (!oki.loaded()) return false;
+    auto file_ok = [&](std::uint32_t fid, std::uint64_t min_size) {
+        std::error_code ec;
+        const auto path = bitcask::detail::from_utf8(
+            fileops::mk_data_filename(dirname_, fid));
+        const auto sz = fs::file_size(path, ec);
+        return !ec && sz >= min_size;
+    };
+    for (const auto& [fid, wm] : oki.manifest_data_wms()) {
+        if (!file_ok(fid, wm)) return false;
+    }
+    for (const auto& f : oki.manifest_fstats()) {
+        if (f.live_keys > 0 && !file_ok(f.file_id, 0)) return false;
+    }
+    return true;
+}
+
 // 返回 false 不代表 open 失败，caller 继续走传统全量 fold / rebuild。
 bool Cask::try_data_only_recovery(
     const std::vector<fileops::DataFileEntry>& entries) {
     auto& oki = authority_->state();
     const bool search_on = text_ != nullptr;
     if (search_on || opts_.merge_only) return false;  // value 恢复仍走旧路径
-    if (!oki.loaded() || !oki.manifest_metadata().has_value()) return false;
+    const auto commit_opt = oki.manifest_metadata();  // 按值快照（防悬空）
+    if (!oki.loaded() || !commit_opt.has_value()) return false;
 
     // S43-3：mode-stamp mismatch 是一级公民 fallback，不做“顺手升级”。
     // 只有 level_b 戳可信时，run 内 loc 才是 merge/写路径在线维护的
@@ -211,8 +241,15 @@ bool Cask::try_data_only_recovery(
     // 重开后会把 stale loc 当权威，可能指向已退休文件。
     const bool intended_level_b =
         opts_.read_write && opts_.keydir_cache_entries > 0;
-    if (!oki.manifest_level_b() || !intended_level_b) return false;
-    const auto& commit = *oki.manifest_metadata();
+    const bool level_b_ok = oki.manifest_level_b() && intended_level_b;
+    // Level A 可写句柄：manifest 通过可信检查即同样走 data-only（原实现
+    // 一律退回兜底：open 一遍 ledger 全量扫描 + 首访一遍全量重建）。
+    // 两种模式都必须过同一道自洽判据（v4 元数据在场已在上方检查）。
+    const bool level_a_ok = opts_.read_write &&
+                            opts_.keydir_cache_entries == 0;
+    if (!level_b_ok && !level_a_ok) return false;
+    if (!oki_manifest_consistent()) return false;
+    const auto& commit = *commit_opt;
 
     // v1 行没有位置和 bloom；混入即组合视图不可点查。这是显式覆盖缺口，
     // 不能靠空 authority 上的普通 get 兜底。v2/v3 load 时已完成结构校验。
@@ -290,96 +327,49 @@ bool Cask::try_data_only_recovery(
 
         std::uint64_t current_end = start;
         std::uint64_t last_valid_end = start;
-        struct StagedRec {
-            format::RecordType type;
-            std::uint64_t tstamp;
-            std::uint64_t ord;
-            std::vector<std::byte> key;
-            std::vector<std::byte> value;
-            std::uint64_t offset;
-            std::uint32_t total_size;
-        };
-        std::vector<StagedRec> staged;
-        std::uint64_t batch_end = 0;
         bool flush_failed = false;
-        auto apply_rec = [&](const codec::DataRecordView& view,
-                             std::uint64_t offset,
-                             std::uint32_t total_size) {
-            if (view.type == format::RecordType::kTombstone) {
-                authority_->account_recovery_row(
-                    bytes_to_view(view.key), fid, total_size,
-                    view.tstamp, view.ord, /*tomb=*/true);
-                oki.append(bytes_to_view(view.key), view.ord,
-                           /*tomb=*/true);
-            } else {
-                const oki::RowLoc loc{fid, total_size, offset, view.tstamp};
-                authority_->account_recovery_row(
-                    bytes_to_view(view.key), fid, total_size,
-                    view.tstamp, view.ord, /*tomb=*/false);
-                oki.append(bytes_to_view(view.key), view.ord,
-                           /*tomb=*/false, &loc);
-            }
-            current_end = offset + total_size;
-        };
-
-        auto fr = df->fold(
-            [&](const codec::DataRecordView& view,
-                std::uint64_t offset, std::uint32_t total_size) {
-                if (view.type == format::RecordType::kBatchHeader) {
-                    auto bh = codec::decode_batch_header_value(view.value);
-                    if (!bh) return;
-                    batch_end = offset + total_size + bh->span_bytes;
-                    staged.clear();
-                    // 批成员收口后才可引用；水位停在批头之前。
-                    authority_->advance_ord(view.ord);
-                    return;
-                }
-                if (batch_end != 0) {
-                    StagedRec sr;
-                    sr.type = view.type;
-                    sr.tstamp = view.tstamp;
-                    sr.ord = view.ord;
-                    sr.key.assign(view.key.begin(), view.key.end());
-                    sr.value.assign(view.value.begin(), view.value.end());
-                    sr.offset = offset;
-                    sr.total_size = total_size;
-                    staged.push_back(std::move(sr));
-                    if (offset + total_size >= batch_end) {
-                        for (const auto& s : staged) {
-                            codec::DataRecordView v{
-                                .crc = 0,
-                                .type = s.type,
-                                .tstamp = s.tstamp,
-                                .ord = s.ord,
-                                .key = s.key,
-                                .value = s.value,
-                                .total_size = s.total_size,
-                            };
-                            apply_rec(v, s.offset, s.total_size);
-                        }
-                        staged.clear();
-                        batch_end = 0;
-                    }
-                    return;
-                }
-                apply_rec(view, offset, total_size);
+        fileops::CommittedFoldOptions fopts;
+        fopts.out_last_valid_end = &last_valid_end;
+        fopts.start_offset = start;
+        fopts.keep_batch_values = false;  // 只需 key / 位置
+        auto fr = fileops::fold_committed(
+            *df,
+            [&](const codec::DataRecordView& view, std::uint64_t offset,
+                std::uint32_t total_size) {
+                if (flush_failed) return;
+                // 与组合视图比对裁决（而非 wm 门）：视图已有同 key 且 ord ≥
+                // 者即已覆盖；否则记账 + 入行。见 IndexAuthority::recover_row。
+                authority_->recover_row(
+                    bytes_to_view(view.key), fid, total_size, offset,
+                    view.tstamp, view.ord,
+                    view.type == format::RecordType::kTombstone);
+                current_end = offset + total_size;
 
                 // S43-3：恢复 flush 和普通写路径同一条协议（run fsync →
                 // Reader 校验 → manifest 原子发布 → delta 截断）。当前文件
                 // 已扫描到的记录先 fsync，才允许 run 引用该位置。
                 if (oki.should_flush()) {
-                    if (!df->sync_fd_only(current_end) ||
-                        !oki.flush(dirname_,
-                                   durable_now(fid, current_end))) {
+                    // 恢复期提交同样必须带一致切面（账本 + 水位 + cut）。
+                    auto cut = authority_->capture_commit_cut(
+                        [&]() -> std::optional<oki::IndexAuthority::DataWms> {
+                            if (!df->sync_fd_only(current_end)) {
+                                return std::nullopt;
+                            }
+                            return durable_now(fid, current_end);
+                        });
+                    if (!cut ||
+                        !oki.flush(dirname_, cut->second,
+                                   std::move(cut->first))) {
                         // 失败时交全量兜底；已提交前缀仍有效，delta 保留。
                         flush_failed = true;
-                        return;
                     }
                 }
             },
-            /*tolerate_crc_errors=*/true,
-            /*out_last_valid_end=*/&last_valid_end,
-            /*start_offset=*/start);
+            // 批成员收口后才可引用；批头 ord 推进分配水位。
+            [&](const codec::DataRecordView& view) {
+                authority_->advance_ord(view.ord);
+            },
+            fopts);
         if (!fr || flush_failed) return false;
 
         // tail 的 torn write 语义与传统恢复一致：写打开且持锁时截掉尾部。
@@ -583,22 +573,8 @@ std::expected<void, CaskFault> Cask::load_authority_from_disk() {
             return std::unexpected(io_fault(df.error().errnum, e.data_path));
         }
         std::uint64_t last_valid_end = 0;
-        // S35 原子批 staging（doc/atomic-batch-design-zh.md §1.3）：批头
-        // 声明区间内的成员**拷贝暂存**（fold 缓冲跨记录复用，view 不可
-        // 留存），推进到区间末端才依序 apply——fold 层保证区间不完整时
-        // break（lve 停批头起点，随后截断），故暂存残留 = 未提交批，
-        // 随作用域丢弃即可。
-        struct StagedRec {
-            format::RecordType type;
-            std::uint64_t tstamp;
-            std::uint64_t ord;
-            std::vector<std::byte> key;
-            std::vector<std::byte> value;
-            std::uint64_t offset;
-            std::uint32_t total_size;
-        };
-        std::vector<StagedRec> staged;
-        std::uint64_t batch_end = 0;  // 0 = 未处于批区间
+        // S35 原子批语义由 fileops::fold_committed 统一实现（批成员收口后
+        // 才放行；区间不完整时 fold 停在批头，随后截断）。
         auto apply_rec = [&](const codec::DataRecordView& view,
                              std::uint64_t offset, std::uint32_t total_size) {
                 if (view.type == format::RecordType::kTombstone) {
@@ -675,52 +651,10 @@ std::expected<void, CaskFault> Cask::load_authority_from_disk() {
                     }
                 }
         };
-        auto fr = df->fold(
-            [&](const codec::DataRecordView& view, std::uint64_t offset,
-                std::uint32_t total_size) {
-                if (view.type == format::RecordType::kBatchHeader) {
-                    // 批头：开启 staging（fold 层已验证区间在 EOF 内；
-                    // value 畸形时 fold 直接 break，此处防御性忽略）。
-                    auto bh = codec::decode_batch_header_value(view.value);
-                    if (!bh) return;
-                    batch_end = offset + total_size + bh->span_bytes;
-                    staged.clear();
-                    // 批头 ord 推进水位（区间即使被弃，跳号无害、复用有害）。
-                    return;
-                }
-                if (batch_end != 0) {
-                    StagedRec sr;
-                    sr.type = view.type;
-                    sr.tstamp = view.tstamp;
-                    sr.ord = view.ord;
-                    sr.key.assign(view.key.begin(), view.key.end());
-                    sr.value.assign(view.value.begin(), view.value.end());
-                    sr.offset = offset;
-                    sr.total_size = total_size;
-                    staged.push_back(std::move(sr));
-                    if (offset + total_size >= batch_end) {
-                        // 区间收口 = 批已提交：依序放行。
-                        for (const auto& s : staged) {
-                            codec::DataRecordView v{
-                                .crc = 0,
-                                .type = s.type,
-                                .tstamp = s.tstamp,
-                                .ord = s.ord,
-                                .key = s.key,
-                                .value = s.value,
-                                .total_size = s.total_size,
-                            };
-                            apply_rec(v, s.offset, s.total_size);
-                        }
-                        staged.clear();
-                        batch_end = 0;
-                    }
-                    return;
-                }
-                apply_rec(view, offset, total_size);
-            }, /*tolerate_crc_errors*/ true,
-            /*out_last_valid_end*/ &last_valid_end,
-            /*start_offset*/ fold_start);
+        fileops::CommittedFoldOptions fopts;
+        fopts.out_last_valid_end = &last_valid_end;
+        fopts.start_offset = fold_start;
+        auto fr = fileops::fold_committed(*df, apply_rec, {}, fopts);
         if (!fr) {
             return std::unexpected(err(CaskError::kBadCrc, e.data_path));
         }
@@ -838,29 +772,25 @@ void Cask::finish_oki_recovery(bool snap_loaded,
     bool rebuild_state = !state_loaded ||
         (level_b && !authority_->state().manifest_level_b()) ||
         (read_only && !authority_->state().point_query_enabled());
-    // 已载 Level B 的两道持久门：run 集为空但 data 有活 key 说明 wm/盖
-    // 且回滚；字节水位越过 EOF 说明引用了不存在的提交点。二者都不可
-    // 保留视图。健康 v3 迁移（有 run、无 v4 元数据）仍只补 ledger。
-    bool data_wms_valid = true;
-    if (level_b) {
-        for (const auto& [file_id, byte_wm] :
-             authority_->state().manifest_data_wms()) {
-            std::error_code ec;
-            const auto path = fs::path(dirname_) /
-                (std::to_string(file_id) + ".bitcask.data");
-            if (!fs::exists(path, ec) || ec ||
-                byte_wm > fs::file_size(path, ec)) {
-                data_wms_valid = false;
-                break;
-            }
-        }
-    }
+    // Level A 可写句柄：manifest 可信 → 开点查后只补账本（含 tail 补行），
+    // 免重建；不可信 → 此处一次性重建。原流程先 ledger-only 全量扫描、首个
+    // get/put 又因点查未开触发第二遍全量重建，期间 range/scan 读的是缺 tail
+    // 的旧 run。
+    const bool level_a_trusted =
+        !level_b && opts_.read_write && !rebuild_state &&
+        authority_->state().manifest_metadata().has_value() &&
+        oki_manifest_consistent();
+    if (!level_b && opts_.read_write && !level_a_trusted) rebuild_state = true;
+    if (level_a_trusted) authority_->state().enable_point_query();
+    // 已载视图的持久门（两种模式同一判据，见 oki_manifest_consistent）：
+    // 水位越过 EOF / 活键文件被删 ⟹ 视图不可保留。
+    const bool manifest_consistent = state_loaded && oki_manifest_consistent();
     // 空 run 集但 data 有活 key，是崩溃前的 memdelta 尾部丢失（典型：
     // 可写进程未 close 就退出）。data 是唯一真相，必须全量重建视图；
     // 有 run 的健康 v3 目录仍只补账本，不得在 open 期伪造/替换视图。
     if (state_loaded && authority_->state().manifest_runs().empty() &&
         !rebuild_state) {
-        if (!authority_->rebuild_ledger_from_data(dirname_) ||
+        if (!authority_->rebuild_ledger_from_data(dirname_, opts_.read_write) ||
             authority_->info().key_count !=
                 authority_->state().manifest_metadata()
                     .value_or(bitcask::oki::OkiManifestMetadata{})
@@ -868,14 +798,13 @@ void Cask::finish_oki_recovery(bool snap_loaded,
             rebuild_state = true;
         }
     }
-    rebuild_state = rebuild_state || (level_b && !data_wms_valid);
+    rebuild_state = rebuild_state || (level_b && !manifest_consistent);
 
-    bool ok = rebuild_state
-                  ? authority_->rebuild_from_data(dirname_)
-                  : authority_->rebuild_ledger_from_data(dirname_);
-    if (rebuild_state && read_only) {
-        ok = authority_->rebuild_memory_from_data(dirname_);
-    }
+    // 只读句柄只建内存视图：原实现先调 rebuild_from_data（落 run +
+    // manifest，且不持 write.lock）再建内存视图——RO 打开改写了目录。
+    bool ok = !rebuild_state ? authority_->rebuild_ledger_from_data(dirname_, opts_.read_write)
+              : read_only    ? authority_->rebuild_memory_from_data(dirname_)
+                             : authority_->rebuild_from_data(dirname_);
     if (!ok) {
         log_warn("oki authority recovery failed (oki disabled until "
                  "next open)");
@@ -884,7 +813,9 @@ void Cask::finish_oki_recovery(bool snap_loaded,
     } else {
         // 未加载重建成功后才有可点查视图；已加载视图沿用 open 早期
         // 的模式门（Level B 才开）。ledger-only 不改变该决策。
-        if (read_only || (!authority_->state().loaded() && level_b)) {
+        // 重建成功即得到可点查视图（rebuild_from_data 产出全 v3 run）。
+        // 原判据在重建**之后**检查 !loaded()，恒为假，Level B 重建后漏开。
+        if (read_only || rebuild_state) {
             authority_->state().enable_point_query();
         }
     }

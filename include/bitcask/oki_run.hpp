@@ -486,6 +486,11 @@ struct OkiManifestFStats {
 struct OkiCommitSnapshot {
     OkiManifestMetadata metadata;
     std::vector<OkiManifestFStats> fstats;
+    // 一致切面：捕获时 OkiState 的到达序号上界。seq ≤ cut_seq 的 delta 行
+    // 恰好是账本已计入的行；之后到达的行（含捕获时 ord 已分配、尚未应用
+    // 的在途写）不得随本快照固化，否则 metadata 与 run 覆盖不一致。
+    // 默认 = 不限（直调 flush 的旧语义）。
+    std::uint64_t cut_seq = ~std::uint64_t{0};
 };
 
 struct OkiManifest {

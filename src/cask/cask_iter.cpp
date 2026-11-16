@@ -78,28 +78,11 @@ CaskIter::start(int /*maxage*/, int /*maxputs*/, std::uint64_t /*now_sec*/,
                            key_prefix.size());
     }
 
-    cursors_.reserve(view_.runs.size());
-    heads_.reserve(view_.runs.size());
-    const std::string lo_str = key_prefix_;
-    const std::string_view lo(lo_str);
-    for (const auto& run : view_.runs) {
-        auto c = run->seek(key_prefix);
-        if (!c) return std::unexpected(map_oki_error(c.error(), "oki seek"));
-        oki::OkiRunReader::Entry head;
-        auto n = c->next(head);
-        if (!n) return std::unexpected(map_oki_error(n.error(), "oki read"));
-        cursors_.push_back(std::move(*c));
-        heads_.push_back(*n ? std::optional<oki::OkiRunReader::Entry>(
-                                std::move(head))
-                            : std::nullopt);
+    {
+        auto mc = oki::OkiMergeCursor::open(view_, key_prefix);
+        if (!mc) return std::unexpected(map_oki_error(mc.error(), "oki seek"));
+        merged_.emplace(std::move(*mc));
     }
-    delta_pos_ = static_cast<std::size_t>(
-        std::lower_bound(view_.delta->begin(), view_.delta->end(), lo,
-                         [](const oki::OkiState::DeltaRow& row,
-                            std::string_view bound) {
-                             return row.key < bound;
-                         }) -
-        view_.delta->begin());
     cur_key_.clear();
     done_ = false;
     iterating_ = true;
@@ -108,90 +91,21 @@ CaskIter::start(int /*maxage*/, int /*maxputs*/, std::uint64_t /*now_sec*/,
     return {};
 }
 
-// 与 Range 迭代器同一规则：key 升序，同 key 取 max(ord)，等 ord 时
-// memdelta / 更高 gen 到达序胜。墓碑在归并层抵消活行。
+// 归并规则统一由 OkiMergeCursor 实现（与 Range 迭代器、merge、run 归并同一份）。
 std::expected<std::optional<oki::OkiState::DeltaRow>, CaskFault>
 CaskIter::next_merged_key() {
-    if (!iterating_ || done_) return std::optional<oki::OkiState::DeltaRow>{};
-
-    while (true) {
-        std::string_view min_key;
-        bool any = false;
-        bool have_run_winner = false;
-        std::uint64_t run_ord = 0;
-        std::size_t delta_pos = std::numeric_limits<std::size_t>::max();
-
-        // 先按 key 分组找最小 key；runs 内到达序随 vector 顺序升序，等
-        // ord 时后扫描者覆盖前者，天然实现“更高 gen 胜”。
-        for (std::size_t i = 0; i < heads_.size(); ++i) {
-            const auto& head = heads_[i];
-            if (!head) continue;
-            const std::string_view key(head->key);
-            if (!any || key < min_key) {
-                min_key = key;
-                any = true;
-                have_run_winner = false;
-                run_ord = 0;
-            }
-            if (key == min_key &&
-                (!have_run_winner || head->ord >= run_ord)) {
-                run_ord = head->ord;
-                have_run_winner = true;
-            }
-        }
-        if (delta_pos_ < view_.delta->size()) {
-            const std::string_view key((*view_.delta)[delta_pos_].key);
-            if (!any || key < min_key) {
-                min_key = key;
-                any = true;
-                have_run_winner = false;
-                run_ord = 0;
-            }
-            if (key == min_key) delta_pos = delta_pos_;
-        }
-        if (!any) {
-            done_ = true;
-            return std::optional<oki::OkiState::DeltaRow>{};
-        }
-
-        // 推进 run cursor 会复用/改写 head.key，因此最小 key 必须先物化，
-        // 否则分组和后续行裁决可能读到下一 key。
-        const std::string current(min_key);
-        cur_key_ = current;
-        oki::OkiState::DeltaRow winner;
-        bool have_winner = false;
-
-        for (std::size_t i = 0; i < heads_.size(); ++i) {
-            auto& head = heads_[i];
-            if (!head || std::string_view(head->key) != current) continue;
-            if (!have_winner || head->ord >= winner.ord) {
-                winner.key = head->key;
-                winner.ord = head->ord;
-                winner.tomb = head->tomb;
-                winner.has_loc = head->has_loc;
-                winner.loc = head->loc;
-                have_winner = true;
-            }
-            head.emplace();
-            auto n = cursors_[i].next(*head);
-            if (!n) return std::unexpected(map_oki_error(n.error(), "oki read"));
-            if (!*n) head.reset();
-        }
-        const bool delta_same_key =
-            delta_pos != std::numeric_limits<std::size_t>::max();
-        if (delta_same_key) {
-            const auto& row = (*view_.delta)[delta_pos];
-            if (!have_winner || row.ord >= winner.ord) winner = row;
-            have_winner = true;
-            delta_pos_ = delta_pos + 1;
-        }
-        if (!have_winner || winner.key != current) {
-            return std::unexpected(err(CaskError::kIndexCorrupt,
-                                       "oki merge winner mismatch"));
-        }
-        if (winner.tomb) continue;
-        return std::optional<oki::OkiState::DeltaRow>(winner);
+    if (!iterating_ || done_ || !merged_) {
+        return std::optional<oki::OkiState::DeltaRow>{};
     }
+    oki::OkiState::DeltaRow row;
+    auto n = merged_->next(row);
+    if (!n) return std::unexpected(map_oki_error(n.error(), "oki read"));
+    if (!*n) {
+        done_ = true;
+        return std::optional<oki::OkiState::DeltaRow>{};
+    }
+    cur_key_ = row.key;
+    return std::optional<oki::OkiState::DeltaRow>(std::move(row));
 }
 
 std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
@@ -376,11 +290,9 @@ void CaskIter::pin_files() {
 void CaskIter::release() noexcept {
     iterating_ = false;
     done_ = true;
-    cursors_.clear();
-    heads_.clear();
+    merged_.reset();
     view_ = {};
     cur_key_.clear();
-    delta_pos_ = 0;
     pinned_files_.clear();
 }
 

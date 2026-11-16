@@ -11,9 +11,11 @@
 #include "bitcask/codec.hpp"
 #include "bitcask/data_file.hpp"
 #include "bitcask/format.hpp"
+#include "bitcask/oki_merge_cursor.hpp"
 #include "bitcask/oki_state.hpp"
 #include "bitcask/plugin_api.hpp"  // S18-7：merge 参与协议（设计 §3.9）
 #include "bitcask/detail/path_utf8.hpp"
+#include "bitcask/detail/scanner.hpp"
 
 namespace bitcask::merge {
 
@@ -66,6 +68,10 @@ private:
     copy_oki_record(const oki::OkiState::DeltaRow& row,
                     fileops::DataFile& source);
 
+    // 输入文件里的墓碑保留到输出（见 run() 中的说明）。
+    [[nodiscard]] std::expected<void, MergeFault>
+    copy_tombstones(std::unordered_map<std::uint32_t, fileops::DataFile>& sources);
+
     void cleanup_partial_outputs() {
         std::error_code ec;
         std::filesystem::remove(
@@ -89,14 +95,11 @@ private:
     std::vector<PendingUpdate>                 pending_;
     oki::OkiState::ReadView                    oki_view_;
 
-    struct RunHead {
-        oki::OkiRunReader::Cursor cursor;
-        std::optional<oki::OkiRunReader::Entry> head;
-    };
-    std::vector<RunHead>                       run_heads_;
-    std::size_t                                delta_pos_ = 0;
-    bool                                       oki_done_ = false;
+    std::optional<oki::OkiMergeCursor>         merged_;
     bool                                       any_applied_ = false;
+    // 目录内存在输入集之外的 data 文件 ⟹ 其中可能有同 key 的更旧记录，
+    // 删除墓碑/过期记录后它们会在 data 重建时复活。此时墓碑必须随输出保留。
+    bool                                       keep_tombs_ = false;
 };
 
 std::expected<void, MergeFault> MergeRunner::apply_pending() {
@@ -144,92 +147,18 @@ std::expected<void, MergeFault> MergeRunner::apply_pending() {
     return {};
 }
 
-// runs 与 memdelta 的 key 归并。同 key 只返回一条权威活行；墓碑在
-// 这里抵消。裁决规则与 CaskIter/CaskRangeIter 一致：key 升序，
-// (ord, 来源序) 最大者胜；runs 按 gen 升序，delta 视作最高来源。
+// runs 与 memdelta 的 key 归并（统一规则见 OkiMergeCursor）：同 key 只
+// 返回一条权威活行，墓碑在归并层抵消。
 std::expected<std::optional<oki::OkiState::DeltaRow>, MergeFault>
 MergeRunner::next_oki_row() {
-    if (oki_done_) return std::optional<oki::OkiState::DeltaRow>{};
-
-    while (true) {
-        bool any = false;
-        std::string_view min_key;
-        bool have_run_winner = false;
-        std::uint64_t run_ord = 0;
-        std::size_t delta_pos = std::numeric_limits<std::size_t>::max();
-
-        for (std::size_t i = 0; i < run_heads_.size(); ++i) {
-            const auto& head = run_heads_[i].head;
-            if (!head) continue;
-            const std::string_view key(head->key);
-            if (!any || key < min_key) {
-                min_key = key;
-                any = true;
-                have_run_winner = false;
-                run_ord = 0;
-            }
-            if (key == min_key &&
-                (!have_run_winner || head->ord >= run_ord)) {
-                run_ord = head->ord;
-                have_run_winner = true;
-            }
-        }
-        if (delta_pos_ < oki_view_.delta->size()) {
-            const std::string_view key((*oki_view_.delta)[delta_pos_].key);
-            if (!any || key < min_key) {
-                min_key = key;
-                any = true;
-                have_run_winner = false;
-                run_ord = 0;
-            }
-            if (key == min_key) delta_pos = delta_pos_;
-        }
-        if (!any) {
-            oki_done_ = true;
-            return std::optional<oki::OkiState::DeltaRow>{};
-        }
-
-        // Cursor::next 会复用/改写 head.key，必须先物化当前 key。
-        const std::string current(min_key);
-        oki::OkiState::DeltaRow winner;
-        bool have_winner = false;
-
-        for (std::size_t i = 0; i < run_heads_.size(); ++i) {
-            auto& item = run_heads_[i];
-            auto& head = item.head;
-            if (!head || std::string_view(head->key) != current) continue;
-            if (!have_winner || head->ord >= winner.ord) {
-                winner.key = head->key;
-                winner.ord = head->ord;
-                winner.tomb = head->tomb;
-                winner.has_loc = head->has_loc;
-                winner.loc = head->loc;
-                have_winner = true;
-            }
-            head.emplace();
-            auto n = item.cursor.next(*head);
-            if (!n) {
-                return std::unexpected(io_fault(
-                    MergeError::kInputReadFailed, 0,
-                    "oki run cursor read failed"));
-            }
-            if (!*n) head.reset();
-        }
-        if (delta_pos != std::numeric_limits<std::size_t>::max()) {
-            const auto& row = (*oki_view_.delta)[delta_pos];
-            if (!have_winner || row.ord >= winner.ord) winner = row;
-            have_winner = true;
-            delta_pos_ = delta_pos + 1;
-        }
-
-        if (!have_winner || winner.key != current) {
-            return std::unexpected(io_fault(
-                MergeError::kInputReadFailed, 0,
-                "oki merge winner mismatch"));
-        }
-        if (winner.tomb) continue;
-        return std::optional<oki::OkiState::DeltaRow>(winner);
+    oki::OkiState::DeltaRow row;
+    auto n = merged_->next(row);
+    if (!n) {
+        return std::unexpected(io_fault(MergeError::kInputReadFailed, 0,
+                                        "oki run cursor read failed"));
     }
+    if (!*n) return std::optional<oki::OkiState::DeltaRow>{};
+    return std::optional<oki::OkiState::DeltaRow>(std::move(row));
 }
 
 std::expected<void, MergeFault>
@@ -261,9 +190,22 @@ MergeRunner::copy_oki_record(const oki::OkiState::DeltaRow& row,
         auto dv = codec::decode_doc_value(rec->value);
         if (dv && dv->expiry_at != 0 && dv->expiry_at <= now_sec_) {
             stats_.records_expired += 1;
-            (void)authority_.conditional_remove(
+            const bool removed = authority_.conditional_remove(
                 row.key, rec->tstamp, row.loc.file_id, row.loc.offset,
                 now_sec_);
+            // 过期记录随输入删除；若别处还有同 key 的更旧版本，必须写一条
+            // 墓碑（受害者 ord）背书本次删除，否则 data 重建会让旧版本复活。
+            if (removed && keep_tombs_) {
+                auto tw = out_data_->write_buffered(
+                    format::RecordType::kTombstone, now_sec_, rec->ord,
+                    rec->key, std::span<const std::byte>{});
+                if (!tw) {
+                    return std::unexpected(io_fault(
+                        MergeError::kOutputWriteFailed, tw.error().errnum,
+                        stats_.output_data_path));
+                }
+                stats_.bytes_written += tw->total_size;
+            }
             return {};
         }
     }
@@ -287,6 +229,60 @@ MergeRunner::copy_oki_record(const oki::OkiState::DeltaRow& row,
 
     if (pending_.size() >= kApplyBatch) {
         if (auto ap = apply_pending(); !ap) return std::unexpected(ap.error());
+    }
+    return {};
+}
+
+std::expected<void, MergeFault> MergeRunner::copy_tombstones(
+    std::unordered_map<std::uint32_t, fileops::DataFile>& sources) {
+    struct Tomb {
+        std::uint64_t ord = 0;
+        std::uint64_t tstamp = 0;
+        std::vector<std::byte> value;
+    };
+    // 同 key 只保留输入里 ord 最大的一条墓碑。
+    std::unordered_map<std::string, Tomb> tombs;
+    for (auto& [fid, df] : sources) {
+        auto folded = df.fold(
+            [&](const codec::DataRecordView& v, std::uint64_t,
+                std::uint32_t) {
+                if (v.type != format::RecordType::kTombstone) return;
+                std::string k(reinterpret_cast<const char*>(v.key.data()),
+                              v.key.size());
+                auto [it, ins] = tombs.try_emplace(std::move(k));
+                if (ins || v.ord > it->second.ord) {
+                    it->second.ord = v.ord;
+                    it->second.tstamp = v.tstamp;
+                    it->second.value.assign(v.value.begin(), v.value.end());
+                }
+            },
+            /*tolerate_crc_errors=*/true);
+        if (!folded) {
+            return std::unexpected(io_fault(MergeError::kInputReadFailed,
+                                            folded.error().errnum,
+                                            std::string(df.path())));
+        }
+    }
+    for (const auto& [key, t] : tombs) {
+        // 组合视图里已有更新的行（新 put 或更新的墓碑）⟹ 本墓碑在 data
+        // 重建中必然被压过，可以安全丢弃；其余（含视图里墓碑已被 run 归并
+        // 丢弃的 miss）一律保留。
+        const auto cur = oki_.locate(key);
+        if (cur.status == oki::OkiState::LocateStatus::kHit &&
+            cur.ord > t.ord) {
+            stats_.records_tombs += 1;
+            continue;
+        }
+        const std::span<const std::byte> kspan(
+            reinterpret_cast<const std::byte*>(key.data()), key.size());
+        auto w = out_data_->write_buffered(format::RecordType::kTombstone,
+                                           t.tstamp, t.ord, kspan, t.value);
+        if (!w) {
+            return std::unexpected(io_fault(MergeError::kOutputWriteFailed,
+                                            w.error().errnum,
+                                            stats_.output_data_path));
+        }
+        stats_.bytes_written += w->total_size;
     }
     return {};
 }
@@ -334,23 +330,30 @@ MergeRunner::run(std::span<const std::string> input_data_paths,
 
     // 先把 OKI 游标全部就位，再创建输出。任何视图/输入读取失败都不会
     // 消耗 output file_id 或留下 data 残件。
-    run_heads_.reserve(oki_view_.runs.size());
-    for (const auto& run : oki_view_.runs) {
-        auto cursor = run->begin();
-        oki::OkiRunReader::Entry head;
-        auto n = cursor.next(head);
-        if (!n) {
+    {
+        auto mc = oki::OkiMergeCursor::open(oki_view_);
+        if (!mc) {
             return std::unexpected(io_fault(
                 MergeError::kInputReadFailed, 0,
                 "oki run cursor read failed"));
         }
-        run_heads_.push_back({std::move(cursor),
-                              *n ? std::optional<oki::OkiRunReader::Entry>(
-                                      std::move(head))
-                                 : std::nullopt});
+        merged_.emplace(std::move(*mc));
     }
-    delta_pos_ = 0;
-    oki_done_ = false;
+
+    {
+        auto all = fileops::scan_dir(std::string(output_dir));
+        if (!all) {
+            return std::unexpected(io_fault(MergeError::kInputOpenFailed,
+                                            all.error().errnum,
+                                            std::string(output_dir)));
+        }
+        for (const auto& e : *all) {
+            if (!input_ids.contains(static_cast<std::uint32_t>(e.tstamp))) {
+                keep_tombs_ = true;
+                break;
+            }
+        }
+    }
 
     stats_.output_file_id = authority_.increment_file_id();
     stats_.output_data_path =
@@ -407,6 +410,15 @@ MergeRunner::run(std::span<const std::string> input_data_paths,
     if (!next.has_value()) {
         fail_cleanup();
         return std::unexpected(next.error());
+    }
+    // 墓碑保留：原实现只复制活行，输入里的墓碑随输入删除——同 key 的旧
+    // put 若在未参与合并的文件里，任何一次 data 重建（manifest 损坏、
+    // Level A 重开、运行期受控重建）都会让已删除的 key 复活。
+    if (keep_tombs_) {
+        if (auto t = copy_tombstones(sources); !t) {
+            fail_cleanup();
+            return std::unexpected(t.error());
+        }
     }
 
     if (auto ap = apply_pending(); !ap) {

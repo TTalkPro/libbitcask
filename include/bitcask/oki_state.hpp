@@ -38,6 +38,8 @@
 #pragma once
 
 #include <atomic>
+#include <optional>
+#include <thread>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -55,6 +57,11 @@ namespace bitcask::oki {
 
 class OkiState {
 public:
+    OkiState() = default;
+    ~OkiState();  // 等后台归并线程收尾
+    OkiState(const OkiState&) = delete;
+    OkiState& operator=(const OkiState&) = delete;
+
     // S36-2：行加宽为全字段（doc/keydir-disk-resident-design-zh.md §6）——
     // 组合视图点查（locate）的权威载体。活行恒 has_loc=true（写挂钩把
     // (file_id, total_sz, offset, tstamp) 一并送入）；墓碑行免位置。
@@ -64,6 +71,14 @@ public:
         bool tomb = false;
         bool has_loc = false;
         RowLoc loc{};
+        // 墓碑行的持久性落点（不进 run，只供 flush 的持留判定）：墓碑没有
+        // loc，但它的 data 记录同样可能尚未持久。0 = 无落点（条件删除等
+        // 无数据记录背书的行）——视为已持久。
+        std::uint32_t dur_file = 0;
+        std::uint64_t dur_end = 0;
+        // 到达序号（mu_ 下单调分配；0 = 恢复/重建装载的行）。与
+        // OkiCommitSnapshot::cut_seq 配合界定「快照已计入」的行。
+        std::uint64_t seq = 0;
     };
 
     // 写挂钩（keydir.cpp 的 put/remove 咽喉点调用）。ord < wm 的行直接
@@ -78,8 +93,16 @@ public:
     //   - TTL conditional_remove（受害者 ord 的墓碑）：keydir 侧删除没有
     //     数据记录背书，组合视图靠这行抵消 run 里的陈旧活行。
     // 恢复期不走本入口（两者皆运行期路径），水位门语义不受影响。
+    // dur_file/dur_end：墓碑行的 data 落点（见 DeltaRow），其余行传 0。
     void append_update(std::string_view key, std::uint64_t ord, bool tomb,
-                       const RowLoc* loc);
+                       const RowLoc* loc, std::uint32_t dur_file = 0,
+                       std::uint64_t dur_end = 0);
+
+    // 当前到达序号上界（一致切面捕获用；调用方须在写序闸门内调用）。
+    [[nodiscard]] std::uint64_t current_seq() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return append_seq_;
+    }
 
     // 写路径探询：memdelta 达阈值（行数/字节）？无锁近似读。
     [[nodiscard]] bool should_flush() const noexcept {
@@ -107,11 +130,14 @@ public:
     // 恒是 active 尾巴（sealed 由封口 fsync 全量持久），ord 全局最高——
     // cover/wm 不含它们，tail 重放的水位门语义自洽。空 span = 不过滤
     // （调用方已保证全部持久，如写路径阈值 flush 的先 sync 后 flush）。
+    // async_compaction：提交后若 run 数越阈值，归并交后台线程（写线程上的
+    // 阈值 flush 用，免写者陪等全量归并）；否则在释放 flush_mu_ 后同步归并。
     [[nodiscard]] bool flush(
         std::string_view dir,
         std::span<const std::pair<std::uint32_t, std::uint64_t>> durable_wms =
             {},
-        std::optional<OkiCommitSnapshot> commit_snapshot = std::nullopt);
+        std::optional<OkiCommitSnapshot> commit_snapshot = std::nullopt,
+        bool async_compaction = false);
 
     // 全量重建：rows 由 caller 从 keydir 收集（活 key + ord；墓碑不需要
     // ——单一全量 run 的缺席即语义）。排序写单 run、manifest 只含它、
@@ -124,6 +150,20 @@ public:
                                std::uint64_t cover_ord,
                                std::optional<OkiCommitSnapshot> commit_snapshot =
                                    std::nullopt);
+
+    // 流式重建的两段接口（IndexAuthority::rebuild_from_data 用）：
+    //   reserve_gen → caller 在锁外把行直接灌进 SpillingRunBuilder(dir, gen)
+    //   → install_built_run 提交（语义同 rebuild：单 run、wm=cover、清 delta、
+    //   sweep 旧 run）。gen=0 = 无 run（零活 key）。构建失败 → abandon_gen。
+    // 预留的 gen 在提交/放弃前登记为在途，并发 sweep 不会删其 run/spill。
+    [[nodiscard]] std::uint64_t reserve_gen(std::string_view dir);
+    [[nodiscard]] bool install_built_run(
+        std::string_view dir, std::uint64_t gen, std::uint64_t cover_ord,
+        std::optional<OkiCommitSnapshot> commit_snapshot = std::nullopt);
+    void abandon_gen(std::string_view dir, std::uint64_t gen);
+
+    // 等待在途后台归并完成（测试 / 需要确定性 run 集合的调用方）。
+    void wait_compaction();
 
     // 只读恢复/升级的内存视图：语义与 rebuild 相同，但不落 run、不改盘上
     // manifest。data 仍是持久真相；可写句柄后续会做持久受控重建。
@@ -190,7 +230,10 @@ public:
     // 同一把写序闸门内应用，避免探测/应用之间出现 TOCTOU。
     void apply_put(std::string_view key, std::uint64_t ord,
                    const RowLoc& loc);
-    void apply_remove(std::string_view key, std::uint64_t ord);
+    // dur_file/dur_end：墓碑 data 记录的落点（文件 + 记录末字节），供 flush
+    // 判定其是否已持久；0 = 未知/无记录。
+    void apply_remove(std::string_view key, std::uint64_t ord,
+                      std::uint32_t dur_file = 0, std::uint64_t dur_end = 0);
     void apply_conditional_remove(std::string_view key,
                                   std::uint64_t victim_ord);
     void apply_relocation(std::string_view key, std::uint64_t ord,
@@ -224,22 +267,27 @@ public:
         return manifest_level_b_.load(std::memory_order_acquire);
     }
     // S43-2：v4 元数据迁移入口；nullopt = 盘上仍是 v1-v3 或未加载。
-    [[nodiscard]] const std::optional<OkiManifestMetadata>&
-    manifest_metadata() const noexcept {
+    // 访问器按值返回并持 flush_mu_：manifest_ 会被 flush/compact/rebuild
+    // 整体替换，返回内部引用是数据竞争（且调用方可能持有悬空引用）。
+    [[nodiscard]] std::optional<OkiManifestMetadata>
+    manifest_metadata() const {
+        std::lock_guard<std::mutex> flk(flush_mu_);
         return manifest_.metadata;
     }
-    [[nodiscard]] const std::vector<OkiManifestFStats>&
-    manifest_fstats() const noexcept {
+    [[nodiscard]] std::vector<OkiManifestFStats>
+    manifest_fstats() const {
+        std::lock_guard<std::mutex> flk(flush_mu_);
         return manifest_.fstats;
     }
     // S43-3：streaming recovery 检查 run 版本/覆盖时需要的只读 manifest 面。
-    [[nodiscard]] const std::vector<OkiManifestEntry>&
-    manifest_runs() const noexcept {
+    [[nodiscard]] std::vector<OkiManifestEntry>
+    manifest_runs() const {
+        std::lock_guard<std::mutex> flk(flush_mu_);
         return manifest_.runs;
     }
-    [[nodiscard]] const std::vector<
-        std::pair<std::uint32_t, std::uint64_t>>&
-    manifest_data_wms() const noexcept {
+    [[nodiscard]] std::vector<std::pair<std::uint32_t, std::uint64_t>>
+    manifest_data_wms() const {
+        std::lock_guard<std::mutex> flk(flush_mu_);
         return manifest_.data_wms;
     }
     // 降级戳：level_b 关而盘上戳开 → 立刻改写 manifest 清戳（Level A 写者
@@ -284,14 +332,33 @@ private:
     // 完整性不变量（OKI key 集 ⊇ keydir 活 key 集）不受影响：被丢弃的 key
     // 若之后重新 put，新行 ord > wm 走 memdelta（读视图含之），崩溃时也由
     // tail 重放补回——归并不动 wm。
-    [[nodiscard]] bool compact_all_locked(std::string_view dir);
+    // 全归并（三段式，IO 不持 flush_mu_；见实现注释）。
+    [[nodiscard]] bool compact_runs(std::string_view dir);
+    void schedule_compaction(std::string_view dir);
+    [[nodiscard]] bool flush_locked_impl(
+        std::string_view dir,
+        std::span<const std::pair<std::uint32_t, std::uint64_t>> durable_wms,
+        std::optional<OkiCommitSnapshot> commit_snapshot, bool& need_compact);
+    void release_gen_locked(std::uint64_t gen);  // 前置：持 flush_mu_
 
     void update_flush_hint_locked() noexcept {
         flush_hint_.store(
             delta_.size() >= kFlushRowLimit || delta_bytes_ >= kFlushByteLimit,
             std::memory_order_relaxed);
     }
-    [[nodiscard]] std::uint64_t next_gen_locked() const noexcept;
+    // gen 必须单调永不重用：取 manifest 与目录内现存 run 文件（含孤儿、
+    // sweep 滞留件）的最大 gen + 1。只看 manifest 会在「0 run 重建 /
+    // manifest 丢失」后从 1 重来，与滞留旧文件同名、并污染以 gen 为键的块缓存。
+    [[nodiscard]] std::uint64_t next_gen_locked(std::string_view dir);
+    std::uint64_t gen_floor_ = 0;  // 曾发布过的最大 gen（flush_mu_ 保护）
+    std::vector<std::uint64_t> inflight_gens_;  // 在途构建的 gen（flush_mu_）
+    // runs 与 delta 同时替换（rebuild / install_memory_view）时奇数；
+    // make_read_view 不持 flush_mu_，靠它检出替换窗口重试。
+    std::atomic<std::uint64_t> view_epoch_{0};
+    std::mutex compact_mu_;         // compact_runs 串行
+    std::mutex compact_thread_mu_;  // compact_thread_ 的启动/join
+    std::thread compact_thread_;
+    std::atomic<bool> compacting_{false};
 
     // S36-2：memdelta 辅助哈希的维护（前置：持 mu_ 且 point_query_ 开）。
     // 胜出规则 = max (ord, 到达序)：新行 ord ≥ 旧行才顶替（等 ord 后到者
@@ -320,6 +387,7 @@ private:
     mutable std::shared_ptr<const std::vector<DeltaRow>> sorted_view_;
     mutable std::uint64_t sorted_view_version_ = 0;  // 与 delta_version_ 相等即有效
     std::uint64_t delta_version_ = 0;
+    std::uint64_t append_seq_ = 0;  // DeltaRow::seq 分配器（mu_ 保护）
     // S36-2：key → delta_ 内最新行下标（透明哈希，点查开启时维护）。
     std::unordered_map<std::string, std::size_t, StringHash, std::equal_to<>>
         delta_idx_;
