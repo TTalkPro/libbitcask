@@ -25,6 +25,21 @@ void IndexAuthority::advance_ord(std::uint64_t ord) noexcept {
                                             std::memory_order_relaxed)) {}
 }
 
+void IndexAuthority::advance_fold_epoch() noexcept {
+    // 新时代 = 当前时代 + 1，只落在 fold_floor_ 上。与并发写的关系：写把
+    // next_ord 推过 want 时时代本就已前进，CAS 失败后的重读自然收敛。
+    auto cur = fold_floor_.load(std::memory_order_relaxed);
+    for (;;) {
+        const auto want =
+            std::max(cur, next_ord_.load(std::memory_order_acquire)) + 1;
+        if (fold_floor_.compare_exchange_weak(cur, want,
+                                              std::memory_order_release,
+                                              std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
 std::uint32_t IndexAuthority::increment_file_id() noexcept {
     return biggest_file_id_.fetch_add(1, std::memory_order_relaxed) + 1;
 }
@@ -274,9 +289,22 @@ bool IndexAuthority::adopt_manifest(const OkiManifest& manifest) {
     ledger_.active_keys = manifest.metadata->active_keys;
     ledger_.key_bytes = manifest.metadata->live_bytes;
     ledger_.files.clear();
+    // fold 时代下界不落盘：已发布为 pending 的文件说明当时时代已越过其
+    // expiration_epoch，据此还原下界，保证派生布尔跨重启不回退。
+    std::uint64_t floor = 0;
+    for (const auto& f : manifest.fstats) {
+        if (f.pending_delete && f.expiration_epoch != kMaxEpoch) {
+            floor = std::max(floor, f.expiration_epoch + 1);
+        }
+    }
+    for (auto cur = fold_floor_.load(std::memory_order_relaxed);
+         cur < floor && !fold_floor_.compare_exchange_weak(
+                            cur, floor, std::memory_order_release,
+                            std::memory_order_relaxed);) {}
+    const auto epoch = fold_epoch();
     for (auto f : manifest.fstats) {
         f.pending_delete = f.expiration_epoch != kMaxEpoch &&
-                           f.expiration_epoch < next_ord_.load();
+                           f.expiration_epoch < epoch;
         ledger_.files.emplace(f.file_id, f);
     }
     return true;
@@ -498,10 +526,11 @@ bool IndexAuthority::rebuild_from_data(std::string_view dir,
     meta.next_file_id = meta.biggest_file_id + 1;
     meta.active_keys = ledger_.active_keys;
     meta.live_bytes = ledger_.key_bytes;
+    const auto epoch = fold_epoch();
     for (auto& [id, f] : ledger_.files) {
         auto out = f;
         out.pending_delete = f.expiration_epoch != kMaxEpoch &&
-                             f.expiration_epoch < meta.next_ord;
+                             f.expiration_epoch < epoch;
         if (out.live_keys != 0) {
             meta.oldest_tstamp = meta.oldest_tstamp == 0 ? out.oldest_tstamp :
                 std::min(meta.oldest_tstamp, out.oldest_tstamp);
@@ -553,10 +582,11 @@ IndexAuthority::capture_locked() {
     g.next_file_id = g.biggest_file_id + 1;
     g.active_keys = ledger_.active_keys;
     g.live_bytes = ledger_.key_bytes;
+    const auto epoch = fold_epoch();
     for (auto& [id, f] : ledger_.files) {
         auto out = f;
         out.pending_delete = f.expiration_epoch != kMaxEpoch &&
-                             f.expiration_epoch < g.next_ord;
+                             f.expiration_epoch < epoch;
         if (out.live_keys == 0) {
             out.oldest_tstamp = 0;
             out.newest_tstamp = 0;
@@ -601,10 +631,11 @@ std::vector<IndexAuthority::FStats> IndexAuthority::fstats() const {
     std::scoped_lock lock(writer_mu_);
     std::vector<FStats> out;
     out.reserve(ledger_.files.size());
+    const auto epoch = fold_epoch();
     for (auto& [id, f] : ledger_.files) {
         auto copy = f;
         copy.pending_delete = f.expiration_epoch != kMaxEpoch &&
-                              f.expiration_epoch < next_ord_.load();
+                              f.expiration_epoch < epoch;
         if (copy.live_keys == 0) {
             copy.oldest_tstamp = 0;
             copy.newest_tstamp = 0;
@@ -620,10 +651,10 @@ void IndexAuthority::set_pending_delete(std::uint32_t file_id) noexcept {
     std::scoped_lock lock(writer_mu_);
     auto it = ledger_.files.find(file_id);
     if (it == ledger_.files.end()) return;
-    // 记录当前 fold 时代；CaskIter::start 会推进到下一个时代，随后
-    // v4 capture 将其发布为派生的 pending_delete。
-    it->second.expiration_epoch = std::min(
-        it->second.expiration_epoch, next_ord_.load(std::memory_order_relaxed));
+    // 记录当前 fold 时代；时代推进（下一次写，或 CaskIter::start 的
+    // advance_fold_epoch）之后，v4 capture 将其发布为派生的 pending_delete。
+    it->second.expiration_epoch =
+        std::min(it->second.expiration_epoch, fold_epoch());
 }
 
 std::uint32_t IndexAuthority::trim_fstats(std::span<const std::uint32_t> ids) {

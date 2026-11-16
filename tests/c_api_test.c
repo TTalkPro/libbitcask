@@ -39,6 +39,7 @@ static const char* const kAllTestDirs[] = {
     TDIR("batch"),
     TDIR("filter"),
     TDIR("fields"),
+    TDIR("flush_after_iter"),
     TDIR("paging"),
     TDIR("iter"),
     TDIR("kv"),
@@ -341,6 +342,119 @@ static int test_version(void) {
     assert(bitcask_version_string() != NULL);
     printf("  version: %s\n", bitcask_version_string());
     printf("PASS test_version\n");
+    return 0;
+}
+
+/* 下游反馈 2026-11-16（feedbacks/2026-11-16-flush-index-hangs-after-iter.md）：
+ * 迭代器用过之后再写一次，bitcask_flush_index 永不返回（6.9.0 ～ 7.0.0，开
+ * 迭代器凭空跳掉一个 ord，索引通道等空号）。三个迭代入口各走一轮
+ * 「迭代 → 释放 → 写 → flush_index」。回归时 flush 不返回：POSIX 下用 alarm
+ * 把挂死变成立刻红；其它平台交给 ctest 超时。 */
+#if !defined(_WIN32)
+#  include <unistd.h>
+#endif
+
+/* Release 构建带 -DNDEBUG，assert 连同其中的调用一起消失——本用例的每一步
+ * 都必须真的执行，故自带一个不受 NDEBUG 影响的检查。 */
+#define FAI_REQUIRE(cond)                                                    \
+    do {                                                                     \
+        if (!(cond)) {                                                       \
+            fprintf(stderr, "FAIL test_flush_after_iter:%d: %s\n", __LINE__, \
+                    #cond);                                                  \
+            exit(1);                                                         \
+        }                                                                    \
+    } while (0)
+
+static int test_flush_after_iter(void) {
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.enable_search = 1;
+    opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    bitcask_error_t err =
+        bitcask_open(TDIR("flush_after_iter"), &opts, &cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_flush_after_iter: open failed: %s\n",
+                fault.detail);
+        return 1;
+    }
+
+    const char* keys[3] = {"a", "b", "c"};
+    for (int i = 0; i < 3; i++) {
+        bitcask_doc_input_t doc;
+        memset(&doc, 0, sizeof(doc));
+        doc.text.data = "apple pie";
+        doc.text.size = strlen("apple pie");
+        bitcask_slice_t key = {keys[i], strlen(keys[i])};
+        FAI_REQUIRE(bitcask_put_doc(cask, key, &doc, 0, &fault) == BITCASK_OK);
+    }
+    bitcask_flush_index(cask);
+
+#if !defined(_WIN32)
+    alarm(60);
+#endif
+    const bitcask_slice_t empty = {NULL, 0};
+    for (int entry_point = 0; entry_point < 3; entry_point++) {
+        int n = 0;
+        if (entry_point == 0) {          /* bitcask_iter_start */
+            bitcask_iter_t* it = NULL;
+            FAI_REQUIRE(bitcask_iter_start(cask, -1, -1, 0, &it, &fault) == BITCASK_OK);
+            bitcask_iter_entry_t e;
+            while (bitcask_iter_next(it, &e, &fault) == 1) {
+                n++;
+                bitcask_iter_entry_free(&e);
+            }
+            bitcask_iter_release(it);
+        } else if (entry_point == 1) {   /* bitcask_iter_start_ex */
+            bitcask_iter_t* it = NULL;
+            FAI_REQUIRE(bitcask_iter_start_ex(cask, -1, -1, 0, empty, 0, NULL, &it,
+                                         &fault) == BITCASK_OK);
+            bitcask_iter_entry_ex_t e;
+            memset(&e, 0, sizeof(e));
+            while (bitcask_iter_next_ex(it, &e, &fault) == 1) {
+                n++;
+                bitcask_iter_entry_ex_free(&e);
+            }
+            bitcask_iter_release(it);
+        } else {                         /* bitcask_range_iter_start_ex */
+            bitcask_range_iter_t* it = NULL;
+            FAI_REQUIRE(bitcask_range_iter_start_ex(cask, NULL, 0, NULL, &it,
+                                               &fault) == BITCASK_OK);
+            bitcask_range_entry_ex_t e;
+            memset(&e, 0, sizeof(e));
+            while (bitcask_range_iter_next_ex(it, &e, &fault) == 1) {
+                n++;
+                bitcask_range_entry_ex_free(&e);
+            }
+            bitcask_range_iter_release(it);
+        }
+        FAI_REQUIRE(n == 3);
+
+        /* 删一篇再原样写回：每轮一次 delete + 一次 put_doc。 */
+        bitcask_slice_t key = {keys[entry_point], strlen(keys[entry_point])};
+        FAI_REQUIRE(bitcask_delete(cask, key, 0, &fault) == BITCASK_OK);
+        bitcask_doc_input_t doc;
+        memset(&doc, 0, sizeof(doc));
+        doc.text.data = "apple pie";
+        doc.text.size = strlen("apple pie");
+        FAI_REQUIRE(bitcask_put_doc(cask, key, &doc, 0, &fault) == BITCASK_OK);
+
+        bitcask_flush_index(cask);   /* 6.9.0 ～ 7.0.0：这里不返回 */
+    }
+#if !defined(_WIN32)
+    alarm(0);
+#endif
+
+    bitcask_search_result_t* res = NULL;
+    FAI_REQUIRE(bitcask_search_text(cask, "apple", 10, &res, &fault) == BITCASK_OK);
+    FAI_REQUIRE(res != NULL && res->count == 3);
+    bitcask_search_result_free(res);
+
+    bitcask_close(cask);
+    printf("PASS test_flush_after_iter\n");
     return 0;
 }
 
@@ -2133,6 +2247,7 @@ int main(void) {
     failures += test_status_and_merge();
     failures += test_iteration();
     failures += test_range_iter();
+    failures += test_flush_after_iter();
     failures += test_search_text_batch();
     failures += test_search_vector_hybrid_batch();
     failures += test_vector_engine_ivfrq();

@@ -59,11 +59,21 @@ public:
     [[nodiscard]] std::uint64_t peek_next_ord() const noexcept {
         return next_ord_.load(std::memory_order_acquire);
     }
-    // fold 时代复用 next_ord 高水位：启动一次 fold 必须推进一个时代，
-    // 让 set_pending_delete 标记的文件在下一次 v4 提交变成可安全删除。
-    void advance_fold_epoch() noexcept {
-        advance_ord(peek_next_ord());
+    // fold 时代：set_pending_delete 记下标记当时的时代，时代越过它之后
+    // 该文件才派生出 pending_delete（下一次 v4 提交发布）。时钟 =
+    // max(next_ord, fold_floor_)：每次写（发 ord）自然推进；启动一次 fold
+    // 只抬 fold_floor_，**绝不动 next_ord_**。
+    //
+    // ord 序列只属于真正的写：每个发出去的 ord 必须恰有一个任务进索引通道
+    // （Add / Delete / Skip / RunFn），重排缓冲按 ord 严格连续 apply。6.9.0
+    // ～ 7.0.0 这里曾用 advance_ord(peek_next_ord()) 借 ord 推进时代，每开
+    // 一次迭代器凭空跳掉一个号，其后第一次写即令 flush_index 永久阻塞
+    // （feedbacks/2026-11-16-flush-index-hangs-after-iter.md）。
+    [[nodiscard]] std::uint64_t fold_epoch() const noexcept {
+        return std::max(next_ord_.load(std::memory_order_acquire),
+                        fold_floor_.load(std::memory_order_acquire));
     }
+    void advance_fold_epoch() noexcept;
     [[nodiscard]] std::uint32_t biggest_file_id() const noexcept {
         return biggest_file_id_.load(std::memory_order_acquire);
     }
@@ -187,6 +197,10 @@ private:
     std::atomic<bool> ready_{false};
     std::atomic<std::uint64_t> next_ord_{0};
     std::atomic<std::uint32_t> biggest_file_id_{0};
+    // fold 时代下界（见 fold_epoch()）。只在内存：持久侧由 fstats 的
+    // pending_delete 布尔 + expiration_epoch 还原（adopt_manifest）。
+    // 放在末尾：不挪动既有成员的偏移。
+    std::atomic<std::uint64_t> fold_floor_{0};
 };
 
 } // namespace bitcask::oki
