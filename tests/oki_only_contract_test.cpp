@@ -1231,12 +1231,16 @@ TEST_F(OkiOnlyContractTest, MergeAndTtlFstatsMatchManifestAfterTrim) {
     EXPECT_EQ(kd.state().manifest_metadata()->biggest_file_id, target_id);
     EXPECT_FALSE(kd.state().manifest_fstats().empty());
     kd.set_pending_delete(target_id);
-    const auto pending_epoch = kd.peek_next_ord();
+    const auto pending_epoch = kd.fold_epoch();
+    const auto ord_before_fold = kd.peek_next_ord();
     {
         auto it = c->make_iter();
         ASSERT_TRUE(it->start(0, -1, 0).has_value());
         it->release();
     }
+    // 时代推进不得借 ord：ord 序列只属于真正的写（2026-11-16 flush 卡死）。
+    EXPECT_EQ(kd.peek_next_ord(), ord_before_fold);
+    EXPECT_GT(kd.fold_epoch(), pending_epoch);
     auto pending_commit = kd.capture_commit_snapshot();
     ASSERT_TRUE(pending_commit.has_value());
     ASSERT_TRUE(kd.state().flush(dir_.string(), {},
@@ -1251,6 +1255,21 @@ TEST_F(OkiOnlyContractTest, MergeAndTtlFstatsMatchManifestAfterTrim) {
     EXPECT_TRUE(pending->pending_delete);
     EXPECT_EQ(pending->expiration_epoch, pending_epoch);
     expect_v4_matches_authority(*c, *pending_manifest);
+
+    // fold 时代下界只在内存；已发布的 pending 必须跨重启保持（由 fstats 的
+    // pending_delete + expiration_epoch 还原），即使其间没有任何写把
+    // next_ord 推过 expiration_epoch。
+    c->close();
+    c.reset();
+    auto c2 = reopen_rw(/*level_b_entries=*/0);
+    ASSERT_TRUE(c2);
+    const auto reopened = c2->index_authority().fstats();
+    const auto still = std::find_if(
+        reopened.begin(), reopened.end(),
+        [&](const auto& f) { return f.file_id == target_id; });
+    ASSERT_NE(still, reopened.end());
+    EXPECT_EQ(still->expiration_epoch, pending_epoch);
+    EXPECT_TRUE(still->pending_delete);
 }
 
 // 健康旧目录强制降回 BCOM v3 后，读端不得伪造空 v4 元数据；下一次

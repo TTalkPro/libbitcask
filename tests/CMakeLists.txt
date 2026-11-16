@@ -540,6 +540,16 @@ target_link_libraries(bitcask_meta_filter_query_test PRIVATE
 )
 gtest_discover_tests(bitcask_meta_filter_query_test ${_bitcask_test_props})
 
+# 下游反馈 2026-11-16：迭代器用过之后再写，flush_index 不得卡死（ord 空洞）。
+add_executable(bitcask_flush_after_iter_test flush_after_iter_test.cpp)
+target_link_libraries(bitcask_flush_after_iter_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_flush_after_iter_test ${_bitcask_test_props})
+
 # 下游反馈 2026-10-06：原子批 / TxnCask 收结构化文档（kPutDoc）。
 add_executable(bitcask_atomic_batch_doc_test atomic_batch_doc_test.cpp)
 target_link_libraries(bitcask_atomic_batch_doc_test PRIVATE

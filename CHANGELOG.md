@@ -5,13 +5,34 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`7.0.0`**；库 `SOVERSION` = **`7`**（= major）；
+`bitcask_version_*` = **`7.0.1`**；库 `SOVERSION` = **`7`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
+
+---
+
+## [7.0.1] - 2026-11-16（迭代后写入 flush_index 卡死修复）
+
+> **版本语义**：纯缺陷修复——C API 签名、盘上格式零改动；`SOVERSION` 保持 `7`。
+> 取 PATCH +1（7.0.1）。C++ 侧 `IndexAuthority`
+> 末尾追加一个成员（`fold_floor_`，既有成员偏移不变）并新增 `fold_epoch()`；
+> `advance_fold_epoch()` 由头内联改为库内定义。
+
+### Fixed
+
+- **迭代器用过之后再写一次，`flush_index` 永不返回**（6.9.0 起；下游反馈
+  `feedbacks/2026-11-16-flush-index-hangs-after-iter.md`）：`CaskIter::start` 借 ord 序列推进 fold 时代
+  （`advance_ord(peek_next_ord())`），每开一次迭代器凭空跳掉一个 ord——既不写 data 也不进索引通道；
+  通道的重排缓冲按 ord 严格连续 apply，其后第一次写把 `submitted_ord_hwm` 推过空洞，
+  `applied_ord` 再也追不上，`flush_index` 永久阻塞（不报错、不超时）。现在 fold 时代用独立下界：
+  `fold_epoch() = max(next_ord, fold_floor_)`，开 fold 只抬下界，**ord 只发给真正的写**。
+  下界不落盘，`adopt_manifest` 由 fstats 的 `pending_delete` + `expiration_epoch` 还原。
+  `bitcask_iter_start` / `_prefix` / `_ex` 同修；`bitcask_range_iter_start*` 本就不受影响。
+  卡过的库无需修复，重开即对齐。回归 `FlushAfterIterTest.*`、C `test_flush_after_iter`。
 
 ---
 

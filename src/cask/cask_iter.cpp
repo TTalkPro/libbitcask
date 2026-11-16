@@ -86,6 +86,7 @@ CaskIter::start(int /*maxage*/, int /*maxputs*/, std::uint64_t /*now_sec*/,
     cur_key_.clear();
     done_ = false;
     iterating_ = true;
+    // 只推进 fold 时代（独立下界），不占 ord：ord 空洞会卡死索引通道。
     parent_->authority_->advance_fold_epoch();
     pin_files();
     return {};
