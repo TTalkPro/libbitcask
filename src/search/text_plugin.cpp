@@ -644,6 +644,11 @@ TextPlugin::collect_default_segment_views() const {
         auto snap = segment_set_->snapshot();
         views.reserve(snap.size() + 1);
         for (auto& sp : snap) {
+            // 全死段不进入查询视图。v2 段的 N/sum_dl/df 是封口时持久化
+            // 快照，mark_dead 只翻 live 位；若全死段仍参与 G-on-the-fly
+            // 聚合，会把死文档统计注入全局 BM25。恢复全量重放重建同一
+            // 文档时正是「旧段全死 + 新 building 全活」形态。
+            if (sp->live_doc_count() == 0) continue;
             const search::SealedSegment* seg = sp.get();
             views.push_back(search::SegmentView{
                 &seg->default_term_index(), seg,
@@ -653,7 +658,7 @@ TextPlugin::collect_default_segment_views() const {
         }
     }
     if (auto bld = building_.load(std::memory_order_acquire);
-        bld && bld->doc_count() > 0) {
+        bld && bld->live_doc_count() > 0) {
         const search::SealedSegment* seg = bld.get();
         views.push_back(search::SegmentView{
             &seg->default_term_index(), seg,
@@ -665,7 +670,7 @@ TextPlugin::collect_default_segment_views() const {
     // 查询线程只读遍历安全;段内容并发读契约同 building_)。
     for (const auto& b : builders_) {
         if (auto bld = b->building.load(std::memory_order_acquire);
-            bld && bld->doc_count() > 0) {
+            bld && bld->live_doc_count() > 0) {
             const search::SealedSegment* seg = bld.get();
             views.push_back(search::SegmentView{
                 &seg->default_term_index(), seg,
@@ -683,13 +688,15 @@ TextPlugin::collect_multi_field_segment_views() const {
     std::vector<search::MultiFieldSegmentView> views;
     if (segment_set_) {
         for (auto& sp : segment_set_->snapshot()) {
+            // 语义同 collect_default_segment_views：全死段不污染多字段聚合。
+            if (sp->live_doc_count() == 0) continue;
             auto v = sp->multi_view();
             v.pin = sp;
             views.push_back(std::move(v));
         }
     }
     if (auto bld = building_.load(std::memory_order_acquire);
-        bld && bld->doc_count() > 0) {
+        bld && bld->live_doc_count() > 0) {
         auto v = bld->multi_view();
         v.pin = std::move(bld);
         views.push_back(std::move(v));
@@ -697,7 +704,7 @@ TextPlugin::collect_multi_field_segment_views() const {
     // S27-4 P3:各 builder 的 building 段(同 collect_default_segment_views)。
     for (const auto& b : builders_) {
         if (auto bld = b->building.load(std::memory_order_acquire);
-            bld && bld->doc_count() > 0) {
+            bld && bld->live_doc_count() > 0) {
             auto v = bld->multi_view();
             v.pin = std::move(bld);
             views.push_back(std::move(v));

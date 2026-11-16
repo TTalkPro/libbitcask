@@ -187,7 +187,12 @@ public:
         const bm25::Bm25Params* params = nullptr) const {
         std::vector<SegmentView> views;
         views.reserve(segments_.size());
-        for (const auto& s : segments_) views.push_back(s->view());
+        for (const auto& s : segments_) {
+            // 全死段不贡献命中，也不贡献持久化 BM25 统计（同
+            // TextPlugin::collect_default_segment_views）。
+            if (s->live_doc_count() == 0) continue;
+            views.push_back(s->view());
+        }
         return multi_segment_search(views, terms, k, params);
     }
 

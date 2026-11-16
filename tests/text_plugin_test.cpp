@@ -79,6 +79,81 @@ TEST(TextPlugin, FlushOpenRoundTrip) {
     fs::remove_all(dir);
 }
 
+// 恢复全量重放后可能形成「旧封口段全死 + 新 building 全活」视图。
+// v2 段的 BM25 全局统计是封口快照；全死段若仍进入查询视图，会把死文档的
+// N/sum_dl/df 再次注入聚合，导致同文档同查询分数漂移。回归锁定：
+// 重放前后命中键、顺序与 BM25 分数必须一致。
+TEST(TextPlugin, RecoveryReplayFullyDeadSegmentKeepsScoresStable) {
+    const fs::path dir = fs::temp_directory_path() /
+                         "bitcask_textplugin_replay_dead_scores";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string dir_s = dir.string();
+
+    constexpr std::size_t N = 5;
+    text::TextPlugin::ChainState st{};
+    {
+        index::Index idx;
+        text::TextPlugin a(make_cfg(), idx, idx, idx);
+        plugin::OpenContext ctx;
+        ctx.dir = dir_s;
+        ASSERT_EQ(a.open(ctx), plugin::PluginStatus::kOk);
+        for (std::uint64_t ord = 0; ord < N; ++ord) {
+            const std::string key = "k" + std::to_string(ord);
+            host_put_row(idx, key, ord);
+            a.apply_text(key, ord, "shared term " + std::to_string(ord));
+        }
+        plugin::FlushRequest req;
+        req.watermark = N;
+        auto fr = a.flush(req);
+        ASSERT_EQ(fr.status, plugin::PluginStatus::kOk);
+        st = a.chain_state();
+    }
+
+    index::Index idx2;
+    for (std::uint64_t ord = 0; ord < N; ++ord) {
+        host_put_row(idx2, "k" + std::to_string(ord), ord);
+    }
+    text::TextPlugin b(make_cfg(), idx2, idx2, idx2);
+    plugin::OpenContext c2;
+    c2.dir = dir_s;
+    c2.committed_base_watermark = st.base_gen;
+    c2.committed_chain_watermark = st.chain_wm;
+    c2.committed_chain_seq = st.next_seq - 1;
+    ASSERT_EQ(b.open(c2), plugin::PluginStatus::kOk);
+
+    auto baseline = b.search_text("shared", 10);
+    ASSERT_TRUE(baseline.has_value());
+    ASSERT_EQ(baseline->size(), N);
+
+    // 模拟恢复 fold 对同一 (key, ord) 的全量重放：现有实现会 mark_dead 旧
+    // 段并把同一文档重建进 building_。查询视图必须不再纳入全死段。
+    for (std::uint64_t ord = 0; ord < N; ++ord) {
+        const std::string key = "k" + std::to_string(ord);
+        b.apply_text(key, ord, "shared term " + std::to_string(ord));
+    }
+
+    const auto* sset = b.segment_set();
+    ASSERT_NE(sset, nullptr);
+    ASSERT_EQ(sset->segment_count(), 1u);
+    ASSERT_NE(sset->segment(0), nullptr);
+    EXPECT_EQ(sset->segment(0)->live_doc_count(), 0u);
+    const auto* bld = b.building_segment();
+    ASSERT_NE(bld, nullptr);
+    EXPECT_EQ(bld->live_doc_count(), N);
+
+    auto replayed = b.search_text("shared", 10);
+    ASSERT_TRUE(replayed.has_value());
+    ASSERT_EQ(replayed->size(), baseline->size());
+    for (std::size_t i = 0; i < baseline->size(); ++i) {
+        EXPECT_EQ((*replayed)[i].key, (*baseline)[i].key);
+        EXPECT_EQ((*replayed)[i].ord, (*baseline)[i].ord);
+        EXPECT_DOUBLE_EQ((*replayed)[i].score, (*baseline)[i].score);
+    }
+
+    fs::remove_all(dir);
+}
+
 // S18-8：replay 路由——单文本活写 prepare 返回 nullptr（reducer 内分析），
 // 重放批则走 prepare 并行分析（kDefaultField 包装），on_put 消费产物。
 TEST(TextPlugin, ReplayPrepareRouting) {

@@ -15,13 +15,23 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
-## [7.0.2] - 2026-11-16（Windows 平台兼容性修复）
+## [7.0.2] - 2026-11-16（Windows 平台兼容性与旧索引分数修复）
 
 > **版本语义**：纯缺陷修复与构建适配——C API 签名、ABI、盘上格式零改动；
 > `SOVERSION` 保持 `7`。取 PATCH +1（7.0.2）。
 
 ### Fixed
 
+- **读旧格式 OKI 索引时 BM25 分数漂移**（下游反馈
+  `feedbacks/2026-11-16-legacy-oki-index-score-drift.md`）：恢复期的全量
+  data fold 重放会把已封口的旧 SegmentSet 段整体标记为 dead，同时在新的
+  building 段重建全部 live 文档。旧段盘上持久化的 BM25 全局统计
+  （`N` / `sum_dl` / `df`）仍是封口时快照，查询视图若继续纳入全死段，
+  on-the-fly 全局聚合会把 stale 统计注入 BM25，造成 idf 口径错与分数恒比例
+  漂移。现在默认字段、多字段与 `SegmentSet::search()` 视图均跳过
+  `live_doc_count() == 0` 的段；building 段也改按 live 文档数判断是否参与
+  聚合。键、正文、向量与盘上格式不受影响，C API 零改动。回归
+  `TextPlugin.RecoveryReplayFullyDeadSegmentKeepsScoresStable`。
 - **Windows `atomic_rename` 共享冲突**：`MoveFileExW(REPLACE_EXISTING)` 在目标
   文件仍被本库读句柄短暂打开，或目标处于 delete-pending 时返回
   `ERROR_ACCESS_DENIED` / `ERROR_SHARING_VIOLATION`，而 POSIX `rename(2)`
