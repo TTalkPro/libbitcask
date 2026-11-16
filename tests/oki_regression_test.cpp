@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -434,6 +435,10 @@ TEST_F(OkiRegressionTest, RuntimeRebuildDoesNotLoseConcurrentWrites) {
         EXPECT_TRUE(c->index_authority().rebuild_from_data(dir_.string()));
         c->index_authority().state().enable_point_query();
         ++rebuilds;
+        // Windows std::mutex 不保证唤醒排队者：连续 rebuild 会在两次加锁
+        // 之间立即抢回 writer_mu_，把并发 writer 饿死。显式留出调度窗口，
+        // 保持「重建期间有写入交错」的测试意图，同时让 done 有机会翻转。
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     writer.join();
     int missing = 0;

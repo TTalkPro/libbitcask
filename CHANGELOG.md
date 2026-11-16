@@ -5,13 +5,37 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`7.0.1`**；库 `SOVERSION` = **`7`**（= major）；
+`bitcask_version_*` = **`7.0.2`**；库 `SOVERSION` = **`7`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
+
+---
+
+## [7.0.2] - 2026-11-16（Windows 平台兼容性修复）
+
+> **版本语义**：纯缺陷修复与构建适配——C API 签名、ABI、盘上格式零改动；
+> `SOVERSION` 保持 `7`。取 PATCH +1（7.0.2）。
+
+### Fixed
+
+- **Windows `atomic_rename` 共享冲突**：`MoveFileExW(REPLACE_EXISTING)` 在目标
+  文件仍被本库读句柄短暂打开，或目标处于 delete-pending 时返回
+  `ERROR_ACCESS_DENIED` / `ERROR_SHARING_VIOLATION`，而 POSIX `rename(2)`
+  没有共享冲突语义。现在对这两类瞬时冲突做有界退避重试（约 0.5 s 上限，
+  防读者死循环拖死写端）；其他错误仍立即失败。目录项持久性仍由
+  `MOVEFILE_WRITE_THROUGH` 承担。
+
+### Changed
+
+- **MSVC 构建适配**：OKI merge cursor 的大端读取从 GCC 内建
+  `__builtin_bswap64` 改为标准 C++23 `std::byteswap`，补 `<bit>` 头。
+- **测试可移植性**：运行期 `rebuild_from_data` 并发写回归给 Windows
+  `std::mutex` 的非公平唤醒留出调度窗口，避免连续 rebuild 把 writer 饿死；
+  测试意图与断言不变。
 
 ---
 

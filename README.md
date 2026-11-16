@@ -429,7 +429,7 @@ cmake --build build -j --target bitcask_static bitcask_shared
 | `BITCASK_LTO` | ON | Release 启用 LTO / IPO；sanitizer 构建自动关闭 |
 | `BITCASK_PCH` | ON | 预编译头加速编译；排查 PCH 异常可临时关闭 |
 
-版本信息由 `CMakeLists.txt` 的 `project(libbitcask VERSION 7.0.1)` 单一真源派生：`libbitcask.so` 的 `SOVERSION=7`，`VERSION=7.0.1`，C 端 `bitcask_version_{major,minor,patch,string}()` 同步。
+版本信息由 `CMakeLists.txt` 的 `project(libbitcask VERSION 7.0.2)` 单一真源派生：`libbitcask.so` 的 `SOVERSION=7`，`VERSION=7.0.2`，C 端 `bitcask_version_{major,minor,patch,string}()` 同步。
 
 ### 产物
 
