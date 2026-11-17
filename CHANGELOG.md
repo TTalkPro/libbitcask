@@ -54,6 +54,20 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
   池已停时任务被丢弃导致 `auto_ckpt_inflight_` 永久卡住（池停时调用线程
   直跑）；`unregister_lib` 超时后析构车道的已知 UAF（改为摘钩入墓地，不再
   回调宿主）。
+- **Windows：取不到「本进程正在写的文件」的准确大小**。NTFS 的目录项
+  大小在句柄存续期惰性更新，`std::filesystem::file_size()` /
+  `directory_iterator::file_size()` 对仍在写入的文件返回陈旧值（实测为 0）。
+  受影响的是 `Cask::collect_snapshot_watermarks()`——checkpoint 的持久
+  水位被钳到陈旧值（方向安全，但 Windows 上 checkpoint 实际失效、每次
+  重开都要全量重放尾部）。新增 `DataFile::physical_size()`（句柄级
+  `fstat` / `GetFileSizeEx`，对打开中的文件即时准确），采集点与崩溃注入
+  测试缝改用它；Windows 上原先稳定失败的
+  `OkiCommitCut.DataWatermarkClampedToAppliedRecords` /
+  `IndexCrashRecoveryTest.OverclaimedOkiManifestFallsBackToRebuild`
+  随之转绿。另加固 `UnorderedApplyTest.ControlGroupWithoutArbitrationShowsViolations`
+  对照组：Windows 默认 timer 粒度约 15 ms 会把 2 ms 提交抖动坍缩到同一
+  唤醒 tick（提交序恒等于 LSN 序、对照组采不到违例），按 `SeqGate`
+  先例在采不到样本时升级抖动窗口。全量 882 项 Windows 测试转绿。
 
 ### Changed
 

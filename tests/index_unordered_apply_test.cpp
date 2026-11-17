@@ -72,7 +72,8 @@ protected:
     }
 
     RunResult run(bool arbitration, std::uint64_t seed, std::size_t ops_per_thread,
-                  int threads = 4) {
+                  int threads = 4,
+                  std::uint32_t final_jitter_us = 2000) {
         RunResult res;
         bitcask::oki::IndexRegistry reg;
         auto oc = bitcask::Cask::open(dir_.string(), search_opts(), &reg);
@@ -124,7 +125,7 @@ protected:
         // （remove 晚 300µs 起步 ⇒ LSN 大概率更大），提交抖动放大到 2ms ⇒
         // 「删除的索引任务先于写到达」高概率发生在**最后一次**写上（随机期
         // 的乱序常被后续写覆盖，终态看不出来）。
-        c->set_submit_jitter_for_test(2000);
+        c->set_submit_jitter_for_test(final_jitter_us);
         for (std::size_t ki = 0; ki < kKeys; ++ki) {
             const std::string key = key_of(ki);
             const std::string tok = "tok_" + key + "_final";
@@ -222,6 +223,19 @@ TEST_F(UnorderedApplyTest, ControlGroupWithoutArbitrationShowsViolations) {
         fs::remove_all(dir_);
         total += run(/*arbitration=*/false, seed, 600).violations;
         if (total > 0) break;
+    }
+    if (total == 0) {
+        // Windows 兜底：默认定时器粒度约 15ms 会把 2ms 提交抖动整桶坍缩
+        // 到同一唤醒 tick，提交序恒等于 LSN 序，对照组采不到任何违例
+        // （对照失效、正例无区分力）。把抖动窗口拉大到跨多个 timer tick
+        // 恢复随机重排——与 SeqGate.PairedReadsNeverTorn 对照组加固同思路。
+        for (std::uint64_t seed : {5u, 6u, 7u, 8u}) {
+            fs::remove_all(dir_);
+            total += run(/*arbitration=*/false, seed, 600, /*threads=*/4,
+                         /*final_jitter_us=*/30000)
+                         .violations;
+            if (total > 0) break;
+        }
     }
     EXPECT_GT(total, 0u)
         << "关闭裁决后乱序负载应出现幽灵/复活——对照组失效，正例无区分力";

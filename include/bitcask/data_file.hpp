@@ -205,6 +205,22 @@ public:
     [[nodiscard]] std::string_view path() const noexcept { return path_; }
     [[nodiscard]] std::uint64_t    size() const noexcept { return current_offset_; }
 
+    // 内核视角的当前字节数（句柄级 fstat / GetFileSizeEx）。
+    //
+    // 与 size()（内存里的逻辑 offset）的差别：writer 可能已推进
+    // current_offset_ 但 pwrite 尚未发出，此时逻辑值高估内核实况——
+    // 拿它当 fsync 的持久 floor 会把未写出的字节计入「已持久」。
+    // 反方向也不行：Windows 对「本进程仍打开写入的文件」stat 目录
+    // 元数据（std::filesystem::file_size / directory_iterator 的
+    // file_size）会拿到陈旧值（常为 0）——NTFS 的目录项大小在句柄
+    // 存续期惰性更新。持久水位 floor（checkpoint 采集）、测试缝里
+    // 需要真实已写字节数的站点一律用本方法；它两平台都即时准确。
+    //
+    // 线程安全: 是（不触碰 fd offset；与写者的 pwrite 并发安全，读到
+    // 的恒是某个已完成的内核态字节数）。
+    [[nodiscard]] std::expected<std::uint64_t, io::IoError>
+    physical_size() const noexcept { return file_.size(); }
+
     void close() noexcept { file_.close_quiet(); }
 
 private:

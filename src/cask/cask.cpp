@@ -865,9 +865,20 @@ Cask::collect_snapshot_watermarks() const noexcept {
         adf = active_data_;
     }
     for (const auto& e : *entries) {
-        std::error_code ec;
-        const auto sz = std::filesystem::file_size(bitcask::detail::from_utf8(e.data_path), ec);
-        if (ec) return std::nullopt;  // 文件态不稳定,放弃本次快照
+        std::uint64_t sz = 0;
+        if (adf && e.data_path == adf->path()) {
+            // active 文件句柄还在本进程手里：Windows 上 stat 目录元数据
+            // 拿到的是陈旧值（常为 0，见 data_file.hpp physical_size 注），
+            // 必须走句柄级 fstat/GetFileSizeEx。sealed 文件已随 roll/close
+            // 封口，目录元数据即准确，无需额外开句柄。
+            const auto phys = adf->physical_size();
+            if (!phys) return std::nullopt;
+            sz = *phys;
+        } else {
+            std::error_code ec;
+            sz = std::filesystem::file_size(bitcask::detail::from_utf8(e.data_path), ec);
+            if (ec) return std::nullopt;  // 文件态不稳定,放弃本次快照
+        }
         // S36-5 B1：active 文件的水位 = **已知持久**字节（sealed 文件由
         // roll/close 的封口 fsync 保证全量持久，不需钳）。采集点顺手做一次
         // fd 级 fdatasync（线程安全，不碰写者的批缓冲）把持久水位推进到

@@ -63,6 +63,19 @@ CaskOptions crash_opts() {
 
 std::string key_of(std::size_t i) { return "ck" + std::to_string(i); }
 
+// Windows：目录枚举对本进程仍打开写入的文件给出陈旧大小（NTFS 目录项
+// 在句柄存续期惰性更新，常为 0）。取真实已写字节数一律开只读句柄
+// （DataFile::size 在 kRead 下初始化为打开那一刻的文件尾，即时准确）。
+[[nodiscard]] std::optional<std::uint64_t>
+data_file_size(const fs::path& p) {
+    auto df = bitcask::fileops::DataFile::open(
+        p.string(), bitcask::fileops::DataFile::Mode::kRead, false, false);
+    if (!df) return std::nullopt;
+    const auto sz = df->size();
+    df->close();
+    return sz;
+}
+
 }  // namespace
 
 BITCASK_CRASH_SCENARIO(index_crash_mid_writes) {
@@ -175,8 +188,10 @@ BITCASK_CRASH_SCENARIO(oki_overclaimed_manifest) {
             for (const auto& e : fs::directory_iterator(dir)) {
                 const auto n = e.path().filename().string();
                 if (n.size() > 13 && n.substr(n.size() - 13) == ".bitcask.data") {
+                    auto sz = data_file_size(e.path());
+                    if (!sz) crash_exit(4);
                     wms.emplace_back(static_cast<std::uint32_t>(std::stoul(n)),
-                                     e.file_size());
+                                     *sz);
                 }
             }
             return wms;
@@ -351,7 +366,9 @@ TEST(OkiCommitCut, DataWatermarkClampedToAppliedRecords) {
             const auto id = static_cast<std::uint32_t>(std::stoul(n));
             if (id >= active) {
                 active = id;
-                active_size = e.file_size();
+                auto sz = data_file_size(e.path());
+                ASSERT_TRUE(sz);
+                active_size = *sz;
             }
         }
     }
