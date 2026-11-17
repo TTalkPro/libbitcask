@@ -276,6 +276,8 @@ TSan 循环、ASan 无报告；附录 A 负载在批 60000 / 10⁶ 下均完成�
 > 篇），S45 以覆盖水位为锚、节奏前漂且有随机性（20 万篇剩约 1.2 万）。跨 15/20/25/30
 > 万篇两者互有胜负；close 前先 checkpoint+sync 时两者持平。排除：段文件数、分片阈值
 > 均摊（实验后撤回）。详见 `docs/design/s45-6-bench-zh.md` §7。代码无改动。
+> 「自动 checkpoint 以触发点为锚」用户定**不做**（会打破重放窗口 ≤ min_docs 的上限，
+> 只换来 close 耗时可预测）。
 
 工作面：`src/cask/cask_recovery.cpp`、`tools/`。
 
