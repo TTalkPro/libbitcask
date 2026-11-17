@@ -15,20 +15,43 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
-## [Unreleased]（S45：索引管线去全局顺序化）
+## [Unreleased]
 
-> **版本语义（待定，由维护者决定）**：C API 签名与 C ABI 零改动；盘上格式
-> 字节布局零改动（HNSW 图文件放宽一条内容校验，见 Changed）。C++ 头面有
-> 破坏性变化（`IndexPool` / `IndexTask` / 插件契约），若视 C++ 头为公开 ABI
-> 则需 major。设计：`designs/index-pipeline-unordered-design-zh.md`；调研：
-> `docs/design/s45-1-research-zh.md`；基准：`docs/design/s45-6-bench-zh.md`。
+> 尚未发布。
+
+---
+
+## [7.0.3] - 2026-11-17（S45：索引管线去全局顺序化 + Windows 文件大小兼容性修复）
+
+> **版本语义**：C API 签名与 C ABI 零改动；盘上格式字节布局零改动（HNSW
+> 图文件放宽一条内容校验，见 Changed）；`SOVERSION` 保持 `7`（C ABI 稳定，
+> 共享库 soname 不变）。取 PATCH +1（7.0.3）——本仓库的 ABI 基线是 C ABI，
+> C++ 头面虽有破坏性变化（`IndexPool` / `IndexTask` / 插件契约 /
+> `TextPlugin` / `DataFile::physical_size()` 等），但**下游 C++ 使用者须
+> 重新编译**（头文件与库同版本发布），沿用 7.0.1 起的既有口径（patch 版
+> 亦含公开头变更）。7.0.3 此前只有提交（`4d3b506`，旧索引 BM25 分数漂移
+> 修复）从未发布/打 tag，故那一条一并并入本节定版。设计：
+> `designs/index-pipeline-unordered-design-zh.md`；调研：
+> `docs/design/s45-1-research-zh.md`；基准：
+> `docs/design/s45-6-bench-zh.md`。
 
 ### Fixed
 
+- **读旧格式 OKI 索引时 BM25 分数漂移**（下游反馈
+  `feedbacks/2026-11-16-legacy-oki-index-score-drift.md`）：恢复期的全量
+  data fold 重放会把已封口的旧 SegmentSet 段整体标记为 dead，同时在新的
+  building 段重建全部 live 文档。旧段盘上持久化的 BM25 全局统计
+  （`N` / `sum_dl` / `df`）仍是封口时快照，查询视图若继续纳入全死段，
+  on-the-fly 全局聚合会把 stale 统计注入 BM25，造成 idf 口径错与分数恒比例
+  漂移。现在默认字段、多字段与 `SegmentSet::search()` 视图均跳过
+  `live_doc_count() == 0` 的段；building 段也改按 live 文档数判断是否参与
+  聚合。键、正文、向量与盘上格式不受影响，C API 零改动。回归
+  `TextPlugin.RecoveryReplayFullyDeadSegmentKeepsScoresStable`。
 - **索引池死锁**（search 模式）：大 `put_batch`（≥ 约 4 万条）与并发 `put`
   交错时，map worker 被 reorder ring 名额挡死、队头 LSN 永远进不了 ring，
-  所有写线程永久挂在索引队列上（同 registry 的其它库一起停摆）。7.0.3 上
-  批 6 万 + 4 线程 2/2 复现。根因是「乱序提交 + 严格按序应用 + 有上限的
+  所有写线程永久挂在索引队列上（同 registry 的其它库一起停摆）。在
+  S45 之前的基线（`4d3b506`，本版之前标注为 7.0.3）上批 6 万 +
+  4 线程 2/2 复现。根因是「乱序提交 + 严格按序应用 + 有上限的
   重排缓冲」三者并存；S45-0 先以饥饿旁路止血，S45-4 起该结构整体退役。
   回归 `IndexLivenessCaskTest.LargePutBatchWithConcurrentPutsCompletes`。
 - **`close()` 的 30 秒逃生门不生效**：等待在途写用的是无超时的
@@ -129,26 +152,9 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 - `Cask::verify_index_consistency()`：docmap 逐行对 OKI 当前版本核对
   （诊断用）。`StatusInfo::index_stale_dropped`：被裁决丢弃的过期写任务数。
-
----
-
-## [7.0.3] - 2026-11-16（旧索引 BM25 分数漂移修复）
-
-> **版本语义**：纯缺陷修复——C API 签名、ABI、盘上格式零改动；
-> `SOVERSION` 保持 `7`。取 PATCH +1（7.0.3）。
-
-### Fixed
-
-- **读旧格式 OKI 索引时 BM25 分数漂移**（下游反馈
-  `feedbacks/2026-11-16-legacy-oki-index-score-drift.md`）：恢复期的全量
-  data fold 重放会把已封口的旧 SegmentSet 段整体标记为 dead，同时在新的
-  building 段重建全部 live 文档。旧段盘上持久化的 BM25 全局统计
-  （`N` / `sum_dl` / `df`）仍是封口时快照，查询视图若继续纳入全死段，
-  on-the-fly 全局聚合会把 stale 统计注入 BM25，造成 idf 口径错与分数恒比例
-  漂移。现在默认字段、多字段与 `SegmentSet::search()` 视图均跳过
-  `live_doc_count() == 0` 的段；building 段也改按 live 文档数判断是否参与
-  聚合。键、正文、向量与盘上格式不受影响，C API 零改动。回归
-  `TextPlugin.RecoveryReplayFullyDeadSegmentKeepsScoresStable`。
+- `DataFile::physical_size()`：句柄级文件大小（`fstat` / `GetFileSizeEx`），
+  对「本进程仍打开写入的文件」即时准确——Windows 上目录元数据（NTFS
+  惰性更新）给出陈旧值，不能用于持久水位 floor。
 
 ---
 
