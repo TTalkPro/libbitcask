@@ -14,6 +14,9 @@
 // 才跑重计算，窗口相应拉长——S10-A1 的 search_text 把 analyze 延后到
 // miss 分支，故 hit 路径无 analyze，窗口仍 ~1µs）。这是 near-real-time
 // 语义的固有约束，不影响正确性（下次查询会看到最新失效）。
+// S45-6：miss 路径的「计算 → put」窗口另有一处 TOCTOU：计算基于失效前的
+// 快照、put 落在失效之后，陈旧结果会**常驻**缓存（直到下次相关写）。现以
+// 失效代号拒收此类 put（generation()/put 的 observed_gen）。
 //
 // 线程安全：shared_mutex——get 共享锁并发,写/失效独占。LRU 触碰经
 // per-node 访问计数(atomic_ref)完成,get 不再修改链表;淘汰时按计数
@@ -67,8 +70,18 @@ public:
     // 写入缓存。如果已满则淘汰 LRU 条目。
     // terms：该查询命中的查询词集合，供 invalidate_terms 做交集判定。
     // 线程安全。
+    // S45-6：observed_gen = 调用方**开始计算前**取的 generation()；若其后
+    // 发生过任何失效（代号已前进），本次结果可能基于失效前的快照，拒收。
+    // 缺省 kAnyGen = 不校验（单线程/测试用）。
+    static constexpr std::uint64_t kAnyGen = ~std::uint64_t{0};
     void put(const CacheKey& key, std::vector<bm25::SearchResult> results,
-             std::vector<std::string> terms);
+             std::vector<std::string> terms, std::uint64_t observed_gen = kAnyGen);
+
+    // S45-6：失效代号——invalidate / invalidate_terms 每次调用 +1（含未命中
+    // 任何条目的调用：写入改变了索引，进行中的计算即可能陈旧）。
+    [[nodiscard]] std::uint64_t generation() const noexcept {
+        return gen_.load(std::memory_order_acquire);
+    }
 
     // 整缓存失效（拿不到变更文档词集时的降级路径）。
     // 线程安全。
@@ -116,6 +129,8 @@ private:
     mutable std::shared_mutex mutex_;
     // 全局访问时钟(LRU 序号源)。
     mutable std::atomic<std::uint64_t> use_clock_{0};
+    // S45-6：失效代号（独占锁内递增；put 在独占锁内比对）。
+    std::atomic<std::uint64_t> gen_{0};
 
     void evict_if_needed();
 };

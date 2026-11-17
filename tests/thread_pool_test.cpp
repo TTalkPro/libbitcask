@@ -1,5 +1,6 @@
-// T2.7 单元测试：IndexPool + IndexTaskQueue + TbbLifetime
-// S6-P2: 测试更新到新 start(MapFn, ReduceFn, ErrorFn) API。
+// IndexPool 分片执行器单测（S45-4 改写；原 map/reduce 流水线用例随 reducer 退役）。
+// 覆盖：LSN 完成跟踪、乱序/逆序提交、同 key 串行、分片并行、串行道、独占维护、
+// 背压、多库共享、注销超时摘钩。
 
 #include <atomic>
 #include <cstddef>
@@ -32,537 +33,11 @@
 #include "bitcask/thread_pool.hpp"
 #include "bitcask/detail/cpu_features.hpp"  // S37-4：BITCASK_TSAN_ENABLED
 
-namespace {
-
-using bitcask::IndexOp;
-using bitcask::IndexPool;
-using bitcask::IndexLane;
-using bitcask::IndexTask;
-using bitcask::IndexTaskQueue;
-using bitcask::TbbLifetime;
-using bitcask::PutEntry;
-using bitcask::ReorderEntry;
-using bitcask::DeleteEntry;
-using bitcask::SkipEntry;
-using bitcask::RunFnEntry;
-
-// S15-2：MapFn 签名泛化 = IndexTask → 各插件 prepare 产物（注册序）。
-// 纯池测试无插件，统一用「空 preps」noop map。
-static std::vector<bitcask::plugin::PreparedPtr> no_preps(const bitcask::IndexTask&) {
-    return {};
-}
-
-// S10-A5: make() 不再带 fields 参数；测试用此 helper 构造带字段 task。
-// string_view 指向 string literal（静态存储）→ 任务生命周期内有效。
-static IndexTask mk_fields_task(
-    bitcask::IndexOp op, std::string_view key, std::uint64_t ord,
-    std::string_view text, std::uint32_t file_id, std::uint64_t offset,
-    std::uint32_t total_sz, std::uint32_t tstamp, std::uint32_t doc_len,
-    std::initializer_list<std::pair<std::string_view, std::string_view>> flds) {
-    auto t = IndexTask::make(op, key, ord, text, file_id, offset, total_sz,
-                             tstamp, doc_len);
-    t.fields.assign(flds.begin(), flds.end());
-    return t;
-}
-
-// S6-P2: 简单计数测试用 — map 返回空 preps，reduce 端计数。
-// ALL task 类型走 reducer 计数（S15-2：所有 Add 都过 map_fn）。
-static void StartCountingPool(IndexPool& pool,
-                              std::atomic<std::size_t>& count) {
-    pool.start(
-        no_preps,
-        [&](ReorderEntry&) { ++count; },
-        []() {}
-    );
-}
-
-TEST(IndexPool, SubmitAndProcess) {
-    IndexPool pool(1, 10240);
-    std::atomic<std::size_t> count{0};
-
-    StartCountingPool(pool, count);
-
-    constexpr std::size_t kTasks = 100;
-    for (std::size_t i = 0; i < kTasks; ++i) {
-        pool.submit(IndexTask::make(IndexOp::Add, std::to_string(i), i, "text", 1, 0, 0, 0, 0));
-    }
-
-    pool.flush();
-    EXPECT_EQ(count.load(), kTasks);
-    pool.stop();
-}
-
-TEST(IndexPool, StopIsIdempotent) {
-    IndexPool pool(1, 10240);
-    pool.start(
-        no_preps,
-        [](ReorderEntry&) {},
-        []() {}
-    );
-    pool.stop();
-    pool.stop();
-}
-
-TEST(IndexPool, DrainWithoutStart) {
-    IndexPool pool(1, 10240);
-    pool.stop();
-}
-
-TEST(IndexPool, SentinelStopsWorker) {
-    IndexPool pool(1, 10240);
-    std::atomic<bool> invoked{false};
-
-    pool.start(
-        no_preps,
-        [&](ReorderEntry&) { invoked = true; },
-        []() {}
-    );
-
-    // S6-P2: Sentinel 走 dispatcher 的特殊路径 — 不进 map 也不进 reducer，
-    // 仅触发 got_sentinel_ 标志让 reducer 退出。所以 reducer 不会被回调。
-    pool.queue().push(IndexTask::sentinel());
-    pool.stop();
-
-    EXPECT_FALSE(invoked);
-}
-
-TEST(IndexTaskQueue, BoundedCapacity) {
-    IndexTaskQueue queue(5);
-    for (int i = 0; i < 5; ++i) {
-        queue.push(IndexTask::make(IndexOp::Add, std::to_string(i), 0, "text", 0, 0, 0, 0, 0));
-    }
-    EXPECT_EQ(queue.size(), 5);
-}
-
-TEST(IndexTaskQueue, TaskOrderingFIFO) {
-    IndexTaskQueue queue(1024);
-    constexpr std::size_t kCount = 200;
-    for (std::size_t i = 0; i < kCount; ++i) {
-        queue.push(IndexTask::make(IndexOp::Add, std::to_string(i), i, "text", 0, 0, 0, 0, 0));
-    }
-
-    std::vector<std::uint64_t> received;
-    received.reserve(kCount);
-    for (std::size_t i = 0; i < kCount; ++i) {
-        auto task = queue.pop();
-        received.push_back(task.ord);
-    }
-    for (std::size_t i = 0; i < kCount; ++i) {
-        EXPECT_EQ(received[i], i);
-    }
-}
-
-// T4:背压——IndexTaskQueue 满时 submit 阻塞。
-// S6-P2: dispatcher 持续 dispatch 单条任务很快（直接构造 entry 入 reorder），
-// 不再是单 worker 串行处理的瓶颈，所以背压测试改为直接灌满有界 queue
-// 验证 tbb::concurrent_bounded_queue 的 capacity 阻塞语义（与 P0/P1 等价）。
-TEST(IndexPool, BackpressureBlocksWhenQueueFull) {
-    constexpr std::size_t kCap = 4;
-    IndexPool pool(1, kCap);
-    std::atomic<std::size_t> processed{0};
-
-    pool.start(
-        no_preps,
-        [&](ReorderEntry&) { ++processed; },
-        []() {}
-    );
-
-    // 直接灌满有界 queue（不启动 start 时的等价路径）：用 producer 线程推
-    // 到 queue 内。在 start 前预填——queue 容量 = kCap = 4。
-    // 实际上 start() 后 dispatcher 也会立刻消费，所以这里用「提交后立刻
-    // 期望已处理」——验证的是 queue 的有界容量不丢任务而非严格阻塞语义。
-    // 严格阻塞测试见 BackpressureBlocksOnBoundedQueue（仅测 queue 类型）。
-    for (std::size_t i = 0; i < kCap; ++i) {
-        pool.submit(IndexTask::make(IndexOp::Add, "k", i, "t", 0, 0, 0, 0, 0));
-    }
-    pool.flush();
-    EXPECT_EQ(processed.load(), kCap);
-    pool.stop();
-}
-
-// T4: IndexTaskQueue 自身的有界容量语义——仅测 queue 不依赖 pool。
-// 不启动 pool（start 不调），producer 直接灌满 kCap 容量，第 kCap+1 次
-// push 必须阻塞。
-TEST(IndexTaskQueue, PushBlocksWhenFull) {
-    constexpr std::size_t kCap = 4;
-    IndexTaskQueue queue(kCap);
-    for (std::size_t i = 0; i < kCap; ++i) {
-        queue.push(IndexTask::make(IndexOp::Add, std::to_string(i), 0, "t", 0, 0, 0, 0, 0));
-    }
-    EXPECT_EQ(queue.size(), kCap);
-
-    std::atomic<bool> pushed{false};
-    std::thread t([&] {
-        queue.push(IndexTask::make(IndexOp::Add, "x", 0, "t", 0, 0, 0, 0, 0));
-        pushed = true;
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    EXPECT_FALSE(pushed.load()) << "queue 满时 push 应阻塞（背压）";
-
-    // 模拟消费者：pop 一条 → push 应立即完成。
-    auto popped = queue.pop();
-    EXPECT_EQ(popped.key(), "0");
-    t.join();
-    EXPECT_TRUE(pushed.load());
-}
-
-// T4:关闭排空契约。close() 的真实序是 flush()→stop()（cask.cpp）：flush()
-// 等 pending 归 0（W3 cv），把背压堆积的全部任务消费干净，再 stop() 干净退出。
-TEST(IndexPool, FlushDrainsBackpressuredThenStopClean) {
-    IndexPool pool(1, 16);
-    std::mutex m;
-    std::condition_variable cv;
-    bool release = false;
-    std::atomic<std::size_t> processed{0};
-    std::atomic<bool> reducer_in_wait{false};
-
-    pool.start(
-        no_preps,
-        [&](ReorderEntry&) {
-            if (processed.load() == 0) {
-                // 第一个 entry：reducer 卡住，让 queue 填满
-                std::unique_lock<std::mutex> lk(m);
-                reducer_in_wait = true;
-                cv.wait(lk, [&] { return release; });
-            }
-            ++processed;
-        },
-        []() {}
-    );
-
-    pool.submit(IndexTask::make(IndexOp::Add, "a0", 0, "t", 0, 0, 0, 0, 0));
-    while (!reducer_in_wait.load()) std::this_thread::yield();
-
-    // 提交 kN+1 个：dispatcher 把它们全部 dispatch 进 reorder_pending_（因为
-    // reducer 在 cv.wait），queue 很快清空——所以这里不依赖 queue 阻塞，
-    // 而是验证 flush 能等到 reducer 把 reorder_pending_ 排空 + applied_ord
-    // 追上 submitted_ord_hwm（这是 P2 的核心契约）。
-    constexpr std::size_t kN = 16;
-    std::thread feeder([&] {
-        for (std::size_t i = 1; i <= kN; ++i) {
-            pool.submit(IndexTask::make(IndexOp::Add, "k", i, "t", 0, 0, 0, 0, 0));
-        }
-    });
-    // 等 feeder 全部 submit（queue 不阻塞因为 dispatcher 在 dispatch）
-    feeder.join();
-
-    // 此时 reducer 仍卡在第一条；reorder_pending_ 里有 16 条 PutEntry；
-    // queue 空。释放 reducer → 排空 reorder buffer。
-    { std::lock_guard<std::mutex> lk(m); release = true; }
-    cv.notify_all();
-
-    pool.flush();  // 真实排空：pending==0 && applied_ord >= submitted_ord_hwm
-    EXPECT_EQ(processed.load(), kN + 1) << "flush() 必须排空全部已提交任务";
-    pool.stop();
-    EXPECT_TRUE(pool.is_stopped());
-}
-
-TEST(TbbLifetime, AcquireRelease) {
-    TbbLifetime lifetime;
-    EXPECT_FALSE(lifetime.is_acquired());
-
-    lifetime.acquire();
-    EXPECT_TRUE(lifetime.is_acquired());
-
-    lifetime.release();
-    EXPECT_FALSE(lifetime.is_acquired());
-}
-
-TEST(CaskCompilation, IndexPoolAccessor) {
-    static_assert(sizeof(IndexPool) > 0, "IndexPool must be complete type");
-    static_assert(sizeof(TbbLifetime) > 0, "TbbLifetime must be complete type");
-}
-
-// S6-P1 AT3: ord 空洞（Skip marker）不 stall flush。
-// 提交 Add{ord=0}, Skip{ord=1}, Add{ord=2} → flush 必须返回（不永久阻塞）。
-// S15-2: 所有 Add 统一走 map（此处空 preps），entry 类型 = PutEntry。
-TEST(IndexPool, SkipMarkerFillsOrdHole) {
-    IndexPool pool(1, 10240);
-    std::atomic<std::size_t> add_count{0};
-    std::atomic<std::size_t> skip_count{0};
-
-    pool.start(
-        no_preps,
-        [&](ReorderEntry& e) {
-            if (std::holds_alternative<PutEntry>(e)) ++add_count;
-            else if (std::holds_alternative<SkipEntry>(e)) ++skip_count;
-        },
-        []() {}
-    );
-
-    pool.submit(IndexTask::make(IndexOp::Add,  "k0", 0, "text0", 1, 0, 0, 0, 0));
-    pool.submit(IndexTask::make(IndexOp::Skip, "",   1, "",      0, 0, 0, 0, 0));
-    pool.submit(IndexTask::make(IndexOp::Add,  "k2", 2, "text2", 1, 0, 0, 0, 0));
-
-    pool.flush();  // Must NOT hang — Skip fills the ord=1 hole
-
-    EXPECT_EQ(add_count.load(), 2);
-    EXPECT_EQ(skip_count.load(), 1);
-    EXPECT_EQ(pool.applied_ord(), 2);
-    EXPECT_EQ(pool.submitted_ord_hwm(), 2);
-    pool.stop();
-}
-
-// S6-P1 AT4: flush 追平——提交多个 ord 任务后 flush，applied_ord 必须追上 hwm。
-// S6-P2: 计数从 reducer 视角做。
-TEST(IndexPool, FlushCatchesUpToSubmittedHwm) {
-    IndexPool pool(1, 10240);
-    std::atomic<std::size_t> processed{0};
-
-    pool.start(
-        no_preps,
-        [&](ReorderEntry&) { ++processed; },
-        []() {}
-    );
-
-    // Submit a sequence: Add{0}, Add{1}, Skip{2}, Delete{3}, Add{4}
-    pool.submit(IndexTask::make(IndexOp::Add,    "k0", 0, "t0", 1, 0, 0, 0, 0));
-    pool.submit(IndexTask::make(IndexOp::Add,    "k1", 1, "t1", 1, 0, 0, 0, 0));
-    pool.submit(IndexTask::make(IndexOp::Skip,   "",   2, "",   0, 0, 0, 0, 0));
-    pool.submit(IndexTask::make(IndexOp::Delete, "k0", 3, "",   0, 0, 0, 0, 0));
-    pool.submit(IndexTask::make(IndexOp::Add,    "k3", 4, "t3", 1, 0, 0, 0, 0));
-
-    EXPECT_EQ(pool.submitted_ord_hwm(), 4);
-
-    pool.flush();
-
-    EXPECT_EQ(processed.load(), 5);  // All 5 tasks (including Skip)
-    EXPECT_EQ(pool.applied_ord(), 4);
-    EXPECT_GE(pool.applied_ord(), pool.submitted_ord_hwm());
-    pool.stop();
-}
-
-// S6-P2 AT1: 管线 vs 串行字节等价 — 简化版（不接真插件，用 mock
-// 计数验证 dispatcher → 并行 map → reorder buffer → reducer 全链路）。
-//
-// 守护的契约（S15-2 修订）：
-//   - 所有 Add 走 map（map_fn_ 被调用一次/条；是否真预处理由插件自决）
-//   - Delete / Skip / RunFn 不走 map_fn_，直接进 reducer 对应 entry
-//   - ALL 任务都在 reducer 串行 apply
-//   - exception 路径：map_fn_ 抛 → reducer 仍收到 entry（空 preps）+
-//     error_fn_ 被调用 + ord 不 stall
-TEST(IndexPool, PipelineProcessesAllTaskTypes) {
-    IndexPool pool(1, 10240);
-    std::atomic<std::size_t> map_count{0};
-    std::atomic<std::size_t> reduce_count{0};
-    std::atomic<std::size_t> error_count{0};
-    std::atomic<std::size_t> put_count{0};
-    std::atomic<std::size_t> delete_count{0};
-    std::atomic<std::size_t> skip_count{0};
-
-    pool.start(
-        [&](const IndexTask&) {
-            ++map_count;
-            // 真实 prepare 分发在此被调用（测试中只验证被触发次数）
-            return std::vector<bitcask::plugin::PreparedPtr>{};
-        },
-        [&](ReorderEntry& entry) {
-            ++reduce_count;
-            // 分发到 variant 各分支计数
-            if (std::holds_alternative<PutEntry>(entry)) ++put_count;
-            else if (std::holds_alternative<DeleteEntry>(entry)) ++delete_count;
-            else if (std::holds_alternative<SkipEntry>(entry)) ++skip_count;
-        },
-        [&]() { ++error_count; }
-    );
-
-    // Submit mixed task types
-    pool.submit(IndexTask::make(IndexOp::Add,  "k0", 0, "text", 1, 0, 0, 0, 0));
-    pool.submit(IndexTask::make(IndexOp::Skip, "",   1, "",     0, 0, 0, 0, 0));
-    pool.submit(IndexTask::make(IndexOp::Delete, "k0", 2, "",    0, 0, 0, 0, 0));
-    pool.submit(IndexTask::make(IndexOp::Add,  "k1", 3, "text", 1, 0, 0, 0, 0));
-
-    pool.flush();
-
-    // S15-2：所有 Add 统一走 map（单文本预处理与否由插件自决）→ map_count=2
-    EXPECT_EQ(map_count.load(), 2);    // Add{0}, Add{3}
-    EXPECT_EQ(reduce_count.load(), 4); // ALL tasks go through reduce_fn
-    EXPECT_EQ(put_count.load(), 2);    // Add{0}, Add{3}
-    EXPECT_EQ(delete_count.load(), 1); // Delete{2}
-    EXPECT_EQ(skip_count.load(), 1);   // Skip{1}
-    EXPECT_EQ(error_count.load(), 0);
-    EXPECT_EQ(pool.applied_ord(), 3);
-    pool.stop();
-}
-
-// S6-P2: 多字段路径走 TBB map（fields 非空）。
-// 验证：map_fn_ 被调用（每条 Add+fields 一次），reduce_fn_ 也被调用。
-TEST(IndexPool, AddWithFieldsGoesThroughMap) {
-    IndexPool pool(1, 10240);
-    std::atomic<std::size_t> map_count{0};
-    std::atomic<std::size_t> reduce_count{0};
-
-    pool.start(
-        [&](const IndexTask&) {
-            ++map_count;
-            return std::vector<bitcask::plugin::PreparedPtr>{};
-        },
-        [&](ReorderEntry&) { ++reduce_count; },
-        []() {}
-    );
-
-    pool.submit(mk_fields_task(
-        IndexOp::Add, "k0", 0, "text", 1, 0, 0, 0, 0,
-        {{"title", "hello"}, {"body", "world"}}));
-    pool.submit(mk_fields_task(
-        IndexOp::Add, "k1", 1, "text", 1, 0, 0, 0, 0,
-        {{"title", "another"}}));
-
-    pool.flush();
-
-    EXPECT_EQ(map_count.load(), 2);     // Both went through TBB map
-    EXPECT_EQ(reduce_count.load(), 2);  // Both went through reducer
-    EXPECT_EQ(pool.applied_ord(), 1);
-    pool.stop();
-}
-
-// S6-P2: exception 路径 — map_fn_ 抛异常时：
-//   1) error_fn_ 被调用
-//   2) reducer 仍收到 entry（不 stall ord 序）
-//   3) applied_ord_ 推进
-TEST(IndexPool, MapExceptionDoesNotStall) {
-    IndexPool pool(1, 10240);
-    std::atomic<std::size_t> error_count{0};
-    std::atomic<std::size_t> reduce_count{0};
-
-    pool.start(
-        [](const IndexTask&) -> std::vector<bitcask::plugin::PreparedPtr> {
-            throw std::runtime_error("prepare failed");
-        },
-        [&](ReorderEntry&) { ++reduce_count; },
-        [&]() { ++error_count; }
-    );
-
-    pool.submit(mk_fields_task(
-        IndexOp::Add, "k0", 0, "text", 1, 0, 0, 0, 0,
-        {{"title", "x"}}));
-    pool.submit(mk_fields_task(
-        IndexOp::Add, "k1", 1, "text", 1, 0, 0, 0, 0,
-        {{"title", "y"}}));
-
-    pool.flush();
-
-    EXPECT_EQ(error_count.load(), 2);    // Both exceptions caught
-    EXPECT_EQ(reduce_count.load(), 2);  // Both entries still applied
-    EXPECT_EQ(pool.applied_ord(), 1);    // Ord progressed despite errors
-    pool.stop();
-}
-
-// S6-P2: 异常在 reduce_fn_ 抛同样不 stall — reducer 仍推进 ord。
-TEST(IndexPool, ReduceExceptionDoesNotStall) {
-    IndexPool pool(1, 10240);
-    std::atomic<std::size_t> error_count{0};
-    std::atomic<std::size_t> processed{0};
-
-    pool.start(
-        no_preps,
-        [&](ReorderEntry&) {
-            ++processed;
-            throw std::runtime_error("apply failed");
-        },
-        [&]() { ++error_count; }
-    );
-
-    pool.submit(IndexTask::make(IndexOp::Add, "k0", 0, "text", 1, 0, 0, 0, 0));
-    pool.submit(IndexTask::make(IndexOp::Add, "k1", 1, "text", 1, 0, 0, 0, 0));
-
-    pool.flush();
-
-    EXPECT_EQ(processed.load(), 2);
-    EXPECT_EQ(error_count.load(), 2);
-    EXPECT_EQ(pool.applied_ord(), 1);  // Crucial: ord not stalled
-    pool.stop();
-}
-
-// S6-P2: ord 序保证 — 即使 map 完成顺序乱序，reducer 严格按 ord 升序 apply。
-// 通过 map_fn_ 的故意 sleep 让大 ord 先返回，断言 apply 序仍按 ord 升序。
-// reducer 端拿不到 entry 的 ord（variant 不直接暴露），但 applied_ord_ 是
-// 已 commit 的最大 ord：reducer 刚 pop 出 entry 时 applied_ord_ 还是前一个
-// 值，调用 reduce_fn_ 时 applied_ord_ 尚未 store 新值。所以观察 applied_ord_
-// 单调递增等价于 apply 序递增。
-TEST(IndexPool, ReducerAppliesInOrdOrder) {
-    IndexPool pool(1, 10240);
-    std::mutex mu;
-    std::vector<std::uint64_t> snapshot;
-
-    pool.start(
-        [&](const IndexTask& task) -> std::vector<bitcask::plugin::PreparedPtr> {
-            // 大 ord sleep 短，小 ord sleep 长 → 完成顺序乱
-            if (task.ord == 0) std::this_thread::sleep_for(std::chrono::milliseconds(30));
-            else if (task.ord == 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            return {};
-        },
-        [&](ReorderEntry&) {
-            std::lock_guard<std::mutex> lk(mu);
-            snapshot.push_back(pool.applied_ord());
-        },
-        []() {}
-    );
-
-    pool.submit(mk_fields_task(
-        IndexOp::Add, "k0", 0, "t", 1, 0, 0, 0, 0, {{"f", "x"}}));
-    pool.submit(mk_fields_task(
-        IndexOp::Add, "k1", 1, "t", 1, 0, 0, 0, 0, {{"f", "y"}}));
-    pool.submit(mk_fields_task(
-        IndexOp::Add, "k2", 2, "t", 1, 0, 0, 0, 0, {{"f", "z"}}));
-
-    pool.flush();
-    pool.stop();
-
-    // 应用序 snapshot: 第一次 reducer 调用时 applied_ord_=-1（初值 0，
-    // 但 reduce_fn_ 在 store(N) 之前被调用，所以读到「上一个 commit 的
-    // max ord」）。snapshot 序列反映了「pop 出的 entry 的 ord」——因为
-    // next_apply_ord_ 严格按升序 pop。等价于 apply 序本身。
-    // 经过 reducer 后：snapshot 必为 [0, 0, 1]（前一个已 commit 序），
-    // 最终提交后 applied_ord_ = 2。flush 后单独断言终值。
-    ASSERT_EQ(snapshot.size(), 3u);
-    EXPECT_LE(snapshot[0], snapshot[1]);
-    EXPECT_LE(snapshot[1], snapshot[2]);
-    EXPECT_LE(snapshot.back(), 2u);
-    EXPECT_EQ(pool.applied_ord(), 2u);
-}
-
-// S15-2: RunFn 携带 ord（merge 路径 alloc_ord；原 RebuildHnsw 已并入本通道）。
-// 验证 RunFn 进 reducer 的 RunFnEntry 分支、闭包在 reducer 执行 + ord 参与
-// submitted_ord_hwm。
-TEST(IndexPool, RunFnCarriesOrdAndExecutesInReducer) {
-    IndexPool pool(1, 10240);
-    std::atomic<std::size_t> runfn_entry_count{0};
-    std::atomic<std::size_t> fn_ran{0};
-
-    pool.start(
-        no_preps,
-        [&](ReorderEntry& e) {
-            if (auto* rf = std::get_if<RunFnEntry>(&e)) {
-                ++runfn_entry_count;
-                if (rf->fn) rf->fn();  // 宿主 reduce 闭包的分发语义
-            }
-        },
-        []() {}
-    );
-
-    // Add{0} + RunFn{1} + Add{2} —— 验证 RunFn 携带 ord 参与
-    // submitted_ord_hwm 且 reducer 按 ord 序 apply。
-    pool.submit(IndexTask::make(IndexOp::Add, "k0", 0, "t", 1, 0, 0, 0, 0));
-    {
-        IndexTask t;
-        t.op  = IndexOp::RunFn;
-        t.ord = 1;
-        t.fn  = [&] { ++fn_ran; };
-        pool.submit(std::move(t));
-    }
-    pool.submit(IndexTask::make(IndexOp::Add, "k2", 2, "t", 1, 0, 0, 0, 0));
-
-    pool.flush();
-
-    EXPECT_EQ(runfn_entry_count.load(), 1);
-    EXPECT_EQ(fn_ran.load(), 1);
-    EXPECT_EQ(pool.submitted_ord_hwm(), 2);  // RunFn ord=1 included
-    EXPECT_EQ(pool.applied_ord(), 2);
-    pool.stop();
-}
-
-// ===== S6-P3: 多 lib 共享池（AT5）=====
+#include <algorithm>
+#include <future>
+#include <set>
+#include <stdexcept>
+#include <string>
 
 // 统计当前进程 OS 线程数。**Linux 专用**——读 /proc/self/task 的目录项。
 // S37-2：改用 std::filesystem 枚举（去掉 <dirent.h>）。
@@ -571,7 +46,7 @@ TEST(IndexPool, RunFnCarriesOrdAndExecutesInReducer) {
 // 失败。这里补 Windows 实现而不是把用例标成 Linux-only：AT5 守的是「线程数
 // 与库数解耦」这条结构性保证，它与平台无关，在 Windows 上同样值得守。
 #if defined(_WIN32)
-static int count_os_threads() {
+[[maybe_unused]] static int count_os_threads() {
     // Windows 没有「本进程的线程列表」这种轻量接口：TH32CS_SNAPTHREAD 拍的是
     // **全系统**线程快照，得自己按 owner pid 过滤。调用不便宜，但本用例只调
     // 三次。
@@ -614,7 +89,7 @@ static int count_os_threads() {
 // 解耦」这条结构性保证，它与平台无关。
 // KERN_PROC_PID 一次 sysctl 取回本进程的 kinfo_proc，ki_numthreads 即
 // 当前线程数（内核直接维护，比枚举目录项还准）。
-static int count_os_threads() {
+[[maybe_unused]] static int count_os_threads() {
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, ::getpid()};
     struct kinfo_proc kp{};
     std::size_t len = sizeof(kp);
@@ -624,7 +99,7 @@ static int count_os_threads() {
     return static_cast<int>(kp.ki_numthreads);
 }
 #else
-static int count_os_threads() {
+[[maybe_unused]] static int count_os_threads() {
     std::error_code ec;
     const std::filesystem::path task_dir{"/proc/self/task"};
     if (!std::filesystem::is_directory(task_dir, ec)) return 0;
@@ -636,233 +111,34 @@ static int count_os_threads() {
 }
 #endif
 
-// AT5-a：线程数与库数解耦（G2）。注册第 1 个 lib 惰性启动 dispatcher+reducer
-// 两个线程；之后注册任意多 lib 都不再起新线程。不提交任务（避免 TBB 懒起
-// worker 干扰计数），纯验证「线程数 = 常量，与库数无关」的结构性保证。
-TEST(IndexPoolMultiLib, ThreadCountIndependentOfLibCount) {
-    // S29-T:TSan 运行时自带后台线程计入 /proc/self/task,精确计数断言在
-    // build-tsan 恒失真(git stash 验证过非业务回归)——按 TASK.md 既定修法
-    // 跳过;结构性保证由 build-clang/build-rel 继续守护。
-#if BITCASK_TSAN_ENABLED   // S37-4：见 detail/cpu_features.hpp
-    GTEST_SKIP() << "TSan 运行时线程计入,OS 线程计数断言失真(S29-T)";
-#endif
-    auto noop_map   = no_preps;
-    auto noop_red   = [](ReorderEntry&) {};
-    auto noop_err   = []() {};
 
-    // S37-6：整轮测量**重试**，而不是一次定生死。
-    //
-    // 计数手段是「进程线程总数」，它同时受被测对象之外的因素影响：Windows
-    // 上 ntdll 的加载器工作线程、DLL 延迟加载、系统线程池都会在任意时刻
-    // 增减本进程的线程；`ctest -j 8` 的并发负载下尤其明显。首版一次测量定
-    // 结论，于是单跑 5/5 全过、并发下偶发失败——**flaky 测试比没有测试更糟**，
-    // 它会让人习惯性忽略这个用例。
-    //
-    // 重试不削弱断言强度：真回归（注册一个 lib 就多起一条线程）是确定性的，
-    // 每一轮都会违反；只有外部噪声才会时中时不中。
-    constexpr int kAttempts = 5;
-    int last_delta_first = -1;
-    int last_after_first = -1;
-    int last_after_many  = -1;
-    bool ok = false;
-    for (int attempt = 0; attempt < kAttempts && !ok; ++attempt) {
-        IndexPool pool(1, 10240);
-        const int before = count_os_threads();
-        IndexLane* l0 = pool.register_lib(noop_map, noop_red, noop_err, 0);
-        const int after_first = count_os_threads();
+namespace {
 
-        std::vector<IndexLane*> lanes{l0};
-        for (int i = 0; i < 49; ++i) {
-            lanes.push_back(pool.register_lib(noop_map, noop_red, noop_err, 0));
-        }
-        const int after_many = count_os_threads();
+using namespace std::chrono_literals;
+using bitcask::ApplyResult;
+using bitcask::IndexLane;
+using bitcask::IndexOp;
+using bitcask::IndexPool;
+using bitcask::IndexTask;
+using bitcask::IndexTaskQueue;
+using bitcask::LaneCallbacks;
+using bitcask::TbbLifetime;
 
-        last_delta_first = after_first - before;
-        last_after_first = after_first;
-        last_after_many  = after_many;
-        // 首个 register 起 dispatcher + reducer 两条线程；
-        // 之后 49 个 lib 零新增（无 per-库线程）。
-        ok = (last_delta_first == 2) && (after_many == after_first);
-
-        for (IndexLane* l : lanes) (void)pool.unregister_lib(l);
-        pool.stop();
-    }
-    EXPECT_TRUE(ok)
-        << "线程数与库数解耦不成立（" << kAttempts << " 轮均未观察到）："
-        << "首个 register 的线程增量=" << last_delta_first << "（应为 2），"
-        << "注册 50 个 lib 后=" << last_after_many
-        << "（应等于首个之后的 " << last_after_first << "）";
+IndexTask add_task(std::string_view key, std::uint64_t ord) {
+    return IndexTask::make(IndexOp::Add, key, ord, "t", 0, 0, 0, 0, 0);
 }
 
-// AT5-b：库间独立 + 库内 ord 序。一个共享池，N 条 lane，每 lane 各自交错
-// 提交 Add-with-fields；reducer 对每条 lane 按其 ord 严格升序 apply（per-lane
-// I2）；各 lane 结果互不串扰。
-TEST(IndexPoolMultiLib, LanesApplyIndependentlyInOrdOrder) {
-    IndexPool pool(1, 10240);
-    constexpr std::size_t kLibs   = 4;    // 用作 vector 尺寸/下标,故 size_t
-    constexpr std::size_t kPerLib = 200;
-
-    // 每 lane 记录 reducer 看到的 ord 序列（reducer 单线程串行，无需锁）。
-    std::vector<std::vector<std::uint64_t>> seen(kLibs);
-    std::vector<IndexLane*> lanes(kLibs);
-
-    for (std::size_t lib = 0; lib < kLibs; ++lib) {
-        lanes[lib] = pool.register_lib(
-            // S15-2：ord 直接随 PutEntry.task 到达 reducer，map 无需透传。
-            no_preps,
-            [&seen, lib](ReorderEntry& e) {
-                // PutEntry 来自 Add；记录其 ord。
-                if (auto* pe = std::get_if<PutEntry>(&e)) {
-                    seen[lib].push_back(pe->task.ord);
-                }
-            },
-            []() {}, 0);
-    }
-
-    // N 个生产者线程，各喂自己的 lane（单写者契约：每 lane 一个 producer）。
-    std::vector<std::thread> producers;
-    for (std::size_t lib = 0; lib < kLibs; ++lib) {
-        producers.emplace_back([&pool, lane = lanes[lib]] {
-            for (std::size_t i = 0; i < kPerLib; ++i) {
-                // Add-with-fields → 走 TBB 并行 map → 该 lane 的 reorder buffer。
-                pool.submit(lane, mk_fields_task(
-                    IndexOp::Add, "k" + std::to_string(i),
-                    static_cast<std::uint64_t>(i), "text",
-                    1, 0, 0, 0, 0,
-                    {{"body", "text"}}));
-            }
-        });
-    }
-    for (auto& t : producers) t.join();
-
-    for (std::size_t lib = 0; lib < kLibs; ++lib) pool.flush(lanes[lib]);
-
-    // 每 lane 恰好看到自己的 kPerLib 条，且严格 0,1,...,kPerLib-1 升序。
-    for (std::size_t lib = 0; lib < kLibs; ++lib) {
-        ASSERT_EQ(seen[lib].size(), static_cast<std::size_t>(kPerLib))
-            << "lib " << lib;
-        for (std::size_t i = 0; i < kPerLib; ++i) {
-            EXPECT_EQ(seen[lib][i], static_cast<std::uint64_t>(i))
-                << "lib " << lib << " pos " << i;
-        }
-        EXPECT_EQ(lanes[lib]->applied_ord.load(),
-                  static_cast<std::uint64_t>(kPerLib - 1));
-    }
-
-    for (std::size_t lib = 0; lib < kLibs; ++lib) (void)pool.unregister_lib(lanes[lib]);
-    pool.stop();
+LaneCallbacks counting_cb(std::atomic<std::size_t>& n) {
+    LaneCallbacks cb;
+    cb.shard_apply = [&n](IndexTask&, unsigned) {
+        ++n;
+        return ApplyResult::kDone;
+    };
+    return cb;
 }
 
-// AT5-c：unregister 后池仍服务其它 lib（生命周期隔离）。
-TEST(IndexPoolMultiLib, UnregisterOneLibKeepsOthersRunning) {
-    IndexPool pool(1, 10240);
-    std::atomic<std::size_t> cntA{0}, cntB{0};
-    IndexLane* a = pool.register_lib(
-        no_preps,
-        [&](ReorderEntry&) { ++cntA; }, []() {}, 0);
-    IndexLane* b = pool.register_lib(
-        no_preps,
-        [&](ReorderEntry&) { ++cntB; }, []() {}, 0);
-
-    for (std::uint64_t i = 0; i < 50; ++i)
-        pool.submit(a, IndexTask::make(IndexOp::Add, "k", i, "t", 1, 0, 0, 0, 0));
-    pool.flush(a);
-    // 返回值就是「是否排空」——注释本来就这么写的,断言它比忽略强,
-    // 且与下一行的 cntA==50 是同一件事的两面。
-    EXPECT_TRUE(pool.unregister_lib(a)) << "a 应排空后注销";
-    EXPECT_EQ(cntA.load(), 50u);
-
-    // b 仍正常工作。
-    for (std::uint64_t i = 0; i < 30; ++i)
-        pool.submit(b, IndexTask::make(IndexOp::Add, "k", i, "t", 1, 0, 0, 0, 0));
-    pool.flush(b);
-    EXPECT_EQ(cntB.load(), 30u);
-
-    (void)pool.unregister_lib(b);
-    pool.stop();
-}
-
-// AT6（S6-P4）：reorder 背压防 OOM。reducer 卡在首个 entry → reorder buffer
-// 涨到 reorder_cap 后 map worker 停 pop → queue 满 → producer 阻塞（内存有界，
-// 不无限堆积）。释放 reducer 后全部追平、零丢失。
-TEST(IndexPoolMultiLib, ReorderBackpressureBoundsMemoryThenDrains) {
-    constexpr int kWorkers = 2;
-    constexpr std::size_t kQueueCap   = 8;
-    constexpr std::size_t kReorderCap = 8;
-    IndexPool pool(kWorkers, kQueueCap, kReorderCap);
-
-    std::mutex m;
-    std::condition_variable cv;
-    bool release = false;
-    std::atomic<std::size_t> processed{0};
-    std::atomic<bool> reducer_blocked{false};
-
-    IndexLane* lane = pool.register_lib(
-        no_preps,
-        [&](ReorderEntry&) {
-            if (processed.load() == 0) {
-                std::unique_lock<std::mutex> lk(m);
-                reducer_blocked = true;
-                cv.wait(lk, [&] { return release; });
-            }
-            ++processed;
-        },
-        []() {}, 0);
-
-    // 先喂一条让 reducer 卡住。
-    pool.submit(lane, IndexTask::make(IndexOp::Add, "k", 0, "t", 0, 0, 0, 0, 0));
-    while (!reducer_blocked.load()) std::this_thread::yield();
-
-    // feeder 狂喂 kTotal 条：reducer 卡住 → reorder 涨到 cap → worker 停 pop →
-    // queue 满 → feeder 在某条 submit 上阻塞。
-    constexpr std::size_t kTotal = 1000;
-    std::atomic<std::size_t> submitted{1};  // 已喂 ord=0
-    std::thread feeder([&] {
-        for (std::size_t i = 1; i < kTotal; ++i) {
-            pool.submit(lane, IndexTask::make(IndexOp::Add, "k", i, "t", 0, 0, 0, 0, 0));
-            submitted.fetch_add(1, std::memory_order_relaxed);
-        }
-    });
-
-    // 给 feeder 充分时间——它必定被背压卡住，远不到 kTotal（内存有界证明）。
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    const std::size_t s = submitted.load();
-    EXPECT_LT(s, kTotal) << "背压必须挡住 producer（内存有界），实际已 submit=" << s;
-    // 上界粗估：在途 ≈ reorder_cap + 队列 + worker 数 + 余量，远小于 kTotal。
-    EXPECT_LE(s, kReorderCap + kQueueCap + kWorkers + 16u);
-
-    // 释放 reducer → 全部追平。
-    { std::lock_guard<std::mutex> lk(m); release = true; }
-    cv.notify_all();
-    feeder.join();
-    pool.flush(lane);
-    EXPECT_EQ(processed.load(), kTotal) << "释放后必须零丢失全部 apply";
-    EXPECT_EQ(submitted.load(), kTotal);
-
-    (void)pool.unregister_lib(lane);
-    pool.stop();
-}
-
-}  // namespace
-// ===========================================================================
-// P6-DL-1 复审：unregister_lib 超时路径
-//
-// T19 把 unregister_lib 的 flush 从无界改为有界(30s)，为的是不让 Cask::close
-// 的 30s 逃生门形同虚设。但有界化**打破了原本使 erase 安全的不变量**——
-// 无界 flush 返回 ⇒ in_flight==0 ⇒ ring 必空 ⇒ erase 不泄漏任何东西。
-// 超时后 ring 非空却照样 erase，其中 K 个 entry 占用的 `reorder_inflight_`
-// （**池全局**背压计数，只在 reducer apply 后减）就永久泄漏了。
-//
-// 后果比 unregister_lib 认下的 UAF 取舍更糟：池由 registry 跨库共享，
-// A 库一次慢关闭会拖垮同进程 B..Z 所有库的索引——且 reorder_cap_ 是硬等待
-// 条件（map worker 达限即停 pop），不是软提示。
-//
-// 这条路径此前零覆盖（30s 硬编码使其不可测，故超时逻辑从未被执行过）。
-// 现超时可注入，本组测试把它钉死。
-// ===========================================================================
-
-// 卡住 reducer，让 entry 堆在 ring 里出不去。
-struct ReducerGate {
+// 把 apply 卡在门上（测试背压 / 超时 / 暂停）。
+struct Gate {
     std::mutex mu;
     std::condition_variable cv;
     bool open = false;
@@ -879,85 +155,431 @@ struct ReducerGate {
     }
 };
 
-TEST(IndexPoolUnregister, TimeoutReturnsFalseAndDoesNotHang) {
-    // 超时注入 100ms：reducer 被卡死 → flush 必然超时。
-    IndexPool pool(1, 64, 16, std::chrono::milliseconds(100));
-    // gate 用 shared_ptr 按值捕获，理由与姊妹用例
-    // TimeoutDoesNotLeakGlobalReorderBudget 完全一致，而这条当初漏了：
-    // 栈上的 `ReducerGate gate` 声明在 `pool` **之后** ⇒ 作用域退出时
-    // **gate 先析构**，reducer 却要到随后的 ~IndexPool()→stop()→join()
-    // 才停。中间那段窗口里 reducer 仍可能停在 gate.wait() 内 —— 对已析构
-    // 的 mutex/condition_variable 动手，是确定的 use-after-scope。
-    // reduce_fn 由 reducer 在 reorder_mu_ 下拷走的 lane shared_ptr 续命
-    // （见 reducer_loop 的「锁下拷活 lane」），故按值捕获足以让 gate 活过
-    // reducer 对它的最后一次访问。
-    //
-    // 为什么 Linux 上一直是绿的：libstdc++ 对「解锁一把并不持有的 mutex」
-    // 静默放过，UB 不表现；libc++（FreeBSD 15 / macOS）检查
-    // pthread_mutex_unlock 的返回值，非 0 直接 ud2 → SIGILL，100% 复现。
-    // 同一段 UB，一边静默一边必炸。
-    auto gate = std::make_shared<ReducerGate>();
-    auto* lane = pool.register_lib(
-        no_preps, [gate](ReorderEntry&) { gate->wait(); }, [] {});
-    ASSERT_NE(lane, nullptr);
-
-    for (std::size_t i = 0; i < 4; ++i) {
-        pool.submit(lane, IndexTask::make(IndexOp::Add, std::to_string(i), i,
-                                          "text", 1, 0, 0, 0, 0));
+// 找一个落在指定分片的 key。
+std::string key_on_shard(const IndexPool& pool, unsigned shard, int salt = 0) {
+    for (int i = 0;; ++i) {
+        std::string k = "k" + std::to_string(salt) + "_" + std::to_string(i);
+        if (pool.shard_of(k) == shard) return k;
     }
-
-    const auto t0 = std::chrono::steady_clock::now();
-    const bool drained = pool.unregister_lib(lane);
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
-
-    EXPECT_FALSE(drained) << "reducer 卡死时 flush 必须超时返回 false";
-    // 有界性本身：不得退化回无界等待。
-    EXPECT_LT(elapsed, std::chrono::seconds(5)) << "超时未生效——退化为无界等待";
-
-    gate->release();  // 放行 reducer，让 stop() 能 join
 }
 
-TEST(IndexPoolUnregister, TimeoutDoesNotLeakGlobalReorderBudget) {
-    // 核心回归，直接钉不变量：**所有 lane 注销、在途 apply 收尾后，全局
-    // reorder_inflight_ 必须归零**。
-    //
-    // 为何不用「lane B 被卡死」做端到端断言：map worker 撞到
-    // reorder_inflight_ >= cap 就停 push，故单轮最多堆 cap-1 条在 ring
-    // （另一条已被 reducer 取走）。单轮泄漏 cap-1 < cap ⇒ 后续 lane 仍剩
-    // 1 个名额、能跑完只是变慢 ⇒ 端到端断言**漏报**（实测如此：注掉修复
-    // 后那版测试照样绿）。要卡死须累积多轮，脆弱且依赖算术。直接查计数
-    // 精确、无时序依赖。
+// ---- IndexTaskQueue ----
+
+TEST(IndexTaskQueue, BoundedCapacity) {
+    IndexTaskQueue queue(5);
+    for (int i = 0; i < 5; ++i) queue.push(add_task(std::to_string(i), 0));
+    EXPECT_EQ(queue.size(), 5u);
+}
+
+TEST(IndexTaskQueue, TaskOrderingFIFO) {
+    IndexTaskQueue queue(1024);
+    constexpr std::size_t kCount = 200;
+    for (std::size_t i = 0; i < kCount; ++i) queue.push(add_task("k", i));
+    for (std::size_t i = 0; i < kCount; ++i) EXPECT_EQ(queue.pop().ord, i);
+}
+
+TEST(IndexTaskQueue, PushBlocksWhenFull) {
     constexpr std::size_t kCap = 4;
-    IndexPool pool(1, 64, kCap, std::chrono::milliseconds(100));
-
-    // gate 用 shared_ptr：lane 被 erase 后 reducer 可能仍在其 reduce_fn 内，
-    // 捕获副本保证 gate 生命周期覆盖到 reducer 退出。
-    auto gate = std::make_shared<ReducerGate>();
-    auto* lane_a = pool.register_lib(
-        no_preps, [gate](ReorderEntry&) { gate->wait(); }, [] {});
-    ASSERT_NE(lane_a, nullptr);
-
-    for (std::size_t i = 0; i < kCap; ++i) {
-        pool.submit(lane_a, IndexTask::make(IndexOp::Add, std::to_string(i), i,
-                                            "text", 1, 0, 0, 0, 0));
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // 待其入 ring
-
-    // reducer 卡在 gate 里 → flush 超时 → ring 非空即被 erase。
-    EXPECT_FALSE(pool.unregister_lib(lane_a));
-
-    // 放行 reducer，让它手里那条（已离开 ring）走完并归还自己的名额。
-    gate->release();
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (pool.reorder_inflight_for_test() != 0 &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    // 此刻池内已无任何 lane，在途 apply 也已收尾 → 计数必须归零。
-    // 不归零 = 那些随 lane 析构而消失的 ring entry 的名额被永久吞掉；
-    // 池由 registry 跨库共享，反复慢关闭会把同进程其它库的索引拖死。
-    EXPECT_EQ(pool.reorder_inflight_for_test(), 0u)
-        << "超时注销泄漏了全局 reorder 名额（未归还 ring 中未 apply 的 entry）";
+    IndexTaskQueue queue(kCap);
+    for (std::size_t i = 0; i < kCap; ++i) queue.push(add_task(std::to_string(i), 0));
+    std::atomic<bool> pushed{false};
+    std::thread t([&] {
+        queue.push(add_task("x", 0));
+        pushed = true;
+    });
+    std::this_thread::sleep_for(50ms);
+    EXPECT_FALSE(pushed.load()) << "queue 满时 push 应阻塞（背压）";
+    EXPECT_EQ(queue.pop().key(), "0");
+    t.join();
+    EXPECT_TRUE(pushed.load());
 }
+
+TEST(TbbLifetime, AcquireRelease) {
+    TbbLifetime lifetime;
+    EXPECT_FALSE(lifetime.is_acquired());
+    lifetime.acquire();
+    EXPECT_TRUE(lifetime.is_acquired());
+    lifetime.release();
+    EXPECT_FALSE(lifetime.is_acquired());
+}
+
+TEST(CaskCompilation, IndexPoolAccessor) {
+    static_assert(sizeof(IndexPool) > 0, "IndexPool must be complete type");
+    static_assert(sizeof(TbbLifetime) > 0, "TbbLifetime must be complete type");
+}
+
+// ---- 基本提交 / LSN 完成 ----
+
+TEST(IndexPool, SubmitAppliesAndCompletesLsn) {
+    IndexPool pool(4);
+    std::atomic<std::size_t> n{0};
+    IndexLane* lane = pool.register_lib(counting_cb(n), 100);
+    EXPECT_EQ(pool.coverage(lane), 100u) << "init_ord 之前视为已完成";
+    for (std::uint64_t o = 100; o < 1100; ++o) pool.submit(lane, add_task(std::to_string(o), o));
+    ASSERT_TRUE(pool.wait_lsn(lane, 1100, 10s));
+    EXPECT_EQ(n.load(), 1000u);
+    EXPECT_EQ(pool.coverage(lane), 1100u);
+    EXPECT_TRUE(pool.unregister_lib(lane));
+}
+
+TEST(IndexPool, StopIsIdempotentAndDrainsQueuedTasks) {
+    IndexPool pool(2);
+    std::atomic<std::size_t> n{0};
+    IndexLane* lane = pool.register_lib(counting_cb(n), 0);
+    for (std::uint64_t o = 0; o < 500; ++o) pool.submit(lane, add_task(std::to_string(o), o));
+    pool.stop();
+    pool.stop();
+    EXPECT_TRUE(pool.is_stopped());
+    EXPECT_EQ(n.load(), 500u) << "stop 的哨兵排在真任务之后，须先排干";
+}
+
+TEST(IndexPool, SubmitAfterStopCompletesLsnWithoutApplying) {
+    IndexPool pool(1);
+    std::atomic<std::size_t> n{0};
+    IndexLane* lane = pool.register_lib(counting_cb(n), 0);
+    pool.stop();
+    pool.submit(lane, add_task("k", 0));
+    EXPECT_EQ(n.load(), 0u);
+    EXPECT_TRUE(pool.wait_lsn(lane, 1, 0ms)) << "丢弃的任务也必须记完成，否则读屏障挂死";
+}
+
+// 乱序完成：LSN 逆序提交，前缀照样推进到底（没有任何「等队头」）。
+TEST(IndexPool, ReverseOrderSubmissionCompletesPrefix) {
+    IndexPool pool(4, 8);  // 小队列：背压与乱序同时存在
+    std::atomic<std::size_t> n{0};
+    IndexLane* lane = pool.register_lib(counting_cb(n), 0);
+    constexpr std::uint64_t kN = 5000;
+    std::thread feeder([&] {
+        for (std::uint64_t o = kN; o-- > 0;) pool.submit(lane, add_task(std::to_string(o), o));
+    });
+    feeder.join();
+    ASSERT_TRUE(pool.wait_lsn(lane, kN, 10s));
+    EXPECT_EQ(n.load(), kN);
+    EXPECT_TRUE(pool.unregister_lib(lane));
+}
+
+TEST(IndexPool, CompleteFillsHoleWithoutTask) {
+    IndexPool pool(2);
+    std::atomic<std::size_t> n{0};
+    IndexLane* lane = pool.register_lib(counting_cb(n), 0);
+    pool.submit(lane, add_task("a", 0));
+    pool.submit(lane, add_task("b", 2));
+    EXPECT_FALSE(pool.wait_lsn(lane, 3, 100ms)) << "缺 LSN 1 时前缀停在 1";
+    pool.complete(lane, 1);
+    EXPECT_TRUE(pool.wait_lsn(lane, 3, 5s));
+    EXPECT_EQ(n.load(), 2u);
+    EXPECT_TRUE(pool.unregister_lib(lane));
+}
+
+TEST(IndexPool, ApplyExceptionDoesNotStall) {
+    IndexPool pool(2);
+    std::atomic<int> errors{0};
+    std::atomic<int> ok{0};
+    LaneCallbacks cb;
+    cb.shard_apply = [&](IndexTask& t, unsigned) {
+        if (t.ord % 2) throw std::runtime_error("boom");
+        ++ok;
+        return ApplyResult::kDone;
+    };
+    cb.on_error = [&] { ++errors; };
+    IndexLane* lane = pool.register_lib(std::move(cb), 0);
+    for (std::uint64_t o = 0; o < 100; ++o) pool.submit(lane, add_task(std::to_string(o), o));
+    ASSERT_TRUE(pool.wait_lsn(lane, 100, 10s));
+    EXPECT_EQ(ok.load(), 50);
+    EXPECT_EQ(errors.load(), 50);
+    EXPECT_TRUE(pool.unregister_lib(lane));
+}
+
+TEST(IndexPool, WaitLsnIsBounded) {
+    IndexPool pool(1);
+    std::atomic<std::size_t> n{0};
+    IndexLane* lane = pool.register_lib(counting_cb(n), 0);
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_FALSE(pool.wait_lsn(lane, 1, 100ms));
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 3s);
+    pool.complete(lane, 0);
+    EXPECT_TRUE(pool.unregister_lib(lane));
+}
+
+// ---- 分片语义 ----
+
+// 同 key 串行且按提交序；不同 key 可并发。
+TEST(IndexPool, SameKeySerializedInSubmissionOrder) {
+    IndexPool pool(4);
+    constexpr int kKeys = 16;
+    constexpr std::uint64_t kVersions = 300;
+    std::mutex mu;
+    std::vector<std::vector<std::uint64_t>> seen(kKeys);
+    std::vector<std::atomic<int>> in_apply(kKeys);
+    std::atomic<bool> overlap{false};
+    LaneCallbacks cb;
+    cb.shard_apply = [&](IndexTask& t, unsigned) {
+        const int k = std::stoi(std::string(t.key()));
+        if (in_apply[static_cast<std::size_t>(k)].fetch_add(1) != 0) overlap = true;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            seen[static_cast<std::size_t>(k)].push_back(t.ord);
+        }
+        in_apply[static_cast<std::size_t>(k)].fetch_sub(1);
+        return ApplyResult::kDone;
+    };
+    IndexLane* lane = pool.register_lib(std::move(cb), 0);
+    std::uint64_t ord = 0;
+    for (std::uint64_t v = 0; v < kVersions; ++v) {
+        for (int k = 0; k < kKeys; ++k) pool.submit(lane, add_task(std::to_string(k), ord++));
+    }
+    ASSERT_TRUE(pool.wait_lsn(lane, ord, 10s));
+    EXPECT_FALSE(overlap.load()) << "同 key 的应用不得并发";
+    for (int k = 0; k < kKeys; ++k) {
+        const auto& s = seen[static_cast<std::size_t>(k)];
+        ASSERT_EQ(s.size(), kVersions);
+        EXPECT_TRUE(std::is_sorted(s.begin(), s.end())) << "同 key 须按提交序到达";
+    }
+    EXPECT_TRUE(pool.unregister_lib(lane));
+}
+
+TEST(IndexPool, DifferentShardsApplyInParallel) {
+    constexpr unsigned kShards = 4;
+    IndexPool pool(kShards);
+    LaneCallbacks cb;
+    cb.shard_apply = [](IndexTask&, unsigned) {
+        std::this_thread::sleep_for(100ms);
+        return ApplyResult::kDone;
+    };
+    IndexLane* lane = pool.register_lib(std::move(cb), 0);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (unsigned s = 0; s < kShards; ++s) pool.submit(lane, add_task(key_on_shard(pool, s), s));
+    ASSERT_TRUE(pool.wait_lsn(lane, kShards, 10s));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    EXPECT_LT(elapsed, 300ms) << "4 个分片各 100ms 应并行（串行需 400ms）";
+    EXPECT_TRUE(pool.unregister_lib(lane));
+}
+
+TEST(IndexPool, ForwardedTasksRunOnSingleSerialThread) {
+    IndexPool pool(4);
+    std::mutex mu;
+    std::set<std::thread::id> serial_threads;
+    std::atomic<int> serial_n{0};
+    LaneCallbacks cb;
+    cb.shard_apply = [](IndexTask& t, unsigned) {
+        return t.ord % 2 ? ApplyResult::kForwardSerial : ApplyResult::kDone;
+    };
+    cb.serial_apply = [&](IndexTask&) {
+        std::lock_guard<std::mutex> lk(mu);
+        serial_threads.insert(std::this_thread::get_id());
+        ++serial_n;
+    };
+    IndexLane* lane = pool.register_lib(std::move(cb), 0);
+    for (std::uint64_t o = 0; o < 400; ++o) pool.submit(lane, add_task(std::to_string(o), o));
+    ASSERT_TRUE(pool.wait_lsn(lane, 400, 10s));
+    EXPECT_EQ(serial_n.load(), 200);
+    EXPECT_EQ(serial_threads.size(), 1u);
+    EXPECT_TRUE(pool.unregister_lib(lane));
+}
+
+// ---- 独占维护 ----
+
+TEST(IndexPool, RunExclusivePausesApplies) {
+    IndexPool pool(4);
+    std::atomic<int> active{0};
+    std::atomic<std::uint64_t> applied{0};
+    std::atomic<bool> violated{false};
+    LaneCallbacks cb;
+    cb.shard_apply = [&](IndexTask&, unsigned) {
+        ++active;
+        std::this_thread::sleep_for(200us);
+        ++applied;
+        --active;
+        return ApplyResult::kDone;
+    };
+    IndexLane* lane = pool.register_lib(std::move(cb), 0);
+    std::atomic<bool> stop{false};
+    std::uint64_t submitted = 0;
+    std::thread feeder([&] {
+        while (!stop.load()) pool.submit(lane, add_task(std::to_string(submitted), submitted)), ++submitted;
+    });
+    std::this_thread::sleep_for(20ms);
+    for (int round = 0; round < 5; ++round) {
+        std::promise<void> done;
+        auto f = done.get_future();
+        pool.run_exclusive(lane, [&] {
+            if (active.load() != 0) violated = true;
+            const auto before = applied.load();
+            std::this_thread::sleep_for(30ms);
+            if (applied.load() != before || active.load() != 0) violated = true;
+            done.set_value();
+        });
+        ASSERT_EQ(f.wait_for(10s), std::future_status::ready);
+    }
+    stop = true;
+    feeder.join();
+    ASSERT_TRUE(pool.wait_lsn(lane, submitted, 30s));
+    EXPECT_FALSE(violated.load()) << "独占闭包执行期间不得有应用在跑或开始";
+    EXPECT_TRUE(pool.unregister_lib(lane));
+}
+
+TEST(IndexPool, RunExclusiveIsFifo) {
+    IndexPool pool(2);
+    std::atomic<std::size_t> n{0};
+    IndexLane* lane = pool.register_lib(counting_cb(n), 0);
+    std::mutex mu;
+    std::vector<int> order;
+    for (int i = 0; i < 10; ++i) {
+        pool.run_exclusive(lane, [&, i] {
+            std::lock_guard<std::mutex> lk(mu);
+            order.push_back(i);
+        });
+    }
+    ASSERT_TRUE(pool.flush(lane, 10s));
+    ASSERT_EQ(order.size(), 10u);
+    EXPECT_TRUE(std::is_sorted(order.begin(), order.end()));
+    EXPECT_TRUE(pool.unregister_lib(lane));
+}
+
+// ---- 背压 ----
+
+TEST(IndexPool, BackpressureBoundsInFlightThenDrains) {
+    constexpr std::size_t kCap = 4;
+    IndexPool pool(1, kCap);
+    auto gate = std::make_shared<Gate>();
+    std::atomic<std::size_t> applied{0};
+    LaneCallbacks cb;
+    cb.shard_apply = [gate, &applied](IndexTask& t, unsigned) {
+        if (t.ord == 0) gate->wait();
+        ++applied;
+        return ApplyResult::kDone;
+    };
+    IndexLane* lane = pool.register_lib(std::move(cb), 0);
+    constexpr std::size_t kTotal = 1000;
+    std::atomic<std::size_t> submitted{0};
+    std::thread feeder([&] {
+        for (std::size_t i = 0; i < kTotal; ++i) {
+            pool.submit(lane, add_task(std::to_string(i), i));
+            ++submitted;
+        }
+    });
+    std::this_thread::sleep_for(200ms);
+    EXPECT_LE(submitted.load(), kCap + 2) << "分片队列有界：在途须封顶";
+    gate->release();
+    feeder.join();
+    ASSERT_TRUE(pool.wait_lsn(lane, kTotal, 10s));
+    EXPECT_EQ(applied.load(), kTotal);
+    EXPECT_TRUE(pool.unregister_lib(lane));
+}
+
+// ---- 多库共享 ----
+
+TEST(IndexPoolMultiLib, ThreadCountIndependentOfLibCount) {
+#if BITCASK_TSAN_ENABLED
+    GTEST_SKIP() << "TSan 运行时线程计入,OS 线程计数断言失真(S29-T)";
+#endif
+    constexpr int kAttempts = 5;
+    constexpr int kShards = 3;
+    int last_delta = -1, last_first = -1, last_many = -1;
+    bool ok = false;
+    for (int attempt = 0; attempt < kAttempts && !ok; ++attempt) {
+        IndexPool pool(kShards);
+        std::atomic<std::size_t> n{0};
+        const int before = count_os_threads();
+        std::vector<IndexLane*> lanes{pool.register_lib(counting_cb(n), 0)};
+        const int after_first = count_os_threads();
+        for (int i = 0; i < 49; ++i) lanes.push_back(pool.register_lib(counting_cb(n), 0));
+        const int after_many = count_os_threads();
+        last_delta = after_first - before;
+        last_first = after_first;
+        last_many = after_many;
+        // 首个 register 起 kShards 个分片线程 + 串行道 + 维护线程。
+        ok = last_delta == kShards + 2 && after_many == after_first;
+        for (auto* l : lanes) (void)pool.unregister_lib(l);
+        pool.stop();
+    }
+    EXPECT_TRUE(ok) << "首个 register 线程增量=" << last_delta << "（应为 "
+                    << kShards + 2 << "），50 个 lib 后=" << last_many
+                    << "（应等于 " << last_first << "）";
+}
+
+TEST(IndexPoolMultiLib, LanesAreIndependent) {
+    IndexPool pool(4);
+    std::atomic<std::size_t> na{0}, nb{0};
+    IndexLane* a = pool.register_lib(counting_cb(na), 0);
+    IndexLane* b = pool.register_lib(counting_cb(nb), 1000);
+    std::thread ta([&] { for (std::uint64_t o = 0; o < 3000; ++o) pool.submit(a, add_task(std::to_string(o), o)); });
+    std::thread tb([&] { for (std::uint64_t o = 1000; o < 2000; ++o) pool.submit(b, add_task(std::to_string(o), o)); });
+    ta.join();
+    tb.join();
+    ASSERT_TRUE(pool.wait_lsn(a, 3000, 10s));
+    ASSERT_TRUE(pool.wait_lsn(b, 2000, 10s));
+    EXPECT_EQ(na.load(), 3000u);
+    EXPECT_EQ(nb.load(), 1000u);
+    EXPECT_TRUE(pool.unregister_lib(a));
+    EXPECT_TRUE(pool.unregister_lib(b));
+}
+
+// 暂停 A 只挡住碰到 A 任务的分片；B 在其它分片上照常推进。
+TEST(IndexPoolMultiLib, PausingOneLaneDoesNotStallOthersOnOtherShards) {
+    IndexPool pool(2);
+    std::atomic<std::size_t> na{0}, nb{0};
+    IndexLane* a = pool.register_lib(counting_cb(na), 0);
+    IndexLane* b = pool.register_lib(counting_cb(nb), 0);
+    auto gate = std::make_shared<Gate>();
+    std::promise<void> paused;
+    pool.run_exclusive(a, [gate, &paused] {
+        paused.set_value();
+        gate->wait();
+    });
+    paused.get_future().wait();
+    for (std::uint64_t o = 0; o < 50; ++o) pool.submit(a, add_task(key_on_shard(pool, 0, int(o)), o));
+    for (std::uint64_t o = 0; o < 50; ++o) pool.submit(b, add_task(key_on_shard(pool, 1, int(o)), o));
+    EXPECT_TRUE(pool.wait_lsn(b, 50, 5s)) << "B 的任务全在分片 1，不受 A 暂停影响";
+    EXPECT_EQ(na.load(), 0u) << "A 暂停期间不得应用";
+    gate->release();
+    ASSERT_TRUE(pool.wait_lsn(a, 50, 5s));
+    EXPECT_EQ(na.load(), 50u);
+    EXPECT_TRUE(pool.unregister_lib(a));
+    EXPECT_TRUE(pool.unregister_lib(b));
+}
+
+// ---- 注销 ----
+
+TEST(IndexPoolUnregister, DrainedUnregisterDestroysLane) {
+    IndexPool pool(2);
+    std::atomic<std::size_t> n{0};
+    IndexLane* lane = pool.register_lib(counting_cb(n), 0);
+    for (std::uint64_t o = 0; o < 100; ++o) pool.submit(lane, add_task(std::to_string(o), o));
+    std::uint64_t cov = 0;
+    EXPECT_TRUE(pool.unregister_lib(lane, &cov));
+    EXPECT_EQ(cov, 100u);
+    EXPECT_EQ(pool.lane_count(), 0u);
+    EXPECT_EQ(pool.graveyard_size(), 0u);
+}
+
+// 超时：车道摘钩入墓地（不析构 → 在途任务的裸指针不悬垂），此后不再回调宿主。
+TEST(IndexPoolUnregister, TimeoutDetachesLaneAndStopsCallbacks) {
+    IndexPool pool(1, 64, 64, 100ms);
+    auto gate = std::make_shared<Gate>();
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    LaneCallbacks cb;
+    cb.shard_apply = [gate, calls](IndexTask& t, unsigned) {
+        ++*calls;
+        if (t.ord == 0) gate->wait();
+        return ApplyResult::kDone;
+    };
+    IndexLane* lane = pool.register_lib(std::move(cb), 0);
+    for (std::uint64_t o = 0; o < 4; ++o) pool.submit(lane, add_task("k", o));
+    while (calls->load() == 0) std::this_thread::yield();
+    std::uint64_t cov = 99;
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_FALSE(pool.unregister_lib(lane, &cov));
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 5s) << "超时必须生效";
+    EXPECT_EQ(cov, 0u) << "覆盖水位不得冒充未完成的 LSN";
+    EXPECT_EQ(pool.graveyard_size(), 1u);
+    gate->release();
+    // 墓地车道上排队的 1..3 被消费但不回调宿主。
+    ASSERT_TRUE(pool.wait_lsn(lane, 4, 5s));
+    EXPECT_EQ(calls->load(), 1);
+    pool.submit(lane, add_task("k", 4));  // 摘钩后提交：直接记完成
+    EXPECT_TRUE(pool.wait_lsn(lane, 5, 0ms));
+    EXPECT_EQ(calls->load(), 1);
+}
+
+}  // namespace

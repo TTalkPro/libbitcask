@@ -46,6 +46,50 @@ std::expected<void, CaskFault> Cask::drain_plugins() {
     return prepare_search();
 }
 
+// S45-5：索引一致性核对（声明见 cask.hpp）。docmap 逐行对 OKI 当前版本。
+std::expected<IndexConsistencyReport, CaskFault>
+Cask::verify_index_consistency(std::size_t max_samples) {
+    if (auto g = drain_plugins(); !g) return std::unexpected(g.error());
+    IndexConsistencyReport rep;
+    rep.kv_live_keys = authority_ ? authority_->info().key_count : 0;
+    auto note = [&](std::string s) {
+        if (rep.samples.size() < max_samples) rep.samples.push_back(std::move(s));
+    };
+    using LS = oki::OkiState::LocateStatus;
+    std::uint64_t unavailable = 0;
+    docmap_->for_each_live([&](std::uint64_t ord, std::string_view key,
+                               const index::DocSlot&) {
+        ++rep.docmap_live;
+        const auto r = authority_->state().locate(key);
+        if (r.status == LS::kUnavailable) {
+            ++unavailable;
+            return;
+        }
+        if (r.status == LS::kMiss || r.tomb) {
+            ++rep.ghost_in_index;
+            note("ghost: " + std::string(key) + " @" + std::to_string(ord));
+        } else if (r.ord != ord) {
+            ++rep.version_mismatch;
+            note("version: " + std::string(key) + " index@" + std::to_string(ord) +
+                 " kv@" + std::to_string(r.ord));
+        } else {
+            ++rep.matched;
+        }
+    });
+    if (unavailable > 0) {
+        return std::unexpected(err(CaskError::kIndexCorrupt,
+            "verify_index_consistency: oki unavailable (rebuild in progress?)"));
+    }
+    const std::uint64_t accounted = rep.matched + rep.version_mismatch;
+    rep.missing_in_index =
+        rep.kv_live_keys > accounted ? rep.kv_live_keys - accounted : 0;
+    if (rep.missing_in_index > 0) {
+        note("missing: " + std::to_string(rep.missing_in_index) +
+             " live key(s) have no index row");
+    }
+    return rep;
+}
+
 // S8-R3: 单条搜索公共骨架。flush → 可选 vector 校验 → 跑内核 → 包错误/结果。
 std::expected<TextSearchResult, CaskFault>
 Cask::run_search_one(

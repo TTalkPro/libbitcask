@@ -10,6 +10,334 @@
 
 ---
 
+## 🔴 S45 · 索引管线去全局顺序化：key + LSN 裁决、分片并发写、去 reducer（2026-11-17 立项）
+
+> 来源：[`designs/index-pipeline-unordered-design-zh.md`](designs/index-pipeline-unordered-design-zh.md)
+> （下文「设计 §x」均指该文档）。2026-11-17 竞态 / 泄漏审计，基线 HEAD `4d3b506`（7.0.3）。
+> 决策基线：**索引应用不再要求全局 LSN 顺序。正确性由「key + LSN 裁决」（旧版本到达即
+> 丢弃）+「同 key 串行」保证；任务按 key 哈希分发到分片线程各写各的段；reducer、重排
+> ring、map worker 池、Skip 占位全部退役；水位改由 LSN 完成跟踪器给出。**
+> 硬约束：公共 API、C ABI 不变；盘上格式不变（目标，S45-1 逐项确认）；严格读己之写保留；
+> HNSW 仍单写者。
+> 验收标准：每项改动后 ctest 全绿 + 编译无新告警；并发测试必须带**对照组**（去掉保护后
+> 能观察到违例），否则不算有效测试；涉及应用顺序的改动必须过乱序注入对拍与 TSan 循环；
+> 收尾过 ASan/TSan、crash 注入与吞吐 / 恢复基准。
+
+### ⚠️ 执行纪律
+
+**先让每一处应用都能乱序且幂等，再拆掉顺序。** 顺序必须是：
+
+```text
+止血（死锁旁路 + close 超时）——可独立随 7.0.x 发
+→ 调研与基线（docmap / 向量 / OKI 点查 / 全库顺序假设清单）
+→ 乱序安全化（reducer 仍在；乱序注入对拍）
+→ LSN 完成跟踪器接管水位与读屏障（reducer 仍在；与旧水位恒等）
+→ 分片执行器替换管线（删 reducer / ring / map worker / Skip）
+→ 恢复重放走新管线
+→ 基准、调参、收口
+```
+
+不得跳过 S45-2 直接做 S45-4：没有裁决和幂等就拆顺序，后果是静默丢文档或幽灵文档
+（`add_doc` 的水位自门、docmap 的无条件覆盖都会在乱序下悄悄出错，不报错）。
+S45-2 / S45-3 期间 reducer 仍在，新机制只是冗余保险，行为必须与基线逐位等价——
+这是判断新机制正确的唯一便宜时机。
+
+| # | 任务 | 状态 | 说明 |
+|---|---|---|---|
+| S45-0 | 止血：死锁旁路 + close 有界轮询（设计 §3） | ✅ done | 旁路随 S45-4 删除；close 有界轮询保留；原复现负载全部跑通 |
+| S45-1 | 调研与基线（设计 §8） | ✅ done | `docs/design/s45-1-research-zh.md`；裁决选 R-b（OKI）+ docmap 守卫；盘上格式仅 HNSW 图文件放宽一条校验 |
+| S45-2 | 乱序安全化（设计 §4.1） | ✅ done | docmap 守卫 + `relocate`；文本 ≥ 守卫 / 定位表按 LSN；HNSW/IVF 重放门；规则 R；乱序注入对拍 + 对照组 |
+| S45-3 | LSN 完成跟踪器（设计 §4.3 / §4.5） | ✅ done | `lsn_tracker.hpp`；读屏障 / ckpt 水位切换；Debug 断言与 applied_ord+1 恒等（250 用例未触发） |
+| S45-4 | 分片执行器替换管线（设计 §4.2 / §4.4 / §4.7 / §5） | ✅ done | `thread_pool.hpp` 重写 + `index_dispatch.hpp`；reducer/ring/map worker/Skip/RunFn 删除；真并发对拍 + 对照组 |
+| S45-5 | 恢复重放走新管线（设计 §4.6） | ✅ done | 重放经执行器 + 重放起点；`verify_index_consistency`；并发写中崩溃用例；20 万文档重开 1.6 s → 0.6 s |
+| S45-6 | 基准、调参、文档与收口 | ✅ done | `docs/design/s45-6-bench-zh.md`；CHANGELOG / RISK_REPORT / 设计稿第 10 节；收口中发现并修复查询缓存 TOCTOU |
+
+### ✅ S45-0 — 止血：死锁旁路 + close 有界轮询（先行，可独立发布）
+
+> **落地记录（2026-11-17）**：`map_worker_loop` 谓词加饥饿旁路（仅 reducer
+> **已入睡**且无就绪 lane 时放行——reducer 正在 apply 时的「无就绪」是取走
+> 队头的瞬态，首版不加此条件导致 `ReorderBackpressureBoundsMemoryThenDrains`
+> 偶发超额）；reducer 入睡前名额满则 notify。close 改 deadline + 退避轮询，
+> `WriteOpGate` 析构去 notify；接缝 `set_close_wait_timeout_for_test` /
+> `pin_write_gate_for_test`。新 `tests/index_pool_liveness_test.cpp`：池层乱序
+> + 对照组（关旁路必挂死、重开自愈）、批 6 万 × 4 put 端到端、close 超时 /
+> 正常两例。原复现 `60000 4` / `40000 8` / `200000 8` 全部跑通；TSan ×50 干净。
+> close 的对照组未做运行时开关（旧实现无接缝，按读码确认会挂死）。
+> 旁路代码随 S45-4 一并删除，池层用例改写为结构性活性用例。
+
+工作面：`include/bitcask/thread_pool.hpp`、`src/cask/cask.cpp`（`close`）、
+`include/bitcask/cask.hpp`（`WriteOpGate`、超时成员）、`tests/`（新
+`tests/index_pool_liveness_test.cpp`）。
+
+1. 回归用例先行（当前代码下必须失败，且不得挂住 ctest——用带超时的 future 或
+   ctest `TIMEOUT`）：
+   - 池层乱序死锁：队列 8、`reorder_cap` 4、2 个 map worker；先提交 LSN 1..N（N ≥ 64），
+     最后提交 0；`flush` 限时返回；
+   - 端到端：设计附录 A 的负载（`put_batch` 60000 + 4 个 `put` 线程），限时完成，
+     随后 `prepare_search` 断言文档数；
+   - close 超时：测试接缝持住一个 `WriteOpGate`，注入 100ms，断言 `close()` 约 100ms
+     返回并有 error 日志。
+2. 死锁旁路：`map_worker_loop` 谓词加 `!any_lane_ready_locked()`；`reducer_loop` 即将
+   等待且 `reorder_inflight_ >= reorder_cap_` 时 `map_cv_.notify_all()`。更新类头
+   「锁与死锁约定」注释，写明 `reorder_cap_` 变为软上限。
+3. ring 在途首次超过 `2 × reorder_cap_` 时 `log_warn` 一次（限频）。
+4. close：等待循环改 deadline + `sleep_for` 退避（50µs 起倍增，封顶 10ms）；超时值改
+   成员 `close_wait_timeout_`（默认 30s）+ `*_for_test` 设置器；删 `WriteOpGate` 析构的
+   `notify_all()`；修正 S25-T1 注释。
+5. 对照组：旁路与新等待各留一个仅测试可见的开关，关掉后用例必须挂死。
+
+验收：三组用例转绿；对照组挂死；`reorder_inflight_for_test()` 在所有 lane 注销后为 0；
+池层用例 TSan ×200 无报告；`plugin_contract_test`、`c_api_shutdown_test` 全绿；
+CHANGELOG `[Unreleased]` 记两项修复。
+
+### ✅ S45-1 — 调研与基线
+
+> **落地记录（2026-11-17）**：调研记录 `docs/design/s45-1-research-zh.md`（17 项
+> 顺序假设逐条判定）。关键发现：HNSW 同样有单调水位门；`flush_building_slot`
+> 假设段内 LSN 单调；merge 搬迁 `get→put_doc` 有既有竞态；checkpoint 水位取
+> 提交时刻 `peek_next_ord` 会高估；search 模式**每次重开全量重新分词**。裁决
+> 选 R-b（OKI `locate`）+ docmap 守卫；docmap 增量链无需改；盘上格式唯一触及
+> 点为 HNSW 图文件的「节点 ord 递增」校验（S45-4 放宽，布局不变，见设计 §10.2）。
+> 基线数据并入 S45-6 的同源对比基准（同一程序分别链接 7.0.3 与 S45 树）。
+
+工作面：只读代码 + `bench/` + `docs/design/`（产出一份调研记录，回填设计 §8）。
+
+1. docmap（`src/keydir/index.cpp`、`docmap_ckpt.cpp`）乱序语义盘点：
+   - `put_doc` / `remove` 加裁决后的行为；`live_` / `meta_` 以 LSN 为键的影响；
+   - 检查点增量日志（`delta_live_`、`removals_`、`delta_window_wm_`）在「LSN ≥ 水位的
+     行可能先于水位落盘」下是否仍成立；
+   - `set_doc_len` / `set_meta` 的寻址与线程约束（设计 §4 表「需核 SoA 无增长」）。
+2. 向量插件：HNSW、IVF、DiskANN 段式插件（`sealed_segment_vector_plugin.hpp` 的
+   `replay_gate_` 等）逐个列出顺序 / 单写者假设，标注「串行道即可」或「需加裁决」。
+3. OKI 点查：`locate` 是否直接返回最新 LSN；刚写入的 key（memdelta 命中）与冷 key 的
+   点查耗时；据此在 R-a / R-b / R-c 中选定裁决实现（设计 §4.1）。
+4. 全库顺序假设清单：grep「升序 / 单调 / 单写 / reducer / 水位自门 / fold 序」，逐条
+   判定「保留 / 需改 / 随管线删除」。已知项见设计 §2.3。
+5. 纪律核对：哪些路径在持 `write_mu_` 时提交索引任务；哪些 RunFn / `run_serialized`
+   闭包会取 `write_mu_`（设计 §4.4 的两条新纪律）。
+6. 盘上格式逐项确认：段文件、段清单、docmap base / delta、向量组件、manifest 是否需要
+   任何改动。
+7. 基线数据：批量导入吞吐（`builder_threads` = 0 / 2 / 4）、`flush_index` 延迟、
+   检查点耗时、恢复时间（尾部 10 万 / 100 万条）。
+
+验收：调研记录入库；设计 §4.1 的实现选定并写明依据；设计 §8 的 1～4 项有结论；
+若确认需要改盘上格式，**停下来与用户确认**后再继续。
+
+### ✅ S45-2 — 乱序安全化（reducer 仍在，行为等价）
+
+> **落地记录（2026-11-17）**：`Index::put_doc` LSN 守卫（同 ord 幂等 no-op）、
+> `remove` 只删更旧、新增 `Index::relocate`（DocmapRelocator 改用，修既有竞态）；
+> TextPlugin 守卫 > → ≥、`rebuild_key_locations` 按 LSN 裁决、`hi_lsn` 逐行取最大；
+> HNSW 去单调门 + `arm_replay_gate`；IVF/DiskANN 重放门改 `<` + open 时已有集合；
+> 宿主规则 R（`index_put_is_current`）+ `StatusInfo::index_stale_dropped`；reducer
+> 乱序注入 `set_apply_shuffle_for_test`。新 `tests/index_unordered_apply_test.cpp`：
+> 5 种子 0 违例、对照组（关裁决）必现违例、重开幂等。3 个旧用例按新语义改写
+> （`Hnsw.OrdWatermarkIdempotent` → `OutOfOrderInsertsAreAllKept` +
+> `ReplayGateIdempotent` 等）。
+
+工作面：`src/keydir/index.cpp`、`include/bitcask/index.hpp`、`src/search/text_plugin.cpp`、
+向量插件、`src/cask/cask.cpp`（`reduce_index_entry`）、`tests/`。
+
+1. 宿主裁决（设计 §4.1 规则 R，按 S45-1 选定的实现）：`reduce_index_entry` 应用前裁决，
+   过期任务整体丢弃（docmap 与各插件都不调用）。
+2. docmap：`put_doc` 拒绝更旧的 LSN；`remove` 不得让更旧的 put 复活。
+3. 文本插件：LSN 守卫由「大于则跳过」改为「大于等于则跳过」（重放幂等）；
+   `rebuild_key_locations` 改为比较 LSN，不再依赖段序。
+4. 向量插件：按 S45-1 结论加裁决或确认串行道足够。
+5. 乱序注入器（仅测试）：reducer 取出就绪条目后，在一个小窗口内随机打乱应用顺序。
+6. 模型对拍：随机 put / 覆盖 / 删除 / 复写序列（固定种子可复现），与内存 map 模型逐 key
+   对比 docmap、BM25 命中集、向量命中集；重放幂等用例（同批任务应用两遍）。
+7. 对照组：关掉裁决后，乱序注入下必须出现幽灵文档或丢文档。
+
+验收：注入器关闭时全量 ctest 与基线逐位等价；注入器开启时对拍 ×1000 种子全绿；
+对照组必现违例；TSan 循环无报告；吞吐相对 S45-1 基线回退 ≤ 3%。
+
+### ✅ S45-3 — LSN 完成跟踪器（reducer 仍在）
+
+> **落地记录（2026-11-17）**：`include/bitcask/lsn_tracker.hpp`（64K 位滑动位图 +
+> 溢出集合，持锁 notify）+ `tests/lsn_tracker_test.cpp`；lane 接入、Debug 断言
+> 「前缀 ≥ reducer 应用水位」在 250 个索引相关用例（含乱序注入）下未触发；
+> `flush_index` 改等 LSN 前缀；ckpt / 自动 ckpt / merge 闭包在执行时刻取
+> `index_coverage()`；close 用注销前一刻前缀；失败补洞收口到
+> `complete_index_ord`。新用例：持续写入下读屏障不饿死 + 读己之写。
+
+工作面：新 `include/bitcask/lsn_tracker.hpp`、`include/bitcask/thread_pool.hpp`、
+`src/cask/cask.cpp`、`tests/`。
+
+1. `LsnTracker`：`begin(L)` / `done(L)` / `contiguous()`；滑动位图 + 溢出集合；
+   `done` 不阻塞、不分配、不抛异常。单测：乱序完成、窗口溢出、并发（TSan）。
+2. 接线：LSN 分配点 `begin`；reducer 应用后、裁决丢弃后 `done`。
+3. 等价性守门：调试构建断言 `contiguous() == applied_ord + 1`（reducer 仍在时两者恒等）。
+4. 读屏障切换：`flush_index` / `prepare_search` 改为等 `contiguous() >= 入口时刻的下一个
+   待分配 LSN`；无界语义不变（T8）。
+5. 检查点水位切换：各保存点的水位取 `contiguous()`（设计 §4.5）。
+6. 失败补偿切换：`OrdSkipGuard` / `BatchOrdGuard` 的析构改调 `done()`；写路径的显式
+   Skip 提交同样替换。`IndexOp::Skip` 暂留（S45-4 删）。
+7. 溢出集合超过阈值时 `log_error` 一次（有 LSN 长时间未完成）。
+
+验收：等价性断言在全量 ctest 与乱序注入对拍下不触发；持续写入下 `flush_index` 不再
+饿死（新用例）；`s43_rollout_gate_test`、`checkpoint_recovery_test` 全绿。
+
+### ✅ S45-4 — 分片执行器替换管线
+
+> **落地记录（2026-11-17）**：`thread_pool.hpp` 重写（N 分片 + 串行道 + 维护线程；
+> Dekker 式暂停；归零递减持锁——TSan 抓到的 UAF 已修）；宿主分发抽成
+> `index_dispatch.hpp`（Cask 与契约测试共用）；插件契约（`concurrency` /
+> `accepts_*` / `shard` / `shards`）；TextPlugin BuilderPool → 每分片 building 段，
+> 自动压实经 `run_serialized`；向量插件声明串行 + 只收带向量写；checkpoint /
+> merge / 自动 ckpt 改 `run_exclusive`(`_and_wait`)；`unregister_lib` 超时摘钩入
+> 墓地。HNSW 图文件放宽「节点 ord 递增」校验（设计 §10.2-1）。测试：
+> `thread_pool_test` / `plugin_contract_test` 改写；乱序对拍改为真并发 + 提交抖动、
+> KV 为预言机（对照组稳定命中靠「收尾竞速」阶段）。bench `index_pool_bench`
+> 改写。
+
+工作面：`include/bitcask/thread_pool.hpp`（重写）、`include/bitcask/plugin_api.hpp`、
+`src/cask/cask.cpp`、`src/search/text_plugin.cpp`、向量插件、`tests/plugin_contract_test.cpp`。
+
+1. 执行器：N 个分片线程 + 1 个串行道线程 + 1 个维护线程；每分片 / 串行道一条有界队列；
+   按 `hash(key) mod N` 分发；删除任务走同一分片。
+2. 每库状态：在途计数、暂停位、跟踪器；`pause(lane)` / `resume(lane)`（设计 §4.4）。
+3. 插件契约（设计 §4.7）：`on_put` / `on_delete` 改为「同 key 串行、到达序任意」；
+   事件带 `shard`、`OpenContext` 带 `shards`；`concurrency()` 声明；`prepare` 改为同线程
+   先行调用；`run_serialized` 改由维护线程在暂停期执行。更新头注释与 DL 陷阱 6 的表述。
+4. 文本插件：每分片一个 building 槽，`on_put` 直接写 `slot[shard]`；BuilderPool 线程、
+   队列与 `builder_threads` 配置退役（配置项保留解析、忽略并告警一次，避免破坏下游配置）。
+5. 向量插件：声明串行，走串行道。
+6. 宿主：`reduce_index_entry` 拆为分片应用（裁决 → docmap → 并发插件）与串行应用；
+   检查点 / merge 收尾 / 自动检查点改走维护线程；`put_batch` / `put_batch_atomic`
+   失败路径的锁内补交挪到解锁后。
+7. 删除（设计 §5）：reducer、ring、`reorder_*`、map worker、`MapFn` / `ReduceFn`、
+   `IndexOp::Skip` / `RunFn`、`applied_ord` / `submitted_ord_hwm`、S45-0 的旁路。
+8. `unregister_lib`：有界等在途归零；超时不销毁 lane（移入墓碑列表），消除已知 UAF 取舍。
+9. 用例：同 key 高频覆盖 + 删除的终态；暂停独占（闭包执行期间无应用回调）；多库共享
+   分片互不死锁；S45-0 的端到端用例继续全绿（此时不依赖旁路）。
+
+验收：全量 ctest 全绿；乱序对拍（此时乱序是真实的，不靠注入器）×1000 种子全绿；
+TSan 循环、ASan 无报告；附录 A 负载在批 60000 / 10⁶ 下均完成且在途任务数 ≤
+(N + 1) × 队列容量。
+
+### ✅ S45-5 — 恢复重放走新管线
+
+> **落地记录（2026-11-17）**：重放车道经分片执行器（规则 R 关闭，结构守卫判重；
+> docmap 已有行时仍送达插件——组件水位可能不同）；墓碑重放为真实删除；
+> `replay_floor = replay_floor_of(min 组件水位)`（余量 `kReplayFloorMargin=4096`
+> 吸收旧 ckpt 高估）。`Cask::verify_index_consistency()`。新
+> `tests/index_crash_recovery_test.cpp`（4 写线程 + 3 次 checkpoint，写到 90% 时
+> 崩溃；重开两轮均一致）。20 万文档库重开 1.6 s → 0.6 s 且不再重写段。
+> **追加（2026-11-17，用户定「向量也走 key+LSN」）**：向量插件改用
+> `detail/vector_key_loc.hpp` 的 key → (LSN, 墓碑) 定位表，HNSW 重放门删除；search
+> 重放移到 `finish_oki_recovery` 之后的第二遍 fold 并开启规则 R（修复重开时已删版本
+> 被重插为重复死节点，`V35MergeRebuildEvictsDead` 75 → 50）；docmap 检查点行 / meta
+> 去掉 LSN 上界（顺带修 ord ≥ 水位行丢 meta）；串行插件一律收删除。回归：向量图节点
+> 数跨重开不变（乱序对拍 + 崩溃用例）。
+> **追加 S45-A（2026-11-17，用户定方案 A）**：向量定位表随检查点持久化——
+> `kVecKeyLoc`（base 快照，不含墓碑）/ `kVecKeyLocDelta`（delta 窗口条目），重开
+> 直接由 base + 链重建、不依赖 docmap；旧检查点回退 docmap 反查。新测试
+> `tests/vector_key_persist_test.cpp`（7 例：编解码 3、插件级「盲 docmap 重开」与
+> 「旧版缺段回退」2、Cask 级「丢 docmap 检查点」+ 对照组 2——对照组剥掉 key 段即
+> 复现重复节点）。顺带修复：崩溃恢复后 OKI 对已删 key 可能报偏旧的墓碑 LSN，重放
+> 期规则 R 原有的「OKI 更旧则放行」会放进中间版本（崩溃用例 5/60 偶发向量节点增长），
+> 重放改为严格版（LSN 恰好相等才放行），100/100 通过；崩溃用例新增断言：每个存活
+> key 的向量定位表 LSN == docmap LSN。
+> **追加（2026-11-17，用户要求）**：OKI 墓碑 LSN 偏旧已修——根因在
+> `IndexAuthority::rebuild_from_data` 账本模式的 tail 补行：视图已是墓碑时跳过 tail
+> 中更新的墓碑。改为视图命中（活行或更旧墓碑）即补行。新用例
+> `IndexCrashRecoveryTest.OkiTailTombstoneOverOlderTombstoneKeepsLatestLsn`（崩溃
+> 子进程：删除 → checkpoint → 再写再删 → 崩溃）：修复前稳定复现（报 51，实为 54）。
+> **追加（2026-11-17，用户要求查 AutoCheckpointOnRoll）**：不是测试复制目录的问题
+> （复制前后源目录逐文件 名/大小/mtime 不变），是 OKI 真缺陷——`capture_commit_cut`
+> 只钳有 `applied_end_` 登记的文件，roll 新建文件首条记录「已追加未应用」时水位
+> 取文件大小，manifest 高估覆盖，崩溃后 tail 补行跳过 → KV 丢写（捕获的失败镜像
+> 稳定复现：`ac_281` 是 5 号文件 offset 0 的首条记录，OKI kMiss、账本却计 400）。
+> 修复：`increment_file_id()` 登记新文件落点 0；`rebuild_from_data` 发布时以各文件
+> 扫描末尾登记（原 `clear()`）。新用例 `OkiCommitCut.DataWatermarkClampedToAppliedRecords`
+> （确定性，修复前两处断言均失败：4096≠0、4846≠750）；TSan 加压复现
+> 0/400（修复前约 1/60～1/180）。
+> **追加（2026-11-17，用户要求加打开期兜底）**：账本模式补 tail 时逐文件抽检水位内
+> 末条记录（tail 补完后比 OKI 与 data 胜出版本），不一致 → `finish_oki_recovery`
+> 改走全量重建（只读句柄建内存视图）。新用例
+> `IndexCrashRecoveryTest.OverclaimedOkiManifestFallsBackToRebuild`（子进程用测试缝
+> 把写者停在「已追加未应用」、删登记后提交切面，忠实复现旧版本写坏的 manifest；关掉
+> 兜底即丢 victim）。捕获的真实失败镜像：抽检 5 键、判不一致、重建后 0 丢失。全量
+> 887 用例中兜底只在该用例触发 1 次（无误报）。
+> **追加（2026-11-17）**：`SeqGate.PairedReadsNeverTorn` 偶发失败已查清——全是对照组
+> （裸读 `torn_raw > 0`）没采到样本，闸本身无误（加压与 TSan 下 0 次不成对、0 告警）。
+> 测试改为对照组为 0 时延长写入直到采到（20 s 封顶）；900 次 0 失败（原约 1%）。
+> **S45-7（2026-11-17，用户要求）**：checkpoint / close 时分片 building 小段先合并再
+> 落盘——`TextPlugin::flush_building` 按文档数装箱（每组 ≤ 65 536），组内
+> `merge_segments_v2` 写一个段（新函数 `merge_building_slots`），失败退回逐段封口。
+> 新用例 `tests/shard_segment_merge_test.cpp`（2 例：覆盖 / 删除 / 命名字段下合成 1
+> 段且逐 key 对拍、合并后续写续删、重开；超组上限拆段）。同场 A/B：段文件 9→2 /
+> 11→4，在线段 8→1，查询 p50 58～60→40～41 µs；**close 耗时无变化**——S45-6 报告里
+> 「close 慢是因为 8 个段文件」的归因已更正为不成立（真正原因未定位）。
+> **追加（2026-11-17，用户要求查 close 慢的真正原因）**：已查清，**非结构性回退**。
+> 两棵树 close 分段计时：差异全在 BM25 落盘，其耗时 ∝ close 时未封口文档数，取决于最后
+> 一次自动 checkpoint 的位置——7.0.3 按 LSN 精确每 65 536 一次（20 万篇时只剩 3 392
+> 篇），S45 以覆盖水位为锚、节奏前漂且有随机性（20 万篇剩约 1.2 万）。跨 15/20/25/30
+> 万篇两者互有胜负；close 前先 checkpoint+sync 时两者持平。排除：段文件数、分片阈值
+> 均摊（实验后撤回）。详见 `docs/design/s45-6-bench-zh.md` §7。代码无改动。
+
+工作面：`src/cask/cask_recovery.cpp`、`tools/`。
+
+1. 尾部重放改为经分片执行器提交（并行、乱序）；原「攒批并行 prepare、串行应用」退役。
+2. 删除依赖「插入序 == fold 序」的自门逻辑，或确认其已被规则 R 覆盖。
+3. 一致性核对：诊断 API / 工具，遍历索引侧 `key → LSN` 与 OKI 比对并报告偏差
+   （不在启动路径上）。
+4. crash 注入：检查点各阶段、暂停期内、重放中途崩溃，重开后与模型一致。
+
+验收：现有恢复 / crash 用例全绿；恢复时间相对 S45-1 基线不回退（预期改善）；
+核对工具在对拍用例收尾处全部报告零偏差。
+
+### ✅ S45-6 — 基准、调参、文档与收口
+
+> **落地记录（2026-11-17）**：基准见 `docs/design/s45-6-bench-zh.md`（对比工具
+> `scripts/s45_compare_bench.cpp`）：文本 end2end +30～45%、重开 2.7×、7.0.3 读屏障
+> 持续写入下饿死 → S45 p50 46 ms；分片队列容量据此定为 512（2048 时 p50 220 ms，
+> 吞吐相同）；close 195 vs 130 ms（每分片一个段，记为后续段合并候选）。文档：设计稿
+> 第 10 节、CHANGELOG `[Unreleased]`、RISK_REPORT Phase 7、插件契约头注释。收口
+> 阶段 sanitizer 矩阵发现并修复：① 新池归零递减 UAF（TSan）；② 查询缓存
+> 「计算 → put」TOCTOU（既有缺陷，真并发下约 5% 丢文档，失效代号修复）。
+> 全矩阵结果见基准报告末节。
+
+1. 基准：批量导入吞吐（1 / 4 / 8 写线程 × 分片数）、`flush_index` 延迟、检查点期间的
+   写停顿、恢复时间；与 S45-1 基线对比，结果写入 `docs/design/`。
+2. 校准分片队列容量；评估跨库公平性（设计 §8 第 7 项），决定是否需要按库配额。
+3. 文档：插件开发说明（新契约）、`thread_pool.hpp` 头注释、设计稿状态改「已实现」。
+4. CHANGELOG：行为变化（`builder_threads` 退役、文本与向量可见时刻、检查点水位取法）。
+5. `RISK_REPORT.md`：增补本轮审计两项及处置；Phase 5/6 已修项标注为已修
+   （P5-MEM-1、P6-MEM-1/2/3、P6-DL-1、P6-DUR-1）；随管线删除而失效的条目标注作废。
+6. 全矩阵：gcc-release / clang-debug / werror 全量 ctest，TSan 循环，ASan。
+
+### 执行序
+
+```text
+S45-0 ──（可独立发布）
+S45-1 ── S45-2 ── S45-3 ── S45-4 ── S45-5 ── S45-6
+```
+
+S45-0 与 S45-1 可并行。S45-2 与 S45-3 都在旧管线上做，互不依赖实现但建议按序，
+便于定位回归。
+
+### 风险排序（按「有多容易静默错」）
+
+1. 裁决或幂等有漏：乱序下丢文档或留幽灵，不报错。靠乱序对拍 + 对照组守门。
+2. docmap 增量链在乱序下的语义：最不确定的一块，S45-1 结论可能改变方案甚至触及格式。
+3. 水位取错（用了「下一个待分配 LSN」而非连续前缀）：崩溃后永久漏索引。靠 S45-3 的
+   等价性断言和 crash 注入守门。
+4. 暂停与写锁的交互：持 `write_mu_` 阻塞式提交 + 独占闭包取 `write_mu_` 会成环。
+5. 插件契约变更波及所有插件实现与下游自定义插件。
+
+### 明确不做
+
+- 不改 BM25 段格式、posting 结构、查询路径；不做 HNSW 多写者。
+- 不在写线程内联分词；不放宽读己之写。
+- 检查点不做「暂停外序列化」优化。
+- 同轮审计的其余次要项（`auto_ckpt_inflight_` 卡死、读路径 / merge 与 close 并发）
+  ——另行立项；`BatchOrdGuard` 析构异常与 `unregister_lib` 超时 UAF 已分别由
+  S45-3、S45-4 顺带消除。
+
+---
+
 ## 🔴 S44 · OKI 分级归并 + 读视图不可变发布（2026-11-16 立项）
 
 > 来源：[`designs/oki-size-tiered-compaction-design-zh.md`](designs/oki-size-tiered-compaction-design-zh.md)

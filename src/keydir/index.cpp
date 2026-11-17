@@ -23,7 +23,7 @@ std::uint64_t Index::alloc_ord() {
     return next_ord_++;
 }
 
-void Index::put_doc(std::string_view ext_id, std::uint64_t ord,
+bool Index::put_doc(std::string_view ext_id, std::uint64_t ord,
                     const DocSlot& slot) {
     std::unique_lock lk(mutex_);
 
@@ -34,6 +34,11 @@ void Index::put_doc(std::string_view ext_id, std::uint64_t ord,
     std::string_view key_view;
     if (auto it = ext2ord_.find(ext_id); it != ext2ord_.end()) {
         const std::uint64_t old_ord = it->second;
+        // S45-2：LSN 守卫——应用序不再等于 LSN 序（索引管线去全局顺序化，
+        // designs/index-pipeline-unordered-design-zh.md §4.1）。更旧版本到达
+        // 直接丢弃；同 LSN = 重放/重复投递，幂等 no-op（保留既有行——含
+        // BM25 回填的 doc_len 与 meta，重放的 doc_len=0 占位不得覆盖它）。
+        if (old_ord >= ord) return false;
         // S42：旧行写路径同步淘汰（live row / meta / delta journal 三处）。
         if (live_.erase(old_ord) > 0) {
             ++retired_since_compact_;  // S12-2：仅旧版本实际 live 时计退休
@@ -56,6 +61,19 @@ void Index::put_doc(std::string_view ext_id, std::uint64_t ord,
         delta_live_.insert(ord);
     }
     dirty_.store(true, std::memory_order_relaxed);  // S18-2：自记账
+    return true;
+}
+
+bool Index::relocate(std::string_view ext_id, std::uint64_t ord,
+                     const DocLoc& loc) {
+    std::unique_lock lk(mutex_);
+    auto it = ext2ord_.find(ext_id);
+    if (it == ext2ord_.end() || it->second != ord) return false;
+    auto lit = live_.find(ord);
+    if (lit == live_.end()) return false;
+    lit->second.slot.loc = loc;
+    dirty_.store(true, std::memory_order_relaxed);
+    return true;
 }
 
 bool Index::remove(std::string_view ext_id, std::uint64_t tomb_ord) {
@@ -76,6 +94,12 @@ bool Index::remove(std::string_view ext_id, std::uint64_t tomb_ord) {
         return false;
     }
     const std::uint64_t cur_ord = it->second;
+    // S45-2：只删更旧的版本。当前行 LSN ≥ 墓碑 LSN = 墓碑之后的写已先行
+    // 应用（乱序到达），本删除过期——保留当前行。
+    if (cur_ord >= tomb_ord) {
+        if (log_removal) removals_.emplace_back(std::string(ext_id), tomb_ord);
+        return false;
+    }
     // S42：先淘汰 live row（拿 retire 计数），再摘 ext 节点——LiveRow.ext
     // 指向节点键，extract 之后任何指向该节点的 view 都不得存活。
     if (live_.erase(cur_ord) > 0) {

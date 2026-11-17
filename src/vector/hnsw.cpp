@@ -903,10 +903,11 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
         std::atomic<bool>& f;
         ~Guard() { f.store(false); }
     } guard{writer_active_};
-    // 水位幂等(回放重叠区;ord 引擎全局单调)。
+    // S45:无判重门(见 hpp;幂等由上层 key+LSN 裁决)。
     const std::uint64_t prev = max_inserted_ord_.load(std::memory_order_relaxed);
-    if (prev != static_cast<std::uint64_t>(-1) && ord <= prev) return;
-    max_inserted_ord_.store(ord, std::memory_order_relaxed);
+    if (prev == static_cast<std::uint64_t>(-1) || ord > prev) {
+        max_inserted_ord_.store(ord, std::memory_order_relaxed);
+    }
 
     const std::uint32_t id = count_.load(std::memory_order_relaxed);
     const std::uint32_t ci = id >> kChunkBits;
@@ -1772,8 +1773,16 @@ bool HnswIndex::serialize(std::vector<std::uint8_t>& buf) const {
     vs_put32(buf, n);
     vs_put64(buf, em);
     // 落盘水位 = 已保存节点的最大 ord(见 hpp:不抄 max_inserted_ord_ 原子,
-    // 防 mid-insert 领先 count 的窗口;ord 按插入序单调 → 尾节点即最大)。
-    vs_put64(buf, n > 0 ? ord_of(n - 1) : static_cast<std::uint64_t>(-1));
+    // 防 mid-insert 领先 count 的窗口)。S45-4:插入序不再等于 ord 序(分片
+    // 执行器下向量乱序到达),逐节点取最大——不再假设尾节点即最大。
+    {
+        std::uint64_t mx = static_cast<std::uint64_t>(-1);
+        for (std::uint32_t id = 0; id < n; ++id) {
+            const std::uint64_t o = ord_of(id);
+            mx = (mx == static_cast<std::uint64_t>(-1) || o > mx) ? o : mx;
+        }
+        vs_put64(buf, mx);
+    }
     // S14-8:payload 代号（与 .vec/.qc8 头配对；save 流程先落 payload 后
     // serialize，二者取同一 gen）。
     ensure_payload_gen();
@@ -1954,9 +1963,9 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         if (!need(file_ver == kBcvhVersion3 ? 13 : 13 + qbytes)) return false;
         std::uint64_t ord;
         std::memcpy(&ord, p, 8); p += 8;
-        // ord 严格递增是写者不变量(插入序分配),也是水位幂等的前提。
-        if (have_prev && ord <= prev_ord) return false;
-        prev_ord = ord;
+        // S45-4:不再要求 ord 随节点 id 严格递增(分片执行器下向量乱序到达,
+        // 插入序 ≠ ord 序;重放幂等改由显式重放门承担)。只核对头部最大值。
+        if (!have_prev || ord > prev_ord) prev_ord = ord;
         have_prev = true;
         const std::uint8_t level = *p++;
         if (level > 31) return false;
@@ -2000,7 +2009,7 @@ bool HnswIndex::deserialize(std::span<const std::uint8_t> buf) {
         }
     }
     if (p != end) return false;
-    // 水位与尾节点 ord 必一致(save 即按此落盘;不符 = 文件不自洽)。
+    // 水位与节点最大 ord 必一致(save 即按此落盘;不符 = 文件不自洽)。
     if (max_ord != prev_ord) return false;
 
     // 第二遍:邻居层数覆盖校验——layer-l 表只允许 level ≥ l 的节点,

@@ -1,6 +1,7 @@
 // 一写多读基础件：SnapshotCell（不可变快照发布槽）与 SeqGate（成对一致闸）。
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -97,7 +98,15 @@ TEST(SeqGate, PairedReadsNeverTorn) {
             }
         });
     }
-    for (std::uint64_t i = 1; i <= 50000; ++i) {
+    // 至少 5 万次写；对照组是概率性的（读者的两次裸读要恰好夹住一次写），
+    // 调度不利时（机器满载）固定次数内可能一次都没撞上——那是对照组没采到
+    // 样本，不是闸失效。故写满 5 万次后若对照组仍为 0，继续写直到采到为止，
+    // 20 s 封顶（届时仍为 0 才判「测试没有分辨力」）。
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    for (std::uint64_t i = 1;
+         i <= 50000 ||
+         (torn_raw.load() == 0 && std::chrono::steady_clock::now() < deadline);
+         ++i) {
         std::lock_guard<std::mutex> wl(writer_mu);  // 写者串行（契约）
         const auto w = gate.write();
         { std::lock_guard<std::mutex> g(ma); a = i; }

@@ -126,28 +126,38 @@ TEST(TextPlugin, RecoveryReplayFullyDeadSegmentKeepsScoresStable) {
     ASSERT_TRUE(baseline.has_value());
     ASSERT_EQ(baseline->size(), N);
 
-    // 模拟恢复 fold 对同一 (key, ord) 的全量重放：现有实现会 mark_dead 旧
-    // 段并把同一文档重建进 building_。查询视图必须不再纳入全死段。
+    // S45-2：同 (key, ord) 重放是幂等 no-op（LSN 守卫 ≥）——旧段保持全活、
+    // building_ 不新增任何行。
     for (std::uint64_t ord = 0; ord < N; ++ord) {
         const std::string key = "k" + std::to_string(ord);
         b.apply_text(key, ord, "shared term " + std::to_string(ord));
     }
-
     const auto* sset = b.segment_set();
     ASSERT_NE(sset, nullptr);
     ASSERT_EQ(sset->segment_count(), 1u);
     ASSERT_NE(sset->segment(0), nullptr);
-    EXPECT_EQ(sset->segment(0)->live_doc_count(), 0u);
+    EXPECT_EQ(sset->segment(0)->live_doc_count(), N);
     const auto* bld = b.building_segment();
     ASSERT_NE(bld, nullptr);
-    EXPECT_EQ(bld->live_doc_count(), N);
+    EXPECT_EQ(bld->doc_count(), 0u) << "同版本重放不得重建文档";
+
+    // 原回归意图（7.0.3）：「旧封口段全死 + 新 building 全活」视图下分数
+    // 不漂移。改用**更新版本**同文本覆盖写构造该视图（同 LSN 重放已不再
+    // 产生它）：全死段不得把死文档统计注入聚合。
+    for (std::uint64_t ord = 0; ord < N; ++ord) {
+        const std::string key = "k" + std::to_string(ord);
+        host_put_row(idx2, key, ord + N);
+        b.apply_text(key, ord + N, "shared term " + std::to_string(ord));
+    }
+    EXPECT_EQ(sset->segment(0)->live_doc_count(), 0u);
+    EXPECT_EQ(b.building_segment()->live_doc_count(), N);
 
     auto replayed = b.search_text("shared", 10);
     ASSERT_TRUE(replayed.has_value());
     ASSERT_EQ(replayed->size(), baseline->size());
     for (std::size_t i = 0; i < baseline->size(); ++i) {
         EXPECT_EQ((*replayed)[i].key, (*baseline)[i].key);
-        EXPECT_EQ((*replayed)[i].ord, (*baseline)[i].ord);
+        EXPECT_EQ((*replayed)[i].ord, (*baseline)[i].ord + N);
         EXPECT_DOUBLE_EQ((*replayed)[i].score, (*baseline)[i].score);
     }
 

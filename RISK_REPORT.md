@@ -979,3 +979,50 @@ RED-3/5/6/10（backlog 维持）。
 3. **超时/旁路要按等待点清点，不能按函数清点**：close() 有超时、checkpoint()
    有超时、map_cv_ 有旁路，全部单独看都"已修"——但同一线程先后两个等待点，
    只要有一个无界，前面所有超时都归零。
+
+---
+
+# Phase 7 修订（2026-11-17，S45）
+
+> 方法：主 Agent 逐模块读码审计（并发 / 内存）+ 复现程序 + gdb 线程栈；
+> 修复经 TASK.md S45-0～S45-6 落地。基线 HEAD `4d3b506`（7.0.3）。
+
+## 二十、Phase 1-6 已修项状态核对
+
+逐条对照代码确认以下条目**已在代码中修复**（报告前文仍按当时状态记载）：
+
+| 条目 | 修复位置 |
+|---|---|
+| P5-MEM-1 OrdSkipGuard 析构可 terminate | 析构内 try/catch（S45-4 起改为直接记 LSN 完成，noexcept，无分配） |
+| P5-MEM-2 checkpoint 漏更新 last_ckpt_ord_ | 三条同步路径均已 store |
+| P6-MEM-1 submit 的 in_flight 泄漏 | push 失败补偿（S45-4 新池同款补偿 + 记 LSN 完成） |
+| P6-MEM-2 RowChunks 异常窗口 | unique_ptr 暂存 |
+| P6-MEM-3 MmapSegment::open 映射泄漏 | new 提前到 mmap 之前 |
+| P6-DL-1 unregister_lib 无界 flush | 有界 30s（S45-4 起超时摘钩入墓地，不再 UAF） |
+| P6-DUR-1 hnsw 原子写缺 fdatasync | commit 内含 fdatasync |
+
+## 二十一、Phase 7 发现与处置
+
+| 编号 | 维度 | 描述 | 状态 |
+|---|---|---|---|
+| P7-DL-1 | 死锁（HIGH，已复现） | 索引池背压死锁：乱序提交 + 严格按序应用 + 有上限的 reorder ring；大 put_batch × 并发 put 必现，全写线程永久挂起、同池其它库连坐 | S45-0 止血（饥饿旁路）；S45-4 结构性消除（无 reducer / ring，任何线程都不等特定 LSN） |
+| P7-DL-2 | 活性（MED） | close() 30s 逃生门不生效（atomic::wait 无超时） | S45-0 有界轮询 |
+| P7-RACE-1 | 竞态（MED） | DocmapRelocator get→put_doc 两步可把 docmap 改回旧版本 | S45-2 `Index::relocate` 原子 CAS |
+| P7-DUR-1 | 持久性/一致性（LOW） | checkpoint 覆盖水位取提交时刻 peek_next_ord，可高估 | S45-3 执行时刻 LSN 连续前缀；S45-5 重放余量 4096 吸收旧 ckpt 高估 |
+| P7-UAF-1 | 内存（LOW，已知取舍） | unregister_lib 超时后析构车道，在途任务持裸指针 | S45-4 摘钩入墓地，不再回调宿主 |
+| P7-MEM-1 | 异常安全（LOW） | BatchOrdGuard 析构提交任务可抛 | S45-3/4 改为直接记完成（noexcept） |
+| P7-LIVE-1 | 活性（LOW） | 自动 checkpoint 任务被池丢弃时 auto_ckpt_inflight_ 永久为真 | S45-4 池停时调用线程直跑 |
+| P7-RACE-2 | 竞态（MED，已复现） | 查询缓存「计算 → put」TOCTOU：旧快照结果在失效之后写回、常驻缓存；真并发应用下约 5% 丢文档 | S45-6 失效代号拒收陈旧 put；on_delete 失效挪到标死之后 |
+| P7-PERF-1 | 性能（MED） | search 模式每次重开全量重新分词 + 重写段 | S45-2 同 LSN 重放幂等 + S45-5 重放起点 |
+
+## 二十二、新结构的残余风险
+
+1. **LSN 永不完成**（写线程在分配 LSN 与提交之间被 kill）：LSN 前缀停住，读屏障
+   无界等待（搜索读己之写依赖，按 T8 保持无界）、checkpoint 30s 超时返回错误。
+   与旧 reducer 等不到队头等价，非新问题；close 有界。
+2. **HNSW 图文件降级兼容**：S45 写出的乱序图文件 7.0.x 读端拒收 → 全量重放重建
+   向量（慢一次，不损坏）。
+3. **跨库共享分片的公平性**：一库的大批量可占满某分片队列，拖慢哈希到同分片的
+   其它库写入（不死锁）。
+4. **独占维护期间写入背压**：大库 checkpoint 序列化期间本库应用暂停，分片队列
+   满后写者被背压（与旧 reducer 执行 RunFn 期间等价）。

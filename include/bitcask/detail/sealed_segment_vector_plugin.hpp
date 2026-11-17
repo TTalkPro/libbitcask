@@ -37,6 +37,7 @@
 
 #pragma once
 
+#include "bitcask/detail/vector_key_loc.hpp"  // S45：key+LSN 裁决
 #include "bitcask/ckpt_chain.hpp"
 #include "bitcask/component_ckpt.hpp"
 #include "bitcask/doc_table.hpp"
@@ -63,6 +64,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <functional>
 #include <vector>
 #include "bitcask/detail/atomic_shared_ptr.hpp"
 #include "bitcask/detail/path_utf8.hpp"
@@ -130,12 +132,15 @@ public:
     plugin::PluginStatus open(const plugin::OpenContext& ctx) final;
     [[nodiscard]] std::uint64_t watermark() const final { return watermark_; }
     plugin::PluginStatus close() final { return plugin::PluginStatus::kOk; }
+    // S45：key+LSN 裁决（乱序旧版本 / 删除覆盖 / 同版本重放一律跳过）。
     void on_put(const plugin::PutEvent& e, plugin::PreparedPtr) final {
-        if (e.doc && !e.doc->vec.empty()) {
+        if (e.doc && !e.doc->vec.empty() && key_loc_.admit_put(e.key, e.ord)) {
             insert(e.ord, e.doc->vec);
         }
     }
-    void on_delete(const plugin::DeleteEvent&) final {}
+    void on_delete(const plugin::DeleteEvent& e) final {
+        key_loc_.on_delete(e.key, e.ord);
+    }
     plugin::FlushResult flush(const plugin::FlushRequest& req) final;
     void on_merge_commit(const plugin::MergeCommitEvent&) final;
 
@@ -232,9 +237,18 @@ protected:
 
     std::atomic<bool> dirty_{true};
     std::atomic<bool> rebase_needed_{true};
-    // 重放幂等门：open 载入覆盖水位之下的事件已在 sealed/链里（宿主从
-    // min(全插件水位) 起 fold，本插件跳过 ord ≤ 此值；uint64(-1) = 无）。
-    std::uint64_t replay_gate_ = static_cast<std::uint64_t>(-1);
+    // S45：key → (ord, 墓碑) 定位表——乱序插入与恢复重放的幂等都由它承担
+    // （取代旧「ord ≤ 水位」重放门）。单写者：串行道；open 重建 / flush 修剪
+    // 在应用暂停期。
+    VectorKeyLocations key_loc_;
+    bool key_loc_from_ckpt_ = false;  // S45-A：同 VectorPlugin
+
+public:
+    [[nodiscard]] bool key_loc_from_ckpt_for_test() const noexcept {
+        return key_loc_from_ckpt_;
+    }
+
+private:
     DeltaLog delta_;
     // S32-M1 同款：自 base 以来入窗向量数（恢复链重放代价的直接度量）。
     std::uint64_t vec_docs_since_base_ = 0;
@@ -293,10 +307,7 @@ void SealedSegmentVectorPlugin<SealedT>::insert(std::uint64_t ord,
                                                 std::span<const float> v) {
     auto w = window_.load(std::memory_order_acquire);
     if (!w || v.size() != config_.dim) return;
-    if (replay_gate_ != static_cast<std::uint64_t>(-1) &&
-        ord <= replay_gate_) {
-        return;
-    }
+    // S45：本方法不判重——on_put 已经过 key+LSN 裁决。
     dirty_.store(true, std::memory_order_relaxed);
     delta_.record(ord, v);  // 窗口门内建（S32-M0b）
     const std::size_t before = w->size();
@@ -510,6 +521,11 @@ bool SealedSegmentVectorPlugin<SealedT>::save_component_base(
         write_blob_tail(b, *fresh);
         sw.add(section_type(), std::move(b));
     }
+    {
+        std::vector<std::byte> b;  // S45-A：key 定位表快照
+        key_loc_.encode_snapshot(b);
+        sw.add(sc::CkptSectionType::kVecKeyLoc, std::move(b));
+    }
     if (!sc::SearchCheckpoint::write(fp, watermark, sw.sections())) {
         return false;  // 旧内存态继续服务；新段配旧 ckpt 由 gen 守卫拒载
     }
@@ -517,6 +533,8 @@ bool SealedSegmentVectorPlugin<SealedT>::save_component_base(
     chain_ = ChainState{watermark, watermark, 1};
     delta_.set_window(watermark);
     clear_delta_log();
+    key_loc_.set_journal_window(watermark);
+    key_loc_.clear_journal();
     dirty_.store(false, std::memory_order_relaxed);
     // 换代发布：先 sealed 后 window（瞬间双持同 ord 由 search 去重兜住）。
     sealed_.store(std::move(fresh), std::memory_order_release);
@@ -550,6 +568,11 @@ SealedSegmentVectorPlugin<SealedT>::save_component_delta(
         serialize_delta_log(b);
         sw.add(sc::CkptSectionType::kHnswDelta, std::move(b));
     }
+    {
+        std::vector<std::byte> b;  // S45-A：窗口内新登记的 (ord, key)
+        key_loc_.encode_journal(b);
+        sw.add(sc::CkptSectionType::kVecKeyLocDelta, std::move(b));
+    }
     if (!sc::SearchCheckpoint::write(dpath, watermark, sw.sections())) {
         return result;
     }
@@ -557,6 +580,8 @@ SealedSegmentVectorPlugin<SealedT>::save_component_delta(
     chain_.next_seq = seq + 1;
     delta_.set_window(watermark);
     clear_delta_log();
+    key_loc_.set_journal_window(watermark);
+    key_loc_.clear_journal();
     dirty_.store(false, std::memory_order_relaxed);
     result.wrote = true;
     result.new_seq = seq;
@@ -583,8 +608,13 @@ SealedSegmentVectorPlugin<SealedT>::load_component(
         result = LoadResult{};
         chain_ = ChainState{};
         delta_.set_window(0);
+        key_loc_.clear();
+        key_loc_.set_journal_window(0);
+        key_loc_from_ckpt_ = false;
         return result;
     };
+    key_loc_.clear();
+    key_loc_from_ckpt_ = false;
     if (!lc) {
         return fail();
     }
@@ -592,8 +622,15 @@ SealedSegmentVectorPlugin<SealedT>::load_component(
     const auto want_type = static_cast<std::uint16_t>(section_type());
     bool segments_ok = true;
     bool any = false;
+    bool keys_ok = false;  // S45-A：base 带 key 段且链上每个 delta 都带
     for (const auto& ls : lc->sections) {
         if (!ls.crc_ok) { segments_ok = false; continue; }
+        if (ls.type ==
+            static_cast<std::uint16_t>(sc::CkptSectionType::kVecKeyLoc)) {
+            keys_ok = key_loc_.load_section(std::span<const std::byte>(
+                ls.payload.data(), ls.payload.size()));
+            continue;
+        }
         if (ls.type != want_type) continue;
         if (ls.payload.size() != blob_size()) {
             segments_ok = false;
@@ -628,6 +665,7 @@ SealedSegmentVectorPlugin<SealedT>::load_component(
                 for (const auto& dls : dc.sections) {
                     if (!dls.crc_ok) return false;
                 }
+                bool delta_keys = false;
                 for (const auto& dls : dc.sections) {
                     if (dls.type ==
                         static_cast<std::uint16_t>(
@@ -636,8 +674,15 @@ SealedSegmentVectorPlugin<SealedT>::load_component(
                                 dls.payload.data(), dls.payload.size()))) {
                             return false;
                         }
+                    } else if (dls.type ==
+                               static_cast<std::uint16_t>(
+                                   sc::CkptSectionType::kVecKeyLocDelta)) {
+                        delta_keys = key_loc_.load_section(
+                            std::span<const std::byte>(dls.payload.data(),
+                                                       dls.payload.size()));
                     }
                 }
+                if (!delta_keys) keys_ok = false;  // 旧版 delta：回退反查
                 return true;
             });
         coverage = walk.coverage;
@@ -654,6 +699,9 @@ SealedSegmentVectorPlugin<SealedT>::load_component(
     chain_ = ChainState{expected_base_wm, coverage, next_seq};
     delta_.set_window(coverage);
     clear_delta_log();
+    key_loc_.set_journal_window(coverage);
+    key_loc_.clear_journal();
+    key_loc_from_ckpt_ = keys_ok;
     dirty_.store(false, std::memory_order_relaxed);
     return result;
 }
@@ -666,7 +714,25 @@ SealedSegmentVectorPlugin<SealedT>::open(const plugin::OpenContext& ctx) {
     auto r = load_component(dir_, ctx.committed_base_watermark,
                             ctx.committed_chain_seq);
     watermark_ = r.loaded ? r.watermark : 0;
-    replay_gate_ = r.loaded ? r.watermark : static_cast<std::uint64_t>(-1);
+    // S45：key+LSN 定位表。S45-A：首选检查点自带的 key 段（不依赖 docmap）；
+    // 旧检查点缺 key 段时回退：sealed / 窗口只存 ord——经 docmap 反查当前
+    // 存活版本。open 早于任何写入，调用线程即单写者。
+    if (!key_loc_from_ckpt_) key_loc_.rebuild(
+        [this](const std::function<void(std::uint64_t)>& emit) {
+            if (auto seg = sealed_.load(std::memory_order_acquire);
+                seg && seg->opened()) {
+                for (std::uint64_t i = 0, n = seg->size(); i < n; ++i) {
+                    emit(seg->record_at(i).ord);
+                }
+            }
+            if (auto w = window_.load(std::memory_order_acquire)) {
+                for (std::uint32_t id = 0, n = static_cast<std::uint32_t>(w->size());
+                     id < n; ++id) {
+                    emit(w->node_ord(id));
+                }
+            }
+        },
+        docs_);
     rebase_needed_.store(!r.loaded, std::memory_order_relaxed);
     return plugin::PluginStatus::kOk;
 }
@@ -675,6 +741,8 @@ template <typename SealedT>
 plugin::FlushResult
 SealedSegmentVectorPlugin<SealedT>::flush(const plugin::FlushRequest& req) {
     plugin::FlushResult res;
+    // S45：覆盖水位之下的墓碑可修剪（独占维护上下文，串行道暂停）。
+    key_loc_.prune_tombs_below(req.watermark);
     const bool cap_hit = config_.max_delta_chain > 0 &&
                          chain_.next_seq > config_.max_delta_chain;
     const bool window_hit = config_.rebase_min_docs > 0 &&

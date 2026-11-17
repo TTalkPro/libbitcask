@@ -189,6 +189,9 @@ bool apply_docmap_delta_section_v2(Index& docmap,
 //   count vbyte; 每条 ord-gap vbyte | len vbyte | bytes
 // 只收 [from, to) 内 live 且 meta 非空的 ord。返回是否有条目（无则 caller
 // 不写段——无 meta 部署零字节开销）。
+// S45：增量 / 全量保存的行与 meta 上界（应用序 ≠ LSN 序，见各调用点）。
+constexpr std::uint64_t kNoUpperOrd = ~std::uint64_t{0};
+
 bool encode_docmap_meta_section(const Index& docmap, std::uint64_t from,
                                 std::uint64_t to, std::vector<std::byte>& out) {
     std::vector<std::byte> rows_buf;
@@ -312,9 +315,13 @@ bool save_docmap_base(Index& docmap, std::string_view dir,
                reinterpret_cast<const std::byte*>(buf.data()) + buf.size()));
     // V5 meta：全部 live ord 的 meta 随 base 落盘（此前只活在内存，重开即丢
     // → 带 filter 的检索恒空）。无 meta 部署不写段。
+    // S45：上界取「无穷」而非 watermark——应用序 ≠ LSN 序，保存时可能已有
+    // ord ≥ watermark 的行先行应用；行段（serialize_docmap）本就写全部 live
+    // 行，meta 必须与之同集，否则这些行重开后丢 meta（同 LSN 重放对 docmap
+    // 是 no-op，不会补回）。
     {
         std::vector<std::byte> mb;
-        if (encode_docmap_meta_section(docmap, 0, watermark, mb)) {
+        if (encode_docmap_meta_section(docmap, 0, kNoUpperOrd, mb)) {
             sw.add(sc::CkptSectionType::kDocmapMeta, std::move(mb));
         }
     }
@@ -353,8 +360,11 @@ bool save_docmap_delta(Index& docmap, std::string_view dir,
         std::uint64_t rows = 0;
         std::uint64_t prev_ord = 0;
         bool ok = true;
+        // S45：上界取「无穷」——保存时已先行应用的 ord ≥ watermark 行也写入
+        // （与 base 同集；下一个窗口会再写一次，载入幂等）。向量插件重开时
+        // 经 docmap 反查节点 key 重建 key+LSN 定位表，依赖此完整性。
         docmap.for_each_live_in(
-            from, watermark,
+            from, kNoUpperOrd,
             [&](std::uint64_t ord, std::string_view ext,
                 const DocSlot& slot) {
                 if (ext.size() > 0xFFFF) { ok = false; return; }
@@ -395,7 +405,7 @@ bool save_docmap_delta(Index& docmap, std::string_view dir,
     // 行先落再 set_meta）。窗口内无 meta 则不写段。
     {
         std::vector<std::byte> mb;
-        if (encode_docmap_meta_section(docmap, from, watermark, mb)) {
+        if (encode_docmap_meta_section(docmap, from, kNoUpperOrd, mb)) {
             sw.add(sc::CkptSectionType::kDocmapMetaDelta, std::move(mb));
         }
     }

@@ -35,10 +35,15 @@ SearchCache::get(const CacheKey& key) const {
 }
 
 void SearchCache::put(const CacheKey& key, std::vector<bm25::SearchResult> results,
-                      std::vector<std::string> terms) {
+                      std::vector<std::string> terms, std::uint64_t observed_gen) {
     if (max_entries_ == 0) return;
 
     std::unique_lock lock(mutex_);
+    // S45-6：计算开始后发生过失效 → 结果可能基于旧快照，拒收。
+    if (observed_gen != kAnyGen &&
+        observed_gen != gen_.load(std::memory_order_relaxed)) {
+        return;
+    }
 
     const std::uint64_t now =
         use_clock_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -74,6 +79,7 @@ void SearchCache::put(const CacheKey& key, std::vector<bm25::SearchResult> resul
 
 void SearchCache::invalidate() {
     std::unique_lock lock(mutex_);
+    gen_.fetch_add(1, std::memory_order_release);
     lru_list_.clear();
     map_.clear();
     term_index_.clear();  // S13-P8
@@ -94,10 +100,11 @@ void SearchCache::remove_entry_locked(std::list<ListNode>::iterator it) {
 
 void SearchCache::invalidate_terms(
     std::span<const std::string_view> changed_terms) {
-    if (changed_terms.empty()) return;
-
     std::unique_lock lock(mutex_);
-    if (map_.empty()) return;
+    // S45-6：先进代号——即便无条目 / 变更词为空（调用方空缓存时的快路径传
+    // 空集），写入已改变索引，进行中的计算即可能陈旧。
+    gen_.fetch_add(1, std::memory_order_release);
+    if (changed_terms.empty() || map_.empty()) return;
 
     // S13-P8：经反向索引直取受害条目——O(变更词 + 受害条目×其词数)，
     // 替代 O(全部条目×词) 的双重扫描（每写一次、持独占锁的热路径）。

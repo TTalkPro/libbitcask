@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include "bitcask/codec.hpp"
+#include "bitcask/string_hash.hpp"
 #include "bitcask/data_file.hpp"
 #include "bitcask/detail/path_utf8.hpp"
 #include "bitcask/detail/scanner.hpp"
@@ -41,7 +42,16 @@ void IndexAuthority::advance_fold_epoch() noexcept {
 }
 
 std::uint32_t IndexAuthority::increment_file_id() noexcept {
-    return biggest_file_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto id = biggest_file_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+    // 新分配的文件（active roll / merge 输出）登记「已应用落点 = 0」：一致
+    // 切面据此把它的 data 水位钳到真正应用过的记录末尾。此前新文件在首条
+    // 记录应用前没有登记项，capture_commit_cut 不钳，水位取文件当前大小——
+    // 已追加、尚未经权威应用的首批记录被 manifest 声明为「run 已覆盖」，
+    // 崩溃后 tail 补行据水位跳过，KV 丢写（AutoCheckpointOnRoll 偶发）。
+    // 不持 writer_mu_ 的调用方才分配文件 id（roll / merger），取锁无环。
+    std::scoped_lock lock(writer_mu_);
+    applied_end_.try_emplace(id, 0);
+    return id;
 }
 
 std::uint32_t IndexAuthority::increment_file_id_at_least(std::uint32_t id) noexcept {
@@ -101,6 +111,7 @@ void IndexAuthority::install_live(
 PutResult IndexAuthority::apply_put(
     std::string_view key, std::uint32_t file_id, std::uint32_t total_size,
     std::uint64_t offset, std::uint64_t tstamp, std::uint64_t ord) {
+    if (pre_apply_hook_) [[unlikely]] pre_apply_hook_();  // 测试缝（锁外）
     std::unique_lock lock(writer_mu_);
     auto prior = state_.probe_for_write(key);
     if (prior.status == OkiState::LocateStatus::kUnavailable) {
@@ -371,6 +382,22 @@ bool IndexAuthority::rebuild_from_data(std::string_view dir,
         return false;
     };
     bool sink_ok = true;
+    // 账本模式的 tail 区界：manifest 声明的各文件 data 水位（之内 = run 已覆盖）。
+    const bool replay_tail = publish_state == 0 && state_.loaded();
+    std::unordered_map<std::uint32_t, std::uint64_t> tail_ends;
+    if (replay_tail) {
+        for (const auto& [f, e] : state_.manifest_data_wms()) tail_ends[f] = e;
+    }
+    if (publish_state == 0) {  // 抽检结论只属于账本模式（全量重建不覆盖它）
+        ledger_view_consistent_ = true;
+        ledger_view_probes_ = 0;
+    }
+    // 水位抽检：每个文件水位之内的最后一条记录的 key（见
+    // last_ledger_view_consistent）。
+    std::unordered_map<std::uint32_t, std::string> probe_key_of_file;
+    // 每个文件本次扫描到的有效末尾——新视图恰好覆盖到这里（扫描全程持
+    // writer_mu_，之后追加的记录必经 apply_* 才进视图）。
+    std::unordered_map<std::uint32_t, std::uint64_t> scanned_ends;
     for (const auto& entry : *entries) {
         const auto fid = static_cast<std::uint32_t>(entry.tstamp);
         (void)increment_file_id_at_least(fid);
@@ -380,12 +407,22 @@ bool IndexAuthority::rebuild_from_data(std::string_view dir,
         if (!df) return fail();
         fileops::CommittedFoldOptions fopts;
         fopts.keep_batch_values = false;
+        std::uint64_t scanned_end = 0;
+        fopts.out_last_valid_end = &scanned_end;
         auto folded = fileops::fold_committed(
             *df,
             [&](const codec::DataRecordView& view, std::uint64_t offset,
                 std::uint32_t total_size) {
                 advance_ord(view.ord);
                 if (!sink_ok) return;
+                if (replay_tail) {
+                    if (auto it = tail_ends.find(fid);
+                        it != tail_ends.end() && offset + total_size <= it->second) {
+                        probe_key_of_file[fid].assign(
+                            reinterpret_cast<const char*>(view.key.data()),
+                            view.key.size());
+                    }
+                }
                 const bool tomb = view.type == format::RecordType::kTombstone;
                 const RowLoc loc{fid, total_size, offset, view.tstamp};
                 if (!tomb) {
@@ -408,6 +445,7 @@ bool IndexAuthority::rebuild_from_data(std::string_view dir,
             fopts);
         df->close();
         if (!folded || !sink_ok) return fail();
+        scanned_ends[fid] = scanned_end;
     }
 
     // ---- 第 2 遍：胜出行 → 账本（+ 视图行 / tail 补行）----
@@ -415,11 +453,14 @@ bool IndexAuthority::rebuild_from_data(std::string_view dir,
     // 账本模式（open 收尾）：已载视图保持原样，但 manifest data 水位之后的
     // tail（崩溃丢失的 memdelta）必须补进视图——否则 data 在、索引无，账本
     // 却已计入。只检查 tail 区内的胜出者，逐个与组合视图比对（流式，不攒）。
-    const bool replay_tail = publish_state == 0 && state_.loaded();
-    std::unordered_map<std::uint32_t, std::uint64_t> tail_ends;
-    if (replay_tail) {
-        for (const auto& [f, e] : state_.manifest_data_wms()) tail_ends[f] = e;
-    }
+    struct ProbeWinner {
+        bool seen = false;
+        std::uint64_t ord = 0;
+        bool tomb = false;
+    };
+    std::unordered_map<std::string, ProbeWinner, StringHash, std::equal_to<>> probes;
+    for (const auto& [f, k] : probe_key_of_file) probes.try_emplace(k);
+    probe_key_of_file.clear();
     const bool pq = state_.point_query_enabled();
     const auto replay_one = [&](std::string_view key, std::uint64_t ord,
                                 bool tomb, const RowLoc& loc) {
@@ -444,8 +485,11 @@ bool IndexAuthority::rebuild_from_data(std::string_view dir,
             return;
         }
         if (tomb) {
-            // 墓碑只需抵消视图里的活行；视图无此 key 时无事可做。
-            if (prior.status != OkiState::LocateStatus::kHit || prior.tomb) return;
+            // 视图无此 key：缺席即删除语义，无事可做。视图是活行 → 抵消；
+            // 视图是**更旧的墓碑** → 同样补行，推进墓碑 LSN。此前这一支直接
+            // 返回，崩溃恢复后 locate 会报偏旧的墓碑 LSN（删除状态对、LSN
+            // 错），索引侧按 key+LSN 裁决时会把中间版本误判为「OKI 更旧」。
+            if (prior.status != OkiState::LocateStatus::kHit) return;
             state_.append_update(key, ord, true, nullptr, loc.file_id, end);
         } else {
             state_.append_update(key, ord, false, &loc);
@@ -461,6 +505,11 @@ bool IndexAuthority::rebuild_from_data(std::string_view dir,
             ++rebuilt.active_keys;
             rebuilt.key_bytes += key.size();
             ++live_rows;
+        }
+        if (!probes.empty()) {
+            if (auto it = probes.find(key); it != probes.end()) {
+                it->second = ProbeWinner{true, ord, tomb};
+            }
         }
         if (publish_state == 2 && !tomb) {
             view_rows.push_back(
@@ -506,6 +555,24 @@ bool IndexAuthority::rebuild_from_data(std::string_view dir,
         }
     }
 
+    // 水位抽检（tail 已补完，视图应与 data 胜出版本一致）。
+    if (replay_tail && pq) {
+        for (const auto& [key, w] : probes) {
+            if (!w.seen) continue;
+            const auto r = state_.locate(key);
+            using LS = OkiState::LocateStatus;
+            if (r.status == LS::kUnavailable) continue;
+            ++ledger_view_probes_;
+            const bool ok = w.tomb
+                ? (r.status == LS::kMiss || (r.status == LS::kHit && r.tomb))
+                : (r.status == LS::kHit && !r.tomb && r.ord == w.ord);
+            if (!ok) {
+                ledger_view_consistent_ = false;
+                break;
+            }
+        }
+    }
+
     ledger_ = std::move(rebuilt);
     // registry 关闭时会保存 biggest+1 作为进程内防碰撞水位；该值不是
     // 持久真相。从 data 全量重建时必须收回到实际最大 data file id，
@@ -543,7 +610,11 @@ bool IndexAuthority::rebuild_from_data(std::string_view dir,
               [](auto& a, auto& b) { return a.file_id < b.file_id; });
     if (!snapshot_valid(meta, snapshot.fstats)) return fail();
     const auto cover_ord = meta.next_ord;
-    applied_end_.clear();  // 新视图的落点由 data 扫描界定
+    // 新视图的落点由 data 扫描界定：以扫描末尾作为各文件的已应用落点。
+    // 此前直接 clear——运行期受控重建后 active 文件失去登记项，一致切面
+    // 不再钳它的水位，扫描之后追加、尚未应用的记录会被 manifest 误声明为
+    // 已覆盖（与新文件首条记录同一类缺口）。
+    applied_end_ = std::move(scanned_ends);
     state_.degrade_for_rebuild();
     // 新视图是全 v3、具备点查能力：必须在释放写序闸门**之前**开启点查。
     // 否则被挡在 writer_mu_ 外的写者会在「已发布、点查未开」的窗口里探测

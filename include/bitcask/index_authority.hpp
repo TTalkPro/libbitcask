@@ -136,6 +136,30 @@ public:
                                                 bool may_write = true) {
         return rebuild_from_data(dir, /*publish_state=*/0, may_write);
     }
+    // 最近一次 rebuild_ledger_from_data 的视图抽检结果：manifest 声明的各
+    // 文件 data 水位是否属实。每个文件取水位之内的**最后一条**记录，tail
+    // 补完后比对视图与 data 胜出版本——同一文件内记录按追加序应用到权威，
+    // 末条在视图里 ⟹ 之前的都在。false = manifest 高估了覆盖（旧版本的
+    // capture_commit_cut 缺陷会写出这种 manifest），调用方应从 data 全量重建。
+    // 视图对抽检 key 不可判定（未开点查 / 坏块）时不作结论，记为 true。
+    [[nodiscard]] bool last_ledger_view_consistent() const noexcept {
+        return ledger_view_consistent_;
+    }
+    // 测试缝：apply_put 入口（取 writer_mu_ 之前）回调——用于把写者停在
+    // 「data 已追加、尚未应用到权威」的窗口。须在任何写者运行前设置。
+    void set_pre_apply_hook_for_test(std::function<void()> fn) {
+        pre_apply_hook_ = std::move(fn);
+    }
+    // 测试缝：删掉某文件的已应用落点登记——模拟旧版本「新文件无登记项、
+    // 一致切面不钳水位」的缺陷，用于构造高估覆盖的 manifest。
+    void drop_applied_end_for_test(std::uint32_t file_id) {
+        std::scoped_lock lock(writer_mu_);
+        applied_end_.erase(file_id);
+    }
+    // 测试 / 诊断：最近一次抽检比对的 key 数。
+    [[nodiscard]] std::size_t last_ledger_view_probes() const noexcept {
+        return ledger_view_probes_;
+    }
     // 只读目录/离线升级专用：完整账本 + 内存点查视图，不写 run/manifest。
     [[nodiscard]] bool rebuild_memory_from_data(std::string_view dir) {
         return rebuild_from_data(dir, /*publish_state=*/2, /*may_write=*/false);
@@ -194,6 +218,9 @@ private:
     // 本进程经权威应用的各文件最大落点（记录末字节）。一致切面用它钳制
     // data 水位：已写入但尚未应用的在途记录必须落在水位之后（交给重放）。
     std::unordered_map<std::uint32_t, std::uint64_t> applied_end_;
+    std::function<void()> pre_apply_hook_;  // 测试缝
+    bool ledger_view_consistent_ = true;   // 见 last_ledger_view_consistent
+    std::size_t ledger_view_probes_ = 0;
     std::atomic<bool> ready_{false};
     std::atomic<std::uint64_t> next_ord_{0};
     std::atomic<std::uint32_t> biggest_file_id_{0};

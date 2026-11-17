@@ -6,10 +6,12 @@
 //（prepare/on_put/flush/open）；S19 起由 Cask 直持（S18 期经 SearchLayer
 // 委托，shim 已降级为测试夹具）——外部 API 面零变化。
 //
-// === 线程模型（与原 SearchLayer 文本域一致，C1）===
-//   单写者（reducer：apply_text/apply_job/on_delete/组件 save/load）+
-//   多读者（查询线程）。fields_（shared_mutex 管 map 结构，InvertedIndex
-//   本体自带分片并发）、doc_texts_（内置 mutex）、cache_（自带锁）。
+// === 线程模型（S45-4）===
+//   多写者：索引池 N 个分片线程并发 on_put/on_delete（不同 key；同 key 串行），
+//   每分片写自己的 building 段（段内单写者）；key 定位表 key_loc_mu_、
+//   doc_texts_（内置 mutex）、cache_（自带锁）、段集 list_mu_ 承担共享态。
+//   独占维护（flush/compact/段合并/重建）经宿主 run_serialized 在本库应用
+//   暂停期执行。多读者（查询线程）经 load+pin 并发读各段。
 //
 // === 依赖注入 ===
 //   const DocTable&：查询面只读身份表（live/翻译/meta 过滤）。
@@ -98,13 +100,18 @@ public:
     [[nodiscard]] std::uint64_t watermark() const override {
         return watermark_;
     }
-    plugin::PluginStatus close() override {
-        stop_builders();  // S27-4 P2:幂等;排干后停线程
-        return plugin::PluginStatus::kOk;
+    plugin::PluginStatus close() override { return plugin::PluginStatus::kOk; }
+    // S45-4：分片线程同步应用，无内部异步队列——读屏障钩子为空操作。
+    void drain() override {}
+    // S45-4：不同 key 的事件在分片线程上并发到达（每分片一个 building 段，
+    // 段内单写者）；同 key 串行由宿主保证。
+    [[nodiscard]] Concurrency concurrency() const override {
+        return Concurrency::kSharded;
     }
-    // S27-4 P2:读屏障钩子(宿主 prepare_search 调)。
-    void drain() override { drain_builders(); }
-    ~TextPlugin() override { stop_builders(); }
+    // S45-4：建 n 个分片 building 段（open 时据 OpenContext::shards 调；须早于
+    // 任何并发应用；此后结构不变，查询线程只读遍历安全）。
+    void set_shards(unsigned n);
+    ~TextPlugin() override = default;
     [[nodiscard]] bool wants_prepare() const override { return true; }
     [[nodiscard]] plugin::PreparedPtr
     prepare(const plugin::PutEvent& e) const override {
@@ -140,42 +147,21 @@ public:
     }
     // S16-2 前置条件：宿主已先 apply docmap——本插件只做 BM25 侧。
     void on_put(const plugin::PutEvent& e, plugin::PreparedPtr prep) override {
-        // S27-4 P2:builder 模式下路由派发(refresh 可见性,drain 保
-        // read-your-writes);B=0 内联(历史行为)。压实触发在 reducer 侧
-        // (builder 不可 compact——遍历他人 building 的 tbb map 与并发 add
-        // 不兼容)。
+        // S45-4：分片线程内联应用到本分片的 building 段（段内单写者）。
+        BuildingSlot& slot = slot_for(e.shard);
         if (auto* sp = static_cast<TextPrepared*>(prep.get())) {
-            if (!builders_.empty()) {
-                BuilderJob bj;
-                bj.job = std::move(sp->job);
-                dispatch_job(std::move(bj));
-            } else {
-                apply_job(sp->job);
-            }
-            maybe_auto_compact_reducer();
+            apply_job_in(slot, sp->job);
             return;
         }
         if (e.doc && !e.doc->fields.empty()) {
             // 多字段但 prep 为空 = prepare 抛过异常（宿主已计数）→ 空 job
             // 降级，apply_job 空 job 守卫兜底。
             const search::ReduceJob empty{};
-            apply_job(empty);
+            apply_job_impl_in(slot, empty, std::string{});
             return;
         }
-        // 单文本（原 OnWriteEntry 语义）：内联时 reducer 内分析;builder
-        // 模式下连分析一起下放 builder(额外并行度)。
         const std::string_view t = e.doc ? e.doc->text : e.value;
-        if (!builders_.empty()) {
-            BuilderJob bj;
-            bj.is_raw = true;
-            bj.raw_key.assign(e.key);
-            bj.raw_text.assign(t);
-            bj.raw_ord = e.ord;
-            dispatch_job(std::move(bj));
-        } else {
-            apply_text(e.key, e.ord, t);
-        }
-        maybe_auto_compact_reducer();
+        apply_text_in(slot, e.key, e.ord, t);
     }
     void on_delete(const plugin::DeleteEvent& e) override {
         // kNoPriorOrd = 删不存在的 key：宿主未动 docmap，历史语义为 no-op。
@@ -483,50 +469,33 @@ private:
     // libbitcask.md)。清单为空/不存在 → 空集是正确状态,返回 true。
     [[nodiscard]] bool init_segment_set(std::string_view dir, bool loaded);
 
-    // ---- S27-4 P2:BuilderPool(设计 docs/design/s27-4-dwpt-design.md)----
-    // 生产者恒为 reducer 单线程(on_put 路由),每 builder 一条 SPSC 队列
-    // (mutex+cv,容量上限 = 背压)。B=0(默认)= 内联,零行为变化。
-    struct BuilderJob {
-        search::ReduceJob job;        // 多字段(map 阶段已分析)
-        std::string       raw_key;    // 单文本路径(builder 内分析)
-        std::string       raw_text;
-        std::uint64_t     raw_ord = 0;
-        bool              is_raw = false;
+    // ---- S45-4：分片 building 段（取代 S27-4 BuilderPool）----
+    // 每个宿主分片一个 building 段：分片线程是该段的唯一写者；查询经收集器
+    // load+pin 并发读（与 building_ 同款契约）。building_ 保留给无宿主的
+    // standalone/测试路径与 rebuild_index。
+    using BuildingSlot = ::bitcask::detail::AtomicSharedPtr<search::SealedSegment>;
+    struct ShardSlot {
+        BuildingSlot building;
     };
-    struct Builder {
-        std::thread             th;
-        std::mutex              mu;
-        std::condition_variable cv_push;  // 生产者等空位
-        std::condition_variable cv_idle;  // 消费者取任务 / drain 等静止
-        std::deque<BuilderJob>  q;
-        bool busy = false;
-        bool stop = false;
-        bool waiting = false;  // builder 睡在 cv_idle(生产者据此免 notify)
-        // S27-4 P3:每 builder 一个 building 段(设计 §1——不共享可变态,
-        // 段内单写者;查询与 building_ 同款 load+pin)。
-        ::bitcask::detail::AtomicSharedPtr<search::SealedSegment> building;
-    };
-    static constexpr std::size_t kBuilderQueueCap = 1024;
-    std::vector<std::unique_ptr<Builder>> builders_;
-    std::size_t rr_next_ = 0;  // round-robin 游标(reducer 单线程)
-    void start_builders();
-    void stop_builders();
-    void builder_loop(Builder& b);
-    void dispatch_job(BuilderJob&& j);
-    void drain_builders();
+    std::vector<std::unique_ptr<ShardSlot>> shard_slots_;
+    BuildingSlot& slot_for(unsigned shard) {
+        return shard_slots_.empty()
+                   ? building_
+                   : shard_slots_[shard % shard_slots_.size()]->building;
+    }
+    // 自动压实请求在途（经 run_serialized 独占执行；防每次应用重复投递）。
+    std::atomic<bool> compact_pending_{false};
     // S27-4 P3:apply/封口按「目标 building 槽」参数化——inline 路径用
     // building_,builder 线程用自己的槽。公开 apply_* 保持旧签名(恒指
     // building_,既有测试/standalone 语义不变)。
-    using BuildingSlot = ::bitcask::detail::AtomicSharedPtr<search::SealedSegment>;
     void apply_text_in(BuildingSlot& slot, std::string_view key,
                        std::uint64_t ord, std::string_view text);
     void apply_job_in(BuildingSlot& slot, search::ReduceJob& job);
     void apply_job_impl_in(BuildingSlot& slot, const search::ReduceJob& job,
                            std::string&& doc_text);
     void flush_building_slot(BuildingSlot& slot);
-    // reducer 侧压实触发(builder 模式下 apply 路径的 maybe_auto_compact
-    // 为 no-op——compact 需 builder 静止;见各自注释)。
-    void maybe_auto_compact_reducer();
+    // S45-7：flush_building 的组合并（若干分片 building 段 → 一个段文件）。
+    bool merge_building_slots(const std::vector<BuildingSlot*>& group);
     // S30-P3:checkpoint 静止点的段合并(策略见 text_plugin_config.hpp
     // merge_fan_in)。契约:reducer 上下文 + builder 已排干(与
     // flush_building 同点)——合并期间无并发写/删,查询经 pin 并发安全。

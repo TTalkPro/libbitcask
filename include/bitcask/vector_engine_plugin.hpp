@@ -36,8 +36,20 @@ public:
     normalize_for_write(std::span<const float> input,
                         std::vector<float>& norm_buf) const = 0;
 
-    // 写（reducer 单写者;防御:无引擎/dim 不符直接忽略）。
+    // 写（串行道单写者;防御:无引擎/dim 不符直接忽略）。S45:ord 到达序任意,
+    // 本方法**不判重**——on_put 先经 key+LSN 定位表裁决再调用（重放 / 链载入
+    // 等直调场景由调用方保证不重复）。
     virtual void insert(std::uint64_t ord, std::span<const float> v) = 0;
+
+    // S45-4:串行插件(HNSW 单写者),只收带向量的写。删除也要收:不改图
+    // (软删经 docmap is_live 过滤),但登记 key+LSN 墓碑——防止更旧的写
+    // 乱序后到 / 重放时把已删 key 的向量插回(见 detail/vector_key_loc.hpp)。
+    [[nodiscard]] Concurrency concurrency() const override {
+        return Concurrency::kSerial;
+    }
+    [[nodiscard]] bool accepts_put(const plugin::PutEvent& e) const override {
+        return e.doc != nullptr && !e.doc->vec.empty();
+    }
 
     // 查询（线程安全,多读者）。ef 是「搜索宽度」旋钮:HNSW = ef,IVF =
     // nprobe（各实现自行映射;0 = 引擎默认）。

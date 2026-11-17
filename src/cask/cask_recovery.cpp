@@ -458,108 +458,14 @@ std::expected<void, CaskFault> Cask::load_authority_from_disk() {
         return 0;  // 快照不认识的文件(快照后新建/merge 产物)→ 全量 fold
     };
 
-    // S3/S18-8:search 恢复期攒批重放——批内**并行 prepare**（纯函数契约
-    // 允许任意线程；PutEvent.replay 让 TextPlugin 对单文本也走 prepare
-    // 并行分析）+ **fold 序串行 on_put 广播**（宿主 docmap 行先落，
-    // doc_len=0 占位——与活写路径 S16-2 同构）。幂等由各结构 ord 水位
-    // 自门兜底（InvertedIndex::add_doc / HnswIndex::insert / docmap LWW），
-    // 重叠区重放安全。插入序 == fold 序 → 与逐条 recover 结果一致。
-    // 墓碑前必 flush 以保相对序。
-    constexpr std::size_t kRecoverBatch = 1024;
-    struct ReplayDoc {
-        std::string key;
-        std::uint64_t ord = 0;
-        std::string text;
-        std::uint32_t file_id = 0;
-        std::uint64_t offset = 0;
-        std::uint32_t total_sz = 0;
-        std::uint64_t tstamp = 0;
-        std::vector<float> vector;
-        std::vector<std::pair<std::string, std::string>> fields;
-        std::vector<std::byte> meta;  // V5 结构化 meta（空 = 无）
-    };
-    std::vector<ReplayDoc> recover_batch;
-    // ①（s13-review §P1 后续）：统计本次恢复重分析的文档数——它度量的是
-    // 「若现在不回存 checkpoint，下次崩溃要白付多少重放」。计所有喂进
-    // recover 的文档（含被索引 ord 自门丢弃的重叠区：分析成本已经付了，
-    // 回存快照能让下次 fold 起点前移、免掉这部分）。
-    std::size_t recovered_docs = 0;
-    // S14-6：恢复期遇到 field.schema 无法解析的悬空 FieldId 的计数（掉电
-    // 窗口：intern 只 fflush 未 fsync，schema 尾条映射可能晚于数据丢失）。
-    // 跳过该字段（与"丢弃"同级的降级）+ 循环后聚合告警，可观测不刷屏。
-    std::size_t dangling_field_ids = 0;
-    auto flush_recover = [&] {
-        if (!search_on || recover_batch.empty()) return;
-        recovered_docs += recover_batch.size();
-        const std::size_t n = recover_batch.size();
-        const std::size_t np = plugins_.size();
-        // 视图物化（owning → FieldKV/DocView/PutEvent；容器预 size，批内
-        // 地址稳定——ev 持 &dv 指针）。
-        struct ItemViews {
-            std::vector<plugin::FieldKV> fkv;
-            plugin::DocView dv;
-            plugin::PutEvent ev;
-        };
-        std::vector<ItemViews> views(n);
-        for (std::size_t i = 0; i < n; ++i) {
-            auto& d = recover_batch[i];
-            auto& v = views[i];
-            v.fkv.reserve(d.fields.size());
-            for (auto& [fn, fv] : d.fields) v.fkv.emplace_back(fn, fv);
-            v.dv.text = d.text;
-            v.dv.fields = v.fkv;
-            v.dv.vec = d.vector;
-            v.ev.ord = d.ord;
-            v.ev.key = d.key;
-            v.ev.doc = &v.dv;
-            v.ev.loc = plugin::RecordLoc{d.file_id, d.offset, d.total_sz};
-            v.ev.tstamp = d.tstamp;
-            v.ev.replay = true;  // S18-8
-        }
-        // S3：批内并行 prepare（TBB 全局线程池，无 per-batch 线程创建）。
-        std::vector<std::vector<plugin::PreparedPtr>> preps(n);
-        tbb::parallel_for(std::size_t{0}, n, [&](std::size_t i) {
-            preps[i].resize(np);
-            for (std::size_t pi = 0; pi < np; ++pi) {
-                if (plugins_[pi]->wants_prepare()) {
-                    preps[i][pi] = plugins_[pi]->prepare(views[i].ev);
-                }
-            }
-        });
-        // fold 序串行 apply：宿主 docmap 行先落（doc_len=0，BM25 侧回填），
-        // 再按注册序广播 on_put——与活写路径 reduce_index_entry 同构。
-        for (std::size_t i = 0; i < n; ++i) {
-            auto& d = recover_batch[i];
-            docmap_->put_doc(d.key, d.ord,
-                             index::DocSlot{
-                                 index::DocLoc{.offset   = d.offset,
-                                               .file_id  = d.file_id,
-                                               .total_sz = d.total_sz},
-                                 d.tstamp, /*doc_len=*/0});
-            // V5 meta 与活写路径（reduce_index_entry）同序回填：此前 fold
-            // 重放整段丢弃 meta → 重开后 eval_meta 恒 false，带 filter 的
-            // 检索一律空集。
-            if (!d.meta.empty()) docmap_->set_meta(d.ord, d.meta);
-            for (std::size_t pi = 0; pi < np; ++pi) {
-                plugins_[pi]->on_put(views[i].ev, std::move(preps[i][pi]));
-            }
-        }
-        recover_batch.clear();
-    };
-
-    // R3:每个 data file 的 fold 抽成独立单元 fold_one(e)。纯 KV 恢复
-    // （search_layer==null）可并行——见函数尾部的并行调度。串行语义下
-    // 「按 tstamp 升序后写覆盖前写」仍成立；并行下 keydir 冲突解析按
-    // (file_id, tstamp, offset) LWW 与到达序无关（put_overwrite），fstats
-    // 全程无锁原子累加，cold-start 期 keyfolders_==0 故新 key 直入分片
-    // entries（不触 meta_mu_），256 分片提供真并发。
+    // R3:pass 1——逐文件 fold：推进 file_id、截断 torn tail。不再承担 search
+    // 重放（S45 移到 pass 2），故 search 模式也可按文件并行。
     auto fold_one =
         [&](const fileops::DataFileEntry& e) -> std::expected<void, CaskFault> {
         // 把 keydir 的 biggest_file_id 推到至少这个文件的 id——保证后续
         // 分配新 file_id 时不会跟磁盘上已有的文件冲突。
         (void)authority_->increment_file_id_at_least(
             static_cast<std::uint32_t>(e.tstamp));
-
         const std::uint64_t fold_start =
             snap_loaded ? wm_of(static_cast<std::uint32_t>(e.tstamp)) : 0;
         // S43-8：恢复恒 fold(data)。tolerate_crc_errors=true 让单条
@@ -575,86 +481,12 @@ std::expected<void, CaskFault> Cask::load_authority_from_disk() {
         std::uint64_t last_valid_end = 0;
         // S35 原子批语义由 fileops::fold_committed 统一实现（批成员收口后
         // 才放行；区间不完整时 fold 停在批头，随后截断）。
-        auto apply_rec = [&](const codec::DataRecordView& view,
-                             std::uint64_t offset, std::uint32_t total_size) {
-                if (view.type == format::RecordType::kTombstone) {
-                    // S33：携带 ord + 缺席即插 sentinel（并行恢复到达序无关，
-                    // 与恢复裁决一致）。
-                    // S43-9：search 全量 fold 只恢复索引侧；权威账本随后
-                    // 用 rebuild_from_data 从同一份 data 精确重建。
-                    if (search_on) {
-                        // S3:墓碑前 flush 攒批，保「文档↔墓碑」相对序（否则墓碑
-                        // 可能先于其要删的 batch 内文档插入而被无效化）。
-                        // S18-8：墓碑重放 = 宿主 docmap remove（Index 自记账：
-                        // 脏位 + S14-4 门限删除日志）。**不广播 on_delete**——
-                        // 历史语义（原 recover_tomb）：恢复期不扣减倒排统计
-                        //（统计基线随 ckpt 快照恢复，重放墓碑只翻 live）。
-                        flush_recover();
-                        docmap_->remove(bytes_to_view(view.key), view.ord);
-                    }
-                    return;
-                }
-                (void)total_size;
-                (void)offset;
-                if (search_on) {
-                    auto dv = codec::decode_doc_value(std::span<const std::byte>(view.value));
-                    // V3.3:带向量的文档即使 text 为空也要恢复(否则
-                    // Index 无该 ord,live 过滤会把它当死文档)。
-                    // P3b:量化落盘(vec_quantized)也算带向量。
-                    const bool dv_has_vec = dv && (dv->has_vector || dv->vec_quantized);
-                    // S14-6：纯命名字段文档（text 空、无向量）也必须恢复——
-                    // 否则连 docmap 都缺该 ord，live 过滤把它当死文档，
-                    // bm25.fields 重建无从谈起。
-                    // V5：仅带 meta 的文档同理（活写路径无条件登记 docmap）。
-                    if (dv && (!dv->text.empty() || dv_has_vec ||
-                               dv->has_fields || dv->has_meta)) {
-                        // S3:攒进批，满 kRecoverBatch 即并行处理。ReplayDoc 持
-                        // owning 拷贝（fold 缓冲会复用，view 不可跨记录留存）。
-                        ReplayDoc rd;
-                        rd.key.assign(reinterpret_cast<const char*>(view.key.data()),
-                                      view.key.size());
-                        rd.ord      = view.ord;
-                        rd.text.assign(reinterpret_cast<const char*>(dv->text.data()),
-                                       dv->text.size());
-                        rd.file_id  = static_cast<std::uint32_t>(e.tstamp);
-                        rd.offset   = offset;
-                        rd.total_sz = total_size;
-                        rd.tstamp   = view.tstamp;
-                        // P3b:doc_vector_f32 统一处理 f32 与 int8 量化两种落盘
-                        // （内部 memcpy 未对齐安全 / dequant）。
-                        rd.vector   = codec::doc_vector_f32(*dv);
-                        // S14-6：命名字段还原（FieldId → 名字经 field.schema），
-                        // 使 fold 重放与活写路径同构（per-field + catch-all）。
-                        // 此前 dv->fields 被整段丢弃——增量窗口（ckpt 不健康
-                        // 时全库）的字段索引在恢复后不存在且被下次 ckpt 固化。
-                        if (dv->has_fields) {
-                            rd.fields.reserve(dv->fields.size());
-                            for (const auto& f : dv->fields) {
-                                auto fname = field_schema_.name_of(f.id);
-                                if (!fname) {
-                                    ++dangling_field_ids;
-                                    continue;
-                                }
-                                rd.fields.emplace_back(
-                                    std::move(*fname),
-                                    std::string(
-                                        reinterpret_cast<const char*>(
-                                            f.value.data()),
-                                        f.value.size()));
-                            }
-                        }
-                        if (dv->has_meta) {
-                            rd.meta.assign(dv->meta.begin(), dv->meta.end());
-                        }
-                        recover_batch.push_back(std::move(rd));
-                        if (recover_batch.size() >= kRecoverBatch) flush_recover();
-                    }
-                }
-        };
+        auto noop_rec = [](const codec::DataRecordView&, std::uint64_t,
+                           std::uint32_t) {};
         fileops::CommittedFoldOptions fopts;
         fopts.out_last_valid_end = &last_valid_end;
         fopts.start_offset = fold_start;
-        auto fr = fileops::fold_committed(*df, apply_rec, {}, fopts);
+        auto fr = fileops::fold_committed(*df, noop_rec, {}, fopts);
         if (!fr) {
             return std::unexpected(err(CaskError::kBadCrc, e.data_path));
         }
@@ -678,81 +510,254 @@ std::expected<void, CaskFault> Cask::load_authority_from_disk() {
         return {};
     };
 
-    // 调度：search_layer 存在时 HNSW 单写者 + BM25 插入须串行 → 走串行 fold，
-    // 但 S3 在串行 fold 内把 recover_doc 攒批、analyze 并行化（见 flush_recover）。
-    // 纯 KV 恢复且文件数 > 1 时并行 fold——worker 各取一文件，原子计数器分发，
+    // 调度：文件数 > 1 时并行 fold——worker 各取一文件，原子计数器分发，
     // 结果数组收集错误后统一传播。
     const std::size_t nfiles = entries->size();
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 4;
-    const std::size_t nworkers =
-        std::min<std::size_t>(nfiles, hw);
-
-    if (search_on || nfiles <= 1 || nworkers <= 1) {
+    const std::size_t nworkers = std::min<std::size_t>(nfiles, hw);
+    if (nfiles <= 1 || nworkers <= 1) {
         for (const auto& e : *entries) {
             if (auto r = fold_one(e); !r) return std::unexpected(r.error());
         }
-        flush_recover();  // S3:落最后一个不满批
-        if (dangling_field_ids > 0) {
-            log_warn("recovery: skipped " +
-                     std::to_string(dangling_field_ids) +
-                     " field value(s) with dangling field id "
-                     "(field.schema tail lost; affected fields stay "
-                     "unindexed until rewritten)");
-        }
-        // ①（s13-review §P1 后续）：恢复期重分析量超阈值时立即回存
-        // checkpoint——否则重建成果只在内存，下次干净 close/merge 前再崩一次
-        // 就全价重付。触发条件用**重分析文档数**而非「是否全量 fold」：ckpt
-        // 健康但陈旧时 fold 起点旧、尾部重放大，同样值得回存；空库/小尾部
-        // 增量不值得付大库整体序列化（回存成本 ∝ 索引总量，省下的 ∝ 重放量）。
-        // 精细节奏走 checkpoint() API（②）。此刻 index lane 未注册、无并发
-        // 写者，调用线程直接序列化即安全。best-effort：失败仅降级下次启动
-        // 速度，不阻断 open。只读 / merge_only 不写（不持 write.lock）。
-        constexpr std::size_t kPostRecoveryCkptMinDocs = 1000;
-        if (search_on && recovered_docs >= kPostRecoveryCkptMinDocs &&
-            opts_.read_write && !opts_.merge_only) {
-            // S14-7：经成对入口（fold 后链可能有效 → delta 回存更省）。
-            auto wms0 = collect_snapshot_watermarks();
-            std::vector<std::byte> kd;
-            if (!save_search_ckpt_paired(dirname_ + "/" + kSearchCkptName,
-                                         authority_->peek_next_ord(), wms0,
-                                         kd)) {
-                log_warn("post-recovery search checkpoint save failed "
-                         "(next open will re-fold)");
+    } else {
+        std::vector<std::expected<void, CaskFault>> results(nfiles);
+        std::atomic<std::size_t> next{0};
+        // RAII join guard：emplace_back 抛异常时已创建的 worker 会被析构自动
+        // join——裸 vector<std::thread> 在此场景会让 joinable 线程触发
+        // std::terminate，把可恢复的资源耗尽升级为崩溃。
+        struct JoiningPool {
+            std::vector<std::thread> threads;
+            ~JoiningPool() {
+                for (auto& t : threads) if (t.joinable()) t.join();
             }
+        } pool;
+        pool.threads.reserve(nworkers);
+        for (std::size_t t = 0; t < nworkers; ++t) {
+            pool.threads.emplace_back([&] {
+                for (;;) {
+                    std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= nfiles) break;
+                    results[i] = fold_one((*entries)[i]);
+                }
+            });
         }
-        finish_oki_recovery(snap_loaded, recovery->snap_next_ord);  // S33-4
-        return {};
+        for (auto& t : pool.threads) t.join();
+        for (auto& r : results) {
+            if (!r) return std::unexpected(r.error());
+        }
     }
 
-    std::vector<std::expected<void, CaskFault>> results(nfiles);
-    std::atomic<std::size_t> next{0};
-    // RAII join guard：emplace_back 抛异常时已创建的 worker 会被析构自动
-    // join——裸 vector<std::thread> 在此场景会让 joinable 线程触发
-    // std::terminate，把可恢复的资源耗尽升级为崩溃。join 幂等（joinable
-    // 检查），与下方显式 join 共存无重复 join。
-    struct JoiningPool {
-        std::vector<std::thread> threads;
-        ~JoiningPool() {
-            for (auto& t : threads) if (t.joinable()) t.join();
-        }
-    } pool;
-    pool.threads.reserve(nworkers);
-    for (std::size_t t = 0; t < nworkers; ++t) {
-        pool.threads.emplace_back([&] {
-            for (;;) {
-                std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-                if (i >= nfiles) break;
-                results[i] = fold_one((*entries)[i]);
-            }
-        });
-    }
-    for (auto& t : pool.threads) t.join();
+    // S33-4：权威收尾（补 tail 行 / 必要时重建）。S45 起先于 search 重放——
+    // 重放要拿 OKI 做 key + LSN 裁决。
+    finish_oki_recovery(snap_loaded, recovery->snap_next_ord);
+    if (!search_on) return {};
 
-    for (auto& r : results) {
-        if (!r) return std::unexpected(r.error());
+    // pass 2（S45-5）：search 恢复重放。按文件序 fold，任务经与在线写相同的
+    // 分片执行器应用（同 key 按 fold 序串行、不同 key 并行 prepare+apply，
+    // 向量走串行道）。正确性：规则 R（OKI）丢弃已删除 / 已被覆盖的旧版本；
+    // 当前版本由 docmap / 倒排 / 向量各自的 key+LSN 守卫判重（重叠区与乱序
+    // 完成皆幂等）。起点：replay_floor 之下的记录必已在各组件 ckpt 里，直接
+    // 跳过（S45 之前每次重开都全量重新分词）。
+    const std::uint64_t replay_floor = search_on ? recovery->replay_floor : 0;
+    IndexPool* rpool = nullptr;
+    IndexLane* replay_lane = nullptr;
+    if (search_on) {
+        dispatcher_.set_plugins(plugins_);
+        dispatcher_.docmap = docmap_.get();
+        // S45：规则 R（严格版）——本 pass 在 finish_oki_recovery 之后执行，
+        // OKI 已补齐 tail，是**终态**：只有「OKI 命中、非墓碑、LSN 恰好相等」
+        // 的版本才是当前版本，其余（已删除 / 已被覆盖 / OKI 不认的）一律丢弃
+        // （不分析、不进 docmap、不进任何插件）。
+        // 不能沿用在线版的「OKI 版本更旧则放行」：在线时那是任务先于 OKI
+        // 安装的防御；重放时 OKI 已是终态，「更旧」只说明它记的墓碑 LSN 不
+        // 精确——实测崩溃恢复后 OKI 对已删 key 可能报更早的墓碑 LSN（删除
+        // 状态正确、LSN 偏旧），按旧规则会把中间版本放进来变成死节点，向量
+        // 定位表快照又不存墓碑，下一次重开再插一遍。
+        // OKI 不可判定（重建失败降级）时放行，退由各结构的 key+LSN 守卫兜底。
+        dispatcher_.is_current = [this](std::string_view k, std::uint64_t o) {
+            if (!index_arbitration_.load(std::memory_order_relaxed) || !authority_) {
+                return true;
+            }
+            const auto r = authority_->state().locate(k);
+            using LS = oki::OkiState::LocateStatus;
+            if (r.status == LS::kUnavailable) return true;
+            return r.status == LS::kHit && !r.tomb && r.ord == o;
+        };
+        dispatcher_.on_error = [this] { on_index_worker_error(); };
+        if (registry_) {
+            rpool = registry_->index_pool();
+            LaneCallbacks cb;
+            cb.shard_apply = [this](IndexTask& t, unsigned sh) {
+                return dispatcher_.shard_apply(t, sh);
+            };
+            if (dispatcher_.has_serial()) {
+                cb.serial_apply = [this](IndexTask& t) { dispatcher_.serial_apply(t); };
+            }
+            cb.on_error = [this] { on_index_worker_error(); };
+            replay_lane = rpool->register_lib(std::move(cb), 0);
+        }
     }
-    finish_oki_recovery(snap_loaded, recovery->snap_next_ord);  // S33-4
+    // 任何退出路径（含 fold 失败早退）都必须排空并注销重放车道——其回调
+    // 引用本 Cask。
+    struct ReplayLaneGuard {
+        IndexPool*& pool;
+        IndexLane*& lane;
+        void finish() {
+            if (pool && lane) {
+                (void)pool->flush(lane);
+                (void)pool->unregister_lib(lane);
+                lane = nullptr;
+            }
+        }
+        ~ReplayLaneGuard() { finish(); }
+    } replay_guard{rpool, replay_lane};
+    auto submit_replay = [&](IndexTask t) {
+        t.replay = true;
+        if (rpool && replay_lane) {
+            rpool->submit(replay_lane, std::move(t));
+            return;
+        }
+        // 无共享池（理论不可达：search 模式 open 强制 registry）：调用线程直跑。
+        try {
+            if (dispatcher_.shard_apply(t, index_shard_of(t.key())) ==
+                ApplyResult::kForwardSerial) {
+                dispatcher_.serial_apply(t);
+            }
+        } catch (...) {
+            on_index_worker_error();
+        }
+    };
+    // ①（s13-review §P1 后续）：统计本次恢复重放的文档数——度量「若现在不
+    // 回存 checkpoint，下次崩溃要白付多少重放」。
+    std::size_t recovered_docs = 0;
+    // S14-6：恢复期遇到 field.schema 无法解析的悬空 FieldId 的计数（掉电
+    // 窗口：intern 只 fflush 未 fsync，schema 尾条映射可能晚于数据丢失）。
+    // 跳过该字段（与"丢弃"同级的降级）+ 循环后聚合告警，可观测不刷屏。
+    std::size_t dangling_field_ids = 0;
+    for (const auto& e : *entries) {
+        auto df = fileops::DataFile::open(e.data_path,
+                                           fileops::DataFile::Mode::kRead,
+                                           /*sync*/ false, /*mmap_enabled*/ false);
+        if (!df) {
+            return std::unexpected(io_fault(df.error().errnum, e.data_path));
+        }
+        auto apply_rec = [&](const codec::DataRecordView& view,
+                             std::uint64_t offset, std::uint32_t total_size) {
+                if (view.type == format::RecordType::kTombstone) {
+                    // S45-5：墓碑重放 = 删除任务（docmap 只删更旧版本、插件
+                    // on_delete 按 ord 判重）。同 key 与其文档同分片 FIFO，
+                    // 相对序天然保持（原「墓碑前 flush 攒批」不再需要）。
+                    // S43-9：权威账本随后用 rebuild_from_data 从同一份 data 重建。
+                    if (search_on && view.ord >= replay_floor) {
+                        submit_replay(IndexTask::make(
+                            IndexOp::Delete,
+                            std::string_view(
+                                reinterpret_cast<const char*>(view.key.data()),
+                                view.key.size()),
+                            view.ord, {}, 0, 0, 0, view.tstamp, 0));
+                    }
+                    return;
+                }
+                if (search_on && view.ord >= replay_floor) {
+                    auto dv = codec::decode_doc_value(std::span<const std::byte>(view.value));
+                    // V3.3:带向量的文档即使 text 为空也要恢复(否则
+                    // Index 无该 ord,live 过滤会把它当死文档)。
+                    // P3b:量化落盘(vec_quantized)也算带向量。
+                    const bool dv_has_vec = dv && (dv->has_vector || dv->vec_quantized);
+                    // S14-6：纯命名字段文档（text 空、无向量）也必须恢复。
+                    // V5：仅带 meta 的文档同理（活写路径无条件登记 docmap）。
+                    if (dv && (!dv->text.empty() || dv_has_vec ||
+                               dv->has_fields || dv->has_meta)) {
+                        auto t = IndexTask::make(
+                            IndexOp::Add,
+                            std::string_view(
+                                reinterpret_cast<const char*>(view.key.data()),
+                                view.key.size()),
+                            view.ord,
+                            std::string_view(
+                                reinterpret_cast<const char*>(dv->text.data()),
+                                dv->text.size()),
+                            static_cast<std::uint32_t>(e.tstamp), offset,
+                            total_size, view.tstamp, 0);
+                        // P3b:doc_vector_f32 统一处理 f32 与 int8 量化两种落盘。
+                        t.vec = codec::doc_vector_f32(*dv);
+                        // S14-6：命名字段还原（FieldId → 名字经 field.schema），
+                        // 打包进 fields_store（同活写路径 make_doc_add_task）。
+                        if (dv->has_fields) {
+                            std::vector<std::pair<std::string, std::span<const std::byte>>>
+                                named;
+                            named.reserve(dv->fields.size());
+                            std::size_t total = 0;
+                            for (const auto& f : dv->fields) {
+                                auto fname = field_schema_.name_of(f.id);
+                                if (!fname) {
+                                    ++dangling_field_ids;
+                                    continue;
+                                }
+                                total += fname->size() + f.value.size();
+                                named.emplace_back(std::move(*fname), f.value);
+                            }
+                            std::vector<char> store;
+                            store.reserve(total);
+                            std::vector<std::pair<std::string_view, std::string_view>> views;
+                            views.reserve(named.size());
+                            for (const auto& [name, val] : named) {
+                                const auto name_off = store.size();
+                                store.insert(store.end(), name.begin(), name.end());
+                                const auto val_off = store.size();
+                                store.insert(store.end(),
+                                             reinterpret_cast<const char*>(val.data()),
+                                             reinterpret_cast<const char*>(val.data()) +
+                                                 val.size());
+                                views.emplace_back(
+                                    std::string_view(store.data() + name_off, name.size()),
+                                    std::string_view(store.data() + val_off, val.size()));
+                            }
+                            t.fields_store = std::move(store);
+                            t.fields = std::move(views);
+                        }
+                        if (dv->has_meta) {
+                            t.meta.assign(dv->meta.begin(), dv->meta.end());
+                        }
+                        ++recovered_docs;
+                        submit_replay(std::move(t));
+                    }
+                }
+        };
+        fileops::CommittedFoldOptions fopts;
+        fopts.start_offset =
+            snap_loaded ? wm_of(static_cast<std::uint32_t>(e.tstamp)) : 0;
+        if (!fileops::fold_committed(*df, apply_rec, {}, fopts)) {
+            return std::unexpected(err(CaskError::kBadCrc, e.data_path));
+        }
+        df->close();
+    }
+    replay_guard.finish();  // 排空重放车道（全部重放任务已应用）
+    dispatcher_.is_current = nullptr;  // 在线车道注册时重新装配
+    if (dangling_field_ids > 0) {
+        log_warn("recovery: skipped " + std::to_string(dangling_field_ids) +
+                 " field value(s) with dangling field id "
+                 "(field.schema tail lost; affected fields stay "
+                 "unindexed until rewritten)");
+    }
+    // ①（s13-review §P1 后续）：恢复期重分析量超阈值时立即回存
+    // checkpoint——否则重建成果只在内存，下次干净 close/merge 前再崩一次
+    // 就全价重付。触发条件用**重分析文档数**而非「是否全量 fold」。此刻
+    // index lane 未注册、无并发写者，调用线程直接序列化即安全。best-effort：
+    // 失败仅降级下次启动速度，不阻断 open。只读 / merge_only 不写。
+    constexpr std::size_t kPostRecoveryCkptMinDocs = 1000;
+    if (recovered_docs >= kPostRecoveryCkptMinDocs && opts_.read_write &&
+        !opts_.merge_only) {
+        // S14-7：经成对入口（fold 后链可能有效 → delta 回存更省）。
+        auto wms0 = collect_snapshot_watermarks();
+        std::vector<std::byte> kd;
+        if (!save_search_ckpt_paired(dirname_ + "/" + kSearchCkptName,
+                                     authority_->peek_next_ord(), wms0, kd)) {
+            log_warn("post-recovery search checkpoint save failed "
+                     "(next open will re-fold)");
+        }
+    }
     return {};
 }
 
@@ -805,6 +810,16 @@ void Cask::finish_oki_recovery(bool snap_loaded,
     bool ok = !rebuild_state ? authority_->rebuild_ledger_from_data(dirname_, opts_.read_write)
               : read_only    ? authority_->rebuild_memory_from_data(dirname_)
                              : authority_->rebuild_from_data(dirname_);
+    // 兜底：manifest 声明的 data 水位高估了 run 的覆盖（旧版本 OKI 提交切面
+    // 缺陷写出的 manifest——roll 新文件的首批记录已追加未应用就被算作覆盖），
+    // 账本模式补 tail 会跳过这些记录 → KV 丢写。抽检不过即从 data 全量重建。
+    if (ok && !rebuild_state && !authority_->last_ledger_view_consistent()) {
+        log_warn("oki manifest overstates data coverage; rebuilding the "
+                 "key index from data");
+        rebuild_state = true;
+        ok = read_only ? authority_->rebuild_memory_from_data(dirname_)
+                       : authority_->rebuild_from_data(dirname_);
+    }
     if (!ok) {
         log_warn("oki authority recovery failed (oki disabled until "
                  "next open)");
@@ -860,6 +875,9 @@ Cask::load_recovery_snapshots() {
                 plugin::OpenContext ctx;
                 ctx.dir = dirname_;
                 ctx.host = &plugin_host_;
+                // S45-4：分片数 = 共享索引池的分片线程数（分片插件据此预建
+                // 每分片单写者结构；恢复重放同样按 key 哈希落分片）。
+                ctx.shards = index_shard_count();
                 ctx.committed_base_watermark  = entry.base_watermark;
                 ctx.committed_chain_watermark = entry.chain_watermark;
                 ctx.committed_chain_seq       = entry.chain_seq;
@@ -902,12 +920,15 @@ Cask::load_recovery_snapshots() {
             index::DocmapReplayHook{};
         bool all_components_ok = true;
         std::uint64_t min_chain_wm = UINT64_MAX;
+        // S45-5：重放起点 = min(各组件实际覆盖水位)，任一未载入（水位 0）即 0。
+        std::uint64_t replay_wm = UINT64_MAX;
         // S18-2：docmap 组件由宿主直载（keydir 链重放钩子只在这里生效）。
         {
             const auto& entry = current_manifest_.entries[0];
             auto dr = index::load_docmap(*docmap_, dirname_,
                                          entry.base_watermark,
                                          entry.chain_seq, hook_arg);
+            replay_wm = std::min(replay_wm, dr.loaded ? dr.watermark : 0);
             if (dr.loaded) {
                 min_chain_wm = std::min(min_chain_wm, dr.watermark);
                 docmap_chain_ = bitcask::ManifestEntry{
@@ -928,6 +949,7 @@ Cask::load_recovery_snapshots() {
             const auto& entry =
                 current_manifest_.entries[static_cast<std::size_t>(*comp)];
             const std::uint64_t pw = p->watermark();
+            replay_wm = std::min(replay_wm, pw);
             if (pw == entry.chain_watermark) {
                 min_chain_wm = std::min(min_chain_wm, pw);
             } else {
@@ -941,6 +963,8 @@ Cask::load_recovery_snapshots() {
         if (min_chain_wm == UINT64_MAX) {
             min_chain_wm = 0;  // 没有任何组件成功
         }
+        recovery.replay_floor =
+            replay_wm == UINT64_MAX ? 0 : plugin::replay_floor_of(replay_wm);
         // 「全组件健康」才走字节水位快路径；任一组件 .prev 回退 → 字节水位
         // 不可信，退全量 fold。保守以 all_components_ok 近似「非 .prev」
         // （load 内部已用 manifest base_wm 校验），再叠加 snap_loaded 双重门。

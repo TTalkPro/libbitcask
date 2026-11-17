@@ -381,20 +381,21 @@ TEST(Hnsw, SelfQueryTop1) {
     EXPECT_GE(ok * 37, n - 37);  // 允许极少数并列向量擦边
 }
 
-// ord 水位幂等:重放重叠区丢弃。
-TEST(Hnsw, OrdWatermarkIdempotent) {
+// S45:ord 不再要求单调、图本身不判重——乱序到达的向量必须全部入图(旧
+// 单调水位门会静默丢掉 ord 3)。幂等由向量插件的 key+LSN 裁决承担。
+TEST(Hnsw, OutOfOrderInsertsAreAllKept) {
     HnswConfig cfg;
     cfg.dim = 4;
     HnswIndex idx(cfg);
     const float a[4] = {1, 0, 0, 0};
     const float b[4] = {0, 1, 0, 0};
     idx.insert(5, a);
-    idx.insert(5, b);   // 同 ord 重放 → 丢弃
-    idx.insert(3, b);   // 低于水位 → 丢弃
-    EXPECT_EQ(idx.size(), 1u);
-    auto got = idx.search(std::span<const float>(a, 4), 1, 16);
+    idx.insert(3, b);
+    EXPECT_EQ(idx.size(), 2u);
+    EXPECT_EQ(idx.max_inserted_ord(), 5u);
+    auto got = idx.search(std::span<const float>(b, 4), 1, 16);
     ASSERT_EQ(got.size(), 1u);
-    EXPECT_EQ(got[0].ord, 5u);
+    EXPECT_EQ(got[0].ord, 3u);
 }
 
 // live 过滤:结果侧滤死,死节点仍可作路标。

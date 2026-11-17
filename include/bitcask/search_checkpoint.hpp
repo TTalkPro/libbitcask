@@ -82,6 +82,13 @@ enum class CkptSectionType : std::uint16_t {
     // ——与其此前「从不落盘」的行为等价，不构成数据洞。
     kDocmapMeta       = 20,  // docmap.ckpt base：全部 live 且 meta 非空的 ord
     kDocmapMetaDelta  = 21,  // docmap.ckpt.d<seq>：窗口 [from, wm) 内同上
+    // S45：向量插件（HNSW / IVF / DiskANN）的 key + LSN 定位表——让向量组件像
+    // BM25 段一样自带 key，重开时不再经 docmap 反查节点 key。布局（两段同）：
+    //   count u64; 每条 ord u64 | klen u32 | key 字节
+    // 仅追加段型、文件版本不动：旧读端静默忽略 → 向量照常载入，只是不认 key
+    // （与其此前行为等价，不构成数据洞）。
+    kVecKeyLoc        = 22,  // vec/ivf/diskann.ckpt base：定位表快照（不含墓碑）
+    kVecKeyLocDelta   = 23,  // *.ckpt.d<seq>：窗口内新登记的 (ord, key)
 };
 
 // 写入用:caller 持有 payload 字节。

@@ -52,6 +52,19 @@ std::vector<float> axis_vec(std::size_t dim, std::size_t axis) {
 
 }  // namespace
 
+// S45-A：带 key 的写事件（key = "k<ord>"，与 FakeDocTable 一致）。
+template <typename P>
+void put_keyed(P& p, std::uint64_t ord, const std::vector<float>& v) {
+    plugin::DocView dv;
+    dv.vec = std::span<const float>(v.data(), v.size());
+    plugin::PutEvent ev;
+    ev.doc = &dv;
+    const std::string key = "k" + std::to_string(ord);
+    ev.key = key;
+    ev.ord = ord;
+    p.on_put(ev, nullptr);
+}
+
 // base（fresh 首 flush）→ delta（窗口）→ 重开链重放 → 检索三段等价。
 TEST(DiskannPlugin, BaseDeltaReopenRoundTrip) {
     const fs::path dir = fs::temp_directory_path() / "bitcask_dap_rt";
@@ -69,7 +82,7 @@ TEST(DiskannPlugin, BaseDeltaReopenRoundTrip) {
     // 4 条 → 首 flush = base（fresh open rebase_needed）。
     for (std::uint64_t i = 0; i < 4; ++i) {
         auto v = axis_vec(dim, i);
-        a.insert(i, std::span<const float>(v.data(), dim));
+        put_keyed(a, i, v);  // S45-A：经 on_put（带 key）——定位表随检查点落盘
     }
     plugin::FlushRequest req;
     req.watermark = 4;
@@ -82,7 +95,7 @@ TEST(DiskannPlugin, BaseDeltaReopenRoundTrip) {
     // 2 条 → delta（链 seq 2）；窗口与 sealed 双路可查。
     for (std::uint64_t i = 4; i < 6; ++i) {
         auto v = axis_vec(dim, i);
-        a.insert(i, std::span<const float>(v.data(), dim));
+        put_keyed(a, i, v);  // S45-A：经 on_put（带 key）——定位表随检查点落盘
     }
     req.watermark = 6;
     ASSERT_EQ(a.flush(req).status, plugin::PluginStatus::kOk);
@@ -120,10 +133,20 @@ TEST(DiskannPlugin, BaseDeltaReopenRoundTrip) {
         EXPECT_EQ((*r)[0].key, "k" + std::to_string(i));
     }
 
-    // 重放幂等门：ord ≤ watermark 的事件（fold 重叠区）被丢弃。
+    // S45：重放幂等由 key+LSN 定位表承担（S45-A 起随检查点落盘重建）。
     auto v0 = axis_vec(dim, 0);
-    b.insert(3, std::span<const float>(v0.data(), dim));
-    EXPECT_EQ(b.window_size(), 2u) << "重放事件必须被幂等门丢弃";
+    plugin::DocView dv;
+    dv.vec = std::span<const float>(v0.data(), dim);
+    plugin::PutEvent ev;
+    ev.doc = &dv;
+    ev.key = "k3";
+    ev.ord = 3;
+    EXPECT_TRUE(b.key_loc_from_ckpt_for_test()) << "S45-A：定位表来自检查点 key 段";
+    b.on_put(ev, nullptr);  // S45：已在 sealed 里的版本重放 → key+LSN 裁决跳过
+    EXPECT_EQ(b.window_size(), 2u) << "重放事件必须被 key+LSN 裁决丢弃";
+    ev.ord = 9;  // 同 key 更新版本
+    b.on_put(ev, nullptr);
+    EXPECT_EQ(b.window_size(), 3u);
     fs::remove_all(dir);
 }
 

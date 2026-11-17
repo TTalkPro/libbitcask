@@ -246,15 +246,76 @@ TEST(VectorPlugin, RebaseWindowSurvivesReopen) {
     fs::remove_all(dir);
 }
 
-// 重放幂等：同 ord 重插被水位门丢弃（fold 重叠区安全的结构基础）。
-TEST(VectorPlugin, ReplayInsertIdempotent) {
+// S45：key+LSN 裁决（乱序版本 / 同版本重放 / 删除后更旧的写）——HNSW 图本身
+// 不判重，幂等全由插件的 key 定位表承担。
+namespace {
+struct VecEv {
+    std::string key;
+    std::vector<float> v;
+    plugin::DocView dv;
+    plugin::PutEvent ev;
+    VecEv(std::string k, std::uint64_t ord, std::vector<float> vec)
+        : key(std::move(k)), v(std::move(vec)) {
+        dv.vec = v;
+        ev.key = key;
+        ev.ord = ord;
+        ev.doc = &dv;
+    }
+};
+}  // namespace
+
+TEST(VectorPlugin, KeyLsnArbitratesOutOfOrderAndReplay) {
     FakeDocTable dt;
     vec::VectorPlugin p(make_cfg(4, meta::VectorMetric::kDot), dt);
-    const float v[4] = {1, 0, 0, 0};
-    p.insert(0, {v, 4});
-    p.insert(1, {v, 4});
+    const std::vector<float> v{1, 0, 0, 0};
+    auto put = [&](const char* k, std::uint64_t ord) {
+        VecEv e(k, ord, v);
+        p.on_put(e.ev, nullptr);
+    };
+    put("a", 5);
+    put("a", 3);  // 乱序：更旧版本后到 → 跳过
+    EXPECT_EQ(p.size(), 1u);
+    EXPECT_EQ(p.key_ord_for_test("a"), 5u);
+    put("a", 5);  // 同版本重放 → 跳过
+    EXPECT_EQ(p.size(), 1u);
+    put("a", 9);  // 更新版本 → 入图（旧节点留作死节点，is_live 过滤）
     EXPECT_EQ(p.size(), 2u);
-    p.insert(0, {v, 4});  // 重放：ord ≤ 水位 → 丢弃
-    p.insert(1, {v, 4});
+    EXPECT_EQ(p.key_ord_for_test("a"), 9u);
+
+    p.on_delete(plugin::DeleteEvent{12, "b", plugin::kNoPriorOrd});
+    put("b", 10);  // 删除(12)之后才到的更旧写 → 不得复活
     EXPECT_EQ(p.size(), 2u);
+    put("b", 14);  // 删除之后的新写 → 入图
+    EXPECT_EQ(p.size(), 3u);
+    p.on_delete(plugin::DeleteEvent{11, "b", plugin::kNoPriorOrd});  // 过期删除
+    EXPECT_EQ(p.key_ord_for_test("b"), 14u);
+}
+
+// S45：重开后 key 定位表经 docmap 反查重建——已在图里的版本重放即跳过。
+TEST(VectorPlugin, ReopenRebuildsKeyLocationsFromGraph) {
+    FakeDocTable dt;  // ord_to_ext(ord) = "k<ord>"
+    vec::VectorPlugin p(make_cfg(4, meta::VectorMetric::kDot), dt);
+    const std::vector<float> v{1, 0, 0, 0};
+    for (std::uint64_t ord : {7u, 2u, 5u}) {  // 乱序入图
+        VecEv e("k" + std::to_string(ord), ord, v);
+        p.on_put(e.ev, nullptr);
+    }
+    EXPECT_EQ(p.size(), 3u);
+    const fs::path dir = fs::temp_directory_path() / "bitcask_vecplugin_keyloc";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    plugin::OpenContext ctx;
+    const std::string dir_s = dir.string();
+    ctx.dir = dir_s;
+    ASSERT_EQ(p.open(ctx), plugin::PluginStatus::kOk);  // 无 ckpt：图保持，表重建
+    EXPECT_EQ(p.key_ord_for_test("k5"), 5u);
+    for (std::uint64_t ord : {2u, 5u, 7u}) {  // 恢复重放：全部已在图里
+        VecEv e("k" + std::to_string(ord), ord, v);
+        p.on_put(e.ev, nullptr);
+    }
+    EXPECT_EQ(p.size(), 3u);
+    VecEv fresh("k3", 3, v);  // 新 key → 入图
+    p.on_put(fresh.ev, nullptr);
+    EXPECT_EQ(p.size(), 4u);
+    fs::remove_all(dir);
 }

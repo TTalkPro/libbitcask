@@ -109,11 +109,19 @@ public:
     // 的 live row/meta/journal 写路径同步淘汰（S42，不再等 compaction），
     // ext2ord 改指新 ord。内部把 next_ord 推到 max(next_ord, ord+1)，
     // 故恢复时按 ord 序回放亦走此方法。线程安全：unique_lock。
-    void put_doc(std::string_view ext_id, DocId docid, const DocSlot& slot);
+    // S45-2：LSN 守卫——ext_id 已有 ord ≥ 本 ord 时不动（更旧版本乱序到达
+    // 丢弃；同 ord 幂等）。返回是否实际登记。
+    bool put_doc(std::string_view ext_id, DocId docid, const DocSlot& slot);
+
+    // S45-2：merge 搬迁——仅当 ext_id 当前版本恰为 ord 时改写其存储定位
+    // （get→put 两步之间被并发写顶替的旧实现会把新版本改回旧 ord）。
+    // 返回是否改写。线程安全：unique_lock。
+    bool relocate(std::string_view ext_id, Lsn ord, const DocLoc& loc);
 
     // 删除：软删 ext_id 当前文档（淘汰 live row）、erase ext2ord。tomb_ord 是
-    // 墓碑 record 自身的 ord（仅用于推进 next_ord）→ 纯 LSN 角色。返回原本
-    // 是否存在。线程安全：unique_lock。
+    // 墓碑 record 自身的 ord（推进 next_ord）。S45-2：只删 ord < tomb_ord 的
+    // 当前版本（墓碑之后的写若已先行应用则本删除过期）。返回是否实际删除。
+    // 线程安全：unique_lock。
     bool remove(std::string_view ext_id, Lsn tomb_ord);
 
     // S16-2：单独回填 doc_len（BM25 token 数）。写路径反转后 DocSlot 由

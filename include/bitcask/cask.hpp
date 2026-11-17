@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <chrono>
 #include <memory>
 #include <shared_mutex>
 #include <condition_variable>  // S29-7:组提交 follower 等待
@@ -63,6 +64,7 @@
 #include "bitcask/text_plugin.hpp"
 #include "bitcask/vector_plugin.hpp"
 #include "bitcask/thread_pool.hpp"
+#include "bitcask/index_dispatch.hpp"  // S45-4：宿主索引分发
 
 namespace bitcask {
 
@@ -327,6 +329,22 @@ struct DocInput {
     std::uint64_t expiry_at = 0;  // S13-D5：per-key 过期时刻（0 = 永不）
 };
 
+// S45-5：索引一致性核对报告（Cask::verify_index_consistency）。诊断用，不在
+// 启动路径上。「索引」以宿主 docmap 为代表（插件写入恒在 docmap 之后、按同
+// 一裁决），权威 = OKI。
+struct IndexConsistencyReport {
+    std::uint64_t kv_live_keys = 0;      // OKI 当前存活 key 数
+    std::uint64_t docmap_live = 0;       // docmap 存活行数
+    std::uint64_t matched = 0;           // docmap 行与 OKI 当前版本（key+ord）一致
+    std::uint64_t version_mismatch = 0;  // docmap 行的 ord ≠ OKI 当前版本 ord
+    std::uint64_t ghost_in_index = 0;    // docmap 有、OKI 无（已删 / 不存在）
+    std::uint64_t missing_in_index = 0;  // OKI 存活但 docmap 无（= kv_live − matched − mismatch）
+    std::vector<std::string> samples;    // 前若干条问题描述
+    [[nodiscard]] bool consistent() const noexcept {
+        return version_mismatch == 0 && ghost_in_index == 0 && missing_in_index == 0;
+    }
+};
+
 struct StatusInfo {
     std::uint64_t key_count = 0;
     std::uint64_t key_bytes = 0;
@@ -334,6 +352,9 @@ struct StatusInfo {
     std::vector<merge::FileStatus> files;
     // indexed worker 抛异常时自增；非零 = 索引可能漂移，搜索结果可能陈旧
     std::uint64_t index_errors = 0;
+    // S45-2：索引应用时被 key+LSN 裁决判为过期而丢弃的写任务数（乱序到达的
+    // 旧版本、已被后续删除覆盖的写）。正常并发写下非零是预期行为。
+    std::uint64_t index_stale_dropped = 0;
     // S13-D8：观测扩展（无索引/不适用时为 0）。
     std::uint64_t hnsw_nodes = 0;            // HNSW 图节点数（含软删死节点）
     std::uint64_t search_cache_entries = 0;  // 查询缓存当前条目数
@@ -900,6 +921,36 @@ public:
     // closed 检查 + flush 索引流水线（submitted ⇒ applied）。未启用搜索
     // 返回 kNoIndex。
     [[nodiscard]] std::expected<void, CaskFault> drain_plugins();
+    // S45-5：索引与权威（OKI）逐 key 一致性核对（先过读屏障）。O(docmap 行数)
+    // 次点查——诊断/离线工具用，勿放热路径。未启用搜索 → kNoIndex。
+    // 注意：值为空且无向量/字段/meta 的文档不进索引（恢复路径口径），会计入
+    // missing_in_index。
+    [[nodiscard]] std::expected<IndexConsistencyReport, CaskFault>
+    verify_index_consistency(std::size_t max_samples = 16);
+    // ---- S45-2 测试接缝（生产代码不得调用）----
+    // 关闭 key+LSN 裁决（对照组：乱序应用下必须观察到幽灵/复活文档）。
+    void set_index_arbitration_for_test(bool on) {
+        index_arbitration_.store(on, std::memory_order_relaxed);
+    }
+    // S45-4：索引提交前随机延迟 [0, max_us] µs（放大并发写同 key 的提交
+    // 乱序窗口，让乱序裁决测试在真并发管线上稳定命中）。0 = 关闭。
+    void set_submit_jitter_for_test(std::uint32_t max_us) {
+        submit_jitter_us_.store(max_us, std::memory_order_relaxed);
+    }
+    // ---- S45-0 测试接缝（生产代码不得调用）----
+    // close 等在途写的超时上界（默认 30s）。
+    void set_close_wait_timeout_for_test(std::chrono::milliseconds t) {
+        close_wait_timeout_ = t;
+    }
+    // 模拟「在途写线程被 kill」：持有期间 writes_in_flight_ 计 1；释放（析构
+    // 返回值）即归还。返回值必须在 Cask 析构前释放。
+    [[nodiscard]] std::shared_ptr<void> pin_write_gate_for_test() {
+        writes_in_flight_.fetch_add(1, std::memory_order_seq_cst);
+        return std::shared_ptr<void>(this, [](void* p) {
+            static_cast<Cask*>(p)->writes_in_flight_.fetch_sub(
+                1, std::memory_order_seq_cst);
+        });
+    }
     // 插件句柄（未启用搜索 = nullptr）。生命周期 = Cask open..close。
     [[nodiscard]] const text::TextPlugin* text_plugin() const {
         return text_.get();
@@ -919,8 +970,14 @@ public:
         return docmap_;
     }
 
+    // 索引读屏障：调用时刻之前分配的全部 LSN 均已应用（S45-3：改为等 LSN
+    // 连续完成前缀，持续写入下不饿死；原「in_flight==0」谓词在持续写入下
+    // 可能长时间不成立）。无界——搜索读己之写依赖（T8）。
     void flush_index() {
-        if (index_pool_ && index_lane_) index_pool_->flush(index_lane_);
+        if (index_pool_ && index_lane_) {
+            (void)index_pool_->wait_lsn(index_lane_,
+                                        authority_->peek_next_ord());
+        }
     }
 
     // fsync active data file。o_sync 模式下退化为 no-op。
@@ -962,9 +1019,8 @@ public:
     //   - KV 路径：merge 与并发 put/remove/get 安全——keydir 重定位是条件
     //     CAS（newest_put=false，S13-F1），收尾对 stuck 文件跳过 unlink 兜底；
     //     get 对 merge unlink 窗口有一次重查重试（S13-F5）。
-    //   - 索引模式：merge 内的 compact/ckpt 序列化经 RunFn 任务在 reducer
-    //     线程内执行（S13-F6，同 RebuildHnsw 先例）——concurrent_hash_map
-    //     的遍历与 add_doc 插入始终同线程串行，无并发窗口。
+    //   - 索引模式：merge 内的 compact/ckpt 序列化经索引池维护线程独占执行
+    //     （S45-4：执行期间本库暂停应用）——段内倒排遍历与并发 add 无交错。
     // 锁要求: caller 须保证同一 dirname 上同时仅一次 merge 在跑。
     [[nodiscard]] std::expected<merge::MergeStats, CaskFault>
     merge(std::vector<std::string> files = {}, std::uint64_t now_sec = 0);
@@ -988,11 +1044,10 @@ public:
     // 保存顺序与 merge 收尾一致（成对性）：先落 keydir 快照（较早水位），
     // 后存 search.ckpt（覆盖必然 ≥ 快照水位）——并发写入下方向安全（下次
     // open 从快照水位重放尾部，重叠区由各索引 ord 自门幂等丢弃）。
-    // 阻塞语义：search.ckpt 序列化经 RunFn 在 reducer 线程按 ord 序执行
-    // （S13-F6：concurrent_hash_map 遍历只允许发生在 reducer），本调用等待
-    // **自己的 RunFn** 完成（其 ord 之前的索引事件此时必然已全部 apply），
-    // 不等整条队列排空——持续写入下等待仍有界。大库序列化可达秒~分钟级，
-    // 期间 reducer 停摆、队列积压（H1 后背压只阻塞提交中的写者）。
+    // 阻塞语义（S45-4）：① 有界等待本调用之前分配的 LSN 全部应用（LSN 前缀
+    // 读屏障，持续写入下不饿死）；② 维护线程独占执行成对保存——期间本库暂停
+    // 应用（写者照常提交，分片队列满后才被背压），覆盖水位 = 暂停时刻的 LSN
+    // 连续完成前缀。两段各 30s 上界，超时返回 kIo。大库序列化可达秒~分钟级。
     // 纯 KV 库（无 search）只落 keydir 快照。
     // 线程安全: **是**。checkpoint 间由内部 ckpt_mu_ 串行；与 put/get 并发
     // 安全（不取 write_mu_）；与 close 并发由 WriteOpGate 收敛（close 等待
@@ -1106,8 +1161,15 @@ private:
 
     // IndexPool 分发闭包的命名方法（原 register_lib 内联 lambda 体提取）。
     // lambda 退化为薄捕获委托——逻辑可独立测试，消除契约测试里的闭包复刻。
-    std::vector<plugin::PreparedPtr> prepare_index_task(const IndexTask& task);
-    void reduce_index_entry(ReorderEntry& entry);
+    // S45-4：宿主索引分发（规则 R 裁决 + docmap + 分片/串行插件扇出）。车道
+    // 回调委托于此；配置在注册车道前完成，之后只读。
+    IndexDispatcher dispatcher_;
+    // S45-2 规则 R（designs/index-pipeline-unordered-design-zh.md §4.1）：写任务
+    // (key, ord) 仅当应用时刻仍是该 key 的最新版本才生效。权威 = OKI（写线程
+    // 先更新 OKI 再提交索引任务 ⇒ 任务到达时权威至少已含它自己）。OKI 不可判定
+    // （受控重建中 / 点查未开）时放行，退由各结构的 LSN 守卫兜底。
+    [[nodiscard]] bool index_put_is_current(std::string_view key,
+                                            std::uint64_t ord) const noexcept;
     void on_index_worker_error() noexcept;
 
     // S14-7：成对保存——search.ckpt（delta 或 base）+ keydir 推进的统一
@@ -1144,6 +1206,9 @@ private:
     bitcask::ManifestEntry docmap_chain_{};
 
     std::atomic<std::uint32_t> writes_in_flight_{0};
+    // S45-0：close() 改为有界轮询，不再 atomic::wait——析构无需 notify
+    // （单线程连续写时每次析构都归零，原 notify_all 是每写一次的白付调用）。
+    // 握手不变：写者先加计数再查 closed_，close 先置 closed_ 再读计数（seq_cst）。
     struct WriteOpGate {
         Cask* cask;
         explicit WriteOpGate(Cask* c) : cask(c) {
@@ -1152,12 +1217,11 @@ private:
         WriteOpGate(const WriteOpGate&) = delete;
         WriteOpGate& operator=(const WriteOpGate&) = delete;
         ~WriteOpGate() {
-            if (cask->writes_in_flight_.fetch_sub(
-                    1, std::memory_order_seq_cst) == 1) {
-                cask->writes_in_flight_.notify_all();
-            }
+            cask->writes_in_flight_.fetch_sub(1, std::memory_order_seq_cst);
         }
     };
+    // S45-0：close 等在途写的上界（默认 30s；测试注入毫秒级以覆盖超时路径）。
+    std::chrono::milliseconds close_wait_timeout_{std::chrono::seconds(30)};
 
     // 按 file_id 缓存的 DataFile 读句柄。read 路径懒打开。
     // 多读者并发，read_cache_mu_ 保护 unordered_map 本身；DataFile 内部
@@ -1238,6 +1302,8 @@ private:
     IndexLane* index_lane_ = nullptr;
     // indexed worker 异常计数器：catch(...) 时 fetch_add(1)；非零 = 索引可能漂移
     std::atomic<std::uint64_t> index_errors_{0};
+    std::atomic<bool> index_arbitration_{true};          // S45-2（测试可关：对照组）
+    std::atomic<std::uint32_t> submit_jitter_us_{0};     // S45-4（仅测试）
 
     // T3: 提交索引任务到 IndexPool（异步索引）。背压由 IndexPool 的有界
     // 队列提供：队列满（capacity 10240）时 submit 内部的 push 阻塞写线程，
@@ -1266,10 +1332,11 @@ private:
     }
 
     // S13-F2: ord 泄漏守卫。写路径 alloc_ord 后、真任务提交前的任何错误
-    // return 都必须给该 ord 补一条 Skip——否则 reducer 的 next_apply_ord
-    // 出现永久空洞，此后 flush/merge/close 全部在 flush_cv_ 上永久阻塞
-    // （一次 ENOSPC 即卡死句柄）。析构时未 disarm 则自动提交 Skip；
-    // 真任务（Add/Delete）或等价 Skip 已覆盖该 ord 后调 disarm()。
+    // return 都必须让该 ord 记完成——否则 LSN 连续完成前缀永久停住，读屏障
+    // （flush_index / 搜索）与 checkpoint 挂住。S45-4：析构时未 disarm 则
+    // complete_index_ord（直接记完成：不排队、不分配、不抛）；真任务
+    // （Add/Delete）已覆盖该 ord 后调 disarm()。以下 P5/P6 记录为历史背景
+    // （彼时补洞靠提交 Skip 任务，可抛 bad_alloc）。
     //
     // P5-MEM-1：析构隐式 noexcept，但 IndexTask::make（buf 分配）与
     // submit_index_task→queue_.push（TBB 有界队列内部分配）均可抛 bad_alloc。
@@ -1294,16 +1361,26 @@ private:
         void disarm() { armed = false; }
         ~OrdSkipGuard() {
             if (!armed) return;
-            try {
-                cask->submit_index_task(
-                    IndexTask::make(IndexOp::Skip, {}, ord, {}, 0, 0, 0, 0, 0));
-            } catch (...) {
-                // ord 泄漏：reducer 该 ord 处留空洞，依赖下游有界超时兜底。
-                cask->log_warn(
-                    "OrdSkipGuard: failed to submit Skip (OOM); ord leaked");
-            }
+            cask->complete_index_ord(ord);
         }
     };
+    // S45-3：失败/不进索引的 LSN 记完成（原各处手工提交 Skip 的收口点）。
+    // noexcept——可在析构函数里调用；内部吞异常（OOM 时 ord 泄漏，依赖下游
+    // 有界等待兜底）。
+    void complete_index_ord(std::uint64_t ord) noexcept;
+    // S45-3：本库索引的 LSN 连续完成前缀——ckpt 覆盖水位必须在**执行时刻**
+    // 由此取得（提交时刻的 peek_next_ord 会把尚未应用的 LSN 计入覆盖，配合
+    // 重放门的「< 水位即已在」语义会丢索引）。无车道（纯 KV / 恢复期）时
+    // 退化为 peek_next_ord。
+    [[nodiscard]] std::uint64_t index_coverage() const;
+    // S45-4：共享索引池的分片数 / key 所属分片（无 registry = 1 / 0）。
+    [[nodiscard]] unsigned index_shard_count() const;
+    [[nodiscard]] unsigned index_shard_of(std::string_view key) const;
+    // S45-4：独占执行 fn（维护线程，按库暂停应用）并有界等待其完成。
+    // 返回 0=超时 / 1=fn 返回 true / 2=fn 返回 false 或抛异常。前置：
+    // index_pool_ && index_lane_。
+    int run_exclusive_and_wait(std::function<bool()> fn,
+                               std::chrono::milliseconds timeout);
 
     // S7-4: 批量搜索公共骨架（去 search_*_batch 三方法的重复）。
     //   ① 空批早退；② 一次 prepare_search()（flush，覆盖全批）；
@@ -1435,6 +1512,9 @@ public:
         // S33-4：快照自身的 next_ord（**链重放之前**捕获）。快照字节水位
         // 跳过的行 ord 全部 < 此值——OKI 缺口检查（wm < 此值 → 重建）用。
         std::uint64_t snap_next_ord = 0;
+        // S45-5：重放起点——replay_floor_of(min(docmap/各插件覆盖水位))；任一
+        // 组件未载入 = 0（全量重放）。fold 跳过 ord 低于它的记录（免重分析）。
+        std::uint64_t replay_floor = 0;
     };
     [[nodiscard]] std::expected<RecoverySnapshots, CaskFault>
     load_recovery_snapshots();

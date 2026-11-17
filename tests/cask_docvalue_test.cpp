@@ -3142,8 +3142,9 @@ TEST(ReadHandleCap, ResolveSemantics) {
     EXPECT_EQ(Cask::resolve_read_handle_cap(1u, 524288u), 1u);
 }
 
-// S12-2：auto-compact 开启下，并发读者 + churn 写者经异步管线（reducer 线程内触发
-// compact）无 data race、结果最终一致、posting 有界。TSan 下为主要护栏。
+// S12-2：auto-compact 开启下，并发读者 + churn 写者经异步管线（S45-4：压实经
+// 独占维护线程执行）无 data race、结果最终一致、posting 有界。TSan 下为主要
+// 护栏；S45-6 起亦守护查询缓存「计算 → put」TOCTOU（曾 ~5% 丢 1~2 篇）。
 TEST_F(CaskDocValueTest, AutoCompactConcurrentReadersNoRace) {
     CaskOptions opts;
     opts.read_write = true;
@@ -3183,7 +3184,11 @@ TEST_F(CaskDocValueTest, AutoCompactConcurrentReadersNoRace) {
     auto sr = (*c)->search_text("hello", 50);
     ASSERT_TRUE(sr);
     EXPECT_EQ(sr->hits.size(), static_cast<std::size_t>(K));   // 最终恰 K 篇 live
-    EXPECT_LT((*c)->text_plugin()->total_postings(), 2000u);  // S27-3 步骤 5 复活
+    // S27-3 步骤 5 复活：posting 有界（不压实 = 3200 版本 × 2 词 = 6400）。
+    // S45-4：压实改为独占维护线程异步执行（应用在分片线程并发），断言时
+    // 最后一轮可能仍在队列里；阈值 kAutoCompactMinDeaths=1024 本身已允许
+    // 两轮压实之间积累 ~(1024+16)×2 posting。上界取 2500：仍远低于 6400。
+    EXPECT_LT((*c)->text_plugin()->total_postings(), 2500u);
     (*c)->close();
 }
 
@@ -4270,9 +4275,23 @@ TEST_F(CaskDocValueTest, CheckpointConcurrentWithWrites) {
     (*c)->close();
 }
 
+// S45-4：自动 checkpoint 是 fire-and-forget 的维护线程作业，flush_index（LSN
+// 读屏障）不等它——测试按「文件在有限时间内出现」断言（旧版借 reducer 数据
+// 流的 RunFn，flush_index 排干即完成）。
+[[maybe_unused]] static bool wait_for_file(const std::filesystem::path& p,
+                                           std::chrono::milliseconds timeout =
+                                               std::chrono::seconds(10)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!std::filesystem::exists(p)) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+}
+
 // S14-1：roll 封口点自动 checkpoint——无 close/merge/手动调用，写满若干
-// 文件后成对 ckpt 文件自动出现（RunFn 在 reducer 落盘，flush_index 排干
-// 即确定完成）；崩溃镜像重开可完整恢复。
+// 文件后成对 ckpt 文件自动出现（S45-4：维护线程异步落盘，按有限时间内出现
+// 断言）；崩溃镜像重开可完整恢复。
 TEST_F(CaskDocValueTest, AutoCheckpointOnRoll) {
     namespace fs = std::filesystem;
     auto opts = v31_opts(0);
@@ -4288,9 +4307,9 @@ TEST_F(CaskDocValueTest, AutoCheckpointOnRoll) {
         ASSERT_TRUE((*c)->put_doc(sv_bytes("ac_" + std::to_string(i)), doc,
                                   static_cast<std::uint32_t>(3000 + i)));
     }
-    (*c)->flush_index();  // 排干 reducer → 在途自动 ckpt RunFn 必已执行
-    EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt"));
-    EXPECT_TRUE(fs::exists(tmpdir_ / "kv.oki.manifest"));
+    (*c)->flush_index();
+    EXPECT_TRUE(wait_for_file(tmpdir_ / "bm25.ckpt"));  // 维护线程异步落盘
+    EXPECT_TRUE(wait_for_file(tmpdir_ / "kv.oki.manifest"));
     {
         auto live = (*c)->search_text("lemon", 500);
         ASSERT_TRUE(live);
@@ -5269,12 +5288,12 @@ TEST_F(CaskDocValueTest, S31AutoCheckpointByOrdDeltaWithoutRoll) {
         ASSERT_TRUE((*c)->put_doc(sv_bytes("ak_" + std::to_string(i)), doc,
                                   static_cast<std::uint32_t>(1000 + i)));
     }
-    // 排干 reducer(fire-and-forget 的 ckpt RunFn 在 reducer 序列内执行)。
     (*c)->flush_index();
-    // 关键断言:无 roll 无 close,ckpt 文件已在盘上。
-    EXPECT_TRUE(fs::exists(tmpdir_ / "bm25.ckpt"))
+    // 关键断言:无 roll 无 close,ckpt 文件在有限时间内落盘(S45-4:自动
+    // checkpoint 在维护线程 fire-and-forget 执行,flush_index 不等它)。
+    EXPECT_TRUE(wait_for_file(tmpdir_ / "bm25.ckpt"))
         << "ord 增量锚点未触发自动 checkpoint";
-    EXPECT_TRUE(fs::exists(tmpdir_ / "index.manifest"));
+    EXPECT_TRUE(wait_for_file(tmpdir_ / "index.manifest"));
 
     // crash-image:未 close 的镜像重开——已 ckpt 的部分免重放,尾部由
     // fold 补,全量可检索。

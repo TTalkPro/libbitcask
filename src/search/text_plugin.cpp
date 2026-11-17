@@ -172,11 +172,13 @@ void TextPlugin::apply_text_in(BuildingSlot& slot, std::string_view key,
         // 跳过**优化**(已见更高版本则免 add);正确性全由下方终检承担。
         {
             std::shared_lock lk(key_loc_mu_);
+            // S45-2:≥(而非 >)——同 LSN = 重放/重复投递,已索引即跳过(幂等;
+            // 原「同 key 重加 + 标死旧副本」每次重开全量重分析)。
             if (auto it = key_to_location_.find(key);
-                it != key_to_location_.end() && it->second.ord > ord) {
+                it != key_to_location_.end() && it->second.ord >= ord) {
                 lk.unlock();
                 cache_.invalidate_terms(changed_terms);
-                return;  // 乱序到达的旧版本,不索引
+                return;  // 乱序到达的旧版本 / 重放的同版本,不索引
             }
         }
         const TermPositionsMap* borrowed = &term_data;
@@ -195,7 +197,7 @@ void TextPlugin::apply_text_in(BuildingSlot& slot, std::string_view key,
         {
             std::unique_lock lk(key_loc_mu_);
             auto it = key_to_location_.find(key);
-            if (it == key_to_location_.end() || it->second.ord <= ord) {
+            if (it == key_to_location_.end() || it->second.ord < ord) {
                 if (it != key_to_location_.end()) displaced = it->second;
                 // S40:换键到本段存储(不变量 K)——不可只改 value。
                 k2l_assign_locked(it, bld->key_at(docid),
@@ -356,10 +358,10 @@ void TextPlugin::apply_job_impl_in(BuildingSlot& slot, const ReduceJob& job,
         {
             std::shared_lock lk(key_loc_mu_);
             if (auto it = key_to_location_.find(job.key);
-                it != key_to_location_.end() && it->second.ord > job.ord) {
+                it != key_to_location_.end() && it->second.ord >= job.ord) {
                 lk.unlock();
                 cache_.invalidate_terms(changed_terms);
-                return;  // 乱序到达的旧版本,不索引
+                return;  // 乱序到达的旧版本 / 重放的同版本,不索引(S45-2)
             }
         }
         std::vector<search::SealedSegment::FieldInput> fin;
@@ -380,7 +382,7 @@ void TextPlugin::apply_job_impl_in(BuildingSlot& slot, const ReduceJob& job,
             {
                 std::unique_lock lk(key_loc_mu_);
                 auto it = key_to_location_.find(job.key);
-                if (it == key_to_location_.end() || it->second.ord <= job.ord) {
+                if (it == key_to_location_.end() || it->second.ord < job.ord) {
                     if (it != key_to_location_.end()) displaced = it->second;
                     // S40:换键到本段存储(不变量 K)。
                     k2l_assign_locked(it, bld->key_at(docid),
@@ -439,11 +441,15 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
     }
 
     doc_texts_.erase(prior_ord);
-    if (have_terms) {
-        cache_.invalidate_terms(changed_terms);  // 空缓存时为 no-op
-    } else {
-        cache_.invalidate();  // 原文 LRU miss：降级整缓存失效（S9.2）
-    }
+    // S45-6：缓存失效挪到 mark_dead 之后（见下）——先失效后标死时，失效与
+    // 标死之间开始的查询会把「仍含被删文档」的结果以新代号写回缓存。
+    auto invalidate_cache = [&] {
+        if (have_terms) {
+            cache_.invalidate_terms(changed_terms);  // 空缓存时仅推进代号
+        } else {
+            cache_.invalidate();  // 原文 LRU miss：降级整缓存失效（S9.2）
+        }
+    };
 
     // S27-3 Slice B1：段级删除镜像（fields_ remove_doc 上面已做）。
     // S27-4 P1:墓碑保留 + LSN 守卫(erase 会让乱序到达的旧 put 复活;
@@ -454,7 +460,11 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
         std::unique_lock lk(key_loc_mu_);
         auto it = key_to_location_.find(key);
         if (it != key_to_location_.end()) {
-            if (it->second.ord > tomb_ord) return;  // 已有更新版本(put/墓碑),本删除过期
+            if (it->second.ord > tomb_ord) {
+                lk.unlock();
+                invalidate_cache();
+                return;  // 已有更新版本(put/墓碑),本删除过期
+            }
             prior = it->second;
             have_prior = (prior.seg != nullptr || prior.tomb);
         }
@@ -470,9 +480,9 @@ void TextPlugin::on_delete(std::string_view key, std::uint64_t tomb_ord,
     if (have_prior && !prior.tomb && prior.seg) {
         (void)prior.seg->mark_dead(prior.docid);
     }
+    invalidate_cache();
 
-    maybe_auto_compact();          // S12-2(内联模式)
-    maybe_auto_compact_reducer();  // S27-4 P2(builder 模式;on_delete 恒在 reducer)
+    maybe_auto_compact();  // S12-2(S45-4:有宿主时投递独占维护)
 }
 
 void TextPlugin::rebuild_index(
@@ -483,10 +493,9 @@ void TextPlugin::rebuild_index(
     // 下一次 checkpoint commit 时删)+ 全新 building_,回调喂入的文档进
     // building_(key 经 docmap ord→ext 反查——回调只给 (ord, text))。
     rebase_needed_.store(true, std::memory_order_relaxed);  // S18-6/S14-4
-    // S27-4 P3:重建前 builder 静止 + 弃其在建段(重建喂入走 inline
-    // building_;不排干会与下方清 map/段集竞态,残留段则成幽灵)。
-    drain_builders();
-    for (auto& b : builders_) {
+    // 契约：独占维护上下文（无并发应用）。弃各分片在建段（重建喂入走
+    // inline building_）。
+    for (auto& b : shard_slots_) {
         b->building.store(std::make_shared<search::SealedSegment>(),
                           std::memory_order_release);
     }
@@ -545,8 +554,8 @@ std::size_t TextPlugin::compact(double dead_ratio_threshold) {
     if (auto bld = building_.load(std::memory_order_acquire)) {
         total += bld->compact_postings(dead_ratio_threshold);
     }
-    // S27-4 P3:builder 段(调用契约已含 builder 静止——drain 前置)。
-    for (auto& b : builders_) {
+    // S45-4：各分片 building 段（调用契约：独占维护上下文，无并发应用）。
+    for (auto& b : shard_slots_) {
         if (auto bld = b->building.load(std::memory_order_acquire)) {
             total += bld->compact_postings(dead_ratio_threshold);
         }
@@ -586,7 +595,7 @@ std::size_t TextPlugin::total_postings() const {
     if (auto bld = building_.load(std::memory_order_acquire)) {
         n += bld->default_total_postings();
     }
-    for (const auto& b : builders_) {
+    for (const auto& b : shard_slots_) {
         if (auto bld = b->building.load(std::memory_order_acquire)) {
             n += bld->default_total_postings();
         }
@@ -596,10 +605,9 @@ std::size_t TextPlugin::total_postings() const {
 
 void TextPlugin::maybe_auto_compact() {
     // S27-3 步骤 5:复活(S12-2 原节流逻辑,目标换段世界 compact)。
-    // S27-4 P2:builder 模式下本函数在 builder 线程被调 → 必须 no-op
-    // (compact 遍历他人 building 的 tbb map 与并发 add 不兼容);压实
-    // 触发改由 reducer 侧 maybe_auto_compact_reducer 承担。
-    if (!builders_.empty()) return;
+    // S45-4:应用在分片线程并发进行,压实(遍历段内倒排)不能在应用路径内联
+    // ——有宿主时经 run_serialized 投递独占维护(compact_pending_ 防重复投递);
+    // 无宿主(standalone 单线程)直跑。
     const double thr = config_.auto_compact_dead_ratio;
     if (thr <= 0.0) return;  // opt-in 关（默认）→ 零开销
 
@@ -607,8 +615,17 @@ void TextPlugin::maybe_auto_compact() {
     if (retired < kAutoCompactMinDeaths) return;      // 常态早退
     if (retired < stats_.live_docs() / 2) return;     // 随 live 规模缩放
 
-    compact(thr);  // reducer 线程内串行 → 与 add_doc/put_doc 无并发窗口
-    stats_.reset_retired_since_compact();
+    if (!host_) {
+        compact(thr);
+        stats_.reset_retired_since_compact();
+        return;
+    }
+    if (compact_pending_.exchange(true, std::memory_order_acq_rel)) return;
+    host_->run_serialized([this, thr] {
+        compact(thr);
+        stats_.reset_retired_since_compact();
+        compact_pending_.store(false, std::memory_order_release);
+    });
 }
 
 // ---- 查询面（自 SearchLayer 平移，S18-4）----
@@ -666,9 +683,9 @@ TextPlugin::collect_default_segment_views() const {
             [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
             std::move(bld)});
     }
-    // S27-4 P3:各 builder 的 building 段(builders_ 结构 open 后不变,
+    // S45-4:各分片 building 段(shard_slots_ 结构 open 后不变,
     // 查询线程只读遍历安全;段内容并发读契约同 building_)。
-    for (const auto& b : builders_) {
+    for (const auto& b : shard_slots_) {
         if (auto bld = b->building.load(std::memory_order_acquire);
             bld && bld->live_doc_count() > 0) {
             const search::SealedSegment* seg = bld.get();
@@ -701,8 +718,8 @@ TextPlugin::collect_multi_field_segment_views() const {
         v.pin = std::move(bld);
         views.push_back(std::move(v));
     }
-    // S27-4 P3:各 builder 的 building 段(同 collect_default_segment_views)。
-    for (const auto& b : builders_) {
+    // S45-4:各分片 building 段(同 collect_default_segment_views)。
+    for (const auto& b : shard_slots_) {
         if (auto bld = b->building.load(std::memory_order_acquire);
             bld && bld->live_doc_count() > 0) {
             auto v = bld->multi_view();
@@ -740,6 +757,9 @@ TextPlugin::search_text(std::string_view query, std::size_t k,
     std::optional<std::vector<std::string>> terms;
     auto fetch = [&](std::size_t k_req) -> FetchOut {
         auto cache_key = CacheKey::make("text", query, k_req);
+        // S45-6：先取缓存代号再计算——计算期间若有写入失效，put 拒收（防
+        // 「旧快照结果在失效之后写回缓存」的 TOCTOU）。
+        const std::uint64_t cache_gen = cache_.generation();
         auto cached = params_override
                           ? std::optional<std::vector<bm25::SearchResult>>{}
                           : cache_.get(cache_key);
@@ -773,7 +793,7 @@ TextPlugin::search_text(std::string_view query, std::size_t k,
                 // multi_segment_search 已按全序给出（见 sort_truncate 注释），
                 // 不再重排（S29-5 的「并列 ord 降序」重排已撤，反馈第 5 条）。
             }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
-            if (!params_override) cache_.put(cache_key, results, *terms);
+            if (!params_override) cache_.put(cache_key, results, *terms, cache_gen);
         }
         // D2：filter 后过滤（空 meta 不通过）+ 截断到 k。
         return make_out(results, materialize_hits(results, docs_, filter, k));
@@ -792,6 +812,9 @@ TextPlugin::search_phrase(std::string_view query, std::size_t k,
     std::optional<std::vector<std::string>> terms;
     auto fetch = [&](std::size_t k_req) -> FetchOut {
         auto cache_key = CacheKey::make("phrase", query, k_req);
+        // S45-6：先取缓存代号再计算——计算期间若有写入失效，put 拒收（防
+        // 「旧快照结果在失效之后写回缓存」的 TOCTOU）。
+        const std::uint64_t cache_gen = cache_.generation();
         auto cached = params_override
                           ? std::optional<std::vector<bm25::SearchResult>>{}
                           : cache_.get(cache_key);
@@ -816,7 +839,7 @@ TextPlugin::search_phrase(std::string_view query, std::size_t k,
                 }
                 sort_truncate(results, k_req);
             }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
-            if (!params_override) cache_.put(cache_key, results, *terms);
+            if (!params_override) cache_.put(cache_key, results, *terms, cache_gen);
         }
         return make_out(results, materialize_hits(results, docs_, filter, k));
     };
@@ -898,6 +921,9 @@ TextPlugin::bool_search(std::string_view query, std::size_t k,
     std::optional<bm25::QueryNode> query_node;
     auto fetch = [&](std::size_t k_req) -> FetchOut {
         auto cache_key = CacheKey::make("bool", query, k_req);
+        // S45-6：先取缓存代号再计算——计算期间若有写入失效，put 拒收（防
+        // 「旧快照结果在失效之后写回缓存」的 TOCTOU）。
+        const std::uint64_t cache_gen = cache_.generation();
         auto cached = params_override
                           ? std::optional<std::vector<bm25::SearchResult>>{}
                           : cache_.get(cache_key);
@@ -949,7 +975,7 @@ TextPlugin::bool_search(std::string_view query, std::size_t k,
                 std::vector<std::string> cterms = std::move(must);
                 cterms.insert(cterms.end(), should.begin(), should.end());
                 cterms.insert(cterms.end(), must_not.begin(), must_not.end());
-                cache_.put(cache_key, results, std::move(cterms));
+                cache_.put(cache_key, results, std::move(cterms), cache_gen);
             }
         }
         return make_out(results, materialize_hits(results, docs_, filter, k));
@@ -1151,6 +1177,7 @@ TextPlugin::search_text_highlight(std::string_view query, std::size_t k,
     if (term_freqs.empty()) return std::vector<SearchHitEx>{};
 
     auto cache_key = CacheKey::make("highlight", query, k);
+    const std::uint64_t cache_gen = cache_.generation();  // S45-6（同上）
     auto cached = cache_.get(cache_key);
 
     std::vector<bm25::SearchResult> results;
@@ -1173,7 +1200,7 @@ TextPlugin::search_text_highlight(std::string_view query, std::size_t k,
             }
             // 已按全序给出，不重排（同 search_text）。
         }  // S27-3 步骤 3:fields_ 回退删除(段集唯一源)
-        cache_.put(cache_key, results, terms);
+        cache_.put(cache_key, results, terms, cache_gen);
     }
 
     std::vector<SearchHitEx> hits;
@@ -1467,9 +1494,31 @@ plugin::PluginStatus TextPlugin::open(const plugin::OpenContext& ctx) {
     building_.store(std::make_shared<search::SealedSegment>(),
                     std::memory_order_release);
 
-    start_builders();  // S27-4 P2:B>0 才起线程(默认 0 = 内联)
+    // S45-4：每宿主分片一个 building 段（BuilderPool 退役，分片线程即 builder）。
+    set_shards(ctx.shards);
+    if (config_.builder_threads > 0 && host_) {
+        host_->log(plugin::LogLevel::kWarn,
+                   "text: builder_threads is ignored since S45-4 "
+                   "(index apply parallelism = index_workers shards)");
+    }
 
     return plugin::PluginStatus::kOk;
+}
+
+void TextPlugin::set_shards(unsigned n) {
+    if (n <= 1) {
+        shard_slots_.clear();  // 单分片 = 直接用 building_
+        return;
+    }
+    if (shard_slots_.size() == n) return;
+    shard_slots_.clear();
+    shard_slots_.reserve(n);
+    for (unsigned i = 0; i < n; ++i) {
+        auto ss = std::make_unique<ShardSlot>();
+        ss->building.store(std::make_shared<search::SealedSegment>(),
+                           std::memory_order_release);
+        shard_slots_.push_back(std::move(ss));
+    }
 }
 
 // S40 D1:key 定位的唯一写入口(不变量 K,见头文件声明处)。
@@ -1505,8 +1554,9 @@ void TextPlugin::k2l_clear_locked() noexcept {
 }
 
 // S27-3 B2b 步骤 4:从段集重建 key_to_location_(open 尾部调,单线程)。
-// 按段集序(seg_id 升序 == 清单序)遍历,段内 docid 升序 == LSN 升序 →
-// 同 key 后写天然覆盖前写;只登记 live 文档(dead 槽位无删除/覆盖价值)。
+// 只登记 live 文档(dead 槽位无删除/覆盖价值)。
+// S45-2:同 key 多份 live 副本按 **LSN** 裁决(高者胜、败者标死)——应用序
+// 不再等于 LSN 序,「段序/段内 docid 序 == LSN 序」不再成立。
 void TextPlugin::rebuild_key_locations() {
     std::unique_lock lk(key_loc_mu_);
     k2l_clear_locked();
@@ -1526,8 +1576,20 @@ void TextPlugin::rebuild_key_locations() {
             // S40:键直接 view 段存储(不构造 string);同 key 后段覆盖前段
             // 时必须换键(operator[] 会保留前段的键,value 却指后段)。
             const auto k = seg.key_at(docid);
-            k2l_assign_locked(key_to_location_.find(k), k,
-                              KeyLocation{sp, docid, seg.lsn_at(docid), false});
+            const Lsn lsn = seg.lsn_at(docid);
+            auto it = key_to_location_.find(k);
+            if (it != key_to_location_.end()) {
+                if (it->second.ord >= lsn) {
+                    (void)sp->mark_dead(docid);  // 更旧/重复副本
+                    seg_dirty_.store(true, std::memory_order_relaxed);
+                    continue;
+                }
+                if (it->second.seg) {
+                    (void)it->second.seg->mark_dead(it->second.docid);
+                    seg_dirty_.store(true, std::memory_order_relaxed);
+                }
+            }
+            k2l_assign_locked(it, k, KeyLocation{sp, docid, lsn, false});
         }
     }
 }
@@ -1536,15 +1598,15 @@ plugin::FlushResult TextPlugin::flush(const plugin::FlushRequest& req) {
     // S27-3 Slice C：delta 链退役，只走 base（全量序列化 fields_）。
     // S27-3 Slice B2b 步骤 1：同时封口 building_ 到段集（段集持久化源）。
     plugin::FlushResult res;
-    drain_builders();  // S27-4 P2:ckpt 覆盖到 watermark 需在途 apply 完成
+    // S45-4：flush 在宿主独占维护上下文执行（本库暂停应用）——无需排干。
     if (!dirty() && !req.force_rebase) {
         res.covered_ord = chain_.chain_wm;
     } else if ((flush_building(), maybe_merge_segments(),
                 save_component_base(dir_, req.watermark))) {
         // S27-3 B2b 步骤 4:保存前先封口 building_ → kSegManifest 覆盖到本次
         // watermark 的全部已 apply 文档(否则 recovery 后段集落后 fields_,
-        // 查询永久走退化路径)。flush 经 RunFn 在 reducer 线程执行(S13-F6),
-        // 与 apply/flush_building 同一单写者上下文,直接调用安全。
+        // 查询永久走退化路径)。S45-4:flush 在独占维护上下文执行(应用暂停),
+        // 各分片 building 段此刻无写者,直接封口安全。
         res.covered_ord = req.watermark;
     } else {
         res.status = plugin::PluginStatus::kFailed;
@@ -1563,12 +1625,9 @@ void TextPlugin::on_merge_commit(const plugin::MergeCommitEvent&) {
     // RunFn 的插件自治版）。merge 后压实恒 rebase（compact 内自置标志）。
     constexpr double kMergeCompactDeadRatio = 0.2;
     if (host_) {
-        host_->run_serialized([this] {
-            drain_builders();  // S27-4 P2:压实需 builder 静止
-            compact(kMergeCompactDeadRatio);
-        });
+        // S45-4：独占维护（本库暂停应用）——压实遍历段内倒排与并发 add 不兼容。
+        host_->run_serialized([this] { compact(kMergeCompactDeadRatio); });
     } else {
-        drain_builders();
         compact(kMergeCompactDeadRatio);  // 无宿主（standalone 测试）：直跑
     }
 }
@@ -1584,10 +1643,12 @@ void TextPlugin::flush_building_slot(BuildingSlot& slot) {
     if (!sealed || sealed->doc_count() == 0) return;
     if (!segment_set_) return;
 
-    // 段内 LSN 单调:inline=全局序;builder 队列 FIFO、派发在 reducer 序 →
-    // 尾行即段内最高 LSN。
-    const std::uint64_t hi_lsn =
-        sealed->lsn_at(static_cast<DocId>(sealed->doc_count() - 1));
+    // S45-2:段内 LSN 不再单调(应用序 ≠ LSN 序)——逐行取最大。
+    std::uint64_t hi_lsn = 0;
+    for (std::size_t d = 0, n = sealed->doc_count(); d < n; ++d) {
+        hi_lsn = std::max<std::uint64_t>(hi_lsn,
+                                         sealed->lsn_at(static_cast<DocId>(d)));
+    }
 
     // S27-3 步骤 5 并发序:先切空 building(查询对 sealed 内文档出现微秒级
     // 不可见窗口——NRT 语义可接受;反序会出现「building+段集同现」的双份
@@ -1626,128 +1687,112 @@ void TextPlugin::flush_building_slot(BuildingSlot& slot) {
     seg_dirty_.store(true, std::memory_order_relaxed);
 }
 
-// 全量封口(checkpoint 路径):inline building_ + 各 builder 段。契约:
-// builder 静止(flush 已前置 drain_builders)。
+// 全量封口(checkpoint / close 路径):inline building_ + 各分片段。契约:独占
+// 维护上下文(S45-4:本库应用暂停,各段无写者)。
+//
+// S45-7:分片后每个 checkpoint 会封出 N(分片数)个小段——close 多写 N-1 个
+// 文件、查询多归并 N-1 个段。这里先把各分片的 building 段按文档数打包分组
+// (每组总数 ≤ kBuildingFlushDocThreshold,即正常阈值封口段的上限),组内
+// 经 merge_segments_v2 直接合成一个段文件再登记;单段组走原封口路径。
+// 合并失败则该组退回逐段封口,不丢数据。
 void TextPlugin::flush_building() {
-    flush_building_slot(building_);
-    for (auto& b : builders_) flush_building_slot(b->building);
-}
-
-// ===========================================================================
-// S27-4 P2:BuilderPool(设计 docs/design/s27-4-dwpt-design.md §1/§3)
-// ===========================================================================
-
-void TextPlugin::start_builders() {
-    const std::size_t n = config_.builder_threads;
-    if (n == 0 || !builders_.empty()) return;
-    builders_.reserve(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        auto b = std::make_unique<Builder>();
-        // S27-4 P3:每 builder 一个 building 段(段内单写者;查询经
-        // 收集器 load+pin 并发读,与 building_ 同款契约)。
-        b->building.store(std::make_shared<search::SealedSegment>(),
-                          std::memory_order_release);
-        Builder* raw = b.get();
-        b->th = std::thread([this, raw] { builder_loop(*raw); });
-        builders_.push_back(std::move(b));
+    std::vector<BuildingSlot*> slots;
+    slots.reserve(shard_slots_.size() + 1);
+    const auto nonempty = [](BuildingSlot& s) {
+        auto seg = s.load(std::memory_order_acquire);
+        return seg && seg->doc_count() > 0;
+    };
+    if (nonempty(building_)) slots.push_back(&building_);
+    for (auto& b : shard_slots_) {
+        if (nonempty(b->building)) slots.push_back(&b->building);
     }
-}
-
-void TextPlugin::stop_builders() {
-    for (auto& b : builders_) {
-        {
-            std::lock_guard<std::mutex> lk(b->mu);
-            b->stop = true;
+    if (slots.size() <= 1 || !segment_set_) {
+        for (auto* s : slots) flush_building_slot(*s);
+        return;
+    }
+    // 小段在前贪心装箱:每组总文档数 ≤ 上限。
+    std::sort(slots.begin(), slots.end(), [](BuildingSlot* a, BuildingSlot* b) {
+        return a->load(std::memory_order_acquire)->doc_count() <
+               b->load(std::memory_order_acquire)->doc_count();
+    });
+    std::vector<std::vector<BuildingSlot*>> groups;
+    std::size_t group_docs = 0;
+    for (auto* s : slots) {
+        const auto dc = s->load(std::memory_order_acquire)->doc_count();
+        if (groups.empty() || group_docs + dc > kBuildingFlushDocThreshold) {
+            groups.emplace_back();
+            group_docs = 0;
         }
-        b->cv_idle.notify_all();
-        b->cv_push.notify_all();
-        if (b->th.joinable()) b->th.join();
+        groups.back().push_back(s);
+        group_docs += dc;
     }
-    builders_.clear();
+    for (auto& g : groups) {
+        if (g.size() == 1 || !merge_building_slots(g)) {
+            for (auto* s : g) flush_building_slot(*s);
+        }
+    }
 }
 
-// 生产者 = reducer 单线程;round-robin + 容量背压。唤醒协议(P3 吞吐):
-// 只在 builder 真睡(waiting)时 notify——稳态(队列非空,builder 自转
-// 取活)每 job 零 futex 唤醒。
-void TextPlugin::dispatch_job(BuilderJob&& j) {
-    Builder& b = *builders_[rr_next_];
-    rr_next_ = (rr_next_ + 1) % builders_.size();
-    bool wake = false;
+// 把若干分片 building 段合成一个段文件并登记(flush_building 的组合并)。
+// 失败返回 false,各槽原样未动(调用方退回逐段封口)。
+bool TextPlugin::merge_building_slots(const std::vector<BuildingSlot*>& group) {
+    std::vector<std::shared_ptr<search::SealedSegment>> owned;
+    std::vector<std::shared_ptr<const search::SealedSegment>> inputs;
+    owned.reserve(group.size());
+    inputs.reserve(group.size());
+    for (auto* s : group) {
+        owned.push_back(s->load(std::memory_order_acquire));
+        inputs.push_back(owned.back());
+    }
+    const auto [new_id, fname] = segment_set_->reserve_seg_file();
+    const std::string path = bitcask::detail::to_utf8(
+        bitcask::detail::from_utf8(segment_set_->dir()) /
+        bitcask::detail::from_utf8(fname));
+    search::MergeResult mr;
+    if (!search::merge_segments_v2(path, new_id, inputs, mr)) return false;
+    std::shared_ptr<search::SealedSegment> merged =
+        search::SealedSegment::open_v2(path);
+    if (!merged) {
+        std::error_code ec;
+        std::filesystem::remove(bitcask::detail::from_utf8(path), ec);
+        return false;
+    }
+    if (mr.out_docs == 0) {  // 组内全是死行:无需登记
+        std::error_code ec;
+        std::filesystem::remove(bitcask::detail::from_utf8(path), ec);
+        for (auto* s : group) {
+            s->store(std::make_shared<search::SealedSegment>(),
+                     std::memory_order_release);
+        }
+        return true;
+    }
+    // 换入:同 flush_building_slot 的并发序——先切空各槽、再登记合并段
+    // (查询对这些文档出现微秒级不可见窗口,而非双份命中)。key 定位在
+    // key_loc_mu_ 独占下重指到合并段。
+    for (auto* s : group) {
+        s->store(std::make_shared<search::SealedSegment>(),
+                 std::memory_order_release);
+    }
+    segment_set_->add_prebuilt_pending(merged, fname, new_id, mr.out_hi_lsn);
     {
-        std::unique_lock<std::mutex> lk(b.mu);
-        b.cv_push.wait(lk,
-                       [&] { return b.q.size() < kBuilderQueueCap || b.stop; });
-        if (b.stop) return;  // 关停中:丢弃(close 前必有 drain,此处防御)
-        b.q.push_back(std::move(j));
-        wake = b.waiting;
-    }
-    if (wake) b.cv_idle.notify_all();
-}
-
-void TextPlugin::builder_loop(Builder& b) {
-    for (;;) {
-        BuilderJob j;
-        {
-            std::unique_lock<std::mutex> lk(b.mu);
-            if (b.q.empty() && !b.stop) {
-                b.waiting = true;
-                b.cv_idle.wait(lk, [&] { return !b.q.empty() || b.stop; });
-                b.waiting = false;
+        std::unique_lock lk(key_loc_mu_);
+        for (std::size_t si = 0; si < inputs.size(); ++si) {
+            const auto& map = mr.docid_map[si];
+            for (std::uint32_t od = 0; od < map.size(); ++od) {
+                const auto nd = map[od];
+                if (nd == search::MergeResult::kDead) continue;
+                const auto k = merged->key_at(nd);
+                auto it = key_to_location_.find(k);
+                if (it != key_to_location_.end() &&
+                    it->second.seg == inputs[si] && it->second.docid == od) {
+                    k2l_assign_locked(it, k,
+                                      KeyLocation{merged, nd, it->second.ord, false});
+                }
             }
-            if (b.q.empty() && b.stop) return;
-            j = std::move(b.q.front());
-            b.q.pop_front();
-            b.busy = true;
         }
-        // 执行(builder 不可抛——吞异常,语义同 reducer 对 apply 异常的
-        // 空 job 降级;宿主错误计数不可达,接受)。
-        try {
-            if (j.is_raw) {
-                apply_text_in(b.building, j.raw_key, j.raw_ord, j.raw_text);
-            } else {
-                apply_job_in(b.building, j.job);
-            }
-        } catch (...) {
-        }
-        // 完工通知按需(P3 吞吐:稳态零 futex):队空 → drain 等待者可能
-        // 达静止;从满附近下来 → 背压生产者可能在等。
-        bool notify_drain = false;
-        bool notify_push = false;
-        {
-            std::lock_guard<std::mutex> lk(b.mu);
-            b.busy = false;
-            notify_drain = b.q.empty();
-            // 背压迟滞:唤醒点 = 半满(而非 cap-1)。饱和时若逐 pop 逐醒,
-            // 生产者每 job 一次 futex 往返;半满唤醒让其一口气推 cap/2 个。
-            notify_push = (b.q.size() == kBuilderQueueCap / 2);
-        }
-        if (notify_drain) b.cv_idle.notify_all();
-        if (notify_push) b.cv_push.notify_all();
     }
-}
-
-// 读屏障:全部 builder 队列空 + 非 busy。可从 reducer(flush/compact)与
-// 查询线程(plugin drain 钩子)并发调用。
-void TextPlugin::drain_builders() {
-    for (auto& b : builders_) {
-        std::unique_lock<std::mutex> lk(b->mu);
-        b->cv_idle.wait(lk, [&] { return b->q.empty() && !b->busy; });
-    }
-}
-
-// reducer 侧压实触发:阈值判定(便宜,常态早退)→ drain(builder 静止,
-// compact 的 tbb 遍历契约)→ compact。B=0 时 apply 路径的 maybe_auto_compact
-// 已覆盖,这里直接返回避免双触发。
-void TextPlugin::maybe_auto_compact_reducer() {
-    if (builders_.empty()) return;  // 内联模式走 apply 路径既有触发
-    const double thr = config_.auto_compact_dead_ratio;
-    if (thr <= 0.0) return;
-    const std::uint64_t retired = stats_.retired_since_compact();
-    if (retired < kAutoCompactMinDeaths) return;
-    if (retired < stats_.live_docs() / 2) return;
-    drain_builders();
-    compact(thr);
-    stats_.reset_retired_since_compact();
+    seg_dirty_.store(true, std::memory_order_relaxed);
+    return true;
 }
 
 }  // namespace bitcask::text

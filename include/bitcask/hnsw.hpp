@@ -91,9 +91,11 @@ public:
     HnswIndex(const HnswIndex&) = delete;
     HnswIndex& operator=(const HnswIndex&) = delete;
 
-    // 插入(仅单写者线程)。前置:vec.size()==dim;ord 全局单调。
-    // 水位幂等:ord <= max_inserted_ord_ 时丢弃(崩溃回放重叠区安全,
-    // 与 InvertedIndex::add_doc 同协议)。
+    // 插入(仅单写者线程)。前置:vec.size()==dim。
+    // S45:ord **不再要求单调**、本方法**不判重**(索引管线去全局顺序化,应用
+    // 序 ≠ LSN 序)。原「ord <= max_inserted_ord_ 即丢弃」的水位门会把乱序
+    // 到达的向量静默丢掉,已移除;乱序与重放的幂等由上层向量插件按 key+LSN
+    // 裁决(detail/vector_key_loc.hpp)。
     void insert(std::uint64_t ord, std::span<const float> vec);
 
     struct Hit {

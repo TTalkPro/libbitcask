@@ -15,6 +15,109 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
+## [Unreleased]（S45：索引管线去全局顺序化）
+
+> **版本语义（待定，由维护者决定）**：C API 签名与 C ABI 零改动；盘上格式
+> 字节布局零改动（HNSW 图文件放宽一条内容校验，见 Changed）。C++ 头面有
+> 破坏性变化（`IndexPool` / `IndexTask` / 插件契约），若视 C++ 头为公开 ABI
+> 则需 major。设计：`designs/index-pipeline-unordered-design-zh.md`；调研：
+> `docs/design/s45-1-research-zh.md`；基准：`docs/design/s45-6-bench-zh.md`。
+
+### Fixed
+
+- **索引池死锁**（search 模式）：大 `put_batch`（≥ 约 4 万条）与并发 `put`
+  交错时，map worker 被 reorder ring 名额挡死、队头 LSN 永远进不了 ring，
+  所有写线程永久挂在索引队列上（同 registry 的其它库一起停摆）。7.0.3 上
+  批 6 万 + 4 线程 2/2 复现。根因是「乱序提交 + 严格按序应用 + 有上限的
+  重排缓冲」三者并存；S45-0 先以饥饿旁路止血，S45-4 起该结构整体退役。
+  回归 `IndexLivenessCaskTest.LargePutBatchWithConcurrentPutsCompletes`。
+- **`close()` 的 30 秒逃生门不生效**：等待在途写用的是无超时的
+  `std::atomic::wait`，写线程被 kill 时 close 永久阻塞。改为有界轮询，
+  超时可注入。回归 `CloseWaitTest.*`。
+- **merge 搬迁与并发写竞态**：`DocmapRelocator` 的 `get → put_doc` 两步
+  之间若应用了同 key 的更新版本，会把 docmap 改回旧版本的定位。新增
+  `Index::relocate`（当前版本 == ord 才改定位，原子）。
+- **checkpoint 覆盖水位高估**：旧水位取提交时刻的 `peek_next_ord()`，会把
+  并发写刚分配、尚未应用的 LSN 计入覆盖。改为执行时刻的 LSN 连续完成前缀。
+- **search 模式每次重开都全量重新分词**：恢复重放对同 LSN 文档执行
+  「重加 + 标死旧副本」，并在回存 checkpoint 时重写段。现同 LSN 重放幂等
+  跳过，且低于各组件覆盖水位的记录直接不重放（20 万文档库重开
+  约 1.6 s → 0.6 s）。
+- **查询结果缓存陈旧写回**（既有 TOCTOU）：查询在 miss 路径基于旧快照
+  计算、写入在计算期间完成失效、随后旧结果才 `put` 进缓存——陈旧结果常驻
+  直到下次相关写。真并发应用下实测约 5% 丢 1～2 篇文档
+  （`CaskDocValueTest.AutoCompactConcurrentReadersNoRace`）。`SearchCache`
+  新增失效代号，计算前取代号、put 时代号已前进即拒收；`on_delete` 的缓存
+  失效挪到标死之后。回归 `SearchCacheGeneration.*`。
+- 同轮审计次要项随重构消除：`BatchOrdGuard` / `OrdSkipGuard` 析构里提交
+  任务可能抛异常（改为直接记 LSN 完成，noexcept）；自动 checkpoint 在
+  池已停时任务被丢弃导致 `auto_ckpt_inflight_` 永久卡住（池停时调用线程
+  直跑）；`unregister_lib` 超时后析构车道的已知 UAF（改为摘钩入墓地，不再
+  回调宿主）。
+
+### Changed
+
+- **索引管线**：reducer、reorder ring、map worker 池、`IndexOp::Skip` /
+  `IndexOp::RunFn` 全部移除。新结构：按 key 哈希分发到 N 个分片线程
+  （N = `index_workers`，同 key 串行、不同 key 并行），单写者插件走 1 个
+  串行道线程，维护操作（checkpoint、压实、HNSW 重建、merge 收尾）在 1 个
+  维护线程上按库暂停后独占执行。正确性由「key + LSN 裁决」（OKI 为权威，
+  乱序到达的旧版本丢弃）与各结构的 LSN 守卫保证；读屏障与 checkpoint
+  水位由新的 `LsnTracker`（LSN 连续完成前缀）给出。
+- **插件契约**（`plugin_api.hpp`）：事件**到达序任意**、同 key 串行；新增
+  `CaskPlugin::concurrency()`（`kSerial` 默认 / `kSharded`）、
+  `accepts_put()` / `accepts_delete()`、`PutEvent::shard` /
+  `DeleteEvent::shard` / `PutEvent::replay`（重放亦经执行器）、
+  `OpenContext::shards`、`kReplayFloorMargin`。`run_serialized` 改为维护
+  线程独占执行。第三方插件默认 `kSerial`，行为最保守。
+- **TextPlugin**：BuilderPool 退役，每分片一个 building 段；
+  `TextPluginConfig::builder_threads` / `SearchLayerConfig::builder_threads`
+  忽略并在 open 时告警一次。
+- **向量索引的乱序与重放**：HNSW / IVF / DiskANN 插件改用 key + LSN 定位表裁决
+  （该 key 已有 LSN ≥ 本事件即跳过，删除登记墓碑），HNSW 图本身不再判重；串行
+  插件一律收到删除事件。定位表随向量检查点持久化（新增段型 `kVecKeyLoc` /
+  `kVecKeyLocDelta`），重开时不再依赖 docmap 反查节点 key；旧检查点自动回退。
+  修复：docmap 检查点没落成而向量检查点落成时，重开会把当前版本再插一遍。
+- **HNSW 图文件**（`vec.ckpt` 的 kHnsw 段）：节点 ord 不再要求随节点 id
+  严格递增，头部 max_ord 写真实最大值。字节布局不变；**7.0.x 读端遇到
+  S45 写出的乱序图文件会拒收并退回全量重放重建向量索引**（降级、不损坏
+  数据）；S45 读端可读旧文件。
+- **恢复重放**：在 OKI 收尾之后单独一遍 fold，经分片执行器并行应用；重放同样
+  走严格的 key + LSN 裁决（OKI 为终态，只有命中、非墓碑且 LSN 恰好相等的版本
+  放行）；墓碑重放改为
+  真实删除；从 `replay_floor_of(min(组件覆盖水位))` 起重放（余量 4096 吸收旧版本
+  checkpoint 的水位高估）。
+- **checkpoint / close 时分片小段先合并再落盘**：各分片的 building 段按文档数
+  装箱（每组 ≤ 65 536 篇）合成一个段文件，不再每分片各封一个。实测在线段数
+  8 → 1、2 词查询 p50 约 −33%；close / checkpoint 耗时无可测变化。
+- **OKI 提交切面高估 data 水位（崩溃后 KV 丢写）**：写路径「追加 data → 应用到
+  OKI」之间，OKI flush 的一致切面会看到已追加、未应用的记录，靠「各文件已应用
+  落点」钳制水位；但 roll 新建的文件在首条记录应用前没有登记项、不被钳制，
+  水位取文件大小，manifest 声明 run 已覆盖其实没进 run 的首批记录——此时崩溃，
+  恢复补 tail 据水位跳过，该写丢失（`AutoCheckpointOnRoll` 约 1% 偶发即此）。
+  现在新分配的文件登记落点 0；运行期受控重建后以扫描末尾登记（原为清空，同类
+  缺口）。
+- **打开时校验 OKI manifest 的覆盖声明**：恢复补 tail 时，对每个 data 文件取
+  manifest 水位之内的最后一条记录，补完后比对 OKI 与 data 的胜出版本（同一文件
+  内记录按追加序应用，末条在 ⟹ 之前都在；每文件一次点查）。不一致即判定
+  manifest 高估覆盖，从 data 全量重建 OKI——旧版本写坏的目录打开即自愈。
+  诊断接口 `IndexAuthority::last_ledger_view_consistent()` /
+  `last_ledger_view_probes()`。
+- **OKI 崩溃恢复的墓碑 LSN**：恢复时补 data tail 行，若 OKI 视图里该 key 已是
+  更旧的墓碑，tail 中更新的墓碑此前被跳过，`locate` 报偏旧的墓碑 LSN（删除状态
+  正确、LSN 错）。现在同样补行，墓碑 LSN 与 data 一致。
+- **docmap 检查点**：行与 meta 不再以覆盖水位为上界（写全部已应用行）——修复
+  乱序先完成、LSN ≥ 水位的行在重开后丢失 meta。
+- **`checkpoint()`**：先有界等待调用时刻之前的 LSN 全部应用，再独占保存；
+  执行期间本库暂停应用（写者照常提交，分片队列满后才被背压）。
+
+### Added
+
+- `Cask::verify_index_consistency()`：docmap 逐行对 OKI 当前版本核对
+  （诊断用）。`StatusInfo::index_stale_dropped`：被裁决丢弃的过期写任务数。
+
+---
+
 ## [7.0.3] - 2026-11-16（旧索引 BM25 分数漂移修复）
 
 > **版本语义**：纯缺陷修复——C API 签名、ABI、盘上格式零改动；

@@ -595,6 +595,69 @@ target_link_libraries(bitcask_plugin_contract_test PRIVATE
 )
 gtest_discover_tests(bitcask_plugin_contract_test ${_bitcask_test_props})
 
+# S45-0：索引管线活性（池层乱序死锁 + 对照组、大 put_batch × 并发 put、
+# close 有界等待）。designs/index-pipeline-unordered-design-zh.md。
+add_executable(bitcask_index_pool_liveness_test index_pool_liveness_test.cpp)
+target_link_libraries(bitcask_index_pool_liveness_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_index_pool_liveness_test ${_bitcask_test_props})
+
+# S45-2：乱序应用下 key+LSN 裁决与幂等的模型对拍（含对照组）。
+add_executable(bitcask_index_unordered_apply_test index_unordered_apply_test.cpp)
+target_link_libraries(bitcask_index_unordered_apply_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_index_unordered_apply_test ${_bitcask_test_props})
+
+# S45-A：向量 key+LSN 定位表持久化（不依赖 docmap 重建）。
+add_executable(bitcask_vector_key_persist_test vector_key_persist_test.cpp)
+target_link_libraries(bitcask_vector_key_persist_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_vector_key_persist_test ${_bitcask_test_props})
+
+# S45-7：checkpoint / close 时分片 building 小段先合并再落盘。
+add_executable(bitcask_shard_segment_merge_test shard_segment_merge_test.cpp)
+target_link_libraries(bitcask_shard_segment_merge_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_shard_segment_merge_test ${_bitcask_test_props})
+
+# S45-3：LSN 完成跟踪器。
+add_executable(bitcask_lsn_tracker_test lsn_tracker_test.cpp)
+target_link_libraries(bitcask_lsn_tracker_test PRIVATE
+    GTest::gtest_main
+    bitcask_warnings
+    bitcask_sanitizers
+)
+target_include_directories(bitcask_lsn_tracker_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/include")
+gtest_discover_tests(bitcask_lsn_tracker_test ${_bitcask_test_props})
+
+# S45-5：分片执行器下的崩溃恢复（并发写中崩溃 → 重开索引与 KV 一致）。
+add_executable(bitcask_index_crash_recovery_test index_crash_recovery_test.cpp)
+target_link_libraries(bitcask_index_crash_recovery_test PRIVATE
+    GTest::gtest
+    bitcask_test_crash_child
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_index_crash_recovery_test ${_bitcask_test_props})
+
 add_executable(bitcask_thread_pool_test thread_pool_test.cpp)
 target_link_libraries(bitcask_thread_pool_test PRIVATE
     GTest::gtest_main

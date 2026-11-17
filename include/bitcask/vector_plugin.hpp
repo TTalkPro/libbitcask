@@ -6,8 +6,9 @@
 // S19 起由 Cask 直持（S18 期经 SearchLayer 委托，shim 已降级为测试夹具）
 // ——外部 API 面零变化。
 //
-// === 线程模型（与原 SearchLayer 向量域一致）===
-//   单写者（reducer：insert/rebuild/组件 save/load）+ 多读者（search）。
+// === 线程模型 ===
+//   单写者（S45-4：索引池串行道线程 insert；rebuild/组件 save/load 在维护
+//   线程独占执行）+ 多读者（search）。insert 的 ord 到达序任意。
 //   hnsw_ 为 atomic<shared_ptr>：读写两端每次操作开头 load 快照，rebuild
 //   以「旁路建新图 + 原子换指针」发布，旧图由引用计数续命（V3.5）。
 //
@@ -20,6 +21,7 @@
 
 #include "bitcask/component_ckpt.hpp"       // S20-1 R6：共用链状态/载入结果类型
 #include "bitcask/detail/atomic_shared_ptr.hpp"
+#include "bitcask/detail/vector_key_loc.hpp"  // S45：key+LSN 裁决
 #include "bitcask/doc_table.hpp"
 #include "bitcask/hnsw.hpp"
 #include "bitcask/vector_plugin_config.hpp"  // S20-4：VectorPluginConfig（轻量头）
@@ -72,12 +74,20 @@ public:
         return watermark_;
     }
     plugin::PluginStatus close() override { return plugin::PluginStatus::kOk; }
+    // S45：key+LSN 裁决——乱序到达的旧版本、已被删除覆盖的写、同版本重放
+    // 一律跳过（HNSW 图本身无判重门）。
     void on_put(const plugin::PutEvent& e, plugin::PreparedPtr) override {
-        if (e.doc && !e.doc->vec.empty()) {
+        if (e.doc && !e.doc->vec.empty() && key_loc_.admit_put(e.key, e.ord)) {
             insert(e.ord, e.doc->vec);
         }
     }
-    void on_delete(const plugin::DeleteEvent&) override {}
+    void on_delete(const plugin::DeleteEvent& e) override {
+        key_loc_.on_delete(e.key, e.ord);
+    }
+    // 测试 / 诊断：key 当前登记的 ord（无 = -1）。
+    [[nodiscard]] std::uint64_t key_ord_for_test(std::string_view key) const {
+        return key_loc_.ord_of(key);
+    }
     // S18-6：落盘决策同 TextPlugin（force ‖ 自身 rebase（rebuild 置位）‖
     // 链长上限）；无向量配置时 base 清残留返回 no-op 成功（覆盖水位随
     // 请求推进——组件恒空，宿主 manifest 不为其记账）。
@@ -194,6 +204,19 @@ private:
     plugin::PluginHost* host_ = nullptr;  // open 时注入（S18-7 merge 收尾用）
     std::uint64_t watermark_ = 0;
     std::atomic<bool> rebase_needed_{true};
+    // S45：key → (ord, 墓碑) 定位表（单写者：串行道；open 重建 / flush 修剪
+    // 在应用暂停期）。
+    detail::VectorKeyLocations key_loc_;
+    // S45-A：本次 open 的定位表是否完整来自检查点（base + 链每个 delta 都带
+    // key 段）。否则 open 回退为「节点 ord 经 docmap 反查」。
+    bool key_loc_from_ckpt_ = false;
+public:
+    [[nodiscard]] bool key_loc_from_ckpt_for_test() const noexcept {
+        return key_loc_from_ckpt_;
+    }
+    [[nodiscard]] std::size_t key_loc_size_for_test() const noexcept {
+        return key_loc_.size();
+    }
 };
 
 }  // namespace bitcask::vec

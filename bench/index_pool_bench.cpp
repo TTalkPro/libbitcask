@@ -1,18 +1,19 @@
-// B2 / S6-P4:IndexPool 异步流水线基准。
+// IndexPool 分片执行器基准（S45-4 改写；原 S6-P4 map/reduce 流水线版退役）。
 //
 // 三个度量：
-//   1. BM_IndexPool_SubmitDrain —— no-op map/reduce，隔离队列/调度/reorder/
-//      flush 的纯开销（tasks/s）。
-//   2. BM_IndexPool_MapSpeedup —— map_fn 含固定 CPU 负载（模拟 analyze），
-//      按 map worker 数（Arg）扫描，对比 1 vs N worker 的吞吐 → 多核加速比
-//      （G1：热点库 analyze 并行吃满多核）。
+//   1. BM_IndexPool_SubmitDrain —— no-op 应用，隔离队列/调度/LSN 完成跟踪/
+//      读屏障的纯开销（tasks/s）。
+//   2. BM_IndexPool_ShardSpeedup —— 应用含固定 CPU 负载（模拟 analyze），按
+//      分片数（Arg）扫描，对比 1 vs N 分片吞吐 → 多核加速比。不同 key 并发、
+//      同 key 串行（key 取 i，均匀散到各分片）。
 //   3. BM_IndexPool_MultiLibThroughput —— 一个共享池、多 lib 并发写，验证
-//      共享池下多库总吞吐随核数扩展（G2 线程恒定 + 跨库并行）。
+//      共享池下多库总吞吐随核数扩展（线程恒定 + 跨库并行）。
 //
 // Run:  ./bitcask_bench --benchmark_filter=IndexPool
 
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -21,27 +22,12 @@
 
 #include "bitcask/thread_pool.hpp"
 
+using bitcask::ApplyResult;
 using bitcask::IndexLane;
 using bitcask::IndexOp;
 using bitcask::IndexPool;
 using bitcask::IndexTask;
-using bitcask::ReorderEntry;
-
-// S15-2：MapFn 泛化 = IndexTask → 各插件 prepare 产物；bench 无插件用空 preps。
-static std::vector<bitcask::plugin::PreparedPtr> no_preps(const bitcask::IndexTask&) {
-    return {};
-}
-
-static IndexTask mk_fields_task(
-    bitcask::IndexOp op, std::string_view key, std::uint64_t ord,
-    std::string_view text, std::uint32_t file_id, std::uint64_t offset,
-    std::uint32_t total_sz, std::uint32_t tstamp, std::uint32_t doc_len,
-    std::initializer_list<std::pair<std::string_view, std::string_view>> flds) {
-    auto t = IndexTask::make(op, key, ord, text, file_id, offset, total_sz,
-                             tstamp, doc_len);
-    t.fields.assign(flds.begin(), flds.end());
-    return t;
-}
+using bitcask::LaneCallbacks;
 
 namespace {
 
@@ -55,127 +41,109 @@ inline std::uint64_t simulated_analyze(std::uint64_t seed) {
     return acc;
 }
 
+LaneCallbacks noop_cb(std::atomic<std::uint64_t>* sink = nullptr, bool heavy = false) {
+    LaneCallbacks cb;
+    cb.shard_apply = [sink, heavy](IndexTask& t, unsigned) {
+        if (heavy) {
+            const std::uint64_t v = simulated_analyze(t.ord);
+            if (sink) sink->fetch_add(v & 1u, std::memory_order_relaxed);
+        }
+        return ApplyResult::kDone;
+    };
+    return cb;
+}
+
 }  // namespace
 
-// ---- 1) 纯流水线开销（no-op map/reduce）----
+// ---- 1) 纯开销 ----
 static void BM_IndexPool_SubmitDrain(benchmark::State& state) {
-    const int kTasks = static_cast<int>(state.range(0));
+    const auto n = static_cast<std::uint64_t>(state.range(0));
     for (auto _ : state) {
         state.PauseTiming();
         IndexPool pool(1, 1u << 17);
-        std::atomic<std::size_t> n{0};
-        pool.start(
-            no_preps,
-            [&](ReorderEntry&) { n.fetch_add(1, std::memory_order_relaxed); },
-            [] {});
+        IndexLane* lane = pool.register_lib(noop_cb(), 0);
         state.ResumeTiming();
-
-        for (int i = 0; i < kTasks; ++i) {
-            pool.submit(mk_fields_task(
-                IndexOp::Add, "key", static_cast<std::uint64_t>(i),
-                "some representative text payload", 0, 0, 0, 0, 0,
-                {{"body", "some representative text payload"}}));
+        for (std::uint64_t i = 0; i < n; ++i) {
+            pool.submit(lane, IndexTask::make(IndexOp::Add, std::to_string(i), i,
+                                              "t", 0, 0, 0, 0, 0));
         }
-        pool.flush();
-
+        pool.wait_lsn(lane, n);
         state.PauseTiming();
+        (void)pool.unregister_lib(lane);
         pool.stop();
         state.ResumeTiming();
     }
     state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) *
-                            static_cast<std::int64_t>(kTasks));
+                            static_cast<std::int64_t>(n));
 }
 BENCHMARK(BM_IndexPool_SubmitDrain)->Arg(100000)->Unit(benchmark::kMillisecond);
 
-// ---- 2) 单 lib map 多核加速比（Arg = map worker 数）----
-// map_fn 含固定 CPU 负载；reduce no-op。worker=1 → 串行 analyze；worker=N →
-// N 文档并发 analyze。对比吞吐即多核加速比（G1）。
-static void BM_IndexPool_MapSpeedup(benchmark::State& state) {
-    const int kWorkers = static_cast<int>(state.range(0));
-    constexpr int kTasks = 20000;
+// ---- 2) 分片加速比 ----
+static void BM_IndexPool_ShardSpeedup(benchmark::State& state) {
+    const int shards = static_cast<int>(state.range(0));
+    constexpr std::uint64_t kTasks = 20000;
     std::atomic<std::uint64_t> sink{0};
     for (auto _ : state) {
         state.PauseTiming();
-        IndexPool pool(kWorkers, 1u << 16);
-        pool.start(
-            [&sink](const IndexTask& t) -> std::vector<bitcask::plugin::PreparedPtr> {
-                sink.fetch_add(simulated_analyze(t.ord),
-                               std::memory_order_relaxed);
-                return {};
-            },
-            [](ReorderEntry&) {},
-            [] {});
+        IndexPool pool(shards, 1u << 16);
+        IndexLane* lane = pool.register_lib(noop_cb(&sink, true), 0);
         state.ResumeTiming();
-
-        for (int i = 0; i < kTasks; ++i) {
-            pool.submit(mk_fields_task(
-                IndexOp::Add, "k", static_cast<std::uint64_t>(i), "t",
-                0, 0, 0, 0, 0, {{"body", "t"}}));
+        for (std::uint64_t i = 0; i < kTasks; ++i) {
+            pool.submit(lane, IndexTask::make(IndexOp::Add, std::to_string(i), i,
+                                              "t", 0, 0, 0, 0, 0));
         }
-        pool.flush();
-
+        pool.wait_lsn(lane, kTasks);
         state.PauseTiming();
+        (void)pool.unregister_lib(lane);
         pool.stop();
         state.ResumeTiming();
     }
+    benchmark::DoNotOptimize(sink.load());
     state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) *
                             static_cast<std::int64_t>(kTasks));
-    benchmark::DoNotOptimize(sink.load());
 }
-// 1 → N worker：吞吐比即加速比。RangeMultiplier 2，覆盖到 8。
-// UseRealTime：map 跑在 pool 线程上，必须按墙钟（而非 benchmark 线程 CPU）计速。
-BENCHMARK(BM_IndexPool_MapSpeedup)
-    ->RangeMultiplier(2)->Range(1, 8)->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_IndexPool_ShardSpeedup)
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)
+    ->Unit(benchmark::kMillisecond)
+    ->UseRealTime();
 
-// ---- 3) 共享池多 lib 并发吞吐（Arg = lib 数）----
-// 一个池（map worker = 硬件并发）、Arg 条 lane、每 lane 一个 producer 线程
-// 并发喂入；含 CPU 负载的 map。度量总吞吐（tasks/s）随库数的扩展。
+// ---- 3) 多库共享池 ----
 static void BM_IndexPool_MultiLibThroughput(benchmark::State& state) {
-    const int kLibs = static_cast<int>(state.range(0));
-    constexpr int kPerLib = 5000;
-    unsigned hc = std::thread::hardware_concurrency();
-    const int kWorkers = static_cast<int>(hc > 1 ? hc : 2);
+    const int libs = static_cast<int>(state.range(0));
+    const int kShards =
+        static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    constexpr std::uint64_t kPerLib = 5000;
     std::atomic<std::uint64_t> sink{0};
-
     for (auto _ : state) {
         state.PauseTiming();
-        IndexPool pool(kWorkers, 1u << 16);
+        IndexPool pool(kShards, 1u << 16);
         std::vector<IndexLane*> lanes;
-        for (int l = 0; l < kLibs; ++l) {
-            lanes.push_back(pool.register_lib(
-                [&sink](const IndexTask& t) -> std::vector<bitcask::plugin::PreparedPtr> {
-                    sink.fetch_add(simulated_analyze(t.ord),
-                                   std::memory_order_relaxed);
-                    return {};
-                },
-                [](ReorderEntry&) {}, [] {}, 0));
+        for (int l = 0; l < libs; ++l) {
+            lanes.push_back(pool.register_lib(noop_cb(&sink, true), 0));
         }
         state.ResumeTiming();
-
-        std::vector<std::thread> producers;
-        for (std::size_t l = 0; l < lanes.size(); ++l) {
-            producers.emplace_back([&pool, lane = lanes[l]] {
-                for (int i = 0; i < kPerLib; ++i) {
-                    pool.submit(lane, mk_fields_task(
-                        IndexOp::Add, "k", static_cast<std::uint64_t>(i), "t",
-                        0, 0, 0, 0, 0, {{"body", "t"}}));
+        std::vector<std::thread> writers;
+        for (int l = 0; l < libs; ++l) {
+            writers.emplace_back([&, l] {
+                for (std::uint64_t i = 0; i < kPerLib; ++i) {
+                    pool.submit(lanes[static_cast<std::size_t>(l)],
+                                IndexTask::make(IndexOp::Add, std::to_string(i), i,
+                                                "t", 0, 0, 0, 0, 0));
                 }
             });
         }
-        for (auto& t : producers) t.join();
-        for (auto* lane : lanes) pool.flush(lane);
-
+        for (auto& w : writers) w.join();
+        for (auto* lane : lanes) pool.wait_lsn(lane, kPerLib);
         state.PauseTiming();
         for (auto* lane : lanes) (void)pool.unregister_lib(lane);
         pool.stop();
         state.ResumeTiming();
     }
-    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) *
-                            static_cast<std::int64_t>(kLibs) *
-                            static_cast<std::int64_t>(kPerLib));
     benchmark::DoNotOptimize(sink.load());
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) *
+                            libs * static_cast<std::int64_t>(kPerLib));
 }
 BENCHMARK(BM_IndexPool_MultiLibThroughput)
-    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
+    ->Arg(1)->Arg(2)->Arg(4)
+    ->Unit(benchmark::kMillisecond)
+    ->UseRealTime();

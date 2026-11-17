@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <limits>   // S37-5：parse_start_token 的溢出保护
 #include <map>
+#include <random>  // S45-4：提交抖动（仅测试）
 #include <thread>
 
 #include "bitcask/format.hpp"
@@ -304,31 +305,39 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         if (auto r = cask->load_authority_from_disk(); !r) return std::unexpected(r.error());
         cask->authority_->mark_ready();
     }
-    // S6-P3: 仅 search 模式注册车道（KV 模式无 search_）。索引双池由 registry
-    // 共享所有——本库向其注册一条 lane（map/reduce/error 闭包 + 起始 ord），
-    // 拿到稳定句柄 index_lane_。线程数与库数解耦（G2）：所有同 registry 的库
-    // 共用一对 dispatcher/reducer。
+    // S6-P3: 仅 search 模式注册车道（KV 模式无 search_）。索引池由 registry
+    // 共享所有——本库向其注册一条 lane，拿到稳定句柄 index_lane_。线程数与
+    // 库数解耦（G2）：所有同 registry 的库共用一组分片/串行/维护线程。
     //
-    // 起始 ord 对齐 keydir 当前水位——reducer 跳过 disk 已恢复的
-    // [0, peek_next_ord) 区间。merge 提交的 RunFn{ord=peek_next_ord} 等
-    // 首个 entry 进该 lane 的 reorder 时 next_apply_ord 已对齐，无 stall。必须
-    // 在 authority_/registry_ 就绪后（create_search_infra 早于此装配）。
+    // 起始 LSN 对齐 keydir 当前水位——[0, peek_next_ord) 已由恢复期建好索引，
+    // 车道的 LSN 完成跟踪视为已完成（S45-4）。必须在 authority_/registry_
+    // 就绪后（create_search_infra 早于此装配）。
     //
     // S15-3：闭包按 CaskPlugin 接口分发（捕获 plugins_ 快照 by value；P1 恒
     // = {TextPlugin, VectorPlugin}，S18-5）。生命周期见 close()：先 unregister_lib（flush
     // 排空 ⇒ 闭包不再被调用）再 reset adapter/search_/docmap_。
     if (cask->text_ && cask->registry_) {
         cask->index_pool_ = cask->registry_->index_pool();
-        // 分发逻辑提取为命名方法（prepare_index_task / reduce_index_entry /
-        // on_index_worker_error），闭包退化为薄捕获委托。
+        // S45-4：分片执行器车道。分发语义集中在 IndexDispatcher（规则 R
+        // 裁决 + docmap + 分片/串行插件扇出），回调退化为薄委托。
         auto* c = cask.get();
+        c->dispatcher_.set_plugins(c->plugins_);
+        c->dispatcher_.docmap = c->docmap_.get();
+        c->dispatcher_.is_current = [c](std::string_view k, std::uint64_t o) {
+            return c->index_put_is_current(k, o);
+        };
+        c->dispatcher_.on_error = [c] { c->on_index_worker_error(); };
+        LaneCallbacks cb;
+        cb.shard_apply = [c](IndexTask& t, unsigned s) {
+            return c->dispatcher_.shard_apply(t, s);
+        };
+        if (c->dispatcher_.has_serial()) {
+            cb.serial_apply = [c](IndexTask& t) { c->dispatcher_.serial_apply(t); };
+        }
+        cb.on_error = [c] { c->on_index_worker_error(); };
+        // 起始 LSN：之前的 LSN 已由恢复期建好索引，视为已完成。
         cask->index_lane_ = cask->index_pool_->register_lib(
-            [c](const IndexTask& task) { return c->prepare_index_task(task); },
-            [c](ReorderEntry& entry) { c->reduce_index_entry(entry); },
-            [c]() { c->on_index_worker_error(); },
-            // 起始 ord。
-            cask->authority_->peek_next_ord()
-        );
+            std::move(cb), cask->authority_->peek_next_ord());
     }
     // S14-1：自动 ckpt 增量基线 = 当前水位（open 恢复路径①已按需回存，
     // 从零起算会导致老库首个 roll 必触发一次全量 ckpt）。
@@ -579,14 +588,14 @@ public:
         return {bitcask::plugin::PluginStatus::kOk, 0, 0};
     }
     void on_relocate(const bitcask::plugin::RelocateEvent& e) override {
-        auto slot = docmap_->get(e.key);
-        if (!slot) return;
-        docmap_->put_doc(e.key, e.ord,
-                         bitcask::index::DocSlot{
-                             bitcask::index::DocLoc{.offset   = e.loc.offset,
-                                                    .file_id  = e.loc.file_id,
-                                                    .total_sz = e.loc.total_sz},
-                             slot->tstamp, slot->doc_len});
+        // S45-2：原子 CAS（当前版本 == e.ord 才改定位）。旧实现 get→put_doc
+        // 两步：间隙里 reducer 应用了更新版本，put_doc(e.ord) 会把它改回旧
+        // 版本；且 put_doc 现带 LSN 守卫，同 ord 改写本就不再生效。
+        (void)docmap_->relocate(
+            e.key, e.ord,
+            bitcask::index::DocLoc{.offset   = e.loc.offset,
+                                   .file_id  = e.loc.file_id,
+                                   .total_sz = e.loc.total_sz});
     }
 private:
     bitcask::index::Index* docmap_;
@@ -608,18 +617,13 @@ Cask::CaskPluginHost::read_at(plugin::RecordLoc loc) {
 }
 
 void Cask::CaskPluginHost::run_serialized(std::function<void()> fn) {
+    // S45-4：维护线程独占执行（按库暂停应用）。不再分配 LSN、不再排进数据
+    // 任务流。无池（纯 KV / 理论不可达）：调用线程直跑。
     Cask* c = cask_;
     if (c->index_pool_ && c->index_lane_) {
-        IndexTask t;
-        t.op  = IndexOp::RunFn;
-        const std::uint64_t ord = c->authority_->alloc_ord();
-        OrdSkipGuard og(c, ord);
-        t.ord = ord;
-        t.fn  = std::move(fn);
-        c->submit_index_task(std::move(t));
-        og.disarm();
+        c->index_pool_->run_exclusive(c->index_lane_, std::move(fn));
     } else {
-        fn();  // 无池（纯 KV / 理论不可达）：调用线程直跑
+        fn();
     }
 }
 
@@ -666,64 +670,19 @@ Cask::create_search_infra(const CaskOptions& opts) {
     return {};
 }
 
-std::vector<plugin::PreparedPtr>
-Cask::prepare_index_task(const IndexTask& task) {
-    std::vector<plugin::PreparedPtr> preps(plugins_.size());
-    const plugin::DocView  doc = make_doc_view(task);
-    const plugin::PutEvent ev  = make_put_event(task, &doc);
-    for (std::size_t i = 0; i < plugins_.size(); ++i) {
-        if (plugins_[i]->wants_prepare()) {
-            preps[i] = plugins_[i]->prepare(ev);
-        }
+bool Cask::index_put_is_current(std::string_view key,
+                                std::uint64_t ord) const noexcept {
+    if (!index_arbitration_.load(std::memory_order_relaxed) || !authority_) {
+        return true;
     }
-    return preps;
-}
-
-// S16-2 写路径：宿主**先 apply DocMap**（身份/存活/meta），再按注册序广播
-// 给各插件（设计 §4：DocMap 恒在所有插件之前）。
-// 顺序安全性：docmap 先亮 live、postings/向量后加——并发查询都不可能命中
-// 「半个文档」（postings 无 → 不命中；live 无 → 过滤），且 reducer 单写者
-// 保证同 ord 两步间无写交错。doc_len 是分析产物，宿主以 0 落行、BM25 侧经
-// set_doc_len 回填（S16 批次头②的缓行通道）。
-void Cask::reduce_index_entry(ReorderEntry& entry) {
-    std::visit([this](auto& e) {
-        using T = std::decay_t<decltype(e)>;
-        if constexpr (std::is_same_v<T, PutEntry>) {
-            const auto& t = e.task;
-            docmap_->put_doc(t.key(), t.ord,
-                             index::DocSlot{
-                                 index::DocLoc{.offset   = t.offset,
-                                               .file_id  = t.file_id,
-                                               .total_sz = t.total_sz},
-                                 t.tstamp, /*doc_len=*/0});
-            if (!t.meta.empty()) docmap_->set_meta(t.ord, t.meta);
-            const plugin::DocView  doc = make_doc_view(e.task);
-            const plugin::PutEvent ev  = make_put_event(e.task, &doc);
-            for (std::size_t i = 0; i < plugins_.size(); ++i) {
-                plugins_[i]->on_put(
-                    ev, i < e.preps.size() ? std::move(e.preps[i])
-                                           : plugin::PreparedPtr{});
-            }
-        } else if constexpr (std::is_same_v<T, DeleteEntry>) {
-            // prior_ord 在 remove **前**捕获（删除统计需要旧 ord，插件不能
-            // 反查已删行）；key 不存在 → 不动 docmap、广播哨兵（历史「删不存在」
-            // 语义 = 插件侧 no-op）。
-            std::uint64_t prior = plugin::kNoPriorOrd;
-            if (auto slot = docmap_->get(e.key)) {
-                prior = slot->ord;
-                docmap_->remove(e.key, e.ord);
-            }
-            for (auto* p : plugins_) {
-                p->on_delete(plugin::DeleteEvent{e.ord, e.key, prior});
-            }
-        } else if constexpr (std::is_same_v<T, SkipEntry>) {
-            // no-op（ord 空洞填充）
-        } else if constexpr (std::is_same_v<T, RunFnEntry>) {
-            // S13-F6：merge 路径的 compact/HNSW 重建/ckpt 序列化等在此
-            // （reducer 单写者上下文）执行。
-            if (e.fn) e.fn();
-        }
-    }, entry);
+    const auto r = authority_->state().locate(key);
+    using LS = oki::OkiState::LocateStatus;
+    if (r.status == LS::kUnavailable) return true;  // 不可判定：结构守卫兜底
+    if (r.status == LS::kMiss) return false;        // 已删除且墓碑已归并掉 / 过期
+    // kHit：权威版本更新（覆盖写或删除）⇒ 本任务过期。权威版本**更旧**理论
+    // 不可达（任务提交前 OKI 已含它），防御性放行——宁可多索引一次（结构
+    // 守卫仍裁决），不丢文档。
+    return r.ord <= ord && !(r.tomb && r.ord == ord);
 }
 
 void Cask::on_index_worker_error() noexcept {
@@ -749,23 +708,30 @@ void Cask::close() noexcept {
     // 契约上 close 时刻不应有在途写调用（closed_ 注释），此处防御性收敛：
     // 违约时 close 阻塞等待而非 UAF。被队列背压挡住的写者也会收敛——池由
     // registry 持有仍在消费，push 必然返回；closed_ 已置位，新写者入口即退。
-    // S25-T1:加 30s 超时兜底——若写线程被 kill（pthread_cancel/信号）致
-    // writes_in_flight_ 卡在非零，close 不再永久阻塞；超时后 log_error 并
-    // 强制继续释放（接受潜在 UAF 风险优于进程永久挂死）。
+    // S25-T1:加超时兜底(默认 30s)——若写线程被 kill（pthread_cancel/信号）致
+    // writes_in_flight_ 卡在非零，close 不永久阻塞；超时后 log_error 并强制继续
+    // 释放（接受潜在 UAF 风险优于进程永久挂死）。
+    // S45-0：有界轮询（退避 50µs→10ms）。原实现超时判断在循环头，随后进
+    // std::atomic::wait(n)——它**没有超时**，值不变就永不返回，计数卡住时
+    // 循环头的超时判断再也执行不到（逃生门形同虚设）。close 是冷路径：常态
+    // 计数已为 0，一次 load 即过；有在途写时最多多等一个睡眠片。
     {
-        constexpr auto kCloseWaitTimeout = std::chrono::seconds(30);
-        auto start = std::chrono::steady_clock::now();
+        const auto deadline = std::chrono::steady_clock::now() +
+                              close_wait_timeout_;
+        auto nap = std::chrono::microseconds(50);
         for (auto n = writes_in_flight_.load(std::memory_order_seq_cst); n != 0;
              n = writes_in_flight_.load(std::memory_order_seq_cst)) {
-            auto elapsed = std::chrono::steady_clock::now() - start;
-            if (elapsed >= kCloseWaitTimeout) {
+            if (std::chrono::steady_clock::now() >= deadline) {
                 log_error("close: writes_in_flight_=" + std::to_string(n) +
-                          " after 30s — proceeding with teardown (write thread "
+                          " after " +
+                          std::to_string(close_wait_timeout_.count()) +
+                          "ms — proceeding with teardown (write thread "
                           "may have been killed; potential UAF risk)");
                 break;
             }
-            // 等到计数变化或超时
-            writes_in_flight_.wait(n, std::memory_order_seq_cst);
+            std::this_thread::sleep_for(nap);
+            nap = std::min<std::chrono::microseconds>(
+                nap * 2, std::chrono::milliseconds(10));
         }
     }
     // close 内部步骤（save_ckpt/snapshot 的 vector 操作）可能抛 bad_alloc；
@@ -813,12 +779,15 @@ void Cask::close() noexcept {
         // lanes_ 移除），不停池（其它库仍在用）。unregister_lib 内含 flush，
         // 保证 search_ 析构前本 lane 的 reduce 闭包已不再被 reducer 调用。
         // 整池停在 registry 析构。
+        // S45-3：ckpt 覆盖水位 = 注销前一刻的 LSN 连续完成前缀（超时未排空时
+        // peek_next_ord 会冒充未应用的 LSN）。无车道 = 纯 KV，不用。
+        std::uint64_t close_coverage = authority_ ? authority_->peek_next_ord() : 0;
         if (index_pool_ && index_lane_) {
             // P6-DL-1：unregister_lib 内含 30s 有界 flush。超时 = 索引车道未
             // 排空（写线程被 kill 于 submit 中途，或 in_flight 泄漏）——此时
             // lane 仍被 erase，与在途 map worker 可能竞态。取舍同上方
             // writes_in_flight_ 逃生门（S25-T1）：潜在 UAF 优于永久挂死。
-            if (!index_pool_->unregister_lib(index_lane_)) {
+            if (!index_pool_->unregister_lib(index_lane_, &close_coverage)) {
                 log_error("close: index lane not drained after 30s — "
                           "proceeding with teardown (potential UAF risk; "
                           "index may be incomplete)");
@@ -832,8 +801,7 @@ void Cask::close() noexcept {
             // .prev 代际刷新、delta 链坍缩（链不跨干净重启累积）。
             force_ckpt_rebase();
             const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
-            (void)save_search_ckpt_paired(search_ckpt,
-                                          authority_->peek_next_ord(),
+            (void)save_search_ckpt_paired(search_ckpt, close_coverage,
                                           collect_snapshot_watermarks(), {});
         }
         if (opts_.read_write) write_authority_snapshot();
@@ -1018,8 +986,32 @@ void Cask::maybe_flush_oki_unlocked() noexcept {
 // H1（s13-review §P1）：常规写路径在 write_mu_ 释放后才调本函数——push
 // 阻塞只挡本写者，不再全队冻结。锁外读 index_pool_/index_lane_ 由
 // WriteOpGate 与 close() 的排空等待同步（见 cask.hpp）。
+void Cask::complete_index_ord(std::uint64_t ord) noexcept {
+    // S45-4：直接记 LSN 完成（不排队、不阻塞、不分配——可在析构里调用）。
+    if (index_pool_ && index_lane_) index_pool_->complete(index_lane_, ord);
+}
+
+unsigned Cask::index_shard_count() const {
+    if (index_pool_) return index_pool_->shard_count();
+    return registry_ ? registry_->index_pool()->shard_count() : 1u;
+}
+
+unsigned Cask::index_shard_of(std::string_view key) const {
+    if (index_pool_) return index_pool_->shard_of(key);
+    return registry_ ? registry_->index_pool()->shard_of(key) : 0u;
+}
+
+std::uint64_t Cask::index_coverage() const {
+    if (index_pool_ && index_lane_) return index_pool_->coverage(index_lane_);
+    return authority_ ? authority_->peek_next_ord() : 0;
+}
+
 void Cask::submit_index_task(IndexTask task) {
     if (!index_pool_ || !index_lane_) return;
+    if (const auto j = submit_jitter_us_.load(std::memory_order_relaxed); j > 0) {
+        thread_local std::minstd_rand rng(std::random_device{}());
+        std::this_thread::sleep_for(std::chrono::microseconds(rng() % (j + 1)));
+    }
     index_pool_->submit(index_lane_, std::move(task));
 }
 
@@ -1331,8 +1323,8 @@ Cask::RebuildOutcome Cask::run_controlled_rebuild(bool wait,
 std::expected<void, CaskFault> Cask::prepare_search() {
     if (!text_) return std::unexpected(err(CaskError::kNoIndex));
     flush_index();
-    // S27-4 P2:reducer 排干只保证 job 已**派发**;builder 模式下 apply 可能
-    // 仍在途。drain 钩子补齐 read-your-writes(设计 §3;内联模式为空操作)。
+    // 插件 drain 钩子(S27-4 builder 时代的读屏障补齐)。S45-4 起分片线程
+    // 同步应用、无插件内部异步队列,内置插件为空操作;保留给第三方插件。
     for (auto* p : plugins_) p->drain();
     return {};
 }
@@ -1386,7 +1378,7 @@ Cask::write_and_keydir(std::span<const std::byte> key,
     // S6-P1: 原始 ord 在 keydir 竞争中落败（kAlreadyExists），数据已写入但
     // keydir 未收录。发 Skip 填充 ord 空洞，防 reorder buffer stall。
     // 必须在 caller 提交 ord2 的真任务之前提交（队列 FIFO 保序）。
-    submit_index_task(IndexTask::make(IndexOp::Skip, {}, ord, {}, 0, 0, 0, 0, 0));
+    complete_index_ord(ord);
     g2.disarm();  // S13-F2: ord2 将由 caller 的真任务（Add）覆盖
     maybe_flush_oki();  // S33-4：memdelta 阈值检查
     return PersistedRecord{ord2, w2->offset, w2->total_size, active_file_id_};
@@ -1485,10 +1477,7 @@ void Cask::process_one_gc_round_locked() {
         r->ok = false;
         r->err = std::move(e);
     };
-    auto skip_ord = [this](std::uint64_t ord) {
-        submit_index_task(
-            IndexTask::make(IndexOp::Skip, {}, ord, {}, 0, 0, 0, 0, 0));
-    };
+    auto skip_ord = [this](std::uint64_t ord) { complete_index_ord(ord); };
 
     if (is_closed()) {
         for (auto* r : batch) fail(r, err(CaskError::kClosed, "cask is closed"));
@@ -2149,8 +2138,7 @@ Cask::put_batch(std::span<const BatchItem> items, std::uint64_t tstamp) {
         ~BatchOrdGuard() {
             for (std::size_t i = 0; i < ords.size(); ++i) {
                 if (!done[i]) {
-                    cask->submit_index_task(IndexTask::make(
-                        IndexOp::Skip, {}, ords[i], {}, 0, 0, 0, 0, 0));
+                    cask->complete_index_ord(ords[i]);
                 }
             }
         }
@@ -2543,8 +2531,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
         ~BatchOrdGuard() {
             for (std::size_t i = 0; i < ords.size(); ++i) {
                 if (!done[i]) {
-                    cask->submit_index_task(IndexTask::make(
-                        IndexOp::Skip, {}, ords[i], {}, 0, 0, 0, 0, 0));
+                    cask->complete_index_ord(ords[i]);
                 }
             }
         }
@@ -2980,6 +2967,7 @@ StatusInfo Cask::status() {
         s.files.push_back(merge::summarize(dirname_, f));
     }
     s.index_errors = index_errors_.load(std::memory_order_relaxed);
+    s.index_stale_dropped = dispatcher_.stale_dropped();
     // S13-D8：观测扩展（全部经线程安全访问器：HNSW 原子计数、cache 自带锁、
     // read_files_ shared_lock；不含需遍历 concurrent map 的指标，见 hpp 注）。
     if (text_) {
@@ -3068,16 +3056,40 @@ Cask::NeedsMerge Cask::needs_merge(std::uint64_t now_sec) {
     return n;
 }
 
+// S45-4：独占执行 fn（维护线程，按库暂停应用）并有界等待其完成。返回
+// 0=超时 / 1=fn 报成功 / 2=fn 报失败。fn 自己返回 bool；超时后 fn 仍可能
+// 稍后执行——状态全在共享块里，不引用调用方栈。
+int Cask::run_exclusive_and_wait(std::function<bool()> fn,
+                                 std::chrono::milliseconds timeout) {
+    struct State {
+        std::mutex mu;
+        std::condition_variable cv;
+        int val = 0;
+    };
+    auto st = std::make_shared<State>();
+    index_pool_->run_exclusive(index_lane_, [st, fn = std::move(fn)] {
+        int r = 2;
+        try {
+            r = fn() ? 1 : 2;
+        } catch (...) {
+        }
+        {
+            std::lock_guard<std::mutex> lk(st->mu);
+            st->val = r;
+        }
+        st->cv.notify_all();
+    });
+    std::unique_lock<std::mutex> lk(st->mu);
+    st->cv.wait_for(lk, timeout, [&] { return st->val != 0; });
+    return st->val;
+}
+
 // 手动 checkpoint（s13-review §P1 后续②）。语义与并发契约见 cask.hpp 声明。
-// 与 merge 收尾（S13-F6）同机制：search.ckpt 序列化封装成 RunFn 经 reorder
-// buffer 在 reducer 线程按 ord 序执行。区别：不等 flush(lane)（持续写入下
-// in_flight 难归零，等待无界），只等自己的 RunFn 完成——reducer 严格按 ord
-// 序 apply，RunFn 执行时其 ord 之前的事件必然已全部应用，等待有界（此刻
-// 之前已提交的积压）。完成信号用 tri-state 原子（0=pending/1=ok/2=fail）+
-// atomic::wait；fn 内兜异常（reducer 的 catch 只计数不回传，若 fn 抛出而
-// 不置状态，本调用将永久挂起）。
+// S45-4：① 有界等本调用之前分配的 LSN 全部应用（LSN 前缀读屏障，持续写入
+// 下不饿死）；② 维护线程独占执行成对保存——执行期间本库暂停应用，覆盖水位
+// = 暂停时刻的 LSN 连续完成前缀（≥ ① 的目标）。
 std::expected<void, CaskFault> Cask::checkpoint() {
-    WriteOpGate gate(this);  // H1：close() 等本调用（含 RunFn 等待）完成
+    WriteOpGate gate(this);  // H1：close() 等本调用（含独占保存等待）完成
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
     drain_retired_files();  // B4：周期落点排水（上一代退休文件删除）
     if (!opts_.read_write || opts_.merge_only) {
@@ -3086,129 +3098,49 @@ std::expected<void, CaskFault> Cask::checkpoint() {
     }
     std::lock_guard<std::mutex> lk(ckpt_mu_);
     if (!text_) {
-        // 纯 KV 库：keydir 快照即全部（无 reducer，调用线程直写；并发调用
-        // 由 ckpt_mu_ 串行，快照 tmp+rename 不与自身竞争）。
+        // 纯 KV 库：keydir 快照即全部（调用线程直写；并发调用由 ckpt_mu_ 串行）。
         write_authority_snapshot();
         return {};
     }
     const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
-    if (index_pool_ && index_lane_) {
-        // DL-MED-2: pool is stopped → synchronous fallback (no submit, no
-        // ord leak, no done-wait). Guard not needed.
-        if (index_pool_->is_stopped()) {
-            std::vector<std::byte> kd;
-            auto wms0 = collect_snapshot_watermarks();
-            (void)wms0;
-            const std::uint64_t wm = authority_->peek_next_ord();
-            if (!save_search_ckpt_paired(search_ckpt, wm, wms0, kd)) {
-                return std::unexpected(err(CaskError::kIo,
-                    "checkpoint: search checkpoint save failed (stopped pool "
-                    "synchronous path)"));
-            }
-            // P5-MEM-2: 同步路径必须自己推进水位——否则 last_ckpt_ord_ 停滞，
-            // 下次写入立刻触发一次冗余自动 ckpt（异步 RunFn 路径在 fn 内 store）。
-            last_ckpt_ord_.store(wm, std::memory_order_relaxed);
-        } else {
-            // DL-MED-2: 用 mutex+cv 替代 atomic+wait —— atomic::wait 无 timeout
-            // 变体（C++20/23 没有 atomic_wait_for/until 自由函数），checkpoint
-            // 需要有界等待防 stopped_ pool 丢弃任务后永久挂死。
-            auto done_mu = std::make_shared<std::mutex>();
-            auto done_cv = std::make_shared<std::condition_variable>();
-            auto done_val = std::make_shared<int>(0);
-            IndexTask t;
-            t.op  = IndexOp::RunFn;
-            const std::uint64_t ord = authority_->alloc_ord();
-            OrdSkipGuard og(this, ord);  // DL-MED-1: 失败路径补 Skip 防 ord 空洞
-            // S14-1：keydir 快照也移进 RunFn——所有 ckpt 文件写统一到 reducer
-            // 单线程，与自动 checkpoint 的 RunFn 天然串行（消除 .tmp 并发写
-            // 窗口，且不能在此持 ckpt_mu_ 等 reducer——会与手动调用互锁）。
-            // 成对性：字节水位在**提交时刻**捕获（wms 先于 wm，保证水位覆盖的
-            // 记录 ord < wm ≤ search 覆盖）；RunFn 执行时刻取水位会被并发写者
-            // 推进而反转不变量（见 collect_snapshot_watermarks 注释）。
-            // S14-7：keydir 元数据 payload 于提交时刻构建（wms 同刻捕获，
-            // 成对一致）；delta 路径内联进 delta 文件，base 路径落全量快照。
-            std::vector<std::byte> kd;
-            if (auto wms0 = collect_snapshot_watermarks()) {
-                (void)wms0;
-                t.fn = [this, search_ckpt, done_mu, done_cv, done_val,
-                        wms = std::move(wms0),
-                        kd = std::move(kd), wm = authority_->peek_next_ord()] {
-                    int result = 2;
-                    try {
-                        result = save_search_ckpt_paired(search_ckpt, wm, wms, kd)
-                                     ? 1
-                                     : 2;
-                    } catch (...) {
-                        // result 保持 2；异常由 reducer error_fn 计数上报。
-                    }
-                    if (result == 1) {
-                        last_ckpt_ord_.store(wm, std::memory_order_relaxed);
-                    }
-                    {
-                        // done_lk 而非 lk：本函数上方已有一个 lk(ckpt_mu_),
-                        // 同名会 shadow 它(-Wshadow,werror-lib 带 -Werror)。
-                        std::lock_guard<std::mutex> done_lk(*done_mu);
-                        *done_val = result;
-                    }
-                    done_cv->notify_all();
-                };
-            } else
-            t.fn  = [this, search_ckpt, done_mu, done_cv, done_val,
-                     wms = collect_snapshot_watermarks(),
-                     wm = authority_->peek_next_ord()] {
-                int result = 2;
-                try {
-                    // 水位捕获失败（文件态不稳定）：无 keydir payload，delta
-                    // 的字节水位不推进（方向安全）；base 路径也无快照可写。
-                    result = save_search_ckpt_paired(
-                                 search_ckpt, wm, wms, {}) ? 1 : 2;
-                } catch (...) {
-                    // result 保持 2；异常本体由 reducer 的 error_fn 计数上报。
-                }
-                if (result == 1) {
-                    last_ckpt_ord_.store(wm, std::memory_order_relaxed);
-                }
-                {
-                    std::lock_guard<std::mutex> done_lk(*done_mu);  // 同上,避免 shadow lk(ckpt_mu_)
-                    *done_val = result;
-                }
-                done_cv->notify_all();
-            };
-            t.ord = ord;
-            index_pool_->submit(index_lane_, std::move(t));
-            og.disarm();  // DL-MED-1: RunFn 已携带 ord，guard 不再需要兜底
-            // DL-MED-2: 有界等待——30s 超时后报告失败（不再永久挂死）。
-            // 超时根因：pool 已 stop 且 submit 静默丢弃任务（理论上 is_stopped()
-            // 已拦截，但双保险）；或 reducer 线程异常卡死。
-            int wait_result = 0;
-            {
-                std::unique_lock<std::mutex> done_lk(*done_mu);  // 同上
-                done_cv->wait_for(done_lk, std::chrono::seconds(30),
-                                  [&] { return *done_val != 0; });
-                wait_result = *done_val;
-            }
-            if (wait_result == 0) {
-                return std::unexpected(err(CaskError::kIo,
-                    "checkpoint: timed out waiting for ckpt RunFn"));
-            }
-            if (wait_result != 1) {
-                return std::unexpected(err(CaskError::kIo,
-                    "checkpoint: search checkpoint save failed"));
-            }
+    if (index_pool_ && index_lane_ && !index_pool_->is_stopped()) {
+        constexpr auto kCkptWait = std::chrono::seconds(30);
+        // ① 覆盖到调用时刻：之前分配的 LSN 全部应用（有界）。
+        if (!index_pool_->wait_lsn(index_lane_, authority_->peek_next_ord(),
+                                   kCkptWait)) {
+            return std::unexpected(err(CaskError::kIo,
+                "checkpoint: timed out waiting for index to catch up"));
         }
-    } else {
-        // 无索引池（理论不可达：search_ 存在则 lane 已注册）——调用线程直跑。
-        std::vector<std::byte> kd;
         auto wms0 = collect_snapshot_watermarks();
-        (void)wms0;
-        const std::uint64_t wm = authority_->peek_next_ord();
-        if (!save_search_ckpt_paired(search_ckpt, wm, wms0, kd)) {
+        const int r = run_exclusive_and_wait(
+            [this, search_ckpt, wms = std::move(wms0)] {
+                const std::uint64_t wm = index_coverage();  // 暂停时刻前缀
+                if (!save_search_ckpt_paired(search_ckpt, wm, wms, {})) {
+                    return false;
+                }
+                last_ckpt_ord_.store(wm, std::memory_order_relaxed);
+                return true;
+            },
+            kCkptWait);
+        if (r == 0) {
+            return std::unexpected(err(CaskError::kIo,
+                "checkpoint: timed out waiting for exclusive save"));
+        }
+        if (r != 1) {
             return std::unexpected(err(CaskError::kIo,
                 "checkpoint: search checkpoint save failed"));
         }
-        // P5-MEM-2: 同步直跑路径同样自己推进水位（防冗余自动 ckpt）。
-        last_ckpt_ord_.store(wm, std::memory_order_relaxed);
+        return {};
     }
+    // 池已停 / 无索引池（理论不可达）：此刻无并发应用，调用线程直跑。
+    auto wms0 = collect_snapshot_watermarks();
+    const std::uint64_t wm = index_coverage();
+    if (!save_search_ckpt_paired(search_ckpt, wm, wms0, {})) {
+        return std::unexpected(err(CaskError::kIo,
+            "checkpoint: search checkpoint save failed (synchronous path)"));
+    }
+    // P5-MEM-2: 同步路径同样推进水位（防冗余自动 ckpt）。
+    last_ckpt_ord_.store(wm, std::memory_order_relaxed);
     return {};
 }
 
@@ -3353,18 +3285,14 @@ void Cask::maybe_submit_auto_checkpoint() {
     if (auto_ckpt_inflight_.exchange(true, std::memory_order_acq_rel)) {
         return;  // 已有在途 RunFn,完成后由后续写触发重试
     }
-    IndexTask t;
-    t.op  = IndexOp::RunFn;
-    const std::uint64_t ord = authority_->alloc_ord();
-    OrdSkipGuard og(this, ord);  // DL-MED-1
-    std::vector<std::byte> auto_kd;
+    // S45-4：维护线程独占执行（不占 LSN）。fire-and-forget；覆盖水位取暂停
+    // 时刻的 LSN 连续完成前缀。
     auto auto_wms = collect_snapshot_watermarks();
-    (void)auto_wms;
-    t.fn  = [this, wms = std::move(auto_wms), kd = std::move(auto_kd),
-             wm = authority_->peek_next_ord()] {
+    index_pool_->run_exclusive(index_lane_, [this, wms = std::move(auto_wms)] {
+        const std::uint64_t wm = index_coverage();
         try {
             if (save_search_ckpt_paired(dirname_ + "/" + kSearchCkptName,
-                                        wm, wms, kd)) {
+                                        wm, wms, {})) {
                 last_ckpt_ord_.store(wm, std::memory_order_relaxed);
             } else {
                 log_warn("auto checkpoint: search ckpt save failed "
@@ -3375,10 +3303,7 @@ void Cask::maybe_submit_auto_checkpoint() {
                       "recovery still covered by data fold)");
         }
         auto_ckpt_inflight_.store(false, std::memory_order_release);
-    };
-    t.ord = ord;
-    submit_index_task(std::move(t));
-    og.disarm();  // DL-MED-1
+    });
 }
 
 // 合并执行。files 为空时先 needs_merge 决定要并什么；非空就直接用
@@ -3486,50 +3411,45 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
         // 两写之间崩溃会留下「新快照+旧 ckpt」，fold 从超前水位起跳、
         // search 永久丢窗口。捕获早 + 写入晚，两个约束同时满足。
         const auto merge_snap_wms = collect_snapshot_watermarks();
-        if (index_pool_ && index_lane_) index_pool_->flush(index_lane_);
+        flush_index();  // S45-3：LSN 前缀读屏障
 
         // S18-7：倒排压实与 HNSW 重建已随 on_merge_commit 由各插件自主
-        // 提交（run_serialized → RunFn FIFO，先于下方成对保存点执行——
+        // 提交（run_serialized → 维护线程 FIFO，先于下方成对保存点执行——
         // 顺序涌现 = 旧「compact → rebuild → ckpt」硬编码序）。宿主只剩
         // docmap 侧收尾（chunk 回收）+ merge 恒 rebase + 成对保存点。
 
         // P14e:统一分段 search.ckpt 替代旧多文件保存。
         // best-effort:checkpoint 保存失败非致命——下次 open 回退到全量 fold 重建
         // 搜索索引（仅慢一次启动，数据不受影响），故显式忽略返回值而非让 merge 失败。
-        // S13-F6：序列化同样遍历 concurrent_hash_map——经 RunFn 在
-        // reducer 线程执行（S22-B2 前还有 truncate_wal 竞争一由，WAL 已退役）。
-        // 水位在提交时取值（by-value 捕获），语义与旧版一致。
+        // S45-4：序列化需要「无并发写」——经维护线程独占执行；覆盖水位取
+        // 暂停时刻的 LSN 连续完成前缀。
         const std::string search_ckpt = dirname_ + "/" + kSearchCkptName;
-        if (index_pool_ && index_lane_) {
-            IndexTask t;
-            t.op  = IndexOp::RunFn;
-            const std::uint64_t ord = authority_->alloc_ord();
-            OrdSkipGuard og(this, ord);  // DL-MED-1
-            // S14-7：merge 恒 rebase → paired 走 base + 全量快照（用早段
-            // 捕获的水位）。S18-7：rebase 标志改在此显式置位（原经 compact
-            // shim 顺带置全局位；插件版 compact 只置自身位）；docmap chunk
-            // 回收（原 compact_index_chunks）一并收进本 RunFn。
-            t.fn  = [this, search_ckpt, wms = merge_snap_wms,
-                     wm = authority_->peek_next_ord()] {
-                docmap_->compact_chunks();
-                force_ckpt_rebase();
-                if (!save_search_ckpt_paired(search_ckpt, wm, wms, {})) {
-                    log_warn("search checkpoint save failed after merge "
-                             "(will rebuild on next open)");  // S13-D7
-                } else {
-                    // P5-MEM-2: merge 后 rebase 全量 ckpt 已落盘 → 推进水位，
-                    // 否则紧随的写入立刻触发一次冗余自动 ckpt。
+        if (index_pool_ && index_lane_ && !index_pool_->is_stopped()) {
+            // S45-4：维护线程独占执行（排在插件 on_merge_commit 投递的压实/
+            // 重建之后——同队列 FIFO），并有界等待其完成再进入收尾阶段。
+            const int mr = run_exclusive_and_wait(
+                [this, search_ckpt, wms = merge_snap_wms] {
+                    const std::uint64_t wm = index_coverage();
+                    docmap_->compact_chunks();
+                    force_ckpt_rebase();
+                    if (!save_search_ckpt_paired(search_ckpt, wm, wms, {})) {
+                        log_warn("search checkpoint save failed after merge "
+                                 "(will rebuild on next open)");  // S13-D7
+                        return false;
+                    }
+                    // P5-MEM-2: merge 后 rebase 全量 ckpt 已落盘 → 推进水位。
                     last_ckpt_ord_.store(wm, std::memory_order_relaxed);
-                }
-            };
-            t.ord = ord;
-            index_pool_->submit(index_lane_, std::move(t));
-            og.disarm();  // DL-MED-1
-            index_pool_->flush(index_lane_);
+                    return true;
+                },
+                std::chrono::seconds(30));
+            if (mr == 0) {
+                log_warn("merge: timed out waiting for post-merge index "
+                         "maintenance (continuing)");
+            }
         } else {
             docmap_->compact_chunks();
             force_ckpt_rebase();
-            const std::uint64_t wm = authority_->peek_next_ord();
+            const std::uint64_t wm = index_coverage();
             if (!save_search_ckpt_paired(search_ckpt, wm, merge_snap_wms, {})) {
                 log_warn("search checkpoint save failed after merge "
                          "(will rebuild on next open)");  // S13-D7

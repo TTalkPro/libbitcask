@@ -9,24 +9,45 @@
 // 本头自包含：只依赖标准库，不 include 任何 bitcask 头。Cask、merge、
 // thread_pool 只 include 本头，不 include bm25/vector/search。
 //
-// === 两相写入契约（现有 IndexPool 流水线 map/reduce 契约的固化）===
-// - prepare：纯函数、任意 map worker 线程并发调用、不得触碰插件可变状态。
-//   可选能力（wants_prepare() 声明）——不需要预处理的插件事件直达 on_put。
-// - on_put / on_delete：reducer 单写者上下文，按 ord 严格升序到达（可有洞：
-//   ord 被 KV 层浪费时以 Skip 填充，插件不感知）。
+// === 写入契约（S45-4：索引管线去全局顺序化，设计
+// designs/index-pipeline-unordered-design-zh.md §4.7）===
+// - **到达序任意**：事件不再按 ord 升序到达。宿主保证 ① 同 key 事件串行
+//   （同一应用线程，按提交序）；② 已按「key + ord」裁决——乱序到达的旧版本
+//   与已被后续删除覆盖的写不会送达插件（规则 R）。插件仍须对**同 ord 重复**
+//   幂等（恢复重放 / 重复投递）。
+// - 并发能力由 concurrency() 声明：
+//     kSharded —— 不同 key 的事件在 N 个分片线程上**并发**到达（PutEvent/
+//                 DeleteEvent::shard 标明分片，同分片恒同一线程；OpenContext::
+//                 shards 给出分片数，供插件预建每分片的单写者结构）；
+//     kSerial  —— 全部事件在同一个串行线程到达（默认；单写者结构如 HNSW）。
+//                 串行道在分片阶段之后执行：插件执行时宿主 docmap 可能已应用
+//                 同 key 的更新版本（docmap 恒先于插件，但不停留在本版本）。
+// - prepare：可选纯函数预处理（wants_prepare()），宿主在同一应用线程、紧挨
+//   on_put 之前调用（独立 map 阶段已退役）；不得触碰插件可变状态。
+// - accepts_put()/accepts_delete()：串行插件的事件过滤（如向量插件只收带
+//   向量的写），减少串行线程负担；分片插件同样适用。
 // - 恢复重放复用 on_put/on_delete（无 recover_* 专用动词）：宿主从
-//   min(全插件 watermark) 起 fold data 文件重放，插件必须跳过
-//   ord <= 自身 watermark() 的事件（幂等义务；HNSW max_inserted_ord_ /
-//   倒排 WAL 水位自门机制的接口化）。
+//   replay_floor_of(min(全插件 watermark)) 起 fold data 文件重放，重放任务
+//   与在线写走同一分片执行器（并行、到达序任意，PutEvent::replay = true）。
+//   插件幂等义务：watermark() 之上的事件**可能已应用过**（乱序应用、早于
+//   落盘；或旧版本 ckpt 的水位高估——宿主为此多重放 kReplayFloorMargin），
+//   须按 **key + LSN** 判重（该 key 已有 LSN ≥ 本事件即跳过；删除保留墓碑），
+//   不得用单调水位门。内置实现：TextPlugin 的 key_to_location_、向量插件的
+//   detail::VectorKeyLocations。
 // - ord 由宿主（keydir alloc_ord）分配，全局单调、不复用；插件只消费。
+//
+// === 独占维护（run_serialized）===
+// PluginHost::run_serialized(fn)：维护线程上 FIFO 执行；执行期间本库暂停
+// 应用（无任何 on_put/on_delete 并发）。插件的压实、重建、封口合并等需要
+// 「无并发写」的操作必须经此通道。闭包内不得提交写、不得等读屏障。
 //
 // === merge 参与协议（设计 §3.9）===
 // on_merge_begin → (逐条 on_relocate，携带 value 视图) → on_merge_commit/abort，
-// 全部在 merge 线程上与 reducer 并发派发。插件在 merge 回调里不得直接变异
-// 自身单写者状态——要么影子构建 + 原子发布，要么经 PluginHost::run_serialized
-// 投递到 reducer 静止点。插件在 on_merge_commit 内提交的 run_serialized 闭包
-// 先于宿主随后提交的成对保存点执行（同队列 FIFO）。
-//
+// 全部在 merge 线程上与应用线程并发派发。插件在 merge 回调里不得直接变异
+// 自身单写者状态——要么影子构建 + 原子发布，要么经 run_serialized 投递。
+// 插件在 on_merge_commit 内提交的 run_serialized 闭包先于宿主随后提交的
+// 成对保存点执行（同队列 FIFO）。
+
 // === 错误契约 ===
 // 数据事件回调（prepare/on_put/on_delete/on_relocate）抛出的异常由宿主吞并：
 // 错误计数自增 + 日志上报、流水线保活、ord 照常推进（S13-D7 语义）。
@@ -44,6 +65,15 @@
 #include <utility>
 
 namespace bitcask::plugin {
+
+// S45-5：恢复重放起点的安全余量。宿主从 max(0, min(全组件 watermark) − 本值)
+// 起重放（插件按 key + LSN 判重，多重放的部分幂等跳过）。
+// 余量吸收 S45 之前版本 checkpoint 的覆盖水位微小高估（旧水位取「提交时刻
+// 的 peek_next_ord」，可能计入数个尚未应用的 LSN）。
+inline constexpr std::uint64_t kReplayFloorMargin = 4096;
+[[nodiscard]] inline constexpr std::uint64_t replay_floor_of(std::uint64_t wm) noexcept {
+    return wm > kReplayFloorMargin ? wm - kReplayFloorMargin : 0;
+}
 
 // 插件操作结果（本头自包含，不复用 CaskError——插件失败语义只有成败与描述）。
 enum class PluginStatus : std::uint8_t {
@@ -86,6 +116,8 @@ struct PutEvent {
     // 据此调整**执行策略**（非语义）：如 TextPlugin 在重放批里让单文本也走
     // prepare 并行分析（S3 恢复期并行语义），活写路径路由不动。
     bool             replay = false;
+    // S45-4：分片下标（kSharded 插件：同分片恒同一线程；kSerial 插件忽略）。
+    unsigned         shard = 0;
 };
 
 // S16-2：prior_ord = 被删文档原 ord，宿主在 docmap remove **前**捕获
@@ -97,6 +129,7 @@ struct DeleteEvent {
     std::uint64_t    ord = 0;   // 墓碑 record 的 ord
     std::string_view key;
     std::uint64_t    prior_ord = kNoPriorOrd;
+    unsigned         shard = 0;  // S45-4：同 PutEvent::shard
 };
 
 // merge 搬迁事件：ord 不变、只换存储定位。value 视图免费附带——merge fold
@@ -162,19 +195,12 @@ public:
     // 按存储定位读回原始记录 value（重建/回填场景）。失败返回 nullopt。
     virtual std::optional<std::string> read_at(RecordLoc loc) = 0;
 
-    // 在 reducer 静止点串行执行 fn（单写者上下文）。fire-and-forget；
-    // 同一提交序 FIFO 执行。插件在 merge 线程等并发上下文要变异自身
-    // 单写者状态时，必须经此通道。
-    //
-    // ⚠️ 死锁陷阱（DL 陷阱 6，RISK_REPORT v2）：
-    // 严禁在 reducer 上下文（on_put / on_delete / RunFn 闭包内）调用本方法——
-    // 构成环死锁：调用者线程已持有 reducer 单写者，但 run_serialized
-    // 提交的 fn 又需排队进同一 reducer。当 queue 满（10240）+ reorder 在途
-    // 达上限（16384）时，submit 阻塞调用者；reducer 等调用者释放单写者——
-    // 环闭合，进程级挂死。
-    // 当前实现所有调用点均在 merge 线程（不在 reducer 上下文），此契约仅作
-    // 防回归固化。新增插件若需在 reducer 内变异状态，改用原子发布 / shadow
-    // build 模式，不得调本方法。
+    // 独占执行 fn（S45-4：维护线程 FIFO；执行期间本库暂停应用，无任何
+    // on_put/on_delete 并发）。fire-and-forget。插件在 merge 线程等并发上下文
+    // 要变异自身单写者状态、或需要「无并发写」的压实/重建时，必须经此通道。
+    // 可在任意线程（含 on_put 内）调用——只入队不等待，不会自锁。
+    // ⚠️ fn 内不得提交写、不得等读屏障（二者都要等应用推进，而应用正被 fn
+    // 暂停）。
     virtual void run_serialized(std::function<void()> fn) = 0;
 
     virtual void log(LogLevel level, std::string_view msg) = 0;
@@ -189,6 +215,8 @@ struct OpenContext {
     std::uint64_t committed_base_watermark  = 0;
     std::uint64_t committed_chain_watermark = 0;
     std::uint32_t committed_chain_seq       = 0;
+    // S45-4：应用分片数（kSharded 插件据此预建每分片单写者结构；≥ 1）。
+    unsigned      shards = 1;
 };
 
 // KV 存储层插件接口。线程/顺序/错误契约见头注释。
@@ -208,9 +236,21 @@ public:
     virtual std::uint64_t watermark() const = 0;
     virtual PluginStatus close() = 0;  // 含终止性 flush
 
-    // ---- 数据事件（reducer 单写者，ord 严格升序）----
+    // ---- 数据事件（S45-4：同 key 串行、到达序任意；并发度见 concurrency()）----
     virtual void on_put(const PutEvent& e, PreparedPtr prep) = 0;
     virtual void on_delete(const DeleteEvent& e) = 0;
+
+    // ---- S45-4：并发能力与事件过滤 ----
+    enum class Concurrency : std::uint8_t {
+        kSerial  = 0,  // 全部事件同一线程（默认，最保守）
+        kSharded = 1,  // 不同 key 并发；同分片同线程
+    };
+    virtual Concurrency concurrency() const { return Concurrency::kSerial; }
+    virtual bool accepts_put(const PutEvent& e) const {
+        (void)e;
+        return true;
+    }
+    virtual bool accepts_delete() const { return true; }
 
     // ---- 可选能力：并行预处理（纯函数，任意线程）----
     virtual bool wants_prepare() const { return false; }
