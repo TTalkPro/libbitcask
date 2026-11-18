@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`8.0.0`**；库 `SOVERSION` = **`8`**（= major）；
+`bitcask_version_*` = **`8.0.1`**；库 `SOVERSION` = **`8`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -15,7 +15,10 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
-## [Unreleased]（S47：Windows TBB finalize 兼容）
+## [8.0.1] - 2026-11-18（S47：Windows TBB finalize 兼容）
+
+> **版本语义**：纯缺陷修复——C API 签名、C ABI、盘上格式零改动；
+> `SOVERSION` 保持 `8`。取 PATCH +1（8.0.1）。
 
 ### Fixed
 
@@ -2178,6 +2181,7 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
 - 协议：[Apache License 2.0](LICENSE)。
 
 [Unreleased]: https://github.com/davidalphafox/libbitcask/compare/8.0.0...HEAD
+[8.0.1]: https://github.com/davidalphafox/libbitcask/compare/8.0.0...8.0.1
 [8.0.0]: https://github.com/davidalphafox/libbitcask/compare/7.0.3...8.0.0
 [3.1.0]: https://github.com/davidalphafox/libbitcask/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/davidalphafox/libbitcask/compare/v1.2.0...v3.0.0
