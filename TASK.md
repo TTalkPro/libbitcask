@@ -10,6 +10,21 @@
 
 ---
 
+## 🔴 S48 · MSVC 显式异常展开（RAII 跨异常契约）（2026-11-18 立项）
+
+> 来源：下游反馈
+> [`feedbacks/2026-11-18-msvc-no-ehsc-raii-not-unwound-seqgate-hangs.md`](feedbacks/2026-11-18-msvc-no-ehsc-raii-not-unwound-seqgate-hangs.md)。
+> 本库异常安全按「异常跨过局部对象必然析构」设计（`SeqGate`、C API
+> `try_call`、锁/句柄守卫）；MSVC 不开启异常展开时该前提失效，可能造成
+> 读者永久自旋。修复必须显式置于目录作用域、不依赖 CMake 默认 flags。
+
+| 项 | 状态 |
+|---|---|
+| S48-1 MSVC 全局显式加 `/EHsc`，写明 SeqGate / oneTBB 连带原因 | ✅ |
+| S48-2 `SeqGate.WindowReleasedOnException` 回归与 Release 增量构建 | ✅ |
+
+---
+
 ## 🔴 S47 · Windows TBB finalize 兼容（2026-11-18 立项）
 
 > 来源：下游反馈

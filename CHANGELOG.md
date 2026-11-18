@@ -15,6 +15,21 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
+## [Unreleased]（S48：MSVC 异常展开必需项）
+
+### Fixed
+
+- **MSVC 未显式启用异常展开时的 RAII/SeqGate 挂死**（下游反馈
+  `feedbacks/2026-11-18-msvc-no-ehsc-raii-not-unwound-seqgate-hangs.md`）：
+  MSVC 全局编译项显式加入 `/EHsc`。此前只依赖 CMake 默认 flags；下游嵌入
+  或清空 `CMAKE_CXX_FLAGS` 后，异常跨过 `SeqGate::WriteGuard` 时不会析构，
+  序号停在奇数，读者会永久自旋。显式 `/EHsc` 保证 RAII 异常安全契约成立，
+  并同步保证 oneTBB 的 `_CPPUNWIND` / `TBB_USE_EXCEPTIONS=1` 配置。C API、
+  盘上格式与正常路径行为零改动；`SeqGate.WindowReleasedOnException` 为
+  必测哨兵。
+
+---
+
 ## [8.0.1] - 2026-11-18（S47：Windows TBB finalize 兼容）
 
 > **版本语义**：纯缺陷修复——C API 签名、C ABI、盘上格式零改动；

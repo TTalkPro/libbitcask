@@ -62,7 +62,12 @@ enable_testing()
 # ② NOMINMAX + WIN32_LEAN_AND_MEAN —— windows.h 的 min/max 函数式宏 vs 全库
 #    94 处 std::min/std::max。**全局定义而非只在移植层给**：windows.h 只准进
 #    移植层 TU，但第三方头（TBB / googletest）也可能间接引入，全局定义才封死。
-# ③ /bigobj —— C++23 重模板 + segment.hpp 一类大 TU 会超过 COFF 的 65279 段上限。
+# ③ /EHsc —— 全库异常安全契约依赖 RAII 跨异常析构（SeqGate 写窗口、C API
+#    try_call、各类锁/句柄守卫）。无展开时 MSVC 不析构异常跨过的局部对象，
+#    SeqGate 会把序号留在奇数、读者永久自旋；同时 _CPPUNWIND 未定义会连带
+#    让 oneTBB 进入 TBB_USE_EXCEPTIONS=0，单参 finalize 消失（S47）。不能
+#    依赖 CMake 默认 flags——下游嵌入或显式清空 flags 时必须仍然成立。
+# ④ /bigobj —— C++23 重模板 + segment.hpp 一类大 TU 会超过 COFF 的 65279 段上限。
 #
 # 附带的一致性开关（设计稿 §1.2 末行）：
 # - /permissive- —— 关闭 MSVC 的宽松模式，两阶段名字查找与 GCC/Clang 对齐，
@@ -73,7 +78,7 @@ enable_testing()
 #   分支的代码（含标准库探测）会走错分支。
 # ---------------------------------------------------------------------------
 if(MSVC)
-    add_compile_options(/utf-8 /bigobj /permissive- /Zc:preprocessor /Zc:__cplusplus)
+    add_compile_options(/utf-8 /bigobj /EHsc /permissive- /Zc:preprocessor /Zc:__cplusplus)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
     # MSVC 对 std::fopen / strdup 报 C4996「不安全，请改用 fopen_s」。这两个
     # 都是**标准/POSIX 明文规定**的函数，弃用是微软单方面的；改用 _s 变体会
