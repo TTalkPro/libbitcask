@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`7.0.3`**；库 `SOVERSION` = **`7`**（= major）；
+`bitcask_version_*` = **`8.0.0`**；库 `SOVERSION` = **`8`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -15,13 +15,13 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
-## [Unreleased]（S46：原子批条件写——待 Windows 验证后发版）
+## [8.0.0] - 2026-11-18（S46：原子批条件写）
 
-> **版本语义（待定）**：尚未发版——S46 尚未在 Windows 上全量验证，
-> 定版与版本号由维护者在 Windows 验证通过后决定。C API **纯加法**
->（错误码 17 + 新结构 + 新函数），C ABI 零改动；C++ 头面追加成员与带
+> **版本语义**：C API **纯加法**
+>
+>（错误码 17 + 新结构 + 新函数），既有 C ABI 零改动；C++ 头面追加成员与带
 > 缺省值的形参——源码兼容、C++ ABI 布局变化，下游需重新编译；盘上格式
-> 零改动。
+> 零改动。按发布决定取 MAJOR +1（8.0.0），`SOVERSION=8` 由 major 派生。
 
 ### Added
 
@@ -2164,7 +2164,8 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/v3.1.0...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/8.0.0...HEAD
+[8.0.0]: https://github.com/davidalphafox/libbitcask/compare/7.0.3...8.0.0
 [3.1.0]: https://github.com/davidalphafox/libbitcask/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/davidalphafox/libbitcask/compare/v1.2.0...v3.0.0
 [1.2.0]: https://github.com/davidalphafox/libbitcask/compare/v1.1.0...v1.2.0
