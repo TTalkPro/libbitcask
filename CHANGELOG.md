@@ -15,6 +15,19 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
+## [Unreleased]（S47：Windows TBB finalize 兼容）
+
+### Fixed
+
+- **Windows/MSVC 单参 `tbb::finalize` 编译失败**（下游反馈
+  `feedbacks/2026-11-18-windows-tbb-finalize-single-arg-does-not-compile.md`）：
+  `TbbLifetime::release()` 改用 `tbb::finalize(*handle_, std::nothrow)`。
+  当 MSVC 编译单元未启用异常展开时，oneTBB 会设 `TBB_USE_EXCEPTIONS=0`，
+  单参重载不存在；nothrow 双参重载在任何配置下都可用，并与 C API
+  shutdown 的既有写法一致。公共 API、行为与盘上格式零改动。
+
+---
+
 ## [8.0.0] - 2026-11-18（S46：原子批条件写）
 
 > **版本语义**：C API **纯加法**

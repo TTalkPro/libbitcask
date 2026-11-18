@@ -48,6 +48,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -630,7 +631,10 @@ public:
 
     void release() {
         if (handle_) {
-            tbb::finalize(*handle_);
+            // S47：不用单参 finalize。MSVC 在异常展开未启用时会把 oneTBB 的
+            // TBB_USE_EXCEPTIONS 折成 0，该重载随之消失；nothrow 双参重载
+            // 恒存在，且与 c_api shutdown 的生命周期语义一致。
+            (void)tbb::finalize(*handle_, std::nothrow);
             handle_.reset();
         }
     }

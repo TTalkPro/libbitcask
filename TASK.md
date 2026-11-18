@@ -10,6 +10,20 @@
 
 ---
 
+## 🔴 S47 · Windows TBB finalize 兼容（2026-11-18 立项）
+
+> 来源：下游反馈
+> [`feedbacks/2026-11-18-windows-tbb-finalize-single-arg-does-not-compile.md`](feedbacks/2026-11-18-windows-tbb-finalize-single-arg-does-not-compile.md)。
+> 单参 `tbb::finalize` 依赖 oneTBB 的 `TBB_USE_EXCEPTIONS`；异常展开未启用时
+> 该重载消失。修复必须不改公共 API、不改异常开关、不改盘上格式。
+
+| 项 | 状态 |
+|---|---|
+| S47-1 `TbbLifetime::release()` 改用 nothrow 双参 finalize，补 `<new>` | ✅ |
+| S47-2 MSVC 无异常展开探针 + 全量重建 / TBB 生命周期回归 | ✅ |
+
+---
+
 ## 🔴 S46 · 原子批前置条件（按 LSN 的乐观并发）（2026-11-17 立项）
 
 > 来源：下游反馈 [`feedbacks/2026-11-17-conditional-atomic-batch.md`](feedbacks/2026-11-17-conditional-atomic-batch.md)
