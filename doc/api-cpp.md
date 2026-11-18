@@ -554,14 +554,23 @@ S13-D1 批量写（语义同 `put` 的 KV 路径）。整批一次提交：记�
 
 ```cpp
 struct BatchOp {
-    enum class Type : std::uint8_t { kPut = 0, kRemove = 1, kPutDoc = 2 };
+    enum class Type : std::uint8_t { kPut = 0, kRemove = 1, kPutDoc = 2, kCheck = 3 };
+    enum class Expect : std::uint8_t { kNone = 0, kAbsent = 1, kOrdEquals = 2 };
     Type type;
     std::span<const std::byte> key;
-    std::span<const std::byte> value{};   // kRemove / kPutDoc 忽略
+    std::span<const std::byte> value{};   // kRemove / kPutDoc / kCheck 忽略
     const DocInput* doc = nullptr;        // kPutDoc 必填，其余忽略
+    Expect expect = Expect::kNone;        // S46：前置条件
+    std::uint64_t expect_ord = 0;         // 仅 kOrdEquals
+};
+struct BatchOutcome {
+    static constexpr std::size_t kNoFailedOp = ~std::size_t{0};
+    std::size_t failed_op = kNoFailedOp;  // 仅 kConditionFailed 时有效
+    std::vector<std::uint64_t> ords;      // 仅成功时填充，与 ops 等长
 };
 [[nodiscard]] std::expected<void, CaskFault>
-put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp = 0);
+put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp = 0,
+                 BatchOutcome* outcome = nullptr);
 ```
 
 语义 = `put_batch` 的超集（设计 [`atomic-batch-design-zh.md`](atomic-batch-design-zh.md)）：
@@ -571,6 +580,19 @@ put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp = 0);
 - 支持批内结构化文档（`kPutDoc`，下游反馈 2026-10-06）：编码、向量归一化、字段 intern、索引登记（text / fields / vector / meta）与 `put_doc` 逐项相同，`expiry_at` 同样生效——文档与它的二级索引项可同批落盘。`doc == nullptr` / 向量维度错 / 未知 op → `kInvalidOption`，零副作用（字段名 intern 推迟到全批校验通过之后）。
 - **首次调用把目录 meta 懒升级为 v6**：旧于 5.1.0 的读端拒开该目录（`unsupported meta version`）。从不调用本方法的目录停留 v5（保守纪元标记）。
 - durability 与 `put_batch` 相同（`o_sync` / `sync_every_n` / caller `sync()`）——原子性与持久性正交：未 fsync 掉电可能整批丢失，但绝不半批。
+- **前置条件（S46，乐观并发）**：每个 op 可带 `expect`——`kAbsent`（key 当前不存在：从未写过 / 已删 / 已过期，口径同 `get()` 的 `kNotFound`）或 `kOrdEquals`（key 当前存在且 `GetResult::ord == expect_ord`）。全部条件在 `write_mu_` 内、任何字节落盘前对照**批前**状态判断（批内同 key 多次也各自对照批前状态）；任一不成立 ⇒ `kConditionFailed`，整批零副作用，`outcome->failed_op` 指出首个不成立的 op。`kCheck` 只校验不写（`expect` 必须非 `kNone`）。成功时 `outcome->ords[i]` 是第 i 个 op 落盘记录的 LSN（`kCheck` 为 0），可直接作为下一轮 `kOrdEquals` 的期望值。LSN 契约：一个 key 的 LSN 只在它被写入时改变（merge 搬迁原样保留，重开 / 索引重建从 record 读回）。典型用法——读-改-写循环：
+
+  ```cpp
+  for (;;) {
+      auto cur = cask->get_owned(key);               // 拿到值和 ord
+      Cask::BatchOp op{.type = Cask::BatchOp::Type::kPut, .key = key,
+                       .value = modify(cur)};
+      if (cur) { op.expect = Cask::BatchOp::Expect::kOrdEquals; op.expect_ord = cur->ord; }
+      else     { op.expect = Cask::BatchOp::Expect::kAbsent; }
+      auto r = cask->put_batch_atomic(std::span(&op, 1));
+      if (r || r.error().kind != CaskError::kConditionFailed) break;  // 冲突才重试
+  }
+  ```
 - 线程安全：是（同 `put_batch`，内部 `write_mu_`）。
 
 #### `Cask::remove`

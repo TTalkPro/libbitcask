@@ -2350,21 +2350,99 @@ IndexTask make_doc_add_task(std::span<const std::byte> key, const DocInput& doc,
 // put/remove + 索引 Add/Delete。恢复时区间不完整 ⟹ lve 停批头起点 ⟹
 // 整批截断——崩溃后 all-or-nothing。
 std::expected<void, CaskFault>
-Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
+Cask::put_batch_atomic(std::span<const BatchOp> in_ops, std::uint64_t tstamp,
+                       BatchOutcome* outcome) {
+    if (outcome) {
+        outcome->failed_op = BatchOutcome::kNoFailedOp;
+        outcome->ords.clear();
+    }
     WriteOpGate gate(this);  // H1：close() 等锁外索引提交完成后才拆资源
     std::unique_lock<std::mutex> wlk(write_mu_);  // S11-W1：写路径互斥
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
     if (!opts_.read_write || opts_.merge_only) {
         return std::unexpected(err(CaskError::kReadOnly));
     }
-    if (ops.empty()) return {};
-    if (ops.size() > 0xFFFF'FFFFull) {
+    if (in_ops.empty()) return {};
+    if (in_ops.size() > 0xFFFF'FFFFull) {
         return std::unexpected(err(CaskError::kInvalidOption, "batch too large"));
     }
+
+    // S46 ⓪a 前置条件的形态校验（零副作用）：expect 取值、kCheck 必带条件。
+    bool has_cond = false;
+    bool has_check = false;
+    for (const auto& op : in_ops) {
+        if (op.expect != BatchOp::Expect::kNone &&
+            op.expect != BatchOp::Expect::kAbsent &&
+            op.expect != BatchOp::Expect::kOrdEquals) {
+            return std::unexpected(err(CaskError::kInvalidOption,
+                                       "unknown batch op expect"));
+        }
+        if (op.type == BatchOp::Type::kCheck) {
+            if (op.expect == BatchOp::Expect::kNone) {
+                return std::unexpected(err(CaskError::kInvalidOption,
+                                           "batch kCheck op without expect"));
+            }
+            if (op.key.size() > format::kMaxKeySize) {
+                return std::unexpected(err(CaskError::kKeyTooLarge));
+            }
+            has_check = true;
+        }
+        has_cond = has_cond || op.expect != BatchOp::Expect::kNone;
+    }
+
     if (!ensure_oki_for_write()) {
         return std::unexpected(err(
             CaskError::kIndexCorrupt,
             "oki unavailable for atomic batch: controlled rebuild failed"));
+    }
+
+    // S46 ⓪b 条件判定：持 write_mu_ ⇒ 判定与写入之间没有别的写者插入；
+    // 全部对照批前状态（尚无任何本批字节）。判定口径 = get()：read_doc 同
+    // 一条定位 + key/ord 自证 + 墓碑 / expiry_secs / expiry_at 过滤；索引
+    // 不可判定（kIndexCorrupt 等）原样上抛，绝不折叠成「不存在」。
+    // read_doc 不取 write_mu_（受控重建只取 oki_rebuild_mu_，与上面
+    // ensure_oki_for_write 在锁内调用同理），这里调用不自锁。
+    if (has_cond) {
+        for (std::size_t i = 0; i < in_ops.size(); ++i) {
+            const auto& op = in_ops[i];
+            if (op.expect == BatchOp::Expect::kNone) continue;
+            auto cur = read_doc(op.key, /*want_fields=*/false);
+            bool ok = false;
+            if (cur) {
+                ok = op.expect == BatchOp::Expect::kOrdEquals &&
+                     cur->ord == op.expect_ord;
+            } else if (cur.error().kind == CaskError::kNotFound) {
+                ok = op.expect == BatchOp::Expect::kAbsent;
+            } else {
+                return std::unexpected(cur.error());
+            }
+            if (!ok) {
+                if (outcome) outcome->failed_op = i;
+                return std::unexpected(err(
+                    CaskError::kConditionFailed,
+                    "atomic batch condition failed at op " + std::to_string(i)));
+            }
+        }
+    }
+
+    // S46 ⓪c kCheck 只校验不写：剔除后其余流程按原样处理写成员。
+    // write_idx[j] = 写成员 j 在 in_ops 中的下标（供 outcome 回填）。
+    std::vector<BatchOp> write_ops_storage;
+    std::vector<std::size_t> write_idx;
+    std::span<const BatchOp> ops = in_ops;
+    if (has_check) {
+        write_ops_storage.reserve(in_ops.size());
+        write_idx.reserve(in_ops.size());
+        for (std::size_t i = 0; i < in_ops.size(); ++i) {
+            if (in_ops[i].type == BatchOp::Type::kCheck) continue;
+            write_ops_storage.push_back(in_ops[i]);
+            write_idx.push_back(i);
+        }
+        ops = write_ops_storage;
+        if (ops.empty()) {
+            if (outcome) outcome->ords.assign(in_ops.size(), 0);
+            return {};
+        }
     }
 
     // S43-5：物理 data 记录保留全部成员及其真实 ord；恢复按文件序重放时
@@ -2634,6 +2712,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
         tasks.clear();
     };
     bool retried = false;
+    std::vector<std::pair<std::size_t, std::uint64_t>> final_ord_override;
     for (const std::size_t i : apply_order) {
         const std::size_t slot0 = i + 1;  // og 槽位（0 是批头）
         if (ops[i].type == BatchOp::Type::kRemove) {
@@ -2679,8 +2758,20 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
             slot = og.ords.size() - 1;
             rec = *p2;
             retried = true;
+            final_ord_override.emplace_back(i, p2->ord);
         }
         tasks.push_back({i, slot, rec, /*is_remove*/ false});
+    }
+    // S46：outcome.ords——每个写成员落盘记录的 LSN；merge race 单条重写的
+    // 成员以重写记录为准（那才是该 key 的当前版本）。
+    if (outcome) {
+        outcome->ords.assign(in_ops.size(), 0);
+        for (std::size_t j = 0; j < ops.size(); ++j) {
+            outcome->ords[has_check ? write_idx[j] : j] = pw[j].ord;
+        }
+        for (const auto& [j, o] : final_ord_override) {
+            outcome->ords[has_check ? write_idx[j] : j] = o;
+        }
     }
     // 最终应用按 key 排序后，成员完成序不再等于 ord 序。索引 reducer 仍按
     // 全局 ord 门消费；这里把真任务先排回 ord 序，非最终成员继续由
@@ -2698,7 +2789,10 @@ Cask::put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp) {
     flush_tasks();
     maybe_submit_auto_checkpoint();  // S14-1（锁外）
     maybe_flush_oki_unlocked();  // S36-4/5：memdelta 阈值（锁外站点包装）
-    if (!gc) return std::unexpected(gc.error());
+    if (!gc) {
+        if (outcome) outcome->ords.clear();
+        return std::unexpected(gc.error());
+    }
     return {};
 }
 

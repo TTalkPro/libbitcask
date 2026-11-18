@@ -10,6 +10,39 @@
 
 ---
 
+## 🔴 S46 · 原子批前置条件（按 LSN 的乐观并发）（2026-11-17 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-17-conditional-atomic-batch.md`](feedbacks/2026-11-17-conditional-atomic-batch.md)
+> （bitcask 图层 v2：一个顶点的边打包成一个 value，每次加边都是读-改-写）。
+> 用户定：只开发不提交。
+
+| 项 | 状态 |
+|---|---|
+| S46-1 引擎：`BatchOp::expect` / `expect_ord` / `kCheck`、`kConditionFailed`、`BatchOutcome` | ✅ |
+| S46-2 TxnCask 透传 | ✅ |
+| S46-3 C API：`bitcask_cond_op_t` + `*_cond` 两函数 + 错误码 17（纯加法） | ✅ |
+| S46-4 测试 + 文档 | ✅ |
+
+**落地记录（2026-11-17）**
+
+- 判定放在 `put_batch_atomic` 拿 `write_mu_` 之后、任何字节进写缓冲之前：
+  ⓪a 形态校验 → `ensure_oki_for_write` → ⓪b 逐个条件调 `read_doc`（与 `get()`
+  同一条定位 + key/ord 自证 + 墓碑 / 过期过滤）→ ⓪c 剔除 `kCheck` 后原流程不变。
+  `read_doc` 不取 `write_mu_`（受控重建只取 `oki_rebuild_mu_`，与锁内调用
+  `ensure_oki_for_write` 同理），不自锁。索引不可判定原样上抛 `kIndexCorrupt`，
+  不折叠成「不存在」。
+- 批内同 key 多次：全部对照批前状态（判定时本批尚无字节）。
+- `outcome.ords`：成员落盘 ord；merge race 单条重写的成员以重写记录的 ord 为准
+  （那才是 `get()` 之后返回的版本）。group commit 失败时清空。
+- LSN 契约核对：merger `copy_oki_record` 原样写回 `rec->ord`；重开 / OKI 重建从
+  record 读 ord。回归覆盖 merge 后、重开后、删派生缓存全量重建后旧 ord 仍可作条件。
+- 代价：每个带条件的 op 一次 `read_doc`（一次定位 + 一次 pread，刚读过的通常在
+  page cache），在写锁内。不带条件的批零额外开销（`has_cond` 门）。
+- 验证：gcc Release 全量 **899/899**；ASan 全量 **899/899**；clang Debug 新用例 + 原子批两组 + C API
+  全绿；TSan 新用例 ×20 零告警；`-Werror` 库树零告警。
+
+---
+
 ## 🔴 S45 · 索引管线去全局顺序化：key + LSN 裁决、分片并发写、去 reducer（2026-11-17 立项）
 
 > 来源：[`designs/index-pipeline-unordered-design-zh.md`](designs/index-pipeline-unordered-design-zh.md)

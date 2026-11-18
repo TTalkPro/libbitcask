@@ -198,6 +198,9 @@ enum class CaskError {
                           // 既有枚举值不动，C API 映射 +1 偏移不破）
     kIndexCorrupt,        // S43-1：定位记录存在，但读回 record 的 key 不同。
                           // 这是索引损坏/陈旧错误的硬证据，绝不能返回 value。
+    kConditionFailed,     // S46：原子批前置条件不成立（key 已被别人改过 /
+                          // 存在性不符）——整批零副作用，调用方重读后重试。
+                          // 不是故障：与 kIo / kIndexCorrupt 严格区分。
 };
 
 struct CaskFault {
@@ -756,17 +759,45 @@ public:
     //   字段 intern、索引登记（text / fields / vector / meta）与 put_doc 逐项
     //   相同，expiry_at 同样生效；value 被忽略，doc 必填（nullptr →
     //   kInvalidOption，零副作用）。用途：文档与它的二级索引项同批落盘。
+    // - 前置条件（S46，下游反馈 2026-11-17）：每个 op 可带 expect——
+    //     kNone       无条件（缺省，与旧行为相同）；
+    //     kAbsent     该 key 当前不存在（从未写过 / 已删 / 已过期，判定口径
+    //                 与 get() 返回 kNotFound 完全一致）；
+    //     kOrdEquals  该 key 当前存在且其 LSN（GetResult::ord）== expect_ord。
+    //   全部条件在 write_mu_ 内、任何字节进入写缓冲之前，对照**批开始前**的
+    //   状态判断（批内同 key 多次出现时各自对照批前状态）；任一不成立 ⇒ 整批
+    //   零副作用，返回 kConditionFailed，outcome->failed_op = 首个不成立的 op
+    //   下标。条件只在写入时判断，落盘的仍是普通记录——恢复重放不感知条件。
+    //   kCheck 型 op 只校验不写（expect 必须非 kNone；value / doc 忽略）。
+    //   LSN 契约：一个 key 的 LSN 只在它被写入时改变——merge 搬迁原样保留
+    //   record 的 ord，重开恢复 / OKI 重建均从 record 读回 ord。
+    // - outcome（可空）：成功时 ords[i] = 第 i 个 op 落盘记录的 LSN（kCheck
+    //   为 0）；即 get() 随后会返回的 ord，可直接作为下一轮 kOrdEquals 的
+    //   期望值。批内同 key 多次时只有最后一个 op 的 LSN 是该 key 的当前版本。
     // 线程安全: **是**（同 put_batch，内部 write_mu_）。
     struct BatchOp {
-        enum class Type : std::uint8_t { kPut = 0, kRemove = 1, kPutDoc = 2 };
+        enum class Type : std::uint8_t {
+            kPut = 0, kRemove = 1, kPutDoc = 2, kCheck = 3
+        };
+        enum class Expect : std::uint8_t {
+            kNone = 0, kAbsent = 1, kOrdEquals = 2
+        };
         Type type = Type::kPut;
         std::span<const std::byte> key;
-        std::span<const std::byte> value{};   // kRemove / kPutDoc 忽略
+        std::span<const std::byte> value{};   // kRemove / kPutDoc / kCheck 忽略
         // kPutDoc 必填，其余类型忽略。借调用方存储，调用期间有效即可。
         const DocInput* doc = nullptr;
+        Expect expect = Expect::kNone;
+        std::uint64_t expect_ord = 0;         // 仅 kOrdEquals
+    };
+    struct BatchOutcome {
+        static constexpr std::size_t kNoFailedOp = ~std::size_t{0};
+        std::size_t failed_op = kNoFailedOp;  // 仅 kConditionFailed 时有效
+        std::vector<std::uint64_t> ords;      // 仅成功时填充，与 ops 等长
     };
     [[nodiscard]] std::expected<void, CaskFault>
-    put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp = 0);
+    put_batch_atomic(std::span<const BatchOp> ops, std::uint64_t tstamp = 0,
+                     BatchOutcome* outcome = nullptr);
 
     // 软删除：写一条墓碑 record。空间在下一次 merge 时回收。
     // 线程安全: **是**（同 put，内部 write_mu_）。

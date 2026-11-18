@@ -83,6 +83,8 @@ typedef enum {
                                       // bitcask_shutdown 时运行时仍被占用
     BITCASK_ERR_INDEX_CORRUPT  = 16,  // S43-1：定位成功但读回 record 的 key
                                       // 不同；不得当作 NotFound 或返回错值。
+    BITCASK_ERR_CONDITION_FAILED = 17,  // S46：原子批前置条件不成立（整批零
+                                        // 副作用；重读后重试）。不是故障。
 } bitcask_error_t;
 
 // 错误详情（对应 bitcask::CaskFault）
@@ -631,8 +633,8 @@ BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
 /* ===========================================================================
  *  多键事务（S34/S35）——引擎原子批
  *
- *  提供崩溃原子性(A)与持久性(D)；**不提供**隔离性(I)与 CAS——事务中间态
- *  对并发读者可见。S35 起提交路径 = 引擎原子批（kBatchHeader，设计
+ *  提供崩溃原子性(A)与持久性(D)；**不提供**隔离性(I)——事务中间态
+ *  对并发读者可见。CAS 见下方 *_cond（S46，按 key 的 ord 做前置条件）。S35 起提交路径 = 引擎原子批（kBatchHeader，设计
  *  doc/atomic-batch-design-zh.md）；模式原理 doc/multikey-txn-zh.md。
  *  key 命名空间 "_txn:" 保留（legacy 意图日志），业务 key 不得使用。
  * ========================================================================= */
@@ -691,6 +693,43 @@ BITCASK_API bitcask_error_t bitcask_txn_commit_ex(bitcask_t* cask,
                                                   size_t n_ops,
                                                   int sync_on_commit,
                                                   bitcask_fault_t* fault);
+
+/* S46（下游反馈 2026-11-17）：带前置条件的原子批 / 事务——乐观并发。
+ * 纯加法：新结构 + 新函数，既有结构与函数零改动。
+ *
+ * expect：0 = 无条件；1 = 该 key 当前不存在（从未写过 / 已删 / 已过期，
+ *         口径同 bitcask_get 返回 BITCASK_ERR_NOT_FOUND）；2 = 该 key 当前
+ *         存在且 ord（bitcask_get_result_t.ord）== expect_ord。
+ * op = 3（check）：只校验不写，expect 必须非 0（否则 INVALID_OPTION）。
+ * 全部条件在写锁内、任何字节落盘前对照**批开始前**的状态判断；任一不成立
+ * ⇒ BITCASK_ERR_CONDITION_FAILED，整批零副作用，*out_failed_op = 首个不成立
+ * 的 op 下标。成功时 out_ords[i] = 第 i 个 op 落盘记录的 ord（check 为 0），
+ * 可直接作为下一轮 expect = 2 的期望值。out_ords（n_ops 个元素）与
+ * out_failed_op 均可为 NULL。其余语义分别同 bitcask_put_batch_atomic_ex /
+ * bitcask_txn_commit_ex（txn 版仍校验 key 互不重复）。 */
+typedef struct {
+    uint8_t                       op;          /* 0 put, 1 remove, 2 put_doc, 3 check */
+    uint8_t                       expect;      /* 0 none, 1 absent, 2 ord_equals */
+    uint64_t                      expect_ord;  /* 仅 expect = 2 */
+    bitcask_slice_t               key;
+    bitcask_slice_t               value;       /* op = 0 时用 */
+    const bitcask_doc_input_ex_t* doc;         /* op = 2 必填 */
+} bitcask_cond_op_t;
+
+BITCASK_API bitcask_error_t bitcask_put_batch_atomic_cond(bitcask_t* cask,
+                                                          const bitcask_cond_op_t* ops,
+                                                          size_t n_ops,
+                                                          uint64_t* out_ords,
+                                                          size_t* out_failed_op,
+                                                          bitcask_fault_t* fault);
+
+BITCASK_API bitcask_error_t bitcask_txn_commit_cond(bitcask_t* cask,
+                                                    const bitcask_cond_op_t* ops,
+                                                    size_t n_ops,
+                                                    int sync_on_commit,
+                                                    uint64_t* out_ords,
+                                                    size_t* out_failed_op,
+                                                    bitcask_fault_t* fault);
 
 /* B2（6.0.0）：恒返回 0——方案 B 的意图重放已删除（发布版从未写过
  * 意图 blob；签名保留为 API 稳定面）。开发期残留的 "_txn:" 前缀 key

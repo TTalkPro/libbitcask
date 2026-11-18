@@ -53,6 +53,7 @@ static const char* const kAllTestDirs[] = {
     TDIR("statusex"),
     TDIR("tuning"),
     TDIR("txn"),
+    TDIR("condbatch"),
     TDIR("veng"),
     TDIR("vhbatch"),
 };
@@ -2234,6 +2235,91 @@ static int test_meta_filter_query(void) {
     return fails ? 1 : 0;
 }
 
+/* S46（下游反馈 2026-11-17）：带前置条件的原子批 / 事务。不受 NDEBUG 影响。 */
+#define CB_CHECK(cond) do { if (!(cond)) { \
+    fprintf(stderr, "FAIL test_conditional_batch: line %d: %s\n", __LINE__, #cond); \
+    bitcask_close(cask); return 1; } } while (0)
+
+static int test_conditional_batch(void) {
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    if (bitcask_open(TDIR("condbatch"), &opts, &cask, &fault) != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_conditional_batch: open: %s\n", fault.detail);
+        return 1;
+    }
+    CB_CHECK(bitcask_put(cask, (bitcask_slice_t){"warm", 4},
+                         (bitcask_slice_t){"w", 1}, 0, &fault) == BITCASK_OK);
+
+    /* expect = 1（不存在才建）：成功并回填 ord，与 bitcask_get 的 ord 一致。 */
+    uint64_t ords[3] = {0, 0, 0};
+    size_t failed = 0;
+    bitcask_cond_op_t c1[1] = {{0, 1, 0, {"k", 1}, {"v1", 2}, NULL}};
+    CB_CHECK(bitcask_put_batch_atomic_cond(cask, c1, 1, ords, &failed, &fault) == BITCASK_OK);
+    CB_CHECK(failed == SIZE_MAX);
+    bitcask_get_result_t* r = NULL;
+    CB_CHECK(bitcask_get(cask, (bitcask_slice_t){"k", 1}, &r, &fault) == BITCASK_OK);
+    const uint64_t ok_ord = r->ord;
+    bitcask_get_result_free(r);
+    CB_CHECK(ords[0] == ok_ord);
+
+    /* 再建一次：CONDITION_FAILED，failed 指向第 2 个 op，同批的 put 不落。 */
+    bitcask_cond_op_t c2[2] = {
+        {0, 0, 0, {"side", 4}, {"x", 1}, NULL},
+        {0, 1, 0, {"k", 1}, {"v2", 2}, NULL},
+    };
+    ords[0] = ords[1] = 99;
+    CB_CHECK(bitcask_put_batch_atomic_cond(cask, c2, 2, ords, &failed, &fault) ==
+             BITCASK_ERR_CONDITION_FAILED);
+    CB_CHECK(failed == 1);
+    CB_CHECK(ords[0] == 0 && ords[1] == 0);
+    r = NULL;
+    CB_CHECK(bitcask_get(cask, (bitcask_slice_t){"side", 4}, &r, &fault) ==
+             BITCASK_ERR_NOT_FOUND);
+
+    /* expect = 2：用 get 的 ord 改写；旧 ord 被拒。check（op = 3）只校验不写。 */
+    bitcask_cond_op_t c3[2] = {
+        {3, 2, ok_ord, {"k", 1}, {NULL, 0}, NULL},
+        {0, 0, 0, {"side", 4}, {"y", 1}, NULL},
+    };
+    CB_CHECK(bitcask_put_batch_atomic_cond(cask, c3, 2, ords, &failed, &fault) == BITCASK_OK);
+    CB_CHECK(ords[0] == 0 && ords[1] != 0);
+    bitcask_cond_op_t c4[1] = {{0, 2, ok_ord, {"k", 1}, {"v3", 2}, NULL}};
+    CB_CHECK(bitcask_txn_commit_cond(cask, c4, 1, 0, ords, &failed, &fault) == BITCASK_OK);
+    const uint64_t new_ord = ords[0];
+    CB_CHECK(new_ord > ok_ord);
+    CB_CHECK(bitcask_txn_commit_cond(cask, c4, 1, 0, ords, &failed, &fault) ==
+             BITCASK_ERR_CONDITION_FAILED);
+    CB_CHECK(failed == 0);
+    r = NULL;
+    CB_CHECK(bitcask_get(cask, (bitcask_slice_t){"k", 1}, &r, &fault) == BITCASK_OK);
+    CB_CHECK(r->ord == new_ord && r->value.size == 2 &&
+             memcmp(r->value.data, "v3", 2) == 0);
+    bitcask_get_result_free(r);
+
+    /* 形态校验：check 不带条件 / 未知 op / 未知 expect → INVALID_OPTION；
+     * 既有 _ex 接口仍不认 op = 3。 */
+    bitcask_cond_op_t bad1[1] = {{3, 0, 0, {"k", 1}, {NULL, 0}, NULL}};
+    CB_CHECK(bitcask_put_batch_atomic_cond(cask, bad1, 1, NULL, NULL, &fault) ==
+             BITCASK_ERR_INVALID_OPTION);
+    bitcask_cond_op_t bad2[1] = {{4, 0, 0, {"k", 1}, {"v", 1}, NULL}};
+    CB_CHECK(bitcask_put_batch_atomic_cond(cask, bad2, 1, NULL, NULL, &fault) ==
+             BITCASK_ERR_INVALID_OPTION);
+    bitcask_cond_op_t bad3[1] = {{0, 3, 0, {"k", 1}, {"v", 1}, NULL}};
+    CB_CHECK(bitcask_put_batch_atomic_cond(cask, bad3, 1, NULL, NULL, &fault) ==
+             BITCASK_ERR_INVALID_OPTION);
+    bitcask_txn_op_ex_t old_api[1] = {{3, {"k", 1}, {"v", 1}, NULL}};
+    CB_CHECK(bitcask_put_batch_atomic_ex(cask, old_api, 1, &fault) ==
+             BITCASK_ERR_INVALID_OPTION);
+
+    bitcask_close(cask);
+    printf("PASS test_conditional_batch\n");
+    return 0;
+}
+#undef CB_CHECK
+
 int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
@@ -2254,6 +2340,7 @@ int main(void) {
     failures += test_parallel_scan();
     failures += test_put_batch();
     failures += test_txn();
+    failures += test_conditional_batch();
     failures += test_levelb();
     failures += test_status_ex_and_log();
     failures += test_search_filtered();

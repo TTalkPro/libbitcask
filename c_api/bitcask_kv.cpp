@@ -6,6 +6,7 @@
 #include "bitcask/txn.hpp"  // S34：多键事务
 
 #include <cstddef>  // offsetof
+#include <cstdint>  // SIZE_MAX
 #include <mutex>
 #include <new>      // std::nothrow
 
@@ -663,6 +664,51 @@ bool to_cpp_batch_ops(const bitcask_txn_op_ex_t* ops, size_t n_ops,
     return true;
 }
 
+// S46：bitcask_cond_op_t[] → BatchOp[]。op / doc 部分复用 to_cpp_batch_ops
+// 的口径（逐条转成 bitcask_txn_op_ex_t 再走它），只多 check 与条件两项。
+bool to_cpp_cond_ops(const bitcask_cond_op_t* ops, size_t n_ops,
+                     std::vector<bitcask::Cask::BatchOp>& out,
+                     std::vector<bitcask::DocInput>& docs) {
+    out.reserve(n_ops);
+    docs.reserve(n_ops);
+    for (size_t i = 0; i < n_ops; ++i) {
+        if (ops[i].op > 3 || ops[i].expect > 2) return false;
+        bitcask::Cask::BatchOp op;
+        if (ops[i].op == 3) {
+            if (!slice_valid(ops[i].key)) return false;
+            op.type = bitcask::Cask::BatchOp::Type::kCheck;
+            op.key = {static_cast<const std::byte*>(ops[i].key.data),
+                      ops[i].key.size};
+        } else {
+            const bitcask_txn_op_ex_t ex{ops[i].op, ops[i].key, ops[i].value,
+                                         ops[i].doc};
+            std::vector<bitcask::Cask::BatchOp> one;
+            // docs 已预留 n_ops 容量：emplace_back 不扩容，指针不悬空。
+            if (!to_cpp_batch_ops(&ex, 1, one, docs)) return false;
+            op = one.front();
+        }
+        op.expect = static_cast<bitcask::Cask::BatchOp::Expect>(ops[i].expect);
+        op.expect_ord = ops[i].expect_ord;
+        out.push_back(op);
+    }
+    return true;
+}
+
+// S46：outcome → C 出参。
+void fill_cond_outputs(const bitcask::Cask::BatchOutcome& oc, size_t n_ops,
+                       bool ok, uint64_t* out_ords, size_t* out_failed_op) {
+    if (out_failed_op) {
+        *out_failed_op = oc.failed_op == bitcask::Cask::BatchOutcome::kNoFailedOp
+                             ? SIZE_MAX
+                             : oc.failed_op;
+    }
+    if (out_ords) {
+        for (size_t i = 0; i < n_ops; ++i) {
+            out_ords[i] = ok && i < oc.ords.size() ? oc.ords[i] : 0;
+        }
+    }
+}
+
 }  // namespace
 }  // extern "C++"
 
@@ -858,6 +904,74 @@ BITCASK_API bitcask_error_t bitcask_txn_commit_ex(bitcask_t* cask,
                          sync_on_commit ? bitcask::TxnSyncPolicy::kSyncOnCommit
                                         : bitcask::TxnSyncPolicy::kNone);
     auto result = txn.commit(cpp_ops);
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    return BITCASK_OK;
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_put_batch_atomic_cond(bitcask_t* cask,
+                                                          const bitcask_cond_op_t* ops,
+                                                          size_t n_ops,
+                                                          uint64_t* out_ords,
+                                                          size_t* out_failed_op,
+                                                          bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (out_failed_op) *out_failed_op = SIZE_MAX;
+    if (!cask) return BITCASK_ERR_INVALID_OPTION;
+    if (n_ops == 0) return BITCASK_OK;
+    if (!ops) return BITCASK_ERR_INVALID_OPTION;
+
+    std::vector<bitcask::Cask::BatchOp> cpp_ops;
+    std::vector<bitcask::DocInput> docs;
+    if (!to_cpp_cond_ops(ops, n_ops, cpp_ops, docs))
+        return BITCASK_ERR_INVALID_OPTION;
+    bitcask::Cask::BatchOutcome oc;
+    auto result = as_cpp_cask(cask)->put_batch_atomic(cpp_ops, 0, &oc);
+    fill_cond_outputs(oc, n_ops, result.has_value(), out_ords, out_failed_op);
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    return BITCASK_OK;
+    });
+}
+
+BITCASK_API bitcask_error_t bitcask_txn_commit_cond(bitcask_t* cask,
+                                                    const bitcask_cond_op_t* ops,
+                                                    size_t n_ops,
+                                                    int sync_on_commit,
+                                                    uint64_t* out_ords,
+                                                    size_t* out_failed_op,
+                                                    bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (out_failed_op) *out_failed_op = SIZE_MAX;
+    if (!cask || !ops || n_ops == 0) return BITCASK_ERR_INVALID_OPTION;
+
+    std::vector<bitcask::Cask::BatchOp> batch;
+    std::vector<bitcask::DocInput> docs;
+    if (!to_cpp_cond_ops(ops, n_ops, batch, docs))
+        return BITCASK_ERR_INVALID_OPTION;
+    std::vector<bitcask::TxnOp> cpp_ops;
+    cpp_ops.reserve(n_ops);
+    for (const auto& b : batch) {
+        bitcask::TxnOp op;
+        op.type = static_cast<bitcask::TxnOp::Type>(b.type);
+        op.key = b.key;
+        op.value = b.value;
+        op.doc = b.doc;
+        op.expect = b.expect;
+        op.expect_ord = b.expect_ord;
+        cpp_ops.push_back(op);
+    }
+    bitcask::TxnCask txn(as_cpp_cask(cask),
+                         sync_on_commit ? bitcask::TxnSyncPolicy::kSyncOnCommit
+                                        : bitcask::TxnSyncPolicy::kNone);
+    bitcask::Cask::BatchOutcome oc;
+    auto result = txn.commit(cpp_ops, &oc);
+    fill_cond_outputs(oc, n_ops, result.has_value(), out_ords, out_failed_op);
     if (!result) {
         to_c_error(result.error(), fault);
         return to_c_error_kind(result.error().kind);

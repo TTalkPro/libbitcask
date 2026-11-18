@@ -21,8 +21,11 @@ static_assert(static_cast<int>(TxnOp::Type::kRemove) ==
               static_cast<int>(Cask::BatchOp::Type::kRemove));
 static_assert(static_cast<int>(TxnOp::Type::kPutDoc) ==
               static_cast<int>(Cask::BatchOp::Type::kPutDoc));
+static_assert(static_cast<int>(TxnOp::Type::kCheck) ==
+              static_cast<int>(Cask::BatchOp::Type::kCheck));
 
-std::expected<void, CaskFault> TxnCask::apply(std::span<const TxnOp> ops) {
+std::expected<void, CaskFault> TxnCask::apply(std::span<const TxnOp> ops,
+                                              Cask::BatchOutcome* outcome) {
     // S35：一次引擎原子批（doc/atomic-batch-design-zh.md）——跨崩溃
     // all-or-nothing 由引擎批头保证，PUT/REMOVE 同批依序 apply。
     std::vector<Cask::BatchOp> batch;
@@ -34,12 +37,15 @@ std::expected<void, CaskFault> TxnCask::apply(std::span<const TxnOp> ops) {
         b.key = op.key;
         b.value = op.value;
         b.doc = op.doc;
+        b.expect = op.expect;
+        b.expect_ord = op.expect_ord;
         batch.push_back(b);
     }
-    return cask_->put_batch_atomic(batch);
+    return cask_->put_batch_atomic(batch, /*tstamp=*/0, outcome);
 }
 
-std::expected<void, CaskFault> TxnCask::commit(std::span<const TxnOp> ops) {
+std::expected<void, CaskFault> TxnCask::commit(std::span<const TxnOp> ops,
+                                               Cask::BatchOutcome* outcome) {
     if (ops.empty())
         return std::unexpected(err(CaskError::kInvalidOption, "txn: empty ops"));
     std::unordered_set<std::string_view> seen;
@@ -59,7 +65,7 @@ std::expected<void, CaskFault> TxnCask::commit(std::span<const TxnOp> ops) {
     // S35：原子性下沉引擎——一次 put_batch_atomic 即崩溃后 all-or-nothing，
     // 意图日志(方案 B 的 ①②④)退役,写放大 2-3× → 1×。
     // TxnSyncPolicy 只管持久性(原子性与其正交)。
-    if (auto r = apply(ops); !r) return r;
+    if (auto r = apply(ops, outcome); !r) return r;
     if (sync_ == TxnSyncPolicy::kSyncOnCommit)
         if (auto r = cask_->sync(); !r) return r;
     return {};

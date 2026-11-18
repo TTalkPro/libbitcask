@@ -15,9 +15,38 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
-## [Unreleased]
+## [Unreleased]（S46：原子批条件写——待 Windows 验证后发版）
 
-> 尚未发布。
+> **版本语义（待定）**：尚未发版——S46 尚未在 Windows 上全量验证，
+> 定版与版本号由维护者在 Windows 验证通过后决定。C API **纯加法**
+>（错误码 17 + 新结构 + 新函数），C ABI 零改动；C++ 头面追加成员与带
+> 缺省值的形参——源码兼容、C++ ABI 布局变化，下游需重新编译；盘上格式
+> 零改动。
+
+### Added
+
+- **原子批前置条件（S46，下游反馈 2026-11-17）**：`Cask::BatchOp` 加
+  `expect`（`kNone` / `kAbsent` / `kOrdEquals`）+ `expect_ord`，新 op 型
+  `kCheck`（只校验不写）。全部条件在 `write_mu_` 内、任何字节落盘前对照
+  批前状态判断；任一不成立 ⇒ 新错误 `CaskError::kConditionFailed`，整批零
+  副作用。「不存在」口径与 `get()` 的 kNotFound 一致（含删除、`expiry_secs`
+  与 per-key `expiry_at` 过期）。`put_batch_atomic` 新增可空出参
+  `BatchOutcome*`：失败时给出首个不成立的 op 下标，成功时给出每个 op 落盘
+  记录的 LSN（可直接作为下一轮 `kOrdEquals` 的期望值，不必重读）。
+  `TxnOp` / `TxnCask::commit` 同步透传。用途：值为聚合体的读-改-写
+  （计数器、邻接表、二级索引）不再需要外部锁——冲突时重读重试即可。
+  LSN 契约写进头文件：merge 搬迁原样保留 record 的 ord，重开 / OKI 重建从
+  record 读回，key 的 LSN 只在它被写入时改变（回归覆盖 merge 后、重开后、
+  删派生缓存全量重建后）。
+- **C API（纯加法）**：`BITCASK_ERR_CONDITION_FAILED = 17`；`bitcask_cond_op_t`
+  （`op = 3` 为 check；`expect` / `expect_ord`）+ `bitcask_put_batch_atomic_cond` /
+  `bitcask_txn_commit_cond`（可空出参 `out_ords` / `out_failed_op`）。既有结构
+  与函数零改动，`bitcask_txn_op_ex_t` 仍不认 `op = 3`。条件所需的 ord 由既有
+  `bitcask_get_result_t.ord` 提供。
+- C++ 头面：`BatchOp` / `TxnOp` 追加成员、`put_batch_atomic` / `TxnCask::commit`
+  追加带缺省值的形参——源码兼容，C++ ABI 变化（与 S45 的 C++ 头面变化同批）。
+- 回归：`ConditionalBatchTest.*`（10 例，含 8 线程并发计数器自增精确 + 无条件
+  对照组确实丢更新）、C `test_conditional_batch`。
 
 ---
 

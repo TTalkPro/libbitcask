@@ -5,8 +5,9 @@
 // 无意图日志写放大。B2（2026-08-06，6.0.0）：方案 B 的意图重放整体删除
 // ——发布版从未写过意图 blob（细节见 txn.cpp 文件头）；recover()/
 // pending_txns() 保留签名恒返空。
-// 提供崩溃原子性（A）与持久性（D）；**不提供**隔离性（I）与 CAS——
-// 事务中间态对并发读者可见（模式文档 §4）。
+// 提供崩溃原子性（A）与持久性（D）；**不提供**隔离性（I）——事务中间态
+// 对并发读者可见（模式文档 §4）。S46 起 op 可带前置条件（按 key 的 LSN
+// 做 CAS，见 TxnOp::expect）。
 #pragma once
 
 #include <cstdint>
@@ -22,12 +23,17 @@ namespace bitcask {
 
 // 事务操作。kRemove 忽略 value。kPutDoc 写结构化文档（语义同
 // Cask::BatchOp::kPutDoc / put_doc），忽略 value，doc 必填。
+// S46：expect / expect_ord / kCheck 语义同 Cask::BatchOp（前置条件不成立
+// ⇒ kConditionFailed，零副作用）。
 struct TxnOp {
-    enum class Type : std::uint8_t { kPut = 0, kRemove = 1, kPutDoc = 2 };
+    enum class Type : std::uint8_t { kPut = 0, kRemove = 1, kPutDoc = 2, kCheck = 3 };
+    using Expect = Cask::BatchOp::Expect;
     Type type = Type::kPut;
     std::span<const std::byte> key;
     std::span<const std::byte> value{};
     const DocInput* doc = nullptr;  // kPutDoc 必填，其余类型忽略
+    Expect expect = Expect::kNone;
+    std::uint64_t expect_ord = 0;   // 仅 kOrdEquals
 };
 
 // 提交点 fsync 策略（模式文档 §2.4）。
@@ -69,15 +75,19 @@ public:
     // 注意：首次 commit 把目录 meta 懒升级为 v6（旧于 5.1.0 的读端
     // 拒开该目录，契约见 Cask::put_batch_atomic）。
     // 并发：键集不相交的并发 commit 安全；键集重叠无隔离/定序保证，
-    // 需应用层串行化。
-    [[nodiscard]] std::expected<void, CaskFault> commit(std::span<const TxnOp> ops);
+    // 需应用层串行化——或给 op 带前置条件（S46，expect / kCheck）：读到的
+    // 版本已被改过 ⇒ kConditionFailed，整批零副作用，重读重试即可（乐观
+    // 并发）。outcome 可空，语义同 Cask::put_batch_atomic。
+    [[nodiscard]] std::expected<void, CaskFault> commit(
+        std::span<const TxnOp> ops, Cask::BatchOutcome* outcome = nullptr);
 
     // B2：恒返回空（同 recover）。
     [[nodiscard]] std::expected<std::vector<PendingTxn>, CaskFault> pending_txns();
 
 private:
     // commit 与 recover（意图重放）共用：一次 put_batch_atomic。
-    [[nodiscard]] std::expected<void, CaskFault> apply(std::span<const TxnOp> ops);
+    [[nodiscard]] std::expected<void, CaskFault> apply(
+        std::span<const TxnOp> ops, Cask::BatchOutcome* outcome);
 
     Cask* cask_;
     TxnSyncPolicy sync_;

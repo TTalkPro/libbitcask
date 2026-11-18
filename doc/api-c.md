@@ -1047,7 +1047,7 @@ BITCASK_API bitcask_error_t bitcask_txn_pending_count(bitcask_t* cask,
                                                       bitcask_fault_t* fault);
 ```
 
-S35 引擎原子批（设计 `doc/atomic-batch-design-zh.md`；模式原理 `doc/multikey-txn-zh.md`）。崩溃原子性（A）+ 持久性（D）；**不提供**隔离性（I）与 CAS。key 命名空间 `_txn:` 保留。
+S35 引擎原子批（设计 `doc/atomic-batch-design-zh.md`；模式原理 `doc/multikey-txn-zh.md`）。崩溃原子性（A）+ 持久性（D）；**不提供**隔离性（I）。CAS 由 S46 的 `*_cond` 两个函数提供（按 key 的 ord 做前置条件，见下）。key 命名空间 `_txn:` 保留。
 
 - `bitcask_put_batch_atomic`：引擎原子批直通——崩溃/掉电后整批要么全可见要么全不可见；批内 op 依序 apply（同 key 多次 = 批内 LWW，不校验重复）。**首次调用把目录 meta 懒升级为 v6**（旧于 5.1.0 的读端拒开该目录；从不调用则停留 v5）。durability 同 `bitcask_put_batch`。
 - `bitcask_txn_commit`：= 原子批 + 事务级校验（空批 / 空 key / 重复 key / `_txn:` 前缀 → `BITCASK_ERR_INVALID_OPTION` 零副作用）。`sync_on_commit` 非零 = 提交后显式 fsync（防掉电丢批——原子性与持久性正交）。
@@ -1060,6 +1060,18 @@ S35 引擎原子批（设计 `doc/atomic-batch-design-zh.md`；模式原理 `doc
       bitcask_slice_t               value;  /* op = 0 时用；1 / 2 忽略 */
       const bitcask_doc_input_ex_t* doc;    /* op = 2 必填；0 / 1 忽略 */
   } bitcask_txn_op_ex_t;
+  ```
+- `bitcask_put_batch_atomic_cond` / `bitcask_txn_commit_cond`（S46，下游反馈 2026-11-17，纯加法）：带前置条件的原子批 / 事务——乐观并发，取代外部锁做读-改-写。`expect = 1`：key 当前不存在（从未写过 / 已删 / 已过期，口径同 `bitcask_get` 返回 `BITCASK_ERR_NOT_FOUND`）；`expect = 2`：key 当前存在且 ord（`bitcask_get_result_t.ord`）`== expect_ord`。`op = 3`（check）只校验不写，`expect` 必须非 0。全部条件在写锁内、任何字节落盘前对照**批开始前**的状态判断；任一不成立 ⇒ `BITCASK_ERR_CONDITION_FAILED`（不是故障：重读后重试），整批零副作用，`*out_failed_op` = 首个不成立的 op 下标（其余情况为 `SIZE_MAX`）。成功时 `out_ords[i]` = 第 i 个 op 落盘记录的 ord（check 为 0），可直接用作下一轮 `expect = 2` 的期望值。`out_ords`（`n_ops` 个元素）与 `out_failed_op` 可为 `NULL`。其余语义分别同 `_ex` 两个函数（txn 版仍校验 key 互不重复）。ord 契约：一个 key 的 ord 只在它被写入时改变——merge、重开、索引重建都不改变它。
+
+  ```c
+  typedef struct {
+      uint8_t                       op;          /* 0 put, 1 remove, 2 put_doc, 3 check */
+      uint8_t                       expect;      /* 0 none, 1 absent, 2 ord_equals */
+      uint64_t                      expect_ord;  /* 仅 expect = 2 */
+      bitcask_slice_t               key;
+      bitcask_slice_t               value;       /* op = 0 时用 */
+      const bitcask_doc_input_ex_t* doc;         /* op = 2 必填 */
+  } bitcask_cond_op_t;
   ```
 - `bitcask_txn_recover` / `bitcask_txn_pending_count`（B2 起恒返回 0）：方案 B 意图重放已删除（意图日志从未随发布版本存在）；签名保留。`out_replayed` 可为 `NULL`。
 - `bitcask_txn_pending_count`：legacy 巡检；S35 后正常恒 0。

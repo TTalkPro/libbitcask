@@ -100,6 +100,8 @@ inline bitcask_error_t to_c_error_kind(bitcask::CaskError e) {
             return BITCASK_ERR_INDEX_REBUILD_FAILED;
         case bitcask::CaskError::kIndexCorrupt:
             return BITCASK_ERR_INDEX_CORRUPT;
+        case bitcask::CaskError::kConditionFailed:
+            return BITCASK_ERR_CONDITION_FAILED;
     }
     return BITCASK_ERR_IO;
 }
