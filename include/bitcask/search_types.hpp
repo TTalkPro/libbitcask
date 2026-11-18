@@ -17,10 +17,9 @@ namespace bitcask::search {
 
 // 默认字段哨兵（S8.6）：旧单-text 文档与无字段限定查询都映射到此字段，
 // 使新旧路径收敛；用不可见前缀避免与用户字段名冲突。
-// 值为 4 字节 0xFA 'u' 'l' 't'（原意 "\x01default"，但 `\x` 会贪婪吞并后续
-// hex 位 "defa" → clang 报错、GCC 静默截断）。写法拆开转义让两端都能编译，
-// 字节内容不变——已作 fields_ 键、可能入 checkpoint，不能改。
-inline constexpr std::string_view kDefaultField = "\xfa" "ult";
+// 首字节 0x01 不可见，后续 "_bitcask:default" 仅作可读性标记；
+// 转义写法拆开，避免对后续字符是否为 hex 产生歧义。
+inline constexpr std::string_view kDefaultField = "\x01" "_bitcask:default";
 
 // 搜索结果条目。
 struct SearchHit {

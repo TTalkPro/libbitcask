@@ -5,13 +5,35 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`8.0.2`**；库 `SOVERSION` = **`8`**（= major）；
+`bitcask_version_*` = **`8.1.0`**；库 `SOVERSION` = **`8`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
+
+---
+
+## [8.1.0] - 2026-11-19（S49：默认字段哨兵改为 `_bitcask:default`）
+
+> **版本语义**：C API 签名、C ABI 与盘上容器格式零改动；
+> `SOVERSION` 保持 `8`。取 MINOR +1（8.1.0）。
+> ⚠️ **search 数据兼容性破坏**：默认字段哨兵字节序列变化。由 8.0.x
+>（或更早）写出的 search checkpoint / 已封存索引在 8.1.0 下不能无损沿用，
+> 需重建 search 索引或回用旧版本打开；KV-only 数据不受影响。
+
+### Changed
+
+- **`kDefaultField` 改为 `"\x01" "_bitcask:default"`**：保留不可见首字节
+  避免与用户字段名冲突，同时让内部哨兵具备可读前缀。转义拆开书写，
+  避免 `\x` 对后续字符的贪婪解析歧义。KV-only 路径与 C API 零改动；
+  search 模式下旧库中的默认字段持久化标识不会自动迁移。
+
+### Validation
+
+- `bitcask_text_plugin_test` 24/24、`bitcask_segment_v2_test` 23/23、
+  `bitcask_cask_docvalue_test` 109/109 通过（GCC Release）。
 
 ---
 
@@ -2198,7 +2220,8 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/8.0.2...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/8.1.0...HEAD
+[8.1.0]: https://github.com/davidalphafox/libbitcask/compare/8.0.2...8.1.0
 [8.0.2]: https://github.com/davidalphafox/libbitcask/compare/8.0.1...8.0.2
 [8.0.1]: https://github.com/davidalphafox/libbitcask/compare/8.0.0...8.0.1
 [8.0.0]: https://github.com/davidalphafox/libbitcask/compare/7.0.3...8.0.0

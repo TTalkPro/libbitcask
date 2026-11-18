@@ -397,7 +397,7 @@ struct ReduceJob {
 ### 4.15 `bitcask::search::kDefaultField`（`search_types.hpp`）
 
 ```cpp
-inline constexpr std::string_view kDefaultField = "\xfa" "ult";
+inline constexpr std::string_view kDefaultField = "\x01" "_bitcask:default";
 ```
 
 默认字段哨兵（S8.6）：旧单 text 文档与无字段限定查询都映射到此字段。
