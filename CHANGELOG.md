@@ -5,13 +5,65 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`9.0.0`**；库 `SOVERSION` = **`9`**（= major）；
+`bitcask_version_*` = **`9.1.0`**；库 `SOVERSION` = **`9`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 / 7.0.0 / 8.0.0 / 9.0.0 皆是）。
+
+---
+
+## [9.1.0] - 2026-11-19（S52 / S53 / S54：下游反馈三条）
+
+> **版本语义**：全部是**纯新增**——C API 新增函数 `bitcask_search_text_highlight_ex` 与宏
+> `BITCASK_HIGHLIGHT_LOAD_COLD`；C++ 新增枚举 `search::ColdText`、`Cask::search_text_highlight`
+> 四参重载、`TextPlugin::highlight_snippets`（public）与私有 `snippets_for`、`SegmentSet::fresh`
+> （头文件内联静态函数）。既有结构体布局、虚函数表、函数签名零改动；盘上格式零改动。
+> 按仓库规则不破 ABI ⇒ MINOR，取 **9.1.0**，`SOVERSION` 保持 `9`。
+
+### Fixed
+
+- **打开旧版封段的检索库：新段写进进程当前目录**（S52，下游反馈
+  `feedbacks/2026-11-19-old-segments-fallback-writes-cwd.md`，观澜）：旧段集载不进
+  （典型：8.1.0 之前封的段默认字段还是旧标识 `\xfa` "ult"，v2 段载入要求 `kDefaultField` ⇒ 拒载，
+  这是 8.1.0 定的「不迁移、需重建」；或清单 / 段 CRC 坏）时，`TextPlugin::init_segment_set` 退到
+  **默认构造**的段集——`dir_` 为空 ⇒ 全量重放封出的 `seg-N.seg` / `segments.manifest` 是相对路径，
+  落进进程当前目录；库目录的段永远是旧的；不报错不记日志。现改为 `SegmentSet::fresh(segs_dir)`：
+  新段落在库目录；seg_id 从目录里已有段文件的最大号之后起（避免全活新段与旧 `seg-N.seg.live`
+  旁车同名——旧旁车会在下次打开时把活文档标成已删）；目录里原有的段与旁车排进延迟删除，下次
+  可写 checkpoint 清掉（只读句柄不动盘）；记一条 warning（`... cannot be loaded ... rebuilding the
+  full-text index from data`）。检索结果此前与此后都正确（全量重放本来就在做）。
+
+### Added
+
+- **冷文档也给高亮片段**（S53，下游反馈
+  `feedbacks/2026-11-19-highlight-cold-docs-never-get-snippets.md`，keelson 转 bitcask-viewer）：
+  `bitcask_search_text_highlight_ex(..., flags, ...)` + `BITCASK_HIGHLIGHT_LOAD_COLD`；C++
+  `Cask::search_text_highlight(query, k, opts, ColdText::kLoad)`。片段为空的命中经 `get_doc_view`
+  读回正文，再由新的 `TextPlugin::highlight_snippets` 切片段——与原文 LRU 命中同一条路，片段逐字相同。
+  正文空取第一个命名字段；读回版本 ≠ 命中版本不补；不回填 LRU；保留 flag 位 ⇒ `INVALID_OPTION`。
+  缺省行为不变。
+
+### Docs
+
+- **`bitcask_range_iter_start` 的 `NO_INDEX` 说明勘误**（S54，下游反馈
+  `feedbacks/2026-11-19-c-api-range-iter-no-index-comment-stale.md`）：只读打开**不会**得到
+  `NO_INDEX`——目录没有 OKI 时 open 期从 data 建一份内存读视图（不写盘），照常迭代；`NO_INDEX`
+  只出在 merge-only 句柄（不建读视图）。`INDEX_REBUILD_FAILED` 也覆盖「只读打开建内存读视图失败」。
+  改动面：`bitcask_kv.h`（两处）、`cask.hpp`（两处）、`cask_range_iter.cpp` 报文
+  （原文把 read-only 写进了 NO_INDEX 的成因）、`doc/api-c.md`、`doc/api-cpp.md`。
+
+### Validation
+
+- 新增 `SegmentFallbackTest.UnreadableSegmentsRebuildInsideTheIndexDir`（9.0.0 实现上红：当前目录被写、
+  无 warning、旧段与旁车未清、新段与旧段同号）与 `.FreshLibraryLogsNothing`；
+  `HighlightColdTest.{ReopenedLibraryHasNoSnippetsUnlessLoaded, HotSnippetsAreUntouchedByLoad,
+  ColdSnippetsMatchHotOnes}`；`OkiRangeTest.ReadOnlyWithoutOkiIteratesMergeOnlyHasNoIndex`；
+  C `test_highlight_load_cold`。
+- GCC Release 全量 ctest 913/913（2 项 Disabled），编译无新告警（`-Werror`）；相关 61 项在
+  ASan / TSan / Clang Debug 全绿。Windows 未实测。
 
 ---
 
@@ -2293,7 +2345,8 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/9.0.0...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/9.1.0...HEAD
+[9.1.0]: https://github.com/davidalphafox/libbitcask/compare/9.0.0...9.1.0
 [9.0.0]: https://github.com/davidalphafox/libbitcask/compare/8.1.0...9.0.0
 [8.1.0]: https://github.com/davidalphafox/libbitcask/compare/8.0.2...8.1.0
 [8.0.2]: https://github.com/davidalphafox/libbitcask/compare/8.0.1...8.0.2

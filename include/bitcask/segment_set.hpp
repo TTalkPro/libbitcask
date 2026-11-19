@@ -14,12 +14,15 @@
 #include "bitcask/segment_query.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
 #include <span>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 #include "bitcask/detail/path_utf8.hpp"
 
@@ -66,6 +69,44 @@ public:
             if (!seg) return nullptr;  // 段损坏 → 整体拒收
             set->segments_.push_back(std::move(seg));
         }
+        return set;
+    }
+
+    // S52：旧段集打不开（`open` / `open_from_payload` 回 nullptr：段载不进、清单坏）时的
+    // 「从零重建」空集。⛔ 拿默认构造当回退——`dir_` 为空 ⇒ 之后 `join(dir_, "seg-N.seg")`
+    // 是相对路径，新段与清单写进**进程当前目录**（feedbacks/2026-11-19-old-segments-
+    // fallback-writes-cwd.md）。这里：
+    //  ① 落在 `dir`；
+    //  ② seg_id 从目录里已有 `seg-<n>.seg[.live]` 的最大号之后起——⛔ 与旧文件同名：全活段
+    //     `save_v2` 不写 `.live` 旁车、也不删同名旧旁车 ⇒ 旧段留下的 `seg-<n>.seg.live` 会在
+    //     下次 `open_v2` 时套到新段上，把活文档标成已删（静默少返回）；
+    //  ③ 目录里原有的段文件与旁车排进 `pending_unlink_`，首次 `commit`（可写 checkpoint）
+    //     时清掉——只读 / 从不 commit 的句柄不动盘。open 期单线程，此刻目录里没有进行中
+    //     merge 预留的文件，全部都是旧的。
+    // `stale_segments`（可空）回填原有段文件个数（不计旁车），宿主据此记日志。
+    [[nodiscard]] static std::unique_ptr<SegmentSet> fresh(
+        const std::string& dir, bool verify_crc = true,
+        std::size_t* stale_segments = nullptr) {
+        auto set = std::make_unique<SegmentSet>();
+        set->dir_ = dir;
+        set->verify_crc_ = verify_crc;
+        std::size_t stale = 0;
+        std::uint64_t next = 0;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator
+                 it(bitcask::detail::from_utf8(dir), ec), end;
+             !ec && it != end; it.increment(ec)) {
+            const std::string name =
+                bitcask::detail::to_utf8(it->path().filename());
+            std::uint64_t id = 0;
+            bool sidecar = false;
+            if (!parse_seg_file_name(name, id, sidecar)) continue;
+            set->pending_unlink_.push_back(name);
+            if (!sidecar) ++stale;
+            if (id + 1 > next) next = id + 1;
+        }
+        set->next_seg_id_ = next;
+        if (stale_segments != nullptr) *stale_segments = stale;
         return set;
     }
 
@@ -312,6 +353,29 @@ private:
     }
     static std::string manifest_path(const std::string& dir) {
         return join(dir, "segments.manifest");
+    }
+
+    // S52：`seg-<十进制 id>.seg` 或其旁车 `seg-<id>.seg.live` ⇒ true（回填 id / 是否旁车）。
+    // 别的名字（清单、`.tmp`、杂物）⇒ false。
+    [[nodiscard]] static bool parse_seg_file_name(std::string_view name,
+                                                  std::uint64_t& id,
+                                                  bool& sidecar) {
+        constexpr std::string_view kPrefix = "seg-";
+        constexpr std::string_view kSuffix = ".seg";
+        constexpr std::string_view kLive = ".live";
+        sidecar = name.ends_with(kLive);
+        if (sidecar) name.remove_suffix(kLive.size());
+        if (!name.starts_with(kPrefix) || !name.ends_with(kSuffix)) return false;
+        name.remove_prefix(kPrefix.size());
+        name.remove_suffix(kSuffix.size());
+        if (name.empty() || name.size() > 19) return false;  // u64 十进制最多 20 位，留余量防溢出
+        std::uint64_t v = 0;
+        for (const char c : name) {
+            if (c < '0' || c > '9') return false;
+            v = v * 10 + static_cast<std::uint64_t>(c - '0');
+        }
+        id = v;
+        return true;
     }
 
     [[nodiscard]] bool commit_manifest() const {

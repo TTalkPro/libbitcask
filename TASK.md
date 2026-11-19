@@ -10,6 +10,90 @@
 
 ---
 
+## 🔴 S54 · `bitcask_range_iter_start` 的 NO_INDEX 说明勘误（2026-11-19 立项）
+
+> 来源：下游反馈
+> [`feedbacks/2026-11-19-c-api-range-iter-no-index-comment-stale.md`](feedbacks/2026-11-19-c-api-range-iter-no-index-comment-stale.md)
+> （keelson 转 bitcask-viewer）：注释说「只读打开且没建过 OKI ⇒ NO_INDEX」，实测只读照常迭代。
+>
+> **实际行为（已核对代码与实测）**：只读打开时 recovery 走 `rebuild_memory_from_data`（只建内存读视图、
+> 不写盘），失败才置 `oki_rebuild_failed_` ⇒ `kIndexRebuildFailed`；`kNoIndex` 只出在 merge-only 句柄
+> （`make_range_iter` 对它不试建）。`cask.hpp:1097` 的注释本来就是对的。
+
+| 项 | 状态 |
+|---|---|
+| S54-1 `bitcask_kv.h`（range 注释 + `INDEX_REBUILD_FAILED` 枚举注释）、`cask.hpp`（`kNoIndex` / `kIndexRebuildFailed` 两处）、`cask_range_iter.cpp` 报文、`doc/api-c.md`、`doc/api-cpp.md` 改口径 | ✅ |
+| S54-2 回归 `OkiRangeTest.ReadOnlyWithoutOkiIteratesMergeOnlyHasNoIndex`（删 OKI 后只读遍历 = 影子、⛔ 写回 OKI；merge-only ⇒ kNoIndex 且报文 ⛔ 再提只读） | ✅ |
+
+**落地记录**（未提交、未定版）：行为零改动，只有注释 / 文档 / 报文。验证见 S52。
+
+---
+
+## 🔴 S53 · 冷文档高亮：读回正文补片段（2026-11-19 立项）
+
+> 来源：下游反馈
+> [`feedbacks/2026-11-19-highlight-cold-docs-never-get-snippets.md`](feedbacks/2026-11-19-highlight-cold-docs-never-get-snippets.md)
+> （keelson 转 bitcask-viewer）：片段只取原文 LRU，LRU 只在写入 / 建索引时填 ⇒ 新开进程 / 只读快照每条
+> 命中都无片段；下游自己 `get_doc` 切片段，分词与引擎不一致。
+>
+> **方案**：在 Cask 层补（插件拿不到 DocValue 解码，宿主有 `get_doc_view`）。`ColdText::kLoad` ⇒ 片段为空的
+> 命中读回正文，交给 `TextPlugin::highlight_snippets`——与 LRU 命中同一条路（抽出私有 `snippets_for` 共用）。
+> 口径：正文空取第一个命名字段（同 LRU 写入口径）；读回 ord ≠ 命中 ord 不补；⛔ 回填 LRU。
+>
+> 约束：⛔ 改既有结构体布局 / 函数签名（C：新函数 `_ex` + 宏；C++：四参重载 + 新枚举 + 新 public 成员函数），
+> 「因冷而无片段」的标记要改 `SearchHitEx` / `bitcask_search_hit_ex_t` 布局 ⇒ 不做（kLoad 已覆盖需求）。
+
+| 项 | 状态 |
+|---|---|
+| S53-1 `TextPlugin::snippets_for`（私有，抽自 `search_text_highlight`）+ `highlight_snippets`（public） | ✅ |
+| S53-2 `search::ColdText` + `Cask::search_text_highlight(query, k, opts, cold)`；三参版委托 kSkip | ✅ |
+| S53-3 C API `bitcask_search_text_highlight_ex` + `BITCASK_HIGHLIGHT_LOAD_COLD`（保留位 ⇒ INVALID_OPTION）；旧入口委托 flags = 0 | ✅ |
+| S53-4 回归 `HighlightColdTest.*`（重开即冷、kLoad 三种文档都有片段、⛔ 回填 LRU、选项生效；热命中不受影响；冷 / 热片段逐字相同）、C `test_highlight_load_cold` | ✅ |
+| S53-5 `doc/api-c.md` §13.13b、`doc/api-cpp.md`、CHANGELOG `[Unreleased]`、反馈回填 | ✅ |
+
+**落地记录**（未提交、未定版）：
+
+- 改动面：`include/bitcask/{highlighter,text_plugin,cask}.hpp`、`src/search/text_plugin.cpp`、`src/cask/cask_search.cpp`、
+  `c_api/bitcask_text.{h,cpp}`、`tests/search_highlight_cold_test.cpp`（新）、`tests/c_api_test.c`、`tests/CMakeLists.txt`。
+- 写判据时撞到：**小库重开会从数据重放**（重放填 LRU ⇒ 热）——3 篇重开全热、1500 篇重开全冷。判据先写目标文档再写一批
+  填充，让目标落进封好的段。文档里写明「小库上看不出冷，别据此判断大库」。
+
+---
+
+## 🔴 S52 · 旧段集打不开时回退空集无目录 ⇒ 新段写进进程当前目录（2026-11-19 立项）
+
+> 来源：下游反馈
+> [`feedbacks/2026-11-19-old-segments-fallback-writes-cwd.md`](feedbacks/2026-11-19-old-segments-fallback-writes-cwd.md)
+> （观澜，9.0.0 打开 7.0.1 封段的旧检索库，当前目录多出 `seg-0.seg` / `segments.manifest`，无日志）。
+>
+> **病因（已复现）**：用观澜给的旧库夹具逐层载入——段清单与 `bm25.ckpt` 读得出、CRC 对；`seg-0.seg` 是 `BSG2` v2、
+> `MmapSegment::open` 也成功，字段为 `\xfault` / `tags` / `title`。`open_v2` 末尾要求有 `kDefaultField`（8.1.0 起是
+> `\x01_bitcask:default`）⇒ 拒载。这是 8.1.0 定的「旧默认字段标识不迁移、需重建」。毛病在回退：
+> `load_component` 失败 ⇒ `open()` 以 loaded=false 再调 `init_segment_set` ⇒ `SegmentSet::open` 回 nullptr ⇒
+> `std::make_unique<SegmentSet>()`（**`dir_` 空串**）⇒ 全量重放封段时 `join("", "seg-0.seg")` 是相对路径。
+> 且 `expect_segments` 为假时回 ok、没有任何日志。
+>
+> 顺带发现的第二个坑：即使回退集带上目录，新段从 0 编号会与旧 `seg-0.seg` 同名；全活段 `save_v2` 不写也不删
+> `.live` 旁车 ⇒ 旧旁车下次打开被套到新段上，把活文档标成已删（静默少返回）。
+
+| 项 | 状态 |
+|---|---|
+| S52-1 `SegmentSet::fresh(dir, verify_crc, &stale)`：落在 dir；seg_id 从已有 `seg-<n>.seg[.live]` 最大号之后起；原有段文件与旁车进 `pending_unlink_`（首次可写 commit 清，只读不动盘） | ✅ |
+| S52-2 `init_segment_set` 回退改用 `fresh` + warning（只在 loaded=false 那次记，⛔ 记两遍） | ✅ |
+| S52-3 回归 `SegmentFallbackTest.UnreadableSegmentsRebuildInsideTheIndexDir`（改坏旧段魔数制造「载不进」、旧段带旁车、当前目录换成空目录；断言当前目录干净、warning、旧文件清掉、新段号 > 旧号、重开检索全对）+ `.FreshLibraryLogsNothing` | ✅ |
+| S52-4 CHANGELOG `[Unreleased]`、反馈回填 | ✅ |
+
+**落地记录**（未提交、未定版）：
+
+- 改动面：`include/bitcask/segment_set.hpp`、`src/search/text_plugin.cpp`、`tests/search_segment_fallback_test.cpp`（新）、`tests/CMakeLists.txt`。
+- 新判据在 9.0.0 实现上红（当前目录被写、无 warning、旧段与旁车未清、新段与旧段同为 0 号），本实现上绿。
+- 验证（S52～S54 合计）：GCC Release 全量 ctest **913/913**（2 项 Disabled），`-Werror` 无新告警；
+  `ctest -R "SegmentFallback|HighlightCold|OkiRange|CApi|TextPlugin|Highlight"` 61/61 在 ASan / TSan / Clang Debug 全绿。Windows 未实测。
+- 未处理（另议）：`SegmentSet::open` 无清单 / 有清单时 `next_seg_id_` 取 0 / 清单水位，崩溃留下的孤儿段（add_pending 后未 commit）
+  若带 `.live` 旁车，同样可能被同名新段误套——同一类风险，本项只修了回退路径。
+
+---
+
 ## 🔴 S51 · 向量检索带过滤时少返回（结果侧过滤 → 遍历期过滤）（2026-11-19 立项）
 
 > 来源：S50 排查时的旁证，无下游反馈。

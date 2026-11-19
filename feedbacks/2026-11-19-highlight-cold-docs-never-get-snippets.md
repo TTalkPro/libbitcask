@@ -34,3 +34,29 @@ bitcask-viewer 实测（clj-bitcask 1.2.8，演示库 60 篇）：`search-highli
   `analyze_with_offsets` + `highlight` 出片段（每条冷命中一次读盘，调用方按需开）。C 侧为了不动 `bitcask_highlight_options_t`
   的布局，可以是新入口（如 `bitcask_search_text_highlight_ex` + 带 flags 的选项）；读来的原文要不要顺手回填 LRU 也请定。
 - 退一步：`bitcask_search_hit_ex_t` 能标出「因冷而无片段」，下游至少能决定要不要自己补。
+
+## 回没回
+
+**已修（未发版，S53）。** 按建议 1 做，新入口不动选项结构体布局。
+
+### 怎么修的
+
+- C：`bitcask_search_text_highlight_ex(cask, query, k, opts, flags, out, fault)` + `BITCASK_HIGHLIGHT_LOAD_COLD`；
+  `flags = 0` 与旧入口同义，保留位给了 ⇒ `INVALID_OPTION`。旧入口不变。
+- C++：`Cask::search_text_highlight(query, k, opts, search::ColdText::kLoad)`；`TextPlugin::highlight_snippets`。
+- 冷命中经 `get_doc_view` 读回正文，按本库分析器切片段——与 LRU 命中**同一条路**，片段逐字相同（判据核过全角文本）。
+- 正文为空取第一个命名字段（同 LRU 写入口径）；读回版本 ≠ 命中版本（已被覆盖 / 删除）该条不补；**不回填 LRU**
+  （批量看冷文档不把热条目挤出去）。
+
+### 没做的
+
+建议 2「标出因冷而无片段」要改 `bitcask_search_hit_ex_t` / `SearchHitEx` 布局（ABI 破坏），而 kLoad 已经能直接拿到
+片段，故不做。
+
+### 下游要知道的
+
+- 「冷」= 本进程没写过它。小库重开时会从数据重放（重放顺带填 LRU），所以 3 篇的小库重开看不出冷；1500 篇左右
+  重开就全冷了（我们实测）。bitcask-viewer 那 60 篇的演示库是冷的，说明它是封好段之后打开的。
+- 代价：每条冷命中一次点查 + 一次分析；热命中不受影响。
+- 纯新增、不破 ABI。Keelson clj-bitcask 要接一个选项（如 `:cold :load`）才用得上。
+

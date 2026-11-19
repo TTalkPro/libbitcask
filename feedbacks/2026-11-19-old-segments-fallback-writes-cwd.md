@@ -46,3 +46,36 @@
 1. 回退出来的空段集也要带上 `segs_dir`（或 `SegmentSet` 不允许无目录构造），⛔ 落到相对路径；
 2. 两路都打不开时至少 `log_fn` 记一条 warning（说明丢掉了哪些旧段、要从数据重建），非空 `expect_segments` 之外的失败也上抛或标记；
 3. 若 9.0.0 确实不再能读 7.x 封的段，CHANGELOG / 升级说明写明「旧检索库需要重建」，或打开时显式返回一个可识别的错误码，让下游决定重建。
+
+## 回没回
+
+**已修（未发版，S52）。** 症状、位置、建议都对；旧段为什么载不进也查清了。
+
+### 病因（实测）
+
+用观澜的旧库夹具（`ak07-cs-index`）逐层载入：段清单与 `bm25.ckpt`（内嵌 kSegManifest）读得出、CRC 对；
+`seg-0.seg` 是 `BSG2` v2，`MmapSegment::open` 成功，字段为 `\xfault` / `tags` / `title`。`open_v2` 末尾要求段里有
+`kDefaultField`——8.1.0 把它从 `\xfa` "ult" 改成了 `\x01_bitcask:default` ⇒ 旧段一律拒载。这是 8.1.0 有意的
+「旧默认字段标识不迁移、需重建」（CHANGELOG 8.1.0 写了，但没写清会怎么表现）。
+
+毛病全在回退：`load_component` 失败 ⇒ `open()` 以 loaded=false 再调 `init_segment_set` ⇒ `SegmentSet::open`
+回 nullptr ⇒ 默认构造的段集（`dir_` 为空串）⇒ 全量重放封出的段写进进程当前目录。检索结果一直是对的（全量重放
+本来就在做），所以只有「当前目录多出文件」这一个外在表现。
+
+另查出一个同类坑：回退集即便带上目录，新段从 0 编号会与旧 `seg-0.seg` 同名；全活段 `save_v2` 不写也不删 `.live`
+旁车 ⇒ 旧旁车下次打开会被套到新段上，把活文档标成已删（静默少返回）。
+
+### 怎么修的
+
+`SegmentSet::fresh(segs_dir)` 取代默认构造：新段落在库目录；seg_id 从目录里已有段文件的最大号之后起；原有段文件与
+旁车排进延迟删除，下次可写 checkpoint 清掉（只读句柄不动盘）；记一条 warning
+（`bm25: N existing segment file(s) in … cannot be loaded … rebuilding the full-text index from data …`）。
+建议 1、2 照做；建议 3（升级说明）写进了 CHANGELOG `[Unreleased]`。回归
+`SegmentFallbackTest.UnreadableSegmentsRebuildInsideTheIndexDir` 在 9.0.0 实现上红、本实现上绿。
+
+### 下游要知道的
+
+- 修了之后，旧库首次打开仍要从数据全量重建全文索引一次（8.1.0 起就如此，只是现在看得见、写对地方）；之后正常载入。
+- 观澜的绕法（键空间 2 → 3 强制整棵重建）与本修复兼容，升级后可以保留，也可以去掉。
+- 纯新增、不破 ABI；盘上格式不变。
+

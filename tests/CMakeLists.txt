@@ -203,6 +203,24 @@ target_link_libraries(bitcask_cask_docvalue_test PRIVATE
 target_compile_definitions(bitcask_cask_docvalue_test PRIVATE
     BITCASK_JIEBA_DICT_DIR="${BITCASK_JIEBA_DICT_DIR}")
 
+# S52：旧段集打不开时从零重建（新段落在库目录，⛔ 进程当前目录）
+add_executable(bitcask_search_segment_fallback_test search_segment_fallback_test.cpp)
+target_link_libraries(bitcask_search_segment_fallback_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
+# S53：冷文档高亮（ColdText::kLoad 从存储读回正文补片段）
+add_executable(bitcask_search_highlight_cold_test search_highlight_cold_test.cpp)
+target_link_libraries(bitcask_search_highlight_cold_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 add_executable(bitcask_oki_range_test oki_range_test.cpp)
 target_link_libraries(bitcask_oki_range_test PRIVATE
     GTest::gtest_main
@@ -465,6 +483,8 @@ gtest_discover_tests(bitcask_posix_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_path_utf8_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_file_lock_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_index_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_search_segment_fallback_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_search_highlight_cold_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_v2_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_test ${_bitcask_test_props})

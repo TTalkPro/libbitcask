@@ -189,12 +189,14 @@ enum class CaskError {
     kWriteLocked,         // 别人已经持有 write.lock / merge.lock
     kInvalidOption,
     kNoIndex,           // 索引在本句柄上本就不存在：KV 模式调 search 接口；
-                        // RO/merge_only 打开无 OKI 的目录调 range（重开读写可建）
+                        // merge_only 句柄调 range（它不建读视图）。S54：只读打开
+                        // **不会**到这里——open 期从 data 建内存读视图（不写盘）
     kModeMismatch,      // 文件模式与打开选项不匹配
     kAnalyzerMismatch,  // 分析器类型不匹配
     kClosed,            // 对已 close 的 handle 发起调用（S12-5：与 kInvalidOption 区分）
-    kIndexRebuildFailed,  // OKI 试建而败（可写 open 重建失败——IO/环境问题，
-                          // 见 log；与 kNoIndex 的「本就不建」区分。追加在尾：
+    kIndexRebuildFailed,  // OKI 试建而败（可写 open 重建 / 只读 open 建内存读视图
+                          // 失败——IO/环境问题，见 log；与 kNoIndex 的「本就不建」
+                          // 区分。追加在尾：
                           // 既有枚举值不动，C API 映射 +1 偏移不破）
     kIndexCorrupt,        // S43-1：定位记录存在，但读回 record 的 key 不同。
                           // 这是索引损坏/陈旧错误的硬证据，绝不能返回 value。
@@ -939,6 +941,18 @@ public:
     [[nodiscard]] std::expected<HighlightSearchResult, CaskFault>
     search_text_highlight(std::string_view query, std::size_t k = 10,
                           const search::HighlightOptions& opts = {});
+    // S53：片段只取原文 LRU（缺省 1024 篇，只在写入 / 建索引时填，读文档不填）⇒ 冷文档的命中
+    // 片段为空——新开进程 / 只读快照里每条都冷（feedbacks/2026-11-19-highlight-cold-docs-never-
+    // get-snippets.md）。`cold = ColdText::kLoad` ⇒ 片段为空的命中从存储读回正文（get_doc_view
+    // 同一条读路径）再按本库分析器切片段（TextPlugin::highlight_snippets，与 LRU 命中同一条路）。
+    // - 取哪段文字与原文 LRU 同口径：正文非空取正文，否则取第一个命名字段（纯 KV 写入的正文即 value）。
+    // - 只认命中的那一版：读回的 ord ≠ 命中的 ord（文档已被覆盖 / 删除）⇒ 该条不补。
+    // - 读回的原文 ⛔ 回填 LRU（批量看冷文档不把热条目挤出去）。
+    // 代价：每条冷命中一次点查 + 一次分析。`kSkip` 与上面的三参版同义。线程安全：是（同上）。
+    [[nodiscard]] std::expected<HighlightSearchResult, CaskFault>
+    search_text_highlight(std::string_view query, std::size_t k,
+                          const search::HighlightOptions& opts,
+                          search::ColdText cold);
 
     // 同义词词典在 **open 时**经 `CaskOptions::synonym_map` 配置（不可变、并发安全）；
     // 运行期 setter 已移除（曾是配置项里唯一的竞态源，见 docs/design/thread-safety.md）。
@@ -1471,8 +1485,8 @@ private:
     std::mutex oki_rebuild_mu_;
     std::condition_variable oki_rebuild_cv_;
     // OKI 试建而败的记账——make_range_iter 据此把「不可用」拆成
-    // kIndexRebuildFailed（可写 open 重建失败）vs kNoIndex（RO/merge_only
-    // 本就不建）。open 期单线程置位，此后只读；loaded_ 置真后不会再翻回，
+    // kIndexRebuildFailed（可写 open 重建 / 只读 open 建内存读视图失败）vs
+    // kNoIndex（merge_only 本就不建；S54：只读打开会建内存读视图，不属此类）。open 期单线程置位，此后只读；loaded_ 置真后不会再翻回，
     // 故不可用性（连同本标志）在 open 期定型。
     std::atomic<bool> oki_rebuild_failed_{false};
     // B4：延迟删除队列——merge 输入退休而非当场 unlink（文件留在原路径，

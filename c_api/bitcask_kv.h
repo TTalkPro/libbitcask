@@ -77,8 +77,9 @@ typedef enum {
     BITCASK_ERR_MODE_MISMATCH  = 11,
     BITCASK_ERR_ANALYZER_MISMATCH = 12,
     BITCASK_ERR_CLOSED         = 13,  // 对已 bitcask_close 的 handle 发起调用（S12-5）
-    BITCASK_ERR_INDEX_REBUILD_FAILED = 14,  // OKI 试建而败（可写 open 重建失败；
-                                            // 与 NO_INDEX 的「本就不建」区分）
+    BITCASK_ERR_INDEX_REBUILD_FAILED = 14,  // OKI 试建而败（可写 open 重建 / 只读 open
+                                            // 建内存读视图失败；与 NO_INDEX 的
+                                            // 「本就不建」区分）
     BITCASK_ERR_BUSY           = 15,  // 6.7.0：仅 C 侧（无 CaskError 对应）——
                                       // bitcask_shutdown 时运行时仍被占用
     BITCASK_ERR_INDEX_CORRUPT  = 16,  // S43-1：定位成功但读回 record 的 key
@@ -982,10 +983,12 @@ BITCASK_API void bitcask_range_options_init(bitcask_range_options_t* opts);
 // 一致性：**per-key 弱一致**（与 bitcask_parallel_scan 同档）——迭代期间的
 // 并发写可能部分可见，不是 bitcask_iter_* 的快照语义。
 // 返回 BITCASK_OK，或：
-//   BITCASK_ERR_NO_INDEX  — 只读/merge-only 打开且目录未建过 OKI（本句柄
-//                           本就不建索引）；读写方式打开会自动重建。
-//   BITCASK_ERR_INDEX_REBUILD_FAILED — 读写打开时 OKI 重建失败（IO/环境
-//                           问题，见日志）；修复后重新打开可重试。
+//   BITCASK_ERR_NO_INDEX  — merge-only 打开（本句柄不建读视图）。只读打开
+//                           不会返回它：目录没有 OKI 时 open 期从 data 建一份
+//                           内存读视图（不写盘），照常迭代（S54 勘误）。
+//   BITCASK_ERR_INDEX_REBUILD_FAILED — OKI 试建而败：读写打开时重建失败，或
+//                           只读打开时建内存读视图失败（IO/环境问题，见日志）；
+//                           修复后重新打开可重试。
 //   BITCASK_ERR_CLOSED / BITCASK_ERR_BAD_CRC 等 — 见 fault 详情。
 // 生命周期：迭代器须在 bitcask_close 之前 release。
 BITCASK_API bitcask_error_t bitcask_range_iter_start(

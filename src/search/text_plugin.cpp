@@ -1211,24 +1211,10 @@ TextPlugin::search_text_highlight(std::string_view query, std::size_t k,
 
         // S9.3：原文 LRU 命中才生成高亮片段；冷文档被挤出（miss）时降级为
         // 无片段的 hit，而非整条丢弃——保证结果集不因 LRU 容量而缩水。
+        // S53：冷文档要片段 ⇒ 宿主读回正文后调 highlight_snippets（Cask ColdText::kLoad）。
         auto doc_text = doc_texts_.get(r.ord);  // 拷贝(C1)
         std::vector<Snippet> snippets;
-        if (doc_text) {
-            // S9.19：analyze_with_offsets 产出的 byte offset 相对「归一化文本」，
-            // 故 highlight 也必须在归一化文本上切片，否则非规范文本（全角/组合
-            // 字符等）会因坐标系不一致切出乱码。NFKC 幂等，传 norm 再归一化无害。
-            std::string norm = text::detail::nfkc_fold(*doc_text);
-            auto token_offsets = analyzer_->analyze_with_offsets(norm);
-            std::unordered_map<std::string, std::vector<text::TokenInfo>> query_token_offsets;
-            for (auto& [term, _] : term_freqs) {
-                auto it_token = token_offsets.find(term);
-                if (it_token != token_offsets.end()) {
-                    query_token_offsets[term] = it_token->second;
-                }
-            }
-            auto hl_result = highlight(norm, query_token_offsets, opts);
-            snippets = std::move(hl_result.snippets);
-        }
+        if (doc_text) snippets = snippets_for(term_freqs, *doc_text, opts);
 
         hits.push_back(SearchHitEx{
             std::move(*ext_id),
@@ -1238,6 +1224,32 @@ TextPlugin::search_text_highlight(std::string_view query, std::size_t k,
         });
     }
     return hits;
+}
+
+std::vector<Snippet> TextPlugin::snippets_for(const TermFreqMap& query_terms,
+                                              std::string_view text,
+                                              const HighlightOptions& opts) const {
+    // S9.19：analyze_with_offsets 产出的 byte offset 相对「归一化文本」，
+    // 故 highlight 也必须在归一化文本上切片，否则非规范文本（全角/组合
+    // 字符等）会因坐标系不一致切出乱码。NFKC 幂等，传 norm 再归一化无害。
+    std::string norm = text::detail::nfkc_fold(text);
+    auto token_offsets = analyzer_->analyze_with_offsets(norm);
+    std::unordered_map<std::string, std::vector<text::TokenInfo>> query_token_offsets;
+    for (const auto& [term, _] : query_terms) {
+        auto it_token = token_offsets.find(term);
+        if (it_token != token_offsets.end()) {
+            query_token_offsets[term] = it_token->second;
+        }
+    }
+    return highlight(norm, query_token_offsets, opts).snippets;
+}
+
+std::vector<Snippet> TextPlugin::highlight_snippets(std::string_view query,
+                                                    std::string_view text,
+                                                    const HighlightOptions& opts) const {
+    const auto query_terms = analyzer_->analyze(query);
+    if (query_terms.empty() || text.empty()) return {};
+    return snippets_for(query_terms, text, opts);
 }
 
 
@@ -1376,7 +1388,23 @@ bool TextPlugin::init_segment_set(std::string_view dir, bool loaded) {
     if (opened) {
         segment_set_ = std::move(opened);
     } else {
-        segment_set_ = std::make_unique<search::SegmentSet>();
+        // S52：旧段集载不进 ⇒ 从零重建，新段集**落在 segs_dir**（见 SegmentSet::fresh）。
+        // 原来是默认构造（dir_ 为空）⇒ 全量重放封出的段与清单写进进程当前目录，库目录的
+        // 段永远是旧的，不报错不记日志（feedbacks/2026-11-19-old-segments-fallback-
+        // writes-cwd.md）。典型成因：8.1.0 之前封的段默认字段还是旧标识（`\xfa` "ult"），
+        // v2 段载入要求 kDefaultField ⇒ 拒载（8.1.0 定的「不迁移、需重建」）；也可能是清单 / 段 CRC 坏。
+        std::size_t stale = 0;
+        segment_set_ = search::SegmentSet::fresh(segs_dir, config_.mmap_verify_crc, &stale);
+        // loaded 路径失败后宿主会以 loaded=false 再调一次（open() 的重建分支）⇒ 只在那次记，⛔ 记两遍。
+        if (!loaded && stale > 0 && host_ != nullptr) {
+            host_->log(plugin::LogLevel::kWarn,
+                       "bm25: " + std::to_string(stale) +
+                           " existing segment file(s) in " + segs_dir +
+                           " cannot be loaded (segments sealed before 8.1.0 carry the old "
+                           "default-field id and are not migrated; or a manifest/segment "
+                           "CRC is bad) - rebuilding the full-text index from data; the "
+                           "stale files are removed at the next checkpoint");
+        }
     }
     segment_set_->set_seal_v2(config_.seal_v2_segments);  // S30-P2
     pending_seg_manifest_.clear();

@@ -54,8 +54,8 @@ Cask::make_range_iter(const RangeOptions& opts) {
         }
         return std::unexpected(err(
             CaskError::kNoIndex,
-            "oki unavailable on this handle (read-only or merge-only open "
-            "of a dir without oki; reopen read-write to build)"));
+            "oki unavailable on this handle (merge-only open builds no read "
+            "view; open read-only or read-write to iterate)"));
     }
 
     // unique_ptr + 私有构造：make_unique 不可用，直接 new。

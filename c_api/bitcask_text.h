@@ -225,6 +225,23 @@ BITCASK_API bitcask_error_t bitcask_search_text_highlight(
     const bitcask_highlight_options_t* opts,
     bitcask_search_result_ex_t** out, bitcask_fault_t* fault);
 
+/* S53：冷文档也给片段（feedbacks/2026-11-19-highlight-cold-docs-never-get-snippets.md）。
+ * 片段只取原文 LRU（缺省 1024 篇，只在写入 / 建索引时填，读文档不填）⇒ 新开进程 / 只读快照里
+ * bitcask_search_text_highlight 的每条命中都是 highlights_count == 0。
+ *   flags : 0 = 同 bitcask_search_text_highlight；
+ *           BITCASK_HIGHLIGHT_LOAD_COLD = 片段为空的命中从存储读回正文（bitcask_get_doc 同一条读路径）
+ *           再按本库分析器切片段（与 LRU 命中同一条路）。取正文；正文为空取第一个命名字段；
+ *           读回的版本 ≠ 命中的版本（已被覆盖 / 删除）则该条不补；读回的原文不回填 LRU。
+ *           代价：每条冷命中一次点查 + 一次分析。
+ *           其余位保留，给了 ⇒ BITCASK_ERR_INVALID_OPTION。
+ * 其余参数与所有权同 bitcask_search_text_highlight。线程安全：是。 */
+#define BITCASK_HIGHLIGHT_LOAD_COLD 0x1u
+
+BITCASK_API bitcask_error_t bitcask_search_text_highlight_ex(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_highlight_options_t* opts, uint32_t flags,
+    bitcask_search_result_ex_t** out, bitcask_fault_t* fault);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

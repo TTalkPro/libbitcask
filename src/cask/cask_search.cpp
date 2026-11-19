@@ -151,10 +151,32 @@ Cask::search_text(std::string_view query, std::size_t k,
 std::expected<Cask::HighlightSearchResult, CaskFault>
 Cask::search_text_highlight(std::string_view query, std::size_t k,
                             const search::HighlightOptions& opts) {
+    return search_text_highlight(query, k, opts, search::ColdText::kSkip);
+}
+
+// S53：冷文档（原文 LRU 未命中）读回正文补片段。契约见 cask.hpp。
+std::expected<Cask::HighlightSearchResult, CaskFault>
+Cask::search_text_highlight(std::string_view query, std::size_t k,
+                            const search::HighlightOptions& opts,
+                            search::ColdText cold) {
     if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // S11-W3
     if (auto g = prepare_search(); !g) return std::unexpected(g.error());
     auto hits = text_->search_text_highlight(query, k, opts);
     if (!hits) return std::unexpected(search_fault(hits.error()));
+    if (cold == search::ColdText::kLoad) {
+        for (auto& h : *hits) {
+            if (!h.highlights.empty()) continue;  // 热：LRU 已给
+            auto doc = get_doc_view(
+                std::as_bytes(std::span<const char>(h.key.data(), h.key.size())));
+            // 读不到（已删 / 过期 / 记录坏）或已被覆盖（ord 变了）⇒ 不补，⛔ 拿新版正文配旧版命中。
+            if (!doc || doc->ord != h.ord) continue;
+            std::span<const std::byte> src = doc->value;
+            if (src.empty() && !doc->fields.empty()) src = doc->fields.front().value;  // 同原文 LRU 口径
+            if (src.empty()) continue;
+            const std::string_view text(reinterpret_cast<const char*>(src.data()), src.size());
+            h.highlights = text_->highlight_snippets(query, text, opts);
+        }
+    }
     return HighlightSearchResult{std::move(*hits)};
 }
 

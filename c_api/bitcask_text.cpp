@@ -328,9 +328,20 @@ BITCASK_API bitcask_error_t bitcask_search_text_highlight(
     bitcask_t* cask, const char* query, size_t k,
     const bitcask_highlight_options_t* opts,
     bitcask_search_result_ex_t** out, bitcask_fault_t* fault) {
+    return bitcask_search_text_highlight_ex(cask, query, k, opts, 0u, out, fault);
+}
+
+// S53：flags 带 BITCASK_HIGHLIGHT_LOAD_COLD ⇒ 冷文档读回正文补片段（Cask ColdText::kLoad）。
+BITCASK_API bitcask_error_t bitcask_search_text_highlight_ex(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_highlight_options_t* opts, uint32_t flags,
+    bitcask_search_result_ex_t** out, bitcask_fault_t* fault) {
     return guarded(fault, [&]() -> bitcask_error_t {
     if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
     *out = nullptr;
+    if ((flags & ~static_cast<uint32_t>(BITCASK_HIGHLIGHT_LOAD_COLD)) != 0) {
+        return BITCASK_ERR_INVALID_OPTION;  // 保留位：⛔ 静默忽略将来才有含义的位
+    }
 
     // opts == NULL 或某字段为 0/NULL → 保留 C++ 侧默认值（不覆盖）。
     // 这样 C 调用方 memset(&opts, 0, ...) 后只填想改的那项即可。
@@ -341,8 +352,11 @@ BITCASK_API bitcask_error_t bitcask_search_text_highlight(
         if (opts->fragment_size > 0) hopts.fragment_size = opts->fragment_size;
         if (opts->max_fragments > 0) hopts.max_fragments = opts->max_fragments;
     }
+    const auto cold = (flags & BITCASK_HIGHLIGHT_LOAD_COLD) != 0
+                          ? search::ColdText::kLoad
+                          : search::ColdText::kSkip;
     return finish_single_ex(
-        as_cpp_cask(cask)->search_text_highlight(query, k, hopts), out, fault);
+        as_cpp_cask(cask)->search_text_highlight(query, k, hopts, cold), out, fault);
     });
 }
 

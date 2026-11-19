@@ -542,3 +542,67 @@ TEST_F(OkiRangeTest, UnflushedMemdeltaRepeatedRangeNotLinearPerQuery) {
         << "ms——memdelta 视图疑似逐查询重排（悬崖回归）";
     (*c)->close();
 }
+
+namespace {
+
+std::vector<std::string> oki_files_in(const fs::path& d) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (fs::directory_iterator it(d, ec), end; !ec && it != end; it.increment(ec)) {
+        const auto n = it->path().filename().string();
+        if (n.find("oki") != std::string::npos) out.push_back(n);
+    }
+    return out;
+}
+
+// S54（勘误，feedbacks/2026-11-19-c-api-range-iter-no-index-comment-stale.md）：只读打开、
+// 目录没有 OKI ⇒ open 期从 data 建内存读视图，range 照常遍历、⛔ 写回 OKI 文件；
+// merge_only 句柄不建读视图 ⇒ kNoIndex（报文 ⛔ 再把只读算进去）。
+TEST_F(OkiRangeTest, ReadOnlyWithoutOkiIteratesMergeOnlyHasNoIndex) {
+    std::map<std::string, std::string> shadow;
+    {
+        CaskOptions o;
+        o.read_write = true;
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 20; ++i) {
+            const std::string k = "k" + std::string(i < 10 ? "0" : "") + std::to_string(i);
+            const std::string v = "v" + std::to_string(i);
+            ASSERT_TRUE((*c)->put(bytes(k), bytes(v), 1000));
+            shadow[k] = v;
+        }
+        (*c)->close();
+    }
+    for (const auto& n : oki_files_in(dir_)) {
+        std::error_code ec;
+        fs::remove(dir_ / n, ec);
+    }
+    ASSERT_TRUE(oki_files_in(dir_).empty());
+
+    {
+        CaskOptions ro;
+        ro.read_write = false;
+        auto c = Cask::open(dir_.string(), ro, &test_registry());
+        ASSERT_TRUE(c);
+        EXPECT_EQ(range_scan(**c, "", ""), shadow_range(shadow, "", ""))
+            << "只读、无 OKI ⇒ 内存读视图照常遍历（⛔ kNoIndex）";
+        (*c)->close();
+    }
+    EXPECT_TRUE(oki_files_in(dir_).empty()) << "只读：内存视图，⛔ 写盘";
+
+    {
+        CaskOptions mo;
+        mo.merge_only = true;
+        auto c = Cask::open(dir_.string(), mo, &test_registry());
+        ASSERT_TRUE(c);
+        auto it = (*c)->make_range_iter(RangeOptions{});
+        ASSERT_FALSE(it.has_value()) << "merge_only 不建读视图";
+        EXPECT_EQ(it.error().kind, bitcask::CaskError::kNoIndex);
+        EXPECT_EQ(it.error().detail.find("read-only or merge-only open"), std::string::npos)
+            << "报文 ⛔ 再说只读打开会没有索引：" << it.error().detail;
+        EXPECT_NE(it.error().detail.find("merge-only"), std::string::npos) << it.error().detail;
+        (*c)->close();
+    }
+}
+
+}  // namespace

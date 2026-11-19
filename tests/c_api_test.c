@@ -38,6 +38,7 @@ static void rmrf(const char* dir) {
 static const char* const kAllTestDirs[] = {
     TDIR("batch"),
     TDIR("filter"),
+    TDIR("hlcold"),
     TDIR("fields"),
     TDIR("flush_after_iter"),
     TDIR("paging"),
@@ -2320,6 +2321,67 @@ static int test_conditional_batch(void) {
 }
 #undef CB_CHECK
 
+#define HC_CHECK(cond) do { if (!(cond)) { \
+    fprintf(stderr, "FAIL test_highlight_load_cold: line %d: %s\n", __LINE__, #cond); \
+    if (cask) bitcask_close(cask); return 1; } } while (0)
+
+/* S53：冷文档高亮（feedbacks/2026-11-19-highlight-cold-docs-never-get-snippets.md）。
+ * 写入后关库再开 ⇒ 原文 LRU 为空、每条命中都冷：旧入口 / flags = 0 片段为空；
+ * BITCASK_HIGHLIGHT_LOAD_COLD 读回正文补片段；保留位 ⇒ INVALID_OPTION。
+ * ⚠ 调用 ⛔ 写进 assert（Release 带 NDEBUG 会整个编掉），全走 HC_CHECK。 */
+static int test_highlight_load_cold(void) {
+    const char* dir = TDIR("hlcold");
+    rmrf(dir);
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.enable_search = 1;
+    opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    HC_CHECK(bitcask_open(dir, &opts, &cask, &fault) == BITCASK_OK);
+    HC_CHECK(bitcask_put(cask, (bitcask_slice_t){"c1", 2},
+                         (bitcask_slice_t){"cold fox text", 13}, 0, &fault) == BITCASK_OK);
+    /* 小库重开会从数据重放（重放填原文 LRU ⇒ 热）；写够一批让 c1 落进封好的段 ⇒ 重开即冷。 */
+    for (int i = 0; i < 1500; i++) {
+        char k[32];
+        char v[48];
+        int kl = snprintf(k, sizeof(k), "zz%d", i);
+        int vl = snprintf(v, sizeof(v), "filler text number %d", i);
+        HC_CHECK(bitcask_put(cask, (bitcask_slice_t){k, (size_t)kl},
+                             (bitcask_slice_t){v, (size_t)vl}, 0, &fault) == BITCASK_OK);
+    }
+    bitcask_close(cask);
+    cask = NULL;
+    HC_CHECK(bitcask_open(dir, &opts, &cask, &fault) == BITCASK_OK);
+
+    bitcask_search_result_ex_t* r = NULL;
+    HC_CHECK(bitcask_search_text_highlight(cask, "fox", 10, NULL, &r, &fault) == BITCASK_OK);
+    HC_CHECK(r != NULL && r->count == 1 && r->hits[0].highlights_count == 0);
+    bitcask_search_result_ex_free(r);
+    r = NULL;
+
+    HC_CHECK(bitcask_search_text_highlight_ex(cask, "fox", 10, NULL, 0u, &r, &fault) == BITCASK_OK);
+    HC_CHECK(r != NULL && r->count == 1 && r->hits[0].highlights_count == 0);
+    bitcask_search_result_ex_free(r);
+    r = NULL;
+
+    HC_CHECK(bitcask_search_text_highlight_ex(cask, "fox", 10, NULL, BITCASK_HIGHLIGHT_LOAD_COLD,
+                                              &r, &fault) == BITCASK_OK);
+    HC_CHECK(r != NULL && r->count == 1 && r->hits[0].highlights_count >= 1);
+    HC_CHECK(strstr(r->hits[0].highlights[0].text, "<em>fox</em>") != NULL);
+    bitcask_search_result_ex_free(r);
+    r = NULL;
+
+    HC_CHECK(bitcask_search_text_highlight_ex(cask, "fox", 10, NULL, 0x80u, &r, &fault) ==
+             BITCASK_ERR_INVALID_OPTION);
+    HC_CHECK(r == NULL);
+    bitcask_close(cask);
+    rmrf(dir);
+    printf("PASS test_highlight_load_cold\n");
+    return 0;
+}
+
 int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
@@ -2346,6 +2408,7 @@ int main(void) {
     failures += test_search_filtered();
     failures += test_doc_fields_and_meta();
     failures += test_paging_and_highlight();
+    failures += test_highlight_load_cold();
     failures += test_meta_filter_query();
     failures += test_merge_policy_files_checkpoint();
 

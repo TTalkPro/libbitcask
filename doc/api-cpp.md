@@ -112,7 +112,7 @@ libbitcask 有两种工作模式，由 `CaskOptions` 决定：
 | `kReadOnly` | 对只读 cask 调用写操作 |
 | `kWriteLocked` | 别人已持有 `write.lock` / `merge.lock` |
 | `kInvalidOption` | 选项非法 |
-| `kNoIndex` | 索引在本句柄上本就不存在：KV 模式调 search 接口；RO/merge_only 打开无 OKI 的目录调 range（重开读写可建）|
+| `kNoIndex` | 索引在本句柄上本就不存在：KV 模式调 search 接口；merge_only 句柄调 range（不建读视图）。只读打开不会返回它——open 期从 data 建内存读视图（不写盘）|
 | `kModeMismatch` | 文件模式与打开选项不匹配 |
 | `kAnalyzerMismatch` | 分析器类型不匹配 |
 | `kClosed` | 对已 close 的 handle 发起调用 |
@@ -794,6 +794,26 @@ search_text_highlight(std::string_view query, std::size_t k = 10,
 ```
 
 S13-D3：命中含高亮片段（`SearchHitEx.highlights`），截取策略由 `opts` 控制。
+
+```cpp
+// highlighter.hpp
+enum class ColdText : std::uint8_t { kSkip = 0, kLoad = 1 };
+// cask.hpp
+[[nodiscard]] std::expected<HighlightSearchResult, CaskFault>
+search_text_highlight(std::string_view query, std::size_t k,
+                      const search::HighlightOptions& opts,
+                      search::ColdText cold);
+// text_plugin.hpp
+[[nodiscard]] std::vector<search::Snippet>
+TextPlugin::highlight_snippets(std::string_view query, std::string_view text,
+                               const search::HighlightOptions& opts = {}) const;
+```
+
+S53：片段只取原文 LRU（`SearchLayerConfig::doc_text_cache_max`，缺省 1024；只在写入 / 建索引时填，
+读文档不填）⇒ 冷文档的命中片段为空——新开进程 / 只读快照里每条都冷。`ColdText::kLoad`：片段为空的
+命中经 `get_doc_view` 读回正文，再由 `TextPlugin::highlight_snippets` 切片段（与 LRU 命中同一条路）。
+口径（取哪段文字、只认命中那一版、不回填 LRU、代价）同 C API [`bitcask_search_text_highlight_ex`](api-c.md)。
+三参版 ≙ `ColdText::kSkip`。
 
 #### 同义词词典（open-time 配置）
 

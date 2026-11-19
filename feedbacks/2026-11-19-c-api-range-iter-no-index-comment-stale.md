@@ -27,3 +27,15 @@ KV 库读写写入若干条、关闭；删 `kv.oki.*`；`read_write = 0` 打开�
 
 `bitcask_kv.h:985` 改成「merge-only 打开（不建读视图）⇒ NO_INDEX；只读打开会从数据建内存读视图（不写盘）」，
 `cask_range_iter.cpp:56` 的报文去掉 read-only。Keelson 这边 clj-bitcask 的 docstring 已按实际行为改了。
+
+## 回没回
+
+**已改（未发版，S54）。** 行为本来就是对的，改的是说明。核对过：只读打开时 recovery 走 `rebuild_memory_from_data`
+（内存读视图、不写盘），失败才置 `oki_rebuild_failed_` ⇒ `INDEX_REBUILD_FAILED`；`NO_INDEX` 只出在 merge-only 句柄。
+
+改动面：`bitcask_kv.h`（range 注释与 `INDEX_REBUILD_FAILED` 枚举注释）、`cask.hpp`（`kNoIndex` / `kIndexRebuildFailed`
+两处注释）、`cask_range_iter.cpp` 报文（原文把 read-only 写进了 NO_INDEX 的成因，现为
+`oki unavailable on this handle (merge-only open builds no read view; open read-only or read-write to iterate)`）、
+`doc/api-c.md`、`doc/api-cpp.md`。回归 `OkiRangeTest.ReadOnlyWithoutOkiIteratesMergeOnlyHasNoIndex`：删掉 OKI 后
+只读遍历与影子一致、不写回 OKI 文件；merge-only ⇒ `kNoIndex`。
+

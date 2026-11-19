@@ -258,6 +258,13 @@ public:
                                 search::SearchError>
     search_text_highlight(std::string_view query, std::size_t k,
                           const search::HighlightOptions& opts = {}) const;
+    // S53：对一段给定的原文按本库分析器切高亮片段——与 `search_text_highlight` 在原文 LRU
+    // 命中时**同一条路**（NFKC 归一化 + analyze_with_offsets + highlight），供宿主给冷文档
+    // （LRU 未命中，从存储读回正文）补片段（Cask::search_text_highlight 的 ColdText::kLoad）。
+    // 查询分不出词 / 原文里没有查询词 ⇒ 空。线程安全：是（const，只读 analyzer_）。
+    [[nodiscard]] std::vector<search::Snippet>
+    highlight_snippets(std::string_view query, std::string_view text,
+                       const search::HighlightOptions& opts = {}) const;
 
     // ---- 维护 ----
     // 死点压实（S10.11）。caller 负责 legacy rebase 标志。
@@ -330,6 +337,11 @@ public:
     void set_chain_state(const ChainState& st) { chain_ = st; }
 
 private:
+    // S53：已分好词的查询 + 原文 ⇒ 片段（search_text_highlight 与 highlight_snippets 共用）。
+    [[nodiscard]] std::vector<search::Snippet>
+    snippets_for(const TermFreqMap& query_terms, std::string_view text,
+                 const search::HighlightOptions& opts) const;
+
     // 高亮原文 LRU（S9.3）：ord → 原文，带容量上限。只服务高亮路径；冷文档
     // 挤出后高亮降级为无片段。C1：内置 mutex（写线程 put 与查询线程 get
     // 并发）；get 返回拷贝而非内部指针，避免锁外被并发淘汰释放（UAF）。

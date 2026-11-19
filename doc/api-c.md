@@ -6,7 +6,7 @@ C API 是 C++ `bitcask::Cask` 的薄 `extern "C"` 包装，编译产物：
 
 | 产物 | 说明 |
 |------|------|
-| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=9`，`VERSION=9.0.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 9.0.0)` 单一真源派生）|
+| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=9`，`VERSION=9.1.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 9.1.0)` 单一真源派生）|
 | `libbitcask.a` | 合并全部静态归档的单一 `.a`（定义 `BITCASK_STATIC_LIB` 去掉导出修饰）|
 
 符号导出由 `BITCASK_API` 宏控制（`bitcask_kv.h` §符号导出宏），Windows 下退化为 `__declspec(dllimport/dllexport)`，其它平台默认 `__attribute__((visibility("default")))`。
@@ -130,7 +130,7 @@ cl /DBITCASK_STATIC_LIB app.c /I<c_api 头目录> bitcask_static.lib   :: 静态
 
 ## 3. 版本信息
 
-版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 9.0.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
+版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 9.1.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
 
 ```c
 BITCASK_API int          bitcask_version_major(void);
@@ -140,7 +140,7 @@ BITCASK_API const char*  bitcask_version_string(void);   // "major.minor.patch"�
 ```
 
 - `bitcask_version_string()` 返回的是库内静态字符串（指向 `BITCASK_VERSION_STRING` 宏展开的字符串字面量），**不需要 free**。
-- 运行时返回值与 `libbitcask.so.9.0.0` 文件名完全对应；SOVERSION 是 `9`（大版本号），反映 ABI 兼容性。
+- 运行时返回值与 `libbitcask.so.9.1.0` 文件名完全对应；SOVERSION 是 `9`（大版本号），反映 ABI 兼容性。
 - 7.0.0 的 major bump 由 **C++ 公共头 ABI 变化**驱动（`StatusInfo` / `OkiState` /
   `OkiMergeCursor` 布局变化）。C API 函数签名与既有 C POD 布局保持零增删改；
   跨语言绑定仍需针对 `.so.7` 重新链接加载。
@@ -491,7 +491,9 @@ typedef struct {
 （C++ 侧 `SearchLayerConfig::doc_text_cache_max`，默认 1024 条，C 侧暂不可配）。
 **LRU 未命中的冷文档降级为 `highlights_count == 0` 的 hit，而不是整条丢弃**——
 结果集不会因缓存容量而缩水，但也不保证每条命中都有片段。`highlights_count == 0`
-时 `highlights` 为 `NULL`。
+时 `highlights` 为 `NULL`。LRU **只在写入 / 建索引时**填（读文档不填）⇒ 新开进程 / 只读快照里
+每条命中都是冷的；要片段用 `bitcask_search_text_highlight_ex` 带 `BITCASK_HIGHLIGHT_LOAD_COLD`
+（S53，[§13.13b](#1313b-bitcask_search_text_highlight_ex冷文档也给片段s53)）。
 
 **配置的 0/NULL 即默认**：`bitcask_highlight_options_t` 各字段留 0/NULL 就取 C++ 侧
 默认值，所以 `memset(&opts, 0, sizeof opts)` 后只填想改的那项即可；`opts` 整个传
@@ -1339,7 +1341,7 @@ BITCASK_API void bitcask_range_entry_free(bitcask_range_entry_t* entry);
 - **一致性：per-key 弱一致**（与 `bitcask_parallel_scan` 同档）——迭代期间的并发写可能部分可见，**不是** `bitcask_iter_*` 的快照语义。
 - `opts == NULL` 等价「全域 + 无预取」；`opts` 指向的切片仅在 `bitcask_range_iter_start` 调用期间被引用（内部已拷贝边界），返回后调用方可释放。
 - `prefetch > 1`：一次归并出 `prefetch` 个 key 后并发取值。**只改变取值时机，输出序与内容不变**。收益形态是「大窗口 + 值不在页缓存」；小窗口/值已缓存时线程成本可能反超（实测数字见 `api-cpp.md` §6 的 `prefetch` 条）。
-- 错误：`BITCASK_ERR_NO_INDEX` = 只读/merge-only 打开且目录未建过 OKI（本句柄本就不建；读写方式打开会自动重建）；`BITCASK_ERR_INDEX_REBUILD_FAILED` = 读写打开时 OKI 重建失败（IO/环境问题，见日志；修复后重开可重试）；`BITCASK_ERR_BAD_CRC` = run 损坏；其余同 `bitcask_get`。
+- 错误：`BITCASK_ERR_NO_INDEX` = merge-only 打开（本句柄不建读视图）——只读打开不会返回它：目录没有 OKI 时 open 期从 data 建一份内存读视图（不写盘），照常迭代；`BITCASK_ERR_INDEX_REBUILD_FAILED` = OKI 试建而败：读写打开时重建失败，或只读打开时建内存读视图失败（IO/环境问题，见日志；修复后重开可重试）；`BITCASK_ERR_BAD_CRC` = run 损坏；其余同 `bitcask_get`。
 - `next` 返回值 / `next_batch` 的错误路径所有权规则与 `bitcask_iter_next` / `_next_batch` **完全一致**（错误时实现已释放中途填充的条目）。
 - 生命周期：迭代器须在 `bitcask_close` 之前 release。
 
@@ -1736,6 +1738,32 @@ if (bitcask_search_text_highlight(cask, "alpha", 10, NULL, &r, &fault) == BITCAS
     bitcask_search_result_ex_free(r);
 }
 ```
+
+### 13.13b `bitcask_search_text_highlight_ex`（冷文档也给片段，S53）
+
+```c
+#define BITCASK_HIGHLIGHT_LOAD_COLD 0x1u
+
+BITCASK_API bitcask_error_t bitcask_search_text_highlight_ex(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_highlight_options_t* opts, uint32_t flags,
+    bitcask_search_result_ex_t** out, bitcask_fault_t* fault);
+```
+
+`flags = 0` 与 `bitcask_search_text_highlight` 同义。`BITCASK_HIGHLIGHT_LOAD_COLD`：片段为空的命中
+（原文 LRU 未命中）从存储读回正文——与 `bitcask_get_doc` 同一条读路径——再按本库分析器切片段，
+与 LRU 命中时**同一条路**（NFKC 归一化、同一分词、同一 `opts`），片段逐字相同。
+
+- 取哪段文字与原文 LRU 同口径：正文非空取正文；正文为空取第一个命名字段；纯 KV 写入的正文即 value。
+- 只认命中的那一版：读回的版本（ord）≠ 命中的版本（文档已被覆盖 / 删除）⇒ 该条不补。
+- 读回的原文**不**回填 LRU（批量看冷文档不把热条目挤出去）。
+- 代价：每条冷命中一次点查 + 一次分析。热命中不受影响。
+- 其余位保留，给了 ⇒ `BITCASK_ERR_INVALID_OPTION`（不静默忽略将来才有含义的位）。
+- 结果类型与所有权同 `bitcask_search_text_highlight`。
+
+> 什么时候是「冷」：本进程没写过这篇。新开进程 / 只读快照里，已经封进段的文档全是冷的；
+> 重启后、或文档数超过 LRU 容量（缺省 1024）时也会冷。小库重开时会从数据重放（重放顺带填 LRU），
+> 所以小库上往往看不出冷——别据此判断大库的行为。
 
 ---
 
