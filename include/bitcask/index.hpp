@@ -215,6 +215,10 @@ public:
     // 语义：死 ord / 无 meta（空 blob）恒 false。
     [[nodiscard]] bool eval_meta(DocId docid,
                                  const meta::MetaFilter& filter) const override;
+    // S51-8：批量版，一次 shared_lock 判整批（语义逐项同 eval_meta）。
+    void fill_eval_meta(std::span<const std::uint64_t> ords,
+                        const meta::MetaFilter& filter,
+                        std::span<char> out) const override;
 
     // P2.1 批量版本：一次 shared_lock 完成整个数组。S42：平坦数组退役后
     // 退化为逐 candidate hash lookup（放弃全局 SIMD gather；BM25 主查询

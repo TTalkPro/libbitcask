@@ -635,60 +635,75 @@ std::vector<DiskannSegment::Hit> DiskannSegment::search(
         stamp_gen = 1;
     }
 
-    // 候选池：(est 降序, id, expanded)。l 有限，插入排序维护。
-    struct Ent {
-        float est;
-        std::uint32_t id;
-        bool expanded;
+    // S51：beam search 改「前沿 + 结果」双堆，过滤在**展开时**求值。
+    //   frontier：已见未展开的候选（est 大顶），不分死活——被过滤拒掉的节点
+    //             照常展开当路标。
+    //   best    ：已展开且**通过过滤**的前 l 个（est 小顶），堆顶即收敛界。
+    // 候选 est 不优于界（且 best 已满 l）就不入前沿；前沿最优者不优于界即
+    // 收敛。即「凑满 l 个通过过滤的候选才停」，与 HNSW 一路同语义。
+    // ord 在盘上块里，所以过滤只能在展开（本就要读块）时做，不能在入前沿时
+    // 做（那会让每个候选都触盘）。
+    // 无过滤 / 全部通过时与旧版「池宽 l、按 est 排序、展开最优未访」展开
+    // 序列相同：旧版收敛 ⇔ 已见前 l 名全部展开 ⇔ 前沿最优者不优于第 l 名
+    // 已展开者。旧版把「未展开」也算进池宽，被拒节点会把活节点挤出池且
+    // 不可挽回——通过率 1/8、l=64 时只剩 ~8 条结果。
+    const bool filtered = live != nullptr && static_cast<bool>(*live);
+    // 预算：带过滤时的 est 计算上限（通过率极低时不把全图扫一遍），与
+    // HnswIndex::kFilterBudgetMul 同值。
+    constexpr std::size_t kFilterBudgetMul = 256;
+    const std::size_t budget =
+        filtered ? static_cast<std::size_t>(l) * kFilterBudgetMul
+                 : ~std::size_t{0};
+    std::size_t evals = 0;
+
+    using Cand = std::pair<float, std::uint32_t>;  // (est, id)
+    std::vector<Cand> frontier;                    // 大顶
+    frontier.reserve(static_cast<std::size_t>(l) * 4);
+    std::vector<std::pair<float, std::uint64_t>> best;  // (score, ord) 小顶
+    best.reserve(static_cast<std::size_t>(l) + 1);
+    const auto fcmp = [](const Cand& a, const Cand& b) {
+        return a.first < b.first;
     };
-    std::vector<Ent> pool;
-    pool.reserve(l + 1);
-    auto push_pool = [&](std::uint32_t id) {
+    const auto bcmp = [](const auto& a, const auto& b) {
+        return a.first > b.first;
+    };
+    const auto converged = [&](float est) {
+        return best.size() >= l && est <= best.front().first;
+    };
+    auto push_frontier = [&](std::uint32_t id) {
         if (stamp[id] == stamp_gen) return;
         stamp[id] = stamp_gen;
         const float est = nav_est(id);
-        if (pool.size() >= l && est <= pool.back().est) return;
-        const Ent e{est, id, false};
-        const auto it = std::lower_bound(
-            pool.begin(), pool.end(), e,
-            [](const Ent& a, const Ent& b) { return a.est > b.est; });
-        pool.insert(it, e);
-        if (pool.size() > l) pool.pop_back();
+        ++evals;
+        if (converged(est)) return;
+        frontier.push_back({est, id});
+        std::push_heap(frontier.begin(), frontier.end(), fcmp);
     };
     {
         thread_local std::vector<std::uint32_t> entries;
         seed_entries(count_, medoid_, entries);
-        for (const std::uint32_t e0 : entries) push_pool(e0);
+        for (const std::uint32_t e0 : entries) push_frontier(e0);
     }
 
-    // 结果堆：(score, ord) 小顶 top-k（精评分数；live 结果侧过滤）。
-    std::vector<std::pair<float, std::uint64_t>> heap;
-    heap.reserve(k + 1);
-    auto hcmp = [](const auto& a, const auto& b) { return a.first > b.first; };
-
-    for (;;) {
-        Ent* best = nullptr;
-        for (auto& e : pool) {
-            if (!e.expanded) { best = &e; break; }
-        }
-        if (best == nullptr) break;
-        best->expanded = true;
+    while (!frontier.empty()) {
+        const auto [score, cur_id] = frontier.front();
+        if (converged(score)) break;
+        if (evals >= budget) break;  // 预算耗尽，返回已找到的
+        std::pop_heap(frontier.begin(), frontier.end(), fcmp);
+        frontier.pop_back();
         const std::uint8_t* blk =
             base_ + blocks_off_ +
-            static_cast<std::uint64_t>(best->id) * bstride;
-        // v1:est 即精评（同 int8 域,入池时已算）——块读只为邻接/ord。
+            static_cast<std::uint64_t>(cur_id) * bstride;
+        // v1:est 即精评（同 int8 域,入前沿时已算）——块读只为邻接/ord。
         // M5.5(PQ nav)后此处恢复块内 int8 精评。
-        const float score = best->est;
-        if (heap.size() < k || score > heap.front().first) {
-            std::uint64_t ord;
-            std::memcpy(&ord, blk, 8);
-            if (live == nullptr || !*live || (*live)(ord)) {
-                heap.push_back({score, ord});
-                std::push_heap(heap.begin(), heap.end(), hcmp);
-                if (heap.size() > k) {
-                    std::pop_heap(heap.begin(), heap.end(), hcmp);
-                    heap.pop_back();
-                }
+        std::uint64_t ord;
+        std::memcpy(&ord, blk, 8);
+        if (!filtered || (*live)(ord)) {
+            best.push_back({score, ord});
+            std::push_heap(best.begin(), best.end(), bcmp);
+            if (best.size() > l) {
+                std::pop_heap(best.begin(), best.end(), bcmp);
+                best.pop_back();
             }
         }
         // 扩展邻接。use-site 越界防御（审计修复 2026-07-13）：邻接 id/ncnt
@@ -704,12 +719,13 @@ std::vector<DiskannSegment::Hit> DiskannSegment::search(
             std::uint32_t id = 0;
             std::memcpy(&id, nb + 4 * j, 4);
             if (id >= count_) continue;
-            push_pool(id);
+            push_frontier(id);
         }
     }
-    std::sort_heap(heap.begin(), heap.end(), hcmp);  // 分数降序
-    out.reserve(heap.size());
-    for (const auto& [s, o] : heap) out.push_back({o, s});
+    std::sort_heap(best.begin(), best.end(), bcmp);  // 分数降序
+    if (best.size() > k) best.resize(k);
+    out.reserve(best.size());
+    for (const auto& [s, o] : best) out.push_back({o, s});
     return out;
 }
 

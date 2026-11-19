@@ -560,9 +560,32 @@ HnswIndex::clone_live(const std::function<bool(std::uint64_t)>& is_live,
         }
     }
 
-    // pass 2：邻接重映射 + 死邻过滤（一跳路径收缩补边）。
+    // S50：死比 ≥ 50% → 全量重连。结构化拷贝在高死比下出度塌缩、0 层
+    // 断裂（反馈 2026-11-19），而此时活节点是少数，重连代价最低、图质量
+    // 与从零建图一致。邻接块 pass 1 已零初始化，按 id 序（= 原插入序）走
+    // 标准连边路径；层数沿用旧图，不重抽。
+    if (n - nn >= nn) {
+        fresh->count_.store(nn, std::memory_order_release);
+        fresh->entry_meta_.store(
+            (static_cast<std::uint64_t>(fresh->chunk_of(0)->levels[0]) + 1)
+                << 32,
+            std::memory_order_release);
+        for (std::uint32_t id = 1; id < nn; ++id) fresh->link_node(id, false);
+        (void)fresh->repair_l0_connectivity();
+        return fresh;
+    }
+
+    // pass 2：邻接重映射 + 全面路径收缩（S50）。
+    // 无死邻的 (节点, 层) 原样重映射，零距离计算。有死邻的：候选 = 活邻 ∪
+    // 穿过死节点链可达的活节点（BFS，限展开数与候选数），候选超过目标度时
+    // 按建图同款启发式选边——死节点原本承担的「路标」连通性由它的活邻居
+    // 接手（同 FreshDiskANN 删除合并的思路，这里允许穿多跳死链）。
     // 本线程是唯一写者：旧图 adj 无并发写，普通读安全（并发读者只读不冲突）。
-    std::vector<std::uint32_t> merged;
+    constexpr std::size_t kMaxDeadExpand = 64;  // 每 (节点,层) 至多展开的死节点数
+    const bool i8 = cfg_.inmem_int8;
+    std::vector<std::uint32_t> cand;   // 候选（新 id）
+    std::vector<std::uint32_t> deadq;  // 待展开的死节点（旧 id，兼作已见集）
+    std::vector<std::pair<float, std::uint32_t>> pool;
     for (std::uint32_t old_id = 0; old_id < n; ++old_id) {
         const std::uint32_t new_id = remap[old_id];
         if (new_id == kDead) continue;
@@ -576,42 +599,71 @@ HnswIndex::clone_live(const std::function<bool(std::uint64_t)>& is_live,
             const std::uint32_t* src = oc->adj[oslot] + layer_off(l);
             std::uint32_t* dst = c->adj[slot] + fresh->layer_off(l);
             const std::uint32_t cap = fresh->layer_cap(l);
-            merged.clear();
-            const std::uint32_t cnt = src[0];
-            for (std::uint32_t i = 1; i <= cnt && merged.size() < cap; ++i) {
+            const std::uint32_t cnt = std::min(src[0], cap);
+            cand.clear();
+            deadq.clear();
+            const auto add_live = [&](std::uint32_t r) {
+                if (r != new_id &&
+                    std::find(cand.begin(), cand.end(), r) == cand.end()) {
+                    cand.push_back(r);
+                }
+            };
+            for (std::uint32_t i = 1; i <= cnt; ++i) {
                 const std::uint32_t nb = src[i];
                 if (nb >= n) continue;  // 超出快照边界（并发插入的新节点）
-                const std::uint32_t r = remap[nb];
-                if (r != kDead && r != new_id) merged.push_back(r);
+                if (remap[nb] != kDead) {
+                    add_live(remap[nb]);
+                } else if (std::find(deadq.begin(), deadq.end(), nb) ==
+                           deadq.end()) {
+                    deadq.push_back(nb);
+                }
             }
-            if (merged.empty() && cnt > 0) {
-                // 一跳路径收缩：全部直接邻居已死——借道死邻的活邻居补边，
-                // 保持该层连通性（否则本节点该层出边为空，可达性劣化）。
-                for (std::uint32_t i = 1;
-                     i <= cnt && merged.size() < cap; ++i) {
-                    const std::uint32_t dead_nb = src[i];
-                    if (dead_nb >= n || remap[dead_nb] != kDead) continue;
-                    const NodeChunk* dc = chunk_of(dead_nb);
-                    const std::uint32_t dslot = dead_nb & kChunkMask;
+            if (!deadq.empty()) {
+                // 目标度：不低于原度数与 M（把丢掉的边补回来），不超 cap。
+                const std::uint32_t target =
+                    std::min(cap, std::max(cnt, cfg_.M));
+                const std::size_t want = static_cast<std::size_t>(cap) * 2;
+                for (std::size_t qi = 0;
+                     qi < deadq.size() && qi < kMaxDeadExpand &&
+                     cand.size() < want;
+                     ++qi) {
+                    const std::uint32_t d = deadq[qi];
+                    const NodeChunk* dc = chunk_of(d);
+                    const std::uint32_t dslot = d & kChunkMask;
                     if (dc->levels[dslot] < l) continue;  // 防御（不应发生）
                     const std::uint32_t* dsrc = dc->adj[dslot] + layer_off(l);
-                    const std::uint32_t dcnt = dsrc[0];
-                    for (std::uint32_t j = 1;
-                         j <= dcnt && merged.size() < cap; ++j) {
+                    const std::uint32_t dcnt = std::min(dsrc[0], cap);
+                    for (std::uint32_t j = 1; j <= dcnt; ++j) {
                         const std::uint32_t nb2 = dsrc[j];
                         if (nb2 >= n) continue;
-                        const std::uint32_t r2 = remap[nb2];
-                        if (r2 == kDead || r2 == new_id) continue;
-                        if (std::find(merged.begin(), merged.end(), r2) ==
-                            merged.end()) {
-                            merged.push_back(r2);
+                        if (remap[nb2] != kDead) {
+                            add_live(remap[nb2]);
+                        } else if (std::find(deadq.begin(), deadq.end(),
+                                             nb2) == deadq.end()) {
+                            deadq.push_back(nb2);
                         }
                     }
                 }
+                if (cand.size() > target) {
+                    // fresh 的节点数据 pass 1 已就位（堆或外溢 mmap）。
+                    pool.clear();
+                    const float* v = i8 ? nullptr : fresh->vec_of(new_id);
+                    for (const std::uint32_t r : cand) {
+                        pool.push_back(
+                            {i8 ? fresh->dist_id_int8_node(new_id, r)
+                                : fresh->dist_id(v, r),
+                             r});
+                    }
+                    std::sort(pool.begin(), pool.end());
+                    if (i8) fresh->select_neighbors_int8(pool, target);
+                    else    fresh->select_neighbors(v, pool, target);
+                    cand.clear();
+                    for (const auto& pr : pool) cand.push_back(pr.second);
+                }
             }
-            dst[0] = static_cast<std::uint32_t>(merged.size());
-            for (std::size_t i = 0; i < merged.size(); ++i) {
-                dst[1 + i] = merged[i];
+            dst[0] = static_cast<std::uint32_t>(cand.size());
+            for (std::size_t i = 0; i < cand.size(); ++i) {
+                dst[1 + i] = cand[i];
             }
         }
     }
@@ -621,7 +673,83 @@ HnswIndex::clone_live(const std::function<bool(std::uint64_t)>& is_live,
         (static_cast<std::uint64_t>(best_level + 1) << 32) | best_new_id,
         std::memory_order_release);
     fresh->count_.store(nn, std::memory_order_release);
+    // S50：收尾兜底——收缩后 0 层仍不强连通的节点走标准连边路径补连。
+    (void)fresh->repair_l0_connectivity();
     return fresh;
+}
+
+// S50：0 层连通性检查 + 修复（契约见头文件）。
+std::size_t HnswIndex::repair_l0_connectivity() {
+    const std::uint32_t n = count_.load(std::memory_order_relaxed);
+    const std::uint64_t em = entry_meta_.load(std::memory_order_relaxed);
+    if (n < 2 || em == 0) return 0;
+    const auto entry = static_cast<std::uint32_t>(em & 0xFFFFFFFFu);
+    const auto adj0 = [this](std::uint32_t u) -> const std::uint32_t* {
+        return chunk_of(u)->adj[u & kChunkMask];  // layer_off(0) == 0
+    };
+
+    std::vector<char> fwd;  // fwd[u]：入口沿 0 层出边可达 u
+    std::vector<char> bwd;  // bwd[u]：u 沿 0 层出边可达入口
+    std::vector<std::uint32_t> stack, rev_off, rev, pos;
+    const auto scan = [&] {
+        fwd.assign(n, 0);
+        stack.assign(1, entry);
+        fwd[entry] = 1;
+        while (!stack.empty()) {
+            const std::uint32_t u = stack.back();
+            stack.pop_back();
+            const std::uint32_t* a = adj0(u);
+            for (std::uint32_t i = 1; i <= a[0]; ++i) {
+                const std::uint32_t v = a[i];
+                if (v < n && !fwd[v]) { fwd[v] = 1; stack.push_back(v); }
+            }
+        }
+        // 反向图（CSR）上从入口 BFS = 「谁能到入口」。
+        rev_off.assign(static_cast<std::size_t>(n) + 1, 0);
+        for (std::uint32_t u = 0; u < n; ++u) {
+            const std::uint32_t* a = adj0(u);
+            for (std::uint32_t i = 1; i <= a[0]; ++i) {
+                if (a[i] < n) ++rev_off[a[i] + 1];
+            }
+        }
+        for (std::uint32_t i = 0; i < n; ++i) rev_off[i + 1] += rev_off[i];
+        rev.resize(rev_off[n]);
+        pos.assign(rev_off.begin(), rev_off.end() - 1);
+        for (std::uint32_t u = 0; u < n; ++u) {
+            const std::uint32_t* a = adj0(u);
+            for (std::uint32_t i = 1; i <= a[0]; ++i) {
+                if (a[i] < n) rev[pos[a[i]]++] = u;
+            }
+        }
+        bwd.assign(n, 0);
+        stack.assign(1, entry);
+        bwd[entry] = 1;
+        while (!stack.empty()) {
+            const std::uint32_t u = stack.back();
+            stack.pop_back();
+            for (std::uint32_t k = rev_off[u]; k < rev_off[u + 1]; ++k) {
+                const std::uint32_t v = rev[k];
+                if (!bwd[v]) { bwd[v] = 1; stack.push_back(v); }
+            }
+        }
+    };
+
+    // 补连会改图（新增双向边、收缩邻居），故每轮重扫；实测一轮即收敛，
+    // 轮数上限只为有界（尽力修复，极端残留由下一次 merge 再修）。
+    constexpr int kMaxRounds = 4;
+    std::size_t total = 0;
+    for (int round = 0; round < kMaxRounds; ++round) {
+        scan();
+        std::size_t fixed = 0;
+        for (std::uint32_t u = 0; u < n; ++u) {
+            if (u == entry || (fwd[u] && bwd[u])) continue;
+            link_node(u, true);
+            ++fixed;
+        }
+        if (fixed == 0) break;
+        total += fixed;
+    }
+    return total;
 }
 
 std::uint32_t HnswIndex::copy_neighbors(std::uint32_t id, std::uint32_t layer,
@@ -712,7 +840,7 @@ template <class Dist, class Prefetch>
 void HnswIndex::search_layer_impl(
     std::uint32_t entry, std::size_t ef, std::uint32_t layer, std::uint32_t n,
     std::uint32_t* scratch, std::vector<std::pair<float, std::uint32_t>>& out,
-    Dist&& dist, Prefetch&& prefetch) const {
+    Dist&& dist, Prefetch&& prefetch, const BatchFilter* filter) const {
     out.reserve(ef);  // D1:保容量 ≥ ef，后续 clear+resize 不 realloc。
     // visited:thread_local 版本化数组(方案见文件顶部注释)。
     auto& vt = t_visited;
@@ -736,31 +864,96 @@ void HnswIndex::search_layer_impl(
     ReusablePQ<std::greater<>> cands(std::greater<>{}, std::move(tl_cands_buf));
     ReusablePQ<std::less<Cand>> top(std::less<Cand>{}, std::move(tl_top_buf));
 
-    const float d0 = dist(entry);
-    cands.push({d0, entry});
-    top.push({d0, entry});
-    visited[entry] = ep;
+    // S51 遍历期过滤:cands(导航前沿)收所有节点,top(结果)只收通过过滤
+    // 的;收敛条件看 top——被拒节点只当路标。filtered=false(建图 / 无过滤
+    // 查询)走下面的原循环,行为与旧版逐步一致。
+    const bool filtered = filter != nullptr && static_cast<bool>(*filter);
+    if (filtered) {
+        // 过滤求值按「每展开一个节点一批」攒着调(逐个调在 Index::is_live
+        // 上是每次一把 shared_lock,并发查询互相拖慢)。一批之内 top 的界
+        // 暂不收紧,代价只是多几次 cands 入堆;落 top 时按最新的界复核。
+        thread_local std::vector<Cand> pend;
+        thread_local std::vector<std::uint64_t> pend_ords;
+        thread_local std::vector<char> pend_ok;
+        const auto flush = [&] {
+            if (pend.empty()) return;
+            pend_ords.clear();
+            for (const auto& pc : pend) pend_ords.push_back(ord_of(pc.second));
+            pend_ok.assign(pend.size(), 0);
+            (*filter)(std::span<const std::uint64_t>(pend_ords),
+                      std::span<char>(pend_ok));
+            for (std::size_t i = 0; i < pend.size(); ++i) {
+                if (!pend_ok[i]) continue;
+                if (top.size() < ef || pend[i].first < top.top().first) {
+                    top.push(pend[i]);
+                    if (top.size() > ef) top.pop();
+                }
+            }
+            pend.clear();
+        };
+        // 预算:距离计算上限(通过率极低时不把全图扫一遍)。
+        const std::size_t budget = ef * kFilterBudgetMul;
+        std::size_t evals = 1;
 
-    while (!cands.empty()) {
-        const auto [d, id] = cands.top();
-        if (d > top.top().first && top.size() >= ef) break;  // 收敛
-        cands.pop();
-        const std::uint32_t cnt = copy_neighbors(id, layer, scratch);
-        // 预取与计算分两遍:未访问的在界邻居先把向量段拉过来。
-        for (std::uint32_t i = 0; i < cnt; ++i) {
-            const std::uint32_t nid = scratch[i];
-            if (nid < n && visited[nid] != ep) prefetch(nid);
+        pend.clear();
+        const float d0 = dist(entry);
+        cands.push({d0, entry});
+        pend.push_back({d0, entry});
+        flush();
+        visited[entry] = ep;
+
+        while (!cands.empty()) {
+            const auto [d, id] = cands.top();
+            if (top.size() >= ef && d > top.top().first) break;  // 收敛
+            if (evals >= budget) break;                           // 预算耗尽
+            cands.pop();
+            const std::uint32_t cnt = copy_neighbors(id, layer, scratch);
+            for (std::uint32_t i = 0; i < cnt; ++i) {
+                const std::uint32_t nid = scratch[i];
+                if (nid < n && visited[nid] != ep) prefetch(nid);
+            }
+            for (std::uint32_t i = 0; i < cnt; ++i) {
+                const std::uint32_t nid = scratch[i];
+                if (nid >= n) continue;
+                if (visited[nid] == ep) continue;
+                visited[nid] = ep;
+                const float nd = dist(nid);
+                ++evals;
+                // 只有「够格进结果」的节点才求过滤(约 3·ef/通过率 个)。
+                if (top.size() < ef || nd < top.top().first) {
+                    cands.push({nd, nid});
+                    pend.push_back({nd, nid});
+                }
+            }
+            flush();
         }
-        for (std::uint32_t i = 0; i < cnt; ++i) {
-            const std::uint32_t nid = scratch[i];
-            if (nid >= n) continue;  // 本地 count 快照之外(见 hpp 协议)
-            if (visited[nid] == ep) continue;
-            visited[nid] = ep;
-            const float nd = dist(nid);
-            if (top.size() < ef || nd < top.top().first) {
-                cands.push({nd, nid});
-                top.push({nd, nid});
-                if (top.size() > ef) top.pop();
+    } else {
+        const float d0 = dist(entry);
+        cands.push({d0, entry});
+        top.push({d0, entry});
+        visited[entry] = ep;
+
+        while (!cands.empty()) {
+            const auto [d, id] = cands.top();
+            if (d > top.top().first && top.size() >= ef) break;  // 收敛
+            cands.pop();
+            const std::uint32_t cnt = copy_neighbors(id, layer, scratch);
+            // 预取与计算分两遍:未访问的在界邻居先把向量段拉过来。
+            for (std::uint32_t i = 0; i < cnt; ++i) {
+                const std::uint32_t nid = scratch[i];
+                if (nid < n && visited[nid] != ep) prefetch(nid);
+            }
+            for (std::uint32_t i = 0; i < cnt; ++i) {
+                const std::uint32_t nid = scratch[i];
+                if (nid >= n) continue;  // 本地 count 快照之外(见 hpp 协议)
+                if (visited[nid] == ep) continue;
+                visited[nid] = ep;
+                const float nd = dist(nid);
+                if (top.size() < ef || nd < top.top().first) {
+                    cands.push({nd, nid});
+                    top.push({nd, nid});
+                    if (top.size() > ef) top.pop();
+                }
             }
         }
     }
@@ -778,11 +971,12 @@ void HnswIndex::search_layer_impl(
 void HnswIndex::search_layer(
     const float* q, std::uint32_t entry, std::size_t ef, std::uint32_t layer,
     std::uint32_t n, std::uint32_t* scratch,
-    std::vector<std::pair<float, std::uint32_t>>& out) const {
+    std::vector<std::pair<float, std::uint32_t>>& out,
+    const BatchFilter* filter) const {
     search_layer_impl(
         entry, ef, layer, n, scratch, out,
         [&](std::uint32_t id) { return dist_id(q, id); },
-        [&](std::uint32_t id) { prefetch_vec(vec_of(id), cfg_.dim); });
+        [&](std::uint32_t id) { prefetch_vec(vec_of(id), cfg_.dim); }, filter);
 }
 
 // V4.2:int8 粗筛版 greedy_closest(D7 起与 f32 版共用 greedy_closest_impl)。
@@ -805,13 +999,15 @@ void HnswIndex::search_layer_int8(
     const std::int8_t* query_codes, float query_scale, std::int32_t query_sum,
     std::uint32_t entry, std::size_t ef, std::uint32_t layer, std::uint32_t n,
     std::uint32_t* scratch,
-    std::vector<std::pair<float, std::uint32_t>>& out) const {
+    std::vector<std::pair<float, std::uint32_t>>& out,
+    const BatchFilter* filter) const {
     search_layer_impl(
         entry, ef, layer, n, scratch, out,
         [&](std::uint32_t id) {
             return dist_id_int8(query_codes, query_scale, query_sum, id);
         },
-        [&](std::uint32_t id) { prefetch_qcodes(qcodes_of(id), cfg_.dim); });
+        [&](std::uint32_t id) { prefetch_qcodes(qcodes_of(id), cfg_.dim); },
+        filter);
 }
 
 void HnswIndex::select_neighbors(
@@ -996,11 +1192,24 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
                           std::memory_order_release);
         return;
     }
+    link_node(id, false);
+}
+
+// S50：标准连边路径（契约见头文件）。insert 与 clone_live 修复共用。
+void HnswIndex::link_node(std::uint32_t id, bool repair) {
+    NodeChunk* c = chunk_of(id);
+    const std::uint32_t slot = id & kChunkMask;
+    const std::uint32_t level = c->levels[slot];
+    // entry_meta_ 仅写者改,relaxed 自读即可。
+    const std::uint64_t em = entry_meta_.load(std::memory_order_relaxed);
     const auto max_level = static_cast<std::int32_t>(em >> 32) - 1;
     auto cur = static_cast<std::uint32_t>(em & 0xFFFFFFFFu);
 
     // 写者侧搜索的可见边界 = id(自身排除:防低层把自己选成自己邻居)。
-    const std::uint32_t n_bound = id;
+    // S50 补连(repair):节点早已在图内,边界 = 全图,自身在候选里显式剔除。
+    if (repair && cur == id) return;  // 入口自身无需补连
+    const std::uint32_t n_bound =
+        repair ? count_.load(std::memory_order_relaxed) : id;
     // ⑦ thread_local 复用(insert 单写者，本线程独占）。
     thread_local std::vector<std::uint32_t> scratch;
     scratch.resize(1 + cfg_.M * 2);
@@ -1043,9 +1252,33 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
             search_layer(q, cur, cfg_.ef_construction, lay, n_bound,
                          scratch.data(), found);
         }
+        if (repair) {
+            std::erase_if(found, [id](const auto& p) { return p.second == id; });
+            if (found.empty()) continue;  // 本层只搜到自己:沿用上层入口
+        }
         cur = found.front().second;  // 下层入口 = 本层最近
 
         auto picked = found;
+        if (repair) {
+            // 并入现有出边(保留原图结构),距离口径与 found 一致(导航距离);
+            // 非 int8-only 的混合精度分支随后统一重算 f32 并重排。
+            const std::uint32_t* mine = c->adj[slot] + layer_off(lay);
+            const std::uint32_t mcnt = adj_load(mine);
+            for (std::uint32_t i = 1; i <= mcnt; ++i) {
+                const std::uint32_t nb0 = adj_load(mine + i);
+                if (nb0 == id || nb0 >= n_bound) continue;
+                if (std::find_if(picked.begin(), picked.end(),
+                                 [nb0](const auto& p) {
+                                     return p.second == nb0;
+                                 }) != picked.end()) {
+                    continue;
+                }
+                picked.push_back({nav_i8 ? dist_id_int8(qc, qs, qsum, nb0)
+                                         : dist_id(q, nb0),
+                                  nb0});
+            }
+            std::sort(picked.begin(), picked.end());
+        }
         if (i8) {
             select_neighbors_int8(picked, cfg_.M);
         } else {
@@ -1064,7 +1297,8 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
             auto& my_seq = c->locks[slot];
             seq_write_begin(my_seq);
             std::uint32_t* my = c->adj[slot] + layer_off(lay);
-            std::uint32_t cnt = adj_load(my);
+            // 补连:picked 已含保留下来的旧出边,整表重写。
+            std::uint32_t cnt = repair ? 0 : adj_load(my);
             for (const auto& [d, nid] : picked) {
                 adj_store(my + 1 + cnt, nid);
                 ++cnt;
@@ -1082,7 +1316,15 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
             std::uint32_t* nb = nc->adj[nslot] + layer_off(lay);
             const std::uint32_t cap = layer_cap(lay);
             const std::uint32_t ncnt = adj_load(nb);
-            if (ncnt < cap) {
+            bool linked = false;  // 补连:对方可能早已连着本节点
+            if (repair) {
+                for (std::uint32_t i = 1; i <= ncnt && !linked; ++i) {
+                    linked = adj_load(nb + i) == id;
+                }
+            }
+            if (linked) {
+                // 已有反向边,不动。
+            } else if (ncnt < cap) {
                 adj_store(nb + 1 + ncnt, id);
                 adj_store(nb, ncnt + 1);
             } else {
@@ -1129,6 +1371,21 @@ void HnswIndex::insert(std::uint64_t ord, std::span<const float> vec) {
 std::vector<HnswIndex::Hit> HnswIndex::search(
     std::span<const float> query, std::size_t k, std::size_t ef,
     const std::function<bool(std::uint64_t)>* live) const {
+    if (live == nullptr || !*live) return search_filtered(query, k, ef, {});
+    // 逐个回调适配成批(standalone / 测试用;插件层直接走批量接口)。
+    const BatchFilter each = [live](std::span<const std::uint64_t> ords,
+                                    std::span<char> out) {
+        for (std::size_t i = 0; i < ords.size(); ++i) {
+            out[i] = static_cast<char>((*live)(ords[i]));
+        }
+    };
+    return search_filtered(query, k, ef, each);
+}
+
+std::vector<HnswIndex::Hit> HnswIndex::search_filtered(
+    std::span<const float> query, std::size_t k, std::size_t ef,
+    const BatchFilter& filter_fn) const {
+    const BatchFilter* filter = filter_fn ? &filter_fn : nullptr;
     std::vector<Hit> hits;
     if (k == 0) return hits;
     assert(query.size() == cfg_.dim);
@@ -1169,8 +1426,11 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
                                       cur, static_cast<std::uint32_t>(l), n,
                                       scratch.data());
         }
+        // S51:过滤在 0 层遍历期完成——found 里全是通过过滤的节点,下面
+        // 截到 3k 精排不会再把活节点挤掉(旧版先截断后滤死,活比 < 1/3
+        // 时调大 ef 也回不满)。
         search_layer_int8(qq.codes.data(), qq.scale, qq.sum_codes,
-                          cur, ef, 0, n, scratch.data(), found);
+                          cur, ef, 0, n, scratch.data(), found, filter);
         // int8-only:无 f32 可精排,found 已按 int8 距离升序,直接取。
         // 默认 f32+int8:对 top k*3 做 f32 精排,召回对齐纯 f32。
         if (!cfg_.inmem_int8) {
@@ -1243,13 +1503,13 @@ std::vector<HnswIndex::Hit> HnswIndex::search(
             cur = greedy_closest(q, cur, static_cast<std::uint32_t>(l), n,
                                  scratch.data());
         }
-        search_layer(q, cur, ef, 0, n, scratch.data(), found);
+        search_layer(q, cur, ef, 0, n, scratch.data(), found, filter);
     }
 
-    hits.reserve(k);
+    // S51:found 已是遍历期过滤后的结果,这里不再滤(免二次求值)。
+    hits.reserve(std::min(k, found.size()));
     for (const auto& [d, id] : found) {
         const std::uint64_t ord = ord_of(id);
-        if (live != nullptr && *live && !(*live)(ord)) continue;  // 结果侧滤死
         // score 语义:kDot 返回内积本身(d = -dot);kL2 返回 -距离。
         hits.push_back({ord, -d});  // kDot:-(-dot)=内积;kL2:-平方距离
         if (hits.size() >= k) break;

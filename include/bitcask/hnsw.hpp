@@ -36,7 +36,8 @@
 //   - visited 标记:thread_local 版本化数组(实现注释见 .cpp)。
 //
 // === 删除 ===
-//   本模块不感知删除;上层经 live 过滤回调在结果侧滤死,死节点留作
+//   本模块不感知删除;上层经 live 过滤回调滤死(S51 起在 0 层遍历期求值,
+//   被拒节点不进结果集),死节点留作
 //   图内路标,merge 重建时物理清除。
 
 #pragma once
@@ -103,10 +104,28 @@ public:
         float score;   // kDot:内积(越大越近);kL2:-平方距离(同向比较)
     };
     // 查询 top-k。线程安全(多读者,可与单写者 insert 并发)。
-    // ef >= k(内部取 max);live 非空时结果侧过滤(死节点仍参与导航)。
+    // ef >= k(内部取 max)。
+    // S51:live 非空时做**遍历期过滤**——被拒节点照常参与导航(当路标),但
+    // 不进结果集,0 层搜索直到凑满 ef 个**通过过滤**的候选才收敛。于是死
+    // 文档占多数 / meta filter 选择性高时仍能回满 k(旧版结果侧过滤:先取
+    // ef 个候选再滤,活比一低就回不满;int8 粗筛路径还先截到 3k,调大 ef
+    // 也无效)。代价:耗时约 ∝ 1/通过率,过滤求值次数约 3·ef/通过率。
+    // 预算:带过滤时 0 层距离计算上限 ef × kFilterBudgetMul,耗尽即返回
+    // 已找到的(可能 < k)——通过率极低时宁可少返回,不把全图扫一遍。
+    static constexpr std::size_t kFilterBudgetMul = 256;
     [[nodiscard]] std::vector<Hit> search(
         std::span<const float> query, std::size_t k, std::size_t ef,
         const std::function<bool(std::uint64_t)>* live = nullptr) const;
+    // S51:批量过滤版。遍历期过滤每查询要求值几百到上千个 ord,逐个回调若
+    // 各拿一次锁(Index::is_live 即如此),并发查询会在锁上互相拖慢(实测
+    // 8 线程 QPS 掉一半以上)。本接口每展开一个节点把「够格进结果」的邻居
+    // 攒成一批调一次:filter(ords, out) 须把 out[i] 置为 ords[i] 是否通过
+    // (两 span 等长)。上面的逐个版内部也走这条路径(逐个回调适配成批)。
+    using BatchFilter = std::function<void(std::span<const std::uint64_t>,
+                                           std::span<char>)>;
+    [[nodiscard]] std::vector<Hit> search_filtered(
+        std::span<const float> query, std::size_t k, std::size_t ef,
+        const BatchFilter& filter) const;
 
     [[nodiscard]] std::size_t size() const noexcept {
         return count_.load(std::memory_order_acquire);
@@ -129,9 +148,16 @@ public:
     // S13-P8：结构化拷贝活子图（merge 期 rebuild 用）。替代「从零逐点重插」
     //（每点 ~ef_construction 次全维距离，100k 节点分钟级、阻塞 merge）：
     // 保留原图的层数与邻接结构，只做 id 重映射 + 死邻过滤——O(节点+边) 的
-    // memcpy 级拷贝，无距离计算。死邻过滤的召回补偿：某层邻居全死时做
-    // **一跳路径收缩**（借道死邻的活邻居补边，去重、限 cap）；极端删除
-    // 模式下个别节点仍可能孤立（无出边），由后续 merge 轮或重插自愈。
+    // memcpy 级拷贝。
+    // S50（反馈 2026-11-19）：只滤死邻会让出度随死比塌缩（死比 75% 时 0 层
+    // 平均出度 26 → 6）、极端时 0 层断裂，检索静默返回错结果。现按死比分
+    // 两路，返回的图**保证 0 层从入口强连通**（尽力修复，见 .cpp）：
+    //   - 死比 < 50%：结构化拷贝 + **全面路径收缩**——凡丢了邻居的节点，
+    //     候选 = 活邻 ∪ 穿过死节点链可达的活节点（限额），超额按建图同款
+    //     启发式选边。只对受影响节点算距离，无图搜索。
+    //   - 死比 ≥ 50%：**全量重连**——节点数据与层数原样保留，邻接清空后
+    //     按 id 序走标准插入连边路径。代价 ∝ 活节点数（此时活节点是少数）。
+    // 两路之后统一做 0 层连通性检查，不合格节点走标准连边路径补连。
     // int8-only 模式直接拷 qcodes/scale/sum——顺带消掉旧重插路径的
     // 反量化→再量化往返（audit P8 项）。
     // 线程模型：调用方须为单写者（reducer）；旧图并发读者不受影响（只读）。
@@ -395,17 +421,21 @@ private:
         std::uint32_t n, std::uint32_t* scratch) const;
 
     // 标准 search-layer:返回 ≤ef 个 (dist,id),按 dist 升序。
+    // S51:filter 非空 = 遍历期过滤(只有 0 层查询传;建图路径恒不传)。此时
+    // out 只含通过过滤的节点,可能为空。
     void search_layer(const float* q, std::uint32_t entry, std::size_t ef,
                       std::uint32_t layer, std::uint32_t n,
                       std::uint32_t* scratch,
-                      std::vector<std::pair<float, std::uint32_t>>& out) const;
+                      std::vector<std::pair<float, std::uint32_t>>& out,
+                      const BatchFilter* filter = nullptr) const;
 
     // V4.2:int8 粗筛版 search-layer,与 f32 版同结构,只换距离函数。
     void search_layer_int8(const std::int8_t* query_codes, float query_scale,
                            std::int32_t query_sum, std::uint32_t entry,
                            std::size_t ef, std::uint32_t layer, std::uint32_t n,
                            std::uint32_t* scratch,
-                           std::vector<std::pair<float, std::uint32_t>>& out) const;
+                           std::vector<std::pair<float, std::uint32_t>>& out,
+                           const BatchFilter* filter = nullptr) const;
 
     // D7:上面 f32 / int8 两对的共用主循环(定义与实例化都在 hnsw.cpp)。
     // dist(id) → float;prefetch(id) 预取该节点参与距离计算的数据。
@@ -418,10 +448,21 @@ private:
                            std::uint32_t layer, std::uint32_t n,
                            std::uint32_t* scratch,
                            std::vector<std::pair<float, std::uint32_t>>& out,
-                           Dist&& dist, Prefetch&& prefetch) const;
+                           Dist&& dist, Prefetch&& prefetch,
+                           const BatchFilter* filter) const;
 
     // 邻居选择启发式(HNSW 论文 Algorithm 4):候选若离 query 比离任一
     // 已选邻居更近才保留——避免聚簇数据上邻居全挤在同一方向。
+    // S50：标准连边路径（insert 的第 3/4 步）——节点数据/层数/邻接块须已
+    // 就位。repair=false：新节点首次连边，搜索边界 = id（只看更早的节点）。
+    // repair=true：图内已有节点补连（clone_live 修复用），搜索边界 = 全图、
+    // 候选并入现有出边、反向边去重。仅单写者调用。
+    void link_node(std::uint32_t id, bool repair);
+    // S50：0 层连通性检查 + 修复（clone_live 收尾；图未发布，无并发读者）。
+    // 「入口到不了」与「到不了入口」的节点都走 link_node(repair) 补连，
+    // 返回补连次数（图本就强连通时为 0，只花一遍 BFS）。
+    std::size_t repair_l0_connectivity();
+
     void select_neighbors(
         const float* q,
         std::vector<std::pair<float, std::uint32_t>>& cands,

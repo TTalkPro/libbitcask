@@ -191,6 +191,69 @@ TEST(DiskannSegment, LiveFilterAndNoncontiguousOrds) {
     fs::remove(fp);
 }
 
+// S51：展开期过滤——通过率低时仍回满 k。旧实现池宽 L 把死活节点一起算，
+// 只有被展开的 ~L 个节点有机会进结果堆，通过率 1/8、L=64 时只剩 ~8 条。
+TEST(DiskannSegment, FilterFillsKWhenMostNodesRejected) {
+    const std::size_t n = 2400, dim = 16, k = 10, nq = 40;
+    auto base = make_clustered(n, dim, 16, 0.2f, 0xA1, 0xB2);
+    const auto fp = tmp_path("bitcask_diskann_filter_fill.bda");
+    ASSERT_TRUE(DiskannSegment::build(fp, dim, src_of(base, dim), 16, 32, 9));
+    DiskannSegment seg;
+    ASSERT_TRUE(seg.open(fp, dim, 9));
+
+    const std::function<bool(std::uint64_t)> live = [](std::uint64_t ord) {
+        return ord % 8 == 0;
+    };
+    // 活集上的暴力真值（int8 域，与段内打分同口径）。
+    std::vector<float> live_base;
+    std::vector<std::uint64_t> live_ords;
+    for (std::size_t i = 0; i < n; i += 8) {
+        live_base.insert(live_base.end(), base.begin() + static_cast<long>(i * dim),
+                         base.begin() + static_cast<long>((i + 1) * dim));
+        live_ords.push_back(i);
+    }
+    std::size_t matched = 0;
+    for (std::size_t qi = 0; qi < nq; ++qi) {
+        const float* q = base.data() + (qi * 37 % n) * dim;
+        const auto hits = seg.search(std::span<const float>(q, dim), k, 64, &live);
+        ASSERT_EQ(hits.size(), k) << "qi=" << qi;  // 回满
+        const auto truth =
+            brute_topk_int8(live_base, live_ords.size(), dim, q, k);
+        for (const auto& h : hits) {
+            ASSERT_EQ(h.ord % 8, 0u);
+            for (const auto t : truth) matched += live_ords[t] == h.ord;
+        }
+    }
+    const double recall =
+        static_cast<double>(matched) / static_cast<double>(nq * k);
+    EXPECT_GE(recall, 0.85) << "recall=" << recall;
+    seg.close();
+    fs::remove(fp);
+}
+
+// 预算：全拒时不扫全图，返回空。
+TEST(DiskannSegment, FilterBudgetBoundsWorkWhenNothingPasses) {
+    const std::size_t n = 4000, dim = 16;
+    auto base = make_clustered(n, dim, 16, 0.2f, 0xC3, 0xD4);
+    const auto fp = tmp_path("bitcask_diskann_filter_budget.bda");
+    ASSERT_TRUE(DiskannSegment::build(fp, dim, src_of(base, dim), 16, 32, 9));
+    DiskannSegment seg;
+    ASSERT_TRUE(seg.open(fp, dim, 9));
+    std::size_t calls = 0;
+    const std::function<bool(std::uint64_t)> reject_all =
+        [&](std::uint64_t) { ++calls; return false; };
+    const std::uint32_t l = 4;
+    const auto hits =
+        seg.search(std::span<const float>(base.data(), dim), 2, l, &reject_all);
+    EXPECT_TRUE(hits.empty());
+    // 回调只在展开时求值，展开数 ≤ est 计算数 ≤ 预算 l × 256。
+    EXPECT_LE(calls, static_cast<std::size_t>(l) * 256);
+    EXPECT_LT(calls, n);
+    EXPECT_GT(calls, static_cast<std::size_t>(l));
+    seg.close();
+    fs::remove(fp);
+}
+
 TEST(DiskannSegment, GenGuardAndCorruption) {
     const std::size_t n = 400, dim = 16;
     auto base = make_clustered(n, dim, 8, 0.2f, 0x21, 0x32);

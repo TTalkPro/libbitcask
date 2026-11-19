@@ -15,8 +15,10 @@
 #include "bitcask/live_checker.hpp"
 #include "bitcask/meta_filter.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -31,6 +33,20 @@ public:
     // meta 过滤锁内求值（S13-P8：省 meta_blob 锁内拷贝）。
     [[nodiscard]] virtual bool
     eval_meta(std::uint64_t ord, const meta::MetaFilter& filter) const = 0;
+
+    // S51-8：eval_meta 批量版——out[i] = ords[i] 活且 meta 通过 filter（死 ord /
+    // 无 meta 恒 0，同 eval_meta）。要求 out.size() == ords.size()。
+    // 向量检索的遍历期过滤每查询要判几百到上千个 ord；逐个 eval_meta 在
+    // Index 上是每次一把 shared_lock，并发查询会在锁上互相拖慢。Index 覆写
+    // 为一把锁判整批；默认实现退化为逐个调用，外部实现者无需改动。
+    // ⚠️ 9.0.0 新增虚函数（vtable 变化）：C++ 下游须重新编译。
+    virtual void fill_eval_meta(std::span<const std::uint64_t> ords,
+                                const meta::MetaFilter& filter,
+                                std::span<char> out) const {
+        for (std::size_t i = 0; i < ords.size(); ++i) {
+            out[i] = static_cast<char>(eval_meta(ords[i], filter));
+        }
+    }
 
     // ext_id → ord（explain 等 key→ord 反查）。
     [[nodiscard]] virtual std::optional<std::uint64_t>

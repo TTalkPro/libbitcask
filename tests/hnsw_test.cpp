@@ -967,3 +967,332 @@ TEST(HnswCloneSpill, SpillAttachAdoptAndReload) {
         fs::remove(qc_path);
     }
 }
+
+// ---- S50：clone_live 高死比后的连通性与召回（反馈 2026-11-19）----
+//
+// 旧实现只滤死邻（仅「邻居全死」才补边）：死比一高，0 层出度塌缩、图被
+// 撕成互不连通的分量，merge 后检索静默返回错 key / 命中数不足。
+
+namespace {
+
+float dot_of(const float* a, const float* b, std::size_t dim) {
+    float s = 0.0f;
+    for (std::size_t d = 0; d < dim; ++d) s += a[d] * b[d];
+    return s;
+}
+
+// 活集上的暴力 top-k（kDot：内积大者近），返回 ord。
+std::vector<std::uint64_t> brute_topk(
+    const float* q, const std::vector<float>& vecs,
+    const std::vector<std::uint64_t>& ords, std::size_t dim, std::size_t k) {
+    std::vector<std::pair<float, std::uint64_t>> all;
+    all.reserve(ords.size());
+    for (std::size_t i = 0; i < ords.size(); ++i) {
+        all.push_back({-dot_of(q, vecs.data() + i * dim, dim), ords[i]});
+    }
+    k = std::min(k, all.size());
+    std::partial_sort(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(k),
+                      all.end());
+    std::vector<std::uint64_t> out;
+    for (std::size_t i = 0; i < k; ++i) out.push_back(all[i].second);
+    return out;
+}
+
+}  // namespace
+
+// 下游给的最小回归：200 key × 4 轮版本（ord % 4 == 3 活，死比 3/4），clone
+// 后对全部 200 个查询做 top-3 全量暴力比对。两种覆盖写形态都测：每轮写
+// 同一向量（纯重写）与每轮写不同向量。
+TEST(HnswCloneConnectivity, RepairAfterHeavyDeadFilter) {
+    const std::size_t dim = 32, keys = 200, rounds = 4, k = 3;
+    const auto live = [](std::uint64_t ord) { return ord % 4 == 3; };
+
+    for (const bool int8_only : {false, true}) {
+        for (const bool same_vec : {true, false}) {
+            SCOPED_TRACE(std::string(int8_only ? "int8-only" : "f32") +
+                         (same_vec ? " / 同向量覆盖" : " / 异向量覆盖"));
+            HnswConfig cfg;
+            cfg.dim = static_cast<std::uint16_t>(dim);
+            cfg.metric = HnswMetric::kDot;
+            cfg.inmem_int8 = int8_only;
+            HnswIndex idx(cfg);
+
+            const auto all = make_vectors(keys * rounds, dim, 20261119);
+            std::vector<float> live_vecs;
+            std::vector<std::uint64_t> live_ords;
+            for (std::size_t key = 0; key < keys; ++key) {
+                for (std::size_t r = 0; r < rounds; ++r) {
+                    const std::size_t src = same_vec ? key : key * rounds + r;
+                    const float* v = all.data() + src * dim;
+                    const std::uint64_t ord = key * rounds + r;
+                    idx.insert(ord, std::span<const float>(v, dim));
+                    if (live(ord)) {
+                        live_vecs.insert(live_vecs.end(), v, v + dim);
+                        live_ords.push_back(ord);
+                    }
+                }
+            }
+
+            auto fresh = idx.clone_live(live);
+            ASSERT_EQ(fresh->size(), keys);
+
+            std::size_t matched = 0;
+            for (std::size_t key = 0; key < keys; ++key) {
+                const float* q = live_vecs.data() + key * dim;
+                const std::span<const float> qs(q, dim);
+                // 命中数不足 = 落点所在分量太小（旧实现 K=3 只回 1 条）。
+                const auto hits = fresh->search(qs, k, 64);
+                ASSERT_EQ(hits.size(), k) << "key=" << key;
+                // 查询就是库内向量：top-1 必须是它自己。
+                EXPECT_EQ(hits[0].ord, live_ords[key]) << "key=" << key;
+                const auto truth = brute_topk(q, live_vecs, live_ords, dim, k);
+                for (const auto& h : hits) {
+                    matched += std::find(truth.begin(), truth.end(), h.ord) !=
+                               truth.end();
+                }
+                // 0 层连通：ef = 全量时从任一落点都应遍历到全部活节点。
+                EXPECT_EQ(fresh->search(qs, keys, keys).size(), keys)
+                    << "key=" << key;
+            }
+            // f32 与暴力逐条一致；int8-only 的距离是量化近似，边界名次
+            // 可与 f32 真值相差个别条。
+            const double recall =
+                static_cast<double>(matched) / static_cast<double>(keys * k);
+            EXPECT_GE(recall, int8_only ? 0.95 : 1.0);
+        }
+    }
+}
+
+// 分档召回门：clone 后的图质量不得明显低于「只用活节点从零建」的图。
+// 死比 < 50% 走结构化拷贝 + 路径收缩，≥ 50% 走全量重连，两路都覆盖。
+TEST(HnswCloneConnectivity, RecallHoldsAcrossDeadRatios) {
+    // 规模按 sanitizer 构建的耗时收着（建图是主要开销）。
+    const std::size_t dim = 32, n_live = 500, k = 10, ef = 64, n_query = 100;
+
+    for (const bool int8_only : {false, true}) {
+        for (const double dead : {0.30, 0.45, 0.75}) {
+            SCOPED_TRACE(std::string(int8_only ? "int8-only" : "f32") +
+                         " 死比=" + std::to_string(dead));
+            const auto total = static_cast<std::size_t>(
+                static_cast<double>(n_live) / (1.0 - dead));
+            HnswConfig cfg;
+            cfg.dim = static_cast<std::uint16_t>(dim);
+            cfg.metric = HnswMetric::kDot;
+            cfg.inmem_int8 = int8_only;
+
+            // 随机挑 n_live 个活。
+            std::vector<char> is_live(total, 0);
+            {
+                std::vector<std::size_t> perm(total);
+                for (std::size_t i = 0; i < total; ++i) perm[i] = i;
+                std::mt19937 rng(7);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                for (std::size_t i = 0; i < n_live; ++i) is_live[perm[i]] = 1;
+            }
+            const auto live = [&](std::uint64_t ord) {
+                return is_live[ord] != 0;
+            };
+
+            const auto all = make_vectors(total, dim, 4242);
+            HnswIndex idx(cfg);      // 全量图（含将死节点）
+            HnswIndex scratch(cfg);  // 对照：只插活节点
+            std::vector<float> live_vecs;
+            std::vector<std::uint64_t> live_ords;
+            for (std::size_t i = 0; i < total; ++i) {
+                const std::span<const float> v(all.data() + i * dim, dim);
+                idx.insert(i, v);
+                if (is_live[i]) {
+                    scratch.insert(i, v);
+                    live_vecs.insert(live_vecs.end(), v.begin(), v.end());
+                    live_ords.push_back(i);
+                }
+            }
+
+            auto fresh = idx.clone_live(live);
+            ASSERT_EQ(fresh->size(), n_live);
+
+            const auto queries = make_vectors(n_query, dim, 99);
+            std::size_t hit_clone = 0, hit_scratch = 0;
+            for (std::size_t qi = 0; qi < n_query; ++qi) {
+                const float* q = queries.data() + qi * dim;
+                const std::span<const float> qs(q, dim);
+                const auto truth = brute_topk(q, live_vecs, live_ords, dim, k);
+                const auto count = [&](const std::vector<HnswIndex::Hit>& hs) {
+                    std::size_t c = 0;
+                    for (const auto& h : hs) {
+                        c += std::find(truth.begin(), truth.end(), h.ord) !=
+                             truth.end();
+                    }
+                    return c;
+                };
+                const auto hc = fresh->search(qs, k, ef);
+                ASSERT_EQ(hc.size(), k) << "qi=" << qi;
+                hit_clone += count(hc);
+                hit_scratch += count(scratch.search(qs, k, ef));
+                EXPECT_EQ(fresh->search(qs, n_live, n_live).size(), n_live)
+                    << "qi=" << qi;
+            }
+            const double denom = static_cast<double>(n_query * k);
+            const double r_clone = static_cast<double>(hit_clone) / denom;
+            const double r_scratch = static_cast<double>(hit_scratch) / denom;
+            EXPECT_GE(r_clone, r_scratch - 0.03)
+                << "clone=" << r_clone << " scratch=" << r_scratch;
+        }
+    }
+}
+
+// ---- S51：遍历期过滤（死文档多 / filter 选择性高时仍回满 k）----
+//
+// 旧实现在结果侧过滤：0 层先取 ef 个候选再滤，活比一低就回不满 k；int8
+// 粗筛路径还先截到 3k 再滤，活比 < 1/3 时调大 ef 也无效。
+
+TEST(HnswFilteredSearch, FillsKWhenMostNodesRejected) {
+    const std::size_t n_live = 300, k = 10, ef = 64, n_query = 50;
+    const double dead = 0.875;  // 通过率 1/8：旧实现 ef=64 只剩 ~8 个活候选
+    const auto total =
+        static_cast<std::size_t>(static_cast<double>(n_live) / (1.0 - dead));
+
+    struct Case {
+        const char* name;
+        std::size_t dim;
+        bool int8_only;
+        double min_recall;
+    };
+    // dim 64 默认配置在有 VNNI 的机器上走 int8 粗筛 + f32 精排（先截 3k 的
+    // 那条路径），否则退纯 f32；两种情况断言都成立。
+    const Case cases[] = {
+        {"f32 dim32", 32, false, 0.95},
+        {"default dim64", 64, false, 0.90},
+        {"int8-only dim64", 64, true, 0.85},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        HnswConfig cfg;
+        cfg.dim = static_cast<std::uint16_t>(c.dim);
+        cfg.metric = HnswMetric::kDot;
+        cfg.inmem_int8 = c.int8_only;
+        HnswIndex idx(cfg);
+
+        std::vector<char> is_live(total, 0);
+        {
+            std::vector<std::size_t> perm(total);
+            for (std::size_t i = 0; i < total; ++i) perm[i] = i;
+            std::mt19937 rng(11);
+            std::shuffle(perm.begin(), perm.end(), rng);
+            for (std::size_t i = 0; i < n_live; ++i) is_live[perm[i]] = 1;
+        }
+        const auto all = make_vectors(total, c.dim, 5151);
+        std::vector<float> live_vecs;
+        std::vector<std::uint64_t> live_ords;
+        for (std::size_t i = 0; i < total; ++i) {
+            const std::span<const float> v(all.data() + i * c.dim, c.dim);
+            idx.insert(i, v);
+            if (is_live[i]) {
+                live_vecs.insert(live_vecs.end(), v.begin(), v.end());
+                live_ords.push_back(i);
+            }
+        }
+        const std::function<bool(std::uint64_t)> live =
+            [&](std::uint64_t ord) { return is_live[ord] != 0; };
+
+        const auto queries = make_vectors(n_query, c.dim, 77);
+        std::size_t matched = 0;
+        for (std::size_t qi = 0; qi < n_query; ++qi) {
+            const float* q = queries.data() + qi * c.dim;
+            const auto hits =
+                idx.search(std::span<const float>(q, c.dim), k, ef, &live);
+            ASSERT_EQ(hits.size(), k) << "qi=" << qi;  // 回满
+            const auto truth = brute_topk(q, live_vecs, live_ords, c.dim, k);
+            for (const auto& h : hits) {
+                ASSERT_TRUE(is_live[h.ord]) << "返回了被过滤的 ord=" << h.ord;
+                matched += std::find(truth.begin(), truth.end(), h.ord) !=
+                           truth.end();
+            }
+        }
+        const double recall = static_cast<double>(matched) /
+                              static_cast<double>(n_query * k);
+        EXPECT_GE(recall, c.min_recall) << "recall=" << recall;
+    }
+}
+
+// 预算：过滤全拒时不把全图扫一遍——距离计算（也就约束了回调次数）封顶在
+// ef × kFilterBudgetMul，返回空。
+TEST(HnswFilteredSearch, BudgetBoundsWorkWhenNothingPasses) {
+    const std::size_t dim = 16, n = 4000, k = 2, ef = 4;
+    HnswConfig cfg;
+    cfg.dim = static_cast<std::uint16_t>(dim);
+    cfg.metric = HnswMetric::kDot;
+    HnswIndex idx(cfg);
+    const auto all = make_vectors(n, dim, 31);
+    for (std::size_t i = 0; i < n; ++i) {
+        idx.insert(i, std::span<const float>(all.data() + i * dim, dim));
+    }
+    std::size_t calls = 0;
+    const std::function<bool(std::uint64_t)> reject_all =
+        [&](std::uint64_t) { ++calls; return false; };
+    const auto hits =
+        idx.search(std::span<const float>(all.data(), dim), k, ef, &reject_all);
+    EXPECT_TRUE(hits.empty());
+    // 预算在展开一个节点之前检查，最多超出一张邻接表（L0 容量 2M）。
+    const std::size_t budget = ef * HnswIndex::kFilterBudgetMul;
+    EXPECT_LE(calls, budget + 2 * cfg.M);
+    EXPECT_LT(calls, n);  // 没有扫全图
+    EXPECT_GT(calls, ef);  // 确实是遍历期过滤在继续找，而非取 ef 个就停
+
+    // 只有一个节点通过：预算内找得到就返回它，且只返回它。
+    const std::uint64_t only = 0;  // 查询向量自身
+    const std::function<bool(std::uint64_t)> one =
+        [&](std::uint64_t ord) { return ord == only; };
+    const auto h1 =
+        idx.search(std::span<const float>(all.data(), dim), k, ef, &one);
+    ASSERT_EQ(h1.size(), 1u);
+    EXPECT_EQ(h1[0].ord, only);
+}
+
+// 批量过滤接口：结果与逐个回调版一致；每展开一个节点至多调一次（批次数
+// 远少于被判的 ord 数——这是它存在的理由：一批一把锁）。
+TEST(HnswFilteredSearch, BatchFilterMatchesPerOrdAndBatches) {
+    const std::size_t dim = 32, n = 2000, k = 10, ef = 64;
+    HnswConfig cfg;
+    cfg.dim = static_cast<std::uint16_t>(dim);
+    cfg.metric = HnswMetric::kDot;
+    HnswIndex idx(cfg);
+    const auto all = make_vectors(n, dim, 606);
+    for (std::size_t i = 0; i < n; ++i) {
+        idx.insert(i, std::span<const float>(all.data() + i * dim, dim));
+    }
+    const auto pass = [](std::uint64_t ord) { return ord % 4 == 0; };
+    const std::function<bool(std::uint64_t)> one = pass;
+    std::size_t batches = 0, judged = 0;
+    const HnswIndex::BatchFilter batch =
+        [&](std::span<const std::uint64_t> ords, std::span<char> out) {
+            ASSERT_EQ(ords.size(), out.size());
+            ASSERT_FALSE(ords.empty());
+            ++batches;
+            judged += ords.size();
+            for (std::size_t i = 0; i < ords.size(); ++i) {
+                out[i] = static_cast<char>(pass(ords[i]));
+            }
+        };
+    const auto queries = make_vectors(20, dim, 707);
+    for (std::size_t qi = 0; qi < 20; ++qi) {
+        const std::span<const float> q(queries.data() + qi * dim, dim);
+        const auto a = idx.search(q, k, ef, &one);
+        const auto b = idx.search_filtered(q, k, ef, batch);
+        ASSERT_EQ(a.size(), k);
+        ASSERT_EQ(b.size(), k);
+        for (std::size_t i = 0; i < k; ++i) {
+            EXPECT_EQ(a[i].ord, b[i].ord) << "qi=" << qi << " i=" << i;
+            EXPECT_EQ(b[i].ord % 4, 0u);
+        }
+    }
+    EXPECT_LT(batches * 3, judged) << "batches=" << batches
+                                   << " judged=" << judged;
+
+    // 空 BatchFilter = 不过滤。
+    const std::span<const float> q0(queries.data(), dim);
+    const auto u1 = idx.search(q0, k, ef);
+    const auto u2 = idx.search_filtered(q0, k, ef, {});
+    ASSERT_EQ(u1.size(), u2.size());
+    for (std::size_t i = 0; i < u1.size(); ++i) EXPECT_EQ(u1[i].ord, u2[i].ord);
+}

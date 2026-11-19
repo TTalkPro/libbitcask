@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "bitcask/index.hpp"
+#include "bitcask/meta_codec.hpp"
 
 using bitcask::index::DocLoc;
 using bitcask::index::DocSlot;
@@ -335,6 +336,62 @@ TEST(Index, DeltaJournalTracksLiveOnly) {
     js = idx.delta_live_snapshot();
     ASSERT_EQ(js.size(), 1u);
     EXPECT_EQ(js[0], 5u);
+}
+
+// ---- S51-8：fill_eval_meta 批量版与逐个 eval_meta 逐项一致 ----
+
+TEST(Index, FillEvalMetaMatchesEvalMeta) {
+    namespace meta = bitcask::meta;
+    const auto blob_of = [](const std::string& c) {
+        std::vector<meta::MetaEntry> entries{{"c", meta::MetaValue(c)}};
+        std::vector<std::byte> blob;
+        meta::encode_meta(blob, entries);
+        return blob;
+    };
+    Index idx;
+    // ord 0..5：red / blue / 无 meta / red（随后被覆盖写淘汰）/ red（随后删除）/ red
+    idx.put_doc("a", 0, slot(1, 0, 10));  idx.set_meta(0, blob_of("red"));
+    idx.put_doc("b", 1, slot(1, 10, 10)); idx.set_meta(1, blob_of("blue"));
+    idx.put_doc("c", 2, slot(1, 20, 10));
+    idx.put_doc("d", 3, slot(1, 30, 10)); idx.set_meta(3, blob_of("red"));
+    idx.put_doc("e", 4, slot(1, 40, 10)); idx.set_meta(4, blob_of("red"));
+    idx.put_doc("d", 5, slot(1, 50, 10)); idx.set_meta(5, blob_of("red"));
+    ASSERT_TRUE(idx.remove("e", 6));
+
+    meta::MetaFilter f;
+    f.conditions.push_back({"c", meta::MetaOp::Eq, meta::MetaValue("red"), {}});
+
+    const std::vector<std::uint64_t> ords{0, 1, 2, 3, 4, 5, 999, 0};
+    std::vector<char> got(ords.size(), 7);
+    idx.fill_eval_meta(ords, f, got);
+    const std::vector<char> want{1, 0, 0, 0, 0, 1, 0, 1};
+    for (std::size_t i = 0; i < ords.size(); ++i) {
+        EXPECT_EQ(got[i], want[i]) << "ord=" << ords[i];
+        EXPECT_EQ(got[i] != 0, idx.eval_meta(ords[i], f)) << "ord=" << ords[i];
+    }
+
+    // 经基类默认实现（逐个调用）结果相同——外部 DocTable 实现者不覆写也成立。
+    struct Fallback final : bitcask::bm25::DocTable {
+        const Index& i;
+        explicit Fallback(const Index& x) : i(x) {}
+        bool is_live(std::uint64_t o) const override { return i.is_live(o); }
+        std::uint32_t doc_len(std::uint64_t o) const override { return i.doc_len(o); }
+        std::optional<std::string> ord_to_ext(std::uint64_t o) const override {
+            return i.ord_to_ext(o);
+        }
+        bool eval_meta(std::uint64_t o, const meta::MetaFilter& mf) const override {
+            return i.eval_meta(o, mf);
+        }
+        std::optional<std::uint64_t> ord_of(std::string_view e) const override {
+            return i.ord_of(e);
+        }
+    } fb(idx);
+    std::vector<char> got2(ords.size(), 7);
+    fb.fill_eval_meta(ords, f, got2);
+    EXPECT_EQ(got2, want);
+
+    // 空批：不触碰 out。
+    idx.fill_eval_meta({}, f, {});
 }
 
 // ---- S42：meta 挂 live 行，覆盖写/删除同步淘汰 ----

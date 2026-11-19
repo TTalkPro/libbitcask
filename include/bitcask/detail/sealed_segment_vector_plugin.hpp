@@ -364,7 +364,14 @@ SealedSegmentVectorPlugin<SealedT>::search(std::span<const float> query,
     }
     if (w && !w->empty()) {
         const std::size_t wef = ef != 0 ? ef : std::max<std::size_t>(k, 64);
-        for (const auto& h : w->search(q, k, wef, &live)) {
+        // S51：窗口 HNSW 走批量过滤（一批一把锁，理由见 VectorPlugin::search）。
+        const HnswIndex::BatchFilter wlive =
+            [&dt, filter](std::span<const std::uint64_t> ords,
+                          std::span<char> out) {
+                if (filter != nullptr) dt.fill_eval_meta(ords, *filter, out);
+                else                   dt.fill_is_live(ords, out);
+            };
+        for (const auto& h : w->search_filtered(q, k, wef, wlive)) {
             merged.push_back({h.score, h.ord});
         }
     }

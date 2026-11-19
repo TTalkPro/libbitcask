@@ -4,6 +4,10 @@
 
 所有可能失败的接口用 `std::expected<T, CaskFault>` / `std::expected<T, MetaError>` / `std::expected<T, MergeFault>` 等返回；调用方应检查 `has_value()` 后再解引用。
 
+> **9.0.0 ABI**：`bm25::DocTable` 新增虚函数 `fill_eval_meta()`（带默认实现，vtable
+> 变化）；`vec::HnswIndex` 新增 `BatchFilter` / `search_filtered()` / `kFilterBudgetMul`。
+> SOVERSION bump 到 9，下游 C++ 使用方需重新编译链接。C API 签名与盘上格式不变。
+>
 > **7.0.0 ABI**：`StatusInfo` 尾部新增 OKI 统计；`OkiState` / `OkiState::ReadView` /
 > `OkiMergeCursor` 接口与布局变化；`OkiState::flush()` 去掉 `async_compaction` 参数。
 > 因此 SOVERSION bump 到 7，下游 C++ 使用方需重新编译链接。C API 签名不变；盘上
@@ -1175,10 +1179,20 @@ public:
         float score;   // kDot:内积(越大越近);kL2:-平方距离
     };
     // 查询 top-k。线程安全(多读者,可与单写者 insert 并发)。
-    // ef >= k(内部取 max);live 非空时结果侧过滤(死节点仍参与导航)。
+    // ef >= k(内部取 max)。9.0.0：live 非空时做遍历期过滤——被拒节点照常参与
+    // 导航但不进结果集，凑满 ef 个通过者才收敛（死文档多 / filter 严时仍回满 k）。
+    // 带过滤时 0 层距离计算上限 ef × kFilterBudgetMul，耗尽即返回已找到的。
+    static constexpr std::size_t kFilterBudgetMul = 256;
     [[nodiscard]] std::vector<Hit> search(
         std::span<const float> query, std::size_t k, std::size_t ef,
         const std::function<bool(std::uint64_t)>* live = nullptr) const;
+    // 9.0.0：批量过滤版——每展开一个节点攒一批调一次 filter(ords, out)，
+    // out[i] = ords[i] 是否通过。过滤回调要拿锁时用它（一批一把锁）。
+    using BatchFilter = std::function<void(std::span<const std::uint64_t>,
+                                           std::span<char>)>;
+    [[nodiscard]] std::vector<Hit> search_filtered(
+        std::span<const float> query, std::size_t k, std::size_t ef,
+        const BatchFilter& filter) const;
 
     [[nodiscard]] std::size_t     size() const noexcept;       // count_.load()
     [[nodiscard]] bool            empty() const noexcept;
@@ -1189,7 +1203,9 @@ public:
     [[nodiscard]] std::uint64_t       node_ord(std::uint32_t id) const;
     [[nodiscard]] std::span<const float> node_vec(std::uint32_t id) const;
 
-    // S13-P8：结构化拷贝活子图（merge 期 rebuild 用）。O(节点+边) memcpy 级。
+    // S13-P8：结构化拷贝活子图（merge 期 rebuild 用）。9.0.0（S50）：死比 < 50%
+    // 结构化拷贝 + 路径收缩；≥ 50% 全量重连（代价 ∝ 活节点数）；返回的图 0 层
+    // 从入口强连通。
     [[nodiscard]] std::shared_ptr<HnswIndex>
     clone_live(const std::function<bool(std::uint64_t)>& is_live) const;
 
@@ -1849,6 +1865,11 @@ public:
     ord_to_ext(std::uint64_t ord) const = 0;
     [[nodiscard]] virtual bool
     eval_meta(std::uint64_t ord, const meta::MetaFilter& filter) const = 0;
+    // 9.0.0：eval_meta 批量版（out[i] = ords[i] 活且通过 filter）。默认实现逐个
+    // 调 eval_meta；Index 覆写为一把锁判整批。
+    virtual void fill_eval_meta(std::span<const std::uint64_t> ords,
+                                const meta::MetaFilter& filter,
+                                std::span<char> out) const;
     [[nodiscard]] virtual std::optional<std::uint64_t>
     ord_of(std::string_view ext_id) const = 0;
 };

@@ -5,13 +5,86 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`8.1.0`**；库 `SOVERSION` = **`8`**（= major）；
+`bitcask_version_*` = **`9.0.0`**；库 `SOVERSION` = **`9`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
-（4.0.0 / 5.0.0 / 6.0.0 三次皆是）。
+（4.0.0 / 5.0.0 / 6.0.0 / 7.0.0 / 8.0.0 / 9.0.0 皆是）。
+
+---
+
+## [9.0.0] - 2026-11-19（S50 / S51：merge 后与带过滤的向量检索结果修复）
+
+> **版本语义**：⚠️ **C++ ABI 破坏**——`bm25::DocTable` 新增虚函数
+> `fill_eval_meta()`（vtable 变化；带默认实现，外部实现者源码无需改动）。
+> `SOVERSION` 升 `9`，取 MAJOR +1（9.0.0），**C++ 下游须重新编译链接**。
+> `vec::HnswIndex` 另有纯新增的 `BatchFilter` / `search_filtered()` /
+> `kFilterBudgetMul`。C API 签名、C ABI、盘上格式零改动；8.1.0 写出的数据
+> 直接可用（下一次 merge 后向量图自动变好）。
+
+### Fixed
+
+- **merge 后向量检索静默返回错结果**（S50，下游反馈
+  `feedbacks/2026-11-19-jinshu-merge-corrupts-search-index.md`）：HNSW
+  `clone_live` 原来只做死邻过滤，仅「某层邻居全死」才补边。死比一高，0 层
+  出度塌缩（死比 75% 时平均出度 26 → 6），极端时图被撕成互不连通的分量——
+  merge 之后检索返回错 key、top-K 命中数不足，不报错；f32 与 int8-only 都中。
+  现按死比分两路：死比 < 50% 走结构化拷贝 + 全面路径收缩（凡丢了邻居的节点，
+  从「活邻 + 穿过死节点链可达的活节点」里按建图同款启发式重新选边）；死比
+  ≥ 50% 走全量重连（节点数据与层数保留，邻接按标准插入路径重建）。两路收尾
+  都做 0 层从入口的强连通检查，不合格节点补连。
+  实测（5000 活节点、dim 32、recall@10、ef=64）：随机删 30% 0.968 → 0.991，
+  75% 0.775 → 0.994，90% 0.344 → 0.991；覆盖写 8 轮（每轮向量不同）
+  0.168 → 0.994。
+
+- **向量检索带过滤时少返回**（S51）：HNSW 的活过滤 / meta filter 原来在结果侧——
+  0 层先取 ef 个候选再滤，死文档占多数或 filter 选择性高时返回数 < k、召回塌陷，
+  不报错；默认高维路径（int8 粗筛 + f32 精排）还先截到 3k 再滤，活比 < 1/3 时
+  调大 ef 也无效。现改为**遍历期过滤**：被拒节点照常参与导航，但只有通过过滤的
+  节点进结果集，凑满 ef 个通过者才收敛。DiskANN 封存段同款处理（过滤在展开时
+  求值，凑满 L 个通过者才收敛）。IVF 本就在入堆前过滤，不受影响。
+  实测（5000 活节点、dim 64 默认路径、k=10、ef=64）：死比 75% recall 0.615 → 0.954，
+  90% 0.300 → 0.956，回不满 k 的查询 237 / 300 条 → 0 条。
+
+### Added
+
+- **`bm25::DocTable::fill_eval_meta()`**（S51-8，⚠️ 新增虚函数）：`eval_meta`
+  的批量版，`out[i]` = `ords[i]` 活且通过 filter。`Index` 覆写为一把
+  `shared_lock` 判整批；默认实现逐个调 `eval_meta`。带 meta filter 的向量检索
+  由此也走批量：2 万节点、dim 64、8 线程，通过率 1/2 时 21.0k → 35.2k QPS，
+  通过率 1/8 时 7.3k → 11.0k QPS。
+- **`HnswIndex::search_filtered()` 与 `HnswIndex::BatchFilter`**（S51，C++ 头纯新增）：
+  批量过滤接口，每展开一个节点把候选攒成一批调一次。遍历期过滤每查询要判几百到
+  上千个 ord，逐个 `Index::is_live` 是每次一把 `shared_lock`——8 线程并发查询 QPS
+  掉一半以上（136k → 57k）；`VectorPlugin` 与封存段插件的窗口 HNSW 现走
+  `fill_is_live` 批量，同条件 130k。原 `search(…, live*)` 签名与语义不变。
+
+### Changed
+
+- **带过滤的向量检索耗时随通过率变化**（S51 的代价）：耗时约 ∝ 1/通过率（dim 32：
+  全部通过 32 µs 不变，死比 75% 34 → 136 µs，90% 42 → 380 µs），过滤求值次数约
+  3 × ef / 通过率。带过滤时 0 层距离计算有预算上限 ef × 256
+  （`HnswIndex::kFilterBudgetMul`；DiskANN 为 L × 256），耗尽即返回已找到的——
+  通过率极低时仍可能 < k，但不会把全图扫一遍。
+- **高死比 merge 的向量重建变慢**（S50 的代价）：死比 ≥ 50% 时 `clone_live`
+  耗时从毫秒级变为「活节点数 × 单点连边耗时」（单线程；dim 32 约 0.1 ms/节点，
+  5000 活节点约 0.5 s）。死比 < 50% 时只对丢了邻居的节点算距离（同规模 25～32 ms，
+  原 1～3 ms）。
+
+### Validation
+
+- 新增 `HnswCloneConnectivity.RepairAfterHeavyDeadFilter`（下游最小回归）与
+  `HnswCloneConnectivity.RecallHoldsAcrossDeadRatios`；两条在 8.1.0 实现上红。
+- 新增 `HnswFilteredSearch.FillsKWhenMostNodesRejected`、
+  `HnswFilteredSearch.BudgetBoundsWorkWhenNothingPasses`、
+  `DiskannSegment.FilterFillsKWhenMostNodesRejected`、
+  `DiskannSegment.FilterBudgetBoundsWorkWhenNothingPasses`、
+  `HnswFilteredSearch.BatchFilterMatchesPerOrdAndBatches`、
+  `Index.FillEvalMetaMatchesEvalMeta`。
+- GCC Release 全量 ctest 907/907；向量 / Index / C API 相关 209 项在 ASan / TSan /
+  Clang Debug 全绿。Windows 未实测。
 
 ---
 
@@ -2220,7 +2293,8 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/8.1.0...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/9.0.0...HEAD
+[9.0.0]: https://github.com/davidalphafox/libbitcask/compare/8.1.0...9.0.0
 [8.1.0]: https://github.com/davidalphafox/libbitcask/compare/8.0.2...8.1.0
 [8.0.2]: https://github.com/davidalphafox/libbitcask/compare/8.0.1...8.0.2
 [8.0.1]: https://github.com/davidalphafox/libbitcask/compare/8.0.0...8.0.1

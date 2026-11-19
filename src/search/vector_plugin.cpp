@@ -149,21 +149,20 @@ VectorPlugin::search(std::span<const float> query, std::size_t k,
     }
     if (ef == 0) ef = std::max<std::size_t>(k, 64);
 
-    // V5：filter 与 is_live 组合为 HNSW live callback——被拒节点从图遍历
-    // 源头就不入候选集。空 meta blob 一律不通过。
+    // V5：filter 与 is_live 组合为 HNSW live callback。S51 起是遍历期过滤：
+    // 被拒节点只当导航路标、不进结果集，凑满 ef 个通过者才收敛（此前实为
+    // 结果侧过滤，活比低时回不满 k）。空 meta blob 一律不通过。
+    // S51：走批量过滤接口——遍历期过滤每查询要判几百到上千个 ord，逐个
+    // is_live 是每次一把 shared_lock（并发查询 8 线程 QPS 掉一半以上）；
+    // fill_is_live / fill_eval_meta 一批一把锁（后者自带判活，S13-P8 锁内求值）。
     const bm25::DocTable& dt = docs_;
-    std::function<bool(std::uint64_t)> live;
-    if (filter) {
-        live = [&dt, filter](std::uint64_t ord) -> bool {
-            if (!dt.is_live(ord)) return false;
-            return dt.eval_meta(ord, *filter);  // S13-P8：锁内求值
+    const HnswIndex::BatchFilter live =
+        [&dt, filter](std::span<const std::uint64_t> ords,
+                      std::span<char> out) {
+            if (filter != nullptr) dt.fill_eval_meta(ords, *filter, out);
+            else                   dt.fill_is_live(ords, out);
         };
-    } else {
-        live = [&dt](std::uint64_t ord) -> bool {
-            return dt.is_live(ord);
-        };
-    }
-    auto raw = hnsw->search(q, k, ef, &live);
+    auto raw = hnsw->search_filtered(q, k, ef, live);
 
     std::vector<search::SearchHit> hits;
     hits.reserve(raw.size());

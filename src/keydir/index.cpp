@@ -178,6 +178,21 @@ bool Index::eval_meta(std::uint64_t ord, const meta::MetaFilter& filter) const {
     return filter.evaluate(std::span<const std::byte>(it->second));
 }
 
+void Index::fill_eval_meta(std::span<const std::uint64_t> ords,
+                           const meta::MetaFilter& filter,
+                           std::span<char> out) const {
+    std::shared_lock lk(mutex_);
+    for (std::size_t i = 0; i < ords.size(); ++i) {
+        bool ok = false;
+        if (live_.contains(ords[i])) {  // 死 ord 恒不通过
+            const auto it = meta_.find(ords[i]);
+            ok = it != meta_.end() && !it->second.empty() &&
+                 filter.evaluate(std::span<const std::byte>(it->second));
+        }
+        out[i] = static_cast<char>(ok);
+    }
+}
+
 void Index::set_doc_len(std::uint64_t ord, std::uint32_t len) {
     std::unique_lock lk(mutex_);
     auto it = live_.find(ord);
