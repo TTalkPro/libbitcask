@@ -66,6 +66,8 @@ Cask::upgrade(std::string_view dirname,
     new_mc.unicode_major = text::detail::unicode_major_version();
     new_mc.analyzer_fp =  // C1：同上，此刻起按该配置分词
         text::analyzer_fingerprint(search_config.analyzer_config);
+    new_mc.analyzer = search_config.analyzer_config;  // S55：连同配置本身（C2）
+    new_mc.analyzer->dict_path.clear();               // 机器相关路径不入 meta
     auto wr = meta::write_meta(std::string(dirname), new_mc);
     if (!wr) {
         return std::unexpected(err(CaskError::kIo, "write meta failed"));

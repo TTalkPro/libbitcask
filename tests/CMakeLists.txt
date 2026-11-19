@@ -212,6 +212,15 @@ target_link_libraries(bitcask_search_segment_fallback_test PRIVATE
     bitcask_sanitizers
 )
 
+# S55：分析器配置进 meta（C2）、按记录打开、ngram 高亮偏移、高亮器区间合并
+add_executable(bitcask_analyzer_record_test analyzer_record_test.cpp)
+target_link_libraries(bitcask_analyzer_record_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 # S53：冷文档高亮（ColdText::kLoad 从存储读回正文补片段）
 add_executable(bitcask_search_highlight_cold_test search_highlight_cold_test.cpp)
 target_link_libraries(bitcask_search_highlight_cold_test PRIVATE
@@ -485,6 +494,7 @@ gtest_discover_tests(bitcask_file_lock_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_index_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_search_segment_fallback_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_search_highlight_cold_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_analyzer_record_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_v2_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_test ${_bitcask_test_props})

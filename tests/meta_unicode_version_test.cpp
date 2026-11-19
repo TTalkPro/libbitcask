@@ -321,13 +321,14 @@ protected:
     }
 };
 
-// 带 search_config 建库 → 记下指纹（非零），meta 为 18B 头 + 9B 尾段。
+// 带 search_config 建库 → 记下指纹（非零），meta 为 18B 头 + 9B 尾段（C1）
+// + S55 的 C2 尾段（分析器配置本身；无自定义停用词时 5 + 23 + 4 = 32B）。
 TEST_F(MetaAnalyzerFpTest, RecordsFingerprintOnCreate) {
     (void)open_with(ngram(2, 3));
     const auto mc = read();
     EXPECT_NE(mc.analyzer_fp, 0u);
     EXPECT_EQ(mc.analyzer_fp, bitcask::text::analyzer_fingerprint(ngram(2, 3)));
-    EXPECT_EQ(meta_size(tmpdir_), 27u);
+    EXPECT_EQ(meta_size(tmpdir_), 27u + 32u);
 }
 
 // 无 search_config（不分词）/ KV 模式：不记，meta 保持 18 字节——与旧版

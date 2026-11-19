@@ -156,8 +156,16 @@ struct MetaConfig {
     bool          vector_quantized = false; // P3b：向量落盘 int8 量化
     bool          vector_inmem_int8 = false;// P5b：HNSW int8-only 内存
     VectorEngine  vector_engine    = VectorEngine::kHnsw; // S32-M0：向量引擎
+    std::uint8_t  icu_major = 0, unicode_major = 0;       // S38：0 = 未记录
+    std::uint32_t analyzer_fp = 0;                        // C1：分析器配置指纹，0 = 未记录
+    std::optional<text::AnalyzerConfig> analyzer;         // S55：分析器配置本身（C2；不含 dict_path）
+    std::uint8_t  version = 5;                            // S35：5 / 6
 };
 ```
+
+S55：`analyzer` 在建库 / KV→检索库升级时记录，读端用 `analyzer_fp` 自校验（不符或 C2 损坏 ⇒ `nullopt`）；
+`write_meta` 只在 `analyzer_fp != 0` 且两者一致时写 C2。打开时按记录用：`SearchLayerConfig::analyzer_from_meta = true`
+（`dict_path` 仍取选项；没有记录时认缺省配置，认不出 ⇒ `kInvalidOption`），语义同 C 的 `BITCASK_ANALYZER_STORED`。
 
 相关自由函数（`meta_file.hpp`）：
 
@@ -168,7 +176,10 @@ struct MetaConfig {
 [[nodiscard]] std::expected<void, MetaError>
                                   write_meta(std::string_view dirname, const MetaConfig& config);
 
-struct MetaError { int errnum = 0; std::string message; };
+struct MetaError {
+    enum class Kind : std::uint8_t { kIo, kCorrupt, kUnsupported };   // S55
+    int errnum = 0; std::string message; Kind kind = Kind::kIo;
+};
 ```
 
 ### 3.7 `bitcask::meta::VectorEngine`（`meta_file.hpp`）

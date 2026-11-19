@@ -257,7 +257,9 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
         return std::unexpected(r.error());
     }
 
-    if (auto r = cask->create_search_infra(opts); !r) {
+    // S55：传 cask->opts_ 而非入参 opts——check_or_create_meta 可能已按 meta 记录改写了
+    // search_config->analyzer_config（analyzer_from_meta），插件必须用改写后的。
+    if (auto r = cask->create_search_infra(cask->opts_); !r) {
         return std::unexpected(r.error());
     }
 
@@ -431,6 +433,35 @@ Cask::create_vector_plugin(const search::SearchLayerConfig& scfg) const {
                                                *docmap_);
 }
 
+namespace {
+
+// S55：记进 meta 的分析器配置——去掉 dict_path（机器相关路径，不入 meta）。
+text::AnalyzerConfig recorded_analyzer(const text::AnalyzerConfig& c) {
+    text::AnalyzerConfig r = c;
+    r.dict_path.clear();
+    return r;
+}
+
+// S55：只有 C1 指纹（S55 之前建）的库，按指纹认缺省配置：三种分析器 × 停用词（内置表）× 词干，
+// 其余字段取缺省。认不出 ⇒ nullopt。指纹是 32 位 FNV-1a，十几个候选里误认的概率可忽略。
+std::optional<text::AnalyzerConfig> default_analyzer_matching(std::uint32_t fp) {
+    for (auto type : {text::AnalyzerType::Ngram, text::AnalyzerType::Whitespace,
+                      text::AnalyzerType::Jieba}) {
+        for (bool stop : {false, true}) {
+            for (bool stem : {false, true}) {
+                text::AnalyzerConfig c;
+                c.type = type;
+                c.enable_stop_words = stop;
+                c.enable_stemming = stem;
+                if (text::analyzer_fingerprint(c) == fp) return c;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
 std::expected<void, CaskFault> Cask::check_or_create_meta() {
     // P5b:int8-only 仅 kDot(int8 距离=重建内积);kL2 不支持,干净拒绝。
     if (opts_.vector_dim > 0 && opts_.vector_inmem_int8 &&
@@ -505,6 +536,26 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
                 "Rebuild the index, or use the original ICU version, if recall "
                 "consistency matters for your corpus.");
         }
+        // S55：按库里记的分词器打开（SearchLayerConfig::analyzer_from_meta /
+        // C BITCASK_ANALYZER_STORED）。必须在下面的指纹比对与插件创建之前。
+        if (mc->mode == meta::Mode::kIndex && opts_.search_config.has_value() &&
+            opts_.search_config->analyzer_from_meta) {
+            auto recorded = mc->analyzer;
+            if (!recorded && mc->analyzer_fp != 0) {
+                recorded = default_analyzer_matching(mc->analyzer_fp);
+            }
+            if (!recorded) {
+                return std::unexpected(err(CaskError::kInvalidOption,
+                    "analyzer_from_meta: this index does not record its analyzer "
+                    "configuration (built before libbitcask 9.2.0 with non-default "
+                    "settings, or bitcask.meta was rewritten by an older binary); "
+                    "open with explicit analyzer settings"));
+            }
+            auto& ac = opts_.search_config->analyzer_config;
+            std::string dict = std::move(ac.dict_path);
+            ac = std::move(*recorded);
+            ac.dict_path = std::move(dict);
+        }
         // C1：analyzer 配置指纹比对——与上面同一失败形态（新旧文档 term 集
         // 静默分叉），同样只告警不拒开。0 = 未记录；本次无 search_config
         // （不建文本插件、不分词）无从比对，跳过。
@@ -522,6 +573,17 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
                     "differently from existing documents and may not match "
                     "them. Reopen with the original analyzer settings, or "
                     "rebuild the index.");
+            } else if (!mc->analyzer && opts_.read_write && !opts_.merge_only) {
+                // S55：S55 之前建的库只有 C1 指纹。可写打开且配置与指纹相符 ⇒ 顺手补记 C2
+                // （此后只读方就能按记录打开）。失败只告警：补记是便利，不是开库条件。
+                meta::MetaConfig upd = meta_config_;
+                upd.analyzer = recorded_analyzer(opts_.search_config->analyzer_config);
+                if (auto wr = meta::write_meta(dirname_, upd); wr) {
+                    meta_config_ = std::move(upd);
+                } else {
+                    log_warn("recording analyzer configuration into bitcask.meta "
+                             "failed: " + wr.error().message);
+                }
             }
         }
         return {};
@@ -539,9 +601,11 @@ std::expected<void, CaskFault> Cask::check_or_create_meta() {
         mc.icu_major = text::detail::icu_major_version();
         mc.unicode_major = text::detail::unicode_major_version();
         // C1：有 search_config 才有分词，才记指纹（否则留 0 = 未记录）。
+        // S55：连同配置本身（C2）。
         if (opts_.search_config.has_value()) {
             mc.analyzer_fp =
                 text::analyzer_fingerprint(opts_.search_config->analyzer_config);
+            mc.analyzer = recorded_analyzer(opts_.search_config->analyzer_config);
         }
     }
     if (opts_.vector_dim > 0) {

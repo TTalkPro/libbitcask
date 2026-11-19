@@ -86,6 +86,9 @@ typedef enum {
                                       // 不同；不得当作 NotFound 或返回错值。
     BITCASK_ERR_CONDITION_FAILED = 17,  // S46：原子批前置条件不成立（整批零
                                         // 副作用；重读后重试）。不是故障。
+    BITCASK_ERR_UNSUPPORTED_FORMAT = 18,  // S55：仅 C 侧（bitcask_meta_read）——
+                                          // 纪元门禁拒开的旧格式 / 未知 meta 版本
+                                          // （detail 写明迁移还是重建）。
 } bitcask_error_t;
 
 // 错误详情（对应 bitcask::CaskFault）
@@ -109,6 +112,13 @@ typedef enum {
     BITCASK_ANALYZER_NGRAM     = 1,  // CJK n-gram + 拉丁空白切分
     BITCASK_ANALYZER_WHITESPACE = 2, // 纯空白切分
     BITCASK_ANALYZER_JIEBA     = 3,  // jieba 中文分词
+    /* S55：按库里记的分析器配置打开（bitcask.meta 的 C2 尾段；类型、n、停用词、token
+       长度、词干全取记录值，analyzer_min_n 等字段被忽略；jieba_dict_path 仍取选项——
+       路径机器相关、不入 meta，记录是 jieba 时照常要给有效词典）。给不知道建库配置的
+       只读查看 / 诊断工具用。库没记录（9.2.0 之前建）时：C1 指纹恰是某个缺省配置
+       （ngram / whitespace / jieba × 停用词 × 词干）就按它开，否则 INVALID_OPTION。
+       新建目录按 NGRAM 缺省建并记录。先用 bitcask_meta_read 看记录是什么。 */
+    BITCASK_ANALYZER_STORED    = 4,
 } bitcask_analyzer_type_t;
 
 // 向量距离度量（对应 bitcask::meta::VectorMetric）
@@ -426,6 +436,42 @@ BITCASK_API bitcask_error_t bitcask_open_ex2(const char* dirname,
                                               const bitcask_open_tuning_t* tuning,
                                               bitcask_t** out,
                                               bitcask_fault_t* fault);
+
+/* S55：不开库、不拿锁读 bitcask.meta——拿到陌生目录先看它是什么库、建库配置是什么，
+   再按记录打开（向量配置要与 meta 完全一致；分析器可直接用 BITCASK_ANALYZER_STORED）。
+   成功时 *out 指向 malloc 出的结构，用完调 bitcask_meta_info_free；失败时 *out = NULL。
+   错误：dirname 为 NULL ⇒ INVALID_OPTION；目录不存在 / 不是目录 / 没有 bitcask.meta ⇒
+   NOT_FOUND；meta 损坏（magic / 截断 / CRC / 字段非法）⇒ BAD_CRC；纪元门禁拒开的旧格式 ⇒
+   UNSUPPORTED_FORMAT（detail 写明迁移还是重建）；其余 ⇒ IO。detail 写明是哪一种。 */
+typedef struct {
+    uint8_t  meta_version;       /* 5 / 6（6 = 用过原子批） */
+    int      index_mode;         /* 0 = KV，1 = 检索库 */
+    bitcask_vector_metric_t vector_metric;   /* NONE = 无向量 */
+    uint16_t vector_dim;         /* 0 = 无向量 */
+    int      vector_quantized;
+    int      vector_inmem_int8;
+    bitcask_vector_engine_t vector_engine;
+    uint8_t  icu_major;          /* 建索引时的 ICU / Unicode 主版本；0 = 未记录 */
+    uint8_t  unicode_major;
+    uint32_t analyzer_fingerprint;  /* C1 指纹；0 = 未记录 */
+    /* 分析器配置（C2）。analyzer_recorded = 0 ⇒ 下面各字段无意义（9.2.0 之前建 / 被旧
+       二进制重写过 meta / KV 库）。 */
+    int      analyzer_recorded;
+    bitcask_analyzer_type_t analyzer_type;   /* NGRAM / WHITESPACE / JIEBA */
+    uint32_t analyzer_min_n;
+    uint32_t analyzer_max_n;
+    int      enable_stop_words;
+    const char* const* stop_words;   /* 自定义停用词表（NULL 结尾）；NULL = 内置表 */
+    uint32_t min_token_length;
+    uint32_t max_token_bytes;
+    int      enable_stemming;
+} bitcask_meta_info_t;
+
+BITCASK_API bitcask_error_t bitcask_meta_read(const char* dirname,
+                                               bitcask_meta_info_t** out,
+                                               bitcask_fault_t* fault);
+/* 释放 bitcask_meta_read 的产物（NULL 安全）。 */
+BITCASK_API void bitcask_meta_info_free(bitcask_meta_info_t* info);
 
 // 6.6.0：进程级线程数上限（下游 keel 转 coxswain 2026-09-22：C API 收不了
 // 线程数，enable_search 首次开库起 hardware_concurrency 条线程）。

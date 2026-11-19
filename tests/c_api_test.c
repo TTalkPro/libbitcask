@@ -39,6 +39,7 @@ static const char* const kAllTestDirs[] = {
     TDIR("batch"),
     TDIR("filter"),
     TDIR("hlcold"),
+    TDIR("metaread"),
     TDIR("fields"),
     TDIR("flush_after_iter"),
     TDIR("paging"),
@@ -2382,6 +2383,89 @@ static int test_highlight_load_cold(void) {
     return 0;
 }
 
+#define MR_CHECK(cond) do { if (!(cond)) { \
+    fprintf(stderr, "FAIL test_meta_read_and_stored_analyzer: line %d: %s\n", __LINE__, #cond); \
+    if (cask) bitcask_close(cask); if (info) bitcask_meta_info_free(info); return 1; } } while (0)
+
+/* S55：不开库读 meta（含分析器配置）+ BITCASK_ANALYZER_STORED 按记录打开 + ngram 冷读高亮
+ * （feedbacks/2026-11-19-analyzer-not-recorded-ngram-no-highlight.md）。 */
+static int test_meta_read_and_stored_analyzer(void) {
+    const char* dir = TDIR("metaread");
+    rmrf(dir);
+    bitcask_t* cask = NULL;
+    bitcask_meta_info_t* info = NULL;
+    bitcask_fault_t fault;
+
+    /* 错误分类：不存在 ⇒ NOT_FOUND；NULL ⇒ INVALID_OPTION。 */
+    MR_CHECK(bitcask_meta_read(dir, &info, &fault) == BITCASK_ERR_NOT_FOUND && info == NULL);
+    MR_CHECK(bitcask_meta_read(NULL, &info, &fault) == BITCASK_ERR_INVALID_OPTION);
+
+    /* whitespace + 自定义停用词建库。 */
+    static const char* const stops[] = {"the", "a", NULL};
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.enable_search = 1;
+    opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+    opts.enable_stop_words = 1;
+    opts.stop_words = stops;
+    MR_CHECK(bitcask_open(dir, &opts, &cask, &fault) == BITCASK_OK);
+    MR_CHECK(bitcask_put(cask, (bitcask_slice_t){"c1", 2},
+                         (bitcask_slice_t){"the cold fox text", 17}, 0, &fault) == BITCASK_OK);
+    for (int i = 0; i < 1500; i++) {
+        char k[32];
+        char v[48];
+        int kl = snprintf(k, sizeof(k), "zz%d", i);
+        int vl = snprintf(v, sizeof(v), "filler text number %d", i);
+        MR_CHECK(bitcask_put(cask, (bitcask_slice_t){k, (size_t)kl},
+                             (bitcask_slice_t){v, (size_t)vl}, 0, &fault) == BITCASK_OK);
+    }
+    bitcask_close(cask);
+    cask = NULL;
+
+    MR_CHECK(bitcask_meta_read(dir, &info, &fault) == BITCASK_OK && info != NULL);
+    MR_CHECK(info->index_mode == 1 && info->vector_dim == 0);
+    MR_CHECK(info->analyzer_fingerprint != 0 && info->analyzer_recorded == 1);
+    MR_CHECK(info->analyzer_type == BITCASK_ANALYZER_WHITESPACE);
+    MR_CHECK(info->enable_stop_words == 1 && info->stop_words != NULL);
+    MR_CHECK(strcmp(info->stop_words[0], "the") == 0 && strcmp(info->stop_words[1], "a") == 0 &&
+             info->stop_words[2] == NULL);
+    bitcask_meta_info_free(info);
+    info = NULL;
+
+    /* 只读、按记录打开：冷读高亮按 whitespace 切 ⇒ 有片段。 */
+    bitcask_options_t ro;
+    bitcask_options_init(&ro);
+    ro.enable_search = 1;
+    ro.analyzer_type = BITCASK_ANALYZER_STORED;
+    MR_CHECK(bitcask_open(dir, &ro, &cask, &fault) == BITCASK_OK);
+    bitcask_search_result_ex_t* r = NULL;
+    MR_CHECK(bitcask_search_text_highlight_ex(cask, "fox", 10, NULL, BITCASK_HIGHLIGHT_LOAD_COLD,
+                                              &r, &fault) == BITCASK_OK);
+    MR_CHECK(r != NULL && r->count == 1 && r->hits[0].highlights_count >= 1);
+    MR_CHECK(strstr(r->hits[0].highlights[0].text, "<em>fox</em>") != NULL);
+    bitcask_search_result_ex_free(r);
+    bitcask_close(cask);
+    cask = NULL;
+
+    /* meta 损坏 ⇒ BAD_CRC。 */
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/bitcask.meta", dir);
+        FILE* f = fopen(path, "r+b");
+        MR_CHECK(f != NULL);
+        fseek(f, 5, SEEK_SET);
+        fputc(7, f);  /* 模式字节改成非法值，头 CRC 随之不符 */
+        fclose(f);
+        MR_CHECK(bitcask_meta_read(dir, &info, &fault) == BITCASK_ERR_BAD_CRC && info == NULL);
+    }
+    bitcask_meta_info_free(NULL);  /* NULL 安全 */
+    rmrf(dir);
+    printf("PASS test_meta_read_and_stored_analyzer\n");
+    return 0;
+}
+#undef MR_CHECK
+
 int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
@@ -2409,6 +2493,7 @@ int main(void) {
     failures += test_doc_fields_and_meta();
     failures += test_paging_and_highlight();
     failures += test_highlight_load_cold();
+    failures += test_meta_read_and_stored_analyzer();
     failures += test_meta_filter_query();
     failures += test_merge_policy_files_checkpoint();
 

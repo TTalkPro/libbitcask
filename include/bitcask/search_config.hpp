@@ -24,6 +24,12 @@ namespace bitcask::search {
 // 搜索配置聚合（拆分产出 Text/Vector 两插件配置；类型名沿用 SearchLayerConfig）。
 struct SearchLayerConfig {
     text::AnalyzerConfig analyzer_config;
+    // S55：按库里记的分词器打开（bitcask.meta 的 C2 尾段）。true 时 Cask::open 用记录的配置
+    // 覆盖 analyzer_config（dict_path 除外：机器相关、不入 meta，仍取这里的值）。库没记录
+    // （S55 之前建的目录）时，若 C1 指纹恰好是某个缺省配置（ngram / whitespace / jieba × 停用词 ×
+    // 词干，其余字段取缺省）就按它开，否则 kInvalidOption。新建目录不受影响：按 analyzer_config 建并记录。
+    // 给只读查看 / 诊断工具用——它们不知道建库时的分词器，猜错了召回静默变化。
+    bool analyzer_from_meta = false;
     bm25::Bm25Params     bm25_params;
     std::size_t          cache_max_entries = 256;  // 缓存最大条目数，0 禁用
     // 高亮原文 LRU 上限（S9.3）：只缓存最近写入/查询的文档原文，避免全文常驻。

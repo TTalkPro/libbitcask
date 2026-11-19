@@ -6,7 +6,7 @@ C API 是 C++ `bitcask::Cask` 的薄 `extern "C"` 包装，编译产物：
 
 | 产物 | 说明 |
 |------|------|
-| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=9`，`VERSION=9.1.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 9.1.0)` 单一真源派生）|
+| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=10`，`VERSION=10.0.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 10.0.0)` 单一真源派生）|
 | `libbitcask.a` | 合并全部静态归档的单一 `.a`（定义 `BITCASK_STATIC_LIB` 去掉导出修饰）|
 
 符号导出由 `BITCASK_API` 宏控制（`bitcask_kv.h` §符号导出宏），Windows 下退化为 `__declspec(dllimport/dllexport)`，其它平台默认 `__attribute__((visibility("default")))`。
@@ -130,7 +130,7 @@ cl /DBITCASK_STATIC_LIB app.c /I<c_api 头目录> bitcask_static.lib   :: 静态
 
 ## 3. 版本信息
 
-版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 9.1.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
+版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 10.0.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
 
 ```c
 BITCASK_API int          bitcask_version_major(void);
@@ -140,7 +140,7 @@ BITCASK_API const char*  bitcask_version_string(void);   // "major.minor.patch"�
 ```
 
 - `bitcask_version_string()` 返回的是库内静态字符串（指向 `BITCASK_VERSION_STRING` 宏展开的字符串字面量），**不需要 free**。
-- 运行时返回值与 `libbitcask.so.9.1.0` 文件名完全对应；SOVERSION 是 `9`（大版本号），反映 ABI 兼容性。
+- 运行时返回值与 `libbitcask.so.10.0.0` 文件名完全对应；SOVERSION 是 `10`（大版本号），反映 ABI 兼容性。
 - 7.0.0 的 major bump 由 **C++ 公共头 ABI 变化**驱动（`StatusInfo` / `OkiState` /
   `OkiMergeCursor` 布局变化）。C API 函数签名与既有 C POD 布局保持零增删改；
   跨语言绑定仍需针对 `.so.7` 重新链接加载。
@@ -203,6 +203,7 @@ NIF host 语义一致。
 | `13` | `BITCASK_ERR_CLOSED`          | 对已 `bitcask_close` 的 handle 发起调用 |
 | `14` | `BITCASK_ERR_INDEX_REBUILD_FAILED` | OKI 试建而败——可写打开时重建失败（IO/环境问题，见日志）；修复后重开可重试 |
 | `15` | `BITCASK_ERR_BUSY`            | `bitcask_shutdown` 时运行时仍被占用（仍有库打开 / TBB 仍被其它线程引用），**不可卸载**；见 §8.3 |
+| `18` | `BITCASK_ERR_UNSUPPORTED_FORMAT` | S55，仅 C 侧：`bitcask_meta_read` 遇到纪元门禁拒开的旧格式 / 未知 meta 版本（detail 写明迁移还是重建）；见 §8.1e |
 
 > **快照过期**：迭代器快照过期时 `bitcask_iter_start` 返回 `BITCASK_ERR_INVALID_OPTION`（头文件中无独立的 `BITCASK_ERR_OUT_OF_DATE`），调用方应捕获并重试。
 
@@ -247,8 +248,16 @@ typedef enum {
     BITCASK_ANALYZER_NGRAM      = 1,  // CJK n-gram + 拉丁空白切分
     BITCASK_ANALYZER_WHITESPACE = 2,  // 纯空白切分
     BITCASK_ANALYZER_JIEBA      = 3,  // jieba 中文分词
+    BITCASK_ANALYZER_STORED     = 4,  // S55：按库里记的分析器配置打开
 } bitcask_analyzer_type_t;
 ```
+
+> **`BITCASK_ANALYZER_STORED`**（S55）：用 `bitcask.meta` 里记的分析器配置（类型、n、停用词、token 长度、词干）打开，
+> `analyzer_min_n` 等字段被忽略；`jieba_dict_path` 仍取选项（路径机器相关、不入 meta——记录是 jieba 时照常要给有效词典）。
+> 给不知道建库配置的只读查看 / 诊断工具。9.2.0 之前建的库没有记录：C1 指纹恰是某个缺省配置（ngram / whitespace /
+> jieba × 停用词 × 词干，其余字段缺省）就按它开，否则 `BITCASK_ERR_INVALID_OPTION`；这类库被**可写**打开一次
+> （配置与指纹相符）后就补上记录。新建目录按缺省 ngram 建。先用 `bitcask_meta_read`（§8.1e）看记录是什么。
+> 分析器与指纹不符仍只经 `log_fn` 告警、不拒开（C1 既定取舍）；要严格就先 `bitcask_meta_read` 自己比对。
 
 > `BITCASK_ANALYZER_NONE` 在 C 端语义为"不建索引"；若选项中同时设了 `enable_search = 1`，C++ 内部会把 `NONE` 映射为 `Ngram` 以让索引能跑（实现见 `c_api/internal.h::to_cpp_analyzer_type`）。若**确实**不想要索引，应让 `enable_search = 0`。
 
@@ -812,6 +821,36 @@ BITCASK_API bitcask_error_t bitcask_set_thread_limits(size_t index_workers,
   动态库，宿主自己的 TBB 并行也会被 `search_slots` 约束。
 - 不管的：纯 KV 恢复的临时线程、`prefetch_threads` / 并行扫描的 `n_threads` 这类
   **单次调用级**的线程（调用返回即回收，本来就由调用方给数）。
+
+### 8.1e `bitcask_meta_read`（S55：不开库读 meta）
+
+```c
+BITCASK_API bitcask_error_t bitcask_meta_read(const char* dirname,
+                                               bitcask_meta_info_t** out,
+                                               bitcask_fault_t* fault);
+BITCASK_API void bitcask_meta_info_free(bitcask_meta_info_t* info);   /* NULL 安全 */
+```
+
+不开库、不拿锁读 `bitcask.meta`：拿到陌生目录先看它是什么库、建库配置是什么，再按记录打开（向量配置必须与 meta
+完全一致；分析器可直接用 `BITCASK_ANALYZER_STORED`）。成功时 `*out` 指向 malloc 出的结构（用完 `bitcask_meta_info_free`）。
+
+| 字段 | 含义 |
+|---|---|
+| `meta_version` | 5 / 6（6 = 用过原子批）|
+| `index_mode` | 0 = KV，1 = 检索库 |
+| `vector_metric` / `vector_dim` / `vector_quantized` / `vector_inmem_int8` / `vector_engine` | 建库时的向量配置（`dim = 0` = 无向量）|
+| `icu_major` / `unicode_major` | 建索引时的 ICU / Unicode 主版本（0 = 未记录）|
+| `analyzer_fingerprint` | C1 指纹（0 = 未记录）|
+| `analyzer_recorded` | 1 = 下面的分析器配置有效（C2）；0 = 9.2.0 之前建 / 被旧二进制重写过 meta / KV |
+| `analyzer_type` / `analyzer_min_n` / `analyzer_max_n` / `enable_stop_words` / `stop_words` / `min_token_length` / `max_token_bytes` / `enable_stemming` | 建库时的分析器配置；`stop_words` 是 NULL 结尾的自定义表，`NULL` = 内置表 |
+
+| 返回 | 情形 |
+|---|---|
+| `BITCASK_ERR_INVALID_OPTION` | `dirname` / `out` 为 NULL |
+| `BITCASK_ERR_NOT_FOUND` | 目录不存在 / 不是目录 / 没有 `bitcask.meta` |
+| `BITCASK_ERR_BAD_CRC` | meta 损坏（magic、截断、CRC、字段取值非法）|
+| `BITCASK_ERR_UNSUPPORTED_FORMAT` | 纪元门禁拒开的旧格式（v1～v4）/ 未知版本；detail 写明迁移还是重建 |
+| `BITCASK_ERR_IO` | 其余读失败（`errnum` 有效）|
 
 ### 8.2 `bitcask_close`
 

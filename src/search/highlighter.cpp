@@ -119,25 +119,41 @@ HighlightResult highlight(
             continue;
         }
 
+        // S55：片段内的命中区间先按位置排序、合并重叠 / 相接的，再插标签。原实现按
+        // unordered_map 的遍历序逐词处理、只收 start >= pos 的出现 ⇒ 多个查询词时位置在前、
+        // 遍历在后的词标不出；ngram 的 token 互相重叠（「着色」「色器」「着色器」）只标出一段残片。
+        std::vector<OffsetRange> marks;
+        for (auto& [term, infos] : query_token_offsets) {
+            (void)term;
+            for (auto& info : infos) {
+                if (info.end_byte > info.start_byte && info.start_byte >= frag_start &&
+                    info.end_byte <= frag_end) {
+                    marks.push_back({info.start_byte, info.end_byte});
+                }
+            }
+        }
+        std::sort(marks.begin(), marks.end(), [](const auto& a, const auto& b) {
+            return a.start != b.start ? a.start < b.start : a.end > b.end;
+        });
+        std::vector<OffsetRange> merged;
+        for (const auto& m : marks) {
+            if (!merged.empty() && m.start <= merged.back().end) {
+                merged.back().end = std::max(merged.back().end, m.end);
+            } else {
+                merged.push_back(m);
+            }
+        }
+
         std::string highlighted;
         highlighted.reserve(frag_end - frag_start + 64);
 
         std::size_t pos = frag_start;
-        for (auto& [term, infos] : query_token_offsets) {
-            (void)term;
-            for (auto& info : infos) {
-                if (info.start_byte < frag_start || info.end_byte > frag_end) {
-                    continue;
-                }
-                if (info.start_byte >= pos) {
-                    highlighted.append(text.data() + pos, info.start_byte - pos);
-                    highlighted.append(opts.pre_tag);
-                    highlighted.append(text.data() + info.start_byte,
-                                      info.end_byte - info.start_byte);
-                    highlighted.append(opts.post_tag);
-                    pos = info.end_byte;
-                }
-            }
+        for (const auto& m : merged) {
+            highlighted.append(text.data() + pos, m.start - pos);
+            highlighted.append(opts.pre_tag);
+            highlighted.append(text.data() + m.start, m.end - m.start);
+            highlighted.append(opts.post_tag);
+            pos = m.end;
         }
 
         if (pos < frag_end) {

@@ -184,6 +184,7 @@ inline text::AnalyzerType to_cpp_analyzer_type(bitcask_analyzer_type_t t) {
         case BITCASK_ANALYZER_NGRAM:     return text::AnalyzerType::Ngram;
         case BITCASK_ANALYZER_WHITESPACE: return text::AnalyzerType::Whitespace;
         case BITCASK_ANALYZER_JIEBA:     return text::AnalyzerType::Jieba;
+        case BITCASK_ANALYZER_STORED:    return text::AnalyzerType::Ngram;  // S55：开库时被记录覆盖
     }
     return text::AnalyzerType::Ngram;
 }

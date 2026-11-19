@@ -5,13 +5,62 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`9.1.0`**；库 `SOVERSION` = **`9`**（= major）；
+`bitcask_version_*` = **`10.0.0`**；库 `SOVERSION` = **`10`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 / 7.0.0 / 8.0.0 / 9.0.0 皆是）。
+
+---
+
+## [10.0.0] - 2026-11-19（S55：分词器配置进 meta、按记录打开、ngram 高亮）
+
+> **版本语义（2026-11-19 定版）**：⚠️ **C++ ABI 破坏**——已安装公共头 `include/bitcask/meta_file.hpp` 的
+> `meta::MetaConfig`（加 `analyzer`）与 `meta::MetaError`（加 `kind`）、`include/bitcask/search_config.hpp` 的
+> `search::SearchLayerConfig`（加 `analyzer_from_meta`，经 `CaskOptions::search_config` 进开库选项）三个结构体
+> **加了成员 = 布局变更 = ABI 破坏**，按 [7.0.0] / [6.0.0] 先例取 MAJOR +1 → **`10.0.0`**，`SOVERSION` → **`10`**
+> （`.so.10`），**C++ 下游须重新编译链接**。
+> C API 侧全是**纯新增**（枚举值 `BITCASK_ANALYZER_STORED`、错误码 `BITCASK_ERR_UNSUPPORTED_FORMAT`、
+> 结构体 `bitcask_meta_info_t`、函数 `bitcask_meta_read` / `bitcask_meta_info_free`），既有 C 结构体布局与函数签名零改动
+> ⇒ C ABI 兼容，旧 C 二进制可直接换新库。
+> 盘上格式：`bitcask.meta` 追加可选 **C2 尾段**（版本仍 v5/v6；C1 读端只读前 27 字节，对其透明）。
+
+### Fixed
+
+- **ngram 分词的库高亮片段恒空**（S55，下游反馈 `feedbacks/2026-11-19-analyzer-not-recorded-ngram-no-highlight.md`，
+  keelson 转 bitcask-viewer）：`NgramAnalyzer::analyze_with_offsets` 从 positions 派生、每个 token 记 `{pos, 0, 0}`
+  ⇒ 高亮器丢掉全部区间 ⇒ 缺省分词器（ngram）的库热 / 冷都没有片段，且不报错。现给真实字节偏移（归一化文本坐标，同
+  whitespace / jieba），与 positions / tf 两版共用 `ngram_collect` + `materialize_and_filter`（term 集与停用词过滤逐位一致）。
+- **高亮器漏标多词与重叠 token**（S55）：`highlight` 按 `unordered_map` 遍历序逐词插标签、只收 `start >= pos` 的出现
+  ⇒ 位置在前、遍历在后的查询词标不出；ngram 的重叠 token（「着色」「色器」「着色器」）只标出残片。现在片段内先按位置排序、
+  合并重叠 / 相接区间再插标签（「quick … fox」两词都标，「着色器」标成一整段）。
+
+### Added
+
+- **`bitcask.meta` 记录分析器配置本身**（S55，C2 尾段）：类型、n、停用词开关与自定义表、token 长度上下限、词干——
+  即 C1 指纹覆盖的全部字段；`dict_path` 不记（机器相关路径）。自带 CRC，读端再用 C1 指纹自校验，任一不过当未记录；
+  只在 C1 存在时写。建库、KV→检索库升级时记录；**S55 之前的库**可写打开且配置与 C1 指纹相符时顺手补记。
+  C++：`meta::MetaConfig::analyzer`（`std::optional<text::AnalyzerConfig>`）。
+- **按库里记的分析器打开**：C `analyzer_type = BITCASK_ANALYZER_STORED` / C++ `SearchLayerConfig::analyzer_from_meta`
+  ——给不知道建库配置的只读查看 / 诊断工具。`jieba_dict_path` 仍取选项。没有 C2 的旧库：C1 指纹恰是某个缺省配置
+  （ngram / whitespace / jieba × 停用词 × 词干）就按它开，否则 `INVALID_OPTION`。新建目录按缺省 ngram 建并记录。
+  （修带的一处：`Cask::open` 建搜索插件改用开库后改写过的选项，否则按记录覆盖的分析器到不了插件。）
+- **`bitcask_meta_read` / `bitcask_meta_info_free`**：不开库、不拿锁读 meta（模式、向量配置、ICU / Unicode 版本、
+  C1 指纹、C2 分析器配置）。失败分类：`NOT_FOUND`（目录不存在 / 不是目录 / 没有 `bitcask.meta`）、`BAD_CRC`（损坏）、
+  新增 **`BITCASK_ERR_UNSUPPORTED_FORMAT` = 18**（纪元门禁拒开的旧格式，detail 写明迁移还是重建；仅 C 侧）、`IO`。
+  C++：`meta::MetaError::kind`（`kIo` / `kCorrupt` / `kUnsupported`）。
+- 回归：`AnalyzerRecordTest.*`（C2 往返 / 坏 C2 不影响 C1 / 与指纹不符不写 / 按记录打开 / 保留选项的词典路径 /
+  旧库认缺省 / 旧库非缺省拒开 / 可写补记 / 不符不补记 / ngram 热冷读高亮）、`NgramOffsets.*`、`HighlighterOrder.*`、
+  C `test_meta_read_and_stored_analyzer`。
+
+### 已知
+
+- **`HighlightColdTest`（S53）在高并发下偶发失败**：用例靠「写 1500 篇填充让目标落进封好的段 ⇒ 重开即冷」，
+  高负载下重开仍从数据重放、把原文填回 LRU ⇒ 前提不成立。改动前的 9.1.0 基线同样如此（16 路并发 64 次：
+  基线 29 / 32 次失败，S55 后 21 / 36 次）；串行跑稳定通过。S55 自己的冷路径用例改用 `doc_text_cache_max = 0`
+  保证必冷（64 次 0 失败）。S53 用例未改。
 
 ---
 
@@ -2345,7 +2394,8 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/9.1.0...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/10.0.0...HEAD
+[10.0.0]: https://github.com/davidalphafox/libbitcask/compare/9.1.0...10.0.0
 [9.1.0]: https://github.com/davidalphafox/libbitcask/compare/9.0.0...9.1.0
 [9.0.0]: https://github.com/davidalphafox/libbitcask/compare/8.1.0...9.0.0
 [8.1.0]: https://github.com/davidalphafox/libbitcask/compare/8.0.2...8.1.0

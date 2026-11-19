@@ -15,6 +15,8 @@
 //   [14..17] CRC32        uint32 LE（v3 起，覆盖 [0,14)）
 //   [18..26] 可选尾段（C1）：TailVersion u8=1 + AnalyzerFp u32 + CRC32(覆盖尾段前 5B)；
 //            旧读端只读前 18 字节，对其透明（布局详见 meta_file.cpp）
+//   [27..]   可选尾段（C2，S55）：分析器配置本身（变长，自带 CRC，读端用 C1 指纹自校验）；
+//            只在 C1 尾段存在时出现；C1 读端只读前 27 字节，对其透明
 //
 // === 线程模型 ===
 // 所有函数均为纯函数：线程安全、可重入、无锁。
@@ -22,9 +24,12 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <expected>
+
+#include "bitcask/analyzer.hpp"  // S55：MetaConfig::analyzer
 
 namespace bitcask::meta {
 
@@ -92,6 +97,15 @@ struct MetaConfig {
     // 显式填写，其余 write_meta 路径原样透传读回的值。
     std::uint32_t analyzer_fp = 0;
 
+    // === S55：建索引时的 analyzer 配置本身（C2 尾段）===
+    // 只有指纹，打开方无从得知建库用的分词器（只读查看工具只能按缺省开、猜错了召回静默
+    // 变化）。记下 analyzer_fingerprint 覆盖的全部字段；**dict_path 不记**（机器相关的路径，
+    // 打开时仍取选项），读回恒空。nullopt = 未记录（S55 之前建的目录 / KV / 被旧二进制重写
+    // meta 丢了尾段 / C2 损坏 / 与 analyzer_fp 自校验不符）。只与 analyzer_fp 同时写：
+    // write_meta 在 analyzer_fp == 0 时不写 C2。纪律同 analyzer_fp（只在建索引时显式填写，
+    // 其余路径原样透传）。
+    std::optional<text::AnalyzerConfig> analyzer;
+
     // S35：盘上纪元。5 = 无原子批（保守纪元标记）；6 = 目录可能含
     // kBatchHeader 记录（首次 put_batch_atomic 前懒升级，见
     // doc/atomic-batch-design-zh.md §2）。read_meta 回填实际值；write_meta
@@ -101,8 +115,15 @@ struct MetaConfig {
 
 // meta 文件操作错误
 struct MetaError {
+    // S55：失败分类（C 入口 bitcask_meta_read 按它映射错误码）。
+    enum class Kind : std::uint8_t {
+        kIo,           // 打不开 / 读不全以外的 I/O 失败（含文件不存在：见 meta_exists）
+        kCorrupt,      // magic 不对、截断、CRC 不符、字段取值非法
+        kUnsupported,  // 纪元门禁：v1～v4 等干净拒开的旧格式 / 未知版本
+    };
     int errnum = 0;
     std::string message;
+    Kind kind = Kind::kIo;
 };
 
 // 检查 meta 文件是否存在

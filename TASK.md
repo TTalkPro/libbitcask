@@ -10,6 +10,51 @@
 
 ---
 
+## 🔴 S55 · 分词器配置进 meta、按记录打开、ngram 高亮偏移（2026-11-19 立项）
+
+> 来源：下游反馈
+> [`feedbacks/2026-11-19-analyzer-not-recorded-ngram-no-highlight.md`](feedbacks/2026-11-19-analyzer-not-recorded-ngram-no-highlight.md)
+> （keelson 转 bitcask-viewer）：① meta 只记分析器指纹，打开方无从得知建库分词器，只读查看工具只能按缺省 ngram 开；
+> ② ngram 的 `analyze_with_offsets` 偏移恒 0 ⇒ 高亮片段恒空（热冷都是）；高亮器按 `unordered_map` 序插标签，
+> 位置在前、遍历在后的词与重叠 token 标不出；③ 指纹不符只告警（C1 既定取舍，不改）。
+>
+> **方案**：
+> - meta 在 C1 尾段后追加 **C2 尾段**（分析器配置本身，自带 CRC；读端用 C1 指纹自校验，不符当未记录）。旧读端只读前
+>   18 / 27 字节，对其透明；被旧二进制重写会丢尾段 ⇒ 退化为未记录（同 C1）。
+> - `SearchLayerConfig::analyzer_from_meta` / C `BITCASK_ANALYZER_STORED`：按库里记的配置打开（`dict_path` 仍取选项：
+>   机器相关、不入 meta）。库没记录 ⇒ `kInvalidOption` 并说明；可写打开、配置指纹与 C1 相符的旧库顺手补记 C2。
+> - C `bitcask_meta_read` / `bitcask_meta_info_free`：不开库、不拿锁读 meta（含分析器配置）；失败分 NOT_FOUND /
+>   BAD_CRC（损坏）/ `BITCASK_ERR_UNSUPPORTED_FORMAT`（新增 18，纪元拒开）/ IO。
+> - ngram 给真实字节偏移（归一化文本坐标，同 whitespace / jieba）；高亮器在片段内按位置排序、合并重叠区间再插标签。
+>
+> 约束：⛔ 改既有结构体布局 / 函数签名（C：新枚举值 + 新错误码 + 新函数 + 新结构体；C++：`MetaConfig` / `MetaError` /
+> `SearchLayerConfig` 加成员）；⛔ 改定长头与 C1 尾段布局。
+
+| 项 | 状态 |
+|---|---|
+| S55-1 meta C2 尾段：`MetaConfig::analyzer`（`std::optional<text::AnalyzerConfig>`，不含 `dict_path`）读 / 写 / 指纹自校验；建库与 KV→索引升级时记录 | ✅ |
+| S55-2 `SearchLayerConfig::analyzer_from_meta` + C `BITCASK_ANALYZER_STORED`；未记录 ⇒ `kInvalidOption`；可写开、指纹相符的旧库补记 C2 | ✅ |
+| S55-3 C `bitcask_meta_read` / `bitcask_meta_info_free` + `MetaError::kind` + `BITCASK_ERR_UNSUPPORTED_FORMAT` | ✅ |
+| S55-4 `NgramAnalyzer::analyze_with_offsets` 真实偏移（`ngram_collect` 的 sink 带字节范围，三条路径共用） | ✅ |
+| S55-5 高亮器：片段内区间排序 + 合并重叠后插标签 | ✅ |
+| S55-6 回归：meta C2 往返 / 指纹自校验 / 旧 meta 透明；按记录打开（whitespace / jieba / 未记录拒开 / 补记）；ngram 偏移对拍；多词乱序与重叠高亮；ngram 冷读高亮；C `test_meta_read_and_stored_analyzer` | ✅ |
+| S55-7 `doc/api-c.md`、`doc/api-cpp.md`、CHANGELOG `[Unreleased]`、反馈回填 | ✅ |
+
+**落地记录**（已提交，10.0.0）：
+- 开发中多修一处：`Cask::open` 建搜索插件原用入参 `opts`，按记录覆盖的分析器到不了插件（`options()` 看着对、实际仍按选项切词）
+  ⇒ 改传 `cask->opts_`。端到端用例 `NgramLibraryHighlightsHotAndColdLoad` 抓到的。
+- 验证：GCC Release（`-Werror`）全量 ctest **928**（+15 新增）两轮：一轮全绿；一轮只挂 S53 的
+  `HighlightColdTest.ColdSnippetsMatchHotOnes`——**既有偶发**：16 路并发 + CPU 负载下跑 64 次，改动前的 9.1.0 基线
+  （`git archive HEAD` 单独编）失败 29 / 32 次，S55 后 21 / 36 次；串行稳定通过。病因是用例前提「写 1500 篇填充 ⇒ 重开即冷」
+  在高负载下不成立（重开仍从数据重放、填回原文 LRU；关库前显式 checkpoint 也不够）。S55 的冷路径用例改用
+  `doc_text_cache_max = 0` 保证必冷（同压力 64 次 0 失败）；S53 用例未改，待定。
+  ASan / Clang Debug：`AnalyzerRecord|NgramOffsets|HighlighterOrder|MetaAnalyzerFp` 23/23、分析器 / 高亮 / 文本插件 / C API
+  相关 120/120 全绿，C `test_meta_read_and_stored_analyzer` 通过。Windows 未实测。
+- 版本（2026-11-19 定版）：C++ 三个公共结构体加成员（`MetaConfig` / `MetaError` / `SearchLayerConfig`）= 布局变更 = ABI 破坏
+  ⇒ MAJOR +1，取 **10.0.0**，`SOVERSION` → **10**（C++ 下游须重新编译链接）；C API 侧纯新增，C ABI 兼容。
+
+---
+
 ## 🔴 S54 · `bitcask_range_iter_start` 的 NO_INDEX 说明勘误（2026-11-19 立项）
 
 > 来源：下游反馈

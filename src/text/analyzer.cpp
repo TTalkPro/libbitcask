@@ -230,7 +230,8 @@ void ngram_tokenize(const std::vector<detail::CpInfo>& cps,
 // 与 BOW 查询路径（tf 版）的一致性前提，却全靠复制粘贴维护。此处把断言
 // 变成结构保证（对拍测试见 analyzer_test 的 NgramTfMatchesPositions*）。
 //
-// sink(term, pos) 按值收 pos：tf 版直接忽略形参 → 零 positions 分配，
+// sink(term, pos, start_byte, end_byte) 按值收 pos 与字节范围（S55：偏移版要；
+// 字节范围是 normalized 坐标，同 whitespace / jieba）：tf 版直接忽略形参 → 零 positions 分配，
 // S29-8 的性能取舍（一篇 CJK 文档数千唯一 n-gram，每个一次 vector 堆分配）
 // 完整保留。故此处不采用 Jieba collect_tokens 的物化 token 向量方案。
 template <class Sink>
@@ -247,10 +248,11 @@ void ngram_collect(const std::vector<detail::CpInfo>& cps,
             for (std::size_t j = start; j + gram <= end; ++j) {
                 const auto& first_cp = cps[j];
                 const auto& last_cp = cps[j + gram - 1];
-                std::string_view term(
-                    normalized.data() + first_cp.byte_off,
-                    (last_cp.byte_off + last_cp.byte_len) - first_cp.byte_off);
-                sink(term, pos);
+                const std::size_t start_byte = first_cp.byte_off;
+                const std::size_t end_byte = last_cp.byte_off + last_cp.byte_len;
+                std::string_view term(normalized.data() + start_byte,
+                                      end_byte - start_byte);
+                sink(term, pos, start_byte, end_byte);
             }
         }
         ++pos;
@@ -265,10 +267,11 @@ void ngram_collect(const std::vector<detail::CpInfo>& cps,
                  max_token_bytes)) {  // S31:超长 token 丢弃(pos 语义不变)
             const auto& first = cps[start];
             const auto& last = cps[end - 1];
-            std::string_view term(
-                normalized.data() + first.byte_off,
-                (last.byte_off + last.byte_len) - first.byte_off);
-            if (!term.empty()) sink(term, pos);
+            const std::size_t start_byte = first.byte_off;
+            const std::size_t end_byte = last.byte_off + last.byte_len;
+            std::string_view term(normalized.data() + start_byte,
+                                  end_byte - start_byte);
+            if (!term.empty()) sink(term, pos, start_byte, end_byte);
         }
         ++pos;
     };
@@ -378,7 +381,8 @@ auto NgramAnalyzer::analyze_with_positions(std::string_view text) const -> TermP
         vpm;
     ngram_collect(cps, normalized, min_n_, max_n_, min_token_length_,
                   max_token_bytes_,
-                  [&](std::string_view term, std::uint32_t pos) {
+                  [&](std::string_view term, std::uint32_t pos, std::size_t,
+                      std::size_t) {
                       auto& [tf, positions] = vpm[term];
                       ++tf;
                       positions.push_back(pos);
@@ -404,7 +408,8 @@ auto NgramAnalyzer::analyze(std::string_view text) const -> TermFreqMap {
     std::unordered_map<std::string_view, std::uint32_t> vfm;
     ngram_collect(cps, normalized, min_n_, max_n_, min_token_length_,
                   max_token_bytes_,
-                  [&](std::string_view term, std::uint32_t) { ++vfm[term]; });
+                  [&](std::string_view term, std::uint32_t, std::size_t,
+                      std::size_t) { ++vfm[term]; });
     return materialize_and_filter<TermFreqMap>(vfm, enable_stop_words_,
                                                stop_words_);
 }
@@ -455,18 +460,28 @@ auto WhitespaceAnalyzer::analyze_with_offsets(std::string_view text) const -> Te
 // NgramAnalyzer
 // ===========================================================================
 
+// S55：真实字节偏移（normalized 坐标——调用方 TextPlugin::snippets_for 在归一化文本上切片，
+// 同 whitespace / jieba）。原实现从 positions 派生、偏移恒 {0, 0} ⇒ 高亮器丢掉全部区间，ngram
+// 库（缺省分词器）的高亮片段恒空。与 positions / tf 两版共用 ngram_collect + materialize_and_filter
+// ⇒ term 集逐位一致（过滤、停用词同一份）。
 auto NgramAnalyzer::analyze_with_offsets(std::string_view text) const -> TermTokenMap {
-    auto tpm = analyze_with_positions(text);
-    TermTokenMap ttm;
-    ttm.reserve(tpm.size());
-    for (auto& [term, data] : tpm) {
-        auto& infos = ttm[term];
-        infos.reserve(data.second.size());
-        for (auto p : data.second) {
-            infos.push_back(TokenInfo{p, 0, 0});
-        }
-    }
-    return ttm;
+    if (text.empty()) return {};
+
+    std::string normalized;
+    const auto& cps = detail::nfkc_fold_codepoints_reuse(text, normalized);
+    if (cps.empty()) return {};
+
+    std::unordered_map<std::string_view, std::vector<TokenInfo>> vtm;
+    ngram_collect(cps, normalized, min_n_, max_n_, min_token_length_,
+                  max_token_bytes_,
+                  [&](std::string_view term, std::uint32_t pos,
+                      std::size_t start_byte, std::size_t end_byte) {
+                      vtm[term].push_back(TokenInfo{
+                          pos, static_cast<std::uint32_t>(start_byte),
+                          static_cast<std::uint32_t>(end_byte)});
+                  });
+    return materialize_and_filter<TermTokenMap>(vtm, enable_stop_words_,
+                                                stop_words_);
 }
 
 }  // namespace bitcask::text

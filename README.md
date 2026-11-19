@@ -429,11 +429,11 @@ cmake --build build -j --target bitcask_static bitcask_shared
 | `BITCASK_LTO` | ON | Release 启用 LTO / IPO；sanitizer 构建自动关闭 |
 | `BITCASK_PCH` | ON | 预编译头加速编译；排查 PCH 异常可临时关闭 |
 
-版本信息由 `CMakeLists.txt` 的 `project(libbitcask VERSION 9.1.0)` 单一真源派生：`libbitcask.so` 的 `SOVERSION=9`，`VERSION=9.1.0`，C 端 `bitcask_version_{major,minor,patch,string}()` 同步。
+版本信息由 `CMakeLists.txt` 的 `project(libbitcask VERSION 10.0.0)` 单一真源派生：`libbitcask.so` 的 `SOVERSION=10`，`VERSION=10.0.0`，C 端 `bitcask_version_{major,minor,patch,string}()` 同步。
 
 ### 产物
 
-- `libbitcask.so` — 共享库，导出 C API（`extern "C"`，`SOVERSION=9`）；Windows 为 `bitcask.dll` + `bitcask.lib`（导入库）
+- `libbitcask.so` — 共享库，导出 C API（`extern "C"`，`SOVERSION=10`）；Windows 为 `bitcask.dll` + `bitcask.lib`（导入库）
 - `libbitcask.a` — 把全部静态归档合并为单一 `.a`；Windows 为 `bitcask_static.lib`（换名避免与导入库撞名）
 - `bitcask_migrate` — 统一纪元迁移入口：`detect` / `be2le`（v1 大端 → 当前）/ `tstamp64`（u32 → u64，5.0 flag-day）/ `hintord`（hint 补 ord，5.1 flag-day）
 - `migrate_le` — v1 大端 → 当前纪元（旧入口，等价于 `bitcask_migrate be2le`）

@@ -7,8 +7,14 @@
 
 #include <cstddef>  // offsetof
 #include <cstdint>  // SIZE_MAX
+#include <cstdlib>  // S55：malloc / free（bitcask_meta_info_t）
+#include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <new>      // std::nothrow
+
+#include "bitcask/detail/path_utf8.hpp"  // S55：bitcask_meta_read
+#include "bitcask/meta_file.hpp"
 
 #include <oneapi/tbb/global_control.h>  // 6.7.0：task_scheduler_handle / finalize
 
@@ -105,6 +111,104 @@ BITCASK_API bitcask_error_t bitcask_set_thread_limits(size_t index_workers,
                  cur.index_workers, cur.search_slots);
     }
     return BITCASK_ERR_INVALID_OPTION;
+    });
+}
+
+// S55：不开库读 meta。
+BITCASK_API void bitcask_meta_info_free(bitcask_meta_info_t* info) {
+    if (!info) return;
+    if (info->stop_words) {
+        for (const char* const* p = info->stop_words; *p; ++p) {
+            std::free(const_cast<char*>(*p));
+        }
+        std::free(const_cast<const char**>(info->stop_words));
+    }
+    std::free(info);
+}
+
+BITCASK_API bitcask_error_t bitcask_meta_read(const char* dirname,
+                                               bitcask_meta_info_t** out,
+                                               bitcask_fault_t* fault) {
+    if (out) *out = nullptr;
+    return guarded(fault, [&]() -> bitcask_error_t {
+        auto fail = [&](bitcask_error_t code, int errnum, const std::string& detail) {
+            if (fault) {
+                fault->code = code;
+                fault->errnum = errnum;
+                snprintf(fault->detail, BITCASK_DETAIL_MAX, "%s", detail.c_str());
+            }
+            return code;
+        };
+        if (!dirname || !out) {
+            return fail(BITCASK_ERR_INVALID_OPTION, 0, "bitcask_meta_read: dirname / out is NULL");
+        }
+        std::error_code ec;
+        const auto dir = bitcask::detail::from_utf8(dirname);
+        if (!std::filesystem::exists(dir, ec)) {
+            return fail(BITCASK_ERR_NOT_FOUND, 0, std::string("directory does not exist: ") + dirname);
+        }
+        if (!std::filesystem::is_directory(dir, ec)) {
+            return fail(BITCASK_ERR_NOT_FOUND, 0, std::string("not a directory: ") + dirname);
+        }
+        if (!meta::meta_exists(dirname)) {
+            return fail(BITCASK_ERR_NOT_FOUND, 0,
+                        std::string("not a bitcask directory (no bitcask.meta): ") + dirname);
+        }
+        auto mc = meta::read_meta(dirname);
+        if (!mc) {
+            const auto& e = mc.error();
+            switch (e.kind) {
+                case meta::MetaError::Kind::kCorrupt:
+                    return fail(BITCASK_ERR_BAD_CRC, e.errnum, "bitcask.meta corrupt: " + e.message);
+                case meta::MetaError::Kind::kUnsupported:
+                    return fail(BITCASK_ERR_UNSUPPORTED_FORMAT, e.errnum, e.message);
+                case meta::MetaError::Kind::kIo:
+                    break;
+            }
+            return fail(BITCASK_ERR_IO, e.errnum, "read bitcask.meta: " + e.message);
+        }
+        auto* info = static_cast<bitcask_meta_info_t*>(std::calloc(1, sizeof(bitcask_meta_info_t)));
+        if (!info) { set_oom_fault(fault); return BITCASK_ERR_IO; }
+        info->meta_version = mc->version;
+        info->index_mode = mc->mode == meta::Mode::kIndex ? 1 : 0;
+        info->vector_metric = static_cast<bitcask_vector_metric_t>(mc->vector_metric);
+        info->vector_dim = mc->vector_dim;
+        info->vector_quantized = mc->vector_quantized ? 1 : 0;
+        info->vector_inmem_int8 = mc->vector_inmem_int8 ? 1 : 0;
+        info->vector_engine = static_cast<bitcask_vector_engine_t>(mc->vector_engine);
+        info->icu_major = mc->icu_major;
+        info->unicode_major = mc->unicode_major;
+        info->analyzer_fingerprint = mc->analyzer_fp;
+        if (mc->analyzer) {
+            const auto& a = *mc->analyzer;
+            info->analyzer_recorded = 1;
+            switch (a.type) {
+                case text::AnalyzerType::Ngram:      info->analyzer_type = BITCASK_ANALYZER_NGRAM; break;
+                case text::AnalyzerType::Whitespace: info->analyzer_type = BITCASK_ANALYZER_WHITESPACE; break;
+                case text::AnalyzerType::Jieba:      info->analyzer_type = BITCASK_ANALYZER_JIEBA; break;
+            }
+            info->analyzer_min_n = a.min_n;
+            info->analyzer_max_n = a.max_n;
+            info->enable_stop_words = a.enable_stop_words ? 1 : 0;
+            info->min_token_length = a.min_token_length;
+            info->max_token_bytes = a.max_token_bytes;
+            info->enable_stemming = a.enable_stemming ? 1 : 0;
+            if (!a.stop_words.empty()) {
+                auto** words = static_cast<char**>(std::calloc(a.stop_words.size() + 1, sizeof(char*)));
+                if (!words) { bitcask_meta_info_free(info); set_oom_fault(fault); return BITCASK_ERR_IO; }
+                info->stop_words = words;   // 先挂上：中途失败由 free 统一回收（NULL 结尾）
+                for (std::size_t i = 0; i < a.stop_words.size(); ++i) {
+                    const auto& w = a.stop_words[i];
+                    auto* c = static_cast<char*>(std::malloc(w.size() + 1));
+                    if (!c) { bitcask_meta_info_free(info); set_oom_fault(fault); return BITCASK_ERR_IO; }
+                    std::memcpy(c, w.data(), w.size());
+                    c[w.size()] = '\0';
+                    words[i] = c;
+                }
+            }
+        }
+        *out = info;
+        return BITCASK_OK;
     });
 }
 
@@ -220,6 +324,8 @@ BITCASK_API bitcask_error_t bitcask_open_ex2(const char* dirname,
             search_cfg.analyzer_config.enable_stop_words = opts->enable_stop_words != 0;
             search_cfg.analyzer_config.min_token_length = opts->min_token_length;
             search_cfg.analyzer_config.enable_stemming = opts->enable_stemming != 0;
+            // S55：按库里记的分析器开（上面几项由 Cask::open 用记录覆盖）。
+            search_cfg.analyzer_from_meta = opts->analyzer_type == BITCASK_ANALYZER_STORED;
             search_cfg.hnsw_m = opts->hnsw_m;                              // S13-D11
             search_cfg.hnsw_ef_construction = opts->hnsw_ef_construction;  // S13-D11
             search_cfg.hnsw_build_nav_int8 = opts->hnsw_build_nav_int8 != 0;  // S29-11-②
