@@ -221,6 +221,17 @@ target_link_libraries(bitcask_analyzer_record_test PRIVATE
     bitcask_sanitizers
 )
 
+# S57：jieba 缺词典不 abort + needs_merge 用实时账本
+add_executable(bitcask_s57_feedback_test s57_feedback_test.cpp)
+target_link_libraries(bitcask_s57_feedback_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+target_compile_definitions(bitcask_s57_feedback_test PRIVATE
+    BITCASK_JIEBA_DICT_DIR="${BITCASK_JIEBA_DICT_DIR}")
+
 # S56：search_fields 打分口径（每字段跨段统计 + 字段自身 dl）
 add_executable(bitcask_search_fields_scoring_test search_fields_scoring_test.cpp)
 target_link_libraries(bitcask_search_fields_scoring_test PRIVATE
@@ -504,6 +515,7 @@ gtest_discover_tests(bitcask_index_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_search_segment_fallback_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_search_highlight_cold_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_search_fields_scoring_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_s57_feedback_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_analyzer_record_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_v2_test ${_bitcask_test_props})

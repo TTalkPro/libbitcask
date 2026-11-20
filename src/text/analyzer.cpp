@@ -83,6 +83,9 @@ static const bool s_reg_jieba = [] {
     AnalyzerFactory::register_creator(
         AnalyzerType::Jieba,
         [](const AnalyzerConfig& c) -> std::unique_ptr<Analyzer> {
+            // S57：词典缺失时 cppjieba abort 进程——先查，缺了返回空，由
+            // 调用方（Cask::open）报 kInvalidOption。
+            if (!jieba_missing_dict_file(c.dict_path).empty()) return nullptr;
             return std::make_unique<JiebaAnalyzer>(
                 c.dict_path, c.min_n, c.max_n,
                 c.enable_stop_words, c.stop_words,

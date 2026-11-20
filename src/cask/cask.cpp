@@ -22,6 +22,7 @@
 
 #include "bitcask/format.hpp"
 #include "bitcask/index_registry.hpp"
+#include "bitcask/jieba_analyzer.hpp"  // S57：jieba_missing_dict_file（open 报文）
 #include "bitcask/merger.hpp"
 #include "bitcask/oki_state.hpp"  // S33-4：flush 搭快照车 / 阈值 flush
 #include "bitcask/detail/scanner.hpp"
@@ -721,6 +722,17 @@ Cask::create_search_infra(const CaskOptions& opts) {
     if (!text_->has_analyzer()) {
         text_.reset();
         docmap_.reset();
+        // S57：jieba 词典缺失报出具体缺的文件（此前 cppjieba 直接 abort 进程，
+        // 这条报文到不了）。
+        if (scfg.analyzer_config.type == text::AnalyzerType::Jieba) {
+            const auto missing =
+                text::jieba_missing_dict_file(scfg.analyzer_config.dict_path);
+            if (!missing.empty()) {
+                return std::unexpected(err(CaskError::kInvalidOption,
+                    "jieba dictionary not found or unreadable: " + missing +
+                    " (check dict_path)"));
+            }
+        }
         return std::unexpected(err(CaskError::kInvalidOption,
                                    "analyzer creation failed (check analyzer type / dict_path)"));
     }
@@ -3185,11 +3197,15 @@ bool Cask::is_frozen() {
 //     下一轮 merge 自然处理。
 Cask::NeedsMerge Cask::needs_merge(std::uint64_t now_sec) {
     if (is_closed()) return {};  // S11-W3：needs=false
-    // S43-7：merge 候选选择优先采信 BCOM v4 元数据。v4 是 OKI/authority
-    // 共同提交点的冻结对拍结果；没有 v4（旧目录/元数据尚未收敛）才退
-    // 回 authority fstats，保持兼容但不再是 OKI-only 目标路径。
-    auto oki_fstats = authority_->state().manifest_fstats();
-    if (oki_fstats.empty()) oki_fstats = authority_->fstats();
+    // S57（下游反馈 2026-11-19 needs-merge-blind-to-dead-bytes）：候选统计
+    // 用**实时**账本（与 status() 同源）。实时账本 = 打开时采信的 v4 清单 +
+    // 之后每次写 / 删 / 合并的增量；此前优先取 v4 清单（上一个提交点的冻结
+    // 快照，S43-7 当时实时源还是待删的 KeyDir），提交点之后产生的死字节看
+    // 不见——长驻写者重开前永远不合并、status 与 needs_merge 结论相反。
+    // 选文件只决定「值不值得并」，merge 的活性裁决走 OKI ReadView，与此无关。
+    // 实时账本为空（尚未建立）才退回清单。
+    auto oki_fstats = authority_->fstats();
+    if (oki_fstats.empty()) oki_fstats = authority_->state().manifest_fstats();
     const std::uint32_t exclude_id =
         opts_.merge_only
             ? merger_writer_active_id_

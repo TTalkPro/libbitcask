@@ -15,6 +15,25 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
+## [Unreleased]（S57：jieba 缺词典 open 报错、`needs_merge` 用实时账本）
+
+> 版本未定。C API、盘上格式、既有结构体布局零改动；C++ 新增自由函数 `text::jieba_missing_dict_file`。
+
+### Fixed
+
+- **jieba 词典路径不对时整个宿主进程被 abort**（S57，下游反馈 `feedbacks/2026-11-19-jieba-missing-dict-aborts-process.md`，bosun）：
+  工厂不检查词典文件就交给 cppjieba，后者 `XCHECK` 失败即 abort。现在建分词器前先查 5 个词典文件，缺任一 ⇒ `Cask::open`
+  返回 `kInvalidOption`，报文带缺失的完整路径（C API 同为 `BITCASK_ERR_INVALID_OPTION`）。不降级：词典缺失的库打不开。
+- **`needs_merge` 看不见本次打开之后的死字节**（S57，`feedbacks/2026-11-19-needs-merge-blind-to-dead-bytes-since-commit-point.md`）：
+  候选统计优先取上一个提交点的 v4 清单快照，长驻写者重开前永远不合并，与 `status()` 结论相反。现改用实时 per-file 账本
+  （`status()` 同源）。
+
+### Added
+
+- `text::jieba_missing_dict_file(dict_dir)`：返回第一个缺失 / 不可读的 jieba 词典文件路径（全在返回空串）。
+
+---
+
 ## [11.0.0] - 2026-11-20（S56：`search_fields` 打分口径）
 
 > **版本语义（2026-11-20 定版）**：⚠️ **C++ ABI 破坏**——已安装公共头 `include/bitcask/segment.hpp` 的

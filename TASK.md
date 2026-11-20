@@ -10,6 +10,38 @@
 
 ---
 
+## 🔴 S57 · jieba 缺词典时 open 返回错误（不再 abort 进程）+ `needs_merge` 用实时账本（2026-11-20 立项）
+
+> 来源：bosun 两份下游反馈（11.0.0 `862d735` 复现）：
+> [`feedbacks/2026-11-19-jieba-missing-dict-aborts-process.md`](feedbacks/2026-11-19-jieba-missing-dict-aborts-process.md)、
+> [`feedbacks/2026-11-19-needs-merge-blind-to-dead-bytes-since-commit-point.md`](feedbacks/2026-11-19-needs-merge-blind-to-dead-bytes-since-commit-point.md)。
+> 用户定：继续修，只编码不提交。
+>
+> **方案**：
+> - jieba：新增 `text::jieba_missing_dict_file(dict_dir)`（5 个词典文件逐个查「存在、普通文件、可读」，返回第一个缺的完整路径）；
+>   工厂的 Jieba creator 先查，缺了返回空 ⇒ `Cask::open` 走既有 `kInvalidOption`，报文带缺失路径。**不降级、不换分词器**：
+>   词典缺失 jieba 无法工作，库直接打不开；改的只是「杀进程」变成「open 返回错误」。直接构造 `JiebaAnalyzer` 仍不检查（头注写明）。
+> - `needs_merge`：候选统计改取实时账本 `authority_->fstats()`（= 打开时采信的 v4 清单 + 之后的增量，`status()` 同源），
+>   实时账本为空才退回清单。S43-7 当时选清单是因为实时源还是待删的 KeyDir；merge 活性裁决走 OKI ReadView，与选文件统计无关。
+>
+> 约束：⛔ 改 C API / 盘上格式 / 既有结构体布局（C++ 只新增一个自由函数）。
+> 下游 bitcask 侧（`merge/2,3` 漏补缺省 `dict_path`、`dict_path` 收 list 被静默忽略）不在本仓库。
+
+| 项 | 状态 |
+|---|---|
+| S57-1 `jieba_missing_dict_file` + Jieba creator 预检 + `Cask::open` 报文带缺失路径 | ✅ |
+| S57-2 `Cask::needs_merge` 实时账本优先 | ✅ |
+| S57-3 回归 `tests/s57_feedback_test.cpp`：缺文件定位（目录同名也算缺）、工厂返回空、open 坏路径 / 空路径 ⇒ `kInvalidOption` + 路径、真词典照常；重开后覆盖写 ⇒ `needs_merge` 为真且候选含 status 过阈值的文件、合并后再写死同样看见（KV / 检索两组） | ✅ |
+| S57-4 CHANGELOG `[Unreleased]`、反馈回填 | ✅ |
+
+**落地记录**（未提交，版本未定）：
+- 基线红：11.0.0 上 `needs_merge` 用例 KV / 检索两组都红；工厂坏路径用例进程在 `DictTrie.hpp:243 FATAL` 处直接死。
+- 验证：GCC Release（`-Werror`）全量 ctest **938** 全绿；ASan 全量 938 全绿；Clang Debug / TSan
+  `S57|NeedsMerge|Merge|Jieba|Analyzer|Oki|S43|CaskDocValue|Checkpoint` 333 全绿。Windows 未实测。
+- 版本建议 MINOR（纯新增函数 + 行为修复，ABI 兼容）。
+
+---
+
 ## 🔴 S56 · `search_fields` 打分口径：每字段跨段统计 + 字段自身 dl（2026-11-19 立项）
 
 > 来源：下游反馈

@@ -16,11 +16,20 @@
 
 namespace bitcask::text {
 
+// S57：jieba 构造所需的 5 个词典文件（jieba.dict.utf8 / hmm_model.utf8 /
+// user.dict.utf8 / idf.utf8 / stop_words.utf8）里第一个打不开的完整路径；
+// 全部可读返回空串。cppjieba 打不开词典时 XCHECK 直接 abort 整个进程，
+// 所以工厂（AnalyzerFactory::create）建 JiebaAnalyzer 之前先过这一道，
+// 缺文件 ⇒ create 返回 nullptr ⇒ Cask::open 报 kInvalidOption（报文带此路径）。
+// 只查「存在、是普通文件、能打开读」，不校验内容。
+[[nodiscard]] std::string jieba_missing_dict_file(const std::string& dict_dir);
+
 class JiebaAnalyzer final : public Analyzer {
 public:
     // dict_dir: jieba 词典文件所在目录，需包含 jieba.dict.utf8 / hmm_model.utf8 等。
-    //           必须是有效目录——当前实现无空路径回退，空串会拼成 "/jieba.dict.utf8"
-    //           导致加载失败。运行时由 Erlang facade（bitcask:open）默认填 priv/dict。
+    //           ⚠️ 直接构造不做检查：词典打不开时 cppjieba abort 进程。库内一律经
+    //           AnalyzerFactory::create（先过 jieba_missing_dict_file）；自行构造的
+    //           调用方须先调 jieba_missing_dict_file。
     explicit JiebaAnalyzer(const std::string& dict_dir = {},
                            std::uint32_t min_n = 2, std::uint32_t max_n = 3,
                            bool enable_stop_words = false,

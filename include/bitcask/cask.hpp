@@ -1051,6 +1051,8 @@ public:
         std::vector<std::string> files;
         std::vector<std::string> expired_files;
     };
+    // 候选统计取实时 per-file 账本（与 status() 同源，含本次打开之后的覆盖写 /
+    // 删除产生的死字节；S57）。merge_only 句柄看到的是它打开时从数据建出的账本。
     // 线程安全: 是（读 keydir info 拿快照 + 纯函数策略）；不需外部锁。
     [[nodiscard]] NeedsMerge needs_merge(std::uint64_t now_sec = 0);
 

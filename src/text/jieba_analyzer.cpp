@@ -6,8 +6,13 @@
 #include "bitcask/jieba_analyzer.hpp"
 #include "bitcask/text_utils.hpp"
 
+#include "bitcask/detail/path_utf8.hpp"
+
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <system_error>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -68,6 +73,23 @@ namespace {
 }
 
 }  // namespace
+
+std::string jieba_missing_dict_file(const std::string& dict_dir) {
+    // 顺序同 JiebaImpl 构造（也是 cppjieba 打开它们的顺序）。
+    static constexpr const char* kFiles[] = {
+        "jieba.dict.utf8", "hmm_model.utf8", "user.dict.utf8",
+        "idf.utf8", "stop_words.utf8"};
+    for (const char* name : kFiles) {
+        const std::string p = dict_dir + "/" + name;
+        const auto fp = bitcask::detail::from_utf8(p);
+        std::error_code ec;
+        // 目录在 Linux 上也能被 ifstream「打开」——先确认是普通文件。
+        if (!std::filesystem::is_regular_file(fp, ec) || ec) return p;
+        std::ifstream f(fp, std::ios::binary);
+        if (!f.is_open()) return p;
+    }
+    return {};
+}
 
 JiebaAnalyzer::~JiebaAnalyzer() = default;
 
