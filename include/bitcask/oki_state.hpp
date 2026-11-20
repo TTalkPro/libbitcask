@@ -107,6 +107,21 @@ public:
                        const RowLoc* loc, std::uint32_t dur_file = 0,
                        std::uint64_t dur_end = 0);
 
+    // S63：原子批的一次性发布入口。语义与对每行调用 append_update 相同，
+    // 但全部行在同一个 mu_ 临界区内进入 active memdelta：并发读者要么看到
+    // 整批，要么一行都看不到。key/loc 借 caller 存储，调用期间有效即可；
+    // DeltaRow 的 key 拷贝在取锁前完成。rows 内 key 可重复时后行按
+    // (ord, 到达序) 胜出（IndexAuthority 的批入口已保证 key 两两不同）。
+    struct BatchRow {
+        std::string_view key;
+        std::uint64_t ord = 0;
+        bool tomb = false;
+        RowLoc loc{};               // tomb 忽略
+        std::uint32_t dur_file = 0; // 仅 tomb：data 记录落点
+        std::uint64_t dur_end = 0;
+    };
+    void apply_batch(std::span<const BatchRow> rows);
+
     // 当前到达序号上界（一致切面捕获用；调用方须在写序闸门内调用）。
     [[nodiscard]] std::uint64_t current_seq() const {
         std::lock_guard<std::mutex> lk(mu_);

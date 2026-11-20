@@ -10,6 +10,32 @@
 
 ---
 
+## 🔴 S63 · 原子批对并发读者整批可见（2026-11-20 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-20-atomic-batch-no-read-isolation.md`](feedbacks/2026-11-20-atomic-batch-no-read-isolation.md)
+> （keelson 压测撞上；bitcask 审图层确认同根因）。设计 [`designs/atomic-batch-read-visibility-design-zh.md`](designs/atomic-batch-read-visibility-design-zh.md)。
+> 拍板：方案 A（整批在权威索引一次性发布）；不做专门 `validate`，用只含 `kCheck` 的批；`put_batch` 不改；检索索引与跨进程读者不在本项。
+> 只编码不提交。
+
+| 项 | 状态 |
+|---|---|
+| S63-1 `OkiState::apply_batch`：锁外构造行（含 key 拷贝），一个 `mu_` 临界区内追加、分配到达序、登记点查哈希；`delta_version_` / flush hint 只批末更新 | ✅ |
+| S63-2 `IndexAuthority::apply_batch`：一个 `writer_mu_` 内先零副作用裁决全部成员，通过后按单条 `apply_put` / `apply_remove` 同口径记账并一次发布；`kIndexUnavailable` / merge 拒绝零成员生效；remove 不裁决、幂等 put 跳账本但仍随批发布 | ✅ |
+| S63-3 `put_batch_atomic` 第 ⑥ 步改整批提交；merge race → `roll_active()`、被拒 put 只落盘重写、整批重试（至多 3 次）；旧重写 ord 补 Skip，重写槽位映射避免批头 task 错标 | ✅ |
+| S63-4 契约文档：`cask.hpp` / `txn.hpp` / C 头 / `doc/api-c.md` §10.3 / CHANGELOG `[Unreleased]`；只含 `kCheck` 批的「不写字节 / 不分配 LSN / 不升 meta」承诺 | ✅ |
+| S63-5 回归 `tests/atomic_batch_visibility_test.cpp`（5）：头→尾、尾→头、remove 与头同批、merge race 重写整批可见 + `flush_index` 排干、check-only 不升 meta | ✅ |
+| S63-6 基准 `BM_Cask_AtomicBatchPointReadP99`：400 行大批 + 4 点查读者 | ✅ |
+| S63-7 反馈与设计稿状态回填 | ✅ |
+
+**落地记录**：
+- 性能：400 行大批 + 4 读者（每读者先读 head 后读 tail），150 批共 19.8k 个 get 样本；
+  点查 **p99 7.4 µs**、p99.9 73.4 µs（GCC Release 本机，三轮均值）。大批持锁成本可观测但未造成毫秒级 p99。
+- 验证：GCC Release（`-Werror`）全量 ctest **967 注册 / 965 执行**全绿（2 项既有 disabled）；ASan 全量 967 注册 / 965 执行全绿（2 项既有 disabled）；
+  新用例 TSan 全绿；既有 `atomic_batch` / `atomic_batch_doc` / `conditional_batch` / `s62` / `oki_only_contract` / C API 全绿。Windows 未实测。
+- 版本定 **12.0.1**（PATCH：行为修复 + C++ 纯新增，ABI 兼容），`SOVERSION` 保持 **12**。
+
+---
+
 ## 🔴 S62 · meta 字符串数组 + Contains 过滤 + bitcask.meta v7 纪元（2026-11-20 立项）
 
 > 来源：下游反馈 [`feedbacks/2026-11-13-doc-capability-gaps.md`](feedbacks/2026-11-13-doc-capability-gaps.md) #4（锦书：别名天然多值）。

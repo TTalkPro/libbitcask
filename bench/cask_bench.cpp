@@ -7,12 +7,14 @@
 #include <benchmark/benchmark.h>
 
 #include <unistd.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <random>
 #include <string>
 #include <chrono>
+#include <thread>
 #include <vector>
 #include <utility>
 
@@ -579,6 +581,108 @@ static void BM_Cask_PutBatchAtomic(benchmark::State& state) {
 }
 BENCHMARK(BM_Cask_PutBatch)->Arg(8)->Arg(64)->Arg(512);
 BENCHMARK(BM_Cask_PutBatchAtomic)->Arg(8)->Arg(64)->Arg(512);
+
+// S63：原子批整批应用期间，并发点查只能等 OkiState::mu_。本项量化 400 行
+// 大批 + 4 读者的点查 p99 / p99.9；每次 get 计一次样本（含 gget 返回值拷贝
+// 的正常读路径），writer 只提交 fixed rounds，读样本在本地累计、writer 收尾
+// 汇总。这是锁代价观测基准，不与 put_batch 对比吞吐。
+static void BM_Cask_AtomicBatchPointReadP99(benchmark::State& state) {
+    constexpr int kRounds = 150;
+    constexpr int kReaders = 4;
+    constexpr std::size_t kSampleCap = 250000;
+    const auto n = static_cast<std::size_t>(state.range(0));
+    const int readers = kReaders;
+    TempDir td;
+    auto c = Cask::open(td.path(), rw_opts(), &test_registry());
+    if (!c) {
+        state.SkipWithError("Cask::open failed");
+        return;
+    }
+    auto& cask = **c;
+    const std::string value(128, 'v');
+    if (!cask.put(as_bytes("head"), as_bytes("h0")) ||
+        !cask.put(as_bytes("tail"), as_bytes("t0"))) {
+        state.SkipWithError("populate failed");
+        cask.close();
+        return;
+    }
+
+    std::atomic<bool> stop{false};
+    std::vector<std::vector<std::uint64_t>> samples(
+        static_cast<std::size_t>(readers));
+    std::vector<std::thread> reader_threads;
+    reader_threads.reserve(static_cast<std::size_t>(readers));
+    for (int t = 0; t < readers; ++t) {
+        reader_threads.emplace_back([&, t] {
+            auto& dst = samples[static_cast<std::size_t>(t)];
+            dst.reserve(kSampleCap);
+            while (!stop.load(std::memory_order_acquire) &&
+                   dst.size() < kSampleCap) {
+                const auto t0 = std::chrono::steady_clock::now();
+                auto r = cask.get_owned(as_bytes("head"));
+                const auto mid = std::chrono::steady_clock::now();
+                auto tr = cask.get_owned(as_bytes("tail"));
+                const auto t1 = std::chrono::steady_clock::now();
+                benchmark::DoNotOptimize(r);
+                benchmark::DoNotOptimize(tr);
+                dst.push_back(static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        mid - t0).count()));
+                dst.push_back(static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t1 - mid).count()));
+            }
+        });
+    }
+
+    for (int round = 1; round <= kRounds; ++round) {
+        const std::string head = "h" + std::to_string(round);
+        const std::string body = "t" + std::to_string(round);
+        std::vector<Cask::BatchOp> ops;
+        ops.reserve(n + 2);
+        ops.push_back({.type = Cask::BatchOp::Type::kPut,
+                       .key = as_bytes("head"), .value = as_bytes(head)});
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::string key = "fill" + std::to_string(i);
+            ops.push_back({.type = Cask::BatchOp::Type::kPut,
+                           .key = as_bytes(key), .value = as_bytes(body)});
+        }
+        ops.push_back({.type = Cask::BatchOp::Type::kPut,
+                       .key = as_bytes("tail"), .value = as_bytes(body)});
+        auto r = cask.put_batch_atomic(ops);
+        if (!r) {
+            state.SkipWithError("atomic batch failed");
+            break;
+        }
+    }
+    stop.store(true, std::memory_order_release);
+    for (auto& reader : reader_threads) reader.join();
+
+    std::vector<std::uint64_t> all;
+    for (const auto& part : samples) {
+        all.insert(all.end(), part.begin(), part.end());
+    }
+    if (!all.empty()) {
+        const auto percentile = [&](double p) {
+            const auto nth = all.begin() +
+                static_cast<std::ptrdiff_t>(std::min(
+                    all.size() - 1,
+                    static_cast<std::size_t>(
+                        static_cast<double>(all.size()) * p)));
+            std::nth_element(all.begin(), nth, all.end());
+            return static_cast<double>(*nth) / 1000.0;
+        };
+        state.counters["read_p99_us"] = percentile(0.99);
+        state.counters["read_p999_us"] = percentile(0.999);
+        state.counters["read_samples"] = static_cast<double>(all.size());
+    }
+    state.counters["batch_rows"] = static_cast<double>(n + 2);
+    state.counters["write_batches"] = static_cast<double>(kRounds);
+    cask.close();
+    state.SetItemsProcessed(kRounds * static_cast<std::int64_t>(n + 2));
+}
+BENCHMARK(BM_Cask_AtomicBatchPointReadP99)
+    ->Arg(400)->Iterations(1)->Unit(benchmark::kMillisecond);
 
 
 // -----------------------------------------------------------------------------

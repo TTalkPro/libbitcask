@@ -178,6 +178,37 @@ void OkiState::append_update(std::string_view key, std::uint64_t ord,
     update_flush_hint_locked();
 }
 
+// S63：批量发布。锁外只构造行（含 key 拷贝），临界区内只做 move 追加、
+// 到达序号分配与点查哈希登记。delta_version_ 只 bump 一次——排序视图
+// 缓存对整批只失效一次；flush_hint 同样在批末更新。
+void OkiState::apply_batch(std::span<const BatchRow> rows) {
+    if (rows.empty()) return;
+    std::vector<DeltaRow> prepared;
+    prepared.reserve(rows.size());
+    std::size_t bytes = 0;
+    for (const auto& row : rows) {
+        bytes += row.key.size() + sizeof(DeltaRow);
+        DeltaRow out{std::string(row.key), row.ord, row.tomb,
+                     /*has_loc=*/!row.tomb,
+                     row.tomb ? RowLoc{} : row.loc};
+        out.dur_file = row.tomb ? row.dur_file : 0;
+        out.dur_end = row.tomb ? row.dur_end : 0;
+        prepared.push_back(std::move(out));
+    }
+
+    std::lock_guard<std::mutex> lk(mu_);
+    const std::size_t first = delta_.size();
+    delta_.insert(delta_.end(), std::make_move_iterator(prepared.begin()),
+                  std::make_move_iterator(prepared.end()));
+    delta_bytes_ += bytes;
+    for (std::size_t i = first; i < delta_.size(); ++i) {
+        delta_[i].seq = ++append_seq_;
+        index_row_locked(i);
+    }
+    ++delta_version_;  // 排序视图缓存失效
+    update_flush_hint_locked();
+}
+
 void OkiState::index_row_locked(std::size_t idx) {
     if (!point_query_.load(std::memory_order_relaxed)) return;
     const DeltaRow& row = delta_[idx];

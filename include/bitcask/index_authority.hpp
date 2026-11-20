@@ -88,6 +88,26 @@ public:
                                       std::uint64_t offset,
                                       std::uint64_t tstamp,
                                       std::uint64_t ord);
+
+    // S63：原子批的一次性应用入口。一次 writer_mu_ 内先裁决全部成员、再
+    // 一次 OkiState::apply_batch 发布整批：并发读者要么看到整批，要么一行
+    // 都看不到。items 内 key 必须两两不同（put_batch_atomic 的 final_ops
+    // 已保证）。kAlreadyExists 时 rejected 返回被拒 put 成员的下标、零成员
+    // 入账/入行；kIndexUnavailable 时同样零副作用。remove 成员沿用
+    // apply_remove 的口径（不裁决、不进 rejected）。
+    struct BatchApply {
+        std::string_view key;
+        bool remove = false;
+        std::uint32_t file_id = 0; // remove：墓碑记录的落点（可为 0）
+        std::uint32_t total_size = 0;
+        std::uint64_t offset = 0;
+        std::uint64_t tstamp = 0;
+        std::uint64_t ord = 0;
+    };
+    [[nodiscard]] PutResult apply_batch(
+        std::span<const BatchApply> items,
+        std::vector<std::size_t>& rejected);
+
     // file_id/end：墓碑 data 记录的落点（供 flush 持久性判定与一致切面）。
     void apply_remove(std::string_view key, std::uint64_t ord,
                       std::uint32_t file_id = 0, std::uint64_t end = 0);

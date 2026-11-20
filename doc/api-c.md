@@ -6,7 +6,7 @@ C API 是 C++ `bitcask::Cask` 的薄 `extern "C"` 包装，编译产物：
 
 | 产物 | 说明 |
 |------|------|
-| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=12`，`VERSION=12.0.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 12.0.0)` 单一真源派生）|
+| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=12`，`VERSION=12.0.1`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 12.0.1)` 单一真源派生）|
 | `libbitcask.a` | 合并全部静态归档的单一 `.a`（定义 `BITCASK_STATIC_LIB` 去掉导出修饰）|
 
 符号导出由 `BITCASK_API` 宏控制（`bitcask_kv.h` §符号导出宏），Windows 下退化为 `__declspec(dllimport/dllexport)`，其它平台默认 `__attribute__((visibility("default")))`。
@@ -130,7 +130,7 @@ cl /DBITCASK_STATIC_LIB app.c /I<c_api 头目录> bitcask_static.lib   :: 静态
 
 ## 3. 版本信息
 
-版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 12.0.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
+版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 12.0.1)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
 
 ```c
 BITCASK_API int          bitcask_version_major(void);
@@ -140,7 +140,7 @@ BITCASK_API const char*  bitcask_version_string(void);   // "major.minor.patch"�
 ```
 
 - `bitcask_version_string()` 返回的是库内静态字符串（指向 `BITCASK_VERSION_STRING` 宏展开的字符串字面量），**不需要 free**。
-- 运行时返回值与 `libbitcask.so.12.0.0` 文件名完全对应；SOVERSION 是 `12`（大版本号），反映 ABI 兼容性。
+- 运行时返回值与 `libbitcask.so.12.0.1` 文件名完全对应；SOVERSION 是 `12`（大版本号），反映 ABI 兼容性。
 - 7.0.0 的 major bump 由 **C++ 公共头 ABI 变化**驱动（`StatusInfo` / `OkiState` /
   `OkiMergeCursor` 布局变化）。C API 函数签名与既有 C POD 布局保持零增删改；
   跨语言绑定仍需针对 `.so.7` 重新链接加载。
@@ -1115,9 +1115,9 @@ BITCASK_API bitcask_error_t bitcask_txn_pending_count(bitcask_t* cask,
                                                       bitcask_fault_t* fault);
 ```
 
-S35 引擎原子批（设计 `doc/atomic-batch-design-zh.md`；模式原理 `doc/multikey-txn-zh.md`）。崩溃原子性（A）+ 持久性（D）；**不提供**隔离性（I）。CAS 由 S46 的 `*_cond` 两个函数提供（按 key 的 ord 做前置条件，见下）。key 命名空间 `_txn:` 保留。
+S35 引擎原子批（设计 `doc/atomic-batch-design-zh.md`；模式原理 `doc/multikey-txn-zh.md`）。崩溃原子性（A）+ 持久性（D）。S63 起提交对并发读者一次性生效，但**不是快照隔离**（I）：两次读之间仍可能插入一个完整提交；一致读用 S46 的 `*_cond` 两个函数和 check op（按 key 的 ord 做前置条件，见下）。key 命名空间 `_txn:` 保留。
 
-- `bitcask_put_batch_atomic`：引擎原子批直通——崩溃/掉电后整批要么全可见要么全不可见；批内 op 依序 apply（同 key 多次 = 批内 LWW，不校验重复）。**首次调用把目录 meta 懒升级为 v6**（旧于 5.1.0 的读端拒开该目录；从不调用则停留 v5）。durability 同 `bitcask_put_batch`。
+- `bitcask_put_batch_atomic`：引擎原子批直通——崩溃/掉电后整批要么全可见要么全不可见；S63 起对并发读者一次性生效。同 key 多次出现时最后一个 op 生效；各 key 之间没有可观察的先后（不校验重复）。**首次调用把目录 meta 懒升级为 v6**（旧于 5.1.0 的读端拒开该目录；从不调用则停留 v5）。durability 同 `bitcask_put_batch`。只含 check op 的批在写锁内校验后返回，不写字节、不分配 ord、不升级 meta。
 - `bitcask_txn_commit`：= 原子批 + 事务级校验（空批 / 空 key / 重复 key / `_txn:` 前缀 → `BITCASK_ERR_INVALID_OPTION` 零副作用）。`sync_on_commit` 非零 = 提交后显式 fsync（防掉电丢批——原子性与持久性正交）。
 - `bitcask_put_batch_atomic_ex` / `bitcask_txn_commit_ex`（下游反馈 2026-10-06，纯加法）：op 数组换成 `bitcask_txn_op_ex_t`，多一种 `op = 2`（put_doc）——写结构化文档，编码与索引登记同 `bitcask_put_doc_ex`（meta / vector / fields / expiry_at 都能进批），`value` 被忽略，`doc` 必填（`NULL` → `BITCASK_ERR_INVALID_OPTION`，零副作用）；`op = 0 / 1` 与旧结构同义。其余语义分别同上两条。典型用途：文档与它的二级索引项同批落盘（改 meta 时 put 文档 + put 新索引项 + remove 旧索引项一批完成）。
 

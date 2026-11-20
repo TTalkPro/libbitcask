@@ -377,6 +377,15 @@ target_link_libraries(bitcask_atomic_batch_test PRIVATE
     bitcask_sanitizers
 )
 
+# S63：原子批对并发读者的一次性可见性契约。
+add_executable(bitcask_atomic_batch_visibility_test atomic_batch_visibility_test.cpp)
+target_link_libraries(bitcask_atomic_batch_visibility_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 # S38：meta 里的 Unicode 数据版本记录与重开比对告警。
 add_executable(bitcask_meta_unicode_version_test meta_unicode_version_test.cpp)
 target_link_libraries(bitcask_meta_unicode_version_test PRIVATE
@@ -580,6 +589,7 @@ gtest_discover_tests(bitcask_segment_v2_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_jieba_analyzer_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_cask_docvalue_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_atomic_batch_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_atomic_batch_visibility_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_txn_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_crash_recovery_test ${_bitcask_test_props})
 if(NOT WIN32)

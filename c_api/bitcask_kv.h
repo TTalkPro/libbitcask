@@ -681,8 +681,9 @@ BITCASK_API bitcask_error_t bitcask_put_batch(bitcask_t* cask,
 /* ===========================================================================
  *  多键事务（S34/S35）——引擎原子批
  *
- *  提供崩溃原子性(A)与持久性(D)；**不提供**隔离性(I)——事务中间态
- *  对并发读者可见。CAS 见下方 *_cond（S46，按 key 的 ord 做前置条件）。S35 起提交路径 = 引擎原子批（kBatchHeader，设计
+ *  提供崩溃原子性(A)与持久性(D)。S63 起提交对并发读者一次性生效，但不是
+ *  快照隔离(I)——两次读之间仍可插入一个完整提交；一致读用 *_cond /
+ *  check op。CAS 见下方 *_cond（S46，按 key 的 ord 做前置条件）。S35 起提交路径 = 引擎原子批（kBatchHeader，设计
  *  doc/atomic-batch-design-zh.md）；模式原理 doc/multikey-txn-zh.md。
  *  key 命名空间 "_txn:" 保留（legacy 意图日志），业务 key 不得使用。
  * ========================================================================= */
@@ -693,9 +694,10 @@ typedef struct {
     bitcask_slice_t value;
 } bitcask_txn_op_t;
 
-/* S35：引擎原子批直通。整批崩溃/掉电后要么全可见要么全不可见；批内 op
- * 依序 apply（同 key 多次 = 批内 LWW，不校验重复）。**首次调用把目录
- * meta 懒升级为 v6**——旧于 5.1.0 的读端拒开该目录（unsupported
+/* S35：引擎原子批直通。整批崩溃/掉电后要么全可见要么全不可见；S63 起对
+ * 并发读者一次性生效。同 key 多次出现时最后一个 op 生效；各 key 之间没有
+ * 可观察的先后（不校验重复）。**首次调用把目录 meta 懒升级为 v6**——旧于
+ * 5.1.0 的读端拒开该目录（unsupported
  * meta version）。durability 同 bitcask_put_batch。ops 借调用方存储。 */
 BITCASK_API bitcask_error_t bitcask_put_batch_atomic(bitcask_t* cask,
                                                      const bitcask_txn_op_t* ops,

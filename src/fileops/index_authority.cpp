@@ -148,6 +148,89 @@ PutResult IndexAuthority::apply_put(
     return PutResult::kOk;
 }
 
+// S63：原子批的一次性应用。裁决段只读（probe_for_write 不改状态），只有
+// 全部成员通过后才做账务并构造 OkiState 行；行在 OkiState::apply_batch 的
+// 单个 mu_ 临界区内发布。
+PutResult IndexAuthority::apply_batch(
+    std::span<const BatchApply> items, std::vector<std::size_t>& rejected) {
+    rejected.clear();
+    if (items.empty()) return PutResult::kOk;
+
+    if (pre_apply_hook_) [[unlikely]] pre_apply_hook_();  // 测试缝（锁外）
+    std::unique_lock lock(writer_mu_);
+
+    std::vector<OkiState::WriteProbe> priors;
+    priors.reserve(items.size());
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        const auto& item = items[i];
+        auto prior = state_.probe_for_write(item.key);
+        if (prior.status == OkiState::LocateStatus::kUnavailable) {
+            rejected.clear();
+            return PutResult::kIndexUnavailable;
+        }
+        if (!item.remove &&
+            (item.file_id <
+                 biggest_file_id_.load(std::memory_order_relaxed) ||
+             (prior.status == OkiState::LocateStatus::kHit &&
+              prior.ord > item.ord))) {
+            rejected.push_back(i);
+        }
+        priors.push_back(prior);
+    }
+    if (!rejected.empty()) return PutResult::kAlreadyExists;
+
+    std::vector<OkiState::BatchRow> rows;
+    rows.reserve(items.size());
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        const auto& item = items[i];
+        const auto& prior = priors[i];
+        const bool prior_live = prior.status == OkiState::LocateStatus::kHit &&
+                                !prior.tomb && prior.has_loc;
+        if (item.remove) {
+            if (prior_live && prior.ord < item.ord) {
+                retire_live(ledger_, prior, item.key);
+            }
+            rows.push_back({item.key, item.ord, true, RowLoc{}, item.file_id,
+                            item.offset + (item.file_id == 0
+                                               ? 0
+                                               : item.total_size)});
+            note_applied(item.file_id, item.offset + item.total_size);
+            continue;
+        }
+
+        // 幂等：同 ord 同落点的行已在视图中（运行期受控重建扫到了这条刚
+        // 写入的记录，写者随后才拿到 writer_mu_）——不得重复记账；行仍随
+        // 批发布，语义与单行重放等价。
+        const bool idempotent =
+            prior.status == OkiState::LocateStatus::kHit && !prior.tomb &&
+            prior.has_loc && prior.ord == item.ord &&
+            prior.loc.file_id == item.file_id &&
+            prior.loc.offset == item.offset;
+        if (!idempotent) {
+            if (!prior_live) {
+                install_live(ledger_, item.key, item.file_id, item.total_size,
+                             item.tstamp, true);
+            } else if (prior.loc.file_id != item.file_id) {
+                retire_live(ledger_, prior, item.key);
+                install_live(ledger_, item.key, item.file_id, item.total_size,
+                             item.tstamp, true);
+            } else {
+                auto old = static_cast<std::int64_t>(prior.loc.total_sz);
+                auto now_sz = static_cast<std::int64_t>(item.total_size);
+                adjust_file(ledger_, item.file_id, item.tstamp, 0, 1,
+                            now_sz - old, now_sz);
+            }
+            (void)increment_file_id_at_least(item.file_id);
+        }
+        const RowLoc loc{item.file_id, item.total_size, item.offset,
+                         item.tstamp};
+        rows.push_back({item.key, item.ord, false, loc, 0, 0});
+        note_applied(item.file_id, item.offset + item.total_size);
+    }
+    state_.apply_batch(rows);
+    return PutResult::kOk;
+}
+
 void IndexAuthority::apply_remove(std::string_view key, std::uint64_t ord,
                                   std::uint32_t file_id, std::uint64_t end) {
     std::unique_lock lock(writer_mu_);

@@ -16,7 +16,7 @@
 | 能力 | 接口（`bitcask::Cask`） | 说明 | 文档 |
 |------|------------------------|------|------|
 | KV 读写 | `put` / `get` / `remove` / `put_batch` | DocValue v4 编码（u64 tstamp），纯 KV 的 binary 走 text 段 | [`api-cpp.md`](doc/api-cpp.md) |
-| **原子批 / 多键事务** | `put_batch_atomic` / `TxnCask` | S35 引擎原子批：崩溃/掉电后整批 all-or-nothing（批头声明区间，meta v6 懒升级）；支持批内 REMOVE | [`atomic-batch-design-zh.md`](doc/atomic-batch-design-zh.md) |
+| **原子批 / 多键事务** | `put_batch_atomic` / `TxnCask` | S35 引擎原子批：崩溃/掉电后整批 all-or-nothing；S63 起提交对并发读者一次性生效（原子可见，不是快照隔离）；支持批内 REMOVE / 条件 / check | [`atomic-batch-design-zh.md`](doc/atomic-batch-design-zh.md) |
 | 零拷贝读 | `get`（`GetResultView`）/ `get_owned` | view 借 `pread` 缓冲或 sealed mmap，无堆分配 | [`getresult-view-design-zh.md`](doc/getresult-view-design-zh.md) |
 | 结构化文档 | `put_doc`（`DocInput`） | text + 可选 meta + 可选 vector + 多字段 | [`api-cpp.md`](doc/api-cpp.md) |
 | 词袋检索 | `search_text` | BM25 + meta 过滤，支持 `offset` 分页 | [`api-cpp.md`](doc/api-cpp.md) |
@@ -429,11 +429,11 @@ cmake --build build -j --target bitcask_static bitcask_shared
 | `BITCASK_LTO` | ON | Release 启用 LTO / IPO；sanitizer 构建自动关闭 |
 | `BITCASK_PCH` | ON | 预编译头加速编译；排查 PCH 异常可临时关闭 |
 
-版本信息由 `CMakeLists.txt` 的 `project(libbitcask VERSION 12.0.0)` 单一真源派生：`libbitcask.so` 的 `SOVERSION=12`，`VERSION=12.0.0`，C 端 `bitcask_version_{major,minor,patch,string}()` 同步。
+版本信息由 `CMakeLists.txt` 的 `project(libbitcask VERSION 12.0.1)` 单一真源派生：`libbitcask.so` 的 `SOVERSION=12`，`VERSION=12.0.1`，C 端 `bitcask_version_{major,minor,patch,string}()` 同步。
 
 ### 产物
 
-- `libbitcask.so` — 共享库，导出 C API（`extern "C"`，`SOVERSION=11`）；Windows 为 `bitcask.dll` + `bitcask.lib`（导入库）
+- `libbitcask.so` — 共享库，导出 C API（`extern "C"`，`SOVERSION=12`）；Windows 为 `bitcask.dll` + `bitcask.lib`（导入库）
 - `libbitcask.a` — 把全部静态归档合并为单一 `.a`；Windows 为 `bitcask_static.lib`（换名避免与导入库撞名）
 - `bitcask_migrate` — 统一纪元迁移入口：`detect` / `be2le`（v1 大端 → 当前）/ `tstamp64`（u32 → u64，5.0 flag-day）/ `hintord`（hint 补 ord，5.1 flag-day）
 - `migrate_le` — v1 大端 → 当前纪元（旧入口，等价于 `bitcask_migrate be2le`）

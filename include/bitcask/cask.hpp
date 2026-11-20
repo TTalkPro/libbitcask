@@ -763,10 +763,16 @@ public:
     put_batch(std::span<const BatchItem> items, std::uint64_t tstamp = 0);
 
     // S35：跨崩溃原子批（doc/atomic-batch-design-zh.md）。语义 = put_batch
-    // 的超集：除进程内 all-or-nothing 外，**崩溃/掉电后整批要么全可见要么
-    // 全不可见**（盘上批头声明区间，恢复时区间不完整 ⟹ 整批截断）。
+    // 的超集。三个范围要分开说（S63 起，feedbacks/2026-11-20）：
+    //   1. 条件判定：全部前置条件在写锁内对照批前状态判断，失败整批零副作用；
+    //   2. 崩溃/掉电：整批要么全可见要么全不可见（盘上批头声明区间，恢复时
+    //      区间不完整 ⟹ 整批截断）；
+    //   3. 并发读者：成功提交后对 get / get_owned / read_doc / CaskIter /
+    //      CaskRangeIter **一次性生效**——不存在某个时刻批内一部分 key 是
+    //      新值而另一部分是批前值。这是原子可见，不是快照隔离；两次 get
+    //      之间仍可能插入一个完整批。
     // - 支持批内 REMOVE（kRemove 忽略 value；墓碑成员 v0 编码）。
-    // - 批内 op 依序 apply（同 key 多次 = 批内 LWW）。
+    // - 同 key 多次出现时最后一个 op 生效；各 key 之间没有可观察的先后。
     // - **首次调用把目录 meta 懒升级为 v6**——旧于 5.1.0 的读端拒开该
     //   目录（unsupported meta version）。从不调用本方法的目录停留 v5。
     // - durability 与 put_batch 相同（o_sync / sync_every_n / caller sync()）；
@@ -785,11 +791,22 @@ public:
     //   零副作用，返回 kConditionFailed，outcome->failed_op = 首个不成立的 op
     //   下标。条件只在写入时判断，落盘的仍是普通记录——恢复重放不感知条件。
     //   kCheck 型 op 只校验不写（expect 必须非 kNone；value / doc 忽略）。
+    //   只含 kCheck 的批在写锁内校验全部条件后返回：不写任何字节、不分配
+    //   LSN、不升级 bitcask.meta。可用它确认一组先前读到的 (key, ord) 此刻
+    //   仍是当前版本。
     //   LSN 契约：一个 key 的 LSN 只在它被写入时改变——merge 搬迁原样保留
     //   record 的 ord，重开恢复 / OKI 重建均从 record 读回 ord。
     // - outcome（可空）：成功时 ords[i] = 第 i 个 op 落盘记录的 LSN（kCheck
     //   为 0）；即 get() 随后会返回的 ord，可直接作为下一轮 kOrdEquals 的
     //   期望值。批内同 key 多次时只有最后一个 op 的 LSN 是该 key 的当前版本。
+    // - 不保证：
+    //     * 不是快照。要多 key 一致读，用头条件写回，或用只含 kCheck 的批校验。
+    //     * CaskRangeIter 仍是 per-key 弱一致（迭代途中生效的完整批可能让
+    //       前半段 key 旧、后半段 key 新；这不是「半个批」）。
+    //     * 检索索引（text / vector / meta filter）仍异步提交，search_* 的
+    //       可见时刻晚于 get；要读自己写的，沿用 flush_index()。
+    //     * put_batch（非原子批）仍逐条生效。
+    //     * 跨进程读者不在本契约内。
     // 线程安全: **是**（同 put_batch，内部 write_mu_）。
     struct BatchOp {
         enum class Type : std::uint8_t {

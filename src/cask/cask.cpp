@@ -2818,56 +2818,105 @@ Cask::put_batch_atomic(std::span<const BatchOp> in_ops, std::uint64_t tstamp,
         }
         tasks.clear();
     };
+    // S63：整批在权威索引里一次性发布。items 的 key 两两不同（final_ops
+    // 已保证）；merge race 时被拒 put 成员先重写到新 active 文件（不应用），
+    // 再带着新落点重试整批，因此这条路径上的读者可见性同样是整批的。
+    std::vector<oki::IndexAuthority::BatchApply> items;
+    std::vector<std::size_t> item_ops;
+    items.reserve(apply_order.size());
+    item_ops.reserve(apply_order.size());
+    for (const std::size_t i : apply_order) {
+        item_ops.push_back(i);
+        auto& item = items.emplace_back();
+        item.key = bytes_to_view(ops[i].key);
+        item.remove = ops[i].type == BatchOp::Type::kRemove;
+        item.file_id = batch_file;
+        item.total_size = pw[i].total_size;
+        item.offset = pw[i].offset;
+        item.tstamp = tstamp;
+        item.ord = pw[i].ord;
+    }
+
     bool retried = false;
     std::vector<std::pair<std::size_t, std::uint64_t>> final_ord_override;
-    for (const std::size_t i : apply_order) {
-        const std::size_t slot0 = i + 1;  // og 槽位（0 是批头）
-        if (ops[i].type == BatchOp::Type::kRemove) {
-            authority_->apply_remove(bytes_to_view(ops[i].key), pw[i].ord,
-                                     batch_file,
-                                     pw[i].offset + pw[i].total_size);
-            tasks.push_back({i, slot0,
-                             PersistedRecord{pw[i].ord, pw[i].offset,
-                                             pw[i].total_size, batch_file},
-                             /*is_remove*/ true});
-            continue;
-        }
-        auto pr = authority_->apply_put(bytes_to_view(ops[i].key), batch_file,
-                               pw[i].total_size, pw[i].offset, tstamp,
-                               pw[i].ord);
+    std::vector<std::pair<std::size_t, std::size_t>> retry_slots;
+    std::vector<std::size_t> rejected;
+    for (int attempt = 0;; ++attempt) {
+        auto pr = authority_->apply_batch(items, rejected);
         if (pr == oki::PutResult::kIndexUnavailable) {
             flush_tasks();
             return std::unexpected(err(
                 CaskError::kIndexCorrupt,
                 "oki unavailable while applying atomic batch"));
         }
-        PersistedRecord rec{pw[i].ord, pw[i].offset, pw[i].total_size,
-                            batch_file};
-        std::size_t slot = slot0;
-        if (pr == oki::PutResult::kAlreadyExists) {
-            // merge race：单条重写（区间之外的独立完整记录，正确）。复用
-            // ①b 的预编码 value（kPutDoc 的 meta/vector/fields 一并保留）。
-            const std::span<const std::byte> val(arena.data() + vals[i].off,
-                                                 vals[i].len);
-            std::vector<std::byte> record;
-            codec::encode_data_record(record, format::RecordType::kDoc, tstamp,
-                                      /*ord 占位*/ 0, ops[i].key, val);
-            const std::uint64_t ord2 = authority_->alloc_ord();
-            OrdSkipGuard g2(this, ord2);
-            auto p2 = write_and_keydir(ops[i].key, record, tstamp, ord2);
-            if (!p2) {
-                flush_tasks();  // 已收录条目补交（同 put_batch）
-                return std::unexpected(p2.error());
-            }
-            og.done.push_back(0);
-            og.ords.push_back(p2->ord);
-            g2.disarm();
-            slot = og.ords.size() - 1;
-            rec = *p2;
-            retried = true;
-            final_ord_override.emplace_back(i, p2->ord);
+        if (pr == oki::PutResult::kOk) break;
+        if (attempt >= 2) {
+            flush_tasks();
+            return std::unexpected(err(
+                CaskError::kAlreadyExists,
+                "atomic batch members rejected by concurrent merge"));
         }
-        tasks.push_back({i, slot, rec, /*is_remove*/ false});
+
+        // merge race：先换文件，再把被拒 put 成员重写为「区间之外的独立
+        // 完整记录」（正确，既有契约）。这里只落盘、不应用；等全部重写完
+        // 成后更新落点并整批重试。重写的 ord 在成功登记进 og 之前都由
+        // pending_retry_ords 兜底补 Skip，避免索引重排缓冲出现空号。
+        if (auto r = roll_active(); !r) {
+            flush_tasks();
+            return std::unexpected(r.error());
+        }
+        std::vector<std::uint64_t> pending_retry_ords;
+        for (const std::size_t idx : rejected) {
+            auto& item = items[idx];
+            const std::size_t i = item_ops[idx];
+            if (item.remove) {
+                flush_tasks();
+                return std::unexpected(err(
+                    CaskError::kInvalidOption,
+                    "atomic batch remove rejected by concurrent merge"));
+            }
+            const std::span<const std::byte> val(
+                arena.data() + vals[i].off, vals[i].len);
+            std::vector<std::byte> record;
+            codec::encode_data_record(record, format::RecordType::kDoc,
+                                      tstamp, /*ord 占位*/ 0, ops[i].key,
+                                      val);
+            const std::uint64_t ord2 = authority_->alloc_ord();
+            pending_retry_ords.push_back(ord2);
+            codec::patch_data_record_ord(record, ord2);
+            auto w = active_data_->write_encoded(record);
+            if (!w) {
+                for (const auto& pending : pending_retry_ords) {
+                    complete_index_ord(pending);
+                }
+                flush_tasks();
+                return std::unexpected(io_fault(
+                    w.error().errnum, std::string(active_data_->path())));
+            }
+            pending_retry_ords.pop_back();
+            og.ords.push_back(ord2);
+            og.done.push_back(0);
+            retry_slots.emplace_back(i, og.ords.size() - 1);
+            item.file_id = active_file_id_.load(std::memory_order_relaxed);
+            item.offset = w->offset;
+            item.total_size = w->total_size;
+            item.ord = ord2;
+            final_ord_override.emplace_back(i, ord2);
+        }
+        retried = true;
+    }
+
+    for (std::size_t j = 0; j < items.size(); ++j) {
+        const auto& item = items[j];
+        const std::size_t i = item_ops[j];
+        std::size_t slot = i + 1;  // og 槽位（0 是批头）
+        for (const auto& [op, rewritten_slot] : retry_slots) {
+            if (op == i) slot = rewritten_slot;
+        }
+        const PersistedRecord rec{item.ord, item.offset, item.total_size,
+                                  item.file_id};
+        tasks.push_back(
+            {i, slot, rec, /*is_remove*/ item.remove});
     }
     // S46：outcome.ords——每个写成员落盘记录的 LSN；merge race 单条重写的
     // 成员以重写记录为准（那才是该 key 的当前版本）。

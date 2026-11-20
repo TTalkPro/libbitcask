@@ -5,13 +5,45 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`12.0.0`**；库 `SOVERSION` = **`12`**（= major）；
+`bitcask_version_*` = **`12.0.1`**；库 `SOVERSION` = **`12`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 / 7.0.0 / 8.0.0 / 9.0.0 皆是）。
+
+---
+
+## [12.0.1] - 2026-11-20（S63：原子批对并发读者整批可见）
+
+> **版本语义**：PATCH **12.0.1**。C API、盘上格式与既有 C++ ABI 均不变；
+> `OkiState` / `IndexAuthority` 只新增非虚成员函数与嵌套类型，C++ 下游重新编译可用、已安装库不用升 major。
+
+### Fixed
+
+- **原子批对并发读者一次性生效**（S63，反馈
+  `feedbacks/2026-11-20-atomic-batch-no-read-isolation.md`，keelson / bitcask）：`put_batch_atomic` 此前按 key 字节序逐条
+  `apply_put` / `apply_remove`，读者能看到「新头 + 旧尾」，据此做「头即版本」条件写回会静默覆盖别人的修改。现整批在
+  `IndexAuthority::apply_batch` 的一个 `writer_mu_` 内先裁决、再由 `OkiState::apply_batch` 的一个 `mu_` 临界区发布——读者要么看到整批，
+  要么一行都看不到。merge 竞争时被拒成员先重写落盘、再整批重试，重写路径同样整批可见。条件判定仍整批零副作用；崩溃后仍全有或全无。
+  这是**原子可见，不是快照隔离**：两次读之间仍可插入一个完整提交。`put_batch`（非原子批）、检索索引异步可见性、跨进程读者契约不变。
+
+### Changed
+
+- 原子批契约注释改准：`Cask::put_batch_atomic`、`txn.hpp`、C 头与 `doc/api-c.md` §10.3 明确「同 key 取最后一个 op、各 key 无可观察先后」；
+  并列出不保证项（快照、`CaskRangeIter` per-key 弱一致、检索索引异步、`put_batch` 逐条、跨进程）。只含 check op 的批承诺为
+  「写锁内校验后返回，不写字节、不分配 LSN、不升级 `bitcask.meta`」。
+
+### Added
+
+- S63 并发可见性、merge 竞争整批重试与 check-only 不升 meta 回归：`tests/atomic_batch_visibility_test.cpp`。
+- `BM_Cask_AtomicBatchPointReadP99`：400 行大批 + 4 并发点查读者，观测整批应用期间点查 p99 / p99.9。
+
+### Validation
+
+- GCC Release（`-Werror`）全量 ctest 967 注册 / 965 执行全绿（2 项既有 disabled）；ASan 全量同口径全绿；
+  新用例 TSan 全绿。400 行大批 + 4 点查读者基准：p99 7.4 µs，p99.9 73.4 µs。
 
 ---
 
@@ -2503,7 +2535,8 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/12.0.0...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/12.0.1...HEAD
+[12.0.1]: https://github.com/davidalphafox/libbitcask/compare/12.0.0...12.0.1
 [12.0.0]: https://github.com/davidalphafox/libbitcask/compare/11.2.0...12.0.0
 [11.2.0]: https://github.com/davidalphafox/libbitcask/compare/11.1.1...11.2.0
 [11.1.1]: https://github.com/davidalphafox/libbitcask/compare/11.1.0...11.1.1
