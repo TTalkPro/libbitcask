@@ -1292,6 +1292,37 @@ std::vector<Snippet> TextPlugin::snippets_for(const TermFreqMap& query_terms,
     return highlight(norm, query_token_offsets, opts).snippets;
 }
 
+std::vector<std::pair<std::string, TermFreqMap>>
+TextPlugin::field_query_terms(std::string_view query) const {
+    // 解析与 search_fields_attributed 一致：叶子的 field 为空 ⇒ 默认字段；叶子词过
+    // 分析器；同义词展开（命中可能来自同义词，片段也该标出它）。
+    auto qnode = bitcask::bm25::parse_query(query);
+    std::vector<const bm25::QueryNode*> leaves;
+    std::function<void(const bm25::QueryNode&)> walk = [&](const bm25::QueryNode& n) {
+        if (!n.term.empty()) { leaves.push_back(&n); return; }
+        for (auto& c : n.children) walk(c);
+    };
+    walk(qnode);
+    std::vector<std::pair<std::string, TermFreqMap>> out;
+    auto slot = [&out](const std::string& f) -> TermFreqMap& {
+        for (auto& [name, terms] : out) {
+            if (name == f) return terms;
+        }
+        out.emplace_back(f, TermFreqMap{});
+        return out.back().second;
+    };
+    for (auto* leaf : leaves) {
+        auto& terms = slot(leaf->field);  // 空串 = 默认字段（对外口径）
+        for (auto& [t, tf] : analyzer_->analyze(leaf->term)) {
+            terms[t] += tf;
+            if (synonym_map_) {
+                for (const auto& syn : synonym_map_->expand(t)) terms.try_emplace(syn, 1);
+            }
+        }
+    }
+    return out;
+}
+
 std::vector<Snippet> TextPlugin::highlight_snippets(std::string_view query,
                                                     std::string_view text,
                                                     const HighlightOptions& opts) const {

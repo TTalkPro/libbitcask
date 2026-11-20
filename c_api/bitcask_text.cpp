@@ -281,6 +281,37 @@ BITCASK_API void bitcask_search_fields_result_free(
     std::free(result);
 }
 
+// S60：逐字段片段。opts 语义同 bitcask_search_text_highlight（0/NULL = 默认）。
+BITCASK_API bitcask_error_t bitcask_search_fields_highlight(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_highlight_options_t* opts,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_fields_hl_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+    search::HighlightOptions hopts;
+    if (opts) {
+        if (opts->pre_tag)  hopts.pre_tag  = opts->pre_tag;
+        if (opts->post_tag) hopts.post_tag = opts->post_tag;
+        if (opts->fragment_size > 0) hopts.fragment_size = opts->fragment_size;
+        if (opts->max_fragments > 0) hopts.max_fragments = opts->max_fragments;
+    }
+    const auto pf = parse_meta_filter(filter);
+    if (!pf.ok) return BITCASK_ERR_INVALID_OPTION;
+    return finish_fields_hl(
+        as_cpp_cask(cask)->search_fields_highlight(query, k, hopts, pf.get()), out, fault);
+    });
+}
+
+BITCASK_API void bitcask_search_fields_hl_result_free(
+    bitcask_search_fields_hl_result_t* result) {
+    if (!result) return;
+    free_hit_fields_hl_range(result->hits, result->count);
+    std::free(result->hits);
+    std::free(result);
+}
+
 BITCASK_API bitcask_error_t bitcask_search_near_filtered(
     bitcask_t* cask, const char* query, uint32_t slop, size_t k,
     const bitcask_meta_filter_t* filter,

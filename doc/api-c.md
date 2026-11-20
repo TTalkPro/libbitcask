@@ -1045,6 +1045,33 @@ BITCASK_API bitcask_error_t bitcask_put_doc_ex(bitcask_t* cask,
 **这条补的是一个死 API**：S39 之前，纯 C 建的库无从写入命名字段，`bitcask_search_fields`
 的 `field:term` 在这类库上永远 0 命中。
 
+### 10.1c `bitcask_update_doc`（S61：文档部分更新）
+
+```c
+typedef struct {
+    const bitcask_doc_field_t*  set_fields;      size_t set_fields_count;
+    const bitcask_slice_t*      remove_fields;   size_t remove_fields_count;
+    const bitcask_meta_entry_t* set_meta;        size_t set_meta_count;
+    const char* const*          remove_meta;     size_t remove_meta_count;
+} bitcask_doc_patch_t;
+
+BITCASK_API bitcask_error_t bitcask_update_doc(bitcask_t* cask, bitcask_slice_t key,
+                                              const bitcask_doc_patch_t* patch,
+                                              uint64_t tstamp, uint64_t* out_ord,
+                                              bitcask_fault_t* fault);
+```
+
+只改命名字段与 meta 的若干键：`set_fields` 新增或整值替换（name 非空），`remove_fields` 删除，
+`set_meta` 新增或替换（值表示同 [§10.4](#104-meta-blob-编解码s39) 的 `bitcask_meta_entry_t`），`remove_meta` 删除；
+要删的本来不存在 ⇒ 忽略。正文、向量、per-key 过期时刻原样保留；fields 保持原顺序、新字段追加在后。
+
+- 引擎内原子读-改-写：读当前版本 → 套补丁 → 条件写回（期望版本不变）；读写之间被并发写改过就重读重试，
+  至多 16 次，仍冲突 ⇒ `BITCASK_ERR_CONDITION_FAILED`（调用方可再试）。不必外部加锁。
+- key 不存在 / 已删 / 已过期 ⇒ `BITCASK_ERR_NOT_FOUND`；只读 / merge_only ⇒ `BITCASK_ERR_READ_ONLY`。
+- 同一名字 / 键重复或既 set 又 remove、空字段名、`count > 0` 而数组为 NULL ⇒ `BITCASK_ERR_INVALID_OPTION`，零副作用。
+- `out_ord` 可为 NULL；非 NULL 时成功写回新版本 LSN（同 `bitcask_get_doc` 的 `ord`）。
+- ⚠️ **不省盘**：bitcask 只追加写，新版本仍是一条完整记录、整篇重建索引。省掉的是调用方的读-改-写往返与竞态。
+
 ### 10.2 `bitcask_put_batch`（批量写）
 
 ```c
@@ -1798,6 +1825,34 @@ BITCASK_API bitcask_error_t bitcask_search_text_highlight_ex(
 - 读回的原文**不**回填 LRU（批量看冷文档不把热条目挤出去）。
 - 代价：每条冷命中一次点查 + 一次分析。热命中不受影响。
 - 其余位保留，给了 ⇒ `BITCASK_ERR_INVALID_OPTION`（不静默忽略将来才有含义的位）。
+
+### 13.13c `bitcask_search_fields_highlight`（逐字段片段，S60）
+
+```c
+typedef struct { char* field; bitcask_snippet_t* snippets; size_t snippets_count; } bitcask_field_snippets_t;
+typedef struct {
+    char* key; uint64_t ord; double score;
+    char** fields; size_t fields_count;                         /* 同 bitcask_search_hit_fields_t */
+    bitcask_field_snippets_t* field_snippets; size_t field_snippets_count;
+} bitcask_search_hit_fields_hl_t;
+typedef struct { bitcask_search_hit_fields_hl_t* hits; size_t count; } bitcask_search_fields_hl_result_t;
+
+BITCASK_API bitcask_error_t bitcask_search_fields_highlight(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_highlight_options_t* opts, const bitcask_meta_filter_t* filter,
+    bitcask_search_fields_hl_result_t** out, bitcask_fault_t* fault);
+BITCASK_API void bitcask_search_fields_hl_result_free(bitcask_search_fields_hl_result_t* result);
+```
+
+命中、排序、`fields` 同 `bitcask_search_fields_ex(_filtered)`；每条命中再按它命中的字段各切一组片段：
+
+- 原文从存储读回（`bitcask_get_doc` 同一条读路径），冷热一样：命名字段取该字段的值，默认字段（`field` 为空串）
+  取正文，正文为空取第一个命名字段。
+- 每个字段**只用查询里属于该字段的词**切：`title:rust memory` 的 title 片段只标 rust、默认字段片段只标 memory；
+  同义词展开后的词也标。
+- 读回的版本 ≠ 命中的版本（已被覆盖 / 删除）⇒ 该条 `field_snippets_count == 0`。
+- `field_snippets` 与 `fields` 同序，只列切出了片段的字段。`opts` 语义同 [§13.13](#1313-bitcask_search_text_highlight词袋--高亮片段s39)。
+- 代价：每条命中一次点查 + 每个命中字段一次分析。读回的原文不进原文 LRU。
 - 结果类型与所有权同 `bitcask_search_text_highlight`。
 
 > 什么时候是「冷」：本进程没写过这篇。新开进程 / 只读快照里，已经封进段的文档全是冷的；

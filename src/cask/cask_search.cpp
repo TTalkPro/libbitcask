@@ -287,6 +287,52 @@ Cask::search_fields_attributed(std::string_view query, std::size_t k,
         std::in_place, std::move(*hits));
 }
 
+// S60：逐字段片段。契约见 cask.hpp。
+std::expected<std::vector<search::SearchFieldHitEx>, CaskFault>
+Cask::search_fields_highlight(std::string_view query, std::size_t k,
+                              const search::HighlightOptions& opts,
+                              const meta::MetaFilter* filter) {
+    auto hits = search_fields_attributed(query, k, filter);  // 含 closed / prepare_search
+    if (!hits) return std::unexpected(hits.error());
+    const auto field_terms = text_->field_query_terms(query);
+    auto terms_of = [&field_terms](const std::string& f) -> const text::TermFreqMap* {
+        for (const auto& [name, terms] : field_terms) {
+            if (name == f) return &terms;
+        }
+        return nullptr;
+    };
+    std::vector<search::SearchFieldHitEx> out;
+    out.reserve(hits->size());
+    for (auto& h : *hits) {
+        search::SearchFieldHitEx x{std::move(h.key), h.ord, h.score, std::move(h.fields), {}};
+        auto doc = get_doc_view(
+            std::as_bytes(std::span<const char>(x.key.data(), x.key.size())));
+        // 读不到 / 已被覆盖 ⇒ 不给片段，⛔ 拿新版原文配旧版命中。
+        if (doc && doc->ord == x.ord) {
+            for (const auto& f : x.fields) {
+                const auto* terms = terms_of(f);
+                if (terms == nullptr || terms->empty()) continue;
+                std::span<const std::byte> src;
+                if (f.empty()) {
+                    src = doc->value;
+                    if (src.empty() && !doc->fields.empty()) src = doc->fields.front().value;
+                } else {
+                    for (const auto& fv : doc->fields) {
+                        if (fv.name == f) { src = fv.value; break; }
+                    }
+                }
+                if (src.empty()) continue;
+                const std::string_view text(reinterpret_cast<const char*>(src.data()),
+                                            src.size());
+                auto sn = text_->snippets_for_terms(*terms, text, opts);
+                if (!sn.empty()) x.field_snippets.push_back({f, std::move(sn)});
+            }
+        }
+        out.push_back(std::move(x));
+    }
+    return out;
+}
+
 // search_near：BM25 近邻搜索（S8.7）。
 std::expected<TextSearchResult, CaskFault>
 Cask::search_near(std::string_view query, std::uint32_t slop, std::size_t k,

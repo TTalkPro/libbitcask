@@ -660,6 +660,7 @@ BITCASK_API bitcask_error_t bitcask_put_doc_ex(bitcask_t* cask,
                                               bitcask_fault_t* fault);
 
 
+
 /* 批量写（S13-D1）。语义同逐条 bitcask_put，但整批一次提交：记录聚合写入、
  * 单次 flush 后才更新 keydir 并返回——本进程内 all-or-nothing 可见；
  * durability 与单条 put 的 sync 策略一致（o_sync 即时；sync_every_n>0 整批一次
@@ -874,6 +875,34 @@ BITCASK_API bitcask_error_t bitcask_meta_encode(const bitcask_meta_entry_t* entr
 
 /* 释放 bitcask_meta_encode 的产物（幂等；blob 置空）。 */
 BITCASK_API void bitcask_meta_blob_free(bitcask_slice_t* blob);
+
+/* S61（反馈 2026-11-13 #3）：文档部分更新。只改命名字段与 meta 的若干键，正文 / 向量 /
+ * per-key 过期时刻原样保留；引擎内原子读-改-写（条件写回，期间被并发写改过就重读重试，
+ * 至多 16 次，仍冲突 ⇒ BITCASK_ERR_CONDITION_FAILED，调用方可再试）。
+ *   set_fields    : 新增或整值替换的命名字段（name 非空；同名两次 ⇒ INVALID_OPTION）
+ *   remove_fields : 要删的字段名（本来没有 ⇒ 忽略）
+ *   set_meta      : 新增或替换的 meta 键（值表示同 bitcask_meta_encode）
+ *   remove_meta   : 要删的 meta 键（NUL 结尾；本来没有 ⇒ 忽略）
+ *   同一名字 / 键既 set 又 remove ⇒ INVALID_OPTION。各数组借调用方存储，调用期间读取。
+ * key 不存在 ⇒ BITCASK_ERR_NOT_FOUND。out_ord 可为 NULL；非 NULL 时成功写回新版本 LSN。
+ * ⚠️ 不省盘：新版本仍是一条完整记录、整篇重建索引；省的是调用方的往返与外部加锁。 */
+typedef struct {
+    const bitcask_doc_field_t*  set_fields;
+    size_t                      set_fields_count;
+    const bitcask_slice_t*      remove_fields;
+    size_t                      remove_fields_count;
+    const bitcask_meta_entry_t* set_meta;
+    size_t                      set_meta_count;
+    const char* const*          remove_meta;
+    size_t                      remove_meta_count;
+} bitcask_doc_patch_t;
+
+BITCASK_API bitcask_error_t bitcask_update_doc(bitcask_t* cask,
+                                              bitcask_slice_t key,
+                                              const bitcask_doc_patch_t* patch,
+                                              uint64_t tstamp,
+                                              uint64_t* out_ord,
+                                              bitcask_fault_t* fault);
 
 /* 零拷贝值视图：STRING 的 str 借 blob 内存，**不保证 NUL 结尾**（用 str.size），
  * 生命周期跟着 blob 走，不需要 free。这是与 bitcask_meta_value_t 的唯一区别

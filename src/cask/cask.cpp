@@ -2974,6 +2974,117 @@ Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
     return {};
 }
 
+// S61：文档部分更新。契约见 cask.hpp。读当前版本 → 套 patch → 条件写回（期望 LSN
+// 不变），冲突重读重试。条件判定与 get 同一条读路径（S46），故「读到的那一版」与
+// 「写回时仍是那一版」用的是同一把尺。
+std::expected<std::uint64_t, CaskFault>
+Cask::update_doc(std::span<const std::byte> key, const DocPatch& patch,
+                 std::uint64_t tstamp) {
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
+    if (!opts_.read_write || opts_.merge_only) {
+        return std::unexpected(err(CaskError::kReadOnly));
+    }
+    // 补丁自洽性（不碰盘）：名字非空、无重复、set 与 remove 不相交。
+    {
+        std::vector<std::string_view> names;
+        for (const auto& [n, _] : patch.set_fields) {
+            if (n.empty()) {
+                return std::unexpected(err(CaskError::kInvalidOption,
+                    "update_doc: field name must not be empty (text is not patchable)"));
+            }
+            names.push_back(n);
+        }
+        std::sort(names.begin(), names.end());
+        if (std::adjacent_find(names.begin(), names.end()) != names.end()) {
+            return std::unexpected(err(CaskError::kInvalidOption,
+                "update_doc: duplicate field in set_fields"));
+        }
+        for (const auto& r : patch.remove_fields) {
+            if (std::binary_search(names.begin(), names.end(), std::string_view(r))) {
+                return std::unexpected(err(CaskError::kInvalidOption,
+                    "update_doc: field both set and removed: " + r));
+            }
+        }
+        std::vector<std::string_view> mkeys;
+        for (const auto& e : patch.set_meta) mkeys.push_back(e.key);
+        std::sort(mkeys.begin(), mkeys.end());
+        if (std::adjacent_find(mkeys.begin(), mkeys.end()) != mkeys.end()) {
+            return std::unexpected(err(CaskError::kInvalidOption,
+                "update_doc: duplicate key in set_meta"));
+        }
+        for (const auto& r : patch.remove_meta) {
+            if (std::binary_search(mkeys.begin(), mkeys.end(), std::string_view(r))) {
+                return std::unexpected(err(CaskError::kInvalidOption,
+                    "update_doc: meta key both set and removed: " + r));
+            }
+        }
+    }
+    constexpr int kMaxAttempts = 16;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        auto cur = get_doc_view(key);
+        if (!cur) return std::unexpected(cur.error());  // kNotFound / 读错误原样
+
+        // fields：保持原顺序，删 / 换就地，新的追加。
+        DocInput doc;
+        doc.text = cur->value;
+        doc.vector = cur->vector;
+        doc.expiry_at = cur->expiry_at;
+        auto in = [](const auto& v, std::string_view n) {
+            return std::find(v.begin(), v.end(), n) != v.end();
+        };
+        for (const auto& f : cur->fields) {
+            if (in(patch.remove_fields, f.name)) continue;
+            auto it = std::find_if(patch.set_fields.begin(), patch.set_fields.end(),
+                                   [&](const auto& s) { return s.first == f.name; });
+            doc.fields.emplace_back(f.name, it != patch.set_fields.end() ? it->second : f.value);
+        }
+        for (const auto& [n, v] : patch.set_fields) {
+            const bool existed = std::any_of(cur->fields.begin(), cur->fields.end(),
+                                             [&](const auto& f) { return f.name == n; });
+            if (!existed) doc.fields.emplace_back(n, v);
+        }
+
+        // meta：解码 → 合并 → 按 key 重排编码（格式不变式）。
+        std::vector<meta::MetaEntry> entries;
+        if (!cur->meta.empty()) {
+            auto dec = meta::decode_meta(cur->meta);
+            if (!dec) {
+                return std::unexpected(err(CaskError::kIo,
+                    "update_doc: stored meta undecodable: " + dec.error()));
+            }
+            entries = std::move(*dec);
+        }
+        std::erase_if(entries, [&](const meta::MetaEntry& e) {
+            return in(patch.remove_meta, e.key);
+        });
+        for (const auto& s : patch.set_meta) {
+            auto it = std::find_if(entries.begin(), entries.end(),
+                                   [&](const meta::MetaEntry& e) { return e.key == s.key; });
+            if (it != entries.end()) it->value = s.value;
+            else entries.push_back(s);
+        }
+        std::sort(entries.begin(), entries.end(),
+                  [](const meta::MetaEntry& a, const meta::MetaEntry& b) { return a.key < b.key; });
+        std::vector<std::byte> meta_blob;
+        if (!entries.empty()) meta::encode_meta(meta_blob, entries);
+        doc.meta = meta_blob;
+
+        BatchOp op;
+        op.type = BatchOp::Type::kPutDoc;
+        op.key = key;
+        op.doc = &doc;
+        op.expect = BatchOp::Expect::kOrdEquals;
+        op.expect_ord = cur->ord;
+        BatchOutcome outcome;
+        auto r = put_batch_atomic(std::span<const BatchOp>(&op, 1), tstamp, &outcome);
+        if (r) return outcome.ords.empty() ? std::uint64_t{0} : outcome.ords.front();
+        if (r.error().kind != CaskError::kConditionFailed) return std::unexpected(r.error());
+        // 读与写之间被并发写改过 ⇒ 重读重试。
+    }
+    return std::unexpected(err(CaskError::kConditionFailed,
+        "update_doc: document kept changing under concurrent writes; retry"));
+}
+
 // put_doc：写入结构化文档（text + 选填 meta）。用于索引模式。
 // 逻辑跟 put 类似，但 DocValue 编码包含 text 和 meta 两段。
 std::expected<void, CaskFault>

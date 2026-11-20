@@ -30,7 +30,7 @@ KV 库读写写入若干条、关闭；删 `kv.oki.*`；`read_write = 0` 打开�
 
 ## 回没回
 
-**已改（未发版，S54）。** 行为本来就是对的，改的是说明。核对过：只读打开时 recovery 走 `rebuild_memory_from_data`
+**已改（9.1.0 已发版，S54）。** 行为本来就是对的，改的是说明。核对过：只读打开时 recovery 走 `rebuild_memory_from_data`
 （内存读视图、不写盘），失败才置 `oki_rebuild_failed_` ⇒ `INDEX_REBUILD_FAILED`；`NO_INDEX` 只出在 merge-only 句柄。
 
 改动面：`bitcask_kv.h`（range 注释与 `INDEX_REBUILD_FAILED` 枚举注释）、`cask.hpp`（`kNoIndex` / `kIndexRebuildFailed`

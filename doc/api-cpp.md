@@ -629,6 +629,23 @@ put_doc(std::span<const std::byte> key, const DocInput& doc,
 
 写入结构化文档（text + 选填 meta / vector / fields），用于索引模式。线程安全：是（同 `put`）。
 
+#### `Cask::update_doc`（S61：文档部分更新）
+
+```cpp
+struct DocPatch {
+    std::vector<std::pair<std::string, std::span<const std::byte>>> set_fields;
+    std::vector<std::string> remove_fields;
+    std::vector<meta::MetaEntry> set_meta;
+    std::vector<std::string> remove_meta;
+};
+[[nodiscard]] std::expected<std::uint64_t, CaskFault>
+update_doc(std::span<const std::byte> key, const DocPatch& patch, std::uint64_t tstamp = 0);
+```
+
+只改命名字段与 meta 的若干键，正文 / 向量 / 过期时刻原样保留；引擎内原子读-改-写（S46 条件写回，冲突重读重试
+至多 16 次，仍冲突 ⇒ `kConditionFailed`）。返回新版本 LSN。错误与口径同 C API [`bitcask_update_doc`](api-c.md)。
+⚠️ 不省盘：新版本仍是一条完整记录、整篇重建索引。
+
 #### 多键事务：`bitcask::TxnCask`（S34，`txn.hpp`）
 
 ```cpp
@@ -825,6 +842,23 @@ S53：片段只取原文 LRU（`SearchLayerConfig::doc_text_cache_max`，缺省 
 命中经 `get_doc_view` 读回正文，再由 `TextPlugin::highlight_snippets` 切片段（与 LRU 命中同一条路）。
 口径（取哪段文字、只认命中那一版、不回填 LRU、代价）同 C API [`bitcask_search_text_highlight_ex`](api-c.md)。
 三参版 ≙ `ColdText::kSkip`。
+
+#### `Cask::search_fields_highlight`（逐字段片段，S60）
+
+```cpp
+struct FieldSnippets { std::string field; std::vector<Snippet> snippets; };
+struct SearchFieldHitEx {
+    std::string key; Lsn ord; double score;
+    std::vector<std::string> fields; std::vector<FieldSnippets> field_snippets;
+};
+[[nodiscard]] std::expected<std::vector<search::SearchFieldHitEx>, CaskFault>
+search_fields_highlight(std::string_view query, std::size_t k = 10,
+                        const search::HighlightOptions& opts = {},
+                        const meta::MetaFilter* filter = nullptr);
+```
+
+`search_fields_attributed` + 每个命中字段一组片段（原文从存储读回、每个字段只用该字段的查询词）。口径同 C API
+[`bitcask_search_fields_highlight`](api-c.md)。
 
 #### 同义词词典（open-time 配置）
 

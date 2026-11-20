@@ -334,6 +334,20 @@ struct DocInput {
     std::uint64_t expiry_at = 0;  // S13-D5：per-key 过期时刻（0 = 永不）
 };
 
+// S61（反馈 2026-11-13 #3）：文档部分更新的补丁（Cask::update_doc）。只动命名字段与
+// meta 的若干键；正文（text）、向量、过期时刻原样保留。
+// - set_fields：新增或整值替换命名字段（名字非空；同名出现两次 ⇒ kInvalidOption）；
+// - remove_fields：删除命名字段（本来没有 ⇒ 忽略）；
+// - set_meta：新增或替换 meta 键；remove_meta：删除 meta 键（本来没有 ⇒ 忽略）；
+// - 同一个名字 / 键既在 set 又在 remove ⇒ kInvalidOption。
+// 字段值必须是 UTF-8（同 DocInput::fields）。值借调用方存储，调用期间有效即可。
+struct DocPatch {
+    std::vector<std::pair<std::string, std::span<const std::byte>>> set_fields;
+    std::vector<std::string> remove_fields;
+    std::vector<meta::MetaEntry> set_meta;
+    std::vector<std::string> remove_meta;
+};
+
 // S45-5：索引一致性核对报告（Cask::verify_index_consistency）。诊断用，不在
 // 启动路径上。「索引」以宿主 docmap 为代表（插件写入恒在 docmap 之后、按同
 // 一裁决），权威 = OKI。
@@ -812,6 +826,20 @@ public:
     put_doc(std::span<const std::byte> key, const DocInput& doc,
             std::uint64_t tstamp = 0);
 
+    // S61（反馈 2026-11-13 #3）：文档部分更新——在引擎内读出当前版本、套上 patch、写回新
+    // 版本，对调用方是一次原子的读-改-写：写回走 S46 条件写（期望 LSN 仍是读到的那一版），
+    // 期间被并发写改过就重读重试（至多 16 次，仍冲突 ⇒ kConditionFailed，调用方可再试）。
+    // - key 不存在 / 已删 / 已过期 ⇒ kNotFound；只读 / merge_only ⇒ kReadOnly；
+    // - 正文、向量、per-key 过期时刻原样保留；fields 保持原顺序，新字段追加在后；
+    //   meta 键合并后按格式要求重排；
+    // - 返回新版本的 LSN（同 get 的 ord）。
+    // ⚠️ 不省盘：bitcask 只追加写，新版本仍是一条完整记录、整篇重建索引。省掉的是调用方
+    // 自己读-改-写的往返与竞态（不必外部加锁）。
+    // 线程安全: **是**（同 put_doc）。
+    [[nodiscard]] std::expected<std::uint64_t, CaskFault>
+    update_doc(std::span<const std::byte> key, const DocPatch& patch,
+               std::uint64_t tstamp = 0);
+
     // BM25 文本搜索（词袋模式）。
     // 线程安全: **是**（并发读安全：cache_/doc_texts_ 各 shared_mutex、倒排/HNSW
     // shared_lock、analyzer const;S6/S7 TSan 已证）。与并发写安全,可见性遵循
@@ -911,6 +939,20 @@ public:
     [[nodiscard]] std::expected<std::vector<search::SearchFieldHit>, CaskFault>
     search_fields_attributed(std::string_view query, std::size_t k = 10,
                              const meta::MetaFilter* filter = nullptr);
+
+    // S60（反馈 2026-11-13 #1 后半）：search_fields_attributed + **逐字段片段**。排序、
+    // 命中与 fields 同 search_fields_attributed；每条命中再按它命中的字段各切一组片段：
+    // - 原文从存储读回（get_doc_view 同一条读路径）：命名字段取该字段的值，默认字段取正文
+    //   （正文空取第一个命名字段，同原文 LRU 口径）；
+    // - 每个字段只用查询里属于该字段的词切（`title:rust body:memory` 的 title 片段只标 rust），
+    //   默认字段用无字段限定的词；同义词展开后的词也标；
+    // - 只认命中的那一版：读回的 ord ≠ 命中的 ord（已被覆盖 / 删除）⇒ 该条不给片段。
+    // 代价：每条命中一次点查 + 每个命中字段一次分析。读回的原文不进原文 LRU。
+    // 线程安全：是（同 search_fields）。
+    [[nodiscard]] std::expected<std::vector<search::SearchFieldHitEx>, CaskFault>
+    search_fields_highlight(std::string_view query, std::size_t k = 10,
+                            const search::HighlightOptions& opts = {},
+                            const meta::MetaFilter* filter = nullptr);
 
     // BM25 近邻搜索（S8.7）：term 按序出现且相邻间隙 ≤ slop。slop=0 即短语。
     // 线程安全: **是**（并发读安全，同 search_text）。

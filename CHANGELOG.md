@@ -15,6 +15,23 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
+## [Unreleased]（S60 / S61：逐字段片段、文档部分更新）
+
+> 版本未定。全是纯新增：C++ 新类型 `search::FieldSnippets` / `search::SearchFieldHitEx` / `DocPatch` 与
+> `Cask` / `TextPlugin` 新成员函数（非虚，不改既有布局）；C API 新结构体 + 新函数。盘上格式零改动。
+
+### Added
+
+- **逐字段片段**（S60，反馈 `feedbacks/2026-11-13-doc-capability-gaps.md` #1 后半，锦书）：
+  `Cask::search_fields_highlight` / C `bitcask_search_fields_highlight` + `bitcask_search_fields_hl_result_free`。
+  命中、排序、命中字段同 `search_fields_attributed`；每个命中字段一组片段，原文从存储读回（冷热一样），
+  每个字段只用查询里属于该字段的词切（同义词展开后的也标）；读回版本 ≠ 命中版本则不给。
+- **文档部分更新**（S61，同反馈 #3）：`Cask::update_doc(key, DocPatch)` / C `bitcask_update_doc` + `bitcask_doc_patch_t`。
+  只改命名字段与 meta 的若干键（设置 / 删除），正文、向量、过期时刻原样保留；引擎内原子读-改-写（S46 条件写回，
+  冲突重读重试至多 16 次，仍冲突 ⇒ `kConditionFailed`），返回新版本 LSN。⚠️ 不省盘：新版本仍是整条记录、整篇重建索引。
+
+---
+
 ## [11.1.1] - 2026-11-20（S58 / S59：merge_only 旁车合并）
 
 > **版本语义（2026-11-20 定版）**：纯行为修复——C API、盘上格式、公共结构体布局零改动，

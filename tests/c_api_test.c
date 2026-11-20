@@ -2466,6 +2466,121 @@ static int test_meta_read_and_stored_analyzer(void) {
 }
 #undef MR_CHECK
 
+#define DO_CHECK(cond) do { if (!(cond)) { \
+    fprintf(stderr, "FAIL test_field_snippets_and_update_doc: line %d: %s\n", __LINE__, #cond); \
+    if (cask) bitcask_close(cask); return 1; } } while (0)
+
+/* S60 / S61（反馈 2026-11-13 #1 后半 / #3）：bitcask_search_fields_highlight 逐字段片段 +
+ * bitcask_update_doc 部分更新。⚠ 调用 ⛔ 写进 assert（Release 带 NDEBUG 会整个编掉）。 */
+static int test_field_snippets_and_update_doc(void) {
+    const char* dir = TDIR("docops");
+    rmrf(dir);
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.enable_search = 1;
+    opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    DO_CHECK(bitcask_open(dir, &opts, &cask, &fault) == BITCASK_OK);
+
+    bitcask_meta_entry_t me[2];
+    memset(me, 0, sizeof(me));
+    me[0].key = "x";  me[0].value.type = BITCASK_META_VALUE_INT64; me[0].value.i64 = 1;
+    me[1].key = "z";  me[1].value.type = BITCASK_META_VALUE_BOOL;  me[1].value.i64 = 1;
+    bitcask_slice_t blob = {NULL, 0};
+    DO_CHECK(bitcask_meta_encode(me, 2, &blob, &fault) == BITCASK_OK);
+    bitcask_doc_field_t fields[2] = {
+        {{"title", 5}, {"rust ownership", 14}},
+        {{"alias", 5}, {"crab", 4}},
+    };
+    bitcask_doc_input_ex_t doc;
+    memset(&doc, 0, sizeof(doc));
+    doc.text = (bitcask_slice_t){"memory without collector", 24};
+    doc.meta = blob;
+    doc.fields = fields;
+    doc.fields_count = 2;
+    DO_CHECK(bitcask_put_doc_ex(cask, (bitcask_slice_t){"c1", 2}, &doc, 0, &fault) == BITCASK_OK);
+    bitcask_meta_blob_free(&blob);
+
+    /* S60：title 片段只标 title 的词，默认字段片段标无限定词。 */
+    bitcask_search_fields_hl_result_t* r = NULL;
+    DO_CHECK(bitcask_search_fields_highlight(cask, "title:rust memory", 10, NULL, NULL, &r,
+                                             &fault) == BITCASK_OK);
+    DO_CHECK(r != NULL && r->count == 1 && r->hits[0].field_snippets_count == 2);
+    int saw_title = 0, saw_default = 0;
+    for (size_t i = 0; i < r->hits[0].field_snippets_count; i++) {
+        const bitcask_field_snippets_t* fs = &r->hits[0].field_snippets[i];
+        DO_CHECK(fs->snippets_count >= 1);
+        if (strcmp(fs->field, "title") == 0) {
+            saw_title = 1;
+            DO_CHECK(strstr(fs->snippets[0].text, "<em>rust</em>") != NULL);
+        } else if (fs->field[0] == '\0') {
+            saw_default = 1;
+            DO_CHECK(strstr(fs->snippets[0].text, "<em>memory</em>") != NULL);
+        }
+    }
+    DO_CHECK(saw_title && saw_default);
+    bitcask_search_fields_hl_result_free(r);
+    r = NULL;
+    bitcask_search_fields_hl_result_free(NULL);  /* NULL 安全 */
+
+    /* S61：改 title、删 alias、加 tags；meta 改 x、删 z、加 w。 */
+    bitcask_doc_field_t setf[2] = {
+        {{"title", 5}, {"new title", 9}},
+        {{"tags", 4}, {"fresh", 5}},
+    };
+    bitcask_slice_t rmf[1] = {{"alias", 5}};
+    bitcask_meta_entry_t setm[2];
+    memset(setm, 0, sizeof(setm));
+    setm[0].key = "x"; setm[0].value.type = BITCASK_META_VALUE_INT64; setm[0].value.i64 = 42;
+    setm[1].key = "w"; setm[1].value.type = BITCASK_META_VALUE_STRING; setm[1].value.str = "hi";
+    const char* rmm[1] = {"z"};
+    bitcask_doc_patch_t patch;
+    memset(&patch, 0, sizeof(patch));
+    patch.set_fields = setf;   patch.set_fields_count = 2;
+    patch.remove_fields = rmf; patch.remove_fields_count = 1;
+    patch.set_meta = setm;     patch.set_meta_count = 2;
+    patch.remove_meta = rmm;   patch.remove_meta_count = 1;
+    uint64_t ord = 0;
+    DO_CHECK(bitcask_update_doc(cask, (bitcask_slice_t){"c1", 2}, &patch, 0, &ord, &fault) ==
+             BITCASK_OK);
+
+    bitcask_get_doc_result_t* g = NULL;
+    DO_CHECK(bitcask_get_doc(cask, (bitcask_slice_t){"c1", 2}, &g, &fault) == BITCASK_OK);
+    DO_CHECK(g != NULL && g->ord == ord);
+    DO_CHECK(g->value.size == 24 && memcmp(g->value.data, "memory without collector", 24) == 0);
+    DO_CHECK(g->fields_count == 2);
+    DO_CHECK(strcmp(g->fields[0].name, "title") == 0 && g->fields[0].value.size == 9);
+    DO_CHECK(strcmp(g->fields[1].name, "tags") == 0);
+    bitcask_meta_value_view_t mv;
+    DO_CHECK(bitcask_meta_lookup(g->meta, "x", &mv) == 1 && mv.i64 == 42);
+    DO_CHECK(bitcask_meta_lookup(g->meta, "w", &mv) == 1 && mv.str.size == 2);
+    DO_CHECK(bitcask_meta_lookup(g->meta, "z", &mv) == 0);
+    bitcask_get_doc_result_free(g);
+
+    /* 不存在 ⇒ NOT_FOUND；set 与 remove 相交 ⇒ INVALID_OPTION；count>0 但数组 NULL ⇒ INVALID_OPTION。 */
+    DO_CHECK(bitcask_update_doc(cask, (bitcask_slice_t){"nope", 4}, &patch, 0, NULL, &fault) ==
+             BITCASK_ERR_NOT_FOUND);
+    bitcask_slice_t rm_title[1] = {{"title", 5}};
+    bitcask_doc_patch_t bad;
+    memset(&bad, 0, sizeof(bad));
+    bad.set_fields = setf;        bad.set_fields_count = 1;
+    bad.remove_fields = rm_title; bad.remove_fields_count = 1;
+    DO_CHECK(bitcask_update_doc(cask, (bitcask_slice_t){"c1", 2}, &bad, 0, NULL, &fault) ==
+             BITCASK_ERR_INVALID_OPTION);
+    memset(&bad, 0, sizeof(bad));
+    bad.set_meta_count = 1;
+    DO_CHECK(bitcask_update_doc(cask, (bitcask_slice_t){"c1", 2}, &bad, 0, NULL, &fault) ==
+             BITCASK_ERR_INVALID_OPTION);
+
+    bitcask_close(cask);
+    rmrf(dir);
+    printf("PASS test_field_snippets_and_update_doc\n");
+    return 0;
+}
+#undef DO_CHECK
+
 int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
@@ -2494,6 +2609,7 @@ int main(void) {
     failures += test_paging_and_highlight();
     failures += test_highlight_load_cold();
     failures += test_meta_read_and_stored_analyzer();
+    failures += test_field_snippets_and_update_doc();
     failures += test_meta_filter_query();
     failures += test_merge_policy_files_checkpoint();
 

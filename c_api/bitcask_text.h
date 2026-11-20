@@ -212,6 +212,49 @@ BITCASK_API void bitcask_search_fields_result_free(
     bitcask_search_fields_result_t* result);
 
 /* ===========================================================================
+ *  逐字段片段（S60，反馈 2026-11-13 #1 后半）——bitcask_search_fields_ex 的高亮版
+ *
+ *  命中、排序、fields 同 bitcask_search_fields_ex(_filtered)；每条命中再按它命中的字段
+ *  各切一组片段：原文从存储读回（bitcask_get_doc 同一条读路径；命名字段取该字段的值，
+ *  默认字段取正文，正文空取第一个命名字段），每个字段只用查询里属于该字段的词切
+ *  （`title:rust body:memory` 的 title 片段只标 rust），同义词展开后的词也标。读回的版本
+ *  ≠ 命中的版本（已被覆盖 / 删除）⇒ 该条 field_snippets_count == 0。
+ *  代价：每条命中一次点查 + 每个命中字段一次分析。纯新增，既有结构零改动。
+ * ========================================================================= */
+
+typedef struct {
+    char*              field;           /* NUL 结尾，malloc；空串 = 默认字段 */
+    bitcask_snippet_t* snippets;        /* 片段数组（同 bitcask_search_hit_ex_t.highlights） */
+    size_t             snippets_count;
+} bitcask_field_snippets_t;
+
+typedef struct {
+    char*                     key;                  /* NUL 结尾，malloc */
+    uint64_t                  ord;
+    double                    score;                /* 同 bitcask_search_hit_fields_t */
+    char**                    fields;               /* 同 bitcask_search_hit_fields_t */
+    size_t                    fields_count;
+    bitcask_field_snippets_t* field_snippets;       /* 与 fields 同序，只列切出了片段的字段 */
+    size_t                    field_snippets_count;
+} bitcask_search_hit_fields_hl_t;
+
+typedef struct {
+    bitcask_search_hit_fields_hl_t* hits;
+    size_t                          count;
+} bitcask_search_fields_hl_result_t;
+
+/* opts：NULL / 字段留 0 = 默认（同 bitcask_search_text_highlight）；filter：NULL = 不过滤。
+ * 成功时 *out 指向新建结果，用完调 bitcask_search_fields_hl_result_free。线程安全：是。 */
+BITCASK_API bitcask_error_t bitcask_search_fields_highlight(
+    bitcask_t* cask, const char* query, size_t k,
+    const bitcask_highlight_options_t* opts,
+    const bitcask_meta_filter_t* filter,
+    bitcask_search_fields_hl_result_t** out, bitcask_fault_t* fault);
+
+BITCASK_API void bitcask_search_fields_hl_result_free(
+    bitcask_search_fields_hl_result_t* result);
+
+/* ===========================================================================
  *  高亮检索（S39）——补上 C++ Cask::search_text_highlight（S13-D3）的 C 表示
  * ========================================================================= */
 

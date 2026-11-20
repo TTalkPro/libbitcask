@@ -400,6 +400,112 @@ inline bitcask_error_t finish_single_fields(
     return BITCASK_OK;
 }
 
+// S60：逐字段片段结果物化。三层 malloc（hit → field_snippets → snippets），OOM 逐层回滚：
+// 每层先清零再填，free_hit_fields_hl_range 只看已初始化的计数。
+inline void free_snippet_array(bitcask_snippet_t* sn, std::size_t n) noexcept {
+    for (std::size_t i = 0; i < n; ++i) std::free(sn[i].text);
+    std::free(sn);
+}
+
+inline void free_hit_fields_hl_range(bitcask_search_hit_fields_hl_t* hits,
+                                     std::size_t n) noexcept {
+    for (std::size_t i = 0; i < n; ++i) {
+        std::free(hits[i].key);
+        for (std::size_t j = 0; j < hits[i].fields_count; ++j) std::free(hits[i].fields[j]);
+        std::free(hits[i].fields);
+        for (std::size_t j = 0; j < hits[i].field_snippets_count; ++j) {
+            std::free(hits[i].field_snippets[j].field);
+            free_snippet_array(hits[i].field_snippets[j].snippets,
+                               hits[i].field_snippets[j].snippets_count);
+        }
+        std::free(hits[i].field_snippets);
+    }
+}
+
+inline bool fill_hit_fields_hl(bitcask::search::SearchFieldHitEx& hit,
+                               bitcask_search_hit_fields_hl_t& dst) {
+    dst.key = nullptr;
+    dst.ord = hit.ord;
+    dst.score = hit.score;
+    dst.fields = nullptr;
+    dst.fields_count = 0;
+    dst.field_snippets = nullptr;
+    dst.field_snippets_count = 0;
+    dst.key = strdup(hit.key.c_str());
+    if (!dst.key) return false;
+    if (!hit.fields.empty()) {
+        dst.fields = static_cast<char**>(std::malloc(sizeof(char*) * hit.fields.size()));
+        if (!dst.fields) return false;
+        for (std::size_t j = 0; j < hit.fields.size(); ++j) {
+            dst.fields[j] = strdup(hit.fields[j].c_str());
+            if (!dst.fields[j]) return false;
+            dst.fields_count = j + 1;
+        }
+    }
+    if (!hit.field_snippets.empty()) {
+        const std::size_t nf = hit.field_snippets.size();
+        dst.field_snippets = static_cast<bitcask_field_snippets_t*>(
+            std::malloc(sizeof(bitcask_field_snippets_t) * nf));
+        if (!dst.field_snippets) return false;
+        for (std::size_t j = 0; j < nf; ++j) {
+            auto& fs = dst.field_snippets[j];
+            const auto& src = hit.field_snippets[j];
+            fs.field = nullptr;
+            fs.snippets = nullptr;
+            fs.snippets_count = 0;
+            dst.field_snippets_count = j + 1;  // 本条已清零，可安全回滚
+            fs.field = strdup(src.field.c_str());
+            if (!fs.field) return false;
+            if (!src.snippets.empty()) {
+                fs.snippets = static_cast<bitcask_snippet_t*>(
+                    std::malloc(sizeof(bitcask_snippet_t) * src.snippets.size()));
+                if (!fs.snippets) return false;
+                for (std::size_t q = 0; q < src.snippets.size(); ++q) {
+                    fs.snippets[q].score = src.snippets[q].score;
+                    fs.snippets[q].text = strdup(src.snippets[q].text.c_str());
+                    if (!fs.snippets[q].text) return false;
+                    fs.snippets_count = q + 1;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+inline bitcask_error_t finish_fields_hl(
+    std::expected<std::vector<bitcask::search::SearchFieldHitEx>, bitcask::CaskFault>&& result,
+    bitcask_search_fields_hl_result_t** out, bitcask_fault_t* fault) {
+    if (!result) {
+        to_c_error(result.error(), fault);
+        return to_c_error_kind(result.error().kind);
+    }
+    auto* r = static_cast<bitcask_search_fields_hl_result_t*>(
+        std::malloc(sizeof(bitcask_search_fields_hl_result_t)));
+    if (!r) {
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
+    r->count = result->size();
+    r->hits = static_cast<bitcask_search_hit_fields_hl_t*>(
+        std::malloc(sizeof(bitcask_search_hit_fields_hl_t) * (r->count ? r->count : 1)));
+    if (!r->hits) {
+        std::free(r);
+        set_oom_fault(fault);
+        return BITCASK_ERR_IO;
+    }
+    for (std::size_t i = 0; i < r->count; ++i) {
+        if (!fill_hit_fields_hl((*result)[i], r->hits[i])) {
+            free_hit_fields_hl_range(r->hits, i + 1);  // 含本条已填的部分
+            std::free(r->hits);
+            std::free(r);
+            set_oom_fault(fault);
+            return BITCASK_ERR_IO;
+        }
+    }
+    *out = r;
+    return BITCASK_OK;
+}
+
 // 把 C++ 批量搜索的 n 个 expected 物化为 malloc 的 n 元结果数组（S12-5）。三种批量
 // （text/vector/hybrid）返回类型相同，故共用。out_results[i]：成功=result 指针，
 // 失败=NULL；fault 回填首个失败查询详情。calloc 失败返回 BITCASK_ERR_IO。

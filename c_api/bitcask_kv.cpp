@@ -1940,4 +1940,63 @@ BITCASK_API int bitcask_meta_lookup(bitcask_slice_t blob,
     }
 }
 
+// S61：文档部分更新。C 补丁 → C++ DocPatch（值借调用方存储，调用期间有效）。
+BITCASK_API bitcask_error_t bitcask_update_doc(bitcask_t* cask,
+                                              bitcask_slice_t key,
+                                              const bitcask_doc_patch_t* patch,
+                                              uint64_t tstamp,
+                                              uint64_t* out_ord,
+                                              bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !patch || !slice_valid(key)) return BITCASK_ERR_INVALID_OPTION;
+    if ((patch->set_fields_count && !patch->set_fields) ||
+        (patch->remove_fields_count && !patch->remove_fields) ||
+        (patch->set_meta_count && !patch->set_meta) ||
+        (patch->remove_meta_count && !patch->remove_meta)) {
+        set_invalid(fault, "bitcask_update_doc: array is NULL but count > 0");
+        return BITCASK_ERR_INVALID_OPTION;
+    }
+    bitcask::DocPatch p;
+    for (size_t i = 0; i < patch->set_fields_count; ++i) {
+        const auto& f = patch->set_fields[i];
+        if (!slice_valid(f.name) || !slice_valid(f.value)) return BITCASK_ERR_INVALID_OPTION;
+        p.set_fields.emplace_back(
+            std::string(static_cast<const char*>(f.name.data), f.name.size), to_span(f.value));
+    }
+    for (size_t i = 0; i < patch->remove_fields_count; ++i) {
+        const auto& n = patch->remove_fields[i];
+        if (!slice_valid(n)) return BITCASK_ERR_INVALID_OPTION;
+        p.remove_fields.emplace_back(static_cast<const char*>(n.data), n.size);
+    }
+    for (size_t i = 0; i < patch->set_meta_count; ++i) {
+        const auto& e = patch->set_meta[i];
+        if (!e.key) {
+            set_invalid(fault, "bitcask_update_doc: set_meta key is NULL");
+            return BITCASK_ERR_INVALID_OPTION;
+        }
+        meta::MetaEntry me;
+        me.key = e.key;
+        if (!to_cpp_meta_value(e.value, me.value)) {
+            set_invalid(fault, "bitcask_update_doc: bad meta value type or NULL string");
+            return BITCASK_ERR_INVALID_OPTION;
+        }
+        p.set_meta.push_back(std::move(me));
+    }
+    for (size_t i = 0; i < patch->remove_meta_count; ++i) {
+        if (!patch->remove_meta[i]) {
+            set_invalid(fault, "bitcask_update_doc: remove_meta key is NULL");
+            return BITCASK_ERR_INVALID_OPTION;
+        }
+        p.remove_meta.emplace_back(patch->remove_meta[i]);
+    }
+    auto r = as_cpp_cask(cask)->update_doc(to_span(key), p, tstamp);
+    if (!r) {
+        to_c_error(r.error(), fault);
+        return to_c_error_kind(r.error().kind);
+    }
+    if (out_ord) *out_ord = *r;
+    return BITCASK_OK;
+    });
+}
+
 }  // extern "C"

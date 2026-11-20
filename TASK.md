@@ -10,6 +10,38 @@
 
 ---
 
+## 🔴 S60 / S61 · 逐字段片段 + 文档部分更新（2026-11-20 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-13-doc-capability-gaps.md`](feedbacks/2026-11-13-doc-capability-gaps.md)（锦书 §Q-21）的遗留：
+> #1 后半「逐字段 snippet」、#3「文档无部分更新」。用户定：先做这两项（#4 多值 meta 涉及盘上格式与 ABI，另出设计），只编码不提交。
+>
+> **S60 方案**：`Cask::search_fields_highlight(query, k, opts, filter)` = `search_fields_attributed` + 每个命中字段一组片段。
+> 原文一律经 `get_doc_view` 读回（不依赖原文 LRU：LRU 只有默认字段），命名字段取该字段值、默认字段取正文（空则第一个命名字段）；
+> `TextPlugin::field_query_terms` 按 search_fields 同一套解析把查询拆成「字段 → 词」（含同义词展开），每个字段只用自己的词切
+> （`snippets_for_terms`，与 S53 同一条切片路）；读回 ord ≠ 命中 ord 则不给。
+> **S61 方案**：`Cask::update_doc(key, DocPatch)`：补丁自洽校验（不碰盘）→ 循环｛`get_doc_view` 读当前版本 → fields 就地删 / 换、
+> 新的追加 → meta 解码合并重排编码 → `put_batch_atomic` 单 op `kPutDoc` + `kOrdEquals(读到的 ord)`｝，`kConditionFailed` 重试至多 16 次。
+> 正文 / 向量 / expiry_at 取自读到的版本。
+>
+> 约束：⛔ 改既有结构体布局 / 函数签名 / 盘上格式。
+
+| 项 | 状态 |
+|---|---|
+| S60-1 `search::FieldSnippets` / `SearchFieldHitEx`；`TextPlugin::field_query_terms` / `snippets_for_terms`；`Cask::search_fields_highlight` | ✅ |
+| S60-2 C `bitcask_search_fields_highlight` / `bitcask_search_fields_hl_result_free`（三层 malloc，OOM 逐层回滚） | ✅ |
+| S61-1 `DocPatch` + `Cask::update_doc` | ✅ |
+| S61-2 C `bitcask_doc_patch_t` + `bitcask_update_doc` | ✅ |
+| S60/61-3 回归 `tests/s60_s61_doc_ops_test.cpp`（8）：字段片段只用该字段的词、与 attributed 命中 / 分数 / 字段一致、冷库 + 自定义标签、带 filter；update_doc 改 / 删 / 加字段与 meta、正文不动、字段顺序、索引与 meta 过滤跟新版本、重开不变、过期时刻保留、坏补丁四种、不存在、只读句柄、4 线程并发改不同 meta 键无丢更新、向量库向量保留且向量检索照常；C `test_field_snippets_and_update_doc` | ✅ |
+| S60/61-4 `doc/api-c.md` §10.1c / §13.13c、`doc/api-cpp.md`、CHANGELOG `[Unreleased]`、反馈回填 | ✅ |
+
+**落地记录**（未提交，版本未定，建议 MINOR：纯新增）：
+- 验证：GCC Release（`-Werror`）全量 ctest **952** 全绿（含 C API 用例）；ASan 全量 952 全绿；Clang Debug / TSan 相关 205 全绿；
+  TSan 下并发 update_doc 用例连跑 8 轮 0 告警。Windows 未实测。
+- 口径备忘：update_doc 不省盘（追加写整条记录 + 整篇重建索引），省的是调用方往返与外部锁；向量 int8 / cosine 库是「读回 → 再写」，
+  测试只覆盖了 f32 cosine（逐元素误差 < 1e-6）。
+
+---
+
 ## 🔴 S59 · 跨进程 merge_only 旁车合并后写者读不到被搬走的 key（2026-11-20 立项）
 
 > 来源：S58 排查中自行发现（探针：两套独立权威 = 两个进程）。用户定：修，只编码不提交。

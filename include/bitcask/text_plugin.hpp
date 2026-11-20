@@ -265,6 +265,18 @@ public:
     [[nodiscard]] std::vector<search::Snippet>
     highlight_snippets(std::string_view query, std::string_view text,
                        const search::HighlightOptions& opts = {}) const;
+    // S60：把 search_fields 查询按字段拆成「字段 → 该字段的查询词」（与
+    // search_fields_attributed 同一套解析：parse_query 叶子 → 分析器 → 同义词展开）。
+    // 无字段限定的词归默认字段，键为空串（对外口径）。线程安全：是（const）。
+    [[nodiscard]] std::vector<std::pair<std::string, TermFreqMap>>
+    field_query_terms(std::string_view query) const;
+    // S60：已分好词的查询词 + 原文 ⇒ 片段（同 highlight_snippets 的后半段）。
+    [[nodiscard]] std::vector<search::Snippet>
+    snippets_for_terms(const TermFreqMap& query_terms, std::string_view text,
+                       const search::HighlightOptions& opts = {}) const {
+        if (query_terms.empty() || text.empty()) return {};
+        return snippets_for(query_terms, text, opts);
+    }
 
     // ---- 维护 ----
     // 死点压实（S10.11）。caller 负责 legacy rebase 标志。

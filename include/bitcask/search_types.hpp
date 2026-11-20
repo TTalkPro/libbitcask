@@ -38,6 +38,22 @@ struct SearchFieldHit {
     std::vector<std::string> fields; // 命中字段名（空串 = 默认字段）
 };
 
+// S60（反馈 2026-11-13 #1 后半）：某个命中字段上的高亮片段。
+struct FieldSnippets {
+    std::string          field;     // 同 SearchFieldHit::fields 的元素（空串 = 默认字段）
+    std::vector<Snippet> snippets;  // 该字段原文里、只用该字段的查询词切出的片段
+};
+
+// S60：字段归属命中 + 逐字段片段（Cask::search_fields_highlight）。前四个成员与
+// SearchFieldHit 同义；field_snippets 与 fields 同序，只列切出了片段的字段。
+struct SearchFieldHitEx {
+    std::string                key;
+    Lsn                        ord;
+    double                     score;
+    std::vector<std::string>   fields;
+    std::vector<FieldSnippets> field_snippets;
+};
+
 // S9-P2-d：搜索层错误类型。强类型枚举只表达「哪类错误」，由 Cask 边界
 // （cask.cpp `search_fault`）翻译成 CaskFault（kind + 可读 detail）。
 // 当前三种都映射到 CaskError::kInvalidOption。

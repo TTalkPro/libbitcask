@@ -221,6 +221,15 @@ target_link_libraries(bitcask_analyzer_record_test PRIVATE
     bitcask_sanitizers
 )
 
+# S60 / S61：逐字段片段 + 文档部分更新（反馈 2026-11-13 #1 后半 / #3）
+add_executable(bitcask_s60_s61_doc_ops_test s60_s61_doc_ops_test.cpp)
+target_link_libraries(bitcask_s60_s61_doc_ops_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 # S59：跨进程 merge_only 旁车合并后写者读被搬走的 key（受控重建自愈）
 add_executable(bitcask_s59_cross_process_sidecar_test s59_cross_process_sidecar_test.cpp)
 target_link_libraries(bitcask_s59_cross_process_sidecar_test PRIVATE
@@ -536,6 +545,7 @@ gtest_discover_tests(bitcask_search_fields_scoring_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_s57_feedback_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_s58_merge_only_search_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_s59_cross_process_sidecar_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_s60_s61_doc_ops_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_analyzer_record_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_v2_test ${_bitcask_test_props})

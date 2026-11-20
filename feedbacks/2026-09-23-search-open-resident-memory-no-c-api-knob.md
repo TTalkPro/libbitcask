@@ -72,7 +72,9 @@ keel 阶段 219：`bitcask-open` 收 `'keydir-cache-entries`，透到 `bitcask_o
    把每段拷一份 payload，峰值 2 × 文件大小。现在：`read` 按目录逐段定位读（全部组件
    ckpt 受益，峰值 1 ×）；docmap 行段与 keydir 快照完全流式（分块校验 CRC + 分块解析，
    堆上只剩一块 1 MiB 缓冲）。这一条不用旋钮，keel 那侧不用接。
-3. **同一批 key 住三份**：结构性改动，本版不动。补一条读代码时看到的：
+3. **同一批 key 住三份**：结构性改动，本版不动。（**后续**：同批由 S40 做了——核对发现实为四份，`ord2ext` /
+   `key_to_location_` 改为 view，常驻降为两份（keydir + docmap `ext2ord_`），见 `docs/design/s40-key-single-instance.md`、
+   CHANGELOG「检索 key 常驻由四份降为两份」。）补一条读代码时看到的：
    `key_to_location_` 的条目带着段的 `shared_ptr`，把 key 改成指向段内 key blob 的
    `string_view` 有生命期上的坑（覆盖到新段后旧段可能被 merge 释放），不是小改。
 

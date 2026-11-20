@@ -91,7 +91,7 @@ C++ 侧等价：`put_doc` 带 `fields`，`search_text` 与 `search_fields` 各�
 
 ## 回没回
 
-已修（**未发版，S56，定 11.0.0**，两条都修）：
+已修（**11.0.0 已发版**，S56，两条都修）：
 
 1. `search_fields_attributed` 每字段跨段聚合 N / sum_dl / df（G-on-the-fly，同 `search_text`），各段同一 idf / avgdl。
    `search_fields "w"` 与 `search_text "w"` 在 building 段、重开、checkpoint 后重开三个时刻逐位一致（已作回归）。
