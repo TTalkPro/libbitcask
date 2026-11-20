@@ -20,7 +20,7 @@
 C API 纯加法 `bitcask_search_fields_ex` / `bitcask_search_fields_ex_filtered` /
 `bitcask_search_fields_result_free`。`fields` 去重、首次命中序；默认字段
 （text / catch-all）记空串。详见 CHANGELOG。
-**逐字段 snippet 已补（未发版，S60）**：`Cask::search_fields_highlight` / C `bitcask_search_fields_highlight`——
+**逐字段 snippet 已补（11.2.0 已发版，S60）**：`Cask::search_fields_highlight` / C `bitcask_search_fields_highlight`——
 在上面的归属结果上，每个命中字段再给一组片段；原文从存储读回（冷热一样），每个字段只用查询里属于该字段的词切
 （`title:rust memory` 的 title 片段只标 rust），读回版本 ≠ 命中版本则不给。纯新增。
 
@@ -47,7 +47,7 @@ fields 成了纯写侧投影，读侧享受不到结构化，「按节读回」�
 **建议**：`update-doc!`（或 put-doc 的 merge 语义）：只改 fields/meta 的若干键，
 不动 value/text，引擎内原子完成读-改-写（写锁内）。
 
-**回没回**：**已修（未发版，S61）**：`Cask::update_doc(key, DocPatch)` / C `bitcask_update_doc` + `bitcask_doc_patch_t`——
+**回没回**：**已修（11.2.0 已发版，S61）**：`Cask::update_doc(key, DocPatch)` / C `bitcask_update_doc` + `bitcask_doc_patch_t`——
 设置 / 删除若干命名字段与 meta 键，正文、向量、过期时刻原样保留；引擎内原子读-改-写，但不是持写锁，而是 S46 条件写
 （期望版本不变）+ 冲突重读重试（至多 16 次，仍冲突 ⇒ `kConditionFailed`），并发改同一文档不同键不会互相覆盖。
 要说清的一点：**写放大消除不了**——bitcask 只追加写，新版本仍是一条完整记录、整篇重建索引；省掉的是调用方的

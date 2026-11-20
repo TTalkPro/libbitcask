@@ -34,11 +34,12 @@
 | S60/61-3 回归 `tests/s60_s61_doc_ops_test.cpp`（8）：字段片段只用该字段的词、与 attributed 命中 / 分数 / 字段一致、冷库 + 自定义标签、带 filter；update_doc 改 / 删 / 加字段与 meta、正文不动、字段顺序、索引与 meta 过滤跟新版本、重开不变、过期时刻保留、坏补丁四种、不存在、只读句柄、4 线程并发改不同 meta 键无丢更新、向量库向量保留且向量检索照常；C `test_field_snippets_and_update_doc` | ✅ |
 | S60/61-4 `doc/api-c.md` §10.1c / §13.13c、`doc/api-cpp.md`、CHANGELOG `[Unreleased]`、反馈回填 | ✅ |
 
-**落地记录**（未提交，版本未定，建议 MINOR：纯新增）：
+**落地记录**（已提交 `a19a20f`，**11.2.0 已发版**）：
 - 验证：GCC Release（`-Werror`）全量 ctest **952** 全绿（含 C API 用例）；ASan 全量 952 全绿；Clang Debug / TSan 相关 205 全绿；
   TSan 下并发 update_doc 用例连跑 8 轮 0 告警。Windows 未实测。
 - 口径备忘：update_doc 不省盘（追加写整条记录 + 整篇重建索引），省的是调用方往返与外部锁；向量 int8 / cosine 库是「读回 → 再写」，
   测试只覆盖了 f32 cosine（逐元素误差 < 1e-6）。
+- 版本定 **11.2.0**（MINOR：纯新增，ABI 兼容），库 `SOVERSION` 保持 **11**（`.so.11`）。
 
 ---
 

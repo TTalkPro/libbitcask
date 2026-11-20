@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`11.1.1`**；库 `SOVERSION` = **`11`**（= major）；
+`bitcask_version_*` = **`11.2.0`**；库 `SOVERSION` = **`11`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -15,10 +15,11 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
-## [Unreleased]（S60 / S61：逐字段片段、文档部分更新）
+## [11.2.0] - 2026-11-20（S60 / S61：逐字段片段、文档部分更新）
 
-> 版本未定。全是纯新增：C++ 新类型 `search::FieldSnippets` / `search::SearchFieldHitEx` / `DocPatch` 与
-> `Cask` / `TextPlugin` 新成员函数（非虚，不改既有布局）；C API 新结构体 + 新函数。盘上格式零改动。
+> **版本语义（2026-11-20 定版）**：纯新增——C++ 新类型 `search::FieldSnippets` / `search::SearchFieldHitEx` /
+> `DocPatch` 与 `Cask` / `TextPlugin` 新成员函数（非虚，不改既有结构体布局）；C API 新结构体 + 新函数。
+> 盘上格式零改动 ⇒ ABI 兼容，取 MINOR 11.2.0，库 `SOVERSION` 保持 `11`（`.so.11`），C++ 下游无需重新编译链接。
 
 ### Added
 
@@ -2478,7 +2479,8 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/11.1.1...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/11.2.0...HEAD
+[11.2.0]: https://github.com/davidalphafox/libbitcask/compare/11.1.1...11.2.0
 [11.1.1]: https://github.com/davidalphafox/libbitcask/compare/11.1.0...11.1.1
 [11.1.0]: https://github.com/davidalphafox/libbitcask/compare/11.0.0...11.1.0
 [11.0.0]: https://github.com/davidalphafox/libbitcask/compare/10.0.0...11.0.0
