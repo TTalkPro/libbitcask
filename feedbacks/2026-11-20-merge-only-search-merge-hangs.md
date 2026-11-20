@@ -54,7 +54,7 @@ auto nm = (*c)->needs_merge();          // needs=1 files=1
 
 ## 回没回
 
-已修（**未发版，S58**）。推测方向对：插桩实测旁车车道以 `next_ord = 0` 注册，`Cask::merge` 开头的受控重建（merge_only 分支
+已修（**11.1.1 已发版**，S58）。推测方向对：插桩实测旁车车道以 `next_ord = 0` 注册，`Cask::merge` 开头的受控重建（merge_only 分支
 `rebuild_memory_from_data`）把 `next_ord` 推到 300，收尾 `flush_index()` 等 `wait_lsn(lane, 300)`、覆盖水位停在 0。
 同进程旁车（共享 registry）另有一条：旁车打开后写者新写的 ord 不在旁车车道上，同样挂。
 
