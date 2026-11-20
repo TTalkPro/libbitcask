@@ -202,6 +202,14 @@ public:
                                             std::string_view term,
                                             bm25::PostingList& out) const;
 
+    // S56:从该字段 posting 的 dls 列推出「该字段自身词数」表(下标 = 段内
+    // docid,该字段无 token 的文档为 0)。只解 docid/tf/dl 列,不碰 positions;
+    // O(该字段 posting 数)。返回 false = 不建表、打分回退整篇总长:字段缺席 /
+    // 解码失败 / 该字段 sum_dl == 段总长(每篇字段长 ≤ 整篇总长,和相等 ⇒
+    // 逐篇相等——catch-all 默认字段的常态,免建表)。
+    [[nodiscard]] bool derive_field_doc_lens(std::string_view field,
+                                             std::vector<std::uint32_t>& out) const;
+
     // ---- 其余查询面(语义与 InvertedIndex 同名方法逐位一致,共享
     //      bm25_search_impl 核;wildcard/fuzzy 因采集顺序不同,浮点累加序
     //      可有末位差,见实现注) ----

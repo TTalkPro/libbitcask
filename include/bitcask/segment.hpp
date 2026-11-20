@@ -8,7 +8,10 @@
 //   section kSegDocStore = 本头 encode 的平坦 doc_store（段级 total doc_len）
 //
 // 段级 doc_lens_[docid] 是**整文档总词数**（Σ 所有字段 dl），与 TextPlugin::docs_
-// 语义一致——LiveChecker::doc_len(docid) 返回段级 total，BM25 dl 归一化即按此值。
+// 语义一致——段自身作 LiveChecker 时 doc_len(docid) 返回段级 total（merge 记账、
+// doc_store 行用）。**BM25 打分不用它**（S56）：每字段一张自身词数表
+// （FieldDocLens，见 field_doc_lens.hpp），查询经 FieldLenChecker 取该字段的 dl，
+// 与该字段倒排的 avgdl 同口径（视图出借：view() 的 live / multi_view() 的 fv.live）。
 //
 // 此 slice 扩展默认字段之外的**命名字段**：每字段一个独立 InvertedIndex。
 // 字段 map 由 `fields_mu_`（shared_mutex）保护——只护 map 结构（写线程首次
@@ -21,6 +24,7 @@
 
 #include "bitcask/index_ids.hpp"
 #include "bitcask/index.hpp"           // DocSlot / DocLoc
+#include "bitcask/field_doc_lens.hpp"  // S56:FieldDocLens / FieldLenChecker
 #include "bitcask/inverted.hpp"        // InvertedIndex / TermPositions / LiveChecker
 #include "bitcask/search_checkpoint.hpp"
 #include "bitcask/search_types.hpp"    // kDefaultField
@@ -54,11 +58,14 @@ class SealedSegment;  // 前向声明（multi_field_segment_search 视图需要�
 // ---- 多字段视图（与 multi_field_segment_search 配套）----
 
 // 单字段视图（multi-field 形态）：指向一个 InvertedIndex（段内某字段）+ 字段名。
-// LiveChecker / key / lsn 由所属段（MultiFieldSegmentView::seg）统一提供。
+// key / lsn 由所属段（MultiFieldSegmentView::seg）统一提供。
 struct FieldSegmentView {
     std::string_view       field_name;   // 含 kDefaultField
     // S30-P1 Slice 4:查询接口指针(同 SegmentView::inv)。
     const bm25::TermIndex* inv;          // 段内该字段倒排查询面（本地 docid）
+    // S56:该字段打分用的 checker(存活走段、dl 取该字段自身词数)。nullptr =
+    // 退回段本身(整篇总长,S56 之前的口径;只给手搭视图的测试留口)。
+    const bm25::LiveChecker* live = nullptr;
 };
 
 // 多字段段视图：把 SealedSegment 的多字段状态暴露给 multi_field_segment_search。
@@ -73,7 +80,7 @@ struct MultiFieldSegmentView {
 
 class SealedSegment : public bm25::LiveChecker {
 public:
-    SealedSegment() = default;
+    SealedSegment() : default_scoring_(std::make_unique<FieldScoring>(this)) {}
     SealedSegment(const SealedSegment&) = delete;
     SealedSegment& operator=(const SealedSegment&) = delete;
 
@@ -98,6 +105,7 @@ public:
         doc_lens_.push_back(dl);
         live_.push_back(std::uint8_t{1});
         count_pub_.store(docid + 1, std::memory_order_release);
+        default_scoring_->lens.append(docid, dl);  // S56:先于 posting
         inv_.add_doc(docid, terms);
         return docid;
     }
@@ -116,7 +124,8 @@ public:
 
     // 多字段构建：所有字段（默认 + 命名）的 posting 落到各自 InvertedIndex；
     // doc_lens_[docid] 存**段级 total**（Σ 所有字段 dl）— 与 TextPlugin::docs_
-    // 语义一致。first-use 字段 emplace 创建 InvertedIndex（与 TextPlugin 的
+    // 语义一致；各字段自身词数（Σ 该字段 tf）另记进该字段的 FieldDocLens（S56，
+    // 打分用）。first-use 字段 emplace 创建 InvertedIndex（与 TextPlugin 的
     // field_index 双检创建同款）。
     DocId add(std::string key, Lsn lsn,
               std::span<const FieldInput> fields,
@@ -140,18 +149,26 @@ public:
         doc_lens_.push_back(total_doc_len);  // 段级 total（不是 per-field）
         live_.push_back(std::uint8_t{1});
         count_pub_.store(docid + 1, std::memory_order_release);
-        // 各字段写倒排（默认 → inv_，其余 → fields_ map）。
+        // 各字段写倒排（默认 → inv_，其余 → fields_ map）。S56:该字段自身
+        // 词数先进 FieldDocLens 再写 posting（读者只经 posting 拿到 docid）。
         for (const auto& f : fields) {
+            std::uint32_t flen = 0;
+            for (const auto& [t, d] : *f.terms) flen += d.first;
             if (f.field_name == kDefaultField) {
+                default_scoring_->lens.append(docid, flen);
                 inv_.add_doc(docid, *f.terms);
             } else {
                 // 双检写：常态（字段已存在）只读锁；首次出现升级独占 emplace。
                 // fields_ 的 unique_ptr<InvertedIndex> 地址稳定 → 出锁后用安全。
                 bm25::InvertedIndex* inv = nullptr;
+                FieldScoring* sc = nullptr;
                 {
                     std::shared_lock lk(fields_mu_);
                     auto it = fields_.find(f.field_name);
-                    if (it != fields_.end()) inv = it->second.get();
+                    if (it != fields_.end()) {
+                        inv = it->second.get();
+                        sc = field_scoring_.find(f.field_name)->second.get();
+                    }
                 }
                 if (!inv) {
                     std::unique_lock lk(fields_mu_);
@@ -163,9 +180,13 @@ public:
                         it = fields_.emplace(std::string(f.field_name),
                                              std::make_unique<bm25::InvertedIndex>())
                                  .first;
+                        field_scoring_.emplace(std::string(f.field_name),
+                                               std::make_unique<FieldScoring>(this));
                     }
                     inv = it->second.get();
+                    sc = field_scoring_.find(f.field_name)->second.get();
                 }
+                sc->lens.append(docid, flen);
                 inv->add_doc(docid, *f.terms);
             }
         }
@@ -290,7 +311,7 @@ public:
         return SegmentView{
             mmap_ ? static_cast<const bm25::TermIndex*>(mmap_default_)
                   : static_cast<const bm25::TermIndex*>(&inv_),
-            this,
+            &default_checker(),
             [this](DocId d) { return std::string(key_at(d)); },
             [this](DocId d) { return lsn_at(d); }};  // pin 留空,见其声明处
     }
@@ -307,18 +328,43 @@ public:
         // (地址稳定,活到段析构)。
         if (mmap_) {
             fvs.reserve(mmap_fields_.size());
-            for (const auto& fi : mmap_fields_) {
-                fvs.push_back(FieldSegmentView{fi->field(), fi.get()});
+            for (std::size_t i = 0; i < mmap_fields_.size(); ++i) {
+                fvs.push_back(FieldSegmentView{mmap_fields_[i]->field(),
+                                               mmap_fields_[i].get(),
+                                               &mmap_scoring_[i]->checker});
             }
             return MultiFieldSegmentView{this, std::move(fvs)};
         }
         std::shared_lock lk(fields_mu_);  // S27-4 P2:size() 读也须在锁内
         fvs.reserve(1 + fields_.size());
-        fvs.push_back(FieldSegmentView{kDefaultField, &inv_});
+        fvs.push_back(FieldSegmentView{kDefaultField, &inv_,
+                                       &default_scoring_->checker});
         for (const auto& [name, inv] : fields_) {
-            fvs.push_back(FieldSegmentView{name, inv.get()});
+            fvs.push_back(FieldSegmentView{
+                name, inv.get(), &field_scoring_.find(name)->second->checker});
         }
         return MultiFieldSegmentView{this, std::move(fvs)};
+    }
+
+    // S56:默认字段打分用的 checker(dl 取默认字段自身词数;catch-all 下与整篇
+    // 总长逐篇相等)。地址稳定,活到段析构。
+    [[nodiscard]] const bm25::LiveChecker& default_checker() const {
+        return mmap_ ? mmap_default_scoring_->checker : default_scoring_->checker;
+    }
+
+    // S56:任一字段打分用的 checker(字段在本段缺席 → 段本身)。测试 / explain 用。
+    [[nodiscard]] const bm25::LiveChecker& field_checker(std::string_view field) const {
+        if (field == kDefaultField) return default_checker();
+        if (mmap_) {
+            for (std::size_t i = 0; i < mmap_fields_.size(); ++i) {
+                if (mmap_fields_[i]->field() == field) return mmap_scoring_[i]->checker;
+            }
+            return *this;
+        }
+        std::shared_lock lk(fields_mu_);
+        auto it = field_scoring_.find(field);
+        return it == field_scoring_.end() ? static_cast<const bm25::LiveChecker&>(*this)
+                                          : it->second->checker;
     }
 
     // 命名字段访问（测试 / 内省用）。返回的指针活到下次 map 结构变更（emplace/
@@ -378,6 +424,7 @@ public:
         }
         if (!have_inv || !have_ds) return nullptr;
         (void)have_fields;  // 可选；不强制要求
+        seg->rebuild_field_lens_from_postings();  // S56:v1 段无字段长表,由 dls 列重建
         return seg;
     }
 
@@ -445,8 +492,17 @@ public:
         for (auto name : seg->mmap_->field_names()) {
             seg->mmap_fields_.push_back(std::make_unique<MmapFieldIndex>(
                 seg->mmap_.get(), std::string(name)));
+            // S56:字段长表盘上不存——首次查询该字段时从 posting dls 列惰性推出
+            // (字段 sum_dl == 段总长时不建表,见 MmapSegment::derive_field_doc_lens)。
+            const MmapSegment* ms = seg->mmap_.get();
+            seg->mmap_scoring_.push_back(std::make_unique<FieldScoring>(
+                seg.get(), [ms, fname = std::string(name)](
+                               std::vector<std::uint32_t>& out) {
+                    return ms->derive_field_doc_lens(fname, out);
+                }));
             if (name == kDefaultField) {
                 seg->mmap_default_ = seg->mmap_fields_.back().get();
+                seg->mmap_default_scoring_ = seg->mmap_scoring_.back().get();
             }
         }
         if (seg->mmap_default_ == nullptr) return nullptr;  // v2 恒写默认字段
@@ -539,6 +595,31 @@ public:
     }
 
 private:
+    // S56:v1 段载入后由各字段 posting 的 dls 列重建字段长表(单线程,无并发读者)。
+    // dls 为 0(更老的快照未记)的行留 0 ⇒ 查询回退整篇总长。
+    static std::vector<std::uint32_t> derive_lens(const bm25::InvertedIndex& inv) {
+        std::vector<std::uint32_t> out;
+        inv.visit_postings_sorted(
+            [&out](std::string_view, const bm25::PostingList& pl) {
+                for (std::size_t i = 0; i < pl.size(); ++i) {
+                    const auto d = static_cast<std::size_t>(pl.ords[i]);
+                    if (d >= out.size()) out.resize(d + 1, 0);
+                    if (out[d] == 0) out[d] = pl.dls[i];
+                }
+            });
+        return out;
+    }
+    void rebuild_field_lens_from_postings() {
+        default_scoring_->lens.assign(derive_lens(inv_));
+        std::unique_lock lk(fields_mu_);
+        field_scoring_.clear();
+        for (const auto& [name, inv] : fields_) {
+            auto sc = std::make_unique<FieldScoring>(this);
+            sc->lens.assign(derive_lens(*inv));
+            field_scoring_.emplace(name, std::move(sc));
+        }
+    }
+
     // DocId(u64) → mmap 段 doc_store 的 u32 本地 docid。
     //
     // 为什么必须显式收窄：`DocId` 是全局 u64（index_ids.hpp——现阶段 docid==lsn），
@@ -732,6 +813,11 @@ private:
     mutable std::shared_mutex fields_mu_;
     std::unordered_map<std::string, std::unique_ptr<bm25::InvertedIndex>,
                        StringHash, std::equal_to<>> fields_;
+    // S56:字段打分件(字段长表 + checker),与 fields_ 同键同锁、同时 emplace。
+    std::unordered_map<std::string, std::unique_ptr<FieldScoring>,
+                       StringHash, std::equal_to<>> field_scoring_;
+    // 默认字段打分件(内存段:add 时追加;mmap 段不用它,见 mmap_default_scoring_)。
+    std::unique_ptr<FieldScoring> default_scoring_;
 
     // ---- S30-P2:mmap 背衬(open_v2 产物) ----
     // 非空 ⇒ 本段由 v2 段文件支撑:上方内存态成员恒为空,查询面/liveness/
@@ -739,7 +825,9 @@ private:
     // 活到段析构;view/multi_view 出借裸指针,持有方 pin 段即可)。
     std::unique_ptr<MmapSegment> mmap_;
     std::vector<std::unique_ptr<MmapFieldIndex>> mmap_fields_;
+    std::vector<std::unique_ptr<FieldScoring>> mmap_scoring_;  // S56:与 mmap_fields_ 平行
     const MmapFieldIndex* mmap_default_ = nullptr;
+    const FieldScoring* mmap_default_scoring_ = nullptr;       // 指 mmap_scoring_ 内一项
 };
 
 // ===========================================================================
@@ -770,7 +858,8 @@ private:
 //   - 一个 docid 只在一个段（并集，不求和）；同段内的多字段命中按字段累加（与
 //     TextPlugin::search_fields 一致：acc[ord]+=score*boost）。
 //   - 每字段一份独立 ExtStats（独立 N/sum_dl/df）；不跨字段混用 idf。
-//   - doc_len 取自段级 LiveChecker（total doc_len，与 TextPlugin::docs_ 一致）。
+//   - doc_len 取该字段自身词数（fv.live，S56；与该字段 avgdl 同口径）。fv.live
+//     为空（手搭视图）才退回段级整篇总长。
 //   - 字段在某个段缺失（fields_ 空）→ 跳过该段该字段，无空查询展开。
 [[nodiscard]] inline std::vector<SearchHit> multi_field_segment_search(
     std::span<const MultiFieldSegmentView> segs,
@@ -838,7 +927,10 @@ private:
             if (ext_it == per_field_ext.end()) continue;
             // ext.df 已挂回（阶段 1 末尾）；nullptr 走 InvertedIndex 本地统计（不应发生）。
             const auto hits =
-                fv.inv->search(terms, k, *seg, params, &ext_it->second);
+                fv.inv->search(terms, k,
+                               fv.live ? *fv.live
+                                       : static_cast<const bm25::LiveChecker&>(*seg),
+                               params, &ext_it->second);
             for (const auto& h : hits) {
                 const auto docid = static_cast<DocId>(h.ord);
                 acc_local[docid] += static_cast<double>(h.score);

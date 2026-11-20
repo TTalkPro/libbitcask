@@ -221,6 +221,15 @@ target_link_libraries(bitcask_analyzer_record_test PRIVATE
     bitcask_sanitizers
 )
 
+# S56：search_fields 打分口径（每字段跨段统计 + 字段自身 dl）
+add_executable(bitcask_search_fields_scoring_test search_fields_scoring_test.cpp)
+target_link_libraries(bitcask_search_fields_scoring_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 # S53：冷文档高亮（ColdText::kLoad 从存储读回正文补片段）
 add_executable(bitcask_search_highlight_cold_test search_highlight_cold_test.cpp)
 target_link_libraries(bitcask_search_highlight_cold_test PRIVATE
@@ -494,6 +503,7 @@ gtest_discover_tests(bitcask_file_lock_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_index_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_search_segment_fallback_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_search_highlight_cold_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_search_fields_scoring_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_analyzer_record_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_v2_test ${_bitcask_test_props})

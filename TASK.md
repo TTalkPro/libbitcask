@@ -10,6 +10,50 @@
 
 ---
 
+## 🔴 S56 · `search_fields` 打分口径：每字段跨段统计 + 字段自身 dl（2026-11-19 立项）
+
+> 来源：下游反馈
+> [`feedbacks/2026-11-19-search-fields-local-stats-and-total-doc-len.md`](feedbacks/2026-11-19-search-fields-local-stats-and-total-doc-len.md)
+> （bosun，经 bitcask 10.0.0）：① `search_fields_attributed` 逐段用**本地** N / df / sum_dl 打分，S45-4 后新文档散在各分片
+> building 段里各算各的 idf ⇒ 同一查询重开前后分数、顺序都变，默认字段查询与 `search_text` 对不上；② 字段打分的 dl 取段级
+> **整篇总词数**而 avgdl 是**该字段**的 ⇒ 短字段被重罚（`labels:w^8` 压不过正文词频）。用户定：两条都修，只编码不提交。
+>
+> **方案**：
+> - ①：`search_fields_attributed` 每字段跨段聚合 N / sum_dl / df（G-on-the-fly，同 `multi_segment_search`），各段同一
+>   idf / avgdl；boost 分组移到段循环外只算一次。
+> - ②：每(段, 字段)一张「该字段自身词数」表 `FieldDocLens` + `FieldLenChecker`（存活走段、dl 取表、未知回退整篇总长）
+>   （新头 `include/bitcask/field_doc_lens.hpp`）。内存段 add 时先记表再写 posting；v1 段载入后由 posting dls 列重建；
+>   v2（mmap）段**盘上格式不变**，首次查询该字段时从 posting dls 列惰性推出（call_once，只解 docid/tf/dl 列），字段
+>   sum_dl == 段总长时不建表（每篇字段长 ≤ 整篇，和相等 ⇒ 逐篇相等——catch-all 默认字段常态）。
+> - 视图出借：`FieldSegmentView::live`（新成员，缺省 nullptr = 退回段本身）、`SealedSegment::view()` / TextPlugin 默认视图 /
+>   explain 改用 `default_checker()`。默认字段因此也走字段自身 dl：catch-all 开（缺省）时与整篇总长逐篇相等，
+>   `search_text` / phrase / bool / fuzzy / wildcard 分数逐位不变；**catch-all 关时默认字段只含正文，此前同样被命名字段长度
+>   压分，一并归正**（反馈未提，基线实测证实）。
+>
+> 约束：⛔ 改盘上格式；⛔ 改 C API。C++ 已安装头 `segment.hpp` 的 `FieldSegmentView` / `SealedSegment` 加成员（内部段层，
+> 下游一般不直接用）。
+
+| 项 | 状态 |
+|---|---|
+| S56-1 `search_fields_attributed` 每字段跨段统计（①） | ✅ |
+| S56-2 `FieldDocLens` / `FieldLenChecker` / `FieldScoring`；内存段 add 记表、v1 载入重建、v2 惰性推导（`MmapSegment::derive_field_doc_lens`） | ✅ |
+| S56-3 视图接线：`FieldSegmentView::live`、`multi_field_segment_search`、默认视图 / `SegmentSet::search` / explain 用 `default_checker()` | ✅ |
+| S56-4 回归 `tests/search_fields_scoring_test.cpp`：与 `search_text` 逐位一致（building / 重开 / checkpoint 重开）、命名字段分数 = 解析 idf、boost 排序、字段分数与其它字段长度无关、catch-all 关的默认字段、内存段与 mmap 段字段长 / 查询逐位一致 | ✅ |
+| S56-5 `InvertedIndex.MultiFieldSegmentMergeEquivalence` 基线改每字段 checker（原基线按整篇总长写，正是②的旧口径） | ✅ |
+| S56-6 CHANGELOG `[11.0.0]`、反馈回填 | ✅ |
+
+**落地记录**（未提交，11.0.0）：
+- 基线红：新用例在 10.0.0（`git archive HEAD` 单独编）上 4 / 4 红，数值与反馈逐位吻合（building 段 `search_fields "zebra"`
+  body=1.8927 vs `search_text` 4.0170）；catch-all 关的 `search_text` 两篇同正文分数 1.369 vs 0.541（命名字段长度压分）。
+- 验证：GCC Release（`-Werror`）全量 ctest **933** 全绿；ASan 全量 933 全绿；Clang Debug / TSan 段与检索相关 331 全绿。
+  `BM_Cask_SearchHybrid` 293 µs 对 293 µs（持平）。Windows 未实测。
+- 代价：v2 段第一次查某个需要建表的字段时付 O(该字段 posting 数) 一次（catch-all 默认字段免建表）；内存段每字段每篇 4 B。
+- 行为变化：既有库的 `search_fields` 分数与排序会变（两条都是）；catch-all 关的库 `search_text` 等默认字段分数会变。
+  不给开关（旧口径是错的）。版本定 **11.0.0**（C API 与盘上格式零改动；C++ 已安装头 `segment.hpp` 两个结构体加成员
+  = ABI 破坏）。
+
+---
+
 ## 🔴 S55 · 分词器配置进 meta、按记录打开、ngram 高亮偏移（2026-11-19 立项）
 
 > 来源：下游反馈

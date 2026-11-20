@@ -2287,7 +2287,9 @@ TEST(InvertedIndex, MultiFieldSegmentMergeEquivalence) {
     auto segB = std::make_unique<SealedSegment>();
     // 基线：每字段一份单 InvertedIndex（8 篇文档，docid 全局 0..7）+ FakeLiveChecker。
     InvertedIndex whole_title, whole_body;
-    FakeLiveChecker whole_chk;
+    // S56:字段打分的 dl 取该字段自身词数(与该字段 avgdl 同口径)——基线每字段
+    // 一个 checker。ttl_d(整篇总长)仍作段级 total 喂给 add。
+    FakeLiveChecker title_chk, body_chk;
     for (std::uint64_t g = 0; g < kNAll; ++g) {
         // 把 title/body 字符串（空格分词）转 TermPositions。
         auto split_add = [](TermPositions& m, const std::string& s) {
@@ -2305,9 +2307,10 @@ TEST(InvertedIndex, MultiFieldSegmentMergeEquivalence) {
         TermPositions tTPM, bTPM;
         split_add(tTPM, titles[g]);
         split_add(bTPM, bodies[g]);
-        std::uint32_t ttl_d = 0;
-        for (const auto& [k, v] : tTPM) ttl_d += v.first;
-        for (const auto& [k, v] : bTPM) ttl_d += v.first;
+        std::uint32_t ttl_d = 0, title_d = 0, body_d = 0;
+        for (const auto& [k, v] : tTPM) title_d += v.first;
+        for (const auto& [k, v] : bTPM) body_d += v.first;
+        ttl_d = title_d + body_d;
 
         // 喂两段。
         std::array<SealedSegment::FieldInput, 2> fs{{
@@ -2323,7 +2326,8 @@ TEST(InvertedIndex, MultiFieldSegmentMergeEquivalence) {
         // 喂基线（每字段单 InvertedIndex，全局 docid）。
         whole_title.add_doc(g, tTPM);
         whole_body.add_doc(g, bTPM);
-        whole_chk.doc_lens[g] = ttl_d;
+        title_chk.doc_lens[g] = title_d;
+        body_chk.doc_lens[g] = body_d;
     }
     ASSERT_EQ(segA->doc_count(), 4u);
     ASSERT_EQ(segB->doc_count(), 4u);
@@ -2336,10 +2340,11 @@ TEST(InvertedIndex, MultiFieldSegmentMergeEquivalence) {
         std::unordered_map<std::uint64_t, double> acc;
         for (const auto& [fname, terms] : qft) {
             const InvertedIndex* inv = nullptr;
-            if (fname == "title") inv = &whole_title;
-            else if (fname == "body") inv = &whole_body;
+            const FakeLiveChecker* chk = nullptr;
+            if (fname == "title") { inv = &whole_title; chk = &title_chk; }
+            else if (fname == "body") { inv = &whole_body; chk = &body_chk; }
             else continue;
-            auto hits = inv->search(terms, k, whole_chk);
+            auto hits = inv->search(terms, k, *chk);
             for (const auto& h : hits) acc[h.ord] += h.score;
         }
         std::vector<std::pair<std::uint64_t, double>> ranked(acc.begin(),

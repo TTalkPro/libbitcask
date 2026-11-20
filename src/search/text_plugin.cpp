@@ -668,7 +668,7 @@ TextPlugin::collect_default_segment_views() const {
             if (sp->live_doc_count() == 0) continue;
             const search::SealedSegment* seg = sp.get();
             views.push_back(search::SegmentView{
-                &seg->default_term_index(), seg,
+                &seg->default_term_index(), &seg->default_checker(),
                 [seg](DocId d) { return std::string(seg->key_at(d)); },
                 [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
                 sp});
@@ -678,7 +678,7 @@ TextPlugin::collect_default_segment_views() const {
         bld && bld->live_doc_count() > 0) {
         const search::SealedSegment* seg = bld.get();
         views.push_back(search::SegmentView{
-            &seg->default_term_index(), seg,
+            &seg->default_term_index(), &seg->default_checker(),
             [seg](DocId d) { return std::string(seg->key_at(d)); },
             [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
             std::move(bld)});
@@ -690,7 +690,7 @@ TextPlugin::collect_default_segment_views() const {
             bld && bld->live_doc_count() > 0) {
             const search::SealedSegment* seg = bld.get();
             views.push_back(search::SegmentView{
-                &seg->default_term_index(), seg,
+                &seg->default_term_index(), &seg->default_checker(),
                 [seg](DocId d) { return std::string(seg->key_at(d)); },
                 [seg](DocId d) -> Lsn { return seg->lsn_at(d); },
                 std::move(bld)});
@@ -1011,7 +1011,8 @@ TextPlugin::explain(std::string_view query, std::string_view key,
     if (have_loc && !loc.tomb && loc.seg) {
         // S27-4 P1:loc.seg 即段对象 shared_ptr(天然 pin)。
         const auto& seg = *loc.seg;
-        return seg.default_term_index().explain(terms, loc.docid, seg,
+        return seg.default_term_index().explain(terms, loc.docid,
+                                                 seg.default_checker(),
                                                  params_override);
     }
     // S27-3 步骤 3:fields_ fallback 删除——key_to_location_ 由 recovery
@@ -1086,6 +1087,21 @@ TextPlugin::search_fields_attributed(std::string_view query, std::size_t k,
         std::uint64_t docid = 0;
         std::vector<std::string> fields;  // 首次命中序，去重
     };
+    // 每字段的 boost 分组（同义词展开后）——与段无关，算一次。
+    std::unordered_map<std::string, std::map<float, std::vector<std::string>>,
+                       StringHash, std::equal_to<>>
+        field_groups;
+    for (auto& [field, tbs] : by_field) {
+        auto& groups = field_groups[field];
+        for (auto& [t, boost] : tbs) {
+            auto expanded = synonym_map_ ? synonym_map_->expand(t)
+                                         : std::span<const std::string>{};
+            if (expanded.empty()) expanded = {&t, 1};
+            auto& g = groups[boost];
+            g.insert(g.end(), expanded.begin(), expanded.end());
+        }
+    }
+
     auto fetch = [&](std::size_t k_req)
         -> std::pair<std::size_t, std::vector<search::SearchFieldHit>> {
         // S27-3 Slice B2a：逐段逐字段 + boost 累加（同 fields_ 逻辑，换段集源）。
@@ -1093,21 +1109,53 @@ TextPlugin::search_fields_attributed(std::string_view query, std::size_t k,
         // 平局键——与 sort_truncate 同序（反馈第 5 条）。
         std::unordered_map<std::uint64_t, Acc> acc;
         auto seg_views = collect_multi_field_segment_views();
+
+        // S56（反馈 2026-11-19 search-fields-local-stats ①）：每字段跨段聚合
+        // N / sum_dl / df（G-on-the-fly，同 multi_segment_search /
+        // multi_field_segment_search），各段用同一 idf / avgdl 打分。此前逐段
+        // 用本段本地统计——S45-4 后新文档按 key 哈希散在各分片 building 段，
+        // 各算各的 idf，同一查询重开（合并落盘）前后分数与顺序都变，且默认
+        // 字段查询与 search_text 对不上。
+        struct FieldExt {
+            std::vector<std::pair<std::string, std::uint64_t>> df;
+            bm25::ExtStats ext;
+        };
+        std::unordered_map<std::string, FieldExt, StringHash, std::equal_to<>>
+            field_ext;
+        for (const auto& [field, groups] : field_groups) {
+            auto& fe = field_ext[field];
+            for (const auto& [boost, gterms] : groups) {
+                for (const auto& t : gterms) {
+                    if (std::none_of(fe.df.begin(), fe.df.end(),
+                                     [&t](const auto& p) { return p.first == t; })) {
+                        fe.df.emplace_back(t, 0);
+                    }
+                }
+            }
+        }
+        for (const auto& sv : seg_views) {
+            for (const auto& fv : sv.fields) {
+                auto it = field_ext.find(fv.field_name);
+                if (it == field_ext.end()) continue;
+                auto& fe = it->second;
+                fe.ext.N += fv.inv->live_doc_count();
+                fe.ext.sum_dl += fv.inv->sum_doc_len();
+                for (auto& [t, df] : fe.df) df += fv.inv->doc_freq(t);
+            }
+        }
+        for (auto& [_, fe] : field_ext) fe.ext.df = &fe.df;
+
         for (std::size_t si = 0; si < seg_views.size(); ++si) {
             const auto& sv = seg_views[si];
             for (const auto& fv : sv.fields) {
-                auto fbi = by_field.find(std::string(fv.field_name));
-                if (fbi == by_field.end()) continue;
-                std::map<float, std::vector<std::string>> boost_groups;
-                for (auto& [t, boost] : fbi->second) {
-                    auto expanded = synonym_map_ ? synonym_map_->expand(t)
-                                                 : std::span<const std::string>{};
-                    if (expanded.empty()) expanded = {&t, 1};
-                    auto& g = boost_groups[boost];
-                    g.insert(g.end(), expanded.begin(), expanded.end());
-                }
-                for (auto& [boost, gterms] : boost_groups) {
-                    auto res = fv.inv->search(gterms, k_req, *sv.seg, params_override);
+                auto fgi = field_groups.find(fv.field_name);
+                if (fgi == field_groups.end()) continue;
+                const bm25::ExtStats* ext = &field_ext.find(fv.field_name)->second.ext;
+                // S56 ②：dl 取该字段自身词数（fv.live），与该字段 avgdl 同口径。
+                const bm25::LiveChecker& live =
+                    fv.live ? *fv.live : static_cast<const bm25::LiveChecker&>(*sv.seg);
+                for (const auto& [boost, gterms] : fgi->second) {
+                    auto res = fv.inv->search(gterms, k_req, live, params_override, ext);
                     for (auto& r : res) {
                         auto& a = acc[sv.seg->lsn_at(r.ord)];
                         a.score += static_cast<double>(r.score) * boost;

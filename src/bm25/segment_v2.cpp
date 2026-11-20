@@ -1045,6 +1045,35 @@ bool MmapSegment::decode_rec_list(const Field& f, const segv2::TermRec& rec,
     return true;
 }
 
+bool MmapSegment::derive_field_doc_lens(std::string_view field,
+                                        std::vector<std::uint32_t>& out) const {
+    const Field* f = field_of(field);
+    if (f == nullptr) return false;
+    if (f->stats.sum_doc_len == total_doc_len_) return false;  // 逐篇相等,用整篇
+    struct Cols {  // decode_rec_columns 的 OutT:要 dl 列,不要 positions
+        std::vector<std::uint64_t> ords;
+        std::vector<std::uint32_t> tfs;
+        std::vector<std::uint32_t> dls;
+    } cols;
+    out.assign(doc_count_, 0);
+    for (std::uint64_t i = 0; i < f->dict_count; ++i) {
+        const auto rec =
+            load_pod<segv2::TermRec>(f->dict + i * sizeof(segv2::TermRec));
+        cols.ords.clear();
+        cols.tfs.clear();
+        cols.dls.clear();
+        if (!decode_rec_columns(*f, rec, cols)) {
+            out.clear();
+            return false;
+        }
+        for (std::size_t j = 0; j < cols.ords.size(); ++j) {
+            const auto d = cols.ords[j];
+            if (d < out.size() && out[d] == 0) out[d] = cols.dls[j];
+        }
+    }
+    return true;
+}
+
 bool MmapSegment::decode_postings_list(std::string_view field,
                                        std::string_view term,
                                        PostingList& out) const {

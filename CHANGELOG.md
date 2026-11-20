@@ -5,13 +5,35 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`10.0.0`**；库 `SOVERSION` = **`10`**（= major）；
+`bitcask_version_*` = **`11.0.0`**；库 `SOVERSION` = **`11`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
 `field.schema` = **FSCH v1**。
 **盘上格式破坏不驱动 major**（3.1.0 / 5.1.0 两次先例）——major 只在 ABI 破坏时 bump
 （4.0.0 / 5.0.0 / 6.0.0 / 7.0.0 / 8.0.0 / 9.0.0 皆是）。
+
+---
+
+## [11.0.0] - 2026-11-20（S56：`search_fields` 打分口径）
+
+> **版本语义（2026-11-20 定版）**：⚠️ **C++ ABI 破坏**——已安装公共头 `include/bitcask/segment.hpp` 的
+> `search::FieldSegmentView`（加 `live`）与 `search::SealedSegment`（加成员）布局变化，按 [10.0.0] / [7.0.0] 先例取
+> MAJOR +1 → **`11.0.0`**，`SOVERSION` → **`11`**（`.so.11`），**C++ 下游须重新编译链接**。
+> C API 与盘上格式零改动。**打分行为变化**：既有库的 `search_fields` 分数与排序会变；
+> `index_catch_all = false` 的库默认字段（`search_text` 等）分数会变。不提供旧口径开关。
+
+### Fixed
+
+- **`search_fields` 分数与 `search_text` 对不上、重开前后排序变化**（S56 ①，下游反馈
+  `feedbacks/2026-11-19-search-fields-local-stats-and-total-doc-len.md`，bosun）：`search_fields_attributed` 逐段用本段本地的
+  N / df / sum_dl 打分，S45-4 后新文档散在各分片 building 段里各算各的 idf ⇒ 刚写入与落盘后分数不同（`title:w` 差 2.4 倍）、
+  默认字段查询与 `search_text` 不一致。现每字段跨段聚合统计（同 `search_text`），`search_fields "w"` 与 `search_text "w"` 任何时刻
+  逐位一致。
+- **命名字段打分的文档长度取了整篇总词数**（S56 ②）：BM25 的 dl 取段级整篇总长、avgdl 却是该字段的 ⇒ 短字段（title / labels）
+  被按「整篇长度 ÷ 字段平均长度」重罚，`field:term^boost` 的加权随正文长度漂移。现 dl 取该字段自身词数（posting dls 列 / 写入时
+  记录；v2 段首次查询该字段时从 posting 惰性推出，盘上格式不变）。`index_catch_all = false` 时默认字段只含正文，此前同样被
+  命名字段长度压分，一并归正；catch-all 开（缺省）时默认字段分数逐位不变。
 
 ---
 
@@ -2394,7 +2416,8 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/10.0.0...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/11.0.0...HEAD
+[11.0.0]: https://github.com/davidalphafox/libbitcask/compare/10.0.0...11.0.0
 [10.0.0]: https://github.com/davidalphafox/libbitcask/compare/9.1.0...10.0.0
 [9.1.0]: https://github.com/davidalphafox/libbitcask/compare/9.0.0...9.1.0
 [9.0.0]: https://github.com/davidalphafox/libbitcask/compare/8.1.0...9.0.0
