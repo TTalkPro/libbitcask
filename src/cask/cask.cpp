@@ -1405,6 +1405,25 @@ Cask::RebuildOutcome Cask::run_controlled_rebuild(bool wait,
     return RebuildOutcome::kRebuilt;
 }
 
+// S59：跨进程 merge_only 旁车在本句柄开着时合并并删除输入文件，本句柄的内存
+// 索引（memdelta / 已载 run）仍指向旧位置——旁车的搬迁只进了它自己的权威，
+// 本进程无从得知。读到「定位所指的数据文件已不存在」时，从 data 受控重建一次
+// （等待式：并发读者排在同一次重建后面，不重复重建），合并输出在 data 里，
+// 重建后定位指向新位置。只认「文件确实不在」：打不开但文件还在是真 I/O 错误，
+// 照常上报。merge_only 句柄自身不触发（它不拥有写权威）。
+bool Cask::heal_stale_location(std::uint32_t file_id) noexcept {
+    if (opts_.merge_only) return false;
+    std::error_code ec;
+    const bool present = fs::exists(
+        bitcask::detail::from_utf8(fileops::mk_data_filename(dirname_, file_id)), ec);
+    if (present || ec) return false;
+    log_warn("data file " + std::to_string(file_id) +
+             " referenced by the index is gone (merged by another process?); "
+             "rebuilding the index from data");
+    return run_controlled_rebuild(/*wait=*/true, /*force=*/true) ==
+           RebuildOutcome::kRebuilt;
+}
+
 // ---- 搜索 / 写入共用辅助 ---------------------------------------------------
 
 std::expected<void, CaskFault> Cask::prepare_search() {
@@ -1803,6 +1822,8 @@ Cask::read_doc(std::span<const std::byte> key, bool want_fields) {
     auto df = read_file(entry.file_id);
     if (!df) {
         if (attempt == 0) continue;  // S13-F5: merge 窗口，重查 keydir 重试
+        // S59：重查后仍指向已不存在的文件 ⇒ 别的进程合并过；重建后再试一次。
+        if (attempt == 1 && heal_stale_location(entry.file_id)) continue;
         return std::unexpected(err(CaskError::kIo,
             "open file_id=" + std::to_string(entry.file_id)));
     }
@@ -3203,7 +3224,8 @@ Cask::NeedsMerge Cask::needs_merge(std::uint64_t now_sec) {
     // 快照，S43-7 当时实时源还是待删的 KeyDir），提交点之后产生的死字节看
     // 不见——长驻写者重开前永远不合并、status 与 needs_merge 结论相反。
     // 选文件只决定「值不值得并」，merge 的活性裁决走 OKI ReadView，与此无关。
-    // 实时账本为空（尚未建立）才退回清单。
+    // 实时账本为空（尚未建立——如跨进程的 merge_only 旁车，打开时不折叠数据）
+    // 才退回清单。
     auto oki_fstats = authority_->fstats();
     if (oki_fstats.empty()) oki_fstats = authority_->state().manifest_fstats();
     const std::uint32_t exclude_id =
@@ -3560,9 +3582,14 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
     // 其余按注册序。纯 KV 库空 span。生命周期：栈上，覆盖 run_merge 全程
     //（事件同步派发；插件收尾闭包经 run_serialized 已入 RunFn 队列，不引用
     // relocator）。
+    //
+    // S58：merge_only 旁车不带检索插件（同纯 KV）。旁车打开时不从数据折叠，
+    // 手里的检索索引是空的——它不拥有索引，搬迁的检索侧归正交给写者（下次
+    // 打开按 key+LSN 重放合并输出）。
     DocmapRelocator relocator(docmap_.get());
     std::vector<plugin::CaskPlugin*> merge_plugins;
-    if (text_) {
+    const bool own_search = text_ && !opts_.merge_only;
+    if (own_search) {
         merge_plugins.reserve(plugins_.size() + 1);
         merge_plugins.push_back(&relocator);
         for (auto* p : plugins_) merge_plugins.push_back(p);
@@ -3590,7 +3617,13 @@ Cask::merge(std::vector<std::string> files, std::uint64_t now_sec) {
                  " relocation CAS request(s) lost to concurrent writes");
     }
 
-    if (text_) {
+    // S58（反馈 2026-11-20 merge-only-search-merge-hangs）：merge_only 旁车跳过
+    // 检索侧收尾。此前这里 ① flush_index() 等 peek_next_ord()——旁车车道以
+    // 打开时的 next_ord（未折叠数据，0）注册，合并开头的受控重建把 next_ord
+    // 推到数据末尾，车道上又永远不会有任务 ⇒ 无界等待，调用线程挂死；
+    // ② 即使不挂，也会用旁车的空索引成对保存 search.ckpt，覆盖写者的 ckpt
+    // ⇒ 下次打开检索数据丢失（公开 checkpoint() / close 本就拒绝 merge_only 写 ckpt）。
+    if (own_search) {
         // P3 顺序约定（S14-4 修订）:**捕获**较早水位（此刻文件大小），但
         // 文件**写入**延后到 search.ckpt 保存成功之后——写序反了的话，
         // 两写之间崩溃会留下「新快照+旧 ckpt」，fold 从超前水位起跳、

@@ -221,6 +221,24 @@ target_link_libraries(bitcask_analyzer_record_test PRIVATE
     bitcask_sanitizers
 )
 
+# S59：跨进程 merge_only 旁车合并后写者读被搬走的 key（受控重建自愈）
+add_executable(bitcask_s59_cross_process_sidecar_test s59_cross_process_sidecar_test.cpp)
+target_link_libraries(bitcask_s59_cross_process_sidecar_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
+# S58：检索库 merge_only 旁车合并不再挂死、不改写写者的 search.ckpt
+add_executable(bitcask_s58_merge_only_search_test s58_merge_only_search_test.cpp)
+target_link_libraries(bitcask_s58_merge_only_search_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 # S57：jieba 缺词典不 abort + needs_merge 用实时账本
 add_executable(bitcask_s57_feedback_test s57_feedback_test.cpp)
 target_link_libraries(bitcask_s57_feedback_test PRIVATE
@@ -516,6 +534,8 @@ gtest_discover_tests(bitcask_search_segment_fallback_test ${_bitcask_test_props}
 gtest_discover_tests(bitcask_search_highlight_cold_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_search_fields_scoring_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_s57_feedback_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_s58_merge_only_search_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_s59_cross_process_sidecar_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_analyzer_record_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_v2_test ${_bitcask_test_props})

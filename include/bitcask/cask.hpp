@@ -1019,6 +1019,9 @@ public:
     // 连续完成前缀，持续写入下不饿死；原「in_flight==0」谓词在持续写入下
     // 可能长时间不成立）。无界——搜索读己之写依赖（T8）。
     void flush_index() {
+        // S58：merge_only 句柄不接受写，车道上不会有它提交的任务；其 next_ord
+        // 在受控重建后才推进到数据末尾，等它只会无界挂住。
+        if (opts_.merge_only) return;
         if (index_pool_ && index_lane_) {
             (void)index_pool_->wait_lsn(index_lane_,
                                         authority_->peek_next_ord());
@@ -1052,7 +1055,9 @@ public:
         std::vector<std::string> expired_files;
     };
     // 候选统计取实时 per-file 账本（与 status() 同源，含本次打开之后的覆盖写 /
-    // 删除产生的死字节；S57）。merge_only 句柄看到的是它打开时从数据建出的账本。
+    // 删除产生的死字节；S57）。merge_only 旁车：与写者同进程（共享 registry ⇒
+    // 共享索引权威）时看到的就是写者的实时账本；跨进程时旁车打开不折叠数据、
+    // 实时账本为空，退回上一个提交点的 v4 清单（S58 更正）。
     // 线程安全: 是（读 keydir info 拿快照 + 纯函数策略）；不需外部锁。
     [[nodiscard]] NeedsMerge needs_merge(std::uint64_t now_sec = 0);
 
@@ -1479,6 +1484,11 @@ private:
     enum class RebuildOutcome { kRebuilt, kBusy, kFailed };
     [[nodiscard]] RebuildOutcome run_controlled_rebuild(bool wait,
                                                         bool force) noexcept;
+    // S59：定位指向的数据文件在盘上已不存在（跨进程 merge_only 旁车合并后删了
+    // 输入文件，本句柄内存索引不知道那次搬迁）⇒ 一次等待式受控重建（从 data
+    // 重建，合并输出就在 data 里）。返回 true = 已重建，调用方重查定位重试；
+    // 文件还在（真 I/O 错误）/ merge_only / 重建失败 ⇒ false。
+    [[nodiscard]] bool heal_stale_location(std::uint32_t file_id) noexcept;
     // 运行期重建一次只允许一个执行者；读者看到 true 时必须返回显式
     // 索引不可用/损坏错误，禁止当 miss。
     std::atomic<bool> oki_rebuilding_{false};

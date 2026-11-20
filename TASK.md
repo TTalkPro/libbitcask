@@ -10,6 +10,73 @@
 
 ---
 
+## 🔴 S59 · 跨进程 merge_only 旁车合并后写者读不到被搬走的 key（2026-11-20 立项）
+
+> 来源：S58 排查中自行发现（探针：两套独立权威 = 两个进程）。用户定：修，只编码不提交。
+>
+> **病因**：跨进程旁车合并时搬迁只进了旁车自己的权威；旁车关库排水删掉输入文件后，写者内存索引（memdelta / 已载 run）
+> 仍指向旧位置——点查 `kIo "open file_id=N"`，删除之后才开始的全表迭代报 `fold location disappeared`，重开才好
+> （打开时 manifest 指向已删文件 ⇒ 一致性门不过 ⇒ 从 data 重建）。纯 KV 同样如此；同进程（共享 registry）不受影响。
+> 迭代开始前已钉住的文件、读缓存里已打开的句柄不受影响（Linux 上删除后仍可读）。
+>
+> **方案**：写者侧自愈。新增 `Cask::heal_stale_location(file_id)`：定位所指数据文件在盘上**确实不存在**（打不开但文件还在
+> = 真 I/O 错误，照常上报）且非 merge_only ⇒ 一次等待式受控重建（`run_controlled_rebuild(wait, force)`：可写句柄
+> `rebuild_from_data`、只读句柄内存重建；并发读者排在同一次重建后，不重复重建），合并输出在 data 里，重建后定位指向新位置。
+> `read_doc`：S13-F5 重查后仍打不开 ⇒ 自愈后再试一次。`CaskIter`：重查到同一版本仍指向缺失文件 ⇒ 自愈；同一版本位置已变
+> （迭代器视图固定在旧 run 上，后续 key 都会遇到）⇒ 按重查位置重读（每 key 至多 2 次）。range 迭代走 `get`，随 `read_doc` 修。
+
+| 项 | 状态 |
+|---|---|
+| S59-1 `Cask::heal_stale_location` | ✅ |
+| S59-2 `read_doc` 第二次重试前自愈 | ✅ |
+| S59-3 `CaskIter` 自愈 + 同版本新位置重读 | ✅ |
+| S59-4 回归 `tests/s59_cross_process_sidecar_test.cpp`（KV / 检索）：写者开着、另一套权威的旁车合并并删输入后，写者点查 / 全表迭代 / range 迭代 / 检索全对、之后照常写、重开不变；删除后第一个读者是全表迭代 | ✅ |
+| S59-5 CHANGELOG `[Unreleased]`、TASK | ✅ |
+
+**落地记录**（未提交，版本未定，与 S58 同在工作区）：
+- 基线红：禁用自愈的副本上 4 条用例全红（点查 `open file_id=1`、迭代 `fold location disappeared`）。开发中先只在「重查仍指向
+  同一文件」时重建，「先迭代」用例仍红——迭代器视图固定在旧 run 上，第二个 key 起重查已是新位置、原逻辑把「同 ord」判为消失；
+  补「同版本新位置重读」后绿。
+- 验证：GCC Release（`-Werror`）全量 ctest **944** 全绿；ASan 全量 944 全绿；Clang Debug / TSan
+  `S59|S58|S57|Merge|Oki|S43|Checkpoint|CaskDocValue|Crash|Iter|Range|Concurrent` 304 全绿。Windows 未实测（Windows 上
+  旁车删不掉写者打开着的文件，原本就不会走到这里）。
+- 代价：每次跨进程旁车合并后，写者第一次碰到被搬走的 key 时整库从 data 重建一次（之后正常）。
+- 未动：两个进程各自提交 `kv.oki.manifest`（后提交者覆盖前者）；崩溃后打开由既有一致性门（manifest 指向已删文件 ⇒
+  从 data 重建）兜住，本项不改。
+
+---
+
+## 🔴 S58 · 检索库 merge_only 旁车合并挂死 + 旁车改写写者检索持久化（2026-11-20 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-20-merge-only-search-merge-hangs.md`](feedbacks/2026-11-20-merge-only-search-merge-hangs.md)
+> （bitcask 修 `merge/2,3` 的 `dict_path` 时撞到）。用户定：修，只编码不提交。
+>
+> **病因**（插桩实测）：merge_only 打开不从数据折叠，车道以 `next_ord = 0` 注册；`Cask::merge` 开头 `ensure_oki_for_write()`
+> 的受控重建（merge_only 分支 `rebuild_memory_from_data`）把 `next_ord` 推到数据末尾（例：300），收尾 `flush_index()` 等
+> `wait_lsn(lane, 300)`，车道覆盖水位 0、车道上永远不会有任务 ⇒ 无界挂死。同进程旁车（共享权威）则是旁车打开后写者新写的
+> ord 不在旁车车道上，同样挂。即使不挂，收尾的成对保存点会用旁车的空检索索引改写写者的 `bm25.ckpt` / `docmap.ckpt` /
+> `index.manifest`（实测改写；本例覆盖水位 0，写者重开整库重放兜住，没丢数据，但逼写者整库重放、且依赖水位恰为 0）。
+>
+> **方案**：merge_only 旁车在检索库上按纯 KV 合并——不带检索插件（DocmapRelocator / Text / Vector）、跳过检索侧收尾（读屏障 +
+> 成对保存点），与公开 `checkpoint()` / close「merge_only 不写检索 ckpt」一致；搬迁的检索侧归正交给写者（同进程：共享权威，
+> 写者读写照常；下次打开按 key+LSN 重放合并输出）。`flush_index()` 对 merge_only 直接返回（旁车不接受写），旁车上调检索也不再挂。
+
+| 项 | 状态 |
+|---|---|
+| S58-1 `Cask::merge`：`own_search = text_ && !merge_only` 门控插件 span 与检索侧收尾 | ✅ |
+| S58-2 `Cask::flush_index()`：merge_only 直接返回 | ✅ |
+| S58-3 回归 `tests/s58_merge_only_search_test.cpp`：写者已关 ⇒ 旁车合并有界返回、旁车上检索不挂、写者检索持久化逐字节不变、输入文件回收、重开检索分数 / 值 / 旧版本不复活 / 之后照常写；写者开着且同进程（旁车打开后写者继续写）⇒ 合并有界返回、写者读与检索照常、在线分数合并前后逐位不变、重开命中集合不变 | ✅ |
+| S58-4 更正 S57 的 `needs_merge` 头注（跨进程旁车实时账本为空、退回清单；同进程共享写者实时账本） | ✅ |
+| S58-5 CHANGELOG `[Unreleased]`、反馈回填 | ✅ |
+
+**落地记录**（未提交，版本未定，建议 PATCH/MINOR：无接口与格式改动）：
+- 基线红：11.1.0 上两条用例都 30 s 挂住；只去掉等待、不拦收尾的变体上，检索持久化三个文件全被旁车改写。
+- 验证：GCC Release（`-Werror`）全量 ctest **940** 全绿；ASan 全量 940 全绿；Clang Debug / TSan
+  `S58|S57|Merge|Oki|S43|Checkpoint|CaskDocValue|Search|TextPlugin` 383 全绿。Windows 未实测。
+- 另发现：**跨进程**旁车在写者开着时合并后写者读被搬走的 key 失败（与 S58 无关、早已存在）——已由 **S59** 修。
+
+---
+
 ## 🔴 S57 · jieba 缺词典时 open 返回错误（不再 abort 进程）+ `needs_merge` 用实时账本（2026-11-20 立项）
 
 > 来源：bosun 两份下游反馈（11.0.0 `862d735` 复现）：

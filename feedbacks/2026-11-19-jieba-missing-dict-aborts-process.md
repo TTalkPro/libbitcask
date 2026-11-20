@@ -65,4 +65,4 @@ bitcask:merge(Dir, [{analyzer, jieba}]).
 只是不再杀宿主进程。新增 `text::jieba_missing_dict_file(dict_dir)` 供自行构造 `JiebaAnalyzer` 的调用方预检（直接构造仍不检查）。
 回归 `S57Test.JiebaMissingDictFileIsReported` / `FactoryReturnsNullInsteadOfAbort` / `OpenWithBadDictPathFailsCleanly`
 （11.0.0 上工厂用例进程直接死在 `DictTrie.hpp:243`）。
-② 在下游 bitcask（`cask_open_opts/1` 补缺省 `dict_path`、`dict_path` 收 list）——未改，不在本仓库。
+② 下游 bitcask 已修（2026-11-20，未提交）：`open/2` 与 `merge/2,3` 共用 `normalize_text_opts/1`（缺省 priv/dict、字符串转 binary、别的类型报 `{invalid_option, _}`），回归 `bitcask_jieba_merge_tests`。

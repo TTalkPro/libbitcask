@@ -154,6 +154,9 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
 
         // 只按视图位置读原始记录；key/ord 核对沿用 S43-1 点查契约。
         // 陈旧 loc 在 merge 窗口里可短暂缺失，重查 OKI 后重试一次。
+        bool healed = false;  // S59：本 key 已为「文件被别的进程合并删掉」重建过
+        int relocations = 0;  // S59：本 key 按重查位置重读的次数（有界）
+    read_at_loc:
         bool retry = false;
         fileops::DataFile* df = nullptr;
         std::shared_ptr<fileops::DataFile> shared_df;
@@ -222,6 +225,30 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
 
         if (!retry) continue;
         auto refreshed = parent_->authority_->state().locate(cur_key_);
+        // S59：同一版本仍指向已不存在的文件 ⇒ 跨进程 merge_only 旁车合并过、
+        // 本句柄索引不知道那次搬迁。从 data 重建一次后按新位置重读（搬迁不改
+        // ord；迭代器视图固定在旧 run 上，所以按重查结果读，不回视图）。
+        const auto same_version = [&] {
+            return refreshed.status == oki::OkiState::LocateStatus::kHit &&
+                   !refreshed.tomb && refreshed.has_loc && refreshed.ord == e.ord;
+        };
+        if (!healed && same_version() && refreshed.loc.file_id == e.file_id &&
+            refreshed.loc.offset == e.offset &&
+            parent_->heal_stale_location(e.file_id)) {
+            healed = true;
+            refreshed = parent_->authority_->state().locate(cur_key_);
+        }
+        // 同一版本、位置已变（本 key 刚重建过，或前面的 key 触发的重建已把它
+        // 搬到合并输出）⇒ 按新位置重读。迭代器视图固定在旧 run 上，后续 key
+        // 拿到的仍是旧位置，都会走这里。
+        if (same_version() && relocations < 2 &&
+            (refreshed.loc.file_id != e.file_id || refreshed.loc.offset != e.offset)) {
+            ++relocations;
+            e.file_id = refreshed.loc.file_id;
+            e.offset = refreshed.loc.offset;
+            e.total_sz = refreshed.loc.total_sz;
+            goto read_at_loc;  // 按新位置重读同一条记录
+        }
         if (refreshed.status != oki::OkiState::LocateStatus::kHit ||
             refreshed.tomb || !refreshed.has_loc || refreshed.ord == e.ord) {
             return std::unexpected(err(CaskError::kIo,

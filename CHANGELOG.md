@@ -15,6 +15,25 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
+## [Unreleased]（S58 / S59：merge_only 旁车合并）
+
+> 版本未定。C API、盘上格式、公共结构体零改动。
+
+### Fixed
+
+- **检索库经 merge_only 旁车合并永久挂住**（S58，下游反馈 `feedbacks/2026-11-20-merge-only-search-merge-hangs.md`，bitcask）：
+  旁车车道以打开时的 `next_ord`（未折叠数据）注册，合并开头的受控重建把 `next_ord` 推到数据末尾，收尾读屏障
+  `flush_index()` 无界等待；同进程旁车则等写者的新写。11.1.0 起 `needs_merge` 不再漏报，`merge` 会真的走到这里。
+  现旁车在检索库上按纯 KV 合并（不带检索插件、不做检索侧收尾），`flush_index()` 对 merge_only 直接返回。
+- **旁车合并改写写者的检索持久化**（S58）：收尾成对保存点用旁车的空检索索引改写 `bm25.ckpt` / `docmap.ckpt` /
+  `index.manifest`，逼写者下次整库重放。现旁车不写检索持久化（与 `checkpoint()` / close 拒绝 merge_only 一致）。
+- **跨进程 merge_only 旁车合并后，开着的写者读不到被搬走的 key**（S59）：旁车关库删掉输入文件，写者内存索引仍指旧位置
+  ⇒ 点查 `kIo "open file_id=N"`、全表迭代 `fold location disappeared`，重开才好（纯 KV 同样）。现读到「定位所指数据文件
+  已不存在」时从 data 受控重建一次再重试，迭代器按重查到的新位置重读；文件还在的读错误照常上报。代价：每次跨进程合并后
+  写者第一次碰到被搬走的 key 时整库重建一次。同进程旁车（共享 registry）本不受影响。
+
+---
+
 ## [11.1.0] - 2026-11-20（S57：jieba 缺词典 open 报错、`needs_merge` 用实时账本）
 
 > **版本语义（2026-11-20 定版）**：C API、盘上格式、既有结构体布局零改动，C++ 侧仅新增自由函数
