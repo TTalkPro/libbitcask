@@ -436,7 +436,9 @@ TEST(Hnsw, EmptyAndZeroK) {
 TEST(Hnsw, ConcurrentReadersWithSingleWriter) {
     // TSan 下缩规模不缩协议:happens-before 验证与节点数无关,
     // 但自旋锁 × TSan 插桩是乘法减速(实测 20k 档 ~110s)。
-#if BITCASK_TSAN_ENABLED   // S37-4：见 detail/cpu_features.hpp
+    // MSVC Debug（调试堆 + 迭代器检查）与 TSan 一样是乘法减速
+    // （实测 20k 档 ~400s，ctest 300s 超时），同档缩规模。
+#if BITCASK_TSAN_ENABLED || defined(_DEBUG)   // S37-4：见 detail/cpu_features.hpp
     const std::size_t n = 5000;
 #else
     const std::size_t n = 20000;

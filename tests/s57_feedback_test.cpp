@@ -79,10 +79,12 @@ TEST_F(S57Test, JiebaMissingDictFileIsReported) {
     EXPECT_EQ(jieba_missing_dict_file(""), "/jieba.dict.utf8") << "空串（下游漏填）";
     // 只有第一个文件 ⇒ 报第二个。
     std::ofstream(dir_ / "jieba.dict.utf8") << "x 1 n\n";
-    EXPECT_EQ(jieba_missing_dict_file(dir_.string()), (dir_ / "hmm_model.utf8").string());
+    // 实现侧统一用 "/" 拼路径（跨平台一致；Windows 上 std::filesystem::path
+    // 的 operator/ 会产生 '\'，不能直接拿它当期望值）。
+    EXPECT_EQ(jieba_missing_dict_file(dir_.string()), dir_.string() + "/hmm_model.utf8");
     // 同名的是目录 ⇒ 也算缺（ifstream 在 Linux 上能「打开」目录）。
     fs::create_directories(dir_ / "hmm_model.utf8");
-    EXPECT_EQ(jieba_missing_dict_file(dir_.string()), (dir_ / "hmm_model.utf8").string());
+    EXPECT_EQ(jieba_missing_dict_file(dir_.string()), dir_.string() + "/hmm_model.utf8");
 }
 
 TEST_F(S57Test, FactoryReturnsNullInsteadOfAbort) {
