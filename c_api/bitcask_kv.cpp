@@ -1794,6 +1794,83 @@ void set_invalid(bitcask_fault_t* fault, const char* msg) {
 }  // namespace
 }  // extern "C++"
 
+// S62：两个编码入口共用的后半段——排序、查重、编码、拷进 malloc 缓冲。
+extern "C++" {
+namespace {
+bitcask_error_t finish_meta_encode(std::vector<meta::MetaEntry>& es, const char* who,
+                                   bitcask_slice_t* out_blob, bitcask_fault_t* fault) {
+    // 格式不变式：key 字典序升序 + 无重复（meta_lookup 靠它提前退出）。
+    // 排序由本层做——不外泄给调用方；重复 key 则是真错误：encode_meta 只有
+    // assert 兜底，Release（NDEBUG）下放过去就是运行期**静默**的过滤失配。
+    std::sort(es.begin(), es.end(),
+              [](const meta::MetaEntry& a, const meta::MetaEntry& b) {
+                  return a.key < b.key;
+              });
+    for (size_t i = 1; i < es.size(); ++i) {
+        if (es[i - 1].key == es[i].key) {
+            char msg[BITCASK_DETAIL_MAX];
+            snprintf(msg, sizeof(msg), "%s: duplicate meta key: %s", who, es[i].key.c_str());
+            set_invalid(fault, msg);
+            return BITCASK_ERR_INVALID_OPTION;
+        }
+    }
+    std::vector<std::byte> blob;
+    meta::encode_meta(blob, es);
+    if (blob.empty()) return BITCASK_OK;
+    void* buf = std::malloc(blob.size());
+    if (!buf) {
+        if (fault) {
+            fault->code = BITCASK_ERR_IO;
+            fault->errnum = ENOMEM;
+            snprintf(fault->detail, BITCASK_DETAIL_MAX, "out of memory");
+        }
+        return BITCASK_ERR_IO;
+    }
+    std::memcpy(buf, blob.data(), blob.size());
+    out_blob->data = buf;
+    out_blob->size = blob.size();
+    return BITCASK_OK;
+}
+
+// S62：C 编码条目（含数组）→ C++ MetaEntry。who 用于报文。
+bool to_cpp_meta_entry_ex(const bitcask_meta_entry_ex_t& e, meta::MetaEntry& out,
+                          const char* who, bitcask_fault_t* fault) {
+    char msg[BITCASK_DETAIL_MAX];
+    if (!e.key) {
+        snprintf(msg, sizeof(msg), "%s: entry key is NULL", who);
+        set_invalid(fault, msg);
+        return false;
+    }
+    out.key = e.key;
+    if (e.value.type == BITCASK_META_VALUE_STRING_ARRAY) {
+        if (e.items_count > 0 && !e.items) {
+            snprintf(msg, sizeof(msg), "%s: array items is NULL but items_count > 0", who);
+            set_invalid(fault, msg);
+            return false;
+        }
+        meta::StringArray arr;
+        arr.reserve(e.items_count);
+        for (size_t i = 0; i < e.items_count; ++i) {
+            if (!slice_valid(e.items[i])) {
+                snprintf(msg, sizeof(msg), "%s: invalid array item slice", who);
+                set_invalid(fault, msg);
+                return false;
+            }
+            arr.emplace_back(static_cast<const char*>(e.items[i].data), e.items[i].size);
+        }
+        out.value = std::move(arr);
+        return true;
+    }
+    if (!to_cpp_meta_value(e.value, out.value)) {
+        snprintf(msg, sizeof(msg), "%s: bad value type or NULL string", who);
+        set_invalid(fault, msg);
+        return false;
+    }
+    return true;
+}
+}  // namespace
+}  // extern "C++"
+
 BITCASK_API bitcask_error_t bitcask_meta_encode(const bitcask_meta_entry_t* entries,
                                               size_t n,
                                               bitcask_slice_t* out_blob,
@@ -1815,48 +1892,58 @@ BITCASK_API bitcask_error_t bitcask_meta_encode(const bitcask_meta_entry_t* entr
         meta::MetaEntry e;
         e.key = entries[i].key;
         if (!to_cpp_meta_value(entries[i].value, e.value)) {
-            set_invalid(fault, "bitcask_meta_encode: bad value type or NULL string");
+            set_invalid(fault, entries[i].value.type == BITCASK_META_VALUE_STRING_ARRAY
+                ? "bitcask_meta_encode: STRING_ARRAY needs bitcask_meta_encode_ex"
+                : "bitcask_meta_encode: bad value type or NULL string");
             return BITCASK_ERR_INVALID_OPTION;
         }
         es.push_back(std::move(e));
     }
+    return finish_meta_encode(es, "bitcask_meta_encode", out_blob, fault);
+    });
+}
 
-    // 格式不变式：key 字典序升序 + 无重复（meta_lookup 靠它提前退出）。
-    // 排序由本层做——不外泄给调用方；重复 key 则是真错误：encode_meta 只有
-    // assert 兜底，Release（NDEBUG）下放过去就是运行期**静默**的过滤失配。
-    std::sort(es.begin(), es.end(),
-              [](const meta::MetaEntry& a, const meta::MetaEntry& b) {
-                  return a.key < b.key;
-              });
-    for (size_t i = 1; i < es.size(); ++i) {
-        if (es[i - 1].key == es[i].key) {
-            char msg[BITCASK_DETAIL_MAX];
-            snprintf(msg, sizeof(msg),
-                     "bitcask_meta_encode: duplicate meta key: %s",
-                     es[i].key.c_str());
-            set_invalid(fault, msg);
+// S62：可写字符串数组的编码入口。
+BITCASK_API bitcask_error_t bitcask_meta_encode_ex(const bitcask_meta_entry_ex_t* entries,
+                                                 size_t n,
+                                                 bitcask_slice_t* out_blob,
+                                                 bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!out_blob) return BITCASK_ERR_INVALID_OPTION;
+    out_blob->data = nullptr;
+    out_blob->size = 0;
+    if (n == 0) return BITCASK_OK;
+    if (!entries) return BITCASK_ERR_INVALID_OPTION;
+    std::vector<meta::MetaEntry> es;
+    es.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        meta::MetaEntry e;
+        if (!to_cpp_meta_entry_ex(entries[i], e, "bitcask_meta_encode_ex", fault)) {
             return BITCASK_ERR_INVALID_OPTION;
         }
+        es.push_back(std::move(e));
     }
-
-    std::vector<std::byte> blob;
-    meta::encode_meta(blob, es);
-    if (blob.empty()) return BITCASK_OK;
-
-    void* buf = std::malloc(blob.size());
-    if (!buf) {
-        if (fault) {
-            fault->code = BITCASK_ERR_IO;
-            fault->errnum = ENOMEM;
-            snprintf(fault->detail, BITCASK_DETAIL_MAX, "out of memory");
-        }
-        return BITCASK_ERR_IO;
-    }
-    std::memcpy(buf, blob.data(), blob.size());
-    out_blob->data = buf;
-    out_blob->size = blob.size();
-    return BITCASK_OK;
+    return finish_meta_encode(es, "bitcask_meta_encode_ex", out_blob, fault);
     });
+}
+
+// S62：逐个取字符串数组元素（region = 视图的 str）。
+BITCASK_API int bitcask_meta_array_next(bitcask_slice_t region, size_t* cursor,
+                                        bitcask_slice_t* out_item) {
+    try {
+    if (!cursor || !slice_valid(region) || *cursor >= region.size) return 0;
+    const auto span = to_span(region);
+    auto il = bitcask::codec::vbyte_read_checked(span, *cursor);
+    if (!il || il->first > span.size() - il->second) return 0;
+    if (out_item) {
+        out_item->data = span.data() + il->second;
+        out_item->size = static_cast<size_t>(il->first);
+    }
+    *cursor = il->second + static_cast<size_t>(il->first);
+    return 1;
+    } catch (...) {
+        return 0;
+    }
 }
 
 BITCASK_API void bitcask_meta_blob_free(bitcask_slice_t* blob) {
@@ -1940,20 +2027,22 @@ BITCASK_API int bitcask_meta_lookup(bitcask_slice_t blob,
     }
 }
 
-// S61：文档部分更新。C 补丁 → C++ DocPatch（值借调用方存储，调用期间有效）。
-BITCASK_API bitcask_error_t bitcask_update_doc(bitcask_t* cask,
-                                              bitcask_slice_t key,
-                                              const bitcask_doc_patch_t* patch,
-                                              uint64_t tstamp,
-                                              uint64_t* out_ord,
-                                              bitcask_fault_t* fault) {
-    return guarded(fault, [&]() -> bitcask_error_t {
+// S61 / S62：文档部分更新。C 补丁 → C++ DocPatch（值借调用方存储，调用期间有效）。
+// 两个补丁变体只差 set_meta 的条目类型，共用一个模板。
+extern "C++" {
+namespace {
+template <class Patch, class MetaConv>
+bitcask_error_t update_doc_common(bitcask_t* cask, bitcask_slice_t key, const Patch* patch,
+                                  uint64_t tstamp, uint64_t* out_ord, bitcask_fault_t* fault,
+                                  const char* who, MetaConv&& conv_meta) {
     if (!cask || !patch || !slice_valid(key)) return BITCASK_ERR_INVALID_OPTION;
     if ((patch->set_fields_count && !patch->set_fields) ||
         (patch->remove_fields_count && !patch->remove_fields) ||
         (patch->set_meta_count && !patch->set_meta) ||
         (patch->remove_meta_count && !patch->remove_meta)) {
-        set_invalid(fault, "bitcask_update_doc: array is NULL but count > 0");
+        char msg[BITCASK_DETAIL_MAX];
+        snprintf(msg, sizeof(msg), "%s: array is NULL but count > 0", who);
+        set_invalid(fault, msg);
         return BITCASK_ERR_INVALID_OPTION;
     }
     bitcask::DocPatch p;
@@ -1969,22 +2058,15 @@ BITCASK_API bitcask_error_t bitcask_update_doc(bitcask_t* cask,
         p.remove_fields.emplace_back(static_cast<const char*>(n.data), n.size);
     }
     for (size_t i = 0; i < patch->set_meta_count; ++i) {
-        const auto& e = patch->set_meta[i];
-        if (!e.key) {
-            set_invalid(fault, "bitcask_update_doc: set_meta key is NULL");
-            return BITCASK_ERR_INVALID_OPTION;
-        }
         meta::MetaEntry me;
-        me.key = e.key;
-        if (!to_cpp_meta_value(e.value, me.value)) {
-            set_invalid(fault, "bitcask_update_doc: bad meta value type or NULL string");
-            return BITCASK_ERR_INVALID_OPTION;
-        }
+        if (!conv_meta(patch->set_meta[i], me)) return BITCASK_ERR_INVALID_OPTION;
         p.set_meta.push_back(std::move(me));
     }
     for (size_t i = 0; i < patch->remove_meta_count; ++i) {
         if (!patch->remove_meta[i]) {
-            set_invalid(fault, "bitcask_update_doc: remove_meta key is NULL");
+            char msg[BITCASK_DETAIL_MAX];
+            snprintf(msg, sizeof(msg), "%s: remove_meta key is NULL", who);
+            set_invalid(fault, msg);
             return BITCASK_ERR_INVALID_OPTION;
         }
         p.remove_meta.emplace_back(patch->remove_meta[i]);
@@ -1996,6 +2078,47 @@ BITCASK_API bitcask_error_t bitcask_update_doc(bitcask_t* cask,
     }
     if (out_ord) *out_ord = *r;
     return BITCASK_OK;
+}
+}  // namespace
+}  // extern "C++"
+
+BITCASK_API bitcask_error_t bitcask_update_doc(bitcask_t* cask,
+                                              bitcask_slice_t key,
+                                              const bitcask_doc_patch_t* patch,
+                                              uint64_t tstamp,
+                                              uint64_t* out_ord,
+                                              bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    return update_doc_common(cask, key, patch, tstamp, out_ord, fault, "bitcask_update_doc",
+        [fault](const bitcask_meta_entry_t& e, meta::MetaEntry& me) {
+            if (!e.key) {
+                set_invalid(fault, "bitcask_update_doc: set_meta key is NULL");
+                return false;
+            }
+            me.key = e.key;
+            if (!to_cpp_meta_value(e.value, me.value)) {
+                set_invalid(fault, e.value.type == BITCASK_META_VALUE_STRING_ARRAY
+                    ? "bitcask_update_doc: STRING_ARRAY needs bitcask_update_doc_ex"
+                    : "bitcask_update_doc: bad meta value type or NULL string");
+                return false;
+            }
+            return true;
+        });
+    });
+}
+
+// S62：可写字符串数组的部分更新。
+BITCASK_API bitcask_error_t bitcask_update_doc_ex(bitcask_t* cask,
+                                                 bitcask_slice_t key,
+                                                 const bitcask_doc_patch_ex_t* patch,
+                                                 uint64_t tstamp,
+                                                 uint64_t* out_ord,
+                                                 bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    return update_doc_common(cask, key, patch, tstamp, out_ord, fault, "bitcask_update_doc_ex",
+        [fault](const bitcask_meta_entry_ex_t& e, meta::MetaEntry& me) {
+            return to_cpp_meta_entry_ex(e, me, "bitcask_update_doc_ex", fault);
+        });
     });
 }
 

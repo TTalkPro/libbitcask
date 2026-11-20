@@ -139,6 +139,7 @@ std::optional<text::AnalyzerConfig> decode_analyzer(std::span<const char> p) {
 // 写端按 MetaConfig::version 写 5 或 6(目录创建默认 5)。
 inline constexpr std::uint8_t kMetaVersion = 5;
 inline constexpr std::uint8_t kMetaVersionBatch = 6;  // S35 原子批纪元
+inline constexpr std::uint8_t kMetaVersionMultiValue = 7;  // S62 meta 字符串数组纪元（蕴含 v6）
 inline constexpr char kMetaMagic[kMetaMagicSize + 1] = "BCME";
 
 // header 前 kMetaCrcCoverLen 字节的 CRC32（与 data/field.schema 同多项式）。
@@ -204,10 +205,10 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
             "run `bitcask_migrate hintord <src> <dst>` to migrate "
             "(data files are copied unchanged; only meta is rewritten)", MetaError::Kind::kUnsupported});
     }
-    if (ver != kMetaVersion && ver != kMetaVersionBatch) {
+    if (ver != kMetaVersion && ver != kMetaVersionBatch && ver != kMetaVersionMultiValue) {
         return std::unexpected(MetaError{0, "unsupported meta version", MetaError::Kind::kUnsupported});
     }
-    // v5/v6：校验 CRC32（检出位翻转/损坏 → fail-fast）。
+    // v5/v6/v7：校验 CRC32（检出位翻转/损坏 → fail-fast）。
     {
         std::uint32_t stored = 0;
         std::memcpy(&stored, header + kMetaCrcOffset, 4);
@@ -218,7 +219,7 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
 
     const std::uint8_t mode_val = static_cast<std::uint8_t>(header[kMetaModeOffset]);
     MetaConfig cfg;
-    cfg.version = ver;  // S35：回填实际纪元（5 或 6）
+    cfg.version = ver;  // S35：回填实际纪元（5 / 6 / 7）
     if (mode_val == 0) {
         cfg.mode = Mode::kKV;
     } else if (mode_val == 1) {
@@ -288,7 +289,8 @@ std::expected<MetaConfig, MetaError> read_meta(std::string_view dirname) {
 
 std::expected<void, MetaError> write_meta(std::string_view dirname, const MetaConfig& config) {
     const auto path = bitcask::detail::from_utf8(dirname) / "bitcask.meta";
-    if (config.version != kMetaVersion && config.version != kMetaVersionBatch) {
+    if (config.version != kMetaVersion && config.version != kMetaVersionBatch &&
+        config.version != kMetaVersionMultiValue) {
         return std::unexpected(MetaError{0, "invalid meta version to write", MetaError::Kind::kUnsupported});
     }
 

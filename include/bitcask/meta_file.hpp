@@ -108,8 +108,10 @@ struct MetaConfig {
 
     // S35：盘上纪元。5 = 无原子批（保守纪元标记）；6 = 目录可能含
     // kBatchHeader 记录（首次 put_batch_atomic 前懒升级，见
-    // doc/atomic-batch-design-zh.md §2）。read_meta 回填实际值；write_meta
-    // 按此值写出（仅接受 5/6）。目录创建默认 5。
+    // doc/atomic-batch-design-zh.md §2）；7 = S62，另外可能含字符串数组 meta
+    // （第一条含数组值的记录落盘前懒升级；纪元单调，7 蕴含 6 的含义；旧读端遇 7
+    // 干净拒开，见 designs/meta-multivalue-design-zh.md §3.2）。read_meta 回填实际值；
+    // write_meta 按此值写出（仅接受 5/6/7）。目录创建默认 5。
     std::uint8_t version = 5;
 };
 

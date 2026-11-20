@@ -10,6 +10,33 @@
 
 ---
 
+## 🔴 S62 · meta 字符串数组 + Contains 过滤 + bitcask.meta v7 纪元（2026-11-20 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-13-doc-capability-gaps.md`](feedbacks/2026-11-13-doc-capability-gaps.md) #4（锦书：别名天然多值）。
+> 设计 [`designs/meta-multivalue-design-zh.md`](designs/meta-multivalue-design-zh.md)；用户定方案 A（新值类型），只编码不提交。
+> 待定项按设计推荐默认：只做字符串数组；既有操作符碰数组按类型不匹配；`bitcask_update_doc_ex` 同批做；下游 Erlang 不在本项。
+>
+> 约束：⛔ 改 C 侧既有结构体布局 / 函数签名；C++ `MetaValue` 加变体（ABI 破坏，须升 major，版本由用户定）。
+
+| 项 | 状态 |
+|---|---|
+| S62-1 `meta_codec.hpp`：类型标记 5 编解码、`meta_find_raw`（零分配值区间，标量跳读内联）、`for_each_array_item`、`meta_has_string_array`、`value_from_raw` | ✅ |
+| S62-2 `meta_filter.hpp`：`Contains` / `ContainsAny`（冷分支 `BITCASK_NOINLINE`）；`compare_values` 数组显式分支；求值改原地比较 `compare_raw`（不物化） | ✅ |
+| S62-3 纪元：`meta_file` 接受 / 写出 v7；`put_doc` 组提交前 `ensure_multivalue_epoch`；原子批（含 `update_doc` / `TxnCask`）懒升目标按「批内是否含数组」取 6 或 7；`meta_multivalue_` 快判 | ✅ |
+| S62-4 C API：枚举、过滤解析、视图 / iter 认数组、`bitcask_meta_array_next`、`bitcask_meta_encode_ex`、`bitcask_update_doc_ex`；旧入口给数组 ⇒ INVALID_OPTION | ✅ |
+| S62-5 回归 `tests/s62_meta_multivalue_test.cpp`（8）+ C `test_meta_string_array` | ✅ |
+| S62-6 文档 `doc/api-c.md` §10.4b、`doc/api-cpp.md` §7.8、CHANGELOG `[Unreleased]`、反馈回填、设计稿状态 | ✅ |
+
+**落地记录**（未提交，版本未定，须升 major）：
+- 旧版本实测（11.2.0 `git archive` 单独编）：打开新版本写出的 v7 目录 ⇒ `read meta failed: unsupported meta version`；
+  无门禁时的后果也实测了——11.2.0 的 `meta_lookup` 对数组之后的 key 返回「不存在」，`zkind == beast` 求值 0（应为 1），`decode_meta` 报错。
+- 性能（无数组的 meta、3 条件组合过滤，独立微基准两份头文件对拍）：初版慢 ~17%（通用 skip 函数调用）→ 标量跳读内联后 ~10%
+  → `Contains` 冷分支移出内联后 ~4% → 原地比较不物化后**持平**（121 对 121 ns）；单项 `Exists` 31 → 22 ns。
+- 验证：GCC Release（`-Werror`）全量 **960**：一轮挂 `HighlightColdTest.ReopenedLibraryHasNoSnippetsUnlessLoaded`（S53 既有偶发，
+  串行连跑 5 次全过）；ASan 全量 960 全绿；Clang Debug / TSan 相关 202 全绿；clang 下 `-Wswitch` 新告警已消。Windows 未实测。
+
+---
+
 ## 🔴 S60 / S61 · 逐字段片段 + 文档部分更新（2026-11-20 立项）
 
 > 来源：下游反馈 [`feedbacks/2026-11-13-doc-capability-gaps.md`](feedbacks/2026-11-13-doc-capability-gaps.md)（锦书 §Q-21）的遗留：

@@ -632,6 +632,10 @@ inline bool to_cpp_meta_value(const bitcask_meta_value_t& v, meta::MetaValue& ou
             if (!v.str) return false;
             out = std::string(v.str);
             return true;
+        case BITCASK_META_VALUE_STRING_ARRAY:
+            // S62：bitcask_meta_value_t 表达不了数组（过滤操作数 / 旧编码入口）——
+            // 写数组走 bitcask_meta_entry_ex_t（bitcask_meta_encode_ex / update_doc_ex）。
+            return false;
     }
     return false;
 }
@@ -647,13 +651,13 @@ inline bool to_cpp_meta_filter(const bitcask_meta_filter_t& src,
         const auto& c = src.conditions[i];
         if (!c.key) return false;
         if (static_cast<unsigned>(c.op) >
-            static_cast<unsigned>(BITCASK_META_OP_EXISTS)) {
+            static_cast<unsigned>(BITCASK_META_OP_CONTAINS_ANY)) {
             return false;
         }
         meta::MetaCondition mc;
         mc.key = c.key;
         mc.op  = static_cast<meta::MetaOp>(c.op);
-        if (mc.op == meta::MetaOp::In) {
+        if (mc.op == meta::MetaOp::In || mc.op == meta::MetaOp::ContainsAny) {
             if (c.values_count > 0 && !c.values) return false;
             mc.values.reserve(c.values_count);
             for (size_t j = 0; j < c.values_count; ++j) {
@@ -831,6 +835,19 @@ inline bool meta_parse_entry(std::span<const std::byte> blob, std::size_t off,
             out.value.str.data = blob.data() + sl_vr->second;
             out.value.str.size = static_cast<std::size_t>(sl_vr->first);
             cur = sl_vr->second + static_cast<std::size_t>(sl_vr->first);
+            break;
+        }
+        case meta::MetaType::StringArray: {
+            // S62：i64 = 元素个数；str = 元素区间（Count 之后到值末尾），给 array_next 用。
+            auto cn = codec::vbyte_read_checked(blob, cur);
+            if (!cn) return false;
+            const std::size_t end = meta::detail::skip_value(blob, cur, meta::MetaType::StringArray);
+            if (end == static_cast<std::size_t>(-1)) return false;
+            out.value.type = BITCASK_META_VALUE_STRING_ARRAY;
+            out.value.i64 = static_cast<std::int64_t>(cn->first);
+            out.value.str.data = blob.data() + cn->second;
+            out.value.str.size = end - cn->second;
+            cur = end;
             break;
         }
         default:

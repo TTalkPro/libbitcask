@@ -159,7 +159,7 @@ struct MetaConfig {
     std::uint8_t  icu_major = 0, unicode_major = 0;       // S38：0 = 未记录
     std::uint32_t analyzer_fp = 0;                        // C1：分析器配置指纹，0 = 未记录
     std::optional<text::AnalyzerConfig> analyzer;         // S55：分析器配置本身（C2；不含 dict_path）
-    std::uint8_t  version = 5;                            // S35：5 / 6
+    std::uint8_t  version = 5;                            // S35：5 / 6；S62：7 = 还写过字符串数组 meta
 };
 ```
 
@@ -1473,13 +1473,15 @@ enum class MetaOp : std::uint8_t {
     Lte    = 5,
     In     = 6,
     Exists = 7,
+    Contains    = 8,  // S62
+    ContainsAny = 9,  // S62
 };
 
 struct MetaCondition {
     std::string key;
     MetaOp      op   = MetaOp::Eq;
     MetaValue   value;
-    std::vector<MetaValue> values;  // 仅 In 操作用
+    std::vector<MetaValue> values;  // 仅 In / ContainsAny 操作用
 
     // 在 meta blob 上求值。key 不存在 → false（Exists 例外）。
     // 类型不匹配或非法 op → false。
@@ -1498,6 +1500,8 @@ struct MetaFilter {
 
 类型系统：`Eq` / `Neq` 同 type 才比较；`Gt` / `Gte` / `Lt` / `Lte` 仅 int64 / float64 参与；`In` 在 values 列表里查；`Exists` 只看 key 是否出现。空 filter（无 conditions 无 children）恒返回 true。
 
+S62：`Contains`（操作数 `value`）/ `ContainsAny`（操作数 `values`）——存储值是字符串数组 ⇒ 任一元素等于操作数；是 string ⇒ 等于操作数（标量当单元素集合）；其它 / 不存在 / 操作数不是 string ⇒ false。既有操作符碰到字符串数组一律按类型不匹配（`Eq` / `In` / `Gt…` false，`Neq` true）。求值在 blob 上原地比较，不物化值（`meta_find_raw`），无数组的库过滤开销与 11.2 持平。
+
 `MetaValue`（在 `meta_codec.hpp`）：
 
 ```cpp
@@ -1506,8 +1510,15 @@ using MetaValue = std::variant<
     bool,
     std::int64_t,
     double,
-    std::string>;
+    std::string,
+    StringArray>;    // S62：std::vector<std::string>（MetaType::StringArray = 5）
 ```
+
+S62 字符串数组：元素是 UTF-8 字符串，保持写入顺序、不去重，允许空数组。⚠️ **纪元**：目录里第一次写入含数组值的
+meta（`put_doc` / `put_batch_atomic` / `TxnCask` / `update_doc`）之前，`bitcask.meta` 懒升 **v7**——≤ 11.2 的旧版本从此
+打不开这个目录（干净报 `unsupported meta version`；否则旧版本会把数组之后的 key 静默读成「不存在」）。不写数组的目录
+停在 v5 / v6。⚠️ **C++ ABI**：`MetaValue` 多了一种类型，自己 `std::visit` / `index()` 分支的代码要补分支、重新编译。
+设计见 `designs/meta-multivalue-design-zh.md`。
 
 ### 7.9 `bitcask::text::SynonymMap`（`synonym_map.hpp`）
 

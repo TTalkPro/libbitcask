@@ -15,6 +15,29 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
+## [Unreleased]（S62：meta 字符串数组）
+
+> 版本未定，**须升 major**：⚠️ C++ ABI 破坏——已安装公共头 `include/bitcask/meta_codec.hpp` 的 `meta::MetaValue`（`std::variant`）
+> 追加 `StringArray`（`std::vector<std::string>`），布局与变体数变化，C++ 下游须重新编译，自己 `std::visit` / `index()` 分支的
+> 代码要补分支。C API 全部纯新增（新枚举值、新结构体、新函数），C ABI 兼容。
+> 盘上格式：meta 新增值类型标记 5（格式版本 `Ver` 不变）；**目录一旦写入数组值，`bitcask.meta` 懒升 v7，≤ 11.2 的旧版本从此打不开
+> 该目录**（干净拒开）。不写数组的目录停在 v5 / v6，存量库与旧版本互通不受影响。
+
+### Added
+
+- **meta 字符串数组 + 「包含」过滤**（S62，反馈 `feedbacks/2026-11-13-doc-capability-gaps.md` #4，锦书）：`meta::StringArray` /
+  `MetaType::StringArray = 5`；过滤新增 `MetaOp::Contains` / `ContainsAny`（数组任一元素命中；标量 string 当单元素集合）。
+  检索后过滤、向量遍历期过滤（经 docmap 同一套求值；用例覆盖 HNSW，DiskANN 未单测）、迭代器与 range 的 filter、`update_doc` 都直接支持。C：`BITCASK_META_VALUE_STRING_ARRAY`、
+  `BITCASK_META_OP_CONTAINS(_ANY)`、`bitcask_meta_entry_ex_t` + `bitcask_meta_encode_ex`、`bitcask_meta_array_next`、
+  `bitcask_doc_patch_ex_t` + `bitcask_update_doc_ex`。设计 `designs/meta-multivalue-design-zh.md`。
+
+### Changed
+
+- **过滤求值改为在 meta blob 上原地比较**（S62）：不再先物化成 `MetaValue`（字符串条件少一次 `std::string` 构造）；
+  `Exists` 变快，组合过滤与 11.2 持平。语义逐条不变。
+
+---
+
 ## [11.2.0] - 2026-11-20（S60 / S61：逐字段片段、文档部分更新）
 
 > **版本语义（2026-11-20 定版）**：纯新增——C++ 新类型 `search::FieldSnippets` / `search::SearchFieldHitEx` /

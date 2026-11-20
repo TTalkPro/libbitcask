@@ -221,6 +221,15 @@ target_link_libraries(bitcask_analyzer_record_test PRIVATE
     bitcask_sanitizers
 )
 
+# S62：meta 字符串数组（反馈 2026-11-13 #4）+ bitcask.meta v7 纪元门禁
+add_executable(bitcask_s62_meta_multivalue_test s62_meta_multivalue_test.cpp)
+target_link_libraries(bitcask_s62_meta_multivalue_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+
 # S60 / S61：逐字段片段 + 文档部分更新（反馈 2026-11-13 #1 后半 / #3）
 add_executable(bitcask_s60_s61_doc_ops_test s60_s61_doc_ops_test.cpp)
 target_link_libraries(bitcask_s60_s61_doc_ops_test PRIVATE
@@ -546,6 +555,7 @@ gtest_discover_tests(bitcask_s57_feedback_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_s58_merge_only_search_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_s59_cross_process_sidecar_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_s60_s61_doc_ops_test ${_bitcask_test_props})
+gtest_discover_tests(bitcask_s62_meta_multivalue_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_analyzer_record_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_data_file_test ${_bitcask_test_props})
 gtest_discover_tests(bitcask_oki_run_v2_test ${_bitcask_test_props})

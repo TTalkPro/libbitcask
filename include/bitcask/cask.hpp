@@ -1347,6 +1347,11 @@ private:
 
     // bitcask.meta 配置（open 时读写）
     meta::MetaConfig meta_config_{};
+    // S62：目录已到 v7（可写字符串数组 meta）——写路径快判，免每次持锁读纪元。
+    std::atomic<bool> meta_multivalue_{false};
+    // S62：把 bitcask.meta 懒升到 v7（持 write_mu_；已是 v7 则只置标志）。调用方须在
+    // 含数组值的记录进入写缓冲之前调用，且调用时不得持有 write_mu_。
+    [[nodiscard]] std::expected<void, CaskFault> ensure_multivalue_epoch();
 
     // S16-1：DocMap 宿主服务（ord↔ext/live/meta 身份表）。Cask 持有、
     // Text/Vector 插件借用（设计 §4：docmap 属「文档身份」域而非「搜索」域）。

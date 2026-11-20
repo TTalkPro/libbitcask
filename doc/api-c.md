@@ -1235,6 +1235,41 @@ bitcask_get_result_free(g);
 
 ## 11. 迭代与并行扫描
 
+### 10.4b 字符串数组 meta（S62）
+
+```c
+/* 枚举追加 */
+BITCASK_META_VALUE_STRING_ARRAY = 5;                 /* bitcask_meta_value_type_t */
+BITCASK_META_OP_CONTAINS = 8; BITCASK_META_OP_CONTAINS_ANY = 9;   /* bitcask_meta_op_t */
+
+typedef struct {
+    const char*            key;
+    bitcask_meta_value_t   value;        /* type == STRING_ARRAY ⇒ 看 items */
+    const bitcask_slice_t* items;
+    size_t                 items_count;
+} bitcask_meta_entry_ex_t;
+
+BITCASK_API bitcask_error_t bitcask_meta_encode_ex(const bitcask_meta_entry_ex_t* entries, size_t n,
+                                                 bitcask_slice_t* out_blob, bitcask_fault_t* fault);
+BITCASK_API int bitcask_meta_array_next(bitcask_slice_t region, size_t* cursor,
+                                        bitcask_slice_t* out_item);
+BITCASK_API bitcask_error_t bitcask_update_doc_ex(bitcask_t* cask, bitcask_slice_t key,
+                                                 const bitcask_doc_patch_ex_t* patch, uint64_t tstamp,
+                                                 uint64_t* out_ord, bitcask_fault_t* fault);
+```
+
+- **写**：`bitcask_meta_encode_ex` 编码含数组的 meta（其余规则同 `bitcask_meta_encode`）；部分更新用 `bitcask_update_doc_ex`
+  （补丁里的 `set_meta` 是 `bitcask_meta_entry_ex_t`）。旧入口 `bitcask_meta_encode` / `bitcask_update_doc` 给
+  `STRING_ARRAY` ⇒ `BITCASK_ERR_INVALID_OPTION`（报文指向 `_ex`）。
+- **读**：`bitcask_meta_lookup` / `bitcask_meta_iter_next` 签名与视图布局不变；数组时 `type = STRING_ARRAY`、`i64 = 元素个数`、
+  `str = 元素区间`，用 `bitcask_meta_array_next(view.str, &cursor, &item)` 逐个取（cursor 从 0 起，零分配）。
+- **过滤**：`CONTAINS` 用 `value`、`CONTAINS_ANY` 用 `values`（都必须是 `STRING`）。存储值是数组 ⇒ 任一元素命中；是 string ⇒
+  等于即命中；其它 / 不存在 ⇒ 不过。既有操作符碰到数组按类型不匹配（`EQ` / `IN` / `GT…` 不过，`NEQ` 过）。旧库收到 8 / 9 ⇒
+  `BITCASK_ERR_INVALID_OPTION`。
+- ⚠️ **纪元**：第一次把含数组值的 meta 写进目录（`bitcask_put_doc_ex` / 原子批 / 事务 / `bitcask_update_doc_ex`）之前，
+  `bitcask.meta` 懒升 **v7**（`bitcask_meta_info_t.meta_version == 7`）——≤ 11.2 的旧版本从此打不开这个目录（干净拒开）。
+  不写数组的目录停在 v5 / v6。混跑新旧版本的部署要先全部升级再开始写数组。
+
 ### 11.1 `bitcask_iter_start`
 
 ```c

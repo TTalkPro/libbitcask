@@ -14,6 +14,10 @@
 // - Gt/Gte/Lt/Lte：仅 int64 / float64 参与；其它类型一律 false。
 // - In：存储值在 values 列表里存在（Eq 语义）；类型不匹配按 Eq 规则逐项 false。
 // - Exists：忽略 value 字段，只看 key 是否出现。
+// - S62 Contains：存储值是字符串数组 ⇒ 任一元素 == value；是 string ⇒ 等于 value（标量
+//   当单元素集合）；其它 / 不存在 / value 不是 string ⇒ false。
+// - S62 ContainsAny：同 Contains，但操作数是 values（string 列表），任一命中即真。
+// - 既有操作符碰到字符串数组一律按「类型不匹配」：Eq/In/Gt… false，Neq true。
 
 #pragma once
 
@@ -27,6 +31,7 @@
 #include <vector>
 
 #include "bitcask/meta_codec.hpp"  // MetaValue + meta_lookup
+#include "bitcask/detail/cpu_features.hpp"  // S62：BITCASK_NOINLINE
 
 namespace bitcask::meta {
 
@@ -41,6 +46,8 @@ enum class MetaOp : std::uint8_t {
     Lte     = 5,
     In      = 6,
     Exists  = 7,
+    Contains    = 8,  // S62
+    ContainsAny = 9,  // S62
 };
 
 // 单条 leaf 条件：{key, op, value}。In 操作用 values；其余只用 value。
@@ -48,7 +55,7 @@ struct MetaCondition {
     std::string key;
     MetaOp      op = MetaOp::Eq;
     MetaValue   value;
-    std::vector<MetaValue> values;  // 仅 In 操作用
+    std::vector<MetaValue> values;  // 仅 In / ContainsAny 操作用
 
     // 在 meta blob 上求值。key 不存在 → false（Exists 例外）。
     // 类型不匹配或非法 op → false。
@@ -95,11 +102,16 @@ compare_values(const MetaValue& a, const MetaValue& b) noexcept {
                 const auto bv = std::get<double>(b);
                 if (av == bv) return 0;
                 return av < bv ? -1 : 1;
-            } else {
+            } else if constexpr (std::is_same_v<AT, std::string>) {
                 if (!std::holds_alternative<std::string>(b)) return std::nullopt;
                 const auto& bs = std::get<std::string>(b);
                 const int c = av.compare(bs);
                 return c < 0 ? -1 : (c > 0 ? 1 : 0);
+            } else {
+                // S62：字符串数组不参与 Eq / Neq / In 比较（类型不匹配）——「包含」走
+                // Contains / ContainsAny。显式分支：不能落进 string 的默认分支。
+                static_assert(std::is_same_v<AT, StringArray>);
+                return std::nullopt;
             }
         },
         a);
@@ -131,47 +143,159 @@ compare_numeric(const MetaValue& a, const MetaValue& b) noexcept {
 
 }  // namespace detail
 
+namespace detail {
+
+// S62：存储值（原始区间）与字面值比较，不物化（S62 前的路径是 meta_lookup 物化成
+// MetaValue 再 compare_values / compare_numeric——字符串要构造一次 std::string）。
+// 语义与那两个函数逐条一致：不存在 ≙ null；类型不匹配 ⇒ nullopt；numeric_only 时只有
+// int64 / float64 参与；字符串数组与任何字面值都类型不匹配。
+inline std::optional<int> compare_raw(const MetaRawValue& raw, const MetaValue& lit,
+                                      bool numeric_only) noexcept {
+    const MetaType tag = raw.found ? raw.tag : MetaType::Null;
+    const auto b = raw.bytes;
+    auto le64 = [&b]() noexcept {
+        std::uint64_t bits = 0;
+        for (std::size_t j = 0; j < 8; ++j) {
+            bits |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(b[j])) << (8 * j);
+        }
+        return bits;
+    };
+    switch (tag) {
+        case MetaType::Null:
+            if (numeric_only) return std::nullopt;
+            return std::holds_alternative<std::monostate>(lit) ? std::optional<int>(0)
+                                                               : std::nullopt;
+        case MetaType::Bool: {
+            if (numeric_only) return std::nullopt;
+            const auto* l = std::get_if<bool>(&lit);
+            if (l == nullptr) return std::nullopt;
+            const bool a = static_cast<std::uint8_t>(b[0]) != 0;
+            if (a == *l) return 0;
+            return a ? 1 : -1;
+        }
+        case MetaType::Int64: {
+            const auto* l = std::get_if<std::int64_t>(&lit);
+            if (l == nullptr) return std::nullopt;
+            const std::uint64_t bits = le64();
+            std::int64_t a;
+            std::memcpy(&a, &bits, sizeof(a));
+            if (a == *l) return 0;
+            return a < *l ? -1 : 1;
+        }
+        case MetaType::Float64: {
+            const auto* l = std::get_if<double>(&lit);
+            if (l == nullptr) return std::nullopt;
+            const std::uint64_t bits = le64();
+            double a;
+            std::memcpy(&a, &bits, sizeof(a));
+            if (a == *l) return 0;
+            return a < *l ? -1 : 1;
+        }
+        case MetaType::String: {
+            if (numeric_only) return std::nullopt;
+            const auto* l = std::get_if<std::string>(&lit);
+            if (l == nullptr) return std::nullopt;
+            auto sl = codec::vbyte_read_checked(b, 0);
+            if (!sl) return std::nullopt;
+            const std::string_view a(reinterpret_cast<const char*>(b.data() + sl->second),
+                                     static_cast<std::size_t>(sl->first));
+            const int c = a.compare(*l);
+            return c < 0 ? -1 : (c > 0 ? 1 : 0);
+        }
+        case MetaType::StringArray:
+            return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+// S62：Contains / ContainsAny（区间里的 string 或数组任一元素 == 操作数）。刻意不内联：
+// 保持 MetaCondition::evaluate 的热路径小——塞进去之后组合求值实测慢 ~10%（evaluate
+// 不再被内联进 MetaFilter 的循环）。
+BITCASK_NOINLINE inline bool evaluate_contains(const MetaRawValue& raw, MetaOp op,
+                                                const MetaValue& value,
+                                                const std::vector<MetaValue>& values) {
+    if (!raw.found) return false;
+    auto contains = [&raw](const std::string& want) -> bool {
+        if (raw.tag == MetaType::String) {
+            auto sl = codec::vbyte_read_checked(raw.bytes, 0);
+            if (!sl) return false;
+            return std::string_view(reinterpret_cast<const char*>(raw.bytes.data() + sl->second),
+                                    static_cast<std::size_t>(sl->first)) == want;
+        }
+        if (raw.tag == MetaType::StringArray) {
+            return for_each_array_item(raw.bytes,
+                                       [&want](std::string_view it) { return it == want; });
+        }
+        return false;
+    };
+    if (op == MetaOp::Contains) {
+        const auto* want = std::get_if<std::string>(&value);
+        return want != nullptr && contains(*want);
+    }
+    for (const auto& v : values) {
+        const auto* want = std::get_if<std::string>(&v);
+        if (want != nullptr && contains(*want)) return true;
+    }
+    return false;
+}
+
+}  // namespace detail
+
 // MetaCondition 求值实现：见头注释的 type system 规则。
 // hot path：每个 HNSW 节点过滤都跑一遍，故走 meta_lookup（O(log n) 二分）。
 inline bool MetaCondition::evaluate(std::span<const std::byte> blob) const {
-    const MetaValue stored = meta_lookup(blob, key);
+    // S62：先拿值的原始区间（零分配）；Exists / Contains 直接在区间上判，数组不物化。
+    const MetaRawValue raw = meta_find_raw(blob, key);
 
     switch (op) {
         case MetaOp::Exists:
-            // 不论 value 字面值是什么，key 是否存在即可。
-            return !std::holds_alternative<std::monostate>(stored);
+            // 不论 value 字面值是什么，key 是否存在即可。注意：值为 null 的 key 仍算
+            // 「不存在」（与 S62 之前的 meta_lookup 口径一致）。
+            return raw.found && raw.tag != MetaType::Null;
+        case MetaOp::Contains:
+        case MetaOp::ContainsAny:
+            return detail::evaluate_contains(raw, op, value, values);
+        default:
+            break;
+    }
 
+    // 其余操作符：直接在原始区间上比较（不物化）。
+    switch (op) {
+        case MetaOp::Exists:
+        case MetaOp::Contains:
+        case MetaOp::ContainsAny:
+            break;  // 上面已处理
         case MetaOp::Eq: {
-            auto c = detail::compare_values(stored, value);
+            auto c = detail::compare_raw(raw, value, false);
             return c.has_value() && *c == 0;
         }
         case MetaOp::Neq: {
-            auto c = detail::compare_values(stored, value);
+            auto c = detail::compare_raw(raw, value, false);
             // nullopt（类型不匹配）按「不等」处理——典型场景「key 不存在且
             // value 是 int64 0」也属于「不等」，结果 true。
             return !c.has_value() || *c != 0;
         }
         case MetaOp::Gt: {
-            auto c = detail::compare_numeric(stored, value);
+            auto c = detail::compare_raw(raw, value, true);
             return c.has_value() && *c > 0;
         }
         case MetaOp::Gte: {
-            auto c = detail::compare_numeric(stored, value);
+            auto c = detail::compare_raw(raw, value, true);
             return c.has_value() && *c >= 0;
         }
         case MetaOp::Lt: {
-            auto c = detail::compare_numeric(stored, value);
+            auto c = detail::compare_raw(raw, value, true);
             return c.has_value() && *c < 0;
         }
         case MetaOp::Lte: {
-            auto c = detail::compare_numeric(stored, value);
+            auto c = detail::compare_raw(raw, value, true);
             return c.has_value() && *c <= 0;
         }
         case MetaOp::In: {
-            // key 不存在 → 直接 false（与 Eq 一致语义）。
-            if (std::holds_alternative<std::monostate>(stored)) return false;
+            // key 不存在 / 值为 null → 直接 false（与 Eq 一致语义）。
+            if (!raw.found || raw.tag == MetaType::Null) return false;
             for (const auto& v : values) {
-                auto c = detail::compare_values(stored, v);
+                auto c = detail::compare_raw(raw, v, false);
                 if (c.has_value() && *c == 0) return true;
             }
             return false;

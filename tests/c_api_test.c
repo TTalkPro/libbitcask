@@ -2581,6 +2581,144 @@ static int test_field_snippets_and_update_doc(void) {
 }
 #undef DO_CHECK
 
+#define MA_CHECK(cond) do { if (!(cond)) { \
+    fprintf(stderr, "FAIL test_meta_string_array: line %d: %s\n", __LINE__, #cond); \
+    if (cask) bitcask_close(cask); if (info) bitcask_meta_info_free(info); return 1; } } while (0)
+
+/* S62：meta 字符串数组（feedbacks/2026-11-13-doc-capability-gaps.md #4）——
+ * encode_ex / 读视图 + array_next / CONTAINS 过滤 / update_doc_ex / 旧入口拒数组 / v7 纪元。 */
+static int test_meta_string_array(void) {
+    const char* dir = TDIR("metaarr");
+    rmrf(dir);
+    bitcask_t* cask = NULL;
+    bitcask_meta_info_t* info = NULL;
+    bitcask_fault_t fault;
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+    opts.enable_search = 1;
+    opts.analyzer_type = BITCASK_ANALYZER_WHITESPACE;
+    MA_CHECK(bitcask_open(dir, &opts, &cask, &fault) == BITCASK_OK);
+
+    /* 旧编码入口给 STRING_ARRAY ⇒ INVALID_OPTION（表达不了数组）。 */
+    bitcask_meta_entry_t old_e;
+    memset(&old_e, 0, sizeof(old_e));
+    old_e.key = "alias";
+    old_e.value.type = BITCASK_META_VALUE_STRING_ARRAY;
+    bitcask_slice_t blob = {NULL, 0};
+    MA_CHECK(bitcask_meta_encode(&old_e, 1, &blob, &fault) == BITCASK_ERR_INVALID_OPTION);
+
+    bitcask_slice_t items[2] = {{"\xE9\x9D\x92\xE9\xBE\x99", 6}, {"mz", 2}};  /* 青龙, mz */
+    bitcask_meta_entry_ex_t es[2];
+    memset(es, 0, sizeof(es));
+    es[0].key = "alias";
+    es[0].value.type = BITCASK_META_VALUE_STRING_ARRAY;
+    es[0].items = items;
+    es[0].items_count = 2;
+    es[1].key = "kind";
+    es[1].value.type = BITCASK_META_VALUE_STRING;
+    es[1].value.str = "beast";
+    MA_CHECK(bitcask_meta_encode_ex(es, 2, &blob, &fault) == BITCASK_OK && blob.size > 0);
+
+    /* 读视图：type / 个数 / 逐个元素；数组之后的 key 照常查到。 */
+    bitcask_meta_value_view_t v;
+    MA_CHECK(bitcask_meta_lookup(blob, "alias", &v) == 1);
+    MA_CHECK(v.type == BITCASK_META_VALUE_STRING_ARRAY && v.i64 == 2);
+    size_t cur = 0;
+    bitcask_slice_t it;
+    MA_CHECK(bitcask_meta_array_next(v.str, &cur, &it) == 1 && it.size == 6);
+    MA_CHECK(bitcask_meta_array_next(v.str, &cur, &it) == 1 && it.size == 2 &&
+             memcmp(it.data, "mz", 2) == 0);
+    MA_CHECK(bitcask_meta_array_next(v.str, &cur, &it) == 0);
+    MA_CHECK(bitcask_meta_lookup(blob, "kind", &v) == 1 && v.type == BITCASK_META_VALUE_STRING);
+
+    /* 写入前 v5，写入含数组的文档后 v7。 */
+    MA_CHECK(bitcask_meta_read(dir, &info, &fault) == BITCASK_OK && info->meta_version == 5);
+    bitcask_meta_info_free(info);
+    info = NULL;
+    bitcask_doc_input_ex_t doc;
+    memset(&doc, 0, sizeof(doc));
+    doc.text = (bitcask_slice_t){"east dragon", 11};
+    doc.meta = blob;
+    MA_CHECK(bitcask_put_doc_ex(cask, (bitcask_slice_t){"d1", 2}, &doc, 0, &fault) == BITCASK_OK);
+    bitcask_meta_blob_free(&blob);
+    doc.text = (bitcask_slice_t){"east wind", 9};
+    doc.meta = (bitcask_slice_t){NULL, 0};
+    MA_CHECK(bitcask_put_doc_ex(cask, (bitcask_slice_t){"d2", 2}, &doc, 0, &fault) == BITCASK_OK);
+    MA_CHECK(bitcask_meta_read(dir, &info, &fault) == BITCASK_OK && info->meta_version == 7);
+    bitcask_meta_info_free(info);
+    info = NULL;
+
+    /* CONTAINS 过滤。 */
+    bitcask_meta_condition_t c;
+    memset(&c, 0, sizeof(c));
+    c.key = "alias";
+    c.op = BITCASK_META_OP_CONTAINS;
+    c.value.type = BITCASK_META_VALUE_STRING;
+    c.value.str = "mz";
+    bitcask_meta_filter_t f;
+    memset(&f, 0, sizeof(f));
+    f.conditions = &c;
+    f.conditions_count = 1;
+    bitcask_search_result_t* sr = NULL;
+    MA_CHECK(bitcask_search_text_filtered(cask, "east", 10, &f, &sr, &fault) == BITCASK_OK);
+    MA_CHECK(sr != NULL && sr->count == 1 && strcmp(sr->hits[0].key, "d1") == 0);
+    bitcask_search_result_free(sr);
+    sr = NULL;
+    /* CONTAINS_ANY 用 values。 */
+    bitcask_meta_value_t cands[2];
+    memset(cands, 0, sizeof(cands));
+    cands[0].type = BITCASK_META_VALUE_STRING; cands[0].str = "zz";
+    cands[1].type = BITCASK_META_VALUE_STRING; cands[1].str = "mz";
+    c.op = BITCASK_META_OP_CONTAINS_ANY;
+    c.values = cands;
+    c.values_count = 2;
+    MA_CHECK(bitcask_search_text_filtered(cask, "east", 10, &f, &sr, &fault) == BITCASK_OK);
+    MA_CHECK(sr != NULL && sr->count == 1);
+    bitcask_search_result_free(sr);
+    sr = NULL;
+    /* 越界操作符 ⇒ INVALID_OPTION。 */
+    c.op = (bitcask_meta_op_t)10;
+    MA_CHECK(bitcask_search_text_filtered(cask, "east", 10, &f, &sr, &fault) ==
+             BITCASK_ERR_INVALID_OPTION);
+
+    /* update_doc_ex 给 d2 写数组；update_doc 写数组 ⇒ INVALID_OPTION（指向 _ex）。 */
+    bitcask_slice_t items2[1] = {{"mz", 2}};
+    bitcask_meta_entry_ex_t setm;
+    memset(&setm, 0, sizeof(setm));
+    setm.key = "alias";
+    setm.value.type = BITCASK_META_VALUE_STRING_ARRAY;
+    setm.items = items2;
+    setm.items_count = 1;
+    bitcask_doc_patch_ex_t patch;
+    memset(&patch, 0, sizeof(patch));
+    patch.set_meta = &setm;
+    patch.set_meta_count = 1;
+    MA_CHECK(bitcask_update_doc_ex(cask, (bitcask_slice_t){"d2", 2}, &patch, 0, NULL, &fault) ==
+             BITCASK_OK);
+    bitcask_meta_entry_t old_set;
+    memset(&old_set, 0, sizeof(old_set));
+    old_set.key = "alias";
+    old_set.value.type = BITCASK_META_VALUE_STRING_ARRAY;
+    bitcask_doc_patch_t old_patch;
+    memset(&old_patch, 0, sizeof(old_patch));
+    old_patch.set_meta = &old_set;
+    old_patch.set_meta_count = 1;
+    MA_CHECK(bitcask_update_doc(cask, (bitcask_slice_t){"d2", 2}, &old_patch, 0, NULL, &fault) ==
+             BITCASK_ERR_INVALID_OPTION);
+    c.op = BITCASK_META_OP_CONTAINS;
+    MA_CHECK(bitcask_search_text_filtered(cask, "east", 10, &f, &sr, &fault) == BITCASK_OK);
+    MA_CHECK(sr != NULL && sr->count == 2);
+    bitcask_search_result_free(sr);
+
+    bitcask_close(cask);
+    cask = NULL;
+    rmrf(dir);
+    printf("PASS test_meta_string_array\n");
+    return 0;
+}
+#undef MA_CHECK
+
 int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
@@ -2610,6 +2748,7 @@ int main(void) {
     failures += test_highlight_load_cold();
     failures += test_meta_read_and_stored_analyzer();
     failures += test_field_snippets_and_update_doc();
+    failures += test_meta_string_array();
     failures += test_meta_filter_query();
     failures += test_merge_policy_files_checkpoint();
 

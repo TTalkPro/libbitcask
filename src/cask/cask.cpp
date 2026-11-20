@@ -2569,6 +2569,7 @@ Cask::put_batch_atomic(std::span<const BatchOp> in_ops, std::uint64_t tstamp,
     // ⑦ 索引任务提交。仅批内含文档时分配。
     std::vector<std::vector<float>> vec_norms;
     std::vector<std::span<const float>> vec_outs;
+    bool batch_has_array_meta = false;  // S62：决定懒升 v6 还是 v7
     for (std::size_t i = 0; i < ops.size(); ++i) {
         const auto& op = ops[i];
         if (op.key.size() > format::kMaxKeySize) {
@@ -2589,6 +2590,11 @@ Cask::put_batch_atomic(std::span<const BatchOp> in_ops, std::uint64_t tstamp,
                 }
                 if (op.doc->text.size() > format::kMaxValueSize) {
                     return std::unexpected(err(CaskError::kValueTooLarge));
+                }
+                if (!batch_has_array_meta && !op.doc->meta.empty() &&
+                    !meta_multivalue_.load(std::memory_order_acquire) &&
+                    meta::meta_has_string_array(op.doc->meta)) {
+                    batch_has_array_meta = true;
                 }
                 if (vec_norms.empty()) {
                     vec_norms.resize(ops.size());
@@ -2682,15 +2688,19 @@ Cask::put_batch_atomic(std::span<const BatchOp> in_ops, std::uint64_t tstamp,
     // ② meta 懒升 v6——必须先于任何批字节进入写缓冲（write_buffered 满
     //    1MiB 会自动 pwrite，字节可能早于 flush 落盘）。原子重写（tmp+
     //    rename+fsync 目录），中途崩溃 meta 要么旧要么新；v6 无批字节合法。
-    if (meta_config_.version < 6) {
+    //    S62：批内含字符串数组 meta ⇒ 直接升到 v7（纪元单调，7 蕴含 6）。
+    const std::uint8_t want_epoch = batch_has_array_meta ? 7 : 6;
+    if (meta_config_.version < want_epoch) {
         meta::MetaConfig mc = meta_config_;
-        mc.version = 6;
+        mc.version = want_epoch;
         if (auto wr = meta::write_meta(dirname_, mc); !wr) {
             return std::unexpected(err(CaskError::kIo,
-                "meta v6 upgrade failed: " + wr.error().message));
+                "meta v" + std::to_string(want_epoch) + " upgrade failed: " +
+                wr.error().message));
         }
         meta_config_ = mc;
     }
+    if (meta_config_.version >= 7) meta_multivalue_.store(true, std::memory_order_release);
 
     // ③ roll：批头 + 整批进同一 active 文件（巨批软上限，同 put_batch）。
     thread_local std::vector<std::byte> header_val;
@@ -2974,6 +2984,23 @@ Cask::remove(std::span<const std::byte> key, std::uint64_t tstamp) {
     return {};
 }
 
+// S62：bitcask.meta 懒升 v7（契约见 cask.hpp）。同 v6 先例：原子重写（tmp + rename +
+// fsync 目录），中途崩溃 meta 要么旧要么新；v7 下没有数组记录也合法。
+std::expected<void, CaskFault> Cask::ensure_multivalue_epoch() {
+    std::lock_guard<std::mutex> wlk(write_mu_);
+    if (meta_config_.version < 7) {
+        meta::MetaConfig mc = meta_config_;
+        mc.version = 7;
+        if (auto wr = meta::write_meta(dirname_, mc); !wr) {
+            return std::unexpected(err(CaskError::kIo,
+                "meta v7 upgrade failed: " + wr.error().message));
+        }
+        meta_config_ = mc;
+    }
+    meta_multivalue_.store(true, std::memory_order_release);
+    return {};
+}
+
 // S61：文档部分更新。契约见 cask.hpp。读当前版本 → 套 patch → 条件写回（期望 LSN
 // 不变），冲突重读重试。条件判定与 get 同一条读路径（S46），故「读到的那一版」与
 // 「写回时仍是那一版」用的是同一把尺。
@@ -3149,6 +3176,13 @@ Cask::put_doc(std::span<const std::byte> key, const DocInput& doc,
     record_buf.clear();
     codec::encode_data_record(record_buf, format::RecordType::kDoc, tstamp,
                               /*ord 占位*/ 0, key, encoded);
+
+    // S62：含字符串数组 meta ⇒ 记录进写缓冲之前把目录懒升 v7（旧二进制从此干净拒开，
+    // 而不是读到未知类型标记后静默把后续 key 当「不存在」）。
+    if (!doc.meta.empty() && !meta_multivalue_.load(std::memory_order_acquire) &&
+        meta::meta_has_string_array(doc.meta)) {
+        if (auto r = ensure_multivalue_epoch(); !r) return std::unexpected(r.error());
+    }
 
     // S29-7:组提交(同 put——leader 侧统一处理,见 process_gc_batch_locked)。
     GcRequest req;

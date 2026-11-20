@@ -444,7 +444,7 @@ BITCASK_API bitcask_error_t bitcask_open_ex2(const char* dirname,
    NOT_FOUND；meta 损坏（magic / 截断 / CRC / 字段非法）⇒ BAD_CRC；纪元门禁拒开的旧格式 ⇒
    UNSUPPORTED_FORMAT（detail 写明迁移还是重建）；其余 ⇒ IO。detail 写明是哪一种。 */
 typedef struct {
-    uint8_t  meta_version;       /* 5 / 6（6 = 用过原子批） */
+    uint8_t  meta_version;       /* 5 / 6 / 7（6 = 用过原子批；7 = S62，还写过字符串数组 meta） */
     int      index_mode;         /* 0 = KV，1 = 检索库 */
     bitcask_vector_metric_t vector_metric;   /* NONE = 无向量 */
     uint16_t vector_dim;         /* 0 = 无向量 */
@@ -809,7 +809,13 @@ typedef enum {
     BITCASK_META_OP_LT     = 4,
     BITCASK_META_OP_LTE    = 5,
     BITCASK_META_OP_IN     = 6,
-    BITCASK_META_OP_EXISTS = 7
+    BITCASK_META_OP_EXISTS = 7,
+    /* S62：字符串数组「包含」。存储值是字符串数组 ⇒ 任一元素 == 操作数；是 string ⇒
+     * 等于操作数（标量当单元素集合）；其它 / 不存在 / 操作数不是 STRING ⇒ 不过。
+     * CONTAINS 用 value，CONTAINS_ANY 用 values（任一命中即过）。既有操作符碰到
+     * 数组一律按类型不匹配（EQ/IN/GT… 不过，NEQ 过）。旧库收到 8/9 ⇒ INVALID_OPTION。 */
+    BITCASK_META_OP_CONTAINS     = 8,
+    BITCASK_META_OP_CONTAINS_ANY = 9
 } bitcask_meta_op_t;
 
 typedef enum {
@@ -817,7 +823,11 @@ typedef enum {
     BITCASK_META_VALUE_BOOL    = 1,
     BITCASK_META_VALUE_INT64   = 2,
     BITCASK_META_VALUE_FLOAT64 = 3,
-    BITCASK_META_VALUE_STRING  = 4
+    BITCASK_META_VALUE_STRING  = 4,
+    /* S62：字符串数组。只出现在读取视图（bitcask_meta_value_view_t）与
+     * bitcask_meta_entry_ex_t 里；bitcask_meta_value_t（过滤操作数 / 旧编码入口）
+     * 表达不了数组，给这个类型 ⇒ INVALID_OPTION。 */
+    BITCASK_META_VALUE_STRING_ARRAY = 5
 } bitcask_meta_value_type_t;
 
 typedef struct {
@@ -876,6 +886,24 @@ BITCASK_API bitcask_error_t bitcask_meta_encode(const bitcask_meta_entry_t* entr
 /* 释放 bitcask_meta_encode 的产物（幂等；blob 置空）。 */
 BITCASK_API void bitcask_meta_blob_free(bitcask_slice_t* blob);
 
+/* S62：可写字符串数组的编码入口。value.type == STRING_ARRAY 时读 items / items_count
+ * （每个元素是 UTF-8 切片，借调用方存储；允许 0 个元素；value 其余字段忽略），否则
+ * 同 bitcask_meta_entry_t 只看 value。其余规则（无需预排序、重复 key 非法、产物用
+ * bitcask_meta_blob_free 释放）同 bitcask_meta_encode。
+ * ⚠️ 纪元：把含数组值的 meta 写进目录时，目录 bitcask.meta 会懒升 v7——≤ 11.2 的
+ * 旧版本从此打不开这个目录（干净拒开，不会读错）。 */
+typedef struct {
+    const char*            key;          /* 必填，NUL 结尾 UTF-8 */
+    bitcask_meta_value_t   value;        /* type == STRING_ARRAY ⇒ 看下面两项 */
+    const bitcask_slice_t* items;        /* 数组元素（items_count > 0 时必填） */
+    size_t                 items_count;
+} bitcask_meta_entry_ex_t;
+
+BITCASK_API bitcask_error_t bitcask_meta_encode_ex(const bitcask_meta_entry_ex_t* entries,
+                                                 size_t n,
+                                                 bitcask_slice_t* out_blob,
+                                                 bitcask_fault_t* fault);
+
 /* S61（反馈 2026-11-13 #3）：文档部分更新。只改命名字段与 meta 的若干键，正文 / 向量 /
  * per-key 过期时刻原样保留；引擎内原子读-改-写（条件写回，期间被并发写改过就重读重试，
  * 至多 16 次，仍冲突 ⇒ BITCASK_ERR_CONDITION_FAILED，调用方可再试）。
@@ -904,15 +932,43 @@ BITCASK_API bitcask_error_t bitcask_update_doc(bitcask_t* cask,
                                               uint64_t* out_ord,
                                               bitcask_fault_t* fault);
 
+/* S62：同 bitcask_doc_patch_t，但 set_meta 是 bitcask_meta_entry_ex_t（可写字符串数组）。
+ * 语义与错误同 bitcask_update_doc。 */
+typedef struct {
+    const bitcask_doc_field_t*     set_fields;
+    size_t                         set_fields_count;
+    const bitcask_slice_t*         remove_fields;
+    size_t                         remove_fields_count;
+    const bitcask_meta_entry_ex_t* set_meta;
+    size_t                         set_meta_count;
+    const char* const*             remove_meta;
+    size_t                         remove_meta_count;
+} bitcask_doc_patch_ex_t;
+
+BITCASK_API bitcask_error_t bitcask_update_doc_ex(bitcask_t* cask,
+                                                 bitcask_slice_t key,
+                                                 const bitcask_doc_patch_ex_t* patch,
+                                                 uint64_t tstamp,
+                                                 uint64_t* out_ord,
+                                                 bitcask_fault_t* fault);
+
 /* 零拷贝值视图：STRING 的 str 借 blob 内存，**不保证 NUL 结尾**（用 str.size），
  * 生命周期跟着 blob 走，不需要 free。这是与 bitcask_meta_value_t 的唯一区别
- * ——后者的 str 是调用方提供的 NUL 结尾串，用于构造过滤/编码输入。 */
+ * ——后者的 str 是调用方提供的 NUL 结尾串，用于构造过滤/编码输入。
+ * S62：type == STRING_ARRAY 时 i64 = 元素个数，str = 元素区间（借 blob），用
+ * bitcask_meta_array_next 逐个取元素。布局不变。 */
 typedef struct {
     bitcask_meta_value_type_t type;
-    int64_t         i64;  /* BOOL（0/1）与 INT64 */
+    int64_t         i64;  /* BOOL（0/1）与 INT64；STRING_ARRAY 时为元素个数 */
     double          f64;  /* FLOAT64 */
-    bitcask_slice_t str;  /* STRING（借 blob 内存，非 NUL 结尾） */
+    bitcask_slice_t str;  /* STRING（借 blob 内存，非 NUL 结尾）；STRING_ARRAY 时为元素区间 */
 } bitcask_meta_value_view_t;
+
+/* S62：逐个取字符串数组的元素。region = 视图的 str（type == STRING_ARRAY），*cursor
+ * 从 0 开始。取到返回 1 并填 *out_item（借 blob，非 NUL 结尾）、推进 *cursor；取完或
+ * 区间损坏返回 0。零分配。 */
+BITCASK_API int bitcask_meta_array_next(bitcask_slice_t region, size_t* cursor,
+                                        bitcask_slice_t* out_item);
 
 /* 单 key 查询，不全量解码（引擎过滤热路径用的就是这条）。
  * 命中返回 1 并填 *out_value；未命中、blob 为空或格式非法返回 0 并把
