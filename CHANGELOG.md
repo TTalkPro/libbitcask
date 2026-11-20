@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`11.2.0`**；库 `SOVERSION` = **`11`**（= major）；
+`bitcask_version_*` = **`12.0.0`**；库 `SOVERSION` = **`12`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -15,13 +15,14 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
-## [Unreleased]（S62：meta 字符串数组）
+## [12.0.0] - 2026-11-20（S62：meta 字符串数组 + Contains 过滤 + meta v7 纪元）
 
-> 版本未定，**须升 major**：⚠️ C++ ABI 破坏——已安装公共头 `include/bitcask/meta_codec.hpp` 的 `meta::MetaValue`（`std::variant`）
-> 追加 `StringArray`（`std::vector<std::string>`），布局与变体数变化，C++ 下游须重新编译，自己 `std::visit` / `index()` 分支的
-> 代码要补分支。C API 全部纯新增（新枚举值、新结构体、新函数），C ABI 兼容。
-> 盘上格式：meta 新增值类型标记 5（格式版本 `Ver` 不变）；**目录一旦写入数组值，`bitcask.meta` 懒升 v7，≤ 11.2 的旧版本从此打不开
-> 该目录**（干净拒开）。不写数组的目录停在 v5 / v6，存量库与旧版本互通不受影响。
+> **版本语义（2026-11-20 定版）**：⚠️ **C++ ABI 破坏**——已安装公共头 `include/bitcask/meta_codec.hpp` 的
+> `meta::MetaValue`（`std::variant`）追加 `StringArray`（`std::vector<std::string>`），布局与变体数变化，按
+> [10.0.0] / [11.0.0] 先例取 MAJOR +1 → **`12.0.0`**，`SOVERSION` → **`12`**（`.so.12`），C++ 下游须重新编译链接，
+> 自己 `std::visit` / `index()` 分支的代码要补分支。C API 全部纯新增（新枚举值、新结构体、新函数），C ABI 兼容。
+> 盘上格式：meta 新增值类型标记 5（格式版本 `Ver` 不变）；**目录一旦写入数组值，`bitcask.meta` 懒升 v7，
+> ≤ 11.2 的旧版本从此打不开该目录**（干净拒开）。不写数组的目录停在 v5 / v6，存量库与旧版本互通不受影响。
 
 ### Added
 
@@ -2502,7 +2503,8 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/11.2.0...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/12.0.0...HEAD
+[12.0.0]: https://github.com/davidalphafox/libbitcask/compare/11.2.0...12.0.0
 [11.2.0]: https://github.com/davidalphafox/libbitcask/compare/11.1.1...11.2.0
 [11.1.1]: https://github.com/davidalphafox/libbitcask/compare/11.1.0...11.1.1
 [11.1.0]: https://github.com/davidalphafox/libbitcask/compare/11.0.0...11.1.0
