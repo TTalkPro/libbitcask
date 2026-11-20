@@ -27,7 +27,7 @@
 | S62-5 回归 `tests/s62_meta_multivalue_test.cpp`（8）+ C `test_meta_string_array` | ✅ |
 | S62-6 文档 `doc/api-c.md` §10.4b、`doc/api-cpp.md` §7.8、CHANGELOG `[Unreleased]`、反馈回填、设计稿状态 | ✅ |
 
-**落地记录**（未提交，版本未定，须升 major）：
+**落地记录**（已提交 `b3bdeae`，**12.0.0 已发版**）：
 - 旧版本实测（11.2.0 `git archive` 单独编）：打开新版本写出的 v7 目录 ⇒ `read meta failed: unsupported meta version`；
   无门禁时的后果也实测了——11.2.0 的 `meta_lookup` 对数组之后的 key 返回「不存在」，`zkind == beast` 求值 0（应为 1），`decode_meta` 报错。
 - 性能（无数组的 meta、3 条件组合过滤，独立微基准两份头文件对拍）：初版慢 ~17%（通用 skip 函数调用）→ 标量跳读内联后 ~10%

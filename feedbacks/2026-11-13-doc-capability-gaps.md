@@ -60,7 +60,7 @@ fields 成了纯写侧投影，读侧享受不到结构化，「按节读回」�
 
 **建议**：字符串数组（或任何多值）meta 类型，filter DSL 相应支持「包含」语义。
 
-**回没回**：**已修（未发版，S62，须升 major）**：meta 新增字符串数组值类型（`meta::StringArray` / C `BITCASK_META_VALUE_STRING_ARRAY`），
+**回没回**：**已修（12.0.0 已发版，S62）**：meta 新增字符串数组值类型（`meta::StringArray` / C `BITCASK_META_VALUE_STRING_ARRAY`），
 过滤新增 `Contains` / `ContainsAny`（数组任一元素命中；标量 string 当单元素集合），检索 / 向量 / 迭代器 / range 的 filter 与
 `update_doc` 都能用。兼容：目录第一次写入数组值时 `bitcask.meta` 懒升 v7，旧版本从此干净拒开（否则旧版本会把数组之后的 key
 静默读成「不存在」，已实测）；不写数组的目录不受影响。C++ `MetaValue` 加变体是 ABI 破坏；C API 纯新增（`bitcask_meta_encode_ex` /
