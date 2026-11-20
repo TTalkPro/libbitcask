@@ -69,7 +69,7 @@ C++ 侧等价：`Cask::open` → 覆盖写 → `needs_merge()`，与 `status()` 
 
 ## 回没回
 
-已修（**未发版，S57**，按建议 1）：`needs_merge` 候选统计改用实时 per-file 账本（与 `status()` 同源；实时账本 = 打开时采信的
+已修（**11.1.0 已发版**，S57，按建议 1）：`needs_merge` 候选统计改用实时 per-file 账本（与 `status()` 同源；实时账本 = 打开时采信的
 v4 清单 + 之后每次写 / 删 / 合并的增量），实时账本为空才退回清单。不需要「推进提交点」入口。merge 的活性裁决本就走 OKI 读视图，
 不依赖选文件的统计。回归 `NeedsMergeLive.SeesDeadBytesAfterReopen/{Kv,Search}`：重开后覆盖写 20 遍 ⇒ `needs_merge` 为真、候选含
 `status` 过阈值的全部封口文件；合并后把输出写死同样看见（11.0.0 上两组都红）。bosun 按 `status` 自挑文件的绕法可以撤。

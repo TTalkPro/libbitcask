@@ -59,7 +59,7 @@ bitcask:merge(Dir, [{analyzer, jieba}]).
 
 ## 回没回
 
-已修 ①（**未发版，S57**）：Jieba 工厂建分词器前先查 `jieba.dict.utf8` / `hmm_model.utf8` / `user.dict.utf8` / `idf.utf8` /
+已修 ①（**11.1.0 已发版**，S57）：Jieba 工厂建分词器前先查 `jieba.dict.utf8` / `hmm_model.utf8` / `user.dict.utf8` / `idf.utf8` /
 `stop_words.utf8`（存在、普通文件、可读），缺任一 ⇒ 不建 ⇒ `Cask::open` 返回 `kInvalidOption`，报文
 `jieba dictionary not found or unreadable: <缺的完整路径> (check dict_path)`。**不降级**：词典缺失 jieba 无法工作，库直接打不开，
 只是不再杀宿主进程。新增 `text::jieba_missing_dict_file(dict_dir)` 供自行构造 `JiebaAnalyzer` 的调用方预检（直接构造仍不检查）。

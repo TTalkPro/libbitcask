@@ -32,13 +32,13 @@
 | S57-1 `jieba_missing_dict_file` + Jieba creator 预检 + `Cask::open` 报文带缺失路径 | ✅ |
 | S57-2 `Cask::needs_merge` 实时账本优先 | ✅ |
 | S57-3 回归 `tests/s57_feedback_test.cpp`：缺文件定位（目录同名也算缺）、工厂返回空、open 坏路径 / 空路径 ⇒ `kInvalidOption` + 路径、真词典照常；重开后覆盖写 ⇒ `needs_merge` 为真且候选含 status 过阈值的文件、合并后再写死同样看见（KV / 检索两组） | ✅ |
-| S57-4 CHANGELOG `[Unreleased]`、反馈回填 | ✅ |
+| S57-4 CHANGELOG `[11.1.0]`、反馈回填 | ✅ |
 
-**落地记录**（未提交，版本未定）：
+**落地记录**（已提交 `24da81b`，**11.1.0 已发版**）：
 - 基线红：11.0.0 上 `needs_merge` 用例 KV / 检索两组都红；工厂坏路径用例进程在 `DictTrie.hpp:243 FATAL` 处直接死。
 - 验证：GCC Release（`-Werror`）全量 ctest **938** 全绿；ASan 全量 938 全绿；Clang Debug / TSan
   `S57|NeedsMerge|Merge|Jieba|Analyzer|Oki|S43|CaskDocValue|Checkpoint` 333 全绿。Windows 未实测。
-- 版本建议 MINOR（纯新增函数 + 行为修复，ABI 兼容）。
+- 版本定 **11.1.0**（MINOR：纯新增函数 + 行为修复，ABI 兼容），库 `SOVERSION` 保持 **11**（`.so.11`）。
 
 ---
 

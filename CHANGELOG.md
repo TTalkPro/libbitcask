@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`11.0.0`**；库 `SOVERSION` = **`11`**（= major）；
+`bitcask_version_*` = **`11.1.0`**；库 `SOVERSION` = **`11`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -15,9 +15,12 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
-## [Unreleased]（S57：jieba 缺词典 open 报错、`needs_merge` 用实时账本）
+## [11.1.0] - 2026-11-20（S57：jieba 缺词典 open 报错、`needs_merge` 用实时账本）
 
-> 版本未定。C API、盘上格式、既有结构体布局零改动；C++ 新增自由函数 `text::jieba_missing_dict_file`。
+> **版本语义（2026-11-20 定版）**：C API、盘上格式、既有结构体布局零改动，C++ 侧仅新增自由函数
+> `text::jieba_missing_dict_file` ⇒ ABI 兼容，取 MINOR 11.1.0，库 `SOVERSION` 保持 `11`（`.so.11`），
+> C++ 下游无需重新编译链接。行为变化：词典缺失的 jieba 库由「abort 进程」变为 `open` 返回
+> `kInvalidOption`；`needs_merge` 结论改与 `status()` 一致（提交点之后的死字节也算）。
 
 ### Fixed
 
@@ -2435,7 +2438,8 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
   `migrate_le` 迁移或从源头重灌数据。
 - 协议：[Apache License 2.0](LICENSE)。
 
-[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/11.0.0...HEAD
+[Unreleased]: https://github.com/davidalphafox/libbitcask/compare/11.1.0...HEAD
+[11.1.0]: https://github.com/davidalphafox/libbitcask/compare/11.0.0...11.1.0
 [11.0.0]: https://github.com/davidalphafox/libbitcask/compare/10.0.0...11.0.0
 [10.0.0]: https://github.com/davidalphafox/libbitcask/compare/9.1.0...10.0.0
 [9.1.0]: https://github.com/davidalphafox/libbitcask/compare/9.0.0...9.1.0
