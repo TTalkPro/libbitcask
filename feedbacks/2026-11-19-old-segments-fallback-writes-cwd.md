@@ -70,7 +70,7 @@
 `SegmentSet::fresh(segs_dir)` 取代默认构造：新段落在库目录；seg_id 从目录里已有段文件的最大号之后起；原有段文件与
 旁车排进延迟删除，下次可写 checkpoint 清掉（只读句柄不动盘）；记一条 warning
 （`bm25: N existing segment file(s) in … cannot be loaded … rebuilding the full-text index from data …`）。
-建议 1、2 照做；建议 3（升级说明）写进了 CHANGELOG `[Unreleased]`。回归
+建议 1、2 照做；建议 3（升级说明）写进了 CHANGELOG 9.1.0。回归
 `SegmentFallbackTest.UnreadableSegmentsRebuildInsideTheIndexDir` 在 9.0.0 实现上红、本实现上绿。
 
 ### 下游要知道的

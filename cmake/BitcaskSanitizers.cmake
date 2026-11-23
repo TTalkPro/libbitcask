@@ -60,6 +60,12 @@ if(NOT "${BITCASK_SANITIZE}" STREQUAL "")
 
     target_compile_options(bitcask_sanitizers INTERFACE ${_san_flags})
     if(MSVC)
+        # S74：关掉 STL 的 ASan 容器标注（string / vector / optional 的 size～capacity
+        # 越界检测）。标注会改容器布局，STL 用 detect_mismatch 把「插桩的 .obj」与
+        # 「没插桩的 .obj」链到一起判成 LNK2038 annotate_*——而 gtest / ICU / TBB
+        # 这些第三方目标不会插桩，测试可执行文件必然两边都有。在插桩目标上统一关掉，
+        # 所有目标回到同一布局。代价是 MSVC ASan 构建少了这一项检测（其余 ASan 检测照旧）。
+        target_compile_definitions(bitcask_sanitizers INTERFACE _DISABLE_STL_ANNOTATION)
         # cl 的 /fsanitize=address 不是链接器开关；链接侧要的是 /INCREMENTAL:NO
         # （增量链接与 ASan 的 thunk 冲突）。同时清掉 Debug 默认的 /RTC1。
         target_link_options(bitcask_sanitizers INTERFACE /INCREMENTAL:NO)

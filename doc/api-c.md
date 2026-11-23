@@ -1343,6 +1343,34 @@ BITCASK_API int bitcask_iter_next_batch(bitcask_iter_t* iter,
 - 返回 `>= 0`：每条 entry 的 key/value 是 malloc 缓冲，调用方**逐条**调 `bitcask_iter_entry_free`。
 - 返回 `< 0`（错误）：**实现已释放中途填充的条目缓冲**——调用方无需（也不可）对 `entries` 做任何 free（见 `c_api/bitcask_kv.cpp::bitcask_iter_next_batch` 中错误路径的释放循环）。
 
+### 11.3a `bitcask_iter_next_batch_view`（S75，免分配批视图）
+
+```c
+typedef struct {
+    bitcask_slice_t key;
+    bitcask_slice_t value;   /* 墓碑恒空 */
+    bitcask_slice_t meta;    /* bitcask_iter_start_ex 的 want_meta 非 0 时填，否则空 */
+    uint64_t        tstamp;
+    uint32_t        file_id;
+    uint64_t        offset;
+    uint32_t        total_sz;
+    int             is_tombstone;
+    uint64_t        ord;
+} bitcask_iter_entry_view_t;
+
+BITCASK_API int bitcask_iter_next_batch_view(bitcask_iter_t* iter,
+                                             bitcask_iter_entry_view_t* entries,
+                                             size_t max_n,
+                                             bitcask_fault_t* fault);
+```
+
+取最多 `max_n` 条（单条用 `max_n = 1`）。遍历语义、快照一致性、墓碑 / 前缀 / meta 过滤都与 `bitcask_iter_next_batch_ex` 相同，区别只在所有权：**整批零堆分配，调用方不释放任何东西**。`entries` 是调用方分配的数组（纯值结构，可栈分配 / 复用）。
+
+- 返回取到的条数（`0` = 迭代结束），`< 0` = 错误（`fault` 已填，**整批不可依赖**）。`iter` / `entries` 为 NULL 或 `max_n == 0` 返回 `-1`。
+- ⚠ **有效期**：`entries` 里的切片只在本迭代器的**下一次推进调用之前**有效——`bitcask_iter_next` / `_ex` / `_batch` / `_batch_ex` / `_batch_view`、`bitcask_iter_release` 都算推进；`bitcask_close` 不算（映射被迭代器钉住 / 记录在迭代器里，close 之后仍可读完当前批，读完再 `bitcask_iter_release`——release 与迭代器析构不访问 cask 句柄）。`bitcask_close` 之后**不可再推进**（句柄已销毁）。要保留请当下复制。
+- 典型误用：先把一批 key 记进自己的数组，回头再读 value——中间只要调过一次 next，记下的切片就悬垂了。
+- 空 key / value / meta 的切片是 `{NULL, 0}`（与 `*_ex` 对空 meta / 空值的表示一致）。
+
 ### 11.4 `bitcask_iter_release`
 
 ```c
@@ -2012,6 +2040,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 | `bitcask_iter_next` / `_next_batch` → 每条 `bitcask_iter_entry_t` 内的 key/value | `bitcask_iter_entry_free` | `free(key.data)` / `free(value.data)` 并清零 | **逐条调用**；`bitcask_iter_next_batch` 错误路径已自行释放，调用方不可再 free |
 | `bitcask_range_iter_start` → `bitcask_range_iter_t*` | `bitcask_range_iter_release` | `delete` 句柄包装 | 可早于迭代结束调用；须在 `bitcask_close` 之前 |
 | `bitcask_range_iter_next` / `_next_batch` → 每条 `bitcask_range_entry_t` 内的 key/value | `bitcask_range_entry_free` | `free(key.data)` / `free(value.data)` 并清零 | **逐条调用**；错误路径同 `bitcask_iter_next_batch`（实现已释放，不可再 free）|
+| `bitcask_iter_next_batch_view` → 每条 `bitcask_iter_entry_view_t` 内的 key/value/meta | **无**（借库内存储） | 不释放 | 只在本迭代器下一次推进调用之前有效；要保留当下复制（§11.3a）|
 
 **无需 free** 的"看起来返回指针"的函数：
 
@@ -2030,6 +2059,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 
 - `bitcask_iter_entry_free` **只释放 entry 内的 malloc 缓冲**（`key.data` / `value.data`），**不释放** entry 结构本身（entry 是栈/调用方提供）。
 - `bitcask_iter_next_batch` 错误返回 `< 0` 时**实现已释放已填充条目**；调用方不可再对 `entries` 调 `bitcask_iter_entry_free`（否则 double-free）。
+- `bitcask_iter_next_batch_view` 返回的切片**不是 malloc 缓冲**：对它调 `bitcask_iter_entry_free` 是未定义行为（free 非堆指针）；它也不跨下一次推进调用存活。
 - `bitcask_search_result_batch_free` 第二个参数 `n` 必须与分配时的 `n` 一致；外层数组 `calloc(n, ...)` 后 free 必须按 `n` 释放（实现按 `n` 遍历）。
 - 已 `bitcask_close` 的 `bitcask_t*` 再调任何函数返回 `BITCASK_ERR_CLOSED`，不崩溃（fail-fast 生命周期）。
 

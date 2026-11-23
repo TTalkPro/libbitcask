@@ -1288,6 +1288,45 @@ BITCASK_API void bitcask_iter_entry_free(bitcask_iter_entry_t* entry) {
     entry->value.size = 0;
 }
 
+/* S75：免分配批视图。契约见头文件——切片借迭代器存储，下一次推进即失效；
+ * 错误即整批作废，没有任何东西需要调用方释放。 */
+BITCASK_API int bitcask_iter_next_batch_view(bitcask_iter_t* iter,
+                                             bitcask_iter_entry_view_t* entries,
+                                             size_t max_n,
+                                             bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    try {
+    if (!iter || !entries || max_n == 0) return -1;
+
+    auto batch = as_cpp_iter(iter)->next_batch_view(max_n);
+    if (!batch) {
+        to_c_error(batch.error(), fault);
+        return -1;
+    }
+    // 借用：空 span 交 {NULL, 0}，与 *_ex 对空 meta / 空值的表示一致。
+    const auto to_slice = [](std::span<const std::byte> s) {
+        return bitcask_slice_t{s.empty() ? nullptr : s.data(), s.size()};
+    };
+    std::size_t count = 0;
+    for (const auto& e : *batch) {
+        bitcask_iter_entry_view_t& out = entries[count++];
+        out.key = to_slice(e.key);
+        out.value = to_slice(e.value);
+        out.meta = to_slice(e.meta);
+        out.tstamp = e.tstamp;
+        out.file_id = e.file_id;
+        out.offset = e.offset;
+        out.total_sz = e.total_sz;
+        out.is_tombstone = e.is_tombstone ? 1 : 0;
+        out.ord = e.ord;
+    }
+    return static_cast<int>(count);
+    } catch (...) {
+        (void)fault_from_exception(fault);
+        return -1;
+    }
+}
+
 /* ---------------------------------------------------------------------------
  *  S33-6：有序 range 迭代（OKI）
  * ------------------------------------------------------------------------- */

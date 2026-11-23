@@ -44,6 +44,7 @@ static const char* const kAllTestDirs[] = {
     TDIR("flush_after_iter"),
     TDIR("paging"),
     TDIR("iter"),
+    TDIR("iterview"),
     TDIR("kv"),
     TDIR("levelb"),
     TDIR("metaq"),
@@ -2734,6 +2735,158 @@ static int test_meta_string_array(void) {
 }
 #undef MA_CHECK
 
+/* S75（反馈 2026-11-23-keydir-scan 第 3 条）：免分配批视图 bitcask_iter_next_batch_view。
+ * 与 bitcask_iter_next_batch_ex 同一快照逐条对拍；整批不 free 任何东西；
+ * 取到的一批在 bitcask_close 之后仍可读。 */
+static int test_iter_batch_view(void) {
+    bitcask_options_t opts;
+    bitcask_options_init(&opts);
+    opts.read_write = 1;
+
+    bitcask_t* cask = NULL;
+    bitcask_fault_t fault;
+    bitcask_error_t err = bitcask_open(TDIR("iterview"), &opts, &cask, &fault);
+    if (err != BITCASK_OK) {
+        fprintf(stderr, "FAIL test_iter_batch_view: open: %s\n", fault.detail);
+        return 1;
+    }
+    int fails = 0;
+
+    /* 50 个 key，每 5 个删 1 个 → 10 条墓碑 + 40 条活。值长短参差。 */
+    for (int i = 0; i < 50; i++) {
+        char kbuf[16];
+        char vbuf[120];
+        int klen = snprintf(kbuf, sizeof(kbuf), "v%03d", i);
+        int vlen = snprintf(vbuf, sizeof(vbuf), "value-%03d-%s", i,
+                            (i % 2) ? "long-tail-padding-padding-padding" : "s");
+        bitcask_slice_t k = {kbuf, (size_t)klen};
+        bitcask_slice_t v = {vbuf, (size_t)vlen};
+        bitcask_put(cask, k, v, 0, &fault);
+        if (i % 5 == 0) bitcask_delete(cask, k, 0, &fault);
+    }
+
+    /* 对拍：_ex（每条 malloc + free）vs _view（零分配、不 free）。 */
+    {
+        bitcask_iter_t* ex_it = NULL;
+        bitcask_iter_t* vw_it = NULL;
+        err = bitcask_iter_start(cask, -1, -1, 1, &ex_it, &fault);
+        if (err == BITCASK_OK) err = bitcask_iter_start(cask, -1, -1, 1, &vw_it, &fault);
+        if (err != BITCASK_OK) {
+            fprintf(stderr, "FAIL test_iter_batch_view: iter_start: %d (%s)\n", err,
+                    fault.detail);
+            ++fails;
+        }
+        int n = 0, tombs = 0;
+        for (;;) {
+            if (!ex_it || !vw_it) break;
+            bitcask_iter_entry_ex_t exb[7];
+            bitcask_iter_entry_view_t vwb[7];
+            memset(exb, 0, sizeof(exb));
+            memset(vwb, 0, sizeof(vwb));
+            bitcask_fault_t ex_fault, vw_fault;
+            memset(&ex_fault, 0, sizeof(ex_fault));
+            memset(&vw_fault, 0, sizeof(vw_fault));
+            int ex_got = bitcask_iter_next_batch_ex(ex_it, exb, 7, &ex_fault);
+            int vw_got = bitcask_iter_next_batch_view(vw_it, vwb, 7, &vw_fault);
+            if (ex_got < 0 || vw_got < 0 || ex_got != vw_got) {
+                fprintf(stderr,
+                        "FAIL test_iter_batch_view: next ex=%d vw=%d (ex: %s | vw: %s)\n",
+                        ex_got, vw_got, ex_fault.detail, vw_fault.detail);
+                ++fails;
+                break;
+            }
+            if (ex_got == 0) break;
+            for (int i = 0; i < ex_got; i++) {
+                const bitcask_iter_entry_t* a = &exb[i].base;
+                const bitcask_iter_entry_view_t* b = &vwb[i];
+                ++n;
+                if (a->key.size != b->key.size ||
+                    memcmp(a->key.data, b->key.data, a->key.size) != 0 ||
+                    a->value.size != b->value.size ||
+                    (a->value.size &&
+                     memcmp(a->value.data, b->value.data, a->value.size) != 0) ||
+                    a->tstamp != b->tstamp || a->ord != b->ord ||
+                    a->file_id != b->file_id || a->offset != b->offset ||
+                    a->total_sz != b->total_sz ||
+                    a->is_tombstone != b->is_tombstone ||
+                    b->meta.data != NULL || b->meta.size != 0) {
+                    fprintf(stderr, "FAIL test_iter_batch_view: entry %d differs\n", n);
+                    ++fails;
+                }
+                if (b->is_tombstone) {
+                    ++tombs;
+                    if (b->value.size != 0) {
+                        fprintf(stderr, "FAIL test_iter_batch_view: tombstone has value\n");
+                        ++fails;
+                    }
+                }
+                bitcask_iter_entry_ex_free(&exb[i]);  /* view 那边没有东西要 free */
+            }
+        }
+        if (n != 50 || tombs != 10) {
+            fprintf(stderr, "FAIL test_iter_batch_view: n=%d tombs=%d\n", n, tombs);
+            ++fails;
+        }
+        bitcask_iter_release(ex_it);
+        bitcask_iter_release(vw_it);
+    }
+
+    /* 非法参数：NULL 迭代器 / NULL 数组 / max_n == 0 → -1。 */
+    {
+        bitcask_iter_t* it = NULL;
+        bitcask_iter_entry_view_t e;
+        err = bitcask_iter_start(cask, -1, -1, 0, &it, &fault);
+        if (err != BITCASK_OK) {
+            fprintf(stderr, "FAIL test_iter_batch_view: iter_start(0): %d (%s)\n", err,
+                    fault.detail);
+            ++fails;
+        } else if (bitcask_iter_next_batch_view(NULL, &e, 1, &fault) != -1 ||
+                   bitcask_iter_next_batch_view(it, NULL, 1, &fault) != -1 ||
+                   bitcask_iter_next_batch_view(it, &e, 0, &fault) != -1) {
+            fprintf(stderr, "FAIL test_iter_batch_view: bad args not rejected\n");
+            ++fails;
+        }
+        bitcask_iter_release(it);
+    }
+
+    /* 取到一批后 close：切片仍可读（映射被钉住 / 记录留在迭代器里）。
+        第一条是墓碑 v000，其后 v001..v003 是活 key。 */
+    {
+        bitcask_iter_t* it = NULL;
+        bitcask_iter_entry_view_t b[4];
+        memset(b, 0, sizeof(b));
+        err = bitcask_iter_start(cask, -1, -1, 1, &it, &fault);
+        memset(&fault, 0, sizeof(fault));
+        int got = (err == BITCASK_OK) ? bitcask_iter_next_batch_view(it, b, 4, &fault) : -2;
+        bitcask_close(cask);
+        if (got != 4) {
+            fprintf(stderr, "FAIL test_iter_batch_view: preclose got=%d (%s)\n", got,
+                    err == BITCASK_OK ? fault.detail : "iter_start failed");
+            ++fails;
+        } else if (b[0].key.size != 4 || memcmp(b[0].key.data, "v000", 4) != 0 ||
+                   !b[0].is_tombstone || b[0].value.size != 0) {
+            fprintf(stderr, "FAIL test_iter_batch_view: tombstone after close\n");
+            ++fails;
+        } else {
+            for (int i = 1; i < got; i++) {
+                char want[24];
+                snprintf(want, sizeof(want), "v%03d", i);
+                if (b[i].is_tombstone || b[i].key.size != 4 ||
+                    memcmp(b[i].key.data, want, 4) != 0 ||
+                    b[i].value.size == 0 ||
+                    memcmp(b[i].value.data, "value-", 6) != 0) {
+                    fprintf(stderr, "FAIL test_iter_batch_view: entry %d lost after close\n", i);
+                    ++fails;
+                }
+            }
+        }
+        bitcask_iter_release(it);
+    }
+
+    if (fails == 0) printf("PASS test_iter_batch_view\n");
+    return fails;
+}
+
 int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
@@ -2746,6 +2899,7 @@ int main(void) {
     failures += test_kv_basic();
     failures += test_status_and_merge();
     failures += test_iteration();
+    failures += test_iter_batch_view();
     failures += test_range_iter();
     failures += test_flush_after_iter();
     failures += test_search_text_batch();

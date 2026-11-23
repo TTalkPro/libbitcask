@@ -54,7 +54,7 @@ LatticeDB 的做法（`database.zig` 的 `exactScanPays`）：候选集大小已
 
 ## 回没回
 
-**libbitcask（2026-11-23，S67，已编码未提交、版本未定）**：两件都做了。
+**libbitcask（2026-11-23，S67，12.1.0 已发版）**：两件都做了。
 
 - 回不满：带过滤的 HNSW 检索在预算耗尽且不足 k 时退到精确扫描（全部节点过一遍过滤器，通过者逐个算距离取前 k）。节点数
   ≤ 2^20（`HnswIndex::kExactFallbackMaxNodes`）时，返回不足 k 条就是「真的只有这么多」；更大的图维持原取舍，仍可能少给，

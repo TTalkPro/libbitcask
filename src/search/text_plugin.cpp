@@ -159,7 +159,11 @@ void TextPlugin::apply_text_in(BuildingSlot& slot, std::string_view key,
     }
     doc_len_writer_.set_doc_len(ord, doc_len);  // S18-1：经窄接口回填
 
-    doc_texts_.put(ord, std::string(text));
+    // S45-2 补遗：原文 LRU 与倒排同受 LSN 守卫——put 必须在同 LSN 判重**之后**。
+    // 原先 put 在前：恢复重放的重复文档照样进 LRU ⇒ 每次 open 把重放窗口内的正文
+    // 深拷一遍，重开后本应冷的文档变热、去留取决于分片线程调度。
+    // feedbacks/2026-11-23-reopen-replay-refills-doc-text-lru-cold-test-flaky.md
+    auto put_doc_text = [&] { doc_texts_.put(ord, std::string(text)); };
 
     // S27-3 B2b 步骤 3:fields_ 退役——building_/段集是唯一写入目标。
     // 覆盖写先 mark_dead 旧 docid（段级 is_live 不知道宿主覆盖,B2a）。
@@ -181,6 +185,7 @@ void TextPlugin::apply_text_in(BuildingSlot& slot, std::string_view key,
                 return;  // 乱序到达的旧版本 / 重放的同版本,不索引
             }
         }
+        put_doc_text();  // 过了判重 = 本版本胜出,原文才进 LRU
         const TermPositionsMap* borrowed = &term_data;
         const search::SealedSegment::FieldInput fin{search::kDefaultField,
                                                      borrowed};
@@ -216,6 +221,9 @@ void TextPlugin::apply_text_in(BuildingSlot& slot, std::string_view key,
              bld->approx_ram_bytes() >= config_.seal_ram_budget_bytes)) {
             flush_building_slot(slot);  // S30-P2:RAM 预算就地封口
         }
+    } else {
+        // 无在建段 / 无可索引词项(向量-only、全停用词):没有 LSN 守卫可查,原文照进 LRU。
+        put_doc_text();
     }
 
     // S9.2：只失效查询词与本文档词集有交集的缓存条目。
@@ -332,9 +340,11 @@ void TextPlugin::apply_job_impl_in(BuildingSlot& slot, const ReduceJob& job,
     // S16-2：docmap 行与 meta 由宿主（流水线）/caller（standalone・recover）
     // 先落；分析产物 doc_len 在此回填（宿主不做分析拿不到 token 数）。
     doc_len_writer_.set_doc_len(job.ord, job.total_doc_len);
-    if (!doc_text.empty()) {
-        doc_texts_.put(job.ord, std::move(doc_text));
-    }
+    // S45-2 补遗：原文 LRU 与倒排同受 LSN 守卫——put 必须在同 LSN 判重**之后**
+    // （同 apply_text_in；重放的重复文档不再深拷进 LRU）。
+    auto put_doc_text = [&] {
+        if (!doc_text.empty()) doc_texts_.put(job.ord, std::move(doc_text));
+    };
     // S13-P1：S9.2 选择性失效——job 已物化本文档全部词集（各字段 terms +
     // catch-all）。BM25 全局统计漂移是 S9.2 已接受的 near-real-time 近似。
     // S21-1：借用 job 的 term key（job 存活覆盖本调用），免 owning 深拷。
@@ -364,6 +374,7 @@ void TextPlugin::apply_job_impl_in(BuildingSlot& slot, const ReduceJob& job,
                 return;  // 乱序到达的旧版本 / 重放的同版本,不索引(S45-2)
             }
         }
+        put_doc_text();  // 过了判重 = 本版本胜出,原文才进 LRU
         std::vector<search::SealedSegment::FieldInput> fin;
         fin.reserve(job.fields.size() + 1);
         for (const auto& f : job.fields) {
@@ -402,6 +413,9 @@ void TextPlugin::apply_job_impl_in(BuildingSlot& slot, const ReduceJob& job,
                 flush_building_slot(slot);  // S30-P2:RAM 预算就地封口
             }
         }
+    } else {
+        // 无在建段(shim / 空 job 降级路径):没有 LSN 守卫可查,原文照进 LRU。
+        put_doc_text();
     }
 
     cache_.invalidate_terms(changed_terms);

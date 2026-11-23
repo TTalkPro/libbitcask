@@ -485,6 +485,31 @@ public:
     [[nodiscard]] std::expected<std::vector<Entry>, CaskFault>
     next_batch(std::size_t max_n);
 
+    // S75：免分配批视图（反馈 2026-11-23-keydir-scan 第 3 条）。语义同
+    // next_batch（同一快照、同一过滤 / 墓碑 / meta 开关），但 key/value/meta
+    // **借迭代器内部的存储**，整批零堆分配——映射命中时 value 直达文件映射，
+    // pread 兜底时记录留在迭代器里，都不拷给调用方。
+    // 生命周期：返回的 span 与其中各字段的 span 只在下一次推进调用之前有效
+    // （next / next_batch / next_batch_view / start / release 都算推进；
+    // Cask::close() 不算）。要保留请当下复制。
+    // ⚠ 典型误用：先把一批 key 记下来，回头再读 value——中间调过 next 就悬垂。
+    // 返回：空 span = 迭代结束；unexpected = 故障，**整批不可依赖**（与
+    // next_batch 不同，后者不产出半批）。max_n == 0 返回空 span。
+    // 线程安全: 否（同 next）。
+    struct EntryView {
+        std::span<const std::byte> key;
+        std::span<const std::byte> value;   // 墓碑恒空
+        std::span<const std::byte> meta;    // set_want_meta(true) 时填，否则空
+        std::uint64_t tstamp = 0;
+        std::uint32_t file_id = 0;
+        std::uint64_t offset = 0;
+        std::uint32_t total_sz = 0;
+        bool is_tombstone = false;
+        std::uint64_t ord = 0;
+    };
+    [[nodiscard]] std::expected<std::span<const EntryView>, CaskFault>
+    next_batch_view(std::size_t max_n);
+
     // 线程安全: 否；幂等。同一对象的 start/next/release 串行调用。
     void release() noexcept;
     [[nodiscard]] bool is_iterating() const noexcept { return iterating_; }
@@ -509,10 +534,50 @@ private:
         }
     };
     [[nodiscard]] FlatKeys drain_live_keys();
-    // OKI 组合视图的公共归并层：产出下一个胜出且非墓碑 key 及其视图行。
-    // CaskIter 与 drain_live_keys 共用；错误必须显式上抛，不得折叠成 EOI。
+    // OKI 组合视图的公共归并层：产出下一个胜出 key 及其视图行。
+    // see_tombstones 决定墓碑是否透传出归并层（S75 顺带修复：此前恒按
+    // 「归并层抵消」调用，see_tombstones=true 从不交出墓碑）；是否交出由
+    // 调用方再判。CaskIter 与 drain_live_keys 共用；错误必须显式上抛，
+    // 不得折叠成 EOI。
     [[nodiscard]] std::expected<std::optional<oki::OkiState::DeltaRow>, CaskFault>
     next_merged_key();
+
+    // S75：next() / next_batch_view() 共用的单行步骤——归并出一个活 key，
+    // 读记录、做 key/ord 自证与 TTL / meta 过滤，结果以 span 交出。false = 结束。
+    // span 的存活担保也在这个结构里：file_holder 锚定 pin 表外的文件映射，
+    // owned 持 pread 兜底的记录；key_from_cursor 表示 key 借 cur_key_（OKI
+    // 墓碑行不读记录），只在下一次推进之前有效。
+    struct RowView {
+        std::span<const std::byte> key;
+        std::span<const std::byte> value;
+        std::span<const std::byte> meta;
+        bool key_from_cursor = false;
+        std::uint64_t tstamp = 0;
+        std::uint32_t file_id = 0;
+        std::uint64_t offset = 0;
+        std::uint32_t total_sz = 0;
+        bool is_tombstone = false;
+        std::uint64_t ord = 0;
+        std::shared_ptr<fileops::DataFile> file_holder;
+        std::optional<fileops::ReadRecord> owned;
+    };
+    [[nodiscard]] std::expected<bool, CaskFault> next_row(RowView& out);
+
+    // S75：当批视图的存储。容量跨批保留 ⇒ 稳态零分配。view_owned_ 扩容会
+    // 搬 ReadRecord 对象，但其 key/value 是堆上的 vector，缓冲不搬 ⇒ span 不受
+    // 影响。墓碑行的 key 落 view_key_buf_：批内只记偏移，整批填完再回填 span
+    // （缓冲批内增长会 realloc，提前填的 span 会悬垂）。
+    struct ScratchKey {
+        std::size_t entry;
+        std::size_t off;
+        std::size_t len;
+    };
+    std::vector<EntryView> view_entries_;
+    std::vector<std::shared_ptr<fileops::DataFile>> view_files_;
+    std::vector<fileops::ReadRecord> view_owned_;
+    std::vector<ScratchKey> view_scratch_keys_;
+    std::string view_key_buf_;
+    void reset_view_batch() noexcept;
 
     // S13：fold 启动时 pin 一份「目录下全部 data file」的只读句柄快照。
     // 并发 merge 在 fold 期间 unlink 旧文件时，已 open 的 fd 让 inode 在

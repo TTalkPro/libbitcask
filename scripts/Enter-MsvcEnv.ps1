@@ -392,6 +392,23 @@ if (-not $cl) {
            " Requested toolset $selectedShort. Try -Force, or repair the C++ toolset installation.")
 }
 
+# ── Pin the toolchain UI language to English ───────────────────────────────
+#
+# ⚠ Not cosmetic. Ninja learns MSVC header dependencies by matching the
+# /showIncludes prefix that CMake records at *compiler detection* time
+# (msvc_deps_prefix in CMakeFiles/rules.ninja). cl.exe picks its output
+# language from the environment, so the prefix recorded in one shell can be
+# "注意: 包含文件:" while a later shell emits "Note: including file:" -- and
+# then not a single include line matches. Ninja records zero deps, header
+# edits stop triggering recompiles, and stale objects get linked against a
+# new class layout. Measured 2026-11-23: build-msvc-release/-debug carried the
+# Chinese prefix, builds ran in English, `ninja -t deps` reported #deps 0, and
+# 36 tests crashed with access violations after a header-only layout change.
+# VSLANG=1033 makes detection and every later build say the same thing.
+# The tell-tale symptom is "Note: including file" lines leaking into build
+# output at all -- with a matching prefix Ninja consumes them silently.
+$env:VSLANG = '1033'
+
 # ⚠️ VsDevCmd resolves -vcvars_ver itself and does *not* fail loudly when the
 # request cannot be honoured -- so confirm we got what was asked for rather than
 # whatever the installation defaults to. This is the check that would have

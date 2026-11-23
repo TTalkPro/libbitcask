@@ -767,6 +767,15 @@ target_include_directories(gen_inert_table PRIVATE include)  # detail/icu_util.h
 # bitcask_io：输出路径可能是非 ASCII（仓库放在中文目录下），文件操作走
 # detail::fopen_utf8 / remove_utf8（2026-11-23）。
 target_link_libraries(gen_inert_table PRIVATE ${BITCASK_ICU_TARGETS} bitcask_io)
+# 构建期工具也要带插桩开关——它链的 bitcask_io 是插桩的（S74）。不带的话：
+#   GCC / Clang：bitcask_io 的目标文件引用 __asan_* / __tsan_*，可执行文件链接时缺运行时
+#         （读代码推的，未实测）。
+#   MSVC 上另有 LNK2038 annotate_* 容器标注不匹配，已在 BitcaskSanitizers.cmake 统一关掉；
+#   这里带上是为了与它链的库一致。
+# （gen_inert_table 链 bitcask_io 是 2026-11-23 的事，此前两边互不相干。）
+if(NOT "${BITCASK_SANITIZE}" STREQUAL "")
+    target_link_libraries(gen_inert_table PRIVATE bitcask_sanitizers)
+endif()
 
 # ---------------------------------------------------------------------------
 # migrate_le — v1 大端 → 当前纪元离线迁移工具（旧入口,保留兼容;新增迁移
@@ -809,8 +818,15 @@ set(INERT_TABLE_HPP
 # 所以 mtime 不动，下游 TU 不会每次构建都重编。
 # 兜底在 tests/analyzer_test.cpp 的 NfkcInert.TableOracleExhaustive——它把表
 # 与**当前链接的 ICU** 双向逐码点比对，版本错配即红。
+if(NOT WIN32 AND NOT "${BITCASK_SANITIZE}" STREQUAL "")
+    # 生成器被插桩后会在构建期跑一次：关掉它退出时的泄漏检测——它是构建工具，
+    # ICU 的静态缓存若被判泄漏不该打断构建（测试进程的检测不受影响；Windows 无 LSan）。
+    set(_inert_gen_cmd "${CMAKE_COMMAND}" -E env ASAN_OPTIONS=detect_leaks=0 "$<TARGET_FILE:gen_inert_table>")
+else()
+    set(_inert_gen_cmd gen_inert_table)
+endif()
 add_custom_target(generate_inert_table ALL
-    COMMAND gen_inert_table "${INERT_TABLE_HPP}"
+    COMMAND ${_inert_gen_cmd} "${INERT_TABLE_HPP}"
     DEPENDS gen_inert_table
     BYPRODUCTS "${INERT_TABLE_HPP}"
     COMMENT "Generating NFKC inert range table"
@@ -886,7 +902,10 @@ add_library(bitcask_shared SHARED
 target_include_directories(bitcask_shared
     PUBLIC include c_api
     PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")  # 生成的 bitcask_version.h
-target_link_libraries(bitcask_shared PRIVATE bitcask_cask)
+# S74：bitcask_cask 是插桩的，本目标自己也要带 bitcask_sanitizers（其余第一方目标都带，
+# 只漏了这里）。MSVC 下不带就是 LNK2038 annotate_* 不匹配；Linux 下 .so 的未定义
+# `__asan_*` 靠加载它的进程兜住，所以那边从没现形。
+target_link_libraries(bitcask_shared PRIVATE bitcask_cask bitcask_sanitizers)
 target_compile_definitions(bitcask_shared PRIVATE BITCASK_DLL_EXPORTS)
 set_target_properties(bitcask_shared PROPERTIES
     OUTPUT_NAME "bitcask"

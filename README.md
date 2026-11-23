@@ -195,7 +195,7 @@ git submodule update --init --recursive
 ```bat
 cmake --preset msvc-debug
 cmake --build --preset msvc-debug
-ctest --preset msvc-debug
+cmake --build --preset msvc-debug --target check
 ```
 
 - **产物**：`bitcask.dll` + `bitcask.lib`（导入库）+ `bitcask_static.lib`（合并静态库；Windows 下不叫 `bitcask.lib` 是为了不与导入库撞名）。所有 exe 与 DLL 统一落到 `<build>/bin/`——Windows 没有 RPATH，DLL 必须与 exe 同目录。

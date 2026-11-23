@@ -98,7 +98,7 @@ C++ 侧等价：`put_doc` 带 `fields`，`search_text` 与 `search_fields` 各�
 2. 字段打分的 dl 改取该字段自身词数：每(段, 字段)一张字段长表（内存段写入时记，v1 段载入时由 posting dls 列重建，v2 段
    首次查询该字段时从 posting dls 列惰性推出——**盘上格式不变**）。默认字段同样按此口径：catch-all 开（缺省）时与整篇总长
    逐篇相等，`search_text` 分数不变；**catch-all 关时默认字段此前也被命名字段长度压分（你们没提，基线实测证实），一并归正**。
-   不给旧口径开关；既有库的 `search_fields` 分数与排序会变，CHANGELOG `[Unreleased]` 已写明。
+   不给旧口径开关；既有库的 `search_fields` 分数与排序会变，CHANGELOG 11.0.0 已写明。
 
 复现对照（新用例在 10.0.0 上红、修后绿）：`labels:zebra` = idf（log 26 ≈ 3.258，之前 0.30 / 0.64），
 `zebra title:zebra^3 labels:zebra^8` 排序 label > title > body。bosun 的「引擎分数外再乘系数」绕法可以撤，也可以留。

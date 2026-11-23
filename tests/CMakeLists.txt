@@ -652,6 +652,16 @@ target_link_libraries(bitcask_flush_after_iter_test PRIVATE
 )
 gtest_discover_tests(bitcask_flush_after_iter_test ${_bitcask_test_props})
 
+# S75：CaskIter::next_batch_view（免分配批视图）
+add_executable(bitcask_iter_batch_view_test iter_batch_view_test.cpp)
+target_link_libraries(bitcask_iter_batch_view_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_iter_batch_view_test ${_bitcask_test_props})
+
 # 下游反馈 2026-10-06：原子批 / TxnCask 收结构化文档（kPutDoc）。
 add_executable(bitcask_atomic_batch_doc_test atomic_batch_doc_test.cpp)
 target_link_libraries(bitcask_atomic_batch_doc_test PRIVATE

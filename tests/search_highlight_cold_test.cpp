@@ -32,9 +32,12 @@ std::span<const std::byte> bytes(std::string_view s) {
     return std::as_bytes(std::span<const char>(s.data(), s.size()));
 }
 
-// 「冷」要靠规模：小库重开时从数据重放，重放会填原文 LRU（文档是热的）；写够一批之后目标文档
-// 落进封好的段，重开直接载段、不重放 ⇒ 冷（实测 3 篇重开全热，1500 篇重开全冷）。
-// 所以先写目标文档，再写一批填充。
+// 「冷」靠的是：重开时的恢复重放是同 key + 同 LSN 的重复投递，原文 LRU 的 put 在同 LSN 判重之后
+// （S73）⇒ 重放不填 LRU，重开后每条都冷，与库的大小、分片线程的调度都无关。
+// （原注释「1500 篇落进封好的段、不重放」是误归因：重放起点 wm − 4096，这个库每次重开都全量重放。）
+// 填充不再是冷的必要条件，留作回归：修前 put 在判重之前，重放的最后 1024 篇留在 LRU，
+// d1 / k2 / f3 冷不冷取决于分片线程谁起得晚（约 1/20 红）。
+// feedbacks/2026-11-23-reopen-replay-refills-doc-text-lru-cold-test-flaky.md
 constexpr int kFiller = 1500;
 
 void write_filler(Cask& c) {

@@ -47,6 +47,7 @@ Windows 上跑全量测试：先默认串行，再 `-j 8`；耗时取自 `ctest`
 - 实测（同一份 `build-msvc-release`）：串行 437 s；`-j 8` 91 s / 40 s / 54 s 三轮全绿；`--target check` 973 个条目约 40～55 s。
 - **顺带撞出来的**：14 核满载（`-j 14`）有两个带时序假设的用例会挂——`AtomicBatchVisibilityTest.HeadThenTailNeverShowsHalfBatch`、
   `OkiCompactionModelTest.ConcurrentLoaderNeverFallsBackToUnloaded`（各单跑 5 次全过）。所以 `check` 封顶 8 而不是照核数开；
-  这两个用例对调度时序的假设偏紧，值得单独立一条。
+  这两个用例对调度时序的假设偏紧，已单独立一条：
+  [2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md](2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md)。
 - **没做**：`OkiCompactionModelTest` / `UnorderedApplyTest` 缩规模或替换 `sleep_for`——那是另一件事，并行之后串行成本仍在，
   想删得单独评估这两个套件在测什么时序。

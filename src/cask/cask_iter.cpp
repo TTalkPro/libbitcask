@@ -99,7 +99,10 @@ CaskIter::next_merged_key() {
         return std::optional<oki::OkiState::DeltaRow>{};
     }
     oki::OkiState::DeltaRow row;
-    auto n = merged_->next(row);
+    // S75 顺带修复：see_tombstones 须透传到归并层，否则墓碑在归并层就被
+    // 抵消，全表迭代器的 see_tombstones=true 形同虚设（下一行的过滤只对
+    // 透传出来的墓碑生效）。
+    auto n = merged_->next(row, see_tombstones_);
     if (!n) return std::unexpected(map_oki_error(n.error(), "oki read"));
     if (!*n) {
         done_ = true;
@@ -109,21 +112,21 @@ CaskIter::next_merged_key() {
     return std::optional<oki::OkiState::DeltaRow>(std::move(row));
 }
 
-std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
-    if (!iterating_) return std::optional<Entry>{};
+std::expected<bool, CaskFault> CaskIter::next_row(RowView& e) {
+    if (!iterating_) return false;
     const auto expiry = parent_->opts_.expiry_secs;
     const auto now = (expiry > 0) ? now_sec_default() : 0;
 
     while (true) {
         auto merged = next_merged_key();
         if (!merged) return std::unexpected(merged.error());
-        if (!*merged) return std::optional<Entry>{};
+        if (!*merged) return false;
         if (!key_prefix_.empty() &&
             (cur_key_.size() < key_prefix_.size() ||
              std::memcmp(cur_key_.data(), key_prefix_.data(),
                          key_prefix_.size()) != 0)) {
             done_ = true;
-            return std::optional<Entry>{};
+            return false;
         }
 
         oki::OkiState::DeltaRow row = **merged;
@@ -137,9 +140,9 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
             continue;
         }
 
-        Entry e;
         const auto* kp = reinterpret_cast<const std::byte*>(cur_key_.data());
-        e.key.assign(kp, kp + cur_key_.size());
+        e.key = std::span<const std::byte>(kp, cur_key_.size());
+        e.key_from_cursor = true;
         e.tstamp = row.loc.tstamp;
         e.file_id = row.loc.file_id;
         e.offset = row.loc.offset;
@@ -147,9 +150,8 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
         e.is_tombstone = row.tomb;
         e.ord = row.ord;
         if (row.tomb) {
-            e.value.clear();
-            e.value.shrink_to_fit();
-            return std::optional<Entry>{std::move(e)};
+            e.value = {};
+            return true;
         }
 
         // 只按视图位置读原始记录；key/ord 核对沿用 S43-1 点查契约。
@@ -223,9 +225,13 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
                 if (rtype == format::RecordType::kTombstone) {
                     if (!see_tombstones_) continue;
                     e.is_tombstone = true;
-                    if (owned) e.value = std::move(owned->value);
-                    else e.value.assign(rval.begin(), rval.end());
-                    return std::optional<Entry>{std::move(e)};
+                    e.value = owned ? std::span<const std::byte>(owned->value)
+                                    : rval;
+                    e.key = rkey;
+                    e.key_from_cursor = false;
+                    e.file_holder = shared_df;
+                    if (owned) e.owned = std::move(*owned);
+                    return true;
                 }
                 auto dv = codec::decode_doc_value(rval);
                 if (!dv) {
@@ -240,9 +246,14 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
                     (dv->meta.empty() || !filter_->evaluate(dv->meta))) {
                     continue;
                 }
-                e.value.assign(dv->text.begin(), dv->text.end());
-                if (want_meta_) e.meta.assign(dv->meta.begin(), dv->meta.end());
-                return std::optional<Entry>{std::move(e)};
+                // S75：span 直达映射（mmap）或 owned 记录（pread 兜底），不拷。
+                e.key = rkey;
+                e.key_from_cursor = false;
+                e.value = dv->text;
+                if (want_meta_) e.meta = dv->meta;
+                e.file_holder = shared_df;
+                if (owned) e.owned = std::move(*owned);
+                return true;
             }
         }
 
@@ -280,6 +291,75 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
     }
 }
 
+std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
+    reset_view_batch();  // S75：推进调用使上一批视图失效（契约见 next_batch_view）
+    RowView rv;
+    auto produced = next_row(rv);
+    if (!produced) return std::unexpected(produced.error());
+    if (!*produced) return std::optional<Entry>{};
+    Entry e;
+    e.key.assign(rv.key.begin(), rv.key.end());
+    e.value.assign(rv.value.begin(), rv.value.end());
+    if (want_meta_) e.meta.assign(rv.meta.begin(), rv.meta.end());
+    e.tstamp = rv.tstamp;
+    e.file_id = rv.file_id;
+    e.offset = rv.offset;
+    e.total_sz = rv.total_sz;
+    e.is_tombstone = rv.is_tombstone;
+    e.ord = rv.ord;
+    return std::optional<Entry>{std::move(e)};
+}
+
+void CaskIter::reset_view_batch() noexcept {
+    view_entries_.clear();
+    view_files_.clear();
+    view_owned_.clear();
+    view_scratch_keys_.clear();
+    view_key_buf_.clear();  // 只 clear 不 shrink：容量跨批复用
+}
+
+std::expected<std::span<const CaskIter::EntryView>, CaskFault>
+CaskIter::next_batch_view(std::size_t max_n) {
+    reset_view_batch();
+    std::size_t n = 0;
+    while (n < max_n) {
+        RowView rv;
+        auto produced = next_row(rv);
+        if (!produced) {
+            reset_view_batch();  // 错误即整批作废
+            return std::unexpected(produced.error());
+        }
+        if (!*produced) break;
+        view_entries_.emplace_back();
+        EntryView& ev = view_entries_.back();
+        if (rv.key_from_cursor) {
+            view_scratch_keys_.push_back(
+                {n, view_key_buf_.size(), rv.key.size()});
+            view_key_buf_.append(reinterpret_cast<const char*>(rv.key.data()),
+                                 rv.key.size());
+        } else {
+            ev.key = rv.key;
+        }
+        ev.value = rv.value;
+        ev.meta = rv.meta;
+        ev.tstamp = rv.tstamp;
+        ev.file_id = rv.file_id;
+        ev.offset = rv.offset;
+        ev.total_sz = rv.total_sz;
+        ev.is_tombstone = rv.is_tombstone;
+        ev.ord = rv.ord;
+        if (rv.file_holder) view_files_.push_back(std::move(rv.file_holder));
+        if (rv.owned) view_owned_.push_back(std::move(*rv.owned));
+        ++n;
+    }
+    // 整批填完再回填墓碑行的 key span（见 hpp 注释）。
+    const auto* base = reinterpret_cast<const std::byte*>(view_key_buf_.data());
+    for (const auto& s : view_scratch_keys_) {
+        view_entries_[s.entry].key = std::span<const std::byte>(base + s.off, s.len);
+    }
+    return std::span<const EntryView>(view_entries_.data(), n);
+}
+
 std::expected<std::vector<CaskIter::Entry>, CaskFault>
 CaskIter::next_batch(std::size_t max_n) {
     std::vector<Entry> batch;
@@ -300,6 +380,7 @@ CaskIter::FlatKeys CaskIter::drain_live_keys() {
     while (true) {
         auto row = next_merged_key();
         if (!row || !*row) break;  // parallel_scan 随后 get 会显式暴露读错误
+        if ((*row)->tomb) continue;  // 只收活 key（see_tombstones 透传后的防御）
         const auto& key = (*row)->key;
         if (!key_prefix_.empty() &&
             (key.size() < key_prefix_.size() ||
@@ -348,6 +429,7 @@ void CaskIter::release() noexcept {
     view_ = {};
     cur_key_.clear();
     pinned_files_.clear();
+    reset_view_batch();
 }
 
 }  // namespace bitcask

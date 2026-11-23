@@ -71,6 +71,6 @@ F = fun(_K, _V, _T, _O, A) -> A + 1 end,
 
 ## 回没回
 
-**libbitcask（2026-11-23，S64，已编码未提交、版本未定）**：已修，取建议 1 + 3。`make_read_view` 的排序视图缓存改成增量的——若干不可变有序段 + 一小段有序尾巴，写后首查只拷贝并整理新增的行；尾巴满 128 行升段，相邻段行数相近时线性归并。锁内拷贝一次最多 4096 行。flush / 重建重排 active 时缓存整体作废，之后第一次读重建一次（首建仍是一次全量排序）。实测「写 1 条无关 key + 扫 1 行」：5 万 / 10 万 / 40 万未落盘行 4 / 4 / 5 µs（改前 10 万行 15 ms、40 万行 80 ms）。C API、盘上格式、C++ ABI 不变。回归 `OkiRangeTest.RangeAfterWriteDoesNotResortWholeMemdelta` / `IncrementalSortedView*`（钉的是视图整理处理的行数，不是墙钟）。建议 2（active 直接用有序结构）没做。
+**libbitcask（2026-11-23，S64，12.0.2 已发版）**：已修，取建议 1 + 3。`make_read_view` 的排序视图缓存改成增量的——若干不可变有序段 + 一小段有序尾巴，写后首查只拷贝并整理新增的行；尾巴满 128 行升段，相邻段行数相近时线性归并。锁内拷贝一次最多 4096 行。flush / 重建重排 active 时缓存整体作废，之后第一次读重建一次（首建仍是一次全量排序）。实测「写 1 条无关 key + 扫 1 行」：5 万 / 10 万 / 40 万未落盘行 4 / 4 / 5 µs（改前 10 万行 15 ms、40 万行 80 ms）。C API、盘上格式、C++ ABI 不变。回归 `OkiRangeTest.RangeAfterWriteDoesNotResortWholeMemdelta` / `IncrementalSortedView*`（钉的是视图整理处理的行数，不是墙钟）。建议 2（active 直接用有序结构）没做。
 
 **bitcask**：bitcask 图层已自行绕开分块组的读（改点查）；其余 range 路径等上游。

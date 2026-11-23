@@ -1070,6 +1070,22 @@ public:
     [[nodiscard]] std::expected<std::vector<Entry>, CaskFault>
     next_batch(std::size_t max_n);
 
+    // S75：免分配批视图（见下）
+    struct EntryView {
+        std::span<const std::byte> key;
+        std::span<const std::byte> value;   // 墓碑恒空
+        std::span<const std::byte> meta;    // set_want_meta(true) 时填，否则空
+        std::uint64_t tstamp      = 0;
+        std::uint32_t file_id     = 0;
+        std::uint64_t offset      = 0;
+        std::uint32_t total_sz    = 0;
+        bool          is_tombstone = false;
+        std::uint64_t ord         = 0;
+    };
+
+    [[nodiscard]] std::expected<std::span<const EntryView>, CaskFault>
+    next_batch_view(std::size_t max_n);
+
     void                release() noexcept;
     [[nodiscard]] bool  is_iterating() const noexcept;
 };
@@ -1099,6 +1115,14 @@ public:
 
 - 批量取最多 `max_n` 条 entry；内部循环调 `next()`。
 - **空 vector = EOI（正常结束）；unexpected = 错误**——两者语义不同。
+
+### `CaskIter::next_batch_view`（S75，免分配批视图）
+
+- 语义同 `next_batch`（同一快照、同一 `see_tombstones` / 前缀 / `set_want_meta` / `set_filter`），`EntryView` 的字段与 `Entry` 一一对应；区别只在所有权：`key` / `value` / `meta` 是 **span，借迭代器内部的存储**，整批稳态零堆分配（映射命中时 value 直达文件映射；`pread` 兜底时记录留在迭代器里）。
+- **要保留就当下复制**（缓冲归库所有）。返回的 span 及其中各字段的 span 只在**本迭代器的下一次推进调用之前**有效：`next` / `next_batch` / `next_batch_view` / `start` / `release` 都算推进；`Cask::close()` 不算（映射被迭代器钉住 / 记录在迭代器里，close 之后仍可读完当前批）。
+- 典型误用：先把一批 key 记进自己的数组，回头再读 value——中间只要调过一次 `next`，记下的切片就悬垂了。
+- 返回：**空 span = 迭代结束；unexpected = 故障，整批不可依赖**（与 `next_batch` 不同，后者出错时不产出半批）；`max_n == 0` 返回空 span 且不推进。
+- 线程安全：否（同 `next`）。
 
 ### `CaskIter::release` / `is_iterating`
 

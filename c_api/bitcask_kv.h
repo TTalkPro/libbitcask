@@ -205,13 +205,15 @@ typedef struct {
     void (*log_fn)(int level, const char* msg, void* ctx);
     void* log_ctx;
 
-    /* S36：keydir 磁盘驻留（Level B）。0 = 关（默认，keydir 全内存 =
-       现状）。>0 = keydir 热点缓存条目预算：超预算逐出，点查落组合视图
-       （memdelta + 磁盘 run，bloom + 块缓存，冷 get ≤2 次 pread）——
-       1 亿 key 常驻从 ~11GB 降到 ~1.1GB。首次对旧目录开启会全量重建
-       OKI（一次性开销）；Level A（=0）写者重开会清模式戳、再开启时重建
-       自愈；merge_only 旁车对 Level B 目录 open 返回 BITCASK_ERR_IO。
-       详见 api-c.md「keydir 磁盘驻留」。
+    /* S36：OKI 磁盘驻留（Level B）。字段名为 ABI 兼容保留（keydir 索引
+       已于 7.0.0 退役，语义即 OKI Level B 开关）。0 = 关（默认，内存
+       索引全量驻留 = 现状）。>0 = 热点缓存条目预算：超预算逐出，点查走
+       组合视图（active memdelta + frozen 段 + BCOK v3 磁盘 run，
+       bloom + 块缓存，冷 get ≤2 次 pread）——1 亿 key 常驻从 ~11GB 降到
+       ~1.1GB。首次对旧目录开启会全量重建 OKI（一次性开销）；Level A
+       （=0）写者重开会清模式戳、再开启时重建自愈；merge_only 旁车对
+       Level B 目录 open 返回 BITCASK_ERR_IO。详见 doc/api-c.md 选项表与
+       doc/api-cpp.md §11.3。
        本字段为 6.0.0 新增——结构体布局较 5.1.0 变更即本版 bump major
        （SOVERSION 6）的原因，见 CHANGELOG [6.0.0] 段。 */
     size_t    keydir_cache_entries;
@@ -349,7 +351,7 @@ typedef struct {
 
 // S33-6：range 迭代条目（对应 bitcask::CaskRangeIter::Entry）。
 // 与 bitcask_iter_entry_t 不同：无 file_id/offset/total_sz/墓碑
-// （range 只产出活 key，位置信息由 keydir 回查内部消化）。
+// （range 只产出活 key，位置回查在 OKI 组合视图内部消化）。
 typedef struct {
     bitcask_slice_t key;        // 指向内部 malloc 缓冲
     bitcask_slice_t value;      // 指向内部 malloc 缓冲
@@ -663,7 +665,7 @@ BITCASK_API bitcask_error_t bitcask_put_doc_ex(bitcask_t* cask,
 
 
 /* 批量写（S13-D1）。语义同逐条 bitcask_put，但整批一次提交：记录聚合写入、
- * 单次 flush 后才更新 keydir 并返回——本进程内 all-or-nothing 可见；
+ * 单次 flush 后才更新 OKI 并返回——本进程内 all-or-nothing 可见；
  * durability 与单条 put 的 sync 策略一致（o_sync 即时；sync_every_n>0 整批一次
  * 组提交；否则由 bitcask_sync 控制）。失败返回时整批不可见（磁盘可能残留
  * 前缀，重启后可见——与连续单条 put 的崩溃语义一致）。
@@ -1068,8 +1070,8 @@ BITCASK_API bitcask_error_t bitcask_iter_start(bitcask_t* cask,
                                                  bitcask_fault_t* fault);
 
 // S13-D4 能力补齐（S33-6）：带 key 前缀过滤的迭代器快照。
-// key_prefix 为空切片时等价 bitcask_iter_start。过滤发生在 keydir proxy 层
-// （不读 value），但 keydir 是哈希表——**仍是 O(全表) 扫描**，省的是 value
+// key_prefix 为空切片时等价 bitcask_iter_start。过滤发生在快照阶段
+// （不读 value），但快照枚举本身是 O(全表)，省的是 value
 // 读取与跨界拷贝。有序范围扫描请用 bitcask_range_iter_*（O(range)）。
 // 其余参数与返回码同 bitcask_iter_start。
 BITCASK_API bitcask_error_t bitcask_iter_start_prefix(bitcask_t* cask,
@@ -1103,6 +1105,37 @@ BITCASK_API void bitcask_iter_release(bitcask_iter_t* iter);
 
 // 释放迭代器条目内部缓冲（key/value 的 malloc 缓冲）。
 BITCASK_API void bitcask_iter_entry_free(bitcask_iter_entry_t* entry);
+
+/* S75（反馈 2026-11-23-keydir-scan 第 3 条）：免分配批视图条目。字段是
+ * bitcask_iter_entry_t 的全集 + meta（同 *_ex），但 key/value/meta **借库内
+ * 存储**，没有、也不需要 free 函数。 */
+typedef struct {
+    bitcask_slice_t key;
+    bitcask_slice_t value;   /* 墓碑恒空 */
+    bitcask_slice_t meta;    /* bitcask_iter_start_ex 的 want_meta 非 0 时填，否则空 */
+    uint64_t        tstamp;
+    uint32_t        file_id;
+    uint64_t        offset;
+    uint32_t        total_sz;
+    int             is_tombstone;
+    uint64_t        ord;
+} bitcask_iter_entry_view_t;
+
+/* 免分配批量取最多 max_n 条（单条用 max_n = 1）。遍历语义、快照一致性、
+ * 墓碑 / 前缀 / meta 过滤都与 bitcask_iter_next_batch_ex 相同，区别只在所有权：
+ * 整批零堆分配，调用方不释放任何东西。
+ * 返回取到的条数（0 = 迭代结束），<0 = 错误（fault 已填，**整批不可依赖**）。
+ * entries 是调用方分配的数组（纯值结构，可栈分配 / 复用）。
+ * ⚠ 有效期：entries 里的切片只在本迭代器的下一次推进调用之前有效——
+ * bitcask_iter_next / _ex / _batch / _batch_ex / _batch_view、bitcask_iter_release
+ * 都算推进；bitcask_close 不算（之后仍可读完当前批再 release，但不可再推进）。
+ * 要保留请当下复制。
+ *   典型误用：先把一批 key 记进自己的数组，回头再读 value——中间只要调过
+ *   一次 next，记下的切片就悬垂了。 */
+BITCASK_API int bitcask_iter_next_batch_view(bitcask_iter_t* iter,
+                                             bitcask_iter_entry_view_t* entries,
+                                             size_t max_n,
+                                             bitcask_fault_t* fault);
 
 /* ---------------------------------------------------------------------------
  *  S33-6：有序 range 迭代（OKI 有序 key 索引，O(range) 而非 O(全表)）
@@ -1240,7 +1273,7 @@ BITCASK_API bitcask_error_t bitcask_parallel_scan(bitcask_t* cask,
 
 // S33-6：带 key 前缀过滤的并行扫描（C++ parallel_scan 的 key_prefix 形参在
 // C 侧的补齐）。key_prefix 为空切片时等价 bitcask_parallel_scan。过滤在快照
-// 阶段（keydir proxy 层）完成——只有匹配的 key 会被并发 get。
+// 阶段（OKI 组合视图枚举）完成——只有匹配的 key 会被并发 get。
 BITCASK_API bitcask_error_t bitcask_parallel_scan_prefix(
     bitcask_t* cask,
     size_t n_threads,
@@ -1294,7 +1327,7 @@ BITCASK_API bitcask_error_t bitcask_merge_files(bitcask_t* cask,
                                                   size_t files_count,
                                                   bitcask_fault_t* fault);
 
-// 6.4.0：手动 checkpoint（对应 C++ Cask::checkpoint()）：keydir 快照 +
+// 6.4.0：手动 checkpoint（对应 C++ Cask::checkpoint()）：OKI manifest +
 // search.ckpt 主动落盘，把崩溃恢复的重放窗口收到「自本次调用以来」；
 // ⭐ 顺带把上一轮 merge 退休的输入文件**此刻删掉**——此前 C API 只能靠
 // bitcask_close / 下一次 merge 才回收那些盘。
@@ -1306,7 +1339,7 @@ BITCASK_API bitcask_error_t bitcask_checkpoint(bitcask_t* cask,
 // 是否空（写过 key 后即使删光也返回 0）。
 BITCASK_API int bitcask_is_empty(bitcask_t* cask);
 
-// keydir 是否被 fold/iterator pin 住。
+// OKI 读视图是否被 fold/iterator pin 住。
 BITCASK_API int bitcask_is_frozen(bitcask_t* cask);
 
 // 刷新异步索引队列（索引模式下，确保 pending 写入被索引）。

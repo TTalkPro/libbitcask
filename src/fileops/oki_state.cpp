@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <cstdlib>
 #include <new>
 #include <filesystem>
@@ -187,7 +188,11 @@ struct ActiveSorted {
     std::size_t covered = 0;
     std::size_t count = 0;
 };
-static_assert(std::is_standard_layout_v<ActiveSorted>);
+// 守的其实是「tail 在偏移 0」（别名指针转回整个对象）。standard-layout 蕴含它，但 MSVC
+// Debug（/MDd，_ITERATOR_DEBUG_LEVEL=2）下 std::vector 带调试迭代器代理、不是 standard-layout，
+// 布局却与 Release 一致 ⇒ 只断 standard-layout 会让 msvc-debug / msvc-asan 编不过
+// （12.0.2 起，S74）。标准布局时照旧断言；否则退到 offsetof。
+static_assert(std::is_standard_layout_v<ActiveSorted> || offsetof(ActiveSorted, tail) == 0);
 
 // ---- S65：memdelta 点查索引（key → delta_ 内最新行下标）----
 //

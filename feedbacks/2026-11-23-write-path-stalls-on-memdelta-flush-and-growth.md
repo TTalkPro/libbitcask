@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
 
 ## 回没回
 
-已修（S70，未发版，CHANGELOG `[Unreleased]`；只编码未提交）。
+已修（S70，12.2.0 已发版）。
 
 - 落段挪到后台线程：读写库第一次写到阈值时起一条线程跑 `commit_oki_cut`，写者只发请求就返回；memdelta 涨到阈值 2 倍还没落下去时写者才
   退回同步落段（内存有界）。线程在 `close()` 时停。
