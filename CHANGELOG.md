@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`12.1.0`**；库 `SOVERSION` = **`12`**（= major）；
+`bitcask_version_*` = **`12.2.0`**；库 `SOVERSION` = **`12`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -15,9 +15,10 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
-## [Unreleased]（S69：原子批删除的批头区间 + S70：写路径长尾 + S71：keydir 扫描提速）
+## [12.2.0] - 2026-11-23（S69：原子批删除的批头区间 + S70：写路径长尾 + S71：keydir 扫描提速）
 
-> **版本语义**：版本未定（S69 单独看是 PATCH；S70 / S71 有新增接口与行为变化，合起来建议 MINOR）。盘上格式不变（读端多认一种旧写端写错的批）；C API 不变；C++ ABI 只有追加（`IndexAuthority` 末尾成员与新成员函数、`MappedFile` / `DataFile` 新成员函数），已有布局不动。
+> **版本语义**：MINOR **12.2.0**（S69 单看是 PATCH；S70 新增 `IndexAuthority` 后台落段入口、S71 新增 `MappedFile` / `DataFile::advise_normal`，`RangeOptions::prefetch_threads = 0` 改为自适应）。
+> 盘上格式不变（读端多认一种旧写端写错的批）；C API 不变；C++ ABI 只有追加（`IndexAuthority` 末尾追加一个成员），已有类的成员偏移不动；`SOVERSION` 仍为 12。
 
 ### Fixed
 
@@ -52,7 +53,7 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 GCC Release（`-Werror`）全量 ctest 986 注册 / 984 执行全绿；ASan 全量 984 全绿；TSan 相关 167 项全绿、无告警；clang Debug 相关 135 项全绿。
 端到端：bitcask 侧隔离副本（索引模式）打开 12.1.0 写出、12.1.0 自己打不开的库，删除生效、文件不变。
-S70 / S71 合入后：GCC Release（`-Werror`）全量 989 注册 / 987 执行全绿；ASan、clang Debug 全量 987 全绿；TSan 全量见 TASK S70。
+S70 / S71 合入后：GCC Release（`-Werror`）全量 989 注册 / 987 执行全绿；ASan、clang Debug、TSan 全量 987 全绿（TSan 无告警）。
 S70 新增回归 `OkiRecoveryTest.S70*`（3 项）。`HighlightColdTest.ReopenedLibraryHasNoSnippetsUnlessLoaded` 在机器有负载时偶发失败，
 HEAD（不含本节改动）在同样负载下同样会失败（4/60），与本节无关，未处理。Windows 未实测。
 
