@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
+#include <new>
 #include <filesystem>
 #include <limits>
 #include <type_traits>
@@ -196,58 +198,146 @@ static_assert(std::is_standard_layout_v<ActiveSorted>);
 // 只增不删（active 重排时整表重建）；装填率不超过 1/2。
 struct FlatIdx {
     static constexpr std::uint64_t kIdxMask = (std::uint64_t{1} << 40) - 1;
-    std::vector<std::uint64_t> slots;  // 容量为 2 的幂（或空）
-    std::size_t used = 0;
+    // S70：扩容不再一次性按行重算哈希重排（52 万行时约 10 ms，持 mu_，挡全部
+    // 写者——feedbacks/2026-11-23-write-path-stalls-on-memdelta-flush-and-growth.md）。
+    // 装填率到 1/2 时开一张两倍大的新表（calloc：大块走零页，不 memset），旧表
+    // 留着；之后每次插入顺带把旧表的 kMigrateStep 个槽搬进新表，搬完释放旧表。
+    // 搬迁期间查找先查新表、再查旧表（一个 key 只在其中一张里）；新插入只进新表。
+    // 新表容量 = 旧表 2 倍、旧表在册项 ≈ 容量 / 2，按每次插入搬 16 个槽，旧表在
+    // 新表涨到 1/2 之前早已搬空。
+    static constexpr std::size_t kMigrateStep = 16;
+
+    struct Table {
+        std::uint64_t* slots = nullptr;  // calloc 分配；容量为 2 的幂（或 0）
+        std::size_t cap = 0;
+        Table() = default;
+        Table(const Table&) = delete;
+        Table& operator=(const Table&) = delete;
+        Table(Table&& o) noexcept : slots(o.slots), cap(o.cap) { o.slots = nullptr; o.cap = 0; }
+        Table& operator=(Table&& o) noexcept {
+            if (this != &o) {
+                std::free(slots);
+                slots = o.slots; cap = o.cap;
+                o.slots = nullptr; o.cap = 0;
+            }
+            return *this;
+        }
+        ~Table() { std::free(slots); }
+        void alloc(std::size_t n) {
+            std::free(slots);
+            slots = static_cast<std::uint64_t*>(std::calloc(n, sizeof(std::uint64_t)));
+            if (slots == nullptr) throw std::bad_alloc();
+            cap = n;
+        }
+    };
+    Table cur;            // 新插入进这里
+    Table old;            // 搬迁中的旧表（cap == 0 = 不在搬迁）
+    std::size_t old_pos = 0;  // 旧表下一个待搬的槽
+    std::size_t used = 0;     // 两张表的在册项合计
 
     static std::uint64_t tag_of(std::size_t h) noexcept {
         return (static_cast<std::uint64_t>(h) >> 40) << 40;
     }
 
-    // 命中 → 槽指针；未命中 → nullptr。
     template <typename Rows>
-    std::uint64_t* find(const Rows& rows, std::string_view key, std::size_t h) noexcept {
-        if (slots.empty()) return nullptr;
-        const std::size_t mask = slots.size() - 1;
+    static std::uint64_t* find_in(Table& t, const Rows& rows, std::string_view key,
+                                  std::size_t h) noexcept {
+        if (t.cap == 0) return nullptr;
+        const std::size_t mask = t.cap - 1;
         const std::uint64_t tag = tag_of(h);
         for (std::size_t pos = h & mask;; pos = (pos + 1) & mask) {
-            const std::uint64_t s = slots[pos];
+            const std::uint64_t s = t.slots[pos];
             if (s == 0) return nullptr;
             if ((s & ~kIdxMask) == tag && rows[(s & kIdxMask) - 1].key == key) {
-                return &slots[pos];
+                return &t.slots[pos];
             }
         }
     }
 
-    // 前置：key 不在表里。
-    void insert_new(std::size_t h, std::size_t idx) noexcept {
-        const std::size_t mask = slots.size() - 1;
+    // 命中 → 槽指针；未命中 → nullptr。
+    template <typename Rows>
+    std::uint64_t* find(const Rows& rows, std::string_view key, std::size_t h) noexcept {
+        if (std::uint64_t* s = find_in(cur, rows, key, h)) return s;
+        return find_in(old, rows, key, h);
+    }
+
+    static void put_slot(Table& t, std::size_t h, std::uint64_t slot) noexcept {
+        const std::size_t mask = t.cap - 1;
         std::size_t pos = h & mask;
-        while (slots[pos] != 0) pos = (pos + 1) & mask;
-        slots[pos] = tag_of(h) | (static_cast<std::uint64_t>(idx) + 1);
+        while (t.slots[pos] != 0) pos = (pos + 1) & mask;
+        t.slots[pos] = slot;
+    }
+
+    // 前置：key 不在表里；已 reserve_one。
+    void insert_new(std::size_t h, std::size_t idx) noexcept {
+        put_slot(cur, h, tag_of(h) | (static_cast<std::uint64_t>(idx) + 1));
         ++used;
     }
 
-    // 保证再放一项后装填率 ≤ 1/2；扩容时按行里的 key 重算哈希重排。
+    // 保证再放一项后新表装填率 ≤ 1/2；推进一段搬迁。
     template <typename Rows>
     void reserve_one(const Rows& rows) {
-        if (!slots.empty() && (used + 1) * 2 <= slots.size()) return;
-        std::vector<std::uint64_t> old = std::move(slots);
-        slots.assign(old.empty() ? 64 : old.size() * 2, 0);
-        used = 0;
-        for (const std::uint64_t s : old) {
+        if (old.cap != 0) migrate_some(rows);
+        if (cur.cap != 0 && (used + 1) * 2 <= cur.cap) return;
+        if (old.cap != 0) migrate_all(rows);   // 不该发生（搬迁远快于填充）：兜底
+        old = std::move(cur);
+        old_pos = 0;
+        cur.alloc(old.cap == 0 ? 64 : old.cap * 2);
+        if (old.cap == 0) return;
+        migrate_some(rows);
+    }
+
+    template <typename Rows>
+    void migrate_some(const Rows& rows) {
+        std::size_t moved = 0;
+        while (old_pos < old.cap && moved < kMigrateStep) {
+            const std::uint64_t s = old.slots[old_pos++];
             if (s == 0) continue;
             const std::size_t idx = static_cast<std::size_t>((s & kIdxMask) - 1);
-            insert_new(StringHash{}(std::string_view(rows[idx].key)), idx);
+            put_slot(cur, StringHash{}(std::string_view(rows[idx].key)), s);
+            ++moved;
         }
+        if (old_pos >= old.cap) {
+            old = Table{};
+            old_pos = 0;
+        }
+    }
+
+    template <typename Rows>
+    void migrate_all(const Rows& rows) {
+        while (old.cap != 0) migrate_some(rows);
     }
 
     void reset(std::size_t expect_rows) {
         std::size_t cap = 64;
         while (cap < expect_rows * 2) cap *= 2;
-        slots.assign(cap, 0);
+        old = Table{};
+        old_pos = 0;
+        cur.alloc(cap);
         used = 0;
     }
 };
+
+// S70：后台分块持锁之间的停顿（见 flush 拷贝处的注释）。
+void lk_pause() {
+    std::this_thread::sleep_for(std::chrono::microseconds(1));
+}
+
+// 把 rows[idx] 记进索引（规则同 OkiState::index_row_locked：同 key 时 ord 不更小的
+// 后到行顶替）。S70：drop_active_through 在锁外给新数组建索引用。
+void flat_index_row(FlatIdx& fi, const std::vector<OkiState::DeltaRow>& rows, std::size_t idx) {
+    const auto& row = rows[idx];
+    const std::size_t h = StringHash{}(std::string_view(row.key));
+    if (std::uint64_t* s = fi.find(rows, row.key, h)) {
+        const std::size_t cur = static_cast<std::size_t>((*s & FlatIdx::kIdxMask) - 1);
+        if (rows[cur].ord <= row.ord) {
+            *s = (*s & ~FlatIdx::kIdxMask) | (static_cast<std::uint64_t>(idx) + 1);
+        }
+        return;
+    }
+    fi.reserve_one(rows);
+    fi.insert_new(h, idx);
+}
 
 FlatIdx* flat_idx(std::uint64_t slot) noexcept {
     return reinterpret_cast<FlatIdx*>(static_cast<std::uintptr_t>(slot));
@@ -273,6 +363,22 @@ constexpr std::size_t kCancelCheckRows = 4096;
 
 }  // namespace
 
+// S70：行数组扩容。翻倍搬迁持 mu_、随行数线性变贵（52 万行时搬一次约 5～10 ms）；
+// 小库照常翻倍，涨到 kRowsJumpAt 行时直接预留到 kRowsJumpTo（落段阈值的 1.25 倍，
+// 留出后台落段期间继续写入的余量），之后不再搬迁。大块分配只占虚拟地址，行写进来
+// 才占内存。落段后的新 active 沿用这块容量（drop_active_through）。
+constexpr std::size_t kRowsJumpAt = std::size_t{1} << 16;
+constexpr std::size_t kRowsJumpTo = OkiState::kFlushRowLimit + OkiState::kFlushRowLimit / 4;
+
+static void reserve_rows_locked(std::vector<OkiState::DeltaRow>& rows, std::size_t more) {
+    const std::size_t need = rows.size() + more;
+    if (need <= rows.capacity()) return;
+    if (need > kRowsJumpAt && rows.capacity() < kRowsJumpTo) {
+        rows.reserve(std::max(need, kRowsJumpTo));
+    }
+    // 其余情况交给 push_back 的翻倍（小库；或后台落段跟不上、超过 1.25 倍阈值）。
+}
+
 // ---------------------------------------------------------------------------
 // active memdelta（只追加；mu_）
 // ---------------------------------------------------------------------------
@@ -289,6 +395,7 @@ void OkiState::append_update(std::string_view key, std::uint64_t ord,
                              bool tomb, const RowLoc* loc,
                              std::uint32_t dur_file, std::uint64_t dur_end) {
     std::lock_guard<std::mutex> lk(mu_);
+    reserve_rows_locked(delta_, 1);
     delta_bytes_ += key.size() + sizeof(DeltaRow);
     delta_.push_back(DeltaRow{std::string(key), ord, tomb,
                               /*has_loc=*/loc != nullptr,
@@ -320,6 +427,7 @@ void OkiState::apply_batch(std::span<const BatchRow> rows) {
     }
 
     std::lock_guard<std::mutex> lk(mu_);
+    reserve_rows_locked(delta_, prepared.size());
     const std::size_t first = delta_.size();
     delta_.insert(delta_.end(), std::make_move_iterator(prepared.begin()),
                   std::make_move_iterator(prepared.end()));
@@ -375,22 +483,71 @@ void OkiState::enable_point_query() {
 }
 
 void OkiState::drop_active_through(std::uint64_t through) {
-    std::lock_guard<std::mutex> lk(mu_);
-    std::vector<DeltaRow> kept;
-    kept.reserve(delta_.size());
-    std::size_t bytes = 0;
-    for (auto& r : delta_) {
-        if (r.seq > through) {
-            bytes += r.key.size() + sizeof(DeltaRow);
-            kept.push_back(std::move(r));
-        }
+    // S70：持 mu_ 的时间与行数无关。delta_ 按到达序追加、seq 单调不减，seq ≤ through
+    // 的行恰是前缀，要留下的是后缀——它在后台落段排序期间还在长（实测 7 万行）。
+    // 先在锁外把后缀分块拷进新数组、给新数组建好索引（每块短暂持锁取行，块间让出
+    // 一次，免得写者抢不到锁）；剩下不到一块时才在锁内搬完零头、整体交换。旧数组
+    // （连同前缀里上百万个 key 字符串）与旧索引在锁外析构。此前在锁内搬后缀、
+    // 重建索引，挡写者约 4 ms；更早（S70 之前）逐行判断整份数组，几十毫秒。
+    // 前置：持 flush_mu_（删除 / 重排只有这里与 rebuild / clear，都要 flush_mu_），
+    // 所以期间 delta_ 只会在尾部追加，下标稳定。
+    std::size_t copied = 0;
+    std::size_t cap = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        copied = static_cast<std::size_t>(
+            std::partition_point(delta_.begin(), delta_.end(),
+                                 [&](const DeltaRow& r) { return r.seq <= through; }) -
+            delta_.begin());
+        cap = std::max(delta_.capacity(), delta_.size() - copied);
     }
-    delta_ = std::move(kept);
-    delta_bytes_ = bytes;
-    ++delta_version_;
-    ++delta_epoch_;  // active 被重排：增量有序视图（ActiveSorted）整体作废
-    rebuild_index_locked();
-    update_flush_hint_locked();
+    const bool indexed = point_query_.load(std::memory_order_acquire);
+    std::vector<DeltaRow> kept;
+    kept.reserve(cap);   // 沿用原容量：落段后不必再从小翻倍（大块只占虚拟地址）
+    auto fresh = std::make_unique<FlatIdx>();
+    fresh->reset(0);
+    std::size_t bytes = 0;
+    const auto add = [&](std::size_t from) {
+        for (std::size_t i = from; i < kept.size(); ++i) {
+            bytes += kept[i].key.size() + sizeof(DeltaRow);
+            if (indexed) flat_index_row(*fresh, kept, i);
+        }
+    };
+    std::vector<DeltaRow> old;
+    std::unique_ptr<FlatIdx> old_idx;
+    while (true) {
+        std::unique_lock<std::mutex> lk(mu_);
+        const std::size_t n = delta_.size();
+        const std::size_t base = kept.size();
+        if (n - copied > kViewCopyChunkRows) {
+            // 拷（不搬）：这些行此刻仍是 active，读者照常可见
+            for (std::size_t i = copied; i < copied + kViewCopyChunkRows; ++i) {
+                kept.push_back(delta_[i]);
+            }
+            copied += kViewCopyChunkRows;
+            lk.unlock();
+            add(base);
+            lk_pause();
+            continue;
+        }
+        for (std::size_t i = copied; i < n; ++i) kept.push_back(std::move(delta_[i]));
+        add(base);
+        old = std::move(delta_);
+        delta_ = std::move(kept);
+        delta_bytes_ = bytes;
+        ++delta_version_;
+        ++delta_epoch_;  // active 被重排：增量有序视图（ActiveSorted）整体作废
+        if (point_query_.load(std::memory_order_relaxed) == indexed && indexed) {
+            old_idx.reset(flat_idx(delta_flat_idx_));
+            delta_flat_idx_ = static_cast<std::uint64_t>(
+                reinterpret_cast<std::uintptr_t>(fresh.release()));
+        } else {
+            rebuild_index_locked();   // 期间点查开关被切换（罕见）：老办法重建
+        }
+        update_flush_hint_locked();
+        break;
+    }
+    // old / old_idx 在这里（锁外）析构
 }
 
 // S43-5：写前探测是 locate 的显式语义别名。
@@ -586,15 +743,34 @@ bool OkiState::flush_locked_impl(
     std::uint64_t max_eligible_seq = 0;
     std::uint64_t min_remaining_ord = std::numeric_limits<std::uint64_t>::max();
     {
-        std::lock_guard<std::mutex> lk(mu_);
-        eligible.reserve(delta_.size());
-        for (const auto& r : delta_) {
-            if (r.seq <= cut_seq) {
-                eligible.push_back(r);
-                max_eligible_seq = std::max(max_eligible_seq, r.seq);
-            } else {
-                min_remaining_ord = std::min(min_remaining_ord, r.ord);
+        // S70：分块拷贝，每块单独持 mu_。持 flush_mu_ 期间 delta_ 只会在尾部追加
+        // （删除 / 重排都要 flush_mu_），所以下标稳定：先记下此刻的行数，再一块一块
+        // 拷。此前一次持锁拷完百万行，写者被挡几十毫秒。拷到的行集合与原来相同
+        // （此刻之后追加的行不在内，与原来「持锁那一刻之后的行不在内」同义）。
+        std::size_t n = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            n = delta_.size();
+        }
+        eligible.reserve(n);
+        for (std::size_t i = 0; i < n; i += kViewCopyChunkRows) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                const std::size_t end = std::min(n, i + kViewCopyChunkRows);
+                for (std::size_t j = i; j < end; ++j) {
+                    const auto& r = delta_[j];
+                    if (r.seq <= cut_seq) {
+                        eligible.push_back(r);
+                        max_eligible_seq = std::max(max_eligible_seq, r.seq);
+                    } else {
+                        min_remaining_ord = std::min(min_remaining_ord, r.ord);
+                    }
+                }
             }
+            // 放锁后歇一下再拿下一块：std::mutex 不保证公平，等锁的写者在别的核上被
+            // 唤醒要几微秒，这边几纳秒就又抢到锁，写者整段拷贝期间都拿不到（实测一次
+            // 挡了约 11 ms）。每块歇约 50 µs（定时器精度），百万行多花几毫秒。
+            lk_pause();
         }
     }
     auto winners = sort_dedup(std::move(eligible));

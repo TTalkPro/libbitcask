@@ -342,7 +342,8 @@ typedef struct {
     /* 值预取：0/1 = 关闭（逐 key 惰性取值）；>1 = 一次归并出 prefetch 个
      * key 后并发取值。仅改变取值时机，输出序与内容不变。 */
     size_t          prefetch;
-    /* 预取线程数；0 = min(hardware_concurrency, 4) */
+    /* 预取线程数；0 = 自动（至多 min(hardware_concurrency, 4)；每批先串行试取
+     * 一小段计时，页缓存热、值小、并行不划算时整批串行）；>0 = 按给的数并行 */
     size_t          prefetch_threads;
 } bitcask_range_options_t;
 

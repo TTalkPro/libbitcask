@@ -544,6 +544,8 @@ MappedFile MappedFile::map_readonly(FileHandle fd, std::size_t len,
     return m;
 }
 
+void MappedFile::advise_normal() noexcept {}
+
 void MappedFile::reset() noexcept {
     if (base_ != nullptr) {
         // UnmapViewOfFile 只要基址，不需要长度（与 munmap 不同）。

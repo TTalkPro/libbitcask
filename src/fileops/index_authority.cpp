@@ -1,7 +1,10 @@
 #include "bitcask/index_authority.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <map>
+#include <thread>
 #include <limits>
 #include <unordered_map>
 
@@ -840,6 +843,108 @@ std::uint32_t IndexAuthority::trim_fstats(std::span<const std::uint32_t> ids) {
 void IndexAuthority::with_writer_lock(const std::function<void()>& fn) {
     std::scoped_lock lock(writer_mu_);
     fn();
+}
+
+// ---------------------------------------------------------------------------
+// S70：阈值落段的后台线程
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct BgFlush {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool requested = false;
+    bool busy = false;
+    bool stop = false;
+    std::uint64_t done = 0;
+    std::function<bool()> commit;
+    std::thread th;
+
+    void loop() {
+        std::unique_lock lk(mu);
+        while (true) {
+            cv.wait(lk, [&] { return requested || stop; });
+            if (stop) break;
+            requested = false;
+            busy = true;
+            lk.unlock();
+            const bool ok = commit();
+            lk.lock();
+            busy = false;
+            ++done;
+            cv.notify_all();
+            if (!ok && !stop) {
+                // 失败（IO 等）不立刻重试：写者每次写都会再请求，留一点间隔免得空转；
+                // 期间 memdelta 若涨到背压线，写者会改成同步落段（Cask::maybe_flush_oki）。
+                cv.wait_for(lk, std::chrono::milliseconds(50), [&] { return stop; });
+            }
+        }
+    }
+
+    void shutdown() {
+        {
+            std::lock_guard lk(mu);
+            stop = true;
+        }
+        cv.notify_all();
+        if (th.joinable()) th.join();
+    }
+};
+
+}  // namespace
+
+void IndexAuthority::start_background_flush(std::function<bool()> commit) {
+    if (bg_flush_) return;
+    // 线程等第一次请求时才起（request_background_flush）：没写到阈值的库
+    // （多数小库、只读多写少的库）不多占一条线程。
+    auto* raw = new BgFlush();
+    raw->commit = std::move(commit);
+    bg_flush_ = std::shared_ptr<void>(raw, [](void* p) {
+        auto* b = static_cast<BgFlush*>(p);
+        b->shutdown();
+        delete b;
+    });
+}
+
+bool IndexAuthority::request_background_flush() noexcept {
+    auto* b = static_cast<BgFlush*>(bg_flush_.get());
+    if (b == nullptr) return false;
+    {
+        std::lock_guard lk(b->mu);
+        if (b->stop) return false;
+        if (b->requested || b->busy) return true;   // 已在处理：不重复唤醒
+        if (!b->th.joinable()) {
+            // 首次请求：起线程（持 mu 起——与 shutdown 置 stop 互斥，不会漏 join）。
+            // 起不来（资源耗尽）⇒ 报 false，调用方当场同步落段。
+            try {
+                b->th = std::thread([b] { b->loop(); });
+            } catch (...) {
+                return false;
+            }
+        }
+        b->requested = true;
+    }
+    b->cv.notify_all();
+    return true;
+}
+
+void IndexAuthority::stop_background_flush() noexcept {
+    bg_flush_.reset();  // 删除器：置 stop、等在途提交做完、join
+}
+
+std::uint64_t IndexAuthority::background_flushes() const noexcept {
+    auto* b = static_cast<BgFlush*>(bg_flush_.get());
+    if (b == nullptr) return 0;
+    std::lock_guard lk(b->mu);
+    return b->done;
+}
+
+void IndexAuthority::wait_background_flush_idle() noexcept {
+    auto* b = static_cast<BgFlush*>(bg_flush_.get());
+    if (b == nullptr) return;
+    std::unique_lock lk(b->mu);
+    b->cv.wait(lk, [&] { return (!b->requested && !b->busy) || b->stop; });
 }
 
 } // namespace bitcask::oki

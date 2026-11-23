@@ -10,6 +10,84 @@
 
 ---
 
+## 🟡 S70 · 写路径不再被 memdelta 落段与扩容挡住（2026-11-23 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-23-write-path-stalls-on-memdelta-flush-and-growth.md`](feedbacks/2026-11-23-write-path-stalls-on-memdelta-flush-and-growth.md)
+>（keelson：升 12.0.3 后量单条写边的长尾）。只编码不提交，版本未定。
+
+| 项 | 状态 |
+|---|---|
+| S70-1 后台落段线程：读写打开（非 merge_only）的库在 `Cask::open` 末尾经 `IndexAuthority::start_background_flush` 登记，线程等第一次请求才起（没写到阈值的库不多占线程；`ThreadLimitsTest` 数开库新增线程，就是它提醒的），跑 `commit_oki_cut`；`maybe_flush_oki*` 越过阈值时只发请求（`request_background_flush`）就返回。背压：memdelta 涨到阈值的 2 倍（行数或字节）仍没落下去时，写者退回同步落段，内存有界。`close()` 先 `stop_background_flush`（等在途的那次做完）再拆资源。状态挂在 `IndexAuthority` 末尾新增的 `bg_flush_`（`shared_ptr<void>`，追加成员，前面的布局不动） | ✅ |
+| S70-2 `commit_oki_cut`：截面在写闸内只取水位，active 文件的 fsync 挪到闸外（`collect_snapshot_watermarks(&defer)`）；fsync 失败时水位钳回已持久处，「run 不引用未持久字节」不变 | ✅ |
+| S70-3 落段拷贝分块：每 4096 行单独持一次 `mu_`，块间歇一下（`sleep_for(1µs)`，实为定时器精度约 50 µs）——只 `yield` 时 std::mutex 不公平，等锁的写者整段拷贝期间都拿不到（实测一次 11 ms） | ✅ |
+| S70-4 `drop_active_through` 两段式：锁外分块拷后缀、给新数组建好点查索引，剩不到一块时才在锁内搬零头并整体交换；旧数组与旧索引在锁外析构。此前锁内搬 7 万行 + 重建索引挡写者约 4 ms，更早逐行判断整份数组几十毫秒 | ✅ |
+| S70-5 扩容：FlatIdx 改增量 rehash（新旧两张表，每次插入顺带搬 16 个槽）；行数组到 65536 行时一次预留到 `kFlushRowLimit × 5/4`，不再逐级翻倍搬迁 | ✅ |
+| S70-6 回归 `OkiRecoveryTest.S70*`：越阈值后由后台线程落段且数据完整、重开一致；4 写者 + 2 读者在后台落段期间并发，读到的只会是写过的版本、最终全是最新版本（TSan 也跑）；后台落段进行中 close | ✅ |
+
+**落地记录**：
+- 测法：单写者 150 万次单条原子写（300 B 值，10 万 key 空间，`bitcask_put_batch_atomic_cond`），每次计时，>1 ms 记一次停顿。
+  12.1.0：最大 **153 ms**，停顿合计占总时长 11.5%；现在：最大 **1.2～2.2 ms**，占 0.1～0.2%；p50 1.44 µs、p99 约 3 µs 不变。
+- 排查过程里排除掉的：截面与 fsync 本身（0.03～0.08 ms）；在 fsync 前先 `sync_file_range` 写回大段（试过，没有可测的收益，已撤回）。
+  最后两处是靠给后台线程每步打时间戳、在写者卡住时取主线程栈（卡在 `OkiState::locate` 拿 `mu_`）定位的。
+- 剩下的 >1 ms 主要是第 65536 次写时行数组一次预留（拷 6.5 万行），每个库一生一次。
+- ABI：`IndexAuthority` 末尾追加成员 + 新增成员函数；`OkiState` / `DataFile` / `Cask` 布局不动。
+- 验证：见 CHANGELOG 同节。
+
+---
+
+## 🟢 S71 · keydir 扫描走映射读；range 预取自适应（2026-11-23 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md`](feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md)
+>（keelson：clj-bitcask `scan-entries` 每行 1 µs）。只编码不提交，版本未定。
+
+| 项 | 状态 |
+|---|---|
+| S71-1 `CaskIter::next` 取值先走 `DataFile::read_mmap`（与点查 `read_doc` 同一条路径），界外 / 无映射才退回 `pread`；映射读不出完整记录报 `kBadCrc` 同点查 | ✅ |
+| S71-2 `CaskIter::pin_files` 钉住的封口文件带映射打开（此前 `mmap_enabled = false`，重开后的扫描全走 `pread`），并 `advise_normal` 恢复缺省预读（扫描大体按文件顺序取值，冷缓存靠预读）。新增 `io::MappedFile::advise_normal` / `DataFile::advise_normal`（Windows 无操作） | ✅ |
+| S71-3 range 预取：`prefetch_threads = 0`（缺省，自动）时每批先串行取 32 条计时，估算并行省下的时间盖不过起线程的成本就整批串行；显式给线程数照给的并行（测试的并行分支靠它覆盖） | ✅ |
+| S71-4 每条两次分配（反馈建议 3）：要新的批接口 / 视图版本，未做，留给下游提需求 | ⏸ |
+
+**落地记录**（反馈附的程序，20 万 key，200 B 值，热缓存，每行 ns；前者 12.1.0，后者现在）：
+
+| 场景 | keydir 扫描 | range（不预取） | range（prefetch 256） |
+|---|---|---|---|
+| 按 key 顺序写入，刚写完 | 949 → **214** | 350 → 320 | 650 → 350 |
+| 按 key 顺序写入，重开后 | 960 → **258** | 570 → 570 | 914 → 635 |
+| 乱序写入，刚写完 | 1230 → **370** | 640 → 635 | 865 → 725 |
+| 乱序写入，重开后 | 1214～1432 → **436** | 800～850 → 793 | 930～1124 → 865 |
+
+- 扫描现在比 range 快：扫描直接用归并视图里的位置，range 每个 key 再走一遍点查定位（重开后要查 run）。
+- 预取在热缓存下还比不开慢 5～15%，剩下的是攒批本身（归并出 key 串、槽位数组）的开销；冷缓存没测（.13 上清不了页缓存）。
+- 验证：见 CHANGELOG 同节。
+
+---
+
+## 🔴 S69 · 原子批删除：写出的字节与批头区间一致；读端认得旧写端多算的批（2026-11-23 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-23-atomic-batch-remove-span-overcounts-tombstone-shadow.md`](feedbacks/2026-11-23-atomic-batch-remove-span-overcounts-tombstone-shadow.md)
+>（bitcask：Cypher 写语句基准里删顶点后重开报 `bad_crc`）。只编码不提交，版本未定。S68 是掉电故障注入的设计稿编号。
+
+| 项 | 状态 |
+|---|---|
+| S69-1 写端：`put_batch_atomic` 的删除成员写出 ①b 准备好的值（tombstone v2 的 4 字节 shadow，或空），与 `span_bytes` 一致，也与单条 `remove` 写出的 tombstone 同形（`cask.cpp` ④） | ✅ |
+| S69-2 读端兼容：`format::legacy_batch_closes` 判定「Count 条成员已读满、离声明的区间末尾还剩 4 × j 字节、j ≤ 空值 tombstone 成员数」= ≤ 12.1.0 写端写出的已提交批，按实际字节收口；`DataFile::fold` 在批头区间越过文件尾不超过 4 × count 时先读成员再判；成员读满却对不上账（不是这种规律）照旧按不完整处理 | ✅ |
+| S69-3 `fold_committed` 放行暂存成员用同一规则 | ✅ |
+| S69-4 回归 `AtomicBatchTest.S69*`：判定规则；新写端 span 与成员字节一致、删除写出 shadow、删 OKI 重开删除生效且文件不变；手工构造的旧写端批（含文件末尾越界 4 字节的那个、混有不多算的空值 tombstone）由 `fold_committed`（不跳坏区）读到文件尾、Cask 重开删除生效；多出来的字节无法归因时成员不可见 | ✅ |
+| S69-5 反馈回填、CHANGELOG `[Unreleased]` | ✅ |
+
+**落地记录**：
+- 根因：`put_batch_atomic` ①b 把带 shadow 的删除成员按 `kHeaderSize + key + 4` 计入 `span_bytes`，④ 写成员时删除一律写空值。自 S35（原子批）、
+  tombstone v2 起就如此；bitcask 的 `tombstone_version` 缺省 2，图层删边 / 删顶点、`bitcask_txn` 提交里的 `delete` 都会写出这种批。
+  恢复时：12.0.3 及更早把批当 torn tail 截断文件（删除与其后同一文件的写静默丢失）；12.1.0（S67）当坏区跳过，同一文件多于 64 处返回 `kBadCrc`。
+- 端到端（bitcask 侧隔离副本，索引模式，2000 篇文档 + 280 个单删除原子批 + 1 条普通写）：12.1.0 写出的库 12.1.0 重开 `bad_crc`；修复后的构建打开同一个库：
+  存活 1720（应为 1720）逐个一致、最后那条普通写在、全文命中 1720、文件大小不变。修复后写出的库，12.1.0 也能正常打开（批头与字节一致，旧读端照认）——
+  盘上格式双向兼容。
+- 读端放宽的边界：只认「成员条数读满 + 余量恰为 4 的倍数 + 不超过空值 tombstone 数」，别的账对不上照旧判不完整（有用例）。批内有被
+  `tolerate_crc_errors` 跳过的坏记录时 `fold_committed` 数不到它，这种「旧批 + 位腐」的双重故障下批成员不放行。
+- 验证：见 CHANGELOG 同节。
+
+---
+
 ## 🔴 S67 · 恢复不再截断已封口的数据；带过滤的向量检索回满 + 候选集内排序（2026-11-23 立项）
 
 > 来源：下游反馈

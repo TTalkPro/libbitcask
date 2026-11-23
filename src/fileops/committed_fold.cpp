@@ -24,6 +24,8 @@ fold_committed_once(DataFile& df, const CommittedRecordFn& on_record,
     };
     std::vector<Staged> staged;
     std::uint64_t batch_end = 0;  // 0 = 未处于批区间
+    std::uint32_t batch_count = 0;
+    std::uint32_t empty_tombs = 0;  // S69：认旧写端的批（format.hpp legacy_batch_closes）
     return df.fold(
         [&](const codec::DataRecordView& view, std::uint64_t offset,
             std::uint32_t total_size) {
@@ -32,6 +34,8 @@ fold_committed_once(DataFile& df, const CommittedRecordFn& on_record,
                 auto bh = codec::decode_batch_header_value(view.value);
                 if (!bh) return;
                 batch_end = offset + total_size + bh->span_bytes;
+                batch_count = bh->count;
+                empty_tombs = 0;
                 staged.clear();
                 if (on_batch_header) on_batch_header(view);
                 return;
@@ -47,7 +51,15 @@ fold_committed_once(DataFile& df, const CommittedRecordFn& on_record,
                 s.value.assign(view.value.begin(), view.value.end());
             }
             staged.push_back(std::move(s));
-            if (offset + total_size >= batch_end) {
+            if (view.type == format::RecordType::kTombstone && view.value.empty()) {
+                ++empty_tombs;
+            }
+            const std::uint64_t end = offset + total_size;
+            // fold 层已核过账：到达声明的末尾，或是 ≤ 12.1.0 写端多算了 shadow 的批。
+            if (end >= batch_end ||
+                format::legacy_batch_closes(batch_count,
+                                            static_cast<std::uint32_t>(staged.size()),
+                                            empty_tombs, batch_end - end)) {
                 // 区间收口 = 批已提交：依序放行。
                 for (const auto& r : staged) {
                     const codec::DataRecordView v{

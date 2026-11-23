@@ -9,6 +9,9 @@
 using bitcask::test::crash_exit;
 
 #include <algorithm>
+#include <thread>
+#include <atomic>
+#include <array>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -562,4 +565,142 @@ TEST_F(OkiRecoveryTest, RangeErrorSplitsNeverBuiltFromRebuildFailed) {
                   bitcask::CaskError::kIndexRebuildFailed);
         (*c)->close();
     }
+}
+
+// =============================================================================
+// S70（feedbacks/2026-11-23-write-path-stalls-on-memdelta-flush-and-growth.md）
+//
+// memdelta 到阈值时的落段改由后台线程完成，写者只发一个请求。阈值按字节算
+// （key 长 + 行结构，64 MiB）：用 2 KiB 长的 key，约 3.1 万行越线。
+// =============================================================================
+
+namespace {
+
+constexpr std::size_t kS70KeyLen = 2048;
+constexpr int kS70Rows = 36000;  // 越过 64 MiB 字节阈值（约 3.1 万行）
+
+std::string s70_key(int i) {
+    std::string k = "k" + std::to_string(i) + ":";
+    k.resize(kS70KeyLen, 'x');
+    return k;
+}
+
+std::string s70_get(Cask& c, const std::string& k) {
+    auto r = c.get_owned(bytes(k));
+    if (!r) return "<" + std::string(r.error().kind == bitcask::CaskError::kNotFound ? "missing" : "error") + ">";
+    return {reinterpret_cast<const char*>(r->value.data()), r->value.size()};
+}
+
+}  // namespace
+
+TEST_F(OkiRecoveryTest, S70ThresholdFlushRunsInBackground) {
+    CaskOptions o;
+    o.read_write = true;
+    {
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        ASSERT_TRUE(c);
+        auto& auth = (*c)->index_authority();
+        EXPECT_EQ(auth.background_flushes(), 0u);
+        for (int i = 0; i < kS70Rows; ++i) {
+            ASSERT_TRUE((*c)->put(bytes(s70_key(i)), bytes("v" + std::to_string(i))));
+        }
+        auth.wait_background_flush_idle();
+        EXPECT_GE(auth.background_flushes(), 1u) << "越过阈值后应由后台线程落段";
+        EXPECT_GE(auth.state().run_count(), 1u);
+        EXPECT_LT(auth.state().delta_rows(), static_cast<std::size_t>(kS70Rows))
+            << "已落段的行应已离开 memdelta";
+        for (int i = 0; i < kS70Rows; i += 97) {
+            EXPECT_EQ(s70_get(**c, s70_key(i)), "v" + std::to_string(i)) << i;
+        }
+        (*c)->close();
+    }
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < kS70Rows; i += 97) {
+        EXPECT_EQ(s70_get(**c, s70_key(i)), "v" + std::to_string(i)) << i;
+    }
+    EXPECT_EQ(s70_get(**c, s70_key(kS70Rows - 1)), "v" + std::to_string(kS70Rows - 1));
+    (*c)->close();
+}
+
+// 后台落段期间多个写者、读者并发：读到的值只会是已经写过的版本，最终全部是最新版本；
+// 重开后一致。（TSan 下也跑。）
+TEST_F(OkiRecoveryTest, S70ConcurrentReadWriteDuringBackgroundFlush) {
+    CaskOptions o;
+    o.read_write = true;
+    constexpr int kWriters = 4;
+    constexpr int kPer = kS70Rows / kWriters;
+    {
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        ASSERT_TRUE(c);
+        Cask& cask = **c;
+        std::array<std::atomic<int>, kWriters> progress{};
+        std::atomic<bool> stop{false};
+        std::atomic<int> bad{0};
+        std::vector<std::thread> ths;
+        for (int w = 0; w < kWriters; ++w) {
+            ths.emplace_back([&, w] {
+                for (int i = 0; i < kPer; ++i) {
+                    const int id = w * kPer + i;
+                    if (!cask.put(bytes(s70_key(id)), bytes("a" + std::to_string(id)))) ++bad;
+                    if (i % 3 == 0 && !cask.put(bytes(s70_key(id)), bytes("b" + std::to_string(id)))) ++bad;
+                    progress[static_cast<std::size_t>(w)].store(i + 1, std::memory_order_release);
+                }
+            });
+        }
+        for (int r = 0; r < 2; ++r) {
+            ths.emplace_back([&, r] {
+                unsigned x = 12345u + static_cast<unsigned>(r);
+                while (!stop.load(std::memory_order_acquire)) {
+                    x = x * 1103515245u + 12345u;
+                    const int w = static_cast<int>(x % kWriters);
+                    const int done = progress[static_cast<std::size_t>(w)].load(std::memory_order_acquire);
+                    if (done == 0) continue;
+                    const int i = static_cast<int>((x >> 8) % static_cast<unsigned>(done));
+                    const int id = w * kPer + i;
+                    const std::string v = s70_get(cask, s70_key(id));
+                    if (v != "a" + std::to_string(id) && v != "b" + std::to_string(id)) ++bad;
+                }
+            });
+        }
+        for (int w = 0; w < kWriters; ++w) ths[static_cast<std::size_t>(w)].join();
+        stop.store(true, std::memory_order_release);
+        for (std::size_t t = kWriters; t < ths.size(); ++t) ths[t].join();
+        EXPECT_EQ(bad.load(), 0);
+        cask.index_authority().wait_background_flush_idle();
+        EXPECT_GE(cask.index_authority().background_flushes(), 1u);
+        for (int id = 0; id < kWriters * kPer; ++id) {
+            const std::string want = (id % kPer) % 3 == 0 ? "b" : "a";
+            ASSERT_EQ(s70_get(cask, s70_key(id)), want + std::to_string(id)) << id;
+        }
+        cask.close();
+    }
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    for (int id = 0; id < kWriters * kPer; id += 13) {
+        const std::string want = (id % kPer) % 3 == 0 ? "b" : "a";
+        EXPECT_EQ(s70_get(**c, s70_key(id)), want + std::to_string(id)) << id;
+    }
+    (*c)->close();
+}
+
+// 后台落段还在做的时候 close：close 等它做完再拆资源；重开数据完整。
+TEST_F(OkiRecoveryTest, S70CloseWhileBackgroundFlushRuns) {
+    CaskOptions o;
+    o.read_write = true;
+    {
+        auto c = Cask::open(dir_.string(), o, &test_registry());
+        ASSERT_TRUE(c);
+        for (int i = 0; i < kS70Rows; ++i) {
+            ASSERT_TRUE((*c)->put(bytes(s70_key(i)), bytes("v")));
+        }
+        (*c)->close();   // 不等后台线程空闲
+    }
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < kS70Rows; i += 101) {
+        EXPECT_EQ(s70_get(**c, s70_key(i)), "v") << i;
+    }
+    EXPECT_EQ(s70_get(**c, s70_key(kS70Rows - 1)), "v");
+    (*c)->close();
 }

@@ -8,6 +8,8 @@
 
 #include <bitcask/cask.hpp>
 #include <bitcask/codec.hpp>
+#include <bitcask/data_file.hpp>
+#include <bitcask/detail/committed_fold.hpp>
 #include <bitcask/format.hpp>
 #include <bitcask/index_registry.hpp>
 #include <bitcask/meta_file.hpp>
@@ -372,6 +374,235 @@ TEST_F(AtomicBatchTest, RecordsAfterCommittedBatchRecover) {
     EXPECT_EQ(get_str(*c, "b1"), "v1");
     EXPECT_EQ(get_str(*c, "after"), "va");
     EXPECT_TRUE(missing(*c, "nonexistent"));
+    c->close();
+}
+
+
+// =============================================================================
+// S69（feedbacks/2026-11-23-atomic-batch-remove-span-overcounts-tombstone-shadow.md）
+//
+// ≤ 12.1.0：原子批里删除存在的 key（tombstone v2）时 span_bytes 计入了 4 字节
+// shadow，成员却写空值——批头声明的区间多 4 字节，恢复时整批被判为不完整。
+// 现在：写端写出 shadow（与 span 一致）；读端认得旧写端写出的这种批。
+// =============================================================================
+
+namespace s69 {
+
+struct Rec {
+    bitcask::format::RecordType type;
+    std::uint64_t offset;
+    std::uint32_t total;
+    std::size_t value_size;
+    std::string key;
+    std::uint64_t span;  // 批头才有
+};
+
+std::vector<Rec> walk(const fs::path& data) {
+    std::vector<Rec> out;
+    auto df = bitcask::fileops::DataFile::open(
+        data.string(), bitcask::fileops::DataFile::Mode::kRead, false, false);
+    EXPECT_TRUE(df.has_value());
+    if (!df) return out;
+    auto r = df->fold([&](const bitcask::codec::DataRecordView& v, std::uint64_t off,
+                          std::uint32_t total) {
+        std::uint64_t span = 0;
+        if (v.type == bitcask::format::RecordType::kBatchHeader) {
+            auto bh = bitcask::codec::decode_batch_header_value(v.value);
+            EXPECT_TRUE(bh.has_value());
+            if (bh) span = bh->span_bytes;
+        }
+        out.push_back({v.type, off, total, v.value.size(),
+                       std::string(reinterpret_cast<const char*>(v.key.data()), v.key.size()),
+                       span});
+    });
+    EXPECT_TRUE(r.has_value());
+    return out;
+}
+
+std::vector<std::byte> doc_value(std::string_view text) {
+    std::vector<std::byte> out;
+    bitcask::codec::DocValueParts parts;
+    parts.text = bytes(text);
+    bitcask::codec::encode_doc_value(out, parts);
+    return out;
+}
+
+std::vector<std::byte> header_value(std::uint32_t count, std::uint64_t span) {
+    std::vector<std::byte> out;
+    bitcask::codec::encode_batch_header_value(out, {.count = count, .span_bytes = span});
+    return out;
+}
+
+std::uint64_t rec_size(std::string_view key, std::size_t value_size) {
+    return bitcask::format::kHeaderSize + key.size() + value_size;
+}
+
+}  // namespace s69
+
+TEST_F(AtomicBatchTest, S69LegacyBatchClosesRule) {
+    using bitcask::format::legacy_batch_closes;
+    EXPECT_TRUE(legacy_batch_closes(1, 1, 1, 4));
+    EXPECT_TRUE(legacy_batch_closes(3, 3, 2, 4));
+    EXPECT_TRUE(legacy_batch_closes(3, 3, 2, 8));
+    EXPECT_FALSE(legacy_batch_closes(3, 3, 2, 12));  // 多于空值 tombstone 的条数
+    EXPECT_FALSE(legacy_batch_closes(3, 2, 2, 4));   // 成员没读满
+    EXPECT_FALSE(legacy_batch_closes(1, 1, 1, 3));   // 不是 4 的倍数
+    EXPECT_FALSE(legacy_batch_closes(1, 1, 0, 4));   // 没有空值 tombstone
+    EXPECT_FALSE(legacy_batch_closes(1, 1, 1, 0));   // 正好对上：走正常收口
+}
+
+// 写端：删除存在的 key 写出 4 字节 shadow，批头 span 与成员字节一致；删 OKI 重开
+// （从 data 全量重建）后删除仍生效、文件不被截断。
+TEST_F(AtomicBatchTest, S69RemoveOfExistingKeyWritesShadowAndMatchingSpan) {
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.tombstone_version = 2;
+    {
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        for (const char* k : {"a", "b", "c"}) ASSERT_TRUE((*c)->put(bytes(k), bytes("v")));
+        ASSERT_TRUE((*c)->put_batch_atomic(std::vector<Cask::BatchOp>{remove_op("a")}));
+        ASSERT_TRUE((*c)->put_batch_atomic(
+            std::vector<Cask::BatchOp>{put_op("d", "vd"), remove_op("b"), remove_op("absent")}));
+        ASSERT_TRUE((*c)->put(bytes("after"), bytes("x")));
+        (*c)->close();
+    }
+    const auto data = max_data_file();
+    const auto recs = s69::walk(data);
+    int headers = 0;
+    for (std::size_t i = 0; i < recs.size(); ++i) {
+        if (recs[i].type != bitcask::format::RecordType::kBatchHeader) continue;
+        ++headers;
+        std::uint64_t members = 0;
+        std::size_t j = i + 1;
+        while (j < recs.size() && recs[j].offset < recs[i].offset + recs[i].total + recs[i].span) {
+            members += recs[j].total;
+            ++j;
+        }
+        EXPECT_EQ(members, recs[i].span) << "batch at " << recs[i].offset;
+    }
+    EXPECT_EQ(headers, 2);
+    for (const auto& r : recs) {
+        if (r.type != bitcask::format::RecordType::kTombstone) continue;
+        if (r.key == "a" || r.key == "b") {
+            EXPECT_EQ(r.value_size, 4u) << r.key;   // shadow
+        }
+        if (r.key == "absent") {
+            EXPECT_EQ(r.value_size, 0u);            // 原本不存在：无 shadow
+        }
+    }
+    const auto size_before = fs::file_size(data);
+    drop_derived();
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c) << c.error().detail;
+    EXPECT_TRUE(missing(**c, "a"));
+    EXPECT_TRUE(missing(**c, "b"));
+    EXPECT_EQ(get_str(**c, "c"), "v");
+    EXPECT_EQ(get_str(**c, "d"), "vd");
+    EXPECT_EQ(get_str(**c, "after"), "x");
+    EXPECT_EQ(fs::file_size(data), size_before);
+    (*c)->close();
+}
+
+// 读端：≤ 12.1.0 写端写出的批（声明区间多算 4 × j 字节，j ≤ 空值 tombstone 数），
+// 包括文件末尾那一个，都按已提交处理；不截断、不当坏区跳过。
+TEST_F(AtomicBatchTest, S69LegacyOvercountedRemoveBatchRecovers) {
+    using bitcask::format::RecordType;
+    {
+        auto c = open_rw();
+        ASSERT_TRUE(c);
+        for (const char* k : {"a", "b", "c", "d", "e"}) ASSERT_TRUE(c->put(bytes(k), bytes("v")));
+        c->close();
+    }
+    const auto data = max_data_file();
+    {
+        auto f = bitcask::fileops::DataFile::open(data.string(),
+                                                  bitcask::fileops::DataFile::Mode::kAppend);
+        ASSERT_TRUE(f);
+        std::uint64_t ord = 1000000;
+        const auto none = std::span<const std::byte>{};
+        auto w = [&](RecordType t, std::string_view k, std::span<const std::byte> v) {
+            ASSERT_TRUE(f->write(t, 1, ord++, bytes(k), v));
+        };
+        // B1：只删 a（旧写端：span 多算 4）
+        auto h1 = s69::header_value(1, s69::rec_size("a", 4));
+        w(RecordType::kBatchHeader, "", h1);
+        w(RecordType::kTombstone, "a", none);
+        // B2：put g + 删 b（多算 4）+ 删一个原本不存在的 key（不多算）
+        const auto gv = s69::doc_value("vg");
+        auto h2 = s69::header_value(3, s69::rec_size("g", gv.size()) + s69::rec_size("b", 4) +
+                                           s69::rec_size("zz", 0));
+        w(RecordType::kBatchHeader, "", h2);
+        w(RecordType::kDoc, "g", gv);
+        w(RecordType::kTombstone, "b", none);
+        w(RecordType::kTombstone, "zz", none);
+        // 批之后的普通写
+        const auto hv = s69::doc_value("vh");
+        w(RecordType::kDoc, "h", hv);
+        // B3：文件最后一个批，声明的区间越过文件尾 4 字节
+        auto h3 = s69::header_value(1, s69::rec_size("c", 4));
+        w(RecordType::kBatchHeader, "", h3);
+        w(RecordType::kTombstone, "c", none);
+        ASSERT_TRUE(f->sync());
+    }
+    const auto size_before = fs::file_size(data);
+    // fold_committed 不靠「跳坏区」也读到文件尾、放行全部批成员
+    {
+        auto df = bitcask::fileops::DataFile::open(
+            data.string(), bitcask::fileops::DataFile::Mode::kRead, false, false);
+        ASSERT_TRUE(df);
+        std::vector<std::string> keys;
+        std::uint64_t lve = 0;
+        bitcask::fileops::CommittedFoldOptions fo;
+        fo.out_last_valid_end = &lve;
+        fo.heal_gaps = false;
+        auto r = bitcask::fileops::fold_committed(
+            *df,
+            [&](const bitcask::codec::DataRecordView& v, std::uint64_t, std::uint32_t) {
+                keys.emplace_back(reinterpret_cast<const char*>(v.key.data()), v.key.size());
+            },
+            {}, fo);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(lve, size_before);
+        EXPECT_EQ(keys, (std::vector<std::string>{"a", "b", "c", "d", "e", "a", "g", "b", "zz", "h", "c"}));
+    }
+    drop_derived();
+    auto c = open_rw();
+    ASSERT_TRUE(c);
+    for (const char* k : {"a", "b", "c", "zz"}) EXPECT_TRUE(missing(*c, k)) << k;
+    EXPECT_EQ(get_str(*c, "d"), "v");
+    EXPECT_EQ(get_str(*c, "e"), "v");
+    EXPECT_EQ(get_str(*c, "g"), "vg");
+    EXPECT_EQ(get_str(*c, "h"), "vh");
+    EXPECT_EQ(fs::file_size(data), size_before);
+    c->close();
+}
+
+// 多出来的字节不符合旧写端的规律（没有空值 tombstone 可归因）：仍是不完整的批，成员不可见。
+TEST_F(AtomicBatchTest, S69OvercountWithoutEmptyTombstoneStaysIncomplete) {
+    using bitcask::format::RecordType;
+    {
+        auto c = open_rw();
+        ASSERT_TRUE(c);
+        ASSERT_TRUE(c->put(bytes("a"), bytes("v")));
+        c->close();
+    }
+    const auto data = max_data_file();
+    {
+        auto f = bitcask::fileops::DataFile::open(data.string(),
+                                                  bitcask::fileops::DataFile::Mode::kAppend);
+        ASSERT_TRUE(f);
+        const auto xv = s69::doc_value("vx");
+        auto h = s69::header_value(1, s69::rec_size("x", xv.size()) + 4);
+        ASSERT_TRUE(f->write(RecordType::kBatchHeader, 1, 1000000, {}, h));
+        ASSERT_TRUE(f->write(RecordType::kDoc, 1, 1000001, bytes("x"), xv));
+        ASSERT_TRUE(f->sync());
+    }
+    drop_derived();
+    auto c = open_rw();
+    ASSERT_TRUE(c);
+    EXPECT_EQ(get_str(*c, "a"), "v");
+    EXPECT_TRUE(missing(*c, "x"));
     c->close();
 }
 

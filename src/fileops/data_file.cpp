@@ -359,6 +359,33 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
     // 写打开恢复按既有语义截断。区间内单条 CRC 腐蚀走 tolerate 跳过（位
     // 腐蚀逐条降级，与全引擎一致——原子性只承诺崩溃故障）。
     std::uint64_t batch_until = 0;
+    // S69：当前批声明的成员条数、已读到的成员数、其中空值 tombstone 的条数——
+    // 用来认出 ≤ 12.1.0 写端多算了 shadow 字节的已提交批（format.hpp
+    // legacy_batch_closes）。
+    std::uint32_t batch_count = 0;
+    std::uint32_t batch_members = 0;
+    std::uint32_t batch_empty_tombs = 0;
+    const auto close_batch = [&] {
+        batch_until = 0;
+        batch_count = batch_members = batch_empty_tombs = 0;
+        if (out_last_valid_end) *out_last_valid_end = offset;
+    };
+    // 成员读完后收口：到达声明的末尾；或是旧写端的批（剩余字节恰为多算的 shadow）。
+    // 返回 false = 区间账坏（越界），调用方 break。
+    const auto member_done = [&]() -> bool {
+        if (batch_until == 0) return true;
+        if (offset >= batch_until) {
+            if (offset > batch_until) return false;
+            close_batch();
+            return true;
+        }
+        if (format::legacy_batch_closes(batch_count, batch_members, batch_empty_tombs,
+                                        batch_until - offset)) {
+            close_batch();
+            return true;
+        }
+        return batch_members < batch_count;   // 成员已读满却没对上账：坏
+    };
 
     // S13-P6：流式 chunked pread——原实现每条 record 2 次 pread（header 23B
     // + 整条 body），百万条即两百万次 syscall；现 256 KiB 一块 + 跨 record
@@ -413,10 +440,9 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
                 offset += rec_total;
                 rd.consume(rec_total);
                 // S35：跳过的坏记录也参与区间收口（区间是纯字节账）。
-                if (batch_until != 0 && offset >= batch_until) {
-                    if (offset > batch_until) break;  // 跨界 = 区间账坏
-                    batch_until = 0;
-                    if (out_last_valid_end) *out_last_valid_end = offset;
+                if (batch_until != 0) {
+                    ++batch_members;
+                    if (!member_done()) break;  // 跨界 = 区间账坏
                 }
                 continue;
             }
@@ -427,24 +453,34 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
                     return std::unexpected(DataFileFault{DataFileError::kShortRead});
             }
         }
-        if (rec->type == format::RecordType::kBatchHeader) {
+        const bool is_header = rec->type == format::RecordType::kBatchHeader;
+        if (is_header) {
             if (batch_until != 0) break;  // 嵌套批头 = 损坏，整批不可见
             auto bh = codec::decode_batch_header_value(rec->value);
             if (!bh) break;  // 批头 value 畸形：torn 语义
             const std::uint64_t until = offset + rec_total + bh->span_bytes;
-            if (until > total) break;  // 区间越 EOF：未提交，整批不可见
+            // 区间越 EOF：未提交，整批不可见。S69：旧写端最多多算 4 × count 字节，
+            // 越界不超过这个数时先读成员，读满 count 条再按实际字节判（见 member_done）。
+            if (until > total &&
+                until - total > format::kLegacyTombShadowBytes * bh->count) {
+                break;
+            }
             batch_until = until;
+            batch_count = bh->count;
+            batch_members = batch_empty_tombs = 0;
+        } else if (batch_until != 0) {
+            ++batch_members;
+            if (rec->type == format::RecordType::kTombstone && rec->value.empty()) {
+                ++batch_empty_tombs;
+            }
         }
         fn(*rec, offset, rec_total);
         offset += rec_total;
         rd.consume(rec_total);
         if (batch_until != 0) {
-            if (offset >= batch_until) {
-                if (offset > batch_until) break;  // 记录跨区间边界 = 账坏
-                batch_until = 0;
-                if (out_last_valid_end) *out_last_valid_end = offset;
-            }
-            // 区间未收口：不推进 lve
+            // 批头本身不算成员；成员读完后收口（到达区间末尾或认出旧写端的批），
+            // 区间未收口时不推进 lve
+            if (!is_header && !member_done()) break;  // 记录跨区间边界 = 账坏
         } else if (out_last_valid_end) {
             *out_last_valid_end = offset;
         }

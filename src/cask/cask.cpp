@@ -385,6 +385,12 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
     // 从零起算会导致老库首个 roll 必触发一次全量 ckpt）。
     cask->last_ckpt_ord_.store(cask->authority_->peek_next_ord(),
                                std::memory_order_relaxed);
+    // S70：memdelta 到阈值的落段交给后台线程（见 maybe_flush_oki）。close 在拆
+    // 任何资源之前先停它。
+    if (cask->opts_.read_write && !cask->opts_.merge_only) {
+        auto* c = cask.get();
+        cask->authority_->start_background_flush([c] { return c->commit_oki_cut(); });
+    }
     return cask;
 }
 
@@ -850,6 +856,9 @@ void Cask::close() noexcept {
                 nap * 2, std::chrono::milliseconds(10));
         }
     }
+    // S70：先停后台落段线程（等在途的那次提交做完）——它调 commit_oki_cut，用到
+    // 下面要拆的 active_data_ / authority_。之后 close 自己的提交照常同步进行。
+    if (authority_) authority_->stop_background_flush();
     // close 内部步骤（save_ckpt/snapshot 的 vector 操作）可能抛 bad_alloc；
     // noexcept 函数抛出 → std::terminate。整个 body 包 try/catch 兜底：吞掉
     // 异常让后续资源释放仍能执行，优于进程硬死。错误可见性靠 index_errors_
@@ -968,6 +977,12 @@ void Cask::close() noexcept {
 // keydir 幂等覆盖。
 std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>>
 Cask::collect_snapshot_watermarks() const noexcept {
+    return collect_snapshot_watermarks(nullptr);
+}
+
+std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>>
+Cask::collect_snapshot_watermarks(
+    std::pair<std::uint32_t, std::uint64_t>* defer_active) const noexcept {
     if (!authority_) return std::nullopt;
     auto entries = fileops::scan_dir(dirname_);
     if (!entries) return std::nullopt;
@@ -1005,8 +1020,13 @@ Cask::collect_snapshot_watermarks() const noexcept {
         // 回，方向安全）。
         std::uint64_t wm = sz;
         if (adf && e.data_path == adf->path()) {
-            (void)adf->sync_fd_only(sz);  // best-effort；失败退持久旧值
-            wm = std::min<std::uint64_t>(sz, adf->durable_bytes());
+            if (defer_active != nullptr) {
+                // S70：调用方在闸门外同步到 sz 之后再用这个水位
+                *defer_active = {static_cast<std::uint32_t>(e.tstamp), sz};
+            } else {
+                (void)adf->sync_fd_only(sz);  // best-effort；失败退持久旧值
+                wm = std::min<std::uint64_t>(sz, adf->durable_bytes());
+            }
         }
         wms.emplace_back(static_cast<std::uint32_t>(e.tstamp), wm);
     }
@@ -1025,9 +1045,30 @@ std::uint64_t Cask::active_durable_bytes() const noexcept {
 // 都会让崩溃重放漏记账或重复记账。
 bool Cask::commit_oki_cut() noexcept {
     if (!authority_ || !authority_->state().loaded()) return false;
+    // S70：活跃文件的 fdatasync 挪到写序闸门（writer_mu_）之外。闸门内只记下它此刻
+    // 的大小作水位；出闸门后同步到这个大小，之后才写 run 与 manifest——仍满足
+    //「run 不引用未持久字节」（S36-5 B1）。此前同步在闸门内做：落段时活跃文件里
+    // 有约 64 MiB 未同步的数据，文件长度也变了，fdatasync 连同日志提交挡全部写者
+    // 约 10 ms（feedbacks/2026-11-23-write-path-stalls-on-memdelta-flush-and-growth.md）。
+    std::pair<std::uint32_t, std::uint64_t> active{0, 0};
+    std::shared_ptr<fileops::DataFile> adf;
+    {
+        std::shared_lock lk(read_cache_mu_);
+        adf = active_data_;
+    }
     auto cut = authority_->capture_commit_cut(
-        [this] { return collect_snapshot_watermarks(); });
+        [this, &active] { return collect_snapshot_watermarks(&active); });
     if (!cut) return false;
+    if (active.first != 0 && adf) {
+        for (auto& [fid, wm] : cut->second) {
+            if (fid != active.first) continue;
+            if (adf->durable_bytes() < wm && !adf->sync_fd_only(wm)) {
+                // 同步失败：水位退回已知持久的字节；引用了更后面字节的行会让这次
+                // 落段放弃（OkiState::flush 的持久性检查），下次重试
+                wm = std::min<std::uint64_t>(wm, adf->durable_bytes());
+            }
+        }
+    }
     return authority_->state().flush(dirname_, cut->second,
                                      std::move(cut->first));
 }
@@ -1075,10 +1116,20 @@ void Cask::drain_retired_files() noexcept {
     }
 }
 
-// S33-4：写路径阈值 flush——memdelta 超限（1M 行 / 64MiB）时同步落 run，
-// 防长时间不 ckpt 的写负载把 memdelta 撑爆。**前置：write_mu_ 已持有**
-// （写者线程内联执行，代价有界且罕见）；与 checkpoint 侧 flush 由
-// OkiState 内部 flush_mu_ 互斥。
+// S70：后台落段跟不上（memdelta 已到阈值的两倍）→ 写者自己同步落段。
+static bool oki_flush_backpressure(const oki::OkiState& oki) {
+    return oki.delta_rows() >= 2 * oki::OkiState::kFlushRowLimit ||
+           oki.delta_bytes() >= 2 * oki::OkiState::kFlushByteLimit;
+}
+
+// S33-4：写路径阈值 flush——memdelta 超限（1M 行 / 64MiB）时落 run，防长时间
+// 不 ckpt 的写负载把 memdelta 撑爆。**前置：write_mu_ 已持有**；与 checkpoint
+// 侧 flush 由 OkiState 内部 flush_mu_ 互斥。
+// S70：常态下只把落段请求交给后台线程（IndexAuthority::request_background_flush）
+// 就返回——此前在写者线程里同步做，每次挡住全部写者 170～200 ms（300 B 值约每
+// 64.6 万次写一次；feedbacks/2026-11-23-write-path-stalls-on-memdelta-flush-and-
+// growth.md）。后台落段期间写者照常写；memdelta 涨到阈值的两倍（后台跟不上）时
+// 回到同步落段，作为背压（内存有界）。
 // S36-5 B1：flush 前先把 active fsync（写者线程，安全）——固化的 run 不
 // 得引用未持久字节；sync 后全部行持久，flush 免过滤。sync 失败放弃本轮
 // （delta 原状，下次重试）。
@@ -1086,6 +1137,7 @@ void Cask::maybe_flush_oki() noexcept {
     if (!authority_) return;  // S36-4：close 竞态（组提交尾可达）
     auto& oki = authority_->state();
     if (!oki.loaded() || !oki.should_flush()) return;
+    if (!oki_flush_backpressure(oki) && authority_->request_background_flush()) return;
     // 与其它提交点同一协议（切面内 fsync active）。原实现裸 flush 不带
     // 元数据与水位：run/wm 前进而 metadata 停在旧点，崩溃后 tail 行被当作
     //「已在 run」跳过记账，active_keys/fstats 永久少计。
@@ -1103,6 +1155,8 @@ void Cask::maybe_flush_oki_unlocked() noexcept {
     if (!authority_) return;
     auto& oki = authority_->state();
     if (!oki.loaded() || !oki.should_flush()) return;
+    // S70：常态只交给后台线程，不取 write_mu_；背压时才取锁同步落段。
+    if (!oki_flush_backpressure(oki) && authority_->request_background_flush()) return;
     std::lock_guard<std::mutex> wlk(write_mu_);
     if (is_closed()) return;
     maybe_flush_oki();
@@ -2807,10 +2861,14 @@ Cask::put_batch_atomic(std::span<const BatchOp> in_ops, std::uint64_t tstamp,
         og.ords.push_back(ord);
         og.done.push_back(0);
         const bool is_put = ops[i].type != BatchOp::Type::kRemove;
+        // S69：删除成员也写 ①b 准备好的值（tombstone v2 的 4 字节 shadow，或空）——
+        // 写出的字节必须与批头的 span_bytes 一致。此前删除一律写空值，带 shadow 的
+        // 删除让批头多算 4 字节，恢复时整批被判为不完整（12.0.3 截断文件，12.1.0
+        // 跳过、多于 64 处打不开）。与单条 remove 写出的 tombstone 同形。
         const std::span<const std::byte> val =
-            is_put ? std::span<const std::byte>(arena.data() + vals[i].off,
-                                                vals[i].len)
-                   : std::span<const std::byte>{};
+            vals[i].len == 0 ? std::span<const std::byte>{}
+                             : std::span<const std::byte>(arena.data() + vals[i].off,
+                                                          vals[i].len);
         auto w = active_data_->write_buffered(
             is_put ? format::RecordType::kDoc : format::RecordType::kTombstone,
             tstamp, ord, ops[i].key, val);

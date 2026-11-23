@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <thread>
 
@@ -165,6 +166,7 @@ std::expected<void, CaskFault> CaskRangeIter::fill_prefetch() {
 
     const std::size_t total = keys.size();
     std::size_t nthr = prefetch_threads_;
+    const bool adaptive = nthr == 0;  // S71：显式给了线程数就照办，不做试探
     if (nthr == 0) {
         nthr = std::min<std::size_t>(
             std::max<std::size_t>(std::thread::hardware_concurrency(), 1), 4);
@@ -195,9 +197,33 @@ std::expected<void, CaskFault> CaskRangeIter::fill_prefetch() {
         }
     };
 
+    // S71：先串行取一小段并计时，按实测单条成本决定剩下的要不要并行。取值走
+    // 映射读，页缓存热、值小时一条零点几微秒，一批 256 条串行不到 100 µs，
+    // 还不够起几个线程再汇合（每线程几十微秒）——此前固定并行，热缓存下比不开
+    // 预取还慢（feedbacks/2026-11-23-keydir-scan-…）。冷缓存 / 大值时单条要
+    // 等 IO，估算出的串行时间远超起线程成本，照旧并行。只在 prefetch_threads
+    // = 0（自动）时这样做；调用方显式给了线程数就按给的并行。
+    constexpr std::size_t kProbeKeys = 32;
+    constexpr double kThreadCostNs = 50'000.0;  // 起一个线程 + 汇合，偏保守
+    std::size_t begin = 0;
+    if (adaptive && nthr > 1) {
+        const std::size_t probe = std::min(total, kProbeKeys);
+        const auto t0 = std::chrono::steady_clock::now();
+        worker(0, probe);
+        const double per_key =
+            static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - t0).count()) /
+            static_cast<double>(probe);
+        begin = probe;
+        const double rest_ns = per_key * static_cast<double>(total - begin);
+        // 并行省下的时间 ≈ rest·(1 − 1/n)，要盖过 n 个线程的成本才划算
+        const double n = static_cast<double>(nthr);
+        if (total == begin || rest_ns * (1.0 - 1.0 / n) <= kThreadCostNs * n) nthr = 1;
+    }
     if (nthr <= 1) {
-        worker(0, total);
-    } else {
+        if (ok.load()) worker(begin, total);
+    } else if (ok.load()) {
+        const std::size_t rest = total - begin;
         // 与 Cask::parallel_scan 同款 RAII join guard：emplace_back 抛异常
         // （资源耗尽）时已创建的 joinable 线程被析构自动 join。
         struct JoiningPool {
@@ -207,9 +233,9 @@ std::expected<void, CaskFault> CaskRangeIter::fill_prefetch() {
             }
         } ws;
         ws.threads.reserve(nthr);
-        const std::size_t chunk = (total + nthr - 1) / nthr;
+        const std::size_t chunk = (rest + nthr - 1) / nthr;
         for (std::size_t t = 0; t < nthr; ++t) {
-            const std::size_t b = t * chunk;
+            const std::size_t b = begin + t * chunk;
             if (b >= total) break;
             ws.threads.emplace_back(worker, b, std::min(b + chunk, total));
         }

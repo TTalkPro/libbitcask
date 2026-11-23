@@ -182,6 +182,9 @@ public:
     // 只在 Linux / FreeBSD 上生效（Windows 的只读映射不能超过文件大小）；别的平台、
     // 32 位、只读句柄、已有映射时什么都不做。须在句柄交给读者之前调用。
     void enable_growing_map(std::uint64_t reserve_bytes) noexcept;
+    // S71：已有映射时恢复缺省预读（见 MappedFile::advise_normal）。keydir 扫描
+    // 钉住的句柄用：值大体按文件顺序读，冷缓存下要靠预读。
+    void advise_normal() noexcept { map_.advise_normal(); }
     [[nodiscard]] std::expected<codec::DataRecordView, DataFileFault>
     read_mmap(std::uint64_t offset, std::uint32_t total_size) const;
 

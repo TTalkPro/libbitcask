@@ -15,6 +15,47 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
+## [Unreleased]（S69：原子批删除的批头区间 + S70：写路径长尾 + S71：keydir 扫描提速）
+
+> **版本语义**：版本未定（S69 单独看是 PATCH；S70 / S71 有新增接口与行为变化，合起来建议 MINOR）。盘上格式不变（读端多认一种旧写端写错的批）；C API 不变；C++ ABI 只有追加（`IndexAuthority` 末尾成员与新成员函数、`MappedFile` / `DataFile` 新成员函数），已有布局不动。
+
+### Fixed
+
+- **原子批里删除存在的 key，恢复时整批被判为不完整**（S69，反馈
+  `feedbacks/2026-11-23-atomic-batch-remove-span-overcounts-tombstone-shadow.md`，bitcask）：`tombstone_version = 2` 时，删除成员的
+  4 字节 shadow 计入了批头的 `span_bytes`，写出的成员却是空值——批头声明的区间比实际多 4 字节。恢复 fold 这个文件时：12.0.3 及更早把批当成
+  没写完的尾巴截断文件（这次删除以及其后写进同一文件的全部记录静默丢失），12.1.0 当坏区跳过（删除不生效），同一文件多于 64 处时 `open`
+  返回 `kBadCrc`、库打不开。bitcask 的图层删边 / 删顶点与 `bitcask_txn` 的删除都会写出这种批。
+  - 写端：删除成员写出 shadow，与 `span_bytes`、与单条 `remove` 一致。
+  - 读端：认得旧写端写出的这种批（Count 条成员读满、余量恰为 4 × j 且 j 不超过空值 tombstone 成员数），按已提交处理——已有的库直接能开，
+    删除生效，文件不改。别的账对不上照旧按不完整处理。
+  - 修复后写出的文件，12.1.0 及更早的读端也能正常读（批头与字节一致）。
+  - ⚠️ 12.0.3 及更早已经从这种批处截断过的文件无法恢复（字节已被截掉）。
+
+### Changed
+
+- **写者不再被 memdelta 落段挡住**（S70，反馈 `feedbacks/2026-11-23-write-path-stalls-on-memdelta-flush-and-growth.md`，keelson）：
+  memdelta 到阈值（64 MiB / 1M 行）时此前在写者线程里同步落段，每次挡住全部写者 170～200 ms。现在读写打开的库有一条后台落段线程，
+  写者只发请求；memdelta 涨到阈值 2 倍还没落下去时写者才退回同步落段（内存有界）。后台落段本身也拆成短临界区：截面闸外 fsync、
+  分块拷贝（块间让写者拿锁）、落段后两段式摘掉已落行。memdelta 扩容不再整体搬迁：点查平表改增量 rehash，行数组一次预留到位。
+  单写者 150 万次单条写（300 B 值）：最大延迟 153 ms → 1.2～2.2 ms，停顿（>1 ms）占比 11.5% → 0.1～0.2%，p50 / p99 不变。
+  - 读写库第一次写到阈值时多起一条线程（`close()` 时停；没写到阈值的库不起）；`IndexAuthority` 新增 `start_background_flush` / `request_background_flush` /
+    `stop_background_flush` / `background_flushes` / `wait_background_flush_idle`，末尾追加一个成员。
+- **keydir 扫描取值走映射读**（S71，反馈 `feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md`，keelson）：
+  `CaskIter`（C API `bitcask_iter_*`）此前每行一次 `pread` 加两份拷贝，钉住的封口文件也不映射。现在与点查同一条读路径（映射读，界外退回
+  `pread`），钉住的文件带映射打开、恢复缺省预读。20 万 key、200 B 值、热缓存：每行 930～1430 ns → 214～436 ns，比 range 还快。
+- **range 预取自适应**（S71）：`RangeOptions::prefetch_threads = 0`（缺省）时每批先串行取 32 条计时，估算并行不划算（热缓存、小值）就整批
+  串行；显式给线程数照旧并行。热缓存下 `prefetch = 256` 从比不开慢 1.5～1.9 倍降到慢 5～15%。
+  新增 `io::MappedFile::advise_normal`、`DataFile::advise_normal`。
+
+### 验证
+
+GCC Release（`-Werror`）全量 ctest 986 注册 / 984 执行全绿；ASan 全量 984 全绿；TSan 相关 167 项全绿、无告警；clang Debug 相关 135 项全绿。
+端到端：bitcask 侧隔离副本（索引模式）打开 12.1.0 写出、12.1.0 自己打不开的库，删除生效、文件不变。
+S70 / S71 合入后：GCC Release（`-Werror`）全量 989 注册 / 987 执行全绿；ASan、clang Debug 全量 987 全绿；TSan 全量见 TASK S70。
+S70 新增回归 `OkiRecoveryTest.S70*`（3 项）。`HighlightColdTest.ReopenedLibraryHasNoSnippetsUnlessLoaded` 在机器有负载时偶发失败，
+HEAD（不含本节改动）在同样负载下同样会失败（4/60），与本节无关，未处理。Windows 未实测。
+
 ## [12.1.0] - 2026-11-23（S67：恢复不截断已封口的数据；带过滤的向量检索回满；候选集内向量排序 + S66：落盘后的点查提速）
 
 > **版本语义**：MINOR **12.1.0**（S67 新增公开入口 `Cask::rank_by_vector` / C API `bitcask_vector_rank`）。

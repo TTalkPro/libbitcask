@@ -1412,7 +1412,7 @@ typedef struct {
     bitcask_slice_t lo;               /* inclusive；空 = 从头 */
     bitcask_slice_t hi;               /* exclusive；空 = 到尾 */
     size_t          prefetch;         /* 0/1 = 关闭；>1 = 批量并发预取值 */
-    size_t          prefetch_threads; /* 0 = min(hardware_concurrency, 4) */
+    size_t          prefetch_threads; /* 0 = 自动（≤ min(hw, 4)，不划算时串行）；>0 = 固定 */
 } bitcask_range_options_t;
 
 typedef struct {
@@ -1441,7 +1441,7 @@ BITCASK_API void bitcask_range_entry_free(bitcask_range_entry_t* entry);
 
 - **一致性：per-key 弱一致**（与 `bitcask_parallel_scan` 同档）——迭代期间的并发写可能部分可见，**不是** `bitcask_iter_*` 的快照语义。
 - `opts == NULL` 等价「全域 + 无预取」；`opts` 指向的切片仅在 `bitcask_range_iter_start` 调用期间被引用（内部已拷贝边界），返回后调用方可释放。
-- `prefetch > 1`：一次归并出 `prefetch` 个 key 后并发取值。**只改变取值时机，输出序与内容不变**。收益形态是「大窗口 + 值不在页缓存」；小窗口/值已缓存时线程成本可能反超（实测数字见 `api-cpp.md` §6 的 `prefetch` 条）。
+- `prefetch > 1`：一次归并出 `prefetch` 个 key 后并发取值。**只改变取值时机，输出序与内容不变**。收益形态是「大窗口 + 值不在页缓存」；小窗口/值已缓存时线程成本可能反超——`prefetch_threads = 0`（缺省）时每批先串行试取 32 条计时，估算并行不划算就整批串行（S71），热缓存下与不开预取基本持平；显式给线程数则照给的并行（实测数字见 `api-cpp.md` §6 的 `prefetch` 条）。
 - 错误：`BITCASK_ERR_NO_INDEX` = merge-only 打开（本句柄不建读视图）——只读打开不会返回它：目录没有 OKI 时 open 期从 data 建一份内存读视图（不写盘），照常迭代；`BITCASK_ERR_INDEX_REBUILD_FAILED` = OKI 试建而败：读写打开时重建失败，或只读打开时建内存读视图失败（IO/环境问题，见日志；修复后重开可重试）；`BITCASK_ERR_BAD_CRC` = run 损坏；其余同 `bitcask_get`。
 - `next` 返回值 / `next_batch` 的错误路径所有权规则与 `bitcask_iter_next` / `_next_batch` **完全一致**（错误时实现已释放中途填充的条目）。
 - 生命周期：迭代器须在 `bitcask_close` 之前 release。

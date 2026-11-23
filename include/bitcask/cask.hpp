@@ -558,8 +558,10 @@ struct RangeOptions {
     // 语义不变量：预取只改变取值时机，**输出序与内容与惰性路径一致**
     // （仍是 per-key 弱一致——预取批内各 key 的取值时刻略早于出货时刻）。
     std::size_t prefetch = 0;
-    // 预取线程数；0 = min(hardware_concurrency, 4)。批内 key 数不足时按
-    // key 数收窄（不会为 1 个 key 起一堆线程）。
+    // 预取线程数；0 = 自动：至多 min(hardware_concurrency, 4)，且每批先串行
+    // 取 32 条计时，估算剩下的串行耗时盖不过起线程的成本（页缓存热、值小）
+    // 就整批串行（S71）。>0 = 按给的线程数并行。批内 key 数不足时按 key 数
+    // 收窄（不会为 1 个 key 起一堆线程）。
     std::size_t prefetch_threads = 0;
 
     // 下游反馈 2026-10-06 第 2、4 条（语义同 CaskIter::set_want_meta /
@@ -1603,6 +1605,10 @@ private:
     [[nodiscard]] std::optional<
         std::vector<std::pair<std::uint32_t, std::uint64_t>>>
     collect_snapshot_watermarks() const noexcept;
+    // S70：同上，但活跃文件不在这里 fdatasync——水位取它此刻的大小，(文件 id,
+    // 大小) 写进 *defer_active，由调用方在闸门外同步后再使用水位（commit_oki_cut）。
+    [[nodiscard]] std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>>
+    collect_snapshot_watermarks(std::pair<std::uint32_t, std::uint64_t>* defer_active) const noexcept;
 
 public:
     // 访问共享 IndexPool（借用自 registry）
