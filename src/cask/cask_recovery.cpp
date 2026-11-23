@@ -334,6 +334,13 @@ bool Cask::try_data_only_recovery(
         fopts.out_last_valid_end = &last_valid_end;
         fopts.start_offset = start;
         fopts.keep_batch_values = false;  // 只需 key / 位置
+        const bool unsealed = authority_->may_have_torn_tail(fid);
+        fopts.heal_gaps = !unsealed;  // S67：封口文件里的坏区跳过，不当尾巴
+        fopts.on_gap = [&](std::uint64_t from, std::uint64_t to) {
+            log_warn("recovery: corrupt region skipped in sealed data file " +
+                     e.data_path + " [" + std::to_string(from) + ", " +
+                     std::to_string(to) + ")");
+        };
         auto fr = fileops::fold_committed(
             *df,
             [&](const codec::DataRecordView& view, std::uint64_t offset,
@@ -376,7 +383,8 @@ bool Cask::try_data_only_recovery(
 
         // tail 的 torn write 语义与传统恢复一致：写打开且持锁时截掉尾部。
         // 这里一定不是 merge_only；RO 不截断，留给下一次可写 open。
-        if (opts_.read_write && last_valid_end < file_size) {
+        // S67：只截可能带尾巴的文件；封口文件末尾读不出记录的字节原样留着。
+        if (opts_.read_write && unsealed && last_valid_end < file_size) {
             auto wdf = fileops::DataFile::open(
                 e.data_path, fileops::DataFile::Mode::kAppend);
             if (wdf) (void)wdf->truncate_to(last_valid_end);
@@ -394,6 +402,31 @@ std::expected<void, CaskFault> Cask::load_authority_from_disk() {
     const bool search_on = text_ != nullptr;
     auto entries = fileops::scan_dir(dirname_);
     if (!entries) return std::unexpected(io_fault(entries.error().errnum, dirname_));
+
+    // S67：哪些 data 文件可能带「没写完的尾巴」。只有上一个写者没有正常关闭（留下了
+    // 陈旧写锁），或者别的进程里有写者活着（只读 / merge_only 打开时写锁文件还在），
+    // 才存在这样的文件：锁里记的活跃文件，外加 id 最大的那个（锁里的路径不保证持久，
+    // 可能还是上一个活跃文件）。其余文件——以及「没有任何写锁证据」时的全部文件——
+    // 都已封口：roll 与 close 在放手前都 fsync 过，里面不会有尾巴。
+    // 封口的文件里遇到坏区是损坏：跳过坏区接着读，**不截断**；此前无论哪个文件，
+    // 只要 fold 停在中间就把后面全部截掉（feedbacks/2026-11-23-recovery-truncates-
+    // synced-data-on-bad-record-header.md）。
+    {
+        const std::optional<std::uint32_t> evidence =
+            (opts_.read_write && !opts_.merge_only)
+                ? detail::take_stale_writer_evidence()
+                : detail::peek_live_writer_active(dirname_);
+        std::vector<std::uint32_t> unsealed;
+        if (evidence) {
+            if (*evidence != 0) unsealed.push_back(*evidence);
+            std::uint32_t max_id = 0;
+            for (const auto& e : *entries) {
+                max_id = std::max(max_id, static_cast<std::uint32_t>(e.tstamp));
+            }
+            if (max_id != 0 && max_id != *evidence) unsealed.push_back(max_id);
+        }
+        authority_->set_unsealed_files(std::move(unsealed));
+    }
 
     // S43-8：hint 从本版起只是历史加速缓存。可写普通句柄已持有
     // write.lock，这里惰性清掉所有旧产物（含无 data 配对的孤儿）；
@@ -489,6 +522,14 @@ std::expected<void, CaskFault> Cask::load_authority_from_disk() {
         fileops::CommittedFoldOptions fopts;
         fopts.out_last_valid_end = &last_valid_end;
         fopts.start_offset = fold_start;
+        const bool unsealed =
+            authority_->may_have_torn_tail(static_cast<std::uint32_t>(e.tstamp));
+        fopts.heal_gaps = !unsealed;  // S67
+        fopts.on_gap = [&](std::uint64_t from, std::uint64_t to) {
+            log_warn("recovery: corrupt region skipped in sealed data file " +
+                     e.data_path + " [" + std::to_string(from) + ", " +
+                     std::to_string(to) + ")");
+        };
         auto fr = fileops::fold_committed(*df, noop_rec, {}, fopts);
         if (!fr) {
             return std::unexpected(err(CaskError::kBadCrc, e.data_path));
@@ -502,7 +543,9 @@ std::expected<void, CaskFault> Cask::load_authority_from_disk() {
         // 把坏字节当成「合法死 record」算到 total_bytes 里。
         // merge_only 不能这么干：它没有 write.lock，万一别的 writer 还在
         // 同一个文件后面追写，这里 truncate 会切掉别人的数据。
-        if (opts_.read_write && !opts_.merge_only &&
+        // S67：只截可能带尾巴的文件（上一个写者崩溃时正在写的那个）。封口文件
+        // 末尾读不出记录的字节原样留着——截掉它们换不来任何东西，判断错了却拿不回来。
+        if (opts_.read_write && !opts_.merge_only && unsealed &&
             last_valid_end < actual_size) {
             auto wdf = fileops::DataFile::open(
                 e.data_path, fileops::DataFile::Mode::kAppend);
@@ -731,6 +774,8 @@ std::expected<void, CaskFault> Cask::load_authority_from_disk() {
         fileops::CommittedFoldOptions fopts;
         fopts.start_offset =
             snap_loaded ? wm_of(static_cast<std::uint32_t>(e.tstamp)) : 0;
+        fopts.heal_gaps =   // S67：与 pass 1 / OKI 重建同一口径
+            !authority_->may_have_torn_tail(static_cast<std::uint32_t>(e.tstamp));
         if (!fileops::fold_committed(*df, apply_rec, {}, fopts)) {
             return std::unexpected(err(CaskError::kBadCrc, e.data_path));
         }

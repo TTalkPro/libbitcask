@@ -345,6 +345,10 @@ public:
     // 主动解除映射（幂等）。析构自动调用。
     void reset() noexcept;
 
+    // S71：撤销 advise_random，恢复内核缺省预读（madvise MADV_NORMAL；Windows
+    // 无操作）。给大体按文件顺序读的场景（keydir 扫描）用。尽力而为。
+    void advise_normal() noexcept;
+
 private:
     const std::byte* base_ = nullptr;
     std::size_t len_ = 0;

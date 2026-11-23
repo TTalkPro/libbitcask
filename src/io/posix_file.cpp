@@ -264,6 +264,12 @@ MappedFile MappedFile::map_readonly(FileHandle fd, std::size_t len,
     return m;
 }
 
+void MappedFile::advise_normal() noexcept {
+    if (base_ != nullptr) {
+        ::madvise(const_cast<std::byte*>(base_), len_, MADV_NORMAL);  // best-effort
+    }
+}
+
 void MappedFile::reset() noexcept {
     if (base_ != nullptr) {
         ::munmap(const_cast<std::byte*>(base_), len_);

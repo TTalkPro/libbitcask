@@ -10,6 +10,156 @@
 
 ---
 
+## 🟡 S70 · 写路径不再被 memdelta 落段与扩容挡住（2026-11-23 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-23-write-path-stalls-on-memdelta-flush-and-growth.md`](feedbacks/2026-11-23-write-path-stalls-on-memdelta-flush-and-growth.md)
+>（keelson：升 12.0.3 后量单条写边的长尾）。只编码不提交，版本未定。
+
+| 项 | 状态 |
+|---|---|
+| S70-1 后台落段线程：读写打开（非 merge_only）的库在 `Cask::open` 末尾经 `IndexAuthority::start_background_flush` 登记，线程等第一次请求才起（没写到阈值的库不多占线程；`ThreadLimitsTest` 数开库新增线程，就是它提醒的），跑 `commit_oki_cut`；`maybe_flush_oki*` 越过阈值时只发请求（`request_background_flush`）就返回。背压：memdelta 涨到阈值的 2 倍（行数或字节）仍没落下去时，写者退回同步落段，内存有界。`close()` 先 `stop_background_flush`（等在途的那次做完）再拆资源。状态挂在 `IndexAuthority` 末尾新增的 `bg_flush_`（`shared_ptr<void>`，追加成员，前面的布局不动） | ✅ |
+| S70-2 `commit_oki_cut`：截面在写闸内只取水位，active 文件的 fsync 挪到闸外（`collect_snapshot_watermarks(&defer)`）；fsync 失败时水位钳回已持久处，「run 不引用未持久字节」不变 | ✅ |
+| S70-3 落段拷贝分块：每 4096 行单独持一次 `mu_`，块间歇一下（`sleep_for(1µs)`，实为定时器精度约 50 µs）——只 `yield` 时 std::mutex 不公平，等锁的写者整段拷贝期间都拿不到（实测一次 11 ms） | ✅ |
+| S70-4 `drop_active_through` 两段式：锁外分块拷后缀、给新数组建好点查索引，剩不到一块时才在锁内搬零头并整体交换；旧数组与旧索引在锁外析构。此前锁内搬 7 万行 + 重建索引挡写者约 4 ms，更早逐行判断整份数组几十毫秒 | ✅ |
+| S70-5 扩容：FlatIdx 改增量 rehash（新旧两张表，每次插入顺带搬 16 个槽）；行数组到 65536 行时一次预留到 `kFlushRowLimit × 5/4`，不再逐级翻倍搬迁 | ✅ |
+| S70-6 回归 `OkiRecoveryTest.S70*`：越阈值后由后台线程落段且数据完整、重开一致；4 写者 + 2 读者在后台落段期间并发，读到的只会是写过的版本、最终全是最新版本（TSan 也跑）；后台落段进行中 close | ✅ |
+
+**落地记录**：
+- 测法：单写者 150 万次单条原子写（300 B 值，10 万 key 空间，`bitcask_put_batch_atomic_cond`），每次计时，>1 ms 记一次停顿。
+  12.1.0：最大 **153 ms**，停顿合计占总时长 11.5%；现在：最大 **1.2～2.2 ms**，占 0.1～0.2%；p50 1.44 µs、p99 约 3 µs 不变。
+- 排查过程里排除掉的：截面与 fsync 本身（0.03～0.08 ms）；在 fsync 前先 `sync_file_range` 写回大段（试过，没有可测的收益，已撤回）。
+  最后两处是靠给后台线程每步打时间戳、在写者卡住时取主线程栈（卡在 `OkiState::locate` 拿 `mu_`）定位的。
+- 剩下的 >1 ms 主要是第 65536 次写时行数组一次预留（拷 6.5 万行），每个库一生一次。
+- ABI：`IndexAuthority` 末尾追加成员 + 新增成员函数；`OkiState` / `DataFile` / `Cask` 布局不动。
+- 验证：见 CHANGELOG 同节。
+
+---
+
+## 🟢 S71 · keydir 扫描走映射读；range 预取自适应（2026-11-23 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md`](feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md)
+>（keelson：clj-bitcask `scan-entries` 每行 1 µs）。只编码不提交，版本未定。
+
+| 项 | 状态 |
+|---|---|
+| S71-1 `CaskIter::next` 取值先走 `DataFile::read_mmap`（与点查 `read_doc` 同一条路径），界外 / 无映射才退回 `pread`；映射读不出完整记录报 `kBadCrc` 同点查 | ✅ |
+| S71-2 `CaskIter::pin_files` 钉住的封口文件带映射打开（此前 `mmap_enabled = false`，重开后的扫描全走 `pread`），并 `advise_normal` 恢复缺省预读（扫描大体按文件顺序取值，冷缓存靠预读）。新增 `io::MappedFile::advise_normal` / `DataFile::advise_normal`（Windows 无操作） | ✅ |
+| S71-3 range 预取：`prefetch_threads = 0`（缺省，自动）时每批先串行取 32 条计时，估算并行省下的时间盖不过起线程的成本就整批串行；显式给线程数照给的并行（测试的并行分支靠它覆盖） | ✅ |
+| S71-4 每条两次分配（反馈建议 3）：要新的批接口 / 视图版本，未做，留给下游提需求 | ⏸ |
+
+**落地记录**（反馈附的程序，20 万 key，200 B 值，热缓存，每行 ns；前者 12.1.0，后者现在）：
+
+| 场景 | keydir 扫描 | range（不预取） | range（prefetch 256） |
+|---|---|---|---|
+| 按 key 顺序写入，刚写完 | 949 → **214** | 350 → 320 | 650 → 350 |
+| 按 key 顺序写入，重开后 | 960 → **258** | 570 → 570 | 914 → 635 |
+| 乱序写入，刚写完 | 1230 → **370** | 640 → 635 | 865 → 725 |
+| 乱序写入，重开后 | 1214～1432 → **436** | 800～850 → 793 | 930～1124 → 865 |
+
+- 扫描现在比 range 快：扫描直接用归并视图里的位置，range 每个 key 再走一遍点查定位（重开后要查 run）。
+- 预取在热缓存下还比不开慢 5～15%，剩下的是攒批本身（归并出 key 串、槽位数组）的开销；冷缓存没测（.13 上清不了页缓存）。
+- 验证：见 CHANGELOG 同节。
+
+---
+
+## 🔴 S69 · 原子批删除：写出的字节与批头区间一致；读端认得旧写端多算的批（2026-11-23 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-23-atomic-batch-remove-span-overcounts-tombstone-shadow.md`](feedbacks/2026-11-23-atomic-batch-remove-span-overcounts-tombstone-shadow.md)
+>（bitcask：Cypher 写语句基准里删顶点后重开报 `bad_crc`）。只编码不提交，版本未定。S68 是掉电故障注入的设计稿编号。
+
+| 项 | 状态 |
+|---|---|
+| S69-1 写端：`put_batch_atomic` 的删除成员写出 ①b 准备好的值（tombstone v2 的 4 字节 shadow，或空），与 `span_bytes` 一致，也与单条 `remove` 写出的 tombstone 同形（`cask.cpp` ④） | ✅ |
+| S69-2 读端兼容：`format::legacy_batch_closes` 判定「Count 条成员已读满、离声明的区间末尾还剩 4 × j 字节、j ≤ 空值 tombstone 成员数」= ≤ 12.1.0 写端写出的已提交批，按实际字节收口；`DataFile::fold` 在批头区间越过文件尾不超过 4 × count 时先读成员再判；成员读满却对不上账（不是这种规律）照旧按不完整处理 | ✅ |
+| S69-3 `fold_committed` 放行暂存成员用同一规则 | ✅ |
+| S69-4 回归 `AtomicBatchTest.S69*`：判定规则；新写端 span 与成员字节一致、删除写出 shadow、删 OKI 重开删除生效且文件不变；手工构造的旧写端批（含文件末尾越界 4 字节的那个、混有不多算的空值 tombstone）由 `fold_committed`（不跳坏区）读到文件尾、Cask 重开删除生效；多出来的字节无法归因时成员不可见 | ✅ |
+| S69-5 反馈回填、CHANGELOG `[Unreleased]` | ✅ |
+
+**落地记录**：
+- 根因：`put_batch_atomic` ①b 把带 shadow 的删除成员按 `kHeaderSize + key + 4` 计入 `span_bytes`，④ 写成员时删除一律写空值。自 S35（原子批）、
+  tombstone v2 起就如此；bitcask 的 `tombstone_version` 缺省 2，图层删边 / 删顶点、`bitcask_txn` 提交里的 `delete` 都会写出这种批。
+  恢复时：12.0.3 及更早把批当 torn tail 截断文件（删除与其后同一文件的写静默丢失）；12.1.0（S67）当坏区跳过，同一文件多于 64 处返回 `kBadCrc`。
+- 端到端（bitcask 侧隔离副本，索引模式，2000 篇文档 + 280 个单删除原子批 + 1 条普通写）：12.1.0 写出的库 12.1.0 重开 `bad_crc`；修复后的构建打开同一个库：
+  存活 1720（应为 1720）逐个一致、最后那条普通写在、全文命中 1720、文件大小不变。修复后写出的库，12.1.0 也能正常打开（批头与字节一致，旧读端照认）——
+  盘上格式双向兼容。
+- 读端放宽的边界：只认「成员条数读满 + 余量恰为 4 的倍数 + 不超过空值 tombstone 数」，别的账对不上照旧判不完整（有用例）。批内有被
+  `tolerate_crc_errors` 跳过的坏记录时 `fold_committed` 数不到它，这种「旧批 + 位腐」的双重故障下批成员不放行。
+- 验证：见 CHANGELOG 同节。
+
+---
+
+## 🔴 S67 · 恢复不再截断已封口的数据；带过滤的向量检索回满 + 候选集内排序（2026-11-23 立项）
+
+> 来源：下游反馈
+> [`feedbacks/2026-11-23-recovery-truncates-synced-data-on-bad-record-header.md`](feedbacks/2026-11-23-recovery-truncates-synced-data-on-bad-record-header.md)（🔴）、
+> [`feedbacks/2026-11-23-filtered-vector-search-incomplete-no-candidate-scoring.md`](feedbacks/2026-11-23-filtered-vector-search-incomplete-no-candidate-scoring.md)（🟡）。
+> 随 12.1.0 发布（MINOR）。掉电故障注入的设计稿（`designs/power-loss-fault-injection-design-zh.md`）让出编号，改记 S68。
+
+| 项 | 状态 |
+|---|---|
+| S67-1 哪些文件可能有「没写完的尾巴」改由写锁证据决定：上一个写者没有正常关闭（读写打开时清掉了陈旧写锁；只读 / merge_only 打开时写锁文件还在）⇒ 写锁里记的活跃文件 + 编号最大的 data 文件；正常关闭 ⇒ 没有。`IndexAuthority::set_unsealed_files` / `may_have_torn_tail`；恢复的三处 fold 与 `rebuild_from_data` 都按它走。**只有这些文件才截断** | ✅ |
+| S67-2 其余文件里 fold 停下的地方当作坏区跳过：`DataFile::find_next_record` 从停点之后逐字节找下一条记录（类型字节合法 + CRC 通过 + 后面紧跟另一条完好记录或恰好到文件尾），找到就从那里接着读，文件不动；找不到当作尾部垃圾。单文件最多跳 64 处（`kMaxHealedGaps`）。每跳一处打一条 warn 日志（文件、起止偏移） | ✅ |
+| S67-3 原子批不被拆开：停点是一个成员不全的批头时整批跳过（`DataFile::batch_end_at` 取批声明的终点），不会把批里碰巧完好的成员单独放出来；批声明的终点超出文件 ⇒ 到此为止 | ✅ |
+| S67-4 `DataFile::read` / `read_mmap`：整条读到了但解不出来的记录统一报 `kBadCrc`（此前坏在长度字段上时报 `kShortRead`，上层并进 `kIo`） | ✅ |
+| S67-5 取得写锁后 fsync 目录（写锁文件的目录项落盘，掉电后仍能认出「上一个写者没正常关闭」） | ✅ |
+| S67-6 带过滤的 HNSW 检索：0 层遍历预算耗尽且不足 k 时退到精确扫描（`HnswIndex::exact_filtered_scan`：全部节点过一遍过滤器，通过者逐个算距离取前 k）。只在节点数 ≤ `kExactFallbackMaxNodes`（2^20）时做，更大的图维持原取舍 | ✅ |
+| S67-7 `Cask::rank_by_vector(query, keys, k)` + C API `bitcask_vector_rank`：在给定的一组 key 里按向量相似度精确排序取前 k。不经向量索引（逐个点读候选、用它存的向量算），与引擎无关，不需要先 flush；分数口径同 `search_vector` | ✅ |
+| S67-8 回归：`CrashRecoveryTest.CorruptHeaderInSealedFileKeepsLaterRecords` / `CorruptRecordReadReportsBadCrc` / `CleanCloseThenDamagedTailIsNotTruncated` / `CrashedWriterTailTruncatedSealedFilesHealed` / `FindNextRecordResyncRules`；`HnswFilteredSearch.SelectiveFilterFallsBackToExactScan`；`CaskDocValueTest.S67RankByVectorAmongCandidates`；`c_api_test` 的 IVF-RQ 用例里加 `bitcask_vector_rank` | ✅ |
+| S67-9 反馈回填、CHANGELOG `[Unreleased]` | ✅ |
+
+**落地记录**：
+- 反馈里的复现（2000 条记录、第 1000 条的头写成 0xFF、删索引后重开）：改前文件 336000 → 167832 字节、后 1000 条消失；
+  改后文件大小不变，只丢被写坏的那一条。同一用例里接着把另一条的 `value_sz` 改成越过文件尾、再盖一段 4 KiB 的零，结论相同。
+- **行为变化（可见）**：
+  1. 正常关闭过的库，文件尾部的残缺不再被截掉（留在原处、读的时候跳过）。此前「正常关闭 + 掐掉文件尾巴」会被当成崩溃尾巴截断；
+     用这种办法模拟掉电的测试要同时留下陈旧写锁（`tests/support/stale_writer_lock.hpp`），已改 4 个既有用例。
+  2. 带过滤的向量检索在过滤全拒 / 极严时，多出一遍 O(节点数) 的过滤求值（≤ 2^20 个节点时）。
+- ABI：`IndexAuthority` 末尾追加一个成员（先例 `fold_floor_`），既有成员偏移不变；`DataFile`、`Cask`、`OkiState` 布局不变；
+  `CommittedFoldOptions`（`detail/`）加了字段。纯新增：`DataFile::find_next_record` / `batch_end_at`、`Cask::rank_by_vector`、
+  `HnswIndex::kExactFallbackMaxNodes`、C API `bitcask_vector_rank`。盘上格式不变。
+- 已知的残余：
+  - 跳坏区靠「两条连着的完好记录」认记录边界。一个 value 的**末尾**若恰好嵌着一条完整记录的字节映像、且这条记录自己的头坏了，
+    嵌着的那条会被当成真记录读出来（它后面紧跟下一条真记录）。要两处巧合同时成立；嵌在 value 中间的不会（有用例）。
+  - 旧版本写者留下的写锁文件没有 fsync 过目录项：用旧版本写、掉电、再用新版本打开，若写锁的目录项没落盘，新版本看到的是
+    「没有崩溃证据」——尾巴不截断、当坏区跳过（不丢数据，只是残缺字节留在文件里）。
+  - 坏区里的记录丢了就是丢了（日志里有起止偏移）；没有做「打开时报告 / 统计接口」，`status()` 也没有加计数。
+  - IVF-RQ / DiskANN 两种引擎的带过滤检索没有动（反馈说的预算是 HNSW 的）。
+- 验证：见 CHANGELOG 同节。
+
+## 🟠 S66 · 落盘后的点查：块内增量比较 + 采样索引，缓存命中不重算 CRC（2026-11-23 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-23-point-get-after-flush-scans-run-block-linearly.md`](feedbacks/2026-11-23-point-get-after-flush-scans-run-block-linearly.md)
+> （bitcask：升 12.0.3 后重开过的库读没有跟着变快——行落进 run 之后点查命中比行在 memdelta 时慢 5～13 倍）。
+> 取反馈建议 1（不动盘上格式的两层做法）、2、3。随 12.1.0 发布。
+
+| 项 | 状态 |
+|---|---|
+| S66-1 `OkiRunReader::find` 不再走 `seek_impl` 的逐条完整解码：块内用前缀压缩做增量比较（记上一行与目标 key 的公共前缀长度，按 `shared_len` 与它的大小关系直接判小于 / 大于，相等时才比后缀），不重建 key、不拷进 `Entry`；ord / tstamp 的块内差分照常累加。行解析抽成 `parse_row`，结构校验口径同 `Cursor::next` | ✅ |
+| S66-2 采样索引：块缓存开着时，给被点查过的块建一份「每 16 行一个完整 key + 块内偏移 + 到该行之前的 ord / tstamp 累加值」，作为另一条缓存项放进同一个块缓存（key = `(gen, 块下标 \| 1<<63)`）；点查先在采样上二分、再从采样行起走至多 16 行。等于在内存里补上盘上格式没有的重启点；随块缓存的容量与淘汰走，约为块大小的 15%～20%。缓存关着 / 无缓存时只走 S66-1 | ✅ |
+| S66-3 块 CRC 挪进块缓存的 loader（块从盘上读进来的那一次），校验不过的块不进缓存；缓存命中不再对整块重算。无缓存路径不变（每次读盘都校验） | ✅ |
+| S66-4 `OkiBlockCache::enabled()`（公开内联访问器，纯新增）。其余类布局、盘上格式不变 | ✅ |
+| S66-5 基准 `BM_Cask_Get_Hot_View_Reopened`（建库 → close → 重开，1024 / 10 万 / 40 万 key） | ✅ |
+| S66-6 回归 `tests/oki_run_v2_test.cpp`：`OkiRunFind.MatchesSequentialScanForAllKeyShapes`（约 2000 个各种形态的 key——互为前缀、长公共前缀、含 0x00 / 0xFF、长 key；v1 / v2 / v3 × 块目标 64 / 300 / 4096 × 无缓存 / 缓存开（两遍）/ 缓存容量 0；在场的 key 逐字段对顺序游标，约 2700 个不在场的探针全部判缺席）、`OkiRunFind.CorruptBlockNeverEntersCache` | ✅ |
+| S66-7 反馈回填、CHANGELOG `[Unreleased]` | ✅ |
+
+**落地记录**：
+- 性能（GCC Release，本机，128 B 的值、页缓存全热；命中一次）：
+
+  | key 数 | 行在 memdelta（`Get_Hot_View`） | 重开后，改前 | 重开后，只做 S66-1 + S66-3 | 重开后，全部 |
+  |---|---|---|---|---|
+  | 1 024 | 130 ns | 3023 ns | 1043 ns | **365 ns** |
+  | 100 000 | 502 ns | 3392 ns | 1526 ns | **703 ns** |
+  | 400 000 | 646 ns | 3562 ns | 1769 ns | **1008 ns** |
+
+  两种状态的差距由 5～23 倍收到 1.4～2.8 倍。剩下的是 bloom、块首 key 二分、两次块缓存查找（块 + 采样索引，各一次分片锁）与 sealed 映射读。
+- 没做：盘上加重启点（要升 run 版本）——内存里的采样索引已拿到大部分收益，先不动格式。范围迭代器的定位（`seek_impl` / `seek_cached`）
+  仍是块内线性解码：它每次迭代只定位一次，不在这条反馈的范围里。
+- 验证：GCC Release（`-Werror`）全量 ctest 975 注册 / 973 执行全绿（首轮 `-j16` 有一次 `HighlightColdTest.ReopenedLibraryHasNoSnippetsUnlessLoaded`
+  ——S53 既有的并行偶发，串行连跑 10 次与整套重跑均通过）；ASan 全量 973 全绿；TSan 相关 320 项全绿、无告警；clang Debug 相关 265 项全绿。
+  Windows 未实测。
+
+---
+
 ## 🟡 S65 · 点查命中：memdelta 索引换平表、活跃文件走映射（2026-11-23 立项）
 
 > 来源：下游反馈 [`feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md`](feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md)

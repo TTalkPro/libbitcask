@@ -69,6 +69,23 @@ enum class RecordType : std::uint8_t {
 inline constexpr std::uint8_t kBatchHeaderVersion   = 1;
 inline constexpr std::size_t  kBatchHeaderValueSize = 13;  // 1 + 4 + 8
 
+// S69：≤ 12.1.0 的写端在原子批里删除存在的 key（tombstone v2）时，把 4 字节 shadow
+// （旧 file_id）计入了 SpanBytes，成员却按空值写出——这样的批声明的区间比实际多
+// 4 × j 字节（j ≤ 批里空值 tombstone 成员数）。读端按「Count 条成员都已读到、剩余
+// 字节是这个数」认出它（它是已提交的批，只是批头写错了），按实际字节收口。
+// feedbacks/2026-11-23-atomic-batch-remove-span-overcounts-tombstone-shadow.md
+inline constexpr std::uint64_t kLegacyTombShadowBytes = 4;
+
+// 已读到 members 条成员、其中 empty_tombs 条是空值 tombstone、当前偏移距批头声明的
+// 区间末尾还有 gap 字节：这是 S69 之前的写端写出的、已提交的批吗？
+[[nodiscard]] constexpr bool legacy_batch_closes(std::uint32_t count,
+                                                 std::uint32_t members,
+                                                 std::uint32_t empty_tombs,
+                                                 std::uint64_t gap) noexcept {
+    return members == count && gap > 0 && gap % kLegacyTombShadowBytes == 0 &&
+           gap / kLegacyTombShadowBytes <= empty_tombs;
+}
+
 // ---------------------------------------------------------------------------
 // kDoc value 打包布局（写在 kDoc record 的 VALUE 段）。设计见 §2.4。
 //

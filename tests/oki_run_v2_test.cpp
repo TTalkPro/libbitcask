@@ -599,3 +599,172 @@ TEST(OkiManifestV2, RoundtripAndLazyVersion) {
 }
 
 }  // namespace
+
+// S66（feedbacks/2026-11-23-point-get-after-flush-scans-run-block-linearly.md）：find 的块内
+// 定位不再走「逐条完整解码」——改成前缀压缩上的增量比较，块缓存开着时再配采样索引。
+// 对照：顺序游标读出的全部行就是真相。各种 key 形态（互为前缀、长公共前缀、空后缀、
+// 高位字节、长 key）、各版本、各块大小、三种缓存状态（无缓存 / 缓存开 / 缓存容量 0），
+// 在场的 key 每一个都要逐字段相同，不在场的探针（比全 run 小、夹在两行之间、是某行的
+// 前缀或延伸、比全 run 大）都要判缺席。
+TEST(OkiRunFind, MatchesSequentialScanForAllKeyShapes) {
+    std::mt19937 rng(66);
+    std::vector<std::string> keys;
+    for (int i = 0; i < 1500; ++i) {
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "doc:%06d", i * 3);
+        keys.emplace_back(buf);
+    }
+    // 互为前缀的链、只差末字节、含 0x00 / 0xFF 的 key、长 key。
+    for (int i = 0; i < 40; ++i) keys.push_back(std::string(static_cast<std::size_t>(i + 1), 'a'));
+    for (int i = 0; i < 60; ++i) keys.push_back("pfx/shared/long/common/prefix/" + std::string(1, static_cast<char>('!' + i)));
+    for (int i = 0; i < 30; ++i) keys.push_back(std::string("z") + static_cast<char>(i) + std::string("\xff", 1));
+    for (int i = 0; i < 30; ++i) keys.push_back(std::string("\xff\xfe", 2) + std::to_string(1000 + i));
+    for (int i = 0; i < 20; ++i) keys.push_back("L" + std::string(300 + static_cast<std::size_t>(i) * 7, static_cast<char>('m' + i % 5)) + std::to_string(i));
+    for (int i = 0; i < 300; ++i) {
+        std::string k;
+        const int len = 1 + static_cast<int>(rng() % 12);
+        for (int j = 0; j < len; ++j) k.push_back(static_cast<char>("abAB01"[rng() % 6]));
+        keys.push_back("r/" + k);
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+
+    auto make = [&](std::uint32_t version) {
+        std::vector<Row> rows;
+        std::uint64_t ord = 0;
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            Row r;
+            r.key = keys[i];
+            ord += 1 + rng() % 1000;
+            r.ord = (i % 97 == 5) ? ord - 500 : ord;       // ord 不单调（差分回绕）
+            r.tomb = (i % 11 == 4);
+            r.has_loc = version != kRunVersion && !r.tomb;
+            if (r.has_loc) {
+                r.loc.file_id = static_cast<std::uint32_t>(1 + rng() % 9);
+                r.loc.total_sz = static_cast<std::uint32_t>(40 + rng() % 5000);
+                r.loc.offset = rng() % (1ull << 33);
+                r.loc.tstamp = 1700000000ull + (rng() % 2 ? rng() % 100000 : 0);  // 有升有降
+            }
+            rows.push_back(std::move(r));
+        }
+        return rows;
+    };
+
+    std::vector<std::string> probes;
+    probes.push_back("");
+    probes.push_back(std::string(1, '\0'));
+    probes.push_back(std::string("\xff\xff\xff\xff", 4));
+    for (std::size_t i = 0; i < keys.size(); i += 3) {
+        probes.push_back(keys[i] + std::string(1, '\0'));          // 紧跟在后
+        probes.push_back(keys[i] + "x");                           // 延伸
+        if (keys[i].size() > 1) probes.push_back(keys[i].substr(0, keys[i].size() - 1));  // 前缀
+        std::string bump = keys[i];
+        bump.back() = static_cast<char>(static_cast<unsigned char>(bump.back()) + 1);
+        probes.push_back(bump);
+    }
+
+    for (const std::uint32_t version : {kRunVersion, kRunVersion2, kRunVersion3}) {
+        for (const std::size_t block_target : {std::size_t{64}, std::size_t{300}, std::size_t{4096}}) {
+            SCOPED_TRACE("version " + std::to_string(version) + " block_target " +
+                         std::to_string(block_target));
+            TempDir td;
+            const auto rows = make(version);
+            std::string path;
+            if (version == kRunVersion) {
+                path = td / "kv.oki.seg-1";
+                auto w = OkiRunWriter::create(path, block_target);
+                ASSERT_TRUE(w.has_value());
+                for (const auto& r : rows) ASSERT_TRUE(w->add(bytes(r.key), r.ord, r.tomb).has_value());
+                ASSERT_TRUE(w->finish().has_value());
+            } else {
+                path = write_v2_run(td, rows, block_target, version);
+            }
+            auto r = OkiRunReader::open(path);
+            ASSERT_TRUE(r.has_value());
+            if (block_target < 4096) {
+                ASSERT_GT(r->block_count(), 8u);
+            }
+
+            // 真相：顺序游标。
+            std::map<std::string, OkiRunReader::Entry> truth;
+            {
+                auto cur = r->begin();
+                OkiRunReader::Entry e;
+                while (true) {
+                    auto n = cur.next(e);
+                    ASSERT_TRUE(n.has_value());
+                    if (!*n) break;
+                    truth.emplace(e.key, e);
+                }
+                ASSERT_EQ(truth.size(), keys.size());
+            }
+
+            OkiBlockCache on(8u << 20);
+            OkiBlockCache off(0);
+            ASSERT_TRUE(on.enabled());
+            ASSERT_FALSE(off.enabled());
+            OkiBlockCache* const modes[] = {nullptr, &on, &off, &on};  // &on 两遍：第二遍全命中
+            for (OkiBlockCache* cache : modes) {
+                for (const auto& [k, want] : truth) {
+                    auto got = r->find(bytes(k), cache, 7);
+                    ASSERT_TRUE(got.has_value()) << k;
+                    ASSERT_TRUE(got->has_value()) << "missing present key " << k;
+                    const auto& e = **got;
+                    ASSERT_EQ(e.key, want.key);
+                    ASSERT_EQ(e.ord, want.ord) << k;
+                    ASSERT_EQ(e.tomb, want.tomb) << k;
+                    ASSERT_EQ(e.has_loc, want.has_loc) << k;
+                    if (want.has_loc) {
+                        ASSERT_EQ(e.loc.file_id, want.loc.file_id) << k;
+                        ASSERT_EQ(e.loc.total_sz, want.loc.total_sz) << k;
+                        ASSERT_EQ(e.loc.offset, want.loc.offset) << k;
+                        ASSERT_EQ(e.loc.tstamp, want.loc.tstamp) << k;
+                    }
+                }
+                for (const auto& p : probes) {
+                    if (truth.count(p) != 0) continue;
+                    auto got = r->find(bytes(p), cache, 7);
+                    ASSERT_TRUE(got.has_value());
+                    ASSERT_FALSE(got->has_value()) << "found absent key, probe size " << p.size();
+                }
+            }
+        }
+    }
+}
+
+// 块缓存命中不再重算块 CRC；坏块仍在装载时被拒、且不进缓存（之后每次都报错，而不是
+// 第一次报错、第二次从缓存里拿到坏块）。
+TEST(OkiRunFind, CorruptBlockNeverEntersCache) {
+    TempDir td;
+    const auto rows = make_rows(400);
+    const auto path = write_v2_run(td, rows, 96, kRunVersion3);
+    {
+        auto good = OkiRunReader::open(path);
+        ASSERT_TRUE(good.has_value());
+        OkiBlockCache cache(1u << 20);
+        for (int round = 0; round < 3; ++round) {
+            for (const auto& row : rows) {
+                auto got = good->find(bytes(row.key), &cache, 1);
+                ASSERT_TRUE(got.has_value() && got->has_value()) << row.key;
+                EXPECT_EQ((**got).ord, row.ord);
+            }
+        }
+        EXPECT_GT(cache.stats().hits, cache.stats().misses);
+    }
+    auto b = read_all(path);
+    b[8] = static_cast<std::byte>(std::to_integer<std::uint8_t>(b[8]) ^ 0x40);
+    write_all(path, b);
+    auto bad = OkiRunReader::open(path);
+    ASSERT_TRUE(bad.has_value());
+    OkiBlockCache cache(1u << 20);
+    for (int i = 0; i < 3; ++i) {
+        auto got = bad->find(bytes(rows.front().key), &cache, 2);
+        ASSERT_FALSE(got.has_value());
+        EXPECT_EQ(got.error(), OkiError::kCorrupt);
+    }
+    EXPECT_EQ(cache.stats().blocks, 0u);
+    // 没坏的块照常可读。
+    auto ok = bad->find(bytes(rows.back().key), &cache, 2);
+    ASSERT_TRUE(ok.has_value() && ok->has_value());
+    EXPECT_EQ((**ok).ord, rows.back().ord);
+}

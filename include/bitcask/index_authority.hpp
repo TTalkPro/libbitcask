@@ -199,6 +199,27 @@ public:
     [[nodiscard]] std::uint32_t trim_fstats(std::span<const std::uint32_t> ids);
     void with_writer_lock(const std::function<void()>& fn);
 
+    // S67：可能带「没写完的尾巴」的 data 文件（上一个写者崩溃时正在写的那个，或
+    // 别的进程里仍在写的那个）。Cask 在 open 的恢复开始前按写锁文件的证据设置；
+    // 不在其中的文件一律视为已封口（封口即 fsync）——从 data 重建时在它们中间
+    // 遇到坏区会跳过去接着读，而不是把后面的记录当成尾巴丢掉。
+    void set_unsealed_files(std::vector<std::uint32_t> ids);
+    [[nodiscard]] bool may_have_torn_tail(std::uint32_t file_id) const;
+
+    // S70：memdelta 到阈值时的落段交给一个后台线程，不在写者线程里同步做
+    // （feedbacks/2026-11-23-write-path-stalls-on-memdelta-flush-and-growth.md）。
+    // commit 是一次完整的 OKI 提交（Cask::commit_oki_cut：一致切面 + 落 run +
+    // manifest），返回是否成功。线程等第一次请求才起（没写到阈值的库不多占
+    // 线程）。写者到阈值时 request_background_flush()：置一个请求标志、立刻返回
+    // true；没 start、已停或线程起不来返回 false，调用方自己同步落段。stop 等在途的那次提交做完再返回；必须在 commit 引用的对象
+    // 析构前调用（Cask::close）。幂等。
+    void start_background_flush(std::function<bool()> commit);
+    [[nodiscard]] bool request_background_flush() noexcept;
+    void stop_background_flush() noexcept;
+    // 测试 / 诊断：后台线程完成的提交次数、失败次数；等当前请求处理完。
+    [[nodiscard]] std::uint64_t background_flushes() const noexcept;
+    void wait_background_flush_idle() noexcept;
+
 private:
     struct Ledger {
         std::uint64_t active_keys = 0;
@@ -248,6 +269,11 @@ private:
     // pending_delete 布尔 + expiration_epoch 还原（adopt_manifest）。
     // 放在末尾：不挪动既有成员的偏移。
     std::atomic<std::uint64_t> fold_floor_{0};
+    // S67（同上，放在末尾）：见 set_unsealed_files。writer_mu_ 保护。
+    std::vector<std::uint32_t> unsealed_files_;
+    // S70（同上，放在末尾）：后台落段线程的状态对象（定义在 index_authority.cpp；
+    // shared_ptr<void> 自带停线程的删除器，头文件不必知道它的类型）。
+    std::shared_ptr<void> bg_flush_;
 };
 
 } // namespace bitcask::oki

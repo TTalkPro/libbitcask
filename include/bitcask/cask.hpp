@@ -558,8 +558,10 @@ struct RangeOptions {
     // 语义不变量：预取只改变取值时机，**输出序与内容与惰性路径一致**
     // （仍是 per-key 弱一致——预取批内各 key 的取值时刻略早于出货时刻）。
     std::size_t prefetch = 0;
-    // 预取线程数；0 = min(hardware_concurrency, 4)。批内 key 数不足时按
-    // key 数收窄（不会为 1 个 key 起一堆线程）。
+    // 预取线程数；0 = 自动：至多 min(hardware_concurrency, 4)，且每批先串行
+    // 取 32 条计时，估算剩下的串行耗时盖不过起线程的成本（页缓存热、值小）
+    // 就整批串行（S71）。>0 = 按给的线程数并行。批内 key 数不足时按 key 数
+    // 收窄（不会为 1 个 key 起一堆线程）。
     std::size_t prefetch_threads = 0;
 
     // 下游反馈 2026-10-06 第 2、4 条（语义同 CaskIter::set_want_meta /
@@ -911,6 +913,24 @@ public:
     search_vector(std::span<const float> query, std::size_t k = 10,
                   std::size_t ef = 0,
                   const meta::MetaFilter* filter = nullptr);
+
+    // S67（下游反馈 2026-11-23）：**在给定的一组 key 里**按与 query 的向量相似度排序，
+    // 取最好的 k 个。候选已经由别处给出时用它——图上某个顶点的邻居、一次全文检索的
+    // 命中、二级索引筛出的一批 key——不必把候选条件硬翻译成 meta filter 去走图遍历，
+    // 也不必把每个候选的向量读回宿主语言自己算。
+    // - 精确计算、不经向量索引：逐个点读候选文档、取它存的向量算分，所以与引擎类型
+    //   无关，结果不受 HNSW 召回影响，也**不需要先 flush_index**（读到的就是 get 读到的）。
+    // - 分数口径与 search_vector 相同（cosine / dot：内积；L2：负的平方距离），降序；
+    //   同分按候选在 keys 里的先后。cosine 配置下 query 内部归一化，零向量返回空。
+    // - 跳过：不存在 / 已删 / 已过期的 key、没有向量的文档；重复的 key 只算一次。
+    //   量化落盘（vector_quantized）的库用还原后的向量算，与写入的原向量有量化误差。
+    // - 代价与候选数成正比（每个候选一次点读 + 一次距离计算）。
+    // query 长度必须等于 vector_dim；无向量配置 → kInvalidOption。
+    // 线程安全: 是（只走读路径）。
+    [[nodiscard]] std::expected<TextSearchResult, CaskFault>
+    rank_by_vector(std::span<const float> query,
+                   std::span<const std::span<const std::byte>> keys,
+                   std::size_t k = 10);
 
     // S7-4:批量 HNSW 向量检索——K 条独立向量查询并发跑共享 Search 池，保序
     // 返回。HNSW 读路径本身线程安全（V3.3）。语义/约束同 search_text_batch。
@@ -1585,6 +1605,10 @@ private:
     [[nodiscard]] std::optional<
         std::vector<std::pair<std::uint32_t, std::uint64_t>>>
     collect_snapshot_watermarks() const noexcept;
+    // S70：同上，但活跃文件不在这里 fdatasync——水位取它此刻的大小，(文件 id,
+    // 大小) 写进 *defer_active，由调用方在闸门外同步后再使用水位（commit_oki_cut）。
+    [[nodiscard]] std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>>
+    collect_snapshot_watermarks(std::pair<std::uint32_t, std::uint64_t>* defer_active) const noexcept;
 
 public:
     // 访问共享 IndexPool（借用自 registry）

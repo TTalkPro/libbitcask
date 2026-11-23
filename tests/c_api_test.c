@@ -559,6 +559,21 @@ static int test_vector_engine_ivfrq(void) {
         assert(strcmp(res->hits[0].key, "e1") == 0);
         bitcask_search_result_free(res);
     }
+    /* S67：候选集内的精确向量排序（与引擎无关；不存在的 key 跳过）。 */
+    {
+        const void* cand[3] = {"e0", "nope", "e2"};
+        const size_t cand_len[3] = {2, 4, 2};
+        bitcask_search_result_t* res = NULL;
+        err = bitcask_vector_rank(cask, vecs[2], 4, cand, cand_len, 3, 5, &res, &fault);
+        assert(err == BITCASK_OK && res && res->count == 2);
+        assert(strcmp(res->hits[0].key, "e2") == 0);
+        assert(strcmp(res->hits[1].key, "e0") == 0);
+        assert(res->hits[0].score > res->hits[1].score);
+        bitcask_search_result_free(res);
+        res = NULL;
+        err = bitcask_vector_rank(cask, vecs[2], 3, cand, cand_len, 3, 5, &res, &fault);
+        assert(err == BITCASK_ERR_INVALID_OPTION && res == NULL);
+    }
     bitcask_close(cask);
 
     /* 引擎不符（默认 HNSW）重开 → MODE_MISMATCH（meta 持久化生效）。 */

@@ -3,6 +3,12 @@
 // 不变），先例同 meta_file.cpp / legacy_ckpt.cpp。
 #include "bitcask/cask.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <string_view>
+#include <unordered_set>
+#include <vector>
+
 #include "bitcask/search_arena.hpp"  // S19-2：批量查询并发入口（原经 shim 头）
 
 #include "cask_internal.hpp"  // err
@@ -114,6 +120,84 @@ Cask::search_vector(std::span<const float> query, std::size_t k,
                      std::size_t ef, const meta::MetaFilter* filter) {
     return run_search_one(/*require_vector=*/true,
         [&] { return vec_plugin_->search(query, k, ef, filter); });
+}
+
+// S67：候选集内的精确向量排序（契约见头文件）。不碰向量索引：候选的向量从文档
+// 本身读（data 是向量的权威来源），所以对 HNSW / IVF / DiskANN 三种引擎一视同仁。
+std::expected<TextSearchResult, CaskFault>
+Cask::rank_by_vector(std::span<const float> query,
+                     std::span<const std::span<const std::byte>> keys,
+                     std::size_t k) {
+    if (is_closed()) return std::unexpected(err(CaskError::kClosed, "cask is closed"));
+    if (meta_config_.vector_dim == 0) {
+        return std::unexpected(err(CaskError::kInvalidOption,
+            "collection has no vector config"));
+    }
+    if (query.size() != meta_config_.vector_dim) {
+        return std::unexpected(err(CaskError::kInvalidOption,
+            "query vector dimension mismatch"));
+    }
+    TextSearchResult out;
+    if (k == 0 || keys.empty()) return out;
+
+    const bool l2 = meta_config_.vector_metric == meta::VectorMetric::kL2;
+    std::vector<float> qn;
+    std::span<const float> q = query;
+    if (meta_config_.vector_metric == meta::VectorMetric::kCosineNormalized) {
+        double sq = 0.0;
+        for (const float x : query) sq += static_cast<double>(x) * x;
+        if (sq <= 0.0) return out;  // 零向量没有方向（同 search_vector）
+        const auto inv = static_cast<float>(1.0 / std::sqrt(sq));
+        qn.resize(query.size());
+        for (std::size_t i = 0; i < query.size(); ++i) qn[i] = query[i] * inv;
+        q = qn;
+    }
+
+    struct Scored {
+        std::size_t index;
+        std::uint64_t ord;
+        double score;
+    };
+    std::vector<Scored> scored;
+    scored.reserve(keys.size());
+    std::unordered_set<std::string_view> seen;
+    seen.reserve(keys.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (!seen.insert(bytes_to_view(keys[i])).second) continue;
+        auto doc = read_doc(keys[i], /*want_fields=*/false);
+        if (!doc) {
+            if (doc.error().kind == CaskError::kNotFound) continue;
+            return std::unexpected(doc.error());
+        }
+        const std::span<const float> v = doc->vector;
+        if (v.size() != q.size()) continue;  // 没有向量（或维度不符的历史数据）
+        double s = 0.0;
+        if (l2) {
+            for (std::size_t d = 0; d < v.size(); ++d) {
+                const double diff = static_cast<double>(q[d]) - v[d];
+                s -= diff * diff;
+            }
+        } else {
+            for (std::size_t d = 0; d < v.size(); ++d) {
+                s += static_cast<double>(q[d]) * v[d];
+            }
+        }
+        scored.push_back({i, doc->ord, s});
+    }
+    const std::size_t take = std::min(k, scored.size());
+    std::partial_sort(scored.begin(),
+                      scored.begin() + static_cast<std::ptrdiff_t>(take), scored.end(),
+                      [](const Scored& a, const Scored& b) {
+                          if (a.score != b.score) return a.score > b.score;
+                          return a.index < b.index;
+                      });
+    out.hits.reserve(take);
+    for (std::size_t i = 0; i < take; ++i) {
+        const auto key = bytes_to_view(keys[scored[i].index]);
+        out.hits.push_back(search::SearchHit{std::string(key), scored[i].ord,
+                                             scored[i].score});
+    }
+    return out;
 }
 
 // search_hybrid:RRF 混合检索(V3.6)。两路检索与 RRF 融合在

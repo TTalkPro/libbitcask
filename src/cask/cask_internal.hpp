@@ -33,6 +33,17 @@ inline constexpr const char* kDocmapCkptName = "docmap.ckpt";
 inline constexpr const char* kBm25CkptName   = "bm25.ckpt";
 inline constexpr const char* kVecCkptName    = "vec.ckpt";
 
+// S67：恢复判断「哪些 data 文件可能带没写完的尾巴」用的证据（定义在 cask.cpp）。
+namespace detail {
+// 可写打开：本线程刚回收的陈旧写锁里记的活跃文件 id（nullopt = 没有陈旧锁，
+// 即上一个写者正常关闭；0 = 有陈旧锁但还没记活跃文件）。取走后清空。
+[[nodiscard]] std::optional<std::uint32_t> take_stale_writer_evidence() noexcept;
+// 只读 / merge_only 打开：目录里现存写锁文件记的活跃文件 id（nullopt = 没有写锁
+// 文件；0 = 有锁但没记路径）。
+[[nodiscard]] std::optional<std::uint32_t>
+peek_live_writer_active(const std::string& dirname);
+}  // namespace detail
+
 inline CaskFault io_fault(int errnum, std::string detail = {}) {
     return CaskFault{CaskError::kIo, errnum, std::move(detail)};
 }

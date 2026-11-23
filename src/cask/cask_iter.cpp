@@ -172,39 +172,62 @@ std::expected<std::optional<CaskIter::Entry>, CaskFault> CaskIter::next() {
                 CaskError::kIo,
                 "open read file_id=" + std::to_string(e.file_id)));
         } else {
-            auto rec = df->read(e.offset, e.total_sz);
-            if (!rec) {
-                if (!parent_->is_closed()) retry = true;
-                else {
-                    switch (rec.error().kind) {
-                        case fileops::DataFileError::kBadCrc:
-                            return std::unexpected(err(CaskError::kBadCrc));
-                        case fileops::DataFileError::kIo:
-                            return std::unexpected(io_fault(rec.error().errnum));
-                        default:
-                            return std::unexpected(err(CaskError::kIo, "read"));
-                    }
+            // S71：先走映射读（封口文件 P6 整文件映射、活跃文件 S65 只读映射），
+            // 不发系统调用、不拷贝整条记录——与点查 read_doc 同一条路径；界外
+            // （kShortRead）或没有映射时才退回 pread。此前每行一次 pread 加两份
+            // 拷贝，全表扫描比 range 慢 2～3 倍（feedbacks/2026-11-23-keydir-scan-…）。
+            std::optional<codec::DataRecordView> view;
+            std::optional<fileops::ReadRecord> owned;
+            if (df->mmapped()) {
+                auto rv = df->read_mmap(e.offset, e.total_sz);
+                if (rv) {
+                    view = *rv;
+                } else if (rv.error().kind == fileops::DataFileError::kBadCrc) {
+                    return std::unexpected(err(CaskError::kBadCrc));
                 }
-            } else {
+            }
+            if (!view) {
+                auto rec = df->read(e.offset, e.total_sz);
+                if (!rec) {
+                    if (!parent_->is_closed()) retry = true;
+                    else {
+                        switch (rec.error().kind) {
+                            case fileops::DataFileError::kBadCrc:
+                                return std::unexpected(err(CaskError::kBadCrc));
+                            case fileops::DataFileError::kIo:
+                                return std::unexpected(io_fault(rec.error().errnum));
+                            default:
+                                return std::unexpected(err(CaskError::kIo, "read"));
+                        }
+                    }
+                } else {
+                    owned = std::move(*rec);
+                }
+            }
+            if (view || owned) {
+                const std::span<const std::byte> rkey =
+                    view ? view->key : std::span<const std::byte>(owned->key);
+                const std::span<const std::byte> rval =
+                    view ? view->value : std::span<const std::byte>(owned->value);
+                const format::RecordType rtype = view ? view->type : owned->type;
+                const std::uint64_t rord = view ? view->ord : owned->ord;
                 const bool key_matches =
-                    rec->key.size() == cur_key_.size() &&
-                    std::memcmp(rec->key.data(), cur_key_.data(),
+                    rkey.size() == cur_key_.size() &&
+                    std::memcmp(rkey.data(), cur_key_.data(),
                                 cur_key_.size()) == 0;
-                if (!key_matches || rec->ord != e.ord) {
+                if (!key_matches || rord != e.ord) {
                     return std::unexpected(err(
                         CaskError::kIndexCorrupt,
                         "located record key/ord mismatch during fold"));
                 }
-                const bool value_is_tomb =
-                    rec->type == format::RecordType::kTombstone;
-                if (value_is_tomb) {
+                if (rtype == format::RecordType::kTombstone) {
                     if (!see_tombstones_) continue;
                     e.is_tombstone = true;
-                    e.value = std::move(rec->value);
+                    if (owned) e.value = std::move(owned->value);
+                    else e.value.assign(rval.begin(), rval.end());
                     return std::optional<Entry>{std::move(e)};
                 }
-                auto dv = codec::decode_doc_value(
-                    std::span<const std::byte>(rec->value));
+                auto dv = codec::decode_doc_value(rval);
                 if (!dv) {
                     return std::unexpected(err(CaskError::kIo,
                                                "corrupt DocValue"));
@@ -306,10 +329,13 @@ void CaskIter::pin_files() {
     for (const auto& entry : *scan) {
         const auto fid = static_cast<std::uint32_t>(entry.tstamp);
         if (has_active && fid == active_fid) continue;
+        // S71：带映射打开——取值走 read_mmap，不再每行一次 pread（映射失败时
+        // 照旧 pread）。恢复缺省预读：扫描大体按文件顺序取值，冷缓存靠预读。
         auto df = fileops::DataFile::open(
             entry.data_path, fileops::DataFile::Mode::kRead,
-            /*sync*/ false, /*mmap_enabled*/ false);
+            /*sync*/ false, /*mmap_enabled*/ true);
         if (!df) continue;
+        df->advise_normal();
         pinned_files_.emplace(fid, std::make_unique<fileops::DataFile>(
                                        std::move(*df)));
     }

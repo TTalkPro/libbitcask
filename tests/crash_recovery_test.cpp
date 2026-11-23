@@ -2,11 +2,15 @@
 
 #include <bitcask/cask.hpp>
 #include <bitcask/index_registry.hpp>
+#include <bitcask/data_file.hpp>
+#include <bitcask/format.hpp>
 
 #include "support/crash_child.hpp"
+#include "support/stale_writer_lock.hpp"
 
 using bitcask::test::crash_exit;
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -216,6 +220,8 @@ TEST_F(CrashRecoveryTest, TornWriteTruncated) {
         std::filesystem::file_size(data_path, ec);
     ASSERT_FALSE(ec);
     EXPECT_EQ(corrupted_size, valid_size + kGarbageBytes);
+    // S67：尾巴只在「上一个写者没有正常关闭」时才截——把那把陈旧的写锁也留下。
+    bitcask::test::plant_stale_writer_lock(tmpdir_, data_path);
 
     {
         CaskOptions opts;
@@ -703,6 +709,340 @@ TEST_F(CrashRecoveryTest, ParallelScanVisitsAllKeysOnce) {
     auto after = (*c)->parallel_scan(4, count_only);
     ASSERT_FALSE(after);
     EXPECT_EQ(after.error().kind, bitcask::CaskError::kClosed);
+}
+
+
+// =============================================================================
+// S67（feedbacks/2026-11-23-recovery-truncates-synced-data-on-bad-record-header.md）
+//
+// 恢复此前把 fold 停下的地方一律当作「没写完的尾巴」截掉——哪怕那是已封口文件
+// 中间的一处损坏，后面全是 fsync 过的完好记录。现在：
+//   * 只有「上一个写者没有正常关闭」时它正在写的文件才可能有尾巴，才截断；
+//   * 其余文件（含正常关闭后的全部文件）里的坏区跳过去接着读，文件一个字节不动；
+//   * 不完整的原子批仍然整批不可见（跳过坏区不会把它的成员单独放出来）。
+// =============================================================================
+
+namespace s67 {
+
+struct Rec {
+    std::uint64_t offset;
+    std::uint32_t size;
+};
+
+// data 文件里各记录的 (偏移, 长度)，按文件序。
+std::vector<Rec> records_of(const std::filesystem::path& data) {
+    std::vector<Rec> out;
+    auto df = bitcask::fileops::DataFile::open(
+        data.string(), bitcask::fileops::DataFile::Mode::kRead, false, false);
+    EXPECT_TRUE(df.has_value());
+    if (!df) return out;
+    auto r = df->fold([&](const bitcask::codec::DataRecordView&, std::uint64_t off,
+                          std::uint32_t total) { out.push_back({off, total}); });
+    EXPECT_TRUE(r.has_value());
+    return out;
+}
+
+void overwrite(const std::filesystem::path& data, std::uint64_t offset,
+               const std::string& bytes_) {
+    std::fstream f(data, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(f.is_open());
+    f.seekp(static_cast<std::streamoff>(offset));
+    f.write(bytes_.data(), static_cast<std::streamsize>(bytes_.size()));
+    ASSERT_TRUE(f.good());
+}
+
+void drop_index(const std::filesystem::path& dir) {
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("kv.oki.", 0) == 0 || e.path().extension() == ".hint") {
+            std::error_code ec;
+            std::filesystem::remove(e.path(), ec);
+        }
+    }
+}
+
+std::vector<std::filesystem::path> data_files(const std::filesystem::path& dir) {
+    std::vector<std::pair<unsigned long, std::filesystem::path>> v;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        const std::string name = e.path().filename().string();
+        constexpr std::string_view kSuffix = ".bitcask.data";
+        if (name.size() <= kSuffix.size() ||
+            name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+            continue;
+        }
+        v.emplace_back(std::strtoul(name.c_str(), nullptr, 10), e.path());
+    }
+    std::sort(v.begin(), v.end());
+    std::vector<std::filesystem::path> out;
+    for (auto& [id, path] : v) out.push_back(std::move(path));
+    return out;
+}
+
+}  // namespace s67
+
+// 反馈里的复现：2000 条 sync 过的记录，正常关闭；第 1000 条的记录头被写坏；索引
+// 文件被删（下次打开从 data 全量重建）。改前：文件从损坏处被截断，后 1000 条消失。
+TEST_F(CrashRecoveryTest, CorruptHeaderInSealedFileKeepsLaterRecords) {
+    constexpr int kN = 2000;
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        for (int i = 0; i < kN; ++i) {
+            ASSERT_TRUE((*c)->put(bytes(key_for(i)), bytes(value_for(i))));
+        }
+        ASSERT_TRUE((*c)->sync());
+        (*c)->close();
+    }
+    const auto data = max_data_file();
+    const auto recs = s67::records_of(data);
+    ASSERT_EQ(recs.size(), static_cast<std::size_t>(kN));
+    const auto size_before = std::filesystem::file_size(data);
+
+    for (const char* what : {"header-ff", "value-size-huge", "zero-4k"}) {
+        SCOPED_TRACE(what);
+        // 每一轮在不同的位置再弄坏一处（累积）。
+        std::vector<int> lost;
+        if (std::string(what) == "header-ff") {
+            s67::overwrite(data, recs[999].offset, std::string(27, '\xff'));
+            lost = {999};
+        } else if (std::string(what) == "value-size-huge") {
+            // 只把 value_sz 改成一个大数：头里的长度越过文件尾。
+            s67::overwrite(data, recs[400].offset + 23, std::string("\xff\xff\xff\x7f", 4));
+            lost = {999, 400};
+        } else {
+            // 一段 4 KiB 的零（文件系统故障后常见的形态），跨好几条记录。
+            s67::overwrite(data, recs[1500].offset + 5, std::string(4096, '\0'));
+            lost = {999, 400};
+            for (int i = 1500; i < kN; ++i) {
+                if (recs[static_cast<std::size_t>(i)].offset < recs[1500].offset + 5 + 4096) {
+                    lost.push_back(i);
+                }
+            }
+            ASSERT_GT(lost.size(), 10u);
+        }
+        s67::drop_index(tmpdir_);
+
+        CaskOptions opts;
+        opts.read_write = true;
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c) << c.error().detail;
+        EXPECT_EQ(std::filesystem::file_size(data), size_before) << "sealed file was truncated";
+        int present = 0;
+        for (int i = 0; i < kN; ++i) {
+            auto gr = (*c)->get_owned(bytes(key_for(i)));
+            const bool expect_lost =
+                std::find(lost.begin(), lost.end(), i) != lost.end();
+            if (expect_lost) {
+                EXPECT_FALSE(gr) << "corrupted record " << i << " came back";
+            } else {
+                ASSERT_TRUE(gr) << "record " << i << " lost: " << gr.error().detail;
+                EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(gr->value.data()),
+                                           gr->value.size()),
+                          value_for(i));
+                ++present;
+            }
+        }
+        EXPECT_EQ(present, kN - static_cast<int>(lost.size()));
+        // 还能接着写；再开一次结果不变。
+        ASSERT_TRUE((*c)->put(bytes("after-" + std::string(what)), bytes("ok")));
+        (*c)->close();
+    }
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    EXPECT_TRUE((*c)->get_owned(bytes("after-header-ff")));
+    EXPECT_TRUE((*c)->get_owned(bytes("after-zero-4k")));
+    EXPECT_TRUE((*c)->get_owned(bytes(key_for(1999))));
+    EXPECT_EQ(std::filesystem::file_size(data), size_before);
+    (*c)->close();
+}
+
+// 索引还在时：水位之内那条坏记录在读的时候报 kBadCrc（此前并进 kIo）。
+TEST_F(CrashRecoveryTest, CorruptRecordReadReportsBadCrc) {
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 50; ++i) {
+            ASSERT_TRUE((*c)->put(bytes(key_for(i)), bytes(value_for(i))));
+        }
+        (*c)->close();
+    }
+    const auto data = max_data_file();
+    const auto recs = s67::records_of(data);
+    s67::overwrite(data, recs[20].offset, std::string(27, '\xff'));
+
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    auto bad = (*c)->get_owned(bytes(key_for(20)));
+    ASSERT_FALSE(bad);
+    EXPECT_EQ(bad.error().kind, bitcask::CaskError::kBadCrc);
+    EXPECT_TRUE((*c)->get_owned(bytes(key_for(19))));
+    EXPECT_TRUE((*c)->get_owned(bytes(key_for(21))));
+    (*c)->close();
+}
+
+// 正常关闭之后文件末尾多出来的垃圾 / 被掐掉一截：不是崩溃尾巴，不截断；
+// 不完整的原子批仍然整批不可见。
+TEST_F(CrashRecoveryTest, CleanCloseThenDamagedTailIsNotTruncated) {
+    std::uint64_t size_before_batch = 0;
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 20; ++i) {
+            ASSERT_TRUE((*c)->put(bytes(key_for(i)), bytes(value_for(i))));
+        }
+        ASSERT_TRUE((*c)->sync());
+        size_before_batch = std::filesystem::file_size(max_data_file());
+        const auto k1 = bytes("b1"), k2 = bytes("b2"), k3 = bytes("b3"), v = bytes("v");
+        const std::vector<Cask::BatchOp> ops = {
+            {.type = Cask::BatchOp::Type::kPut, .key = k1, .value = v},
+            {.type = Cask::BatchOp::Type::kPut, .key = k2, .value = v},
+            {.type = Cask::BatchOp::Type::kPut, .key = k3, .value = v}};
+        ASSERT_TRUE((*c)->put_batch_atomic(ops));
+        (*c)->close();
+    }
+    const auto data = max_data_file();
+    std::error_code ec;
+    const auto full = std::filesystem::file_size(data);
+    std::filesystem::resize_file(data, full - 1, ec);   // 批的最后一个成员缺 1 字节
+    ASSERT_FALSE(ec);
+    s67::drop_index(tmpdir_);
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c) << c.error().detail;
+        for (int i = 0; i < 20; ++i) EXPECT_TRUE((*c)->get_owned(bytes(key_for(i))));
+        for (const char* k : {"b1", "b2", "b3"}) {
+            auto gr = (*c)->get_owned(bytes(k));
+            ASSERT_FALSE(gr) << "member of an incomplete batch became visible: " << k;
+            EXPECT_EQ(gr.error().kind, bitcask::CaskError::kNotFound);
+        }
+        EXPECT_EQ(std::filesystem::file_size(data), full - 1) << "no crash evidence: must not truncate";
+        ASSERT_TRUE((*c)->put(bytes("later"), bytes("ok")));
+        (*c)->close();
+    }
+    // 同一个目录再开：结论不变（不会因为那个文件不再是最新的而把批成员放出来）。
+    s67::drop_index(tmpdir_);
+    CaskOptions opts;
+    opts.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c);
+    EXPECT_FALSE((*c)->get_owned(bytes("b1")));
+    EXPECT_FALSE((*c)->get_owned(bytes("b3")));
+    EXPECT_TRUE((*c)->get_owned(bytes("later")));
+    EXPECT_TRUE((*c)->get_owned(bytes(key_for(19))));
+    EXPECT_GT(size_before_batch, 0u);
+    (*c)->close();
+}
+
+// 写者崩溃（留下陈旧写锁）+ 多个文件：崩溃时正在写的那个文件的尾巴照旧截断；
+// 更早的已封口文件中间的坏区跳过、不截断。
+TEST_F(CrashRecoveryTest, CrashedWriterTailTruncatedSealedFilesHealed) {
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        opts.max_file_size = 8 * 1024;  // 逼出多个文件
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c);
+        for (int i = 0; i < 1000; ++i) {
+            ASSERT_TRUE((*c)->put(bytes(key_for(i)), bytes(value_for(i))));
+        }
+        ASSERT_TRUE((*c)->sync());
+        (*c)->close();
+    }
+    const auto files = s67::data_files(tmpdir_);
+    ASSERT_GE(files.size(), 3u);
+    const auto& sealed = files.front();
+    const auto& active = files.back();
+    const auto sealed_recs = s67::records_of(sealed);
+    ASSERT_GE(sealed_recs.size(), 10u);
+    const auto sealed_size = std::filesystem::file_size(sealed);
+    const auto active_valid = std::filesystem::file_size(active);
+    s67::overwrite(sealed, sealed_recs[3].offset, std::string(27, '\xff'));
+    {
+        std::ofstream out(active, std::ios::binary | std::ios::app);
+        out << std::string(100, 'G');
+    }
+    s67::drop_index(tmpdir_);
+    bitcask::test::plant_stale_writer_lock(tmpdir_, active);
+
+    CaskOptions opts;
+    opts.read_write = true;
+    opts.max_file_size = 8 * 1024;
+    auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+    ASSERT_TRUE(c) << c.error().detail;
+    EXPECT_EQ(std::filesystem::file_size(sealed), sealed_size) << "sealed file truncated";
+    EXPECT_EQ(std::filesystem::file_size(active), active_valid) << "crashed writer's tail kept";
+    int missing = 0;
+    for (int i = 0; i < 1000; ++i) {
+        if (!(*c)->get_owned(bytes(key_for(i)))) ++missing;
+    }
+    EXPECT_EQ(missing, 1);  // 只丢被写坏头的那一条
+    (*c)->close();
+}
+
+// DataFile::find_next_record / batch_end_at 的契约。
+TEST_F(CrashRecoveryTest, FindNextRecordResyncRules) {
+    using bitcask::fileops::DataFile;
+    using bitcask::format::RecordType;
+    const auto path = (tmpdir_ / "1.bitcask.data").string();
+    std::vector<s67::Rec> recs;
+    std::uint64_t embedded_at = 0;
+    {
+        auto f = DataFile::open(path, DataFile::Mode::kCreate);
+        ASSERT_TRUE(f);
+        auto add = [&](const std::string& k, const std::string& v) {
+            auto w = f->write(RecordType::kDoc, 1, recs.size(), bytes(k), bytes(v));
+            ASSERT_TRUE(w);
+            recs.push_back({w->offset, w->total_size});
+        };
+        add("a", std::string(40, 'x'));
+        add("b", std::string(40, 'y'));
+        // 一条 value 里嵌着「一条完整记录的字节」的记录：把 a 的整条记录映像放进
+        // value 中间。嵌着的那条后面不是另一条完好记录，不能当成重新同步点。
+        std::string img(recs[0].size, '\0');
+        {
+            std::ifstream in(path, std::ios::binary);
+            in.read(img.data(), static_cast<std::streamsize>(img.size()));
+        }
+        add("c", std::string(10, 'p') + img + std::string(10, 'q'));
+        embedded_at = recs[2].offset + 27 + 1 + 10;
+        add("d", std::string(40, 'z'));
+        add("e", std::string(40, 'w'));
+    }
+    auto f = DataFile::open(path, DataFile::Mode::kRead, false, false);
+    ASSERT_TRUE(f);
+    // 从任意一条的中间出发，找到的是下一条的起点。
+    auto n0 = f->find_next_record(recs[0].offset + 1);
+    ASSERT_TRUE(n0.has_value() && n0->has_value());
+    EXPECT_EQ(**n0, recs[1].offset);
+    // 从 c 的头后面出发：越过嵌在 value 里的那条映像，落在 d。
+    auto n2 = f->find_next_record(recs[2].offset + 1);
+    ASSERT_TRUE(n2.has_value() && n2->has_value());
+    EXPECT_NE(**n2, embedded_at);
+    EXPECT_EQ(**n2, recs[3].offset);
+    // 最后一条：恰好结束在文件尾，算完好。
+    auto n4 = f->find_next_record(recs[3].offset + 1);
+    ASSERT_TRUE(n4.has_value() && n4->has_value());
+    EXPECT_EQ(**n4, recs[4].offset);
+    // 之后没有了。
+    auto n5 = f->find_next_record(recs[4].offset + 1);
+    ASSERT_TRUE(n5.has_value());
+    EXPECT_FALSE(n5->has_value());
+    // 普通记录不是批头。
+    auto be = f->batch_end_at(recs[0].offset);
+    ASSERT_TRUE(be.has_value());
+    EXPECT_FALSE(be->has_value());
 }
 
 }  // namespace

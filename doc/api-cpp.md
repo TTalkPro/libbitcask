@@ -1118,7 +1118,7 @@ struct RangeOptions {
     std::span<const std::byte> lo{};   // inclusive；空 = 从头
     std::span<const std::byte> hi{};   // exclusive；空 = 到尾
     std::size_t prefetch = 0;          // 0/1 = 关闭；>1 = 批量并发预取值
-    std::size_t prefetch_threads = 0;  // 0 = min(hardware_concurrency, 4)
+    std::size_t prefetch_threads = 0;  // 0 = 自动（≤ min(hw, 4)，不划算时串行）；>0 = 固定
     bool want_meta = false;                    // Entry::meta 填原样 meta blob
     const meta::MetaFilter* filter = nullptr;  // 只交出 meta 满足条件的 key（借用）
 };
@@ -1141,7 +1141,7 @@ public:
 - **一致性：per-key 弱一致**（与 `parallel_scan` 同档）——迭代期间的并发写可能部分可见，**不是** `CaskIter` 的 fold 快照语义。需要快照请先用 `CaskIter` 冻结。
 - **生命周期**：不可跨线程共享；须在 `Cask::close()` 之前用完（内部 pin OKI
   `ReadView`，但取值经 Cask 读路径）。无 `release()`——析构即释放。
-- **`prefetch`（S33-6）**：>1 时一次归并出 `prefetch` 个 key，再用 `prefetch_threads` 个线程并发取值填缓冲，`next()` 从缓冲出货。**只改变取值时机，输出序与内容和惰性路径完全一致**。线程按批创建（无常驻池），故内部按「每线程至少 64 个 key」收窄线程数——小批自动退化为串行。实测（tmpfs、1 KiB 值、6250 条命中窗口）：惰性 10.8 ms、`prefetch=64` 11.6 ms（无收益）、`prefetch=256/4 线程` 7.6 ms（**1.4×**）。收益形态是「大窗口 + 值不在页缓存」；小窗口或值已缓存时线程成本可能反超，故默认关闭。
+- **`prefetch`（S33-6）**：>1 时一次归并出 `prefetch` 个 key，再用 `prefetch_threads` 个线程并发取值填缓冲，`next()` 从缓冲出货。**只改变取值时机，输出序与内容和惰性路径完全一致**。线程按批创建（无常驻池），故内部按「每线程至少 64 个 key」收窄线程数——小批自动退化为串行。实测（tmpfs、1 KiB 值、6250 条命中窗口）：惰性 10.8 ms、`prefetch=64` 11.6 ms（无收益）、`prefetch=256/4 线程` 7.6 ms（**1.4×**）。收益形态是「大窗口 + 值不在页缓存」；小窗口或值已缓存时线程成本可能反超，故默认关闭。S71 起 `prefetch_threads = 0`（缺省）时每批先串行取 32 条计时，按实测单条成本估算并行省下的时间盖不过起线程的成本就整批串行：热缓存、200 B 值、20 万行时 `prefetch=256` 从比不开慢 1.5～1.9 倍降到慢 5～15%（剩下的是攒批本身的开销）；显式给线程数则照给的并行。
 - 错误：run 损坏 → `kBadCrc`（该 run 整体不可信，重开会重建）；取值路径的 IO 错误原样上抛。并发删除导致的 `kNotFound` 静默跳过（同 `parallel_scan`）。
 
 ```cpp

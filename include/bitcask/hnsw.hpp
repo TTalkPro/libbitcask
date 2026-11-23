@@ -110,8 +110,15 @@ public:
     // 文档占多数 / meta filter 选择性高时仍能回满 k(旧版结果侧过滤:先取
     // ef 个候选再滤,活比一低就回不满;int8 粗筛路径还先截到 3k,调大 ef
     // 也无效)。代价:耗时约 ∝ 1/通过率,过滤求值次数约 3·ef/通过率。
-    // 预算:带过滤时 0 层距离计算上限 ef × kFilterBudgetMul,耗尽即返回
-    // 已找到的(可能 < k)——通过率极低时宁可少返回,不把全图扫一遍。
+    // 预算:带过滤时 0 层距离计算上限 ef × kFilterBudgetMul。
+    // S67:预算耗尽且结果不足 k 时退到**精确扫描**(全部节点过一遍过滤器,对通过者
+    // 逐个算距离)——此前是带着不足 k 条的结果直接返回,调用方分不清穷尽与截断。
+    // 精确扫描的代价是 O(节点数) 次过滤求值,所以只在图不超过 kExactFallbackMaxNodes
+    // 个节点时做(约一百万节点、几十毫秒量级);更大的图维持原取舍——预算耗尽即返回
+    // 已找到的(可能 < k),要回满请调大 ef(预算随 ef 线性放大)。
+    // 即:节点数 ≤ kExactFallbackMaxNodes 时,带过滤的检索返回不足 k 条 ⟺ 满足过滤
+    // 的文档确实不足 k 篇。
+    static constexpr std::size_t kExactFallbackMaxNodes = std::size_t{1} << 20;
     static constexpr std::size_t kFilterBudgetMul = 256;
     [[nodiscard]] std::vector<Hit> search(
         std::span<const float> query, std::size_t k, std::size_t ef,
@@ -423,6 +430,12 @@ private:
     // 标准 search-layer:返回 ≤ef 个 (dist,id),按 dist 升序。
     // S51:filter 非空 = 遍历期过滤(只有 0 层查询传;建图路径恒不传)。此时
     // out 只含通过过滤的节点,可能为空。
+    // S67：search_filtered 在预算耗尽且不足 k 时的兜底——全部节点过一遍过滤器，
+    // 通过者逐个算距离取前 k（定义与说明见 hnsw.cpp）。
+    void exact_filtered_scan(
+        const float* q, std::uint32_t n, std::size_t k, const BatchFilter& filter,
+        std::vector<std::pair<float, std::uint32_t>>& found) const;
+
     void search_layer(const float* q, std::uint32_t entry, std::size_t ef,
                       std::uint32_t layer, std::uint32_t n,
                       std::uint32_t* scratch,
