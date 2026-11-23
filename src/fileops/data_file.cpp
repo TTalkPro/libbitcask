@@ -154,14 +154,9 @@ DataFile::read_mmap(std::uint64_t offset, std::uint32_t total_size) const {
     auto rec = codec::decode_data_record(
         std::span<const std::byte>(map_.data() + offset, total_size));
     if (!rec) {
-        switch (rec.error()) {
-            case codec::DecodeError::kBadCrc:
-                return std::unexpected(DataFileFault{DataFileError::kBadCrc});
-            case codec::DecodeError::kBufferTooShort:
-                return std::unexpected(DataFileFault{DataFileError::kShortRead});
-            default:
-                return std::unexpected(DataFileFault{DataFileError::kBadCrc});
-        }
+        // S67：区间已在映射的有效范围内（上面核过）——解不出来就是记录坏了。
+        // 报 kShortRead 会让调用方当成「落在映射窗口之外」退回 pread 再读一遍。
+        return std::unexpected(DataFileFault{DataFileError::kBadCrc});
     }
     return *rec;
 }
@@ -323,15 +318,11 @@ DataFile::read(std::uint64_t offset, std::uint32_t total_size) {
     auto rec = codec::decode_data_record(
         std::span<const std::byte>(rb, total_size));
     if (!rec) {
-        // codec::DecodeError → DataFileFault
-        switch (rec.error()) {
-            case codec::DecodeError::kBadCrc:
-                return std::unexpected(DataFileFault{DataFileError::kBadCrc});
-            case codec::DecodeError::kBufferTooShort:
-                return std::unexpected(DataFileFault{DataFileError::kShortRead});
-            default:
-                return std::unexpected(DataFileFault{DataFileError::kBadCrc});
-        }
+        // S67：调用方给的 total_size 字节已经完整读到——再解不出来（CRC 不过，或
+        // 记录头里的长度与索引记的对不上）就是这条记录坏了，一律报 kBadCrc。
+        // 此前「头里的长度偏大」会报成 kShortRead，上层并进 kIo，下游分不清是
+        // 读盘失败还是记录损坏。
+        return std::unexpected(DataFileFault{DataFileError::kBadCrc});
     }
     ReadRecord out;
     out.type       = rec->type;
@@ -461,6 +452,116 @@ DataFile::fold(FoldFn fn, bool tolerate_crc_errors,
     // 防线程内存膨胀：一次巨型 record 不应让 buffer 永久占住线程堆。
     rd.shrink();
     return {};
+}
+
+// S67：损坏恢复的重新同步（契约见头文件）。
+std::expected<std::optional<std::uint64_t>, DataFileFault>
+DataFile::find_next_record(std::uint64_t from) {
+    const std::uint64_t total = current_offset_;
+    // 块读：一块 1 MiB，块与块之间重叠一个记录头，候选记录整条落在块内时直接在
+    // 内存里验，不落在块内（大记录）才单独 pread。
+    constexpr std::size_t kChunk = 1u << 20;
+    std::vector<std::byte> buf(kChunk + format::kHeaderSize);
+    std::vector<std::byte> big;
+
+    // 取 [off, off+len) 的字节：优先从当前块里拿，否则 pread 进 big。
+    std::uint64_t chunk_off = 0;
+    std::size_t chunk_len = 0;
+    const auto bytes_at = [&](std::uint64_t off, std::size_t len)
+        -> std::expected<std::span<const std::byte>, DataFileFault> {
+        if (off >= chunk_off && off + len <= chunk_off + chunk_len) {
+            return std::span<const std::byte>(buf.data() + (off - chunk_off), len);
+        }
+        big.resize(len);
+        auto n = file_.pread_into(off, std::span(big.data(), len));
+        if (!n) return std::unexpected(io_fault(n.error()));
+        if (*n < len) return std::span<const std::byte>{};
+        return std::span<const std::byte>(big.data(), len);
+    };
+    // off 处是否是一条完好的记录；是则给出它的总长。
+    const auto valid_at = [&](std::uint64_t off)
+        -> std::expected<std::uint64_t, DataFileFault> {  // 0 = 不是
+        if (off + format::kHeaderSize > total) return std::uint64_t{0};
+        auto h = bytes_at(off, format::kHeaderSize);
+        if (!h) return std::unexpected(h.error());
+        if (h->size() < format::kHeaderSize) return std::uint64_t{0};
+        const auto type = static_cast<std::uint8_t>((*h)[format::kTypeOffset]);
+        if (type > static_cast<std::uint8_t>(format::RecordType::kBatchHeader)) {
+            return std::uint64_t{0};
+        }
+        std::uint16_t key_sz;
+        std::uint32_t value_sz;
+        std::memcpy(&key_sz, h->data() + format::kKeySzOffset, sizeof(key_sz));
+        std::memcpy(&value_sz, h->data() + format::kValueSzOffset, sizeof(value_sz));
+        const std::uint64_t rec_total =
+            static_cast<std::uint64_t>(format::kHeaderSize) + key_sz + value_sz;
+        if (off + rec_total > total) return std::uint64_t{0};
+        auto r = bytes_at(off, static_cast<std::size_t>(rec_total));
+        if (!r) return std::unexpected(r.error());
+        if (r->size() < rec_total) return std::uint64_t{0};
+        if (!codec::decode_data_record(*r)) return std::uint64_t{0};
+        return rec_total;
+    };
+
+    for (std::uint64_t off = from; off + format::kHeaderSize <= total;) {
+        // 装入以 off 起头的一块；本块能验的起点是「记录头整个落在块内」的那些。
+        const std::size_t want = static_cast<std::size_t>(
+            std::min<std::uint64_t>(buf.size(), total - off));
+        auto n = file_.pread_into(off, std::span(buf.data(), want));
+        if (!n) return std::unexpected(io_fault(n.error()));
+        chunk_off = off;
+        chunk_len = *n;
+        if (chunk_len < format::kHeaderSize) break;
+        const std::uint64_t last = chunk_off + chunk_len - format::kHeaderSize;  // 含
+        for (; off <= last; ++off) {
+            // 最便宜的筛：类型字节。
+            const auto type = static_cast<std::uint8_t>(
+                buf[static_cast<std::size_t>(off - chunk_off) + format::kTypeOffset]);
+            if (type > static_cast<std::uint8_t>(format::RecordType::kBatchHeader)) continue;
+            auto v = valid_at(off);
+            if (!v) return std::unexpected(v.error());
+            if (*v == 0) continue;
+            const std::uint64_t next = off + *v;
+            if (next == total) return std::optional<std::uint64_t>(off);
+            auto v2 = valid_at(next);
+            if (!v2) return std::unexpected(v2.error());
+            if (*v2 != 0) return std::optional<std::uint64_t>(off);
+        }
+        // 下一块从 last + 1 起（与本块重叠一个记录头减一字节）。
+    }
+    return std::optional<std::uint64_t>{};
+}
+
+std::expected<std::optional<std::uint64_t>, DataFileFault>
+DataFile::batch_end_at(std::uint64_t offset) {
+    const std::uint64_t total = current_offset_;
+    if (offset + format::kHeaderSize > total) return std::optional<std::uint64_t>{};
+    std::byte head[format::kHeaderSize];
+    auto n = file_.pread_into(offset, std::span(head, format::kHeaderSize));
+    if (!n) return std::unexpected(io_fault(n.error()));
+    if (*n < format::kHeaderSize) return std::optional<std::uint64_t>{};
+    if (static_cast<std::uint8_t>(head[format::kTypeOffset]) !=
+        static_cast<std::uint8_t>(format::RecordType::kBatchHeader)) {
+        return std::optional<std::uint64_t>{};
+    }
+    std::uint16_t key_sz;
+    std::uint32_t value_sz;
+    std::memcpy(&key_sz, head + format::kKeySzOffset, sizeof(key_sz));
+    std::memcpy(&value_sz, head + format::kValueSzOffset, sizeof(value_sz));
+    const std::uint64_t rec_total =
+        static_cast<std::uint64_t>(format::kHeaderSize) + key_sz + value_sz;
+    if (rec_total > (1u << 16) || offset + rec_total > total) {
+        return std::optional<std::uint64_t>{};  // 批头记录本身很小；否则不是批头
+    }
+    std::vector<std::byte> rec(static_cast<std::size_t>(rec_total));
+    auto m = file_.pread_into(offset, std::span(rec.data(), rec.size()));
+    if (!m) return std::unexpected(io_fault(m.error()));
+    if (*m < rec.size()) return std::optional<std::uint64_t>{};
+    auto view = codec::decode_data_record(rec);
+    if (!view) return std::optional<std::uint64_t>{};
+    auto bh = codec::decode_batch_header_value(view->value);
+    if (!bh) return std::optional<std::uint64_t>{};
+    return std::optional<std::uint64_t>(offset + rec_total + bh->span_bytes);
 }
 
 // 截到指定大小（torn-write 修复用）：seek 到 new_size 然后 ftruncate。

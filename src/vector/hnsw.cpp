@@ -832,6 +832,9 @@ struct ReusablePQ : std::priority_queue<Cand, std::vector<Cand>, Compare> {
     using Base::Base;
     std::vector<Cand> extract() && noexcept { return std::move(this->c); }
 };
+// S67：带过滤的 0 层搜索是否因距离计算预算耗尽而提前返回（search_filtered 据此
+// 决定要不要退到精确扫描）。每次 search_filtered 开头清零。
+thread_local bool tl_filter_budget_hit = false;
 thread_local std::vector<Cand> tl_cands_buf;
 thread_local std::vector<Cand> tl_top_buf;
 
@@ -905,7 +908,10 @@ void HnswIndex::search_layer_impl(
         while (!cands.empty()) {
             const auto [d, id] = cands.top();
             if (top.size() >= ef && d > top.top().first) break;  // 收敛
-            if (evals >= budget) break;                           // 预算耗尽
+            if (evals >= budget) {                                // 预算耗尽
+                tl_filter_budget_hit = true;
+                break;
+            }
             cands.pop();
             const std::uint32_t cnt = copy_neighbors(id, layer, scratch);
             for (std::uint32_t i = 0; i < cnt; ++i) {
@@ -1368,6 +1374,47 @@ void HnswIndex::link_node(std::uint32_t id, bool repair) {
     }
 }
 
+// S67：精确的带过滤扫描（search_filtered 的兜底）。found 输出按距离升序、至多 k 条，
+// 距离口径与图遍历之后的最终结果一致：有常驻 f32 时用 f32；int8-only 模式用 int8。
+void HnswIndex::exact_filtered_scan(
+    const float* q, std::uint32_t n, std::size_t k, const BatchFilter& filter,
+    std::vector<std::pair<float, std::uint32_t>>& found) const {
+    found.clear();
+    int8::QVector qq;
+    if (cfg_.inmem_int8) int8::quantize_into(q, cfg_.dim, qq);
+    constexpr std::uint32_t kBatch = 256;
+    std::vector<std::uint64_t> ords;
+    std::vector<char> ok;
+    ords.reserve(kBatch);
+    // 最大堆（堆顶 = 当前前 k 里最远的）。
+    const auto worse = [](const std::pair<float, std::uint32_t>& a,
+                          const std::pair<float, std::uint32_t>& b) {
+        return a.first < b.first;
+    };
+    for (std::uint32_t base = 0; base < n; base += kBatch) {
+        const std::uint32_t end = std::min(n, base + kBatch);
+        ords.clear();
+        for (std::uint32_t id = base; id < end; ++id) ords.push_back(ord_of(id));
+        ok.assign(ords.size(), 0);
+        filter(std::span<const std::uint64_t>(ords), std::span<char>(ok));
+        for (std::uint32_t id = base; id < end; ++id) {
+            if (!ok[id - base]) continue;
+            const float d = cfg_.inmem_int8
+                ? dist_id_int8(qq.codes.data(), qq.scale, qq.sum_codes, id)
+                : dist_id(q, id);
+            if (found.size() < k) {
+                found.emplace_back(d, id);
+                std::push_heap(found.begin(), found.end(), worse);
+            } else if (d < found.front().first) {
+                std::pop_heap(found.begin(), found.end(), worse);
+                found.back() = {d, id};
+                std::push_heap(found.begin(), found.end(), worse);
+            }
+        }
+    }
+    std::sort_heap(found.begin(), found.end(), worse);  // 升序
+}
+
 std::vector<HnswIndex::Hit> HnswIndex::search(
     std::span<const float> query, std::size_t k, std::size_t ef,
     const std::function<bool(std::uint64_t)>* live) const {
@@ -1388,6 +1435,7 @@ std::vector<HnswIndex::Hit> HnswIndex::search_filtered(
     const BatchFilter* filter = filter_fn ? &filter_fn : nullptr;
     std::vector<Hit> hits;
     if (k == 0) return hits;
+    tl_filter_budget_hit = false;
     assert(query.size() == cfg_.dim);
 
     // 一致快照:先 entry_meta_(acquire)再 count_(acquire)。entry 的
@@ -1504,6 +1552,16 @@ std::vector<HnswIndex::Hit> HnswIndex::search_filtered(
                                  scratch.data());
         }
         search_layer(q, cur, ef, 0, n, scratch.data(), found, filter);
+    }
+
+    // S67（下游反馈 2026-11-23）：过滤很严时图遍历会在预算耗尽后带着不足 k 条的
+    // 结果返回——哪怕满足过滤的文档远多于 k。这时退到精确扫描：把全部节点过一遍
+    // 过滤器，对通过者逐个算距离取前 k。代价是 O(节点数) 次过滤求值（内存里的 meta
+    // 比较）外加通过者的距离计算——比「悄悄少给」值得；图遍历自己收敛（没耗尽预算）
+    // 或已经凑满 k 时不触发。图太大（> kExactFallbackMaxNodes）时不做，维持原取舍。
+    if (filter != nullptr && tl_filter_budget_hit && found.size() < k &&
+        n <= kExactFallbackMaxNodes) {
+        exact_filtered_scan(q, n, k, *filter, found);
     }
 
     // S51:found 已是遍历期过滤后的结果,这里不再滤(免二次求值)。

@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`12.0.3`**；库 `SOVERSION` = **`12`**（= major）；
+`bitcask_version_*` = **`12.1.0`**；库 `SOVERSION` = **`12`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -14,6 +14,55 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 （4.0.0 / 5.0.0 / 6.0.0 / 7.0.0 / 8.0.0 / 9.0.0 皆是）。
 
 ---
+
+## [12.1.0] - 2026-11-23（S67：恢复不截断已封口的数据；带过滤的向量检索回满；候选集内向量排序 + S66：落盘后的点查提速）
+
+> **版本语义**：MINOR **12.1.0**（S67 新增公开入口 `Cask::rank_by_vector` / C API `bitcask_vector_rank`）。
+> 盘上格式不变；既有 C API 与 C++ 类的成员偏移不变（`IndexAuthority` 末尾追加一个成员）；
+> S66 部分只改内部实现（`OkiBlockCache` 新增内联访问器 `enabled()`）。
+
+### Fixed
+
+- **数据文件中间的损坏不再让恢复把文件截断**（S67，反馈
+  `feedbacks/2026-11-23-recovery-truncates-synced-data-on-bad-record-header.md`，bitcask）：索引从 data 重建时，fold 在一条读不出来的
+  记录上停下，此前一律当作「没写完的尾巴」把文件截到那里——哪怕那是已经 fsync、正常关闭的文件中间的一处位腐，后面的记录全部被删，
+  `open` 照样成功。现在：
+  - 只有上一个写者**没有正常关闭**时它正在写的文件才可能有尾巴、才会被截断（依据是遗留的写锁：它记着活跃文件）；
+  - 其余文件一个字节不动：坏区跳过去，从后面第一条完好的记录接着读（每处打一条 warn 日志，带文件与起止偏移）；
+  - 成员不全的原子批仍然整批不可见，跳坏区不会把它的成员单独放出来。
+- 读一条在索引里但盘上已坏的记录，统一报 `kBadCrc`（此前坏在长度字段上时报成 `kIo`）。
+- 取得写锁后 fsync 目录，写锁文件的目录项不再可能在掉电后消失。
+
+### Changed
+
+- **带过滤的 `search_vector`（HNSW）不再悄悄少给**（S67，反馈
+  `feedbacks/2026-11-23-filtered-vector-search-incomplete-no-candidate-scoring.md`，bitcask）：过滤很严时图遍历在距离计算预算
+  （`ef × 256`）耗尽后带着不足 k 条返回。现在这种情况下退到精确扫描——全部节点过一遍过滤器、通过者逐个算距离取前 k。
+  节点数不超过 `HnswIndex::kExactFallbackMaxNodes`（2^20）时，返回不足 k 条 ⟺ 满足过滤的文档确实不足 k 篇；更大的图维持原取舍
+  （要回满请调大 `ef`）。代价：过滤全拒 / 极严的查询多一遍 O(节点数) 的过滤求值。
+- **行为变化**：正常关闭过的库，文件尾部的残缺不再被截掉，而是留在原处、读的时候跳过。
+- **行落进 run 之后（重开 / checkpoint 之后）的点查命中提速 3.5～8 倍**（S66，反馈
+  `feedbacks/2026-11-23-point-get-after-flush-scans-run-block-linearly.md`，bitcask）：`OkiRunReader::find` 此前在 4 KiB 的前缀压缩块里
+  从头逐条完整解码（每条重建 key 再拷一份、再整串比较），命中平均走半块；块缓存命中后还对整块重算一遍 CRC。现在：
+  - 块内只为比较而解——利用前缀压缩做增量比较，不重建 key；
+  - 块缓存开着时给被点查过的块配一份采样索引（每 16 行一个完整 key + 偏移 + 差分累加值，同样放在块缓存里），先二分再走至多 16 行；
+  - 块 CRC 只在块从盘上读进缓存的那一次校验，坏块不进缓存。
+  `BM_Cask_Get_Hot_View_Reopened`（128 B 的值，建库后重开）命中一次：1 千 / 10 万 / 40 万个 key 由 3023 / 3392 / 3562 ns 降到
+  365 / 703 / 1008 ns（同档行在 memdelta 时是 130 / 502 / 646 ns）。盘上格式不变；采样索引占块缓存容量的一部分（约为块大小的 15%～20%）。
+- 基准新增 `BM_Cask_Get_Hot_View_Reopened`。
+
+### Added
+
+- `Cask::rank_by_vector(query, keys, k)` / C API `bitcask_vector_rank`：在给定的一组 key 里按向量相似度**精确**排序取前 k。
+  候选已经由别处给出（图上的邻居、全文检索的命中、二级索引筛出的一批 key）时用它，不必把候选条件翻译成 meta filter，也不必把
+  向量读回宿主自己算。不经向量索引（与 HNSW / IVF-RQ / DiskANN 无关）、不需要先 `flush_index`；分数口径同 `search_vector`。
+  不存在 / 已删 / 没有向量的 key 跳过，重复的只算一次。代价与候选数成正比（每个候选一次点读）。
+- `DataFile::find_next_record` / `batch_end_at`、`IndexAuthority::set_unsealed_files` / `may_have_torn_tail`（恢复用）。
+
+### 验证
+
+GCC Release（`-Werror`）全量 ctest 982 注册 / 980 执行全绿；ASan 全量 980 全绿；TSan 相关 107 项全绿、无告警；
+clang Debug 相关 242 项全绿。Windows 未实测。
 
 ## [12.0.3] - 2026-11-23（S65：点查命中提速）
 

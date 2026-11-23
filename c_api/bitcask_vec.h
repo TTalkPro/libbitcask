@@ -67,6 +67,16 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_batch(bitcask_t* cask,
                                                            bitcask_fault_t* fault);
 
 
+// 在给定的一组 key 里按向量相似度排序取前 k（S67，对应 Cask::rank_by_vector）。
+// 精确计算、不经向量索引、不需要先 flush；分数口径同 bitcask_search_vector，降序。
+//   keys / key_lens：n_keys 个候选 key 的指针与长度；不存在的 key、没有向量的文档跳过，
+//   重复的 key 只算一次。结果用 bitcask_search_result_free 释放。
+// query_len 必须等于 vector_dim；库没有向量配置 → BITCASK_ERR_INVALID_OPTION。
+BITCASK_API bitcask_error_t bitcask_vector_rank(
+    bitcask_t* cask, const float* query, size_t query_len,
+    const void* const* keys, const size_t* key_lens, size_t n_keys, size_t k,
+    bitcask_search_result_t** out, bitcask_fault_t* fault);
+
 BITCASK_API bitcask_error_t bitcask_search_vector_filtered(
     bitcask_t* cask, const float* query, size_t query_len, size_t k, size_t ef,
     const bitcask_meta_filter_t* filter,

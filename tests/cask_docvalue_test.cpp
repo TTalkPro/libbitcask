@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -2538,6 +2539,130 @@ TEST_F(CaskDocValueTest, V31VectorRoundTripNormalized) {
     ASSERT_EQ(g->vector.size(), 4u);
     EXPECT_FLOAT_EQ(g->vector[0], 0.6f);
     EXPECT_FLOAT_EQ(g->vector[1], 0.8f);
+    (*c)->close();
+}
+
+// S67（feedbacks/2026-11-23-filtered-vector-search-incomplete-no-candidate-scoring.md）：
+// rank_by_vector——在给定的一组 key 里按向量相似度精确排序。
+TEST_F(CaskDocValueTest, S67RankByVectorAmongCandidates) {
+    for (const bool l2 : {false, true}) {
+        SCOPED_TRACE(l2 ? "L2" : "cosine");
+        std::error_code ec;
+        std::filesystem::remove_all(tmpdir_, ec);
+        std::filesystem::create_directories(tmpdir_, ec);
+        auto opts = v31_opts(4);
+        if (l2) opts.vector_metric = bitcask::meta::VectorMetric::kL2;
+        auto c = Cask::open(tmpdir_.string(), opts, &test_registry());
+        ASSERT_TRUE(c) << c.error().detail;
+
+        std::mt19937 rng(67);
+        std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+        std::vector<std::string> keys;
+        std::vector<std::array<float, 4>> vecs;
+        for (int i = 0; i < 200; ++i) {
+            keys.push_back("doc" + std::to_string(i));
+            std::array<float, 4> v{uni(rng), uni(rng), uni(rng), uni(rng)};
+            vecs.push_back(v);
+            bitcask::DocInput doc;
+            const std::string text = "t" + std::to_string(i);
+            doc.text = sv_bytes(text);
+            doc.vector = std::span<const float>(v.data(), 4);
+            ASSERT_TRUE((*c)->put_doc(sv_bytes(keys.back()), doc, 1000));
+        }
+        // 一篇没有向量的文档、一篇随后删掉的文档。
+        {
+            bitcask::DocInput doc;
+            const std::string text = "no vector";
+            doc.text = sv_bytes(text);
+            ASSERT_TRUE((*c)->put_doc(sv_bytes(std::string("plain")), doc, 1000));
+        }
+        ASSERT_TRUE((*c)->remove(sv_bytes(keys[7]), 2000));
+
+        const float q[4] = {0.3f, -0.7f, 0.2f, 0.9f};
+        // 期望：按库的度量对候选暴力算分。cosine 下存的是归一化向量、查询也归一化。
+        const auto score_of = [&](int i) {
+            const auto& v = vecs[static_cast<std::size_t>(i)];
+            if (l2) {
+                double s = 0;
+                for (int d = 0; d < 4; ++d) s -= (double(q[d]) - v[static_cast<std::size_t>(d)]) * (double(q[d]) - v[static_cast<std::size_t>(d)]);
+                return s;
+            }
+            double qn = 0, vn = 0, dot = 0;
+            for (int d = 0; d < 4; ++d) {
+                qn += double(q[d]) * q[d];
+                vn += double(v[static_cast<std::size_t>(d)]) * v[static_cast<std::size_t>(d)];
+                dot += double(q[d]) * v[static_cast<std::size_t>(d)];
+            }
+            return dot / std::sqrt(qn) / std::sqrt(vn);
+        };
+        // 候选：每隔 3 篇取一篇，外加不存在的、无向量的、已删的、重复的。
+        std::vector<std::string> cand_keys;
+        std::vector<int> cand_ids;
+        for (int i = 0; i < 200; i += 3) {
+            cand_keys.push_back(keys[static_cast<std::size_t>(i)]);
+            if (i != 7) cand_ids.push_back(i);
+        }
+        cand_keys.push_back("missing-key");
+        cand_keys.push_back("plain");
+        cand_keys.push_back(keys[7]);
+        cand_keys.push_back(keys[0]);  // 重复
+        std::vector<std::span<const std::byte>> cand;
+        for (const auto& k : cand_keys) cand.push_back(sv_bytes(k));
+
+        std::sort(cand_ids.begin(), cand_ids.end(), [&](int a, int b) {
+            return score_of(a) > score_of(b);
+        });
+
+        // 不 flush 就能用（读到的就是 get 读到的）。
+        auto r = (*c)->rank_by_vector(std::span<const float>(q, 4), cand, 10);
+        ASSERT_TRUE(r) << r.error().detail;
+        ASSERT_EQ(r->hits.size(), 10u);
+        for (std::size_t i = 0; i < 10; ++i) {
+            EXPECT_EQ(r->hits[i].key, keys[static_cast<std::size_t>(cand_ids[i])]) << "rank " << i;
+            EXPECT_NEAR(r->hits[i].score, score_of(cand_ids[i]), 1e-5);
+        }
+        // k 大于候选数：全部返回（去掉不存在 / 无向量 / 已删 / 重复）。
+        auto all = (*c)->rank_by_vector(std::span<const float>(q, 4), cand, 1000);
+        ASSERT_TRUE(all);
+        EXPECT_EQ(all->hits.size(), cand_ids.size());
+        // 分数口径与 search_vector 相同：对同一篇文档两边的分数一致。
+        auto sv = (*c)->search_vector(std::span<const float>(q, 4), 1);
+        ASSERT_TRUE(sv);
+        ASSERT_EQ(sv->hits.size(), 1u);
+        const std::string top_key = sv->hits[0].key;
+        const std::span<const std::byte> one[] = {sv_bytes(top_key)};
+        auto same = (*c)->rank_by_vector(std::span<const float>(q, 4), one, 1);
+        ASSERT_TRUE(same);
+        ASSERT_EQ(same->hits.size(), 1u);
+        EXPECT_NEAR(same->hits[0].score, sv->hits[0].score, 1e-4);
+        EXPECT_EQ(same->hits[0].ord, sv->hits[0].ord);
+        // 边界与错误。
+        auto none = (*c)->rank_by_vector(std::span<const float>(q, 4), {}, 5);
+        ASSERT_TRUE(none);
+        EXPECT_TRUE(none->hits.empty());
+        auto k0 = (*c)->rank_by_vector(std::span<const float>(q, 4), cand, 0);
+        ASSERT_TRUE(k0);
+        EXPECT_TRUE(k0->hits.empty());
+        const float bad[3] = {1, 2, 3};
+        auto dim = (*c)->rank_by_vector(std::span<const float>(bad, 3), cand, 5);
+        ASSERT_FALSE(dim);
+        EXPECT_EQ(dim.error().kind, bitcask::CaskError::kInvalidOption);
+        (*c)->close();
+    }
+    // 没有向量配置的库。
+    std::error_code ec;
+    std::filesystem::remove_all(tmpdir_, ec);
+    std::filesystem::create_directories(tmpdir_, ec);
+    CaskOptions kv;
+    kv.read_write = true;
+    auto c = Cask::open(tmpdir_.string(), kv, &test_registry());
+    ASSERT_TRUE(c);
+    const float q[4] = {1, 0, 0, 0};
+    const std::string k = "x";
+    const std::span<const std::byte> one[] = {sv_bytes(k)};
+    auto r = (*c)->rank_by_vector(std::span<const float>(q, 4), one, 1);
+    ASSERT_FALSE(r);
+    EXPECT_EQ(r.error().kind, bitcask::CaskError::kInvalidOption);
     (*c)->close();
 }
 

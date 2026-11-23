@@ -558,20 +558,35 @@ OkiRunReader::Cursor::load_block(std::size_t bi) {
     };
     if (cache_ != nullptr) {
         // S36-3：块缓存路径——命中零 IO，miss 时 loader pread（锁外）。
+        // S66：块 CRC 在 loader 里校验（块从盘上读进来的那一次），校验不过的块
+        // 不进缓存；缓存命中不再对整块重算——点查每次命中都重算 4 KiB 的 CRC
+        // 曾占落盘后点查的约 7%。
+        bool short_read = false;
+        bool bad_crc = false;
         auto blk = cache_->get_or_load(
             cache_gen_, bi,
             [&]() -> std::optional<std::vector<std::byte>> {
                 std::vector<std::byte> buf(len);
                 auto got = r_->file_.pread_into(b.off,
                                                 std::span(buf.data(), len));
-                if (!got || *got != len) return std::nullopt;
+                if (!got) return std::nullopt;
+                if (*got != len) {
+                    short_read = true;
+                    return std::nullopt;
+                }
+                if (!verify_crc(buf)) {
+                    bad_crc = true;
+                    return std::nullopt;
+                }
                 return buf;
             });
-        if (!blk) return std::unexpected(OkiError::kIo);
+        if (!blk) {
+            return std::unexpected(bad_crc ? OkiError::kCorrupt : OkiError::kIo);
+        }
+        (void)short_read;  // 短读沿用既有口径：kIo
         if ((*blk)->size() != len) {
             return std::unexpected(OkiError::kCorrupt);  // 防御（gen 不重用）
         }
-        if (!verify_crc(**blk)) return std::unexpected(OkiError::kCorrupt);
         blk_hold_ = *std::move(blk);
     } else {
         blk_hold_.reset();
@@ -708,20 +723,290 @@ OkiRunReader::seek_impl(std::span<const std::byte> lo, OkiBlockCache* cache,
     }
 }
 
+// ---------------------------------------------------------------------------
+// S66：点查的块内定位（盘上格式不变）
+//
+// 此前 find 走 seek_impl：块内从头逐条完整解码——每条重建 key（resize + append）、
+// 再拷一份进 Entry、再整串比较；4 KiB 的块两三百行，命中平均走半块，落盘后的点查
+// 因此比行在 memdelta 时慢 5～13 倍
+// （feedbacks/2026-11-23-point-get-after-flush-scans-run-block-linearly.md）。
+// 现在分两层：
+//   1. 只为比较而解：利用前缀压缩做增量比较，不重建 key（scan_block）。
+//   2. 块缓存开着时，给每个被点查过的块配一份「采样索引」，同样放进块缓存
+//      （key = (gen, 块下标 | kSampleIdxFlag)）：每 kSampleEvery 行记一个完整 key、
+//      该行在块里的偏移、以及到这一行之前的 ord / tstamp 差分累加值。点查先在采样
+//      上二分，再从采样行起走至多 kSampleEvery 行。相当于在内存里补上盘上格式
+//      没有的重启点；索引随块缓存的容量与淘汰走，不单独占预算。
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr std::uint64_t kSampleIdxFlag = std::uint64_t{1} << 63;
+constexpr std::size_t kSampleEvery = 16;
+
+// 一行的非 key 部分（key 只给出共享前缀长度与后缀所在位置）。
+struct RowHead {
+    std::size_t shared = 0;
+    std::size_t suffix_len = 0;
+    std::size_t suffix_pos = 0;
+    std::size_t next_pos = 0;
+    std::uint64_t ord_delta = 0;
+    std::uint64_t tstamp_delta = 0;
+    std::uint8_t flags = 0;
+    bool has_loc = false;
+    std::uint32_t file_id = 0;
+    std::uint32_t total_sz = 0;
+    std::uint64_t offset = 0;
+};
+
+// 解 b[pos..] 处的一行；结构错误 → false（同 Cursor::next 的防御口径；
+// shared 与上一行 key 长度的关系由调用方核对）。
+bool parse_row(std::span<const std::byte> b, std::size_t pos, std::uint8_t known_flags,
+               RowHead& out) noexcept {
+    auto shared = codec::vbyte_read_checked(b, pos);
+    if (!shared) return false;
+    auto sfx = codec::vbyte_read_checked(b, shared->second);
+    if (!sfx) return false;
+    pos = sfx->second;
+    if (shared->first > b.size() || sfx->first > b.size() ||
+        pos + sfx->first + 1 > b.size()) {
+        return false;
+    }
+    out.shared = static_cast<std::size_t>(shared->first);
+    out.suffix_len = static_cast<std::size_t>(sfx->first);
+    out.suffix_pos = pos;
+    pos += out.suffix_len;
+    auto od = codec::vbyte_read_checked(b, pos);
+    if (!od) return false;
+    pos = od->second;
+    if (pos + 1 > b.size()) return false;
+    out.flags = static_cast<std::uint8_t>(b[pos]);
+    pos += 1;
+    // 未知扩展位 fail-fast（行无长度前缀，跳不动）。
+    if ((out.flags & ~known_flags) != 0) return false;
+    out.ord_delta = od->first;
+    out.has_loc = (out.flags & kFlagHasLoc) != 0;
+    out.tstamp_delta = 0;
+    if (out.has_loc) {
+        auto fid = codec::vbyte_read_checked(b, pos);
+        if (!fid) return false;
+        auto tsz = codec::vbyte_read_checked(b, fid->second);
+        if (!tsz) return false;
+        auto off = codec::vbyte_read_checked(b, tsz->second);
+        if (!off) return false;
+        auto tsd = codec::vbyte_read_checked(b, off->second);
+        if (!tsd) return false;
+        pos = tsd->second;
+        if (fid->first > 0xFFFF'FFFFull || tsz->first > 0xFFFF'FFFFull) return false;
+        out.file_id = static_cast<std::uint32_t>(fid->first);
+        out.total_sz = static_cast<std::uint32_t>(tsz->first);
+        out.offset = off->first;
+        out.tstamp_delta = tsd->first;
+    }
+    out.next_pos = pos;
+    return true;
+}
+
+// 采样索引的内存布局（只在内存里，本机字节序）：
+//   [u32 n] [Sample × n] [各采样行的完整 key 依次排列]
+struct Sample {
+    std::uint32_t pos = 0;       // 采样行在块内的偏移
+    std::uint32_t key_off = 0;   // key 在索引 blob 里的偏移
+    std::uint32_t key_len = 0;
+    std::uint32_t pad = 0;
+    std::uint64_t ord_before = 0;     // 到采样行之前的 ord 差分累加
+    std::uint64_t tstamp_before = 0;  // 同上，tstamp
+};
+
+std::optional<std::vector<std::byte>>
+build_sample_index(std::span<const std::byte> b, std::uint8_t known_flags) {
+    std::vector<Sample> samples;
+    std::string keys;
+    std::string prev;
+    std::uint64_t ord = 0;
+    std::uint64_t tstamp = 0;
+    std::size_t pos = 0;
+    for (std::size_t row = 0; pos < b.size(); ++row) {
+        RowHead h;
+        if (!parse_row(b, pos, known_flags, h) || h.shared > prev.size()) {
+            return std::nullopt;
+        }
+        prev.resize(h.shared);
+        prev.append(reinterpret_cast<const char*>(b.data() + h.suffix_pos), h.suffix_len);
+        if (row % kSampleEvery == 0) {
+            Sample s;
+            s.pos = static_cast<std::uint32_t>(pos);
+            s.key_off = static_cast<std::uint32_t>(keys.size());
+            s.key_len = static_cast<std::uint32_t>(prev.size());
+            s.ord_before = ord;
+            s.tstamp_before = tstamp;
+            samples.push_back(s);
+            keys.append(prev);
+        }
+        ord += h.ord_delta;
+        tstamp += h.tstamp_delta;
+        pos = h.next_pos;
+    }
+    const std::uint32_t n = static_cast<std::uint32_t>(samples.size());
+    const std::size_t table = sizeof(std::uint32_t) + samples.size() * sizeof(Sample);
+    std::vector<std::byte> out(table + keys.size());
+    std::memcpy(out.data(), &n, sizeof(n));
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        samples[i].key_off += static_cast<std::uint32_t>(table);
+        std::memcpy(out.data() + sizeof(n) + i * sizeof(Sample), &samples[i], sizeof(Sample));
+    }
+    if (!keys.empty()) std::memcpy(out.data() + table, keys.data(), keys.size());
+    return out;
+}
+
+Sample sample_at(std::span<const std::byte> idx, std::size_t i) noexcept {
+    Sample s;
+    std::memcpy(&s, idx.data() + sizeof(std::uint32_t) + i * sizeof(Sample), sizeof(Sample));
+    return s;
+}
+
+std::string_view sample_key(std::span<const std::byte> idx, const Sample& s) noexcept {
+    return {reinterpret_cast<const char*>(idx.data()) + s.key_off, s.key_len};
+}
+
+}  // namespace
+
 std::expected<std::optional<OkiRunReader::Entry>, OkiError>
 OkiRunReader::find(std::span<const std::byte> key, OkiBlockCache* cache,
                    std::uint64_t cache_gen) const {
-    // seek 定位（首个 ≥ key）→ 首行等值比对。run 内同 key 至多一行
-    //（flush/compact/外排都做同 key 去重），单行不跨块——命中必在首行。
-    auto c = seek_impl(key, cache, cache_gen);
-    if (!c) return std::unexpected(c.error());
-    Entry e;
-    auto n = c->next(e);
-    if (!n) return std::unexpected(n.error());
-    if (*n && std::string_view(e.key) == sv(key)) {
-        return std::optional<Entry>(std::move(e));
+    // run 内同 key 至多一行（flush/compact/外排都做同 key 去重），单行不跨块。
+    if (blocks_.empty()) return std::optional<Entry>{};
+    const std::string_view target = sv(key);
+    // 最后一个 first_key ≤ key 的块（全部 > key → key 小于全 run 的首 key，缺席）。
+    auto it = std::upper_bound(
+        blocks_.begin(), blocks_.end(), target,
+        [](std::string_view v, const BlockRef& br) {
+            return v < std::string_view(br.first_key);
+        });
+    if (it == blocks_.begin()) return std::optional<Entry>{};
+    const std::size_t bi = static_cast<std::size_t>(it - blocks_.begin()) - 1;
+
+    Cursor c(this);
+    c.cache_ = cache;
+    c.cache_gen_ = cache_gen;
+    auto l = c.load_block(bi);
+    if (!l) return std::unexpected(l.error());
+    const std::span<const std::byte> b = c.block_span();
+    const std::uint8_t known = version_ != kRunVersion ? kKnownFlagsMaskV2 : kKnownFlagsMask;
+    const auto* tgt = reinterpret_cast<const unsigned char*>(target.data());
+    const std::size_t tgt_len = target.size();
+
+    // 扫描状态。不变式：已走过的行都 < target；match = 上一行的 key 与 target 的公共
+    // 前缀长度；prev_len = 上一行 key 的长度；ord / tstamp = 到当前行之前的累加值。
+    std::size_t pos = 0;
+    std::size_t match = 0;
+    std::size_t prev_len = 0;
+    std::uint64_t ord = 0;
+    std::uint64_t tstamp = 0;
+    // 采样起步时第一行的 key 已知（采样里存着）：直接给出它与 target 的关系。
+    bool first_known = false;
+    int first_rel = 0;
+    std::size_t first_len = 0;
+
+    if (cache != nullptr && cache->enabled()) {
+        bool corrupt = false;
+        auto idx = cache->get_or_load(
+            cache_gen, static_cast<std::uint64_t>(bi) | kSampleIdxFlag,
+            [&]() -> std::optional<std::vector<std::byte>> {
+                auto built = build_sample_index(b, known);
+                if (!built) corrupt = true;
+                return built;
+            });
+        if (!idx) {
+            if (corrupt) return std::unexpected(OkiError::kCorrupt);
+        } else {
+            const std::span<const std::byte> ix(**idx);
+            std::uint32_t n = 0;
+            if (ix.size() >= sizeof(n)) std::memcpy(&n, ix.data(), sizeof(n));
+            if (n > 0) {
+                // 最后一个 key ≤ target 的采样。
+                std::size_t lo = 0, hi = n;  // 答案在 [lo, hi)；sample 0 = 块首 key ≤ target
+                while (hi - lo > 1) {
+                    const std::size_t mid = (lo + hi) / 2;
+                    if (sample_key(ix, sample_at(ix, mid)) <= target) lo = mid;
+                    else hi = mid;
+                }
+                const Sample s = sample_at(ix, lo);
+                const std::string_view sk = sample_key(ix, s);
+                if (sk > target) return std::optional<Entry>{};  // 防御：不该发生
+                std::size_t i = 0;
+                const std::size_t m = std::min(sk.size(), tgt_len);
+                while (i < m && sk[i] == target[i]) ++i;
+                pos = s.pos;
+                match = i;
+                ord = s.ord_before;
+                tstamp = s.tstamp_before;
+                first_known = true;
+                first_rel = (sk.size() == tgt_len && i == tgt_len) ? 0 : -1;
+                first_len = sk.size();
+            }
+        }
     }
-    return std::optional<Entry>{};  // 缺席（或 bloom 假阳性）
+
+    while (pos < b.size()) {
+        RowHead h;
+        if (!parse_row(b, pos, known, h)) return std::unexpected(OkiError::kCorrupt);
+
+        // 本行与 target 的关系：-1 小于、0 相等、+1 大于。
+        int rel;
+        if (first_known) {
+            first_known = false;
+            rel = first_rel;
+            prev_len = first_len;
+        } else {
+            if (h.shared > prev_len) return std::unexpected(OkiError::kCorrupt);
+            if (h.shared > match) {
+                // 与上一行共享的前缀比上一行与 target 共享的还长 ⟹ 在第 match 字节上
+                // 与上一行相同，而上一行在那里已经小于 target。
+                rel = -1;
+            } else if (h.shared < match) {
+                // 在第 shared 字节上离开了上一行（且更大），而上一行在那里与 target 相同。
+                rel = 1;
+            } else {
+                const auto* suffix =
+                    reinterpret_cast<const unsigned char*>(b.data() + h.suffix_pos);
+                const std::size_t rest = tgt_len - match;
+                const std::size_t m = std::min(h.suffix_len, rest);
+                std::size_t i = 0;
+                while (i < m && suffix[i] == tgt[match + i]) ++i;
+                if (i == h.suffix_len && i == rest) {
+                    rel = 0;
+                } else if (i == h.suffix_len) {
+                    rel = -1;          // 本行是 target 的真前缀
+                } else if (i == rest) {
+                    rel = 1;           // target 是本行的真前缀
+                } else {
+                    rel = suffix[i] < tgt[match + i] ? -1 : 1;
+                }
+                if (rel < 0) match += i;
+            }
+            prev_len = h.shared + h.suffix_len;
+        }
+        if (rel > 0) return std::optional<Entry>{};  // 越过 target：缺席
+
+        ord += h.ord_delta;        // 回绕还原
+        tstamp += h.tstamp_delta;  // 回绕还原
+        if (rel == 0) {
+            Entry e;
+            e.key.assign(target);
+            e.ord = ord;
+            e.tomb = (h.flags & kFlagTomb) != 0;
+            e.has_loc = h.has_loc;
+            if (h.has_loc) {
+                e.loc.file_id = h.file_id;
+                e.loc.total_sz = h.total_sz;
+                e.loc.offset = h.offset;
+                e.loc.tstamp = tstamp;
+            }
+            return std::optional<Entry>(std::move(e));
+        }
+        pos = h.next_pos;
+    }
+    return std::optional<Entry>{};  // 块内全部 < target：缺席（或 bloom 假阳性）
 }
 
 // ---------------------------------------------------------------------------

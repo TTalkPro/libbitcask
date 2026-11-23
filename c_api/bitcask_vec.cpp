@@ -30,6 +30,28 @@ BITCASK_API bitcask_error_t bitcask_search_vector(bitcask_t* cask,
     });
 }
 
+BITCASK_API bitcask_error_t bitcask_vector_rank(
+    bitcask_t* cask, const float* query, size_t query_len,
+    const void* const* keys, const size_t* key_lens, size_t n_keys, size_t k,
+    bitcask_search_result_t** out, bitcask_fault_t* fault) {
+    return guarded(fault, [&]() -> bitcask_error_t {
+    if (!cask || !query || !out) return BITCASK_ERR_INVALID_OPTION;
+    if (n_keys != 0 && (!keys || !key_lens)) return BITCASK_ERR_INVALID_OPTION;
+    *out = nullptr;
+
+    std::vector<std::span<const std::byte>> key_spans;
+    key_spans.reserve(n_keys);
+    for (size_t i = 0; i < n_keys; ++i) {
+        if (!keys[i] && key_lens[i] != 0) return BITCASK_ERR_INVALID_OPTION;
+        key_spans.emplace_back(static_cast<const std::byte*>(keys[i]), key_lens[i]);
+    }
+    return finish_single(
+        as_cpp_cask(cask)->rank_by_vector(std::span<const float>{query, query_len},
+                                          key_spans, k),
+        out, fault);
+    });
+}
+
 BITCASK_API bitcask_error_t bitcask_search_hybrid(bitcask_t* cask,
                                                       const char* text_query,
                                                       const float* vec_query,

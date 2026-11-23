@@ -205,6 +205,22 @@ public:
          std::uint64_t* out_last_valid_end = nullptr,
          std::uint64_t start_offset = 0);  // A4:从该偏移起扫(快照尾部回放)
 
+    // S67：从 from 起向后找「下一处完好记录的起点」——损坏恢复用。fold 在某处停下
+    // （记录头里的长度不可信 / 校验连续失败）之后，用它判断后面是否还有完好的数据：
+    // 有 ⇒ 停下的地方是文件**中间**的坏区，不是没写完的尾巴；没有 ⇒ 尾部垃圾。
+    // 判定「完好」：该处的记录头合理、整条 CRC 通过，并且紧接着的下一条也完好
+    // （或它恰好结束在文件尾）。要求连续两条是为了不把某个 value 里嵌着的一条
+    // 记录映像当成真记录。逐字节扫描，只在出了损坏时才会被调用。
+    // 返回：找到 → 偏移；直到文件尾都没有 → nullopt；IO 失败 → unexpected。
+    // 线程安全: 是（pread）。
+    [[nodiscard]] std::expected<std::optional<std::uint64_t>, DataFileFault>
+    find_next_record(std::uint64_t from);
+    // S67：offset 处若是一条完好的原子批批头，返回它声明的成员区间的末尾偏移
+    // （可能超过文件大小 = 批没写完）；不是批头 → nullopt。损坏恢复用它保证
+    // 「跳过坏区」时不会把一个不完整的批的成员单独放出来。
+    [[nodiscard]] std::expected<std::optional<std::uint64_t>, DataFileFault>
+    batch_end_at(std::uint64_t offset);
+
     // 截断到 new_size。给 fold 发现 torn write 后做尾部修复用。
     // caller 必须处于 write/append 模式；截断后内部 seek 到末尾，
     // 后续 write 可以无缝继续。

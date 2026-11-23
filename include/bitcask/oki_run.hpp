@@ -154,6 +154,10 @@ public:
 
     // 测试/bench：重设容量（0 = 关缓存）；顺带清空。
     void reset_capacity(std::size_t capacity_bytes);
+    // 缓存是否开着（容量非 0）。关着时 get_or_load 每次都调 loader、不驻留。
+    [[nodiscard]] bool enabled() const noexcept {
+        return shard_cap_.load(std::memory_order_relaxed) != 0;
+    }
 
     struct Stats {
         std::uint64_t hits = 0;

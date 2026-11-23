@@ -132,6 +132,12 @@ parse_start_token(std::span<const std::byte> bytes) noexcept {
     return s;
 }
 
+// S67：本线程最近一次回收的陈旧写锁里记的活跃文件 id（0 = 锁里还没写路径）。
+// 有值 ⇒ 上一个写者没有正常关闭（崩溃 / 掉电），它当时正在写的文件可能带一段没
+// 写完的尾巴。Cask::open 在同一线程上先拿锁、后做恢复，恢复开头取走这份证据
+// （detail::take_stale_writer_evidence）。Cask 不能加数据成员，所以走线程局部。
+thread_local std::optional<std::uint32_t> tl_stale_writer_active;
+
 // 如果锁文件里记录的 pid 已死，尝试删掉它，让 caller 重试 O_EXCL acquire。
 //
 // 竞态窗口：从读 pid 到 unlink 之间，另一 writer 可能写了新 lock 而被误删；
@@ -161,6 +167,11 @@ parse_start_token(std::span<const std::byte> bytes) noexcept {
     }
     rl->release_quiet();  // closes fd; read locks don't unlink
     if (!dead) return false;
+    // S67：记下「上一个写者是崩掉的」以及它当时的活跃文件。
+    tl_stale_writer_active =
+        data ? parse_active_file_id_from_lock(
+                   std::span<const std::byte>(data->data(), data->size()))
+             : std::uint32_t{0};
     return io::remove_file(path);
 }
 
@@ -188,10 +199,38 @@ acquire_writer_lock(const std::string& dirname) {
         reinterpret_cast<const std::byte*>(pid_line.data()),
         pid_line.size());
     (void)fl->write_data(pid_bytes);
+    // S67：让「写锁文件存在」这件事本身持久。恢复用它判断上一个写者是否正常关闭
+    // （正常关闭 = 先 fsync 活跃文件、后删锁）：锁文件的目录项若可能随掉电丢失，
+    // 「没有锁文件」就不能当作「已正常关闭」的证据。每次拿锁一次目录 fsync。
+    io::sync_directory(dirname);
     return std::move(*fl);
 }
 
 }  // namespace
+
+namespace detail {
+
+std::optional<std::uint32_t> take_stale_writer_evidence() noexcept {
+    auto v = tl_stale_writer_active;
+    tl_stale_writer_active.reset();
+    return v;
+}
+
+std::optional<std::uint32_t> peek_live_writer_active(const std::string& dirname) {
+    const auto wlock_path = bitcask::detail::to_utf8(
+        bitcask::detail::from_utf8(dirname) / "bitcask.write.lock");
+    auto wl = lock::FileLock::acquire(wlock_path, /*write*/ false);
+    if (!wl) return std::nullopt;  // 没有写锁文件
+    std::uint32_t id = 0;
+    if (auto data = wl->read_data()) {
+        id = parse_active_file_id_from_lock(
+            std::span<const std::byte>(data->data(), data->size()));
+    }
+    wl->release_quiet();
+    return id;
+}
+
+}  // namespace detail
 
 // =============================================================================
 // Cask 主体实现
@@ -358,6 +397,7 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
 // 回滚已分配的资源（write_lock_/search_ RAII 自管；S6-P3 共享池车道
 // index_lane_ 由 ~Cask→close()→unregister_lib 注销，见 close()）。
 std::expected<void, CaskFault> Cask::acquire_open_locks() {
+    tl_stale_writer_active.reset();  // 本次 open 的证据从零开始
     if (opts_.read_write && !opts_.merge_only) {
         auto fl = acquire_writer_lock(dirname_);
         if (!fl) return std::unexpected(fl.error());

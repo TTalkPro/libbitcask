@@ -199,6 +199,13 @@ public:
     [[nodiscard]] std::uint32_t trim_fstats(std::span<const std::uint32_t> ids);
     void with_writer_lock(const std::function<void()>& fn);
 
+    // S67：可能带「没写完的尾巴」的 data 文件（上一个写者崩溃时正在写的那个，或
+    // 别的进程里仍在写的那个）。Cask 在 open 的恢复开始前按写锁文件的证据设置；
+    // 不在其中的文件一律视为已封口（封口即 fsync）——从 data 重建时在它们中间
+    // 遇到坏区会跳过去接着读，而不是把后面的记录当成尾巴丢掉。
+    void set_unsealed_files(std::vector<std::uint32_t> ids);
+    [[nodiscard]] bool may_have_torn_tail(std::uint32_t file_id) const;
+
 private:
     struct Ledger {
         std::uint64_t active_keys = 0;
@@ -248,6 +255,8 @@ private:
     // pending_delete 布尔 + expiration_epoch 还原（adopt_manifest）。
     // 放在末尾：不挪动既有成员的偏移。
     std::atomic<std::uint64_t> fold_floor_{0};
+    // S67（同上，放在末尾）：见 set_unsealed_files。writer_mu_ 保护。
+    std::vector<std::uint32_t> unsealed_files_;
 };
 
 } // namespace bitcask::oki

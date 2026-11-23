@@ -1217,8 +1217,9 @@ TEST(HnswFilteredSearch, FillsKWhenMostNodesRejected) {
     }
 }
 
-// 预算：过滤全拒时不把全图扫一遍——距离计算（也就约束了回调次数）封顶在
-// ef × kFilterBudgetMul，返回空。
+// 预算：图遍历的距离计算（也就约束了回调次数）封顶在 ef × kFilterBudgetMul。
+// S67：预算耗尽且不足 k 时，节点数不超过 kExactFallbackMaxNodes 的图再做一遍精确
+// 扫描（每个节点恰好再问一次过滤器）——过滤全拒时仍返回空，总回调次数有界。
 TEST(HnswFilteredSearch, BudgetBoundsWorkWhenNothingPasses) {
     const std::size_t dim = 16, n = 4000, k = 2, ef = 4;
     HnswConfig cfg;
@@ -1235,10 +1236,12 @@ TEST(HnswFilteredSearch, BudgetBoundsWorkWhenNothingPasses) {
     const auto hits =
         idx.search(std::span<const float>(all.data(), dim), k, ef, &reject_all);
     EXPECT_TRUE(hits.empty());
-    // 预算在展开一个节点之前检查，最多超出一张邻接表（L0 容量 2M）。
+    // 预算在展开一个节点之前检查，最多超出一张邻接表（L0 容量 2M）；之后精确扫描
+    // 把 n 个节点各问一次。
     const std::size_t budget = ef * HnswIndex::kFilterBudgetMul;
-    EXPECT_LE(calls, budget + 2 * cfg.M);
-    EXPECT_LT(calls, n);  // 没有扫全图
+    ASSERT_LE(n, HnswIndex::kExactFallbackMaxNodes);
+    EXPECT_LE(calls, budget + 2 * cfg.M + n);
+    EXPECT_GE(calls, n);   // 兜底扫描确实跑了（结论「没有通过者」是穷尽得出的）
     EXPECT_GT(calls, ef);  // 确实是遍历期过滤在继续找，而非取 ef 个就停
 
     // 只有一个节点通过：预算内找得到就返回它，且只返回它。
@@ -1249,6 +1252,72 @@ TEST(HnswFilteredSearch, BudgetBoundsWorkWhenNothingPasses) {
         idx.search(std::span<const float>(all.data(), dim), k, ef, &one);
     ASSERT_EQ(h1.size(), 1u);
     EXPECT_EQ(h1[0].ord, only);
+}
+
+// S67（feedbacks/2026-11-23-filtered-vector-search-incomplete-no-candidate-scoring.md）：
+// 过滤很严（通过率千分之一点五）时，图遍历在预算耗尽前只碰到零星几个通过者。此前
+// 带着不足 k 条返回；现在退到精确扫描，回满 k 且就是通过者里真正最近的 k 个。
+TEST(HnswFilteredSearch, SelectiveFilterFallsBackToExactScan) {
+    const std::size_t n = 20000, n_pass = 30, k = 10, ef = 16, n_query = 20;
+    struct Case {
+        const char* name;
+        std::size_t dim;
+        bool int8_only;
+    };
+    for (const Case& c : {Case{"f32 dim32", 32, false}, Case{"int8-only dim64", 64, true}}) {
+        SCOPED_TRACE(c.name);
+        HnswConfig cfg;
+        cfg.dim = static_cast<std::uint16_t>(c.dim);
+        cfg.metric = HnswMetric::kDot;
+        cfg.inmem_int8 = c.int8_only;
+        HnswIndex idx(cfg);
+        const auto all = make_vectors(n, c.dim, 9090);
+        std::vector<char> pass(n, 0);
+        std::vector<float> pass_vecs;
+        std::vector<std::uint64_t> pass_ords;
+        std::mt19937 rng(67);
+        for (std::size_t i = 0; i < n; ++i) {
+            idx.insert(i, std::span<const float>(all.data() + i * c.dim, c.dim));
+        }
+        while (pass_ords.size() < n_pass) {
+            const std::size_t i = rng() % n;
+            if (pass[i]) continue;
+            pass[i] = 1;
+            pass_ords.push_back(i);
+            pass_vecs.insert(pass_vecs.end(), all.begin() + static_cast<std::ptrdiff_t>(i * c.dim),
+                             all.begin() + static_cast<std::ptrdiff_t>((i + 1) * c.dim));
+        }
+        const std::function<bool(std::uint64_t)> live =
+            [&](std::uint64_t ord) { return pass[ord] != 0; };
+        const auto queries = make_vectors(n_query, c.dim, 4242);
+        std::size_t matched = 0;
+        for (std::size_t qi = 0; qi < n_query; ++qi) {
+            const float* q = queries.data() + qi * c.dim;
+            const auto hits = idx.search(std::span<const float>(q, c.dim), k, ef, &live);
+            ASSERT_EQ(hits.size(), k) << "qi=" << qi;  // 回满
+            const auto truth = brute_topk(q, pass_vecs, pass_ords, c.dim, k);
+            for (const auto& h : hits) {
+                ASSERT_TRUE(pass[h.ord]) << "返回了被过滤的 ord=" << h.ord;
+                matched += std::find(truth.begin(), truth.end(), h.ord) != truth.end();
+            }
+            // 降序。
+            for (std::size_t i = 1; i < hits.size(); ++i) {
+                EXPECT_GE(hits[i - 1].score, hits[i].score);
+            }
+        }
+        if (!c.int8_only) {
+            EXPECT_EQ(matched, n_query * k) << "f32 精确扫描应与暴力结果逐条相同";
+        } else {
+            EXPECT_GE(static_cast<double>(matched) / static_cast<double>(n_query * k), 0.85);
+        }
+        // 通过者不足 k：全部返回，不多不少。
+        std::vector<char> few(n, 0);
+        few[17] = few[4321] = few[19999] = 1;
+        const std::function<bool(std::uint64_t)> live3 =
+            [&](std::uint64_t ord) { return few[ord] != 0; };
+        const auto h3 = idx.search(std::span<const float>(queries.data(), c.dim), k, ef, &live3);
+        EXPECT_EQ(h3.size(), 3u);
+    }
 }
 
 // 批量过滤接口：结果与逐个回调版一致；每展开一个节点至多调一次（批次数

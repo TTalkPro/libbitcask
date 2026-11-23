@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include "support/stale_writer_lock.hpp"
+
 #include <bitcask/cask.hpp>
 #include <bitcask/codec.hpp>
 #include <bitcask/format.hpp>
@@ -214,6 +216,7 @@ TEST_F(AtomicBatchTest, TornBatchInvisibleAndTruncated) {
     std::error_code ec;
     fs::resize_file(data, full - 1, ec);
     ASSERT_FALSE(ec);
+    bitcask::test::plant_stale_writer_lock(tmpdir_, data);  // 写者是崩掉的
 
     {
         auto c = open_rw();
@@ -251,6 +254,7 @@ TEST_F(AtomicBatchTest, TornAtHeaderInvisible) {
     std::error_code ec;
     fs::resize_file(data, header_end, ec);  // 只留批头，区间 0 字节
     ASSERT_FALSE(ec);
+    bitcask::test::plant_stale_writer_lock(tmpdir_, data);  // 写者是崩掉的
     {
         auto c = open_rw();
         ASSERT_TRUE(c);
@@ -334,6 +338,7 @@ TEST_F(AtomicBatchTest, TxnCaskCommitUsesAtomicBatch) {
     std::error_code ec;
     fs::resize_file(data, fs::file_size(data) - 1, ec);
     ASSERT_FALSE(ec);
+    bitcask::test::plant_stale_writer_lock(tmpdir_, data);  // 写者是崩掉的
     {
         auto c = open_rw();
         ASSERT_TRUE(c);

@@ -492,6 +492,11 @@ bool IndexAuthority::rebuild_from_data(std::string_view dir,
         fopts.keep_batch_values = false;
         std::uint64_t scanned_end = 0;
         fopts.out_last_valid_end = &scanned_end;
+        // S67：已封口的文件中间的坏区跳过去接着读（扫描全程持 writer_mu_，
+        // 直接读成员）。
+        fopts.heal_gaps =
+            std::find(unsealed_files_.begin(), unsealed_files_.end(), fid) ==
+            unsealed_files_.end();
         auto folded = fileops::fold_committed(
             *df,
             [&](const codec::DataRecordView& view, std::uint64_t offset,
@@ -755,6 +760,17 @@ IndexAuthority::capture_locked() {
               [](auto& a, auto& b) { return a.file_id < b.file_id; });
     if (!snapshot_valid(g, snap.fstats)) return std::nullopt;
     return snap;
+}
+
+void IndexAuthority::set_unsealed_files(std::vector<std::uint32_t> ids) {
+    std::scoped_lock lock(writer_mu_);
+    unsealed_files_ = std::move(ids);
+}
+
+bool IndexAuthority::may_have_torn_tail(std::uint32_t file_id) const {
+    std::scoped_lock lock(writer_mu_);
+    return std::find(unsealed_files_.begin(), unsealed_files_.end(), file_id) !=
+           unsealed_files_.end();
 }
 
 std::optional<std::pair<IndexAuthority::CommitSnapshot,

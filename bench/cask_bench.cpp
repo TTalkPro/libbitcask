@@ -370,6 +370,44 @@ static void BM_Cask_Get_Hot_View(benchmark::State& state) {
 }
 BENCHMARK(BM_Cask_Get_Hot_View)->Arg(1024)->Arg(100000)->Arg(400000);
 
+// S66：同上，但建库后 close 再重开——行已落进 OKI run，点查走「bloom → 块首 key 二分
+// → 块内定位 → sealed 映射读」。与上面两档并排看：行在 memdelta 与行在 run 两种状态
+// （feedbacks/2026-11-23-point-get-after-flush-scans-run-block-linearly.md）。
+static void BM_Cask_Get_Hot_View_Reopened(benchmark::State& state) {
+    TempDir td;
+    const int kKeyspace = static_cast<int>(state.range(0));
+    std::vector<std::string> keys;
+    keys.reserve(static_cast<std::size_t>(kKeyspace));
+    for (int i = 0; i < kKeyspace; ++i) {
+        keys.push_back("k" + std::to_string(i));
+    }
+    const std::string value(128, 'v');
+    {
+        auto c = Cask::open(td.path(), rw_opts(), &test_registry());
+        if (!c) state.SkipWithError("Cask::open failed");
+        for (const auto& k : keys) {
+            auto r = (*c)->put(as_bytes(k), as_bytes(value));
+            if (!r) state.SkipWithError("populate put failed");
+        }
+        (*c)->close();
+    }
+    auto c = Cask::open(td.path(), rw_opts(), &test_registry());
+    if (!c) state.SkipWithError("Cask::reopen failed");
+    auto& cask = **c;
+
+    std::mt19937 rng(0xCAFE);
+    std::uniform_int_distribution<int> dist(0, kKeyspace - 1);
+
+    for (auto _ : state) {
+        auto& k = keys[static_cast<std::size_t>(dist(rng))];
+        auto r = cask.get(as_bytes(k));
+        benchmark::DoNotOptimize(r);
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(value.size()));
+}
+BENCHMARK(BM_Cask_Get_Hot_View_Reopened)->Arg(1024)->Arg(100000)->Arg(400000);
+
 // -----------------------------------------------------------------------------
 // A4:open 冷启动——keydir 段快照 vs 全量 fold(20k 记录)。
 // 两者共用同一份预生成目录;FullFold 变体每轮删快照(close 会重写)。
