@@ -149,6 +149,117 @@ TEST(DataFile, CreateAppendReadRoundTrip) {
     EXPECT_EQ(view_str(r2->value), "vvv");
 }
 
+// S65（feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md）：
+// 可写句柄（活跃文件）的增长式只读映射。映射一次建好、比文件长；read_mmap 只认已经
+// pwrite 出去的字节——界外退 kShortRead（调用方走 pread），绝不去碰文件尾之后的页。
+TEST(DataFile, GrowingMapOnWritableHandle) {
+    TempDir td;
+    const auto path = td / "1.bitcask.data";
+    auto f = DataFile::open(path, DataFile::Mode::kCreate);
+    ASSERT_TRUE(f);
+    EXPECT_FALSE(f->mmapped());
+    f->enable_growing_map(1u << 20);
+#if defined(__linux__) || defined(__FreeBSD__)
+    ASSERT_TRUE(f->mmapped());
+
+    // 逐条写：写完即可经映射读到，内容与 pread 一致。
+    std::vector<bitcask::fileops::WriteResult> ws;
+    for (int i = 0; i < 200; ++i) {
+        const std::string k = "key" + std::to_string(i);
+        const std::string v(static_cast<std::size_t>(10 + i), static_cast<char>('a' + i % 26));
+        auto w = f->write(RecordType::kDoc, 100, static_cast<std::uint64_t>(i),
+                          as_bytes(k), as_bytes(v));
+        ASSERT_TRUE(w);
+        ws.push_back(*w);
+        auto m = f->read_mmap(w->offset, w->total_size);
+        ASSERT_TRUE(m) << "record " << i;
+        EXPECT_EQ(view_str(m->key), k);
+        EXPECT_EQ(view_str(m->value), v);
+        EXPECT_EQ(m->ord, static_cast<std::uint64_t>(i));
+    }
+    // 文件长了几十 KiB，早先的记录仍在同一段映射里可读。
+    auto first = f->read_mmap(ws.front().offset, ws.front().total_size);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(view_str(first->key), "key0");
+
+    // 文件尾之后（还没有任何字节）→ kShortRead，不是崩溃。
+    const auto end = f->size();
+    auto beyond = f->read_mmap(end, 64);
+    ASSERT_FALSE(beyond);
+    EXPECT_EQ(beyond.error().kind, bitcask::fileops::DataFileError::kShortRead);
+    auto straddle = f->read_mmap(ws.back().offset, ws.back().total_size + 1);
+    ASSERT_FALSE(straddle);
+    EXPECT_EQ(straddle.error().kind, bitcask::fileops::DataFileError::kShortRead);
+
+    // 批缓冲里、还没 flush 的记录：逻辑偏移已推进，但字节不在文件里 → kShortRead；
+    // flush 之后可读。
+    auto wb = f->write_buffered(RecordType::kDoc, 100, 999, as_bytes("buffered"),
+                                as_bytes("vv"));
+    ASSERT_TRUE(wb);
+    auto early = f->read_mmap(wb->offset, wb->total_size);
+    ASSERT_FALSE(early);
+    EXPECT_EQ(early.error().kind, bitcask::fileops::DataFileError::kShortRead);
+    ASSERT_TRUE(f->flush_batch());
+    auto late = f->read_mmap(wb->offset, wb->total_size);
+    ASSERT_TRUE(late);
+    EXPECT_EQ(view_str(late->key), "buffered");
+
+    // 截断：界随之收回；截掉的区间 → kShortRead，保留的照常可读。
+    ASSERT_TRUE(f->truncate_to(ws[100].offset));
+    auto cut = f->read_mmap(ws[150].offset, ws[150].total_size);
+    ASSERT_FALSE(cut);
+    EXPECT_EQ(cut.error().kind, bitcask::fileops::DataFileError::kShortRead);
+    auto kept = f->read_mmap(ws[99].offset, ws[99].total_size);
+    ASSERT_TRUE(kept);
+    EXPECT_EQ(view_str(kept->key), "key99");
+    // 截断后接着写，新记录可读。
+    auto w2 = f->write(RecordType::kDoc, 100, 5000, as_bytes("after"), as_bytes("cut"));
+    ASSERT_TRUE(w2);
+    EXPECT_EQ(w2->offset, ws[100].offset);
+    auto m2 = f->read_mmap(w2->offset, w2->total_size);
+    ASSERT_TRUE(m2);
+    EXPECT_EQ(view_str(m2->key), "after");
+#else
+    EXPECT_FALSE(f->mmapped());  // 其它平台：不建映射，读者走 pread
+#endif
+}
+
+TEST(DataFile, GrowingMapBeyondReserveFallsBackAndReadOnlyIsNoop) {
+    TempDir td;
+    const auto path = td / "1.bitcask.data";
+    {
+        auto f = DataFile::open(path, DataFile::Mode::kCreate);
+        ASSERT_TRUE(f);
+        f->enable_growing_map(4096);  // 预留一页
+        const std::string v(3000, 'x');
+        auto w1 = f->write(RecordType::kDoc, 1, 1, as_bytes("a"), as_bytes(v));
+        auto w2 = f->write(RecordType::kDoc, 1, 2, as_bytes("b"), as_bytes(v));
+        ASSERT_TRUE(w1);
+        ASSERT_TRUE(w2);
+#if defined(__linux__) || defined(__FreeBSD__)
+        ASSERT_TRUE(f->mmapped());
+        EXPECT_TRUE(f->read_mmap(w1->offset, w1->total_size));
+        // 第二条跨出预留长度 → kShortRead；pread 照常读到。
+        auto m = f->read_mmap(w2->offset, w2->total_size);
+        ASSERT_FALSE(m);
+        EXPECT_EQ(m.error().kind, bitcask::fileops::DataFileError::kShortRead);
+#endif
+        auto r = f->read(w2->offset, w2->total_size);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(view_str(r->key), "b");
+    }
+    // 只读句柄：open 已经整文件映射，enable_growing_map 不改它。
+    auto ro = DataFile::open(path, DataFile::Mode::kRead);
+    ASSERT_TRUE(ro);
+    const bool was = ro->mmapped();
+    ro->enable_growing_map(1u << 30);
+    EXPECT_EQ(ro->mmapped(), was);
+    // 默认构造的句柄：什么都不做。
+    DataFile empty;
+    empty.enable_growing_map(1u << 20);
+    EXPECT_FALSE(empty.mmapped());
+}
+
 TEST(DataFile, FoldVisitsAllRecords) {
     TempDir td;
     const auto path = td / "2.bitcask.data";

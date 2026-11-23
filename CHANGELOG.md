@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`12.0.2`**；库 `SOVERSION` = **`12`**（= major）；
+`bitcask_version_*` = **`12.0.3`**；库 `SOVERSION` = **`12`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -14,6 +14,25 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 （4.0.0 / 5.0.0 / 6.0.0 / 7.0.0 / 8.0.0 / 9.0.0 皆是）。
 
 ---
+
+## [12.0.3] - 2026-11-23（S65：点查命中提速）
+
+> **版本语义**：PATCH **12.0.3**。C API、盘上格式与既有 C++ ABI 均不变；`OkiState` / `DataFile` 的数据成员数量、类型、
+> 位置不变（`OkiState` 一个私有成员改名），`DataFile` 新增公开成员函数 `enable_growing_map` 与若干私有成员函数。
+
+### Changed
+
+- **点查命中提速，且不再随未落盘行数明显变慢**（S65，反馈
+  `feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md`，bitcask）：
+  - memdelta 的点查索引由节点式哈希表（`unordered_map<std::string, size_t>`）换成开放寻址的平表，key 不另存、直接比行里的 key
+    ——一次点查的内存访问从 3～4 处降到 2 处，每个 key 也不再存两份。
+  - 活跃文件的命中读走只读映射（零拷贝、无系统调用），不再每次一个 `pread`。映射一次建好、预留到 `max_file_size` 之后，
+    文件增长不用重映射；只认已写出的字节，界外自动退回 `pread`。仅 Linux / FreeBSD，其它平台行为不变。
+  - `BM_Cask_Get_Hot_View`（128 B 的值，全部行未落盘）命中一次：1 千 / 10 万 / 40 万行由 857 / 1540 / 1828 ns 降到
+    138 / 435 / 648 ns。
+  - 注意：活跃文件被点查过的页现在计入进程 RSS（文件页，可回收），映射读遇到 I/O 错误是 SIGBUS——两点都与 sealed 文件
+    既有的映射读（P6）相同。每个可写句柄多占一段地址空间（默认约 2 GiB，不占内存）。
+- 基准 `BM_Cask_Get_Hot` / `BM_Cask_Get_Hot_View` 增加 10 万 / 40 万未落盘行两档。
 
 ## [12.0.2] - 2026-11-23（S64：写后首查不再整份重排 memdelta）
 

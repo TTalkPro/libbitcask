@@ -10,6 +10,41 @@
 
 ---
 
+## 🟡 S65 · 点查命中：memdelta 索引换平表、活跃文件走映射（2026-11-23 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md`](feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md)
+> （bitcask：图层优化到头后，各条主路径一半以上的时间在引擎点查上）。取反馈建议 1、2、5；建议 4 随 2 一并解决；
+> 建议 3（CRC 零头）没做。随 12.0.3 发布（PATCH）。
+
+| 项 | 状态 |
+|---|---|
+| S65-1 memdelta 点查索引换成开放寻址的平表（`oki_state.cpp` 的 `FlatIdx`）：槽 = u64（高 24 位哈希 tag + 低 40 位「行下标 + 1」），key 不另存、比较时直接比 `delta_[下标].key`；线性探测、装填率 ≤ 1/2、扩容按行重算哈希；只增不删，active 重排时整表重建。一次点查从「桶 → 节点 → key 字符串 → 行」变成「槽 → 行」，每个 key 也不再存两份 | ✅ |
+| S65-2 **类布局不动**：平表在堆上，指针放进 `OkiState` 原 `sorted_view_version_` 的槽位（改名 `delta_flat_idx_`，析构释放）；原 `delta_idx_` 成员保留、恒为空 | ✅ |
+| S65-3 活跃文件的命中读走映射：`DataFile::enable_growing_map(reserve)` 给可写句柄一次建好一段只读映射（长度 = 预留值，可以比文件长；文件往后长时对应的页随之可读，不用重映射）。`read_mmap` 以「已 `pwrite` 出去的字节数」为界（跨线程原子量），界外 / 超出预留 → `kShortRead`，`read_doc` 照旧退回 `pread`；`truncate_to` / `truncate_here` 先收界再截文件。`Cask::roll_active` 建新活跃文件后启用，预留 = `min(max_file_size, 16 GiB) + 64 MiB`。只在 Linux / FreeBSD 生效，别的平台不变 | ✅ |
+| S65-4 「已写出字节数」与持久水位放进同一块堆对象（`FileMarks`，`durable_` 是指向首成员的别名指针）——`DataFile` 不加数据成员。新增公开成员函数 `enable_growing_map`、私有静态 `make_marks` 与两个私有成员函数，纯新增 | ✅ |
+| S65-5 基准：`BM_Cask_Get_Hot` / `BM_Cask_Get_Hot_View` 的 keyspace 做成参数（1024 / 10 万 / 40 万，全部未落盘） | ✅ |
+| S65-6 回归：`DataFile.GrowingMapOnWritableHandle`（逐条写后经映射读、文件尾之后 / 跨尾 / 批缓冲未 flush / 截断区间一律 `kShortRead`、截断后续写）、`DataFile.GrowingMapBeyondReserveFallsBackAndReadOnlyIsNoop`；`OkiRangeTest.PointGetMatchesModelAcrossIndexGrowthRebuildAndRoll`（6 万 key、15 万步覆盖写 / 删除、3 次 checkpoint、256 KiB 文件上限下多次 roll、重开，点查对模型） | ✅ |
+| S65-7 反馈回填、CHANGELOG `[Unreleased]` | ✅ |
+
+**落地记录**：
+- 性能（GCC Release，本机，128 B 的值、页缓存全热、全部行未落盘；`BM_Cask_Get_Hot_View`，命中一次）：
+
+  | 未落盘行数 | 改前 | 改后 |
+  |---|---|---|
+  | 1 024 | 857 ns | **138 ns** |
+  | 100 000 | 1540 ns | **435 ns** |
+  | 400 000 | 1828 ns | **648 ns** |
+
+  `get_owned`（多一次拷贝）同档：866 / 1572 / 1908 ns → 158 / 526 / 705 ns。大档剩下的增长是随机访问 60 MiB 数据页与平表本身的缓存未命中。
+- 行为上的注意点：① 活跃文件的命中读现在经映射取页，被访问过的页计入进程 RSS（文件页，可回收）——与 P6 对 sealed 文件的效果相同；
+  ② 映射读遇到底层 I/O 错误是 SIGBUS 而不是错误码，同 P6 既有取舍；③ 每个可写句柄多占一段地址空间（默认 2 GiB + 64 MiB，不占内存）。
+- 没做：建议 3（`crc32_bytewise` 处理头尾零头，约占改前一次命中的 5%）——动校验和内核的风险与这点收益不相称，留给以后单独评估。
+  落盘之后（行进了 run）走 bloom + 块缓存的那条路没有动，也没有量。
+- 验证：GCC Release（`-Werror`）全量 ctest 973 注册 / 971 执行全绿（2 项既有 disabled）；ASan 全量 971 全绿；TSan 跑 OKI / range /
+  迭代器 / merge / 原子批 / DataFile / Cask 相关 318 项全绿、无告警；clang Debug 相关 263 项全绿。Windows 未实测（映射一项在 Windows 上不启用）。
+
+---
+
 ## 🟠 S64 · 写后首查不再整份重排 memdelta（2026-11-23 立项）
 
 > 来源：下游反馈 [`feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md`](feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md)

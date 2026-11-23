@@ -171,6 +171,17 @@ public:
     [[nodiscard]] bool mmapped() const noexcept {
         return map_.valid();
     }
+    // S65：给**可写**句柄（活跃文件）建一段只读映射，供 read_mmap 用——点查命中
+    // 活跃文件不再每次一个 pread 系统调用（没 roll 过的库全部数据都在活跃文件里；
+    // feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md）。
+    // 映射长度取 reserve_bytes，一次建好、可以超过文件当前大小：文件往后长，映射里
+    // 对应的页随之变得可读（MAP_SHARED 文件映射），不用重映射，在途读者持有的 span
+    // 也不会失效。read_mmap 以「已 pwrite 出去的字节数」为界（跨线程原子读），界外
+    // 或超出预留长度 → kShortRead，调用方照旧退回 pread——文件尾之后的页碰了是
+    // SIGBUS，所以界必须是已写出的字节，不是逻辑偏移。
+    // 只在 Linux / FreeBSD 上生效（Windows 的只读映射不能超过文件大小）；别的平台、
+    // 32 位、只读句柄、已有映射时什么都不做。须在句柄交给读者之前调用。
+    void enable_growing_map(std::uint64_t reserve_bytes) noexcept;
     [[nodiscard]] std::expected<codec::DataRecordView, DataFileFault>
     read_mmap(std::uint64_t offset, std::uint32_t total_size) const;
 
@@ -229,7 +240,14 @@ private:
         : file_(std::move(f)), path_(std::move(p)),
           current_offset_(off), mode_(m),
           durable_writes_(durable_writes),
-          durable_(std::make_shared<std::atomic<std::uint64_t>>(off)) {}
+          durable_(make_marks(off)) {}
+
+    // S65：durable_ 指向的原子量与「已写出字节数」放在同一块堆对象里（类布局不能
+    // 加成员）；open() 建出来的句柄都经这里。定义与访问器在 data_file.cpp。
+    [[nodiscard]] static std::shared_ptr<std::atomic<std::uint64_t>>
+    make_marks(std::uint64_t off);
+    void note_written(std::uint64_t end) noexcept;       // 写者：pwrite 成功后
+    void clamp_written(std::uint64_t new_size) noexcept; // 写者：截断之前
 
     io::PosixFile  file_;
     std::string    path_;

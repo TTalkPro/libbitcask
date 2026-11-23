@@ -1134,6 +1134,14 @@ std::expected<void, CaskFault> Cask::ensure_active_writer() {
                                        fileops::DataFile::Mode::kCreate,
                                        opts_.o_sync);
     if (!df) return std::unexpected(io_fault(df.error().errnum, data_path));
+    // S65：活跃文件的点查走映射（零拷贝、无系统调用），不再每次 pread。预留长度取
+    // max_file_size 加一点余量（巨批可以让文件超出软上限——超出预留的部分读者
+    // 自动退回 pread），封顶 16 GiB：只占地址空间，页按访问才进来。
+    {
+        constexpr std::uint64_t kSlack = 64ull << 20;
+        constexpr std::uint64_t kCap = 16ull << 30;
+        df->enable_growing_map(std::min<std::uint64_t>(opts_.max_file_size, kCap) + kSlack);
+    }
     {
         // active_data_ 被 read_file 在 read_cache_mu_ 下读取,
         // 写点必须同锁互斥(O10:shared_ptr 拷贝与替换需要串行化)。

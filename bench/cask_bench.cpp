@@ -75,7 +75,7 @@ static void BM_Cask_Put_Overwrite(benchmark::State& state) {
     // run 态 OKI probe 形态（每 put 一次，不是热哈希捷径）。
     const std::size_t kKeyspace = static_cast<std::size_t>(state.range(0));
     std::vector<std::string> keys;
-    keys.reserve(kKeyspace);
+    keys.reserve(static_cast<std::size_t>(kKeyspace));
     for (std::size_t i = 0; i < kKeyspace; ++i) {
         keys.push_back("k" + std::to_string(i));
     }
@@ -113,7 +113,7 @@ static void BM_Cask_Put_Zipfian(benchmark::State& state) {
     }
     auto& cask = **c;
     std::vector<std::string> keys;
-    keys.reserve(kKeyspace);
+    keys.reserve(static_cast<std::size_t>(kKeyspace));
     for (std::size_t i = 0; i < kKeyspace; ++i) {
         keys.push_back("k" + std::to_string(i));
     }
@@ -230,7 +230,7 @@ static void BM_Cask_Put_Concurrent(benchmark::State& state) {
     const int tid = state.thread_index();
     constexpr int kKeyspace = 1024;
     std::vector<std::string> keys;
-    keys.reserve(kKeyspace);
+    keys.reserve(static_cast<std::size_t>(kKeyspace));
     for (int i = 0; i < kKeyspace; ++i) {
         keys.push_back("t" + std::to_string(tid) + "_" + std::to_string(i));
     }
@@ -306,9 +306,12 @@ static void BM_Cask_Get_Hot(benchmark::State& state) {
     if (!c) state.SkipWithError("Cask::open failed");
     auto& cask = **c;
 
-    constexpr int kKeyspace = 1024;
+    // S65：keyspace 做成参数——全部行都在 memdelta + 活跃文件里（不 checkpoint），
+    // 大档钉的是「命中耗时随未落盘行数涨」（feedbacks/2026-11-23-point-get-hit-
+    // cost-grows-with-unflushed-rows.md）。
+    const int kKeyspace = static_cast<int>(state.range(0));
     std::vector<std::string> keys;
-    keys.reserve(kKeyspace);
+    keys.reserve(static_cast<std::size_t>(kKeyspace));
     for (int i = 0; i < kKeyspace; ++i) {
         keys.push_back("k" + std::to_string(i));
     }
@@ -329,7 +332,7 @@ static void BM_Cask_Get_Hot(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
     state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(value.size()));
 }
-BENCHMARK(BM_Cask_Get_Hot);
+BENCHMARK(BM_Cask_Get_Hot)->Arg(1024)->Arg(100000)->Arg(400000);
 
 // V6.1.5: 零拷贝 get() benchmark——与上方 get_owned() 对比。
 // 目标：get() (view) 耗时 < 90% get_owned() (owned)。
@@ -339,9 +342,12 @@ static void BM_Cask_Get_Hot_View(benchmark::State& state) {
     if (!c) state.SkipWithError("Cask::open failed");
     auto& cask = **c;
 
-    constexpr int kKeyspace = 1024;
+    // S65：keyspace 做成参数——全部行都在 memdelta + 活跃文件里（不 checkpoint），
+    // 大档钉的是「命中耗时随未落盘行数涨」（feedbacks/2026-11-23-point-get-hit-
+    // cost-grows-with-unflushed-rows.md）。
+    const int kKeyspace = static_cast<int>(state.range(0));
     std::vector<std::string> keys;
-    keys.reserve(kKeyspace);
+    keys.reserve(static_cast<std::size_t>(kKeyspace));
     for (int i = 0; i < kKeyspace; ++i) {
         keys.push_back("k" + std::to_string(i));
     }
@@ -362,7 +368,7 @@ static void BM_Cask_Get_Hot_View(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
     state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(value.size()));
 }
-BENCHMARK(BM_Cask_Get_Hot_View);
+BENCHMARK(BM_Cask_Get_Hot_View)->Arg(1024)->Arg(100000)->Arg(400000);
 
 // -----------------------------------------------------------------------------
 // A4:open 冷启动——keydir 段快照 vs 全量 fold(20k 记录)。

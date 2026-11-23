@@ -2,7 +2,10 @@
 
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <memory>
+#include <type_traits>
 #include <filesystem>
 #include <optional>
 #include <utility>
@@ -18,7 +21,53 @@ namespace {
 // fold(tolerate_crc_errors=true) 模式下，连续遇到 CRC 错的 record 上限。
 // legacy 是 20 条——超过就认定文件损坏程度太重，放弃恢复整个文件。
 constexpr int kCrcSkipLimit = 20;
+
+// S65：持久水位 + 已写出字节数。DataFile::durable_ 是指向 durable 的别名指针
+// （durable 必须是首成员）；written 只在可写句柄上使用。
+struct FileMarks {
+    std::atomic<std::uint64_t> durable;
+    std::atomic<std::uint64_t> written;
+};
+static_assert(std::is_standard_layout_v<FileMarks>);
+
+std::atomic<std::uint64_t>&
+written_mark(const std::shared_ptr<std::atomic<std::uint64_t>>& durable) noexcept {
+    return reinterpret_cast<FileMarks*>(durable.get())->written;
+}
 }  // namespace
+
+std::shared_ptr<std::atomic<std::uint64_t>> DataFile::make_marks(std::uint64_t off) {
+    auto m = std::make_shared<FileMarks>();
+    m->durable.store(off, std::memory_order_relaxed);
+    m->written.store(off, std::memory_order_relaxed);
+    return std::shared_ptr<std::atomic<std::uint64_t>>(m, &m->durable);
+}
+
+void DataFile::note_written(std::uint64_t end) noexcept {
+    auto& w = written_mark(durable_);
+    if (end > w.load(std::memory_order_relaxed)) w.store(end, std::memory_order_release);
+}
+
+void DataFile::clamp_written(std::uint64_t new_size) noexcept {
+    auto& w = written_mark(durable_);
+    if (new_size < w.load(std::memory_order_relaxed)) {
+        w.store(new_size, std::memory_order_release);
+    }
+}
+
+void DataFile::enable_growing_map(std::uint64_t reserve_bytes) noexcept {
+#if defined(__linux__) || defined(__FreeBSD__)
+    if (mode_ == Mode::kRead || map_.valid() || sizeof(void*) < 8 || reserve_bytes == 0) {
+        return;
+    }
+    // 失败 → 无效映射，读者照旧走 pread。
+    map_ = io::MappedFile::map_readonly(file_.fd(),
+                                        static_cast<std::size_t>(reserve_bytes),
+                                        /*advise_random=*/true);
+#else
+    (void)reserve_bytes;
+#endif
+}
 
 std::expected<DataFile, DataFileFault>
 DataFile::open(std::string_view path, Mode mode, bool sync, bool mmap_enabled) {
@@ -93,7 +142,13 @@ DataFile::read_mmap(std::uint64_t offset, std::uint32_t total_size) const {
     if (!map_.valid()) {
         return std::unexpected(DataFileFault{DataFileError::kIo});
     }
-    if (offset > map_.size() || total_size > map_.size() - offset) {
+    // 可写句柄的映射（enable_growing_map）比文件长：只认已 pwrite 出去的字节。
+    std::uint64_t limit = map_.size();
+    if (mode_ != Mode::kRead) {
+        limit = std::min<std::uint64_t>(
+            limit, written_mark(durable_).load(std::memory_order_acquire));
+    }
+    if (offset > limit || total_size > limit - offset) {
         return std::unexpected(DataFileFault{DataFileError::kShortRead});
     }
     auto rec = codec::decode_data_record(
@@ -141,6 +196,7 @@ DataFile::write(format::RecordType type,
     auto w = file_.pwrite(off, write_buf_);
     if (!w) return std::unexpected(io_fault(w.error()));
     current_offset_ += total;
+    note_written(current_offset_);
     if (durable_writes_) {  // S36-5 B1：O_SYNC pwrite 即持久
         durable_->store(current_offset_, std::memory_order_release);
     }
@@ -158,6 +214,8 @@ DataFile::write_encoded(std::span<const std::byte> record) {
     auto w = file_.pwrite(off, record);
     if (!w) return std::unexpected(io_fault(w.error()));
     current_offset_ += record.size();
+    // 批缓冲非空时（不应与逐条写混用）已写出的只到 off + 本条；取保守值。
+    note_written(batch_buf_.empty() ? current_offset_ : off);
     if (durable_writes_) {  // S36-5 B1：O_SYNC pwrite 即持久
         durable_->store(current_offset_, std::memory_order_release);
     }
@@ -197,6 +255,7 @@ std::expected<void, DataFileFault> DataFile::flush_batch() {
     auto w = file_.pwrite(flush_off, batch_buf_);
     if (!w) return std::unexpected(io_fault(w.error()));
     batch_buf_.clear();  // 复用容量
+    note_written(current_offset_);
     if (durable_writes_) {  // S36-5 B1：O_SYNC pwrite 即持久
         durable_->store(current_offset_, std::memory_order_release);
     }
@@ -207,6 +266,7 @@ std::expected<void, DataFileFault> DataFile::flush_batch() {
 // 用于 undo——caller 想撤销最近一次 write 的话，可以记下 write 前的
 // current_offset_，写完发现不对就 truncate_to(那个旧值)。
 std::expected<void, DataFileFault> DataFile::truncate_here() {
+    if (mode_ != Mode::kRead) clamp_written(current_offset_);  // 先收界，再截文件
     auto s = file_.seek(static_cast<std::int64_t>(current_offset_), SEEK_SET);
     if (!s) return std::unexpected(io_fault(s.error()));
     auto t = file_.truncate_here();
@@ -411,6 +471,7 @@ DataFile::truncate_to(std::uint64_t new_size) {
     if (mode_ == Mode::kRead) {
         return std::unexpected(DataFileFault{DataFileError::kIo, 0});
     }
+    clamp_written(new_size);  // S65：先收 read_mmap 的界，再截文件
     auto s = file_.seek(static_cast<std::int64_t>(new_size), SEEK_SET);
     if (!s) return std::unexpected(io_fault(s.error()));
     auto t = file_.truncate_here();

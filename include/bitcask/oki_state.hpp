@@ -482,16 +482,22 @@ private:
     // sorted_view_ 是指向该对象尾巴的别名指针（对象整体由它保活）；
     // delta_epoch_ 在 active 被重排（drop_active_through）时 +1，缓存整体作废。
     // ⚠️ 这三个成员的类型与位置不能动（IndexAuthority 内嵌 OkiState，其后有内联
-    //    访问器读的成员）：delta_epoch_ 占的是原 sorted_view_min_seq_ 的槽位，
-    //    sorted_view_version_ 已不使用、留作占位。
+    //    访问器读的成员）：delta_epoch_ 占的是原 sorted_view_min_seq_ 的槽位；
+    //    delta_flat_idx_ 占的是原 sorted_view_version_ 的槽位（S65，见下）。
     // 锁序恒为 flush_mu_ → mu_ → view_mu_（整理在锁外，持锁段只碰指针）。
     mutable std::mutex view_mu_;
     mutable std::shared_ptr<const std::vector<DeltaRow>> sorted_view_;  // view_mu_
-    [[maybe_unused]] mutable std::uint64_t sorted_view_version_ = 0;  // 未使用（占位）
+    // S65：memdelta 点查索引（key → delta_ 内最新行下标）的实体——一张开放寻址的
+    // 平表，堆上分配，这里存它的指针（uintptr；mu_ 保护，析构时释放）。结构见
+    // oki_state.cpp 的 FlatIdx。取代下面的 delta_idx_（节点式哈希表：每次点查
+    // 桶 → 节点 → key 字符串 → 行，表一大全是缓存未命中；
+    // feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md）。
+    mutable std::uint64_t delta_flat_idx_ = 0;
     mutable std::uint64_t delta_epoch_ = 0;          // mu_ 保护
     std::uint64_t delta_version_ = 0;
     std::uint64_t append_seq_ = 0;  // DeltaRow::seq 分配器（mu_ 保护）
-    // S36-2：key → delta_ 内最新行下标（透明哈希，点查开启时维护）。
+    // S36-2 的点查索引原实体。S65 起不再使用（索引在 delta_flat_idx_ 指向的平表里），
+    // 成员保留、恒为空——类布局不能动。
     std::unordered_map<std::string, std::size_t, StringHash, std::equal_to<>>
         delta_idx_;
     std::atomic<bool> point_query_{false};

@@ -187,6 +187,72 @@ struct ActiveSorted {
 };
 static_assert(std::is_standard_layout_v<ActiveSorted>);
 
+// ---- S65：memdelta 点查索引（key → delta_ 内最新行下标）----
+//
+// 开放寻址、线性探测的平表。槽 = 一个 u64：高 24 位是 key 哈希的高位（tag，先筛
+// 掉绝大多数不相干的槽），低 40 位是「行下标 + 1」（0 = 空槽）。key 本身不另存，
+// 比较时直接比 delta_[下标].key——一次点查是「槽 → 行」两处内存，原来的节点式
+// 哈希表是「桶 → 节点 → key 字符串 → 行」，且每个 key 的字节存两份。
+// 只增不删（active 重排时整表重建）；装填率不超过 1/2。
+struct FlatIdx {
+    static constexpr std::uint64_t kIdxMask = (std::uint64_t{1} << 40) - 1;
+    std::vector<std::uint64_t> slots;  // 容量为 2 的幂（或空）
+    std::size_t used = 0;
+
+    static std::uint64_t tag_of(std::size_t h) noexcept {
+        return (static_cast<std::uint64_t>(h) >> 40) << 40;
+    }
+
+    // 命中 → 槽指针；未命中 → nullptr。
+    template <typename Rows>
+    std::uint64_t* find(const Rows& rows, std::string_view key, std::size_t h) noexcept {
+        if (slots.empty()) return nullptr;
+        const std::size_t mask = slots.size() - 1;
+        const std::uint64_t tag = tag_of(h);
+        for (std::size_t pos = h & mask;; pos = (pos + 1) & mask) {
+            const std::uint64_t s = slots[pos];
+            if (s == 0) return nullptr;
+            if ((s & ~kIdxMask) == tag && rows[(s & kIdxMask) - 1].key == key) {
+                return &slots[pos];
+            }
+        }
+    }
+
+    // 前置：key 不在表里。
+    void insert_new(std::size_t h, std::size_t idx) noexcept {
+        const std::size_t mask = slots.size() - 1;
+        std::size_t pos = h & mask;
+        while (slots[pos] != 0) pos = (pos + 1) & mask;
+        slots[pos] = tag_of(h) | (static_cast<std::uint64_t>(idx) + 1);
+        ++used;
+    }
+
+    // 保证再放一项后装填率 ≤ 1/2；扩容时按行里的 key 重算哈希重排。
+    template <typename Rows>
+    void reserve_one(const Rows& rows) {
+        if (!slots.empty() && (used + 1) * 2 <= slots.size()) return;
+        std::vector<std::uint64_t> old = std::move(slots);
+        slots.assign(old.empty() ? 64 : old.size() * 2, 0);
+        used = 0;
+        for (const std::uint64_t s : old) {
+            if (s == 0) continue;
+            const std::size_t idx = static_cast<std::size_t>((s & kIdxMask) - 1);
+            insert_new(StringHash{}(std::string_view(rows[idx].key)), idx);
+        }
+    }
+
+    void reset(std::size_t expect_rows) {
+        std::size_t cap = 64;
+        while (cap < expect_rows * 2) cap *= 2;
+        slots.assign(cap, 0);
+        used = 0;
+    }
+};
+
+FlatIdx* flat_idx(std::uint64_t slot) noexcept {
+    return reinterpret_cast<FlatIdx*>(static_cast<std::uintptr_t>(slot));
+}
+
 constexpr std::size_t kTailPromoteRows = 128;
 // 一次持 mu_ 最多拷这么多行：首建 / 久未读之后要拷的行可能很多，分批拷，别让
 // 开迭代器把点查和写挡住一整份拷贝的时间。
@@ -269,14 +335,35 @@ void OkiState::apply_batch(std::span<const BatchRow> rows) {
 void OkiState::index_row_locked(std::size_t idx) {
     if (!point_query_.load(std::memory_order_relaxed)) return;
     const DeltaRow& row = delta_[idx];
-    auto [it, inserted] = delta_idx_.try_emplace(row.key, idx);
-    // (ord, 到达序) 胜出：等 ord 后到者顶替（搬迁行），更小 ord 不顶替。
-    if (!inserted && delta_[it->second].ord <= row.ord) it->second = idx;
+    FlatIdx* fi = flat_idx(delta_flat_idx_);
+    if (fi == nullptr) {
+        fi = new FlatIdx();
+        delta_flat_idx_ = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(fi));
+    }
+    const std::size_t h = StringHash{}(std::string_view(row.key));
+    if (std::uint64_t* s = fi->find(delta_, row.key, h)) {
+        // (ord, 到达序) 胜出：等 ord 后到者顶替（搬迁行），更小 ord 不顶替。
+        const std::size_t cur = static_cast<std::size_t>((*s & FlatIdx::kIdxMask) - 1);
+        if (delta_[cur].ord <= row.ord) {
+            *s = (*s & ~FlatIdx::kIdxMask) | (static_cast<std::uint64_t>(idx) + 1);
+        }
+        return;
+    }
+    fi->reserve_one(delta_);
+    fi->insert_new(h, idx);
 }
 
 void OkiState::rebuild_index_locked() {
-    delta_idx_.clear();
-    if (!point_query_.load(std::memory_order_relaxed)) return;
+    FlatIdx* fi = flat_idx(delta_flat_idx_);
+    if (!point_query_.load(std::memory_order_relaxed)) {
+        if (fi != nullptr) fi->reset(0);
+        return;
+    }
+    if (fi == nullptr) {
+        fi = new FlatIdx();
+        delta_flat_idx_ = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(fi));
+    }
+    fi->reset(delta_.size());
     for (std::size_t i = 0; i < delta_.size(); ++i) index_row_locked(i);
 }
 
@@ -983,6 +1070,8 @@ OkiState::~OkiState() {
         lane_cv_.notify_all();
     }
     wait_compaction();
+    delete flat_idx(delta_flat_idx_);
+    delta_flat_idx_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,9 +1252,11 @@ OkiState::LocateResult OkiState::locate(std::string_view key) const {
     DeltaRow active;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        auto it = delta_idx_.find(key);
-        if (it != delta_idx_.end()) {
-            const DeltaRow& r = delta_[it->second];
+        FlatIdx* fi = flat_idx(delta_flat_idx_);
+        const std::uint64_t* slot =
+            fi != nullptr ? fi->find(delta_, key, StringHash{}(key)) : nullptr;
+        if (slot != nullptr) {
+            const DeltaRow& r = delta_[static_cast<std::size_t>((*slot & FlatIdx::kIdxMask) - 1)];
             active.ord = r.ord;
             active.tomb = r.tomb;
             active.has_loc = r.has_loc;

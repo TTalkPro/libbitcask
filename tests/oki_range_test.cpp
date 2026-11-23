@@ -638,6 +638,71 @@ TEST_F(OkiRangeTest, IncrementalSortedViewMatchesShadowAcrossPromotionsAndFlush)
     (*c)->close();
 }
 
+// S65（feedbacks/2026-11-23-point-get-hit-cost-grows-with-unflushed-rows.md）：memdelta 点查
+// 索引换成开放寻址的平表、活跃文件的命中读走映射。点查对模型：6 万个 key（平表多次
+// 扩容重排）、覆盖写（同 key 取最新）、删除、checkpoint（active 重排，整表重建）、
+// 小文件上限下的多次 roll（活跃文件换代，旧文件转 sealed 映射）交错；每一步之后抽查，
+// 最后全量核对，命中的值与 LSN 都要对。
+TEST_F(OkiRangeTest, PointGetMatchesModelAcrossIndexGrowthRebuildAndRoll) {
+    CaskOptions o;
+    o.read_write = true;
+    o.max_file_size = 256 * 1024;  // 多次 roll
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    std::map<std::string, std::string> shadow;
+    std::mt19937 rng(65);
+    auto key_of = [](unsigned n) {
+        char buf[24];
+        // 一半 key 超过 15 字节（std::string 小串优化的边界）
+        std::snprintf(buf, sizeof(buf), (n % 2) ? "k%05u" : "key-long-prefix-%05u", n);
+        return std::string(buf);
+    };
+    auto check = [&](const std::string& k) {
+        auto r = (*c)->get_owned(bytes(k));
+        auto it = shadow.find(k);
+        if (it == shadow.end()) {
+            ASSERT_FALSE(r) << k;
+            ASSERT_EQ(r.error().kind, bitcask::CaskError::kNotFound) << k;
+        } else {
+            ASSERT_TRUE(r) << k << ": " << r.error().detail;
+            ASSERT_EQ(to_str(r->value), it->second) << k;
+        }
+    };
+    constexpr unsigned kSpace = 60000;
+    for (int step = 1; step <= 150000; ++step) {
+        const std::string k = key_of(static_cast<unsigned>(rng() % kSpace));
+        if (rng() % 5 == 0) {
+            ASSERT_TRUE((*c)->remove(bytes(k), 2000));
+            shadow.erase(k);
+        } else {
+            const std::string v = "v" + std::to_string(step);
+            ASSERT_TRUE((*c)->put(bytes(k), bytes(v), 1000));
+            shadow[k] = v;
+        }
+        if (step % 40000 == 0) {
+            ASSERT_TRUE((*c)->checkpoint());
+        }
+        if (step % 7 == 0) {
+            check(k);
+            check(key_of(static_cast<unsigned>(rng() % kSpace)));
+            if (::testing::Test::HasFatalFailure()) FAIL() << "at step " << step;
+        }
+    }
+    for (unsigned n = 0; n < kSpace; ++n) {
+        check(key_of(n));
+        if (::testing::Test::HasFatalFailure()) FAIL() << "final, key " << n;
+    }
+    // 重开后（索引从 data / run 恢复）结果相同。
+    (*c)->close();
+    c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    for (unsigned n = 0; n < kSpace; n += 7) {
+        check(key_of(n));
+        if (::testing::Test::HasFatalFailure()) FAIL() << "after reopen, key " << n;
+    }
+    (*c)->close();
+}
+
 // 并发：写者只追加新 key（从不删），读者全域扫描。读视图的 active 切面是到达序的
 // 一个前缀，所以读到的 key 集合必须是「0..n-1 连续」——中间缺一个就是增量视图在
 // 并发整理 / 回填时丢了行。TSan 下同时钉分批拷贝与缓存回填的数据竞争。
