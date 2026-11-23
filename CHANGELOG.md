@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`12.0.1`**；库 `SOVERSION` = **`12`**（= major）；
+`bitcask_version_*` = **`12.0.2`**；库 `SOVERSION` = **`12`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -14,6 +14,21 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 （4.0.0 / 5.0.0 / 6.0.0 / 7.0.0 / 8.0.0 / 9.0.0 皆是）。
 
 ---
+
+## [12.0.2] - 2026-11-23（S64：写后首查不再整份重排 memdelta）
+
+> **版本语义**：PATCH **12.0.2**。C API、盘上格式与既有 C++ ABI 均不变；`OkiState` 的数据成员数量、类型、位置不变
+> （一个私有成员改名），只新增一个静态成员函数。
+
+### Fixed
+
+- **每次写之后的第一次 range / 迭代不再把整个未落盘的 memdelta 拷一遍、排一遍**（S64，反馈
+  `feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md`，bitcask）：`OkiState::make_read_view` 的排序视图缓存此前被任何一次
+  写整体作废，下一次开迭代器在 `mu_` 内整份拷贝 `delta_`、锁外全量排序——耗时随未落盘行数线性涨（扫 1 行的 range：10 万行 15 ms、
+  40 万行 80 ms），拷贝期间点查与写被挡住。现缓存改为增量：若干不可变有序段 + 一小段有序尾巴，写后首查只整理新增的行；
+  尾巴满 128 行升段，相邻段行数相近时线性归并。同一操作现为 4～5 µs，与未落盘行数无关。锁内拷贝一次最多 4096 行。
+  flush / 重建重排 active 时缓存整体作废（纪元 +1），之后的第一次读重建一次。读视图的内容与一致性语义不变；
+  `ReadView::frozen` 现在可能在末尾带上 active 较早到达的有序段（消费方按内存来源列表统一归并，`OkiMergeCursor` 无需改动）。
 
 ## [12.0.1] - 2026-11-20（S63：原子批对并发读者整批可见）
 

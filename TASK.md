@@ -10,6 +10,33 @@
 
 ---
 
+## 🟠 S64 · 写后首查不再整份重排 memdelta（2026-11-23 立项）
+
+> 来源：下游反馈 [`feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md`](feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md)
+> （bitcask 图层排查 hub 读变慢时量出）。是 2026-09-18 那条（只修了无写时的连续查询）的后一半。
+> 取反馈建议 1（增量维护有序视图）+ 建议 3（拷贝不长时间占 `mu_`）。随 12.0.2 发布（PATCH）。
+
+| 项 | 状态 |
+|---|---|
+| S64-1 `make_read_view` 的 active 有序视图改增量：缓存 = 若干不可变有序段（覆盖 `delta_` 的一段前缀，行数逐级翻倍）+ 一小段有序尾巴；写后首查只拷贝、整理缓存之后新增的行，并进尾巴；尾巴满 128 行升段，相邻两段行数相近时线性归并（段数 O(log 行数)）。结构与不变式见 `oki_state.cpp` 的 `ActiveSorted` | ✅ |
+| S64-2 纪元：`drop_active_through`（flush 冻结 / 重建 / 装载后重排 active）时 `delta_epoch_` +1，缓存整体作废；纪元内 active 只追加，缓存按行下标增量覆盖 | ✅ |
+| S64-3 锁内拷贝分批：一次持 `mu_` 最多拷 4096 行（首建 / 久未读时要拷的行多），途中纪元变了重来，第 3 次起不再分批 | ✅ |
+| S64-4 读视图装配：active 的有序段排在 `ReadView::frozen` 末尾（待落盘冻结段之后，旧→新），`delta` 只装尾巴；seq 过滤（丢弃 `seq ≤ frozen_through` 的行）改为逐来源判定。`ReadView` 结构不变 | ✅ |
+| S64-5 **类布局不动**：`IndexAuthority` 内嵌 `OkiState` 且其后有内联访问器读的成员，不能加数据成员。缓存对象经 `sorted_view_` 的别名指针挂接（指向对象首成员）；`delta_epoch_` 占原 `sorted_view_min_seq_` 的槽位；`sorted_view_version_` 留作占位。新增一个静态成员函数 `read_view_rows_processed_for_test()`（纯新增） | ✅ |
+| S64-6 回归 `tests/oki_range_test.cpp`（3）：5 万未落盘行上 300 轮「写 1 条 + 扫 1 行」，视图整理处理的行数 < 5 万（旧实现 1500 万）；6000 步随机 put / 覆盖 / 删除穿过升段、归并、3 次 checkpoint 的三方对拍；1 写者追加 + 3 读者全域扫描，读到的 key 必须是连续前缀且不倒退 | ✅ |
+| S64-7 反馈回填、CHANGELOG `[Unreleased]` | ✅ |
+
+**落地记录**：
+- 性能（GCC Release，本机）：「写 1 条无关 key + 扫 1 行的 range」每轮耗时——5 万 / 10 万 / 40 万未落盘行分别 **4 / 4 / 5 µs**，
+  300 轮共处理 17758 行，与未落盘行数无关。改前同一操作经 Erlang 封装量得 10 万行 14.9 ms、40 万行 80.1 ms（反馈里的表）。
+  首建（缓存为空时第一次读）仍是一次全量排序，之后增量。
+- 段数上限约 log2(行数 / 128)（100 万行 ≈ 13 段），范围游标每段多一路归并 / 一次二分定位。
+- 验证：GCC Release（`-Werror`）全量 ctest 972 注册 / 970 执行，969 通过；唯一失败 `HighlightColdTest.ReopenedLibraryHasNoSnippetsUnlessLoaded`
+  是 S53 既有的 `-j16` 偶发（串行重跑通过，与本项无关）。ASan 全量 970 执行全绿（2 项既有 disabled）。TSan 跑 OKI / range / 迭代器 /
+  merge / 原子批相关 194 项全绿、无告警。clang Debug 相关 138 项全绿。Windows 未实测。
+
+---
+
 ## 🔴 S63 · 原子批对并发读者整批可见（2026-11-20 立项）
 
 > 来源：下游反馈 [`feedbacks/2026-11-20-atomic-batch-no-read-isolation.md`](feedbacks/2026-11-20-atomic-batch-no-read-isolation.md)

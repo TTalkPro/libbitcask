@@ -245,6 +245,9 @@ public:
     // S44-1：runs 与 frozen 恒来自同一个已发布的不可变视图；delta 是 active
     // 中「到达序号 > 该视图 frozen_through」的行（已排序去重）。三者来源序
     // runs（gen 升序）< frozen（旧→新）< delta，与 OkiMergeCursor 一致。
+    // S64：active 行数多时，它较早到达的部分以若干有序段的形式排在 frozen 的
+    // 末尾（待落盘冻结段之后，旧→新），delta 只装最新的一小段——消费方按「内存
+    // 来源列表」统一归并即可，不要假定 frozen 只含待落盘的冻结段。
     struct ReadView {
         std::vector<std::shared_ptr<OkiRunReader>> runs;
         std::vector<SegmentPtr> frozen;
@@ -255,6 +258,9 @@ public:
         std::shared_ptr<OkiBlockCache> cache;
     };
     [[nodiscard]] std::optional<ReadView> make_read_view() const;
+    // 仅供测试：进程内历次 make_read_view 为整理 active 的有序视图而处理（排序 /
+    // 归并）的行数累计。用来钉「写后首查的工作量不随未落盘行数线性涨」。
+    [[nodiscard]] static std::uint64_t read_view_rows_processed_for_test() noexcept;
 
     // ---- S36-2：组合视图点查（Level B 权威的冷侧；设计 §5.1）----
     //
@@ -467,17 +473,22 @@ private:
     std::vector<DeltaRow> delta_;
     std::size_t delta_bytes_ = 0;
     // 排序视图缓存（make_read_view 的复用层）。memdelta 本是「append + 惰性
-    // 排序」——惰性排序的成本原落在每一次 range 的视图构建上，与查询次数
-    // 相乘（下游实测：5 万行未 flush 时 ~120ms/次，flush 后 ~0.03ms，4200×；
-    // 见 feedbacks/2026-09-18-oki-unflushed-memdelta-range-query-4000x-slower.md）。
-    // 缓存 = 排序去重后的快照；失效判据 = delta_version_ 失配（任何 append /
-    // flush 前缀裁剪 / rebuild 清空都 bump 版本）——「写后首查重建一次」语义
-    // 不变，无写时的连续查询降为 shared_ptr 拷贝。
-    // 锁序恒为 flush_mu_ → mu_ → view_mu_（构建在锁外，持锁段只碰指针）。
+    // 排序」——惰性排序的成本原落在每一次 range 的视图构建上（下游实测：5 万行
+    // 未 flush 时 ~120ms/次；feedbacks/2026-09-18-oki-unflushed-memdelta-
+    // range-query-4000x-slower.md 加了「无写时复用」的缓存，但写后首查仍整份
+    // 重排）。S64 起缓存是增量的（feedbacks/2026-11-23-range-iter-after-write-
+    // resorts-memdelta.md）：若干不可变有序段 + 一小段有序尾巴，写后首查只整理
+    // 新增的行——结构与不变式见 oki_state.cpp 的 ActiveSorted。
+    // sorted_view_ 是指向该对象尾巴的别名指针（对象整体由它保活）；
+    // delta_epoch_ 在 active 被重排（drop_active_through）时 +1，缓存整体作废。
+    // ⚠️ 这三个成员的类型与位置不能动（IndexAuthority 内嵌 OkiState，其后有内联
+    //    访问器读的成员）：delta_epoch_ 占的是原 sorted_view_min_seq_ 的槽位，
+    //    sorted_view_version_ 已不使用、留作占位。
+    // 锁序恒为 flush_mu_ → mu_ → view_mu_（整理在锁外，持锁段只碰指针）。
     mutable std::mutex view_mu_;
-    mutable std::shared_ptr<const std::vector<DeltaRow>> sorted_view_;
-    mutable std::uint64_t sorted_view_version_ = 0;  // 与 delta_version_ 相等即有效
-    mutable std::uint64_t sorted_view_min_seq_ = 0;  // 缓存内最小到达序号
+    mutable std::shared_ptr<const std::vector<DeltaRow>> sorted_view_;  // view_mu_
+    [[maybe_unused]] mutable std::uint64_t sorted_view_version_ = 0;  // 未使用（占位）
+    mutable std::uint64_t delta_epoch_ = 0;          // mu_ 保护
     std::uint64_t delta_version_ = 0;
     std::uint64_t append_seq_ = 0;  // DeltaRow::seq 分配器（mu_ 保护）
     // S36-2：key → delta_ 内最新行下标（透明哈希，点查开启时维护）。

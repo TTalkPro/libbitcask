@@ -9,6 +9,7 @@
 #include <charconv>
 #include <filesystem>
 #include <limits>
+#include <type_traits>
 #include "bitcask/detail/path_utf8.hpp"
 
 namespace bitcask::oki {
@@ -119,13 +120,13 @@ void sweep_runs(std::string_view dir, std::span<const std::uint64_t> keep,
 
 namespace {
 
-// 按 (key, ord) 稳定排序后每 key 取末行（(ord, 到达序) 胜出者）。
-std::vector<OkiState::DeltaRow> sort_dedup(std::vector<OkiState::DeltaRow> rows) {
-    std::stable_sort(rows.begin(), rows.end(),
-                     [](const OkiState::DeltaRow& a, const OkiState::DeltaRow& b) {
-                         if (a.key != b.key) return a.key < b.key;
-                         return a.ord < b.ord;
-                     });
+bool row_less(const OkiState::DeltaRow& a, const OkiState::DeltaRow& b) {
+    if (a.key != b.key) return a.key < b.key;
+    return a.ord < b.ord;
+}
+
+// 已按 (key, ord) 稳定有序的行：每 key 取末行（(ord, 到达序) 胜出者）。
+void dedup_sorted(std::vector<OkiState::DeltaRow>& rows) {
     // out == i 的自移动赋值对 std::string 是 valid-but-unspecified，必须跳过。
     std::size_t out = 0;
     for (std::size_t i = 0; i < rows.size(); ++i) {
@@ -134,8 +135,64 @@ std::vector<OkiState::DeltaRow> sort_dedup(std::vector<OkiState::DeltaRow> rows)
         ++out;
     }
     rows.resize(out);
+}
+
+// 按 (key, ord) 稳定排序后每 key 取末行（(ord, 到达序) 胜出者）。
+std::vector<OkiState::DeltaRow> sort_dedup(std::vector<OkiState::DeltaRow> rows) {
+    std::stable_sort(rows.begin(), rows.end(), row_less);
+    dedup_sorted(rows);
     return rows;
 }
+
+// 两段各自已 sort_dedup 的行归并去重；older 的行到达在前（等 ord 时 newer 胜）。
+// 线性归并，不重排。
+std::vector<OkiState::DeltaRow> merge_dedup(const std::vector<OkiState::DeltaRow>& older,
+                                            std::vector<OkiState::DeltaRow> newer) {
+    std::vector<OkiState::DeltaRow> out;
+    out.reserve(older.size() + newer.size());
+    out.insert(out.end(), older.begin(), older.end());
+    out.insert(out.end(), std::make_move_iterator(newer.begin()),
+               std::make_move_iterator(newer.end()));
+    std::inplace_merge(out.begin(),
+                       out.begin() + static_cast<std::ptrdiff_t>(older.size()),
+                       out.end(), row_less);
+    dedup_sorted(out);
+    return out;
+}
+
+// ---- S64：active 的增量有序视图（make_read_view 的缓存）----
+//
+// active（delta_）在一个「纪元」内只追加（append_update / apply_batch 只
+// push_back；行内容不再变）。缓存把它的一段前缀整理成若干不可变有序段 + 一小
+// 段有序尾巴：
+//   segs  覆盖 delta_[0, covered)，旧→新；每段已 sort_dedup，行数大致逐级翻倍
+//   tail  覆盖 delta_[covered, count)，已 sort_dedup
+// 写后首查只拷贝并整理新增的行 delta_[count, size)：并进尾巴；尾巴攒够
+// kTailPromoteRows 行就升成一段，相邻两段行数相近时归并（二进制计数器式，段数
+// O(log 行数)、每行被归并 O(log 行数) 次）。此前是每次写之后整份拷贝 + 全量排序
+// （feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md）。
+// 纪元在 active 被重排时 +1（drop_active_through），旧缓存整体作废。
+//
+// 对象发布后不可变。OkiState::sorted_view_ 存的是指向 tail 的别名指针（类布局
+// 不能动——IndexAuthority 内嵌 OkiState，其后的成员有内联访问器）；tail 必须是
+// 首成员，由它转回整个对象（标准布局，首成员指针可互转）。
+struct ActiveSorted {
+    std::vector<OkiState::DeltaRow> tail;
+    std::vector<OkiState::SegmentPtr> segs;
+    std::vector<std::uint64_t> seg_min_seq;  // 与 segs 一一对应（保守下界）
+    std::uint64_t tail_min_seq = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t epoch = 0;
+    std::size_t covered = 0;
+    std::size_t count = 0;
+};
+static_assert(std::is_standard_layout_v<ActiveSorted>);
+
+constexpr std::size_t kTailPromoteRows = 128;
+// 一次持 mu_ 最多拷这么多行：首建 / 久未读之后要拷的行可能很多，分批拷，别让
+// 开迭代器把点查和写挡住一整份拷贝的时间。
+constexpr std::size_t kViewCopyChunkRows = 4096;
+
+std::atomic<std::uint64_t> g_read_view_rows_processed{0};
 
 const OkiState::DeltaRow* segment_find(const OkiState::Segment& seg,
                                        std::string_view key) {
@@ -244,6 +301,7 @@ void OkiState::drop_active_through(std::uint64_t through) {
     delta_ = std::move(kept);
     delta_bytes_ = bytes;
     ++delta_version_;
+    ++delta_epoch_;  // active 被重排：增量有序视图（ActiveSorted）整体作废
     rebuild_index_locked();
     update_flush_hint_locked();
 }
@@ -1144,50 +1202,121 @@ OkiState::LocateResult OkiState::locate(std::string_view key) const {
     return out;
 }
 
+std::uint64_t OkiState::read_view_rows_processed_for_test() noexcept {
+    return g_read_view_rows_processed.load(std::memory_order_relaxed);
+}
+
 std::optional<OkiState::ReadView> OkiState::make_read_view() const {
     // 不持 flush_mu_（flush/归并/重建持该锁横跨长 IO）。成对一致由构造保证：
     // runs 与冻结段来自同一个已发布视图；active 先取、视图后取，丢弃
     // seq ≤ frozen_through 的 active 行（已归入视图）。
     if (!loaded_.load(std::memory_order_acquire)) return std::nullopt;
 
-    // 1) active 排序视图（缓存命中零拷贝；失配则锁内拷贝、锁外排序）。
-    std::shared_ptr<const std::vector<DeltaRow>> sorted;
-    std::uint64_t sorted_min_seq = 0;
-    std::shared_ptr<std::vector<DeltaRow>> fresh;
-    std::uint64_t want = 0;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        {
-            std::lock_guard<std::mutex> vlk(view_mu_);
-            if (sorted_view_ && sorted_view_version_ == delta_version_) {
-                sorted = sorted_view_;
-                sorted_min_seq = sorted_view_min_seq_;
+    // 1) active 的有序视图（S64，见 ActiveSorted）：缓存仍覆盖全部行 → 零拷贝；
+    //    否则只拷缓存之后新增的行。切面 = 首次持锁时的 delta_.size()——
+    //    apply_batch 整批在一个 mu_ 临界区内追加，切面不会落在批中间。
+    using Base = std::shared_ptr<const ActiveSorted>;
+    Base base;                       // 可复用的缓存（纪元相符）；否则空
+    std::vector<DeltaRow> fresh;     // delta_[from0, target)，未排序
+    std::uint64_t epoch = 0;
+    std::size_t target = 0;
+    for (int attempt = 0;; ++attempt) {
+        base.reset();
+        fresh.clear();
+        bool restart = false;
+        std::size_t from = 0;
+        for (bool first = true;; first = false) {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (first) {
+                epoch = delta_epoch_;
+                target = delta_.size();
+                std::lock_guard<std::mutex> vlk(view_mu_);
+                if (sorted_view_) {
+                    // 别名指针 → 整个对象（tail 是首成员）。
+                    const auto* as = reinterpret_cast<const ActiveSorted*>(sorted_view_.get());
+                    if (as->epoch == epoch && as->count <= target) {
+                        base = Base(sorted_view_, as);
+                        from = as->count;
+                    }
+                }
+                fresh.reserve(target - from);
+            } else if (delta_epoch_ != epoch) {
+                restart = true;  // 分批拷贝途中 active 被重排：重来
+                break;
             }
+            // 最后一次尝试不再分批（不会被饿死）。
+            const std::size_t chunk = attempt >= 2 ? target - from : kViewCopyChunkRows;
+            const std::size_t upto = std::min(target, from + chunk);
+            fresh.insert(fresh.end(),
+                         delta_.begin() + static_cast<std::ptrdiff_t>(from),
+                         delta_.begin() + static_cast<std::ptrdiff_t>(upto));
+            from = upto;
+            if (from == target) break;
         }
-        if (!sorted) {
-            fresh = std::make_shared<std::vector<DeltaRow>>(delta_);
-            want = delta_version_;
-        }
+        if (!restart) break;
     }
-    // 2) 视图。
+    // 2) 视图（必须在 active 切面之后取）。
     const auto view = view_.load();
     if (!view) return std::nullopt;
 
-    if (fresh) {
-        std::uint64_t min_seq = std::numeric_limits<std::uint64_t>::max();
-        for (const auto& r : *fresh) min_seq = std::min(min_seq, r.seq);
-        *fresh = sort_dedup(std::move(*fresh));
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            std::lock_guard<std::mutex> vlk(view_mu_);
-            if (delta_version_ == want) {
-                sorted_view_ = fresh;
-                sorted_view_version_ = want;
-                sorted_view_min_seq_ = min_seq;
+    Base cur = base;
+    if (!cur || !fresh.empty()) {
+        // 锁外整理：新增行排序去重后并进尾巴；尾巴够大就升段并逐级归并。
+        auto ns = std::make_shared<ActiveSorted>();
+        ns->epoch = epoch;
+        ns->count = target;
+        std::uint64_t fresh_min = std::numeric_limits<std::uint64_t>::max();
+        for (const auto& r : fresh) fresh_min = std::min(fresh_min, r.seq);
+        std::uint64_t processed = fresh.size();
+        auto sorted_fresh = sort_dedup(std::move(fresh));
+        if (base) {
+            ns->segs = base->segs;
+            ns->seg_min_seq = base->seg_min_seq;
+            ns->covered = base->covered;
+            ns->tail_min_seq = std::min(base->tail_min_seq, fresh_min);
+            if (base->tail.empty()) {
+                ns->tail = std::move(sorted_fresh);
+            } else {
+                processed += base->tail.size();
+                ns->tail = merge_dedup(base->tail, std::move(sorted_fresh));
+            }
+        } else {
+            ns->tail_min_seq = fresh_min;
+            ns->tail = std::move(sorted_fresh);
+        }
+        if (target - ns->covered >= kTailPromoteRows) {
+            ns->segs.push_back(std::make_shared<const Segment>(std::move(ns->tail)));
+            ns->seg_min_seq.push_back(ns->tail_min_seq);
+            ns->tail = {};
+            ns->tail_min_seq = std::numeric_limits<std::uint64_t>::max();
+            ns->covered = target;
+            while (ns->segs.size() >= 2) {
+                const std::size_t n = ns->segs.size();
+                if (ns->segs[n - 2]->size() >= 2 * ns->segs[n - 1]->size()) break;
+                processed += ns->segs[n - 2]->size() + ns->segs[n - 1]->size();
+                auto merged = std::make_shared<const Segment>(
+                    merge_dedup(*ns->segs[n - 2], std::vector<DeltaRow>(*ns->segs[n - 1])));
+                const auto mn = std::min(ns->seg_min_seq[n - 2], ns->seg_min_seq[n - 1]);
+                ns->segs.pop_back();
+                ns->seg_min_seq.pop_back();
+                ns->segs.back() = std::move(merged);
+                ns->seg_min_seq.back() = mn;
             }
         }
-        sorted = fresh;
-        sorted_min_seq = min_seq;
+        g_read_view_rows_processed.fetch_add(processed, std::memory_order_relaxed);
+        cur = ns;
+        {
+            // 回填：纪元没变，且没有别的读者已经放进覆盖更多行的缓存。
+            std::lock_guard<std::mutex> lk(mu_);
+            std::lock_guard<std::mutex> vlk(view_mu_);
+            if (delta_epoch_ == epoch) {
+                const auto* have = sorted_view_
+                    ? reinterpret_cast<const ActiveSorted*>(sorted_view_.get()) : nullptr;
+                if (!have || have->epoch != epoch || have->count <= ns->count) {
+                    sorted_view_ = std::shared_ptr<const std::vector<DeltaRow>>(cur, &cur->tail);
+                }
+            }
+        }
     }
 
     ReadView v;
@@ -1200,16 +1329,29 @@ std::optional<OkiState::ReadView> OkiState::make_read_view() const {
     v.cache = block_cache_;
     v.frozen = view->frozen;
     // 3) seq 过滤。胜出行 seq ≤ frozen_through ⟹ 该 key 的权威在视图里
-    //    （冻结段恰持有它），整行剔除。常见情形缓存内全部行都新于水位，零拷贝。
-    if (sorted->empty() || sorted_min_seq > view->frozen_through) {
-        v.delta = std::move(sorted);
-    } else {
-        auto filtered = std::make_shared<std::vector<DeltaRow>>();
-        filtered->reserve(sorted->size());
-        for (const auto& r : *sorted) {
-            if (r.seq > view->frozen_through) filtered->push_back(r);
+    //    （冻结段恰持有它），整行剔除。常见情形全部行都新于水位，零拷贝。
+    //    active 的有序段排在冻结段之后、尾巴之前（来源序：旧 → 新）。
+    const auto ft = view->frozen_through;
+    const auto filtered = [ft](const std::vector<DeltaRow>& rows) {
+        auto out = std::make_shared<std::vector<DeltaRow>>();
+        out->reserve(rows.size());
+        for (const auto& r : rows) {
+            if (r.seq > ft) out->push_back(r);
         }
-        v.delta = std::move(filtered);
+        return out;
+    };
+    v.frozen.reserve(v.frozen.size() + cur->segs.size());
+    for (std::size_t i = 0; i < cur->segs.size(); ++i) {
+        if (cur->seg_min_seq[i] > ft) {
+            v.frozen.push_back(cur->segs[i]);
+        } else if (auto f = filtered(*cur->segs[i]); !f->empty()) {
+            v.frozen.push_back(std::move(f));
+        }
+    }
+    if (cur->tail.empty() || cur->tail_min_seq > ft) {
+        v.delta = std::shared_ptr<const std::vector<DeltaRow>>(cur, &cur->tail);
+    } else {
+        v.delta = filtered(cur->tail);
     }
     return v;
 }

@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
+#include <iostream>
 #include <map>
 #include <random>
 #include <string>
@@ -540,6 +542,148 @@ TEST_F(OkiRangeTest, UnflushedMemdeltaRepeatedRangeNotLinearPerQuery) {
         << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
                .count()
         << "ms——memdelta 视图疑似逐查询重排（悬崖回归）";
+    (*c)->close();
+}
+
+// S64（下游反馈 2026-11-23，feedbacks/2026-11-23-range-iter-after-write-resorts-memdelta.md）：
+// 写后首查不再整份重排 memdelta。此前每次写都让排序视图缓存作废，下一次开迭代器
+// 把全部未落盘行拷一遍再排一遍——扫 1 行的 range 在 40 万未落盘行时 80 ms。
+// 现在缓存是增量的（有序段 + 小尾巴），写后首查只整理新增的行。
+// 钉工作量而不是墙钟：OkiState 记下视图整理处理过的行数。
+TEST_F(OkiRangeTest, RangeAfterWriteDoesNotResortWholeMemdelta) {
+    constexpr int kKeys = 50000;
+    constexpr int kRounds = 300;
+
+    CaskOptions o;
+    o.read_write = true;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < kKeys; ++i) {
+        char k[16];
+        std::snprintf(k, sizeof(k), "m%06d", i);
+        ASSERT_TRUE((*c)->put(bytes(std::string_view(k)), bytes("v"), 1000));
+    }
+    ASSERT_EQ((*c)->status().oki_delta_rows, static_cast<std::uint64_t>(kKeys));
+    ASSERT_EQ(range_scan(**c, "m000007", "m000008").size(), 1u);  // 首建
+
+    const auto before = bitcask::oki::OkiState::read_view_rows_processed_for_test();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int r = 0; r < kRounds; ++r) {
+        // 写一条与被扫区间无关的 key，再扫 1 行。
+        char k[16], lo[16], hi[16];
+        std::snprintf(k, sizeof(k), "w%06d", r);
+        ASSERT_TRUE((*c)->put(bytes(std::string_view(k)), bytes("x"), 1000));
+        std::snprintf(lo, sizeof(lo), "m%06d", (r * 37) % kKeys);
+        std::snprintf(hi, sizeof(hi), "m%06d", (r * 37) % kKeys + 1);
+        ASSERT_EQ(range_scan(**c, lo, hi).size(), 1u);
+    }
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+    const auto processed =
+        bitcask::oki::OkiState::read_view_rows_processed_for_test() - before;
+    std::cout << "[S64] " << kRounds << " rounds of put + 1-row range over " << kKeys
+              << " unflushed rows: " << us / kRounds << " us/round, "
+              << processed << " rows processed\n";
+    // 旧实现每轮处理全部 5 万行（300 轮 = 1500 万行）。新实现每轮只碰尾巴（< 128 行）
+    // 外加偶尔的小段归并。
+    EXPECT_LT(processed, static_cast<std::uint64_t>(kKeys));
+    // 写进去的 key 都在。
+    EXPECT_EQ(range_scan(**c, "w", "x").size(), static_cast<std::size_t>(kRounds));
+    (*c)->close();
+}
+
+// 增量视图的正确性：随机 put / 覆盖 / 删除穿过多次「尾巴升段」「相邻段归并」与
+// checkpoint（active 被重排，缓存整体作废），每隔几步与影子 map、全表扫描三方对拍。
+TEST_F(OkiRangeTest, IncrementalSortedViewMatchesShadowAcrossPromotionsAndFlush) {
+    CaskOptions o;
+    o.read_write = true;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    std::map<std::string, std::string> shadow;
+    std::mt19937 rng(20261123);
+    auto key_of = [](unsigned n) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "k%04u", n);
+        return std::string(buf);
+    };
+    for (int step = 1; step <= 6000; ++step) {
+        const std::string k = key_of(static_cast<unsigned>(rng() % 900));
+        if (rng() % 4 == 0) {
+            ASSERT_TRUE((*c)->remove(bytes(k), 2000));
+            shadow.erase(k);
+        } else {
+            const std::string v = "v" + std::to_string(step);
+            ASSERT_TRUE((*c)->put(bytes(k), bytes(v), 1000));
+            shadow[k] = v;
+        }
+        if (step % 2000 == 0) {
+            ASSERT_TRUE((*c)->checkpoint());
+        }
+        // 读的间隔不规则：有时每步都读（尾巴逐行长大），有时隔几百步（一次并进一大段）。
+        const bool read_now = step < 400 || step % 53 == 0 ||
+                              (step > 3000 && step < 3300) || step % 2000 == 1;
+        if (!read_now) continue;
+        unsigned a = static_cast<unsigned>(rng() % 900);
+        unsigned b = static_cast<unsigned>(rng() % 900);
+        if (a > b) std::swap(a, b);
+        expect_three_way_equal(**c, shadow, key_of(a), key_of(b + 1), "window");
+        if (step % 530 == 0 || step % 2000 == 1) {
+            expect_three_way_equal(**c, shadow, "", "", "full");
+        }
+        if (::testing::Test::HasFailure()) {
+            FAIL() << "first divergence at step " << step;
+        }
+    }
+    expect_three_way_equal(**c, shadow, "", "", "final");
+    (*c)->close();
+}
+
+// 并发：写者只追加新 key（从不删），读者全域扫描。读视图的 active 切面是到达序的
+// 一个前缀，所以读到的 key 集合必须是「0..n-1 连续」——中间缺一个就是增量视图在
+// 并发整理 / 回填时丢了行。TSan 下同时钉分批拷贝与缓存回填的数据竞争。
+TEST_F(OkiRangeTest, IncrementalSortedViewConcurrentReadersSeeContiguousPrefix) {
+    constexpr int kKeys = 20000;
+    CaskOptions o;
+    o.read_write = true;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    std::atomic<bool> done{false};
+    std::atomic<int> bad{0};
+    std::atomic<std::uint64_t> scans{0};
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 3; ++t) {
+        readers.emplace_back([&] {
+            std::size_t last = 0;
+            while (true) {
+                const bool final_pass = done.load(std::memory_order_acquire);
+                auto out = range_scan(**c, "p", "q");
+                for (std::size_t i = 0; i < out.size(); ++i) {
+                    char k[16];
+                    std::snprintf(k, sizeof(k), "p%06zu", i);
+                    if (out[i].first != k) {
+                        bad.fetch_add(1);
+                        break;
+                    }
+                }
+                if (out.size() < last) bad.fetch_add(1);  // 同一读者不得倒退
+                last = out.size();
+                scans.fetch_add(1);
+                if (final_pass) {
+                    if (out.size() != static_cast<std::size_t>(kKeys)) bad.fetch_add(1);
+                    break;
+                }
+            }
+        });
+    }
+    for (int i = 0; i < kKeys; ++i) {
+        char k[16];
+        std::snprintf(k, sizeof(k), "p%06d", i);
+        ASSERT_TRUE((*c)->put(bytes(std::string_view(k)), bytes("v"), 1000));
+    }
+    done.store(true, std::memory_order_release);
+    for (auto& th : readers) th.join();
+    EXPECT_EQ(bad.load(), 0);
+    EXPECT_GT(scans.load(), 3u);
     (*c)->close();
 }
 
