@@ -18,7 +18,8 @@ jobs:
   # 这条约定在类型上看不见：std::string 既能装 UTF-8 也能装 GBK，而
   # fs::path(窄) / path.string() / std::fopen 在 Windows 上都按系统 ANSI
   # 代码页编解码，编译期毫无提示，且**只在非 ASCII 路径上暴露**——全部现有
-  # 测试都是 ASCII 路径，绿得毫无意义。故用 grep 补上强制力。
+  # 功能测试都用 ASCII 路径，绿得毫无意义。故用 grep 补上强制力（非 ASCII 路径
+  # 的运行期覆盖在 path_utf8_test / Tools.*NonAsciiDir）。
   # ---------------------------------------------------------------------------
   path-encoding:
     runs-on: ubuntu-24.04
@@ -123,12 +124,13 @@ jobs:
   # B1：Windows MSVC Release + 全量 ctest。Windows 移植此前零 CI。
   # 依赖全走 third_party 子模块（zlib / oneTBB / ICU 现编，见 CMakePresets 的
   # windows-base 注）；ICU 的 MSBuild 工具集钉法见 feedbacks/2026-09-13。
-  # **非门控**（continue-on-error）直到首次跑绿。
+  # 2026-11-23 起门控（此前 continue-on-error：本机全绿、job 红了也不拦）。
+  # /WX 不在这里开：本机只验证过 VS 18 / MSVC 14.51，runner 是 VS 2022——
+  # 两个编译器版本的告警面未必一致，/WX 单放下面的 werror-windows（非门控）。
   # ---------------------------------------------------------------------------
   windows-msvc:
     runs-on: windows-2022
     timeout-minutes: 120
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -145,6 +147,59 @@ jobs:
         run: cmake --build build-msvc-release -j 4
       - name: Test
         run: ctest --test-dir build-msvc-release --output-on-failure -j 4
+
+  # ---------------------------------------------------------------------------
+  # Windows /WX（2026-11-23）。`BITCASK_WERROR` 在 MSVC 分支就是 /WX（S37-4 时
+  # 刻意没开：C4267 / C4244 / C4100 存量刷屏）。存量已清零（C4324 对齐填充
+  # 定点关、一处 u64→u32 显式收窄），先只对库目标开、且**非门控**——待 VS 2022
+  # 上跑绿后再并入 windows-msvc。照 werror-lib 的做法。
+  # ---------------------------------------------------------------------------
+  werror-windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install Ninja
+        run: choco install ninja -y
+      - name: Configure (-Werror, library only)
+        run: cmake --preset msvc-release -DBUILD_TESTING=OFF -DBITCASK_WERROR=ON
+      - name: Build (library only)
+        run: cmake --build build-msvc-release --target bitcask_static bitcask_shared
+
+  # ---------------------------------------------------------------------------
+  # Windows ASan（2026-11-23）：msvc-asan preset 此前没有任何 job 在用，Windows
+  # 下的内存错误没有自动护栏（ASan + UBSan job 只在 Linux clang 上跑）。
+  # Debug + /fsanitize=address + 全量 ctest。**非门控**直到首次跑绿。
+  # ---------------------------------------------------------------------------
+  windows-msvc-asan:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install Ninja
+        run: choco install ninja -y
+      - name: Configure
+        run: cmake --preset msvc-asan -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build-msvc-asan -j 4
+      - name: Test
+        env:
+          ASAN_OPTIONS: halt_on_error=1:abort_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-msvc-asan --output-on-failure -j 4
 
   # ---------------------------------------------------------------------------
   # Clang 构建 + 全量 ctest（S12-6）。GCC 是主编译器；clang 作可移植性护栏——

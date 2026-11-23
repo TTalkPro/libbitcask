@@ -12,7 +12,12 @@
 //
 // 安全性：经 write.lock 排他（拒绝与在线进程并跑）；meta 改写前校验
 // 目录模式/维度/度量与目标引擎的兼容性（ivfrq 拒 kL2）。
+//
+// 路径编码：`--dir` 经 argv_utf8.hpp 转成 UTF-8（Windows 上窄 argv 是系统
+// ACP，而库约定窄路径 = UTF-8），之后一律用 bitcask::detail::from_utf8 /
+// to_utf8 在 fs::path 与窄串之间走。
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -20,6 +25,8 @@
 #include <string_view>
 #include <vector>
 
+#include "argv_utf8.hpp"
+#include "bitcask/detail/path_utf8.hpp"
 #include "bitcask/file_lock.hpp"
 #include "bitcask/meta_file.hpp"
 
@@ -38,25 +45,25 @@ const char* engine_name(VectorEngine e) {
 }
 
 // 各引擎的组件文件族（清理/统计用；.d 链按前缀匹配）。
-std::vector<fs::path> engine_files(const fs::path& dir, VectorEngine e) {
+std::vector<fs::path> engine_files(const fs::path& dir_path, VectorEngine e) {
     std::vector<fs::path> out;
     const char* base = e == VectorEngine::kHnsw    ? "vec.ckpt"
                        : e == VectorEngine::kIvfRq ? "ivf.ckpt"
                                                    : "diskann.ckpt";
-    out.push_back(dir / base);
-    out.push_back(dir / (std::string(base) + ".prev"));
+    out.push_back(dir_path / base);
+    out.push_back(dir_path / (std::string(base) + ".prev"));
     if (e == VectorEngine::kHnsw) {
-        out.push_back(dir / "vec.vec");
-        out.push_back(dir / "vec.qc8");
+        out.push_back(dir_path / "vec.vec");
+        out.push_back(dir_path / "vec.qc8");
     } else if (e == VectorEngine::kIvfRq) {
-        out.push_back(dir / "ivf.biv");
+        out.push_back(dir_path / "ivf.biv");
     } else {
-        out.push_back(dir / "diskann.bda");
+        out.push_back(dir_path / "diskann.bda");
     }
     // .d 链。
     std::error_code ec;
-    for (const auto& ent : fs::directory_iterator(dir, ec)) {
-        const std::string name = ent.path().filename().string();
+    for (const auto& ent : fs::directory_iterator(dir_path, ec)) {
+        const std::string name = bitcask::detail::to_utf8(ent.path().filename());
         if (name.rfind(std::string(base) + ".d", 0) == 0) {
             out.push_back(ent.path());
         }
@@ -67,22 +74,23 @@ std::vector<fs::path> engine_files(const fs::path& dir, VectorEngine e) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    const auto args = bitcask_tools::args_as_utf8(argc, argv);
     std::string dir;
     std::string to;
     bool purge_old = false;
     bool dry_run = false;
     for (int i = 1; i < argc; ++i) {
-        const std::string_view a = argv[i];
+        const std::string_view a = args[static_cast<std::size_t>(i)];
         if (a == "--dir" && i + 1 < argc) {
-            dir = argv[++i];
+            dir = args[static_cast<std::size_t>(++i)];
         } else if (a == "--to" && i + 1 < argc) {
-            to = argv[++i];
+            to = args[static_cast<std::size_t>(++i)];
         } else if (a == "--purge-old") {
             purge_old = true;
         } else if (a == "--dry-run") {
             dry_run = true;
         } else {
-            std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
+            std::fprintf(stderr, "unknown arg: %s\n", args[static_cast<std::size_t>(i)].c_str());
             dir.clear();
             break;
         }
@@ -105,12 +113,24 @@ int main(int argc, char** argv) {
                         : VectorEngine::kDiskann;
 
     // 排他：write.lock（与在线写进程同一把锁）。
-    const std::string lock_path = (fs::path(dir) / "write.lock").string();
+    const fs::path dir_path = bitcask::detail::from_utf8(dir);
+    const std::string lock_path =
+        bitcask::detail::to_utf8(dir_path / "write.lock");
     auto lock = bitcask::lock::FileLock::acquire(lock_path, true);
     if (!lock) {
-        std::fprintf(stderr,
-                     "cannot acquire %s (store in use by another process?)\n",
-                     lock_path.c_str());
+        // 只有 EEXIST 才是「别人持锁」。其余 errno（最典型：Windows 上路径
+        // 不是合法 UTF-8 ⇒ EINVAL）说成「被占用」会把人支去找根本不存在的进程。
+        if (lock.error().errnum == EEXIST) {
+            std::fprintf(stderr,
+                         "cannot acquire %s (store in use by another "
+                         "process?)\n",
+                         lock_path.c_str());
+        } else {
+            std::fprintf(stderr, "cannot acquire %s: %s (errno %d)\n",
+                         lock_path.c_str(),
+                         std::strerror(lock.error().errnum),
+                         lock.error().errnum);
+        }
         return 1;
     }
 
@@ -143,11 +163,11 @@ int main(int argc, char** argv) {
                 engine_name(target), mc->vector_dim);
     std::printf("  next open will FULL-FOLD rebuild the %s index\n",
                 engine_name(target));
-    const auto old_files = engine_files(dir, old_engine);
+    const auto old_files = engine_files(dir_path, old_engine);
     std::uintmax_t old_bytes = 0;
-    for (const auto& f : old_files) {
+    for (const auto& f_path : old_files) {
         std::error_code ec;
-        if (fs::exists(f, ec)) old_bytes += fs::file_size(f, ec);
+        if (fs::exists(f_path, ec)) old_bytes += fs::file_size(f_path, ec);
     }
     std::printf("  old engine files: %llu bytes (%s)\n",
                 static_cast<unsigned long long>(old_bytes),
@@ -164,9 +184,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (purge_old) {
-        for (const auto& f : old_files) {
+        for (const auto& f_path : old_files) {
             std::error_code ec;
-            fs::remove(f, ec);
+            fs::remove(f_path, ec);
         }
     }
     std::printf("done. reopen with vector_engine=%s to rebuild.\n",

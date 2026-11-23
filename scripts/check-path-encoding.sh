@@ -26,7 +26,7 @@ ALLOW='include/bitcask/detail/path_utf8.hpp|include/bitcask/detail/file_util.hpp
 scan() {  # scan <正则> <说明>
     local pat="$1" msg="$2" hits
     hits=$(grep -rnE "$pat" --include='*.cpp' --include='*.hpp' --include='*.h' \
-             src include c_api 2>/dev/null \
+             src include c_api tools 2>/dev/null \
            | grep -vE "^($ALLOW):" \
            | grep -vE '^\s*//' \
            | grep -vE ':[0-9]+:\s*//')
@@ -43,6 +43,12 @@ rc=0
 
 scan '(std::)?filesystem::path\s*\([a-z_]' \
      '从窄串构造 fs::path —— Windows 上按 ANSI 代码页解码。改用 bitcask::detail::from_utf8()。' || rc=1
+
+# `fs::path x(窄)` 别名 + 具名变量形态。上面那条只认 `filesystem::path(`，
+# 2026-11-23 backup 的 `fs::path base(dirname_)` 与 migrate 的 `fs::path src(src_dir)`
+# 都是从这个缝里漏的：非 ASCII 路径在 Windows 上要么开错目录、要么构造直接抛。
+scan '\b(fs|filesystem)::path[[:space:]]+[a-z_]+[[:space:]]*[(]' \
+     '从窄串构造具名 fs::path 变量（fs::path 别名形态）—— 同样按 ANSI 代码页解码。改用 bitcask::detail::from_utf8()。' || rc=1
 
 scan '\.string\(\)' \
      'path::string() —— Windows 上按 ANSI 代码页编码。改用 bitcask::detail::to_utf8()。' || rc=1
@@ -62,7 +68,7 @@ scan 'std::(fseek|ftell)\s*\(' \
 # std::filesystem 的 error_code 是 system_category，装 Win32 码。目录不存在
 # 给 3（ERROR_PATH_NOT_FOUND），按 errno 读成 ESRCH。必须过 io::errno_of_native。
 ecval=$(grep -rnE '\b(ec|rm_ec|sec|[a-z_]+_ec)\.value\(\)' \
-          --include='*.cpp' --include='*.hpp' --include='*.h' src include c_api 2>/dev/null \
+          --include='*.cpp' --include='*.hpp' --include='*.h' src include c_api tools 2>/dev/null \
         | grep -vE "^($ALLOW):" \
         | grep -vE ':[0-9]+: *//' \
         | grep -v 'errno_of_native')
@@ -87,12 +93,18 @@ fi
 #   e.path() / it->path()            迭代器产出的 path
 #   以 _path / _dir 结尾的变量        约定其类型已是 fs::path
 # 其余一律要求显式化。判不准的地方宁可报出来让人写清楚，也好过悄悄错。
+#
+# 2026-11-23：正则原先只认 `filesystem::x(`，认不出 `fs::x(` 别名——而库内
+# 绝大多数调用点写的正是 `fs::`。于是 Cask::open 的
+# `fs::create_directories(dirname_)`、upgrade 的 `fs::exists(dirname)`、
+# backup 的 `fs::path(dst_dir)` 等一整批「UTF-8 窄串隐式转 path」全都漏过
+# （Windows 上按 ACP 解：中文路径要么开错目录、要么构造直接抛）。
 # ---------------------------------------------------------------------------
-FS_FNS='remove|remove_all|exists|rename|copy_file|file_size|create_directories|create_directory|is_directory|is_regular_file|status'
+FS_FNS='remove|remove_all|exists|rename|copy_file|file_size|create_directories|create_directory|is_directory|is_regular_file|status|create_hard_link|create_symlink|directory_iterator|canonical|weakly_canonical|absolute|equivalent|last_write_time'
 
 # 调用常跨行（`fs::remove(` 后换行才是入参），逐行扫会把它们全判成违规。
 # 先把以 ( 或 , 结尾的行与下一行拼起来再扫。
-joined=$(find src include c_api -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) 2>/dev/null \
+joined=$(find src include c_api tools -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) 2>/dev/null \
          | xargs awk '{
              buf = $0
              n = 0
@@ -102,10 +114,11 @@ joined=$(find src include c_api -type f \( -name '*.cpp' -o -name '*.hpp' -o -na
            }')
 
 implicit=$(echo "$joined" \
-           | grep -E "(std::)?filesystem::($FS_FNS) ?\(" \
+           | grep -E "((std::)?filesystem|fs)::($FS_FNS) ?\(" \
            | grep -vE "^($ALLOW):" \
            | grep -vE ':[0-9]+: *//' \
-           | grep -vE 'from_utf8|\.path\(\)|_path\b|_dir\b')
+           | grep -vE 'from_utf8|\.path\(\)|_path\b|_dir\b' \
+           | grep -vE 'directory_iterator ?\(\)')  # 尾迭代器，无路径入参
 if [[ -n "$implicit" ]]; then
     echo "FAIL: fs:: 调用点的路径入参可能是窄串（隐式构造 fs::path，按 ANSI 解码）。"
     echo "   包成 bitcask::detail::from_utf8(...)；若入参本就是 fs::path，"

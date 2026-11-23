@@ -39,3 +39,20 @@ src/cask/cask.cpp:3349:                "backup: copy failed: " + entry.path().st
 - 本地给 `cmake --build` 加一个不依赖 bash 的等价检查（CMake script 或 CTest 用例），让 Windows 开发者也能在提交前看到。
 - 更新 `win32_file.cpp:114` 的「已知缺口」注释（剩余站点与工具侧那条见
   [`2026-11-23-vec-engine-migrate-non-ascii-dir-false-store-in-use.md`](2026-11-23-vec-engine-migrate-non-ascii-dir-false-store-in-use.md)）。
+
+## 回没回
+
+已修（未发版）。写本条时脚本没跑成，这次用 Git 自带的 `sh`（`scoop shims\sh.exe`；`bash` 解析到 WSL 起不来）跑了原脚本，结论有修正：
+
+- **HEAD（`d995557`）上脚本是红的，且不止这两处**：除 `cask.cpp:3345` / `:3349` 外，还有
+  `c_api/bitcask_kv.cpp:147` / `:150`（`9f940ed`，11-19）与 `src/text/jieba_analyzer.cpp:87`（`a30186d`，11-20）三处——
+  后三处入参本就是 `fs::path`，只是变量名不合 `*_path` 约定（假阳性，改名 `dir_path` / `file_path` 即可）。
+  按 `7af29da` 的日期，`path-encoding` job 从 11-15 起就红，11-19 起红 5 处；CI 上的实际颜色仍没核实（本机没有 `gh`）。
+- **更大的问题在脚本自己**：隐式规则的正则只认 `(std::)?filesystem::x(`，而库内绝大多数调用点写的是 `fs::` 别名
+  ⇒ `Cask::open` / `upgrade` / `backup` / 三个迁移入口的「窄串直接喂 `fs::`」全都漏过（详见工具侧那条的「回没回」）。
+  本次：正则改 `((std::)?filesystem|fs)::`，新增 `fs::path x(窄)` 具名变量规则，扫描范围加 `tools`，
+  受检函数加 `create_hard_link` / `create_symlink` / `directory_iterator` / `canonical` / `weakly_canonical` / `absolute` / `equivalent` / `last_write_time`。
+- `:3345` 改 `to_utf8(entry.path().filename())`；`:3349` 只进报文、改为同一个 `name`。`win32_file.cpp:114` 的注释已改写成现状
+  （库内站点已清，`fs::` 仍只收 `fs::path`，窄串一律经 `from_utf8`）。
+- **没做**建议里的「CMake script 版等价检查」：规则是一组正则，移植成 CMake 要维护两份、迟早漂移；
+  Windows 上装了 Git for Windows（或 scoop 的 `sh`）就能跑，「怎么撞上的」里缺的只是这个环境。

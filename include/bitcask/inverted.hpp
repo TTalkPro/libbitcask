@@ -515,6 +515,13 @@ public:
     // mutable_pl）。phrase/near 读者持引用零拷贝读；写者 use_count==1 时
     // 原地改（常态），>1（有 phrase 读者在持）才克隆替换。
     using PostingMap = tbb::concurrent_hash_map<std::string, std::shared_ptr<PostingList>>;
+#if defined(_MSC_VER)
+    // C4324「因对齐说明符而填充结构」：正是下面 gen_ 的 alignas(64) 的预期
+    // 结果——尾部补齐到 64 的倍数，下一个 Shard 的数据才不会与 gen_ 同行。
+    // 只关这一个结构体的这一条，其余的 C4324 照常报。
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
     struct Shard {
         PostingMap inverted;
 
@@ -548,6 +555,9 @@ public:
         // 独占 cacheline:写者 bump 不得连带失效读者正在读的邻接字段。
         alignas(64) std::atomic<std::uint64_t> gen_{0};
     };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
     // 获取内部 shard（用于测试）。
     [[nodiscard]] auto shard_for(std::string_view term) -> Shard&;

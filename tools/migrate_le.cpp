@@ -7,10 +7,13 @@
 // 非破坏性:只读 src、只写 dst。迁移 data（重编码）、meta、
 // field.schema;ckpt/seg/wal 等可重建文件不迁移（新库首开自动重建）。
 // 详见 bitcask/migrate.hpp 与 doc/format-zh.md。
+//
+// 路径编码：argv 经 argv_utf8.hpp 转成 UTF-8（库约定窄路径 = UTF-8）。
 
 #include <cstdio>
 #include <string>
 
+#include "argv_utf8.hpp"
 #include "bitcask/migrate.hpp"
 
 int main(int argc, char** argv) {
@@ -24,13 +27,14 @@ int main(int argc, char** argv) {
                      argv[0]);
         return 2;
     }
-    auto r = bitcask::migrate::migrate_be_to_le(argv[1], argv[2]);
+    const auto args = bitcask_tools::args_as_utf8(argc, argv);
+    auto r = bitcask::migrate::migrate_be_to_le(args[1], args[2]);
     if (!r) {
         std::fprintf(stderr, "migrate failed: %s\n", r.error().c_str());
         return 1;
     }
     const auto& s = *r;
-    std::printf("migrated %s -> %s\n", argv[1], argv[2]);
+    std::printf("migrated %s -> %s\n", args[1].c_str(), args[2].c_str());
     std::printf("  data files     : %llu\n",
                 static_cast<unsigned long long>(s.data_files));
     std::printf("  records        : %llu (tombstones %llu)\n",

@@ -449,7 +449,12 @@ protected:
         for (const auto& entry : fs::directory_iterator(dir_)) {
             const auto name = entry.path().filename().string();
             const auto id = bitcask::fileops::parse_data_tstamp(name);
-            if (id.has_value()) files.emplace_back(*id, entry.path().string());
+            // parse_data_tstamp 回 u64，sealed 表的 file_id 是 u32：位宽在格式里
+            // 就定死了（显式收窄，C4244）。
+            if (id.has_value()) {
+                files.emplace_back(static_cast<std::uint32_t>(*id),
+                                   entry.path().string());
+            }
         }
         EXPECT_FALSE(files.empty());
         if (files.empty()) return {};

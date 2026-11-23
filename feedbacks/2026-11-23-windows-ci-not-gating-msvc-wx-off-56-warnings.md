@@ -41,3 +41,18 @@
 - 加一个 `msvc-asan` job（非门控起步也行），把已有的 preset 用起来。
 - Windows 的 `ctest` 加 `-j`（见
   [`2026-11-23-ctest-test-presets-serial-437s.md`](2026-11-23-ctest-test-presets-serial-437s.md)）。
+
+## 回没回
+
+已修（未发版）：
+
+- 56 条告警清零：`InvertedIndex::Shard` 的 C4324 是 `gen_` 的 `alignas(64)` 的预期结果（尾部补齐，下一个分片不与它同行），
+  只在该结构体上 `#pragma warning(push) / (disable : 4324) / (pop)`（`_MSC_VER` 下）；`oki_only_contract_test.cpp` 的 u64→u32 显式 `static_cast`。
+  本机 VS 18 / MSVC 14.51：`msvc-release` 配 `-DBITCASK_WERROR=ON -DBUILD_TESTING=OFF`，`bitcask_static` + `bitcask_shared` 以 `/WX` 编过，0 告警；
+  全量构建日志里另有 `bitcask_migrate` 的 14 条 C4840 / C4477（`std::string` 直接喂 `printf("%s")`，是 UB 不是噪音），已改 `.c_str()`。
+- `windows-msvc` 去掉 `continue-on-error`，**改门控**。⚠️ 建议里的前提「先在 `windows-2022` 上确认 HEAD 是绿的」**没能本地核实**
+  （本机只有 VS 18）；若 runner 上是红的，这一行改回去即可。
+- `/WX` **没有**直接开在 `windows-msvc` 上：VS 2022 与 VS 18 的告警面未必一致，开成门控等于把没验证过的东西当闸门。
+  改为新增 `werror-windows` job（库目标、`continue-on-error: true`），照 `werror-lib` 的做法；它在 runner 上绿了再并入门控 job。
+- 新增 `windows-msvc-asan` job（`msvc-asan` preset，Debug + `/fsanitize=address` + 全量 ctest，`continue-on-error: true` 直到首次跑绿）。
+- 三个 job 都没在 GitHub 上实跑过（本地无法触发 CI）。

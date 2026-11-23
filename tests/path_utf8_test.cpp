@@ -27,6 +27,7 @@
 // （含 /execution-charset:utf-8），故运行期字节就是 UTF-8。
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <span>
 #include <string>
@@ -37,7 +38,10 @@
 #include "bitcask/detail/file_util.hpp"
 #include "bitcask/detail/path_utf8.hpp"
 #include "bitcask/detail/scanner.hpp"
+#include "bitcask/codec.hpp"
+#include "bitcask/format.hpp"
 #include "bitcask/io.hpp"
+#include "bitcask/migrate.hpp"
 #include "support/test_paths.hpp"
 
 namespace fs = std::filesystem;
@@ -257,4 +261,154 @@ TEST(PathUtf8, NonAsciiDirIsUsableEndToEnd) {
 
     // 窄 → path → 窄 之后仍指向同一个文件
     EXPECT_EQ(to_utf8(from_utf8(meta)), meta);
+}
+
+// --- 离线迁移器（2026-11-23）------------------------------------------------
+//
+// 三个迁移入口收的是 UTF-8 窄串（库级约定），但第一行就写 `fs::path src(src_dir)`
+// ——「测试库」的 UTF-8 字节不是合法 GBK ⇒ 形态 2：构造直接抛 std::system_error，
+// 没人接 ⇒ 用例炸。守门脚本原先只认 `filesystem::path(`，认不出 `fs::` 别名，
+// 所以这三处一直是绿的。这里只守「非 ASCII 目录下迁移器走得通、产物落在对的
+// 目录」；格式语义由 data_file_test / cask_docvalue_test 的迁移用例守。
+
+namespace {
+
+void be_put16(std::vector<std::byte>& b, std::uint16_t v) {
+    b.push_back(static_cast<std::byte>((v >> 8) & 0xFF));
+    b.push_back(static_cast<std::byte>(v & 0xFF));
+}
+void be_put32(std::vector<std::byte>& b, std::uint32_t v) {
+    for (int i = 3; i >= 0; --i)
+        b.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+}
+void be_put64(std::vector<std::byte>& b, std::uint64_t v) {
+    for (int i = 7; i >= 0; --i)
+        b.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+}
+
+// 一条 v1 大端 data record：[crc BE][type][tstamp BE][ord BE][keysz BE][valsz BE][key][val]。
+std::vector<std::byte> be_data_record(std::string_view key, std::string_view val) {
+    std::vector<std::byte> covered;
+    covered.push_back(static_cast<std::byte>(bitcask::format::RecordType::kDoc));
+    be_put32(covered, 100);
+    be_put64(covered, 1);
+    be_put16(covered, static_cast<std::uint16_t>(key.size()));
+    be_put32(covered, static_cast<std::uint32_t>(val.size()));
+    auto append = [&](std::string_view s) {
+        const auto* p = reinterpret_cast<const std::byte*>(s.data());
+        covered.insert(covered.end(), p, p + s.size());
+    };
+    append(key);
+    append(val);
+    std::vector<std::byte> rec;
+    be_put32(rec, bitcask::codec::crc32(covered));
+    rec.insert(rec.end(), covered.begin(), covered.end());
+    return rec;
+}
+
+// 当前纪元版式的小端 meta：[BCME][ver][mode=1][metric=1][dim LE u16]...[crc32 LE @14]。
+std::vector<std::byte> le_meta(std::uint8_t ver) {
+    std::vector<std::byte> m(18, std::byte{0});
+    std::memcpy(m.data(), "BCME", 4);
+    m[4] = static_cast<std::byte>(ver);
+    m[5] = static_cast<std::byte>(1);  // mode = index
+    m[6] = static_cast<std::byte>(1);  // metric = cosine
+    m[8] = static_cast<std::byte>(4);  // dim = 4（小端低位）
+    const std::uint32_t crc = bitcask::codec::crc32(
+        std::span<const std::byte>(m.data(), 14));
+    for (int i = 0; i < 4; ++i)
+        m[14 + i] = static_cast<std::byte>((crc >> (8 * i)) & 0xFF);
+    return m;
+}
+
+std::string read_narrow(const std::string& p) {
+    auto b = bitcask::detail::read_file_bytes<>(p);
+    return b ? std::string(reinterpret_cast<const char*>(b->data()), b->size())
+             : std::string();
+}
+
+}  // namespace
+
+TEST(PathUtf8, MigrateBeToLeInNonAsciiDir) {
+    CjkTempDir td;
+    const std::string src = td.narrow_file("旧库");
+    const std::string dst = td.narrow_file("新库");
+    std::error_code ec;
+    ASSERT_TRUE(fs::create_directories(from_utf8(src), ec)) << ec.message();
+
+    // v1 大端 meta：[BCME][1][mode=1][metric=1][dim BE 00 04]...
+    std::vector<std::byte> m(18, std::byte{0});
+    std::memcpy(m.data(), "BCME", 4);
+    m[4] = static_cast<std::byte>(1);
+    m[5] = static_cast<std::byte>(1);
+    m[6] = static_cast<std::byte>(1);
+    m[8] = static_cast<std::byte>(4);
+    ASSERT_TRUE(bitcask::detail::atomic_write_bytes(src + "/bitcask.meta", m));
+    const auto rec = be_data_record("k1", "v1");
+    ASSERT_TRUE(bitcask::detail::atomic_write_bytes(src + "/1.bitcask.data", rec));
+
+    auto r = bitcask::migrate::migrate_be_to_le(src, dst);
+    ASSERT_TRUE(r) << (r ? "" : r.error());
+    EXPECT_EQ(r->data_files, 1u);
+    EXPECT_EQ(r->records, 1u);
+
+    // 产物必须落在**这个**中文目录下（形态 1 下会静默落到另一个名字的目录）。
+    const fs::path dst_dir = from_utf8(dst);
+    ASSERT_TRUE(fs::exists(dst_dir / "bitcask.meta"));
+    ASSERT_TRUE(fs::exists(dst_dir / "1.bitcask.data"));
+    const auto out = read_narrow(dst + "/bitcask.meta");
+    ASSERT_EQ(out.size(), 18u);
+    EXPECT_EQ(static_cast<unsigned char>(out[4]), 5u);
+}
+
+TEST(PathUtf8, MigrateHintOrdInNonAsciiDir) {
+    CjkTempDir td;
+    const std::string src = td.narrow_file("v4库");
+    const std::string dst = td.narrow_file("v5库");
+    std::error_code ec;
+    ASSERT_TRUE(fs::create_directories(from_utf8(src), ec)) << ec.message();
+    ASSERT_TRUE(bitcask::detail::atomic_write_bytes(src + "/bitcask.meta", le_meta(4)));
+    // hintord 不看 data 内容：data 文件原样硬链接 / 拷贝进 dst。
+    ASSERT_TRUE(bitcask::detail::atomic_write_bytes(src + "/7.bitcask.data",
+                                                    as_bytes("payload")));
+
+    auto r = bitcask::migrate::migrate_hint_ord(src, dst);
+    ASSERT_TRUE(r) << (r ? "" : r.error());
+    EXPECT_EQ(r->data_files, 1u);
+    EXPECT_TRUE(r->meta_migrated);
+
+    const fs::path dst_dir = from_utf8(dst);
+    ASSERT_TRUE(fs::exists(dst_dir / "7.bitcask.data"));
+    EXPECT_EQ(read_narrow(dst + "/7.bitcask.data"), "payload");
+    const auto out = read_narrow(dst + "/bitcask.meta");
+    ASSERT_EQ(out.size(), 18u);
+    EXPECT_EQ(static_cast<unsigned char>(out[4]), 5u);
+}
+
+TEST(PathUtf8, MigrateU32ToU64InNonAsciiDir) {
+    CjkTempDir td;
+    const std::string src = td.narrow_file("v3库");
+    const std::string dst = td.narrow_file("v5库b");
+    std::error_code ec;
+    ASSERT_TRUE(fs::create_directories(from_utf8(src), ec)) << ec.message();
+    // 只带 meta（无 data 文件）：足够走到「建 dst 目录 + 写 v5 meta」那一步，
+    // 而 u32 纪元 record 头的字段布局由 data_file_test 的迁移用例守。
+    ASSERT_TRUE(bitcask::detail::atomic_write_bytes(src + "/bitcask.meta", le_meta(3)));
+
+    auto r = bitcask::migrate::migrate_u32_to_u64(src, dst);
+    ASSERT_TRUE(r) << (r ? "" : r.error());
+    EXPECT_EQ(r->data_files, 0u);
+    EXPECT_TRUE(r->meta_migrated);
+    const auto out = read_narrow(dst + "/bitcask.meta");
+    ASSERT_EQ(out.size(), 18u);
+    EXPECT_EQ(static_cast<unsigned char>(out[4]), 5u);
+}
+
+// src 不存在时的报文也必须是「目录不存在」，而不是构造 path 时抛出来。
+TEST(PathUtf8, MigrateMissingNonAsciiSrcReportsNotFound) {
+    CjkTempDir td;
+    auto r = bitcask::migrate::migrate_be_to_le(td.narrow_file("没有这个目录"),
+                                                td.narrow_file("x"));
+    ASSERT_FALSE(r);
+    EXPECT_NE(r.error().find("src dir does not exist"), std::string::npos) << r.error();
 }

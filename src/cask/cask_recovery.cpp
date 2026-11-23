@@ -37,7 +37,7 @@ namespace fs = std::filesystem;
 std::expected<std::unique_ptr<Cask>, CaskFault>
 Cask::upgrade(std::string_view dirname,
               const search::SearchLayerConfig& search_config) {
-    if (!fs::exists(dirname)) {
+    if (!fs::exists(bitcask::detail::from_utf8(dirname))) {  // 窄 = UTF-8
         return std::unexpected(err(CaskError::kIo, "directory does not exist"));
     }
 
@@ -214,9 +214,9 @@ bool Cask::oki_manifest_consistent() const {
     if (!oki.loaded()) return false;
     auto file_ok = [&](std::uint32_t fid, std::uint64_t min_size) {
         std::error_code ec;
-        const auto path = bitcask::detail::from_utf8(
+        const auto data_file_path = bitcask::detail::from_utf8(
             fileops::mk_data_filename(dirname_, fid));
-        const auto sz = fs::file_size(path, ec);
+        const auto sz = fs::file_size(data_file_path, ec);
         return !ec && sz >= min_size;
     };
     for (const auto& [fid, wm] : oki.manifest_data_wms()) {
@@ -401,7 +401,8 @@ std::expected<void, CaskFault> Cask::load_authority_from_disk() {
     // data-only recovery / fold(data)。
     if (opts_.read_write && !opts_.merge_only) {
         std::error_code ec;
-        for (const auto& entry : fs::directory_iterator(dirname_, ec)) {
+        for (const auto& entry
+             : fs::directory_iterator(bitcask::detail::from_utf8(dirname_), ec)) {
             if (ec) break;
             std::error_code hint_ec;
             if (!entry.is_regular_file(hint_ec) || hint_ec) continue;

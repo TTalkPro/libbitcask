@@ -242,7 +242,10 @@ Cask::open(std::string_view dirname, const CaskOptions& opts,
 
     // 目录不存在就建（mkdir -p 语义）。已存在不报错。
     std::error_code ec;
-    fs::create_directories(cask->dirname_, ec);
+    // dirname_ 是 UTF-8 窄串，必须经 from_utf8：`fs::create_directories(窄)`
+    // 在 Windows 上按系统 ACP 解码，中文路径要么建错目录、要么直接抛
+    // std::system_error（2026-11-23 守门复核）。
+    fs::create_directories(bitcask::detail::from_utf8(cask->dirname_), ec);
 
     // 字段名 ↔ id 注册表（#1）：加载已有 + 打开追加句柄。
     if (!cask->field_schema_.open(bitcask::detail::to_utf8(bitcask::detail::from_utf8(cask->dirname_) / "field.schema"))) {
@@ -3286,10 +3289,13 @@ std::expected<void, CaskFault> Cask::backup(std::string_view dst_dir) {
 
     namespace fs = std::filesystem;
     std::error_code ec;
-    const fs::path dst(dst_dir);
-    fs::create_directories(dst, ec);
+    // 窄路径 = UTF-8（库级约定）。`fs::path(dst_dir)` 在 Windows 上按系统 ACP
+    // 解码：中文目录要么被解成另一个目录（备份写错地方）、要么构造直接抛
+    // std::system_error。下面的 base 同理。
+    const fs::path dst_dir_path = bitcask::detail::from_utf8(dst_dir);
+    fs::create_directories(dst_dir_path, ec);
     if (ec) return std::unexpected(err(CaskError::kIo,
-        "backup: cannot create dst dir: " + bitcask::detail::to_utf8(dst)));
+        "backup: cannot create dst dir: " + bitcask::detail::to_utf8(dst_dir_path)));
 
     // 关闭 active writer：data 封口持久后成为 sealed（不可变），
     // 可安全 hardlink。read_write 且有 active 时才需要；下一次 put 经
@@ -3311,15 +3317,16 @@ std::expected<void, CaskFault> Cask::backup(std::string_view dst_dir) {
     if (opts_.read_write) write_authority_snapshot();
 
     // hardlink（同设备零拷贝、天然一致）→ 跨设备回退字节拷贝。
-    auto link_or_copy = [&](const fs::path& src) -> bool {
-        if (!fs::exists(src, ec)) return true;  // 可选文件缺失 = 跳过
-        const fs::path to = dst / src.filename();
+    auto link_or_copy = [&](const fs::path& src_file_path) -> bool {
+        if (!fs::exists(src_file_path, ec)) return true;  // 可选文件缺失 = 跳过
+        const fs::path dst_file_path = dst_dir_path / src_file_path.filename();
         std::error_code ec2;
-        fs::remove(to, ec2);  // 幂等：目标已存在则覆盖
-        fs::create_hard_link(src, to, ec2);
+        fs::remove(dst_file_path, ec2);  // 幂等：目标已存在则覆盖
+        fs::create_hard_link(src_file_path, dst_file_path, ec2);
         if (!ec2) return true;
         ec2.clear();
-        fs::copy_file(src, to, fs::copy_options::overwrite_existing, ec2);
+        fs::copy_file(src_file_path, dst_file_path,
+                      fs::copy_options::overwrite_existing, ec2);
         return !ec2;
     };
 
@@ -3328,33 +3335,34 @@ std::expected<void, CaskFault> Cask::backup(std::string_view dst_dir) {
         return std::unexpected(io_fault(entries.error().errnum, dirname_));
     }
     for (const auto& e : *entries) {
-        if (!link_or_copy(e.data_path)) {
+        // scan_dir 产出的是 UTF-8 窄串：进 fs:: 前必须显式转 path。
+        if (!link_or_copy(bitcask::detail::from_utf8(e.data_path))) {
             return std::unexpected(err(CaskError::kIo,
                 "backup: copy failed: " + e.data_path));
         }
     }
     // 元数据必备；索引/checkpoint 可选（缺失只是备份目录首次 open 慢一次）。
-    const fs::path base(dirname_);
-    if (!link_or_copy(base / "bitcask.meta")) {
+    const fs::path base_dir = bitcask::detail::from_utf8(dirname_);
+    if (!link_or_copy(base_dir / "bitcask.meta")) {
         return std::unexpected(err(CaskError::kIo, "backup: meta copy failed"));
     }
-    (void)link_or_copy(base / "field.schema");
-    (void)link_or_copy(base / oki::kManifestName);
-    for (const auto& entry : fs::directory_iterator(base, ec)) {
+    (void)link_or_copy(base_dir / "field.schema");
+    (void)link_or_copy(base_dir / oki::kManifestName);
+    for (const auto& entry : fs::directory_iterator(base_dir, ec)) {
         if (ec) break;
-        const auto name = entry.path().filename().string();
+        const auto name = bitcask::detail::to_utf8(entry.path().filename());
         if (!name.starts_with("kv.oki.seg-")) continue;
         if (!link_or_copy(entry.path())) {
             return std::unexpected(err(CaskError::kIo,
-                "backup: copy failed: " + entry.path().string()));
+                "backup: copy failed: " + name));
         }
     }
-    (void)link_or_copy(base / kSearchCkptName);
+    (void)link_or_copy(base_dir / kSearchCkptName);
     // S14-8：向量 payload 一并带上（此前漏 .vec——缺失仅降级为 fold 重建，
     // 但备份目录首次 open 会付全量重建代价）。delta 链文件不带：备份点的
     // base+快照自洽，链属运行期窗口。
-    (void)link_or_copy(base / "search.vec");
-    (void)link_or_copy(base / "search.qc8");
+    (void)link_or_copy(base_dir / "search.vec");
+    (void)link_or_copy(base_dir / "search.qc8");
     return {};
 }
 

@@ -764,7 +764,9 @@ include(BitcaskICU)
 # ---------------------------------------------------------------------------
 add_executable(gen_inert_table tools/gen_inert_table.cpp)
 target_include_directories(gen_inert_table PRIVATE include)  # detail/icu_util.hpp
-target_link_libraries(gen_inert_table PRIVATE ${BITCASK_ICU_TARGETS})
+# bitcask_io：输出路径可能是非 ASCII（仓库放在中文目录下），文件操作走
+# detail::fopen_utf8 / remove_utf8（2026-11-23）。
+target_link_libraries(gen_inert_table PRIVATE ${BITCASK_ICU_TARGETS} bitcask_io)
 
 # ---------------------------------------------------------------------------
 # migrate_le — v1 大端 → 当前纪元离线迁移工具（旧入口,保留兼容;新增迁移
@@ -1007,6 +1009,52 @@ install(FILES c_api/bitcask_c.h
 # ---------------------------------------------------------------------------
 if(BUILD_TESTING)
     add_subdirectory(tests)
+
+    # 离线工具在**非 ASCII 目录**下的入口（2026-11-23 反馈）。Windows 上窄 argv
+    # 是系统 ACP（简中 936/GBK），工具必须先转成库约定的 UTF-8 再交给库——
+    # 否则 vec_engine_migrate 连 write.lock 都拿不到，却报「store in use」。
+    # 两个用例都拿一个只放着坏 meta 的目录：期望工具**越过锁 / 编码这关**、停在
+    # 校验 meta 那一步（退出码非 0，靠 PASS_REGULAR_EXPRESSION 判定）。修前
+    # vec_engine_migrate 的输出是 `cannot acquire`，FAIL_REGULAR_EXPRESSION 把它
+    # 钉死为失败。
+    set(_bitcask_cjk_tool_dir "${CMAKE_CURRENT_BINARY_DIR}/工具-目录-vé")
+    file(MAKE_DIRECTORY "${_bitcask_cjk_tool_dir}")
+    file(WRITE "${_bitcask_cjk_tool_dir}/bitcask.meta" "not-a-bitcask-meta")
+    add_test(NAME Tools.VecEngineMigrateNonAsciiDir
+        COMMAND vec_engine_migrate --dir "${_bitcask_cjk_tool_dir}" --to ivfrq --dry-run)
+    set_tests_properties(Tools.VecEngineMigrateNonAsciiDir PROPERTIES
+        PASS_REGULAR_EXPRESSION "read meta failed"
+        FAIL_REGULAR_EXPRESSION "cannot acquire")
+    add_test(NAME Tools.MigrateDetectNonAsciiDir
+        COMMAND bitcask_migrate detect "${_bitcask_cjk_tool_dir}")
+    set_tests_properties(Tools.MigrateDetectNonAsciiDir PROPERTIES
+        PASS_REGULAR_EXPRESSION "has no valid BCME magic"
+        FAIL_REGULAR_EXPRESSION "cannot open")
+    unset(_bitcask_cjk_tool_dir)
+
+    # `cmake --build . --target check` = 并行 ctest。test preset 里配不了 jobs
+    # （CMakePresets 是 version 3，execution.jobs 要 version 6 / CMake ≥ 3.29），
+    # 串行跑 966 个用例 437 s、-j 8 只要 91 s，成本几乎全是进程启动。
+    include(ProcessorCount)
+    ProcessorCount(_bitcask_check_jobs)
+    if(_bitcask_check_jobs LESS 1)
+        set(_bitcask_check_jobs 1)
+    endif()
+    # 封顶 8：实测 14 核满载（-j 14）时两个带时序假设的用例会挂
+    # （AtomicBatchVisibilityTest.HeadThenTailNeverShowsHalfBatch、
+    # OkiCompactionModelTest.ConcurrentLoaderNeverFallsBackToUnloaded；单跑各 5 次全过），
+    # -j 8 多轮全绿。这是那两个用例对调度时序的假设偏紧，不是产品问题；要用更多并行
+    # 得先把它们改稳。
+    if(_bitcask_check_jobs GREATER 8)
+        set(_bitcask_check_jobs 8)
+    endif()
+    add_custom_target(check
+        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -j ${_bitcask_check_jobs}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        USES_TERMINAL
+        COMMENT "Running tests (parallel ctest, -j ${_bitcask_check_jobs})"
+        VERBATIM)
+    unset(_bitcask_check_jobs)
 endif()
 
 # ---------------------------------------------------------------------------

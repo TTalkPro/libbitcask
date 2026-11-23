@@ -53,3 +53,25 @@ GBK 的「中文库」不是合法 UTF-8 ⇒ 拿不到句柄。`FileLock::acquir
 - `FileLock::acquire` 的失败按 `errnum` 分流再出报文：`EEXIST` 才说「被占用」，`EINVAL` 说「路径不是合法 UTF-8」。
 - 回归：非 ASCII 目录下 `vec_engine_migrate --dry-run` 能越过锁、到达读 meta 的那一步（ASCII / 非 ASCII 两目录报文一致）。
 - `scripts/check-path-encoding.sh` 的扫描范围加上 `tools/`（现在只扫 `src include c_api`，所以 `:108` 的 `fs::path(窄)` / `.string()` 没被拦）。
+
+## 回没回
+
+已修（未发版），按建议做；**但根因比本条写的宽得多——库本身在非 ASCII 目录下也开不了**，不只是工具：
+
+- 病因是同一类写法「UTF-8 窄串隐式转 `fs::path`」（Windows 上按 ACP 解码），不止 `tools/`。库内还有：
+  `Cask::open` 的 `fs::create_directories(dirname_)`、`Cask::upgrade` 的 `fs::exists(dirname)`、
+  `Cask::backup` 的 `fs::path(dst_dir)` / `fs::path base(dirname_)` / `link_or_copy(e.data_path)`、
+  三个迁移入口的 `fs::path src(src_dir)`、恢复期清理 hint 的 `fs::directory_iterator(dirname_)`。
+  两种现形方式：名字的 UTF-8 字节不是合法 GBK（如「测试库」）⇒ 构造抛 `std::system_error`，`Cask::open` 连目录都建不出来；
+  字节恰好是合法 GBK（如「中文库」）⇒ **静默解成另一个目录**，数据写错地方、不报错。
+  守门脚本原先只认 `filesystem::x(`，认不出库内通用的 `fs::` 别名，所以这一整批都是绿的。
+- 工具侧：新增 `tools/argv_utf8.hpp`（`args_as_utf8`，Windows 上 ACP → UTF-8，POSIX 原样），
+  `vec_engine_migrate` / `bitcask_migrate` / `migrate_le` / `gen_inert_table` 四个入口都过一遍；
+  `lock_path` 改 `to_utf8(from_utf8(dir) / "write.lock")`，锁失败按 `errnum` 分流（`EEXIST` 才说「被占用」，其余带 `strerror`）；
+  `bitcask_migrate detect` 的 `std::fopen` 改 `fopen_utf8`（此前「碰巧能用」是两头都按 ACP 解、错误互相抵消，
+  经 C++ API 传 UTF-8 路径的调用方在同一份代码上解错）。
+- 回归：`Tools.VecEngineMigrateNonAsciiDir` / `Tools.MigrateDetectNonAsciiDir`（ctest，目录名含中文与 `é`；
+  修前输出 `cannot acquire`，被 `FAIL_REGULAR_EXPRESSION` 钉死）、`PathUtf8.Migrate{BeToLe,HintOrd,U32ToU64}InNonAsciiDir`、
+  `CaskDocValueTest.OpenAndBackupInNonAsciiDir`（两个中文目录名各占一种现形方式：open 建目录 / backup 落盘 / 重开读回）。
+- 守门：扫描范围加 `tools`；隐式规则认 `fs::` 别名；新增 `fs::path x(窄)` 具名变量规则；
+  受检函数加 `create_hard_link` / `directory_iterator` / `canonical` 等。现在 `sh scripts/check-path-encoding.sh .` 输出 `OK`。

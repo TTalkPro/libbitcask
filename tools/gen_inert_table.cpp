@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,8 @@
 #include <unicode/uchar.h>
 #include <unicode/uversion.h>
 
+#include "argv_utf8.hpp"
+#include "bitcask/detail/file_util.hpp"
 #include "bitcask/detail/icu_util.hpp"
 
 namespace {
@@ -55,7 +58,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s <output.hpp>\n", argv[0]);
         return 1;
     }
-    const char* out_path = argv[1];
+    // 输出路径按库约定走 UTF-8（argv_utf8.hpp；Windows 上窄 argv 是系统 ACP），
+    // 文件操作一律 fopen_utf8 / remove_utf8。
+    const auto args = bitcask_tools::args_as_utf8(argc, argv);
+    const std::string out_path = args[1];
 
     std::vector<Range> ranges;
     char32_t run_lo = 0;
@@ -91,7 +97,7 @@ int main(int argc, char** argv) {
     // （见 CMakeLists.txt 的 generate_inert_table），但那样若无条件重写文件，
     // mtime 每次都变，全部下游 TU 每次构建都要重编。内容不变就不落盘即可两全。
     const std::string tmp_path = std::string(out_path) + ".tmp";
-    FILE* fp = std::fopen(tmp_path.c_str(), "wb");
+    FILE* fp = bitcask::detail::fopen_utf8(tmp_path, "wb");
     if (fp == nullptr) {
         std::fprintf(stderr, "gen_inert_table: cannot open %s\n",
                      tmp_path.c_str());
@@ -158,12 +164,12 @@ int main(int argc, char** argv) {
     if (std::fclose(fp) != 0) {
         std::fprintf(stderr, "gen_inert_table: write failed for %s\n",
                      tmp_path.c_str());
-        std::remove(tmp_path.c_str());
+        bitcask::detail::remove_utf8(tmp_path);
         return 1;
     }
 
-    const auto slurp = [](const char* path) -> std::string {
-        FILE* f = std::fopen(path, "rb");
+    const auto slurp = [](const std::string& path) -> std::string {
+        FILE* f = bitcask::detail::fopen_utf8(path, "rb");
         if (f == nullptr) return {};
         std::string out;
         char buf[8192];
@@ -173,21 +179,25 @@ int main(int argc, char** argv) {
         return out;
     };
 
-    if (slurp(tmp_path.c_str()) == slurp(out_path)) {
-        std::remove(tmp_path.c_str());
+    if (slurp(tmp_path) == slurp(out_path)) {
+        bitcask::detail::remove_utf8(tmp_path);
         std::printf("gen_inert_table: %zu range(s), %s already up to date\n",
-                    ranges.size(), out_path);
+                    ranges.size(), out_path.c_str());
         return 0;
     }
 
-    std::remove(out_path);  // Windows 的 rename 不覆盖已存在的目标
-    if (std::rename(tmp_path.c_str(), out_path) != 0) {
+    // fs::rename 按 POSIX 语义覆盖已存在的目标（MSVC 走 MoveFileExW +
+    // MOVEFILE_REPLACE_EXISTING），不必先 remove。
+    std::error_code rename_ec;
+    std::filesystem::rename(bitcask::detail::from_utf8(tmp_path),
+                            bitcask::detail::from_utf8(out_path), rename_ec);
+    if (rename_ec) {
         std::fprintf(stderr, "gen_inert_table: rename %s -> %s failed\n",
-                     tmp_path.c_str(), out_path);
-        std::remove(tmp_path.c_str());
+                     tmp_path.c_str(), out_path.c_str());
+        bitcask::detail::remove_utf8(tmp_path);
         return 1;
     }
     std::printf("gen_inert_table: wrote %zu range(s) to %s\n",
-                ranges.size(), out_path);
+                ranges.size(), out_path.c_str());
     return 0;
 }

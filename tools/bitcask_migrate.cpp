@@ -16,12 +16,19 @@
 // 非破坏性:只读 src、只写 dst（dst 不存在则创建）。data 重编码（hintord
 // 例外:硬链接零改动）;ckpt/seg/wal/旧 hint 等派生缓存不迁移,新库首开
 // 按 data 重建索引。
+//
+// 路径编码：argv 经 argv_utf8.hpp 转成 UTF-8（Windows 上窄 argv 是系统 ACP，
+// 而库约定窄路径 = UTF-8）。此前这个工具「碰巧能用」是因为 detect 的 std::fopen
+// 与 bitcask::migrate 内部的 fs::path(窄) 两头都按 ACP 解、错误互相抵消——
+// 代价是经 C++ API 传 UTF-8 路径的调用方在同一份代码上解错。
 
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <string_view>
 
+#include "argv_utf8.hpp"
+#include "bitcask/detail/file_util.hpp"
 #include "bitcask/migrate.hpp"
 
 namespace {
@@ -86,9 +93,9 @@ void print_stats(const char* src, const char* dst,
 }
 
 // detect：只读 bitcask.meta 的 magic + version 字节,不碰任何数据文件。
-int cmd_detect(const char* dir) {
-    const std::string path = std::string(dir) + "/bitcask.meta";
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+int cmd_detect(const std::string& dir) {
+    const std::string path = dir + "/bitcask.meta";
+    std::FILE* f = bitcask::detail::fopen_utf8(path, "rb");
     if (!f) {
         std::fprintf(stderr, "detect: cannot open %s (not a bitcask dir?)\n",
                      path.c_str());
@@ -105,29 +112,29 @@ int cmd_detect(const char* dir) {
     const unsigned ver = hdr[4];
     switch (ver) {
         case 1:
-            std::printf("%s: meta v1 — big-endian legacy era\n", dir);
-            std::printf("  next step: bitcask_migrate be2le %s <dst>\n", dir);
+            std::printf("%s: meta v1 — big-endian legacy era\n", dir.c_str());
+            std::printf("  next step: bitcask_migrate be2le %s <dst>\n", dir.c_str());
             return 0;
         case 2:
         case 3:
             std::printf("%s: meta v%u — little-endian u32-timestamp era\n",
-                        dir, ver);
+                        dir.c_str(), ver);
             std::printf("  next step: bitcask_migrate tstamp64 %s <dst>\n",
-                        dir);
+                        dir.c_str());
             return 0;
         case 4:
             std::printf("%s: meta v4 — u64-timestamp, ord-less era\n",
-                        dir);
+                        dir.c_str());
             std::printf("  next step: bitcask_migrate hintord %s <dst>\n",
-                        dir);
+                        dir.c_str());
             return 0;
         case 5:
             std::printf("%s: meta v5 — current era, "
-                        "nothing to migrate\n", dir);
+                        "nothing to migrate\n", dir.c_str());
             return 0;
         case 6:
             std::printf("%s: meta v6 — atomic-batch era (v5 + kBatchHeader "
-                        "records), nothing to migrate\n", dir);
+                        "records), nothing to migrate\n", dir.c_str());
             return 0;
         default:
             std::fprintf(stderr,
@@ -140,6 +147,10 @@ int cmd_detect(const char* dir) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    const auto args = bitcask_tools::args_as_utf8(argc, argv);
+    const auto arg = [&args](int i) -> const char* {
+        return args[static_cast<std::size_t>(i)].c_str();
+    };
     if (argc >= 2 && (std::strcmp(argv[1], "-h") == 0 ||
                       std::strcmp(argv[1], "--help") == 0)) {
         std::fputs(kUsage, stdout);
@@ -149,37 +160,37 @@ int main(int argc, char** argv) {
         std::fputs(kUsage, stderr);
         return 2;
     }
-    const std::string_view cmd = argv[1];
+    const std::string_view cmd = args[1];
 
     if (cmd == "detect") {
         if (argc != 3) {
             std::fprintf(stderr, "usage: %s detect <dir>\n", argv[0]);
             return 2;
         }
-        return cmd_detect(argv[2]);
+        return cmd_detect(args[2]);
     }
 
     if (cmd == "be2le" || cmd == "tstamp64" || cmd == "hintord") {
         if (argc != 4) {
             std::fprintf(stderr, "usage: %s %s <src_dir> <dst_dir>\n",
-                         argv[0], argv[1]);
+                         argv[0], arg(1));
             return 2;
         }
         auto r = (cmd == "be2le")
-                     ? bitcask::migrate::migrate_be_to_le(argv[2], argv[3])
+                     ? bitcask::migrate::migrate_be_to_le(args[2], args[3])
                  : (cmd == "tstamp64")
-                     ? bitcask::migrate::migrate_u32_to_u64(argv[2], argv[3])
-                     : bitcask::migrate::migrate_hint_ord(argv[2], argv[3]);
+                     ? bitcask::migrate::migrate_u32_to_u64(args[2], args[3])
+                     : bitcask::migrate::migrate_hint_ord(args[2], args[3]);
         if (!r) {
-            std::fprintf(stderr, "%s failed: %s\n", argv[1],
+            std::fprintf(stderr, "%s failed: %s\n", arg(1),
                          r.error().c_str());
             return 1;
         }
-        print_stats(argv[2], argv[3], *r);
+        print_stats(arg(2), arg(3), *r);
         return 0;
     }
 
-    std::fprintf(stderr, "unknown command '%s'\n\n", argv[1]);
+    std::fprintf(stderr, "unknown command '%s'\n\n", arg(1));
     std::fputs(kUsage, stderr);
     return 2;
 }

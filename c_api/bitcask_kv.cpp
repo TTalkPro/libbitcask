@@ -143,11 +143,13 @@ BITCASK_API bitcask_error_t bitcask_meta_read(const char* dirname,
             return fail(BITCASK_ERR_INVALID_OPTION, 0, "bitcask_meta_read: dirname / out is NULL");
         }
         std::error_code ec;
-        const auto dir = bitcask::detail::from_utf8(dirname);
-        if (!std::filesystem::exists(dir, ec)) {
+        // 变量名带 _path 后缀：scripts/check-path-encoding.sh 靠它认出「入参已是
+        // fs::path」（2026-11-23 守门复核时这里被当作隐式窄串构造报了出来）。
+        const auto dir_path = bitcask::detail::from_utf8(dirname);
+        if (!std::filesystem::exists(dir_path, ec)) {
             return fail(BITCASK_ERR_NOT_FOUND, 0, std::string("directory does not exist: ") + dirname);
         }
-        if (!std::filesystem::is_directory(dir, ec)) {
+        if (!std::filesystem::is_directory(dir_path, ec)) {
             return fail(BITCASK_ERR_NOT_FOUND, 0, std::string("not a directory: ") + dirname);
         }
         if (!meta::meta_exists(dirname)) {

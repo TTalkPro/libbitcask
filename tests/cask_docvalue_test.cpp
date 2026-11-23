@@ -7,6 +7,7 @@
 #include <bitcask/search_checkpoint.hpp>  // S14-3 段 carry 断言
 #include <bitcask/codec.hpp>
 #include <bitcask/data_file.hpp>  // parse_data_tstamp（S13 测试枚举 data 文件）
+#include <bitcask/detail/path_utf8.hpp>  // 非 ASCII 目录 open / backup（2026-11-23）
 #include <bitcask/hw_crc32.hpp>   // S32-M0 meta 手改字节重算 CRC
 #include <bitcask/migrate.hpp>    // u32 纪元迁移产物可开可读（集成测试）
 #include <algorithm>
@@ -1012,6 +1013,69 @@ TEST_F(CaskDocValueTest, BackupHotCopyAndReopen) {
     EXPECT_FALSE((*b)->get_owned(bytes("after_backup")));
     (*b)->close();
     std::filesystem::remove_all(dst);
+}
+
+// 2026-11-23：非 ASCII 目录下的 open / backup。`Cask::open` 的
+// `fs::create_directories(dirname_)`、`Cask::backup` 的 `fs::path(dst_dir)` /
+// `fs::path base(dirname_)` 都是「UTF-8 窄串隐式转 path」——Windows 上按 ACP
+// 解码。「测试库」的 UTF-8 字节不是合法 GBK ⇒ 构造抛 std::system_error（open
+// 甚至建不出目录）；合法 GBK 的名字（如「中文备份」）则更糟：静默解成另一个
+// 目录。两个名字各占一个角色。库拿到的永远是 UTF-8 窄串（to_utf8）。
+TEST_F(CaskDocValueTest, OpenAndBackupInNonAsciiDir) {
+    namespace fs = std::filesystem;
+    // 中文字面量是 UTF-8 字节：拼进 fs::path 必须经 from_utf8——
+    // `tmpdir_ / "测试库"` 会被 MSVC 按 GBK 解，字节不合法时直接抛。
+    const fs::path store_dir = tmpdir_ / bitcask::detail::from_utf8("测试库");
+    const fs::path backup_dir = tmpdir_ / bitcask::detail::from_utf8("中文备份");
+    const std::string store = bitcask::detail::to_utf8(store_dir);
+    const std::string backup = bitcask::detail::to_utf8(backup_dir);
+
+    auto bytes = [](std::string_view s2) {
+        return std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(s2.data()), s2.size());
+    };
+    {
+        CaskOptions opts;
+        opts.read_write = true;
+        // 目录尚不存在：open 负责建（mkdir -p 语义）——建出来的必须是**这个**目录。
+        auto c = Cask::open(store, opts, &test_registry());
+        ASSERT_TRUE(c) << (c ? "" : c.error().detail);
+        ASSERT_TRUE(fs::is_directory(store_dir))
+            << "open 没有在传入的中文路径下建目录";
+        for (int i = 0; i < 30; ++i) {
+            ASSERT_TRUE((*c)->put(bytes("cjk" + std::to_string(i)),
+                                  bytes("值" + std::to_string(i)), 1000));
+        }
+
+        auto bk = (*c)->backup(backup);
+        ASSERT_TRUE(bk) << (bk ? "" : bk.error().detail);
+        ASSERT_TRUE(fs::is_directory(backup_dir))
+            << "backup 没有落在传入的中文路径下";
+        ASSERT_TRUE(fs::exists(backup_dir / "bitcask.meta"));
+        (*c)->close();
+    }
+
+    // 备份目录独立 open：经 backup 的 OKI run（`kv.oki.seg-*` 那段 directory_iterator
+    // + filename）读回 30 个 key。
+    CaskOptions ro;
+    ro.read_write = false;
+    auto b = Cask::open(backup, ro, &test_registry());
+    ASSERT_TRUE(b) << (b ? "" : b.error().detail);
+    for (int i = 0; i < 30; ++i) {
+        auto r = (*b)->get_owned(bytes("cjk" + std::to_string(i)));
+        ASSERT_TRUE(r) << "backup missing key cjk" << i << ": "
+                       << (r ? "" : r.error().detail);
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(r->value.data()),
+                              r->value.size()),
+                  "值" + std::to_string(i));
+    }
+    (*b)->close();
+
+    // 原库重开（恢复期在中文目录下扫描 / 读索引）。
+    auto c2 = Cask::open(store, ro, &test_registry());
+    ASSERT_TRUE(c2) << (c2 ? "" : c2.error().detail);
+    ASSERT_TRUE((*c2)->get_owned(bytes("cjk7")));
+    (*c2)->close();
 }
 
 // S13-D1：put_batch——整批一次提交（flush 后才 apply keydir）。

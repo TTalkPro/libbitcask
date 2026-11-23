@@ -111,10 +111,15 @@ inline int last_errno() noexcept { return errno_of(::GetLastError()); }
 // 让非法序列直接失败，而不是退回 ANSI 代码页猜一次——「同一个 char* 可能是两种
 // 编码」会让「打开了错误的文件」这种故障无法定位。
 //
-// ⚠️ 已知缺口：库内多处经 std::filesystem::path::string() 产出窄路径，
-// 而它在 Windows 上走的是**系统 ANSI 代码页**，不是 UTF-8。纯 ASCII 路径
-// 两者一致（现有全部测试与典型部署），非 ASCII 路径则会在此被判为非法 UTF-8
-// 而报 EINVAL。彻底修复需要把那些站点换成 u8string()——见 TASK.md 的遗留项。
+// 守门：窄串 ↔ fs::path 只经 detail::from_utf8 / to_utf8（path_utf8.hpp）；
+// `fs::path(窄)`、`.string()`、`std::fopen`、`std::remove` 一律不许出现，
+// 由 scripts/check-path-encoding.sh 在 CI 上 grep（范围 src / include /
+// c_api / tools）。两个方向都错时错误会互相抵消、看着能用（2026-11-23
+// backup 与 migrate 的 `fs::path(窄)`、工具的 `.string()` 都是这么漏过的），
+// 所以靠评审不可靠，只认 grep。
+//
+// 剩下一类不归本层管：控制台工具的窄 argv 是 CRT 按**系统 ACP** 转出来的，
+// 进库之前要先转成 UTF-8（tools/argv_utf8.hpp）。
 // ---------------------------------------------------------------------------
 std::optional<std::wstring> widen(std::string_view s) noexcept {
     if (s.empty()) return std::wstring();

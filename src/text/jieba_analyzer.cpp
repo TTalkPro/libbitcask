@@ -81,11 +81,11 @@ std::string jieba_missing_dict_file(const std::string& dict_dir) {
         "idf.utf8", "stop_words.utf8"};
     for (const char* name : kFiles) {
         const std::string p = dict_dir + "/" + name;
-        const auto fp = bitcask::detail::from_utf8(p);
+        const auto file_path = bitcask::detail::from_utf8(p);  // *_path：守门脚本认 fs::path
         std::error_code ec;
         // 目录在 Linux 上也能被 ifstream「打开」——先确认是普通文件。
-        if (!std::filesystem::is_regular_file(fp, ec) || ec) return p;
-        std::ifstream f(fp, std::ios::binary);
+        if (!std::filesystem::is_regular_file(file_path, ec) || ec) return p;
+        std::ifstream f(file_path, std::ios::binary);
         if (!f.is_open()) return p;
     }
     return {};

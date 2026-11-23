@@ -79,19 +79,19 @@ write_all(const fs::path& path, std::span<const std::byte> bytes) {
 // 一个 data 文件：逐 record 解大端头 → 小端重编码。S43-8 后迁移目标
 // data-only，旧 hint 不迁移、不重生成。
 std::expected<void, std::string>
-migrate_data_file(const fs::path& src_data, const fs::path& dst_dir,
+migrate_data_file(const fs::path& src_data_path, const fs::path& dst_dir,
                   MigrateStats& st) {
-    auto bytes = read_all(src_data);
+    auto bytes = read_all(src_data_path);
     if (!bytes) return std::unexpected(bytes.error());
 
-    const auto name = bitcask::detail::to_utf8(src_data.filename());
-    const auto dst_data_path = bitcask::detail::to_utf8(dst_dir / src_data.filename());
+    const auto name = bitcask::detail::to_utf8(src_data_path.filename());
+    const auto dst_data_file = bitcask::detail::to_utf8(dst_dir / src_data_path.filename());
 
     // 小端写：DataFile/HintFile 内部用新（小端）codec,CRC/水位重算。
     auto dst_data = fileops::DataFile::open(
-        dst_data_path, fileops::DataFile::Mode::kCreate, /*sync*/ false,
+        dst_data_file, fileops::DataFile::Mode::kCreate, /*sync*/ false,
         /*mmap_enabled*/ false);
-    if (!dst_data) return std::unexpected("create dst data " + dst_data_path);
+    if (!dst_data) return std::unexpected("create dst data " + dst_data_file);
 
     const std::byte* base = bytes->data();
     const std::uint64_t total = bytes->size();
@@ -134,7 +134,7 @@ migrate_data_file(const fs::path& src_data, const fs::path& dst_dir,
         }
 
         auto w = dst_data->write(type, tstamp, ord, key, value);
-        if (!w) return std::unexpected("write record to " + dst_data_path);
+        if (!w) return std::unexpected("write record to " + dst_data_file);
         ++st.records;
         if (tomb) ++st.tombstones;
         off += rec_total;
@@ -146,11 +146,11 @@ migrate_data_file(const fs::path& src_data, const fs::path& dst_dir,
 std::expected<void, std::string>
 migrate_meta(const fs::path& src_dir, const fs::path& dst_dir,
              MigrateStats& st) {
-    const auto src_meta = src_dir / "bitcask.meta";
-    if (!fs::exists(src_meta)) {
+    const auto src_meta_path = src_dir / "bitcask.meta";
+    if (!fs::exists(src_meta_path)) {
         return std::unexpected("no bitcask.meta in src (not a bitcask dir)");
     }
-    auto bytes = read_all(src_meta);
+    auto bytes = read_all(src_meta_path);
     if (!bytes) return std::unexpected(bytes.error());
     if (bytes->size() < 18) return std::unexpected("meta too short");
     const std::byte* b = bytes->data();
@@ -188,9 +188,9 @@ migrate_meta(const fs::path& src_dir, const fs::path& dst_dir,
 std::expected<void, std::string>
 migrate_field_schema(const fs::path& src_dir, const fs::path& dst_dir,
                      MigrateStats& st) {
-    const auto src_fs = src_dir / "field.schema";
-    if (!fs::exists(src_fs)) return {};  // 无字段表（纯 KV）→ 跳过。
-    auto bytes = read_all(src_fs);
+    const auto src_schema_path = src_dir / "field.schema";
+    if (!fs::exists(src_schema_path)) return {};  // 无字段表（纯 KV）→ 跳过。
+    auto bytes = read_all(src_schema_path);
     if (!bytes) return std::unexpected(bytes.error());
 
     // 输出新格式（S12-3）：文件头 [magic:u32][version:u32] + 每条 [len:u16][name][crc32:u32]。
@@ -262,17 +262,17 @@ bool transcode_doc_value_v3_to_v4(std::span<const std::byte> in,
 // 一个 data 文件：逐 record 解 u32 纪元小端头（23B,偏移同 kLegacy*）→
 // 当前 codec 重编码（27B 头,u64 tstamp）。迁移目标 data-only。
 std::expected<void, std::string>
-migrate_u32_data_file(const fs::path& src_data, const fs::path& dst_dir,
+migrate_u32_data_file(const fs::path& src_data_path, const fs::path& dst_dir,
                       MigrateStats& st) {
-    auto bytes = read_all(src_data);
+    auto bytes = read_all(src_data_path);
     if (!bytes) return std::unexpected(bytes.error());
 
-    const auto name = bitcask::detail::to_utf8(src_data.filename());
-    const auto dst_data_path = bitcask::detail::to_utf8(dst_dir / src_data.filename());
+    const auto name = bitcask::detail::to_utf8(src_data_path.filename());
+    const auto dst_data_file = bitcask::detail::to_utf8(dst_dir / src_data_path.filename());
     auto dst_data = fileops::DataFile::open(
-        dst_data_path, fileops::DataFile::Mode::kCreate, /*sync*/ false,
+        dst_data_file, fileops::DataFile::Mode::kCreate, /*sync*/ false,
         /*mmap_enabled*/ false);
-    if (!dst_data) return std::unexpected("create dst data " + dst_data_path);
+    if (!dst_data) return std::unexpected("create dst data " + dst_data_file);
 
     const std::byte* base = bytes->data();
     const std::uint64_t total = bytes->size();
@@ -318,7 +318,7 @@ migrate_u32_data_file(const fs::path& src_data, const fs::path& dst_dir,
         }
 
         auto w = dst_data->write(type, tstamp, ord, key, value);
-        if (!w) return std::unexpected("write record to " + dst_data_path);
+        if (!w) return std::unexpected("write record to " + dst_data_file);
         ++st.records;
         if (tomb) ++st.tombstones;
         off += rec_total;
@@ -333,11 +333,11 @@ migrate_u32_data_file(const fs::path& src_data, const fs::path& dst_dir,
 std::expected<void, std::string>
 migrate_u32_meta(const fs::path& src_dir, const fs::path& dst_dir,
                  MigrateStats& st) {
-    const auto src_meta = src_dir / "bitcask.meta";
-    if (!fs::exists(src_meta)) {
+    const auto src_meta_path = src_dir / "bitcask.meta";
+    if (!fs::exists(src_meta_path)) {
         return std::unexpected("no bitcask.meta in src (not a bitcask dir)");
     }
-    auto bytes = read_all(src_meta);
+    auto bytes = read_all(src_meta_path);
     if (!bytes) return std::unexpected(bytes.error());
     if (bytes->size() < 18) return std::unexpected("meta too short");
     const std::byte* b = bytes->data();
@@ -384,18 +384,21 @@ migrate_u32_meta(const fs::path& src_dir, const fs::path& dst_dir,
 // ---------------------------------------------------------------------------
 
 std::expected<void, std::string>
-hintord_link_data(const fs::path& src_data, const fs::path& dst_dir,
+hintord_link_data(const fs::path& src_data_path, const fs::path& dst_dir,
                         MigrateStats& st) {
-    const auto name = bitcask::detail::to_utf8(src_data.filename());
-    const auto dst_data_path = bitcask::detail::to_utf8(dst_dir / src_data.filename());
+    // 报文用的 UTF-8 窄串；fs:: 调用只喂下面两个 fs::path。
+    const auto dst_data_utf8 = bitcask::detail::to_utf8(dst_dir / src_data_path.filename());
+    // fs:: 只收 fs::path：dst_data_utf8 是窄串，直接喂进去在 Windows 上
+    // 按 ACP 解（中文目标目录要么链错地方、要么抛 std::system_error）。
+    const fs::path dst_file_path = dst_dir / src_data_path.filename();
     std::error_code ec;
-    fs::create_hard_link(src_data, dst_data_path, ec);
+    fs::create_hard_link(src_data_path, dst_file_path, ec);
     if (ec) {  // 跨设备等 → 退化为拷贝
         ec.clear();
-        fs::copy_file(src_data, dst_data_path,
+        fs::copy_file(src_data_path, dst_file_path,
                       fs::copy_options::overwrite_existing, ec);
         if (ec) {
-            return std::unexpected("copy data " + dst_data_path + ": " +
+            return std::unexpected("copy data " + dst_data_utf8 + ": " +
                                    ec.message());
         }
     }
@@ -440,26 +443,32 @@ hintord_check_meta(const fs::path& src_dir) {
 
 std::expected<MigrateStats, std::string>
 migrate_be_to_le(std::string_view src_dir, std::string_view dst_dir) {
-    const fs::path src(src_dir);
-    const fs::path dst(dst_dir);
-    if (!fs::exists(src)) return std::unexpected("src dir does not exist");
+    // 窄路径 = UTF-8（库级约定，见 detail/path_utf8.hpp 头注）。原先的
+    // `fs::path src(src_dir)` 在 Windows 上按系统 ACP 解码：GBK 系统上传入
+    // UTF-8 的中文路径，要么被静默解成别的目录、要么构造直接抛
+    // std::system_error。三个迁移入口同病同修。
+    const fs::path src_dir_path = detail::from_utf8(src_dir);
+    const fs::path dst_dir_path = detail::from_utf8(dst_dir);
+    if (!fs::exists(src_dir_path)) {
+        return std::unexpected("src dir does not exist");
+    }
     std::error_code ec;
-    fs::create_directories(dst, ec);
+    fs::create_directories(dst_dir_path, ec);
     if (ec) return std::unexpected("cannot create dst dir: " + ec.message());
 
     MigrateStats st;
     // meta 先行（同时校验 src 确为 v1 大端目录）。
-    if (auto r = migrate_meta(src, dst, st); !r) {
+    if (auto r = migrate_meta(src_dir_path, dst_dir_path, st); !r) {
         return std::unexpected(r.error());
     }
-    if (auto r = migrate_field_schema(src, dst, st); !r) {
+    if (auto r = migrate_field_schema(src_dir_path, dst_dir_path, st); !r) {
         return std::unexpected(r.error());
     }
     // 逐 data 文件（data-only）。ckpt/seg/wal/旧 hint/锁不迁移。
-    for (const auto& de : fs::directory_iterator(src)) {
+    for (const auto& de : fs::directory_iterator(src_dir_path)) {
         const auto fname = bitcask::detail::to_utf8(de.path().filename());
         if (fileops::parse_data_tstamp(fname).has_value()) {
-            if (auto r = migrate_data_file(de.path(), dst, st); !r) {
+            if (auto r = migrate_data_file(de.path(), dst_dir_path, st); !r) {
                 return std::unexpected(r.error());
             }
         }
@@ -469,22 +478,24 @@ migrate_be_to_le(std::string_view src_dir, std::string_view dst_dir) {
 
 std::expected<MigrateStats, std::string>
 migrate_u32_to_u64(std::string_view src_dir, std::string_view dst_dir) {
-    const fs::path src(src_dir);
-    const fs::path dst(dst_dir);
-    if (!fs::exists(src)) return std::unexpected("src dir does not exist");
+    const fs::path src_dir_path = detail::from_utf8(src_dir);
+    const fs::path dst_dir_path = detail::from_utf8(dst_dir);
+    if (!fs::exists(src_dir_path)) {
+        return std::unexpected("src dir does not exist");
+    }
     std::error_code ec;
-    fs::create_directories(dst, ec);
+    fs::create_directories(dst_dir_path, ec);
     if (ec) return std::unexpected("cannot create dst dir: " + ec.message());
 
     MigrateStats st;
     // meta 先行（同时校验 src 确为 u32 纪元 v2/v3 目录）。
-    if (auto r = migrate_u32_meta(src, dst, st); !r) {
+    if (auto r = migrate_u32_meta(src_dir_path, dst_dir_path, st); !r) {
         return std::unexpected(r.error());
     }
     // field.schema 格式在本次 flag-day 未变（S12-3 版式,不含时间戳）,
     // 原样拷贝。
-    if (fs::exists(src / "field.schema")) {
-        fs::copy_file(src / "field.schema", dst / "field.schema",
+    if (fs::exists(src_dir_path / "field.schema")) {
+        fs::copy_file(src_dir_path / "field.schema", dst_dir_path / "field.schema",
                       fs::copy_options::overwrite_existing, ec);
         if (ec) {
             return std::unexpected("copy field.schema: " + ec.message());
@@ -492,10 +503,11 @@ migrate_u32_to_u64(std::string_view src_dir, std::string_view dst_dir) {
         st.field_schema_migrated = true;
     }
     // 逐 data 文件（data-only）。ckpt/seg/wal/旧 hint/锁不迁移。
-    for (const auto& de : fs::directory_iterator(src)) {
+    for (const auto& de : fs::directory_iterator(src_dir_path)) {
         const auto fname = bitcask::detail::to_utf8(de.path().filename());
         if (fileops::parse_data_tstamp(fname).has_value()) {
-            if (auto r = migrate_u32_data_file(de.path(), dst, st); !r) {
+            if (auto r = migrate_u32_data_file(de.path(), dst_dir_path, st);
+                !r) {
                 return std::unexpected(r.error());
             }
         }
@@ -505,22 +517,25 @@ migrate_u32_to_u64(std::string_view src_dir, std::string_view dst_dir) {
 
 std::expected<MigrateStats, std::string>
 migrate_hint_ord(std::string_view src_dir, std::string_view dst_dir) {
-    const fs::path src(src_dir);
-    const fs::path dst(dst_dir);
-    if (!fs::exists(src)) return std::unexpected("src dir does not exist");
+    const fs::path src_dir_path = detail::from_utf8(src_dir);
+    const fs::path dst_dir_path = detail::from_utf8(dst_dir);
+    if (!fs::exists(src_dir_path)) {
+        return std::unexpected("src dir does not exist");
+    }
 
     // 前置校验先行（任何数据工作之前）：src 确为 v4 且 meta CRC 合法。
-    auto meta_bytes = hintord_check_meta(src);
+    auto meta_bytes = hintord_check_meta(src_dir_path);
     if (!meta_bytes) return std::unexpected(meta_bytes.error());
 
     std::error_code ec;
-    fs::create_directories(dst, ec);
+    fs::create_directories(dst_dir_path, ec);
     if (ec) return std::unexpected("cannot create dst dir: " + ec.message());
 
     MigrateStats st;
     // field.schema 格式未变,原样拷贝。
-    if (fs::exists(src / "field.schema")) {
-        fs::copy_file(src / "field.schema", dst / "field.schema",
+    if (fs::exists(src_dir_path / "field.schema")) {
+        fs::copy_file(src_dir_path / "field.schema",
+                      dst_dir_path / "field.schema",
                       fs::copy_options::overwrite_existing, ec);
         if (ec) {
             return std::unexpected("copy field.schema: " + ec.message());
@@ -529,10 +544,10 @@ migrate_hint_ord(std::string_view src_dir, std::string_view dst_dir) {
     }
     // 逐 data 文件：硬链接 + data-only 元数据迁移。
     // ckpt/seg/wal/旧 hint/锁不迁移（新库首开 fold 重建,与既有迁移器同策略）。
-    for (const auto& de : fs::directory_iterator(src)) {
+    for (const auto& de : fs::directory_iterator(src_dir_path)) {
         const auto fname = bitcask::detail::to_utf8(de.path().filename());
         if (fileops::parse_data_tstamp(fname).has_value()) {
-            if (auto r = hintord_link_data(de.path(), dst, st); !r) {
+            if (auto r = hintord_link_data(de.path(), dst_dir_path, st); !r) {
                 return std::unexpected(r.error());
             }
         }
@@ -542,7 +557,7 @@ migrate_hint_ord(std::string_view src_dir, std::string_view dst_dir) {
     std::memcpy(out, meta_bytes->data(), 18);
     out[4] = static_cast<std::byte>(5);
     le_store_u32(out + 14, codec::crc32(std::span<const std::byte>(out, 14)));
-    if (auto r = write_all(dst / "bitcask.meta",
+    if (auto r = write_all(dst_dir_path / "bitcask.meta",
                            std::span<const std::byte>(out, 18)); !r) {
         return std::unexpected(r.error());
     }
