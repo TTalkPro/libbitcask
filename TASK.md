@@ -14,7 +14,7 @@
 
 > 来源：S71-4 ⏸（下游反馈 [`feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md`](feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md) 第 3 条）。
 > 2026-11-23 下游拍板：视图归库所有（借用，需保留外部复制）、新入口不动老 ABI、扫描与 range 都做。
-> 设计稿：[`doc/scan-batch-view-design-zh.md`](doc/scan-batch-view-design-zh.md)（已定稿；扫描半边已实施未发版，range 半边待 Linux 实测门槛）。
+> 设计稿：[`doc/scan-batch-view-design-zh.md`](doc/scan-batch-view-design-zh.md)（已定稿；扫描半边随 13.0.0 发版，range 半边待 Linux 实测门槛）。
 
 | 项 | 状态 |
 |---|---|

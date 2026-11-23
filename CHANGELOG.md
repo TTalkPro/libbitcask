@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`12.2.0`**；库 `SOVERSION` = **`12`**（= major）；
+`bitcask_version_*` = **`13.0.0`**；库 `SOVERSION` = **`13`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -14,6 +14,67 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 （4.0.0 / 5.0.0 / 6.0.0 / 7.0.0 / 8.0.0 / 9.0.0 皆是）。
 
 ---
+
+## [13.0.0] - 2026-11-23（S72：Windows CI 门控与非 ASCII 路径 + S73：重开重放回填 LRU + S74：MSVC Debug/ASan preset + S75：扫描免分配批视图）
+
+> **版本语义**：⚠️ **C++ ABI 破坏**——`CaskIter` 新增 5 个私有数据成员（批视图的缓冲与文件 holder，
+> `include/bitcask/cask.hpp`），插在既有成员之前，其后的成员偏移都动了；按 [10.0.0] 先例取 MAJOR +1 →
+> **`13.0.0`**，`SOVERSION` → **`13`**（`.so.13`），**C++ 下游须重新编译链接**。
+> C API 侧全是**纯新增**（结构体 `bitcask_iter_entry_view_t`、函数 `bitcask_iter_next_batch_view`），既有结构体布局与
+> 函数签名零改动 ⇒ C ABI 兼容，旧 C 二进制可直接换新库。盘上格式零改动。
+> S72 / S73 / S74 单看都是 PATCH；进 MAJOR 是因为与 S75 同车。
+
+### Added
+
+- **扫描免分配批视图**（S75，反馈 `feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md` 第 3 条，
+  keelson；设计 `doc/scan-batch-view-design-zh.md`）：C++ `CaskIter::EntryView` / `CaskIter::next_batch_view(max_n)`，
+  C API `bitcask_iter_entry_view_t` / `bitcask_iter_next_batch_view`。遍历语义、快照一致性、墓碑 / 前缀 / meta 过滤都与
+  `next_batch` / `bitcask_iter_next_batch_ex` 相同，区别只在所有权：key / value / meta **借迭代器内部的存储**，整批稳态
+  零堆分配（映射命中时 value 直达文件映射，`pread` 兜底时记录留在迭代器里），没有也不需要 free 函数。
+  - 有效期到本迭代器的**下一次推进调用**为止（`next` / `_ex` / `_batch` / `_batch_view` / `release`）；`Cask::close()` /
+    `bitcask_close` 不算推进，当前批读完再 release 即可，但 close 之后不可再推进。要保留请当下复制。
+  - 空 span（C 返回 0）= 迭代结束；出错时**整批不可依赖**；`max_n == 0` 交空批、不推进。
+  - 只做了扫描半边。range 半边（`CaskRangeIter::next_batch_view` / `bitcask_range_iter_next_batch_view`）等 Linux 上
+    扫描半边的实测数字（门槛 ≥ 10%；评审估的理论上限约 15%，JVM 绑定端到端可能只有个位数）。
+  - 文档：`doc/api-c.md` §11.3a 与所有权表、`doc/api-cpp.md` §6。
+
+### Fixed
+
+- **全表迭代器 `see_tombstones = true` 从不交出墓碑**（S75 顺带）：开关没有透传到 OKI 归并层，墓碑在归并层就被抵消，
+  结果与 `false` 完全一样。现在照常交出墓碑行（`is_tombstone = true`，value 空）。依赖旧行为的调用方会多看到墓碑行。
+- **重开时的恢复重放把原文填回 LRU**（S73，反馈 `feedbacks/2026-11-23-reopen-replay-refills-doc-text-lru-cold-test-flaky.md`）：
+  重放 / 乱序到达的旧版本文档此前原文照进 LRU，冷文档被重放「焐热」。现在原文的 put 挪到同 LSN 早读判重之后、
+  文档进段之前——旧版本在判重处直接返回，不再 put。
+- **非 ASCII 目录下库打不开**（S72，反馈 `feedbacks/2026-11-23-vec-engine-migrate-non-ascii-dir-false-store-in-use.md` 等）：
+  Windows 上 UTF-8 窄串隐式转 `fs::path` 按 ACP 解码，`Cask::open` 连目录都建不出来，`upgrade` / `backup` /
+  三个迁移入口 / 恢复期清理 hint 同病；`vec_engine_migrate` 报「store in use by another process」其实没人占着。
+  一律改走 UTF-8 路径转换。路径编码守门脚本认 `fs::` 别名，误报的三处改名。
+- **MSVC 的 `msvc-debug` / `msvc-asan` 两个 preset 编不过**（S74，反馈
+  `feedbacks/2026-11-23-msvc-debug-asan-presets-do-not-build.md`）：`oki_state.cpp` 的 `is_standard_layout` 断言、
+  插桩目标与没插桩目标的 STL 容器标注不一致、插桩目标的链接。
+- **Windows CI 不拦合并**（S72，反馈 `feedbacks/2026-11-23-windows-ci-not-gating-msvc-wx-off-56-warnings.md`）：
+  `windows-msvc` 去掉 `continue-on-error` 改门控；56 条告警清零（`bitcask_migrate` 的 `std::string` 直接喂
+  `printf("%s")` 是 UB，已改 `.c_str()`）。
+- **`cmake --build <build-dir> --target check`**（S72）：`ctest` 并行跑（封顶 8）。`ctest --preset` 仍串行。
+
+### 构建
+
+- `scripts/Enter-MsvcEnv.ps1` 固定 `VSLANG=1033`（S75）。Ninja 靠匹配 CMake 在探测编译器时记下的 `/showIncludes` 前缀
+  来学头文件依赖；`cl.exe` 的输出语言随环境变，前缀对不上时 Ninja 记到的依赖是 0——改头文件不触发重编，
+  旧布局的 .obj 被链进新代码。症状是 `Note: including file` 行漏进构建输出。已有的 `build-msvc-*` 目录若如此，
+  删掉 `CMakeFiles/<cmake 版本>/CMake{C,CXX}Compiler.cmake` 重新 configure，并清理项目目标重编。
+
+### 验证
+
+Windows（VS 18 / MSVC 14.51，修好依赖跟踪、清理项目目标全量重编之后）：Release 全量 ctest 996 注册、100% 通过
+（1 项既有 Skipped、2 项既有 Disabled）；Debug 全量同上；ASan 迭代器相关 30 项（IterBatchView / CApi / FlushAfterIter /
+CrashRecovery 迭代器 / V61BatchFold / Scanner / PrefixScan）全过、无 AddressSanitizer 报告；`/WX` 库构建通过；
+`sh scripts/check-path-encoding.sh .` OK。新增回归 `IterBatchViewTest.*`（7 项）、`c_api_test.c::test_iter_batch_view`。
+S72 / S73 / S74 的逐项验证见各自反馈记录。
+**Linux 未实测**（GCC / ASan / TSan / clang 均未跑）；映射零拷贝路径（活跃文件 growing map）只有 Linux 覆盖，
+Windows 上刚写完的库扫描全走 `pread` + 记录 holder。`HighlightColdTest.ReopenedLibraryHasNoSnippetsUnlessLoaded`
+（S73）与另两个带时序假设的用例在满载下的表现见
+`feedbacks/2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md`（未回）。
 
 ## [12.2.0] - 2026-11-23（S69：原子批删除的批头区间 + S70：写路径长尾 + S71：keydir 扫描提速）
 
@@ -2661,6 +2722,7 @@ clang 构建 job / -Werror 库构建护栏 / 三套版本号单一真源。
 - 协议：[Apache License 2.0](LICENSE)。
 
 [Unreleased]: https://github.com/davidalphafox/libbitcask/compare/12.0.1...HEAD
+[13.0.0]: https://github.com/davidalphafox/libbitcask/compare/12.1.0...13.0.0
 [12.0.1]: https://github.com/davidalphafox/libbitcask/compare/12.0.0...12.0.1
 [12.0.0]: https://github.com/davidalphafox/libbitcask/compare/11.2.0...12.0.0
 [11.2.0]: https://github.com/davidalphafox/libbitcask/compare/11.1.1...11.2.0

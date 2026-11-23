@@ -42,7 +42,7 @@ src/cask/cask.cpp:3349:                "backup: copy failed: " + entry.path().st
 
 ## 回没回
 
-已修（未发版）。写本条时脚本没跑成，这次用 Git 自带的 `sh`（`scoop shims\sh.exe`；`bash` 解析到 WSL 起不来）跑了原脚本，结论有修正：
+已修（13.0.0 已发版）。写本条时脚本没跑成，这次用 Git 自带的 `sh`（`scoop shims\sh.exe`；`bash` 解析到 WSL 起不来）跑了原脚本，结论有修正：
 
 - **HEAD（`d995557`）上脚本是红的，且不止这两处**：除 `cask.cpp:3345` / `:3349` 外，还有
   `c_api/bitcask_kv.cpp:147` / `:150`（`9f940ed`，11-19）与 `src/text/jieba_analyzer.cpp:87`（`a30186d`，11-20）三处——

@@ -56,7 +56,7 @@ GBK 的「中文库」不是合法 UTF-8 ⇒ 拿不到句柄。`FileLock::acquir
 
 ## 回没回
 
-已修（未发版），按建议做；**但根因比本条写的宽得多——库本身在非 ASCII 目录下也开不了**，不只是工具：
+已修（13.0.0 已发版），按建议做；**但根因比本条写的宽得多——库本身在非 ASCII 目录下也开不了**，不只是工具：
 
 - 病因是同一类写法「UTF-8 窄串隐式转 `fs::path`」（Windows 上按 ACP 解码），不止 `tools/`。库内还有：
   `Cask::open` 的 `fs::create_directories(dirname_)`、`Cask::upgrade` 的 `fs::exists(dirname)`、

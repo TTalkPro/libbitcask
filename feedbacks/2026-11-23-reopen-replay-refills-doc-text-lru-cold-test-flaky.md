@@ -72,7 +72,7 @@
 
 ## 回没回
 
-已修（S73，未发版），按方案 A：
+已修（S73，13.0.0 已发版），按方案 A：
 
 - `apply_text_in` / `apply_job_impl_in` 的 `doc_texts_.put` 挪到同 LSN 早读判重**之后**、`bld->add` **之前**：
   重放 / 乱序到达的旧版本在判重处直接 return，不再 put。放在 `add` 之前是保住原来的顺序——

@@ -44,7 +44,7 @@
 
 ## 回没回
 
-已修（未发版）：
+已修（13.0.0 已发版）：
 
 - 56 条告警清零：`InvertedIndex::Shard` 的 C4324 是 `gen_` 的 `alignas(64)` 的预期结果（尾部补齐，下一个分片不与它同行），
   只在该结构体上 `#pragma warning(push) / (disable : 4324) / (pop)`（`_MSC_VER` 下）；`oki_only_contract_test.cpp` 的 u64→u32 显式 `static_cast`。

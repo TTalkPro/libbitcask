@@ -38,7 +38,7 @@ Windows 上跑全量测试：先默认串行，再 `-j 8`；耗时取自 `ctest`
 
 ## 回没回
 
-已修（未发版），**但不是按建议里的写法**：
+已修（13.0.0 已发版），**但不是按建议里的写法**：
 
 - `test-base` 加不了 `jobs`：`CMakePresets.json` 是 version 3，`execution.jobs` 要 preset version 6（CMake ≥ 3.29），
   而本项目要求 CMake 3.20——升 preset 版本等于抬高所有使用者的 CMake 下限，为这一项不值得。

@@ -24,7 +24,7 @@ CI 的 `windows-msvc-asan` job 一上跑就是红（目前非门控，没在 Git
 
 - `src/fileops/oki_state.cpp:190`：`static_assert(std::is_standard_layout_v<ActiveSorted>)`（S64，`ab9b51f`，12.0.2）。
 - `cmake/BitcaskSanitizers.cmake`：MSVC 分支只加了 `/fsanitize=address`，没处理 STL 的容器标注。
-- `CMakeLists.txt:769`：`gen_inert_table` 链 `bitcask_io`（S72，`e87cdbd`，未发版）而不链 `bitcask_sanitizers`。
+- `CMakeLists.txt:769`：`gen_inert_table` 链 `bitcask_io`（S72，`e87cdbd`，13.0.0 已发版）而不链 `bitcask_sanitizers`。
 - `CMakeLists.txt:904`：`bitcask_shared` 只链 `bitcask_cask`，是第一方目标里唯一没带 `bitcask_sanitizers` 的。
 
 ## 怎么撞上的
@@ -66,7 +66,7 @@ CI 的 `windows-msvc-asan` job 一上跑就是红（目前非门控，没在 Git
 
 ## 回没回
 
-已修（S74，未发版），三条都按建议做：
+已修（S74，13.0.0 已发版），三条都按建议做：
 
 - `oki_state.cpp`：断言改为 `is_standard_layout || offsetof(tail) == 0`，加 `<cstddef>`。
 - `BitcaskSanitizers.cmake`：MSVC 分支 `target_compile_definitions(... _DISABLE_STL_ANNOTATION)`。
