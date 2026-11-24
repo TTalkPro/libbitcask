@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`13.0.0`**；库 `SOVERSION` = **`13`**（= major）；
+`bitcask_version_*` = **`13.1.0`**；库 `SOVERSION` = **`13`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -14,6 +14,36 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 （4.0.0 / 5.0.0 / 6.0.0 / 7.0.0 / 8.0.0 / 9.0.0 皆是）。
 
 ---
+
+## [13.1.0] - 2026-11-24（S76：range 快照语义与取值提速 + OKI 写前探测长尾压平）
+
+> **版本语义**：MINOR **13.1.0**。`CaskRangeIter` 从 per-key 弱一致改为 `ReadView` 快照，是**行为契约变化**；
+> 既有调用方若依赖「迭代途中看到新写值」需改用新建迭代器或显式回查。C API 签名与结构体布局不变；
+> C++ 公共类布局不变（只新增成员函数 / 私有辅助声明），既有二进制继续兼容；盘上格式不变；`SOVERSION` 仍为 `13`。
+
+### Changed
+
+- **range 迭代器改为快照语义**（S76）：`CaskRangeIter` 的 key 集合与值都固定在 `make_range_iter` /
+  `bitcask_range_iter_start` 建立那一刻。之后的 put、remove、原子批不再改变已建迭代器的输出；预取与惰性路径也完全一致。
+  唯一例外是 merge 把快照版本合并掉、该 key 之后又改写过时，会按 public `get` 交出当前值，避免活 key 从结果里消失。
+  ≤ 13.0.0 的 per-key 弱一致行为（删除后跳过、改写后交新值）不再保留。
+- **range 取值改走视图位置直读**（S76）：归并层改交 `DeltaRow`（key + ord + 位置），与 `CaskIter` 共用
+  `Cask::read_located`：映射读、`pread` 兜底、key / ord 自证、TTL / meta 过滤、merge 搬迁后有界重定位。
+  不再逐 key 重走 public `get` 的定位流程。v1 run 行没有位置时继续回查 `get`；快照版本不可读且 key 有新版时回查 `get`。
+  实测 20 万 key 重开后每行约 **600～830 ns → 270～410 ns**，与全表扫描持平。
+- **压平 OKI 落段与写前探测长尾**（S76）：新 run 发布前在其所在落段线程预热块缓存（至多缓存容量 1/4），避免发布后头一批
+  写前探测集中装载块和构建采样索引；作废 run 的块不再集中清理，由容量 LRU 自然淘汰；被淘汰节点的释放挪到分片锁外；
+  memdelta 行数组按行数 / 字节阈值计算常态预留，后台落段过程中余量不足时由落段线程锁外分块提前扩到背压线。
+  这些路径只改内部时机和内存布局策略，持久化格式与读端语义不变。
+
+### 构建
+
+- 补齐测试中的整型符号 / 缺省字段初始化告警（`iter_batch_view_test.cpp`、`path_utf8_test.cpp`）。
+
+### 验证
+
+Linux GCC Release 构建通过；`OkiRange`、`IterBatchView`、`CApi`、`OkiRecovery`、OKI run / compaction / recovery 相关
+140 项 ctest 全绿，含新增回归 `OkiRangeTest.S76RangeIsReadViewSnapshot`。未在本轮重复全量 Linux / Windows / Sanitizer 矩阵。
 
 ## [13.0.0] - 2026-11-23（S72：Windows CI 门控与非 ASCII 路径 + S73：重开重放回填 LRU + S74：MSVC Debug/ASan preset + S75：扫描免分配批视图）
 

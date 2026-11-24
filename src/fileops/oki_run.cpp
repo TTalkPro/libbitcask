@@ -508,29 +508,41 @@ void OkiBlockCache::evict_over_cap_locked(Shard& sh) noexcept {
 }
 
 void OkiBlockCache::purge_except(std::span<const std::uint64_t> keep_gens) {
+    // 被清掉的节点先整段挪进本地链表，放锁之后再析构：释放块（4 KiB 的缓冲 +
+    // 链表节点 + shared_ptr 控制块）比摘链贵得多，在锁里做时一个分片持锁可达
+    // 2 ms，期间写前探测（OkiState::locate 查 run）命中这个分片的写者全挡住。
+    std::list<Node> dead;
     for (auto& sh : shards_) {
-        std::lock_guard<std::mutex> lk(sh.mu);
-        for (auto it = sh.lru.begin(); it != sh.lru.end();) {
-            const bool keep = std::find(keep_gens.begin(), keep_gens.end(),
-                                        it->key.gen) != keep_gens.end();
-            if (keep) {
-                ++it;
-                continue;
+        {
+            std::lock_guard<std::mutex> lk(sh.mu);
+            for (auto it = sh.lru.begin(); it != sh.lru.end();) {
+                const bool keep = std::find(keep_gens.begin(), keep_gens.end(),
+                                            it->key.gen) != keep_gens.end();
+                if (keep) {
+                    ++it;
+                    continue;
+                }
+                sh.bytes -= it->block->size();
+                sh.map.erase(it->key);
+                const auto next = std::next(it);
+                dead.splice(dead.end(), sh.lru, it);
+                it = next;
             }
-            sh.bytes -= it->block->size();
-            sh.map.erase(it->key);
-            it = sh.lru.erase(it);
         }
+        dead.clear();  // 锁外释放
     }
 }
 
 void OkiBlockCache::reset_capacity(std::size_t capacity_bytes) {
     shard_cap_.store(capacity_bytes / kShards, std::memory_order_relaxed);
     for (auto& sh : shards_) {
-        std::lock_guard<std::mutex> lk(sh.mu);
-        sh.lru.clear();
-        sh.map.clear();
-        sh.bytes = 0;
+        std::list<Node> dead;  // 同 purge_except：锁外释放
+        {
+            std::lock_guard<std::mutex> lk(sh.mu);
+            dead.swap(sh.lru);
+            sh.map.clear();
+            sh.bytes = 0;
+        }
     }
 }
 
@@ -869,6 +881,30 @@ std::string_view sample_key(std::span<const std::byte> idx, const Sample& s) noe
 }
 
 }  // namespace
+
+std::size_t OkiRunReader::warm_cache(OkiBlockCache* cache, std::uint64_t cache_gen,
+                                     std::size_t max_bytes) const {
+    if (cache == nullptr || !cache->enabled() || max_bytes == 0) return 0;
+    const std::uint8_t known = version_ != kRunVersion ? kKnownFlagsMaskV2 : kKnownFlagsMask;
+    std::size_t bytes = 0;
+    std::size_t n = 0;
+    for (std::size_t bi = 0; bi < blocks_.size(); ++bi) {
+        const auto& b = blocks_[bi];
+        bytes += static_cast<std::size_t>(b.end - b.off);
+        if (bytes > max_bytes) break;
+        Cursor c(this);
+        c.cache_ = cache;
+        c.cache_gen_ = cache_gen;
+        if (!c.load_block(bi)) break;   // 同 find 的装载（含 CRC 校验）
+        const std::span<const std::byte> blk = c.block_span();
+        auto idx = cache->get_or_load(
+            cache_gen, static_cast<std::uint64_t>(bi) | kSampleIdxFlag,
+            [&]() { return build_sample_index(blk, known); });
+        if (!idx) break;
+        ++n;
+    }
+    return n;
+}
 
 std::expected<std::optional<OkiRunReader::Entry>, OkiError>
 OkiRunReader::find(std::span<const std::byte> key, OkiBlockCache* cache,

@@ -26,6 +26,7 @@ namespace fs = std::filesystem;
 using bitcask::Cask;
 using bitcask::CaskOptions;
 using bitcask::RangeOptions;
+using bitcask::CaskRangeIter;
 
 namespace {
 
@@ -815,3 +816,59 @@ TEST_F(OkiRangeTest, ReadOnlyWithoutOkiIteratesMergeOnlyHasNoIndex) {
 }
 
 }  // namespace
+
+// S76：range 取值按视图位置读 ⇒ 与 CaskIter 同为 ReadView 快照。迭代器建好之后的
+// 改写 / 删除 / 新增都不可见（≤ 13.0.0 是 per-key 弱一致：删掉的跳过、改过的交新值）。
+// 惰性与预取两条路径一致；close 之后 next() 报 kClosed（同 get）。
+TEST_F(OkiRangeTest, S76RangeIsReadViewSnapshot) {
+    CaskOptions o;
+    o.read_write = true;
+    auto c = Cask::open(dir_.string(), o, &test_registry());
+    ASSERT_TRUE(c);
+    for (int i = 0; i < 50; ++i) {
+        char k[16];
+        std::snprintf(k, sizeof k, "s%03d", i);
+        ASSERT_TRUE((*c)->put(bytes(k), bytes(std::string("old") + k)));
+    }
+    const auto drain = [](CaskRangeIter& it) {
+        KvVec out;
+        while (true) {
+            auto e = it.next();
+            EXPECT_TRUE(e.has_value()) << (e ? "" : e.error().detail);
+            if (!e || !e->has_value()) break;
+            out.emplace_back(to_str((*e)->key), to_str((*e)->value));
+        }
+        return out;
+    };
+    for (std::size_t prefetch : {std::size_t{0}, std::size_t{16}}) {
+        RangeOptions ro;
+        ro.prefetch = prefetch;
+        auto it = (*c)->make_range_iter(ro);
+        ASSERT_TRUE(it);
+        // 建好之后：改 s001、删 s002、新增 s0005（落在窗口里）
+        ASSERT_TRUE((*c)->put(bytes("s001"), bytes("new")));
+        ASSERT_TRUE((*c)->remove(bytes("s002")));
+        ASSERT_TRUE((*c)->put(bytes("s0005"), bytes("added")));
+        const auto got = drain(**it);
+        ASSERT_EQ(got.size(), 50u) << "prefetch=" << prefetch;
+        EXPECT_EQ(got[1], (std::pair<std::string, std::string>{"s001", "olds001"}));
+        EXPECT_EQ(got[2], (std::pair<std::string, std::string>{"s002", "olds002"}));
+        for (const auto& [k, v] : got) EXPECT_NE(k, "s0005");
+        // 复原，给下一轮
+        ASSERT_TRUE((*c)->put(bytes("s001"), bytes("olds001")));
+        ASSERT_TRUE((*c)->put(bytes("s002"), bytes("olds002")));
+        ASSERT_TRUE((*c)->remove(bytes("s0005")));
+    }
+    // 新建的迭代器看得到最新状态
+    ASSERT_TRUE((*c)->put(bytes("s010"), bytes("latest")));
+    const auto now = range_scan(**c, "s010", "s011");
+    ASSERT_EQ(now.size(), 1u);
+    EXPECT_EQ(now[0].second, "latest");
+
+    auto it = (*c)->make_range_iter(RangeOptions{});
+    ASSERT_TRUE(it);
+    (*c)->close();
+    auto e = (*it)->next();
+    ASSERT_FALSE(e.has_value());
+    EXPECT_EQ(e.error().kind, bitcask::CaskError::kClosed);
+}

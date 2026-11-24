@@ -1147,8 +1147,10 @@ BITCASK_API void bitcask_range_options_init(bitcask_range_options_t* opts);
 // 启动有序 range 迭代：按 key 字典序遍历 [lo, hi)。
 // opts 为 NULL 时等价「全域 + 无预取」。opts 指向的切片仅在本调用期间被引用
 // （内部已拷贝边界），返回后调用方可释放。
-// 一致性：**per-key 弱一致**（与 bitcask_parallel_scan 同档）——迭代期间的
-// 并发写可能部分可见，不是 bitcask_iter_* 的快照语义。
+// 一致性：**快照**（S76 起，与 bitcask_iter_* 相同）——key 集合与值都是
+// start 那一刻的版本，之后的并发写（含删除）不可见；迭代期间 merge 把某个 key
+// 的快照版本合并掉了（之后又改写过）时，这一个 key 交出当前值。≤ 13.0.0 是
+// per-key 弱一致（值在取的那一刻回查，被删的跳过、被改的交新值）。
 // 返回 BITCASK_OK，或：
 //   BITCASK_ERR_NO_INDEX  — merge-only 打开（本句柄不建读视图）。只读打开
 //                           不会返回它：目录没有 OKI 时 open 期从 data 建一份

@@ -63,7 +63,7 @@ meta::MetaFilter tag_filter(const std::string& tag) {
 struct IterOpts {
     bool see_tombstones = false;
     bool want_meta = false;
-    std::string prefix;
+    std::string prefix{};  // 带缺省初始化器：指定初始化器省略它时 GCC 不报 -Wmissing-field-initializers
     const meta::MetaFilter* filter = nullptr;
 };
 
@@ -124,10 +124,12 @@ protected:
     void populate_plain() {
         for (int i = 0; i < 300; ++i) {
             const auto v = value_of(i);
-            ASSERT_TRUE(cask_->put(sv_bytes(plain_key(i)), sv_bytes(v), 1000 + i));
+            ASSERT_TRUE(cask_->put(sv_bytes(plain_key(i)), sv_bytes(v),
+                                   static_cast<std::uint64_t>(1000 + i)));
         }
         for (int i = 0; i < 100; i += 7) {
-            ASSERT_TRUE(cask_->remove(sv_bytes(plain_key(i)), 2000 + i));
+            ASSERT_TRUE(cask_->remove(sv_bytes(plain_key(i)),
+                                      static_cast<std::uint64_t>(2000 + i)));
         }
     }
 
@@ -140,7 +142,7 @@ protected:
             const auto blob = tag_blob(i % 4 == 0 ? "keep" : "drop");
             doc.meta = std::span<const std::byte>(blob);
             ASSERT_TRUE(cask_->put_doc(sv_bytes("m" + std::to_string(i)), doc,
-                                       3000 + i));
+                                       static_cast<std::uint64_t>(3000 + i)));
         }
     }
 
@@ -227,7 +229,7 @@ protected:
 // 墓碑行的 key 长度参差，逼扁平缓冲在一批之内多次增长。
 TEST_F(IterBatchViewTest, ScratchKeyGrowthWithinBatchKeepsEarlierKeys) {
     for (int i = 0; i < 200; ++i) {
-        std::string key(3 + i, 'x');  // 3..202 字节，互不相同
+        std::string key(static_cast<std::size_t>(3 + i), 'x');  // 3..202 字节，互不相同
         key.push_back(static_cast<char>('0' + i % 10));
         ASSERT_TRUE(cask_->put(sv_bytes(key), sv_bytes("v"), 10));
         ASSERT_TRUE(cask_->remove(sv_bytes(key), 20));

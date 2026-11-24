@@ -316,7 +316,7 @@ std::vector<std::byte> le_meta(std::uint8_t ver) {
     m[8] = static_cast<std::byte>(4);  // dim = 4（小端低位）
     const std::uint32_t crc = bitcask::codec::crc32(
         std::span<const std::byte>(m.data(), 14));
-    for (int i = 0; i < 4; ++i)
+    for (std::size_t i = 0; i < 4; ++i)
         m[14 + i] = static_cast<std::byte>((crc >> (8 * i)) & 0xFF);
     return m;
 }

@@ -6,7 +6,7 @@ C API 是 C++ `bitcask::Cask` 的薄 `extern "C"` 包装，编译产物：
 
 | 产物 | 说明 |
 |------|------|
-| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=13`，`VERSION=13.0.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 13.0.0)` 单一真源派生）|
+| `libbitcask.so` | 共享库，导出全部 C API（`SOVERSION=13`，`VERSION=13.1.0`，由 `CMakeLists.txt` 的 `project(libbitcask VERSION 13.1.0)` 单一真源派生）|
 | `libbitcask.a` | 合并全部静态归档的单一 `.a`（定义 `BITCASK_STATIC_LIB` 去掉导出修饰）|
 
 符号导出由 `BITCASK_API` 宏控制（`bitcask_kv.h` §符号导出宏），Windows 下退化为 `__declspec(dllimport/dllexport)`，其它平台默认 `__attribute__((visibility("default")))`。
@@ -130,7 +130,7 @@ cl /DBITCASK_STATIC_LIB app.c /I<c_api 头目录> bitcask_static.lib   :: 静态
 
 ## 3. 版本信息
 
-版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 13.0.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
+版本号由 `CMakeLists.txt` 的 `project(libbitcask VERSION 13.1.0)` 单一真源派生，configure 时通过 `c_api/bitcask_version.h.in` 生成 `bitcask_version.h`。
 
 ```c
 BITCASK_API int          bitcask_version_major(void);
@@ -140,7 +140,7 @@ BITCASK_API const char*  bitcask_version_string(void);   // "major.minor.patch"�
 ```
 
 - `bitcask_version_string()` 返回的是库内静态字符串（指向 `BITCASK_VERSION_STRING` 宏展开的字符串字面量），**不需要 free**。
-- 运行时返回值与 `libbitcask.so.13.0.0` 文件名完全对应；SOVERSION 是 `13`（大版本号），反映 ABI 兼容性。
+- 运行时返回值与 `libbitcask.so.13.1.0` 文件名完全对应；SOVERSION 是 `13`（大版本号），反映 ABI 兼容性。
 - 7.0.0 的 major bump 由 **C++ 公共头 ABI 变化**驱动（`StatusInfo` / `OkiState` /
   `OkiMergeCursor` 布局变化）。C API 函数签名与既有 C POD 布局保持零增删改；
   跨语言绑定仍需针对 `.so.7` 重新链接加载。
@@ -1467,7 +1467,7 @@ BITCASK_API void bitcask_range_iter_release(bitcask_range_iter_t* iter);
 BITCASK_API void bitcask_range_entry_free(bitcask_range_entry_t* entry);
 ```
 
-- **一致性：per-key 弱一致**（与 `bitcask_parallel_scan` 同档）——迭代期间的并发写可能部分可见，**不是** `bitcask_iter_*` 的快照语义。
+- **一致性：快照**（S76 起，与 `bitcask_iter_*` 相同）——key 集合与值都是 `bitcask_range_iter_start` 那一刻的版本，之后的并发写（含删除）不可见；迭代期间 merge 把某个 key 的快照版本合并掉了（之后又改写过）时，这一个 key 交出当前值。取值与全表扫描同一条读路径（按视图里的位置映射读），不再逐 key 回查点查——20 万 key 重开后每行约 600～830 → 270～410 ns。≤ 13.0.0 是 per-key 弱一致（值在取的那一刻回查，被删的跳过、被改的交新值）。
 - `opts == NULL` 等价「全域 + 无预取」；`opts` 指向的切片仅在 `bitcask_range_iter_start` 调用期间被引用（内部已拷贝边界），返回后调用方可释放。
 - `prefetch > 1`：一次归并出 `prefetch` 个 key 后并发取值。**只改变取值时机，输出序与内容不变**。收益形态是「大窗口 + 值不在页缓存」；小窗口/值已缓存时线程成本可能反超——`prefetch_threads = 0`（缺省）时每批先串行试取 32 条计时，估算并行不划算就整批串行（S71），热缓存下与不开预取基本持平；显式给线程数则照给的并行（实测数字见 `api-cpp.md` §6 的 `prefetch` 条）。
 - 错误：`BITCASK_ERR_NO_INDEX` = merge-only 打开（本句柄不建读视图）——只读打开不会返回它：目录没有 OKI 时 open 期从 data 建一份内存读视图（不写盘），照常迭代；`BITCASK_ERR_INDEX_REBUILD_FAILED` = OKI 试建而败：读写打开时重建失败，或只读打开时建内存读视图失败（IO/环境问题，见日志；修复后重开可重试）；`BITCASK_ERR_BAD_CRC` = run 损坏；其余同 `bitcask_get`。
@@ -2082,7 +2082,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 | 同义词词典（`options.synonym_file_path`，open-time） | ✅（不可变 → 并发查询安全；无运行期 setter）|
 | `bitcask_iter_*` | ⚠️（同一 iter 不可并发；每线程一个迭代器；不同 iter 之间并发安全）|
 | `bitcask_range_iter_start` | ✅（取 OKI 只读视图）|
-| `bitcask_range_iter_next` / `_next_batch` / `_release` | ⚠️（同一 iter 不可并发；每线程一个；与并发写/merge 安全——per-key 弱一致）|
+| `bitcask_range_iter_next` / `_next_batch` / `_release` | ⚠️（同一 iter 不可并发；每线程一个；与并发写/merge 安全——读 start 时的快照，S76）|
 | `bitcask_parallel_scan` / `_prefix` | ✅（内部多线程并发 `get`；**回调可能多线程并发触发**——回调须线程安全）|
 | `bitcask_status` / `bitcask_status_ex` / `bitcask_needs_merge` / `bitcask_merge` / `bitcask_is_empty` / `bitcask_is_frozen` / `bitcask_flush_index` | ✅ |
 | 读 / 写并发 | ✅（搜索可见性 near-real-time）|

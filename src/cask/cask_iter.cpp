@@ -154,34 +154,62 @@ std::expected<bool, CaskFault> CaskIter::next_row(RowView& e) {
             return true;
         }
 
-        // 只按视图位置读原始记录；key/ord 核对沿用 S43-1 点查契约。
-        // 陈旧 loc 在 merge 窗口里可短暂缺失，重查 OKI 后重试一次。
-        bool healed = false;  // S59：本 key 已为「文件被别的进程合并删掉」重建过
-        int relocations = 0;  // S59：本 key 按重查位置重读的次数（有界）
-    read_at_loc:
+        Cask::LocatedRecord rec;
+        auto st = parent_->read_located(cur_key_, row.ord, row.loc, &pinned_files_,
+                                        see_tombstones_, filter_, want_meta_, rec);
+        if (!st) return std::unexpected(st.error());
+        if (*st != Cask::LocatedStatus::kHit) continue;  // 跳过 / 已被取代（扫描照旧不交出）
+        // S75：span 直达映射（mmap）或 owned 记录（pread 兜底），不拷。
+        e.key = rec.key;
+        e.key_from_cursor = false;
+        e.value = rec.value;
+        if (want_meta_) e.meta = rec.meta;
+        e.is_tombstone = rec.tomb;
+        e.file_id = rec.file_id;
+        e.offset = rec.offset;
+        e.total_sz = rec.total_sz;
+        e.file_holder = std::move(rec.holder);
+        if (rec.owned) e.owned = std::move(rec.owned);
+        return true;
+    }
+}
+
+std::expected<Cask::LocatedStatus, CaskFault>
+Cask::read_located(std::string_view key, std::uint64_t ord, const oki::RowLoc& loc,
+                   const PinnedFiles* pinned, bool see_tombstones,
+                   const meta::MetaFilter* filter, bool want_meta,
+                   LocatedRecord& out) {
+    // 只按视图位置读原始记录；key/ord 核对沿用 S43-1 点查契约。
+    // 陈旧 loc 在 merge 窗口里可短暂缺失，重查 OKI 后重试。
+    // （S76 从 CaskIter::next_row 抽出，与 CaskRangeIter 共用。）
+    std::uint32_t file_id = loc.file_id;
+    std::uint64_t offset = loc.offset;
+    std::uint32_t total_sz = loc.total_sz;
+    bool healed = false;  // S59：本 key 已为「文件被别的进程合并删掉」重建过
+    int relocations = 0;  // S59：本 key 按重查位置重读的次数（有界）
+    while (true) {
         bool retry = false;
         fileops::DataFile* df = nullptr;
         std::shared_ptr<fileops::DataFile> shared_df;
-        if (auto it = pinned_files_.find(e.file_id); it != pinned_files_.end()) {
-            df = it->second.get();
-        } else {
-            shared_df = parent_->read_file(e.file_id);
+        if (pinned != nullptr) {
+            if (auto it = pinned->find(file_id); it != pinned->end()) df = it->second.get();
+        }
+        if (df == nullptr) {
+            shared_df = read_file(file_id);
             df = shared_df.get();
         }
         if (!df) {
-            if (!parent_->is_closed()) retry = true;
+            if (!is_closed()) retry = true;
             else return std::unexpected(err(
-                CaskError::kIo,
-                "open read file_id=" + std::to_string(e.file_id)));
+                CaskError::kIo, "open read file_id=" + std::to_string(file_id)));
         } else {
             // S71：先走映射读（封口文件 P6 整文件映射、活跃文件 S65 只读映射），
             // 不发系统调用、不拷贝整条记录——与点查 read_doc 同一条路径；界外
-            // （kShortRead）或没有映射时才退回 pread。此前每行一次 pread 加两份
-            // 拷贝，全表扫描比 range 慢 2～3 倍（feedbacks/2026-11-23-keydir-scan-…）。
+            // （kShortRead）或没有映射时才退回 pread。
             std::optional<codec::DataRecordView> view;
             std::optional<fileops::ReadRecord> owned;
             if (df->mmapped()) {
-                auto rv = df->read_mmap(e.offset, e.total_sz);
+                auto rv = df->read_mmap(offset, total_sz);
                 if (rv) {
                     view = *rv;
                 } else if (rv.error().kind == fileops::DataFileError::kBadCrc) {
@@ -189,9 +217,9 @@ std::expected<bool, CaskFault> CaskIter::next_row(RowView& e) {
                 }
             }
             if (!view) {
-                auto rec = df->read(e.offset, e.total_sz);
+                auto rec = df->read(offset, total_sz);
                 if (!rec) {
-                    if (!parent_->is_closed()) retry = true;
+                    if (!is_closed()) retry = true;
                     else {
                         switch (rec.error().kind) {
                             case fileops::DataFileError::kBadCrc:
@@ -214,80 +242,77 @@ std::expected<bool, CaskFault> CaskIter::next_row(RowView& e) {
                 const format::RecordType rtype = view ? view->type : owned->type;
                 const std::uint64_t rord = view ? view->ord : owned->ord;
                 const bool key_matches =
-                    rkey.size() == cur_key_.size() &&
-                    std::memcmp(rkey.data(), cur_key_.data(),
-                                cur_key_.size()) == 0;
-                if (!key_matches || rord != e.ord) {
+                    rkey.size() == key.size() &&
+                    std::memcmp(rkey.data(), key.data(), key.size()) == 0;
+                if (!key_matches || rord != ord) {
                     return std::unexpected(err(
                         CaskError::kIndexCorrupt,
                         "located record key/ord mismatch during fold"));
                 }
+                out.tstamp = view ? view->tstamp : owned->tstamp;
+                out.file_id = file_id;
+                out.offset = offset;
+                out.total_sz = total_sz;
                 if (rtype == format::RecordType::kTombstone) {
-                    if (!see_tombstones_) continue;
-                    e.is_tombstone = true;
-                    e.value = owned ? std::span<const std::byte>(owned->value)
-                                    : rval;
-                    e.key = rkey;
-                    e.key_from_cursor = false;
-                    e.file_holder = shared_df;
-                    if (owned) e.owned = std::move(*owned);
-                    return true;
+                    if (!see_tombstones) return LocatedStatus::kSkip;
+                    out.tomb = true;
+                    out.key = rkey;
+                    out.value = rval;
+                    out.meta = {};
+                } else {
+                    auto dv = codec::decode_doc_value(rval);
+                    if (!dv) {
+                        return std::unexpected(err(CaskError::kIo, "corrupt DocValue"));
+                    }
+                    if (dv->expiry_at != 0 && dv->expiry_at <= now_sec_default()) {
+                        return LocatedStatus::kSkip;
+                    }
+                    if (filter != nullptr &&
+                        (dv->meta.empty() || !filter->evaluate(dv->meta))) {
+                        return LocatedStatus::kSkip;
+                    }
+                    out.tomb = false;
+                    out.key = rkey;
+                    out.value = dv->text;
+                    out.meta = want_meta ? dv->meta : std::span<const std::byte>{};
                 }
-                auto dv = codec::decode_doc_value(rval);
-                if (!dv) {
-                    return std::unexpected(err(CaskError::kIo,
-                                               "corrupt DocValue"));
-                }
-                if (dv->expiry_at != 0 &&
-                    dv->expiry_at <= now_sec_default()) {
-                    continue;
-                }
-                if (filter_ &&
-                    (dv->meta.empty() || !filter_->evaluate(dv->meta))) {
-                    continue;
-                }
-                // S75：span 直达映射（mmap）或 owned 记录（pread 兜底），不拷。
-                e.key = rkey;
-                e.key_from_cursor = false;
-                e.value = dv->text;
-                if (want_meta_) e.meta = dv->meta;
-                e.file_holder = shared_df;
-                if (owned) e.owned = std::move(*owned);
-                return true;
+                // span 借这两者之一：owned 搬进 out 后其堆缓冲不动，span 仍有效
+                out.holder = std::move(shared_df);
+                out.owned = std::move(owned);
+                return LocatedStatus::kHit;
             }
         }
 
-        if (!retry) continue;
-        auto refreshed = parent_->authority_->state().locate(cur_key_);
+        if (!retry) return LocatedStatus::kSkip;
+        auto refreshed = authority_->state().locate(key);
         // S59：同一版本仍指向已不存在的文件 ⇒ 跨进程 merge_only 旁车合并过、
         // 本句柄索引不知道那次搬迁。从 data 重建一次后按新位置重读（搬迁不改
         // ord；迭代器视图固定在旧 run 上，所以按重查结果读，不回视图）。
         const auto same_version = [&] {
             return refreshed.status == oki::OkiState::LocateStatus::kHit &&
-                   !refreshed.tomb && refreshed.has_loc && refreshed.ord == e.ord;
+                   !refreshed.tomb && refreshed.has_loc && refreshed.ord == ord;
         };
-        if (!healed && same_version() && refreshed.loc.file_id == e.file_id &&
-            refreshed.loc.offset == e.offset &&
-            parent_->heal_stale_location(e.file_id)) {
+        if (!healed && same_version() && refreshed.loc.file_id == file_id &&
+            refreshed.loc.offset == offset && heal_stale_location(file_id)) {
             healed = true;
-            refreshed = parent_->authority_->state().locate(cur_key_);
+            refreshed = authority_->state().locate(key);
         }
         // 同一版本、位置已变（本 key 刚重建过，或前面的 key 触发的重建已把它
         // 搬到合并输出）⇒ 按新位置重读。迭代器视图固定在旧 run 上，后续 key
         // 拿到的仍是旧位置，都会走这里。
         if (same_version() && relocations < 2 &&
-            (refreshed.loc.file_id != e.file_id || refreshed.loc.offset != e.offset)) {
+            (refreshed.loc.file_id != file_id || refreshed.loc.offset != offset)) {
             ++relocations;
-            e.file_id = refreshed.loc.file_id;
-            e.offset = refreshed.loc.offset;
-            e.total_sz = refreshed.loc.total_sz;
-            goto read_at_loc;  // 按新位置重读同一条记录
+            file_id = refreshed.loc.file_id;
+            offset = refreshed.loc.offset;
+            total_sz = refreshed.loc.total_sz;
+            continue;  // 按新位置重读同一条记录
         }
         if (refreshed.status != oki::OkiState::LocateStatus::kHit ||
-            refreshed.tomb || !refreshed.has_loc || refreshed.ord == e.ord) {
-            return std::unexpected(err(CaskError::kIo,
-                                       "fold location disappeared"));
+            refreshed.tomb || !refreshed.has_loc || refreshed.ord == ord) {
+            return std::unexpected(err(CaskError::kIo, "fold location disappeared"));
         }
+        return LocatedStatus::kSuperseded;  // 本快照里的版本已不可读，该 key 有更新的版本
     }
 }
 

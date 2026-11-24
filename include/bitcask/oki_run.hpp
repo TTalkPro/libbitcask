@@ -158,6 +158,10 @@ public:
     [[nodiscard]] bool enabled() const noexcept {
         return shard_cap_.load(std::memory_order_relaxed) != 0;
     }
+    // S76：总容量（字节）。
+    [[nodiscard]] std::size_t capacity() const noexcept {
+        return shard_cap_.load(std::memory_order_relaxed) * kShards;
+    }
 
     struct Stats {
         std::uint64_t hits = 0;
@@ -353,6 +357,13 @@ public:
     [[nodiscard]] std::expected<std::optional<Entry>, OkiError>
     find(std::span<const std::byte> key, OkiBlockCache* cache = nullptr,
          std::uint64_t cache_gen = 0) const;
+
+    // S76：把本 run 的块（连同 find 用的块内采样索引）按顺序装进缓存，累计到
+    // max_bytes 为止——刚写出的 run 在页缓存里，读回很便宜；此后点查（写前探测）
+    // 命中它时不必再 pread + 解析。缓存关着或 max_bytes 为 0 时什么都不做。
+    // 读失败即停（不报错：预热只是优化）。返回装进去的块数。
+    std::size_t warm_cache(OkiBlockCache* cache, std::uint64_t cache_gen,
+                           std::size_t max_bytes) const;
 
     [[nodiscard]] std::uint64_t entry_count() const noexcept {
         return entry_count_;

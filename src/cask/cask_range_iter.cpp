@@ -79,9 +79,9 @@ Cask::make_range_iter(const RangeOptions& opts) {
     return it;
 }
 
-std::expected<std::optional<std::string>, CaskFault>
+std::expected<std::optional<oki::OkiState::DeltaRow>, CaskFault>
 CaskRangeIter::next_merged_key() {
-    if (done_ || !merged_) return std::optional<std::string>{};
+    if (done_ || !merged_) return std::optional<oki::OkiState::DeltaRow>{};
     oki::OkiState::DeltaRow row;
     auto n = merged_->next(row);  // 规则见 OkiMergeCursor；墓碑已抵消
     if (!n) {
@@ -90,13 +90,13 @@ CaskRangeIter::next_merged_key() {
     }
     if (!*n || (has_hi_ && std::string_view(row.key) >= std::string_view(hi_))) {
         done_ = true;
-        return std::optional<std::string>{};
+        return std::optional<oki::OkiState::DeltaRow>{};
     }
-    return std::optional<std::string>(std::move(row.key));
+    return std::optional<oki::OkiState::DeltaRow>(std::move(row));
 }
 
-// 惰性单条：归并出 key → 立刻回查 keydir 取权威值（key 可能已死 / 已被
-// 更新——OKI 行陈旧无害）。kNotFound → 跳过；其余错误上抛。
+// 惰性单条：归并出视图行 → 按行里的位置取值（S76）。跳过的行（TTL / filter /
+// 已不可读）继续下一个；错误上抛。
 std::expected<std::optional<CaskRangeIter::Entry>, CaskFault>
 CaskRangeIter::next() {
     if (prefetch_ > 1) {
@@ -121,10 +121,46 @@ CaskRangeIter::next() {
     }
 }
 
+// S76：按视图行的位置取值——与 CaskIter 全表扫描同一条读路径（Cask::read_located：
+// 映射读、key/ord 自证、TTL / filter、merge 搬迁后重定位）。此前每个 key 回查一次
+// public get，把点查定位整套重走一遍（重开后还要查 run）：20 万 key 重开后每行
+// 776～936 ns，扫描只要 398～489 ns。filter 在 meta 段上求值，不通过的连 value 都不拷。
+std::expected<std::optional<CaskRangeIter::Entry>, CaskFault>
+CaskRangeIter::fetch_entry(const oki::OkiState::DeltaRow& row) const {
+    if (cask_->is_closed()) {
+        return std::unexpected(err(CaskError::kClosed, "cask is closed"));  // 同 get
+    }
+    if (!row.has_loc) return fetch_by_get(row.key);  // v1 run 行：没有位置
+    // 句柄级 expiry_secs（同 get / CaskIter：按写入时刻判）
+    const auto expiry = cask_->opts_.expiry_secs;
+    if (expiry > 0 &&
+        static_cast<std::uint64_t>(row.loc.tstamp) + expiry <= now_sec_default()) {
+        return std::optional<Entry>{};
+    }
+    Cask::LocatedRecord rec;
+    auto st = cask_->read_located(row.key, row.ord, row.loc, /*pinned=*/nullptr,
+                                  /*see_tombstones=*/false, filter_, want_meta_, rec);
+    if (!st) return std::unexpected(st.error());
+    if (*st == Cask::LocatedStatus::kSkip) return std::optional<Entry>{};
+    if (*st == Cask::LocatedStatus::kSuperseded) {
+        // 快照里的版本被 merge 合并掉了：交出该 key 的当前值（≤ 13.0.0 的行为），
+        // 不让一个活 key 从结果里消失。
+        return fetch_by_get(row.key);
+    }
+    Entry out;
+    const auto* kp = reinterpret_cast<const std::byte*>(row.key.data());
+    out.key.assign(kp, kp + row.key.size());
+    out.value.assign(rec.value.begin(), rec.value.end());
+    if (want_meta_) out.meta.assign(rec.meta.begin(), rec.meta.end());
+    out.tstamp = rec.tstamp;
+    out.ord = row.ord;   // 已与记录自证一致
+    return std::optional<Entry>(std::move(out));
+}
+
 // 反馈 2026-10-06：走零拷贝 get 视图——filter 在视图的 meta 段上求值，
 // 不通过的连 value 都不拷；value 与 meta 出自同一次读（同一版本）。
 std::expected<std::optional<CaskRangeIter::Entry>, CaskFault>
-CaskRangeIter::fetch_entry(const std::string& key) const {
+CaskRangeIter::fetch_by_get(const std::string& key) const {
     const auto* kp = reinterpret_cast<const std::byte*>(key.data());
     auto g = cask_->get(std::span<const std::byte>(kp, key.size()));
     if (!g) {
@@ -145,16 +181,15 @@ CaskRangeIter::fetch_entry(const std::string& key) const {
     return std::optional<Entry>(std::move(out));
 }
 
-// S33-6：预取一批。归并 ≤prefetch_ 个 key（串行、廉价，只碰 run 块与
-// memdelta）→ 分段并发 get 取值（被并行化的是 value 的 pread+decode，
+// S33-6：预取一批。归并 ≤prefetch_ 个视图行（串行、廉价，只碰 run 块与
+// memdelta）→ 分段并发按位置取值（被并行化的是 value 的读 + decode，
 // 与 parallel_scan 同款 JoiningPool）→ 按 key 序压实进 buf_。
-// 死 key（并发删除 / OKI 行陈旧）与 parallel_scan 同样静默跳过；filter 不
-// 通过的同样不进 buf_。
+// 跳过的行（TTL / filter 不通过 / 已不可读）不进 buf_。
 std::expected<void, CaskFault> CaskRangeIter::fill_prefetch() {
     buf_.clear();
     buf_pos_ = 0;
 
-    std::vector<std::string> keys;
+    std::vector<oki::OkiState::DeltaRow> keys;   // 视图行（key + 位置）
     keys.reserve(prefetch_);
     while (keys.size() < prefetch_) {
         auto k = next_merged_key();

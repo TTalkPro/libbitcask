@@ -605,12 +605,15 @@ private:
 // --- CaskRangeIter（S33-5：OKI 有序 Range 迭代器）--------------------------
 //
 // 按 key 字典序遍历 [lo, hi)：k 路归并 OKI runs + memdelta（同 key 按
-// (ord, 来源序) 胜、墓碑抵消）→ public get 相同的 key/ord 核对与 merge
-// 重试取值。OKI 行允许陈旧——死 key 被回查过滤，merge 搬迁后重定位收敛。
+// (ord, 来源序) 胜、墓碑抵消）→ 按归并出的位置读记录（与 CaskIter 同一条
+// 路径：映射读、key/ord 自证、merge 搬迁后重定位）。
 //
-// 一致性：**per-key 弱一致**——迭代期间的并发写可能部分可见，不是
-// CaskIter 的 ReadView 快照语义。生命周期契约同 CaskIter：不可跨线程
-// 共享；须在 Cask 对象析构前用完（close() 仍安全）。
+// 一致性：**ReadView 快照**（S76 起，与 CaskIter 相同）——key 集合与值都是
+// make_range_iter 那一刻的版本；之后的并发写（含删除）不可见。例外：迭代期间
+// merge 把快照里的旧版本合并掉了（该 key 之后被改写过），这一个 key 交出当前值。此前（≤ 13.0.0）
+// 是 per-key 弱一致：key 集合取自快照，值在取的那一刻回查 public get，之后被
+// 删的 key 跳过、被改的 key 交出新值。生命周期契约同 CaskIter：不可跨线程
+// 共享；须在 Cask 对象析构前用完（close() 之后 next() 返回 kClosed）。
 struct RangeOptions {
     std::span<const std::byte> lo{};  // inclusive；空 = 从头
     std::span<const std::byte> hi{};  // exclusive；空 = 到尾
@@ -621,7 +624,7 @@ struct RangeOptions {
     // 对「窗口大 + 值不在页缓存」的扫描明显；小窗口/命中缓存时线程创建
     // 成本可能反超，故默认关闭。
     // 语义不变量：预取只改变取值时机，**输出序与内容与惰性路径一致**
-    // （仍是 per-key 弱一致——预取批内各 key 的取值时刻略早于出货时刻）。
+    // （S76 起取值都按快照位置读，取值时刻不影响内容）。
     std::size_t prefetch = 0;
     // 预取线程数；0 = 自动：至多 min(hardware_concurrency, 4)，且每批先串行
     // 取 32 条计时，估算剩下的串行耗时盖不过起线程的成本（页缓存热、值小）
@@ -656,19 +659,23 @@ private:
     friend class Cask;
     CaskRangeIter() = default;
 
-    // 归并层：产出下一个「胜出且非墓碑」的 key（尚未回查 public get）；
+    // 归并层：产出下一个「胜出且非墓碑」的视图行（key + 位置 + ord）；
     // 到尾或越过 hi → nullopt。取值与预取都建在它之上。
-    [[nodiscard]] std::expected<std::optional<std::string>, CaskFault>
+    [[nodiscard]] std::expected<std::optional<oki::OkiState::DeltaRow>, CaskFault>
     next_merged_key();
 
     // S33-6：预取一批——归并至多 prefetch_ 个 key，并发回查取值填 buf_。
     // 死 key（kNotFound）在批内被丢弃，故 buf_ 可能为空而迭代未结束。
     [[nodiscard]] std::expected<void, CaskFault> fill_prefetch();
 
-    // 回查 public get 取值 + filter + 物化（惰性与预取共用；只读成员，可并发调）。
-    // 死 key（kNotFound）或 filter 不通过 → nullopt。
+    // 按视图行的位置取值（S76，Cask::read_located，与 CaskIter 同一条路径）+
+    // filter + 物化（惰性与预取共用；只读成员，可并发调）。TTL 过期、filter 不
+    // 通过、该 key 在本快照之后已有新版本且旧版本已不可读 → nullopt。
     [[nodiscard]] std::expected<std::optional<Entry>, CaskFault>
-    fetch_entry(const std::string& key) const;
+    fetch_entry(const oki::OkiState::DeltaRow& row) const;
+    // 视图行没有位置（v1 run）时退回 public get 回查。
+    [[nodiscard]] std::expected<std::optional<Entry>, CaskFault>
+    fetch_by_get(const std::string& key) const;
 
     Cask* cask_ = nullptr;
     oki::OkiState::ReadView view_;
@@ -868,8 +875,8 @@ public:
     //   期望值。批内同 key 多次时只有最后一个 op 的 LSN 是该 key 的当前版本。
     // - 不保证：
     //     * 不是快照。要多 key 一致读，用头条件写回，或用只含 kCheck 的批校验。
-    //     * CaskRangeIter 仍是 per-key 弱一致（迭代途中生效的完整批可能让
-    //       前半段 key 旧、后半段 key 新；这不是「半个批」）。
+    //     * CaskRangeIter / CaskIter 读的是迭代器建立时的快照（S76 起 range 也是），
+    //       迭代途中生效的批整批不可见。
     //     * 检索索引（text / vector / meta filter）仍异步提交，search_* 的
     //       可见时刻晚于 get；要读自己写的，沿用 flush_index()。
     //     * put_batch（非原子批）仍逐条生效。
@@ -1278,6 +1285,7 @@ public:
 
 private:
     friend class CaskIter;
+    friend class CaskRangeIter;  // S76：range 取值按视图位置读（read_located）
 
     std::string dirname_;
     CaskOptions opts_;
@@ -1638,6 +1646,34 @@ private:
     // 重建，合并输出就在 data 里）。返回 true = 已重建，调用方重查定位重试；
     // 文件还在（真 I/O 错误）/ merge_only / 重建失败 ⇒ false。
     [[nodiscard]] bool heal_stale_location(std::uint32_t file_id) noexcept;
+
+    // S76：按 OKI 视图行的位置读一条记录——CaskIter（全表扫描）与 CaskRangeIter
+    // 共用。先映射读、界外退回 pread；key / ord 与视图行自证；DocValue 的 TTL、
+    // meta filter 在这里判；位置陈旧（merge 搬走 / 跨进程旁车合并删了文件）时按
+    // S59 重查、必要时重建一次再按新位置重读。kSkip = 该行不交出（TTL 过期、
+    // filter 不通过、记录是墓碑而调用方不看墓碑）；kSuperseded = 这个版本已读
+    // 不到（merge 合并掉了），而该 key 有更新的版本。span 借 holder / owned。
+    // 只读成员，可并发调（range 预取的多个线程同时用）。
+    struct LocatedRecord {
+        std::span<const std::byte> key;
+        std::span<const std::byte> value;   // DocValue text 段；墓碑时是记录原值
+        std::span<const std::byte> meta;    // want_meta 时填
+        bool tomb = false;
+        std::uint64_t tstamp = 0;
+        std::uint32_t file_id = 0;          // 最终读到的位置（重定位后可能变）
+        std::uint64_t offset = 0;
+        std::uint32_t total_sz = 0;
+        std::shared_ptr<fileops::DataFile> holder;
+        std::optional<fileops::ReadRecord> owned;
+    };
+    enum class LocatedStatus { kHit, kSkip, kSuperseded };
+    using PinnedFiles =
+        std::unordered_map<std::uint32_t, std::unique_ptr<fileops::DataFile>>;
+    [[nodiscard]] std::expected<LocatedStatus, CaskFault>
+    read_located(std::string_view key, std::uint64_t ord, const oki::RowLoc& loc,
+                 const PinnedFiles* pinned, bool see_tombstones,
+                 const meta::MetaFilter* filter, bool want_meta,
+                 LocatedRecord& out);
     // 运行期重建一次只允许一个执行者；读者看到 true 时必须返回显式
     // 索引不可用/损坏错误，禁止当 miss。
     std::atomic<bool> oki_rebuilding_{false};

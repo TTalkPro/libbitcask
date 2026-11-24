@@ -468,6 +468,8 @@ private:
     void publish_view_locked();  // 前置：持 flush_mu_；由 readers_/frozen_ 构造
     // 从 active 物理删除 seq ≤ through 的行（前置：持 flush_mu_；内部取 mu_）。
     void drop_active_through(std::uint64_t through);
+    // S70：落段线程在落段途中提前给 active 扩容（锁外分块拷贝，前置 flush_mu_）。
+    void grow_rows_ahead();
 
     mutable std::mutex mu_;        // delta_ / delta_bytes_ / delta_idx_ / delta_version_
     std::vector<DeltaRow> delta_;

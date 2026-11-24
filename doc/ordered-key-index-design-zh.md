@@ -168,6 +168,8 @@ struct RangeOptions {
 
 ### 4.3 一致性语义（诚实声明）
 
+> S76（13.0.0 之后）：`CaskRangeIter` 取值改为按视图位置读，语义随之变成与 `CaskIter` 相同的快照（见 `api-cpp.md` §6）。下面是首版的设计理由，留作历史。
+
 `CaskRangeIter` 是 **per-key 一致**（与 `parallel_scan` 同档），不是 `CaskIter` 的 fold 快照一致：迭代期间的并发写可能部分可见。理由：把 range 挂进 fold 的 sibling-chain/pending 机制会把 memdelta 拖进屏障协议，复杂度收益比极差。需要快照语义的调用方组合用法：先 `CaskIter::start()`（冻结 fold 快照）再跑 range——留作开放问题（§10），首版文档言明弱一致即可。
 
 ### 4.4 值预取（WiscKey 的 SSD-conscious 补偿）

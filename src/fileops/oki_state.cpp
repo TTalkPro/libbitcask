@@ -369,19 +369,33 @@ constexpr std::size_t kCancelCheckRows = 4096;
 }  // namespace
 
 // S70：行数组扩容。翻倍搬迁持 mu_、随行数线性变贵（52 万行时搬一次约 5～10 ms）；
-// 小库照常翻倍，涨到 kRowsJumpAt 行时直接预留到 kRowsJumpTo（落段阈值的 1.25 倍，
-// 留出后台落段期间继续写入的余量），之后不再搬迁。大块分配只占虚拟地址，行写进来
-// 才占内存。落段后的新 active 沿用这块容量（drop_active_through）。
+// 小库照常翻倍，涨到 kRowsJumpAt 行时一次预留到 kRowsJumpTo，之后常态不再搬迁。
+// 落段后的新 active 沿用这块容量（drop_active_through）。
+// 预留量按两个落段阈值里先到的那个算：字节阈值按「key 长 + sizeof(DeltaRow)」计，
+// 短 key 时约 63 万行就落段，按 1M 行阈值预留有一半用不上——Linux 上没写过的页
+// 不占内存，Windows 上大块分配却直接计入提交内存（12.2.0 是 120 MiB，落段摘行时
+// 新旧两份同时在是 240 MiB）。现在是 min(行阈值, 字节阈值 / 行大小) 的 1.25 倍
+// （留出后台落段期间继续写入的余量），约 87 万行、80 MiB。
+// 后台落段跟不上、越过这个余量时一次扩到背压线（写者在 2 倍阈值处改同步落段，
+// Cask::maybe_flush_oki），不按翻倍走：翻倍会到 1.75M 行，而行数到不了那么多。
+constexpr std::size_t kRowsAtThreshold =
+    std::min(OkiState::kFlushRowLimit,
+             OkiState::kFlushByteLimit / sizeof(OkiState::DeltaRow));
 constexpr std::size_t kRowsJumpAt = std::size_t{1} << 16;
-constexpr std::size_t kRowsJumpTo = OkiState::kFlushRowLimit + OkiState::kFlushRowLimit / 4;
+constexpr std::size_t kRowsJumpTo = kRowsAtThreshold + kRowsAtThreshold / 4;
+constexpr std::size_t kRowsCeiling = 2 * kRowsAtThreshold + kRowsAtThreshold / 8;
+static_assert(kRowsJumpAt < kRowsJumpTo && kRowsJumpTo < kRowsCeiling);
 
 static void reserve_rows_locked(std::vector<OkiState::DeltaRow>& rows, std::size_t more) {
     const std::size_t need = rows.size() + more;
     if (need <= rows.capacity()) return;
-    if (need > kRowsJumpAt && rows.capacity() < kRowsJumpTo) {
+    if (need <= kRowsJumpAt) return;  // 小库：交给 push_back / insert 的翻倍
+    if (rows.capacity() < kRowsJumpTo) {
         rows.reserve(std::max(need, kRowsJumpTo));
+    } else if (rows.capacity() < kRowsCeiling) {
+        rows.reserve(std::max(need, kRowsCeiling));
     }
-    // 其余情况交给 push_back 的翻倍（小库；或后台落段跟不上、超过 1.25 倍阈值）。
+    // 再往上（只有同步落段也失败的异常路径会到）交给翻倍。
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +501,44 @@ void OkiState::enable_point_query() {
     rebuild_index_locked();
 }
 
+void OkiState::grow_rows_ahead() {
+    // 写得比后台落段快时，active 会在落段期间涨过常态预留（约 87 万行）；放任写者自己
+    // 扩容就是持 mu_ 整体搬一次，实测挡 12～15 ms。这里由落段线程在落段途中（几个
+    // 检查点）看余量，不到 1/4 就提前扩到背压线：锁外分块拷贝、剩不到一块时锁内搬零头
+    // 再交换，同 drop_active_through。下标不变，点查索引不用动。
+    // 前置：持 flush_mu_ ⇒ 期间 delta_ 只会在尾部追加（drop / rebuild / clear 都要它）。
+    std::size_t cap = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        cap = delta_.capacity();
+        if (cap < kRowsJumpTo || cap >= kRowsCeiling) return;   // 小库 / 已经扩过
+        if (cap - delta_.size() > cap / 4) return;              // 余量还够
+    }
+    std::vector<DeltaRow> grown;
+    grown.reserve(kRowsCeiling);
+    std::size_t copied = 0;
+    while (true) {
+        std::unique_lock<std::mutex> lk(mu_);
+        if (delta_.capacity() >= kRowsCeiling) return;  // 写者抢先扩了：作罢（grown 锁外析构）
+        const std::size_t n = delta_.size();
+        if (n - copied > kViewCopyChunkRows) {
+            // 拷（不搬）：这些行此刻仍在用
+            grown.insert(grown.end(), delta_.begin() + static_cast<std::ptrdiff_t>(copied),
+                         delta_.begin() + static_cast<std::ptrdiff_t>(copied + kViewCopyChunkRows));
+            copied += kViewCopyChunkRows;
+            lk.unlock();
+            lk_pause();
+            continue;
+        }
+        grown.insert(grown.end(),
+                     std::make_move_iterator(delta_.begin() + static_cast<std::ptrdiff_t>(copied)),
+                     std::make_move_iterator(delta_.end()));
+        delta_.swap(grown);   // 内容、下标、字节账都不变：delta_version_ / epoch 不动
+        break;
+    }
+    // grown（旧存储）在这里（锁外）析构
+}
+
 void OkiState::drop_active_through(std::uint64_t through) {
     // S70：持 mu_ 的时间与行数无关。delta_ 按到达序追加、seq 单调不减，seq ≤ through
     // 的行恰是前缀，要留下的是后缀——它在后台落段排序期间还在长（实测 7 万行）。
@@ -504,11 +556,18 @@ void OkiState::drop_active_through(std::uint64_t through) {
             std::partition_point(delta_.begin(), delta_.end(),
                                  [&](const DeltaRow& r) { return r.seq <= through; }) -
             delta_.begin());
-        cap = std::max(delta_.capacity(), delta_.size() - copied);
+        // 沿用原容量。这一轮落段期间行数逼近或冲过了常态预留（写得比后台落段快，
+        // grow_rows_ahead 已扩到背压线）⇒ 保留扩大后的容量，持续批量写入时下一轮不必
+        // 再扩；离得远 ⇒ 回落到常态预留量（这里是锁外两段式拷贝，回落不挡写者）。
+        const std::size_t peak = delta_.size();
+        const std::size_t keep_cap = peak > kRowsJumpTo - kRowsJumpTo / 4
+                                         ? delta_.capacity()
+                                         : std::min(delta_.capacity(), kRowsJumpTo);
+        cap = std::max(keep_cap, peak - copied);
     }
     const bool indexed = point_query_.load(std::memory_order_acquire);
     std::vector<DeltaRow> kept;
-    kept.reserve(cap);   // 沿用原容量：落段后不必再从小翻倍（大块只占虚拟地址）
+    kept.reserve(cap);   // 落段后不必再从小翻倍
     auto fresh = std::make_unique<FlatIdx>();
     fresh->reset(0);
     std::size_t bytes = 0;
@@ -778,7 +837,9 @@ bool OkiState::flush_locked_impl(
             lk_pause();
         }
     }
+    grow_rows_ahead();
     auto winners = sort_dedup(std::move(eligible));
+    grow_rows_ahead();
 
     // 持久性：胜出行引用了未持久字节 → 放弃本轮（状态不变）。带快照时这些行
     // 已计入账本，run 不含而 data 水位又在其前，崩溃重放会重复记账；无快照
@@ -848,17 +909,24 @@ bool OkiState::flush_locked_impl(
             }
             cover = std::max(cover, r.ord + 1);
             ++written;
+            if ((written & 0xFFFF) == 0) grow_rows_ahead();
         }
     }
     if (!w->finish(/*fsync_dir=*/true)) {
         drop_run();
         return false;
     }
+    grow_rows_ahead();
     auto rd = OkiRunReader::open(run_path);
     if (!rd) {
         drop_run();
         return false;
     }
+    // S76：发布前把新 run 的块预热进块缓存（至多缓存容量的 1/4）。它是最新的 run，
+    // 写前探测按 gen 从新到旧查、刚写过的 key 都落在它里面；不预热时发布后的头一批
+    // 探测全是 pread + 解析块 + 建采样索引，批量写入时写者因此成批卡 2～6 ms。
+    // 在落段线程上、页缓存里读，写者感觉不到。
+    rd->warm_cache(block_cache_.get(), gen, block_cache_->capacity() / 4);
 
     // ---- 4) manifest 提交（唯一 commit point）----
     OkiManifest next = manifest_;
@@ -1106,10 +1174,7 @@ OkiState::CompactResult OkiState::compact_once(std::string_view dir,
                     std::vector<std::uint64_t> keep;
                     for (const auto& r : manifest_.runs) keep.push_back(r.gen);
                     sweep_runs(dir, keep, sweep_backlog_, inflight_gens_);
-                    std::vector<std::uint64_t> cache_keep = keep;
-                    cache_keep.insert(cache_keep.end(), inflight_gens_.begin(),
-                                      inflight_gens_.end());
-                    block_cache_->purge_except(cache_keep);
+                    // 块缓存不清（见 install 处注释）。
                     // 墓碑只在全归并时回收；非全归并输出里墓碑占比过高 →
                     // 下一次主道归并强制全归并。
                     if (full) {
@@ -1341,10 +1406,11 @@ bool OkiState::install_built_run(
         std::vector<std::uint64_t> keep;
         if (new_reader) keep.push_back(gen);
         sweep_runs(dir, keep, sweep_backlog_, inflight_gens_);
-        std::vector<std::uint64_t> cache_keep = keep;
-        cache_keep.insert(cache_keep.end(), inflight_gens_.begin(),
-                          inflight_gens_.end());
-        block_cache_->purge_except(cache_keep);
+        // 块缓存不主动清掉作废 run 的块：gen 不复用，这些块不会再被命中，自然沉到
+        // LRU 尾部、由后续插入淘汰（内存上限仍是缓存容量）。主动清理时由落段线程
+        // 集中释放几万个块，而块多是写者线程装载时分配的，释放要拿写者的 malloc
+        // arena 锁——批量写入时写者因此频繁卡 2 ms 以上；在分片锁里清还会让写前
+        // 探测连着撞上几个正在清的分片（实测最长挡 10～17 ms）。
     }
     // 新视图覆盖到此刻的全部 active 行：frozen_through 抬到当前最大到达序号，
     // 旧 active 行随即被水位整体作废（读者按 seq 过滤），再物理删除。
