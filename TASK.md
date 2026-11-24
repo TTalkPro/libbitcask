@@ -10,6 +10,21 @@
 
 ---
 
+## 🟢 S77 · 两个时序敏感用例改稳；`check` 照核数并行（2026-11-24 立项）
+
+> 来源：[`feedbacks/2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md`](feedbacks/2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md)（Windows 14 核 `-j 14` 偶发假红）。
+> 只动测试与 `check` 目标；库代码、ABI、盘上格式不变。
+
+| 项 | 状态 |
+|---|---|
+| S77-1 复现：Linux 8 核 8 倍超额撞不出；注入最不利调度坐实两个失败模式（读者写完后才被调度 ⇒ `seen == 0`；写者被饿住 ⇒ load 期间零归并） | ✅ |
+| S77-2 `atomic_batch_visibility_test.cpp`：`run_overlapped()`（latch 放行写者 + 写到每个读者在写入期间观察满 200 次，上限 10 万批）；三个并发用例共用；撕裂判据改为代数相等（旧判据只查 h0～h9）；子 lambda 里的 `ASSERT` 改 `ADD_FAILURE` | ✅ |
+| S77-3 `oki_compaction_model_test.cpp` `ConcurrentLoader`：等第一次 flush 再 load；做到 ≥ 1000 次且期间 ≥ 3 次归并（120 s 期限，不够则 `GTEST_SKIP`，`unloaded` 照严查） | ✅ |
+| S77-4 顶层 `check` 去掉封顶 8 | ✅ |
+| S77-5 验证：注入下全过；64 份并发 576 次全过；TSan 无报告；`check` 1002 / 1002；`ctest -j 16` 两轮全过 | ✅ Linux；⚠️ Windows `-j 14` 未实测 |
+
+---
+
 ## 🟡 S75 · 扫描 / range 批视图接口（免分配）（2026-11-23 立项）
 
 > 来源：S71-4 ⏸（下游反馈 [`feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md`](feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md) 第 3 条）。

@@ -1059,14 +1059,10 @@ if(BUILD_TESTING)
     if(_bitcask_check_jobs LESS 1)
         set(_bitcask_check_jobs 1)
     endif()
-    # 封顶 8：实测 14 核满载（-j 14）时两个带时序假设的用例会挂
-    # （AtomicBatchVisibilityTest.HeadThenTailNeverShowsHalfBatch、
-    # OkiCompactionModelTest.ConcurrentLoaderNeverFallsBackToUnloaded；单跑各 5 次全过），
-    # -j 8 多轮全绿。这是那两个用例对调度时序的假设偏紧，不是产品问题；要用更多并行
-    # 得先把它们改稳。
-    if(_bitcask_check_jobs GREATER 8)
-        set(_bitcask_check_jobs 8)
-    endif()
+    # 照核数开，不封顶。13.0.0 曾封顶 8：14 核满载（-j 14）时两个用例对调度时序的假设
+    # 偏紧会假红（AtomicBatchVisibilityTest.HeadThenTailNeverShowsHalfBatch、
+    # OkiCompactionModelTest.ConcurrentLoaderNeverFallsBackToUnloaded）；S77 把读写交叠
+    # 改成由同步点 / 条件循环保证后去掉（feedbacks/2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md）。
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -j ${_bitcask_check_jobs}
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}

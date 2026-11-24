@@ -15,6 +15,23 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ---
 
+## [Unreleased]
+
+> 只动测试与构建目标；库代码、C / C++ ABI、盘上格式不变。
+
+### Changed
+
+- `check` 目标照核数并行，去掉 13.0.0 为绕开时序敏感用例（见下面 Fixed）加的封顶 8。
+
+### Fixed
+
+- **两个时序敏感用例满载时假红**（S77，[反馈](feedbacks/2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md)）：
+  `AtomicBatchVisibilityTest.HeadThenTailNeverShowsHalfBatch` 在读线程于写者写完之后才被调度时 `seen == 0`；
+  `OkiCompactionModelTest.ConcurrentLoaderNeverFallsBackToUnloaded` 在写线程被饿住时 1000 次 load 期间一次归并都没有。
+  读写交叠改由同步点与条件循环保证（`std::latch` 放行写者、写到每个读者在写入期间观察满 200 次；load 做到期间有 ≥ 3 次归并，
+  期限内不够则跳过、`unloaded` 照严查）。`TailThenHead` / `RemoveSwitches` 同样改走这套。
+- 半批可见性用例的撕裂判据此前只在值长 2 时比较，700 批里只查了前 9 批；改为两次读到同一个 head 时 tail 的代数必须与之相等。
+
 ## [13.1.0] - 2026-11-24（S76：range 快照语义与取值提速 + OKI 写前探测长尾压平）
 
 > **版本语义**：MINOR **13.1.0**。`CaskRangeIter` 从 per-key 弱一致改为 `ReadView` 快照，是**行为契约变化**；

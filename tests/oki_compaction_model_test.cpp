@@ -595,9 +595,22 @@ TEST_F(OkiCompactionModelTest, BackpressureBoundsRunCount) {
 // S44-5：跨进程 load 重试
 // ---------------------------------------------------------------------------
 
+// 交叠由条件保证，不靠调度运气（feedbacks/2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md：
+// 满载时写线程可能整段被饿住，1000 次 load 在一次归并都没发生时就做完了，
+// `compactions >= 1` 假红；没红时 load 也没撞上 sweep，断言空转）：
+//   - 写者做完第一次 flush 才开始 load；
+//   - load 一直做到「≥ kMinLoads 次，且 load 期间写者提交了 ≥ kMinCompactions
+//     次归并」——归并之后才有 sweep，load 撞 sweep 才是要测的；期限 kDeadline；
+//   - 期限到仍没交叠够（极端饥饿）⇒ 跳过而不判失败；unloaded 照样严格检查。
 TEST_F(OkiCompactionModelTest, ConcurrentLoaderNeverFallsBackToUnloaded) {
+    constexpr int kMinLoads = 1000;
+    constexpr std::uint64_t kMinCompactions = 3;
+    constexpr auto kDeadline = std::chrono::seconds(120);
+
     auto writer = fresh(tiered(/*max_runs=*/4, /*k=*/1.0));
     std::atomic<bool> stop{false};
+    std::atomic<bool> writer_failed{false};
+    std::atomic<std::uint64_t> flushes{0};
     std::thread w([&] {
         std::uint64_t ord = 0;
         while (!stop.load()) {
@@ -606,23 +619,36 @@ TEST_F(OkiCompactionModelTest, ConcurrentLoaderNeverFallsBackToUnloaded) {
                                   RowLoc{1, 10, ord * 16, 1000});
                 ++ord;
             }
-            ASSERT_TRUE(writer->flush(dir_.string()));
+            if (!writer->flush(dir_.string())) {
+                writer_failed.store(true);
+                return;
+            }
+            flushes.fetch_add(1);
         }
     });
+    while (flushes.load() == 0 && !writer_failed.load()) std::this_thread::yield();
+
+    const auto compactions = [&] { return writer->compaction_stats().compactions; };
+    const std::uint64_t base = compactions();
     int loads = 0, unloaded = 0;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
-    while (loads < 1000 && std::chrono::steady_clock::now() < deadline) {
+    const auto deadline = std::chrono::steady_clock::now() + kDeadline;
+    while (!writer_failed.load() && std::chrono::steady_clock::now() < deadline &&
+           (loads < kMinLoads || compactions() - base < kMinCompactions)) {
         OkiState r;  // 另一个「进程」：只读加载同一目录
         r.load(dir_.string());
         ++loads;
         if (!r.loaded()) ++unloaded;
     }
+    const std::uint64_t overlapped = compactions() - base;
     stop.store(true);
     w.join();
     writer->wait_compaction();
-    EXPECT_GE(loads, 200);
-    EXPECT_GE(writer->compaction_stats().compactions, 1u);
+    EXPECT_FALSE(writer_failed.load()) << "写者 flush 失败";
     EXPECT_EQ(unloaded, 0) << "load 撞上 sweep 后应重读 manifest 重试";
+    if (loads < kMinLoads || overlapped < kMinCompactions) {
+        GTEST_SKIP() << "前提没达成（调度饥饿）：" << loads << " 次 load 期间只有 "
+                     << overlapped << " 次归并";
+    }
 }
 
 }  // namespace
