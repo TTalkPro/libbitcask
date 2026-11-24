@@ -1252,33 +1252,6 @@ BITCASK_API int bitcask_range_iter_next_batch_ex(bitcask_range_iter_t* iter,
 
 BITCASK_API void bitcask_range_entry_ex_free(bitcask_range_entry_ex_t* entry);
 
-/* S75-3：range 的免分配批视图（与 bitcask_iter_next_batch_view 同一契约）。
- * key/value/meta **借库内存储**，没有、也不需要 free 函数。 */
-typedef struct {
-    bitcask_slice_t key;
-    bitcask_slice_t value;
-    bitcask_slice_t meta;    /* bitcask_range_iter_start_ex 的 want_meta 非 0 时填，否则空 */
-    uint64_t        tstamp;
-    uint64_t        ord;
-} bitcask_range_entry_view_t;
-
-/* 免分配批量取最多 max_n 条（单条用 max_n = 1）。遍历语义、快照一致性、
- * lo/hi / filter / want_meta / 预取都与 bitcask_range_iter_next_batch_ex 相同
- * （输出序与内容一致），区别只在所有权：稳态零堆分配，调用方不释放任何东西。
- * 与 *_next_ex / *_next_batch_ex 可混用（预取缓冲共用，不丢不乱序）。
- * 返回取到的条数（0 = 迭代结束），<0 = 错误（fault 已填，**整批不可依赖**）。
- * entries 是调用方分配的数组（纯值结构，可栈分配 / 复用）。
- * ⚠ 有效期：entries 里的切片只在本迭代器的下一次推进调用之前有效——
- * bitcask_range_iter_next / _ex / _batch / _batch_ex / _batch_view、
- * bitcask_range_iter_release 都算推进；bitcask_close 不算（之后仍可读完当前批
- * 再 release，但不可再推进——bitcask_close 会释放库对象）。要保留请当下复制。
- *   典型误用：先把一批 key 记进自己的数组，回头再读 value——中间只要调过
- *   一次 next，记下的切片就悬垂了。 */
-BITCASK_API int bitcask_range_iter_next_batch_view(bitcask_range_iter_t* iter,
-                                                   bitcask_range_entry_view_t* entries,
-                                                   size_t max_n,
-                                                   bitcask_fault_t* fault);
-
 // 并行全表扫描回调（S12-5）。对每个 live 文档调用一次；**可能来自多个工作线程并发调用**。
 //   ctx  : bitcask_parallel_scan 透传的用户指针（C 无闭包，用它带状态）
 //   key/value: 零拷贝 view，仅在本次回调内有效（返回后即失效，需保留请自行拷贝）

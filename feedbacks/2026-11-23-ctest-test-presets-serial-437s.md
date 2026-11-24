@@ -50,6 +50,6 @@ Windows 上跑全量测试：先默认串行，再 `-j 8`；耗时取自 `ctest`
   `OkiCompactionModelTest.ConcurrentLoaderNeverFallsBackToUnloaded`（各单跑 5 次全过）。所以 `check` 封顶 8 而不是照核数开；
   这两个用例对调度时序的假设偏紧，已单独立一条：
   [2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md](2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md)。
-  **后续（S77，未发版）**：那两个用例已改稳，`check` 去掉封顶 8、照核数开。
+  **后续（S77，13.1.1 已发版）**：那两个用例已改稳，`check` 去掉封顶 8、照核数开。
 - **没做**：`OkiCompactionModelTest` / `UnorderedApplyTest` 缩规模或替换 `sleep_for`——那是另一件事，并行之后串行成本仍在，
   想删得单独评估这两个套件在测什么时序。

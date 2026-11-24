@@ -17,26 +17,9 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 ## [Unreleased]
 
-> 库代码只多一个入口（S75-3）+ range 迭代器内部缓冲的复用；盘上格式不变。
-> C API 是纯新增。⚠️ C++ 侧 `CaskRangeIter` 的私有成员重排并新增（对象布局变），与 13.0.0 给
-> `CaskIter` 加批视图缓冲同一情形——按该版先例发版时取 MAJOR。**2026-11-24 拍板：暂不发**，留到下次 MAJOR 同车；
-> 在那之前发 MINOR / PATCH，须先把下面 S75-3 的条目挪出 `[Unreleased]`。只动测试与构建目标的是 S77；只动文档的是 S78。
-
-### Added
-
-- **range 免分配批视图**（S75-3，S75 的 range 半边；反馈
-  `feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md` 第 3 条，keelson；
-  设计 `doc/scan-batch-view-design-zh.md`）：C++ `CaskRangeIter::EntryView` / `CaskRangeIter::next_batch_view(max_n)`，
-  C API `bitcask_range_entry_view_t` / `bitcask_range_iter_next_batch_view`。遍历语义、快照一致性、
-  `lo` / `hi` / `prefetch` / `want_meta` / `filter` 都与 owned 版相同（输出序与内容一致），区别只在所有权：
-  key / value / meta **借迭代器内部的存储**，整批稳态零堆分配，没有也不需要 free 函数。
-  有效期到本迭代器的下一次推进调用为止；`bitcask_close` 不算推进，当前批读完再 release 即可，
-  但 close 后不可再推进（`BITCASK_ERR_CLOSED`）。可与 `next()` / `*_next_batch_ex` 混用。
-  - ⚠️ **收益没到 S75 定的门槛**：Linux 实测（20 万 key、200 B 值、页缓存热）比 owned `next()`
-    每行省 11～38 ns——不预取 4%～10%，`prefetch=256` 时 5%～12%；门槛是 10%。
-  - 回归 `RangeBatchViewTest.*`（6 例：惰性 / 自适应预取 / 显式 4 线程 × 批大小 1～1000 对拍、
-    owned·view 混用、跨 close 可读、快照版本被两次 merge 合并后 key 落扁平缓冲、重开、空批）、
-    C `test_range_batch_view`。
+> 暂无。**range 免分配批视图（S75-3）做完但没发**：实测收益 4%～12%，没到 S75 定的 10% 门槛，且让 `CaskRangeIter`
+> 对象布局变（按 13.0.0 先例发出去要 MAJOR）。2026-11-24 拍板暂不发，代码在分支 `s75-3-range-batch-view`（`a286679`），
+> main 上已回退，留到下次 MAJOR 同车。设计稿与实测数字见 [`doc/scan-batch-view-design-zh.md`](doc/scan-batch-view-design-zh.md)（分支上的版本）。
 
 ### Changed
 
@@ -46,10 +29,6 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
   `doc/text-encoding-zh.md` / `doc/architecture-zh.md` / `doc/README.md`；README 只留概览、线程安全摘要、快速开始、
   最短构建与常用文档表。跑测试统一写成 `cmake --build <build> --target check`。`doc/cpp-arch.md` 里重复的
   「构建入口」与产物清单（还写着 `SOVERSION=3`）改为指向 `build-zh.md`；写死的 `SOVERSION=12` / `12.0.1` 去掉。
-- `CaskRangeIter::next()` 开预取时快 6%～12%（`prefetch=256`，同上负载 341～355 → 313～321 ns/行）：
-  预取的 `keys` / `slots` 两个 vector 不再每批新分配，Entry 只搬一次。不预取时与 13.1.0 持平（±4%，噪声内）。
-  预取路径 close 之后推进也立刻报 `kClosed`（此前会先把缓冲里剩的出完）。
-
 ### Fixed
 
 - **两个时序敏感用例满载时假红**（S77，[反馈](feedbacks/2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md)）：

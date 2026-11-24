@@ -99,7 +99,7 @@
 | [`doc/ordered-key-index-design-zh.md`](ordered-key-index-design-zh.md) | 有序 Key 索引（OKI）：WiscKey 式 range 扫描 + keydir 内存天花板路线 |
 | [`docs/design/oki-only-keydir-analysis-zh.md`](../docs/design/oki-only-keydir-analysis-zh.md) | OKI-only keydir 架构改造深度分析 |
 | [`docs/design/oki-run-open-verify.md`](../docs/design/oki-run-open-verify.md) | 决策稿：OKI run 开库校验（惰性 / 分块） |
-| [`doc/scan-batch-view-design-zh.md`](scan-batch-view-design-zh.md) | 扫描 / range 批视图接口（免分配）设计（扫描半边 13.0.0 已发；range 半边未发版） |
+| [`doc/scan-batch-view-design-zh.md`](scan-batch-view-design-zh.md) | 扫描 / range 批视图接口（免分配）设计（扫描半边 13.0.0 已发；range 半边在分支 `s75-3-range-batch-view`，未发版） |
 | [`doc/getresult-view-design-zh.md`](getresult-view-design-zh.md) | `GetResultView` 零拷贝设计 |
 | [`doc/recovery-unified-checkpoint-design-zh.md`](recovery-unified-checkpoint-design-zh.md) | 恢复持久化：分段 ckpt + manifest commit |
 | [`doc/merge-policy-zh.md`](merge-policy-zh.md) | Merge 触发策略（碎片率 / 死字节 / 过期阈值） |

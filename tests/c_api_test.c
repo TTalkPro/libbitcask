@@ -45,7 +45,6 @@ static const char* const kAllTestDirs[] = {
     TDIR("paging"),
     TDIR("iter"),
     TDIR("iterview"),
-    TDIR("rangeview"),
     TDIR("kv"),
     TDIR("levelb"),
     TDIR("metaq"),
@@ -2888,144 +2887,6 @@ static int test_iter_batch_view(void) {
     return fails;
 }
 
-/* S75-3：range 的免分配批视图 bitcask_range_iter_next_batch_view。
- * 与 bitcask_range_iter_next_batch_ex 同一快照逐条对拍（惰性 / 预取各一遍）；
- * 整批不 free 任何东西；取到的一批在 bitcask_close 之后仍可读（之后只 release，
- * 不再推进：bitcask_close 释放了库对象）。 */
-static int test_range_batch_view(void) {
-    bitcask_options_t opts;
-    bitcask_options_init(&opts);
-    opts.read_write = 1;
-
-    bitcask_t* cask = NULL;
-    bitcask_fault_t fault;
-    bitcask_error_t err = bitcask_open(TDIR("rangeview"), &opts, &cask, &fault);
-    if (err != BITCASK_OK) {
-        fprintf(stderr, "FAIL test_range_batch_view: open: %s\n", fault.detail);
-        return 1;
-    }
-    int fails = 0;
-
-    /* 50 个 key，每 5 个删 1 个 → range 只产出 40 条活 key。值长短参差。 */
-    for (int i = 0; i < 50; i++) {
-        char kbuf[16];
-        char vbuf[120];
-        int klen = snprintf(kbuf, sizeof(kbuf), "r%03d", i);
-        int vlen = snprintf(vbuf, sizeof(vbuf), "value-%03d-%s", i,
-                            (i % 2) ? "long-tail-padding-padding-padding" : "s");
-        bitcask_slice_t k = {kbuf, (size_t)klen};
-        bitcask_slice_t v = {vbuf, (size_t)vlen};
-        bitcask_put(cask, k, v, 0, &fault);
-        if (i % 5 == 0) bitcask_delete(cask, k, 0, &fault);
-    }
-
-    /* 对拍：_ex（每条 malloc + free）vs _view（零分配、不 free），惰性与预取。 */
-    for (int pass = 0; pass < 2; pass++) {
-        bitcask_range_options_t ro;
-        bitcask_range_options_init(&ro);
-        ro.prefetch = pass ? 16 : 0;
-        bitcask_range_iter_t* ex_it = NULL;
-        bitcask_range_iter_t* vw_it = NULL;
-        err = bitcask_range_iter_start_ex(cask, &ro, 0, NULL, &ex_it, &fault);
-        if (err == BITCASK_OK) err = bitcask_range_iter_start_ex(cask, &ro, 0, NULL, &vw_it, &fault);
-        if (err != BITCASK_OK) {
-            fprintf(stderr, "FAIL test_range_batch_view: start: %d (%s)\n", err, fault.detail);
-            ++fails;
-        }
-        int n = 0;
-        for (;;) {
-            if (!ex_it || !vw_it) break;
-            bitcask_range_entry_ex_t exb[7];
-            bitcask_range_entry_view_t vwb[7];
-            memset(exb, 0, sizeof(exb));
-            memset(vwb, 0, sizeof(vwb));
-            bitcask_fault_t ex_fault, vw_fault;
-            memset(&ex_fault, 0, sizeof(ex_fault));
-            memset(&vw_fault, 0, sizeof(vw_fault));
-            int ex_got = bitcask_range_iter_next_batch_ex(ex_it, exb, 7, &ex_fault);
-            int vw_got = bitcask_range_iter_next_batch_view(vw_it, vwb, 7, &vw_fault);
-            if (ex_got < 0 || vw_got < 0 || ex_got != vw_got) {
-                fprintf(stderr,
-                        "FAIL test_range_batch_view: next ex=%d vw=%d (ex: %s | vw: %s)\n",
-                        ex_got, vw_got, ex_fault.detail, vw_fault.detail);
-                ++fails;
-                break;
-            }
-            if (ex_got == 0) break;
-            for (int i = 0; i < ex_got; i++) {
-                const bitcask_range_entry_t* a = &exb[i].base;
-                const bitcask_range_entry_view_t* b = &vwb[i];
-                ++n;
-                if (a->key.size != b->key.size ||
-                    memcmp(a->key.data, b->key.data, a->key.size) != 0 ||
-                    a->value.size != b->value.size ||
-                    (a->value.size &&
-                     memcmp(a->value.data, b->value.data, a->value.size) != 0) ||
-                    a->tstamp != b->tstamp || a->ord != b->ord ||
-                    b->meta.data != NULL || b->meta.size != 0) {
-                    fprintf(stderr, "FAIL test_range_batch_view: pass %d entry %d differs\n",
-                            pass, n);
-                    ++fails;
-                }
-                bitcask_range_entry_ex_free(&exb[i]);  /* view 那边没有东西要 free */
-            }
-        }
-        if (n != 40) {
-            fprintf(stderr, "FAIL test_range_batch_view: pass %d n=%d\n", pass, n);
-            ++fails;
-        }
-        bitcask_range_iter_release(ex_it);
-        bitcask_range_iter_release(vw_it);
-    }
-
-    /* 非法参数：NULL 迭代器 / NULL 数组 / max_n == 0 → -1。 */
-    {
-        bitcask_range_iter_t* it = NULL;
-        bitcask_range_entry_view_t e;
-        err = bitcask_range_iter_start_ex(cask, NULL, 0, NULL, &it, &fault);
-        if (err != BITCASK_OK) {
-            fprintf(stderr, "FAIL test_range_batch_view: start(NULL opts): %d (%s)\n", err,
-                    fault.detail);
-            ++fails;
-        } else if (bitcask_range_iter_next_batch_view(NULL, &e, 1, &fault) != -1 ||
-                   bitcask_range_iter_next_batch_view(it, NULL, 1, &fault) != -1 ||
-                   bitcask_range_iter_next_batch_view(it, &e, 0, &fault) != -1) {
-            fprintf(stderr, "FAIL test_range_batch_view: bad args not rejected\n");
-            ++fails;
-        }
-        bitcask_range_iter_release(it);
-    }
-
-    /* 取到一批后 close：切片仍可读（映射被钉住 / 记录留在迭代器里）。r000 已删，首条是 r001。 */
-    {
-        bitcask_range_iter_t* it = NULL;
-        bitcask_range_entry_view_t b[4];
-        memset(b, 0, sizeof(b));
-        err = bitcask_range_iter_start_ex(cask, NULL, 0, NULL, &it, &fault);
-        memset(&fault, 0, sizeof(fault));
-        int got = (err == BITCASK_OK) ? bitcask_range_iter_next_batch_view(it, b, 4, &fault) : -2;
-        bitcask_close(cask);
-        if (got != 4) {
-            fprintf(stderr, "FAIL test_range_batch_view: preclose got=%d (%s)\n", got,
-                    err == BITCASK_OK ? fault.detail : "start failed");
-            ++fails;
-        } else {
-            static const char* const want[4] = {"r001", "r002", "r003", "r004"};
-            for (int i = 0; i < got; i++) {
-                if (b[i].key.size != 4 || memcmp(b[i].key.data, want[i], 4) != 0 ||
-                    b[i].value.size == 0 || memcmp(b[i].value.data, "value-", 6) != 0) {
-                    fprintf(stderr, "FAIL test_range_batch_view: entry %d lost after close\n", i);
-                    ++fails;
-                }
-            }
-        }
-        bitcask_range_iter_release(it);
-    }
-
-    if (fails == 0) printf("PASS test_range_batch_view\n");
-    return fails;
-}
-
 int main(void) {
     // 各用例使用固定 /tmp 路径且原先不清理——跨运行/跨二进制版本累积的
     // checkpoint 残留会污染 reopen（尤以向量批量用例敏感，陈旧 vec.ckpt →
@@ -3039,7 +2900,6 @@ int main(void) {
     failures += test_status_and_merge();
     failures += test_iteration();
     failures += test_iter_batch_view();
-    failures += test_range_batch_view();
     failures += test_range_iter();
     failures += test_flush_after_iter();
     failures += test_search_text_batch();
