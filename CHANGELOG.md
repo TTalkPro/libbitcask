@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`13.1.0`**；库 `SOVERSION` = **`13`**（= major）；
+`bitcask_version_*` = **`13.1.1`**；库 `SOVERSION` = **`13`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -20,6 +20,11 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 > 暂无。**range 免分配批视图（S75-3）做完但没发**：实测收益 4%～12%，没到 S75 定的 10% 门槛，且让 `CaskRangeIter`
 > 对象布局变（按 13.0.0 先例发出去要 MAJOR）。2026-11-24 拍板暂不发，代码在分支 `s75-3-range-batch-view`（`a286679`），
 > main 上已回退，留到下次 MAJOR 同车。设计稿与实测数字见 [`doc/scan-batch-view-design-zh.md`](doc/scan-batch-view-design-zh.md)（分支上的版本）。
+
+## [13.1.1] - 2026-11-24（S77：两个时序敏感用例改稳；S78：README 拆分）
+
+> **版本语义**：PATCH **13.1.1**。只动测试、`check` 构建目标与文档；**库代码、C / C++ ABI、盘上格式与 13.1.0 完全相同**，
+> `SOVERSION` 仍为 `13`。
 
 ### Changed
 
@@ -37,6 +42,15 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
   读写交叠改由同步点与条件循环保证（`std::latch` 放行写者、写到每个读者在写入期间观察满 200 次；load 做到期间有 ≥ 3 次归并，
   期限内不够则跳过、`unloaded` 照严查）。`TailThenHead` / `RemoveSwitches` 同样改走这套。
 - 半批可见性用例的撕裂判据此前只在值长 2 时比较，700 批里只查了前 9 批；改为两次读到同一个 head 时 tail 的代数必须与之相等。
+
+### 验证
+
+库源码与 `v13.1.0` 逐字节相同（`git diff v13.1.0 v13.1.1 -- src include c_api tools cmake` 为空）；
+测试和文档之外只有 `CMakeLists.txt` 不同（`check` 目标与版本号）。
+Linux GCC 14.2 Release `-Werror` 构建通过，产物 `libbitcask.so.13.1.1`（SONAME `libbitcask.so.13`），
+`bitcask_version_string()` = `"13.1.1"`；导出表里没有 `bitcask_range_iter_next_batch_view`，`bitcask_iter_next_batch_view` 照旧。
+`check` 1002 / 1002 全过（照核数并行；2 项 RSS 探针预存 Disabled），`check-path-encoding` OK。
+未在本轮跑 Sanitizer 与 Windows。
 
 ## [13.1.0] - 2026-11-24（S76：range 快照语义与取值提速 + OKI 写前探测长尾压平）
 
