@@ -1496,6 +1496,8 @@ if (bitcask_range_iter_start(cask, &ro, &it, &fault) == BITCASK_OK) {
 
 ### 11.7b `bitcask_range_iter_next_batch_view`（S75-3，免分配批视图）
 
+> **未发版**（暂不发，留到下次 MAJOR）：只在 `main` 上有，已发布的库里没有这个符号。
+
 ```c
 typedef struct {
     bitcask_slice_t key;

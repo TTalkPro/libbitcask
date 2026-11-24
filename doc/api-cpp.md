@@ -1174,6 +1174,7 @@ public:
 - **`want_meta` / `filter`（下游反馈 2026-10-06）**：语义同 `CaskIter::set_want_meta` / `set_filter`。合用即「只按 meta 筛选的有序扫描」——filter 在 C++ 侧逐条求值（取值走零拷贝 `get` 视图，不通过的不拷 value），惰性与预取路径一致。
 
 - **`next_batch_view`（S75-3，免分配批视图）**：语义同 `next()`（同一快照、同一 `lo` / `hi` / `prefetch` / `want_meta` / `filter`，输出序与内容一致），`EntryView` 的字段与 `Entry` 一一对应；区别只在所有权：`key` / `value` / `meta` 是 **span，借迭代器内部的存储**，整批稳态零堆分配（映射命中时 key / value 直达文件映射；`pread` 兜底与退回 `get` 的记录留在迭代器里）。预取并发与自适应串行照旧。
+  - ⚠️ **未发版**（暂不发，留到下次 MAJOR）：只在 `main` 上有，已发布的库里没有这个入口。
   - **要保留就当下复制**。返回的 span 及其中各字段的 span 只在**本迭代器的下一次推进调用之前**有效（`next` / `next_batch_view` / 析构都算推进）；`Cask::close()` 不算——已取到的这一批在 close 之后仍可读，但 close 之后再推进返回 `kClosed`。
   - 返回：空 span = 迭代结束；unexpected = 故障，**整批不可依赖**；`max_n == 0` 返回空 span 且不推进。可与 `next()` 混用（预取缓冲共用，不丢不乱序）。线程安全：否（同 `next`）。
   - 实测（Linux、20 万 key、200 B 值、页缓存热、2026-11-24）：比 owned `next()` 每行省 11～38 ns——不预取 4～10%（单条 / 64 / 1024 一批），`prefetch=256` 时 5～12%。**没到 S75 给 range 半边定的 10% 门槛**：range 每行的成本主要在定位与解码，不在分配。只在「扫完即用、不保留」的路径上用它；要保留 entry 的调用方继续用 `next()`。

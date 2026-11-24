@@ -19,7 +19,8 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 
 > 库代码只多一个入口（S75-3）+ range 迭代器内部缓冲的复用；盘上格式不变。
 > C API 是纯新增。⚠️ C++ 侧 `CaskRangeIter` 的私有成员重排并新增（对象布局变），与 13.0.0 给
-> `CaskIter` 加批视图缓冲同一情形——按该版先例发版时取 MAJOR；**版本未定**。只动测试与构建目标的是 S77。
+> `CaskIter` 加批视图缓冲同一情形——按该版先例发版时取 MAJOR。**2026-11-24 拍板：暂不发**，留到下次 MAJOR 同车；
+> 在那之前发 MINOR / PATCH，须先把下面 S75-3 的条目挪出 `[Unreleased]`。只动测试与构建目标的是 S77；只动文档的是 S78。
 
 ### Added
 
@@ -40,6 +41,11 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 ### Changed
 
 - `check` 目标照核数并行，去掉 13.0.0 为绕开时序敏感用例（见下面 Fixed）加的封顶 8。
+- **README 拆分**（S78；补 `feedbacks/2026-11-23-ctest-test-presets-serial-437s.md` 里「README 的跑法没改」那条尾巴）：
+  功能表、构建、文本编码、架构总览、文档索引分别移到 `doc/features-zh.md` / `doc/build-zh.md` /
+  `doc/text-encoding-zh.md` / `doc/architecture-zh.md` / `doc/README.md`；README 只留概览、线程安全摘要、快速开始、
+  最短构建与常用文档表。跑测试统一写成 `cmake --build <build> --target check`。`doc/cpp-arch.md` 里重复的
+  「构建入口」与产物清单（还写着 `SOVERSION=3`）改为指向 `build-zh.md`；写死的 `SOVERSION=12` / `12.0.1` 去掉。
 - `CaskRangeIter::next()` 开预取时快 6%～12%（`prefetch=256`，同上负载 341～355 → 313～321 ns/行）：
   预取的 `keys` / `slots` 两个 vector 不再每批新分配，Entry 只搬一次。不预取时与 13.1.0 持平（±4%，噪声内）。
   预取路径 close 之后推进也立刻报 `kClosed`（此前会先把缓冲里剩的出完）。

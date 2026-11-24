@@ -10,6 +10,20 @@
 
 ---
 
+## 🟢 S78 · README 拆分；range 批视图暂不发（2026-11-24）
+
+> 来源：`feedbacks/2026-11-23-ctest-test-presets-serial-437s.md` 里「README 的跑法没改成 `check`」那条尾巴，
+> 加 S75-9 的发版口径。只动文档，不碰代码。
+
+| 项 | 状态 |
+|---|---|
+| S78-1 拆分（内容原样搬，按行号切）：功能表 → `doc/features-zh.md`；依赖 / Windows / ICU 来源 / CMake 选项 / 产物 → `doc/build-zh.md`；文本编码与 Unicode 版本绑定 → `doc/text-encoding-zh.md`；架构图 + 关键设计点 + 目录结构 → `doc/architecture-zh.md`；文档索引 → `doc/README.md`。README 614 → 174 行，留概览、能做什么、线程安全摘要（别的文档把它当契约来源引用，不挪）、快速开始、最短构建、常用文档表 | ✅ |
+| S78-2 索引补全：`doc/README.md` 此前漏了 19 份（`designs/` 全部、`docs/design/` 里 S40 以后的、`ordered-key-index` / `scan-batch-view` / `windows-port` 三份设计稿），现已全列 | ✅ |
+| S78-3 去重与过期事实：`doc/cpp-arch.md` 的「构建入口」与产物清单（还写着 `SOVERSION=3`、只有 `migrate_le`）改成指向 `build-zh.md`；跑测试统一写 `cmake --build <build> --target check`；写死的 `SOVERSION=12` / `12.0.1` 去掉，「50 个测试二进制」更正为 77；CMake 选项表补 `BITCASK_ICU_PROVIDER` / `BITCASK_ICU_TRIM_DATA` / `BITCASK_BUNDLED_ZLIB` / `BITCASK_BUNDLED_TBB` | ✅ |
+| S78-4 S75-9 拍板：range 批视图暂不发，留到下次 MAJOR 同车；代码留在 main，CHANGELOG / 设计稿 / 两份 API 文档标「未发版」 | ✅ |
+
+---
+
 ## 🟢 S77 · 两个时序敏感用例改稳；`check` 照核数并行（2026-11-24 立项）
 
 > 来源：[`feedbacks/2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md`](feedbacks/2026-11-23-two-timing-sensitive-tests-fail-under-full-load.md)（Windows 14 核 `-j 14` 偶发假红）。
@@ -29,7 +43,7 @@
 
 > 来源：S71-4 ⏸（下游反馈 [`feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md`](feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md) 第 3 条）。
 > 2026-11-23 下游拍板：视图归库所有（借用，需保留外部复制）、新入口不动老 ABI、扫描与 range 都做。
-> 设计稿：[`doc/scan-batch-view-design-zh.md`](doc/scan-batch-view-design-zh.md)（已定稿；扫描半边随 13.0.0 发版；range 半边 2026-11-24 做完、未发版，**实测没到门槛**，发不发待拍板——见 S75-3 / S75-8）。
+> 设计稿：[`doc/scan-batch-view-design-zh.md`](doc/scan-batch-view-design-zh.md)（已定稿；扫描半边随 13.0.0 发版；range 半边 2026-11-24 做完，**实测没到门槛**，同日拍板**暂不发**、留到下次 MAJOR 同车——见 S75-3 / S75-8 / S75-9）。
 
 | 项 | 状态 |
 |---|---|
@@ -46,7 +60,7 @@
 | S75-6r 文档：api-c §11.7b 与所有权表 / 陷阱 / 线程安全表、api-cpp §6、设计稿 §2.2 / §4 与落地记录、头注释、反馈收口 | ✅ 2026-11-24 |
 | S75-7 顺带修复构建环境：`build-msvc-release` / `-debug` 的 Ninja 头文件依赖跟踪失效（CMake 记的 `msvc_deps_prefix` 是中文「注意: 包含文件:」，cl.exe 实际输出英文 → `ninja -t deps` 显示 `#deps 0`，改头文件不触发重编，旧布局的 .obj 被链进新代码）。`Enter-MsvcEnv.ps1` 固定 `VSLANG=1033`，两个目录重新做编译器探测并全量重编 | ✅ |
 | S75-8 顺带：预取的 `keys` / `slots` 不再每批新分配（`prefetch=256` 的 owned `next()` 快 6%～12%）；首版每行构造 `Fetched` 让不预取的 `next()` 慢了 9%～10%，改为成员 `cur_` 逐行复用后回到持平（±4%） | ✅ |
-| S75-9 发版口径：`CaskRangeIter` 私有成员重排 + 新增，对象布局变——与 13.0.0 给 `CaskIter` 加缓冲同一情形，按先例发版取 MAJOR；C API 纯新增、盘上格式不变。**不发的代价**：只回退 S75-3 / 4r / 5r / 6r，扫描半边与 S75-8 不受影响 | ⏸ 待拍板（发 MAJOR / 留到下次 MAJOR 同车 / 回退） |
+| S75-9 发版口径：`CaskRangeIter` 私有成员重排 + 新增，对象布局变——与 13.0.0 给 `CaskIter` 加缓冲同一情形，按先例发版取 MAJOR；C API 纯新增、盘上格式不变。**不发的代价**：只回退 S75-3 / 4r / 5r / 6r，扫描半边与 S75-8 不受影响 | ✅ 2026-11-24 拍板**暂不发**：代码留在 main（`0ce2cbe`，CHANGELOG `[Unreleased]` 有标注），留到下次 MAJOR 同车。⚠️ 在那之前若要发 MINOR / PATCH，须先把 S75-3 / 4r / 5r / 6r / 8 挪到分支或回退——`CaskRangeIter` 布局变，不能随非 MAJOR 出去 |
 
 > S75 验证（Windows，2026-11-23，均在修好依赖跟踪、干净重编之后）：Release ctest 994/994；Debug ctest 994/994；
 > ASan 迭代器相关 30 例（IterBatchView / CApi / FlushAfterIter / CrashRecovery 迭代器 / V61BatchFold / Scanner / PrefixScan）

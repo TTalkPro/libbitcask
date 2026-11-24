@@ -478,45 +478,7 @@ reducer 串行，读可与之并发。
 
 ## 构建入口
 
-```bash
-# Release 构建（含 LTO / -falign-functions=64）
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-
-# 测试 + 基准
-cmake -S . -B build -DBUILD_TESTING=ON -DBITCASK_BUILD_BENCHMARKS=ON
-cmake --build build -j
-ctest --test-dir build --output-on-failure
-
-# Sanitizers（一次设置一种；ASan 和 TSan 互斥）
-cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug \
-    -DBITCASK_SANITIZE=address,undefined -DBUILD_TESTING=ON
-cmake --build build/asan -j
-
-# TSan 构建改用 third_party/oneTBB 源码编译插桩版（系统 libtbb 未插桩会漏报/误报）
-cmake -S . -B build/tsan -DCMAKE_BUILD_TYPE=Debug \
-    -DBITCASK_SANITIZE=thread -DBUILD_TESTING=ON
-cmake --build build/tsan -j
-
-# -Werror 库构建（first-party 护栏，CI `werror-lib` job 开启）
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-    -DBITCASK_WERROR=ON -DBUILD_TESTING=OFF
-cmake --build build -j --target bitcask_static bitcask_shared
-
-# 仅构建大小端迁移工具
-cmake -S . -B build -DBUILD_TESTING=ON
-cmake --build build -j --target migrate_le
-
-# 安装
-cmake --install build        # 头文件、libbitcask.{so,a}、bitcask_c.h
-```
-
-产物：
-
-- `libbitcask.so` — 共享库，导出 C API（`SOVERSION=3`，版本由 `project(VERSION ...)` 派生）
-- `libbitcask.a` — 把全部静态归档合并为单一 `.a`
-- `migrate_le` — 旧大端目录 → 小端目录的离线迁移工具（详见 [`migrate-le.md`](migrate-le.md)）
-- `gen_inert_table` — NFKC 惰性区间表代码生成器（构建期自动执行）
+构建命令、sanitizer、`-Werror`、CMake 选项与产物清单统一维护在 [`build-zh.md`](build-zh.md)，此处不再重复。
 
 ## 添加新的 C++ 特性
 

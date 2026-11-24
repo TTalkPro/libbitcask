@@ -43,7 +43,8 @@ Windows 上跑全量测试：先默认串行，再 `-j 8`；耗时取自 `ctest`
 - `test-base` 加不了 `jobs`：`CMakePresets.json` 是 version 3，`execution.jobs` 要 preset version 6（CMake ≥ 3.29），
   而本项目要求 CMake 3.20——升 preset 版本等于抬高所有使用者的 CMake 下限，为这一项不值得。
 - 改为顶层 CMake 目标 `check`：`cmake --build <build-dir> --target check` = `ctest --output-on-failure -j <ProcessorCount>`
-  封顶 8（`BUILD_TESTING=ON` 时才有）。`ctest --preset msvc-release` 仍是串行，README 里的跑法需要跟着改成本目标（没改文档）。
+  封顶 8（`BUILD_TESTING=ON` 时才有）。`ctest --preset msvc-release` 仍是串行。README 里的跑法 2026-11-24 已改成
+  `--target check`（README 拆分时一并改，细节在 `doc/build-zh.md`）。
 - 实测（同一份 `build-msvc-release`）：串行 437 s；`-j 8` 91 s / 40 s / 54 s 三轮全绿；`--target check` 973 个条目约 40～55 s。
 - **顺带撞出来的**：14 核满载（`-j 14`）有两个带时序假设的用例会挂——`AtomicBatchVisibilityTest.HeadThenTailNeverShowsHalfBatch`、
   `OkiCompactionModelTest.ConcurrentLoaderNeverFallsBackToUnloaded`（各单跑 5 次全过）。所以 `check` 封顶 8 而不是照核数开；
