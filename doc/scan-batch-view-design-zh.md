@@ -114,15 +114,41 @@ struct EntryView {
 
 内部状态与扫描侧同构，差异：
 
-- **holder 是 `GetResultView`**（move-only）：`buf_view_` 为
-  `struct { GetResultView view; size_t key_off, key_len; }` 的 vector，
-  预取路径沿用 `fill_prefetch` 的「归并 N 个 key → 并发 get → 按 key 序
-  压实」，只是压实对象从 owned Entry 换成 view 结构。预取并发取值
-  （JoiningPool）与自适应串行（S71-3）全部保留——冷缓存下预取仍是
-  视图版的主要价值场景。
-- key 来自归并行的 string，必须落 `view_key_buf_`（一次小 memcpy，摊还零分配）；
+- **holder 是 `Fetched`**（`cask.hpp`，S76 之后取值不再经 `get`）：三个 span +
+  三种担保之一——`file_holder`（封口文件映射的 `shared_ptr<DataFile>`）/
+  `owned`（`pread` 兜底的 `ReadRecord`）/ `got`（退回 public `get` 时的
+  `GetResultView`，包 `unique_ptr` 以便移动赋值）。`next()` 在 `Fetched` 上物化
+  `Entry`，`next_batch_view()` 把它整个搬进当批存储，两条路共用一份取值判定
+  （`fetch_row`：TTL / filter / 已被 merge 取代时退回 `get`）。
+- 预取路径沿用 `fill_prefetch` 的「归并 N 个 key → 并发取值 → 按 key 序压实」，
+  只是压实对象从 owned `Entry` 换成 `Fetched`；三个缓冲都是迭代器成员、容量跨批
+  复用（此前每批新分配 `keys` / `slots` 两个 vector）。预取并发取值（JoiningPool）
+  与自适应串行（S71-3）全部保留。
+- key 的来源分两种：读到记录的行**借记录里的 key**（`read_located` 已做过
+  key/ord 自证，不必拷）；退回 `get` 的行（v1 run / 快照版本被 merge 合并掉）
+  记录里没有 key 可借，key 借归并行的 string，当下拷进 `view_key_buf_`。
   回填规则同 §2.1（批内只记偏移，批末统一回填 span）。
-- filter 不通过的 view 要**当场销毁**，不能留到下一批（否则白持一份记录）。
+- filter 不通过的 `Fetched` 当场销毁，不留到下一批（否则白持一份记录）。
+
+**落地记录（2026-11-24，Linux，g++ 14 `-O3`，20 万 key / 200 B 值 / 页缓存热，
+6 轮取最小值，ns/行）**：
+
+| 场景 | owned `next()`（13.1.0） | owned `next()`（现在） | `next_batch_view` | 视图省 |
+|---|---|---|---|---|
+| 刚写完，不预取，单条 / 64 一批 | 282 / 272 | 290 / 280 | 261 / 256 | 29 / 24 ns（10% / 9%） |
+| 重开，不预取，单条 / 64 一批 | 285 / 276 | 283 / 286 | 266 / 267 | 17 / 19 ns（6% / 7%） |
+| 不预取，1024 一批（两场景） | 275～280 | 285～286 | 266～274 | 11～20 ns（4%～7%） |
+| `prefetch=256`，64 / 1024 一批 | 341～355 | 313～321 | 283～298 | 15～30 ns（5%～10%） |
+
+- §9 的门槛是「扫描半边 Linux 实测 ≥ 10% 再做 range」。仓库里没有扫描半边的实测记录，
+  range 半边是做完后补量的：视图版对 owned 版省 11～38 ns/行（4%～12%），不预取时
+  **没到 10%**。做完的理由只剩「下游 11-23 拍板两个都做」与「代码已过全量回归」，不是数字。
+  要不要随下一个版本发，由发版时拍板；不发的话只回退 S75-3 这一半，扫描半边不受影响。
+- 顺带的 owned `next()` 变化：不预取时与 13.1.0 持平（±4%，在噪声内）；
+  `prefetch=256` 时快 6%～12%（每批不再新分配 `keys` / `slots`，Entry 只搬一次）。
+- `Fetched` 逐行复用（`cur_`）而不是每行构造：首版每行构造 / 析构一次，
+  不预取的 owned `next()` 慢了 9%～10%（274 → 300），视图版的「收益」有一大半
+  只是把这点找回来。
 
 ---
 
@@ -183,8 +209,9 @@ BITCASK_API int bitcask_range_iter_next_batch_view(bitcask_range_iter_t* iter,
 | 迭代器析构 / `release` | 失效 |
 
 「`close()` 仍有效」只针对**已取到的那一批**。`close()` 之后继续推进：扫描侧
-照常（pin 表里的封口文件仍在，现有契约）；range 侧会失败——推进要走
-`cask_->get()`，close 后新发起的调用返回 `kClosed`（现有行为，不是本设计引入）。
+照常（pin 表里的封口文件仍在，现有契约）；range 侧返回 `kClosed`——
+`next_fetched` 入口即查（S75-3 起；此前只有惰性路径在 `fetch_row` 里查，
+预取路径会先把缓冲里剩的出完才报）。
 
 一句话契约（写进头注释）：**「借库内存储，下一次推进即失效；要保留，
 当下复制。」** 与 `bitcask_parallel_scan` 回调「仅本次回调内有效」的既有

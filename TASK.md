@@ -29,7 +29,7 @@
 
 > 来源：S71-4 ⏸（下游反馈 [`feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md`](feedbacks/2026-11-23-keydir-scan-preads-each-value-and-range-prefetch-slower.md) 第 3 条）。
 > 2026-11-23 下游拍板：视图归库所有（借用，需保留外部复制）、新入口不动老 ABI、扫描与 range 都做。
-> 设计稿：[`doc/scan-batch-view-design-zh.md`](doc/scan-batch-view-design-zh.md)（已定稿；扫描半边随 13.0.0 发版，range 半边待 Linux 实测门槛）。
+> 设计稿：[`doc/scan-batch-view-design-zh.md`](doc/scan-batch-view-design-zh.md)（已定稿；扫描半边随 13.0.0 发版；range 半边 2026-11-24 做完、未发版，**实测没到门槛**，发不发待拍板——见 S75-3 / S75-8）。
 
 | 项 | 状态 |
 |---|---|
@@ -37,18 +37,24 @@
 | S75-1b 评审：前提逐条核实通过（映射不撤换 / LRU 逐出不悬垂 / move 不搬堆缓冲）；收益重估——理论上限约 15%，JVM 绑定端到端估计个位数；改为分两步：扫描先行，Linux 实测 ≥ 10% 再做 range | ✅ |
 | S75-2 `CaskIter::next_batch_view`（key 扁平缓冲 + holder 担保 + EntryView 数组，稳态零分配）；`next()` 改为其拷贝包装，同一份 `next_row` | ✅ 扫描 |
 | S75-2a 顺带修复：全表迭代器 `see_tombstones=true` 从不交出墓碑——`next_merged_key` 没把开关透传给归并层（`include_tombs` 恒 false），墓碑在归并层就被抵消。改为透传；`drain_live_keys` 补「只收活 key」防御 | ✅ |
-| S75-3 `CaskRangeIter::next_batch_view`（GetResultView 为 holder；预取并发 / 自适应串行保留） | ⏸ 待 Linux 实测扫描半边 ≥ 10% 再做 |
+| S75-3 `CaskRangeIter::next_batch_view`（holder 实为 `Fetched`：映射 `shared_ptr` / `pread` 记录 / 退回 `get` 的 `GetResultView` 三选一；`next()` 与视图版共用 `fetch_row` 一份判定；预取并发 / 自适应串行保留） | ✅ 2026-11-24，未发版。⚠️ 实测没到门槛：比 owned `next()` 每行省 11～38 ns，不预取 4%～10%、`prefetch=256` 时 5%～12%（门槛 10%）。仓库里没有扫描半边的实测记录，range 这半边是做完后补量的 |
 | S75-4 C API `bitcask_iter_next_batch_view`（`*_view` 命名先例，批接口，无 free 函数） | ✅ |
-| S75-4r C API `bitcask_range_iter_next_batch_view` | ⏸ 随 S75-3 |
+| S75-4r C API `bitcask_range_iter_next_batch_view` + `bitcask_range_entry_view_t` | ✅ 2026-11-24，未发版 |
 | S75-5 测试：`iter_batch_view_test.cpp`（7 例：批内 key 缓冲增长 / 跨批大小对拍 / meta·filter·prefix 对拍 / 跨 close 可读 / owned·view 混用 / 重开 / 空库·未 start·max_n=0）+ `c_api_test.c::test_iter_batch_view`（`_ex` vs `_view` 对拍、非法参数、close 后可读） | ✅ 扫描 |
-| S75-5r 测试：预取 view 版 | ⏸ 随 S75-3 |
+| S75-5r 测试：`range_batch_view_test.cpp`（6 例：惰性 / 自适应预取 / 显式 4 线程 × 批大小 1～1000 与 owned 对拍、owned·view 混用、跨 close 可读且 close 后推进 `kClosed`、快照版本被两次 merge 合并后 key 落扁平缓冲且批内多次增长、重开、空批 / `max_n = 0`）+ `c_api_test.c::test_range_batch_view` | ✅ 2026-11-24 |
 | S75-6 文档（api-c §11.3a 与所有权表 / api-cpp §6 / 头注释）与反馈「回没回」收口 | ✅ 扫描 |
+| S75-6r 文档：api-c §11.7b 与所有权表 / 陷阱 / 线程安全表、api-cpp §6、设计稿 §2.2 / §4 与落地记录、头注释、反馈收口 | ✅ 2026-11-24 |
 | S75-7 顺带修复构建环境：`build-msvc-release` / `-debug` 的 Ninja 头文件依赖跟踪失效（CMake 记的 `msvc_deps_prefix` 是中文「注意: 包含文件:」，cl.exe 实际输出英文 → `ninja -t deps` 显示 `#deps 0`，改头文件不触发重编，旧布局的 .obj 被链进新代码）。`Enter-MsvcEnv.ps1` 固定 `VSLANG=1033`，两个目录重新做编译器探测并全量重编 | ✅ |
+| S75-8 顺带：预取的 `keys` / `slots` 不再每批新分配（`prefetch=256` 的 owned `next()` 快 6%～12%）；首版每行构造 `Fetched` 让不预取的 `next()` 慢了 9%～10%，改为成员 `cur_` 逐行复用后回到持平（±4%） | ✅ |
+| S75-9 发版口径：`CaskRangeIter` 私有成员重排 + 新增，对象布局变——与 13.0.0 给 `CaskIter` 加缓冲同一情形，按先例发版取 MAJOR；C API 纯新增、盘上格式不变。**不发的代价**：只回退 S75-3 / 4r / 5r / 6r，扫描半边与 S75-8 不受影响 | ⏸ 待拍板（发 MAJOR / 留到下次 MAJOR 同车 / 回退） |
 
 > S75 验证（Windows，2026-11-23，均在修好依赖跟踪、干净重编之后）：Release ctest 994/994；Debug ctest 994/994；
 > ASan 迭代器相关 30 例（IterBatchView / CApi / FlushAfterIter / CrashRecovery 迭代器 / V61BatchFold / Scanner / PrefixScan）
 > 全过、无 AddressSanitizer 报告；`/WX` 库构建通过；`check-path-encoding` OK。
 > 未在本机验证：Linux 构建与测试、Linux 上映射零拷贝路径的 ASan、扫描半边的实测收益（range 半边的门槛）。
+> S75-3 验证（Linux，2026-11-24，g++ 14 / clang）：Release `/WX` 全量 + `check` 1008 / 1008；ASan+UBSan（Debug）全量 1008 / 1008、无报告；
+> TSan `RangeBatchViewTest` ×30 + `IterBatchView` + C API 无报告；A/B 用同一负载交替 6 轮取最小值（数字见 S75-3 / 设计稿落地记录）。
+> ⚠️ Windows 未实测（刚写完的库全走 `pread` 兜底 + `owned` 担保，映射路径只有 Linux 覆盖）。
 
 ---
 

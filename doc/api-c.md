@@ -1494,6 +1494,46 @@ if (bitcask_range_iter_start(cask, &ro, &it, &fault) == BITCASK_OK) {
 }
 ```
 
+### 11.7b `bitcask_range_iter_next_batch_view`（S75-3，免分配批视图）
+
+```c
+typedef struct {
+    bitcask_slice_t key;
+    bitcask_slice_t value;
+    bitcask_slice_t meta;    /* bitcask_range_iter_start_ex 的 want_meta 非 0 时填，否则空 */
+    uint64_t        tstamp;
+    uint64_t        ord;
+} bitcask_range_entry_view_t;
+
+BITCASK_API int bitcask_range_iter_next_batch_view(bitcask_range_iter_t* iter,
+                                                   bitcask_range_entry_view_t* entries,
+                                                   size_t max_n,
+                                                   bitcask_fault_t* fault);
+```
+
+与 §11.3a **同一契约**，只是对象换成 range。取最多 `max_n` 条；遍历语义、快照一致性、`lo` / `hi` / `prefetch` / `filter` / `want_meta` 都与 `bitcask_range_iter_next_ex` / `_next_batch_ex` 相同（输出序与内容一致），区别只在所有权：**整批稳态零堆分配，调用方不释放任何东西**。`entries` 是调用方分配的数组（纯值结构，可栈分配 / 复用）。
+
+- 返回取到的条数（`0` = 迭代结束），`< 0` = 错误（`fault` 已填，**整批不可依赖**）。`iter` / `entries` 为 NULL 或 `max_n == 0` 返回 `-1`（`max_n == 0` 不推进）。
+- ⚠ **有效期**：同 §11.3a——切片只在本迭代器的**下一次推进调用之前**有效（`bitcask_range_iter_next` / `_ex` / `_batch` / `_batch_ex` / `_batch_view`、`bitcask_range_iter_release` 都算推进）；`bitcask_close` **不算**：已取到的这一批在 close 之后仍可读（映射被迭代器钉住 / 记录留在迭代器里），读完再 `bitcask_range_iter_release`；close 之后**不可再推进**（`BITCASK_ERR_CLOSED`）。这是 §11.7「迭代器须在 `bitcask_close` 之前 release」的唯一例外，且只对视图版成立。
+- 可与 `*_next` / `_ex` / `_batch` / `_batch_ex` 混用（预取缓冲共用，不丢不乱序）。
+- 空 key / value / meta 的切片是 `{NULL, 0}`。
+- **收益比扫描半边小**（range 每行的成本主要在定位与解码，不在分配；实测数字见 [`api-cpp.md`](api-cpp.md) §6 的 `next_batch_view` 条）。
+
+```c
+bitcask_range_entry_view_t batch[256];
+bitcask_range_iter_t* it = NULL;
+if (bitcask_range_iter_start(cask, &ro, &it, &fault) == BITCASK_OK) {
+    int n;
+    while ((n = bitcask_range_iter_next_batch_view(it, batch, 256, &fault)) > 0) {
+        for (int i = 0; i < n; ++i) {
+            /* batch[i].key / value 只在本轮内有效；要跨轮保留请当下 memcpy */
+        }
+    }
+    /* n == 0：结束；n < 0：fault 已填，本批不可依赖 */
+    bitcask_range_iter_release(it);
+}
+```
+
 ### 11.8 迭代时交出 meta / 按 meta 筛选（下游反馈 2026-10-06）
 
 ```c
@@ -2041,6 +2081,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 | `bitcask_range_iter_start` → `bitcask_range_iter_t*` | `bitcask_range_iter_release` | `delete` 句柄包装 | 可早于迭代结束调用；须在 `bitcask_close` 之前 |
 | `bitcask_range_iter_next` / `_next_batch` → 每条 `bitcask_range_entry_t` 内的 key/value | `bitcask_range_entry_free` | `free(key.data)` / `free(value.data)` 并清零 | **逐条调用**；错误路径同 `bitcask_iter_next_batch`（实现已释放，不可再 free）|
 | `bitcask_iter_next_batch_view` → 每条 `bitcask_iter_entry_view_t` 内的 key/value/meta | **无**（借库内存储） | 不释放 | 只在本迭代器下一次推进调用之前有效；要保留当下复制（§11.3a）|
+| `bitcask_range_iter_next_batch_view` → 每条 `bitcask_range_entry_view_t` 内的 key/value/meta | **无**（借库内存储） | 不释放 | 只在本迭代器下一次推进调用之前有效；要保留当下复制（§11.7b）；close 后当前批仍可读、不可再推进 |
 
 **无需 free** 的"看起来返回指针"的函数：
 
@@ -2060,6 +2101,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 - `bitcask_iter_entry_free` **只释放 entry 内的 malloc 缓冲**（`key.data` / `value.data`），**不释放** entry 结构本身（entry 是栈/调用方提供）。
 - `bitcask_iter_next_batch` 错误返回 `< 0` 时**实现已释放已填充条目**；调用方不可再对 `entries` 调 `bitcask_iter_entry_free`（否则 double-free）。
 - `bitcask_iter_next_batch_view` 返回的切片**不是 malloc 缓冲**：对它调 `bitcask_iter_entry_free` 是未定义行为（free 非堆指针）；它也不跨下一次推进调用存活。
+- `bitcask_range_iter_next_batch_view` 同理：对它调 `bitcask_range_entry_free` / `bitcask_range_entry_ex_free` 是未定义行为。
 - `bitcask_search_result_batch_free` 第二个参数 `n` 必须与分配时的 `n` 一致；外层数组 `calloc(n, ...)` 后 free 必须按 `n` 释放（实现按 `n` 遍历）。
 - 已 `bitcask_close` 的 `bitcask_t*` 再调任何函数返回 `BITCASK_ERR_CLOSED`，不崩溃（fail-fast 生命周期）。
 
@@ -2082,7 +2124,7 @@ BITCASK_API bitcask_error_t bitcask_search_hybrid_filtered(
 | 同义词词典（`options.synonym_file_path`，open-time） | ✅（不可变 → 并发查询安全；无运行期 setter）|
 | `bitcask_iter_*` | ⚠️（同一 iter 不可并发；每线程一个迭代器；不同 iter 之间并发安全）|
 | `bitcask_range_iter_start` | ✅（取 OKI 只读视图）|
-| `bitcask_range_iter_next` / `_next_batch` / `_release` | ⚠️（同一 iter 不可并发；每线程一个；与并发写/merge 安全——读 start 时的快照，S76）|
+| `bitcask_range_iter_next` / `_next_batch` / `_next_batch_view` / `_release` | ⚠️（同一 iter 不可并发；每线程一个；与并发写/merge 安全——读 start 时的快照，S76）|
 | `bitcask_parallel_scan` / `_prefix` | ✅（内部多线程并发 `get`；**回调可能多线程并发触发**——回调须线程安全）|
 | `bitcask_status` / `bitcask_status_ex` / `bitcask_needs_merge` / `bitcask_merge` / `bitcask_is_empty` / `bitcask_is_frozen` / `bitcask_flush_index` | ✅ |
 | 读 / 写并发 | ✅（搜索可见性 near-real-time）|

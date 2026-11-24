@@ -1598,6 +1598,39 @@ BITCASK_API void bitcask_range_entry_ex_free(bitcask_range_entry_ex_t* entry) {
     entry->meta.size = 0;
 }
 
+BITCASK_API int bitcask_range_iter_next_batch_view(bitcask_range_iter_t* iter,
+                                                   bitcask_range_entry_view_t* entries,
+                                                   size_t max_n,
+                                                   bitcask_fault_t* fault) {
+    // S13-M2：extern "C" 异常隔离
+    try {
+    if (!iter || !entries || max_n == 0) return -1;
+
+    auto batch = as_cpp_range_iter(iter)->next_batch_view(max_n);
+    if (!batch) {
+        to_c_error(batch.error(), fault);
+        return -1;
+    }
+    // 借用：空 span 交 {NULL, 0}，与 *_ex 对空 meta / 空值的表示一致。
+    const auto to_slice = [](std::span<const std::byte> s) {
+        return bitcask_slice_t{s.empty() ? nullptr : s.data(), s.size()};
+    };
+    std::size_t count = 0;
+    for (const auto& e : *batch) {
+        bitcask_range_entry_view_t& out = entries[count++];
+        out.key = to_slice(e.key);
+        out.value = to_slice(e.value);
+        out.meta = to_slice(e.meta);
+        out.tstamp = e.tstamp;
+        out.ord = e.ord;
+    }
+    return static_cast<int>(count);
+    } catch (...) {
+        (void)fault_from_exception(fault);
+        return -1;
+    }
+}
+
 BITCASK_API bitcask_error_t bitcask_parallel_scan_prefix(
     bitcask_t* cask, size_t n_threads, bitcask_slice_t key_prefix,
     bitcask_scan_fn fn, void* ctx, size_t* out_count,

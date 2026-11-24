@@ -662,6 +662,16 @@ target_link_libraries(bitcask_iter_batch_view_test PRIVATE
 )
 gtest_discover_tests(bitcask_iter_batch_view_test ${_bitcask_test_props})
 
+# S75-3：range 半边的免分配批视图（CaskRangeIter::next_batch_view）。
+add_executable(bitcask_range_batch_view_test range_batch_view_test.cpp)
+target_link_libraries(bitcask_range_batch_view_test PRIVATE
+    GTest::gtest_main
+    bitcask_cask
+    bitcask_warnings
+    bitcask_sanitizers
+)
+gtest_discover_tests(bitcask_range_batch_view_test ${_bitcask_test_props})
+
 # 下游反馈 2026-10-06：原子批 / TxnCask 收结构化文档（kPutDoc）。
 add_executable(bitcask_atomic_batch_doc_test atomic_batch_doc_test.cpp)
 target_link_libraries(bitcask_atomic_batch_doc_test PRIVATE

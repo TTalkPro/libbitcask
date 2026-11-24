@@ -1157,14 +1157,30 @@ public:
         std::vector<std::byte> meta;    // want_meta 时填，否则恒空
     };
     [[nodiscard]] std::expected<std::optional<Entry>, CaskFault> next();
+
+    // S75-3：免分配批视图（与 CaskIter::next_batch_view 同一契约）
+    struct EntryView {
+        std::span<const std::byte> key;
+        std::span<const std::byte> value;
+        std::span<const std::byte> meta;   // want_meta 时填，否则空
+        std::uint64_t tstamp = 0;
+        std::uint64_t ord = 0;
+    };
+    [[nodiscard]] std::expected<std::span<const EntryView>, CaskFault>
+    next_batch_view(std::size_t max_n);
 };
 ```
 
 - **`want_meta` / `filter`（下游反馈 2026-10-06）**：语义同 `CaskIter::set_want_meta` / `set_filter`。合用即「只按 meta 筛选的有序扫描」——filter 在 C++ 侧逐条求值（取值走零拷贝 `get` 视图，不通过的不拷 value），惰性与预取路径一致。
 
+- **`next_batch_view`（S75-3，免分配批视图）**：语义同 `next()`（同一快照、同一 `lo` / `hi` / `prefetch` / `want_meta` / `filter`，输出序与内容一致），`EntryView` 的字段与 `Entry` 一一对应；区别只在所有权：`key` / `value` / `meta` 是 **span，借迭代器内部的存储**，整批稳态零堆分配（映射命中时 key / value 直达文件映射；`pread` 兜底与退回 `get` 的记录留在迭代器里）。预取并发与自适应串行照旧。
+  - **要保留就当下复制**。返回的 span 及其中各字段的 span 只在**本迭代器的下一次推进调用之前**有效（`next` / `next_batch_view` / 析构都算推进）；`Cask::close()` 不算——已取到的这一批在 close 之后仍可读，但 close 之后再推进返回 `kClosed`。
+  - 返回：空 span = 迭代结束；unexpected = 故障，**整批不可依赖**；`max_n == 0` 返回空 span 且不推进。可与 `next()` 混用（预取缓冲共用，不丢不乱序）。线程安全：否（同 `next`）。
+  - 实测（Linux、20 万 key、200 B 值、页缓存热、2026-11-24）：比 owned `next()` 每行省 11～38 ns——不预取 4～10%（单条 / 64 / 1024 一批），`prefetch=256` 时 5～12%。**没到 S75 给 range 半边定的 10% 门槛**：range 每行的成本主要在定位与解码，不在分配。只在「扫完即用、不保留」的路径上用它；要保留 entry 的调用方继续用 `next()`。
 - **一致性：快照**（S76 起，与 `CaskIter` 相同）——key 集合与值都是 `make_range_iter` 那一刻的版本，之后的并发写（含删除）不可见；迭代期间 merge 把某个 key 的快照版本合并掉了（之后又改写过）时，这一个 key 交出当前值。取值与 `CaskIter` 同一条读路径（`Cask::read_located`：按视图位置映射读、key/ord 自证、merge 搬迁后重定位），不再逐 key 回查 `get`——20 万 key 重开后每行约 600～830 → 270～410 ns，与全表扫描持平。≤ 13.0.0 是 per-key 弱一致（值在取的那一刻回查，被删的跳过、被改的交新值）。
 - **生命周期**：不可跨线程共享；须在 `Cask::close()` 之前用完（内部 pin OKI
-  `ReadView`，但取值经 Cask 读路径）。无 `release()`——析构即释放。
+  `ReadView`，但取值经 Cask 读路径）。无 `release()`——析构即释放。唯一例外是
+  `next_batch_view` 已取到的那一批：close 之后仍可读完（见上）。
 - **`prefetch`（S33-6）**：>1 时一次归并出 `prefetch` 个 key，再用 `prefetch_threads` 个线程并发取值填缓冲，`next()` 从缓冲出货。**只改变取值时机，输出序与内容和惰性路径完全一致**。线程按批创建（无常驻池），故内部按「每线程至少 64 个 key」收窄线程数——小批自动退化为串行。实测（tmpfs、1 KiB 值、6250 条命中窗口）：惰性 10.8 ms、`prefetch=64` 11.6 ms（无收益）、`prefetch=256/4 线程` 7.6 ms（**1.4×**）。收益形态是「大窗口 + 值不在页缓存」；小窗口或值已缓存时线程成本可能反超，故默认关闭。S71 起 `prefetch_threads = 0`（缺省）时每批先串行取 32 条计时，按实测单条成本估算并行省下的时间盖不过起线程的成本就整批串行：热缓存、200 B 值、20 万行时 `prefetch=256` 从比不开慢 1.5～1.9 倍降到慢 5～15%（剩下的是攒批本身的开销）；显式给线程数则照给的并行。
 - 错误：run 损坏 → `kBadCrc`（该 run 整体不可信，重开会重建）；取值路径的 IO 错误原样上抛。并发删除导致的 `kNotFound` 静默跳过（同 `parallel_scan`）。
 
@@ -2792,7 +2808,7 @@ auto c = bitcask::Cask::open(dir, opts, &registry);
 | `backup` | ✅ | 与 put/get 并发（put 被 `write_mu_` 挡在备份期间外，get 不受影响）；须与 merge 串行 |
 | `CaskIter::start` / `next` / `next_batch` / `release` | ⚠️ 每线程一个 | 有状态游标，同一对象不可并发；不同 CaskIter 可并发；并行遍历用 `parallel_scan` |
 | `make_range_iter` | ✅ | 取 OKI 整体不可变 `ReadView`（runs + frozen + 排序 delta 快照 + 共享块缓存）|
-| `CaskRangeIter::next` | ⚠️ 每线程一个 | 有状态游标，同一对象不可并发；不同 range 迭代器可与写/merge 并发（读建立时的快照，S76）|
+| `CaskRangeIter::next` / `next_batch_view` | ⚠️ 每线程一个 | 有状态游标，同一对象不可并发；不同 range 迭代器可与写/merge 并发（读建立时的快照，S76）|
 
 > **读写并发**：搜索可见性遵循 near-real-time 契约（`drain_plugins()` flush 覆盖调用前的写）。
 > **更高写并发**：写在文件层本就串行（单 append WAL），`write_mu_` 不损吞吐；需要更高写并发请**按目录分片多个 Cask 实例**（横向扩展）。

@@ -655,27 +655,84 @@ public:
     // 下一条：有 → Entry；到尾（或越过 hi）→ nullopt；错误 → unexpected。
     [[nodiscard]] std::expected<std::optional<Entry>, CaskFault> next();
 
+    // S75-3：免分配批视图（与 CaskIter::next_batch_view 同一契约）。同一快照、
+    // 同一 lo/hi / filter / want_meta / 预取设置，输出序与内容与 next() 一致，
+    // 但 key/value/meta **借迭代器内部的存储**，稳态零堆分配——映射命中时
+    // key/value 直达文件映射，pread 兜底与退回 get 的记录留在迭代器里。
+    // 生命周期：返回的 span 与其中各字段的 span 只在下一次推进调用之前有效
+    // （next / next_batch_view / 迭代器析构都算推进；Cask::close() 不算——
+    // 已取到的这一批仍可读，但 close 之后再推进返回 kClosed）。要保留请当下复制。
+    // ⚠ 典型误用：先把一批 key 记下来，回头再读 value——中间调过 next 就悬垂。
+    // 返回：空 span = 迭代结束；unexpected = 故障，**整批不可依赖**。
+    // max_n == 0 返回空 span。与 next() 可混用（预取缓冲共用，不丢不乱序）。
+    // 线程安全: 否（同 next）。
+    struct EntryView {
+        std::span<const std::byte> key;
+        std::span<const std::byte> value;
+        std::span<const std::byte> meta;   // RangeOptions::want_meta 时填，否则空
+        std::uint64_t tstamp = 0;
+        std::uint64_t ord = 0;
+    };
+    [[nodiscard]] std::expected<std::span<const EntryView>, CaskFault>
+    next_batch_view(std::size_t max_n);
+
 private:
     friend class Cask;
     CaskRangeIter() = default;
 
-    // 归并层：产出下一个「胜出且非墓碑」的视图行（key + 位置 + ord）；
-    // 到尾或越过 hi → nullopt。取值与预取都建在它之上。
-    [[nodiscard]] std::expected<std::optional<oki::OkiState::DeltaRow>, CaskFault>
-    next_merged_key();
+    // 归并层：产出下一个「胜出且非墓碑」的视图行（key + 位置 + ord），写进 row
+    // （复用其 key 容量）；到尾或越过 hi → false。取值与预取都建在它之上。
+    [[nodiscard]] std::expected<bool, CaskFault>
+    next_merged_key(oki::OkiState::DeltaRow& row);
 
-    // S33-6：预取一批——归并至多 prefetch_ 个 key，并发回查取值填 buf_。
-    // 死 key（kNotFound）在批内被丢弃，故 buf_ 可能为空而迭代未结束。
+    // S75-3：取到的一行，只有 span + 存活担保，不拷贝。next() 在它上面物化
+    // Entry，next_batch_view() 把它整个留在当批存储里。span 的担保：
+    // file_holder 锚定文件映射，owned 持 pread 兜底的记录，got 持退回 public
+    // get 时的视图；key_from_row = key 借视图行（退回 get 的两条路，记录里
+    // 没有 key 可借），只在下一次取行之前有效，消费方须当下拷走。
+    // 可移动赋值（惰性路径逐行复用 cur_，不每行构造 / 析构）——为此 got 包
+    // unique_ptr：GetResultView 只能移动构造。这条路本身少见（v1 run / 快照
+    // 版本被 merge 合并掉），一次分配无妨。
+    struct Fetched {
+        std::span<const std::byte> key;
+        std::span<const std::byte> value;
+        std::span<const std::byte> meta;
+        bool key_from_row = false;
+        std::uint64_t tstamp = 0;
+        std::uint64_t ord = 0;
+        std::shared_ptr<fileops::DataFile> file_holder;
+        std::optional<fileops::ReadRecord> owned;
+        std::unique_ptr<GetResultView> got;
+
+        // 释放上一行的担保（span 一并清空）。
+        void reset() noexcept {
+            key = {};
+            value = {};
+            meta = {};
+            key_from_row = false;
+            file_holder.reset();
+            owned.reset();
+            got.reset();
+        }
+    };
+
+    // 下一行（惰性或预取，按 prefetch_ 分流），out 指向它：有 → true；到尾 →
+    // false。惰性路径指向 cur_（只活到下一次取行），预取路径指向 pbuf_ 的槽位
+    // （活到下一次 fill_prefetch）；要留过下一个 next_fetched 就得搬走。
+    [[nodiscard]] std::expected<bool, CaskFault> next_fetched(Fetched*& out);
+
+    // S33-6：预取一批——归并至多 prefetch_ 个视图行进 pkeys_，并发取值，按 key
+    // 序压实进 pbuf_。跳过的行不进 pbuf_，故 pbuf_ 可能为空而迭代未结束。
     [[nodiscard]] std::expected<void, CaskFault> fill_prefetch();
 
     // 按视图行的位置取值（S76，Cask::read_located，与 CaskIter 同一条路径）+
-    // filter + 物化（惰性与预取共用；只读成员，可并发调）。TTL 过期、filter 不
-    // 通过、该 key 在本快照之后已有新版本且旧版本已不可读 → nullopt。
-    [[nodiscard]] std::expected<std::optional<Entry>, CaskFault>
-    fetch_entry(const oki::OkiState::DeltaRow& row) const;
-    // 视图行没有位置（v1 run）时退回 public get 回查。
-    [[nodiscard]] std::expected<std::optional<Entry>, CaskFault>
-    fetch_by_get(const std::string& key) const;
+    // filter（惰性与预取共用；只读成员，可并发调）。TTL 过期、filter 不通过、
+    // 该 key 已不可读 → false。row 须在 out 被消费完之前保持不动（key_from_row）。
+    [[nodiscard]] std::expected<bool, CaskFault>
+    fetch_row(const oki::OkiState::DeltaRow& row, Fetched& out) const;
+    // 视图行没有位置（v1 run）或快照版本已被 merge 合并掉时退回 public get。
+    [[nodiscard]] std::expected<bool, CaskFault>
+    fetch_by_get(const std::string& key, Fetched& out) const;
 
     Cask* cask_ = nullptr;
     oki::OkiState::ReadView view_;
@@ -684,13 +741,37 @@ private:
     bool has_hi_ = false;
     bool done_ = false;
 
-    // S33-6：预取缓冲（prefetch_ ≤ 1 时恒空，走惰性路径）。
     std::size_t prefetch_ = 0;
     std::size_t prefetch_threads_ = 0;
     bool want_meta_ = false;
     const meta::MetaFilter* filter_ = nullptr;
-    std::vector<Entry> buf_;
-    std::size_t buf_pos_ = 0;
+
+    // 惰性路径的当前视图行（复用 key 容量；key_from_row 的 span 借它）。
+    oki::OkiState::DeltaRow cur_row_;
+    // 惰性路径的当前取值结果，逐行复用。
+    Fetched cur_;
+    // S33-6 / S75-3：预取缓冲（prefetch_ ≤ 1 时恒空）。next() 与
+    // next_batch_view() 共用同一份，混用不丢不乱序。pkeys_ 只在下一次
+    // fill_prefetch 时覆盖（容量复用），在此之前 pbuf_ 里 key_from_row 的
+    // span 借它；pslots_ 是并发取值时与 pkeys_ 一一对应的槽位。
+    std::vector<oki::OkiState::DeltaRow> pkeys_;
+    std::vector<std::optional<Fetched>> pslots_;
+    std::vector<Fetched> pbuf_;
+    std::size_t pbuf_pos_ = 0;
+
+    // S75-3：当批视图的存储，容量跨批保留。view_rows_ 扩容会搬 Fetched，但
+    // span 指向的是堆缓冲 / 映射，不随之移动。key_from_row 的 key 落
+    // view_key_buf_：批内只记偏移，整批填完再回填 span（批内增长会 realloc）。
+    struct ScratchKey {
+        std::size_t entry;
+        std::size_t off;
+        std::size_t len;
+    };
+    std::vector<EntryView> view_entries_;
+    std::vector<Fetched> view_rows_;
+    std::vector<ScratchKey> view_scratch_keys_;
+    std::string view_key_buf_;
+    void reset_view_batch() noexcept;
 };
 
 // --- Cask ------------------------------------------------------------------
