@@ -2923,6 +2923,8 @@ int main(void) {
 
     if (failures == 0) {
         printf("\n=== All C API tests passed ===\n");
+        /* 全过才清：失败时留着现场方便排查（下次运行开头照样会清）。 */
+        cleanup_all_test_dirs();
     } else {
         printf("\n=== %d test(s) FAILED ===\n", failures);
     }

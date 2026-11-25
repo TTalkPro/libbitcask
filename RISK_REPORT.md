@@ -1,6 +1,8 @@
 # libbitcask 风险报告
 
 > 基线：Google C++ Style 规范化审计（2026-07-14）
+>
+> **当前状态看文末「二十三、状态核对（2026-11-24）」**。前文各节按当时状态记载、不回改（同 Phase 7 的做法），开头的风险摘要表是 2026-07-14 的基线数字。
 > 范围：`src/`、`include/bitcask/`、`c_api/`（208 文件 / ~74K 行）
 > 方法：3 路 explore agent 全树扫描 + 逐一阅读上下文验证 + diff 比对
 > 结论：**内存与并发维度达到工业级水准（误报率 ~95%）；唯一显著问题在冗余维度**
@@ -44,6 +46,8 @@
 | 内存逃逸 | 0 | 0 | 2 | ✅ 无真泄漏 |
 | 死锁场景 | 0 | 0 | 0 | ✅ 无可达死锁 |
 | 代码冗余 | 1 | 4 | 1 | ⚠️ 需行动 |
+
+> ↑ 2026-07-14 基线。2026-11-24 复核：HIGH-1 / MED-1 / MED-3 / LOW-3 已解决，MED-2 基本归并，MED-4 / LOW-1 / LOW-2 属有意保留；内存与死锁维度后续各轮的发现均已修复。逐条见 §二十三。
 
 ---
 
@@ -565,12 +569,12 @@ DiskANN/IVF/VectorDeltaLog/SearchCheckpoint/IndexManifest——未审计≠有 b
 
 | # | 项 | 位置 | 规模 | 状态 |
 |---|---|---|---|---|
-| RED-1 | HNSW flush() 与 SealedSegmentVectorPlugin flush() 逐字节相同 | `vector_plugin.cpp:511-555` vs `sealed_segment_vector_plugin.hpp:670-710` | ~115 行（Phase 6 实测修正：flush 35 + delta 31 + load ~50；原 ~90 系跨度重计） | T12 待独立分支 |
+| RED-1 | HNSW flush() 与 SealedSegmentVectorPlugin flush() 逐字节相同 | `vector_plugin.cpp:511-555` vs `sealed_segment_vector_plugin.hpp:670-710` | ~115 行（Phase 6 实测修正：flush 35 + delta 31 + load ~50；原 ~90 系跨度重计） | T12 待独立分支 → 2026-11-24：T12 定为默认不做，仍在（现位于 `src/search/vector_plugin.cpp` / `include/bitcask/detail/sealed_segment_vector_plugin.hpp`），见 §二十三 |
 | RED-3 | 小端编解码三套并行 | `byte_order.hpp:14-48` vs `search_checkpoint.hpp:135-163` vs `index_manifest.hpp:75-99` | ~55 行 | 未处理 |
-| RED-5 | hnsw.cpp search_layer / search_layer_int8 成对复制 | `hnsw.cpp:846-910 / 952-1023` | ~130 行 | 未处理 |
+| RED-5 | hnsw.cpp search_layer / search_layer_int8 成对复制 | `hnsw.cpp:846-910 / 952-1023` | ~130 行 | 未处理 → 2026-11-24 核实：✅ 已归并（D7，共用 `search_layer_impl`） |
 | RED-6 | IvfSegment::open vs DiskannSegment::open 骨架同构 | `ivf_rq.cpp:475-549` vs `diskann.cpp:472-569` | ~45 行 | 未处理 |
-| RED-7（残） | hnsw.cpp 仍有本地 pwrite_all，未消费 diskint::pwrite_all | `hnsw.cpp:1523-1536` vs `vec_disk_internal.hpp:25-37` | ~14 行 | T10 未覆盖 |
-| RED-10 | SnapCursor::vb() 与 codec::vbyte_read_checked 语义等价 | `keydir.cpp:1297-1307` | ~11 行 | 未处理 |
+| RED-7（残） | hnsw.cpp 仍有本地 pwrite_all，未消费 diskint::pwrite_all | `hnsw.cpp:1523-1536` vs `vec_disk_internal.hpp:25-37` | ~14 行 | T10 未覆盖 → 2026-11-24 核实：✅ 本地版已删，统一用 `diskint::pwrite_all` |
+| RED-10 | SnapCursor::vb() 与 codec::vbyte_read_checked 语义等价 | `keydir.cpp:1297-1307` | ~11 行 | 未处理 → 2026-11-24 核实：随 S43 退役 KeyDir，`keydir.cpp` / `SnapCursor` 已删，本项不复存在 |
 | RED-12 | Manifest::min_chain_watermark 生产零调用（仅测试引用） | `index_manifest.hpp:61-65` | ~5 行 | 维持 |
 | RED-13 | c_api 错误翻译样板 ×16 | `bitcask_kv.cpp` 等 | ~32 行 | **有意保留**（C ABI 隔离代价） |
 
@@ -1026,3 +1030,60 @@ RED-3/5/6/10（backlog 维持）。
    其它库写入（不死锁）。
 4. **独占维护期间写入背压**：大库 checkpoint 序列化期间本库应用暂停，分片队列
    满后写者被背压（与旧 reducer 执行 RunFn 期间等价）。
+
+---
+
+# 状态核对（2026-11-24，13.1.1 `8511c09`）
+
+## 二十三、状态核对
+
+方法：对前文每一条**仍标开放**的发现逐条到代码里核实（grep 定义 / 调用点，读上下文），不沿用前文结论。
+同日补跑：Release 全量 `check` 1002 / 1002；ASan（Debug）全量 1002 / 1002、无报告。
+
+### 内存 / 死锁 / 持久性
+
+前文 Phase 4～7 标定的条目均已在代码中修复（Phase 1～6 见 §二十、Phase 7 见 §二十一），本次未发现新的开放项。
+**仍开放的只有设计层面的两条**：T8（搜索读屏障无界等待，4 项前置未满足，TASK「⏸ 遗留」）与 §二十二 列的残余风险。
+
+### 2026-07-14 基线（§三）
+
+| 条目 | 现状 | 证据 |
+|---|---|---|
+| HIGH-1 IVF / DiskANN 插件 ~950 行重复 | ✅ 已解决 | 两者都继承 `detail::SealedSegmentVectorPlugin<SegmentT>`（`include/bitcask/detail/sealed_segment_vector_plugin.hpp`），各自只剩 57～59 行 |
+| MED-1 mmap 释放样板 ~8 处 | ✅ 已解决 | `src/` 与 `include/` 中 io 层之外的 `munmap` / `UnmapViewOfFile` 只剩注释，释放都经 io 层 |
+| MED-2 vbyte 解码三份 | 🟡 基本归并 | 两种解码契约 `vbyte_decode` / `vbyte_read_checked` 都在 `include/bitcask/vbyte.hpp`（即本报告建议的「保留两种契约」）；`meta_codec.hpp` 另有一个按指针顺序写入的 `vbyte_store`（注释：避免 vector 扩容），属性能取舍 |
+| MED-3 CRC32 入口不一致 | ✅ 已解决 | 统一 `codec::crc32` / `crc32_update` → `hw::crc32_update`；表只有 `hw_crc32.hpp` 一张，其余是 SIMD 内核 |
+| MED-4 C API `guarded()` 样板 | 有意保留 | 64 处调用（kv 35 / text 22 / vec 7），C ABI 异常隔离的代价，同 RED-13 |
+| LOW-1 `row_chunks.hpp` 裸 `new T[]` | 有意保留 | 分配先进 `unique_ptr<T[]>` 暂存（P6-MEM-2 修复），析构 `delete[]` 是无锁发布结构的设计，前文已注明理由 |
+| LOW-2 `const_cast<void*>` 后 `free` | 有意保留 | 18 处，C 切片是 `const void*`，释放 malloc 出去的缓冲必须这样 |
+| LOW-3 插件路径助手重复 | ✅ 已解决 | 随 HIGH-1 收进模板（`comp_path` / `segment_path_ext`） |
+
+### 冗余 backlog（§九 v2 残留）
+
+| 条目 | 现状 | 证据 |
+|---|---|---|
+| RED-1 HNSW flush 与 SealedSegmentVectorPlugin flush 重复 | 仍在（T12 默认不做） | `src/search/vector_plugin.cpp:504` vs `sealed_segment_vector_plugin.hpp:749` |
+| RED-3 小端编解码三套 | 仍在 | `search_checkpoint.hpp:197-220`（`put_u32/u64`、`get_u32/u64`）与 `index_manifest.hpp:86-99`（`read_u32/u64`）未用 `byte_order.hpp` 的 `le_load_* / le_store_*` |
+| RED-5 `search_layer` / `search_layer_int8` 成对复制 | ✅ 已归并 | D7：共用 `HnswIndex::search_layer_impl`（`hnsw.cpp:843`） |
+| RED-6 `IvfSegment::open` / `DiskannSegment::open` 骨架同构 | 仍在 | `ivf_rq.cpp:471` / `diskann.cpp:465`：开句柄 → 读头 → 校验 magic → 逐字段 `memcpy` 的前 ~30 行仍逐段同形 |
+| RED-7（残）hnsw 本地 `pwrite_all` | ✅ 已删 | `hnsw.cpp:1633` 注释，统一 `diskint::pwrite_all` |
+| RED-10 `SnapCursor::vb()` | 不复存在 | S43 退役 KeyDir，`keydir.cpp` 已删 |
+| RED-12 `Manifest::min_chain_watermark` 仅测试引用 | 维持 | `index_manifest.hpp:60`，仍只在 `index_manifest_test.cpp` 用 |
+| RED-13 c_api 错误翻译样板 | 有意保留 | 同前 |
+
+### Phase 6 冗余（§十七）与行动建议（§十九）
+
+| 条目 | 现状 | 证据 |
+|---|---|---|
+| P6-RED-1 原子写样板 ×9 | ✅ T21 | `detail::AtomicFileWriter` / `atomic_write_bytes`（`detail/file_util.hpp`），各处轮转经 `io::atomic_rename` |
+| P6-RED-2 整文件读样板 ×6 | ✅ T21 | `detail::read_file_bytes`，6 处调用 |
+| P6-RED-3 chunked-pread refill ×3 | ✅ T23 | `detail::ChunkedReader`（`detail/chunked_reader.hpp`） |
+| P6-RED-4 Analyzer 双出口成对复制 | ✅ | `analyzer.cpp` 按 `Sink` 模板共用主循环（偏移版与普通版只差 sink） |
+| P6-RED-5 `decode_rec` / `decode_rec_list` 共享解包段 | ✅ T24 | `decode_rec_columns`（`segment_v2.cpp:611`） |
+| P6-RED-6 死代码 7 行 | ✅ | `ends_with_vowel` / `newest_folder_epoch_` / `kValueSizeOverflow` 全树已无 |
+| 行动建议 #1～#9 | ✅ 全部落地 | #1/#2/#9 见 §二十，#3～#8 即上表 |
+
+### 结论
+
+开放项只剩：**T8 + §二十二 的残余风险**（设计层面）与 **RED-1 / RED-3 / RED-6 / RED-12** 四处小冗余（合计 ~200 行，均为 LOW，
+RED-1 已定不做）。

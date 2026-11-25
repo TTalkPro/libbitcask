@@ -5,7 +5,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本遵循语义化版本。**3.0.0 起三套版本号统一**（S12-7 后单一真源 =
 `project(libbitcask VERSION ...)`）：CHANGELOG 发布版本 = 库 `VERSION` = C API 产品版本
-`bitcask_version_*` = **`13.1.1`**；库 `SOVERSION` = **`13`**（= major）；
+`bitcask_version_*` = **`13.1.2`**；库 `SOVERSION` = **`13`**（= major）；
 盘上格式版本独立于库版本：`bitcask.meta` = **`v5`**（基线；使用原子批的目录懒升 **`v6`**），
 hint = 历史 BCH4/BCH5（新库停写），OKI = **BCOK v1/v2/v3 / BCOM v1-v4**，
 keydir 快照 = 历史 BCKS v3/v4（不再生成），
@@ -20,6 +20,29 @@ keydir 快照 = 历史 BCKS v3/v4（不再生成），
 > 暂无。**range 免分配批视图（S75-3）做完但没发**：实测收益 4%～12%，没到 S75 定的 10% 门槛，且让 `CaskRangeIter`
 > 对象布局变（按 13.0.0 先例发出去要 MAJOR）。2026-11-24 拍板暂不发，代码在分支 `s75-3-range-batch-view`（`a286679`），
 > main 上已回退，留到下次 MAJOR 同车。设计稿与实测数字见 [`doc/scan-batch-view-design-zh.md`](doc/scan-batch-view-design-zh.md)（分支上的版本）。
+
+## [13.1.2] - 2026-11-25（S79：过期记录对账；测试跑完不留临时文件）
+
+> **版本语义**：PATCH **13.1.2**。只动测试与文档（含记录性 Markdown）；**库代码、C / C++ ABI、盘上格式与 13.1.1 完全相同**，
+> `SOVERSION` 仍为 `13`。
+
+### Changed
+
+- **遗留表对账**（S79-1/S79-2）：W1（核心路径 `O_CLOEXEC` 缺失）改标结清——`e788bb2`（2026-09-23）已修，
+  `src/` 逐处复核无漏网；`RISK_REPORT.md` 文首加指引、backlog 已变条目标日期与新状态、文末新增
+  「二十三、状态核对（2026-11-24）」逐条核实：仍开放的只剩 T8 + §二十二残余风险与 RED-1 / RED-3 / RED-6 / RED-12
+  四处小冗余。
+- **测试临时文件收口**（S79-3）：`tests/support/test_paths.hpp` 新增 `scratch_dir()`（进程专用子目录、退出时整删）；
+  `segment_v2_test` 8 处散文件改用它；docvalue fixture 连带删 `.oki.old`；hnsw 补删 `.qc8` 旁车；
+  s57 参数化用例名的 `/` 换 `_`（此前建两层目录只删内层）；shutdown 用例补删第二个目录；
+  `c_api_test` 全过后清理（失败留现场）。
+- `process_isolation_test` 文件头注释同步（W1 已修 / B3 已覆盖）；shutdown 第④步注释写清两段
+  （dir2 新建写查、dir1 重开重放），测试语义未变。
+
+### 验证
+
+库源码与 `13.1.1` 完全相同（本次未触碰 `src/` `include/` `c_api/`）。
+Release 全量 `check` 1002 / 1002；跑完 `TMPDIR` 与 `/tmp` 零残留；改动的 7 个测试在 ASan 下无报告、零残留。
 
 ## [13.1.1] - 2026-11-24（S77：两个时序敏感用例改稳；S78：README 拆分）
 

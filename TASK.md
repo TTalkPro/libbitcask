@@ -10,6 +10,22 @@
 
 ---
 
+## 🟢 S79 · 过期记录对账；测试跑完不留临时文件（2026-11-25）
+
+> 来源：13.1.1 之后的全面排查。只动记录与测试，库代码不变。
+
+| 项 | 状态 |
+|---|---|
+| S79-1 遗留表 W1（`O_CLOEXEC`）改为结清：`e788bb2`（2026-09-23）已修，`src/` 逐处复核无漏网，回归 `ProcessIsolationTest.LibraryFdsAreNotInheritedAcrossExec`；该测试文件头注释里的「W1 / B3 TODO」同步改掉 | ✅ |
+| S79-2 `RISK_REPORT.md`：前文按当时状态保留不回改；文首与 07-14 摘要表下加指引，backlog 表里已变的行标日期与新状态，文末新增「二十三、状态核对」——每条开放项到代码里核实（HIGH-1 / MED-1 / MED-3 / LOW-3、RED-5 / RED-7、P6-RED-1～6 已解决，RED-10 随 KeyDir 退役消失；仍开放的只剩 T8 与 §二十二 残余风险、RED-1 / RED-3 / RED-6 / RED-12） | ✅ |
+| S79-3 测试临时文件：全量一遍原留下 38 项（3.6 MB）+ `/tmp/bitcask_c_test_*` 21 个。`support/test_paths.hpp` 加 `scratch_dir()`（进程专用子目录，退出时析构删掉），`segment_v2_test` 8 处改用它；docvalue fixture 的 `TearDown` 连带删 `<tmpdir>.oki.old`；hnsw 两个用例补删 `.qc8` 旁车；s57 参数化用例名里的 `/` 换 `_`（此前建出两层目录、只删内层）；shutdown 用例记下第二个目录并删除；`c_api_test` 全过后清理（失败时留现场） | ✅ |
+| S79-4 验证：Release 全量 1002 / 1002，跑完 `TMPDIR` 与 `/tmp` 零残留；改动的 7 个测试在 ASan 下无报告、零残留 | ✅ |
+
+> 更正（同日）：排查时一度以为 `c_api_shutdown_test` 第④步「含重放已有数据」与做法不符——实际该步分两段，新建 `dir2`
+> 之后紧接着就单独重开了 `dir1` 查询（重放路径本来就覆盖着），是只读了前半段的误判。未改测试语义，只把注释写清两段。
+
+---
+
 ## 🟢 S78 · README 拆分；range 批视图暂不发（2026-11-24）
 
 > 来源：`feedbacks/2026-11-23-ctest-test-presets-serial-437s.md` 里「README 的跑法没改成 `check`」那条尾巴，
@@ -3472,7 +3488,7 @@ S37-7 (1.5周) ───── CI + 收尾
 |---|---|---|
 | T8 | 搜索读屏障无界等待（`prepare_search` 饥饿）| ⏸ 4 项前置未满足（原文 62789cd）|
 | T12 | HNSW ckpt 去重（~115 行）| ⏸ 默认不做（注释同步已替代）|
-| **W1** | `File::open` 默认**不设 `O_CLOEXEC`** | 🔍 S37-1 期间发现：11 处裸 `::open` 全部显式带 `O_CLOEXEC`（收编后由 `kCloseOnExec` 原样保留），而走 `io::File` 的核心 KV 路径（data/hint/oki run/write.lock）**没有** —— fork+exec 场景下 data file fd 泄漏进子进程。现有 fork 测试只 fork 不 exec 故未暴露，**S37-2 改 exec-self 后会变成真实暴露面**。收编时未擅自统一（那是行为变化，超出「零行为变化」约束）。**待评估**：给核心路径补 `kCloseOnExec`。Windows 侧句柄默认不继承，无对应问题 |
+| ~~W1~~ | `File::open` 默认**不设 `O_CLOEXEC`** | [结清] `e788bb2`（2026-09-23，C2/W1）：核心路径一律带 `kCloseOnExec`——`DataFile::open`（`data_file.cpp`）、OKI run（`oki_run.cpp`）、写锁（`file_lock.cpp`），BM25 段与 HNSW / IVF / DiskANN 的读写同样带上；`src/` 里已无不带它的 `PosixFile::open` / 裸 `::open` / `fopen`（2026-11-24 逐处复核）。回归 `ProcessIsolationTest.LibraryFdsAreNotInheritedAcrossExec`（exec-self：带检索的读写库开着时 spawn 子进程，子进程不得继承库内任何 fd）+ `CloexecProbeDetectsDeliberateLeak`（探针自检）。以下为立项时原文——S37-1 期间发现：11 处裸 `::open` 全部显式带 `O_CLOEXEC`（收编后由 `kCloseOnExec` 原样保留），而走 `io::File` 的核心 KV 路径（data/hint/oki run/write.lock）**没有** —— fork+exec 场景下 data file fd 泄漏进子进程。现有 fork 测试只 fork 不 exec 故未暴露，**S37-2 改 exec-self 后会变成真实暴露面**。收编时未擅自统一（那是行为变化，超出「零行为变化」约束）。**待评估**：给核心路径补 `kCloseOnExec`。Windows 侧句柄默认不继承，无对应问题 |
 | ~~W5~~ | Windows CRT/堆 边界（/MT 下每模块各一份）| [结清]。**准确范围：本库的 C++ API 本就不是模块边界，只有 C API 是。** 原有三处跨界：`io::File::pread` 返回 `std::vector`（库这侧分配、调用方析构）、`io::open_stream` 返回 `FILE*`、`io::flush_and_sync_stream` 反向收 `FILE*`。`/MD`（本项目默认，已核实 `-MDd`）下全部成立；`/MT` + 多模块下是跨堆 free 与跨 fd 表查号，失败形态为 **invalid-parameter handler → `__fastfail`，进程无声消失、退出码 0xC0000409、terminate/abort 都不触发**（参考 `../coxswain` W9.9，当时靠 cdb 取栈才定位；该状态码名为 STACK_BUFFER_OVERRUN，与栈无关）。已做：配置期告警 + `io.hpp` 注释 + `doc/api-c.md` §2.1 与 README 的 Windows 段（36655bd）+ **两处 `FILE*` 跨界消除：seam 只交换内核句柄，`FILE*` 的生成与拆解由 `detail/file_util.hpp` 的 inline `adopt_stream` / `stream_handle` 在调用方模块内完成**（6ad5b4b）。余下 `pread` 返回 `std::vector` 属常规 C++ ABI 约束（任何按值返回 STL 容器的 C++ 库都有），靠「跨模块只用 C API」这条规则解决，不为它动 API |
 | ~~W4~~ | 窄路径的编码约定 | [结清] 由 P0 结清。立项时以为只是「45 处 `.string()` 产出 ANSI → seam 报 EINVAL」，实测（CP936 简中 Windows）比这严重两级：`fs::path(窄串)` 这个**构造方向**同样走 ANSI，两头的错误互相抵消，才让纯 ASCII 与「碰巧是合法 GBK」的数据看着正常；一旦字节不是合法 GBK，**构造直接抛 `std::system_error`**，而 `detail::fsync_parent_dir` 是 `noexcept` 且是全库 9 个原子写站点的公共收尾 ⇒ **`std::terminate`**。修法见 P 段 P0 |
 | **W2** | `bitcask_format` → `bitcask_io` 的 PUBLIC 依赖 | 🔍 S37-1 引入（见落地记录）。当前无环且必要，但「记录 codec 层依赖 I/O 层」是轻微的分层异味。若 S37-4 把 13 个 STATIC 改 OBJECT 库，可顺带复核是否有更干净的归置 |

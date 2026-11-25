@@ -17,6 +17,7 @@
 #include "bitcask/segment_query.hpp"  // Slice 4:SegmentView / multi_segment_search
 #include "bitcask/segment_v2.hpp"
 #include "test_support.hpp"
+#include "support/test_paths.hpp"  // scratch_dir：段文件跑完随进程清掉
 
 using namespace bitcask::bm25;
 using bitcask::search::MmapSegment;
@@ -68,7 +69,7 @@ std::unique_ptr<Corpus> build_corpus(std::uint32_t docs,
     c.vocab.emplace_back("hot");
     for (int i = 0; i < 10; ++i) c.vocab.push_back("mid" + std::to_string(i));
     for (int i = 0; i < 100; ++i) c.vocab.push_back("rare" + std::to_string(i));
-    c.path = (std::filesystem::temp_directory_path() /
+    c.path = (bitcask::test::scratch_dir() /
               ("segv2_" + file_tag + ".seg"))
                  .string();
     std::filesystem::remove(c.path);
@@ -332,7 +333,7 @@ TEST(SegmentV2, MultiFieldRoundTrip) {
         live.doc_lens[d] = 3;
     }
     title.finalize_all_postings();
-    const auto path = (std::filesystem::temp_directory_path() /
+    const auto path = (bitcask::test::scratch_dir() /
                        "segv2_multifield.seg")
                           .string();
     std::filesystem::remove(path);
@@ -396,7 +397,7 @@ std::unique_ptr<Corpus> build_phrase_corpus(std::uint32_t docs,
         c.idx.add_doc(d, tp);
         c.live.doc_lens[d] = 4;
     }
-    c.path = (std::filesystem::temp_directory_path() /
+    c.path = (bitcask::test::scratch_dir() /
               ("segv2_" + tag + ".seg"))
                  .string();
     std::filesystem::remove(c.path);
@@ -742,7 +743,7 @@ std::unique_ptr<SealedSegment> build_sealed(std::uint32_t docs) {
 // 查询流全部等价(mmap 侧走 MmapFieldIndex 适配器,消费方无感)。
 TEST(SegmentV2P2, SealedSegmentMmapBackedEquivalence) {
     auto mem = build_sealed(200);
-    const auto path = (std::filesystem::temp_directory_path() /
+    const auto path = (bitcask::test::scratch_dir() /
                        "segv2_p2_sealed.seg")
                           .string();
     std::filesystem::remove(path);
@@ -798,7 +799,7 @@ TEST(SegmentV2P2, SealedSegmentMmapBackedEquivalence) {
 // save_live_sidecar → 重开还原;compact_postings 恒 no-op;save(v1) 拒绝。
 TEST(SegmentV2P2, MmapBackedMarkDeadAndSidecar) {
     auto mem = build_sealed(60);
-    const auto path = (std::filesystem::temp_directory_path() /
+    const auto path = (bitcask::test::scratch_dir() /
                        "segv2_p2_dead.seg")
                           .string();
     std::filesystem::remove(path);
@@ -841,7 +842,7 @@ TEST(SegmentV2P2, SaveV2CarriesDeadBits) {
     auto mem = build_sealed(30);
     ASSERT_TRUE(mem->mark_dead(3));
     ASSERT_TRUE(mem->mark_dead(7));
-    const auto path = (std::filesystem::temp_directory_path() /
+    const auto path = (bitcask::test::scratch_dir() /
                        "segv2_p2_carry.seg")
                           .string();
     std::filesystem::remove(path);
@@ -895,7 +896,7 @@ void add_merge_doc(SealedSegment& seg, std::uint32_t g) {
 }  // namespace
 
 TEST(SegmentV2P3, KWayMergeGoldenEquivalence) {
-    const auto tmp = std::filesystem::temp_directory_path();
+    const auto tmp = bitcask::test::scratch_dir();
     // 三个输入段:[0,100) / [100,180) / [180,240),每输入杀部分文档。
     const std::uint32_t bounds[4] = {0, 100, 180, 240};
     std::vector<std::shared_ptr<SealedSegment>> ins;
@@ -1024,7 +1025,7 @@ TEST(SegmentV2P3, KWayMergeGoldenEquivalence) {
 // 短语在合并段上的 positions 保真(默认字段 "alpha beta" 相邻仅存在于
 // body 字段——default 无;此测直接在 body 上跑 near/phrase)。
 TEST(SegmentV2P3, MergePhraseOnNamedField) {
-    const auto tmp = std::filesystem::temp_directory_path();
+    const auto tmp = bitcask::test::scratch_dir();
     std::vector<std::shared_ptr<const SealedSegment>> cins;
     for (std::uint32_t i = 0; i < 2; ++i) {
         auto seg = std::make_shared<SealedSegment>();

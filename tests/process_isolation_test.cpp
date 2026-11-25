@@ -1,9 +1,9 @@
 // 跨进程隔离测试（exec-self 骨架，S37-2）——两类缺口：
 //
-// W1（TODO C2）：核心路径的 fd 必须带 O_CLOEXEC。宿主 fork+exec 子进程时，
+// W1（已修，e788bb2 / C2）：核心路径的 fd 必须带 O_CLOEXEC。宿主 fork+exec 子进程时，
 //   不带 cloexec 的 data/hint/write.lock/ckpt fd 会被子进程继承：拖住已删除
 //   文件的磁盘空间、子进程能读到库内容、锁 fd 的生命期被子进程延长。
-// B3（TODO B3）：写锁的两进程争用路径此前零覆盖（S37-5 的 PID 复用 bug 恰是
+// B3（本文件已覆盖）：写锁的两进程争用路径此前零覆盖（S37-5 的 PID 复用 bug 恰是
 //   该形态抓到的）。这里用真实的第二个进程争锁，而非进程内模拟。
 
 #include <gtest/gtest.h>

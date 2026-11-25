@@ -47,7 +47,13 @@ class S57Test : public ::testing::Test {
 protected:
     void SetUp() override {
         const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
-        dir_ = fs::temp_directory_path() / (std::string("bitcask_s57_") + info->name());
+        // 参数化用例的名字带 '/'（SeesDeadBytesAfterReopen/0）：原样拼会建出两层目录，
+        // TearDown 只删得掉内层。换成 '_'。
+        std::string name = info->name();
+        for (char& ch : name) {
+            if (ch == '/') ch = '_';
+        }
+        dir_ = fs::temp_directory_path() / ("bitcask_s57_" + name);
         std::error_code ec;
         fs::remove_all(dir_, ec);
         fs::create_directories(dir_, ec);

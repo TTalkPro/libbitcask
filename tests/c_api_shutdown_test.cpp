@@ -185,11 +185,13 @@ TEST(CApiShutdownTest, JoinsBackgroundThreadsAndStaysUsable) {
         EXPECT_LE(*after, *baseline) << "shutdown 后不应残留后台线程";
     }
 
-    // ④ shutdown 后库仍可用：再开（含重放已有数据）、查询、关闭、再 shutdown。
-    cask = open_and_exercise(fresh_dir("b"));
+    // ④ shutdown 后库仍可用，两段：先新建一个库写入并查询（dir2：索引池 / TBB
+    // 拆掉之后能重新建起来），再重开 dir1（纯重放已有数据、不写）查询，最后再 shutdown。
+    const auto dir2 = fresh_dir("b");
+    cask = open_and_exercise(dir2);
     ASSERT_NE(cask, nullptr);
     bitcask_close(cask);
-    {
+    {   // 重开 dir1：③ 之前写入的数据经重放可查
         bitcask_options_t opts;
         bitcask_options_init(&opts);
         opts.read_write = 1;
@@ -248,4 +250,5 @@ TEST(CApiShutdownTest, JoinsBackgroundThreadsAndStaysUsable) {
 
     std::error_code ec;
     fs::remove_all(dir1, ec);
+    fs::remove_all(dir2, ec);
 }

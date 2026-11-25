@@ -282,6 +282,7 @@ TEST(VectorQuant, Int8OnlyRealModeRecallAndRoundtrip) {
     EXPECT_NEAR(r_reload, r_i8o, 0.02)
         << "reload recall " << r_reload << " vs in-mem " << r_i8o;
     std::filesystem::remove(path);
+    std::filesystem::remove(path + ".qc8");  // int8 码字旁车（S14-8）
 }
 
 // P5c：召回 gate（部署维度 dim=2560，与 qwen3-embedding 同维）。真实
@@ -672,6 +673,7 @@ TEST(HnswVecAppend, AppendRoundTripPrefixContract) {
     fs::remove(base);
     fs::remove(old_ckpt);
     fs::remove(vec_path);
+    fs::remove(base + ".qc8");  // int8 码字旁车（S14-8）
 }
 
 // ── S14-8：int8 码字外置（search.qc8）─────────────────────────────────────

@@ -75,6 +75,9 @@ protected:
         namespace fs = std::filesystem;
         std::error_code ec;
         std::filesystem::remove_all(tmpdir_, ec);
+        // 陈旧快照类用例把 OKI 挪到测试目录旁边的 <tmpdir>.oki.old，一并清掉。
+        std::filesystem::remove_all(
+            tmpdir_.parent_path() / (tmpdir_.filename().string() + ".oki.old"), ec);
     }
 
     std::filesystem::path tmpdir_;
